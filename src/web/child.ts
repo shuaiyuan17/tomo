@@ -6,7 +6,7 @@ import { USAGE_RPC_TIMEOUT_MS, WebError, type EventEnvelope, type Rpc } from "./
 import { loadWebToken, writeWebAccessLinks } from "./token-store.js";
 import { setUnreadableReporter } from "./sdk-transcript.js";
 
-interface Init { type: "init"; options: WebDataOptions & { port: number; assetsDir: string; tomoHome: string; externalOrigin?: string; uploadsEnabled?: boolean } }
+interface Init { type: "init"; options: WebDataOptions & { port: number; assetsDir: string; tomoHome: string; externalOrigin?: string; uploadsEnabled?: boolean; fileUploadsEnabled?: boolean } }
 type Message = Init | { type: "ping" } | { type: "event"; value: EventEnvelope }
   | { type: "result"; id: number; value?: unknown; error?: { status: number; code: string } };
 const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
@@ -53,7 +53,8 @@ process.on("message", (value: Message) => {
     accessToken,
     externalOrigin: value.options.externalOrigin,
     data: new WebData(value.options),
-    ...(value.options.uploadsEnabled !== false ? { uploadsDir: uploadsDir(value.options.tomoHome) } : {}),
+    ...(value.options.uploadsEnabled !== false || value.options.fileUploadsEnabled === true ? { uploadsDir: uploadsDir(value.options.tomoHome),
+      uploadKinds: { images: value.options.uploadsEnabled !== false, files: value.options.fileUploadsEnabled === true } } : {}),
     // Captured here, in the web process, so frames never cross the daemon IPC
     // and the daemon thread does no image work. Same user and GUI session as
     // the daemon (this process is its child), so the same Screen Recording grant.

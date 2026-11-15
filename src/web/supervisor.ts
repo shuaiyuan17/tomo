@@ -15,6 +15,8 @@ export interface WebSupervisorOptions extends WebDataOptions {
   tomoHome: string;
   /** Image uploads are offered only when inbound images are kept (config saveInboundImages). */
   uploadsEnabled?: boolean;
+  /** Other files are offered only when they are kept (config saveInboundFiles). */
+  fileUploadsEnabled?: boolean;
   externalOrigin?: string;
   port: number;
   assetsDir?: string;
@@ -314,8 +316,8 @@ export class WebSupervisor implements WebLifecycle {
         settle();
       });
       child.once("exit", onGone);
-      const { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath, agentName, uploadsEnabled } = this.options;
-      send({ type: "init", options: { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath, agentName, uploadsEnabled,
+      const { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath, agentName, uploadsEnabled, fileUploadsEnabled } = this.options;
+      send({ type: "init", options: { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath, agentName, uploadsEnabled, fileUploadsEnabled,
         assetsDir: this.options.assetsDir ?? fileURLToPath(new URL("../../dist/web-assets/", import.meta.url)) } });
     });
   }

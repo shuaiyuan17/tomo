@@ -16,6 +16,7 @@ import { OutgoingMediaError, type OutgoingMediaStore } from "../web/outgoing-med
 import { claimUploads, recoverClaims } from "../web/uploads.js";
 import { buildImageAttachment } from "./attachments.js";
 import { formatImageMarker } from "./imageStore.js";
+import { FALLBACK_MIME, formatFileMarker, sanitizeAttachmentFilename, saveInboundFile, type SavedFileNotice } from "./fileStore.js";
 import type { ImageAttachment } from "./types.js";
 import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request-journal.js";
 import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
@@ -91,7 +92,7 @@ export class WebChannel implements Channel {
   private modelLookups = new Map<string, { key: string; taskId: string; runId: string | undefined; attempt: number; timer: ReturnType<typeof setTimeout> | undefined }>();
   private readonly now: () => number;
   private readonly outgoing: OutgoingMediaStore | undefined;
-  private readonly uploads: { dir: string; workspaceDir: string | undefined } | undefined;
+  private readonly uploads: { dir: string; workspaceDir: string | undefined; fileDir?: string | undefined } | undefined;
   /** Request ids being admitted right now (between the duplicate check and the receipt). */
   private readonly inFlight = new Set<string>();
   private readonly compact: ((sessionKey: string, onSettled: (outcome: "done" | "unverified" | "failed") => void) => "queued" | "already_requested" | "no_owner") | undefined;
@@ -140,8 +141,9 @@ export class WebChannel implements Channel {
       taskModel?: (sessionKey: string, taskId: string) => Promise<string | undefined>;
       /** Where pictures the agent sends are copied, so the browser can show them by id. */
       outgoingMedia?: OutgoingMediaStore;
-      /** Staged browser uploads (`uploadsDir`) and the workspace whose inbound image store files them. */
-      uploads?: { dir: string; workspaceDir: string | undefined };
+      /** Staged browser uploads (`uploadsDir`), the workspace whose inbound image store files them,
+       *  and the one whose inbound file store files other files (absent: saveInboundFiles is off). */
+      uploads?: { dir: string; workspaceDir: string | undefined; fileDir?: string | undefined };
       /** Durable receipts; loaded here, before any request is accepted. */
       journal?: WebRequestJournal;
       /** Soft-stops the running turn of `sessionKey`; false when nothing was running. */
@@ -191,6 +193,7 @@ export class WebChannel implements Channel {
       const request: WebRequest = { requestId: entry.requestId, state: entry.state, timestamp: entry.timestamp,
         ...(this.ownerId ? { sessionId: this.ownerId } : {}), ...(entry.text !== undefined ? { text: entry.text } : {}),
         ...(entry.images?.length ? { images: entry.images } : {}),
+        ...(entry.files?.length ? { files: entry.files } : {}),
         // History: a request whose turn completed was read, whatever the last run saw.
         ...(entry.state === "completed" ? { read: true } : {}) };
       if (entry.text !== undefined) this.pendingTextBytes += Buffer.byteLength(JSON.stringify(entry.text));
@@ -218,7 +221,8 @@ export class WebChannel implements Channel {
     if (!this.ownerId || !this.owner) throw new WebError(409, "owner_setup_required");
     if (input.targetId !== undefined && input.targetId !== this.ownerId) throw new WebError(403, "owner_dm_only");
     if (this.journalUnavailable) throw new WebError(503, "journal_unavailable");
-    const digest = createHash("sha256").update(input.images?.length ? `${input.text}\0${input.images.join(",")}` : input.text).digest("hex");
+    const attached = [...(input.images ?? []), ...(input.files ?? []).map((file) => `${file.id}:${file.type}:${file.name}`)];
+    const digest = createHash("sha256").update(attached.length ? `${input.text}\0${attached.join(",")}` : input.text).digest("hex");
     const previous = this.receipts.get(input.requestId);
     if (previous) {
       if (previous.digest !== digest) throw new WebError(409, "request_id_conflict");
@@ -244,26 +248,29 @@ export class WebChannel implements Channel {
     // Attached uploads are claimed and filed like any channel's inbound
     // images; one that expired or is unknown refuses the message, before
     // anything is accepted. Until the receipt is durable they stay claimable.
-    let images: Awaited<ReturnType<WebChannel["fileImages"]>> | undefined;
-    try { images = input.images?.length ? await this.fileImages(input.images, input.requestId) : undefined; }
+    let uploads: Awaited<ReturnType<WebChannel["fileUploads"]>> | undefined;
+    try { uploads = input.images?.length || input.files?.length ? await this.fileUploads(input.images ?? [], input.files ?? [], input.requestId) : undefined; }
     finally { this.inFlight.delete(input.requestId); }
     // From here to receipts.set there is no await, so no other receive can interleave.
+    const images = uploads?.list.length ? uploads : undefined;
     const filed = images?.list.flatMap((image) => image.savedPath ? [image.savedPath] : []) ?? [];
+    const filedFiles = uploads?.notices.flatMap((notice) => notice.savedPath ? [notice.savedPath] : []) ?? [];
     const request: WebRequest = { requestId: input.requestId, state: "queued", sessionId: this.ownerId, text: input.text, timestamp: this.now(), responseTurnId: input.requestId,
-      ...(filed.length ? { images: filed } : {}) };
+      ...(filed.length ? { images: filed } : {}), ...(filedFiles.length ? { files: filedFiles } : {}) };
     this.receipts.set(input.requestId, { digest, request, settled: false });
     this.pendingTextBytes += textBytes;
     // Durable before custody: a crash after the 202 must leave a record.
     // Durable first, with the filed images' paths; only then do the staged
     // copies go. A failure leaves them staged, so the page can retry the same ids.
-    try { this.journal?.recordReceived(input.requestId, digest, input.text, request.timestamp!, filed); } catch {
-      images?.undo();
+    try { this.journal?.recordReceived(input.requestId, digest, input.text, request.timestamp!, filed, filedFiles); } catch {
+      uploads?.undo();
       this.clearRequestText(this.receipts.get(input.requestId)!);
       this.receipts.delete(input.requestId);
       throw new WebError(503, "persist_failed");
     }
-    images?.finalize();
-    const marker = images ? formatImageMarker(images.list.length, filed, images.unconverted) : "";
+    uploads?.finalize();
+    // Images first, then files — the order the iMessage channel writes its markers in.
+    const marker = [images ? formatImageMarker(images.list.length, filed, images.unconverted) : "", formatFileMarker(uploads?.notices ?? [])].filter(Boolean).join(" ");
     const message: IncomingMessage = { id: input.requestId, chatId: WEB_CHAT_ID, senderName: "Owner",
       text: marker ? (input.text ? `${marker} ${neutralizeMarker(input.text)}` : marker) : neutralizeMarker(input.text), timestamp: Date.now(), isGroup: false,
       ...(images ? { images: images.list } : {}) };
@@ -284,36 +291,59 @@ export class WebChannel implements Channel {
 
   /**
    * The staged uploads of one message, filed as Telegram and iMessage file
-   * theirs: base64 for the model, and (with saveInboundImages) a copy under
-   * memory/incoming-images as `HHMMSS_web_owner_<id8>.<ext>`. Every id is
-   * checked first (present, unexpired, an image, not repeated); one bad id
-   * refuses the message and nothing is written. The staged files are NOT
-   * removed here: receive() does that once the receipt is durable. `undo`
-   * removes what this filed, for a receipt that could not be written.
+   * theirs. Images: base64 for the model, and (with saveInboundImages) a copy
+   * under memory/incoming-images as `HHMMSS_web_owner_<id8>.<ext>`. Other
+   * files: through the same inbound file store as iMessage's (saveInboundFile:
+   * memory/incoming-files/<date>/HHMMSS_web_owner_<sanitised name>, its cap,
+   * never overwriting), path only — the marker tells the agent where it is.
+   * Every id is claimed and checked first (present, unexpired, the kind the
+   * message says, not repeated); one bad id refuses the message and nothing
+   * is written. The staged files are NOT removed here: receive() does that
+   * once the receipt is durable. `undo` removes what this filed, for a
+   * receipt that could not be written.
    */
-  private async fileImages(ids: readonly string[], requestId: string): Promise<{ list: ImageAttachment[]; unconverted: number; undo: () => void; finalize: () => void }> {
+  private async fileUploads(imageIds: readonly string[], fileRefs: ReadonlyArray<{ id: string; name: string; type: string }>, requestId: string):
+    Promise<{ list: ImageAttachment[]; notices: SavedFileNotice[]; unconverted: number; undo: () => void; finalize: () => void }> {
     if (!this.uploads) throw new WebError(400, "uploads_unavailable");
-    // Without saveInboundImages there is no durable copy to record with the
-    // receipt (and the owner asked for images not to be kept): refused, and
-    // the page does not offer attaching at all (bootstrap capabilities).
-    if (!this.uploads.workspaceDir) throw new WebError(409, "uploads_disabled");
-    const claim = claimUploads(this.uploads.dir, ids, requestId);
+    // Without saveInboundImages / saveInboundFiles there is no durable copy to
+    // record with the receipt (and the owner asked for them not to be kept):
+    // refused, and the page does not offer attaching them (bootstrap capabilities).
+    if (imageIds.length && !this.uploads.workspaceDir) throw new WebError(409, "uploads_disabled");
+    const fileDir = this.uploads.fileDir;
+    if (fileRefs.length && !fileDir) throw new WebError(409, "uploads_disabled");
+    const claim = claimUploads(this.uploads.dir, [...imageIds, ...fileRefs.map((file) => file.id)], requestId);
     if (!claim) throw new WebError(409, "upload_missing");
-    const files = claim.files;
+    // Each id must be the kind it was sent as: an image id named as a file (or the reverse) is refused.
+    const kinds = claim.files.map((file) => file.kind);
+    if (kinds.some((kind, at) => kind !== (at < imageIds.length ? "image" : "file"))) { claim.release(); throw new WebError(409, "upload_missing"); }
     const list: ImageAttachment[] = [];
-    const undo = () => { for (const image of list) if (image.savedPath) rmSync(image.savedPath, { force: true }); claim.release(); };
+    const notices: SavedFileNotice[] = [];
+    const undo = () => {
+      for (const path of [...list.map((image) => image.savedPath), ...notices.map((notice) => notice.savedPath)]) if (path) rmSync(path, { force: true });
+      claim.release();
+    };
     let unconverted = 0;
     try {
-      for (const { id, bytes, type } of files) {
+      for (const [at, { id, bytes, type, kind }] of claim.files.entries()) {
+        if (kind === "file") {
+          const ref = fileRefs[at - imageIds.length];
+          // The browser's type, when it gave one; else the same fallback (flagged unknown) as iMessage's MIME-less files.
+          const mimeUnknown = !ref.type.trim();
+          const mimeType = mimeUnknown ? FALLBACK_MIME : ref.type.trim();
+          const savedPath = await saveInboundFile(bytes, mimeType, { sessionKey: `web_${WEB_CHAT_ID}`, filename: ref.name, timestamp: new Date() }, fileDir!);
+          // Filing was asked for and failed: refuse, keep the uploads staged.
+          if (!savedPath) throw new WebError(503, "persist_failed");
+          notices.push({ filename: sanitizeAttachmentFilename(ref.name, mimeType), mimeType, byteSize: bytes.length, mimeUnknown, savedPath, status: "saved" });
+          continue;
+        }
         // Still HEIC: the web process could not convert it at upload (see uploads.ts).
         if (type === "image/heic") unconverted++;
-        const image = await buildImageAttachment(bytes, type, { sessionKey: `web_${WEB_CHAT_ID}`, guid: id, timestamp: new Date() }, this.uploads.workspaceDir);
+        const image = await buildImageAttachment(bytes, type, { sessionKey: `web_${WEB_CHAT_ID}`, guid: id, timestamp: new Date() }, this.uploads.workspaceDir!);
         list.push(image);
-        // Filing was asked for and failed: refuse, keep the uploads staged.
         if (!image.savedPath) throw new WebError(503, "persist_failed");
       }
     } catch (error) { undo(); throw error; }
-    return { list, unconverted, undo, finalize: claim.finalize };
+    return { list, notices, unconverted, undo, finalize: claim.finalize };
   }
 
   request(id: string): WebRequest { return { ...(this.receipts.get(id)?.request ?? { requestId: id, state: "unknown" }) }; }
@@ -657,6 +687,7 @@ export class WebChannel implements Channel {
     if (receipt.request.text !== undefined) this.pendingTextBytes -= Buffer.byteLength(JSON.stringify(receipt.request.text));
     delete receipt.request.text;
     delete receipt.request.images;
+    delete receipt.request.files;
   }
 
   private state(requestId: string, state: WebRequest["state"]): void {

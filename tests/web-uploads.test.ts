@@ -247,7 +247,7 @@ describe("composer attachments (browser, pure)", () => {
   it("a send takes only what it captured: an image pasted while it was sending stays", () => {
     const before = [item("a", "done", "u1"), item("b", "done", "u2")];
     const captured = captureSend([...before, item("c", "uploading")]);
-    expect(captured).toEqual({ keys: ["a", "b"], ids: ["u1", "u2"] });
+    expect(captured).toEqual({ keys: ["a", "b"], ids: ["u1", "u2"], files: [] });
     const now = [...before, item("c", "uploading"), item("d", "done", "u4")];
     const { taken, kept } = takeSent(now, captured.keys);
     expect(taken.map((i) => i.key)).toEqual(["a", "b"]);

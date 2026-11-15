@@ -7,8 +7,8 @@ export function recordedReplyIds(history: HistoryPage): Set<string> {
 /** Messages this owner sent from the browser that the transcript does not show yet (#381). */
 export function pendingUserMessages(requests: WebRequest[], history: HistoryPage, sessionId: string, withImages: ReadonlySet<string> = new Set()): WebRequest[] {
   const recorded = new Set(history.messages.filter((m) => m.role === "user").map((m) => m.requestId));
-  // An image-only message has no text, but this tab still shows its bubble (with the pictures).
-  return requests.filter((r) => r.sessionId === sessionId && (r.text || r.images?.length || withImages.has(r.requestId)) && !recorded.has(r.requestId) && r.state !== "refused");
+  // An image- or file-only message has no text, but this tab still shows its bubble (with the attachments).
+  return requests.filter((r) => r.sessionId === sessionId && (r.text || r.images?.length || r.files?.length || withImages.has(r.requestId)) && !recorded.has(r.requestId) && r.state !== "refused");
 }
 export function pendingLabel(request: WebRequest): string {
   if (request.joined) return "Joined the running turn";

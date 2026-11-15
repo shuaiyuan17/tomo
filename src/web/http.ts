@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { convertUpload, discardUpload, MAX_UPLOAD_BYTES, stageUpload, UploadError } from "./uploads.js";
+import { convertUpload, discardUpload, MAX_UPLOAD_BYTES, MAX_UPLOAD_FILE_BYTES, stageUpload, UploadError } from "./uploads.js";
 import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { resolve, sep } from "node:path";
@@ -37,8 +37,11 @@ export interface HttpDependencies {
   subscribe(fn: (event: EventEnvelope) => void): () => void;
   /** The shared desktop capture loop; absent where the screen cannot be captured. */
   screen?: ScreenLoop;
-  /** Where image uploads wait to be sent (uploads.ts); absent: uploads are unavailable. */
+  /** Where uploads wait to be sent (uploads.ts); absent: uploads are unavailable. */
   uploadsDir?: string;
+  /** Which uploads `uploadsDir` takes (default: images only). Images follow
+   *  saveInboundImages, other files saveInboundFiles. */
+  uploadKinds?: { images: boolean; files: boolean };
 }
 
 /** Idle socket timeout; every RPC deadline (e.g. USAGE_RPC_TIMEOUT_MS) stays under it. */
@@ -48,6 +51,7 @@ const TASK_ACTION_PATH = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/tasks\/([A-
 
 export async function startWebHttp(port: number, deps: HttpDependencies) {
   const csrf = new CsrfTokens(deps.now);
+  const uploadKinds = deps.uploadKinds ?? { images: true, files: false };
   const access = new WebAccess(deps.accessToken, deps.now);
   const externalOrigin = webConfigSchema.shape.externalOrigin.parse(deps.externalOrigin);
   const streams = new Set<ServerResponse>();
@@ -139,7 +143,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           const csrfToken = csrf.bootstrap(session!);
           const { sessions, ownerId, setupRequired } = deps.data.catalog();
           const { snapshot } = await deps.rpc({ method: "snapshot" }) as WebSync;
-          json(res, 200, { sessions, ownerId, setupRequired, ...snapshot, csrfToken, capabilities: { screen: !!deps.screen, uploads: !!deps.uploadsDir }, agentName: deps.data.agentName() });
+          json(res, 200, { sessions, ownerId, setupRequired, ...snapshot, csrfToken, capabilities: { screen: !!deps.screen, uploads: !!deps.uploadsDir && uploadKinds.images, files: !!deps.uploadsDir && uploadKinds.files }, agentName: deps.data.agentName() });
           return;
         }
         if (url.pathname === "/api/v1/sessions") {
@@ -305,17 +309,19 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         json(res, 200, await deps.rpc({ method: "task-action", epoch, sessionId, taskId, action: action as TaskAction }));
         return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/uploads") {
-        // An image for the owner's next message: the same gate as sending one
-        // (CSRF, the owner, the daemon epoch), a raw body of at most
-        // MAX_UPLOAD_BYTES, and the type decided by its leading bytes.
+        // An image or file for the owner's next message: the same gate as
+        // sending one (CSRF, the owner, the daemon epoch), a raw body of at
+        // most MAX_UPLOAD_BYTES for an image / MAX_UPLOAD_FILE_BYTES for any
+        // other file, and the kind decided by its leading bytes.
         csrf.verify(req, session!, "application/octet-stream");
         const { ownerId } = deps.data.catalog();
         if (!ownerId) throw new WebError(409, "owner_setup_required");
         if (url.searchParams.get("targetId") !== ownerId) throw new WebError(403, "owner_dm_only");
         const epoch = req.headers["x-tomo-epoch"];
         if (typeof epoch !== "string" || epoch !== await deps.rpc({ method: "epoch" })) throw new WebError(409, "epoch_changed");
-        const bytes = await rawBody(req, MAX_UPLOAD_BYTES);
-        try { json(res, 201, stageUpload(required(deps.uploadsDir), await convertUpload(bytes))); }
+        if (!uploadKinds.images && !uploadKinds.files) throw new WebError(409, "uploads_disabled");
+        const bytes = await rawBody(req, uploadKinds.files ? Math.max(MAX_UPLOAD_BYTES, MAX_UPLOAD_FILE_BYTES) : MAX_UPLOAD_BYTES);
+        try { json(res, 201, stageUpload(required(deps.uploadsDir), uploadKinds.images ? await convertUpload(bytes) : bytes, Date.now(), uploadKinds.files, uploadKinds.images)); }
         catch (error) {
           if (!(error instanceof UploadError)) throw error;
           throw new WebError(error.code === "not_image" ? 415 : error.code === "too_large" ? 413 : 429, error.code);

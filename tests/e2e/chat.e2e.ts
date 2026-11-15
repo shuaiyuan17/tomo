@@ -34,8 +34,8 @@ beforeEach(async () => {
   store.append("telegram:-1", { role: "user", content: "A shared group note.", channel: "telegram", timestamp: Date.now() });
   agent = new Agent(); channel = new WebChannel(mockConfig.owner, undefined, { compact: (key, settled) => agent.requestOwnerCompact(key, settled),
     outgoingMedia: new OutgoingMediaStore(outgoingImagesDir(mockConfig.workspaceDir), { isPrivate: (path) => path.includes("/memory/private/") }),
-    uploads: { dir: uploadsDir(mockConfig.tomoHome), workspaceDir: mockConfig.workspaceDir } }); provider = new MockChannel("telegram");
-  supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0 });
+    uploads: { dir: uploadsDir(mockConfig.tomoHome), workspaceDir: mockConfig.workspaceDir, fileDir: mockConfig.workspaceDir } }); provider = new MockChannel("telegram");
+  supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0, fileUploadsEnabled: true });
   channel.attach(supervisor); agent.addChannel(channel); agent.addChannel(provider);
   await channel.start();
   expect(supervisor.status().port).toBeTypeOf("number");
@@ -917,7 +917,7 @@ it("attaches images by button, drop and paste; shows the tray with ×; sends an 
   const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
   mockSdk.responseFn = () => "Got the picture.";
   await page.locator("input[type=file]").setInputFiles([{ name: "one.png", mimeType: "image/png", buffer: png }]);
-  const tray = page.getByRole("list", { name: "Attached images" });
+  const tray = page.getByRole("list", { name: "Attachments" });
   await browserExpect(tray.getByRole("listitem", { name: "one.png, attached" })).toBeVisible();
   // Drag files over the chat: "Drop to attach"; dropping adds them.
   const drop = async (type: "dragenter" | "drop") => page.locator("#conversation").evaluate((el, [kind, b64]) => {
@@ -941,10 +941,11 @@ it("attaches images by button, drop and paste; shows the tray with ×; sends an 
   await browserExpect(tray.getByRole("listitem")).toHaveCount(3);
   await tray.getByRole("button", { name: "Remove three.png" }).click();
   await browserExpect(tray.getByRole("listitem")).toHaveCount(2);
-  // A fake image (an SVG named .png) is refused by the server: the tray says so and offers a retry.
+  // A fake image (an SVG named .png) is never shown as one: the server decides by its bytes, so it becomes a plain file chip.
   await page.locator("input[type=file]").setInputFiles([{ name: "evil.png", mimeType: "image/png", buffer: Buffer.from("<svg xmlns='http://www.w3.org/2000/svg'/>") }]);
-  await browserExpect(tray.getByRole("listitem", { name: "evil.png, upload failed" })).toBeVisible();
-  await browserExpect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
+  const evil = tray.getByRole("listitem", { name: "evil.png, attached" });
+  await browserExpect(evil).toHaveAttribute("data-kind", "file");
+  await browserExpect(evil.locator("img")).toHaveCount(0);
   await tray.getByRole("button", { name: "Remove evil.png" }).click();
   await page.getByRole("button", { name: "Send", exact: true }).click();
   await browserExpect(page.locator(".message.assistant .markdown").last()).toHaveText("Got the picture.");
@@ -961,10 +962,47 @@ it("attaches images by button, drop and paste; shows the tray with ×; sends an 
   await browserExpect(page.locator("main")).not.toContainText("incoming-images");
 });
 
+it("attaches any file with \"+\": a .md shows as a chip, is sent, and the bubble shows a file card — filed like iMessage's, card kept on reload", async () => {
+  mockSdk.responseFn = () => "Read your notes.";
+  const md = Buffer.from("# Notes\n\nhello\n");
+  const plus = page.getByRole("button", { name: "Attach files" });
+  await browserExpect(plus).toBeEnabled();
+  // The picker takes any file (no accept filter).
+  expect(await page.locator("input[type=file]").getAttribute("accept")).toBeNull();
+  const [chooser] = await Promise.all([page.waitForEvent("filechooser"), plus.click()]);
+  await chooser.setFiles([{ name: "notes.md", mimeType: "text/markdown", buffer: md }]);
+  const tray = page.getByRole("list", { name: "Attachments" });
+  const chip = tray.getByRole("listitem", { name: "notes.md, attached" });
+  await browserExpect(chip).toHaveAttribute("data-kind", "file");
+  await browserExpect(chip).toContainText("notes.md");
+  await browserExpect(chip).toContainText(`${md.length} B`);
+  await browserExpect(chip.getByRole("button", { name: "Remove notes.md" })).toBeVisible();
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("see attached");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect(page.locator(".message.assistant .markdown").last()).toHaveText("Read your notes.");
+  await browserExpect(tray).toHaveCount(0);
+  const card = page.locator(".message.user").last().getByRole("group", { name: `File notes.md, ${md.length} B` });
+  await browserExpect(card).toBeVisible();
+  // What the agent got: the shared inbound-file marker, the path under incoming-files, no bytes.
+  const sent = JSON.stringify(mockSdk.userContents.at(-1));
+  const { readdirSync, readFileSync: read } = await import("node:fs");
+  const filed = readdirSync(resolve(mockConfig.workspaceDir, "memory", "incoming-files"), { recursive: true }).map(String).filter((name) => name.endsWith("_web_owner_notes.md"));
+  expect(filed).toHaveLength(1);
+  expect(filed[0]).toMatch(/^\d{4}-\d{2}-\d{2}\/\d{6}_web_owner_notes\.md$/);
+  const path = resolve(mockConfig.workspaceDir, "memory", "incoming-files", filed[0]);
+  expect(read(path).equals(md)).toBe(true);
+  expect(sent).toContain(`[Sent a file: notes.md (text/markdown, ${md.length} B) saved to ${path}. Contents not attached to this message — open the path if you need them.] see attached`);
+  expect(readdirSync(uploadsDir(mockConfig.tomoHome))).toEqual([]);
+  // Recorded: after a reload the card comes back from the transcript; the path is never shown.
+  await page.reload();
+  await browserExpect(page.locator(".message.user").last().getByRole("group", { name: `File notes.md, ${md.length} B` })).toBeVisible();
+  await browserExpect(page.locator("main")).not.toContainText("incoming-files");
+});
+
 it("an image pasted while a message is sending stays in the tray for the next one", async () => {
   const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
   mockSdk.responseFn = () => "Seen.";
-  const tray = page.getByRole("list", { name: "Attached images" });
+  const tray = page.getByRole("list", { name: "Attachments" });
   await page.locator("input[type=file]").setInputFiles([{ name: "first.png", mimeType: "image/png", buffer: png }]);
   await browserExpect(tray.getByRole("listitem", { name: "first.png, attached" })).toBeVisible();
   let release!: () => void;
@@ -997,7 +1035,7 @@ it("Resend on an interrupted message brings its images back into the tray", asyn
   mockSdk.responseFn = () => new Promise<string>((resolve) => { finish = resolve; });
   let requestId = "";
   page.on("request", (request) => { if (request.method() === "POST" && request.url().endsWith("/api/v1/messages")) requestId = JSON.parse(request.postData() ?? "{}").requestId; });
-  const tray = page.getByRole("list", { name: "Attached images" });
+  const tray = page.getByRole("list", { name: "Attachments" });
   await page.locator("input[type=file]").setInputFiles([{ name: "pic.png", mimeType: "image/png", buffer: png }]);
   await browserExpect(tray.getByRole("listitem", { name: "pic.png, attached" })).toBeVisible();
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("with a picture");
@@ -1020,7 +1058,7 @@ it("an image-only interrupted message, resent, is dismissed: its interrupted bub
   mockSdk.responseFn = () => new Promise<string>((resolve) => { finishes.push(resolve); });
   const ids: string[] = [];
   page.on("request", (request) => { if (request.method() === "POST" && request.url().endsWith("/api/v1/messages")) ids.push(JSON.parse(request.postData() ?? "{}").requestId); });
-  const tray = page.getByRole("list", { name: "Attached images" });
+  const tray = page.getByRole("list", { name: "Attachments" });
   await page.locator("input[type=file]").setInputFiles([{ name: "only.png", mimeType: "image/png", buffer: png }]);
   await browserExpect(tray.getByRole("listitem", { name: "only.png, attached" })).toBeVisible();
   await page.getByRole("button", { name: "Send", exact: true }).click();

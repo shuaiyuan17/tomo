@@ -59,6 +59,8 @@ beforeEach(async () => {
       if (input.method === "dismiss") return channel.resolveInterrupted(input.requestId, "dismissed");
       if (input.method === "compact") return channel.requestCompact();
       if (input.method === "stop") return channel.stopOwnerTurn();
+      if (input.method === "epoch") return channel.events.epoch;
+      if (input.method === "rewind") return channel.rewindOwner(input.count, input.text, input.from);
       if (input.method === "task") return channel.task(input.sessionId, input.taskId, input.output);
       if (input.method === "usage") return channel.usage(input.refresh);
       return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };
@@ -200,6 +202,25 @@ describe("local HTTP boundary", () => {
     expect(busy.status).toBe(409);
     expect(JSON.parse(busy.text)).toEqual({ error: "tasks_running" });
     expect(compact).toHaveBeenCalledTimes(1);
+  });
+  it("rewind needs CSRF, the current epoch and an explicit confirm, and names a refusal", async () => {
+    const rewind = vi.fn(async (_key: string, count: number, matches: (preview: string) => boolean) =>
+      matches("[web · Sun 11/15 04:20 UTC] hello there") ? { ok: true as const, count, preview: "hello there" } : { ok: false as const, reason: "rewind_mismatch" as const });
+    (channel as unknown as { rewind: typeof rewind }).rewind = rewind;
+    const post = (body: unknown, headers: Record<string, string | undefined> = mutationHeaders()) => call("/api/v1/rewind", { method: "POST", headers, body: JSON.stringify(body) });
+    const input = { count: 1, text: "hello there", from: 1, confirm: true };
+    expect((await post(input, { ...mutationHeaders(), "x-tomo-csrf": "wrong" })).status).toBe(403);
+    expect((await post(input, { ...mutationHeaders(), "x-tomo-epoch": "00000000-0000-4000-8000-000000000000" })).status).toBe(409);
+    expect((await post({ ...input, confirm: false })).status).toBe(400);
+    expect((await post({ ...input, count: 0 })).status).toBe(400);
+    expect(rewind).not.toHaveBeenCalled();
+    const ok = await post(input);
+    expect(ok.status).toBe(200);
+    expect(JSON.parse(ok.text)).toMatchObject({ count: 1, mark: { from: 1, count: 1 } });
+    expect(rewind.mock.calls[0].slice(0, 2)).toEqual(["dm:owner", 1]);
+    const refused = await post({ ...input, text: "another message" });
+    expect(refused.status).toBe(409);
+    expect(JSON.parse(refused.text)).toEqual({ error: "rewind_mismatch" });
   });
   it("stop needs CSRF and the epoch, and reaches the owner conversation's running turn", async () => {
     const stop = vi.fn(async (_key: string) => true);

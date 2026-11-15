@@ -6,7 +6,7 @@ import { PAGE_BYTES, readLine, readWindow, type ToolRedaction } from "./subagent
 import { isSidechainLine, mayHoldToolBlocks, reportUnreadable, SDK_SESSION_ID, sessionTranscriptFile, type Problem } from "./sdk-transcript.js";
 import { redactText, redactToolInput } from "./redact-command.js";
 import { isPrivateMemoryAccess } from "../agent/private-memory-access.js";
-import type { SessionTools, SubagentItem } from "./protocol.js";
+import type { CallItem, SessionTools, SubagentItem } from "./protocol.js";
 
 /**
  * The tool calls of a conversation's CURRENT SDK transcript
@@ -82,8 +82,11 @@ export function toolItemsFromLine(text: string, offset: number, scope: PrivateSc
 function toolLine(text: string, offset: number, scope: PrivateScope): { items: SubagentItem[]; problems: Problem[] } {
   if (!mayHoldToolBlocks(text) || isSidechainLine(text)) return { items: [], problems: [] };
   const { items, problems } = readLine(text, offset, redaction(scope));
-  return { items: items.filter((item) => item.kind === "tool" || item.kind === "result"), problems };
+  return { items: items.filter((item) => isCallItem(item) || item.kind === "result"), problems };
 }
+
+/** A call as the chat counts and keeps them: an ordinary call or a parsed TodoWrite list. */
+export function isCallItem(item: SubagentItem): item is CallItem { return item.kind === "tool" || item.kind === "todos"; }
 
 /**
  * Pair every result with its call, ON THE SERVER, before anything is sent:
@@ -93,14 +96,15 @@ function toolLine(text: string, offset: number, scope: PrivateScope): { items: S
  */
 export function pairOutputs(items: SubagentItem[], known: ReadonlyMap<string, boolean> = new Map()): SubagentItem[] {
   const calls = new Map(known);
-  for (const item of items) if (item.kind === "tool") calls.set(item.toolUseId, item.privateOutput === true);
+  for (const item of items) if (isCallItem(item)) calls.set(item.toolUseId, item.kind === "tool" && item.privateOutput === true);
   return items.map((item) => {
     if (item.kind === "tool") { const rest = { ...item }; delete rest.privateOutput; return rest; }
     if (item.kind !== "result") return item;
     const reached = calls.get(item.toolUseId);
-    // A withheld output is replaced whole: not even how many images it held.
+    // A withheld output is replaced whole: not even how many images or links it held.
     const rest = { ...item };
     delete rest.images;
+    delete rest.sources;
     if (reached === undefined) return { ...rest, output: UNPAIRED_HIDDEN, truncated: false };
     return reached ? { ...rest, output: PRIVATE_HIDDEN, truncated: false } : item;
   });
@@ -156,7 +160,7 @@ export async function readSessionTools(sdkSessionsDir: string, sdkSessionId: str
         cursor = page.end;
       }
       // Results whose call was on an earlier page: find those calls just before `after`.
-      const inPage = new Set(items.flatMap((item) => item.kind === "tool" ? [item.toolUseId] : []));
+      const inPage = new Set(items.flatMap((item) => isCallItem(item) ? [item.toolUseId] : []));
       const wanted = new Set(items.flatMap((item) => item.kind === "result" && !inPage.has(item.toolUseId) ? [item.toolUseId] : []));
       const known = new Map<string, boolean>();
       let hi = query.after;
@@ -164,7 +168,9 @@ export async function readSessionTools(sdkSessionsDir: string, sdkSessionId: str
         const page = await readWindow(fd, size, Math.max(0, hi - PAGE_BYTES), hi, "back");
         for (const line of page.lines) {
           for (const item of toolItemsFromLine(line.text, line.offset, scope)) {
-            if (item.kind === "tool" && wanted.has(item.toolUseId)) { known.set(item.toolUseId, item.privateOutput === true); wanted.delete(item.toolUseId); }
+            if (isCallItem(item) && wanted.has(item.toolUseId)) {
+              known.set(item.toolUseId, item.kind === "tool" && item.privateOutput === true); wanted.delete(item.toolUseId);
+            }
           }
         }
         if (page.start >= hi) break;
@@ -184,14 +190,14 @@ export async function readSessionTools(sdkSessionsDir: string, sdkSessionId: str
       const items = page.lines.flatMap(read);
       pages.unshift(items);
       count += items.length;
-      if (items.some((item) => item.kind === "tool" && item.ts !== undefined && item.ts < from)) { reached = true; break; }
+      if (items.some((item) => isCallItem(item) && item.ts !== undefined && item.ts < from)) { reached = true; break; }
       if (page.start >= hi) break;
       hi = page.start;
     }
     const all = pages.flat();
-    const tools = all.filter((item) => item.kind === "tool" && (item.ts ?? Infinity) >= from);
-    const kept = new Set(tools.slice(-MAX_TOOL_ITEMS / 2).map((item) => (item as Extract<SubagentItem, { kind: "tool" }>).toolUseId));
-    const items = all.filter((item) => (item.kind === "tool" || item.kind === "result") && kept.has(item.toolUseId));
+    const tools = all.filter((item): item is CallItem => isCallItem(item) && (item.ts ?? Infinity) >= from);
+    const kept = new Set(tools.slice(-MAX_TOOL_ITEMS / 2).map((item) => item.toolUseId));
+    const items = all.filter((item) => (isCallItem(item) || item.kind === "result") && kept.has(item.toolUseId));
     // Incomplete: the scan stopped at a cap before reaching `from`, or found more calls than it keeps.
     return { items: pairOutputs(items), end: end ?? 0, transcript: token, complete: (reached || hi === 0) && tools.length <= MAX_TOOL_ITEMS / 2, ...flagged() };
   } finally { await fd.close(); }

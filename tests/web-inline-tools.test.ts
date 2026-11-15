@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { HistoryMessage, SessionTools, SubagentItem } from "../src/web/protocol.js";
-import { blockKey, interleave, isFar, jumpLabel, jumpVisible, mergeTools, messageKey, NO_TOOLS, pendingKey, scrollAction, unseenCount } from "../web/src/inline-tools.js";
+import type { HistoryMessage, SessionTools, SubagentItem, WebRequest } from "../src/web/protocol.js";
+import { blockKey, interleave, jumpLabel, jumpVisible, mergeTools, messageKey, NO_TOOLS, pendingKey, unseenKeys } from "../web/src/inline-tools.js";
+import { chatRows, rowId } from "../web/src/chat-rows.js";
 import { groupLabel, pendingTool } from "../web/src/subagent.js";
 
 const msg = (id: string, role: "user" | "assistant", timestamp: number, extra: Partial<HistoryMessage> = {}): HistoryMessage =>
@@ -33,7 +34,8 @@ describe("interleave: tool calls between the chat's messages", () => {
     const group = out.trailing[0];
     if (group.kind !== "group") throw new Error("expected a group");
     const pending = pendingTool(group.tools)!;
-    expect(groupLabel(group.tools, pending)).toEqual({ lead: "Read a file · ", running: `${pending.summary || pending.name}…` });
+    expect(groupLabel(group.tools, true)).toEqual({ lead: "", running: `${pending.summary || pending.name}…` });
+    expect(groupLabel(group.tools)).toEqual({ lead: "Read a file, ran a command" });
   });
   it("drops calls before the oldest loaded message (older history not loaded) and calls without a time", () => {
     const items = [...call("old", "Read", 50), { kind: "tool", id: "1:0", toolUseId: "nots", name: "X", summary: "", input: "{}", inputTruncated: false } as SubagentItem,
@@ -73,23 +75,48 @@ describe("new-message counter", () => {
   it("a streamed reply and its recorded copy count once; paged-in older messages never count", () => {
     const baseline = new Set([messageKey(msg("u1", "user", 1, { requestId: "q1" })), "reply:x"]);
     const streaming = [...baseline, blockKey({ requestId: "q2", turnId: "turn2" })];
-    expect(unseenCount(baseline, streaming)).toBe(1);
+    expect(unseenKeys(baseline, streaming).size).toBe(1);
     const recorded = [...baseline, messageKey(msg("a2", "assistant", 5, { requestId: "q2", turnId: "turn2" })), blockKey({ requestId: "q2", turnId: "turn2" })];
-    expect(unseenCount(baseline, recorded)).toBe(1);
-    expect(unseenCount(baseline, ["msg:older", ...baseline])).toBe(0);
+    expect([...unseenKeys(baseline, recorded)]).toEqual(["reply:turn2"]);
+    expect(unseenKeys(baseline, ["msg:older", ...baseline]).size).toBe(0);
     expect(pendingKey({ requestId: "q3" })).toBe(messageKey(msg("u3", "user", 6, { requestId: "q3" })));
   });
-  it("labels and visibility", () => {
+  it("labels, and the pill shows only with conversation below: a new message, or the last row out of view", () => {
     expect(jumpLabel(0)).toBe(""); expect(jumpLabel(1)).toBe("1 new message"); expect(jumpLabel(3)).toBe("3 new messages");
-    expect(jumpVisible({ atBottom: true, far: true, unseen: 4 })).toBe(false);
-    expect(jumpVisible({ atBottom: false, far: false, unseen: 0 })).toBe(false);
-    expect(jumpVisible({ atBottom: false, far: true, unseen: 0 })).toBe(true);
-    expect(jumpVisible({ atBottom: false, far: false, unseen: 2 })).toBe(true);
-    expect(isFar(901, 900)).toBe(true); expect(isFar(400, 900)).toBe(false);
+    // At the end (or following it) the scroller reports nothing below: never shown.
+    expect(jumpVisible({ canScrollEnd: false, lastRowVisible: false, unseen: 4 })).toBe(false);
+    expect(jumpVisible({ canScrollEnd: true, lastRowVisible: true, unseen: 0 })).toBe(false);
+    expect(jumpVisible({ canScrollEnd: true, lastRowVisible: false, unseen: 0 })).toBe(true);
+    expect(jumpVisible({ canScrollEnd: true, lastRowVisible: true, unseen: 2 })).toBe(true);
   });
-  it("a reader up in the history is not pulled to the end by new messages", () => {
-    expect(scrollAction({ restoring: false, atBottom: false })).toBe("stay");
-    expect(scrollAction({ restoring: false, atBottom: true })).toBe("bottom");
-    expect(scrollAction({ restoring: true, atBottom: true })).toBe("restore");
+});
+
+describe("chatRows: the Message Scroller's rows", () => {
+  const request = (requestId: string, extra: Partial<WebRequest> = {}): WebRequest => ({ requestId, sessionId: "s", state: "running", text: requestId, ...extra } as WebRequest);
+  const shapeOf = (rows: ReturnType<typeof chatRows>) => rows.map((row) => `${row.id}${row.anchor ? "*" : ""}${row.kind === "message" && row.tools.length ? `[${row.tools.map((t) => t.key).join(",")}]` : ""}`);
+  it("tool calls ride in the row of the message they precede: loading them grows a row, never inserts one", () => {
+    const messages = [msg("u1", "user", 100), msg("a1", "assistant", 500), msg("u2", "user", 600), msg("a2", "assistant", 900)];
+    const before = chatRows(interleave(messages, []).entries, [], false);
+    const after = chatRows(interleave(messages, [...call("r1", "Read", 200), ...call("b1", "Bash", 300), ...call("g1", "Grep", 700)]).entries, [], false);
+    expect(after.map((row) => row.id)).toEqual(before.map((row) => row.id));
+    expect(shapeOf(after)).toEqual(["u1", "a1[calls:r1]", "u2*", "a2[call:g1]"]);
+  });
+  it("only the latest user message anchors (pending or recorded); a web message keeps one id from bubble to record", () => {
+    const history = [msg("u1", "user", 100), msg("a1", "assistant", 200)];
+    const sent = chatRows(interleave(history, []).entries, [request("q2")], true);
+    expect(shapeOf(sent)).toEqual(["u1", "a1", "sent:q2*"]);
+    const recorded = chatRows(interleave([...history, msg("x9", "user", 300, { requestId: "q2" })], []).entries, [], true);
+    expect(shapeOf(recorded)).toEqual(["u1", "a1", "sent:q2*"]);
+    expect(rowId(msg("x9", "user", 300, { requestId: "q2" }))).toBe("sent:q2");
+    expect(rowId(msg("a9", "assistant", 300, { requestId: "q2" }))).toBe("a9");
+    const queued = chatRows(interleave(history, []).entries, [request("q2"), request("q3", { state: "queued" })], false);
+    expect(shapeOf(queued)).toEqual(["u1", "a1", "sent:q2", "sent:q3*"]);
+  });
+  it("history paged in above only prepends; live content with no row to ride in gets one", () => {
+    const newer = chatRows(interleave([msg("u2", "user", 600), msg("a2", "assistant", 700)], []).entries, [], false).map((row) => row.id);
+    const paged = chatRows(interleave([msg("u1", "user", 100), msg("a1", "assistant", 200), msg("u2", "user", 600), msg("a2", "assistant", 700)], []).entries, [], false).map((row) => row.id);
+    expect(paged.slice(-newer.length)).toEqual(newer);
+    expect(shapeOf(chatRows([], [], true))).toEqual(["live"]);
+    expect(chatRows([], [], false)).toEqual([]);
   });
 });

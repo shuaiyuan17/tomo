@@ -3,9 +3,10 @@ import { open, realpath, type FileHandle } from "node:fs/promises";
 import { sep } from "node:path";
 import { scrubSecretValues } from "../redact.js";
 import { toolTitle } from "../agent/tool-summary.js";
-import type { SubagentBrief, SubagentItem, SubagentPage } from "./protocol.js";
-import { mayBeAssistant, metaModels, parseEntry, reportUnreadable, subagentMetaFile, subagentTranscriptFile,
-  type Block, type Entry, type Problem, type ResultPart } from "./sdk-transcript.js";
+import { redactText } from "./redact-command.js";
+import type { SubagentBrief, SubagentItem, SubagentPage, TodoEntry, WebSource } from "./protocol.js";
+import { fetchedPage, mayBeAssistant, metaModels, parseEntry, reportUnreadable, searchResultLinks, subagentMetaFile, subagentTranscriptFile,
+  todoList, taskNotice, BACKGROUND_TASK_TOOL, SUBAGENT_MESSAGE_TOOL, type Block, type Entry, type Problem, type ResultPart, type TaskNotice, type WebLink } from "./sdk-transcript.js";
 
 /**
  * Bounded, read-only pages over one subagent's transcript
@@ -32,6 +33,11 @@ export const BRIEF_LIMIT = 12_000;
 export const MAX_PAGE_ITEMS = 400;
 /** Blocks shown from one transcript entry; the rest is summarised by a marker. */
 export const MAX_LINE_ITEMS = 400;
+/** Entries kept from one TodoWrite list (the rest are counted), and the characters kept of each entry's text. */
+export const MAX_TODOS = 50;
+export const TODO_TEXT_LIMIT = 400;
+/** Characters kept of a source's title. */
+export const SOURCE_TITLE_LIMIT = 200;
 export class SubagentReadError extends Error {
   constructor(readonly code: "invalid_cursor" | "transcript_not_found" | "transcript_reset") { super(code); }
 }
@@ -71,6 +77,14 @@ function itemsFromEntry(entry: Entry, offset: number, redact?: ToolRedaction): S
     return [{ kind: "message", id: `${offset}:queued`, text, truncated, ...(entry.ts ? { ts: entry.ts } : {}) }];
   }
   if (entry.kind !== "message") return [];
+  // A background task reporting back (the CLI's own user-role entry) is shown
+  // as a step of the turn, like a tool call: a titled row that opens to the
+  // report. It is carried as a synthetic call/result pair so every rule a
+  // call already obeys (pairing, grouping, redaction, bounds) applies to it.
+  if (entry.role === "user") {
+    const notice = taskNotice(userText(entry.content));
+    if (notice) return noticeItems(notice, offset, entry.ts, redact);
+  }
   // A user entry with text is a message to the subagent. The very first entry
   // is its brief (served separately), so it is never repeated here.
   if (entry.role === "user" && offset > 0) {
@@ -92,6 +106,18 @@ export interface ToolRedaction {
   output: (text: string) => string;
   /** Asked with the RAW input: does this call reach memory/private? Its tool item is then marked `privateOutput`. */
   reachesPrivate?: (name: string, input: Record<string, unknown>) => boolean;
+}
+
+function noticeItems(notice: TaskNotice, offset: number, ts: number | undefined, redact?: ToolRedaction): SubagentItem[] {
+  const toolUseId = `notice:${offset}`;
+  const name = notice.subagent ? SUBAGENT_MESSAGE_TOOL : BACKGROUND_TASK_TOOL;
+  const title = clip(scrubSecretValues(`${notice.subagent ? "Message from subagent" : "Background task"} · ${notice.name}`), 200).text;
+  const report = clip(notice.text || (notice.status ? `(${notice.status}; no report text)` : "(no report text)"), IO_LIMIT);
+  const failed = notice.status === "failed" || notice.status === "killed";
+  return [
+    { kind: "tool", id: `${offset}:notice`, toolUseId, name, summary: title, input: "", inputTruncated: false, ...(ts ? { ts } : {}) },
+    { kind: "result", id: `${offset}:notice-result`, toolUseId, output: redact ? redact.output(report.text) : report.text, truncated: report.truncated, isError: failed, ...(ts ? { ts } : {}) },
+  ];
 }
 
 /** The text a user entry carries: a string, or its text blocks (tool results are not text). */
@@ -119,20 +145,56 @@ function itemsFromBlocks(entry: Extract<Entry, { kind: "message" }>, content: Bl
       items.push({ kind: "thinking", id, text, truncated, ...(ts ? { ts } : {}) });
     } else if (entry.role === "assistant" && b.type === "tool_use") {
       const raw = b.input;
+      const todos = todoList(b.name, raw);
+      if (todos) {
+        // The agent's todo list: parsed, bounded and scrubbed like any other text.
+        items.push({ kind: "todos", id, toolUseId: b.id ?? id, todos: todos.slice(0, MAX_TODOS).map((todo) => todoEntry(todo, redact)),
+          ...(todos.length > MAX_TODOS ? { more: todos.length - MAX_TODOS } : {}), ...(ts ? { ts } : {}) });
+        return;
+      }
       const input = redact ? redact.input(raw, b.name) : raw;
       const inputText = clip(JSON.stringify(input, null, 2), IO_LIMIT);
+      const reaches = redact?.reachesPrivate?.(b.name, raw) === true;
+      const page = reaches ? undefined : sources([fetchedPage(b.name, raw)], redact);
       items.push({ kind: "tool", id, toolUseId: b.id ?? id, name: b.name.slice(0, 128),
         summary: clip(toolTitle(b.name, input), 200).text, input: inputText.text, inputTruncated: inputText.truncated,
-        ...(ts ? { ts } : {}), ...(redact?.reachesPrivate?.(b.name, raw) ? { privateOutput: true } : {}) });
+        ...(ts ? { ts } : {}), ...(page ? { sources: page } : {}), ...(reaches ? { privateOutput: true } : {}) });
     } else if (entry.role === "user" && b.type === "tool_result") {
       const result = resultText(b.parts);
       const { text, truncated } = clip(result.text, IO_LIMIT);
+      // Links are read from the whole result (they can sit past the clip), then bounded on their own.
+      const links = sources(searchResultLinks(b.parts), redact);
       items.push({ kind: "result", id, toolUseId: b.toolUseId, output: redact ? redact.output(text) : text, truncated, isError: b.isError,
-        ...(result.images ? { images: result.images } : {}) });
+        ...(result.images ? { images: result.images } : {}), ...(ts ? { ts } : {}), ...(links ? { sources: links } : {}) });
     }
   });
   if (hidden) items.push({ kind: "text", id: `${offset}:more`, text: `… ${hidden} more entries in this step are not shown.`, truncated: true });
   return items;
+}
+
+/** One todo's text, clipped and scrubbed (and redacted where the caller redacts outputs). */
+function todoEntry(todo: { content: string; status: TodoEntry["status"]; activeForm?: string }, redact?: ToolRedaction): TodoEntry {
+  const text = (value: string) => { const clipped = clip(value.replace(/\s+/g, " ").trim(), TODO_TEXT_LIMIT).text; return redact ? redact.output(clipped) : clipped; };
+  const activeForm = todo.activeForm ? text(todo.activeForm) : "";
+  return { content: text(todo.content), status: todo.status, ...(activeForm ? { activeForm } : {}) };
+}
+
+/**
+ * Links as they may be sent: a URL that the UI's redaction would change (a
+ * token in its query string, a credential shape) is left out rather than
+ * shown altered or whole;
+ * titles are clipped and scrubbed. Undefined when none is left.
+ */
+function sources(links: ReadonlyArray<WebLink | undefined>, redact?: ToolRedaction): WebSource[] | undefined {
+  const kept = links.flatMap((link): WebSource[] => {
+    if (!link) return [];
+    const url = link.url;
+    if (redactText(url) !== url || (redact && redact.output(url) !== url)) return [];
+    const title = link.title ? clip(link.title, SOURCE_TITLE_LIMIT).text : "";
+    const shown = title && redact ? redact.output(title) : title;
+    return [{ url, ...(shown ? { title: shown } : {}) }];
+  });
+  return kept.length ? kept : undefined;
 }
 
 export async function readRange(fd: FileHandle, start: number, end: number): Promise<Buffer> {

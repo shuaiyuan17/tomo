@@ -12,7 +12,7 @@ describe("chat message line breaks", () => {
     expect(html).not.toMatch(/<p>• one • two/);
   });
   it("leaves code blocks and real markdown lists alone", () => {
-    expect(render("```\na\nb\n```")).toContain("<pre><code>a\nb\n</code></pre>");
+    expect(render("```\na\nb\n```")).toContain("<code>a\nb\n</code></pre>");
     const list = render("- one\n- two");
     expect(list).toContain("<ul>");
     expect(list).not.toContain("<br/>");

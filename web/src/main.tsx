@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
-import { api, ApiError, dismissRequest, sendMessage, stopTurn } from "./api.js";
+import { api, ApiError, dismissRequest, rewindTo, sendMessage, stopTurn } from "./api.js";
+import { rewindCount, rewindRefusal, rewoundBy, startsRewind } from "./rewind.js";
 import { useWeb } from "./use-web.js";
 import { createCompositionGuard } from "./compose-keys.js";
 import { Text } from "./markdown.js";
@@ -12,7 +13,7 @@ import { CompactButton } from "./compact-button.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
-import { ArrowDown, ArrowUp, ImagePlus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
+import { ArrowUp, ImagePlus, Sparkles, Square, Undo2, RotateCw, X, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
 import { Study } from "./study.js";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { ScreenWindow } from "./screen.js";
@@ -30,10 +31,11 @@ import { composerStatus, requestLabels, requestStamp, useCompletedSettle, type C
 import { ModelBadge } from "./model-badge.js";
 import { useRailWidth } from "./rail-width.js";
 import { AgentNameContext, agentNameOf } from "./agent-name.js";
-import { blockKey, interleave, jumpLabel, messageKey, pendingKey, type ToolBlock } from "./inline-tools.js";
+import { blockKey, interleave, messageKey, pendingKey, type ToolBlock } from "./inline-tools.js";
 import { useSessionTools } from "./use-session-tools.js";
-import { useJumpToLatest } from "./use-jump-to-latest.js";
-import { ToolCall, ToolGroup, ToolsUnreadableNote } from "./tool-calls.js";
+import { ChatRow, ChatScroller, type ChatScrollerHandle } from "./chat-scroller.js";
+import { chatRows, rowId } from "./chat-rows.js";
+import { ToolsUnreadableNote, TurnBlock } from "./tool-calls.js";
 import { useAttachments } from "./use-attachments.js";
 import { attachmentLabel, canSendWith, captureSend, dragHasFiles, imageFiles } from "./uploads.js";
 
@@ -97,17 +99,6 @@ function useStudyRoute(): [StudyPage | null, (page: StudyPage | null) => void, s
   return [page, (next) => { window.location.hash = next ? `study/${next}` : ""; if (!next) history.replaceState(null, "", window.location.pathname + window.location.search); setPage(next); setFocus(null); }, focus];
 }
 
-/** Floats above the composer when the reader is up in the history; fades out at the bottom. */
-function JumpToLatest({ visible, unseen, onJump }: { visible: boolean; unseen: number; onJump: () => void }) {
-  const motion = useMountedFor(visible, 180);
-  if (!motion.mounted) return null;
-  const label = jumpLabel(unseen);
-  return <button type="button" onClick={onJump} data-state={motion.shown ? "open" : "closed"} tabIndex={visible ? 0 : -1}
-    aria-label={label ? `${label}, jump to latest` : "Jump to latest"}
-    className="absolute bottom-3 left-1/2 z-10 flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border bg-card px-3 text-[12px] text-foreground shadow-md transition-[opacity,transform] duration-[180ms] ease-[var(--ease-soft)] hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none data-[state=closed]:pointer-events-none data-[state=closed]:translate-y-1 data-[state=closed]:opacity-0">
-    {label && <span aria-hidden="true">{label}</span>}<ArrowDown className="size-3.5" strokeWidth={2} aria-hidden="true" /></button>;
-}
-
 export function App() {
   const web = useWeb();
   const agent = agentNameOf(web.bootstrap?.agentName);
@@ -126,9 +117,7 @@ export function App() {
   const [historyStatus, setHistoryStatus] = useState("loading");
   const [reload, setReload] = useState(0);
   const historySession = useRef("");
-  const scroll = useRef<HTMLDivElement>(null);
-  const atBottom = useRef(true);
-  const restoreScroll = useRef<number | null>(null);
+  const scroller = useRef<ChatScrollerHandle>(null);
   const [draft, setDraft] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -170,7 +159,8 @@ export function App() {
   // A quoted message briefly highlights when its reply's quote is clicked.
   const [flashId, setFlashId] = useState<string>();
   const showMessage = (id: string) => {
-    document.getElementById(`msg-${id}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+    const message = history.messages.find((m) => m.id === id);
+    if (message) scroller.current?.scrollToRow(rowId(message));
     setFlashId(id);
     setTimeout(() => setFlashId((current) => (current === id ? undefined : current)), 1_600);
   };
@@ -225,7 +215,7 @@ export function App() {
     const controller = new AbortController();
     if (historySession.current !== selectedId) {
       historySession.current = selectedId;
-      setHistory({ messages: [], nextCursor: null }); setHistoryStatus("loading"); atBottom.current = true;
+      setHistory({ messages: [], nextCursor: null }); setHistoryStatus("loading");
     }
     void api<HistoryPage>(`/sessions/${selectedId}/messages`, { signal: controller.signal }).then((value) => {
       if (controller.signal.aborted) return;
@@ -261,6 +251,9 @@ export function App() {
     const { keys: sentKeys, ids: images } = captureSend(attachments.items);
     const requestId = crypto.randomUUID();
     setSending(true); setFeedback("Sending…"); remember(requestId);
+    // Sending is the reader's own move: their message anchors its turn wherever they were reading.
+    // Claimed before the request goes out: the live stream can show its bubble before the POST returns.
+    scroller.current?.claim(pendingKey({ requestId }));
     try {
       const request = await sendMessage({ requestId, targetId: session.id, text, ...(images.length ? { images } : {}) }, web.bootstrap, web.refreshBootstrap);
       if (images.length) { const taken = attachments.take(sentKeys); setSentImages((old) => ({ ...old, [requestId]: taken.map((item) => item.preview) })); }
@@ -271,7 +264,7 @@ export function App() {
       if (replaced) void dismiss(replaced, true);
       setResending(null);
       setDraft((old) => old.trim() === text ? "" : old);
-      setFeedback(""); remember(null); setReload((r) => r + 1); atBottom.current = true;
+      setFeedback(""); remember(null); setReload((r) => r + 1);
     } catch (err) {
       // Definite refusals the daemon names (nothing was accepted), not network uncertainty.
       const refusal = err instanceof ApiError && err.status === 503 ? refusalReasons[err.code] : undefined;
@@ -344,15 +337,13 @@ export function App() {
     try {
       const value = await api<HistoryPage>(`/sessions/${target}/messages?cursor=${encodeURIComponent(history.nextCursor)}`);
       if (historySession.current !== target) return;
-      const element = scroll.current;
-      if (element) restoreScroll.current = element.scrollHeight - element.scrollTop;
       setHistory((old) => ({ revision: value.revision, messages: [...value.messages.filter((m) => !old.messages.some((item) => item.id === m.id)), ...old.messages], nextCursor: value.nextCursor }));
       setHistoryStatus("ready");
     } catch (error) {
       if (historySession.current !== target) return;
       if (error instanceof ApiError && error.status === 409 && error.code === "history_changed") {
         setHistory({ messages: [], nextCursor: null }); setHistoryStatus("loading");
-        restoreScroll.current = null; atBottom.current = true; setReload((value) => value + 1);
+        setReload((value) => value + 1);
       } else setHistoryStatus("error");
     }
   };
@@ -370,12 +361,11 @@ export function App() {
   const timeline = interleave(history.messages, tools.items, history.nextCursor ? toolsSince ?? 0 : 0);
   const messageIndex = new Map(history.messages.map((m, i) => [m.id, i]));
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
-  const toolBlock = (block: ToolBlock, running: boolean) => <div key={block.key} className="mx-auto mb-4 max-w-[740px]">
-    {block.kind === "tool" ? <ToolCall row={block.row} running={running} />
-      : <ToolGroup tools={block.tools} running={running} open={openGroups[block.key] ?? false}
-        onOpenChange={(value) => setOpenGroups((old) => ({ ...old, [block.key]: value }))} />}</div>;
-  const jumper = useJumpToLatest(scroll, atBottom,
-    [...history.messages.map(messageKey), ...pendingUsers.map(pendingKey), ...blocks.map(blockKey)], selectedId, restoreScroll);
+  // A turn's step rows (calls, its todo list, its sources) sit close together; the last one keeps the gap before the next message.
+  const toolBlock = (block: ToolBlock, running: boolean) => <div key={block.key} data-slot="turn-block" className="mx-auto mb-4 max-w-[740px] has-[+[data-slot=turn-block]]:mb-0.5">
+    <TurnBlock block={block} running={running} choices={openGroups} onChoice={(key, value) => setOpenGroups((old) => ({ ...old, [key]: value }))} /></div>;
+  // Rows of the scroller (see chat-rows.ts); the running turn's calls and reply ride in the last one.
+  const rows = chatRows(timeline.entries, pendingUsers, timeline.trailing.length > 0 || blocks.length > 0);
   useEffect(() => { stamp.current = requestStamp(latest); });
   // The status line counts a running tool's seconds itself between the daemon's reports.
   const turn = web.turns[selectedId];
@@ -403,6 +393,24 @@ export function App() {
   // The SDK's predicted next message: offered only while the composer is empty and idle.
   const suggestion = session?.writable && !turnActive && !draft && !attachments.items.length && !resending && !uncertain ? web.suggestions[selectedId] : undefined;
   const model = web.models[selectedId];
+  // "Rewind to here" on one of the owner's own messages: the model's context
+  // goes back to before it; the history stays, shown as rewound.
+  const [confirmRewind, setConfirmRewind] = useState<string | null>(null);
+  const [rewinding, setRewinding] = useState(false);
+  const canRewind = !!session?.writable && !turnActive && web.connection === "live" && pendingUsers.length === 0 && !sending;
+  const rewind = async (message: HistoryPage["messages"][number], count: number) => {
+    if (!web.bootstrap || rewinding) return;
+    setRewinding(true);
+    try {
+      await rewindTo({ count, text: parseReply(message.content).body, from: message.timestamp }, web.bootstrap, web.refreshBootstrap);
+      setConfirmRewind(null);
+      // Edit and retry: the rewound message comes back to an empty composer.
+      setDraft((old) => old || parseReply(message.content).body);
+      setFeedback(`Rewound. ${agent} no longer has this message or what followed; edit it below and send to continue.`);
+      input.current?.focus();
+    } catch (error) { setConfirmRewind(null); setFeedback(rewindRefusal(error instanceof ApiError ? error.code : undefined)); }
+    finally { setRewinding(false); }
+  };
   const usage = session?.stats;
   const hasContext = !!usage?.contextMax;
   const sessions = web.bootstrap?.sessions ?? [];
@@ -495,27 +503,38 @@ export function App() {
           <span className="flex items-center gap-2"><ImagePlus className="size-5" strokeWidth={1.75} />Drop to attach</span></div>}
         {web.bootstrap?.setupRequired && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}
         {web.connection === "locked" && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Open the access link in Tomo's private <code>web-access.log</code> to connect. The link includes your private access token.</div>}
-        <div className="relative flex min-h-0 w-full flex-1 flex-col">
-        <div className="min-h-0 w-full flex-1 overflow-y-auto pt-2 pr-4 pb-6 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] max-[600px]:pr-2" ref={scroll} aria-label="Conversation history" tabIndex={0} onScroll={jumper.onScroll}>
+        {/* A conversation (and a rewritten history) opens afresh: at its last turn. */}
+        <ChatScroller key={`${selectedId}:${history.revision ?? ""}`} handle={scroller} busy={turnActive} lastRowId={rows.at(-1)?.id}
+          keys={[...history.messages.map(messageKey), ...pendingUsers.map(pendingKey), ...blocks.map(blockKey)]} top={<>
           {history.nextCursor && <Button variant="outline" size="sm" className="mx-auto mb-6 flex rounded-full text-xs" onClick={() => void older()} disabled={historyStatus === "loading-older"}>{historyStatus === "loading-older" ? "Loading…" : "Load earlier messages"}</Button>}
           {!tools.complete && <p className="mx-auto mb-4 max-w-[740px] text-center text-[11.5px] text-muted-foreground" role="note">Older tool calls not shown</p>}
           {tools.unreadable && <ToolsUnreadableNote />}
           {historyStatus === "error" && <div className={cn(notice, "mx-auto mb-4 flex max-w-[740px] items-center gap-3")} role="alert">History is unavailable. <Button variant="outline" size="sm" className="rounded-lg" onClick={() => setReload((r) => r + 1)}>Try again</Button></div>}
           {historyStatus === "loading" && selectedId && <p className="text-center text-sm text-muted-foreground" role="status">Opening your conversation…</p>}
           {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && pendingUsers.length === 0 && <div className="m-auto flex h-full min-h-56 max-w-md flex-col items-center justify-center pb-12 text-center"><Mark className="mb-4 size-16 stroke-[1.3]" /><h2 className="mt-2 mb-3 font-serif text-[28px] font-normal">Start wherever you are.</h2><p className="m-0 max-w-80 text-sm text-muted-foreground">{session?.kind === "group" ? "There are no recorded messages in this group yet." : "A question, a half-formed idea, or something on your mind."}</p></div>}
-          {timeline.entries.map((entry) => { if (entry.kind === "tools") return toolBlock(entry.block, false);
-            const message = entry.message; const index = messageIndex.get(message.id)!;
+          </>}>
+          {rows.map((row, rowIndex) => <ChatRow key={row.id} row={row}>{row.kind === "message" && <>{row.tools.map((block) => toolBlock(block, false))}{(() => {
+            const message = row.message; const index = messageIndex.get(message.id)!;
             const { reply, body } = parseReply(message.content); const quoted = reply && findQuoted(history.messages, index, reply);
-            return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
+            const rewound = rewoundBy(web.rewinds, selectedId, message.timestamp); const back = canRewind && !rewound ? rewindCount(history.messages, index) : null;
+            return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", "group/message", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
+            {startsRewind(web.rewinds, selectedId, history.messages, index) && <div role="separator" className="mb-5 flex items-center gap-3 tracking-[0.02em] text-[11px] text-muted-foreground">
+              <span className="h-px flex-1 bg-border" /><Undo2 className="size-3" strokeWidth={1.75} aria-hidden="true" /><span>Rewound from here · no longer in {agent}'s context</span><span className="h-px flex-1 bg-border" /></div>}
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
-              {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
-            <div className={cn("markdown", message.role === "user" && "rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5", message.role === "assistant" && "reading")}>
+              {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}
+              {back !== null && <button type="button" onClick={() => setConfirmRewind(confirmRewind === message.id ? null : message.id)} title="Rewind to before this message" aria-label="Rewind the conversation to before this message" aria-expanded={confirmRewind === message.id}
+                className="ml-auto grid size-6 place-items-center self-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-foreground/[0.07] hover:text-foreground focus-visible:opacity-100 group-hover/message:opacity-100 aria-expanded:opacity-100 [@media(hover:none)]:opacity-70"><Undo2 className="size-3.5" strokeWidth={1.75} /></button>}</div>
+            <div className={cn("markdown", message.role === "user" && "rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5", message.role === "assistant" && "reading", rewound && "opacity-55")}>
               {message.role === "assistant" && body.trim() === "NO_REPLY"
                 // A turn that ended without a reply (silent by choice, or stopped): said plainly, not as the agent's words.
                 ? <p className="m-0 font-sans text-[12.5px] text-muted-foreground">No reply</p>
                 : <MessageBody body={body} reply={reply} sessionId={selectedId} onQuote={quoted ? () => showMessage(quoted.id) : undefined} thinking={message.role === "assistant" ? "joined" : undefined} />}</div>
-            {message.role === "user" && interruptedActions(web.requests.find((r) => r.requestId === message.requestId && awaitingOwner(r)))}</article>; })}
-          {pendingUsers.map((request) => <article className="message user motion-enter mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
+            {back !== null && confirmRewind === message.id && <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground motion-enter" role="group" aria-label="Confirm rewind">
+              <span>Rewind to before this message? {agent} forgets it{back > 1 ? ` and everything after it (${back} of your messages)` : " and its reply"}. The history stays here; actions already taken are not undone.</span>
+              <Button variant="outline" size="sm" className="h-7 rounded-lg text-xs" disabled={rewinding} aria-busy={rewinding} onClick={() => void rewind(message, back)}>Rewind</Button>
+              <Button variant="ghost" size="sm" className="h-7 rounded-lg text-xs" onClick={() => setConfirmRewind(null)}>Cancel</Button></div>}
+            {message.role === "user" && interruptedActions(web.requests.find((r) => r.requestId === message.requestId && awaitingOwner(r)))}</article>; })()}</>}
+          {row.kind === "pending" && ((request: WebRequest) => <article className="message user motion-enter mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">You</span><span>Web</span>
               <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{pendingLabel(request)}</Badge></div>
             {!sentImages[request.requestId] && request.images?.length ? <div className="mb-2 opacity-80"><MessageBody sessionId={selectedId}
@@ -523,12 +542,12 @@ export function App() {
             {sentImages[request.requestId] && <div className="mb-2 flex flex-wrap gap-2 opacity-80">{sentImages[request.requestId].map((src, i) =>
               <img key={i} src={src} alt="Image" className="block max-h-[280px] max-w-[280px] rounded-xl border object-contain" />)}</div>}
             {request.text && <div className="markdown rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80"><Text breaks>{request.text}</Text></div>}
-            {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)}
-          {timeline.trailing.map((block, i) => toolBlock(block, turnActive && i === timeline.trailing.length - 1))}
+            {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)(row.request)}
+          {rowIndex === rows.length - 1 && <>
+          {timeline.trailing.map((block) => toolBlock(block, turnActive))}
           {blocks.map((block) => <article className="message assistant motion-enter mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{agent}</span><span>Reply in progress</span></div><div className="markdown reading"><MessageBody body={[block.text, ...(block.images ?? []).map((id) => `MEDIA:web:${id}`)].filter(Boolean).join("\n")} sessionId={selectedId} thinking="block" /></div></article>)}
-        </div>
-        <JumpToLatest visible={jumper.visible} unseen={jumper.unseen} onJump={jumper.jump} />
-        </div>
+          </>}</ChatRow>)}
+        </ChatScroller>
         <div className="mx-auto w-full max-w-[740px]"><div className="flex min-h-7 items-baseline gap-3 pb-2">
           <div className={cn("feedback min-w-0 flex-1 tracking-[0.02em] text-xs leading-normal text-muted-foreground tabular-nums transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0")} role="status" aria-live="polite">{composerStatus({ activity: web.activity[selectedId], note, latest, settled: settle.settled, agent, turn, now })}</div>
           {model && <a href="#study/model" title={`Model: ${model}`} aria-label={`Model: ${model}. Open model settings`} className="shrink-0 rounded-md no-underline opacity-80 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"><ModelBadge model={model} className="ml-0 h-[18px] px-1.5 text-[10.5px]" /></a>}</div>

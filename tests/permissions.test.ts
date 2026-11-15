@@ -1265,6 +1265,22 @@ describe("isPrivateMemoryAccess — Bash exfiltration shapes", () => {
     expect(isPrivateMemoryAccess("Bash", { command: "cat skills/tool?.md" }, ctx)).toBe(false);
   });
 
+  it("judges a glob by the names it can match, not by its literal prefix", () => {
+    // A bare `*` with a suffix can only expand to names with that suffix:
+    // never `memory` or `private`.
+    for (const cmd of [
+      "grep -n x *.d.ts",
+      'cd ~/Developer/tomo/node_modules/@anthropic-ai/claude-agent-sdk && grep -n -i -E "automemory|auto_memory|AUTO_MEMORY|autoMemoryDirectory" *.d.ts | head -15 | cut -c1-220',
+      "ls *.md",
+      "cat notes/[!mp]*.txt",
+      "cat mem*x/a.md",
+    ]) expect(isPrivateMemoryAccess("Bash", { command: cmd }, ctx), cmd).toBe(false);
+    // …and still denies every glob that can name either directory.
+    for (const cmd of ["cat *", "cat */x.md", "cat *ory/x.md", "cat ?rivate/x", "cat [mM]emory/x", "cat [!x]emory/x", "cat *E*/x", "cat {a,b}.md"]) {
+      expect(isPrivateMemoryAccess("Bash", { command: cmd }, ctx), cmd).toBe(true);
+    }
+  });
+
   it("allows non-recursive grep", () => {
     for (const cmd of [
       "grep needle notes.txt",

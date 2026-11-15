@@ -312,19 +312,41 @@ const GLOB_META = /[*?[{]/;
 /**
  * Could this token's glob expand into `memory` or `private`?
  *
- * Per SEGMENT, on the literal text before the first metacharacter: `mem*`
- * yields "mem" (a prefix of "memory" → deny), `sk*` yields "sk" (a prefix of
- * neither → allow), and `*.md` yields "" — a prefix of everything, which is
- * why any bare glob is denied. That last case is intentional over-matching:
- * a shell glob's expansion is not knowable here, and `cat *` is exactly as
- * dangerous as `cat memory/private/*`.
+ * Per SEGMENT, by where the expansion can actually land: a glob segment only
+ * ever expands to directory entries whose NAME it matches, so it reaches the
+ * memory tree only if it can match the name `memory` or `private` itself.
+ * `mem*`, `*`, `m?mory` and `priv[a]te` can (deny); `sk*`, `*.md` and
+ * `*.d.ts` cannot (allow) — `cd node_modules/x && grep foo *.d.ts` was judged
+ * private only because its bare `*` had an empty literal prefix. A `{` is
+ * always denied: brace expansion fires whatever is on disk.
  */
 function globCouldExpandToMemory(token: string): boolean {
   if (!GLOB_META.test(token)) return false;
   return token.split(/[/\\]/).some((segment) => {
-    const meta = GLOB_META.exec(segment);
-    if (!meta) return false;
-    const literalPrefix = segment.slice(0, meta.index).toLowerCase();
-    return "memory".startsWith(literalPrefix) || "private".startsWith(literalPrefix);
+    if (!GLOB_META.test(segment)) return false;
+    if (segment.includes("{")) return true;
+    const name = segmentGlobRegExp(segment);
+    return !name || name.test("memory") || name.test("private");
   });
+}
+
+/** One path segment's glob (`*`, `?`, `[…]`) as an anchored, case-insensitive
+ *  name matcher; undefined when it cannot be read (judged as reaching). */
+function segmentGlobRegExp(segment: string): RegExp | undefined {
+  let out = "";
+  for (let i = 0; i < segment.length; i++) {
+    const c = segment[i];
+    if (c === "*") out += "[^/]*";
+    else if (c === "?") out += "[^/]";
+    else if (c === "[") {
+      const close = segment.indexOf("]", i + 2);
+      if (close < 0) { out += "\\["; continue; }
+      let body = segment.slice(i + 1, close);
+      const negated = body[0] === "!" || body[0] === "^";
+      if (negated) body = body.slice(1);
+      out += `[${negated ? "^" : ""}${body.replace(/[\\\]^]/g, "\\$&")}]`;
+      i = close;
+    } else out += c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  try { return new RegExp(`^${out}$`, "i"); } catch { return undefined; }
 }

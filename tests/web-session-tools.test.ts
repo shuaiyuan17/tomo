@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PRIVATE_HIDDEN, readSessionTools, SessionToolsError, transcriptToken, UNPAIRED_HIDDEN } from "../src/web/session-tools.js";
 import { redactText, redactToolInput } from "../src/web/redact-command.js";
+import { SessionStore } from "../src/sessions/store.js";
+import { WebData } from "../src/web/data.js";
+import { webSessionId } from "../src/web/owner.js";
 
 let root: string;
 const SDK = "sdk-main-1";
@@ -148,5 +151,57 @@ describe("a file tool aimed at memory/private shows only its name and redacted p
     expect(edit && "input" in edit && JSON.parse(edit.input)).toEqual({ file_path: "<private>" });
     // A public edit keeps its body.
     expect(text).toContain("public new");
+  });
+});
+
+describe("the owner's DM shows its calls whole; a group keeps the withholding", () => {
+  const ws = () => join(root, "ws");
+  const privateCalls = () => call("p1", "Read", { file_path: join(ws(), "memory", "private", "diary.md") }, "DEAR DIARY the owner's text", 1_000)
+    + call("b1", "Bash", { command: "cat memory/private/x.md" }, "TOP SECRET", 2_000);
+  it("owner: a Read or a Bash into memory/private returns its output as it is", async () => {
+    writeFileSync(file(), privateCalls());
+    const page = await readSessionTools(root, SDK, { from: 0 }, { workspaceDir: ws(), owner: true });
+    const by = (id: string) => page.items.find((i) => i.kind === "result" && i.toolUseId === id);
+    expect(by("p1")).toMatchObject({ output: "DEAR DIARY the owner's text" });
+    expect(by("b1")).toMatchObject({ output: "TOP SECRET" });
+    expect(JSON.stringify(page)).not.toContain(PRIVATE_HIDDEN);
+    expect(JSON.stringify(page)).not.toContain("privateOutput");
+  });
+  it("group: the same calls are still withheld", async () => {
+    writeFileSync(file(), privateCalls());
+    const text = JSON.stringify(await readSessionTools(root, SDK, { from: 0 }, { workspaceDir: ws() }));
+    expect(text).not.toMatch(/DEAR DIARY|TOP SECRET/);
+    expect(text).toContain(PRIVATE_HIDDEN);
+  });
+  it("owner: an `after` read shows a result whose call is out of view", async () => {
+    writeFileSync(file(), line("assistant", 1_000, [{ type: "tool_use", id: "o1", name: "Read", input: { file_path: "/tmp/ok" } }]));
+    const first = await readSessionTools(root, SDK, { from: 0 }, { workspaceDir: ws(), owner: true });
+    appendFileSync(file(), line("user", 2_000, [{ type: "tool_result", tool_use_id: "ghost", content: "ORPHAN BODY" }]));
+    const next = await readSessionTools(root, SDK, { after: first.end, transcript: first.transcript }, { workspaceDir: ws(), owner: true });
+    expect(next.items.find((i) => i.kind === "result" && i.toolUseId === "ghost")).toMatchObject({ output: "ORPHAN BODY" });
+  });
+  it("group: a grep of SDK type files over `*.d.ts` is not judged private (its glob cannot name memory/ or private/)", async () => {
+    const command = 'cd ~/Developer/tomo/node_modules/@anthropic-ai/claude-agent-sdk && grep -n -i -E "automemory|auto_memory|AUTO_MEMORY|autoMemoryDirectory" *.d.ts | head -15 | cut -c1-220; grep -n "SDK_SETTING_SOURCES" -A2 sdk.d.ts | head -6';
+    writeFileSync(file(), call("g1", "Bash", { command }, "sdk.d.ts:42:  autoMemoryDirectory?: string;", 1_000));
+    const page = await readSessionTools(root, SDK, { from: 0 }, { workspaceDir: ws() });
+    expect(page.items.find((i) => i.kind === "result" && i.toolUseId === "g1")).toMatchObject({ output: "sdk.d.ts:42:  autoMemoryDirectory?: string;" });
+  });
+});
+
+describe("WebData.tools: which conversation is the owner's", () => {
+  it("the owner's DM gets the private output; a group's view of the same call stays withheld", async () => {
+    const ws = join(root, "ws");
+    const dirs = { sessionsDir: join(root, "sessions"), sdkSessionsDir: root, workspaceDir: ws };
+    const store = new SessionStore(dirs.sessionsDir, 20, dirs.sdkSessionsDir);
+    const group = "telegram:-100123";
+    store.setSdkSessionId("dm:owner", "sdk-owner");
+    store.setSdkSessionId(group, "sdk-group");
+    const body = call("p1", "Read", { file_path: join(ws, "memory", "private", "diary.md") }, "DEAR DIARY", 1_000);
+    writeFileSync(join(root, "sdk-owner.jsonl"), body);
+    writeFileSync(join(root, "sdk-group.jsonl"), body);
+    const data = new WebData({ ...dirs, owner: { name: "owner", telegram: ["1"], imessage: [] } });
+    const result = async (id: string) => (await data.tools(id, { from: 0 })).items.find((i) => i.kind === "result");
+    expect(await result(webSessionId("dm:owner"))).toMatchObject({ output: "DEAR DIARY" });
+    expect(await result(webSessionId(group))).toMatchObject({ output: PRIVATE_HIDDEN });
   });
 });

@@ -1235,3 +1235,28 @@ it("own bubbles fit their content (85% cap) and show ✓ sent, then ✓✓ read 
   await browserExpect(longOwn.locator(".read-receipt")).toHaveAttribute("data-receipt", "read");
   await browserExpect.poll(async () => { const m = await measure(longOwn); return m.bubble <= m.column * 0.85 + 1 && m.bubble > m.column * 0.8; }).toBe(true);
 });
+
+it("a foldable held open (wide, touch, not tall): the sidebar stays, the header is the phone's compact bar; desktop keeps its tall one", async () => {
+  const token = readFileSync(resolve(mockConfig.tomoHome, "web-token"), "utf8").trim();
+  const duo = await browser.newPage({ viewport: { width: 1000, height: 700 }, hasTouch: true, isMobile: true });
+  await duo.goto(`${url}/?t=${token}`);
+  await browserExpect(duo.getByRole("textbox", { name: "Message Tomo" })).toBeEnabled();
+  const header = (await duo.locator("header").boundingBox())!;
+  expect(header.height).toBeLessThanOrEqual(56);
+  await browserExpect(duo.locator("#sidebar")).toBeVisible();
+  expect((await duo.locator("#sidebar").boundingBox())!.x).toBe(0);
+  await browserExpect(duo.getByRole("button", { name: /^Menu/ })).toBeHidden();
+  // Nothing in the header is lost: the page title, Tasks, the connection.
+  await browserExpect(duo.locator("header").getByText("Conversation", { exact: true })).toBeVisible();
+  await browserExpect(duo.locator("header").getByRole("status")).toContainText("Connected");
+  // The Tasks overlay and its backdrop start right under the compact header.
+  await duo.getByRole("button", { name: /^Tasks/ }).click();
+  await browserExpect(duo.locator("#tasks-rail")).toBeVisible();
+  await duo.waitForTimeout(300);
+  // (as on a phone: it starts at 3rem and covers the header's 1px bottom border)
+  expect(Math.abs((await duo.locator("#tasks-rail").boundingBox())!.y - (header.y + header.height))).toBeLessThanOrEqual(1);
+  await duo.close();
+
+  // Desktop (the suite's 1440 x 900 page): the tall header as before.
+  expect((await page.locator("header").boundingBox())!.height).toBeGreaterThanOrEqual(72);
+});

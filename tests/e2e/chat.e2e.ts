@@ -81,6 +81,18 @@ it("refreshes bootstrap after a definite CSRF rejection and retries the same req
   expect(mockSdk.promptsBySession).toHaveLength(1);
 });
 
+it("one composer status follows a request to the end, then clears", async () => {
+  mockSdk.responseFn = () => "Done.";
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("status check");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "Done." }).first()).toBeVisible();
+  const status = page.locator(".feedback");
+  await browserExpect(status).toHaveCount(1);
+  await browserExpect(status).toHaveText("Completed");
+  await browserExpect(page.getByText("Tomo is working…")).toHaveCount(0);
+  await browserExpect(status).toHaveText("", { timeout: 5_000 });
+});
+
 it("explains oversized requests and preserves the draft", async () => {
   await page.route("**/api/v1/messages", (route) => route.fulfill({ status: 413, contentType: "application/json", body: '{"error":"body_too_large"}' }));
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("Keep this draft");

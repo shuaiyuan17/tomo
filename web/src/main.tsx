@@ -26,11 +26,9 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
+import { composerStatus, REQUEST_LABELS, useCompletedSettle } from "./composer-status.js";
 
-const labels: Record<WebRequest["state"], string> = { queued: "Queued", running: "Tomo is working…", completed: "Completed",
-  failed: "Delivery failed — check the conversation before sending again", refused: "Message was not accepted",
-  unknown: "Outcome unknown — Tomo may already have acted on it. Check the conversation before sending again",
-  interrupted: "Interrupted by a restart and not answered — Tomo may have started on it. Check before sending again" };
+const labels = REQUEST_LABELS;
 type Theme = "system" | "light" | "dark";
 /** 503s that mean "not accepted, and why" — the draft stays, nothing ran. */
 const refusalReasons: Record<string, string> = {
@@ -228,7 +226,7 @@ export function App() {
       if (replaced) void dismiss(replaced, true);
       setResending(null);
       setDraft((old) => old.trim() === text ? "" : old);
-      setFeedback(labels[request.state]); remember(null); setReload((r) => r + 1); atBottom.current = true;
+      setFeedback(""); remember(null); setReload((r) => r + 1); atBottom.current = true;
     } catch (err) {
       // Definite refusals the daemon names (nothing was accepted), not network uncertainty.
       const refusal = err instanceof ApiError && err.status === 503 ? refusalReasons[err.code] : undefined;
@@ -297,6 +295,7 @@ export function App() {
   const blocks = web.blocks.filter((b) => b.sessionId === selectedId && !durable.has(b.turnId ?? b.requestId));
   const pendingUsers = pendingUserMessages(web.requests, history, selectedId);
   const latest = web.requests.filter((r) => r.sessionId === selectedId).at(-1);
+  const settle = useCompletedSettle(latest);
   const usage = session?.stats;
   const hasContext = !!usage?.contextMax;
   const sessions = web.bootstrap?.sessions ?? [];
@@ -406,7 +405,7 @@ export function App() {
             {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)}
           {blocks.map((block) => <article className="message assistant motion-enter mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">Tomo</span><span>Reply in progress</span></div><div className="markdown reading"><Text breaks>{block.text}</Text></div></article>)}
         </div>
-        <div className="mx-auto w-full max-w-[740px]"><div className="min-h-7 pb-2 tracking-[0.02em] text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]" role="status" aria-live="polite">{web.activity[selectedId] || (latest && labels[latest.state]) || feedback}</div>
+        <div className="mx-auto w-full max-w-[740px]"><div className={cn("feedback min-h-7 pb-2 tracking-[0.02em] text-xs leading-normal text-muted-foreground transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0")} role="status" aria-live="polite">{composerStatus({ activity: web.activity[selectedId], feedback, latest, settled: settle.settled })}</div>
           {resending && <div className="mb-2 flex items-center gap-2 tracking-[0.02em] text-[11px] text-muted-foreground">
             <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Resending an interrupted message</Badge>
             <span>The original is dismissed once this one is accepted.</span>
@@ -421,7 +420,6 @@ export function App() {
               className="size-9 shrink-0 rounded-full transition-[background-color,transform] hover:bg-primary/85 active:scale-[0.94] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100 [&_svg:not([class*='size-'])]:size-[18px]"
               disabled={!session?.writable || !draft.trim() || sending || !!uncertain || web.connection !== "live"}><ArrowUp strokeWidth={2.2} /></Button>
           </form>
-          {feedback && <p className="feedback mt-2 text-xs text-muted-foreground" role="status">{feedback}</p>}
           {uncertain && !sending && <div className="mt-2 flex flex-wrap gap-2"><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => void checkOutcome()}>Check message status</Button><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { remember(null); setFeedback("Draft kept. Review the conversation before sending it again."); }}>Keep draft for review</Button></div>}
         </div>
       </main>

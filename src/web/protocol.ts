@@ -62,19 +62,25 @@ export type SubagentItem =
   | { kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean; ts?: number;
     /** Server-side only (session-tools.ts): the call reached memory/private, so its output is withheld. Never sent. */
     privateOutput?: boolean }
-  | { kind: "result"; id: string; toolUseId: string; output: string; truncated: boolean; isError: boolean }
+  /** `images`: image blocks in the output, counted and never served (the view shows a chip). */
+  | { kind: "result"; id: string; toolUseId: string; output: string; truncated: boolean; isError: boolean; images?: number }
   /** A message sent to the subagent while it ran (not its first prompt, which is the brief). */
-  | { kind: "message"; id: string; text: string; truncated: boolean; ts?: number };
+  | { kind: "message"; id: string; text: string; truncated: boolean; ts?: number }
+  /** A subagent's (non-empty) thinking block, clipped like text; shown folded. Never in the main chat's tool items. */
+  | { kind: "thinking"; id: string; text: string; truncated: boolean; ts?: number };
 /** The prompt the subagent was given: the first entry of its transcript. */
 export interface SubagentBrief { text: string; truncated: boolean }
 /** A byte window of complete transcript lines: page back with `before=start`, tail with `after=end`. */
-export interface SubagentPage { items: SubagentItem[]; start: number; end: number; size: number; hasEarlier: boolean }
+/** `unreadable`: lines in this window the reader did not recognise (sdk-transcript.ts); the view says some entries could not be read. */
+export interface SubagentPage { items: SubagentItem[]; start: number; end: number; size: number; hasEarlier: boolean; unreadable?: number }
 /**
  * The tool calls of a conversation's current SDK transcript, for the chat to
  * show inline. `end`: read on with `after=end&transcript=…`; `complete`: the
  * scan reached the requested time (or the transcript's start).
  */
-export interface SessionTools { items: SubagentItem[]; end: number; transcript: string; complete: boolean }
+export interface SessionTools { items: SubagentItem[]; end: number; transcript: string; complete: boolean;
+  /** Lines read for this answer that the reader did not recognise. */
+  unreadable?: number }
 /** The end of a shell/Monitor task's output (SDK `get_task_output`: at most the last 8 KiB). */
 export interface TaskOutput { output: string; size: number }
 /** One subscription usage window for the Plan usage card. */

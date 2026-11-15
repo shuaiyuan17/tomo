@@ -9,7 +9,7 @@ import { CommandBrief, ShellPill } from "./shell-pill.js";
 import { isShellTask } from "./shell.js";
 import { Button } from "@/components/ui/button";
 import { Terminal } from "@/components/ai/terminal";
-import { ToolCall, ToolGroup } from "./tool-calls.js";
+import { Thinking, ToolCall, ToolGroup, UnreadableNote } from "./tool-calls.js";
 import { followStep, groupOpen, groupRows, INITIAL_TRANSCRIPT, isOutputTask, POLL_MS, transcriptReducer, viewRows,
   type TranscriptAction } from "./subagent.js";
 import { STATE_LABELS, taskKind } from "./tasks.js";
@@ -147,6 +147,7 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
     className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-2.5 pl-1 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]">
     {gone && <p role="status" className="m-0 mb-2 rounded-lg bg-muted/70 px-2.5 py-2 text-[12px] text-muted-foreground">This task has left the panel, so nothing more can be loaded. What was read stays here.</p>}
     {!gone && state.hasEarlier && <Button variant="outline" size="sm" className="mx-auto mb-2 flex h-7 rounded-full text-[11px]" disabled={loadingOlder} onClick={() => void older()}>{loadingOlder ? "Loading…" : "Load earlier"}</Button>}
+    {state.unreadable && <UnreadableNote className="mb-2 px-1.5" />}
     {(state.status === "loading" || state.status === "missing" || state.status === "error") && !state.items.length && <Note status={state.status} />}
     {state.status === "ready" && rows.length === 0 && <p className="m-0 px-1.5 text-[13px] text-muted-foreground">{running ? "Nothing yet." : "No recorded steps."}</p>}
     {blocks.map((block, index) => {
@@ -155,8 +156,9 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
       if (block.kind === "message") return <div key={block.row.id} className="my-1.5 rounded-xl bg-muted px-3 py-2">
         <p className="m-0 mb-0.5 text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">Message from {agent}</p>
         <div className="markdown text-[13px]! leading-relaxed"><Text>{block.row.text + (block.row.truncated ? "\n\n…" : "")}</Text></div></div>;
+      if (block.kind === "thinking") return <Thinking key={block.row.id} text={block.row.text} truncated={block.row.truncated} />;
       if (block.kind === "tool") return <ToolCall key={block.row.id} row={block.row} running={running} />;
-      return <ToolGroup key={block.key} tools={block.tools} running={running && last} open={groupOpen(openGroups, block.key)}
+      return <ToolGroup key={block.key} tools={block.tools} steps={block.steps} running={running && last} open={groupOpen(openGroups, block.key)}
         onOpenChange={(value) => setOpenGroups((old) => ({ ...old, [block.key]: value }))} />;
     })}
     {!gone && state.mode === "browse" && <Button variant="secondary" size="sm" onClick={jump}

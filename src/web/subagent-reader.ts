@@ -1,14 +1,19 @@
 import { constants } from "node:fs";
 import { open, realpath, type FileHandle } from "node:fs/promises";
-import { join, sep } from "node:path";
+import { sep } from "node:path";
 import { scrubSecretValues } from "../redact.js";
 import { summarizeToolInput } from "../agent/tool-summary.js";
 import type { SubagentBrief, SubagentItem, SubagentPage } from "./protocol.js";
+import { mayBeAssistant, metaModels, parseEntry, reportUnreadable, subagentMetaFile, subagentTranscriptFile,
+  type Block, type Entry, type Problem, type ResultPart } from "./sdk-transcript.js";
 
 /**
  * Bounded, read-only pages over one subagent's transcript
  * (`<sdkSessionsDir>/<sdkSessionId>/subagents/agent-<taskId>.jsonl`, the
  * layout `listSubagents` documents; a local_agent's task_id is its agentId).
+ * What the SDK's records look like is known only to sdk-transcript.ts (which
+ * also says why this is not the SDK's own reader); this module turns its
+ * normalised entries into clipped, scrubbed view items.
  *
  * Pages are byte windows over complete JSONL lines, so they are cheap to
  * page backwards ("load earlier") and to tail (`after` = the previous
@@ -27,16 +32,14 @@ export const BRIEF_LIMIT = 12_000;
 export const MAX_PAGE_ITEMS = 400;
 /** Blocks shown from one transcript entry; the rest is summarised by a marker. */
 export const MAX_LINE_ITEMS = 400;
-const TASK_ID = /^[A-Za-z0-9_-]{1,64}$/;
-const SDK_SESSION_ID = /^[A-Za-z0-9-]{1,80}$/;
-
 export class SubagentReadError extends Error {
   constructor(readonly code: "invalid_cursor" | "transcript_not_found" | "transcript_reset") { super(code); }
 }
 
 export function subagentTranscriptPath(sdkSessionsDir: string, sdkSessionId: string, taskId: string): string {
-  if (!SDK_SESSION_ID.test(sdkSessionId) || !TASK_ID.test(taskId)) throw new SubagentReadError("transcript_not_found");
-  return join(sdkSessionsDir, sdkSessionId, "subagents", `agent-${taskId}.jsonl`);
+  const path = subagentTranscriptFile(sdkSessionsDir, sdkSessionId, taskId);
+  if (!path) throw new SubagentReadError("transcript_not_found");
+  return path;
 }
 
 const clip = (text: string, limit: number) => {
@@ -44,49 +47,42 @@ const clip = (text: string, limit: number) => {
   return scrubbed.length > limit ? { text: scrubbed.slice(0, limit), truncated: true } : { text: scrubbed, truncated: false };
 };
 
-function resultText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content.map((block) => {
-    if (block && typeof block === "object") {
-      const b = block as { type?: string; text?: unknown };
-      if (typeof b.text === "string") return b.text;
-      if (b.type) return `[${b.type}]`;
-    }
-    return "";
-  }).join("\n");
+/** A tool result's text (other non-text parts by their type, as `[document]`); images are counted, never written. */
+function resultText(parts: ResultPart[]): { text: string; images: number } {
+  const images = parts.filter((part) => part.type === "image").length;
+  const text = parts.flatMap((part) => part.type === "text" ? [part.text] : part.type === "other" ? [`[${part.name}]`] : []).join("\n");
+  return { text, images };
 }
 
-/** Turn one transcript line into view items. Unknown shapes yield nothing. */
+/** Turn one transcript line into view items. Unknown shapes yield nothing (readLine also says what was not read). */
 export function itemsFromLine(line: string, offset: number, redact?: ToolRedaction): SubagentItem[] {
-  let record: { type?: string; message?: { content?: unknown }; timestamp?: string; attachment?: { type?: unknown; prompt?: unknown } };
-  try { record = JSON.parse(line); } catch { return []; }
-  // A message sent while the subagent was busy is first written as a
-  // `queued_command` attachment; the SDK later folds it into the next API
-  // request (an `api-request-blob` entry, the API's own copy — never shown,
-  // so it is not shown twice).
-  if (record?.type === "attachment") {
-    const attachment = record.attachment;
-    if (attachment?.type !== "queued_command" || typeof attachment.prompt !== "string" || !attachment.prompt.trim()) return [];
-    const { text, truncated } = clip(attachment.prompt, TEXT_LIMIT);
-    const ts = typeof record.timestamp === "string" ? Date.parse(record.timestamp) || undefined : undefined;
-    return [{ kind: "message", id: `${offset}:queued`, text, truncated, ...(ts ? { ts } : {}) }];
+  return readLine(line, offset, redact).items;
+}
+
+/** One line's items, and what in it the parser did not recognise (sdk-transcript.ts). */
+export function readLine(line: string, offset: number, redact?: ToolRedaction): { items: SubagentItem[]; problems: Problem[] } {
+  const { entry, problems } = parseEntry(line);
+  return { items: itemsFromEntry(entry, offset, redact), problems };
+}
+
+function itemsFromEntry(entry: Entry, offset: number, redact?: ToolRedaction): SubagentItem[] {
+  if (entry.kind === "queued") {
+    const { text, truncated } = clip(entry.prompt, TEXT_LIMIT);
+    return [{ kind: "message", id: `${offset}:queued`, text, truncated, ...(entry.ts ? { ts: entry.ts } : {}) }];
   }
-  if (record?.type !== "user" && record?.type !== "assistant") return [];
-  const content = record?.message?.content;
+  if (entry.kind !== "message") return [];
   // A user entry with text is a message to the subagent. The very first entry
   // is its brief (served separately), so it is never repeated here.
-  if (record?.type === "user" && offset > 0) {
-    const said = userText(content);
+  if (entry.role === "user" && offset > 0) {
+    const said = userText(entry.content);
     if (said.trim()) {
       const { text, truncated } = clip(said, TEXT_LIMIT);
-      const ts = typeof record.timestamp === "string" ? Date.parse(record.timestamp) || undefined : undefined;
-      return [{ kind: "message", id: `${offset}:msg`, text, truncated, ...(ts ? { ts } : {}) },
-        ...(Array.isArray(content) ? itemsFromBlocks(record, content, offset, redact) : [])];
+      return [{ kind: "message", id: `${offset}:msg`, text, truncated, ...(entry.ts ? { ts: entry.ts } : {}) },
+        ...(Array.isArray(entry.content) ? itemsFromBlocks(entry, entry.content, offset, redact) : [])];
     }
   }
-  if (!Array.isArray(content)) return [];
-  return itemsFromBlocks(record, content, offset, redact);
+  if (typeof entry.content === "string") return [];
+  return itemsFromBlocks(entry, entry.content, offset, redact);
 }
 
 /** Optional server-side masking of tool inputs and outputs (the main chat applies #492's redaction). */
@@ -99,38 +95,40 @@ export interface ToolRedaction {
 }
 
 /** The text a user entry carries: a string, or its text blocks (tool results are not text). */
-function userText(content: unknown): string {
+function userText(content: string | Block[]): string {
   if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
-  return content.filter((b): b is { type: string; text: string } => !!b && typeof b === "object" && (b as { type?: unknown }).type === "text"
-    && typeof (b as { text?: unknown }).text === "string")
+  return content.flatMap((b) => b.type === "text" ? [b.text] : [])
     // Harness reminders ride along on user entries; they are not messages.
-    .map((b) => b.text).filter((t) => !t.trimStart().startsWith("<system-reminder>")).join("\n\n");
+    .filter((t) => !t.trimStart().startsWith("<system-reminder>")).join("\n\n");
 }
 
-function itemsFromBlocks(record: { type?: string; timestamp?: string }, content: unknown[], offset: number, redact?: ToolRedaction): SubagentItem[] {
-  const ts = typeof record.timestamp === "string" ? Date.parse(record.timestamp) || undefined : undefined;
+function itemsFromBlocks(entry: Extract<Entry, { kind: "message" }>, content: Block[], offset: number, redact?: ToolRedaction): SubagentItem[] {
+  const ts = entry.ts;
   const items: SubagentItem[] = [];
   // One entry is always returned whole (pages never split a line); an entry
   // with more blocks than the cap says how many were left out.
   const hidden = Math.max(0, content.length - MAX_LINE_ITEMS);
-  content.slice(0, MAX_LINE_ITEMS).forEach((block: unknown, index: number) => {
-    if (!block || typeof block !== "object") return;
-    const b = block as Record<string, unknown>;
+  content.slice(0, MAX_LINE_ITEMS).forEach((b, index) => {
     const id = `${offset}:${index}`;
-    if (record.type === "assistant" && b.type === "text" && typeof b.text === "string" && b.text.trim()) {
+    if (entry.role === "assistant" && b.type === "text" && b.text.trim()) {
       const { text, truncated } = clip(b.text, TEXT_LIMIT);
       items.push({ kind: "text", id, text, truncated, ...(ts ? { ts } : {}) });
-    } else if (record.type === "assistant" && b.type === "tool_use" && typeof b.name === "string") {
-      const raw = (b.input && typeof b.input === "object" ? b.input : {}) as Record<string, unknown>;
+    } else if (entry.role === "assistant" && b.type === "thinking" && b.text.trim()) {
+      // Empty thinking (display "omitted": a signature-only block) and redacted thinking show nothing.
+      const { text, truncated } = clip(b.text, TEXT_LIMIT);
+      items.push({ kind: "thinking", id, text, truncated, ...(ts ? { ts } : {}) });
+    } else if (entry.role === "assistant" && b.type === "tool_use") {
+      const raw = b.input;
       const input = redact ? redact.input(raw, b.name) : raw;
       const inputText = clip(JSON.stringify(input, null, 2), IO_LIMIT);
-      items.push({ kind: "tool", id, toolUseId: typeof b.id === "string" ? b.id : id, name: b.name.slice(0, 128),
+      items.push({ kind: "tool", id, toolUseId: b.id ?? id, name: b.name.slice(0, 128),
         summary: clip(summarizeToolInput(b.name, input), 200).text, input: inputText.text, inputTruncated: inputText.truncated,
         ...(ts ? { ts } : {}), ...(redact?.reachesPrivate?.(b.name, raw) ? { privateOutput: true } : {}) });
-    } else if (record.type === "user" && b.type === "tool_result" && typeof b.tool_use_id === "string") {
-      const { text, truncated } = clip(resultText(b.content), IO_LIMIT);
-      items.push({ kind: "result", id, toolUseId: b.tool_use_id, output: redact ? redact.output(text) : text, truncated, isError: b.is_error === true });
+    } else if (entry.role === "user" && b.type === "tool_result") {
+      const result = resultText(b.parts);
+      const { text, truncated } = clip(result.text, IO_LIMIT);
+      items.push({ kind: "result", id, toolUseId: b.toolUseId, output: redact ? redact.output(text) : text, truncated, isError: b.isError,
+        ...(result.images ? { images: result.images } : {}) });
     }
   });
   if (hidden) items.push({ kind: "text", id: `${offset}:more`, text: `… ${hidden} more entries in this step are not shown.`, truncated: true });
@@ -215,7 +213,7 @@ export async function readSubagentPage(sdkSessionsDir: string, sdkSessionId: str
     // Whole lines only, stopping once a page holds MAX_PAGE_ITEMS: forward
     // pages keep their oldest lines, backward pages their newest. The cursor
     // moves to the edge of the last line kept, so nothing is skipped.
-    const perLine = page.lines.map((line) => ({ line, items: itemsFromLine(line.text, line.offset) }));
+    const perLine = page.lines.map((line) => ({ line, ...readLine(line.text, line.offset) }));
     const ordered = cursor.after !== undefined ? perLine : [...perLine].reverse();
     const kept: typeof perLine = [];
     let count = 0;
@@ -229,7 +227,11 @@ export async function readSubagentPage(sdkSessionsDir: string, sdkSessionId: str
     const all = kept.length === perLine.length;
     const start = all || cursor.after !== undefined ? page.start : kept[0].line.offset;
     const end = all || cursor.after === undefined ? page.end : kept.at(-1)!.line.offset + kept.at(-1)!.line.bytes;
-    return { items, start, end, size, hasEarlier: start > 0 };
+    // Lines the parser did not recognise: said in the page (the view notes
+    // it) and logged once per file — a changed format must not read as empty.
+    const unreadable = kept.filter((entry) => entry.problems.length);
+    reportUnreadable(canonical, "subagent", unreadable.length, unreadable.flatMap((entry) => entry.problems));
+    return { items, start, end, size, hasEarlier: start > 0, ...(unreadable.length ? { unreadable: unreadable.length } : {}) };
   } finally { await fd.close(); }
 }
 
@@ -243,7 +245,7 @@ const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 
 /** The subagent's sidecar written when it is spawned (`agent-<id>.meta.json`). */
 export function subagentMetaPath(sdkSessionsDir: string, sdkSessionId: string, taskId: string): string {
-  return subagentTranscriptPath(sdkSessionsDir, sdkSessionId, taskId).replace(/\.jsonl$/, ".meta.json");
+  return subagentMetaFile(subagentTranscriptPath(sdkSessionsDir, sdkSessionId, taskId));
 }
 /** A meta.json is a few hundred bytes; anything past this is not one. */
 export const META_MAX_BYTES = 16 * 1024;
@@ -275,8 +277,7 @@ async function readMetaModel(sdkSessionsDir: string, sdkSessionId: string, taskI
     if (!fd) return undefined;
     const raw = await readRange(fd, 0, META_MAX_BYTES + 1);
     if (raw.length > META_MAX_BYTES) return undefined;
-    const meta = JSON.parse(raw.toString("utf8")) as { pickedEffortModel?: unknown; model?: unknown };
-    for (const model of [meta?.pickedEffortModel, meta?.model]) {
+    for (const model of metaModels(raw.toString("utf8"))) {
       if (typeof model === "string" && MODEL_ID.test(model)) return model;
     }
     return undefined;
@@ -293,12 +294,10 @@ async function readTranscriptModel(sdkSessionsDir: string, sdkSessionId: string,
     const lines = head.toString("utf8").split("\n");
     if (head.length === MODEL_HEAD_BYTES) lines.pop(); // possibly cut mid-line
     for (const line of lines) {
-      if (!line.includes('"assistant"')) continue;
-      let record: { type?: string; message?: { model?: unknown } };
-      try { record = JSON.parse(line); } catch { continue; }
-      if (record?.type !== "assistant") continue;
-      const model = record.message?.model;
-      if (typeof model === "string" && MODEL_ID.test(model)) return model;
+      if (!mayBeAssistant(line)) continue;
+      const { entry } = parseEntry(line);
+      if (entry.kind !== "message" || entry.role !== "assistant") continue;
+      if (entry.model && MODEL_ID.test(entry.model)) return entry.model;
     }
     return undefined;
   } catch { return undefined; }
@@ -321,10 +320,9 @@ export async function readSubagentBrief(sdkSessionsDir: string, sdkSessionId: st
     const head = await readRange(fd, 0, MAX_LINE_BYTES);
     const end = head.indexOf(0x0a);
     if (end < 0) return undefined; // first entry not complete yet
-    let record: { type?: string; message?: { content?: unknown } };
-    try { record = JSON.parse(head.subarray(0, end).toString("utf8")); } catch { return undefined; }
-    if (record?.type !== "user") return undefined;
-    const said = userText(record.message?.content);
+    const { entry } = parseEntry(head.subarray(0, end).toString("utf8"));
+    if (entry.kind !== "message" || entry.role !== "user") return undefined;
+    const said = userText(entry.content);
     if (!said.trim()) return undefined;
     return clip(said, BRIEF_LIMIT);
   } catch { return undefined; }

@@ -344,6 +344,11 @@ async function openTasks(page: Page): Promise<void> {
   if (await item.count() === 0) await page.getByRole("button", { name: /^Tasks/ }).click();
   await item.first().waitFor();
 }
+async function closeTasks(page: Page): Promise<void> {
+  const item = page.getByText(/^Audit the rename paths/).filter({ visible: true });
+  if (await item.count() > 0) await page.getByRole("button", { name: /^Tasks/ }).click();
+  await item.first().waitFor({ state: "hidden" });
+}
 const history = (page: Page) => page.getByLabel("Conversation history");
 const openToolGroup = async (page: Page) => {
   const group = history(page).getByRole("button", { name: /Read a file|tool calls/ }).first();
@@ -518,6 +523,7 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
   for (const tab of ["todos", "memory", "context", "model", "cron", "mcp", "config"]) {
     await s("study", tab, async (snap) => {
       await page.goto(`${url}/#study/${tab}`);
+      await closeTasks(page);
       await page.waitForTimeout(900);
       if (tab === "cron") await page.getByText("Dentist reminder", { exact: true }).filter({ visible: true }).first().waitFor();
       await snap();
@@ -525,6 +531,8 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
   }
   await s("study", "cron-confirm", async (snap) => {
     await page.goto(`${url}/#study/cron`);
+    // A Tasks rail left open by an earlier step covers the job's buttons at laptop and phone widths.
+    await closeTasks(page);
     // The jobs arrive after the page; wait for them rather than for a fixed time.
     await page.getByText("Dentist reminder", { exact: true }).filter({ visible: true }).first().waitFor();
     await page.waitForTimeout(300);

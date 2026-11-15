@@ -222,7 +222,7 @@ describe("screen over HTTP", () => {
     expect((await stream(`/api/v1/screen?fps=1&epoch=00000000-0000-4000-8000-000000000000`)).status).toBe(409);
     expect((await stream(`/api/v1/screen?fps=5&epoch=${boot.epoch}`)).status).toBe(400);
     expect(source.capture).not.toHaveBeenCalled();
-    expect(boot.capabilities).toEqual({ screen: true });
+    expect(boot.capabilities).toEqual({ screen: true, uploads: false });
   });
 
   it("streams frames with no-store, and stops capturing when the viewer leaves", async () => {
@@ -256,7 +256,7 @@ describe("screen over HTTP", () => {
   it("answers 503 where the screen cannot be captured", async () => {
     await start(false);
     expect((await stream(`/api/v1/screen?fps=1&epoch=${boot.epoch}`)).status).toBe(503);
-    expect(boot.capabilities).toEqual({ screen: false });
+    expect(boot.capabilities).toEqual({ screen: false, uploads: false });
   });
 });
 

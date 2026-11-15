@@ -1,10 +1,11 @@
 import { WebData, type WebDataOptions } from "./data.js";
+import { sweepUploads, uploadsDir } from "./uploads.js";
 import { startWebHttp } from "./http.js";
 import { macScreenSource, ScreenLoop } from "./screen.js";
 import { USAGE_RPC_TIMEOUT_MS, WebError, type EventEnvelope, type Rpc } from "./protocol.js";
 import { loadWebToken, writeWebAccessLinks } from "./token-store.js";
 
-interface Init { type: "init"; options: WebDataOptions & { port: number; assetsDir: string; tomoHome: string; externalOrigin?: string } }
+interface Init { type: "init"; options: WebDataOptions & { port: number; assetsDir: string; tomoHome: string; externalOrigin?: string; uploadsEnabled?: boolean } }
 type Message = Init | { type: "ping" } | { type: "event"; value: EventEnvelope }
   | { type: "result"; id: number; value?: unknown; error?: { status: number; code: string } };
 const pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void; timer: ReturnType<typeof setTimeout> }>();
@@ -40,10 +41,14 @@ process.on("message", (value: Message) => {
   let accessToken: string;
   void Promise.resolve().then(() => {
     accessToken = loadWebToken(value.options.tomoHome, () => send({ type: "token_created" }));
+    // Uploads never sent expire; sweep at start and every few minutes (also on each upload).
+    sweepUploads(uploadsDir(value.options.tomoHome));
+    setInterval(() => sweepUploads(uploadsDir(value.options.tomoHome)), 5 * 60_000).unref();
     return startWebHttp(value.options.port, {
     accessToken,
     externalOrigin: value.options.externalOrigin,
     data: new WebData(value.options),
+    ...(value.options.uploadsEnabled !== false ? { uploadsDir: uploadsDir(value.options.tomoHome) } : {}),
     // Captured here, in the web process, so frames never cross the daemon IPC
     // and the daemon thread does no image work. Same user and GUI session as
     // the daemon (this process is its child), so the same Screen Recording grant.

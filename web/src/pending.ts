@@ -5,9 +5,10 @@ export function recordedReplyIds(history: HistoryPage): Set<string> {
   return new Set(history.messages.filter((m) => m.role === "assistant").flatMap((m) => [m.requestId, m.turnId]).filter((id): id is string => !!id));
 }
 /** Messages this owner sent from the browser that the transcript does not show yet (#381). */
-export function pendingUserMessages(requests: WebRequest[], history: HistoryPage, sessionId: string): WebRequest[] {
+export function pendingUserMessages(requests: WebRequest[], history: HistoryPage, sessionId: string, withImages: ReadonlySet<string> = new Set()): WebRequest[] {
   const recorded = new Set(history.messages.filter((m) => m.role === "user").map((m) => m.requestId));
-  return requests.filter((r) => r.sessionId === sessionId && r.text && !recorded.has(r.requestId) && r.state !== "refused");
+  // An image-only message has no text, but this tab still shows its bubble (with the pictures).
+  return requests.filter((r) => r.sessionId === sessionId && (r.text || r.images?.length || withImages.has(r.requestId)) && !recorded.has(r.requestId) && r.state !== "refused");
 }
 export function pendingLabel(request: WebRequest): string {
   if (request.joined) return "Joined the running turn";
@@ -65,12 +66,20 @@ export function isResendOf(original: string, sent: string): boolean {
 }
 
 /** An interrupted request the owner is resending from the composer. */
-export interface Resend { requestId: string; original: string }
-/** Clearing the composer cancels a resend; editing it does not. */
+/** `imageKeys`: the tray items its images were re-attached as (an image-only message is a resend by these). */
+export interface Resend { requestId: string; original: string; imageKeys?: string[] }
+/** Clearing the composer cancels a resend; editing it does not (nor does an image-only one's empty draft). */
 export function resendAfterDraftChange(resend: Resend | null, draft: string): Resend | null {
-  return resend && draft.trim() ? resend : null;
+  return resend && (draft.trim() || resend.imageKeys?.length) ? resend : null;
 }
-/** The interrupted request to dismiss once `sent` was ACCEPTED — only if it really was that message (or an edit of it). */
-export function dismissAfterAcceptedSend(resend: Resend | null, sent: string): string | null {
-  return resend && isResendOf(resend.original, sent) ? resend.requestId : null;
+/**
+ * The interrupted request to dismiss once `sent` was ACCEPTED — only if it
+ * really was that message: its text (or an edit of it), or, for one without
+ * text, at least one of its re-attached images (`sentKeys`: the tray items sent).
+ */
+export function dismissAfterAcceptedSend(resend: Resend | null, sent: string, sentKeys: readonly string[] = []): string | null {
+  if (!resend) return null;
+  if (isResendOf(resend.original, sent)) return resend.requestId;
+  if (!resend.original.trim() && resend.imageKeys?.some((key) => sentKeys.includes(key))) return resend.requestId;
+  return null;
 }

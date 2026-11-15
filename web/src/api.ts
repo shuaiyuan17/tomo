@@ -99,3 +99,43 @@ export async function stream(cursor: string, signal: AbortSignal, handlers: Stre
   } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
 }
 export type { WebBootstrap };
+
+/**
+ * Upload one image for the next message (XHR, for upload progress). Same
+ * gate as sending: CSRF, the daemon epoch, the owner's conversation. A
+ * definite CSRF rejection is retried once with a fresh token, like `mutate`.
+ */
+export function uploadImage(file: Blob, targetId: string, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>,
+  onProgress: (fraction: number) => void, signal?: AbortSignal): Promise<{ uploadId: string; type: string; size: number }> {
+  const send = (csrfToken: string) => new Promise<{ uploadId: string; type: string; size: number }>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api/v1/uploads?targetId=${encodeURIComponent(targetId)}`);
+    xhr.withCredentials = true;
+    xhr.setRequestHeader("x-tomo-request", "1");
+    xhr.setRequestHeader("x-tomo-csrf", csrfToken);
+    xhr.setRequestHeader("x-tomo-epoch", bootstrap.epoch);
+    xhr.setRequestHeader("content-type", "application/octet-stream");
+    xhr.upload.onprogress = (event) => { if (event.lengthComputable) onProgress(event.loaded / event.total); };
+    xhr.onload = () => {
+      let value: { error?: string } & Record<string, unknown> = {};
+      try { value = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
+      if (xhr.status >= 200 && xhr.status < 300) resolve(value as unknown as { uploadId: string; type: string; size: number });
+      else reject(new ApiError(xhr.status, value.error ?? "unavailable"));
+    };
+    xhr.onerror = () => reject(new ApiError(0, "network"));
+    xhr.onabort = () => reject(new ApiError(0, "aborted"));
+    signal?.addEventListener("abort", () => xhr.abort(), { once: true });
+    xhr.send(file);
+  });
+  return send(bootstrap.csrfToken).catch(async (error) => {
+    if (!(error instanceof ApiError) || error.status !== 403 || error.code !== "invalid_csrf") throw error;
+    const fresh = await refresh();
+    if (fresh.epoch !== bootstrap.epoch) throw new ApiError(409, "epoch_changed");
+    return send(fresh.csrfToken);
+  });
+}
+
+/** Drop an upload the owner removed before sending (best effort: unsent uploads also expire). */
+export function discardUpload(uploadId: string, bootstrap: WebBootstrap): void {
+  void api(`/uploads/${uploadId}`, { method: "DELETE", headers: { "content-type": "application/json", "x-tomo-csrf": bootstrap.csrfToken, "x-tomo-epoch": bootstrap.epoch }, body: "{}" }).catch(() => {});
+}

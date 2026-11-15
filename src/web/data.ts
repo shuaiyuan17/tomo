@@ -79,7 +79,9 @@ export function subagentModelReader(options: WebDataOptions): (sessionKey: strin
 const MEDIA_TYPES: Record<string, string> = { ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp", ".heic": "image/heic" };
 export const MAX_MEDIA_BYTES = 15 * 1024 * 1024;
 /** Messaging channels whose inbound images the store files (never "web"). */
-const INBOUND_CHANNELS = new Set(["telegram", "imessage"]);
+const INBOUND_CHANNELS = new Set(["telegram", "imessage", "web"]);
+/** The meta.sessionKey the web channel files the owner's uploads under. */
+export const WEB_IMAGE_KEY = "web_owner";
 /** Most images taken from one message (the UI shows "+N more" past this). */
 export const MAX_MESSAGE_IMAGES = 20;
 
@@ -206,7 +208,11 @@ export class WebData {
    */
   async mediaFile(id: string, path: string): Promise<{ type: string; bytes: Buffer }> {
     const refuse = () => new WebError(404, "media_not_found");
-    if (!this.catalog().keys.has(id) || !this.media.get(id)?.has(path) || !this.options.workspaceDir) throw refuse();
+    // Named by a served history page — or, in the owner's conversation, one
+    // of the owner's own browser uploads (an interrupted request's bubble
+    // shows them before any history names them).
+    const named = this.media.get(id)?.has(path) || (id === this.catalog().ownerId && isImageFiledFor(basename(path), [WEB_IMAGE_KEY]));
+    if (!this.catalog().keys.has(id) || !named || !this.options.workspaceDir) throw refuse();
     const type = MEDIA_TYPES[extname(path).toLowerCase()];
     if (!type) throw refuse();
     let file: FileHandle | undefined;
@@ -276,7 +282,10 @@ export class WebData {
         : { ...message, content: this.outgoing.rewrite(key, [message.requestId, message.turnId], message.content).content });
       for (const message of page.messages) {
         if (message.role !== "user" || !INBOUND_CHANNELS.has(message.channel)) continue;
-        for (const path of imagePaths(message.content)) if (isImageFiledFor(basename(path), filedAs)) allowed.add(path);
+        // A browser upload is filed as web_owner (channels/web.ts), and only a
+        // web message may name one; a web message names nothing else.
+        const filed = message.channel === "web" ? (id === this.catalog().ownerId ? [WEB_IMAGE_KEY] : []) : filedAs;
+        for (const path of imagePaths(message.content)) if (isImageFiledFor(basename(path), filed)) allowed.add(path);
       }
       if (allowed.size > 4096) allowed.clear();
       this.media.set(id, allowed);

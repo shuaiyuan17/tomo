@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { convertUpload, discardUpload, MAX_UPLOAD_BYTES, stageUpload, UploadError } from "./uploads.js";
 import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { resolve, sep } from "node:path";
@@ -28,6 +29,8 @@ export interface HttpDependencies {
   subscribe(fn: (event: EventEnvelope) => void): () => void;
   /** The shared desktop capture loop; absent where the screen cannot be captured. */
   screen?: ScreenLoop;
+  /** Where image uploads wait to be sent (uploads.ts); absent: uploads are unavailable. */
+  uploadsDir?: string;
 }
 
 /** Idle socket timeout; every RPC deadline (e.g. USAGE_RPC_TIMEOUT_MS) stays under it. */
@@ -122,7 +125,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           const csrfToken = csrf.bootstrap(session!);
           const { sessions, ownerId, setupRequired } = deps.data.catalog();
           const { snapshot } = await deps.rpc({ method: "snapshot" }) as WebSync;
-          json(res, 200, { sessions, ownerId, setupRequired, ...snapshot, csrfToken, capabilities: { screen: !!deps.screen }, agentName: deps.data.agentName() });
+          json(res, 200, { sessions, ownerId, setupRequired, ...snapshot, csrfToken, capabilities: { screen: !!deps.screen, uploads: !!deps.uploadsDir }, agentName: deps.data.agentName() });
           return;
         }
         if (url.pathname === "/api/v1/sessions") {
@@ -216,6 +219,29 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         const epoch = req.headers["x-tomo-epoch"];
         if (typeof epoch !== "string" || !/^[a-f0-9-]{36}$/.test(epoch)) throw new WebError(409, "epoch_required");
         json(res, 202, await deps.rpc({ method: "compact", epoch }));
+        return;
+      } else if (req.method === "POST" && url.pathname === "/api/v1/uploads") {
+        // An image for the owner's next message: the same gate as sending one
+        // (CSRF, the owner, the daemon epoch), a raw body of at most
+        // MAX_UPLOAD_BYTES, and the type decided by its leading bytes.
+        csrf.verify(req, session!, "application/octet-stream");
+        const { ownerId } = deps.data.catalog();
+        if (!ownerId) throw new WebError(409, "owner_setup_required");
+        if (url.searchParams.get("targetId") !== ownerId) throw new WebError(403, "owner_dm_only");
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || epoch !== await deps.rpc({ method: "epoch" })) throw new WebError(409, "epoch_changed");
+        const bytes = await rawBody(req, MAX_UPLOAD_BYTES);
+        try { json(res, 201, stageUpload(required(deps.uploadsDir), await convertUpload(bytes))); }
+        catch (error) {
+          if (!(error instanceof UploadError)) throw error;
+          throw new WebError(error.code === "not_image" ? 415 : error.code === "too_large" ? 413 : 429, error.code);
+        }
+        return;
+      } else if (req.method === "DELETE" && /^\/api\/v1\/uploads\/[a-f0-9]{32}$/.test(url.pathname)) {
+        csrf.verify(req, session!);
+        await body(req).catch(() => undefined);
+        discardUpload(required(deps.uploadsDir), url.pathname.split("/").at(-1)!);
+        json(res, 200, {});
         return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/messages") {
         csrf.verify(req, session!);
@@ -368,6 +394,19 @@ function json(res: ServerResponse, status: number, value: unknown): void {
   if (Buffer.byteLength(text) > MAX_BUFFER_BYTES) throw new WebError(413, "response_too_large");
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   res.end(text);
+}
+
+/** A raw body of at most `limit` bytes (a larger one is refused before it is read in full). */
+async function rawBody(req: IncomingMessage, limit: number): Promise<Buffer> {
+  if (Number(req.headers["content-length"]) > limit) throw new WebError(413, "too_large");
+  let bytes = 0;
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    bytes += chunk.length;
+    if (bytes > limit) throw new WebError(413, "too_large");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
 }
 
 async function body(req: IncomingMessage): Promise<unknown> {

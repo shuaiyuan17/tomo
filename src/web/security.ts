@@ -3,7 +3,7 @@ import type { IncomingMessage } from "node:http";
 import { WebError } from "./protocol.js";
 
 export const securityHeaders = {
-  "content-security-policy": "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'",
+  "content-security-policy": "default-src 'none'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'",
   "x-content-type-options": "nosniff",
   "referrer-policy": "no-referrer",
   "cache-control": "no-store",
@@ -45,12 +45,13 @@ export class CsrfTokens {
     return token;
   }
 
-  verify(req: IncomingMessage, session: string): void {
+  /** `contentType`: what the body must be (JSON for every mutation but an image upload). */
+  verify(req: IncomingMessage, session: string, contentType = "application/json"): void {
     const saved = this.tokens.get(session);
     const actual = req.headers["x-tomo-csrf"];
     if (!saved || saved.expires < this.now() || typeof actual !== "string" || Buffer.byteLength(actual) !== Buffer.byteLength(saved.token)
       || !timingSafeEqual(Buffer.from(actual), Buffer.from(saved.token))) throw new WebError(403, "invalid_csrf");
-    if (req.headers["content-type"] !== "application/json") throw new WebError(415, "json_required");
+    if (req.headers["content-type"] !== contentType) throw new WebError(415, contentType === "application/json" ? "json_required" : "content_type_required");
   }
 
 }

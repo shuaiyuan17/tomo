@@ -12,7 +12,7 @@ import { CompactButton } from "./compact-button.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
-import { ArrowDown, ArrowUp, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
+import { ArrowDown, ArrowUp, ImagePlus, RotateCw, X, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
 import { Study } from "./study.js";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { ScreenWindow } from "./screen.js";
@@ -33,6 +33,8 @@ import { blockKey, interleave, jumpLabel, messageKey, pendingKey, type ToolBlock
 import { useSessionTools } from "./use-session-tools.js";
 import { useJumpToLatest } from "./use-jump-to-latest.js";
 import { ToolCall, ToolGroup } from "./tool-calls.js";
+import { useAttachments } from "./use-attachments.js";
+import { attachmentLabel, canSendWith, captureSend, dragHasFiles, imageFiles } from "./uploads.js";
 
 type Theme = "system" | "light" | "dark";
 /** 503s that mean "not accepted, and why" — the draft stays, nothing ran. */
@@ -127,6 +129,26 @@ export function App() {
   const atBottom = useRef(true);
   const restoreScroll = useRef<number | null>(null);
   const [draft, setDraft] = useState("");
+  const fileInput = useRef<HTMLInputElement>(null);
+  const [dragging, setDragging] = useState(false);
+  /** Previews of images this tab sent, per request, for its pending bubble. */
+  const [sentImages, setSentImages] = useState<Record<string, string[]>>({});
+  const attachments = useAttachments(web.bootstrap, web.refreshBootstrap, session?.writable ? session.id : undefined);
+  // Off with saveInboundImages: there would be no durable copy to keep with the message.
+  const uploadsOn = web.bootstrap?.capabilities?.uploads !== false;
+  const canAttach = !!session?.writable && web.connection === "live" && uploadsOn;
+  /** Files dragged over the chat: "Drop to attach" (only files, only where sending is possible). */
+  const dragProps = {
+    onDragEnter: (e: React.DragEvent) => { if (canAttach && dragHasFiles(e.dataTransfer.types)) { e.preventDefault(); setDragging(true); } },
+    onDragOver: (e: React.DragEvent) => { if (canAttach && dragHasFiles(e.dataTransfer.types)) { e.preventDefault(); e.dataTransfer.dropEffect = "copy"; } },
+    onDragLeave: (e: React.DragEvent) => { if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false); },
+    onDrop: (e: React.DragEvent) => {
+      if (!canAttach || !dragHasFiles(e.dataTransfer.types)) return;
+      e.preventDefault(); setDragging(false);
+      attachments.add(imageFiles(e.dataTransfer.items).length ? imageFiles(e.dataTransfer.items) : Array.from(e.dataTransfer.files));
+      input.current?.focus();
+    },
+  };
   const [sending, setSending] = useState(false);
   const [uncertain, setUncertain] = useState<string | null>(() => {
     try { return sessionStorage.getItem("tomo-pending-request"); } catch { return null; }
@@ -232,16 +254,19 @@ export function App() {
   const webRequestIds = new Set(web.requests.map((r) => r.requestId));
   const send = async (event: FormEvent) => {
     event.preventDefault();
-    if (!session?.writable || !draft.trim() || sending || uncertain || !web.bootstrap || web.connection !== "live") return;
+    if (!session?.writable || !canSendWith(draft, attachments.items) || sending || uncertain || !web.bootstrap || web.connection !== "live") return;
     const text = draft.trim();
+    // Captured now: images added while this sends stay in the tray.
+    const { keys: sentKeys, ids: images } = captureSend(attachments.items);
     const requestId = crypto.randomUUID();
     setSending(true); setFeedback("Sending…"); remember(requestId);
     try {
-      const request = await sendMessage({ requestId, targetId: session.id, text }, web.bootstrap, web.refreshBootstrap);
+      const request = await sendMessage({ requestId, targetId: session.id, text, ...(images.length ? { images } : {}) }, web.bootstrap, web.refreshBootstrap);
+      if (images.length) { const taken = attachments.take(sentKeys); setSentImages((old) => ({ ...old, [requestId]: taken.map((item) => item.preview) })); }
       web.acceptRequest({ ...request, text, timestamp: Date.now() });
       // Accepted, and it really was that message (or the owner's edit of it):
       // only now does the interrupted one go.
-      const replaced = dismissAfterAcceptedSend(resending, text);
+      const replaced = dismissAfterAcceptedSend(resending, text, sentKeys);
       if (replaced) void dismiss(replaced, true);
       setResending(null);
       setDraft((old) => old.trim() === text ? "" : old);
@@ -254,9 +279,24 @@ export function App() {
         remember(null);
         setFeedback(err.status === 413 ? "Message is too large. Shorten it and send again; your draft is kept."
           : err.status === 401 ? "Open the private link in web-access.log to reconnect. Your draft is kept."
-          : err.code === "owner_dm_only" ? "Group conversations are read-only." : "Message was not accepted. Your draft is saved here; reconnect or check web settings.");
+          : err.code === "owner_dm_only" ? "Group conversations are read-only."
+          : err.code === "upload_missing" ? "An attached image expired before it was sent. Remove it and attach it again; your draft is kept." : "Message was not accepted. Your draft is saved here; reconnect or check web settings.");
       } else setFeedback(labels.unknown);
     } finally { setSending(false); }
+  };
+  const reattach = async (paths: string[]) => {
+    const files = await Promise.all(paths.map(async (path, i) => {
+      try {
+        const response = await fetch(`/api/v1/sessions/${selectedId}/media?path=${encodeURIComponent(path)}`, { credentials: "same-origin" });
+        if (!response.ok) return null;
+        const blob = await response.blob();
+        return new File([blob], path.split("/").at(-1) || `image-${i + 1}`, { type: blob.type });
+      } catch { return null; }
+    }));
+    const found = files.filter((file): file is File => !!file);
+    const keys = attachments.add(found);
+    setResending((old) => old && { ...old, imageKeys: keys });
+    if (found.length < paths.length) setFeedback("Some of its images could not be read back; attach them again before sending.");
   };
   /** Interrupted request being resent from the composer (dismissed once the resend is accepted). */
   const [resending, setResending] = useState<Resend | null>(null);
@@ -270,6 +310,8 @@ export function App() {
   const resend = (request: WebRequest) => {
     setResending({ requestId: request.requestId, original: request.text ?? "" });
     setDraft(request.text ?? ""); input.current?.focus();
+    // Its images come back too: read from where they were filed, attached (uploaded) again.
+    if (request.images?.length) void reattach(request.images);
     setFeedback("Review the message, then send it again. The interrupted one is dismissed once this is accepted.");
   };
   /** Resend / Dismiss for an interrupted request awaiting the owner, on its bubble (history or pending). */
@@ -315,7 +357,7 @@ export function App() {
   };
   const durable = recordedReplyIds(history);
   const blocks = web.blocks.filter((b) => b.sessionId === selectedId && !durable.has(b.turnId ?? b.requestId));
-  const pendingUsers = pendingUserMessages(web.requests, history, selectedId);
+  const pendingUsers = pendingUserMessages(web.requests, history, selectedId, new Set(Object.keys(sentImages)));
   const latest = web.requests.filter((r) => r.sessionId === selectedId).at(-1);
   const settle = useCompletedSettle(latest);
   // Tool calls, inline: read from the session's transcript back to the oldest
@@ -421,7 +463,9 @@ export function App() {
       </aside>
       {study && <Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} focus={studyFocus} cronRevision={web.cronRevision}
         mutator={{ bootstrap: web.bootstrap, refresh: web.refreshBootstrap, live: web.connection === "live" }} />}
-      <main id="conversation" hidden={!!study} className="mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-3" tabIndex={-1} inert={modal}>
+      <main id="conversation" hidden={!!study} {...dragProps} className="relative mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-3" tabIndex={-1} inert={modal}>
+        {dragging && <div aria-hidden="true" className="pointer-events-none absolute inset-3 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary/60 bg-background/80 text-[15px] font-medium text-foreground motion-enter">
+          <span className="flex items-center gap-2"><ImagePlus className="size-5" strokeWidth={1.75} />Drop to attach</span></div>}
         {web.bootstrap?.setupRequired && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}
         {web.connection === "locked" && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Open the access link in Tomo's private <code>web-access.log</code> to connect. The link includes your private access token.</div>}
         <div className="relative flex min-h-0 w-full flex-1 flex-col">
@@ -443,7 +487,11 @@ export function App() {
           {pendingUsers.map((request) => <article className="message user motion-enter mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">You</span><span>Web</span>
               <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{pendingLabel(request)}</Badge></div>
-            <div className="markdown rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80"><Text breaks>{request.text!}</Text></div>
+            {!sentImages[request.requestId] && request.images?.length ? <div className="mb-2 opacity-80"><MessageBody sessionId={selectedId}
+              body={`[Sent ${request.images.length === 1 ? "an image" : `${request.images.length} images`}, saved to: ${request.images.join(", ")}]`} /></div> : null}
+            {sentImages[request.requestId] && <div className="mb-2 flex flex-wrap gap-2 opacity-80">{sentImages[request.requestId].map((src, i) =>
+              <img key={i} src={src} alt="Image" className="block max-h-[280px] max-w-[280px] rounded-xl border object-contain" />)}</div>}
+            {request.text && <div className="markdown rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80"><Text breaks>{request.text}</Text></div>}
             {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)}
           {timeline.trailing.map((block, i) => toolBlock(block, turnActive && i === timeline.trailing.length - 1))}
           {blocks.map((block) => <article className="message assistant motion-enter mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{agent}</span><span>Reply in progress</span></div><div className="markdown reading"><MessageBody body={[block.text, ...(block.images ?? []).map((id) => `MEDIA:web:${id}`)].filter(Boolean).join("\n")} sessionId={selectedId} /></div></article>)}
@@ -455,15 +503,37 @@ export function App() {
             <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Resending an interrupted message</Badge>
             <span>The original is dismissed once this one is accepted.</span>
             <Button variant="ghost" size="sm" className="h-6 rounded-md px-2 text-[11px]" onClick={() => setResending(null)}>Not a resend</Button></div>}
+          {attachments.items.length > 0 && <ul aria-label="Attached images" className="m-0 mb-2 flex list-none flex-wrap gap-2 p-0">
+            {attachments.items.map((item, index) => <li key={item.key} aria-label={attachmentLabel(item, index)}
+              className={cn("relative size-16 overflow-hidden rounded-xl border bg-muted/40 motion-enter", item.status === "failed" && "border-destructive/60")}>
+              <img src={item.preview} alt="" className={cn("size-full object-cover", item.status !== "done" && "opacity-60")} />
+              {item.status === "uploading" && <span className="absolute inset-x-1.5 bottom-1.5 h-1 overflow-hidden rounded-full bg-background/70" role="progressbar" aria-label="Upload progress"
+                aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(item.progress * 100)}><span className="block h-full bg-primary transition-[width] duration-150" style={{ width: `${Math.round(item.progress * 100)}%` }} /></span>}
+              {item.status === "failed" && <button type="button" onClick={() => attachments.retry(item.key)} title={item.error} aria-label={`Retry upload${item.error ? ` (${item.error})` : ""}`}
+                className="absolute inset-0 grid place-items-center bg-background/60 text-destructive hover:bg-background/40"><RotateCw className="size-4" /></button>}
+              <button type="button" onClick={() => attachments.remove(item.key)} aria-label={`Remove ${item.file.name || `image ${index + 1}`}`}
+                className="absolute top-1 right-1 grid size-5 place-items-center rounded-full bg-foreground/70 text-background hover:bg-foreground"><X className="size-3" strokeWidth={2.5} /></button>
+            </li>)}</ul>}
+          {attachments.note && <p className="m-0 mb-2 text-[12px] text-muted-foreground" role="status">{attachments.note}</p>}
           <form onSubmit={(e) => void send(e)} className="composer flex items-end gap-2 rounded-[20px] border bg-card py-2.5 pr-2.5 pl-1 shadow-xs transition-[border-color,box-shadow] focus-within:border-muted-foreground/50 focus-within:shadow-md">
+            <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/heic,image/heif,.heic,.heif" multiple hidden
+              onChange={(e) => { attachments.add(Array.from(e.target.files ?? [])); e.target.value = ""; input.current?.focus(); }} />
+            <Button type="button" variant="ghost" size="icon" aria-label="Attach images" title={uploadsOn ? "Attach images (or drop / paste them)" : "Image uploads are off (saveInboundImages is false in config)"} disabled={!canAttach}
+              onClick={() => fileInput.current?.click()} className="ml-1 size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground"><ImagePlus strokeWidth={1.75} /></Button>
             <label className="sr-only" htmlFor="message">Message {agent}</label>
             <Textarea ref={input} id="message" placeholder={session?.kind === "group" ? "This group is read-only" : "What's on your mind?"} value={draft} maxLength={16_000} rows={1} disabled={!session?.writable}
               className="max-h-60 min-h-10 flex-1 resize-none rounded-none border-0 bg-transparent! px-3.5 py-[7px] text-[15px] leading-relaxed shadow-none placeholder:text-muted-foreground focus-visible:ring-0 disabled:opacity-80 md:text-[15px]"
-              onChange={(e) => { setDraft(e.target.value); setResending((old) => resendAfterDraftChange(old, e.target.value)); }} onCompositionStart={() => ime.current.start()} onCompositionEnd={() => ime.current.end()}
+              onChange={(e) => { setDraft(e.target.value); setResending((old) => resendAfterDraftChange(old, e.target.value)); }} onPaste={(e) => {
+                const files = imageFiles(e.clipboardData?.items);
+                if (!files.length || !canAttach) return;
+                attachments.add(files);
+                // An image on the clipboard is attached; text that came with it still pastes.
+                if (!Array.from(e.clipboardData.types).includes("text/plain")) e.preventDefault();
+              }} onCompositionStart={() => ime.current.start()} onCompositionEnd={() => ime.current.end()}
               onKeyDown={(e) => { if (ime.current.shouldSubmit({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
             <Button type="submit" size="icon" aria-label="Send" aria-busy={sending}
               className="size-9 shrink-0 rounded-full transition-[background-color,transform] hover:bg-primary/85 active:scale-[0.94] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100 [&_svg:not([class*='size-'])]:size-[18px]"
-              disabled={!session?.writable || !draft.trim() || sending || !!uncertain || web.connection !== "live"}><ArrowUp strokeWidth={2.2} /></Button>
+              disabled={!session?.writable || !canSendWith(draft, attachments.items) || sending || !!uncertain || web.connection !== "live"}><ArrowUp strokeWidth={2.2} /></Button>
           </form>
           {uncertain && !sending && <div className="mt-2 flex flex-wrap gap-2"><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => void checkOutcome()}>Check message status</Button><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { remember(null); setFeedback("Draft kept. Review the conversation before sending it again."); }}>Keep draft for review</Button></div>}
         </div>

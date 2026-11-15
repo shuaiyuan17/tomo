@@ -12,6 +12,8 @@ export type DiagnosticLevel = "info" | "warn" | "error";
 
 export interface WebSupervisorOptions extends WebDataOptions {
   tomoHome: string;
+  /** Image uploads are offered only when inbound images are kept (config saveInboundImages). */
+  uploadsEnabled?: boolean;
   externalOrigin?: string;
   port: number;
   assetsDir?: string;
@@ -292,8 +294,8 @@ export class WebSupervisor implements WebLifecycle {
         settle();
       });
       child.once("exit", onGone);
-      const { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath, agentName } = this.options;
-      send({ type: "init", options: { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath, agentName,
+      const { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath, agentName, uploadsEnabled } = this.options;
+      send({ type: "init", options: { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath, agentName, uploadsEnabled,
         assetsDir: this.options.assetsDir ?? fileURLToPath(new URL("../../dist/web-assets/", import.meta.url)) } });
     });
   }

@@ -231,7 +231,9 @@ async function startForeground(): Promise<void> {
       const { OutgoingMediaStore, outgoingImagesDir } = await import("../web/outgoing-media.js");
       // No private-memory guard, no copying (fail closed: pictures are then refused, not filed).
       const guard = await import("../agent/private-memory-guard.js").catch(() => undefined);
+      const { uploadsDir } = await import("../web/uploads.js");
       const web = new WebChannel(config.owner, undefined, {
+        uploads: { dir: uploadsDir(config.tomoHome), workspaceDir: imageStoreBaseDir },
         outgoingMedia: config.workspaceDir && guard
           ? new OutgoingMediaStore(outgoingImagesDir(config.workspaceDir), { isPrivate: guard.isPrivateAttachmentPath }) : undefined,
         journal: new WebRequestJournal(join(config.tomoHome, "data", "web", "requests.jsonl")),
@@ -245,7 +247,7 @@ async function startForeground(): Promise<void> {
       web.attach(new WebSupervisor(web, {
         ...config.web, owner: config.owner,
         sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,
-        workspaceDir: config.workspaceDir, agentName: config.agentName, cronStorePath: CRON_STORE_PATH, mcpStatus: () => agent.readMcpStatuses(),
+        workspaceDir: config.workspaceDir, agentName: config.agentName, uploadsEnabled: config.saveInboundImages, cronStorePath: CRON_STORE_PATH, mcpStatus: () => agent.readMcpStatuses(),
         diagnostic: (message, level = "info") => log[level](message),
       }));
       agent.addChannel(web);

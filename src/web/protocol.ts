@@ -13,8 +13,10 @@ export const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
 export const messageInputSchema = z.object({
   requestId: z.uuid(),
   targetId: z.string().max(128).optional(),
-  text: z.string().trim().min(1).max(16_000),
-}).strict();
+  text: z.string().trim().max(16_000),
+  /** Staged uploads (POST /uploads) to attach, in order; at most 6 (see uploads.ts). */
+  images: z.array(z.string().regex(/^[a-f0-9]{32}$/)).min(1).max(6).optional(),
+}).strict().refine((input) => input.text.length > 0 || (input.images?.length ?? 0) > 0, { message: "empty message" });
 export type MessageInput = z.infer<typeof messageInputSchema>;
 export interface WebSession {
   id: string;
@@ -29,7 +31,8 @@ export interface WebCatalog { sessions: WebSession[]; ownerId: string | null; se
  *  failed). `interrupted`: accepted, then the daemon restarted before it
  *  settled; never re-run automatically. Neither is retried. */
 export type RequestState = "queued" | "running" | "completed" | "refused" | "failed" | "unknown" | "interrupted";
-export interface WebRequest { requestId: string; state: RequestState; sessionId?: string; responseTurnId?: string; joined?: boolean; handedOff?: boolean; text?: string; timestamp?: number }
+/** `images`: where an owner's attached images were filed (incoming-images), while the request's text is kept. */
+export interface WebRequest { requestId: string; state: RequestState; sessionId?: string; responseTurnId?: string; joined?: boolean; handedOff?: boolean; text?: string; timestamp?: number; images?: string[] }
 export interface HistoryMessage extends SessionMessage { id: string }
 export interface HistoryPage { messages: HistoryMessage[]; nextCursor: string | null; revision?: string }
 export type WebTaskState = "running" | "completed" | "failed" | "stopped" | "ended";
@@ -136,7 +139,7 @@ export interface WebBootstrap extends WebCatalog {
   /** Every visible session's tasks; replaces the client's whole task list. */
   tasks: WebTask[];
   /** Optional features this daemon serves (absent on older daemons). */
-  capabilities?: { screen: boolean };
+  capabilities?: { screen: boolean; uploads?: boolean };
   /** The latest compact request, so a reload still shows it. */
   compact?: WebCompactState;
   /** What the UI calls the agent (config `agent.name`, else IDENTITY.md, else "Tomo"); absent on older daemons. */

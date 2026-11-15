@@ -224,8 +224,22 @@ describe("SessionStore", () => {
       expect(store.getUsageBaseline("telegram:1")).toEqual(zero("session-1"));
       store.setUsageBaseline("telegram:1", baseline("session-1", 1.5));
       expect(new SessionStore(TEST_DIR, 20).getUsageBaseline("telegram:1")).toEqual(baseline("session-1", 1.5));
+      // A snapshot for a different SDK session never lands on this one.
       store.setUsageBaseline("telegram:1", baseline("session-other", 9));
+      expect(store.getUsageBaseline("telegram:1")).toEqual(baseline("session-1", 1.5));
+    });
+
+    it("a landed row's snapshot that arrives before its SDK session is linked becomes the link's baseline, not zero", () => {
+      const store = new SessionStore(TEST_DIR, 20);
+      // The first row of a brand-new session lands before turn completion links its id.
+      store.setUsageBaseline("telegram:1", baseline("session-1", 0.75));
       expect(store.getUsageBaseline("telegram:1")).toBeUndefined();
+      store.setSdkSessionId("telegram:1", "session-1");
+      expect(new SessionStore(TEST_DIR, 20).getUsageBaseline("telegram:1")).toEqual(baseline("session-1", 0.75));
+      // A pending snapshot for another SDK session is not borrowed.
+      store.setUsageBaseline("telegram:2", baseline("session-x", 3));
+      store.setSdkSessionId("telegram:2", "session-2");
+      expect(store.getUsageBaseline("telegram:2")).toEqual(zero("session-2"));
     });
 
     it("persists the baseline next to the SDK session id and reads it back from disk", () => {

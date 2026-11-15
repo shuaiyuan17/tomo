@@ -746,7 +746,7 @@ export class SessionStore {
         stub.sdkSessionId = sessionId;
         // A new SDK session starts its cumulative totals from zero — which is
         // exactly what its baseline says until a usage-ledger row lands.
-        stub.usageBaseline = zeroUsageBaseline(sessionId);
+        stub.usageBaseline = this.takeLinkBaseline(key, sessionId);
         stub.lastActiveAt = Date.now();
         this.saveRegistry();
         return;
@@ -765,7 +765,7 @@ export class SessionStore {
         lastActiveAt: now,
         unlinkedAt: null,
         expiresAt: null,
-        usageBaseline: zeroUsageBaseline(sessionId),
+        usageBaseline: this.takeLinkBaseline(key, sessionId),
         stats: {
           totalQueries: 0,
           totalCostUsd: 0,
@@ -881,10 +881,28 @@ export class SessionStore {
   setUsageBaseline(key: string, baseline: UsageBaseline | null): void {
     this.mutateRegistry("setUsageBaseline", "bookkeeping", () => {
       const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+      // A NEW SDK session's first row can land before its id is linked
+      // (setSdkSessionId runs at turn completion). Held until the link, so
+      // the link starts from the row rather than from zero.
+      if (baseline && (!entry || entry.sdkSessionId !== baseline.sdkSessionId)) {
+        this.pendingUsageBaselines.set(key, baseline);
+        return;
+      }
+      this.pendingUsageBaselines.delete(key);
       if (!entry) return;
       applyUsageBaseline(entry, baseline);
       this.saveRegistryBestEffort("setUsageBaseline");
     });
+  }
+
+  /** Snapshots from landed ledger rows whose SDK session was not linked yet (see setUsageBaseline). */
+  private readonly pendingUsageBaselines = new Map<string, UsageBaseline>();
+
+  /** The baseline a link to `sessionId` starts with: a pending landed snapshot for it, else zero. */
+  private takeLinkBaseline(key: string, sessionId: string): UsageBaseline {
+    const pending = this.pendingUsageBaselines.get(key);
+    this.pendingUsageBaselines.delete(key);
+    return pending && pending.sdkSessionId === sessionId ? pending : zeroUsageBaseline(sessionId);
   }
 
   /** Touch the active session (update lastActiveAt) */

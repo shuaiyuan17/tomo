@@ -25,7 +25,7 @@ export function ScheduledSection({ revision, onNavigate }: { revision: number; o
   if (!jobs.length) return null;
   const go = (hash: string) => { window.location.hash = hash; onNavigate?.(); };
   return <section className="mt-3 border-t pt-3 pr-2.5" aria-labelledby="scheduled-heading">
-    <h3 id="scheduled-heading" className="mt-0 mb-1 px-2.5 font-mono text-[11px] font-normal tracking-[0.12em] text-muted-foreground uppercase">Scheduled</h3>
+    <h3 id="scheduled-heading" className="eyebrow mb-1 px-2.5">Scheduled</h3>
     <ul className="m-0 list-none space-y-0.5 p-0">{jobs.map((job) => {
       const oneShot = job.schedule.kind === "at" || job.deleteAfterRun;
       const Icon = oneShot ? CalendarClock : Repeat;
@@ -42,6 +42,6 @@ export function ScheduledSection({ revision, onNavigate }: { revision: number; o
       </li>;
     })}</ul>
     <Button variant="ghost" size="sm" onClick={() => go("#study/cron")}
-      className="mt-1 ml-1 h-8 gap-1 rounded-lg px-2 text-xs text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground">View all<ChevronRight className="size-3.5" /></Button>
+      className="mt-1 h-8 gap-1 rounded-lg px-2.5 text-xs text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground">View all<ChevronRight className="size-3.5" /></Button>
   </section>;
 }

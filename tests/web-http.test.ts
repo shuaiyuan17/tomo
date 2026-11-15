@@ -44,6 +44,7 @@ beforeEach(async () => {
   const sessionsDir = join(root, "sessions"); const sdkSessionsDir = join(root, "sdk");
   const assetsDir = join(root, "assets"); mkdirSync(join(assetsDir, "assets"), { recursive: true });
   writeFileSync(join(assetsDir, "index.html"), "<!doctype html><title>Tomo</title>");
+  for (const icon of ["favicon.svg", "favicon.ico", "apple-touch-icon.png", "icon-192.png", "icon-512.png", "manifest.webmanifest"]) writeFileSync(join(assetsDir, icon), icon);
   writeFileSync(join(assetsDir, "assets", "app-test.js"), "export {};");
   const owner = { name: "owner", telegram: ["test-owner"], imessage: [] as string[] };
   const store = new SessionStore(sessionsDir, 20, sdkSessionsDir);
@@ -207,6 +208,17 @@ describe("local HTTP boundary", () => {
     }
     expect((await call("/", { headers: { cookie: undefined } })).status).toBe(200);
     expect((await call("/api/v1/bootstrap")).status).toBe(200);
+  });
+  it("serves the app icons and manifest publicly (no cookie, no custom header) with their MIME types; nothing else at the root", async () => {
+    const types: Record<string, string> = { "/favicon.svg": "image/svg+xml", "/favicon.ico": "image/x-icon", "/apple-touch-icon.png": "image/png",
+      "/icon-192.png": "image/png", "/icon-512.png": "image/png", "/manifest.webmanifest": "application/manifest+json" };
+    for (const [path, type] of Object.entries(types)) {
+      const result = await call(path, { headers: { cookie: undefined, "x-tomo-csrf": undefined } });
+      expect(result.status).toBe(200);
+      expect(result.headers["content-type"]).toBe(type);
+    }
+    expect((await call("/favicon.png", { headers: { cookie: undefined } })).status).toBe(404);
+    expect((await call("/index.html", { headers: { cookie: undefined } })).status).toBe(404);
   });
   it("supports an exact Serve Host/Origin pair with independent secure authentication", async () => {
     const host = new URL(externalOrigin).host;

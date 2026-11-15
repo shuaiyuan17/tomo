@@ -436,6 +436,8 @@ describe("local HTTP boundary", () => {
     expect(pickEncoding("gzip, deflate, br, zstd")).toBe("br");
     expect(pickEncoding("gzip;q=1.0, br;q=0")).toBe("gzip");
     expect(pickEncoding("GZIP")).toBe("gzip");
+    expect(pickEncoding("br ;q=1")).toBe("br");
+    expect(pickEncoding("gzip, br ;q=0")).toBe("gzip");
     expect(pickEncoding("*")).toBe("br");
     expect(pickEncoding("*;q=0, gzip")).toBe("gzip");
     expect(pickEncoding("identity")).toBeUndefined();

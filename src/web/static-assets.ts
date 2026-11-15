@@ -23,7 +23,8 @@ export type Encoding = "br" | "gzip";
 export function pickEncoding(header: string | string[] | undefined): Encoding | undefined {
   const accepted = new Map<string, number>();
   for (const part of (Array.isArray(header) ? header.join(",") : header ?? "").split(",")) {
-    const [name, ...params] = part.trim().toLowerCase().split(";");
+    const [coding, ...params] = part.toLowerCase().split(";");
+    const name = coding.trim();
     if (!name) continue;
     const q = params.map((p) => p.trim()).find((p) => p.startsWith("q="));
     const value = q ? Number(q.slice(2)) : 1;

@@ -217,6 +217,9 @@ function seedConversation(store: SessionStore): void {
 function publishTasks(): void {
   watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
     { taskId: "a1", taskType: "local_agent", subagentType: "Explore", description: "Audit the rename paths and find every place a live transcript could be clobbered", ambient: false, background: true, startedAt: BASE - 95_000, summary: "Reading src/sessions/store.ts" },
+    // Nested under the subagent: a command it described in words (shown whole), and a command line.
+    { taskId: "a3", taskType: "local_bash", description: "用 stdin 重跑 codex 审 #539", parentTaskId: "a1", ambient: false, background: true, startedAt: BASE - 40_000 },
+    { taskId: "a4", taskType: "local_bash", description: "git log --oneline -5", parentTaskId: "a1", ambient: false, background: true, startedAt: BASE - 30_000 },
     { taskId: "a2", taskType: "local_bash", description: "npm test", ambient: false, background: true, startedAt: BASE - 20_000 },
   ] });
   watchBus.publish({ type: "tasks", sessionKey: "telegram:-100111", tasks: [

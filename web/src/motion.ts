@@ -35,15 +35,33 @@ export function useAppeared(ids: readonly string[], scope: string, ready = true)
 export function useExiting<T>(items: readonly T[], key: (item: T) => string, ms = 200): Array<{ item: T; exiting: boolean }> {
   const [leaving, setLeaving] = useState<Map<string, { item: T; index: number }>>(new Map());
   const previous = useRef<readonly T[]>(items);
+  // One removal timer per leaving item, kept across renders. A parent that re-renders with a fresh
+  // `items` array (the Tasks panel does every second) must not cancel them: an item whose timer was
+  // cancelled stayed in the list for good, as an invisible row holding open a gap.
+  const timers = useRef(new Map<string, ReturnType<typeof setTimeout>>());
   useEffect(() => {
     const now = new Set(items.map(key));
     const gone = previous.current.map((item, index) => ({ item, index })).filter(({ item }) => !now.has(key(item)));
     previous.current = items;
-    if (!gone.length) return;
-    setLeaving((old) => { const next = new Map(old); for (const g of gone) next.set(key(g.item), g); return next; });
-    const timer = setTimeout(() => setLeaving((old) => { const next = new Map(old); for (const g of gone) next.delete(key(g.item)); return next; }), ms);
-    return () => clearTimeout(timer);
+    const back = [...timers.current.keys()].filter((k) => now.has(k));
+    for (const k of back) { clearTimeout(timers.current.get(k)); timers.current.delete(k); }
+    if (!gone.length && !back.length) return;
+    setLeaving((old) => {
+      const next = new Map(old);
+      for (const k of back) next.delete(k);
+      for (const g of gone) next.set(key(g.item), g);
+      return next;
+    });
+    for (const g of gone) {
+      const k = key(g.item);
+      clearTimeout(timers.current.get(k));
+      timers.current.set(k, setTimeout(() => {
+        timers.current.delete(k);
+        setLeaving((old) => { const next = new Map(old); next.delete(k); return next; });
+      }, ms));
+    }
   }, [items, key, ms]);
+  useEffect(() => { const all = timers.current; return () => { for (const t of all.values()) clearTimeout(t); all.clear(); }; }, []);
   const out: Array<{ item: T; exiting: boolean }> = items.map((item) => ({ item, exiting: false }));
   for (const { item, index } of [...leaving.values()].sort((a, b) => a.index - b.index)) {
     if (!out.some((o) => key(o.item) === key(item))) out.splice(Math.min(index, out.length), 0, { item, exiting: true });

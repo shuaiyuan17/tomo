@@ -75,6 +75,36 @@ export function shellShortName(command: string): string {
   return name.length > SHORT_NAME_MAX ? `${name.slice(0, SHORT_NAME_MAX - 1)}…` : name;
 }
 
+export const PROSE_LABEL_MAX = 80;
+
+/** Han, kana and Hangul: text in these scripts is a sentence, never a command name. */
+const CJK = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u;
+/** Operators, redirects, substitutions: only a command line has them. */
+const SHELL_OPERATORS = /&&|\|\||[|;<>`$]/;
+
+/**
+ * Whether a shell task's description is the model's own words ("用 stdin 重跑 codex 审 #539",
+ * "Run the e2e suite") rather than the command line itself. The SDK hands over the Bash call's
+ * `description` when there is one and the command otherwise, so the task carries either.
+ * A sentence is one line without shell operators that has CJK in it, or opens with a
+ * capitalised word and goes on (commands are lower case: `npm test`, `codex`).
+ */
+export function isProseDescription(text: string): boolean {
+  const line = text.trim();
+  if (!line || line.includes("\n") || SHELL_OPERATORS.test(line)) return false;
+  return CJK.test(line) || /^\p{Lu}\p{Ll}*(?:-\p{L}+)*\s+\S/u.test(line);
+}
+
+/**
+ * A shell task's label: a description in words is shown whole (on one line, cut with an ellipsis
+ * past PROSE_LABEL_MAX), a command line by its short name (shellShortName).
+ */
+export function shellLabel(description: string): string {
+  if (!isProseDescription(description)) return shellShortName(description);
+  const line = description.trim().replace(/\s+/g, " ");
+  return line.length > PROSE_LABEL_MAX ? `${line.slice(0, PROSE_LABEL_MAX - 1).trimEnd()}…` : line;
+}
+
 /** Shell-type tasks (their description is a command line). */
 export function isShellTask(taskType: string): boolean {
   return taskType === "local_bash";

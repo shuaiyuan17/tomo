@@ -1,6 +1,6 @@
-import { useEffect, useState, type ComponentType } from "react";
+import { useEffect, useState } from "react";
 import { ArrowUpRightIcon, BotIcon, BrainIcon, CircleCheckIcon, CircleDotIcon, CircleIcon, FilePenLineIcon, FileTextIcon, GlobeIcon, ImageIcon,
-  LayersIcon, ListTodoIcon, MessageSquareTextIcon, SearchIcon, TerminalIcon, WrenchIcon } from "lucide-react";
+  LayersIcon, ListTodoIcon, MessageSquareTextIcon, SearchIcon, TerminalIcon, WrenchIcon, type LucideIcon } from "lucide-react";
 import type { TodoEntry, WebSource } from "../../src/web/protocol.js";
 import { cn } from "@/lib/utils";
 import { Trace, TraceCollapsible, TraceCollapsibleContent, TraceCollapsibleTrigger, TraceDescription, TraceIcon, TraceLine, TraceTitle,
@@ -21,7 +21,7 @@ import { callDuration, elapsedSince, groupDuration, groupLabel, groupStart, todo
  * it used are a line each.
  */
 
-const TOOL_ICONS: Record<string, ComponentType> = {
+const TOOL_ICONS: Record<string, LucideIcon> = {
   Bash: TerminalIcon, Read: FileTextIcon,
   Edit: FilePenLineIcon, Write: FilePenLineIcon, MultiEdit: FilePenLineIcon, NotebookEdit: FilePenLineIcon,
   Grep: SearchIcon, Glob: SearchIcon, WebSearch: SearchIcon, WebFetch: GlobeIcon,
@@ -37,7 +37,8 @@ const TOOL_ICONS: Record<string, ComponentType> = {
 const PROSE_TITLES = new Set(["Agent", "Task", "SubagentMessage", "BackgroundTask", "WebSearch"]);
 /** What a row's result is called: a subagent hands back a report, a tool returns output. */
 const resultLabel = (name: string, isError: boolean) => isError ? "Error" : name === "SubagentMessage" || name === "Agent" || name === "Task" ? "Report" : "Output";
-const toolIcon = (name: string) => TOOL_ICONS[name] ?? WrenchIcon;
+/** A tool's trace icon; the Tasks panel marks its subagent and shell tasks with the same ones. */
+export const toolIcon = (name: string) => TOOL_ICONS[name] ?? WrenchIcon;
 
 /**
  * In front of a running step: Tomo's own ring, drawing itself. The accent

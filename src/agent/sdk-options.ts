@@ -240,6 +240,12 @@ export function sdkOptions(
       // an unstripped index into group sessions if pointed at ours, and its
       // extract/dream passes are gated by server flags we cannot see.
       autoMemoryEnabled: false,
+      // claude.ai connectors (Gmail, Calendar, Drive, Claude Docs, ...) ride
+      // the CLI's claude.ai login, not our mcpServers — `mcpServers: {}`
+      // would not drop them. They reach the owner's private accounts, so a
+      // group's own session never loads them. Session-level: a group
+      // summoned into the owner's DM keeps them on purpose (owner present).
+      ...(isGroup ? { disableClaudeAiConnectors: true } : {}),
       attribution: {
         commit: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
         pr: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",

@@ -6,7 +6,6 @@ import { markDefiniteFailure } from "./types.js";
 import { watchBus, type WatchBus } from "../watch/bus.js";
 import type { WatchEvent, WatchTask } from "../watch/protocol.js";
 import type { SdkSignal } from "../agent/sdk-signals.js";
-import { RewindMarks, rewindTargetMatches } from "../web/rewind-marks.js";
 import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
 import { webSessionId } from "../web/owner.js";
 import { WebEvents } from "../web/events.js";
@@ -22,11 +21,8 @@ import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request
 import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
 import type { WebModelChangeResult, WebModelView } from "../web/protocol.js";
 import { modelLabel } from "../models.js";
-import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type WebRewindMark, type WebRewindResult, type WebStopResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
+import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type WebStopResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
-/** The agent's checked rewind, as the web channel calls it (see Agent.rewindFromWeb). */
-export type WebRewind = (sessionKey: string, count: number, matches: (preview: string) => boolean) => Promise<
-  { ok: true; count: number; preview: string } | { ok: false; reason: "turn_in_flight" | "rewind_mismatch" | "nothing_to_rewind" | "rewind_failed" }>;
 /** A running tool's progress reaches the browser at most this often; the page counts in between. */
 export const TOOL_PROGRESS_EVERY_MS = 10_000;
 /** A shell task's full command is served up to this many characters. */
@@ -95,8 +91,6 @@ export class WebChannel implements Channel {
   private readonly compact: ((sessionKey: string, onSettled: (outcome: "done" | "unverified" | "failed") => void) => "queued" | "already_requested" | "no_owner") | undefined;
   private compactState: WebCompactState | undefined;
   private readonly stopTurn: ((sessionKey: string) => Promise<boolean>) | undefined;
-  private readonly rewind: WebRewind | undefined;
-  private readonly rewindMarks: RewindMarks;
   private readonly configuredModel: ((sessionKey: string) => string | undefined) | undefined;
   /** Model id per browser session: the SDK's report, else the configured model. */
   private modelBySession = new Map<string, string>();
@@ -144,10 +138,6 @@ export class WebChannel implements Channel {
       uploads?: { dir: string; workspaceDir: string | undefined };
       /** Durable receipts; loaded here, before any request is accepted. */
       journal?: WebRequestJournal;
-      /** "Rewind to here": the agent's checked rewind (Agent.rewindFromWeb). */
-      rewind?: WebRewind;
-      /** Where browser rewinds are remembered across restarts (see rewind-marks.ts). */
-      rewindMarksPath?: string;
       /** Soft-stops the running turn of `sessionKey`; false when nothing was running. */
       stop?: (sessionKey: string) => Promise<boolean>;
       /** The model `sessionKey` is configured to run on. */
@@ -162,8 +152,6 @@ export class WebChannel implements Channel {
     this.sessionKeys = options.sessionKeys;
     this.usageReader = options.usage;
     this.stopTurn = options.stop;
-    this.rewind = options.rewind;
-    this.rewindMarks = new RewindMarks(options.rewindMarksPath);
     this.configuredModel = options.model;
     this.taskOutput = options.taskOutput;
     this.toolCommand = options.toolCommand;
@@ -339,8 +327,7 @@ export class WebChannel implements Channel {
       ...(this.compactState ? { compact: { ...this.compactState } } : {}),
       ...(this.modelBySession.size ? { models: Object.fromEntries(this.modelBySession) } : {}),
       ...(this.rateLimit ? { rateLimit: { ...this.rateLimit } } : {}),
-      ...(this.suggestions.size ? { suggestions: Object.fromEntries(this.suggestions) } : {}),
-      ...(this.rewindMarks.list().length ? { rewinds: this.rewindMarks.list() } : {}) };
+      ...(this.suggestions.size ? { suggestions: Object.fromEntries(this.suggestions) } : {}) };
   }
 
   /**
@@ -377,30 +364,6 @@ export class WebChannel implements Channel {
     const key = this.ownerKey();
     if (!this.stopTurn || !this.ownerId || !key) throw new WebError(409, "owner_setup_required");
     return { stopped: await this.stopTurn(key).catch(() => false) };
-  }
-
-  /**
-   * "Rewind to here" on one of the owner's messages: the model's context goes
-   * back to before it, Tomo's transcript is untouched. `count` is how many of
-   * the conversation's latest user messages that is, `text` the message the
-   * owner pointed at (the rewind is refused unless the SDK would cut exactly
-   * there), `from` its timestamp. Refused while a turn runs: this never stops
-   * one.
-   */
-  async rewindOwner(count: number, text: string, from: number): Promise<WebRewindResult> {
-    const key = this.ownerKey();
-    if (!this.rewind || !this.ownerId || !key) throw new WebError(409, "owner_setup_required");
-    if (this.tornDown) throw new WebError(503, "ingress_closed");
-    const at = this.now();
-    if (from > at) throw new WebError(400, "invalid_rewind");
-    const outcome = await this.rewind(key, count, (preview) => rewindTargetMatches(preview, text));
-    if (!outcome.ok) throw new WebError(outcome.reason === "rewind_failed" ? 503 : 409, outcome.reason);
-    const mark: WebRewindMark = { sessionId: this.ownerId, from, at: this.now(), count: outcome.count };
-    this.rewindMarks.add(mark);
-    // What the model would have been asked next no longer follows from its context.
-    this.setSuggestion(this.ownerId, null);
-    this.publishQuietly({ type: "rewind", mark });
-    return { count: outcome.count, mark };
   }
 
   /** The owner conversation's model as configured, when the SDK has not reported one since it last changed. */

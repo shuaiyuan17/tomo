@@ -175,8 +175,6 @@ export type WebEvent =
   | { type: "rate-limit"; limit: WebRateLimit }
   /** The model a session runs on (the SDK's own report once it has one, else the configured one). */
   | { type: "model"; sessionId: string; model: string }
-  /** The owner rewound the conversation from a browser. */
-  | { type: "rewind"; mark: WebRewindMark }
   /** The SDK's predicted next message for the composer; null withdraws it. */
   | { type: "suggestion"; sessionId: string; text: string | null }
   /** All tasks of one session, live and recently ended. REPLACE semantics. */
@@ -199,8 +197,6 @@ export interface WebBootstrap extends WebCatalog {
   rateLimit?: WebRateLimit;
   /** The standing prompt suggestion per session. */
   suggestions?: Record<string, string>;
-  /** Rewinds made from the browser (see WebRewindMark). */
-  rewinds?: WebRewindMark[];
   /** What the UI calls the agent (config `agent.name`, else IDENTITY.md, else "Tomo"); absent on older daemons. */
   agentName?: string;
 }
@@ -278,8 +274,6 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("context-events"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict(),
   z.object({ method: z.literal("usage"), refresh: z.boolean() }).strict(),
   z.object({ method: z.literal("compact"), epoch: z.uuid() }).strict(),
-  /** Rewind the owner conversation to before one of its user messages. */
-  z.object({ method: z.literal("rewind"), epoch: z.uuid(), count: z.number().int().min(1).max(500), text: z.string().min(1).max(16_000), from: z.number().int().positive() }).strict(),
   /** Stop the owner conversation's running turn. */
   z.object({ method: z.literal("stop"), epoch: z.uuid() }).strict(),
   /** A task the browser was shown, by its browser session: where to read it. */
@@ -292,23 +286,12 @@ export const rpcSchema = z.discriminatedUnion("method", [
     model: z.string().trim().min(1).max(200), from: z.string().min(1).max(200) }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
-export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "models" | "rateLimit" | "suggestions" | "rewinds">;
+export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "models" | "rateLimit" | "suggestions">;
 export interface WebSync { snapshot: WebSnapshot; replay: EventEnvelope[] | null }
 /** Daemon answer to the `task` RPC. `sessionKey` stays inside the web process. */
 export interface WebTaskAccess { sessionKey: string; taskType: string; output?: TaskOutput;
   /** A shell task's full command, redacted and capped (see redact-command.ts). */
   command?: { text: string; truncated: boolean } }
-/**
- * A rewind made from the browser: the model no longer has the owner
- * conversation's messages from `from` (the first rewound message's timestamp)
- * up to `at` (when it was rewound). Tomo's transcript keeps them, so the page
- * shows them as rewound. Both are daemon-clock ms epochs.
- */
-export interface WebRewindMark { sessionId: string; from: number; at: number; count: number }
-/** "Rewind to here": how many of the conversation's latest user messages to go back, and which one that should be. */
-export const rewindSchema = z.object({ count: z.number().int().min(1).max(500), text: z.string().min(1).max(16_000),
-  from: z.number().int().positive(), confirm: z.literal(true) }).strict();
-export interface WebRewindResult { count: number; mark: WebRewindMark }
 /** Answer to a stop request: whether a turn was running to stop. */
 export interface WebStopResult { stopped: boolean }
 /** Answer to a compact request: queued, or one is already outstanding. */

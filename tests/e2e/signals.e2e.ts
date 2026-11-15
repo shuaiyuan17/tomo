@@ -19,15 +19,12 @@ let channel: WebChannel;
 let supervisor: WebSupervisor;
 let browser: Browser;
 let url: string;
-let rewindPreview = "";
 beforeEach(async () => {
   watchBus.reset();
   mockConfig.identities = [{ name: "owner", channels: { telegram: "test-owner" }, replyPolicy: "last-active" }];
   agent = new Agent();
   channel = new WebChannel(mockConfig.owner, undefined, { stop: (key) => agent.stopTurn(key), model: (key) => agent.modelFor(key),
-    models: { view: (key) => agent.webModelView(key), switch: (key, model, from) => agent.switchModelFromWeb(key, model, from) },
-    // The fork itself is covered in tests/web-rewind.test.ts; here the SDK's preview is whatever the test says it would cut at.
-    rewind: async (_key, count, matches) => matches(rewindPreview) ? { ok: true, count, preview: rewindPreview } : { ok: false, reason: "rewind_mismatch" } });
+    models: { view: (key) => agent.webModelView(key), switch: (key, model, from) => agent.switchModelFromWeb(key, model, from) } });
   supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0 });
   channel.attach(supervisor); agent.addChannel(channel); agent.addChannel(new MockChannel("telegram"));
   await channel.start();
@@ -154,42 +151,4 @@ it("on a phone: no zoom-triggering fields, a compact header, and the view follow
   await page.screenshot({ path: "test-results/chat-phone.png" });
   await input.focus();
   await page.screenshot({ path: "test-results/chat-phone-focused.png" });
-});
-
-it("rewinds to one of the owner's messages: confirm, marker, the message back in the composer; a mismatch changes nothing", async () => {
-  const page = await open({ viewport: { width: 1440, height: 900 } });
-  const input = page.getByRole("textbox", { name: "Message Tomo" });
-  let answers = 0;
-  mockSdk.responseFn = () => `Answer ${++answers}.`;
-  for (const [index, text] of ["Plan the trip to Kyoto", "Make it five days", "Add a day in Nara"].entries()) {
-    await input.fill(text);
-    await page.getByRole("button", { name: "Send", exact: true }).click();
-    await browserExpect(page.locator(".message.assistant").filter({ hasText: `Answer ${index + 1}.` })).toBeVisible();
-  }
-  const second = page.locator(".message.user").filter({ hasText: "Make it five days" });
-  const rewindButton = second.getByRole("button", { name: "Rewind the conversation to before this message" });
-  // Replies have no rewind control.
-  await browserExpect(page.locator(".message.assistant").getByRole("button", { name: /Rewind the conversation/ })).toHaveCount(0);
-
-  // The SDK would cut somewhere else: refused, nothing marked.
-  rewindPreview = "[web · Sun 11/15 04:20 UTC] Some other message";
-  await second.hover(); await rewindButton.click();
-  await browserExpect(second.getByRole("group", { name: "Confirm rewind" })).toContainText("everything after it (2 of your messages)");
-  await second.getByRole("button", { name: "Rewind", exact: true }).click();
-  await browserExpect(page.locator(".feedback")).toContainText("Not rewound: this message does not line up");
-  await browserExpect(page.getByRole("separator").filter({ hasText: "Rewound from here" })).toHaveCount(0);
-
-  rewindPreview = "[web · Sun 11/15 04:20 UTC] Make it five days";
-  await second.hover(); await rewindButton.click();
-  await second.getByRole("button", { name: "Rewind", exact: true }).click();
-  await browserExpect(page.locator(".feedback")).toContainText("Rewound. Tomo no longer has this message");
-  await browserExpect(input).toHaveValue("Make it five days");
-  await browserExpect(page.getByRole("separator").filter({ hasText: "Rewound from here" })).toHaveCount(1);
-  // What was rewound stays readable but can no longer be rewound to; what came before still can.
-  await browserExpect(second.getByRole("button", { name: /Rewind the conversation/ })).toHaveCount(0);
-  await browserExpect(page.locator(".message.user").filter({ hasText: "Plan the trip to Kyoto" }).getByRole("button", { name: /Rewind the conversation/ })).toHaveCount(1);
-  await page.screenshot({ path: "test-results/rewind-desktop.png" });
-  // The mark comes from the daemon, so a reload keeps it.
-  await page.reload();
-  await browserExpect(page.getByRole("separator").filter({ hasText: "Rewound from here" })).toHaveCount(1);
 });

@@ -243,8 +243,6 @@ async function startForeground(): Promise<void> {
         toolCommand: (key, toolUseId) => agent.readToolCommand(key, toolUseId),
         compact: (key, onSettled) => agent.requestOwnerCompact(key, onSettled),
         stop: (key) => agent.stopTurn(key),
-        rewind: (key, count, matches) => agent.rewindFromWeb(key, count, matches),
-        rewindMarksPath: join(config.tomoHome, "data", "web", "rewinds.json"),
         model: (key) => agent.modelFor(key),
         taskModel: subagentModelReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
         usage: (refresh) => usageCache.get(refresh),

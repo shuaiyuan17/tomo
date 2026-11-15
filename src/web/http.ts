@@ -9,7 +9,7 @@ import { MemoryReadError } from "../workspace/memory-reader.js";
 import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
-import { cronChangeSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, rewindSchema, WebError,
+import { cronChangeSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
   type EventEnvelope, type Rpc, type WebCompaction, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
 
 /**
@@ -240,18 +240,6 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         const epoch = req.headers["x-tomo-epoch"];
         if (typeof epoch !== "string" || !/^[a-f0-9-]{36}$/.test(epoch)) throw new WebError(409, "epoch_required");
         json(res, 202, await deps.rpc({ method: "compact", epoch }));
-        return;
-      } else if (req.method === "POST" && url.pathname === "/api/v1/rewind") {
-        // "Rewind to here" on the owner conversation, guarded like a cron
-        // action: CSRF, JSON with confirm: true, the current daemon epoch.
-        csrf.verify(req, session!);
-        const epoch = req.headers["x-tomo-epoch"];
-        if (typeof epoch !== "string" || epoch !== await deps.rpc({ method: "epoch" })) throw new WebError(409, "epoch_changed");
-        const parsed = rewindSchema.safeParse(await body(req));
-        if (!parsed.success) throw new WebError(400, "invalid_rewind");
-        const { ownerId } = deps.data.catalog();
-        if (!ownerId) throw new WebError(409, "owner_setup_required");
-        json(res, 200, await deps.rpc({ method: "rewind", epoch, count: parsed.data.count, text: parsed.data.text, from: parsed.data.from }));
         return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/stop") {
         // Stops the owner conversation's running turn. Same gate as a message.

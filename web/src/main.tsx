@@ -1,7 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
-import { api, ApiError, dismissRequest, rewindTo, sendMessage, stopTurn } from "./api.js";
-import { rewindCount, rewindRefusal, rewoundBy, startsRewind } from "./rewind.js";
+import { api, ApiError, dismissRequest, sendMessage, stopTurn } from "./api.js";
 import { useWeb } from "./use-web.js";
 import { createCompositionGuard } from "./compose-keys.js";
 import { Text } from "./markdown.js";
@@ -13,7 +12,7 @@ import { CompactButton } from "./compact-button.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
-import { ArrowUp, ImagePlus, Sparkles, Square, Undo2, RotateCw, X, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
+import { ArrowUp, ImagePlus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
 import { Study } from "./study.js";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { ScreenWindow } from "./screen.js";
@@ -393,24 +392,6 @@ export function App() {
   // The SDK's predicted next message: offered only while the composer is empty and idle.
   const suggestion = session?.writable && !turnActive && !draft && !attachments.items.length && !resending && !uncertain ? web.suggestions[selectedId] : undefined;
   const model = web.models[selectedId];
-  // "Rewind to here" on one of the owner's own messages: the model's context
-  // goes back to before it; the history stays, shown as rewound.
-  const [confirmRewind, setConfirmRewind] = useState<string | null>(null);
-  const [rewinding, setRewinding] = useState(false);
-  const canRewind = !!session?.writable && !turnActive && web.connection === "live" && pendingUsers.length === 0 && !sending;
-  const rewind = async (message: HistoryPage["messages"][number], count: number) => {
-    if (!web.bootstrap || rewinding) return;
-    setRewinding(true);
-    try {
-      await rewindTo({ count, text: parseReply(message.content).body, from: message.timestamp }, web.bootstrap, web.refreshBootstrap);
-      setConfirmRewind(null);
-      // Edit and retry: the rewound message comes back to an empty composer.
-      setDraft((old) => old || parseReply(message.content).body);
-      setFeedback(`Rewound. ${agent} no longer has this message or what followed; edit it below and send to continue.`);
-      input.current?.focus();
-    } catch (error) { setConfirmRewind(null); setFeedback(rewindRefusal(error instanceof ApiError ? error.code : undefined)); }
-    finally { setRewinding(false); }
-  };
   const usage = session?.stats;
   const hasContext = !!usage?.contextMax;
   const sessions = web.bootstrap?.sessions ?? [];
@@ -516,23 +497,14 @@ export function App() {
           {rows.map((row, rowIndex) => <ChatRow key={row.id} row={row}>{row.kind === "message" && <>{row.tools.map((block) => toolBlock(block, false))}{(() => {
             const message = row.message; const index = messageIndex.get(message.id)!;
             const { reply, body } = parseReply(message.content); const quoted = reply && findQuoted(history.messages, index, reply);
-            const rewound = rewoundBy(web.rewinds, selectedId, message.timestamp); const back = canRewind && !rewound ? rewindCount(history.messages, index, (timestamp) => !!rewoundBy(web.rewinds, selectedId, timestamp)) : null;
-            return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", "group/message", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
-            {startsRewind(web.rewinds, selectedId, history.messages, index) && <div role="separator" className="mb-5 flex items-center gap-3 tracking-[0.02em] text-[11px] text-muted-foreground">
-              <span className="h-px flex-1 bg-border" /><Undo2 className="size-3" strokeWidth={1.75} aria-hidden="true" /><span>Rewound from here · no longer in {agent}'s context</span><span className="h-px flex-1 bg-border" /></div>}
+            return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
-              {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}
-              {back !== null && <button type="button" onClick={() => setConfirmRewind(confirmRewind === message.id ? null : message.id)} title="Rewind to before this message" aria-label="Rewind the conversation to before this message" aria-expanded={confirmRewind === message.id}
-                className="ml-auto grid size-6 place-items-center self-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-foreground/[0.07] hover:text-foreground focus-visible:opacity-100 group-hover/message:opacity-100 aria-expanded:opacity-100 [@media(hover:none)]:opacity-70"><Undo2 className="size-3.5" strokeWidth={1.75} /></button>}</div>
-            <div className={cn("markdown", message.role === "user" && "rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5", message.role === "assistant" && "reading", rewound && "opacity-55")}>
+              {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
+            <div className={cn("markdown", message.role === "user" && "rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5", message.role === "assistant" && "reading")}>
               {message.role === "assistant" && body.trim() === "NO_REPLY"
                 // A turn that ended without a reply (silent by choice, or stopped): said plainly, not as the agent's words.
                 ? <p className="m-0 font-sans text-[12.5px] text-muted-foreground">No reply</p>
                 : <MessageBody body={body} reply={reply} sessionId={selectedId} onQuote={quoted ? () => showMessage(quoted.id) : undefined} thinking={message.role === "assistant" ? "joined" : undefined} />}</div>
-            {back !== null && confirmRewind === message.id && <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground motion-enter" role="group" aria-label="Confirm rewind">
-              <span>Rewind to before this message? {agent} forgets it{back > 1 ? ` and everything after it (${back} of your messages)` : " and its reply"}. The history stays here; actions already taken are not undone.</span>
-              <Button variant="outline" size="sm" className="h-7 rounded-lg text-xs" disabled={rewinding} aria-busy={rewinding} onClick={() => void rewind(message, back)}>Rewind</Button>
-              <Button variant="ghost" size="sm" className="h-7 rounded-lg text-xs" onClick={() => setConfirmRewind(null)}>Cancel</Button></div>}
             {message.role === "user" && interruptedActions(web.requests.find((r) => r.requestId === message.requestId && awaitingOwner(r)))}</article>; })()}</>}
           {row.kind === "pending" && ((request: WebRequest) => <article className="message user motion-enter mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">You</span><span>Web</span>

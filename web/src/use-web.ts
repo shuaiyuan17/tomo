@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, readBootstrap, stream, type WebBootstrap } from "./api.js";
-import type { WebCompactState, WebEvent, WebRateLimit, WebRequest, WebRewindMark, WebSnapshot, WebTask } from "../../src/web/protocol.js";
+import type { WebCompactState, WebEvent, WebRateLimit, WebRequest, WebSnapshot, WebTask } from "../../src/web/protocol.js";
 import { replaceSessionTasks } from "./tasks.js";
 import { trimRequests } from "./pending.js";
 import { isTransient, TYPING_ACTIVITY, type TurnStatus } from "./composer-status.js";
@@ -28,8 +28,6 @@ export function useWeb() {
   const [rateLimit, setRateLimit] = useState<WebRateLimit>();
   /** The SDK's predicted next message per conversation. */
   const [suggestions, setSuggestions] = useState<Record<string, string>>({});
-  /** Rewinds made from a browser: what the history still shows but the model no longer has. */
-  const [rewinds, setRewinds] = useState<WebRewindMark[]>([]);
   const [revision, setRevision] = useState(0);
   /** Bumped whenever the daemon reports a cron run; Study / Scheduled re-read /cron. */
   const [cronRevision, setCronRevision] = useState(0);
@@ -74,7 +72,7 @@ export function useWeb() {
       setBlocks(value.blocks); setRequests(value.requests); setActivity({}); setTasks(value.tasks ?? []); setCompact(value.compact);
       // Turn statuses are of the moment: a (re)connect starts without them.
       setTurns({}); setModels(value.models ?? {}); setSuggestions(value.suggestions ?? {});
-      setRateLimit(value.rateLimit); setRewinds(value.rewinds ?? []);
+      setRateLimit(value.rateLimit);
       // A (re)connect may have missed cron events while the stream was down.
       setConnection("live"); refresh(); setCronRevision((r) => r + 1);
     };
@@ -90,7 +88,6 @@ export function useWeb() {
       }
       if (event.type === "model") setModels((old) => ({ ...old, [event.sessionId]: event.model }));
       if (event.type === "rate-limit") setRateLimit(event.limit);
-      if (event.type === "rewind") setRewinds((old) => [...old.filter((mark) => mark.at !== event.mark.at || mark.sessionId !== event.mark.sessionId), event.mark]);
       if (event.type === "suggestion") {
         const { sessionId, text } = event;
         setSuggestions((old) => text ? { ...old, [sessionId]: text } : old[sessionId] ? without(old, sessionId) : old);
@@ -129,5 +126,5 @@ export function useWeb() {
     void connect();
     return () => { controller.abort(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
-  return { bootstrap, connection, blocks, requests, activity, toolTicks, tasks, compact, turns, models, rateLimit, suggestions, rewinds, revision, cronRevision, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
+  return { bootstrap, connection, blocks, requests, activity, toolTicks, tasks, compact, turns, models, rateLimit, suggestions, revision, cronRevision, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
 }

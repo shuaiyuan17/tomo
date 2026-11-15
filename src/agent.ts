@@ -99,11 +99,6 @@ const REWIND_SHUTDOWN_TIMEOUT_MS = 3_000;
  */
 const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
 
-
-/** The message the SDK would rewind to is not the one the owner pointed at (see Agent.rewindFromWeb). */
-export class RewindTargetMismatch extends Error {
-  constructor() { super("rewind target mismatch"); }
-}
 export class Agent {
   private channels: Channel[] = [];
   private sessions: SessionStore;
@@ -589,9 +584,9 @@ export class Agent {
    * conversation. Nothing queued is dropped or re-run. Rewinds of one key
    * run one at a time.
    */
-  private rewindSession(key: string, count: number, expect?: (preview: string) => boolean): Promise<RewindOutcome> {
+  private rewindSession(key: string, count: number): Promise<RewindOutcome> {
     const previous = this.rewinds.get(key) ?? Promise.resolve();
-    const run = previous.then(() => this.rewindSessionNow(key, count, expect));
+    const run = previous.then(() => this.rewindSessionNow(key, count));
     const settled = run.then(() => {}, () => {});
     this.rewinds.set(key, settled);
     this.activeRewinds.add(settled);
@@ -602,34 +597,7 @@ export class Agent {
     return run;
   }
 
-  /**
-   * "Rewind to here" from the web UI: the same fork as /rewind, with two
-   * differences. It never stops a running turn (the owner pointed at a
-   * message, not at a stuck turn: refused, Stop is the control for that), and
-   * it is CHECKED: `matches` is shown the SDK's preview of the message it
-   * would rewind to, before the new link is published. The browser counts
-   * messages in Tomo's transcript, the fork counts human entries in the
-   * SDK's, and the two can differ (a batch coalesced into one entry, a cut
-   * that moved back past a tool call, history compacted away). A mismatch
-   * discards the fork and changes nothing, rather than rewinding somewhere
-   * the owner did not point.
-   */
-  async rewindFromWeb(key: string, count: number, matches: (preview: string) => boolean): Promise<
-    { ok: true; count: number; preview: string } | { ok: false; reason: "turn_in_flight" | "rewind_mismatch" | "nothing_to_rewind" | "rewind_failed" }> {
-    if (this.liveSessionManager.hasTurnInFlight(key)) return { ok: false, reason: "turn_in_flight" };
-    try {
-      const outcome = await this.rewindSession(key, count, matches);
-      if (outcome.nothingToRewind) return { ok: false, reason: "nothing_to_rewind" };
-      log.info({ key, count: outcome.count }, "Context rewound from the web UI");
-      return { ok: true, count: outcome.count, preview: outcome.preview };
-    } catch (err) {
-      if (err instanceof RewindTargetMismatch) return { ok: false, reason: "rewind_mismatch" };
-      log.warn({ err, key }, "Web rewind failed");
-      return { ok: false, reason: /no active conversation|can be rewound in the current context/i.test(String((err as Error)?.message)) ? "nothing_to_rewind" : "rewind_failed" };
-    }
-  }
-
-  private async rewindSessionNow(key: string, count: number, expect?: (preview: string) => boolean): Promise<RewindOutcome> {
+  private async rewindSessionNow(key: string, count: number): Promise<RewindOutcome> {
     const stopping = () => new Error("Tomo is stopping. Try again after restart.");
     if (this.stopping) throw stopping();
     // A brand-new conversation has no stored SDK id until its first turn
@@ -650,8 +618,6 @@ export class Agent {
       const rewind = await prepareSettledSessionRewind(sid, count, config.workspaceDir, config.sdkSessionsDir, (prepared) => {
         if (this.stopping) throw stopping();
         prepared.assertUnchanged();
-        // Thrown before the link is published: the fork is discarded, nothing changed.
-        if (expect && (prepared.count !== count || !expect(prepared.preview))) throw new RewindTargetMismatch();
         this.sessions.replaceSdkSessionId(key, sid, prepared.sessionId);
       }, { signal: this.rewindAbort.signal });
       return { count: rewind.count, preview: rewind.preview, stoppedTurn: suspension.stoppedTurn, droppedMessages: suspension.droppedMessages };

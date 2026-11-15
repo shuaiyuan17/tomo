@@ -403,10 +403,14 @@ describe("send_message direct mode", () => {
     const secondAgent = new Agent();
     const internals = secondAgent as unknown as {
       drainPendingNotes(key: string): string;
+      pendingNotesQueue: { settle(key: string, drained: string): void };
     };
-    expect(internals.drainPendingNotes("telegram:12345")).toContain(
+    const drained = internals.drainPendingNotes("telegram:12345");
+    expect(drained).toContain(
       'Tomo from another session sent the following message to this conversation earlier: "survive restart"',
     );
+    // The turn that carried it ended (until then a crash re-delivers it).
+    internals.pendingNotesQueue.settle("telegram:12345", drained);
     await secondAgent.stop();
 
     const thirdAgent = new Agent();

@@ -327,6 +327,9 @@ export interface TurnRunnerDeps {
   drainPendingNotes(sessionKey: string): string;
   /** Put drained notes back: the turn they were drained for never ran. */
   restorePendingNotes?(sessionKey: string, drained: string): void;
+  /** The turn the notes were drained for has ended: drop them from the
+   *  durable store (until now a crash re-delivers them). */
+  settlePendingNotes?(sessionKey: string, drained: string): void;
   runWithRetry(req: RunWithRetryRequest): Promise<string>;
   /** Append an assistant response to the session transcript. */
   appendAssistantTranscript(sessionKey: string, content: string, channelName: string, correlation?: { requestId?: string; turnId: string }): void;
@@ -450,6 +453,7 @@ export class TurnRunner {
       return ok;
     } finally {
       if (!declined) {
+        if (notes) this.deps.settlePendingNotes?.(spec.key, notes);
         this.deps.recordTurnOutcome?.(spec.key, ok);
         watchBus.publish({
           type: "turn.end",

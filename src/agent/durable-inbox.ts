@@ -53,6 +53,17 @@ import type { SessionResolution } from "../router.js";
  * keeps a second daemon out, so there is no cross-process lock. Compaction is
  * an atomic rewrite; a torn tail line from a crash mid-append is preserved in
  * a `.corrupt-<ts>` sibling rather than silently dropped.
+ *
+ * KNOWN LIMITS (accepted). Both need a disk fault followed by a crash. In
+ * that double fault the inbox picks "maybe answered twice" over "lost" — the
+ * at-least-once side:
+ *   - `start` fails twice and the compaction fallback fails too, then the
+ *     daemon crashes before `done`: the log still says `received`, so the
+ *     next start replays a message whose turn may already have replied
+ *     (raised loudly when it happens; see markStarted).
+ *   - An append's fsync reports an error although the bytes did reach disk
+ *     (a Telegram message is then answered in memory, and the owner told):
+ *     a crash before `done` replays the persisted record and answers again.
  */
 
 export type InboxStatus = "received" | "started";

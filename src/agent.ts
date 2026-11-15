@@ -217,6 +217,7 @@ export class Agent {
     this.turnRunner = new TurnRunner({
       drainPendingNotes: (sessionKey) => this.drainPendingNotes(sessionKey),
       restorePendingNotes: (sessionKey, drained) => this.pendingNotesQueue.restore(sessionKey, drained),
+      settlePendingNotes: (sessionKey, drained) => this.pendingNotesQueue.settle(sessionKey, drained),
       // Persisted (sessions' pending-notes file): a reply the owner never got
       // must still be known to the next turn if the daemon restarts first.
       queueDeliveryFailureNote: (sessionKey, note) => this.queuePendingNote(
@@ -2656,15 +2657,32 @@ export class Agent {
       // The messages themselves travel with the note: the turn may have died
       // before the prompt ever reached the transcript, and a note that only
       // says "something was interrupted" leaves nothing to answer.
-      this.queuePendingNote(key, formatTomoEvent(
-        "inbox",
-        `Tomo restarted while a turn was handling ${recs.length === 1 ? "a message" : `${recs.length} messages`} received from ${oldest}. `
-          + "Your reply may be missing or incomplete; check the conversation before assuming it was answered, "
-          + "and answer now if it was not.\n"
-          + formatInterruptedMessages(recs),
-        { name: "interrupted" },
-      ));
-      this.inbox.markDone(recs.map((r) => r.id));
+      //
+      // CUSTODY HAND-OFF. From here the note is the message's only copy, so
+      // the inbox record is closed only once EVERY part of it is in the
+      // durable pending-notes store (which keeps a note until the turn that
+      // carries it ends — see PendingNotesQueue). A note that could not be
+      // persisted leaves the record started: the next start tells the session
+      // again (a repeated note, never a lost message).
+      const chunks = interruptedNoteChunks(recs);
+      let persisted = true;
+      chunks.forEach((chunk, i) => {
+        const part = chunks.length > 1 ? ` (part ${i + 1} of ${chunks.length})` : "";
+        const ok = this.queuePendingNote(key, formatTomoEvent(
+          "inbox",
+          `Tomo restarted while a turn was handling ${recs.length === 1 ? "a message" : `${recs.length} messages`} received from ${oldest}${part}. `
+            + "Your reply may be missing or incomplete; check the conversation before assuming it was answered, "
+            + "and answer now if it was not.\n"
+            + chunk,
+          { name: "interrupted" },
+        ));
+        persisted &&= ok;
+      });
+      if (persisted) {
+        this.inbox.markDone(recs.map((r) => r.id));
+      } else {
+        log.error({ sessionKey: key, count: recs.length }, "Durable inbox: could not persist the interrupted-turn note; the inbox record is kept so the next start tells the session again");
+      }
       log.warn({ sessionKey: key, count: recs.length }, "Durable inbox: turn was interrupted by a restart; session notified, not re-run");
     }
 
@@ -2687,20 +2705,37 @@ export class Agent {
 }
 
 /** Per-message cap on the text quoted in an `interrupted` note. */
-const INTERRUPTED_TEXT_MAX = 1_000;
-/** Messages quoted in one `interrupted` note; the rest are counted. */
-const INTERRUPTED_MAX_MESSAGES = 10;
+const INTERRUPTED_TEXT_MAX = 8_000;
+/** Above this many characters of quoted messages, the note is split into parts. */
+const INTERRUPTED_NOTE_CHUNK = 16_000;
 
-/** The interrupted messages, quoted (truncated) for the session's `interrupted` note. */
-function formatInterruptedMessages(recs: readonly InboxRecord[]): string {
-  const shown = recs.slice(0, INTERRUPTED_MAX_MESSAGES).map((rec, i) => {
-    const raw = rec.message.text ?? "";
-    const text = raw.length > INTERRUPTED_TEXT_MAX ? `${raw.slice(0, INTERRUPTED_TEXT_MAX)}… [truncated]` : raw;
-    const sender = rec.message.senderName ? `${rec.message.senderName}: ` : "";
-    return `Message ${i + 1}${recs.length > 1 ? ` of ${recs.length}` : ""} (${new Date(rec.receivedAt).toISOString()}) — ${sender}${text}`;
+/** One interrupted message as quoted in the note: sender, text, saved attachments. */
+function formatInterruptedMessage(rec: InboxRecord, i: number, total: number): string {
+  const raw = rec.message.text ?? "";
+  const text = raw.length > INTERRUPTED_TEXT_MAX ? `${raw.slice(0, INTERRUPTED_TEXT_MAX)}… [truncated]` : raw;
+  const sender = rec.message.senderName ? `${rec.message.senderName}: ` : "";
+  const attachments = [...(rec.message.images ?? []), ...(rec.message.documents ?? [])]
+    .map((a) => `\n  [attachment ${a.mediaType}: ${a.savedPath ?? "not saved"}]`).join("");
+  return `Message ${i + 1}${total > 1 ? ` of ${total}` : ""} (${new Date(rec.receivedAt).toISOString()}) — ${sender}${text}${attachments}`;
+}
+
+/**
+ * Every interrupted message, quoted, grouped into note-sized chunks. None is
+ * left out: a message not quoted here is a message lost.
+ */
+function interruptedNoteChunks(recs: readonly InboxRecord[]): string[] {
+  const chunks: string[] = [];
+  let current = "";
+  recs.forEach((rec, i) => {
+    const entry = formatInterruptedMessage(rec, i, recs.length);
+    if (current && current.length + entry.length + 1 > INTERRUPTED_NOTE_CHUNK) {
+      chunks.push(current);
+      current = "";
+    }
+    current = current ? `${current}\n${entry}` : entry;
   });
-  const more = recs.length - shown.length;
-  return shown.join("\n") + (more > 0 ? `\n(+${more} more not shown)` : "");
+  if (current) chunks.push(current);
+  return chunks;
 }
 
 /** Owner DMs about inbox faults: at most one per this window. */

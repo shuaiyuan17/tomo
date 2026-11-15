@@ -83,7 +83,46 @@ describe("PendingNotesQueue", () => {
     expect(drained).toContain("note-5");
     expect(drained).toContain("note-19");
     expect(queue.drain("telegram:-987")).toBe("");
+    // Still on disk while the turn that took them runs…
+    expect(store.getPendingNotes("telegram:-987")).toHaveLength(15);
+    queue.settle("telegram:-987", drained);
+    // …and gone once it has ended.
     expect(store.getPendingNotes("telegram:-987")).toEqual([]);
+  });
+
+  it("keeps drained notes durable until their turn settles, alongside notes queued meanwhile", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", "before");
+    const drained = queue.drain("k");
+    queue.queueNote("k", "during");
+    expect(store.getPendingNotes("k")).toEqual(["before", "during"]);
+
+    // A crash here: the next process sees both and delivers both.
+    const next = new PendingNotesQueue(store);
+    expect(next.drain("k")).toContain("before");
+
+    queue.settle("k", drained);
+    expect(store.getPendingNotes("k")).toEqual(["during"]);
+  });
+
+  it("restore puts a drained batch back without duplicating it on disk", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", "n1");
+    const drained = queue.drain("k");
+    queue.restore("k", drained);
+    expect(store.getPendingNotes("k")).toEqual(["n1"]);
+    expect(queue.drain("k")).toContain("n1");
+  });
+
+  it("never caps away a durable-inbox note (the message's only copy)", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", '<tomo-event type="inbox" name="interrupted" ts="x">\nthe message\n</tomo-event>');
+    for (let i = 0; i < 30; i++) queue.queueNote("k", `note-${i}`);
+    expect(queue.peekNotes("k")[0]).toContain("the message");
+    expect(queue.peekNotes("k")).toHaveLength(15);
   });
 
   it("caps pending error notes before injecting them into a prompt", () => {

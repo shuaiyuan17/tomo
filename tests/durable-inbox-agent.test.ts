@@ -420,3 +420,96 @@ describe("durable inbox: steered into another turn", () => {
     await agent.stop();
   });
 });
+
+describe("durable inbox: the interrupted-turn note takes custody", () => {
+  async function interruptedFirstRun(chatId: string, text: string): Promise<void> {
+    const first = await boot();
+    let turns = 0;
+    mockSdk.responseFn = () => { turns++; return new Promise(() => {}); };
+    await first.channel.simulateMessage(makeMsg({ id: `i-${chatId}`, chatId, text }));
+    await waitFor(() => expect(turns).toBe(1));
+    crash(first.agent);
+  }
+
+  it("keeps the inbox record when the note cannot be persisted", async () => {
+    await interruptedFirstRun("580", "remember the milk");
+    resetConfig({ inbox: true, imessageInboundSettleMs: 0, tomoHome: mockConfig.tomoHome });
+    const agent = new Agent();
+    const sessions = (agent as unknown as { sessions: { setPendingNotes: (k: string, n: string[]) => void } }).sessions;
+    const realSet = sessions.setPendingNotes.bind(sessions);
+    sessions.setPendingNotes = (k, n) => {
+      if (n.some((x) => x.includes("remember the milk"))) throw new Error("EIO");
+      realSet(k, n);
+    };
+    const channel = new MockChannel("imessage");
+    agent.addChannel(channel);
+    await agent.start();
+    expect(openInbox().pending().map((r) => r.message.text)).toEqual(["remember the milk"]);
+    crash(agent);
+
+    // The next start still has it, and tells the session.
+    const third = await boot();
+    expect(peekPendingNotes(third.agent, "imessage:580").join("\n")).toContain("remember the milk");
+    await third.agent.stop();
+  });
+
+  it("a crash while the note's turn is running delivers the note again", async () => {
+    await interruptedFirstRun("581", "call the plumber");
+    const second = await boot();
+    expect(openInbox().pending()).toEqual([]);
+    // The next turn takes the note and dies mid-turn.
+    let turns = 0;
+    mockSdk.responseFn = () => { turns++; return new Promise(() => {}); };
+    await second.channel.simulateMessage(makeMsg({ id: "next-581", chatId: "581", text: "anything new?" }));
+    await waitFor(() => expect(turns).toBe(1));
+    expect(mockSdk.promptsBySession.some((p) => p.text.includes("call the plumber"))).toBe(true);
+    crash(second.agent);
+
+    const third = await boot();
+    expect(peekPendingNotes(third.agent, "imessage:581").join("\n")).toContain("call the plumber");
+    await third.agent.stop();
+  });
+
+  it("quotes every message in full up to 8000 characters, with saved attachment paths", async () => {
+    const first = await boot(60_000);
+    const long = `${"y".repeat(7_990)}TAIL`;
+    await first.channel.simulateMessage(makeMsg({ id: "q0", chatId: "582", text: long }));
+    for (let i = 1; i <= 11; i++) await first.channel.simulateMessage(makeMsg({ id: `q${i}`, chatId: "582", text: `msg number ${i}` }));
+    await first.channel.simulateMessage(makeMsg({
+      id: "q12", chatId: "582", text: "see photo",
+      images: [{ data: "AAAA", mediaType: "image/png", savedPath: "/tmp/tomo-test-photo.png" }],
+    }));
+    // Mark every record started, as a turn taking them all would.
+    const inbox = (first.agent as unknown as { inbox: DurableInbox }).inbox;
+    inbox.markStarted(inbox.pending().map((r) => r.id));
+    crash(first.agent);
+
+    const second = await boot();
+    const notes = peekPendingNotes(second.agent, "imessage:582").join("\n");
+    expect(notes).toContain("TAIL");
+    expect(notes).toContain("msg number 11");
+    expect(notes).toContain("/tmp/tomo-test-photo.png");
+    await second.agent.stop();
+  });
+});
+
+describe("durable inbox: start means the SDK took it", () => {
+  it("a steered message still waiting in the input queue is replayed after a crash", async () => {
+    const { agent, channel } = await bootWith("imessage", realWrite, { steering: true });
+    // No echo: the mock SDK does not pull the steered message while the host turn runs.
+    mockSdk.responseFn = (text) => (text.includes("CRON JOB") ? new Promise(() => {}) : Promise.resolve("misc"));
+    void agent.handleCronMessage("CRON JOB", "imessage:583");
+    await waitFor(() => expect(steers(agent, "imessage:583")).toBe(0));
+    const live = () => (agent as unknown as { liveSessionManager: { isBusy(k: string): boolean } }).liveSessionManager.isBusy("imessage:583");
+    await waitFor(() => expect(live()).toBe(true));
+    await channel.simulateMessage(makeMsg({ id: "q-583", chatId: "583", text: "queued not taken" }));
+    await waitFor(() => expect(steers(agent, "imessage:583")).toBe(1));
+    expect(openInbox().pending()[0]?.status).toBe("received");
+    crash(agent);
+
+    const second = await boot();
+    mockSdk.responseFn = async () => "replayed";
+    await waitFor(() => expect(second.channel.delivered.map((d) => d.text)).toEqual(["replayed"]));
+    await second.agent.stop();
+  });
+});

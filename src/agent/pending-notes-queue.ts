@@ -20,15 +20,51 @@ function pendingErrorChars(notes: string[]): number {
   return notes.reduce((sum, note) => sum + note.length, 0);
 }
 
+/**
+ * Notes the cap never drops: a durable-inbox `replay`/`interrupted` note is
+ * the only remaining copy of a message (its inbox record is already done), so
+ * losing it to the cap would lose the message.
+ */
+function isPinnedNote(note: string): boolean {
+  return note.startsWith('<tomo-event type="inbox"');
+}
+
+/** Drop oldest unpinned notes until `arr` fits the cap (pinned ones always stay). */
+function capNotes(arr: string[]): number {
+  let dropped = 0;
+  for (let i = 0; i < arr.length && arr.length > MAX_PENDING_NOTES;) {
+    if (isPinnedNote(arr[i])) { i++; continue; }
+    arr.splice(i, 1);
+    dropped++;
+  }
+  return dropped;
+}
+
+interface InFlightBatch {
+  prefix: string;
+  notes: string[];
+}
+
+/**
+ * Per-session prompt notes, durable until the turn that carries them ENDS.
+ *
+ * TWO-PHASE. `drain` hands the notes to a turn but keeps them in the durable
+ * store as "in flight"; `settle` (the turn finished, same moment the durable
+ * inbox marks its messages done) removes them; `restore` (the turn never
+ * reached the model) puts them back in the queue. A crash in between leaves
+ * them in the store, so the next process delivers them again — at least once,
+ * never zero times. The store always holds in-flight notes (oldest batch
+ * first) followed by queued ones.
+ */
 export class PendingNotesQueue {
+  /** Queued, not yet drained. Absent: not loaded from the store this process. */
   private notes = new Map<string, string[]>();
+  private inflight = new Map<string, InFlightBatch[]>();
   private errorNotes = new Map<string, string[]>();
 
   constructor(private store: DurablePendingNotesStore) {}
 
-  /** Queue a note for the session's next turn. Returns false when it could
-   *  not be persisted (it is still held in memory for this process). */
-  queueNote(sessionKey: string, note: string): boolean {
+  private queued(sessionKey: string): string[] {
     let arr = this.notes.get(sessionKey);
     if (!arr) {
       try {
@@ -37,20 +73,34 @@ export class PendingNotesQueue {
         log.warn({ err, sessionKey }, "Could not load durable pending notes");
         arr = [];
       }
+      this.notes.set(sessionKey, arr);
     }
-    arr.push(note);
-    if (arr.length > MAX_PENDING_NOTES) {
-      const dropped = arr.splice(0, arr.length - MAX_PENDING_NOTES).length;
-      log.debug({ sessionKey, dropped }, "Pending notes capped at limit; dropped oldest");
-    }
-    this.notes.set(sessionKey, arr);
+    return arr;
+  }
+
+  /** Write in-flight + queued notes for this session. Returns false on failure. */
+  private persist(sessionKey: string): boolean {
+    const all = [
+      ...(this.inflight.get(sessionKey) ?? []).flatMap((b) => b.notes),
+      ...(this.notes.get(sessionKey) ?? []),
+    ];
     try {
-      this.store.setPendingNotes(sessionKey, arr);
+      this.store.setPendingNotes(sessionKey, all);
       return true;
     } catch (err) {
       log.warn({ err, sessionKey }, "Could not persist pending notes");
       return false;
     }
+  }
+
+  /** Queue a note for the session's next turn. Returns false when it could
+   *  not be persisted (it is still held in memory for this process). */
+  queueNote(sessionKey: string, note: string): boolean {
+    const arr = this.queued(sessionKey);
+    arr.push(note);
+    const dropped = capNotes(arr);
+    if (dropped > 0) log.debug({ sessionKey, dropped }, "Pending notes capped at limit; dropped oldest");
+    return this.persist(sessionKey);
   }
 
   queueError(sessionKey: string, visibleError: string): void {
@@ -64,43 +114,55 @@ export class PendingNotesQueue {
     this.errorNotes.set(sessionKey, notes);
   }
 
-  /** Drain notes queued for this session and return them as a prompt prefix. */
+  /**
+   * Hand the session's queued notes to a turn, as a prompt prefix. They stay
+   * in the durable store until {@link settle} (or {@link restore}) is called
+   * with the same prefix.
+   */
   drain(sessionKey: string): string {
-    const drained: string[] = [];
-    let notes = this.notes.get(sessionKey);
-    if (!notes) {
-      try {
-        notes = this.store.getPendingNotes(sessionKey);
-      } catch (err) {
-        log.warn({ err, sessionKey }, "Could not load durable pending notes");
-        notes = [];
-      }
-    }
-    if (notes && notes.length > 0) {
-      drained.push(...notes);
-      try {
-        this.store.setPendingNotes(sessionKey, []);
-        this.notes.delete(sessionKey);
-      } catch (err) {
-        // Avoid replaying the same note repeatedly in this process. If the
-        // durable clear failed, a restart may replay it, which is safer than
-        // silently losing context.
-        this.notes.set(sessionKey, []);
-        log.warn({ err, sessionKey }, "Could not clear durable pending notes");
-      }
-    }
+    const notes = this.queued(sessionKey);
+    const drained = [...notes];
+    this.notes.set(sessionKey, []);
 
     const errorNotes = this.errorNotes.get(sessionKey);
+    const parts = [...drained];
     if (errorNotes && errorNotes.length > 0) {
       this.errorNotes.delete(sessionKey);
-      drained.push(formatTomoEvent("errors", [
+      parts.push(formatTomoEvent("errors", [
         "Recent Tomo errors before this turn (newest last, capped):",
         ...errorNotes.map((note) => `- ${note}`),
         "Use this as operational context; do not repeat the raw error unless it helps the user.",
       ].join("\n")));
     }
 
-    return drained.map((n) => `${n}\n\n`).join("");
+    const prefix = parts.map((n) => `${n}\n\n`).join("");
+    // Error notes are memory-only to begin with; only durable notes ride in flight.
+    if (drained.length > 0) {
+      const batches = this.inflight.get(sessionKey) ?? [];
+      batches.push({ prefix, notes: drained });
+      this.inflight.set(sessionKey, batches);
+    }
+    return prefix;
+  }
+
+  /** Take the in-flight batch drained as `prefix` off the session's list. */
+  private takeInFlight(sessionKey: string, prefix: string): InFlightBatch | undefined {
+    const batches = this.inflight.get(sessionKey);
+    if (!batches) return undefined;
+    const idx = batches.findIndex((b) => b.prefix === prefix);
+    if (idx < 0) return undefined;
+    const [batch] = batches.splice(idx, 1);
+    if (batches.length === 0) this.inflight.delete(sessionKey);
+    return batch;
+  }
+
+  /**
+   * The turn that drained `prefix` has ended: its notes are consumed. Until
+   * this runs they are still in the durable store, so a crash re-delivers them.
+   */
+  settle(sessionKey: string, prefix: string): void {
+    if (!prefix || !this.takeInFlight(sessionKey, prefix)) return;
+    this.persist(sessionKey);
   }
 
   /**
@@ -109,17 +171,12 @@ export class PendingNotesQueue {
    * so its notes stay together and ahead of anything queued since.
    */
   restore(sessionKey: string, drainedPrefix: string): void {
+    this.takeInFlight(sessionKey, drainedPrefix);
     const note = drainedPrefix.trim();
     if (!note) return;
-    let arr = this.notes.get(sessionKey);
-    if (!arr) {
-      try { arr = this.store.getPendingNotes(sessionKey); } catch { arr = []; }
-    }
+    const arr = this.queued(sessionKey);
     arr.unshift(note);
-    this.notes.set(sessionKey, arr);
-    try { this.store.setPendingNotes(sessionKey, arr); } catch (err) {
-      log.warn({ err, sessionKey }, "Could not persist restored pending notes");
-    }
+    if (!this.persist(sessionKey)) log.warn({ sessionKey }, "Could not persist restored pending notes");
   }
 
   /** Test/support helper for observing queued durable notes without draining. */

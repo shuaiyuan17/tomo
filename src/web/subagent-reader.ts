@@ -219,18 +219,54 @@ export async function readSubagentPage(sdkSessionsDir: string, sdkSessionId: str
 export const MODEL_HEAD_BYTES = 256 * 1024;
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
 
+/** The subagent's sidecar written when it is spawned (`agent-<id>.meta.json`). */
+export function subagentMetaPath(sdkSessionsDir: string, sdkSessionId: string, taskId: string): string {
+  return subagentTranscriptPath(sdkSessionsDir, sdkSessionId, taskId).replace(/\.jsonl$/, ".meta.json");
+}
+/** A meta.json is a few hundred bytes; anything past this is not one. */
+export const META_MAX_BYTES = 16 * 1024;
+
+/** Open a file under `sdkSessionsDir` the same guarded way for every read here. */
+async function openUnder(sdkSessionsDir: string, path: string): Promise<FileHandle | undefined> {
+  const root = await realpath(sdkSessionsDir);
+  const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  if (!(await realpath(path)).startsWith(root + sep) || !(await fd.stat()).isFile()) { await fd.close(); return undefined; }
+  return fd;
+}
+
 /**
- * The model a subagent runs on: `message.model` of the first assistant entry
- * in its transcript (the SDK's task events carry no model). Undefined when
- * there is none yet, or it is not a plain model id (e.g. "<synthetic>").
+ * The model a subagent runs on. First from its meta.json — written when the
+ * subagent is spawned, so it is there before any transcript entry:
+ * `pickedEffortModel` (the resolved id), else `model`. Then, as a fallback,
+ * `message.model` of the first assistant entry in its transcript (the SDK's
+ * task events carry no model). Undefined when neither has one yet.
  */
 export async function readSubagentModel(sdkSessionsDir: string, sdkSessionId: string, taskId: string): Promise<string | undefined> {
+  return await readMetaModel(sdkSessionsDir, sdkSessionId, taskId)
+    ?? await readTranscriptModel(sdkSessionsDir, sdkSessionId, taskId);
+}
+
+async function readMetaModel(sdkSessionsDir: string, sdkSessionId: string, taskId: string): Promise<string | undefined> {
   let fd: FileHandle | undefined;
   try {
-    const path = subagentTranscriptPath(sdkSessionsDir, sdkSessionId, taskId);
-    const root = await realpath(sdkSessionsDir);
-    fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    if (!(await realpath(path)).startsWith(root + sep) || !(await fd.stat()).isFile()) return undefined;
+    fd = await openUnder(sdkSessionsDir, subagentMetaPath(sdkSessionsDir, sdkSessionId, taskId));
+    if (!fd) return undefined;
+    const raw = await readRange(fd, 0, META_MAX_BYTES + 1);
+    if (raw.length > META_MAX_BYTES) return undefined;
+    const meta = JSON.parse(raw.toString("utf8")) as { pickedEffortModel?: unknown; model?: unknown };
+    for (const model of [meta?.pickedEffortModel, meta?.model]) {
+      if (typeof model === "string" && MODEL_ID.test(model)) return model;
+    }
+    return undefined;
+  } catch { return undefined; }
+  finally { await fd?.close(); }
+}
+
+async function readTranscriptModel(sdkSessionsDir: string, sdkSessionId: string, taskId: string): Promise<string | undefined> {
+  let fd: FileHandle | undefined;
+  try {
+    fd = await openUnder(sdkSessionsDir, subagentTranscriptPath(sdkSessionsDir, sdkSessionId, taskId));
+    if (!fd) return undefined;
     const head = await readRange(fd, 0, MODEL_HEAD_BYTES);
     const lines = head.toString("utf8").split("\n");
     if (head.length === MODEL_HEAD_BYTES) lines.pop(); // possibly cut mid-line

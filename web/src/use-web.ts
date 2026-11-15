@@ -22,8 +22,6 @@ export function useWeb() {
   const [compact, setCompact] = useState<WebCompactState>();
   /** What the SDK last reported about each conversation's turn (retry, tool progress, refusal, error, stopped). */
   const [turns, setTurns] = useState<Record<string, TurnStatus>>({});
-  /** Model id per conversation. */
-  const [models, setModels] = useState<Record<string, string>>({});
   /** The subscription's live rate-limit state, on the local clock. */
   const [rateLimit, setRateLimit] = useState<WebRateLimit>();
   /** The SDK's predicted next message per conversation. */
@@ -71,7 +69,7 @@ export function useWeb() {
     const snapshot = (value: WebSnapshot) => {
       setBlocks(value.blocks); setRequests(value.requests); setActivity({}); setTasks(value.tasks ?? []); setCompact(value.compact);
       // Turn statuses are of the moment: a (re)connect starts without them.
-      setTurns({}); setModels(value.models ?? {}); setSuggestions(value.suggestions ?? {});
+      setTurns({}); setSuggestions(value.suggestions ?? {});
       setRateLimit(value.rateLimit);
       // A (re)connect may have missed cron events while the stream was down.
       setConnection("live"); refresh(); setCronRevision((r) => r + 1);
@@ -86,7 +84,6 @@ export function useWeb() {
         const { sessionId, status } = event;
         setTurns((old) => status ? { ...old, [sessionId]: { status, at: Date.now() } } : old[sessionId] ? without(old, sessionId) : old);
       }
-      if (event.type === "model") setModels((old) => ({ ...old, [event.sessionId]: event.model }));
       if (event.type === "rate-limit") setRateLimit(event.limit);
       if (event.type === "suggestion") {
         const { sessionId, text } = event;
@@ -126,5 +123,5 @@ export function useWeb() {
     void connect();
     return () => { controller.abort(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
-  return { bootstrap, connection, blocks, requests, activity, toolTicks, tasks, compact, turns, models, rateLimit, suggestions, revision, cronRevision, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
+  return { bootstrap, connection, blocks, requests, activity, toolTicks, tasks, compact, turns, rateLimit, suggestions, revision, cronRevision, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
 }

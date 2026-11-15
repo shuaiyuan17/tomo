@@ -23,7 +23,7 @@ beforeEach(async () => {
   watchBus.reset();
   mockConfig.identities = [{ name: "owner", channels: { telegram: "test-owner" }, replyPolicy: "last-active" }];
   agent = new Agent();
-  channel = new WebChannel(mockConfig.owner, undefined, { stop: (key) => agent.stopTurn(key), model: (key) => agent.modelFor(key),
+  channel = new WebChannel(mockConfig.owner, undefined, { stop: (key) => agent.stopTurn(key),
     models: { view: (key) => agent.webModelView(key), switch: (key, model, from) => agent.switchModelFromWeb(key, model, from) } });
   supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0 });
   channel.attach(supervisor); agent.addChannel(channel); agent.addChannel(new MockChannel("telegram"));
@@ -52,7 +52,8 @@ it("shows what the SDK reports about a running turn, stops it, and offers the ne
   const page = await open({ viewport: { width: 1440, height: 900 } });
   const status = page.locator(".feedback");
   const release = heldTurn();
-  await browserExpect(page.getByRole("link", { name: /^Model: / })).toBeVisible();
+  // No model badge by the composer: the model lives on the Study's Model page.
+  await browserExpect(page.getByRole("link", { name: /^Model: / })).toHaveCount(0);
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("Do the long thing.");
   await page.getByRole("button", { name: "Send", exact: true }).click();
   const stop = page.getByRole("button", { name: "Stop Tomo" });
@@ -60,8 +61,6 @@ it("shows what the SDK reports about a running turn, stops it, and offers the ne
   await browserExpect(page.getByRole("button", { name: "Send", exact: true })).toHaveCount(0);
   const sdk = mockSdk.queryControllers.at(-1)!;
 
-  sdk.pushEvent({ type: "system", subtype: "init", model: "claude-opus-5-5[1m]" });
-  await browserExpect(page.getByRole("link", { name: "Model: claude-opus-5-5[1m]. Open model settings" })).toHaveText("Opus 5.5");
   sdk.pushEvent({ type: "system", subtype: "api_retry", attempt: 2, max_retries: 10, retry_delay_ms: 4000, error_status: 529, error: "overloaded" });
   await browserExpect(status).toHaveText("Tomo is working… Retrying 2/10 · claude is overloaded");
   sdk.pushEvent({ type: "tool_progress", tool_use_id: "t1", tool_name: "Bash", parent_tool_use_id: null, elapsed_time_seconds: 42 });
@@ -89,9 +88,7 @@ it("shows what the SDK reports about a running turn, stops it, and offers the ne
   // The stopped turn said nothing: history says so, not "NO_REPLY" in the agent's voice.
   await browserExpect(page.locator(".message.assistant")).toHaveText(/No reply$/);
 
-  // The badge leads to the Study's Model page.
-  await page.getByRole("link", { name: /^Model: / }).click();
-  await browserExpect(page).toHaveURL(/#study\/model$/);
+  await page.evaluate(() => { window.location.hash = "study/model"; });
   await browserExpect(page.getByRole("tab", { name: "Model" })).toHaveAttribute("aria-selected", "true");
   await browserExpect(page.getByText("claude-sonnet-5[1m]").first()).toBeVisible();
   await page.screenshot({ path: "test-results/study-model-desktop.png" });
@@ -151,4 +148,57 @@ it("on a phone: no zoom-triggering fields, a compact header, and the view follow
   await page.screenshot({ path: "test-results/chat-phone.png" });
   await input.focus();
   await page.screenshot({ path: "test-results/chat-phone-focused.png" });
+});
+
+it("on a phone the sidebar is a drawer behind the top-left button: navigation, conversation, usage and theme, and the chat gets the screen", async () => {
+  const page = await open({ ...devices["iPhone 14"], defaultBrowserType: undefined });
+  const input = page.getByRole("textbox", { name: "Message Tomo" });
+  const menu = page.getByRole("button", { name: /^Menu/ });
+  const drawer = page.locator("#sidebar");
+  // Closed: one bar of chrome, and nothing of the sidebar is reachable or on screen.
+  await browserExpect(menu).toHaveAttribute("aria-expanded", "false");
+  await browserExpect(page.getByRole("button", { name: /^Session/ })).toHaveCount(0);
+  expect((await page.getByLabel("Conversation history").boundingBox())!.y).toBeLessThan(70);
+  expect((await drawer.boundingBox())!.x).toBeLessThan(0);
+  await page.screenshot({ path: "test-results/phone-drawer-closed.png" });
+
+  await menu.click();
+  await browserExpect(menu).toHaveAttribute("aria-expanded", "true");
+  await browserExpect(drawer).toHaveAttribute("role", "dialog");
+  for (const name of ["Conversation", "The Study"]) await browserExpect(drawer.getByRole("button", { name, exact: true })).toBeVisible();
+  await browserExpect(drawer.getByRole("button", { name: /^Session/ })).toBeVisible();
+  await browserExpect(drawer.getByText("Plan usage", { exact: true })).toBeVisible();
+  await browserExpect(drawer.getByText("Context window", { exact: true })).toBeVisible();
+  await browserExpect(drawer.getByRole("radio", { name: "Dark theme" })).toBeVisible();
+  await browserExpect.poll(async () => (await drawer.boundingBox())!.x).toBe(0);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  // A modal layer: the chat under it is inert, and Escape closes it back to the button.
+  await browserExpect(page.locator("#conversation")).toHaveAttribute("inert", "");
+  await page.screenshot({ path: "test-results/phone-drawer-open.png" });
+  await page.keyboard.press("Escape");
+  await browserExpect(menu).toHaveAttribute("aria-expanded", "false");
+  await browserExpect(menu).toBeFocused();
+  await browserExpect(input).toBeEnabled();
+
+  // The theme switches from inside it; choosing a destination closes it.
+  await menu.click();
+  await drawer.getByRole("radio", { name: "Dark theme" }).click();
+  await browserExpect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await drawer.getByRole("button", { name: "The Study", exact: true }).click();
+  await browserExpect(menu).toHaveAttribute("aria-expanded", "false");
+  await browserExpect(page).toHaveURL(/#study\//);
+  await menu.click();
+  await drawer.getByRole("button", { name: "Conversation", exact: true }).click();
+  await browserExpect(input).toBeVisible();
+  // Tasks and the drawer are never open together.
+  await menu.click();
+  await page.getByRole("button", { name: /^Tasks/ }).click({ force: true });
+  await browserExpect(menu).toHaveAttribute("aria-expanded", "false");
+});
+
+it("on a desktop the sidebar is as it was: always there, no menu button", async () => {
+  const page = await open({ viewport: { width: 1280, height: 800 } });
+  await browserExpect(page.getByRole("button", { name: /^Menu/ })).toBeHidden();
+  await browserExpect(page.locator("#sidebar").getByRole("button", { name: /^Session/ })).toBeVisible();
+  await browserExpect(page.locator("#sidebar")).not.toHaveAttribute("role", "dialog");
 });

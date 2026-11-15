@@ -173,8 +173,6 @@ export type WebEvent =
   /** null: a new turn started, whatever the last one reported no longer applies. */
   | { type: "turn"; sessionId: string; status: WebTurnStatus | null }
   | { type: "rate-limit"; limit: WebRateLimit }
-  /** The model a session runs on (the SDK's own report once it has one, else the configured one). */
-  | { type: "model"; sessionId: string; model: string }
   /** The SDK's predicted next message for the composer; null withdraws it. */
   | { type: "suggestion"; sessionId: string; text: string | null }
   /** All tasks of one session, live and recently ended. REPLACE semantics. */
@@ -192,8 +190,6 @@ export interface WebBootstrap extends WebCatalog {
   capabilities?: { screen: boolean; uploads?: boolean };
   /** The latest compact request, so a reload still shows it. */
   compact?: WebCompactState;
-  /** Model id per session, where known. */
-  models?: Record<string, string>;
   rateLimit?: WebRateLimit;
   /** The standing prompt suggestion per session. */
   suggestions?: Record<string, string>;
@@ -286,7 +282,7 @@ export const rpcSchema = z.discriminatedUnion("method", [
     model: z.string().trim().min(1).max(200), from: z.string().min(1).max(200) }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
-export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "models" | "rateLimit" | "suggestions">;
+export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "rateLimit" | "suggestions">;
 export interface WebSync { snapshot: WebSnapshot; replay: EventEnvelope[] | null }
 /** Daemon answer to the `task` RPC. `sessionKey` stays inside the web process. */
 export interface WebTaskAccess { sessionKey: string; taskType: string; output?: TaskOutput;

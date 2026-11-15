@@ -1,7 +1,7 @@
 /**
  * What the SDK says about a running turn (or the account) besides its content:
- * retries, rate-limit changes, refusals, tool progress, typed API errors, the
- * model in use, prompt suggestions. LiveSession used to drop all of these;
+ * retries, rate-limit changes, refusals, tool progress, typed API errors,
+ * prompt suggestions. LiveSession used to drop all of these;
  * they are now read here, in one pure function, and published on the watch
  * bus for the web UI.
  *
@@ -33,8 +33,6 @@ export type SdkSignal =
   | { kind: "tool_progress"; toolUseId: string; tool: string; elapsedSeconds: number }
   /** An assistant message ended on a typed API error. */
   | { kind: "error"; error: SdkErrorKind }
-  /** The model this SDK process runs (system/init). */
-  | { kind: "model"; model: string }
   /** The SDK's predicted next owner message (promptSuggestions). */
   | { kind: "suggestion"; text: string }
   /** The owner stopped the running turn. */
@@ -99,10 +97,6 @@ export function sdkSignalOf(event: unknown): SdkSignal | undefined {
       const fallbackModel = e.subtype === "model_refusal_fallback" ? text(e.fallback_model, MODEL_LIMIT) : undefined;
       const category = text(e.api_refusal_category, 64);
       return { kind: "refusal", model, ...(fallbackModel ? { fallbackModel } : {}), ...(category ? { category } : {}) };
-    }
-    if (e.subtype === "init") {
-      const model = text(e.model, MODEL_LIMIT);
-      return model ? { kind: "model", model } : undefined;
     }
     return undefined;
   }

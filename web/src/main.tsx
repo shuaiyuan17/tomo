@@ -12,7 +12,7 @@ import { CompactButton } from "./compact-button.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
-import { ArrowUp, ImagePlus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
+import { ArrowUp, ImagePlus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, PanelLeft, Sun, SunMoon } from "lucide-react";
 import { Study } from "./study.js";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { ScreenWindow } from "./screen.js";
@@ -27,7 +27,6 @@ import { cn } from "@/lib/utils";
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
 import { composerStatus, requestLabels, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
-import { ModelBadge } from "./model-badge.js";
 import { useRailWidth } from "./rail-width.js";
 import { AgentNameContext, agentNameOf } from "./agent-name.js";
 import { blockKey, interleave, messageKey, pendingKey, type ToolBlock } from "./inline-tools.js";
@@ -187,13 +186,33 @@ export function App() {
   const railSize = useRailWidth({ enabled: !overlay, sidebar: () => sidebar.current?.offsetWidth ?? 272 });
   // The rail stays mounted through its closing transition (see motion.ts).
   const railMotion = useMountedFor(tasksOpen);
-  const modal = tasksOpen && overlay && railMotion.mounted;
+  const tasksModal = tasksOpen && overlay && railMotion.mounted;
   const closeTasks = () => { setTasksOpen(false); tasksButton.current?.focus(); };
+  // Phone width: the sidebar (navigation, conversation picker, context,
+  // plan usage, theme) is a drawer behind a button at the top left, so the
+  // chat has the whole screen. It is a modal layer like the Tasks overlay;
+  // only one of the two is open at a time.
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  const drawer = phone && menuOpen;
+  const drawerMotion = useMountedFor(drawer);
+  const closeMenu = (refocus = true) => { setMenuOpen(false); if (refocus) menuButton.current?.focus(); };
+  const modal = tasksModal || drawer;
+  useEffect(() => {
+    if (!drawer) return;
+    sidebar.current?.querySelector<HTMLElement>("button, a[href]")?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); closeMenu(); return; }
+      if (event.key === "Tab" && sidebar.current) trapTab(sidebar.current, event);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [drawer]);
   // On narrow screens the rail is a modal layer: focus moves into it, stays
   // there (the content under it is inert), and Escape anywhere closes it,
   // returning focus to the topbar button. A pinned desktop rail is not modal.
   useEffect(() => {
-    if (!modal) return;
+    if (!tasksModal) return;
     rail.current?.querySelector<HTMLElement>("[data-tasks-close]")?.focus();
     const onKey = (event: KeyboardEvent) => {
       if (event.key === "Escape") { event.preventDefault(); closeTasks(); return; }
@@ -201,7 +220,7 @@ export function App() {
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-  }, [modal]);
+  }, [tasksModal]);
   const systemDark = useMediaQuery("(prefers-color-scheme: dark)");
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -391,7 +410,6 @@ export function App() {
   };
   // The SDK's predicted next message: offered only while the composer is empty and idle.
   const suggestion = session?.writable && !turnActive && !draft && !attachments.items.length && !resending && !uncertain ? web.suggestions[selectedId] : undefined;
-  const model = web.models[selectedId];
   const usage = session?.stats;
   const hasContext = !!usage?.contextMax;
   const sessions = web.bootstrap?.sessions ?? [];
@@ -400,12 +418,15 @@ export function App() {
   return <AgentNameContext.Provider value={agent}><div className="flex h-dvh flex-col">
     <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href={study ? "#study" : "#conversation"} onClick={(e) => { e.preventDefault(); document.getElementById(study ? "study" : "conversation")?.focus(); }}>{study ? `Skip to ${STUDY_LABELS[study]}` : "Skip to conversation"}</a>
     <header className="flex h-[72px] shrink-0 items-center gap-8 border-b px-8 max-[1024px]:px-6 max-[600px]:h-12 max-[600px]:gap-3 max-[600px]:px-3.5 max-[600px]:pt-[env(safe-area-inset-top)] max-[600px]:box-content">
+      <Button ref={menuButton} variant="ghost" size="icon" aria-expanded={drawer} aria-controls="sidebar" title="Menu" aria-label="Menu: conversations, the Study, usage and theme"
+        onClick={() => { setTasksOpen(false); setMenuOpen((open) => !open); }}
+        className="-ml-1.5 hidden size-9 shrink-0 rounded-xl text-foreground hover:bg-foreground/[0.07] aria-expanded:bg-foreground/[0.11] max-[600px]:inline-flex [&_svg:not([class*='size-'])]:size-5"><PanelLeft strokeWidth={1.75} /></Button>
       <a className="flex items-center gap-2 font-serif text-[30px] tracking-[-1.5px] text-foreground no-underline max-[600px]:gap-1.5 max-[600px]:text-[22px] max-[600px]:tracking-[-1px]" href="/" aria-label="Tomo home">
         <Mark className="size-9 max-[600px]:size-7" /><span>tomo<span className="text-primary">.</span></span></a>
       <span className="border-l pl-8 text-sm text-muted-foreground max-[800px]:hidden">{study ? "The Study" : "Conversation"}</span>
       <div className="ml-auto flex items-center gap-4 max-[600px]:gap-1">
         <Button ref={tasksButton} variant="ghost" size="icon" aria-pressed={tasksOpen} aria-controls="tasks-rail" title="Tasks"
-          aria-label={`Tasks${running ? `, ${running} running` : ""}`} onClick={() => setTasksOpen((open) => !open)}
+          aria-label={`Tasks${running ? `, ${running} running` : ""}`} onClick={() => { setMenuOpen(false); setTasksOpen((open) => !open); }}
           className="relative size-10 rounded-xl text-foreground max-[600px]:size-9 hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-5">
           <ListChecks strokeWidth={1.75} />
           {running > 0 && <span aria-hidden="true" className="absolute top-0.5 right-0.5 min-w-4 rounded-full bg-primary px-1 text-center text-[10px] leading-4 font-semibold text-primary-foreground ring-2 ring-background">{running > 99 ? "99+" : running}</span>}
@@ -419,40 +440,43 @@ export function App() {
           <span className="max-[600px]:sr-only">{connectionLabel}</span></span>
       </div>
     </header>
-    <div className="flex min-h-0 flex-1 max-[600px]:flex-col">
-      <aside ref={sidebar} className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-width:thin] max-[600px]:overflow-visible max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:w-full max-[600px]:flex-row max-[600px]:items-center max-[600px]:gap-3 max-[600px]:border-r-0 max-[600px]:border-b max-[600px]:px-3.5 max-[600px]:py-1.5 max-[600px]:gap-2"
-        aria-label="Conversation details" inert={modal}>
-        <nav aria-label="Workspace" className="mb-7 flex flex-col gap-0.5 max-[600px]:mb-0 max-[600px]:flex-row max-[600px]:gap-1">
+    <div className="flex min-h-0 flex-1">
+      {phone && drawerMotion.mounted && <div aria-hidden="true" onClick={() => closeMenu()} data-state={drawerMotion.shown ? "open" : "closed"}
+        className="fixed inset-0 top-[calc(3rem+env(safe-area-inset-top))] z-20 bg-black/20 transition-opacity duration-[220ms] data-[state=closed]:opacity-0" />}
+      <aside ref={sidebar} id="sidebar" data-state={drawer ? "open" : "closed"} {...(drawer ? { role: "dialog", "aria-modal": true } : {})}
+        className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-width:thin] max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:fixed max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:bottom-0 max-[600px]:left-0 max-[600px]:z-30 max-[600px]:w-[min(320px,86vw)] max-[600px]:bg-background max-[600px]:px-5 max-[600px]:pt-5 max-[600px]:pb-[max(1.25rem,env(safe-area-inset-bottom))] max-[600px]:shadow-2xl max-[600px]:transition-transform max-[600px]:duration-[220ms] max-[600px]:data-[state=closed]:-translate-x-full max-[600px]:data-[state=closed]:shadow-none"
+        aria-label="Conversation details" inert={tasksModal || (phone && !drawer)} aria-hidden={phone && !drawer ? true : undefined}>
+        <nav aria-label="Workspace" className="mb-7 flex flex-col gap-0.5">
           {([[null, "Conversation", MessageCircle], ["todos", "The Study", BookOpen]] as const).map(([target, label, Icon]) => {
             const current = target === null ? !study : !!study;
-            return <Button key={label} variant="ghost" aria-current={current ? "page" : undefined} onClick={() => setStudy(target === null ? null : study ?? target)}
-              className="h-9 justify-start gap-2.5 rounded-xl px-3 text-[13px] font-normal text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground aria-[current=page]:bg-foreground/[0.08] aria-[current=page]:font-medium aria-[current=page]:text-foreground max-[600px]:h-9 max-[600px]:px-2.5">
-              <Icon strokeWidth={1.75} /><span className="max-[600px]:sr-only">{label}</span></Button>;
+            return <Button key={label} variant="ghost" aria-current={current ? "page" : undefined} onClick={() => { setStudy(target === null ? null : study ?? target); if (drawer) closeMenu(false); }}
+              className="h-9 justify-start gap-2.5 rounded-xl px-3 text-[13px] font-normal text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground aria-[current=page]:bg-foreground/[0.08] aria-[current=page]:font-medium aria-[current=page]:text-foreground max-[600px]:h-10 max-[600px]:text-[14px]">
+              <Icon strokeWidth={1.75} /><span>{label}</span></Button>;
           })}
         </nav>
-        <p className="eyebrow mb-3 max-[600px]:hidden">Your conversations</p>
-        <div className="mb-1.5 flex items-center justify-between gap-2 max-[600px]:mb-0">
-          <span id="session-label" className="text-[13px] font-medium max-[600px]:sr-only">Session</span>
-          <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground max-[600px]:hidden">{session?.kind === "group" ? "Read-only" : "Owner DM"}</Badge>
+        <p className="eyebrow mb-3">Your conversations</p>
+        <div className="mb-1.5 flex items-center justify-between gap-2">
+          <span id="session-label" className="text-[13px] font-medium">Session</span>
+          <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{session?.kind === "group" ? "Read-only" : "Owner DM"}</Badge>
         </div>
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild disabled={!sessions.length}>
             <Button variant="outline" aria-labelledby="session-label session-value"
-              className="h-11 w-full min-w-0 justify-between rounded-xl bg-card px-3.5 text-[13px] font-normal shadow-xs hover:bg-accent max-[600px]:h-9 max-[600px]:flex-1 max-[600px]:px-3">
+              className="h-11 w-full min-w-0 justify-between rounded-xl bg-card px-3.5 text-[13px] font-normal shadow-xs hover:bg-accent">
               <span id="session-value" className="truncate">{session ? `${session.title}${session.kind === "group" ? " · read-only" : ""}` : "No session available"}</span>
               <ChevronsUpDown className="text-muted-foreground" /></Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" className="w-(--radix-dropdown-menu-trigger-width) min-w-56 rounded-xl p-1">
             <DropdownMenuLabel className="px-2 py-1.5 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">Conversations</DropdownMenuLabel>
-            <DropdownMenuRadioGroup value={selectedId} onValueChange={(value) => { setSelected(value); setFeedback(""); }}>
+            <DropdownMenuRadioGroup value={selectedId} onValueChange={(value) => { setSelected(value); setFeedback(""); if (drawer) closeMenu(false); }}>
               {sessions.map((s) => <DropdownMenuRadioItem key={s.id} value={s.id} className="rounded-lg py-2 text-[13px]">
                 <span className="truncate">{s.title}</span>{s.kind === "group" && <span className="ml-auto pl-3 tracking-[0.02em] text-[10px] text-muted-foreground">read-only</span>}
               </DropdownMenuRadioItem>)}
             </DropdownMenuRadioGroup>
           </DropdownMenuContent>
         </DropdownMenu>
-        <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground max-[600px]:hidden">{session?.kind === "group" ? "Shared history. Messages can be sent from the group's messaging channel." : `The same conversation you share with ${agent} across your messaging channels.`}</p>
-        <section className="mt-8 border-t pt-7 max-[600px]:hidden" aria-labelledby="context-heading">
+        <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{session?.kind === "group" ? "Shared history. Messages can be sent from the group's messaging channel." : `The same conversation you share with ${agent} across your messaging channels.`}</p>
+        <section className="mt-8 border-t pt-7" aria-labelledby="context-heading">
           <div className="mb-3 flex items-center justify-between gap-2"><p className="eyebrow m-0" id="context-heading">Context window</p>
             <CompactButton bootstrap={web.bootstrap} refresh={web.refreshBootstrap} ownerSession={!!session && session.id === web.bootstrap?.ownerId}
               running={web.tasks.filter((t) => t.sessionId === web.bootstrap?.ownerId && t.state === "running" && !t.ambient).length}
@@ -462,8 +486,8 @@ export function App() {
           <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{hasContext ? `${usage?.contextEstimated ? "Estimated" : "Reported"} tokens · last recorded turn` : "Usage appears after a turn reports its context window."}</p>
         </section>
         <PlanUsage ready={!!web.bootstrap} live={web.rateLimit} />
-        {/* Theme: pinned to the bottom of the sidebar; in the phone-width top bar, one button at its end that cycles. */}
-        <div className="mt-auto flex items-center justify-between gap-3 border-t pt-4 max-[600px]:hidden">
+        {/* Theme: pinned to the bottom of the sidebar (and of the phone drawer). */}
+        <div className="mt-auto flex items-center justify-between gap-3 border-t pt-4 max-[600px]:mt-8">
           <span className="eyebrow">Theme</span>
           <ToggleGroup type="single" aria-label="Color theme" value={theme} onValueChange={(value) => { if (value) setTheme(value as Theme); }}
             className="rounded-xl bg-foreground/[0.05] p-0.5">
@@ -473,9 +497,6 @@ export function App() {
                 <Icon strokeWidth={1.75} /></ToggleGroupItem>)}
           </ToggleGroup>
         </div>
-        {(() => { const index = THEMES.findIndex(([value]) => value === theme); const [, label, Icon] = THEMES[index]; const next = THEMES[(index + 1) % THEMES.length];
-          return <Button variant="ghost" size="icon" className="hidden size-9 shrink-0 rounded-xl text-muted-foreground hover:bg-foreground/[0.06] max-[600px]:inline-flex"
-            aria-label={`${label}. Switch to ${next[1].toLowerCase()}`} title={label} onClick={() => setTheme(next[0])}><Icon strokeWidth={1.75} /></Button>; })()}
       </aside>
       {study && <Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} focus={studyFocus} cronRevision={web.cronRevision}
         mutator={{ bootstrap: web.bootstrap, refresh: web.refreshBootstrap, live: web.connection === "live" }} />}
@@ -522,7 +543,7 @@ export function App() {
         </ChatScroller>
         <div className="mx-auto w-full max-w-[740px]"><div className="flex min-h-7 items-baseline gap-3 pb-2">
           <div className={cn("feedback min-w-0 flex-1 tracking-[0.02em] text-xs leading-normal text-muted-foreground tabular-nums transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0")} role="status" aria-live="polite">{composerStatus({ activity: web.activity[selectedId], note, latest, settled: settle.settled, agent, turn, now })}</div>
-          {model && <a href="#study/model" title={`Model: ${model}`} aria-label={`Model: ${model}. Open model settings`} className="shrink-0 rounded-md no-underline opacity-80 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"><ModelBadge model={model} className="ml-0 h-[18px] px-1.5 text-[10.5px]" /></a>}</div>
+</div>
           {suggestion && <button type="button" onClick={() => { setDraft(suggestion); input.current?.focus(); }} title="Use this as your message"
             className="motion-enter mb-2 flex max-w-full items-center gap-1.5 rounded-full border bg-card px-3 py-1.5 text-left text-[12.5px] text-muted-foreground shadow-xs transition-colors hover:border-muted-foreground/50 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none">
             <Sparkles className="size-3.5 shrink-0" strokeWidth={1.75} aria-hidden="true" /><span className="truncate">{suggestion}</span></button>}

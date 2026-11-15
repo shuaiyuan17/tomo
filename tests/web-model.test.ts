@@ -134,9 +134,9 @@ describe("model switch from the web (channel)", () => {
     expect(events).toEqual([]);
     expect(channel.switchModel(ownerId, "claude-haiku-5-5", mockConfig.model)).toEqual({ status: "switched",
       model: { id: "claude-haiku-5-5", label: "Haiku 5.5 1M (cheapest)" }, previous: { id: mockConfig.model, label: expect.any(String) } });
-    expect(events).toEqual([{ type: "model", sessionId: ownerId, model: "claude-haiku-5-5" }, { type: "invalidate", sessionId: ownerId }]);
+    expect(events).toEqual([{ type: "invalidate", sessionId: ownerId }]);
     expect(channel.switchModel(ownerId, "claude-haiku-5-5", "claude-haiku-5-5").status).toBe("unchanged");
-    expect(events).toHaveLength(2);
+    expect(events).toHaveLength(1);
     expect(switched.map(([key]) => key)).toEqual(["dm:owner", "dm:owner", "dm:owner", "dm:owner"]);
   });
 });

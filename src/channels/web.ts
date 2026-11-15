@@ -91,10 +91,6 @@ export class WebChannel implements Channel {
   private readonly compact: ((sessionKey: string, onSettled: (outcome: "done" | "unverified" | "failed") => void) => "queued" | "already_requested" | "no_owner") | undefined;
   private compactState: WebCompactState | undefined;
   private readonly stopTurn: ((sessionKey: string) => Promise<boolean>) | undefined;
-  private readonly configuredModel: ((sessionKey: string) => string | undefined) | undefined;
-  /** Model id per browser session: the SDK's report, else the configured model. */
-  private modelBySession = new Map<string, string>();
-  private configuredSeen: string | undefined;
   private rateLimit: WebRateLimit | undefined;
   /** The SDK's standing prompt suggestion per browser session. */
   private suggestions = new Map<string, string>();
@@ -140,8 +136,6 @@ export class WebChannel implements Channel {
       journal?: WebRequestJournal;
       /** Soft-stops the running turn of `sessionKey`; false when nothing was running. */
       stop?: (sessionKey: string) => Promise<boolean>;
-      /** The model `sessionKey` is configured to run on. */
-      model?: (sessionKey: string) => string | undefined;
       /** Claude subscription usage for the Plan usage card (cached, debounced). */
       usage?: (refresh: boolean) => Promise<WebUsage>;
       /** The Study's Model page: a session key's model, and the agent's shared model switch. */
@@ -152,7 +146,6 @@ export class WebChannel implements Channel {
     this.sessionKeys = options.sessionKeys;
     this.usageReader = options.usage;
     this.stopTurn = options.stop;
-    this.configuredModel = options.model;
     this.taskOutput = options.taskOutput;
     this.toolCommand = options.toolCommand;
     this.compact = options.compact;
@@ -322,10 +315,8 @@ export class WebChannel implements Channel {
       .sort((a, b) => (a.request.timestamp ?? 0) - (b.request.timestamp ?? 0)).map((r) => ({ ...r.request }));
     const blocks = [...this.blocks];
     const tasks = this.tasks.snapshot();
-    this.refreshOwnerModel();
     return { epoch: this.events.epoch, cursor: this.events.cursor(), requests, blocks, tasks,
       ...(this.compactState ? { compact: { ...this.compactState } } : {}),
-      ...(this.modelBySession.size ? { models: Object.fromEntries(this.modelBySession) } : {}),
       ...(this.rateLimit ? { rateLimit: { ...this.rateLimit } } : {}),
       ...(this.suggestions.size ? { suggestions: Object.fromEntries(this.suggestions) } : {}) };
   }
@@ -366,23 +357,6 @@ export class WebChannel implements Channel {
     return { stopped: await this.stopTurn(key).catch(() => false) };
   }
 
-  /** The owner conversation's model as configured, when the SDK has not reported one since it last changed. */
-  refreshOwnerModel(): void {
-    // A snapshot must never fail over a badge.
-    let model: string | undefined;
-    try { const key = this.ownerKey(); model = key ? this.configuredModel?.(key) : undefined; } catch { return; }
-    // Only a CHANGE of the configured model replaces what the SDK reported
-    // (its own spelling of the same model must not flip the badge back).
-    if (!this.ownerId || !model || this.configuredSeen === model) return;
-    this.configuredSeen = model;
-    this.setModel(this.ownerId, model);
-  }
-  private setModel(sessionId: string, model: string): void {
-    if (this.modelBySession.get(sessionId) === model) return;
-    if (!this.modelBySession.has(sessionId) && this.modelBySession.size >= 256) this.modelBySession.delete(this.modelBySession.keys().next().value!);
-    this.modelBySession.set(sessionId, model);
-    this.publishQuietly({ type: "model", sessionId, model });
-  }
   private setSuggestion(sessionId: string, text: string | null): void {
     if ((this.suggestions.get(sessionId) ?? null) === text) return;
     if (text === null) this.suggestions.delete(sessionId); else this.suggestions.set(sessionId, text);
@@ -412,7 +386,6 @@ export class WebChannel implements Channel {
     }
     const sessionId = sessionKey ? this.sessionId(sessionKey) : undefined;
     if (!sessionId) return;
-    if (signal.kind === "model") { this.setModel(sessionId, signal.model); return; }
     if (signal.kind === "suggestion") { this.setSuggestion(sessionId, signal.text); return; }
     if (signal.kind === "tool_progress") {
       const now = this.now();
@@ -505,9 +478,6 @@ export class WebChannel implements Channel {
     const outcome = this.models.switch(key, model, from);
     if (!outcome.ok) throw new WebError(MODEL_REFUSAL_STATUS[outcome.reason], outcome.reason);
     if (outcome.changed) {
-      // The chat's model badge follows at once, not at the next turn.
-      this.setModel(sessionId, outcome.model);
-      this.configuredSeen = outcome.model;
       try { this.events.publish({ type: "invalidate", sessionId }); } catch { /* best effort */ }
     }
     return { status: outcome.changed ? "switched" : "unchanged",
@@ -747,7 +717,6 @@ export class WebChannel implements Channel {
       // A new turn makes the last one's suggestion stale.
       this.publishQuietly({ type: "turn", sessionId, status: null });
       this.setSuggestion(sessionId, null);
-      this.refreshOwnerModel();
       if (event.requestId && this.receipts.has(event.requestId)) this.state(event.requestId, "running");
     } else if (event.type === "turn.end" && event.requestId) {
       // Handed to the SDK and then cut short: it may have run. Say so rather

@@ -243,7 +243,6 @@ async function startForeground(): Promise<void> {
         toolCommand: (key, toolUseId) => agent.readToolCommand(key, toolUseId),
         compact: (key, onSettled) => agent.requestOwnerCompact(key, onSettled),
         stop: (key) => agent.stopTurn(key),
-        model: (key) => agent.modelFor(key),
         taskModel: subagentModelReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
         usage: (refresh) => usageCache.get(refresh),
         models: { view: (key) => agent.webModelView(key), switch: (key, model, from) => agent.switchModelFromWeb(key, model, from) },

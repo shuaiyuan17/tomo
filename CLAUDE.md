@@ -36,7 +36,7 @@ src/
     context-nudge.ts        # Pure decision logic for context-usage nudges
     sdk-options.ts          # Builds SDK query options (model, MCP servers, auto-compact policy)
     sdk-signals.ts          # What the SDK says ABOUT a turn (api_retry, rate_limit_event, refusals, tool_progress,
-                            #   typed assistant error, init model, prompt_suggestion) → `sdk` watch events for the web UI
+                            #   typed assistant error, prompt_suggestion) → `sdk` watch events for the web UI
     audience.ts             # DM-session audience tracking (private DM vs summoned group)
     inbound-batcher.ts      # Coalesces messages that pile up behind an in-flight turn
     proactive-send.ts       # send_message service (direct + delegate modes)

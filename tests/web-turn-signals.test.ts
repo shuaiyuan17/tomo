@@ -64,24 +64,6 @@ describe("SDK signals in the browser", () => {
     expect(channel.snapshot().rateLimit).toMatchObject({ status: "rejected" });
   });
 
-  it("the model badge follows the SDK's report, and a /model change replaces it until the SDK reports again", () => {
-    let configured = "claude-opus-5-5";
-    const { channel, events, signal, id } = setup({ model: () => configured });
-    expect(channel.snapshot().models).toEqual({ [id]: "claude-opus-5-5" });
-    signal({ kind: "model", model: "claude-opus-5-5[1m]" });
-    // The same configured model does not flip the badge back to its other spelling.
-    expect(channel.snapshot().models).toEqual({ [id]: "claude-opus-5-5[1m]" });
-    configured = "claude-fable-5-1[1m]";
-    expect(channel.snapshot().models).toEqual({ [id]: "claude-fable-5-1[1m]" });
-    expect(events.filter((event) => event.type === "model").map((event) => event.type === "model" && event.model))
-      .toEqual(["claude-opus-5-5", "claude-opus-5-5[1m]", "claude-fable-5-1[1m]"]);
-  });
-
-  it("a snapshot survives a model reader that throws", () => {
-    const { channel } = setup({ model: () => { throw new Error("no agent"); } });
-    expect(channel.snapshot().models).toBeUndefined();
-  });
-
   it("a suggestion stands until the next turn starts", () => {
     const { channel, bus, events, signal, id } = setup();
     signal({ kind: "suggestion", text: "and tomorrow?" });

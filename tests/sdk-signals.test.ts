@@ -30,10 +30,6 @@ describe("sdkSignalOf", () => {
       .toEqual({ kind: "refusal", model: "claude-fable-5-1" });
   });
 
-  it("reads the model from system/init", () => {
-    expect(sdkSignalOf({ type: "system", subtype: "init", model: "claude-opus-5-5[1m]" })).toEqual({ kind: "model", model: "claude-opus-5-5[1m]" });
-  });
-
   it("normalises rate-limit times to ms and utilisation to a percentage", () => {
     expect(sdkSignalOf({ type: "rate_limit_event", rate_limit_info: { status: "rejected", rateLimitType: "seven_day", resetsAt: 1_800_000_000, utilization: 1, isUsingOverage: true } }))
       .toEqual({ kind: "rate_limit", status: "rejected", limit: "seven_day", resetsAt: 1_800_000_000_000, utilization: 100, overage: true });

@@ -83,7 +83,7 @@ export function PlanUsage({ ready, live }: { ready: boolean;
   const liveNotice = rateLimitNotice(live, now);
   const { main, scoped } = splitWindows(usage?.windows ?? []);
   const notice = failed ? "Couldn't reach Tomo for usage." : usage && usageNotice(usage);
-  return <section className="mt-8 border-t pt-7 max-[600px]:hidden" aria-labelledby="usage-heading">
+  return <section className="mt-8 border-t pt-7" aria-labelledby="usage-heading">
     <div className="mb-3 flex items-center justify-between gap-2">
       <p className="eyebrow m-0" id="usage-heading">Plan usage{usage?.plan ? <span className="normal-case tracking-normal"> · {usage.plan}</span> : null}</p>
       <Button variant="ghost" size="icon" aria-label="Refresh plan usage" title="Refresh" disabled={loading} onClick={() => void load(true)}

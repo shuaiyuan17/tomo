@@ -84,6 +84,8 @@ const CHANNEL_QUIESCE_TIMEOUT_MS = 10_000;
  */
 const MCP_SWEEP_SHUTDOWN_TIMEOUT_MS = 3_000;
 const CHANNEL_TEARDOWN_TIMEOUT_MS = 10_000;
+/** How long shutdown waits for queued usage-ledger rows (local appends). */
+const USAGE_LEDGER_SHUTDOWN_TIMEOUT_MS = 2_000;
 /**
  * How long shutdown waits for an aborted /rewind to wind down. Abort is
  * honoured between steps, so this only covers one step already in flight
@@ -2556,6 +2558,8 @@ export class Agent {
           () => Promise.all(this.channels.map((ch) => ch.teardown())),
         );
         this.inbox?.close();
+        // The last turns' ledger rows are queued writes; let them land.
+        await this.boundedShutdownStep("usage ledger", USAGE_LEDGER_SHUTDOWN_TIMEOUT_MS, () => this.usageLedger.idle());
       }
     }
   }

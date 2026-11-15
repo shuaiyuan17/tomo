@@ -115,6 +115,8 @@ export type UsageRecorder = (row: UsageLedgerRow) => void;
 export class UsageLedger {
   /** After a failure, warn once until a write succeeds again. */
   private failing = false;
+  /** Appends not yet settled (see idle). */
+  private readonly pending = new Set<Promise<void>>();
 
   /** `dir`: the usage data directory (`usageDataDir`). */
   constructor(private readonly dir: string) {}
@@ -131,8 +133,16 @@ export class UsageLedger {
       this.warn(err, row);
       return Promise.resolve();
     }
-    return appendLineSerial(join(this.dir, ledgerFileName(row.ts)), () => line, () => { this.failing = false; })
+    const write = appendLineSerial(join(this.dir, ledgerFileName(row.ts)), () => line, () => { this.failing = false; })
       .then(() => undefined, (err: unknown) => this.warn(err, row));
+    this.pending.add(write);
+    void write.finally(() => this.pending.delete(write));
+    return write;
+  }
+
+  /** Resolves once every row appended so far has landed (or failed). Shutdown waits on it. */
+  async idle(): Promise<void> {
+    while (this.pending.size > 0) await Promise.all([...this.pending]);
   }
 
   private warn(err: unknown, row: UsageLedgerRow): void {

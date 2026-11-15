@@ -59,11 +59,11 @@ describe("usage ledger (agent wiring)", () => {
     mockSdk.responseFn = () => "NO_REPLY";
     await agent.handleContinuity("System: Free time.");
     await drainQueue(agent);
-    await waitFor(() => expect(ledgerRows()).toHaveLength(4));
+    // Shutdown waits for the queued rows: nothing is still in flight once stop() resolves.
+    await agent.stop();
+    expect(ledgerRows()).toHaveLength(4);
     expect(ledgerRows().at(-1)).toMatchObject({ source: "heartbeat", trigger: "System: Free time." });
 
     for (const r of rows) expect(r).toMatchObject({ costUsd: expect.any(Number), tokens: expect.any(Object) });
-
-    await agent.stop();
   });
 });

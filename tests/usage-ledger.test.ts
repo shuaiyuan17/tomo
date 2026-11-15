@@ -58,8 +58,8 @@ describe("UsageLedger", () => {
     const ts = new Date(2026, 10, 15).getTime();
     const sessions = ["slow-first", ...Array.from({ length: 20 }, (_, i) => `telegram:${i}`)];
     // Fired without awaiting each one, as LiveSession does.
-    const writes = sessions.map((key, i) => ledger.append(row(ts, { sessionKey: key, trigger: String(i % 10).repeat(80) })));
-    await Promise.all(writes);
+    for (const [i, key] of sessions.entries()) void ledger.append(row(ts, { sessionKey: key, trigger: String(i % 10).repeat(80) }));
+    await ledger.idle();
     const lines = readFileSync(join(dir, ledgerFileName(ts)), "utf-8").split("\n").filter(Boolean);
     const parsed = lines.map((l) => JSON.parse(l) as UsageLedgerRow);
     expect(parsed.map((r) => r.sessionKey)).toEqual(sessions);

@@ -18,7 +18,9 @@ import {
   resetConfig,
   waitFor,
 } from "./helpers/agent-harness.js";
-import { DurableInbox, INBOX_STALE_NOT_PROCESSED } from "../src/agent/durable-inbox.js";
+import { DurableInbox, INBOX_STALE_NOT_PROCESSED, type WriteFn } from "../src/agent/durable-inbox.js";
+import { InboxPersistError } from "../src/agent.js";
+import { writeSync } from "node:fs";
 
 installAgentTestHooks();
 
@@ -130,7 +132,11 @@ describe("durable inbox: crash and replay", () => {
 
     const second = await boot();
     expect(mockSdk.promptsBySession.filter((p) => p.text.includes("book the table"))).toHaveLength(1);
-    expect(peekPendingNotes(second.agent, "imessage:558").join("\n")).toContain("may be missing or incomplete");
+    const note = peekPendingNotes(second.agent, "imessage:558").join("\n");
+    expect(note).toContain("may be missing or incomplete");
+    // The note quotes the message itself: the turn may have died before the
+    // prompt reached the transcript, and the session must be able to answer.
+    expect(note).toContain("book the table");
     expect(openInbox().pending()).toEqual([]);
     await second.agent.stop();
   });
@@ -238,6 +244,179 @@ describe("durable inbox: what never reaches disk", () => {
     await new Promise((r) => setTimeout(r, 20));
     const onDisk = existsSync(inboxPath()) ? readFileSync(inboxPath(), "utf8") : "";
     expect(onDisk).not.toContain("open-sesame");
+    await agent.stop();
+  });
+});
+
+/** Swap the agent's inbox for one over the same file whose writes go through `write`. */
+function useWriter(agent: Agent, write: WriteFn): void {
+  const internals = agent as unknown as { inbox?: DurableInbox };
+  internals.inbox?.close();
+  internals.inbox = new DurableInbox({ path: inboxPath(), writeSync: write });
+}
+
+const realWrite: WriteFn = (fd, buf, off, len) => writeSync(fd, buf, off, len);
+const failingWrite: WriteFn = () => { throw Object.assign(new Error("EIO"), { code: "EIO" }); };
+
+async function bootWith(channelName: string, write: WriteFn, extra: Record<string, unknown> = {}) {
+  resetConfig({ inbox: true, imessageInboundSettleMs: 0, tomoHome: mockConfig.tomoHome, ...extra });
+  const agent = new Agent();
+  useWriter(agent, write);
+  const channel = new MockChannel(channelName);
+  agent.addChannel(channel);
+  await agent.start();
+  return { agent, channel };
+}
+
+describe("durable inbox: when a turn counts as started", () => {
+  it("a crash before the prompt reaches the SDK replays the message instead of writing it off", async () => {
+    const first = await boot();
+    // Hold the turn while its live session is still being built: past the
+    // queue, before anything was handed to the model.
+    const internals = first.agent as unknown as { mcpOAuthManager: { buildServersWithAuth: (...a: unknown[]) => Promise<unknown> } };
+    let building = 0;
+    internals.mcpOAuthManager.buildServersWithAuth = () => { building++; return new Promise(() => {}); };
+    await first.channel.simulateMessage(makeMsg({ id: "pre", chatId: "575", text: "not yet seen" }));
+    await waitFor(() => expect(building).toBe(1));
+    expect(openInbox().pending()[0]?.status).toBe("received");
+    crash(first.agent);
+
+    const second = await boot();
+    mockSdk.responseFn = async () => "seen now";
+    await waitFor(() => expect(second.channel.delivered.map((d) => d.text)).toEqual(["seen now"]));
+    await second.agent.stop();
+  });
+});
+
+describe("durable inbox: a write that fails at ingress", () => {
+  it("imsg: does not take custody, so the cursor stays and the row is redelivered", async () => {
+    let healthy = false;
+    const { agent, channel } = await bootWith("imessage", (fd, buf, off, len) => (healthy ? realWrite(fd, buf, off, len) : failingWrite(fd, buf, off, len)));
+    Object.assign(channel, { redeliversUnacknowledged: true });
+    mockSdk.responseFn = async () => "answered";
+
+    // A throw is the hand-off contract's "not handled": imsg's processWatchRow
+    // skips the cursor advance and recoverFromGap replays the row.
+    await expect(channel.simulateMessage(makeMsg({ id: "w1", chatId: "570", text: "did you get this" })))
+      .rejects.toBeInstanceOf(InboxPersistError);
+    await new Promise((r) => setTimeout(r, 30));
+    // Not dispatched in memory either: the redelivery is the only copy.
+    expect(mockSdk.promptsBySession.some((p) => p.text.includes("did you get this"))).toBe(false);
+    expect(channel.delivered).toEqual([]);
+
+    healthy = true;
+    expect(await channel.simulateMessage(makeMsg({ id: "w1", chatId: "570", text: "did you get this" }))).toBe(true);
+    await waitFor(() => expect(channel.delivered.map((d) => d.text)).toEqual(["answered"]));
+    expect(mockSdk.promptsBySession.filter((p) => p.text.includes("did you get this"))).toHaveLength(1);
+    await agent.stop();
+  });
+
+  it("telegram: already acknowledged, so it is answered in memory and the owner is told", async () => {
+    const { agent, channel } = await bootWith("telegram", failingWrite);
+    const notify = vi.spyOn(agent, "notifyOwner").mockResolvedValue(true);
+    mockSdk.responseFn = async () => "answered anyway";
+
+    expect(await channel.simulateMessage(makeMsg({ id: "t1", chatId: "571", text: "hello" }))).toBe(true);
+    await waitFor(() => expect(channel.delivered.map((d) => d.text)).toEqual(["answered anyway"]));
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0]).toContain("could not save an incoming telegram message");
+    await agent.stop();
+  });
+});
+
+describe("durable inbox: a start mark that cannot be written", () => {
+  /** Fails every single-line `start` append; everything else is written. */
+  const failStartAppends: WriteFn = (fd, buf, off, len) => {
+    if (Buffer.from(buf).subarray(off, off + len).toString("utf8").replace(/^\n/, "").startsWith('{"op":"start"')) {
+      return failingWrite(fd, buf, off, len);
+    }
+    return realWrite(fd, buf, off, len);
+  };
+
+  it("leaves no replayable state behind: a crash mid-turn is not answered twice", async () => {
+    const first = await bootWith("imessage", failStartAppends);
+    let turns = 0;
+    mockSdk.responseFn = () => { turns++; return new Promise(() => {}); };
+    await first.channel.simulateMessage(makeMsg({ id: "s1", chatId: "572", text: "transfer the money" }));
+    await waitFor(() => expect(turns).toBe(1));
+    // The append failed twice; the rewrite recorded the start instead.
+    expect(openInbox().pending()[0]?.status).toBe("started");
+    crash(first.agent);
+
+    const second = await boot();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(mockSdk.promptsBySession.filter((p) => p.text.includes("transfer the money"))).toHaveLength(1);
+    expect(peekPendingNotes(second.agent, "imessage:572").join("\n")).toContain("transfer the money");
+    await second.agent.stop();
+  });
+});
+
+function steers(agent: Agent, key: string): number {
+  const sessions = (agent as unknown as { liveSessionManager: { liveSessions: Map<string, { steeredRequestCount(): number }> } }).liveSessionManager.liveSessions;
+  return sessions.get(key)?.steeredRequestCount() ?? 0;
+}
+
+describe("durable inbox: steered into another turn", () => {
+  it("stays open until the host turn finishes, so a crash before then still surfaces it", async () => {
+    const { agent, channel } = await bootWith("imessage", realWrite, { steering: true });
+    mockSdk.steerEcho = true;
+    let releaseHost: (() => void) | null = null;
+    const hostGate = new Promise<void>((r) => { releaseHost = r; });
+    mockSdk.responseFn = async (text) => {
+      if (text.includes("CRON JOB")) { await hostGate; return "cron reply"; }
+      return "misc";
+    };
+
+    // The host is a cron turn — no inbox record of its own. Its queue task is
+    // held open past its result, standing in for delivery and transcript work
+    // still running when the daemon dies.
+    let releaseTail: (() => void) | null = null;
+    const tailGate = new Promise<void>((r) => { releaseTail = r; });
+    const runner = (agent as unknown as { turnRunner: { runTurn: (spec: { source: string }) => Promise<boolean> } }).turnRunner;
+    const realRunTurn = runner.runTurn.bind(runner);
+    runner.runTurn = async (spec) => {
+      const ok = await realRunTurn(spec);
+      if (spec.source === "cron") await tailGate;
+      return ok;
+    };
+
+    void agent.handleCronMessage("CRON JOB", "imessage:573");
+    const live = () => (agent as unknown as { liveSessionManager: { isBusy(k: string): boolean } }).liveSessionManager.isBusy("imessage:573");
+    await waitFor(() => expect(live()).toBe(true));
+    await channel.simulateMessage(makeMsg({ id: "st1", chatId: "573", text: "steered question" }));
+    await waitFor(() => expect(steers(agent, "imessage:573")).toBe(1));
+    releaseHost!();
+    // The host's result has resolved the steer as merged; its task is still open.
+    await waitFor(() => expect(live()).toBe(false));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(openInbox().pending().map((r) => r.message.id)).toEqual(["st1"]);
+    crash(agent);
+
+    const second = await boot();
+    expect(peekPendingNotes(second.agent, "imessage:573").join("\n")).toContain("steered question");
+    releaseTail!();
+    await second.agent.stop();
+  });
+
+  it("is consumed once the host turn's task ends", async () => {
+    const { agent, channel } = await bootWith("imessage", realWrite, { steering: true });
+    mockSdk.steerEcho = true;
+    let releaseHost: (() => void) | null = null;
+    const hostGate = new Promise<void>((r) => { releaseHost = r; });
+    mockSdk.responseFn = async (text) => {
+      if (text.includes("CRON JOB")) { await hostGate; return "cron reply"; }
+      return "misc";
+    };
+    const cron = agent.handleCronMessage("CRON JOB", "imessage:574");
+    const live = () => (agent as unknown as { liveSessionManager: { isBusy(k: string): boolean } }).liveSessionManager.isBusy("imessage:574");
+    await waitFor(() => expect(live()).toBe(true));
+    await channel.simulateMessage(makeMsg({ id: "st2", chatId: "574", text: "another steer" }));
+    await waitFor(() => expect(steers(agent, "imessage:574")).toBe(1));
+    releaseHost!();
+    await cron;
+    expect(mockSdk.promptsBySession.filter((p) => p.text.includes("another steer"))).toHaveLength(0);
+    expect(mockSdk.userContents.some((c) => JSON.stringify(c).includes("another steer"))).toBe(true);
+    await waitFor(() => expect(openInbox().pending()).toEqual([]));
     await agent.stop();
   });
 });

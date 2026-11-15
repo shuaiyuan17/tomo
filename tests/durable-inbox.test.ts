@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,6 +12,7 @@ import {
   DurableInbox,
   persistableMessage,
   restoreMessage,
+  type WriteFn,
 } from "../src/agent/durable-inbox.js";
 import type { IncomingMessage } from "../src/channels/types.js";
 import type { SessionResolution } from "../src/router.js";
@@ -193,7 +194,7 @@ describe("DurableInbox: retention and compaction", () => {
     // A directory where the log should be: unreadable AND unwritable.
     mkdirSync(path, { recursive: true });
     const inbox = reopen();
-    expect(inbox.accept("imessage", msg("a"), resolution)).toEqual({ status: "unpersisted" });
+    expect(inbox.accept("imessage", msg("a"), resolution)).toEqual({ status: "unpersisted", reason: "failed" });
   });
 
   it("a read-only instance neither compacts nor writes", () => {
@@ -203,7 +204,7 @@ describe("DurableInbox: retention and compaction", () => {
     appendFileSync(path, "torn");
     const reader = new DurableInbox({ path, readOnly: true });
     expect(reader.pending().map((r) => r.message.id)).toEqual(["a"]);
-    expect(reader.accept("imessage", msg("b"), resolution)).toEqual({ status: "unpersisted" });
+    expect(reader.accept("imessage", msg("b"), resolution)).toEqual({ status: "unpersisted", reason: "closed" });
     expect(readFileSync(path, "utf8")).toBe(`${before}torn`);
     expect(readdirSync(join(dir, "data")).some((f) => f.includes(".corrupt-"))).toBe(false);
   });
@@ -211,7 +212,7 @@ describe("DurableInbox: retention and compaction", () => {
   it("refuses new writes once closed", () => {
     const inbox = reopen();
     inbox.close();
-    expect(inbox.accept("imessage", msg("a"), resolution)).toEqual({ status: "unpersisted" });
+    expect(inbox.accept("imessage", msg("a"), resolution)).toEqual({ status: "unpersisted", reason: "closed" });
   });
 });
 
@@ -240,5 +241,106 @@ describe("DurableInbox: attachments", () => {
     expect(restored.images).toBeUndefined();
     expect(restored.documents).toBeUndefined();
     expect(restored.text).toBe(`text a\n${ATTACHMENT_NOT_RESTORED}`);
+  });
+});
+
+const realWrite: WriteFn = (fd, buf, off, len) => writeSync(fd, buf, off, len);
+
+describe("DurableInbox: short writes", () => {
+  it("an append that the kernel only half-writes is finished, not truncated", () => {
+    // Every call writes at most half of what it is asked for.
+    const halfWrite: WriteFn = (fd, buf, off, len) => realWrite(fd, buf, off, Math.max(1, Math.floor(len / 2)));
+    const inbox = reopen({ writeSync: halfWrite });
+    expect(inbox.accept("imessage", msg("half", { text: "x".repeat(500) }), resolution).status).toBe("accepted");
+    expect(reopen().pending().map((r) => r.message.text)).toEqual(["x".repeat(500)]);
+  });
+
+  it("a write that makes no progress is a failure, not a success", () => {
+    const inbox = reopen({ writeSync: () => 0 });
+    expect(inbox.accept("imessage", msg("zero"), resolution)).toEqual({ status: "unpersisted", reason: "failed" });
+  });
+
+  it("a compaction whose temp file came out short keeps the original log", () => {
+    let lie = false;
+    // Reports the whole buffer written but writes only half of it.
+    const lying: WriteFn = (fd, buf, off, len) => {
+      if (!lie) return realWrite(fd, buf, off, len);
+      realWrite(fd, buf, off, Math.floor(len / 2));
+      return len;
+    };
+    const inbox = reopen({ writeSync: lying, compactEvery: 1 });
+    inbox.accept("imessage", msg("keep1"), resolution);
+    inbox.accept("imessage", msg("keep2"), resolution);
+    const before = readFileSync(path, "utf8");
+    lie = true;
+    inbox.markDone([inbox.pending()[0].id]); // the `done` append is short too…
+    lie = false;
+    // …so the line torn by it is set apart on the next append, and the
+    // compaction that followed it never replaced the log.
+    expect(readFileSync(path, "utf8").startsWith(before)).toBe(true);
+    expect(readdirSync(join(dir, "data")).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+    expect(reopen().pending().map((r) => r.message.id)).toContain("keep2");
+  });
+
+  it("a compaction temp file of the wrong length is discarded and the log kept", () => {
+    const inbox = reopen({ compactEvery: 1 });
+    inbox.accept("imessage", msg("c1"), resolution);
+    inbox.accept("imessage", msg("c2"), resolution);
+    const before = readFileSync(path, "utf8");
+    // Every write from here on (the compaction's temp file) comes out half as long as reported.
+    const lyingInbox = inbox as unknown as { write: WriteFn };
+    lyingInbox.write = (fd, buf, off, len) => { realWrite(fd, buf, off, Math.floor(len / 2)); return len; };
+    (inbox as unknown as { compact(): boolean }).compact();
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(readdirSync(join(dir, "data")).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+    expect(reopen().pending().map((r) => r.message.id)).toEqual(["c1", "c2"]);
+  });
+});
+
+describe("DurableInbox: a start that cannot be written", () => {
+  it("retries, then rewrites the log with the start, so nothing is left replayable", () => {
+    let startFails = 0;
+    const failStart: WriteFn = (fd, buf, off, len) => {
+      if (Buffer.from(buf).subarray(off, off + len).toString("utf8").replace(/^\n/, "").startsWith('{"op":"start"')) {
+        startFails++;
+        throw new Error("EIO");
+      }
+      return realWrite(fd, buf, off, len);
+    };
+    const inbox = reopen({ writeSync: failStart });
+    const id = (inbox.accept("imessage", msg("s"), resolution) as { id: string }).id;
+    expect(inbox.markStarted([id])).toEqual([]);
+    expect(startFails).toBe(2);
+    expect(reopen().pending()[0]).toMatchObject({ id, status: "started" });
+  });
+
+  it("when nothing can be written, marks it unreplayable and records it started once the disk is back", () => {
+    let broken = false;
+    const write: WriteFn = (fd, buf, off, len) => {
+      if (broken) throw new Error("EIO");
+      return realWrite(fd, buf, off, len);
+    };
+    const inbox = reopen({ writeSync: write, compactEvery: 1 });
+    const id = (inbox.accept("imessage", msg("u"), resolution) as { id: string }).id;
+    const other = (inbox.accept("imessage", msg("v"), resolution) as { id: string }).id;
+    broken = true;
+    expect(inbox.markStarted([id])).toEqual([id]);
+    expect(inbox.get(id)).toMatchObject({ status: "started", unreplayable: true });
+    expect(inbox.isPending(id)).toBe(false);
+
+    broken = false;
+    inbox.markDone([other]); // its compaction rewrites the log from memory
+    expect(reopen().pending()).toEqual([expect.objectContaining({ id, status: "started" })]);
+    expect(inbox.get(id)?.unreplayable).toBeUndefined();
+  });
+});
+
+describe("DurableInbox: leftovers", () => {
+  it("removes a compaction temp file a crash left behind", () => {
+    mkdirSync(join(dir, "data"), { recursive: true });
+    const stale = `${path}.123.abc.tmp`;
+    writeFileSync(stale, "partial");
+    reopen();
+    expect(existsSync(stale)).toBe(false);
   });
 });

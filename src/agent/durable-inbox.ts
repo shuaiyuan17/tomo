@@ -2,16 +2,18 @@ import {
   appendFileSync,
   closeSync,
   existsSync,
+  fstatSync,
   fsyncSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
-import { dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { DocumentAttachment, ImageAttachment, IncomingMessage } from "../channels/types.js";
 import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord } from "../jsonl.js";
 import { log } from "../logger.js";
@@ -85,6 +87,13 @@ export interface InboxRecord {
   receivedAt: number;
   status: InboxStatus;
   startedAt?: number;
+  /**
+   * In memory only: the `start` mark could not be written, so the log on disk
+   * may still say `received`. The record is treated as started everywhere in
+   * this process (never handed to a replay, rewritten as started by the next
+   * compaction) — see {@link DurableInbox.markStarted}.
+   */
+  unreplayable?: boolean;
 }
 
 type RecvLine = { op: "recv"; v: 1; rec: Omit<InboxRecord, "status" | "startedAt"> };
@@ -95,8 +104,15 @@ export type AcceptResult =
   | { status: "accepted"; id: string }
   /** Already known (pending or consumed): the caller must not dispatch it again. */
   | { status: "duplicate"; id: string }
-  /** The write failed. The caller keeps the old in-memory behaviour for this one. */
-  | { status: "unpersisted" };
+  /**
+   * Not on disk. `closed`: the inbox was closed (shutdown) — the ordinary
+   * refusal path applies. `failed`: the write itself failed, which is an
+   * ingress fault the caller must surface (see Agent.enqueueMessage).
+   */
+  | { status: "unpersisted"; reason: "closed" | "failed" };
+
+/** Byte writer, injectable so tests can simulate short writes. */
+export type WriteFn = (fd: number, buffer: Uint8Array, offset: number, length: number) => number;
 
 export interface DurableInboxOptions {
   path: string;
@@ -115,6 +131,8 @@ export interface DurableInboxOptions {
    */
   readOnly?: boolean;
   now?: () => number;
+  /** Test seam for `fs.writeSync` (short writes, failures). */
+  writeSync?: WriteFn;
 }
 
 const DEFAULT_DEDUP_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -194,19 +212,56 @@ export function restoreMessage(persisted: PersistedMessage): IncomingMessage {
   return message;
 }
 
+const defaultWrite: WriteFn = (fd, buffer, offset, length) => writeSync(fd, buffer, offset, length);
+
+/**
+ * Write all of `buffer`. `write(2)` may write fewer bytes than asked (a full
+ * disk, a signal, a quota): the remainder is written in a loop, and a write
+ * that makes no progress at all is an error, never a silent truncation.
+ */
+function writeAllSync(fd: number, buffer: Uint8Array, write: WriteFn): void {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const n = write(fd, buffer, offset, buffer.length - offset);
+    if (!Number.isInteger(n) || n <= 0) throw new Error(`short write: ${offset} of ${buffer.length} bytes written`);
+    offset += n;
+  }
+}
+
+/** fsync a directory so a create or rename in it survives a power loss. */
+function fsyncDir(dir: string): void {
+  try {
+    const dirFd = openSync(dir, "r");
+    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+  } catch {
+    // Some platforms refuse fsync on a directory; the entry itself is there.
+  }
+}
+
+/** Temp-file name of a compaction of `path` (see writeFileDurableSync). */
+function isCompactionTemp(path: string, name: string): boolean {
+  return name.startsWith(`${basename(path)}.`) && name.endsWith(".tmp");
+}
+
 /**
  * Replace `path` so that a power loss leaves either the old file or the whole
- * new one: write and fsync a temp file, rename it over, fsync the directory.
- * (`writeFileAtomicSync` renames without syncing, which is fine for a config
- * file and not for a log that holds messages we have already acknowledged.)
+ * new one: write and fsync a temp file, check it holds every byte, rename it
+ * over, fsync the directory. (`writeFileAtomicSync` renames without syncing,
+ * which is fine for a config file and not for a log that holds messages we
+ * have already acknowledged.) A temp file of the wrong length is discarded
+ * and the original kept: renaming a truncated log over a whole one would
+ * delete acknowledged messages.
  */
-function writeFileDurableSync(path: string, content: string, sync: boolean): void {
+function writeFileDurableSync(path: string, content: string, sync: boolean, write: WriteFn): void {
   const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  const bytes = Buffer.from(content, "utf8");
   let fd: number | undefined;
   try {
     fd = openSync(tmp, "w", 0o600);
-    writeSync(fd, content);
+    writeAllSync(fd, bytes, write);
     if (sync) fsyncSync(fd);
+    const size = fstatSync(fd).size;
+    if (size !== bytes.length) throw new Error(`compaction temp file is ${size} bytes, expected ${bytes.length}`);
     closeSync(fd);
     fd = undefined;
     renameSync(tmp, path);
@@ -215,13 +270,7 @@ function writeFileDurableSync(path: string, content: string, sync: boolean): voi
     try { unlinkSync(tmp); } catch { /* best effort */ }
     throw err;
   }
-  if (!sync) return;
-  try {
-    const dirFd = openSync(dirname(path), "r");
-    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-  } catch {
-    // Some platforms refuse fsync on a directory; the rename itself is done.
-  }
+  if (sync) fsyncDir(dirname(path));
 }
 
 export class DurableInbox {
@@ -239,6 +288,13 @@ export class DurableInbox {
    */
   private readFailed = false;
   private closed = false;
+  /**
+   * The last append failed part-way, so the file may end in a torn line. The
+   * next append starts on a fresh line, or it would be glued to the fragment
+   * and lost with it.
+   */
+  private tornTail = false;
+  private readonly write: WriteFn;
   private readonly dedupRetentionMs: number;
   private readonly maxSeen: number;
   private readonly compactEvery: number;
@@ -252,7 +308,9 @@ export class DurableInbox {
     this.compactEvery = opts.compactEvery ?? DEFAULT_COMPACT_EVERY;
     this.fsync = opts.fsync ?? true;
     this.now = opts.now ?? Date.now;
+    this.write = opts.writeSync ?? defaultWrite;
     this.closed = opts.readOnly ?? false;
+    if (!this.closed) this.removeStaleTemps();
     this.load();
   }
 
@@ -275,6 +333,12 @@ export class DurableInbox {
     return this.live.get(id)?.status === "received";
   }
 
+  /** The live record for `id`, if any (a copy). */
+  get(id: string): InboxRecord | undefined {
+    const rec = this.live.get(id);
+    return rec ? { ...rec } : undefined;
+  }
+
   /** Snapshot of every unconsumed record, oldest first. */
   pending(): InboxRecord[] {
     return [...this.live.values()]
@@ -290,7 +354,7 @@ export class DurableInbox {
   accept(channelName: string, message: IncomingMessage, resolution: SessionResolution): AcceptResult {
     const id = DurableInbox.idFor(channelName, message.chatId, message.id, message.inboxKey);
     if (this.has(id)) return { status: "duplicate", id };
-    if (this.closed) return { status: "unpersisted" };
+    if (this.closed) return { status: "unpersisted", reason: "closed" };
     const rec: RecvLine["rec"] = {
       id,
       channel: channelName,
@@ -301,23 +365,47 @@ export class DurableInbox {
     try {
       this.append({ op: "recv", v: 1, rec });
     } catch (err) {
-      log.error({ err, path: this.path, channel: channelName }, "Durable inbox: could not persist inbound message; continuing in memory");
-      return { status: "unpersisted" };
+      log.error({ err, path: this.path, channel: channelName }, "Durable inbox: could not persist inbound message");
+      return { status: "unpersisted", reason: "failed" };
     }
     this.live.set(id, { ...rec, status: "received" });
     return { status: "accepted", id };
   }
 
-  /** A turn began consuming these. From here a crash is NOT replayed. */
-  markStarted(ids: readonly string[]): void {
+  /**
+   * A turn began consuming these. From here a crash is NOT replayed.
+   *
+   * A `start` that cannot be written is the dangerous direction: the log
+   * still says `received`, so a crash before `done` would re-run a turn that
+   * may already have replied. The write is retried once; if it still fails,
+   * the whole log is rewritten (a different path to the disk — a fresh file
+   * and a rename) with these records started. If that fails too, they are
+   * marked `unreplayable` in memory — started for every purpose in this
+   * process, so nothing here ever hands them to a replay and the next
+   * successful compaction records them as started — and their ids are
+   * returned so the caller can raise it.
+   *
+   * @returns ids whose `start` is NOT on disk (empty when all were written).
+   */
+  markStarted(ids: readonly string[]): string[] {
+    const unwritten: InboxRecord[] = [];
     for (const id of ids) {
       const rec = this.live.get(id);
       if (!rec || rec.status === "started") continue;
       const at = this.now();
-      if (!this.tryAppend({ op: "start", id, at })) continue;
       rec.status = "started";
       rec.startedAt = at;
+      if (this.tryAppend({ op: "start", id, at }) || this.tryAppend({ op: "start", id, at })) continue;
+      unwritten.push(rec);
     }
+    if (unwritten.length === 0) return [];
+    if (this.compact()) return [];
+    for (const rec of unwritten) rec.unreplayable = true;
+    log.error(
+      { path: this.path, ids: unwritten.map((r) => r.id) },
+      "Durable inbox: could not record that a turn started; a crash before it ends could answer these messages twice",
+    );
+    return unwritten.map((r) => r.id);
   }
 
   /** Consumed (answered, dropped, or recorded). Kept only as a dedup tombstone. */
@@ -359,12 +447,36 @@ export class DurableInbox {
 
   private append(line: LogLine): void {
     if (this.fd === undefined) {
-      mkdirSync(dirname(this.path), { recursive: true });
+      const dir = dirname(this.path);
+      mkdirSync(dir, { recursive: true });
+      const created = !existsSync(this.path);
       this.fd = openSync(this.path, "a", 0o600);
+      // A new file's directory entry is not durable until the directory is:
+      // without this, a power loss can take the whole log with it even though
+      // every line in it was fsynced.
+      if (created && this.fsync) fsyncDir(dir);
     }
-    writeSync(this.fd, `${JSON.stringify(line)}\n`);
-    if (this.fsync) fsyncSync(this.fd);
+    const text = `${this.tornTail ? "\n" : ""}${JSON.stringify(line)}\n`;
+    try {
+      writeAllSync(this.fd, Buffer.from(text, "utf8"), this.write);
+      if (this.fsync) fsyncSync(this.fd);
+    } catch (err) {
+      this.tornTail = true;
+      throw err;
+    }
+    this.tornTail = false;
     this.appendsSinceCompact++;
+  }
+
+  /** A compaction that died between writing its temp file and the rename leaves the temp behind. */
+  private removeStaleTemps(): void {
+    const dir = dirname(this.path);
+    let names: string[];
+    try { names = readdirSync(dir); } catch { return; }
+    for (const name of names) {
+      if (!isCompactionTemp(this.path, name)) continue;
+      try { unlinkSync(join(dir, name)); } catch { /* best effort */ }
+    }
   }
 
   private load(): void {
@@ -430,9 +542,12 @@ export class DurableInbox {
     }
   }
 
-  /** Rewrite the log as just its live state plus recent dedup tombstones. */
-  private compact(): void {
-    if (this.readFailed || this.closed) return;
+  /**
+   * Rewrite the log as just its live state plus recent dedup tombstones.
+   * @returns whether the rewrite landed.
+   */
+  private compact(): boolean {
+    if (this.readFailed || this.closed) return false;
     const cutoff = this.now() - this.dedupRetentionMs;
     for (const [id, at] of this.seen) {
       if (at < cutoff) this.seen.delete(id);
@@ -451,16 +566,22 @@ export class DurableInbox {
       if (status === "started") lines.push({ op: "start", id: rec.id, at: startedAt ?? rec.receivedAt });
     }
 
-    if (lines.length === 0 && !existsSync(this.path)) return;
+    if (lines.length === 0 && !existsSync(this.path)) return true;
     try {
-      if (this.fd !== undefined) {
-        closeSync(this.fd);
-        this.fd = undefined;
-      }
-      writeFileDurableSync(this.path, lines.map((l) => `${JSON.stringify(l)}\n`).join(""), this.fsync);
-      this.appendsSinceCompact = 0;
+      writeFileDurableSync(this.path, lines.map((l) => `${JSON.stringify(l)}\n`).join(""), this.fsync, this.write);
     } catch (err) {
-      log.warn({ err, path: this.path }, "Durable inbox: compaction failed; the log keeps growing until the next one");
+      log.warn({ err, path: this.path }, "Durable inbox: compaction failed; the original log is kept and keeps growing until the next one");
+      return false;
     }
+    // Only now: the descriptor points at the replaced file, so the next append
+    // must reopen. Closed after a failed rewrite it would merely be reopened.
+    if (this.fd !== undefined) {
+      try { closeSync(this.fd); } catch { /* best effort */ }
+      this.fd = undefined;
+    }
+    this.tornTail = false;
+    this.appendsSinceCompact = 0;
+    for (const rec of this.live.values()) delete rec.unreplayable;
+    return true;
   }
 }

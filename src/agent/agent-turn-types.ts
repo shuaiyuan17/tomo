@@ -32,6 +32,8 @@ export interface UserTurnRequest {
   steerAudience: string[];
   /** True for turns where most inputs are expected to resolve to NO_REPLY. */
   passiveListen?: boolean;
+  /** The prompt reached the SDK (see MessageRequest.onPromptHandedOff). */
+  onPromptHandedOff?: () => void;
   /** Owner DM notice for an error `suppressErrors` keeps out of the chat. */
   ownerNotice?: OwnerNoticeTarget;
   /** This turn's inbound audiences, in order (see agent/audience.ts): "dm",

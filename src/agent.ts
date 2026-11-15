@@ -148,6 +148,8 @@ export class Agent {
    * could not be opened — the in-memory path then runs exactly as before.
    */
   private inbox: DurableInbox | undefined;
+  /** Throttle for reportInboxFault's owner DM. */
+  private lastInboxFaultNoticeAt = 0;
   private delivery: DeliveryPipeline;
   private turnRunner: TurnRunner;
   private liveSessionManager: LiveSessionManager;
@@ -710,6 +712,28 @@ export class Agent {
         return true;
       }
       if (persisted.status === "accepted") inboxId = persisted.id;
+      else if (persisted.reason === "failed") {
+        // THE WRITE FAILED: an ingress fault, not a reason to quietly fall
+        // back to memory. Answering `true` now would make a channel that
+        // commits on our answer (imsg's rowid cursor) forget the message, and
+        // a crash before the turn would then lose it for good.
+        if (channel.redeliversUnacknowledged) {
+          // Do not take custody. A throw is the hand-off contract's "row not
+          // handled" (MessageHandler): imsg leaves its cursor where it was,
+          // floors it at this row and resubscribes, so the row comes again
+          // (with backoff) until a write succeeds. Nothing is dispatched here,
+          // so the redelivery is the only copy — never a second answer.
+          throw new InboxPersistError(channel.name, message.id);
+        }
+        // The channel confirmed this before we saw it (grammY acks the
+        // update first), so refusing would only lose it now instead of on a
+        // crash. Process it in memory as before, and say so loudly.
+        this.reportInboxFault(
+          `Tomo could not save an incoming ${channel.name} message to disk before answering it. `
+            + "It is being answered now, but would be lost if Tomo crashed first. Check the disk under ~/.tomo/data.",
+          { channel: channel.name, messageId: message.id },
+        );
+      }
     }
 
     const accepted = this.dispatchInbound(channel, message, resolution, inboxId);
@@ -835,20 +859,64 @@ export class Agent {
       return;
     }
 
-    // From here a turn (or a steer into one) owns these messages. A crash past
-    // this point is NOT replayed — the turn may already have acted — and the
-    // next start tells the session instead (see replayInbox).
+    // `start` is written the moment the prompt reaches the SDK (the first
+    // point the model can act on it), not here: a crash before that is
+    // replayed as a fresh message rather than written off as "may already
+    // have run". From `start` on a crash is NOT re-run — the turn may already
+    // have acted — and the next start tells the session instead, quoting the
+    // messages (see replayInbox).
     const inboxIds = inboxIdsOf(routed);
-    this.inbox?.markStarted(inboxIds);
+    const onPromptHandedOff = inboxIds.length > 0 ? () => this.markInboxStarted(routedKey, inboxIds) : undefined;
     try {
       if (routed.length === 1) {
-        await this.handleMessage(routed[0].channel, routed[0].message, steer, routed[0].resolution, routed[0].userRecorded);
+        await this.handleMessage(routed[0].channel, routed[0].message, steer, routed[0].resolution, routed[0].userRecorded, onPromptHandedOff);
         return;
       }
-      await this.handleBatchedMessages(routed, steer);
+      await this.handleBatchedMessages(routed, steer, onPromptHandedOff);
     } finally {
-      this.inbox?.markDone(inboxIds);
+      if (inboxIds.length > 0) {
+        if (steer) {
+          // A steered message may have MERGED into another turn: its answer is
+          // that turn's reply, which is delivered and recorded only when that
+          // turn's own queue task finishes — after our STEER_MERGED resolves.
+          // The host may be a web or cron turn with no inbox record of its own,
+          // so marking done now would let a crash in that window drop the
+          // message silently. Behind the session queue, done lands after it.
+          this.enqueueForSession(routedKey, async () => { this.inbox?.markDone(inboxIds); })
+            .catch((err) => log.warn({ err, sessionKey: routedKey }, "Durable inbox: deferred done failed"));
+        } else {
+          this.inbox?.markDone(inboxIds);
+        }
+      }
     }
+  }
+
+  /**
+   * Record that a turn took these inbox records. A `start` the inbox could
+   * not write leaves a log a crash would replay — and answer twice — so it is
+   * raised loudly (see DurableInbox.markStarted).
+   */
+  private markInboxStarted(sessionKey: string, ids: string[]): void {
+    const unwritten = this.inbox?.markStarted(ids) ?? [];
+    if (unwritten.length === 0) return;
+    this.reportInboxFault(
+      `Tomo could not record on disk that it started answering ${unwritten.length === 1 ? "a message" : `${unwritten.length} messages`} in ${sessionKey}. `
+        + "The reply is going ahead; if Tomo crashes before it finishes, the message may be answered twice after the restart. Check the disk under ~/.tomo/data.",
+      { sessionKey, ids: unwritten },
+    );
+  }
+
+  /**
+   * An inbox write failed in a way that weakens a delivery guarantee: log it
+   * as an error and tell the owner (at most once per INBOX_FAULT_NOTICE_MS —
+   * a dead disk fails every message, and one DM says it).
+   */
+  private reportInboxFault(text: string, context: Record<string, unknown>): void {
+    log.error(context, `Durable inbox fault: ${text}`);
+    const now = Date.now();
+    if (now - this.lastInboxFaultNoticeAt < INBOX_FAULT_NOTICE_MS) return;
+    this.lastInboxFaultNoticeAt = now;
+    void this.notifyOwner(`⚠️ ${text}`).catch((err) => log.warn({ err }, "Could not send durable inbox fault notice"));
   }
 
   /**
@@ -1270,6 +1338,7 @@ export class Agent {
       },
       silentMatcher: isSilentReply,
       transcript: "always",
+      ...(req.onPromptHandedOff ? { onPromptHandedOff: req.onPromptHandedOff } : {}),
       errors: {
         visiblePrefix: "[error] ",
         // Agent-error responses stream back like any text and are handled by
@@ -1288,6 +1357,7 @@ export class Agent {
     steer = false,
     receiptResolution?: SessionResolution,
     userRecorded = false,
+    onPromptHandedOff?: () => void,
   ): Promise<void> {
     if (this.commands.isRestoring) {
       channel.settleMessage?.(message.id, "refused");
@@ -1404,6 +1474,7 @@ export class Agent {
         steer,
         steerAudience: audience,
         passiveListen: isPassiveGroup,
+        ...(onPromptHandedOff ? { onPromptHandedOff } : {}),
         ...(channel.name === "web" ? { webRequestId: message.id } : {}),
       });
     } catch (err) {
@@ -1462,6 +1533,7 @@ export class Agent {
   private async handleBatchedMessages(
     items: InboundItem[],
     steer = false,
+    onPromptHandedOff?: () => void,
   ): Promise<void> {
     const last = items[items.length - 1];
     const lastChannel = last.channel;
@@ -1574,6 +1646,7 @@ export class Agent {
         ? `${it.channel.name}:${it.message.chatId}`
         : key)),
       passiveListen: isPassiveGroup,
+      ...(onPromptHandedOff ? { onPromptHandedOff } : {}),
     });
   }
 
@@ -2580,10 +2653,15 @@ export class Agent {
 
     for (const [key, recs] of interrupted) {
       const oldest = new Date(recs[0].receivedAt).toISOString();
+      // The messages themselves travel with the note: the turn may have died
+      // before the prompt ever reached the transcript, and a note that only
+      // says "something was interrupted" leaves nothing to answer.
       this.queuePendingNote(key, formatTomoEvent(
         "inbox",
         `Tomo restarted while a turn was handling ${recs.length === 1 ? "a message" : `${recs.length} messages`} received from ${oldest}. `
-          + "Your reply may be missing or incomplete; check the conversation before assuming it was answered.",
+          + "Your reply may be missing or incomplete; check the conversation before assuming it was answered, "
+          + "and answer now if it was not.\n"
+          + formatInterruptedMessages(recs),
         { name: "interrupted" },
       ));
       this.inbox.markDone(recs.map((r) => r.id));
@@ -2605,6 +2683,38 @@ export class Agent {
     for (const { rec, channel } of replay) {
       this.dispatchInbound(channel, restoreMessage(rec.message), rec.resolution, rec.id);
     }
+  }
+}
+
+/** Per-message cap on the text quoted in an `interrupted` note. */
+const INTERRUPTED_TEXT_MAX = 1_000;
+/** Messages quoted in one `interrupted` note; the rest are counted. */
+const INTERRUPTED_MAX_MESSAGES = 10;
+
+/** The interrupted messages, quoted (truncated) for the session's `interrupted` note. */
+function formatInterruptedMessages(recs: readonly InboxRecord[]): string {
+  const shown = recs.slice(0, INTERRUPTED_MAX_MESSAGES).map((rec, i) => {
+    const raw = rec.message.text ?? "";
+    const text = raw.length > INTERRUPTED_TEXT_MAX ? `${raw.slice(0, INTERRUPTED_TEXT_MAX)}… [truncated]` : raw;
+    const sender = rec.message.senderName ? `${rec.message.senderName}: ` : "";
+    return `Message ${i + 1}${recs.length > 1 ? ` of ${recs.length}` : ""} (${new Date(rec.receivedAt).toISOString()}) — ${sender}${text}`;
+  });
+  const more = recs.length - shown.length;
+  return shown.join("\n") + (more > 0 ? `\n(+${more} more not shown)` : "");
+}
+
+/** Owner DMs about inbox faults: at most one per this window. */
+const INBOX_FAULT_NOTICE_MS = 10 * 60_000;
+
+/**
+ * The durable inbox could not persist an inbound message from a channel that
+ * redelivers what it was not told it handed off. Thrown out of the message
+ * handler so the channel treats the row as not handled.
+ */
+export class InboxPersistError extends Error {
+  constructor(channelName: string, messageId: string) {
+    super(`Durable inbox could not persist ${channelName} message ${messageId}; not taking custody so the channel redelivers it`);
+    this.name = "InboxPersistError";
   }
 }
 

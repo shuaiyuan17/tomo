@@ -86,6 +86,8 @@ function isBareHttpUrl(part: string): boolean {
  */
 export class ImsgChannel implements Channel {
   readonly name = "imessage";
+  /** A thrown hand-off replays the row from the committed cursor (recoverFromGap). */
+  readonly redeliversUnacknowledged = true;
   private handlers: MessageHandler[] = [];
   private commandHandlers: CommandHandler[] = [];
   private messageGuidDedupe: MessageGuidDedupeStore;

@@ -813,8 +813,9 @@ export class LiveSessionManager {
       return await this.runTurnOnSession(key, session, steer, () => (steer
         ? session!.steer(prompt, images, documents, onBlock, onBlockAbandoned, origin, steerAudience, {
           replyContext: req.replyContext, onJoined: req.onJoined, onHandedOff: req.onHandedOff,
+          onPromptHandedOff: req.onPromptHandedOff,
           canJoin: () => this.deps.isOwnAudienceTurn(key) })
-        : session!.send(prompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery, req.replyContext)));
+        : session!.send(prompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery, req.replyContext, req.onPromptHandedOff)));
     } catch (err) {
       // Declined before injection: nothing ran. The caller re-queues it.
       if (err instanceof SteerDeclinedError) throw err;

@@ -21,6 +21,8 @@ export interface RunWithRetryRequest {
   onJoined?: TurnRequest["onJoined"];
   /** See SteerJoin.onHandedOff. */
   onHandedOff?: () => void;
+  /** See MessageRequest.onPromptHandedOff. May fire once per attempt. */
+  onPromptHandedOff?: () => void;
   key: string;
   prompt: string;
   images?: Array<{ data: string; mediaType: string }>;
@@ -254,6 +256,8 @@ export interface TurnSpec {
   handedOff?: boolean;
   /** Graceful shutdown converted this turn into NO_REPLY mid-flight. */
   shutdownInterrupted?: boolean;
+  /** The prompt reached the SDK's input queue (see MessageRequest.onPromptHandedOff). */
+  onPromptHandedOff?: () => void;
   requestId?: string;
   key: string;
   /** Ingress path label for observability (watch feed turn events). */
@@ -510,6 +514,7 @@ export class TurnRunner {
           spec.handedOff = true;
           watchBus.publish({ type: "turn.handoff", sessionKey: spec.key, requestId: spec.requestId! });
         } } : {}),
+        ...(spec.onPromptHandedOff ? { onPromptHandedOff: spec.onPromptHandedOff } : {}),
         flushOnShutdown: sink.flushBlockTranscript,
         onShutdownInterrupted: () => { spec.shutdownInterrupted = true; spec.onShutdown?.("interrupted"); },
         ...(reply

@@ -26,7 +26,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
-import { composerStatus, REQUEST_LABELS, useCompletedSettle } from "./composer-status.js";
+import { composerStatus, REQUEST_LABELS, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
 
 const labels = REQUEST_LABELS;
 type Theme = "system" | "light" | "dark";
@@ -113,7 +113,11 @@ export function App() {
   const [uncertain, setUncertain] = useState<string | null>(() => {
     try { return sessionStorage.getItem("tomo-pending-request"); } catch { return null; }
   });
-  const [feedback, setFeedback] = useState("");
+  // One-off notes for the status line, stamped with where the latest request
+  // stood; composerStatus drops a note as soon as the request moves on.
+  const [note, setNote] = useState<ComposerNote>({ text: "", at: "" });
+  const stamp = useRef("");
+  const setFeedback = (text: string) => setNote({ text, at: stamp.current });
   const [theme, setTheme] = useState<Theme>(storedTheme);
   const [tasksOpen, setTasksOpen] = useState(storedTasksOpen);
   useEffect(() => {
@@ -266,7 +270,10 @@ export function App() {
     if (!uncertain) return;
     try {
       const request = await api<WebRequest>(`/messages/${uncertain}`);
-      setFeedback(labels[request.state]);
+      // The answer goes into the request stream, so the status line shows it
+      // live (and follows it to Completed) instead of a frozen copy.
+      if (request.sessionId) { web.acceptRequest(request); setFeedback(""); }
+      else setFeedback(labels[request.state]);
       // Unknown stays unresolved; refused and interrupted were not answered, so the draft is kept.
       if (request.state !== "unknown") { remember(null); if (request.state !== "refused" && request.state !== "interrupted") setDraft(""); }
       setReload((r) => r + 1);
@@ -296,6 +303,7 @@ export function App() {
   const pendingUsers = pendingUserMessages(web.requests, history, selectedId);
   const latest = web.requests.filter((r) => r.sessionId === selectedId).at(-1);
   const settle = useCompletedSettle(latest);
+  useEffect(() => { stamp.current = requestStamp(latest); });
   const usage = session?.stats;
   const hasContext = !!usage?.contextMax;
   const sessions = web.bootstrap?.sessions ?? [];
@@ -405,7 +413,7 @@ export function App() {
             {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)}
           {blocks.map((block) => <article className="message assistant motion-enter mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">Tomo</span><span>Reply in progress</span></div><div className="markdown reading"><Text breaks>{block.text}</Text></div></article>)}
         </div>
-        <div className="mx-auto w-full max-w-[740px]"><div className={cn("feedback min-h-7 pb-2 tracking-[0.02em] text-xs leading-normal text-muted-foreground transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0")} role="status" aria-live="polite">{composerStatus({ activity: web.activity[selectedId], feedback, latest, settled: settle.settled })}</div>
+        <div className="mx-auto w-full max-w-[740px]"><div className={cn("feedback min-h-7 pb-2 tracking-[0.02em] text-xs leading-normal text-muted-foreground transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0")} role="status" aria-live="polite">{composerStatus({ activity: web.activity[selectedId], note, latest, settled: settle.settled })}</div>
           {resending && <div className="mb-2 flex items-center gap-2 tracking-[0.02em] text-[11px] text-muted-foreground">
             <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Resending an interrupted message</Badge>
             <span>The original is dismissed once this one is accepted.</span>

@@ -10,21 +10,31 @@ export const REQUEST_LABELS: Record<WebRequest["state"], string> = { queued: "Qu
   unknown: "Outcome unknown — Tomo may already have acted on it. Check the conversation before sending again",
   interrupted: "Interrupted by a restart and not answered — Tomo may have started on it. Check before sending again" };
 
+/** Where the latest request stands: a note is tied to this and lapses when it moves. */
+export function requestStamp(latest: WebRequest | undefined): string {
+  return latest ? `${latest.requestId}:${latest.state}` : "";
+}
+
+/** A one-off note from the page (sending, a refusal, a failed check), and the request stamp it was written at. */
+export interface ComposerNote { text: string; at: string }
+
 /**
- * The composer's ONE status line. Live tool/typing activity first, then a
- * note the page just produced (sending, a refusal), then the state of the
- * conversation's latest web request, read live from the request stream.
- * A completed request shows "Completed" until `settled` names it.
+ * The composer's ONE status line. Live tool/typing activity first; then a
+ * note the page produced, but only while the latest request is still where
+ * it was when the note was written (any change of request or state retires
+ * it, so a note can never hold back "Running" or "Completed"); then the
+ * latest web request's state, read live from the request stream. A
+ * completed request shows "Completed" until `settled` names it.
  */
 export function composerStatus(input: {
   activity: string | undefined;
-  feedback: string;
+  note: ComposerNote;
   latest: WebRequest | undefined;
   settled: string | null;
 }): string {
   if (input.activity) return input.activity;
-  if (input.feedback) return input.feedback;
   const { latest } = input;
+  if (input.note.text && input.note.at === requestStamp(latest)) return input.note.text;
   if (!latest) return "";
   if (latest.state === "completed" && input.settled === latest.requestId) return "";
   return REQUEST_LABELS[latest.state];

@@ -10,12 +10,13 @@ import { isImageFiledFor } from "../channels/imageStore.js";
 import { sniffImageType } from "./image-type.js";
 import { OutgoingMediaStore, outgoingImagesDir } from "./outgoing-media.js";
 export { sniffImageType };
-import { WebError, type SubagentBrief, type SubagentPage, type WebCatalog, type WebContext } from "./protocol.js";
+import { WebError, type SessionTools, type SubagentBrief, type SubagentPage, type WebCatalog, type WebContext } from "./protocol.js";
 import { readSessionContext, WebCron } from "./inspection.js";
 import { WebConfigReader } from "./config-view.js";
 import { MemoryReader } from "../workspace/memory-reader.js";
 import { AgentNameReader } from "../workspace/agent-name.js";
 import { readSubagentBrief, readSubagentModel, readSubagentPage, SubagentReadError } from "./subagent-reader.js";
+import { readSessionTools, SessionToolsError } from "./session-tools.js";
 
 export interface WebDataOptions {
   sessionsDir: string;
@@ -231,6 +232,21 @@ export class WebData {
     const file = key && this.outgoing.read(key, mediaId);
     if (!file) throw new WebError(404, "media_not_found");
     return file;
+  }
+
+  /**
+   * Tool calls of a session the catalog shows (the same gate as its history),
+   * read from that session's current SDK transcript.
+   */
+  async tools(id: string, query: { from?: number; after?: number; transcript?: string }): Promise<SessionTools> {
+    const key = this.catalog().keys.get(id);
+    if (!key) throw new WebError(404, "session_not_found");
+    const entry = SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir).find((e) => e.channelKey === key);
+    try { return await readSessionTools(this.options.sdkSessionsDir, entry?.sdkSessionId, query, { workspaceDir: this.options.workspaceDir }); }
+    catch (error) {
+      if (error instanceof SessionToolsError) throw new WebError(error.code === "invalid_cursor" ? 400 : 409, error.code);
+      throw error;
+    }
   }
 
   /** The brief of a shown subagent (sessionKey from the daemon's task gate). */

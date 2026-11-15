@@ -135,6 +135,19 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           json(res, 200, await deps.data.history(history[1], url.searchParams.get("cursor") ?? undefined));
           return;
         }
+        const tools = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/tools$/.exec(url.pathname);
+        if (tools) {
+          const number = (name: string) => {
+            const raw = url.searchParams.get(name);
+            if (raw === null) return undefined;
+            if (!/^\d{1,15}$/.test(raw)) throw new WebError(400, "invalid_cursor");
+            return Number(raw);
+          };
+          const transcript = url.searchParams.get("transcript") ?? undefined;
+          if (transcript !== undefined && !/^[A-Za-z0-9_-]{0,32}$/.test(transcript)) throw new WebError(400, "invalid_cursor");
+          json(res, 200, await deps.data.tools(tools[1], { from: number("from"), after: number("after"), transcript }));
+          return;
+        }
         if (url.pathname === "/api/v1/usage") {
           // Cached for 30 minutes in the daemon; refresh=1 forces a read, at most every 30 s.
           try { json(res, 200, await deps.rpc({ method: "usage", refresh: url.searchParams.get("refresh") === "1" })); }

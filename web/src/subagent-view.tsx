@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState } from "react";
-import { ArrowLeft, ChevronRight } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import type { SubagentBrief, SubagentPage, TaskOutput, WebTask } from "../../src/web/protocol.js";
 import { cn } from "@/lib/utils";
 import { api, ApiError } from "./api.js";
@@ -9,10 +9,9 @@ import { CommandBrief, ShellPill } from "./shell-pill.js";
 import { isShellTask } from "./shell.js";
 import { Button } from "@/components/ui/button";
 import { Terminal } from "@/components/ai/terminal";
-import { Tool, ToolContent, ToolHeader, ToolSection } from "@/components/ai/tool";
-import { followStep, groupLabel, groupOpen, groupRows, INITIAL_TRANSCRIPT, isOutputTask, pendingTool, POLL_MS, transcriptReducer, viewRows,
-  type ToolRow, type TranscriptAction } from "./subagent.js";
-import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { ToolCall, ToolGroup } from "./tool-calls.js";
+import { followStep, groupOpen, groupRows, INITIAL_TRANSCRIPT, isOutputTask, POLL_MS, transcriptReducer, viewRows,
+  type TranscriptAction } from "./subagent.js";
 import { STATE_LABELS, taskKind } from "./tasks.js";
 import { useAgentName } from "./agent-name.js";
 
@@ -157,17 +156,8 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
         <p className="m-0 mb-0.5 text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">Message from {agent}</p>
         <div className="markdown text-[13px]! leading-relaxed"><Text>{block.row.text + (block.row.truncated ? "\n\n…" : "")}</Text></div></div>;
       if (block.kind === "tool") return <ToolCall key={block.row.id} row={block.row} running={running} />;
-      const open = groupOpen(openGroups, block.key);
-      const label = groupLabel(block.tools, running && last ? pendingTool(block.tools) : undefined);
-      return <Collapsible key={block.key} open={open} onOpenChange={(value) => setOpenGroups((old) => ({ ...old, [block.key]: value }))} className="group/calls">
-        <CollapsibleTrigger className="flex w-full min-w-0 items-center gap-1.5 rounded-lg px-1.5 py-1 text-left text-[12px] text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground">
-          <ChevronRight className="size-3.5 shrink-0 transition-transform group-data-[state=open]/calls:rotate-90" />
-          <span className="min-w-0 flex-1 truncate">{label.lead}{label.running && <span className="shimmer">{label.running}</span>}</span>
-        </CollapsibleTrigger>
-        <CollapsibleContent className="space-y-0.5 border-l border-border/70 py-0.5 pl-1.5 ml-3">
-          {block.tools.map((row) => <ToolCall key={row.id} row={row} running={running} />)}
-        </CollapsibleContent>
-      </Collapsible>;
+      return <ToolGroup key={block.key} tools={block.tools} running={running && last} open={groupOpen(openGroups, block.key)}
+        onOpenChange={(value) => setOpenGroups((old) => ({ ...old, [block.key]: value }))} />;
     })}
     {!gone && state.mode === "browse" && <Button variant="secondary" size="sm" onClick={jump}
       className="sticky bottom-1 mx-auto mt-2 flex h-7 rounded-full text-[11px] shadow-sm">↓ Jump to latest</Button>}
@@ -196,16 +186,6 @@ function Brief({ base }: { base: string }) {
     <div className={cn("markdown text-[12.5px]! leading-relaxed", open ? "max-h-[40vh] overflow-y-auto pr-1" : "line-clamp-3")}>
       <Text>{brief.text + (brief.truncated ? "\n\n… (truncated)" : "")}</Text></div>
   </section>;
-}
-
-function ToolCall({ row, running }: { row: ToolRow; running: boolean }) {
-  return <Tool>
-    <ToolHeader title={row.summary || row.name} state={row.result ? (row.result.isError ? "error" : "done") : running ? "running" : "done"} />
-    <ToolContent>
-      <ToolSection label="Input" text={row.input} truncated={row.inputTruncated} />
-      {row.result && <ToolSection label={row.result.isError ? "Error" : "Output"} text={row.result.output} truncated={row.result.truncated} error={row.result.isError} />}
-    </ToolContent>
-  </Tool>;
 }
 
 function Note({ status }: { status: Status }) {

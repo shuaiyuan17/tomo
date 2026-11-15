@@ -95,3 +95,20 @@ describe("sdkOptions allowedTools", () => {
     expect(missing).toEqual([]);
   });
 });
+
+describe("sdkOptions claude.ai connectors", () => {
+  it("disables claude.ai connectors for a group's own session", () => {
+    resetConfig();
+    for (const key of ["telegram:-100123", "imessage:any;+;chat123"]) {
+      const opts = sdkOptions(internalServer, undefined, undefined, { sessionKey: key });
+      expect((opts.settings as { disableClaudeAiConnectors?: boolean }).disableClaudeAiConnectors).toBe(true);
+    }
+  });
+
+  it("keeps claude.ai connectors for the owner's DM and keyless (cron) sessions", () => {
+    resetConfig();
+    const dm = sdkOptions(internalServer, undefined, undefined, { sessionKey: "dm:shuai" });
+    expect(dm.settings).not.toHaveProperty("disableClaudeAiConnectors");
+    expect(sdkOptions(internalServer).settings).not.toHaveProperty("disableClaudeAiConnectors");
+  });
+});

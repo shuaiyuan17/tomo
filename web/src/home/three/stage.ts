@@ -1,4 +1,5 @@
-import { Color, DirectionalLight, Group, HemisphereLight, Mesh, PCFSoftShadowMap, PerspectiveCamera, PointLight, Scene, Vector3, WebGLRenderer, type Object3D } from "three";
+import { Color, DirectionalLight, Group, HemisphereLight, MathUtils, Mesh, PCFSoftShadowMap, PerspectiveCamera, PointLight, Scene, Spherical, Vector3, WebGLRenderer, type Object3D } from "three";
+import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { HomeScene } from "../../../../src/home/scene.js";
 import type { HomeSubagent } from "../../../../src/home/status.js";
 import { fillSign, MAX_WAITING_DRAWN, partEffects, seatVisitors, characterSpot, visitorKind, waitingPosition, type Conditions, type SignValues, type Vec3 } from "../evaluate.js";
@@ -17,8 +18,29 @@ import { base64Bytes } from "../snapshot.js";
 
 export interface StageState { conditions: Conditions; values: SignValues; subagents: HomeSubagent[]; hasPet: boolean; sky: Sky }
 
-/** How far the owner can turn the room (radians around it, 0 = straight on). */
+/**
+ * The default view looks from AZIMUTH_DEFAULT (radians around the room, 0 =
+ * straight on) and is framed so the room fits from anywhere between
+ * AZIMUTH_MIN and AZIMUTH_MAX. The owner can then orbit all the way round.
+ */
 export const AZIMUTH_MIN = 0.05, AZIMUTH_MAX = 1.45, AZIMUTH_DEFAULT = 0.72;
+/** How high the owner can tilt the view (radians above the floor): never under it, never straight down. */
+export const ELEVATION_MIN = 10 * Math.PI / 180, ELEVATION_MAX = 85 * Math.PI / 180;
+/** How far the owner can zoom out, as a multiple of the default distance. */
+export const ZOOM_OUT_MAX = 1.8;
+/**
+ * The owner's camera limits for a room `size` [w, h, d] whose default view is
+ * `distance` away: the target may wander a quarter of the room from its centre,
+ * and the camera stays outside the room's walls wherever the target is.
+ */
+export function viewLimits(size: readonly [number, number, number], distance: number): { minDistance: number; maxDistance: number; maxTargetRadius: number } {
+  const [w, , d] = size;
+  const maxTargetRadius = Math.max(w, d) / 4;
+  const minDistance = Math.min(distance, Math.hypot(w, d) / 2 + maxTargetRadius + 0.3);
+  return { minDistance, maxDistance: distance * ZOOM_OUT_MAX, maxTargetRadius };
+}
+/** The camera as the owner left it: distance from what it looks at, angle round the room and above the floor (radians). */
+export interface StageView { distance: number; azimuth: number; elevation: number; target: Vec3 }
 /**
  * How far above the room the camera looks down (radians): the reference
  * angle on a wide view, steeper on a tall one, so a phone in portrait sees
@@ -64,13 +86,24 @@ export class HomeStage {
   private fastUntil = 0;
   private paused = false;
   private disposed = false;
-  private azimuth = AZIMUTH_DEFAULT;
   private distance = 12;
   private elevation = 0.5;
-  private target = new Vector3();
+  /** The default view looks here (the room's centre, a little up). */
+  private center = new Vector3();
+  private size: [number, number, number] = [6, 3, 6];
+  private readonly controls: OrbitControls;
+  /** The owner moved the view: a resize keeps it (within the new limits) instead of reframing. */
+  private moved = false;
+  /** A gesture is under way. */
+  private held = false;
   private width = 1;
   private height = 1;
-  reducedMotion = false;
+  private reduced = false;
+  /** Told whenever the view changes (the owner's camera). */
+  onView: ((view: StageView) => void) | undefined;
+  get reducedMotion(): boolean { return this.reduced; }
+  /** Reduced motion: the view stops where the owner lets go (no inertia). */
+  set reducedMotion(value: boolean) { this.reduced = value; this.controls.enableDamping = !value; }
 
   constructor(canvas: HTMLCanvasElement, private readonly assetUrl: (name: string) => string) {
     // Throws without WebGL: the caller says so in words.
@@ -78,6 +111,15 @@ export class HomeStage {
     this.renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
     this.renderer.shadowMap.enabled = true;
     this.renderer.shadowMap.type = PCFSoftShadowMap;
+    // Orbit (one finger / left drag), zoom (pinch / wheel) and pan (two fingers /
+    // right or Shift drag). The canvas gets touch-action: none, so a gesture on
+    // the room never scrolls the page.
+    this.controls = new OrbitControls(this.camera, canvas);
+    Object.assign(this.controls, { enableDamping: true, dampingFactor: 0.12, zoomSpeed: 0.8, rotateSpeed: 0.8,
+      minPolarAngle: Math.PI / 2 - ELEVATION_MAX, maxPolarAngle: Math.PI / 2 - ELEVATION_MIN });
+    this.controls.addEventListener("start", () => { this.held = true; });
+    this.controls.addEventListener("end", () => { this.held = false; });
+    this.controls.addEventListener("change", () => { if (this.held) this.moved = true; this.invalidate(); this.tellView(); });
     this.sun.castShadow = true;
     this.sun.shadow.mapSize.set(1024, 1024);
     this.sun.shadow.bias = -0.0005;
@@ -113,7 +155,8 @@ export class HomeStage {
     Object.assign(this.sun.shadow.camera, { left: -half, right: half, top: half, bottom: -half, near: 0.5, far: reach * 3 + h });
     this.sun.shadow.camera.updateProjectionMatrix();
     this.sun.shadow.needsUpdate = true;
-    this.target.set(0, h * 0.28, 0);
+    this.size = [w, h, d];
+    this.center.set(0, h * 0.28, 0);
     this.fit();
     if (this.state) this.setState(this.state, true);
     this.invalidate();
@@ -285,11 +328,16 @@ export class HomeStage {
     this.invalidate();
   }
 
-  /** Far enough that the whole room fits at every angle the owner can turn to (no zooming while dragging). */
+  /**
+   * The default view: far enough that the whole room fits from every angle
+   * between AZIMUTH_MIN and AZIMUTH_MAX. Then the owner's limits around it;
+   * a view the owner moved is kept (clamped to them), else it is the default.
+   */
   private fit(): void {
     if (!this.home) return;
-    const [w, h, d] = this.home.room.size;
+    const [w, h, d] = this.size;
     this.elevation = elevationFor(this.width / this.height);
+    const kept = { position: this.camera.position.clone(), target: this.controls.target.clone() };
     const corners: Vector3[] = [];
     for (let i = 0; i < 8; i++) corners.push(new Vector3(i & 1 ? w / 2 + 0.1 : -w / 2 - 0.2, i & 2 ? h : -0.2, i & 4 ? d / 2 + 0.1 : -d / 2 - 0.2));
     let distance = 4;
@@ -297,31 +345,75 @@ export class HomeStage {
       let low = 2, high = 120;
       for (let i = 0; i < 24; i++) {
         const mid = (low + high) / 2;
-        this.place(azimuth, mid);
+        this.place(this.center, azimuth, this.elevation, mid);
         const fits = corners.every((corner) => { const p = corner.clone().project(this.camera); return Math.abs(p.x) < 0.97 && Math.abs(p.y) < 0.94 && p.z < 1; });
         if (fits) high = mid; else low = mid;
       }
       distance = Math.max(distance, high);
     }
     this.distance = distance;
-    this.place(this.azimuth, this.distance);
+    Object.assign(this.controls, viewLimits(this.size, distance));
+    this.controls.cursor.copy(this.center);
+    if (!this.moved) { this.resetView(); return; }
+    this.camera.position.copy(kept.position); this.controls.target.copy(kept.target);
+    this.settle();
   }
-  private place(azimuth: number, distance: number): void {
-    const flat = Math.cos(this.elevation) * distance;
-    this.camera.position.set(this.target.x + Math.sin(azimuth) * flat, this.target.y + Math.sin(this.elevation) * distance, this.target.z + Math.cos(azimuth) * flat);
-    this.camera.lookAt(this.target);
+  private place(target: Vector3, azimuth: number, elevation: number, distance: number): void {
+    const flat = Math.cos(elevation) * distance;
+    this.camera.position.set(target.x + Math.sin(azimuth) * flat, target.y + Math.sin(elevation) * distance, target.z + Math.cos(azimuth) * flat);
+    this.camera.lookAt(target);
     this.camera.updateMatrixWorld();
   }
+  /** Apply the controls' limits now, dropping any motion still gliding. */
+  private settle(): void {
+    const damping = this.controls.enableDamping;
+    this.controls.enableDamping = false;
+    this.controls.update();
+    this.controls.enableDamping = damping;
+  }
 
-  /** Turn the view by `delta` radians, within the limits. */
-  turn(delta: number): void {
-    const next = Math.max(AZIMUTH_MIN, Math.min(AZIMUTH_MAX, this.azimuth + delta));
-    if (next === this.azimuth) return;
-    this.azimuth = next; this.place(this.azimuth, this.distance);
+  /** The owner has moved the view from the default. */
+  isMoved(): boolean { return this.moved; }
+
+  /** The view as it is now. */
+  view(): StageView {
+    const offset = this.camera.position.clone().sub(this.controls.target);
+    const spherical = new Spherical().setFromVector3(offset);
+    const t = this.controls.target;
+    return { distance: spherical.radius, azimuth: MathUtils.euclideanModulo(spherical.theta, Math.PI * 2), elevation: Math.PI / 2 - spherical.phi, target: [t.x, t.y, t.z] };
+  }
+  private tellView(): void { try { this.onView?.(this.view()); } catch { /* a listener never breaks the drawing */ } }
+
+  /** Orbit by `azimuth` radians round the room and `elevation` up (the keyboard's way), within the limits. */
+  turn(azimuth: number, elevation = 0): void {
+    const offset = this.camera.position.clone().sub(this.controls.target);
+    const spherical = new Spherical().setFromVector3(offset);
+    spherical.theta += azimuth;
+    spherical.phi = MathUtils.clamp(spherical.phi - elevation, this.controls.minPolarAngle, this.controls.maxPolarAngle);
+    this.camera.position.copy(this.controls.target).add(offset.setFromSpherical(spherical));
+    this.moved = true;
+    this.settle();
     this.fastUntil = performance.now() / 1000 + 0.5;
     this.invalidate();
   }
-  resetView(): void { this.azimuth = AZIMUTH_DEFAULT; this.place(this.azimuth, this.distance); this.invalidate(); }
+  /** Zoom by `factor` (below 1 closer), within the limits. */
+  zoom(factor: number): void {
+    const offset = this.camera.position.clone().sub(this.controls.target).multiplyScalar(factor);
+    this.camera.position.copy(this.controls.target).add(offset);
+    this.moved = true;
+    this.settle();
+    this.invalidate();
+  }
+  /** Back to the default view. */
+  resetView(): void {
+    this.settle();
+    this.controls.target.copy(this.center);
+    this.place(this.center, AZIMUTH_DEFAULT, this.elevation, this.distance);
+    this.moved = false;
+    this.settle();
+    this.invalidate();
+    this.tellView();
+  }
 
   /** Something changed: draw again (and keep drawing while anything moves). */
   invalidate(): void {
@@ -343,8 +435,11 @@ export class HomeStage {
     this.fast = moving;
     if (this.drawWindows(now)) busy = true;
     this.placeGlowLights();
+    // Gliding to a stop after the owner lets go (damping).
+    const gliding = this.controls.enableDamping && this.controls.update();
     this.renderer.render(this.scene, this.camera);
-    if (busy || moving) this.invalidate(); else this.lastTime = 0;
+    if (gliding) this.fastUntil = now + 0.1;
+    if (busy || moving || gliding) this.invalidate(); else this.lastTime = 0;
   }
 
   pause(): void { this.paused = true; if (this.frame) cancelAnimationFrame(this.frame); this.frame = 0; this.lastTime = 0; }
@@ -388,6 +483,7 @@ export class HomeStage {
   dispose(): void {
     this.disposed = true;
     if (this.frame) cancelAnimationFrame(this.frame);
+    this.controls.dispose();
     this.clearWorld();
     this.sun.shadow.map?.dispose();
     this.sun.dispose(); this.hemi.dispose(); for (const light of this.glowLights) light.dispose();

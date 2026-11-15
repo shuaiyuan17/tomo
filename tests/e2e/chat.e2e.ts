@@ -1108,14 +1108,23 @@ it("own bubbles fit their content (85% cap) and show ✓ sent, then ✓✓ read 
   await browserExpect(receipt).toHaveAttribute("title", "Read by Tomo");
   // Measured once the turn is over and the bubble is the settled history row.
   await browserExpect(page.locator("article.message.assistant").filter({ hasText: "A tick is a receipt." })).toBeVisible();
+  // Hidden until the bubble is hovered.
+  const opacity = () => receipt.evaluate((el) => Number(getComputedStyle(el).opacity));
+  await page.mouse.move(0, 0);
+  await browserExpect.poll(opacity).toBe(0);
+  await own.locator(".own-bubble").hover();
+  await browserExpect.poll(opacity).toBeGreaterThan(0.5);
   await receipt.click();
   await browserExpect(receipt).toContainText("Read by Tomo");
   // A row can be re-rendered (pending → history) between reads: measure in one evaluate, retried.
   const measure = (row: typeof own) => row.evaluate((el) => {
     const r = (sel: string) => el.querySelector(sel)!.getBoundingClientRect();
-    return { column: el.getBoundingClientRect().width, bubble: r(".own-bubble").width, text: r(".own-bubble .markdown").right, tick: r(".read-receipt").right };
+    const b = r(".own-bubble"); const t = r(".read-receipt");
+    return { column: el.getBoundingClientRect().width, bubble: b.width,
+      // The tick sits inside the bubble, in its bottom-right corner.
+      inCorner: t.right <= b.right && t.right > b.right - 24 && t.bottom <= b.bottom && t.bottom > b.bottom - 16 };
   });
-  await browserExpect.poll(async () => { const m = await measure(own); return m.bubble < m.column * 0.4 && Math.abs(m.tick - m.text) < 2; }).toBe(true);
+  await browserExpect.poll(async () => { const m = await measure(own); return m.bubble < m.column * 0.4 && m.inCorner; }).toBe(true);
 
   mockSdk.responseFn = () => "ok";
   const long = "long words ".repeat(120).trim();

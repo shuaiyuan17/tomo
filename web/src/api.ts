@@ -127,13 +127,13 @@ export async function stream(cursor: string, signal: AbortSignal, handlers: Stre
 export type { WebBootstrap };
 
 /**
- * Upload one image for the next message (XHR, for upload progress). Same
+ * Upload one image or file for the next message (XHR, for upload progress). Same
  * gate as sending: CSRF, the daemon epoch, the owner's conversation. A
  * definite CSRF rejection is retried once with a fresh token, like `mutate`.
  */
 export function uploadImage(file: Blob, targetId: string, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>,
-  onProgress: (fraction: number) => void, signal?: AbortSignal): Promise<{ uploadId: string; type: string; size: number }> {
-  const send = (csrfToken: string) => new Promise<{ uploadId: string; type: string; size: number }>((resolve, reject) => {
+  onProgress: (fraction: number) => void, signal?: AbortSignal): Promise<{ uploadId: string; type: string; size: number; kind?: "image" | "file" }> {
+  const send = (csrfToken: string) => new Promise<{ uploadId: string; type: string; size: number; kind?: "image" | "file" }>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `/api/v1/uploads?targetId=${encodeURIComponent(targetId)}`);
     xhr.withCredentials = true;
@@ -145,7 +145,7 @@ export function uploadImage(file: Blob, targetId: string, bootstrap: WebBootstra
     xhr.onload = () => {
       let value: { error?: string } & Record<string, unknown> = {};
       try { value = JSON.parse(xhr.responseText); } catch { /* not JSON */ }
-      if (xhr.status >= 200 && xhr.status < 300) resolve(value as unknown as { uploadId: string; type: string; size: number });
+      if (xhr.status >= 200 && xhr.status < 300) resolve(value as unknown as { uploadId: string; type: string; size: number; kind?: "image" | "file" });
       else reject(new ApiError(xhr.status, value.error ?? "unavailable"));
     };
     xhr.onerror = () => reject(new ApiError(0, "network"));

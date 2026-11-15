@@ -18,7 +18,20 @@ export const messageInputSchema = z.object({
   text: z.string().trim().max(16_000),
   /** Staged uploads (POST /uploads) to attach, in order; at most 6 (see uploads.ts). */
   images: z.array(z.string().regex(/^[a-f0-9]{32}$/)).min(1).max(6).optional(),
-}).strict().refine((input) => input.text.length > 0 || (input.images?.length ?? 0) > 0, { message: "empty message" });
+  /** Staged non-image uploads, with the name and type the browser gave them
+   *  (both sanitised when filed, exactly as iMessage's are); at most 6. */
+  files: z.array(z.object({
+    id: z.string().regex(/^[a-f0-9]{32}$/),
+    name: z.string().max(1024),
+    type: z.string().max(255),
+  }).strict()).min(1).max(6).optional(),
+  /** Resending an interrupted message: files it already filed (their paths, as
+   *  its request lists them), attached again from where they are — never a
+   *  path the daemon did not file for an interrupted request. */
+  refiled: z.array(z.string().min(1).max(4096)).min(1).max(6).optional(),
+}).strict().refine((input) => input.text.length > 0 || (input.images?.length ?? 0) > 0 || (input.files?.length ?? 0) > 0 || (input.refiled?.length ?? 0) > 0, { message: "empty message" });
+/** A non-image file a web message filed (memory/incoming-files): where, and what its notice said. */
+export interface WebFiledFile { path: string; name: string; type: string; size: number; typeUnknown?: boolean }
 export type MessageInput = z.infer<typeof messageInputSchema>;
 export interface WebSession {
   id: string;
@@ -33,10 +46,10 @@ export interface WebCatalog { sessions: WebSession[]; ownerId: string | null; se
  *  failed). `interrupted`: accepted, then the daemon restarted before it
  *  settled; never re-run automatically. Neither is retried. */
 export type RequestState = "queued" | "running" | "completed" | "refused" | "failed" | "unknown" | "interrupted";
-/** `images`: where an owner's attached images were filed (incoming-images), while the request's text is kept. */
+/** `images` / `files`: where an owner's attached images (incoming-images) and other files (incoming-files) were filed, while the request's text is kept. */
 export interface WebRequest { requestId: string; state: RequestState; sessionId?: string; responseTurnId?: string; joined?: boolean; handedOff?: boolean;
   /** The agent has read (the SDK consumed) this message. In memory only; restored completed requests count as read. */
-  read?: boolean; text?: string; timestamp?: number; images?: string[] }
+  read?: boolean; text?: string; timestamp?: number; images?: string[]; files?: WebFiledFile[] }
 export interface HistoryMessage extends SessionMessage { id: string }
 export interface HistoryPage { messages: HistoryMessage[]; nextCursor: string | null; revision?: string }
 export type WebTaskState = "running" | "completed" | "failed" | "stopped" | "ended";
@@ -214,7 +227,8 @@ export interface WebBootstrap extends WebCatalog {
   /** Every visible session's tasks; replaces the client's whole task list. */
   tasks: WebTask[];
   /** Optional features this daemon serves (absent on older daemons). */
-  capabilities?: { screen: boolean; uploads?: boolean };
+  /** `uploads`: images can be attached; `files`: any other file can. */
+  capabilities?: { screen: boolean; uploads?: boolean; files?: boolean };
   /** The latest compact request, so a reload still shows it. */
   compact?: WebCompactState;
   rateLimit?: WebRateLimit;

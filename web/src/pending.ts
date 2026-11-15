@@ -7,8 +7,8 @@ export function recordedReplyIds(history: HistoryPage): Set<string> {
 /** Messages this owner sent from the browser that the transcript does not show yet (#381). */
 export function pendingUserMessages(requests: WebRequest[], history: HistoryPage, sessionId: string, withImages: ReadonlySet<string> = new Set()): WebRequest[] {
   const recorded = new Set(history.messages.filter((m) => m.role === "user").map((m) => m.requestId));
-  // An image-only message has no text, but this tab still shows its bubble (with the pictures).
-  return requests.filter((r) => r.sessionId === sessionId && (r.text || r.images?.length || withImages.has(r.requestId)) && !recorded.has(r.requestId) && r.state !== "refused");
+  // An image- or file-only message has no text, but this tab still shows its bubble (with the attachments).
+  return requests.filter((r) => r.sessionId === sessionId && (r.text || r.images?.length || r.files?.length || withImages.has(r.requestId)) && !recorded.has(r.requestId) && r.state !== "refused");
 }
 export function pendingLabel(request: WebRequest): string {
   if (request.joined) return "Joined the running turn";
@@ -66,21 +66,54 @@ export function isResendOf(original: string, sent: string): boolean {
 }
 
 /** An interrupted request the owner is resending from the composer. */
-/** `imageKeys`: the tray items its images were re-attached as (an image-only message is a resend by these). */
-export interface Resend { requestId: string; original: string; imageKeys?: string[] }
+/**
+ * `imageKeys` / `fileKeys`: the tray items its images / files were re-attached
+ * as (a message without text is a resend by these). `restoring`: its images
+ * are still being read back — not sendable yet, and never counted as the resend.
+ * `expected`: how many attachments the ORIGINAL had (images + files) — the
+ * resend counts only if every one of them came back and was sent.
+ */
+export interface Resend { requestId: string; original: string; imageKeys?: string[]; fileKeys?: string[]; restoring?: boolean; expected?: number;
+  /** Which restore this is (one per Resend click): a late result for an earlier one must never land on this one. */
+  token?: number }
+/**
+ * A restore's result (the keys its images were re-attached as), applied only
+ * to the resend that started it: if the owner has since resent another
+ * message, cancelled, or sent, the current resend is returned unchanged.
+ */
+export function applyRestored(current: Resend | null, token: number, imageKeys: string[]): Resend | null {
+  if (!current || current.token !== token) return current;
+  return { ...current, imageKeys, restoring: false };
+}
+/** After a send was accepted: clear the resend it was sent as — not another one the owner started meanwhile. */
+export function resendAfterSend(current: Resend | null, sentAs: Resend | null): Resend | null {
+  if (!current) return null;
+  return sentAs && current.requestId === sentAs.requestId && current.token === sentAs.token ? null : current;
+}
+/** Attachments of the original that did not make it back into the tray (a failed read, a full tray). */
+export function missingAttachments(resend: Resend | null): number {
+  if (!resend || resend.restoring) return 0;
+  return Math.max(0, (resend.expected ?? 0) - attachedKeys(resend).length);
+}
+const attachedKeys = (resend: Resend) => [...(resend.imageKeys ?? []), ...(resend.fileKeys ?? [])];
 /** Clearing the composer cancels a resend; editing it does not (nor does an image-only one's empty draft). */
 export function resendAfterDraftChange(resend: Resend | null, draft: string): Resend | null {
-  return resend && (draft.trim() || resend.imageKeys?.length) ? resend : null;
+  return resend && (draft.trim() || attachedKeys(resend).length || resend.restoring) ? resend : null;
 }
 /**
  * The interrupted request to dismiss once `sent` was ACCEPTED — only if it
  * really was that message: its text (or an edit of it), or, for one without
- * text, at least one of its re-attached images (`sentKeys`: the tray items sent).
+ * text, at least one of its re-attached images or files (`sentKeys`: the tray items sent).
+ * Only once its attachments were all restored, and only if the send took
+ * every one of them: a send that left one behind keeps the original queued.
  */
 export function dismissAfterAcceptedSend(resend: Resend | null, sent: string, sentKeys: readonly string[] = []): string | null {
-  if (!resend) return null;
+  if (!resend || resend.restoring) return null;
+  // Judged against the original's attachments, not what happened to come back.
+  if (missingAttachments(resend) > 0) return null;
+  if (!attachedKeys(resend).every((key) => sentKeys.includes(key))) return null;
   if (isResendOf(resend.original, sent)) return resend.requestId;
-  if (!resend.original.trim() && resend.imageKeys?.some((key) => sentKeys.includes(key))) return resend.requestId;
+  if (!resend.original.trim() && attachedKeys(resend).some((key) => sentKeys.includes(key))) return resend.requestId;
   return null;
 }
 

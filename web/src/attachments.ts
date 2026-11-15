@@ -6,14 +6,16 @@
  *   [Sent 2 images, saved to: /a.png, /b.jpg; 1 still downloading — will follow …]
  *   [Sent a sticker, saved to: /…png; resend with STICKER:<saved path>]
  *   [Sent a document, saved to: /…/incoming-documents/…pdf]
- *   [Sent a file: name.zip — saved to /…; … Contents not attached …]
+ *   [Sent a file: notes.md (text/markdown, 1.2 KB) saved to /…/incoming-files/…; … Contents not attached …]
+ *   [Sent a file: name.zip — saved to /…; … Contents not attached …]   (older form)
  * The UI shows images as thumbnails and other attachments as a named chip,
  * never the raw path.
  */
 export type MessagePart =
   | { kind: "text"; text: string }
   | { kind: "images"; paths: string[]; sticker: boolean; missing: number; more: number }
-  | { kind: "attachment"; label: string; names: string[] }
+  /** `files`: each file's name and size, where the marker gives them (shown as a card each). */
+  | { kind: "attachment"; label: string; names: string[]; files?: Array<{ name: string; size?: string }> }
   /** Pictures the agent sent, by outgoing-store id; null: no longer available. */
   | { kind: "sent"; ids: (string | null)[] };
 
@@ -49,8 +51,11 @@ export function splitAttachments(content: string): MessagePart[] {
     } else if (/document/.test(noun)) {
       parts.push({ kind: "attachment", label: count(noun) > 1 ? `${count(noun)} documents` : "Document", names: savedPaths(rest).map(fileName) });
     } else {
-      const names = [...rest.matchAll(/(?:^:\s*|;\s*)([^;—]+?)\s+—/g)].map((m) => m[1].trim()).filter(Boolean);
-      parts.push({ kind: "attachment", label: count(noun) > 1 ? `${count(noun)} files` : "File", names });
+      // fileStore's notice: "<name> (<type>, <size>) saved to …" — the name is sanitised to [A-Za-z0-9._-].
+      const files = [...rest.matchAll(/(?:^:\s*|;\s*)([A-Za-z0-9._-]+) \((?:[^()]*), ([^(),]+)\)/g)].map((m) => ({ name: m[1], size: m[2].trim() }));
+      const names = files.length ? files.map((file) => file.name)
+        : [...rest.matchAll(/(?:^:\s*|;\s*)([^;—]+?)\s+—/g)].map((m) => m[1].trim()).filter(Boolean);
+      parts.push({ kind: "attachment", label: count(noun) > 1 ? `${count(noun)} files` : "File", names, ...(files.length ? { files } : {}) });
     }
   }
   const after = content.slice(last);

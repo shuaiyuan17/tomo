@@ -14,10 +14,10 @@ import { CompactButton } from "./compact-button.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
-import { ArrowUp, ImagePlus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, House, ListChecks, MessageCircle, Monitor, Moon, PanelLeft, Sun, SunMoon } from "lucide-react";
+import { ArrowUp, FileIcon, ImagePlus, Plus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, House, ListChecks, MessageCircle, Monitor, Moon, PanelLeft, Sun, SunMoon } from "lucide-react";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { HomePage, useHomeRoute } from "./home/home-page.js";
-import { awaitingOwner, dismissAfterAcceptedSend, historyBadge, pendingLabel, pendingUserMessages, readReceipt, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
+import { applyRestored, awaitingOwner, dismissAfterAcceptedSend, missingAttachments, resendAfterSend, historyBadge, pendingLabel, pendingUserMessages, readReceipt, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
 import { ReadReceiptMark } from "./read-receipt.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -39,7 +39,8 @@ import { ChunkBoundary } from "./chunk-boundary.js";
 import { ToolsUnreadableNote, TurnBlock } from "./tool-calls.js";
 import { useAttachments } from "./use-attachments.js";
 import { channelLabel, dayDividers, messageDateTime, messageTime } from "./message-meta.js";
-import { attachmentLabel, canSendWith, captureSend, dragHasFiles, imageFiles } from "./uploads.js";
+import { attachmentLabel, canSendWith, captureSend, dragHasFiles, formatSize, imageFiles, pastedFiles } from "./uploads.js";
+import { FileCard } from "./message-body.js";
 
 // The Study and the screen window are off the chat's first paint: their own chunks, fetched when opened.
 const Study = lazy(() => import("./study.js").then((m) => ({ default: m.Study })));
@@ -60,6 +61,10 @@ function parsedMessages(messages: HistoryPage["messages"]) {
 
 type Theme = "system" | "light" | "dark";
 /** 503s that mean "not accepted, and why" — the draft stays, nothing ran. */
+/** A resend that could not bring all of the original's attachments back (a failed read, a full tray). */
+const missingNote = (missing: number) =>
+  `${missing} attachment${missing === 1 ? "" : "s"} could not be restored. The interrupted message stays queued; attach ${missing === 1 ? "it" : "them"} again or dismiss it yourself.`;
+
 const refusalReasons: Record<string, string> = {
   interrupted_backlog: "Not sent: messages interrupted by restarts are waiting for you above. Resend or dismiss them first; your draft is kept.",
   journal_unavailable: "Not sent: Tomo cannot read its record of browser messages, so it is not taking new ones. Check the daemon log; your draft is kept.",
@@ -163,10 +168,14 @@ export function App() {
   const [dragging, setDragging] = useState(false);
   /** Previews of images this tab sent, per request, for its pending bubble. */
   const [sentImages, setSentImages] = useState<Record<string, string[]>>({});
-  const attachments = useAttachments(web.bootstrap, web.refreshBootstrap, session?.writable ? session.id : undefined);
+  /** Names and sizes of the other files this tab sent, per request, for its pending bubble. */
+  const [sentFiles, setSentFiles] = useState<Record<string, Array<{ name: string; size: number }>>>({});
   // Off with saveInboundImages: there would be no durable copy to keep with the message.
   const uploadsOn = web.bootstrap?.capabilities?.uploads !== false;
-  const canAttach = !!session?.writable && web.connection === "live" && uploadsOn;
+  // Any other file: on with saveInboundFiles (filed by path, as iMessage's are).
+  const filesOn = web.bootstrap?.capabilities?.files === true;
+  const attachments = useAttachments(web.bootstrap, web.refreshBootstrap, session?.writable ? session.id : undefined, { images: uploadsOn, files: filesOn });
+  const canAttach = !!session?.writable && web.connection === "live" && (uploadsOn || filesOn);
   /** Files dragged over the chat: "Drop to attach" (only files, only where sending is possible). */
   const dragProps = {
     onDragEnter: (e: React.DragEvent) => { if (canAttach && dragHasFiles(e.dataTransfer.types)) { e.preventDefault(); setDragging(true); } },
@@ -175,7 +184,8 @@ export function App() {
     onDrop: (e: React.DragEvent) => {
       if (!canAttach || !dragHasFiles(e.dataTransfer.types)) return;
       e.preventDefault(); setDragging(false);
-      attachments.add(imageFiles(e.dataTransfer.items).length ? imageFiles(e.dataTransfer.items) : Array.from(e.dataTransfer.files));
+      attachments.add(filesOn ? Array.from(e.dataTransfer.files)
+        : imageFiles(e.dataTransfer.items).length ? imageFiles(e.dataTransfer.items) : Array.from(e.dataTransfer.files));
       input.current?.focus();
     },
   };
@@ -373,24 +383,32 @@ export function App() {
   const webRequestIds = new Set(web.requests.map((r) => r.requestId));
   const send = async (event: FormEvent) => {
     event.preventDefault();
-    if (!session?.writable || !canSendWith(draft, attachments.items) || sending || uncertain || !web.bootstrap || web.connection !== "live") return;
+    if (!session?.writable || !canSendWith(draft, attachments.items) || sending || uncertain || restoring || !web.bootstrap || web.connection !== "live") return;
     const text = draft.trim();
     // Captured now: images added while this sends stay in the tray.
-    const { keys: sentKeys, ids: images } = captureSend(attachments.items);
+    const { keys: sentKeys, ids: images, files, refiled } = captureSend(attachments.items);
+    // The resend this send is (captured now: the owner may start another while it is in flight).
+    const sentAs = resending;
     const requestId = crypto.randomUUID();
     setSending(true); setFeedback("Sending…"); remember(requestId);
     // Sending is the reader's own move: it takes them to the end, wherever they were reading.
     // Claimed before the request goes out: the live stream can show its bubble before the POST returns.
     scroller.current?.claim(pendingKey({ requestId }));
     try {
-      const request = await sendMessage({ requestId, targetId: session.id, text, ...(images.length ? { images } : {}) }, web.bootstrap, web.refreshBootstrap);
-      if (images.length) { const taken = attachments.take(sentKeys); setSentImages((old) => ({ ...old, [requestId]: taken.map((item) => item.preview) })); }
+      const request = await sendMessage({ requestId, targetId: session.id, text, ...(images.length ? { images } : {}), ...(files.length ? { files } : {}), ...(refiled.length ? { refiled } : {}) }, web.bootstrap, web.refreshBootstrap);
+      if (sentKeys.length) {
+        const taken = attachments.take(sentKeys);
+        const pictures = taken.filter((item) => item.kind !== "file"), others = taken.filter((item) => item.kind === "file");
+        if (pictures.length) setSentImages((old) => ({ ...old, [requestId]: pictures.map((item) => item.preview) }));
+        if (others.length) setSentFiles((old) => ({ ...old, [requestId]: others.map((item) => ({ name: item.file.name, size: item.file.size })) }));
+      }
       web.acceptRequest({ ...request, text, timestamp: Date.now() });
       // Accepted, and it really was that message (or the owner's edit of it):
       // only now does the interrupted one go.
-      const replaced = dismissAfterAcceptedSend(resending, text, sentKeys);
+      const replaced = dismissAfterAcceptedSend(sentAs, text, sentKeys);
       if (replaced) void dismiss(replaced, true);
-      setResending(null);
+      // Only the resend this was sent as ends; one the owner started while it was sending stays.
+      setResending((old) => resendAfterSend(old, sentAs));
       setDraft((old) => old.trim() === text ? "" : old);
       setFeedback(""); remember(null); setReload((r) => r + 1);
     } catch (err) {
@@ -402,11 +420,13 @@ export function App() {
         setFeedback(err.status === 413 ? "Message is too large. Shorten it and send again; your draft is kept."
           : err.status === 401 ? "Open the private link in web-access.log to reconnect. Your draft is kept."
           : err.code === "owner_dm_only" ? "Group conversations are read-only."
-          : err.code === "upload_missing" ? "An attached image expired before it was sent. Remove it and attach it again; your draft is kept." : "Message was not accepted. Your draft is saved here; reconnect or check web settings.", err.code !== "owner_dm_only");
+          : err.code === "upload_missing" ? "An attachment expired before it was sent. Remove it and attach it again; your draft is kept."
+          : err.code === "uploads_disabled" ? "Attachments of that kind are off in config. Remove them to send; your draft is kept." : "Message was not accepted. Your draft is saved here; reconnect or check web settings.", err.code !== "owner_dm_only");
       } else setFeedback(labels.unknown, true);
     } finally { setSending(false); }
   };
-  const reattach = async (paths: string[]) => {
+  const reattach = async (paths: string[], restored: { fileKeys: string[]; expected: number; token: number }) => {
+    // Every read settles (allSettled-style: each one catches) before the tray or the resend changes.
     const files = await Promise.all(paths.map(async (path, i) => {
       try {
         const response = await fetch(`/api/v1/sessions/${selectedId}/media?path=${encodeURIComponent(path)}`, { credentials: "same-origin" });
@@ -415,14 +435,24 @@ export function App() {
         return new File([blob], path.split("/").at(-1) || `image-${i + 1}`, { type: blob.type });
       } catch { return null; }
     }));
+    // Another resend, a cancel or a send since: this result is stale — nothing goes in the tray, nothing changes.
+    if (restoreToken.current !== restored.token) return;
     const found = files.filter((file): file is File => !!file);
     const keys = attachments.add(found);
-    setResending((old) => old && { ...old, imageKeys: keys });
-    if (found.length < paths.length) setFeedback("Some of its images could not be read back; attach them again before sending.", true);
+    // Restored: only now may it be sent (and only now can it count as the resend).
+    setResending((old) => applyRestored(old, restored.token, keys));
+    // A failed read or a full tray: the original stays queued (missingAttachments), and the owner is told.
+    const missing = missingAttachments({ requestId: "", original: "", imageKeys: keys, fileKeys: restored.fileKeys, expected: restored.expected });
+    if (missing) setFeedback(missingNote(missing), true);
   };
   /** Interrupted request being resent from the composer (dismissed once the resend is accepted). */
   const [resending, setResending] = useState<Resend | null>(null);
+  /** The current restore; bumped whenever the resend is replaced or ends, so a late result is dropped. */
+  const restoreToken = useRef(0);
+  const endResend = () => { restoreToken.current++; setResending(null); };
   const [confirmDismiss, setConfirmDismiss] = useState<string | null>(null);
+  /** A resend's images are still being read back into the tray. */
+  const restoring = resending?.restoring === true;
   const dismiss = async (requestId: string, quiet = false) => {
     if (!web.bootstrap) return;
     setConfirmDismiss(null);
@@ -430,10 +460,18 @@ export function App() {
     catch { if (!quiet) setFeedback("Could not dismiss it yet. It is still kept; try again.", true); }
   };
   const resend = (request: WebRequest) => {
-    setResending({ requestId: request.requestId, original: request.text ?? "" });
+    // A new restore: any earlier one still reading is void, and what it put back in the tray goes (as its draft does).
+    const token = ++restoreToken.current;
+    // Its files come back as they are: already filed, the resend names them by path (nothing is uploaded again).
+    // One atomic tray change: the previous resend's items out, this one's files in.
+    const fileKeys = attachments.replaceAll([...(resending?.imageKeys ?? []), ...(resending?.fileKeys ?? [])], request.files ?? []);
+    const restoringImages = !!request.images?.length;
+    const expected = (request.images?.length ?? 0) + (request.files?.length ?? 0);
+    setResending({ requestId: request.requestId, original: request.text ?? "", ...(fileKeys.length ? { fileKeys } : {}), ...(restoringImages ? { restoring: true } : {}), ...(expected ? { expected } : {}), token });
     setDraft(request.text ?? ""); input.current?.focus();
     // Its images come back too: read from where they were filed, attached (uploaded) again.
-    if (request.images?.length) void reattach(request.images);
+    // Until every one is back, Send stays off — a send now would leave them behind.
+    if (restoringImages) void reattach(request.images!, { fileKeys, expected, token });
     setFeedback("Review the message, then send it again. The interrupted one is dismissed once this is accepted.");
   };
   // The latest resend/dismiss, for buttons in memoized history rows (they read state from this render).
@@ -480,7 +518,7 @@ export function App() {
   };
   const durable = recordedReplyIds(history);
   const blocks = web.blocks.filter((b) => b.sessionId === selectedId && !durable.has(b.turnId ?? b.requestId));
-  const pendingUsers = pendingUserMessages(web.requests, history, selectedId, new Set(Object.keys(sentImages)));
+  const pendingUsers = pendingUserMessages(web.requests, history, selectedId, new Set([...Object.keys(sentImages), ...Object.keys(sentFiles)]));
   const latest = web.requests.filter((r) => r.sessionId === selectedId).at(-1);
   const settle = useCompletedSettle(latest);
   // Tool calls, inline: read from the session's transcript back to the oldest
@@ -696,6 +734,9 @@ export function App() {
               body={`[Sent ${request.images.length === 1 ? "an image" : `${request.images.length} images`}, saved to: ${request.images.join(", ")}]`} /></div> : null}
             {sentImages[request.requestId] && <div className="mb-2 flex flex-wrap gap-2 opacity-80">{sentImages[request.requestId].map((src, i) =>
               <img key={i} src={src} alt="Image" className="block max-h-[280px] max-w-[280px] rounded-xl border object-contain" />)}</div>}
+            {((files) => files.length > 0 && <div className="mb-2 flex flex-wrap gap-2 opacity-80">
+              {files.map((file, i) => <FileCard key={i} name={file.name} size={file.size === undefined ? undefined : formatSize(file.size)} />)}</div>)(
+              sentFiles[request.requestId] ?? (request.files ?? []).map((file): { name: string; size?: number } => ({ name: file.name, size: file.size })))}
             {request.text ? ownBubble(<div className="markdown min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80 max-[600px]:px-4 max-[600px]:py-3"><Text breaks>{request.text}</Text></div>, request.requestId)
               : ownBubble(null, request.requestId)}
             {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)(row.request)}
@@ -714,10 +755,23 @@ export function App() {
             <Sparkles className="size-3.5 shrink-0" strokeWidth={1.75} aria-hidden="true" /><span className="truncate">{suggestion}</span></button>}
           {resending && <div className="mb-2 flex items-center gap-2 tracking-[0.02em] text-[11px] text-muted-foreground">
             <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Resending an interrupted message</Badge>
-            <span>The original is dismissed once this one is accepted.</span>
-            <Button variant="ghost" size="sm" className="h-6 rounded-md px-2 text-[11px]" onClick={() => setResending(null)}>Not a resend</Button></div>}
-          {attachments.items.length > 0 && <ul aria-label="Attached images" className="m-0 mb-2 flex list-none flex-wrap gap-2 p-0">
-            {attachments.items.map((item, index) => <li key={item.key} aria-label={attachmentLabel(item, index)}
+            <span role="status" className={cn(missingAttachments(resending) > 0 && "text-destructive")}>{restoring ? "Restoring attachments…"
+              : missingAttachments(resending) > 0 ? missingNote(missingAttachments(resending)) : "The original is dismissed once this one is accepted."}</span>
+            <Button variant="ghost" size="sm" className="h-6 rounded-md px-2 text-[11px]" onClick={endResend}>Not a resend</Button></div>}
+          {attachments.items.length > 0 && <ul aria-label={filesOn ? "Attachments" : "Attached images"} className="m-0 mb-2 flex list-none flex-wrap gap-2 p-0">
+            {attachments.items.map((item, index) => item.kind === "file" ? <li key={item.key} aria-label={attachmentLabel(item, index)} data-kind="file"
+              className={cn("relative flex h-16 max-w-[260px] items-center gap-2.5 overflow-hidden rounded-xl border bg-muted/40 py-2 pr-9 pl-3 motion-enter", item.status === "failed" && "border-destructive/60")}>
+              <FileIcon className="size-5 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
+              <span className={cn("flex min-w-0 flex-col", item.status !== "done" && "opacity-60")}>
+                <span className="truncate text-[13px] text-foreground">{item.file.name || `File ${index + 1}`}</span>
+                <span className="text-[11px] text-muted-foreground tabular-nums">{item.status === "failed" ? item.error ?? "Upload failed" : formatSize(item.file.size)}</span></span>
+              {item.status === "uploading" && <span className="absolute inset-x-3 bottom-1.5 h-1 overflow-hidden rounded-full bg-background/70" role="progressbar" aria-label="Upload progress"
+                aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(item.progress * 100)}><span className="block h-full bg-primary transition-[width] duration-150" style={{ width: `${Math.round(item.progress * 100)}%` }} /></span>}
+              {item.status === "failed" && <button type="button" onClick={() => attachments.retry(item.key)} title={item.error} aria-label={`Retry upload${item.error ? ` (${item.error})` : ""}`}
+                className="absolute top-1 right-8 grid size-6 place-items-center rounded-full text-destructive hover:bg-background/60"><RotateCw className="size-3.5" /></button>}
+              <button type="button" onClick={() => attachments.remove(item.key)} aria-label={`Remove ${item.file.name || `file ${index + 1}`}`}
+                className="absolute top-1 right-1 grid size-6 place-items-center rounded-full bg-foreground/70 text-background transition-colors hover:bg-foreground focus-visible:outline-offset-0"><X className="size-3" strokeWidth={2.5} /></button>
+            </li> : <li key={item.key} aria-label={attachmentLabel(item, index)}
               className={cn("relative size-16 overflow-hidden rounded-xl border bg-muted/40 motion-enter", item.status === "failed" && "border-destructive/60")}>
               <img src={item.preview} alt="" className={cn("size-full object-cover", item.status !== "done" && "opacity-60")} />
               {item.status === "uploading" && <span className="absolute inset-x-1.5 bottom-1.5 h-1 overflow-hidden rounded-full bg-background/70" role="progressbar" aria-label="Upload progress"
@@ -729,18 +783,21 @@ export function App() {
             </li>)}</ul>}
           {attachments.note && <p className="m-0 mb-2 text-[12px] text-muted-foreground" role="status">{attachments.note}</p>}
           <form onSubmit={(e) => void send(e)} className="composer flex items-end gap-1 rounded-[20px] border bg-card p-2.5 shadow-xs transition-[border-color,box-shadow] focus-within:border-muted-foreground/50 focus-within:shadow-md">
-            <input ref={fileInput} type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/heic,image/heif,.heic,.heif" multiple hidden
+            <input ref={fileInput} type="file" {...(filesOn ? {} : { accept: "image/png,image/jpeg,image/gif,image/webp,image/heic,image/heif,.heic,.heif" })} multiple hidden
               onChange={(e) => { attachments.add(Array.from(e.target.files ?? [])); e.target.value = ""; input.current?.focus(); }} />
-            <Button type="button" variant="ghost" size="icon" aria-label="Attach images" title={uploadsOn ? "Attach images (or drop / paste them)" : "Image uploads are off (saveInboundImages is false in config)"} disabled={!canAttach}
-              onClick={() => fileInput.current?.click()} className="size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground [&_svg:not([class*='size-'])]:size-[18px]"><ImagePlus strokeWidth={1.75} /></Button>
+            <Button type="button" variant="ghost" size="icon" aria-label={filesOn ? "Attach files" : "Attach images"}
+              title={filesOn ? "Attach photos or files (or drop / paste them)" : uploadsOn ? "Attach images (or drop / paste them)" : "Uploads are off (saveInboundImages and saveInboundFiles are false in config)"} disabled={!canAttach}
+              onClick={() => fileInput.current?.click()} className="size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground [&_svg:not([class*='size-'])]:size-[20px]"><Plus strokeWidth={2} /></Button>
             <label className="sr-only" htmlFor="message">Message {agent}</label>
             <Textarea ref={input} id="message" placeholder={session?.kind === "group" ? "This group is read-only" : "What's on your mind?"} value={draft} maxLength={16_000} rows={1} disabled={!session?.writable}
               className="max-h-60 min-h-10 flex-1 resize-none rounded-none border-0 bg-transparent! py-[7px] pr-3 pl-1.5 text-[15px] leading-relaxed shadow-none placeholder:text-muted-foreground focus-visible:ring-0 disabled:opacity-80 md:text-[15px]"
-              onChange={(e) => { setDraft(e.target.value); setResending((old) => resendAfterDraftChange(old, e.target.value)); }} onPaste={(e) => {
-                const files = imageFiles(e.clipboardData?.items);
+              onChange={(e) => { setDraft(e.target.value);
+                // Cleared: the resend ends, and so does any restore it still had running.
+                if (resending && !resendAfterDraftChange(resending, e.target.value)) endResend(); }} onPaste={(e) => {
+                const files = filesOn ? pastedFiles(e.clipboardData?.items) : imageFiles(e.clipboardData?.items);
                 if (!files.length || !canAttach) return;
                 attachments.add(files);
-                // An image on the clipboard is attached; text that came with it still pastes.
+                // A file on the clipboard is attached; text that came with it still pastes.
                 if (!Array.from(e.clipboardData.types).includes("text/plain")) e.preventDefault();
               }} onCompositionStart={() => ime.current.start()} onCompositionEnd={() => ime.current.end()}
               onKeyDown={(e) => { if (ime.current.shouldSubmit({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
@@ -749,7 +806,8 @@ export function App() {
               <Square fill="currentColor" strokeWidth={0} /></Button> :
             <Button type="submit" size="icon" aria-label="Send" aria-busy={sending}
               className="size-9 shrink-0 rounded-full transition-[background-color,transform] hover:bg-primary/85 active:scale-[0.94] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100 [&_svg:not([class*='size-'])]:size-[18px]"
-              disabled={!session?.writable || !canSendWith(draft, attachments.items) || sending || !!uncertain || web.connection !== "live"}><ArrowUp strokeWidth={2.2} /></Button>}
+              title={restoring ? "Restoring attachments…" : undefined}
+              disabled={!session?.writable || !canSendWith(draft, attachments.items) || sending || restoring || !!uncertain || web.connection !== "live"}><ArrowUp strokeWidth={2.2} /></Button>}
           </form>
           {uncertain && !sending && <div className="mt-2 flex flex-wrap gap-2"><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => void checkOutcome()}>Check message status</Button><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { remember(null); setFeedback("Draft kept. Review the conversation before sending it again."); }}>Keep draft for review</Button></div>}
         </div>

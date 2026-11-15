@@ -46,10 +46,22 @@ function ReplyParts({ body, sessionId, onView }: { body: string; sessionId: stri
         {Array.from({ length: part.missing }, (_, i) => <Placeholder key={`m${i}`} />)}
         {part.more > 0 && <span className="inline-flex h-16 items-center rounded-xl border bg-muted/50 px-3 text-[12px] text-muted-foreground">+{part.more} more</span>}
       </div>;
+      if (part.files) return <div key={index} className="my-1.5 flex flex-wrap gap-2">
+        {part.files.map((file, i) => <FileCard key={`${file.name}:${i}`} name={file.name} size={file.size} />)}</div>;
       return <span key={index} className="my-1 mr-1.5 inline-flex items-center gap-1.5 rounded-lg border bg-card/70 px-2 py-1 text-[12px] text-muted-foreground">
         <FileIcon className="size-3.5" aria-hidden="true" />{part.names.length ? part.names.join(", ") : part.label}</span>;
     })}
   </>;
+}
+
+/** A file sent in a message (not an image): icon, name, size — never the path. */
+export function FileCard({ name, size }: { name: string; size?: string }) {
+  return <span role="group" aria-label={size ? `File ${name}, ${size}` : `File ${name}`} data-file-card=""
+    className="inline-flex max-w-[280px] items-center gap-2.5 rounded-xl border bg-card/70 px-3 py-2">
+    <FileIcon className="size-5 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
+    <span className="flex min-w-0 flex-col leading-tight">
+      <span className="truncate font-sans text-[13px] text-foreground">{name}</span>
+      {size && <span className="font-sans text-[11px] text-muted-foreground tabular-nums">{size}</span>}</span></span>;
 }
 
 const sentUrl = (sessionId: string, id: string) => `/api/v1/sessions/${sessionId}/outgoing/${id}`;

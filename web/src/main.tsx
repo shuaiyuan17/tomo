@@ -379,7 +379,7 @@ export function App() {
   const webRequestIds = new Set(web.requests.map((r) => r.requestId));
   const send = async (event: FormEvent) => {
     event.preventDefault();
-    if (!session?.writable || !canSendWith(draft, attachments.items) || sending || uncertain || !web.bootstrap || web.connection !== "live") return;
+    if (!session?.writable || !canSendWith(draft, attachments.items) || sending || uncertain || restoring || !web.bootstrap || web.connection !== "live") return;
     const text = draft.trim();
     // Captured now: images added while this sends stay in the tray.
     const { keys: sentKeys, ids: images, files, refiled } = captureSend(attachments.items);
@@ -419,6 +419,7 @@ export function App() {
     } finally { setSending(false); }
   };
   const reattach = async (paths: string[]) => {
+    // Every read settles (allSettled-style: each one catches) before the tray or the resend changes.
     const files = await Promise.all(paths.map(async (path, i) => {
       try {
         const response = await fetch(`/api/v1/sessions/${selectedId}/media?path=${encodeURIComponent(path)}`, { credentials: "same-origin" });
@@ -429,12 +430,15 @@ export function App() {
     }));
     const found = files.filter((file): file is File => !!file);
     const keys = attachments.add(found);
-    setResending((old) => old && { ...old, imageKeys: keys });
+    // Restored: only now may it be sent (and only now can it count as the resend).
+    setResending((old) => old && { ...old, imageKeys: keys, restoring: false });
     if (found.length < paths.length) setFeedback("Some of its images could not be read back; attach them again before sending.", true);
   };
   /** Interrupted request being resent from the composer (dismissed once the resend is accepted). */
   const [resending, setResending] = useState<Resend | null>(null);
   const [confirmDismiss, setConfirmDismiss] = useState<string | null>(null);
+  /** A resend's images are still being read back into the tray. */
+  const restoring = resending?.restoring === true;
   const dismiss = async (requestId: string, quiet = false) => {
     if (!web.bootstrap) return;
     setConfirmDismiss(null);
@@ -444,10 +448,12 @@ export function App() {
   const resend = (request: WebRequest) => {
     // Its files come back as they are: already filed, the resend names them by path (nothing is uploaded again).
     const fileKeys = request.files?.length ? attachments.addFiled(request.files) : [];
-    setResending({ requestId: request.requestId, original: request.text ?? "", ...(fileKeys.length ? { fileKeys } : {}) });
+    const restoringImages = !!request.images?.length;
+    setResending({ requestId: request.requestId, original: request.text ?? "", ...(fileKeys.length ? { fileKeys } : {}), ...(restoringImages ? { restoring: true } : {}) });
     setDraft(request.text ?? ""); input.current?.focus();
     // Its images come back too: read from where they were filed, attached (uploaded) again.
-    if (request.images?.length) void reattach(request.images);
+    // Until every one is back, Send stays off — a send now would leave them behind.
+    if (restoringImages) void reattach(request.images!);
     setFeedback("Review the message, then send it again. The interrupted one is dismissed once this is accepted.");
   };
   // The latest resend/dismiss, for buttons in memoized history rows (they read state from this render).
@@ -731,7 +737,7 @@ export function App() {
             <Sparkles className="size-3.5 shrink-0" strokeWidth={1.75} aria-hidden="true" /><span className="truncate">{suggestion}</span></button>}
           {resending && <div className="mb-2 flex items-center gap-2 tracking-[0.02em] text-[11px] text-muted-foreground">
             <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Resending an interrupted message</Badge>
-            <span>The original is dismissed once this one is accepted.</span>
+            <span role="status">{restoring ? "Restoring attachments…" : "The original is dismissed once this one is accepted."}</span>
             <Button variant="ghost" size="sm" className="h-6 rounded-md px-2 text-[11px]" onClick={() => setResending(null)}>Not a resend</Button></div>}
           {attachments.items.length > 0 && <ul aria-label={filesOn ? "Attachments" : "Attached images"} className="m-0 mb-2 flex list-none flex-wrap gap-2 p-0">
             {attachments.items.map((item, index) => item.kind === "file" ? <li key={item.key} aria-label={attachmentLabel(item, index)} data-kind="file"
@@ -779,7 +785,8 @@ export function App() {
               <Square fill="currentColor" strokeWidth={0} /></Button> :
             <Button type="submit" size="icon" aria-label="Send" aria-busy={sending}
               className="size-9 shrink-0 rounded-full transition-[background-color,transform] hover:bg-primary/85 active:scale-[0.94] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100 [&_svg:not([class*='size-'])]:size-[18px]"
-              disabled={!session?.writable || !canSendWith(draft, attachments.items) || sending || !!uncertain || web.connection !== "live"}><ArrowUp strokeWidth={2.2} /></Button>}
+              title={restoring ? "Restoring attachments…" : undefined}
+              disabled={!session?.writable || !canSendWith(draft, attachments.items) || sending || restoring || !!uncertain || web.connection !== "live"}><ArrowUp strokeWidth={2.2} /></Button>}
           </form>
           {uncertain && !sending && <div className="mt-2 flex flex-wrap gap-2"><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => void checkOutcome()}>Check message status</Button><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { remember(null); setFeedback("Draft kept. Review the conversation before sending it again."); }}>Keep draft for review</Button></div>}
         </div>

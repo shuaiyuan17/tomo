@@ -175,6 +175,18 @@ describe("a message with a file (web channel)", () => {
     await expect(channel.receive({ requestId: randomUUID(), text: "", refiled: sent.refiled })).rejects.toMatchObject({ code: "upload_missing" });
     await channel.stop();
   });
+  it("while a resend's images are still being restored, a send never counts as the resend: the original stays queued", () => {
+    // Its file is back at once, its image is still being read back.
+    const restoring = { requestId: "orig", original: "see both", fileKeys: ["f1"], restoring: true };
+    expect(dismissAfterAcceptedSend(restoring, "see both", ["f1"])).toBeNull();
+    expect(dismissAfterAcceptedSend({ ...restoring, original: "" }, "", ["f1"])).toBeNull();
+    // An empty draft does not cancel a resend still restoring.
+    expect(resendAfterDraftChange({ ...restoring, original: "", fileKeys: [] }, "")).not.toBeNull();
+    // Restored: it counts only if the send took every re-attached item.
+    const restored = { ...restoring, imageKeys: ["i1"], restoring: false };
+    expect(dismissAfterAcceptedSend(restored, "see both", ["f1"])).toBeNull();
+    expect(dismissAfterAcceptedSend(restored, "see both", ["f1", "i1"])).toBe("orig");
+  });
   it("refiled never names an arbitrary path: only files an interrupted request filed, still present", async () => {
     const { channel, handled, request } = await interrupted("x", "n.md");
     const secret = join(root, "secret.txt");

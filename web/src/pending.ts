@@ -66,20 +66,27 @@ export function isResendOf(original: string, sent: string): boolean {
 }
 
 /** An interrupted request the owner is resending from the composer. */
-/** `imageKeys` / `fileKeys`: the tray items its images / files were re-attached as (a message without text is a resend by these). */
-export interface Resend { requestId: string; original: string; imageKeys?: string[]; fileKeys?: string[] }
+/**
+ * `imageKeys` / `fileKeys`: the tray items its images / files were re-attached
+ * as (a message without text is a resend by these). `restoring`: its images
+ * are still being read back — not sendable yet, and never counted as the resend.
+ */
+export interface Resend { requestId: string; original: string; imageKeys?: string[]; fileKeys?: string[]; restoring?: boolean }
 const attachedKeys = (resend: Resend) => [...(resend.imageKeys ?? []), ...(resend.fileKeys ?? [])];
 /** Clearing the composer cancels a resend; editing it does not (nor does an image-only one's empty draft). */
 export function resendAfterDraftChange(resend: Resend | null, draft: string): Resend | null {
-  return resend && (draft.trim() || attachedKeys(resend).length) ? resend : null;
+  return resend && (draft.trim() || attachedKeys(resend).length || resend.restoring) ? resend : null;
 }
 /**
  * The interrupted request to dismiss once `sent` was ACCEPTED — only if it
  * really was that message: its text (or an edit of it), or, for one without
  * text, at least one of its re-attached images or files (`sentKeys`: the tray items sent).
+ * Only once its attachments were all restored, and only if the send took
+ * every one of them: a send that left one behind keeps the original queued.
  */
 export function dismissAfterAcceptedSend(resend: Resend | null, sent: string, sentKeys: readonly string[] = []): string | null {
-  if (!resend) return null;
+  if (!resend || resend.restoring) return null;
+  if (!attachedKeys(resend).every((key) => sentKeys.includes(key))) return null;
   if (isResendOf(resend.original, sent)) return resend.requestId;
   if (!resend.original.trim() && attachedKeys(resend).some((key) => sentKeys.includes(key))) return resend.requestId;
   return null;

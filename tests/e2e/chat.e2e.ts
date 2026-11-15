@@ -1073,6 +1073,41 @@ it("an image-only interrupted message, resent, is dismissed: its interrupted bub
   for (const finish of finishes) finish("done");
 });
 
+it("Resend of an image + file message: Send stays off until its image is back, then both go and the original is dismissed", async () => {
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  const finishes: Array<(value: string) => void> = [];
+  mockSdk.responseFn = () => new Promise<string>((resolve) => { finishes.push(resolve); });
+  const bodies: Array<{ requestId: string; images?: string[]; refiled?: string[] }> = [];
+  page.on("request", (request) => { if (request.method() === "POST" && request.url().endsWith("/api/v1/messages")) bodies.push(JSON.parse(request.postData() ?? "{}")); });
+  const tray = page.getByRole("list", { name: "Attachments" });
+  await page.locator("input[type=file]").setInputFiles([{ name: "pic.png", mimeType: "image/png", buffer: png }, { name: "notes.md", mimeType: "text/markdown", buffer: Buffer.from("# n\n") }]);
+  await browserExpect(tray.getByRole("listitem", { name: /attached$/ })).toHaveCount(2);
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("both of these");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect.poll(() => bodies.length && channel.request(bodies[0].requestId).state).toBe("running");
+  (channel as unknown as { state(id: string, state: string): void }).state(bodies[0].requestId, "interrupted");
+  // Reading the image back is held: the file is in the tray already, but Send stays off.
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route("**/api/v1/sessions/*/media**", async (route) => { await held; await route.continue(); });
+  await page.getByRole("button", { name: "Resend…" }).click();
+  await browserExpect(tray.getByRole("listitem", { name: "notes.md, attached" })).toBeVisible();
+  await browserExpect(page.getByText("Restoring attachments…")).toBeVisible();
+  const send = page.getByRole("button", { name: "Send", exact: true });
+  await browserExpect(send).toBeDisabled();
+  await page.getByRole("textbox", { name: "Message Tomo" }).press("Enter");
+  expect(bodies).toHaveLength(1);
+  release();
+  await browserExpect(tray.getByRole("listitem", { name: /attached$/ })).toHaveCount(2);
+  await browserExpect(send).toBeEnabled();
+  await send.click();
+  await browserExpect.poll(() => bodies.length).toBe(2);
+  expect(bodies[1].images).toHaveLength(1);
+  expect(bodies[1].refiled).toEqual([channel.request(bodies[0].requestId).files?.[0]?.path ?? expect.any(String)]);
+  await browserExpect.poll(() => channel.request(bodies[0].requestId).files).toBeUndefined();
+  for (const finish of finishes) finish("done");
+});
+
 it("a thinking block in history reads as a folded, quiet Thinking row; the reply stays the reply", async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
   const t = Date.now() - 60_000;

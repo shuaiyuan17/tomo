@@ -4,29 +4,39 @@ import {
   MessageScroller, MessageScrollerContent, MessageScrollerItem, MessageScrollerProvider, MessageScrollerViewport,
   useMessageScroller, useMessageScrollerScrollable, useMessageScrollerVisibility,
 } from "@/components/ui/message-scroller";
-import type { ChatRow as Row } from "./chat-rows.js";
+import { openingAnchors, type ChatRow as Row } from "./chat-rows.js";
 import { jumpLabel, jumpVisible, unseenKeys } from "./inline-tools.js";
 import { useMountedFor } from "./motion.js";
 
 /**
  * The main chat's scroll behaviour: shadcn's Message Scroller (follow the
- * live edge only while the reader is there, anchor a new turn near the top,
- * keep the reader's place when history is prepended or a row changes size,
- * reopen at the last turn), plus what Tomo adds on its hooks: the "N new
- * messages" pill and a quoted-message jump.
+ * live edge only while the reader is there, keep the reader's place when
+ * history is prepended or a row changes size, reopen at the last turn), plus
+ * what Tomo adds on its hooks: the "N new messages" pill and a quoted-message
+ * jump.
+ *
+ * A new turn is not anchored near the top: the scroller would hold a spacer
+ * of nearly a screen under it for the reply, mostly empty while the reply is
+ * short or not there yet. Only the rows the conversation opened with may be
+ * scroll anchors (that is all "last-anchor" needs); after that a message goes
+ * in at the end and, while the reader is there, the view follows the end, so
+ * a sent message (and its picture, once loaded) is just fully shown, then the
+ * reply as it grows.
  *
  * Mount one per conversation (key it): the opening position is applied once.
  */
 export interface ChatScrollerHandle {
   /** Brings a row (`rowId`) into view, centred; false when it is not mounted. */
   scrollToRow(id: string): boolean;
-  /** A message this tab is sending: never "new" to this reader, so it anchors its turn wherever the reader was. */
+  /** A message this tab is sending: never "new" to this reader, and it takes the reader to the end, to follow its turn. */
   claim(key: string): void;
 }
 
 const NONE: ReadonlySet<string> = new Set();
-/** Unseen message keys, for the rows: one that arrived while the reader was away does not pull them to it. */
-const Unseen = createContext<ReadonlySet<string>>(NONE);
+/** The rows that may be scroll anchors: those the conversation opened with. */
+const Anchors = createContext<ReadonlySet<string>>(NONE);
+/** Keys that scroll a viewport down. */
+const DOWN_KEYS: ReadonlySet<string> = new Set(["End", "PageDown", "ArrowDown", " "]);
 const reducedMotion = () => typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 /**
@@ -48,14 +58,17 @@ function Frame({ keys, lastRowId, busy, top, handle, children }: Parameters<type
   // What was there when the reader was last at the end; only what came after it counts.
   const baseline = useRef<Set<string> | null>(null);
   if (!baseline.current) baseline.current = new Set(keys);
+  const claimed = useRef(new Set<string>());
+  const opening = useRef<ReadonlySet<string> | null>(null);
+  if (!opening.current && keys.length) opening.current = openingAnchors(keys, claimed.current);
   const joined = keys.join("\n");
   // `joined` stands in for `keys`, a fresh array every render.
   const unseen = useMemo(() => atEnd ? NONE : unseenKeys(baseline.current!, keys), [atEnd, joined]);
   useEffect(() => { if (atEnd) baseline.current = new Set(keys); });
   useImperativeHandle(handle, () => ({
     scrollToRow: (id) => scrollToMessage(id, { align: "center", behavior: reducedMotion() ? "auto" : "smooth" }),
-    claim: (key) => { baseline.current?.add(key); },
-  }), [scrollToMessage]);
+    claim: (key) => { baseline.current?.add(key); claimed.current.add(key); scrollToEnd({ behavior: "auto" }); },
+  }), [scrollToMessage, scrollToEnd]);
   const jump = () => {
     scrollToEnd({ behavior: reducedMotion() ? "auto" : "smooth" });
     // The pill goes away under the pointer; keyboard focus stays in the conversation.
@@ -66,22 +79,32 @@ function Frame({ keys, lastRowId, busy, top, handle, children }: Parameters<type
   // would snap back to it at the next layout change. A synthetic wheel event
   // reaches its handler (and scrolls nothing).
   const dragging = useRef(false);
+  // The scroller lets go of the end on any wheel, touch or scroll key, and
+  // only takes it back on a scroll that lands there. At the end already, a
+  // move further down scrolls nothing, so the view would stop following the
+  // reply under a reader who never left: take the end back for it.
+  const refollow = (el: HTMLElement) => { if (el.scrollHeight - el.scrollTop - el.clientHeight <= 2) scrollToEnd({ behavior: "auto" }); };
+  const touchY = useRef<number | null>(null);
   const count = unseen.size;
   return <MessageScroller className="min-h-0 w-full flex-1">
     <MessageScrollerViewport ref={viewport} aria-label="Conversation history" className="pt-2 pr-4 pb-6 max-[600px]:pr-2"
       onPointerDown={(e) => { dragging.current = e.target === e.currentTarget; }} onPointerUp={() => { dragging.current = false; }}
+      onWheel={(e) => { if (e.deltaY > 0) refollow(e.currentTarget); }}
+      onKeyDown={(e) => { if (DOWN_KEYS.has(e.key) && !(e.key === " " && e.shiftKey)) refollow(e.currentTarget); }}
+      onTouchStart={(e) => { touchY.current = e.touches[0]?.clientY ?? null; }}
+      onTouchMove={(e) => { const y = e.touches[0]?.clientY; if (touchY.current !== null && y !== undefined && y < touchY.current) refollow(e.currentTarget); }}
       onScroll={(e) => { if (dragging.current) { dragging.current = false; e.currentTarget.dispatchEvent(new WheelEvent("wheel", { bubbles: true })); } }}>
       {top}
-      <MessageScrollerContent aria-busy={busy} className="min-h-0 gap-0"><Unseen.Provider value={unseen}>{children}</Unseen.Provider></MessageScrollerContent>
+      <MessageScrollerContent aria-busy={busy} className="min-h-0 gap-0"><Anchors.Provider value={opening.current ?? NONE}>{children}</Anchors.Provider></MessageScrollerContent>
     </MessageScrollerViewport>
     <JumpToLatest visible={jumpVisible({ canScrollEnd: end, lastRowVisible: !lastRowId || visibleMessageIds.includes(lastRowId), unseen: count })} unseen={count} onJump={jump} />
   </MessageScroller>;
 }
 
-/** One transcript row. Its anchor yields while the message is unseen: arriving while the reader is away, it must not move them. */
+/** One transcript row: a scroll anchor only when it is the latest turn of the conversation as it opened. */
 export function ChatRow({ row, children }: { row: Row; children: ReactNode }) {
-  const unseen = useContext(Unseen);
-  return <MessageScrollerItem messageId={row.id} scrollAnchor={row.anchor && !unseen.has(row.key)}>{children}</MessageScrollerItem>;
+  const anchors = useContext(Anchors);
+  return <MessageScrollerItem messageId={row.id} scrollAnchor={row.anchor && anchors.has(row.key)}>{children}</MessageScrollerItem>;
 }
 
 /** Floats above the composer when the reader is up in the history; fades out at the end. */

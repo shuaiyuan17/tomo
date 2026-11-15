@@ -2,6 +2,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { chromium, expect as browserExpect, type Browser, type Page } from "@playwright/test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { crc32, deflateSync } from "node:zlib";
 
 vi.mock("../../src/config.js", async () => (await import("../helpers/agent-mocks.js")).configModuleMock());
 vi.mock("../../src/workspace/index.js", async () => (await import("../helpers/agent-mocks.js")).workspaceModuleMock());
@@ -601,7 +602,22 @@ const topOf = (row: ReturnType<Page["locator"]>) => row.evaluate((el) => {
 });
 const tall = (i: number) => `Reply ${i}.\n\n${"A paragraph of the reply, long enough to give the conversation some height on any screen.\n\n".repeat(16)}`;
 
-it("opens at the last turn; a sent message anchors near the top under a peek of the previous row, and the reply grows below it", async () => {
+/** A solid PNG of the given size (a real one: the upload sniffs it). */
+function solidPng(width: number, height: number): Buffer {
+  const chunk = (type: string, data: Buffer) => {
+    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
+    const out = Buffer.alloc(body.length + 8);
+    out.writeUInt32BE(data.length, 0); body.copy(out, 4); out.writeUInt32BE(crc32(body), body.length + 4);
+    return out;
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0); header.writeUInt32BE(height, 4); header.set([8, 2, 0, 0, 0], 8);
+  const row = Buffer.alloc(1 + width * 3, 0x88); row[0] = 0;
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk("IHDR", header),
+    chunk("IDAT", deflateSync(Buffer.concat(Array.from({ length: height }, () => row)))), chunk("IEND", Buffer.alloc(0))]);
+}
+
+it("opens at the last turn; a sent message (a tall picture too) is just fully shown, no screen of blank under it, and the reply is followed while the reader stays at the end", async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
   const t = Date.now() - 600_000;
   for (let i = 0; i < 30; i++) store.append("dm:owner", { role: i % 2 ? "assistant" : "user", channel: "web", content: i % 2 ? tall(i) : `Question ${i}?`, timestamp: t + i * 1_000 });
@@ -634,42 +650,73 @@ it("opens at the last turn; a sent message anchors near the top under a peek of 
   await page.waitForTimeout(300);
   expect(await history.evaluate((el) => el.scrollTop)).toBe(dragged);
 
+  const gap = () => history.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
+  /** How far a row's bottom sits above the viewport's (negative: cut off), and whether its top is in view. */
+  const fit = (row: ReturnType<Page["locator"]>) => row.evaluate((el) => {
+    const view = el.closest("[aria-label='Conversation history']")!.getBoundingClientRect(), box = el.getBoundingClientRect();
+    return { below: Math.round(view.bottom - box.bottom), topIn: box.top >= view.top - 1 };
+  });
+  const spacer = () => history.evaluate((el) => { const s = el.querySelector<HTMLElement>("[data-message-scroller-spacer]"); return s && !s.hidden ? s.offsetHeight : 0; });
+
+  // Sent from a screen up, with a tall picture and no reply yet: the view goes
+  // to the end, just far enough to show the whole message; nothing reserved under it.
   let release!: (text: string) => void;
   mockSdk.responseFn = () => new Promise<string>((r) => { release = r; });
+  await page.locator("input[type=file]").setInputFiles([{ name: "tall.png", mimeType: "image/png", buffer: solidPng(200, 900) }]);
+  await browserExpect(page.getByRole("listitem", { name: "tall.png, attached" })).toBeVisible();
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("The next question");
   await page.getByRole("button", { name: "Send", exact: true }).click();
   const sent = page.locator("article.message.user").filter({ hasText: "The next question" });
-  await browserExpect(sent).toBeVisible();
-  await browserExpect.poll(() => topOf(sent)).toBeLessThan(100);
-  const anchored = await topOf(sent);
-  expect(anchored).toBeGreaterThan(40);
+  await browserExpect(sent.getByRole("img")).toBeVisible();
+  await browserExpect.poll(gap).toBeLessThan(2);
+  await browserExpect.poll(async () => (await fit(sent)).below).toBeGreaterThanOrEqual(0);
+  expect((await fit(sent)).below).toBeLessThan(60);
+  expect((await fit(sent)).topIn).toBe(true);
+  expect(await spacer()).toBe(0);
   await page.screenshot({ path: "test-results/chat-just-sent.png" });
+  // A picture that loads late (0px, then its height) in the last row: the end stays in view, not cut off.
+  await page.route("**/late-picture.png", async (route) => { await new Promise((r) => setTimeout(r, 400)); await route.fulfill({ contentType: "image/png", body: solidPng(200, 600) }); });
+  await sent.evaluate((el) => { const img = document.createElement("img"); img.src = "/late-picture.png"; img.style.display = "block"; img.style.maxHeight = "200px"; el.append(img); });
+  await browserExpect.poll(() => sent.evaluate((el) => el.querySelector<HTMLImageElement>("img[src='/late-picture.png']")!.offsetHeight)).toBe(200);
+  await browserExpect.poll(gap).toBeLessThan(2);
+  expect((await fit(sent)).below).toBeGreaterThanOrEqual(0);
+  // A short answer: right under the question, and the view ends at it.
   release("A short answer.\n\nIn two paragraphs.");
   const reply = page.locator("article.message.assistant").filter({ hasText: "In two paragraphs." });
   await browserExpect(reply).toBeVisible();
-  await page.waitForTimeout(300);
-  // Recorded (the bubble becomes the history message) and answered: the turn stays where it was anchored.
-  expect(Math.abs(await topOf(sent) - anchored)).toBeLessThanOrEqual(1);
-  expect(await topOf(reply)).toBeGreaterThan(anchored);
+  await browserExpect.poll(gap).toBeLessThan(2);
+  expect((await fit(reply)).below).toBeGreaterThanOrEqual(0);
+  expect((await fit(reply)).below).toBeLessThan(60);
+  expect(await spacer()).toBe(0);
 
-  // A reply that streams past the screen: once it fills the room under the
-  // anchored question, the view follows its end, block by block.
+  // A reply that streams past the screen: the view follows its end, block by block.
   mockSdk.responseFn = () => new Promise<string>((r) => { release = r; });
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("Now a long one");
   await page.getByRole("button", { name: "Send", exact: true }).click();
-  const second = page.locator("article.message.user").filter({ hasText: "Now a long one" });
-  await browserExpect.poll(() => topOf(second)).toBeLessThan(100);
+  await browserExpect(page.locator("article.message.user").filter({ hasText: "Now a long one" })).toBeVisible();
+  await browserExpect.poll(gap).toBeLessThan(2);
   const sdk = mockSdk.queryControllers.at(-1)!;
-  const gap = () => history.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
   for (const i of [100, 101, 102]) {
     sdk.pushEvent({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: tall(i) }] } });
     await browserExpect(history).toContainText(`Reply ${i}.`);
     await browserExpect.poll(gap).toBeLessThan(2);
   }
+  // The reader scrolls up (past the start of the reply): what streams in next leaves them there, and the pill offers the way back.
+  await history.hover();
+  await page.mouse.wheel(0, -8_000);
+  await page.waitForTimeout(300);
+  const reading = await history.evaluate((el) => el.scrollTop);
+  sdk.pushEvent({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: tall(103) }] } });
+  await browserExpect(history).toContainText("Reply 103.");
+  await page.waitForTimeout(300);
+  expect(await history.evaluate((el) => el.scrollTop)).toBe(reading);
+  expect(await gap()).toBeGreaterThan(400);
+  await browserExpect(page.getByRole("button", { name: /jump to latest/i })).toBeVisible();
   release("The end of it.");
   await browserExpect(page.locator("article.message.assistant").filter({ hasText: "The end of it." })).toBeVisible();
-  await browserExpect.poll(gap).toBeLessThan(2);
-  await browserExpect(page.getByText("Reply in progress")).toHaveCount(0);
+  await page.waitForTimeout(300);
+  expect(await history.evaluate((el) => el.scrollTop)).toBe(reading);
+  await page.getByRole("button", { name: /jump to latest/i }).click();
   await browserExpect.poll(gap).toBeLessThan(2);
   // The scroller sets its spacer through the DOM: no <style> element, nothing the CSP refused.
   expect(await page.evaluate(() => [document.querySelectorAll("style").length, (window as unknown as { cspViolations: string[] }).cspViolations])).toEqual([0, []]);

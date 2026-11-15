@@ -2,7 +2,7 @@ import { lazy, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormE
 import { createRoot } from "react-dom/client";
 import { api, ApiError, dismissRequest, sendMessage, stopTurn, taskAction } from "./api.js";
 import { useWeb } from "./use-web.js";
-import { nudgeBrowserChrome, onResume, repaint } from "./resume.js";
+import { onResume, repaint } from "./resume.js";
 import { createCompositionGuard } from "./compose-keys.js";
 import { Text } from "./markdown.js";
 import { MessageBody } from "./message-body.js";
@@ -282,7 +282,6 @@ export function App() {
     if (overlayNow.current) setTasksOpen(false);
     if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
     repaint(header.current);
-    nudgeBrowserChrome();
   }), []);
   const systemDark = useMediaQuery("(prefers-color-scheme: dark)");
   useEffect(() => {

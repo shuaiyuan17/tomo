@@ -36,11 +36,30 @@ function redaction(scope: PrivateScope): ToolRedaction {
   const ctx = scope.workspaceDir
     ? { cwd: scope.workspaceDir, memoryDir: join(scope.workspaceDir, "memory"), privateDir: join(scope.workspaceDir, "memory", "private") }
     : undefined;
-  return { input: redactToolInput, output: redactText,
-    // No workspace known: any mention of memory/private withholds (fail closed).
-    reachesPrivate: (name, input) => ctx ? isPrivateMemoryAccess(name, input, ctx) || /memory[/\\]private/i.test(JSON.stringify(input))
-      : /memory[/\\]private/i.test(JSON.stringify(input)) };
+  // No workspace known: any mention of memory/private withholds (fail closed).
+  const reaches = (name: string, input: Record<string, unknown>) =>
+    (ctx ? isPrivateMemoryAccess(name, input, ctx) : false) || /memory[/\\]private/i.test(JSON.stringify(input));
+  return {
+    // A file/search tool aimed at memory/private shows its name and its
+    // (redacted) path only: no old_string/new_string/content/pattern body,
+    // and so no body in its summary either.
+    input: (input, name) => PATH_TOOLS[name] && reaches(name, input)
+      ? redactToolInput(Object.fromEntries(PATH_TOOLS[name].flatMap((key) => typeof input[key] === "string" ? [[key, input[key]]] : [])))
+      : redactToolInput(input),
+    output: redactText,
+    // Bash is judged by bashTouchesMemory on the command's words: BEST EFFORT,
+    // not a security boundary (an alias, a variable or a symlink can reach
+    // private/ unseen). The web UI is the owner's alone (token + tailnet);
+    // this is defence in depth, like #492's redaction.
+    reachesPrivate: reaches,
+  };
 }
+
+/** Path-addressed tools, and the input fields kept (redacted) when one reaches memory/private. */
+const PATH_TOOLS: Record<string, readonly string[]> = {
+  Read: ["file_path"], Edit: ["file_path"], Write: ["file_path"], MultiEdit: ["file_path"],
+  NotebookEdit: ["notebook_path"], Grep: ["path"], Glob: ["path"],
+};
 
 export class SessionToolsError extends Error {
   constructor(readonly code: "invalid_cursor" | "transcript_reset") { super(code); }

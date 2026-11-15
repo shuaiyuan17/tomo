@@ -91,7 +91,8 @@ export function itemsFromLine(line: string, offset: number, redact?: ToolRedacti
 
 /** Optional server-side masking of tool inputs and outputs (the main chat applies #492's redaction). */
 export interface ToolRedaction {
-  input: (input: Record<string, unknown>) => Record<string, unknown>;
+  /** Redacts a call's input; `name` lets a caller drop the body of a call it withholds. */
+  input: (input: Record<string, unknown>, name: string) => Record<string, unknown>;
   output: (text: string) => string;
   /** Asked with the RAW input: does this call reach memory/private? Its tool item is then marked `privateOutput`. */
   reachesPrivate?: (name: string, input: Record<string, unknown>) => boolean;
@@ -122,7 +123,7 @@ function itemsFromBlocks(record: { type?: string; timestamp?: string }, content:
       items.push({ kind: "text", id, text, truncated, ...(ts ? { ts } : {}) });
     } else if (record.type === "assistant" && b.type === "tool_use" && typeof b.name === "string") {
       const raw = (b.input && typeof b.input === "object" ? b.input : {}) as Record<string, unknown>;
-      const input = redact ? redact.input(raw) : raw;
+      const input = redact ? redact.input(raw, b.name) : raw;
       const inputText = clip(JSON.stringify(input, null, 2), IO_LIMIT);
       items.push({ kind: "tool", id, toolUseId: typeof b.id === "string" ? b.id : id, name: b.name.slice(0, 128),
         summary: clip(summarizeToolInput(b.name, input), 200).text, input: inputText.text, inputTruncated: inputText.truncated,

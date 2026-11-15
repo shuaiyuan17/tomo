@@ -130,3 +130,23 @@ describe("private memory: outputs withheld on the server (#464's predicate)", ()
     expect(JSON.stringify(next)).not.toMatch(/PRIVATE BODY|ORPHAN BODY/);
   });
 });
+
+describe("a file tool aimed at memory/private shows only its name and redacted path", () => {
+  it("Edit/Write/MultiEdit bodies never reach the response, nor the summary", async () => {
+    const ws = join(root, "ws");
+    const secret = join(ws, "memory", "private", "notes.md");
+    writeFileSync(file(),
+      call("e1", "Edit", { file_path: secret, old_string: "OLD SECRET", new_string: "NEW SECRET" }, "ok", 1_000) +
+      call("w1", "Write", { file_path: secret, content: "WRITTEN SECRET" }, "ok", 2_000) +
+      call("m1", "MultiEdit", { file_path: secret, edits: [{ old_string: "A SECRET", new_string: "B SECRET" }] }, "ok", 3_000) +
+      call("e2", "Edit", { file_path: join(ws, "memory", "MEMORY.md"), old_string: "public old", new_string: "public new" }, "ok", 4_000));
+    const page = await readSessionTools(root, SDK, { from: 0 }, { workspaceDir: ws });
+    const text = JSON.stringify(page);
+    for (const body of ["OLD SECRET", "NEW SECRET", "WRITTEN SECRET", "A SECRET", "B SECRET", "notes.md"]) expect(text).not.toContain(body);
+    const edit = page.items.find((i) => i.kind === "tool" && i.toolUseId === "e1");
+    expect(edit).toMatchObject({ name: "Edit", input: expect.stringContaining("<private>") });
+    expect(edit && "input" in edit && JSON.parse(edit.input)).toEqual({ file_path: "<private>" });
+    // A public edit keeps its body.
+    expect(text).toContain("public new");
+  });
+});

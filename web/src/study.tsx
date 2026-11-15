@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useAgentName } from "./agent-name.js";
 import { ChevronRight, FileText, Folder, Lock, Pause, Play, RefreshCw, Search, Trash2, X } from "lucide-react";
 import { ApiError, mutate, type WebBootstrap } from "./api.js";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
@@ -16,8 +17,8 @@ import { Text } from "./markdown.js";
 import { countTasks, formatTokens, formatWhen, STUDY_LABELS, STUDY_PAGES, useResource, type Resource, type StudyPage } from "./study-data.js";
 
 const INTRO: Record<StudyPage, string> = {
-  todos: "Task lists Tomo keeps in memory/TODO*.md. Read-only here.",
-  memory: "What Tomo remembers, as it is written in the workspace. Private memory is never shown in the browser.",
+  todos: "Task lists {agent} keeps in memory/TODO*.md. Read-only here.",
+  memory: "What {agent} remembers, as it is written in the workspace. Private memory is never shown in the browser.",
   context: "How full the selected conversation's context window is, and what has been rolled up.",
   cron: "Scheduled jobs and when they last ran.",
   mcp: "External tool servers in config.json, and what live sessions report about them.",
@@ -50,12 +51,13 @@ export interface Mutator { bootstrap?: WebBootstrap; refresh: () => Promise<WebB
 export function Study({ page, onPage, session, reload, inert, mutator, focus, cronRevision = 0 }: { page: StudyPage; onPage: (page: StudyPage) => void; session?: WebSession; reload: number; inert?: boolean; mutator: Mutator;
   /** An item to scroll to and highlight (`#study/cron/<jobId>`). */ focus?: string | null; cronRevision?: number }) {
   const [local, setLocal] = useState(0);
+  const agent = useAgentName();
   const key = reload + local;
   return <main id="study" tabIndex={-1} inert={inert} className="mx-auto flex min-h-0 w-full max-w-[1040px] min-w-0 flex-1 flex-col px-12 pt-7 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:px-4 max-[600px]:pt-4">
     <div className="mb-5 flex items-end justify-between gap-4">
       <div className="min-w-0"><p className="eyebrow">The Study</p>
         <h1 className="mt-1 mb-1 font-serif text-[30px] leading-tight font-normal tracking-[-0.5px] max-[600px]:text-[24px]">{STUDY_LABELS[page]}</h1>
-        <p className="m-0 text-[13px] text-muted-foreground">{INTRO[page]}</p></div>
+        <p className="m-0 text-[13px] text-muted-foreground">{INTRO[page].replace("{agent}", agent)}</p></div>
       <Button variant="ghost" size="icon" className="size-9 shrink-0 rounded-xl text-muted-foreground hover:bg-foreground/[0.07]" aria-label="Refresh" title="Refresh" onClick={() => setLocal((v) => v + 1)}><RefreshCw strokeWidth={1.75} /></Button>
     </div>
     <Tabs value={page} onValueChange={(value) => onPage(value as StudyPage)} className="min-h-0 flex-1 gap-0">

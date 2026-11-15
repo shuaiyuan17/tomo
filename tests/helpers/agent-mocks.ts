@@ -334,6 +334,7 @@ export const mockConfig = {
   continuity: false,
   continuityScript: null,
   city: null as string | null,
+  agentName: null as string | null,
   /** Legacy-shaped input most tests still write. `owner` is derived from it
    *  through the PRODUCTION resolver (src/owner.ts), so these tests exercise
    *  the back-compat path an upgraded install takes. Assign `owner` directly

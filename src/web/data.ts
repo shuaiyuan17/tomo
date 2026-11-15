@@ -14,6 +14,7 @@ import { WebError, type SubagentBrief, type SubagentPage, type WebCatalog, type 
 import { readSessionContext, WebCron } from "./inspection.js";
 import { WebConfigReader } from "./config-view.js";
 import { MemoryReader } from "../workspace/memory-reader.js";
+import { AgentNameReader } from "../workspace/agent-name.js";
 import { readSubagentBrief, readSubagentModel, readSubagentPage, SubagentReadError } from "./subagent-reader.js";
 
 export interface WebDataOptions {
@@ -25,6 +26,8 @@ export interface WebDataOptions {
   workspaceDir?: string;
   /** Runtime home holding config.json (Study config / MCP view). */
   tomoHome?: string;
+  /** `agent.name` from config (null/undefined: read IDENTITY.md in workspaceDir). */
+  agentName?: string | null;
   /** The scheduler's cron store file, passed by the daemon (the web process never derives it). */
   cronStorePath?: string;
 }
@@ -123,12 +126,17 @@ export class WebData {
   readonly cron: WebCron;
   readonly config?: WebConfigReader;
   private readonly outgoing: OutgoingMediaStore;
+  private readonly agent: AgentNameReader;
   constructor(private readonly options: WebDataOptions) {
     this.outgoing = new OutgoingMediaStore(options.workspaceDir ? outgoingImagesDir(options.workspaceDir) : undefined);
+    this.agent = new AgentNameReader({ configured: options.agentName, workspaceDir: options.workspaceDir });
     if (options.workspaceDir) this.memory = new MemoryReader(options.workspaceDir);
     if (options.tomoHome) this.config = new WebConfigReader(options.tomoHome);
     this.cron = new WebCron(options.cronStorePath);
   }
+
+  /** What the UI calls the agent (re-read per call; IDENTITY.md is cached by mtime). */
+  agentName(): string { return this.agent.name(); }
 
   /** Context usage, estimated breakdown and rollups of a session the catalog shows. */
   async context(id: string): Promise<WebContext> {

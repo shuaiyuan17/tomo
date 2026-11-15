@@ -5,10 +5,16 @@ import type { WebRequest } from "../../src/web/protocol.js";
 export const COMPLETED_VISIBLE_MS = 2000;
 export const COMPLETED_FADE_MS = 200;
 
-export const REQUEST_LABELS: Record<WebRequest["state"], string> = { queued: "Queued", running: "Tomo is working…", completed: "Completed",
-  failed: "Delivery failed — check the conversation before sending again", refused: "Message was not accepted",
-  unknown: "Outcome unknown — Tomo may already have acted on it. Check the conversation before sending again",
-  interrupted: "Interrupted by a restart and not answered — Tomo may have started on it. Check before sending again" };
+/** The request states as the status line words them, naming the agent (see agent-name.ts). */
+export function requestLabels(agent = "Tomo"): Record<WebRequest["state"], string> {
+  return { queued: "Queued", running: `${agent} is working…`, completed: "Completed",
+    failed: "Delivery failed — check the conversation before sending again", refused: "Message was not accepted",
+    unknown: `Outcome unknown — ${agent} may already have acted on it. Check the conversation before sending again`,
+    interrupted: `Interrupted by a restart and not answered — ${agent} may have started on it. Check before sending again` };
+}
+export const REQUEST_LABELS = requestLabels();
+/** The typing indicator's activity value; the status line words it with the agent's name. */
+export const TYPING_ACTIVITY = "typing";
 
 /** Where the latest request stands: a note is tied to this and lapses when it moves. */
 export function requestStamp(latest: WebRequest | undefined): string {
@@ -31,13 +37,17 @@ export function composerStatus(input: {
   note: ComposerNote;
   latest: WebRequest | undefined;
   settled: string | null;
+  /** The agent's name (default "Tomo"). */
+  agent?: string;
 }): string {
+  const labels = requestLabels(input.agent);
+  if (input.activity === TYPING_ACTIVITY) return labels.running;
   if (input.activity) return input.activity;
   const { latest } = input;
   if (input.note.text && input.note.at === requestStamp(latest)) return input.note.text;
   if (!latest) return "";
   if (latest.state === "completed" && input.settled === latest.requestId) return "";
-  return REQUEST_LABELS[latest.state];
+  return labels[latest.state];
 }
 
 /**

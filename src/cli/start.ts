@@ -245,7 +245,7 @@ async function startForeground(): Promise<void> {
       web.attach(new WebSupervisor(web, {
         ...config.web, owner: config.owner,
         sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,
-        workspaceDir: config.workspaceDir, cronStorePath: CRON_STORE_PATH, mcpStatus: () => agent.readMcpStatuses(),
+        workspaceDir: config.workspaceDir, agentName: config.agentName, cronStorePath: CRON_STORE_PATH, mcpStatus: () => agent.readMcpStatuses(),
         diagnostic: (message, level = "info") => log[level](message),
       }));
       agent.addChannel(web);

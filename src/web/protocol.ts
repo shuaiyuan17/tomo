@@ -131,6 +131,8 @@ export interface WebBootstrap extends WebCatalog {
   capabilities?: { screen: boolean };
   /** The latest compact request, so a reload still shows it. */
   compact?: WebCompactState;
+  /** What the UI calls the agent (config `agent.name`, else IDENTITY.md, else "Tomo"); absent on older daemons. */
+  agentName?: string;
 }
 /** One tick of the read-only screen view: a JPEG when live, otherwise why there is none. */
 export interface WebScreenFrame { status: "live" | "locked" | "away" | "unconfirmed" | "unavailable" | "too_large"; capturedAt: number; jpeg?: string }

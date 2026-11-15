@@ -14,6 +14,7 @@ import { followStep, groupLabel, groupOpen, groupRows, INITIAL_TRANSCRIPT, isOut
   type ToolRow, type TranscriptAction } from "./subagent.js";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { STATE_LABELS, taskKind } from "./tasks.js";
+import { useAgentName } from "./agent-name.js";
 
 /**
  * While the task runs, poll for new lines every POLL_MS (`after=<end>` reads
@@ -139,6 +140,7 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
   };
   const jump = () => { pinned.current = true; apply({ type: "jump" }); };
 
+  const agent = useAgentName();
   const rows = viewRows(state.items);
   const blocks = groupRows(rows);
   const gone = state.status === "gone";
@@ -152,7 +154,7 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
       const last = index === blocks.length - 1;
       if (block.kind === "text") return <div key={block.row.id} className="markdown px-1.5 py-1 text-[13px]! leading-relaxed"><Text>{block.row.text + (block.row.truncated ? "\n\n…" : "")}</Text></div>;
       if (block.kind === "message") return <div key={block.row.id} className="my-1.5 rounded-xl bg-muted px-3 py-2">
-        <p className="m-0 mb-0.5 text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">Message from Tomo</p>
+        <p className="m-0 mb-0.5 text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">Message from {agent}</p>
         <div className="markdown text-[13px]! leading-relaxed"><Text>{block.row.text + (block.row.truncated ? "\n\n…" : "")}</Text></div></div>;
       if (block.kind === "tool") return <ToolCall key={block.row.id} row={block.row} running={running} />;
       const open = groupOpen(openGroups, block.key);

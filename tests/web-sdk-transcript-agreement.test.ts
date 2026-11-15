@@ -72,6 +72,17 @@ function transcript(options: { sidechain: boolean; agentId?: string }): string {
     message("user", [{ type: "text", text: "Also check the images." }]),
     message("assistant", [{ type: "tool_use", id: "toolu_04", name: "Read", input: { file_path: "/repo/shot.png" } }]),
     message("user", [{ type: "tool_result", tool_use_id: "toolu_04", content: [png] }]),
+    // The calls the views show as more than a call: a todo list, a web search's links, a fetched page.
+    message("assistant", [{ type: "tool_use", id: "toolu_05", name: "TodoWrite", input: { todos: [
+      { content: "Check the images", status: "completed", activeForm: "Checking the images" },
+      { content: "Look up the format", status: "in_progress", activeForm: "Looking up the format" }] } }]),
+    message("user", [{ type: "tool_result", tool_use_id: "toolu_05", content: "Todos have been modified successfully." }]),
+    message("assistant", [{ type: "tool_use", id: "toolu_06", name: "WebSearch", input: { query: "jsonl transcript format" } }]),
+    message("user", [{ type: "tool_result", tool_use_id: "toolu_06", content: 'Web search results for query: "jsonl transcript format"\n\n'
+      + 'Links: [{"title":"JSON Lines","url":"https://jsonlines.org/"},{"title":"NDJSON","url":"https://github.com/ndjson/ndjson-spec"}]\n\n'
+      + "JSON Lines is one JSON value per line.\n\nREMINDER: You MUST include the sources above in your response to the user using markdown hyperlinks." }]),
+    message("assistant", [{ type: "tool_use", id: "toolu_07", name: "WebFetch", input: { url: "https://jsonlines.org/", prompt: "What is it?" } }]),
+    message("user", [{ type: "tool_result", tool_use_id: "toolu_07", content: "A format for structured data." }]),
     message("assistant", [{ type: "text", text: "Done: the image is a screenshot." }]),
   ].join("\n") + "\n";
 }
@@ -86,26 +97,35 @@ function sdkFacts(messages: SessionMessage[], { brief }: { brief: boolean }): Fa
     return content.flatMap((block: Record<string, unknown>): Fact[] => {
       if (m.type === "assistant" && block.type === "text" && String(block.text).trim()) return [`text:${String(block.text)}`];
       if (m.type === "assistant" && block.type === "thinking" && String(block.thinking).trim()) return [`thinking:${String(block.thinking)}`];
-      if (m.type === "assistant" && block.type === "tool_use") return [`tool:${String(block.id)}:${String(block.name)}`];
+      if (m.type === "assistant" && block.type === "tool_use") {
+        const input = block.input as { todos?: Array<{ status: string; content: string }>; url?: string };
+        // The SDK's TodoWriteInput / WebFetchInput, read straight from the block.
+        if (block.name === "TodoWrite") return [`todos:${String(block.id)}:${input.todos!.map((t) => `${t.status}=${t.content}`).join("|")}`];
+        return [`tool:${String(block.id)}:${String(block.name)}`, ...(block.name === "WebFetch" ? [`source:${input.url}`] : [])];
+      }
       if (m.type === "user" && block.type === "text" && !(brief && index === 0)) return [`message:${String(block.text)}`];
       if (m.type === "user" && block.type === "tool_result") {
         const parts = typeof block.content === "string" ? [{ type: "text", text: block.content }] : (block.content as Array<Record<string, unknown>>);
         const text = parts.filter((p) => p.type === "text").map((p) => String(p.text)).join("\n");
         const images = parts.filter((p) => p.type === "image").length;
-        return [`result:${String(block.tool_use_id)}:${block.is_error === true}:${text}:${images}`];
+        // Every URL a web search's result text names (found here with a plain pattern, not our parser).
+        const links = text.startsWith("Web search results") ? [...text.matchAll(/"url":"([^"]+)"/g)].map((match) => `source:${match[1]}`) : [];
+        return [`result:${String(block.tool_use_id)}:${block.is_error === true}:${text}:${images}`, ...links];
       }
       return [];
     });
   });
 }
 function ourFacts(items: SubagentItem[]): Fact[] {
-  return items.map((item) => {
+  const sources = (item: { sources?: Array<{ url: string }> }) => (item.sources ?? []).map((source) => `source:${source.url}`);
+  return items.flatMap((item) => {
     switch (item.kind) {
-      case "text": return `text:${item.text}`;
-      case "thinking": return `thinking:${item.text}`;
-      case "message": return `message:${item.text}`;
-      case "tool": return `tool:${item.toolUseId}:${item.name}`;
-      case "result": return `result:${item.toolUseId}:${item.isError}:${item.output}:${item.images ?? 0}`;
+      case "text": return [`text:${item.text}`];
+      case "thinking": return [`thinking:${item.text}`];
+      case "message": return [`message:${item.text}`];
+      case "tool": return [`tool:${item.toolUseId}:${item.name}`, ...sources(item)];
+      case "todos": return [`todos:${item.toolUseId}:${item.todos.map((t) => `${t.status}=${t.content}`).join("|")}`];
+      case "result": return [`result:${item.toolUseId}:${item.isError}:${item.output}:${item.images ?? 0}`, ...sources(item)];
     }
   });
 }
@@ -144,17 +164,18 @@ describe("our transcript reader agrees with the SDK's", () => {
     while (page.end < page.size) { page = await readSubagentPage(sdkSessionsDir, SESSION, AGENT, { after: page.end }); items.push(...page.items); }
     expect(page.unreadable).toBeUndefined();
     // Sanity: the fixture exercises every kind compared.
-    expect(theirs.map((f) => f.split(":")[0])).toEqual(expect.arrayContaining(["text", "thinking", "message", "tool", "result"]));
+    expect(theirs.map((f) => f.split(":")[0])).toEqual(expect.arrayContaining(["text", "thinking", "message", "tool", "result", "todos", "source"]));
     expect(ourFacts(items)).toEqual(theirs);
     expect(JSON.stringify(items)).not.toContain("iVBORw0KGgo");
   });
 
-  it("main chat: the same tool calls and results", async () => {
+  it("main chat: the same tool calls, todo lists, results and pages", async () => {
     const theirs = sdkFacts(await sdk.getSessionMessages(SESSION, { dir: workspace }), { brief: false })
-      .filter((fact) => fact.startsWith("tool:") || fact.startsWith("result:"));
+      .filter((fact) => /^(tool|result|todos|source):/.test(fact));
     const page = await readSessionTools(sdkSessionsDir, SESSION, { from: 0 });
     expect(page.unreadable).toBeUndefined();
-    expect(theirs.length).toBe(8);
+    // 7 calls (one of them a todo list) with 7 results, a search's 2 links and a fetched page.
+    expect(theirs.length).toBe(17);
     expect(ourFacts(page.items)).toEqual(theirs);
   });
 });

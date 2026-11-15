@@ -1,15 +1,22 @@
-import type { SubagentItem, SubagentPage } from "../../src/web/protocol.js";
+import type { SubagentItem, SubagentPage, TodoEntry, WebSource } from "../../src/web/protocol.js";
+import { safeHref } from "./links.js";
 
 /** Pure state for the read-only subagent view, kept out of React so it is testable. */
 
 export interface ToolRow {
   kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean;
-  /** `images`: image blocks in the output (never served; the row shows a chip). */
-  result?: { output: string; truncated: boolean; isError: boolean; images?: number };
+  /** When the call was made (ms epoch); with the result's, its duration. */
+  ts?: number;
+  /** The page a WebFetch reads. */
+  sources?: WebSource[];
+  /** `images`: image blocks in the output (never served; the row shows a chip). `sources`: a WebSearch's links. */
+  result?: { output: string; truncated: boolean; isError: boolean; images?: number; ts?: number; sources?: WebSource[] };
 }
 /** A subagent's thinking: a folded, muted row. */
 export interface ThinkingRow { kind: "thinking"; id: string; text: string; truncated: boolean }
-export type ViewRow = { kind: "text" | "message"; id: string; text: string; truncated: boolean } | ToolRow | ThinkingRow;
+/** One TodoWrite call's list. `failed`: its result was an error (the list did not change). */
+export interface TodosRow { kind: "todos"; id: string; toolUseId: string; todos: TodoEntry[]; more: number; failed: boolean }
+export type ViewRow = { kind: "text" | "message"; id: string; text: string; truncated: boolean } | ToolRow | ThinkingRow | TodosRow;
 
 /**
  * The transcript window has two mutually exclusive modes:
@@ -115,13 +122,46 @@ export function viewRows(items: SubagentItem[]): ViewRow[] {
   const rows: ViewRow[] = [];
   for (const item of items) {
     if (item.kind === "text" || item.kind === "message" || item.kind === "thinking") rows.push({ kind: item.kind, id: item.id, text: item.text, truncated: item.truncated });
-    else if (item.kind === "tool") {
+    else if (item.kind === "todos") {
+      rows.push({ kind: "todos", id: item.id, toolUseId: item.toolUseId, todos: item.todos, more: item.more ?? 0, failed: results.get(item.toolUseId)?.isError === true });
+    } else if (item.kind === "tool") {
       const result = results.get(item.toolUseId);
       rows.push({ kind: "tool", id: item.id, toolUseId: item.toolUseId, name: item.name, summary: item.summary, input: item.input, inputTruncated: item.inputTruncated,
-        ...(result ? { result: { output: result.output, truncated: result.truncated, isError: result.isError, ...(result.images ? { images: result.images } : {}) } } : {}) });
+        ...(item.ts !== undefined ? { ts: item.ts } : {}), ...(item.sources ? { sources: item.sources } : {}),
+        ...(result ? { result: { output: result.output, truncated: result.truncated, isError: result.isError, ...(result.images ? { images: result.images } : {}),
+          ...(result.ts !== undefined ? { ts: result.ts } : {}), ...(result.sources ? { sources: result.sources } : {}) } } : {}) });
     }
   }
   return rows;
+}
+
+/** How long a call took, "4s" / "1m 12s", when both ends are known and it took a second or more. */
+export function callDuration(row: ToolRow): string | undefined {
+  return row.ts !== undefined && row.result?.ts !== undefined ? formatDuration(row.result.ts - row.ts) : undefined;
+}
+/** From the first call's start to the last result: a group's duration. */
+export function groupDuration(tools: readonly ToolRow[]): string | undefined {
+  const starts = tools.flatMap((tool) => tool.ts !== undefined ? [tool.ts] : []);
+  const ends = tools.flatMap((tool) => tool.result?.ts !== undefined ? [tool.result.ts] : []);
+  if (!starts.length || ends.length < tools.length) return undefined;
+  return formatDuration(Math.max(...ends) - Math.min(...starts));
+}
+/** When a run of calls began: its first call's time. */
+export function groupStart(tools: readonly ToolRow[]): number | undefined {
+  const starts = tools.flatMap((tool) => tool.ts !== undefined ? [tool.ts] : []);
+  return starts.length ? Math.min(...starts) : undefined;
+}
+/** A running step's elapsed time so far, "23s" / "5m 3s"; nothing in its first second or with no start. */
+export function elapsedSince(start: number | undefined, now: number): string | undefined {
+  return start === undefined ? undefined : formatDuration(Math.max(0, now - start));
+}
+export function formatDuration(ms: number): string | undefined {
+  if (!Number.isFinite(ms) || ms < 1_000) return undefined;
+  const seconds = Math.round(ms / 1_000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return seconds % 60 ? `${minutes}m ${seconds % 60}s` : `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
 /** Collapsed tool rows show this much of an input/output; "Show more" reveals the rest (already capped server-side). */
@@ -188,29 +228,106 @@ export async function followStep(io: {
  * like a call: it does not break a run, and folds into the group with the
  * calls around it (`steps`, in order; `tools` stays the calls alone). A run
  * with fewer than two calls shows its rows as they are.
+ *
+ * Per TURN (up to a message sent to the subagent; the chat calls this once
+ * per turn), two more blocks:
+ * - `todos`: the agent's todo list as the turn's LAST successful TodoWrite
+ *   left it — one block however many calls rewrote it, standing where the
+ *   first one was made (so it does not move while the turn runs). TodoWrite
+ *   calls are not steps: they neither join nor split a run.
+ * - `sources`: the pages the turn used (sourcesOf), one block right after the
+ *   turn's last tool block.
+ * Both are keyed by the call that first produced them, so an open/closed
+ * choice survives growth.
  */
 export type ViewBlock =
   | { kind: "text"; row: Extract<ViewRow, { kind: "text" | "message" }> }
   | { kind: "message"; row: Extract<ViewRow, { kind: "text" | "message" }> }
   | { kind: "thinking"; row: ThinkingRow }
   | { kind: "tool"; row: ToolRow }
-  | { kind: "group"; key: string; tools: ToolRow[]; steps: Array<ToolRow | ThinkingRow> };
+  | { kind: "group"; key: string; tools: ToolRow[]; steps: Array<ToolRow | ThinkingRow> }
+  | { kind: "todos"; key: string; row: TodosRow }
+  | { kind: "sources"; key: string; sources: WebSource[] };
 
 export function groupRows(rows: ViewRow[]): ViewBlock[] {
   const blocks: ViewBlock[] = [];
   let run: Array<ToolRow | ThinkingRow> = [];
+  let turn: { todosAt?: number; todos: TodosRow[]; tools: ToolRow[]; afterTools: number } = { todos: [], tools: [], afterTools: 0 };
   const flush = () => {
     const tools = run.filter((row): row is ToolRow => row.kind === "tool");
     if (tools.length > 1) blocks.push({ kind: "group", key: tools[0].toolUseId, tools, steps: run });
     else for (const row of run) blocks.push(row.kind === "tool" ? { kind: "tool", row } : { kind: "thinking", row });
+    if (tools.length) turn.afterTools = blocks.length;
     run = [];
   };
+  const endTurn = () => {
+    flush();
+    if (turn.todosAt !== undefined) {
+      const first = turn.todos[0];
+      blocks[turn.todosAt] = { kind: "todos", key: `todos:${first.toolUseId}`, row: latestTodos(turn.todos) };
+    }
+    const sources = sourcesOf(turn.tools);
+    if (sources.length) {
+      const first = turn.tools.find((tool) => sourcesOf([tool]).length)!;
+      blocks.splice(turn.afterTools, 0, { kind: "sources", key: `sources:${first.toolUseId}`, sources });
+    }
+    turn = { todos: [], tools: [], afterTools: 0 };
+  };
   for (const row of rows) {
-    if (row.kind === "tool" || row.kind === "thinking") run.push(row);
-    else { flush(); blocks.push(row.kind === "message" ? { kind: "message", row } : { kind: "text", row }); }
+    if (row.kind === "tool" || row.kind === "thinking") {
+      run.push(row);
+      if (row.kind === "tool") turn.tools.push(row);
+    } else if (row.kind === "todos") {
+      // Held in place by the first list; filled with the latest at the end of the turn.
+      if (turn.todosAt === undefined) { turn.todosAt = blocks.length; blocks.push({ kind: "todos", key: "", row }); }
+      turn.todos.push(row);
+    } else if (row.kind === "message") { endTurn(); blocks.push({ kind: "message", row }); }
+    else { flush(); blocks.push({ kind: "text", row }); }
   }
-  flush();
+  endTurn();
   return blocks;
+}
+
+/** The list as the last TodoWrite that did not fail left it (the last one, if all failed). */
+export function latestTodos(rows: readonly TodosRow[]): TodosRow {
+  return [...rows].reverse().find((row) => !row.failed) ?? rows.at(-1)!;
+}
+
+/** Pages listed in one Sources block. */
+export const MAX_SOURCES = 50;
+
+/**
+ * The pages a run of calls used, in the order the calls were made: each
+ * WebFetch URL and each link its WebSearch results listed, once a call has
+ * finished without an error. Deduplicated by URL (ignoring a #fragment); a
+ * title, when any copy has one, is kept.
+ */
+export function sourcesOf(tools: readonly ToolRow[]): WebSource[] {
+  const seen = new Map<string, WebSource>();
+  for (const tool of tools) {
+    if (!tool.result || tool.result.isError) continue;
+    const found = tool.name === "WebFetch" ? tool.sources : tool.name === "WebSearch" ? tool.result.sources : undefined;
+    for (const source of found ?? []) {
+      if (!safeHref(source.url)) continue;
+      const key = source.url.replace(/#.*$/, "");
+      const known = seen.get(key);
+      if (!known) { if (seen.size < MAX_SOURCES) seen.set(key, { ...source }); }
+      else if (!known.title && source.title) known.title = source.title;
+    }
+  }
+  return [...seen.values()];
+}
+
+/** A todo list's summary: "3 of 7 done". */
+export function todoSummary(row: Pick<TodosRow, "todos" | "more">): string {
+  const done = row.todos.filter((todo) => todo.status === "completed").length;
+  return `${done} of ${row.todos.length + row.more} done`;
+}
+
+/** What a todo list shows: the item in progress, what is left, what is done (each in the agent's order). */
+export function todoSections(todos: readonly TodoEntry[]): { active: TodoEntry[]; left: TodoEntry[]; done: TodoEntry[] } {
+  return { active: todos.filter((todo) => todo.status === "in_progress"), left: todos.filter((todo) => todo.status === "pending"),
+    done: todos.filter((todo) => todo.status === "completed") };
 }
 
 /** What a tool call was, for counting: [verb, singular, plural]. Anything unlisted is "used N tools". */
@@ -221,6 +338,7 @@ const TOOL_KINDS: Record<string, readonly [string, string, string]> = {
   Grep: ["ran", "search", "searches"], Glob: ["ran", "search", "searches"],
   WebSearch: ["looked up", "page", "pages"], WebFetch: ["looked up", "page", "pages"],
   Agent: ["started", "subagent", "subagents"], Task: ["started", "subagent", "subagents"],
+  SubagentMessage: ["heard from", "subagent", "subagents"], BackgroundTask: ["finished", "background task", "background tasks"],
 };
 const OTHER_KIND = ["used", "tool", "tools"] as const;
 
@@ -248,15 +366,15 @@ export function groupOpen(choices: Readonly<Record<string, boolean>>, key: strin
 }
 
 /**
- * A group's summary line, split so the running part can shimmer:
- * "Ran 5 commands, read 3 files" or, while a call is still running, what is
- * done so far and then the running call by its title: "Ran 2 commands · " +
- * "Run the test suite…".
+ * A group's one line. While its turn runs it says only what the agent is
+ * doing now: the latest call's title, shimmering ("Run the test suite…"; no
+ * ellipsis in the moment between two calls). Once the turn is over it sums
+ * the run up: "Ran 5 commands, read 3 files".
  */
-export function groupLabel(tools: ToolRow[], pending?: ToolRow): { lead: string; running?: string } {
-  if (!pending) return { lead: groupSummary(tools) };
-  const done = tools.filter((tool) => tool !== pending);
-  return { lead: done.length ? `${groupSummary(done)} · ` : "", running: `${pending.summary || pending.name}…` };
+export function groupLabel(tools: ToolRow[], running = false): { lead: string; running?: string } {
+  const latest = tools.at(-1);
+  if (!running || !latest) return { lead: groupSummary(tools) };
+  return { lead: "", running: `${latest.summary || latest.name}${latest.result ? "" : "…"}` };
 }
 
 /** The call still waiting for its result in a running group, if any. */

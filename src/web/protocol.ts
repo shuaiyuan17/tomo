@@ -56,18 +56,30 @@ export interface WebTask {
   totalTokens?: number;
   toolUses?: number;
 }
+/** A web page a turn used: a WebFetch URL, or a link a WebSearch returned. http(s) only, clipped and scrubbed. */
+export interface WebSource { url: string; title?: string }
+export type TodoStatus = "pending" | "in_progress" | "completed";
+/** One entry of the agent's todo list (TodoWrite). `activeForm`: the present-tense label shown while it is in progress. */
+export interface TodoEntry { content: string; status: TodoStatus; activeForm?: string }
 /** One entry of a subagent's transcript, as the read-only task view shows it. */
 export type SubagentItem =
   | { kind: "text"; id: string; text: string; truncated: boolean; ts?: number }
+  /** `sources`: the page a WebFetch call reads. */
   | { kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean; ts?: number;
+    sources?: WebSource[];
     /** Server-side only (session-tools.ts): the call reached memory/private, so its output is withheld. Never sent. */
     privateOutput?: boolean }
-  /** `images`: image blocks in the output, counted and never served (the view shows a chip). */
-  | { kind: "result"; id: string; toolUseId: string; output: string; truncated: boolean; isError: boolean; images?: number }
+  /** `images`: image blocks in the output, counted and never served (the view shows a chip). `sources`: a WebSearch result's links. */
+  | { kind: "result"; id: string; toolUseId: string; output: string; truncated: boolean; isError: boolean; images?: number; ts?: number;
+    sources?: WebSource[] }
+  /** A TodoWrite call, parsed: the whole list as the agent wrote it (at most MAX_TODOS entries; `more` says how many were left out). */
+  | { kind: "todos"; id: string; toolUseId: string; todos: TodoEntry[]; more?: number; ts?: number }
   /** A message sent to the subagent while it ran (not its first prompt, which is the brief). */
   | { kind: "message"; id: string; text: string; truncated: boolean; ts?: number }
   /** A subagent's (non-empty) thinking block, clipped like text; shown folded. Never in the main chat's tool items. */
   | { kind: "thinking"; id: string; text: string; truncated: boolean; ts?: number };
+/** A tool call as either view counts it: an ordinary call, or a parsed TodoWrite. */
+export type CallItem = Extract<SubagentItem, { kind: "tool" | "todos" }>;
 /** The prompt the subagent was given: the first entry of its transcript. */
 export interface SubagentBrief { text: string; truncated: boolean }
 /** A byte window of complete transcript lines: page back with `before=start`, tail with `after=end`. */

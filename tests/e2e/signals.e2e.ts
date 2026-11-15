@@ -134,13 +134,16 @@ it("on a phone: no zoom-triggering fields, a compact header, and the view follow
   }
   const scroller = page.getByLabel("Conversation history");
   const gap = () => scroller.evaluate((element) => element.scrollHeight - element.scrollTop - element.clientHeight);
+  // Each question anchored near the top, its answer below it; the reader goes on to the end.
+  await scroller.focus();
+  await page.keyboard.press("End");
   await browserExpect.poll(gap).toBeLessThan(2);
   // A picture has no height until it loads: the reader, at the end, must stay at the end.
   await scroller.evaluate((element) => {
     const image = document.createElement("img");
     image.alt = "late";
     image.src = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="200" height="400"><rect width="200" height="400" fill="gray"/></svg>')}`;
-    element.appendChild(image);
+    [...element.querySelectorAll("article.message")].at(-1)!.appendChild(image);
   });
   await browserExpect.poll(() => scroller.evaluate((element) => (element.querySelector('img[alt="late"]') as HTMLImageElement).naturalHeight)).toBe(400);
   await browserExpect.poll(gap).toBeLessThan(2);

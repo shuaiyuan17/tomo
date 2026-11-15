@@ -397,6 +397,8 @@ it("renders channel images as thumbnails (never the path), keeps line breaks, an
   await browserExpect(page.locator("article.message.assistant").filter({ hasText: "第一个已经合了" })).toHaveClass(/bg-primary/);
   await image.click();
   await browserExpect(page.getByRole("dialog", { name: "Image" })).toBeVisible();
+  // The overlay covers the window: no row or scroller contains it (paint/layout containment would).
+  expect(await page.getByRole("dialog", { name: "Image" }).evaluate((el) => { const r = el.getBoundingClientRect(); return [r.width === innerWidth, r.height === innerHeight]; })).toEqual([true, true]);
   await page.keyboard.press("Escape");
   await browserExpect(page.getByRole("dialog", { name: "Image" })).toHaveCount(0);
 });
@@ -530,8 +532,8 @@ it("shows a turn's tool calls inline, folded, between the messages; INPUT/OUTPUT
   await browserExpect(summary).toBeVisible();
   // Collapsed by default, between the request and the reply; the reply text is never folded.
   expect(await summary.evaluate((el) => {
-    const all = [...document.querySelectorAll("#conversation article, #conversation [data-slot=collapsible]")];
-    const index = all.indexOf(el.closest("[data-slot=collapsible]")!);
+    const all = [...document.querySelectorAll("#conversation article, #conversation [data-slot=trace-collapsible]")];
+    const index = all.indexOf(el.closest("[data-slot=trace-collapsible]")!);
     return [all[index - 1]?.textContent?.includes("Check the changelog"), all[index + 1]?.textContent?.includes("The changelog is fine.")];
   })).toEqual([true, true]);
   await browserExpect(summary).toHaveAttribute("aria-expanded", "false");
@@ -563,7 +565,9 @@ it("a jump-to-latest pill: shown a screen up, counts new messages without pullin
   const history = page.getByLabel("Conversation history");
   await browserExpect(history).toContainText("Line 39");
   await browserExpect(page.getByRole("button", { name: /jump to latest/i })).toHaveCount(0);
-  await history.evaluate((el) => { el.scrollTop = 0; });
+  // The reader scrolls up (a wheel: the scroller stops following on the reader's own scroll).
+  await history.hover();
+  await page.mouse.wheel(0, -100_000);
   const pill = page.getByRole("button", { name: "Jump to latest" });
   await browserExpect(pill).toBeVisible();
   const top = await history.evaluate((el) => el.scrollTop);
@@ -571,11 +575,152 @@ it("a jump-to-latest pill: shown a screen up, counts new messages without pullin
   watchBus.publish({ type: "transcript", ts: Date.now(), sessionKey: "dm:owner", role: "assistant", channel: "telegram", text: "x" });
   await browserExpect(page.getByRole("button", { name: "1 new message, jump to latest" })).toBeVisible();
   expect(await history.evaluate((el) => el.scrollTop)).toBe(top);
-  await page.getByRole("button", { name: "1 new message, jump to latest" }).focus();
+  // A new turn from another channel (a user message: a scroll anchor) does not pull the reader to it either.
+  store.append("dm:owner", { role: "user", channel: "telegram", content: "Asked from the phone.", timestamp: Date.now() + 1 });
+  watchBus.publish({ type: "transcript", ts: Date.now(), sessionKey: "dm:owner", role: "user", channel: "telegram", text: "x" });
+  await browserExpect(page.getByRole("button", { name: "2 new messages, jump to latest" })).toBeVisible();
+  await page.waitForTimeout(300);
+  expect(await history.evaluate((el) => el.scrollTop)).toBe(top);
+  await page.getByRole("button", { name: "2 new messages, jump to latest" }).focus();
   await page.keyboard.press("Enter");
   await browserExpect.poll(() => history.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThan(80);
   await browserExpect(page.getByRole("button", { name: /jump to latest/i })).toHaveCount(0);
   expect(await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))).toBe("Conversation history");
+  // Back at the end, the view follows what arrives.
+  store.append("dm:owner", { role: "assistant", channel: "telegram", content: `Followed.\n\n${"A tall reply line.\n\n".repeat(30)}`, timestamp: Date.now() + 2 });
+  watchBus.publish({ type: "transcript", ts: Date.now(), sessionKey: "dm:owner", role: "assistant", channel: "telegram", text: "x" });
+  await browserExpect(history).toContainText("Followed.");
+  await browserExpect.poll(() => history.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThan(2);
+  await browserExpect(page.getByRole("button", { name: /jump to latest/i })).toHaveCount(0);
+});
+
+/** A row's top, relative to the conversation's viewport (Infinity for one just replaced, so a poll retries). */
+const topOf = (row: ReturnType<Page["locator"]>) => row.evaluate((el) => {
+  const view = el.closest("[aria-label='Conversation history']");
+  return view ? Math.round(el.getBoundingClientRect().top - view.getBoundingClientRect().top) : Infinity;
+});
+const tall = (i: number) => `Reply ${i}.\n\n${"A paragraph of the reply, long enough to give the conversation some height on any screen.\n\n".repeat(16)}`;
+
+it("opens at the last turn; a sent message anchors near the top under a peek of the previous row, and the reply grows below it", async () => {
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const t = Date.now() - 600_000;
+  for (let i = 0; i < 30; i++) store.append("dm:owner", { role: i % 2 ? "assistant" : "user", channel: "web", content: i % 2 ? tall(i) : `Question ${i}?`, timestamp: t + i * 1_000 });
+  await page.addInitScript(() => {
+    const w = window as unknown as { cspViolations: string[] };
+    w.cspViolations = [];
+    document.addEventListener("securitypolicyviolation", (event) => w.cspViolations.push(event.violatedDirective));
+  });
+  await page.reload();
+  const history = page.getByLabel("Conversation history");
+  const last = page.locator("article.message.user").filter({ hasText: "Question 28?" });
+  await browserExpect(last).toBeVisible();
+  // Not the absolute end: the last question, with its (taller than the screen) answer below it.
+  await browserExpect.poll(() => topOf(last)).toBeGreaterThan(40);
+  expect(await topOf(last)).toBeLessThan(100);
+  expect(await history.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeGreaterThan(100);
+  // The previous row peeks in above it.
+  expect(await page.locator("article.message.assistant").filter({ hasText: "Reply 27." }).evaluate((el) =>
+    el.getBoundingClientRect().bottom > el.closest("[aria-label='Conversation history']")!.getBoundingClientRect().top)).toBe(true);
+  await page.screenshot({ path: "test-results/chat-opened-at-last-turn.png" });
+  // Dragging the scrollbar (a pointer on the viewport itself, then a scroll) lets go of the turn too:
+  // a row growing afterwards does not snap the reader back to it.
+  await history.evaluate((el) => { el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true })); el.scrollTop -= 300; });
+  await page.waitForTimeout(200);
+  const dragged = await history.evaluate((el) => el.scrollTop);
+  await history.evaluate((el) => {
+    el.dispatchEvent(new PointerEvent("pointerup", { bubbles: true }));
+    const block = document.createElement("div"); block.style.height = "100px"; [...el.querySelectorAll("article.message")].at(-1)!.append(block);
+  });
+  await page.waitForTimeout(300);
+  expect(await history.evaluate((el) => el.scrollTop)).toBe(dragged);
+
+  let release!: (text: string) => void;
+  mockSdk.responseFn = () => new Promise<string>((r) => { release = r; });
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("The next question");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  const sent = page.locator("article.message.user").filter({ hasText: "The next question" });
+  await browserExpect(sent).toBeVisible();
+  await browserExpect.poll(() => topOf(sent)).toBeLessThan(100);
+  const anchored = await topOf(sent);
+  expect(anchored).toBeGreaterThan(40);
+  await page.screenshot({ path: "test-results/chat-just-sent.png" });
+  release("A short answer.\n\nIn two paragraphs.");
+  const reply = page.locator("article.message.assistant").filter({ hasText: "In two paragraphs." });
+  await browserExpect(reply).toBeVisible();
+  await page.waitForTimeout(300);
+  // Recorded (the bubble becomes the history message) and answered: the turn stays where it was anchored.
+  expect(Math.abs(await topOf(sent) - anchored)).toBeLessThanOrEqual(1);
+  expect(await topOf(reply)).toBeGreaterThan(anchored);
+
+  // A reply that streams past the screen: once it fills the room under the
+  // anchored question, the view follows its end, block by block.
+  mockSdk.responseFn = () => new Promise<string>((r) => { release = r; });
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("Now a long one");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  const second = page.locator("article.message.user").filter({ hasText: "Now a long one" });
+  await browserExpect.poll(() => topOf(second)).toBeLessThan(100);
+  const sdk = mockSdk.queryControllers.at(-1)!;
+  const gap = () => history.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
+  for (const i of [100, 101, 102]) {
+    sdk.pushEvent({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: tall(i) }] } });
+    await browserExpect(history).toContainText(`Reply ${i}.`);
+    await browserExpect.poll(gap).toBeLessThan(2);
+  }
+  release("The end of it.");
+  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "The end of it." })).toBeVisible();
+  await browserExpect.poll(gap).toBeLessThan(2);
+  await browserExpect(page.getByText("Reply in progress")).toHaveCount(0);
+  await browserExpect.poll(gap).toBeLessThan(2);
+  // The scroller sets its spacer through the DOM: no <style> element, nothing the CSP refused.
+  expect(await page.evaluate(() => [document.querySelectorAll("style").length, (window as unknown as { cspViolations: string[] }).cspViolations])).toEqual([0, []]);
+});
+
+it("Load earlier keeps the reader's place, and a row growing above the view does not move it", async () => {
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const t = Date.now() - 600_000;
+  for (let i = 0; i < 130; i++) store.append("dm:owner", { role: i % 2 ? "assistant" : "user", channel: "web", content: `Message ${i}\n\nwith a second paragraph`, timestamp: t + i * 1_000 });
+  await page.reload();
+  const history = page.getByLabel("Conversation history");
+  const earlier = page.getByRole("button", { name: "Load earlier messages" });
+  await browserExpect(earlier).toBeVisible();
+  await history.hover();
+  await browserExpect.poll(async () => { await page.mouse.wheel(0, -20_000); return history.evaluate((el) => el.scrollTop); }).toBe(0);
+  const firstRow = () => history.evaluate((el) => {
+    const view = el.getBoundingClientRect();
+    const row = [...el.querySelectorAll<HTMLElement>("[data-message-id]")].find((r) => r.getBoundingClientRect().bottom > view.top)!;
+    return { id: row.dataset.messageId!, top: Math.round(row.getBoundingClientRect().top - view.top) };
+  });
+  const before = await firstRow();
+  await earlier.click();
+  await browserExpect(history).toContainText("Message 0");
+  await page.waitForTimeout(300);
+  const row = history.locator(`[data-message-id="${before.id}"]`);
+  expect(Math.abs(await topOf(row) - before.top)).toBeLessThanOrEqual(1);
+  // A picture loading (here: a row growing by 400px) above the view leaves the reader where they are.
+  const reading = await firstRow();
+  await history.evaluate((el) => {
+    const view = el.getBoundingClientRect();
+    const above = [...el.querySelectorAll("article.message")].filter((a) => a.getBoundingClientRect().bottom < view.top).at(-1)!;
+    const block = document.createElement("div"); block.style.height = "400px"; above.append(block);
+  });
+  await page.waitForTimeout(300);
+  expect(Math.abs(await topOf(history.locator(`[data-message-id="${reading.id}"]`)) - reading.top)).toBeLessThanOrEqual(1);
+});
+
+it("a reply's quote jumps to the quoted message far up and flashes it; focus stays in the conversation", async () => {
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const t = Date.now() - 600_000;
+  store.append("dm:owner", { role: "assistant", channel: "imessage", content: "The original note, far up.", timestamp: t });
+  for (let i = 1; i < 40; i++) store.append("dm:owner", { role: i % 2 ? "user" : "assistant", channel: "web", content: `Line ${i}\n\nmore text to make it tall`, timestamp: t + i * 1_000 });
+  store.append("dm:owner", { role: "user", channel: "imessage", content: '[replying to: "The original note, far up."] this one', timestamp: t + 50_000 });
+  await page.reload();
+  const original = page.locator("article.message.assistant").filter({ hasText: "The original note, far up." });
+  await browserExpect(page.getByText("this one", { exact: true })).toBeVisible();
+  await browserExpect(original).not.toBeInViewport();
+  await page.getByRole("button", { name: /Replying to/ }).click();
+  await browserExpect(original).toBeInViewport();
+  await browserExpect(original).toHaveClass(/bg-primary/);
+  expect(await page.evaluate(() => !!document.activeElement?.closest("[aria-label='Conversation history']"))).toBe(true);
 });
 
 it("attaches images by button, drop and paste; shows the tray with ×; sends an image alone; it reaches the model and incoming-images", async () => {
@@ -766,5 +911,95 @@ it("a subagent's thinking folds, an image output is a chip, and unreadable lines
   await settledShot("subagent-thinking-desktop");
   await page.setViewportSize({ width: 390, height: 844 });
   await settledShot("subagent-thinking-phone");
+  await page.setViewportSize({ width: 1440, height: 900 });
+});
+
+it("a turn's trace: the todo list open while it runs and folded after, its Sources, and a copyable code block in the reply", async () => {
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: url });
+  const requests: string[] = [];
+  page.on("request", (request) => requests.push(request.url()));
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  store.setSdkSessionId("dm:owner", "sdk-trace");
+  const t = Date.now() - 60_000;
+  store.append("dm:owner", { role: "user", channel: "web", content: "How do I start an Astro project with pnpm?", timestamp: t });
+  const line = (type: string, ms: number, content: unknown[]) => JSON.stringify({ type, isSidechain: false, timestamp: new Date(ms).toISOString(), message: { role: type, content } }) + "\n";
+  const todo = (id: string, ms: number, done: number) => line("assistant", ms, [{ type: "tool_use", id, name: "TodoWrite", input: { todos: [
+    { content: "Search the docs", activeForm: "Searching the docs" }, { content: "Read the install page", activeForm: "Reading the install page" },
+    { content: "Write the answer", activeForm: "Writing the answer" }].map((step, i) => ({ ...step, status: i < done ? "completed" : i === done ? "in_progress" : "pending" })) } }])
+    + line("user", ms + 50, [{ type: "tool_result", tool_use_id: id, content: "Todos have been modified successfully." }]);
+  const running = line("user", t + 100, [{ type: "text", text: "How do I start an Astro project with pnpm?" }]) + todo("p1", t + 1_000, 0) +
+    line("assistant", t + 2_000, [{ type: "tool_use", id: "s1", name: "WebSearch", input: { query: "astro pnpm create" } }]) +
+    line("user", t + 4_000, [{ type: "tool_result", tool_use_id: "s1", content: 'Web search results for query: "astro pnpm create"\n\nLinks: '
+      + JSON.stringify([{ title: "Install Astro", url: "https://docs.astro.build/en/install-and-setup/" }, { title: "pnpm create", url: "https://pnpm.io/cli/create" }])
+      + "\n\nUse pnpm create astro." }]) +
+    line("assistant", t + 5_000, [{ type: "tool_use", id: "f1", name: "WebFetch", input: { url: "https://docs.astro.build/en/install-and-setup/", prompt: "Steps?" } }]) +
+    line("user", t + 7_000, [{ type: "tool_result", tool_use_id: "f1", content: "Run pnpm create astro@latest." }]) +
+    todo("p2", t + 8_000, 1) +
+    line("assistant", t + 9_000, [{ type: "tool_use", id: "b1", name: "Bash", input: { command: "pnpm --version", description: "Check pnpm" } }]);
+  mkdirSync(mockConfig.sdkSessionsDir, { recursive: true });
+  const file = resolve(mockConfig.sdkSessionsDir, "sdk-trace.jsonl");
+  writeFileSync(file, running);
+  await page.reload();
+  const history = page.getByLabel("Conversation history");
+  const todos = history.getByRole("button", { name: /To-dos/ });
+  await browserExpect(todos).toContainText("1 of 3 done");
+  // The turn is running (typing is live state, not in the reload snapshot).
+  const stopTyping = channel.startTyping("owner");
+  // Open while the turn runs: the item in progress by its activeForm, shimmering; one list however many TodoWrite calls.
+  await browserExpect(todos).toHaveAttribute("aria-expanded", "true");
+  await browserExpect(history.getByRole("button", { name: /To-dos/ })).toHaveCount(1);
+  await browserExpect(history.locator('[data-todo="active"] [data-status="running"]')).toHaveText(/Reading the install page/);
+  await browserExpect(history.getByRole("button", { name: /Check pnpm…/ })).toBeVisible();
+  await browserExpect(history.getByRole("button", { name: /^Sources/ })).toContainText("2");
+  for (const [scheme, width] of [["light", 1440], ["dark", 1440], ["dark", 390], ["light", 390]] as const) {
+    await page.emulateMedia({ colorScheme: scheme });
+    await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await settledShot(`trace-running-${width === 390 ? "phone" : "desktop"}-${scheme}`);
+  }
+  await page.setViewportSize({ width: 1440, height: 900 });
+
+  // The turn finishes: the list is complete and folds; the reply has a code block.
+  writeFileSync(file, running + line("user", t + 10_000, [{ type: "tool_result", tool_use_id: "b1", content: "9.15.0" }]) + todo("p3", t + 11_000, 3));
+  store.append("dm:owner", { role: "assistant", channel: "web", timestamp: t + 12_000,
+    content: "Run this in an empty folder:\n\n```sh\npnpm create astro@latest\n```\n\nThen follow the prompts." });
+  stopTyping();
+  watchBus.publish({ type: "transcript", ts: Date.now(), sessionKey: "dm:owner", role: "assistant", channel: "web", text: "x" });
+  await browserExpect(history).toContainText("Then follow the prompts.");
+  await browserExpect(todos).toContainText("3 of 3 done");
+  await browserExpect(todos).toHaveAttribute("aria-expanded", "false");
+  const sources = history.getByRole("button", { name: /^Sources/ });
+  await sources.click();
+  const link = history.getByRole("link", { name: /Install Astro/ });
+  await browserExpect(link).toHaveAttribute("href", "https://docs.astro.build/en/install-and-setup/");
+  await browserExpect(link).toHaveAttribute("target", "_blank");
+  await browserExpect(link).toHaveAttribute("rel", "noopener noreferrer");
+  await browserExpect(link).toContainText("docs.astro.build");
+  await browserExpect(history.getByRole("link", { name: /pnpm create/ })).toContainText("pnpm.io");
+  // Deduplicated: the fetched page is the search's first link.
+  await browserExpect(history.locator('[data-kind="sources"] a')).toHaveCount(2);
+  // Nothing from those hosts was requested by the page.
+  expect(requests.some((request) => /astro\.build|pnpm\.io/.test(new URL(request).hostname))).toBe(false);
+  const reply = history.locator("article.message.assistant").last();
+  await browserExpect(reply.locator('[data-slot="code-block-title"]')).toHaveText("sh");
+  await reply.locator('[data-slot="code-block"]').hover();
+  await reply.getByRole("button", { name: "Copy code" }).click();
+  await browserExpect(reply.getByRole("button", { name: "Copied" })).toBeVisible();
+  await reply.locator('[data-slot="code-block"]').screenshot({ path: "test-results/trace-code-copied.png" });
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe("pnpm create astro@latest");
+  // Tool panes keep their plain <pre>: no copy button there.
+  await history.getByRole("button", { name: /Looked up 2 pages/ }).click();
+  await history.getByRole("button", { name: /Check pnpm/ }).click();
+  await browserExpect(history.locator('[data-kind="group"] [data-slot="code-block"]')).toHaveCount(0);
+  for (const [scheme, width] of [["light", 1440], ["dark", 1440], ["dark", 390], ["light", 390]] as const) {
+    await page.emulateMedia({ colorScheme: scheme });
+    await page.setViewportSize({ width, height: width === 390 ? 844 : 900 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+    await settledShot(`trace-done-${width === 390 ? "phone" : "desktop"}-${scheme}`);
+  }
+  await todos.click();
+  await browserExpect(todos).toHaveAttribute("aria-expanded", "true");
+  await settledShot("trace-todos-done-phone-light");
+  await page.emulateMedia({ colorScheme: "light" });
   await page.setViewportSize({ width: 1440, height: 900 });
 });

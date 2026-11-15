@@ -112,6 +112,9 @@
   --font-mono: var(--font-mono);
   --animate-shimmer: shimmer 2s linear infinite;
   @keyframes shimmer { from { background-position: 100% 0; } to { background-position: 0% 0; } }
+  /* The logo ring drawing itself, then running out the other end: "working". The path has pathLength 100. */
+  --animate-mark: mark-draw 1.9s cubic-bezier(0.45, 0.05, 0.3, 0.95) infinite;
+  @keyframes mark-draw { 0% { stroke-dashoffset: 100; } 55% { stroke-dashoffset: 0; } 100% { stroke-dashoffset: -100; } }
   @keyframes rail-in { from { transform: translateX(100%); } }
 }
 
@@ -141,13 +144,16 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   /* "Working" sweeps a soft highlight, like the old slide-to-unlock. */
   /* A bright glint sweeping across dim text, like the old slide-to-unlock:
      the band is about a third of the word wide, with soft edges. */
-  .shimmer {
+  /* A running Trace line (components/ui/trace.tsx) shimmers its title the same way. */
+  .shimmer, [data-slot="trace-line"][data-status="running"] > [data-slot="trace-title"] {
     @apply animate-shimmer bg-clip-text text-transparent;
     background-image: linear-gradient(100deg, var(--shimmer-base) 0%, var(--shimmer-base) 43%, var(--shimmer-glint) 50%, var(--shimmer-base) 57%, var(--shimmer-base) 100%);
     background-size: 300% 100%;
     background-repeat: no-repeat;
   }
-  @media (prefers-reduced-motion: reduce) { .shimmer { color: var(--shimmer-base); background: none; } }
+  @media (prefers-reduced-motion: reduce) {
+    .shimmer, [data-slot="trace-line"][data-status="running"] > [data-slot="trace-title"] { color: var(--shimmer-base); background: none; }
+  }
 
   /* Rendered markdown (model output): typography only, no executable HTML. */
   .markdown { @apply text-[15px] leading-[1.75]; overflow-wrap: anywhere; }

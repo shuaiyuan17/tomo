@@ -44,8 +44,11 @@ export function summarizeToolInput(name: string, input?: Record<string, unknown>
  * Everything else, and a Bash call without a description, keeps its summary.
  */
 export function toolTitle(name: string, input?: Record<string, unknown>): string {
-  const description = name === "Bash" && typeof input?.description === "string" ? input.description.replace(/\s+/g, " ").trim() : "";
-  return description ? scrubSecretValues(description) : summarizeToolInput(name, input);
+  const description = typeof input?.description === "string" ? input.description.replace(/\s+/g, " ").trim() : "";
+  if (name === "Bash" && description) return scrubSecretValues(description);
+  // A subagent is named by what it was sent to do; its type is in the row's input.
+  if ((name === "Agent" || name === "Task") && description) return scrubSecretValues(`Subagent · ${description}`);
+  return summarizeToolInput(name, input);
 }
 
 function describeToolInput(name: string, input?: Record<string, unknown>): string {

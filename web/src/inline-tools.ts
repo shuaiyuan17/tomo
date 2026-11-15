@@ -30,34 +30,36 @@ export function mergeTools(state: ToolsState, page: SessionTools, kind: "full" |
 }
 
 /** A tool block in the chat, keyed so its open/closed state survives paging and live updates. */
-export type ToolBlock = Extract<ViewBlock, { kind: "tool" | "group" }> & { key: string };
+export type ToolBlock = Extract<ViewBlock, { kind: "tool" | "group" | "todos" | "sources" }> & { key: string };
 export type TimelineEntry = { kind: "message"; message: HistoryMessage } | { kind: "tools"; block: ToolBlock };
 
-/** A run of calls is keyed by its first call (a run only grows at its end). */
-const keyed = (block: ViewBlock): ToolBlock => block.kind === "group" ? { ...block, key: `calls:${block.key}` }
-  : { ...(block as Extract<ViewBlock, { kind: "tool" }>), key: `call:${(block as Extract<ViewBlock, { kind: "tool" }>).row.toolUseId}` };
+/** A run of calls is keyed by its first call (a run only grows at its end); todos and sources carry their own key. */
+const keyed = (block: ToolBlock): ToolBlock => block.kind === "group" ? { ...block, key: `calls:${block.key}` }
+  : block.kind === "tool" ? { ...block, key: `call:${block.row.toolUseId}` } : block;
+const isToolBlock = (block: ViewBlock): block is ToolBlock => block.kind === "tool" || block.kind === "group" || block.kind === "todos" || block.kind === "sources";
 
 /**
  * Messages in order with the tool calls made before each placed in front of
  * it: the calls of one turn fold into a group (one call stays a row), the
- * text is never folded. Calls after the last message are `trailing` (the
+ * text is never folded; the turn's todo list and the pages it used are their
+ * own rows (groupRows). Calls after the last message are `trailing` (the
  * turn still running). Calls before `since` (the oldest loaded message, when
  * older history is not loaded yet) and calls without a time are left out.
  */
 export function interleave(messages: readonly HistoryMessage[], items: readonly SubagentItem[], since = 0):
   { entries: TimelineEntry[]; trailing: ToolBlock[] } {
   const times = new Map<string, number>();
-  for (const item of items) if (item.kind === "tool" && item.ts !== undefined) times.set(item.id, item.ts);
-  const rows = viewRows([...items]).filter((row) => row.kind === "tool" && (times.get(row.id) ?? -1) >= since);
+  for (const item of items) if ((item.kind === "tool" || item.kind === "todos") && item.ts !== undefined) times.set(item.id, item.ts);
+  const rows = viewRows([...items]).filter((row) => (row.kind === "tool" || row.kind === "todos") && (times.get(row.id) ?? -1) >= since);
   const entries: TimelineEntry[] = [];
   let next = 0;
   for (const message of messages) {
     const run = [];
     while (next < rows.length && times.get(rows[next].id)! < message.timestamp) run.push(rows[next++]);
-    for (const block of groupRows(run)) entries.push({ kind: "tools", block: keyed(block) });
+    for (const block of groupRows(run).filter(isToolBlock)) entries.push({ kind: "tools", block: keyed(block) });
     entries.push({ kind: "message", message });
   }
-  return { entries, trailing: groupRows(rows.slice(next)).map(keyed) };
+  return { entries, trailing: groupRows(rows.slice(next)).filter(isToolBlock).map(keyed) };
 }
 
 // ---- "N new messages ↓" ----
@@ -70,28 +72,21 @@ export function messageKey(message: Pick<HistoryMessage, "id" | "role" | "reques
 export const blockKey = (block: { requestId: string; turnId?: string }) => `reply:${block.turnId ?? block.requestId}`;
 export const pendingKey = (request: { requestId: string }) => `sent:${request.requestId}`;
 
-/** Messages that arrived after the reader left the bottom (paged-in older ones never count). */
-export function unseenCount(baseline: ReadonlySet<string>, keys: readonly string[]): number {
-  return appendedIds(baseline, [...new Set(keys)]).size;
+/** Messages that arrived after the reader left the end (paged-in older ones never count). */
+export function unseenKeys(baseline: ReadonlySet<string>, keys: readonly string[]): Set<string> {
+  return appendedIds(baseline, [...new Set(keys)]);
 }
 
-/** More than about a screen above the end. */
-export function isFar(distance: number, viewport: number): boolean { return distance > viewport; }
-
-/** The jump button: shown once the reader is more than about a screen up, or something new arrived while away. */
-export function jumpVisible(input: { atBottom: boolean; far: boolean; unseen: number }): boolean {
-  if (input.atBottom) return false;
-  return input.unseen > 0 || input.far;
+/**
+ * The jump pill: shown while there is conversation below the view (the
+ * scroller's `end` edge) and either the last row is out of view or something
+ * arrived while the reader was away from the end.
+ */
+export function jumpVisible(input: { canScrollEnd: boolean; lastRowVisible: boolean; unseen: number }): boolean {
+  if (!input.canScrollEnd) return false;
+  return input.unseen > 0 || !input.lastRowVisible;
 }
 
 export function jumpLabel(unseen: number): string {
   return unseen === 1 ? "1 new message" : unseen > 1 ? `${unseen} new messages` : "";
 }
-
-/** After a render: keep the place after "Load earlier", follow the end only when the reader is at the bottom. */
-export function scrollAction(input: { restoring: boolean; atBottom: boolean }): "restore" | "bottom" | "stay" {
-  return input.restoring ? "restore" : input.atBottom ? "bottom" : "stay";
-}
-
-/** Within this many pixels of the end counts as "at the bottom". */
-export const BOTTOM_SLACK = 80;

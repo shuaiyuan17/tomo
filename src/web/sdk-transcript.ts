@@ -27,7 +27,9 @@ import { join } from "node:path";
  *
  * The content blocks themselves (text / thinking / tool_use / tool_result /
  * image) are the Anthropic Messages API's public shapes, which the SDK
- * stores verbatim (`SessionMessage.message`).
+ * stores verbatim (`SessionMessage.message`). The few TOOL formats the views
+ * read more closely live here too: TodoWrite's input (the todo list),
+ * WebFetch's `url`, and the links a WebSearch result lists.
  */
 
 /** An SDK session id as it names a transcript file (`<id>.jsonl`). */
@@ -57,8 +59,8 @@ export function metaModels(raw: string): unknown[] {
   return [meta?.pickedEffortModel, meta?.model];
 }
 
-/** One part of a tool result's content. Images are counted, never carried. */
-export type ResultPart = { type: "text"; text: string } | { type: "image" } | { type: "other"; name: string };
+/** One part of a tool result's content. Images are counted, never carried. `link`: a `search_result` block's page. */
+export type ResultPart = { type: "text"; text: string } | { type: "image" } | { type: "other"; name: string; link?: WebLink };
 
 /**
  * One content block, in its original position (so an item id `<offset>:<index>`
@@ -163,11 +165,85 @@ function resultParts(content: unknown): ResultPart[] | undefined {
   if (!Array.isArray(content)) return undefined;
   return content.flatMap((part): ResultPart[] => {
     if (!part || typeof part !== "object") return [];
-    const p = part as { type?: unknown; text?: unknown };
+    const p = part as { type?: unknown; text?: unknown; source?: unknown; title?: unknown };
     if (typeof p.text === "string") return [{ type: "text", text: p.text }];
     if (p.type === "image") return [{ type: "image" }];
-    return typeof p.type === "string" ? [{ type: "other", name: p.type.slice(0, 64) }] : [];
+    if (typeof p.type !== "string") return [];
+    // WebSearch with citations on returns its hits as search_result blocks (`source`: the page's URL).
+    const link = p.type === "search_result" ? webLink(p.source, p.title) : undefined;
+    return [{ type: "other", name: p.type.slice(0, 64), ...(link ? { link } : {}) }];
   });
+}
+
+// ---- Tool calls the views show as more than a call ----
+
+/** A page link as the transcript names it: http(s) only (the markdown renderer's own rule), at most MAX_URL_CHARS. */
+export interface WebLink { url: string; title?: string }
+export const MAX_URL_CHARS = 2_048;
+/** Links read from one WebSearch result; the rest are left out. */
+export const MAX_RESULT_LINKS = 20;
+/** How much of one result's text is searched for its links (the commentary after them is not). */
+export const LINK_SCAN_CHARS = 256 * 1024;
+
+function webLink(url: unknown, title?: unknown): WebLink | undefined {
+  if (typeof url !== "string" || url.length > MAX_URL_CHARS || !/^https?:\/\//.test(url)) return undefined;
+  try { new URL(url); } catch { return undefined; }
+  const named = typeof title === "string" ? title.replace(/\s+/g, " ").trim() : "";
+  return { url, ...(named && named !== url ? { title: named } : {}) };
+}
+
+/** The page a WebFetch call reads (its `url` input). */
+export function fetchedPage(name: string, input: Record<string, unknown>): WebLink | undefined {
+  return name === "WebFetch" ? webLink(input.url) : undefined;
+}
+
+/**
+ * The links a WebSearch result lists. Claude Code writes the result as text:
+ * `Web search results for query: "…"`, then for each search a line
+ * `Links: [{"title":…,"url":…},…]` (JSON), then the model's commentary.
+ * With citations on, the hits are `search_result` blocks instead. Any other
+ * text (another tool's output that happens to say "Links:") yields nothing.
+ */
+export function searchResultLinks(parts: readonly ResultPart[]): WebLink[] {
+  const links: WebLink[] = [];
+  for (const part of parts) {
+    if (links.length >= MAX_RESULT_LINKS) break;
+    if (part.type === "other" && part.link) links.push(part.link);
+    if (part.type !== "text" || !part.text.startsWith("Web search results for query:")) continue;
+    for (const line of part.text.slice(0, LINK_SCAN_CHARS).split("\n")) {
+      if (links.length >= MAX_RESULT_LINKS) break;
+      if (!line.startsWith("Links: [")) continue;
+      let hits: unknown;
+      try { hits = JSON.parse(line.slice("Links: ".length)); } catch { continue; }
+      if (!Array.isArray(hits)) continue;
+      for (const hit of hits) {
+        const link = hit && typeof hit === "object" ? webLink((hit as { url?: unknown }).url, (hit as { title?: unknown }).title) : undefined;
+        if (link) links.push(link);
+        if (links.length >= MAX_RESULT_LINKS) break;
+      }
+    }
+  }
+  return links;
+}
+
+export const TODO_STATUSES = ["pending", "in_progress", "completed"] as const;
+export interface Todo { content: string; status: typeof TODO_STATUSES[number]; activeForm?: string }
+
+/**
+ * A TodoWrite call's list (`{ todos: [{ content, status, activeForm }] }`,
+ * the SDK's TodoWriteInput), or undefined when the input is not that shape:
+ * such a call is then shown as an ordinary one, never dropped.
+ */
+export function todoList(name: string, input: Record<string, unknown>): Todo[] | undefined {
+  if (name !== "TodoWrite" || !Array.isArray(input.todos)) return undefined;
+  const todos: Todo[] = [];
+  for (const raw of input.todos as unknown[]) {
+    if (!raw || typeof raw !== "object") return undefined;
+    const { content, status, activeForm } = raw as { content?: unknown; status?: unknown; activeForm?: unknown };
+    if (typeof content !== "string" || !(TODO_STATUSES as readonly unknown[]).includes(status)) return undefined;
+    todos.push({ content, status: status as Todo["status"], ...(typeof activeForm === "string" && activeForm.trim() ? { activeForm } : {}) });
+  }
+  return todos;
 }
 
 /**
@@ -176,7 +252,42 @@ function resultParts(content: unknown): ResultPart[] | undefined {
  * defeats them is what the agreement test exists to catch.
  */
 export function mayHoldToolBlocks(line: string): boolean {
-  return line.includes('"tool_use"') || line.includes('"tool_result"');
+  return line.includes('"tool_use"') || line.includes('"tool_result"') || line.includes(TASK_NOTIFICATION_OPEN);
+}
+
+// ---- Task notifications: a background task reporting back into the conversation ----
+
+const TASK_NOTIFICATION_OPEN = "<task-notification>";
+/** The names the two views give a task notification's synthetic call (see subagent-reader.ts). */
+export const SUBAGENT_MESSAGE_TOOL = "SubagentMessage";
+export const BACKGROUND_TASK_TOOL = "BackgroundTask";
+export interface TaskNotice {
+  /** True when the task was a subagent (its report is a message from it); false for a shell or other background task. */
+  subagent: boolean;
+  /** The subagent's description, or the notification's own summary line. */
+  name: string;
+  /** completed | failed | stopped | …, when given. */
+  status?: string;
+  /** The report it handed back; may be empty. */
+  text: string;
+}
+/**
+ * A user-role entry the CLI wrote itself when a background task ended: an
+ * XML-ish envelope (`<task-notification>` with `<status>`, `<summary>`,
+ * `<result>` …), not something a person typed. `Agent "<description>"
+ * finished` in the summary marks a subagent. Undefined for any other text.
+ */
+export function taskNotice(text: string): TaskNotice | undefined {
+  const body = text.trimStart();
+  if (!body.startsWith(TASK_NOTIFICATION_OPEN)) return undefined;
+  const tag = (name: string) => new RegExp(`<${name}>([\\s\\S]*?)</${name}>`).exec(body)?.[1]?.trim();
+  const summary = (tag("summary") ?? "").replace(/\s+/g, " ");
+  const agent = /^Agent\s+"([^"]{1,300})"/.exec(summary)?.[1];
+  const status = tag("status");
+  // An envelope with no inner tags carries its text directly.
+  const bare = body.slice(TASK_NOTIFICATION_OPEN.length).replace(/<\/task-notification>\s*$/, "").trim();
+  const result = tag("result") ?? (/<[a-z-]+>/.test(bare) ? "" : bare);
+  return { subagent: agent !== undefined, name: (agent ?? summary) || "Background task", ...(status ? { status } : {}), text: result };
 }
 export function isSidechainLine(line: string): boolean { return line.includes('"isSidechain":true'); }
 /** A line that may be an assistant record (the model lookup reads only those). */

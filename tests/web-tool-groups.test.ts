@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { groupLabel, groupOpen, groupRows, groupSummary, pendingTool, viewRows, type ToolRow } from "../web/src/subagent.js";
+import { elapsedSince, groupLabel, groupOpen, groupStart, groupRows, groupSummary, pendingTool, viewRows, type ToolRow } from "../web/src/subagent.js";
 import type { SubagentItem } from "../src/web/protocol.js";
 
 let n = 0;
@@ -42,12 +42,15 @@ describe("tool-call groups", () => {
     expect(pendingTool(running)?.name).toBe("Bash");
   });
 
-  it("a closed running group still says what it is doing: what is done, then the running call by its title", () => {
+  it("a closed running group says only what it is doing now: the latest call by its title; the summary comes when the turn is over", () => {
     const running = viewRows([...call("Read", "1"), ...call("Read", "2"), ...call("Bash", "3", false)]) as ToolRow[];
     const pending = pendingTool(running)!;
-    expect(groupLabel(running, pending)).toEqual({ lead: "Read 2 files · ", running: `${pending.summary || "Bash"}…` });
+    expect(groupLabel(running, true)).toEqual({ lead: "", running: `${pending.summary || "Bash"}…` });
     const described = { ...pending, summary: "Run the test suite" };
-    expect(groupLabel([described], described)).toEqual({ lead: "", running: "Run the test suite…" });
+    expect(groupLabel([described], true)).toEqual({ lead: "", running: "Run the test suite…" });
+    // Between two calls the latest finished one is still what the line says, without the ellipsis.
+    const finished = viewRows([...call("Read", "1"), ...call("Bash", "2")]) as ToolRow[];
+    expect(groupLabel(finished, true)).toEqual({ lead: "", running: finished[1].summary });
     expect(groupLabel(running)).toEqual({ lead: groupSummary(running) });
   });
 
@@ -59,5 +62,17 @@ describe("tool-call groups", () => {
     const before = groupRows(viewRows([...call("Read", "g1"), ...call("Read", "g2")]));
     const after = groupRows(viewRows([...call("Read", "g1"), ...call("Read", "g2"), ...call("Bash", "g3")]));
     expect(before[0].kind === "group" && after[0].kind === "group" && before[0].key === after[0].key).toBe(true);
+  });
+
+  it("a running step counts from its first call; nothing in the first second or without a start", () => {
+    const tools = [{ ts: 5_000 }, { ts: 2_000 }, {}] as ToolRow[];
+    expect(groupStart(tools)).toBe(2_000);
+    expect(groupStart([{} as ToolRow])).toBeUndefined();
+    expect(elapsedSince(2_000, 25_400)).toBe("23s");
+    expect(elapsedSince(2_000, 305_000)).toBe("5m 3s");
+    expect(elapsedSince(2_000, 2_400)).toBeUndefined();
+    // A phone whose clock is behind the Mac's never shows a negative time.
+    expect(elapsedSince(9_000, 2_000)).toBeUndefined();
+    expect(elapsedSince(undefined, 9_000)).toBeUndefined();
   });
 });

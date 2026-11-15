@@ -15,6 +15,7 @@ import { webSessionId } from "../../src/web/owner.js";
 import { watchBus } from "../../src/watch/bus.js";
 import { transcriptFileStem } from "../../src/sessions/store.js";
 import { OutgoingMediaStore, outgoingImagesDir } from "../../src/web/outgoing-media.js";
+import { uploadsDir } from "../../src/web/uploads.js";
 
 installAgentTestHooks();
 let agent: Agent;
@@ -31,7 +32,8 @@ beforeEach(async () => {
   store.setChatTitle("telegram:-1", "Test group");
   store.append("telegram:-1", { role: "user", content: "A shared group note.", channel: "telegram", timestamp: Date.now() });
   agent = new Agent(); channel = new WebChannel(mockConfig.owner, undefined, { compact: (key, settled) => agent.requestOwnerCompact(key, settled),
-    outgoingMedia: new OutgoingMediaStore(outgoingImagesDir(mockConfig.workspaceDir), { isPrivate: (path) => path.includes("/memory/private/") }) }); provider = new MockChannel("telegram");
+    outgoingMedia: new OutgoingMediaStore(outgoingImagesDir(mockConfig.workspaceDir), { isPrivate: (path) => path.includes("/memory/private/") }),
+    uploads: { dir: uploadsDir(mockConfig.tomoHome), workspaceDir: mockConfig.workspaceDir } }); provider = new MockChannel("telegram");
   supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0 });
   channel.attach(supervisor); agent.addChannel(channel); agent.addChannel(provider);
   await channel.start();
@@ -298,7 +300,7 @@ it("shows tasks in a pinnable rail; on narrow screens it is a keyboard-safe over
 
 it("the composer re-fits its height when only its width changes", async () => {
   const input = page.getByRole("textbox", { name: "Message Tomo" });
-  await input.fill("word ".repeat(60).trim());
+  await input.fill("word ".repeat(45).trim());
   const wide = await input.evaluate((el) => el.getBoundingClientRect().height);
   await page.setViewportSize({ width: 390, height: 844 });
   await browserExpect.poll(() => input.evaluate((el) => el.getBoundingClientRect().height)).toBeGreaterThan(wide);
@@ -569,4 +571,126 @@ it("a jump-to-latest pill: shown a screen up, counts new messages without pullin
   await browserExpect.poll(() => history.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThan(80);
   await browserExpect(page.getByRole("button", { name: /jump to latest/i })).toHaveCount(0);
   expect(await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))).toBe("Conversation history");
+});
+
+it("attaches images by button, drop and paste; shows the tray with ×; sends an image alone; it reaches the model and incoming-images", async () => {
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  mockSdk.responseFn = () => "Got the picture.";
+  await page.locator("input[type=file]").setInputFiles([{ name: "one.png", mimeType: "image/png", buffer: png }]);
+  const tray = page.getByRole("list", { name: "Attached images" });
+  await browserExpect(tray.getByRole("listitem", { name: "one.png, attached" })).toBeVisible();
+  // Drag files over the chat: "Drop to attach"; dropping adds them.
+  const drop = async (type: "dragenter" | "drop") => page.locator("#conversation").evaluate((el, [kind, b64]) => {
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const data = new DataTransfer();
+    data.items.add(new File([bytes], "two.png", { type: "image/png" }));
+    el.dispatchEvent(new DragEvent(kind, { dataTransfer: data, bubbles: true, cancelable: true }));
+  }, [type, png.toString("base64")] as const);
+  await drop("dragenter");
+  await browserExpect(page.getByText("Drop to attach")).toBeVisible();
+  await drop("drop");
+  await browserExpect(page.getByText("Drop to attach")).toHaveCount(0);
+  await browserExpect(tray.getByRole("listitem", { name: "two.png, attached" })).toBeVisible();
+  // Paste an image into the composer.
+  await page.getByRole("textbox", { name: "Message Tomo" }).evaluate((el, b64) => {
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const data = new DataTransfer();
+    data.items.add(new File([bytes], "three.png", { type: "image/png" }));
+    el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }));
+  }, png.toString("base64"));
+  await browserExpect(tray.getByRole("listitem")).toHaveCount(3);
+  await tray.getByRole("button", { name: "Remove three.png" }).click();
+  await browserExpect(tray.getByRole("listitem")).toHaveCount(2);
+  // A fake image (an SVG named .png) is refused by the server: the tray says so and offers a retry.
+  await page.locator("input[type=file]").setInputFiles([{ name: "evil.png", mimeType: "image/png", buffer: Buffer.from("<svg xmlns='http://www.w3.org/2000/svg'/>") }]);
+  await browserExpect(tray.getByRole("listitem", { name: "evil.png, upload failed" })).toBeVisible();
+  await browserExpect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
+  await tray.getByRole("button", { name: "Remove evil.png" }).click();
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect(page.locator(".message.assistant .markdown").last()).toHaveText("Got the picture.");
+  await browserExpect(tray).toHaveCount(0);
+  const blocks = mockSdk.userContents.at(-1) as Array<{ type: string }>;
+  expect(blocks.filter((block) => block.type === "image")).toHaveLength(2);
+  const { readdirSync } = await import("node:fs");
+  const filed = readdirSync(resolve(mockConfig.workspaceDir, "memory", "incoming-images"), { recursive: true }).map(String).filter((name) => name.endsWith(".png"));
+  expect(filed.filter((name) => /_web_owner_/.test(name))).toHaveLength(2);
+  expect(readdirSync(uploadsDir(mockConfig.tomoHome))).toEqual([]);
+  // Recorded: the bubble shows thumbnails, not the path.
+  await page.reload();
+  await browserExpect(page.locator(".message.user").last().getByRole("img", { name: "Image" })).toHaveCount(2);
+  await browserExpect(page.locator("main")).not.toContainText("incoming-images");
+});
+
+it("an image pasted while a message is sending stays in the tray for the next one", async () => {
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  mockSdk.responseFn = () => "Seen.";
+  const tray = page.getByRole("list", { name: "Attached images" });
+  await page.locator("input[type=file]").setInputFiles([{ name: "first.png", mimeType: "image/png", buffer: png }]);
+  await browserExpect(tray.getByRole("listitem", { name: "first.png, attached" })).toBeVisible();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let sentBody = "";
+  await page.route("**/api/v1/messages", async (route) => {
+    sentBody = route.request().postData() ?? "";
+    await held;
+    await route.continue();
+  });
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect.poll(() => sentBody).toContain("images");
+  await page.getByRole("textbox", { name: "Message Tomo" }).evaluate((el, b64) => {
+    const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    const data = new DataTransfer();
+    data.items.add(new File([bytes], "later.png", { type: "image/png" }));
+    el.dispatchEvent(new ClipboardEvent("paste", { clipboardData: data, bubbles: true, cancelable: true }));
+  }, png.toString("base64"));
+  await browserExpect(tray.getByRole("listitem", { name: "later.png, attached" })).toBeVisible();
+  release();
+  await browserExpect(page.locator(".message.assistant .markdown").last()).toHaveText("Seen.");
+  await browserExpect(tray.getByRole("listitem")).toHaveCount(1);
+  await browserExpect(tray.getByRole("listitem", { name: "later.png, attached" })).toBeVisible();
+  expect(JSON.parse(sentBody).images).toHaveLength(1);
+});
+
+it("Resend on an interrupted message brings its images back into the tray", async () => {
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  let finish!: (value: string) => void;
+  mockSdk.responseFn = () => new Promise<string>((resolve) => { finish = resolve; });
+  let requestId = "";
+  page.on("request", (request) => { if (request.method() === "POST" && request.url().endsWith("/api/v1/messages")) requestId = JSON.parse(request.postData() ?? "{}").requestId; });
+  const tray = page.getByRole("list", { name: "Attached images" });
+  await page.locator("input[type=file]").setInputFiles([{ name: "pic.png", mimeType: "image/png", buffer: png }]);
+  await browserExpect(tray.getByRole("listitem", { name: "pic.png, attached" })).toBeVisible();
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("with a picture");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect(tray).toHaveCount(0);
+  await browserExpect.poll(() => channel.request(requestId).state).toBe("running");
+  // As a restart would leave it: interrupted, with its filed image in the receipt.
+  expect(channel.request(requestId).images).toHaveLength(1);
+  (channel as unknown as { state(id: string, state: string): void }).state(requestId, "interrupted");
+  await page.getByRole("button", { name: "Resend…" }).click();
+  await browserExpect(tray.getByRole("listitem")).toHaveCount(1);
+  await browserExpect(tray.getByRole("listitem").first()).toHaveAccessibleName(/attached$/);
+  await browserExpect(page.getByRole("textbox", { name: "Message Tomo" })).toHaveValue("with a picture");
+  finish("done");
+});
+
+it("an image-only interrupted message, resent, is dismissed: its interrupted bubble goes", async () => {
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  const finishes: Array<(value: string) => void> = [];
+  mockSdk.responseFn = () => new Promise<string>((resolve) => { finishes.push(resolve); });
+  const ids: string[] = [];
+  page.on("request", (request) => { if (request.method() === "POST" && request.url().endsWith("/api/v1/messages")) ids.push(JSON.parse(request.postData() ?? "{}").requestId); });
+  const tray = page.getByRole("list", { name: "Attached images" });
+  await page.locator("input[type=file]").setInputFiles([{ name: "only.png", mimeType: "image/png", buffer: png }]);
+  await browserExpect(tray.getByRole("listitem", { name: "only.png, attached" })).toBeVisible();
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect.poll(() => ids.length && channel.request(ids[0]).state).toBe("running");
+  (channel as unknown as { state(id: string, state: string): void }).state(ids[0], "interrupted");
+  await browserExpect(page.getByText("Not answered.", { exact: false })).toHaveCount(1);
+  await page.getByRole("button", { name: "Resend…" }).click();
+  await browserExpect(tray.getByRole("listitem").first()).toHaveAccessibleName(/attached$/);
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect.poll(() => ids.length).toBe(2);
+  await browserExpect(page.getByText("Not answered.", { exact: false })).toHaveCount(0);
+  for (const finish of finishes) finish("done");
 });

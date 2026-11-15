@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
 import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
 import type { Channel, CommandHandler, IncomingMessage, MessageHandler, OutgoingMessage } from "./types.js";
 import { markDefiniteFailure } from "./types.js";
@@ -11,6 +12,10 @@ import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
 import { redactCommand } from "../web/redact-command.js";
 import { selectOwnerSessionKey } from "../web/data.js";
 import { OutgoingMediaError, type OutgoingMediaStore } from "../web/outgoing-media.js";
+import { claimUploads, recoverClaims } from "../web/uploads.js";
+import { buildImageAttachment } from "./attachments.js";
+import { formatImageMarker } from "./imageStore.js";
+import type { ImageAttachment } from "./types.js";
 import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request-journal.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
@@ -33,6 +38,15 @@ interface Receipt { digest: string; request: WebRequest; settled: boolean }
 
 /** A real channel: only Agent's registered MessageHandler accepts input, and
  * only the existing delivery pipeline calls send. HTTP is an optional peer. */
+/**
+ * Typed text never reads as a leading `[Sent an image, saved to: …]` marker
+ * (only the server writes those, for real uploads): a leading "[" gets a
+ * zero-width space in front, which the marker reader does not skip.
+ */
+export function neutralizeMarker(text: string): string {
+  return text.startsWith("[") ? `\u200b${text}` : text;
+}
+
 export class WebChannel implements Channel {
   readonly name = "web";
   readonly events = new WebEvents();
@@ -55,6 +69,9 @@ export class WebChannel implements Channel {
   private modelLookups = new Map<string, { key: string; taskId: string; runId: string | undefined; attempt: number; timer: ReturnType<typeof setTimeout> | undefined }>();
   private readonly now: () => number;
   private readonly outgoing: OutgoingMediaStore | undefined;
+  private readonly uploads: { dir: string; workspaceDir: string | undefined } | undefined;
+  /** Request ids being admitted right now (between the duplicate check and the receipt). */
+  private readonly inFlight = new Set<string>();
   private readonly compact: ((sessionKey: string, onSettled: (outcome: "done" | "unverified" | "failed") => void) => "queued" | "already_requested" | "no_owner") | undefined;
   private compactState: WebCompactState | undefined;
   private readonly toolCommand: ((sessionKey: string, toolUseId: string) => string | undefined) | undefined;
@@ -89,6 +106,8 @@ export class WebChannel implements Channel {
       taskModel?: (sessionKey: string, taskId: string) => Promise<string | undefined>;
       /** Where pictures the agent sends are copied, so the browser can show them by id. */
       outgoingMedia?: OutgoingMediaStore;
+      /** Staged browser uploads (`uploadsDir`) and the workspace whose inbound image store files them. */
+      uploads?: { dir: string; workspaceDir: string | undefined };
       /** Durable receipts; loaded here, before any request is accepted. */
       journal?: WebRequestJournal;
       /** Claude subscription usage for the Plan usage card (cached, debounced). */
@@ -99,6 +118,7 @@ export class WebChannel implements Channel {
     this.compact = options.compact;
     this.taskModel = options.taskModel;
     this.outgoing = options.outgoingMedia;
+    this.uploads = options.uploads;
     const now = options.now ?? Date.now;
     this.now = now;
     // Without registry access the catalog would pick the canonical key.
@@ -111,6 +131,8 @@ export class WebChannel implements Channel {
     this.unsubscribe = this.bus.subscribe((event) => this.observe(event));
     this.journal = options.journal;
     if (this.journal) this.restore(this.journal);
+    // Uploads claimed when the last run stopped: recorded ones go, the rest return to staging.
+    if (this.uploads) recoverClaims(this.uploads.dir, (requestId) => this.receipts.has(requestId));
   }
   /** Previous run's receipts: settled, deduplicated by id, never re-run. */
   private restore(journal: WebRequestJournal): void {
@@ -120,7 +142,8 @@ export class WebChannel implements Channel {
     try { loaded = journal.load(); } catch { this.journalUnavailable = true; return; }
     for (const entry of loaded.entries) {
       const request: WebRequest = { requestId: entry.requestId, state: entry.state, timestamp: entry.timestamp,
-        ...(this.ownerId ? { sessionId: this.ownerId } : {}), ...(entry.text !== undefined ? { text: entry.text } : {}) };
+        ...(this.ownerId ? { sessionId: this.ownerId } : {}), ...(entry.text !== undefined ? { text: entry.text } : {}),
+        ...(entry.images?.length ? { images: entry.images } : {}) };
       if (entry.text !== undefined) this.pendingTextBytes += Buffer.byteLength(JSON.stringify(entry.text));
       this.receipts.set(entry.requestId, { digest: entry.digest, request, settled: true });
     }
@@ -146,7 +169,7 @@ export class WebChannel implements Channel {
     if (!this.ownerId || !this.owner) throw new WebError(409, "owner_setup_required");
     if (input.targetId !== undefined && input.targetId !== this.ownerId) throw new WebError(403, "owner_dm_only");
     if (this.journalUnavailable) throw new WebError(503, "journal_unavailable");
-    const digest = createHash("sha256").update(input.text).digest("hex");
+    const digest = createHash("sha256").update(input.images?.length ? `${input.text}\0${input.images.join(",")}` : input.text).digest("hex");
     const previous = this.receipts.get(input.requestId);
     if (previous) {
       if (previous.digest !== digest) throw new WebError(409, "request_id_conflict");
@@ -164,17 +187,37 @@ export class WebChannel implements Channel {
       if (!oldest) throw new WebError(429, "request_limit");
       this.receipts.delete(oldest[0]);
     }
-    const request: WebRequest = { requestId: input.requestId, state: "queued", sessionId: this.ownerId, text: input.text, timestamp: this.now(), responseTurnId: input.requestId };
+    // The id is taken NOW, synchronously, before any await: a second request
+    // with it (a double click, a retry racing the first) is refused as in
+    // flight instead of filing the same uploads twice.
+    if (this.inFlight.has(input.requestId)) throw new WebError(409, "request_in_flight");
+    this.inFlight.add(input.requestId);
+    // Attached uploads are claimed and filed like any channel's inbound
+    // images; one that expired or is unknown refuses the message, before
+    // anything is accepted. Until the receipt is durable they stay claimable.
+    let images: Awaited<ReturnType<WebChannel["fileImages"]>> | undefined;
+    try { images = input.images?.length ? await this.fileImages(input.images, input.requestId) : undefined; }
+    finally { this.inFlight.delete(input.requestId); }
+    // From here to receipts.set there is no await, so no other receive can interleave.
+    const filed = images?.list.flatMap((image) => image.savedPath ? [image.savedPath] : []) ?? [];
+    const request: WebRequest = { requestId: input.requestId, state: "queued", sessionId: this.ownerId, text: input.text, timestamp: this.now(), responseTurnId: input.requestId,
+      ...(filed.length ? { images: filed } : {}) };
     this.receipts.set(input.requestId, { digest, request, settled: false });
     this.pendingTextBytes += textBytes;
     // Durable before custody: a crash after the 202 must leave a record.
-    try { this.journal?.recordReceived(input.requestId, digest, input.text, request.timestamp!); } catch {
+    // Durable first, with the filed images' paths; only then do the staged
+    // copies go. A failure leaves them staged, so the page can retry the same ids.
+    try { this.journal?.recordReceived(input.requestId, digest, input.text, request.timestamp!, filed); } catch {
+      images?.undo();
       this.clearRequestText(this.receipts.get(input.requestId)!);
       this.receipts.delete(input.requestId);
       throw new WebError(503, "persist_failed");
     }
+    images?.finalize();
+    const marker = images ? formatImageMarker(images.list.length, filed, images.unconverted) : "";
     const message: IncomingMessage = { id: input.requestId, chatId: WEB_CHAT_ID, senderName: "Owner",
-      text: input.text, timestamp: Date.now(), isGroup: false };
+      text: marker ? (input.text ? `${marker} ${neutralizeMarker(input.text)}` : marker) : neutralizeMarker(input.text), timestamp: Date.now(), isGroup: false,
+      ...(images ? { images: images.list } : {}) };
     const handoff = Promise.resolve().then(() => this.handler!(message));
     this.handoffs.add(handoff);
     try {
@@ -188,6 +231,40 @@ export class WebChannel implements Channel {
       this.clearRequestText(this.receipts.get(input.requestId)!);
       throw err instanceof WebError ? err : new WebError(503, "handoff_failed");
     } finally { this.handoffs.delete(handoff); }
+  }
+
+  /**
+   * The staged uploads of one message, filed as Telegram and iMessage file
+   * theirs: base64 for the model, and (with saveInboundImages) a copy under
+   * memory/incoming-images as `HHMMSS_web_owner_<id8>.<ext>`. Every id is
+   * checked first (present, unexpired, an image, not repeated); one bad id
+   * refuses the message and nothing is written. The staged files are NOT
+   * removed here: receive() does that once the receipt is durable. `undo`
+   * removes what this filed, for a receipt that could not be written.
+   */
+  private async fileImages(ids: readonly string[], requestId: string): Promise<{ list: ImageAttachment[]; unconverted: number; undo: () => void; finalize: () => void }> {
+    if (!this.uploads) throw new WebError(400, "uploads_unavailable");
+    // Without saveInboundImages there is no durable copy to record with the
+    // receipt (and the owner asked for images not to be kept): refused, and
+    // the page does not offer attaching at all (bootstrap capabilities).
+    if (!this.uploads.workspaceDir) throw new WebError(409, "uploads_disabled");
+    const claim = claimUploads(this.uploads.dir, ids, requestId);
+    if (!claim) throw new WebError(409, "upload_missing");
+    const files = claim.files;
+    const list: ImageAttachment[] = [];
+    const undo = () => { for (const image of list) if (image.savedPath) rmSync(image.savedPath, { force: true }); claim.release(); };
+    let unconverted = 0;
+    try {
+      for (const { id, bytes, type } of files) {
+        // Still HEIC: the web process could not convert it at upload (see uploads.ts).
+        if (type === "image/heic") unconverted++;
+        const image = await buildImageAttachment(bytes, type, { sessionKey: `web_${WEB_CHAT_ID}`, guid: id, timestamp: new Date() }, this.uploads.workspaceDir);
+        list.push(image);
+        // Filing was asked for and failed: refuse, keep the uploads staged.
+        if (!image.savedPath) throw new WebError(503, "persist_failed");
+      }
+    } catch (error) { undo(); throw error; }
+    return { list, unconverted, undo, finalize: claim.finalize };
   }
 
   request(id: string): WebRequest { return { ...(this.receipts.get(id)?.request ?? { requestId: id, state: "unknown" }) }; }
@@ -384,6 +461,7 @@ export class WebChannel implements Channel {
   private clearRequestText(receipt: Receipt): void {
     if (receipt.request.text !== undefined) this.pendingTextBytes -= Buffer.byteLength(JSON.stringify(receipt.request.text));
     delete receipt.request.text;
+    delete receipt.request.images;
   }
 
   private state(requestId: string, state: WebRequest["state"]): void {

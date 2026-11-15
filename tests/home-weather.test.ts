@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  DEFAULT_WEATHER, HomeWeatherSource, parseWeatherAnswer, skyAt, sunTimes, WANTED_FOR_MS, WEATHER_CODES, WEATHER_FAILURE_TTL_MS, WEATHER_TTL_MS,
+  DEFAULT_WEATHER, HomeWeatherSource, parseWeatherAnswer, readBodyCapped, WEATHER_MAX_BYTES, skyAt, sunTimes, WANTED_FOR_MS, WEATHER_CODES, WEATHER_FAILURE_TTL_MS, WEATHER_TTL_MS,
   weatherOfCode, type FetchLike,
 } from "../src/home/weather.js";
 import { WEATHERS } from "../src/home/scene.js";
@@ -95,7 +95,27 @@ describe("the sun", () => {
 });
 
 describe("weather source", () => {
-  const answer = (body: unknown, ok = true) => ({ ok, headers: { get: () => null }, text: async () => typeof body === "string" ? body : JSON.stringify(body) });
+  const answer = (body: unknown, ok = true) => new Response(typeof body === "string" ? body : JSON.stringify(body), { status: ok ? 200 : 500 });
+
+  it("a streamed body with no Content-Length is abandoned as soon as it passes the cap", async () => {
+    const chunk = new Uint8Array(64 * 1024).fill(0x20);
+    let pulls = 0;
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) { pulls += 1; controller.enqueue(chunk); },   // never ends
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 });
+    const fetch = vi.fn<FetchLike>(async () => ({ ok: true, headers: { get: () => null }, body }));
+    const source = new HomeWeatherSource("Seattle", { fetch });
+    source.want();
+    await source.settled();
+    expect(source.sky()).toBeUndefined();
+    expect(cancelled).toBe(true);
+    expect(pulls).toBe(WEATHER_MAX_BYTES / chunk.byteLength + 1);
+    await expect(readBodyCapped({ body: null }, 10)).rejects.toThrow("no body");
+    expect(await readBodyCapped(new Response("héllo"), 6)).toBe("héllo");
+    await expect(readBodyCapped(new Response("héllo"), 5)).rejects.toThrow("too large");
+  });
 
   it("no city: no request, no sky", () => {
     const fetch = vi.fn<FetchLike>();

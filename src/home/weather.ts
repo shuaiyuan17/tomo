@@ -165,7 +165,32 @@ export function skyAt(city: CityWeather, time: number): HomeSky | undefined {
   return { weather: city.weather, phase, progress: round(progress), ...(city.tempC !== undefined ? { tempC: city.tempC } : {}) };
 }
 
-export type FetchLike = (url: string, init: { signal: AbortSignal; headers: Record<string, string> }) => Promise<{ ok: boolean; headers: { get(name: string): string | null }; text(): Promise<string> }>;
+export type FetchLike = (url: string, init: { signal: AbortSignal; headers: Record<string, string> }) => Promise<{ ok: boolean; headers: { get(name: string): string | null }; body: ReadableStream<Uint8Array> | null }>;
+
+/**
+ * The body as text, read as a stream and abandoned the moment it passes `maxBytes`.
+ * The count is of DECODED bytes (what fetch hands over after decompression), so neither
+ * a missing Content-Length nor a small compressed body that expands can be buffered whole.
+ */
+export async function readBodyCapped(response: { body: ReadableStream<Uint8Array> | null }, maxBytes: number): Promise<string> {
+  if (!response.body) throw new Error("no body");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) throw new Error("too large");
+      chunks.push(value);
+    }
+  } catch (err) {
+    await reader.cancel().catch(() => {});
+    throw err;
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
 
 export class HomeWeatherSource {
   private answer: CityWeather | undefined;
@@ -214,8 +239,7 @@ export class HomeWeatherSource {
       const response = await this.fetchImpl(`https://wttr.in/${encodeURIComponent(this.city!.trim())}?format=j1`,
         { signal: AbortSignal.timeout(WEATHER_TIMEOUT_MS), headers: { accept: "application/json" } });
       if (!response.ok || Number(response.headers.get("content-length") ?? 0) > WEATHER_MAX_BYTES) throw new Error("bad response");
-      const text = await response.text();
-      if (text.length > WEATHER_MAX_BYTES) throw new Error("too large");
+      const text = await readBodyCapped(response, WEATHER_MAX_BYTES);
       const parsed = parseWeatherAnswer(JSON.parse(text));
       if (!parsed) throw new Error("unrecognised answer");
       this.answer = parsed;

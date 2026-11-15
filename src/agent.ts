@@ -2675,30 +2675,49 @@ export class Agent {
 
   /**
    * Tell each session which of its subagents and background commands the last
-   * restart or crash cut off. Runs as a background turn on THAT session only
-   * (never rerouted: an agent id is only addressable from the SDK session that
-   * started it), and nothing is resumed — the model decides. Each session's
-   * entries are acknowledged once its notice turn has run, so the notice is
-   * sent once rather than on every restart.
+   * restart or crash cut off — that session ONLY (never rerouted: an agent id
+   * is only addressable from the SDK session that started it). Nothing is
+   * resumed; the model decides.
+   *
+   * CUSTODY HAND-OFF, as for the durable inbox's `interrupted` note: the list
+   * goes into the durable pending-notes store, which keeps a note until a turn
+   * that TOOK it ran to its normal result (a turn that failed, was refused, or
+   * was cut short puts it back). Only once it is persisted there is the ledger
+   * entry dropped; a note that could not be persisted leaves the entry, so the
+   * next start tells the session again. A background turn is then queued so
+   * the note reaches the model now rather than at the next message.
    */
   private notifyInterruptedAgents(): void {
     const ledger = this.runningAgents;
     if (!ledger) return;
     const known = new Set(this.sessions.listActiveEntries().map((e) => e.channelKey));
+    // A note an earlier start handed off but no turn finished with is still
+    // owed: give it its turn again now, not only at the next message.
+    const owed = new Set([...known].filter((key) =>
+      this.pendingNotesQueue.peekNotes(key).some((n) => n.includes('<tomo-event type="interrupted-agents"'))));
     for (const [key, records] of ledger.pendingBySession()) {
       if (!known.has(key)) {
         log.warn({ sessionKey: key, count: records.length }, "Interrupted subagents belong to an unknown session; dropping the notice");
         ledger.acknowledge(key);
         continue;
       }
+      if (!this.queuePendingNote(key, formatTomoEvent("interrupted-agents", formatInterruptedAgentsNotice(records)))) {
+        log.error({ sessionKey: key }, "Could not persist the interrupted-subagents note; kept for the next start");
+        continue;
+      }
+      ledger.acknowledge(key);
+      owed.add(key);
       log.info({ sessionKey: key, ids: records.map((r: RunningTaskRecord) => r.taskId) }, "Reporting subagents interrupted by the last restart");
-      const prompt = formatTomoEvent(
-        "interrupted-agents",
-        `${formatInterruptedAgentsNotice(records)}\n${CONTINUITY_DELIVERY_NOTE}`,
-      );
+    }
+    const prompt = formatTomoEvent(
+      "interrupted-agents",
+      "Startup check after a restart: if a note above lists interrupted subagents or commands, decide whether each is "
+        + `still worth continuing; otherwise there is nothing to do. ${CONTINUITY_DELIVERY_NOTE}`,
+      { name: "check" },
+    );
+    for (const key of owed) {
       this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "An interrupted-subagents notice turn"))
-        .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"))
-        .finally(() => ledger.acknowledge(key));
+        .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"));
     }
   }
 

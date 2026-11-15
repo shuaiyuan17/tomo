@@ -92,6 +92,33 @@ describe("interrupted subagents across a restart", () => {
     await third.agent.stop();
   });
 
+  it("a notice turn that fails keeps the list, and the next start tells the session again", async () => {
+    const first = await boot();
+    await haveSession(first.channel, "705");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:705", tasks: [task("retry705")] });
+    crash(first.agent);
+
+    // Second run: the SDK takes the notice turn and never finishes it; the
+    // daemon dies again mid-turn.
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = () => new Promise(() => {});
+    const second = await boot();
+    await waitFor(() => expect(notices("imessage:705").length).toBeGreaterThan(0));
+    // The ledger has handed off, but the durable note is still owed.
+    expect(JSON.parse(readFileSync(ledgerPath(), "utf8")).interrupted).toEqual([]);
+    const store = (second.agent as unknown as { sessions: { getPendingNotes(k: string): string[] } }).sessions;
+    expect(store.getPendingNotes("imessage:705").join("\n")).toContain("retry705");
+    crash(second.agent);
+
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = async () => "ok";
+    const third = await boot();
+    await waitFor(() => expect(notices("imessage:705").some((p) => p.text.includes("retry705"))).toBe(true));
+    const thirdStore = (third.agent as unknown as { sessions: { getPendingNotes(k: string): string[] } }).sessions;
+    await waitFor(() => expect(thirdStore.getPendingNotes("imessage:705").join("\n")).not.toContain("retry705"));
+    await third.agent.stop();
+  });
+
   it("only the session that owned the agent is told", async () => {
     const first = await boot();
     await haveSession(first.channel, "702");

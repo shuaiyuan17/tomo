@@ -23,11 +23,12 @@ function pendingErrorChars(notes: string[]): number {
 /**
  * Notes the cap never drops: a durable-inbox `replay`/`interrupted` note is
  * the only remaining copy of a message (its inbox record is already done), so
- * losing it to the cap would lose the message.
+ * losing it to the cap would lose the message. Same for an
+ * `interrupted-agents` note: its ledger entry is already gone.
  */
 function isPinnedNote(note: string): boolean {
   // `includes`, not `startsWith`: a restored prefix bundles several notes.
-  return note.includes('<tomo-event type="inbox"');
+  return note.includes('<tomo-event type="inbox"') || note.includes('<tomo-event type="interrupted-agents"');
 }
 
 /** Drop oldest unpinned notes until `arr` fits the cap (pinned ones always stay). */

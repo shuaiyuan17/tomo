@@ -168,6 +168,8 @@ npm run test:e2e
 
 The browser E2E test uses the real HTTP, CSRF, child-process RPC, router, Agent, delivery pipeline, and session store. Only the external SDK and messaging transport are deterministic test doubles. All runtime paths are temporary; no real account or daemon is used. Browser screenshots are written to the ignored `test-results/` directory. CI runs lint, strict TypeScript, Vitest coverage on the existing Node matrix, and Chromium E2E on Node 24.
 
+`npm run build` includes browser assets in `dist/web-assets`; `npm pack` includes them in the distribution. `npm run dev` serves those built assets, so rebuild after frontend changes. The UI does not start a Vite development server in the daemon.
+
 ### UI gallery
 
 `npm run web:gallery` builds, then screenshots every surface and state of the UI so a change can be reviewed by eye: the rich conversation (markdown, tables, code, an image, a quote), tool rows open and closed, hover and focus, the composer (focus, refused, delivery uncertain, working with a draft and an attachment), the empty chat, the phone drawer, the session menu, the Tasks rail and a subagent transcript, the scheduled list, every Study tab, the cron confirm dialog, the compact dialog, the screen window, a read-only group, Home with and without WebGL, the locked page and the disconnected state. Each is taken at desktop 1440×900, laptop 1280×720, tablet 820×1180 and phone 390×844, light and dark, at device scale 2.
@@ -187,5 +189,3 @@ node scripts/ui-gallery.mjs --sheet-only         # rebuild index.html from the P
 (cd ../tomo-main && npm ci && npm run web:gallery -- --dir /tmp/gallery-before)
 npm run web:gallery -- --dir /tmp/gallery-after
 ```
-
-`npm run build` includes browser assets in `dist/web-assets`; `npm pack` includes them in the distribution. `npm run dev` serves those built assets, so rebuild after frontend changes. The UI does not start a Vite development server in the daemon.

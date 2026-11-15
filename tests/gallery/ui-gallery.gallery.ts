@@ -331,7 +331,7 @@ async function step(page: Page, vp: Viewport, theme: Theme, surface: string, sta
     await target.screenshot({ path: join(OUT, `${name}.png`), fullPage: options.fullPage, animations: "disabled", caret: "hide" });
     shot = true; shots++;
   };
-  try { await act(snap); if (!shot) throw new Error("step took no shot"); } catch (error) {
+  try { await resetChrome(page); await act(snap); if (!shot) throw new Error("step took no shot"); } catch (error) {
     failures.push({ name, error: error instanceof Error ? error.message.split("\n")[0] : String(error) });
     console.warn(`gallery: ${name} failed: ${String(error).split("\n")[0]}`);
   }
@@ -344,10 +344,27 @@ async function openTasks(page: Page): Promise<void> {
   if (await item.count() === 0) await page.getByRole("button", { name: /^Tasks/ }).click();
   await item.first().waitFor();
 }
-async function closeTasks(page: Page): Promise<void> {
-  const item = page.getByText(/^Audit the rename paths/).filter({ visible: true });
-  if (await item.count() > 0) await page.getByRole("button", { name: /^Tasks/ }).click();
-  await item.first().waitFor({ state: "hidden" });
+
+/**
+ * Every step starts from the same chrome: no menu, dialog or phone drawer (Escape), no screen
+ * window and no Tasks rail. The page remembers the last two across reloads, so a step that left
+ * one open would otherwise put it on top of every later shot of the pass.
+ */
+async function resetChrome(page: Page): Promise<void> {
+  if (page.isClosed()) return;
+  for (let i = 0; i < 2; i++) await page.keyboard.press("Escape");
+  const screen = page.locator("#screen-window");
+  if (await screen.isVisible()) {
+    await page.getByRole("button", { name: "Close screen" }).click();
+    await screen.waitFor({ state: "hidden" });
+  }
+  const closeTasks = page.locator("[data-tasks-close]").filter({ visible: true });
+  if (await closeTasks.count() > 0) {
+    await closeTasks.first().click();
+    await page.getByText(/^Audit the rename paths/).filter({ visible: true }).first().waitFor({ state: "hidden" });
+  }
+  // Closing hands focus back to the trigger; a focus shot sets its own focus.
+  await page.evaluate(() => { (document.activeElement as HTMLElement | null)?.blur(); });
 }
 const history = (page: Page) => page.getByLabel("Conversation history");
 const openToolGroup = async (page: Page) => {
@@ -507,6 +524,9 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
     await page.getByRole("button", { name: /^Screen/ }).click({ timeout: 5000 });
     await page.waitForTimeout(1200);
     await snap();
+    // Close it again (the page remembers it); resetChrome() would too, but a step cleans up after itself.
+    await page.getByRole("button", { name: "Close screen" }).click();
+    await page.locator("#screen-window").waitFor({ state: "hidden" });
   });
   // In a context of its own: the chosen conversation is remembered, and every later shot is of the owner's.
   await s("group", "readonly", async (snap) => {
@@ -523,7 +543,6 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
   for (const tab of ["todos", "memory", "context", "model", "cron", "mcp", "config"]) {
     await s("study", tab, async (snap) => {
       await page.goto(`${url}/#study/${tab}`);
-      await closeTasks(page);
       await page.waitForTimeout(900);
       if (tab === "cron") await page.getByText("Dentist reminder", { exact: true }).filter({ visible: true }).first().waitFor();
       await snap();
@@ -531,15 +550,10 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
   }
   await s("study", "cron-confirm", async (snap) => {
     await page.goto(`${url}/#study/cron`);
-    // A Tasks rail left open by an earlier step covers the job's buttons at laptop and phone widths.
-    await closeTasks(page);
     // The jobs arrive after the page; wait for them rather than for a fixed time.
     await page.getByText("Dentist reminder", { exact: true }).filter({ visible: true }).first().waitFor();
     await page.waitForTimeout(300);
-    const pause = page.getByRole("button", { name: /^(Pause|Delete)/ }).filter({ visible: true }).first();
-    // At 1280x720, after the full pass, something left open still intercepts the pointer; the
-    // dialog is what is shot, so open it with a dispatched click when a real one cannot land.
-    await pause.click({ timeout: 3000 }).catch(() => pause.dispatchEvent("click"));
+    await page.getByRole("button", { name: /^(Pause|Delete)/ }).filter({ visible: true }).first().click();
     await snap();
     await page.keyboard.press("Escape");
   });

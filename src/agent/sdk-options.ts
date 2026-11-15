@@ -285,7 +285,7 @@ export function sdkOptions(
       scopedCallerKey: sessionContext?.scopedCallerKey,
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
-    ...(sdkEnv ? { env: sdkEnv } : {}),
+    env: sdkEnv,
     // Steering needs the CLI to re-emit consumed user messages as
     // isReplay events — that's how LiveSession detects whether a steered
     // message merged into the in-flight turn or spilled to a follow-up
@@ -324,11 +324,23 @@ function adaptiveThinkingForModel(
     : undefined;
 }
 
-function buildSdkEnv(args: {
+/** Env vars set on EVERY SDK child, whatever the auth/routing branch.
+ *
+ *  CLAUDE_CODE_DISABLE_FILE_MENTIONS: `@path` mentions in a prompt are expanded
+ *  by the CLI straight into context, with no tool call — so the PreToolUse
+ *  private-memory guard never sees them, and a group member typing
+ *  `@memory/private/...` would get the file inlined (verified against the SDK).
+ *  With this set the CLI only passes the path on and the model has to read it
+ *  with a tool, which the guard does gate. Tomo never relies on @-mentions. */
+export const ALWAYS_ON_SDK_ENV = {
+  CLAUDE_CODE_DISABLE_FILE_MENTIONS: "1",
+} as const;
+
+export function buildSdkEnv(args: {
   disableAutoCompact: boolean;
   model: string;
   sessionKey?: string;
-}): NodeJS.ProcessEnv | null {
+}): NodeJS.ProcessEnv {
   // Decide whether this session routes through the LiteLLM proxy. A generic
   // anthropic-compatible proxy forwards every model (that's its purpose), so it
   // routes all sessions. A chatgpt-subscription proxy only serves its LiteLLM
@@ -338,12 +350,18 @@ function buildSdkEnv(args: {
   const litellm = config.litellm;
   const useGateway = litellmRoutesModel(litellm, args.model);
   const useDirectApiKey = !useGateway && config.auth.method === "api-key";
-  if (!args.disableAutoCompact && !useGateway && !useDirectApiKey && !args.sessionKey) return null;
+
+  // Nothing session-specific to wire: pass the daemon's env through unchanged
+  // (credentials included, as before), plus the always-on flags.
+  if (!args.disableAutoCompact && !useGateway && !useDirectApiKey && !args.sessionKey) {
+    return { ...process.env, ...ALWAYS_ON_SDK_ENV };
+  }
 
   // Note: SDK `env` fully replaces the child's env (not merged despite the
   // d.ts claim), so we must spread process.env ourselves — otherwise the
   // child CLI spawns with an empty env and fails to locate its runtime.
   const env: NodeJS.ProcessEnv = { ...process.env };
+  Object.assign(env, ALWAYS_ON_SDK_ENV);
   if (useGateway && litellm) {
     env.ANTHROPIC_BASE_URL = litellm.baseUrl;
     // Never forward a direct Anthropic credential inherited by the daemon to

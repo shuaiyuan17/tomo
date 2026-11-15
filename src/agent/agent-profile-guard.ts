@@ -114,6 +114,10 @@ export function agentProfileGuardHooks(
   const warnedTypes = new Set<string>();
   return {
     PreToolUse: [{
+      // Fail CLOSED: by default a callback that throws lets the tool call through
+      // (and under bypassPermissions nothing else stops it). A security guard
+      // must deny instead, so a crash here blocks the call.
+      onFailure: "block" as const,
       hooks: [async (input: AgentHookInput) => {
         if (!input.agent_id) return {};
         const agentType = input.agent_type ?? RESERVED_AGENT_TYPE;

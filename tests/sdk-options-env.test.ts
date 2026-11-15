@@ -29,11 +29,50 @@ describe("sdkOptions session env", () => {
     mockConfig.lcm.groupCompactStyle = "lcm";
   });
 
-  it("leaves the env untouched when there is no session context", () => {
+  it("passes the daemon env through when there is no session context", () => {
     resetConfig();
-    const opts = sdkOptions(internalServer);
-    expect(opts.env).toBeUndefined();
+    process.env.TOMO_TEST_PASSTHROUGH = "yes";
+    try {
+      const opts = sdkOptions(internalServer);
+      expect(opts.env?.TOMO_TEST_PASSTHROUGH).toBe("yes");
+    } finally {
+      delete process.env.TOMO_TEST_PASSTHROUGH;
+    }
   });
+});
+
+/**
+ * `@path` mentions are expanded by the CLI with no tool call, so the PreToolUse
+ * private-memory guard cannot see them. CLAUDE_CODE_DISABLE_FILE_MENTIONS must
+ * reach EVERY SDK child — including the branch that used to return no env at
+ * all (no session context, subscription auth, no gateway).
+ */
+describe("sdkOptions disables @file mentions", () => {
+  const cases: Array<[string, () => ReturnType<typeof sdkOptions>]> = [
+    ["no session context", () => sdkOptions(internalServer)],
+    ["DM session", () => sdkOptions(internalServer, undefined, undefined, { sessionKey: "dm:shuai" })],
+    ["group session", () => sdkOptions(internalServer, undefined, undefined, { sessionKey: "telegram:-100123" })],
+    ["api-key auth", () => {
+      mockConfig.auth = { ...mockConfig.auth, method: "api-key", apiKey: "sk-test" } as typeof mockConfig.auth;
+      return sdkOptions(internalServer);
+    }],
+    ["LiteLLM gateway", () => {
+      mockConfig.litellm = { mode: "anthropic-compatible", baseUrl: "http://127.0.0.1:4000", apiKey: "gw" };
+      return sdkOptions(internalServer);
+    }],
+  ];
+  for (const [label, build] of cases) {
+    it(`sets CLAUDE_CODE_DISABLE_FILE_MENTIONS=1 (${label})`, () => {
+      resetConfig();
+      const opts = build();
+      try {
+        expect(opts.env?.CLAUDE_CODE_DISABLE_FILE_MENTIONS).toBe("1");
+      } finally {
+        mockConfig.litellm = null;
+        resetConfig();
+      }
+    });
+  }
 });
 
 /**

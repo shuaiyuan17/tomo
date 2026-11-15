@@ -40,6 +40,29 @@ describe("buildHooksOption — the two PreToolUse guards coexist", () => {
     expect(hooks.PostToolBatch).toHaveLength(1);
   });
 
+  // FAIL CLOSED. A matcher without `onFailure` defaults to "continue": a guard
+  // callback that throws lets the tool call through, and under
+  // bypassPermissions nothing else stops it. Every security guard must say
+  // "block"; the bookkeeping hooks (turn budget, undelivered nudge) must not,
+  // since a crash there should never cost the user a tool call.
+  it("every PreToolUse guard fails closed; the bookkeeping hooks do not", () => {
+    const { hooks } = buildHooksOption({
+      turnBudget: makeTurnBudget(),
+      maxTurns: 50,
+      sessionKey: "telegram:-100123",
+      privateMemoryBar: () => "group-session",
+      agentProfile: () => undefined,
+      undeliveredReply: () => false,
+    }) as { hooks: Record<string, Array<{ onFailure?: string }>> };
+
+    expect(hooks.PreToolUse).toHaveLength(2);
+    for (const entry of hooks.PreToolUse) expect(entry.onFailure).toBe("block");
+    for (const [event, entries] of Object.entries(hooks)) {
+      if (event === "PreToolUse") continue;
+      for (const entry of entries) expect(entry.onFailure).toBeUndefined();
+    }
+  });
+
   it("installs neither guard when neither is asked for", () => {
     const { hooks } = buildHooksOption({ turnBudget: makeTurnBudget(), maxTurns: 50 }) as {
       hooks: Record<string, unknown[]>;

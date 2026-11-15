@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, beforeEach, describe, it, expect, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, it, expect, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -33,9 +33,12 @@ vi.mock("../src/logger.js", () => ({
 // `tests/bash-sandbox.test.ts` exercises the real wrap, kernel included.
 // `wrap` returning null is the fail-closed path: every reason the sandbox can be
 // unavailable arrives at the hook as exactly that.
-const sandbox = { wrap: (cmd: string): string | null => `SANDBOXED:${cmd}` };
+const sandbox = { wrap: (cmd: string): string | null => `SANDBOXED:${cmd}`, denyDirs: [] as readonly string[] };
 vi.mock("../src/agent/bash-sandbox.js", () => ({
-  sandboxedBashCommand: (cmd: string) => sandbox.wrap(cmd),
+  sandboxedBashCommand: (cmd: string, _p?: string, _s?: unknown, _w?: unknown, denyDirs: readonly string[] = []) => {
+    sandbox.denyDirs = denyDirs;
+    return sandbox.wrap(cmd);
+  },
 }));
 
 const { log } = await import("../src/logger.js");
@@ -53,6 +56,8 @@ const {
   PRIVATE_MEMORY_SUMMONED_DENIAL,
 } = await import("../src/agent/permissions.js");
 const { MIXED_AUDIENCE_KEY } = await import("../src/agent/audience.js");
+const { harnessDataDenialReason, isPrivateAttachmentPath } = await import("../src/agent/private-memory-guard.js");
+const { config } = await import("../src/config.js");
 
 const ctx = {
   cwd: "/ws",
@@ -356,6 +361,56 @@ function decision(result: PreToolUseResult): string | undefined {
  *  null and nothing else should inherit that. */
 beforeEach(() => {
   sandbox.wrap = (cmd: string) => `SANDBOXED:${cmd}`;
+});
+
+describe("privateMemoryGuardHooks — Tomo's data/ on a barred turn", () => {
+  const cfg = config as unknown as { tomoHome?: string; sessionsDir?: string };
+  beforeEach(() => { cfg.tomoHome = "/th"; cfg.sessionsDir = "/th/data/sessions"; });
+  afterEach(() => { delete cfg.tomoHome; delete cfg.sessionsDir; });
+
+  const DATA_CALLS = [
+    { tool_name: "Read", tool_input: { file_path: "/th/data/usage/2026-11.ndjson" } },
+    { tool_name: "Read", tool_input: { file_path: "/th/data/inbox.jsonl" } },
+    { tool_name: "Read", tool_input: { file_path: "/th/data/sessions/dm_owner.jsonl" } },
+    { tool_name: "Read", tool_input: { file_path: "/th/workspace/../data/usage/2026-11.ndjson" } },
+    { tool_name: "Write", tool_input: { file_path: "/th/data/usage/2026-11.ndjson", content: "x" } },
+    { tool_name: "Grep", tool_input: { pattern: "trigger", path: "/th/data" } },
+    { tool_name: "Grep", tool_input: { pattern: "trigger", path: "/th" } },
+    { tool_name: "Glob", tool_input: { pattern: "/th/data/**/*.ndjson" } },
+    { tool_name: "Glob", tool_input: { path: "/th/data/usage", pattern: "*" } },
+    { tool_name: "Glob", tool_input: { pattern: "/th/*/usage/*.ndjson" } },
+    { tool_name: "Grep", tool_input: { pattern: "trigger", path: "/tmp", glob: "/th/data/usage/*.ndjson" } },
+    { tool_name: SEND_MESSAGE_TOOL, tool_input: { target: "owner", message: "MEDIA:/th/data/usage/2026-11.ndjson" } },
+  ];
+
+  for (const bar of ["group-session", "summoned-turn"] as const) {
+    it(`denies file tools reaching it (${bar})`, async () => {
+      const hook = hookFor(() => bar);
+      for (const call of DATA_CALLS) {
+        const result = await hook({ ...call, tool_input: { ...call.tool_input } });
+        expect(decision(result), JSON.stringify(call)).toBe("deny");
+        expect(result.hookSpecificOutput?.permissionDecisionReason).toBe(harnessDataDenialReason(bar));
+      }
+    });
+  }
+
+  it("hands the data dirs to the Bash sandbox as read+write denies", async () => {
+    const result = await hookFor(() => "group-session")(INNOCUOUS_BASH);
+    expect(result.hookSpecificOutput?.updatedInput).toBeDefined();
+    expect(sandbox.denyDirs).toEqual(["/th/data", "/th/data/sessions"]);
+  });
+
+  it("leaves the workspace and the owner's own turn alone", async () => {
+    expect(await hookFor(() => "group-session")(PUBLIC_READ)).toEqual({});
+    expect(await hookFor(() => "group-session")({ tool_name: "Grep", tool_input: { pattern: "x", path: "/ws/notes" } })).toEqual({});
+    expect(await hookFor(() => "group-session")({ tool_name: "Glob", tool_input: { pattern: "/ws/notes/**/*.md" } })).toEqual({});
+    for (const call of DATA_CALLS) expect(await hookFor(() => null)(call)).toEqual({});
+  });
+
+  it("refuses a reply attachment from it", () => {
+    expect(isPrivateAttachmentPath("/th/data/usage/2026-11.ndjson")).toBe(true);
+    expect(isPrivateAttachmentPath("/ws/notes/photo.png")).toBe(false);
+  });
 });
 
 describe("privateMemoryGuardHooks", () => {

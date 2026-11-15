@@ -88,12 +88,19 @@ export const SANDBOX_SHELL_PATH = "/bin/zsh";
  * what makes `ls memory/private` and `mv memory/private …` fail and not only
  * `cat memory/private/x`.
  */
-export function sandboxProfileText(denyDir: string, writeDenyDirs: readonly string[] = []): string {
+export function sandboxProfileText(
+  denyDir: string,
+  writeDenyDirs: readonly string[] = [],
+  /** Further directories denied for reads AND writes, like `denyDir` (Tomo's own `data/`). */
+  extraDenyDirs: readonly string[] = [],
+): string {
   return [
     "(version 1)",
     "(allow default)",
-    `(deny file-read* (subpath ${sandboxLiteral(denyDir)}))`,
-    `(deny file-write* (subpath ${sandboxLiteral(denyDir)}))`,
+    ...[denyDir, ...extraDenyDirs].flatMap((dir) => [
+      `(deny file-read* (subpath ${sandboxLiteral(dir)}))`,
+      `(deny file-write* (subpath ${sandboxLiteral(dir)}))`,
+    ]),
     // Directories the shell may read but not change (Tomo's home).
     ...writeDenyDirs.map((dir) => `(deny file-write* (subpath ${sandboxLiteral(dir)}))`),
     "",
@@ -345,6 +352,9 @@ export function sandboxedBashCommand(
   scan?: { settingsFiles: readonly string[]; pluginDirs: readonly string[] },
   /** Denied for writes only, each resolved like `privateDir` (Tomo's home by default). */
   writeOnlyDirs: readonly string[] = [HOME_SCENE_DIR],
+  /** Denied for reads and writes like `privateDir`, each resolved the same way
+   *  and failing closed the same way (the guard passes Tomo's `data/`). */
+  denyDirs: readonly string[] = [],
 ): string | null {
   if (!existsSync(SANDBOX_EXEC_PATH)) return warnOnce("sandbox-exec is not present on this host");
   if (!existsSync(SANDBOX_SHELL_PATH)) return warnOnce(`${SANDBOX_SHELL_PATH} is not present on this host`);
@@ -367,8 +377,14 @@ export function sandboxedBashCommand(
     if (resolved === null) return warnOnce(`cannot resolve the real path of ${dir}, so writes under it cannot be denied`);
     writeDeny.push(resolved);
   }
+  const extraDeny: string[] = [];
+  for (const dir of denyDirs) {
+    const resolved = resolvedDenyDir(dir);
+    if (resolved === null) return warnOnce(`cannot resolve the real path of ${dir}, so its subpath cannot be denied`);
+    extraDeny.push(resolved);
+  }
   try {
-    return wrapWithSandbox(command, sandboxProfileText(denyDir, writeDeny));
+    return wrapWithSandbox(command, sandboxProfileText(denyDir, writeDeny, extraDeny));
   } catch {
     return warnOnce("could not build the sandboxed command");
   }

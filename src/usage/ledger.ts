@@ -1,7 +1,10 @@
+import { chmod } from "node:fs/promises";
 import { join } from "node:path";
 import { log } from "../logger.js";
+import { scrubSecretValues } from "../redact.js";
 import { appendLineSerial } from "./append.js";
 import type { ModelTurnUsage } from "../agent/sdk-result.js";
+import type { UsageBaseline } from "../sessions/types.js";
 import { parseTomoEvent } from "../tomo-event.js";
 
 /**
@@ -95,10 +98,14 @@ export const TRIGGER_MAX_CHARS = 80;
 /**
  * The first TRIGGER_MAX_CHARS characters of a turn's prompt, for "the most
  * expensive turns". A harness envelope (`<tomo-event>`) is unwrapped to its
- * body so a cron turn reads as its task, not as markup.
+ * body so a cron turn reads as its task, not as markup. Credentials are
+ * scrubbed (`scrubSecretValues`): the ledger holds every session's snippets,
+ * DMs included, in one file.
  */
 export function triggerSnippet(prompt: string): string | undefined {
-  const text = (parseTomoEvent(prompt)?.body ?? prompt).replace(/\s+/g, " ").trim();
+  // Scrubbed BEFORE clipping: a credential cut in half at the 80th character
+  // no longer has the shape the scrubber recognises.
+  const text = scrubSecretValues((parseTomoEvent(prompt)?.body ?? prompt).replace(/\s+/g, " ").trim());
   if (!text) return undefined;
   const chars = Array.from(text);
   return chars.length > TRIGGER_MAX_CHARS ? chars.slice(0, TRIGGER_MAX_CHARS).join("") : text;
@@ -110,11 +117,24 @@ export function ledgerFileName(ts: number): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}.ndjson`;
 }
 
-export type UsageRecorder = (row: UsageLedgerRow) => void;
+/** Owner-only: the ledger mixes every session's trigger snippets. */
+export const LEDGER_FILE_MODE = 0o600;
+export const LEDGER_DIR_MODE = 0o700;
+
+/**
+ * Called once per SDK result with its ledger row and the cumulative baseline
+ * the next resume must start from (`null`: drop it; see QueryResult). The two
+ * travel together so the baseline is persisted with every row written: a
+ * result whose row was written but whose baseline was not would be charged
+ * again by the first turn after a resume.
+ */
+export type UsageRecorder = (row: UsageLedgerRow, baseline: UsageBaseline | null) => void;
 
 export class UsageLedger {
   /** After a failure, warn once until a write succeeds again. */
   private failing = false;
+  /** The directory's mode has been tightened (it may predate the ledger). */
+  private dirSecured = false;
   /** Appends not yet settled (see idle). */
   private readonly pending = new Set<Promise<void>>();
 
@@ -133,11 +153,33 @@ export class UsageLedger {
       this.warn(err, row);
       return Promise.resolve();
     }
-    const write = appendLineSerial(join(this.dir, ledgerFileName(row.ts)), () => line, () => { this.failing = false; })
+    const path = join(this.dir, ledgerFileName(row.ts));
+    const write = appendLineSerial(path, () => line, () => { this.failing = false; }, {
+      fileMode: LEDGER_FILE_MODE,
+      dirMode: LEDGER_DIR_MODE,
+    })
+      .then(() => this.secure(path))
       .then(() => undefined, (err: unknown) => this.warn(err, row));
     this.pending.add(write);
     void write.finally(() => this.pending.delete(write));
     return write;
+  }
+
+  /**
+   * Creation modes do not touch what already exists: the usage directory is
+   * shared with limits-log and may have been made 0755 before the ledger, and
+   * a month file from an older build may be 0644. Tighten both, once each.
+   */
+  private secured = new Set<string>();
+  private async secure(path: string): Promise<void> {
+    if (!this.dirSecured) {
+      await chmod(this.dir, LEDGER_DIR_MODE);
+      this.dirSecured = true;
+    }
+    if (!this.secured.has(path)) {
+      await chmod(path, LEDGER_FILE_MODE);
+      this.secured.add(path);
+    }
   }
 
   /** Resolves once every row appended so far has landed (or failed). Shutdown waits on it. */

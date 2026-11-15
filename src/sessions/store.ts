@@ -862,15 +862,24 @@ export class SessionStore {
       // bookkeeping write is skipped, the turn's cost was not recorded either,
       // and the older baseline correctly charges it on the next resume. Only
       // stored against the SDK session it was measured on.
-      if (update.usageBaseline !== undefined) {
-        if (update.usageBaseline && update.usageBaseline.sdkSessionId === entry.sdkSessionId) {
-          entry.usageBaseline = update.usageBaseline;
-        } else {
-          delete entry.usageBaseline;
-        }
-      }
+      if (update.usageBaseline !== undefined) applyUsageBaseline(entry, update.usageBaseline);
       entry.lastActiveAt = Date.now();
       this.saveRegistryBestEffort("updateStats");
+    });
+  }
+
+  /**
+   * Persist the usage baseline an SDK result advanced to, without touching
+   * stats — for every result, as its usage-ledger row is written (see
+   * Agent.recordResultUsage). `null` drops the stored baseline. Bookkeeping:
+   * a skipped write leaves the older baseline, which undercharges nothing.
+   */
+  setUsageBaseline(key: string, baseline: UsageBaseline | null): void {
+    this.mutateRegistry("setUsageBaseline", "bookkeeping", () => {
+      const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+      if (!entry) return;
+      applyUsageBaseline(entry, baseline);
+      this.saveRegistryBestEffort("setUsageBaseline");
     });
   }
 
@@ -3552,4 +3561,10 @@ export class SessionStore {
       "Transcript rotated: prior months moved to archive files",
     );
   }
+}
+
+/** Only stored against the SDK session it was measured on; anything else drops it. */
+function applyUsageBaseline(entry: SessionEntry, baseline: UsageBaseline | null): void {
+  if (baseline && baseline.sdkSessionId === entry.sdkSessionId) entry.usageBaseline = baseline;
+  else delete entry.usageBaseline;
 }

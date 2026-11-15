@@ -1025,7 +1025,7 @@ export class LiveSession {
         models,
         noBaseline,
       } = this.turnUsage(result);
-      this.appendUsageRow(result, turnCost, { input, output, cacheRead, cacheCreated }, models, noBaseline);
+      this.recordResultUsage(result, turnCost, { input, output, cacheRead, cacheCreated }, models, noBaseline, baseline);
 
       // A NON-SUCCESS RESULT IS STILL THE END OF THE TURN — but not a
       // successful one. `subtype` names why the CLI stopped early (max turns,
@@ -1453,16 +1453,25 @@ export class LiveSession {
   }
 
   /**
-   * One usage-ledger row for this result. Attribution comes from the request
-   * that owns the turn; a turn the CLI started itself has none ("background").
-   * Bookkeeping: whatever goes wrong here, the turn goes on.
+   * One usage-ledger row for this result, handed over WITH the baseline this
+   * result advanced the in-memory counters to, for the host to persist in the
+   * same step. Every result goes through here — including the turns the CLI
+   * starts itself, which never reach the manager's turn-completion
+   * bookkeeping: before, such a turn advanced the counters in memory only, so
+   * the first turn after a rebuild differenced against the older persisted
+   * baseline and charged that turn a second time.
+   *
+   * Attribution comes from the request that owns the turn; a turn the CLI
+   * started itself has none ("background"). Bookkeeping: whatever goes wrong
+   * here, the turn goes on.
    */
-  private appendUsageRow(
+  private recordResultUsage(
     result: SdkResultLike,
     costUsd: number,
     tokens: TokenTotals,
     models: Record<string, ModelTurnUsage> | undefined,
     noBaseline: boolean,
+    baseline: UsageBaseline | null,
   ): void {
     if (!this.recordUsage || !this.sessionKey) return;
     try {
@@ -1486,7 +1495,7 @@ export class LiveSession {
         ...(result.num_turns !== undefined ? { numTurns: result.num_turns } : {}),
         ...(noBaseline ? { noBaseline: true as const } : {}),
         ...(models ? { models } : {}),
-      });
+      }, baseline);
     } catch (err) {
       log.warn({ err, session: this.sessionKey }, "Usage ledger row failed; turn unaffected");
     }

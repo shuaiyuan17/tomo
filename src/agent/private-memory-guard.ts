@@ -5,8 +5,9 @@ import { HOME_SCENE_DIR, MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR }
 import { sandboxedBashCommand } from "./bash-sandbox.js";
 import { MIXED_AUDIENCE_KEY } from "./audience.js";
 import { loadedSettingsFiles } from "./setting-sources.js";
-import { isHomeWrite, isPrivateMemoryAccess, SEND_MESSAGE_TOOL } from "./private-memory-access.js";
-export { isHomeWrite, isPrivateMemoryAccess, SEND_MESSAGE_TOOL };
+import { isHarnessDataAccess, isHomeWrite, isPrivateMemoryAccess, SEND_MESSAGE_TOOL } from "./private-memory-access.js";
+export { isHarnessDataAccess, isHomeWrite, isPrivateMemoryAccess, SEND_MESSAGE_TOOL };
+import { join } from "node:path";
 import { landsInPrivate } from "./private-memory-reach.js";
 import { expandTilde } from "./bash-write-targets.js";
 
@@ -59,6 +60,25 @@ export const PRIVATE_MEMORY_GROUP_DENIAL =
  */
 export const PRIVATE_MEMORY_SUMMONED_DENIAL =
   `\`memory/${PRIVATE_MEMORY_SUBDIR}/\` is unavailable during a summoned turn. This turn's messages come from a group summoned into this session (or span several audiences), so the owner's private memory is not readable from it — the session key says "private DM", but a group is steering. Scans rooted at \`memory/\` are blocked for the same reason: use Read on a specific public memory file, or ask again in the owner's own DM (\`/dismiss\` ends the summon).`;
+
+/**
+ * Tomo's own state directories, barred on a barred turn: `<tomoHome>/data/`
+ * and the sessions dir (normally inside it, but relocatable). Everything the
+ * harness keeps about every conversation lives there.
+ */
+export function harnessDataDirs(): string[] {
+  const dirs = new Set<string>();
+  if (config.tomoHome) dirs.add(join(config.tomoHome, "data"));
+  if (config.sessionsDir) dirs.add(config.sessionsDir);
+  return [...dirs];
+}
+
+/** Denial text for a file-tool call into Tomo's `data/` on a barred turn. */
+export function harnessDataDenialReason(bar: PrivateMemoryBar): string {
+  return `Tomo's own state directory (\`~/.tomo/data/\`: transcripts, the inbox, the usage ledger) is not readable or writable ${bar === "group-session"
+    ? "from a group session"
+    : "during a summoned turn (a group is steering this session)"}. It holds every conversation, the owner's DMs included; use the tools for what you need from it.`;
+}
 
 export function privateMemoryDenialReason(bar: PrivateMemoryBar): string {
   return bar === "group-session" ? PRIVATE_MEMORY_GROUP_DENIAL : PRIVATE_MEMORY_SUMMONED_DENIAL;
@@ -185,6 +205,7 @@ export function privateMemoryGuardHooks(
 ) {
   const ctx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, privateDir: PRIVATE_MEMORY_DIR };
   const homeCtx = { cwd: config.workspaceDir, homeDir: HOME_SCENE_DIR };
+  const dataCtx = { cwd: config.workspaceDir, dataDirs: harnessDataDirs() };
   // The settings files the query actually loads, so the Bash arm can refuse when
   // one of them carries a PreToolUse hook that could undo the sandbox rewrite.
   // Derived from the same constant the query option uses (setting-sources.ts) —
@@ -233,7 +254,7 @@ export function privateMemoryGuardHooks(
           const sandboxed = sandboxedBashInput(input.tool_input, {
             settingsFiles,
             pluginDirs: pluginDirs(),
-          });
+          }, dataCtx.dataDirs);
           if (sandboxed) {
             log.info(
               { key: sessionKey, tool: input.tool_name, bar: reason },
@@ -247,6 +268,17 @@ export function privateMemoryGuardHooks(
             };
           }
         } else if (!isPrivateMemoryAccess(input.tool_name, input.tool_input, ctx)) {
+          // The third barred directory, reads and writes: Tomo's own data/.
+          if (isHarnessDataAccess(input.tool_name, input.tool_input, dataCtx)) {
+            log.warn({ key: sessionKey, tool: input.tool_name, bar: reason }, "Blocked access to Tomo's data directory on a private-memory-barred turn");
+            return {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse" as const,
+                permissionDecision: "deny" as const,
+                permissionDecisionReason: harnessDataDenialReason(reason),
+              },
+            };
+          }
           // The second barred directory, write-only: Tomo's home.
           if (!isHomeWrite(input.tool_name, input.tool_input, homeCtx)) return {};
           log.warn({ key: sessionKey, tool: input.tool_name, bar: reason }, "Blocked a write to the home on a private-memory-barred turn");
@@ -327,11 +359,13 @@ export function sandboxedBashInput(
   // refactor drop the scan and leave the suite green; a required one makes
   // that a type error.
   scan: { settingsFiles: readonly string[]; pluginDirs: readonly string[] },
+  /** Denied for reads and writes besides private memory (Tomo's data/). Required for the same reason. */
+  denyDirs: readonly string[],
 ): Record<string, unknown> | null {
   if (!toolInput || typeof toolInput !== "object") return null;
   const ti = toolInput as Record<string, unknown>;
   if (typeof ti.command !== "string") return null;
-  const command = sandboxedBashCommand(ti.command, undefined, scan);
+  const command = sandboxedBashCommand(ti.command, undefined, scan, undefined, denyDirs);
   return command === null ? null : { ...ti, command };
 }
 
@@ -389,9 +423,8 @@ export function isPrivateAttachmentPath(p: string): boolean {
   // `~` expanded first: `path.resolve` does not, so `~/.tomo/workspace/memory/
   // private/x` resolved to `<ws>/~/.tomo/…` and passed — while the iMessage
   // sticker sender expands it and opens the real file.
-  return landsInPrivate(expandTilde(p), {
-    cwd: config.workspaceDir,
-    memoryDir: MEMORY_DIR,
-    privateDir: PRIVATE_MEMORY_DIR,
-  });
+  const path = expandTilde(p);
+  if (landsInPrivate(path, { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, privateDir: PRIVATE_MEMORY_DIR })) return true;
+  // Tomo's data/ is barred the same way (transcripts, the usage ledger).
+  return harnessDataDirs().some((dir) => landsInPrivate(path, { cwd: config.workspaceDir, memoryDir: dir, privateDir: dir }));
 }

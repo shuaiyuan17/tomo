@@ -2,7 +2,7 @@ import type { Channel, IncomingMessage, MessageReaction, StopTyping, StopTypingO
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
-import type { ReplyTarget, SessionMessage } from "./sessions/types.js";
+import type { ReplyTarget, SessionMessage, UsageBaseline } from "./sessions/types.js";
 import {
   isGroupSessionKey,
   isDmSessionKey,
@@ -50,7 +50,7 @@ import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/bl
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { appendToTomoEventBody, formatTomoEvent } from "./tomo-event.js";
-import { UsageLedger, triggerSnippet, type UsageSource } from "./usage/ledger.js";
+import { UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
 import { usageDataDir } from "./usage/dir.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
@@ -331,7 +331,7 @@ export class Agent {
           ...(result.contextEstimated ? { contextEstimated: true } : {}),
         });
       },
-      recordUsage: (row) => { void this.usageLedger.append(row); },
+      recordUsage: (key, row, baseline) => this.recordResultUsage(key, row, baseline),
       getSessionMessages: (key) => this.sessions.get(key).messages,
       getModelOverride: (key) => this.modelOverrides.get(key),
       createInternalMcpServer: (key) => createTomoInternalMcpServer(this, key),
@@ -1134,6 +1134,17 @@ export class Agent {
     }
 
     return { channel, chatId: target.chatId };
+  }
+
+  /**
+   * One SDK result's bookkeeping that must not be split: the ledger row, and
+   * the usage baseline the result advanced to. A row written without its
+   * baseline (a background turn, which never reaches recordTurnCompletion)
+   * is charged again by the first turn after the session is rebuilt.
+   */
+  private recordResultUsage(key: string, row: UsageLedgerRow, baseline: UsageBaseline | null): void {
+    void this.usageLedger.append(row);
+    this.sessions.setUsageBaseline(key, baseline);
   }
 
   private createUnownedTurnRequest(key: string): TurnRequest | undefined {

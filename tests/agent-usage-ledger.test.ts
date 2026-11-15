@@ -67,3 +67,43 @@ describe("usage ledger (agent wiring)", () => {
     for (const r of rows) expect(r).toMatchObject({ costUsd: expect.any(Number), tokens: expect.any(Object) });
   });
 });
+
+describe("usage ledger and the resume baseline", () => {
+  it("a background turn's baseline is persisted with its row, so a rebuilt session does not charge it again", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const key = "telegram:12345";
+    const models = (n: number) => ({
+      "claude-opus": { inputTokens: 10 * n, outputTokens: 5 * n, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, webSearchRequests: 0, costUSD: 0.25 * n },
+    });
+
+    // 1. An owner turn: the SDK's running total is $1.00.
+    mockSdk.responseFn = () => "hello";
+    mockSdk.nextResult = { total_cost_usd: 1.0, modelUsage: models(4) };
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "hi" }));
+    await drainQueue(agent);
+
+    // 2. The CLI starts a turn itself (a background task reported): +$0.50.
+    mockSdk.nextResult = { total_cost_usd: 1.5, modelUsage: models(6) };
+    mockSdk.queryControllers[0].pushTaskNotificationTurn("the review finished");
+    await waitFor(() => expect(ledgerRows()).toHaveLength(2));
+
+    // 3. The live session is rebuilt (compact reload, model switch, restart)
+    //    and resumes the same SDK session, whose totals carry everything.
+    (agent as unknown as { liveSessionManager: { closeLiveSession(k: string): void } }).liveSessionManager.closeLiveSession(key);
+    mockSdk.responseFn = () => "again";
+    mockSdk.nextResult = { total_cost_usd: 1.75, modelUsage: models(7) };
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "and now?" }));
+    await drainQueue(agent);
+    await agent.stop();
+
+    expect(mockSdk.queryControllers.length).toBeGreaterThanOrEqual(2);
+    const rows = ledgerRows();
+    expect(rows.map((r) => r.source)).toEqual(["owner", "background", "owner"]);
+    expect(rows.map((r) => r.costUsd)).toEqual([1.0, 0.5, 0.25]);
+    expect(rows[2].models).toEqual({ "claude-opus": { input: 10, output: 5, cacheRead: 0, cacheCreated: 0, webSearch: 0, costUsd: 0.25 } });
+    // Together they add up to the SDK's own total: nothing charged twice.
+    expect(rows.reduce((sum, r) => sum + (r.costUsd as number), 0)).toBe(1.75);
+  });
+});

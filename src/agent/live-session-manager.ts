@@ -117,8 +117,12 @@ export interface LiveSessionManagerDeps {
    */
   getUsageBaseline(key: string): UsageBaseline | undefined;
   updateStats(key: string, result: QueryResult): void;
-  /** Append one SDK result to the usage ledger (`usage/ledger.ts`). */
-  recordUsage?(row: UsageLedgerRow): void;
+  /**
+   * One SDK result: append its row to the usage ledger (`usage/ledger.ts`)
+   * AND persist the usage baseline it advanced to, in one step (see
+   * UsageRecorder). Called for every result, background turns included.
+   */
+  recordUsage?(key: string, row: UsageLedgerRow, baseline: UsageBaseline | null): void;
   /** Transcript messages for pre-resume repair. */
   getSessionMessages(key: string): SessionMessage[];
   /** Per-session model override, if any. */
@@ -550,7 +554,7 @@ export class LiveSessionManager {
         this.deps.handleToolResult?.(key, toolName, content, isError);
       },
       ...(resumeId ? { resumeFrom: { sdkSessionId: resumeId, baseline: this.deps.getUsageBaseline(key) } } : {}),
-      ...(this.deps.recordUsage ? { recordUsage: (row: UsageLedgerRow) => this.deps.recordUsage?.(row) } : {}),
+      ...(this.deps.recordUsage ? { recordUsage: (row: UsageLedgerRow, baseline: UsageBaseline | null) => this.deps.recordUsage?.(key, row, baseline) } : {}),
     });
     // RE-CHECKED AFTER THE AWAIT, NOT ONLY BEFORE IT. `buildExternalMcpServers`
     // yields — it can spend real time on OAuth — and stop() may have run its

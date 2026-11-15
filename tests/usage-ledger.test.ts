@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -66,6 +66,25 @@ describe("UsageLedger", () => {
     expect(parsed.every((r, i) => r.trigger === String(i % 10).repeat(80))).toBe(true);
   });
 
+  it("keeps the ledger owner-only: files 0600, the directory 0700, even when either already existed wider", async () => {
+    const usageDir = join(dir, "usage");
+    const ts = new Date(2026, 10, 15).getTime();
+    await new UsageLedger(usageDir).append(row(ts));
+    const mode = (p: string) => statSync(p).mode & 0o777;
+    expect(mode(usageDir)).toBe(0o700);
+    expect(mode(join(usageDir, ledgerFileName(ts)))).toBe(0o600);
+
+    // A directory limits-log made first, and a month file from an older build.
+    const wider = join(dir, "wider");
+    mkdirSync(wider, { mode: 0o755 });
+    chmodSync(wider, 0o755);
+    writeFileSync(join(wider, ledgerFileName(ts)), "", { mode: 0o644 });
+    chmodSync(join(wider, ledgerFileName(ts)), 0o644);
+    await new UsageLedger(wider).append(row(ts));
+    expect(mode(wider)).toBe(0o700);
+    expect(mode(join(wider, ledgerFileName(ts)))).toBe(0o600);
+  });
+
   it("swallows a write failure with one warn per streak, and recovers once the path is writable again", async () => {
     // A FILE where the directory should be: every write fails.
     const usageDir = join(dir, "usage");
@@ -117,6 +136,23 @@ describe("usage attribution", () => {
     expect(triggerSnippet(long)).toBe("字".repeat(TRIGGER_MAX_CHARS));
     const cron = formatTomoEvent("cron", 'Scheduled task "Digest" triggered. Summarise the inbox', { name: "Digest" });
     expect(triggerSnippet(cron)).toBe('Scheduled task "Digest" triggered. Summarise the inbox');
+  });
+
+  it("scrubs credentials out of the trigger before clipping it", () => {
+    for (const [prompt, secret] of [
+      ["use sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx to call it", "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx"],
+      ["curl -H 'Authorization: Bearer abcDEF1234567890xyz' https://x", "abcDEF1234567890xyz"],
+      ["the wifi password=Sup3rSecretPass please", "Sup3rSecretPass"],
+      ["token: ghp_abcdefghijklmnopqrstuvwxyz0123456789", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"],
+    ] as const) {
+      const snippet = triggerSnippet(prompt)!;
+      expect(snippet).not.toContain(secret);
+      expect(snippet).toContain("***");
+    }
+    // A key that straddles the 80-character cut is still caught whole.
+    const straddling = `${"x ".repeat(36)}sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWx`;
+    expect(triggerSnippet(straddling)).not.toContain("sk-ant-api03-AbCd");
+    expect(triggerSnippet("an ordinary message")).toBe("an ordinary message");
   });
 
   it("derives the source from the ingress path when the spec names none", () => {

@@ -1,6 +1,8 @@
 import { extractAttachments } from "./text-utils.js";
 import { landsInPrivate, globReachesPrivate, grepReachesPrivate, bashTouchesMemory } from "./private-memory-reach.js";
 import { expandTilde } from "./bash-write-targets.js";
+import { isAbsolute } from "node:path";
+import { foldPath, isInside } from "./permission-paths.js";
 
 /*
  * The #464 private-memory predicate for one tool call, in a module free of
@@ -56,6 +58,43 @@ export function isHomeWrite(toolName: string, toolInput: unknown, ctx: { cwd: st
   const p = toolName === "NotebookEdit" ? ti.notebook_path : ti.file_path;
   if (typeof p !== "string") return false;
   return landsInPrivate(p, { cwd: ctx.cwd, memoryDir: ctx.homeDir, privateDir: ctx.homeDir });
+}
+
+/**
+ * Would this tool call reach one of `dataDirs` — Tomo's own state under
+ * `~/.tomo/data/` (session transcripts, the inbox, the usage ledger, running
+ * agents, …)? Barred for reads AND writes on a barred turn, like private
+ * memory: those files hold every conversation's content, DMs included, and a
+ * group gets what it needs from them through harness tools, never by reading
+ * them. Same predicates as private memory, with each data dir as both the
+ * tree and the barred dir (so a scan rooted at or above it is refused, and any
+ * `..` under it). Bash is the sandbox profile's job and is not decided here.
+ */
+export function isHarnessDataAccess(
+  toolName: string,
+  toolInput: unknown,
+  ctx: { cwd: string; dataDirs: readonly string[] },
+): boolean {
+  if (toolName === "Bash") return false;
+  if (ctx.dataDirs.some((dir) => isPrivateMemoryAccess(toolName, toolInput, { cwd: ctx.cwd, memoryDir: dir, privateDir: dir }))) {
+    return true;
+  }
+  // An ABSOLUTE Glob pattern / Grep filter anchors itself wherever the root
+  // is, and the probe paths above cannot model every suffix it might ask for
+  // (`/…/data/**/*.ndjson` matches no `probe.md`). For data/ the rule is
+  // blunter: refuse when the pattern's literal prefix is inside a data dir,
+  // or is a string prefix of one (it can still widen into it).
+  if (toolName !== "Glob" && toolName !== "Grep") return false;
+  const ti = toolInput as Record<string, unknown>;
+  const pattern = toolName === "Glob" ? ti.pattern : ti.glob;
+  if (typeof pattern !== "string") return false;
+  const spelled = expandTilde(pattern);
+  if (!isAbsolute(spelled)) return false;
+  const literal = foldPath(spelled.split(/[*?[{]/, 1)[0]);
+  return ctx.dataDirs.some((dir) => {
+    const folded = foldPath(dir);
+    return isInside(literal, folded) || folded.startsWith(literal);
+  });
 }
 
 export function isPrivateMemoryAccess(

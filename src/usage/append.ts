@@ -14,12 +14,24 @@ const chains = new Map<string, Promise<unknown>>();
  * always what the file says. Resolves true once written, false when skipped;
  * rejects on a failed write (the chain itself carries on).
  */
-export function appendLineSerial(path: string, line: () => string | undefined, onWritten?: () => void): Promise<boolean> {
+export interface AppendModes {
+  /** Mode for a file this append creates (an existing file keeps its own). */
+  fileMode?: number;
+  /** Mode for directories this append creates. */
+  dirMode?: number;
+}
+
+export function appendLineSerial(
+  path: string,
+  line: () => string | undefined,
+  onWritten?: () => void,
+  modes: AppendModes = {},
+): Promise<boolean> {
   const run = (chains.get(path) ?? Promise.resolve()).catch(() => undefined).then(async () => {
     const text = line();
     if (text === undefined) return false;
-    await mkdir(dirname(path), { recursive: true });
-    await appendFile(path, `${text}\n`, "utf8");
+    await mkdir(dirname(path), { recursive: true, ...(modes.dirMode !== undefined ? { mode: modes.dirMode } : {}) });
+    await appendFile(path, `${text}\n`, { encoding: "utf8", ...(modes.fileMode !== undefined ? { mode: modes.fileMode } : {}) });
     onWritten?.();
     return true;
   });

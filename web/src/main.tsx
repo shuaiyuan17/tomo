@@ -218,6 +218,9 @@ export function App() {
   // A conversation picked with the pointer: the menu closes without handing focus back to
   // its trigger, which Chromium would then draw with a keyboard focus ring. Keys keep it.
   const pickedByPointer = useRef(false);
+  const sessionTrigger = useRef<HTMLButtonElement>(null);
+  // A pick in the phone drawer: the drawer closed and its menu button took focus already.
+  const pickedInDrawer = useRef(false);
   const drawer = phone && menuOpen;
   const drawerMotion = useMountedFor(drawer);
   const closeMenu = (refocus = true) => { setMenuOpen(false); if (refocus) menuButton.current?.focus(); };
@@ -499,16 +502,21 @@ export function App() {
         </div>
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild disabled={!sessions.length}>
-            <Button variant="outline" aria-labelledby="session-label session-value"
+            <Button ref={sessionTrigger} variant="outline" aria-labelledby="session-label session-value"
               className="h-11 w-full min-w-0 justify-between rounded-xl bg-card px-3.5 text-[13px] font-normal shadow-xs hover:bg-accent">
               <span id="session-value" className="truncate" title={session?.title}>{session ? `${session.title}${session.kind === "group" ? " · read-only" : ""}` : "No session available"}</span>
               <ChevronsUpDown className="text-muted-foreground" /></Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" className="w-auto max-w-[min(22rem,calc(100vw-2rem))] min-w-(--radix-dropdown-menu-trigger-width) rounded-xl p-1"
             onPointerDown={() => { pickedByPointer.current = true; }} onKeyDown={() => { pickedByPointer.current = false; }}
-            onCloseAutoFocus={(event) => { if (pickedByPointer.current) event.preventDefault(); pickedByPointer.current = false; }}>
+            onCloseAutoFocus={(event) => {
+              // Focus goes back to the trigger (so Tab continues from there), without a ring after a pointer pick;
+              // after a pick in the phone drawer it is already on the menu button (the trigger is inert by now).
+              if (pickedInDrawer.current) event.preventDefault();
+              else if (pickedByPointer.current) { event.preventDefault(); sessionTrigger.current?.focus({ focusVisible: false } as FocusOptions); }
+              pickedByPointer.current = false; pickedInDrawer.current = false; }}>
             <DropdownMenuLabel className="px-2 py-1.5 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">Conversations</DropdownMenuLabel>
-            <DropdownMenuRadioGroup value={selectedId} onValueChange={(value) => { setSelected(value); setFeedback(""); if (drawer) closeMenu(false); }}>
+            <DropdownMenuRadioGroup value={selectedId} onValueChange={(value) => { setSelected(value); setFeedback(""); if (drawer) { pickedInDrawer.current = true; closeMenu(!pickedByPointer.current); } }}>
               {sessions.map((s) => <DropdownMenuRadioItem key={s.id} value={s.id} className="rounded-lg py-2 text-[13px]">
                 <span className="min-w-0 truncate" title={s.title}>{s.title}</span>{s.kind === "group" && <span className="ml-auto shrink-0 pl-3 tracking-[0.02em] text-[10px] whitespace-nowrap text-muted-foreground">read-only</span>}
               </DropdownMenuRadioItem>)}

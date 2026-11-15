@@ -1,3 +1,4 @@
+import { closeSync, fstatSync, openSync, readSync } from "node:fs";
 import { join } from "node:path";
 import type { SdkSignal } from "../agent/sdk-signals.js";
 import { usageWindows, type UsageResponse } from "../agent/usage.js";
@@ -139,4 +140,45 @@ export function limitsLogFor(tomoHome: string): LimitsLog {
   let existing = shared.get(tomoHome);
   if (!existing) shared.set(tomoHome, existing = new LimitsLog(tomoHome));
   return existing;
+}
+
+/** How much of the end of `limits.ndjson` the latest-sample lookup reads. */
+const LIMITS_TAIL_BYTES = 256 * 1024;
+
+/**
+ * The newest quota sample, for the Cost page's quota bar: the last
+ * `oauth-usage` line (all windows at once) in the file's tail, or failing
+ * that the last line of any source. Torn or foreign lines are skipped;
+ * undefined when there is none or the file cannot be read.
+ */
+export function readLatestLimitSample(path: string): LimitSample | undefined {
+  let text: string;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const size = fstatSync(fd).size;
+    const start = Math.max(0, size - LIMITS_TAIL_BYTES);
+    const buffer = Buffer.alloc(size - start);
+    let read = 0;
+    while (read < buffer.length) {
+      const n = readSync(fd, buffer, read, buffer.length - read, start + read);
+      if (n === 0) break;
+      read += n;
+    }
+    text = buffer.toString("utf8", 0, read);
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  let fallback: LimitSample | undefined;
+  const lines = text.split("\n");
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let sample: LimitSample;
+    try { sample = JSON.parse(lines[i]) as LimitSample; } catch { continue; }
+    if (!sample || typeof sample.ts !== "string" || !Array.isArray(sample.windows)) continue;
+    if (sample.source === "oauth-usage") return sample;
+    fallback ??= sample;
+  }
+  return fallback;
 }

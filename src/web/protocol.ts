@@ -159,6 +159,116 @@ export interface WebUsage {
  */
 export const USAGE_RPC_TIMEOUT_MS = 24_000;
 /**
+ * `GET /api/v1/cost?from&to`: the Study Cost page, from the usage ledger
+ * (`~/.tomo/data/usage/YYYY-MM.ndjson`). Every dollar figure is the SDK's
+ * estimate at API list prices, never a bill. Dates are `YYYY-MM-DD` in
+ * `timeZone` (the owner's), whose midnights are the day boundaries.
+ */
+export type WebCostCategory = "you" | "background" | "scheduled";
+export type WebCostSplit = Record<WebCostCategory, number>;
+export interface WebCostDay {
+  date: string;
+  costUsd: number;
+  turns: number;
+  byCategory: WebCostSplit;
+  /** Before the first ledger row: nothing was recorded (not "a $0 day"). */
+  recorded: boolean;
+  /** Before the #389 fix (Sep 23): too high, shown marked, never compared. */
+  overcounted: boolean;
+  /** Rebuilt from the activity log (`tomo usage backfill`). */
+  backfilled: boolean;
+}
+/** One local clock hour, summed over the range. */
+export interface WebCostHour { hour: number; costUsd: number; turns: number; byCategory: WebCostSplit }
+export interface WebCostSession {
+  /** The web session id when the browser can open it (owner DM, groups). */
+  id?: string;
+  label: string;
+  kind: "dm" | "group" | "other";
+  costUsd: number;
+  turns: number;
+  byCategory: WebCostSplit;
+}
+export interface WebCostCron {
+  /** null: scheduled turns with no job (LCM rollups, nudges, unpaired backfilled cron turns). */
+  jobId: string | null;
+  name: string;
+  costUsd: number;
+  runs: number;
+}
+export interface WebCostModel {
+  model: string;
+  costUsd: number;
+  turns: number;
+  tokens: { input: number; output: number; cacheRead: number; cacheCreated: number };
+}
+export interface WebCostTurn {
+  ts: number;
+  date: string;
+  session: { id?: string; label: string; kind: WebCostSession["kind"] };
+  category: WebCostCategory;
+  /** The ledger's finer source (owner, group, cron, heartbeat, …). */
+  source: string;
+  jobName?: string;
+  costUsd: number;
+  durationMs?: number;
+  /** Main-loop tool calls; absent on rows from before it was recorded. */
+  tools?: number;
+  /** SDK round trips (`num_turns`). */
+  numTurns?: number;
+  /** Start of the message that triggered the turn, credentials scrubbed. */
+  trigger?: string;
+  overcounted?: true;
+  backfilled?: true;
+}
+/** A rolling window ending today. `comparable: false`: it holds an over-counted day, so no ratio is given. */
+export interface WebCostPeriod { from: string; to: string; costUsd: number; comparable: boolean }
+export interface WebCostGlance {
+  today: string;
+  /** Today and the six days before. */
+  thisWeek: WebCostPeriod;
+  /** The seven days before thisWeek. */
+  lastWeek: WebCostPeriod;
+  /** thisWeek / lastWeek; null when either is not comparable or lastWeek is $0. */
+  weekRatio: number | null;
+  last30: WebCostPeriod;
+  /** Median of the last 30 recorded, not over-counted days; null with none. */
+  typicalDay: { costUsd: number; days: number } | null;
+  /** Costliest of those days. */
+  busiestDay: { date: string; costUsd: number } | null;
+}
+export interface WebCostLimitWindow {
+  window: string;
+  label?: string;
+  group?: "session" | "weekly" | "other";
+  scoped?: boolean;
+  percent?: number;
+  resetsAt?: string;
+  status?: string;
+}
+/** The newest quota sample in `limits.ndjson`; null when there is none. */
+export interface WebCostLimits { sampledAt: string; source: string; windows: WebCostLimitWindow[] }
+export interface WebCost {
+  from: string;
+  to: string;
+  timeZone: string;
+  /** Ms epoch of the earliest ledger row; null: the ledger is empty. */
+  recordedSince: number | null;
+  totals: { costUsd: number; turns: number; byCategory: WebCostSplit; overcountedCostUsd: number };
+  days: WebCostDay[];
+  hours: WebCostHour[];
+  sessions: WebCostSession[];
+  crons: WebCostCron[];
+  /** Per model, from rows that carry the split; `unsplitCostUsd` is the rest of the range's cost. */
+  models: WebCostModel[];
+  unsplitCostUsd: number;
+  topTurns: WebCostTurn[];
+  /** Relative to today, whatever the range. */
+  glance: WebCostGlance;
+  limits: WebCostLimits | null;
+  generatedAt: number;
+}
+/**
  * What the SDK reports about a session's running turn besides its content.
  * `retry` and `tool` describe the moment and lapse as the turn moves on;
  * `refusal`, `error` and `stopped` say how it went and stay until the next

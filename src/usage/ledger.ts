@@ -92,6 +92,25 @@ export interface UsageLedgerRow {
    * per-model usage existed.
    */
   models?: Record<string, ModelTurnUsage>;
+  /**
+   * Tool calls the main loop made this turn (root `tool_use` blocks;
+   * subagents' own calls are not counted). Absent on rows written before it
+   * existed.
+   */
+  tools?: number;
+  /**
+   * Rebuilt by `tomo usage backfill` from the activity log, not written when
+   * the result arrived: cost, timings and attribution only — `tokens` are
+   * zeros (the activity log never had them) and there is no `models` or
+   * `snapshot`.
+   */
+  backfilled?: true;
+  /**
+   * Before the fix of #389 (2026-09-23): a resumed session's first turn was
+   * charged the session's whole history, so `costUsd` is too high. Kept, shown
+   * marked, and left out of every comparison.
+   */
+  overcounted?: true;
   /** The SDK session the result belongs to. */
   sdkSessionId?: string;
   /**
@@ -285,7 +304,8 @@ export class UsageLedger {
   }
 }
 
-const LEDGER_FILE_RE = /^\d{4}-\d{2}\.ndjson$/;
+/** A month file of the ledger (`YYYY-MM.ndjson`). */
+export const LEDGER_FILE_RE = /^\d{4}-\d{2}\.ndjson$/;
 
 function snapshotKey(sessionKey: string, sdkSessionId: string): string {
   return `${sessionKey}\u0000${sdkSessionId}`;

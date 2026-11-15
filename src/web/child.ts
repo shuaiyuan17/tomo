@@ -49,10 +49,14 @@ process.on("message", (value: Message) => {
     // Uploads never sent expire; sweep at start and every few minutes (also on each upload).
     sweepUploads(uploadsDir(value.options.tomoHome));
     setInterval(() => sweepUploads(uploadsDir(value.options.tomoHome)), 5 * 60_000).unref();
+    const data = new WebData(value.options);
+    // Read the usage ledger into the Cost page's cache once the server is up,
+    // so even the first visit only reads rows appended since.
+    setTimeout(() => data.warmCost(), 2_000).unref();
     return startWebHttp(value.options.port, {
     accessToken,
     externalOrigin: value.options.externalOrigin,
-    data: new WebData(value.options),
+    data,
     ...(value.options.uploadsEnabled !== false || value.options.fileUploadsEnabled === true ? { uploadsDir: uploadsDir(value.options.tomoHome),
       uploadKinds: { images: value.options.uploadsEnabled !== false, files: value.options.fileUploadsEnabled === true } } : {}),
     // Captured here, in the web process, so frames never cross the daemon IPC

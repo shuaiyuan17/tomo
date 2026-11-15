@@ -412,6 +412,8 @@ export const mockConfig = {
    *  the inbox fails). tests/durable-inbox-agent.test.ts turns it on. */
   inbox: false,
   inboxReplayMaxAgeMinutes: 360,
+  /** Off by default here; tests/interrupted-agents-agent.test.ts turns it on. */
+  interruptedAgents: false,
   notifyOwnerOnSuppressedErrors: true,
   liveSessionTimeoutMs: 10 * 60 * 1000,
   litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,

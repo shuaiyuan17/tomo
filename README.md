@@ -379,6 +379,7 @@ Environment variables override config file values:
 | `TOMO_MAX_TURNS` | Override per-turn tool-use ceiling (default: `50`) |
 | `TOMO_STEERING` | Override message steering. Defaults to `true`; set `false` to keep mid-turn messages queued. |
 | `TOMO_INBOX` | Override the durable inbox. Defaults to `true`; set `false` to hold waiting messages in memory only. |
+| `TOMO_INTERRUPTED_AGENTS` | Track running subagents on disk and report the ones a restart or crash cut off. Defaults to `true`. |
 | `TOMO_INBOX_REPLAY_MAX_AGE_MINUTES` | Oldest waiting message answered after a restart (default: `360`; `0` = never replay, only record). |
 | `TOMO_SAVE_INBOUND_FILES` | Override storage of inbound attachments that are neither images nor supported documents. Defaults to whatever `saveInboundImages` is. |
 | `TOMO_NOTIFY_OWNER_ON_SUPPRESSED_ERRORS` | Tell the owner when a failure is kept out of a chat: passive-group turns, group cron/background turns, and silent housekeeping/heartbeat turns on the owner's own DM (an error already shown in a chat is not repeated). Group failures are reported in the owner's DM, never in the group; DM failures in that DM. Each notice names the session, the kind of error, a one-line excerpt and a recovery hint (`/login` for auth failures). At most one notice per session and error kind per 30 minutes; the next one says how many failures were folded in. Defaults to `true` (config key `notifyOwnerOnSuppressedErrors`); set `false` to keep these failures in the log only. |
@@ -516,6 +517,10 @@ Every message Tomo accepts is written to `~/.tomo/data/inbox.jsonl` (fsynced) be
 - Web UI requests, the group secret and attachment bytes are never written there; attachments are reloaded from their saved copies (`saveInboundImages` / `saveInboundFiles`), and one that was never saved is dropped with a note.
 
 Set `"inbox": false` or `TOMO_INBOX=false` to turn it off. Waiting messages are then held in memory, and a graceful shutdown records them as not processed.
+
+### Interrupted Subagents
+
+Each session's running subagents and background commands are mirrored to `~/.tomo/data/running-agents.json` (atomic write on every start and end), so a crash is covered as well as a restart. On the next start, every session that had some still running gets one `interrupted-agents` event listing their ids, descriptions, types and last activity. Nothing is resumed automatically: the model can continue a subagent with `SendMessage` to its id. Explore/Plan subagents and background commands cannot be resumed. Set `"interruptedAgents": false` or `TOMO_INTERRUPTED_AGENTS=false` to turn it off.
 
 ### LiteLLM / ChatGPT Subscription Models
 

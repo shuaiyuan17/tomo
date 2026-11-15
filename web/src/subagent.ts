@@ -4,9 +4,12 @@ import type { SubagentItem, SubagentPage } from "../../src/web/protocol.js";
 
 export interface ToolRow {
   kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean;
-  result?: { output: string; truncated: boolean; isError: boolean };
+  /** `images`: image blocks in the output (never served; the row shows a chip). */
+  result?: { output: string; truncated: boolean; isError: boolean; images?: number };
 }
-export type ViewRow = { kind: "text" | "message"; id: string; text: string; truncated: boolean } | ToolRow;
+/** A subagent's thinking: a folded, muted row. */
+export interface ThinkingRow { kind: "thinking"; id: string; text: string; truncated: boolean }
+export type ViewRow = { kind: "text" | "message"; id: string; text: string; truncated: boolean } | ToolRow | ThinkingRow;
 
 /**
  * The transcript window has two mutually exclusive modes:
@@ -32,8 +35,10 @@ export interface TranscriptState {
   /** File length at the last read; in follow mode, `end < size` means more to read now. */
   size: number;
   hasEarlier: boolean;
+  /** A page read so far had lines the server could not read: the view says some entries are missing. */
+  unreadable: boolean;
 }
-export const INITIAL_TRANSCRIPT: TranscriptState = { mode: "follow", gen: 0, status: "loading", items: [], start: 0, end: 0, size: 0, hasEarlier: false };
+export const INITIAL_TRANSCRIPT: TranscriptState = { mode: "follow", gen: 0, status: "loading", items: [], start: 0, end: 0, size: 0, hasEarlier: false, unreadable: false };
 /** Kept in memory per open view. */
 export const MAX_KEPT_ITEMS = 2_000;
 
@@ -82,7 +87,7 @@ export function transcriptReducer(state: TranscriptState, action: TranscriptActi
   if (action.gen !== state.gen || state.status === "gone") return state;
   const page = action.page;
   if (action.type === "tail") {
-    return { ...state, status: "ready", items: page.items, start: page.start, end: page.end, size: page.size, hasEarlier: page.hasEarlier };
+    return { ...state, status: "ready", items: page.items, start: page.start, end: page.end, size: page.size, hasEarlier: page.hasEarlier, unreadable: !!page.unreadable };
   }
   const seen = new Set(state.items.map((item) => item.id));
   const fresh = page.items.filter((item) => !seen.has(item.id));
@@ -92,12 +97,12 @@ export function transcriptReducer(state: TranscriptState, action: TranscriptActi
     const items = all.length > MAX_KEPT_ITEMS ? keepLines(all, "newest") : all;
     const dropped = items.length < all.length;
     return { ...state, status: "ready", items, end: Math.max(state.end, page.end), size: Math.max(state.size, page.size),
-      start: dropped ? lineOf(items[0]) : state.start, hasEarlier: state.hasEarlier || dropped };
+      start: dropped ? lineOf(items[0]) : state.start, hasEarlier: state.hasEarlier || dropped, unreadable: state.unreadable || !!page.unreadable };
   }
   if (state.mode !== "browse") return state;
   const all = [...fresh, ...state.items];
   const items = all.length > MAX_KEPT_ITEMS ? keepLines(all, "oldest") : all;
-  return { ...state, items, start: page.start, hasEarlier: page.hasEarlier };
+  return { ...state, items, start: page.start, hasEarlier: page.hasEarlier, unreadable: state.unreadable || !!page.unreadable };
 }
 
 /** In follow mode, more lines are already on disk than have been read. */
@@ -109,11 +114,11 @@ export function viewRows(items: SubagentItem[]): ViewRow[] {
   for (const item of items) if (item.kind === "result") results.set(item.toolUseId, item);
   const rows: ViewRow[] = [];
   for (const item of items) {
-    if (item.kind === "text" || item.kind === "message") rows.push({ kind: item.kind, id: item.id, text: item.text, truncated: item.truncated });
+    if (item.kind === "text" || item.kind === "message" || item.kind === "thinking") rows.push({ kind: item.kind, id: item.id, text: item.text, truncated: item.truncated });
     else if (item.kind === "tool") {
       const result = results.get(item.toolUseId);
       rows.push({ kind: "tool", id: item.id, toolUseId: item.toolUseId, name: item.name, summary: item.summary, input: item.input, inputTruncated: item.inputTruncated,
-        ...(result ? { result: { output: result.output, truncated: result.truncated, isError: result.isError } } : {}) });
+        ...(result ? { result: { output: result.output, truncated: result.truncated, isError: result.isError, ...(result.images ? { images: result.images } : {}) } } : {}) });
     }
   }
   return rows;
@@ -179,24 +184,29 @@ export async function followStep(io: {
  * subagent) always in full; a single tool
  * call as its own row; a run of two or more consecutive tool calls folded
  * into one group, keyed by its first tool_use id (stable while the run grows,
- * so an open/closed choice survives incremental updates).
+ * so an open/closed choice survives incremental updates). Thinking is a step
+ * like a call: it does not break a run, and folds into the group with the
+ * calls around it (`steps`, in order; `tools` stays the calls alone). A run
+ * with fewer than two calls shows its rows as they are.
  */
 export type ViewBlock =
   | { kind: "text"; row: Extract<ViewRow, { kind: "text" | "message" }> }
   | { kind: "message"; row: Extract<ViewRow, { kind: "text" | "message" }> }
+  | { kind: "thinking"; row: ThinkingRow }
   | { kind: "tool"; row: ToolRow }
-  | { kind: "group"; key: string; tools: ToolRow[] };
+  | { kind: "group"; key: string; tools: ToolRow[]; steps: Array<ToolRow | ThinkingRow> };
 
 export function groupRows(rows: ViewRow[]): ViewBlock[] {
   const blocks: ViewBlock[] = [];
-  let run: ToolRow[] = [];
+  let run: Array<ToolRow | ThinkingRow> = [];
   const flush = () => {
-    if (run.length === 1) blocks.push({ kind: "tool", row: run[0] });
-    else if (run.length > 1) blocks.push({ kind: "group", key: run[0].toolUseId, tools: run });
+    const tools = run.filter((row): row is ToolRow => row.kind === "tool");
+    if (tools.length > 1) blocks.push({ kind: "group", key: tools[0].toolUseId, tools, steps: run });
+    else for (const row of run) blocks.push(row.kind === "tool" ? { kind: "tool", row } : { kind: "thinking", row });
     run = [];
   };
   for (const row of rows) {
-    if (row.kind === "tool") run.push(row);
+    if (row.kind === "tool" || row.kind === "thinking") run.push(row);
     else { flush(); blocks.push(row.kind === "message" ? { kind: "message", row } : { kind: "text", row }); }
   }
   flush();

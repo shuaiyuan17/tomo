@@ -77,6 +77,8 @@ export const mockSdk = {
    *  `{ subtype: "error_max_turns", is_error: true, errors: [...] }` to
    *  simulate the CLI ending a turn on an error result. */
   nextResult: null as Record<string, unknown> | null,
+  /** Stamp each turn's assistant frames with the consumed message's client uuid (`user_message_uuids`), like current CLIs do. */
+  stampUserUuids: false,
   queryControllers: [] as MockQueryController[],
   mcpServerSets: [] as Array<Record<string, unknown>>,
   /** Every prompt the mock received, tagged with the session it ran on
@@ -100,6 +102,7 @@ export function resetMockSdk(): void {
   mockSdk.contextUsageFails = false;
   mockSdk.failNextQuery = null;
   mockSdk.nextResult = null;
+  mockSdk.stampUserUuids = false;
   mockSdk.queryControllers = [];
   mockSdk.interrupts = 0;
   mockSdk.mcpServerSets = [];
@@ -122,6 +125,7 @@ function enqueueAssistantTurnEvents(
   eventQueue: unknown[],
   blocks: MockResponseBlock[],
   wakeConsumer: () => void,
+  stamp?: string[],
 ): void {
   // For each block, emit stream events + an assistant event. This mirrors how
   // the real SDK reports multi-block turns: text deltas arrive, then an
@@ -167,6 +171,7 @@ function enqueueAssistantTurnEvents(
     eventQueue.push({
       type: "assistant",
       message: { content: [assistantBlock] },
+      ...(stamp?.length ? { user_message_uuids: stamp, user_message_uuid: stamp.at(-1) } : {}),
     });
   }
 
@@ -270,7 +275,8 @@ function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
           }
         }
 
-        enqueueAssistantTurnEvents(eventQueue, blocks, wakeConsumer);
+        const uuid = (userMsg as { uuid?: string }).uuid;
+        enqueueAssistantTurnEvents(eventQueue, blocks, wakeConsumer, mockSdk.stampUserUuids && uuid ? [uuid] : undefined);
       }
     } catch {
       // prompt generator closed

@@ -32,7 +32,9 @@ export interface WebCatalog { sessions: WebSession[]; ownerId: string | null; se
  *  settled; never re-run automatically. Neither is retried. */
 export type RequestState = "queued" | "running" | "completed" | "refused" | "failed" | "unknown" | "interrupted";
 /** `images`: where an owner's attached images were filed (incoming-images), while the request's text is kept. */
-export interface WebRequest { requestId: string; state: RequestState; sessionId?: string; responseTurnId?: string; joined?: boolean; handedOff?: boolean; text?: string; timestamp?: number; images?: string[] }
+export interface WebRequest { requestId: string; state: RequestState; sessionId?: string; responseTurnId?: string; joined?: boolean; handedOff?: boolean;
+  /** The agent has read (the SDK consumed) this message. In memory only; restored completed requests count as read. */
+  read?: boolean; text?: string; timestamp?: number; images?: string[] }
 export interface HistoryMessage extends SessionMessage { id: string }
 export interface HistoryPage { messages: HistoryMessage[]; nextCursor: string | null; revision?: string }
 export type WebTaskState = "running" | "completed" | "failed" | "stopped" | "ended";

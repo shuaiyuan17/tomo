@@ -17,7 +17,8 @@ import { ArrowUp, ImagePlus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUp
 import { Study } from "./study.js";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { ScreenWindow } from "./screen.js";
-import { awaitingOwner, dismissAfterAcceptedSend, historyBadge, pendingLabel, pendingUserMessages, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
+import { awaitingOwner, dismissAfterAcceptedSend, historyBadge, pendingLabel, pendingUserMessages, readReceipt, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
+import { ReadReceiptMark } from "./read-receipt.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -107,6 +108,13 @@ export function App() {
   const [selected, setSelected] = useState("");
   const selectedId = selected || web.bootstrap?.ownerId || web.bootstrap?.sessions[0]?.id || "";
   const session = web.bootstrap?.sessions.find((s) => s.id === selectedId);
+  // The owner's own bubble: as wide as its content (up to 85% of the column),
+  // left-aligned with its header, and — in the owner conversation — the read
+  // receipt under its right edge.
+  const ownerConversation = !!selectedId && selectedId === web.bootstrap?.ownerId;
+  const ownBubble = (node: React.JSX.Element | null, requestId: string | undefined) =>
+    <div className="own-bubble flex w-fit min-w-0 max-w-[85%] flex-col">{node}
+      {ownerConversation && <ReadReceiptMark receipt={readReceipt(requestId, web.requests)} agent={agent} />}</div>;
   // The screen is the owner's: offered only with the owner conversation selected.
   const screenAllowed = !!web.bootstrap?.capabilities?.screen && session?.kind !== "group";
   const screen = screenOpen && screenAllowed;
@@ -524,11 +532,11 @@ export function App() {
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
               {sent && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{sendMarkerLabel(sent)}</Badge>}
               {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
-            <div className={cn("markdown", message.role === "user" && "rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5", message.role === "assistant" && "reading")}>
+            {(message.role === "user" ? (node: React.JSX.Element) => ownBubble(node, message.requestId) : (node: React.JSX.Element) => node)(<div className={cn("markdown", message.role === "user" && "min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5", message.role === "assistant" && "reading")}>
               {message.role === "assistant" && body.trim() === "NO_REPLY"
                 // A turn that ended without a reply (silent by choice, or stopped): said plainly, not as the agent's words.
                 ? <p className="m-0 font-sans text-[12.5px] text-muted-foreground">No reply</p>
-                : <MessageBody body={body} reply={reply} sessionId={selectedId} onQuote={quoted ? () => showMessage(quoted.id) : undefined} thinking={message.role === "assistant" ? "joined" : undefined} />}</div>
+                : <MessageBody body={body} reply={reply} sessionId={selectedId} onQuote={quoted ? () => showMessage(quoted.id) : undefined} thinking={message.role === "assistant" ? "joined" : undefined} />}</div>)}
             {message.role === "user" && interruptedActions(web.requests.find((r) => r.requestId === message.requestId && awaitingOwner(r)))}</article>; })()}</>}
           {row.kind === "pending" && ((request: WebRequest) => <article className="message user motion-enter mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">You</span><span>Web</span>
@@ -537,7 +545,8 @@ export function App() {
               body={`[Sent ${request.images.length === 1 ? "an image" : `${request.images.length} images`}, saved to: ${request.images.join(", ")}]`} /></div> : null}
             {sentImages[request.requestId] && <div className="mb-2 flex flex-wrap gap-2 opacity-80">{sentImages[request.requestId].map((src, i) =>
               <img key={i} src={src} alt="Image" className="block max-h-[280px] max-w-[280px] rounded-xl border object-contain" />)}</div>}
-            {request.text && <div className="markdown rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80"><Text breaks>{request.text}</Text></div>}
+            {request.text ? ownBubble(<div className="markdown min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80"><Text breaks>{request.text}</Text></div>, request.requestId)
+              : ownBubble(null, request.requestId)}
             {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)(row.request)}
           {rowIndex === rows.length - 1 && <>
           {timeline.trailing.map((block) => toolBlock(block, turnActive))}

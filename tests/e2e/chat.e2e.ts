@@ -1092,3 +1092,40 @@ it("a turn's trace: the todo list open while it runs and folded after, its Sourc
   await page.emulateMedia({ colorScheme: "light" });
   await page.setViewportSize({ width: 1440, height: 900 });
 });
+
+it("own bubbles fit their content (85% cap) and show ✓ sent, then ✓✓ read by the agent", async () => {
+  mockSdk.stampUserUuids = true;
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  mockSdk.responseFn = async () => { await gate; return "A tick is a receipt."; };
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("第一个对号是啥意思");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  const own = page.locator("article.message.user").filter({ hasText: "第一个对号是啥意思" }).last();
+  const receipt = own.locator(".read-receipt");
+  await browserExpect(receipt).toHaveAttribute("data-receipt", "sent");
+  release();
+  await browserExpect(receipt).toHaveAttribute("data-receipt", "read");
+  await browserExpect(receipt).toHaveAttribute("title", "Read by Tomo");
+  // Measured once the turn is over and the bubble is the settled history row.
+  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "A tick is a receipt." })).toBeVisible();
+  await receipt.click();
+  await browserExpect(receipt).toContainText("Read by Tomo");
+  const column = (await own.boundingBox())!.width;
+  const short = (await own.locator(".own-bubble").boundingBox())!.width;
+  expect(short).toBeLessThan(column * 0.4);
+  // Receipt sits under the bubble's right edge.
+  const bubbleBox = (await own.locator(".own-bubble .markdown").boundingBox())!;
+  const tick = (await receipt.boundingBox())!;
+  expect(Math.abs(tick.x + tick.width - (bubbleBox.x + bubbleBox.width))).toBeLessThan(2);
+
+  mockSdk.responseFn = () => "ok";
+  const long = "long words ".repeat(120).trim();
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill(long);
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  const longOwn = page.locator("article.message.user").filter({ hasText: "long words long words" }).last();
+  await browserExpect(longOwn.locator(".read-receipt")).toHaveAttribute("data-receipt", "read");
+  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "ok" }).last()).toBeVisible();
+  const longWidth = (await longOwn.locator(".own-bubble").boundingBox())!.width;
+  expect(longWidth).toBeLessThanOrEqual(column * 0.85 + 1);
+  expect(longWidth).toBeGreaterThan(column * 0.8);
+});

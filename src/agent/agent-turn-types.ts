@@ -69,6 +69,9 @@ export interface CronTurnOptions {
   /** The turn ended with no reply text and not by the model's choice (see
    *  TurnSpec.onEmpty). Carried through every handoff. */
   onEmpty?: () => void;
+  /** The owner stopped the turn before it finished (see TurnSpec.onStopped).
+   *  Carried through every handoff. */
+  onStopped?: () => void;
   /** The cron job's name, for the owner notice when its failure is kept out
    *  of a group (see agent/owner-error-notice.ts). */
   jobName?: string;

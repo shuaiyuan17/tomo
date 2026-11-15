@@ -3,18 +3,35 @@ import { FileIcon, ImageIcon, X } from "lucide-react";
 import { Text } from "./markdown.js";
 import { splitMessage } from "./attachments.js";
 import type { ReplyContext } from "./reply.js";
+import { splitThinking } from "./thinking.js";
+import { Thinking } from "./tool-calls.js";
 import { cn } from "@/lib/utils";
 
 /**
  * A chat message's body: the reply quote (if any), text with single line
  * breaks kept, images from messaging channels as thumbnails (never the raw
  * path), and other attachments as a named chip.
+ *
+ * `thinking` (Tomo's replies only): text marked as a thinking block shows as
+ * a folded "Thinking" row, never as the reply. `block`: one live content
+ * block; `joined`: a recorded turn (see splitThinking).
  */
-export function MessageBody({ body, reply, sessionId, onQuote }:
-  { body: string; reply?: ReplyContext; sessionId: string; onQuote?: () => void }) {
+export function MessageBody({ body, reply, sessionId, onQuote, thinking }:
+  { body: string; reply?: ReplyContext; sessionId: string; onQuote?: () => void; thinking?: "block" | "joined" }) {
   const [viewing, setViewing] = useState<string>();
+  const segments = thinking ? splitThinking(body, thinking) : [{ kind: "reply" as const, text: body }];
   return <>
     {reply && <ReplyQuote reply={reply} onClick={onQuote} />}
+    {segments.map((segment, at) => segment.kind === "thinking"
+      ? <Thinking key={`t${at}`} text={segment.text} className="my-1" />
+      : <ReplyParts key={`r${at}`} body={segment.text} sessionId={sessionId} onView={setViewing} />)}
+    {viewing && <Lightbox src={viewing} onClose={() => setViewing(undefined)} />}
+  </>;
+}
+
+function ReplyParts({ body, sessionId, onView }: { body: string; sessionId: string; onView: (src: string) => void }) {
+  const setViewing = onView;
+  return <>
     {splitMessage(body).map((part, index) => {
       if (part.kind === "text") return <Text key={index} breaks>{part.text}</Text>;
       if (part.kind === "sent") return <div key={index} className="my-1.5 flex flex-wrap gap-2">
@@ -29,7 +46,6 @@ export function MessageBody({ body, reply, sessionId, onQuote }:
       return <span key={index} className="my-1 mr-1.5 inline-flex items-center gap-1.5 rounded-lg border bg-card/70 px-2 py-1 text-[12px] text-muted-foreground">
         <FileIcon className="size-3.5" aria-hidden="true" />{part.names.length ? part.names.join(", ") : part.label}</span>;
     })}
-    {viewing && <Lightbox src={viewing} onClose={() => setViewing(undefined)} />}
   </>;
 }
 

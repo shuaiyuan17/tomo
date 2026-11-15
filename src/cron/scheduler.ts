@@ -103,17 +103,7 @@ export class CronScheduler {
     // Tell the owner what will not happen on its own: skipped runs and parked
     // one-shots. On the first tick, whenever something new happens, and —
     // until a report goes through — every OWNER_REPORT_RETRY_MS.
-    if (!this.reportingToOwner && Date.now() >= this.nextOwnerReportAt) {
-      this.nextOwnerReportAt = Date.now() + OWNER_REPORT_RETRY_MS;
-      this.reportingToOwner = true;
-      // Caught HERE, at the call site: reportToOwner handles its expected
-      // failures itself, but anything unexpected escaping it must not become
-      // an unhandled rejection that takes the daemon down. Everything it would
-      // have reported is still pending on disk and is retried later.
-      void this.reportToOwner()
-        .catch((err: unknown) => { log.error({ err }, "Cron owner report failed unexpectedly; will retry"); })
-        .finally(() => { this.reportingToOwner = false; });
-    }
+    this.reportToOwnerIfDue();
 
     // The scan-and-dispatch below is synchronous (execute() marks the job
     // in-flight before its first await), so overlapping ticks cannot
@@ -170,6 +160,20 @@ export class CronScheduler {
     return true;
   }
 
+  /** Starts an owner report when one is due and none is in flight. */
+  private reportToOwnerIfDue(): void {
+    if (this.reportingToOwner || Date.now() < this.nextOwnerReportAt) return;
+    this.nextOwnerReportAt = Date.now() + OWNER_REPORT_RETRY_MS;
+    this.reportingToOwner = true;
+    // Caught HERE, at the call site: reportToOwner handles its expected
+    // failures itself, but anything unexpected escaping it must not become
+    // an unhandled rejection that takes the daemon down. Everything it would
+    // have reported is still pending on disk and is retried later.
+    void this.reportToOwner()
+      .catch((err: unknown) => { log.error({ err }, "Cron owner report failed unexpectedly; will retry"); })
+      .finally(() => { this.reportingToOwner = false; });
+  }
+
   /**
    * One DM to the owner (direct, no model turn) covering everything that will
    * not happen on its own:
@@ -216,7 +220,7 @@ export class CronScheduler {
     if (parked.length > 0) {
       sections.push([
         `${parked.length === 1 ? "A scheduled one-time task was" : `${parked.length} scheduled one-time tasks were`} ` +
-          "interrupted by a restart and did NOT finish. It may have partly run, so it will not be re-run on its own:",
+          "interrupted (by a restart, or stopped from the web UI) and did NOT finish. It may have partly run, so it will not be re-run on its own:",
         ...parked.map((job) => {
           const started = job.lastStartedAt ?? job.lastRunAt;
           const interrupted = job.lastRunAt != null && job.lastRunAt !== started ? job.lastRunAt : null;
@@ -231,7 +235,7 @@ export class CronScheduler {
     if (interrupted.length > 0) {
       sections.push([
         `${interrupted.length === 1 ? "A recurring task's run was" : `${interrupted.length} recurring tasks' runs were`} ` +
-          "interrupted by a restart and did NOT finish. It may have partly run. It will not be re-run; " +
+          "interrupted (by a restart, or stopped from the web UI) and did NOT finish. It may have partly run. It will not be re-run; " +
           `${interrupted.length === 1 ? "the job continues" : "the jobs continue"} at the next normal time:`,
         ...interrupted.map((job) => {
           const { count, runs } = job.interruptNotice!;
@@ -336,6 +340,7 @@ export class CronScheduler {
       let ok: boolean;
       let shutdown: "refused" | "interrupted" | undefined;
       let empty = false;
+      let stopped = false;
       try {
         // handleCronMessage never rejects — it reports the turn's outcome so
         // real agent failures land in lastStatus instead of reading as "ok".
@@ -346,6 +351,7 @@ export class CronScheduler {
           jobName: name,
           onShutdown: (kind) => { shutdown = kind; },
           onEmpty: () => { empty = true; },
+          onStopped: () => { stopped = true; },
         });
       } catch (err) {
         // Unreachable by contract; a broken contract must not read as success.
@@ -382,6 +388,28 @@ export class CronScheduler {
           // The token stays unacknowledged; restart recovery settles it.
           log.error({ err, jobId, runId }, "Could not record a cron run cut short by shutdown; restart recovery will settle it");
         }
+        watchBus.publish({ type: "cron.done", jobId, name, ok: false });
+        return;
+      }
+      // STOPPED BY THE OWNER IS NOT AN OUTCOME EITHER. Stop in the web UI ends
+      // whichever turn is running in the owner conversation, and that can be
+      // this job's. The turn settles cleanly (no error notice), which read
+      // here as "ok": a one-shot deleted half-done, a recurring run recorded
+      // as complete. Same rule as a shutdown mid-turn: it may have partly
+      // run, so it is never re-run automatically. A one-shot is parked and
+      // the owner asked; a recurring job records "interrupted" and waits for
+      // its next normal slot. The owner is told right away.
+      if (stopped) {
+        try {
+          this.store.markInterruptedByShutdown(jobId, runId);
+          log.warn({ jobId, runId }, "Cron run stopped by the owner; recorded as interrupted, will not be re-run automatically");
+        } catch (err) {
+          // The token stays unacknowledged; restart recovery settles it.
+          log.error({ err, jobId, runId }, "Could not record a cron run stopped by the owner; restart recovery will settle it");
+        }
+        // He pressed Stop a moment ago: say now what became of the job, not at the next poll.
+        this.nextOwnerReportAt = 0;
+        this.reportToOwnerIfDue();
         watchBus.publish({ type: "cron.done", jobId, name, ok: false });
         return;
       }

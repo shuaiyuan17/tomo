@@ -343,7 +343,7 @@ it("opens a task to read its subagent transcript, expands a tool call, and goes 
   await browserExpect(transcript.getByText("Also check the README.")).toHaveCount(1);
   await browserExpect(transcript).toContainText("Message from Tomo");
   await browserExpect(transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ })).toHaveCount(0);
-  await transcript.getByRole("button", { name: /2 tool calls · Read, Grep/ }).click();
+  await transcript.getByRole("button", { name: /Read a file, ran a search/ }).click();
   await transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ }).click();
   await browserExpect(transcript).toContainText("## 0.12.0 entries");
   await page.getByRole("button", { name: "Back to tasks" }).click();
@@ -522,11 +522,11 @@ it("shows a turn's tool calls inline, folded, between the messages; INPUT/OUTPUT
     line("user", t + 1_100, [{ type: "tool_result", tool_use_id: "c1", content: "## 0.12.0 entries" }]) +
     line("assistant", t + 2_000, [{ type: "tool_use", id: "c2", name: "Bash", input: { command: "GH_TOKEN=supersecret gh pr list" } }]) +
     line("user", t + 2_100, [{ type: "tool_result", tool_use_id: "c2", content: "#1 open" }]) +
-    line("assistant", t + 3_000, [{ type: "tool_use", id: "c3", name: "Bash", input: { command: "git status" } }]) +
+    line("assistant", t + 3_000, [{ type: "tool_use", id: "c3", name: "Bash", input: { command: "git status", description: "Check the working tree" } }]) +
     line("user", t + 3_100, [{ type: "tool_result", tool_use_id: "c3", content: "clean" }]));
   await page.reload();
   const history = page.getByLabel("Conversation history");
-  const summary = history.getByRole("button", { name: "3 tool calls · Bash ×2, Read" });
+  const summary = history.getByRole("button", { name: "Read a file, ran 2 commands" });
   await browserExpect(summary).toBeVisible();
   // Collapsed by default, between the request and the reply; the reply text is never folded.
   expect(await summary.evaluate((el) => {
@@ -544,6 +544,11 @@ it("shows a turn's tool calls inline, folded, between the messages; INPUT/OUTPUT
   await history.getByRole("button", { name: /gh pr list/ }).click();
   await browserExpect(history).toContainText("GH_TOKEN=•••");
   expect(await page.content()).not.toContain("supersecret");
+  // A command the model described is titled by that description; the command itself is inside.
+  await browserExpect(history.getByText("git status")).toHaveCount(0);
+  await history.getByRole("button", { name: "Check the working tree" }).click();
+  await browserExpect(history).toContainText("git status");
+  await page.screenshot({ path: "test-results/inline-tools-desktop.png" });
   // No separate "Bash · completed" line above the composer.
   watchBus.publish({ type: "tool.end", ts: Date.now(), sessionKey: "dm:owner", tool: "Bash", ok: true } as never);
   await page.waitForTimeout(300);
@@ -693,4 +698,73 @@ it("an image-only interrupted message, resent, is dismissed: its interrupted bub
   await browserExpect.poll(() => ids.length).toBe(2);
   await browserExpect(page.getByText("Not answered.", { exact: false })).toHaveCount(0);
   for (const finish of finishes) finish("done");
+});
+
+it("a thinking block in history reads as a folded, quiet Thinking row; the reply stays the reply", async () => {
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const t = Date.now() - 60_000;
+  store.append("dm:owner", { role: "user", channel: "web", content: "Which option is cheaper?", timestamp: t });
+  // As renderResponseBlocks records a turn with showThinking on: blocks joined by "\n".
+  store.append("dm:owner", { role: "assistant", channel: "web", content: "💭 Comparing the two plans by monthly cost.\n\nThe second has a setup fee.\nThe first one is cheaper over a year.", timestamp: t + 5_000 });
+  await page.reload();
+  const history = page.getByLabel("Conversation history");
+  const reply = history.locator("article.message.assistant").last();
+  const thinking = reply.getByRole("button", { name: "Thinking" });
+  await browserExpect(thinking).toHaveAttribute("aria-expanded", "false");
+  await browserExpect(reply).toContainText("The first one is cheaper over a year.");
+  await browserExpect(reply).not.toContainText("💭");
+  await browserExpect(reply.getByText("Comparing the two plans")).toHaveCount(0);
+  // Sans and small, not the reply serif.
+  expect(await thinking.evaluate((el) => { const s = getComputedStyle(el); return [s.fontFamily.includes("Source Serif"), s.fontSize]; })).toEqual([false, "12px"]);
+  await settledShot("thinking-desktop-closed");
+  await thinking.click();
+  await browserExpect(reply).toContainText("The second has a setup fee.");
+  await settledShot("thinking-desktop");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await settledShot("thinking-phone");
+  await page.setViewportSize({ width: 1440, height: 900 });
+});
+
+/** A screenshot once the collapsible motion has finished and no row is hovered. */
+async function settledShot(name: string) {
+  await page.mouse.move(0, 0);
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: `test-results/${name}.png` });
+}
+
+it("a subagent's thinking folds, an image output is a chip, and unreadable lines are said", async () => {
+  new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).setSdkSessionId("dm:owner", "sdk-think");
+  const dir = resolve(mockConfig.sdkSessionsDir, "sdk-think", "subagents");
+  mkdirSync(dir, { recursive: true });
+  const line = (type: string, content: unknown[]) => JSON.stringify({ type, message: { content } }) + "\n";
+  const png = { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgoAAAANSUhEUg==" } };
+  writeFileSync(resolve(dir, "agent-b1.jsonl"),
+    line("user", [{ type: "text", text: "Look at the screenshot." }]) +
+    line("assistant", [{ type: "thinking", thinking: "The screenshot path is in the brief; read it first." }, { type: "redacted_thinking", data: "x" },
+      { type: "text", text: "Reading the screenshot." }]) +
+    line("assistant", [{ type: "tool_use", id: "i1", name: "Read", input: { file_path: "/repo/shot.png" } }]) +
+    line("user", [{ type: "tool_result", tool_use_id: "i1", content: [png] }]) +
+    line("assistant", [{ type: "hologram", data: 1 }]) +
+    line("assistant", [{ type: "text", text: "It shows the login page." }]));
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
+    { taskId: "b1", taskType: "local_agent", subagentType: "Explore", description: "Check the screenshot", ambient: false, background: true, startedAt: Date.now() },
+  ] });
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  await page.getByRole("button", { name: /Check the screenshot/ }).click();
+  const transcript = page.getByLabel("Subagent transcript");
+  await browserExpect(transcript).toContainText("It shows the login page.");
+  await browserExpect(transcript).toContainText("Some entries could not be read.");
+  const thinking = transcript.getByRole("button", { name: "Thinking" });
+  await browserExpect(thinking).toHaveCount(1);
+  await browserExpect(transcript.getByText("read it first")).toHaveCount(0);
+  await thinking.click();
+  await browserExpect(transcript).toContainText("The screenshot path is in the brief; read it first.");
+  await transcript.getByRole("button", { name: /Read \/repo\/shot\.png/ }).click();
+  await browserExpect(transcript).toContainText("Image output, not shown");
+  await browserExpect(transcript).not.toContainText("[image]");
+  expect(await page.content()).not.toContain("iVBORw0KGgo");
+  await settledShot("subagent-thinking-desktop");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await settledShot("subagent-thinking-phone");
+  await page.setViewportSize({ width: 1440, height: 900 });
 });

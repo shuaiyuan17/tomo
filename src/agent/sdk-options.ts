@@ -2,7 +2,7 @@ import type { ElicitationRequest, ElicitationResult, McpSdkServerConfigWithInsta
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
-import { isGroupSessionKey } from "../sessions/keys.js";
+import { isDmSessionKey, isGroupSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
 import { litellmRoutesModel } from "../litellm.js";
@@ -243,6 +243,15 @@ export function sdkOptions(
     // Token-level partials are disabled. Completed content blocks still arrive
     // on assistant events and are delivered immediately (delivery-pipeline.ts).
     includePartialMessages: false,
+    // A one-line, model-written status for each running subagent (about every
+    // 30 s, forked off the subagent's own warm prompt cache). The web Tasks
+    // panel shows it as "Working · <summary>"; without it a subagent's card
+    // only ever names its last tool.
+    agentProgressSummaries: true,
+    // A predicted next owner message after each turn (`prompt_suggestion`,
+    // riding the turn's prompt cache). Only the web composer offers it, so
+    // only the owner's DM session asks for it, and only with the web UI on.
+    ...(sessionContext && isDmSessionKey(sessionContext.sessionKey) && config.web?.enabled ? { promptSuggestions: true } : {}),
     ...(thinking ? { thinking } : {}),
     maxTurns: config.maxTurns,
     ...buildHooksOption({

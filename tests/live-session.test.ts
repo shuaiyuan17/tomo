@@ -25,6 +25,7 @@ const mcpRuntime = vi.hoisted(() => ({
   calls: [] as Array<Record<string, unknown>>,
 }));
 
+const interruptState = vi.hoisted(() => ({ calls: 0, fail: false }));
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   query: vi.fn(({ prompt }: { prompt: AsyncGenerator<{ message: { content: Array<{ type: string; text?: string }> }; priority?: string; origin?: unknown; uuid?: string }> }) => {
     const inputs: string[] = [];
@@ -72,6 +73,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
         }
       },
       close: () => { done = true; wake?.(); },
+      interrupt: async () => { interruptState.calls++; if (interruptState.fail) throw new Error("not connected"); },
       getContextUsage: async () => ({ totalTokens: 100, maxTokens: 1000, percentage: 10, categories: [] }),
       getTaskOutput: async (taskId: string) => taskId === "b1" ? { output: "line 1\nline 2", size: 4096 } : { output: 7 },
     };
@@ -341,6 +343,8 @@ beforeEach(() => {
   harnessRef.current = null;
   mcpRuntime.available = true;
   mcpRuntime.calls = [];
+  interruptState.calls = 0;
+  interruptState.fail = false;
 });
 
 afterEach(() => {
@@ -1557,5 +1561,81 @@ describe("LiveSession: which request a result belongs to (2026-11-14 lost reply)
     harness.pushEvent(answering(harness.uuids[0]));
     await expect(p1).resolves.toBe("NO_REPLY");
     expect(vi.mocked(log.warn)).not.toHaveBeenCalledWith(expect.anything(), "Turn ended with no reply text; resolving as an empty reply");
+  });
+});
+
+describe("LiveSession.stop (owner Stop) and SDK signals", () => {
+  const interrupted = (uuid: string | undefined) => ({ ...resultEvent(), subtype: "error_during_execution", is_error: true,
+    user_message_uuids: [uuid], user_message_uuid: uuid });
+  const signals = async () => {
+    const { watchBus } = await import("../src/watch/bus.js");
+    const seen: unknown[] = [];
+    const off = watchBus.subscribe((event) => { if (event.type === "sdk") seen.push(event.signal); });
+    return { seen, off };
+  };
+
+  it("asks the SDK to interrupt and settles the stopped turn with what it had said, not as a failure", async () => {
+    const { session, harness } = makeSession();
+    const { seen, off } = await signals();
+    const turn = session.send("long job", undefined, undefined, () => {});
+    await flushMicrotasks();
+    harness.pushEvent(assistantEvent("Starting on it."));
+    await flushMicrotasks();
+    await expect(session.stop()).resolves.toBe(true);
+    expect(interruptState.calls).toBe(1);
+    harness.pushEvent(interrupted(harness.uuids[0]));
+    await expect(turn).resolves.toBe("Starting on it.");
+    expect(seen).toContainEqual({ kind: "stopped" });
+    expect(session.isAlive()).toBe(true);
+    off();
+  });
+
+  it("a stopped turn that had said nothing is silent, and the next turn's failure is still a failure", async () => {
+    const { session, harness } = makeSession();
+    const first = session.send("one");
+    await flushMicrotasks();
+    await session.stop();
+    harness.pushEvent(interrupted(harness.uuids[0]));
+    await expect(first).resolves.toBe("NO_REPLY");
+    const second = session.send("two");
+    await flushMicrotasks();
+    harness.pushEvent(interrupted(harness.uuids[1]));
+    await expect(second).rejects.toBeInstanceOf(SdkResultError);
+  });
+
+  it("stops nothing when idle, and a failed interrupt leaves the turn's own outcome in place", async () => {
+    const { session, harness } = makeSession();
+    await expect(session.stop()).resolves.toBe(false);
+    expect(interruptState.calls).toBe(0);
+    const turn = session.send("one");
+    await flushMicrotasks();
+    interruptState.fail = true;
+    await expect(session.stop()).resolves.toBe(false);
+    harness.pushEvent(interrupted(harness.uuids[0]));
+    await expect(turn).rejects.toBeInstanceOf(SdkResultError);
+  });
+
+  it("publishes retries, rate limits, tool progress and suggestions without touching the turn", async () => {
+    const { session, harness } = makeSession();
+    const { seen, off } = await signals();
+    const turn = session.send("hello", undefined, undefined, () => {});
+    await flushMicrotasks();
+    harness.pushEvent({ type: "system", subtype: "api_retry", attempt: 2, max_retries: 10, retry_delay_ms: 4000, error_status: 529, error: "overloaded" });
+    harness.pushEvent({ type: "rate_limit_event", rate_limit_info: { status: "allowed_warning", rateLimitType: "five_hour", resetsAt: 1_800_000_000, utilization: 0.9 } });
+    harness.pushEvent({ type: "tool_progress", tool_use_id: "t1", tool_name: "Bash", parent_tool_use_id: null, elapsed_time_seconds: 31 });
+    harness.pushEvent({ type: "tool_progress", tool_use_id: "t2", tool_name: "Read", parent_tool_use_id: "agent-1", elapsed_time_seconds: 5 });
+    harness.pushEvent(assistantEvent("Hi."));
+    harness.pushEvent({ ...resultEvent(), user_message_uuids: [harness.uuids[0]], user_message_uuid: harness.uuids[0] });
+    await expect(turn).resolves.toBe("Hi.");
+    harness.pushEvent({ type: "prompt_suggestion", suggestion: "[web · Wed 09/02 20:50 PDT] and tomorrow?" });
+    await flushMicrotasks();
+    expect(seen).toEqual([
+      { kind: "retry", attempt: 2, maxRetries: 10, delayMs: 4000, error: "overloaded", status: 529 },
+      { kind: "rate_limit", status: "allowed_warning", limit: "five_hour", resetsAt: 1_800_000_000_000, utilization: 90 },
+      { kind: "tool_progress", toolUseId: "t1", tool: "Bash", elapsedSeconds: 31 },
+      { kind: "suggestion", text: "and tomorrow?" },
+    ]);
+    expect(session.isBusy()).toBe(false);
+    off();
   });
 });

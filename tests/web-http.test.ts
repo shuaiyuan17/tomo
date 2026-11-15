@@ -58,6 +58,7 @@ beforeEach(async () => {
       if (input.method === "request") return channel.request(input.requestId);
       if (input.method === "dismiss") return channel.resolveInterrupted(input.requestId, "dismissed");
       if (input.method === "compact") return channel.requestCompact();
+      if (input.method === "stop") return channel.stopOwnerTurn();
       if (input.method === "task") return channel.task(input.sessionId, input.taskId, input.output);
       if (input.method === "usage") return channel.usage(input.refresh);
       return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };
@@ -199,6 +200,20 @@ describe("local HTTP boundary", () => {
     expect(busy.status).toBe(409);
     expect(JSON.parse(busy.text)).toEqual({ error: "tasks_running" });
     expect(compact).toHaveBeenCalledTimes(1);
+  });
+  it("stop needs CSRF and the epoch, and reaches the owner conversation's running turn", async () => {
+    const stop = vi.fn(async (_key: string) => true);
+    (channel as unknown as { stopTurn: typeof stop }).stopTurn = stop;
+    const post = (headers: Record<string, string | undefined>) => call("/api/v1/stop", { method: "POST", headers, body: "{}" });
+    expect((await post({ ...mutationHeaders(), "x-tomo-csrf": "wrong" })).status).toBe(403);
+    expect((await post({ ...mutationHeaders(), "x-tomo-epoch": undefined })).status).toBe(409);
+    expect(stop).not.toHaveBeenCalled();
+    const ok = await post(mutationHeaders());
+    expect(ok.status).toBe(200);
+    expect(JSON.parse(ok.text)).toEqual({ stopped: true });
+    expect(stop).toHaveBeenCalledWith("dm:owner");
+    stop.mockResolvedValueOnce(false);
+    expect(JSON.parse((await post(mutationHeaders())).text)).toEqual({ stopped: false });
   });
   it("gates every private API including SSE, while keeping static assets public", async () => {
     for (const path of ["/api/v1/bootstrap", "/api/v1/sessions", `/api/v1/sessions/${bootstrap.ownerId}/messages`, `/api/v1/messages/${randomUUID()}`, "/api/v1/events",

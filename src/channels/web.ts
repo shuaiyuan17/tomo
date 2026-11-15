@@ -5,6 +5,7 @@ import type { Channel, CommandHandler, IncomingMessage, MessageHandler, Outgoing
 import { markDefiniteFailure } from "./types.js";
 import { watchBus, type WatchBus } from "../watch/bus.js";
 import type { WatchEvent, WatchTask } from "../watch/protocol.js";
+import type { SdkSignal } from "../agent/sdk-signals.js";
 import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
 import { webSessionId } from "../web/owner.js";
 import { WebEvents } from "../web/events.js";
@@ -17,8 +18,13 @@ import { buildImageAttachment } from "./attachments.js";
 import { formatImageMarker } from "./imageStore.js";
 import type { ImageAttachment } from "./types.js";
 import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request-journal.js";
-import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
+import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
+import type { WebModelChangeResult, WebModelView } from "../web/protocol.js";
+import { modelLabel } from "../models.js";
+import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type WebStopResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
+/** A running tool's progress reaches the browser at most this often; the page counts in between. */
+export const TOOL_PROGRESS_EVERY_MS = 10_000;
 /** A shell task's full command is served up to this many characters. */
 const COMMAND_LIMIT = 16_000;
 /** Task types whose output tail the SDK serves (`get_task_output`). */
@@ -34,6 +40,16 @@ export const MAX_INTERRUPTED_BACKLOG = 64;
 const SNAPSHOT_MAILBOX_BYTES = MAX_BUFFER_BYTES - 64 * 1024 - MAX_SNAPSHOT_TASK_BYTES;
 
 export interface WebLifecycle { start(): Promise<void>; stop(): Promise<void> }
+/** The agent side of the Study's Model page (see Agent.webModelView / switchModelFromWeb). */
+export interface WebModelAccess {
+  view(key: string): Omit<WebModelView, "sessionId" | "writable">;
+  switch(key: string, model: string, from: string): ModelSwitchOutcome;
+}
+/** HTTP status of each refused model switch; the reason is the error code. */
+const MODEL_REFUSAL_STATUS: Record<ModelSwitchRefusal, number> = {
+  unknown_model: 422, gateway_required: 422, gateway_unroutable: 422,
+  model_changed: 409, turn_in_flight: 409, persist_failed: 503,
+};
 interface Receipt { digest: string; request: WebRequest; settled: boolean }
 
 /** A real channel: only Agent's registered MessageHandler accepts input, and
@@ -74,8 +90,20 @@ export class WebChannel implements Channel {
   private readonly inFlight = new Set<string>();
   private readonly compact: ((sessionKey: string, onSettled: (outcome: "done" | "unverified" | "failed") => void) => "queued" | "already_requested" | "no_owner") | undefined;
   private compactState: WebCompactState | undefined;
+  private readonly stopTurn: ((sessionKey: string) => Promise<boolean>) | undefined;
+  private readonly configuredModel: ((sessionKey: string) => string | undefined) | undefined;
+  /** Model id per browser session: the SDK's report, else the configured model. */
+  private modelBySession = new Map<string, string>();
+  private configuredSeen: string | undefined;
+  private rateLimit: WebRateLimit | undefined;
+  /** The SDK's standing prompt suggestion per browser session. */
+  private suggestions = new Map<string, string>();
+  /** When a tool's progress was last sent to the browser, by tool_use id. */
+  private toolProgressAt = new Map<string, number>();
   private readonly toolCommand: ((sessionKey: string, toolUseId: string) => string | undefined) | undefined;
   private readonly taskOutput: ((sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>) | undefined;
+  private readonly models: WebModelAccess | undefined;
+  private readonly sessionKeys: (() => readonly string[]) | undefined;
   /** Live and recently ended subagents/background tasks, per visible session. */
   readonly tasks: TaskBoard;
 
@@ -110,9 +138,21 @@ export class WebChannel implements Channel {
       uploads?: { dir: string; workspaceDir: string | undefined };
       /** Durable receipts; loaded here, before any request is accepted. */
       journal?: WebRequestJournal;
+      /** Soft-stops the running turn of `sessionKey`; false when nothing was running. */
+      stop?: (sessionKey: string) => Promise<boolean>;
+      /** The model `sessionKey` is configured to run on. */
+      model?: (sessionKey: string) => string | undefined;
       /** Claude subscription usage for the Plan usage card (cached, debounced). */
-      usage?: (refresh: boolean) => Promise<WebUsage> } = {}) {
+      usage?: (refresh: boolean) => Promise<WebUsage>;
+      /** The Study's Model page: a session key's model, and the agent's shared model switch. */
+      models?: WebModelAccess;
+      /** Every key in the session registry: where a group's browser session id is looked up. */
+      sessionKeys?: () => readonly string[] } = {}) {
+    this.models = options.models;
+    this.sessionKeys = options.sessionKeys;
     this.usageReader = options.usage;
+    this.stopTurn = options.stop;
+    this.configuredModel = options.model;
     this.taskOutput = options.taskOutput;
     this.toolCommand = options.toolCommand;
     this.compact = options.compact;
@@ -282,8 +322,12 @@ export class WebChannel implements Channel {
       .sort((a, b) => (a.request.timestamp ?? 0) - (b.request.timestamp ?? 0)).map((r) => ({ ...r.request }));
     const blocks = [...this.blocks];
     const tasks = this.tasks.snapshot();
+    this.refreshOwnerModel();
     return { epoch: this.events.epoch, cursor: this.events.cursor(), requests, blocks, tasks,
-      ...(this.compactState ? { compact: { ...this.compactState } } : {}) };
+      ...(this.compactState ? { compact: { ...this.compactState } } : {}),
+      ...(this.modelBySession.size ? { models: Object.fromEntries(this.modelBySession) } : {}),
+      ...(this.rateLimit ? { rateLimit: { ...this.rateLimit } } : {}),
+      ...(this.suggestions.size ? { suggestions: Object.fromEntries(this.suggestions) } : {}) };
   }
 
   /**
@@ -309,6 +353,83 @@ export class WebChannel implements Channel {
     const value = await this.taskOutput?.(found.slot, taskId).catch(() => undefined);
     if (!value) throw new WebError(503, "task_output_unavailable");
     return { ...access, output: { output: value.output.slice(-16 * 1024), size: value.size } };
+  }
+
+  /**
+   * The owner pressed Stop: soft-stop the running turn of the owner
+   * conversation the browser shows. The turn ends at the SDK's next
+   * checkpoint and settles like any other; background tasks keep running.
+   */
+  async stopOwnerTurn(): Promise<WebStopResult> {
+    const key = this.ownerKey();
+    if (!this.stopTurn || !this.ownerId || !key) throw new WebError(409, "owner_setup_required");
+    return { stopped: await this.stopTurn(key).catch(() => false) };
+  }
+
+  /** The owner conversation's model as configured, when the SDK has not reported one since it last changed. */
+  refreshOwnerModel(): void {
+    // A snapshot must never fail over a badge.
+    let model: string | undefined;
+    try { const key = this.ownerKey(); model = key ? this.configuredModel?.(key) : undefined; } catch { return; }
+    // Only a CHANGE of the configured model replaces what the SDK reported
+    // (its own spelling of the same model must not flip the badge back).
+    if (!this.ownerId || !model || this.configuredSeen === model) return;
+    this.configuredSeen = model;
+    this.setModel(this.ownerId, model);
+  }
+  private setModel(sessionId: string, model: string): void {
+    if (this.modelBySession.get(sessionId) === model) return;
+    if (!this.modelBySession.has(sessionId) && this.modelBySession.size >= 256) this.modelBySession.delete(this.modelBySession.keys().next().value!);
+    this.modelBySession.set(sessionId, model);
+    this.publishQuietly({ type: "model", sessionId, model });
+  }
+  private setSuggestion(sessionId: string, text: string | null): void {
+    if ((this.suggestions.get(sessionId) ?? null) === text) return;
+    if (text === null) this.suggestions.delete(sessionId); else this.suggestions.set(sessionId, text);
+    this.publishQuietly({ type: "suggestion", sessionId, text });
+  }
+  /** Status events are never worth failing an Agent path over. */
+  private publishQuietly(event: WebEvent): void {
+    try { this.events.publish(event); } catch { /* oversized: dropped */ }
+  }
+  /**
+   * An SDK signal for one session, as the browser shows it. Rate-limit state
+   * is the account's, not a conversation's; it is kept for the Plan usage
+   * card and sent only when it changes. Tool progress is sent at the first
+   * report and then at most every TOOL_PROGRESS_EVERY_MS: the page counts the
+   * seconds in between itself.
+   */
+  private observeSignal(sessionKey: string | undefined, signal: SdkSignal): void {
+    if (signal.kind === "rate_limit") {
+      const limit = { status: signal.status, ...(signal.limit ? { limit: signal.limit } : {}), ...(signal.resetsAt !== undefined ? { resetsAt: signal.resetsAt } : {}),
+        ...(signal.utilization !== undefined ? { utilization: signal.utilization } : {}), ...(signal.overage ? { overage: true } : {}) };
+      const old = this.rateLimit;
+      if (old && old.status === signal.status && old.limit === signal.limit && old.resetsAt === signal.resetsAt
+        && old.utilization === signal.utilization && !!old.overage === !!signal.overage) return;
+      this.rateLimit = { ...limit, at: this.now() };
+      this.publishQuietly({ type: "rate-limit", limit: { ...this.rateLimit } });
+      return;
+    }
+    const sessionId = sessionKey ? this.sessionId(sessionKey) : undefined;
+    if (!sessionId) return;
+    if (signal.kind === "model") { this.setModel(sessionId, signal.model); return; }
+    if (signal.kind === "suggestion") { this.setSuggestion(sessionId, signal.text); return; }
+    if (signal.kind === "tool_progress") {
+      const now = this.now();
+      const last = this.toolProgressAt.get(signal.toolUseId);
+      if (last !== undefined && now - last < TOOL_PROGRESS_EVERY_MS) return;
+      this.toolProgressAt.delete(signal.toolUseId);
+      this.toolProgressAt.set(signal.toolUseId, now);
+      if (this.toolProgressAt.size > 256) this.toolProgressAt.delete(this.toolProgressAt.keys().next().value!);
+      this.publishQuietly({ type: "turn", sessionId, status: { kind: "tool", tool: signal.tool, elapsed: signal.elapsedSeconds } });
+      return;
+    }
+    const status: WebTurnStatus = signal.kind === "retry"
+      ? { kind: "retry", attempt: signal.attempt, max: signal.maxRetries, delayMs: signal.delayMs, error: signal.error }
+      : signal.kind === "refusal"
+        ? { kind: "refusal", model: signal.model, ...(signal.fallbackModel ? { fallbackModel: signal.fallbackModel } : {}), ...(signal.category ? { category: signal.category } : {}) }
+        : signal.kind === "error" ? { kind: "error", error: signal.error } : { kind: "stopped" };
+    this.publishQuietly({ type: "turn", sessionId, status });
   }
 
   /** Subscription usage for the browser; never fails: an unconfigured reader reads as "unavailable". */
@@ -342,6 +463,55 @@ export class WebChannel implements Channel {
     if (status === "already_requested") return { status, requestId: this.compactState?.requestId ?? requestId };
     this.setCompactState({ requestId, state: "accepted", at: Date.now() });
     return { status, requestId };
+  }
+
+  /**
+   * The daemon key behind a browser session id, for the sessions the browser
+   * catalog shows: the owner conversation (the same owner-key rule) or a
+   * group in the registry. Anything else is not found.
+   */
+  private visibleKey(sessionId: string): { key: string; owner: boolean } {
+    if (this.ownerId && sessionId === this.ownerId) {
+      const key = this.ownerKey();
+      if (!key) throw new WebError(409, "owner_setup_required");
+      return { key, owner: true };
+    }
+    let keys: readonly string[] = [];
+    try { keys = this.sessionKeys?.() ?? []; } catch { /* unreadable registry: not found */ }
+    const key = keys.find((k) => isGroupSessionKey(k) && webSessionId(k) === sessionId);
+    if (!key) throw new WebError(404, "session_not_found");
+    return { key, owner: false };
+  }
+
+  /** The model a browser session runs on and what it could switch to. Groups read it, never switch it. */
+  model(sessionId: string): WebModelView {
+    if (!this.models) throw new WebError(503, "service_unavailable");
+    const { key, owner } = this.visibleKey(sessionId);
+    return { sessionId, writable: owner, ...this.models.view(key) };
+  }
+
+  /**
+   * Switch the owner conversation's model through the agent's shared switch
+   * (the one /model uses). `from` is the model the owner reviewed: a different
+   * current model refuses (409 model_changed). Refused while a turn is in
+   * flight (409 turn_in_flight) rather than cutting it off. Nothing is
+   * persisted on any refusal. Open pages re-read on the invalidate event.
+   */
+  switchModel(sessionId: string, model: string, from: string): WebModelChangeResult {
+    if (!this.models) throw new WebError(503, "service_unavailable");
+    if (this.tornDown) throw new WebError(503, "ingress_closed");
+    const { key, owner } = this.visibleKey(sessionId);
+    if (!owner) throw new WebError(403, "owner_dm_only");
+    const outcome = this.models.switch(key, model, from);
+    if (!outcome.ok) throw new WebError(MODEL_REFUSAL_STATUS[outcome.reason], outcome.reason);
+    if (outcome.changed) {
+      // The chat's model badge follows at once, not at the next turn.
+      this.setModel(sessionId, outcome.model);
+      this.configuredSeen = outcome.model;
+      try { this.events.publish({ type: "invalidate", sessionId }); } catch { /* best effort */ }
+    }
+    return { status: outcome.changed ? "switched" : "unchanged",
+      model: { id: outcome.model, label: modelLabel(outcome.model) }, previous: { id: outcome.previous, label: modelLabel(outcome.previous) } };
   }
 
   private setCompactState(state: WebCompactState): void {
@@ -560,6 +730,7 @@ export class WebChannel implements Channel {
   private observe(event: WatchEvent): void {
     // Session-less: a run changes the job's next / last run. Carries nothing.
     if (event.type === "cron.fired" || event.type === "cron.done") { this.events.publish({ type: "cron" }); return; }
+    if (event.type === "sdk") { this.observeSignal(event.sessionKey, event.signal); return; }
     if (!("sessionKey" in event) || !event.sessionKey) return;
     const sessionId = this.sessionId(event.sessionKey);
     if (!sessionId) return;
@@ -572,8 +743,12 @@ export class WebChannel implements Channel {
     } else if (event.type === "turn.requeue") {
       const receipt = this.receipts.get(event.requestId);
       if (receipt && !receipt.settled) this.state(event.requestId, "queued");
-    } else if (event.type === "turn.start" && event.requestId && this.receipts.has(event.requestId)) {
-      this.state(event.requestId, "running");
+    } else if (event.type === "turn.start") {
+      // A new turn makes the last one's suggestion stale.
+      this.publishQuietly({ type: "turn", sessionId, status: null });
+      this.setSuggestion(sessionId, null);
+      this.refreshOwnerModel();
+      if (event.requestId && this.receipts.has(event.requestId)) this.state(event.requestId, "running");
     } else if (event.type === "turn.end" && event.requestId) {
       // Handed to the SDK and then cut short: it may have run. Say so rather
       // than "failed", which invites a resend that could run it twice.

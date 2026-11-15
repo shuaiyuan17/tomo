@@ -2,7 +2,8 @@ import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { join, sep } from "node:path";
-import { itemsFromLine, PAGE_BYTES, readWindow, type ToolRedaction } from "./subagent-reader.js";
+import { PAGE_BYTES, readLine, readWindow, type ToolRedaction } from "./subagent-reader.js";
+import { isSidechainLine, mayHoldToolBlocks, reportUnreadable, SDK_SESSION_ID, sessionTranscriptFile, type Problem } from "./sdk-transcript.js";
 import { redactText, redactToolInput } from "./redact-command.js";
 import { isPrivateMemoryAccess } from "../agent/private-memory-access.js";
 import type { SessionTools, SubagentItem } from "./protocol.js";
@@ -24,7 +25,6 @@ import type { SessionTools, SubagentItem } from "./protocol.js";
 export const MAX_SCAN_BYTES = 16 * 1024 * 1024;
 /** Tool and result items in one answer; the newest are kept. */
 export const MAX_TOOL_ITEMS = 800;
-const SDK_SESSION_ID = /^[A-Za-z0-9-]{1,80}$/;
 /** How far back an `after` read looks for the calls of results it got without them. */
 export const PAIR_LOOKBACK_BYTES = 2 * 1024 * 1024;
 export const PRIVATE_HIDDEN = "[private memory content hidden]";
@@ -70,11 +70,19 @@ export function transcriptToken(sdkSessionId: string): string {
   return createHash("sha256").update(sdkSessionId).digest("base64url").slice(0, 16);
 }
 
-/** Only the tool calls and results of one main-conversation line (no sidechains, no text). */
+/** Only the tool calls and results of one main-conversation line (no sidechains, no text, no thinking). */
 export function toolItemsFromLine(text: string, offset: number, scope: PrivateScope = {}): SubagentItem[] {
-  if (!text.includes('"tool_use"') && !text.includes('"tool_result"')) return [];
-  if (text.includes('"isSidechain":true')) return [];
-  return itemsFromLine(text, offset, redaction(scope)).filter((item) => item.kind === "tool" || item.kind === "result");
+  return toolLine(text, offset, scope).items;
+}
+
+/**
+ * As toolItemsFromLine, plus what the parser did not recognise. Only lines
+ * that can hold a tool block are parsed (the scan covers up to 16 MiB).
+ */
+function toolLine(text: string, offset: number, scope: PrivateScope): { items: SubagentItem[]; problems: Problem[] } {
+  if (!mayHoldToolBlocks(text) || isSidechainLine(text)) return { items: [], problems: [] };
+  const { items, problems } = readLine(text, offset, redaction(scope));
+  return { items: items.filter((item) => item.kind === "tool" || item.kind === "result"), problems };
 }
 
 /**
@@ -90,8 +98,11 @@ export function pairOutputs(items: SubagentItem[], known: ReadonlyMap<string, bo
     if (item.kind === "tool") { const rest = { ...item }; delete rest.privateOutput; return rest; }
     if (item.kind !== "result") return item;
     const reached = calls.get(item.toolUseId);
-    if (reached === undefined) return { ...item, output: UNPAIRED_HIDDEN, truncated: false };
-    return reached ? { ...item, output: PRIVATE_HIDDEN, truncated: false } : item;
+    // A withheld output is replaced whole: not even how many images it held.
+    const rest = { ...item };
+    delete rest.images;
+    if (reached === undefined) return { ...rest, output: UNPAIRED_HIDDEN, truncated: false };
+    return reached ? { ...rest, output: PRIVATE_HIDDEN, truncated: false } : item;
   });
 }
 
@@ -110,7 +121,7 @@ export async function readSessionTools(sdkSessionsDir: string, sdkSessionId: str
   if (query.after !== undefined && query.transcript !== token) throw new SessionToolsError("transcript_reset");
   let root: string;
   try { root = await realpath(sdkSessionsDir); } catch { return EMPTY; }
-  const path = join(root, `${sdkSessionId}.jsonl`);
+  const path = sessionTranscriptFile(root, sdkSessionId)!;
   const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK).catch(() => undefined);
   if (!fd) {
     if (query.after !== undefined) throw new SessionToolsError("transcript_reset");
@@ -121,6 +132,19 @@ export async function readSessionTools(sdkSessionsDir: string, sdkSessionId: str
     const stat = await fd.stat();
     if (!stat.isFile()) return EMPTY;
     const size = stat.size;
+    // Lines this answer read that the parser did not recognise: counted in
+    // the answer (the chat notes it) and logged once per transcript.
+    const problems: Problem[] = [];
+    let unreadable = 0;
+    const read = (line: { text: string; offset: number }) => {
+      const result = toolLine(line.text, line.offset, scope);
+      if (result.problems.length) { unreadable++; problems.push(...result.problems); }
+      return result.items;
+    };
+    const flagged = () => {
+      reportUnreadable(path, "session", unreadable, problems);
+      return unreadable ? { unreadable } : {};
+    };
     if (query.after !== undefined) {
       if (query.after > size) throw new SessionToolsError("transcript_reset");
       const items: SubagentItem[] = [];
@@ -128,7 +152,7 @@ export async function readSessionTools(sdkSessionsDir: string, sdkSessionId: str
       while (cursor < size && cursor - query.after < MAX_SCAN_BYTES && items.length < MAX_TOOL_ITEMS) {
         const page = await readWindow(fd, size, cursor, Math.min(size, cursor + PAGE_BYTES), "forward");
         if (page.end <= cursor) break; // only a partial line so far
-        for (const line of page.lines) items.push(...toolItemsFromLine(line.text, line.offset, scope));
+        for (const line of page.lines) items.push(...read(line));
         cursor = page.end;
       }
       // Results whose call was on an earlier page: find those calls just before `after`.
@@ -146,7 +170,7 @@ export async function readSessionTools(sdkSessionsDir: string, sdkSessionId: str
         if (page.start >= hi) break;
         hi = page.start;
       }
-      return { items: pairOutputs(items, known), end: cursor, transcript: token, complete: true };
+      return { items: pairOutputs(items, known), end: cursor, transcript: token, complete: true, ...flagged() };
     }
     const from = query.from ?? 0;
     const pages: SubagentItem[][] = [];
@@ -157,7 +181,7 @@ export async function readSessionTools(sdkSessionsDir: string, sdkSessionId: str
     while (hi > 0 && size - hi < MAX_SCAN_BYTES && count < MAX_TOOL_ITEMS) {
       const page = await readWindow(fd, size, Math.max(0, hi - PAGE_BYTES), hi, "back");
       end ??= page.end;
-      const items = page.lines.flatMap((line) => toolItemsFromLine(line.text, line.offset, scope));
+      const items = page.lines.flatMap(read);
       pages.unshift(items);
       count += items.length;
       if (items.some((item) => item.kind === "tool" && item.ts !== undefined && item.ts < from)) { reached = true; break; }
@@ -167,8 +191,8 @@ export async function readSessionTools(sdkSessionsDir: string, sdkSessionId: str
     const all = pages.flat();
     const tools = all.filter((item) => item.kind === "tool" && (item.ts ?? Infinity) >= from);
     const kept = new Set(tools.slice(-MAX_TOOL_ITEMS / 2).map((item) => (item as Extract<SubagentItem, { kind: "tool" }>).toolUseId));
-    const items = all.filter((item) => item.kind !== "text" && item.kind !== "message" && kept.has(item.toolUseId));
+    const items = all.filter((item) => (item.kind === "tool" || item.kind === "result") && kept.has(item.toolUseId));
     // Incomplete: the scan stopped at a cap before reaching `from`, or found more calls than it keeps.
-    return { items: pairOutputs(items), end: end ?? 0, transcript: token, complete: (reached || hi === 0) && tools.length <= MAX_TOOL_ITEMS / 2 };
+    return { items: pairOutputs(items), end: end ?? 0, transcript: token, complete: (reached || hi === 0) && tools.length <= MAX_TOOL_ITEMS / 2, ...flagged() };
   } finally { await fd.close(); }
 }

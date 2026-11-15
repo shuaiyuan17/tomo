@@ -26,6 +26,21 @@ export function useJumpToLatest(scroll: RefObject<HTMLDivElement | null>, atBott
     else if (action === "bottom") element.scrollTop = element.scrollHeight;
     lastTop.current = element.scrollTop;
   });
+  // A picture has no height until it loads, which is after the render that
+  // followed the end: the view was left short of the bottom, with the image
+  // cut off. `load` does not bubble, so it is caught on the way down; while
+  // the reader is following, the view follows the picture's real height too.
+  useEffect(() => {
+    const element = scroll.current;
+    if (!element) return;
+    const follow = (event: Event) => {
+      if (!(event.target instanceof HTMLImageElement) || !atBottom.current || restore.current !== null) return;
+      element.scrollTop = element.scrollHeight;
+      lastTop.current = element.scrollTop;
+    };
+    element.addEventListener("load", follow, true);
+    return () => element.removeEventListener("load", follow, true);
+  }, [scroll, atBottom, restore]);
   const baseline = useRef<{ scope: string; keys: Set<string> }>({ scope: "", keys: new Set() });
   const [position, setPosition] = useState({ atBottom: true, far: false });
   const fresh = baseline.current.scope !== scope;

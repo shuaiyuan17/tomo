@@ -32,7 +32,8 @@ describe("interleave: tool calls between the chat's messages", () => {
     expect(shape(out)).toEqual(["u1", "|", "group:calls:r1"]);
     const group = out.trailing[0];
     if (group.kind !== "group") throw new Error("expected a group");
-    expect(groupLabel(group.tools, pendingTool(group.tools))).toEqual({ lead: "2 tool calls · ", running: "Running Bash…" });
+    const pending = pendingTool(group.tools)!;
+    expect(groupLabel(group.tools, pending)).toEqual({ lead: "Read a file · ", running: `${pending.summary || pending.name}…` });
   });
   it("drops calls before the oldest loaded message (older history not loaded) and calls without a time", () => {
     const items = [...call("old", "Read", 50), { kind: "tool", id: "1:0", toolUseId: "nots", name: "X", summary: "", input: "{}", inputTruncated: false } as SubagentItem,

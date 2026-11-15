@@ -304,6 +304,14 @@ export interface TurnSpec {
    * caller that records outcomes (cron) uses this to record "empty", not "ok".
    */
   onEmpty?: () => void;
+  /**
+   * The owner stopped this turn (web Stop → the SDK's interrupt). It settles
+   * like a finished turn — what it had already said is delivered and
+   * recorded, nothing is reported as an error — and still returns true. But
+   * it did NOT finish, so a caller that records outcomes (cron) uses this to
+   * record an interruption, never "ok".
+   */
+  onStopped?: () => void;
 }
 
 /**
@@ -547,6 +555,14 @@ export class TurnRunner {
     // and the caller is told it was empty so cron does not record "ok".
     const empty = rawResponse === EMPTY_REPLY;
     if (empty) spec.onEmpty?.();
+    // STOPPED BY THE OWNER IS NOT A FINISHED RUN. The outcome is on this
+    // request's own context (set by the session at the result), so it does
+    // not depend on that session still existing: a compact reload closes it
+    // in the manager's completion bookkeeping, before control returns here.
+    if (spec.replyContext?.stopped) {
+      log.info({ key: spec.key, source: spec.source }, "turn was stopped by the owner before it finished");
+      spec.onStopped?.();
+    }
 
     // The scaffold-leak filter already ran PER BLOCK in renderBlock, as each
     // block shipped — running it here over the joined response would cut every

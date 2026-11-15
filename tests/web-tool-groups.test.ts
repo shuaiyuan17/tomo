@@ -32,17 +32,22 @@ describe("tool-call groups", () => {
       .toEqual(["group:m1:2", "text", "group:m3:2"].map((x) => x === "text" ? "message" : x));
   });
 
-  it("summarises by tool, most used first", () => {
+  it("summarises by what the calls did, in order of first use", () => {
     const tools = viewRows([...call("Read", "1"), ...call("Bash", "2"), ...call("Read", "3"), ...call("Grep", "4"), ...call("Bash", "5"), ...call("Read", "6"), ...call("Edit", "7")]) as ToolRow[];
-    expect(groupSummary(tools)).toBe("7 tool calls · Read ×3, Bash ×2, Grep, Edit");
+    expect(groupSummary(tools)).toBe("Read 3 files, ran 2 commands, ran a search, edited a file");
+    const mixed = [{ name: "mcp__tomo-internal__recall" }, { name: "Edit" }, { name: "Write" }, { name: "Agent" }, { name: "WebFetch" }, { name: "Glob" }, { name: "Grep" }] as ToolRow[];
+    expect(groupSummary(mixed)).toBe("Used a tool, edited 2 files, started a subagent, looked up a page, ran 2 searches");
     expect(pendingTool(tools)).toBeUndefined();
     const running = viewRows([...call("Read", "1"), ...call("Bash", "2", false)]) as ToolRow[];
     expect(pendingTool(running)?.name).toBe("Bash");
   });
 
-  it("a closed running group still says what it is doing: the count, then the running call", () => {
+  it("a closed running group still says what it is doing: what is done, then the running call by its title", () => {
     const running = viewRows([...call("Read", "1"), ...call("Read", "2"), ...call("Bash", "3", false)]) as ToolRow[];
-    expect(groupLabel(running, pendingTool(running))).toEqual({ lead: "3 tool calls · ", running: "Running Bash…" });
+    const pending = pendingTool(running)!;
+    expect(groupLabel(running, pending)).toEqual({ lead: "Read 2 files · ", running: `${pending.summary || "Bash"}…` });
+    const described = { ...pending, summary: "Run the test suite" };
+    expect(groupLabel([described], described)).toEqual({ lead: "", running: "Run the test suite…" });
     expect(groupLabel(running)).toEqual({ lead: groupSummary(running) });
   });
 

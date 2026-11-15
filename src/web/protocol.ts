@@ -62,19 +62,25 @@ export type SubagentItem =
   | { kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean; ts?: number;
     /** Server-side only (session-tools.ts): the call reached memory/private, so its output is withheld. Never sent. */
     privateOutput?: boolean }
-  | { kind: "result"; id: string; toolUseId: string; output: string; truncated: boolean; isError: boolean }
+  /** `images`: image blocks in the output, counted and never served (the view shows a chip). */
+  | { kind: "result"; id: string; toolUseId: string; output: string; truncated: boolean; isError: boolean; images?: number }
   /** A message sent to the subagent while it ran (not its first prompt, which is the brief). */
-  | { kind: "message"; id: string; text: string; truncated: boolean; ts?: number };
+  | { kind: "message"; id: string; text: string; truncated: boolean; ts?: number }
+  /** A subagent's (non-empty) thinking block, clipped like text; shown folded. Never in the main chat's tool items. */
+  | { kind: "thinking"; id: string; text: string; truncated: boolean; ts?: number };
 /** The prompt the subagent was given: the first entry of its transcript. */
 export interface SubagentBrief { text: string; truncated: boolean }
 /** A byte window of complete transcript lines: page back with `before=start`, tail with `after=end`. */
-export interface SubagentPage { items: SubagentItem[]; start: number; end: number; size: number; hasEarlier: boolean }
+/** `unreadable`: lines in this window the reader did not recognise (sdk-transcript.ts); the view says some entries could not be read. */
+export interface SubagentPage { items: SubagentItem[]; start: number; end: number; size: number; hasEarlier: boolean; unreadable?: number }
 /**
  * The tool calls of a conversation's current SDK transcript, for the chat to
  * show inline. `end`: read on with `after=end&transcript=…`; `complete`: the
  * scan reached the requested time (or the transcript's start).
  */
-export interface SessionTools { items: SubagentItem[]; end: number; transcript: string; complete: boolean }
+export interface SessionTools { items: SubagentItem[]; end: number; transcript: string; complete: boolean;
+  /** Lines read for this answer that the reader did not recognise. */
+  unreadable?: number }
 /** The end of a shell/Monitor task's output (SDK `get_task_output`: at most the last 8 KiB). */
 export interface TaskOutput { output: string; size: number }
 /** One subscription usage window for the Plan usage card. */
@@ -116,6 +122,31 @@ export interface WebUsage {
  * rather than a dropped connection.
  */
 export const USAGE_RPC_TIMEOUT_MS = 24_000;
+/**
+ * What the SDK reports about a session's running turn besides its content.
+ * `retry` and `tool` describe the moment and lapse as the turn moves on;
+ * `refusal`, `error` and `stopped` say how it went and stay until the next
+ * message.
+ */
+export type WebTurnStatus =
+  | { kind: "retry"; attempt: number; max: number; delayMs: number; error: string }
+  | { kind: "tool"; tool: string; elapsed: number }
+  | { kind: "refusal"; model: string; fallbackModel?: string; category?: string }
+  | { kind: "error"; error: string }
+  | { kind: "stopped" };
+/** The subscription's rate-limit state as the SDK last reported it (`rate_limit_event`). */
+export interface WebRateLimit {
+  status: "allowed" | "allowed_warning" | "rejected";
+  /** five_hour, seven_day, seven_day_opus, … */
+  limit?: string;
+  /** ms epoch. */
+  resetsAt?: number;
+  /** 0–100. */
+  utilization?: number;
+  overage?: boolean;
+  /** Daemon clock when it was reported (ms epoch). */
+  at: number;
+}
 export type WebEvent =
   /** `images`: ids of pictures this block sent, filed in the outgoing media store (see outgoing-media.ts). */
   | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string; images?: string[] }
@@ -127,6 +158,13 @@ export type WebEvent =
   | { type: "typing"; sessionId: string; active: boolean }
   /** The latest compact request changed state. */
   | { type: "compact"; request: WebCompactState }
+  /** null: a new turn started, whatever the last one reported no longer applies. */
+  | { type: "turn"; sessionId: string; status: WebTurnStatus | null }
+  | { type: "rate-limit"; limit: WebRateLimit }
+  /** The model a session runs on (the SDK's own report once it has one, else the configured one). */
+  | { type: "model"; sessionId: string; model: string }
+  /** The SDK's predicted next message for the composer; null withdraws it. */
+  | { type: "suggestion"; sessionId: string; text: string | null }
   /** All tasks of one session, live and recently ended. REPLACE semantics. */
   | { type: "tasks"; sessionId: string; tasks: WebTask[] };
 export interface EventEnvelope { id: string; event: WebEvent }
@@ -142,6 +180,11 @@ export interface WebBootstrap extends WebCatalog {
   capabilities?: { screen: boolean; uploads?: boolean };
   /** The latest compact request, so a reload still shows it. */
   compact?: WebCompactState;
+  /** Model id per session, where known. */
+  models?: Record<string, string>;
+  rateLimit?: WebRateLimit;
+  /** The standing prompt suggestion per session. */
+  suggestions?: Record<string, string>;
   /** What the UI calls the agent (config `agent.name`, else IDENTITY.md, else "Tomo"); absent on older daemons. */
   agentName?: string;
 }
@@ -175,6 +218,29 @@ export type McpConnectionState = "connected" | "failed" | "needs-auth" | "pendin
 export interface WebMcpServer { name: string; enabled: boolean; type: string; oauth: boolean; timeout: number | null; alwaysLoad: boolean; configured: string[] }
 export interface WebMcpLiveSession { sessionId: string; connections: Array<{ name: string; status: McpConnectionState }> | null }
 export interface WebMcpView { missing: boolean; servers: WebMcpServer[]; live: { available: boolean; sessions: WebMcpLiveSession[] } }
+/** One model the Study's Model page offers: an alias target, with every alias naming it. */
+export interface WebModelOption { id: string; label: string; aliases: string[] }
+/** The model of one browser session, and what it can be switched to (GET /models?session=). */
+export interface WebModelView {
+  sessionId: string;
+  model: { id: string; label: string };
+  /** config.model: what a conversation without its own choice runs on. */
+  defaultModel: { id: string; label: string };
+  /** The conversation has its own choice (sessionModelOverrides). */
+  overridden: boolean;
+  /** Only the owner's conversation can be switched from the browser; groups are read-only. */
+  writable: boolean;
+  /** A turn is in flight; a switch is refused (409 turn_in_flight) until it ends. */
+  busy: boolean;
+  options: WebModelOption[];
+  /** A LiteLLM gateway is configured (provider/model ids are accepted); chatgptOnly: it routes chatgpt/* only. */
+  gateway: { configured: boolean; chatgptOnly: boolean; example: string };
+}
+/** A confirmed model switch of the owner's conversation (POST /models). `from`: the model id the page showed. */
+export const modelChangeSchema = z.object({ sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/), model: z.string().trim().min(1).max(200),
+  from: z.string().min(1).max(200), confirm: z.literal(true) }).strict();
+/** `unchanged`: it already ran on that model; nothing was written or restarted. */
+export interface WebModelChangeResult { status: "switched" | "unchanged"; model: { id: string; label: string }; previous: { id: string; label: string } }
 /** A confirmed cron change: PATCH sets `enabled`, DELETE removes. */
 export const cronChangeSchema = z.object({ revision: z.string().regex(/^[a-f0-9]{64}$/), confirm: z.literal(true), enabled: z.boolean().optional() }).strict();
 export class WebError extends Error {
@@ -196,17 +262,26 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("context-events"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict(),
   z.object({ method: z.literal("usage"), refresh: z.boolean() }).strict(),
   z.object({ method: z.literal("compact"), epoch: z.uuid() }).strict(),
+  /** Stop the owner conversation's running turn. */
+  z.object({ method: z.literal("stop"), epoch: z.uuid() }).strict(),
   /** A task the browser was shown, by its browser session: where to read it. */
   z.object({ method: z.literal("task"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     taskId: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/), output: z.boolean(), command: z.boolean().optional() }).strict(),
+  /** The model of a browser session (the Study's Model page). */
+  z.object({ method: z.literal("model"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict(),
+  /** Switch the owner conversation's model; `from` is the model the owner reviewed. */
+  z.object({ method: z.literal("model-switch"), epoch: z.uuid(), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    model: z.string().trim().min(1).max(200), from: z.string().min(1).max(200) }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
-export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact">;
+export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "models" | "rateLimit" | "suggestions">;
 export interface WebSync { snapshot: WebSnapshot; replay: EventEnvelope[] | null }
 /** Daemon answer to the `task` RPC. `sessionKey` stays inside the web process. */
 export interface WebTaskAccess { sessionKey: string; taskType: string; output?: TaskOutput;
   /** A shell task's full command, redacted and capped (see redact-command.ts). */
   command?: { text: string; truncated: boolean } }
+/** Answer to a stop request: whether a turn was running to stop. */
+export interface WebStopResult { stopped: boolean }
 /** Answer to a compact request: queued, or one is already outstanding. */
 export interface WebCompactResult { status: "queued" | "already_requested"; requestId: string }
 /**

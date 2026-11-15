@@ -9,21 +9,24 @@ import { appendedIds } from "./motion.js";
  * between the chat's own messages by time.
  */
 
-/** `complete: false`: the first scan stopped at its cap before reaching the oldest loaded message (older calls are not shown). */
-export interface ToolsState { transcript: string; end: number; items: SubagentItem[]; complete: boolean }
-export const NO_TOOLS: ToolsState = { transcript: "", end: 0, items: [], complete: true };
+/**
+ * `complete: false`: the first scan stopped at its cap before reaching the oldest loaded message (older calls are not shown).
+ * `unreadable`: the server met transcript lines it could not read since the last fresh scan (some calls may be missing).
+ */
+export interface ToolsState { transcript: string; end: number; items: SubagentItem[]; complete: boolean; unreadable: boolean }
+export const NO_TOOLS: ToolsState = { transcript: "", end: 0, items: [], complete: true, unreadable: false };
 /** Items kept in memory for one conversation; the oldest go first. */
 export const MAX_KEPT_TOOL_ITEMS = 2_000;
 
 /** A fresh scan (`from`) replaces; a tail read (`after`) appends what is new, by item id (a byte offset, so stable). */
 export function mergeTools(state: ToolsState, page: SessionTools, kind: "full" | "newer"): ToolsState {
   if (kind === "full" || page.transcript !== state.transcript) {
-    return { transcript: page.transcript, end: page.end, items: page.items.slice(-MAX_KEPT_TOOL_ITEMS), complete: page.complete };
+    return { transcript: page.transcript, end: page.end, items: page.items.slice(-MAX_KEPT_TOOL_ITEMS), complete: page.complete, unreadable: !!page.unreadable };
   }
   const seen = new Set(state.items.map((item) => item.id));
   const fresh = page.items.filter((item) => !seen.has(item.id));
   const items = fresh.length ? [...state.items, ...fresh].slice(-MAX_KEPT_TOOL_ITEMS) : state.items;
-  return { transcript: state.transcript, end: Math.max(state.end, page.end), items, complete: state.complete };
+  return { transcript: state.transcript, end: Math.max(state.end, page.end), items, complete: state.complete, unreadable: state.unreadable || !!page.unreadable };
 }
 
 /** A tool block in the chat, keyed so its open/closed state survives paging and live updates. */

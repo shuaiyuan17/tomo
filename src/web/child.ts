@@ -4,6 +4,7 @@ import { startWebHttp } from "./http.js";
 import { macScreenSource, ScreenLoop } from "./screen.js";
 import { USAGE_RPC_TIMEOUT_MS, WebError, type EventEnvelope, type Rpc } from "./protocol.js";
 import { loadWebToken, writeWebAccessLinks } from "./token-store.js";
+import { setUnreadableReporter } from "./sdk-transcript.js";
 
 interface Init { type: "init"; options: WebDataOptions & { port: number; assetsDir: string; tomoHome: string; externalOrigin?: string; uploadsEnabled?: boolean } }
 type Message = Init | { type: "ping" } | { type: "event"; value: EventEnvelope }
@@ -18,6 +19,10 @@ function send(value: unknown) {
   if (!process.connected) throw new WebError(503, "daemon_disconnected");
   process.send!(value as object, (error: Error | null) => { if (error) process.exit(1); });
 }
+
+// A transcript the reader does not recognise is logged by the daemon (this
+// process has no log): enumerated fields only, never a path or file text.
+setUnreadableReporter((report) => { try { send({ type: "transcript_unreadable", ...report }); } catch { /* daemon gone */ } });
 
 process.on("message", (value: Message) => {
   if (value.type === "ping") { send({ type: "pong" }); return; }

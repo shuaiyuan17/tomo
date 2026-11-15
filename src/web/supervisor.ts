@@ -6,6 +6,7 @@ import type { WebDataOptions } from "./data.js";
 import type { McpConnection } from "../mcp/live-status.js";
 import { MAX_BUFFER_BYTES, rpcSchema, WebError } from "./protocol.js";
 import { validAccessToken } from "./access.js";
+import { describeUnreadable } from "./sdk-transcript.js";
 import { writeWebStatus, type WebState, type WebStatusRecord } from "./status-file.js";
 
 export type DiagnosticLevel = "info" | "warn" | "error";
@@ -195,6 +196,7 @@ export class WebSupervisor implements WebLifecycle {
         const value = raw as Record<string, unknown>;
         if (value.type === "pong") { lastPong = Date.now(); return; }
         if (value.type === "token_created") { this.report("Web access token created or replaced; use the new access link."); return; }
+        if (value.type === "transcript_unreadable") { const line = describeUnreadable(value); if (line) this.report(line, "warn"); return; }
         if (value.type === "ready" && typeof value.port === "number" && validAccessToken(value.accessToken)) {
           this.boundPort = value.port;
           const recovered = this.restarts;
@@ -260,6 +262,15 @@ export class WebSupervisor implements WebLifecycle {
             });
           }
           if (input.method === "usage") return this.channel.usage(input.refresh);
+          if (input.method === "stop") {
+            if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
+            return this.channel.stopOwnerTurn();
+          }
+          if (input.method === "model") return this.channel.model(input.sessionId);
+          if (input.method === "model-switch") {
+            if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
+            return this.channel.switchModel(input.sessionId, input.model, input.from);
+          }
           if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
           if (input.method === "dismiss") return this.channel.resolveInterrupted(input.requestId, "dismissed");
           return this.channel.receive(input.input);

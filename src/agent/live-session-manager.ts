@@ -219,6 +219,23 @@ export class LiveSessionManager {
     return !!live?.isAlive() && live.isBusy();
   }
 
+  /** Soft-stop the key's running turn (SDK interrupt); the session stays. False when nothing runs. */
+  async stopTurn(key: string): Promise<boolean> {
+    const live = this.liveSessions.get(key);
+    return live?.isAlive() && live.isBusy() ? live.stop() : false;
+  }
+
+  /**
+   * Is a turn running on this key in any phase: dispatched (still building
+   * its session, or built and not yet claimed), being answered, or held by a
+   * /rewind? Wider than isBusy(), which only sees the answering phase. Used to
+   * refuse a model switch from the web rather than close a session under a turn.
+   */
+  hasTurnInFlight(key: string): boolean {
+    return this.isBusy(key) || (this.dispatches.get(key)?.size ?? 0) > 0
+      || this.liveSessionCreates.has(key) || this.sessionHolds.has(key);
+  }
+
   /** A shell/Monitor task's output tail from the key's live session; never creates one. */
   async taskOutput(key: string, taskId: string): Promise<{ output: string; size: number } | undefined> {
     const live = this.liveSessions.get(key);

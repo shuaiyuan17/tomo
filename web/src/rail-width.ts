@@ -11,9 +11,9 @@ export const RAIL_KEY_STEP_LARGE = 64;
 
 export interface RailBounds { min: number; max: number }
 
-/** The stylesheet's width for the rail (main.tsx: w-[300px], max-[1024px]:w-[260px]). */
+/** The stylesheet's width for the rail (main.tsx: w-[300px], max-[1024px]:w-[280px]); never below RAIL_MIN. */
 export function railDefaultWidth(viewport: number): number {
-  return viewport <= 1024 ? 260 : 300;
+  return viewport <= 1024 ? 280 : 300;
 }
 
 /**
@@ -28,6 +28,16 @@ export function railBounds(viewport: number, sidebar: number): RailBounds | null
 
 export function clampRailWidth(width: number, bounds: RailBounds): number {
   return Math.round(Math.min(bounds.max, Math.max(bounds.min, width)));
+}
+
+/**
+ * localStorage, or undefined where the browser refuses it. Reading the
+ * PROPERTY can throw (SecurityError when storage is blocked), not just
+ * getItem/setItem, so it is fetched inside the try too; without storage the
+ * width lives in memory only.
+ */
+export function safeLocalStorage(): Storage | undefined {
+  try { return typeof window === "undefined" ? undefined : window.localStorage; } catch { return undefined; }
 }
 
 /** The stored width, if it is a sane number (bounds are applied at use). */
@@ -70,7 +80,7 @@ export function railWidthForKey(key: string, shift: boolean, width: number, boun
  * reflows once.
  */
 export function useRailWidth(options: { enabled: boolean; sidebar: () => number }) {
-  const storage = typeof window === "undefined" ? undefined : window.localStorage;
+  const [storage] = useState(safeLocalStorage);
   const [stored, setStored] = useState<number | null>(() => readRailWidth(storage));
   const [viewport, setViewport] = useState(() => (typeof window === "undefined" ? 1440 : window.innerWidth));
   const guide = useRef<HTMLDivElement>(null);

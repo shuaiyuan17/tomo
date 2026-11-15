@@ -130,6 +130,20 @@ it("the Tasks rail resizes from its edge: keyboard, drag (one resize on release)
   expect(await page.evaluate(() => localStorage.getItem("tomo.tasksRailWidth"))).toBeNull();
 });
 
+it("renders with blocked storage (reading localStorage throws), and the rail still resizes in memory", async () => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "localStorage", { configurable: true, get() { throw new DOMException("blocked", "SecurityError"); } });
+    Object.defineProperty(window, "sessionStorage", { configurable: true, get() { throw new DOMException("blocked", "SecurityError"); } });
+  });
+  await page.reload();
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  const handle = page.getByRole("separator", { name: "Resize the Tasks panel" });
+  await handle.focus();
+  await page.keyboard.press("ArrowLeft");
+  await browserExpect(handle).toHaveAttribute("aria-valuenow", "316");
+});
+
 it("explains oversized requests and preserves the draft", async () => {
   await page.route("**/api/v1/messages", (route) => route.fulfill({ status: 413, contentType: "application/json", body: '{"error":"body_too_large"}' }));
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("Keep this draft");

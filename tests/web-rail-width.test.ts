@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CHAT_MIN, clampRailWidth, RAIL_MAX, RAIL_MIN, RAIL_WIDTH_KEY, railBounds, railDefaultWidth, railWidthForKey, readRailWidth, writeRailWidth } from "../web/src/rail-width.js";
+import { CHAT_MIN, clampRailWidth, RAIL_MAX, RAIL_MIN, RAIL_WIDTH_KEY, railBounds, railDefaultWidth, safeLocalStorage, railWidthForKey, readRailWidth, writeRailWidth } from "../web/src/rail-width.js";
 
 const memory = () => {
   const data = new Map<string, string>();
@@ -15,9 +15,17 @@ describe("Tasks rail width", () => {
     expect(railBounds(1000, 272)).toBeNull();
   });
 
-  it("the default follows the stylesheet: 300, or 260 at 1024 and below", () => {
+  it("the default follows the stylesheet (300, or 280 at 1024 and below) and is never below the minimum", () => {
     expect(railDefaultWidth(1440)).toBe(300);
-    expect(railDefaultWidth(1024)).toBe(260);
+    expect(railDefaultWidth(1024)).toBe(280);
+    for (const vw of [801, 1024, 1025, 1440, 2560]) expect(railDefaultWidth(vw)).toBeGreaterThanOrEqual(RAIL_MIN);
+  });
+
+  it("a browser that refuses localStorage (the property itself throws) leaves no storage, not an exception", () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, "window");
+    Object.defineProperty(globalThis, "window", { configurable: true, value: Object.defineProperty({}, "localStorage", { get() { throw new Error("SecurityError"); } }) });
+    try { expect(safeLocalStorage()).toBeUndefined(); }
+    finally { if (original) Object.defineProperty(globalThis, "window", original); else delete (globalThis as { window?: unknown }).window; }
   });
 
   it("clamps into the bounds", () => {

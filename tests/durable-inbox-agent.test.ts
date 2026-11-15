@@ -467,6 +467,8 @@ describe("durable inbox: the interrupted-turn note takes custody", () => {
 
     const third = await boot();
     expect(peekPendingNotes(third.agent, "imessage:581").join("\n")).toContain("call the plumber");
+    // Taken by a turn that never finished: marked as possibly partly answered.
+    expect(peekPendingNotes(third.agent, "imessage:581").join("\n")).toContain("you may already have partly answered it");
     await third.agent.stop();
   });
 
@@ -575,5 +577,32 @@ describe("durable inbox: deliberate pauses do not consume", () => {
     const second = await boot();
     expect(peekPendingNotes(second.agent, "imessage:592").join("\n")).toContain("halfway there");
     await second.agent.stop();
+  });
+});
+
+describe("durable inbox: an interrupted note whose own turn is cut short", () => {
+  it("is kept for the next start, marked as possibly partly answered", async () => {
+    const first = await boot();
+    let turns = 0;
+    mockSdk.responseFn = () => { turns++; return new Promise(() => {}); };
+    await first.channel.simulateMessage(makeMsg({ id: "cs1", chatId: "593", text: "original request" }));
+    await waitFor(() => expect(turns).toBe(1));
+    crash(first.agent);
+
+    // Second run: the note rides into a turn the SDK takes, and graceful
+    // shutdown stops that turn mid-flight.
+    const second = await boot();
+    expect(openInbox().pending()).toEqual([]);
+    turns = 0;
+    await second.channel.simulateMessage(makeMsg({ id: "cs2", chatId: "593", text: "hello again" }));
+    await waitFor(() => expect(turns).toBe(1));
+    expect(mockSdk.promptsBySession.some((p) => p.text.includes("original request") && p.text.includes("hello again"))).toBe(true);
+    await second.agent.stop();
+
+    const third = await boot();
+    const notes = peekPendingNotes(third.agent, "imessage:593").join("\n");
+    expect(notes).toContain("original request");
+    expect(notes).toContain("you may already have partly answered it");
+    await third.agent.stop();
   });
 });

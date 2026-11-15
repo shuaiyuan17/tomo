@@ -635,7 +635,9 @@ describe("TurnRunner: pending notes are consumed only by a prompt the model took
     const deps = (h.runner as unknown as { deps: TurnRunnerDeps }).deps;
     deps.settlePendingNotes = (_key, drained) => { settled.push(drained); };
     deps.restorePendingNotes = (_key, drained) => { restored.push(drained); };
-    return { h, settled, restored };
+    const interrupted: string[] = [];
+    deps.restoreInterruptedPendingNotes = (_key, drained) => { interrupted.push(drained); };
+    return { h, settled, restored, interrupted };
   }
 
   it("settles the notes once the SDK took the prompt and the turn ended", async () => {
@@ -657,5 +659,33 @@ describe("TurnRunner: pending notes are consumed only by a prompt the model took
     await failed.h.runner.runTurn(replySpec(failed.h));
     expect(failed.settled).toEqual([]);
     expect(failed.restored).toEqual(["[note]\n\n"]);
+  });
+});
+
+describe("TurnRunner: notes taken by a turn that did not finish", () => {
+  function harness(respond: (req: RunWithRetryRequest) => Promise<string>) {
+    const h = makeHarness(respond);
+    const calls: string[] = [];
+    const deps = (h.runner as unknown as { deps: TurnRunnerDeps }).deps;
+    deps.settlePendingNotes = () => { calls.push("settle"); };
+    deps.restorePendingNotes = () => { calls.push("restore"); };
+    deps.restoreInterruptedPendingNotes = () => { calls.push("interrupted"); };
+    return { h, calls };
+  }
+
+  it("keeps them (marked) when graceful shutdown cut the turn short", async () => {
+    const { h, calls } = harness(async (req) => {
+      req.onPromptHandedOff?.();
+      req.onShutdownInterrupted?.();
+      return "NO_REPLY";
+    });
+    await h.runner.runTurn(replySpec(h));
+    expect(calls).toEqual(["interrupted"]);
+  });
+
+  it("keeps them (marked) when the turn failed after taking them", async () => {
+    const { h, calls } = harness(async (req) => { req.onPromptHandedOff?.(); throw new Error("aborted"); });
+    await h.runner.runTurn(replySpec(h));
+    expect(calls).toEqual(["interrupted"]);
   });
 });

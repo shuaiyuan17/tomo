@@ -41,6 +41,17 @@ function capNotes(arr: string[]): number {
   return dropped;
 }
 
+/**
+ * Prepended to a note whose turn took it but did not finish (crash, graceful
+ * shutdown, abort): the model may already have acted on it, partly or fully.
+ */
+export const INTERRUPTED_NOTE_MARKER =
+  "[The previous attempt to handle the note below was interrupted (Tomo restarted, or the turn was cut short) — you may already have partly answered it. Check the conversation and do not repeat what was already said.]";
+
+function markInterrupted(note: string): string {
+  return note.startsWith(INTERRUPTED_NOTE_MARKER) ? note : `${INTERRUPTED_NOTE_MARKER}\n${note}`;
+}
+
 interface InFlightBatch {
   prefix: string;
   notes: string[];
@@ -52,10 +63,12 @@ interface InFlightBatch {
  * TWO-PHASE. `drain` hands the notes to a turn but keeps them in the durable
  * store as "in flight"; `settle` (the turn finished, same moment the durable
  * inbox marks its messages done) removes them; `restore` (the turn never
- * reached the model) puts them back in the queue. A crash in between leaves
- * them in the store, so the next process delivers them again — at least once,
- * never zero times. The store always holds in-flight notes (oldest batch
- * first) followed by queued ones.
+ * reached the model) puts them back in the queue, `restoreInterrupted` (it
+ * reached the model but the turn did not finish) puts them back marked as
+ * possibly partly answered. While in flight they are stored already marked,
+ * so a crash in between leaves them in the store in that form, and the next
+ * process delivers them again — at least once, never zero times. The store
+ * always holds in-flight notes (oldest batch first) followed by queued ones.
  */
 export class PendingNotesQueue {
   /** Queued, not yet drained. Absent: not loaded from the store this process. */
@@ -82,7 +95,7 @@ export class PendingNotesQueue {
   /** Write in-flight + queued notes for this session. Returns false on failure. */
   private persist(sessionKey: string): boolean {
     const all = [
-      ...(this.inflight.get(sessionKey) ?? []).flatMap((b) => b.notes),
+      ...(this.inflight.get(sessionKey) ?? []).flatMap((b) => b.notes.map(markInterrupted)),
       ...(this.notes.get(sessionKey) ?? []),
     ];
     try {
@@ -142,6 +155,8 @@ export class PendingNotesQueue {
       const batches = this.inflight.get(sessionKey) ?? [];
       batches.push({ prefix, notes: drained });
       this.inflight.set(sessionKey, batches);
+      // On disk they now read as interrupted: true from here unless settle runs.
+      this.persist(sessionKey);
     }
     return prefix;
   }
@@ -172,8 +187,22 @@ export class PendingNotesQueue {
    * so its notes stay together and ahead of anything queued since.
    */
   restore(sessionKey: string, drainedPrefix: string): void {
+    this.putBack(sessionKey, drainedPrefix, false);
+  }
+
+  /**
+   * The turn that drained `drainedPrefix` took it but did not run to a
+   * normal end (cut short by shutdown, aborted, failed): back at the front of
+   * the queue, marked as possibly partly answered.
+   */
+  restoreInterrupted(sessionKey: string, drainedPrefix: string): void {
+    this.putBack(sessionKey, drainedPrefix, true);
+  }
+
+  private putBack(sessionKey: string, drainedPrefix: string, interrupted: boolean): void {
     this.takeInFlight(sessionKey, drainedPrefix);
-    const note = drainedPrefix.trim();
+    const trimmed = drainedPrefix.trim();
+    const note = trimmed && interrupted ? markInterrupted(trimmed) : trimmed;
     if (!note) return;
     const arr = this.queued(sessionKey);
     arr.unshift(note);

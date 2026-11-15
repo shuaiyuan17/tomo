@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PendingNotesQueue, type DurablePendingNotesStore } from "../src/agent/pending-notes-queue.js";
+import { INTERRUPTED_NOTE_MARKER, PendingNotesQueue, type DurablePendingNotesStore } from "../src/agent/pending-notes-queue.js";
 import { SessionQueue } from "../src/agent/session-queue.js";
 
 class MemoryPendingNotesStore implements DurablePendingNotesStore {
@@ -96,7 +96,8 @@ describe("PendingNotesQueue", () => {
     queue.queueNote("k", "before");
     const drained = queue.drain("k");
     queue.queueNote("k", "during");
-    expect(store.getPendingNotes("k")).toEqual(["before", "during"]);
+    // In flight it is stored already marked as possibly partly answered.
+    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nbefore`, "during"]);
 
     // A crash here: the next process sees both and delivers both.
     const next = new PendingNotesQueue(store);
@@ -104,6 +105,18 @@ describe("PendingNotesQueue", () => {
 
     queue.settle("k", drained);
     expect(store.getPendingNotes("k")).toEqual(["during"]);
+  });
+
+  it("restoreInterrupted puts a taken-but-unfinished batch back, marked", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", "n1");
+    const drained = queue.drain("k");
+    queue.restoreInterrupted("k", drained);
+    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nn1`]);
+    const again = queue.drain("k");
+    expect(again.startsWith(INTERRUPTED_NOTE_MARKER)).toBe(true);
+    expect(again.split(INTERRUPTED_NOTE_MARKER)).toHaveLength(2);
   });
 
   it("restore puts a drained batch back without duplicating it on disk", () => {

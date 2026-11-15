@@ -26,6 +26,7 @@ import { PetStore } from "../mcp/pet-store.js";
 import type { ExternalMcpServerStatus, McpLoginStart } from "../mcp/oauth.js";
 import { ClaudeLoginManager } from "./claude-login.js";
 import { buildUsageReport } from "./usage.js";
+import { limitsLogFor } from "../usage/limits-log.js";
 import { litellmRoutesModel } from "../litellm.js";
 
 /** Back up ~/.tomo/config.json before a programmatic rewrite. */
@@ -282,6 +283,7 @@ export class ChatCommandHandler {
         text: await buildUsageReport({
           authMethod: config.auth.method,
           gatewayActive: litellmRoutesModel(config.litellm, effectiveModel),
+          onData: (data) => { void limitsLogFor(config.tomoHome).recordOAuthUsage(data); },
         }),
       });
       return;

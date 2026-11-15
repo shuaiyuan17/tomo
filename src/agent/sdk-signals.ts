@@ -25,8 +25,11 @@ export type RateLimitStatus = "allowed" | "allowed_warning" | "rejected";
 export type SdkSignal =
   /** The API call failed and the CLI is waiting to try again. */
   | { kind: "retry"; attempt: number; maxRetries: number; delayMs: number; error: SdkErrorKind; status?: number }
-  /** The subscription's rate-limit state changed. `resetsAt`: ms epoch. `utilization`: 0–100. */
-  | { kind: "rate_limit"; status: RateLimitStatus; limit?: string; resetsAt?: number; utilization?: number; overage?: boolean }
+  /**
+   * The subscription's rate-limit state changed. `resetsAt`: ms epoch. `utilization`: 0–100, rounded for display;
+   * `rawUtilization`: the SDK's own number, unrounded (a 0–1 fraction, or 0–100 on some shapes) for the quota history.
+   */
+  | { kind: "rate_limit"; status: RateLimitStatus; limit?: string; resetsAt?: number; utilization?: number; rawUtilization?: number; overage?: boolean }
   /** The model declined; `fallbackModel` when the turn was retried on another one. */
   | { kind: "refusal"; model: string; fallbackModel?: string; category?: string }
   /** A tool call is still running. */
@@ -116,8 +119,9 @@ export function sdkSignalOf(event: unknown): SdkSignal | undefined {
     const limit = text(info.rateLimitType, 64);
     const resetsAt = epochMs(info.resetsAt);
     const utilization = percent(info.utilization);
+    const rawUtilization = utilization !== undefined ? finite(info.utilization) : undefined;
     return { kind: "rate_limit", status, ...(limit ? { limit } : {}), ...(resetsAt !== undefined ? { resetsAt } : {}),
-      ...(utilization !== undefined ? { utilization } : {}), ...(info.isUsingOverage === true ? { overage: true } : {}) };
+      ...(utilization !== undefined ? { utilization } : {}), ...(rawUtilization !== undefined ? { rawUtilization } : {}), ...(info.isUsingOverage === true ? { overage: true } : {}) };
   }
 
   if (e.type === "tool_progress") {

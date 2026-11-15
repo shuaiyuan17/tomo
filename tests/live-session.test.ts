@@ -1631,7 +1631,7 @@ describe("LiveSession.stop (owner Stop) and SDK signals", () => {
     await flushMicrotasks();
     expect(seen).toEqual([
       { kind: "retry", attempt: 2, maxRetries: 10, delayMs: 4000, error: "overloaded", status: 529 },
-      { kind: "rate_limit", status: "allowed_warning", limit: "five_hour", resetsAt: 1_800_000_000_000, utilization: 90 },
+      { kind: "rate_limit", status: "allowed_warning", limit: "five_hour", resetsAt: 1_800_000_000_000, utilization: 90, rawUtilization: 0.9 },
       { kind: "tool_progress", toolUseId: "t1", tool: "Bash", elapsedSeconds: 31 },
       { kind: "suggestion", text: "and tomorrow?" },
     ]);

@@ -480,6 +480,8 @@ it("a picture the agent sends (MEDIA:<path>) shows as a thumbnail by id, never a
   await browserExpect(page.locator("main")).not.toContainText("MEDIA:");
   expect(await page.content()).not.toContain("gap.png");
   expect(await page.content()).not.toContain("long-gone");
+});
+
 it("calls the agent by its IDENTITY.md name (re-read on edit); the product keeps its own name", async () => {
   mkdirSync(mockConfig.workspaceDir, { recursive: true });
   writeFileSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), "# IDENTITY.md - Who Am I?\n\n- **Name:** Claw\n- **Vibe:** direct\n");
@@ -495,4 +497,6 @@ it("calls the agent by its IDENTITY.md name (re-read on edit); the product keeps
   utimesSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), new Date(), new Date(Date.now() + 5_000));
   await page.reload();
   await browserExpect(page.getByRole("textbox", { name: "Message 小爪" })).toBeVisible();
+  const { rmSync } = await import("node:fs");
+  rmSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), { force: true });
 });

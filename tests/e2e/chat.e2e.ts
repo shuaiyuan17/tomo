@@ -93,6 +93,57 @@ it("one composer status follows a request to the end, then clears", async () => 
   await browserExpect(status).toHaveText("", { timeout: 5_000 });
 });
 
+it("the Tasks rail resizes from its edge: keyboard, drag (one resize on release), persisted, double-click resets", async () => {
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  const rail = page.locator("#tasks-rail");
+  await browserExpect(rail).toHaveAttribute("data-state", "open");
+  const handle = page.getByRole("separator", { name: "Resize the Tasks panel" });
+  await browserExpect(handle).toHaveAttribute("aria-valuenow", "300");
+  await browserExpect(handle).toHaveAttribute("aria-valuemin", "280");
+  await browserExpect(handle).toHaveAttribute("aria-valuemax", String(1440 - 272 - 480));
+  const width = () => rail.evaluate((el) => Math.round(el.getBoundingClientRect().width));
+
+  await handle.focus();
+  await page.keyboard.press("ArrowLeft");
+  await page.keyboard.press("ArrowLeft");
+  await browserExpect(handle).toHaveAttribute("aria-valuenow", "332");
+  expect(await width()).toBe(332);
+
+  // Drag: the rail keeps its width while the pointer moves, and takes the new one on release.
+  const box = (await handle.boundingBox())!;
+  await page.mouse.move(box.x + 2, box.y + 200);
+  await page.mouse.down();
+  await page.mouse.move(1440 - 500, box.y + 200, { steps: 5 });
+  expect(await width()).toBe(332);
+  await page.mouse.up();
+  await browserExpect(handle).toHaveAttribute("aria-valuenow", "500");
+  expect(await width()).toBe(500);
+
+  await page.reload();
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  await browserExpect(page.getByRole("separator", { name: "Resize the Tasks panel" })).toHaveAttribute("aria-valuenow", "500");
+  expect(await width()).toBe(500);
+
+  await page.getByRole("separator", { name: "Resize the Tasks panel" }).dblclick();
+  await browserExpect(page.getByRole("separator", { name: "Resize the Tasks panel" })).toHaveAttribute("aria-valuenow", "300");
+  expect(await width()).toBe(300);
+  expect(await page.evaluate(() => localStorage.getItem("tomo.tasksRailWidth"))).toBeNull();
+});
+
+it("renders with blocked storage (reading localStorage throws), and the rail still resizes in memory", async () => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "localStorage", { configurable: true, get() { throw new DOMException("blocked", "SecurityError"); } });
+    Object.defineProperty(window, "sessionStorage", { configurable: true, get() { throw new DOMException("blocked", "SecurityError"); } });
+  });
+  await page.reload();
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  const handle = page.getByRole("separator", { name: "Resize the Tasks panel" });
+  await handle.focus();
+  await page.keyboard.press("ArrowLeft");
+  await browserExpect(handle).toHaveAttribute("aria-valuenow", "316");
+});
+
 it("explains oversized requests and preserves the draft", async () => {
   await page.route("**/api/v1/messages", (route) => route.fulfill({ status: 413, contentType: "application/json", body: '{"error":"body_too_large"}' }));
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("Keep this draft");

@@ -326,6 +326,7 @@ Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
     "apiKey": "sk-tomo-local"
   },
   "maxTurns": 50,
+  "agent": { "name": "Claw" },
   "saveInboundImages": true,
   "saveInboundFiles": true,
   "continuity": true,

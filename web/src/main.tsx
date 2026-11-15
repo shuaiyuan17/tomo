@@ -26,10 +26,10 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
-import { composerStatus, REQUEST_LABELS, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
+import { composerStatus, requestLabels, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
 import { useRailWidth } from "./rail-width.js";
+import { AgentNameContext, agentNameOf } from "./agent-name.js";
 
-const labels = REQUEST_LABELS;
 type Theme = "system" | "light" | "dark";
 /** 503s that mean "not accepted, and why" — the draft stays, nothing ran. */
 const refusalReasons: Record<string, string> = {
@@ -92,6 +92,8 @@ function useStudyRoute(): [StudyPage | null, (page: StudyPage | null) => void, s
 
 export function App() {
   const web = useWeb();
+  const agent = agentNameOf(web.bootstrap?.agentName);
+  const labels = requestLabels(agent);
   const [study, setStudy, studyFocus] = useStudyRoute();
   const [screenOpen, setScreenOpen] = useState(false);
   const [selected, setSelected] = useState("");
@@ -263,7 +265,7 @@ export function App() {
   };
   /** Resend / Dismiss for an interrupted request awaiting the owner, on its bubble (history or pending). */
   const interruptedActions = (request: WebRequest | undefined) => request && <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-    <span>Not answered. Tomo may have started on it — check before resending.</span>
+    <span>Not answered. {agent} may have started on it — check before resending.</span>
     <Button variant="outline" size="sm" className="h-7 rounded-lg text-xs" onClick={() => resend(request)} disabled={!session?.writable}>Resend…</Button>
     {confirmDismiss === request.requestId
       ? <><Button variant="outline" size="sm" className="h-7 rounded-lg text-xs" onClick={() => void dismiss(request.requestId)}>Dismiss it</Button>
@@ -313,7 +315,7 @@ export function App() {
   const sessions = web.bootstrap?.sessions ?? [];
   const connectionLabel = web.connection === "live" ? "Connected" : web.connection === "locked" ? "Access link required" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…";
   const notice = "rounded-xl border bg-muted/60 px-4 py-3 text-[13px]";
-  return <div className="flex h-dvh flex-col">
+  return <AgentNameContext.Provider value={agent}><div className="flex h-dvh flex-col">
     <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href={study ? "#study" : "#conversation"} onClick={(e) => { e.preventDefault(); document.getElementById(study ? "study" : "conversation")?.focus(); }}>{study ? `Skip to ${STUDY_LABELS[study]}` : "Skip to conversation"}</a>
     <header className="flex h-[72px] shrink-0 items-center gap-8 border-b px-8 max-[1024px]:px-6 max-[600px]:h-16 max-[600px]:gap-3 max-[600px]:px-4">
       <a className="flex items-center gap-2 font-serif text-[30px] tracking-[-1.5px] text-foreground no-underline max-[600px]:text-[26px]" href="/" aria-label="Tomo home">
@@ -367,7 +369,7 @@ export function App() {
             </DropdownMenuRadioGroup>
           </DropdownMenuContent>
         </DropdownMenu>
-        <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground max-[600px]:hidden">{session?.kind === "group" ? "Shared history. Messages can be sent from the group's messaging channel." : "The same conversation you share with Tomo across your messaging channels."}</p>
+        <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground max-[600px]:hidden">{session?.kind === "group" ? "Shared history. Messages can be sent from the group's messaging channel." : `The same conversation you share with ${agent} across your messaging channels.`}</p>
         <section className="mt-8 border-t pt-7 max-[600px]:hidden" aria-labelledby="context-heading">
           <div className="mb-3 flex items-center justify-between gap-2"><p className="eyebrow m-0" id="context-heading">Context window</p>
             <CompactButton bootstrap={web.bootstrap} refresh={web.refreshBootstrap} ownerSession={!!session && session.id === web.bootstrap?.ownerId}
@@ -405,7 +407,7 @@ export function App() {
           {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && pendingUsers.length === 0 && <div className="m-auto flex h-full min-h-56 max-w-md flex-col items-center justify-center pb-12 text-center"><Mark className="mb-4 size-16 stroke-[1.3]" /><h2 className="mt-2 mb-3 font-serif text-[28px] font-normal">Start wherever you are.</h2><p className="m-0 max-w-80 text-sm text-muted-foreground">{session?.kind === "group" ? "There are no recorded messages in this group yet." : "A question, a half-formed idea, or something on your mind."}</p></div>}
           {history.messages.map((message, index) => { const { reply, body } = parseReply(message.content); const quoted = reply && findQuoted(history.messages, index, reply);
             return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
-            <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? "Tomo" : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
+            <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
               {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
             <div className={cn("markdown", message.role === "user" && "rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5", message.role === "assistant" && "reading")}>
               <MessageBody body={body} reply={reply} sessionId={selectedId} onQuote={quoted ? () => showMessage(quoted.id) : undefined} /></div>
@@ -415,15 +417,15 @@ export function App() {
               <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{pendingLabel(request)}</Badge></div>
             <div className="markdown rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80"><Text breaks>{request.text!}</Text></div>
             {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)}
-          {blocks.map((block) => <article className="message assistant motion-enter mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">Tomo</span><span>Reply in progress</span></div><div className="markdown reading"><MessageBody body={[block.text, ...(block.images ?? []).map((id) => `MEDIA:web:${id}`)].filter(Boolean).join("\n")} sessionId={selectedId} /></div></article>)}
+          {blocks.map((block) => <article className="message assistant motion-enter mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{agent}</span><span>Reply in progress</span></div><div className="markdown reading"><MessageBody body={[block.text, ...(block.images ?? []).map((id) => `MEDIA:web:${id}`)].filter(Boolean).join("\n")} sessionId={selectedId} /></div></article>)}
         </div>
-        <div className="mx-auto w-full max-w-[740px]"><div className={cn("feedback min-h-7 pb-2 tracking-[0.02em] text-xs leading-normal text-muted-foreground transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0")} role="status" aria-live="polite">{composerStatus({ activity: web.activity[selectedId], note, latest, settled: settle.settled })}</div>
+        <div className="mx-auto w-full max-w-[740px]"><div className={cn("feedback min-h-7 pb-2 tracking-[0.02em] text-xs leading-normal text-muted-foreground transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0")} role="status" aria-live="polite">{composerStatus({ activity: web.activity[selectedId], note, latest, settled: settle.settled, agent })}</div>
           {resending && <div className="mb-2 flex items-center gap-2 tracking-[0.02em] text-[11px] text-muted-foreground">
             <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Resending an interrupted message</Badge>
             <span>The original is dismissed once this one is accepted.</span>
             <Button variant="ghost" size="sm" className="h-6 rounded-md px-2 text-[11px]" onClick={() => setResending(null)}>Not a resend</Button></div>}
           <form onSubmit={(e) => void send(e)} className="composer flex items-end gap-2 rounded-[20px] border bg-card py-2.5 pr-2.5 pl-1 shadow-xs transition-[border-color,box-shadow] focus-within:border-muted-foreground/50 focus-within:shadow-md">
-            <label className="sr-only" htmlFor="message">Message Tomo</label>
+            <label className="sr-only" htmlFor="message">Message {agent}</label>
             <Textarea ref={input} id="message" placeholder={session?.kind === "group" ? "This group is read-only" : "What's on your mind?"} value={draft} maxLength={16_000} rows={1} disabled={!session?.writable}
               className="max-h-60 min-h-10 flex-1 resize-none rounded-none border-0 bg-transparent! px-3.5 py-[7px] text-[15px] leading-relaxed shadow-none placeholder:text-muted-foreground focus-visible:ring-0 disabled:opacity-80 md:text-[15px]"
               onChange={(e) => { setDraft(e.target.value); setResending((old) => resendAfterDraftChange(old, e.target.value)); }} onCompositionStart={() => ime.current.start()} onCompositionEnd={() => ime.current.end()}
@@ -453,7 +455,7 @@ export function App() {
       {railSize.separator && <div ref={railSize.guide} hidden aria-hidden="true" className="pointer-events-none fixed inset-y-0 left-0 z-40 w-0.5 bg-primary/70" />}
     </div>
     {screen && <ScreenWindow bootstrap={web.bootstrap} refresh={web.refreshBootstrap} live={web.connection === "live"} compact={phone} onClose={closeScreen} />}
-  </div>;
+  </div></AgentNameContext.Provider>;
 }
 
 createRoot(document.getElementById("root")!).render(<App />);

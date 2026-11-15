@@ -3,6 +3,7 @@ import { api, ApiError, readBootstrap, stream, type WebBootstrap } from "./api.j
 import type { WebCompactState, WebEvent, WebRequest, WebSnapshot, WebTask } from "../../src/web/protocol.js";
 import { replaceSessionTasks } from "./tasks.js";
 import { trimRequests } from "./pending.js";
+import { TYPING_ACTIVITY } from "./composer-status.js";
 
 export function useWeb() {
   const [bootstrap, setBootstrap] = useState<WebBootstrap>();
@@ -69,7 +70,7 @@ export function useWeb() {
         [event.sessionId]: `${event.tool} · ${event.state}` }));
       if (event.type === "compact") setCompact(event.request);
       if (event.type === "tasks") setTasks((old) => replaceSessionTasks(old, event.sessionId, event.tasks));
-      if (event.type === "typing") setActivity((old) => ({ ...old, [event.sessionId]: event.active ? "Tomo is working…" : "" }));
+      if (event.type === "typing") setActivity((old) => ({ ...old, [event.sessionId]: event.active ? TYPING_ACTIVITY : "" }));
     };
     let delay = 1_000;
     const connect = async () => {

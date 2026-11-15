@@ -181,6 +181,8 @@ export interface TomoConfig {
   /** Optional local script to run once per continuity heartbeat and append to the heartbeat prompt. */
   continuityScript: ContinuityScriptConfig | null;
   city: string | null;
+  /** `agent.name`: what the web UI calls the agent. Unset: IDENTITY.md's Name line, else "Tomo". */
+  agentName: string | null;
   /** The one person Tomo works for (see src/owner.ts), resolved from `owner`
    *  or, for older files, from `identities`. Undefined = no owner: every DM is
    *  ignored. */
@@ -889,6 +891,8 @@ function buildConfig(): TomoConfig {
     continuityIntervalMs: Math.round(Math.max(continuityIntervalMinutes, MIN_CONTINUITY_INTERVAL_MINUTES) * 60_000),
     continuityScript: parseContinuityScriptConfig(file.continuityScript),
     city: validated("city (TOMO_CITY)", z.string().nullable(), envVar("TOMO_CITY") ?? file.city, null),
+    agentName: validated("agent.name", z.string().trim().min(1, "expected a non-empty name").max(64, "expected at most 64 characters"),
+      file.agent && typeof file.agent === "object" ? (file.agent as { name?: unknown }).name : undefined, null),
     ...resolveOwnerConfig(file, channels),
     imessageProvider: validated(
       "channels.imessage.provider (IMESSAGE_PROVIDER)",

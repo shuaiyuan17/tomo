@@ -120,7 +120,9 @@ describe("usage ledger and the resume baseline", () => {
     mockSdk.nextResult = { total_cost_usd: 1.0, modelUsage: models(4) };
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "one" }));
     await drainQueue(agent);
-    await waitFor(() => expect(ledgerRows()).toHaveLength(1));
+    // Fully settled (including the ledger's own chmod) before the file is locked.
+    await (agent as unknown as { usageLedger: { idle(): Promise<void> } }).usageLedger.idle();
+    expect(ledgerRows()).toHaveLength(1);
 
     // The ledger cannot be appended to for the second turn.
     const file = join(agentEnv.tmpDir, "data", "usage", readdirSync(join(agentEnv.tmpDir, "data", "usage")).find((f) => f.endsWith(".ndjson"))!);

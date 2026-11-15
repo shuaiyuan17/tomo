@@ -84,6 +84,8 @@ export type RefreshOutcome = "completed" | "timed_out" | "failed_to_start";
 
 interface UsageDeps {
   fetchImpl?: typeof fetch;
+  /** Sees every successfully parsed usage body (e.g. the quota history in usage/limits-log.ts). Must not throw; if it does, it is ignored. */
+  onData?: (data: UsageResponse) => void;
   now?: () => number;
   /** Injectable token loader for tests; defaults to the real Keychain reader. */
   loadCredentials?: () => Promise<ClaudeCredentials>;
@@ -269,7 +271,9 @@ export async function fetchUsage(deps: UsageDeps = {}): Promise<UsageResult> {
   }
   // A body of literal `null` is not an error here: `/usage` renders it as an
   // empty report, and the web card as "no usage data".
-  return { ok: true, data: (data ?? {}) as UsageResponse, subscriptionType: oauth?.subscriptionType };
+  const body = (data ?? {}) as UsageResponse;
+  try { deps.onData?.(body); } catch { /* an observer never breaks the read */ }
+  return { ok: true, data: body, subscriptionType: oauth?.subscriptionType };
 }
 
 /** True when a recorded `expiresAt` (ms epoch) is at or before `nowMs`. */

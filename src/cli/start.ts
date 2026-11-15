@@ -208,6 +208,12 @@ async function startForeground(): Promise<void> {
   });
   setHomeService(home);
 
+  // Quota history (usage/limits-log.ts): every SDK rate_limit_event, whatever
+  // channel the turn came from. Recording only; it never throws.
+  const { limitsLogFor } = await import("../usage/limits-log.js");
+  const { watchBus } = await import("../watch/bus.js");
+  watchBus.subscribe((event) => { if (event.type === "sdk") void limitsLogFor(config.tomoHome).recordSignal(event.signal); });
+
   // Optional UI failures must not become a messaging startup prerequisite.
   if (config.web?.enabled) {
     try {
@@ -218,8 +224,10 @@ async function startForeground(): Promise<void> {
       const { fetchUsage } = await import("../agent/usage.js");
       const { litellmRoutesModel } = await import("../litellm.js");
       // The same reader as `/usage` (Claude Code's OAuth token from the Keychain).
+      const limitsLog = limitsLogFor(config.tomoHome);
       const usageCache = new UsageCache(() => fetchUsage({ authMethod: config.auth.method,
-        gatewayActive: litellmRoutesModel(config.litellm, config.model) }));
+        gatewayActive: litellmRoutesModel(config.litellm, config.model),
+        onData: (data) => { void limitsLog.recordOAuthUsage(data); } }));
       const { CRON_STORE_PATH } = await import("../cron/store.js");
       const { WebRequestJournal } = await import("../web/request-journal.js");
       const { WEB_CHAT_ID } = await import("../web/protocol.js");

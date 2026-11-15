@@ -36,7 +36,9 @@ export type SdkSignal =
   /** The SDK's predicted next owner message (promptSuggestions). */
   | { kind: "suggestion"; text: string }
   /** The owner stopped the running turn. */
-  | { kind: "stopped" };
+  | { kind: "stopped" }
+  /** The SDK started (true) or finished (false) compacting the session's context (`system`/`status`). */
+  | { kind: "compacting"; active: boolean };
 
 const SUGGESTION_LIMIT = 300;
 const MODEL_LIMIT = 128;
@@ -88,6 +90,12 @@ export function sdkSignalOf(event: unknown): SdkSignal | undefined {
       const status = finite(e.error_status);
       return { kind: "retry", attempt, maxRetries: finite(e.max_retries) ?? attempt, delayMs: Math.max(0, finite(e.retry_delay_ms) ?? 0),
         error: errorKind(e.error), ...(status !== undefined ? { status } : {}) };
+    }
+    if (e.subtype === "status" && (e.status === "compacting" || e.status === null)) {
+      // `compacting` while the SDK compacts, null once it is done. `requesting`
+      // (every API call) is left out: it would only flood the bus. The
+      // compact_boundary that follows a compaction also ends it (status-reducer.ts).
+      return { kind: "compacting", active: e.status === "compacting" };
     }
     if (e.subtype === "model_refusal_fallback" || e.subtype === "model_refusal_no_fallback") {
       // A subagent's or side question's fallback leaves the session model alone: not the owner's turn.

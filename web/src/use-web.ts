@@ -4,6 +4,10 @@ import type { WebCompactState, WebEvent, WebRateLimit, WebRequest, WebSnapshot, 
 import { replaceSessionTasks } from "./tasks.js";
 import { trimRequests } from "./pending.js";
 import { isTransient, TYPING_ACTIVITY, type TurnStatus } from "./composer-status.js";
+import { localizeHomeStatus, newerStatus, type LocalHomeStatus } from "./home/caption.js";
+
+/** Tomo's home as the event stream reports it: the latest status, a counter to re-read /home on, and the latest request to look. */
+export interface HomeEvents { status?: LocalHomeStatus; revision: number; look?: { requestId: string; seq: number } }
 
 function without<T>(record: Record<string, T>, key: string): Record<string, T> {
   const next = { ...record };
@@ -29,6 +33,7 @@ export function useWeb() {
   const [revision, setRevision] = useState(0);
   /** Bumped whenever the daemon reports a cron run; Study / Scheduled re-read /cron. */
   const [cronRevision, setCronRevision] = useState(0);
+  const [home, setHome] = useState<HomeEvents>({ revision: 0 });
   const refreshBootstrap = useCallback(async () => {
     try { const value = await readBootstrap(); setBootstrap(value); return value; }
     catch (error) { if (error instanceof ApiError && error.status === 401) setConnection("locked"); throw error; }
@@ -73,6 +78,8 @@ export function useWeb() {
       setRateLimit(value.rateLimit);
       // A (re)connect may have missed cron events while the stream was down.
       setConnection("live"); refresh(); setCronRevision((r) => r + 1);
+      // Home events may have been missed too: the page re-reads /home.
+      setHome((old) => ({ ...old, revision: old.revision + 1 }));
     };
     const update = (event: WebEvent) => {
       if (event.type === "block") setBlocks((old) => [...old.filter((b) => b.id !== event.id), event]);
@@ -95,6 +102,9 @@ export function useWeb() {
       }
       if (event.type === "invalidate") refresh();
       if (event.type === "cron") setCronRevision((value) => value + 1);
+      if (event.type === "home") setHome((old) => ({ ...old, revision: old.revision + 1 }));
+      if (event.type === "home-status") { const status = localizeHomeStatus(event.status, Date.now()); setHome((old) => ({ ...old, status: newerStatus(old.status, status) })); }
+      if (event.type === "home-look") { const { requestId } = event; setHome((old) => ({ ...old, look: { requestId, seq: (old.look?.seq ?? 0) + 1 } })); }
       // Tool calls show inline in the chat (the running one in its group's
       // summary), not as a separate line above the composer.
       if (event.type === "tool") setToolTicks((old) => ({ ...old, [event.sessionId]: (old[event.sessionId] ?? 0) + 1 }));
@@ -123,5 +133,5 @@ export function useWeb() {
     void connect();
     return () => { controller.abort(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
-  return { bootstrap, connection, blocks, requests, activity, toolTicks, tasks, compact, turns, rateLimit, suggestions, revision, cronRevision, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
+  return { bootstrap, connection, blocks, requests, activity, toolTicks, tasks, compact, turns, rateLimit, suggestions, revision, cronRevision, home, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
 }

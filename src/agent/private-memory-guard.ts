@@ -1,12 +1,12 @@
 // Group-session / summoned-turn guard for memory/private/ (moved from permissions.ts).
 import { config } from "../config.js";
 import { log } from "../logger.js";
-import { MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../workspace/index.js";
+import { HOME_SCENE_DIR, MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR } from "../workspace/index.js";
 import { sandboxedBashCommand } from "./bash-sandbox.js";
 import { MIXED_AUDIENCE_KEY } from "./audience.js";
 import { loadedSettingsFiles } from "./setting-sources.js";
-import { isPrivateMemoryAccess, SEND_MESSAGE_TOOL } from "./private-memory-access.js";
-export { isPrivateMemoryAccess, SEND_MESSAGE_TOOL };
+import { isHomeWrite, isPrivateMemoryAccess, SEND_MESSAGE_TOOL } from "./private-memory-access.js";
+export { isHomeWrite, isPrivateMemoryAccess, SEND_MESSAGE_TOOL };
 import { landsInPrivate } from "./private-memory-reach.js";
 import { expandTilde } from "./bash-write-targets.js";
 
@@ -62,6 +62,17 @@ export const PRIVATE_MEMORY_SUMMONED_DENIAL =
 
 export function privateMemoryDenialReason(bar: PrivateMemoryBar): string {
   return bar === "group-session" ? PRIVATE_MEMORY_GROUP_DENIAL : PRIVATE_MEMORY_SUMMONED_DENIAL;
+}
+
+/**
+ * Denial text for a write into Tomo's home on a barred turn. The home is the
+ * owner conversation's alone (the design the owner approved): a group may
+ * look at the scene, not change it.
+ */
+export function homeWriteDenialReason(bar: PrivateMemoryBar): string {
+  return `\`home/\` (your home, the room the owner sees in the web UI) can only be changed from the owner's own conversation. ${bar === "group-session"
+    ? "This is a group session: you may read the scene, not write it."
+    : "This turn's messages come from a group summoned into this session, so the home is read-only for it; ask again in the owner's own DM."}`;
 }
 
 /**
@@ -173,6 +184,7 @@ export function privateMemoryGuardHooks(
   scopedCallerKey: () => string | undefined = () => undefined,
 ) {
   const ctx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, privateDir: PRIVATE_MEMORY_DIR };
+  const homeCtx = { cwd: config.workspaceDir, homeDir: HOME_SCENE_DIR };
   // The settings files the query actually loads, so the Bash arm can refuse when
   // one of them carries a PreToolUse hook that could undo the sandbox rewrite.
   // Derived from the same constant the query option uses (setting-sources.ts) —
@@ -231,7 +243,16 @@ export function privateMemoryGuardHooks(
             };
           }
         } else if (!isPrivateMemoryAccess(input.tool_name, input.tool_input, ctx)) {
-          return {};
+          // The second barred directory, write-only: Tomo's home.
+          if (!isHomeWrite(input.tool_name, input.tool_input, homeCtx)) return {};
+          log.warn({ key: sessionKey, tool: input.tool_name, bar: reason }, "Blocked a write to the home on a private-memory-barred turn");
+          return {
+            hookSpecificOutput: {
+              hookEventName: "PreToolUse" as const,
+              permissionDecision: "deny" as const,
+              permissionDecisionReason: homeWriteDenialReason(reason),
+            },
+          };
         }
         log.warn(
           { key: sessionKey, tool: input.tool_name, bar: reason },

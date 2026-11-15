@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join, sep } from "node:path";
 import { log } from "../logger.js";
-import { PRIVATE_MEMORY_DIR } from "../workspace/index.js";
+import { HOME_SCENE_DIR, PRIVATE_MEMORY_DIR } from "../workspace/index.js";
 
 /**
  * Kernel-level scoping for the shell on a private-memory-barred turn.
@@ -41,6 +41,12 @@ import { PRIVATE_MEMORY_DIR } from "../workspace/index.js";
  * not decoration: with reads denied alone, `mv memory/private /tmp/p && cat
  * /tmp/p/note.txt` walks the files OUT of the denied subpath and reads them at a
  * path the profile says nothing about. Verified by running it.
+ *
+ * ONE MORE, WRITE-ONLY: TOMO'S HOME. `<ws>/home/` is the owner conversation's
+ * alone, so a barred turn's shell may read it but not change it: the profile
+ * adds `(deny file-write* (subpath <home>))`, its path resolved and failing
+ * closed exactly like the private dir's. Nothing about the private-memory
+ * deny changes.
  *
  * THE REWRITE IS NOT THE LAST WORD, SO A FOREIGN HOOK WITHHOLDS THE SHELL. The
  * CLI takes the last `updatedInput` any PreToolUse hook produces, and hooks from
@@ -82,12 +88,14 @@ export const SANDBOX_SHELL_PATH = "/bin/zsh";
  * what makes `ls memory/private` and `mv memory/private …` fail and not only
  * `cat memory/private/x`.
  */
-export function sandboxProfileText(denyDir: string): string {
+export function sandboxProfileText(denyDir: string, writeDenyDirs: readonly string[] = []): string {
   return [
     "(version 1)",
     "(allow default)",
     `(deny file-read* (subpath ${sandboxLiteral(denyDir)}))`,
     `(deny file-write* (subpath ${sandboxLiteral(denyDir)}))`,
+    // Directories the shell may read but not change (Tomo's home).
+    ...writeDenyDirs.map((dir) => `(deny file-write* (subpath ${sandboxLiteral(dir)}))`),
     "",
   ].join("\n");
 }
@@ -335,6 +343,8 @@ export function sandboxedBashCommand(
   command: string,
   privateDir: string = PRIVATE_MEMORY_DIR,
   scan?: { settingsFiles: readonly string[]; pluginDirs: readonly string[] },
+  /** Denied for writes only, each resolved like `privateDir` (Tomo's home by default). */
+  writeOnlyDirs: readonly string[] = [HOME_SCENE_DIR],
 ): string | null {
   if (!existsSync(SANDBOX_EXEC_PATH)) return warnOnce("sandbox-exec is not present on this host");
   if (!existsSync(SANDBOX_SHELL_PATH)) return warnOnce(`${SANDBOX_SHELL_PATH} is not present on this host`);
@@ -351,8 +361,14 @@ export function sandboxedBashCommand(
   if (denyDir === null) {
     return warnOnce(`cannot resolve the real path of ${privateDir}, so its subpath cannot be denied`);
   }
+  const writeDeny: string[] = [];
+  for (const dir of writeOnlyDirs) {
+    const resolved = resolvedDenyDir(dir);
+    if (resolved === null) return warnOnce(`cannot resolve the real path of ${dir}, so writes under it cannot be denied`);
+    writeDeny.push(resolved);
+  }
   try {
-    return wrapWithSandbox(command, sandboxProfileText(denyDir));
+    return wrapWithSandbox(command, sandboxProfileText(denyDir, writeDeny));
   } catch {
     return warnOnce("could not build the sandboxed command");
   }

@@ -216,6 +216,8 @@ export function sdkOptions(
       `mcp__${TOMO_INTERNAL_MCP_NAME}__list_people`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__upsert_person`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__lcm_rollup`,
+      // Registered only on the owner's DM session (internal-server.ts).
+      `mcp__${TOMO_INTERNAL_MCP_NAME}__home_check`,
       ...externalMcpAllowedTools,
     ],
     // SDK v0.2.133 deprecated passing "Skill" in allowedTools — the new path

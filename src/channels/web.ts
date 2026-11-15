@@ -19,7 +19,7 @@ import { formatImageMarker } from "./imageStore.js";
 import type { ImageAttachment } from "./types.js";
 import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request-journal.js";
 import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
-import type { WebModelChangeResult, WebModelView } from "../web/protocol.js";
+import type { WebHome, WebModelChangeResult, WebModelView } from "../web/protocol.js";
 import { modelLabel } from "../models.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type WebStopResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
@@ -40,6 +40,12 @@ export const MAX_INTERRUPTED_BACKLOG = 64;
 const SNAPSHOT_MAILBOX_BYTES = MAX_BUFFER_BYTES - 64 * 1024 - MAX_SNAPSHOT_TASK_BYTES;
 
 export interface WebLifecycle { start(): Promise<void>; stop(): Promise<void> }
+/** The daemon side of Tomo's home (src/home/service.ts) as the browser reaches it. */
+export interface WebHomeAccess {
+  view(): WebHome;
+  /** A picture from an open Home page; re-validated there. */
+  snapshot(input: unknown): { accepted: boolean };
+}
 /** The agent side of the Study's Model page (see Agent.webModelView / switchModelFromWeb). */
 export interface WebModelAccess {
   view(key: string): Omit<WebModelView, "sessionId" | "writable">;
@@ -100,6 +106,7 @@ export class WebChannel implements Channel {
   private readonly taskOutput: ((sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>) | undefined;
   private readonly models: WebModelAccess | undefined;
   private readonly sessionKeys: (() => readonly string[]) | undefined;
+  private readonly homeAccess: WebHomeAccess | undefined;
   /** Live and recently ended subagents/background tasks, per visible session. */
   readonly tasks: TaskBoard;
 
@@ -141,7 +148,10 @@ export class WebChannel implements Channel {
       /** The Study's Model page: a session key's model, and the agent's shared model switch. */
       models?: WebModelAccess;
       /** Every key in the session registry: where a group's browser session id is looked up. */
-      sessionKeys?: () => readonly string[] } = {}) {
+      sessionKeys?: () => readonly string[];
+      /** Tomo's home (scene, status, snapshots); absent: the Home page has nothing to show (503). */
+      home?: WebHomeAccess } = {}) {
+    this.homeAccess = options.home;
     this.models = options.models;
     this.sessionKeys = options.sessionKeys;
     this.usageReader = options.usage;
@@ -386,6 +396,8 @@ export class WebChannel implements Channel {
       this.publishQuietly({ type: "rate-limit", limit: { ...this.rateLimit } });
       return;
     }
+    // The home's business (status-reducer.ts), not the composer's.
+    if (signal.kind === "compacting") return;
     const sessionId = sessionKey ? this.sessionId(sessionKey) : undefined;
     if (!sessionId) return;
     if (signal.kind === "suggestion") { this.setSuggestion(sessionId, signal.text); return; }
@@ -457,6 +469,23 @@ export class WebChannel implements Channel {
     if (!key) throw new WebError(404, "session_not_found");
     return { key, owner: false };
   }
+
+  /** Tomo's home for the Home page: always a valid scene (the last good one, or the starter). */
+  home(): WebHome {
+    if (!this.homeAccess || this.tornDown) throw new WebError(503, "home_unavailable");
+    return this.homeAccess.view();
+  }
+  /** A picture of the home from an open Home page, for Tomo to look at. */
+  homeSnapshot(input: unknown): { accepted: boolean } {
+    if (!this.homeAccess || this.tornDown) throw new WebError(503, "home_unavailable");
+    return this.homeAccess.snapshot(input);
+  }
+  /**
+   * May the browser already read `key`'s task text? The Tasks panel's own
+   * rule (taskRouter): any group, and for DMs only the key the catalog shows
+   * as the owner conversation.
+   */
+  mayShowTask(key: string): boolean { return this.taskRouter()(key) !== undefined; }
 
   /** The model a browser session runs on and what it could switch to. Groups read it, never switch it. */
   model(sessionId: string): WebModelView {

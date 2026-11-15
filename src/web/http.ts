@@ -9,8 +9,15 @@ import { MemoryReadError } from "../workspace/memory-reader.js";
 import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
-import { cronChangeSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
-  type EventEnvelope, type Rpc, type WebCompaction, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
+import { cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
+  type EventEnvelope, type Rpc, type WebCompaction, type WebHome, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
+import { homeSceneSchema } from "../home/scene.js";
+import { decodeSnapshotPng } from "../home/snapshot.js";
+
+/** The snapshot route's body: the schema's base64 bound plus the JSON envelope around it. */
+export const HOME_SNAPSHOT_BODY_BYTES = Math.ceil(HOME_SNAPSHOT_MAX_BYTES * 4 / 3) + 4 + 1024;
+/** A home picture is served with a CSP of its own: an SVG opened directly can run, fetch and embed nothing. */
+export const HOME_ASSET_CSP = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
 /**
  * App icons and the web manifest, served like the bundle: public, no cookie.
@@ -69,7 +76,10 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
     // (GET, read-only, cookie-authenticated like every API) instead requires
     // a same-origin image fetch: a hostile page's <img> is cross-site.
     // The same holds for a picture the agent sent (`/outgoing/<id>`).
-    const mediaRequest = req.method === "GET" && /^\/api\/v1\/sessions\/[A-Za-z0-9_-]{43}\/(?:media(?:\?|$)|outgoing\/[a-f0-9]{32}$)/.test(req.url ?? "");
+    // A home picture (`/home/assets/<name>`) is loaded the same way, by the renderer's image loader.
+    const mediaRequest = req.method === "GET" && (/^\/api\/v1\/sessions\/[A-Za-z0-9_-]{43}\/(?:media(?:\?|$)|outgoing\/[a-f0-9]{32}$)/.test(req.url ?? "")
+      // The page adds `?r=<revision>` so a replaced picture is fetched again; the query is otherwise ignored.
+      || /^\/api\/v1\/home\/assets\/[^/?#]+(?:\?[^#]*)?$/.test(req.url ?? ""));
     const origin = checkRequest(req, boundPort, api && !mediaRequest, externalOrigin);
     if (mediaRequest && (req.headers["sec-fetch-site"] !== "same-origin" || !["image", "empty"].includes(String(req.headers["sec-fetch-dest"] ?? "")))) {
       throw new WebError(403, "same_origin_required");
@@ -201,6 +211,21 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           res.end(file.bytes);
           return;
         }
+        if (url.pathname === "/api/v1/home") {
+          // Validated by the daemon; checked again here before it is served.
+          const home = await deps.rpc({ method: "home" }) as WebHome;
+          if (!home || !homeSceneSchema.safeParse(home.scene).success || typeof home.revision !== "string") throw new WebError(503, "home_unavailable");
+          json(res, 200, home);
+          return;
+        }
+        const homeAsset = /^\/api\/v1\/home\/assets\/([^/]+)$/.exec(url.pathname);
+        if (homeAsset) {
+          const file = deps.data.homeAsset(homeAsset[1]);
+          res.writeHead(200, { "content-type": file.type, "content-length": file.bytes.length, "cache-control": "no-store", "x-content-type-options": "nosniff",
+            ...(file.type === "image/svg+xml" ? { "content-security-policy": HOME_ASSET_CSP } : {}) });
+          res.end(file.bytes);
+          return;
+        }
         const request = /^\/api\/v1\/messages\/([a-f0-9-]{36})$/.exec(url.pathname);
         if (request) {
           const value = await deps.rpc({ method: "request", requestId: request[1] }) as WebRequest;
@@ -230,6 +255,18 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         if (!ownerId) throw new WebError(409, "owner_setup_required");
         if (parsed.data.sessionId !== ownerId) throw new WebError(403, "owner_dm_only");
         json(res, 200, await deps.rpc({ method: "model-switch", epoch, sessionId: parsed.data.sessionId, model: parsed.data.model, from: parsed.data.from }));
+        return;
+      } else if (req.method === "POST" && url.pathname === "/api/v1/home/snapshot") {
+        // A picture of the room for Tomo: exact Origin, cookie, CSRF, the
+        // current daemon epoch, a JSON body of at most the schema's size (this
+        // route alone is allowed more than MAX_BODY_BYTES), a real PNG.
+        csrf.verify(req, session!);
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || epoch !== await deps.rpc({ method: "epoch" })) throw new WebError(409, "epoch_changed");
+        const parsed = homeSnapshotSchema.safeParse(await body(req, HOME_SNAPSHOT_BODY_BYTES));
+        if (!parsed.success) throw new WebError(400, "invalid_snapshot");
+        decodeSnapshotPng(parsed.data.png);
+        json(res, 200, await deps.rpc({ method: "home-snapshot", epoch, snapshot: parsed.data }));
         return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/compact-request") {
         // Same gate as sending a message: CSRF, the owner, the daemon epoch.
@@ -440,13 +477,13 @@ async function rawBody(req: IncomingMessage, limit: number): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
-async function body(req: IncomingMessage): Promise<unknown> {
-  if (Number(req.headers["content-length"]) > MAX_BODY_BYTES) throw new WebError(413, "body_too_large");
+async function body(req: IncomingMessage, limit = MAX_BODY_BYTES): Promise<unknown> {
+  if (Number(req.headers["content-length"]) > limit) throw new WebError(413, "body_too_large");
   let bytes = 0;
   const chunks: Buffer[] = [];
   for await (const chunk of req) {
     bytes += chunk.length;
-    if (bytes > MAX_BODY_BYTES) throw new WebError(413, "body_too_large");
+    if (bytes > limit) throw new WebError(413, "body_too_large");
     chunks.push(chunk);
   }
   try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }

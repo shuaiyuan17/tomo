@@ -37,6 +37,27 @@ export function attachmentPathsIn(message: string): string[] {
   return [...mediaPaths, ...stickerIds];
 }
 
+/** File tools that WRITE a path: the ones barred from Tomo's home on a barred turn. */
+export const HOME_WRITE_TOOLS: ReadonlySet<string> = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
+
+/**
+ * Would this file-tool call WRITE at-or-inside Tomo's home (`<ws>/home/`)?
+ *
+ * The second barred directory, write-only: a scene is not private, so reading
+ * it stays open, but the home is the owner conversation's alone. Judged by
+ * {@link landsInPrivate} with the home as both the tree and the barred dir, so
+ * the same three rules hold: lexical containment, the symlink-resolved path,
+ * and any `..` under the home refused outright. Shell writes are the sandbox
+ * profile's job (`./bash-sandbox.ts`), not this predicate's.
+ */
+export function isHomeWrite(toolName: string, toolInput: unknown, ctx: { cwd: string; homeDir: string }): boolean {
+  if (!HOME_WRITE_TOOLS.has(toolName) || !toolInput || typeof toolInput !== "object") return false;
+  const ti = toolInput as Record<string, unknown>;
+  const p = toolName === "NotebookEdit" ? ti.notebook_path : ti.file_path;
+  if (typeof p !== "string") return false;
+  return landsInPrivate(p, { cwd: ctx.cwd, memoryDir: ctx.homeDir, privateDir: ctx.homeDir });
+}
+
 export function isPrivateMemoryAccess(
   toolName: string,
   toolInput: unknown,

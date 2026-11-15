@@ -42,6 +42,7 @@ vi.mock("../src/config.js", () => ({ config: { workspaceDir: ROOT } }));
 vi.mock("../src/workspace/index.js", () => ({
   MEMORY_DIR: MEMORY,
   PRIVATE_MEMORY_DIR: PRIVATE,
+  HOME_SCENE_DIR: "/nonexistent-ws/home",
   PRIVATE_MEMORY_SUBDIR: "private",
 }));
 vi.mock("../src/logger.js", () => ({

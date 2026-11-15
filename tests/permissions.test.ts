@@ -18,6 +18,7 @@ vi.mock("../src/config.js", () => ({
 vi.mock("../src/workspace/index.js", () => ({
   MEMORY_DIR: "/ws/memory",
   PRIVATE_MEMORY_DIR: "/ws/memory/private",
+  HOME_SCENE_DIR: "/ws/home",
   PRIVATE_MEMORY_SUBDIR: "private",
 }));
 // Stubbed so the agent-profile tests can assert on the fail-open warning and
@@ -42,6 +43,8 @@ const {
   agentProfileDenial,
   agentProfileGuardHooks,
   isPrivateMemoryAccess,
+  isHomeWrite,
+  homeWriteDenialReason,
   privateMemoryBashDenial,
   privateMemoryGuardHooks,
   skillsCanUseTool,
@@ -404,6 +407,77 @@ describe("privateMemoryGuardHooks", () => {
     expect(decision(await hook(PRIVATE_READ))).toBe("deny");
     bar = null;
     expect(await hook(PRIVATE_READ)).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tomo's home: the second barred directory, WRITE-only. A scene is not private,
+// so a barred turn may read it; the home is the owner conversation's alone, so
+// it may not change it. Shell writes are the sandbox profile's (bash-sandbox).
+// ---------------------------------------------------------------------------
+
+describe("privateMemoryGuardHooks - writes to Tomo's home on a barred turn", () => {
+  const homeCtx = { cwd: "/ws", homeDir: "/ws/home" };
+  const writes = [
+    { tool_name: "Write", tool_input: { file_path: "/ws/home/scene.json", content: "{}" } },
+    { tool_name: "Edit", tool_input: { file_path: "home/scene.json", old_string: "a", new_string: "b" } },
+    { tool_name: "MultiEdit", tool_input: { file_path: "/ws/home/assets/x.svg", edits: [] } },
+    { tool_name: "NotebookEdit", tool_input: { notebook_path: "/ws/home/n.ipynb", new_source: "" } },
+    { tool_name: "Write", tool_input: { file_path: "/ws/home" } },
+    { tool_name: "Write", tool_input: { file_path: "/ws/memory/../home/scene.json" } },
+    { tool_name: "Write", tool_input: { file_path: "/ws/home/../home/scene.json" } },
+    { tool_name: "Write", tool_input: { file_path: "/ws/HOME/scene.json" } },
+  ];
+
+  for (const bar of ["group-session", "summoned-turn"] as const) {
+    it(`${bar}: denies every file-tool write under home/, with the home's own reason`, async () => {
+      const hook = hookFor(() => bar);
+      for (const call of writes) {
+        const result = await hook(call);
+        expect([call.tool_name, decision(result)]).toEqual([call.tool_name, "deny"]);
+        expect(result.hookSpecificOutput?.permissionDecisionReason).toBe(homeWriteDenialReason(bar));
+      }
+      expect(homeWriteDenialReason(bar)).toContain("can only be changed from the owner's own conversation");
+    });
+
+    it(`${bar}: reading the home, and writing elsewhere, stay open`, async () => {
+      const hook = hookFor(() => bar);
+      for (const call of [
+        { tool_name: "Read", tool_input: { file_path: "/ws/home/scene.json" } },
+        { tool_name: "Glob", tool_input: { path: "/ws/home", pattern: "*.json" } },
+        { tool_name: "Grep", tool_input: { path: "/ws/home", pattern: "desk" } },
+        { tool_name: "Write", tool_input: { file_path: "/ws/homework.md", content: "x" } },
+        { tool_name: "Write", tool_input: { file_path: "/ws/tmp/home/scene.json", content: "x" } },
+      ]) expect(await hook(call), JSON.stringify(call)).toEqual({});
+    });
+  }
+
+  it("the owner's own turn may write the home", async () => {
+    const hook = hookFor(() => null);
+    for (const call of writes) expect(await hook(call)).toEqual({});
+  });
+
+  it("private memory keeps its own denial (unchanged) and wins over the home rule", async () => {
+    const result = await hookFor(() => "group-session")({ tool_name: "Write", tool_input: { file_path: "/ws/memory/private/x.md" } });
+    expect(result.hookSpecificOutput?.permissionDecisionReason).toBe(PRIVATE_MEMORY_GROUP_DENIAL);
+  });
+
+  it("isHomeWrite: only write tools, only string paths", () => {
+    expect(isHomeWrite("Read", { file_path: "/ws/home/scene.json" }, homeCtx)).toBe(false);
+    expect(isHomeWrite("Write", { file_path: 42 }, homeCtx)).toBe(false);
+    expect(isHomeWrite("Write", null, homeCtx)).toBe(false);
+    expect(isHomeWrite("NotebookEdit", { file_path: "/ws/home/n.ipynb" }, homeCtx)).toBe(false);
+  });
+
+  it("isHomeWrite follows a symlink planted outside the home into it", () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "tomo-home-guard-")));
+    try {
+      mkdirSync(join(root, "home"));
+      symlinkSync(join(root, "home"), join(root, "notes"));
+      const real = { cwd: root, homeDir: join(root, "home") };
+      expect(isHomeWrite("Write", { file_path: join(root, "notes", "scene.json") }, real)).toBe(true);
+      expect(isHomeWrite("Write", { file_path: join(root, "notes2", "scene.json") }, real)).toBe(false);
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
 

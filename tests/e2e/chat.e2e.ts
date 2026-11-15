@@ -696,7 +696,10 @@ it("opens at the last turn; a sent message (a tall picture too) is just fully sh
   const gap = () => history.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight);
   /** How far a row's bottom sits above the viewport's (negative: cut off), and whether its top is in view. */
   const fit = (row: ReturnType<Page["locator"]>) => row.evaluate((el) => {
-    const view = el.closest("[aria-label='Conversation history']")!.getBoundingClientRect(), box = el.getBoundingClientRect();
+    // A bubble is replaced when its pending copy becomes the recorded one; a detached one reads as "not fitted yet".
+    const scroller = el.closest("[aria-label='Conversation history']");
+    if (!scroller) return { below: -1, topIn: false };
+    const view = scroller.getBoundingClientRect(), box = el.getBoundingClientRect();
     return { below: Math.round(view.bottom - box.bottom), topIn: box.top >= view.top - 1 };
   });
   const spacer = () => history.evaluate((el) => { const s = el.querySelector<HTMLElement>("[data-message-scroller-spacer]"); return s && !s.hidden ? s.offsetHeight : 0; });
@@ -712,8 +715,7 @@ it("opens at the last turn; a sent message (a tall picture too) is just fully sh
   const sent = page.locator("article.message.user").filter({ hasText: "The next question" });
   await browserExpect(sent.getByRole("img")).toBeVisible();
   await browserExpect.poll(gap).toBeLessThan(2);
-  await browserExpect.poll(async () => (await fit(sent)).below).toBeGreaterThanOrEqual(0);
-  expect((await fit(sent)).below).toBeLessThan(60);
+  await browserExpect.poll(async () => { const { below } = await fit(sent); return below >= 0 && below < 60; }).toBe(true);
   expect((await fit(sent)).topIn).toBe(true);
   expect(await spacer()).toBe(0);
   await page.screenshot({ path: "test-results/chat-just-sent.png" });

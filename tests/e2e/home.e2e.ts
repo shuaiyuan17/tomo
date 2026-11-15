@@ -199,7 +199,7 @@ it("draws the sky in the window: night, dusk, rain and snow, in both themes", as
   }
 }, ROOM_TEST_TIMEOUT_MS);
 
-it("on a phone: the room fills the width under the header, and turns by a sideways drag", async () => {
+it("on a phone: the room fills the width under the header, and its view is the owner's to move", async () => {
   const { page, violations } = await open({ ...devices["iPhone 14"], defaultBrowserType: undefined }, homeOf());
   await page.getByRole("button", { name: /^Menu/ }).click();
   await page.getByRole("dialog").getByRole("button", { name: "Home" }).click();
@@ -221,8 +221,9 @@ it("on a phone: the room fills the width under the header, and turns by a sidewa
   await page.evaluate(() => { window.location.hash = "home"; });
   await drawn(page);
   await page.screenshot({ path: "test-results/home-working-phone-dark.png" });
-  // touch-action: pan-y keeps vertical swipes for the page.
-  expect(await page.locator('[data-testid="home-room"] [data-state="ready"]').evaluate((element) => getComputedStyle(element).touchAction)).toBe("pan-y");
+  // touch-action: none: a gesture on the room orbits, pinches or pans it, and never fights the page's scrolling.
+  expect(await page.locator('[data-testid="home-room"] [data-state="ready"]').evaluate((element) => getComputedStyle(element).touchAction)).toBe("none");
+  expect(await page.locator('[data-testid="home-room"] canvas').evaluate((element) => getComputedStyle(element).touchAction)).toBe("none");
   expect(await violations()).toEqual([]);
 }, ROOM_TEST_TIMEOUT_MS);
 
@@ -330,3 +331,89 @@ it("back from another app on a phone: the scrim is gone, nothing stays inert, an
   await browserExpect(caption(page)).toHaveText(/1 subagent/);
   expect(reads).toBeGreaterThan(before);
 });
+
+interface View { distance: number; azimuth: number; elevation: number; target: [number, number, number] }
+const viewOf = async (page: Page): Promise<View> => JSON.parse((await page.getByTestId("home-view").getAttribute("data-view"))!) as View;
+/** Waits for the damped glide to settle: the view stops changing. */
+async function settled(page: Page): Promise<View> {
+  let last = "";
+  for (let i = 0; i < 40; i++) {
+    const now = (await page.getByTestId("home-view").getAttribute("data-view")) ?? "";
+    if (now === last) break;
+    last = now; await page.waitForTimeout(150);
+  }
+  return viewOf(page);
+}
+
+it("the owner looks round the room: orbit all the way, zoom and pan within limits, double-click to reset", async () => {
+  const { page } = await open({ viewport: { width: 1280, height: 800 } }, homeOf());
+  await page.evaluate(() => { window.location.hash = "home"; });
+  await drawn(page);
+  const start = await viewOf(page);
+  const box = (await page.getByTestId("home-view").boundingBox())!;
+  const mid = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  const drag = async (dx: number, dy: number, options: { button?: "left" | "right"; shift?: boolean } = {}) => {
+    if (options.shift) await page.keyboard.down("Shift");
+    await page.mouse.move(mid.x, mid.y); await page.mouse.down({ button: options.button ?? "left" });
+    await page.mouse.move(mid.x + dx, mid.y + dy, { steps: 12 }); await page.mouse.up({ button: options.button ?? "left" });
+    if (options.shift) await page.keyboard.up("Shift");
+    return settled(page);
+  };
+
+  // Orbit: far past the old ±40° limit, round to the other side of the room.
+  const turned = await drag(-300, 0);
+  const swing = Math.abs(((turned.azimuth - start.azimuth + Math.PI * 3) % (Math.PI * 2)) - Math.PI);
+  expect(swing).toBeGreaterThan(1.2);
+  await browserExpect(page.getByRole("button", { name: "Reset view" })).toBeVisible();
+  // Tilt: never under the floor, never straight down.
+  const low = await drag(0, -2000);
+  expect(low.elevation).toBeGreaterThanOrEqual(10 * Math.PI / 180 - 0.01);
+  expect(low.elevation).toBeLessThan(start.elevation);
+  const high = await drag(0, 2000);
+  expect(high.elevation).toBeLessThanOrEqual(85 * Math.PI / 180 + 0.01);
+  expect(high.elevation).toBeGreaterThan(start.elevation);
+
+  // Zoom: the wheel brings the camera in, and only so far (it never goes through a wall), then out, and only so far.
+  await page.mouse.move(mid.x, mid.y);
+  for (let i = 0; i < 30; i++) await page.mouse.wheel(0, -400);
+  const near = await settled(page);
+  expect(near.distance).toBeLessThan(start.distance);
+  expect(near.distance).toBeGreaterThanOrEqual(Math.hypot(6, 6) / 2 - 0.01); // the starter room is 6 x 6
+  for (let i = 0; i < 60; i++) await page.mouse.wheel(0, 400);
+  const far = await settled(page);
+  expect(far.distance).toBeGreaterThan(start.distance);
+  expect(far.distance).toBeLessThanOrEqual(start.distance * 1.8 + 0.01);
+
+  // Pan: right drag and Shift drag move what the camera looks at, never far from the room.
+  const before = (await settled(page)).target;
+  const panned = (await drag(4000, 2500, { button: "right" })).target;
+  expect(panned).not.toEqual(before);
+  const shifted = (await drag(-4000, -2500, { shift: true })).target;
+  expect(shifted).not.toEqual(panned);
+  for (const target of [panned, shifted]) expect(Math.hypot(target[0] - start.target[0], target[1] - start.target[1], target[2] - start.target[2])).toBeLessThanOrEqual(6 / 4 + 0.01);
+
+  // Double-click: back to the default view.
+  await page.mouse.dblclick(mid.x, mid.y);
+  expect(await settled(page)).toEqual(start);
+  await browserExpect(page.getByRole("button", { name: "Reset view" })).toHaveCount(0);
+
+  // The keyboard still turns it (and Home resets it); so does the reset button.
+  await page.getByTestId("home-view").focus();
+  await page.keyboard.press("ArrowLeft"); await page.keyboard.press("ArrowUp"); await page.keyboard.press("-");
+  const keyed = await settled(page);
+  expect(keyed.azimuth).not.toBe(start.azimuth); expect(keyed.elevation).toBeGreaterThan(start.elevation); expect(keyed.distance).toBeGreaterThan(start.distance);
+  await page.getByRole("button", { name: "Reset view" }).click();
+  expect(await settled(page)).toEqual(start);
+}, ROOM_TEST_TIMEOUT_MS);
+
+it("with reduced motion the view stops where the owner lets go (no glide)", async () => {
+  const { page } = await open({ viewport: { width: 1280, height: 800 }, reducedMotion: "reduce" }, homeOf());
+  await page.evaluate(() => { window.location.hash = "home"; });
+  await drawn(page);
+  const box = (await page.getByTestId("home-view").boundingBox())!;
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2); await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2 - 200, box.y + box.height / 2, { steps: 4 }); await page.mouse.up();
+  const released = await viewOf(page);
+  await page.waitForTimeout(600);
+  expect(await viewOf(page)).toEqual(released);
+}, ROOM_TEST_TIMEOUT_MS);

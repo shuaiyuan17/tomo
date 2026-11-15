@@ -14,8 +14,8 @@ import { HomeStage, type StageState } from "./three/stage.js";
 export interface RoomHandle { capture(maxBytes: number): string | null }
 export type RoomFailure = "webgl" | "lost";
 
-const TURN_PER_PIXEL = 0.008;
 const TURN_PER_KEY = 0.12;
+const ZOOM_PER_KEY = 1.15;
 
 function usePrefersReducedMotion(): boolean {
   const [reduced, setReduced] = useState(() => window.matchMedia("(prefers-reduced-motion: reduce)").matches);
@@ -36,7 +36,8 @@ export function RoomView({ scene, revision, status, now, label, handle, onFailur
   const canvas = useRef<HTMLCanvasElement>(null);
   const stage = useRef<HomeStage | null>(null);
   const [ready, setReady] = useState(false);
-  const [turned, setTurned] = useState(false);
+  /** The owner moved the view away from the default: a reset button shows. */
+  const [moved, setMoved] = useState(false);
   const reduced = usePrefersReducedMotion();
   const failure = useRef(onFailure);
   failure.current = onFailure;
@@ -48,6 +49,12 @@ export function RoomView({ scene, revision, status, now, label, handle, onFailur
     try { made = new HomeStage(canvas.current, (name) => `/api/v1/home/assets/${encodeURIComponent(name)}`); }
     catch { failure.current("webgl"); return; }
     stage.current = made;
+    // The view, rounded, on the element: for tests and anything that reads the DOM.
+    made.onView = (view) => {
+      box.current?.setAttribute("data-view", JSON.stringify({ ...view, target: view.target.map((v) => Math.round(v * 100) / 100), distance: Math.round(view.distance * 1000) / 1000,
+        azimuth: Math.round(view.azimuth * 1000) / 1000, elevation: Math.round(view.elevation * 1000) / 1000 }));
+      setMoved(made.isMoved());
+    };
     handle.current = { capture: (maxBytes) => made.capture(maxBytes) };
     const element = box.current, surface = canvas.current;
     const observer = new ResizeObserver(() => made.resize(element.clientWidth, element.clientHeight));
@@ -78,28 +85,26 @@ export function RoomView({ scene, revision, status, now, label, handle, onFailur
   const signature = JSON.stringify([[...state.conditions].sort(), state.values, state.subagents, state.hasPet, { ...state.sky, progress: Math.round(state.sky.progress * 200) }]);
   useEffect(() => { if (ready) stage.current?.setState(state); }, [signature, ready, scene, revision]);
 
-  // Dragging turns the room; vertical swipes still scroll the page (touch-action: pan-y).
-  const drag = useRef<{ id: number; x: number } | null>(null);
-  return <div ref={box} className="relative size-full min-h-0 touch-pan-y select-none outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
-    role="img" aria-label={label} tabIndex={0} data-state={ready ? "ready" : "loading"}
+  // The room is the owner's to look round (OrbitControls, in the stage): drag
+  // to orbit, pinch or wheel to zoom, two fingers or right / Shift drag to
+  // pan, double-click to go back. touch-action: none keeps those gestures off
+  // the page's own scrolling. The keyboard does the same from the arrows.
+  return <><div ref={box} data-testid="home-view" className="relative size-full min-h-0 touch-none select-none outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+    role="img" aria-label={`${label}. Arrow keys turn the room, plus and minus zoom, Home resets the view.`} tabIndex={0} data-state={ready ? "ready" : "loading"}
     onKeyDown={(event) => {
-      if (event.key === "ArrowLeft" || event.key === "ArrowRight") { event.preventDefault(); stage.current?.turn(event.key === "ArrowLeft" ? TURN_PER_KEY : -TURN_PER_KEY); setTurned(true); }
-      if (event.key === "Home") { event.preventDefault(); stage.current?.resetView(); }
+      const key = event.key;
+      if (key === "ArrowLeft" || key === "ArrowRight") stage.current?.turn(key === "ArrowLeft" ? TURN_PER_KEY : -TURN_PER_KEY);
+      else if (key === "ArrowUp" || key === "ArrowDown") stage.current?.turn(0, key === "ArrowUp" ? TURN_PER_KEY : -TURN_PER_KEY);
+      else if (key === "+" || key === "=" || key === "-") stage.current?.zoom(key === "-" ? ZOOM_PER_KEY : 1 / ZOOM_PER_KEY);
+      else if (key === "Home") stage.current?.resetView();
+      else return;
+      event.preventDefault();
     }}
-    onPointerDown={(event) => {
-      if (event.pointerType === "mouse" && event.button !== 0) return;
-      drag.current = { id: event.pointerId, x: event.clientX };
-      if (event.pointerType === "mouse") event.currentTarget.setPointerCapture(event.pointerId);
-    }}
-    onPointerMove={(event) => {
-      if (!drag.current || drag.current.id !== event.pointerId) return;
-      const dx = event.clientX - drag.current.x;
-      drag.current.x = event.clientX;
-      if (dx) { stage.current?.turn(-dx * TURN_PER_PIXEL); setTurned(true); }
-    }}
-    onPointerUp={() => { drag.current = null; }} onPointerCancel={() => { drag.current = null; }}
     onDoubleClick={() => stage.current?.resetView()}>
-    <canvas ref={canvas} className="block size-full cursor-grab active:cursor-grabbing" />
-    {!turned && <span aria-hidden="true" className="pointer-events-none absolute right-3 bottom-2.5 rounded-full bg-background/75 px-2 py-0.5 text-[11px] tracking-[0.02em] text-muted-foreground">Drag to turn</span>}
-  </div>;
+    <canvas ref={canvas} className="block size-full cursor-grab touch-none active:cursor-grabbing" />
+  </div>
+  {moved ? <button type="button" onClick={() => stage.current?.resetView()} onDoubleClick={(event) => event.stopPropagation()}
+      className="absolute right-3 bottom-2.5 rounded-full bg-background/75 px-2 py-0.5 text-[11px] tracking-[0.02em] text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none">Reset view</button>
+      : <span aria-hidden="true" className="pointer-events-none absolute right-3 bottom-2.5 rounded-full bg-background/75 px-2 py-0.5 text-[11px] tracking-[0.02em] text-muted-foreground">Drag to turn · pinch to zoom</span>}
+  </>;
 }

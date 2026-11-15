@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { WebRequest } from "../src/web/protocol.js";
-import { composerStatus, elapsedLabel, rateLimitNotice, requestStamp, toolName, turnDetail, turnOutcome, TYPING_ACTIVITY, type ComposerNote, type TurnStatus } from "../web/src/composer-status.js";
+import { composerStatus, composerStatusIsProblem, elapsedLabel, rateLimitNotice, requestStamp, toolName, turnDetail, turnOutcome, TYPING_ACTIVITY, type ComposerNote, type TurnStatus } from "../web/src/composer-status.js";
 import { modelLabel } from "../web/src/tasks.js";
 
 const req = (state: WebRequest["state"], requestId = "r1"): WebRequest => ({ requestId, state, sessionId: "s" });
@@ -92,5 +92,30 @@ describe("composer status: what the SDK says about the turn", () => {
       .toBe("5-hour limit almost reached · 91% · resets in 2h 05m");
     expect(rateLimitNotice({ status: "rejected", limit: "seven_day_opus", resetsAt: now + 30 * 60_000, at: now }, now)).toBe("Weekly Opus limit reached · resets in 30 min");
     expect(rateLimitNotice({ status: "rejected", at: now }, now)).toBe("Usage limit reached");
+  });
+});
+
+describe("composer status: problems read as problems", () => {
+  const problem = (latest: WebRequest | undefined, extra: Partial<Parameters<typeof composerStatus>[0]> = {}) =>
+    composerStatusIsProblem({ activity: undefined, note: { text: "", at: "" }, latest, settled: null, now: 10_000, ...extra });
+  it("marks failed, refused, unknown and interrupted requests; never progress or success", () => {
+    for (const state of ["failed", "refused", "unknown", "interrupted"] as const) expect(problem(req(state))).toBe(true);
+    for (const state of ["queued", "running", "completed"] as const) expect(problem(req(state))).toBe(false);
+    expect(problem(undefined)).toBe(false);
+    expect(problem(req("failed"), { activity: "Bash · running" })).toBe(false);
+  });
+  it("follows the SDK's outcome when that is what the line shows", () => {
+    expect(problem(req("completed"), { turn: { status: { kind: "stopped" }, at: 0 } })).toBe(false);
+    expect(problem(req("failed"), { turn: { status: { kind: "error", error: "rate_limit" }, at: 0 } })).toBe(true);
+    expect(problem(req("completed"), { turn: { status: { kind: "refusal", model: "claude-fable-5-1" }, at: 0 } })).toBe(true);
+    expect(problem(req("completed"), { turn: { status: { kind: "refusal", model: "claude-fable-5-1", fallbackModel: "claude-opus-5-5" }, at: 0 } })).toBe(false);
+    // While a turn runs, a retry is progress.
+    expect(problem(req("running"), { turn: { status: { kind: "retry", attempt: 2, max: 10, delayMs: 1, error: "overloaded" }, at: 0 } })).toBe(false);
+  });
+  it("follows the note that is shown: a warning note is a problem, a neutral one is not", () => {
+    expect(problem(undefined, { note: { text: "Message is too large.", at: "", warn: true } })).toBe(true);
+    expect(problem(undefined, { note: { text: "Sending…", at: "" } })).toBe(false);
+    expect(problem(req("failed"), { note: { text: "Review the message", at: requestStamp(req("failed")) } })).toBe(false);
+    expect(problem(req("completed"), { note: { text: "Cannot check yet.", at: "old", warn: true } })).toBe(false);
   });
 });

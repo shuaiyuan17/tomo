@@ -29,7 +29,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
-import { composerStatus, requestLabels, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
+import { composerStatus, composerStatusIsProblem, requestLabels, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
 import { useRailWidth } from "./rail-width.js";
 import { AgentNameContext, agentNameOf } from "./agent-name.js";
 import { blockKey, interleave, messageKey, pendingKey, type ToolBlock } from "./inline-tools.js";
@@ -38,6 +38,7 @@ import { ChatRow, ChatScroller, type ChatScrollerHandle } from "./chat-scroller.
 import { chatRows, rowId } from "./chat-rows.js";
 import { ToolsUnreadableNote, TurnBlock } from "./tool-calls.js";
 import { useAttachments } from "./use-attachments.js";
+import { channelLabel, dayDividers, messageDateTime, messageTime } from "./message-meta.js";
 import { attachmentLabel, canSendWith, captureSend, dragHasFiles, imageFiles } from "./uploads.js";
 
 type Theme = "system" | "light" | "dark";
@@ -49,7 +50,8 @@ const refusalReasons: Record<string, string> = {
 };
 
 
-const OVERLAY_QUERY = "(max-width: 800px)";
+/** Below this the Tasks rail slides over the chat: pinned beside a 232 px sidebar it would leave the chat under ~500 px. */
+const OVERLAY_QUERY = "(max-width: 1024px)";
 function useMediaQuery(query: string): boolean {
   const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
   useEffect(() => {
@@ -81,6 +83,8 @@ function storedTasksOpen(): boolean {
   try { return localStorage.getItem("tomo-tasks-open") === "1"; } catch { return false; }
 }
 const THEMES = [["system", "System theme", SunMoon], ["light", "Light theme", Sun], ["dark", "Dark theme", Moon]] as const;
+/** The page background per theme (`--background` in styles.css), for `<meta name="theme-color">`. */
+const THEME_COLORS = { light: "#f4efe6", dark: "#1e1c1b" } as const;
 function storedTheme(): Theme {
   try { const theme = localStorage.getItem("tomo-theme"); return theme === "light" || theme === "dark" ? theme : "system"; }
   catch { return "system"; }
@@ -98,6 +102,12 @@ function useStudyRoute(): [StudyPage | null, (page: StudyPage | null) => void, s
     return () => window.removeEventListener("hashchange", update);
   }, []);
   return [page, (next) => { window.location.hash = next ? `study/${next}` : ""; if (!next) history.replaceState(null, "", window.location.pathname + window.location.search); setPage(next); setFocus(null); }, focus];
+}
+
+/** A centred day label at the top of the first row of a day ("Yesterday", "Sat, Nov 8"). */
+function DayDivider({ label }: { label: string }) {
+  return <div role="separator" aria-label={label} className="mx-auto mb-6 flex max-w-[740px] items-center gap-3 text-[11px] font-medium tracking-[0.02em] text-muted-foreground">
+    <span aria-hidden="true" className="h-px flex-1 bg-border" /><span aria-hidden="true">{label}</span><span aria-hidden="true" className="h-px flex-1 bg-border" /></div>;
 }
 
 export function App() {
@@ -156,7 +166,7 @@ export function App() {
   // stood; composerStatus drops a note as soon as the request moves on.
   const [note, setNote] = useState<ComposerNote>({ text: "", at: "" });
   const stamp = useRef("");
-  const setFeedback = (text: string) => setNote({ text, at: stamp.current });
+  const setFeedback = (text: string, warn = false) => setNote({ text, at: stamp.current, warn });
   const [theme, setTheme] = useState<Theme>(storedTheme);
   const [tasksOpen, setTasksOpen] = useState(storedTasksOpen);
   useEffect(() => {
@@ -210,6 +220,12 @@ export function App() {
   // only one of the two is open at a time.
   const [menuOpen, setMenuOpen] = useState(false);
   const menuButton = useRef<HTMLButtonElement>(null);
+  // A conversation picked with the pointer: the menu closes without handing focus back to
+  // its trigger, which Chromium would then draw with a keyboard focus ring. Keys keep it.
+  const pickedByPointer = useRef(false);
+  const sessionTrigger = useRef<HTMLButtonElement>(null);
+  // A pick in the phone drawer: the drawer closed and its menu button took focus already.
+  const pickedInDrawer = useRef(false);
   const drawer = phone && menuOpen;
   const drawerMotion = useMountedFor(drawer);
   const closeMenu = (refocus = true) => { setMenuOpen(false); if (refocus) menuButton.current?.focus(); };
@@ -241,8 +257,17 @@ export function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     document.documentElement.classList.toggle("dark", theme === "dark" || (theme === "system" && systemDark));
+    // The browser's own chrome (tab strip, phone status bar) follows the chosen theme, not only the OS one.
+    for (const meta of document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"]')) {
+      const dark = theme === "system" ? meta.media.includes("dark") : theme === "dark";
+      meta.content = dark ? THEME_COLORS.dark : THEME_COLORS.light;
+    }
     try { localStorage.setItem("tomo-theme", theme); } catch { /* Storage can be unavailable. */ }
   }, [theme, systemDark]);
+  // The tab says where you are: a Study page or a group being read.
+  useEffect(() => {
+    document.title = study ? `${STUDY_LABELS[study]} · The Study · Tomo` : home ? "Home · Tomo" : session?.kind === "group" ? `${session.title} · Tomo` : "Tomo";
+  }, [study, home, session?.kind, session?.title]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -302,14 +327,14 @@ export function App() {
     } catch (err) {
       // Definite refusals the daemon names (nothing was accepted), not network uncertainty.
       const refusal = err instanceof ApiError && err.status === 503 ? refusalReasons[err.code] : undefined;
-      if (refusal) { remember(null); setFeedback(refusal); }
+      if (refusal) { remember(null); setFeedback(refusal, true); }
       else if (err instanceof ApiError && [400, 401, 403, 409, 413, 415, 429].includes(err.status)) {
         remember(null);
         setFeedback(err.status === 413 ? "Message is too large. Shorten it and send again; your draft is kept."
           : err.status === 401 ? "Open the private link in web-access.log to reconnect. Your draft is kept."
           : err.code === "owner_dm_only" ? "Group conversations are read-only."
-          : err.code === "upload_missing" ? "An attached image expired before it was sent. Remove it and attach it again; your draft is kept." : "Message was not accepted. Your draft is saved here; reconnect or check web settings.");
-      } else setFeedback(labels.unknown);
+          : err.code === "upload_missing" ? "An attached image expired before it was sent. Remove it and attach it again; your draft is kept." : "Message was not accepted. Your draft is saved here; reconnect or check web settings.", err.code !== "owner_dm_only");
+      } else setFeedback(labels.unknown, true);
     } finally { setSending(false); }
   };
   const reattach = async (paths: string[]) => {
@@ -324,7 +349,7 @@ export function App() {
     const found = files.filter((file): file is File => !!file);
     const keys = attachments.add(found);
     setResending((old) => old && { ...old, imageKeys: keys });
-    if (found.length < paths.length) setFeedback("Some of its images could not be read back; attach them again before sending.");
+    if (found.length < paths.length) setFeedback("Some of its images could not be read back; attach them again before sending.", true);
   };
   /** Interrupted request being resent from the composer (dismissed once the resend is accepted). */
   const [resending, setResending] = useState<Resend | null>(null);
@@ -333,7 +358,7 @@ export function App() {
     if (!web.bootstrap) return;
     setConfirmDismiss(null);
     try { web.applyRequest(await dismissRequest(requestId, web.bootstrap, web.refreshBootstrap)); }
-    catch { if (!quiet) setFeedback("Could not dismiss it yet. It is still kept; try again."); }
+    catch { if (!quiet) setFeedback("Could not dismiss it yet. It is still kept; try again.", true); }
   };
   const resend = (request: WebRequest) => {
     setResending({ requestId: request.requestId, original: request.text ?? "" });
@@ -358,11 +383,11 @@ export function App() {
       // The answer goes into the request stream, so the status line shows it
       // live (and follows it to Completed) instead of a frozen copy.
       if (request.sessionId) { web.acceptRequest(request); setFeedback(""); }
-      else setFeedback(labels[request.state]);
+      else setFeedback(labels[request.state], request.state !== "completed" && request.state !== "running" && request.state !== "queued");
       // Unknown stays unresolved; refused and interrupted were not answered, so the draft is kept.
       if (request.state !== "unknown") { remember(null); if (request.state !== "refused" && request.state !== "interrupted") setDraft(""); }
       setReload((r) => r + 1);
-    } catch { setFeedback("Cannot check yet. Your draft is still here."); }
+    } catch { setFeedback("Cannot check yet. Your draft is still here.", true); }
   };
   const older = async () => {
     if (!history.nextCursor || historyStatus === "loading-older") return;
@@ -400,6 +425,8 @@ export function App() {
     <TurnBlock block={block} running={running} choices={openGroups} onChoice={(key, value) => setOpenGroups((old) => ({ ...old, [key]: value }))} /></div>;
   // Rows of the scroller (see chat-rows.ts); the running turn's calls and reply ride in the last one.
   const rows = chatRows(timeline.entries, pendingUsers, timeline.trailing.length > 0 || blocks.length > 0);
+  // A day divider rides at the top of the row it introduces (rows only grow at their ends; see chat-rows.ts).
+  const dividers = dayDividers(rows.map((row) => row.kind === "message" ? { at: row.message.timestamp } : { at: row.kind === "pending" ? row.request.timestamp : undefined, late: true }));
   useEffect(() => { stamp.current = requestStamp(latest); });
   // The status line counts a running tool's seconds itself between the daemon's reports.
   const turn = web.turns[selectedId];
@@ -422,45 +449,48 @@ export function App() {
     try {
       const { stopped } = await stopTurn(web.bootstrap, web.refreshBootstrap);
       if (!stopped) { setStopping(false); setFeedback("Nothing was running to stop."); }
-    } catch { setStopping(false); setFeedback("Could not stop it. Try again."); }
+    } catch { setStopping(false); setFeedback("Could not stop it. Try again.", true); }
   };
   // The SDK's predicted next message: offered only while the composer is empty and idle.
   const suggestion = session?.writable && !turnActive && !draft && !attachments.items.length && !resending && !uncertain ? web.suggestions[selectedId] : undefined;
+  const statusInput = { activity: web.activity[selectedId], note, latest, settled: settle.settled, agent, turn, now };
   const usage = session?.stats;
   const hasContext = !!usage?.contextMax;
   const sessions = web.bootstrap?.sessions ?? [];
   const connectionLabel = web.connection === "live" ? "Connected" : web.connection === "locked" ? "Access link required" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…";
-  const notice = "rounded-xl border bg-muted/60 px-4 py-3 text-[13px]";
+  const notice = "rounded-xl border bg-muted/60 px-4 py-3 text-[13px] [&_code]:whitespace-nowrap";
   return <AgentNameContext.Provider value={agent}><div className="flex h-dvh flex-col">
     <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href={study ? "#study" : home ? "#home" : "#conversation"} onClick={(e) => { e.preventDefault(); document.getElementById(study ? "study" : home ? "home" : "conversation")?.focus(); }}>{study ? `Skip to ${STUDY_LABELS[study]}` : home ? "Skip to Home" : "Skip to conversation"}</a>
     <header className="flex h-[72px] shrink-0 items-center gap-8 border-b px-8 max-[1024px]:px-6 max-[600px]:h-12 max-[600px]:gap-3 max-[600px]:px-3.5 max-[600px]:pt-[env(safe-area-inset-top)] max-[600px]:box-content">
       <Button ref={menuButton} variant="ghost" size="icon" aria-expanded={drawer} aria-controls="sidebar" title="Menu" aria-label="Menu: conversations, the Study, usage and theme"
         onClick={() => { setTasksOpen(false); setMenuOpen((open) => !open); }}
-        className="-ml-1.5 hidden size-9 shrink-0 rounded-xl text-foreground hover:bg-foreground/[0.07] aria-expanded:bg-foreground/[0.11] max-[600px]:inline-flex [&_svg:not([class*='size-'])]:size-5"><PanelLeft strokeWidth={1.75} /></Button>
-      <a className="flex items-center gap-2 font-serif text-[30px] tracking-[-1.5px] text-foreground no-underline max-[600px]:gap-1.5 max-[600px]:text-[22px] max-[600px]:tracking-[-1px]" href="/" aria-label="Tomo home">
+        className="-ml-2.5 hidden size-11 shrink-0 rounded-xl text-foreground hover:bg-foreground/[0.07] aria-expanded:bg-foreground/[0.11] max-[600px]:inline-flex [&_svg:not([class*='size-'])]:size-5"><PanelLeft strokeWidth={1.75} /></Button>
+      <a className="flex shrink-0 items-center gap-2 font-serif text-[30px] tracking-[-1.5px] text-foreground no-underline max-[600px]:gap-1.5 max-[600px]:text-[22px] max-[600px]:tracking-[-1px]" href="/" aria-label="Tomo home">
         <Mark className="size-9 max-[600px]:size-7" /><span>tomo<span className="text-primary">.</span></span></a>
       <span className="border-l pl-8 text-sm text-muted-foreground max-[800px]:hidden">{study ? "The Study" : home ? "Home" : "Conversation"}</span>
-      <div className="ml-auto flex items-center gap-4 max-[600px]:gap-1">
+      {/* Phones have no sidebar on screen: Home, or a group being read, is named here. */}
+      {(home || (!study && session?.kind === "group")) && <span className="hidden min-w-0 truncate border-l pl-3 text-[13px] text-muted-foreground max-[600px]:block" title={home ? undefined : session?.title}>{home ? "Home" : session?.title}</span>}
+      <div className="ml-auto flex items-center gap-4 max-[600px]:gap-0.5">
         <Button ref={tasksButton} variant="ghost" size="icon" aria-pressed={tasksOpen} aria-controls="tasks-rail" title="Tasks"
           aria-label={`Tasks${running ? `, ${running} running` : ""}`} onClick={() => { setMenuOpen(false); setTasksOpen((open) => !open); }}
-          className="relative size-10 rounded-xl text-foreground max-[600px]:size-9 hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-5">
+          className="relative size-10 rounded-xl text-foreground max-[600px]:size-11 hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-5">
           <ListChecks strokeWidth={1.75} />
           {running > 0 && <span aria-hidden="true" className="absolute top-0.5 right-0.5 min-w-4 rounded-full bg-primary px-1 text-center text-[10px] leading-4 font-semibold text-primary-foreground ring-2 ring-background">{running > 99 ? "99+" : running}</span>}
         </Button>
         {screenAllowed && <Button ref={screenButton} variant="ghost" size="icon" aria-pressed={screen} aria-controls="screen-window" title="Screen"
           aria-label="Screen (read-only live view)" onClick={() => screen ? closeScreen() : setScreenOpen(true)}
-          className="size-10 rounded-xl text-foreground max-[600px]:size-9 hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-5">
+          className="size-10 rounded-xl text-foreground max-[600px]:size-11 hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-5">
           <Monitor strokeWidth={1.75} /></Button>}
         <span role="status" className="flex items-center gap-2 tracking-[0.02em] text-xs text-muted-foreground">
-          <i className={cn("size-1.5 rounded-full border border-muted-foreground", web.connection === "live" && "border-primary bg-primary")} />
-          <span className="max-[600px]:sr-only">{connectionLabel}</span></span>
+          <i className={cn("size-1.5 rounded-full border border-muted-foreground", web.connection === "live" && "border-primary bg-primary", web.connection !== "live" && web.connection !== "locked" && "animate-pulse")} />
+          <span className={cn(web.connection === "live" && "max-[600px]:sr-only")}>{connectionLabel}</span></span>
       </div>
     </header>
     <div className="flex min-h-0 flex-1">
       {phone && drawerMotion.mounted && <div aria-hidden="true" onClick={() => closeMenu()} data-state={drawerMotion.shown ? "open" : "closed"}
-        className="fixed inset-0 top-[calc(3rem+env(safe-area-inset-top))] z-20 bg-black/20 transition-opacity duration-[220ms] data-[state=closed]:opacity-0" />}
+        className="fixed inset-0 top-[calc(3rem+env(safe-area-inset-top))] z-20 bg-black/20 transition-opacity dark:bg-black/45 duration-[220ms] data-[state=closed]:opacity-0" />}
       <aside ref={sidebar} id="sidebar" data-state={drawer ? "open" : "closed"} {...(drawer ? { role: "dialog", "aria-modal": true } : {})}
-        className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-width:thin] max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:fixed max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:bottom-0 max-[600px]:left-0 max-[600px]:z-30 max-[600px]:w-[min(320px,86vw)] max-[600px]:bg-background max-[600px]:px-5 max-[600px]:pt-5 max-[600px]:pb-[max(1.25rem,env(safe-area-inset-bottom))] max-[600px]:shadow-2xl max-[600px]:transition-transform max-[600px]:duration-[220ms] max-[600px]:data-[state=closed]:-translate-x-full max-[600px]:data-[state=closed]:shadow-none"
+        className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:fixed max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:bottom-0 max-[600px]:left-0 max-[600px]:z-30 max-[600px]:w-[min(320px,86vw)] max-[600px]:bg-background max-[600px]:px-5 max-[600px]:pt-5 max-[600px]:pb-[max(1.25rem,env(safe-area-inset-bottom))] max-[600px]:shadow-2xl max-[600px]:transition-transform max-[600px]:duration-[220ms] max-[600px]:data-[state=closed]:-translate-x-full max-[600px]:data-[state=closed]:shadow-none"
         aria-label="Conversation details" inert={tasksModal || (phone && !drawer)} aria-hidden={phone && !drawer ? true : undefined}>
         <nav aria-label="Workspace" className="mb-7 flex flex-col gap-0.5">
           {([[null, "Conversation", MessageCircle], ["home", "Home", House], ["todos", "The Study", BookOpen]] as const).map(([target, label, Icon]) => {
@@ -473,20 +503,27 @@ export function App() {
         <p className="eyebrow mb-3">Your conversations</p>
         <div className="mb-1.5 flex items-center justify-between gap-2">
           <span id="session-label" className="text-[13px] font-medium">Session</span>
-          <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{session?.kind === "group" ? "Read-only" : "Owner DM"}</Badge>
+          {session && <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{session.kind === "group" ? "Read-only" : "Owner DM"}</Badge>}
         </div>
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild disabled={!sessions.length}>
-            <Button variant="outline" aria-labelledby="session-label session-value"
+            <Button ref={sessionTrigger} variant="outline" aria-labelledby="session-label session-value"
               className="h-11 w-full min-w-0 justify-between rounded-xl bg-card px-3.5 text-[13px] font-normal shadow-xs hover:bg-accent">
-              <span id="session-value" className="truncate">{session ? `${session.title}${session.kind === "group" ? " · read-only" : ""}` : "No session available"}</span>
+              <span id="session-value" className="truncate" title={session?.title}>{session ? `${session.title}${session.kind === "group" ? " · read-only" : ""}` : "No session available"}</span>
               <ChevronsUpDown className="text-muted-foreground" /></Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="w-(--radix-dropdown-menu-trigger-width) min-w-56 rounded-xl p-1">
+          <DropdownMenuContent align="start" className="w-auto max-w-[min(22rem,calc(100vw-2rem))] min-w-(--radix-dropdown-menu-trigger-width) rounded-xl p-1"
+            onPointerDown={() => { pickedByPointer.current = true; }} onKeyDown={() => { pickedByPointer.current = false; }}
+            onCloseAutoFocus={(event) => {
+              // Focus goes back to the trigger (so Tab continues from there), without a ring after a pointer pick;
+              // after a pick in the phone drawer it is already on the menu button (the trigger is inert by now).
+              if (pickedInDrawer.current) event.preventDefault();
+              else if (pickedByPointer.current) { event.preventDefault(); sessionTrigger.current?.focus({ focusVisible: false } as FocusOptions); }
+              pickedByPointer.current = false; pickedInDrawer.current = false; }}>
             <DropdownMenuLabel className="px-2 py-1.5 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">Conversations</DropdownMenuLabel>
-            <DropdownMenuRadioGroup value={selectedId} onValueChange={(value) => { setSelected(value); setFeedback(""); if (drawer) closeMenu(false); }}>
+            <DropdownMenuRadioGroup value={selectedId} onValueChange={(value) => { setSelected(value); setFeedback(""); if (drawer) { pickedInDrawer.current = true; closeMenu(!pickedByPointer.current); } }}>
               {sessions.map((s) => <DropdownMenuRadioItem key={s.id} value={s.id} className="rounded-lg py-2 text-[13px]">
-                <span className="truncate">{s.title}</span>{s.kind === "group" && <span className="ml-auto pl-3 tracking-[0.02em] text-[10px] text-muted-foreground">read-only</span>}
+                <span className="min-w-0 truncate" title={s.title}>{s.title}</span>{s.kind === "group" && <span className="ml-auto shrink-0 pl-3 tracking-[0.02em] text-[10px] whitespace-nowrap text-muted-foreground">read-only</span>}
               </DropdownMenuRadioItem>)}
             </DropdownMenuRadioGroup>
           </DropdownMenuContent>
@@ -501,15 +538,15 @@ export function App() {
           {hasContext && <Progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" className="h-1.5 bg-border" />}
           {!hasContext && <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">Usage appears after a turn reports its context window.</p>}
         </section>
-        <PlanUsage ready={!!web.bootstrap} live={web.rateLimit} />
+        <PlanUsage ready={!!web.bootstrap} locked={web.connection === "locked"} live={web.rateLimit} />
         {/* Theme: pinned to the bottom of the sidebar (and of the phone drawer). */}
         <div className="mt-auto flex items-center justify-between gap-3 border-t pt-4 max-[600px]:mt-8">
           <span className="eyebrow">Theme</span>
           <ToggleGroup type="single" aria-label="Color theme" value={theme} onValueChange={(value) => { if (value) setTheme(value as Theme); }}
-            className="rounded-xl bg-foreground/[0.05] p-0.5">
+            className="rounded-xl bg-foreground/[0.05] p-0.5 max-[600px]:rounded-[13px]">
             {THEMES.map(([value, label, Icon]) =>
               <ToggleGroupItem key={value} value={value} aria-label={label} title={label}
-                className="size-7 rounded-[9px]! px-0 text-muted-foreground hover:bg-transparent hover:text-foreground data-[state=on]:bg-card data-[state=on]:text-foreground data-[state=on]:shadow-sm dark:data-[state=on]:bg-foreground/[0.13] [&_svg:not([class*='size-'])]:size-3.5">
+                className="size-7 rounded-[9px]! px-0 text-muted-foreground max-[600px]:size-10 max-[600px]:rounded-[11px]! hover:bg-transparent hover:text-foreground data-[state=on]:bg-card data-[state=on]:text-foreground data-[state=on]:shadow-sm dark:data-[state=on]:bg-foreground/[0.13] [&_svg:not([class*='size-'])]:size-3.5 max-[600px]:[&_svg:not([class*='size-'])]:size-[18px]">
                 <Icon strokeWidth={1.75} /></ToggleGroupItem>)}
           </ToggleGroup>
         </div>
@@ -531,16 +568,18 @@ export function App() {
           {historyStatus === "error" && <div className={cn(notice, "mx-auto mb-4 flex max-w-[740px] items-center gap-3")} role="alert">History is unavailable. <Button variant="outline" size="sm" className="rounded-lg" onClick={() => setReload((r) => r + 1)}>Try again</Button></div>}
           {historyStatus === "loading" && selectedId && <p className="text-center text-sm text-muted-foreground" role="status">Opening your conversation…</p>}
           {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && pendingUsers.length === 0 && <div className="m-auto flex h-full min-h-56 max-w-md flex-col items-center justify-center pb-12 text-center"><Mark className="mb-4 size-16 stroke-[1.3]" /><h2 className="mt-2 mb-3 font-serif text-[28px] font-normal">Start wherever you are.</h2><p className="m-0 max-w-80 text-sm text-muted-foreground">{session?.kind === "group" ? "There are no recorded messages in this group yet." : "A question, a half-formed idea, or something on your mind."}</p></div>}
+          {/* The first shown row's day, outside the rows: on "Load earlier" only its text changes. */}
+          {dividers.first && <DayDivider label={dividers.first} />}
           </>}>
           {rows.map((row, rowIndex) => <ChatRow key={row.id} row={row}>{row.kind === "message" && <>{row.tools.map((block) => toolBlock(block, false))}{(() => {
             const message = row.message; const index = messageIndex.get(message.id)!;
             const { sent, body: content } = parseSendMarker(message.role, message.content);
             const { reply, body } = parseReply(content); const quoted = reply && findQuoted(history.messages, index, reply);
             return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
-            <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
+            <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()} title={messageDateTime(message.timestamp)} className="tabular-nums">{messageTime(message.timestamp)}</time><span>{channelLabel(message.channel)}</span>
               {sent && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{sendMarkerLabel(sent)}</Badge>}
               {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
-            {(message.role === "user" ? (node: React.JSX.Element) => ownBubble(node, message.requestId) : (node: React.JSX.Element) => node)(<div className={cn("markdown", message.role === "user" && "min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5", message.role === "assistant" && "reading")}>
+            {(message.role === "user" ? (node: React.JSX.Element) => ownBubble(node, message.requestId) : (node: React.JSX.Element) => node)(<div className={cn("markdown", message.role === "user" && "min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 max-[600px]:px-4 max-[600px]:py-3", message.role === "assistant" && "reading")}>
               {message.role === "assistant" && body.trim() === "NO_REPLY"
                 // A turn that ended without a reply (silent by choice, or stopped): said plainly, not as the agent's words.
                 ? <p className="m-0 font-sans text-[12.5px] text-muted-foreground">No reply</p>
@@ -553,16 +592,18 @@ export function App() {
               body={`[Sent ${request.images.length === 1 ? "an image" : `${request.images.length} images`}, saved to: ${request.images.join(", ")}]`} /></div> : null}
             {sentImages[request.requestId] && <div className="mb-2 flex flex-wrap gap-2 opacity-80">{sentImages[request.requestId].map((src, i) =>
               <img key={i} src={src} alt="Image" className="block max-h-[280px] max-w-[280px] rounded-xl border object-contain" />)}</div>}
-            {request.text ? ownBubble(<div className="markdown min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80"><Text breaks>{request.text}</Text></div>, request.requestId)
+            {request.text ? ownBubble(<div className="markdown min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80 max-[600px]:px-4 max-[600px]:py-3"><Text breaks>{request.text}</Text></div>, request.requestId)
               : ownBubble(null, request.requestId)}
             {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)(row.request)}
           {rowIndex === rows.length - 1 && <>
           {timeline.trailing.map((block) => toolBlock(block, turnActive))}
           {blocks.map((block) => <article className="message assistant motion-enter mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{agent}</span><span>Reply in progress</span></div><div className="markdown reading"><MessageBody body={[block.text, ...(block.images ?? []).map((id) => `MEDIA:web:${id}`)].filter(Boolean).join("\n")} sessionId={selectedId} thinking="block" /></div></article>)}
-          </>}</ChatRow>)}
+          </>}
+          {/* A change of day: at the END of the earlier row, so no row ever changes at its top. */}
+          {dividers.after[rowIndex] && <DayDivider label={dividers.after[rowIndex]!} />}</ChatRow>)}
         </ChatScroller>
         <div className="mx-auto w-full max-w-[740px]"><div className="flex min-h-7 items-baseline gap-3 pb-2">
-          <div className={cn("feedback min-w-0 flex-1 tracking-[0.02em] text-xs leading-normal text-muted-foreground tabular-nums transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0")} role="status" aria-live="polite">{composerStatus({ activity: web.activity[selectedId], note, latest, settled: settle.settled, agent, turn, now })}</div>
+          <div className={cn("feedback min-w-0 flex-1 tracking-[0.02em] text-xs leading-normal text-muted-foreground tabular-nums transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0", composerStatusIsProblem(statusInput) && "text-destructive")} role="status" aria-live="polite">{composerStatus(statusInput)}</div>
 </div>
           {suggestion && <button type="button" onClick={() => { setDraft(suggestion); input.current?.focus(); }} title="Use this as your message"
             className="motion-enter mb-2 flex max-w-full items-center gap-1.5 rounded-full border bg-card px-3 py-1.5 text-left text-[12.5px] text-muted-foreground shadow-xs transition-colors hover:border-muted-foreground/50 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none">
@@ -580,7 +621,7 @@ export function App() {
               {item.status === "failed" && <button type="button" onClick={() => attachments.retry(item.key)} title={item.error} aria-label={`Retry upload${item.error ? ` (${item.error})` : ""}`}
                 className="absolute inset-0 grid place-items-center bg-background/60 text-destructive hover:bg-background/40"><RotateCw className="size-4" /></button>}
               <button type="button" onClick={() => attachments.remove(item.key)} aria-label={`Remove ${item.file.name || `image ${index + 1}`}`}
-                className="absolute top-1 right-1 grid size-5 place-items-center rounded-full bg-foreground/70 text-background hover:bg-foreground"><X className="size-3" strokeWidth={2.5} /></button>
+                className="absolute top-1 right-1 grid size-6 place-items-center rounded-full bg-foreground/70 text-background transition-colors hover:bg-foreground focus-visible:outline-offset-0"><X className="size-3" strokeWidth={2.5} /></button>
             </li>)}</ul>}
           {attachments.note && <p className="m-0 mb-2 text-[12px] text-muted-foreground" role="status">{attachments.note}</p>}
           <form onSubmit={(e) => void send(e)} className="composer flex items-end gap-1 rounded-[20px] border bg-card p-2.5 shadow-xs transition-[border-color,box-shadow] focus-within:border-muted-foreground/50 focus-within:shadow-md">
@@ -614,11 +655,11 @@ export function App() {
           ones: it slides over the chat, with a dimmed backdrop. It stays
           mounted for the closing transition. */}
       {railMotion.mounted && overlay && <div aria-hidden="true" onClick={closeTasks} data-state={railMotion.shown ? "open" : "closed"}
-        className="fixed inset-0 top-[72px] z-20 bg-black/20 transition-opacity duration-[220ms] data-[state=closed]:opacity-0 max-[600px]:top-[calc(3rem+env(safe-area-inset-top))]" />}
+        className="fixed inset-0 top-[72px] z-20 bg-black/20 transition-opacity dark:bg-black/45 duration-[220ms] data-[state=closed]:opacity-0 max-[600px]:top-[calc(3rem+env(safe-area-inset-top))]" />}
       {railMotion.mounted && <aside ref={rail} id="tasks-rail" aria-label="Tasks" data-state={railMotion.shown ? "open" : "closed"} {...(modal ? { role: "dialog", "aria-modal": true } : {})}
         style={railSize.width !== null ? { width: railSize.width } : undefined}
-        className="group/rail relative flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 max-[1024px]:w-[280px] max-[1024px]:pl-2.5 max-[800px]:fixed max-[800px]:top-[72px] max-[800px]:right-0 max-[800px]:bottom-0 max-[800px]:z-30 max-[800px]:w-[min(340px,88vw)] max-[800px]:bg-background max-[800px]:pt-3 max-[800px]:shadow-2xl max-[800px]:transition-transform max-[800px]:duration-[220ms] max-[800px]:data-[state=closed]:translate-x-full max-[600px]:top-[calc(3rem+env(safe-area-inset-top))]">
-        <div className="flex min-h-0 min-w-[246px] flex-1 flex-col transition-[opacity,transform] duration-[220ms] min-[801px]:group-data-[state=closed]/rail:translate-x-4 min-[801px]:group-data-[state=closed]/rail:opacity-0"><TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks} control={taskControl}
+        className="group/rail relative flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 max-[1024px]:fixed max-[1024px]:top-[72px] max-[1024px]:right-0 max-[1024px]:bottom-0 max-[1024px]:z-30 max-[1024px]:w-[min(340px,88vw)] max-[1024px]:bg-background max-[1024px]:pt-3 max-[1024px]:pl-2.5 max-[1024px]:shadow-2xl max-[1024px]:transition-transform max-[1024px]:duration-[220ms] max-[1024px]:data-[state=closed]:translate-x-full max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+        <div className="flex min-h-0 min-w-[246px] flex-1 flex-col transition-[opacity,transform] duration-[220ms] min-[1025px]:group-data-[state=closed]/rail:translate-x-4 min-[1025px]:group-data-[state=closed]/rail:opacity-0"><TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks} control={taskControl}
           footer={<ScheduledSection revision={web.cronRevision} onNavigate={() => { if (overlay) setTasksOpen(false); }} />} /></div>
         {railSize.separator && <div {...railSize.separator}
           className="group/handle absolute inset-y-0 left-0 z-10 w-2 cursor-col-resize touch-none outline-none">

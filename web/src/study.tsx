@@ -64,7 +64,7 @@ export function Study({ page, onPage, session, reload, inert, mutator, focus, cr
       <Button variant="ghost" size="icon" className="size-9 shrink-0 rounded-xl text-muted-foreground hover:bg-foreground/[0.07]" aria-label="Refresh" title="Refresh" onClick={() => setLocal((v) => v + 1)}><RefreshCw strokeWidth={1.75} /></Button>
     </div>
     <Tabs value={page} onValueChange={(value) => onPage(value as StudyPage)} className="min-h-0 flex-1 gap-0">
-      <TabsList aria-label="Study sections" className="h-auto w-full justify-start gap-1 overflow-x-auto rounded-none border-b bg-transparent p-0 [scrollbar-width:none]">
+      <TabsList aria-label="Study sections" className="h-auto w-full justify-start gap-1 overflow-x-auto rounded-none border-b bg-transparent p-0 [scrollbar-width:none] max-[800px]:pr-8 max-[800px]:[mask-image:linear-gradient(to_right,#000_calc(100%-2.5rem),transparent)]">
         {STUDY_PAGES.map((value) => <TabsTrigger key={value} value={value}
           className="-mb-px h-10 flex-none rounded-none border-0 border-b-2 border-transparent bg-transparent! px-3 text-[13px] font-medium text-muted-foreground shadow-none! hover:text-foreground data-[state=active]:border-primary data-[state=active]:text-foreground dark:data-[state=active]:border-primary">{STUDY_LABELS[value]}</TabsTrigger>)}
       </TabsList>
@@ -341,7 +341,7 @@ function CronActions({ job, mutator, onDone }: { job: WebCronJob; mutator: Mutat
       body: "The job is removed from the schedule. This cannot be undone from here. A run already in progress is not stopped." },
   };
   const toggle: CronAction = job.enabled ? "pause" : "resume";
-  const iconButton = "size-8 rounded-lg text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground";
+  const iconButton = "size-8 rounded-lg text-muted-foreground max-[600px]:size-10 hover:bg-foreground/[0.07] hover:text-foreground";
   return <AlertDialog open={open !== null} onOpenChange={(value) => { if (!value && !busy) { setOpen(null); setError(""); } }}>
     <div className="flex shrink-0 items-center gap-1">
       <AlertDialogTrigger asChild><Button variant="ghost" size="icon" className={iconButton} disabled={disabled} onClick={() => setOpen(toggle)}
@@ -351,10 +351,10 @@ function CronActions({ job, mutator, onDone }: { job: WebCronJob; mutator: Mutat
     </div>
     {open && <AlertDialogContent className="rounded-2xl bg-card sm:max-w-md">
       <AlertDialogHeader>
-        <AlertDialogTitle className="font-serif text-[22px] font-normal">{copy[open].title}</AlertDialogTitle>
+        <AlertDialogTitle className="font-serif text-[22px] leading-snug font-normal">{copy[open].title}</AlertDialogTitle>
         <AlertDialogDescription className="text-[13px] leading-relaxed">{copy[open].body}</AlertDialogDescription>
       </AlertDialogHeader>
-      <dl className="m-0 grid grid-cols-[88px_minmax(0,1fr)] gap-x-3 gap-y-1 rounded-xl bg-muted px-4 py-3 text-[13px]">
+      <dl className="m-0 grid grid-cols-[88px_minmax(0,1fr)] items-baseline gap-x-3 gap-y-1 rounded-xl bg-muted px-4 py-3 text-[13px]">
         <dt className={meta}>Schedule</dt><dd className="m-0 font-mono text-xs [overflow-wrap:anywhere]">{job.scheduleLabel}</dd>
         <dt className={meta}>Session</dt><dd className="m-0 font-mono text-xs [overflow-wrap:anywhere]">{job.sessionKey}</dd>
         <dt className={meta}>Message</dt><dd className="m-0 line-clamp-3 [overflow-wrap:anywhere]">{job.message}</dd>

@@ -15,14 +15,14 @@ import { cn } from "@/lib/utils";
  */
 export function CodeBlock({ language, code, children }: { language?: string; code: string; children: ReactNode }) {
   const pre = useRef<HTMLPreElement>(null);
-  return <div data-slot="code-block" className="group/code relative my-3 max-w-full rounded-lg bg-muted font-sans">
+  return <div data-slot="code-block" className="group/code relative my-4 max-w-full rounded-xl border bg-card font-sans">
     {language && <div data-slot="code-block-header" className="flex h-7 items-center px-4 pt-1.5 text-[11px] leading-none tracking-[0.02em] text-muted-foreground">
       <span data-slot="code-block-title" className="min-w-0 truncate">{language}</span></div>}
     <div data-slot="code-block-actions" className={cn("absolute right-1.5 z-10 opacity-0 transition-opacity group-hover/code:opacity-100 group-focus-within/code:opacity-100 pointer-coarse:opacity-100",
       language ? "top-1" : "top-1.5")}>
       <CopyButton value={code} fallback={pre} />
     </div>
-    <pre ref={pre} className={cn("m-0! bg-transparent!", language && "pt-2!")}>{children}</pre>
+    <pre ref={pre} className={cn("m-0! bg-transparent!", language ? "pt-2!" : "pr-10!")}>{children}</pre>
   </div>;
 }
 

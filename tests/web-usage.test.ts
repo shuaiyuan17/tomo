@@ -4,7 +4,7 @@ import { USAGE_DEADLINE_MS, USAGE_FAILURE_TTL_MS, USAGE_REFRESH_MIN_MS, USAGE_TI
 import { USAGE_RPC_TIMEOUT_MS } from "../src/web/protocol.js";
 import { SOCKET_TIMEOUT_MS } from "../src/web/http.js";
 import { vi } from "vitest";
-import { formatSpan, isWarn, localizeUsage, nextUsageDelay, RequestGate, USAGE_MARGIN_MS, USAGE_MIN_GAP_MS, USAGE_RETRY_MS, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle } from "../web/src/usage.js";
+import { formatSpan, isWarn, localizeUsage, nextUsageDelay, planName, RequestGate, USAGE_MARGIN_MS, USAGE_MIN_GAP_MS, USAGE_RETRY_MS, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle } from "../web/src/usage.js";
 import type { WebUsage, WebUsageWindow } from "../src/web/protocol.js";
 
 const NOW = Date.parse("2026-07-27T22:36:00.000Z");
@@ -189,5 +189,14 @@ describe("Plan usage card helpers", () => {
     const notices = states.map((state) => usageNotice({ ...base, state }));
     expect(new Set(notices).size).toBe(states.length);
     expect(usageNotice({ ...base, state: "ok" })).toBeUndefined();
+  });
+});
+
+describe("planName", () => {
+  it("reads the plan as a name: first letter up, the rest kept", () => {
+    expect(planName("max")).toBe("Max");
+    expect(planName("pro")).toBe("Pro");
+    expect(planName("Team Premium")).toBe("Team Premium");
+    expect(planName("")).toBe("");
   });
 });

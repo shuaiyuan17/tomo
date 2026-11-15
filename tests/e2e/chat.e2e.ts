@@ -185,6 +185,25 @@ it("silently reloads the first history page after rotation invalidates a cursor"
   expect(staleStatus).toBe(409);
 });
 
+it("loads the Study as a lazy chunk under the CSP, cached immutable and compressed", async () => {
+  const chunks: Record<string, string | undefined>[] = [];
+  page.on("response", (response) => {
+    if (/^\/assets\/study-[\w-]+\.js$/.test(new URL(response.url()).pathname)) chunks.push(response.headers());
+  });
+  await page.evaluate(() => {
+    const w = window as unknown as { __csp: string[] }; w.__csp = [];
+    document.addEventListener("securitypolicyviolation", (event) => w.__csp.push(event.violatedDirective));
+  });
+  // Not on the chat's critical path: nothing of the Study is fetched until it is opened.
+  expect(chunks).toHaveLength(0);
+  await page.getByRole("button", { name: "The Study" }).click();
+  await browserExpect(page.locator("#study")).toBeVisible();
+  expect(chunks).toHaveLength(1);
+  expect(chunks[0]["cache-control"]).toBe("public, max-age=31536000, immutable");
+  expect(chunks[0]["content-encoding"]).toBe("br");
+  expect(await page.evaluate(() => (window as unknown as { __csp: string[] }).__csp)).toEqual([]);
+});
+
 it("chats over real HTTP/CSRF/IPC/SSE and preserves history, themes, accessibility and group read-only state", async () => {
   const errors: string[] = []; const requests: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));

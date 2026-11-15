@@ -59,6 +59,7 @@ beforeEach(async () => {
       if (input.method === "dismiss") return channel.resolveInterrupted(input.requestId, "dismissed");
       if (input.method === "compact") return channel.requestCompact();
       if (input.method === "stop") return channel.stopOwnerTurn();
+      if (input.method === "task-action") return channel.taskAction(input.sessionId, input.taskId, input.action);
       if (input.method === "task") return channel.task(input.sessionId, input.taskId, input.output);
       if (input.method === "usage") return channel.usage(input.refresh);
       return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };
@@ -214,6 +215,30 @@ describe("local HTTP boundary", () => {
     expect(stop).toHaveBeenCalledWith("dm:owner");
     stop.mockResolvedValueOnce(false);
     expect(JSON.parse((await post(mutationHeaders())).text)).toEqual({ stopped: false });
+  });
+  it("a task action needs CSRF, the epoch and the owner conversation, and reaches the task by its id", async () => {
+    const stop = vi.fn(async (_key: string, _taskId: string) => true);
+    const background = vi.fn(async (_key: string, _toolUseId: string) => true);
+    const { watchBus } = await import("../src/watch/bus.js");
+    (channel as unknown as { taskControl: unknown }).taskControl = { stop, background };
+    watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
+      { taskId: "a1", taskType: "local_agent", description: "x", ambient: false, background: false, toolUseId: "toolu_1", startedAt: 1 }] });
+    const post = (path: string, headers: Record<string, string | undefined> = mutationHeaders()) =>
+      call(`/api/v1/sessions/${path}`, { method: "POST", headers, body: "{}" });
+    const own = `${bootstrap.ownerId}/tasks/a1`;
+    expect((await post(`${own}/stop`, { ...mutationHeaders(), "x-tomo-csrf": "wrong" })).status).toBe(403);
+    expect((await post(`${own}/stop`, { ...mutationHeaders(), "x-tomo-epoch": undefined })).status).toBe(409);
+    const group = bootstrap.sessions.find((s) => s.id !== bootstrap.ownerId)!;
+    const refused = await post(`${group.id}/tasks/a1/stop`);
+    expect(refused.status).toBe(403); expect(JSON.parse(refused.text)).toEqual({ error: "owner_dm_only" });
+    expect((await post(`${own}/kill`)).status).toBe(404);
+    expect((await post(`${bootstrap.ownerId}/tasks/zz/stop`)).status).toBe(404);
+    expect(stop).not.toHaveBeenCalled();
+    const moved = await post(`${own}/background`);
+    expect(moved.status).toBe(200); expect(JSON.parse(moved.text)).toEqual({ done: true });
+    expect(background).toHaveBeenCalledWith("dm:owner", "toolu_1");
+    expect(JSON.parse((await post(`${own}/stop`)).text)).toEqual({ done: true });
+    expect(stop).toHaveBeenCalledWith("dm:owner", "a1");
   });
   it("gates every private API including SSE, while keeping static assets public", async () => {
     for (const path of ["/api/v1/bootstrap", "/api/v1/sessions", `/api/v1/sessions/${bootstrap.ownerId}/messages`, `/api/v1/messages/${randomUUID()}`, "/api/v1/events",

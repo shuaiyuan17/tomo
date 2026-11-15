@@ -270,12 +270,17 @@ it("keeps messaging operational when the optional web process dies", async () =>
 it("shows tasks in a pinnable rail; on narrow screens it is a keyboard-safe overlay", async () => {
   watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
     { taskId: "a1", taskType: "local_agent", subagentType: "Explore", description: "Map the repo", ambient: false, background: true, startedAt: Date.now(), summary: "Reading src/web" },
+    { taskId: "f1", taskType: "local_agent", description: "Check the tests", ambient: false, background: false, startedAt: Date.now() },
   ] });
-  const toggle = page.getByRole("button", { name: /^Tasks, 1 running$/ });
+  const toggle = page.getByRole("button", { name: /^Tasks, 2 running$/ });
   await browserExpect(toggle).toHaveAttribute("aria-pressed", "false");
   // Desktop: pinned rail, not modal, persisted across reloads.
   await toggle.click();
   await browserExpect(page.getByRole("complementary", { name: "Tasks" })).toContainText("Reading src/web");
+  // Only the task that outlives the reply is tagged; the one the turn is waiting on is not.
+  await browserExpect(page.getByTestId("task-background")).toHaveCount(1);
+  await browserExpect(page.getByRole("button", { name: /Map the repo/ })).toContainText(/background · \d/);
+  await browserExpect(page.getByRole("button", { name: /Check the tests/ })).not.toContainText("background");
   await browserExpect(page.locator("main#conversation")).not.toHaveAttribute("inert", "");
   await page.reload();
   await browserExpect(page.getByRole("complementary", { name: "Tasks" })).toBeVisible();
@@ -361,6 +366,43 @@ const offset = async (box: ReturnType<Page["locator"]>, ref: ReturnType<Page["lo
   const [a, b] = [await edges(box), await edges(ref)];
   return [a[0] - b[0], a[1] - b[1]];
 };
+
+it("an opened owner task can be moved to the background and stopped; a group's task offers neither", async () => {
+  const calls: string[] = [];
+  let answer = true;
+  (channel as unknown as { taskControl: unknown }).taskControl = {
+    stop: async (key: string, taskId: string) => { calls.push(`stop ${key} ${taskId}`); return answer; },
+    background: async (key: string, toolUseId: string) => { calls.push(`background ${key} ${toolUseId}`); return answer; } };
+  const task = (background: boolean) => ({ taskId: "f1", taskType: "local_agent", description: "Check the tests", ambient: false, background, toolUseId: "toolu_f1", startedAt: Date.now() });
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task(false)] });
+  watchBus.publish({ type: "tasks", sessionKey: "telegram:-1", tasks: [{ ...task(false), taskId: "g1", description: "Group work" }] });
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  await page.getByRole("button", { name: /Check the tests/ }).click();
+  const move = page.getByRole("button", { name: "Move to background" });
+  const stop = page.getByRole("button", { name: "Stop task" });
+  // Refused by the SDK (it had just finished): said quietly, nothing else changes.
+  answer = false;
+  await move.click();
+  await browserExpect(page.getByRole("status").filter({ hasText: "Couldn't move it" })).toBeVisible();
+  answer = true;
+  await move.click();
+  await browserExpect.poll(() => calls).toEqual(["background dm:owner toolu_f1", "background dm:owner toolu_f1"]);
+  // The daemon reports it in the background: the offer goes, the tag shows, Stop stays.
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task(true)] });
+  await browserExpect(move).toHaveCount(0);
+  await browserExpect(page.getByRole("complementary", { name: "Tasks" })).toContainText("Working · background");
+  await page.screenshot({ path: "test-results/task-controls.png" });
+  await stop.click();
+  await browserExpect.poll(() => calls.at(-1)).toBe("stop dm:owner f1");
+  // Ended: nothing left to act on.
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [{ ...task(true), status: "stopped" }] });
+  await browserExpect(stop).toHaveCount(0);
+  await page.getByRole("button", { name: "Back to tasks" }).click();
+  await page.getByRole("button", { name: /Group work/ }).click();
+  await browserExpect(page.getByRole("heading", { name: "Group work" })).toBeVisible();
+  await browserExpect(stop).toHaveCount(0);
+  await browserExpect(move).toHaveCount(0);
+});
 
 it("a shell task: its Output card lines up with the Command card above it", async () => {
   await page.route("**/tasks/b1/command", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ text: "/tmp/merge-seq.sh 2>&1", truncated: false }) }));

@@ -236,6 +236,7 @@ async function startForeground(): Promise<void> {
         owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
         taskOutput: (key, taskId) => agent.readTaskOutput(key, taskId),
         toolCommand: (key, toolUseId) => agent.readToolCommand(key, toolUseId),
+        taskControl: { stop: (key, taskId) => agent.stopTask(key, taskId), background: (key, toolUseId) => agent.backgroundTask(key, toolUseId) },
         compact: (key, onSettled) => agent.requestOwnerCompact(key, onSettled),
         stop: (key) => agent.stopTurn(key),
         taskModel: subagentModelReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),

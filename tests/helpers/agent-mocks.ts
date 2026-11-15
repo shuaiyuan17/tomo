@@ -50,6 +50,11 @@ export interface MockQueryController {
 export const mockSdk = {
   /** How many times a query was asked to interrupt its turn. */
   interrupts: 0,
+  /** Task ids a query was asked to stop, and tool_use ids it was asked to move to the background. */
+  stoppedTasks: [] as string[],
+  backgroundedToolUses: [] as string[],
+  /** What `backgroundTasks` answers (false: no foreground task matched); "throw" makes both task calls fail. */
+  taskControlResult: true as boolean | "throw",
   /** Controls what the mock SDK returns for each user message. Returning a
    *  string emits a single text block; returning an array emits one assistant
    *  event per element (each becomes its own block, stitched into the same turn
@@ -105,6 +110,9 @@ export function resetMockSdk(): void {
   mockSdk.stampUserUuids = false;
   mockSdk.queryControllers = [];
   mockSdk.interrupts = 0;
+  mockSdk.stoppedTasks = [];
+  mockSdk.backgroundedToolUses = [];
+  mockSdk.taskControlResult = true;
   mockSdk.mcpServerSets = [];
   mockSdk.promptsBySession = [];
   mockSdk.optionsBySession = [];
@@ -317,6 +325,15 @@ function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
       eventQueue.push({ type: "result", subtype: "error_during_execution", is_error: true, session_id: "mock-sdk-session-123",
         total_cost_usd: 0.001, num_turns: 1, duration_ms: 100, usage: { input_tokens: 1, output_tokens: 1 } });
       wakeConsumer();
+    },
+    async stopTask(taskId: string) {
+      if (mockSdk.taskControlResult === "throw") throw new Error("task control unavailable");
+      mockSdk.stoppedTasks.push(taskId);
+    },
+    async backgroundTasks(toolUseId?: string) {
+      if (mockSdk.taskControlResult === "throw") throw new Error("background tasks are disabled");
+      mockSdk.backgroundedToolUses.push(toolUseId ?? "*");
+      return mockSdk.taskControlResult;
     },
     async getContextUsage() {
       if (mockSdk.contextUsageFails) throw new Error("context usage unavailable");

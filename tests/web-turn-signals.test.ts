@@ -92,3 +92,46 @@ describe("Stop from the browser", () => {
     await expect(setup({ stop: async () => { throw new Error("gone"); } }).channel.stopOwnerTurn()).resolves.toEqual({ stopped: false });
   });
 });
+
+describe("Stopping a task and moving one to the background from the browser", () => {
+  const task = (taskId: string, extra = {}) => ({ taskId, taskType: "local_agent", description: taskId, ambient: false, background: true, startedAt: 1, ...extra });
+  function controlled() {
+    const calls: string[] = [];
+    let answer = true;
+    const made = setup({ taskControl: {
+      stop: async (key, taskId) => { calls.push(`stop ${key} ${taskId}`); return answer; },
+      background: async (key, toolUseId) => { calls.push(`background ${key} ${toolUseId}`); return answer; } } });
+    made.bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
+      task("bg"), task("fg", { background: false, toolUseId: "toolu_fg" }), task("bare", { background: false }), task("over", { status: "completed" })] });
+    return { ...made, calls, refuse: () => { answer = false; } };
+  }
+
+  it("stops any running owner task, and moves a foreground one by the tool call that started it", async () => {
+    const { channel, id, calls, refuse } = controlled();
+    await expect(channel.taskAction(id, "bg", "stop")).resolves.toEqual({ done: true });
+    await expect(channel.taskAction(id, "fg", "stop")).resolves.toEqual({ done: true });
+    await expect(channel.taskAction(id, "fg", "background")).resolves.toEqual({ done: true });
+    expect(calls).toEqual(["stop dm:owner bg", "stop dm:owner fg", "background dm:owner toolu_fg"]);
+    refuse();
+    await expect(channel.taskAction(id, "fg", "background")).resolves.toEqual({ done: false });
+  });
+
+  it("refuses what cannot be done: unknown, ended, already in the background, or with no tool call to name", async () => {
+    const { channel, id, calls } = controlled();
+    await expect(channel.taskAction(id, "nope", "stop")).rejects.toMatchObject({ status: 404, code: "task_not_found" });
+    await expect(channel.taskAction(id, "over", "stop")).rejects.toMatchObject({ status: 409, code: "task_not_running" });
+    await expect(channel.taskAction(id, "bg", "background")).rejects.toMatchObject({ status: 409, code: "task_already_background" });
+    await expect(channel.taskAction(id, "bare", "background")).rejects.toMatchObject({ status: 409, code: "task_not_backgroundable" });
+    expect(calls).toEqual([]);
+  });
+
+  it("is refused without the hooks, and a failing hook reads as not done", async () => {
+    const plain = setup();
+    plain.bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task("bg")] });
+    await expect(plain.channel.taskAction(plain.id, "bg", "stop")).rejects.toMatchObject({ status: 409, code: "owner_setup_required" });
+    const failing = setup({ taskControl: { stop: async () => { throw new Error("gone"); }, background: async () => { throw new Error("gone"); } } });
+    failing.bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task("bg"), task("fg", { background: false, toolUseId: "t" })] });
+    await expect(failing.channel.taskAction(failing.id, "bg", "stop")).resolves.toEqual({ done: false });
+    await expect(failing.channel.taskAction(failing.id, "fg", "background")).resolves.toEqual({ done: false });
+  });
+});

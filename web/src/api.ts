@@ -1,4 +1,4 @@
-import type { EventEnvelope, MessageInput, WebBootstrap, WebCompactResult, WebEvent, WebRequest, WebSnapshot, WebStopResult } from "../../src/web/protocol.js";
+import type { EventEnvelope, MessageInput, WebBootstrap, WebCompactResult, WebEvent, WebRequest, TaskAction, WebSnapshot, WebStopResult, WebTaskActionResult } from "../../src/web/protocol.js";
 
 export class ApiError extends Error {
   constructor(readonly status: number, readonly code: string) { super(code); }
@@ -59,6 +59,11 @@ export function postHomeSnapshot(input: { requestId?: string; revision: string; 
 /** Stop the owner conversation's running turn. Same CSRF/epoch rules as sending a message. */
 export function stopTurn(bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebStopResult> {
   return mutate<WebStopResult>("/stop", "POST", {}, bootstrap, refresh);
+}
+
+/** Stop one running task of the owner conversation, or move a foreground one to the background. */
+export function taskAction(sessionId: string, taskId: string, action: TaskAction, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebTaskActionResult> {
+  return mutate<WebTaskActionResult>(`/sessions/${sessionId}/tasks/${encodeURIComponent(taskId)}/${action}`, "POST", {}, bootstrap, refresh);
 }
 
 /** Ask Tomo to compact the owner's session. Same CSRF/epoch rules as sending a message. */

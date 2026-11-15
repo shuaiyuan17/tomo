@@ -52,6 +52,13 @@ afterEach(async () => { home.stop(); await browser?.close(); await agent.stop();
 
 const writeScene = (scene: unknown) => { mkdirSync(homeDir, { recursive: true }); writeFileSync(join(homeDir, "scene.json"), typeof scene === "string" ? scene : JSON.stringify(scene)); };
 
+/**
+ * Every test here draws the room on a software rasteriser (SwiftShader) and waits for walks and
+ * fades to finish; the longest takes about 21 s on a quiet machine, which a busy CI runner
+ * stretches past the suite's 30 s default.
+ */
+const ROOM_TEST_TIMEOUT_MS = 90_000;
+
 it("the starter room, live status, Tomo's own scene, a broken scene, a picture, and the look back, all through the real server", async () => {
   // 1. Nothing written yet: the starter room, drawn, and said to be the starter.
   await browserExpect(page.locator("canvas").first()).toBeVisible();
@@ -95,7 +102,7 @@ it("the starter room, live status, Tomo's own scene, a broken scene, a picture, 
   expect(looked.snapshot.png.length).toBeGreaterThan(2_000);
   writeFileSync("test-results/home-as-tomo-sees-it.png", looked.snapshot.png);
   await page.screenshot({ path: "test-results/home-real-desktop.png" });
-});
+}, ROOM_TEST_TIMEOUT_MS);
 
 it("with no browser on the Home page, a look comes back without a picture", async () => {
   await browserExpect(page.locator("canvas").first()).toBeVisible();
@@ -106,4 +113,4 @@ it("with no browser on the Home page, a look comes back without a picture", asyn
   const looked = await home.look(home.web().revision, 1_500);
   expect(looked.status).toBe("no_browser");
   expect(Date.now() - started).toBeLessThan(3_000);
-});
+}, ROOM_TEST_TIMEOUT_MS);

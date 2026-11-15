@@ -82,6 +82,13 @@ async function drawn(page: Page): Promise<void> {
 }
 const publish = (event: Parameters<WebChannel["events"]["publish"]>[0]) => channel.events.publish(event);
 
+/**
+ * Every test here draws the room on a software rasteriser (SwiftShader) and waits for walks and
+ * fades to finish; the longest takes about 21 s on a quiet machine, which a busy CI runner
+ * stretches past the suite's 30 s default.
+ */
+const ROOM_TEST_TIMEOUT_MS = 90_000;
+
 it("opens Home from the sidebar, loads three.js only then, and follows the status live", async () => {
   const { page, served, violations } = await open({ viewport: { width: 1440, height: 900 } }, homeOf());
   const chunks: string[] = [];
@@ -136,7 +143,7 @@ it("opens Home from the sidebar, loads three.js only then, and follows the statu
   expect(Buffer.compare(before, await room.screenshot())).not.toBe(0);
   expect(served.snapshots).toHaveLength(0);
   expect(await violations()).toEqual([]);
-});
+}, ROOM_TEST_TIMEOUT_MS);
 
 it("answers a home-look with a PNG inside the limit, re-reads on a home event, and shows a problem quietly", async () => {
   const { page, served } = await open({ viewport: { width: 1280, height: 800 } }, homeOf());
@@ -172,7 +179,7 @@ it("answers a home-look with a PNG inside the limit, re-reads on a home event, a
   publish({ type: "home-look", requestId: crypto.randomUUID() });
   await page.waitForTimeout(500);
   expect(served.snapshots).toHaveLength(1);
-});
+}, ROOM_TEST_TIMEOUT_MS);
 
 it("draws the sky in the window: night, dusk, rain and snow, in both themes", async () => {
   const { page } = await open({ viewport: { width: 1440, height: 900 } }, homeOf(), "dark");
@@ -190,7 +197,7 @@ it("draws the sky in the window: night, dusk, rain and snow, in both themes", as
     await page.waitForTimeout(700);
     await page.screenshot({ path: `test-results/home-sky-${name}.png` });
   }
-});
+}, ROOM_TEST_TIMEOUT_MS);
 
 it("on a phone: the room fills the width under the header, and turns by a sideways drag", async () => {
   const { page, violations } = await open({ ...devices["iPhone 14"], defaultBrowserType: undefined }, homeOf());
@@ -217,7 +224,7 @@ it("on a phone: the room fills the width under the header, and turns by a sidewa
   // touch-action: pan-y keeps vertical swipes for the page.
   expect(await page.locator('[data-testid="home-room"] [data-state="ready"]').evaluate((element) => getComputedStyle(element).touchAction)).toBe("pan-y");
   expect(await violations()).toEqual([]);
-});
+}, ROOM_TEST_TIMEOUT_MS);
 
 it("without WebGL, or when the room's code fails to load, still says what Tomo is doing", async () => {
   const noGl = await open({ viewport: { width: 1280, height: 800 } }, homeOf({ status: status({ working: true, by: "cron", idleSince: undefined }) }));
@@ -237,7 +244,7 @@ it("without WebGL, or when the room's code fails to load, still says what Tomo i
   await failing.page.evaluate(() => { window.location.hash = "home"; });
   await browserExpect(failing.page.getByText("The room's drawing code didn't load.", { exact: false })).toBeVisible();
   await browserExpect(caption(failing.page)).toHaveText(/^Idle for 20 min/);
-});
+}, ROOM_TEST_TIMEOUT_MS);
 
 it("a scene at the format's limits draws without freezing the page", async () => {
   const objects: HomeScene["objects"] = Array.from({ length: 400 }, (_, i) => i % 4 === 0
@@ -256,7 +263,7 @@ it("a scene at the format's limits draws without freezing the page", async () =>
   expect(Date.now() - started).toBeLessThan(10_000);
   await page.waitForTimeout(800);
   await page.screenshot({ path: "test-results/home-limits.png" });
-});
+}, ROOM_TEST_TIMEOUT_MS);
 
 it("re-reads /home at least once a minute while the page shows in a visible tab", async () => {
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
@@ -274,7 +281,7 @@ it("re-reads /home at least once a minute while the page shows in a visible tab"
   await page.clock.runFor(70_000);
   await browserExpect.poll(() => reads).toBeGreaterThan(opened);
   expect(served.snapshots).toHaveLength(0);
-});
+}, ROOM_TEST_TIMEOUT_MS);
 
 it("the pet sits near Tomo while awake and goes into its nest to sleep", async () => {
   const { page } = await open({ viewport: { width: 1440, height: 900 } }, homeOf({ status: status({ pet: "happy" }) }));
@@ -285,4 +292,4 @@ it("the pet sits near Tomo while awake and goes into its nest to sleep", async (
   await page.waitForTimeout(3_500); // it walks over
   await page.screenshot({ path: "test-results/home-pet-sleeping.png" });
   await browserExpect(caption(page)).toHaveText(/^Idle for 20 min/);
-});
+}, ROOM_TEST_TIMEOUT_MS);

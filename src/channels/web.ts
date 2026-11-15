@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { rmSync } from "node:fs";
+import { lstatSync, rmSync } from "node:fs";
 import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
 import type { Channel, CommandHandler, IncomingMessage, MessageHandler, OutgoingMessage } from "./types.js";
 import { markDefiniteFailure } from "./types.js";
@@ -22,7 +22,7 @@ import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request
 import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
 import type { WebHome, WebModelChangeResult, WebModelView } from "../web/protocol.js";
 import { modelLabel } from "../models.js";
-import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type TaskAction, type WebStopResult, type WebTaskActionResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
+import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type TaskAction, type WebStopResult, type WebTaskActionResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess, type WebFiledFile } from "../web/protocol.js";
 
 /** A running tool's progress reaches the browser at most this often; the page counts in between. */
 export const TOOL_PROGRESS_EVERY_MS = 10_000;
@@ -221,7 +221,7 @@ export class WebChannel implements Channel {
     if (!this.ownerId || !this.owner) throw new WebError(409, "owner_setup_required");
     if (input.targetId !== undefined && input.targetId !== this.ownerId) throw new WebError(403, "owner_dm_only");
     if (this.journalUnavailable) throw new WebError(503, "journal_unavailable");
-    const attached = [...(input.images ?? []), ...(input.files ?? []).map((file) => `${file.id}:${file.type}:${file.name}`)];
+    const attached = [...(input.images ?? []), ...(input.files ?? []).map((file) => `${file.id}:${file.type}:${file.name}`), ...(input.refiled ?? []).map((path) => `refiled:${path}`)];
     const digest = createHash("sha256").update(attached.length ? `${input.text}\0${attached.join(",")}` : input.text).digest("hex");
     const previous = this.receipts.get(input.requestId);
     if (previous) {
@@ -249,12 +249,17 @@ export class WebChannel implements Channel {
     // images; one that expired or is unknown refuses the message, before
     // anything is accepted. Until the receipt is durable they stay claimable.
     let uploads: Awaited<ReturnType<WebChannel["fileUploads"]>> | undefined;
-    try { uploads = input.images?.length || input.files?.length ? await this.fileUploads(input.images ?? [], input.files ?? [], input.requestId) : undefined; }
-    finally { this.inFlight.delete(input.requestId); }
+    let refiled: WebFiledFile[];
+    try {
+      // Checked first: nothing is claimed or filed for a message that names a file it may not.
+      refiled = this.refiledFiles(input.refiled ?? []);
+      uploads = input.images?.length || input.files?.length ? await this.fileUploads(input.images ?? [], input.files ?? [], input.requestId) : undefined;
+    } finally { this.inFlight.delete(input.requestId); }
     // From here to receipts.set there is no await, so no other receive can interleave.
     const images = uploads?.list.length ? uploads : undefined;
     const filed = images?.list.flatMap((image) => image.savedPath ? [image.savedPath] : []) ?? [];
-    const filedFiles = uploads?.notices.flatMap((notice) => notice.savedPath ? [notice.savedPath] : []) ?? [];
+    const filedFiles: WebFiledFile[] = [...refiled, ...(uploads?.notices ?? []).flatMap((notice) => notice.savedPath
+      ? [{ path: notice.savedPath, name: notice.filename, type: notice.mimeType, size: notice.byteSize ?? 0, ...(notice.mimeUnknown ? { typeUnknown: true } : {}) }] : [])];
     const request: WebRequest = { requestId: input.requestId, state: "queued", sessionId: this.ownerId, text: input.text, timestamp: this.now(), responseTurnId: input.requestId,
       ...(filed.length ? { images: filed } : {}), ...(filedFiles.length ? { files: filedFiles } : {}) };
     this.receipts.set(input.requestId, { digest, request, settled: false });
@@ -270,7 +275,9 @@ export class WebChannel implements Channel {
     }
     uploads?.finalize();
     // Images first, then files — the order the iMessage channel writes its markers in.
-    const marker = [images ? formatImageMarker(images.list.length, filed, images.unconverted) : "", formatFileMarker(uploads?.notices ?? [])].filter(Boolean).join(" ");
+    // A resend's files are announced exactly as the first time (the same path, name, type and size).
+    const notices: SavedFileNotice[] = filedFiles.map((file) => ({ filename: file.name, mimeType: file.type, byteSize: file.size, mimeUnknown: file.typeUnknown, savedPath: file.path, status: "saved" }));
+    const marker = [images ? formatImageMarker(images.list.length, filed, images.unconverted) : "", formatFileMarker(notices)].filter(Boolean).join(" ");
     const message: IncomingMessage = { id: input.requestId, chatId: WEB_CHAT_ID, senderName: "Owner",
       text: marker ? (input.text ? `${marker} ${neutralizeMarker(input.text)}` : marker) : neutralizeMarker(input.text), timestamp: Date.now(), isGroup: false,
       ...(images ? { images: images.list } : {}) };
@@ -344,6 +351,28 @@ export class WebChannel implements Channel {
       }
     } catch (error) { undo(); throw error; }
     return { list, notices, unconverted, undo, finalize: claim.finalize };
+  }
+
+  /**
+   * A resend's already-filed files: each path must be one an interrupted
+   * request still awaiting the owner filed (its receipt lists it), and still
+   * be a regular file there. Anything else refuses the message — this is
+   * never a way to name an arbitrary path.
+   */
+  private refiledFiles(paths: readonly string[]): WebFiledFile[] {
+    if (!paths.length) return [];
+    if (new Set(paths).size !== paths.length) throw new WebError(409, "upload_missing");
+    const known = new Map<string, WebFiledFile>();
+    for (const receipt of this.receipts.values()) {
+      if (this.awaitingOwner(receipt)) for (const file of receipt.request.files ?? []) known.set(file.path, file);
+    }
+    return paths.map((path) => {
+      const file = known.get(path);
+      let present = false;
+      try { present = !!file && lstatSync(path).isFile(); } catch { /* gone */ }
+      if (!file || !present) throw new WebError(409, "upload_missing");
+      return { ...file };
+    });
   }
 
   request(id: string): WebRequest { return { ...(this.receipts.get(id)?.request ?? { requestId: id, state: "unknown" }) }; }

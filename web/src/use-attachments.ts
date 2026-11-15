@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { WebBootstrap } from "./api.js";
 import { ApiError, discardUpload, uploadImage } from "./api.js";
-import { addFiles, isAttachableImage, takeSent, updateAttachment, type Attachment } from "./uploads.js";
+import type { WebFiledFile } from "../../src/web/protocol.js";
+import { addFiles, filedAttachment, isAttachableImage, takeSent, updateAttachment, type Attachment } from "./uploads.js";
 
 const failure = (error: unknown) => {
   if (!(error instanceof ApiError)) return "Upload failed";
@@ -58,6 +59,15 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
     return added.map((item) => item.key);
   }, [upload, allow.images, allow.files]);
 
+  /** Resend: files the interrupted message already filed go back in the tray as they are. Returns their keys. */
+  const addFiled = useCallback((files: readonly WebFiledFile[]): string[] => {
+    const added = files.map((file) => filedAttachment(`a${++counter.current}`, file));
+    const next = [...list.current, ...added];
+    list.current = next;
+    setItems(next);
+    return added.map((item) => item.key);
+  }, []);
+
   const remove = useCallback((key: string) => {
     const item = list.current.find((entry) => entry.key === key);
     if (!item) return;
@@ -87,5 +97,5 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
   }, []);
 
   useEffect(() => () => { for (const controller of aborts.current.values()) controller.abort(); }, []);
-  return { items, note, add, remove, retry, take };
+  return { items, note, add, addFiled, remove, retry, take };
 }

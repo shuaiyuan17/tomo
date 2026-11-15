@@ -1,3 +1,5 @@
+import type { WebFiledFile } from "../../src/web/protocol.js";
+
 /**
  * Files attached in the composer ("+", drop, paste): pure state, kept out of
  * React so it is testable. Each picked file is uploaded at once
@@ -25,6 +27,8 @@ export interface Attachment {
   progress: number;
   uploadId?: string;
   error?: string;
+  /** Resending an interrupted message: a file it already filed, attached again from where it is (no upload). */
+  filed?: WebFiledFile;
 }
 
 /** Whether a picked/dropped/pasted file may be attached (by its declared type; the server checks the bytes). */
@@ -122,10 +126,17 @@ export function takeSent(list: readonly Attachment[], keys: readonly string[]): 
  * upload ids, and the other files' ids with the name and type the message
  * carries for them — each in order.
  */
-export function captureSend(list: readonly Attachment[]): { keys: string[]; ids: string[]; files: Array<{ id: string; name: string; type: string }> } {
-  const done = list.filter((item) => item.status === "done" && item.uploadId);
-  return { keys: done.map((item) => item.key), ids: done.filter((item) => item.kind !== "file").map((item) => item.uploadId!),
-    files: done.filter((item) => item.kind === "file").map((item) => ({ id: item.uploadId!, name: item.file.name, type: item.file.type })) };
+export function captureSend(list: readonly Attachment[]): { keys: string[]; ids: string[]; files: Array<{ id: string; name: string; type: string }>; refiled: string[] } {
+  const done = list.filter((item) => item.status === "done" && (item.uploadId || item.filed));
+  const uploaded = done.filter((item) => item.uploadId);
+  return { keys: done.map((item) => item.key), ids: uploaded.filter((item) => item.kind !== "file").map((item) => item.uploadId!),
+    files: uploaded.filter((item) => item.kind === "file").map((item) => ({ id: item.uploadId!, name: item.file.name, type: item.file.type })),
+    refiled: done.flatMap((item) => (item.filed ? [item.filed.path] : [])) };
+}
+
+/** A tray item for a file an interrupted message already filed (resend): done at once, nothing to upload. */
+export function filedAttachment(key: string, filed: WebFiledFile): Attachment {
+  return { key, file: { name: filed.name, type: filed.type, size: filed.size } as File, preview: "", kind: "file", status: "done", progress: 1, filed };
 }
 
 /** A byte count as a chip shows it — the same form as the server's file marker (fileStore formatBytes: "820 B", "14.2 KB"). */

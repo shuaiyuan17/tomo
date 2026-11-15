@@ -61,11 +61,6 @@ function parsedMessages(messages: HistoryPage["messages"]) {
 
 type Theme = "system" | "light" | "dark";
 /** 503s that mean "not accepted, and why" — the draft stays, nothing ran. */
-/** A filed upload's name as the owner gave it (sanitised): its path without the `HHMMSS_web_owner_` prefix. */
-function filedName(path: string): string {
-  return (path.split("/").at(-1) ?? path).replace(/^\d{6}_web_owner_/, "");
-}
-
 const refusalReasons: Record<string, string> = {
   interrupted_backlog: "Not sent: messages interrupted by restarts are waiting for you above. Resend or dismiss them first; your draft is kept.",
   journal_unavailable: "Not sent: Tomo cannot read its record of browser messages, so it is not taking new ones. Check the daemon log; your draft is kept.",
@@ -387,14 +382,14 @@ export function App() {
     if (!session?.writable || !canSendWith(draft, attachments.items) || sending || uncertain || !web.bootstrap || web.connection !== "live") return;
     const text = draft.trim();
     // Captured now: images added while this sends stay in the tray.
-    const { keys: sentKeys, ids: images, files } = captureSend(attachments.items);
+    const { keys: sentKeys, ids: images, files, refiled } = captureSend(attachments.items);
     const requestId = crypto.randomUUID();
     setSending(true); setFeedback("Sending…"); remember(requestId);
     // Sending is the reader's own move: it takes them to the end, wherever they were reading.
     // Claimed before the request goes out: the live stream can show its bubble before the POST returns.
     scroller.current?.claim(pendingKey({ requestId }));
     try {
-      const request = await sendMessage({ requestId, targetId: session.id, text, ...(images.length ? { images } : {}), ...(files.length ? { files } : {}) }, web.bootstrap, web.refreshBootstrap);
+      const request = await sendMessage({ requestId, targetId: session.id, text, ...(images.length ? { images } : {}), ...(files.length ? { files } : {}), ...(refiled.length ? { refiled } : {}) }, web.bootstrap, web.refreshBootstrap);
       if (sentKeys.length) {
         const taken = attachments.take(sentKeys);
         const pictures = taken.filter((item) => item.kind !== "file"), others = taken.filter((item) => item.kind === "file");
@@ -447,14 +442,13 @@ export function App() {
     catch { if (!quiet) setFeedback("Could not dismiss it yet. It is still kept; try again.", true); }
   };
   const resend = (request: WebRequest) => {
-    setResending({ requestId: request.requestId, original: request.text ?? "" });
+    // Its files come back as they are: already filed, the resend names them by path (nothing is uploaded again).
+    const fileKeys = request.files?.length ? attachments.addFiled(request.files) : [];
+    setResending({ requestId: request.requestId, original: request.text ?? "", ...(fileKeys.length ? { fileKeys } : {}) });
     setDraft(request.text ?? ""); input.current?.focus();
     // Its images come back too: read from where they were filed, attached (uploaded) again.
     if (request.images?.length) void reattach(request.images);
-    setFeedback(request.files?.length
-      // Files are filed for the agent by path, never served back to the page: they are not re-attached.
-      ? "Review the message, then send it again. Its files are not re-attached; attach them again if needed."
-      : "Review the message, then send it again. The interrupted one is dismissed once this is accepted.");
+    setFeedback("Review the message, then send it again. The interrupted one is dismissed once this is accepted.");
   };
   // The latest resend/dismiss, for buttons in memoized history rows (they read state from this render).
   const latestActions = useRef({ resend, dismiss });
@@ -718,7 +712,7 @@ export function App() {
               <img key={i} src={src} alt="Image" className="block max-h-[280px] max-w-[280px] rounded-xl border object-contain" />)}</div>}
             {((files) => files.length > 0 && <div className="mb-2 flex flex-wrap gap-2 opacity-80">
               {files.map((file, i) => <FileCard key={i} name={file.name} size={file.size === undefined ? undefined : formatSize(file.size)} />)}</div>)(
-              sentFiles[request.requestId] ?? (request.files ?? []).map((path): { name: string; size?: number } => ({ name: filedName(path) })))}
+              sentFiles[request.requestId] ?? (request.files ?? []).map((file): { name: string; size?: number } => ({ name: file.name, size: file.size })))}
             {request.text ? ownBubble(<div className="markdown min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80 max-[600px]:px-4 max-[600px]:py-3"><Text breaks>{request.text}</Text></div>, request.requestId)
               : ownBubble(null, request.requestId)}
             {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)(row.request)}

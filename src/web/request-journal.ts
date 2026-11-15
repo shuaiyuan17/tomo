@@ -1,7 +1,13 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync, chmodSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { RequestState } from "./protocol.js";
+import type { RequestState, WebFiledFile } from "./protocol.js";
+
+const isFiledFile = (value: unknown): value is WebFiledFile => {
+  const file = value as Partial<WebFiledFile> | null;
+  return !!file && typeof file === "object" && typeof file.path === "string" && typeof file.name === "string"
+    && typeof file.type === "string" && typeof file.size === "number" && (file.typeUnknown === undefined || typeof file.typeUnknown === "boolean");
+};
 
 /**
  * Durable custody for browser messages (append-only JSONL, 0600, fsynced).
@@ -45,14 +51,14 @@ const TERMINAL: ReadonlySet<RequestState> = new Set(["completed", "failed", "ref
 export type Resolution = "recorded" | "dismissed";
 type JournalRecord =
   /** `images`: where the message's attached images were filed (memory/incoming-images), kept with the text. */
-  | { op: "recv"; id: string; digest: string; ts: number; text?: string; images?: string[]; files?: string[] }
+  | { op: "recv"; id: string; digest: string; ts: number; text?: string; images?: string[]; files?: WebFiledFile[] }
   | { op: "state"; id: string; state: RequestState }
   | { op: "resolve"; id: string; how: Resolution }
   /** The owner's session has been told about this interrupted request. */
   | { op: "notified"; id: string };
 
 /** `files`: where the message's attached non-image files were filed (memory/incoming-files). */
-export interface JournalEntry { requestId: string; digest: string; timestamp: number; state: RequestState; text?: string; images?: string[]; files?: string[] }
+export interface JournalEntry { requestId: string; digest: string; timestamp: number; state: RequestState; text?: string; images?: string[]; files?: WebFiledFile[] }
 export interface JournalLoad {
   /** Every retained request, oldest first. Unresolved interrupted ones carry their full text. */
   entries: JournalEntry[];
@@ -108,7 +114,7 @@ export class WebRequestJournal {
         entries.set(record.id, { requestId: record.id, digest: record.digest, timestamp: Number(record.ts) || 0,
           state: "queued", ...(typeof record.text === "string" ? { text: record.text } : {}),
           ...(Array.isArray(record.images) && record.images.every((p: unknown) => typeof p === "string") ? { images: record.images.slice(0, 6) } : {}),
-          ...(Array.isArray(record.files) && record.files.every((p: unknown) => typeof p === "string") ? { files: record.files.slice(0, 6) } : {}) });
+          ...(Array.isArray(record.files) && record.files.every(isFiledFile) ? { files: record.files.slice(0, 6) } : {}) });
       } else if (record?.op === "state" && typeof record.id === "string") {
         const entry = entries.get(record.id);
         if (entry) { entry.state = record.state; if (record.state !== "interrupted") { delete entry.text; delete entry.images; delete entry.files; } }
@@ -135,7 +141,7 @@ export class WebRequestJournal {
   }
 
   /** Durable before custody: throws when the record could not be fsynced. */
-  recordReceived(requestId: string, digest: string, text: string, timestamp: number, images?: string[], files?: string[]): void {
+  recordReceived(requestId: string, digest: string, text: string, timestamp: number, images?: string[], files?: WebFiledFile[]): void {
     // In the map BEFORE the append: an append can trigger compaction, which
     // rewrites the file from the map and would otherwise drop this record.
     const previous = this.entries.get(requestId);

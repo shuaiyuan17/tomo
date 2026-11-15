@@ -15,7 +15,8 @@ import { WebData } from "../src/web/data.js";
 import { webSessionId } from "../src/web/owner.js";
 import type { IncomingMessage } from "../src/channels/types.js";
 import { splitAttachments } from "../web/src/attachments.js";
-import { addFiles, captureSend, formatSize, pastedFiles, type Attachment } from "../web/src/uploads.js";
+import { addFiles, captureSend, filedAttachment, formatSize, pastedFiles, type Attachment } from "../web/src/uploads.js";
+import { dismissAfterAcceptedSend, resendAfterDraftChange } from "../web/src/pending.js";
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
 const MD = Buffer.from("# Notes\n\n- one\n- two\n");
@@ -73,7 +74,7 @@ describe("a message with a file (web channel)", () => {
     // No bytes go to the model; the staged copy is gone; the request records where it was filed.
     expect(handled[0].images).toBeUndefined();
     expect(readdirSync(dir)).toEqual([]);
-    expect(channel.request(requestId).files).toEqual([path]);
+    expect(channel.request(requestId).files).toEqual([{ path, name: "notes.md", type: "text/markdown", size: MD.length }]);
     await channel.stop();
   });
   it("sanitises the name: ../, absolute paths and NULs never leave incoming-files", async () => {
@@ -131,6 +132,60 @@ describe("a message with a file (web channel)", () => {
     const again = new WebChannel({ name: "owner", telegram: ["test-owner"], imessage: [] }, new WatchBus(), { journal: new WebRequestJournal(path) });
     expect(again.request(requestId)).toMatchObject({ state: "interrupted", files: filed });
     await again.stop();
+  });
+  /** A request filed with `files`, then interrupted by a restart: what the owner resends from. */
+  const interrupted = async (text: string, name: string) => {
+    const journalPath = join(root, "requests.jsonl");
+    const first = setup(new WebRequestJournal(journalPath));
+    const requestId = randomUUID();
+    await first.channel.receive({ requestId, text, files: [{ id: stageUpload(dir, MD, Date.now(), true).uploadId, name, type: "text/markdown" }] });
+    const firstText = first.handled[0].text;
+    await first.channel.stop();
+    const again = setup(new WebRequestJournal(journalPath));
+    const request = again.channel.request(requestId);
+    expect(request.state).toBe("interrupted");
+    return { ...again, request, firstText };
+  };
+  it("resending an interrupted text + file message re-attaches its filed file: the agent gets the same file marker, nothing re-uploaded", async () => {
+    const { channel, handled, request, firstText } = await interrupted("see notes", "notes.md");
+    // The page: the file comes back into the tray as it is, and is sent by path.
+    const item = filedAttachment("k1", request.files![0]);
+    const sent = captureSend([item]);
+    expect(sent).toMatchObject({ keys: ["k1"], ids: [], files: [], refiled: [request.files![0].path] });
+    const resend = { requestId: request.requestId, original: "see notes", fileKeys: ["k1"] };
+    await channel.receive({ requestId: randomUUID(), text: "see notes", refiled: sent.refiled });
+    expect(handled[0].text).toBe(firstText);
+    expect(dismissAfterAcceptedSend(resend, "see notes", sent.keys)).toBe(request.requestId);
+    // Still one copy on disk: the resend named the filed one.
+    expect(readdirSync(join(root, "workspace", "memory", "incoming-files"), { recursive: true }).map(String).filter((n) => n.endsWith(".md"))).toHaveLength(1);
+    await channel.stop();
+  });
+  it("resending an interrupted file-only message: re-attached by its file, the resend is recognised and the original dismissed", async () => {
+    const { channel, handled, request, firstText } = await interrupted("", "only.md");
+    const item = filedAttachment("k7", request.files![0]);
+    const resend = { requestId: request.requestId, original: "", fileKeys: ["k7"] };
+    // An empty draft does not cancel it; the send names the file; once accepted the original goes.
+    expect(resendAfterDraftChange(resend, "")).toBe(resend);
+    const sent = captureSend([item]);
+    await channel.receive({ requestId: randomUUID(), text: "", refiled: sent.refiled });
+    expect(handled[0].text).toBe(firstText);
+    expect(dismissAfterAcceptedSend(resend, "", sent.keys)).toBe(request.requestId);
+    expect(channel.resolveInterrupted(request.requestId, "dismissed").files).toBeUndefined();
+    // Dismissed: its file can no longer be named.
+    await expect(channel.receive({ requestId: randomUUID(), text: "", refiled: sent.refiled })).rejects.toMatchObject({ code: "upload_missing" });
+    await channel.stop();
+  });
+  it("refiled never names an arbitrary path: only files an interrupted request filed, still present", async () => {
+    const { channel, handled, request } = await interrupted("x", "n.md");
+    const secret = join(root, "secret.txt");
+    writeFileSync(secret, "s");
+    for (const refiled of [[secret], ["/etc/passwd"], [`${request.files![0].path}/../../x`], [request.files![0].path, request.files![0].path]]) {
+      await expect(channel.receive({ requestId: randomUUID(), text: "x", refiled })).rejects.toMatchObject({ code: "upload_missing" });
+    }
+    rmSync(request.files![0].path);
+    await expect(channel.receive({ requestId: randomUUID(), text: "x", refiled: [request.files![0].path] })).rejects.toMatchObject({ code: "upload_missing" });
+    expect(handled).toHaveLength(0);
+    await channel.stop();
   });
   it("the schema: at most 6 files, ids only, a bounded name and type", () => {
     const base = { requestId: randomUUID(), text: "" };
@@ -208,7 +263,7 @@ describe("the page's side", () => {
       { key: "a", file: file("a.png", "image/png"), preview: "", status: "done", progress: 1, uploadId: "u1", kind: "image" },
       { key: "b", file: file("n.md", "text/markdown"), preview: "", status: "done", progress: 1, uploadId: "u2", kind: "file" },
     ];
-    expect(captureSend(items)).toEqual({ keys: ["a", "b"], ids: ["u1"], files: [{ id: "u2", name: "n.md", type: "text/markdown" }] });
+    expect(captureSend(items)).toEqual({ keys: ["a", "b"], ids: ["u1"], files: [{ id: "u2", name: "n.md", type: "text/markdown" }], refiled: [] });
     expect(formatSize(820)).toBe("820 B");
     expect(formatSize(14_540)).toBe("14.2 KB");
   });

@@ -25,7 +25,13 @@ export const messageInputSchema = z.object({
     name: z.string().max(1024),
     type: z.string().max(255),
   }).strict()).min(1).max(6).optional(),
-}).strict().refine((input) => input.text.length > 0 || (input.images?.length ?? 0) > 0 || (input.files?.length ?? 0) > 0, { message: "empty message" });
+  /** Resending an interrupted message: files it already filed (their paths, as
+   *  its request lists them), attached again from where they are — never a
+   *  path the daemon did not file for an interrupted request. */
+  refiled: z.array(z.string().min(1).max(4096)).min(1).max(6).optional(),
+}).strict().refine((input) => input.text.length > 0 || (input.images?.length ?? 0) > 0 || (input.files?.length ?? 0) > 0 || (input.refiled?.length ?? 0) > 0, { message: "empty message" });
+/** A non-image file a web message filed (memory/incoming-files): where, and what its notice said. */
+export interface WebFiledFile { path: string; name: string; type: string; size: number; typeUnknown?: boolean }
 export type MessageInput = z.infer<typeof messageInputSchema>;
 export interface WebSession {
   id: string;
@@ -43,7 +49,7 @@ export type RequestState = "queued" | "running" | "completed" | "refused" | "fai
 /** `images` / `files`: where an owner's attached images (incoming-images) and other files (incoming-files) were filed, while the request's text is kept. */
 export interface WebRequest { requestId: string; state: RequestState; sessionId?: string; responseTurnId?: string; joined?: boolean; handedOff?: boolean;
   /** The agent has read (the SDK consumed) this message. In memory only; restored completed requests count as read. */
-  read?: boolean; text?: string; timestamp?: number; images?: string[]; files?: string[] }
+  read?: boolean; text?: string; timestamp?: number; images?: string[]; files?: WebFiledFile[] }
 export interface HistoryMessage extends SessionMessage { id: string }
 export interface HistoryPage { messages: HistoryMessage[]; nextCursor: string | null; revision?: string }
 export type WebTaskState = "running" | "completed" | "failed" | "stopped" | "ended";

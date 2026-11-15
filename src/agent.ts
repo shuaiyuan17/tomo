@@ -2,7 +2,7 @@ import type { Channel, IncomingMessage, MessageReaction, StopTyping, StopTypingO
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
-import type { ReplyTarget, SessionMessage } from "./sessions/types.js";
+import type { ReplyTarget, SessionMessage, UsageBaseline } from "./sessions/types.js";
 import {
   isGroupSessionKey,
   isDmSessionKey,
@@ -50,6 +50,8 @@ import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/bl
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { appendToTomoEventBody, formatTomoEvent } from "./tomo-event.js";
+import { UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
+import { usageDataDir } from "./usage/dir.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
@@ -82,6 +84,8 @@ const CHANNEL_QUIESCE_TIMEOUT_MS = 10_000;
  */
 const MCP_SWEEP_SHUTDOWN_TIMEOUT_MS = 3_000;
 const CHANNEL_TEARDOWN_TIMEOUT_MS = 10_000;
+/** How long shutdown waits for queued usage-ledger rows (local appends). */
+const USAGE_LEDGER_SHUTDOWN_TIMEOUT_MS = 2_000;
 /**
  * How long shutdown waits for an aborted /rewind to wind down. Abort is
  * honoured between steps, so this only covers one step already in flight
@@ -136,6 +140,7 @@ export class Agent {
   private commands: ChatCommandHandler;
   // /pause state: raw group keys whose inbound messages are dropped at receipt.
   private pauses: PauseStore;
+  private usageLedger: UsageLedger;
   private modelOverrides = new Map<string, string>();
   private readonly ownerAdoption: OwnerAdoption;
   private readonly contextNudger: ContextNudger;
@@ -280,6 +285,7 @@ export class Agent {
     this.router.onSummonExpired = (channelName, chatId, identity, notifyGroup) =>
       this.handleSummonExpired(channelName, chatId, identity, notifyGroup);
     this.pauses = new PauseStore(join(config.tomoHome, "data", "pauses.json"));
+    this.usageLedger = new UsageLedger(usageDataDir(config.tomoHome));
     this.commands = new ChatCommandHandler({
       router: this.router,
       sessions: this.sessions,
@@ -310,9 +316,15 @@ export class Agent {
       setSdkSessionId: (key, sessionId) => this.sessions.setSdkSessionId(key, sessionId),
       clearSdkSessionId: (key) => this.sessions.clearSdkSessionId(key),
       retireSdkSessionId: (key) => { this.sessions.retireSdkSessionId(key); },
-      getUsageBaseline: (key) => this.sessions.getUsageBaseline(key),
+      getUsageBaseline: (key, sdkSessionId) => this.resumeUsageBaseline(key, sdkSessionId),
       updateStats: (key, result) => {
-        this.sessions.updateStats(key, result);
+        // Stats only. The registry's usage baseline is advanced by landed
+        // usage-ledger rows alone (recordUsage below), never by a result
+        // seen: a baseline that ran ahead of the ledger would let a resume
+        // skip a turn whose row failed to land.
+        const { usageBaseline: _seen, ...stats } = result;
+        void _seen;
+        this.sessions.updateStats(key, stats);
         watchBus.publish({
           type: "turn.stats",
           sessionKey: key,
@@ -323,6 +335,14 @@ export class Agent {
           // turn's own token count over the window as the session's pressure —
           // which is a plausible-looking low percentage, not a missing one.
           ...(result.contextEstimated ? { contextEstimated: true } : {}),
+        });
+      },
+      recordUsage: (key, build, onWritten) => {
+        let row: UsageLedgerRow | undefined;
+        void this.usageLedger.appendFor(key, () => (row = build()), () => {
+          onWritten();
+          // The registry copy follows the ledger, one landed row at a time.
+          if (row) this.sessions.setUsageBaseline(key, row.snapshot ?? null);
         });
       },
       getSessionMessages: (key) => this.sessions.get(key).messages,
@@ -374,6 +394,7 @@ export class Agent {
       queuePendingNote: (sessionKey, note) => this.queuePendingNote(sessionKey, note),
       runDelegateTurn: (systemMsg, sessionKey, deliveryTarget, audiences) =>
         this.handleCronMessage(systemMsg, sessionKey, {
+          usageSource: "delegate",
           ...(deliveryTarget ? { deliveryTarget } : {}),
           ...(audiences ? { audiences } : {}),
         }),
@@ -1128,6 +1149,28 @@ export class Agent {
     return { channel, chatId: target.chatId };
   }
 
+  /**
+   * The usage baseline a resume of `sdkSessionId` on `key` starts from. The
+   * LEDGER is the source: its last row for that SDK session carries the
+   * cumulative snapshot, written in the same append as the turn's delta, so
+   * the two cannot disagree. Rows still queued land first.
+   *
+   * The registry's copy is the fallback for a session the ledger has no row
+   * for. It is advanced ONLY by landed ledger rows (and starts at zero with a
+   * new SDK session), so it can lag the ledger but never lead it: a session
+   * whose rows have all failed resumes from zero and its first landed row
+   * carries everything, rather than skipping what never landed. Not "no
+   * registry at all": sessions older than the ledger have a registry
+   * baseline and no row, and starting them from zero would charge each one's
+   * whole lifetime to its first row.
+   */
+  private async resumeUsageBaseline(key: string, sdkSessionId: string): Promise<UsageBaseline | undefined> {
+    await this.usageLedger.idle();
+    const fromLedger = this.usageLedger.lastSnapshot(key, sdkSessionId);
+    if (fromLedger !== undefined) return fromLedger ?? undefined;
+    return this.sessions.getUsageBaseline(key);
+  }
+
   private createUnownedTurnRequest(key: string): TurnRequest | undefined {
     const target = this.resolveDeliveryTargetForSession(key, "Background task");
     if (!target) return undefined;
@@ -1365,6 +1408,8 @@ export class Agent {
       requestId: req.webRequestId,
       key: req.key,
       source: "user",
+      // A summoned group's messages run on the owner's dm: session.
+      ...(req.audiences?.some((a) => isGroupSessionKey(a)) ? { usage: { source: "group" as const } } : {}),
       prompt: req.promptText,
       stampChannelName: req.sourceChannelName,
       stampSenderTimeZone: req.senderTimeZone,
@@ -1934,6 +1979,14 @@ export class Agent {
       return await this.turnRunner.runTurn({
         key,
         source: "cron",
+        // The trigger is the message as the caller wrote it, before the
+        // delivery note above was appended to it.
+        usage: {
+          ...(options.jobId
+            ? { source: "cron" as const, jobId: options.jobId, ...(options.jobName ? { jobName: options.jobName } : {}) }
+            : { source: options.usageSource ?? "system" }),
+          ...(triggerSnippet(message) ? { trigger: triggerSnippet(message) } : {}),
+        },
         ...(options.restate ? { restate: true } : {}),
         ...(options.onShutdown ? { onShutdown: options.onShutdown } : {}),
         ...(options.onEmpty ? { onEmpty: options.onEmpty } : {}),
@@ -2002,7 +2055,7 @@ export class Agent {
       key = `${channel.name}:${chatId}`;
     }
 
-    return this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "A heartbeat turn"))
+    return this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "A heartbeat turn", "heartbeat"))
       .catch((err) => {
         log.error({ err, sessionKey: key }, "Continuity failed in queue");
       });
@@ -2039,28 +2092,41 @@ export class Agent {
     // group is summoned, is the group's turn wherever it runs — same rule as
     // the cron handoff in processCronMessage.
     const audiences = summonedKey ? [sessionKey] : undefined;
-    return this.enqueueForSession(targetKey, () => this.processContinuity(routedPrompt, targetKey, audiences, "A restart notice turn"))
+    return this.enqueueForSession(targetKey, () => this.processContinuity(routedPrompt, targetKey, audiences, "A restart notice turn", "restart"))
       .catch((err) => {
         log.error({ err, sessionKey: targetKey }, "Restart notice failed in queue");
       });
   }
 
-  private async processContinuity(prompt: string, key: string, audiences: string[] | undefined, turnKind: string): Promise<void> {
+  private async processContinuity(
+    prompt: string,
+    key: string,
+    audiences: string[] | undefined,
+    turnKind: string,
+    usageSource: UsageSource,
+  ): Promise<void> {
     const turnId = audiences ? this.turnAudiences.begin(key, audiences) : undefined;
     try {
       // A summoned group's restart notice runs on the owner's dm: session;
       // its failure still belongs to (and is reported as) the group's.
       const groupKey = audiences?.find((a) => isGroupSessionKey(a));
-      await this.runContinuityTurn(prompt, key, turnKind, groupKey);
+      await this.runContinuityTurn(prompt, key, turnKind, usageSource, groupKey);
     } finally {
       if (turnId !== undefined) this.turnAudiences.end(key, turnId);
     }
   }
 
-  private async runContinuityTurn(prompt: string, key: string, turnKind: string, noticeGroupKey?: string): Promise<void> {
+  private async runContinuityTurn(
+    prompt: string,
+    key: string,
+    turnKind: string,
+    usageSource: UsageSource,
+    noticeGroupKey?: string,
+  ): Promise<void> {
     await this.turnRunner.runTurn({
       key,
       source: "continuity",
+      usage: { source: usageSource },
       prompt,
       // No timestamp stamp, no typing indicator — continuity turns are
       // invisible. A heartbeat speaks only through the explicit `send_message`
@@ -2527,6 +2593,8 @@ export class Agent {
           () => Promise.all(this.channels.map((ch) => ch.teardown())),
         );
         this.inbox?.close();
+        // The last turns' ledger rows are queued writes; let them land.
+        await this.boundedShutdownStep("usage ledger", USAGE_LEDGER_SHUTDOWN_TIMEOUT_MS, () => this.usageLedger.idle());
       }
     }
   }
@@ -2716,7 +2784,7 @@ export class Agent {
       { name: "check" },
     );
     for (const key of owed) {
-      this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "An interrupted-subagents notice turn"))
+      this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "An interrupted-subagents notice turn", "restart"))
         .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"));
     }
   }

@@ -21,17 +21,15 @@ import {
 import { silentTurnSteerNote } from "../continuity-defaults.js";
 import { stageExternalMcpServers } from "./mcp-config-file.js";
 import type { UsageBaseline } from "../sessions/types.js";
+import { USAGE_LEDGER_VERSION, type UsageAttribution, type UsageRecorder } from "../usage/ledger.js";
+import { initialUsageCounters, stepUsage, type UsageCounters, type UsageStep } from "./usage-counters.js";
 import {
   STEER_MERGED,
   EMPTY_REPLY,
   SteerDeclinedError,
-  cumulativeModelTokens,
   describeResultFailure,
-  mainLoopUsage,
-  tokenSum,
   type QueryResult,
   type SdkResultLike,
-  type TokenTotals,
 } from "./sdk-result.js";
 import { DELIVERY_TIMEOUT_MS, formatTimeout, normalizeTimeoutMs, queryTimeoutError, withDeliveryTimeout } from "./turn-timeouts.js";
 import { McpAuthRefresher, type McpAuthRefreshOutcome } from "./mcp-auth-refresh.js";
@@ -75,6 +73,8 @@ export {
 export { summarizeToolInput } from "./tool-summary.js";
 
 export interface ReplyContext { turnId: string; channel: string; requestId?: string; webJoined?: boolean; interactive?: boolean;
+  /** Who started this turn, for the usage ledger. Absent: an SDK-initiated turn. */
+  usage?: UsageAttribution;
   /**
    * Set when THIS request's turn ended because the owner pressed Stop. The
    * turn resolves like a finished one (what it had said, or NO_REPLY) so
@@ -208,6 +208,8 @@ export interface LiveSessionSettings {
    * deltas start from `baseline` instead of 0. See `turnUsage`.
    */
   resumeFrom?: { sdkSessionId: string; baseline?: UsageBaseline };
+  /** One row per SDK result for the usage ledger. Must not throw (it is caught anyway). */
+  recordUsage?: UsageRecorder;
 }
 
 export class LiveSession {
@@ -272,16 +274,18 @@ export class LiveSession {
   private lastContextMax = 0;
   /** Consecutive turns whose context reading failed. Reset by any real one. */
   private estimatedReadingStreak = 0;
-  private prevTotalCost = 0;
-  /** Cumulative `modelUsage` token totals as of the previous result, for per-turn deltas. */
-  private prevModelTokens: TokenTotals | null = null;
   /**
-   * The next result is the first since this session resumed an SDK session.
-   * `"baseline"`: prev* were seeded from the persisted baseline. `"unknown"`:
-   * there was none, so the carried totals are unknown. Null otherwise
-   * (including for every fresh session). Consumed by the first result.
+   * The SDK's cumulative counters as of the previous result, for the per-turn
+   * figures in QueryResult (session stats). Advanced by every result.
    */
-  private resumeState: "baseline" | "unknown" | null = null;
+  private seenUsage: UsageCounters = initialUsageCounters();
+  /**
+   * The same counters as of the last result whose usage-ledger row is ON
+   * DISK. Advanced only when the row lands, so a row that failed to land
+   * leaves its turn to be counted by the next row.
+   */
+  private committedUsage: UsageCounters = initialUsageCounters();
+  private recordUsage: UsageRecorder | undefined;
   private eventLoopDone: Promise<void>;
   private sessionKey: string | undefined;
   private turnBudget: TurnBudget | undefined;
@@ -345,17 +349,9 @@ export class LiveSession {
     this.showThinking = settings.showThinking ?? false;
     this.mcpAuthRefresher = new McpAuthRefresher(settings.onMcpAuthError, settings.now ?? Date.now);
     this.onToolResult = settings.onToolResult;
-    const resumeFrom = settings.resumeFrom;
-    if (resumeFrom) {
-      const baseline = resumeFrom.baseline;
-      if (baseline && baseline.sdkSessionId === resumeFrom.sdkSessionId) {
-        this.prevTotalCost = baseline.totalCostUsd;
-        this.prevModelTokens = { ...baseline.tokens };
-        this.resumeState = "baseline";
-      } else {
-        this.resumeState = "unknown";
-      }
-    }
+    this.recordUsage = settings.recordUsage;
+    this.seenUsage = initialUsageCounters(settings.resumeFrom);
+    this.committedUsage = initialUsageCounters(settings.resumeFrom);
     // External MCP configs (OAuth bearer tokens among them) go to the CLI in
     // a 0600 file rather than on its argv. The CLI reads that file once while
     // starting up, so it is deleted as soon as the child has answered the
@@ -1004,6 +1000,7 @@ export class LiveSession {
         tokens: { input, output, cacheRead, cacheCreated },
         baseline,
       } = this.turnUsage(result);
+      this.recordResultUsage(result);
 
       // A NON-SUCCESS RESULT IS STILL THE END OF THE TURN — but not a
       // successful one. `subtype` names why the CLI stopped early (max turns,
@@ -1319,96 +1316,81 @@ export class LiveSession {
   }
 
   /**
-   * Per-turn cost and tokens for this result, plus the cumulative baseline the
-   * next resume must start from.
-   *
-   * `total_cost_usd` and `modelUsage` are cumulative per query() (and
-   * `modelUsage` covers the whole pipeline, subagents included, where `usage`
-   * is the MAIN AGENT LOOP ONLY), so a turn's own figures are the delta from
-   * the previous result. A counter that went BACKWARDS is a reset, not a
-   * refund — crash results carry zeroed totals and a mid-session /clear
-   * restarts the running sum — so the cumulative value is then this turn's
-   * own; never record a negative. A result without `modelUsage` (older CLIs,
-   * zeroed crash results) falls back to `usage`, already per-turn.
-   *
-   * THE FIRST RESULT AFTER A RESUME is different: the SDK continues from the
-   * totals the transcript saved, so it already carries every earlier turn.
-   *  - With a persisted baseline, prev* were seeded from it and the delta is
-   *    this turn's own. If the carried total is BELOW the baseline, the
-   *    transcript saved an older total than tomo last recorded (e.g. a reload
-   *    after compaction); that is not a reset — charging the whole carried
-   *    total is exactly the over-count this exists to prevent — so it takes
-   *    the no-baseline path below.
-   *  - With NO baseline (sessions persisted before baselines existed, or whose
-   *    last result reset the totals), the carried total is unknown. The SDK
-   *    exposes no per-turn cost, so this turn's cost is recorded as 0 and its
-   *    tokens as `usage` (per-turn, main loop only): a one-turn UNDERcount
-   *    instead of charging the session's lifetime. The result then becomes
-   *    the baseline for every later delta.
+   * Per-turn cost and tokens for this result (session stats), plus the
+   * cumulative baseline the next resume must start from. See stepUsage.
    */
-  private turnUsage(result: SdkResultLike): {
-    costUsd: number;
-    totalCost: number;
-    tokens: TokenTotals;
-    baseline: UsageBaseline | null;
-  } {
-    const totalCost = result.total_cost_usd ?? 0;
-    const cumulative = cumulativeModelTokens(result);
-    const perTurnUsage = mainLoopUsage(result);
-
-    const resumeState = this.resumeState;
-    this.resumeState = null;
-    const prevCost = this.prevTotalCost;
-    const prevTokens = this.prevModelTokens;
-
-    const tokensWentBackwards = !!(cumulative && prevTokens) && (
-      cumulative.input < prevTokens.input
-      || cumulative.output < prevTokens.output
-      || cumulative.cacheRead < prevTokens.cacheRead
-      || cumulative.cacheCreated < prevTokens.cacheCreated
-    );
-    const costWentBackwards = totalCost < prevCost;
-
-    this.prevTotalCost = totalCost;
-    if (cumulative) this.prevModelTokens = cumulative;
-
-    const baselineFor = (trusted: boolean): UsageBaseline | null =>
-      trusted && cumulative && this.sessionId
-        ? { sdkSessionId: this.sessionId, totalCostUsd: totalCost, tokens: { ...cumulative } }
-        : null;
-
-    if (resumeState === "unknown" || (resumeState === "baseline" && (costWentBackwards || tokensWentBackwards))) {
+  private turnUsage(result: SdkResultLike): UsageStep {
+    const step = stepUsage(this.seenUsage, result, this.sessionId);
+    if (step.noBaseline) {
       log.info(
-        { session: this.sessionKey, carriedTotalUsd: totalCost, baselineUsd: resumeState === "baseline" ? prevCost : undefined },
+        {
+          session: this.sessionKey,
+          carriedTotalUsd: step.totalCost,
+          baselineUsd: this.seenUsage.resume === "baseline" ? this.seenUsage.totalCost : undefined,
+        },
         "First result after resume without a usable usage baseline; recording 0 cost for this turn",
       );
-      // A zeroed crash result is no baseline at all — keep none. Judge
-      // "zeroed" by cost AND tokens: a zero-cost route (e.g. a gateway that
-      // reports no price) with real cumulative tokens is a valid baseline.
-      const zeroed = totalCost <= 0 && !(cumulative && tokenSum(cumulative) > 0);
-      return { costUsd: 0, totalCost, tokens: perTurnUsage, baseline: baselineFor(!zeroed) };
     }
+    this.seenUsage = step.next;
+    return step;
+  }
 
-    // A reset is decided ONCE for the whole result: after one (crash or
-    // /clear) every cumulative figure is this turn's own. Deciding per field
-    // would subtract the old total from any counter that happened to come
-    // back larger than before, undercounting that turn.
-    const reset = costWentBackwards || tokensWentBackwards;
-    const costUsd = reset ? totalCost : totalCost - prevCost;
-    const tokens = cumulative
-      ? prevTokens && !reset
-        ? {
-          input: cumulative.input - prevTokens.input,
-          output: cumulative.output - prevTokens.output,
-          cacheRead: cumulative.cacheRead - prevTokens.cacheRead,
-          cacheCreated: cumulative.cacheCreated - prevTokens.cacheCreated,
-        }
-        : cumulative
-      : perTurnUsage;
-    // After a reset it is unknown what total the SDK transcript saved (a
-    // crash leaves the old one, a /clear the new one): drop the baseline so
-    // the next resume takes the conservative path instead of guessing.
-    return { costUsd, totalCost, tokens, baseline: baselineFor(!reset) };
+  /**
+   * This result's usage-ledger row. The row carries both the turn's delta and
+   * the cumulative snapshot it ends on, and the ledger is where a resume
+   * looks for its baseline first — so one append records both, and they
+   * cannot disagree.
+   *
+   * The delta is measured against the last row that LANDED (`committedUsage`),
+   * not the last result seen, and is computed only when this row's turn in
+   * the session's write queue comes (`build`), after every earlier row of
+   * this session has landed or failed. A row that fails to land leaves the
+   * counters where they were: the next row carries its turn too.
+   *
+   * Every result goes through here, turns the CLI starts itself included.
+   * Attribution is captured now, from the request that owns the turn; a turn
+   * the CLI started itself has none ("background"). Bookkeeping: whatever
+   * goes wrong here, the turn goes on.
+   */
+  private recordResultUsage(result: SdkResultLike): void {
+    const record = this.recordUsage;
+    const sessionKey = this.sessionKey;
+    if (!record || !sessionKey) return;
+    const ctx = this.currentRequest?.replyContext;
+    const usage = ctx?.usage ?? { source: "background" as const };
+    const ts = Date.now();
+    const sessionId = this.sessionId;
+    let step: UsageStep | undefined;
+    try {
+      record(() => {
+        step = stepUsage(this.committedUsage, result, sessionId);
+        return {
+          v: USAGE_LEDGER_VERSION,
+          ts,
+          sessionKey,
+          ...(sessionId ? { sdkSessionId: sessionId } : {}),
+          source: usage.source,
+          ...(usage.jobId ? { jobId: usage.jobId } : {}),
+          ...(usage.jobName ? { jobName: usage.jobName } : {}),
+          ...(ctx?.requestId ? { requestId: ctx.requestId } : {}),
+          ...(usage.trigger ? { trigger: usage.trigger } : {}),
+          ...(result.subtype !== "success" ? { subtype: result.subtype } : {}),
+          // Unrounded: rounding is for display, never for the record.
+          costUsd: step.costUsd,
+          tokens: { ...step.tokens },
+          ...(result.duration_ms !== undefined ? { durationMs: result.duration_ms } : {}),
+          ...(result.duration_api_ms !== undefined ? { durationApiMs: result.duration_api_ms } : {}),
+          ...(result.num_turns !== undefined ? { numTurns: result.num_turns } : {}),
+          ...(step.noBaseline ? { noBaseline: true as const } : {}),
+          ...(step.models ? { models: step.models } : {}),
+          ...(step.baseline ? { snapshot: step.baseline } : {}),
+        };
+      }, () => {
+        if (step) this.committedUsage = step.next;
+      });
+    } catch (err) {
+      log.warn({ err, session: sessionKey }, "Usage ledger row failed; turn unaffected");
+    }
   }
 
   private async logContextUsage(

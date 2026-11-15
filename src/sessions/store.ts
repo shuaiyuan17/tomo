@@ -744,8 +744,9 @@ export class SessionStore {
       const stub = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null && !e.sdkSessionId);
       if (stub) {
         stub.sdkSessionId = sessionId;
-        // A new SDK session starts its cumulative totals from zero.
-        delete stub.usageBaseline;
+        // A new SDK session starts its cumulative totals from zero — which is
+        // exactly what its baseline says until a usage-ledger row lands.
+        stub.usageBaseline = this.takeLinkBaseline(key, sessionId);
         stub.lastActiveAt = Date.now();
         this.saveRegistry();
         return;
@@ -764,6 +765,7 @@ export class SessionStore {
         lastActiveAt: now,
         unlinkedAt: null,
         expiresAt: null,
+        usageBaseline: this.takeLinkBaseline(key, sessionId),
         stats: {
           totalQueries: 0,
           totalCostUsd: 0,
@@ -862,16 +864,45 @@ export class SessionStore {
       // bookkeeping write is skipped, the turn's cost was not recorded either,
       // and the older baseline correctly charges it on the next resume. Only
       // stored against the SDK session it was measured on.
-      if (update.usageBaseline !== undefined) {
-        if (update.usageBaseline && update.usageBaseline.sdkSessionId === entry.sdkSessionId) {
-          entry.usageBaseline = update.usageBaseline;
-        } else {
-          delete entry.usageBaseline;
-        }
-      }
+      if (update.usageBaseline !== undefined) applyUsageBaseline(entry, update.usageBaseline);
       entry.lastActiveAt = Date.now();
       this.saveRegistryBestEffort("updateStats");
     });
+  }
+
+  /**
+   * Persist the usage baseline from a usage-ledger row that has LANDED — the
+   * only writer of a baseline besides the zero one a new SDK session starts
+   * with (setSdkSessionId). The registry copy is the resume fallback for a
+   * session the ledger has no row for, so it must never run ahead of the
+   * ledger: a turn whose row failed to land is then still owed by the next
+   * row, whichever copy the resume reads. `null` drops it.
+   */
+  setUsageBaseline(key: string, baseline: UsageBaseline | null): void {
+    this.mutateRegistry("setUsageBaseline", "bookkeeping", () => {
+      const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+      // A NEW SDK session's first row can land before its id is linked
+      // (setSdkSessionId runs at turn completion). Held until the link, so
+      // the link starts from the row rather than from zero.
+      if (baseline && (!entry || entry.sdkSessionId !== baseline.sdkSessionId)) {
+        this.pendingUsageBaselines.set(key, baseline);
+        return;
+      }
+      this.pendingUsageBaselines.delete(key);
+      if (!entry) return;
+      applyUsageBaseline(entry, baseline);
+      this.saveRegistryBestEffort("setUsageBaseline");
+    });
+  }
+
+  /** Snapshots from landed ledger rows whose SDK session was not linked yet (see setUsageBaseline). */
+  private readonly pendingUsageBaselines = new Map<string, UsageBaseline>();
+
+  /** The baseline a link to `sessionId` starts with: a pending landed snapshot for it, else zero. */
+  private takeLinkBaseline(key: string, sessionId: string): UsageBaseline {
+    const pending = this.pendingUsageBaselines.get(key);
+    this.pendingUsageBaselines.delete(key);
+    return pending && pending.sdkSessionId === sessionId ? pending : zeroUsageBaseline(sessionId);
   }
 
   /** Touch the active session (update lastActiveAt) */
@@ -3552,4 +3583,15 @@ export class SessionStore {
       "Transcript rotated: prior months moved to archive files",
     );
   }
+}
+
+/** Only stored against the SDK session it was measured on; anything else drops it. */
+function applyUsageBaseline(entry: SessionEntry, baseline: UsageBaseline | null): void {
+  if (baseline && baseline.sdkSessionId === entry.sdkSessionId) entry.usageBaseline = baseline;
+  else delete entry.usageBaseline;
+}
+
+/** The baseline of an SDK session nothing has been accounted for yet. */
+function zeroUsageBaseline(sdkSessionId: string): UsageBaseline {
+  return { sdkSessionId, totalCostUsd: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheCreated: 0 }, models: {} };
 }

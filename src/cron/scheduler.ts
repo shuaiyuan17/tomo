@@ -348,6 +348,7 @@ export class CronScheduler {
         // resolve when that turn actually completes, not when it is queued.
         ok = await this.agent.handleCronMessage(cronMessage, sessionKey, {
           waitForHandoff: true,
+          jobId,
           jobName: name,
           onShutdown: (kind) => { shutdown = kind; },
           onEmpty: () => { empty = true; },

@@ -1,7 +1,34 @@
-import { appendFile, mkdir } from "node:fs/promises";
+import { appendFile, mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
 
 const chains = new Map<string, Promise<unknown>>();
+
+/** Does the file exist, non-empty, without a final newline? */
+async function endsTorn(path: string): Promise<boolean> {
+  let handle;
+  try {
+    handle = await open(path, "r");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+  try {
+    const { size } = await handle.stat();
+    if (size === 0) return false;
+    const last = Buffer.alloc(1);
+    await handle.read(last, 0, 1, size - 1);
+    return last[0] !== 0x0a;
+  } finally {
+    await handle.close();
+  }
+}
+
+export interface AppendModes {
+  /** Mode for a file this append creates (an existing file keeps its own). */
+  fileMode?: number;
+  /** Mode for directories this append creates. */
+  dirMode?: number;
+}
 
 /**
  * Append to an ndjson file with every write to the same path run one after
@@ -13,13 +40,25 @@ const chains = new Map<string, Promise<unknown>>();
  * inside the chain (before the next write's `line`), so state it updates is
  * always what the file says. Resolves true once written, false when skipped;
  * rejects on a failed write (the chain itself carries on).
+ *
+ * A file that does not end in a newline — the torn tail of a crash mid-append,
+ * by this process or another — gets one first, so the torn fragment stays a
+ * line of its own (skipped by readers) instead of swallowing the new line
+ * into one unparseable mess. Checked before every append: one byte read, and
+ * a tail torn by another writer since the last check is caught too.
  */
-export function appendLineSerial(path: string, line: () => string | undefined, onWritten?: () => void): Promise<boolean> {
+export function appendLineSerial(
+  path: string,
+  line: () => string | undefined,
+  onWritten?: () => void,
+  modes: AppendModes = {},
+): Promise<boolean> {
   const run = (chains.get(path) ?? Promise.resolve()).catch(() => undefined).then(async () => {
     const text = line();
     if (text === undefined) return false;
-    await mkdir(dirname(path), { recursive: true });
-    await appendFile(path, `${text}\n`, "utf8");
+    await mkdir(dirname(path), { recursive: true, ...(modes.dirMode !== undefined ? { mode: modes.dirMode } : {}) });
+    const lead = (await endsTorn(path)) ? "\n" : "";
+    await appendFile(path, `${lead}${text}\n`, { encoding: "utf8", ...(modes.fileMode !== undefined ? { mode: modes.fileMode } : {}) });
     onWritten?.();
     return true;
   });

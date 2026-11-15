@@ -344,6 +344,13 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
     }
   });
 
+  it("returns null when a data dir (read+write deny) cannot be resolved", () => {
+    const dir = scratchDir("tomo-sbx-data-");
+    const dangling = join(dir, "data");
+    symlinkSync(join(dir, "nowhere"), dangling);
+    expect(sandboxedBashCommand("echo hi", join(dir, "private"), undefined, [], [dangling])).toBeNull();
+  });
+
   it("returns null when the home (write-only deny) cannot be resolved", () => {
     // The second barred directory fails closed exactly like the first.
     const root = scratchDir("tomo-sbx-home-unresolvable-");
@@ -529,8 +536,13 @@ describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
   /** Run `command` the way the Bash tool would once the hook has rewritten it.
    *  `/bin/zsh -lc` on the OUTSIDE too, because `updatedInput` hands the tool a
    *  command LINE, not an argv. */
-  function runSandboxed(command: string, privateDir: string, writeOnlyDirs?: readonly string[]): { code: number; out: string } {
-    const wrapped = sandboxedBashCommand(command, privateDir, undefined, writeOnlyDirs);
+  function runSandboxed(
+    command: string,
+    privateDir: string,
+    writeOnlyDirs?: readonly string[],
+    denyDirs?: readonly string[],
+  ): { code: number; out: string } {
+    const wrapped = sandboxedBashCommand(command, privateDir, undefined, writeOnlyDirs, denyDirs);
     expect(wrapped).not.toBeNull();
     try {
       return {
@@ -542,6 +554,29 @@ describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
       return { code: e.status ?? -1, out: `${e.stdout ?? ""}${e.stderr ?? ""}` };
     }
   }
+
+  it("denies Tomo's data/ (usage ledger, transcripts) to reads and writes, however the path is spelled", () => {
+    const { priv, dir } = workspace();
+    const data = join(dir, "tomo-home", "data");
+    mkdirSync(join(data, "usage"), { recursive: true });
+    writeFileSync(join(data, "usage", "2026-11.ndjson"), "{\"trigger\":\"DM SNIPPET\"}\n");
+    symlinkSync(data, join(dir, "innocent"));
+    for (const command of [
+      `cat ${shellSingleQuote(join(data, "usage", "2026-11.ndjson"))}`,
+      `cat ${shellSingleQuote(join(dir, "innocent", "usage", "2026-11.ndjson"))}`,
+      `node -e 'process.stdout.write(require("node:fs").readFileSync(process.argv[1].replace("X","usage"),"utf8"))' ${shellSingleQuote(join(data, "X", "2026-11.ndjson"))}`,
+      `ls ${shellSingleQuote(data)}`,
+      `echo x >> ${shellSingleQuote(join(data, "usage", "2026-11.ndjson"))}`,
+      `mv ${shellSingleQuote(data)} ${shellSingleQuote(join(dir, "moved"))}`,
+    ]) {
+      const run = runSandboxed(command, priv, [], [data]);
+      expect(run.code, command).not.toBe(0);
+      expect(run.out).not.toContain("DM SNIPPET");
+    }
+    // Everything else still works.
+    expect(runSandboxed(`cat ${shellSingleQuote(join(dir, "memory", "MEMORY.md"))}`, priv, [], [data])).toMatchObject({ code: 0 });
+    expect(readFileSync(join(data, "usage", "2026-11.ndjson"), "utf8")).toBe("{\"trigger\":\"DM SNIPPET\"}\n");
+  });
 
   it("lets the shell read Tomo's home but not write, create, move or remove anything in it", () => {
     const { priv, dir } = workspace();

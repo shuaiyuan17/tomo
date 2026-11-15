@@ -104,6 +104,8 @@ const {
   SdkResultError,
 } = await import("../src/agent/live-session.js");
 const { log } = await import("../src/logger.js");
+type UsageLedgerRow = import("../src/usage/ledger.js").UsageLedgerRow;
+type ModelCounters = import("../src/sessions/types.js").ModelCounters;
 const TIMEOUT_MS = 10 * 60 * 1000;
 
 function makeSession(settings?: {
@@ -118,8 +120,10 @@ function makeSession(settings?: {
       sdkSessionId: string;
       totalCostUsd: number;
       tokens: { input: number; output: number; cacheRead: number; cacheCreated: number };
+      models?: Record<string, ModelCounters>;
     };
   };
+  recordUsage?: (build: () => UsageLedgerRow | undefined, onWritten: () => void) => void;
 }) {
   const session = new LiveSession({} as never, "test:session", undefined, undefined, settings);
   const harness = harnessRef.current!;
@@ -1286,7 +1290,7 @@ describe("LiveSession token accounting", () => {
       const r2 = await runTurn(session, harness, 2, { total_cost_usd: 276.0, modelUsage: modelUsage(51) });
       expect(r2.costUsd).toBeCloseTo(0.53, 10);
       expect(r2).toMatchObject({ inputTokens: 1010, outputTokens: 505, cacheReadTokens: 100, cacheCreationTokens: 1 });
-      expect(r2.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 276.0, tokens: tokensAt(51) });
+      expect(r2.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 276.0, tokens: tokensAt(51), models: expect.any(Object) });
     });
 
     it("does not charge the carried total when there is no baseline yet", async () => {
@@ -1302,7 +1306,7 @@ describe("LiveSession token accounting", () => {
       expect(r1.costUsd).toBe(0);
       expect(r1).toMatchObject({ inputTokens: 7, outputTokens: 3, cacheReadTokens: 2, cacheCreationTokens: 0 });
       // ... and that first result becomes the baseline.
-      expect(r1.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 275.47, tokens: tokensAt(50) });
+      expect(r1.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 275.47, tokens: tokensAt(50), models: expect.any(Object) });
 
       const r2 = await runTurn(session, harness, 2, { total_cost_usd: 276.0, modelUsage: modelUsage(51) });
       expect(r2.costUsd).toBeCloseTo(0.53, 10);
@@ -1351,7 +1355,7 @@ describe("LiveSession token accounting", () => {
 
       const r3 = await runTurn(session, harness, 3, { total_cost_usd: 0.5, modelUsage: modelUsage(2) });
       expect(r3.costUsd).toBeCloseTo(0.3, 10);
-      expect(r3.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 0.5, tokens: tokensAt(2) });
+      expect(r3.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 0.5, tokens: tokensAt(2), models: expect.any(Object) });
     });
   });
 
@@ -1374,7 +1378,7 @@ describe("LiveSession token accounting", () => {
     const { session, harness } = makeSession({ resumeFrom: { sdkSessionId: "sid-1" } });
     const r1 = await runTurn(session, harness, 1, { total_cost_usd: 0, modelUsage: modelUsage(3) });
     expect(r1.costUsd).toBe(0);
-    expect(r1.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 0, tokens: tokensAt(3) });
+    expect(r1.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 0, tokens: tokensAt(3), models: expect.any(Object) });
   });
 
   it("a fresh session charges the first result in full and reports it as the baseline", async () => {
@@ -1382,7 +1386,7 @@ describe("LiveSession token accounting", () => {
     const r1 = await runTurn(session, harness, 1, { total_cost_usd: 0.5, modelUsage: modelUsage(1) });
     expect(r1.costUsd).toBeCloseTo(0.5, 10);
     expect(r1).toMatchObject({ inputTokens: 1010, outputTokens: 505, cacheReadTokens: 100, cacheCreationTokens: 1 });
-    expect(r1.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 0.5, tokens: tokensAt(1) });
+    expect(r1.usageBaseline).toEqual({ sdkSessionId: "sid-1", totalCostUsd: 0.5, tokens: tokensAt(1), models: expect.any(Object) });
 
     const r2 = await runTurn(session, harness, 2, { total_cost_usd: 0.75, modelUsage: modelUsage(2) });
     expect(r2.costUsd).toBeCloseTo(0.25, 10);
@@ -1731,5 +1735,217 @@ describe("LiveSession: read receipts (user_message_uuids)", () => {
     harness.pushEvent(resultEvent());
     await p;
     expect(reads).toEqual([{ uuids: [harness.uuids[0]], requestIds: [] }]);
+  });
+});
+
+/** A recorder that lands every row at once, like a ledger whose writes all succeed. */
+const into = (rows: UsageLedgerRow[]) => (build: () => UsageLedgerRow | undefined, onWritten: () => void) => {
+  const row = build();
+  if (row) { rows.push(row); onWritten(); }
+};
+
+describe("LiveSession usage ledger rows", () => {
+  // Cumulative modelUsage after n turns: an opus main loop plus a haiku subagent.
+  const sdkModels = (n: number, haiku = n) => ({
+    "claude-opus": {
+      inputTokens: 10 * n, outputTokens: 5 * n, cacheReadInputTokens: 100 * n, cacheCreationInputTokens: 4 * n,
+      cacheCreationEphemeral5mInputTokens: 3 * n, cacheCreationEphemeral1hInputTokens: n,
+      thinkingTokens: 2 * n, webSearchRequests: n, costUSD: 0.5 * n, costBasis: "list",
+    },
+    "claude-haiku": {
+      inputTokens: 1000 * haiku, outputTokens: 50 * haiku, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+      webSearchRequests: 0, costUSD: 0.01 * haiku,
+    },
+  });
+  const opusAt = (n: number) => ({
+    input: 10 * n, output: 5 * n, cacheRead: 100 * n, cacheCreated: 4 * n,
+    cacheCreated5m: 3 * n, cacheCreated1h: n, thinking: 2 * n, webSearch: n, costUsd: 0.5 * n,
+  });
+  const haikuAt = (n: number) => ({ input: 1000 * n, output: 50 * n, cacheRead: 0, cacheCreated: 0, webSearch: 0, costUsd: 0.01 * n });
+  const totalsAt = (n: number) => ({ input: 1010 * n, output: 55 * n, cacheRead: 100 * n, cacheCreated: 4 * n });
+  // Field-by-field b - a, exactly as JS computes it: the ledger keeps the raw delta, float noise and all.
+  const diff = <T extends Record<string, number>>(b: T, a: T): T =>
+    Object.fromEntries(Object.entries(b).map(([k, v]) => [k, v - a[k]])) as T;
+
+  async function turn(
+    session: InstanceType<typeof LiveSession>,
+    harness: Harness,
+    n: number,
+    result: Record<string, unknown>,
+    replyContext?: Record<string, unknown>,
+  ) {
+    const p = session.send(`turn ${n}`, undefined, undefined, undefined, undefined, undefined, undefined, replyContext as never);
+    await waitFor(() => harness.inputs.length === n);
+    harness.pushEvent({ ...resultEvent(), ...result });
+    return p;
+  }
+
+  it("writes one versioned row per result with the turn's own cost, tokens, timings and attribution", async () => {
+    const rows: UsageLedgerRow[] = [];
+    const { session, harness } = makeSession({ recordUsage: into(rows) });
+    const owner = { turnId: "t1", channel: "web", requestId: "req-1", usage: { source: "owner", trigger: "what did I spend" } };
+
+    await turn(session, harness, 1, { total_cost_usd: 0.51, modelUsage: sdkModels(1), duration_ms: 900, duration_api_ms: 700, num_turns: 3 }, owner);
+    await turn(session, harness, 2, { total_cost_usd: 1.02, modelUsage: sdkModels(2), duration_ms: 400, duration_api_ms: 300, num_turns: 1 }, owner);
+
+    expect(rows).toHaveLength(2);
+    expect(rows[1]).toEqual({
+      v: 1,
+      ts: expect.any(Number),
+      sessionKey: "test:session",
+      source: "owner",
+      requestId: "req-1",
+      trigger: "what did I spend",
+      costUsd: 0.51,
+      tokens: totalsAt(1),
+      durationMs: 400,
+      durationApiMs: 300,
+      numTurns: 1,
+      models: {
+        "claude-opus": { ...opusAt(1), costBasis: "list" },
+        "claude-haiku": haikuAt(1),
+      },
+      // The cumulative counters this turn ends on: the next resume's baseline.
+      sdkSessionId: "sid-1",
+      snapshot: {
+        sdkSessionId: "sid-1", totalCostUsd: 1.02, tokens: totalsAt(2),
+        models: { "claude-opus": opusAt(2), "claude-haiku": haikuAt(2) },
+      },
+    });
+    expect(JSON.stringify(rows[1])).not.toContain("noBaseline");
+  });
+
+  it("leaves a model that did nothing this turn out, and the costs per model add up to the turn's", async () => {
+    const rows: UsageLedgerRow[] = [];
+    const { session, harness } = makeSession({ recordUsage: into(rows) });
+    await turn(session, harness, 1, { total_cost_usd: 0.51, modelUsage: sdkModels(1, 1) });
+    // The haiku subagent did not run on turn 2.
+    await turn(session, harness, 2, { total_cost_usd: 1.01, modelUsage: sdkModels(2, 1) });
+
+    expect(Object.keys(rows[1].models!)).toEqual(["claude-opus"]);
+    expect(rows[1].models!["claude-opus"]).toEqual({ ...opusAt(1), costBasis: "list" });
+    const perModel = Object.values(rows[1].models!).reduce((sum, m) => sum + m.costUsd, 0);
+    expect(perModel).toBeCloseTo(rows[1].costUsd, 6);
+  });
+
+  it("splits the first turn after a resume by model against the per-model baseline", async () => {
+    const rows: UsageLedgerRow[] = [];
+    const { session, harness } = makeSession({
+      recordUsage: into(rows),
+      resumeFrom: {
+        sdkSessionId: "sid-1",
+        baseline: {
+          sdkSessionId: "sid-1", totalCostUsd: 25.5, tokens: totalsAt(50),
+          models: { "claude-opus": opusAt(50), "claude-haiku": haikuAt(50) },
+        },
+      },
+    });
+    await turn(session, harness, 1, { total_cost_usd: 26.01, modelUsage: sdkModels(51) });
+
+    expect(rows[0]).toMatchObject({ costUsd: 26.01 - 25.5, tokens: totalsAt(1) });
+    expect(rows[0].noBaseline).toBeUndefined();
+    expect(rows[0].models).toEqual({
+      "claude-opus": { ...diff(opusAt(51), opusAt(50)), costBasis: "list" },
+      "claude-haiku": diff(haikuAt(51), haikuAt(50)),
+    });
+    // ... and the baseline it hands on carries the per-model counters too.
+    expect(session.lastResult!.usageBaseline!.models).toEqual({ "claude-opus": opusAt(51), "claude-haiku": haikuAt(51) });
+  });
+
+  it("does not guess a per-model split when the resume baseline predates per-model counters", async () => {
+    const rows: UsageLedgerRow[] = [];
+    const { session, harness } = makeSession({
+      recordUsage: into(rows),
+      resumeFrom: { sdkSessionId: "sid-1", baseline: { sdkSessionId: "sid-1", totalCostUsd: 25.5, tokens: totalsAt(50) } },
+    });
+    await turn(session, harness, 1, { total_cost_usd: 26.01, modelUsage: sdkModels(51) });
+    await turn(session, harness, 2, { total_cost_usd: 26.52, modelUsage: sdkModels(52) });
+
+    // Totals are still exact; only the split is unknown, for this one turn.
+    expect(rows[0]).toMatchObject({ costUsd: 26.01 - 25.5, tokens: totalsAt(1) });
+    expect(rows[0].models).toBeUndefined();
+    expect(rows[1].models).toEqual({
+      "claude-opus": { ...diff(opusAt(52), opusAt(51)), costBasis: "list" },
+      "claude-haiku": diff(haikuAt(52), haikuAt(51)),
+    });
+  });
+
+  it("flags the first turn after a resume with no baseline, with no per-model split", async () => {
+    const rows: UsageLedgerRow[] = [];
+    const { session, harness } = makeSession({ recordUsage: into(rows), resumeFrom: { sdkSessionId: "sid-1" } });
+    await turn(session, harness, 1, { total_cost_usd: 26.01, modelUsage: sdkModels(51), usage: { input_tokens: 7, output_tokens: 3 } });
+    await turn(session, harness, 2, { total_cost_usd: 26.52, modelUsage: sdkModels(52) });
+
+    expect(rows[0]).toMatchObject({ costUsd: 0, noBaseline: true, tokens: { input: 7, output: 3, cacheRead: 0, cacheCreated: 0 } });
+    expect(rows[0].models).toBeUndefined();
+    expect(rows[1].noBaseline).toBeUndefined();
+    expect(rows[1].models!["claude-opus"]).toEqual({ ...opusAt(1), costBasis: "list" });
+  });
+
+  it("attributes cron turns to their job and SDK-initiated turns to background", async () => {
+    const rows: UsageLedgerRow[] = [];
+    const factory = vi.fn(() => ({ resolve: () => {}, reject: () => {}, onBlock: () => {} }));
+    const session = new LiveSession({} as never, "dm:owner", undefined, factory, { recordUsage: into(rows) });
+    const harness = harnessRef.current!;
+    await turn(session, harness, 1, { total_cost_usd: 0.2 }, {
+      turnId: "t", channel: "telegram",
+      usage: { source: "cron", jobId: "job-7", jobName: "Morning digest", trigger: "Scheduled task \"Morning digest\" triggered." },
+    });
+    expect(rows[0]).toMatchObject({ source: "cron", jobId: "job-7", jobName: "Morning digest", sessionKey: "dm:owner", costUsd: 0.2 });
+
+    // The CLI starts a turn on its own (a background task reported back).
+    harness.pushEvent(assistantEvent("the review finished"));
+    await waitFor(() => factory.mock.calls.length === 1);
+    harness.pushEvent({ ...resultEvent(), total_cost_usd: 0.5, origin: { kind: "task-notification" }, num_turns: 1 });
+    await waitFor(() => rows.length === 2);
+    expect(rows[1]).toMatchObject({ source: "background", costUsd: 0.3 });
+    expect(rows[1].jobId).toBeUndefined();
+    session.close();
+  });
+
+  it("records costs exactly as differenced from the SDK's totals, never rounded", async () => {
+    const rows: UsageLedgerRow[] = [];
+    const { session, harness } = makeSession({ recordUsage: into(rows) });
+    const models = (usd: number) => ({ "claude-opus": { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: usd } });
+    await turn(session, harness, 1, { total_cost_usd: 0.0000001234, modelUsage: models(0.0000001234) });
+    await turn(session, harness, 2, { total_cost_usd: 0.1234567891, modelUsage: models(0.1234567891) });
+
+    expect(rows[0].costUsd).toBe(0.0000001234);
+    expect(rows[0].models!["claude-opus"].costUsd).toBe(0.0000001234);
+    expect(rows[1].costUsd).toBe(0.1234567891 - 0.0000001234);
+    expect(rows[1].models!["claude-opus"].costUsd).toBe(0.1234567891 - 0.0000001234);
+  });
+
+  it("a row that fails to land does not advance the ledger's counters: the next row carries both turns", async () => {
+    const rows: UsageLedgerRow[] = [];
+    let fail = true;
+    const { session, harness } = makeSession({
+      recordUsage: (build, onWritten) => {
+        const row = build();
+        if (!row) return;
+        if (fail) { fail = false; return; } // the append failed: never on disk, onWritten not called
+        rows.push(row);
+        onWritten();
+      },
+    });
+    await turn(session, harness, 1, { total_cost_usd: 0.51, modelUsage: sdkModels(1) });
+    await turn(session, harness, 2, { total_cost_usd: 1.02, modelUsage: sdkModels(2) });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ costUsd: 1.02, tokens: totalsAt(2), snapshot: { totalCostUsd: 1.02 } });
+    expect(rows[0].models).toEqual({ "claude-opus": { ...opusAt(2), costBasis: "list" }, "claude-haiku": haikuAt(2) });
+    // Session stats are a separate counter and still saw each turn once.
+    expect(session.lastResult?.costUsd).toBeCloseTo(0.51);
+  });
+
+  it("a recorder that throws costs a warn, never the turn", async () => {
+    const { session, harness } = makeSession({ recordUsage: () => { throw new Error("disk full"); } });
+    const p = session.send("hi");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent(assistantEvent("fine"));
+    harness.pushEvent({ ...resultEvent(), total_cost_usd: 0.4 });
+    await expect(p).resolves.toBe("fine");
+    expect(session.lastResult?.costUsd).toBeCloseTo(0.4);
+    expect(log.warn).toHaveBeenCalledWith(expect.objectContaining({ session: "test:session" }), "Usage ledger row failed; turn unaffected");
   });
 });

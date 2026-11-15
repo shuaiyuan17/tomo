@@ -2,6 +2,7 @@ import type { Channel, IncomingMessage } from "../channels/types.js";
 import type { ReplyTarget } from "../sessions/types.js";
 import type { InboundItem } from "./inbound-batcher.js";
 import type { OwnerNoticeTarget, ShutdownTurnEnd } from "./turn-runner.js";
+import type { UsageSource } from "../usage/ledger.js";
 
 // Request and option shapes passed between the Agent's turn entry points.
 
@@ -75,8 +76,12 @@ export interface CronTurnOptions {
    *  Carried through every handoff. */
   onStopped?: () => void;
   /** The cron job's name, for the owner notice when its failure is kept out
-   *  of a group (see agent/owner-error-notice.ts). */
+   *  of a group (see agent/owner-error-notice.ts), and for the usage ledger. */
   jobName?: string;
+  /** The cron job's id, for the usage ledger. Set only by the scheduler. */
+  jobId?: string;
+  /** Usage-ledger source for a turn with no `jobId` (default "system"). */
+  usageSource?: UsageSource;
   /** The audience this turn carries from the session that ASKED for it —
    *  `send_message(mode: "delegate")`, or a group's background turn handed to
    *  the summoning dm: session. Registered in the TurnAudienceRegistry for the

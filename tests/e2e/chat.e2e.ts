@@ -1133,6 +1133,65 @@ it("Resend where an image cannot be read back: says so, and sending keeps the or
   for (const finish of finishes) finish("done");
 });
 
+it("Resend A, then Resend B before A's image is back: A's late result never lands on B, and A's items leave the tray", async () => {
+  const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+  const finishes: Array<(value: string) => void> = [];
+  mockSdk.responseFn = () => new Promise<string>((resolve) => { finishes.push(resolve); });
+  const bodies: Array<{ requestId: string; images?: string[]; refiled?: string[] }> = [];
+  page.on("request", (request) => { if (request.method() === "POST" && request.url().endsWith("/api/v1/messages")) bodies.push(JSON.parse(request.postData() ?? "{}")); });
+  const tray = page.getByRole("list", { name: "Attachments" });
+  const box = page.getByRole("textbox", { name: "Message Tomo" });
+  const interrupt = (id: string) => (channel as unknown as { state(id: string, state: string): void }).state(id, "interrupted");
+  // A: an image and a file.
+  await page.locator("input[type=file]").setInputFiles([{ name: "a.png", mimeType: "image/png", buffer: png }, { name: "a.md", mimeType: "text/markdown", buffer: Buffer.from("a") }]);
+  await browserExpect(tray.getByRole("listitem", { name: /attached$/ })).toHaveCount(2);
+  await box.fill("message A");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect.poll(() => bodies.length && channel.request(bodies[0].requestId).state).toBe("running");
+  interrupt(bodies[0].requestId);
+  const pathA = channel.request(bodies[0].requestId).images![0];
+  // B: one image.
+  await page.locator("input[type=file]").setInputFiles([{ name: "b.png", mimeType: "image/png", buffer: png }]);
+  await browserExpect(tray.getByRole("listitem", { name: "b.png, attached" })).toBeVisible();
+  await box.fill("message B");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect.poll(() => bodies.length === 2 && channel.request(bodies[1].requestId).images?.length).toBe(1);
+  interrupt(bodies[1].requestId);
+  const pathB = channel.request(bodies[1].requestId).images![0];
+  // Every image read is held, then released one by one.
+  const held = new Map<string, () => void>();
+  await page.route("**/api/v1/sessions/*/media**", async (route) => {
+    const path = new URL(route.request().url()).searchParams.get("path")!;
+    await new Promise<void>((resolve) => held.set(path, resolve));
+    await route.continue();
+  });
+  const resendOf = (text: string) => page.locator("article.message.user").filter({ hasText: text }).getByRole("button", { name: "Resend…" });
+  await resendOf("message A").click();
+  await browserExpect(tray.getByRole("listitem", { name: "a.md, attached" })).toBeVisible();
+  await browserExpect.poll(() => held.has(pathA)).toBe(true);
+  await resendOf("message B").click();
+  await browserExpect(box).toHaveValue("message B");
+  // A's file left with A's draft.
+  await browserExpect(tray.getByRole("listitem")).toHaveCount(0);
+  await browserExpect.poll(() => held.has(pathB)).toBe(true);
+  // A's image comes back late: B stays locked and gets nothing.
+  held.get(pathA)!();
+  await page.waitForTimeout(500);
+  await browserExpect(page.getByText("Restoring attachments…")).toBeVisible();
+  await browserExpect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
+  await browserExpect(tray.getByRole("listitem")).toHaveCount(0);
+  held.get(pathB)!();
+  await browserExpect(tray.getByRole("listitem", { name: /attached$/ })).toHaveCount(1);
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect.poll(() => bodies.length).toBe(3);
+  expect(bodies[2].images).toHaveLength(1);
+  expect(bodies[2].refiled).toBeUndefined();
+  // B was resent and dismissed; A still awaits the owner.
+  await browserExpect.poll(() => channel.request(bodies[1].requestId).text).toBeUndefined();
+  expect(channel.request(bodies[0].requestId)).toMatchObject({ state: "interrupted", text: "message A" });
+  for (const finish of finishes) finish("done");
+});
+
 it("a thinking block in history reads as a folded, quiet Thinking row; the reply stays the reply", async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
   const t = Date.now() - 60_000;

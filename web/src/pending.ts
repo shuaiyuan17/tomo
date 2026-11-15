@@ -73,7 +73,23 @@ export function isResendOf(original: string, sent: string): boolean {
  * `expected`: how many attachments the ORIGINAL had (images + files) — the
  * resend counts only if every one of them came back and was sent.
  */
-export interface Resend { requestId: string; original: string; imageKeys?: string[]; fileKeys?: string[]; restoring?: boolean; expected?: number }
+export interface Resend { requestId: string; original: string; imageKeys?: string[]; fileKeys?: string[]; restoring?: boolean; expected?: number;
+  /** Which restore this is (one per Resend click): a late result for an earlier one must never land on this one. */
+  token?: number }
+/**
+ * A restore's result (the keys its images were re-attached as), applied only
+ * to the resend that started it: if the owner has since resent another
+ * message, cancelled, or sent, the current resend is returned unchanged.
+ */
+export function applyRestored(current: Resend | null, token: number, imageKeys: string[]): Resend | null {
+  if (!current || current.token !== token) return current;
+  return { ...current, imageKeys, restoring: false };
+}
+/** After a send was accepted: clear the resend it was sent as — not another one the owner started meanwhile. */
+export function resendAfterSend(current: Resend | null, sentAs: Resend | null): Resend | null {
+  if (!current) return null;
+  return sentAs && current.requestId === sentAs.requestId && current.token === sentAs.token ? null : current;
+}
 /** Attachments of the original that did not make it back into the tray (a failed read, a full tray). */
 export function missingAttachments(resend: Resend | null): number {
   if (!resend || resend.restoring) return 0;

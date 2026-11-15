@@ -17,7 +17,7 @@ import { runningCount } from "./tasks.js";
 import { ArrowUp, FileIcon, ImagePlus, Plus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, House, ListChecks, MessageCircle, Monitor, Moon, PanelLeft, Sun, SunMoon } from "lucide-react";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { HomePage, useHomeRoute } from "./home/home-page.js";
-import { awaitingOwner, dismissAfterAcceptedSend, missingAttachments, historyBadge, pendingLabel, pendingUserMessages, readReceipt, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
+import { applyRestored, awaitingOwner, dismissAfterAcceptedSend, missingAttachments, resendAfterSend, historyBadge, pendingLabel, pendingUserMessages, readReceipt, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
 import { ReadReceiptMark } from "./read-receipt.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -387,6 +387,8 @@ export function App() {
     const text = draft.trim();
     // Captured now: images added while this sends stay in the tray.
     const { keys: sentKeys, ids: images, files, refiled } = captureSend(attachments.items);
+    // The resend this send is (captured now: the owner may start another while it is in flight).
+    const sentAs = resending;
     const requestId = crypto.randomUUID();
     setSending(true); setFeedback("Sending…"); remember(requestId);
     // Sending is the reader's own move: it takes them to the end, wherever they were reading.
@@ -403,9 +405,10 @@ export function App() {
       web.acceptRequest({ ...request, text, timestamp: Date.now() });
       // Accepted, and it really was that message (or the owner's edit of it):
       // only now does the interrupted one go.
-      const replaced = dismissAfterAcceptedSend(resending, text, sentKeys);
+      const replaced = dismissAfterAcceptedSend(sentAs, text, sentKeys);
       if (replaced) void dismiss(replaced, true);
-      setResending(null);
+      // Only the resend this was sent as ends; one the owner started while it was sending stays.
+      setResending((old) => resendAfterSend(old, sentAs));
       setDraft((old) => old.trim() === text ? "" : old);
       setFeedback(""); remember(null); setReload((r) => r + 1);
     } catch (err) {
@@ -422,7 +425,7 @@ export function App() {
       } else setFeedback(labels.unknown, true);
     } finally { setSending(false); }
   };
-  const reattach = async (paths: string[], restored: { fileKeys: string[]; expected: number }) => {
+  const reattach = async (paths: string[], restored: { fileKeys: string[]; expected: number; token: number }) => {
     // Every read settles (allSettled-style: each one catches) before the tray or the resend changes.
     const files = await Promise.all(paths.map(async (path, i) => {
       try {
@@ -432,16 +435,21 @@ export function App() {
         return new File([blob], path.split("/").at(-1) || `image-${i + 1}`, { type: blob.type });
       } catch { return null; }
     }));
+    // Another resend, a cancel or a send since: this result is stale — nothing goes in the tray, nothing changes.
+    if (restoreToken.current !== restored.token) return;
     const found = files.filter((file): file is File => !!file);
     const keys = attachments.add(found);
     // Restored: only now may it be sent (and only now can it count as the resend).
-    setResending((old) => old && { ...old, imageKeys: keys, restoring: false });
+    setResending((old) => applyRestored(old, restored.token, keys));
     // A failed read or a full tray: the original stays queued (missingAttachments), and the owner is told.
     const missing = missingAttachments({ requestId: "", original: "", imageKeys: keys, fileKeys: restored.fileKeys, expected: restored.expected });
     if (missing) setFeedback(missingNote(missing), true);
   };
   /** Interrupted request being resent from the composer (dismissed once the resend is accepted). */
   const [resending, setResending] = useState<Resend | null>(null);
+  /** The current restore; bumped whenever the resend is replaced or ends, so a late result is dropped. */
+  const restoreToken = useRef(0);
+  const endResend = () => { restoreToken.current++; setResending(null); };
   const [confirmDismiss, setConfirmDismiss] = useState<string | null>(null);
   /** A resend's images are still being read back into the tray. */
   const restoring = resending?.restoring === true;
@@ -452,15 +460,18 @@ export function App() {
     catch { if (!quiet) setFeedback("Could not dismiss it yet. It is still kept; try again.", true); }
   };
   const resend = (request: WebRequest) => {
+    // A new restore: any earlier one still reading is void, and what it put back in the tray goes (as its draft does).
+    const token = ++restoreToken.current;
+    for (const key of [...(resending?.imageKeys ?? []), ...(resending?.fileKeys ?? [])]) attachments.remove(key);
     // Its files come back as they are: already filed, the resend names them by path (nothing is uploaded again).
     const fileKeys = request.files?.length ? attachments.addFiled(request.files) : [];
     const restoringImages = !!request.images?.length;
     const expected = (request.images?.length ?? 0) + (request.files?.length ?? 0);
-    setResending({ requestId: request.requestId, original: request.text ?? "", ...(fileKeys.length ? { fileKeys } : {}), ...(restoringImages ? { restoring: true } : {}), ...(expected ? { expected } : {}) });
+    setResending({ requestId: request.requestId, original: request.text ?? "", ...(fileKeys.length ? { fileKeys } : {}), ...(restoringImages ? { restoring: true } : {}), ...(expected ? { expected } : {}), token });
     setDraft(request.text ?? ""); input.current?.focus();
     // Its images come back too: read from where they were filed, attached (uploaded) again.
     // Until every one is back, Send stays off — a send now would leave them behind.
-    if (restoringImages) void reattach(request.images!, { fileKeys, expected });
+    if (restoringImages) void reattach(request.images!, { fileKeys, expected, token });
     setFeedback("Review the message, then send it again. The interrupted one is dismissed once this is accepted.");
   };
   // The latest resend/dismiss, for buttons in memoized history rows (they read state from this render).
@@ -746,7 +757,7 @@ export function App() {
             <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Resending an interrupted message</Badge>
             <span role="status" className={cn(missingAttachments(resending) > 0 && "text-destructive")}>{restoring ? "Restoring attachments…"
               : missingAttachments(resending) > 0 ? missingNote(missingAttachments(resending)) : "The original is dismissed once this one is accepted."}</span>
-            <Button variant="ghost" size="sm" className="h-6 rounded-md px-2 text-[11px]" onClick={() => setResending(null)}>Not a resend</Button></div>}
+            <Button variant="ghost" size="sm" className="h-6 rounded-md px-2 text-[11px]" onClick={endResend}>Not a resend</Button></div>}
           {attachments.items.length > 0 && <ul aria-label={filesOn ? "Attachments" : "Attached images"} className="m-0 mb-2 flex list-none flex-wrap gap-2 p-0">
             {attachments.items.map((item, index) => item.kind === "file" ? <li key={item.key} aria-label={attachmentLabel(item, index)} data-kind="file"
               className={cn("relative flex h-16 max-w-[260px] items-center gap-2.5 overflow-hidden rounded-xl border bg-muted/40 py-2 pr-9 pl-3 motion-enter", item.status === "failed" && "border-destructive/60")}>
@@ -780,7 +791,9 @@ export function App() {
             <label className="sr-only" htmlFor="message">Message {agent}</label>
             <Textarea ref={input} id="message" placeholder={session?.kind === "group" ? "This group is read-only" : "What's on your mind?"} value={draft} maxLength={16_000} rows={1} disabled={!session?.writable}
               className="max-h-60 min-h-10 flex-1 resize-none rounded-none border-0 bg-transparent! py-[7px] pr-3 pl-1.5 text-[15px] leading-relaxed shadow-none placeholder:text-muted-foreground focus-visible:ring-0 disabled:opacity-80 md:text-[15px]"
-              onChange={(e) => { setDraft(e.target.value); setResending((old) => resendAfterDraftChange(old, e.target.value)); }} onPaste={(e) => {
+              onChange={(e) => { setDraft(e.target.value);
+                // Cleared: the resend ends, and so does any restore it still had running.
+                if (resending && !resendAfterDraftChange(resending, e.target.value)) endResend(); }} onPaste={(e) => {
                 const files = filesOn ? pastedFiles(e.clipboardData?.items) : imageFiles(e.clipboardData?.items);
                 if (!files.length || !canAttach) return;
                 attachments.add(files);

@@ -16,7 +16,7 @@ import { webSessionId } from "../src/web/owner.js";
 import type { IncomingMessage } from "../src/channels/types.js";
 import { splitAttachments } from "../web/src/attachments.js";
 import { addFiles, captureSend, filedAttachment, formatSize, pastedFiles, type Attachment } from "../web/src/uploads.js";
-import { dismissAfterAcceptedSend, missingAttachments, resendAfterDraftChange } from "../web/src/pending.js";
+import { applyRestored, dismissAfterAcceptedSend, missingAttachments, resendAfterDraftChange, resendAfterSend } from "../web/src/pending.js";
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
 const MD = Buffer.from("# Notes\n\n- one\n- two\n");
@@ -206,6 +206,22 @@ describe("a message with a file (web channel)", () => {
     expect(dismissAfterAcceptedSend(resend, "three pictures", [...full.map((item) => item.key), ...resend.imageKeys])).toBeNull();
     // All back and all sent: then, and only then, it counts.
     expect(dismissAfterAcceptedSend({ ...resend, imageKeys: ["a", "b", "c"] }, "three pictures", ["a", "b", "c"])).toBe("orig");
+  });
+  it("A's restore finishing after the owner switched to B's resend never touches B: B stays locked, A's images are not B's", () => {
+    const a = { requestId: "A", original: "a", restoring: true, expected: 1, token: 1 };
+    const b = { requestId: "B", original: "b", restoring: true, expected: 1, token: 2 };
+    // Current is B; A's late result arrives.
+    expect(applyRestored(b, 1, ["imgA"])).toBe(b);
+    expect(dismissAfterAcceptedSend(applyRestored(b, 1, ["imgA"]), "b", ["imgA"])).toBeNull();
+    // B's own result applies.
+    expect(applyRestored(b, 2, ["imgB"])).toMatchObject({ requestId: "B", imageKeys: ["imgB"], restoring: false });
+    // Cancelled (no resend): a late result changes nothing.
+    expect(applyRestored(null, 1, ["imgA"])).toBeNull();
+    expect(applyRestored(a, 1, ["imgA"])).toMatchObject({ requestId: "A", restoring: false });
+    // A send accepted as A ends A — but not B, started while it was in flight.
+    expect(resendAfterSend(a, a)).toBeNull();
+    expect(resendAfterSend(b, a)).toBe(b);
+    expect(resendAfterSend(b, null)).toBe(b);
   });
   it("refiled never names an arbitrary path: only files an interrupted request filed, still present", async () => {
     const { channel, handled, request } = await interrupted("x", "n.md");

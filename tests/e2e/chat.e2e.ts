@@ -343,7 +343,7 @@ it("opens a task to read its subagent transcript, expands a tool call, and goes 
   await browserExpect(transcript.getByText("Also check the README.")).toHaveCount(1);
   await browserExpect(transcript).toContainText("Message from Tomo");
   // Its card lines up with the Brief card above, left and right.
-  expect(await edges(transcript.getByText("Message from Tomo").locator(".."))).toEqual(await edges(page.getByRole("region", { name: "Brief" })));
+  await browserExpect.poll(() => offset(transcript.getByText("Message from Tomo").locator(".."), page.getByRole("region", { name: "Brief" }))).toEqual([0, 0]);
   await browserExpect(transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ })).toHaveCount(0);
   await transcript.getByRole("button", { name: /Read a file, ran a search/ }).click();
   await transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ }).click();
@@ -354,6 +354,11 @@ it("opens a task to read its subagent transcript, expands a tool call, and goes 
 
 /** A box's left and right edges, in whole pixels. */
 const edges = (box: ReturnType<Page["locator"]>) => box.evaluate((el) => { const r = el.getBoundingClientRect(); return [Math.round(r.left), Math.round(r.right)]; });
+/** How far `box`'s left and right edges sit from `ref`'s, once the rail has finished sliding in. */
+const offset = async (box: ReturnType<Page["locator"]>, ref: ReturnType<Page["locator"]>) => {
+  const [a, b] = [await edges(box), await edges(ref)];
+  return [a[0] - b[0], a[1] - b[1]];
+};
 
 it("a shell task: its Output card lines up with the Command card above it", async () => {
   await page.route("**/tasks/b1/command", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ text: "/tmp/merge-seq.sh 2>&1", truncated: false }) }));
@@ -367,7 +372,7 @@ it("a shell task: its Output card lines up with the Command card above it", asyn
   await browserExpect(command).toContainText("/tmp/merge-seq.sh");
   const output = page.getByText("352 already merged").locator("xpath=ancestor::div[contains(@class,'border')][1]");
   await browserExpect(output).toBeVisible();
-  expect(await edges(output)).toEqual(await edges(command));
+  await browserExpect.poll(() => offset(output, command)).toEqual([0, 0]);
   await page.screenshot({ path: "test-results/shell-task.png" });
 });
 

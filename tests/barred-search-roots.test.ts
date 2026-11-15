@@ -22,8 +22,15 @@ const tree = vi.hoisted(() => {
   symlinkSync(tomoHome, join(ws, "notes", "up"));          // a link to an ANCESTOR of both
   symlinkSync(join(data, "usage"), join(ws, "ledger"));     // a link INTO data/
   symlinkSync(join(ws, "memory", "private"), join(ws, "p")); // a link INTO private/
+  // An "allowed" folder outside the workspace that a turn could write links into.
+  const allowed = join(home, "allowed");
+  mkdirSync(allowed);
+  symlinkSync(join(ws, "memory", "private"), join(allowed, "plink"));
+  symlinkSync(join(data, "usage"), join(allowed, "dlink"));
+  symlinkSync(join(allowed, "loop-b"), join(allowed, "loop-a"));
+  symlinkSync(join(allowed, "loop-a"), join(allowed, "loop-b"));
   process.env.HOME = home;
-  return { home, tomoHome, ws, data };
+  return { home, tomoHome, ws, data, allowed };
 });
 
 vi.mock("../src/config.js", () => ({
@@ -60,6 +67,14 @@ describe("a barred turn may not search at, inside or above a barred directory", 
     ["a symlink to an ancestor, with a suffix-specific relative glob", "Glob", { path: "notes/up", pattern: "data/usage/*.ndjson" }],
     ["a symlink into data/", "Glob", { path: "ledger", pattern: "*" }],
     ["a symlink into private/", "Grep", { pattern: "SECRET", path: "p" }],
+    // An ABSOLUTE Glob pattern replaces \`path\`: the CLI searches its literal
+    // base directory, here a link into private/ or data/.
+    ["an absolute Glob through a link to private/", "Glob", { path: "notes", pattern: `${tree.allowed}/plink/**/*.txt` }],
+    ["an absolute Glob through a link to data/", "Glob", { pattern: `${tree.allowed}/dlink/*.ndjson` }],
+    ["an absolute Glob with no glob character, through a link", "Glob", { pattern: `${tree.allowed}/dlink/2026-11.ndjson` }],
+    ["a Grep rooted at a link to private/", "Grep", { pattern: "SECRET", path: `${tree.allowed}/plink` }],
+    ["a Grep rooted at a link to data/", "Grep", { pattern: "SNIPPET", path: `${tree.allowed}/dlink`, glob: "*.ndjson" }],
+    ["a root that cannot be resolved (symlink loop)", "Grep", { pattern: "x", path: `${tree.allowed}/loop-a` }],
     // At and inside.
     ["data/ itself", "Grep", { pattern: "x", path: "~/.tomo/data" }],
     ["inside data/", "Glob", { path: `${tree.data}/usage`, pattern: "*.ndjson" }],
@@ -85,6 +100,8 @@ describe("a barred turn may not search at, inside or above a barred directory", 
       { tool_name: "Grep", tool_input: { pattern: "milk", path: "notes", glob: "*.txt" } },
       { tool_name: "Glob", tool_input: { path: "notes", pattern: "*.txt" } },
       { tool_name: "Grep", tool_input: { pattern: "milk", path: `${tree.ws}/notes` } },
+      // An absolute pattern whose base is a plain workspace folder.
+      { tool_name: "Glob", tool_input: { path: "~", pattern: `${tree.ws}/notes/*.txt` } },
     ]) expect(await hook("group-session")(input), JSON.stringify(input)).toEqual({});
     for (const [, tool, input] of refused) expect(await hook(null)({ tool_name: tool, tool_input: input })).toEqual({});
   });

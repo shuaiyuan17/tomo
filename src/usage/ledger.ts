@@ -105,6 +105,8 @@ export interface UsageLedgerRow {
    * `snapshot`.
    */
   backfilled?: true;
+  /** A backfilled row's id (backfillRowId): what a later backfill merges by. */
+  backfillId?: string;
   /**
    * Before the fix of #389 (2026-09-23): a resumed session's first turn was
    * charged the session's whole history, so `costUsd` is too high. Kept, shown

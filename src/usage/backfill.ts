@@ -1,4 +1,5 @@
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { isGroupSessionKey } from "../sessions/keys.js";
 import { BACKFILL_FILE, LEDGER_DIR_MODE, LEDGER_FILE_MODE, readLedgerStarted, triggerSnippet, USAGE_LEDGER_VERSION, type UsageLedgerRow, type UsageSource } from "./ledger.js";
@@ -16,9 +17,10 @@ import { localParts } from "./local-time.js";
  * that fired within 5 s before it (`cron.fired`). No tokens, no model split.
  *
  * The rows go to a file of their own, `<usage dir>/backfill.ndjson`, never
- * into the live month files: the whole file is computed again and replaced
- * atomically on every run (so running twice gives the same file, and the
- * daemon's appends are never touched). Only turns before the ledger's start
+ * into the live month files (the daemon's appends are never touched). Each
+ * run merges what the log yields into it by row id, adding and never
+ * removing, so history survives the log's rotation, and replaces the file
+ * atomically. Only turns before the ledger's start
  * marker (`ledger-started.json`) are kept: from then on the ledger owns every
  * turn — one whose row failed to land included, its cost carried by the next
  * row — so the activity log must not add any of them. No marker (the ledger
@@ -185,17 +187,25 @@ export interface BackfillOptions {
   usageDir: string;
   timeZone: string;
   dryRun: boolean;
+  /** Write even when the activity log yields nothing, or under half the rows already backfilled. */
+  force?: boolean;
 }
 
 export interface BackfillReport {
   activityFiles: string[];
   /** Rows the activity log yields. */
   found: number;
-  /** Of those, at or after the ledger's start (left to the ledger). */
+  /** Of those, at or after the ledger's start (left to it). */
   afterStart: number;
-  /** Rows in backfill.ndjson (dry run: would be). */
-  written: number;
-  /** Local dates the rows cover. */
+  /** Of those, before the start: this run's input. */
+  fromLog: number;
+  /** Rows backfill.ndjson already held. */
+  existing: number;
+  /** Rows this run adds (dry run: would add). */
+  added: number;
+  /** Rows in backfill.ndjson after the run. */
+  total: number;
+  /** Local dates the file's rows cover. */
   days: number;
   firstDay: string | null;
   lastDay: string | null;
@@ -203,14 +213,20 @@ export interface BackfillReport {
   costUsd: number;
   /** The ledger's start marker, ms epoch. */
   ledgerStartedAt: number;
-  /** An earlier backfill.ndjson was (dry run: would be) replaced. */
-  replaced: boolean;
   dryRun: boolean;
 }
 
 export class BackfillError extends Error {}
 
 export const BACKFILL_LOCK_FILE = "backfill.lock";
+
+/**
+ * A backfilled row's id, from what the activity log gives the same on every
+ * read (session key + the result's timestamp), hashed.
+ */
+export function backfillRowId(sessionKey: string, ts: number): string {
+  return createHash("sha256").update(`${sessionKey}\u0000${ts}`).digest("hex").slice(0, 24);
+}
 
 function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
@@ -266,6 +282,14 @@ function replaceFile(path: string, text: string): void {
   try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
 }
 
+/**
+ * Merge this run's rows from the activity log into backfill.ndjson and write
+ * it back whole (atomically). Only adds: a row already there (same id) is
+ * kept as written, and rows the log no longer has (it rotates) stay. A run
+ * whose input is empty, or under half of what the file holds, is refused
+ * unless `force`: a missing or cut-short log is far likelier than history
+ * that shrank.
+ */
 export function backfillUsage(options: BackfillOptions): BackfillReport {
   const ledgerStartedAt = readLedgerStarted(options.usageDir);
   if (ledgerStartedAt === undefined) {
@@ -286,34 +310,70 @@ export function backfillUsage(options: BackfillOptions): BackfillReport {
       }
     })();
     const rows = rowsFromActivity(lines, options.timeZone);
-    const kept = rows.filter((row) => row.ts < ledgerStartedAt);
+    const fresh = rows.filter((row) => row.ts < ledgerStartedAt);
+
+    // What the file holds, kept line for line.
+    const target = join(options.usageDir, BACKFILL_FILE);
+    let text = "";
+    try { text = readFileSync(target, "utf8"); }
+    catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+    const merged: { id: string; ts: number; line: string; row?: Partial<UsageLedgerRow> }[] = [];
+    const ids = new Set<string>();
+    for (const line of text.split("\n")) {
+      if (!line) continue;
+      let row: Partial<UsageLedgerRow> | undefined;
+      try { row = JSON.parse(line) as Partial<UsageLedgerRow>; } catch { /* kept verbatim */ }
+      const ts = typeof row?.ts === "number" ? row.ts : -Infinity;
+      const id = row?.backfillId ?? (row && typeof row.sessionKey === "string" ? backfillRowId(row.sessionKey, ts) : `line:${merged.length}`);
+      ids.add(id);
+      merged.push({ id, ts, line, row });
+    }
+    const existing = merged.length;
+
+    if (!options.force && (fresh.length === 0 || fresh.length < existing / 2)) {
+      throw new BackfillError(fresh.length === 0
+        ? `The activity log yields no turns before the ledger started (${files.length} file(s) in ${options.logsDir}); nothing written. --force to write anyway.`
+        : `The activity log yields ${fresh.length} turns, under half the ${existing} already backfilled (rotated or cut short?); nothing written. --force to merge anyway (nothing already backfilled is removed).`);
+    }
+
+    let added = 0;
+    for (const row of fresh) {
+      const id = backfillRowId(row.sessionKey, row.ts);
+      if (ids.has(id)) continue;
+      ids.add(id);
+      const withId: UsageLedgerRow = { ...row, backfillId: id };
+      merged.push({ id, ts: row.ts, line: JSON.stringify(withId), row: withId });
+      added++;
+    }
+    merged.sort((a, b) => a.ts - b.ts || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 
     const days = new Set<string>();
     const overcounted = new Set<string>();
     let costUsd = 0;
-    for (const row of kept) {
+    for (const { row } of merged) {
+      if (typeof row?.ts !== "number") continue;
       const date = localParts(row.ts, options.timeZone).date;
       days.add(date);
       if (row.overcounted) overcounted.add(date);
-      costUsd += row.costUsd;
+      costUsd += typeof row.costUsd === "number" ? row.costUsd : 0;
     }
-    const target = join(options.usageDir, BACKFILL_FILE);
-    const replaced = existsSync(target);
-    if (!options.dryRun) replaceFile(target, kept.map((row) => `${JSON.stringify(row)}\n`).join(""));
+    if (!options.dryRun && (added > 0 || !existsSync(target))) replaceFile(target, merged.map((m) => `${m.line}\n`).join(""));
 
     const sorted = [...days].sort();
     return {
       activityFiles: files,
       found: rows.length,
-      afterStart: rows.length - kept.length,
-      written: kept.length,
+      afterStart: rows.length - fresh.length,
+      fromLog: fresh.length,
+      existing,
+      added,
+      total: merged.length,
       days: days.size,
       firstDay: sorted[0] ?? null,
       lastDay: sorted.at(-1) ?? null,
       overcountedDays: overcounted.size,
       costUsd,
       ledgerStartedAt,
-      replaced,
       dryRun: options.dryRun,
     };
   } finally {

@@ -509,7 +509,10 @@ export function App() {
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
               {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
             <div className={cn("markdown", message.role === "user" && "rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5", message.role === "assistant" && "reading")}>
-              <MessageBody body={body} reply={reply} sessionId={selectedId} onQuote={quoted ? () => showMessage(quoted.id) : undefined} /></div>
+              {message.role === "assistant" && body.trim() === "NO_REPLY"
+                // A turn that ended without a reply (silent by choice, or stopped): said plainly, not as the agent's words.
+                ? <p className="m-0 font-sans text-[12.5px] text-muted-foreground">No reply</p>
+                : <MessageBody body={body} reply={reply} sessionId={selectedId} onQuote={quoted ? () => showMessage(quoted.id) : undefined} />}</div>
             {message.role === "user" && interruptedActions(web.requests.find((r) => r.requestId === message.requestId && awaitingOwner(r)))}</article>; })}
           {pendingUsers.map((request) => <article className="message user motion-enter mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">You</span><span>Web</span>
@@ -525,7 +528,7 @@ export function App() {
         </div>
         <JumpToLatest visible={jumper.visible} unseen={jumper.unseen} onJump={jumper.jump} />
         </div>
-        <div className="mx-auto w-full max-w-[740px]"><div className="flex min-h-7 items-start gap-3 pb-2">
+        <div className="mx-auto w-full max-w-[740px]"><div className="flex min-h-7 items-baseline gap-3 pb-2">
           <div className={cn("feedback min-w-0 flex-1 tracking-[0.02em] text-xs leading-normal text-muted-foreground tabular-nums transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0")} role="status" aria-live="polite">{composerStatus({ activity: web.activity[selectedId], note, latest, settled: settle.settled, agent, turn, now })}</div>
           {model && <a href="#study/model" title={`Model: ${model}`} aria-label={`Model: ${model}. Open model settings`} className="shrink-0 rounded-md no-underline opacity-80 transition-opacity hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"><ModelBadge model={model} className="ml-0 h-[18px] px-1.5 text-[10.5px]" /></a>}</div>
           {suggestion && <button type="button" onClick={() => { setDraft(suggestion); input.current?.focus(); }} title="Use this as your message"

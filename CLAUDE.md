@@ -35,6 +35,8 @@ src/
     inbound-markers.ts      # Inbound marker formatters + outlet guard for fabricated ones
     context-nudge.ts        # Pure decision logic for context-usage nudges
     sdk-options.ts          # Builds SDK query options (model, MCP servers, auto-compact policy)
+    sdk-signals.ts          # What the SDK says ABOUT a turn (api_retry, rate_limit_event, refusals, tool_progress,
+                            #   typed assistant error, init model, prompt_suggestion) → `sdk` watch events for the web UI
     audience.ts             # DM-session audience tracking (private DM vs summoned group)
     inbound-batcher.ts      # Coalesces messages that pile up behind an in-flight turn
     proactive-send.ts       # send_message service (direct + delegate modes)
@@ -126,6 +128,8 @@ Use the helpers in `src/sessions/keys.ts` — don't re-parse keys by hand:
 3. `runWithRetry(key, prompt)` — send with auto-retry on session errors (resets and retries once)
 
 SDK session IDs are persisted in the session registry so conversations survive daemon restarts. Every mutator goes through the private `mutateRegistry(op, mode, fn)`, which holds an advisory cross-process lock (`_sessions.json.lock`, `src/file-lock.ts`) for the whole load→mutate→save and forces a fresh read inside it (bypassing the mtime/size stat cache) — the daemon and a short-lived CLI (`tomo sessions clear`, identity migration) write the same file, and publishing a whole-snapshot copy read before the other's write is a lost update no atomic rename can prevent. A lock that cannot be taken follows the same split as an unreadable file: link-changing mutators throw, bookkeeping logs once and skips. A registry that cannot be read is not an empty one: `loadRegistry()` separates ENOENT (legitimately empty) from a read/parse failure, keeps the last known-good state in memory, and refuses to persist until a later load succeeds — so one unreadable instant can no longer be persisted as `{version:1,sessions:[]}`. How it refuses depends on the mutator: bookkeeping (`updateStats`, `touchSession`, `setChatTitle`, `addParticipant`, `setReplyTarget`) skips silently because it runs on the inbound and turn-completion paths where a throw drops a message or fails a good turn; link-changing (`setSdkSessionId`, `clearSdkSessionId`, `retireSdkSessionId`, `migrateSessionKey`) throws `SessionRegistryReadError`. Both guard *before* mutating, so nothing is left applied-but-unsaved.
+
+`LiveSession.stop()` is the owner's Stop (web UI): the SDK's `interrupt()`, a SOFT stop. The CLI ends the turn at its next checkpoint and still yields a `result` (error-shaped), which is settled as a clean end for the request that was running when Stop was pressed: no failure, no error notice, the session and its background tasks stay. It is not `LiveSession.interrupt(err)`, which fails the turn and closes the session (`/rewind`).
 
 With config `steering` (default on), user messages that arrive mid-turn bypass the per-session queue via `session.steer(text)` — they either merge into the in-flight turn or are promoted to their own follow-up turn. Details (STEER_MERGED sentinel, replay detection, idle-wait) live in `src/agent/turn-runner.ts` and `src/agent/live-session.ts`; set `steering: false` or `TOMO_STEERING=false` to keep mid-turn messages queued.
 

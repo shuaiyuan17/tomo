@@ -13,7 +13,7 @@ import { checkAndClearCompactTrigger } from "../lcm/index.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage, UsageBaseline } from "../sessions/types.js";
-import type { UsageLedgerRow } from "../metrics/usage-ledger.js";
+import type { UsageLedgerRow } from "../usage/ledger.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, TurnInterruptedError, type McpAuthRefreshOutcome, type QueryResult, type TurnRequest } from "./live-session.js";
 import { SteerDeclinedError } from "./sdk-result.js";
@@ -117,7 +117,7 @@ export interface LiveSessionManagerDeps {
    */
   getUsageBaseline(key: string): UsageBaseline | undefined;
   updateStats(key: string, result: QueryResult): void;
-  /** Append one SDK result to the usage ledger (`metrics/usage-ledger.ts`). */
+  /** Append one SDK result to the usage ledger (`usage/ledger.ts`). */
   recordUsage?(row: UsageLedgerRow): void;
   /** Transcript messages for pre-resume repair. */
   getSessionMessages(key: string): SessionMessage[];

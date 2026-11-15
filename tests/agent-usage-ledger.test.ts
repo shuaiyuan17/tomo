@@ -16,6 +16,7 @@ import {
   installAgentTestHooks,
   makeMsg,
   mockSdk,
+  waitFor,
 } from "./helpers/agent-harness.js";
 
 installAgentTestHooks();
@@ -45,8 +46,8 @@ describe("usage ledger (agent wiring)", () => {
     mockSdk.responseFn = () => "NO_REPLY";
     await agent.handleCronMessage("rollup nudge", "telegram:12345", { showTyping: false, suppressDelivery: true });
 
+    await waitFor(() => expect(ledgerRows()).toHaveLength(3));
     const rows = ledgerRows();
-    expect(rows).toHaveLength(3);
     expect(rows[0]).toMatchObject({ v: 1, sessionKey: "telegram:12345", source: "owner", trigger: "How much did yesterday cost?" });
     expect(rows[1]).toMatchObject({
       source: "cron", jobId: "job-42", jobName: "Morning digest",
@@ -58,6 +59,7 @@ describe("usage ledger (agent wiring)", () => {
     mockSdk.responseFn = () => "NO_REPLY";
     await agent.handleContinuity("System: Free time.");
     await drainQueue(agent);
+    await waitFor(() => expect(ledgerRows()).toHaveLength(4));
     expect(ledgerRows().at(-1)).toMatchObject({ source: "heartbeat", trigger: "System: Free time." });
 
     for (const r of rows) expect(r).toMatchObject({ costUsd: expect.any(Number), tokens: expect.any(Object) });

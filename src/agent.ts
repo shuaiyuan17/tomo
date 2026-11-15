@@ -50,7 +50,8 @@ import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/bl
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { appendToTomoEventBody, formatTomoEvent } from "./tomo-event.js";
-import { UsageLedger, triggerSnippet, type UsageSource } from "./metrics/usage-ledger.js";
+import { UsageLedger, triggerSnippet, type UsageSource } from "./usage/ledger.js";
+import { usageDataDir } from "./usage/dir.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
@@ -282,7 +283,7 @@ export class Agent {
     this.router.onSummonExpired = (channelName, chatId, identity, notifyGroup) =>
       this.handleSummonExpired(channelName, chatId, identity, notifyGroup);
     this.pauses = new PauseStore(join(config.tomoHome, "data", "pauses.json"));
-    this.usageLedger = new UsageLedger(join(config.tomoHome, "data", "usage"));
+    this.usageLedger = new UsageLedger(usageDataDir(config.tomoHome));
     this.commands = new ChatCommandHandler({
       router: this.router,
       sessions: this.sessions,
@@ -328,7 +329,7 @@ export class Agent {
           ...(result.contextEstimated ? { contextEstimated: true } : {}),
         });
       },
-      recordUsage: (row) => this.usageLedger.append(row),
+      recordUsage: (row) => { void this.usageLedger.append(row); },
       getSessionMessages: (key) => this.sessions.get(key).messages,
       getModelOverride: (key) => this.modelOverrides.get(key),
       createInternalMcpServer: (key) => createTomoInternalMcpServer(this, key),

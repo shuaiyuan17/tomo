@@ -104,7 +104,7 @@ const {
   SdkResultError,
 } = await import("../src/agent/live-session.js");
 const { log } = await import("../src/logger.js");
-type UsageLedgerRow = import("../src/metrics/usage-ledger.js").UsageLedgerRow;
+type UsageLedgerRow = import("../src/usage/ledger.js").UsageLedgerRow;
 type ModelCounters = import("../src/sessions/types.js").ModelCounters;
 const TIMEOUT_MS = 10 * 60 * 1000;
 

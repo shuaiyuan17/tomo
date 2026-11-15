@@ -2,7 +2,7 @@ import type { Channel, IncomingMessage } from "../channels/types.js";
 import type { ReplyTarget } from "../sessions/types.js";
 import type { InboundItem } from "./inbound-batcher.js";
 import type { OwnerNoticeTarget, ShutdownTurnEnd } from "./turn-runner.js";
-import type { UsageSource } from "../metrics/usage-ledger.js";
+import type { UsageSource } from "../usage/ledger.js";
 
 // Request and option shapes passed between the Agent's turn entry points.
 

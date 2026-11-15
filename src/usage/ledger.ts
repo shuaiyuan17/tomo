@@ -1,6 +1,6 @@
-import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { log } from "../logger.js";
+import { appendLineSerial } from "./append.js";
 import type { ModelTurnUsage } from "../agent/sdk-result.js";
 import { parseTomoEvent } from "../tomo-event.js";
 
@@ -12,11 +12,10 @@ import { parseTomoEvent } from "../tomo-event.js";
  *
  * Bookkeeping only: a failed write is a warn, never a failed turn.
  *
- * Writes are SYNCHRONOUS on purpose: each row is one `appendFileSync` (one
- * O_APPEND write of the whole line) finished before `append` returns, so rows
- * from concurrent sessions can neither interleave nor land out of call order.
- * An async `appendFile` per row gives neither guarantee. Values are written
- * as the SDK reported them (deltas unrounded); rounding is for display.
+ * Writes go through `appendLineSerial`: every append to the same month file
+ * runs after the previous one, in call order, so rows from concurrent
+ * sessions land whole and in order. Values are written as the SDK reported
+ * them (deltas unrounded); rounding is for display.
  */
 export const USAGE_LEDGER_VERSION = 1;
 
@@ -114,28 +113,34 @@ export function ledgerFileName(ts: number): string {
 export type UsageRecorder = (row: UsageLedgerRow) => void;
 
 export class UsageLedger {
-  private dirReady = false;
   /** After a failure, warn once until a write succeeds again. */
   private failing = false;
 
+  /** `dir`: the usage data directory (`usageDataDir`). */
   constructor(private readonly dir: string) {}
 
-  /** Never throws. */
-  append(row: UsageLedgerRow): void {
+  /**
+   * Queue one row. Never throws and never rejects: callers fire and forget.
+   * Resolves once the row is written (or the write failed and was logged).
+   */
+  append(row: UsageLedgerRow): Promise<void> {
+    let line: string;
     try {
-      if (!this.dirReady) {
-        mkdirSync(this.dir, { recursive: true });
-        this.dirReady = true;
-      }
-      appendFileSync(join(this.dir, ledgerFileName(row.ts)), `${JSON.stringify(row)}\n`);
-      this.failing = false;
+      line = JSON.stringify(row);
     } catch (err) {
-      // A deleted directory comes back on the next try.
-      this.dirReady = false;
-      if (!this.failing) {
-        this.failing = true;
-        log.warn({ err, dir: this.dir, sessionKey: row.sessionKey }, "Could not write the usage ledger; this turn's usage is not recorded");
-      }
+      this.warn(err, row);
+      return Promise.resolve();
     }
+    return appendLineSerial(join(this.dir, ledgerFileName(row.ts)), () => line, () => { this.failing = false; })
+      .then(() => undefined, (err: unknown) => this.warn(err, row));
+  }
+
+  private warn(err: unknown, row: UsageLedgerRow): void {
+    if (this.failing) return;
+    this.failing = true;
+    log.warn(
+      { err: err instanceof Error ? err.message : String(err), dir: this.dir, sessionKey: row.sessionKey },
+      "Could not write the usage ledger; this turn's usage is not recorded",
+    );
   }
 }

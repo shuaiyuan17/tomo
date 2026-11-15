@@ -19,7 +19,8 @@ export function checkRequest(req: IncomingMessage, port: number, api: boolean, e
     throw new WebError(403, "invalid_host");
   }
   if (req.headers.origin !== undefined && req.headers.origin !== origin) throw new WebError(403, "invalid_origin");
-  if (req.headers["sec-fetch-site"] === "cross-site" || req.headers["sec-fetch-site"] === "same-site") {
+  const site = req.headers["sec-fetch-site"];
+  if ((site === "cross-site" || site === "same-site") && !(!api && isTopLevelNavigation(req))) {
     throw new WebError(403, "cross_origin_request");
   }
   if (api && (req.headers["x-tomo-request"] !== "1" || req.headers["sec-fetch-site"] !== "same-origin")) {
@@ -27,6 +28,20 @@ export function checkRequest(req: IncomingMessage, port: number, api: boolean, e
   }
   if (api && req.method !== "GET" && req.headers.origin !== origin) throw new WebError(403, "origin_required");
   return origin;
+}
+
+/**
+ * A top-level GET of the page itself. It only fetches the static app shell:
+ * every API call it then makes is same-origin and checked on its own, the
+ * shell carries no data, and `frame-ancestors 'none'` stops framing. Phone
+ * browsers re-issue a discarded tab's original navigation, still labelled
+ * cross-site when the page was first opened from another app (a link in
+ * Messages), so refusing it shows a bare error page until a manual reload.
+ */
+function isTopLevelNavigation(req: IncomingMessage): boolean {
+  return (req.method === "GET" || req.method === "HEAD")
+    && req.headers["sec-fetch-mode"] === "navigate"
+    && req.headers["sec-fetch-dest"] === "document";
 }
 
 /** Browser capabilities are process-local, bounded, and never logged. */

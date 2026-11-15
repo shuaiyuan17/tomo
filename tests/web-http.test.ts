@@ -280,6 +280,24 @@ describe("local HTTP boundary", () => {
     expect(response.text).not.toContain("csrfToken");
     expect(response.headers["access-control-allow-origin"]).toBeUndefined();
   });
+  it("serves the page shell to a top-level navigation a phone re-issues as cross-site, and nothing else", async () => {
+    const nav = { "sec-fetch-mode": "navigate", "sec-fetch-dest": "document" };
+    for (const site of ["cross-site", "same-site"]) {
+      // A discarded tab first opened from another app comes back labelled cross-site.
+      const page = await call("/", { headers: { "x-tomo-request": undefined, "sec-fetch-site": site, ...nav } });
+      expect(page.status).toBe(200);
+      expect(page.text).not.toContain("csrfToken");
+      // The same label on anything that is not a top-level document GET is still refused.
+      for (const headers of [{ "sec-fetch-mode": "no-cors", "sec-fetch-dest": "document" }, { "sec-fetch-mode": "navigate", "sec-fetch-dest": "iframe" }, {}]) {
+        const other = await call("/", { headers: { "x-tomo-request": undefined, "sec-fetch-site": site, ...headers } });
+        expect(other.status).toBe(403);
+      }
+      // An API call never gets the exemption, even dressed as a navigation.
+      const api = await call("/api/v1/bootstrap", { headers: { "sec-fetch-site": site, ...nav } });
+      expect(api.status).toBe(403);
+      expect(api.text).not.toContain("csrfToken");
+    }
+  });
   it("requires Origin, JSON, and a matching cookie-bound CSRF token before mutation", async () => {
     for (const headers of [{ origin: undefined }, { cookie: undefined }, { "x-tomo-csrf": "wrong" },
       { "x-tomo-csrf": "é".repeat(43) }, { "content-type": "text/plain" }]) {

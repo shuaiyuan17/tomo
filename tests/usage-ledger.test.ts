@@ -142,6 +142,23 @@ describe("UsageLedger.lastSnapshot — the ledger is where a resume finds its ba
     expect(new UsageLedger(dir).lastSnapshot("dm:owner", "sid-1")).toEqual(snap(1));
   });
 
+  it("a torn tail gets its own line before the next append: the new row reads back after a restart, the torn one never counts", async () => {
+    const first = new UsageLedger(dir);
+    await first.append(row(ts, { sdkSessionId: "sid-1", costUsd: 1, snapshot: snap(1) }));
+    const file = join(dir, ledgerFileName(ts));
+    // The daemon died mid-append: half a row, no newline.
+    writeFileSync(file, `${readFileSync(file, "utf8")}{"v":1,"ts":${ts},"sessionKey":"dm:owner","sdkSessionId":"sid-1","costUsd":0.5,"snap`);
+
+    // A restarted daemon appends the next row.
+    await new UsageLedger(dir).append(row(ts, { sdkSessionId: "sid-1", costUsd: 0.5, snapshot: snap(1.5) }));
+
+    const lines = readFileSync(file, "utf8").split("\n").filter(Boolean);
+    expect(lines).toHaveLength(3);
+    const parsed = lines.flatMap((l) => { try { return [JSON.parse(l) as UsageLedgerRow]; } catch { return []; } });
+    expect(parsed.map((r) => r.costUsd)).toEqual([1, 0.5]);
+    expect(new UsageLedger(dir).lastSnapshot("dm:owner", "sid-1")).toEqual(snap(1.5));
+  });
+
   it("a row whose counters cannot be trusted says so (null), rather than falling back further", async () => {
     const writer = new UsageLedger(dir);
     await writer.append(row(ts, { sdkSessionId: "sid-1", snapshot: snap(1) }));

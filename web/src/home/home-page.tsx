@@ -134,7 +134,7 @@ export function HomePage({ events, bootstrap, refresh, inert }: {
           label={`${agent}'s home, ${home.scene.name ?? "a small room"}. ${caption}.`} handle={handle} onFailure={setFailure} onReady={() => setDrawn(true)} />
         : <p className="sr-only" role="status">Opening the room…</p>}
     </div>
-    <div className="mx-auto w-full max-w-[740px] pt-3 max-[600px]:px-4">
+    <div className="w-full px-1 pt-3 max-[600px]:px-4">
       <p className="m-0 flex items-baseline gap-2 text-[13px] leading-relaxed text-muted-foreground" role="status" aria-live="polite">
         <i aria-hidden="true" className={cn("relative top-[-1px] size-1.5 shrink-0 rounded-full border border-muted-foreground", working && "border-primary bg-primary", status?.trouble && "border-warn bg-warn")} />
         <span className="min-w-0 flex-1" data-testid="home-caption">{caption}</span>

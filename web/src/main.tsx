@@ -251,8 +251,8 @@ export function App() {
   }, [theme, systemDark]);
   // The tab says where you are: a Study page or a group being read.
   useEffect(() => {
-    document.title = study ? `${STUDY_LABELS[study]} · The Study · Tomo` : session?.kind === "group" ? `${session.title} · Tomo` : "Tomo";
-  }, [study, session?.kind, session?.title]);
+    document.title = study ? `${STUDY_LABELS[study]} · The Study · Tomo` : home ? "Home · Tomo" : session?.kind === "group" ? `${session.title} · Tomo` : "Tomo";
+  }, [study, home, session?.kind, session?.title]);
 
   useEffect(() => {
     if (!selectedId) return;
@@ -450,8 +450,8 @@ export function App() {
       <a className="flex shrink-0 items-center gap-2 font-serif text-[30px] tracking-[-1.5px] text-foreground no-underline max-[600px]:gap-1.5 max-[600px]:text-[22px] max-[600px]:tracking-[-1px]" href="/" aria-label="Tomo home">
         <Mark className="size-9 max-[600px]:size-7" /><span>tomo<span className="text-primary">.</span></span></a>
       <span className="border-l pl-8 text-sm text-muted-foreground max-[800px]:hidden">{study ? "The Study" : home ? "Home" : "Conversation"}</span>
-      {/* Phones have no sidebar on screen: a group being read is named here. */}
-      {!study && !home && session?.kind === "group" && <span className="hidden min-w-0 truncate border-l pl-3 text-[13px] text-muted-foreground max-[600px]:block" title={session.title}>{session.title}</span>}
+      {/* Phones have no sidebar on screen: Home, or a group being read, is named here. */}
+      {(home || (!study && session?.kind === "group")) && <span className="hidden min-w-0 truncate border-l pl-3 text-[13px] text-muted-foreground max-[600px]:block" title={home ? undefined : session?.title}>{home ? "Home" : session?.title}</span>}
       <div className="ml-auto flex items-center gap-4 max-[600px]:gap-0.5">
         <Button ref={tasksButton} variant="ghost" size="icon" aria-pressed={tasksOpen} aria-controls="tasks-rail" title="Tasks"
           aria-label={`Tasks${running ? `, ${running} running` : ""}`} onClick={() => { setMenuOpen(false); setTasksOpen((open) => !open); }}

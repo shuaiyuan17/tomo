@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
-import { api, ApiError, dismissRequest, sendMessage, stopTurn } from "./api.js";
+import { api, ApiError, dismissRequest, sendMessage, stopTurn, taskAction } from "./api.js";
 import { useWeb } from "./use-web.js";
 import { createCompositionGuard } from "./compose-keys.js";
 import { Text } from "./markdown.js";
@@ -209,6 +209,11 @@ export function App() {
   const railMotion = useMountedFor(tasksOpen);
   const tasksModal = tasksOpen && overlay && railMotion.mounted;
   const closeTasks = () => { setTasksOpen(false); tasksButton.current?.focus(); };
+  // Stop / move to background for an opened task of the owner conversation (same gate as a message).
+  const taskControl = { ownerId: web.bootstrap?.ownerId ?? undefined, act: async (task: { sessionId: string; taskId: string }, action: "stop" | "background") => {
+    if (!web.bootstrap) return false;
+    return (await taskAction(task.sessionId, task.taskId, action, web.bootstrap, web.refreshBootstrap)).done;
+  } };
   // Phone width: the sidebar (navigation, conversation picker, context,
   // plan usage, theme) is a drawer behind a button at the top left, so the
   // chat has the whole screen. It is a modal layer like the Tasks overlay;
@@ -654,7 +659,7 @@ export function App() {
       {railMotion.mounted && <aside ref={rail} id="tasks-rail" aria-label="Tasks" data-state={railMotion.shown ? "open" : "closed"} {...(modal ? { role: "dialog", "aria-modal": true } : {})}
         style={railSize.width !== null ? { width: railSize.width } : undefined}
         className="group/rail relative flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 max-[1024px]:fixed max-[1024px]:top-[72px] max-[1024px]:right-0 max-[1024px]:bottom-0 max-[1024px]:z-30 max-[1024px]:w-[min(340px,88vw)] max-[1024px]:bg-background max-[1024px]:pt-3 max-[1024px]:pl-2.5 max-[1024px]:shadow-2xl max-[1024px]:transition-transform max-[1024px]:duration-[220ms] max-[1024px]:data-[state=closed]:translate-x-full max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:pb-[max(1.5rem,env(safe-area-inset-bottom))]">
-        <div className="flex min-h-0 min-w-[246px] flex-1 flex-col transition-[opacity,transform] duration-[220ms] min-[1025px]:group-data-[state=closed]/rail:translate-x-4 min-[1025px]:group-data-[state=closed]/rail:opacity-0"><TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks}
+        <div className="flex min-h-0 min-w-[246px] flex-1 flex-col transition-[opacity,transform] duration-[220ms] min-[1025px]:group-data-[state=closed]/rail:translate-x-4 min-[1025px]:group-data-[state=closed]/rail:opacity-0"><TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks} control={taskControl}
           footer={<ScheduledSection revision={web.cronRevision} onNavigate={() => { if (overlay) setTasksOpen(false); }} />} /></div>
         {railSize.separator && <div {...railSize.separator}
           className="group/handle absolute inset-y-0 left-0 z-10 w-2 cursor-col-resize touch-none outline-none">

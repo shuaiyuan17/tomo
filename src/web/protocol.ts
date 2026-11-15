@@ -51,6 +51,11 @@ export interface WebTask {
   description: string;
   parentTaskId?: string;
   ambient: boolean;
+  /**
+   * Set while the task is in the SDK's background set: it runs on after Tomo has replied.
+   * Absent for a foreground one (a blocking tool call the turn is waiting on).
+   */
+  background?: true;
   /** Daemon clock, ms epoch. */
   startedAt: number;
   endedAt?: number;
@@ -277,6 +282,9 @@ export class WebError extends Error {
   constructor(readonly status: number, readonly code: string) { super(code); }
 }
 
+/** What the owner can do to a running task from the task view. */
+export const TASK_ACTIONS = ["stop", "background"] as const;
+export type TaskAction = (typeof TASK_ACTIONS)[number];
 /** This is a closed RPC protocol, never a generic method/file/command proxy. */
 export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("message"), epoch: z.uuid(), input: messageInputSchema }).strict(),
@@ -297,6 +305,9 @@ export const rpcSchema = z.discriminatedUnion("method", [
   /** A task the browser was shown, by its browser session: where to read it. */
   z.object({ method: z.literal("task"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     taskId: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/), output: z.boolean(), command: z.boolean().optional() }).strict(),
+  /** Stop a running task of the owner conversation, or move a foreground one to the background. */
+  z.object({ method: z.literal("task-action"), epoch: z.uuid(), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    taskId: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/), action: z.enum(TASK_ACTIONS) }).strict(),
   /** The model of a browser session (the Study's Model page). */
   z.object({ method: z.literal("model"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict(),
   /** Switch the owner conversation's model; `from` is the model the owner reviewed. */
@@ -314,6 +325,8 @@ export interface WebSync { snapshot: WebSnapshot; replay: EventEnvelope[] | null
 export interface WebTaskAccess { sessionKey: string; taskType: string; output?: TaskOutput;
   /** A shell task's full command, redacted and capped (see redact-command.ts). */
   command?: { text: string; truncated: boolean } }
+/** Answer to a task action: whether the SDK took it (false: the task had already ended, or it refused). */
+export interface WebTaskActionResult { done: boolean }
 /** Answer to a stop request: whether a turn was running to stop. */
 export interface WebStopResult { stopped: boolean }
 /** Answer to a compact request: queued, or one is already outstanding. */

@@ -10,7 +10,7 @@ import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
 import { cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
-  type EventEnvelope, type Rpc, type WebCompaction, type WebHome, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
+  type EventEnvelope, type Rpc, type TaskAction, type WebCompaction, type WebHome, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
 import { homeSceneSchema } from "../home/scene.js";
 import { decodeSnapshotPng } from "../home/snapshot.js";
 
@@ -42,6 +42,8 @@ export interface HttpDependencies {
 
 /** Idle socket timeout; every RPC deadline (e.g. USAGE_RPC_TIMEOUT_MS) stays under it. */
 export const SOCKET_TIMEOUT_MS = 30_000;
+
+const TASK_ACTION_PATH = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/tasks\/([A-Za-z0-9_-]{1,64})\/(stop|background)$/;
 
 export async function startWebHttp(port: number, deps: HttpDependencies) {
   const csrf = new CsrfTokens(deps.now);
@@ -287,6 +289,18 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         const epoch = req.headers["x-tomo-epoch"];
         if (typeof epoch !== "string" || !/^[a-f0-9-]{36}$/.test(epoch)) throw new WebError(409, "epoch_required");
         json(res, 200, await deps.rpc({ method: "stop", epoch }));
+        return;
+      } else if (req.method === "POST" && TASK_ACTION_PATH.test(url.pathname)) {
+        // Stop one running task of the owner conversation, or move it to the background. Same gate as a message.
+        csrf.verify(req, session!);
+        await body(req);
+        const [, sessionId, taskId, action] = TASK_ACTION_PATH.exec(url.pathname)!;
+        const { ownerId } = deps.data.catalog();
+        if (!ownerId) throw new WebError(409, "owner_setup_required");
+        if (sessionId !== ownerId) throw new WebError(403, "owner_dm_only");
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || !/^[a-f0-9-]{36}$/.test(epoch)) throw new WebError(409, "epoch_required");
+        json(res, 200, await deps.rpc({ method: "task-action", epoch, sessionId, taskId, action: action as TaskAction }));
         return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/uploads") {
         // An image for the owner's next message: the same gate as sending one

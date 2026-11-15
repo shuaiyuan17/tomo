@@ -254,6 +254,9 @@ export function sdkOptions(
     // riding the turn's prompt cache). Only the web composer offers it, so
     // only the owner's DM session asks for it, and only with the web UI on.
     ...(sessionContext && isDmSessionKey(sessionContext.sessionKey) && config.web?.enabled ? { promptSuggestions: true } : {}),
+    // The web task view can stop one task, so the owner's Stop (interrupt) ends only the turn and
+    // spares background agents. Without this declaration the CLI kills them on every interrupt.
+    ...(sessionContext && isDmSessionKey(sessionContext.sessionKey) && config.web?.enabled ? { perTaskStopAffordance: true } : {}),
     ...(thinking ? { thinking } : {}),
     maxTurns: config.maxTurns,
     ...buildHooksOption({

@@ -56,7 +56,9 @@ export interface WebTask {
 /** One entry of a subagent's transcript, as the read-only task view shows it. */
 export type SubagentItem =
   | { kind: "text"; id: string; text: string; truncated: boolean; ts?: number }
-  | { kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean; ts?: number }
+  | { kind: "tool"; id: string; toolUseId: string; name: string; summary: string; input: string; inputTruncated: boolean; ts?: number;
+    /** Server-side only (session-tools.ts): the call reached memory/private, so its output is withheld. Never sent. */
+    privateOutput?: boolean }
   | { kind: "result"; id: string; toolUseId: string; output: string; truncated: boolean; isError: boolean }
   /** A message sent to the subagent while it ran (not its first prompt, which is the brief). */
   | { kind: "message"; id: string; text: string; truncated: boolean; ts?: number };
@@ -64,6 +66,12 @@ export type SubagentItem =
 export interface SubagentBrief { text: string; truncated: boolean }
 /** A byte window of complete transcript lines: page back with `before=start`, tail with `after=end`. */
 export interface SubagentPage { items: SubagentItem[]; start: number; end: number; size: number; hasEarlier: boolean }
+/**
+ * The tool calls of a conversation's current SDK transcript, for the chat to
+ * show inline. `end`: read on with `after=end&transcript=…`; `complete`: the
+ * scan reached the requested time (or the transcript's start).
+ */
+export interface SessionTools { items: SubagentItem[]; end: number; transcript: string; complete: boolean }
 /** The end of a shell/Monitor task's output (SDK `get_task_output`: at most the last 8 KiB). */
 export interface TaskOutput { output: string; size: number }
 /** One subscription usage window for the Plan usage card. */

@@ -58,9 +58,21 @@ function resultText(content: unknown): string {
 }
 
 /** Turn one transcript line into view items. Unknown shapes yield nothing. */
-export function itemsFromLine(line: string, offset: number): SubagentItem[] {
-  let record: { type?: string; message?: { content?: unknown }; timestamp?: string };
+export function itemsFromLine(line: string, offset: number, redact?: ToolRedaction): SubagentItem[] {
+  let record: { type?: string; message?: { content?: unknown }; timestamp?: string; attachment?: { type?: unknown; prompt?: unknown } };
   try { record = JSON.parse(line); } catch { return []; }
+  // A message sent while the subagent was busy is first written as a
+  // `queued_command` attachment; the SDK later folds it into the next API
+  // request (an `api-request-blob` entry, the API's own copy — never shown,
+  // so it is not shown twice).
+  if (record?.type === "attachment") {
+    const attachment = record.attachment;
+    if (attachment?.type !== "queued_command" || typeof attachment.prompt !== "string" || !attachment.prompt.trim()) return [];
+    const { text, truncated } = clip(attachment.prompt, TEXT_LIMIT);
+    const ts = typeof record.timestamp === "string" ? Date.parse(record.timestamp) || undefined : undefined;
+    return [{ kind: "message", id: `${offset}:queued`, text, truncated, ...(ts ? { ts } : {}) }];
+  }
+  if (record?.type !== "user" && record?.type !== "assistant") return [];
   const content = record?.message?.content;
   // A user entry with text is a message to the subagent. The very first entry
   // is its brief (served separately), so it is never repeated here.
@@ -70,11 +82,19 @@ export function itemsFromLine(line: string, offset: number): SubagentItem[] {
       const { text, truncated } = clip(said, TEXT_LIMIT);
       const ts = typeof record.timestamp === "string" ? Date.parse(record.timestamp) || undefined : undefined;
       return [{ kind: "message", id: `${offset}:msg`, text, truncated, ...(ts ? { ts } : {}) },
-        ...(Array.isArray(content) ? itemsFromBlocks(record, content, offset) : [])];
+        ...(Array.isArray(content) ? itemsFromBlocks(record, content, offset, redact) : [])];
     }
   }
   if (!Array.isArray(content)) return [];
-  return itemsFromBlocks(record, content, offset);
+  return itemsFromBlocks(record, content, offset, redact);
+}
+
+/** Optional server-side masking of tool inputs and outputs (the main chat applies #492's redaction). */
+export interface ToolRedaction {
+  input: (input: Record<string, unknown>) => Record<string, unknown>;
+  output: (text: string) => string;
+  /** Asked with the RAW input: does this call reach memory/private? Its tool item is then marked `privateOutput`. */
+  reachesPrivate?: (name: string, input: Record<string, unknown>) => boolean;
 }
 
 /** The text a user entry carries: a string, or its text blocks (tool results are not text). */
@@ -87,7 +107,7 @@ function userText(content: unknown): string {
     .map((b) => b.text).filter((t) => !t.trimStart().startsWith("<system-reminder>")).join("\n\n");
 }
 
-function itemsFromBlocks(record: { type?: string; timestamp?: string }, content: unknown[], offset: number): SubagentItem[] {
+function itemsFromBlocks(record: { type?: string; timestamp?: string }, content: unknown[], offset: number, redact?: ToolRedaction): SubagentItem[] {
   const ts = typeof record.timestamp === "string" ? Date.parse(record.timestamp) || undefined : undefined;
   const items: SubagentItem[] = [];
   // One entry is always returned whole (pages never split a line); an entry
@@ -101,21 +121,22 @@ function itemsFromBlocks(record: { type?: string; timestamp?: string }, content:
       const { text, truncated } = clip(b.text, TEXT_LIMIT);
       items.push({ kind: "text", id, text, truncated, ...(ts ? { ts } : {}) });
     } else if (record.type === "assistant" && b.type === "tool_use" && typeof b.name === "string") {
-      const input = (b.input && typeof b.input === "object" ? b.input : {}) as Record<string, unknown>;
+      const raw = (b.input && typeof b.input === "object" ? b.input : {}) as Record<string, unknown>;
+      const input = redact ? redact.input(raw) : raw;
       const inputText = clip(JSON.stringify(input, null, 2), IO_LIMIT);
       items.push({ kind: "tool", id, toolUseId: typeof b.id === "string" ? b.id : id, name: b.name.slice(0, 128),
         summary: clip(summarizeToolInput(b.name, input), 200).text, input: inputText.text, inputTruncated: inputText.truncated,
-        ...(ts ? { ts } : {}) });
+        ...(ts ? { ts } : {}), ...(redact?.reachesPrivate?.(b.name, raw) ? { privateOutput: true } : {}) });
     } else if (record.type === "user" && b.type === "tool_result" && typeof b.tool_use_id === "string") {
       const { text, truncated } = clip(resultText(b.content), IO_LIMIT);
-      items.push({ kind: "result", id, toolUseId: b.tool_use_id, output: text, truncated, isError: b.is_error === true });
+      items.push({ kind: "result", id, toolUseId: b.tool_use_id, output: redact ? redact.output(text) : text, truncated, isError: b.is_error === true });
     }
   });
   if (hidden) items.push({ kind: "text", id: `${offset}:more`, text: `… ${hidden} more entries in this step are not shown.`, truncated: true });
   return items;
 }
 
-async function readRange(fd: FileHandle, start: number, end: number): Promise<Buffer> {
+export async function readRange(fd: FileHandle, start: number, end: number): Promise<Buffer> {
   const buffer = Buffer.alloc(Math.max(0, end - start));
   let read = 0;
   while (read < buffer.length) {
@@ -131,7 +152,7 @@ async function readRange(fd: FileHandle, start: number, end: number): Promise<Bu
  * until it holds at least one whole line, so one huge entry cannot stall
  * paging. The end is always cut back to the last newline.
  */
-async function window(fd: FileHandle, size: number, start: number, end: number, direction: "back" | "forward"):
+export async function readWindow(fd: FileHandle, size: number, start: number, end: number, direction: "back" | "forward"):
   Promise<{ start: number; end: number; lines: { offset: number; bytes: number; text: string }[] }> {
   let lo = start, hi = end;
   for (;;) {
@@ -188,8 +209,8 @@ export async function readSubagentPage(sdkSessionsDir: string, sdkSessionId: str
     // A cursor past the end means the file was replaced: start over.
     if ((cursor.after ?? 0) > size || (cursor.before ?? 0) > size) throw new SubagentReadError("transcript_reset");
     const page = cursor.after !== undefined
-      ? await window(fd, size, cursor.after, Math.min(size, cursor.after + PAGE_BYTES), "forward")
-      : await window(fd, size, Math.max(0, (cursor.before ?? size) - PAGE_BYTES), cursor.before ?? size, "back");
+      ? await readWindow(fd, size, cursor.after, Math.min(size, cursor.after + PAGE_BYTES), "forward")
+      : await readWindow(fd, size, Math.max(0, (cursor.before ?? size) - PAGE_BYTES), cursor.before ?? size, "back");
     // Whole lines only, stopping once a page holds MAX_PAGE_ITEMS: forward
     // pages keep their oldest lines, backward pages their newest. The cursor
     // moves to the edge of the last line kept, so nothing is skipped.

@@ -12,7 +12,7 @@ import { CompactButton } from "./compact-button.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
-import { ArrowUp, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
+import { ArrowDown, ArrowUp, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, Sun, SunMoon } from "lucide-react";
 import { Study } from "./study.js";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { ScreenWindow } from "./screen.js";
@@ -29,6 +29,10 @@ import "./styles.css";
 import { composerStatus, requestLabels, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
 import { useRailWidth } from "./rail-width.js";
 import { AgentNameContext, agentNameOf } from "./agent-name.js";
+import { blockKey, interleave, jumpLabel, messageKey, pendingKey, type ToolBlock } from "./inline-tools.js";
+import { useSessionTools } from "./use-session-tools.js";
+import { useJumpToLatest } from "./use-jump-to-latest.js";
+import { ToolCall, ToolGroup } from "./tool-calls.js";
 
 type Theme = "system" | "light" | "dark";
 /** 503s that mean "not accepted, and why" — the draft stays, nothing ran. */
@@ -88,6 +92,17 @@ function useStudyRoute(): [StudyPage | null, (page: StudyPage | null) => void, s
     return () => window.removeEventListener("hashchange", update);
   }, []);
   return [page, (next) => { window.location.hash = next ? `study/${next}` : ""; if (!next) history.replaceState(null, "", window.location.pathname + window.location.search); setPage(next); setFocus(null); }, focus];
+}
+
+/** Floats above the composer when the reader is up in the history; fades out at the bottom. */
+function JumpToLatest({ visible, unseen, onJump }: { visible: boolean; unseen: number; onJump: () => void }) {
+  const motion = useMountedFor(visible, 180);
+  if (!motion.mounted) return null;
+  const label = jumpLabel(unseen);
+  return <button type="button" onClick={onJump} data-state={motion.shown ? "open" : "closed"} tabIndex={visible ? 0 : -1}
+    aria-label={label ? `${label}, jump to latest` : "Jump to latest"}
+    className="absolute bottom-3 left-1/2 z-10 flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border bg-card px-3 text-[12px] text-foreground shadow-md transition-[opacity,transform] duration-[180ms] ease-[var(--ease-soft)] hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none data-[state=closed]:pointer-events-none data-[state=closed]:translate-y-1 data-[state=closed]:opacity-0">
+    {label && <span aria-hidden="true">{label}</span>}<ArrowDown className="size-3.5" strokeWidth={2} aria-hidden="true" /></button>;
 }
 
 export function App() {
@@ -202,12 +217,6 @@ export function App() {
     return () => controller.abort();
   }, [selectedId, web.revision, reload]);
 
-  useLayoutEffect(() => {
-    const element = scroll.current;
-    if (!element) return;
-    if (restoreScroll.current !== null) { element.scrollTop = element.scrollHeight - restoreScroll.current; restoreScroll.current = null; }
-    else if (atBottom.current) element.scrollTop = element.scrollHeight;
-  }, [history, web.blocks, web.requests]);
 
   useEffect(() => {
     web.discardRecordedBlocks(recordedReplyIds(history));
@@ -309,6 +318,21 @@ export function App() {
   const pendingUsers = pendingUserMessages(web.requests, history, selectedId);
   const latest = web.requests.filter((r) => r.sessionId === selectedId).at(-1);
   const settle = useCompletedSettle(latest);
+  // Tool calls, inline: read from the session's transcript back to the oldest
+  // loaded message (everything, once the whole history is loaded).
+  const toolsSince = historyStatus === "ready" || historyStatus === "loading-older"
+    ? (history.nextCursor ? history.messages[0]?.timestamp ?? 0 : 0) : null;
+  const turnActive = latest?.state === "running" || latest?.state === "queued" || !!web.activity[selectedId];
+  const tools = useSessionTools(selectedId, toolsSince, (web.toolTicks[selectedId] ?? 0) * 1_000_003 + web.revision, turnActive);
+  const timeline = interleave(history.messages, tools.items, history.nextCursor ? toolsSince ?? 0 : 0);
+  const messageIndex = new Map(history.messages.map((m, i) => [m.id, i]));
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
+  const toolBlock = (block: ToolBlock, running: boolean) => <div key={block.key} className="mx-auto mb-4 max-w-[740px]">
+    {block.kind === "tool" ? <ToolCall row={block.row} running={running} />
+      : <ToolGroup tools={block.tools} running={running} open={openGroups[block.key] ?? false}
+        onOpenChange={(value) => setOpenGroups((old) => ({ ...old, [block.key]: value }))} />}</div>;
+  const jumper = useJumpToLatest(scroll, atBottom,
+    [...history.messages.map(messageKey), ...pendingUsers.map(pendingKey), ...blocks.map(blockKey)], selectedId, restoreScroll);
   useEffect(() => { stamp.current = requestStamp(latest); });
   const usage = session?.stats;
   const hasContext = !!usage?.contextMax;
@@ -400,12 +424,16 @@ export function App() {
       <main id="conversation" hidden={!!study} className="mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-3" tabIndex={-1} inert={modal}>
         {web.bootstrap?.setupRequired && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}
         {web.connection === "locked" && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Open the access link in Tomo's private <code>web-access.log</code> to connect. The link includes your private access token.</div>}
-        <div className="min-h-0 w-full flex-1 overflow-y-auto pt-2 pr-4 pb-6 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] max-[600px]:pr-2" ref={scroll} aria-label="Conversation history" tabIndex={0} onScroll={() => { const e = scroll.current!; atBottom.current = e.scrollHeight - e.scrollTop - e.clientHeight < 80; }}>
+        <div className="relative flex min-h-0 w-full flex-1 flex-col">
+        <div className="min-h-0 w-full flex-1 overflow-y-auto pt-2 pr-4 pb-6 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] max-[600px]:pr-2" ref={scroll} aria-label="Conversation history" tabIndex={0} onScroll={jumper.onScroll}>
           {history.nextCursor && <Button variant="outline" size="sm" className="mx-auto mb-6 flex rounded-full text-xs" onClick={() => void older()} disabled={historyStatus === "loading-older"}>{historyStatus === "loading-older" ? "Loading…" : "Load earlier messages"}</Button>}
+          {!tools.complete && <p className="mx-auto mb-4 max-w-[740px] text-center text-[11.5px] text-muted-foreground" role="note">Older tool calls not shown</p>}
           {historyStatus === "error" && <div className={cn(notice, "mx-auto mb-4 flex max-w-[740px] items-center gap-3")} role="alert">History is unavailable. <Button variant="outline" size="sm" className="rounded-lg" onClick={() => setReload((r) => r + 1)}>Try again</Button></div>}
           {historyStatus === "loading" && selectedId && <p className="text-center text-sm text-muted-foreground" role="status">Opening your conversation…</p>}
           {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && pendingUsers.length === 0 && <div className="m-auto flex h-full min-h-56 max-w-md flex-col items-center justify-center pb-12 text-center"><Mark className="mb-4 size-16 stroke-[1.3]" /><h2 className="mt-2 mb-3 font-serif text-[28px] font-normal">Start wherever you are.</h2><p className="m-0 max-w-80 text-sm text-muted-foreground">{session?.kind === "group" ? "There are no recorded messages in this group yet." : "A question, a half-formed idea, or something on your mind."}</p></div>}
-          {history.messages.map((message, index) => { const { reply, body } = parseReply(message.content); const quoted = reply && findQuoted(history.messages, index, reply);
+          {timeline.entries.map((entry) => { if (entry.kind === "tools") return toolBlock(entry.block, false);
+            const message = entry.message; const index = messageIndex.get(message.id)!;
+            const { reply, body } = parseReply(message.content); const quoted = reply && findQuoted(history.messages, index, reply);
             return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
               {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
@@ -417,7 +445,10 @@ export function App() {
               <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{pendingLabel(request)}</Badge></div>
             <div className="markdown rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80"><Text breaks>{request.text!}</Text></div>
             {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)}
+          {timeline.trailing.map((block, i) => toolBlock(block, turnActive && i === timeline.trailing.length - 1))}
           {blocks.map((block) => <article className="message assistant motion-enter mx-auto mb-7 max-w-[740px]" key={block.id}><div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{agent}</span><span>Reply in progress</span></div><div className="markdown reading"><MessageBody body={[block.text, ...(block.images ?? []).map((id) => `MEDIA:web:${id}`)].filter(Boolean).join("\n")} sessionId={selectedId} /></div></article>)}
+        </div>
+        <JumpToLatest visible={jumper.visible} unseen={jumper.unseen} onJump={jumper.jump} />
         </div>
         <div className="mx-auto w-full max-w-[740px]"><div className={cn("feedback min-h-7 pb-2 tracking-[0.02em] text-xs leading-normal text-muted-foreground transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0")} role="status" aria-live="polite">{composerStatus({ activity: web.activity[selectedId], note, latest, settled: settle.settled, agent })}</div>
           {resending && <div className="mb-2 flex items-center gap-2 tracking-[0.02em] text-[11px] text-muted-foreground">

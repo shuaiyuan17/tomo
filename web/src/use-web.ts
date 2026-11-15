@@ -11,6 +11,8 @@ export function useWeb() {
   const [blocks, setBlocks] = useState<WebSnapshot["blocks"]>([]);
   const [requests, setRequests] = useState<WebRequest[]>([]);
   const [activity, setActivity] = useState<Record<string, string>>({});
+  /** Bumped per session on every tool event: the chat re-reads its inline tool calls. */
+  const [toolTicks, setToolTicks] = useState<Record<string, number>>({});
   const [tasks, setTasks] = useState<WebTask[]>([]);
   const [compact, setCompact] = useState<WebCompactState>();
   const [revision, setRevision] = useState(0);
@@ -66,8 +68,9 @@ export function useWeb() {
       }
       if (event.type === "invalidate") refresh();
       if (event.type === "cron") setCronRevision((value) => value + 1);
-      if (event.type === "tool") setActivity((old) => ({ ...old,
-        [event.sessionId]: `${event.tool} · ${event.state}` }));
+      // Tool calls show inline in the chat (the running one in its group's
+      // summary), not as a separate line above the composer.
+      if (event.type === "tool") setToolTicks((old) => ({ ...old, [event.sessionId]: (old[event.sessionId] ?? 0) + 1 }));
       if (event.type === "compact") setCompact(event.request);
       if (event.type === "tasks") setTasks((old) => replaceSessionTasks(old, event.sessionId, event.tasks));
       if (event.type === "typing") setActivity((old) => ({ ...old, [event.sessionId]: event.active ? TYPING_ACTIVITY : "" }));
@@ -93,5 +96,5 @@ export function useWeb() {
     void connect();
     return () => { controller.abort(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
-  return { bootstrap, connection, blocks, requests, activity, tasks, compact, revision, cronRevision, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
+  return { bootstrap, connection, blocks, requests, activity, toolTicks, tasks, compact, revision, cronRevision, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
 }

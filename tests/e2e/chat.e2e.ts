@@ -322,6 +322,8 @@ it("opens a task to read its subagent transcript, expands a tool call, and goes 
     line("user", [{ type: "tool_result", tool_use_id: "t1", content: "## 0.12.0 entries" }]) +
     line("assistant", [{ type: "tool_use", id: "t2", name: "Grep", input: { pattern: "owner" } }]) +
     line("user", [{ type: "tool_result", tool_use_id: "t2", content: "src/web/data.ts:24" }]) +
+    JSON.stringify({ type: "attachment", attachment: { type: "queued_command", prompt: "Also check the README.", origin: { kind: "coordinator" }, isMeta: true } }) + "\n" +
+    JSON.stringify({ type: "api-request-blob", message: { role: "user", content: [{ type: "text", text: "Also check the README." }] } }) + "\n" +
     line("assistant", [{ type: "text", text: "Both look fine." }]));
   watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
     { taskId: "a1", taskType: "local_agent", subagentType: "Explore", description: "Review the release", ambient: false, background: true, startedAt: Date.now() },
@@ -335,6 +337,9 @@ it("opens a task to read its subagent transcript, expands a tool call, and goes 
   await browserExpect(transcript).not.toContainText("the hidden prompt");
   // Consecutive calls fold into one group; the narration around them stays visible.
   await browserExpect(transcript).toContainText("Both look fine.");
+  // A message sent while it was busy (queued_command) shows once, as a message.
+  await browserExpect(transcript.getByText("Also check the README.")).toHaveCount(1);
+  await browserExpect(transcript).toContainText("Message from Tomo");
   await browserExpect(transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ })).toHaveCount(0);
   await transcript.getByRole("button", { name: /2 tool calls · Read, Grep/ }).click();
   await transcript.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ }).click();
@@ -499,4 +504,69 @@ it("calls the agent by its IDENTITY.md name (re-read on edit); the product keeps
   await browserExpect(page.getByRole("textbox", { name: "Message 小爪" })).toBeVisible();
   const { rmSync } = await import("node:fs");
   rmSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), { force: true });
+});
+
+it("shows a turn's tool calls inline, folded, between the messages; INPUT/OUTPUT open on demand", async () => {
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  store.setSdkSessionId("dm:owner", "sdk-inline");
+  const t = Date.now() - 60_000;
+  store.append("dm:owner", { role: "user", channel: "web", content: "Check the changelog please.", timestamp: t });
+  store.append("dm:owner", { role: "assistant", channel: "web", content: "The changelog is fine.", timestamp: t + 5_000 });
+  const line = (type: string, ms: number, content: unknown[]) => JSON.stringify({ type, isSidechain: false, timestamp: new Date(ms).toISOString(), message: { role: type, content } }) + "\n";
+  mkdirSync(mockConfig.sdkSessionsDir, { recursive: true });
+  writeFileSync(resolve(mockConfig.sdkSessionsDir, "sdk-inline.jsonl"),
+    line("user", t + 100, [{ type: "text", text: "Check the changelog please." }]) +
+    line("assistant", t + 1_000, [{ type: "tool_use", id: "c1", name: "Read", input: { file_path: "/repo/CHANGELOG.md" } }]) +
+    line("user", t + 1_100, [{ type: "tool_result", tool_use_id: "c1", content: "## 0.12.0 entries" }]) +
+    line("assistant", t + 2_000, [{ type: "tool_use", id: "c2", name: "Bash", input: { command: "GH_TOKEN=supersecret gh pr list" } }]) +
+    line("user", t + 2_100, [{ type: "tool_result", tool_use_id: "c2", content: "#1 open" }]) +
+    line("assistant", t + 3_000, [{ type: "tool_use", id: "c3", name: "Bash", input: { command: "git status" } }]) +
+    line("user", t + 3_100, [{ type: "tool_result", tool_use_id: "c3", content: "clean" }]));
+  await page.reload();
+  const history = page.getByLabel("Conversation history");
+  const summary = history.getByRole("button", { name: "3 tool calls · Bash ×2, Read" });
+  await browserExpect(summary).toBeVisible();
+  // Collapsed by default, between the request and the reply; the reply text is never folded.
+  expect(await summary.evaluate((el) => {
+    const all = [...document.querySelectorAll("#conversation article, #conversation [data-slot=collapsible]")];
+    const index = all.indexOf(el.closest("[data-slot=collapsible]")!);
+    return [all[index - 1]?.textContent?.includes("Check the changelog"), all[index + 1]?.textContent?.includes("The changelog is fine.")];
+  })).toEqual([true, true]);
+  await browserExpect(summary).toHaveAttribute("aria-expanded", "false");
+  await browserExpect(history.getByText("## 0.12.0 entries")).toHaveCount(0);
+  await summary.click();
+  const read = history.getByRole("button", { name: /Read \/repo\/CHANGELOG\.md/ });
+  await read.click();
+  await browserExpect(history).toContainText("## 0.12.0 entries");
+  // #492's redaction runs on the server: the secret never reaches the page.
+  await history.getByRole("button", { name: /gh pr list/ }).click();
+  await browserExpect(history).toContainText("GH_TOKEN=•••");
+  expect(await page.content()).not.toContain("supersecret");
+  // No separate "Bash · completed" line above the composer.
+  watchBus.publish({ type: "tool.end", ts: Date.now(), sessionKey: "dm:owner", tool: "Bash", ok: true } as never);
+  await page.waitForTimeout(300);
+  await browserExpect(page.getByText("Bash · completed")).toHaveCount(0);
+});
+
+it("a jump-to-latest pill: shown a screen up, counts new messages without pulling the reader down, jumps on click", async () => {
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const t = Date.now() - 600_000;
+  for (let i = 0; i < 40; i++) store.append("dm:owner", { role: i % 2 ? "assistant" : "user", channel: "web", content: `Line ${i}\n\nmore text to make it tall`, timestamp: t + i * 1_000 });
+  await page.reload();
+  const history = page.getByLabel("Conversation history");
+  await browserExpect(history).toContainText("Line 39");
+  await browserExpect(page.getByRole("button", { name: /jump to latest/i })).toHaveCount(0);
+  await history.evaluate((el) => { el.scrollTop = 0; });
+  const pill = page.getByRole("button", { name: "Jump to latest" });
+  await browserExpect(pill).toBeVisible();
+  const top = await history.evaluate((el) => el.scrollTop);
+  store.append("dm:owner", { role: "assistant", channel: "telegram", content: "A new reply arrived.", timestamp: Date.now() });
+  watchBus.publish({ type: "transcript", ts: Date.now(), sessionKey: "dm:owner", role: "assistant", channel: "telegram", text: "x" });
+  await browserExpect(page.getByRole("button", { name: "1 new message, jump to latest" })).toBeVisible();
+  expect(await history.evaluate((el) => el.scrollTop)).toBe(top);
+  await page.getByRole("button", { name: "1 new message, jump to latest" }).focus();
+  await page.keyboard.press("Enter");
+  await browserExpect.poll(() => history.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThan(80);
+  await browserExpect(page.getByRole("button", { name: /jump to latest/i })).toHaveCount(0);
+  expect(await page.evaluate(() => document.activeElement?.getAttribute("aria-label"))).toBe("Conversation history");
 });

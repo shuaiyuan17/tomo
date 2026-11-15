@@ -11,6 +11,13 @@ import { webConfigSchema } from "./config.js";
 import { cronChangeSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, WebError,
   type EventEnvelope, type Rpc, type WebCompaction, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
 
+/**
+ * App icons and the web manifest, served like the bundle: public, no cookie.
+ * Browsers fetch them without our headers or credentials (a favicon or
+ * manifest request never carries the CSRF header), and they reveal nothing.
+ */
+const ICON_FILES = new Set(["/favicon.svg", "/favicon.ico", "/apple-touch-icon.png", "/icon-192.png", "/icon-512.png", "/manifest.webmanifest"]);
+
 export interface HttpDependencies {
   accessToken: string;
   externalOrigin?: string;
@@ -302,7 +309,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
   }
 
   async function asset(path: string, res: ServerResponse): Promise<void> {
-    const relative = path === "/" ? "index.html" : /^\/assets\/[A-Za-z0-9_-]+\.(js|css|woff2)$/.test(path) ? path.slice(1) : null;
+    const relative = path === "/" ? "index.html" : /^\/assets\/[A-Za-z0-9_-]+\.(js|css|woff2)$/.test(path) || ICON_FILES.has(path) ? path.slice(1) : null;
     if (!relative) throw new WebError(404, "not_found");
     const root = await realpath(deps.assetsDir);
     const candidate = resolve(root, relative);
@@ -315,7 +322,8 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
       const bytes = await file.readFile();
       const ext = relative.split(".").pop()!;
       res.writeHead(200, { "content-type": ({ html: "text/html; charset=utf-8", js: "text/javascript; charset=utf-8",
-        css: "text/css; charset=utf-8", woff2: "font/woff2" } as Record<string, string>)[ext] });
+        css: "text/css; charset=utf-8", woff2: "font/woff2", svg: "image/svg+xml", ico: "image/x-icon", png: "image/png",
+        webmanifest: "application/manifest+json" } as Record<string, string>)[ext] });
       res.end(bytes);
     } finally { await file.close(); }
   }

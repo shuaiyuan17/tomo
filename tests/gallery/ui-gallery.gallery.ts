@@ -536,7 +536,10 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
     // The jobs arrive after the page; wait for them rather than for a fixed time.
     await page.getByText("Dentist reminder", { exact: true }).filter({ visible: true }).first().waitFor();
     await page.waitForTimeout(300);
-    await page.getByRole("button", { name: /^(Pause|Delete)/ }).filter({ visible: true }).first().click();
+    const pause = page.getByRole("button", { name: /^(Pause|Delete)/ }).filter({ visible: true }).first();
+    // At 1280x720, after the full pass, something left open still intercepts the pointer; the
+    // dialog is what is shot, so open it with a dispatched click when a real one cannot land.
+    await pause.click({ timeout: 3000 }).catch(() => pause.dispatchEvent("click"));
     await snap();
     await page.keyboard.press("Escape");
   });

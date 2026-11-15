@@ -204,6 +204,26 @@ it("loads the Study as a lazy chunk under the CSP, cached immutable and compress
   expect(await page.evaluate(() => (window as unknown as { __csp: string[] }).__csp)).toEqual([]);
 });
 
+it("a Study chunk that fails to load shows Reload in its place; the rest of the app stays", async () => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.route(/\/assets\/study-[\w-]+\.js$/, (route) => route.abort());
+  const input = page.getByRole("textbox", { name: "Message Tomo" });
+  await input.fill("a draft that must survive");
+  await page.getByRole("button", { name: "The Study" }).first().click();
+  await browserExpect(page.getByText("The Study didn't load. Reload the page to try again.")).toBeVisible();
+  await browserExpect(page.getByRole("button", { name: "Reload", exact: true })).toBeVisible();
+  // Header, sidebar and the (hidden) chat are still mounted, the stream still live.
+  await browserExpect(page.locator("header")).toBeVisible();
+  await browserExpect(page.locator("#sidebar")).toHaveCount(1);
+  await browserExpect(page.locator("#conversation")).toHaveCount(1);
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Conversation" }).first().click();
+  await browserExpect(page.locator("#conversation")).toBeVisible();
+  await browserExpect(input).toHaveValue("a draft that must survive");
+  expect(errors).toEqual([]);
+});
+
 it("chats over real HTTP/CSRF/IPC/SSE and preserves history, themes, accessibility and group read-only state", async () => {
   const errors: string[] = []; const requests: string[] = [];
   page.on("pageerror", (error) => errors.push(error.message));

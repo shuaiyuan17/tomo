@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { lazy, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
 import { api, ApiError, dismissRequest, sendMessage, stopTurn, taskAction } from "./api.js";
 import { useWeb } from "./use-web.js";
@@ -34,6 +34,7 @@ import { blockKey, interleave, messageKey, pendingKey, type ToolBlock } from "./
 import { useSessionTools } from "./use-session-tools.js";
 import { ChatRow, ChatScroller, type ChatScrollerHandle } from "./chat-scroller.js";
 import { chatRows, rowId, type ChatRow as ChatRowData } from "./chat-rows.js";
+import { ChunkBoundary } from "./chunk-boundary.js";
 import { ToolsUnreadableNote, TurnBlock } from "./tool-calls.js";
 import { useAttachments } from "./use-attachments.js";
 import { channelLabel, dayDividers, messageDateTime, messageTime } from "./message-meta.js";
@@ -384,7 +385,7 @@ export function App() {
   };
   // The latest resend/dismiss, for buttons in memoized history rows (they read state from this render).
   const latestActions = useRef({ resend, dismiss });
-  latestActions.current = { resend, dismiss };
+  useLayoutEffect(() => { latestActions.current = { resend, dismiss }; });
   /** Resend / Dismiss for an interrupted request awaiting the owner, on its bubble (history or pending). */
   const interruptedActions = (request: WebRequest | undefined) => request && <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
     <span>Not answered. {agent} may have started on it — check before resending.</span>
@@ -584,8 +585,8 @@ export function App() {
           </ToggleGroup>
         </div>
       </aside>
-      {study && <Suspense fallback={null}><Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} focus={studyFocus} cronRevision={web.cronRevision}
-        mutator={{ bootstrap: web.bootstrap, refresh: web.refreshBootstrap, live: web.connection === "live" }} /></Suspense>}
+      {study && <ChunkBoundary what="The Study" className="min-h-0 min-w-0 flex-1"><Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} focus={studyFocus} cronRevision={web.cronRevision}
+        mutator={{ bootstrap: web.bootstrap, refresh: web.refreshBootstrap, live: web.connection === "live" }} /></ChunkBoundary>}
       {home && <HomePage events={web.home} bootstrap={web.bootstrap} refresh={web.refreshBootstrap} inert={modal} />}
       <main id="conversation" hidden={!!study || home} {...dragProps} className="relative mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-3.5 max-[600px]:pt-2 max-[600px]:pb-[max(0.625rem,env(safe-area-inset-bottom))]" tabIndex={-1} inert={modal}>
         {dragging && <div aria-hidden="true" className="pointer-events-none absolute inset-3 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary/60 bg-background/80 text-[15px] font-medium text-foreground motion-enter">
@@ -699,7 +700,7 @@ export function App() {
       {/* While dragging only this guide moves (a transform); the rail and the chat resize once, on release. */}
       {railSize.separator && <div ref={railSize.guide} hidden aria-hidden="true" className="pointer-events-none fixed inset-y-0 left-0 z-40 w-0.5 bg-primary/70" />}
     </div>
-    {screen && <Suspense fallback={null}><ScreenWindow bootstrap={web.bootstrap} refresh={web.refreshBootstrap} live={web.connection === "live"} compact={phone} onClose={closeScreen} /></Suspense>}
+    {screen && <ChunkBoundary what="The screen view" className="fixed right-4 bottom-4 z-40 rounded-xl border bg-card shadow-md"><ScreenWindow bootstrap={web.bootstrap} refresh={web.refreshBootstrap} live={web.connection === "live"} compact={phone} onClose={closeScreen} /></ChunkBoundary>}
   </div></AgentNameContext.Provider>;
 }
 

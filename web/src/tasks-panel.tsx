@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
+import { lazy, useEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronRight, TerminalIcon, X } from "lucide-react";
 import type { WebSession, WebTask } from "../../src/web/protocol.js";
 import { Button } from "@/components/ui/button";
@@ -8,6 +8,7 @@ import { measureExit, useAppeared, useExiting } from "./motion.js";
 import type { TaskControl } from "./subagent-view.js";
 import { isShellTask, shellShortName } from "./shell.js";
 import { ShellPill } from "./shell-pill.js";
+import { ChunkBoundary } from "./chunk-boundary.js";
 import { ModelBadge } from "./model-badge.js";
 import { type TaskRow, buildTaskView, elapsed, formatElapsed, lastStep, STATE_LABELS, taskKind } from "./tasks.js";
 
@@ -45,7 +46,7 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control }: { task
   // Task list ↔ task view slide: in from the right when opening, from the left when going back.
   if (openTask) return <div className="motion-from-right relative flex min-h-0 flex-1 flex-col">
     <div className="absolute top-0 right-1">{close}</div>
-    <Suspense fallback={null}><SubagentView key={`${openTask.sessionId}/${openTask.taskId}`} task={openTask} control={control} onBack={() => { setCameBack(true); setOpened(undefined); }} /></Suspense>
+    <ChunkBoundary what="The task view" className="min-h-0 flex-1"><SubagentView key={`${openTask.sessionId}/${openTask.taskId}`} task={openTask} control={control} onBack={() => { setCameBack(true); setOpened(undefined); }} /></ChunkBoundary>
   </div>;
   return <section className={cn("flex min-h-0 flex-1 flex-col", cameBack && "motion-from-left")} aria-labelledby="tasks-heading">
     <div className="mb-1.5 flex items-center justify-between gap-3 pr-1 pl-2.5">

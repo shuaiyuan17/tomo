@@ -113,7 +113,7 @@ export function App() {
   // receipt under its right edge.
   const ownerConversation = !!selectedId && selectedId === web.bootstrap?.ownerId;
   const ownBubble = (node: React.JSX.Element | null, requestId: string | undefined) =>
-    <div className="own-bubble flex w-fit min-w-0 max-w-[85%] flex-col">{node}
+    <div className="own-bubble group relative flex w-fit min-w-0 max-w-[85%] flex-col">{node}
       {ownerConversation && <ReadReceiptMark receipt={readReceipt(requestId, web.requests)} agent={agent} />}</div>;
   // The screen is the owner's: offered only with the owner conversation selected.
   const screenAllowed = !!web.bootstrap?.capabilities?.screen && session?.kind !== "group";

@@ -358,10 +358,12 @@ async function resetChrome(page: Page): Promise<void> {
     await page.getByRole("button", { name: "Close screen" }).click();
     await screen.waitFor({ state: "hidden" });
   }
+  // Best effort: on a phone the rail's close button cannot always be clicked, and a step that needs
+  // the rail closed or open (openTasks) checks for itself, so a rail left open must not fail the step.
   const closeTasks = page.locator("[data-tasks-close]").filter({ visible: true });
   if (await closeTasks.count() > 0) {
-    await closeTasks.first().click();
-    await page.getByText(/^Audit the rename paths/).filter({ visible: true }).first().waitFor({ state: "hidden" });
+    await closeTasks.first().click({ timeout: 2000 }).catch(() => undefined);
+    await page.getByText(/^Audit the rename paths/).filter({ visible: true }).first().waitFor({ state: "hidden", timeout: 2000 }).catch(() => undefined);
   }
   // Closing hands focus back to the trigger; a focus shot sets its own focus.
   await page.evaluate(() => { (document.activeElement as HTMLElement | null)?.blur(); });
@@ -387,6 +389,7 @@ async function conversationSteps(page: Page, vp: Viewport, theme: Theme): Promis
     await reset(page);
   });
   await s("conversation", "top", async (snap) => {
+    await reset(page);
     await history(page).evaluate((el) => { el.scrollTop = 0; });
     await page.waitForTimeout(400);
     await snap();
@@ -413,6 +416,7 @@ async function conversationSteps(page: Page, vp: Viewport, theme: Theme): Promis
       await snap({ keepPointer: true });
     });
     await s("conversation", "hover-code", async (snap) => {
+      await reset(page);
       const code = page.locator("[data-slot=code-block]").first();
       await code.scrollIntoViewIfNeeded();
       await code.hover({ timeout: 3000 });
@@ -478,6 +482,8 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
       await snap();
     });
     await s("drawer", "sessions", async (snap) => {
+      await reset(page);
+      await page.getByRole("button", { name: MENU }).click();
       await page.getByRole("button", { name: /^Session/ }).click();
       await snap();
     });
@@ -572,6 +578,8 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
   });
   if (phone) {
     await s("home", "drawer", async (snap) => {
+      await page.goto(`${url}/#home`);
+      await page.waitForTimeout(2000);
       await page.getByRole("button", { name: MENU }).click();
       await snap();
       await page.keyboard.press("Escape");

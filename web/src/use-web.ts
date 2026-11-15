@@ -4,7 +4,11 @@ import type { WebCompactState, WebEvent, WebRateLimit, WebRequest, WebSnapshot, 
 import { replaceSessionTasks } from "./tasks.js";
 import { trimRequests } from "./pending.js";
 import { isTransient, TYPING_ACTIVITY, type TurnStatus } from "./composer-status.js";
+import { onResume } from "./resume.js";
 import { localizeHomeStatus, newerStatus, type LocalHomeStatus } from "./home/caption.js";
+
+/** Hidden at least this long, the page reconnects its event stream when it shows again. */
+export const RESUME_RECONNECT_MS = 5_000;
 
 /** Tomo's home as the event stream reports it: the latest status, a counter to re-read /home on, and the latest request to look. */
 export interface HomeEvents { status?: LocalHomeStatus; revision: number; look?: { requestId: string; seq: number } }
@@ -113,25 +117,41 @@ export function useWeb() {
       if (event.type === "typing") setActivity((old) => ({ ...old, [event.sessionId]: event.active ? TYPING_ACTIVITY : "" }));
     };
     let delay = 1_000;
+    /** The current connection attempt: dropped on its own when the page comes back (see below). */
+    let attempt: AbortController | undefined;
+    let locked = false;
     const connect = async () => {
+      clearTimeout(retryTimer);
+      attempt?.abort();
+      const own = attempt = new AbortController();
       try {
-        const value = await readBootstrap(controller.signal);
-        if (controller.signal.aborted) return;
+        const value = await readBootstrap(own.signal);
+        if (own.signal.aborted) return;
         if (epoch !== value.epoch) { cursor = value.cursor; epoch = value.epoch; }
         setBootstrap(value);
         snapshot(value);
         delay = 1_000;
-        await stream(cursor || value.cursor, controller.signal, { snapshot, update, cursor: (value) => { cursor = value; } });
+        await stream(cursor || value.cursor, own.signal, { snapshot, update, cursor: (value) => { cursor = value; } });
       } catch (error) {
-        if (controller.signal.aborted) return;
-        if (error instanceof ApiError && error.status === 401) { setConnection("locked"); return; }
+        if (own.signal.aborted) return;
+        if (error instanceof ApiError && error.status === 401) { locked = true; setConnection("locked"); return; }
         setConnection("reconnecting");
         retryTimer = setTimeout(() => { void connect(); }, delay);
         delay = Math.min(delay * 2, 10_000);
       }
     };
+    controller.signal.addEventListener("abort", () => attempt?.abort());
     void connect();
-    return () => { controller.abort(); clearTimeout(invalidation); clearTimeout(retryTimer); };
+    // Back from the background (or the back/forward cache): the stream may
+    // be dead without knowing it, and whatever it missed is missed. A fresh
+    // connection re-reads the bootstrap and snapshot (and so /home). A brief
+    // tab switch keeps a stream that is still flowing.
+    const stopResume = onResume((hiddenFor) => {
+      if (locked || hiddenFor < RESUME_RECONNECT_MS) return;
+      delay = 1_000;
+      void connect();
+    });
+    return () => { controller.abort(); stopResume(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
   return { bootstrap, connection, blocks, requests, activity, toolTicks, tasks, compact, turns, rateLimit, suggestions, revision, cronRevision, home, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
 }

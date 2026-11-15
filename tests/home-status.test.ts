@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { COMPACT_STALE_MS, HomeStatusReducer, RATE_LIMIT_MS, subagentId, toolKind, TROUBLE_ERROR_MS, TURN_STALE_MS, turnSource } from "../src/home/status-reducer.js";
 import { HomeService, STATUS_MIN_INTERVAL_MS } from "../src/home/service.js";
 import { WatchBus } from "../src/watch/bus.js";
+import { TaskTracker, type TaskSystemMessage } from "../src/agent/task-tracker.js";
 import type { WatchEvent, WatchTask } from "../src/watch/protocol.js";
 import type { WebEvent } from "../src/web/protocol.js";
 
@@ -106,6 +107,25 @@ describe("home status reducer", () => {
     expect(status.subagents[0].id).not.toContain("t1");
     r.apply(at({ type: "tasks", sessionKey: OWNER, tasks: [] }));
     expect(r.status(ts, all)).toMatchObject({ subagents: [], tasks: 0 });
+  });
+
+  it("a background subagent keeps a visitor after its turn ends, whichever SDK frame comes first", () => {
+    const started = { subtype: "task_started", task_id: "bg", task_type: "local_agent", subagent_type: "general-purpose", description: "rebase the PRs", is_backgrounded: true } as const;
+    const level = { subtype: "background_tasks_changed", tasks: [{ task_id: "bg", task_type: "local_agent", subagent_type: "general-purpose", description: "rebase the PRs" }] } as const;
+    for (const order of [[started, level], [level, started]] as TaskSystemMessage[][]) {
+      const r = new HomeStatusReducer(ts);
+      const tracker = new TaskTracker();
+      const feed = (change: ReturnType<TaskTracker["apply"]>) => { if (change) r.apply(at({ type: "tasks", sessionKey: OWNER, tasks: change.tasks })); };
+      r.apply(at({ type: "turn.start", sessionKey: OWNER, source: "user" }));
+      for (const message of order) feed(tracker.apply(message));
+      feed(tracker.endTurn());
+      r.apply(at({ type: "turn.end", sessionKey: OWNER }));
+      const s = r.status(++ts, all);
+      expect(s.working).toBe(false);
+      expect(s.subagents.length).toBeGreaterThanOrEqual(1);
+      expect(s.subagents[0]).toMatchObject({ id: subagentId(OWNER, "bg"), type: "general-purpose" });
+      expect(s.tasks).toBe(0);
+    }
   });
 
   it("a subagent's task text only for sessions the browser may read", () => {

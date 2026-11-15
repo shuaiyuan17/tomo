@@ -45,6 +45,20 @@ describe("UsageLedger", () => {
     expect(read("2026-11.ndjson")).toEqual([row(nov), row(nov, { source: "cron", jobId: "j1" })]);
   });
 
+  it("keeps rows from concurrent sessions whole and in call order", async () => {
+    const ledger = new UsageLedger(dir);
+    const ts = new Date(2026, 10, 15).getTime();
+    // Many sessions finishing at once, each with a long trigger so a torn
+    // write would show; read back the moment the last append returns.
+    const sessions = Array.from({ length: 40 }, (_, i) => `telegram:${i}`);
+    await Promise.all(sessions.map(async (key, i) => {
+      await Promise.resolve();
+      ledger.append(row(ts, { sessionKey: key, trigger: String(i).repeat(80) }));
+    }));
+    const lines = readFileSync(join(dir, ledgerFileName(ts)), "utf-8").split("\n").filter(Boolean);
+    expect(lines.map((l) => (JSON.parse(l) as UsageLedgerRow).sessionKey)).toEqual(sessions);
+  });
+
   it("swallows a write failure with one warn, and recovers once the path is writable again", () => {
     // A FILE where the directory should be: every write fails.
     const usageDir = join(dir, "usage");

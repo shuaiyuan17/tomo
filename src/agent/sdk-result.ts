@@ -133,7 +133,7 @@ export function modelUsageDelta(
     for (const key of COUNTER_KEYS) {
       const now = cur[key];
       if (now === undefined) continue;
-      const value = key === "costUsd" ? roundUsd(now - (prev?.[key] ?? 0)) : now - (prev?.[key] ?? 0);
+      const value = now - (prev?.[key] ?? 0);
       delta[key] = value;
       if (value !== 0) active = true;
     }
@@ -142,11 +142,6 @@ export function modelUsageDelta(
     out[model] = { ...(delta as unknown as ModelCounters), ...(basis ? { costBasis: basis } : {}) };
   }
   return out;
-}
-
-/** Strip float noise from a differenced dollar figure (micro-dollar precision). */
-export function roundUsd(usd: number): number {
-  return Math.round(usd * 1e6) / 1e6;
 }
 
 /** `usage`: main agent loop only, but already per-turn. */

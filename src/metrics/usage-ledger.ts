@@ -11,6 +11,12 @@ import { parseTomoEvent } from "../tomo-event.js";
  * optional, size-rotated activity log it is always on and kept forever.
  *
  * Bookkeeping only: a failed write is a warn, never a failed turn.
+ *
+ * Writes are SYNCHRONOUS on purpose: each row is one `appendFileSync` (one
+ * O_APPEND write of the whole line) finished before `append` returns, so rows
+ * from concurrent sessions can neither interleave nor land out of call order.
+ * An async `appendFile` per row gives neither guarantee. Values are written
+ * as the SDK reported them (deltas unrounded); rounding is for display.
  */
 export const USAGE_LEDGER_VERSION = 1;
 

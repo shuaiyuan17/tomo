@@ -1757,6 +1757,9 @@ describe("LiveSession usage ledger rows", () => {
   });
   const haikuAt = (n: number) => ({ input: 1000 * n, output: 50 * n, cacheRead: 0, cacheCreated: 0, webSearch: 0, costUsd: 0.01 * n });
   const totalsAt = (n: number) => ({ input: 1010 * n, output: 55 * n, cacheRead: 100 * n, cacheCreated: 4 * n });
+  // Field-by-field b - a, exactly as JS computes it: the ledger keeps the raw delta, float noise and all.
+  const diff = <T extends Record<string, number>>(b: T, a: T): T =>
+    Object.fromEntries(Object.entries(b).map(([k, v]) => [k, v - a[k]])) as T;
 
   async function turn(
     session: InstanceType<typeof LiveSession>,
@@ -1827,9 +1830,12 @@ describe("LiveSession usage ledger rows", () => {
     });
     await turn(session, harness, 1, { total_cost_usd: 26.01, modelUsage: sdkModels(51) });
 
-    expect(rows[0]).toMatchObject({ costUsd: 0.51, tokens: totalsAt(1) });
+    expect(rows[0]).toMatchObject({ costUsd: 26.01 - 25.5, tokens: totalsAt(1) });
     expect(rows[0].noBaseline).toBeUndefined();
-    expect(rows[0].models).toEqual({ "claude-opus": { ...opusAt(1), costBasis: "list" }, "claude-haiku": haikuAt(1) });
+    expect(rows[0].models).toEqual({
+      "claude-opus": { ...diff(opusAt(51), opusAt(50)), costBasis: "list" },
+      "claude-haiku": diff(haikuAt(51), haikuAt(50)),
+    });
     // ... and the baseline it hands on carries the per-model counters too.
     expect(session.lastResult!.usageBaseline!.models).toEqual({ "claude-opus": opusAt(51), "claude-haiku": haikuAt(51) });
   });
@@ -1844,9 +1850,12 @@ describe("LiveSession usage ledger rows", () => {
     await turn(session, harness, 2, { total_cost_usd: 26.52, modelUsage: sdkModels(52) });
 
     // Totals are still exact; only the split is unknown, for this one turn.
-    expect(rows[0]).toMatchObject({ costUsd: 0.51, tokens: totalsAt(1) });
+    expect(rows[0]).toMatchObject({ costUsd: 26.01 - 25.5, tokens: totalsAt(1) });
     expect(rows[0].models).toBeUndefined();
-    expect(rows[1].models).toEqual({ "claude-opus": { ...opusAt(1), costBasis: "list" }, "claude-haiku": haikuAt(1) });
+    expect(rows[1].models).toEqual({
+      "claude-opus": { ...diff(opusAt(52), opusAt(51)), costBasis: "list" },
+      "claude-haiku": diff(haikuAt(52), haikuAt(51)),
+    });
   });
 
   it("flags the first turn after a resume with no baseline, with no per-model split", async () => {
@@ -1880,6 +1889,19 @@ describe("LiveSession usage ledger rows", () => {
     expect(rows[1]).toMatchObject({ source: "background", costUsd: 0.3 });
     expect(rows[1].jobId).toBeUndefined();
     session.close();
+  });
+
+  it("records costs exactly as differenced from the SDK's totals, never rounded", async () => {
+    const rows: UsageLedgerRow[] = [];
+    const { session, harness } = makeSession({ recordUsage: (r) => rows.push(r) });
+    const models = (usd: number) => ({ "claude-opus": { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: usd } });
+    await turn(session, harness, 1, { total_cost_usd: 0.0000001234, modelUsage: models(0.0000001234) });
+    await turn(session, harness, 2, { total_cost_usd: 0.1234567891, modelUsage: models(0.1234567891) });
+
+    expect(rows[0].costUsd).toBe(0.0000001234);
+    expect(rows[0].models!["claude-opus"].costUsd).toBe(0.0000001234);
+    expect(rows[1].costUsd).toBe(0.1234567891 - 0.0000001234);
+    expect(rows[1].models!["claude-opus"].costUsd).toBe(0.1234567891 - 0.0000001234);
   });
 
   it("a recorder that throws costs a warn, never the turn", async () => {

@@ -31,7 +31,6 @@ import {
   describeResultFailure,
   mainLoopUsage,
   modelUsageDelta,
-  roundUsd,
   tokenSum,
   type ModelTurnUsage,
   type QueryResult,
@@ -1479,7 +1478,8 @@ export class LiveSession {
         ...(ctx?.requestId ? { requestId: ctx.requestId } : {}),
         ...(usage.trigger ? { trigger: usage.trigger } : {}),
         ...(result.subtype !== "success" ? { subtype: result.subtype } : {}),
-        costUsd: roundUsd(costUsd),
+        // Unrounded: rounding is for display, never for the record.
+        costUsd,
         tokens: { ...tokens },
         ...(result.duration_ms !== undefined ? { durationMs: result.duration_ms } : {}),
         ...(result.duration_api_ms !== undefined ? { durationApiMs: result.duration_api_ms } : {}),

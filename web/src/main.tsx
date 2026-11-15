@@ -29,7 +29,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
-import { composerStatus, requestLabels, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
+import { composerStatus, composerStatusIsProblem, requestLabels, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
 import { useRailWidth } from "./rail-width.js";
 import { AgentNameContext, agentNameOf } from "./agent-name.js";
 import { blockKey, interleave, messageKey, pendingKey, type ToolBlock } from "./inline-tools.js";
@@ -38,6 +38,7 @@ import { ChatRow, ChatScroller, type ChatScrollerHandle } from "./chat-scroller.
 import { chatRows, rowId } from "./chat-rows.js";
 import { ToolsUnreadableNote, TurnBlock } from "./tool-calls.js";
 import { useAttachments } from "./use-attachments.js";
+import { channelLabel, dayDividers, messageDateTime, messageTime } from "./message-meta.js";
 import { attachmentLabel, canSendWith, captureSend, dragHasFiles, imageFiles } from "./uploads.js";
 
 type Theme = "system" | "light" | "dark";
@@ -103,6 +104,12 @@ function useStudyRoute(): [StudyPage | null, (page: StudyPage | null) => void, s
   return [page, (next) => { window.location.hash = next ? `study/${next}` : ""; if (!next) history.replaceState(null, "", window.location.pathname + window.location.search); setPage(next); setFocus(null); }, focus];
 }
 
+/** A centred day label at the top of the first row of a day ("Yesterday", "Sat, Nov 8"). */
+function DayDivider({ label }: { label: string }) {
+  return <div role="separator" aria-label={label} className="mx-auto mb-6 flex max-w-[740px] items-center gap-3 text-[11px] font-medium tracking-[0.02em] text-muted-foreground">
+    <span aria-hidden="true" className="h-px flex-1 bg-border" /><span aria-hidden="true">{label}</span><span aria-hidden="true" className="h-px flex-1 bg-border" /></div>;
+}
+
 export function App() {
   const web = useWeb();
   const agent = agentNameOf(web.bootstrap?.agentName);
@@ -159,7 +166,7 @@ export function App() {
   // stood; composerStatus drops a note as soon as the request moves on.
   const [note, setNote] = useState<ComposerNote>({ text: "", at: "" });
   const stamp = useRef("");
-  const setFeedback = (text: string) => setNote({ text, at: stamp.current });
+  const setFeedback = (text: string, warn = false) => setNote({ text, at: stamp.current, warn });
   const [theme, setTheme] = useState<Theme>(storedTheme);
   const [tasksOpen, setTasksOpen] = useState(storedTasksOpen);
   useEffect(() => {
@@ -312,14 +319,14 @@ export function App() {
     } catch (err) {
       // Definite refusals the daemon names (nothing was accepted), not network uncertainty.
       const refusal = err instanceof ApiError && err.status === 503 ? refusalReasons[err.code] : undefined;
-      if (refusal) { remember(null); setFeedback(refusal); }
+      if (refusal) { remember(null); setFeedback(refusal, true); }
       else if (err instanceof ApiError && [400, 401, 403, 409, 413, 415, 429].includes(err.status)) {
         remember(null);
         setFeedback(err.status === 413 ? "Message is too large. Shorten it and send again; your draft is kept."
           : err.status === 401 ? "Open the private link in web-access.log to reconnect. Your draft is kept."
           : err.code === "owner_dm_only" ? "Group conversations are read-only."
-          : err.code === "upload_missing" ? "An attached image expired before it was sent. Remove it and attach it again; your draft is kept." : "Message was not accepted. Your draft is saved here; reconnect or check web settings.");
-      } else setFeedback(labels.unknown);
+          : err.code === "upload_missing" ? "An attached image expired before it was sent. Remove it and attach it again; your draft is kept." : "Message was not accepted. Your draft is saved here; reconnect or check web settings.", true);
+      } else setFeedback(labels.unknown, true);
     } finally { setSending(false); }
   };
   const reattach = async (paths: string[]) => {
@@ -334,7 +341,7 @@ export function App() {
     const found = files.filter((file): file is File => !!file);
     const keys = attachments.add(found);
     setResending((old) => old && { ...old, imageKeys: keys });
-    if (found.length < paths.length) setFeedback("Some of its images could not be read back; attach them again before sending.");
+    if (found.length < paths.length) setFeedback("Some of its images could not be read back; attach them again before sending.", true);
   };
   /** Interrupted request being resent from the composer (dismissed once the resend is accepted). */
   const [resending, setResending] = useState<Resend | null>(null);
@@ -343,7 +350,7 @@ export function App() {
     if (!web.bootstrap) return;
     setConfirmDismiss(null);
     try { web.applyRequest(await dismissRequest(requestId, web.bootstrap, web.refreshBootstrap)); }
-    catch { if (!quiet) setFeedback("Could not dismiss it yet. It is still kept; try again."); }
+    catch { if (!quiet) setFeedback("Could not dismiss it yet. It is still kept; try again.", true); }
   };
   const resend = (request: WebRequest) => {
     setResending({ requestId: request.requestId, original: request.text ?? "" });
@@ -368,11 +375,11 @@ export function App() {
       // The answer goes into the request stream, so the status line shows it
       // live (and follows it to Completed) instead of a frozen copy.
       if (request.sessionId) { web.acceptRequest(request); setFeedback(""); }
-      else setFeedback(labels[request.state]);
+      else setFeedback(labels[request.state], request.state !== "completed" && request.state !== "running" && request.state !== "queued");
       // Unknown stays unresolved; refused and interrupted were not answered, so the draft is kept.
       if (request.state !== "unknown") { remember(null); if (request.state !== "refused" && request.state !== "interrupted") setDraft(""); }
       setReload((r) => r + 1);
-    } catch { setFeedback("Cannot check yet. Your draft is still here."); }
+    } catch { setFeedback("Cannot check yet. Your draft is still here.", true); }
   };
   const older = async () => {
     if (!history.nextCursor || historyStatus === "loading-older") return;
@@ -410,6 +417,8 @@ export function App() {
     <TurnBlock block={block} running={running} choices={openGroups} onChoice={(key, value) => setOpenGroups((old) => ({ ...old, [key]: value }))} /></div>;
   // Rows of the scroller (see chat-rows.ts); the running turn's calls and reply ride in the last one.
   const rows = chatRows(timeline.entries, pendingUsers, timeline.trailing.length > 0 || blocks.length > 0);
+  // A day divider rides at the top of the row it introduces (rows only grow at their ends; see chat-rows.ts).
+  const dividers = dayDividers(rows.map((row) => row.kind === "message" ? row.message.timestamp : row.kind === "pending" ? row.request.timestamp : undefined));
   useEffect(() => { stamp.current = requestStamp(latest); });
   // The status line counts a running tool's seconds itself between the daemon's reports.
   const turn = web.turns[selectedId];
@@ -432,10 +441,11 @@ export function App() {
     try {
       const { stopped } = await stopTurn(web.bootstrap, web.refreshBootstrap);
       if (!stopped) { setStopping(false); setFeedback("Nothing was running to stop."); }
-    } catch { setStopping(false); setFeedback("Could not stop it. Try again."); }
+    } catch { setStopping(false); setFeedback("Could not stop it. Try again.", true); }
   };
   // The SDK's predicted next message: offered only while the composer is empty and idle.
   const suggestion = session?.writable && !turnActive && !draft && !attachments.items.length && !resending && !uncertain ? web.suggestions[selectedId] : undefined;
+  const statusInput = { activity: web.activity[selectedId], note, latest, settled: settle.settled, agent, turn, now };
   const usage = session?.stats;
   const hasContext = !!usage?.contextMax;
   const sessions = web.bootstrap?.sessions ?? [];
@@ -546,15 +556,15 @@ export function App() {
           {historyStatus === "loading" && selectedId && <p className="text-center text-sm text-muted-foreground" role="status">Opening your conversation…</p>}
           {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && pendingUsers.length === 0 && <div className="m-auto flex h-full min-h-56 max-w-md flex-col items-center justify-center pb-12 text-center"><Mark className="mb-4 size-16 stroke-[1.3]" /><h2 className="mt-2 mb-3 font-serif text-[28px] font-normal">Start wherever you are.</h2><p className="m-0 max-w-80 text-sm text-muted-foreground">{session?.kind === "group" ? "There are no recorded messages in this group yet." : "A question, a half-formed idea, or something on your mind."}</p></div>}
           </>}>
-          {rows.map((row, rowIndex) => <ChatRow key={row.id} row={row}>{row.kind === "message" && <>{row.tools.map((block) => toolBlock(block, false))}{(() => {
+          {rows.map((row, rowIndex) => <ChatRow key={row.id} row={row}>{dividers[rowIndex] && <DayDivider label={dividers[rowIndex]!} />}{row.kind === "message" && <>{row.tools.map((block) => toolBlock(block, false))}{(() => {
             const message = row.message; const index = messageIndex.get(message.id)!;
             const { sent, body: content } = parseSendMarker(message.role, message.content);
             const { reply, body } = parseReply(content); const quoted = reply && findQuoted(history.messages, index, reply);
             return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
-            <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()}>{new Date(message.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><span>{message.channel === "web" ? "Web" : message.channel}</span>
+            <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()} title={messageDateTime(message.timestamp)} className="tabular-nums">{messageTime(message.timestamp)}</time><span>{channelLabel(message.channel)}</span>
               {sent && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{sendMarkerLabel(sent)}</Badge>}
               {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
-            {(message.role === "user" ? (node: React.JSX.Element) => ownBubble(node, message.requestId) : (node: React.JSX.Element) => node)(<div className={cn("markdown", message.role === "user" && "min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5", message.role === "assistant" && "reading")}>
+            {(message.role === "user" ? (node: React.JSX.Element) => ownBubble(node, message.requestId) : (node: React.JSX.Element) => node)(<div className={cn("markdown", message.role === "user" && "min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 max-[600px]:px-4 max-[600px]:py-3", message.role === "assistant" && "reading")}>
               {message.role === "assistant" && body.trim() === "NO_REPLY"
                 // A turn that ended without a reply (silent by choice, or stopped): said plainly, not as the agent's words.
                 ? <p className="m-0 font-sans text-[12.5px] text-muted-foreground">No reply</p>
@@ -567,7 +577,7 @@ export function App() {
               body={`[Sent ${request.images.length === 1 ? "an image" : `${request.images.length} images`}, saved to: ${request.images.join(", ")}]`} /></div> : null}
             {sentImages[request.requestId] && <div className="mb-2 flex flex-wrap gap-2 opacity-80">{sentImages[request.requestId].map((src, i) =>
               <img key={i} src={src} alt="Image" className="block max-h-[280px] max-w-[280px] rounded-xl border object-contain" />)}</div>}
-            {request.text ? ownBubble(<div className="markdown min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80"><Text breaks>{request.text}</Text></div>, request.requestId)
+            {request.text ? ownBubble(<div className="markdown min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80 max-[600px]:px-4 max-[600px]:py-3"><Text breaks>{request.text}</Text></div>, request.requestId)
               : ownBubble(null, request.requestId)}
             {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)(row.request)}
           {rowIndex === rows.length - 1 && <>
@@ -576,7 +586,7 @@ export function App() {
           </>}</ChatRow>)}
         </ChatScroller>
         <div className="mx-auto w-full max-w-[740px]"><div className="flex min-h-7 items-baseline gap-3 pb-2">
-          <div className={cn("feedback min-w-0 flex-1 tracking-[0.02em] text-xs leading-normal text-muted-foreground tabular-nums transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0")} role="status" aria-live="polite">{composerStatus({ activity: web.activity[selectedId], note, latest, settled: settle.settled, agent, turn, now })}</div>
+          <div className={cn("feedback min-w-0 flex-1 tracking-[0.02em] text-xs leading-normal text-muted-foreground tabular-nums transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0", composerStatusIsProblem(statusInput) && "text-destructive")} role="status" aria-live="polite">{composerStatus(statusInput)}</div>
 </div>
           {suggestion && <button type="button" onClick={() => { setDraft(suggestion); input.current?.focus(); }} title="Use this as your message"
             className="motion-enter mb-2 flex max-w-full items-center gap-1.5 rounded-full border bg-card px-3 py-1.5 text-left text-[12.5px] text-muted-foreground shadow-xs transition-colors hover:border-muted-foreground/50 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none">
@@ -594,7 +604,7 @@ export function App() {
               {item.status === "failed" && <button type="button" onClick={() => attachments.retry(item.key)} title={item.error} aria-label={`Retry upload${item.error ? ` (${item.error})` : ""}`}
                 className="absolute inset-0 grid place-items-center bg-background/60 text-destructive hover:bg-background/40"><RotateCw className="size-4" /></button>}
               <button type="button" onClick={() => attachments.remove(item.key)} aria-label={`Remove ${item.file.name || `image ${index + 1}`}`}
-                className="absolute top-1 right-1 grid size-5 place-items-center rounded-full bg-foreground/70 text-background hover:bg-foreground"><X className="size-3" strokeWidth={2.5} /></button>
+                className="absolute top-1 right-1 grid size-6 place-items-center rounded-full bg-foreground/70 text-background transition-colors hover:bg-foreground focus-visible:outline-offset-0"><X className="size-3" strokeWidth={2.5} /></button>
             </li>)}</ul>}
           {attachments.note && <p className="m-0 mb-2 text-[12px] text-muted-foreground" role="status">{attachments.note}</p>}
           <form onSubmit={(e) => void send(e)} className="composer flex items-end gap-1 rounded-[20px] border bg-card p-2.5 shadow-xs transition-[border-color,box-shadow] focus-within:border-muted-foreground/50 focus-within:shadow-md">

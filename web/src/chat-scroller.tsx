@@ -86,8 +86,8 @@ function Frame({ keys, lastRowId, busy, top, handle, children }: Parameters<type
   const refollow = (el: HTMLElement) => { if (el.scrollHeight - el.scrollTop - el.clientHeight <= 2) scrollToEnd({ behavior: "auto" }); };
   const touchY = useRef<number | null>(null);
   const count = unseen.size;
-  return <MessageScroller className="min-h-0 w-full flex-1">
-    <MessageScrollerViewport ref={viewport} aria-label="Conversation history" className="pt-2 pr-4 pb-6 max-[600px]:pr-2"
+  return <MessageScroller className="-mr-4 min-h-0 w-auto flex-1 self-stretch max-[600px]:-mr-2">
+    <MessageScrollerViewport ref={viewport} aria-label="Conversation history" className="chat-fade pt-2 pr-4 pb-6 max-[600px]:pr-2"
       onPointerDown={(e) => { dragging.current = e.target === e.currentTarget; }} onPointerUp={() => { dragging.current = false; }}
       onWheel={(e) => { if (e.deltaY > 0) refollow(e.currentTarget); }}
       onKeyDown={(e) => { if (DOWN_KEYS.has(e.key) && !(e.key === " " && e.shiftKey)) refollow(e.currentTarget); }}
@@ -114,6 +114,6 @@ function JumpToLatest({ visible, unseen, onJump }: { visible: boolean; unseen: n
   const label = jumpLabel(unseen);
   return <button type="button" onClick={onJump} data-state={motion.shown ? "open" : "closed"} tabIndex={visible ? 0 : -1}
     aria-label={label ? `${label}, jump to latest` : "Jump to latest"}
-    className="absolute bottom-3 left-1/2 z-10 flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border bg-card px-3 text-[12px] text-foreground shadow-md transition-[opacity,transform] duration-[180ms] ease-[var(--ease-soft)] hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none data-[state=closed]:pointer-events-none data-[state=closed]:translate-y-1 data-[state=closed]:opacity-0">
+    className="absolute bottom-3 left-[calc(50%-0.5rem)] z-10 max-[600px]:left-[calc(50%-0.25rem)] flex h-8 -translate-x-1/2 items-center gap-1.5 rounded-full border bg-card px-3 text-[12px] text-foreground shadow-md transition-[opacity,transform] duration-[180ms] ease-[var(--ease-soft)] hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none data-[state=closed]:pointer-events-none data-[state=closed]:translate-y-1 data-[state=closed]:opacity-0">
     {label && <span aria-hidden="true">{label}</span>}<ArrowDown className="size-3.5" strokeWidth={2} aria-hidden="true" /></button>;
 }

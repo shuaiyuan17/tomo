@@ -94,7 +94,7 @@ function ReplyQuote({ reply, onClick }: { reply: ReplyContext; onClick?: () => v
     <span className="block text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">{label}</span>
     <span className="line-clamp-2 text-[12.5px] leading-snug whitespace-pre-line text-muted-foreground">{reply.excerpt ?? "an earlier message"}</span>
   </>;
-  const className = "mb-2 block w-full rounded-md border-l-2 border-muted-foreground/40 bg-foreground/[0.04] py-1 pr-2 pl-2.5 text-left";
+  const className = "mb-2 block w-full rounded-r-md border-l-2 border-muted-foreground/40 bg-foreground/[0.04] py-1 pr-2 pl-2.5 text-left";
   return onClick
     ? <button type="button" onClick={onClick} title="Show the original message" className={cn(className, "cursor-pointer transition-colors hover:bg-foreground/[0.07]")}>{content}</button>
     : <div className={className}>{content}</div>;

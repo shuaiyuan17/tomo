@@ -167,17 +167,35 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   .markdown ul { @apply list-disc pl-6; }
   .markdown ol { @apply list-decimal pl-6; }
   .markdown ul:has(> li > input) { @apply list-none pl-1; }
-  .markdown pre { @apply my-3 max-w-full overflow-auto rounded-lg bg-muted p-4; }
-  .markdown code { @apply font-mono text-[0.88em]; }
-  .markdown :not(pre) > code { @apply rounded bg-muted px-1 py-0.5; }
-  .markdown table { @apply my-3 block overflow-x-auto border-collapse; }
-  .markdown td, .markdown th { @apply border p-2; }
-  .markdown blockquote { @apply my-3 border-l-2 pl-5 text-muted-foreground; }
-  .markdown h1, .markdown h2, .markdown h3 { @apply mt-5 mb-2 font-serif font-normal leading-snug; }
-  .markdown h1 { @apply text-[28px]; }
-  .markdown h2 { @apply text-[22px]; }
-  .markdown input { @apply mr-1.5 accent-primary; }
-  .markdown a { @apply underline; }
+  /* Long code lines scroll, never wrap (the block is on the card colour, see code-block.tsx). */
+  .markdown pre { @apply my-3 max-w-full overflow-auto rounded-lg bg-muted px-4 py-3 text-[13.5px] leading-[1.6]; overflow-wrap: normal; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+  .markdown pre code { @apply text-[1em]; }
+  .markdown code { @apply font-mono text-[0.86em]; }
+  .markdown :not(pre) > code { @apply rounded-[5px] bg-foreground/[0.07] px-[0.35em] py-[0.1em]; }
+  /* Inside your own bubble the chip darkens against the bubble (it was the bubble's own colour). */
+  .message.user .markdown :not(pre) > code { @apply bg-foreground/[0.08]; }
+  /* Tables: hairline grid, left-aligned header on a tint; a cell never breaks a
+     word mid-way (the table scrolls sideways instead). */
+  .markdown table { @apply my-4 block max-w-full overflow-x-auto border-collapse text-[0.9em] leading-normal; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+  .markdown td, .markdown th { @apply border px-3 py-1.5 text-left align-top; overflow-wrap: normal; }
+  .markdown th { @apply bg-foreground/[0.04] font-semibold; }
+  .markdown blockquote { @apply my-4 border-l-2 border-primary/40 pl-4 text-muted-foreground; }
+  .markdown hr { @apply my-6 border-t; }
+  .markdown li { @apply my-1; }
+  .markdown li > ul, .markdown li > ol { @apply my-1; }
+  .markdown li::marker { @apply text-muted-foreground; }
+  /* Headings scaled for a chat column; h3–h6 had no size and read as body text. */
+  .markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 { @apply mt-6 mb-2 font-serif leading-snug text-foreground; }
+  .markdown h1 { @apply text-[24px] font-normal; }
+  .markdown h2 { @apply text-[20px] font-normal; }
+  .markdown h3 { @apply text-[17px] font-semibold; }
+  .markdown h4, .markdown h5, .markdown h6 { @apply text-[1em] font-semibold; }
+  .markdown strong { @apply font-semibold; }
+  /* Task-list boxes drawn in the palette: a read-only (disabled) native box is the browser's grey. */
+  .markdown input[type="checkbox"] { @apply relative mr-2 inline-block size-[15px] shrink-0 appearance-none rounded-[4px] border border-muted-foreground/60 bg-card align-[-2px]; }
+  .markdown input[type="checkbox"]:checked { @apply border-primary bg-primary; }
+  .markdown input[type="checkbox"]:checked::after { content: ""; @apply absolute top-[1.5px] left-[4.5px] h-[8px] w-[4px] rotate-45 border-r-[1.75px] border-b-[1.75px] border-primary-foreground; }
+  .markdown a { @apply underline decoration-primary/40 decoration-1 underline-offset-[3px] transition-colors hover:decoration-primary; }
 }
 
 @layer components {
@@ -206,6 +224,12 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
 }
+
+/* The conversation softens into the composer instead of a hard cut (the viewport's bottom padding keeps the last line clear of it). */
+.chat-fade { mask-image: linear-gradient(to bottom, #000 calc(100% - 20px), transparent); }
+
+/* Everything clickable in the conversation and composer says so (Tailwind v4 buttons default to the arrow). */
+#conversation button:not(:disabled) { cursor: pointer; }
 
 /* Dragging the Tasks rail's edge: one cursor everywhere, no text selection. */
 body.rail-resizing { cursor: col-resize; user-select: none; }

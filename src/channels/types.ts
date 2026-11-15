@@ -62,6 +62,15 @@ export interface IncomingMessage {
   isMentioned?: boolean;
   /** Group chat title */
   chatTitle?: string;
+  /**
+   * Distinguishes two hand-offs that deliberately share a provider `id` — an
+   * iMessage attachment follow-up reuses its original message's GUID so
+   * replies and reactions still target it. The durable inbox dedups on
+   * (channel, chatId, id, inboxKey), so without this the follow-up would be
+   * acknowledged and dropped as a duplicate of the original. Absent for an
+   * ordinary message.
+   */
+  inboxKey?: string;
 }
 
 export interface OutgoingMessage {
@@ -308,7 +317,14 @@ export type AdmissionPredicate = (chatId: string) => boolean;
 export interface Channel {
   /** Channel identifier (e.g. "telegram", "imessage") */
   readonly name: string;
-
+  /**
+   * True when a THROWN hand-off makes this channel deliver the same message
+   * again (imsg: the rowid cursor is not advanced and the row replays). The
+   * agent relies on it when it cannot persist a message: it refuses custody
+   * by throwing and lets the redelivery carry it. A channel that already
+   * acknowledged the message before the hand-off (Telegram) leaves this unset.
+   */
+  readonly redeliversUnacknowledged?: boolean;
 
   /** Register a handler for incoming messages */
   onMessage(handler: MessageHandler): void;

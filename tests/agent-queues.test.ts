@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PendingNotesQueue, type DurablePendingNotesStore } from "../src/agent/pending-notes-queue.js";
+import { INTERRUPTED_NOTE_MARKER, PendingNotesQueue, type DurablePendingNotesStore } from "../src/agent/pending-notes-queue.js";
 import { SessionQueue } from "../src/agent/session-queue.js";
 
 class MemoryPendingNotesStore implements DurablePendingNotesStore {
@@ -83,7 +83,59 @@ describe("PendingNotesQueue", () => {
     expect(drained).toContain("note-5");
     expect(drained).toContain("note-19");
     expect(queue.drain("telegram:-987")).toBe("");
+    // Still on disk while the turn that took them runs…
+    expect(store.getPendingNotes("telegram:-987")).toHaveLength(15);
+    queue.settle("telegram:-987", drained);
+    // …and gone once it has ended.
     expect(store.getPendingNotes("telegram:-987")).toEqual([]);
+  });
+
+  it("keeps drained notes durable until their turn settles, alongside notes queued meanwhile", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", "before");
+    const drained = queue.drain("k");
+    queue.queueNote("k", "during");
+    // In flight it is stored already marked as possibly partly answered.
+    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nbefore`, "during"]);
+
+    // A crash here: the next process sees both and delivers both.
+    const next = new PendingNotesQueue(store);
+    expect(next.drain("k")).toContain("before");
+
+    queue.settle("k", drained);
+    expect(store.getPendingNotes("k")).toEqual(["during"]);
+  });
+
+  it("restoreInterrupted puts a taken-but-unfinished batch back, marked", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", "n1");
+    const drained = queue.drain("k");
+    queue.restoreInterrupted("k", drained);
+    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nn1`]);
+    const again = queue.drain("k");
+    expect(again.startsWith(INTERRUPTED_NOTE_MARKER)).toBe(true);
+    expect(again.split(INTERRUPTED_NOTE_MARKER)).toHaveLength(2);
+  });
+
+  it("restore puts a drained batch back without duplicating it on disk", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", "n1");
+    const drained = queue.drain("k");
+    queue.restore("k", drained);
+    expect(store.getPendingNotes("k")).toEqual(["n1"]);
+    expect(queue.drain("k")).toContain("n1");
+  });
+
+  it("never caps away a durable-inbox note (the message's only copy)", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", '<tomo-event type="inbox" name="interrupted" ts="x">\nthe message\n</tomo-event>');
+    for (let i = 0; i < 30; i++) queue.queueNote("k", `note-${i}`);
+    expect(queue.peekNotes("k")[0]).toContain("the message");
+    expect(queue.peekNotes("k")).toHaveLength(15);
   });
 
   it("caps pending error notes before injecting them into a prompt", () => {

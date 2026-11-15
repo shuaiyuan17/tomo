@@ -32,6 +32,8 @@ export interface UserTurnRequest {
   steerAudience: string[];
   /** True for turns where most inputs are expected to resolve to NO_REPLY. */
   passiveListen?: boolean;
+  /** Durable-inbox progress for the messages behind this turn. */
+  inboxHooks?: InboxTurnHooks;
   /** Owner DM notice for an error `suppressErrors` keeps out of the chat. */
   ownerNotice?: OwnerNoticeTarget;
   /** This turn's inbound audiences, in order (see agent/audience.ts): "dm",
@@ -100,3 +102,18 @@ export type RewindOutcome = {
   /** A stuck first turn was stopped; there was no earlier history to fork. */
   nothingToRewind?: boolean;
 };
+
+/**
+ * How a user turn reports progress to the durable inbox. `notConsumed`: the
+ * messages are being held back (a turn was set up, or /restore deferred
+ * them) and are NOT consumed unless `onPromptHandedOff` follows (the SDK took
+ * the prompt, see MessageRequest.onPromptHandedOff). Neither called: the
+ * messages were deliberately dropped (allowlist, unmentioned group), which
+ * is a consumption.
+ */
+export interface InboxTurnHooks {
+  notConsumed(): void;
+  /** Graceful shutdown stopped the turn mid-flight (TurnSpec.onShutdown "interrupted"). */
+  cutShort(): void;
+  onPromptHandedOff(): void;
+}

@@ -21,6 +21,8 @@ export interface RunWithRetryRequest {
   onJoined?: TurnRequest["onJoined"];
   /** See SteerJoin.onHandedOff. */
   onHandedOff?: () => void;
+  /** See MessageRequest.onPromptHandedOff. May fire once per attempt. */
+  onPromptHandedOff?: () => void;
   key: string;
   prompt: string;
   images?: Array<{ data: string; mediaType: string }>;
@@ -254,6 +256,12 @@ export interface TurnSpec {
   handedOff?: boolean;
   /** Graceful shutdown converted this turn into NO_REPLY mid-flight. */
   shutdownInterrupted?: boolean;
+  /** The prompt reached the SDK's input queue (see MessageRequest.onPromptHandedOff). */
+  onPromptHandedOff?: () => void;
+  /** Set once the SDK has taken this turn's prompt (notes included). */
+  promptTaken?: boolean;
+  /** Set when runWithRetry returned normally (the turn reached its result). */
+  completed?: boolean;
   requestId?: string;
   key: string;
   /** Ingress path label for observability (watch feed turn events). */
@@ -323,6 +331,12 @@ export interface TurnRunnerDeps {
   drainPendingNotes(sessionKey: string): string;
   /** Put drained notes back: the turn they were drained for never ran. */
   restorePendingNotes?(sessionKey: string, drained: string): void;
+  /** The turn the notes were drained for has ended: drop them from the
+   *  durable store (until now a crash re-delivers them). */
+  settlePendingNotes?(sessionKey: string, drained: string): void;
+  /** The prompt carrying the notes reached the model but the turn did not
+   *  finish normally: put them back, marked as possibly partly answered. */
+  restoreInterruptedPendingNotes?(sessionKey: string, drained: string): void;
   runWithRetry(req: RunWithRetryRequest): Promise<string>;
   /** Append an assistant response to the session transcript. */
   appendAssistantTranscript(sessionKey: string, content: string, channelName: string, correlation?: { requestId?: string; turnId: string }): void;
@@ -446,6 +460,22 @@ export class TurnRunner {
       return ok;
     } finally {
       if (!declined) {
+        // Notes are consumed only by a turn that took them AND ran to its
+        // normal result. Never taken (session build failed, refused for
+        // shutdown): back as they were. Taken but not finished (cut short by
+        // shutdown, aborted, failed): back, marked as possibly partly
+        // answered — they may be the only copy of a message whose inbox
+        // record is already done.
+        //
+        // A turn the owner STOPPED ends with a normal result, so its notes
+        // are settled (cleared) — on purpose: Stop is the owner's explicit
+        // decision that this turn, recovery note included, needs no further
+        // answer.
+        if (notes) {
+          if (!spec.promptTaken) this.deps.restorePendingNotes?.(spec.key, notes);
+          else if (spec.completed && !spec.shutdownInterrupted) this.deps.settlePendingNotes?.(spec.key, notes);
+          else this.deps.restoreInterruptedPendingNotes?.(spec.key, notes);
+        }
         this.deps.recordTurnOutcome?.(spec.key, ok);
         watchBus.publish({
           type: "turn.end",
@@ -510,6 +540,7 @@ export class TurnRunner {
           spec.handedOff = true;
           watchBus.publish({ type: "turn.handoff", sessionKey: spec.key, requestId: spec.requestId! });
         } } : {}),
+        onPromptHandedOff: () => { spec.promptTaken = true; spec.onPromptHandedOff?.(); },
         flushOnShutdown: sink.flushBlockTranscript,
         onShutdownInterrupted: () => { spec.shutdownInterrupted = true; spec.onShutdown?.("interrupted"); },
         ...(reply
@@ -541,6 +572,10 @@ export class TurnRunner {
       // moved on, and must never be re-sent.
       sink.end();
     }
+
+    // The turn reached its result (a shutdown cut is told apart by
+    // spec.shutdownInterrupted, set during the run).
+    spec.completed = true;
 
     if (reply?.steer && rawResponse === STEER_MERGED) {
       // Steered message merged into the in-flight turn — that turn's owner

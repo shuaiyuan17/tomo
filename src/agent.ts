@@ -35,13 +35,14 @@ import { SteerDeclinedError, TurnInterruptedError, type QueryResult, type TurnRe
 import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
+import { DurableInbox, INBOX_STALE_NOT_PROCESSED, restoreMessage, type InboxRecord } from "./agent/durable-inbox.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import { describeSessionModel, switchSessionModel, type ModelSwitchOutcome } from "./agent/model-switch.js";
 import { prepareSettledSessionRewind } from "./agent/settled-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
-import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest } from "./agent/turn-runner.js";
+import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest, type ShutdownTurnEnd } from "./agent/turn-runner.js";
 import { OwnerErrorNotifier } from "./agent/owner-error-notice.js";
 import { formatGroupTag } from "./agent/inbound-markers.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
@@ -56,7 +57,7 @@ import { readFileSync } from "node:fs";
 import { withConfigLockSync } from "./config-file.js";
 import { writeJsonAtomicSync } from "./fs-utils.js";
 import { CONTINUITY_DELIVERY_NOTE } from "./continuity-defaults.js";
-import type { CronTurnOptions, QueuedInboundWork, RewindOutcome, UserTurnRequest } from "./agent/agent-turn-types.js";
+import type { CronTurnOptions, InboxTurnHooks, QueuedInboundWork, RewindOutcome, UserTurnRequest } from "./agent/agent-turn-types.js";
 import { OwnerAdoption } from "./agent/owner-adoption.js";
 import { ContextNudger } from "./agent/context-nudger.js";
 import { RestartCoordinator } from "./agent/restart-coordinator.js";
@@ -141,6 +142,14 @@ export class Agent {
   private readonly ownerNotices: OwnerNotices;
   private readonly mcpAuthPrompts: McpAuthPrompts;
   private pendingNotesQueue: PendingNotesQueue;
+  /**
+   * Durable record of every accepted inbound message until a turn consumes
+   * it (see DurableInbox). Undefined when `config.inbox` is off or the log
+   * could not be opened — the in-memory path then runs exactly as before.
+   */
+  private inbox: DurableInbox | undefined;
+  /** Throttle for reportInboxFault's owner DM. */
+  private lastInboxFaultNoticeAt = 0;
   private delivery: DeliveryPipeline;
   private turnRunner: TurnRunner;
   private liveSessionManager: LiveSessionManager;
@@ -193,6 +202,13 @@ export class Agent {
       getChannel: (name) => this.getChannel(name),
     });
     this.pendingNotesQueue = new PendingNotesQueue(this.sessions);
+    if (config.inbox) {
+      try {
+        this.inbox = new DurableInbox({ path: join(config.tomoHome, "data", "inbox.jsonl") });
+      } catch (err) {
+        log.error({ err }, "Durable inbox unavailable; inbound messages are held in memory only");
+      }
+    }
     this.delivery = new DeliveryPipeline({
       queuePendingErrorNote: (sessionKey, visibleError) => this.queuePendingErrorNote(sessionKey, visibleError),
     });
@@ -201,6 +217,8 @@ export class Agent {
     this.turnRunner = new TurnRunner({
       drainPendingNotes: (sessionKey) => this.drainPendingNotes(sessionKey),
       restorePendingNotes: (sessionKey, drained) => this.pendingNotesQueue.restore(sessionKey, drained),
+      settlePendingNotes: (sessionKey, drained) => this.pendingNotesQueue.settle(sessionKey, drained),
+      restoreInterruptedPendingNotes: (sessionKey, drained) => this.pendingNotesQueue.restoreInterrupted(sessionKey, drained),
       // Persisted (sessions' pending-notes file): a reply the owner never got
       // must still be known to the next turn if the daemon restarts first.
       queueDeliveryFailureNote: (sessionKey, note) => this.queuePendingNote(
@@ -681,8 +699,64 @@ export class Agent {
     // message waits (in-flight turn, iMessage settle window) re-route it.
     const resolution = this.router.resolve(channel.name, message.chatId, isGroup);
     if (channel.name === "web") resolution.replyTarget = { channelName: "web", chatId: message.id };
-    const sessionKey = resolution.sessionKey;
 
+    // DURABLE CUSTODY. Persist before the `true` below reaches the channel:
+    // that answer is what makes imsg commit its cursor, and Telegram has
+    // already confirmed the update. From here a crash replays the message on
+    // the next start instead of losing it. Web turns are bound to a live HTTP
+    // request that does not survive a restart (the browser sees the failure
+    // and can resend), and the group secret must never be written to disk.
+    let inboxId: string | undefined;
+    if (this.inbox && channel.name !== "web" && !(config.groupSecret && message.text.trim() === config.groupSecret)) {
+      const persisted = this.inbox.accept(channel.name, message, resolution);
+      if (persisted.status === "duplicate") {
+        log.info({ channel: channel.name, messageId: message.id }, "Inbound message already in the durable inbox; not dispatching it twice");
+        return true;
+      }
+      if (persisted.status === "accepted") inboxId = persisted.id;
+      else if (persisted.reason === "failed") {
+        // THE WRITE FAILED: an ingress fault, not a reason to quietly fall
+        // back to memory. Answering `true` now would make a channel that
+        // commits on our answer (imsg's rowid cursor) forget the message, and
+        // a crash before the turn would then lose it for good.
+        if (channel.redeliversUnacknowledged) {
+          // Do not take custody. A throw is the hand-off contract's "row not
+          // handled" (MessageHandler): imsg leaves its cursor where it was,
+          // floors it at this row and resubscribes, so the row comes again
+          // (with backoff) until a write succeeds. Nothing is dispatched here,
+          // so the redelivery is the only copy — never a second answer.
+          throw new InboxPersistError(channel.name, message.id);
+        }
+        // The channel confirmed this before we saw it (grammY acks the
+        // update first), so refusing would only lose it now instead of on a
+        // crash. Process it in memory as before, and say so loudly.
+        this.reportInboxFault(
+          `Tomo could not save an incoming ${channel.name} message to disk before answering it. `
+            + "It is being answered now, but would be lost if Tomo crashed first. Check the disk under ~/.tomo/data.",
+          { channel: channel.name, messageId: message.id },
+        );
+      }
+    }
+
+    const accepted = this.dispatchInbound(channel, message, resolution, inboxId);
+    // Refused only past the shutdown drain. A durably persisted message is
+    // still ours — the next start replays it — so custody stands.
+    return accepted || inboxId !== undefined;
+  }
+
+  /**
+   * Hand an accepted message to the batcher or the per-session queue. Shared
+   * by live ingress and the durable-inbox replay, so a replayed message takes
+   * exactly the path it would have taken the first time.
+   */
+  private dispatchInbound(
+    channel: Channel,
+    message: IncomingMessage,
+    resolution: SessionResolution,
+    inboxId: string | undefined,
+  ): boolean {
+    const isGroup = message.isGroup ?? false;
+    const sessionKey = resolution.sessionKey;
     const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
     // Owner web input can join an active private user turn (#382). Replies
     // stay on the turn's own outlet and are mirrored to the browser; group,
@@ -702,11 +776,11 @@ export class Agent {
       // Through processInboundItems (not handleMessage directly) so the
       // allowlist and /pause state are re-checked at processing time — this
       // task can wait behind an in-flight turn, and both can change meanwhile.
-      this.enqueueInboundForSession(sessionKey, [{ channel, message, resolution }]);
+      this.enqueueInboundForSession(resolution.sessionKey, [{ channel, message, resolution, ...(inboxId ? { inboxId } : {}) }]);
       return true;
     }
 
-    return this.batcher.enqueue(sessionKey, channel, message, canCoalesce, resolution);
+    return this.batcher.enqueue(resolution.sessionKey, channel, message, canCoalesce, resolution, inboxId);
   }
 
   private async handlePastedMcpCallback(channel: Channel, message: IncomingMessage): Promise<boolean> {
@@ -767,6 +841,8 @@ export class Agent {
     for (const item of items) {
       if (!allowed.includes(item)) item.channel.settleMessage?.(item.message.id, "refused");
     }
+    // A deliberate drop is a consumption: it must not come back after a restart.
+    this.inbox?.markDone(inboxIdsOf(items.filter((item) => !allowed.includes(item))));
     if (allowed.length === 0) return;
 
     // Receipt-time routing remains stable in the ordinary direction: a
@@ -785,11 +861,84 @@ export class Agent {
       return;
     }
 
-    if (routed.length === 1) {
-      await this.handleMessage(routed[0].channel, routed[0].message, steer, routed[0].resolution, routed[0].userRecorded);
-      return;
+    // `start` is written the moment the prompt reaches the SDK (the first
+    // point the model can act on it), not here: a crash before that is
+    // replayed as a fresh message rather than written off as "may already
+    // have run". From `start` on a crash is NOT re-run — the turn may already
+    // have acted — and the next start tells the session instead, quoting the
+    // messages (see replayInbox).
+    const inboxIds = inboxIdsOf(routed);
+    const progress = { unconsumed: false, handedOff: false, cutShort: false };
+    const hooks: InboxTurnHooks | undefined = inboxIds.length > 0
+      ? {
+        notConsumed: () => { progress.unconsumed = true; },
+        cutShort: () => { progress.cutShort = true; },
+        onPromptHandedOff: () => { progress.handedOff = true; this.markInboxStarted(routedKey, inboxIds); },
+      }
+      : undefined;
+    try {
+      if (routed.length === 1) {
+        await this.handleMessage(routed[0].channel, routed[0].message, steer, routed[0].resolution, routed[0].userRecorded, hooks);
+        return;
+      }
+      await this.handleBatchedMessages(routed, steer, hooks);
+    } finally {
+      if (inboxIds.length > 0) {
+        if (progress.unconsumed && !progress.handedOff) {
+          // A turn was set up for these but the prompt never reached the model
+          // (session build failed, refused for shutdown, a steer whose session
+          // died before the CLI pulled it). Not consumed, so not done: the
+          // record stays `received` and the next start answers it. Marking it
+          // done here would drop a message nobody ever saw.
+          log.warn({ sessionKey: routedKey, count: inboxIds.length }, "Durable inbox: turn ended before its prompt reached the model; left for replay on next start");
+        } else if (progress.cutShort) {
+          // Graceful shutdown stopped this turn mid-flight: the reply may be
+          // missing or partial, exactly as after a crash. Left `started`, so
+          // the next start tells the session (quoting the messages) instead of
+          // the shutdown silently writing them off.
+          log.info({ sessionKey: routedKey, count: inboxIds.length }, "Durable inbox: turn cut short by shutdown; the next start tells the session");
+        } else if (steer) {
+          // A steered message may have MERGED into another turn: its answer is
+          // that turn's reply, which is delivered and recorded only when that
+          // turn's own queue task finishes — after our STEER_MERGED resolves.
+          // The host may be a web or cron turn with no inbox record of its own,
+          // so marking done now would let a crash in that window drop the
+          // message silently. Behind the session queue, done lands after it.
+          this.enqueueForSession(routedKey, async () => { this.inbox?.markDone(inboxIds); })
+            .catch((err) => log.warn({ err, sessionKey: routedKey }, "Durable inbox: deferred done failed"));
+        } else {
+          this.inbox?.markDone(inboxIds);
+        }
+      }
     }
-    await this.handleBatchedMessages(routed, steer);
+  }
+
+  /**
+   * Record that a turn took these inbox records. A `start` the inbox could
+   * not write leaves a log a crash would replay — and answer twice — so it is
+   * raised loudly (see DurableInbox.markStarted).
+   */
+  private markInboxStarted(sessionKey: string, ids: string[]): void {
+    const unwritten = this.inbox?.markStarted(ids) ?? [];
+    if (unwritten.length === 0) return;
+    this.reportInboxFault(
+      `Tomo could not record on disk that it started answering ${unwritten.length === 1 ? "a message" : `${unwritten.length} messages`} in ${sessionKey}. `
+        + "The reply is going ahead; if Tomo crashes before it finishes, the message may be answered twice after the restart. Check the disk under ~/.tomo/data.",
+      { sessionKey, ids: unwritten },
+    );
+  }
+
+  /**
+   * An inbox write failed in a way that weakens a delivery guarantee: log it
+   * as an error and tell the owner (at most once per INBOX_FAULT_NOTICE_MS —
+   * a dead disk fails every message, and one DM says it).
+   */
+  private reportInboxFault(text: string, context: Record<string, unknown>): void {
+    log.error(context, `Durable inbox fault: ${text}`);
+    const now = Date.now();
+    if (now - this.lastInboxFaultNoticeAt < INBOX_FAULT_NOTICE_MS) return;
+    this.lastInboxFaultNoticeAt = now;
+    void this.notifyOwner(`⚠️ ${text}`).catch((err) => log.warn({ err }, "Could not send durable inbox fault notice"));
   }
 
   /**
@@ -1130,6 +1279,8 @@ export class Agent {
     // cron or background turn on the same session is the owner's again and
     // does not inherit a summoned group's narrower scope.
     const turnId = this.turnAudiences.begin(req.key, req.audiences);
+    // Until the SDK takes the prompt, this turn has not consumed its messages.
+    req.inboxHooks?.notConsumed();
     try {
       await this.runUserTurnInner(req);
     } finally {
@@ -1211,6 +1362,10 @@ export class Agent {
       },
       silentMatcher: isSilentReply,
       transcript: "always",
+      ...(req.inboxHooks ? {
+        onPromptHandedOff: req.inboxHooks.onPromptHandedOff,
+        onShutdown: (kind: ShutdownTurnEnd) => { if (kind === "interrupted") req.inboxHooks?.cutShort(); },
+      } : {}),
       errors: {
         visiblePrefix: "[error] ",
         // Agent-error responses stream back like any text and are handled by
@@ -1229,9 +1384,13 @@ export class Agent {
     steer = false,
     receiptResolution?: SessionResolution,
     userRecorded = false,
+    inboxHooks?: InboxTurnHooks,
   ): Promise<void> {
     if (this.commands.isRestoring) {
       channel.settleMessage?.(message.id, "refused");
+      // /restore drops input until the restart it leads to. A durably held
+      // message is not dropped: it stays `received` and that restart answers it.
+      inboxHooks?.notConsumed();
       return;
     }
 
@@ -1345,6 +1504,7 @@ export class Agent {
         steer,
         steerAudience: audience,
         passiveListen: isPassiveGroup,
+        ...(inboxHooks ? { inboxHooks } : {}),
         ...(channel.name === "web" ? { webRequestId: message.id } : {}),
       });
     } catch (err) {
@@ -1403,6 +1563,7 @@ export class Agent {
   private async handleBatchedMessages(
     items: InboundItem[],
     steer = false,
+    inboxHooks?: InboxTurnHooks,
   ): Promise<void> {
     const last = items[items.length - 1];
     const lastChannel = last.channel;
@@ -1515,6 +1676,7 @@ export class Agent {
         ? `${it.channel.name}:${it.message.chatId}`
         : key)),
       passiveListen: isPassiveGroup,
+      ...(inboxHooks ? { inboxHooks } : {}),
     });
   }
 
@@ -1533,7 +1695,7 @@ export class Agent {
    * summonReminder, which is appended to the prompt but kept out of transcripts.
    */
   private formatGroupText(
-    channel: Channel,
+    channel: Pick<Channel, "name">,
     message: IncomingMessage,
     sessionKey: string,
     people: PeopleSnapshot,
@@ -2153,7 +2315,18 @@ export class Agent {
 
   async start(): Promise<void> {
     log.info({ channels: this.channels.length }, "Starting Tomo");
+    // Snapshot what the PREVIOUS run left BEFORE any channel starts ingesting:
+    // a message accepted while another channel is still starting is already
+    // dispatched by live ingress, and replaying it too would run it twice (or
+    // misread its fresh turn as interrupted).
+    const recovered = this.inbox?.pending() ?? [];
     await Promise.all(this.channels.map((ch) => ch.start()));
+    try {
+      this.replayInbox(recovered);
+    } catch (err) {
+      // Replay is recovery, never a startup prerequisite.
+      log.error({ err }, "Durable inbox replay failed");
+    }
     this.startMcpTokenRefreshSweep();
     log.info("Tomo is running");
 
@@ -2324,6 +2497,7 @@ export class Agent {
           CHANNEL_TEARDOWN_TIMEOUT_MS,
           () => Promise.all(this.channels.map((ch) => ch.teardown())),
         );
+        this.inbox?.close();
       }
     }
   }
@@ -2424,12 +2598,27 @@ export class Agent {
     this.recordInboundItems(pending);
   }
 
-  /** Append `<user message>` + the not-processed marker for each item. */
-  private recordInboundItems(pending: Map<string, InboundItem[]>): void {
+  /**
+   * Append `<user message>` + the not-processed marker for each item.
+   *
+   * Items still pending in the durable inbox are skipped: the next start
+   * replays them, and recording them here as well would put the message in
+   * the transcript twice with a marker that turns out to be false.
+   */
+  private recordInboundItems(
+    pending: Map<string, Array<Pick<InboundItem, "message" | "inboxId" | "userRecorded"> & { channel: Pick<Channel, "name"> }>>,
+    marker: string = SHUTDOWN_NOT_PROCESSED,
+  ): void {
     // One read for the whole drain: this runs during shutdown, where every
     // avoidable synchronous file read delays the exit.
     const people = createPeopleSnapshot();
-    for (const [key, items] of pending) {
+    for (const [key, all] of pending) {
+      const items = all.filter((it) => !(it.inboxId && this.inbox?.isPending(it.inboxId) && marker === SHUTDOWN_NOT_PROCESSED));
+      const leftForReplay = all.length - items.length;
+      if (leftForReplay > 0) {
+        log.info({ sessionKey: key, count: leftForReplay }, "Inbound messages left in the durable inbox for replay on next start");
+      }
+      if (items.length === 0) continue;
       for (const { channel, message, userRecorded } of items) {
         if (!userRecorded) this.sessions.append(key, {
           role: "user",
@@ -2441,16 +2630,154 @@ export class Agent {
         });
         this.sessions.append(key, {
           role: "assistant",
-          content: SHUTDOWN_NOT_PROCESSED,
+          content: marker,
           channel: channel.name,
           ...(channel.name === "web" ? { requestId: message.id } : {}),
           timestamp: Date.now(),
         });
       }
+      this.inbox?.markDone(inboxIdsOf(items));
       log.info(
         { sessionKey: key, count: items.length },
         "Recorded inbound messages shutdown will not process",
       );
     }
   }
+
+  /**
+   * Settle what the durable inbox still holds from the previous run. Called
+   * once, from start(), after the channels are up (a replayed turn has to be
+   * able to reply).
+   *
+   * - `received` → dispatched again through the normal ingress path, so they
+   *   coalesce, steer and settle exactly as they would have. The session is
+   *   told the messages are being answered late.
+   * - `started` → NOT re-run: the turn that was consuming them may already
+   *   have called tools or sent part of a reply. The session gets a note to
+   *   check before assuming they were answered.
+   * - too old (`inboxReplayMaxAgeMinutes`), or their channel is gone → the
+   *   transcript records them with a not-processed marker, as a graceful
+   *   shutdown would have.
+   */
+  private replayInbox(records: InboxRecord[]): void {
+    if (!this.inbox || records.length === 0) return;
+
+    const maxAgeMs = config.inboxReplayMaxAgeMinutes * 60_000;
+    const now = Date.now();
+    const interrupted = new Map<string, InboxRecord[]>();
+    const stale = new Map<string, Array<{ channel: Pick<Channel, "name">; message: IncomingMessage; inboxId: string }>>();
+    const replay: Array<{ rec: InboxRecord; channel: Channel }> = [];
+    for (const rec of records) {
+      const key = rec.resolution.sessionKey;
+      if (rec.status === "started") {
+        interrupted.set(key, [...(interrupted.get(key) ?? []), rec]);
+        continue;
+      }
+      const channel = this.getChannel(rec.channel);
+      if (!channel || maxAgeMs <= 0 || now - rec.receivedAt > maxAgeMs) {
+        stale.set(key, [...(stale.get(key) ?? []), { channel: channel ?? { name: rec.channel }, message: restoreMessage({ ...rec.message, images: undefined, documents: undefined }), inboxId: rec.id }]);
+        continue;
+      }
+      replay.push({ rec, channel });
+    }
+
+    for (const [key, recs] of interrupted) {
+      const oldest = new Date(recs[0].receivedAt).toISOString();
+      // The messages themselves travel with the note: the turn may have died
+      // before the prompt ever reached the transcript, and a note that only
+      // says "something was interrupted" leaves nothing to answer.
+      //
+      // CUSTODY HAND-OFF. From here the note is the message's only copy, so
+      // the inbox record is closed only once EVERY part of it is in the
+      // durable pending-notes store (which keeps a note until the turn that
+      // carries it ends — see PendingNotesQueue). A note that could not be
+      // persisted leaves the record started: the next start tells the session
+      // again (a repeated note, never a lost message).
+      const chunks = interruptedNoteChunks(recs);
+      let persisted = true;
+      chunks.forEach((chunk, i) => {
+        const part = chunks.length > 1
+          ? ` (part ${i + 1} of ${chunks.length}; the quoted text continues across parts exactly where each one ends)`
+          : "";
+        const ok = this.queuePendingNote(key, formatTomoEvent(
+          "inbox",
+          `Tomo restarted while a turn was handling ${recs.length === 1 ? "a message" : `${recs.length} messages`} received from ${oldest}${part}. `
+            + "Your reply may be missing or incomplete; check the conversation before assuming it was answered, "
+            + "and answer now if it was not.\n"
+            + chunk,
+          { name: "interrupted" },
+        ));
+        persisted &&= ok;
+      });
+      if (persisted) {
+        this.inbox.markDone(recs.map((r) => r.id));
+      } else {
+        log.error({ sessionKey: key, count: recs.length }, "Durable inbox: could not persist the interrupted-turn note; the inbox record is kept so the next start tells the session again");
+      }
+      log.warn({ sessionKey: key, count: recs.length }, "Durable inbox: turn was interrupted by a restart; session notified, not re-run");
+    }
+
+    if (stale.size > 0) this.recordInboundItems(stale, INBOX_STALE_NOT_PROCESSED);
+
+    const perSession = new Map<string, number>();
+    for (const { rec } of replay) perSession.set(rec.resolution.sessionKey, (perSession.get(rec.resolution.sessionKey) ?? 0) + 1);
+    for (const [key, count] of perSession) {
+      this.queuePendingNote(key, formatTomoEvent(
+        "inbox",
+        `${count === 1 ? "The next message" : `The next ${count} messages`} arrived before Tomo restarted and ${count === 1 ? "is" : "are"} being answered late.`,
+        { name: "replay" },
+      ));
+      log.info({ sessionKey: key, count }, "Durable inbox: replaying messages received before the restart");
+    }
+    for (const { rec, channel } of replay) {
+      this.dispatchInbound(channel, restoreMessage(rec.message), rec.resolution, rec.id);
+    }
+  }
+}
+
+/**
+ * Size of one `interrupted` note part. Larger quoted text is split across
+ * parts — never truncated: the note is the message's only remaining copy.
+ */
+const INTERRUPTED_NOTE_CHUNK = 16_000;
+
+/** One interrupted message as quoted in the note, in full: sender, text, saved attachments. */
+function formatInterruptedMessage(rec: InboxRecord, i: number, total: number): string {
+  const text = rec.message.text ?? "";
+  const sender = rec.message.senderName ? `${rec.message.senderName}: ` : "";
+  const attachments = [...(rec.message.images ?? []), ...(rec.message.documents ?? [])]
+    .map((a) => `\n  [attachment ${a.mediaType}: ${a.savedPath ?? "not saved"}]`).join("");
+  return `Message ${i + 1}${total > 1 ? ` of ${total}` : ""} (${new Date(rec.receivedAt).toISOString()}) — ${sender}${text}${attachments}`;
+}
+
+/**
+ * Every interrupted message, quoted in full, cut into note-sized parts in
+ * order. A message longer than one part continues in the next. Nothing is
+ * left out or shortened: a character not quoted here is a character lost.
+ */
+export function interruptedNoteChunks(recs: readonly InboxRecord[], chunkSize = INTERRUPTED_NOTE_CHUNK): string[] {
+  // By code point, so a cut never splits a surrogate pair.
+  const all = Array.from(recs.map((rec, i) => formatInterruptedMessage(rec, i, recs.length)).join("\n"));
+  const chunks: string[] = [];
+  for (let at = 0; at < all.length; at += chunkSize) chunks.push(all.slice(at, at + chunkSize).join(""));
+  return chunks.length > 0 ? chunks : [""];
+}
+
+/** Owner DMs about inbox faults: at most one per this window. */
+const INBOX_FAULT_NOTICE_MS = 10 * 60_000;
+
+/**
+ * The durable inbox could not persist an inbound message from a channel that
+ * redelivers what it was not told it handed off. Thrown out of the message
+ * handler so the channel treats the row as not handled.
+ */
+export class InboxPersistError extends Error {
+  constructor(channelName: string, messageId: string) {
+    super(`Durable inbox could not persist ${channelName} message ${messageId}; not taking custody so the channel redelivers it`);
+    this.name = "InboxPersistError";
+  }
+}
+
+function inboxIdsOf(items: ReadonlyArray<{ inboxId?: string }>): string[] {
+  return items.flatMap((item) => (item.inboxId ? [item.inboxId] : []));
 }

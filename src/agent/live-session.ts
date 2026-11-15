@@ -93,6 +93,8 @@ export interface SteerJoin {
   /** Called synchronously once the input is in the SDK's input queue: from
    *  then on it may run even with no echo, so it must never be re-sent. */
   onHandedOff?: () => void;
+  /** See TurnRequest.onPromptHandedOff (any steered input, not only web). */
+  onPromptHandedOff?: () => void;
 }
 export interface TurnRequest {
   replyContext?: ReplyContext;
@@ -154,6 +156,10 @@ export interface TurnRequest {
 
 export interface MessageRequest extends TurnRequest {
   message: SDKUserMessage;
+  /** Called when the SDK takes the prompt from the input generator — the
+   *  first moment the model can act on it. Not called for a prompt still
+   *  queued when the session dies. */
+  onPromptHandedOff?: () => void;
 }
 
 /**
@@ -212,6 +218,8 @@ export class LiveSession {
   // The SDK pumps this eagerly (writes to the CLI as soon as we yield), which
   // is what lets steer() inject a message while a turn is in flight.
   private inputQueue: SDKUserMessage[] = [];
+  /** Called as the SDK takes a message off inputQueue (see messageGenerator). */
+  private readonly onInputTaken = new WeakMap<SDKUserMessage, () => void>();
   private inputWaiter: (() => void) | null = null;
   // The request that owns the in-flight turn: its callbacks receive the
   // turn's collected blocks and it resolves with the turn's full response.
@@ -372,11 +380,18 @@ export class LiveSession {
         await new Promise<void>((resolve) => { this.inputWaiter = resolve; });
         this.inputWaiter = null;
       }
-      yield this.inputQueue.shift()!;
+      const msg = this.inputQueue.shift()!;
+      // The SDK pulled this message (it awaits next() and writes what it gets
+      // to the CLI straight away). Sitting in inputQueue it was still ours:
+      // a crash there never reached the model. Only now is it handed off.
+      const taken = this.onInputTaken.get(msg);
+      this.onInputTaken.delete(msg);
+      try { taken?.(); } catch (err) { log.warn({ err, session: this.sessionKey }, "input hand-off callback threw"); }
+      yield msg;
     }
   }
 
-  private pushInput(msg: SDKUserMessage, requestId?: string): void {
+  private pushInput(msg: SDKUserMessage, requestId?: string, onTaken?: () => void): void {
     // A client uuid on every send: the CLI stamps it back on the assistant
     // frames and the result of the turn that consumed it
     // (`user_message_uuids`), which is how attributeResult tells this
@@ -384,6 +399,7 @@ export class LiveSession {
     // the web UI learns the message was read.
     msg.uuid ??= randomUUID();
     this.readReceipts.track(msg.uuid, requestId);
+    if (onTaken) this.onInputTaken.set(msg, onTaken);
     this.inputQueue.push(msg);
     this.inputWaiter?.();
   }
@@ -1521,7 +1537,7 @@ export class LiveSession {
           this.parts = [];
           this.turnSawAssistant = false;
           this.refreshActivityTimeout();
-          this.pushInput(req.message, req.replyContext?.requestId);
+          this.pushInput(req.message, req.replyContext?.requestId, req.onPromptHandedOff);
           return;
         }
         // Steered messages can keep the session busy past the turn that the
@@ -1542,6 +1558,8 @@ export class LiveSession {
     /** This turn's reply text will not be delivered (see TurnRequest). */
     silentDelivery?: boolean,
     replyContext?: ReplyContext,
+    /** See MessageRequest.onPromptHandedOff. */
+    onPromptHandedOff?: () => void,
   ): Promise<string> {
     if (!this.alive) throw new Error("Session is closed");
 
@@ -1565,6 +1583,7 @@ export class LiveSession {
         ...(onBlock ? { onBlock } : {}),
         ...(onBlockAbandoned ? { onBlockAbandoned } : {}),
         ...(silentDelivery ? { silentDelivery } : {}),
+        ...(onPromptHandedOff ? { onPromptHandedOff } : {}),
         replyContext,
       };
       // Rejects only if the session dies before the claim; once claimed, the
@@ -1597,7 +1616,7 @@ export class LiveSession {
     audience?: string[],
     join: SteerJoin = {},
   ): Promise<string> {
-    const { replyContext, onJoined, canJoin, onHandedOff } = join;
+    const { replyContext, onJoined, canJoin, onHandedOff, onPromptHandedOff } = join;
     if (!this.alive) throw new Error("Session is closed");
     // Ingress may have observed a different turn before asynchronous prompt /
     // session preparation. Check at injection, with no await before enqueue.
@@ -1607,7 +1626,7 @@ export class LiveSession {
     if (replyContext?.channel === "web" && (!this.isBusy() || !this.isInteractiveTurn() || canJoin?.() !== true)) {
       throw new SteerDeclinedError();
     }
-    if (!this.isBusy()) return this.send(text, images, documents, onBlock, onBlockAbandoned, origin, false, replyContext);
+    if (!this.isBusy()) return this.send(text, images, documents, onBlock, onBlockAbandoned, origin, false, replyContext, onPromptHandedOff);
 
     // New instructions arrived — refresh the turn budget like any user message.
     if (this.turnBudget) resetTurnBudget(this.turnBudget);
@@ -1661,7 +1680,7 @@ export class LiveSession {
       // Keyed on the text the CLI actually received (note included) — that is
       // what it echoes back, and matchSteerEchoes compares verbatim.
       this.pendingSteers.push({ req, text: injected });
-      this.pushInput(req.message, replyContext?.requestId);
+      this.pushInput(req.message, replyContext?.requestId, onPromptHandedOff);
       onHandedOff?.();
     });
   }

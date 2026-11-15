@@ -626,3 +626,66 @@ describe("per-block trailing NO_REPLY in TurnRunner.onBlock", () => {
     expect(h.transcript.map((t) => t.content)).toEqual(["the real answer"]);
   });
 });
+
+describe("TurnRunner: pending notes are consumed only by a prompt the model took", () => {
+  function notesHarness(respond: (req: RunWithRetryRequest) => Promise<string>) {
+    const h = makeHarness(respond);
+    const settled: string[] = [];
+    const restored: string[] = [];
+    const deps = (h.runner as unknown as { deps: TurnRunnerDeps }).deps;
+    deps.settlePendingNotes = (_key, drained) => { settled.push(drained); };
+    deps.restorePendingNotes = (_key, drained) => { restored.push(drained); };
+    const interrupted: string[] = [];
+    deps.restoreInterruptedPendingNotes = (_key, drained) => { interrupted.push(drained); };
+    return { h, settled, restored, interrupted };
+  }
+
+  it("settles the notes once the SDK took the prompt and the turn ended", async () => {
+    const { h, settled, restored } = notesHarness(async (req) => { req.onPromptHandedOff?.(); return "ok"; });
+    await h.runner.runTurn(replySpec(h));
+    expect(settled).toEqual(["[note]\n\n"]);
+    expect(restored).toEqual([]);
+  });
+
+  it("puts the notes back when the turn ended without the prompt reaching the model", async () => {
+    // A clean end that never handed anything off (refused for shutdown, say)…
+    const clean = notesHarness(async () => "NO_REPLY");
+    await clean.h.runner.runTurn(replySpec(clean.h));
+    expect(clean.settled).toEqual([]);
+    expect(clean.restored).toEqual(["[note]\n\n"]);
+
+    // …and a failure before hand-off (the session could not be built).
+    const failed = notesHarness(async () => { throw new Error("session build failed"); });
+    await failed.h.runner.runTurn(replySpec(failed.h));
+    expect(failed.settled).toEqual([]);
+    expect(failed.restored).toEqual(["[note]\n\n"]);
+  });
+});
+
+describe("TurnRunner: notes taken by a turn that did not finish", () => {
+  function harness(respond: (req: RunWithRetryRequest) => Promise<string>) {
+    const h = makeHarness(respond);
+    const calls: string[] = [];
+    const deps = (h.runner as unknown as { deps: TurnRunnerDeps }).deps;
+    deps.settlePendingNotes = () => { calls.push("settle"); };
+    deps.restorePendingNotes = () => { calls.push("restore"); };
+    deps.restoreInterruptedPendingNotes = () => { calls.push("interrupted"); };
+    return { h, calls };
+  }
+
+  it("keeps them (marked) when graceful shutdown cut the turn short", async () => {
+    const { h, calls } = harness(async (req) => {
+      req.onPromptHandedOff?.();
+      req.onShutdownInterrupted?.();
+      return "NO_REPLY";
+    });
+    await h.runner.runTurn(replySpec(h));
+    expect(calls).toEqual(["interrupted"]);
+  });
+
+  it("keeps them (marked) when the turn failed after taking them", async () => {
+    const { h, calls } = harness(async (req) => { req.onPromptHandedOff?.(); throw new Error("aborted"); });
+    await h.runner.runTurn(replySpec(h));
+    expect(calls).toEqual(["interrupted"]);
+  });
+});

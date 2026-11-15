@@ -50,7 +50,7 @@ import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/bl
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { appendToTomoEventBody, formatTomoEvent } from "./tomo-event.js";
-import { UsageLedger, triggerSnippet, type UsageSource } from "./usage/ledger.js";
+import { UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
 import { usageDataDir } from "./usage/dir.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
@@ -318,7 +318,13 @@ export class Agent {
       retireSdkSessionId: (key) => { this.sessions.retireSdkSessionId(key); },
       getUsageBaseline: (key, sdkSessionId) => this.resumeUsageBaseline(key, sdkSessionId),
       updateStats: (key, result) => {
-        this.sessions.updateStats(key, result);
+        // Stats only. The registry's usage baseline is advanced by landed
+        // usage-ledger rows alone (recordUsage below), never by a result
+        // seen: a baseline that ran ahead of the ledger would let a resume
+        // skip a turn whose row failed to land.
+        const { usageBaseline: _seen, ...stats } = result;
+        void _seen;
+        this.sessions.updateStats(key, stats);
         watchBus.publish({
           type: "turn.stats",
           sessionKey: key,
@@ -331,7 +337,14 @@ export class Agent {
           ...(result.contextEstimated ? { contextEstimated: true } : {}),
         });
       },
-      recordUsage: (key, build, onWritten) => { void this.usageLedger.appendFor(key, build, onWritten); },
+      recordUsage: (key, build, onWritten) => {
+        let row: UsageLedgerRow | undefined;
+        void this.usageLedger.appendFor(key, () => (row = build()), () => {
+          onWritten();
+          // The registry copy follows the ledger, one landed row at a time.
+          if (row) this.sessions.setUsageBaseline(key, row.snapshot ?? null);
+        });
+      },
       getSessionMessages: (key) => this.sessions.get(key).messages,
       getModelOverride: (key) => this.modelOverrides.get(key),
       createInternalMcpServer: (key) => createTomoInternalMcpServer(this, key),
@@ -1140,9 +1153,16 @@ export class Agent {
    * The usage baseline a resume of `sdkSessionId` on `key` starts from. The
    * LEDGER is the source: its last row for that SDK session carries the
    * cumulative snapshot, written in the same append as the turn's delta, so
-   * the two cannot disagree. Rows still queued land first. The registry's
-   * copy is only the fallback for a session the ledger has no row for
-   * (sessions older than the ledger, or a ledger that could not be written).
+   * the two cannot disagree. Rows still queued land first.
+   *
+   * The registry's copy is the fallback for a session the ledger has no row
+   * for. It is advanced ONLY by landed ledger rows (and starts at zero with a
+   * new SDK session), so it can lag the ledger but never lead it: a session
+   * whose rows have all failed resumes from zero and its first landed row
+   * carries everything, rather than skipping what never landed. Not "no
+   * registry at all": sessions older than the ledger have a registry
+   * baseline and no row, and starting them from zero would charge each one's
+   * whole lifetime to its first row.
    */
   private async resumeUsageBaseline(key: string, sdkSessionId: string): Promise<UsageBaseline | undefined> {
     await this.usageLedger.idle();

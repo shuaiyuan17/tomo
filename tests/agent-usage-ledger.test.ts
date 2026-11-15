@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { chmodSync, existsSync, readdirSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { formatTomoEvent } from "../src/tomo-event.js";
 
@@ -148,5 +148,69 @@ describe("usage ledger and the resume baseline", () => {
     expect(rows.map((r) => r.costUsd)).toEqual([1.0, 0.75]);
     expect(rows[1].models).toEqual({ "claude-opus": { input: 30, output: 15, cacheRead: 0, cacheCreated: 0, webSearch: 0, costUsd: 0.75 } });
     expect(rows.reduce((sum, r) => sum + (r.costUsd as number), 0)).toBe(1.75);
+  });
+
+  it("every write failing from the session's first turn: the registry stays at zero, so the first row that lands carries it all", async () => {
+    // Not a directory: every ledger write fails from the start.
+    mkdirSync(join(agentEnv.tmpDir, "data"), { recursive: true });
+    writeFileSync(join(agentEnv.tmpDir, "data", "usage"), "not a directory");
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    const key = "telegram:12345";
+    const ledger = (agent as unknown as { usageLedger: { idle(): Promise<void> } }).usageLedger;
+
+    for (const [text, total] of [["one", 1.0], ["two", 1.5]] as const) {
+      mockSdk.responseFn = () => text;
+      mockSdk.nextResult = { total_cost_usd: total };
+      await tg.simulateMessage(makeMsg({ chatId: "12345", text }));
+      await drainQueue(agent);
+      await ledger.idle();
+    }
+    // Session stats saw both turns; the ledger has nothing.
+    expect((agent as unknown as { sessions: { getEntry(k: string): { stats: { totalCostUsd: number } } } }).sessions.getEntry(key).stats.totalCostUsd).toBeCloseTo(1.5);
+
+    // The disk recovers, the session is rebuilt and resumes.
+    rmSync(join(agentEnv.tmpDir, "data", "usage"));
+    (agent as unknown as { liveSessionManager: { closeLiveSession(k: string): void } }).liveSessionManager.closeLiveSession(key);
+    mockSdk.responseFn = () => "three";
+    mockSdk.nextResult = { total_cost_usd: 1.75 };
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "three" }));
+    await drainQueue(agent);
+    await agent.stop();
+
+    const rows = ledgerRows();
+    expect(rows.map((r) => r.costUsd)).toEqual([1.75]);
+    expect(rows[0].noBaseline).toBeUndefined();
+  });
+
+  it("the registry copy follows landed rows, for a resume the ledger cannot answer", async () => {
+    const models = (n: number) => ({
+      "claude-opus": { inputTokens: 10 * n, outputTokens: 5 * n, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, webSearchRequests: 0, costUSD: 0.25 * n },
+    });
+    const first = new Agent();
+    const tg1 = new MockChannel("telegram");
+    first.addChannel(tg1);
+    mockSdk.responseFn = () => "one";
+    mockSdk.nextResult = { total_cost_usd: 1.0, modelUsage: models(4) };
+    await tg1.simulateMessage(makeMsg({ chatId: "12345", text: "one" }));
+    await drainQueue(first);
+    await first.stop();
+    expect(ledgerRows().map((r) => r.costUsd)).toEqual([1.0]);
+
+    // The ledger's rows are gone (out of the look-back, or lost): a restarted
+    // daemon can only resume from the registry's copy.
+    const dir = join(agentEnv.tmpDir, "data", "usage");
+    for (const f of readdirSync(dir)) rmSync(join(dir, f));
+
+    const second = new Agent();
+    const tg2 = new MockChannel("telegram");
+    second.addChannel(tg2);
+    mockSdk.responseFn = () => "two";
+    mockSdk.nextResult = { total_cost_usd: 1.25, modelUsage: models(5) };
+    await tg2.simulateMessage(makeMsg({ chatId: "12345", text: "two" }));
+    await drainQueue(second);
+    await second.stop();
+    expect(ledgerRows().map((r) => r.costUsd)).toEqual([0.25]);
   });
 });

@@ -744,8 +744,9 @@ export class SessionStore {
       const stub = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null && !e.sdkSessionId);
       if (stub) {
         stub.sdkSessionId = sessionId;
-        // A new SDK session starts its cumulative totals from zero.
-        delete stub.usageBaseline;
+        // A new SDK session starts its cumulative totals from zero — which is
+        // exactly what its baseline says until a usage-ledger row lands.
+        stub.usageBaseline = zeroUsageBaseline(sessionId);
         stub.lastActiveAt = Date.now();
         this.saveRegistry();
         return;
@@ -764,6 +765,7 @@ export class SessionStore {
         lastActiveAt: now,
         unlinkedAt: null,
         expiresAt: null,
+        usageBaseline: zeroUsageBaseline(sessionId),
         stats: {
           totalQueries: 0,
           totalCostUsd: 0,
@@ -865,6 +867,23 @@ export class SessionStore {
       if (update.usageBaseline !== undefined) applyUsageBaseline(entry, update.usageBaseline);
       entry.lastActiveAt = Date.now();
       this.saveRegistryBestEffort("updateStats");
+    });
+  }
+
+  /**
+   * Persist the usage baseline from a usage-ledger row that has LANDED — the
+   * only writer of a baseline besides the zero one a new SDK session starts
+   * with (setSdkSessionId). The registry copy is the resume fallback for a
+   * session the ledger has no row for, so it must never run ahead of the
+   * ledger: a turn whose row failed to land is then still owed by the next
+   * row, whichever copy the resume reads. `null` drops it.
+   */
+  setUsageBaseline(key: string, baseline: UsageBaseline | null): void {
+    this.mutateRegistry("setUsageBaseline", "bookkeeping", () => {
+      const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+      if (!entry) return;
+      applyUsageBaseline(entry, baseline);
+      this.saveRegistryBestEffort("setUsageBaseline");
     });
   }
 
@@ -3552,4 +3571,9 @@ export class SessionStore {
 function applyUsageBaseline(entry: SessionEntry, baseline: UsageBaseline | null): void {
   if (baseline && baseline.sdkSessionId === entry.sdkSessionId) entry.usageBaseline = baseline;
   else delete entry.usageBaseline;
+}
+
+/** The baseline of an SDK session nothing has been accounted for yet. */
+function zeroUsageBaseline(sdkSessionId: string): UsageBaseline {
+  return { sdkSessionId, totalCostUsd: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheCreated: 0 }, models: {} };
 }

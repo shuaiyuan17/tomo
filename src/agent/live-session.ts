@@ -73,7 +73,16 @@ export {
 } from "./block-render.js";
 export { summarizeToolInput } from "./tool-summary.js";
 
-export interface ReplyContext { turnId: string; channel: string; requestId?: string; webJoined?: boolean; interactive?: boolean }
+export interface ReplyContext { turnId: string; channel: string; requestId?: string; webJoined?: boolean; interactive?: boolean;
+  /**
+   * Set when THIS request's turn ended because the owner pressed Stop. The
+   * turn resolves like a finished one (what it had said, or NO_REPLY) so
+   * nothing is reported as an error, but it is not a finished run, and a
+   * caller that records outcomes (cron) must be told. It rides on the
+   * request's own context, never on the session: completion bookkeeping can
+   * close and replace the session (a compact reload) before the caller looks.
+   */
+  stopped?: boolean }
 /** How owner web input joins a running turn (see LiveSession.steer). */
 export interface SteerJoin {
   replyContext?: ReplyContext;
@@ -977,7 +986,10 @@ export class LiveSession {
       // interrupted). That is what he asked for: no failure, no error notice.
       const stopped = this.stopRequestedFor !== null && this.stopRequestedFor === this.currentRequest;
       this.stopRequestedFor = null;
-      if (stopped) { this.publishSignal({ kind: "stopped" }); this.turnStopped = true; }
+      if (stopped) {
+        this.publishSignal({ kind: "stopped" });
+        if (this.currentRequest?.replyContext) this.currentRequest.replyContext.stopped = true;
+      }
       const failure = stopped ? null : describeResultFailure(result);
       if (failure) {
         log.warn(
@@ -1115,19 +1127,6 @@ export class LiveSession {
     watchBus.publish({ type: "sdk", ...(this.sessionKey ? { sessionKey: this.sessionKey } : {}), signal });
   }
 
-  /** The turn that just settled was stopped by the owner (read-and-clear, see takeTurnStopped). */
-  private turnStopped = false;
-  /**
-   * Read-and-clear: did the turn that just resolved end because the owner
-   * pressed Stop? The turn resolves like a finished one (what it had said, or
-   * NO_REPLY) so nothing is reported to the owner as an error, but it is NOT
-   * a finished run: a caller that records outcomes (cron) must be told.
-   */
-  takeTurnStopped(): boolean {
-    const stopped = this.turnStopped;
-    this.turnStopped = false;
-    return stopped;
-  }
   /** The request whose turn the owner asked to stop; its result is a clean end, not a failure. */
   private stopRequestedFor: TurnRequest | null = null;
   /**

@@ -12,7 +12,7 @@
  * Stop goes through Agent.stopTurn, exactly as the web channel calls it.
  */
 import { afterAll, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -21,7 +21,8 @@ vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/agent-mocks.js")).sdkModuleMock());
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
-import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockSdk, waitFor } from "./helpers/agent-harness.js";
+import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockConfig, mockSdk, waitFor } from "./helpers/agent-harness.js";
+import { getCompactTriggerPath } from "../src/lcm/compact.js";
 import { CronStore } from "../src/cron/store.js";
 import { CronScheduler } from "../src/cron/scheduler.js";
 
@@ -117,6 +118,36 @@ describe("a cron run the owner stopped is not recorded as finished", () => {
       const again = new CronScheduler(agent, new CronStore(path));
       again.start();
       try { await waitFor(() => expect(new CronStore(path).get(job.id)?.lastStatus).toBe("ok")); } finally { again.stop(); }
+    } finally { scheduler.stop(); await agent.stop(); }
+  });
+
+  it("Stop racing a compact reload: the session is closed and replaced before the outcome is read, and the run is still interrupted", async () => {
+    const { agent, path, store } = await setup();
+    const job = store.add({ name: "tidy", schedule: { kind: "at", at: soon() }, message: "compact and tidy up", sessionKey: "telegram:12345" });
+    await elapse();
+    const runs = hangingRuns();
+    const closeLiveSession = vi.spyOn((agent as unknown as { liveSessionManager: { closeLiveSession(key: string): void } }).liveSessionManager, "closeLiveSession");
+    const scheduler = new CronScheduler(agent, store);
+    scheduler.start();
+    try {
+      await waitFor(() => expect(runs.started).toBe(1));
+      // The run compacted its own context: the manager's completion
+      // bookkeeping finds this trigger and closes the session instance
+      // before control returns to the turn runner.
+      mkdirSync(mockConfig.sdkSessionsDir, { recursive: true });
+      const trigger = getCompactTriggerPath("mock-sdk-session-123", mockConfig.sdkSessionsDir);
+      writeFileSync(trigger, "");
+      const key = runningKey();
+      closeLiveSession.mockClear();
+      await agent.stopTurn(key);
+      runs.release("too late");
+      await waitFor(() => expect(new CronStore(path).get(job.id)?.lastStatus).toBe("interrupted"));
+      // The race really happened: the trigger was consumed and the instance closed.
+      expect(existsSync(trigger)).toBe(false);
+      expect(closeLiveSession).toHaveBeenCalledWith(key);
+      const kept = new CronStore(path).get(job.id)!;
+      expect(kept.enabled).toBe(false);
+      expect(kept.nextRunAt).toBeNull();
     } finally { scheduler.stop(); await agent.stop(); }
   });
 

@@ -261,11 +261,6 @@ export class LiveSessionManager {
     return this.liveSessions.get(key)?.isInteractiveTurn() ?? false;
   }
 
-  /** Read-and-clear: see LiveSession.takeTurnStopped. False when not live. */
-  takeTurnStopped(key: string): boolean {
-    return this.liveSessions.get(key)?.takeTurnStopped() ?? false;
-  }
-
   /** Read-and-clear: see LiveSession.takeUndeliveredReply. False when not live. */
   takeUndeliveredReply(key: string): boolean {
     return this.liveSessions.get(key)?.takeUndeliveredReply() ?? false;

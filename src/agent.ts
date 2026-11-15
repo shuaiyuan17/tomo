@@ -222,7 +222,6 @@ export class Agent {
       isPrivateMemoryBarred: (sessionKey) => this.isPrivateMemoryBarred(sessionKey),
       delivery: this.delivery,
       undeliveredReplyAtTurnEnd: (sessionKey) => this.liveSessionManager.takeUndeliveredReply(sessionKey),
-      turnStoppedByOwner: (sessionKey) => this.liveSessionManager.takeTurnStopped(sessionKey),
       requestRestate: (sessionKey, target) => this.restateUndeliveredReply(sessionKey, target),
       reportSuppressedError: (sessionKey, target, detail) => this.reportSuppressedError(sessionKey, target, detail),
       recordTurnOutcome: (sessionKey, ok) => { if (ok) this.lastGoodTurnAt.set(sessionKey, Date.now()); },

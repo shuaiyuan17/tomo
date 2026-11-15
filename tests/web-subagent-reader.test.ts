@@ -116,6 +116,25 @@ describe("readSubagentPage", () => {
     expect(await readSubagentModel(dir, SDK, "../a1")).toBeUndefined();
   });
 
+  it("prefers the meta.json written at spawn: pickedEffortModel, else model; the transcript is the fallback", async () => {
+    const meta = (id: string, body: unknown) => writeFileSync(join(dir, SDK, "subagents", `agent-${id}.meta.json`), JSON.stringify(body));
+    const withModel = (model: string) => JSON.stringify({ type: "assistant", message: { model, content: [] } }) + "\n";
+    // Spawned, no assistant entry yet: the meta already knows.
+    writeFileSync(file("m1"), line("user", [{ type: "text", text: "prompt" }]));
+    meta("m1", { agentType: "general-purpose", model: "opus", pickedEffortModel: "claude-opus-5-5" });
+    expect(await readSubagentModel(dir, SDK, "m1")).toBe("claude-opus-5-5");
+    meta("m2", { agentType: "general-purpose", model: "sonnet" });
+    expect(await readSubagentModel(dir, SDK, "m2")).toBe("sonnet");
+    // Meta unusable (no model / not JSON / oversized): fall back to the transcript.
+    writeFileSync(file("m3"), withModel("claude-fable-5-2"));
+    meta("m3", { agentType: "general-purpose" });
+    expect(await readSubagentModel(dir, SDK, "m3")).toBe("claude-fable-5-2");
+    writeFileSync(join(dir, SDK, "subagents", "agent-m3.meta.json"), "{not json");
+    expect(await readSubagentModel(dir, SDK, "m3")).toBe("claude-fable-5-2");
+    meta("m3", { pickedEffortModel: "x".repeat(70) });
+    expect(await readSubagentModel(dir, SDK, "m3")).toBe("claude-fable-5-2");
+  });
+
   it("the brief is the first entry only (string or text blocks), clipped; later user text is a message", async () => {
     const userLine = (content: unknown) => JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n";
     writeFileSync(file(), userLine("Review **PR #482**.") + text("ok") + userLine([{ type: "text", text: "Also check the tests." }]));

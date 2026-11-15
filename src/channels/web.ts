@@ -51,7 +51,7 @@ export class WebChannel implements Channel {
   private readonly usageReader: ((refresh: boolean) => Promise<WebUsage>) | undefined;
   private readonly taskModel: ((sessionKey: string, taskId: string) => Promise<string | undefined>) | undefined;
   /** Model lookups in progress (or given up), per key and task. */
-  private modelLookups = new Map<string, { key: string; taskId: string; attempt: number; timer: ReturnType<typeof setTimeout> | undefined }>();
+  private modelLookups = new Map<string, { key: string; taskId: string; runId: string | undefined; attempt: number; timer: ReturnType<typeof setTimeout> | undefined }>();
   private readonly now: () => number;
   private readonly compact: ((sessionKey: string, onSettled: (outcome: "done" | "unverified" | "failed") => void) => "queued" | "already_requested" | "no_owner") | undefined;
   private compactState: WebCompactState | undefined;
@@ -406,11 +406,18 @@ export class WebChannel implements Channel {
     };
   }
   /**
-   * Subagents (local_agent) get their model from the first assistant entry of
-   * their transcript. Looked up when the task first appears; if that entry is
-   * not written yet, retried after MODEL_RETRY_DELAYS_MS (1 s, 3 s, 10 s) and
-   * then given up. A task that ended keeps being looked up while the panel
-   * still holds it; once it has left the panel, its retries are dropped.
+   * Subagents (local_agent) get their model from their meta.json, else the
+   * first assistant entry of their transcript (readSubagentModel). Looked up
+   * when the task first appears; if neither has it yet, retried after
+   * MODEL_RETRY_DELAYS_MS (1 s, 3 s, 10 s) and then given up — for THIS run.
+   * A task that ended keeps being looked up while the panel still holds it;
+   * once it has left the panel, its retries are dropped.
+   *
+   * A found model ends the lookup (the board caches it, `hasModel`). A lookup
+   * is per run: a resumed subagent (same task id, new run id) is looked up
+   * afresh. Before, a finished or exhausted lookup stayed in the map for good,
+   * so a subagent that left the panel and was later resumed came back without
+   * its badge and was never looked up again (2026-11-14).
    * Other task types have no model and are never looked up.
    */
   private lookUpModels(key: string, tasks: WatchTask[]): void {
@@ -422,8 +429,10 @@ export class WebChannel implements Channel {
     for (const task of tasks) {
       if (task.taskType !== "local_agent" || this.tasks.hasModel(key, task.taskId)) continue;
       const id = `${key}\0${task.taskId}`;
-      if (this.modelLookups.has(id)) continue;
-      const lookup = { key, taskId: task.taskId, attempt: 0, timer: undefined as ReturnType<typeof setTimeout> | undefined };
+      const existing = this.modelLookups.get(id);
+      if (existing && existing.runId === task.runId) continue;
+      if (existing) clearTimeout(existing.timer); // a new run: look again
+      const lookup = { key, taskId: task.taskId, runId: task.runId, attempt: 0, timer: undefined as ReturnType<typeof setTimeout> | undefined };
       this.modelLookups.set(id, lookup);
       const attempt = () => {
         lookup.timer = undefined;
@@ -432,7 +441,7 @@ export class WebChannel implements Channel {
           // A short task may have ended meanwhile; it still gets its badge
           // while the panel keeps it. Once it left the panel, stop.
           if (!this.tasks.holds(key, task.taskId)) { this.modelLookups.delete(id); return; }
-          if (model) { this.tasks.setModel(key, task.taskId, model); return; }
+          if (model) { this.tasks.setModel(key, task.taskId, model); this.modelLookups.delete(id); return; }
           const delay = MODEL_RETRY_DELAYS_MS[lookup.attempt++];
           if (delay !== undefined) { lookup.timer = setTimeout(attempt, delay); lookup.timer.unref?.(); }
         }, () => {});

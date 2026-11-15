@@ -325,6 +325,46 @@ describe("web task panel feed", () => {
       expect(lookups).toHaveLength(2);
     } finally { vi.useRealTimers(); }
   });
+  it("a subagent resumed after it left the panel gets its badge again (2026-11-14)", async () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      const lookups: string[] = [];
+      const { channel, bus } = setup(owner, undefined, undefined, async (_key, id) => { lookups.push(id); return "claude-opus-5-5"; }, () => Date.now());
+      const run = (runId: string) => ({ ...live("a1"), runId });
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [run("r1")] });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(channel.snapshot().tasks.find((t) => t.taskId === "a1")?.model).toBe("claude-opus-5-5");
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [], ended: [{ taskId: "a1", status: "completed" }] });
+      // Quiet past the retention window: the next event is the resume itself,
+      // which both lets the ended run go and brings the task back.
+      await vi.advanceTimersByTimeAsync(TASK_RETENTION_MS * 2);
+      // Resumed by a SendMessage: same task id, new run.
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [run("r2")] });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lookups).toEqual(["a1", "a1"]);
+      expect(channel.snapshot().tasks.find((t) => t.taskId === "a1")?.model).toBe("claude-opus-5-5");
+    } finally { vi.useRealTimers(); }
+  });
+  it("a run whose lookups ran out is looked up afresh when the subagent is resumed while still on the panel", async () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      const found: { model?: string } = {};
+      const lookups: string[] = [];
+      const { channel, bus } = setup(owner, undefined, undefined, async (_key, id) => { lookups.push(id); return found.model; }, () => Date.now());
+      const run = (runId: string) => ({ ...live("a1"), runId });
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [run("r1")] });
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(lookups).toHaveLength(4); // first try + three retries, then given up for r1
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [run("r1")] });
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(lookups).toHaveLength(4); // same run: still given up
+      found.model = "claude-opus-5-5";
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [run("r2")] });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(lookups).toHaveLength(5);
+      expect(channel.snapshot().tasks.find((t) => t.taskId === "a1")?.model).toBe("claude-opus-5-5");
+    } finally { vi.useRealTimers(); }
+  });
   it("gives up after three retries, and drops retries for a task that left the panel", async () => {
     vi.useFakeTimers({ now: 0 });
     try {

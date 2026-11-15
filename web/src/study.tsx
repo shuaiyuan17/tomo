@@ -341,7 +341,7 @@ function CronActions({ job, mutator, onDone }: { job: WebCronJob; mutator: Mutat
       body: "The job is removed from the schedule. This cannot be undone from here. A run already in progress is not stopped." },
   };
   const toggle: CronAction = job.enabled ? "pause" : "resume";
-  const iconButton = "size-8 rounded-lg text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground";
+  const iconButton = "size-8 rounded-lg text-muted-foreground max-[600px]:size-10 hover:bg-foreground/[0.07] hover:text-foreground";
   return <AlertDialog open={open !== null} onOpenChange={(value) => { if (!value && !busy) { setOpen(null); setError(""); } }}>
     <div className="flex shrink-0 items-center gap-1">
       <AlertDialogTrigger asChild><Button variant="ghost" size="icon" className={iconButton} disabled={disabled} onClick={() => setOpen(toggle)}
@@ -351,10 +351,10 @@ function CronActions({ job, mutator, onDone }: { job: WebCronJob; mutator: Mutat
     </div>
     {open && <AlertDialogContent className="rounded-2xl bg-card sm:max-w-md">
       <AlertDialogHeader>
-        <AlertDialogTitle className="font-serif text-[22px] font-normal">{copy[open].title}</AlertDialogTitle>
+        <AlertDialogTitle className="font-serif text-[22px] leading-snug font-normal">{copy[open].title}</AlertDialogTitle>
         <AlertDialogDescription className="text-[13px] leading-relaxed">{copy[open].body}</AlertDialogDescription>
       </AlertDialogHeader>
-      <dl className="m-0 grid grid-cols-[88px_minmax(0,1fr)] gap-x-3 gap-y-1 rounded-xl bg-muted px-4 py-3 text-[13px]">
+      <dl className="m-0 grid grid-cols-[88px_minmax(0,1fr)] items-baseline gap-x-3 gap-y-1 rounded-xl bg-muted px-4 py-3 text-[13px]">
         <dt className={meta}>Schedule</dt><dd className="m-0 font-mono text-xs [overflow-wrap:anywhere]">{job.scheduleLabel}</dd>
         <dt className={meta}>Session</dt><dd className="m-0 font-mono text-xs [overflow-wrap:anywhere]">{job.sessionKey}</dd>
         <dt className={meta}>Message</dt><dd className="m-0 line-clamp-3 [overflow-wrap:anywhere]">{job.message}</dd>

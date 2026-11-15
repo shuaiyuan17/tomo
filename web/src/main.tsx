@@ -515,7 +515,7 @@ export function App() {
           {hasContext && <Progress max={usage!.contextMax} value={Math.min(usage!.contextUsed, usage!.contextMax)} aria-label="Context tokens used" className="h-1.5 bg-border" />}
           {!hasContext && <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">Usage appears after a turn reports its context window.</p>}
         </section>
-        <PlanUsage ready={!!web.bootstrap} live={web.rateLimit} />
+        <PlanUsage ready={!!web.bootstrap} locked={web.connection === "locked"} live={web.rateLimit} />
         {/* Theme: pinned to the bottom of the sidebar (and of the phone drawer). */}
         <div className="mt-auto flex items-center justify-between gap-3 border-t pt-4 max-[600px]:mt-8">
           <span className="eyebrow">Theme</span>

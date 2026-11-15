@@ -14,7 +14,9 @@ import { isWarn, localizeUsage, planName, nextUsageDelay, RequestGate, resetLabe
  * then again when the server's 30-minute cache expires (plus a few seconds)
  * while the tab is visible, and on demand; the daemon caches and debounces.
  */
-export function PlanUsage({ ready, live }: { ready: boolean;
+export function PlanUsage({ ready, locked, live }: { ready: boolean;
+  /** The page has no access link yet: nothing will load until it is opened with one. */
+  locked?: boolean;
   /** The rate-limit state the SDK last pushed (`rate_limit_event`): shown at once, and the bars are re-read when it changes. */
   live?: WebRateLimit }) {
   const [usage, setUsage] = useState<WebUsage>();
@@ -91,7 +93,7 @@ export function PlanUsage({ ready, live }: { ready: boolean;
         <RefreshCw className={cn(spinning && "animate-spin")} onAnimationIteration={() => { if (!loading) setSpinning(false); }} strokeWidth={1.75} /></Button>
     </div>
     {liveNotice && <p className="m-0 mb-3 text-[12px] leading-relaxed font-medium text-warn" role="status">{liveNotice}</p>}
-    {!usage && !failed && <p className="m-0 text-[13px] text-muted-foreground" role="status">{ready ? "Loading…" : "Shown once connected."}</p>}
+    {!usage && !failed && <p className="m-0 text-[13px] text-muted-foreground" role="status">{locked ? "Shown once connected." : "Loading…"}</p>}
     {main.length > 0 && <div className="space-y-3.5">{main.map((window) => <UsageRow key={window.id} title={windowTitle(window)} window={window} now={now} />)}</div>}
     {scoped.length > 0 && <Collapsible className="group/models mt-3">
       <CollapsibleTrigger className="flex items-center gap-1 rounded-md px-0.5 py-0.5 text-[12px] max-[600px]:-my-2 max-[600px]:py-2.5 text-muted-foreground transition-colors hover:text-foreground">

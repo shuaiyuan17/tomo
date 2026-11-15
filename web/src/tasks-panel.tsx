@@ -35,7 +35,7 @@ export function TasksPanel({ tasks, sessions, onClose, footer }: { tasks: WebTas
   }, [ticking]);
   const ambient = tasks.some((task) => task.ambient);
   const close = onClose && <Button data-tasks-close variant="ghost" size="icon" aria-label="Close tasks" title="Close" onClick={onClose}
-    className="size-8 rounded-lg hover:bg-foreground/[0.07] active:bg-foreground/[0.11] [&_svg:not([class*='size-'])]:size-5"><X strokeWidth={1.75} /></Button>;
+    className="size-8 rounded-lg max-[600px]:size-10 hover:bg-foreground/[0.07] active:bg-foreground/[0.11] [&_svg:not([class*='size-'])]:size-5"><X strokeWidth={1.75} /></Button>;
   // Task list ↔ task view slide: in from the right when opening, from the left when going back.
   if (openTask) return <div className="motion-from-right relative flex min-h-0 flex-1 flex-col">
     <div className="absolute top-0 right-1">{close}</div>

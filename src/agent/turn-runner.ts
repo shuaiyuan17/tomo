@@ -466,6 +466,11 @@ export class TurnRunner {
         // shutdown, aborted, failed): back, marked as possibly partly
         // answered — they may be the only copy of a message whose inbox
         // record is already done.
+        //
+        // A turn the owner STOPPED ends with a normal result, so its notes
+        // are settled (cleared) — on purpose: Stop is the owner's explicit
+        // decision that this turn, recovery note included, needs no further
+        // answer.
         if (notes) {
           if (!spec.promptTaken) this.deps.restorePendingNotes?.(spec.key, notes);
           else if (spec.completed && !spec.shutdownInterrupted) this.deps.settlePendingNotes?.(spec.key, notes);

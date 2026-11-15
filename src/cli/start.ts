@@ -218,7 +218,7 @@ async function startForeground(): Promise<void> {
     try {
       const { WebChannel } = await import("../channels/web.js");
       const { WebSupervisor } = await import("../web/supervisor.js");
-      const { ownerSessionKeyReader, subagentModelReader } = await import("../web/data.js");
+      const { ownerSessionKeyReader, sessionKeysReader, subagentModelReader } = await import("../web/data.js");
       const { UsageCache } = await import("../web/usage.js");
       const { fetchUsage } = await import("../agent/usage.js");
       const { litellmRoutesModel } = await import("../litellm.js");
@@ -245,7 +245,9 @@ async function startForeground(): Promise<void> {
         stop: (key) => agent.stopTurn(key),
         model: (key) => agent.modelFor(key),
         taskModel: subagentModelReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
-        usage: (refresh) => usageCache.get(refresh) });
+        usage: (refresh) => usageCache.get(refresh),
+        models: { view: (key) => agent.webModelView(key), switch: (key, model, from) => agent.switchModelFromWeb(key, model, from) },
+        sessionKeys: sessionKeysReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }) });
       web.attach(new WebSupervisor(web, {
         ...config.web, owner: config.owner,
         sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,

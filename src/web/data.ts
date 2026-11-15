@@ -64,6 +64,14 @@ export function ownerSessionKeyReader(options: WebDataOptions): () => string | u
   };
 }
 
+/** Every key in the session registry, read fresh on each call (daemon side; unreadable reads as none). */
+export function sessionKeysReader(options: WebDataOptions): () => string[] {
+  return () => {
+    try { return SessionStore.readSnapshot(options.sessionsDir, options.sdkSessionsDir).map((e) => e.channelKey); }
+    catch { return []; }
+  };
+}
+
 /** The model of a session key's subagent, from its transcript (daemon side; never throws). */
 export function subagentModelReader(options: WebDataOptions): (sessionKey: string, taskId: string) => Promise<string | undefined> {
   return async (sessionKey, taskId) => {

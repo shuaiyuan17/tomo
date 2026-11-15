@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "./api.js";
 
-export const STUDY_PAGES = ["todos", "memory", "context", "cron", "mcp", "config"] as const;
+export const STUDY_PAGES = ["todos", "memory", "context", "model", "cron", "mcp", "config"] as const;
 export type StudyPage = typeof STUDY_PAGES[number];
-export const STUDY_LABELS: Record<StudyPage, string> = { todos: "TODOs", memory: "Memory", context: "Context", cron: "Cron", mcp: "MCP servers", config: "Config" };
+export const STUDY_LABELS: Record<StudyPage, string> = { todos: "TODOs", memory: "Memory", context: "Context", model: "Model", cron: "Cron", mcp: "MCP servers", config: "Config" };
 
 /** `#study/<page>[/<item>]`: the Study is linkable and the back button leaves it. */
 const STUDY_HASH = /^#study(?:\/([a-z]+)(?:\/([A-Za-z0-9_-]{1,64}))?)?$/;

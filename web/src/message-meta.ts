@@ -18,8 +18,21 @@ const formatters = new Map<string, Intl.DateTimeFormat>();
  * One Intl formatter per shape and locale. `toLocaleTimeString` /
  * `toLocaleString` with these options format exactly the same, but build a
  * new formatter on every call: a long history's meta lines paid for that.
+ *
+ * A formatter keeps the time zone it was made in, while the day dividers
+ * read the live local clock: at most once a minute the system time zone is
+ * read again (that read builds a formatter itself, so not per call) and a
+ * change drops the cache.
  */
+let zone: { name: string; checked: number } | undefined;
+const ZONE_CHECK_MS = 60_000;
 function formatter(shape: "time" | "dateTime", locale: string | undefined): Intl.DateTimeFormat {
+  const now = Date.now();
+  if (!zone || now - zone.checked >= ZONE_CHECK_MS || now < zone.checked) {
+    const name = new Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (zone && zone.name !== name) formatters.clear();
+    zone = { name, checked: now };
+  }
   const key = `${shape}\n${locale ?? ""}`;
   let found = formatters.get(key);
   if (!found) { found = new Intl.DateTimeFormat(locale, shape === "time" ? TIME : DATE_TIME); formatters.set(key, found); }

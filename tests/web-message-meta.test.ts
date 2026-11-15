@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { channelLabel, dayDividers, dayLabel, dividerBefore, messageDateTime, messageTime } from "../web/src/message-meta.js";
 
 const at = (y: number, m: number, d: number, h = 12, min = 0) => new Date(y, m - 1, d, h, min).getTime();
@@ -14,6 +14,23 @@ describe("message meta line", () => {
   });
   it("shows the hour without a leading zero", () => {
     expect(messageTime(at(2026, 11, 15, 6, 5), "en-US")).toBe("6:05 AM");
+  });
+  it("follows a system time-zone change within a minute (cached formatters)", () => {
+    const saved = process.env.TZ;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(at(2026, 11, 15, 9));
+      process.env.TZ = "UTC";
+      const stamp = Date.UTC(2026, 10, 15, 6, 5);
+      expect(messageTime(stamp, "en-US")).toBe("6:05 AM");
+      process.env.TZ = "Asia/Tokyo";
+      vi.setSystemTime(Date.now() + 61_000);
+      expect(messageTime(stamp, "en-US")).toBe("3:05 PM");
+      expect(messageTime(stamp, "en-US")).toBe(new Date(stamp).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }));
+    } finally {
+      vi.useRealTimers();
+      if (saved === undefined) delete process.env.TZ; else process.env.TZ = saved;
+    }
   });
   it("formats exactly as toLocaleTimeString / toLocaleString do (cached formatters)", () => {
     for (const locale of [undefined, "en-US", "en-GB", "de-DE", "ja-JP", "zh-CN"]) {

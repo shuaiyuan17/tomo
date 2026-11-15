@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { FileIcon, ImageIcon, X } from "lucide-react";
 import { Text } from "./markdown.js";
 import { splitMessage } from "./attachments.js";
@@ -15,8 +15,11 @@ import { cn } from "@/lib/utils";
  * `thinking` (Tomo's replies only): text marked as a thinking block shows as
  * a folded "Thinking" row, never as the reply. `block`: one live content
  * block; `joined`: a recorded turn (see splitThinking).
+ *
+ * Memoized: the chat re-renders on every keystroke and SSE event; an
+ * unchanged body (streamed blocks, the pending bubbles) is skipped.
  */
-export function MessageBody({ body, reply, sessionId, onQuote, thinking }:
+export const MessageBody = memo(function MessageBody({ body, reply, sessionId, onQuote, thinking }:
   { body: string; reply?: ReplyContext; sessionId: string; onQuote?: () => void; thinking?: "block" | "joined" }) {
   const [viewing, setViewing] = useState<string>();
   const segments = thinking ? splitThinking(body, thinking) : [{ kind: "reply" as const, text: body }];
@@ -27,7 +30,7 @@ export function MessageBody({ body, reply, sessionId, onQuote, thinking }:
       : <ReplyParts key={`r${at}`} body={segment.text} sessionId={sessionId} onView={setViewing} />)}
     {viewing && <Lightbox src={viewing} onClose={() => setViewing(undefined)} />}
   </>;
-}
+});
 
 function ReplyParts({ body, sessionId, onView }: { body: string; sessionId: string; onView: (src: string) => void }) {
   const setViewing = onView;

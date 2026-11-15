@@ -169,4 +169,26 @@ npm run test:e2e
 
 The browser E2E test uses the real HTTP, CSRF, child-process RPC, router, Agent, delivery pipeline, and session store. Only the external SDK and messaging transport are deterministic test doubles. All runtime paths are temporary; no real account or daemon is used. Browser screenshots are written to the ignored `test-results/` directory. CI runs lint, strict TypeScript, Vitest coverage on the existing Node matrix, and Chromium E2E on Node 24.
 
+Loading and rendering: the chat's first paint needs the entry chunk, the React chunk (its own chunk so its hash, and the browser's cached copy, survive app releases) and one small shared chunk, all `modulepreload`ed; the Study, the screen window, the task view and the home room's three.js are lazy chunks fetched when opened (same origin, so `script-src 'self'` covers them; all CSS stays in the one stylesheet). index.html preloads the regular serif woff2. The web child serves `/assets/*` (content-hashed names) with `Cache-Control: public, max-age=31536000, immutable`; index.html, icons and the manifest stay `no-store`. JS, CSS, HTML, SVG and the manifest are compressed (brotli, else gzip, per `Accept-Encoding`) once per file version and kept in memory. Markdown uses GFM's parser only (no serializers). Recorded messages are memoized — the markdown `Text`, `MessageBody`, the parsed send markers and reply quotes, and each recorded row's content (`messageView` in `main.tsx`, rebuilt only when something it reads changes; the day dividers, which depend on the neighbouring row and on today's date, and the live content of the last row are outside it) — so a keystroke in the composer or a streamed block does not re-render or re-parse the whole history. Events that change what a row reads still rebuild every recorded row: while a turn runs, each tool event (it refreshes the tool list, hence the timeline) and each request update (read receipts, badges); the markdown memo is what keeps those rebuilds from re-parsing every message. A lazy view whose chunk fails to load (for example a tab left open across an upgrade) shows a Reload note in its place (`ChunkBoundary`); the rest of the app stays. Something new a recorded row reads must go into `messageViews`' dependency list (or be read through a ref, like `latestActions`), or the row shows a stale value.
+
 `npm run build` includes browser assets in `dist/web-assets`; `npm pack` includes them in the distribution. `npm run dev` serves those built assets, so rebuild after frontend changes. The UI does not start a Vite development server in the daemon.
+
+### UI gallery
+
+`npm run web:gallery` builds, then screenshots every surface and state of the UI so a change can be reviewed by eye: the rich conversation (markdown, tables, code, an image, a quote), tool rows open and closed, hover and focus, the composer (focus, refused, delivery uncertain, working with a draft and an attachment), the empty chat, the phone drawer, the session menu, the Tasks rail and a subagent transcript, the scheduled list, every Study tab, the cron confirm dialog, the compact dialog, the screen window, a read-only group, Home with and without WebGL, the locked page and the disconnected state. Each is taken at desktop 1440×900, laptop 1280×720, tablet 820×1180 and phone 390×844, light and dark, at device scale 2.
+
+It runs `tests/gallery/ui-gallery.gallery.ts` (its own `vitest.gallery.config.ts`; not part of `npm test` or `npm run test:e2e`) against the same real stack and deterministic doubles as the E2E tests. The browser clock is frozen and seeded timestamps, time zone and locale are fixed, so shots of the same code match run to run; times the server takes from its own clock (a message sent during the run) still follow real time. Shots are written as `<surface>-<state>-<viewport>-<theme>.png` to the ignored `test-results/gallery/`, with `index.html`, a contact sheet grouped by surface with light and dark side by side. A step whose control can no longer be found does not stop the run: it is listed in `failures.json` and at the top of the sheet, and the command exits non-zero. A full run takes several minutes.
+
+```sh
+npm run web:gallery                              # everything, into test-results/gallery/
+npm run web:gallery -- --only study,phone-dark   # only names containing one of the substrings
+npm run web:gallery -- --dir /tmp/gallery-after  # another folder (or GALLERY_DIR=...)
+node scripts/ui-gallery.mjs --sheet-only         # rebuild index.html from the PNGs already there
+```
+
+`--only` keeps the folder's other shots; without it the folder is emptied first. For a before/after comparison, run it from two checkouts (for example a `git worktree` of `main` and your branch) into two folders, then open the two `index.html` files side by side:
+
+```sh
+(cd ../tomo-main && npm ci && npm run web:gallery -- --dir /tmp/gallery-before)
+npm run web:gallery -- --dir /tmp/gallery-after
+```

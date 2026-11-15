@@ -23,6 +23,7 @@
     "prepublishOnly": "npm run build",
     "postinstall": "echo '\n  Welcome to Tomo! 🤖\n\n  First time?  tomo init\n  Start:       tomo start\n  Upgraded?    tomo restart\n  Help:        tomo --help\n'",
     "test:e2e": "npm run build && vitest run --config vitest.e2e.config.ts",
+    "web:gallery": "npm run build && node scripts/ui-gallery.mjs",
     "test:web:mutations": "node scripts/test-web-mutations.mjs"
   },
   "keywords": [
@@ -73,11 +74,12 @@
     "clsx": "^2.1.1",
     "eslint": "^10.6.0",
     "lucide-react": "^1.73.0",
+    "mdast-util-gfm": "^3.1.0",
+    "micromark-extension-gfm": "^3.0.0",
     "radix-ui": "^1.8.1",
     "react-dom": "19.3.1",
     "react-markdown": "10.1.0",
     "remark-breaks": "^4.0.0",
-    "remark-gfm": "4.0.1",
     "tailwind-merge": "^3.7.0",
     "tailwindcss": "^4.3.5",
     "three": "^0.182.0",

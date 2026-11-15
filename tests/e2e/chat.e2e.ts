@@ -2,7 +2,6 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { chromium, expect as browserExpect, type Browser, type Page } from "@playwright/test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { crc32, deflateSync } from "node:zlib";
 
 vi.mock("../../src/config.js", async () => (await import("../helpers/agent-mocks.js")).configModuleMock());
 vi.mock("../../src/workspace/index.js", async () => (await import("../helpers/agent-mocks.js")).workspaceModuleMock());
@@ -17,6 +16,7 @@ import { watchBus } from "../../src/watch/bus.js";
 import { transcriptFileStem } from "../../src/sessions/store.js";
 import { OutgoingMediaStore, outgoingImagesDir } from "../../src/web/outgoing-media.js";
 import { uploadsDir } from "../../src/web/uploads.js";
+import { solidPng } from "../helpers/png.js";
 
 installAgentTestHooks();
 let agent: Agent;
@@ -183,6 +183,45 @@ it("silently reloads the first history page after rotation invalidates a cursor"
   await browserExpect(page.getByText("History changed safely", { exact: true })).toBeVisible();
   await browserExpect(page.getByRole("button", { name: "Try again" })).toHaveCount(0);
   expect(staleStatus).toBe(409);
+});
+
+it("loads the Study as a lazy chunk under the CSP, cached immutable and compressed", async () => {
+  const chunks: Record<string, string | undefined>[] = [];
+  page.on("response", (response) => {
+    if (/^\/assets\/study-[\w-]+\.js$/.test(new URL(response.url()).pathname)) chunks.push(response.headers());
+  });
+  await page.evaluate(() => {
+    const w = window as unknown as { __csp: string[] }; w.__csp = [];
+    document.addEventListener("securitypolicyviolation", (event) => w.__csp.push(event.violatedDirective));
+  });
+  // Not on the chat's critical path: nothing of the Study is fetched until it is opened.
+  expect(chunks).toHaveLength(0);
+  await page.getByRole("button", { name: "The Study" }).click();
+  await browserExpect(page.locator("#study")).toBeVisible();
+  expect(chunks).toHaveLength(1);
+  expect(chunks[0]["cache-control"]).toBe("public, max-age=31536000, immutable");
+  expect(chunks[0]["content-encoding"]).toBe("br");
+  expect(await page.evaluate(() => (window as unknown as { __csp: string[] }).__csp)).toEqual([]);
+});
+
+it("a Study chunk that fails to load shows Reload in its place; the rest of the app stays", async () => {
+  const errors: string[] = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  await page.route(/\/assets\/study-[\w-]+\.js$/, (route) => route.abort());
+  const input = page.getByRole("textbox", { name: "Message Tomo" });
+  await input.fill("a draft that must survive");
+  await page.getByRole("button", { name: "The Study" }).first().click();
+  await browserExpect(page.getByText("The Study didn't load. Reload the page to try again.")).toBeVisible();
+  await browserExpect(page.getByRole("button", { name: "Reload", exact: true })).toBeVisible();
+  // Header, sidebar and the (hidden) chat are still mounted, the stream still live.
+  await browserExpect(page.locator("header")).toBeVisible();
+  await browserExpect(page.locator("#sidebar")).toHaveCount(1);
+  await browserExpect(page.locator("#conversation")).toHaveCount(1);
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Conversation" }).first().click();
+  await browserExpect(page.locator("#conversation")).toBeVisible();
+  await browserExpect(input).toHaveValue("a draft that must survive");
+  expect(errors).toEqual([]);
 });
 
 it("chats over real HTTP/CSRF/IPC/SSE and preserves history, themes, accessibility and group read-only state", async () => {
@@ -696,21 +735,6 @@ const topOf = (row: ReturnType<Page["locator"]>) => row.evaluate((el) => {
   return view ? Math.round(el.getBoundingClientRect().top - view.getBoundingClientRect().top) : Infinity;
 });
 const tall = (i: number) => `Reply ${i}.\n\n${"A paragraph of the reply, long enough to give the conversation some height on any screen.\n\n".repeat(16)}`;
-
-/** A solid PNG of the given size (a real one: the upload sniffs it). */
-function solidPng(width: number, height: number): Buffer {
-  const chunk = (type: string, data: Buffer) => {
-    const body = Buffer.concat([Buffer.from(type, "ascii"), data]);
-    const out = Buffer.alloc(body.length + 8);
-    out.writeUInt32BE(data.length, 0); body.copy(out, 4); out.writeUInt32BE(crc32(body), body.length + 4);
-    return out;
-  };
-  const header = Buffer.alloc(13);
-  header.writeUInt32BE(width, 0); header.writeUInt32BE(height, 4); header.set([8, 2, 0, 0, 0], 8);
-  const row = Buffer.alloc(1 + width * 3, 0x88); row[0] = 0;
-  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk("IHDR", header),
-    chunk("IDAT", deflateSync(Buffer.concat(Array.from({ length: height }, () => row)))), chunk("IEND", Buffer.alloc(0))]);
-}
 
 it("opens at the last turn; a sent message (a tall picture too) is just fully shown, no screen of blank under it, and the reply is followed while the reader stays at the end", async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);

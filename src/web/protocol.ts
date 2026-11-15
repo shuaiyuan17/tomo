@@ -175,6 +175,29 @@ export type McpConnectionState = "connected" | "failed" | "needs-auth" | "pendin
 export interface WebMcpServer { name: string; enabled: boolean; type: string; oauth: boolean; timeout: number | null; alwaysLoad: boolean; configured: string[] }
 export interface WebMcpLiveSession { sessionId: string; connections: Array<{ name: string; status: McpConnectionState }> | null }
 export interface WebMcpView { missing: boolean; servers: WebMcpServer[]; live: { available: boolean; sessions: WebMcpLiveSession[] } }
+/** One model the Study's Model page offers: an alias target, with every alias naming it. */
+export interface WebModelOption { id: string; label: string; aliases: string[] }
+/** The model of one browser session, and what it can be switched to (GET /models?session=). */
+export interface WebModelView {
+  sessionId: string;
+  model: { id: string; label: string };
+  /** config.model: what a conversation without its own choice runs on. */
+  defaultModel: { id: string; label: string };
+  /** The conversation has its own choice (sessionModelOverrides). */
+  overridden: boolean;
+  /** Only the owner's conversation can be switched from the browser; groups are read-only. */
+  writable: boolean;
+  /** A turn is in flight; a switch is refused (409 turn_in_flight) until it ends. */
+  busy: boolean;
+  options: WebModelOption[];
+  /** A LiteLLM gateway is configured (provider/model ids are accepted); chatgptOnly: it routes chatgpt/* only. */
+  gateway: { configured: boolean; chatgptOnly: boolean; example: string };
+}
+/** A confirmed model switch of the owner's conversation (POST /models). `from`: the model id the page showed. */
+export const modelChangeSchema = z.object({ sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/), model: z.string().trim().min(1).max(200),
+  from: z.string().min(1).max(200), confirm: z.literal(true) }).strict();
+/** `unchanged`: it already ran on that model; nothing was written or restarted. */
+export interface WebModelChangeResult { status: "switched" | "unchanged"; model: { id: string; label: string }; previous: { id: string; label: string } }
 /** A confirmed cron change: PATCH sets `enabled`, DELETE removes. */
 export const cronChangeSchema = z.object({ revision: z.string().regex(/^[a-f0-9]{64}$/), confirm: z.literal(true), enabled: z.boolean().optional() }).strict();
 export class WebError extends Error {
@@ -199,6 +222,11 @@ export const rpcSchema = z.discriminatedUnion("method", [
   /** A task the browser was shown, by its browser session: where to read it. */
   z.object({ method: z.literal("task"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     taskId: z.string().regex(/^[A-Za-z0-9_.:-]{1,64}$/), output: z.boolean(), command: z.boolean().optional() }).strict(),
+  /** The model of a browser session (the Study's Model page). */
+  z.object({ method: z.literal("model"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict(),
+  /** Switch the owner conversation's model; `from` is the model the owner reviewed. */
+  z.object({ method: z.literal("model-switch"), epoch: z.uuid(), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+    model: z.string().trim().min(1).max(200), from: z.string().min(1).max(200) }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
 export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact">;

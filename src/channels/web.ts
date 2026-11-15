@@ -17,6 +17,9 @@ import { buildImageAttachment } from "./attachments.js";
 import { formatImageMarker } from "./imageStore.js";
 import type { ImageAttachment } from "./types.js";
 import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request-journal.js";
+import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
+import type { WebModelChangeResult, WebModelView } from "../web/protocol.js";
+import { modelLabel } from "../models.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebUsage, type WebRequest, type WebTaskAccess } from "../web/protocol.js";
 
 /** A shell task's full command is served up to this many characters. */
@@ -34,6 +37,16 @@ export const MAX_INTERRUPTED_BACKLOG = 64;
 const SNAPSHOT_MAILBOX_BYTES = MAX_BUFFER_BYTES - 64 * 1024 - MAX_SNAPSHOT_TASK_BYTES;
 
 export interface WebLifecycle { start(): Promise<void>; stop(): Promise<void> }
+/** The agent side of the Study's Model page (see Agent.webModelView / switchModelFromWeb). */
+export interface WebModelAccess {
+  view(key: string): Omit<WebModelView, "sessionId" | "writable">;
+  switch(key: string, model: string, from: string): ModelSwitchOutcome;
+}
+/** HTTP status of each refused model switch; the reason is the error code. */
+const MODEL_REFUSAL_STATUS: Record<ModelSwitchRefusal, number> = {
+  unknown_model: 422, gateway_required: 422, gateway_unroutable: 422,
+  model_changed: 409, turn_in_flight: 409, persist_failed: 503,
+};
 interface Receipt { digest: string; request: WebRequest; settled: boolean }
 
 /** A real channel: only Agent's registered MessageHandler accepts input, and
@@ -76,6 +89,8 @@ export class WebChannel implements Channel {
   private compactState: WebCompactState | undefined;
   private readonly toolCommand: ((sessionKey: string, toolUseId: string) => string | undefined) | undefined;
   private readonly taskOutput: ((sessionKey: string, taskId: string) => Promise<TaskOutput | undefined>) | undefined;
+  private readonly models: WebModelAccess | undefined;
+  private readonly sessionKeys: (() => readonly string[]) | undefined;
   /** Live and recently ended subagents/background tasks, per visible session. */
   readonly tasks: TaskBoard;
 
@@ -111,7 +126,13 @@ export class WebChannel implements Channel {
       /** Durable receipts; loaded here, before any request is accepted. */
       journal?: WebRequestJournal;
       /** Claude subscription usage for the Plan usage card (cached, debounced). */
-      usage?: (refresh: boolean) => Promise<WebUsage> } = {}) {
+      usage?: (refresh: boolean) => Promise<WebUsage>;
+      /** The Study's Model page: a session key's model, and the agent's shared model switch. */
+      models?: WebModelAccess;
+      /** Every key in the session registry: where a group's browser session id is looked up. */
+      sessionKeys?: () => readonly string[] } = {}) {
+    this.models = options.models;
+    this.sessionKeys = options.sessionKeys;
     this.usageReader = options.usage;
     this.taskOutput = options.taskOutput;
     this.toolCommand = options.toolCommand;
@@ -342,6 +363,52 @@ export class WebChannel implements Channel {
     if (status === "already_requested") return { status, requestId: this.compactState?.requestId ?? requestId };
     this.setCompactState({ requestId, state: "accepted", at: Date.now() });
     return { status, requestId };
+  }
+
+  /**
+   * The daemon key behind a browser session id, for the sessions the browser
+   * catalog shows: the owner conversation (the same owner-key rule) or a
+   * group in the registry. Anything else is not found.
+   */
+  private visibleKey(sessionId: string): { key: string; owner: boolean } {
+    if (this.ownerId && sessionId === this.ownerId) {
+      const key = this.ownerKey();
+      if (!key) throw new WebError(409, "owner_setup_required");
+      return { key, owner: true };
+    }
+    let keys: readonly string[] = [];
+    try { keys = this.sessionKeys?.() ?? []; } catch { /* unreadable registry: not found */ }
+    const key = keys.find((k) => isGroupSessionKey(k) && webSessionId(k) === sessionId);
+    if (!key) throw new WebError(404, "session_not_found");
+    return { key, owner: false };
+  }
+
+  /** The model a browser session runs on and what it could switch to. Groups read it, never switch it. */
+  model(sessionId: string): WebModelView {
+    if (!this.models) throw new WebError(503, "service_unavailable");
+    const { key, owner } = this.visibleKey(sessionId);
+    return { sessionId, writable: owner, ...this.models.view(key) };
+  }
+
+  /**
+   * Switch the owner conversation's model through the agent's shared switch
+   * (the one /model uses). `from` is the model the owner reviewed: a different
+   * current model refuses (409 model_changed). Refused while a turn is in
+   * flight (409 turn_in_flight) rather than cutting it off. Nothing is
+   * persisted on any refusal. Open pages re-read on the invalidate event.
+   */
+  switchModel(sessionId: string, model: string, from: string): WebModelChangeResult {
+    if (!this.models) throw new WebError(503, "service_unavailable");
+    if (this.tornDown) throw new WebError(503, "ingress_closed");
+    const { key, owner } = this.visibleKey(sessionId);
+    if (!owner) throw new WebError(403, "owner_dm_only");
+    const outcome = this.models.switch(key, model, from);
+    if (!outcome.ok) throw new WebError(MODEL_REFUSAL_STATUS[outcome.reason], outcome.reason);
+    if (outcome.changed) {
+      try { this.events.publish({ type: "invalidate", sessionId }); } catch { /* best effort */ }
+    }
+    return { status: outcome.changed ? "switched" : "unchanged",
+      model: { id: outcome.model, label: modelLabel(outcome.model) }, previous: { id: outcome.previous, label: modelLabel(outcome.previous) } };
   }
 
   private setCompactState(state: WebCompactState): void {

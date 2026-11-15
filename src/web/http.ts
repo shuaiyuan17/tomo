@@ -9,7 +9,7 @@ import { MemoryReadError } from "../workspace/memory-reader.js";
 import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
-import { cronChangeSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, WebError,
+import { cronChangeSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
   type EventEnvelope, type Rpc, type WebCompaction, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
 
 /**
@@ -162,6 +162,13 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           }
           return;
         }
+        if (url.pathname === "/api/v1/models") {
+          // The model of a conversation the catalog shows, from the daemon (which holds the overrides).
+          const sessionId = url.searchParams.get("session") ?? "";
+          if (!/^[A-Za-z0-9_-]{43}$/.test(sessionId)) throw new WebError(400, "invalid_session");
+          json(res, 200, await deps.rpc({ method: "model", sessionId }));
+          return;
+        }
         const task = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/tasks\/([A-Za-z0-9_-]{1,64})\/(transcript|output|command|brief)$/.exec(url.pathname);
         if (task) {
           const [, sessionId, taskId, what] = task;
@@ -209,6 +216,20 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         const parsed = cronChangeSchema.safeParse(await body(req));
         if (!parsed.success || (req.method === "PATCH") !== (parsed.data.enabled !== undefined)) throw new WebError(400, "invalid_cron_change");
         json(res, 200, await deps.data.cron.change(url.pathname.split("/").at(-1)!, parsed.data.revision, parsed.data.enabled));
+        return;
+      } else if (req.method === "POST" && url.pathname === "/api/v1/models") {
+        // A model switch, guarded like a cron action: exact Origin, cookie,
+        // CSRF, JSON with confirm: true, the current daemon epoch; and only
+        // the owner's own conversation (groups are read-only in the browser).
+        csrf.verify(req, session!);
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || epoch !== await deps.rpc({ method: "epoch" })) throw new WebError(409, "epoch_changed");
+        const parsed = modelChangeSchema.safeParse(await body(req));
+        if (!parsed.success) throw new WebError(400, "invalid_model_change");
+        const { ownerId } = deps.data.catalog();
+        if (!ownerId) throw new WebError(409, "owner_setup_required");
+        if (parsed.data.sessionId !== ownerId) throw new WebError(403, "owner_dm_only");
+        json(res, 200, await deps.rpc({ method: "model-switch", epoch, sessionId: parsed.data.sessionId, model: parsed.data.model, from: parsed.data.from }));
         return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/compact-request") {
         // Same gate as sending a message: CSRF, the owner, the daemon epoch.

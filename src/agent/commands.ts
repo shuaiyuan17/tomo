@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Channel } from "../channels/types.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "../config.js";
-import { backupFileIfExistsSync, writeFileAtomicSync, writeJsonAtomicSync } from "../fs-utils.js";
+import { writeFileAtomicSync } from "../fs-utils.js";
 import type { OwnerRouter } from "../router.js";
 import { ownerDisplayName, type OwnerConfig } from "../owner.js";
 import { redactChatIdForLog } from "./blocked-inbound-log.js";
@@ -12,12 +12,11 @@ import type { SessionStore } from "../sessions/index.js";
 import type { PauseStore } from "../sessions/pause-store.js";
 import { dmSessionKeyForIdentity, isGroupSessionKey } from "../sessions/keys.js";
 import { writeRestartReasonFile } from "../restart-reason.js";
-import { DEFAULT_MODEL, MODEL_ALIASES, isLiteLlmProviderModel, modelHelpText, resolveModelName } from "../models.js";
+import { DEFAULT_MODEL, MODEL_ALIASES, modelHelpText } from "../models.js";
+import { switchSessionModel, type ModelSwitchRefusal } from "./model-switch.js";
 import { buildSessionCostReport } from "../costs.js";
 import {
   CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
-  CHATGPT_SUBSCRIPTION_MODE,
-  isChatGptSubscriptionModel,
   liteLlmModeLabel,
 } from "../litellm.js";
 import { log } from "../logger.js";
@@ -30,9 +29,19 @@ import { buildUsageReport } from "./usage.js";
 import { litellmRoutesModel } from "../litellm.js";
 
 /** Back up ~/.tomo/config.json before a programmatic rewrite. */
-export function backupConfigFile(): void {
-  mkdirSync(dirname(CONFIG_BACKUP_PATH), { recursive: true });
-  backupFileIfExistsSync(CONFIG_PATH, CONFIG_BACKUP_PATH, { mode: 0o600 });
+export { backupConfigFile } from "./model-switch.js";
+
+/** The chat reply for a refused /model switch (texts unchanged since before the shared switch). */
+function modelRefusalText(reason: ModelSwitchRefusal, arg: string, resolved: string): string {
+  switch (reason) {
+    case "unknown_model": return `⚠️ Unknown model "${arg}". Use ${modelHelpText()}.`;
+    case "gateway_required": return `⚠️ "${resolved}" needs a LiteLLM gateway. Run \`tomo config\` → LiteLLM gateway to set one up first.`;
+    case "gateway_unroutable": return `⚠️ The configured ChatGPT subscription gateway only routes chatgpt/* models, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}.`;
+    case "persist_failed": return "⚠️ [error] Could not save the model override to ~/.tomo/config.json — model unchanged. Check the file (or /restore) and try again.";
+    // Only reachable with options /model does not pass.
+    case "turn_in_flight": return "⚠️ A reply is still running; try again once it has finished.";
+    case "model_changed": return "⚠️ The model changed meanwhile; check /model and try again.";
+  }
 }
 
 export interface ChatCommandDeps {
@@ -182,40 +191,14 @@ export class ChatCommandHandler {
         return;
       }
 
-      const resolved = resolveModelName(arg);
-      if (!resolved) {
-        await channel.send({ chatId, text: `⚠️ Unknown model "${arg}". Use ${modelHelpText()}.` });
+      // No turn-in-flight check here: /model has always switched at once.
+      const outcome = switchSessionModel({ modelOverrides: this.deps.modelOverrides,
+        closeLiveSession: (sessionKey) => this.deps.closeLiveSession(sessionKey) }, key, arg);
+      if (!outcome.ok) {
+        await channel.send({ chatId, text: modelRefusalText(outcome.reason, arg, outcome.model ?? arg) });
         return;
       }
-      if (isLiteLlmProviderModel(resolved)) {
-        if (!config.litellm?.baseUrl) {
-          await channel.send({
-            chatId,
-            text: `⚠️ "${resolved}" needs a LiteLLM gateway. Run \`tomo config\` → LiteLLM gateway to set one up first.`,
-          });
-          return;
-        }
-        if (config.litellm.mode === CHATGPT_SUBSCRIPTION_MODE && !isChatGptSubscriptionModel(resolved)) {
-          await channel.send({
-            chatId,
-            text: `⚠️ The configured ChatGPT subscription gateway only routes chatgpt/* models, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}.`,
-          });
-          return;
-        }
-      }
-      if (!this.persistModelOverride(key, resolved)) {
-        await channel.send({
-          chatId,
-          text: "⚠️ [error] Could not save the model override to ~/.tomo/config.json — model unchanged. Check the file (or /restore) and try again.",
-        });
-        return;
-      }
-      this.deps.modelOverrides.set(key, resolved);
-      // Model changes require a fresh SDK child process, but keep the SDK
-      // session ID so continuity survives switching between Claude and LiteLLM.
-      // getOrCreateLiveSession repairs provider-specific JSONL quirks before
-      // resuming.
-      this.deps.closeLiveSession(key);
+      const resolved = outcome.model;
       log.info({ channel: channel.name, chatId, model: resolved }, "Model switched via /model");
       await channel.send({ chatId, text: `🔄 Switched to ${resolved}` });
       return;
@@ -484,30 +467,6 @@ export class ChatCommandHandler {
   /** The owner, when this sender is the owner on this channel (fails closed). */
   private ownerFor(channel: Channel, senderId?: string): OwnerConfig | undefined {
     return this.deps.router.isOwnerSender(channel.name, senderId) ? this.deps.router.owner() : undefined;
-  }
-
-  /** Persist a /model override into config.json. Returns false (after logging,
-   *  leaving in-memory state untouched) if the file can't be read or written. */
-  private persistModelOverride(key: string, model: string): boolean {
-    try {
-      mkdirSync(dirname(CONFIG_PATH), { recursive: true });
-      // Shared config lock, re-read inside it (see saveConfig).
-      withConfigLockSync(CONFIG_PATH, () => {
-        const cfg = existsSync(CONFIG_PATH)
-          ? JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>
-          : {};
-        const overrides = (cfg.sessionModelOverrides ?? {}) as Record<string, string>;
-        overrides[key] = model;
-        cfg.sessionModelOverrides = overrides;
-        backupConfigFile();
-        writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
-      });
-      config.sessionModelOverrides[key] = model;
-      return true;
-    } catch (err) {
-      log.error({ err, key }, "Failed to persist model override");
-      return false;
-    }
   }
 
   private async handleClaudeLogin(

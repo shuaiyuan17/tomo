@@ -36,6 +36,7 @@ import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
+import { describeSessionModel, switchSessionModel, type ModelSwitchOutcome } from "./agent/model-switch.js";
 import { prepareSettledSessionRewind } from "./agent/settled-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
@@ -1087,6 +1088,29 @@ export class Agent {
   requestOwnerCompact(sessionKey: string, onSettled?: (outcome: "done" | "unverified" | "failed") => void): "queued" | "already_requested" | "no_owner" {
     if (!config.owner) return "no_owner";
     return this.contextNudger.requestCompact(sessionKey, onSettled);
+  }
+
+  /** The web Study's view of a session key's model. Never creates a session. */
+  webModelView(sessionKey: string): ReturnType<typeof describeSessionModel> {
+    return describeSessionModel(this.modelOverrides, sessionKey, this.liveSessionManager.hasTurnInFlight(sessionKey));
+  }
+
+  /**
+   * The owner switched a session's model from the web Study: the same shared
+   * switch as `/model` (validation, config.json, live-session restart), but
+   * refused while a turn is in flight and when the model is no longer the
+   * one the owner reviewed (`from`). The caller decides which key may be
+   * switched (the owner conversation only).
+   */
+  switchModelFromWeb(sessionKey: string, model: string, from: string): ModelSwitchOutcome {
+    const outcome = switchSessionModel({
+      modelOverrides: this.modelOverrides,
+      closeLiveSession: (key) => this.liveSessionManager.closeLiveSession(key),
+      hasTurnInFlight: (key) => this.liveSessionManager.hasTurnInFlight(key),
+    }, sessionKey, model, { expectedCurrent: from, unchangedIsNoop: true });
+    if (outcome.ok && outcome.changed) log.info({ sessionKey, model: outcome.model, previous: outcome.previous }, "Model switched from the web UI");
+    else if (!outcome.ok) log.info({ sessionKey, reason: outcome.reason }, "Model switch from the web UI refused");
+    return outcome;
   }
 
   /** Context-pressure nudge after a completed turn — see ContextNudger. */

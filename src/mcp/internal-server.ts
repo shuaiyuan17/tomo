@@ -7,7 +7,10 @@ import { buildPetTools } from "./pet-tools.js";
 import { buildRecallTools } from "./recall-tools.js";
 import { buildPeopleTools } from "./people-tools.js";
 import { buildLcmTools } from "./lcm-tools.js";
+import { buildHomeTools } from "./home-tools.js";
 import { isGroupSessionKey } from "../sessions/keys.js";
+import { ownerSessionKey } from "../owner.js";
+import { homeService } from "../home/service.js";
 
 export const TOMO_INTERNAL_MCP_NAME = "tomo-internal";
 
@@ -34,6 +37,8 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
    * into it. False for a summoned-group turn and for a mixed batch.
    */
   const isOwnAudience = (): boolean => agent.isOwnAudienceTurn(callerSessionKey);
+  /** The owner's own DM session: the only one that gets Tomo's home. */
+  const ownerSession = !!config.owner && callerSessionKey === ownerSessionKey(config.owner);
 
   return createSdkMcpServer({
     name: TOMO_INTERNAL_MCP_NAME,
@@ -323,6 +328,13 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
         search: (opts) => agent.searchSessionTranscript(callerSessionKey, opts),
         canSearch: isOwnAudience,
       }),
+      // Tomo's home: the owner's DM session only (a group never gets the
+      // tool), and even there refused while a summoned group steers the turn.
+      ...(ownerSession ? buildHomeTools({
+        workspaceDir: config.workspaceDir,
+        allowed: isOwnAudience,
+        service: homeService,
+      }) : []),
     ],
   });
 }

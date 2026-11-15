@@ -1,0 +1,55 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`home floor plan > is stable for a fixed scene 1`] = `
+""Test study": room 8 m wide × 5 m deep × 3 m high; floor #7a5c3e, walls #e0d6c2, backdrop #101418.
+Light: #fff4e0, from 30° around the room, level 0.7.
+
+Floor plan from above (back wall at the top, the viewer at the bottom; letters are objects, digits are spots):
++------------------------------------------------+  back wall
+|....AAAAAAAAAA..........EEEEEEEEEEEE.HHHHHHHH...|
+|....AAAAAAAABB.......................HHHHHHHH...|
+|....AAAAAAAABB..................................|
+|.......CCCC.....................................|
+|.......CC1C.....................................|
+|...............................................F|
+|...............................................F|
+|G..............................................F|
+|G..............................................F|
+|G...................................3..........F|
+|G.......................2.......................|
+|..................DDDDDD........................|
+|..................DDDDDD........................|
+|..................DDDDDD........................|
+|.............................................4..|
++------------------------------------------------+  viewer's side
+One column is 0.17 m across, one row 0.33 m deep.
+Legend: A desk, B lamp, C (chair), D big-chair, E window, F board, G poster, H shelf, 1 spot desk-chair, 2 spot rug, 3 spot seat-1, 4 spot hall.
+
+Objects (8):
+- [A] desk: box 1.6×0.75×0.8 m, #8a6244; back left, base at (-2.5, 0, -1.9), top at 0.75 m.
+- [B] lamp: cylinder 0.15×0.5×0.15 m, #ddcc88; back left, base at (-1.9, 0.75, -1.9), top at 1.25 m; on desk.
+    glows #ffd27a while working and except while working for the owner
+    pulses by 20% while in trouble (retrying, rate-limited or errored)
+- [C] (chair): a chair, turned (0, 180, 0)°; back left, base at (-2.5, 0, -1.1), top at 0.95 m, takes up 0.5 m wide × 0.5 m deep × 0.95 m high.
+- [D] big-chair: a chair, scaled ×1.5; front centre, base at (-0.5, 0, 1.6), top at 1.43 m, takes up 0.75 m wide × 0.75 m deep × 1.43 m high.
+- [E] window: window 1.8×1.2 m (the app draws the sky in it), frame #ffffff; back centre, base at (1, 1.1, -2.47), top at 2.3 m.
+    turns #8899aa while it is raining outside
+- [F] board: sign "Next job {next_job}" 1.6×0.3 m, #111111, on #f5f0e6, turned (0, -90, 0)°; right side, base at (3.9, 1.6, 0), top at 1.9 m.
+- [G] poster: picture poster.png 0.8×1 m, turned (0, 90, 0)°; left side, base at (-3.95, 1.2, 0.5), top at 2.2 m.
+- [H] shelf: group of 2 parts; back right, base at (2.8, 0.5, -2.3), top at 0.94 m, takes up 1.2 m wide × 0.3 m deep × 0.44 m high.
+      part: box 1.2×0.04×0.3 m at (0, 0, 0)
+      part: box 1.2×0.04×0.3 m at (0, 0.4, 0); hidden at night (outside the window)
+
+Kinds (4): chair (2 parts: box 0.5×0.45×0.5 m, #553311; box 0.5×0.5×0.05 m), me (1 part: sphere 0.6×0.6×0.6 m, #5f7a4f), guest (2 parts: cone 0.4×0.7×0.4 m, #c98a4b; sign "{task}" 1.6×0.15 m), cat (1 part: sphere 0.3×0.25×0.4 m, #333333).
+
+Spots (4):
+- 1 desk-chair: at (-2.5, 0, -1.1), back left, facing 180° (toward the back wall).
+- 2 rug: at (0, 0, 1), front centre, facing 0° (toward the viewer).
+- 3 seat-1: at (2, 0, 0.5), right side, facing 270° (toward the left wall).
+- 4 hall: at (3.5, 0, 2.2), front right, facing 0° (toward the viewer).
+
+Who goes where:
+- Tomo (a me): at desk-chair while working; otherwise at seat-1 just after a scheduled job fires; otherwise at rug.
+- Subagents (a guest; explore as a guest): one each at seat-1, in order; the rest wait at hall.
+- The pet (a cat), when Tomo has one: at hall while the pet is sleeping; otherwise at desk-chair at night (outside the window) and while the pet is not hungry; otherwise at rug."
+`;

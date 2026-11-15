@@ -114,7 +114,7 @@ async function startForeground(): Promise<void> {
   mkdirSync(join(TOMO_HOME, "logs"), { recursive: true });
 
   // Sync defaults on startup (handles upgrades)
-  const { copyFileSync, existsSync: fileExists, readdirSync } = await import("node:fs");
+  const { copyFileSync, existsSync: fileExists } = await import("node:fs");
   const { resolve } = await import("node:path");
   const { dirname: dirnameFn } = await import("node:path");
   const { fileURLToPath: fileUrlFn } = await import("node:url");
@@ -130,32 +130,11 @@ async function startForeground(): Promise<void> {
     }
   }
 
-  // Sync tomo- skills (always overwrite to pick up updates)
-  const { rmSync } = await import("node:fs");
-  const defaultSkillsDir = join(defaultsDir, "skills");
-  const targetSkillsDir = join(config.workspaceDir, ".claude", "skills");
-  if (fileExists(defaultSkillsDir)) {
-    mkdirSync(targetSkillsDir, { recursive: true });
-    const expected = new Set<string>();
-    for (const skill of readdirSync(defaultSkillsDir, { withFileTypes: true })) {
-      if (!skill.isDirectory()) continue;
-      expected.add(`tomo-${skill.name}`);
-      const destDir = join(targetSkillsDir, `tomo-${skill.name}`);
-      mkdirSync(destDir, { recursive: true });
-      for (const file of readdirSync(join(defaultSkillsDir, skill.name))) {
-        copyFileSync(join(defaultSkillsDir, skill.name, file), join(destDir, file));
-      }
-    }
-    // Prune retired tomo- skills (built-ins removed in an upgrade). Only touch
-    // `tomo-` directories — the prefix is reserved for built-ins; users are
-    // told to avoid it for custom skills, which therefore stay untouched here.
-    for (const entry of readdirSync(targetSkillsDir, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      if (!entry.name.startsWith("tomo-")) continue;
-      if (expected.has(entry.name)) continue;
-      rmSync(join(targetSkillsDir, entry.name), { recursive: true, force: true });
-    }
-  }
+  // Sync tomo- skills (always overwrite to pick up updates; Markdown rendered
+  // so the home skill's lists come from the scene format).
+  const { syncBundledSkills } = await import("../workspace/bundled-skills.js");
+  try { syncBundledSkills(join(defaultsDir, "skills"), join(config.workspaceDir, ".claude", "skills")); }
+  catch (err) { log.warn({ err }, "Bundled skills could not be synced"); }
 
   // Drop restart requests that can no longer be honoured before any session
   // can observe one. A request outlives the daemon whenever the process went
@@ -213,6 +192,22 @@ async function startForeground(): Promise<void> {
     }));
   }
 
+  // Tomo's home (src/home/): the scene store, the status the web UI draws,
+  // and the picture broker home_check uses. The next job is read from the
+  // cron store once it exists (below).
+  const { HomeService, setHomeService } = await import("../home/service.js");
+  const { PetStore } = await import("../mcp/pet-store.js");
+  let homeNextJob: () => number | undefined = () => undefined;
+  const home = new HomeService({
+    workspaceDir: config.workspaceDir,
+    lastGoodPath: join(config.tomoHome, "data", "home", "last-good.json"),
+    // The window's sky: only the city goes to wttr.in, as for the heartbeat.
+    city: config.city,
+    nextJobAt: () => homeNextJob(),
+    petMood: () => { const pets = new PetStore(); const pet = pets.load(); return pet ? pets.computeMood(pet) : undefined; },
+  });
+  setHomeService(home);
+
   // Optional UI failures must not become a messaging startup prerequisite.
   if (config.web?.enabled) {
     try {
@@ -246,13 +241,17 @@ async function startForeground(): Promise<void> {
         taskModel: subagentModelReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
         usage: (refresh) => usageCache.get(refresh),
         models: { view: (key) => agent.webModelView(key), switch: (key, model, from) => agent.switchModelFromWeb(key, model, from) },
-        sessionKeys: sessionKeysReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }) });
-      web.attach(new WebSupervisor(web, {
+        sessionKeys: sessionKeysReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
+        home: { view: () => home.web(), snapshot: (input) => home.deliverSnapshot(input) } });
+      const supervisor = new WebSupervisor(web, {
         ...config.web, owner: config.owner,
         sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,
         workspaceDir: config.workspaceDir, agentName: config.agentName, uploadsEnabled: config.saveInboundImages, cronStorePath: CRON_STORE_PATH, mcpStatus: () => agent.readMcpStatuses(),
         diagnostic: (message, level = "info") => log[level](message),
-      }));
+      });
+      web.attach(supervisor);
+      home.attachWeb({ publish: (event) => web.events.publish(event), available: () => supervisor.status().state === "running",
+        mayShowTask: (key) => web.mayShowTask(key) });
       agent.addChannel(web);
       web.markRecorded(agent.recordedWebRequests(web.interruptedAwaiting(), WEB_CHAT_ID));
       web.announceInterrupted((items) => agent.noteInterruptedWebRequests(items, WEB_CHAT_ID));
@@ -275,6 +274,12 @@ async function startForeground(): Promise<void> {
     }
     return jobs;
   };
+  homeNextJob = () => {
+    let next: number | undefined;
+    for (const job of readCronJobsSafely(cronStore).jobs) if (job.enabled && job.nextRunAt !== null && (next === undefined || job.nextRunAt < next)) next = job.nextRunAt;
+    return next;
+  };
+  try { home.start(); } catch (err) { log.warn({ err }, "Tomo's home could not start; everything else runs without it"); }
   const scheduler = new CronScheduler(agent, cronStore);
   const petScheduler = new PetScheduler(agent);
 
@@ -347,6 +352,7 @@ async function startForeground(): Promise<void> {
     activityLog?.stop();
     metricsExporter?.stop();
     watchServer.stop();
+    home.stop();
     versionChecker.stop();
     rollupRunner.stop();
     continuity.stop();

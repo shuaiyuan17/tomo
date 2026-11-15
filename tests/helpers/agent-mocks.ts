@@ -436,6 +436,7 @@ export function workspaceModuleMock() {
     PRIVATE_MEMORY_SUBDIR: "private",
     PRIVATE_MEMORY_DIR: "/tmp/tomo-mock/workspace/memory/private",
     MEMORY_DIR: "/tmp/tomo-mock/workspace/memory",
+    HOME_SCENE_DIR: "/tmp/tomo-mock/workspace/home",
   };
 }
 

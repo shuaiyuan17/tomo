@@ -17,6 +17,7 @@ import { MemoryReader } from "../workspace/memory-reader.js";
 import { AgentNameReader } from "../workspace/agent-name.js";
 import { readSubagentBrief, readSubagentModel, readSubagentPage, SubagentReadError } from "./subagent-reader.js";
 import { readSessionTools, SessionToolsError } from "./session-tools.js";
+import { readHomeAsset } from "../home/files.js";
 
 export interface WebDataOptions {
   sessionsDir: string;
@@ -238,6 +239,21 @@ export class WebData {
       return { type, bytes };
     } catch (error) { throw error instanceof WebError ? error : refuse(); }
     finally { await file?.close(); }
+  }
+
+  /**
+   * A picture of Tomo's home, by name: only `home/assets/<name>` with a name
+   * ASSET_NAME accepts, the real directory exactly there (no symlinked
+   * `home` or `assets`), an ordinary single-link file of at most 512 KiB
+   * whose bytes are the type its extension says (src/home/files.ts). Every
+   * refusal is the same 404, so nothing about other files leaks.
+   */
+  homeAsset(name: string): { type: string; bytes: Buffer } {
+    let decoded: string;
+    try { decoded = decodeURIComponent(name); } catch { throw new WebError(404, "asset_not_found"); }
+    const file = this.options.workspaceDir ? readHomeAsset(this.options.workspaceDir, decoded) : undefined;
+    if (!file) throw new WebError(404, "asset_not_found");
+    return file;
   }
 
   /** A picture the agent sent in a session the catalog shows, by its store id. */

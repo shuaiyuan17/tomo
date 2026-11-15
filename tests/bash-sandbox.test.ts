@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -52,6 +53,7 @@ vi.mock("../src/config.js", () => ({ config: { workspaceDir: "/ws", tomoHome: OL
 vi.mock("../src/workspace/index.js", () => ({
   MEMORY_DIR: "/ws/memory",
   PRIVATE_MEMORY_DIR: "/ws/memory/private",
+  HOME_SCENE_DIR: "/ws/home",
   PRIVATE_MEMORY_SUBDIR: "private",
 }));
 vi.mock("../src/logger.js", () => ({
@@ -212,6 +214,20 @@ describe("sandboxProfileText", () => {
   it("escapes a quote in the path rather than closing the literal early", () => {
     expect(sandboxProfileText(`/ws/me"mo\\ry`)).toContain(`(subpath "/ws/me\\"mo\\\\ry")`);
   });
+
+  it("adds a WRITE-only deny for Tomo's home, leaving the private-memory denies as they were", () => {
+    expect(sandboxProfileText("/ws/memory/private", ["/ws/home"])).toBe(
+      [
+        "(version 1)",
+        "(allow default)",
+        `(deny file-read* (subpath "/ws/memory/private"))`,
+        `(deny file-write* (subpath "/ws/memory/private"))`,
+        `(deny file-write* (subpath "/ws/home"))`,
+        "",
+      ].join("\n"),
+    );
+    expect(sandboxProfileText("/ws/memory/private", ["/ws/home"])).not.toContain(`(deny file-read* (subpath "/ws/home"))`);
+  });
 });
 
 describe("resolvedDenyDir", () => {
@@ -328,6 +344,21 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
     }
   });
 
+  it("returns null when the home (write-only deny) cannot be resolved", () => {
+    // The second barred directory fails closed exactly like the first.
+    const root = scratchDir("tomo-sbx-home-unresolvable-");
+    symlinkSync(join(root, "nowhere"), join(root, "home"));
+    expect(sandboxedBashCommand("ls", scratchDir("tomo-sbx-home-priv-"), undefined, [join(root, "home")])).toBeNull();
+    expect(vi.mocked(log.warn)).toHaveBeenCalled();
+    if (sandboxRuns) {
+      expect(vi.mocked(log.warn).mock.calls[0][0]).toMatchObject({
+        reason: expect.stringContaining("writes under it cannot be denied"),
+      });
+    }
+    // And a `..` spelling of it is refused like the private dir's.
+    expect(sandboxedBashCommand("ls", scratchDir("tomo-sbx-home-priv2-"), undefined, [`${root}/x/../home`])).toBeNull();
+  });
+
   it("returns null when a foreign PreToolUse hook could rewrite the sandbox away", () => {
     // Registering our rewrite last does not make it final: the CLI keeps the
     // last `updatedInput` it sees, and project/plugin hooks arrive through its
@@ -355,7 +386,10 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
   it("wraps when the sandbox is available, with the profile inline", () => {
     if (!existsSync(SANDBOX_EXEC_PATH) || !existsSync(SANDBOX_SHELL_PATH)) return;
     const dir = scratchDir("tomo-sbx-ok-");
+    // The home's write-only deny rides along by default (HOME_SCENE_DIR, mocked as /ws/home).
     expect(sandboxedBashCommand("echo hi", dir))
+      .toBe(wrapWithSandbox("echo hi", sandboxProfileText(dir, [resolvedDenyDir("/ws/home")!])));
+    expect(sandboxedBashCommand("echo hi", dir, undefined, []))
       .toBe(wrapWithSandbox("echo hi", sandboxProfileText(dir)));
   });
 
@@ -495,8 +529,8 @@ describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
   /** Run `command` the way the Bash tool would once the hook has rewritten it.
    *  `/bin/zsh -lc` on the OUTSIDE too, because `updatedInput` hands the tool a
    *  command LINE, not an argv. */
-  function runSandboxed(command: string, privateDir: string): { code: number; out: string } {
-    const wrapped = sandboxedBashCommand(command, privateDir);
+  function runSandboxed(command: string, privateDir: string, writeOnlyDirs?: readonly string[]): { code: number; out: string } {
+    const wrapped = sandboxedBashCommand(command, privateDir, undefined, writeOnlyDirs);
     expect(wrapped).not.toBeNull();
     try {
       return {
@@ -508,6 +542,34 @@ describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
       return { code: e.status ?? -1, out: `${e.stdout ?? ""}${e.stderr ?? ""}` };
     }
   }
+
+  it("lets the shell read Tomo's home but not write, create, move or remove anything in it", () => {
+    const { priv, dir } = workspace();
+    const home = join(dir, "home");
+    mkdirSync(home);
+    writeFileSync(join(home, "scene.json"), "{\"version\":1}\n");
+    const read = runSandboxed(`cat ${shellSingleQuote(join(home, "scene.json"))}`, priv, [home]);
+    expect(read).toMatchObject({ code: 0 });
+    expect(read.out).toContain("version");
+    for (const command of [
+      `echo x > ${shellSingleQuote(join(home, "scene.json"))}`,
+      `touch ${shellSingleQuote(join(home, "new.json"))}`,
+      `rm ${shellSingleQuote(join(home, "scene.json"))}`,
+      `mv ${shellSingleQuote(home)} ${shellSingleQuote(join(dir, "moved"))}`,
+      `node -e 'require("node:fs").writeFileSync(process.argv[1], "x")' ${shellSingleQuote(join(home, "scene.json"))}`,
+    ]) expect(runSandboxed(command, priv, [home]).code).not.toBe(0);
+    expect(readFileSync(join(home, "scene.json"), "utf8")).toContain("version");
+  });
+
+  it("denies a write to the home through a symlink planted outside it", () => {
+    const { priv, dir } = workspace();
+    const home = join(dir, "home");
+    mkdirSync(home);
+    writeFileSync(join(home, "scene.json"), "{}\n");
+    symlinkSync(home, join(dir, "elsewhere"));
+    expect(runSandboxed(`echo x > ${shellSingleQuote(join(dir, "elsewhere", "scene.json"))}`, priv, [home]).code).not.toBe(0);
+    expect(readFileSync(join(home, "scene.json"), "utf8")).toBe("{}\n");
+  });
 
   it("denies a direct read of a file under the private dir", () => {
     const { priv } = workspace();

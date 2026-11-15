@@ -13,10 +13,11 @@ import { CompactButton } from "./compact-button.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
-import { ArrowUp, ImagePlus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, ListChecks, MessageCircle, Monitor, Moon, PanelLeft, Sun, SunMoon } from "lucide-react";
+import { ArrowUp, ImagePlus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, House, ListChecks, MessageCircle, Monitor, Moon, PanelLeft, Sun, SunMoon } from "lucide-react";
 import { Study } from "./study.js";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { ScreenWindow } from "./screen.js";
+import { HomePage, useHomeRoute } from "./home/home-page.js";
 import { awaitingOwner, dismissAfterAcceptedSend, historyBadge, pendingLabel, pendingUserMessages, readReceipt, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
 import { ReadReceiptMark } from "./read-receipt.js";
 import { Badge } from "@/components/ui/badge";
@@ -104,6 +105,7 @@ export function App() {
   const agent = agentNameOf(web.bootstrap?.agentName);
   const labels = requestLabels(agent);
   const [study, setStudy, studyFocus] = useStudyRoute();
+  const home = useHomeRoute() && !study;
   const [screenOpen, setScreenOpen] = useState(false);
   const [selected, setSelected] = useState("");
   const selectedId = selected || web.bootstrap?.ownerId || web.bootstrap?.sessions[0]?.id || "";
@@ -425,14 +427,14 @@ export function App() {
   const connectionLabel = web.connection === "live" ? "Connected" : web.connection === "locked" ? "Access link required" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…";
   const notice = "rounded-xl border bg-muted/60 px-4 py-3 text-[13px]";
   return <AgentNameContext.Provider value={agent}><div className="flex h-dvh flex-col">
-    <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href={study ? "#study" : "#conversation"} onClick={(e) => { e.preventDefault(); document.getElementById(study ? "study" : "conversation")?.focus(); }}>{study ? `Skip to ${STUDY_LABELS[study]}` : "Skip to conversation"}</a>
+    <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href={study ? "#study" : home ? "#home" : "#conversation"} onClick={(e) => { e.preventDefault(); document.getElementById(study ? "study" : home ? "home" : "conversation")?.focus(); }}>{study ? `Skip to ${STUDY_LABELS[study]}` : home ? "Skip to Home" : "Skip to conversation"}</a>
     <header className="flex h-[72px] shrink-0 items-center gap-8 border-b px-8 max-[1024px]:px-6 max-[600px]:h-12 max-[600px]:gap-3 max-[600px]:px-3.5 max-[600px]:pt-[env(safe-area-inset-top)] max-[600px]:box-content">
       <Button ref={menuButton} variant="ghost" size="icon" aria-expanded={drawer} aria-controls="sidebar" title="Menu" aria-label="Menu: conversations, the Study, usage and theme"
         onClick={() => { setTasksOpen(false); setMenuOpen((open) => !open); }}
         className="-ml-1.5 hidden size-9 shrink-0 rounded-xl text-foreground hover:bg-foreground/[0.07] aria-expanded:bg-foreground/[0.11] max-[600px]:inline-flex [&_svg:not([class*='size-'])]:size-5"><PanelLeft strokeWidth={1.75} /></Button>
       <a className="flex items-center gap-2 font-serif text-[30px] tracking-[-1.5px] text-foreground no-underline max-[600px]:gap-1.5 max-[600px]:text-[22px] max-[600px]:tracking-[-1px]" href="/" aria-label="Tomo home">
         <Mark className="size-9 max-[600px]:size-7" /><span>tomo<span className="text-primary">.</span></span></a>
-      <span className="border-l pl-8 text-sm text-muted-foreground max-[800px]:hidden">{study ? "The Study" : "Conversation"}</span>
+      <span className="border-l pl-8 text-sm text-muted-foreground max-[800px]:hidden">{study ? "The Study" : home ? "Home" : "Conversation"}</span>
       <div className="ml-auto flex items-center gap-4 max-[600px]:gap-1">
         <Button ref={tasksButton} variant="ghost" size="icon" aria-pressed={tasksOpen} aria-controls="tasks-rail" title="Tasks"
           aria-label={`Tasks${running ? `, ${running} running` : ""}`} onClick={() => { setMenuOpen(false); setTasksOpen((open) => !open); }}
@@ -456,9 +458,9 @@ export function App() {
         className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-width:thin] max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:fixed max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:bottom-0 max-[600px]:left-0 max-[600px]:z-30 max-[600px]:w-[min(320px,86vw)] max-[600px]:bg-background max-[600px]:px-5 max-[600px]:pt-5 max-[600px]:pb-[max(1.25rem,env(safe-area-inset-bottom))] max-[600px]:shadow-2xl max-[600px]:transition-transform max-[600px]:duration-[220ms] max-[600px]:data-[state=closed]:-translate-x-full max-[600px]:data-[state=closed]:shadow-none"
         aria-label="Conversation details" inert={tasksModal || (phone && !drawer)} aria-hidden={phone && !drawer ? true : undefined}>
         <nav aria-label="Workspace" className="mb-7 flex flex-col gap-0.5">
-          {([[null, "Conversation", MessageCircle], ["todos", "The Study", BookOpen]] as const).map(([target, label, Icon]) => {
-            const current = target === null ? !study : !!study;
-            return <Button key={label} variant="ghost" aria-current={current ? "page" : undefined} onClick={() => { setStudy(target === null ? null : study ?? target); if (drawer) closeMenu(false); }}
+          {([[null, "Conversation", MessageCircle], ["home", "Home", House], ["todos", "The Study", BookOpen]] as const).map(([target, label, Icon]) => {
+            const current = target === null ? !study && !home : target === "home" ? home : !!study;
+            return <Button key={label} variant="ghost" aria-current={current ? "page" : undefined} onClick={() => { if (target === "home") window.location.hash = "home"; else setStudy(target === null ? null : study ?? target); if (drawer) closeMenu(false); }}
               className="h-9 justify-start gap-2.5 rounded-xl px-3 text-[13px] font-normal text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground aria-[current=page]:bg-foreground/[0.08] aria-[current=page]:font-medium aria-[current=page]:text-foreground max-[600px]:h-10 max-[600px]:text-[14px]">
               <Icon strokeWidth={1.75} /><span>{label}</span></Button>;
           })}
@@ -509,7 +511,8 @@ export function App() {
       </aside>
       {study && <Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} focus={studyFocus} cronRevision={web.cronRevision}
         mutator={{ bootstrap: web.bootstrap, refresh: web.refreshBootstrap, live: web.connection === "live" }} />}
-      <main id="conversation" hidden={!!study} {...dragProps} className="relative mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-3.5 max-[600px]:pt-2 max-[600px]:pb-[max(0.625rem,env(safe-area-inset-bottom))]" tabIndex={-1} inert={modal}>
+      {home && <HomePage events={web.home} bootstrap={web.bootstrap} refresh={web.refreshBootstrap} inert={modal} />}
+      <main id="conversation" hidden={!!study || home} {...dragProps} className="relative mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-3.5 max-[600px]:pt-2 max-[600px]:pb-[max(0.625rem,env(safe-area-inset-bottom))]" tabIndex={-1} inert={modal}>
         {dragging && <div aria-hidden="true" className="pointer-events-none absolute inset-3 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary/60 bg-background/80 text-[15px] font-medium text-foreground motion-enter">
           <span className="flex items-center gap-2"><ImagePlus className="size-5" strokeWidth={1.75} />Drop to attach</span></div>}
         {web.bootstrap?.setupRequired && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}

@@ -51,6 +51,11 @@ export function dismissRequest(requestId: string, bootstrap: WebBootstrap, refre
   return mutate<WebRequest>(`/messages/${requestId}/dismiss`, "POST", {}, bootstrap, refresh);
 }
 
+/** A picture of Tomo's home, answering a `home-look` (only ever then). Same CSRF/epoch rules as sending a message. */
+export function postHomeSnapshot(input: { requestId?: string; revision: string; png: string }, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<unknown> {
+  return mutate<unknown>("/home/snapshot", "POST", input, bootstrap, refresh);
+}
+
 /** Stop the owner conversation's running turn. Same CSRF/epoch rules as sending a message. */
 export function stopTurn(bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebStopResult> {
   return mutate<WebStopResult>("/stop", "POST", {}, bootstrap, refresh);

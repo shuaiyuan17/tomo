@@ -38,6 +38,15 @@ describe("sdkSignalOf", () => {
   });
 });
 
+describe("sdkSignalOf: compaction status", () => {
+  it("reads the SDK's compacting status for the home, and its end", () => {
+    expect(sdkSignalOf({ type: "system", subtype: "status", status: "compacting" })).toEqual({ kind: "compacting", active: true });
+    expect(sdkSignalOf({ type: "system", subtype: "status", status: null, compact_result: "success" })).toEqual({ kind: "compacting", active: false });
+    expect(sdkSignalOf({ type: "system", subtype: "status", status: "requesting" })).toBeUndefined();
+    expect(sdkSignalOf({ type: "system", subtype: "status" })).toBeUndefined();
+  });
+});
+
 describe("cleanSuggestion", () => {
   it("drops the inbound stamp a predicted prompt can imitate, and bounds the text", () => {
     expect(cleanSuggestion("[imessage · Wed 09/02 20:50 PDT] what about Friday?")).toBe("what about Friday?");

@@ -1,6 +1,8 @@
 import { z } from "zod";
 import type { ContextCategory, SessionMessage, SessionStats } from "../sessions/types.js";
 import type { CronRunStatus, CronSchedule } from "../cron/types.js";
+import type { HomeScene } from "../home/scene.js";
+import type { HomeStatus } from "../home/status.js";
 import type { ContextSection } from "../lcm/stats.js";
 import type { SummaryBlock } from "../lcm/summary-reader.js";
 
@@ -163,6 +165,16 @@ export interface WebRateLimit {
   /** Daemon clock when it was reported (ms epoch). */
   at: number;
 }
+// ---- Tomo's home (see src/home/scene.ts) ----
+/**
+ * The scene the page draws: always a valid one. `problems` is set when the
+ * file Tomo last wrote is not valid, and `scene` is then the last good one
+ * (or the starter). `revision` changes whenever `scene` or an asset does.
+ */
+export interface WebHome { scene: HomeScene; revision: string; starter: boolean; problems?: string[]; status: HomeStatus }
+/** A picture of the room as a browser drew it, for Tomo to look at: a PNG as base64, at most HOME_SNAPSHOT_MAX_BYTES decoded. */
+export const HOME_SNAPSHOT_MAX_BYTES = 1024 * 1024;
+export const homeSnapshotSchema = z.object({ requestId: z.uuid().optional(), revision: z.string().max(80), png: z.string().min(1).max(Math.ceil(HOME_SNAPSHOT_MAX_BYTES * 4 / 3) + 4).regex(/^[A-Za-z0-9+/]+={0,2}$/) }).strict();
 export type WebEvent =
   /** `images`: ids of pictures this block sent, filed in the outgoing media store (see outgoing-media.ts). */
   | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string; images?: string[] }
@@ -179,6 +191,12 @@ export type WebEvent =
   | { type: "rate-limit"; limit: WebRateLimit }
   /** The SDK's predicted next message for the composer; null withdraws it. */
   | { type: "suggestion"; sessionId: string; text: string | null }
+  /** The home's scene or one of its pictures changed: the page re-reads /home. */
+  | { type: "home"; revision: string }
+  /** What Tomo is doing changed. REPLACE semantics. */
+  | { type: "home-status"; status: HomeStatus }
+  /** Tomo wants to look at its home: an open Home page answers with POST /home/snapshot. */
+  | { type: "home-look"; requestId: string }
   /** All tasks of one session, live and recently ended. REPLACE semantics. */
   | { type: "tasks"; sessionId: string; tasks: WebTask[] };
 export interface EventEnvelope { id: string; event: WebEvent }
@@ -284,6 +302,10 @@ export const rpcSchema = z.discriminatedUnion("method", [
   /** Switch the owner conversation's model; `from` is the model the owner reviewed. */
   z.object({ method: z.literal("model-switch"), epoch: z.uuid(), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
     model: z.string().trim().min(1).max(200), from: z.string().min(1).max(200) }).strict(),
+  /** Tomo's home as the page draws it (WebHome). */
+  z.object({ method: z.literal("home") }).strict(),
+  /** A picture of the home an open Home page drew, for Tomo's home_check (checked again by the daemon). */
+  z.object({ method: z.literal("home-snapshot"), epoch: z.uuid(), snapshot: homeSnapshotSchema }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
 export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "rateLimit" | "suggestions">;

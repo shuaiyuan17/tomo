@@ -18,6 +18,9 @@ export { PRIVATE_MEMORY_SUBDIR };
 /** Absolute path to the private memory dir. Used by the group-session guard
  *  hook to deny tool calls referencing this location. */
 export const PRIVATE_MEMORY_DIR = join(MEMORY_DIR, PRIVATE_MEMORY_SUBDIR);
+/** Absolute path to Tomo's home (src/home/files.ts HOME_DIR). The owner
+ *  conversation's alone: a barred (group) turn may read it but not write it. */
+export const HOME_SCENE_DIR = join(WORKSPACE_DIR, "home");
 
 /** Load a .md file from workspace, falling back to bundled defaults */
 function load(name: string): string {
@@ -199,8 +202,14 @@ The harness strips the tag and sends the sticker. Match the value to the channel
 An inbound iMessage sticker arrives as \`[Sent a sticker, saved to: <path>]\`; reuse that path to send it back.
 `.trim();
 
+/** Owner DM only: groups have no home tool. At most two sentences; the rest is the tomo-home skill. */
+export const HOME_NOTE = `## Your Home
+
+You have a home: a small 3D room the owner can open in the web UI, which you design as data in \`~/.tomo/workspace/home/scene.json\` and which shows what you are doing. Load the \`tomo-home\` skill before changing it, and check your work with \`home_check\`.`;
+
 export function buildSystemPrompt(opts: { isGroup?: boolean } = {}): string {
   const isGroup = !!opts.isGroup;
-  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup), loadPeopleSection(isGroup), HARNESS_INSTRUCTIONS].filter(Boolean);
+  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup), loadPeopleSection(isGroup),
+    isGroup ? HARNESS_INSTRUCTIONS : `${HARNESS_INSTRUCTIONS}\n\n${HOME_NOTE}`].filter(Boolean);
   return sections.join("\n\n---\n\n");
 }

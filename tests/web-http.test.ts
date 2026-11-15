@@ -59,7 +59,6 @@ beforeEach(async () => {
       if (input.method === "dismiss") return channel.resolveInterrupted(input.requestId, "dismissed");
       if (input.method === "compact") return channel.requestCompact();
       if (input.method === "stop") return channel.stopOwnerTurn();
-      if (input.method === "epoch") return channel.events.epoch;
       if (input.method === "task") return channel.task(input.sessionId, input.taskId, input.output);
       if (input.method === "usage") return channel.usage(input.refresh);
       return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };

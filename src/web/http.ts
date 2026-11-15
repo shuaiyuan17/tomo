@@ -473,6 +473,8 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
   // Keep runtime listener errors local even after the startup promise settles.
   server.on("error", () => { for (const stream of [...streams, ...screenStreams]) stream.destroy(); });
   boundPort = (server.address() as { port: number }).port;
+  // The bundle's brotli copies, made now rather than on the first page load.
+  void realpath(deps.assetsDir).then((root) => compressed.warm(root), () => undefined);
   return { port: boundPort, async close() {
     for (const stream of [...streams, ...screenStreams]) stream.destroy();
     server.closeAllConnections();

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { request } from "node:http";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -14,7 +14,7 @@ import type { WebBootstrap } from "../src/web/protocol.js";
 import { sendMessage } from "../web/src/api.js";
 import type { IncomingMessage } from "node:http";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
-import { pickEncoding } from "../src/web/static-assets.js";
+import { CompressedAssets, pickEncoding } from "../src/web/static-assets.js";
 
 let root: string;
 let service: Awaited<ReturnType<typeof startWebHttp>>;
@@ -415,6 +415,22 @@ describe("local HTTP boundary", () => {
     for (const path of ["/", "/favicon.svg", "/manifest.webmanifest"]) {
       expect((await raw(path, "br")).headers["cache-control"]).toBe("no-store");
     }
+  });
+  it("warms the bundle's brotli copies at startup, regular files only", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tomo-web-warm-")); mkdirSync(join(dir, "assets"));
+    const source = "x".repeat(4_000);
+    writeFileSync(join(dir, "assets", "app-1.js"), source); writeFileSync(join(dir, "index.html"), source);
+    writeFileSync(join(dir, "elsewhere.js"), source); symlinkSync(join(dir, "elsewhere.js"), join(dir, "assets", "link-1.js"));
+    const cache = new CompressedAssets();
+    await cache.warm(dir);
+    const version = (path: string) => { const stat = statSync(join(dir, path)); return `${stat.size}:${stat.mtimeMs}`; };
+    // Already compressed: the bytes passed now are not what is returned.
+    for (const path of ["assets/app-1.js", "index.html"]) {
+      expect(brotliDecompressSync(await cache.get(path, version(path), "br", Buffer.from("other"))).toString()).toBe(source);
+    }
+    expect(brotliDecompressSync(await cache.get("assets/link-1.js", version("assets/link-1.js"), "br", Buffer.from("other"))).toString()).toBe("other");
+    await cache.warm(join(dir, "missing"));
+    rmSync(dir, { recursive: true, force: true });
   });
   it("negotiates brotli, then gzip, honouring q=0", () => {
     expect(pickEncoding("gzip, deflate, br, zstd")).toBe("br");

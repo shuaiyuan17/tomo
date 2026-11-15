@@ -1,3 +1,5 @@
+import { lstat, readdir, readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { promisify } from "node:util";
 import { brotliCompress, constants, gzip } from "node:zlib";
 
@@ -13,6 +15,8 @@ export const IMMUTABLE_CACHE = "public, max-age=31536000, immutable";
 const COMPRESSIBLE = new Set(["html", "js", "css", "svg", "webmanifest"]);
 /** Below this, compression saves less than the header it adds. */
 const MIN_COMPRESS_BYTES = 1024;
+/** Warming skips anything bigger (the server refuses files over its buffer limit anyway). */
+const WARM_MAX_BYTES = 16 * 1024 * 1024;
 export type Encoding = "br" | "gzip";
 
 /** The best encoding the request accepts: brotli, then gzip, else none (`q=0` refuses one). */
@@ -41,6 +45,23 @@ export class CompressedAssets {
 
   static compressible(ext: string, size: number): boolean {
     return COMPRESSIBLE.has(ext) && size >= MIN_COMPRESS_BYTES;
+  }
+
+  /**
+   * Compresses the bundle (brotli) in the background at startup, so the
+   * first page load after a start or upgrade does not wait for it. Only
+   * regular files; errors are ignored (a request compresses on demand).
+   */
+  async warm(root: string): Promise<void> {
+    const files = ["index.html", ...(await readdir(join(root, "assets")).catch(() => [])).map((name) => `assets/${name}`)];
+    for (const relative of files) {
+      try {
+        const stat = await lstat(join(root, relative));
+        const ext = relative.split(".").pop()!;
+        if (!stat.isFile() || stat.size > WARM_MAX_BYTES || !CompressedAssets.compressible(ext, stat.size)) continue;
+        await this.get(relative, `${stat.size}:${stat.mtimeMs}`, "br", await readFile(join(root, relative)));
+      } catch { /* compressed on first request instead */ }
+    }
   }
 
   get(path: string, version: string, encoding: Encoding, bytes: Buffer): Promise<Buffer> {

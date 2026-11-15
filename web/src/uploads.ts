@@ -134,6 +134,12 @@ export function captureSend(list: readonly Attachment[]): { keys: string[]; ids:
     refiled: done.flatMap((item) => (item.filed ? [item.filed.path] : [])) };
 }
 
+/** One atomic tray change: `dropKeys` leave, `added` come in (order kept). Returns what was dropped, for its cleanup. */
+export function replaceItems(current: readonly Attachment[], dropKeys: readonly string[], added: readonly Attachment[]): { next: Attachment[]; dropped: Attachment[] } {
+  const drop = new Set(dropKeys);
+  return { next: [...current.filter((item) => !drop.has(item.key)), ...added], dropped: current.filter((item) => drop.has(item.key)) };
+}
+
 /** A tray item for a file an interrupted message already filed (resend): done at once, nothing to upload. */
 export function filedAttachment(key: string, filed: WebFiledFile): Attachment {
   return { key, file: { name: filed.name, type: filed.type, size: filed.size } as File, preview: "", kind: "file", status: "done", progress: 1, filed };

@@ -15,7 +15,7 @@ import { WebData } from "../src/web/data.js";
 import { webSessionId } from "../src/web/owner.js";
 import type { IncomingMessage } from "../src/channels/types.js";
 import { splitAttachments } from "../web/src/attachments.js";
-import { addFiles, captureSend, filedAttachment, formatSize, pastedFiles, type Attachment } from "../web/src/uploads.js";
+import { addFiles, captureSend, filedAttachment, formatSize, pastedFiles, replaceItems, type Attachment } from "../web/src/uploads.js";
 import { applyRestored, dismissAfterAcceptedSend, missingAttachments, resendAfterDraftChange, resendAfterSend } from "../web/src/pending.js";
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
@@ -222,6 +222,18 @@ describe("a message with a file (web channel)", () => {
     expect(resendAfterSend(a, a)).toBeNull();
     expect(resendAfterSend(b, a)).toBe(b);
     expect(resendAfterSend(b, null)).toBe(b);
+  });
+  it("switching resend is one atomic tray change: A's items (files and images) out, B's in — a send then carries only B's", () => {
+    const file = (path: string, name: string) => ({ path, name, type: "text/markdown", size: 1 });
+    const image = (key: string, uploadId: string): Attachment => ({ key, file: { name: `${key}.png`, type: "image/png", size: 1 } as File, preview: "", kind: "image", status: "done", progress: 1, uploadId });
+    const typed = image("mine", "u0");
+    const tray = [typed, filedAttachment("fa", file("/f/a.md", "a.md")), image("ia", "uA")];
+    const { next, dropped } = replaceItems(tray, ["fa", "ia"], [filedAttachment("fb", file("/f/b.md", "b.md"))]);
+    expect(dropped.map((item) => item.key)).toEqual(["fa", "ia"]);
+    const withB = [...next, image("ib", "uB")];
+    const sent = captureSend(withB);
+    expect(sent.refiled).toEqual(["/f/b.md"]);
+    expect(sent.ids).toEqual(["u0", "uB"]);
   });
   it("refiled never names an arbitrary path: only files an interrupted request filed, still present", async () => {
     const { channel, handled, request } = await interrupted("x", "n.md");

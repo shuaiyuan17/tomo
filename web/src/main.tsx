@@ -462,9 +462,9 @@ export function App() {
   const resend = (request: WebRequest) => {
     // A new restore: any earlier one still reading is void, and what it put back in the tray goes (as its draft does).
     const token = ++restoreToken.current;
-    for (const key of [...(resending?.imageKeys ?? []), ...(resending?.fileKeys ?? [])]) attachments.remove(key);
     // Its files come back as they are: already filed, the resend names them by path (nothing is uploaded again).
-    const fileKeys = request.files?.length ? attachments.addFiled(request.files) : [];
+    // One atomic tray change: the previous resend's items out, this one's files in.
+    const fileKeys = attachments.replaceAll([...(resending?.imageKeys ?? []), ...(resending?.fileKeys ?? [])], request.files ?? []);
     const restoringImages = !!request.images?.length;
     const expected = (request.images?.length ?? 0) + (request.files?.length ?? 0);
     setResending({ requestId: request.requestId, original: request.text ?? "", ...(fileKeys.length ? { fileKeys } : {}), ...(restoringImages ? { restoring: true } : {}), ...(expected ? { expected } : {}), token });

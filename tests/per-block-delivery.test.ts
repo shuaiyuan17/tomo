@@ -2,7 +2,7 @@
  * Mid-turn outbound delivery: one completed content block, one delivery.
  *
  * #292 removed streaming and moved delivery to the END of the turn. That fixed
- * the "几十条消息" newline-splitting of the streaming era but cost the owner the
+ * the "dozens of messages" newline-splitting of the streaming era but cost the owner the
  * ability to be answered mid-turn: while the agent waits 20 minutes on a
  * subagent, text it already produced sits in a buffer.
  *

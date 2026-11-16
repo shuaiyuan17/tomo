@@ -8,7 +8,8 @@ export function recordedReplyIds(history: HistoryPage): Set<string> {
 export function pendingUserMessages(requests: WebRequest[], history: HistoryPage, sessionId: string, withImages: ReadonlySet<string> = new Set()): WebRequest[] {
   const recorded = new Set(history.messages.filter((m) => m.role === "user").map((m) => m.requestId));
   // An image- or file-only message has no text, but this tab still shows its bubble (with the attachments).
-  return requests.filter((r) => r.sessionId === sessionId && (r.text || r.images?.length || r.files?.length || withImages.has(r.requestId)) && !recorded.has(r.requestId) && r.state !== "refused");
+  // A reaction has no text either: it shows as a tapback line.
+  return requests.filter((r) => r.sessionId === sessionId && (r.text || r.images?.length || r.files?.length || r.reply?.reaction || withImages.has(r.requestId)) && !recorded.has(r.requestId) && r.state !== "refused");
 }
 export function pendingLabel(request: WebRequest): string {
   if (request.joined) return "Joined the running turn";

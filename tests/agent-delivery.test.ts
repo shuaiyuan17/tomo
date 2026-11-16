@@ -122,7 +122,7 @@ describe("outbound delivery", () => {
 
     await im.simulateMessage(makeMsg({
       chatId: "iMessage;-;+15551112222",
-      text: "translate 计数 to English, one word",
+      text: "translate Zählung to English, one word",
     }));
     await drainQueue(agent);
 
@@ -132,15 +132,15 @@ describe("outbound delivery", () => {
     await agent.stop();
   });
 
-  it("delivers a text block that opens with 思考: verbatim (#291 P1)", async () => {
+  it("delivers a text block that opens with Thinking: verbatim (#291 P1)", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
     agent.addChannel(im);
 
-    const reply = "思考: 我建议分两步。 第一步先备份。 第二步再迁移。";
+    const reply = "Thinking: I suggest two steps. First back up. Then migrate.";
     mockSdk.responseFn = () => reply;
 
-    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "怎么做" }));
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "How?" }));
     await drainQueue(agent);
 
     expect(im.delivered).toHaveLength(1);
@@ -154,7 +154,7 @@ describe("outbound delivery", () => {
     const im = new MockChannel("imessage");
     agent.addChannel(im);
 
-    mockSdk.responseFn = () => "清单 🦀\n· Lululemon ×3\n· Canada Goose ×1\n\n取货：国庆自取。";
+    mockSdk.responseFn = () => "List 🦀\n· Running shoes ×3\n· Winter coat ×1\n\nPickup: Saturday, in store.";
 
     await im.simulateMessage(makeMsg({
       chatId: "iMessage;+;group123",
@@ -165,7 +165,7 @@ describe("outbound delivery", () => {
     await drainQueue(agent);
 
     expect(im.delivered.map((d) => d.text)).toEqual([
-      "清单 🦀\n· Lululemon ×3\n· Canada Goose ×1\n\n取货：国庆自取。",
+      "List 🦀\n· Running shoes ×3\n· Winter coat ×1\n\nPickup: Saturday, in store.",
     ]);
 
     await agent.stop();

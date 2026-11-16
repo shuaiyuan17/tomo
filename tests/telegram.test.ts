@@ -14,6 +14,7 @@ import {
   cleanMention,
   mentionRegex,
   nextPollingBackoff,
+  TELEGRAM_ALLOWED_UPDATES,
 } from "../src/channels/telegram.js";
 
 // A REAL file for the photo sends: the channel refuses a path that does not
@@ -1075,5 +1076,69 @@ describe("/tasks command", () => {
 
   it("ignores /tasks addressed to another bot", async () => {
     expect(await commandsFor("/tasks@otherbot")).toEqual([]);
+  });
+});
+
+describe("TelegramChannel inbound reactions", () => {
+  function setup() {
+    const channel = new TelegramChannel("123456:TEST-TOKEN");
+    const bot = (channel as unknown as { bot: { botInfo: unknown; handleUpdate: (u: unknown) => Promise<void> } }).bot;
+    bot.botInfo = {
+      id: 123456, is_bot: true, first_name: "Tomo", username: "tomobot",
+      can_join_groups: true, can_read_all_group_messages: false,
+      supports_inline_queries: false, can_connect_to_business_account: false,
+      has_main_web_app: false,
+    };
+    const received: IncomingMessage[] = [];
+    channel.onMessage(async (msg) => { received.push(msg); return true; });
+    let updateId = 1;
+    const message = (messageId: number, text: string) => bot.handleUpdate({ update_id: updateId++, message: {
+      message_id: messageId, date: 1_700_000_000, chat: { id: 42, type: "private" }, from: { id: 7, is_bot: false, first_name: "Alice" }, text } });
+    const react = (messageId: number, oldReaction: unknown[], newReaction: unknown[], extra: Record<string, unknown> = {}) =>
+      bot.handleUpdate({ update_id: updateId++, message_reaction: {
+        chat: { id: 42, type: "private" }, message_id: messageId, user: { id: 7, is_bot: false, first_name: "Alice" },
+        date: 1_700_000_100, old_reaction: oldReaction, new_reaction: newReaction, ...extra } });
+    return { channel, received, message, react };
+  }
+  const emoji = (e: string) => ({ type: "emoji", emoji: e });
+
+  it("polling asks Telegram for reactions, which its defaults leave out", () => {
+    expect(TELEGRAM_ALLOWED_UPDATES).toContain("message_reaction");
+    expect(TELEGRAM_ALLOWED_UPDATES).toContain("message");
+  });
+
+  it("an added reaction reads as an iMessage tapback, quoting the message it is on", async () => {
+    const { received, message, react } = setup();
+    await message(5, "pizza tonight?");
+    await react(5, [], [emoji("❤️")]);
+    expect(received.at(-1)).toMatchObject({
+      chatId: "42", senderName: "Alice", senderId: "7", isGroup: false, isMentioned: false, isReaction: true,
+      text: '[reacting to: "pizza tonight?"] [tapback: love]', timestamp: 1_700_000_100_000,
+    });
+    expect(received.at(-1)!.id).toMatch(/^reaction:5:7:/);
+  });
+
+  it("an emoji outside our six is passed as it is; an unknown message gets the quote-less form", async () => {
+    const { received, react } = setup();
+    await react(99, [], [emoji("\u{1F525}")]);
+    expect(received.at(-1)!.text).toBe("[tapback: \u{1F525} on an earlier message]");
+  });
+
+  it("only what was added counts: removals and unchanged reactions dispatch nothing", async () => {
+    const { received, message, react } = setup();
+    await message(5, "hello");
+    const before = received.length;
+    await react(5, [emoji("\u{1F44D}")], []);
+    await react(5, [emoji("\u{1F44D}")], [emoji("\u{1F44D}")]);
+    expect(received).toHaveLength(before);
+    await react(5, [emoji("\u{1F44D}")], [emoji("\u{1F44D}"), emoji("\u{1F914}")]);
+    expect(received.at(-1)!.text).toBe('[reacting to: "hello"] [tapback: question]');
+  });
+
+  it("a reaction never enters the recent-message ring", async () => {
+    const { channel, message, react } = setup();
+    await message(5, "hello");
+    await react(5, [], [emoji("\u{1F44D}")]);
+    expect(channel.recentMessages("42").map((m) => m.id)).toEqual(["5"]);
   });
 });

@@ -390,14 +390,14 @@ describe("imsg inbound message mapping", () => {
 
     children[0].notifyMessage(inboundMessage({
       guid: "plain-guid-1",
-      text: "早啊",
+      text: "Morning!",
       reply_to_guid: "our-last-outbound-guid",
       reply_to_text: "our latest outbound message",
       reply_to_sender: "me",
     }));
     await settle();
 
-    expect(handler.mock.calls[0][0].text).toBe("早啊");
+    expect(handler.mock.calls[0][0].text).toBe("Morning!");
     await channel.stop();
   });
 
@@ -2653,6 +2653,7 @@ describe("imsg inbound tapbacks", () => {
     const reaction = handler.mock.calls.map((c) => c[0]).find((m) => m.id === "react-1");
     expect(reaction?.text).toBe('[reacting to: "pizza tonight?"] [tapback: love]');
     expect(reaction?.isMentioned).toBe(false);
+    expect(reaction?.isReaction).toBe(true);
     await channel.stop();
   });
 

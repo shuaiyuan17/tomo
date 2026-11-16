@@ -1,4 +1,5 @@
 import { parseSendMarker } from "./send-marker.js";
+import { splitThinking } from "./thinking.js";
 
 /**
  * Threaded-reply prefixes tomo writes for iMessage replies and reactions
@@ -38,21 +39,54 @@ export function parseReply(content: string): { reply?: ReplyContext; body: strin
 const normalize = (text: string) => parseReply(parseSendMarker("assistant", text).body).body.replace(/\s+/g, " ").trim();
 
 /**
+ * The markers a messaging channel puts in front of an inbound message
+ * (attachments: "[Sent an image, saved to: …]", "[Sent 2 files: …]", a
+ * Telegram sticker; satellite; a late attachment follow-up). The channel
+ * quotes the provider's text, which has none. Only these: a message that
+ * itself starts with brackets ("[1, 2, 3]", a markdown link) keeps them.
+ */
+const LEADING_MARKERS = /^(?:\s*\[(?:Sent (?:an?|\d+) [^\]]*|via satellite[^\]]*|Attachments from an earlier message[^\]]*)\])+\s*/;
+/** A picture line Tomo's reply carries (delivery-pipeline MEDIA:/STICKER: tags); never part of the quote. */
+const MEDIA_LINE = /^[ \t]*(?:MEDIA|STICKER):\S.*$/gm;
+
+/**
+ * The text a reply or reaction quotes for a message, as a messaging channel
+ * would: what the sender wrote, without the markers tomo puts in front
+ * (send marker, reply quote, attachments), Tomo's thinking or picture tags.
+ * Whitespace is collapsed, as the reply marker does.
+ */
+export function quotableText(role: string, content: string): string {
+  return messageText(role, content).replace(/\s+/g, " ").trim();
+}
+
+/** The same text with its line breaks (what Copy copies). */
+export function messageText(role: string, content: string): string {
+  let body = parseReply(parseSendMarker(role, content).body).body;
+  // Channel markers lead inbound (user) messages only; Tomo's text is its own.
+  body = role === "assistant"
+    ? splitThinking(body, "joined").filter((s) => s.kind === "reply").map((s) => s.text).join("\n").replace(MEDIA_LINE, "")
+    : body.replace(LEADING_MARKERS, "");
+  return body.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+/**
  * The message a reply quotes, among messages earlier in time than the reply:
  * first the nearest whose text EQUALS the excerpt (a message can itself end
  * in "…"); only if none does and the excerpt may be a cut, the nearest that
  * starts with it (minus the trailing "…"). Whitespace is collapsed, as the
  * marker does. Undefined when the excerpt is missing or nothing matches.
  */
-export function findQuoted<T extends { id: string; content: string; timestamp: number }>(messages: T[], replyIndex: number, reply: ReplyContext): T | undefined {
+export function findQuoted<T extends { id: string; content: string; timestamp: number; role?: string }>(messages: T[], replyIndex: number, reply: ReplyContext): T | undefined {
   if (!reply.excerpt) return undefined;
   const exact = reply.excerpt.replace(/\s+/g, " ").trim();
   if (!exact) return undefined;
   const replyAt = messages[replyIndex]?.timestamp ?? Infinity;
   const earlier: T[] = [];
   for (let i = Math.min(replyIndex, messages.length) - 1; i >= 0; i--) if (messages[i].timestamp <= replyAt) earlier.push(messages[i]);
-  const same = earlier.find((m) => normalize(m.content) === exact);
+  // Each message's text as the transcript has it, and as a quote of it reads (quotableText).
+  const forms = (m: T) => [normalize(m.content), quotableText(m.role ?? "user", m.content)];
+  const same = earlier.find((m) => forms(m).includes(exact));
   if (same || !reply.truncated) return same;
   const prefix = exact.replace(/…$/, "").trimEnd();
-  return prefix ? earlier.find((m) => normalize(m.content).startsWith(prefix)) : undefined;
+  return prefix ? earlier.find((m) => forms(m).some((form) => form.startsWith(prefix))) : undefined;
 }

@@ -5,9 +5,9 @@ const IMG = "/Users/x/.tomo/workspace/memory/incoming-images/2026-11-14/123533_i
 
 describe("attachment markers", () => {
   it("an image marker becomes an image part; the text around it stays", () => {
-    expect(splitAttachments(`[Sent an image, saved to: ${IMG}] 像是长路径`)).toEqual([
+    expect(splitAttachments(`[Sent an image, saved to: ${IMG}] looks like a long path`)).toEqual([
       { kind: "images", paths: [IMG], sticker: false, missing: 0, more: 0 },
-      { kind: "text", text: "像是长路径" },
+      { kind: "text", text: "looks like a long path" },
     ]);
   });
   it("several images, one still downloading", () => {

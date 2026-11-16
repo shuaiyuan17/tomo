@@ -131,7 +131,7 @@ describe("transcriptFileStem", () => {
       "imessage:+15551234567",
       ALEX_DOT, ALEX_UNDERSCORE,
       "imessage:chat123;+;abc", "imessage:any;-;a@b.co", "imessage:any_-_a_b_co",
-      "dm:ünïcode", "dm:名前", "dm:emoji-🐈", "dm:", "", "dm:a/b", "dm:a\\b", "dm:a b",
+      "dm:ünïcode", "dm:имя", "dm:emoji-🐈", "dm:", "", "dm:a/b", "dm:a\\b", "dm:a b",
     ];
     const stems = new Map<string, string>();
     for (const key of keys) {

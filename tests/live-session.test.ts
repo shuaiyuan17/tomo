@@ -946,7 +946,7 @@ describe("LiveSession subagent events", () => {
 //
 // Delivery is decided by SDK content-block TYPE, never by inspecting text.
 // `text` blocks always ship, even when their text happens to look like
-// thinking (`思考:`) or like tool debris (`count`). A `thinking` block with the
+// thinking (`Thinking:`) or like tool debris (`count`). A `thinking` block with the
 // flag OFF is judged by its length, still never by its prose: empty is the
 // signature-only residue of `display: "omitted"` and is dropped; non-empty
 // under `omitted` has only ever been a misplaced message, so it is kept as
@@ -1002,7 +1002,7 @@ describe("LiveSession thinking blocks", () => {
   it("never truncates a text block that looks like thinking or tool debris", async () => {
     const { session, harness } = makeSession();
 
-    const p = session.send("translate 计数 to English, one word");
+    const p = session.send("translate Zählung to English, one word");
     await waitFor(() => harness.inputs.length === 1);
     harness.pushEvent(assistantEvent("count"));
     harness.pushEvent(resultEvent());
@@ -1449,7 +1449,7 @@ describe("LiveSession: which request a result belongs to (2026-11-14 lost reply)
     const { session, harness } = makeSession();
     const web: string[] = [];
     const nudge: string[] = [];
-    const p1 = session.send("好啊 现在看起来非常好了！", undefined, undefined, (b) => { web.push(b); });
+    const p1 = session.send("Nice, it looks great now!", undefined, undefined, (b) => { web.push(b); });
     await flushMicrotasks();
     harness.pushEvent(staleNotification);
     harness.pushEvent(staleResult);
@@ -1463,10 +1463,10 @@ describe("LiveSession: which request a result belongs to (2026-11-14 lost reply)
     await flushMicrotasks(20);
     expect(harness.inputs).toHaveLength(1);
 
-    harness.pushEvent(assistantEvent("太好了 😁"));
+    harness.pushEvent(assistantEvent("Glad it works 😁"));
     harness.pushEvent(answering(harness.uuids[0]));
-    await expect(p1).resolves.toBe("太好了 😁");
-    expect(web).toEqual(["太好了 😁"]);
+    await expect(p1).resolves.toBe("Glad it works 😁");
+    expect(web).toEqual(["Glad it works 😁"]);
     expect(vi.mocked(log.warn)).toHaveBeenCalledWith(expect.objectContaining({ why: "task-notification turn" }), expect.any(String));
 
     await flushMicrotasks(20);
@@ -1474,7 +1474,7 @@ describe("LiveSession: which request a result belongs to (2026-11-14 lost reply)
     harness.pushEvent(assistantEvent("NO_REPLY"));
     harness.pushEvent(answering(harness.uuids[1]));
     await expect(p2).resolves.toBe("NO_REPLY");
-    expect(nudge).not.toContain("太好了 😁");
+    expect(nudge).not.toContain("Glad it works 😁");
   });
 
   it("backstop: an unstamped success that ran nothing and said nothing is nobody's answer", async () => {

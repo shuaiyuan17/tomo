@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 import { findQuoted, parseReply } from "../web/src/reply.js";
 
 describe("reply context", () => {
-  it("parses a Chinese excerpt cut with an ellipsis and keeps only the real reply as the body", () => {
-    expect(parseReply('[replying to: "强哥的 #383 捡起来了，拆成了 3 个 PR，…"] nicenice！！')).toEqual({
-      reply: { verb: "replying", excerpt: "强哥的 #383 捡起来了，拆成了 3 个 PR，…", truncated: true }, body: "nicenice！！" });
+  it("parses an excerpt cut with an ellipsis and keeps only the real reply as the body", () => {
+    expect(parseReply('[replying to: "Picked up the stale #383 and split it into 3 PRs,…"] nice!!')).toEqual({
+      reply: { verb: "replying", excerpt: "Picked up the stale #383 and split it into 3 PRs,…", truncated: true }, body: "nice!!" });
   });
   it("English, quotes inside, fullwidth delimiters restored", () => {
     expect(parseReply('[replying to: "he said "ok" ［see #1］"] Sounds good')).toEqual({
@@ -19,10 +19,10 @@ describe("reply context", () => {
   });
   it("finds the quoted message: exact for a whole excerpt, prefix for a cut one, nearest earlier in time", () => {
     const messages = [
-      { id: "1", timestamp: 1, content: "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了" },
+      { id: "1", timestamp: 1, content: "Picked up the stale #383 and split it into 3 PRs, the first is merged" },
       { id: "2", timestamp: 2, content: "Other\nthing" },
-      { id: "3", timestamp: 3, content: "强哥的 #383 捡起来了，拆成了 3 个 PR，第二版" },
-      { id: "4", timestamp: 4, content: '[replying to: "强哥的 #383 捡起来了，拆成了 3 个 PR，…"] nicenice！！' },
+      { id: "3", timestamp: 3, content: "Picked up the stale #383 and split it into 3 PRs, second draft" },
+      { id: "4", timestamp: 4, content: '[replying to: "Picked up the stale #383 and split it into 3 PRs,…"] nice!!' },
       { id: "5", timestamp: 5, content: "lunch?" },
       { id: "6", timestamp: 6, content: "lunch? at noon" },
       { id: "7", timestamp: 7, content: '[replying to: "lunch?"] sure' },

@@ -949,6 +949,7 @@ export class ImsgChannel implements Channel {
       text: formatReactionMarker(reaction, original),
       timestamp: meta.timestampMs,
       isGroup: data.is_group === true || chatGuid.includes(";+;"),
+      isReaction: true,
       // Tapbacks are ambient signals, not summons — never treat as mentioned,
       // so group sessions can stay silent without an explicit NO_REPLY.
       isMentioned: false,

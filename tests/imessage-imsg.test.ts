@@ -2653,6 +2653,7 @@ describe("imsg inbound tapbacks", () => {
     const reaction = handler.mock.calls.map((c) => c[0]).find((m) => m.id === "react-1");
     expect(reaction?.text).toBe('[reacting to: "pizza tonight?"] [tapback: love]');
     expect(reaction?.isMentioned).toBe(false);
+    expect(reaction?.isReaction).toBe(true);
     await channel.stop();
   });
 

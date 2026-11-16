@@ -310,6 +310,7 @@ export class WebChannel implements Channel {
       : [input.reply ? formatReplyContextMarker(input.reply.text) : "", images ? formatImageMarker(images.list.length, filed, images.unconverted) : "", formatFileMarker(notices)].filter(Boolean).join(" ");
     const message: IncomingMessage = { id: input.requestId, chatId: WEB_CHAT_ID, senderName: "Owner",
       text: marker ? (input.text ? `${marker} ${neutralizeMarker(input.text)}` : marker) : neutralizeMarker(input.text), timestamp: Date.now(), isGroup: false,
+      ...(input.reply?.reaction ? { isReaction: true } : {}),
       ...(images ? { images: images.list } : {}) };
     const handoff = Promise.resolve().then(() => this.handler!(message));
     this.handoffs.add(handoff);

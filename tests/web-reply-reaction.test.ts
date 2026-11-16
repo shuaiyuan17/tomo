@@ -56,12 +56,14 @@ describe("web message input with a reply", () => {
     // The typed text is still neutralised after the marker, as after an attachment marker.
     expect(textOf(handler)).toBe('[replying to: "Want to grab lunch?"] ​[sure]');
     expect(request.reply).toEqual({ text: "Want to\ngrab lunch?" });
+    expect(handler.mock.calls.at(-1)![0]).not.toHaveProperty("isReaction");
   });
 
   it("a reaction is worded as an iMessage tapback and shown with its reaction", async () => {
     const { channel, handler } = setup();
     const request = await channel.receive({ requestId: randomUUID(), text: "", reply: { text: "Done — pushed the fix", reaction: "like" } });
     expect(textOf(handler)).toBe('[reacting to: "Done — pushed the fix"] [tapback: like]');
+    expect(handler.mock.calls.at(-1)![0]).toMatchObject({ isReaction: true });
     expect(request.reply).toEqual({ text: "Done — pushed the fix", reaction: "like" });
   });
 

@@ -71,6 +71,15 @@ export interface IncomingMessage {
    * ordinary message.
    */
   inboxKey?: string;
+  /**
+   * This message IS a reaction (an iMessage tapback, a Telegram reaction, a
+   * web tapback), worded as `[reacting to: "…"] [tapback: …]`. Its `id` is the
+   * reaction's own (a tapback row GUID, a synthetic `reaction:…` id, a web
+   * request id), not a message anything can react or reply to, so the agent
+   * never records it as the session's latest inbound message: a later
+   * `react_to_message` without `match` still reaches the last real message.
+   */
+  isReaction?: boolean;
 }
 
 export interface OutgoingMessage {

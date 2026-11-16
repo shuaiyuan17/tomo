@@ -507,6 +507,19 @@ describe("ProactiveSendService.reactToMessage", () => {
     ]);
   });
 
+  it("a reaction never becomes the latest inbound message: its id names the reaction, not a message", async () => {
+    const h = makeHarness();
+    h.service.recordLatestInboundMessage("telegram:12345", h.channel, inbound({ id: "real" }));
+    h.service.recordLatestInboundMessage("telegram:12345", h.channel, inbound({ id: "reaction:5:7:1700000100", isReaction: true }));
+
+    const result = await h.service.reactToMessage("telegram:12345", "like");
+
+    expect(result).toEqual({ ok: true });
+    expect(h.channel.reacted).toEqual([
+      { chatId: "12345", messageId: "real", reaction: "like", remove: false },
+    ]);
+  });
+
   it("ignores inbound messages without provider ids", async () => {
     const h = makeHarness();
     h.service.recordLatestInboundMessage("telegram:12345", h.channel, inbound({ id: "" }));

@@ -1112,7 +1112,7 @@ describe("TelegramChannel inbound reactions", () => {
     await message(5, "pizza tonight?");
     await react(5, [], [emoji("❤️")]);
     expect(received.at(-1)).toMatchObject({
-      chatId: "42", senderName: "Alice", senderId: "7", isGroup: false, isMentioned: false,
+      chatId: "42", senderName: "Alice", senderId: "7", isGroup: false, isMentioned: false, isReaction: true,
       text: '[reacting to: "pizza tonight?"] [tapback: love]', timestamp: 1_700_000_100_000,
     });
     expect(received.at(-1)!.id).toMatch(/^reaction:5:7:/);

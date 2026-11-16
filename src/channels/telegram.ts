@@ -374,6 +374,7 @@ export class TelegramChannel implements Channel {
       text: formatReactionMarker(reactionName(added), original),
       timestamp: update.date * 1000,
       isGroup,
+      isReaction: true,
       // Ambient, not a summons: a group session can stay silent.
       isMentioned: false,
       chatTitle: isGroup && "title" in update.chat ? update.chat.title : undefined,

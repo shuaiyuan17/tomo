@@ -612,6 +612,8 @@ export class ProactiveSendService {
     // Incoming channels are expected to provide provider message ids; keep the
     // guard defensive so synthetic/test messages cannot poison reaction state.
     if (!message.id) return;
+    // A reaction's id names the reaction, not a message: keep the last real one.
+    if (message.isReaction) return;
     this.latestInboundMessages.set(sessionKey, {
       channelName: channel.name,
       chatId: message.chatId,

@@ -13,7 +13,7 @@ import {
 } from "./sessions/keys.js";
 import { privateMemoryBarFor } from "./agent/permissions.js";
 import { OwnerRouter, type SessionResolution } from "./router.js";
-import { ignoredAllowlistDmEntries, isOwnerHandle } from "./owner.js";
+import { ignoredAllowlistDmEntries, isOwnerHandle, ownerSessionKey } from "./owner.js";
 import { BlockedInboundLog, redactChatIdForLog } from "./agent/blocked-inbound-log.js";
 import {
   annotateSenderName,
@@ -307,6 +307,15 @@ export class Agent {
         config.mcpServers ?? {},
       ),
       listTasks: (key, since) => this.taskSource?.listFor(key, since),
+      sendToOwnerDm: async (owner, text) => {
+        const target = this.router.getReplyTarget(ownerSessionKey(owner)) ?? this.router.deriveReplyTargetFromConfig(owner.name);
+        // Only a private DM: a reply target that is a group must not receive it.
+        if (!target || isGroupSessionKey(`${target.channelName}:${target.chatId}`)) return false;
+        const dm = this.getChannel(target.channelName);
+        if (!dm) return false;
+        await dm.send({ chatId: target.chatId, text });
+        return true;
+      },
     });
     this.mcpOAuthManager = new McpOAuthManager({
       workspaceDir: config.workspaceDir,

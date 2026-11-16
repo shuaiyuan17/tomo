@@ -63,16 +63,40 @@ describe("/tasks chat command", () => {
     await agent.stop();
   });
 
-  it("in a summoned group, gives the owner the owner's list and anyone else the group's", async () => {
+  it("in a summoned group, sends the owner's list to the owner's DM only; anyone else gets the group's", async () => {
     const { agent, tg, board } = setup();
+    // The owner has written from their DM, so it is the reply target.
+    await tg.simulateCommand("status", OWNER_ID, "Shuai", undefined, OWNER_ID);
     await tg.simulateCommand("summon", GROUP, "Shuai", undefined, OWNER_ID);
     tg.clearDelivered();
     await tg.simulateCommand("tasks", GROUP, "Shuai", undefined, OWNER_ID);
-    expect(tg.sent[0].text).toContain("owner private errand");
-    expect(tg.sent[0].text).not.toContain("group trip planning");
+    const toGroup = tg.sent.filter((m) => m.chatId === GROUP);
+    const toDm = tg.sent.filter((m) => m.chatId === OWNER_ID);
+    expect(toGroup.map((m) => m.text)).toEqual(["Sent to your DM."]);
+    expect(toDm).toHaveLength(1);
+    expect(toDm[0].text).toContain("owner private errand");
+    expect(toDm[0].text).not.toContain("group trip planning");
+    tg.clearDelivered();
     await tg.simulateCommand("tasks", GROUP, "Member", undefined, "99999");
-    expect(tg.sent[1].text).toContain("group trip planning");
-    expect(tg.sent[1].text).not.toContain("owner private errand");
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0].chatId).toBe(GROUP);
+    expect(tg.sent[0].text).toContain("group trip planning");
+    expect(tg.sent[0].text).not.toContain("owner private errand");
+    board.dispose();
+    await agent.stop();
+  });
+
+  it("in a summoned group, never posts the owner's list in the group when the DM is unreachable", async () => {
+    const { agent, tg, board } = setup();
+    await tg.simulateCommand("summon", GROUP, "Shuai", undefined, OWNER_ID);
+    tg.clearDelivered();
+    const realSend = tg.send.bind(tg);
+    tg.send = async (message) => {
+      if (message.chatId === OWNER_ID) throw new Error("DM down");
+      return realSend(message);
+    };
+    await tg.simulateCommand("tasks", GROUP, "Shuai", undefined, OWNER_ID);
+    expect(tg.sent.map((m) => [m.chatId, m.text])).toEqual([[GROUP, "Couldn't reach your DM."]]);
     board.dispose();
     await agent.stop();
   });

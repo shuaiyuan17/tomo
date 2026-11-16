@@ -66,6 +66,8 @@ export interface ChatCommandDeps {
   /** One session's tasks from the web Tasks panel's board (`TaskBoard.listFor`);
    *  undefined when there is no board (web UI off). */
   listTasks(sessionKey: string, since: number): SessionTaskList | undefined;
+  /** Send plain text to the owner's private DM (its reply target); false when there is none. */
+  sendToOwnerDm(owner: OwnerConfig, text: string): Promise<boolean>;
 }
 
 /**
@@ -357,7 +359,8 @@ export class ChatCommandHandler {
    * session — never a DM's or another group's task text, which may be
    * private — except when the group is summoned into the owner's session AND
    * the sender is the owner: the summoned turns run there, so the owner gets
-   * the owner's list (summoning is the owner's statement of trust).
+   * the owner's list (summoning is the owner's statement of trust), sent
+   * to the owner's private DM — the group only sees "Sent to your DM.".
    * `/tasks all` lists every task that ended today instead of the last few.
    */
   private async handleTasksCommand(channel: Channel, chatId: string, resolvedKey: string, args: string | undefined, senderId?: string): Promise<void> {
@@ -367,11 +370,18 @@ export class ChatCommandHandler {
       return;
     }
     let key = resolvedKey;
+    // Summoned group + owner sender: the owner's list, which must never be
+    // posted in the group (everyone there reads it) — it goes to the owner's
+    // private DM, and the group gets one content-free line.
+    let ownerDm: OwnerConfig | undefined;
     if (isGroupSessionKey(`${channel.name}:${chatId}`)) {
       key = `${channel.name}:${chatId}`;
       const owner = this.ownerFor(channel, senderId);
       const summoned = this.deps.router.getSummonedIdentity(channel.name, chatId);
-      if (owner && summoned !== undefined && summoned === owner.name.toLowerCase()) key = dmSessionKeyForIdentity(owner.name);
+      if (owner && summoned !== undefined && summoned === owner.name.toLowerCase()) {
+        key = dmSessionKeyForIdentity(owner.name);
+        ownerDm = owner;
+      }
     }
     const now = Date.now();
     const list = this.deps.listTasks(key, startOfLocalDay(now));
@@ -379,7 +389,16 @@ export class ChatCommandHandler {
       await channel.send({ chatId, text: "Tasks are unavailable: /tasks reads the web UI's Tasks panel, and the web UI is off." });
       return;
     }
-    await channel.send({ chatId, text: formatTaskList(list, { now, all: arg === "all" }) });
+    const text = formatTaskList(list, { now, all: arg === "all" });
+    if (ownerDm) {
+      let sent = false;
+      try { sent = await this.deps.sendToOwnerDm(ownerDm, text); } catch (err) {
+        log.warn({ err }, "/tasks: could not send the list to the owner's DM");
+      }
+      await channel.send({ chatId, text: sent ? "Sent to your DM." : "Couldn't reach your DM." });
+      return;
+    }
+    await channel.send({ chatId, text });
   }
 
   /**

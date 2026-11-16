@@ -12,6 +12,7 @@ export const CHAT_COMMANDS: readonly { command: string; description: string }[] 
   { command: "login", description: "Refresh Claude login (owner DM only)" },
   { command: "mcp", description: "Inspect or re-authenticate external MCP servers" },
   { command: "status", description: "Show current session status" },
+  { command: "tasks", description: "List this chat's running and recent tasks (/tasks all: all of today)" },
   { command: "cost", description: "Show current session costs" },
   { command: "usage", description: "Show Claude subscription usage limits" },
   { command: "pet", description: "Check on Tomo's pet" },
@@ -22,3 +23,20 @@ export const CHAT_COMMANDS: readonly { command: string; description: string }[] 
 ];
 
 export const CHAT_COMMAND_NAMES: readonly string[] = CHAT_COMMANDS.map((c) => c.command);
+
+/** `/task` is an alias of `/tasks`; both reach the handler as "tasks". */
+export const TASKS_COMMAND = "tasks";
+const TASKS_NAMES = new Set(["task", "tasks"]);
+
+/**
+ * Recognize `/task` or `/tasks` (any case, surrounding whitespace allowed),
+ * optionally addressed `/tasks@botname` — accepted only when `botUsername`
+ * is given and matches (case-insensitively), as Telegram does for every
+ * command. Returns the trimmed arguments, or undefined when it is not one.
+ */
+export function parseTasksCommand(text: string, botUsername?: string): { args: string } | undefined {
+  const match = /^\/([A-Za-z]+)(?:@([A-Za-z0-9_]+))?(?:\s+([\s\S]*))?$/.exec(text.trim());
+  if (!match || !TASKS_NAMES.has(match[1].toLowerCase())) return undefined;
+  if (match[2] !== undefined && (!botUsername || match[2].toLowerCase() !== botUsername.toLowerCase())) return undefined;
+  return { args: (match[3] ?? "").trim() };
+}

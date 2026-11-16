@@ -38,6 +38,7 @@ import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { formatInterruptedAgentsNotice, RunningAgentsLedger, type RunningTaskRecord } from "./agent/running-agents-ledger.js";
 import { DurableInbox, INBOX_STALE_NOT_PROCESSED, restoreMessage, type InboxRecord } from "./agent/durable-inbox.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
+import type { TaskBoard } from "./web/tasks.js";
 import { describeSessionModel, switchSessionModel, type ModelSwitchOutcome } from "./agent/model-switch.js";
 import { prepareSettledSessionRewind } from "./agent/settled-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
@@ -138,6 +139,8 @@ export class Agent {
     canSteerIntoSession: (key) => !this.webRequestIds.has(key),
   });
   private commands: ChatCommandHandler;
+  /** The web Tasks panel's board, read by /tasks (unset while the web UI is off). */
+  private taskSource: Pick<TaskBoard, "listFor"> | undefined;
   // /pause state: raw group keys whose inbound messages are dropped at receipt.
   private pauses: PauseStore;
   private usageLedger: UsageLedger;
@@ -303,6 +306,7 @@ export class Agent {
         serverName,
         config.mcpServers ?? {},
       ),
+      listTasks: (key, since) => this.taskSource?.listFor(key, since),
     });
     this.mcpOAuthManager = new McpOAuthManager({
       workspaceDir: config.workspaceDir,
@@ -510,6 +514,11 @@ export class Agent {
     } catch (err) {
       log.error({ err }, "Failed to activate group");
     }
+  }
+
+  /** Give /tasks the web Tasks panel's board, so the chat list and the panel share one state. */
+  setTaskSource(source: Pick<TaskBoard, "listFor">): void {
+    this.taskSource = source;
   }
 
   addChannel(channel: Channel): void {

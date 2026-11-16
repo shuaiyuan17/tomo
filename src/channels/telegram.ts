@@ -15,7 +15,7 @@ import { log } from "../logger.js";
 import { scrubSecretValues } from "../redact.js";
 import { splitText } from "./text-utils.js";
 import { formatMimeToken, sanitizeAttachmentFilename } from "./fileStore.js";
-import { CHAT_COMMANDS, CHAT_COMMAND_NAMES } from "./chat-commands.js";
+import { CHAT_COMMANDS, CHAT_COMMAND_NAMES, parseTasksCommand, TASKS_COMMAND } from "./chat-commands.js";
 
 /**
  * A Bot API 400 whose description names an entity-parsing failure — the one
@@ -171,6 +171,15 @@ export class TelegramChannel implements Channel {
 
     // Text messages (skip bot commands)
     this.bot.on("message:text", (ctx) => this.ingest(String(ctx.chat.id), String(ctx.message.message_id), async () => {
+      // `/task` (alias) and any-case `/Tasks`, which bot.command above does not match.
+      const tasks = parseTasksCommand(ctx.message.text, ctx.me.username);
+      if (tasks) {
+        const chatId = String(ctx.chat.id);
+        const senderName = this.getSenderName(ctx);
+        const senderId = ctx.from ? String(ctx.from.id) : undefined;
+        for (const handler of this.commandHandlers) await handler(TASKS_COMMAND, chatId, senderName, tasks.args, senderId);
+        return;
+      }
       if (ctx.message.text.startsWith("/")) return;
 
       const isGroup = isGroupChatType(ctx.chat.type);

@@ -2005,6 +2005,26 @@ describe("imsg inbound message mapping", () => {
     expect(commandHandler).toHaveBeenCalledWith("model", DM_GUID, "Shuai", "sonnet", "+15551234567");
     await channel.stop();
   });
+
+  it("dispatches /task and /tasks in any case and with padding as the tasks command", async () => {
+    const { channel, children } = makeChannel();
+    await channel.start();
+    const commandHandler = vi.fn(async () => true);
+    const messageHandler = vi.fn(async () => true);
+    channel.onCommand(commandHandler);
+    channel.onMessage(messageHandler);
+
+    children[0].notifyMessage(inboundMessage({ guid: "tasks-1", text: "/Task", sender: "+15551234567", sender_name: "Shuai" }));
+    children[0].notifyMessage(inboundMessage({ guid: "tasks-2", text: "  /TASKS all ", sender: "+15551234567", sender_name: "Shuai" }));
+    await settle();
+
+    expect(commandHandler.mock.calls).toEqual([
+      ["tasks", DM_GUID, "Shuai", "", "+15551234567"],
+      ["tasks", DM_GUID, "Shuai", "all", "+15551234567"],
+    ]);
+    expect(messageHandler).not.toHaveBeenCalled();
+    await channel.stop();
+  });
 });
 
 // --- Arbitrary (non-image, non-document) attachments -------------------------

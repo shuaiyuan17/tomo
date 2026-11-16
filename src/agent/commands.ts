@@ -28,6 +28,9 @@ import { ClaudeLoginManager } from "./claude-login.js";
 import { buildUsageReport } from "./usage.js";
 import { limitsLogFor } from "../usage/limits-log.js";
 import { litellmRoutesModel } from "../litellm.js";
+import { TASKS_COMMAND } from "../channels/chat-commands.js";
+import type { SessionTaskList } from "../web/tasks.js";
+import { formatTaskList, startOfLocalDay } from "./tasks-command.js";
 
 /** Back up ~/.tomo/config.json before a programmatic rewrite. */
 export { backupConfigFile } from "./model-switch.js";
@@ -60,11 +63,14 @@ export interface ChatCommandDeps {
   queuePendingNote(sessionKey: string, note: string): void;
   getExternalMcpStatuses(sessionKey: string): ExternalMcpServerStatus[];
   startExternalMcpLogin(serverName: string): Promise<McpLoginStart>;
+  /** One session's tasks from the web Tasks panel's board (`TaskBoard.listFor`);
+   *  undefined when there is no board (web UI off). */
+  listTasks(sessionKey: string, since: number): SessionTaskList | undefined;
 }
 
 /**
  * Handles slash commands typed in chat (/new, /model, /status, /pet,
- * /cost, /restore, /login, /mcp, /pause, /resume, /rewind).
+ * /cost, /restore, /login, /mcp, /pause, /resume, /rewind, /tasks).
  * Wired to Channel.onCommand by the Agent.
  */
 export class ChatCommandHandler {
@@ -147,6 +153,11 @@ export class ChatCommandHandler {
     }
 
     const { sessionKey: key } = this.deps.router.resolve(channel.name, chatId, false);
+
+    if (command === TASKS_COMMAND) {
+      await this.handleTasksCommand(channel, chatId, key, args, senderId);
+      return;
+    }
 
     if (command === "summon" || command === "dismiss") {
       await this.handleSummonCommand(channel, command, chatId, senderName, senderId);
@@ -337,6 +348,38 @@ export class ChatCommandHandler {
       await channel.send({ chatId, text: lines.join("\n") });
       return;
     }
+  }
+
+  /**
+   * /tasks (alias /task): the Tasks panel's list for THIS chat's own session,
+   * answered by the harness — no model call. A DM sees its own session (for
+   * the owner, the owner's session). A group sees only the group's own
+   * session — never a DM's or another group's task text, which may be
+   * private — except when the group is summoned into the owner's session AND
+   * the sender is the owner: the summoned turns run there, so the owner gets
+   * the owner's list (summoning is the owner's statement of trust).
+   * `/tasks all` lists every task that ended today instead of the last few.
+   */
+  private async handleTasksCommand(channel: Channel, chatId: string, resolvedKey: string, args: string | undefined, senderId?: string): Promise<void> {
+    const arg = args?.trim().toLowerCase() ?? "";
+    if (arg !== "" && arg !== "all") {
+      await channel.send({ chatId, text: "Usage: /tasks or /tasks all" });
+      return;
+    }
+    let key = resolvedKey;
+    if (isGroupSessionKey(`${channel.name}:${chatId}`)) {
+      key = `${channel.name}:${chatId}`;
+      const owner = this.ownerFor(channel, senderId);
+      const summoned = this.deps.router.getSummonedIdentity(channel.name, chatId);
+      if (owner && summoned !== undefined && summoned === owner.name.toLowerCase()) key = dmSessionKeyForIdentity(owner.name);
+    }
+    const now = Date.now();
+    const list = this.deps.listTasks(key, startOfLocalDay(now));
+    if (!list) {
+      await channel.send({ chatId, text: "Tasks are unavailable: /tasks reads the web UI's Tasks panel, and the web UI is off." });
+      return;
+    }
+    await channel.send({ chatId, text: formatTaskList(list, { now, all: arg === "all" }) });
   }
 
   /**

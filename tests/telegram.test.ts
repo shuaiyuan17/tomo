@@ -1036,3 +1036,44 @@ describe("TelegramChannel attachment admission", () => {
     expect(received[0].images).toBeUndefined();
   });
 });
+
+describe("/tasks command", () => {
+  async function commandsFor(text: string, chat: Record<string, unknown> = { id: 42, type: "private" }) {
+    const channel = new TelegramChannel("123456:TEST-TOKEN");
+    const bot = (channel as unknown as {
+      bot: { botInfo: unknown; handleUpdate: (u: unknown) => Promise<void> };
+    }).bot;
+    bot.botInfo = {
+      id: 123456, is_bot: true, first_name: "Tomo", username: "tomobot",
+      can_join_groups: true, can_read_all_group_messages: false,
+      supports_inline_queries: false, can_connect_to_business_account: false,
+      has_main_web_app: false,
+    };
+    const commands: unknown[][] = [];
+    const messages: IncomingMessage[] = [];
+    channel.onCommand(async (...call) => { commands.push(call); });
+    channel.onMessage(async (msg) => { messages.push(msg); return true; });
+    const command = /^\/\S+/.exec(text)?.[0];
+    await bot.handleUpdate({
+      update_id: 1,
+      message: {
+        message_id: 5, date: 1_700_000_000, chat, from: { id: 7, is_bot: false, first_name: "Alice" }, text,
+        ...(command ? { entities: [{ type: "bot_command", offset: 0, length: command.length }] } : {}),
+      },
+    });
+    expect(messages).toEqual([]);
+    return commands;
+  }
+
+  it("routes /task, /tasks, any case and /tasks@thisbot to the tasks command", async () => {
+    for (const [text, args] of [["/tasks", ""], ["/task", ""], ["/Tasks all", "all"], ["/TASK", ""],
+      ["/tasks@tomobot all", "all"], ["/Task@TomoBot", ""]] as const) {
+      expect(await commandsFor(text, { id: -100777, type: "supergroup", title: "G" }), text)
+        .toEqual([["tasks", "-100777", "Alice", args, "7"]]);
+    }
+  });
+
+  it("ignores /tasks addressed to another bot", async () => {
+    expect(await commandsFor("/tasks@otherbot")).toEqual([]);
+  });
+});

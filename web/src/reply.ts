@@ -38,18 +38,38 @@ export function parseReply(content: string): { reply?: ReplyContext; body: strin
 /** What says a transcript message is a reply or a reaction: the record's structured fields (SessionMessage). */
 export interface MessageKind { role: string; isReply?: boolean; isReaction?: boolean }
 
+/** Where a flagged record's own reply / reaction marker starts. */
+const MARKER_START = /\[(?:(?:replying|reacting) to[: ]|tapback: )/;
+
 /**
- * {@link parseReply} for a transcript message, but only one RECORDED as an
- * inbound reply or reaction. Text that merely reads like a marker — typed by a
- * sender, or in a record older than the fields — is never a reply: its `body`
- * is the content unchanged.
+ * Where the channel's reply / reaction marker starts in a transcript message,
+ * or -1. Only a record RECORDED as an inbound reply or reaction has one: text
+ * that merely reads like a marker — typed by a sender, or in a record older
+ * than the fields — never does. In a flagged record the first such marker is
+ * the channel's own: it may follow a group line's `[group "…"] Sender: ` or a
+ * satellite / attachment marker, but the sender's body (and name) were
+ * neutralised before it was written, so nothing in them can match first.
  */
-export function replyOf(message: MessageKind, content: string): { reply?: ReplyContext; body: string } {
-  return message.role === "user" && (message.isReply || message.isReaction) ? parseReply(content) : { body: content };
+export function markerStart(message: MessageKind & { content: string }): number {
+  return message.role === "user" && (message.isReply || message.isReaction) ? message.content.search(MARKER_START) : -1;
+}
+
+/**
+ * {@link parseReply} for a transcript message: the reply context of a record
+ * flagged as a reply or reaction (whatever leads it — a group line's sender,
+ * other markers — stays in `body`), and for anything else no reply at all,
+ * `body` being `content` unchanged.
+ */
+export function replyOf(message: MessageKind & { content: string }, content = message.content): { reply?: ReplyContext; body: string } {
+  const at = markerStart({ ...message, content });
+  if (at < 0) return { body: content };
+  const { reply, body } = parseReply(content.slice(at));
+  return reply ? { reply, body: content.slice(0, at) + body } : { body: content };
 }
 
 // A quoted message Tomo sent on its own is recorded with a send marker in front; the quote never has it.
-const normalize = (text: string) => parseReply(parseSendMarker("assistant", text).body).body.replace(/\s+/g, " ").trim();
+const normalize = (message: MessageKind & { content: string }) =>
+  replyOf(message, parseSendMarker("assistant", message.content).body).body.replace(/\s+/g, " ").trim();
 
 /**
  * The markers a messaging channel puts in front of an inbound message
@@ -68,13 +88,14 @@ const MEDIA_LINE = /^[ \t]*(?:MEDIA|STICKER):\S.*$/gm;
  * (send marker, reply quote, attachments), Tomo's thinking or picture tags.
  * Whitespace is collapsed, as the reply marker does.
  */
-export function quotableText(role: string, content: string): string {
-  return messageText(role, content).replace(/\s+/g, " ").trim();
+export function quotableText(role: string, content: string, kind: Omit<MessageKind, "role"> = {}): string {
+  return messageText(role, content, kind).replace(/\s+/g, " ").trim();
 }
 
 /** The same text with its line breaks (what Copy copies). */
-export function messageText(role: string, content: string): string {
-  let body = parseReply(parseSendMarker(role, content).body).body;
+export function messageText(role: string, content: string, kind: Omit<MessageKind, "role"> = {}): string {
+  // Only a record flagged as a reply has a reply quote to drop; marker-like text is the sender's own words.
+  let body = replyOf({ role, ...kind, content }, parseSendMarker(role, content).body).body;
   // Channel markers lead inbound (user) messages only; Tomo's text is its own.
   body = role === "assistant"
     ? splitThinking(body, "joined").filter((s) => s.kind === "reply").map((s) => s.text).join("\n").replace(MEDIA_LINE, "")
@@ -89,7 +110,7 @@ export function messageText(role: string, content: string): string {
  * starts with it (minus the trailing "…"). Whitespace is collapsed, as the
  * marker does. Undefined when the excerpt is missing or nothing matches.
  */
-export function findQuoted<T extends { id: string; content: string; timestamp: number; role?: string }>(messages: T[], replyIndex: number, reply: ReplyContext): T | undefined {
+export function findQuoted<T extends { id: string; content: string; timestamp: number; role?: string; isReply?: boolean; isReaction?: boolean }>(messages: T[], replyIndex: number, reply: ReplyContext): T | undefined {
   if (!reply.excerpt) return undefined;
   const exact = reply.excerpt.replace(/\s+/g, " ").trim();
   if (!exact) return undefined;
@@ -97,7 +118,10 @@ export function findQuoted<T extends { id: string; content: string; timestamp: n
   const earlier: T[] = [];
   for (let i = Math.min(replyIndex, messages.length) - 1; i >= 0; i--) if (messages[i].timestamp <= replyAt) earlier.push(messages[i]);
   // Each message's text as the transcript has it, and as a quote of it reads (quotableText).
-  const forms = (m: T) => [normalize(m.content), quotableText(m.role ?? "user", m.content)];
+  const forms = (m: T) => {
+    const kind = { role: m.role ?? "user", isReply: m.isReply, isReaction: m.isReaction };
+    return [normalize({ ...kind, content: m.content }), quotableText(kind.role, m.content, kind)];
+  };
   const same = earlier.find((m) => forms(m).includes(exact));
   if (same || !reply.truncated) return same;
   const prefix = exact.replace(/…$/, "").trimEnd();

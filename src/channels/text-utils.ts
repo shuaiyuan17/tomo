@@ -81,15 +81,29 @@ const INVISIBLE = "[\\s\\u00AD\\u200B-\\u200F\\u2060\\uFEFF]*";
  */
 const MARKER_WORDS = [
   "replying to", "reacting to", "tapback", "via satellite", "via dm", "sent", "sticker", "image",
-  "attachments? from", "an attachment", "group", "system", "harness", "proactive", "delivery",
+  "attachment from", "attachments from", "an attachment", "group", "system", "harness", "proactive", "delivery",
   "not processed", "error", "empty reply", "pruned", "compacted",
 ];
-const WEEKDAY = "(?:sun|mon|tue|wed|thu|fri|sat)";
+const WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+
+/** Invisible characters only (no whitespace): what may hide INSIDE a word. */
+const HIDDEN = "[\\u00AD\\u200B-\\u200F\\u2060\\uFEFF]*";
+
+/**
+ * A marker word as a pattern that still matches with invisible characters
+ * hidden between its letters (`rep\u200Blying to`) or extra spacing between
+ * its words — both read exactly like the word itself.
+ */
+function spelledLoosely(word: string): string {
+  return word.split(" ").map((part) => Array.from(part).join(HIDDEN)).join(`${INVISIBLE}\\s${INVISIBLE}`);
+}
 
 /** `[` opening a marker word, the inbound stamp (`[imessage · …`, `[Sat 08/29 …`), or `<` opening a `<tomo-event>` tag. */
 const FORGED_OPENER_RE = new RegExp(
-  `\\[(?=${INVISIBLE}(?:(?:${MARKER_WORDS.join("|")})\\b|[a-z][\\w-]*${INVISIBLE}·|${WEEKDAY} \\d))`
-  + `|<(?=${INVISIBLE}\\/?${INVISIBLE}tomo-event\\b)`,
+  `\\[(?=${INVISIBLE}(?:(?:${MARKER_WORDS.map(spelledLoosely).join("|")})\\b`
+  + `|[a-z][\\w\\-\\u00AD\\u200B-\\u200F\\u2060\\uFEFF]*${INVISIBLE}·`
+  + `|(?:${WEEKDAYS.map(spelledLoosely).join("|")})${INVISIBLE}\\d))`
+  + `|<(?=${INVISIBLE}\\/?${INVISIBLE}${spelledLoosely("tomo-event")}\\b)`,
   "giu",
 );
 

@@ -1,4 +1,5 @@
 import type { Channel, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions } from "./channels/types.js";
+import { neutralizeInboundBody } from "./channels/text-utils.js";
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
@@ -1790,11 +1791,15 @@ export class Agent {
     // records only, even when a summon routes this line into a dm: session —
     // the reply audience is still the group, and a harness-stitched private
     // canonical name would sit right next to the content being answered.
-    const sender = annotateSenderName(people.scoped(false), channel.name, message.senderName, message.senderId);
+    //
+    // The display name and the chat title are the sender's to choose, like the
+    // body: neutralised the same way so neither can carry a marker that would
+    // sit in front of the channel's real one.
+    const sender = neutralizeInboundBody(annotateSenderName(people.scoped(false), channel.name, message.senderName, message.senderId));
     const prefixed = `${sender}: ${message.text}`;
     if (!isDmSessionKey(sessionKey)) return prefixed;
-    const label = message.chatTitle ?? this.sessions.getEntry(`${channel.name}:${message.chatId}`)?.chatTitle;
-    return `${formatGroupTag(label)} ${prefixed}`;
+    const title = message.chatTitle ?? this.sessions.getEntry(`${channel.name}:${message.chatId}`)?.chatTitle;
+    return `${formatGroupTag(title === undefined ? undefined : neutralizeInboundBody(title))} ${prefixed}`;
   }
 
   /**

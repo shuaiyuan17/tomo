@@ -1,7 +1,7 @@
 import type { HistoryMessage, WebReaction, WebRequest } from "../../src/web/protocol.js";
 // Not from protocol.ts: a value import from there would bring zod (and its eval probe) into the page.
 import { WEB_REPLY_TEXT_LIMIT } from "../../src/web/reply-limits.js";
-import { findQuoted, parseReply, quotableText, type MessageKind, type ReplyContext } from "./reply.js";
+import { findQuoted, markerStart, parseReply, quotableText, type MessageKind, type ReplyContext } from "./reply.js";
 
 /**
  * Tapbacks in the chat. The owner's reactions (from this page, or an iMessage
@@ -57,7 +57,8 @@ export function parseTapback(content: string): { reaction: ReactionKind; reply?:
  * `[reacting to: "…"] [tapback: love]`, and that must stay text, not a ❤.
  */
 export function tapbackOf(message: MessageKind & { content: string }): ReturnType<typeof parseTapback> {
-  return message.role === "user" && message.isReaction ? parseTapback(message.content) : undefined;
+  const at = message.isReaction ? markerStart(message) : -1;
+  return at < 0 ? undefined : parseTapback(message.content.slice(at));
 }
 
 export type ReactionFrom = "you" | "agent" | "participant";
@@ -105,8 +106,8 @@ export function collectReactions(messages: readonly HistoryMessage[], pending: r
  * units as every string length does (an emoji is two), never between the two
  * halves of a surrogate pair.
  */
-export function quoteFor(message: { role: string; content: string }, limit = WEB_REPLY_TEXT_LIMIT): string {
-  const text = quotableText(message.role, message.content);
+export function quoteFor(message: MessageKind & { content: string }, limit = WEB_REPLY_TEXT_LIMIT): string {
+  const text = quotableText(message.role, message.content, message);
   if (text.length <= limit) return text;
   const high = text.charCodeAt(limit - 1);
   return text.slice(0, high >= 0xd800 && high <= 0xdbff ? limit - 1 : limit);

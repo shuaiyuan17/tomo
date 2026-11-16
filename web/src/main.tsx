@@ -780,7 +780,7 @@ export function App() {
                 {session?.writable && web.connection === "live" && <>
                   <ReplyAction onReply={() => latestActions.current.startReply(message)} />
                   <ReactAction current={mine} onReact={(kind) => void latestActions.current.react(quoteFor(message), kind)} /></>}
-                <CopyAction text={messageText(message.role, message.content)} /></MessageActions>}</div>
+                <CopyAction text={messageText(message.role, message.content, message)} /></MessageActions>}</div>
             {(message.role === "user" ? (node: React.JSX.Element) => ownBubble(node, message.requestId) : (node: React.JSX.Element) => node)(<div className={cn("markdown", message.role === "user" && "min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 max-[600px]:px-4 max-[600px]:py-3", message.role === "assistant" && "reading")}>
               {silent
                 // A turn that ended without a reply (silent by choice, or stopped): said plainly, not as the agent's words.

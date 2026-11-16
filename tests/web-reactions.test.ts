@@ -25,7 +25,7 @@ describe("tapback records", () => {
 
 describe("what a reply quotes", () => {
   it("drops tomo's markers, thinking and picture tags; Copy keeps line breaks", () => {
-    expect(quotableText("user", '[replying to: "x"] [Sent an image, saved to: /a/b.png] look  at\nthis')).toBe("look at this");
+    expect(quotableText("user", '[replying to: "x"] [Sent an image, saved to: /a/b.png] look  at\nthis', { isReply: true })).toBe("look at this");
     expect(quotableText("assistant", "[proactive] 💭 musing\nHere you go\nMEDIA:/tmp/a.png")).toBe("Here you go");
     expect(messageText("assistant", "One\n\nTwo")).toBe("One\n\nTwo");
     expect(Array.from(quoteFor({ role: "user", content: "x".repeat(3000) }))).toHaveLength(2000);

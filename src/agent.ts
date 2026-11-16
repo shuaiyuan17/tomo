@@ -37,7 +37,7 @@ import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { formatInterruptedAgentsNotice, RunningAgentsLedger, type RunningTaskRecord } from "./agent/running-agents-ledger.js";
-import { DurableInbox, INBOX_STALE_NOT_PROCESSED, restoreMessage, type InboxRecord } from "./agent/durable-inbox.js";
+import { DurableInbox, INBOX_STALE_NOT_PROCESSED, persistedText, restoreMessage, type InboxRecord } from "./agent/durable-inbox.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import type { TaskBoard } from "./web/tasks.js";
 import { describeSessionModel, switchSessionModel, type ModelSwitchOutcome } from "./agent/model-switch.js";
@@ -2916,7 +2916,7 @@ const INTERRUPTED_NOTE_CHUNK = 16_000;
 
 /** One interrupted message as quoted in the note, in full: sender, text, saved attachments. */
 function formatInterruptedMessage(rec: InboxRecord, i: number, total: number): string {
-  const text = rec.message.text ?? "";
+  const text = persistedText(rec.message);
   const sender = rec.message.senderName ? `${rec.message.senderName}: ` : "";
   const attachments = [...(rec.message.images ?? []), ...(rec.message.documents ?? [])]
     .map((a) => `\n  [attachment ${a.mediaType}: ${a.savedPath ?? "not saved"}]`).join("");

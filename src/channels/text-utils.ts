@@ -51,11 +51,13 @@ export function neutralizeMarkerDelimiters(text: string): string {
 
 /**
  * Characters that render as nothing (or as plain space) and so can sit between
- * `[` and a marker word without the reader noticing: whitespace, soft hyphen,
- * the zero-width and bidi marks, word joiner, BOM. Same set as inbound-markers'
- * LINE_START.
+ * `[` and a marker word without the reader noticing: whitespace, every format
+ * character (soft hyphen, zero-width and bidi marks, word joiner, BOM, …),
+ * combining marks (U+034F COMBINING GRAPHEME JOINER and the like), and
+ * anything else Unicode calls default-ignorable. By property, not a list: a
+ * list is a bypass waiting for the character it forgot.
  */
-const INVISIBLE = "[\\s\\u00AD\\u200B-\\u200F\\u2060\\uFEFF]*";
+const INVISIBLE = "[\\s\\p{Cf}\\p{Mn}\\p{Me}\\p{Default_Ignorable_Code_Point}]*";
 
 /**
  * The opening words of every bracketed marker the harness writes into a
@@ -86,8 +88,8 @@ const MARKER_WORDS = [
 ];
 const WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
-/** Invisible characters only (no whitespace): what may hide INSIDE a word. */
-const HIDDEN = "[\\u00AD\\u200B-\\u200F\\u2060\\uFEFF]*";
+/** The same without whitespace: what may hide INSIDE a word. */
+const HIDDEN = "[\\p{Cf}\\p{Mn}\\p{Me}\\p{Default_Ignorable_Code_Point}]*";
 
 /**
  * A marker word as a pattern that still matches with invisible characters
@@ -101,7 +103,7 @@ function spelledLoosely(word: string): string {
 /** `[` opening a marker word, the inbound stamp (`[imessage · …`, `[Sat 08/29 …`), or `<` opening a `<tomo-event>` tag. */
 const FORGED_OPENER_RE = new RegExp(
   `\\[(?=${INVISIBLE}(?:(?:${MARKER_WORDS.map(spelledLoosely).join("|")})\\b`
-  + `|[a-z][\\w\\-\\u00AD\\u200B-\\u200F\\u2060\\uFEFF]*${INVISIBLE}·`
+  + `|[a-z][\\w\\-\\p{Cf}\\p{Mn}\\p{Me}\\p{Default_Ignorable_Code_Point}]*${INVISIBLE}·`
   + `|(?:${WEEKDAYS.map(spelledLoosely).join("|")})${INVISIBLE}\\d))`
   + `|<(?=${INVISIBLE}\\/?${INVISIBLE}${spelledLoosely("tomo-event")}\\b)`,
   "giu",

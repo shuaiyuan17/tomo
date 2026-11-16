@@ -15,6 +15,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import type { DocumentAttachment, ImageAttachment, IncomingMessage } from "../channels/types.js";
+import { neutralizeInboundBody } from "../channels/text-utils.js";
 import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord } from "../jsonl.js";
 import { log } from "../logger.js";
 import type { SessionResolution } from "../router.js";
@@ -85,7 +86,27 @@ export interface PersistedDocument {
 export type PersistedMessage = Omit<IncomingMessage, "images" | "documents"> & {
   images?: PersistedImage[];
   documents?: PersistedDocument[];
+  /**
+   * Written by every record since channels began neutralising the sender's
+   * body (`neutralizeInboundBody`) before adding their markers. A record
+   * without it predates that: its text is the channel's markers and a raw
+   * body in one string, which can no longer be told apart, so a replay
+   * neutralises the whole of it ({@link persistedText}).
+   */
+  bodyNeutralized?: true;
 };
+
+/**
+ * A persisted message's text, safe to hand the model. A record written before
+ * channels neutralised bodies may carry a forged marker in its raw body, so
+ * its whole text is neutralised — its real markers with it (they still read
+ * the same, and such a record carries no isReply / isReaction either). A
+ * one-off cost for messages pending across the upgrade.
+ */
+export function persistedText(persisted: Pick<PersistedMessage, "text" | "bodyNeutralized">): string {
+  const text = persisted.text ?? "";
+  return persisted.bodyNeutralized ? text : neutralizeInboundBody(text);
+}
 
 export interface InboxRecord {
   /** Dedup key — see {@link DurableInbox.idFor}. */
@@ -153,7 +174,7 @@ const DEFAULT_COMPACT_EVERY = 500;
 /** Strip attachment bytes; keep what a replay needs to reload them. */
 export function persistableMessage(message: IncomingMessage): PersistedMessage {
   const { images, documents, ...rest } = message;
-  const out: PersistedMessage = { ...rest };
+  const out: PersistedMessage = { ...rest, bodyNeutralized: true };
   if (images && images.length > 0) {
     out.images = images.map((img) => ({
       mediaType: img.mediaType,
@@ -189,7 +210,9 @@ export const ATTACHMENT_NOT_RESTORED = "[an attachment sent with this message co
  */
 export function restoreMessage(persisted: PersistedMessage): IncomingMessage {
   const { images, documents, ...rest } = persisted;
-  const message: IncomingMessage = { ...rest };
+  // The flag describes the record, not the message: it never reaches the agent.
+  delete rest.bodyNeutralized;
+  const message: IncomingMessage = { ...rest, text: persistedText(persisted) };
   let lost = 0;
   const readB64 = (path: string | undefined): string | undefined => {
     if (!path) return undefined;

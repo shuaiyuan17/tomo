@@ -217,13 +217,15 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   .motion-collapsible[data-state="open"] { animation: collapsible-open 180ms var(--ease-soft); }
   .motion-collapsible[data-state="closed"] { animation: collapsible-close 150ms var(--ease-soft); }
 }
-/* Charts (Study · Cost). Categorical hues validated (dataviz validate_palette.js) against the card
-   surface in each mode: light #3d7ab5,#c8623a,#2f9a74 on #fbf8f1; dark #3987e5,#d95926,#199e70 on #27231f.
-   One meaning per hue across the page: You, Background, Scheduled. `--seq-*` is the heatmap's single-hue ramp. */
+/* Charts (Study · Cost). Categorical hues validated (dataviz validate_palette.js, --pairs all) against the card
+   surface in each mode: light #3d7ab5,#c8623a,#2f9a74 on #fbf8f1; dark #3a70b3,#b65329,#28815e on #27231f.
+   One meaning per hue across the page: You, Background, Scheduled. `--seq-*` is the heatmap's single-hue ramp.
+   Dark is muted on purpose: series sit just above 3:1 and the ramp tops out at L 0.64 / C 0.09, so the
+   hero figure, not the charts, is the brightest thing on the page; each ramp step is ≥ 0.06 OKLCH L apart. */
 .viz { --series-1:#3d7ab5; --series-2:#c8623a; --series-3:#2f9a74; --grid:#e6ddca; --axis:#cfc4ad;
   --seq-0:#efe8d8; --seq-1:#cfdcea; --seq-2:#a3c0dd; --seq-3:#729fcd; --seq-4:#3d7ab5; --seq-5:#27578a; }
-.dark .viz { --series-1:#3987e5; --series-2:#d95926; --series-3:#199e70; --grid:#3a342d; --axis:#4e463c;
-  --seq-0:#322d27; --seq-1:#2b3f5a; --seq-2:#2c558a; --seq-3:#2f6cb8; --seq-4:#3987e5; --seq-5:#7fb2f0; }
+.dark .viz { --series-1:#3a70b3; --series-2:#b65329; --series-3:#28815e; --grid:#3a342d; --axis:#4e463c;
+  --seq-0:#37322c; --seq-1:#354254; --seq-2:#3e5471; --seq-3:#48668d; --seq-4:#5479a9; --seq-5:#658dc1; }
 .viz .bar { transition: filter 120ms var(--ease-soft); }
 .viz [data-col]:hover .bar, .viz [data-col]:focus-visible .bar { filter: brightness(1.12); }
 .viz .vgrow { transform-origin: bottom; animation: viz-grow 240ms var(--ease-soft) both; }

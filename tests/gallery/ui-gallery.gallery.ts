@@ -27,6 +27,7 @@ vi.mock("../../src/logger.js", async () => (await import("../helpers/agent-mocks
 
 import { Agent, MockChannel, SessionStore, installAgentTestHooks, mockConfig, mockSdk } from "../helpers/agent-harness.js";
 import { solidPng } from "../helpers/png.js";
+import { seedCostLedger } from "../helpers/cost-fixture.js";
 import { WebChannel } from "../../src/channels/web.js";
 import { WebSupervisor } from "../../src/web/supervisor.js";
 import { watchBus } from "../../src/watch/bus.js";
@@ -155,6 +156,8 @@ function seedWorkspace(store: SessionStore): string {
   Object.assign(byName("Book club poll"), { enabled: false, nextRunAt: Date.UTC(2026, 10, 21, 2, 0) });
   Object.assign(byName("Parked one-shot"), { enabled: false, lastStatus: "interrupted", lastRunAt: BASE - 3_600_000, interruptedAt: BASE - 3_600_000, nextRunAt: null });
   writeFileSync(cronPath, JSON.stringify(file, null, 2));
+  // The Study's Cost tab: ten weeks of ledger and a quota sample (the server's own clock decides "today").
+  seedCostLedger(mockConfig.tomoHome);
   return cronPath;
 }
 
@@ -549,10 +552,11 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
       await snap({ target: group });
     } finally { await group.close(); }
   });
-  for (const tab of ["todos", "memory", "context", "model", "cron", "mcp", "config"]) {
+  for (const tab of ["todos", "memory", "context", "model", "cost", "cron", "mcp", "config"]) {
     await s("study", tab, async (snap) => {
       await page.goto(`${url}/#study/${tab}`);
       await page.waitForTimeout(900);
+      if (tab === "cost") await page.getByRole("list", { name: "Costliest turns" }).waitFor();
       if (tab === "cron") await page.getByText("Dentist reminder", { exact: true }).filter({ visible: true }).first().waitFor();
       await snap();
     });

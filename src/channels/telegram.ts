@@ -1,6 +1,6 @@
-import { Bot, GrammyError, type Context } from "grammy";
+import { API_CONSTANTS, Bot, GrammyError, type Context } from "grammy";
 import { existsSync } from "node:fs";
-import type { ReactionType, ReactionTypeEmoji } from "grammy/types";
+import type { MessageReactionUpdated, ReactionType, ReactionTypeEmoji } from "grammy/types";
 import type { AdmissionPredicate, Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, MessageReaction, RecentChatMessage } from "./types.js";
 import { AttachmentUnreadableError, PartialSendError, markDefiniteFailure, markNothingSent, markPartsSent } from "./types.js";
 import { formatImageMarker } from "./imageStore.js";
@@ -13,7 +13,7 @@ import {
 } from "./attachments.js";
 import { log } from "../logger.js";
 import { scrubSecretValues } from "../redact.js";
-import { splitText } from "./text-utils.js";
+import { formatReactionMarker, splitText } from "./text-utils.js";
 import { formatMimeToken, sanitizeAttachmentFilename } from "./fileStore.js";
 import { CHAT_COMMANDS, CHAT_COMMAND_NAMES, parseTasksCommand, TASKS_COMMAND } from "./chat-commands.js";
 
@@ -118,6 +118,27 @@ function formatUnsupportedDocumentNotice(
 function isGroupChatType(type: string): boolean {
   return type === "group" || type === "supergroup";
 }
+
+/** Our reactions as the Telegram emoji `reactToMessage` sets. */
+const EMOJI_BY_REACTION = {
+  love: "\u2764",
+  like: "\u{1F44D}",
+  dislike: "\u{1F44E}",
+  laugh: "\u{1F923}",
+  emphasize: "\u{1F92F}",
+  question: "\u{1F914}",
+} satisfies Record<MessageReaction, ReactionTypeEmoji["emoji"]>;
+/** ...and back: an inbound one of those reads as the tapback it stands for (variation selector ignored). */
+const REACTION_BY_EMOJI = new Map<string, MessageReaction>(
+  (Object.entries(EMOJI_BY_REACTION) as Array<[MessageReaction, string]>).map(([reaction, emoji]) => [emoji, reaction]));
+const reactionKey = (r: ReactionType) => r.type === "emoji" ? `e:${r.emoji}` : r.type === "custom_emoji" ? `c:${r.custom_emoji_id}` : r.type;
+/** What a reaction is called in the tapback marker: one of ours, else the emoji itself. */
+function reactionName(r: ReactionType): string {
+  if (r.type === "emoji") return REACTION_BY_EMOJI.get(r.emoji.replace(/\uFE0F/g, "")) ?? r.emoji;
+  return r.type === "custom_emoji" ? "custom emoji" : "paid star";
+}
+/** Updates polling asks for: Telegram's defaults leave reactions out, so they are named. */
+export const TELEGRAM_ALLOWED_UPDATES = [...API_CONSTANTS.DEFAULT_UPDATE_TYPES, "message_reaction"] as const;
 
 export class TelegramChannel implements Channel {
   readonly name = "telegram";
@@ -316,6 +337,47 @@ export class TelegramChannel implements Channel {
         chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
       });
     }));
+
+    // Reactions (Telegram's tapbacks). Polling asks for them explicitly (TELEGRAM_ALLOWED_UPDATES).
+    this.bot.on("message_reaction", (ctx) => this.ingest(String(ctx.messageReaction.chat.id), `reaction:${ctx.messageReaction.message_id}`, async () => {
+      this.handleInboundReaction(ctx.messageReaction);
+    }));
+  }
+
+  /**
+   * A reaction someone ADDED, worded exactly as an iMessage tapback
+   * (`[reacting to: "…"] [tapback: love]`), so the agent sees one shape for
+   * both. Removals and changes that add nothing are noise, as on iMessage; so
+   * is a bot's own (Telegram sends none). Telegram's emoji for our six map
+   * back to their names; any other emoji is passed as it is. The quote comes
+   * from the recent-message ring (our own sends included); unknown, the
+   * marker degrades to the quote-less form. Never recorded in the ring
+   * itself, so substring targeting never lands on a reaction.
+   */
+  private handleInboundReaction(update: MessageReactionUpdated): void {
+    if (update.user?.is_bot) return;
+    const before = new Set(update.old_reaction.map(reactionKey));
+    const added = update.new_reaction.find((r) => !before.has(reactionKey(r)));
+    if (!added) return;
+    const chatId = String(update.chat.id);
+    const messageId = String(update.message_id);
+    const original = this.recentByChat.get(chatId)?.find((m) => m.id === messageId)?.text;
+    const isGroup = isGroupChatType(update.chat.type);
+    const user = update.user;
+    this.dispatch({
+      // Its own id: one person's reaction at one moment, never the message's.
+      id: `reaction:${messageId}:${user?.id ?? update.actor_chat?.id ?? "anonymous"}:${update.date}`,
+      chatId,
+      senderName: user ? user.first_name + (user.last_name ? ` ${user.last_name}` : "")
+        : (update.actor_chat && "title" in update.actor_chat ? update.actor_chat.title : undefined) ?? "Unknown",
+      senderId: user ? String(user.id) : undefined,
+      text: formatReactionMarker(reactionName(added), original),
+      timestamp: update.date * 1000,
+      isGroup,
+      // Ambient, not a summons: a group session can stay silent.
+      isMentioned: false,
+      chatTitle: isGroup && "title" in update.chat ? update.chat.title : undefined,
+    }, { remember: false });
   }
 
   /**
@@ -477,8 +539,8 @@ export class TelegramChannel implements Channel {
     }
   }
 
-  private dispatch(msg: IncomingMessage): void {
-    if (msg.id && msg.text.trim()) {
+  private dispatch(msg: IncomingMessage, options: { remember?: boolean } = {}): void {
+    if (options.remember !== false && msg.id && msg.text.trim()) {
       this.recordRecentMessage(msg.chatId, {
         id: msg.id,
         text: msg.text,
@@ -733,15 +795,7 @@ export class TelegramChannel implements Channel {
   }
 
   async reactToMessage(chatId: string, messageId: string, reaction: MessageReaction, remove = false): Promise<void> {
-    const emojiByReaction = {
-      love: "\u2764",
-      like: "\u{1F44D}",
-      dislike: "\u{1F44E}",
-      laugh: "\u{1F923}",
-      emphasize: "\u{1F92F}",
-      question: "\u{1F914}",
-    } satisfies Record<MessageReaction, ReactionTypeEmoji["emoji"]>;
-    const reactions = remove ? [] : [{ type: "emoji" as const, emoji: emojiByReaction[reaction] }];
+    const reactions = remove ? [] : [{ type: "emoji" as const, emoji: EMOJI_BY_REACTION[reaction] }];
     try {
       await this.bot.api.setMessageReaction(chatId, Number(messageId), reactions satisfies ReactionType[]);
     } catch (err) {
@@ -855,7 +909,7 @@ export class TelegramChannel implements Channel {
       }, delayMs);
     };
 
-    this.bot.start().then(() => scheduleRestart(), (err) => scheduleRestart(err));
+    this.bot.start({ allowed_updates: TELEGRAM_ALLOWED_UPDATES }).then(() => scheduleRestart(), (err) => scheduleRestart(err));
   }
 
   /**

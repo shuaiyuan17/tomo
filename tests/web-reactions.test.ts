@@ -3,7 +3,7 @@ import { collectReactions, parseTapback, quoteFor, reactionKind } from "../web/s
 import { findQuoted, messageText, quotableText } from "../web/src/reply.js";
 import { formatReactionMarker, formatReplyContextMarker } from "../src/channels/text-utils.js";
 import { pendingUserMessages } from "../web/src/pending.js";
-import type { HistoryMessage, WebRequest } from "../src/web/protocol.js";
+import { messageInputSchema, type HistoryMessage, type WebRequest } from "../src/web/protocol.js";
 
 const msg = (id: string, role: HistoryMessage["role"], content: string, extra: Partial<HistoryMessage> = {}): HistoryMessage =>
   ({ id, role, content, timestamp: Number(id), channel: "web", ...extra });
@@ -29,6 +29,20 @@ describe("what a reply quotes", () => {
     expect(quotableText("assistant", "[proactive] 💭 musing\nHere you go\nMEDIA:/tmp/a.png")).toBe("Here you go");
     expect(messageText("assistant", "One\n\nTwo")).toBe("One\n\nTwo");
     expect(Array.from(quoteFor({ role: "user", content: "x".repeat(3000) }))).toHaveLength(2000);
+  });
+  it("only the channels' own markers are stripped; a message that starts with brackets keeps them", () => {
+    expect(quotableText("assistant", "[Documentation](https://example.com) explains it.")).toBe("[Documentation](https://example.com) explains it.");
+    expect(quotableText("user", "[1, 2, 3]")).toBe("[1, 2, 3]");
+    expect(quotableText("user", "[via satellite — sender off-grid, text-only, keep it short] [Sent a Telegram sticker: file_id=x] hi")).toBe("hi");
+    expect(quotableText("user", "[Sent 2 files: a.md (text/markdown, 1 KB) saved to /x] [notes] here")).toBe("[notes] here");
+  });
+  it("a quote fits the server's limit in UTF-16 units and never splits an emoji", () => {
+    const quote = quoteFor({ role: "user", content: "🙂".repeat(1500) });
+    expect(quote.length).toBeLessThanOrEqual(2000);
+    expect(Array.from(quote)).toHaveLength(1000);
+    const odd = quoteFor({ role: "user", content: `x${"🙂".repeat(1500)}` });
+    expect(odd.length).toBe(1999);
+    expect(messageInputSchema.safeParse({ requestId: "00000000-0000-4000-8000-000000000000", text: "", reply: { text: odd, reaction: "like" } }).success).toBe(true);
   });
   it("a reply sent from this page finds its original again, also one with an attachment marker", () => {
     const messages = [

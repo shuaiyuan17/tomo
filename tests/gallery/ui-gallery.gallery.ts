@@ -173,11 +173,11 @@ function seedConversation(store: SessionStore): void {
   const add = (role: "user" | "assistant", content: string, channel: string, timestamp: number) => store.append("dm:owner", { role, channel, content, timestamp });
   add("user", "Hey, can you look at the transcript migration and tell me if it's safe to ship?", "web", day1);
   add("assistant", "Sure — give me a minute to read through it.", "telegram", day1 + 60_000);
+  // A Telegram reaction on it: a pill on the message and one quiet line, not a bubble.
+  add("user", formatReactionMarker("love", "Sure — give me a minute to read through it."), "telegram", day1 + 90_000);
+  add("assistant", "NO_REPLY", "telegram", day1 + 91_000);
   add("user", `[Sent an image, saved to: ${image}] this is what I see in Finder`, "telegram", day1 + 120_000);
   add("assistant", "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了", "imessage", day1 + 180_000);
-  // An iMessage tapback on it: a pill on the message and one quiet line, not a bubble.
-  add("user", formatReactionMarker("love", "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了"), "imessage", day1 + 200_000);
-  add("assistant", "NO_REPLY", "imessage", day1 + 201_000);
   add("user", '[replying to: "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了"] nicenice！！ 那第二个呢？', "imessage", day1 + 240_000);
   const q = BASE - 40 * 60_000;
   add("user", "Walk me through the plan in detail please, with a table of the keys and some code.", "web", q);

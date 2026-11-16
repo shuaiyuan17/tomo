@@ -38,8 +38,14 @@ export function parseReply(content: string): { reply?: ReplyContext; body: strin
 // A quoted message Tomo sent on its own is recorded with a send marker in front; the quote never has it.
 const normalize = (text: string) => parseReply(parseSendMarker("assistant", text).body).body.replace(/\s+/g, " ").trim();
 
-/** Leading channel markers (attachments, satellite): the channel quotes the provider's text, which has none. */
-const LEADING_MARKERS = /^(?:\s*\[[^\]]*\])+\s*/;
+/**
+ * The markers a messaging channel puts in front of an inbound message
+ * (attachments: "[Sent an image, saved to: …]", "[Sent 2 files: …]", a
+ * Telegram sticker; satellite; a late attachment follow-up). The channel
+ * quotes the provider's text, which has none. Only these: a message that
+ * itself starts with brackets ("[1, 2, 3]", a markdown link) keeps them.
+ */
+const LEADING_MARKERS = /^(?:\s*\[(?:Sent (?:an?|\d+) [^\]]*|via satellite[^\]]*|Attachments from an earlier message[^\]]*)\])+\s*/;
 /** A picture line Tomo's reply carries (delivery-pipeline MEDIA:/STICKER: tags); never part of the quote. */
 const MEDIA_LINE = /^[ \t]*(?:MEDIA|STICKER):\S.*$/gm;
 
@@ -56,8 +62,11 @@ export function quotableText(role: string, content: string): string {
 /** The same text with its line breaks (what Copy copies). */
 export function messageText(role: string, content: string): string {
   let body = parseReply(parseSendMarker(role, content).body).body;
-  if (role === "assistant") body = splitThinking(body, "joined").filter((s) => s.kind === "reply").map((s) => s.text).join("\n");
-  return body.replace(LEADING_MARKERS, "").replace(MEDIA_LINE, "").replace(/\n{3,}/g, "\n\n").trim();
+  // Channel markers lead inbound (user) messages only; Tomo's text is its own.
+  body = role === "assistant"
+    ? splitThinking(body, "joined").filter((s) => s.kind === "reply").map((s) => s.text).join("\n").replace(MEDIA_LINE, "")
+    : body.replace(LEADING_MARKERS, "");
+  return body.replace(/\n{3,}/g, "\n\n").trim();
 }
 
 /**

@@ -1,4 +1,4 @@
-import type { HistoryMessage, WebReaction, WebRequest } from "../../src/web/protocol.js";
+import { WEB_REPLY_TEXT_LIMIT, type HistoryMessage, type WebReaction, type WebRequest } from "../../src/web/protocol.js";
 import { findQuoted, parseReply, quotableText, type ReplyContext } from "./reply.js";
 
 /**
@@ -88,8 +88,15 @@ export function collectReactions(messages: readonly HistoryMessage[], pending: r
   return out;
 }
 
-/** What a reply or reaction from this page quotes of a message (the agent sees its first 60 code points). */
-export function quoteFor(message: { role: string; content: string }, limit = 2_000): string {
-  const points = Array.from(quotableText(message.role, message.content));
-  return points.length > limit ? points.slice(0, limit).join("") : points.join("");
+/**
+ * What a reply or reaction from this page quotes of a message (the agent sees
+ * its first 60 code points). Cut to the server's limit, which counts UTF-16
+ * units as every string length does (an emoji is two), never between the two
+ * halves of a surrogate pair.
+ */
+export function quoteFor(message: { role: string; content: string }, limit = WEB_REPLY_TEXT_LIMIT): string {
+  const text = quotableText(message.role, message.content);
+  if (text.length <= limit) return text;
+  const high = text.charCodeAt(limit - 1);
+  return text.slice(0, high >= 0xd800 && high <= 0xdbff ? limit - 1 : limit);
 }

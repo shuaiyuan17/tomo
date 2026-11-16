@@ -136,6 +136,7 @@ Tomo keeps person records at `~/.tomo/workspace/memory/people/*.md` — canonica
   - Image/photo support (sends to Claude as vision input)
   - Group chat: defaults to mention-required (only responds when @mentioned or replied to); per-group passive listen mode opt-in via `channels.telegram.passiveGroups`
   - Markdown rendering with plain-text fallback
+  - Inbound reactions reach Tomo worded like iMessage tapbacks (`[reacting to: "…"] [tapback: love]`). In a group Telegram sends them only when the bot is an admin.
 - **iMessage** — via the local [imsg CLI](https://github.com/openclaw/imsg), enabled with `channels.imessage.provider: "imsg"`
   - DM and group chat support
   - Image attachment support

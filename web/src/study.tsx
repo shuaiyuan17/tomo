@@ -14,6 +14,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import { Text } from "./markdown.js";
+import { CostPage } from "./cost-page.js";
 import type { WebModelChangeResult, WebModelView } from "../../src/web/protocol.js";
 import { modelErrorRefreshes, modelErrorText, pickTarget, switchCopy } from "./model-picker.js";
 import { countTasks, formatTokens, formatWhen, STUDY_LABELS, STUDY_PAGES, useResource, type Resource, type StudyPage } from "./study-data.js";
@@ -23,6 +24,7 @@ const INTRO: Record<StudyPage, string> = {
   memory: "What {agent} remembers, as it is written in the workspace. Private memory is never shown in the browser.",
   context: "How full the selected conversation's context window is, and what has been rolled up.",
   model: "Which model the selected conversation runs on. Your own conversation can be switched here.",
+  cost: "What {agent}'s work would cost at API prices, day by day, and how much of your plan it is using.",
   cron: "Scheduled jobs and when they last ran.",
   mcp: "External tool servers in config.json, and what live sessions report about them.",
   config: "The saved config.json. Only known non-sensitive text is shown; everything else is hidden.",
@@ -73,6 +75,7 @@ export function Study({ page, onPage, session, reload, inert, mutator, focus, cr
         {page === "memory" && <Memory reload={key} />}
         {page === "context" && <Context session={session} reload={key} />}
         {page === "model" && <ModelPage session={session} reload={key} mutator={mutator} />}
+        {page === "cost" && <CostPage reload={key} focus={focus ?? null} />}
         {page === "cron" && <Cron reload={key + cronRevision} mutator={mutator} focus={focus ?? null} />}
         {page === "mcp" && <Mcp reload={key} />}
         {page === "config" && <Config reload={key} />}

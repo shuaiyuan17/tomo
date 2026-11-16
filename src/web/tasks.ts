@@ -18,7 +18,19 @@ export const SNAPSHOT_SUMMARY_LIMIT = 120;
  * the browser can treat it as the complete list.
  */
 export const MAX_SNAPSHOT_TASK_BYTES = MAX_BOARD_TASKS * 3 * 1024;
+/** Ended tasks kept per session for the `/tasks` chat command (never published). */
+export const MAX_SESSION_HISTORY = 100;
+/** An ended task older than this leaves the `/tasks` history. */
+export const HISTORY_RETENTION_MS = 36 * 60 * 60 * 1000;
 const TASK_ID = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/** One session's tasks as the `/tasks` chat command reads them (see `TaskBoard.listFor`). */
+export interface SessionTaskList {
+  /** Running, non-ambient, oldest first. */
+  running: Array<WebTask & { lastActiveAt?: number }>;
+  /** Ended at or after `since`, non-ambient, newest first. */
+  ended: WebTask[];
+}
 const LABEL_LIMIT = 40;
 
 export interface TaskBoardOptions {
@@ -53,6 +65,14 @@ export class TaskBoard {
   private toolUses = new Map<string, Map<string, string>>();
   /** Models learned per slot and task (kept across REPLACE updates). */
   private models = new Map<string, Map<string, string>>();
+  /**
+   * Per slot: tasks that ended, kept past the panel's retention window (up to
+   * MAX_SESSION_HISTORY, HISTORY_RETENTION_MS) for the `/tasks` chat command.
+   * Fed by the same `apply` as the panel; never published to the browser.
+   */
+  private history = new Map<string, Map<string, WebTask>>();
+  /** Per slot and task: when progress last changed (for `/tasks`; never published). */
+  private activity = new Map<string, Map<string, number>>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private readonly now: () => number;
   private readonly retainMs: number;
@@ -121,6 +141,12 @@ export class TaskBoard {
       if (task.toolUseId) { const uses = this.toolUses.get(sessionId) ?? new Map<string, string>(); uses.set(task.taskId, task.toolUseId); this.toolUses.set(sessionId, uses); }
       const previous = old.get(task.taskId);
       const reported = task.status;
+      if (previous && (previous.toolUses !== task.toolUses || previous.lastTool !== task.lastTool
+        || previous.summary !== task.summary || previous.totalTokens !== task.totalTokens)) {
+        const seen = this.activity.get(sessionId) ?? new Map<string, number>();
+        seen.set(task.taskId, now);
+        this.activity.set(sessionId, seen);
+      }
       next.set(task.taskId, {
         sessionId,
         taskId: task.taskId,
@@ -154,6 +180,28 @@ export class TaskBoard {
     this.store(sessionId, next);
   }
 
+  /**
+   * One slot's tasks for the `/tasks` chat command: exactly the slot asked
+   * for, never another (the caller picks the slot the chat may see). Running
+   * tasks come from the panel's live state; ended ones from the panel plus
+   * the history kept past its retention window. Ambient tasks (watchers) are
+   * left out, as the panel hides them by default.
+   */
+  listFor(slot: string, since: number): SessionTaskList {
+    const activity = this.activity.get(slot);
+    const running = [...(this.sessions.get(slot)?.values() ?? [])]
+      .filter((task) => task.state === "running" && task.endedAt === undefined && !task.ambient)
+      .sort((a, b) => a.startedAt - b.startedAt || a.taskId.localeCompare(b.taskId))
+      .map((task) => ({ ...task, ...(activity?.get(task.taskId) !== undefined ? { lastActiveAt: activity.get(task.taskId)! } : {}) }));
+    const live = new Set(running.map((task) => task.taskId));
+    const ended = [...(this.history.get(slot)?.values() ?? [])]
+      // A resumed task (same id) is listed as running, not also as done.
+      .filter((task) => !task.ambient && !live.has(task.taskId) && task.endedAt! >= since)
+      .sort((a, b) => b.endedAt! - a.endedAt!)
+      .map((task) => ({ ...task }));
+    return { running, ended };
+  }
+
   dispose(): void { clearTimeout(this.timer); this.timer = undefined; }
 
   private store(sessionId: string, next: Map<string, WebTask>): void {
@@ -162,9 +210,21 @@ export class TaskBoard {
     const live = list.filter((task) => task.endedAt === undefined);
     const done = list.filter((task) => task.endedAt !== undefined).sort((a, b) => b.endedAt! - a.endedAt!);
     const kept = [...live, ...done].slice(0, MAX_SESSION_TASKS);
+    this.remember(sessionId, done);
     if (kept.length) this.sessions.set(sessionId, new Map(kept.map((task) => [task.taskId, task])));
     else this.sessions.delete(sessionId);
     this.publish();
+  }
+
+  /** Record ended tasks (and later status patches) in the slot's `/tasks` history. */
+  private remember(slot: string, done: WebTask[]): void {
+    const cutoff = this.now() - HISTORY_RETENTION_MS;
+    const history = this.history.get(slot) ?? new Map<string, WebTask>();
+    for (const task of done) history.set(task.taskId, task);
+    const list = [...history.values()].filter((task) => task.endedAt! >= cutoff)
+      .sort((a, b) => b.endedAt! - a.endedAt!).slice(0, MAX_SESSION_HISTORY);
+    if (list.length) this.history.set(slot, new Map(list.map((task) => [task.taskId, task])));
+    else this.history.delete(slot);
   }
 
   /**
@@ -191,6 +251,11 @@ export class TaskBoard {
       const tasks = this.sessions.get(slot);
       for (const id of [...uses.keys()]) if (!tasks?.has(id)) uses.delete(id);
       if (!uses.size) this.toolUses.delete(slot);
+    }
+    for (const [slot, seen] of [...this.activity]) {
+      const tasks = this.sessions.get(slot);
+      for (const id of [...seen.keys()]) if (tasks?.get(id)?.state !== "running") seen.delete(id);
+      if (!seen.size) this.activity.delete(slot);
     }
     for (const [slot, models] of [...this.models]) {
       const tasks = this.sessions.get(slot);

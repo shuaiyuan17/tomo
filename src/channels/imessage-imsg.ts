@@ -10,7 +10,7 @@ import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 import { ChatDbServiceLookup, type ServiceLookup } from "./imsg-satellite.js";
 import { isStickerStagingRefusal, stickerStagingDiagnosis } from "./imsg-sticker-staging.js";
 import { normalizeImessageHandle } from "../sessions/keys.js";
-import { CHAT_COMMAND_NAMES } from "./chat-commands.js";
+import { CHAT_COMMAND_NAMES, parseTasksCommand, TASKS_COMMAND } from "./chat-commands.js";
 import type { ImsgChannelConfig } from "./imsg-channel-config.js";
 import { ImsgAttachmentIntake } from "./imsg-inbound-attachments.js";
 import { DEFAULT_CHAT_DB_PATH, ImsgRpcClient, ImsgRpcResponseError } from "./imsg-rpc.js";
@@ -715,11 +715,13 @@ export class ImsgChannel implements Channel {
     // iMessage has no @mention system — treat all group messages as mentioned.
     const isMentioned = isGroup;
 
-    // Handle slash commands
-    if (text.startsWith("/")) {
+    // Handle slash commands. `/task` / `/tasks` also match in any case, with
+    // surrounding whitespace (the phone may capitalize or pad it).
+    const tasksCommand = parseTasksCommand(text);
+    if (tasksCommand || text.startsWith("/")) {
       const parts = text.slice(1).split(/\s+/);
-      const command = parts[0];
-      const args = parts.slice(1).join(" ");
+      const command = tasksCommand ? TASKS_COMMAND : parts[0];
+      const args = tasksCommand ? tasksCommand.args : parts.slice(1).join(" ");
       if (KNOWN_COMMANDS.has(command)) {
         const senderId = sender ? this.normalizeAddress(sender) : undefined;
         for (const handler of this.commandHandlers) {

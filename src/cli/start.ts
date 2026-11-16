@@ -262,6 +262,8 @@ async function startForeground(): Promise<void> {
       home.attachWeb({ publish: (event) => web.events.publish(event), available: () => supervisor.status().state === "running",
         mayShowTask: (key) => web.mayShowTask(key) });
       agent.addChannel(web);
+      // /tasks in chat reads the same board the Tasks panel shows.
+      agent.setTaskSource(web.tasks);
       web.markRecorded(agent.recordedWebRequests(web.interruptedAwaiting(), WEB_CHAT_ID));
       web.announceInterrupted((items) => agent.noteInterruptedWebRequests(items, WEB_CHAT_ID));
     } catch { log.warn("Web UI unavailable; messaging channels remain active."); }

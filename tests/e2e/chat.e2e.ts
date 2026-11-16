@@ -499,7 +499,7 @@ it("renders channel images as thumbnails (never the path), keeps line breaks, an
   const t = Date.now();
   store.append("dm:owner", { role: "assistant", channel: "telegram", timestamp: t, content: "Picked up the stale #383 and split it into 3 PRs, the first is merged" });
   store.append("dm:owner", { role: "user", channel: "telegram", timestamp: t + 1, content: `[Sent an image, saved to: ${file}] like this\n• one\n• two` });
-  store.append("dm:owner", { role: "user", channel: "imessage", timestamp: t + 2, content: '[replying to: "Picked up the stale #383 and split it into 3 PRs,…"] nice!!' });
+  store.append("dm:owner", { role: "user", channel: "imessage", timestamp: t + 2, content: '[replying to: "Picked up the stale #383 and split it into 3 PRs,…"] nice!!', isReply: true });
   await page.reload();
   const image = page.getByRole("img", { name: "Image" });
   await image.evaluate((el) => el.scrollIntoView());
@@ -902,7 +902,7 @@ it("a reply's quote jumps to the quoted message far up and flashes it; focus sta
   const t = Date.now() - 600_000;
   store.append("dm:owner", { role: "assistant", channel: "imessage", content: "The original note, far up.", timestamp: t });
   for (let i = 1; i < 40; i++) store.append("dm:owner", { role: i % 2 ? "user" : "assistant", channel: "web", content: `Line ${i}\n\nmore text to make it tall`, timestamp: t + i * 1_000 });
-  store.append("dm:owner", { role: "user", channel: "imessage", content: '[replying to: "The original note, far up."] this one', timestamp: t + 50_000 });
+  store.append("dm:owner", { role: "user", channel: "imessage", content: '[replying to: "The original note, far up."] this one', timestamp: t + 50_000, isReply: true });
   await page.reload();
   const original = page.locator("article.message.assistant").filter({ hasText: "The original note, far up." });
   await browserExpect(page.getByText("this one", { exact: true })).toBeVisible();

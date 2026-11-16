@@ -170,7 +170,9 @@ function seedConversation(store: SessionStore): void {
   const image = resolve(dir, "123533_telegram_test-owner_abcd1234.png");
   writeFileSync(image, solidPng(640, 400));
   const day1 = BASE - 26 * 3_600_000;
-  const add = (role: "user" | "assistant", content: string, channel: string, timestamp: number) => store.append("dm:owner", { role, channel, content, timestamp });
+  // A channel marks its replies on the record; the web shows a quote only for those.
+  const add = (role: "user" | "assistant", content: string, channel: string, timestamp: number) =>
+    store.append("dm:owner", { role, channel, content, timestamp, ...(role === "user" && content.startsWith("[replying to") ? { isReply: true as const } : {}) });
   add("user", "Hey, can you look at the transcript migration and tell me if it's safe to ship?", "web", day1);
   add("assistant", "Sure — give me a minute to read through it.", "telegram", day1 + 60_000);
   // A Telegram reaction on it: a pill on the message and one quiet line, not a bubble.

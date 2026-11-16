@@ -1801,6 +1801,7 @@ describe("LiveSession usage ledger rows", () => {
       durationMs: 400,
       durationApiMs: 300,
       numTurns: 1,
+      tools: 0,
       models: {
         "claude-opus": { ...opusAt(1), costBasis: "list" },
         "claude-haiku": haikuAt(1),
@@ -1813,6 +1814,24 @@ describe("LiveSession usage ledger rows", () => {
       },
     });
     expect(JSON.stringify(rows[1])).not.toContain("noBaseline");
+  });
+
+  it("counts the main loop's tool calls since the previous result, and starts again at zero", async () => {
+    const rows: UsageLedgerRow[] = [];
+    const { session, harness } = makeSession({ recordUsage: into(rows) });
+    const p = session.send("turn 1");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent(assistantToolEvent("Bash", "tu-1"));
+    harness.pushEvent(toolResultEvent("tu-1"));
+    harness.pushEvent({ type: "assistant", message: { content: [toolUseBlock("Read", "tu-2"), toolUseBlock("Grep", "tu-3")] } });
+    harness.pushEvent(toolResultEvent("tu-2"));
+    harness.pushEvent(toolResultEvent("tu-3"));
+    // A subagent's own call is not the turn's.
+    harness.pushEvent({ ...assistantToolEvent("Bash", "sub-1"), parent_tool_use_id: "tu-x" });
+    harness.pushEvent({ ...resultEvent(), total_cost_usd: 0.1 });
+    await p;
+    await turn(session, harness, 2, { total_cost_usd: 0.2 });
+    expect(rows.map((row) => row.tools)).toEqual([3, 0]);
   });
 
   it("leaves a model that did nothing this turn out, and the costs per model add up to the turn's", async () => {

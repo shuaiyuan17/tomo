@@ -285,6 +285,8 @@ export class LiveSession {
    * leaves its turn to be counted by the next row.
    */
   private committedUsage: UsageCounters = initialUsageCounters();
+  /** Root tool calls since the last result: the usage row's `tools`. */
+  private toolUsesSinceResult = 0;
   private recordUsage: UsageRecorder | undefined;
   private eventLoopDone: Promise<void>;
   private sessionKey: string | undefined;
@@ -933,6 +935,7 @@ export class LiveSession {
           this.parts.push({ type: "thinking", text: block.thinking });
           await this.shipBlock({ type: "thinking", text: block.thinking });
         } else if (isToolUseBlock(block)) {
+          this.toolUsesSinceResult++;
           if (block.id) this.pendingToolNames.set(block.id, block.name);
           if (block.id && (block.name === "Agent" || block.name === "Task")) {
             const subType = (block.input as { subagent_type?: string } | undefined)?.subagent_type;
@@ -1353,6 +1356,8 @@ export class LiveSession {
    * goes wrong here, the turn goes on.
    */
   private recordResultUsage(result: SdkResultLike): void {
+    const tools = this.toolUsesSinceResult;
+    this.toolUsesSinceResult = 0;
     const record = this.recordUsage;
     const sessionKey = this.sessionKey;
     if (!record || !sessionKey) return;
@@ -1381,6 +1386,7 @@ export class LiveSession {
           ...(result.duration_ms !== undefined ? { durationMs: result.duration_ms } : {}),
           ...(result.duration_api_ms !== undefined ? { durationApiMs: result.duration_api_ms } : {}),
           ...(result.num_turns !== undefined ? { numTurns: result.num_turns } : {}),
+          tools,
           ...(step.noBaseline ? { noBaseline: true as const } : {}),
           ...(step.models ? { models: step.models } : {}),
           ...(step.baseline ? { snapshot: step.baseline } : {}),

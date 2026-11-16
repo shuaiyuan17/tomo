@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from "node:fs";
+import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, writeSync } from "node:fs";
 import { chmod } from "node:fs/promises";
 import { join } from "node:path";
 import { log } from "../logger.js";
@@ -92,6 +92,27 @@ export interface UsageLedgerRow {
    * per-model usage existed.
    */
   models?: Record<string, ModelTurnUsage>;
+  /**
+   * Tool calls the main loop made this turn (root `tool_use` blocks;
+   * subagents' own calls are not counted). Absent on rows written before it
+   * existed.
+   */
+  tools?: number;
+  /**
+   * Rebuilt by `tomo usage backfill` from the activity log, not written when
+   * the result arrived: cost, timings and attribution only — `tokens` are
+   * zeros (the activity log never had them) and there is no `models` or
+   * `snapshot`.
+   */
+  backfilled?: true;
+  /** A backfilled row's id (backfillRowId): what a later backfill merges by. */
+  backfillId?: string;
+  /**
+   * Before the fix of #389 (2026-09-23): a resumed session's first turn was
+   * charged the session's whole history, so `costUsd` is too high. Kept, shown
+   * marked, and left out of every comparison.
+   */
+  overcounted?: true;
   /** The SDK session the result belongs to. */
   sdkSessionId?: string;
   /**
@@ -159,6 +180,21 @@ export class UsageLedger {
   /** sessionKey + sdkSessionId → the snapshot of the last row that landed this process. */
   private readonly landed = new Map<string, UsageBaseline | null>();
 
+  /**
+   * Record, once ever, when the ledger first started (LEDGER_STARTED_FILE).
+   * `tomo usage backfill` rebuilds history only from before it: from then on
+   * every turn is the ledger's, a row that failed to land included (its cost
+   * rides on the next row), so nothing after it may come from elsewhere.
+   * Called at daemon start, before any turn. Never throws.
+   */
+  markStarted(now = Date.now()): void {
+    try {
+      writeLedgerStarted(this.dir, now);
+    } catch (err) {
+      log.warn({ err: err instanceof Error ? err.message : String(err), dir: this.dir }, "Could not record when the usage ledger started");
+    }
+  }
+
   /** Queue a ready row. See appendFor. */
   append(row: UsageLedgerRow, onWritten?: () => void): Promise<void> {
     return this.appendFor(row.sessionKey, () => row, onWritten);
@@ -201,7 +237,7 @@ export class UsageLedger {
         if (landedRow.sdkSessionId) this.landed.set(snapshotKey(landedRow.sessionKey, landedRow.sdkSessionId), landedRow.snapshot ?? null);
         onWritten?.();
       }, { fileMode: LEDGER_FILE_MODE, dirMode: LEDGER_DIR_MODE });
-      await this.secure(path);
+      await this.secureDir();
     } catch (err) {
       this.warn(err, row.sessionKey);
     }
@@ -255,18 +291,14 @@ export class UsageLedger {
 
   /**
    * Creation modes do not touch what already exists: the usage directory is
-   * shared with limits-log and may have been made 0755 before the ledger, and
-   * a month file from an older build may be 0644. Tighten both, once each.
+   * shared with limits-log and may have been made 0755 before the ledger.
+   * Tightened once. (A month file wider than 0600 is tightened by
+   * appendLineSerial, before the row is written.)
    */
-  private secured = new Set<string>();
-  private async secure(path: string): Promise<void> {
+  private async secureDir(): Promise<void> {
     if (!this.dirSecured) {
       await chmod(this.dir, LEDGER_DIR_MODE);
       this.dirSecured = true;
-    }
-    if (!this.secured.has(path)) {
-      await chmod(path, LEDGER_FILE_MODE);
-      this.secured.add(path);
     }
   }
 
@@ -285,7 +317,67 @@ export class UsageLedger {
   }
 }
 
-const LEDGER_FILE_RE = /^\d{4}-\d{2}\.ndjson$/;
+/** `<usage dir>/backfill.ndjson`: history rebuilt by `tomo usage backfill`, replaced whole on each run. */
+export const BACKFILL_FILE = "backfill.ndjson";
+
+/** `<usage dir>/ledger-started.json`: `{ v: 1, startedAt: <ms epoch> }`, written once ever. */
+export const LEDGER_STARTED_FILE = "ledger-started.json";
+
+/**
+ * Write the start marker unless it exists (O_EXCL: the first writer wins,
+ * an existing marker is never moved). A ledger that already has rows — it
+ * ran before the marker existed — is dated by its earliest row instead.
+ * Returns the marker's time.
+ */
+export function writeLedgerStarted(dir: string, now: number): number {
+  const existing = readLedgerStarted(dir);
+  if (existing !== undefined) return existing;
+  let startedAt = now;
+  try {
+    for (const file of readdirSync(dir).filter((f) => LEDGER_FILE_RE.test(f)).sort().slice(0, 1)) {
+      for (const line of readFileSync(join(dir, file), "utf8").split("\n")) {
+        try {
+          const ts = (JSON.parse(line) as { ts?: unknown }).ts;
+          if (typeof ts === "number" && Number.isFinite(ts) && ts < startedAt) startedAt = ts;
+        } catch { /* torn line */ }
+      }
+    }
+  } catch { /* no directory yet */ }
+  mkdirSync(dir, { recursive: true, mode: LEDGER_DIR_MODE });
+  // Whole or absent: written and synced under a temporary name, then linked
+  // into place — link(2) fails if the marker exists, so the first writer wins.
+  const marker = join(dir, LEDGER_STARTED_FILE);
+  const tmp = `${marker}.${process.pid}.tmp`;
+  const fd = openSync(tmp, "w", LEDGER_FILE_MODE);
+  try {
+    writeSync(fd, `${JSON.stringify({ v: 1, startedAt })}\n`);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  try {
+    linkSync(tmp, marker);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+    return readLedgerStarted(dir) ?? startedAt;
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+  return startedAt;
+}
+
+/** When the ledger first started (ms epoch); undefined: never, or the marker is unreadable. */
+export function readLedgerStarted(dir: string): number | undefined {
+  try {
+    const value = (JSON.parse(readFileSync(join(dir, LEDGER_STARTED_FILE), "utf8")) as { startedAt?: unknown }).startedAt;
+    return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A month file of the ledger (`YYYY-MM.ndjson`). */
+export const LEDGER_FILE_RE = /^\d{4}-\d{2}\.ndjson$/;
 
 function snapshotKey(sessionKey: string, sdkSessionId: string): string {
   return `${sessionKey}\u0000${sdkSessionId}`;

@@ -75,7 +75,10 @@ src/
                       #   one row per SDK result from LiveSession, split per model; each row also
                       #   carries the cumulative snapshot a resume reads back as its baseline —
                       #   the registry's copy is only a fallback), limits-log.ts (limits.ndjson);
-                      #   append.ts serializes writes per file
+                      #   append.ts serializes writes per file; ledger-reader.ts + cost-report.ts
+                      #   (GET /api/v1/cost: per-file cache, owner's-zone days via local-time.ts);
+                      #   backfill.ts (`tomo usage backfill`: activity log merged into backfill.ndjson
+                      #   whole under a lock; only before ledger-started.json, written once at start)
   costs.ts, models.ts, litellm.ts        # /cost reports; model aliases; LiteLLM gateway modes
   jsonl.ts, fs-utils.ts, runtime-paths.ts # JSONL readers; atomic writes; SDK session file paths
   file-lock.ts        # withFileLockSync — advisory cross-process lock for the JSON stores

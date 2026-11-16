@@ -18,6 +18,13 @@ import { AgentNameReader } from "../workspace/agent-name.js";
 import { readSubagentBrief, readSubagentModel, readSubagentPage, SubagentReadError } from "./subagent-reader.js";
 import { readSessionTools, SessionToolsError } from "./session-tools.js";
 import { readHomeAsset } from "../home/files.js";
+import { LedgerReader } from "../usage/ledger-reader.js";
+import { buildCostReport, DEFAULT_RANGE_DAYS, MAX_RANGE_DAYS, type SessionLabel } from "../usage/cost-report.js";
+import { addDays, daysBetween, isCalendarDate, localParts, systemTimeZone } from "../usage/local-time.js";
+import { usageDataDir } from "../usage/dir.js";
+import { readLatestLimitSample } from "../usage/limits-log.js";
+import { findPersonByName, loadPeople, personTimeZone } from "../people.js";
+import type { WebCost } from "./protocol.js";
 
 export interface WebDataOptions {
   sessionsDir: string;
@@ -145,6 +152,81 @@ export class WebData {
     if (options.workspaceDir) this.memory = new MemoryReader(options.workspaceDir);
     if (options.tomoHome) this.config = new WebConfigReader(options.tomoHome);
     this.cron = new WebCron(options.cronStorePath);
+  }
+
+  private ledger?: LedgerReader;
+
+  /**
+   * The owner's clock, whose midnights split the Cost page's days: the
+   * owner's people record (public memory only — the web process never reads
+   * memory/private), else this machine's zone. Read per request: a record
+   * edited because he travelled moves the days at once.
+   */
+  ownerTimeZone(): string {
+    const { owner, workspaceDir } = this.options;
+    if (owner && workspaceDir) {
+      try {
+        const people = loadPeople({ includePrivate: false, dirs: { publicDir: join(workspaceDir, "memory", "people"), privateDir: join(workspaceDir, "memory", "private", "people") } });
+        const zone = personTimeZone(findPersonByName(people, owner.name) ?? (owner.displayName ? findPersonByName(people, owner.displayName) : undefined));
+        if (zone) return zone;
+      } catch { /* fall back */ }
+    }
+    return systemTimeZone();
+  }
+
+  /** Fill the ledger cache with the last 13 month files (the default view and its year); never throws. */
+  warmCost(): void {
+    if (!this.options.tomoHome) return;
+    try {
+      this.ledger ??= new LedgerReader(usageDataDir(this.options.tomoHome));
+      this.ledger.rows(this.ledger.files().slice(-13));
+    } catch { /* the first request reads instead */ }
+  }
+
+  /**
+   * The Study Cost page for local dates `from`–`to` (inclusive; default the
+   * last 30 days). Reads the usage ledger through a per-file cache (see
+   * LedgerReader), so a repeat request reads only rows appended since.
+   */
+  cost(query: { from?: string | null; to?: string | null; top?: string | null }, now = Date.now()): WebCost {
+    if (!this.options.tomoHome) throw new WebError(503, "cost_unavailable");
+    const timeZone = this.ownerTimeZone();
+    const today = localParts(now, timeZone).date;
+    const to = query.to ?? today;
+    const from = query.from ?? addDays(to, -(DEFAULT_RANGE_DAYS - 1));
+    if (!isCalendarDate(from) || !isCalendarDate(to)) throw new WebError(400, "invalid_range");
+    const span = daysBetween(from, to) + 1;
+    if (span < 1 || span > MAX_RANGE_DAYS) throw new WebError(400, "invalid_range");
+    let top: number | undefined;
+    if (query.top !== undefined && query.top !== null) {
+      if (!/^\d{1,2}$/.test(query.top)) throw new WebError(400, "invalid_range");
+      top = Number(query.top);
+    }
+    const dir = usageDataDir(this.options.tomoHome);
+    this.ledger ??= new LedgerReader(dir);
+    const catalog = this.catalog();
+    const idByKey = new Map([...catalog.keys].map(([id, key]) => [key, id]));
+    const entries = new Map(SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir).map((e) => [e.channelKey, e]));
+    const owner = this.options.owner;
+    const labels = new Map<string, SessionLabel>();
+    const describeSession = (key: string): SessionLabel => {
+      let label = labels.get(key);
+      if (label) return label;
+      const id = idByKey.get(key);
+      const group = isGroupSessionKey(key);
+      if (id && id === catalog.ownerId) label = { id, label: owner ? `${owner.displayName ?? owner.name} (DM)` : "Owner conversation", kind: "dm" };
+      else if (group) label = { ...(id ? { id } : {}), label: entries.get(key)?.chatTitle || "Group conversation", kind: "group" };
+      else label = { label: entries.get(key)?.chatTitle || "Other conversation", kind: "other" };
+      labels.set(key, label);
+      return label;
+    };
+    const sample = readLatestLimitSample(join(dir, "limits.ndjson"));
+    const limits = sample ? {
+      sampledAt: sample.ts, source: sample.source,
+      windows: sample.windows.map(({ window, label, group, scoped, percent, resetsAt, status }) =>
+        ({ window, label, group, scoped, percent, resetsAt, status })),
+    } : null;
+    return buildCostReport(this.ledger, { from, to, timeZone, now, top, describeSession, limits });
   }
 
   /** What the UI calls the agent (re-read per call; IDENTITY.md is cached by mtime). */

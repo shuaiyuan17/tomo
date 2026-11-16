@@ -16,6 +16,7 @@ import { uninstallCommand } from "./cli/uninstall.js";
 import { backupCommand } from "./cli/backup.js";
 import { updateCommand } from "./cli/update.js";
 import { watchCommand } from "./cli/watch.js";
+import { usageCommand } from "./cli/usage.js";
 
 // Read version at runtime from package.json (works in dev via tsx and after
 // build under dist/) so it can't drift from package.json on release bumps.
@@ -44,5 +45,6 @@ program.addCommand(lcmCommand);
 program.addCommand(uninstallCommand);
 program.addCommand(backupCommand);
 program.addCommand(updateCommand);
+program.addCommand(usageCommand);
 
 program.parse();

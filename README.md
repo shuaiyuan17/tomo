@@ -67,6 +67,7 @@ tomo cron              # Manage scheduled tasks (add / list / remove / run <id>)
 tomo continuity        # Manually trigger a continuity heartbeat
 tomo lcm               # Context tools (stats / blocks / compact / search / prune-tools / rollups)
 tomo backup            # Back up all Tomo data (create / list / restore <date>)
+tomo usage backfill    # One-off: rebuild the usage ledger's history from the activity log (--dry-run first)
 tomo migrate           # Import conversation history from other platforms (openclaw <file>)
 tomo update            # Update Tomo to the latest version and restart
 tomo uninstall         # Stop Tomo and remove the login item (keeps your data)
@@ -294,6 +295,7 @@ Structured logs via [pino](https://github.com/pinojs/pino):
     pet.json                  # Virtual pet state
     summons.json              # Active group summons
     usage/YYYY-MM.ndjson      # Usage ledger: estimated cost and tokens per turn, per model
+    usage/backfill.ndjson     # History from before the ledger started (`tomo usage backfill`, merged, never shrinks)
   logs/
     tomo.log                  # Daemon logs
 ```

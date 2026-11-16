@@ -1,4 +1,6 @@
-import { WEB_REPLY_TEXT_LIMIT, type HistoryMessage, type WebReaction, type WebRequest } from "../../src/web/protocol.js";
+import type { HistoryMessage, WebReaction, WebRequest } from "../../src/web/protocol.js";
+// Not from protocol.ts: a value import from there would bring zod (and its eval probe) into the page.
+import { WEB_REPLY_TEXT_LIMIT } from "../../src/web/reply-limits.js";
 import { findQuoted, parseReply, quotableText, type ReplyContext } from "./reply.js";
 
 /**

@@ -6,6 +6,7 @@ import type { HomeStatus } from "../home/status.js";
 import type { ContextSection } from "../lcm/stats.js";
 import type { SummaryBlock } from "../lcm/summary-reader.js";
 import type { MessageReaction } from "../channels/types.js";
+import { WEB_REPLY_TEXT_LIMIT } from "./reply-limits.js";
 
 export const WEB_CHAT_ID = "owner";
 // JSON can escape one UTF-16 code unit as six bytes (e.g. a lone surrogate).
@@ -16,8 +17,7 @@ export const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
 /** The tapbacks a web message can carry: the channels' own MessageReaction set (iMessage tapback kinds, Telegram emoji). */
 export const WEB_REACTIONS = ["love", "like", "dislike", "laugh", "emphasize", "question"] as const satisfies readonly MessageReaction[];
 export type WebReaction = (typeof WEB_REACTIONS)[number];
-/** Longest quoted text a web reply or reaction carries (the agent sees a 60-code-point excerpt of it, as on iMessage). */
-export const WEB_REPLY_TEXT_LIMIT = 2_000;
+export { WEB_REPLY_TEXT_LIMIT } from "./reply-limits.js";
 /**
  * The earlier message a web message answers, as the iMessage channel sees a
  * long-press Reply or a tapback: its text, quoted to the agent by the same

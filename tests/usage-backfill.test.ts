@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { execFile, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -126,6 +126,19 @@ describe("backfillUsage", () => {
     expect(readFileSync(path, "utf8")).toBe(first);
     // No month file, temp or lock left.
     expect(listing()).toEqual([BACKFILL_FILE, LEDGER_STARTED_FILE]);
+  });
+
+  it("tightens a wider file and directory on a run that adds nothing", () => {
+    startedLate();
+    run();
+    const path = join(usage, BACKFILL_FILE);
+    const bytes = readFileSync(path, "utf8");
+    chmodSync(path, 0o644);
+    chmodSync(usage, 0o755);
+    expect(run()).toMatchObject({ added: 0, total: 5 });
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(statSync(usage).mode & 0o777).toBe(0o700);
+    expect(readFileSync(path, "utf8")).toBe(bytes);
   });
 
   it("merges: after the log rotates, history already backfilled stays and new turns are added", () => {

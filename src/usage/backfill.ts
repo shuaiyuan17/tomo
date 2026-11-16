@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { isGroupSessionKey } from "../sessions/keys.js";
@@ -262,6 +262,11 @@ export function acquireBackfillLock(usageDir: string): () => void {
   }
 }
 
+/** chmod `path` to `mode` when its permissions are wider. */
+function tighten(path: string, mode: number): void {
+  if ((statSync(path).mode & 0o777 & ~mode) !== 0) chmodSync(path, mode);
+}
+
 /** Replace `path` with `text` whole: temp file, fsync, rename, fsync the directory. */
 function replaceFile(path: string, text: string): void {
   const tmp = `${path}.${process.pid}.tmp`;
@@ -357,7 +362,13 @@ export function backfillUsage(options: BackfillOptions): BackfillReport {
       if (row.overcounted) overcounted.add(date);
       costUsd += typeof row.costUsd === "number" ? row.costUsd : 0;
     }
-    if (!options.dryRun && (added > 0 || !existsSync(target))) replaceFile(target, merged.map((m) => `${m.line}\n`).join(""));
+    if (!options.dryRun) {
+      if (added > 0 || !existsSync(target)) replaceFile(target, merged.map((m) => `${m.line}\n`).join(""));
+      // Every run, new rows or not: a file or directory left wider (an older
+      // build, a restore, by hand) is tightened.
+      tighten(options.usageDir, LEDGER_DIR_MODE);
+      tighten(target, LEDGER_FILE_MODE);
+    }
 
     const sorted = [...days].sort();
     return {

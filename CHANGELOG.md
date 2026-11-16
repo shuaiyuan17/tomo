@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.14.0 (2026-11-16)
+
+### Features
+
+- **Durable inbox** (#481): messages waiting behind a turn are written to disk before the channel is acknowledged, so a crash or restart no longer loses them; the next start answers them. **On by default**; turn off with `inbox: false`. Messages older than `inboxReplayMaxAgeMinutes` (default 360) are not answered late.
+- **Interrupted subagents** (#544): after a restart or crash, each session is told which of its subagents and background commands were cut off. Nothing is resumed automatically. **On by default**; turn off with `interruptedAgents: false`.
+- **Cost page in the Study** (#545, #546, #547, #548, #551): a usage ledger split by model and a calendar of spend by day, hour and source. `tomo usage backfill` fills in past days.
+- **Home** (#524, #531, #536): a low-poly 3D room the agent designs and the web UI draws, with live status. With `city` set, weather is fetched from wttr.in while the page is open.
+- **`/tasks`** (#549): lists the chat's running and recent tasks without a model call.
+- **Task controls** (#526): stop one task or move it to the background. **Behaviour change:** with the web UI on, Stop on a turn no longer kills the owner session's background agents.
+- **Web chat** (#515, #516, #517, #521, #540, #552): turn status, a Stop button, a model picker, read receipts, replies and reactions, any-file attachments, and a phone drawer. Telegram reactions now reach the agent as tapbacks.
+
+### Bug fixes
+
+- Web: long conversations stay fast and first load ships 180 kB of JS instead of 763 kB (#528).
+- Web: a visual and accessibility pass (#527); recovery after iOS suspends or discards the tab (#520, #530); scrolling and layout fixes (#518, #519, #522, #523, #532, #541, #550).
+- A subagent's model badge shows the model it ran on (#537); the owner's own DM shows tool outputs whole, and Bash globs like `*.md` are no longer misjudged as private (#539).
+- An error-shaped response no longer clears pending notes for the next turn (#544).
+
+### Security
+
+- `@file` mentions are disabled in agent sessions, and the private-memory and agent-profile guards fail closed (#542).
+- Group sessions no longer load claude.ai connectors (#543).
+- The SDK's own auto memory is off; Tomo's memory is the only one (#538).
+
+### Other
+
+- `npm run web:gallery` screenshots every UI surface and state for review (#529).
+
+### Dependencies
+
+- `@anthropic-ai/claude-agent-sdk` stays at 0.3.325. New web build deps: `three` 0.187.0, `@shadcn/react` 0.3.1.
+- `zod` stays pinned at 4.4.3 (#359), so `npm audit` reports GHSA-mrhx-c7xc-m3w5 (fixed in 4.6.6).
+- Minor bumps: `vite` 8.3.8, `@playwright/test` 1.65.0, `typescript-eslint` 8.73.0; transitive refresh.
+
 ## 0.13.0 (2026-11-14)
 
 ### Behaviour changes

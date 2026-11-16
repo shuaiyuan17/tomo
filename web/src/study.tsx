@@ -66,7 +66,7 @@ export function Study({ page, onPage, session, reload, inert, mutator, focus, cr
       <Button variant="ghost" size="icon" className="size-9 shrink-0 rounded-xl text-muted-foreground hover:bg-foreground/[0.07]" aria-label="Refresh" title="Refresh" onClick={() => setLocal((v) => v + 1)}><RefreshCw strokeWidth={1.75} /></Button>
     </div>
     <Tabs value={page} onValueChange={(value) => onPage(value as StudyPage)} className="min-h-0 flex-1 gap-0">
-      <TabsList aria-label="Study sections" className="h-auto w-full justify-start gap-1 overflow-x-auto rounded-none border-b bg-transparent p-0 [scrollbar-width:none] max-[800px]:pr-8 max-[800px]:[mask-image:linear-gradient(to_right,#000_calc(100%-2.5rem),transparent)]">
+      <TabsList aria-label="Study sections" className="h-auto w-full justify-start gap-1 overflow-x-auto overflow-y-hidden overscroll-x-contain touch-pan-x rounded-none border-b bg-transparent p-0 [scrollbar-width:none] max-[800px]:pr-8 max-[800px]:[mask-image:linear-gradient(to_right,#000_calc(100%-2.5rem),transparent)]">
         {STUDY_PAGES.map((value) => <TabsTrigger key={value} value={value}
           className="-mb-px h-10 flex-none rounded-none border-0 border-b-2 border-transparent bg-transparent! px-3 text-[13px] font-medium text-muted-foreground shadow-none! hover:text-foreground data-[state=active]:border-primary data-[state=active]:text-foreground dark:data-[state=active]:border-primary">{STUDY_LABELS[value]}</TabsTrigger>)}
       </TabsList>

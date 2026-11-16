@@ -100,6 +100,15 @@ export function seedCostLedger(tomoHome: string, options: CostFixtureOptions = {
     }
     add(3, { sessionKey: "dm:owner", source: "system", costUsd: between(0.3, 0.9), durationMs: 20_000, numTurns: 2, tools: 1 });
   }
+  // Just after midnight today has nothing yet; a page that opens on today still needs a few turns to show.
+  const todayStart = midnight.getTime();
+  if (rows.filter((r) => r.ts >= todayStart).length < 4) {
+    for (let k = 1; k <= 4; k++) {
+      const ts = todayStart + Math.floor(((now - todayStart) * k) / 5);
+      rows.push({ v: 1, ts, sessionKey: "dm:owner", source: "owner", trigger: pick(OWNER_TRIGGERS), costUsd: Math.round(between(0.4, 3) * 10_000) / 10_000,
+        tokens: { input: 900, output: 4_000, cacheRead: 220_000, cacheCreated: 9_000 }, durationMs: Math.round(between(6_000, 45_000)), numTurns: 3, tools: Math.round(between(0, 8)) });
+    }
+  }
   rows.sort((a, b) => a.ts - b.ts);
   const dir = usageDataDir(tomoHome);
   mkdirSync(dir, { recursive: true });

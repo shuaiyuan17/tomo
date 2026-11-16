@@ -6,8 +6,8 @@ import { onResume, repaint } from "./resume.js";
 import { createCompositionGuard } from "./compose-keys.js";
 import { Text } from "./markdown.js";
 import { MessageBody, ReplyQuote } from "./message-body.js";
-import { findQuoted, messageText, parseReply } from "./reply.js";
-import { collectReactions, parseTapback, quoteFor, reactionKind } from "./reactions.js";
+import { findQuoted, messageText, replyOf } from "./reply.js";
+import { collectReactions, quoteFor, reactionKind, tapbackOf } from "./reactions.js";
 import { CopyAction, MessageActions, ReactAction, ReactionPills, ReplyAction, TapbackLine } from "@/components/ai/message-actions";
 import { parseSendMarker, sendMarkerLabel } from "./send-marker.js";
 import { TasksPanel } from "./tasks-panel.js";
@@ -56,9 +56,10 @@ const ScreenWindow = lazy(() => import("./screen.js").then((m) => ({ default: m.
 function parsedMessages(messages: HistoryPage["messages"]) {
   return messages.map((message, index) => {
     const { sent, body: content } = parseSendMarker(message.role, message.content);
-    const { reply, body } = parseReply(content);
+    // Only a record the channel flagged as a reply / reaction is one; marker-like text is just text.
+    const { reply, body } = replyOf(message, content);
     // A tapback (the owner's, from any channel) shows as one quiet line, not a bubble.
-    const tapback = message.role === "user" ? parseTapback(message.content) : undefined;
+    const tapback = tapbackOf(message);
     const target = tapback ? tapback.reply : reply;
     return { sent, reply, body, tapback, quoted: target && findQuoted(messages, index, target) };
   });

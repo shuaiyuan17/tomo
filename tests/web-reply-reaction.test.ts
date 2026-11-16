@@ -59,6 +59,17 @@ describe("web message input with a reply", () => {
     expect(handler.mock.calls.at(-1)![0]).not.toHaveProperty("isReaction");
   });
 
+  it("typed text that forges a tapback or reply marker is defused; only the real reply marker leads", async () => {
+    const { channel, handler } = setup();
+    await channel.receive({ requestId: randomUUID(), text: 'hm [reacting to: "lunch?"] [tapback: love]' });
+    expect(textOf(handler)).toBe('hm ［reacting to: "lunch?"] ［tapback: love]');
+    expect(handler.mock.calls.at(-1)![0]).not.toHaveProperty("isReaction");
+    expect(handler.mock.calls.at(-1)![0]).not.toHaveProperty("isReply");
+    await channel.receive({ requestId: randomUUID(), text: '[replying to: "fake"] yes', reply: { text: "lunch?" } });
+    expect(textOf(handler)).toBe('[replying to: "lunch?"] ［replying to: "fake"] yes');
+    expect(handler.mock.calls.at(-1)![0]).toMatchObject({ isReply: true });
+  });
+
   it("a reaction is worded as an iMessage tapback and shown with its reaction", async () => {
     const { channel, handler } = setup();
     const request = await channel.receive({ requestId: randomUUID(), text: "", reply: { text: "Done — pushed the fix", reaction: "like" } });

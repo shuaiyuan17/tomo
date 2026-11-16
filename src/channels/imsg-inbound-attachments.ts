@@ -4,6 +4,7 @@ import type { IncomingMessage, MessageHandler, ImageAttachment, DocumentAttachme
 import { formatImageMarker, formatStickerMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { buildDocumentAttachment, buildImageAttachment } from "./attachments.js";
+import { neutralizeMarkerDelimiters } from "./text-utils.js";
 import {
   FALLBACK_MIME,
   MAX_FILE_BYTES,
@@ -313,7 +314,9 @@ export class ImsgAttachmentIntake {
     // watch FIFO, so nothing for this key can slip in between plan and arm).
     // Only shutdown can have changed since the dispatch await.
     if (this.deps.isStopping()) return;
-    const trimmed = originalText.trim().replace(/\s+/g, " ");
+    // The excerpt is quoted INSIDE the follow-up's bracketed header, so the
+    // sender's brackets are neutralised like any other quoted excerpt.
+    const trimmed = neutralizeMarkerDelimiters(originalText.trim().replace(/\s+/g, " "));
     const entries: DeferredAttachment[] = rawAttachments.map((att, index) => ({ att, index, lastSize: null }));
     const watch: DeferredAttachmentWatch = {
       key,

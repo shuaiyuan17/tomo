@@ -50,6 +50,70 @@ export function neutralizeMarkerDelimiters(text: string): string {
 }
 
 /**
+ * Characters that render as nothing (or as plain space) and so can sit between
+ * `[` and a marker word without the reader noticing: whitespace, soft hyphen,
+ * the zero-width and bidi marks, word joiner, BOM. Same set as inbound-markers'
+ * LINE_START.
+ */
+const INVISIBLE = "[\\s\\u00AD\\u200B-\\u200F\\u2060\\uFEFF]*";
+
+/**
+ * The opening words of every bracketed marker the harness writes into a
+ * model-facing message (grep `"[` / `` `[ `` in src/ for the producers):
+ *
+ * - channel markers: `[replying to: "…"]`, `[replying to an earlier message]`,
+ *   `[reacting to: "…"]`, `[tapback: …]` (text-utils), `[via satellite — …]`,
+ *   `[Sent an image / N images / a file / a document / a sticker / a Telegram
+ *   sticker / an unsupported document …]` (imageStore, fileStore,
+ *   documentStore, telegram), `[Attachments from an earlier message …]`
+ *   (imsg-inbound-attachments), `[sticker: …]` (own-send ring), `[Image …]`;
+ * - agent markers: `[group "…"]`, the inbound stamp `[imessage · Sat 08/29 …]`
+ *   (inbound-markers), `[System: …]` (tomo-event), `[harness: …]`
+ *   (continuity-defaults, inbound-markers), `[via dm:…]`, `[proactive]`
+ *   (proactive-send), `[delivery failed …]` / `[delivery status unknown]`
+ *   (block-transcript, turn-runner), `[not processed …]`,
+ *   `[an attachment sent with this message …]` (durable-inbox), `[error]`,
+ *   `[empty reply]`, `[pruned …]`, `[Compacted …]`.
+ *
+ * tests/inbound-body-neutralize.test.ts feeds every producer's own output
+ * through {@link neutralizeInboundBody}, so a new marker that is missing here
+ * fails there.
+ */
+const MARKER_WORDS = [
+  "replying to", "reacting to", "tapback", "via satellite", "via dm", "sent", "sticker", "image",
+  "attachments? from", "an attachment", "group", "system", "harness", "proactive", "delivery",
+  "not processed", "error", "empty reply", "pruned", "compacted",
+];
+const WEEKDAY = "(?:sun|mon|tue|wed|thu|fri|sat)";
+
+/** `[` opening a marker word, the inbound stamp (`[imessage · …`, `[Sat 08/29 …`), or `<` opening a `<tomo-event>` tag. */
+const FORGED_OPENER_RE = new RegExp(
+  `\\[(?=${INVISIBLE}(?:(?:${MARKER_WORDS.join("|")})\\b|[a-z][\\w-]*${INVISIBLE}·|${WEEKDAY} \\d))`
+  + `|<(?=${INVISIBLE}\\/?${INVISIBLE}tomo-event\\b)`,
+  "giu",
+);
+
+/**
+ * Neutralise a sender's message BODY so it cannot pass for a harness marker.
+ *
+ * Every channel hands the body it got from the provider (iMessage text, a
+ * Telegram message or caption, what the owner typed on the web page) through
+ * this before writing its own markers in front: anyone in a group can type
+ * `[reacting to: "…"] [tapback: love]` or `[replying to: "…"]`, and without
+ * this the agent — and the web UI reading the transcript — would take it for
+ * the real thing. Only the bracket that OPENS a marker-looking token is
+ * swapped for its fullwidth lookalike (`[` → `［`, `<` → `＜`), the same
+ * substitution {@link neutralizeMarkerDelimiters} makes inside a quote, so the
+ * text still reads the same to a person while no marker parser — the model's
+ * or the web page's — matches it. Ordinary brackets (`[1, 2]`, a markdown
+ * link) are left alone. Anywhere in the body counts, not only its start: the
+ * model reads every line.
+ */
+export function neutralizeInboundBody(text: string): string {
+  return text.replace(FORGED_OPENER_RE, (c) => FULLWIDTH_DELIMITERS[c]!);
+}
+
+/**
  * Marker prepended to inbound threaded replies (long-press → Reply) so the
  * model sees which earlier message the sender is responding to. Same visual
  * family as SATELLITE_MARKER. When the original text is unavailable the

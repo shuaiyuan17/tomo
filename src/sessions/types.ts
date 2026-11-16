@@ -8,6 +8,15 @@ export interface SessionMessage {
   channel: string;
   senderName?: string;
   timestamp: number;
+  /**
+   * An inbound reaction (IncomingMessage.isReaction): its content is the
+   * channel's `[reacting to: "…"] [tapback: …]` marker. The web UI shows a
+   * tapback only for a record carrying this — text that merely reads like one
+   * (typed by a sender, or in a transcript older than the field) stays text.
+   */
+  isReaction?: true;
+  /** An inbound threaded reply (IncomingMessage.isReply), led by `[replying to: …]`. Same rule as `isReaction`. */
+  isReply?: true;
   /** Monotonic sequence number within this transcript */
   seq?: number;
   /** UUID of the corresponding SDK session event */

@@ -13,7 +13,7 @@ import {
 } from "./attachments.js";
 import { log } from "../logger.js";
 import { scrubSecretValues } from "../redact.js";
-import { formatReactionMarker, splitText } from "./text-utils.js";
+import { formatReactionMarker, neutralizeInboundBody, splitText } from "./text-utils.js";
 import { formatMimeToken, sanitizeAttachmentFilename } from "./fileStore.js";
 import { CHAT_COMMANDS, CHAT_COMMAND_NAMES, parseTasksCommand, TASKS_COMMAND } from "./chat-commands.js";
 
@@ -211,7 +211,7 @@ export class TelegramChannel implements Channel {
         chatId: String(ctx.chat.id),
         senderName: this.getSenderName(ctx),
         senderId: this.getSenderId(ctx),
-        text: this.cleanMention(ctx.message.text),
+        text: this.inboundBody(ctx.message.text),
         timestamp: ctx.message.date * 1000,
         isGroup,
         isMentioned,
@@ -233,7 +233,7 @@ export class TelegramChannel implements Channel {
         ? await this.downloadPhoto(largest.file_id, String(ctx.chat.id))
         : undefined;
 
-      const caption = this.cleanMention(ctx.message.caption ?? "");
+      const caption = this.inboundBody(ctx.message.caption ?? "");
       const savedPaths = image?.savedPath ? [image.savedPath] : [];
       const marker = formatImageMarker(1, savedPaths);
       const text = caption ? `${marker} ${caption}` : marker;
@@ -264,7 +264,7 @@ export class TelegramChannel implements Channel {
       // text message so the agent can still see "user sent some unsupported
       // file" rather than the message disappearing entirely.
       if (!isSupportedDocumentMime(doc.mime_type)) {
-        const caption = this.cleanMention(ctx.message.caption ?? "");
+        const caption = this.inboundBody(ctx.message.caption ?? "");
         const note = formatUnsupportedDocumentNotice(doc.file_name, doc.mime_type);
         this.dispatch({
           id: String(ctx.message.message_id),
@@ -292,7 +292,7 @@ export class TelegramChannel implements Channel {
         )
         : undefined;
 
-      const caption = this.cleanMention(ctx.message.caption ?? "");
+      const caption = this.inboundBody(ctx.message.caption ?? "");
       const savedPaths = document?.savedPath ? [document.savedPath] : [];
       const marker = formatDocumentMarker(1, savedPaths);
       const text = caption ? `${marker} ${caption}` : marker;
@@ -440,6 +440,16 @@ export class TelegramChannel implements Channel {
   /** Strip @botname from the message text */
   private cleanMention(text: string): string {
     return cleanMention(text, this.botUsername);
+  }
+
+  /**
+   * A message's text or caption as the agent gets it: @botname stripped, and
+   * neutralised so a typed `[reacting to: …] [tapback: …]` or
+   * `[Sent an image …]` cannot pass for a marker this channel writes. Our own
+   * markers are added in front of the result, never run through it.
+   */
+  private inboundBody(text: string): string {
+    return neutralizeInboundBody(this.cleanMention(text));
   }
 
   /** Error detail safe to log — file-download URLs embed the bot token. */

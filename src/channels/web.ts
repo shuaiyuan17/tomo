@@ -25,7 +25,7 @@ import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request
 import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
 import type { WebHome, WebModelChangeResult, WebModelView } from "../web/protocol.js";
 import { modelLabel } from "../models.js";
-import { formatReactionMarker, formatReplyContextMarker } from "./text-utils.js";
+import { formatReactionMarker, formatReplyContextMarker, neutralizeInboundBody } from "./text-utils.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WEB_REACTIONS, WEB_REQUEST_QUOTE_LIMIT, WebError, type WebReaction, type WebReply, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type TaskAction, type WebStopResult, type WebTaskActionResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess, type WebFiledFile } from "../web/protocol.js";
 
 /** A running tool's progress reaches the browser at most this often; the page counts in between. */
@@ -308,9 +308,12 @@ export class WebChannel implements Channel {
     // quoted text is the FULL original the page sent, not the kept copy.
     const marker = input.reply?.reaction ? formatReactionMarker(input.reply.reaction, input.reply.text)
       : [input.reply ? formatReplyContextMarker(input.reply.text) : "", images ? formatImageMarker(images.list.length, filed, images.unconverted) : "", formatFileMarker(notices)].filter(Boolean).join(" ");
+    // What was typed is neutralised before our markers go in front: typed text
+    // cannot pass for a reply, a tapback or an attachment marker.
+    const body = neutralizeMarker(neutralizeInboundBody(input.text));
     const message: IncomingMessage = { id: input.requestId, chatId: WEB_CHAT_ID, senderName: "Owner",
-      text: marker ? (input.text ? `${marker} ${neutralizeMarker(input.text)}` : marker) : neutralizeMarker(input.text), timestamp: Date.now(), isGroup: false,
-      ...(input.reply?.reaction ? { isReaction: true } : {}),
+      text: marker ? (body ? `${marker} ${body}` : marker) : body, timestamp: Date.now(), isGroup: false,
+      ...(input.reply?.reaction ? { isReaction: true } : input.reply ? { isReply: true } : {}),
       ...(images ? { images: images.list } : {}) };
     const handoff = Promise.resolve().then(() => this.handler!(message));
     this.handoffs.add(handoff);

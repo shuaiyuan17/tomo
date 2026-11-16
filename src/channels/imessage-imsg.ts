@@ -5,7 +5,7 @@ import type { AdmissionPredicate, Channel, IncomingMessage, OutgoingMessage, Sen
 import { AttachmentUnreadableError, PartialSendError, markNothingSent, markPartsSent } from "./types.js";
 import { formatFileMarker } from "./fileStore.js";
 import { log } from "../logger.js";
-import { splitText, formatReactionMarker, formatReplyContextMarker, isSatelliteService, SATELLITE_MARKER } from "./text-utils.js";
+import { splitText, formatReactionMarker, formatReplyContextMarker, isSatelliteService, neutralizeInboundBody, SATELLITE_MARKER } from "./text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 import { ChatDbServiceLookup, type ServiceLookup } from "./imsg-satellite.js";
 import { isStickerStagingRefusal, stickerStagingDiagnosis } from "./imsg-sticker-staging.js";
@@ -816,8 +816,12 @@ export class ImsgChannel implements Channel {
       : "";
 
     const markers = [satelliteMarker, replyMarker, stickerMarker, imageMarker, docMarker, fileMarker].filter(Boolean).join(" ");
-    const composedText = text
-      ? (markers ? `${markers} ${text}` : text)
+    // The body is the sender's: neutralised first so a typed "[replying to: …]"
+    // or "[tapback: love]" cannot pass for one of ours, and only then do our
+    // real markers go in front.
+    const body = neutralizeInboundBody(text);
+    const composedText = body
+      ? (markers ? `${markers} ${body}` : body)
       : markers;
 
     // Ghost, poll, and system rows can arrive with no text or usable
@@ -845,6 +849,7 @@ export class ImsgChannel implements Channel {
       // as "+1 (415) 555-1234" or "+14155551234" across restarts.
       senderId: sender ? this.normalizeAddress(sender) : undefined,
       text: composedText,
+      ...(replyMarker ? { isReply: true } : {}),
       images: images.length > 0 ? images : undefined,
       documents: documents.length > 0 ? documents : undefined,
       timestamp: timestampMs,

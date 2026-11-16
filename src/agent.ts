@@ -1535,6 +1535,7 @@ export class Agent {
       ...(channel.name === "web" ? { requestId: message.id } : {}),
       senderName: message.senderName,
       timestamp: message.timestamp,
+      ...inboundKind(message),
     });
 
     const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
@@ -1682,6 +1683,7 @@ export class Agent {
         channel: channel.name,
         senderName: message.senderName,
         timestamp: message.timestamp,
+        ...inboundKind(message),
       });
     }
 
@@ -2744,6 +2746,7 @@ export class Agent {
           ...(channel.name === "web" ? { requestId: message.id } : {}),
           senderName: message.senderName,
           timestamp: message.timestamp,
+          ...inboundKind(message),
         });
         this.sessions.append(key, {
           role: "assistant",
@@ -2941,6 +2944,15 @@ export class InboxPersistError extends Error {
     super(`Durable inbox could not persist ${channelName} message ${messageId}; not taking custody so the channel redelivers it`);
     this.name = "InboxPersistError";
   }
+}
+
+/**
+ * The structured kind of an inbound message, for its transcript record. The
+ * web UI renders a reply quote or a tapback from these fields only, never from
+ * text that reads like one (see SessionMessage.isReaction).
+ */
+function inboundKind(message: Pick<IncomingMessage, "isReaction" | "isReply">): { isReaction?: true; isReply?: true } {
+  return message.isReaction ? { isReaction: true } : message.isReply ? { isReply: true } : {};
 }
 
 function inboxIdsOf(items: ReadonlyArray<{ inboxId?: string }>): string[] {

@@ -62,9 +62,9 @@ describe("collectReactions", () => {
   const history = [
     msg("1", "user", "ship it?", { requestId: "r1" }),
     msg("2", "assistant", "Shipped. Tests are green."),
-    msg("3", "user", formatReactionMarker("like", "Shipped. Tests are green.")),
+    msg("3", "user", formatReactionMarker("like", "Shipped. Tests are green."), { isReaction: true }),
     msg("4", "assistant", "NO_REPLY"),
-    msg("5", "user", formatReactionMarker("love", "Shipped. Tests are green.")),
+    msg("5", "user", formatReactionMarker("love", "Shipped. Tests are green."), { isReaction: true }),
   ];
   it("one reaction per sender per message, the latest winning; Tomo's come from the daemon by request id", () => {
     const shown = collectReactions(history, [], { r1: "laugh", gone: "love" }, false);

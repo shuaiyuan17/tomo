@@ -1,12 +1,13 @@
 import type { HistoryMessage, WebReaction, WebRequest } from "../../src/web/protocol.js";
 // Not from protocol.ts: a value import from there would bring zod (and its eval probe) into the page.
 import { WEB_REPLY_TEXT_LIMIT } from "../../src/web/reply-limits.js";
-import { findQuoted, parseReply, quotableText, type ReplyContext } from "./reply.js";
+import { findQuoted, parseReply, quotableText, type MessageKind, type ReplyContext } from "./reply.js";
 
 /**
  * Tapbacks in the chat. The owner's reactions (from this page, or an iMessage
  * tapback) are recorded in the transcript as the iMessage channel words them
- * (src/channels/text-utils.ts formatReactionMarker):
+ * (src/channels/text-utils.ts formatReactionMarker), on a record flagged
+ * `isReaction` — the flag, not the wording, is what makes it one:
  *   [reacting to: "<excerpt>"] [tapback: <reaction>]
  *   [tapback: <reaction> on an earlier message]
  * Tomo's own reactions on web messages are not in the transcript: the daemon
@@ -50,6 +51,15 @@ export function parseTapback(content: string): { reaction: ReactionKind; reply?:
   return match ? { reaction: reactionKind(match[1]) } : undefined;
 }
 
+/**
+ * The tapback a transcript message records, or undefined. Only a message the
+ * channel recorded as a reaction (`isReaction`) counts: anyone can type
+ * `[reacting to: "…"] [tapback: love]`, and that must stay text, not a ❤.
+ */
+export function tapbackOf(message: MessageKind & { content: string }): ReturnType<typeof parseTapback> {
+  return message.role === "user" && message.isReaction ? parseTapback(message.content) : undefined;
+}
+
 export type ReactionFrom = "you" | "agent" | "participant";
 export interface ShownReaction { from: ReactionFrom; reaction: ReactionKind; pending?: boolean }
 
@@ -70,8 +80,7 @@ export function collectReactions(messages: readonly HistoryMessage[], pending: r
   const owner = new Map<string, ShownReaction>();
   const list = messages as HistoryMessage[];
   list.forEach((message, index) => {
-    if (message.role !== "user") return;
-    const tapback = parseTapback(message.content);
+    const tapback = tapbackOf(message);
     const target = tapback?.reply && findQuoted(list, index, tapback.reply);
     if (target) owner.set(target.id, { from: group ? "participant" : "you", reaction: tapback.reaction });
   });

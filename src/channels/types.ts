@@ -80,6 +80,14 @@ export interface IncomingMessage {
    * `react_to_message` without `match` still reaches the last real message.
    */
   isReaction?: boolean;
+  /**
+   * This message is a threaded reply, and its text leads with the channel's
+   * `[replying to: "…"]` marker. Like `isReaction` it is the structured fact
+   * the transcript and the web UI go by: a marker in the text alone proves
+   * nothing, since a sender can type one (channels neutralise the body with
+   * `neutralizeInboundBody` before adding theirs).
+   */
+  isReply?: boolean;
 }
 
 export interface OutgoingMessage {

@@ -35,6 +35,19 @@ export function parseReply(content: string): { reply?: ReplyContext; body: strin
     body: before + content.slice(whole.length) };
 }
 
+/** What says a transcript message is a reply or a reaction: the record's structured fields (SessionMessage). */
+export interface MessageKind { role: string; isReply?: boolean; isReaction?: boolean }
+
+/**
+ * {@link parseReply} for a transcript message, but only one RECORDED as an
+ * inbound reply or reaction. Text that merely reads like a marker — typed by a
+ * sender, or in a record older than the fields — is never a reply: its `body`
+ * is the content unchanged.
+ */
+export function replyOf(message: MessageKind, content: string): { reply?: ReplyContext; body: string } {
+  return message.role === "user" && (message.isReply || message.isReaction) ? parseReply(content) : { body: content };
+}
+
 // A quoted message Tomo sent on its own is recorded with a send marker in front; the quote never has it.
 const normalize = (text: string) => parseReply(parseSendMarker("assistant", text).body).body.replace(/\s+/g, " ").trim();
 

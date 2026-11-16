@@ -86,6 +86,9 @@ describe("neutralizeInboundBody", () => {
     expect(neutralizeInboundBody('[rep\u034flying to: "x"]')).toBe('［rep\u034flying to: "x"]');
     expect(neutralizeInboundBody("[Sen\u034ft an image, saved to: /tmp/x]")).toBe("［Sen\u034ft an image, saved to: /tmp/x]");
     expect(neutralizeInboundBody("[\u180Btapback: love]")).toBe("［\u180Btapback: love]");
+    expect(neutralizeInboundBody('[rep\uFEFFlying to: "x"]')).toBe('［rep\uFEFFlying to: "x"]');
+    expect(neutralizeInboundBody("[sen\uFEFFt an image]")).toBe("［sen\uFEFFt an image]");
+    expect(neutralizeInboundBody("<tomo\uFEFF-event>")).toBe("＜tomo\uFEFF-event>");
   });
 
   it("stays linear on long runs of invisibles and brackets (no regex backtracking)", () => {

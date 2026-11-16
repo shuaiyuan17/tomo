@@ -129,9 +129,12 @@ export function neutralizeInboundBody(text: string): string {
   const offsets: number[] = [];
   let offset = 0;
   for (const ch of text) {
-    if (/\s/.test(ch)) {
+    // Invisible first: JS `\s` also matches U+FEFF, which must vanish, not read as a space.
+    if (INVISIBLE_CHAR_RE.test(ch)) {
+      // dropped
+    } else if (/\s/.test(ch)) {
       if (reads.at(-1) !== " ") { reads.push(" "); offsets.push(offset); }
-    } else if (!INVISIBLE_CHAR_RE.test(ch)) {
+    } else {
       reads.push(ch);
       offsets.push(offset);
     }

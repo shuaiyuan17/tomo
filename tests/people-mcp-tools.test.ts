@@ -102,11 +102,11 @@ describe("people MCP tools", () => {
     expect(created.content[0].text).toContain("Created person record");
 
     const updated = await upsert.handler(
-      { name: "Kevin Wang", match: "kw", aliases: ["嘉伟"], replace_aliases: false, notes: "climbing buddy" },
+      { name: "Kevin Wang", match: "kw", aliases: ["KDub"], replace_aliases: false, notes: "climbing buddy" },
       {},
     );
     expect(updated.content[0].text).toContain("Updated person record");
-    expect(updated.content[0].text).toContain("嘉伟");
+    expect(updated.content[0].text).toContain("KDub");
   });
 
   it("upsert_person rejects the private flag for group callers", async () => {

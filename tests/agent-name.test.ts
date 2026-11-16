@@ -6,15 +6,18 @@ import { AgentNameReader, DEFAULT_AGENT_NAME, parseIdentityName } from "../src/w
 import { composerStatus, requestLabels, TYPING_ACTIVITY } from "../web/src/composer-status.js";
 import { agentNameOf } from "../web/src/agent-name.js";
 
+/** The Han word for "name" (U+540D U+5B57), one of the labels the parser accepts. */
+const HAN_NAME_LABEL = "\u540D\u5B57";
+
 describe("parseIdentityName", () => {
   it("reads the Name line tomo init writes, with markdown bold", () => {
     expect(parseIdentityName("# IDENTITY.md - Who Am I?\n\n- **Name:** Claw\n- **Pronouns:** he / him")).toBe("Claw");
   });
-  it("accepts plainer and Chinese forms", () => {
+  it("accepts plainer forms, and the Han label for \"name\" with a fullwidth colon", () => {
     expect(parseIdentityName("Name: Mochi")).toBe("Mochi");
     expect(parseIdentityName("* **Name**: _Juniper_")).toBe("Juniper");
-    expect(parseIdentityName("- **名字：** 小爪")).toBe("小爪");
-    expect(parseIdentityName("名字: 克劳")).toBe("克劳");
+    expect(parseIdentityName(`- **${HAN_NAME_LABEL}\uFF1A** Pixel`)).toBe("Pixel");
+    expect(parseIdentityName(`${HAN_NAME_LABEL}: Bolt`)).toBe("Bolt");
     expect(parseIdentityName("- **name:** `Tomo-Two`")).toBe("Tomo-Two");
   });
   it("drops a trailing note and link markup", () => {

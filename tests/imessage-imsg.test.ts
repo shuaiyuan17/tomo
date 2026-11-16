@@ -390,14 +390,14 @@ describe("imsg inbound message mapping", () => {
 
     children[0].notifyMessage(inboundMessage({
       guid: "plain-guid-1",
-      text: "早啊",
+      text: "Morning!",
       reply_to_guid: "our-last-outbound-guid",
       reply_to_text: "our latest outbound message",
       reply_to_sender: "me",
     }));
     await settle();
 
-    expect(handler.mock.calls[0][0].text).toBe("早啊");
+    expect(handler.mock.calls[0][0].text).toBe("Morning!");
     await channel.stop();
   });
 

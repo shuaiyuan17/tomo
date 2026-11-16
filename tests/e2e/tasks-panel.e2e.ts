@@ -53,7 +53,7 @@ const row = (name: RegExp) => rail().locator("li").filter({ has: page.getByRole(
 it("marks subagents with the trace's robot and shell tasks with its terminal; children hang off CSS tree lines", async () => {
   watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
     task("p1", "local_agent", "Review the release", { subagentType: "Explore" }),
-    task("c1", "local_bash", "用 stdin 重跑 codex 审 #539", { parentTaskId: "p1" }),
+    task("c1", "local_bash", "Rerun the codex review of #539 via stdin", { parentTaskId: "p1" }),
     task("c2", "local_bash", "cd /Users/alex/repo && npm test", { parentTaskId: "p1" }),
     task("m1", "monitor", "Watch the CI run"),
   ] });
@@ -70,15 +70,15 @@ it("marks subagents with the trace's robot and shell tasks with its terminal; ch
     await browserExpect(icon).toHaveAttribute("aria-hidden", "true");
   }
   // A description in words is the label, whole; a command line keeps its short name.
-  await browserExpect(row(/重跑/).locator("[data-shell-label]")).toHaveText("用 stdin 重跑 codex 审 #539");
+  await browserExpect(row(/Rerun the codex/).locator("[data-shell-label]")).toHaveText("Rerun the codex review of #539 via stdin");
   await browserExpect(row(/npm test/).locator("[data-shell-label]")).toHaveText("npm test");
   // Tree lines: the first child's line goes on to its sibling, the last one's stops at its elbow; top-level rows have none.
   const lines = (name: RegExp) => row(name).locator("[data-tree-lines] [data-tree-line]").evaluateAll((els) => els.map((el) => el.getAttribute("data-tree-line")));
-  expect(await lines(/重跑/)).toEqual(["stem", "elbow"]);
+  expect(await lines(/Rerun the codex/)).toEqual(["stem", "elbow"]);
   expect(await lines(/npm test/)).toEqual(["elbow"]);
   await browserExpect(row(/Review the release/).locator("[data-tree-lines]")).toHaveCount(0);
   await browserExpect(row(/Watch the CI run/).locator("[data-tree-lines]")).toHaveCount(0);
-  await browserExpect(row(/重跑/).locator("[data-tree-lines]")).toHaveAttribute("aria-hidden", "true");
+  await browserExpect(row(/Rerun the codex/).locator("[data-tree-lines]")).toHaveAttribute("aria-hidden", "true");
   // Drawn, not typed: no box-drawing characters in the list.
   expect(await rail().textContent()).not.toMatch(/[└├│]/);
   await page.screenshot({ path: "test-results/tasks-tree.png" });

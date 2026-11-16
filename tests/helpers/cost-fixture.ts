@@ -24,11 +24,11 @@ function rng(seed: number): () => number {
 }
 
 const OWNER_TRIGGERS = [
-  "我发现 workspace/memory/CONTINUITY.md 里的东西怎么没了", "需要我去github建repo吗", "Can you check why the morning brief ran twice?",
-  "task最后那个 auto memory 分析 model标错了吧 是bug吗", "Plan the trip to Yosemite for the long weekend, with a packing list",
-  "make sure我们utilize了最新sdk给的有用信息（如果我们少东西 可以加上）", "Look at the failing CI on the release branch",
-  "帮我看看这周的日程 有没有冲突", "Summarise the three PRs that landed today", "What did the dentist say about the appointment?",
-  "你觉得干活subagent和subsession哪个好 有必要给tomo在加入subsession吗", "Rewrite the README intro, it reads like a changelog",
+  "Why did the notes in workspace/memory/CONTINUITY.md disappear?", "Should I create the GitHub repo?", "Can you check why the morning brief ran twice?",
+  "The last task shows the wrong model for the memory analysis, is that a bug?", "Plan a weekend hiking trip, with a packing list",
+  "Make sure we use everything useful the latest SDK reports", "Look at the failing CI on the release branch",
+  "Check this week's calendar for conflicts", "Summarise the three PRs that landed today", "When is the next team meeting?",
+  "Subagents or sub-sessions for background work: which is better?", "Rewrite the README intro, it reads like a changelog",
 ];
 const GROUP_TRIGGERS = ["Who's bringing the second rope?", "Can someone book the campsite for Friday?", "Next month: Piranesi.", "Sam: permits are sorted 🎉"];
 const JOBS = [

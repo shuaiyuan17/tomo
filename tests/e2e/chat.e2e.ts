@@ -56,8 +56,8 @@ it("keeps private history locked without the access link", async () => {
   await anonymous.close();
 });
 
-it("round-trips 16,000 CJK characters through the chat and transcript", async () => {
-  const text = "中".repeat(16_000);
+it("round-trips 16,000 three-byte characters through the chat and transcript", async () => {
+  const text = "€".repeat(16_000);
   mockSdk.responseFn = () => text;
   await page.getByRole("textbox", { name: "Message Tomo" }).fill(text);
   await page.getByRole("button", { name: "Send", exact: true }).click();
@@ -447,10 +447,10 @@ it("a shell task: its Output card lines up with the Command card above it", asyn
   await page.route("**/tasks/b1/command", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ text: "/tmp/merge-seq.sh 2>&1", truncated: false }) }));
   await page.route("**/tasks/b1/output", (route) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ output: "351 already merged\n352 already merged\n", size: 38 }) }));
   watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
-    { taskId: "b1", taskType: "local_bash", description: "重启后拉起", ambient: false, background: true, startedAt: Date.now() },
+    { taskId: "b1", taskType: "local_bash", description: "Bring the watcher back up after restart", ambient: false, background: true, startedAt: Date.now() },
   ] });
   await page.getByRole("button", { name: /^Tasks/ }).click();
-  await page.getByRole("button", { name: /重启后拉起/ }).click();
+  await page.getByRole("button", { name: /Bring the watcher back up/ }).click();
   const command = page.getByRole("region", { name: "Command" });
   await browserExpect(command).toContainText("/tmp/merge-seq.sh");
   const output = page.getByText("352 already merged").locator("xpath=ancestor::div[contains(@class,'border')][1]");
@@ -461,11 +461,11 @@ it("a shell task: its Output card lines up with the Command card above it", asyn
 
 it("a message Tomo sent on its own carries a label, and no [proactive] marker in its text", async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
-  store.append("dm:owner", { role: "assistant", channel: "imessage", content: "[proactive] 重启好了，可以继续用了。", timestamp: Date.now() - 1_000 });
+  store.append("dm:owner", { role: "assistant", channel: "imessage", content: "[proactive] Restarted, you can carry on.", timestamp: Date.now() - 1_000 });
   await page.reload();
-  const sent = page.locator("article.message.assistant").filter({ hasText: "重启好了" });
+  const sent = page.locator("article.message.assistant").filter({ hasText: "Restarted" });
   await browserExpect(sent).toBeVisible();
-  await browserExpect(sent.locator(".markdown")).toHaveText("重启好了，可以继续用了。");
+  await browserExpect(sent.locator(".markdown")).toHaveText("Restarted, you can carry on.");
   await browserExpect(sent).toContainText("Sent proactively");
   await browserExpect(page.locator("main")).not.toContainText("[proactive]");
 });
@@ -476,7 +476,7 @@ it("an Enter that confirms an IME candidate (Safari order) does not send", async
   // Safari fires compositionend before the confirming Enter's keydown, which then has isComposing=false.
   await input.evaluate((el) => {
     el.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
-    el.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "你好" }));
+    el.dispatchEvent(new CompositionEvent("compositionend", { bubbles: true, data: "hello" }));
     el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
   });
   await page.waitForTimeout(300);
@@ -497,9 +497,9 @@ it("renders channel images as thumbnails (never the path), keeps line breaks, an
   write(file, png);
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
   const t = Date.now();
-  store.append("dm:owner", { role: "assistant", channel: "telegram", timestamp: t, content: "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了" });
-  store.append("dm:owner", { role: "user", channel: "telegram", timestamp: t + 1, content: `[Sent an image, saved to: ${file}] 像这样\n• one\n• two` });
-  store.append("dm:owner", { role: "user", channel: "imessage", timestamp: t + 2, content: '[replying to: "强哥的 #383 捡起来了，拆成了 3 个 PR，…"] nicenice！！' });
+  store.append("dm:owner", { role: "assistant", channel: "telegram", timestamp: t, content: "Picked up the stale #383 and split it into 3 PRs, the first is merged" });
+  store.append("dm:owner", { role: "user", channel: "telegram", timestamp: t + 1, content: `[Sent an image, saved to: ${file}] like this\n• one\n• two` });
+  store.append("dm:owner", { role: "user", channel: "imessage", timestamp: t + 2, content: '[replying to: "Picked up the stale #383 and split it into 3 PRs,…"] nice!!' });
   await page.reload();
   const image = page.getByRole("img", { name: "Image" });
   await image.evaluate((el) => el.scrollIntoView());
@@ -510,11 +510,11 @@ it("renders channel images as thumbnails (never the path), keeps line breaks, an
   await browserExpect(page.locator(".message.user .markdown").first()).toContainText("• one");
   expect(await page.locator(".message.user .markdown br").count()).toBeGreaterThanOrEqual(2);
   const quote = page.getByRole("button", { name: /Replying to/ });
-  await browserExpect(quote).toContainText("强哥的 #383");
-  await browserExpect(page.getByText("nicenice！！")).toBeVisible();
+  await browserExpect(quote).toContainText("Picked up the stale #383");
+  await browserExpect(page.getByText("nice!!", { exact: true })).toBeVisible();
   await browserExpect(page.locator("main")).not.toContainText("[replying to");
   await quote.click();
-  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "第一个已经合了" })).toHaveClass(/bg-primary/);
+  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "the first is merged" })).toHaveClass(/bg-primary/);
   await image.click();
   await browserExpect(page.getByRole("dialog", { name: "Image" })).toBeVisible();
   // The overlay covers the window: no row or scroller contains it (paint/layout containment would).
@@ -631,11 +631,11 @@ it("calls the agent by its IDENTITY.md name (re-read on edit); the product keeps
   await browserExpect(page.locator("article.message.assistant").first()).not.toContainText("Tomo");
   await browserExpect(page.getByRole("link", { name: "Tomo home" })).toBeVisible();
   expect(await page.title()).toMatch(/Tomo/i);
-  writeFileSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), "- **名字：** 小爪\n");
+  writeFileSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), "- **Name:** Pixel\n");
   const { utimesSync } = await import("node:fs");
   utimesSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), new Date(), new Date(Date.now() + 5_000));
   await page.reload();
-  await browserExpect(page.getByRole("textbox", { name: "Message 小爪" })).toBeVisible();
+  await browserExpect(page.getByRole("textbox", { name: "Message Pixel" })).toBeVisible();
   const { rmSync } = await import("node:fs");
   rmSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), { force: true });
 });
@@ -1395,9 +1395,9 @@ it("own bubbles fit their content (85% cap) and show ✓ sent, then ✓✓ read 
   let release!: () => void;
   const gate = new Promise<void>((r) => { release = r; });
   mockSdk.responseFn = async () => { await gate; return "A tick is a receipt."; };
-  await page.getByRole("textbox", { name: "Message Tomo" }).fill("第一个对号是啥意思");
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("What's the tick?");
   await page.getByRole("button", { name: "Send", exact: true }).click();
-  const own = page.locator("article.message.user").filter({ hasText: "第一个对号是啥意思" }).last();
+  const own = page.locator("article.message.user").filter({ hasText: "What's the tick?" }).last();
   const receipt = own.locator(".read-receipt");
   await browserExpect(receipt).toHaveAttribute("data-receipt", "sent");
   release();

@@ -308,7 +308,7 @@ describe("findDuePromotions — past-day nudging", () => {
 describe("isWarmTailCandidate — classifier", () => {
   const stamp = "[imessage · Fri 06/05 22:18 PDT]";
   it("counts a real user message", () => {
-    expect(isWarmTailCandidate({ type: "user", message: { role: "user", content: `${stamp} 🧱做好了` } } as any)).toBe(true);
+    expect(isWarmTailCandidate({ type: "user", message: { role: "user", content: `${stamp} 🧱 done` } } as any)).toBe(true);
   });
   it("counts a coalesced real-message turn", () => {
     expect(isWarmTailCandidate({ type: "user", message: { role: "user", content: `${stamp} [User sent 2 messages in quick succession] hi` } } as any)).toBe(true);
@@ -370,7 +370,7 @@ describe("isWarmTailCandidate — classifier", () => {
     expect(isWarmTailCandidate({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "x", content: "..." }] } } as any)).toBe(false);
   });
   it("counts an assistant text reply", () => {
-    expect(isWarmTailCandidate({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "好的 🦀" }] } } as any)).toBe(true);
+    expect(isWarmTailCandidate({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "Sure 🦀" }] } } as any)).toBe(true);
   });
   it("rejects an assistant silent housekeeping reply", () => {
     expect(isWarmTailCandidate({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "NO_REPLY" }] } } as any)).toBe(false);
@@ -429,7 +429,7 @@ describe("summaryBudgetCheck", () => {
   });
 
   it("uses mixed-script token estimation for CJK summaries", () => {
-    const result = summaryBudgetCheck("weekly", "汉".repeat(1600));
+    const result = summaryBudgetCheck("weekly", "\u6C49".repeat(1600)); // one Han character, repeated
     expect(result).toEqual({
       tokens: 1216,
       budget: 1000,

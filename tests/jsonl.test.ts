@@ -33,13 +33,13 @@ describe("jsonl backward reading", () => {
   });
 
   it("preserves multi-byte UTF-8 characters that straddle chunk boundaries", () => {
-    const records = Array.from({ length: 50 }, (_, i) => ({ i, text: "日本語テキスト🎌".repeat(3) }));
+    const records = Array.from({ length: 50 }, (_, i) => ({ i, text: "café — naïve ✓ résumé 🎌".repeat(3) }));
     const file = writeRecords("utf8.jsonl", records);
 
     // A chunk size not aligned to the multi-byte sequences guarantees splits
     // inside characters.
     for (const record of iterateJsonlBackwardsSync<{ text: string }>(file, 37)) {
-      expect(record.text).toBe("日本語テキスト🎌".repeat(3));
+      expect(record.text).toBe("café — naïve ✓ résumé 🎌".repeat(3));
     }
     expect([...iterateJsonlBackwardsSync(file, 37)]).toHaveLength(50);
   });

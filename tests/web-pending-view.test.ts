@@ -72,9 +72,9 @@ describe("resending an interrupted message", () => {
     expect(resendAfterDraftChange(resend, "   ")).toBeNull();
     expect(resendAfterDraftChange(resend, "Please book")).toBe(resend);
   });
-  it("compares characters for short or unspaced text (e.g. Chinese)", () => {
-    expect(isResendOf("帮我订周五晚上七点的餐厅", "帮我订周六晚上七点的餐厅")).toBe(true);
-    expect(isResendOf("帮我订周五晚上七点的餐厅", "明天天气怎么样")).toBe(false);
+  it("compares characters for short or unspaced text", () => {
+    expect(isResendOf("book-dinner-friday-7pm", "book-dinner-saturday-7pm")).toBe(true);
+    expect(isResendOf("book-dinner-friday-7pm", "weather?")).toBe(false);
   });
 });
 

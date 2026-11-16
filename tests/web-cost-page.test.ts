@@ -50,7 +50,7 @@ describe("Cost page helpers", () => {
   });
 
   it("names a turn by its trigger, else by what started it", () => {
-    expect(turnTitle(turn({ trigger: "需要我去github建repo吗" }))).toBe("需要我去github建repo吗");
+    expect(turnTitle(turn({ trigger: "Should I create the GitHub repo?" }))).toBe("Should I create the GitHub repo?");
     expect(turnTitle(turn({ category: "scheduled", source: "cron", jobName: "Morning brief" }))).toBe("Morning brief");
     expect(turnTitle(turn({ category: "background", source: "background" }))).toBe("Background work finished");
     expect(turnMeta(turn({ durationMs: 20_000, tools: 5 }))).toBe("You · Shuai (DM) · 20s · 5 tools");

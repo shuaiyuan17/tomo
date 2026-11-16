@@ -119,7 +119,7 @@ An unbroken string: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 - [ ] Write the tests
 - [ ] Ship it
 
-中文段落：迁移只会重命名文件，不会重写记录。如果两个键映射到同一个文件名，就把整组文件停放起来，而不是猜测或合并。`;
+A closing paragraph: the migration only renames files and never rewrites a record. If two keys map to the same file name, the whole family is parked rather than guessed at or merged.`;
 
 /** Group chats, the owner's workspace memory and to-dos, and the scheduled jobs. */
 function seedWorkspace(store: SessionStore): string {
@@ -177,8 +177,8 @@ function seedConversation(store: SessionStore): void {
   add("user", formatReactionMarker("love", "Sure — give me a minute to read through it."), "telegram", day1 + 90_000);
   add("assistant", "NO_REPLY", "telegram", day1 + 91_000);
   add("user", `[Sent an image, saved to: ${image}] this is what I see in Finder`, "telegram", day1 + 120_000);
-  add("assistant", "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了", "imessage", day1 + 180_000);
-  add("user", '[replying to: "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了"] nicenice！！ 那第二个呢？', "imessage", day1 + 240_000);
+  add("assistant", "Picked up the stale #383 and split it into 3 PRs, the first is merged", "imessage", day1 + 180_000);
+  add("user", '[replying to: "Picked up the stale #383 and split it into 3 PRs, the first…"] nice!! and the second?', "imessage", day1 + 240_000);
   const q = BASE - 40 * 60_000;
   add("user", "Walk me through the plan in detail please, with a table of the keys and some code.", "web", q);
   add("assistant", LONG_MD, "web", q + 50_000);
@@ -227,7 +227,7 @@ function publishTasks(): void {
   watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
     { taskId: "a1", taskType: "local_agent", subagentType: "Explore", description: "Audit the rename paths and find every place a live transcript could be clobbered", ambient: false, background: true, startedAt: BASE - 95_000, summary: "Reading src/sessions/store.ts" },
     // Nested under the subagent: a command it described in words (shown whole), and a command line.
-    { taskId: "a3", taskType: "local_bash", description: "用 stdin 重跑 codex 审 #539", parentTaskId: "a1", ambient: false, background: true, startedAt: BASE - 40_000 },
+    { taskId: "a3", taskType: "local_bash", description: "Rerun the codex review of #539 via stdin", parentTaskId: "a1", ambient: false, background: true, startedAt: BASE - 40_000 },
     { taskId: "a4", taskType: "local_bash", description: "git log --oneline -5", parentTaskId: "a1", ambient: false, background: true, startedAt: BASE - 30_000 },
     { taskId: "a2", taskType: "local_bash", description: "npm test", ambient: false, background: true, startedAt: BASE - 20_000 },
   ] });

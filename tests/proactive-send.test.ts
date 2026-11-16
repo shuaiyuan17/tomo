@@ -324,10 +324,10 @@ describe("ProactiveSendService.sendToSession", () => {
   it("passes a normalized effect through to an iMessage send", async () => {
     const h = makeHarness({}, new FakeChannel("imessage"));
 
-    const result = await h.service.sendToSession("imessage:+15551234567", "恭喜!!", undefined, { effect: " Confetti " });
+    const result = await h.service.sendToSession("imessage:+15551234567", "Congrats!!", undefined, { effect: " Confetti " });
 
     expect(result).toEqual({ ok: true });
-    expect(h.channel.sent).toEqual([{ chatId: "+15551234567", text: "恭喜!!", effect: "confetti" }]);
+    expect(h.channel.sent).toEqual([{ chatId: "+15551234567", text: "Congrats!!", effect: "confetti" }]);
   });
 
   it("still sends the text when the effect name is a typo, and teaches via the note", async () => {

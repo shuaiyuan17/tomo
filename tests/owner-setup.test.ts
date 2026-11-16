@@ -158,7 +158,7 @@ describe("checkTelegramUserId / deriveOwnerName / group entries", () => {
   it("derives the session-id name the way init always has", () => {
     expect(deriveOwnerName("Alex Example")).toBe("alex");
     expect(deriveOwnerName("   ")).toBe("owner");
-    expect(deriveOwnerName("小明")).toBe("小明");
+    expect(deriveOwnerName("Željko")).toBe("željko");
   });
 
   it("the Groups editor only takes group ids", () => {

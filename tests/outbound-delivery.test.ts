@@ -92,9 +92,9 @@ describe("outbound delivery never inspects the model's own words", () => {
     expect(channel.sent[0].text).toBe("count");
   });
 
-  it("delivers a text block that starts with `思考:` verbatim (#291 P1: seam cut real prose)", async () => {
+  it("delivers a text block that starts with `Thinking:` verbatim (#291 P1: seam cut real prose)", async () => {
     const { channel, deliver } = makePipeline();
-    const reply = "思考: 我建议分两步。 第一步先备份。 第二步再迁移。";
+    const reply = "Thinking: I suggest two steps. First back up. Then migrate.";
 
     await deliver(reply);
 

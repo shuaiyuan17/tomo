@@ -32,23 +32,27 @@ describe("shell task short names", () => {
   });
 });
 
+/** A Han-script description (U+91CD U+542F, "restart"): prose without a capital letter. */
+const HAN_PROSE = "\u91CD\u542F";
+
 describe("shell task labels", () => {
   it.each([
     // A description in words is shown whole: not cut at its first space.
-    ["用 stdin 重跑 codex 审 #539", "用 stdin 重跑 codex 审 #539"],
-    ["重启后拉起", "重启后拉起"],
+    ["Rerun the codex review of #539 via stdin", "Rerun the codex review of #539 via stdin"],
+    // Han text has no capital letter to tell it by: any of it reads as words.
+    [HAN_PROSE, HAN_PROSE],
     ["Run the e2e suite --watch", "Run the e2e suite --watch"],
     ["Stream-extract tool calls", "Stream-extract tool calls"],
     // A command line keeps its short name.
     ["npm test", "npm test"],
     ["codex", "codex"],
-    ["cd /tmp && 跑测试.sh", "跑测试.sh"],
+    ["cd /tmp && run-tests.sh", "run-tests.sh"],
     ["FOO=1 npm test", "npm test"],
     ["~/.tomo/workspace/scripts/wait-ci.sh ~/Developer/tomo 490", "wait-ci.sh 490"],
   ])("%s → %s", (description, label) => expect(shellLabel(description)).toBe(label));
 
   it("tells words from a command", () => {
-    expect(isProseDescription("用 stdin 重跑 codex 审 #539")).toBe(true);
+    expect(isProseDescription(`${HAN_PROSE} via stdin`)).toBe(true);
     expect(isProseDescription("Check CI")).toBe(true);
     expect(isProseDescription("git status")).toBe(false);
     expect(isProseDescription("Build | tee log")).toBe(false);
@@ -56,9 +60,9 @@ describe("shell task labels", () => {
   });
 
   it("cuts a long sentence with an ellipsis, on one line", () => {
-    const label = shellLabel(`用   stdin\t${"重跑".repeat(60)}`);
+    const label = shellLabel(`Rerun   via\t${"again ".repeat(60)}`);
     expect(label.length).toBe(PROSE_LABEL_MAX);
     expect(label.endsWith("…")).toBe(true);
-    expect(label.startsWith("用 stdin 重跑")).toBe(true);
+    expect(label.startsWith("Rerun via again")).toBe(true);
   });
 });

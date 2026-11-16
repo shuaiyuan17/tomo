@@ -274,7 +274,7 @@ describe("local HTTP boundary", () => {
       expect((await call("/api/v1/bootstrap", { headers: { ...headers, ...extra } })).status).toBe(403);
     }
   });
-  it.each(["中".repeat(16_000), "😀".repeat(8_000), "\u0000".repeat(16_000)])("accepts every advertised UTF-16 unit within the JSON byte limit %#", async (text) => {
+  it.each(["€".repeat(16_000), "😀".repeat(8_000), "\u0000".repeat(16_000)])("accepts every advertised UTF-16 unit within the JSON byte limit %#", async (text) => {
     const response = await call("/api/v1/messages", { method: "POST", headers: mutationHeaders(), body: JSON.stringify({ requestId: randomUUID(), text }) });
     expect(response.status).toBe(202); expect(handoff).toHaveBeenCalledWith(expect.objectContaining({ text }));
   });

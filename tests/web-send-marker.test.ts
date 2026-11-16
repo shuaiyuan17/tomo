@@ -4,8 +4,8 @@ import { findQuoted, parseReply } from "../web/src/reply.js";
 
 describe("send markers (proactive-send.ts) in the web chat", () => {
   it("a direct send's [proactive] marker becomes a label, never text", () => {
-    const { sent, body } = parseSendMarker("assistant", "[proactive] 重启好了，可以继续");
-    expect(body).toBe("重启好了，可以继续");
+    const { sent, body } = parseSendMarker("assistant", "[proactive] Restarted, you can carry on");
+    expect(body).toBe("Restarted, you can carry on");
     expect(sent && sendMarkerLabel(sent)).toBe("Sent proactively");
   });
   it("a send from a summoning main session names it", () => {

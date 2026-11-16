@@ -38,7 +38,7 @@ function writePerson(dir: string, file: string, content: string): void {
 
 const KEVIN = `---
 name: Kevin Wang
-aliases: kw, 嘉伟
+aliases: kw, KDub
 telegram: 12345678
 imessage: +1 (415) 555-1234
 ---
@@ -58,19 +58,19 @@ describe("people store", () => {
   it("parses frontmatter, handles, and notes", () => {
     const record = parsePersonFile(KEVIN, "/tmp/kevin.md", false);
     expect(record?.name).toBe("Kevin Wang");
-    expect(record?.aliases).toEqual(["kw", "嘉伟"]);
+    expect(record?.aliases).toEqual(["kw", "KDub"]);
     expect(record?.handles).toEqual({ telegram: "12345678", imessage: "+1 (415) 555-1234" });
     expect(record?.notes).toContain("Met at Stanford");
   });
 
   it("tolerates inline-array aliases, quotes, and full-width commas", () => {
     const record = parsePersonFile(
-      `---\nname: "Alice Chen"\naliases: [阿丽、'ali']\n---\n`,
+      `---\nname: "Alice Chen"\naliases: [Lissy\u3001'ali']\n---\n`, // U+3001: the ideographic comma
       "/tmp/a.md",
       false,
     );
     expect(record?.name).toBe("Alice Chen");
-    expect(record?.aliases).toEqual(["阿丽", "ali"]);
+    expect(record?.aliases).toEqual(["Lissy", "ali"]);
   });
 
   it("preserves unknown frontmatter keys across a round trip", () => {
@@ -115,7 +115,7 @@ describe("people store", () => {
     const people = loadPeople({ includePrivate: false, dirs });
     expect(findPersonByName(people, "kevin  wang")?.name).toBe("Kevin Wang");
     expect(findPersonByName(people, "KW")?.name).toBe("Kevin Wang");
-    expect(findPersonByName(people, "嘉伟")?.name).toBe("Kevin Wang");
+    expect(findPersonByName(people, "kdub")?.name).toBe("Kevin Wang");
     expect(findPersonByName(people, "kevin")).toBeUndefined();
   });
 
@@ -131,10 +131,10 @@ describe("people store", () => {
       writePerson(dirs.publicDir, "kevin.md", KEVIN);
       const people = loadPeople({ includePrivate: false, dirs });
       expect(findPersonByDisplayName(people, "kw 🚀")?.name).toBe("Kevin Wang");
-      expect(findPersonByDisplayName(people, "阿丽✨")).toBeUndefined();
-      writePerson(dirs.publicDir, "alice.md", `---\nname: Alice Chen\naliases: 阿丽\n---\n`);
+      expect(findPersonByDisplayName(people, "Lissy✨")).toBeUndefined();
+      writePerson(dirs.publicDir, "alice.md", `---\nname: Alice Chen\naliases: Lissy\n---\n`);
       const reloaded = loadPeople({ includePrivate: false, dirs });
-      expect(findPersonByDisplayName(reloaded, "阿丽✨")?.name).toBe("Alice Chen");
+      expect(findPersonByDisplayName(reloaded, "Lissy✨")?.name).toBe("Alice Chen");
     });
 
     it("prefers an exact match over the stripped fallback", () => {
@@ -180,14 +180,14 @@ describe("people store", () => {
         { includePrivate: true, dirs },
       );
       expect(created).toBe(false);
-      expect(record.aliases).toEqual(["kw", "嘉伟", "Kev"]);
+      expect(record.aliases).toEqual(["kw", "KDub", "Kev"]);
       expect(record.notes).toContain("Met at Stanford");
     });
 
     it("keeps the old canonical name as an alias on rename", () => {
       writePerson(dirs.publicDir, "kevin.md", KEVIN);
       const { record } = upsertPerson(
-        { name: "Kevin W.", match: "嘉伟", aliases: [] },
+        { name: "Kevin W.", match: "KDub", aliases: [] },
         { includePrivate: true, dirs },
       );
       expect(record.name).toBe("Kevin W.");
@@ -226,8 +226,8 @@ describe("people store", () => {
 
   describe("autoBindHandle", () => {
     it("binds when the display name unambiguously matches an unbound record", () => {
-      writePerson(dirs.publicDir, "alice.md", `---\nname: Alice Chen\naliases: 阿丽\n---\n`);
-      const bound = autoBindHandle("telegram", "42", "阿丽", dirs);
+      writePerson(dirs.publicDir, "alice.md", `---\nname: Alice Chen\naliases: Lissy\n---\n`);
+      const bound = autoBindHandle("telegram", "42", "Lissy", dirs);
       expect(bound?.name).toBe("Alice Chen");
       const reloaded = loadPeople({ includePrivate: false, dirs });
       expect(findPersonByHandle(reloaded, "telegram", "42")?.name).toBe("Alice Chen");
@@ -285,7 +285,7 @@ describe("people store", () => {
         people,
       });
       expect(labels).toEqual([
-        'Kevin Wang (aka: kw, 嘉伟; appears as "kw 🚀")',
+        'Kevin Wang (aka: kw, KDub; appears as "kw 🚀")',
         "Unknown Guy",
       ]);
     });
@@ -317,7 +317,7 @@ describe("people store", () => {
       writePerson(dirs.publicDir, "kevin.md", KEVIN);
       const people = loadPeople({ includePrivate: false, dirs });
       expect(annotateSenderName(people, "telegram", "kw 🚀", "12345678")).toBe("kw 🚀 (Kevin Wang)");
-      expect(annotateSenderName(people, "telegram", "嘉伟")).toBe("嘉伟 (Kevin Wang)");
+      expect(annotateSenderName(people, "telegram", "KDub")).toBe("KDub (Kevin Wang)");
       expect(annotateSenderName(people, "telegram", "Kevin Wang", "12345678")).toBe("Kevin Wang");
       expect(annotateSenderName(people, "telegram", "Stranger", "555")).toBe("Stranger");
     });

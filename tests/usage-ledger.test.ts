@@ -220,8 +220,8 @@ describe("usage attribution", () => {
   it("clips the trigger to its first characters and unwraps a harness envelope", () => {
     expect(triggerSnippet("  hello\n\n  there ")).toBe("hello there");
     expect(triggerSnippet("")).toBeUndefined();
-    const long = "字".repeat(200);
-    expect(triggerSnippet(long)).toBe("字".repeat(TRIGGER_MAX_CHARS));
+    const long = "é".repeat(200);
+    expect(triggerSnippet(long)).toBe("é".repeat(TRIGGER_MAX_CHARS));
     const cron = formatTomoEvent("cron", 'Scheduled task "Digest" triggered. Summarise the inbox', { name: "Digest" });
     expect(triggerSnippet(cron)).toBe('Scheduled task "Digest" triggered. Summarise the inbox');
   });

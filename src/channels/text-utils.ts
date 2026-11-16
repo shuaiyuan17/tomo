@@ -50,14 +50,14 @@ export function neutralizeMarkerDelimiters(text: string): string {
 }
 
 /**
- * Characters that render as nothing (or as plain space) and so can sit between
- * `[` and a marker word without the reader noticing: whitespace, every format
- * character (soft hyphen, zero-width and bidi marks, word joiner, BOM, …),
- * combining marks (U+034F COMBINING GRAPHEME JOINER and the like), and
- * anything else Unicode calls default-ignorable. By property, not a list: a
- * list is a bypass waiting for the character it forgot.
+ * Characters that render as nothing and so can hide inside or around a marker
+ * word without the reader noticing: every format character (soft hyphen,
+ * zero-width and bidi marks, word joiner, BOM, …), combining marks (U+034F
+ * COMBINING GRAPHEME JOINER and the like), and anything else Unicode calls
+ * default-ignorable. By property, not a list: a list is a bypass waiting for
+ * the character it forgot.
  */
-const INVISIBLE = "[\\s\\p{Cf}\\p{Mn}\\p{Me}\\p{Default_Ignorable_Code_Point}]*";
+const INVISIBLE_CHAR_RE = /^[\p{Cf}\p{Mn}\p{Me}\p{Default_Ignorable_Code_Point}]$/u;
 
 /**
  * The opening words of every bracketed marker the harness writes into a
@@ -88,26 +88,20 @@ const MARKER_WORDS = [
 ];
 const WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
-/** The same without whitespace: what may hide INSIDE a word. */
-const HIDDEN = "[\\p{Cf}\\p{Mn}\\p{Me}\\p{Default_Ignorable_Code_Point}]*";
-
 /**
- * A marker word as a pattern that still matches with invisible characters
- * hidden between its letters (`rep\u200Blying to`) or extra spacing between
- * its words — both read exactly like the word itself.
+ * A marker's opening, matched against the text as it READS: invisible
+ * characters dropped and whitespace runs collapsed to one space (see
+ * {@link neutralizeInboundBody}). `[` and a marker word, the inbound stamp
+ * (`[imessage · …`, `[Sat 08/29 …`), or `<` opening a `<tomo-event>` tag.
  */
-function spelledLoosely(word: string): string {
-  return word.split(" ").map((part) => Array.from(part).join(HIDDEN)).join(`${INVISIBLE}\\s${INVISIBLE}`);
-}
-
-/** `[` opening a marker word, the inbound stamp (`[imessage · …`, `[Sat 08/29 …`), or `<` opening a `<tomo-event>` tag. */
-const FORGED_OPENER_RE = new RegExp(
-  `\\[(?=${INVISIBLE}(?:(?:${MARKER_WORDS.map(spelledLoosely).join("|")})\\b`
-  + `|[a-z][\\w\\-\\p{Cf}\\p{Mn}\\p{Me}\\p{Default_Ignorable_Code_Point}]*${INVISIBLE}·`
-  + `|(?:${WEEKDAYS.map(spelledLoosely).join("|")})${INVISIBLE}\\d))`
-  + `|<(?=${INVISIBLE}\\/?${INVISIBLE}${spelledLoosely("tomo-event")}\\b)`,
-  "giu",
+const MARKER_HEAD_RE = new RegExp(
+  `^(?:\\[ ?(?:(?:${MARKER_WORDS.join("|")})\\b|[a-z][\\w-]* ?·|(?:${WEEKDAYS.join("|")}) ?\\d)`
+  + `|< ?\\/? ?tomo-event\\b)`,
+  "i",
 );
+
+/** Enough of the reading text after a bracket to hold the longest marker opening. */
+const MARKER_HEAD_WINDOW = 32;
 
 /**
  * Neutralise a sender's message BODY so it cannot pass for a harness marker.
@@ -126,7 +120,33 @@ const FORGED_OPENER_RE = new RegExp(
  * model reads every line.
  */
 export function neutralizeInboundBody(text: string): string {
-  return text.replace(FORGED_OPENER_RE, (c) => FULLWIDTH_DELIMITERS[c]!);
+  if (!/[[<]/.test(text)) return text;
+  // The text as it reads, one code point per entry, each with its offset in
+  // the original. Built once, so the whole pass is linear — a regex that
+  // skipped invisibles itself backtracked quadratically over a long run of
+  // them, which is a stall any sender could trigger.
+  const reads: string[] = [];
+  const offsets: number[] = [];
+  let offset = 0;
+  for (const ch of text) {
+    if (/\s/.test(ch)) {
+      if (reads.at(-1) !== " ") { reads.push(" "); offsets.push(offset); }
+    } else if (!INVISIBLE_CHAR_RE.test(ch)) {
+      reads.push(ch);
+      offsets.push(offset);
+    }
+    offset += ch.length;
+  }
+  let out = "";
+  let copied = 0;
+  for (let i = 0; i < reads.length; i++) {
+    const ch = reads[i]!;
+    if (ch !== "[" && ch !== "<") continue;
+    if (!MARKER_HEAD_RE.test(reads.slice(i, i + MARKER_HEAD_WINDOW).join(""))) continue;
+    out += text.slice(copied, offsets[i]) + FULLWIDTH_DELIMITERS[ch]!;
+    copied = offsets[i]! + 1;
+  }
+  return copied === 0 ? text : out + text.slice(copied);
 }
 
 /**

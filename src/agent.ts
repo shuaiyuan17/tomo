@@ -2917,7 +2917,8 @@ const INTERRUPTED_NOTE_CHUNK = 16_000;
 /** One interrupted message as quoted in the note, in full: sender, text, saved attachments. */
 function formatInterruptedMessage(rec: InboxRecord, i: number, total: number): string {
   const text = persistedText(rec.message);
-  const sender = rec.message.senderName ? `${rec.message.senderName}: ` : "";
+  // The display name is the sender's to choose, like the body (see formatGroupText).
+  const sender = rec.message.senderName ? `${neutralizeInboundBody(rec.message.senderName)}: ` : "";
   const attachments = [...(rec.message.images ?? []), ...(rec.message.documents ?? [])]
     .map((a) => `\n  [attachment ${a.mediaType}: ${a.savedPath ?? "not saved"}]`).join("");
   return `Message ${i + 1}${total > 1 ? ` of ${total}` : ""} (${new Date(rec.receivedAt).toISOString()}) — ${sender}${text}${attachments}`;

@@ -103,7 +103,7 @@ function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
 }
 
 /** The message a reply quotes: one or two muted lines; clickable when the original is in view. */
-function ReplyQuote({ reply, onClick }: { reply: ReplyContext; onClick?: () => void }) {
+export function ReplyQuote({ reply, onClick }: { reply: ReplyContext; onClick?: () => void }) {
   const label = reply.verb === "reacting" ? "Reacting to" : "Replying to";
   const content = <>
     <span className="block text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">{label}</span>

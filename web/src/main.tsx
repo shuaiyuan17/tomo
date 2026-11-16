@@ -5,8 +5,10 @@ import { useWeb } from "./use-web.js";
 import { onResume, repaint } from "./resume.js";
 import { createCompositionGuard } from "./compose-keys.js";
 import { Text } from "./markdown.js";
-import { MessageBody } from "./message-body.js";
-import { findQuoted, parseReply } from "./reply.js";
+import { MessageBody, ReplyQuote } from "./message-body.js";
+import { findQuoted, messageText, parseReply } from "./reply.js";
+import { collectReactions, parseTapback, quoteFor, reactionKind } from "./reactions.js";
+import { CopyAction, MessageActions, ReactAction, ReactionPills, ReplyAction, TapbackLine } from "@/components/ai/message-actions";
 import { parseSendMarker, sendMarkerLabel } from "./send-marker.js";
 import { TasksPanel } from "./tasks-panel.js";
 import { PlanUsage } from "./plan-usage.js";
@@ -14,7 +16,7 @@ import { CompactButton } from "./compact-button.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
-import { ArrowUp, FileIcon, ImagePlus, Plus, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, House, ListChecks, MessageCircle, Monitor, Moon, PanelLeft, Sun, SunMoon } from "lucide-react";
+import { ArrowUp, FileIcon, ImagePlus, Plus, Reply, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, House, ListChecks, MessageCircle, Monitor, Moon, PanelLeft, Sun, SunMoon } from "lucide-react";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { HomePage, useHomeRoute } from "./home/home-page.js";
 import { applyRestored, awaitingOwner, dismissAfterAcceptedSend, missingAttachments, resendAfterSend, historyBadge, pendingLabel, pendingUserMessages, readReceipt, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
@@ -26,7 +28,7 @@ import { Progress } from "@/components/ui/progress";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
-import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
+import type { HistoryPage, WebReaction, WebRequest } from "../../src/web/protocol.js";
 import "./styles.css";
 import { composerStatus, composerStatusIsProblem, requestLabels, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
 import { useRailWidth } from "./rail-width.js";
@@ -55,7 +57,10 @@ function parsedMessages(messages: HistoryPage["messages"]) {
   return messages.map((message, index) => {
     const { sent, body: content } = parseSendMarker(message.role, message.content);
     const { reply, body } = parseReply(content);
-    return { sent, reply, body, quoted: reply && findQuoted(messages, index, reply) };
+    // A tapback (the owner's, from any channel) shows as one quiet line, not a bubble.
+    const tapback = message.role === "user" ? parseTapback(message.content) : undefined;
+    const target = tapback ? tapback.reply : reply;
+    return { sent, reply, body, tapback, quoted: target && findQuoted(messages, index, target) };
   });
 }
 
@@ -164,6 +169,9 @@ export function App() {
   const historySession = useRef("");
   const scroller = useRef<ChatScrollerHandle>(null);
   const [draft, setDraft] = useState("");
+  /** The message the next send replies to (its quote, as the agent will read it). */
+  const [replyingTo, setReplyingTo] = useState<{ id: string; who: string; text: string } | null>(null);
+  useEffect(() => { setReplyingTo(null); }, [selectedId]);
   const fileInput = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   /** Previews of images this tab sent, per request, for its pending bubble. */
@@ -389,13 +397,15 @@ export function App() {
     const { keys: sentKeys, ids: images, files, refiled } = captureSend(attachments.items);
     // The resend this send is (captured now: the owner may start another while it is in flight).
     const sentAs = resending;
+    const replyTo = replyingTo;
     const requestId = crypto.randomUUID();
     setSending(true); setFeedback("Sending…"); remember(requestId);
     // Sending is the reader's own move: it takes them to the end, wherever they were reading.
     // Claimed before the request goes out: the live stream can show its bubble before the POST returns.
     scroller.current?.claim(pendingKey({ requestId }));
     try {
-      const request = await sendMessage({ requestId, targetId: session.id, text, ...(images.length ? { images } : {}), ...(files.length ? { files } : {}), ...(refiled.length ? { refiled } : {}) }, web.bootstrap, web.refreshBootstrap);
+      const request = await sendMessage({ requestId, targetId: session.id, text, ...(images.length ? { images } : {}), ...(files.length ? { files } : {}), ...(refiled.length ? { refiled } : {}),
+        ...(replyTo ? { reply: { text: replyTo.text } } : {}) }, web.bootstrap, web.refreshBootstrap);
       if (sentKeys.length) {
         const taken = attachments.take(sentKeys);
         const pictures = taken.filter((item) => item.kind !== "file"), others = taken.filter((item) => item.kind === "file");
@@ -410,6 +420,7 @@ export function App() {
       // Only the resend this was sent as ends; one the owner started while it was sending stays.
       setResending((old) => resendAfterSend(old, sentAs));
       setDraft((old) => old.trim() === text ? "" : old);
+      setReplyingTo((old) => old === replyTo ? null : old);
       setFeedback(""); remember(null); setReload((r) => r + 1);
     } catch (err) {
       // Definite refusals the daemon names (nothing was accepted), not network uncertainty.
@@ -459,7 +470,33 @@ export function App() {
     try { web.applyRequest(await dismissRequest(requestId, web.bootstrap, web.refreshBootstrap)); }
     catch { if (!quiet) setFeedback("Could not dismiss it yet. It is still kept; try again.", true); }
   };
+  /**
+   * A tapback on a message: its own request (no text), worded to the agent as
+   * an iMessage tapback. It never touches the draft, and the reader stays
+   * where they are. `replaces`: an interrupted reaction this one resends.
+   */
+  const react = async (quote: string, reaction: WebReaction, replaces?: string) => {
+    if (!session?.writable || !web.bootstrap || web.connection !== "live") return;
+    const requestId = crypto.randomUUID();
+    try {
+      const request = await sendMessage({ requestId, targetId: session.id, text: "", reply: { text: quote, reaction } }, web.bootstrap, web.refreshBootstrap);
+      web.acceptRequest({ ...request, text: "", timestamp: Date.now() });
+      if (replaces) void dismiss(replaces, true);
+      setReload((r) => r + 1);
+    } catch (err) {
+      const refusal = err instanceof ApiError && err.status === 503 ? refusalReasons[err.code] : undefined;
+      setFeedback(refusal ? refusal.replace("your draft is kept", "the reaction was not sent")
+        : err instanceof ApiError ? "Reaction was not sent. Reconnect or try again."
+        : "The reaction may not have been sent. Check the conversation before trying again.", true);
+    }
+  };
+  const startReply = (message: { id: string; role: string; content: string }) => {
+    setReplyingTo({ id: message.id, who: message.role === "assistant" ? agent : "yourself", text: quoteFor(message) });
+    input.current?.focus();
+  };
   const resend = (request: WebRequest) => {
+    // A tapback is sent again as it was: there is nothing to review.
+    if (request.reply?.reaction) { void react(request.reply.text, request.reply.reaction, request.requestId); return; }
     // A new restore: any earlier one still reading is void, and what it put back in the tray goes (as its draft does).
     const token = ++restoreToken.current;
     // Its files come back as they are: already filed, the resend names them by path (nothing is uploaded again).
@@ -469,14 +506,15 @@ export function App() {
     const expected = (request.images?.length ?? 0) + (request.files?.length ?? 0);
     setResending({ requestId: request.requestId, original: request.text ?? "", ...(fileKeys.length ? { fileKeys } : {}), ...(restoringImages ? { restoring: true } : {}), ...(expected ? { expected } : {}), token });
     setDraft(request.text ?? ""); input.current?.focus();
+    setReplyingTo(request.reply ? { id: "", who: "an earlier message", text: request.reply.text } : null);
     // Its images come back too: read from where they were filed, attached (uploaded) again.
     // Until every one is back, Send stays off — a send now would leave them behind.
     if (restoringImages) void reattach(request.images!, { fileKeys, expected, token });
     setFeedback("Review the message, then send it again. The interrupted one is dismissed once this is accepted.");
   };
   // The latest resend/dismiss, for buttons in memoized history rows (they read state from this render).
-  const latestActions = useRef({ resend, dismiss });
-  useLayoutEffect(() => { latestActions.current = { resend, dismiss }; });
+  const latestActions = useRef({ resend, dismiss, react, startReply });
+  useLayoutEffect(() => { latestActions.current = { resend, dismiss, react, startReply }; });
   /** Resend / Dismiss for an interrupted request awaiting the owner, on its bubble (history or pending). */
   const interruptedActions = (request: WebRequest | undefined) => request && <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
     <span>Not answered. {agent} may have started on it — check before resending.</span>
@@ -532,6 +570,10 @@ export function App() {
   const timeline = useMemo(() => interleave(history.messages, tools.items, toolsCutoff), [history.messages, tools.items, toolsCutoff]);
   const messageIndex = useMemo(() => new Map(history.messages.map((m, i) => [m.id, i])), [history.messages]);
   const parsed = useMemo(() => parsedMessages(history.messages), [history.messages]);
+  const group = session?.kind === "group";
+  // Who reacted to what: recorded tapbacks, this page's pending ones, and Tomo's (kept by the daemon).
+  const reactions = useMemo(() => collectReactions(history.messages, pendingUserMessages(web.requests, history, selectedId), web.reactions, group),
+    [history, web.requests, web.reactions, selectedId, group]);
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
   // A turn's step rows (calls, its todo list, its sources) sit close together; the last one keeps the gap before the next message.
   const toolBlock = (block: ToolBlock, running: boolean) => <div key={block.key} data-slot="turn-block" className="mx-auto mb-4 max-w-[740px] has-[+[data-slot=turn-block]]:mb-0.5">
@@ -544,7 +586,7 @@ export function App() {
   // one at a row's end depends on the next row and on today's date), nor is the live content of the last row.
   const appearedKey = [...appeared].join("\n");
   const messageViews = useMemo(() => new Map<string, React.JSX.Element>(),
-    [timeline, parsed, appearedKey, web.requests, flashId, confirmDismiss, agent, session?.kind, session?.writable, ownerConversation, selectedId, openGroups]);
+    [timeline, parsed, appearedKey, web.requests, flashId, confirmDismiss, agent, session?.kind, session?.writable, ownerConversation, selectedId, openGroups, reactions, web.connection]);
   const messageView = (row: Extract<ChatRowData, { kind: "message" }>, build: () => React.JSX.Element) => {
     let view = messageViews.get(row.id);
     if (!view) { view = build(); messageViews.set(row.id, view); }
@@ -716,18 +758,41 @@ export function App() {
           </>}>
           {rows.map((row, rowIndex) => <ChatRow key={row.id} row={row}>{row.kind === "message" && messageView(row, () => <>{row.tools.map((block) => toolBlock(block, false))}{(() => {
             const message = row.message; const index = messageIndex.get(message.id)!;
-            const { sent, reply, body, quoted } = parsed[index];
-            return <article id={`msg-${message.id}`} className={cn(`message ${message.role} mx-auto mb-7 max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]")} key={message.id}>
-            <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span><time dateTime={new Date(message.timestamp).toISOString()} title={messageDateTime(message.timestamp)} className="tabular-nums">{messageTime(message.timestamp)}</time><span>{channelLabel(message.channel)}</span>
+            const { sent, reply, body, quoted, tapback } = parsed[index];
+            const articleClass = (gap: string) => cn(`message ${message.role} group/message mx-auto ${gap} max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`, appeared.has(message.id) && !webRequestIds.has(message.requestId ?? "") && "motion-enter", flashId === message.id && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]");
+            const when = <><time dateTime={new Date(message.timestamp).toISOString()} title={messageDateTime(message.timestamp)} className="tabular-nums">{messageTime(message.timestamp)}</time><span>{channelLabel(message.channel)}</span></>;
+            if (tapback) return <article id={`msg-${message.id}`} className={articleClass("mb-5")} key={message.id}>
+              <TapbackLine who={session?.kind === "group" ? "Someone" : "You"} reaction={tapback.reaction} quote={tapback.reply?.excerpt}
+                meta={<span className="flex shrink-0 items-baseline gap-3 text-[11px] tracking-[0.02em]">{when}</span>} onQuote={quoted ? () => showMessage(quoted.id) : undefined} />
+              {interruptedActions(web.requests.find((r) => r.requestId === message.requestId && awaitingOwner(r)))}</article>;
+            const silent = message.role === "assistant" && body.trim() === "NO_REPLY";
+            // Tomo's silence after a tapback is the expected answer to one: nothing to show.
+            if (silent && parsed[index - 1]?.tapback) return <></>;
+            const shown = reactions.get(message.id) ?? [];
+            const mine = shown.find((r) => r.from !== "agent")?.reaction.kind;
+            const actionable = !silent && message.role !== "tool_summary";
+            return <article id={`msg-${message.id}`} className={articleClass("mb-7")} key={message.id}>
+            <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : message.role === "user" ? (session?.kind === "group" ? "Participant" : "You") : "System"}</span>{when}
               {sent && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{sendMarkerLabel(sent)}</Badge>}
-              {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}</div>
+              {message.role === "user" && historyBadge(message.requestId, web.requests) && <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{historyBadge(message.requestId, web.requests)}</Badge>}
+              {actionable && <MessageActions aria-label="Message actions" className="-my-1.5 ml-auto self-center">
+                {session?.writable && web.connection === "live" && <>
+                  <ReplyAction onReply={() => latestActions.current.startReply(message)} />
+                  <ReactAction current={mine} onReact={(kind) => void latestActions.current.react(quoteFor(message), kind)} /></>}
+                <CopyAction text={messageText(message.role, message.content)} /></MessageActions>}</div>
             {(message.role === "user" ? (node: React.JSX.Element) => ownBubble(node, message.requestId) : (node: React.JSX.Element) => node)(<div className={cn("markdown", message.role === "user" && "min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 max-[600px]:px-4 max-[600px]:py-3", message.role === "assistant" && "reading")}>
-              {message.role === "assistant" && body.trim() === "NO_REPLY"
+              {silent
                 // A turn that ended without a reply (silent by choice, or stopped): said plainly, not as the agent's words.
                 ? <p className="m-0 font-sans text-[12.5px] text-muted-foreground">No reply</p>
                 : <MessageBody body={body} reply={reply} sessionId={selectedId} onQuote={quoted ? () => showMessage(quoted.id) : undefined} thinking={message.role === "assistant" ? "joined" : undefined} />}</div>)}
+            <ReactionPills reactions={shown} agent={agent} className={message.role === "user" ? "relative z-[1] -mt-2.5 ml-3" : "mt-1"} />
             {message.role === "user" && interruptedActions(web.requests.find((r) => r.requestId === message.requestId && awaitingOwner(r)))}</article>; })()}</>)}
-          {row.kind === "pending" && ((request: WebRequest) => <article className="message user motion-enter mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
+          {row.kind === "pending" && ((request: WebRequest) => request.reply?.reaction
+            ? <article className="message user tapback motion-enter mx-auto mb-5 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
+              <TapbackLine who="You" reaction={reactionKind(request.reply.reaction)} quote={request.reply.text.replace(/\s+/g, " ").trim() || null}
+                meta={<Badge variant="outline" className="shrink-0 self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{pendingLabel(request)}</Badge>} />
+              {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>
+            : <article className="message user motion-enter mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId} key={request.requestId}>
             <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">You</span><span>Web</span>
               <Badge variant="outline" className="self-center rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{pendingLabel(request)}</Badge></div>
             {!sentImages[request.requestId] && request.images?.length ? <div className="mb-2 opacity-80"><MessageBody sessionId={selectedId}
@@ -737,8 +802,11 @@ export function App() {
             {((files) => files.length > 0 && <div className="mb-2 flex flex-wrap gap-2 opacity-80">
               {files.map((file, i) => <FileCard key={i} name={file.name} size={file.size === undefined ? undefined : formatSize(file.size)} />)}</div>)(
               sentFiles[request.requestId] ?? (request.files ?? []).map((file): { name: string; size?: number } => ({ name: file.name, size: file.size })))}
-            {request.text ? ownBubble(<div className="markdown min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80 max-[600px]:px-4 max-[600px]:py-3"><Text breaks>{request.text}</Text></div>, request.requestId)
+            {request.text ? ownBubble(<div className="markdown min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 opacity-80 max-[600px]:px-4 max-[600px]:py-3">
+              {request.reply && <ReplyQuote reply={{ verb: "replying", excerpt: request.reply.text.replace(/\s+/g, " ").trim() || null, truncated: false }} />}
+              <Text breaks>{request.text}</Text></div>, request.requestId)
               : ownBubble(null, request.requestId)}
+            <ReactionPills reactions={reactions.get(request.requestId) ?? []} agent={agent} className="relative z-[1] -mt-2.5 ml-3" />
             {interruptedActions(awaitingOwner(request) ? request : undefined)}</article>)(row.request)}
           {rowIndex === rows.length - 1 && <>
           {timeline.trailing.map((block) => toolBlock(block, turnActive))}
@@ -782,6 +850,13 @@ export function App() {
                 className="absolute top-1 right-1 grid size-6 place-items-center rounded-full bg-foreground/70 text-background transition-colors hover:bg-foreground focus-visible:outline-offset-0"><X className="size-3" strokeWidth={2.5} /></button>
             </li>)}</ul>}
           {attachments.note && <p className="m-0 mb-2 text-[12px] text-muted-foreground" role="status">{attachments.note}</p>}
+          {replyingTo && session?.writable && <div className="motion-enter mb-2 flex items-center gap-2.5 rounded-2xl border bg-card/70 py-1.5 pr-1.5 pl-3" role="group" aria-label="Replying">
+            <Reply className="size-4 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
+            <div className="min-w-0 flex-1 border-l-2 border-muted-foreground/40 pl-2.5">
+              <span className="block text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">Replying to {replyingTo.who}</span>
+              <span className="block truncate text-[12.5px] leading-snug text-foreground/80">{replyingTo.text || "an earlier message"}</span></div>
+            <Button type="button" variant="ghost" size="icon" aria-label="Cancel reply" title="Cancel reply (Esc)" onClick={() => { setReplyingTo(null); input.current?.focus(); }}
+              className="size-7 shrink-0 rounded-full text-muted-foreground hover:text-foreground"><X className="size-3.5" strokeWidth={2} /></Button></div>}
           <form onSubmit={(e) => void send(e)} className="composer flex items-end gap-1 rounded-[20px] border bg-card p-2.5 shadow-xs transition-[border-color,box-shadow] focus-within:border-muted-foreground/50 focus-within:shadow-md">
             <input ref={fileInput} type="file" {...(filesOn ? {} : { accept: "image/png,image/jpeg,image/gif,image/webp,image/heic,image/heif,.heic,.heif" })} multiple hidden
               onChange={(e) => { attachments.add(Array.from(e.target.files ?? [])); e.target.value = ""; input.current?.focus(); }} />
@@ -800,7 +875,9 @@ export function App() {
                 // A file on the clipboard is attached; text that came with it still pastes.
                 if (!Array.from(e.clipboardData.types).includes("text/plain")) e.preventDefault();
               }} onCompositionStart={() => ime.current.start()} onCompositionEnd={() => ime.current.end()}
-              onKeyDown={(e) => { if (ime.current.shouldSubmit({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
+              onKeyDown={(e) => {
+                if (e.key === "Escape" && replyingTo && !e.nativeEvent.isComposing) { e.preventDefault(); e.stopPropagation(); setReplyingTo(null); return; }
+                if (ime.current.shouldSubmit({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
             {showStop ? <Button type="button" size="icon" aria-label={`Stop ${agent}`} title="Stop" aria-busy={stopping} disabled={stopping} onClick={() => void stop()}
               className="size-9 shrink-0 rounded-full bg-foreground text-background transition-[background-color,transform] hover:bg-foreground/85 active:scale-[0.94] disabled:opacity-60 [&_svg:not([class*='size-'])]:size-3.5">
               <Square fill="currentColor" strokeWidth={0} /></Button> :

@@ -1,7 +1,7 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync, chmodSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { RequestState, WebFiledFile } from "./protocol.js";
+import { webReplySchema, type RequestState, type WebFiledFile, type WebReply } from "./protocol.js";
 
 const isFiledFile = (value: unknown): value is WebFiledFile => {
   const file = value as Partial<WebFiledFile> | null;
@@ -51,14 +51,15 @@ const TERMINAL: ReadonlySet<RequestState> = new Set(["completed", "failed", "ref
 export type Resolution = "recorded" | "dismissed";
 type JournalRecord =
   /** `images`: where the message's attached images were filed (memory/incoming-images), kept with the text. */
-  | { op: "recv"; id: string; digest: string; ts: number; text?: string; images?: string[]; files?: WebFiledFile[] }
+  | { op: "recv"; id: string; digest: string; ts: number; text?: string; images?: string[]; files?: WebFiledFile[]; reply?: WebReply }
   | { op: "state"; id: string; state: RequestState }
   | { op: "resolve"; id: string; how: Resolution }
   /** The owner's session has been told about this interrupted request. */
   | { op: "notified"; id: string };
 
 /** `files`: where the message's attached non-image files were filed (memory/incoming-files). */
-export interface JournalEntry { requestId: string; digest: string; timestamp: number; state: RequestState; text?: string; images?: string[]; files?: WebFiledFile[] }
+/** `reply`: what the message replied or reacted to, kept with the text. */
+export interface JournalEntry { requestId: string; digest: string; timestamp: number; state: RequestState; text?: string; images?: string[]; files?: WebFiledFile[]; reply?: WebReply }
 export interface JournalLoad {
   /** Every retained request, oldest first. Unresolved interrupted ones carry their full text. */
   entries: JournalEntry[];
@@ -114,13 +115,14 @@ export class WebRequestJournal {
         entries.set(record.id, { requestId: record.id, digest: record.digest, timestamp: Number(record.ts) || 0,
           state: "queued", ...(typeof record.text === "string" ? { text: record.text } : {}),
           ...(Array.isArray(record.images) && record.images.every((p: unknown) => typeof p === "string") ? { images: record.images.slice(0, 6) } : {}),
-          ...(Array.isArray(record.files) && record.files.every(isFiledFile) ? { files: record.files.slice(0, 6) } : {}) });
+          ...(Array.isArray(record.files) && record.files.every(isFiledFile) ? { files: record.files.slice(0, 6) } : {}),
+          ...(record.reply !== undefined && webReplySchema.safeParse(record.reply).success ? { reply: record.reply } : {}) });
       } else if (record?.op === "state" && typeof record.id === "string") {
         const entry = entries.get(record.id);
-        if (entry) { entry.state = record.state; if (record.state !== "interrupted") { delete entry.text; delete entry.images; delete entry.files; } }
+        if (entry) { entry.state = record.state; if (record.state !== "interrupted") { delete entry.text; delete entry.images; delete entry.files; delete entry.reply; } }
       } else if (record?.op === "resolve" && typeof record.id === "string") {
         const entry = entries.get(record.id);
-        if (entry) { entry.resolved = record.how; delete entry.text; delete entry.images; delete entry.files; }
+        if (entry) { entry.resolved = record.how; delete entry.text; delete entry.images; delete entry.files; delete entry.reply; }
       } else if (record?.op === "notified" && typeof record.id === "string") {
         const entry = entries.get(record.id);
         if (entry) entry.notified = true;
@@ -141,12 +143,12 @@ export class WebRequestJournal {
   }
 
   /** Durable before custody: throws when the record could not be fsynced. */
-  recordReceived(requestId: string, digest: string, text: string, timestamp: number, images?: string[], files?: WebFiledFile[]): void {
+  recordReceived(requestId: string, digest: string, text: string, timestamp: number, images?: string[], files?: WebFiledFile[], reply?: WebReply): void {
     // In the map BEFORE the append: an append can trigger compaction, which
     // rewrites the file from the map and would otherwise drop this record.
     const previous = this.entries.get(requestId);
     this.entries.delete(requestId);
-    const attached = { ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}) };
+    const attached = { ...(images?.length ? { images } : {}), ...(files?.length ? { files } : {}), ...(reply ? { reply } : {}) };
     this.entries.set(requestId, { requestId, digest, timestamp, state: "queued", text, ...attached });
     try { this.append({ op: "recv", id: requestId, digest, ts: timestamp, text, ...attached }); } catch (err) {
       this.entries.delete(requestId);
@@ -161,7 +163,7 @@ export class WebRequestJournal {
     const entry = this.entries.get(requestId);
     if (!this.loaded || !entry || !TERMINAL.has(state) || entry.state === state) return;
     entry.state = state;
-    if (state !== "interrupted") { delete entry.text; delete entry.images; delete entry.files; }
+    if (state !== "interrupted") { delete entry.text; delete entry.images; delete entry.files; delete entry.reply; }
     try { this.append({ op: "state", id: requestId, state }); } catch { /* Read back as interrupted. */ }
   }
 
@@ -174,15 +176,18 @@ export class WebRequestJournal {
     const text = entry.text;
     const images = entry.images;
     const files = entry.files;
+    const reply = entry.reply;
     entry.resolved = how;
     delete entry.text;
     delete entry.images;
     delete entry.files;
+    delete entry.reply;
     try { this.append({ op: "resolve", id: requestId, how }); } catch (err) {
       delete entry.resolved;
       if (text !== undefined) entry.text = text;
       if (images) entry.images = images;
       if (files) entry.files = files;
+      if (reply) entry.reply = reply;
       throw err;
     }
   }
@@ -200,7 +205,7 @@ export class WebRequestJournal {
   private view(entry: Entry): JournalEntry {
     return { requestId: entry.requestId, digest: entry.digest, timestamp: entry.timestamp, state: entry.state,
       ...(entry.text !== undefined ? { text: entry.text } : {}), ...(entry.images ? { images: [...entry.images] } : {}),
-      ...(entry.files ? { files: [...entry.files] } : {}) };
+      ...(entry.files ? { files: [...entry.files] } : {}), ...(entry.reply ? { reply: { ...entry.reply } } : {}) };
   }
 
   /** Holds text the owner has not dealt with yet: never evicted. */
@@ -240,7 +245,8 @@ export class WebRequestJournal {
       const text = this.pinned(entry) ? entry.text : undefined;
       const images = this.pinned(entry) ? entry.images : undefined;
       const files = this.pinned(entry) ? entry.files : undefined;
-      lines.push(JSON.stringify({ op: "recv", id: entry.requestId, digest: entry.digest, ts: entry.timestamp, ...(text !== undefined ? { text } : {}), ...(images ? { images } : {}), ...(files ? { files } : {}) }));
+      const reply = this.pinned(entry) ? entry.reply : undefined;
+      lines.push(JSON.stringify({ op: "recv", id: entry.requestId, digest: entry.digest, ts: entry.timestamp, ...(text !== undefined ? { text } : {}), ...(images ? { images } : {}), ...(files ? { files } : {}), ...(reply ? { reply } : {}) }));
       if (TERMINAL.has(entry.state)) lines.push(JSON.stringify({ op: "state", id: entry.requestId, state: entry.state }));
       if (entry.resolved) lines.push(JSON.stringify({ op: "resolve", id: entry.requestId, how: entry.resolved }));
       if (entry.notified) lines.push(JSON.stringify({ op: "notified", id: entry.requestId }));

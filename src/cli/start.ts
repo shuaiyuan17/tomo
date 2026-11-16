@@ -240,6 +240,7 @@ async function startForeground(): Promise<void> {
         outgoingMedia: config.workspaceDir && guard
           ? new OutgoingMediaStore(outgoingImagesDir(config.workspaceDir), { isPrivate: guard.isPrivateAttachmentPath }) : undefined,
         journal: new WebRequestJournal(join(config.tomoHome, "data", "web", "requests.jsonl")),
+        reactionsPath: join(config.tomoHome, "data", "web", "reactions.json"),
         ownerKey: ownerSessionKeyReader({
         owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
         taskOutput: (key, taskId) => agent.readTaskOutput(key, taskId),

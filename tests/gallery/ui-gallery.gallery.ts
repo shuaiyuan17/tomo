@@ -29,6 +29,7 @@ import { Agent, MockChannel, SessionStore, installAgentTestHooks, mockConfig, mo
 import { solidPng } from "../helpers/png.js";
 import { seedCostLedger } from "../helpers/cost-fixture.js";
 import { WebChannel } from "../../src/channels/web.js";
+import { formatReactionMarker } from "../../src/channels/text-utils.js";
 import { WebSupervisor } from "../../src/web/supervisor.js";
 import { watchBus } from "../../src/watch/bus.js";
 import { CronStore } from "../../src/cron/store.js";
@@ -174,12 +175,17 @@ function seedConversation(store: SessionStore): void {
   add("assistant", "Sure — give me a minute to read through it.", "telegram", day1 + 60_000);
   add("user", `[Sent an image, saved to: ${image}] this is what I see in Finder`, "telegram", day1 + 120_000);
   add("assistant", "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了", "imessage", day1 + 180_000);
+  // An iMessage tapback on it: a pill on the message and one quiet line, not a bubble.
+  add("user", formatReactionMarker("love", "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了"), "imessage", day1 + 200_000);
+  add("assistant", "NO_REPLY", "imessage", day1 + 201_000);
   add("user", '[replying to: "强哥的 #383 捡起来了，拆成了 3 个 PR，第一个已经合了"] nicenice！！ 那第二个呢？', "imessage", day1 + 240_000);
   const q = BASE - 40 * 60_000;
   add("user", "Walk me through the plan in detail please, with a table of the keys and some code.", "web", q);
   add("assistant", LONG_MD, "web", q + 50_000);
   add("user", "Perfect. One more: a very long message from me to see how my own bubble wraps when it goes on for several lines, including a URL https://example.com/owner/project/pull/513/files#diff-0123456789abcdef0123456789abcdef and `inline code` too.\nSecond line\nThird line", "web", q + 120_000);
   add("assistant", "Short answer: yes.", "web", q + 125_000);
+  add("user", formatReactionMarker("like", "Short answer: yes."), "web", q + 130_000);
+  add("assistant", "NO_REPLY", "web", q + 131_000);
   store.updateStats("dm:owner", { costUsd: 0.4, inputTokens: 1000, outputTokens: 400, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 128_400, contextMax: 200_000,
     contextBreakdown: [{ name: "System prompt", tokens: 12_000 }, { name: "Messages", tokens: 110_000 }] });
 
@@ -431,6 +437,30 @@ async function conversationSteps(page: Page, vp: Viewport, theme: Theme): Promis
   }
 }
 
+/** A message's actions (reply, react, copy): the reaction picker open, and the composer replying. */
+async function messageActionSteps(page: Page, vp: Viewport, theme: Theme): Promise<void> {
+  const s = (surface: string, state: string, act: (snap: Snap) => Promise<void>) => step(page, vp, theme, surface, state, act);
+  const lastReply = () => history(page).locator("article.message.assistant").filter({ hasText: "Short answer" }).last();
+  await s("message", "react", async (snap) => {
+    await reset(page);
+    const article = lastReply();
+    await article.scrollIntoViewIfNeeded();
+    await article.hover({ timeout: 3000 });
+    await article.getByRole("button", { name: "React" }).click({ timeout: 3000 });
+    await page.getByRole("button", { name: "Ha ha" }).waitFor();
+    await snap({ keepPointer: true });
+  });
+  await s("composer", "replying", async (snap) => {
+    await reset(page);
+    const article = lastReply();
+    await article.scrollIntoViewIfNeeded();
+    await article.hover({ timeout: 3000 });
+    await article.getByRole("button", { name: "Reply" }).click({ timeout: 3000 });
+    await page.getByRole("group", { name: "Replying" }).waitFor();
+    await snap();
+  });
+}
+
 /** Composer states. Run last: a sent message joins the transcript every later shot would show. */
 async function composerSteps(page: Page, vp: Viewport, theme: Theme): Promise<void> {
   const s = (surface: string, state: string, act: (snap: Snap) => Promise<void>) => step(page, vp, theme, surface, state, act);
@@ -599,6 +629,7 @@ for (const vp of Object.keys(VIEWPORTS) as Viewport[]) for (const theme of THEME
     await boot({ conversation: true });
     const page = await open(vp, theme);
     await conversationSteps(page, vp, theme);
+    await messageActionSteps(page, vp, theme);
     await chromeSteps(page, vp, theme);
     await composerSteps(page, vp, theme);
     await page.close();

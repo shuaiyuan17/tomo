@@ -1,7 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstatSync, rmSync } from "node:fs";
+import { lstatSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { dirname } from "node:path";
+import { writeJsonAtomicSync } from "../fs-utils.js";
+import { log } from "../logger.js";
 import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
-import type { Channel, CommandHandler, IncomingMessage, MessageHandler, OutgoingMessage } from "./types.js";
+import type { Channel, CommandHandler, IncomingMessage, MessageHandler, MessageReaction, OutgoingMessage } from "./types.js";
 import { markDefiniteFailure } from "./types.js";
 import { watchBus, type WatchBus } from "../watch/bus.js";
 import type { WatchEvent, WatchTask } from "../watch/protocol.js";
@@ -22,7 +25,8 @@ import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request
 import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
 import type { WebHome, WebModelChangeResult, WebModelView } from "../web/protocol.js";
 import { modelLabel } from "../models.js";
-import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WebError, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type TaskAction, type WebStopResult, type WebTaskActionResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess, type WebFiledFile } from "../web/protocol.js";
+import { formatReactionMarker, formatReplyContextMarker } from "./text-utils.js";
+import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WEB_REACTIONS, WEB_REQUEST_QUOTE_LIMIT, WebError, type WebReaction, type WebReply, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type TaskAction, type WebStopResult, type WebTaskActionResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess, type WebFiledFile } from "../web/protocol.js";
 
 /** A running tool's progress reaches the browser at most this often; the page counts in between. */
 export const TOOL_PROGRESS_EVERY_MS = 10_000;
@@ -39,6 +43,8 @@ export const OWNER_KEY_CHECK_MS = 1_000;
 export const MAX_INTERRUPTED_BACKLOG = 64;
 /** Snapshot bytes left for reply blocks and pending request text after the receipts envelope and the task panel. */
 const SNAPSHOT_MAILBOX_BYTES = MAX_BUFFER_BYTES - 64 * 1024 - MAX_SNAPSHOT_TASK_BYTES;
+/** Tomo's reactions on web messages kept (and shipped in the snapshot): the most recent ones. */
+export const MAX_WEB_REACTIONS = 256;
 
 export interface WebLifecycle { start(): Promise<void>; stop(): Promise<void> }
 /** The daemon side of Tomo's home (src/home/service.ts) as the browser reaches it. */
@@ -58,6 +64,15 @@ const MODEL_REFUSAL_STATUS: Record<ModelSwitchRefusal, number> = {
   model_changed: 409, turn_in_flight: 409, persist_failed: 503,
 };
 interface Receipt { digest: string; request: WebRequest; settled: boolean }
+/** Snapshot bytes a request holds while its text is kept: the text and what it replied to. */
+const heldBytes = (request: { text?: string; reply?: WebReply }) =>
+  (request.text !== undefined ? Buffer.byteLength(JSON.stringify(request.text)) : 0)
+  + (request.reply ? Buffer.byteLength(JSON.stringify(request.reply)) : 0);
+/** A reply's quote as a request keeps it: enough for the pending bubble's two lines. */
+const keptReply = (reply: WebReply): WebReply => {
+  const points = Array.from(reply.text);
+  return { ...reply, text: points.length > WEB_REQUEST_QUOTE_LIMIT ? `${points.slice(0, WEB_REQUEST_QUOTE_LIMIT).join("")}…` : reply.text };
+};
 
 /** A real channel: only Agent's registered MessageHandler accepts input, and
  * only the existing delivery pipeline calls send. HTTP is an optional peer. */
@@ -101,6 +116,10 @@ export class WebChannel implements Channel {
   private rateLimit: WebRateLimit | undefined;
   /** The SDK's standing prompt suggestion per browser session. */
   private suggestions = new Map<string, string>();
+  /** Tomo's reaction on each of the owner's web messages it reacted to, oldest first (see reactToMessage). */
+  private reactions = new Map<string, WebReaction>();
+  /** Where they are kept across restarts; undefined: in memory only (no path, or the file was unreadable). */
+  private reactionsPath: string | undefined;
   /** When a tool's progress was last sent to the browser, by tool_use id. */
   private toolProgressAt = new Map<string, number>();
   private readonly toolCommand: ((sessionKey: string, toolUseId: string) => string | undefined) | undefined;
@@ -155,7 +174,9 @@ export class WebChannel implements Channel {
       /** Every key in the session registry: where a group's browser session id is looked up. */
       sessionKeys?: () => readonly string[];
       /** Tomo's home (scene, status, snapshots); absent: the Home page has nothing to show (503). */
-      home?: WebHomeAccess } = {}) {
+      home?: WebHomeAccess;
+      /** Where Tomo's reactions on web messages are kept (JSON); absent: in memory only. */
+      reactionsPath?: string } = {}) {
     this.homeAccess = options.home;
     this.models = options.models;
     this.sessionKeys = options.sessionKeys;
@@ -180,6 +201,7 @@ export class WebChannel implements Channel {
     this.unsubscribe = this.bus.subscribe((event) => this.observe(event));
     this.journal = options.journal;
     if (this.journal) this.restore(this.journal);
+    if (options.reactionsPath) this.loadReactions(options.reactionsPath);
     // Uploads claimed when the last run stopped: recorded ones go, the rest return to staging.
     if (this.uploads) recoverClaims(this.uploads.dir, (requestId) => this.receipts.has(requestId));
   }
@@ -194,9 +216,10 @@ export class WebChannel implements Channel {
         ...(this.ownerId ? { sessionId: this.ownerId } : {}), ...(entry.text !== undefined ? { text: entry.text } : {}),
         ...(entry.images?.length ? { images: entry.images } : {}),
         ...(entry.files?.length ? { files: entry.files } : {}),
+        ...(entry.reply ? { reply: entry.reply } : {}),
         // History: a request whose turn completed was read, whatever the last run saw.
         ...(entry.state === "completed" ? { read: true } : {}) };
-      if (entry.text !== undefined) this.pendingTextBytes += Buffer.byteLength(JSON.stringify(entry.text));
+      if (entry.text !== undefined) this.pendingTextBytes += heldBytes(request);
       this.receipts.set(entry.requestId, { digest: entry.digest, request, settled: true });
     }
     this.interruptedAtStart.push(...loaded.interrupted);
@@ -222,7 +245,9 @@ export class WebChannel implements Channel {
     if (input.targetId !== undefined && input.targetId !== this.ownerId) throw new WebError(403, "owner_dm_only");
     if (this.journalUnavailable) throw new WebError(503, "journal_unavailable");
     const attached = [...(input.images ?? []), ...(input.files ?? []).map((file) => `${file.id}:${file.type}:${file.name}`), ...(input.refiled ?? []).map((path) => `refiled:${path}`)];
-    const digest = createHash("sha256").update(attached.length ? `${input.text}\0${attached.join(",")}` : input.text).digest("hex");
+    // What it replies to is part of the message (absent: the digest older receipts were recorded with).
+    const replied = input.reply ? `\0reply:${input.reply.reaction ?? ""}:${input.reply.text}` : "";
+    const digest = createHash("sha256").update((attached.length ? `${input.text}\0${attached.join(",")}` : input.text) + replied).digest("hex");
     const previous = this.receipts.get(input.requestId);
     if (previous) {
       if (previous.digest !== digest) throw new WebError(409, "request_id_conflict");
@@ -230,7 +255,8 @@ export class WebChannel implements Channel {
     }
     const backlog = this.interruptedBacklog();
     if (backlog.count >= MAX_INTERRUPTED_BACKLOG || backlog.bytes > SNAPSHOT_MAILBOX_BYTES / 2) throw new WebError(503, "interrupted_backlog");
-    const textBytes = Buffer.byteLength(JSON.stringify(input.text));
+    const reply = input.reply ? keptReply(input.reply) : undefined;
+    const textBytes = heldBytes({ text: input.text, reply });
     if (this.pendingTextBytes + this.blockBytes + textBytes > SNAPSHOT_MAILBOX_BYTES) throw new WebError(429, "request_limit");
     if ([...this.receipts.values()].filter((r) => !r.settled).length >= 32) {
       throw new WebError(429, "request_limit");
@@ -261,13 +287,13 @@ export class WebChannel implements Channel {
     const filedFiles: WebFiledFile[] = [...refiled, ...(uploads?.notices ?? []).flatMap((notice) => notice.savedPath
       ? [{ path: notice.savedPath, name: notice.filename, type: notice.mimeType, size: notice.byteSize ?? 0, ...(notice.mimeUnknown ? { typeUnknown: true } : {}) }] : [])];
     const request: WebRequest = { requestId: input.requestId, state: "queued", sessionId: this.ownerId, text: input.text, timestamp: this.now(), responseTurnId: input.requestId,
-      ...(filed.length ? { images: filed } : {}), ...(filedFiles.length ? { files: filedFiles } : {}) };
+      ...(filed.length ? { images: filed } : {}), ...(filedFiles.length ? { files: filedFiles } : {}), ...(reply ? { reply } : {}) };
     this.receipts.set(input.requestId, { digest, request, settled: false });
     this.pendingTextBytes += textBytes;
     // Durable before custody: a crash after the 202 must leave a record.
     // Durable first, with the filed images' paths; only then do the staged
     // copies go. A failure leaves them staged, so the page can retry the same ids.
-    try { this.journal?.recordReceived(input.requestId, digest, input.text, request.timestamp!, filed, filedFiles); } catch {
+    try { this.journal?.recordReceived(input.requestId, digest, input.text, request.timestamp!, filed, filedFiles, reply); } catch {
       uploads?.undo();
       this.clearRequestText(this.receipts.get(input.requestId)!);
       this.receipts.delete(input.requestId);
@@ -277,7 +303,11 @@ export class WebChannel implements Channel {
     // Images first, then files — the order the iMessage channel writes its markers in.
     // A resend's files are announced exactly as the first time (the same path, name, type and size).
     const notices: SavedFileNotice[] = filedFiles.map((file) => ({ filename: file.name, mimeType: file.type, byteSize: file.size, mimeUnknown: file.typeUnknown, savedPath: file.path, status: "saved" }));
-    const marker = [images ? formatImageMarker(images.list.length, filed, images.unconverted) : "", formatFileMarker(notices)].filter(Boolean).join(" ");
+    // A reply's quote leads, as on iMessage (reply, then attachments); a
+    // reaction is the whole message, worded as an iMessage tapback. The
+    // quoted text is the FULL original the page sent, not the kept copy.
+    const marker = input.reply?.reaction ? formatReactionMarker(input.reply.reaction, input.reply.text)
+      : [input.reply ? formatReplyContextMarker(input.reply.text) : "", images ? formatImageMarker(images.list.length, filed, images.unconverted) : "", formatFileMarker(notices)].filter(Boolean).join(" ");
     const message: IncomingMessage = { id: input.requestId, chatId: WEB_CHAT_ID, senderName: "Owner",
       text: marker ? (input.text ? `${marker} ${neutralizeMarker(input.text)}` : marker) : neutralizeMarker(input.text), timestamp: Date.now(), isGroup: false,
       ...(images ? { images: images.list } : {}) };
@@ -393,7 +423,8 @@ export class WebChannel implements Channel {
     return { epoch: this.events.epoch, cursor: this.events.cursor(), requests, blocks, tasks,
       ...(this.compactState ? { compact: { ...this.compactState } } : {}),
       ...(this.rateLimit ? { rateLimit: { ...this.rateLimit } } : {}),
-      ...(this.suggestions.size ? { suggestions: Object.fromEntries(this.suggestions) } : {}) };
+      ...(this.suggestions.size ? { suggestions: Object.fromEntries(this.suggestions) } : {}),
+      ...(this.reactions.size ? { reactions: Object.fromEntries(this.reactions) } : {}) };
   }
 
   /**
@@ -643,6 +674,55 @@ export class WebChannel implements Channel {
     this.blockBytes += bytes;
   }
 
+  /**
+   * Tomo's tapback on one of the owner's web messages (`react_to_message`):
+   * `messageId` is the request id the message was received under, which is
+   * what the agent records as the latest inbound message. One reaction per
+   * message, as on iMessage: a new one replaces it, `remove` takes it back.
+   * Shown on the message at once and kept across restarts (the transcript
+   * records no reaction of Tomo's, on any channel).
+   */
+  async reactToMessage(_chatId: string, messageId: string, reaction: MessageReaction, remove = false): Promise<void> {
+    if (this.tornDown || !this.ownerId) throw markDefiniteFailure(new Error("Web outlet unavailable"));
+    if (!this.receipts.has(messageId)) throw markDefiniteFailure(new Error("That web message is no longer known; react to a newer one"));
+    if (remove ? this.reactions.get(messageId) === undefined : this.reactions.get(messageId) === reaction) return;
+    this.reactions.delete(messageId);
+    if (!remove) this.reactions.set(messageId, reaction);
+    while (this.reactions.size > MAX_WEB_REACTIONS) this.reactions.delete(this.reactions.keys().next().value!);
+    this.saveReactions();
+    try { this.events.publish({ type: "reaction", sessionId: this.ownerId, requestId: messageId, reaction: remove ? null : reaction }); }
+    catch { /* The snapshot carries it; the page reads it on its next sync. */ }
+  }
+
+  /** An unreadable file is not an empty one: it is left alone and reactions stay in memory. */
+  private loadReactions(path: string): void {
+    let raw: string;
+    try { raw = readFileSync(path, "utf8"); } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") this.reactionsPath = path;
+      else log.warn({ err, path }, "Web reactions file unreadable; Tomo's reactions on web messages are kept in memory only");
+      return;
+    }
+    try {
+      const parsed = JSON.parse(raw) as { reactions?: unknown };
+      if (!Array.isArray(parsed.reactions)) throw new Error("no reactions list");
+      for (const item of parsed.reactions.slice(-MAX_WEB_REACTIONS)) {
+        const [id, reaction] = Array.isArray(item) ? item : [];
+        if (typeof id === "string" && id.length <= 128 && (WEB_REACTIONS as readonly unknown[]).includes(reaction)) this.reactions.set(id, reaction as WebReaction);
+      }
+      this.reactionsPath = path;
+    } catch (err) {
+      log.warn({ err, path }, "Web reactions file unparseable; Tomo's reactions on web messages are kept in memory only");
+    }
+  }
+
+  private saveReactions(): void {
+    if (!this.reactionsPath) return;
+    try {
+      mkdirSync(dirname(this.reactionsPath), { recursive: true, mode: 0o700 });
+      writeJsonAtomicSync(this.reactionsPath, { version: 1, reactions: [...this.reactions] }, { mode: 0o600 });
+    } catch (err) { log.warn({ err }, "Could not save Tomo's reactions on web messages"); }
+  }
+
   startTyping(_chatId: string) {
     if (this.ownerId) this.events.publish({ type: "typing", sessionId: this.ownerId, active: true });
     return () => { if (this.ownerId) this.events.publish({ type: "typing", sessionId: this.ownerId, active: false }); };
@@ -713,10 +793,11 @@ export class WebChannel implements Channel {
   }
 
   private clearRequestText(receipt: Receipt): void {
-    if (receipt.request.text !== undefined) this.pendingTextBytes -= Buffer.byteLength(JSON.stringify(receipt.request.text));
+    if (receipt.request.text !== undefined) this.pendingTextBytes -= heldBytes(receipt.request);
     delete receipt.request.text;
     delete receipt.request.images;
     delete receipt.request.files;
+    delete receipt.request.reply;
   }
 
   private state(requestId: string, state: WebRequest["state"]): void {

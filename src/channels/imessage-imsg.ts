@@ -5,7 +5,7 @@ import type { AdmissionPredicate, Channel, IncomingMessage, OutgoingMessage, Sen
 import { AttachmentUnreadableError, PartialSendError, markNothingSent, markPartsSent } from "./types.js";
 import { formatFileMarker } from "./fileStore.js";
 import { log } from "../logger.js";
-import { splitText, formatReplyContextMarker, isSatelliteService, SATELLITE_MARKER } from "./text-utils.js";
+import { splitText, formatReactionMarker, formatReplyContextMarker, isSatelliteService, SATELLITE_MARKER } from "./text-utils.js";
 import { MessageGuidDedupeStore } from "./imessage-dedupe.js";
 import { ChatDbServiceLookup, type ServiceLookup } from "./imsg-satellite.js";
 import { isStickerStagingRefusal, stickerStagingDiagnosis } from "./imsg-sticker-staging.js";
@@ -940,16 +940,13 @@ export class ImsgChannel implements Channel {
     const original = reactedToGuid
       ? this.recentByChat.get(chatGuid)?.find((m) => m.id === reactedToGuid)?.text
       : undefined;
-    const target = original ? formatReplyContextMarker(original).replace(/^\[replying to/, "[reacting to") : "";
 
     const message: IncomingMessage = {
       id: meta.guid,
       chatId: chatGuid,
       senderName: meta.senderName,
       senderId: meta.sender ? this.normalizeAddress(meta.sender) : undefined,
-      text: target
-        ? `${target} [tapback: ${reaction}]`
-        : `[tapback: ${reaction} on an earlier message]`,
+      text: formatReactionMarker(reaction, original),
       timestamp: meta.timestampMs,
       isGroup: data.is_group === true || chatGuid.includes(";+;"),
       // Tapbacks are ambient signals, not summons — never treat as mentioned,

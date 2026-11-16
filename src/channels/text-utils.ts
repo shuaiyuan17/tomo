@@ -68,6 +68,21 @@ export function formatReplyContextMarker(originalText?: string): string {
   return `[replying to: "${excerpt}"]`;
 }
 
+/**
+ * Marker for an inbound reaction (iMessage tapback, a reaction from the web
+ * UI): `[reacting to: "<excerpt>"] [tapback: <reaction>]`, or the quote-less
+ * `[tapback: <reaction> on an earlier message]` when the original text is
+ * unknown. The excerpt follows {@link formatReplyContextMarker} exactly (the
+ * web UI reads both back with the same parser); the reaction name is
+ * sender-controlled on iMessage (a custom emoji), so it is neutralised too.
+ */
+export function formatReactionMarker(reaction: string, originalText?: string): string {
+  const name = neutralizeMarkerDelimiters(reaction).trim();
+  const collapsed = originalText?.replace(/\s+/g, " ").trim();
+  if (!collapsed) return `[tapback: ${name} on an earlier message]`;
+  return `${formatReplyContextMarker(collapsed).replace(/^\[replying to/, "[reacting to")} [tapback: ${name}]`;
+}
+
 /** Leading half of a UTF-16 surrogate pair; slicing after one splits a character. */
 function isHighSurrogate(unit: number): boolean {
   return unit >= 0xd800 && unit <= 0xdbff;

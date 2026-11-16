@@ -5,6 +5,7 @@ import type { HomeScene } from "../home/scene.js";
 import type { HomeStatus } from "../home/status.js";
 import type { ContextSection } from "../lcm/stats.js";
 import type { SummaryBlock } from "../lcm/summary-reader.js";
+import type { MessageReaction } from "../channels/types.js";
 
 export const WEB_CHAT_ID = "owner";
 // JSON can escape one UTF-16 code unit as six bytes (e.g. a lone surrogate).
@@ -12,6 +13,23 @@ export const WEB_CHAT_ID = "owner";
 export const MAX_BODY_BYTES = 128 * 1024;
 export const MAX_EVENT_BYTES = 256 * 1024;
 export const MAX_BUFFER_BYTES = 2 * 1024 * 1024;
+/** The tapbacks a web message can carry: the channels' own MessageReaction set (iMessage tapback kinds, Telegram emoji). */
+export const WEB_REACTIONS = ["love", "like", "dislike", "laugh", "emphasize", "question"] as const satisfies readonly MessageReaction[];
+export type WebReaction = (typeof WEB_REACTIONS)[number];
+/** Longest quoted text a web reply or reaction carries (the agent sees a 60-code-point excerpt of it, as on iMessage). */
+export const WEB_REPLY_TEXT_LIMIT = 2_000;
+/**
+ * The earlier message a web message answers, as the iMessage channel sees a
+ * long-press Reply or a tapback: its text, quoted to the agent by the same
+ * `[replying to: "…"]` / `[reacting to: "…"] [tapback: …]` markers
+ * (channels/text-utils.ts). With `reaction` the message IS the tapback, and
+ * carries no text or attachments of its own.
+ */
+export const webReplySchema = z.object({
+  text: z.string().max(WEB_REPLY_TEXT_LIMIT),
+  reaction: z.enum(WEB_REACTIONS).optional(),
+}).strict();
+export type WebReply = z.infer<typeof webReplySchema>;
 export const messageInputSchema = z.object({
   requestId: z.uuid(),
   targetId: z.string().max(128).optional(),
@@ -29,7 +47,13 @@ export const messageInputSchema = z.object({
    *  its request lists them), attached again from where they are — never a
    *  path the daemon did not file for an interrupted request. */
   refiled: z.array(z.string().min(1).max(4096)).min(1).max(6).optional(),
-}).strict().refine((input) => input.text.length > 0 || (input.images?.length ?? 0) > 0 || (input.files?.length ?? 0) > 0 || (input.refiled?.length ?? 0) > 0, { message: "empty message" });
+  /** Replying to (or, with `reaction`, reacting to) an earlier message. */
+  reply: webReplySchema.optional(),
+}).strict().refine((input) => {
+  const content = input.text.length > 0 || (input.images?.length ?? 0) > 0 || (input.files?.length ?? 0) > 0 || (input.refiled?.length ?? 0) > 0;
+  // A reaction is the whole message; anything else needs content of its own.
+  return input.reply?.reaction ? !content : content;
+}, { message: "empty message" });
 /** A non-image file a web message filed (memory/incoming-files): where, and what its notice said. */
 export interface WebFiledFile { path: string; name: string; type: string; size: number; typeUnknown?: boolean }
 export type MessageInput = z.infer<typeof messageInputSchema>;
@@ -49,7 +73,11 @@ export type RequestState = "queued" | "running" | "completed" | "refused" | "fai
 /** `images` / `files`: where an owner's attached images (incoming-images) and other files (incoming-files) were filed, while the request's text is kept. */
 export interface WebRequest { requestId: string; state: RequestState; sessionId?: string; responseTurnId?: string; joined?: boolean; handedOff?: boolean;
   /** The agent has read (the SDK consumed) this message. In memory only; restored completed requests count as read. */
-  read?: boolean; text?: string; timestamp?: number; images?: string[]; files?: WebFiledFile[] }
+  read?: boolean; text?: string; timestamp?: number; images?: string[]; files?: WebFiledFile[];
+  /** What this message replied or reacted to; its text cut to {@link WEB_REQUEST_QUOTE_LIMIT} code points. Kept while `text` is. */
+  reply?: WebReply }
+/** Code points of a reply's quoted text a request keeps for its pending bubble. */
+export const WEB_REQUEST_QUOTE_LIMIT = 200;
 export interface HistoryMessage extends SessionMessage { id: string }
 export interface HistoryPage { messages: HistoryMessage[]; nextCursor: string | null; revision?: string }
 export type WebTaskState = "running" | "completed" | "failed" | "stopped" | "ended";
@@ -326,7 +354,9 @@ export type WebEvent =
   /** Tomo wants to look at its home: an open Home page answers with POST /home/snapshot. */
   | { type: "home-look"; requestId: string }
   /** All tasks of one session, live and recently ended. REPLACE semantics. */
-  | { type: "tasks"; sessionId: string; tasks: WebTask[] };
+  | { type: "tasks"; sessionId: string; tasks: WebTask[] }
+  /** Tomo reacted to (null: took back its reaction on) one of the owner's web messages. */
+  | { type: "reaction"; sessionId: string; requestId: string; reaction: WebReaction | null };
 export interface EventEnvelope { id: string; event: WebEvent }
 export interface WebBootstrap extends WebCatalog {
   epoch: string;
@@ -344,6 +374,8 @@ export interface WebBootstrap extends WebCatalog {
   rateLimit?: WebRateLimit;
   /** The standing prompt suggestion per session. */
   suggestions?: Record<string, string>;
+  /** Tomo's reactions on the owner's web messages, by request id (absent on older daemons). */
+  reactions?: Record<string, WebReaction>;
   /** What the UI calls the agent (config `agent.name`, else IDENTITY.md, else "Tomo"); absent on older daemons. */
   agentName?: string;
 }
@@ -443,7 +475,7 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("home-snapshot"), epoch: z.uuid(), snapshot: homeSnapshotSchema }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
-export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "rateLimit" | "suggestions">;
+export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "rateLimit" | "suggestions" | "reactions">;
 export interface WebSync { snapshot: WebSnapshot; replay: EventEnvelope[] | null }
 /** Daemon answer to the `task` RPC. `sessionKey` stays inside the web process. */
 export interface WebTaskAccess { sessionKey: string; taskType: string; output?: TaskOutput;

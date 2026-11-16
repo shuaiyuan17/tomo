@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, readBootstrap, stream, type WebBootstrap } from "./api.js";
-import type { WebCompactState, WebEvent, WebRateLimit, WebRequest, WebSnapshot, WebTask } from "../../src/web/protocol.js";
+import type { WebCompactState, WebEvent, WebRateLimit, WebReaction, WebRequest, WebSnapshot, WebTask } from "../../src/web/protocol.js";
 import { replaceSessionTasks } from "./tasks.js";
 import { trimRequests } from "./pending.js";
 import { isTransient, TYPING_ACTIVITY, type TurnStatus } from "./composer-status.js";
@@ -23,6 +23,8 @@ export function useWeb() {
   const [connection, setConnection] = useState<"connecting" | "live" | "reconnecting" | "locked">("connecting");
   const [blocks, setBlocks] = useState<WebSnapshot["blocks"]>([]);
   const [requests, setRequests] = useState<WebRequest[]>([]);
+  /** Tomo's reactions on the owner's web messages, by request id. */
+  const [reactions, setReactions] = useState<Record<string, WebReaction>>({});
   const [activity, setActivity] = useState<Record<string, string>>({});
   /** Bumped per session on every tool event: the chat re-reads its inline tool calls. */
   const [toolTicks, setToolTicks] = useState<Record<string, number>>({});
@@ -76,7 +78,7 @@ export function useWeb() {
       }, 100);
     };
     const snapshot = (value: WebSnapshot) => {
-      setBlocks(value.blocks); setRequests(value.requests); setActivity({}); setTasks(value.tasks ?? []); setCompact(value.compact);
+      setBlocks(value.blocks); setRequests(value.requests); setReactions(value.reactions ?? {}); setActivity({}); setTasks(value.tasks ?? []); setCompact(value.compact);
       // Turn statuses are of the moment: a (re)connect starts without them.
       setTurns({}); setSuggestions(value.suggestions ?? {});
       setRateLimit(value.rateLimit);
@@ -114,6 +116,10 @@ export function useWeb() {
       if (event.type === "tool") setToolTicks((old) => ({ ...old, [event.sessionId]: (old[event.sessionId] ?? 0) + 1 }));
       if (event.type === "compact") setCompact(event.request);
       if (event.type === "tasks") setTasks((old) => replaceSessionTasks(old, event.sessionId, event.tasks));
+      if (event.type === "reaction") {
+        const { requestId, reaction } = event;
+        setReactions((old) => reaction ? { ...old, [requestId]: reaction } : old[requestId] ? without(old, requestId) : old);
+      }
       if (event.type === "typing") setActivity((old) => ({ ...old, [event.sessionId]: event.active ? TYPING_ACTIVITY : "" }));
     };
     let delay = 1_000;
@@ -153,5 +159,5 @@ export function useWeb() {
     });
     return () => { controller.abort(); stopResume(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
-  return { bootstrap, connection, blocks, requests, activity, toolTicks, tasks, compact, turns, rateLimit, suggestions, revision, cronRevision, home, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
+  return { bootstrap, connection, blocks, requests, reactions, activity, toolTicks, tasks, compact, turns, rateLimit, suggestions, revision, cronRevision, home, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
 }

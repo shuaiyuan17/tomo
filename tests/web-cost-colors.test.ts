@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
  */
 const css = readFileSync(new URL("../web/src/styles.css", import.meta.url), "utf8");
 function tokens(selector: string): Record<string, string> {
-  const body = new RegExp(`(?:^|\\n)${selector.replace(/\./g, "\\.")}\\s*\\{([^}]*)\\}`).exec(css)?.[1];
+  const body = new RegExp(`(?:^|\\n)${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`).exec(css)?.[1];
   if (!body) throw new Error(`no ${selector} block`);
   return Object.fromEntries([...body.matchAll(/--([\w-]+):\s*(#[0-9a-f]{6})/gi)].map(([, k, v]) => [k, v.toLowerCase()]));
 }

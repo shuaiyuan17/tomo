@@ -5,7 +5,7 @@ import { dirname, join } from "node:path";
 import { writeFileAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
-import type { ExternalMcpServerConfig, McpOAuthConfig } from "./external-config.js";
+import { defaultOAuthConfig, mayUseDiscoveredOAuth, type ExternalMcpServerConfig, type McpOAuthConfig } from "./external-config.js";
 
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 const AUTH_TIMEOUT_MS = 10 * 60 * 1000;
@@ -213,6 +213,8 @@ export class McpOAuthManager {
   /** One interactive/refresh flow per configured server. Session churn must
    * not open duplicate callback listeners or send duplicate login links. */
   private serverAuthBuilds = new Map<string, ServerAuthBuild>();
+  /** Servers found to be OAuth by a `/mcp login` probe → scopes from the challenge. */
+  private readonly discoveredOAuth = new Map<string, string[]>();
   private pendingCallbacks = new Map<string, PendingCallback>();
   private completedCallbackStates = new Map<string, { serverName: string; completedAt: number }>();
   private serverFailures = new Map<string, { error: string; at: number }>();
@@ -247,6 +249,7 @@ export class McpOAuthManager {
     sendAuthorizeUrl: (serverName: string, url: string) => Promise<void>,
     options: BuildServersWithAuthOptions = {},
   ): Promise<Record<string, McpServerConfig>> {
+    servers = this.withDiscoveredOAuth(servers);
     const result: Record<string, McpServerConfig> = {};
     for (const [name, entry] of Object.entries(servers)) {
       if (!entry.oauth) {
@@ -267,6 +270,7 @@ export class McpOAuthManager {
     servers: Record<string, ExternalMcpServerConfig>,
     mountedServerNames: ReadonlySet<string> = new Set(),
   ): ExternalMcpServerStatus[] {
+    servers = this.withDiscoveredOAuth(servers);
     const store = this.readStore();
     return Object.entries(servers).map(([name, entry]) => {
       const mounted = mountedServerNames.has(name);
@@ -302,8 +306,10 @@ export class McpOAuthManager {
     serverName: string,
     servers: Record<string, ExternalMcpServerConfig>,
   ): Promise<McpLoginStart> {
+    if (!servers[serverName]) throw new Error(`Unknown external MCP server "${serverName}"`);
+    await this.discoverOAuthServer(serverName, servers[serverName]);
+    servers = this.withDiscoveredOAuth(servers);
     const entry = servers[serverName];
-    if (!entry) throw new Error(`Unknown external MCP server "${serverName}"`);
     if (!entry.oauth) throw new Error(`MCP server "${serverName}" does not use OAuth`);
     if (!supportsHeaders(entry.server)) throw new Error(`MCP server "${serverName}" cannot use OAuth headers`);
 
@@ -462,6 +468,65 @@ export class McpOAuthManager {
     }
   }
 
+  /**
+   * Fill in OAuth for http/sse servers that were not configured with an
+   * `oauth` block but are OAuth servers per the MCP authorization spec: either
+   * a `/mcp login` probe saw a Bearer challenge this process, or a token is
+   * already stored under the server's name (a previous discovery login).
+   * Servers with `oauth: false` or their own Authorization header are left
+   * alone.
+   */
+  private withDiscoveredOAuth(
+    servers: Record<string, ExternalMcpServerConfig>,
+  ): Record<string, ExternalMcpServerConfig> {
+    let store: TokenStoreFile | undefined;
+    let changed = false;
+    const result: Record<string, ExternalMcpServerConfig> = {};
+    for (const [name, entry] of Object.entries(servers)) {
+      if (entry.oauth || !mayUseDiscoveredOAuth(entry)) {
+        result[name] = entry;
+        continue;
+      }
+      const scopes = this.discoveredOAuth.get(name);
+      store ??= this.readStore();
+      if (scopes === undefined && !store.mcpOAuth?.[name]) {
+        result[name] = entry;
+        continue;
+      }
+      result[name] = { ...entry, oauth: defaultOAuthConfig(name, scopes ?? []) };
+      changed = true;
+    }
+    return changed ? result : servers;
+  }
+
+  /**
+   * Probe an unconfigured http/sse server for a spec-style OAuth challenge
+   * (401 + `WWW-Authenticate: Bearer ...`). On a hit, remember it (with the
+   * challenge's `scope`, if any) so this and later session builds treat the
+   * server as OAuth. Probe failures are non-fatal: startLogin then reports
+   * the server as not using OAuth, as before.
+   */
+  private async discoverOAuthServer(serverName: string, entry: ExternalMcpServerConfig): Promise<void> {
+    if (entry.oauth || this.discoveredOAuth.has(serverName) || !mayUseDiscoveredOAuth(entry)) return;
+    if (!supportsHeaders(entry.server)) return;
+    try {
+      const res = await this.fetchImpl(entry.server.url, {
+        method: "POST",
+        headers: {
+          Accept: "application/json, text/event-stream",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(MCP_INITIALIZE_PROBE),
+      });
+      const header = res.headers.get("www-authenticate") ?? "";
+      const bearer = res.status === 401 ? bearerChallenge(header) : null;
+      if (bearer === null) return;
+      this.discoveredOAuth.set(serverName, parseChallengeScopes(bearer));
+    } catch (err) {
+      log.warn({ serverName, err }, "MCP OAuth discovery probe failed");
+    }
+  }
+
   async withOAuthHeader(
     serverName: string,
     entry: ExternalMcpServerConfig,
@@ -489,6 +554,7 @@ export class McpOAuthManager {
    * Returns the names actually refreshed.
    */
   async refreshExpiringTokens(servers: Record<string, ExternalMcpServerConfig>): Promise<string[]> {
+    servers = this.withDiscoveredOAuth(servers);
     const refreshed: string[] = [];
     const visitedStoreKeys = new Set<string>();
     for (const [name, entry] of Object.entries(servers)) {
@@ -520,6 +586,7 @@ export class McpOAuthManager {
     servers: Record<string, ExternalMcpServerConfig>,
     options: { onlyIfExpiring?: boolean } = {},
   ): Promise<TokenRefreshOutcome> {
+    servers = this.withDiscoveredOAuth(servers);
     const entry = servers[serverName];
     const oauth = entry?.oauth;
     if (!entry || !oauth || !supportsHeaders(entry.server)) return "skipped";
@@ -1137,6 +1204,23 @@ function withBearer(
     ...server,
     headers: { ...(server.headers ?? {}), Authorization: `Bearer ${accessToken}` },
   };
+}
+
+/**
+ * The Bearer challenge out of a WWW-Authenticate value, or null. A header may
+ * carry several challenges (`Basic realm="x", Bearer scope="..."`), so Bearer
+ * counts at any challenge boundary, not only first; the returned slice starts
+ * at Bearer so its own params are read, not a preceding scheme's.
+ */
+function bearerChallenge(header: string): string | null {
+  const match = /(?:^|,)\s*bearer(?=\s|,|$)/i.exec(header);
+  return match ? header.slice(match.index).replace(/^,?\s*/, "") : null;
+}
+
+function parseChallengeScopes(header: string): string[] {
+  const match = /\bscope=(?:"([^"]*)"|([^,\s]+))/i.exec(header);
+  const value = match ? (match[1] ?? match[2] ?? "") : "";
+  return value.split(/\s+/).map((s) => s.trim()).filter(Boolean);
 }
 
 function parseResourceMetadataUrl(header: string): string | null {

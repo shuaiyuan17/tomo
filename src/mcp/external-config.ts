@@ -16,6 +16,28 @@ export interface McpOAuthConfig {
 export interface ExternalMcpServerConfig {
   server: McpServerConfig;
   oauth?: McpOAuthConfig;
+  /**
+   * `oauth: false` in config: never treat this server as OAuth, even when it
+   * answers 401 with a Bearer challenge. Without it, an http/sse server with
+   * no `oauth` block is OAuth-capable by discovery (MCP authorization spec).
+   */
+  oauthDisabled?: boolean;
+}
+
+/**
+ * Could this server be OAuth by discovery? http/sse, not opted out with
+ * `oauth: false`, and not already carrying its own Authorization header.
+ */
+export function mayUseDiscoveredOAuth(entry: ExternalMcpServerConfig): boolean {
+  if (entry.oauth || entry.oauthDisabled) return false;
+  if (entry.server.type !== "http" && entry.server.type !== "sse") return false;
+  const headers = entry.server.headers ?? {};
+  return !Object.keys(headers).some((key) => key.toLowerCase() === "authorization");
+}
+
+/** Default OAuth settings for a server that was discovered, not configured. */
+export function defaultOAuthConfig(serverName: string, scopes: string[] = []): McpOAuthConfig {
+  return { scopes, tokenStoreKey: serverName, clientName: "Tomo" };
 }
 
 const SERVER_NAME_RE = /^[A-Za-z0-9._-]{1,128}$/;
@@ -40,8 +62,9 @@ export function parseExternalMcpServers(
 
     const server = parseServer(value, env);
     if (server) {
+      const oauthDisabled = value.oauth === false ? true : undefined;
       const oauth = parseOAuthConfig(value.oauth, name, env);
-      servers[name] = stripUndefined({ server, oauth }) as ExternalMcpServerConfig;
+      servers[name] = stripUndefined({ server, oauth, oauthDisabled }) as ExternalMcpServerConfig;
     }
   }
   return servers;

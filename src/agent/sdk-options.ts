@@ -227,10 +227,10 @@ export function sdkOptions(
     // skill invocable (same surface as the old `"Skill"` allowedTools entry).
     skills: "all" as const,
     ...(plugins.length > 0 ? { plugins } : {}),
-    // External entries never reach the CLI's argv: LiveSession moves them to
-    // a 0600 file before spawning (see ./mcp-config-file.ts), because an
-    // OAuth server's entry carries its bearer token.
     mcpServers: { ...externalMcpServers, [TOMO_INTERNAL_MCP_NAME]: internalMcpServer },
+    // External entries never reach the CLI's argv: LiveSession sends them
+    // over stdin in the initialize request (mcpServersDelivery: "initialize"),
+    // because an OAuth server's entry carries its bearer token.
     settingSources: [...SDK_SETTING_SOURCES],
     settings: {
       // Tomo keeps its own memory (workspace/memory, written into the system

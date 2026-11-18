@@ -17,9 +17,10 @@ export function registerSecretValue(value: string, name: string): void {
   if (value.length >= MIN_SECRET_LENGTH) secrets.set(value, name);
 }
 
+/** Back to a fresh process: no values, and not ready until a first load succeeds. */
 export function clearSecretValuesForTests(): void {
   secrets.clear();
-  readiness = null;
+  readiness = initialReadiness();
 }
 
 export function scrubKnownSecrets(text: string): string {
@@ -58,9 +59,13 @@ export function scrubDeep<T>(value: T, depth = 0): T {
  * backoff) and the PostToolUse hook withholds output that went near the
  * keychain (`withholdDeep`).
  */
-interface Readiness { retry: () => Promise<boolean>; nextAt: number; backoffMs: number; inFlight?: Promise<boolean> }
-let readiness: Readiness | null = null;
+interface Readiness { retry: (() => Promise<boolean>) | null; nextAt: number; backoffMs: number; inFlight?: Promise<boolean> }
 const MIN_BACKOFF_MS = 5_000;
+/** NOT ready until the first load has succeeded: a restart's load runs in the
+ *  background, and output arriving before it returns must not pass unmasked.
+ *  `retry: null` = the first load is still running; nothing to retry yet. */
+const initialReadiness = (): Readiness => ({ retry: null, nextAt: 0, backoffMs: MIN_BACKOFF_MS });
+let readiness: Readiness | null = initialReadiness();
 const MAX_BACKOFF_MS = 5 * 60_000;
 
 export function redactionReady(): boolean {
@@ -69,7 +74,7 @@ export function redactionReady(): boolean {
 
 /** Marks the redactor not ready; `retry` loads the values again and says whether it worked. */
 export function markRedactionNotReady(retry: () => Promise<boolean>, now = Date.now()): void {
-  if (readiness) return;
+  if (readiness?.retry) return;
   readiness = { retry, nextAt: now + MIN_BACKOFF_MS, backoffMs: MIN_BACKOFF_MS };
 }
 
@@ -82,7 +87,7 @@ export async function ensureRedactionReady(now = Date.now()): Promise<boolean> {
   const r = readiness;
   if (!r) return true;
   if (r.inFlight) return r.inFlight;
-  if (now < r.nextAt) return false;
+  if (!r.retry || now < r.nextAt) return false;
   r.inFlight = r.retry().catch(() => false).then((ok) => {
     if (ok) { if (readiness === r) readiness = null; return true; }
     r.backoffMs = Math.min(r.backoffMs * 2, MAX_BACKOFF_MS);
@@ -103,6 +108,3 @@ export function withholdDeep<T>(value: T, depth = 0): T {
   return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, withholdDeep(v, depth + 1)])) as T;
 }
 
-export function resetRedactionReadinessForTests(): void {
-  readiness = null;
-}

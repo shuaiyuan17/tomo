@@ -16,7 +16,7 @@ const home = vi.hoisted(() => {
 
 import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk";
 import { buildHooksOption } from "../../src/agent/sdk-options.js";
-import { clearSecretValuesForTests, registerSecretValue } from "../../src/credentials/redactor.js";
+import { clearSecretValuesForTests, markRedactionReady, registerSecretValue } from "../../src/credentials/redactor.js";
 
 const FAKE = "fake-e2e-credential-3f9a1c7d";
 type Step = { name: string; input: Record<string, unknown> };
@@ -42,6 +42,8 @@ function sse(res: ServerResponse, content: Record<string, unknown>, stop: string
 beforeAll(async () => {
   cwd = mkdtempSync(join(tmpdir(), "tomo-broker-e2e-cwd-"));
   registerSecretValue(FAKE, "user/e2e");
+  // As after the broker's first successful load.
+  markRedactionReady();
   server = createServer((req, res) => {
     let body = "";
     req.on("data", (chunk) => { body += chunk; });

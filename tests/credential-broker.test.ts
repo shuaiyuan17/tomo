@@ -646,6 +646,30 @@ describe("CredentialBroker", () => {
       expect(scrubKnownSecrets(`x ${FAKE}`)).toContain("[REDACTED");
     });
 
+    // Codex round 2: the redactor started out "ready" and the Agent does not
+    // wait for the first load, so output before it returned passed unmasked.
+    it("is not ready before the first load returns: keychain output is withheld meanwhile", async () => {
+      const first = make();
+      await first.request("x", "p", SESSION, IM);
+      await first.handleInbound(im.ch, reply());
+      first.shutdown();
+      clearSecretValuesForTests();
+
+      let release!: () => void;
+      const get = backend.get.bind(backend);
+      backend.get = (name) => new Promise((resolve) => { release = () => { void get(name).then(resolve); }; });
+      const broker = make();
+      const loading = broker.primeRedaction();
+      await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+      expect(redactionReady()).toBe(false);
+      const hook = credentialRedactionHooks().PostToolUse[0].hooks[0];
+      const keychainCall = { tool_input: { command: `echo "$(${keychainReadCommand("x")})"` }, tool_response: { stdout: `${FAKE}\n` } };
+      expect(await hook(keychainCall)).toEqual({ hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { stdout: WITHHELD_OUTPUT } } });
+      release();
+      expect(await loading).toBe(true);
+      expect(await hook(keychainCall)).toEqual({ hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { stdout: "[REDACTED secret://x]\n" } } });
+    });
+
     it("an unreadable state file at start is also not ready, and recovers once it is repaired", async () => {
       const first = make();
       await first.request("x", "p", SESSION, IM);

@@ -6,7 +6,9 @@ import { isDmSessionKey, isGroupSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
 import { litellmRoutesModel } from "../litellm.js";
-import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, skillsCanUseTool, type PrivateMemoryBar } from "./permissions.js";
+import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, skillsCanUseTool, todoStoreGuardHooks, type PrivateMemoryBar } from "./permissions.js";
+import { TODO_TOOL_NAMES } from "../mcp/todo-tools.js";
+import { todosDir } from "../todos/store.js";
 import type { AgentProfile } from "../config.js";
 import { resolvePlugins } from "./plugins.js";
 import { SDK_SETTING_SOURCES } from "./setting-sources.js";
@@ -218,6 +220,7 @@ export function sdkOptions(
       `mcp__${TOMO_INTERNAL_MCP_NAME}__list_people`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__upsert_person`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__lcm_rollup`,
+      ...TODO_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`),
       // Registered only on the owner's DM session (internal-server.ts).
       `mcp__${TOMO_INTERNAL_MCP_NAME}__home_check`,
       ...(config.credentialBroker?.enabled ? CREDENTIAL_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`) : []),
@@ -294,6 +297,7 @@ export function sdkOptions(
       // against that group's key rather than the owner's dm: key.
       scopedCallerKey: sessionContext?.scopedCallerKey,
       credentialBroker: config.credentialBroker?.enabled === true,
+      todosDir: () => todosDir(),
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     env: sdkEnv,
@@ -452,6 +456,9 @@ export function buildHooksOption(args: {
   undeliveredReply?: () => boolean;
   /** Install the global PostToolUse redactor for known credential values. */
   credentialBroker?: boolean;
+  /** The todo store directory; when set, direct writes into it are denied on
+   *  every session (todo-store-guard.ts). */
+  todosDir?: () => string;
 }) {
   const hooks: Record<string, unknown[]> = {};
   if (args.credentialBroker) {
@@ -466,6 +473,10 @@ export function buildHooksOption(args: {
   }
   if (args.agentProfile) {
     mergeHooks(hooks, agentProfileGuardHooks(args.sessionKey, args.agentProfile));
+  }
+  // Deny-only, so its place before the private-memory guard costs nothing.
+  if (args.todosDir) {
+    mergeHooks(hooks, todoStoreGuardHooks(args.sessionKey, config.workspaceDir, args.todosDir));
   }
   // THE PRIVATE-MEMORY GUARD GOES LAST, and the order is load-bearing now that it
   // returns `updatedInput` (the `sandbox-exec` rewrite, see permissions.ts).

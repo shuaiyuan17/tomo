@@ -13,6 +13,7 @@ export const CHAT_COMMANDS: readonly { command: string; description: string }[] 
   { command: "mcp", description: "Inspect or re-authenticate external MCP servers" },
   { command: "status", description: "Show current session status" },
   { command: "tasks", description: "List this chat's running and recent tasks (/tasks all: all of today)" },
+  { command: "todo", description: "Open todos (/todo add <text>, /todo done <id>, /todo drop <id>, /todo all)" },
   { command: "cost", description: "Show current session costs" },
   { command: "usage", description: "Show Claude subscription usage limits" },
   { command: "pet", description: "Check on Tomo's pet" },

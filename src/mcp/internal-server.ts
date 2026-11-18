@@ -9,6 +9,7 @@ import { buildPeopleTools } from "./people-tools.js";
 import { buildLcmTools } from "./lcm-tools.js";
 import { buildHomeTools } from "./home-tools.js";
 import { buildCredentialTools } from "./credential-tools.js";
+import { buildTodoTools } from "./todo-tools.js";
 import { isDmSessionKey, isGroupSessionKey } from "../sessions/keys.js";
 import { ownerSessionKey } from "../owner.js";
 import { homeService } from "../home/service.js";
@@ -300,6 +301,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       // A getter, not the key: a summoned group's turns run on the owner's
       // dm: session, so the key alone would give the group the owner's scope.
       ...buildCronTools(undefined, () => agent.scopedCallerKey(callerSessionKey)),
+      ...buildTodoTools({ caller: () => agent.scopedCallerKey(callerSessionKey) }),
       ...buildPetTools(),
       ...buildLcmTools({
         sdkSessionIdFor: () => agent.sdkSessionIdFor(callerSessionKey),

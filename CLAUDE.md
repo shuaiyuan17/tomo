@@ -37,7 +37,8 @@ src/
     sdk-options.ts          # Builds SDK query options (model, MCP servers, auto-compact policy)
     sdk-signals.ts          # What the SDK says ABOUT a turn (api_retry, rate_limit_event, refusals, tool_progress,
                             #   typed assistant error, prompt_suggestion) → `sdk` watch events for the web UI
-    audience.ts             # DM-session audience tracking (private DM vs summoned group)
+    audience.ts             # DM-session audience tracking (private DM vs summoned group); turnOrigin: the one
+                            #   chat a live turn came in on (null for cron/heartbeat/mixed), for request_credential
     inbound-batcher.ts      # Coalesces messages that pile up behind an in-flight turn
     proactive-send.ts       # send_message service (direct + delegate modes)
     bash-sandbox.ts         # sandbox-exec wrap for Bash on a private-memory-barred turn
@@ -59,7 +60,9 @@ src/
   web/                # Optional supervised HTTP/SSE process, bounded RPC, local security
   sessions/           # Persistence (store.ts + transcript-names/-rotation/-order.ts, store-support.ts),
                       #   key helpers (keys.ts), summon-store.ts
-  credentials/        # Credential broker, off by default: broker.ts (request, capture), store.ts (keychain over stdin), redactor.ts (literal scrub), exec.ts (env injection)
+  credentials/        # Credential broker, off by default: broker.ts (request on the turn's channel, capture, fulfill),
+                      #   capture.ts (CaptureChannel: iMessage/Telegram next message, web password card),
+                      #   store.ts (keychain over stdin; state.json), redactor.ts (literal scrub, global PostToolUse hook)
   mcp/                # tomo-internal in-process MCP server (internal-server.ts) + tool factories
                       #   (cron-, people-, recall-, pet-tools); external-config.ts, oauth.ts
   cron/               # Scheduler (30s poll → agent.handleCronMessage) + store (data/cron/jobs.json)

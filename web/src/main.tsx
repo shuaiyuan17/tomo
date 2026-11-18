@@ -13,6 +13,7 @@ import { parseSendMarker, sendMarkerLabel } from "./send-marker.js";
 import { TasksPanel } from "./tasks-panel.js";
 import { PlanUsage } from "./plan-usage.js";
 import { CompactButton } from "./compact-button.js";
+import { CredentialCard } from "./credential-card.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
@@ -850,6 +851,7 @@ export function App() {
                 className="absolute top-1 right-1 grid size-6 place-items-center rounded-full bg-foreground/70 text-background transition-colors hover:bg-foreground focus-visible:outline-offset-0"><X className="size-3" strokeWidth={2.5} /></button>
             </li>)}</ul>}
           {attachments.note && <p className="m-0 mb-2 text-[12px] text-muted-foreground" role="status">{attachments.note}</p>}
+          {web.credentialRequest && <CredentialCard key={web.credentialRequest.id} request={web.credentialRequest} bootstrap={web.bootstrap} refresh={web.refreshBootstrap} />}
           {replyingTo && session?.writable && <div className="motion-enter mb-2 flex items-center gap-2.5 rounded-2xl border bg-card/70 py-1.5 pr-1.5 pl-3" role="group" aria-label="Replying">
             <Reply className="size-4 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
             <div className="min-w-0 flex-1 border-l-2 border-muted-foreground/40 pl-2.5">

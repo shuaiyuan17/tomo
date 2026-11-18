@@ -4,7 +4,6 @@ import { log } from "../logger.js";
 import { pathCandidates, bashTokens } from "./permission-paths.js";
 import { writeVerbIn, writeTargets, commandSegments, segmentCwd, HARMLESS_REDIRECT_TARGET, redirectTargets, isAbsoluteish, pathishTokens, landsIn, landsInWriteRoot } from "./bash-write-targets.js";
 import { MONITOR_TOOL } from "./private-memory-guard.js";
-import { RUN_WITH_SECRETS_TOOL } from "../credentials/names.js";
 
 // ---------------------------------------------------------------------------
 // Per-agent permission scoping (config `agentProfiles`)
@@ -180,9 +179,6 @@ export function agentProfileDenial(
   toolInput: unknown,
   cwd: string,
 ): string | null {
-  if (toolName === RUN_WITH_SECRETS_TOOL) {
-    return "a subagent with a permission profile cannot use run_with_secrets";
-  }
   if (!toolInput || typeof toolInput !== "object") return null;
   const ti = toolInput as Record<string, unknown>;
 

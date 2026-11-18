@@ -357,6 +357,10 @@ export interface Channel {
    *  ring backing `recentMessages` is filled before dispatch, and a substring
    *  `match` over it would answer "is the value X?". */
   forgetMessage?(chatId: string, messageId: string): void;
+  /** Delete a message the OWNER sent from the chat itself, where the platform
+   *  lets a bot do that (Telegram private chats). The credential broker uses it
+   *  on a message that may carry a value. Throws when the platform refuses. */
+  deleteInboundMessage?(chatId: string, messageId: string): Promise<void>;
 
   /** Register a handler for slash commands */
   onCommand(handler: CommandHandler): void;

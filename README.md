@@ -404,7 +404,13 @@ Environment variables override config file values:
 
 ### Credential Broker (`credentialBroker`)
 
-`{ "credentialBroker": { "enabled": true } }` keeps a password you send on request away from the model. `request_credential` asks you on your iMessage DM and takes your next message there as the value, before it reaches the transcript, the logs or the model. The value goes in the login keychain, and the agent uses it through `run_with_secrets`, which puts it in a command's environment. Known values are scrubbed from tool output and logs.
+`{ "credentialBroker": { "enabled": true } }` (default `false`) keeps a password you send on request away from the model. The agent calls `request_credential`, and you are asked **where your message came from**:
+
+- **iMessage**: your next message in that private chat is the value. It stays in Messages, so delete it there.
+- **Telegram**: your next message in your private chat with the bot is the value, and Tomo deletes it from the chat (if Telegram refuses, you are told to delete it yourself).
+- **Web UI**: a password card opens above the composer. What you type goes to its own endpoint, never into the chat, the request journal or the transcript.
+
+A scheduled job, a heartbeat or a group turn cannot ask. The value goes in the login keychain (service `tomo-credential-broker`, account = the name), and the agent uses it in Bash only inside a command substitution, `"$(security find-generic-password -s tomo-credential-broker -a <name> -w)"`, so the command text never holds it. Known values are masked in every tool's output (a global `PostToolUse` hook) and in logs. While a request is open, your messages on the other chat channel are dropped (one of them may be the value) and you are told; the web chat keeps working.
 
 This prevents accidents. It does not stop a model trying to get the value: see [SECURITY.md](SECURITY.md).
 

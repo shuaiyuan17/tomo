@@ -3,6 +3,7 @@ import type { ReplyTarget } from "../sessions/types.js";
 import type { InboundItem } from "./inbound-batcher.js";
 import type { OwnerNoticeTarget, ShutdownTurnEnd } from "./turn-runner.js";
 import type { UsageSource } from "../usage/ledger.js";
+import type { TurnOrigin } from "./audience.js";
 
 // Request and option shapes passed between the Agent's turn entry points.
 
@@ -41,6 +42,9 @@ export interface UserTurnRequest {
    *  or a raw group key for a summoned group's messages. Session-scoped MCP
    *  tools resolve against these, not against the session key. */
   audiences?: string[];
+  /** The chat each of this turn's messages came in on, in order. Credential
+   *  requests are asked there (`TurnAudienceRegistry.turnOrigin`). */
+  origins?: TurnOrigin[];
 }
 
 export interface CronTurnOptions {

@@ -10,11 +10,13 @@ import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
 import { CompressedAssets, IMMUTABLE_CACHE, pickEncoding } from "./static-assets.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
-import { cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
+import { credentialSubmitSchema, cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
   type EventEnvelope, type Rpc, type TaskAction, type WebCompaction, type WebHome, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
 import { homeSceneSchema } from "../home/scene.js";
 import { decodeSnapshotPng } from "../home/snapshot.js";
 
+/** The credential card's answer: POST /api/v1/credentials/<request id>. */
+const CREDENTIAL_PATH = /^\/api\/v1\/credentials\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 /** The snapshot route's body: the schema's base64 bound plus the JSON envelope around it. */
 export const HOME_SNAPSHOT_BODY_BYTES = Math.ceil(HOME_SNAPSHOT_MAX_BYTES * 4 / 3) + 4 + 1024;
 /** A home picture is served with a CSP of its own: an SVG opened directly can run, fetch and embed nothing. */
@@ -279,6 +281,22 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         if (!parsed.success) throw new WebError(400, "invalid_snapshot");
         decodeSnapshotPng(parsed.data.png);
         json(res, 200, await deps.rpc({ method: "home-snapshot", epoch, snapshot: parsed.data }));
+        return;
+      } else if (req.method === "POST" && CREDENTIAL_PATH.test(url.pathname)) {
+        // The credential card's answer. Its own route, NOT /messages: that one
+        // journals the request to requests.jsonl and draws a chat bubble. Same
+        // gate as every write: exact Origin (checkRequest), cookie, CSRF, the
+        // current daemon epoch, the owner. Nothing here echoes the body: every
+        // refusal is a fixed code, and the value is not logged.
+        csrf.verify(req, session!);
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || epoch !== await deps.rpc({ method: "epoch" })) throw new WebError(409, "epoch_changed");
+        const { ownerId } = deps.data.catalog();
+        if (!ownerId) throw new WebError(409, "owner_setup_required");
+        const parsed = credentialSubmitSchema.safeParse(await body(req));
+        if (!parsed.success) throw new WebError(400, "invalid_credential");
+        const id = CREDENTIAL_PATH.exec(url.pathname)![1];
+        json(res, 200, await deps.rpc({ method: "credential-submit", epoch, id, input: parsed.data }));
         return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/compact-request") {
         // Same gate as sending a message: CSRF, the owner, the daemon epoch.

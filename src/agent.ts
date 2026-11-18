@@ -13,7 +13,7 @@ import {
 } from "./sessions/keys.js";
 import { privateMemoryBarFor } from "./agent/permissions.js";
 import { OwnerRouter, type SessionResolution } from "./router.js";
-import { ignoredAllowlistDmEntries, isOwnerHandle, ownerBindings, ownerSessionKey } from "./owner.js";
+import { ignoredAllowlistDmEntries, isOwnerHandle, ownerSessionKey } from "./owner.js";
 import { BlockedInboundLog, redactChatIdForLog } from "./agent/blocked-inbound-log.js";
 import {
   annotateSenderName,
@@ -33,7 +33,7 @@ import { log } from "./logger.js";
 import { shortErrorMessage } from "./error-text.js";
 import { SteerDeclinedError, TurnInterruptedError, type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { isSilentReply } from "./agent/text-utils.js";
-import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
+import { audienceOf, audienceSwitchNote, TurnAudienceRegistry, type TurnOrigin } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { formatInterruptedAgentsNotice, RunningAgentsLedger, type RunningTaskRecord } from "./agent/running-agents-ledger.js";
 import { DurableInbox, INBOX_STALE_NOT_PROCESSED, restoreMessage, type InboxRecord } from "./agent/durable-inbox.js";
@@ -48,6 +48,7 @@ import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest, type Shut
 import { OwnerErrorNotifier } from "./agent/owner-error-notice.js";
 import { formatGroupTag } from "./agent/inbound-markers.js";
 import { CredentialBroker } from "./credentials/broker.js";
+import { captureChannelFor } from "./credentials/capture.js";
 import { BrokerStateFile, KeychainBackend } from "./credentials/store.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
@@ -432,11 +433,8 @@ export class Agent {
       backend: new KeychainBackend(),
       stateFile: new BrokerStateFile(join(config.tomoHome, "data", "credentials", "state.json")),
       isOwnerSender: (channelName, senderId) => this.router.isOwnerSender(channelName, senderId),
-      ownerImessage: () => {
-        const channel = this.getChannel("imessage");
-        const chatId = ownerBindings(config.owner, "imessage")[0];
-        return channel && chatId ? { channel, chatId } : null;
-      },
+      // Asked where the turn came in on: iMessage, Telegram, or the web card.
+      captureChannel: (origin) => captureChannelFor(this.getChannel(origin.channelName), origin.chatId),
       notifySession: (sessionKey, body) => {
         this.handleCronMessage(formatTomoEvent("credential", body, { name: "result" }), sessionKey, { showTyping: false })
           .catch((err) => log.error({ err, sessionKey }, "Credential result turn failed to queue"));
@@ -1391,7 +1389,7 @@ export class Agent {
     // second one's cleanup unscope the first. Removed afterwards, so a later
     // cron or background turn on the same session is the owner's again and
     // does not inherit a summoned group's narrower scope.
-    const turnId = this.turnAudiences.begin(req.key, req.audiences);
+    const turnId = this.turnAudiences.begin(req.key, req.audiences, req.origins);
     // Until the SDK takes the prompt, this turn has not consumed its messages.
     req.inboxHooks?.notConsumed();
     try {
@@ -1436,6 +1434,17 @@ export class Agent {
    */
   isOwnAudienceTurn(sessionKey: string): boolean {
     return this.turnAudiences.isOwnAudienceTurn(sessionKey);
+  }
+
+  /**
+   * The chat the turn in flight on this session came in on, for a request that
+   * must be answered where the owner is typing (`request_credential`). Null
+   * for a cron, heartbeat or other background turn, and for a batch or
+   * concurrent turns spanning more than one chat. Alongside
+   * `isOwnAudienceTurn`, which says WHOSE turn it is; this says WHERE.
+   */
+  turnOrigin(sessionKey: string): TurnOrigin | null {
+    return this.turnAudiences.turnOrigin(sessionKey) ?? null;
   }
 
   /**
@@ -1613,6 +1622,7 @@ export class Agent {
         images: message.images,
         documents: message.documents,
         audiences,
+        origins: [{ channelName: channel.name, chatId: message.chatId }],
         suppressErrors: isPassiveGroup,
         ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, "A message turn", `${channel.name}:${message.chatId}`) } : {}),
         errorLogMessage: "Error handling message",
@@ -1775,6 +1785,7 @@ export class Agent {
       images: allImages.length > 0 ? allImages : undefined,
       documents: allDocuments.length > 0 ? allDocuments : undefined,
       audiences,
+      origins: items.map((it) => ({ channelName: it.channel.name, chatId: it.message.chatId })),
       suppressErrors: isPassiveGroup,
       ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, "A message turn", `${lastChannel.name}:${lastMessage.chatId}`) } : {}),
       errorLogMessage: "Error handling batched messages",

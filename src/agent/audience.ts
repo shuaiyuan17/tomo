@@ -136,13 +136,23 @@ export function originAudienceFor(
  * concurrent turns agree the answer is unambiguous, and when they disagree
  * `scopedCallerKeyFor` already fails closed.
  */
+/** The chat one inbound message came in on. */
+export interface TurnOrigin {
+  channelName: string;
+  chatId: string;
+}
+
 export class TurnAudienceRegistry {
   private live = new Map<string, Map<number, string[]>>();
+  /** The chats each live turn's messages came in on (inbound turns only). */
+  private origins = new Map<number, TurnOrigin[]>();
   private nextId = 1;
 
-  /** Register a turn. Returns the id to pass to `end`. */
-  begin(sessionKey: string, audiences: readonly string[] | undefined): number {
+  /** Register a turn. Returns the id to pass to `end`. `origins`: the chat of
+   *  each inbound message, for a turn the owner (or a group) is typing in. */
+  begin(sessionKey: string, audiences: readonly string[] | undefined, origins?: readonly TurnOrigin[]): number {
     const id = this.nextId++;
+    if (origins?.length) this.origins.set(id, origins.map((o) => ({ ...o })));
     let turns = this.live.get(sessionKey);
     if (!turns) {
       turns = new Map();
@@ -162,10 +172,31 @@ export class TurnAudienceRegistry {
   }
 
   end(sessionKey: string, id: number): void {
+    this.origins.delete(id);
     const turns = this.live.get(sessionKey);
     if (!turns) return;
     turns.delete(id);
     if (turns.size === 0) this.live.delete(sessionKey);
+  }
+
+  /**
+   * The one chat every live turn on this session came in on, or undefined.
+   * Undefined when no turn is live (a cron job, a heartbeat: nobody is typing),
+   * when a live turn registered no origin (a delegated or background turn), and
+   * when the live turns' messages came from more than one chat. The same
+   * union-of-live-turns rule as `scopedCallerKey`, failing closed the same way.
+   */
+  turnOrigin(sessionKey: string): TurnOrigin | undefined {
+    const turns = this.live.get(sessionKey);
+    if (!turns || turns.size === 0) return undefined;
+    const all: TurnOrigin[] = [];
+    for (const id of turns.keys()) {
+      const origins = this.origins.get(id);
+      if (!origins) return undefined;
+      all.push(...origins);
+    }
+    const distinct = new Set(all.map((o) => `${o.channelName}\u0000${o.chatId}`));
+    return distinct.size === 1 ? { ...all[0] } : undefined;
   }
 
   /** The audiences of every turn live on this session right now, or

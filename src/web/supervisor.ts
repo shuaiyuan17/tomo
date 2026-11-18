@@ -278,6 +278,10 @@ export class WebSupervisor implements WebLifecycle {
             if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
             return this.channel.homeSnapshot(input.snapshot);
           }
+          if (input.method === "credential-submit") {
+            if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
+            return this.channel.submitCredential(input.id, input.input);
+          }
           if (input.method === "model-switch") {
             if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
             return this.channel.switchModel(input.sessionId, input.model, input.from);

@@ -1,9 +1,7 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
-import type { CredentialBroker } from "../credentials/broker.js";
-import { DEFAULT_EXEC_TIMEOUT_MS, MAX_EXEC_TIMEOUT_MS, runWithSecrets } from "../credentials/exec.js";
-import { parseSecretRef } from "../credentials/names.js";
-import { log } from "../logger.js";
+import type { CredentialBroker, CredentialOrigin } from "../credentials/broker.js";
+import { keychainReadCommand } from "../credentials/names.js";
 
 export interface CredentialToolDeps {
   broker: CredentialBroker;
@@ -14,6 +12,9 @@ export interface CredentialToolDeps {
    * "private DM" on exactly the turn it must refuse.
    */
   canUse: () => boolean;
+  /** The chat this turn came in on, resolved per call; null for a cron job, a
+   *  heartbeat, or a batch across channels. */
+  origin: () => CredentialOrigin | null;
 }
 
 export const CREDENTIAL_SCOPE_REFUSAL =
@@ -24,62 +25,31 @@ const text = (body: string, isError = false) => ({
   ...(isError ? { isError: true } : {}),
 });
 
-export function buildCredentialTools({ broker, sessionKey, canUse }: CredentialToolDeps) {
-  const refused = () => text(CREDENTIAL_SCOPE_REFUSAL, true);
+export function buildCredentialTools({ broker, sessionKey, canUse, origin }: CredentialToolDeps) {
   return [
     tool(
       "request_credential",
       [
         "Ask the owner for a credential (API key, password, token). NEVER ask for one in chat: a credential typed as an ordinary message reaches the transcript and the model.",
         "",
-        "The harness messages the owner on their iMessage DM and takes their next message there as the value. You never see it. This returns immediately with a secret_ref; a later <tomo-event type=\"credential\"> says whether the owner provided it, refused, or let the 5 minutes run out. Asking again under the same name replaces the value if the owner replies. One request at a time. Refused outside the owner's own private turn.",
+        "The harness asks the owner where this turn came from: in iMessage or Telegram their next message in that private chat is taken as the value (Telegram's is then deleted from the chat); in the web UI a password card opens. You never see the value. This returns immediately with a secret_ref; a later <tomo-event type=\"credential\"> says whether the owner provided it, refused, or let the 5 minutes run out. Asking again under the same name replaces the value if the owner answers. One request at a time. Refused outside the owner's own private turn, and on a turn the owner is not typing in (a scheduled job, a heartbeat).",
+        "",
+        `Once provided, use it in Bash only inside a command substitution, e.g. curl -H "Authorization: Bearer $(${keychainReadCommand("<name>")})" ... so the value never appears in the command text or the transcript. Never echo, print, encode or log it; known values are masked in tool output, literally and only when the command succeeds.`,
       ].join("\n"),
       {
         name: z.string().describe("Lowercase letters, digits, `.`, `_`, `-`, e.g. `github-token`."),
         purpose: z.string().min(1).max(200).describe("One line shown to the owner saying what it is for. Plain and accurate."),
       },
       async ({ name, purpose }) => {
-        if (!canUse()) return refused();
-        const result = await broker.request(name, purpose, sessionKey);
+        if (!canUse()) return text(CREDENTIAL_SCOPE_REFUSAL, true);
+        const result = await broker.request(name, purpose, sessionKey, origin());
         if (!result.ok) return text(result.error, true);
-        return text(JSON.stringify({ status: "pending", secret_ref: result.ref, expires_at: result.expiresAt, note: result.note }));
+        return text(JSON.stringify({
+          status: "pending", secret_ref: result.ref, asked_on: result.channel, expires_at: result.expiresAt,
+          read_with: `$(${keychainReadCommand(name)})`, note: result.note,
+        }));
       },
-      { searchHint: "ask owner credential api key password token secret imessage" },
-    ),
-    tool(
-      "run_with_secrets",
-      [
-        "Run a shell command with credentials in its environment. Refer to them as variables (`curl -H \"Authorization: Bearer $GITHUB_TOKEN\" ...`); the value is not in the command, the transcript or argv. A secret_ref means nothing to Bash, so use this whenever a command needs a credential.",
-        "",
-        "Known values are scrubbed from the output. Do not print, encode, or send a credential anywhere except the service it belongs to. Refused outside the owner's own private turn.",
-      ].join("\n"),
-      {
-        command: z.string().min(1).describe("Shell command, run with zsh -lc."),
-        secrets: z.record(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/), z.string()).describe("Environment variable name -> secret_ref."),
-        cwd: z.string().optional().describe("Working directory. Defaults to the workspace."),
-        timeout_ms: z.number().int().min(1000).max(MAX_EXEC_TIMEOUT_MS).default(DEFAULT_EXEC_TIMEOUT_MS),
-      },
-      async ({ command, secrets, cwd, timeout_ms }) => {
-        if (!canUse()) return refused();
-        const values: Record<string, string> = {};
-        try {
-          for (const [variable, ref] of Object.entries(secrets)) {
-            const name = parseSecretRef(ref);
-            const value = name ? await broker.reveal(name) : null;
-            if (value === null) return text(`Unknown secret ref "${ref}".`, true);
-            values[variable] = value;
-          }
-          const result = await runWithSecrets({ command, secrets: values, cwd, timeoutMs: timeout_ms });
-          const status = result.timedOut ? `timed out after ${timeout_ms}ms` : `exit code ${result.exitCode ?? "none"}`;
-          return text(`${status}${result.truncated ? " (output truncated)" : ""}\n${result.output}`, result.exitCode !== 0);
-        } catch (err) {
-          // The code and never the message: this spawn held a value in its environment.
-          const code = (err as NodeJS.ErrnoException).code ?? "error";
-          log.warn({ code }, "run_with_secrets failed");
-          return text(`run_with_secrets failed (${code}).`, true);
-        }
-      },
-      { searchHint: "run command shell credential env variable secret api key" },
+      { searchHint: "ask owner credential api key password token secret keychain" },
     ),
   ];
 }

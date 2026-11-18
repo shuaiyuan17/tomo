@@ -7,13 +7,12 @@ vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js"
 vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
-import { runWithSecrets } from "../src/credentials/exec.js";
 import { clearSecretValuesForTests, registerSecretValue, scrubDeep, scrubKnownSecrets } from "../src/credentials/redactor.js";
-import { CredentialStoreError, KeychainBackend } from "../src/credentials/store.js";
-import { credentialRedactionHooks } from "../src/agent/sdk-options.js";
-import { agentProfileDenial } from "../src/agent/permissions.js";
+import { CredentialStoreError, isStorableValue, KeychainBackend } from "../src/credentials/store.js";
+import { keychainReadCommand } from "../src/credentials/names.js";
+import { buildHooksOption, credentialRedactionHooks } from "../src/agent/sdk-options.js";
 
-const FAKE = "fake-exec-credential-7c21";
+const FAKE = "fake-redactor-credential-7c21";
 const REDACTED = "[REDACTED secret://x]";
 
 /** A fake `security`: logs argv and stdin, then runs `body`. No test touches the
@@ -22,16 +21,18 @@ function fakeSecurity(dir: string, body: string): { path: string; argvLog: strin
   const path = join(dir, "fake-bin");
   const argvLog = join(dir, "argv.log");
   const stdinLog = join(dir, "stdin.log");
-  writeFileSync(path, `#!/bin/sh\necho "$@" >> "${argvLog}"\ncat >> "${stdinLog}"\n${body}\n`);
+  writeFileSync(path, `#!/bin/sh\necho "$@" >> "${argvLog}"\ncat >> "${stdinLog}" 2>/dev/null\n${body}\n`);
   chmodSync(path, 0o755);
   writeFileSync(argvLog, "");
   writeFileSync(stdinLog, "");
   return { path, argvLog, stdinLog };
 }
 
+type PostHook = (input: { tool_name?: string; tool_response?: unknown }) => Promise<Record<string, unknown>>;
+
 let dir: string;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "tomo-broker-exec-"));
+  dir = mkdtempSync(join(tmpdir(), "tomo-broker-redactor-"));
   registerSecretValue(FAKE, "x");
 });
 afterEach(() => {
@@ -62,6 +63,27 @@ describe("redactor", () => {
     });
   });
 
+  // The global redactor, as the session installs it: no matcher, so it covers
+  // Bash, where the agent reads a value with $(security … -w) and a careless
+  // `echo` would put it in the transcript.
+  it("masks a value in Bash output through the session's hooks, and covers every tool (no matcher)", async () => {
+    const hooks = buildHooksOption({ maxTurns: 10, sessionKey: "dm:owner", credentialBroker: true }) as { hooks: Record<string, Array<{ matcher?: string; hooks: PostHook[] }>> };
+    const post = hooks.hooks.PostToolUse;
+    expect(post).toHaveLength(1);
+    expect(post[0].matcher).toBeUndefined();
+    const bash = { stdout: `token is ${FAKE}\n`, stderr: "", interrupted: false, isImage: false };
+    const result = await post[0].hooks[0]({ tool_name: "Bash", tool_response: bash });
+    expect(result).toEqual({ hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { ...bash, stdout: `token is ${REDACTED}\n` } } });
+    expect(JSON.stringify(result)).not.toContain(FAKE);
+    const read = await post[0].hooks[0]({ tool_name: "Read", tool_response: { file: { content: FAKE } } });
+    expect(JSON.stringify(read)).not.toContain(FAKE);
+  });
+
+  it("is not installed while the broker is off", () => {
+    const hooks = buildHooksOption({ maxTurns: 10, sessionKey: "dm:owner" }) as { hooks?: Record<string, unknown> };
+    expect(hooks.hooks?.PostToolUse).toBeUndefined();
+  });
+
   it("the log scrubber picks up registered values", async () => {
     const { scrubSecretValues } = await import("../src/redact.js");
     expect(scrubSecretValues(`failed with ${FAKE}`)).toBe(`failed with ${REDACTED}`);
@@ -77,15 +99,15 @@ describe("KeychainBackend, against a fake security binary", () => {
     expect(argv.trim()).toBe("-i -p");
     expect(argv + stdin).not.toContain(FAKE);
     expect(stdin).toContain('add-generic-password -a "x" -s "tomo-credential-broker" -U -X ');
+    // The raw value, so the agent's `security … -w` reads it back unchanged.
+    const hex = /-X ([0-9a-f]+)/.exec(stdin)![1];
+    expect(Buffer.from(hex, "hex").toString("utf8")).toBe(FAKE);
   });
 
-  it("round-trips the stored form, surviving a prompt in the output", async () => {
-    const capture = fakeSecurity(dir, "exit 0");
-    await new KeychainBackend(capture.path).put("x", FAKE);
-    const hex = /-X ([0-9a-f]+)/.exec(readFileSync(capture.stdinLog, "utf8"))![1];
-    const stored = Buffer.from(hex, "hex").toString("utf8");
-    const reader = fakeSecurity(dir, `printf 'security> ${stored}\\n'; exit 0`);
+  it("reads with the same command the agent is told to use, value on stdout only", async () => {
+    const reader = fakeSecurity(dir, `printf '%s\\n' '${FAKE}'; exit 0`);
     expect(await new KeychainBackend(reader.path).get("x")).toBe(FAKE);
+    expect(readFileSync(reader.argvLog, "utf8").trim()).toBe(keychainReadCommand("x").replace(/^security /, ""));
   });
 
   it("maps not-found, and hides everything else behind one error", async () => {
@@ -93,56 +115,12 @@ describe("KeychainBackend, against a fake security binary", () => {
     await expect(new KeychainBackend(fakeSecurity(dir, `echo ${FAKE}; exit 1`).path).get("x")).rejects.toBeInstanceOf(CredentialStoreError);
     await expect(new KeychainBackend(fakeSecurity(dir, "exit 1").path).put("x", FAKE)).rejects.toBeInstanceOf(CredentialStoreError);
     await expect(new KeychainBackend(join(dir, "missing")).get("x")).rejects.toBeInstanceOf(CredentialStoreError);
-  });
-});
-
-describe.runIf(process.platform === "darwin")("runWithSecrets (fake value)", () => {
-  const run = (command: string, secrets: Record<string, string> = {}) =>
-    runWithSecrets({ command, secrets, cwd: dir, timeoutMs: 20_000 });
-
-  it("puts the value in the environment and scrubs it from output", async () => {
-    const result = await run('printf "%s" "$MY_TOKEN"', { MY_TOKEN: FAKE });
-    expect(result.exitCode).toBe(0);
-    expect(result.output).toBe(REDACTED);
+    await expect(new KeychainBackend(fakeSecurity(dir, "exit 0").path).put("x", "fake-é-value")).rejects.toBeInstanceOf(CredentialStoreError);
   });
 
-  it("does not expose the value in the command's argv", async () => {
-    const result = await run("ps -o args= -p $$", { MY_TOKEN: FAKE });
-    expect(result.output).not.toContain("[REDACTED");
-    expect(result.output).not.toContain(FAKE);
-  });
-
-  it("reports failure scrubbed, and bounds a runaway command", async () => {
-    const failed = await run('echo "$T" >&2; exit 7', { T: FAKE });
-    expect(failed.exitCode).toBe(7);
-    expect(failed.output).not.toContain(FAKE);
-    const hung = await runWithSecrets({ command: "sleep 30", secrets: {}, cwd: dir, timeoutMs: 1000 });
-    expect(hung.timedOut).toBe(true);
-  });
-
-  // Codex finding 6.
-  it.each([
-    ["stdout", `printf 'fake-exec-'; sleep 0.2; printf '[other]' >&2; sleep 0.2; printf 'credential-7c21'`],
-    ["stderr", `printf 'fake-exec-' >&2; sleep 0.2; printf '[other]'; sleep 0.2; printf 'credential-7c21' >&2`],
-  ])("scrubs a value split across two %s reads with the other stream between them", async (_label, command) => {
-    const result = await run(command);
-    expect(result.exitCode).toBe(0);
-    expect(result.output).toContain(REDACTED);
-    expect(result.output).toContain("[other]");
-    expect(result.output).not.toContain("fake-exec-");
-    expect(result.output).not.toContain("credential-7c21");
-  });
-
-  it("does not leave the head of a value on either stream when truncated", async () => {
-    const result = await run(`(yes "$T" | head -c 3000000) & (yes "$T" | head -c 3000000 >&2); wait`, { T: FAKE });
-    expect(result.truncated).toBe(true);
-    expect(result.output).not.toContain(FAKE.slice(0, 12));
-  });
-});
-
-describe("agent profiles", () => {
-  it("a profiled subagent cannot use run_with_secrets, whose shell its Bash rules never see", () => {
-    const profile = { writeRoots: [], denyReadPaths: [], bash: "none" } as unknown as Parameters<typeof agentProfileDenial>[0];
-    expect(agentProfileDenial(profile, "mcp__tomo-internal__run_with_secrets", { command: "x" }, "/tmp")).toMatch(/cannot use run_with_secrets/);
+  it("stores only printable ASCII, which `security -w` prints unchanged", () => {
+    expect(isStorableValue("ghp_abc DEF-123!")).toBe(true);
+    expect(isStorableValue("tab\there")).toBe(false);
+    expect(isStorableValue("café-key")).toBe(false);
   });
 });

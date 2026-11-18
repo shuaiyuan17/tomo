@@ -343,6 +343,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           broker: agent.credentialBroker,
           sessionKey: callerSessionKey,
           canUse: () => isOwnAudience() && isDmSessionKey(callerSessionKey),
+          origin: () => agent.turnOrigin(callerSessionKey),
         })
         : []),
     ],

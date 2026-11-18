@@ -450,7 +450,7 @@ export function buildHooksOption(args: {
   /** Read-and-clear "the model's last message was dropped" flag. Undefined ⇒
    *  the nudge is not installed. */
   undeliveredReply?: () => boolean;
-  /** Scrub known credentials from tool output. */
+  /** Install the global PostToolUse redactor for known credential values. */
   credentialBroker?: boolean;
 }) {
   const hooks: Record<string, unknown[]> = {};
@@ -504,10 +504,14 @@ export function mergeHooks(
 }
 
 /**
- * Replaces a tool's output when it contains a known credential, before the model
- * or the session file gets it. Successful calls only: the CLI cannot rewrite a
- * failed tool's output, so a Bash command that prints a value and then exits
- * non-zero is not scrubbed (pinned in tests/e2e/credential-hooks.e2e.ts).
+ * The global literal-value redactor: replaces ANY tool's output (Bash, Read,
+ * MCP, subagent results alike) when it contains a credential the broker
+ * stored, before the model or the session file gets it. It is what keeps a
+ * value the agent reads with `$(security find-generic-password … -w)` from
+ * reaching the transcript when a command echoes it. Literal only, and
+ * successful calls only: the CLI cannot rewrite a failed tool's output, so a
+ * Bash command that prints a value and then exits non-zero is not scrubbed
+ * (pinned in tests/e2e/credential-hooks.e2e.ts). No matcher, so every tool.
  */
 export function credentialRedactionHooks() {
   return {

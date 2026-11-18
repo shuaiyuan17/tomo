@@ -135,6 +135,17 @@ it("scrubs a successful Bash result from the model request and the session file"
   expect(files).not.toContain(FAKE);
 }, 60_000);
 
+// The pattern the agent is told to use, with a careless echo: the command text
+// holds only the substitution, and the value it yields is masked in the result.
+it("masks a value read with $(security … -w) and echoed, from the model and the session file", async () => {
+  const command = 'security() { printf "%s\\n" "$FAKE_E2E_VALUE"; }; echo "token=$(security find-generic-password -s tomo-credential-broker -a e2e -w)"';
+  const { results, files } = await runSteps([{ name: "Bash", input: { command, description: "probe" } }], guarded());
+  expect(results).toContain("token=[REDACTED secret://user/e2e]");
+  expect(results).not.toContain(FAKE);
+  expect(files).toContain("find-generic-password");
+  expect(files).not.toContain(FAKE);
+}, 60_000);
+
 it("pins a known limit: the CLI cannot rewrite a failing Bash, so it is not scrubbed", async () => {
   const { results } = await runSteps(
     [{ name: "Bash", input: { command: 'printf "got %s\\n" "$FAKE_E2E_VALUE"; exit 3', description: "probe" } }],

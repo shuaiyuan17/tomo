@@ -63,6 +63,11 @@ The broker (off by default) has one job: when the owner is clearly sending a pas
 - **`purpose` is written by the agent.** The prompt and the card label it unverified, but it can mislead the owner.
 - **The web card is only as safe as the web UI.** Anyone holding the web access link and a session cookie can answer it; the same is true of everything else the web UI can do.
 
+## Todo store: what it does not stop
+
+- **A summoned, shell-allowlisted group can read the owner's todos through `tomo todo`.** The CLI is scoped by `$TOMO_SESSION_KEY`, which is the session the shell runs on. A summoned group's turns run on the owner's `dm:` session, so if that group is also in `groupShellAllowlist` (an unsandboxed shell), `tomo todo list` from its turn sees the owner's scope. Allowlisting a group's shell is already full trust (that shell can read any file the owner can), so this adds nothing new; keep groups out of `groupShellAllowlist` unless you trust everyone in them.
+- **The Bash write guard reads command text.** It catches writers in command position (redirections, `tee`, `cp`, `mv`, `rm`, `ln`, `sed -i`, `perl -i`, `truncate`, `dd of=`). An interpreter (`python3 -c`, `node -e`) can still write the file from the owner's own session.
+
 ## Usually not a security bug
 
 - Prompt injection that changes what the model says or does without bypassing an allowlist, a private-memory rule, an agent profile, or a hook.

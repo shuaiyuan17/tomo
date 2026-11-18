@@ -1,7 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 
 /**
  * Hooks into the store's atomic write — after it built the new content from
@@ -30,6 +30,7 @@ afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 vi.mock("../src/config.js", () => ({ config: { tomoHome: ROOT }, TOMO_HOME: ROOT }));
 
 const { TodoStore, TodoStoreConflictError } = await import("../src/todos/store.js");
+const { FileLockTimeoutError } = await import("../src/file-lock.js");
 
 let dir: string;
 beforeEach(() => {
@@ -71,6 +72,21 @@ describe("a write that lost its lock does not overwrite the other writer", () =>
   });
 });
 
+describe("the store's lock is never taken from a live holder", () => {
+  it("a second writer waits (and times out) while the holder is alive and slow, past the stale window", () => {
+    const store = new TodoStore(dir, undefined, { staleMs: 10, timeoutMs: 200 });
+    store.add(input("first"));
+    const before = readFileSync(join(dir, "todos.json"), "utf-8");
+    // A holder in this host that is alive (this very process) and has held it for a minute.
+    mkdirSync(join(dir, "todos.json.lock"));
+    writeFileSync(join(dir, "todos.json.lock", "owner.slow"), JSON.stringify({ pid: process.pid, ts: Date.now() - 60_000, host: hostname() }));
+    expect(() => store.add(input("second"))).toThrow(FileLockTimeoutError);
+    expect(readFileSync(join(dir, "todos.json"), "utf-8")).toBe(before);
+    rmSync(join(dir, "todos.json.lock"), { recursive: true });
+    expect(store.add(input("second")).id).toBe("t-2");
+  });
+});
+
 describe("closing an item survives a crash between its two writes", () => {
   it("counts it as done once, with one record, and heals todos.json", () => {
     const store = new TodoStore(dir);
@@ -101,6 +117,21 @@ describe("closing an item survives a crash between its two writes", () => {
     store.add(input("owner thing"));
     store.resolve("t-1", { action: "done", by: "self" });
     expect(() => store.resolve("t-1", { action: "done", by: "self" }, Date.now(), (i) => i.session === "telegram:-100777")).toThrow(/No open todo t-1/);
+  });
+
+  it("starts a new line after a torn one, so the next record still parses", () => {
+    const store = new TodoStore(dir);
+    store.add(input("a"));
+    store.add(input("b"));
+    store.resolve("t-1", { action: "done", by: "self" });
+    writeFileSync(join(dir, "done.ndjson"), `${readFileSync(join(dir, "done.ndjson"), "utf-8")}{"id":"t-9","sess`);
+    store.resolve("t-2", { action: "drop", reason: "no", by: "self" });
+    const lines = doneLines();
+    expect(lines).toHaveLength(3);
+    expect(JSON.parse(lines[2])).toMatchObject({ id: "t-2", resolution: "drop" });
+    expect(new TodoStore(dir).list()).toEqual([]);
+    expect(store.resolve("t-2", { action: "done", by: "self" }).action).toBe("drop");
+    expect(doneLines()).toHaveLength(3);
   });
 
   it("skips a torn last line in done.ndjson", () => {

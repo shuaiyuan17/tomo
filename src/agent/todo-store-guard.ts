@@ -1,10 +1,10 @@
 // PreToolUse guard: the todo store is written by the todo tools only.
 import { isAbsolute, resolve as pathResolve } from "node:path";
 import { log } from "../logger.js";
-import { bashTokens } from "./permission-paths.js";
+import { bashTokens, pathCandidates } from "./permission-paths.js";
 import { landsInPrivate } from "./private-memory-reach.js";
 import { HOME_WRITE_TOOLS } from "./private-memory-access.js";
-import { commandSegments, expandTilde, landsIn, redirectTargets, writeTargets, writeVerbIn } from "./bash-write-targets.js";
+import { commandSegments, expandTilde, landsIn, redirectTargets } from "./bash-write-targets.js";
 
 /**
  * Why the todo store has a guard of its own, on EVERY session (the owner's
@@ -68,7 +68,8 @@ export function isTodoStoreWrite(toolName: string, toolInput: unknown, ctx: { cw
  */
 function bashWritesInto(command: string, ctx: { cwd: string; todosDir: string }): boolean {
   let cwd = ctx.cwd;
-  for (const segment of commandSegments(command)) {
+  // `$(…)` and backticks start a command too.
+  for (const segment of commandSegments(command.replace(/\$\(|`/g, "\n"))) {
     const tokens = bashTokens(segment);
     if (tokens[0] === "cd") {
       const target = tokens[1];
@@ -78,12 +79,45 @@ function bashWritesInto(command: string, ctx: { cwd: string; todosDir: string })
     }
     const redirects = redirectTargets(segment);
     if (redirects.some((t) => landsIn(t, [ctx.todosDir], cwd, false))) return true;
-    const verb = writeVerbIn(segment);
-    if (!verb || !WRITE_VERBS.has(verb)) continue;
-    const paths = destinationsOf(verb, tokens) ?? writeTargets(segment, verb, [], cwd).map((t) => t.path);
+    const at = commandWordIndex(tokens);
+    const verb = at === -1 ? null : writerAt(tokens, at);
+    if (!verb) continue;
+    const args = tokens.slice(at + 1);
+    const paths = destinationsOf(verb, args) ?? args.flatMap((word) => pathCandidates(word));
     if (paths.some((p) => landsIn(p, [ctx.todosDir], cwd, DESTRUCTIVE.has(verb)))) return true;
   }
   return false;
+}
+
+/** Words that run the command after them. */
+const PREFIXES: ReadonlySet<string> = new Set(["sudo", "command", "env", "nice", "nohup", "time", "exec", "xargs"]);
+
+/**
+ * Index of the word in COMMAND POSITION of a segment: the first token, past
+ * `VAR=value` assignments and prefixes like `sudo`/`xargs` (and their flags).
+ * A writer named anywhere else — `grep 'rm' file`, a commit message — is an
+ * argument, not a command.
+ */
+function commandWordIndex(tokens: string[]): number {
+  let i = 0;
+  while (i < tokens.length) {
+    const t = tokens[i];
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) { i++; continue; }
+    if (PREFIXES.has(t)) {
+      i++;
+      while (i < tokens.length && tokens[i].startsWith("-")) i++;
+      continue;
+    }
+    return i;
+  }
+  return -1;
+}
+
+/** The writer this command is, or null. `sed`/`perl` only with `-i`. */
+function writerAt(tokens: string[], at: number): string | null {
+  const word = tokens[at].split("/").pop() ?? "";
+  if (word === "sed" || word === "perl") return tokens.slice(at + 1).some((t) => /^-[a-zA-Z]*i/.test(t)) ? `${word} -i` : null;
+  return WRITE_VERBS.has(word) ? word : null;
 }
 
 /**
@@ -92,11 +126,9 @@ function bashWritesInto(command: string, ctx: { cwd: string; todosDir: string })
  * rest, whose every operand is written (`rm`, `tee`, `sed -i`, ... and `mv`,
  * which also removes its source).
  */
-function destinationsOf(verb: string, tokens: string[]): string[] | undefined {
-  if (verb === "dd") return tokens.filter((t) => t.startsWith("of=")).map((t) => t.slice(3));
+function destinationsOf(verb: string, args: string[]): string[] | undefined {
+  if (verb === "dd") return args.filter((t) => t.startsWith("of=")).map((t) => t.slice(3));
   if (verb !== "cp" && verb !== "ln") return undefined;
-  const at = tokens.indexOf(verb);
-  const args = tokens.slice(at + 1);
   const t = args.indexOf("-t");
   if (t !== -1 && args[t + 1] !== undefined) return [args[t + 1]];
   const operands = args.filter((a) => !a.startsWith("-"));

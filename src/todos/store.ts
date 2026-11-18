@@ -1,9 +1,9 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
+import { closeSync, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { config, TOMO_HOME } from "../config.js";
 import { DEFAULT_TODOS, type TodoConfig } from "./limits.js";
-import { withFileLockSync } from "../file-lock.js";
+import { withFileLockSync, type FileLockOptions } from "../file-lock.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 
 /**
@@ -235,7 +235,11 @@ export class TodoStore {
   private readonly lockPath: string;
   private readonly limitsOverride?: TodoConfig;
 
-  constructor(dir: string = todosDir(), limits?: TodoConfig) {
+  private readonly lockOptions: FileLockOptions;
+
+  /** `lockOptions` is for tests (a shorter wait); a live holder is never robbed of the lock. */
+  constructor(dir: string = todosDir(), limits?: TodoConfig, lockOptions: FileLockOptions = {}) {
+    this.lockOptions = { ...lockOptions, neverReclaimLiveOwner: true };
     this.dir = dir;
     this.path = join(dir, "todos.json");
     this.donePath = join(dir, "done.ndjson");
@@ -396,6 +400,10 @@ export class TodoStore {
    */
   private mutate<T>(fn: (file: StoreFile, closed: Map<string, TodoResolution>) => T): T {
     mkdirSync(this.dir, { recursive: true });
+    // The lock is never reclaimed from a live holder on this host, so a slow
+    // writer makes others wait (or time out) rather than write over it. The
+    // re-read before the rename stays as a second line of defence (another
+    // host, a hand edit, an older build that ignores the lock).
     return withFileLockSync(this.lockPath, () => {
       for (let attempt = 1; ; attempt++) {
         const state = this.readState();
@@ -413,7 +421,7 @@ export class TodoStore {
           throw err;
         }
       }
-    });
+    }, this.lockOptions);
   }
 
   private read(): StoreFile {
@@ -479,9 +487,20 @@ export class TodoStore {
   }
 }
 
+/**
+ * Append one record and fsync. If the file ends in a torn line (an append cut
+ * short), a newline goes first, so the new record starts a line of its own
+ * instead of being glued onto the fragment.
+ */
 function appendDurably(path: string, text: string): void {
-  const fd = openSync(path, "a");
+  const fd = openSync(path, "a+");
   try {
+    const size = fstatSync(fd).size;
+    if (size > 0) {
+      const last = Buffer.alloc(1);
+      readSync(fd, last, 0, 1, size - 1);
+      if (last[0] !== 0x0a) text = `\n${text}`;
+    }
     writeSync(fd, text);
     fsyncSync(fd);
   } finally {

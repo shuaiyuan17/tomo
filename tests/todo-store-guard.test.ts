@@ -81,6 +81,11 @@ describe("isTodoStoreWrite — Bash", () => {
       "echo x >> ~/.tomo/data/todos/done.ndjson",
       `rm ${STORE}`,
       "rm ~/.tomo/data/todos/todos.json",
+      "true && rm ~/.tomo/data/todos/todos.json",
+      "ls; rm ~/.tomo/data/todos/todos.json",
+      "echo $(rm ~/.tomo/data/todos/todos.json)",
+      "sudo -n rm ~/.tomo/data/todos/todos.json",
+      "FOO=1 /bin/rm ~/.tomo/data/todos/todos.json",
       "rm -rf ~/.tomo/data",
       "cd ~/.tomo && rm -rf data/todos",
       "cd ~/.tomo/data && rm -rf todos",
@@ -100,6 +105,10 @@ describe("isTodoStoreWrite — Bash", () => {
   it("lets reads and quoted text through", () => {
     for (const command of [
       "grep 'data/todos' x.log",
+      "grep 'rm' ~/.tomo/data/todos/todos.json",
+      "grep -e rm -e mv ~/.tomo/data/todos/done.ndjson",
+      "echo rm ~/.tomo/data/todos/todos.json",
+      "sed 's/a/b/' ~/.tomo/data/todos/todos.json",
       "git commit -m \"fix data/todos\"",
       "git commit -m \"docs: explain todos.json and done.ndjson\"",
       "cat ~/.tomo/data/todos/todos.json",

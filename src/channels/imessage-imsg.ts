@@ -389,6 +389,11 @@ export class ImsgChannel implements Channel {
     }
   }
 
+  forgetMessage(chatId: string, messageId: string): void {
+    const ring = this.recentByChat.get(chatId);
+    if (ring) this.recentByChat.set(chatId, ring.filter((m) => m.id !== messageId));
+  }
+
   recentMessages(chatId: string): RecentChatMessage[] {
     // Own sends to a bare handle are recorded under the handle itself (no
     // GUID was known to key them by), so look for an exact ring first.
@@ -851,6 +856,9 @@ export class ImsgChannel implements Channel {
       isGroup,
       isMentioned,
       chatTitle: (typeof data.chat_name === "string" && data.chat_name) || undefined,
+      rawText: text,
+      attachmentCount: rawAttachments.length,
+      ...(threadOriginatorGuid ? { replyToId: threadOriginatorGuid } : {}),
     };
 
     // Final staleness gate immediately before the delivery side effect: if a
@@ -954,6 +962,7 @@ export class ImsgChannel implements Channel {
       // so group sessions can stay silent without an explicit NO_REPLY.
       isMentioned: false,
       chatTitle: (typeof data.chat_name === "string" && data.chat_name) || undefined,
+      ...(reactedToGuid ? { reactedToId: reactedToGuid } : {}),
     };
 
     await Promise.all(this.handlers.map((handler) =>

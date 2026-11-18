@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError, readBootstrap, stream, type WebBootstrap } from "./api.js";
-import type { WebCompactState, WebEvent, WebRateLimit, WebReaction, WebRequest, WebSnapshot, WebTask } from "../../src/web/protocol.js";
+import type { WebCompactState, WebCredentialRequest, WebEvent, WebRateLimit, WebReaction, WebRequest, WebSnapshot, WebTask } from "../../src/web/protocol.js";
 import { replaceSessionTasks } from "./tasks.js";
 import { trimRequests } from "./pending.js";
 import { isTransient, TYPING_ACTIVITY, type TurnStatus } from "./composer-status.js";
@@ -30,6 +30,8 @@ export function useWeb() {
   const [toolTicks, setToolTicks] = useState<Record<string, number>>({});
   const [tasks, setTasks] = useState<WebTask[]>([]);
   const [compact, setCompact] = useState<WebCompactState>();
+  /** The open credential request (the password card); null: none. Never a value. */
+  const [credentialRequest, setCredentialRequest] = useState<WebCredentialRequest | null>(null);
   /** What the SDK last reported about each conversation's turn (retry, tool progress, refusal, error, stopped). */
   const [turns, setTurns] = useState<Record<string, TurnStatus>>({});
   /** The subscription's live rate-limit state, on the local clock. */
@@ -78,7 +80,7 @@ export function useWeb() {
       }, 100);
     };
     const snapshot = (value: WebSnapshot) => {
-      setBlocks(value.blocks); setRequests(value.requests); setReactions(value.reactions ?? {}); setActivity({}); setTasks(value.tasks ?? []); setCompact(value.compact);
+      setBlocks(value.blocks); setRequests(value.requests); setReactions(value.reactions ?? {}); setActivity({}); setTasks(value.tasks ?? []); setCompact(value.compact); setCredentialRequest(value.credentialRequest ?? null);
       // Turn statuses are of the moment: a (re)connect starts without them.
       setTurns({}); setSuggestions(value.suggestions ?? {});
       setRateLimit(value.rateLimit);
@@ -115,6 +117,7 @@ export function useWeb() {
       // summary), not as a separate line above the composer.
       if (event.type === "tool") setToolTicks((old) => ({ ...old, [event.sessionId]: (old[event.sessionId] ?? 0) + 1 }));
       if (event.type === "compact") setCompact(event.request);
+      if (event.type === "credential-request") setCredentialRequest(event.request);
       if (event.type === "tasks") setTasks((old) => replaceSessionTasks(old, event.sessionId, event.tasks));
       if (event.type === "reaction") {
         const { requestId, reaction } = event;
@@ -159,5 +162,5 @@ export function useWeb() {
     });
     return () => { controller.abort(); stopResume(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
-  return { bootstrap, connection, blocks, requests, reactions, activity, toolTicks, tasks, compact, turns, rateLimit, suggestions, revision, cronRevision, home, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
+  return { bootstrap, connection, blocks, requests, reactions, activity, toolTicks, tasks, compact, credentialRequest, turns, rateLimit, suggestions, revision, cronRevision, home, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
 }

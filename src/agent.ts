@@ -33,7 +33,7 @@ import { log } from "./logger.js";
 import { shortErrorMessage } from "./error-text.js";
 import { SteerDeclinedError, TurnInterruptedError, type QueryResult, type TurnRequest } from "./agent/live-session.js";
 import { isSilentReply } from "./agent/text-utils.js";
-import { audienceOf, audienceSwitchNote, TurnAudienceRegistry } from "./agent/audience.js";
+import { audienceOf, audienceSwitchNote, TurnAudienceRegistry, type TurnOrigin } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { formatInterruptedAgentsNotice, RunningAgentsLedger, type RunningTaskRecord } from "./agent/running-agents-ledger.js";
 import { DurableInbox, INBOX_STALE_NOT_PROCESSED, restoreMessage, type InboxRecord } from "./agent/durable-inbox.js";
@@ -47,6 +47,9 @@ import { DeliveryPipeline, isAgentErrorResponse, deliveredEntry, failedDeliveryE
 import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest, type ShutdownTurnEnd } from "./agent/turn-runner.js";
 import { OwnerErrorNotifier } from "./agent/owner-error-notice.js";
 import { formatGroupTag } from "./agent/inbound-markers.js";
+import { CredentialBroker } from "./credentials/broker.js";
+import { captureChannelFor } from "./credentials/capture.js";
+import { BrokerStateFile, KeychainBackend } from "./credentials/store.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
@@ -108,6 +111,8 @@ const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
 
 export class Agent {
   private channels: Channel[] = [];
+  /** Null unless `credentialBroker.enabled`. Read by the internal MCP server. */
+  readonly credentialBroker: CredentialBroker | null;
   private sessions: SessionStore;
   private router: OwnerRouter;
   /** Owner-facing, rate-limited trace of inbound messages the admission gate refused. */
@@ -413,10 +418,37 @@ export class Agent {
         }),
     });
 
+    this.credentialBroker = this.createCredentialBroker();
+
     // Load persistent per-session model overrides
     for (const [key, model] of Object.entries(config.sessionModelOverrides)) {
       this.modelOverrides.set(key, model);
     }
+  }
+
+  /** The broker when `credentialBroker.enabled`, else null. */
+  private createCredentialBroker(): CredentialBroker | null {
+    if (!config.credentialBroker?.enabled) return null;
+    const broker = new CredentialBroker({
+      backend: new KeychainBackend(),
+      stateFile: new BrokerStateFile(join(config.tomoHome, "data", "credentials", "state.json")),
+      isOwnerSender: (channelName, senderId) => this.router.isOwnerSender(channelName, senderId),
+      // Asked where the turn came in on: iMessage, Telegram, or the web card.
+      captureChannel: (origin) => captureChannelFor(this.getChannel(origin.channelName), origin.chatId),
+      notifySession: (sessionKey, body) => {
+        this.handleCronMessage(formatTomoEvent("credential", body, { name: "result" }), sessionKey, { showTyping: false })
+          .catch((err) => log.error({ err, sessionKey }, "Credential result turn failed to queue"));
+      },
+      // Deferred: the first load runs in this constructor, before any channel
+      // is added, and the notice would have nowhere to go.
+      notifyOwner: (text) => {
+        setTimeout(() => {
+          this.sendNotification(text).catch((err) => log.warn({ err }, "Could not tell the owner about credential redaction"));
+        }, 15_000).unref?.();
+      },
+    });
+    void broker.primeRedaction();
+    return broker;
   }
 
   /** Look up a channel by name */
@@ -729,6 +761,12 @@ export class Agent {
       } else {
         this.blockedInbound.record(channel.name, message.chatId, isGroup);
       }
+      return true;
+    }
+
+    // Before routing, the batcher, the transcript and the log line in
+    // handleMessage: a message taken here reaches none of them.
+    if (this.credentialBroker && await this.credentialBroker.handleInbound(channel, message)) {
       return true;
     }
 
@@ -1358,7 +1396,7 @@ export class Agent {
     // second one's cleanup unscope the first. Removed afterwards, so a later
     // cron or background turn on the same session is the owner's again and
     // does not inherit a summoned group's narrower scope.
-    const turnId = this.turnAudiences.begin(req.key, req.audiences);
+    const turnId = this.turnAudiences.begin(req.key, req.audiences, req.origins);
     // Until the SDK takes the prompt, this turn has not consumed its messages.
     req.inboxHooks?.notConsumed();
     try {
@@ -1403,6 +1441,17 @@ export class Agent {
    */
   isOwnAudienceTurn(sessionKey: string): boolean {
     return this.turnAudiences.isOwnAudienceTurn(sessionKey);
+  }
+
+  /**
+   * The chat the turn in flight on this session came in on, for a request that
+   * must be answered where the owner is typing (`request_credential`). Null
+   * for a cron, heartbeat or other background turn, and for a batch or
+   * concurrent turns spanning more than one chat. Alongside
+   * `isOwnAudienceTurn`, which says WHOSE turn it is; this says WHERE.
+   */
+  turnOrigin(sessionKey: string): TurnOrigin | null {
+    return this.turnAudiences.turnOrigin(sessionKey) ?? null;
   }
 
   /**
@@ -1580,6 +1629,7 @@ export class Agent {
         images: message.images,
         documents: message.documents,
         audiences,
+        origins: [{ channelName: channel.name, chatId: message.chatId }],
         suppressErrors: isPassiveGroup,
         ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, "A message turn", `${channel.name}:${message.chatId}`) } : {}),
         errorLogMessage: "Error handling message",
@@ -1742,6 +1792,7 @@ export class Agent {
       images: allImages.length > 0 ? allImages : undefined,
       documents: allDocuments.length > 0 ? allDocuments : undefined,
       audiences,
+      origins: items.map((it) => ({ channelName: it.channel.name, chatId: it.message.chatId })),
       suppressErrors: isPassiveGroup,
       ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, "A message turn", `${lastChannel.name}:${lastMessage.chatId}`) } : {}),
       errorLogMessage: "Error handling batched messages",
@@ -2548,6 +2599,7 @@ export class Agent {
     this.runningAgents?.freeze();
     this.detachRunningAgents?.();
     this.detachRunningAgents = undefined;
+    this.credentialBroker?.shutdown();
     if (this.mcpTokenRefreshTimer) {
       clearInterval(this.mcpTokenRefreshTimer);
       this.mcpTokenRefreshTimer = undefined;

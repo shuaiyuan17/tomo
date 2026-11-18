@@ -60,6 +60,19 @@ export interface IncomingMessage {
   isGroup?: boolean;
   /** Whether the bot was mentioned or replied to */
   isMentioned?: boolean;
+  /**
+   * What the sender typed, before the channel prefixed any `[replying to ...]`
+   * or attachment markers to `text`. Absent on a tapback, which nobody typed.
+   * The credential broker takes a value from here: an owner answering a prompt
+   * with long-press Reply would otherwise store the marker as part of it.
+   */
+  rawText?: string;
+  /** How many attachments the provider row carried, loaded or not. */
+  attachmentCount?: number;
+  /** Provider id of the message this one threads onto, if any. */
+  replyToId?: string;
+  /** Provider id of the message this tapback is on, if it is one. */
+  reactedToId?: string;
   /** Group chat title */
   chatTitle?: string;
   /**
@@ -340,6 +353,14 @@ export interface Channel {
   /** Optional custody feedback when accepted input cannot enter a turn.
    * `unknown` must never trigger automatic transport resubmission. */
   settleMessage?(messageId: string, outcome: "refused" | "unknown"): void;
+  /** Drop an inbound message from anything the channel keeps in memory. The
+   *  ring backing `recentMessages` is filled before dispatch, and a substring
+   *  `match` over it would answer "is the value X?". */
+  forgetMessage?(chatId: string, messageId: string): void;
+  /** Delete a message the OWNER sent from the chat itself, where the platform
+   *  lets a bot do that (Telegram private chats). The credential broker uses it
+   *  on a message that may carry a value. Throws when the platform refuses. */
+  deleteInboundMessage?(chatId: string, messageId: string): Promise<void>;
 
   /** Register a handler for slash commands */
   onCommand(handler: CommandHandler): void;

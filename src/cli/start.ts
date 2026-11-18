@@ -252,7 +252,12 @@ async function startForeground(): Promise<void> {
         usage: (refresh) => usageCache.get(refresh),
         models: { view: (key) => agent.webModelView(key), switch: (key, model, from) => agent.switchModelFromWeb(key, model, from) },
         sessionKeys: sessionKeysReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
-        home: { view: () => home.web(), snapshot: (input) => home.deliverSnapshot(input) } });
+        home: { view: () => home.web(), snapshot: (input) => home.deliverSnapshot(input) },
+        // The credential broker's password card: only while the broker is on.
+        ...(agent.credentialBroker ? { credentials: {
+          current: () => agent.credentialBroker?.formRequest("web") ?? null,
+          submit: (id, input) => agent.credentialBroker!.fulfill(id, input),
+        } } : {}) });
       const supervisor = new WebSupervisor(web, {
         ...config.web, owner: config.owner,
         sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,

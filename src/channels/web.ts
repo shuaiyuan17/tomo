@@ -23,7 +23,7 @@ import { FALLBACK_MIME, formatFileMarker, sanitizeAttachmentFilename, saveInboun
 import type { ImageAttachment } from "./types.js";
 import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request-journal.js";
 import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
-import type { WebHome, WebModelChangeResult, WebModelView } from "../web/protocol.js";
+import type { WebCredentialRequest, WebCredentialResult, WebCredentialSubmit, WebHome, WebModelChangeResult, WebModelView } from "../web/protocol.js";
 import { modelLabel } from "../models.js";
 import { formatReactionMarker, formatReplyContextMarker } from "./text-utils.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WEB_REACTIONS, WEB_REQUEST_QUOTE_LIMIT, WebError, type WebReaction, type WebReply, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type TaskAction, type WebStopResult, type WebTaskActionResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess, type WebFiledFile } from "../web/protocol.js";
@@ -47,6 +47,14 @@ const SNAPSHOT_MAILBOX_BYTES = MAX_BUFFER_BYTES - 64 * 1024 - MAX_SNAPSHOT_TASK_
 export const MAX_WEB_REACTIONS = 256;
 
 export interface WebLifecycle { start(): Promise<void>; stop(): Promise<void> }
+/** The credential broker as the browser's password card reaches it (src/credentials/broker.ts). */
+export interface WebCredentialAccess {
+  /** The open request the card shows, or null. */
+  current(): WebCredentialRequest | null;
+  /** The card's answer. Refusals carry the HTTP status and a fixed code, never the value. */
+  submit(id: string, input: WebCredentialSubmit): Promise<{ ok: true; outcome: WebCredentialResult["status"] } | { ok: false; status: number; code: string }>;
+}
+
 /** The daemon side of Tomo's home (src/home/service.ts) as the browser reaches it. */
 export interface WebHomeAccess {
   view(): WebHome;
@@ -128,6 +136,7 @@ export class WebChannel implements Channel {
   private readonly models: WebModelAccess | undefined;
   private readonly sessionKeys: (() => readonly string[]) | undefined;
   private readonly homeAccess: WebHomeAccess | undefined;
+  private readonly credentials: WebCredentialAccess | undefined;
   /** Live and recently ended subagents/background tasks, per visible session. */
   readonly tasks: TaskBoard;
 
@@ -175,9 +184,12 @@ export class WebChannel implements Channel {
       sessionKeys?: () => readonly string[];
       /** Tomo's home (scene, status, snapshots); absent: the Home page has nothing to show (503). */
       home?: WebHomeAccess;
+      /** The credential broker's card; absent: the broker is off (409 on submit). */
+      credentials?: WebCredentialAccess;
       /** Where Tomo's reactions on web messages are kept (JSON); absent: in memory only. */
       reactionsPath?: string } = {}) {
     this.homeAccess = options.home;
+    this.credentials = options.credentials;
     this.models = options.models;
     this.sessionKeys = options.sessionKeys;
     this.usageReader = options.usage;
@@ -425,7 +437,33 @@ export class WebChannel implements Channel {
       ...(this.compactState ? { compact: { ...this.compactState } } : {}),
       ...(this.rateLimit ? { rateLimit: { ...this.rateLimit } } : {}),
       ...(this.suggestions.size ? { suggestions: Object.fromEntries(this.suggestions) } : {}),
-      ...(this.reactions.size ? { reactions: Object.fromEntries(this.reactions) } : {}) };
+      ...(this.reactions.size ? { reactions: Object.fromEntries(this.reactions) } : {}),
+      ...(this.credentialRequest() ? { credentialRequest: this.credentialRequest() } : {}) };
+  }
+
+  /** The open credential request the card shows (name and purpose only). */
+  private credentialRequest(): WebCredentialRequest | null {
+    try {
+      const request = this.credentials?.current() ?? null;
+      return request ? { id: request.id, name: request.name, purpose: request.purpose, expiresAt: request.expiresAt } : null;
+    } catch { return null; }
+  }
+
+  /**
+   * The broker opened (a request) or closed (null) the card. REPLACE
+   * semantics; the snapshot carries the same state, so a reload still shows it.
+   */
+  publishCredentialRequest(request: WebCredentialRequest | null): void {
+    const view = request ? { id: request.id, name: request.name, purpose: request.purpose, expiresAt: request.expiresAt } : null;
+    this.publishQuietly({ type: "credential-request", request: view });
+  }
+
+  /** The card's answer, straight to the broker: no journal, no bubble, no transcript. */
+  async submitCredential(id: string, input: WebCredentialSubmit): Promise<WebCredentialResult> {
+    if (!this.credentials || this.tornDown) throw new WebError(409, "credential_unknown");
+    const result = await this.credentials.submit(id, input);
+    if (!result.ok) throw new WebError(result.status, result.code);
+    return { status: result.outcome };
   }
 
   /**

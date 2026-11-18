@@ -292,6 +292,9 @@ export interface TomoConfig {
    *  Read/Edit/Glob/Grep/MEDIA guards for `memory/private/` still apply;
    *  only the Bash sandbox is bypassed. */
   groupShellAllowlist: string[];
+  /** The credential broker (`src/credentials/`). Off by default: off means no
+   *  tools and no inbound interception. See SECURITY.md. */
+  credentialBroker: { enabled: boolean };
   lcm: LcmConfig;
   metrics: MetricsConfig;
 }
@@ -1005,6 +1008,7 @@ function buildConfig(): TomoConfig {
     plugins: parsePlugins(file.plugins),
     agentProfiles: parseAgentProfiles(file.agentProfiles),
     groupShellAllowlist: validated("groupShellAllowlist", z.array(z.string()), file.groupShellAllowlist, []),
+    credentialBroker: validated("credentialBroker", z.object({ enabled: z.boolean().default(false) }), file.credentialBroker, { enabled: false }),
     lcm: validated("lcm", lcmSchema, file.lcm, DEFAULT_LCM),
     metrics: parseMetricsConfig(file.metrics),
   };

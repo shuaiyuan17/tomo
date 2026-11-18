@@ -331,6 +331,20 @@ export interface WebHome { scene: HomeScene; revision: string; starter: boolean;
 /** A picture of the room as a browser drew it, for Tomo to look at: a PNG as base64, at most HOME_SNAPSHOT_MAX_BYTES decoded. */
 export const HOME_SNAPSHOT_MAX_BYTES = 1024 * 1024;
 export const homeSnapshotSchema = z.object({ requestId: z.uuid().optional(), revision: z.string().max(80), png: z.string().min(1).max(Math.ceil(HOME_SNAPSHOT_MAX_BYTES * 4 / 3) + 4).regex(/^[A-Za-z0-9+/]+={0,2}$/) }).strict();
+/**
+ * An open credential request the owner answers in the web UI's password card
+ * (src/credentials/broker.ts). Name and purpose only: no event, snapshot or
+ * response ever carries a value.
+ */
+export interface WebCredentialRequest { id: string; name: string; purpose: string; expiresAt: number }
+/** The card's answer (POST /credentials/<id>): the value, or a refusal. Its own route, never /messages. */
+export const credentialSubmitSchema = z.union([
+  z.object({ value: z.string().min(1).max(8192) }).strict(),
+  z.object({ cancel: z.literal(true) }).strict(),
+]);
+export type WebCredentialSubmit = z.infer<typeof credentialSubmitSchema>;
+/** Answer to the card: the value was stored, or the request was refused. Never echoes the value. */
+export interface WebCredentialResult { status: "stored" | "cancelled" }
 export type WebEvent =
   /** `images`: ids of pictures this block sent, filed in the outgoing media store (see outgoing-media.ts). */
   | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string; images?: string[] }
@@ -353,6 +367,8 @@ export type WebEvent =
   | { type: "home-status"; status: HomeStatus }
   /** Tomo wants to look at its home: an open Home page answers with POST /home/snapshot. */
   | { type: "home-look"; requestId: string }
+  /** The open credential request for the card; null: none (answered, refused, expired). REPLACE semantics. */
+  | { type: "credential-request"; request: WebCredentialRequest | null }
   /** All tasks of one session, live and recently ended. REPLACE semantics. */
   | { type: "tasks"; sessionId: string; tasks: WebTask[] }
   /** Tomo reacted to (null: took back its reaction on) one of the owner's web messages. */
@@ -378,6 +394,8 @@ export interface WebBootstrap extends WebCatalog {
   reactions?: Record<string, WebReaction>;
   /** What the UI calls the agent (config `agent.name`, else IDENTITY.md, else "Tomo"); absent on older daemons. */
   agentName?: string;
+  /** The open credential request, so a reload still shows the card (absent: none, or an older daemon). */
+  credentialRequest?: WebCredentialRequest | null;
 }
 /** One tick of the read-only screen view: a JPEG when live, otherwise why there is none. */
 export interface WebScreenFrame { status: "live" | "locked" | "away" | "unconfirmed" | "unavailable" | "too_large"; capturedAt: number; jpeg?: string }
@@ -473,9 +491,11 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("home") }).strict(),
   /** A picture of the home an open Home page drew, for Tomo's home_check (checked again by the daemon). */
   z.object({ method: z.literal("home-snapshot"), epoch: z.uuid(), snapshot: homeSnapshotSchema }).strict(),
+  /** The credential card's answer, for the broker. The value goes no further than broker.fulfill. */
+  z.object({ method: z.literal("credential-submit"), epoch: z.uuid(), id: z.uuid(), input: credentialSubmitSchema }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
-export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "rateLimit" | "suggestions" | "reactions">;
+export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "rateLimit" | "suggestions" | "reactions" | "credentialRequest">;
 export interface WebSync { snapshot: WebSnapshot; replay: EventEnvelope[] | null }
 /** Daemon answer to the `task` RPC. `sessionKey` stays inside the web process. */
 export interface WebTaskAccess { sessionKey: string; taskType: string; output?: TaskOutput;

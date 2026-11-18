@@ -60,6 +60,9 @@ const cases = [
   ["messaging-requirement", "src/cli/start.ts", "assertChannelsConfigured();", "void 0;", "tests/web-startup.test.ts"],
   ["group-composer", "web/src/main.tsx", "disabled={!session?.writable} onChange", "disabled={false} onChange", "e2e"],
   ["theme-choice", "web/src/main.tsx", "document.documentElement.dataset.theme = theme", 'document.documentElement.dataset.theme = "light"', "e2e"],
+  ["credential-body-check", "src/web/http.ts", "if (!parsed.success) throw new WebError(400, \"invalid_credential\");", "if (!parsed.success) void 0;", "tests/web-credentials.test.ts"],
+  ["credential-web-chat-not-held", "src/credentials/broker.ts", "const CHAT_CHANNELS = [\"imessage\", \"telegram\"] as const;", "const CHAT_CHANNELS = [\"imessage\", \"telegram\", \"web\"] as const;", "tests/credential-broker.test.ts"],
+  ["credential-card-withdrawn", "src/credentials/capture.ts", "close: () => card.publishCredentialRequest(null),", "close: () => {},", "tests/web-credentials.test.ts"],
   ["uncertain-draft", "web/src/main.tsx", "else setFeedback(labels.unknown);", 'else { setDraft(""); setFeedback(labels.unknown); }', "e2e"],
 ];
 const results = [];

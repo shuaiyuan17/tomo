@@ -47,6 +47,7 @@ export type TomoEventType =
   | "web"              // browser-channel notice (name = interrupted)
   | "inbox"            // durable-inbox replay after a restart (name = replay|interrupted)
   | "interrupted-agents" // subagents/background commands a restart or crash cut off
+  | "credential"       // how a credential request ended (never carries a value)
   | "note";            // bare harness aside with no producer of its own
                        //   (appendToTomoEventBody's fallback wrapper)
 

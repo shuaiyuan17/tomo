@@ -8,7 +8,8 @@ import { buildRecallTools } from "./recall-tools.js";
 import { buildPeopleTools } from "./people-tools.js";
 import { buildLcmTools } from "./lcm-tools.js";
 import { buildHomeTools } from "./home-tools.js";
-import { isGroupSessionKey } from "../sessions/keys.js";
+import { buildCredentialTools } from "./credential-tools.js";
+import { isDmSessionKey, isGroupSessionKey } from "../sessions/keys.js";
 import { ownerSessionKey } from "../owner.js";
 import { homeService } from "../home/service.js";
 
@@ -335,6 +336,16 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
         allowed: isOwnAudience,
         service: homeService,
       }) : []),
+      // Absent while the broker is off. On a group session they are listed and
+      // refuse, so the model can say why.
+      ...(agent.credentialBroker
+        ? buildCredentialTools({
+          broker: agent.credentialBroker,
+          sessionKey: callerSessionKey,
+          canUse: () => isOwnAudience() && isDmSessionKey(callerSessionKey),
+          origin: () => agent.turnOrigin(callerSessionKey),
+        })
+        : []),
     ],
   });
 }

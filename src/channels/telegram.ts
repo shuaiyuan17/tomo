@@ -216,6 +216,10 @@ export class TelegramChannel implements Channel {
         isGroup,
         isMentioned,
         chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
+        // What was typed, for the credential broker (Telegram puts no marker in `text`).
+        rawText: ctx.message.text,
+        attachmentCount: 0,
+        ...(ctx.message.reply_to_message ? { replyToId: String(ctx.message.reply_to_message.message_id) } : {}),
       });
     }));
 
@@ -245,6 +249,8 @@ export class TelegramChannel implements Channel {
         senderId: this.getSenderId(ctx),
         text,
         images: image ? [image] : undefined,
+        rawText: ctx.message.caption ?? "",
+        attachmentCount: 1,
         timestamp: ctx.message.date * 1000,
         isGroup,
         isMentioned,
@@ -272,6 +278,8 @@ export class TelegramChannel implements Channel {
           senderName: this.getSenderName(ctx),
           senderId: this.getSenderId(ctx),
           text: caption ? `${note} ${caption}` : note,
+          rawText: ctx.message.caption ?? "",
+          attachmentCount: 1,
           timestamp: ctx.message.date * 1000,
           isGroup,
           isMentioned,
@@ -304,6 +312,8 @@ export class TelegramChannel implements Channel {
         senderId: this.getSenderId(ctx),
         text,
         documents: document ? [document] : undefined,
+        rawText: ctx.message.caption ?? "",
+        attachmentCount: 1,
         timestamp: ctx.message.date * 1000,
         isGroup,
         isMentioned,
@@ -375,6 +385,7 @@ export class TelegramChannel implements Channel {
       timestamp: update.date * 1000,
       isGroup,
       isReaction: true,
+      reactedToId: messageId,
       // Ambient, not a summons: a group session can stay silent.
       isMentioned: false,
       chatTitle: isGroup && "title" in update.chat ? update.chat.title : undefined,
@@ -582,6 +593,22 @@ export class TelegramChannel implements Channel {
         .finally(() => { this.inFlightUpdates.delete(done); });
       this.inFlightUpdates.add(done);
     }
+  }
+
+  /**
+   * Deletes a message the owner sent. Telegram lets a bot delete INCOMING
+   * messages in a private chat (Bot API deleteMessage, within 48 hours); never
+   * used on a group. Throws when Telegram refuses.
+   */
+  async deleteInboundMessage(chatId: string, messageId: string): Promise<void> {
+    if (chatId.startsWith("-") || !/^\d+$/.test(messageId)) throw new Error("Only a private chat's own messages can be deleted");
+    await this.bot.api.deleteMessage(chatId, Number(messageId));
+    this.forgetMessage(chatId, messageId);
+  }
+
+  forgetMessage(chatId: string, messageId: string): void {
+    const ring = this.recentByChat.get(chatId);
+    if (ring) this.recentByChat.set(chatId, ring.filter((m) => m.id !== messageId));
   }
 
   private recordRecentMessage(chatId: string, message: RecentChatMessage): void {

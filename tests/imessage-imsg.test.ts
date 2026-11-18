@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import type { IncomingMessage } from "../src/channels/types.js";
 import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, rmSync, truncateSync, writeFileSync, writeSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -5752,6 +5753,48 @@ describe("imsg admission before spending anything on a chat", () => {
     children[0].notifyMessage(inboundMessage({ guid: "fmt-1", sender: "+1 (555) 123-4567" }));
     await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
     expect((handler.mock.calls[0][0] as { senderId?: string }).senderId).toBe("+15551234567");
+    await channel.stop();
+  });
+});
+
+describe("what the credential broker needs from an inbound row", () => {
+  it("carries what was typed apart from the markers, the thread id, and the attachment count", async () => {
+    const { channel, children } = makeChannel();
+    await channel.start();
+    const handler = vi.fn(async () => true);
+    channel.onMessage(handler);
+    children[0].notifyMessage(inboundMessage({ guid: "reply-1", text: "fake-typed-value", thread_originator_guid: "prompt-guid" }));
+    await settle();
+    const message = handler.mock.calls[0][0] as IncomingMessage;
+    expect(message.text).toBe("[replying to an earlier message] fake-typed-value");
+    expect(message.rawText).toBe("fake-typed-value");
+    expect(message.replyToId).toBe("prompt-guid");
+    expect(message.attachmentCount).toBe(0);
+    await channel.stop();
+  });
+
+  it("gives a tapback no rawText, so it cannot be captured as a value, and names its target", async () => {
+    const { channel, children } = makeChannel();
+    await channel.start();
+    const handler = vi.fn(async () => true);
+    channel.onMessage(handler);
+    children[0].notifyMessage(inboundMessage({ id: 101, guid: "react-1", is_reaction: true, reaction_type: "like", is_reaction_add: true, reacted_to_guid: "target-guid" }));
+    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    const message = handler.mock.calls[0][0] as IncomingMessage;
+    expect(message.rawText).toBeUndefined();
+    expect(message.reactedToId).toBe("target-guid");
+    await channel.stop();
+  });
+
+  it("forgetMessage removes a row from the ring that substring targeting and reply quoting read", async () => {
+    const { channel, children } = makeChannel();
+    await channel.start();
+    channel.onMessage(vi.fn(async () => true));
+    children[0].notifyMessage(inboundMessage({ guid: "secret-row", text: "fake-ring-value" }));
+    await settle();
+    expect(channel.recentMessages(DM_GUID).map((m) => m.id)).toContain("secret-row");
+    channel.forgetMessage(DM_GUID, "secret-row");
+    expect(channel.recentMessages(DM_GUID).map((m) => m.id)).not.toContain("secret-row");
     await channel.stop();
   });
 });

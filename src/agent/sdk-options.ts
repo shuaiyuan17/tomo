@@ -271,7 +271,8 @@ export function sdkOptions(
     // spares background agents. Without this declaration the CLI kills them on every interrupt.
     ...(sessionContext && isDmSessionKey(sessionContext.sessionKey) && config.web?.enabled ? { perTaskStopAffordance: true } : {}),
     ...(thinking ? { thinking } : {}),
-    maxTurns: config.maxTurns,
+    // 0 = no limit: leave maxTurns out so the CLI gets no --max-turns at all.
+    ...(config.maxTurns > 0 ? { maxTurns: config.maxTurns } : {}),
     ...buildHooksOption({
       turnBudget,
       maxTurns: config.maxTurns,
@@ -447,7 +448,8 @@ export function buildHooksOption(args: {
   undeliveredReply?: () => boolean;
 }) {
   const hooks: Record<string, unknown[]> = {};
-  if (args.turnBudget) {
+  // The reminders count toward a wall; with no limit (0) there is none to warn about.
+  if (args.turnBudget && args.maxTurns > 0) {
     mergeHooks(hooks, turnBudgetHooks(args.turnBudget, args.maxTurns, args.sessionKey));
   }
   if (args.undeliveredReply) {

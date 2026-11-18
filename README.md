@@ -385,7 +385,7 @@ Environment variables override config file values:
 | `TOMO_LITELLM_API_KEY` | API key sent to the LiteLLM proxy as `ANTHROPIC_API_KEY` |
 | `TOMO_LITELLM_MODE` | Optional LiteLLM mode: `anthropic-compatible` or `chatgpt-subscription` |
 | `TOMO_WORKSPACE` | Override workspace directory |
-| `TOMO_MAX_TURNS` | Override per-turn tool-use ceiling (default: `50`) |
+| `TOMO_MAX_TURNS` | Override per-turn tool-use ceiling (default: `50`; `0` = no limit, which also turns off the 75%/90% wrap-up reminders) |
 | `TOMO_STEERING` | Override message steering. Defaults to `true`; set `false` to keep mid-turn messages queued. |
 | `TOMO_INBOX` | Override the durable inbox. Defaults to `true`; set `false` to hold waiting messages in memory only. |
 | `TOMO_INTERRUPTED_AGENTS` | Track running subagents on disk and report the ones a restart or crash cut off. Defaults to `true`. |

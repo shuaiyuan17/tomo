@@ -11,8 +11,8 @@ import type { AgentProfile } from "../config.js";
 import { resolvePlugins } from "./plugins.js";
 import { SDK_SETTING_SOURCES } from "./setting-sources.js";
 import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
-import { CREDENTIAL_TOOL_NAMES } from "../credentials/names.js";
-import { scrubDeep } from "../credentials/redactor.js";
+import { CREDENTIAL_TOOL_NAMES, KEYCHAIN_SERVICE } from "../credentials/names.js";
+import { ensureRedactionReady, redactionReady, scrubDeep, withholdDeep } from "../credentials/redactor.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
 // rollups via skill), so SDK auto-compact is disabled for them via the
@@ -516,13 +516,21 @@ export function mergeHooks(
 export function credentialRedactionHooks() {
   return {
     PostToolUse: [{
-      hooks: [async (input: { tool_response?: unknown }) => {
-        const scrubbed = scrubDeep(input.tool_response);
-        if (scrubbed === input.tool_response) return {};
+      hooks: [async (input: { tool_input?: unknown; tool_response?: unknown }) => {
+        // Not ready (a restart could not load the stored values): retry, with
+        // backoff; still not ready, fail closed on output that went near the
+        // keychain, the one way a value is meant to enter a command.
+        const ready = redactionReady() || await ensureRedactionReady();
+        let rewritten = scrubDeep(input.tool_response);
+        if (!ready && JSON.stringify(input.tool_input ?? "").includes(KEYCHAIN_SERVICE)) {
+          log.warn("Withheld a tool result that read the keychain: credential redaction is not ready");
+          rewritten = withholdDeep(input.tool_response);
+        }
+        if (rewritten === input.tool_response) return {};
         return {
           hookSpecificOutput: {
             hookEventName: "PostToolUse" as const,
-            updatedToolOutput: scrubbed,
+            updatedToolOutput: rewritten,
           },
         };
       }],

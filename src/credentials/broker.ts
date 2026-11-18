@@ -3,7 +3,7 @@ import type { Channel, IncomingMessage } from "../channels/types.js";
 import { isDefiniteFailure } from "../channels/types.js";
 import { log } from "../logger.js";
 import { isCredentialName, keychainReadCommand, secretRefFor } from "./names.js";
-import { MIN_SECRET_LENGTH, registerSecretValue, scrubKnownSecrets } from "./redactor.js";
+import { markRedactionNotReady, markRedactionReady, MIN_SECRET_LENGTH, redactionReady, registerSecretValue, scrubKnownSecrets } from "./redactor.js";
 import { isStorableValue } from "./store.js";
 import type { BrokerState, BrokerStateFile, CredentialBackend, PendingRequest } from "./store.js";
 
@@ -57,6 +57,8 @@ export interface BrokerDeps {
   captureChannel(origin: CredentialOrigin): CaptureChannel | null;
   /** Tell a session's model how a request ended. Never carries a value. */
   notifySession(sessionKey: string, body: string): void;
+  /** A notice for the owner that needs no model turn (agent.sendNotification). */
+  notifyOwner?(text: string): void;
   now?: () => number;
   timeoutMs?: number;
 }
@@ -93,6 +95,8 @@ export class CredentialBroker {
   /** Set while the state file cannot be trusted: the chat channels held back. */
   private held: Set<string> | null = null;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  /** The owner was told redaction is not ready (once per outage). */
+  private redactionAlerted = false;
   private readonly now: () => number;
   private readonly timeoutMs: number;
 
@@ -122,17 +126,40 @@ export class CredentialBroker {
     return true;
   }
 
-  /** So a value still in a running child or a file is scrubbed after a restart. */
-  async primeRedaction(): Promise<void> {
-    if (this.held) return;
-    for (const name of this.state.names) {
-      try {
-        const value = await this.deps.backend.get(name);
-        if (value !== null) registerSecretValue(value, name);
-      } catch {
-        log.warn({ name }, "Could not load a credential for redaction");
+  /**
+   * So a value still in a running child or a file is scrubbed after a restart.
+   * True when every stored value is known to the redactor. On failure (state
+   * unreadable, keychain unavailable) the redactor is marked not ready: the
+   * PostToolUse hook retries this with backoff and, meanwhile, withholds the
+   * output of commands that read the keychain. The owner is told once.
+   */
+  async primeRedaction(): Promise<boolean> {
+    if (this.held) this.loadState();
+    let ok = !this.held;
+    if (ok) {
+      for (const name of this.state.names) {
+        try {
+          const value = await this.deps.backend.get(name);
+          if (value !== null) registerSecretValue(value, name);
+        } catch {
+          ok = false;
+          log.warn({ name }, "Could not load a credential for redaction");
+        }
       }
     }
+    if (ok) {
+      if (!redactionReady()) log.info("Credential redaction is ready again");
+      markRedactionReady();
+      this.redactionAlerted = false;
+      return true;
+    }
+    markRedactionNotReady(() => this.primeRedaction());
+    if (!this.redactionAlerted) {
+      this.redactionAlerted = true;
+      log.error("Credential redaction is not ready: stored values could not be loaded, so they would not be masked in tool output. Retrying; output of commands that read the keychain is withheld meanwhile.");
+      this.deps.notifyOwner?.("Tomo could not load its stored credentials (the keychain or ~/.tomo/data/credentials/state.json is unavailable), so it cannot mask them in tool output yet. It keeps retrying, and hides the output of any command that reads the keychain until then.");
+    }
+    return false;
   }
 
   shutdown(): void {
@@ -304,16 +331,24 @@ export class CredentialBroker {
     const value = (message.rawText ?? "").trim();
     const ref = secretRefFor(pending.name);
     this.markConsumed(channel, message);
+    const valid = (message.attachmentCount ?? 0) === 0 && acceptableValue(value);
 
-    if (CANCEL_WORDS.has(value.toLowerCase())) {
-      this.endRequest(pending);
+    // CLAIM the request synchronously, before the first await. Deleting the
+    // message and writing the keychain both wait, and a second message landing
+    // meanwhile must find no open request: otherwise it is captured too and an
+    // ordinary sentence overwrites the value, or a later "cancel" is undone.
+    // Only an invalid value leaves the request open, to be answered again.
+    const cancelled = CANCEL_WORDS.has(value.toLowerCase());
+    if (cancelled || valid) this.endRequest(pending);
+
+    if (cancelled) {
       await this.say(channel, message.chatId, `Cancelled the request for ${pending.name}.`);
       this.deps.notifySession(pending.sessionKey, `The owner refused the request for ${ref}.`);
       return true;
     }
     const removed = await this.removeMessage(channel, message);
     const tidy = removed ? "Your message was deleted from this chat." : deletionAdvice(channel.name);
-    if ((message.attachmentCount ?? 0) > 0 || !acceptableValue(value)) {
+    if (!valid) {
       await this.say(channel, message.chatId, `That was not stored and not shown to the model. ${tidy} ${pending.name} needs plain text (printable ASCII, ${MIN_SECRET_LENGTH} to ${MAX_SECRET_LENGTH} characters) and no attachment. Send it again, or reply "cancel".`);
       return true;
     }
@@ -344,7 +379,7 @@ export class CredentialBroker {
       `The owner provided ${ref}. You do not have the value and must not ask for it, print it, or write it anywhere.`,
       `Use it in Bash only inside a command substitution, so it reaches the command but never the command text or the output: "$(${keychainReadCommand(pending.name)})".`,
       `For example: curl -sS -H "Authorization: Bearer $(${keychainReadCommand(pending.name)})" https://api.example.com/...`,
-      "Known values are masked in tool output, but only literally, and not when the command fails.",
+      "Known values are masked in tool output, but only literally and NOT when the command fails: redirect such a command's output (> out.txt 2>&1) and/or end it with || true so it exits 0.",
     ].join("\n"));
     return true;
   }

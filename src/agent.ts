@@ -439,6 +439,13 @@ export class Agent {
         this.handleCronMessage(formatTomoEvent("credential", body, { name: "result" }), sessionKey, { showTyping: false })
           .catch((err) => log.error({ err, sessionKey }, "Credential result turn failed to queue"));
       },
+      // Deferred: the first load runs in this constructor, before any channel
+      // is added, and the notice would have nowhere to go.
+      notifyOwner: (text) => {
+        setTimeout(() => {
+          this.sendNotification(text).catch((err) => log.warn({ err }, "Could not tell the owner about credential redaction"));
+        }, 15_000).unref?.();
+      },
     });
     void broker.primeRedaction();
     return broker;

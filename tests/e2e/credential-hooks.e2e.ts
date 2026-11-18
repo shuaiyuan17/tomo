@@ -154,6 +154,25 @@ it("pins a known limit: the CLI cannot rewrite a failing Bash, so it is not scru
   expect(results).toContain(FAKE);
 }, 60_000);
 
+// Tripwire for the limit above. PostToolUseFailure's output type has only
+// `additionalContext` (sdk.d.ts, PostToolUseFailureHookSpecificOutput), and the
+// CLI ignores a rewrite returned from it. If this starts failing, the CLI can
+// rewrite failed output: wire the redactor to PostToolUseFailure.
+it("pins that a PostToolUseFailure hook cannot rewrite a failed Bash's output either", async () => {
+  let fired = 0;
+  const failureHook = { PostToolUseFailure: [{ hooks: [async () => {
+    fired++;
+    return { hookSpecificOutput: { hookEventName: "PostToolUseFailure", updatedToolOutput: "rewritten", additionalContext: "rewritten" } };
+  }] }] };
+  const base = guarded() as { hooks: Record<string, unknown> };
+  const { results } = await runSteps(
+    [{ name: "Bash", input: { command: 'printf "got %s\\n" "$FAKE_E2E_VALUE"; exit 3', description: "probe" } }],
+    { ...base, hooks: { ...base.hooks, ...failureHook } },
+  );
+  expect(fired).toBe(1);
+  expect(results).toContain(FAKE);
+}, 60_000);
+
 it("scrubs an in-process MCP tool's result", async () => {
   const { results, files } = await runSteps([{ name: "mcp__probe__leak", input: {} }], guarded());
   expect(results).toContain("[REDACTED secret://user/e2e]");

@@ -7,7 +7,9 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 
 import { CREDENTIAL_REQUEST_TIMEOUT_MS, CredentialBroker, type CaptureChannel, type CredentialOrigin, type CredentialRequestView } from "../src/credentials/broker.js";
 import { chatCaptureChannel, webCaptureChannel } from "../src/credentials/capture.js";
-import { clearSecretValuesForTests, scrubKnownSecrets } from "../src/credentials/redactor.js";
+import { clearSecretValuesForTests, ensureRedactionReady, redactionReady, scrubKnownSecrets, WITHHELD_OUTPUT } from "../src/credentials/redactor.js";
+import { credentialRedactionHooks } from "../src/agent/sdk-options.js";
+import { keychainReadCommand } from "../src/credentials/names.js";
 import { BrokerStateFile, CredentialStoreError, MemoryBackend } from "../src/credentials/store.js";
 import { markDefiniteFailure, type Channel, type IncomingMessage, type OutgoingMessage } from "../src/channels/types.js";
 import { log } from "../src/logger.js";
@@ -451,6 +453,39 @@ describe("CredentialBroker", () => {
       expect(await broker.handleInbound(tg.ch, tgReply({ id: "42" }))).toBe(true);
     });
 
+    // Codex P1: the request used to stay open until the delete (and the store)
+    // had been awaited, so a second message meanwhile was captured too.
+    it("claims the request before awaiting the delete: a second message meanwhile is ordinary, and cannot overwrite the value", async () => {
+      const broker = make();
+      await broker.request("x", "p", SESSION, TG);
+      let release!: () => void;
+      tg.del!.mockImplementationOnce(() => new Promise<void>((resolve) => { release = resolve; }));
+      const first = broker.handleInbound(tg.ch, tgReply());
+      await vi.waitFor(() => expect(tg.del).toHaveBeenCalledTimes(1));
+      const second = tgReply({ rawText: "fake-ordinary-sentence", text: "fake-ordinary-sentence" });
+      expect(await broker.handleInbound(tg.ch, second)).toBe(false);
+      expect(await broker.handleInbound(tg.ch, tgReply({ rawText: "cancel", text: "cancel" }))).toBe(false);
+      release();
+      expect(await first).toBe(true);
+      expect(backend.items.get("x")).toBe(FAKE);
+      expect(notes.filter((n) => n.body.includes("refused"))).toEqual([]);
+      expect(JSON.parse(readFileSync(statePath(), "utf8")).pending).toBeNull();
+    });
+
+    it("claims the request before awaiting the keychain write, too", async () => {
+      let release!: () => void;
+      const put = backend.put.bind(backend);
+      backend.put = (name, value) => new Promise<void>((resolve) => { release = () => { void put(name, value).then(resolve); }; });
+      const broker = make();
+      await broker.request("x", "p", SESSION, IM);
+      const first = broker.handleInbound(im.ch, reply());
+      await vi.waitFor(() => expect(release).toBeTypeOf("function"));
+      expect(await broker.handleInbound(im.ch, reply({ rawText: "fake-second-message" }))).toBe(false);
+      release();
+      expect(await first).toBe(true);
+      expect(backend.items.get("x")).toBe(FAKE);
+    });
+
     it("deletes an invalid value too, and keeps the request open", async () => {
       const broker = make();
       await broker.request("x", "p", SESSION, TG);
@@ -560,6 +595,71 @@ describe("CredentialBroker", () => {
       expect(await broker.handleInbound(im.ch, ordinary())).toBe(true);
       expect(await broker.handleInbound(tg.ch, ordinary({ chatId: TG.chatId, senderId: TG_OWNER }))).toBe(true);
       expect(await broker.handleInbound(channel("web").ch, ordinary({ chatId: "owner" }))).toBe(false);
+    });
+  });
+
+  // Codex P1: a restart that could not load the stored values never retried,
+  // and the redactor then did not know them.
+  describe("redaction after a restart that could not load the values", () => {
+    afterEach(() => { vi.restoreAllMocks(); });
+
+    it("retries with backoff, withholds keychain output while not ready, tells the owner once, then masks", async () => {
+      const first = make();
+      await first.request("x", "p", SESSION, IM);
+      await first.handleInbound(im.ch, reply());
+      first.shutdown();
+      clearSecretValuesForTests();
+
+      const get = backend.get.bind(backend);
+      let failures = 2;
+      backend.get = async (name) => { if (failures-- > 0) throw new CredentialStoreError(); return get(name); };
+      const owner: string[] = [];
+      const broker = new CredentialBroker({ backend, stateFile: new BrokerStateFile(statePath()), isOwnerSender: () => true,
+        captureChannel: () => null, notifySession: () => {}, notifyOwner: (text) => owner.push(text) });
+      expect(await broker.primeRedaction()).toBe(false);
+      expect(redactionReady()).toBe(false);
+      expect(owner).toHaveLength(1);
+
+      const hook = credentialRedactionHooks().PostToolUse[0].hooks[0];
+      const keychainCall = { tool_input: { command: `echo "$(${keychainReadCommand("x")})"` }, tool_response: { stdout: `${FAKE}\n`, stderr: "" } };
+      // Not ready, retry not yet due: the keychain command's output is withheld, shape kept.
+      expect(await hook(keychainCall)).toEqual({ hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { stdout: WITHHELD_OUTPUT, stderr: "" } } });
+      // Other output is not withheld (it cannot hold the value unless the model fetched it some other way).
+      expect(await hook({ tool_input: { command: "ls" }, tool_response: { stdout: "a b" } })).toEqual({});
+
+      let clock = Date.now();
+      vi.spyOn(Date, "now").mockImplementation(() => clock);
+      clock += 60_000;
+      // Due: retried, fails again (second failure), still withheld, owner not told again.
+      expect(JSON.stringify(await hook(keychainCall))).not.toContain(FAKE);
+      expect(redactionReady()).toBe(false);
+      expect(owner).toHaveLength(1);
+      // Backed off: not retried again yet.
+      clock += 1_000;
+      await hook(keychainCall);
+      expect(failures).toBe(0);
+      clock += 10 * 60_000;
+      // Due again: the load succeeds, and from now on the value is masked.
+      const masked = await hook(keychainCall);
+      expect(redactionReady()).toBe(true);
+      expect(masked).toEqual({ hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { stdout: "[REDACTED secret://x]\n", stderr: "" } } });
+      expect(scrubKnownSecrets(`x ${FAKE}`)).toContain("[REDACTED");
+    });
+
+    it("an unreadable state file at start is also not ready, and recovers once it is repaired", async () => {
+      const first = make();
+      await first.request("x", "p", SESSION, IM);
+      await first.handleInbound(im.ch, reply());
+      first.shutdown();
+      clearSecretValuesForTests();
+      const good = readFileSync(statePath(), "utf8");
+      writeFileSync(statePath(), "{ not json");
+      const broker = make();
+      expect(await broker.primeRedaction()).toBe(false);
+      writeFileSync(statePath(), good);
+      expect(await ensureRedactionReady(Date.now() + 60_000)).toBe(true);
+      expect(scrubKnownSecrets(FAKE)).toContain("[REDACTED");
+      void broker;
     });
   });
 });

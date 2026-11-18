@@ -19,6 +19,7 @@ export function registerSecretValue(value: string, name: string): void {
 
 export function clearSecretValuesForTests(): void {
   secrets.clear();
+  readiness = null;
 }
 
 export function scrubKnownSecrets(text: string): string {
@@ -47,4 +48,61 @@ export function scrubDeep<T>(value: T, depth = 0): T {
   const entries = Object.entries(value as Record<string, unknown>);
   const next = entries.map(([key, item]) => [key, scrubDeep(item, depth + 1)] as const);
   return next.some(([, item], i) => item !== entries[i][1]) ? (Object.fromEntries(next) as T) : value;
+}
+
+/**
+ * Whether the redactor knows every value the broker holds. After a restart it
+ * learns them from the keychain (`CredentialBroker.primeRedaction`); until that
+ * has succeeded it does not, and a value printed meanwhile would pass the
+ * literal match. While not ready, `ensureRedactionReady` retries the load (with
+ * backoff) and the PostToolUse hook withholds output that went near the
+ * keychain (`withholdDeep`).
+ */
+interface Readiness { retry: () => Promise<boolean>; nextAt: number; backoffMs: number; inFlight?: Promise<boolean> }
+let readiness: Readiness | null = null;
+const MIN_BACKOFF_MS = 5_000;
+const MAX_BACKOFF_MS = 5 * 60_000;
+
+export function redactionReady(): boolean {
+  return readiness === null;
+}
+
+/** Marks the redactor not ready; `retry` loads the values again and says whether it worked. */
+export function markRedactionNotReady(retry: () => Promise<boolean>, now = Date.now()): void {
+  if (readiness) return;
+  readiness = { retry, nextAt: now + MIN_BACKOFF_MS, backoffMs: MIN_BACKOFF_MS };
+}
+
+export function markRedactionReady(): void {
+  readiness = null;
+}
+
+/** Retries the load if it is due. Resolves to whether the redactor is ready. Never throws. */
+export async function ensureRedactionReady(now = Date.now()): Promise<boolean> {
+  const r = readiness;
+  if (!r) return true;
+  if (r.inFlight) return r.inFlight;
+  if (now < r.nextAt) return false;
+  r.inFlight = r.retry().catch(() => false).then((ok) => {
+    if (ok) { if (readiness === r) readiness = null; return true; }
+    r.backoffMs = Math.min(r.backoffMs * 2, MAX_BACKOFF_MS);
+    r.nextAt = Date.now() + r.backoffMs;
+    r.inFlight = undefined;
+    return false;
+  });
+  return r.inFlight;
+}
+
+export const WITHHELD_OUTPUT = "[withheld: Tomo's credential redaction is not ready, so output of a command that reads the keychain is not shown]";
+
+/** `value` with every string leaf replaced, its shape kept (see scrubDeep). */
+export function withholdDeep<T>(value: T, depth = 0): T {
+  if (typeof value === "string") return (value ? WITHHELD_OUTPUT : value) as unknown as T;
+  if (depth > 32 || value === null || typeof value !== "object") return value;
+  if (Array.isArray(value)) return value.map((item) => withholdDeep(item, depth + 1)) as unknown as T;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, withholdDeep(v, depth + 1)])) as T;
+}
+
+export function resetRedactionReadinessForTests(): void {
+  readiness = null;
 }

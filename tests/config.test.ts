@@ -206,6 +206,17 @@ describe("config file validation", () => {
     expect(config.saveInboundFiles).toBe(true);
   });
 
+  it("accepts maxTurns 0 as no limit and still rejects a negative one", async () => {
+    const zero = await loadWithConfigFile(JSON.stringify({ maxTurns: 0 }));
+    expect(zero.configIssues).toEqual([]);
+    expect(zero.config.maxTurns).toBe(0);
+
+    vi.resetModules();
+    const negative = await loadWithConfigFile(JSON.stringify({ maxTurns: -5 }));
+    expect(negative.config.maxTurns).toBe(50);
+    expect(negative.configIssues.join("\n")).toContain("maxTurns");
+  });
+
   it("reports invalid values, falls back to defaults, and refuses startup", async () => {
     const { config, configIssues, assertConfigValid } = await loadWithConfigFile(JSON.stringify({
       maxTurns: "plenty",

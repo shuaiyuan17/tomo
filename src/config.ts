@@ -239,7 +239,8 @@ export interface TomoConfig {
    *  silence the notice; the agent is still told a file arrived, just without
    *  a path to open (silence is what caused the 2026-08-27 incident). */
   saveInboundFiles: boolean;
-  /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50. */
+  /** Max agent turns per single user message (one turn ≈ one tool-use round). Default 50.
+   *  0 means no limit: the SDK gets no maxTurns and the wrap-up reminders are off. */
   maxTurns: number;
   /** Steer messages that arrive while a turn is in flight into that turn at the
    *  next tool-call boundary, instead of queueing them behind it. Default true. */
@@ -972,7 +973,7 @@ function buildConfig(): TomoConfig {
       // attachments", and a new key must not quietly re-enable that.
       saveInboundImages,
     ),
-    maxTurns: validated("maxTurns (TOMO_MAX_TURNS)", positiveInt, envVar("TOMO_MAX_TURNS") ?? file.maxTurns, 50),
+    maxTurns: validated("maxTurns (TOMO_MAX_TURNS)", nonNegativeInt, envVar("TOMO_MAX_TURNS") ?? file.maxTurns, 50),
     steering: validated("steering (TOMO_STEERING)", boolLike, envVar("TOMO_STEERING") ?? file.steering, true),
     inbox: validated("inbox (TOMO_INBOX)", boolLike, envVar("TOMO_INBOX") ?? file.inbox, true),
     inboxReplayMaxAgeMinutes: validated(

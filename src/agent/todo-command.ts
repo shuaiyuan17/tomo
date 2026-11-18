@@ -1,5 +1,5 @@
 import { canSeeTodo, formatTodoLine, formatTodoList } from "../todos/format.js";
-import { TodoRuleError, TodoStoreReadError, type TodoStore } from "../todos/store.js";
+import { TodoRuleError, TodoStoreError, type TodoStore } from "../todos/store.js";
 
 export const TODO_USAGE = "Usage: /todo, /todo all, /todo add <text>, /todo done <id>, /todo drop <id> [reason]";
 
@@ -57,7 +57,7 @@ export function runTodoCommand(command: TodoCommand, deps: { store: TodoStore; s
       }
     }
   } catch (err) {
-    if (err instanceof TodoStoreReadError) return `Todos are unavailable: ${err.message}`;
+    if (err instanceof TodoStoreError) return `Todos are unavailable: ${err.message}`;
     if (err instanceof TodoRuleError) return err.message;
     throw err;
   }

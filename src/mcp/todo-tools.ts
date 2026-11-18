@@ -3,7 +3,7 @@ import { z } from "zod";
 import { MIXED_AUDIENCE_KEY } from "../agent/audience.js";
 import { isStorableSessionKey } from "../cron/scope.js";
 import { canSeeTodo, formatTodoLine } from "../todos/format.js";
-import { compareByReview, TodoRuleError, TodoStore, TodoStoreReadError, type TodoItem } from "../todos/store.js";
+import { compareByReview, TodoRuleError, TodoStore, TodoStoreError, type TodoItem } from "../todos/store.js";
 
 export const TODO_TOOL_NAMES = ["todo_add", "todo_list", "todo_resolve"] as const;
 
@@ -24,7 +24,7 @@ export function buildTodoTools(deps: { store?: () => TodoStore; caller?: () => s
   const callerKey = (): string | undefined => deps.caller?.();
   const visible = (item: TodoItem): boolean => canSeeTodo(item, callerKey());
   const fail = (name: string, err: unknown) => {
-    if (err instanceof TodoRuleError || err instanceof TodoStoreReadError) {
+    if (err instanceof TodoRuleError || err instanceof TodoStoreError) {
       return { content: [{ type: "text" as const, text: `${name} failed: ${err.message}` }], isError: true };
     }
     throw err;

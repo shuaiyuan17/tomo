@@ -35,7 +35,7 @@ vi.mock("../src/workspace/index.js", () => ({
 }));
 vi.mock("../src/logger.js", () => ({ log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
-const { isTodoStoreWrite, todoStoreGuardHooks, TODO_STORE_WRITE_DENIAL } = await import("../src/agent/todo-store-guard.js");
+const { isTodoStoreWrite, todoGuardDecision, todoStoreGuardHooks, TODO_STORE_WRITE_DENIAL } = await import("../src/agent/todo-store-guard.js");
 const { privateMemoryGuardHooks } = await import("../src/agent/private-memory-guard.js");
 const { SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH } = await import("../src/agent/bash-sandbox.js");
 
@@ -60,10 +60,10 @@ describe("isTodoStoreWrite — file tools", () => {
     ]) expect(isTodoStoreWrite(call.tool_name, call.tool_input, ctx), JSON.stringify(call)).toBe(true);
   });
 
-  it("fails closed on an input it cannot read", () => {
-    expect(isTodoStoreWrite("Write", { content: "x" }, ctx)).toBe(true);
-    expect(isTodoStoreWrite("Write", null, ctx)).toBe(true);
-    expect(isTodoStoreWrite("Bash", { command: 42 }, ctx)).toBe(true);
+  it("does not judge an input it cannot read (the tool rejects it on its own)", () => {
+    expect(isTodoStoreWrite("Write", { content: "x" }, ctx)).toBe(false);
+    expect(isTodoStoreWrite("Write", null, ctx)).toBe(false);
+    expect(isTodoStoreWrite("Bash", { command: 42 }, ctx)).toBe(false);
   });
 
   it("leaves other paths and reads alone", () => {
@@ -74,31 +74,55 @@ describe("isTodoStoreWrite — file tools", () => {
 });
 
 describe("isTodoStoreWrite — Bash", () => {
-  it("denies commands that write the store or name it as a path", () => {
+  it("denies writes whose target is in the store", () => {
     for (const command of [
+      "echo x > ~/.tomo/data/todos/todos.json",
       `echo '{}' > ${STORE}`,
       "echo x >> ~/.tomo/data/todos/done.ndjson",
-      "cat ~/.tomo/data/todos/todos.json",
-      `python3 -c "open('${tree.todos}/todos.json','w')"`,
-      "node -e 'require(\"fs\").writeFileSync(process.env.HOME + \"/.tomo/data/todos/todos.json\", \"{}\")'",
+      `rm ${STORE}`,
+      "rm ~/.tomo/data/todos/todos.json",
+      "rm -rf ~/.tomo/data",
       "cd ~/.tomo && rm -rf data/todos",
       "cd ~/.tomo/data && rm -rf todos",
-      "cd ~/.tomo/data/todos && ls",
-      "rm -rf ~/.tomo/data",
+      "echo x | tee ~/.tomo/data/todos/todos.json",
+      `cp /tmp/x.json ${STORE}`,
+      `cp -t ${tree.todos} /tmp/x.json`,
       `mv ${join(tree.ws, "x.json")} ${tree.todos}/`,
-      `jq . innocent/todos.json > /tmp/t && mv /tmp/t ${join(tree.ws, "innocent", "todos.json")}`,
+      `ln -sf /tmp/x ${STORE}`,
+      `sed -i '' 's/a/b/' ${STORE}`,
+      `perl -i -pe 's/a/b/' ${STORE}`,
+      `truncate -s 0 ${STORE}`,
+      `dd if=/dev/zero of=${STORE} count=1`,
+      "jq . x > innocent/todos.json",
     ]) expect(isTodoStoreWrite("Bash", { command }, ctx), command).toBe(true);
   });
 
-  it("leaves ordinary commands alone, including prose that mentions the file names", () => {
+  it("lets reads and quoted text through", () => {
     for (const command of [
-      "tomo todo due --max 3",
-      "tomo todo list",
-      "ls /tmp && echo hi > /tmp/out.txt",
+      "grep 'data/todos' x.log",
+      "git commit -m \"fix data/todos\"",
       "git commit -m \"docs: explain todos.json and done.ndjson\"",
-      `cat ${join(tree.ws, "memory", "MEMORY.md")}`,
+      "cat ~/.tomo/data/todos/todos.json",
+      `jq '.items[] | .title' ${STORE}`,
+      `cp ${STORE} /tmp/backup.json`,
+      `dd if=${STORE} of=/tmp/backup.json`,
+      `ln -s ${STORE} /tmp/link.json`,
+      "echo 'x > ~/.tomo/data/todos/todos.json'",
+      "tomo todo due --max 3",
+      "ls /tmp && echo hi > /tmp/out.txt",
       "rm -rf /tmp/scratch",
     ]) expect(isTodoStoreWrite("Bash", { command }, ctx), command).toBe(false);
+  });
+});
+
+describe("todoGuardDecision — a failing check blocks only calls that name the store", () => {
+  const boom = () => { throw new Error("guard bug"); };
+  it("denies a call that names the store, allows everything else", () => {
+    expect(todoGuardDecision("Bash", { command: "cat ~/.tomo/data/todos/todos.json" }, ctx, boom)).toBe("deny");
+    expect(todoGuardDecision("Write", { file_path: STORE }, ctx, boom)).toBe("deny");
+    expect(todoGuardDecision("Bash", { command: "ls -la" }, ctx, boom)).toBe("allow");
+    expect(todoGuardDecision("Read", { file_path: join(tree.ws, "notes.md") }, ctx, boom)).toBe("allow");
+    expect(todoGuardDecision("WebFetch", { url: "https://example.com" }, ctx, boom)).toBe("allow");
   });
 });
 

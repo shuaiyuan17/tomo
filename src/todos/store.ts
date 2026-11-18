@@ -1,4 +1,4 @@
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { config, TOMO_HOME } from "../config.js";
@@ -74,14 +74,30 @@ export function todoLimits(): TodoConfig {
   return { ...DEFAULT_TODOS, ...(config.todos ?? {}) };
 }
 
+/** Base of the store's own failures (as opposed to rule refusals). */
+export class TodoStoreError extends Error {}
+
 /** The store file could not be read or parsed. Never treated as empty. */
-export class TodoStoreReadError extends Error {
+export class TodoStoreReadError extends TodoStoreError {
   readonly path: string;
   constructor(path: string, cause: unknown) {
     const detail = cause instanceof Error ? cause.message : String(cause);
     super(`todo store could not be read: ${path} (${detail}). Nothing was changed; fix or restore the file.`, { cause });
     this.name = "TodoStoreReadError";
     this.path = path;
+  }
+}
+
+/**
+ * Someone else published `todos.json` between our read and our rename, even
+ * though we held the lock — `withFileLockSync` reclaims a lock held past its
+ * stale window from a live holder. Retried from a fresh read; reported only
+ * if it keeps happening.
+ */
+export class TodoStoreConflictError extends TodoStoreError {
+  constructor(path: string) {
+    super(`todo store changed while it was being written: ${path}. Nothing was overwritten; try again.`);
+    this.name = "TodoStoreConflictError";
   }
 }
 
@@ -119,6 +135,17 @@ interface StoreFile {
   next_id: number;
   items: TodoItem[];
 }
+
+interface StoreState {
+  file: StoreFile;
+  /** The exact bytes read (null: no file), compared again just before the rename. */
+  raw: string | null;
+  /** Finished items by id, from done.ndjson. */
+  closed: Map<string, TodoResolution>;
+}
+
+/** Fresh reads before a conflicting write is reported instead of retried. */
+const WRITE_ATTEMPTS = 3;
 
 const DAY_MS = 86_400_000;
 const REF_MAX_CHARS = 300;
@@ -299,10 +326,17 @@ export class TodoStore {
     }
     const until = input.action === "snooze" ? parseReviewWhen(input.until!, now, limits) : undefined;
 
-    return this.mutate((file) => {
+    return this.mutate((file, closed) => {
       const index = file.items.findIndex((item) => item.id === key);
       const found = index === -1 ? undefined : file.items[index];
-      if (!found || !visible(found)) throw new TodoRuleError(`No open todo ${id.trim()} in this conversation.`);
+      if (!found || !visible(found)) {
+        // Closing an item that is already closed is a no-op, not a second record.
+        const done = closed.get(key);
+        if (done && visible(done) && (input.action === "done" || input.action === "drop")) {
+          return { action: done.resolution, item: stripResolution(done) };
+        }
+        throw new TodoRuleError(`No open todo ${id.trim()} in this conversation.`);
+      }
       const stamp = new Date(now).toISOString();
 
       if (input.action === "done" || input.action === "drop") {
@@ -314,9 +348,11 @@ export class TodoStore {
           ...(reason ? { reason } : {}),
           ...(evidence ? { evidence } : {}),
         };
-        // Append first: a crash between the two leaves the item both open and
-        // logged (shown again, harmless), never closed and lost.
-        appendFileSync(this.donePath, `${JSON.stringify(record)}\n`);
+        // Append (and fsync) first. A crash before todos.json is rewritten
+        // leaves the item in both files; every read treats an id that is in
+        // done.ndjson as closed, so it is never shown again or closed twice.
+        appendDurably(this.donePath, `${JSON.stringify(record)}\n`);
+        closed.set(record.id, record);
         file.items.splice(index, 1);
         return { action: input.action, item: found };
       }
@@ -351,26 +387,52 @@ export class TodoStore {
     });
   }
 
-  /** Lock, read fresh, change, publish atomically. A read error aborts before anything is written. */
-  private mutate<T>(fn: (file: StoreFile) => T): T {
+  /**
+   * Lock, read fresh, change, publish atomically. A read error aborts before
+   * anything is written. Just before the rename the file is read again and
+   * compared with what this attempt read: if another writer got in (the lock
+   * can be reclaimed from a holder that is slow but alive), nothing is
+   * published and the change is redone from a fresh read.
+   */
+  private mutate<T>(fn: (file: StoreFile, closed: Map<string, TodoResolution>) => T): T {
     mkdirSync(this.dir, { recursive: true });
     return withFileLockSync(this.lockPath, () => {
-      const file = this.read();
-      const result = fn(file);
-      writeJsonAtomicSync(this.path, file, { fsync: true });
-      return result;
+      for (let attempt = 1; ; attempt++) {
+        const state = this.readState();
+        const result = fn(state.file, state.closed);
+        try {
+          writeJsonAtomicSync(this.path, state.file, {
+            fsync: true,
+            beforeRename: () => {
+              if (this.rawNow() !== state.raw) throw new TodoStoreConflictError(this.path);
+            },
+          });
+          return result;
+        } catch (err) {
+          if (err instanceof TodoStoreConflictError && attempt < WRITE_ATTEMPTS) continue;
+          throw err;
+        }
+      }
     });
   }
 
   private read(): StoreFile {
-    let raw: string;
+    return this.readState().file;
+  }
+
+  private rawNow(): string | null {
     try {
-      raw = readFileSync(this.path, "utf-8");
+      return readFileSync(this.path, "utf-8");
     } catch (err) {
-      // Absent is a fresh install. Anything else is a failure, not emptiness.
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { version: 1, next_id: 1, items: [] };
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw new TodoStoreReadError(this.path, err);
     }
+  }
+
+  private readState(): StoreState {
+    const raw = this.rawNow();
+    const closed = this.readClosed();
+    if (raw === null) return { file: { version: 1, next_id: 1, items: [] }, raw, closed };
     let data: unknown;
     try {
       data = JSON.parse(raw);
@@ -388,8 +450,53 @@ export class TodoStore {
         throw new TodoStoreReadError(this.path, new Error(`${item.id} is not below next_id ${file.next_id}`));
       }
     }
-    return file;
+    // Self-heal a close interrupted between its two writes: logged means closed.
+    file.items = file.items.filter((item) => !closed.has(item.id));
+    return { file, raw, closed };
   }
+
+  /**
+   * done.ndjson by id. A line that does not parse is skipped — the torn tail
+   * of an append cut short — rather than failing every read over history.
+   */
+  private readClosed(): Map<string, TodoResolution> {
+    const closed = new Map<string, TodoResolution>();
+    let raw: string;
+    try {
+      raw = readFileSync(this.donePath, "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return closed;
+      throw new TodoStoreReadError(this.donePath, err);
+    }
+    for (const text of raw.split("\n")) {
+      if (!text.trim()) continue;
+      try {
+        const record = JSON.parse(text) as TodoResolution;
+        if (typeof record?.id === "string" && typeof record.session === "string" && !closed.has(record.id)) closed.set(record.id, record);
+      } catch { /* torn line */ }
+    }
+    return closed;
+  }
+}
+
+function appendDurably(path: string, text: string): void {
+  const fd = openSync(path, "a");
+  try {
+    writeSync(fd, text);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function stripResolution(record: TodoResolution): TodoItem {
+  const item: Partial<TodoResolution> = { ...record };
+  delete item.resolution;
+  delete item.resolved_at;
+  delete item.resolved_by;
+  delete item.reason;
+  delete item.evidence;
+  return item as TodoItem;
 }
 
 function byReview(a: TodoItem, b: TodoItem): number {

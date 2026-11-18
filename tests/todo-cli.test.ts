@@ -26,7 +26,15 @@ function home(items?: unknown[] | string): string {
 }
 
 function tomo(homeDir: string, ...args: string[]) {
-  const run = spawnSync(TSX, [CLI, "todo", ...args], { encoding: "utf8", env: { ...process.env, HOME: homeDir } });
+  return tomoAs(undefined, homeDir, ...args);
+}
+
+/** Run as an agent shell would: with the session key tomo puts in its env. */
+function tomoAs(sessionKey: string | undefined, homeDir: string, ...args: string[]) {
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: homeDir };
+  delete env.TOMO_SESSION_KEY;
+  if (sessionKey !== undefined) env.TOMO_SESSION_KEY = sessionKey;
+  const run = spawnSync(TSX, [CLI, "todo", ...args], { encoding: "utf8", env });
   return { code: run.status, out: run.stdout, err: run.stderr };
 }
 
@@ -63,5 +71,24 @@ describe("tomo todo due", () => {
     expect(run.code).toBe(1);
     expect(run.out).toBe("");
     expect(run.err).toMatch(/todo store could not be read/);
+  });
+});
+
+describe("tomo todo from an agent's shell", () => {
+  it("is held to the session key in its env: a group never sees the owner's items", { timeout: 30_000 }, () => {
+    const dir = home([item(1, -1, "owner secret"), item(2, -1, "group thing"), item(3, -1, "owner other")]);
+    for (const args of [["due"], ["list"], ["due", "--session", "dm:shuai"], ["list", "--session", "dm:shuai"]]) {
+      const run = tomoAs("telegram:-100777", dir, ...args);
+      expect(run.code, args.join(" ")).toBe(0);
+      expect(run.out, args.join(" ")).not.toContain("owner");
+    }
+    expect(tomoAs("telegram:-100777", dir, "list").out).toContain("t-2 group thing");
+    // Another group sees nothing at all; due prints nothing.
+    expect(tomoAs("telegram:-100999", dir, "due")).toMatchObject({ code: 0, out: "" });
+    // The owner's DM shell, and a terminal with no key, see everything.
+    for (const run of [tomoAs("dm:shuai", dir, "list"), tomo(dir, "list")]) {
+      expect(run.out).toContain("owner secret");
+      expect(run.out).toContain("group thing");
+    }
   });
 });

@@ -4,7 +4,7 @@ import { log } from "../logger.js";
 import { bashTokens } from "./permission-paths.js";
 import { landsInPrivate } from "./private-memory-reach.js";
 import { HOME_WRITE_TOOLS } from "./private-memory-access.js";
-import { commandSegments, expandTilde, landsIn, pathishTokens, redirectTargets, writeTargets, writeVerbIn } from "./bash-write-targets.js";
+import { commandSegments, expandTilde, landsIn, redirectTargets, writeTargets, writeVerbIn } from "./bash-write-targets.js";
 
 /**
  * Why the todo store has a guard of its own, on EVERY session (the owner's
@@ -22,51 +22,50 @@ import { commandSegments, expandTilde, landsIn, pathishTokens, redirectTargets, 
  * - Write / Edit / MultiEdit / NotebookEdit at or inside the store directory
  *   (lexical, symlink-resolved, and any `..` under it — the same
  *   `landsInPrivate` rules as the home guard);
- * - Bash, judged on its text: any path that names or resolves into the store
- *   (reads included — `tomo todo list` is the shell's way in), or a write (redirection or write verb) whose target is the store, one of
- *   its files, or an ancestor of it (`rm -rf ~/.tomo/data`). `cd` between
- *   segments is followed.
+ * - Bash WRITES only: a redirection, `tee`, `cp`/`mv`/`rm`/`ln`, `sed -i`,
+ *   `perl -i`, `truncate` or `dd of=` whose target is in the store (or, for
+ *   `rm`/`mv`, an ancestor of it: `rm -rf ~/.tomo/data`). Reads and quoted
+ *   text are not judged. `cd` between segments is followed.
  *
  * The Bash arm is a text filter on an unsandboxed shell and cannot be complete
  * (an interpreter can assemble a path the text never spells). It is a guard
  * against habit, not against an adversary: the owner's DM is trusted, and the
  * adversarial case (a group steering the model) is the kernel sandbox's.
- * It fails closed: a tool input it cannot read is denied, and the hook is
- * registered with `onFailure: "block"`.
+ * When the check itself throws, only a call whose input names the store is
+ * denied (see {@link todoGuardDecision}); the hook is also registered with
+ * `onFailure: "block"` for anything that escapes.
  */
 
 export const TODO_STORE_WRITE_DENIAL =
-  "Tomo's todo store (`~/.tomo/data/todos/`) is written only through the todo tools, so their rules hold. Use todo_add, todo_list and todo_resolve (done, drop, snooze, handoff), or `tomo todo list` / `tomo todo due` to read it from a shell.";
+  "Tomo's todo store (`~/.tomo/data/todos/`) is written only through the todo tools, so their rules hold. Use todo_add, todo_list and todo_resolve (done, drop, snooze, handoff). Reading it (cat, `tomo todo list`) is fine.";
 
-/**
- * Text that names the store's directory or files as a path. Path-shaped on
- * purpose: a commit message that mentions `todos.json` in prose is not a
- * write, and refusing it would make working on Tomo itself impossible.
- */
-const STORE_MENTION = /\.tomo\/data\/todos(?![\w-])|(^|[\s'"=])data\/todos(?![\w-])|todos\/(todos\.json|done\.ndjson)/i;
+/** Shell writers judged by their targets. Anything else is let through. */
+const WRITE_VERBS: ReadonlySet<string> = new Set(["tee", "cp", "mv", "rm", "rmdir", "unlink", "ln", "sed -i", "perl -i", "truncate", "dd"]);
+/** Writers that destroy what they name, so an ancestor of the store counts (`rm -rf ~/.tomo/data`). */
+const DESTRUCTIVE: ReadonlySet<string> = new Set(["rm", "rmdir", "mv"]);
 
 /**
  * Would this tool call write the todo store directly?
- * Exported for tests.
+ * Exported for tests. An input this cannot read is not a store write (the
+ * tool will reject it on its own); only a call that hits the store is denied.
  */
 export function isTodoStoreWrite(toolName: string, toolInput: unknown, ctx: { cwd: string; todosDir: string }): boolean {
+  if (!toolInput || typeof toolInput !== "object") return false;
+  const ti = toolInput as Record<string, unknown>;
   if (HOME_WRITE_TOOLS.has(toolName)) {
-    if (!toolInput || typeof toolInput !== "object") return true;
-    const ti = toolInput as Record<string, unknown>;
     const p = toolName === "NotebookEdit" ? ti.notebook_path : ti.file_path;
-    if (typeof p !== "string") return true;
+    if (typeof p !== "string") return false;
     return landsInPrivate(expandTilde(p), { cwd: ctx.cwd, memoryDir: ctx.todosDir, privateDir: ctx.todosDir });
   }
-  if (toolName !== "Bash") return false;
-  if (!toolInput || typeof toolInput !== "object") return true;
-  const command = (toolInput as Record<string, unknown>).command;
-  if (typeof command !== "string") return true;
-  if (STORE_MENTION.test(command)) return true;
-  // Any path token that resolves into the store (a relocated tomoHome, a symlink).
-  if (pathishTokens(command).some((t) => landsIn(t, [ctx.todosDir], ctx.cwd, false))) return true;
-  return bashWritesInto(command, ctx);
+  if (toolName !== "Bash" || typeof ti.command !== "string") return false;
+  return bashWritesInto(ti.command, ctx);
 }
 
+/**
+ * Only WRITES: a `>`/`>>` redirection, or one of {@link WRITE_VERBS}, whose
+ * target lands in the store. Quoted text (a grep pattern, a commit message)
+ * and read-only commands pass. `cd` between segments is followed.
+ */
 function bashWritesInto(command: string, ctx: { cwd: string; todosDir: string }): boolean {
   let cwd = ctx.cwd;
   for (const segment of commandSegments(command)) {
@@ -75,24 +74,66 @@ function bashWritesInto(command: string, ctx: { cwd: string; todosDir: string })
       const target = tokens[1];
       if (target === undefined || target === "~") cwd = expandTilde("~");
       else if (target !== "-") cwd = isAbsolute(expandTilde(target)) ? expandTilde(target) : pathResolve(cwd, target);
-      // A `cd` that lands in the store is itself the warning sign.
-      if (landsIn(cwd, [ctx.todosDir], ctx.cwd, false)) return true;
       continue;
     }
-    const targets = writeTargets(segment, writeVerbIn(segment), redirectTargets(segment), cwd);
-    if (targets.some((t) => landsIn(t.path, [ctx.todosDir], cwd, true))) return true;
+    const redirects = redirectTargets(segment);
+    if (redirects.some((t) => landsIn(t, [ctx.todosDir], cwd, false))) return true;
+    const verb = writeVerbIn(segment);
+    if (!verb || !WRITE_VERBS.has(verb)) continue;
+    const paths = destinationsOf(verb, tokens) ?? writeTargets(segment, verb, [], cwd).map((t) => t.path);
+    if (paths.some((p) => landsIn(p, [ctx.todosDir], cwd, DESTRUCTIVE.has(verb)))) return true;
   }
   return false;
+}
+
+/**
+ * For writers whose SOURCE is only read, just the destination: `cp`/`ln`
+ * write their last operand (or `-t <dir>`), `dd` its `of=`. Undefined for the
+ * rest, whose every operand is written (`rm`, `tee`, `sed -i`, ... and `mv`,
+ * which also removes its source).
+ */
+function destinationsOf(verb: string, tokens: string[]): string[] | undefined {
+  if (verb === "dd") return tokens.filter((t) => t.startsWith("of=")).map((t) => t.slice(3));
+  if (verb !== "cp" && verb !== "ln") return undefined;
+  const at = tokens.indexOf(verb);
+  const args = tokens.slice(at + 1);
+  const t = args.indexOf("-t");
+  if (t !== -1 && args[t + 1] !== undefined) return [args[t + 1]];
+  const operands = args.filter((a) => !a.startsWith("-"));
+  return operands.length ? [operands[operands.length - 1]] : [];
+}
+
+/**
+ * Decide one call. When the judgement itself throws, the call is denied only
+ * if its input names the store; everything else goes through, so a bug here
+ * cannot shut down every tool.
+ */
+export function todoGuardDecision(
+  toolName: string,
+  toolInput: unknown,
+  ctx: { cwd: string; todosDir: string },
+  judge: typeof isTodoStoreWrite = isTodoStoreWrite,
+): "deny" | "allow" {
+  try {
+    return judge(toolName, toolInput, ctx) ? "deny" : "allow";
+  } catch (err) {
+    let text: string;
+    try { text = JSON.stringify(toolInput) ?? ""; } catch { text = String(toolInput); }
+    const hits = text.includes(ctx.todosDir) || /data\/todos(?![\w-])/.test(text);
+    log.warn({ err, tool: toolName, denied: hits }, "Todo-store guard failed to judge a tool call");
+    return hits ? "deny" : "allow";
+  }
 }
 
 /** The PreToolUse hook. `todosDir` is resolved per call. */
 export function todoStoreGuardHooks(sessionKey: string | undefined, cwd: string, todosDir: () => string) {
   return {
     PreToolUse: [{
-      // A guard that throws must deny, not let the call through.
+      // Errors inside the decision are handled there; anything that still
+      // escapes (todosDir() throwing) denies rather than lets the call through.
       onFailure: "block" as const,
       hooks: [async (input: { tool_name: string; tool_input: unknown }) => {
-        if (!isTodoStoreWrite(input.tool_name, input.tool_input, { cwd, todosDir: todosDir() })) return {};
+        if (todoGuardDecision(input.tool_name, input.tool_input, { cwd, todosDir: todosDir() }) === "allow") return {};
         log.warn({ key: sessionKey, tool: input.tool_name }, "Blocked a direct write to the todo store");
         return {
           hookSpecificOutput: {

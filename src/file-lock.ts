@@ -31,6 +31,14 @@ export interface FileLockOptions {
   staleMs?: number;
   /** Wait budget before `FileLockTimeoutError`. */
   timeoutMs?: number;
+  /**
+   * Never reclaim, by age, a lock whose owner is on THIS host and alive.
+   * Default false (the old behaviour: past `staleMs` even a live owner loses
+   * it). A slow holder then makes contenders time out instead of letting
+   * them write over it. Owners on another host, or with an unreadable record,
+   * are still judged by age.
+   */
+  neverReclaimLiveOwner?: boolean;
   /** Sleep between acquisition attempts. */
   pollMs?: number;
 }
@@ -156,7 +164,7 @@ function acquire(lockPath: string, opts: FileLockOptions): string {
       }
     }
 
-    const abandoned = abandonedOwner(lockPath, staleMs);
+    const abandoned = abandonedOwner(lockPath, staleMs, opts.neverReclaimLiveOwner === true);
     if (abandoned !== null) {
       let reclaimed = true;
       try {
@@ -197,14 +205,15 @@ function release(lockPath: string, ownerName: string): void {
  * that is merely slow keeps its lock; contenders time out rather than steal,
  * because stealing is exactly the lost update the lock exists to prevent.
  */
-function abandonedOwner(lockPath: string, staleMs: number): { name: string; pid: number | null } | null {
+function abandonedOwner(lockPath: string, staleMs: number, keepLiveOwner = false): { name: string; pid: number | null } | null {
   const entry = ownerEntry(lockPath);
   // 0 entries: a reclaim is mid-flight. More than one: garbage we did not
   // write. Neither is ours to adjudicate — the rename settles it.
   if (entry === null) return null;
   const sameHost = entry.owner !== null && entry.owner.host === hostname();
-  if (sameHost && entry.owner !== null && !isPidAlive(entry.owner.pid)) {
-    return { name: entry.name, pid: entry.owner.pid };
+  if (sameHost && entry.owner !== null) {
+    if (!isPidAlive(entry.owner.pid)) return { name: entry.name, pid: entry.owner.pid };
+    if (keepLiveOwner) return null;
   }
   let ageMs: number;
   try {

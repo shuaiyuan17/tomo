@@ -131,6 +131,25 @@ describe("buildHooksOption — the two PreToolUse guards coexist", () => {
     });
   });
 
+  it("adds the todo-store guard, fail-closed and deny-only, before the private-memory guard", async () => {
+    type Hook = (input: { tool_name: string; tool_input: unknown }) => Promise<{ hookSpecificOutput?: { permissionDecision?: string; updatedInput?: unknown } }>;
+    const { hooks } = buildHooksOption({
+      maxTurns: 50,
+      sessionKey: "dm:shuai",
+      privateMemoryBar: () => null,
+      agentProfile: () => undefined,
+      todosDir: () => "/th/data/todos",
+    }) as { hooks: Record<string, Array<{ onFailure?: string; hooks: Hook[] }>> };
+    expect(hooks.PreToolUse).toHaveLength(3);
+    for (const entry of hooks.PreToolUse) expect(entry.onFailure).toBe("block");
+    const todoGuard = hooks.PreToolUse[1].hooks[0];
+    // On the owner's own turn (no bar), a direct write is still denied.
+    const denied = await todoGuard({ tool_name: "Write", tool_input: { file_path: "/th/data/todos/todos.json", content: "{}" } });
+    expect(denied.hookSpecificOutput?.permissionDecision).toBe("deny");
+    expect(denied.hookSpecificOutput?.updatedInput).toBeUndefined();
+    expect(await todoGuard({ tool_name: "Bash", tool_input: { command: "ls -la" } })).toEqual({});
+  });
+
   it("installs the agent-profile guard on its own", () => {
     const { hooks } = buildHooksOption({ maxTurns: 50, agentProfile: () => undefined }) as {
       hooks: Record<string, unknown[]>;

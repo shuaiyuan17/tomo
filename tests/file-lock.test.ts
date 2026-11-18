@@ -149,3 +149,29 @@ describe("withFileLockSync", () => {
     expect(existsSync(lockPath)).toBe(false);
   });
 });
+
+describe("neverReclaimLiveOwner (opt-in)", () => {
+  const old = () => Date.now() - 60_000;
+
+  it("by default a live owner past staleMs still loses the lock (behaviour unchanged)", () => {
+    plantLock({ pid: process.pid, ts: old() });
+    expect(withFileLockSync(lockPath, () => "ran", { staleMs: 10, timeoutMs: 200 })).toBe("ran");
+  });
+
+  it("with it set, a live holder past staleMs is waited on, not robbed", () => {
+    plantLock({ pid: process.pid, ts: old() });
+    let ran = false;
+    expect(() => withFileLockSync(lockPath, () => { ran = true; }, { staleMs: 10, timeoutMs: 200, neverReclaimLiveOwner: true }))
+      .toThrow(FileLockTimeoutError);
+    expect(ran).toBe(false);
+    expect(readdirSync(lockPath)).toEqual(["owner.planted"]);
+  });
+
+  it("still reclaims a dead owner at once, and a foreign host's by age", () => {
+    const dead = spawnSync(process.execPath, ["-e", ""]).pid!;
+    plantLock({ pid: dead });
+    expect(withFileLockSync(lockPath, () => "ran", { timeoutMs: 200, neverReclaimLiveOwner: true })).toBe("ran");
+    plantLock({ pid: process.pid, ts: old(), host: "elsewhere.invalid" });
+    expect(withFileLockSync(lockPath, () => "ran", { staleMs: 10, timeoutMs: 200, neverReclaimLiveOwner: true })).toBe("ran");
+  });
+});

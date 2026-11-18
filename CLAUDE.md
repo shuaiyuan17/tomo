@@ -64,8 +64,14 @@ src/
                       #   capture.ts (CaptureChannel: iMessage/Telegram next message, web password card),
                       #   store.ts (keychain over stdin; state.json), redactor.ts (literal scrub, global PostToolUse hook)
   mcp/                # tomo-internal in-process MCP server (internal-server.ts) + tool factories
-                      #   (cron-, people-, recall-, pet-tools); external-config.ts, oauth.ts
+                      #   (cron-, people-, recall-, pet-, todo-tools); external-config.ts, oauth.ts
   cron/               # Scheduler (30s poll → agent.handleCronMessage) + store (data/cron/jobs.json)
+  todos/              # Todo primitive: store.ts (data/todos/todos.json under withFileLockSync + atomic write,
+                      #   done.ndjson append-only; unreadable = error, never empty; all rules: required fields,
+                      #   length limits, open cap, snooze cap, four actions), limits.ts (defaults for config
+                      #   `todos`), format.ts (canSeeTodo = cron's canManageJob on the item's session; plain-text
+                      #   lines for /todo and `tomo todo due`). Agent tools in mcp/todo-tools.ts; /todo in
+                      #   agent/todo-command.ts; direct writes denied on every session by agent/todo-store-guard.ts
   home/               # Tomo's home: scene format, check, floor plan, store, status, sky (see "Tomo's home")
   lcm/                # Context mgmt — compact, stats, prune-tools, blocks (rollups), runner
   continuity.ts       # ContinuityRunner — periodic heartbeats for autonomous behavior

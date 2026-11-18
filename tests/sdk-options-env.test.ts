@@ -112,3 +112,17 @@ describe("sdkOptions claude.ai connectors", () => {
     expect(sdkOptions(internalServer).settings).not.toHaveProperty("disableClaudeAiConnectors");
   });
 });
+
+describe("sdkOptions todo-store guard", () => {
+  type Hook = (input: { tool_name: string; tool_input: unknown }) => Promise<{ hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } }>;
+  it("denies a direct write to the store on every session, the owner's own DM included", async () => {
+    resetConfig();
+    const store = `${mockConfig.tomoHome}/data/todos/todos.json`;
+    for (const ctx of [{ sessionKey: "dm:shuai" }, { sessionKey: "telegram:-100123" }, undefined]) {
+      const opts = sdkOptions(internalServer, undefined, undefined, ctx) as { hooks?: { PreToolUse?: Array<{ hooks: Hook[] }> } };
+      const hooks = (opts.hooks?.PreToolUse ?? []).flatMap((entry) => entry.hooks);
+      const results = await Promise.all(hooks.map((hook) => hook({ tool_name: "Write", tool_input: { file_path: store, content: "{}" } })));
+      expect(results.some((r) => r.hookSpecificOutput?.permissionDecisionReason?.includes("todo tools")), JSON.stringify(ctx)).toBe(true);
+    }
+  });
+});

@@ -31,6 +31,8 @@ import { litellmRoutesModel } from "../litellm.js";
 import { TASKS_COMMAND } from "../channels/chat-commands.js";
 import type { SessionTaskList } from "../web/tasks.js";
 import { formatTaskList, startOfLocalDay } from "./tasks-command.js";
+import { parseTodoArgs, runTodoCommand, TODO_USAGE } from "./todo-command.js";
+import { TodoStore } from "../todos/store.js";
 
 /** Back up ~/.tomo/config.json before a programmatic rewrite. */
 export { backupConfigFile } from "./model-switch.js";
@@ -68,11 +70,13 @@ export interface ChatCommandDeps {
   listTasks(sessionKey: string, since: number): SessionTaskList | undefined;
   /** Send plain text to the owner's private DM (its reply target); false when there is none. */
   sendToOwnerDm(owner: OwnerConfig, text: string): Promise<boolean>;
+  /** The todo store `/todo` reads and writes (tests); defaults to `<tomoHome>/data/todos`. */
+  todoStore?: () => TodoStore;
 }
 
 /**
  * Handles slash commands typed in chat (/new, /model, /status, /pet,
- * /cost, /restore, /login, /mcp, /pause, /resume, /rewind, /tasks).
+ * /cost, /restore, /login, /mcp, /pause, /resume, /rewind, /tasks, /todo).
  * Wired to Channel.onCommand by the Agent.
  */
 export class ChatCommandHandler {
@@ -158,6 +162,11 @@ export class ChatCommandHandler {
 
     if (command === TASKS_COMMAND) {
       await this.handleTasksCommand(channel, chatId, key, args, senderId);
+      return;
+    }
+
+    if (command === "todo") {
+      await this.handleTodoCommand(channel, chatId, key, args, senderId);
       return;
     }
 
@@ -394,6 +403,53 @@ export class ChatCommandHandler {
       let sent = false;
       try { sent = await this.deps.sendToOwnerDm(ownerDm, text); } catch (err) {
         log.warn({ err }, "/tasks: could not send the list to the owner's DM");
+      }
+      await channel.send({ chatId, text: sent ? "Sent to your DM." : "Couldn't reach your DM." });
+      return;
+    }
+    await channel.send({ chatId, text });
+  }
+
+  /**
+   * /todo: the todo list for THIS chat's scope, answered by the harness — no
+   * model call. Same routing as /tasks: a DM sees the owner's scope (every
+   * item); a group sees only its own items, and only the owner may add, finish
+   * or drop there; a group summoned into the owner's session with the owner as
+   * sender gets the owner's scope, with the reply sent to the owner's private
+   * DM and only "Sent to your DM." in the group.
+   */
+  private async handleTodoCommand(channel: Channel, chatId: string, resolvedKey: string, args: string | undefined, senderId?: string): Promise<void> {
+    const parsed = parseTodoArgs(args);
+    if (!parsed) {
+      await channel.send({ chatId, text: TODO_USAGE });
+      return;
+    }
+    let key = resolvedKey;
+    let ownerDm: OwnerConfig | undefined;
+    const owner = this.ownerFor(channel, senderId);
+    if (isGroupSessionKey(`${channel.name}:${chatId}`)) {
+      key = `${channel.name}:${chatId}`;
+      const summoned = this.deps.router.getSummonedIdentity(channel.name, chatId);
+      if (owner && summoned !== undefined && summoned === owner.name.toLowerCase()) {
+        key = dmSessionKeyForIdentity(owner.name);
+        ownerDm = owner;
+      } else if (parsed.kind !== "list" && !owner) {
+        await channel.send({ chatId, text: "Only the owner can change todos." });
+        return;
+      }
+    }
+    let text: string;
+    try {
+      const store = this.deps.todoStore?.() ?? new TodoStore();
+      text = runTodoCommand(parsed, { store, scopeKey: key, now: Date.now() });
+    } catch (err) {
+      log.warn({ err }, "/todo failed");
+      text = `Todos are unavailable: ${shortErrorMessage(err)}`;
+    }
+    if (ownerDm) {
+      let sent = false;
+      try { sent = await this.deps.sendToOwnerDm(ownerDm, text); } catch (err) {
+        log.warn({ err }, "/todo: could not send the reply to the owner's DM");
       }
       await channel.send({ chatId, text: sent ? "Sent to your DM." : "Couldn't reach your DM." });
       return;

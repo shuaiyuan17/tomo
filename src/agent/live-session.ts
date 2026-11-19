@@ -1730,7 +1730,7 @@ export class LiveSession {
   /** SDK-reported MCP connection state (bounded, one request in flight); null when unknown. */
   readMcpStatus(): Promise<McpConnection[] | null> {
     if (!this.alive) return Promise.resolve(null);
-    return (this.mcpLiveStatus ??= new McpLiveStatus(this.q as unknown as { mcpServerStatus?: () => Promise<unknown> })).read();
+    return (this.mcpLiveStatus ??= new McpLiveStatus(this.q as unknown as { mcpServerStatus?: () => Promise<unknown> }, () => this.alive)).read();
   }
 
   /**

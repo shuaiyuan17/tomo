@@ -23,10 +23,11 @@ export function sanitizeMcpConnections(raw: unknown): McpConnection[] | null {
  * text is exposed. A hung query has at most one outstanding request. */
 export class McpLiveStatus {
   private pending?: Promise<McpConnection[] | null>;
-  constructor(private readonly query: { mcpServerStatus?: () => Promise<unknown> }) {}
+  /** `alive` is checked again right before the SDK call: the session may close in between. */
+  constructor(private readonly query: { mcpServerStatus?: () => Promise<unknown> }, private readonly alive: () => boolean = () => true) {}
   async read(timeoutMs = 1000): Promise<McpConnection[] | null> {
-    if (!this.query.mcpServerStatus) return null;
-    this.pending ??= Promise.resolve().then(() => this.query.mcpServerStatus!()).then(sanitizeMcpConnections)
+    if (!this.query.mcpServerStatus || !this.alive()) return null;
+    this.pending ??= Promise.resolve().then(() => this.alive() ? this.query.mcpServerStatus!() : null).then(sanitizeMcpConnections)
       .catch(() => null).finally(() => { this.pending = undefined; });
     let timer: ReturnType<typeof setTimeout> | undefined;
     try { return await Promise.race([this.pending, new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), timeoutMs); })]); }

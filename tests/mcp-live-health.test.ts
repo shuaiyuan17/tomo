@@ -9,7 +9,7 @@ import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockSdk
 import { log } from "../src/logger.js";
 import { McpHealthMonitor } from "../src/agent/mcp-health.js";
 import { mergeMcpStatus } from "../src/mcp/status-merge.js";
-import { sanitizeMcpConnections } from "../src/mcp/live-status.js";
+import { McpLiveStatus, sanitizeMcpConnections } from "../src/mcp/live-status.js";
 import type { ExternalMcpServerStatus } from "../src/mcp/oauth.js";
 
 installAgentTestHooks();
@@ -46,6 +46,18 @@ describe("mergeMcpStatus", () => {
     expect(mergeMcpStatus([], configured)[0]).toMatchObject({ live: "not-reported" });
     // OAuth still shows without a session.
     expect(mergeMcpStatus(undefined, configured)[1]).toMatchObject({ oauth: { state: "login-required" }, action: "login" });
+  });
+
+  it("a status read never calls the SDK on a session that closed before the call", async () => {
+    let alive = true;
+    const call = vi.fn(async () => []);
+    const status = new McpLiveStatus({ mcpServerStatus: call }, () => alive);
+    const read = status.read();
+    alive = false; // closes before the deferred call runs
+    expect(await read).toBeNull();
+    expect(call).not.toHaveBeenCalled();
+    expect(await status.read()).toBeNull();
+    expect(call).not.toHaveBeenCalled();
   });
 
   it("init's mcp_servers is sanitized like the status call", () => {
@@ -124,7 +136,7 @@ describe("McpHealthMonitor", () => {
     await settle();
     expect(notifyOwner).toHaveBeenCalledTimes(2);
     // A success ends the streak; a new streak can notify again.
-    await monitor.reconnectNow("dm:owner", "tomo-internal", async () => {});
+    expect(await monitor.reconnectNow("dm:owner", "tomo-internal", async () => {})).toBe("reconnected");
     for (let i = 0; i < 3; i++) await monitor.beforeTurn("dm:owner", failed, failing);
     await settle();
     expect(notifyOwner).toHaveBeenCalledTimes(3);
@@ -140,6 +152,31 @@ describe("McpHealthMonitor", () => {
     release();
     await Promise.all([auto, manual]);
     expect(order).toEqual(["auto done", "manual start"]);
+  });
+
+  it("several explicit reconnects queued on one never run at the same time", async () => {
+    let active = 0; let peak = 0;
+    const tracked = async () => { active++; peak = Math.max(peak, active); await new Promise((resolve) => setTimeout(resolve, 5)); active--; };
+    let release!: () => void;
+    const auto = monitor.beforeTurn("dm:owner", failed, () => new Promise<void>((resolve) => { release = resolve; }));
+    const waiting = ["a", "b", "c"].map((key) => monitor.reconnectNow(key, "tomo-internal", tracked));
+    release();
+    await auto;
+    expect(await Promise.all(waiting)).toEqual(["reconnected", "reconnected", "reconnected"]);
+    expect(peak).toBe(1);
+  });
+
+  it("an explicit reconnect that waited gives up if its session is no longer idle and reserved", async () => {
+    let release!: () => void;
+    const auto = monitor.beforeTurn("telegram:-1", failed, () => new Promise<void>((resolve) => { release = resolve; }));
+    let allowed = true;
+    const ours = vi.fn(async () => {});
+    const manual = monitor.reconnectNow("dm:owner", "tomo-internal", ours, () => allowed);
+    allowed = false; // e.g. its own turn started while it waited
+    release();
+    await auto;
+    expect(await manual).toBe("busy");
+    expect(ours).not.toHaveBeenCalled();
   });
 
   it("logs only state changes", async () => {

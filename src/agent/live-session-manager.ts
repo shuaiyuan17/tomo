@@ -425,13 +425,18 @@ export class LiveSessionManager {
     const session = this.liveSessions.get(key);
     if (!session?.isAlive()) return "no-live-session";
     if (this.hasTurnInFlight(key) || this.mcpReservations.has(key)) return "busy";
-    const run = this.mcpHealth.reconnectNow(key, server, (name) => this.reconnectOn(key, session, name));
-    const reservation = run.finally(() => { if (this.mcpReservations.get(key) === reservation) this.mcpReservations.delete(key); });
+    // Re-checked after waiting on another reconnect of the server: the session
+    // must still be ours (reserved, idle, current), or we give up. Only
+    // called after an await, so `reservation` below is set by then.
+    const stillAllowed = () => this.mcpReservations.get(key) === reservation && this.liveSessions.get(key) === session
+      && session.isAlive() && !session.isBusy();
+    const run = this.mcpHealth.reconnectNow(key, server, (name) => this.reconnectOn(key, session, name), stillAllowed);
+    const reservation: Promise<unknown> = run.finally(() => { if (this.mcpReservations.get(key) === reservation) this.mcpReservations.delete(key); });
     this.mcpReservations.set(key, reservation);
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const ok = await Promise.race([run, new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), MCP_MANUAL_RECONNECT_WAIT_MS); })])
+    const outcome = await Promise.race([run, new Promise<"failed">((resolve) => { timer = setTimeout(() => resolve("failed"), MCP_MANUAL_RECONNECT_WAIT_MS); })])
       .finally(() => clearTimeout(timer));
-    return ok ? "reconnected" : "failed";
+    return outcome;
   }
 
   /** Reconnect `server` on exactly `session`, if it is still the key's live session. */
@@ -451,6 +456,9 @@ export class LiveSessionManager {
     try {
       const reservation = this.mcpReservations.get(key);
       if (reservation && !await withTimeout(reservation, MCP_PRE_TURN_WAIT_MS)) {
+        // The turn goes ahead: the reservation is no longer the reconnect's,
+        // so one still queued behind another session's gives up (busy).
+        if (this.mcpReservations.get(key) === reservation) this.mcpReservations.delete(key);
         log.warn({ key }, "Explicit MCP reconnect still running; starting the turn anyway");
       }
       if (session.lastResult === null || this.liveSessions.get(key) !== session || !session.isAlive()) return;

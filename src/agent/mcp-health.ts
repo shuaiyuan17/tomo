@@ -123,13 +123,17 @@ export class McpHealthMonitor {
 
   /**
    * An explicit reconnect (web button, `/mcp reconnect`): no interval, but
-   * still one at a time per server — it waits for a running one first.
-   * The caller reserves the session for its duration.
+   * still one at a time per server — it waits until no reconnect of the
+   * server is running (however many others were waiting too). After the
+   * wait `stillAllowed()` must hold (its session still idle and reserved),
+   * or it gives up with "busy". The caller reserves the session.
    */
-  async reconnectNow(key: string, server: string, reconnect: (server: string) => Promise<void>): Promise<boolean> {
-    const running = this.health(server).inFlight;
-    if (running) await running;
-    return this.run(key, server, reconnect, "manual");
+  async reconnectNow(key: string, server: string, reconnect: (server: string) => Promise<void>, stillAllowed: () => boolean = () => true): Promise<"reconnected" | "failed" | "busy"> {
+    const health = this.health(server);
+    let waited = false;
+    while (health.inFlight) { waited = true; await health.inFlight; }
+    if (waited && !stillAllowed()) return "busy";
+    return await this.run(key, server, reconnect, "manual") ? "reconnected" : "failed";
   }
 
   private run(key: string, server: string, reconnect: (server: string) => Promise<void>, kind: "auto" | "manual"): Promise<boolean> {

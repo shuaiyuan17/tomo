@@ -682,7 +682,7 @@ export function App() {
         <p className="eyebrow mb-3">Your conversations</p>
         <div className="mb-1.5 flex items-center justify-between gap-2">
           <span id="session-label" className="text-[13px] font-medium">Session</span>
-          {session && <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{session.kind === "group" ? "Read-only" : "Owner DM"}</Badge>}
+          {session?.kind === "group" && <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Read-only</Badge>}
         </div>
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild disabled={!sessions.length}>
@@ -690,7 +690,7 @@ export function App() {
               className="h-11 w-full min-w-0 justify-between rounded-xl bg-card px-3.5 text-[13px] font-normal shadow-xs hover:bg-accent">
               <span id="session-value" className="flex min-w-0 flex-1 items-center gap-2">
                 <span className="truncate" title={session?.title}>{session ? `${session.title}${session.kind === "group" ? " · read-only" : ""}` : "No session available"}</span>
-                {session && session.id === ownerId && <span data-testid="session-main" className={mainTag}><Pin aria-hidden="true" className="size-3 text-primary" strokeWidth={2} />main</span>}
+                {session && session.id === ownerId && <span data-testid="session-main" role="img" aria-label="Main session" title="Main session" className="ml-auto flex shrink-0 pl-1"><Pin aria-hidden="true" className="size-3.5 text-primary" strokeWidth={2} /></span>}
               </span>
               <ChevronsUpDown className="text-muted-foreground" /></Button>
           </DropdownMenuTrigger>

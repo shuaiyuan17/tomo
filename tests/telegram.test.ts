@@ -1142,3 +1142,72 @@ describe("TelegramChannel inbound reactions", () => {
     expect(channel.recentMessages("42").map((m) => m.id)).toEqual(["5"]);
   });
 });
+
+describe("TelegramChannel.startTyping", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function makeChannel(sendChatAction: (chatId: string, action: string) => Promise<unknown>) {
+    const channel = new TelegramChannel("000000:test-token");
+    const calls: Array<{ chatId: string; action: string }> = [];
+    (channel as unknown as { bot: { api: unknown } }).bot.api = {
+      sendChatAction: (chatId: string, action: string) => {
+        calls.push({ chatId, action });
+        return sendChatAction(chatId, action);
+      },
+    };
+    return { channel, calls };
+  }
+
+  it("sends typing immediately and every 6s until stopped", async () => {
+    const { channel, calls } = makeChannel(async () => true);
+    const stop = channel.startTyping("42");
+    expect(calls).toEqual([{ chatId: "42", action: "typing" }]);
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(calls).toHaveLength(3);
+    expect(stop()).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls).toHaveLength(3);
+  });
+
+  // Revert-catcher: before the shared typing loop, a sendChatAction slower
+  // than the 6s interval was re-sent on every tick while still in flight.
+  it("does not overlap a sendChatAction slower than the interval", async () => {
+    let release: () => void = () => {};
+    const { channel, calls } = makeChannel(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve(true);
+        }),
+    );
+    const stop = channel.startTyping("42");
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(calls).toHaveLength(1);
+    release();
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(calls).toHaveLength(2);
+    stop();
+  });
+
+  it("gives up after 10 consecutive errors", async () => {
+    const { channel, calls } = makeChannel(async () => {
+      throw new Error("network");
+    });
+    channel.startTyping("42");
+    await vi.advanceTimersByTimeAsync(110_000);
+    expect(calls).toHaveLength(10);
+  });
+
+  it("stops by itself after the 2-minute cap", async () => {
+    const { channel, calls } = makeChannel(async () => true);
+    channel.startTyping("42");
+    await vi.advanceTimersByTimeAsync(2 * 60 * 1000);
+    const atCap = calls.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls).toHaveLength(atCap);
+  });
+});

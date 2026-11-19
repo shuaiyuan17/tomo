@@ -16,6 +16,7 @@ import { scrubSecretValues } from "../redact.js";
 import { formatReactionMarker, splitText } from "./text-utils.js";
 import { formatMimeToken, sanitizeAttachmentFilename } from "./fileStore.js";
 import { CHAT_COMMANDS, CHAT_COMMAND_NAMES, parseTasksCommand, TASKS_COMMAND } from "./chat-commands.js";
+import { startTypingLoop } from "./typing-loop.js";
 
 /**
  * A Bot API 400 whose description names an entity-parsing failure — the one
@@ -672,41 +673,17 @@ export class TelegramChannel implements Channel {
   }
 
   startTyping(chatId: string): () => void {
-    let sealed = false;
-    let consecutiveErrors = 0;
-    let interval: ReturnType<typeof setInterval> | null = null;
-
     const MAX_ERRORS = 10;
-    const INTERVAL_MS = 6000;
-    const TTL_MS = 2 * 60 * 1000;
-
-    const send = async () => {
-      if (sealed) return;
-      if (consecutiveErrors >= MAX_ERRORS) {
-        log.warn({ chatId }, "Typing suspended after %d consecutive errors", MAX_ERRORS);
-        cleanup();
-        return;
-      }
-      try {
-        await this.bot.api.sendChatAction(chatId, "typing");
-        consecutiveErrors = 0;
-      } catch {
-        consecutiveErrors++;
-      }
-    };
-
-    const cleanup = () => {
-      if (sealed) return;
-      sealed = true;
-      if (interval) clearInterval(interval);
-      if (ttlTimeout) clearTimeout(ttlTimeout);
-    };
-
-    send();
-    interval = setInterval(send, INTERVAL_MS);
-    const ttlTimeout = setTimeout(cleanup, TTL_MS);
-
-    return cleanup;
+    const loop = startTypingLoop({
+      tick: () => this.bot.api.sendChatAction(chatId, "typing"),
+      intervalMs: 6000,
+      ttlMs: 2 * 60 * 1000,
+      maxErrors: MAX_ERRORS,
+      onGiveUp: () => log.warn({ chatId }, "Typing suspended after %d consecutive errors", MAX_ERRORS),
+    });
+    // Telegram's indicator decays on its own, so there is no "off" call and
+    // stopping stays synchronous: nothing is awaited on the turn's exit path.
+    return () => void loop.stop();
   }
 
   async send(message: OutgoingMessage): Promise<void> {

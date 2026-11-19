@@ -14,6 +14,7 @@ import { CHAT_COMMAND_NAMES, parseTasksCommand, TASKS_COMMAND } from "./chat-com
 import type { ImsgChannelConfig } from "./imsg-channel-config.js";
 import { ImsgAttachmentIntake } from "./imsg-inbound-attachments.js";
 import { DEFAULT_CHAT_DB_PATH, ImsgRpcClient, ImsgRpcResponseError } from "./imsg-rpc.js";
+import { startTypingLoop } from "./typing-loop.js";
 
 export type { ImsgChannelConfig } from "./imsg-channel-config.js";
 export type { ImsgCapabilities } from "./imsg-rpc.js";
@@ -537,62 +538,32 @@ export class ImsgChannel implements Channel {
     }
     chatId = typingGuid;
 
-    let sealed = false;
-    let tickInFlight: Promise<void> | null = null;
-    let consecutiveErrors = 0;
-    let interval: ReturnType<typeof setInterval> | null = null;
-    let ttl: ReturnType<typeof setTimeout> | null = null;
-
-    // The bridge's indicator persistence across time isn't documented, so
-    // refresh periodically. The cadence can be gentle: each tick is a local
-    // IMCore call, not a network round trip.
-    const INTERVAL_MS = 10_000;
-    const TTL_MS = 2 * 60 * 1000;
-    const MAX_ERRORS = 5;
-
     const setTypingState = async (typing: boolean) => {
       await this.rpc.request("typing", { chat_guid: chatId, typing }, 5_000);
     };
 
-    const cleanup = async () => {
-      if (sealed) return;
-      sealed = true;
-      if (interval) clearInterval(interval);
-      if (ttl) clearTimeout(ttl);
-      if (tickInFlight) await tickInFlight.catch(() => {});
+    const MAX_ERRORS = 5;
+    const loop = startTypingLoop({
+      tick: () => setTypingState(true),
+      // The bridge's indicator persistence across time isn't documented, so
+      // refresh periodically. The cadence can be gentle: each tick is a local
+      // IMCore call, not a network round trip.
+      intervalMs: 10_000,
+      ttlMs: 2 * 60 * 1000,
+      maxErrors: MAX_ERRORS,
+      onGiveUp: () => log.warn({ chatId }, "imsg typing suspended after %d consecutive errors", MAX_ERRORS),
       // The bridge indicator has no known decay — nothing turns it off on our
-      // behalf, so always stop it explicitly.
-      try {
-        await setTypingState(false);
-      } catch (err) {
-        log.debug({ err, chatId }, "Failed to clear imsg typing indicator");
-      }
-    };
-
-    const sendTyping = () => {
-      if (sealed || tickInFlight) return;
-      if (consecutiveErrors >= MAX_ERRORS) {
-        log.warn({ chatId }, "imsg typing suspended after %d consecutive errors", MAX_ERRORS);
-        void cleanup();
-        return;
-      }
-      tickInFlight = (async () => {
+      // behalf, so always stop it explicitly (after any in-flight "on").
+      onStop: async () => {
         try {
-          await setTypingState(true);
-          consecutiveErrors = 0;
-        } catch {
-          consecutiveErrors++;
-        } finally {
-          tickInFlight = null;
+          await setTypingState(false);
+        } catch (err) {
+          log.debug({ err, chatId }, "Failed to clear imsg typing indicator");
         }
-      })();
-    };
+      },
+    });
 
-    sendTyping();
-    interval = setInterval(sendTyping, INTERVAL_MS);
-    ttl = setTimeout(() => void cleanup(), TTL_MS);
-
-    return cleanup;
+    return loop.stop;
   }
 
   // --- Inbound watch messages ---

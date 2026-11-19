@@ -33,6 +33,8 @@ import { formatReactionMarker } from "../../src/channels/text-utils.js";
 import { WebSupervisor } from "../../src/web/supervisor.js";
 import { watchBus } from "../../src/watch/bus.js";
 import { CronStore } from "../../src/cron/store.js";
+import { TodoStore } from "../../src/todos/store.js";
+import { DEFAULT_TODOS } from "../../src/todos/limits.js";
 import { HomeService } from "../../src/home/service.js";
 import { OutgoingMediaStore, outgoingImagesDir } from "../../src/web/outgoing-media.js";
 import { uploadsDir } from "../../src/web/uploads.js";
@@ -136,7 +138,23 @@ function seedWorkspace(store: SessionStore): string {
   mkdirSync(resolve(mem, "topics"), { recursive: true });
   writeFileSync(resolve(mem, "MEMORY.md"), "# Memory\n\n- Prefers mornings\n- [Garden](topics/garden.md)\n");
   writeFileSync(resolve(mem, "topics", "garden.md"), "# Garden\n\nThree raised beds.\n");
-  writeFileSync(resolve(mem, "TODO.md"), "# TODO\n\n- [x] Order seeds\n- [ ] Build the trellis\n- [ ] Call the plumber about the outdoor tap that has been leaking since the frost in early November\n");
+
+  // The Study's Todos tab: one item per section, one due, one out of snoozes, one of a group, and a short done log.
+  const todos = new TodoStore(resolve(mockConfig.tomoHome, "data", "todos"), DEFAULT_TODOS);
+  const day = 86_400_000; const now = Date.now();
+  const todo = (daysAgo: number, input: Record<string, unknown>) => todos.add({ session: "dm:owner", source: "self", ...input } as Parameters<TodoStore["add"]>[0], now - daysAgo * day);
+  const seeds = todo(20, { title: "Order seeds", next: "Place the order with the nursery", waiting_on: "me", review_in: "3d" });
+  const shed = todo(16, { title: "Ask about the bike shed", next: "Wait for the reply", waiting_on: "external", review_in: "7d" });
+  todos.resolve(seeds.id, { action: "done", by: "self", evidence: "https://example.com/orders/1042" }, now - 9 * day);
+  todos.resolve(shed.id, { action: "drop", by: "owner", reason: "The shed is being removed." }, now - 3 * day);
+  todo(9, { title: "Review the release PR", next: "Read the diff and approve or request changes", waiting_on: "owner", review_in: "7d", ref: "https://github.com/example/garden/pull/41" });
+  todo(1, { title: "Build the trellis", next: "Pick between the south fence and the shed wall", waiting_on: "owner", review_in: "7d", ref: "memory/topics/garden.md", source: "owner" });
+  const tap = todo(12, { title: "Call the plumber about the outdoor tap that has been leaking since the frost in early November", next: "Phone during business hours and book the earliest slot that works", waiting_on: "me", review_in: "2d" });
+  for (const [daysAgo, reason] of [[10, "Their line was busy all afternoon."], [7, "Closed over the weekend."], [4, "Waiting for the callback they promised."]] as const) {
+    todos.resolve(tap.id, { action: "snooze", by: "self", until: "3d", reason }, now - daysAgo * day);
+  }
+  todo(0.5, { title: "Pick December's book", next: "Post the poll with the three finalists", waiting_on: "me", review_in: "2d", session: "telegram:-2" });
+  todo(2, { title: "Upstream fix for the calendar sync bug", next: "Watch the issue; upgrade once a release ships", waiting_on: "external", review_in: "14d", ref: "example/calendar-sync#1203" });
 
   const cronPath = resolve(mockConfig.tomoHome, "data", "cron", "jobs.json");
   mkdirSync(resolve(cronPath, ".."), { recursive: true });

@@ -10,7 +10,10 @@ import { isImageFiledFor } from "../channels/imageStore.js";
 import { sniffImageType } from "./image-type.js";
 import { OutgoingMediaStore, outgoingImagesDir } from "./outgoing-media.js";
 export { sniffImageType };
-import { WebError, type SessionTools, type SubagentBrief, type SubagentPage, type WebCatalog, type WebContext } from "./protocol.js";
+import { WebError, type SessionTools, type SubagentBrief, type SubagentPage, type WebCatalog, type WebContext, type WebTodos } from "./protocol.js";
+import { readWebTodos } from "./todos-view.js";
+import { todosDirIn } from "../todos/store.js";
+import type { TodoConfig } from "../todos/limits.js";
 import { readSessionContext, WebCron } from "./inspection.js";
 import { WebConfigReader } from "./config-view.js";
 import { MemoryReader } from "../workspace/memory-reader.js";
@@ -39,6 +42,8 @@ export interface WebDataOptions {
   agentName?: string | null;
   /** The scheduler's cron store file, passed by the daemon (the web process never derives it). */
   cronStorePath?: string;
+  /** The todo limits in force (config `todos`), passed by the daemon; absent: the defaults. */
+  todoLimits?: Pick<TodoConfig, "maxOpen" | "maxSnoozes">;
 }
 
 /**
@@ -227,6 +232,21 @@ export class WebData {
         ({ window, label, group, scoped, percent, resetsAt, status })),
     } : null;
     return buildCostReport(this.ledger, { from, to, timeZone, now, top, describeSession, limits });
+  }
+
+  /**
+   * The Study Todos page: the todo store, read and never written. Scoped to
+   * what the owner's own conversation sees (see `readWebTodos`).
+   */
+  todos(): WebTodos {
+    const { tomoHome, owner, todoLimits } = this.options;
+    if (!tomoHome) throw new WebError(503, "todos_unavailable");
+    const titles = new Map(SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir).map((e) => [e.channelKey, e.chatTitle]));
+    return readWebTodos({
+      dir: todosDirIn(tomoHome), limits: todoLimits,
+      ownerKey: owner ? ownerSessionKey(owner) : undefined,
+      groupTitle: (key) => titles.get(key) || "Group conversation",
+    });
   }
 
   /** What the UI calls the agent (re-read per call; IDENTITY.md is cached by mtime). */

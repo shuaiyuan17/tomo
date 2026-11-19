@@ -64,9 +64,14 @@ export interface TodoResolution extends TodoItem {
   evidence?: string;
 }
 
+/** The store directory under a given runtime home: `<home>/data/todos`. */
+export function todosDirIn(home: string): string {
+  return join(home, "data", "todos");
+}
+
 /** The default store directory: `<tomoHome>/data/todos`. */
 export function todosDir(): string {
-  return join(config.tomoHome || TOMO_HOME, "data", "todos");
+  return todosDirIn(config.tomoHome || TOMO_HOME);
 }
 
 /** The limits in force (config, falling back to the defaults field by field). */
@@ -122,6 +127,15 @@ const itemSchema = z.looseObject({
   source: z.enum(["owner", "self"]),
   snoozes: z.number().int().min(0),
   snooze_reason: z.string().optional(),
+});
+
+/** A `done.ndjson` line a reader can show: an item plus how it was closed. */
+const resolutionSchema = itemSchema.extend({
+  resolution: z.enum(["done", "drop"]),
+  resolved_at: z.string().refine((v) => !Number.isNaN(Date.parse(v)), "expected an ISO timestamp"),
+  resolved_by: z.enum(["owner", "self"]),
+  reason: z.string().optional(),
+  evidence: z.string().optional(),
 });
 
 const fileSchema = z.looseObject({
@@ -254,6 +268,19 @@ export class TodoStore {
   /** Every open item, oldest id first. Throws TodoStoreReadError. */
   list(): TodoItem[] {
     return this.read().items;
+  }
+
+  /**
+   * Finished items (done or dropped), oldest first, as `done.ndjson` logged
+   * them. Read-only, for views of the history: a line that is torn or not a
+   * whole record is left out. Throws TodoStoreReadError.
+   */
+  resolved(): TodoResolution[] {
+    const records: TodoResolution[] = [];
+    for (const record of this.readClosed().values()) {
+      if (resolutionSchema.safeParse(record).success) records.push(record);
+    }
+    return records;
   }
 
   /** Items whose review time has passed, longest overdue first. */

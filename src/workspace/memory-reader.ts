@@ -107,17 +107,6 @@ export class MemoryReader {
       throw new MemoryReadError("unavailable");
     }
   }
-  /** Root-level `memory/TODO*.md` files (nested TODO files stay browsable in Memory). */
-  async todos() {
-    const tree = await this.tree();
-    const paths = tree.entries.filter((e) => e.kind === "file" && /^TODO[^/]*\.md$/i.test(e.path));
-    const files: Array<MemoryFile | { path: string; error: string }> = [];
-    for (const item of paths.slice(0, 32)) {
-      try { files.push(await this.file(item.path)); }
-      catch (error) { files.push({ path: item.path, error: error instanceof MemoryReadError ? error.code : "unavailable" }); }
-    }
-    return { files, missing: tree.missing, truncated: tree.truncated || paths.length > 32 };
-  }
   /** Literal, case-insensitive search over the public tree, bounded in bytes, time and hits. */
   async search(query: string) {
     if (!query.trim() || query.length > 200) throw new MemoryReadError("invalid_path");

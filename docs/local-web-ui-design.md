@@ -65,7 +65,7 @@ All paths use `/api/v1`, shared typed contracts, server validation, bounded resp
 | `GET /sessions/:id/messages?cursor=…` | Full canonical history pages. |
 | `POST /messages`; `GET /messages/:requestId` | `{requestId, targetId?, text}`; default owner DM, `202` after custody, query outcome. Text-only initially. |
 | `GET /events` | Same-origin fetch SSE: safe activity, delivery references, invalidation/resync. |
-| `GET /todos` | `memory/TODO*.md` and read-only checkbox state. |
+| `GET /todos` | The todo store (`data/todos/`), read-only: open items, the recent done log, and the limits. (Originally `memory/TODO*.md`.) |
 | `GET /cron`; `PATCH /cron/:id`; `DELETE /cron/:id` | Full job fields; confirm enable/disable/delete, then existing store operations with revision guards. |
 | `GET /memory/tree`, `/memory/file`, `/memory/search` | Read-only bounded browser and literal search. |
 | `GET /sessions/:id/context` | Usage/window, freshness, estimated breakdown, available compact/rollup history. |

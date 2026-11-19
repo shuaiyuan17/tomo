@@ -71,7 +71,10 @@ describe("send and reaction failures", () => {
     expect(sendFailure(new ApiError(500, "unavailable"), "Outcome unknown").definite).toBe(false);
   });
   it("a reaction has no draft to keep", () => {
-    expect(reactFailure(new ApiError(503, "interrupted_backlog"))).toContain("the reaction was not sent");
+    expect(reactFailure(new ApiError(503, "interrupted_backlog"))).toContain("; the reaction was not sent.");
+    // The phrase at the start of a sentence is replaced too, keeping its capital.
+    expect(reactFailure(new ApiError(503, "persist_failed"))).toBe("Not sent: Tomo could not record the message safely. The reaction was not sent; try again.");
+    for (const code of ["interrupted_backlog", "journal_unavailable", "persist_failed"]) expect(reactFailure(new ApiError(503, code))).not.toMatch(/draft/i);
     expect(reactFailure(new ApiError(409, "epoch_changed"))).toBe("Reaction was not sent. Reconnect or try again.");
     expect(reactFailure(new TypeError("network"))).toMatch(/may not have been sent/);
   });

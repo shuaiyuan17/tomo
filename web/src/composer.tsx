@@ -72,7 +72,8 @@ export function sendFailure(err: unknown, unknownLabel: string): { text: string;
 /** Why a reaction failed: never "your draft is kept" (a reaction has no draft). */
 export function reactFailure(err: unknown): string {
   const refused = refusal(err);
-  return refused ? refused.replace("your draft is kept", "the reaction was not sent")
+  // Either case: the phrase can open a sentence ("Your draft is kept; try again.").
+  return refused ? refused.replace(/([Yy])our draft is kept/, (_, y: string) => `${y === "Y" ? "The" : "the"} reaction was not sent`)
     : err instanceof ApiError ? "Reaction was not sent. Reconnect or try again."
     : "The reaction may not have been sent. Check the conversation before trying again.";
 }

@@ -251,6 +251,20 @@ describe("conversation rewind with the installed SDK (no model requests)", () =>
     expect(await rewind(2)).toMatchObject({ count: 2, preview: "Request after an interrupted turn" });
   });
 
+  it("previews only string text blocks, joined with a space", async () => {
+    human("Initial request"); assistant("Answer");
+    add("user", [
+      { type: "text", text: "alpha" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "" } },
+      { type: "text" },
+      { type: "text", text: null },
+      { type: "text", text: 42 },
+      { type: "text", text: "beta" },
+    ], { origin: { kind: "human" } });
+    assistant("Unavailable"); save();
+    expect((await rewind()).preview).toBe("alpha beta");
+  });
+
   it("quotes the opening words of the rewound message, trimmed", async () => {
     human("Initial request"); assistant("Answer");
     add("user", [{ type: "text", text: `[imessage · Mon 10/05 16:54 PDT]   ${"word ".repeat(40)}` }], { origin: { kind: "human" } });

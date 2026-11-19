@@ -1,15 +1,9 @@
 import { existsSync } from "node:fs";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { readJsonlFileSync } from "../jsonl.js";
+import type { TranscriptEvent } from "../sessions/transcript-event.js";
 
-export interface SdkEvent {
-  type?: string;
-  uuid?: string;
-  timestamp?: string;
-  message?: {
-    content?: unknown;
-  };
-}
+export type SdkEvent = TranscriptEvent;
 
 export interface ResolvedTimeRange {
   fromIdx: number;
@@ -177,9 +171,9 @@ export function computeContextStatsFromEvents(sdkEvents: Iterable<SdkEvent>): Co
     if (type === "assistant") {
       if (!Array.isArray(content)) continue;
 
-      const hasToolUse = content.some((c: any) => c?.type === "tool_use");
-      const hasText = content.some((c: any) => c?.type === "text" && c.text?.trim());
-      const hasThinking = content.some((c: any) => c?.type === "thinking" && c.thinking?.trim());
+      const hasToolUse = content.some((c) => c?.type === "tool_use");
+      const hasText = content.some((c) => c?.type === "text" && c.text?.trim());
+      const hasThinking = content.some((c) => c?.type === "thinking" && c.thinking?.trim());
 
       // Estimate tokens from content
       let tokens = 0;
@@ -221,7 +215,7 @@ export function computeContextStatsFromEvents(sdkEvents: Iterable<SdkEvent>): Co
     } else if (type === "user") {
       // User messages: check if it's a tool_result or actual user input
       if (Array.isArray(content)) {
-        const hasToolResult = content.some((c: any) => c?.type === "tool_result");
+        const hasToolResult = content.some((c) => c?.type === "tool_result");
         if (hasToolResult) {
           let tokens = 0;
           for (const c of content) {

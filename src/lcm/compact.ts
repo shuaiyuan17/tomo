@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { writeFileAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
+import type { TranscriptEvent } from "../sessions/transcript-event.js";
 import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord, type RawJsonlLine } from "../jsonl.js";
 
 /** Path to the compact trigger file for a given session */
@@ -86,16 +87,12 @@ export interface CompactResult {
   error?: string;
 }
 
-interface SdkEvent {
+interface SdkEvent extends TranscriptEvent {
   type: string;
-  uuid?: string;
-  parentUuid?: string | null;
   message?: {
     role: string;
     content: any;
   };
-  timestamp?: string;
-  sessionId?: string;
   [key: string]: any;
 }
 

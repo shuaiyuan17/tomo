@@ -4,6 +4,7 @@ import { basename, join } from "node:path";
 import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget, UsageBaseline } from "./types.js";
 import { isDmSessionKey } from "./keys.js";
 import { log } from "../logger.js";
+import { textOfContent, type TranscriptEvent } from "./transcript-event.js";
 import {
   parseJsonl, readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync,
   isRawJsonlLine, reportRawJsonlLines, serializeJsonlRecord, type RawJsonlLine,
@@ -593,7 +594,7 @@ export class SessionStore {
     const results: SessionMessage[] = [];
     const queryLower = opts.query?.toLowerCase();
 
-    for (const event of readJsonlFileSync<Record<string, any>>(archivePath)) {
+    for (const event of readJsonlFileSync<TranscriptEvent>(archivePath)) {
       try {
         if (event.type !== "user" && event.type !== "assistant") continue;
 
@@ -601,16 +602,7 @@ export class SessionStore {
         const msg = event.message;
         if (!msg) continue;
 
-        let text = "";
-        const content = msg.content;
-        if (typeof content === "string") {
-          text = content;
-        } else if (Array.isArray(content)) {
-          for (const block of content) {
-            if (block?.type === "text") text += (block.text ?? "") + " ";
-          }
-        }
-        text = text.trim();
+        const text = textOfContent(msg.content, " ", { missing: "empty", nonString: "stringify" }).trim();
         if (!text) continue;
 
         if (queryLower && !text.toLowerCase().includes(queryLower)) continue;

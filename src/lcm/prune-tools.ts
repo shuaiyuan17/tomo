@@ -11,6 +11,7 @@ import {
   type SdkEntry,
 } from "./compact.js";
 import { log } from "../logger.js";
+import type { TranscriptEvent } from "../sessions/transcript-event.js";
 import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord } from "../jsonl.js";
 
 export interface PruneToolsRequest {
@@ -48,10 +49,8 @@ export interface PruneToolsResult {
   error?: string;
 }
 
-interface SdkEvent {
+interface SdkEvent extends TranscriptEvent {
   type: string;
-  uuid?: string;
-  parentUuid?: string | null;
   message?: {
     role: string;
     content: any;

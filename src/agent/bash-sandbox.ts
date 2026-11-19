@@ -181,8 +181,38 @@ export function shellSingleQuote(s: string): string {
 }
 
 /**
- * `command`, rewritten to run under `profileText`. Pure, and the profile travels
- * as an ARGUMENT — there is no file for the sandboxed command to edit.
+ * The environment variables a group shell keeps. Everything else the SDK
+ * process carries is dropped — an API key, a gateway token, `SSH_AUTH_SOCK`,
+ * whatever the daemon was started with — because a sandbox that hides the
+ * config file but hands its secrets over in `env` hides nothing.
+ *
+ * An ALLOWLIST, for the same reason the profile is one: names that carry a
+ * credential cannot be enumerated. The kept ones locate things (PATH, HOME,
+ * TMPDIR), describe the terminal and locale, or scope Tomo's own CLI to the
+ * session (`TOMO_SESSION_KEY`, `TOMO_DAEMON_PID` — identifiers, not secrets).
+ */
+export const SANDBOX_ENV_ALLOWLIST: readonly string[] = [
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "COLORTERM",
+  "LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME",
+  "TZ", "TOMO_SESSION_KEY", "TOMO_DAEMON_PID",
+];
+
+/**
+ * `/usr/bin/env -i` plus each allowed variable, expanded by the OUTER shell
+ * (the Bash tool's), so the values never appear in the command text.
+ * `${V+"V=$V"}` yields the assignment only when `V` is set — an unset variable
+ * stays unset rather than becoming empty.
+ */
+export const ENV_ALLOWLIST_PREFIX = [
+  "/usr/bin/env",
+  "-i",
+  ...SANDBOX_ENV_ALLOWLIST.map((name) => "${" + name + "+\"" + name + "=$" + name + "\"}"),
+].join(" ");
+
+/**
+ * `command`, rewritten to run under `profileText` with only the allowlisted
+ * environment. Pure, and the profile travels as an ARGUMENT — there is no file
+ * for the sandboxed command to edit.
  *
  * `--` before the command is load-bearing. `zsh -lc '-n …'` is
  * `zsh: bad option string` — zsh reads a leading `-` as its own flag, so any
@@ -191,6 +221,7 @@ export function shellSingleQuote(s: string): string {
  */
 export function wrapWithSandbox(command: string, profileText: string): string {
   return [
+    ENV_ALLOWLIST_PREFIX,
     SANDBOX_EXEC_PATH,
     "-p",
     shellSingleQuote(profileText),

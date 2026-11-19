@@ -1,5 +1,5 @@
-import { afterAll, describe, expect, it, vi } from "vitest";
-import { execFileSync, spawnSync } from "node:child_process";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -52,7 +52,7 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { groupPathPolicy, groupPathDenial, effectiveGroupSandbox, isValidExtraPath, tomoHomeDenies } = await import("../src/agent/group-fs-policy.js");
+const { groupPathPolicy, groupPathDenial, effectiveGroupSandbox, isValidExtraPath, reachesTomoHome } = await import("../src/agent/group-fs-policy.js");
 const { sandboxedBashCommand, sandboxProfileText, SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH, SANDBOX_MACH_DENY, resolvedDenyDir, shellSingleQuote } = await import("../src/agent/bash-sandbox.js");
 const { privateMemoryGuardHooks } = await import("../src/agent/private-memory-guard.js");
 
@@ -136,15 +136,42 @@ describe("isValidExtraPath", () => {
   });
 });
 
-describe("tomoHomeDenies", () => {
-  it("denies everything in Tomo's home except the workspace, read from disk", () => {
-    const denies = tomoHomeDenies(fx.tomoHome, fx.ws);
-    expect(denies).toEqual(expect.arrayContaining([CONFIG, join(fx.tomoHome, "logs"), join(fx.tomoHome, "data")]));
-    expect(denies).not.toContain(fx.ws);
+describe("Tomo's home: fixed denies, no extra over it", () => {
+  it("names the config file, logs and data as fixed paths", () => {
+    expect(policy().denyDirs).toEqual(expect.arrayContaining([CONFIG, join(fx.tomoHome, "logs"), join(fx.tomoHome, "data")]));
   });
 
-  it("denies all of it when the workspace lives elsewhere", () => {
-    expect(tomoHomeDenies(fx.tomoHome, fx.external)).toEqual([fx.tomoHome]);
+  it.each([
+    ["Tomo's home itself", () => fx.tomoHome, true],
+    ["a directory above it", () => fx.root, true],
+    ["a directory inside it, outside the workspace", () => join(fx.tomoHome, "run"), true],
+    ["a directory inside the workspace", () => join(fx.ws, "notes"), false],
+    ["a directory elsewhere", () => fx.external, false],
+  ])("an extra at %s is dropped: %s", (_what, dir, dropped) => {
+    expect(reachesTomoHome(dir(), fx.tomoHome, fx.ws)).toBe(dropped);
+    expect(policy({ extraRead: [dir()] }).readDirs.includes(dir())).toBe(!dropped);
+  });
+});
+
+describe("file-tool allows compare exactly; denies fold case", () => {
+  // Paths that do not exist resolve as spelled on every volume, which is what a
+  // case-sensitive volume does with them too.
+  const p = () => groupPathPolicy({
+    workspaceDir: fx.ws,
+    privateDir: join(fx.ws, "memory", "private"),
+    homeSceneDir: join(fx.ws, "home"),
+    dataDirs: [],
+    entry: { extraRead: ["/work-case-test/Project"], extraWrite: [] },
+    userHome: fx.userHome,
+  });
+
+  it("a grant of /work/Project does not grant /work/project", () => {
+    expect(groupPathDenial("Read", { file_path: "/work-case-test/Project/a.txt" }, fx.ws, p())).toBeNull();
+    expect(groupPathDenial("Read", { file_path: "/work-case-test/project/a.txt" }, fx.ws, p())).not.toBeNull();
+  });
+
+  it("a deny still matches whatever the case", () => {
+    expect(groupPathDenial("Read", { file_path: join(fx.ws, "SECRETS", "token.txt") }, fx.ws, p())).not.toBeNull();
   });
 });
 
@@ -208,11 +235,14 @@ describe.runIf(sandboxRuns)("group Bash under a real sandbox-exec", () => {
 
   // REVERT-CATCHER. The permanent denies are emitted after every allow because
   // SBPL applies the last matching rule. Move them first (or go back to
-  // `(allow default)`) and an extra covering Tomo's home reads the config file.
-  it("keeps the permanent denies even when an extra covers them", () => {
-    const r = run(`cat ${q(CONFIG)}; cat ${q(SECRET)}`, policy({ extraRead: [fx.tomoHome], extraWrite: [fx.ws] }));
-    expect(r.out).not.toContain("CONFIG-SECRET");
+  // `(allow default)`) and the workspace allow re-opens secrets/, and an extra
+  // over the home's Library re-opens the keychains.
+  it("keeps the permanent denies even when an allow covers them", () => {
+    const kcFile = join(KEYCHAINS, "marker.txt");
+    write(kcFile, "KEYCHAIN-SECRET\n");
+    const r = run(`cat ${q(SECRET)}; cat ${q(kcFile)}`, policy({ extraRead: [join(fx.userHome, "Library")] }));
     expect(r.out).not.toContain("TOKEN-SECRET");
+    expect(r.out).not.toContain("KEYCHAIN-SECRET");
   });
 
   it("cannot write the scene or the workspace's .claude/", () => {
@@ -231,10 +261,79 @@ describe.runIf(sandboxRuns)("group Bash under a real sandbox-exec", () => {
     expect(r.out).toContain("git-ok");
   });
 
-  it("cannot connect to localhost", () => {
-    const r = run(`curl -sS -m 3 -o /dev/null http://127.0.0.1:9/ ; echo "rc=$?"`);
-    expect(r.out).toMatch(/rc=(7|1|28)/);
-    expect(r.out).not.toContain("rc=0");
+  it("cannot read a file created in Tomo's home after the policy was built, at any depth", () => {
+    const p = policy();
+    const late = join(fx.tomoHome, "created-later", "deep", "late.txt");
+    write(late, "LATE-SECRET\n");
+    write(join(fx.tomoHome, "late-top.txt"), "LATE-TOP-SECRET\n");
+    const r = run(`cat ${q(late)}; cat ${q(join(fx.tomoHome, "late-top.txt"))}`, p);
+    expect(r.out).not.toContain("LATE-SECRET");
+    expect(r.out).not.toContain("LATE-TOP-SECRET");
+  });
+
+  // NETWORK, with listeners. A child process serves (spawnSync would block a
+  // server in this process); each case first proves the listener answers from
+  // outside the sandbox, then that the group shell cannot reach it.
+  describe("local listeners", () => {
+    // Short and in a granted dir (/tmp): a unix socket path is capped at 104
+    // bytes, and only the network rule should be what refuses the connection.
+    const sock = `/tmp/tomo-sbx-${process.pid}-${Date.now() % 100000}.sock`;
+    let server: ReturnType<typeof spawn> | undefined;
+    let port = 0;
+    beforeAll(async () => {
+      server = spawn(process.execPath, ["-e", `
+        const net = require("node:net");
+        const http = net.createServer((c) => c.end("HTTP/1.1 200 OK\\r\\nContent-Length: 4\\r\\nConnection: close\\r\\n\\r\\npong"));
+        http.listen(0, "127.0.0.1", () => {
+          net.createServer((c) => c.end("pong")).listen(process.argv[1], () => console.log(http.address().port));
+        });
+      `, sock], { stdio: ["ignore", "pipe", "inherit"] });
+      port = await new Promise<number>((resolve) => server!.stdout!.once("data", (d) => resolve(Number(String(d).trim()))));
+    });
+    afterAll(() => {
+      server?.kill();
+      rmSync(sock, { force: true });
+    });
+
+    const tcp = () => `curl -sS -m 3 http://127.0.0.1:${port}/ ; echo " rc=$?"`;
+    const unix = () => `/usr/bin/python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(9).decode())' ${q(sock)} 2>&1; echo " rc=$?"`;
+
+    it("localhost answers outside the sandbox (control)", () => {
+      expect(runWrapped(tcp()).out).toContain("pong");
+    });
+
+    it("localhost is refused from a group shell", () => {
+      const r = run(tcp());
+      expect(r.out).not.toContain("pong");
+      expect(r.out).not.toContain(" rc=0");
+    });
+
+    it("a unix socket answers outside the sandbox (control)", () => {
+      expect(runWrapped(unix()).out).toContain("pong");
+    });
+
+    it("a unix socket is refused from a group shell, though its file is in a granted dir", () => {
+      const r = run(unix());
+      expect(r.out).not.toContain("pong");
+      expect(r.out).not.toContain(" rc=0");
+    });
+  });
+
+  // ENVIRONMENT. The SDK process's env can carry credentials; a group shell
+  // gets an allowlist only.
+  it("drops every environment variable outside the allowlist", () => {
+    const env = { ...process.env, HOME: fx.userHome, TOMO_TEST_SECRET: "env-canary", ANTHROPIC_API_KEY: "sk-fake", SSH_AUTH_SOCK: "/fake/agent.sock" };
+    const plain = spawnSync("/bin/zsh", ["-lc", "env"], { encoding: "utf8", env });
+    // Control: the variables really are in the parent's environment.
+    expect(plain.stdout).toContain("TOMO_TEST_SECRET=env-canary");
+    const wrapped = sandboxedBashCommand("env", policy())!;
+    const r = spawnSync("/bin/zsh", ["-lc", wrapped], { encoding: "utf8", env, cwd: fx.ws });
+    expect(r.status).toBe(0);
+    for (const name of ["TOMO_TEST_SECRET", "ANTHROPIC_API_KEY", "SSH_AUTH_SOCK"]) expect(r.stdout).not.toContain(`${name}=`);
+    expect(r.stdout).not.toContain("env-canary");
+    // What a shell needs survives.
+    expect(r.stdout).toMatch(/^PATH=/m);
+    expect(r.stdout).toContain(`HOME=${fx.userHome}`);
   });
 
   // THE KEYCHAIN, with controls. A throwaway keychain file in the fixture's

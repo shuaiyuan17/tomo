@@ -1,8 +1,8 @@
-import { readdirSync, realpathSync } from "node:fs";
+import { realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { expandTilde } from "./bash-write-targets.js";
-import { abs, foldPath, isInside, realResolve } from "./permission-paths.js";
+import { abs, isInside, isInsideExact, realResolve } from "./permission-paths.js";
 import { attachmentPathsIn, barredSearch, effectiveSearchRoot, SEARCH_TOOLS, SEND_MESSAGE_TOOL } from "./private-memory-access.js";
 
 /**
@@ -15,8 +15,10 @@ import { attachmentPathsIn, barredSearch, effectiveSearchRoot, SEARCH_TOOLS, SEN
  * home directory, Tomo's own config, logs and state, other checkouts.
  *
  * PERMANENT DENIES WIN over every allow, the group's extras included: private
- * memory, the workspace's `secrets/`, everything under Tomo's home except the
- * workspace, the login keychains and `~/.ssh`. The workspace's `home/` (the
+ * memory, the workspace's `secrets/`, Tomo's config file, logs and state, the
+ * login keychains and `~/.ssh` — fixed paths, so nothing depends on what exists
+ * when the policy is built. The rest of Tomo's home is unreachable because no
+ * allow covers it: an extra that would is dropped ({@link reachesTomoHome}). The workspace's `home/` (the
  * scene) and `.claude/` (settings, hooks, skills the CLI loads) are read-only.
  *
  * WHY ONE POLICY. With the shell boxed in and the file tools not, a group could
@@ -122,49 +124,47 @@ export function defaultTempDirs(): string[] {
   return [...dirs];
 }
 
+/** `p` resolved the way the kernel sees it (unfolded), or its absolute
+ *  spelling when it cannot be resolved. */
+function realOrSpelled(p: string): string {
+  return realResolve(p, "/", true) ?? abs(p, "/");
+}
+
 /**
- * Everything directly under `tomoHome` except the entry holding the workspace.
- * When the workspace is not inside `tomoHome` at all, the whole of it. Read
- * from disk on every call, so a file that appears there later is covered.
+ * Would granting `extra` reach into Tomo's home outside the workspace? True for
+ * Tomo's home itself, any directory above it, and anything inside it that is
+ * not inside the workspace. Such an extra is DROPPED, not narrowed: the
+ * default-deny profile is what keeps the config file, logs, state and anything
+ * created there later out of reach, and an extra over that tree would undo it
+ * for every path the fixed denies do not name.
  */
-export function tomoHomeDenies(tomoHome: string | undefined, workspaceDir: string): string[] {
-  if (!tomoHome) return [];
-  let realHome: string;
-  let realWs: string;
-  try {
-    realHome = realpathSync.native(tomoHome);
-  } catch {
-    return [];
-  }
-  try {
-    realWs = realpathSync.native(workspaceDir);
-  } catch {
-    realWs = workspaceDir;
-  }
-  const rel = relative(realHome, realWs);
-  const inside = rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
-  if (!inside) return rel === "" ? [] : [tomoHome];
-  const keep = rel.split("/")[0];
-  try {
-    return readdirSync(realHome).filter((name) => name !== keep).map((name) => join(realHome, name));
-  } catch {
-    return [];
-  }
+export function reachesTomoHome(extra: string, tomoHome: string | undefined, workspaceDir: string): boolean {
+  if (!tomoHome) return false;
+  const e = realOrSpelled(extra);
+  const home = realOrSpelled(tomoHome);
+  const ws = realOrSpelled(workspaceDir);
+  if (isInside(home, e)) return true;
+  return isInside(e, home) && !isInside(e, ws);
 }
 
 export function groupPathPolicy(input: GroupPathPolicyInput): GroupPathPolicy {
   const home = input.userHome ?? homedir();
-  const extraRead = (input.entry?.extraRead ?? []).filter((p) => isValidExtraPath(p, home)).map(expandTilde);
-  const extraWrite = (input.entry?.extraWrite ?? []).filter((p) => isValidExtraPath(p, home)).map(expandTilde);
+  const keep = (p: string) => isValidExtraPath(p, home) && !reachesTomoHome(expandTilde(p), input.tomoHome, input.workspaceDir);
+  const extraRead = (input.entry?.extraRead ?? []).filter(keep).map(expandTilde);
+  const extraWrite = (input.entry?.extraWrite ?? []).filter(keep).map(expandTilde);
   return {
     readDirs: [...SYSTEM_READ_DIRS, join(home, ".config", "git"), ...extraRead],
     readFiles: HOME_STARTUP_FILES.map((f) => join(home, f)),
     writeDirs: ["/dev", ...(input.tempDirs ?? defaultTempDirs()), input.workspaceDir, ...extraWrite],
+    // FIXED PATHS, never an enumeration of what exists now: a deny list built
+    // from `readdir` misses whatever is created after it is built. Everything
+    // else under Tomo's home is out of reach because nothing grants it (the
+    // profile denies by default and `reachesTomoHome` drops any extra over it).
     denyDirs: [
       input.privateDir,
       join(input.workspaceDir, "secrets"),
       ...input.dataDirs,
-      ...tomoHomeDenies(input.tomoHome, input.workspaceDir),
+      ...(input.tomoHome ? [join(input.tomoHome, "config.json"), join(input.tomoHome, "logs"), join(input.tomoHome, "data")] : []),
       join(home, "Library", "Keychains"),
       join(home, ".ssh"),
     ],
@@ -179,31 +179,51 @@ export function groupPathPolicy(input: GroupPathPolicyInput): GroupPathPolicy {
 const READ_TOOLS: ReadonlySet<string> = new Set(["Read"]);
 const WRITE_TOOLS: ReadonlySet<string> = new Set(["Edit", "Write", "MultiEdit", "NotebookEdit"]);
 
-/** `p` as spelled (absolute) and as the kernel resolves it, folded; null when
- *  it cannot be resolved (a symlink loop), which every caller reads as "no". */
+/**
+ * `p` as spelled (absolute) and as the kernel resolves it; null when it cannot
+ * be resolved (a symlink loop), which every caller reads as "no". The real path
+ * keeps the on-disk spelling (realpath(3)), so the ALLOW side can compare it
+ * exactly.
+ */
 function spellingsOf(p: string, cwd: string): { spelled: string; real: string } | null {
   const expanded = expandTilde(p);
   const real = realResolve(expanded, cwd, true);
   if (real === null) return null;
-  return { spelled: foldPath(abs(expanded, cwd)), real: foldPath(real) };
+  return { spelled: abs(expanded, cwd), real };
 }
 
-function resolvedDirs(dirs: readonly string[], cwd: string): string[] {
+/** Deny dirs, each as spelled and as resolved. */
+function resolvedDenyDirs(dirs: readonly string[], cwd: string): string[] {
   return dirs.flatMap((d) => {
     const s = spellingsOf(d, cwd);
-    return s ? [...new Set([s.spelled, s.real])] : [foldPath(abs(d, cwd))];
+    return s ? [...new Set([s.spelled, s.real])] : [abs(d, cwd)];
   });
 }
 
-/** Inside a permanent deny, as spelled OR as resolved? */
+/** Allow dirs, resolved only: an allow that cannot be resolved grants nothing. */
+function resolvedAllowDirs(dirs: readonly string[], cwd: string): string[] {
+  return dirs.flatMap((d) => {
+    const s = spellingsOf(d, cwd);
+    return s ? [s.real] : [];
+  });
+}
+
+/** Inside a permanent deny, as spelled OR as resolved? CASE-FOLDED: over-matching
+ *  a deny only refuses more, which is the safe direction. */
 function hitsDeny(p: { spelled: string; real: string }, denies: readonly string[]): boolean {
   return denies.some((d) => isInside(p.spelled, d) || isInside(p.real, d));
 }
 
-/** Inside an allow? Judged on the RESOLVED path only: a symlink in the
- *  workspace pointing out of it opens the target, not the link. */
+/**
+ * Inside an allow? Judged on the RESOLVED path only (a symlink in the workspace
+ * pointing out of it opens the target, not the link), and EXACTLY: on a
+ * case-sensitive volume `/work/Project` and `/work/project` are different
+ * directories, and granting one must not grant the other. On a case-insensitive
+ * volume realpath(3) returns the on-disk spelling for both sides, so nothing
+ * is lost there.
+ */
 function inAllow(p: { real: string }, dirs: readonly string[], files: readonly string[] = []): boolean {
-  return dirs.some((d) => isInside(p.real, d)) || files.some((f) => p.real === f);
+  return dirs.some((d) => isInsideExact(p.real, d)) || files.some((f) => p.real === f);
 }
 
 export interface ResolvedGroupPathPolicy {
@@ -216,11 +236,11 @@ export interface ResolvedGroupPathPolicy {
 
 export function resolveGroupPathPolicy(policy: GroupPathPolicy, cwd: string): ResolvedGroupPathPolicy {
   return {
-    read: resolvedDirs([...policy.readDirs, ...policy.writeDirs], cwd),
-    readFiles: resolvedDirs(policy.readFiles, cwd),
-    write: resolvedDirs(policy.writeDirs, cwd),
-    deny: resolvedDirs(policy.denyDirs, cwd),
-    writeDeny: resolvedDirs(policy.writeDenyDirs, cwd),
+    read: resolvedAllowDirs([...policy.readDirs, ...policy.writeDirs], cwd),
+    readFiles: resolvedAllowDirs(policy.readFiles, cwd),
+    write: resolvedAllowDirs(policy.writeDirs, cwd),
+    deny: resolvedDenyDirs(policy.denyDirs, cwd),
+    writeDeny: resolvedDenyDirs(policy.writeDenyDirs, cwd),
   };
 }
 

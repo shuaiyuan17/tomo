@@ -18,7 +18,9 @@ import { startWebHttp } from "../src/web/http.js";
 import { WebData } from "../src/web/data.js";
 import { SessionStore } from "../src/sessions/store.js";
 import type { WebBootstrap, WebEvent, WebModelView } from "../src/web/protocol.js";
-import { modelErrorText, pickTarget, switchCopy } from "../web/src/model-picker.js";
+import { effortText, modelErrorText, pickTarget, switchCopy } from "../web/src/model-picker.js";
+import { sdkOptions } from "../src/agent/sdk-options.js";
+import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 
 installAgentTestHooks();
 
@@ -225,5 +227,36 @@ describe("Model page copy", () => {
     expect(copy.body).toContain("from the next message");
     expect(modelErrorText("turn_in_flight", "Tomo")).toContain("Tomo is in the middle of a reply");
     expect(modelErrorText("something_else", "Tomo")).toContain("could not be confirmed");
+  });
+});
+
+describe("Model page effort", () => {
+  const server = { type: "sdk", name: "tomo-internal", instance: {} } as unknown as McpSdkServerConfigWithInstance;
+  const sent = (key: string, model?: string) => sdkOptions(server, undefined, model, { sessionKey: key }).effort ?? null;
+
+  it("shows the level each session starts with and where it comes from, as sdkOptions sends it", () => {
+    const LEGACY = "imessage:any;+;chat0000000001";
+    resetConfig({ effort: "high", sessionEffortOverrides: { [LEGACY]: "low" } });
+    const overrides = new Map<string, string>([["dm:gateway", "chatgpt/gpt-5.5"]]);
+    const cases: Array<[string, WebModelView["effort"]]> = [
+      [LEGACY, { level: "low", source: "session" }],
+      ["dm:owner", { level: "high", source: "global" }],
+      ["dm:gateway", { level: null, source: "not-supported" }],
+    ];
+    for (const [key, expected] of cases) {
+      const view = describeSessionModel(overrides, key, false);
+      expect(view.effort).toEqual(expected);
+      expect(sent(key, overrides.get(key))).toBe(view.effort.level);
+    }
+    resetConfig({ effort: null });
+    expect(describeSessionModel(new Map(), "dm:owner", false).effort).toEqual({ level: null, source: "sdk-default" });
+    expect(sent("dm:owner")).toBeNull();
+  });
+
+  it("words each source", () => {
+    expect(effortText({ level: "low", source: "session" })).toContain("chosen for this conversation");
+    expect(effortText({ level: "high", source: "global" })).toBe("high, the default from config.json.");
+    expect(effortText({ level: null, source: "sdk-default" })).toContain("model's own default");
+    expect(effortText({ level: null, source: "not-supported" })).toContain("does not take an effort");
   });
 });

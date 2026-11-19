@@ -44,3 +44,13 @@ export function switchCopy(from: { id: string; label: string }, to: { id: string
     body: `This conversation moves from ${from.label} to ${to.label}. It continues on the new model from the next message; the history is kept.`,
   };
 }
+
+/** The Model page's effort line: the level the conversation starts with and where it comes from. */
+export function effortText(effort: WebModelView["effort"]): string {
+  switch (effort.source) {
+    case "session": return `${effort.level}, chosen for this conversation (sessionEffortOverrides).`;
+    case "global": return `${effort.level}, the default from config.json.`;
+    case "sdk-default": return "not set; the model's own default applies.";
+    case "not-supported": return "not sent; this model does not take an effort setting.";
+  }
+}

@@ -271,6 +271,15 @@ describe("config view", () => {
     const { fields } = configFields({ sessionModelOverrides: { "sk-ant-api03-synthetic000000000000000000": "claude-opus-5-5" } });
     expect(JSON.stringify(fields)).not.toContain("sk-ant-api03");
   });
+  it("shows legacy iMessage session keys and effort levels in per-session overrides", () => {
+    const key = "imessage:any;+;chat0000000001";
+    const { fields } = configFields({ effort: "high", sessionModelOverrides: { [key]: "claude-opus-5-5" }, sessionEffortOverrides: { [key]: "low", "dm:owner": "turbo-ish" } });
+    const at = (path: string) => fields.find((f) => f.path.join(".") === path);
+    expect(at("effort")).toMatchObject({ secret: false, value: "high" });
+    expect(at(`sessionModelOverrides.${key}`)).toMatchObject({ secret: false, value: "claude-opus-5-5" });
+    expect(at(`sessionEffortOverrides.${key}`)).toMatchObject({ secret: false, value: "low" });
+    expect(at("sessionEffortOverrides.dm:owner")).toMatchObject({ secret: true });
+  });
   it("masks an allowlisted string that looks like a credential, and numbers under a credential name", () => {
     const { fields } = configFields({ model: "sk-ant-api03-synthetic-0000000000000000", auth: { pin: 1234 }, tokenTtl: 5 });
     expect(fields.map((f) => [f.path.join("."), f.secret])).toEqual([["model", true], ["auth.pin", true], ["tokenTtl", true]]);

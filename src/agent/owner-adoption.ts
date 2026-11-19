@@ -27,7 +27,8 @@ export class OwnerAdoption {
   /**
    * The one-time adoption of a legacy per-channel session into the owner's
    * `dm:` key, WITH everything that is keyed by the session: its cron jobs
-   * (`data/cron/jobs.json`) and its `sessionModelOverrides` entry. Moving only
+   * (`data/cron/jobs.json`) and its `sessionModelOverrides` and
+   * `sessionEffortOverrides` entries. Moving only
    * the registry entry left the jobs on the raw key — the next run forked a
    * fresh session there — and dropped the owner's model.
    *
@@ -68,11 +69,17 @@ export class OwnerAdoption {
     withConfigLockSync(CONFIG_PATH, () => {
       if (!existsSync(CONFIG_PATH)) return;
       const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf-8")) as Record<string, unknown>;
-      const overrides = (cfg.sessionModelOverrides ?? {}) as Record<string, string>;
-      if (overrides[from] === undefined) return;
-      if (overrides[to] === undefined) overrides[to] = overrides[from];
-      delete overrides[from];
-      cfg.sessionModelOverrides = overrides;
+      // The effort override is keyed the same way and moves with the model's.
+      let changed = false;
+      for (const field of ["sessionModelOverrides", "sessionEffortOverrides"] as const) {
+        const overrides = (cfg[field] ?? {}) as Record<string, string>;
+        if (overrides[from] === undefined) continue;
+        if (overrides[to] === undefined) overrides[to] = overrides[from];
+        delete overrides[from];
+        cfg[field] = overrides;
+        changed = true;
+      }
+      if (!changed) return;
       backupConfigFile();
       writeJsonAtomicSync(CONFIG_PATH, cfg, { mode: 0o600 });
     });
@@ -81,6 +88,12 @@ export class OwnerAdoption {
       if (live[to] === undefined) live[to] = live[from];
       delete live[from];
       log.info({ from, to }, "Moved the model override with the adopted session");
+    }
+    const liveEffort = config.sessionEffortOverrides;
+    if (liveEffort?.[from] !== undefined) {
+      if (liveEffort[to] === undefined) liveEffort[to] = liveEffort[from];
+      delete liveEffort[from];
+      log.info({ from, to }, "Moved the effort override with the adopted session");
     }
     const loaded = this.modelOverrides.get(from);
     if (loaded !== undefined) {

@@ -11,7 +11,8 @@ import { effectiveGroupSandbox, type GroupSandboxConfig } from "./group-fs-polic
 import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, skillsCanUseTool, todoStoreGuardHooks, type PrivateMemoryBar } from "./permissions.js";
 import { TODO_TOOL_NAMES } from "../mcp/todo-tools.js";
 import { todosDir } from "../todos/store.js";
-import type { AgentProfile, EffortLevel } from "../config.js";
+import type { AgentProfile } from "../config.js";
+import { effectiveEffort } from "./effort.js";
 import { resolvePlugins } from "./plugins.js";
 import { SDK_SETTING_SOURCES } from "./setting-sources.js";
 import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
@@ -204,7 +205,11 @@ export function sdkOptions(
   // its reply was not delivered (see renderBlock). Resolved at session spawn — a
   // mid-session config change only takes effect on the next session (restart).
   const thinking = adaptiveThinkingForModel(effectiveModel, config.showThinking);
-  const effort = effortForModel(effectiveModel, sessionContext?.sessionKey);
+  // Resolved at session spawn like `thinking`: a config change takes effect on
+  // the next session start (daemon restart, or a `/model` switch, which
+  // restarts the session). Tomo has no live config edit, so nothing calls
+  // `applyFlagSettings({ effortLevel })` mid-session.
+  const effort = effectiveEffort(config, sessionContext?.sessionKey, effectiveModel).level;
 
   // Resolved at session spawn, not config load: CLI-installed plugin paths are
   // version-pinned and change on `claude plugin update` (old dirs are GC'd),
@@ -333,27 +338,6 @@ export function sdkOptions(
     // for it, so pass it through extraArgs when steering is enabled.
     ...(config.steering ? { extraArgs: { "replay-user-messages": null } } : {}),
   };
-}
-
-/**
- * The `effort` option for a session: its `sessionEffortOverrides` entry, else
- * the global `effort`, else none (the SDK uses the model's default).
- *
- * Resolved at session spawn like `thinking`: a config change takes effect on
- * the next session start (daemon restart, or a `/model` switch, which restarts
- * the session). Tomo has no live config edit, so nothing calls
- * `applyFlagSettings({ effortLevel })` mid-session.
- *
- * Claude models without effort support, or without a level (e.g. `max`), are
- * handled by the CLI: it silently downgrades the level or sends none. A
- * LiteLLM provider model (`chatgpt/...`) is not a Claude model, so — as for
- * adaptive thinking — the option is not sent at all.
- */
-function effortForModel(model: string, sessionKey?: string): EffortLevel | undefined {
-  const resolved = resolveModelName(model) ?? model;
-  if (isLiteLlmProviderModel(resolved)) return undefined;
-  const override = sessionKey ? config.sessionEffortOverrides?.[sessionKey] : undefined;
-  return override ?? config.effort ?? undefined;
 }
 
 /**

@@ -185,8 +185,14 @@ export function protectedLinkTargets(tomoHome: string | undefined): { targets: s
   }
   const targets: string[] = [];
   for (const name of names) {
-    if (!TOMO_HOME_DENY_PREFIXES.some((prefix) => name.startsWith(prefix))) continue;
+    // Case-INSENSITIVE, like every deny: on a case-insensitive volume
+    // `Config.json` is opened by `config.json`, and the kernel matches the
+    // name as stored, which the exact-case prefix would miss. Such an entry
+    // is denied by its own path.
+    const lower = name.toLowerCase();
+    if (!TOMO_HOME_DENY_PREFIXES.some((prefix) => lower.startsWith(prefix.toLowerCase()))) continue;
     const entry = join(tomoHome, name);
+    if (!TOMO_HOME_DENY_PREFIXES.some((prefix) => name.startsWith(prefix))) targets.push(entry);
     let link: boolean;
     try {
       link = lstatSync(entry).isSymbolicLink();
@@ -330,6 +336,9 @@ function writeDenial(p: string, cwd: string, r: ResolvedGroupPathPolicy): string
   const s = spellingsOf(p, cwd);
   if (s === null) return `${p} could not be resolved`;
   if (hitsDeny(s, r.deny) || hitsDenyPrefix(s, r.denyPrefixes) || hitsDeny(s, r.writeDeny)) return `${p} is never writable from a group turn`;
+  // Nor is a directory ABOVE a denied path: overwriting or replacing it would
+  // move the protected tree out from under its name.
+  if ([...r.deny, ...r.writeDeny].some((d) => isInside(d, s.spelled) || isInside(d, s.real))) return `${p} contains a protected path and is not writable from a group turn`;
   if (!inAllow(s, r.write)) return `${p} is outside what this group may write`;
   return null;
 }

@@ -704,3 +704,67 @@ describe("a protected entry in Tomo's home that is a symlink", () => {
     expect(sandboxedBashCommand("ls", p)).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Renaming an ancestor of a denied path
+// ---------------------------------------------------------------------------
+
+describe.runIf(sandboxRuns)("ancestors of denied paths", () => {
+  it("cannot rename memory/ (or the workspace) to walk private/ out from under its deny", () => {
+    const r = run(`cd ${q(fx.ws)}; mv memory moved; echo "mv rc=$?"; cat moved/private/note.txt; mv ${q(fx.ws)} ${q(join(fx.tomoHome, "ws-moved"))}; echo "mv ws rc=$?"`);
+    expect(r.out).toContain("mv rc=1");
+    expect(r.out).toContain("mv ws rc=1");
+    expect(r.out).not.toContain("PRIVATE-SECRET");
+    expect(existsSync(join(fx.ws, "memory", "private", "note.txt"))).toBe(true);
+    expect(run(`cat ${q(PRIVATE)}`).out).not.toContain("PRIVATE-SECRET");
+  });
+
+  it("still writes and creates the ancestors' other children", () => {
+    const r = run(`echo fine > ${q(join(fx.ws, "memory", "foo.md"))} && mkdir -p ${q(join(fx.ws, "memory", "sub"))} && cat ${q(join(fx.ws, "memory", "foo.md"))}`);
+    expect(r).toMatchObject({ code: 0 });
+    expect(r.out).toContain("fine");
+  });
+});
+
+describe("file tools and ancestors", () => {
+  it("Write cannot target a directory above a protected path", async () => {
+    expect(denied(await hook()({ tool_name: "Write", tool_input: { file_path: join(fx.ws, "memory"), content: "x" } }))).toBe(true);
+    expect(await hook()({ tool_name: "Write", tool_input: { file_path: join(fx.ws, "memory", "new.md"), content: "x" } })).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Protected names in a different case
+// ---------------------------------------------------------------------------
+
+describe("protected entries whose name differs only in case", () => {
+  const home = join(fx.root, "case-home");
+  const target = join(home, "notes", "target.json");
+  write(join(home, "notes", "plain.md"), "PLAIN\n");
+  write(target, "CASE-LINK-SECRET\n");
+  write(join(home, "Config.json.upper"), "CASE-SECRET\n");
+  symlinkSync(target, join(home, "CONFIG.json.bak"));
+  const casePolicy = () => groupPathPolicy({
+    workspaceDir: home,
+    privateDir: join(home, "memory", "private"),
+    homeSceneDir: join(home, "home"),
+    tomoHome: home,
+    dataDirs: [],
+    userHome: fx.userHome,
+  });
+
+  it("are found and denied, links included", () => {
+    expect(casePolicy().denyDirs).toEqual(expect.arrayContaining([join(home, "Config.json.upper"), join(home, "CONFIG.json.bak"), target]));
+    for (const p of [join(home, "Config.json.upper"), target]) {
+      expect(groupPathDenial("Read", { file_path: p }, home, casePolicy()), p).not.toBeNull();
+    }
+    expect(groupPathDenial("Read", { file_path: join(home, "notes", "plain.md") }, home, casePolicy())).toBeNull();
+  });
+
+  it.runIf(sandboxRuns)("are unreadable from the shell", () => {
+    const r = run(`cat ${q(join(home, "Config.json.upper"))}; cat ${q(target)}; cat ${q(join(home, "notes", "plain.md"))}`, casePolicy());
+    expect(r.out).not.toContain("CASE-SECRET");
+    expect(r.out).not.toContain("CASE-LINK-SECRET");
+    expect(r.out).toContain("PLAIN");
+  });
+});

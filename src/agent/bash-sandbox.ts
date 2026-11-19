@@ -162,9 +162,35 @@ export function sandboxProfileText(policy: ResolvedSandboxPolicy): string {
       `(deny file-write* (prefix ${sandboxLiteral(prefix)}))`,
     ]),
     ...policy.writeDenyDirs.map((dir) => `(deny file-write* ${sub(dir)})`),
+    // The ANCESTORS of every denied path may not themselves be written —
+    // renamed, removed, re-moded — or `mv memory moved && cat moved/private/x`
+    // walks the denied tree out from under its path. `literal`, so creating
+    // and writing their other children is unaffected (verified).
+    ...denyAncestors(policy).map((dir) => `(deny file-write* (literal ${sandboxLiteral(dir)}))`),
     ...SANDBOX_MACH_DENY.map((name) => `(deny mach-lookup (global-name ${sandboxLiteral(name)}))`),
     "",
   ].join("\n");
+}
+
+/** Every directory above a denied path (prefixes: above their directory, and
+ *  that directory itself), deduplicated, `/` included. */
+export function denyAncestors(policy: Pick<ResolvedSandboxPolicy, "denyDirs" | "denyPrefixes" | "writeDenyDirs">): string[] {
+  const out = new Set<string>();
+  const climb = (start: string) => {
+    let cur = start;
+    for (;;) {
+      out.add(cur);
+      const parent = dirname(cur);
+      if (parent === cur) return;
+      cur = parent;
+    }
+  };
+  for (const dir of [...policy.denyDirs, ...policy.writeDenyDirs]) {
+    const parent = dirname(dir);
+    if (parent !== dir) climb(parent);
+  }
+  for (const prefix of policy.denyPrefixes) climb(dirname(prefix));
+  return [...out];
 }
 
 /** A path as a TinyScheme string literal for the profile: backslash and double

@@ -49,6 +49,19 @@ describe("buildSystemPrompt", () => {
     expect(prompt).toContain("HARNESS");
   });
 
+  // The workspace prompt is the cross-session-cacheable prefix (see
+  // src/workspace/system-prompt-blocks.ts): every build of a variant must be
+  // byte-identical, and it must not carry the SDK boundary marker itself.
+  it("is byte-identical across builds of the same variant", () => {
+    for (const isGroup of [false, true]) {
+      const a = buildSystemPrompt({ isGroup });
+      expect(buildSystemPrompt({ isGroup })).toBe(a);
+      expect(a).not.toContain("__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__");
+      expect(a).not.toContain("# SESSION");
+      expect(a).not.toContain("# RUNTIME");
+    }
+  });
+
   it("includes NO_REPLY instruction in harness", () => {
     const prompt = buildSystemPrompt();
     expect(prompt).toContain("NO_REPLY");

@@ -254,6 +254,25 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(replacement).not.toBe(first);
   });
 
+  it("does not read the cache-boundary marker as a prompt change", async () => {
+    const BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
+    let prompt: string | string[] = "v1";
+    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+
+    const first = await manager.getOrCreateLiveSession("telegram:1");
+
+    // Same workspace content, now handed over as blocks around the marker.
+    prompt = ["v1", BOUNDARY];
+    expect(await manager.getOrCreateLiveSession("telegram:1")).toBe(first);
+    expect(first.isAlive()).toBe(true);
+
+    // A real content change still retires it.
+    prompt = ["v2", BOUNDARY];
+    const second = await manager.getOrCreateLiveSession("telegram:1");
+    expect(first.isAlive()).toBe(false);
+    expect(second).not.toBe(first);
+  });
+
   it("notices a prompt change even when the session would just be reused", async () => {
     let prompt = "v1";
     const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));

@@ -742,10 +742,10 @@ describe("chat commands", () => {
     await drainQueue(agent);
 
     const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
-    const lastCall = calls[calls.length - 1]?.[0] as { options?: { systemPrompt?: string } };
-    expect(lastCall.options?.systemPrompt).toContain("# RUNTIME");
+    const lastCall = calls[calls.length - 1]?.[0] as { options?: { systemPrompt?: string[] } };
+    expect(lastCall.options?.systemPrompt?.join("\n\n")).toContain("# RUNTIME");
     // alias "sonnet" must be resolved to its concrete id, not echoed raw
-    expect(lastCall.options?.systemPrompt).toContain("claude-sonnet-5");
+    expect(lastCall.options?.systemPrompt?.join("\n\n")).toContain("claude-sonnet-5");
 
     await agent.stop();
   });
@@ -767,8 +767,8 @@ describe("chat commands", () => {
     await drainQueue(agent);
 
     const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
-    const lastCall = calls[calls.length - 1]?.[0] as { options?: { systemPrompt?: string } };
-    expect(lastCall.options?.systemPrompt).toContain("chatgpt/gpt-5.5");
+    const lastCall = calls[calls.length - 1]?.[0] as { options?: { systemPrompt?: string[] } };
+    expect(lastCall.options?.systemPrompt?.join("\n\n")).toContain("chatgpt/gpt-5.5");
 
     await agent.stop();
   });

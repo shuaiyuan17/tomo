@@ -12,6 +12,7 @@ import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, s
 import { TODO_TOOL_NAMES } from "../mcp/todo-tools.js";
 import { todosDir } from "../todos/store.js";
 import type { AgentProfile } from "../config.js";
+import { effectiveEffort } from "./effort.js";
 import { resolvePlugins } from "./plugins.js";
 import { SDK_SETTING_SOURCES } from "./setting-sources.js";
 import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
@@ -204,6 +205,11 @@ export function sdkOptions(
   // its reply was not delivered (see renderBlock). Resolved at session spawn — a
   // mid-session config change only takes effect on the next session (restart).
   const thinking = adaptiveThinkingForModel(effectiveModel, config.showThinking);
+  // Resolved at session spawn like `thinking`: a config change takes effect on
+  // the next session start (daemon restart, or a `/model` switch, which
+  // restarts the session). Tomo has no live config edit, so nothing calls
+  // `applyFlagSettings({ effortLevel })` mid-session.
+  const effort = effectiveEffort(config, sessionContext?.sessionKey, effectiveModel).level;
 
   // Resolved at session spawn, not config load: CLI-installed plugin paths are
   // version-pinned and change on `claude plugin update` (old dirs are GC'd),
@@ -212,6 +218,7 @@ export function sdkOptions(
 
   return {
     model: effectiveModel,
+    ...(effort ? { effort } : {}),
     cwd: config.workspaceDir,
     systemPrompt,
     permissionMode: "bypassPermissions" as const,

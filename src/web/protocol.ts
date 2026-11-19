@@ -488,6 +488,8 @@ export interface WebModelView {
   defaultModel: { id: string; label: string };
   /** The conversation has its own choice (sessionModelOverrides). */
   overridden: boolean;
+  /** The reasoning effort the session starts with, and where it comes from (src/agent/effort.ts). */
+  effort: { level: "low" | "medium" | "high" | "xhigh" | "max" | null; source: "session" | "global" | "sdk-default" | "not-supported" };
   /** Only the owner's conversation can be switched from the browser; groups are read-only. */
   writable: boolean;
   /** A turn is in flight; a switch is refused (409 turn_in_flight) until it ends. */

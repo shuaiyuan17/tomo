@@ -33,6 +33,12 @@ const DEFAULT_IMESSAGE_TYPING_START_DELAY_MS = 1200;
 const DEFAULT_IMESSAGE_PASSIVE_TYPING_START_DELAY_MS = 4000;
 const DEFAULT_LIVE_SESSION_TIMEOUT_MS = 10 * 60 * 1000;
 
+/** The reasoning-effort levels the Agent SDK accepts (`EffortLevel` in
+ *  @anthropic-ai/claude-agent-sdk `sdk.d.ts`). */
+export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+const effortSchema = z.enum(EFFORT_LEVELS);
+
 /** Legacy `identities[]` entry. Still read (forever) to derive `owner`; never
  *  consumed at runtime. `replyPolicy` is accepted and ignored. */
 export interface IdentityConfig {
@@ -171,6 +177,9 @@ export interface TomoConfig {
   auth: AnthropicAuthConfig;
   telegramToken: string;
   model: string;
+  /** `effort`: reasoning effort passed to the SDK at session start. Null =
+   *  unset, the SDK picks the model's default. */
+  effort: EffortLevel | null;
   workspaceDir: string;
   sessionsDir: string;
   /** Claude Agent SDK JSONL directory derived from workspaceDir. */
@@ -212,6 +221,8 @@ export interface TomoConfig {
   /** Longer delay before showing iMessage typing in passive group turns. */
   imessagePassiveTypingStartDelayMs: number;
   sessionModelOverrides: Record<string, string>;
+  /** Per-session `effort` overrides, keyed like sessionModelOverrides. */
+  sessionEffortOverrides: Record<string, EffortLevel>;
   /** Per-channel GROUP allowlists (activated groups). DM entries are ignored:
    *  only the owner's DMs are answered. */
   channelAllowlists: Record<string, string[]>;
@@ -940,6 +951,7 @@ function buildConfig(): TomoConfig {
     web: parseWebConfig(file.web, (message) => log.warn(message)),
     telegramToken: envVar("TELEGRAM_BOT_TOKEN") ?? channels.telegram?.token ?? "",
     model,
+    effort: validated("effort", effortSchema, file.effort, null),
     workspaceDir: paths.workspaceDir,
     sessionsDir: paths.sessionsDir,
     sdkSessionsDir: paths.sdkSessionsDir,
@@ -996,6 +1008,7 @@ function buildConfig(): TomoConfig {
       DEFAULT_IMESSAGE_PASSIVE_TYPING_START_DELAY_MS,
     ),
     sessionModelOverrides: validated("sessionModelOverrides", z.record(z.string(), z.string()), file.sessionModelOverrides, {}),
+    sessionEffortOverrides: validated("sessionEffortOverrides", z.record(z.string(), effortSchema), file.sessionEffortOverrides, {}),
     channelAllowlists: Object.fromEntries(
       Object.entries(channels).flatMap(([name, ch]) => (ch.allowlist ? [[name, ch.allowlist]] : [])),
     ),

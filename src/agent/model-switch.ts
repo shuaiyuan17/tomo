@@ -7,6 +7,7 @@ import { CHATGPT_SUBSCRIPTION_DEFAULT_MODEL, CHATGPT_SUBSCRIPTION_MODE, isChatGp
 import { log } from "../logger.js";
 import { MODEL_ALIASES, isLiteLlmProviderModel, modelLabel, resolveModelName } from "../models.js";
 import type { WebModelView } from "../web/protocol.js";
+import { effectiveEffort } from "./effort.js";
 
 /**
  * One way to switch a session's model, shared by the `/model` chat command and
@@ -119,6 +120,7 @@ export function describeSessionModel(overrides: ReadonlyMap<string, string>, key
     model: { id: current, label: modelLabel(current) },
     defaultModel: { id: config.model, label: modelLabel(config.model) },
     overridden: overrides.has(key),
+    effort: effectiveEffort(config, key, current),
     busy,
     options: modelChoices(),
     gateway: {

@@ -3,6 +3,7 @@ import { backgroundLaunchGuardHooks } from "./compact-reservations.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
+import { assembleSystemPrompt, renderRuntimeSection, renderSessionSection } from "../workspace/system-prompt-blocks.js";
 import { isDmSessionKey, isGroupSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
@@ -120,7 +121,7 @@ export function sdkOptions(
   externalMcpServersOverride?: Record<string, McpServerConfig>,
 ) {
   const isGroup = sessionContext ? isGroupSessionKey(sessionContext.sessionKey) : false;
-  let systemPrompt = buildSystemPrompt({ isGroup });
+  const staticPrompt = buildSystemPrompt({ isGroup });
 
   // Why `memory/private/` is closed for the turn in flight — or null when it is
   // open. INSTALLED FOR EVERY SESSION, and resolved per tool call rather than
@@ -145,33 +146,12 @@ export function sdkOptions(
   // early when the SDK reports no `agent_id`.
   const agentProfile = (agentType: string): AgentProfile | undefined => config.agentProfiles[agentType];
 
-  // Inject the small amount of runtime context that cannot live in the
-  // user-editable workspace prompt.
-  if (sessionContext) {
-    const lines = [
-      "\n\n# SESSION",
-      `- Session key: ${sessionContext.sessionKey}`,
-    ];
-    if (sessionContext.sdkSessionId) {
-      lines.push(`- SDK session ID: ${sessionContext.sdkSessionId}`);
-    }
-    if (sessionContext.group) {
-      const g = sessionContext.group;
-      lines.push("");
-      lines.push("## Group Chat Context");
-      if (g.chatTitle) lines.push(`- Group title: "${g.chatTitle}"`);
-      if (g.participants && g.participants.length > 0) {
-        lines.push(`- Known participants: ${g.participants.join(", ")}`);
-      }
-      lines.push("- Incoming messages identify the sender. A canonical PEOPLE name in parentheses refers to the same person.");
-      if (g.isPassive) {
-        lines.push("- **Listen mode: passive.** You see every message. Reply only when directly addressed or genuinely useful; otherwise reply `NO_REPLY`.");
-      } else {
-        lines.push("- **Listen mode: mention-required.** Every message you receive explicitly tagged you; respond as in a DM.");
-      }
-    }
-    systemPrompt += lines.join("\n");
-  }
+  // The small amount of runtime context that cannot live in the user-editable
+  // workspace prompt. It goes AFTER the cache boundary (see
+  // workspace/system-prompt-blocks.ts): it names this one session, so before
+  // the marker it would stop every other session sharing the prefix.
+  const dynamicSections: string[] = [];
+  if (sessionContext) dynamicSections.push(renderSessionSection(sessionContext));
 
   const configuredMcpServers = Object.fromEntries(
     Object.entries(config.mcpServers ?? {}).map(([name, entry]) => [name, entry.server]),
@@ -191,7 +171,8 @@ export function sdkOptions(
   const resolvedModel = resolveModelName(effectiveModel) ?? effectiveModel;
   const resolvedLabel = modelLabel(resolvedModel);
   const modelDisplay = resolvedLabel === resolvedModel ? resolvedModel : `${resolvedModel} — ${resolvedLabel}`;
-  systemPrompt += `\n\n# RUNTIME\n- Current model: ${modelDisplay}\n- Treat this model value as authoritative.`;
+  dynamicSections.push(renderRuntimeSection(modelDisplay));
+  const systemPrompt = assembleSystemPrompt(staticPrompt, dynamicSections);
 
   const sdkEnv = buildSdkEnv({
     disableAutoCompact: shouldDisableAutoCompact,

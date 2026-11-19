@@ -23,6 +23,7 @@ import { SteerDeclinedError } from "./sdk-result.js";
 import type { GroupSandboxConfig } from "./group-fs-policy.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
+import { flattenSystemPrompt } from "../workspace/system-prompt-blocks.js";
 
 /**
  * How long a prompt-stale session may wait for its background tasks before it
@@ -109,8 +110,13 @@ export { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
  * context), and the post-turn context-pressure hook.
  */
 export interface LiveSessionManagerDeps {
-  /** Current system prompt — hashed to detect workspace changes. */
-  buildSystemPrompt(): string;
+  /**
+   * Current system prompt — hashed to detect workspace changes. Only the
+   * workspace (static, pre-boundary) prompt belongs here: per-session blocks
+   * and the SDK cache-boundary marker are not workspace changes. A block array
+   * is accepted and flattened, so the marker itself never moves the hash.
+   */
+  buildSystemPrompt(): string | readonly string[];
   getSdkSessionId(key: string): string | undefined;
   setSdkSessionId(key: string, sessionId: string): void;
   clearSdkSessionId(key: string): void;
@@ -522,7 +528,7 @@ export class LiveSessionManager {
    * workspace, so a changed prompt reaches every key by its next idle turn.
    */
   private sweepPromptChanges(): void {
-    const currentHash = this.hashString(this.deps.buildSystemPrompt());
+    const currentHash = this.hashString(flattenSystemPrompt(this.deps.buildSystemPrompt()));
     if (this.lastPromptHash && currentHash !== this.lastPromptHash) {
       log.info("System prompt changed; retiring live sessions at their next idle boundary");
       for (const [key, session] of this.liveSessions) {

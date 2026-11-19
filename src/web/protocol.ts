@@ -403,7 +403,41 @@ export interface WebScreenFrame { status: "live" | "locked" | "away" | "unconfir
 export interface WebMemoryEntry { path: string; kind: "directory" | "file" }
 export interface WebMemoryTree { entries: WebMemoryEntry[]; truncated: boolean; missing: boolean }
 export interface WebMemoryFile { path: string; content: string; modifiedAt: number; hiddenLines: number }
-export interface WebTodos { files: Array<WebMemoryFile | { path: string; error: string }>; missing: boolean; truncated: boolean }
+/** One open todo of the todo store (`src/todos/`). Times are epoch milliseconds. */
+export interface WebTodoItem {
+  /** `t-<n>`. */
+  id: string; title: string;
+  /** The next step. Equal to `title` when the owner added it without one. */
+  next: string;
+  /** Who moves next: the agent (`me`), the owner, or someone else. */
+  waitingOn: "me" | "owner" | "external";
+  /** The item is due for review once this has passed. */
+  reviewAt: number;
+  ref?: string;
+  createdAt: number; updatedAt: number;
+  /** Who added it. */
+  source: "owner" | "self";
+  snoozes: number; snoozeReason?: string;
+  /** Title of the group conversation it belongs to; absent for the owner's own conversation. */
+  group?: string;
+}
+/** A finished todo, from the store's done log. */
+export interface WebTodoResolution extends WebTodoItem {
+  resolution: "done" | "drop"; resolvedAt: number; resolvedBy: "owner" | "self"; reason?: string; evidence?: string;
+}
+export interface WebTodos {
+  /** Open items the owner's conversation may see, oldest id first. */
+  items: WebTodoItem[];
+  /** Every open item in the store, which is what the cap counts (`items` can be fewer). */
+  openTotal: number;
+  /** The most recently finished items, newest first (at most MAX_WEB_TODO_RESOLUTIONS). */
+  recent: WebTodoResolution[];
+  /** The done log holds more finished items than `recent` (only its tail is read, so there is no total). */
+  moreResolved: boolean;
+  limits: { maxOpen: number; maxSnoozes: number };
+}
+/** Finished todos one `/todos` response carries. */
+export const MAX_WEB_TODO_RESOLUTIONS = 20;
 export interface WebMemorySearch { results: Array<{ path: string; line: number; text: string }>; truncated: boolean; unreadable: number; missing: boolean }
 export interface WebCronJob {
   /** Hash of the job's intent; a confirmed change must name the revision it reviewed. */

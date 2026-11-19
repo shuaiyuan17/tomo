@@ -3,7 +3,7 @@ import { api, ApiError } from "./api.js";
 
 export const STUDY_PAGES = ["todos", "memory", "context", "model", "cost", "cron", "mcp", "config"] as const;
 export type StudyPage = typeof STUDY_PAGES[number];
-export const STUDY_LABELS: Record<StudyPage, string> = { todos: "TODOs", memory: "Memory", context: "Context", model: "Model", cost: "Cost", cron: "Cron", mcp: "MCP servers", config: "Config" };
+export const STUDY_LABELS: Record<StudyPage, string> = { todos: "Todos", memory: "Memory", context: "Context", model: "Model", cost: "Cost", cron: "Cron", mcp: "MCP servers", config: "Config" };
 
 /** `#study/<page>[/<item>]`: the Study is linkable and the back button leaves it. */
 const STUDY_HASH = /^#study(?:\/([a-z]+)(?:\/([A-Za-z0-9_-]{1,64}))?)?$/;
@@ -63,14 +63,4 @@ export function formatWhen(ms: number | null | undefined, now = Date.now()): str
 
 export function formatTokens(value: number): string {
   return value >= 10_000 ? `${(value / 1000).toFixed(value >= 100_000 ? 0 : 1)}k` : value.toLocaleString();
-}
-
-/** Open / done checkbox counts of a markdown task list. */
-export function countTasks(markdown: string): { open: number; done: number } {
-  let open = 0, done = 0;
-  for (const line of markdown.split("\n")) {
-    const match = /^\s*[-*+]\s+\[([ xX])\](?:\s|$)/.exec(line);
-    if (match) { if (match[1] === " ") open++; else done++; }
-  }
-  return { open, done };
 }

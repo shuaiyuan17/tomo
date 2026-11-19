@@ -120,7 +120,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         return;
       }
       if (req.method === "GET") {
-        if (url.pathname === "/api/v1/todos") { json(res, 200, await required(deps.data.memory).todos()); return; }
+        if (url.pathname === "/api/v1/todos") { json(res, 200, await deps.data.todos()); return; }
         if (url.pathname === "/api/v1/memory/tree") { json(res, 200, await required(deps.data.memory).tree()); return; }
         if (url.pathname === "/api/v1/memory/file") { json(res, 200, await required(deps.data.memory).file(url.searchParams.get("path") ?? "")); return; }
         if (url.pathname === "/api/v1/memory/search") { json(res, 200, await required(deps.data.memory).search(url.searchParams.get("q") ?? "")); return; }

@@ -64,9 +64,14 @@ export interface TodoResolution extends TodoItem {
   evidence?: string;
 }
 
+/** The store directory under a given runtime home: `<home>/data/todos`. */
+export function todosDirIn(home: string): string {
+  return join(home, "data", "todos");
+}
+
 /** The default store directory: `<tomoHome>/data/todos`. */
 export function todosDir(): string {
-  return join(config.tomoHome || TOMO_HOME, "data", "todos");
+  return todosDirIn(config.tomoHome || TOMO_HOME);
 }
 
 /** The limits in force (config, falling back to the defaults field by field). */
@@ -124,16 +129,69 @@ const itemSchema = z.looseObject({
   snooze_reason: z.string().optional(),
 });
 
+/** A `done.ndjson` line a reader can show: an item plus how it was closed. */
+const resolutionSchema = itemSchema.extend({
+  resolution: z.enum(["done", "drop"]),
+  resolved_at: z.string().refine((v) => !Number.isNaN(Date.parse(v)), "expected an ISO timestamp"),
+  resolved_by: z.enum(["owner", "self"]),
+  reason: z.string().optional(),
+  evidence: z.string().optional(),
+});
+
 const fileSchema = z.looseObject({
   version: z.literal(1),
   next_id: z.number().int().min(1),
   items: z.array(itemSchema),
 });
 
-interface StoreFile {
+export interface StoreFile {
   version: 1;
   next_id: number;
   items: TodoItem[];
+}
+
+/**
+ * The text of `todos.json` as a checked store file. Throws TodoStoreReadError
+ * (naming `path`) for anything that is not one. Pure: a reader that must not
+ * block (the web UI) reads the bytes itself and parses them with this.
+ */
+export function parseTodoFile(raw: string, path: string): StoreFile {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch (err) {
+    throw new TodoStoreReadError(path, err);
+  }
+  const parsed = fileSchema.safeParse(data);
+  if (!parsed.success) throw new TodoStoreReadError(path, new Error(parsed.error.issues[0]?.message ?? "invalid shape"));
+  const file = parsed.data as unknown as StoreFile;
+  const ids = new Set<string>();
+  for (const item of file.items) {
+    if (ids.has(item.id)) throw new TodoStoreReadError(path, new Error(`duplicate id ${item.id}`));
+    ids.add(item.id);
+    if (Number(item.id.slice(2)) >= file.next_id) {
+      throw new TodoStoreReadError(path, new Error(`${item.id} is not below next_id ${file.next_id}`));
+    }
+  }
+  return file;
+}
+
+/**
+ * Whole records in a stretch of `done.ndjson`, oldest first, for views of the
+ * history. Each line is checked before ids are compared: a line that is torn
+ * or not a whole record is left out and does not stand in for a later, whole
+ * record of the same id. The first whole record of an id wins.
+ */
+export function parseResolutions(raw: string): TodoResolution[] {
+  const records = new Map<string, TodoResolution>();
+  for (const text of raw.split("\n")) {
+    if (!text.trim()) continue;
+    let data: unknown;
+    try { data = JSON.parse(text); } catch { continue; }
+    const parsed = resolutionSchema.safeParse(data);
+    if (parsed.success && !records.has(parsed.data.id)) records.set(parsed.data.id, parsed.data as unknown as TodoResolution);
+  }
+  return [...records.values()];
 }
 
 interface StoreState {
@@ -441,23 +499,7 @@ export class TodoStore {
     const raw = this.rawNow();
     const closed = this.readClosed();
     if (raw === null) return { file: { version: 1, next_id: 1, items: [] }, raw, closed };
-    let data: unknown;
-    try {
-      data = JSON.parse(raw);
-    } catch (err) {
-      throw new TodoStoreReadError(this.path, err);
-    }
-    const parsed = fileSchema.safeParse(data);
-    if (!parsed.success) throw new TodoStoreReadError(this.path, new Error(parsed.error.issues[0]?.message ?? "invalid shape"));
-    const file = parsed.data as unknown as StoreFile;
-    const ids = new Set<string>();
-    for (const item of file.items) {
-      if (ids.has(item.id)) throw new TodoStoreReadError(this.path, new Error(`duplicate id ${item.id}`));
-      ids.add(item.id);
-      if (Number(item.id.slice(2)) >= file.next_id) {
-        throw new TodoStoreReadError(this.path, new Error(`${item.id} is not below next_id ${file.next_id}`));
-      }
-    }
+    const file = parseTodoFile(raw, this.path);
     // Self-heal a close interrupted between its two writes: logged means closed.
     file.items = file.items.filter((item) => !closed.has(item.id));
     return { file, raw, closed };

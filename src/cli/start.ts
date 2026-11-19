@@ -261,7 +261,7 @@ async function startForeground(): Promise<void> {
       const supervisor = new WebSupervisor(web, {
         ...config.web, owner: config.owner,
         sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,
-        workspaceDir: config.workspaceDir, agentName: config.agentName, uploadsEnabled: config.saveInboundImages, fileUploadsEnabled: config.saveInboundFiles, cronStorePath: CRON_STORE_PATH, mcpStatus: () => agent.readMcpStatuses(),
+        workspaceDir: config.workspaceDir, agentName: config.agentName, uploadsEnabled: config.saveInboundImages, fileUploadsEnabled: config.saveInboundFiles, cronStorePath: CRON_STORE_PATH, todoLimits: config.todos, mcpStatus: () => agent.readMcpStatuses(),
         diagnostic: (message, level = "info") => log[level](message),
       });
       web.attach(supervisor);

@@ -4,7 +4,7 @@ import { Check, ChevronRight, FileText, Folder, Lock, Pause, Play, RefreshCw, Se
 import { ApiError, mutate, type WebBootstrap } from "./api.js";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 import type { WebConfigField, WebConfigView, WebContext, WebCronJob, WebMcpView, WebMemoryFile, WebMemorySearch,
-  WebMemoryTree, WebSession, WebTodos } from "../../src/web/protocol.js";
+  WebMemoryTree, WebSession } from "../../src/web/protocol.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -15,12 +15,13 @@ import { cn } from "@/lib/utils";
 import { Text } from "./markdown.js";
 import { ContextView } from "./context-page.js";
 import { CostPage } from "./cost-page.js";
+import { Todos } from "./study-todos.js";
 import type { WebModelChangeResult, WebModelView } from "../../src/web/protocol.js";
 import { modelErrorRefreshes, modelErrorText, pickTarget, switchCopy } from "./model-picker.js";
-import { countTasks, formatWhen, STUDY_LABELS, STUDY_PAGES, useResource, type Resource, type StudyPage } from "./study-data.js";
+import { formatWhen, STUDY_LABELS, STUDY_PAGES, useResource, type Resource, type StudyPage } from "./study-data.js";
 
 const INTRO: Record<StudyPage, string> = {
-  todos: "Task lists {agent} keeps in memory/TODO*.md. Read-only here.",
+  todos: "What {agent} is keeping track of, and who moves next. Read-only here: todos change in conversation or with /todo.",
   memory: "What {agent} remembers, as it is written in the workspace. Private memory is never shown in the browser.",
   context: "How full the selected conversation's context window is, what fills it, and what has been rolled up.",
   model: "Which model the selected conversation runs on. Your own conversation can be switched here.",
@@ -82,29 +83,6 @@ export function Study({ page, onPage, session, reload, inert, mutator, focus, cr
       </div>
     </Tabs>
   </main>;
-}
-
-function Todos({ reload }: { reload: number }) {
-  const [resource] = useResource<WebTodos>("/todos", reload);
-  const value = resource.state === "ready" ? resource.value : undefined;
-  return <Status resource={resource} empty={value && (value.missing ? <Empty>The workspace has no memory folder yet.</Empty>
-    : !value.files.length ? <Empty>No <code className="font-mono">memory/TODO*.md</code> files yet.</Empty> : undefined)}>
-    <div className="space-y-4">{value?.files.map((file) => "error" in file
-      ? <div key={file.path} className={cn(card, "px-5 py-4 text-[13px]")}><span className="font-mono">{file.path}</span> — {ERRORS[`memory_${file.error}`] ?? "unreadable"}</div>
-      : <TodoFile key={file.path} file={file} />)}
-      {value?.truncated && <p className={meta}>Only the first 32 TODO files are shown.</p>}</div>
-  </Status>;
-}
-
-function TodoFile({ file }: { file: WebMemoryFile }) {
-  const { open, done } = countTasks(file.content);
-  return <section className={cn(card, "px-6 py-5")} aria-label={file.path}>
-    <div className="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1">
-      <h2 className="m-0 font-mono text-[13px] font-medium">{file.path}</h2>
-      <span className={meta}>{open} open · {done} done</span>
-      <span className={cn(meta, "ml-auto")}>Updated {formatWhen(file.modifiedAt)}</span></div>
-    <div className="markdown [&_li:has(>input:checked)]:text-muted-foreground [&_li:has(>input:checked)]:line-through"><Text>{file.content}</Text></div>
-  </section>;
 }
 
 function Memory({ reload }: { reload: number }) {

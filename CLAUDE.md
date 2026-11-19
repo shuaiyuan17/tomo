@@ -72,6 +72,7 @@ src/
                       #   `todos`), format.ts (canSeeTodo = cron's canManageJob on the item's session; plain-text
                       #   lines for /todo and `tomo todo due`). Agent tools in mcp/todo-tools.ts; /todo in
                       #   agent/todo-command.ts; direct writes denied on every session by agent/todo-store-guard.ts
+                      #   The web UI's Study reads it (web/todos-view.ts: list() + resolved(), never a write)
   home/               # Tomo's home: scene format, check, floor plan, store, status, sky (see "Tomo's home")
   lcm/                # Context mgmt — compact, stats, prune-tools, blocks (rollups), runner
   continuity.ts       # ContinuityRunner — periodic heartbeats for autonomous behavior

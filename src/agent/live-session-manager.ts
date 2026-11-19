@@ -148,7 +148,7 @@ export interface LiveSessionManagerDeps {
    * The key the turn in flight on `key` is scoped to (`Agent.scopedCallerKey`),
    * which is the steering group's key on a summoned turn. Read per tool call by
    * the private-memory guard so a summoned turn inherits its group's
-   * `groupShellAllowlist` entry; a live query for the same reason as above.
+   * `groupSandbox` entry; a live query for the same reason as above.
    */
   scopedCallerKey(key: string): string;
   handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult>;

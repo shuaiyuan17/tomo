@@ -62,6 +62,7 @@ vi.mock("../src/logger.js", () => ({
 
 const { log } = await import("../src/logger.js");
 const {
+  ENV_ALLOWLIST_PREFIX,
   SANDBOX_EXEC_PATH,
   SANDBOX_SHELL_PATH,
   foreignPreToolUseHookSource,
@@ -72,6 +73,30 @@ const {
   shellSingleQuote,
   wrapWithSandbox,
 } = await import("../src/agent/bash-sandbox.js");
+const { SYSTEM_READ_DIRS, defaultTempDirs } = await import("../src/agent/group-fs-policy.js");
+
+/**
+ * The policy the older tests were written against: deny `privateDir`, plus
+ * `writeOnly` for writes and `deny` for reads and writes, with nothing granted
+ * but the system read set and the temp dirs. Every fixture lives under the temp
+ * dir, so the workspace-shaped trees these tests build are reachable exactly
+ * as a group's workspace would be.
+ */
+function policyFor(privateDir: string, writeOnly: readonly string[] = [], deny: readonly string[] = []) {
+  return {
+    readDirs: [...SYSTEM_READ_DIRS],
+    readFiles: [] as string[],
+    writeDirs: ["/dev", ...defaultTempDirs()],
+    denyDirs: [privateDir, ...deny],
+    denyPrefixes: [] as string[],
+    writeDenyDirs: [...writeOnly],
+  };
+}
+
+/** A resolved policy for the pure profile-text tests. */
+function resolvedProfile(over: Partial<{ readDirs: string[]; readFiles: string[]; writeDirs: string[]; denyDirs: string[]; denyPrefixes: string[]; writeDenyDirs: string[] }> = {}) {
+  return { readDirs: [], readFiles: [], writeDirs: [], denyDirs: [], denyPrefixes: [], writeDenyDirs: [], ...over };
+}
 
 const scratch: string[] = [OLD_TOMO_HOME];
 function scratchDir(prefix: string): string {
@@ -107,8 +132,8 @@ describe("wrapWithSandbox — the exact command the Bash tool will run", () => {
     // of the same turn ran unsandboxed. `-p` puts the policy in this process's
     // argv, where the sandboxed command cannot reach it at all.
     const wrapped = wrapWithSandbox("ls -la /tmp", PROFILE);
-    expect(wrapped).toBe(`/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- 'ls -la /tmp'`);
-    expect(wrapped).not.toContain("-f ");
+    expect(wrapped).toBe(`${ENV_ALLOWLIST_PREFIX} /usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -f -c -- 'ls -la /tmp'`);
+    expect(wrapped).not.toMatch(/sandbox-exec -f /);
     expect(wrapped).not.toContain(".sb");
   });
 
@@ -116,20 +141,20 @@ describe("wrapWithSandbox — the exact command the Bash tool will run", () => {
     // Without it, `zsh -lc '-n …'` is `zsh: bad option string` and the command
     // never runs at all — zsh reads the leading dash as one of its own flags.
     expect(wrapWithSandbox("-n true || echo fell-through", PROFILE))
-      .toBe(`/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- '-n true || echo fell-through'`);
+      .toBe(`${ENV_ALLOWLIST_PREFIX} /usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -f -c -- '-n true || echo fell-through'`);
   });
 
   it("escapes single quotes by closing, quoting and reopening", () => {
     // `'` → `'\''`: the only character a single-quoted shell word cannot hold.
     expect(wrapWithSandbox(`echo 'hi there'`, PROFILE)).toBe(
-      `/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- 'echo '\\''hi there'\\'''`,
+      `${ENV_ALLOWLIST_PREFIX} /usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -f -c -- 'echo '\\''hi there'\\'''`,
     );
   });
 
   it("carries a multi-line heredoc through unchanged", () => {
     const heredoc = ["cat <<'EOF'", "line one with 'quotes'", "  line two", "EOF"].join("\n");
     expect(wrapWithSandbox(heredoc, PROFILE)).toBe(
-      `/usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- `
+      `${ENV_ALLOWLIST_PREFIX} /usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -f -c -- `
       + `'cat <<'\\''EOF'\\''\nline one with '\\''quotes'\\''\n  line two\nEOF'`,
     );
   });
@@ -137,8 +162,8 @@ describe("wrapWithSandbox — the exact command the Bash tool will run", () => {
   it("single-quotes the profile so its newlines survive as one shell word", () => {
     // The rewrite is handed back as a command LINE, not an argv, so the whole
     // multi-line profile has to reach the outer shell as a single word.
-    const wrapped = wrapWithSandbox("true", sandboxProfileText("/ws/memory/private"));
-    expect(wrapped).toContain(`-p '(version 1)\n(allow default)\n`);
+    const wrapped = wrapWithSandbox("true", sandboxProfileText(resolvedProfile({ denyDirs: ["/ws/memory/private"] })));
+    expect(wrapped).toContain(`-p '(version 1)\n(deny default)\n`);
     expect(wrapped.split(`' ${SANDBOX_SHELL_PATH} `)).toHaveLength(2);
   });
 
@@ -199,34 +224,53 @@ describe("shellSingleQuote — round-tripped through a real shell", () => {
 });
 
 describe("sandboxProfileText", () => {
-  it("denies reads AND writes under exactly the named subpath", () => {
-    expect(sandboxProfileText("/ws/memory/private")).toBe(
-      [
-        "(version 1)",
-        "(allow default)",
-        `(deny file-read* (subpath "/ws/memory/private"))`,
-        `(deny file-write* (subpath "/ws/memory/private"))`,
-        "",
-      ].join("\n"),
-    );
+  const profile = sandboxProfileText(resolvedProfile({
+    readDirs: ["/usr"],
+    readFiles: ["/h/.zprofile"],
+    writeDirs: ["/ws"],
+    denyDirs: ["/ws/memory/private"],
+    writeDenyDirs: ["/ws/home"],
+  }));
+  const lines = profile.split("\n");
+  const at = (line: string) => {
+    const i = lines.indexOf(line);
+    expect(i, line).toBeGreaterThanOrEqual(0);
+    return i;
+  };
+
+  it("denies by default, never allows by default", () => {
+    expect(lines[1]).toBe("(deny default)");
+    expect(profile).not.toContain("(allow default)");
+  });
+
+  it("allows the listed dirs and files, reads only where it says read", () => {
+    at(`(allow file-read* (subpath "/usr"))`);
+    at(`(allow file-read* (literal "/h/.zprofile"))`);
+    at(`(allow file-read* file-write* (subpath "/ws"))`);
+  });
+
+  it("puts every permanent deny AFTER every allow — SBPL applies the last match", () => {
+    const lastAllow = Math.max(...lines.map((l, i) => (l.startsWith("(allow file-") ? i : -1)));
+    for (const line of [
+      `(deny file-read* (subpath "/ws/memory/private"))`,
+      `(deny file-write* (subpath "/ws/memory/private"))`,
+      `(deny file-write* (subpath "/ws/home"))`,
+    ]) expect(at(line)).toBeGreaterThan(lastAllow);
+    expect(profile).not.toContain(`(deny file-read* (subpath "/ws/home"))`);
+  });
+
+  it("closes localhost and unix sockets but leaves outbound IP open", () => {
+    expect(at(`(deny network-outbound (remote ip "localhost:*"))`))
+      .toBeGreaterThan(at(`(allow network-outbound (remote ip "*:*"))`));
+    expect(profile).not.toContain("(allow network*)");
+  });
+
+  it("refuses the mach services that reach outside the sandbox, last", () => {
+    expect(at(`(deny mach-lookup (global-name "com.apple.SecurityServer"))`)).toBeGreaterThan(at("(allow mach-lookup)"));
   });
 
   it("escapes a quote in the path rather than closing the literal early", () => {
-    expect(sandboxProfileText(`/ws/me"mo\\ry`)).toContain(`(subpath "/ws/me\\"mo\\\\ry")`);
-  });
-
-  it("adds a WRITE-only deny for Tomo's home, leaving the private-memory denies as they were", () => {
-    expect(sandboxProfileText("/ws/memory/private", ["/ws/home"])).toBe(
-      [
-        "(version 1)",
-        "(allow default)",
-        `(deny file-read* (subpath "/ws/memory/private"))`,
-        `(deny file-write* (subpath "/ws/memory/private"))`,
-        `(deny file-write* (subpath "/ws/home"))`,
-        "",
-      ].join("\n"),
-    );
-    expect(sandboxProfileText("/ws/memory/private", ["/ws/home"])).not.toContain(`(deny file-read* (subpath "/ws/home"))`);
+    expect(sandboxProfileText(resolvedProfile({ denyDirs: [`/ws/me"mo\\ry`] }))).toContain(`(subpath "/ws/me\\"mo\\\\ry")`);
   });
 });
 
@@ -317,12 +361,12 @@ describe("resolvedDenyDir", () => {
 describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", () => {
   it("returns null when sandbox-exec is absent", () => {
     MISSING.add(SANDBOX_EXEC_PATH);
-    expect(sandboxedBashCommand("ls", scratchDir("tomo-sbx-nosbx-"))).toBeNull();
+    expect(sandboxedBashCommand("ls", policyFor(scratchDir("tomo-sbx-nosbx-")))).toBeNull();
   });
 
   it("returns null when the shell is absent", () => {
     MISSING.add(SANDBOX_SHELL_PATH);
-    expect(sandboxedBashCommand("ls", scratchDir("tomo-sbx-nosh-"))).toBeNull();
+    expect(sandboxedBashCommand("ls", policyFor(scratchDir("tomo-sbx-nosh-")))).toBeNull();
   });
 
   it("returns null when the deny dir cannot be resolved", () => {
@@ -330,7 +374,7 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
     // an unresolvable scope must withhold the shell, not sandbox it loosely.
     const root = scratchDir("tomo-sbx-unresolvable-");
     symlinkSync(join(root, "nowhere"), join(root, "private"));
-    expect(sandboxedBashCommand("ls", join(root, "private"))).toBeNull();
+    expect(sandboxedBashCommand("ls", policyFor(join(root, "private")))).toBeNull();
     expect(vi.mocked(log.warn)).toHaveBeenCalled();
     // WHICH reason is logged depends on the host: off macOS the `sandbox-exec`
     // preflight refuses first and never reaches the resolver, which is why the
@@ -348,14 +392,14 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
     const dir = scratchDir("tomo-sbx-data-");
     const dangling = join(dir, "data");
     symlinkSync(join(dir, "nowhere"), dangling);
-    expect(sandboxedBashCommand("echo hi", join(dir, "private"), undefined, [], [dangling])).toBeNull();
+    expect(sandboxedBashCommand("echo hi", policyFor(join(dir, "private"), [], [dangling]))).toBeNull();
   });
 
   it("returns null when the home (write-only deny) cannot be resolved", () => {
     // The second barred directory fails closed exactly like the first.
     const root = scratchDir("tomo-sbx-home-unresolvable-");
     symlinkSync(join(root, "nowhere"), join(root, "home"));
-    expect(sandboxedBashCommand("ls", scratchDir("tomo-sbx-home-priv-"), undefined, [join(root, "home")])).toBeNull();
+    expect(sandboxedBashCommand("ls", policyFor(scratchDir("tomo-sbx-home-priv-"), [join(root, "home")]))).toBeNull();
     expect(vi.mocked(log.warn)).toHaveBeenCalled();
     if (sandboxRuns) {
       expect(vi.mocked(log.warn).mock.calls[0][0]).toMatchObject({
@@ -363,7 +407,7 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
       });
     }
     // And a `..` spelling of it is refused like the private dir's.
-    expect(sandboxedBashCommand("ls", scratchDir("tomo-sbx-home-priv2-"), undefined, [`${root}/x/../home`])).toBeNull();
+    expect(sandboxedBashCommand("ls", policyFor(scratchDir("tomo-sbx-home-priv2-"), [`${root}/x/../home`]))).toBeNull();
   });
 
   it("returns null when a foreign PreToolUse hook could rewrite the sandbox away", () => {
@@ -376,7 +420,7 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
     writeFileSync(settings, JSON.stringify({
       hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "true" }] }] },
     }));
-    expect(sandboxedBashCommand("ls", scratchDir("tomo-sbx-foreign-priv-"), {
+    expect(sandboxedBashCommand("ls", policyFor(scratchDir("tomo-sbx-foreign-priv-")), {
       settingsFiles: [settings],
       pluginDirs: [],
     })).toBeNull();
@@ -385,7 +429,7 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
   it("logs the fallback exactly once, however many commands are refused", () => {
     MISSING.add(SANDBOX_EXEC_PATH);
     const dir = scratchDir("tomo-sbx-warnonce-");
-    for (let i = 0; i < 4; i++) expect(sandboxedBashCommand("ls", dir)).toBeNull();
+    for (let i = 0; i < 4; i++) expect(sandboxedBashCommand("ls", policyFor(dir))).toBeNull();
     expect(vi.mocked(log.warn).mock.calls).toHaveLength(1);
     expect(vi.mocked(log.warn).mock.calls[0][1]).toContain("withholding the shell instead");
   });
@@ -393,20 +437,25 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
   it("wraps when the sandbox is available, with the profile inline", () => {
     if (!existsSync(SANDBOX_EXEC_PATH) || !existsSync(SANDBOX_SHELL_PATH)) return;
     const dir = scratchDir("tomo-sbx-ok-");
-    // The home's write-only deny rides along by default (HOME_SCENE_DIR, mocked as /ws/home).
-    expect(sandboxedBashCommand("echo hi", dir))
-      .toBe(wrapWithSandbox("echo hi", sandboxProfileText(dir, [resolvedDenyDir("/ws/home")!])));
-    expect(sandboxedBashCommand("echo hi", dir, undefined, []))
-      .toBe(wrapWithSandbox("echo hi", sandboxProfileText(dir)));
+    const home = resolvedDenyDir("/ws/home")!;
+    const policy = policyFor(dir, [home]);
+    expect(sandboxedBashCommand("echo hi", policy)).toBe(wrapWithSandbox("echo hi", sandboxProfileText({
+      readDirs: policy.readDirs.map((d) => resolvedDenyDir(d)!),
+      readFiles: policy.readFiles.map((d) => resolvedDenyDir(d)!),
+      writeDirs: policy.writeDirs.map((d) => resolvedDenyDir(d)!),
+      denyDirs: [dir],
+      denyPrefixes: [],
+      writeDenyDirs: [home],
+    })));
   });
 
   it("puts the whole policy in the command, and nothing on disk", () => {
     if (!existsSync(SANDBOX_EXEC_PATH) || !existsSync(SANDBOX_SHELL_PATH)) return;
     const dir = scratchDir("tomo-sbx-nofile-");
-    const wrapped = sandboxedBashCommand("echo hi", dir)!;
+    const wrapped = sandboxedBashCommand("echo hi", policyFor(dir))!;
     // Every deny clause travels in the argv, so there is no second place the
     // policy could be read from — and therefore none to overwrite.
-    for (const clause of ["(allow default)", `(deny file-read* (subpath "${dir}"))`]) {
+    for (const clause of ["(deny default)", `(deny file-read* (subpath "${dir}"))`]) {
       expect(wrapped).toContain(clause);
     }
     expect(wrapped).not.toContain(".sb");
@@ -542,7 +591,7 @@ describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
     writeOnlyDirs?: readonly string[],
     denyDirs?: readonly string[],
   ): { code: number; out: string } {
-    const wrapped = sandboxedBashCommand(command, privateDir, undefined, writeOnlyDirs, denyDirs);
+    const wrapped = sandboxedBashCommand(command, policyFor(privateDir, writeOnlyDirs, denyDirs));
     expect(wrapped).not.toBeNull();
     try {
       return {
@@ -669,7 +718,7 @@ describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
     expect(r.out).not.toContain("SECRET");
   });
 
-  it("leaves the everyday toolchain working — this is one deny, not a jail", () => {
+  it("leaves the everyday toolchain working inside the allowlist", () => {
     const { priv } = workspace();
     const r = runSandboxed(`git --version && echo ok > /dev/null && echo fine`, priv);
     expect(r.code).toBe(0);

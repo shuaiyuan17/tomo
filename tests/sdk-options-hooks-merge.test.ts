@@ -189,7 +189,7 @@ describe("undelivered-reply nudge", () => {
   });
 });
 
-describe("buildHooksOption — groupShellAllowlist threaded to the guard", () => {
+describe("buildHooksOption — groupSandbox threaded to the guard", () => {
   type Hook = (input: { tool_name: string; tool_input: unknown }) => Promise<{
     hookSpecificOutput?: {
       permissionDecision?: string;
@@ -197,13 +197,13 @@ describe("buildHooksOption — groupShellAllowlist threaded to the guard", () =>
     };
   }>;
 
-  it("passes the allowlist through to privateMemoryGuardHooks", async () => {
+  it("passes an unsandboxed group entry through to privateMemoryGuardHooks", async () => {
     const KEY = "imessage:any;+;test";
     const { hooks } = buildHooksOption({
       maxTurns: 50,
       sessionKey: KEY,
       privateMemoryBar: () => "group-session" as const,
-      groupShellAllowlist: () => [KEY],
+      groupSandbox: () => ({ groups: { [KEY]: { extraRead: [], extraWrite: [], unsandboxed: true } } }),
     }) as { hooks: Record<string, Array<{ hooks: Hook[] }>> };
 
     // The private-memory guard is the last PreToolUse entry.

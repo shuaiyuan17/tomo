@@ -110,6 +110,19 @@ export function absoluteGlobBaseDir(pattern: string): string {
 }
 
 /**
+ * The directory a search really walks, `~`-expanded but not resolved: for a
+ * Glob with an absolute pattern, the pattern's base directory (which REPLACES
+ * `path`); otherwise `path`, or the cwd.
+ */
+export function effectiveSearchRoot(toolName: string, toolInput: unknown, cwd: string): string {
+  const ti = toolInput && typeof toolInput === "object" ? toolInput as Record<string, unknown> : {};
+  const pattern = toolName === "Glob" ? ti.pattern : undefined;
+  const spelledPattern = typeof pattern === "string" && pattern ? expandTilde(pattern) : "";
+  const pathArg = typeof ti.path === "string" && ti.path ? expandTilde(ti.path) : cwd;
+  return toolName === "Glob" && isAbsolute(spelledPattern) ? absoluteGlobBaseDir(spelledPattern) : pathArg;
+}
+
+/**
  * Would this search walk a barred directory? On a barred turn the test is the
  * search's EFFECTIVE ROOT alone: at, inside, or ABOVE a barred directory is
  * refused without asking whether the pattern could reach the barred tree.
@@ -136,8 +149,7 @@ export function barredSearch(
   const ti = toolInput && typeof toolInput === "object" ? toolInput as Record<string, unknown> : {};
   const pattern = toolName === "Glob" ? ti.pattern : toolName === "Grep" ? ti.glob : undefined;
   const spelledPattern = typeof pattern === "string" && pattern ? expandTilde(pattern) : "";
-  const pathArg = typeof ti.path === "string" && ti.path ? expandTilde(ti.path) : ctx.cwd;
-  const rootRaw = toolName === "Glob" && isAbsolute(spelledPattern) ? absoluteGlobBaseDir(spelledPattern) : pathArg;
+  const rootRaw = effectiveSearchRoot(toolName, toolInput, ctx.cwd);
   const roots = spellings(rootRaw, ctx.cwd);
   if (roots === null) return true;
   const dirs = ctx.barredDirs.flatMap((dir) => spellings(dir, ctx.cwd) ?? [foldPath(abs(dir, ctx.cwd))]);

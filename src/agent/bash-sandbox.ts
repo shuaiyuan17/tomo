@@ -1,7 +1,7 @@
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join, sep } from "node:path";
 import { log } from "../logger.js";
-import { HOME_SCENE_DIR, PRIVATE_MEMORY_DIR } from "../workspace/index.js";
+import type { GroupPathPolicy } from "./group-fs-policy.js";
 
 /**
  * Kernel-level scoping for the shell on a private-memory-barred turn.
@@ -34,19 +34,17 @@ import { HOME_SCENE_DIR, PRIVATE_MEMORY_DIR } from "../workspace/index.js";
  * race; the fix is to have no file at all. `-p` puts the policy in this
  * process's argv, where the sandboxed command cannot reach it.
  *
- * DENY SCOPE IS EXACTLY THE PRIVATE DIR — the same boundary the Read/Grep/Glob
- * arms of the guard already enforce, no wider. Both `file-read*` and
- * `file-write*` are denied, which is also what the file-tool arms do (they cover
- * `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, not just `Read`). The write half is
- * not decoration: with reads denied alone, `mv memory/private /tmp/p && cat
- * /tmp/p/note.txt` walks the files OUT of the denied subpath and reads them at a
- * path the profile says nothing about. Verified by running it.
- *
- * ONE MORE, WRITE-ONLY: TOMO'S HOME. `<ws>/home/` is the owner conversation's
- * alone, so a barred turn's shell may read it but not change it: the profile
- * adds `(deny file-write* (subpath <home>))`, its path resolved and failing
- * closed exactly like the private dir's. Nothing about the private-memory
- * deny changes.
+ * DEFAULT DENY, NOT A FEW DENIES. The profile used to be `(allow default)`
+ * plus denies for private memory, Tomo's data/ and a write deny on the home —
+ * which left the shell free to read the config file, the logs, `secrets/`, the
+ * keychain and everything else the owner's account can. It is now an
+ * allowlist: system directories read-only, the temp dirs and the workspace
+ * read-write, plus whatever the group's entry adds, with the permanent denies
+ * of `./group-fs-policy.ts` emitted LAST so no allow can reach past them.
+ * The same policy decides the file tools, so the two cannot disagree. The
+ * write half of every deny is not decoration: with reads denied alone, `mv
+ * memory/private /tmp/p && cat /tmp/p/note.txt` walks the files OUT of the
+ * denied subpath. Verified by running it.
  *
  * THE REWRITE IS NOT THE LAST WORD, SO A FOREIGN HOOK WITHHOLDS THE SHELL. The
  * CLI takes the last `updatedInput` any PreToolUse hook produces, and hooks from
@@ -70,41 +68,129 @@ export const SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
 
 /** The shell the wrapped command is handed to, also absolute.
  *
- *  `-l` and not just `-c`: the Bash tool's own shell is a login shell, and a
- *  command that resolves a tool through `~/.zprofile`'s PATH must keep
- *  resolving it. Non-interactive, so `~/.zshrc` is not read and nothing
- *  interactive can print into the captured output. */
+ *  Started with `-f` (no start-up files) and `-c`, NOT as a login shell: the
+ *  owner's `~/.zshenv` / `~/.zprofile` run as the owner and can export
+ *  credentials straight back into an environment `env -i` just emptied. PATH
+ *  comes from the Bash tool's own shell through the env allowlist instead. */
 export const SANDBOX_SHELL_PATH = "/bin/zsh";
 
-/** Sandbox profile denying every read and write at-or-under `denyDir`.
+/** The inner shell's flags: no start-up files, run the script. */
+export const SANDBOX_SHELL_FLAGS: readonly string[] = ["-f", "-c"];
+
+/**
+ * Mach services a group shell may not look up, though `mach-lookup` is
+ * otherwise open.
  *
- * `(allow default)` and one deny, deliberately: this is not a general-purpose
- * jail and must not become one. A barred turn is otherwise a normal turn — git,
- * gh, curl, npm and the rest have to keep working, or the change trades one
- * impossible task for a hundred — so the profile states the single boundary the
- * harness already enforces everywhere else and nothing more.
- *
- * `subpath` covers the directory itself as well as everything under it, which is
- * what makes `ls memory/private` and `mv memory/private …` fail and not only
- * `cat memory/private/x`.
+ * WHY A DENY LIST AND NOT AN ALLOW LIST. A narrow allow list was tried: node,
+ * python and git kept working, but the system `curl` failed TLS (exit 60) and
+ * the missing service was not found. So lookups stay open and the services
+ * that reach OUTSIDE the sandbox are refused: the keychain daemon (the file
+ * deny on the keychain directory already stops `security`; this is the second
+ * lock), Apple Events and LaunchServices (driving another app, `open`), the
+ * pasteboard, TCC, and the window server / screen capture.
  */
-export function sandboxProfileText(
-  denyDir: string,
-  writeDenyDirs: readonly string[] = [],
-  /** Further directories denied for reads AND writes, like `denyDir` (Tomo's own `data/`). */
-  extraDenyDirs: readonly string[] = [],
-): string {
+export const SANDBOX_MACH_DENY: readonly string[] = [
+  "com.apple.SecurityServer",
+  "com.apple.coreservices.appleevents",
+  "com.apple.coreservices.launchservicesd",
+  "com.apple.lsd.mapdb",
+  "com.apple.CoreServices.coreservicesd",
+  "com.apple.pasteboard.1",
+  "com.apple.tccd",
+  "com.apple.tccd.system",
+  "com.apple.windowserver.active",
+  "com.apple.ScreenCaptureKit.service",
+];
+
+/** A {@link GroupPathPolicy} with every path resolved the way the kernel sees it. */
+export interface ResolvedSandboxPolicy {
+  readDirs: readonly string[];
+  readFiles: readonly string[];
+  writeDirs: readonly string[];
+  denyDirs: readonly string[];
+  /** Read + write denies of every path starting with one of these. */
+  denyPrefixes: readonly string[];
+  writeDenyDirs: readonly string[];
+}
+
+/**
+ * The sandbox profile for a group turn's shell: DEFAULT DENY.
+ *
+ * ORDER IS THE POLICY. SBPL applies the LAST rule that matches — measured: a
+ * `deny` followed by an `allow` of its parent reads the file, the other order
+ * does not. So every allow comes first (system read-only dirs, start-up files,
+ * the workspace and temp dirs, the group's extras) and the permanent denies
+ * come last, where no allow can reach past them.
+ *
+ * NETWORK. Outbound IP is open, except to localhost — which on macOS also
+ * covers this machine's own LAN address (measured). Unix sockets are closed
+ * except the resolver's. Daemons on this machine (build servers, the web UI,
+ * MCP servers, ssh-agent) run OUTSIDE the sandbox, so a socket to one is a
+ * way out of it.
+ *
+ * `file-read-metadata` is open everywhere: `stat` of a parent is what `ls`,
+ * `realpath` and git's repository discovery do, and it reveals that a file
+ * exists, never what is in it.
+ */
+export function sandboxProfileText(policy: ResolvedSandboxPolicy): string {
+  const sub = (dir: string) => `(subpath ${sandboxLiteral(dir)})`;
   return [
     "(version 1)",
-    "(allow default)",
-    ...[denyDir, ...extraDenyDirs].flatMap((dir) => [
-      `(deny file-read* (subpath ${sandboxLiteral(dir)}))`,
-      `(deny file-write* (subpath ${sandboxLiteral(dir)}))`,
+    "(deny default)",
+    "(allow process-fork)",
+    "(allow process-exec)",
+    "(allow signal (target same-sandbox))",
+    "(allow sysctl-read)",
+    "(allow ipc-posix-shm)",
+    "(allow system-socket)",
+    "(allow file-read-metadata)",
+    "(allow mach-lookup)",
+    `(allow file-read* (literal "/"))`,
+    ...policy.readDirs.map((dir) => `(allow file-read* ${sub(dir)})`),
+    ...policy.readFiles.map((file) => `(allow file-read* (literal ${sandboxLiteral(file)}))`),
+    ...policy.writeDirs.map((dir) => `(allow file-read* file-write* ${sub(dir)})`),
+    `(allow network-outbound (remote ip "*:*"))`,
+    `(allow network-outbound (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))`,
+    `(deny network-outbound (remote ip "localhost:*"))`,
+    // ---- permanent denies: LAST, so nothing above can re-allow them ----
+    ...policy.denyDirs.flatMap((dir) => [
+      `(deny file-read* ${sub(dir)})`,
+      `(deny file-write* ${sub(dir)})`,
     ]),
-    // Directories the shell may read but not change (Tomo's home).
-    ...writeDenyDirs.map((dir) => `(deny file-write* (subpath ${sandboxLiteral(dir)}))`),
+    ...policy.denyPrefixes.flatMap((prefix) => [
+      `(deny file-read* (prefix ${sandboxLiteral(prefix)}))`,
+      `(deny file-write* (prefix ${sandboxLiteral(prefix)}))`,
+    ]),
+    ...policy.writeDenyDirs.map((dir) => `(deny file-write* ${sub(dir)})`),
+    // The ANCESTORS of every denied path may not themselves be written —
+    // renamed, removed, re-moded — or `mv memory moved && cat moved/private/x`
+    // walks the denied tree out from under its path. `literal`, so creating
+    // and writing their other children is unaffected (verified).
+    ...denyAncestors(policy).map((dir) => `(deny file-write* (literal ${sandboxLiteral(dir)}))`),
+    ...SANDBOX_MACH_DENY.map((name) => `(deny mach-lookup (global-name ${sandboxLiteral(name)}))`),
     "",
   ].join("\n");
+}
+
+/** Every directory above a denied path (prefixes: above their directory, and
+ *  that directory itself), deduplicated, `/` included. */
+export function denyAncestors(policy: Pick<ResolvedSandboxPolicy, "denyDirs" | "denyPrefixes" | "writeDenyDirs">): string[] {
+  const out = new Set<string>();
+  const climb = (start: string) => {
+    let cur = start;
+    for (;;) {
+      out.add(cur);
+      const parent = dirname(cur);
+      if (parent === cur) return;
+      cur = parent;
+    }
+  };
+  for (const dir of [...policy.denyDirs, ...policy.writeDenyDirs]) {
+    const parent = dirname(dir);
+    if (parent !== dir) climb(parent);
+  }
+  for (const prefix of policy.denyPrefixes) climb(dirname(prefix));
+  return [...out];
 }
 
 /** A path as a TinyScheme string literal for the profile: backslash and double
@@ -130,8 +216,41 @@ export function shellSingleQuote(s: string): string {
 }
 
 /**
- * `command`, rewritten to run under `profileText`. Pure, and the profile travels
- * as an ARGUMENT — there is no file for the sandboxed command to edit.
+ * The environment variables a group shell keeps. Everything else the SDK
+ * process carries is dropped — an API key, a gateway token, `SSH_AUTH_SOCK`,
+ * whatever the daemon was started with — because a sandbox that hides the
+ * config file but hands its secrets over in `env` hides nothing.
+ *
+ * An ALLOWLIST, for the same reason the profile is one: names that carry a
+ * credential cannot be enumerated. The kept ones locate things (PATH, HOME,
+ * TMPDIR), describe the terminal and locale, or scope Tomo's own CLI to the
+ * session (`TOMO_SESSION_KEY`, `TOMO_DAEMON_PID` — identifiers, not secrets).
+ */
+export const SANDBOX_ENV_ALLOWLIST: readonly string[] = [
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TERM", "COLORTERM",
+  "LANG", "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME",
+  "TZ", "TOMO_SESSION_KEY", "TOMO_DAEMON_PID",
+];
+
+/**
+ * `/usr/bin/env -i` plus each allowed variable, expanded by the OUTER shell
+ * (the Bash tool's), so the values never appear in the command text.
+ * `${V+"V=$V"}` yields the assignment only when `V` is set — an unset variable
+ * stays unset rather than becoming empty.
+ */
+export const ENV_ALLOWLIST_PREFIX = [
+  "/usr/bin/env",
+  "-i",
+  ...SANDBOX_ENV_ALLOWLIST.map((name) => "${" + name + "+\"" + name + "=$" + name + "\"}"),
+  // git reads ~/.gitconfig on every run and stops when it cannot; the owner's
+  // home is not readable, so point it at nothing.
+  "GIT_CONFIG_GLOBAL=/dev/null",
+].join(" ");
+
+/**
+ * `command`, rewritten to run under `profileText` with only the allowlisted
+ * environment. Pure, and the profile travels as an ARGUMENT — there is no file
+ * for the sandboxed command to edit.
  *
  * `--` before the command is load-bearing. `zsh -lc '-n …'` is
  * `zsh: bad option string` — zsh reads a leading `-` as its own flag, so any
@@ -140,11 +259,12 @@ export function shellSingleQuote(s: string): string {
  */
 export function wrapWithSandbox(command: string, profileText: string): string {
   return [
+    ENV_ALLOWLIST_PREFIX,
     SANDBOX_EXEC_PATH,
     "-p",
     shellSingleQuote(profileText),
     SANDBOX_SHELL_PATH,
-    "-lc",
+    ...SANDBOX_SHELL_FLAGS,
     "--",
     shellSingleQuote(command),
   ].join(" ");
@@ -270,8 +390,9 @@ export function resolvedDenyDir(privateDir: string): string | null {
  *  An unreadable or unparseable settings file counts too: absence of a hook has
  *  to be established, not assumed.
  *
- * RE-READ ON EVERY CALL, never memoized. The sandboxed shell runs under
- * `(allow default)` and can therefore WRITE `.claude/settings.json` or drop a
+ * RE-READ ON EVERY CALL, never memoized. The profile now denies writes to the
+ * workspace's `.claude/`, but a group's extra write dirs, an unsandboxed
+ * group, or the owner's own turns can still WRITE a settings file or drop a
  * `hooks/` directory into a plugin. Caching this answer would mean command 1
  * installs a racing hook and command 2 is still told there is none; re-reading
  * means command 2 is withheld instead. The files are small and this runs once
@@ -332,29 +453,29 @@ export function resetBashSandboxForTests(): void {
 }
 
 /**
- * `command` rewritten to run sandboxed, or `null` to fall back to withholding
- * the shell. The one function the PreToolUse guard calls.
+ * `command` rewritten to run sandboxed under `policy`, or `null` to fall back
+ * to withholding the shell. The one function the PreToolUse guard calls.
  *
  * Recomputed from scratch on every call. There is nothing worth caching: the
- * profile text is two string interpolations, and the thing an earlier version
+ * profile text is string interpolation, and the thing an earlier version
  * cached — a path to a file on disk — was the bypass.
+ *
+ * DENIES FAIL CLOSED, ALLOWS FAIL QUIET. A deny whose real location cannot be
+ * established withholds the shell (it would deny a path nothing opens). An
+ * allow that cannot be resolved is left out: a missing grant only narrows the
+ * box.
  *
  * No "is it already wrapped?" shortcut, on purpose. The model is free to type
  * its own `sandbox-exec -p <permissive profile>` prefix, and a shortcut keyed on
  * the text would hand it an unsandboxed shell for the price of a guess. Our wrap
  * always goes on the OUTSIDE, and a nested `sandbox_apply` inside an existing
  * sandbox fails (`sandbox-exec: sandbox_apply: Operation not permitted`) —
- * verified by running it — so the outer deny cannot be relaxed from within.
+ * verified by running it — so the outer profile cannot be relaxed from within.
  */
 export function sandboxedBashCommand(
   command: string,
-  privateDir: string = PRIVATE_MEMORY_DIR,
+  policy: GroupPathPolicy,
   scan?: { settingsFiles: readonly string[]; pluginDirs: readonly string[] },
-  /** Denied for writes only, each resolved like `privateDir` (Tomo's home by default). */
-  writeOnlyDirs: readonly string[] = [HOME_SCENE_DIR],
-  /** Denied for reads and writes like `privateDir`, each resolved the same way
-   *  and failing closed the same way (the guard passes Tomo's `data/`). */
-  denyDirs: readonly string[] = [],
 ): string | null {
   if (!existsSync(SANDBOX_EXEC_PATH)) return warnOnce("sandbox-exec is not present on this host");
   if (!existsSync(SANDBOX_SHELL_PATH)) return warnOnce(`${SANDBOX_SHELL_PATH} is not present on this host`);
@@ -362,29 +483,45 @@ export function sandboxedBashCommand(
   // A foreign PreToolUse hook can overwrite our rewrite — see
   // `foreignPreToolUseHookSource`. Checked before the wrap is built, because the
   // answer is "no shell", not "a different shell".
+  if (policy.unresolvable) return warnOnce(policy.unresolvable);
   const foreign = scan ? foreignPreToolUseHookSource(scan) : null;
   if (foreign) {
     return warnOnce(`a foreign PreToolUse hook could rewrite the sandbox away: ${foreign}`);
   }
 
-  const denyDir = resolvedDenyDir(privateDir);
-  if (denyDir === null) {
-    return warnOnce(`cannot resolve the real path of ${privateDir}, so its subpath cannot be denied`);
-  }
-  const writeDeny: string[] = [];
-  for (const dir of writeOnlyDirs) {
-    const resolved = resolvedDenyDir(dir);
-    if (resolved === null) return warnOnce(`cannot resolve the real path of ${dir}, so writes under it cannot be denied`);
-    writeDeny.push(resolved);
-  }
-  const extraDeny: string[] = [];
-  for (const dir of denyDirs) {
+  const denyDirs: string[] = [];
+  for (const dir of policy.denyDirs) {
     const resolved = resolvedDenyDir(dir);
     if (resolved === null) return warnOnce(`cannot resolve the real path of ${dir}, so its subpath cannot be denied`);
-    extraDeny.push(resolved);
+    denyDirs.push(resolved);
   }
+  // A prefix is resolved through its directory: the kernel matches the real
+  // path, and the last component is a name prefix, not a directory.
+  const denyPrefixes: string[] = [];
+  for (const prefix of policy.denyPrefixes) {
+    const dir = resolvedDenyDir(dirname(prefix));
+    if (dir === null) return warnOnce(`cannot resolve the real path of ${dirname(prefix)}, so ${basename(prefix)}* cannot be denied`);
+    denyPrefixes.push(join(dir, basename(prefix)));
+  }
+  const writeDenyDirs: string[] = [];
+  for (const dir of policy.writeDenyDirs) {
+    const resolved = resolvedDenyDir(dir);
+    if (resolved === null) return warnOnce(`cannot resolve the real path of ${dir}, so writes under it cannot be denied`);
+    writeDenyDirs.push(resolved);
+  }
+  const allow = (dirs: readonly string[]) => dirs.flatMap((dir) => {
+    const resolved = resolvedDenyDir(dir);
+    return resolved === null ? [] : [resolved];
+  });
   try {
-    return wrapWithSandbox(command, sandboxProfileText(denyDir, writeDeny, extraDeny));
+    return wrapWithSandbox(command, sandboxProfileText({
+      readDirs: allow(policy.readDirs),
+      readFiles: allow(policy.readFiles),
+      writeDirs: allow(policy.writeDirs),
+      denyDirs,
+      denyPrefixes,
+      writeDenyDirs,
+    }));
   } catch {
     return warnOnce("could not build the sandboxed command");
   }

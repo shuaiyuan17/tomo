@@ -13,6 +13,8 @@ import {
   replyTargetFromRawSessionKey,
 } from "./sessions/keys.js";
 import { privateMemoryBarFor } from "./agent/permissions.js";
+import { attachmentBarredFor } from "./agent/private-memory-guard.js";
+import { effectiveGroupSandbox } from "./agent/group-fs-policy.js";
 import { OwnerRouter, type SessionResolution } from "./router.js";
 import { ignoredAllowlistDmEntries, isOwnerHandle, ownerSessionKey } from "./owner.js";
 import { BlockedInboundLog, redactChatIdForLog } from "./agent/blocked-inbound-log.js";
@@ -271,6 +273,7 @@ export class Agent {
       queuePendingErrorNote: (sessionKey, visibleError) => this.queuePendingErrorNote(sessionKey, visibleError),
       startTurnTyping: (channel, chatId, passiveListen) => this.startTurnTyping(channel, chatId, passiveListen),
       isPrivateMemoryBarred: (sessionKey) => this.isPrivateMemoryBarred(sessionKey),
+      isAttachmentBarred: (sessionKey, path) => this.isAttachmentBarred(sessionKey, path),
       delivery: this.delivery,
       undeliveredReplyAtTurnEnd: (sessionKey) => this.liveSessionManager.takeUndeliveredReply(sessionKey),
       requestRestate: (sessionKey, target) => this.restateUndeliveredReply(sessionKey, target),
@@ -397,6 +400,7 @@ export class Agent {
     this.proactive = new ProactiveSendService({
       getChannel: (name) => this.getChannel(name),
       isPrivateMemoryBarred: (sessionKey) => this.isPrivateMemoryBarred(sessionKey),
+      isAttachmentBarred: (sessionKey, path) => this.isAttachmentBarred(sessionKey, path),
       getSummonedIdentity: (channelName, chatId) => this.router.getSummonedIdentity(channelName, chatId),
       getReplyTarget: (sessionKey) => this.router.getReplyTarget(sessionKey),
       deriveReplyTargetFromConfig: (identityName) => this.router.deriveReplyTargetFromConfig(identityName),
@@ -1241,6 +1245,7 @@ export class Agent {
       // A background turn ships through the same fence as an owned one: its
       // audience is whatever is registered for the session at send time.
       blockPrivateMedia: () => this.isPrivateMemoryBarred(key),
+      attachmentBarred: (path) => this.isAttachmentBarred(key, path),
     });
     // Ordered per-block transcript, same rule as every owned turn: the slot is
     // taken at dispatch and filled at settle, so an abandoned send cannot let a
@@ -1469,6 +1474,23 @@ export class Agent {
       isGroupSessionKey(sessionKey),
       () => this.isOwnAudienceTurn(sessionKey),
     ) !== null;
+  }
+
+  /**
+   * On this session's turn in flight, must `path` be dropped as an attachment?
+   * False when the turn is not barred. Otherwise the group-aware answer from
+   * `attachmentBarredFor`: a sandboxed group ships only what it may read.
+   */
+  isAttachmentBarred(sessionKey: string, path: string): boolean {
+    const bar = privateMemoryBarFor(isGroupSessionKey(sessionKey), () => this.isOwnAudienceTurn(sessionKey));
+    if (bar === null) return false;
+    return attachmentBarredFor(
+      path,
+      bar,
+      sessionKey,
+      () => this.scopedCallerKey(sessionKey),
+      () => effectiveGroupSandbox(config.groupSandbox, config.groupShellAllowlist),
+    );
   }
 
   private async runUserTurnInner(req: UserTurnRequest): Promise<void> {

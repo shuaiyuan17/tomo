@@ -35,8 +35,8 @@ vi.mock("../src/logger.js", () => ({
 // unavailable arrives at the hook as exactly that.
 const sandbox = { wrap: (cmd: string): string | null => `SANDBOXED:${cmd}`, denyDirs: [] as readonly string[] };
 vi.mock("../src/agent/bash-sandbox.js", () => ({
-  sandboxedBashCommand: (cmd: string, _p?: string, _s?: unknown, _w?: unknown, denyDirs: readonly string[] = []) => {
-    sandbox.denyDirs = denyDirs;
+  sandboxedBashCommand: (cmd: string, policy: { denyDirs: readonly string[] }) => {
+    sandbox.denyDirs = policy.denyDirs;
     return sandbox.wrap(cmd);
   },
 }));
@@ -58,6 +58,7 @@ const {
 const { MIXED_AUDIENCE_KEY } = await import("../src/agent/audience.js");
 const { barredSearchDenialReason, harnessDataDenialReason, isPrivateAttachmentPath } = await import("../src/agent/private-memory-guard.js");
 const { config } = await import("../src/config.js");
+const { effectiveGroupSandbox } = await import("../src/agent/group-fs-policy.js");
 
 const ctx = {
   cwd: "/ws",
@@ -323,11 +324,13 @@ function hookFor(
     scopedCallerKey?: () => string | undefined;
   },
 ): PreToolUseHook {
+  const list = opts?.groupShellAllowlist;
   const hooks = privateMemoryGuardHooks(
     opts?.sessionKey ?? "dm:shuai",
     bar,
     undefined,
-    opts?.groupShellAllowlist,
+    // The legacy allowlist, read the way sdk-options reads it.
+    list ? () => effectiveGroupSandbox(undefined, list()) : undefined,
     opts?.scopedCallerKey,
   ) as {
     PreToolUse: Array<{ hooks: PreToolUseHook[] }>;
@@ -397,7 +400,7 @@ describe("privateMemoryGuardHooks — Tomo's data/ on a barred turn", () => {
   it("hands the data dirs to the Bash sandbox as read+write denies", async () => {
     const result = await hookFor(() => "group-session")(INNOCUOUS_BASH);
     expect(result.hookSpecificOutput?.updatedInput).toBeDefined();
-    expect(sandbox.denyDirs).toEqual(["/th/data", "/th/data/sessions"]);
+    expect(sandbox.denyDirs).toEqual(expect.arrayContaining(["/th/data", "/th/data/sessions"]));
   });
 
   it("leaves the workspace and the owner's own turn alone", async () => {

@@ -406,6 +406,7 @@ export const mockConfig = {
   passiveGroups: {} as Record<string, string[]>,
   groupSecret: null as string | null,
   groupShellAllowlist: [] as string[],
+  groupSandbox: { groups: {} },
   steering: true,
   /** Off by default here so the pre-inbox shutdown/recording suites keep
    *  pinning the in-memory path (which is also the fallback when a write to

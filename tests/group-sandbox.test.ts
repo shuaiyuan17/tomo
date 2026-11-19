@@ -1,0 +1,780 @@
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join } from "node:path";
+
+// ---------------------------------------------------------------------------
+// The group path policy (src/agent/group-fs-policy.ts), end to end: the Bash
+// profile under a REAL sandbox-exec, and the file-tool arm of the guard, both
+// against one fixture tree shaped like a real install:
+//
+//   <root>/tomo-home/config.json, logs/, data/   — Tomo's home
+//   <root>/tomo-home/workspace/                  — the workspace inside it
+//       memory/MEMORY.md, memory/private/note.txt, secrets/token.txt, home/
+//   <root>/user-home/Library/Keychains/, .ssh/   — a stand-in home directory
+//   <root>/external/project/file.txt             — a checkout outside the workspace
+//
+// The fixture root is outside the temp dirs every group turn is granted, so
+// "outside the workspace" really is outside the allowlist.
+// ---------------------------------------------------------------------------
+
+const fx = await vi.hoisted(async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  // NOT under the temp dir: the temp dirs are granted to every group turn, so a
+  // fixture there would be reachable by construction. node_modules/.cache is
+  // inside the checkout and ignored by git.
+  const base = path.join(process.cwd(), "node_modules", ".cache");
+  fs.mkdirSync(base, { recursive: true });
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(base, "tomo-group-sbx-")));
+  const tomoHome = path.join(root, "tomo-home");
+  const ws = path.join(tomoHome, "workspace");
+  return {
+    root,
+    tomoHome,
+    ws,
+    userHome: path.join(root, "user-home"),
+    external: path.join(root, "external", "project"),
+  };
+});
+
+vi.mock("../src/config.js", () => ({
+  config: { workspaceDir: fx.ws, tomoHome: fx.tomoHome, sessionsDir: join(fx.tomoHome, "data", "sessions") },
+}));
+vi.mock("../src/workspace/index.js", () => ({
+  MEMORY_DIR: join(fx.ws, "memory"),
+  PRIVATE_MEMORY_DIR: join(fx.ws, "memory", "private"),
+  HOME_SCENE_DIR: join(fx.ws, "home"),
+  PRIVATE_MEMORY_SUBDIR: "private",
+}));
+vi.mock("../src/logger.js", () => ({
+  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+
+const { groupPathPolicy, groupPathDenial, effectiveGroupSandbox, isValidExtraPath, reachesTomoHome } = await import("../src/agent/group-fs-policy.js");
+const { sandboxedBashCommand, sandboxProfileText, SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH, SANDBOX_MACH_DENY, resolvedDenyDir, shellSingleQuote } = await import("../src/agent/bash-sandbox.js");
+const { privateMemoryGuardHooks, attachmentBarredFor } = await import("../src/agent/private-memory-guard.js");
+const { DeliveryPipeline } = await import("../src/agent/delivery-pipeline.js");
+
+const CONFIG = join(fx.tomoHome, "config.json");
+const LOG = join(fx.tomoHome, "logs", "tomo.log");
+const DATA = join(fx.tomoHome, "data", "usage.ndjson");
+const PUBLIC = join(fx.ws, "memory", "MEMORY.md");
+const PRIVATE = join(fx.ws, "memory", "private", "note.txt");
+const SECRET = join(fx.ws, "secrets", "token.txt");
+const EXTERNAL = join(fx.external, "file.txt");
+const SSH_KEY = join(fx.userHome, ".ssh", "id_test");
+const KEYCHAINS = join(fx.userHome, "Library", "Keychains");
+
+function write(p: string, body: string) {
+  mkdirSync(join(p, ".."), { recursive: true });
+  writeFileSync(p, body);
+}
+write(CONFIG, "CONFIG-SECRET\n");
+write(LOG, "LOG-SECRET\n");
+write(DATA, "DATA-SECRET\n");
+write(PUBLIC, "PUBLIC\n");
+write(PRIVATE, "PRIVATE-SECRET\n");
+write(SECRET, "TOKEN-SECRET\n");
+write(EXTERNAL, "EXTERNAL\n");
+write(SSH_KEY, "SSH-SECRET\n");
+mkdirSync(KEYCHAINS, { recursive: true });
+mkdirSync(join(fx.ws, "home"), { recursive: true });
+mkdirSync(join(fx.ws, "notes"), { recursive: true });
+
+afterAll(() => rmSync(fx.root, { recursive: true, force: true }));
+
+/** The policy a group turn gets in this fixture, optionally with extras. */
+function policy(entry?: { extraRead?: string[]; extraWrite?: string[] }) {
+  return groupPathPolicy({
+    workspaceDir: fx.ws,
+    privateDir: join(fx.ws, "memory", "private"),
+    homeSceneDir: join(fx.ws, "home"),
+    tomoHome: fx.tomoHome,
+    dataDirs: [join(fx.tomoHome, "data")],
+    entry: { extraRead: entry?.extraRead ?? [], extraWrite: entry?.extraWrite ?? [] },
+    userHome: fx.userHome,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Pure policy
+// ---------------------------------------------------------------------------
+
+describe("effectiveGroupSandbox — the legacy allowlist, read in place", () => {
+  it("maps every groupShellAllowlist key to an unsandboxed entry", () => {
+    expect(effectiveGroupSandbox(undefined, ["group:test-1"])).toEqual({
+      groups: { "group:test-1": { extraRead: [], extraWrite: [], unsandboxed: true } },
+    });
+  });
+
+  it("lets an explicit groupSandbox entry win over the legacy list", () => {
+    const explicit = { extraRead: ["/x"], extraWrite: [], unsandboxed: false };
+    expect(effectiveGroupSandbox({ groups: { "group:test-1": explicit } }, ["group:test-1"]).groups["group:test-1"]).toBe(explicit);
+  });
+
+  it("is empty with neither", () => {
+    expect(effectiveGroupSandbox(undefined, undefined)).toEqual({ groups: {} });
+  });
+});
+
+describe("isValidExtraPath", () => {
+  it.each([
+    ["/abs/dir", true],
+    ["~/dir", true],
+    ["relative/dir", false],
+    ["/abs/../escape", false],
+    ["/", false],
+    ["~", false],
+    ["~/", false],
+  ])("%s → %s", (p, ok) => {
+    expect(isValidExtraPath(p, "/h")).toBe(ok);
+  });
+
+  it("drops an invalid extra rather than granting it", () => {
+    expect(policy({ extraRead: ["/", "relative"] }).readDirs).not.toContain("/");
+  });
+});
+
+describe("Tomo's home: fixed denies, no extra over it", () => {
+  it("names the config file, logs and data as fixed paths", () => {
+    expect(policy().denyDirs).toEqual(expect.arrayContaining([join(fx.tomoHome, "logs"), join(fx.tomoHome, "data")]));
+    expect(policy().denyPrefixes).toEqual(expect.arrayContaining([CONFIG, join(fx.tomoHome, "web-token")]));
+  });
+
+  it.each([
+    ["Tomo's home itself", () => fx.tomoHome, true],
+    ["a directory above it", () => fx.root, true],
+    ["a directory inside it, outside the workspace", () => join(fx.tomoHome, "run"), true],
+    ["a directory inside the workspace", () => join(fx.ws, "notes"), false],
+    ["a directory elsewhere", () => fx.external, false],
+  ])("an extra at %s is dropped: %s", (_what, dir, dropped) => {
+    expect(reachesTomoHome(dir(), fx.tomoHome, fx.ws)).toBe(dropped);
+    expect(policy({ extraRead: [dir()] }).readDirs.includes(dir())).toBe(!dropped);
+  });
+});
+
+describe("file-tool allows compare exactly; denies fold case", () => {
+  // Paths that do not exist resolve as spelled on every volume, which is what a
+  // case-sensitive volume does with them too.
+  const p = () => groupPathPolicy({
+    workspaceDir: fx.ws,
+    privateDir: join(fx.ws, "memory", "private"),
+    homeSceneDir: join(fx.ws, "home"),
+    dataDirs: [],
+    entry: { extraRead: ["/work-case-test/Project"], extraWrite: [] },
+    userHome: fx.userHome,
+  });
+
+  it("a grant of /work/Project does not grant /work/project", () => {
+    expect(groupPathDenial("Read", { file_path: "/work-case-test/Project/a.txt" }, fx.ws, p())).toBeNull();
+    expect(groupPathDenial("Read", { file_path: "/work-case-test/project/a.txt" }, fx.ws, p())).not.toBeNull();
+  });
+
+  it("a deny still matches whatever the case", () => {
+    expect(groupPathDenial("Read", { file_path: join(fx.ws, "SECRETS", "token.txt") }, fx.ws, p())).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The kernel
+// ---------------------------------------------------------------------------
+
+const sandboxRuns = process.platform === "darwin" && existsSync(SANDBOX_EXEC_PATH) && existsSync(SANDBOX_SHELL_PATH);
+
+function runWrapped(wrapped: string): { code: number; out: string } {
+  // HOME is the fixture's, so git and zsh look for their start-up files where
+  // the policy (built with the fixture's userHome) grants them.
+  const r = spawnSync("/bin/zsh", ["-lc", wrapped], { encoding: "utf8", cwd: fx.ws, env: { ...process.env, HOME: fx.userHome } });
+  return { code: r.status ?? -1, out: `${r.stdout}${r.stderr}` };
+}
+
+function run(command: string, p = policy()): { code: number; out: string } {
+  const wrapped = sandboxedBashCommand(command, p);
+  expect(wrapped).not.toBeNull();
+  return runWrapped(wrapped!);
+}
+
+const q = shellSingleQuote;
+
+describe.runIf(sandboxRuns)("group Bash under a real sandbox-exec", () => {
+  it.each([
+    ["the config file", CONFIG, "CONFIG-SECRET"],
+    ["the logs", LOG, "LOG-SECRET"],
+    ["Tomo's data", DATA, "DATA-SECRET"],
+    ["secrets/", SECRET, "TOKEN-SECRET"],
+    ["private memory", PRIVATE, "PRIVATE-SECRET"],
+    ["~/.ssh", SSH_KEY, "SSH-SECRET"],
+  ])("cannot read %s", (_what, file, marker) => {
+    const r = run(`cat ${q(file)}`);
+    expect(r.code).not.toBe(0);
+    expect(r.out).not.toContain(marker);
+  });
+
+  it("cannot list secrets/ or write the config file", () => {
+    expect(run(`ls ${q(join(fx.ws, "secrets"))}`).code).not.toBe(0);
+    expect(run(`echo '{"x":1}' > ${q(CONFIG)}`).code).not.toBe(0);
+    expect(readFileSync(CONFIG, "utf8")).toBe("CONFIG-SECRET\n");
+  });
+
+  it("reads and writes ordinary workspace files", () => {
+    const r = run(`cat ${q(PUBLIC)} && echo made > ${q(join(fx.ws, "made.txt"))} && cat ${q(join(fx.ws, "made.txt"))}`);
+    expect(r).toMatchObject({ code: 0 });
+    expect(r.out).toContain("PUBLIC");
+    expect(r.out).toContain("made");
+  });
+
+  it("cannot read outside the workspace until the group's entry grants it", () => {
+    expect(run(`cat ${q(EXTERNAL)}`).code).not.toBe(0);
+    const granted = run(`cat ${q(EXTERNAL)}`, policy({ extraRead: [fx.external] }));
+    expect(granted).toMatchObject({ code: 0 });
+    expect(granted.out).toContain("EXTERNAL");
+    // Read, not write.
+    expect(run(`echo x >> ${q(EXTERNAL)}`, policy({ extraRead: [fx.external] })).code).not.toBe(0);
+    expect(run(`echo x >> ${q(EXTERNAL)} && echo ok`, policy({ extraWrite: [fx.external] })).out).toContain("ok");
+  });
+
+  // REVERT-CATCHER. The permanent denies are emitted after every allow because
+  // SBPL applies the last matching rule. Move them first (or go back to
+  // `(allow default)`) and the workspace allow re-opens secrets/, and an extra
+  // over the home's Library re-opens the keychains.
+  it("keeps the permanent denies even when an allow covers them", () => {
+    const kcFile = join(KEYCHAINS, "marker.txt");
+    write(kcFile, "KEYCHAIN-SECRET\n");
+    const r = run(`cat ${q(SECRET)}; cat ${q(kcFile)}`, policy({ extraRead: [join(fx.userHome, "Library")] }));
+    expect(r.out).not.toContain("TOKEN-SECRET");
+    expect(r.out).not.toContain("KEYCHAIN-SECRET");
+  });
+
+  it("cannot write the scene or the workspace's .claude/", () => {
+    expect(run(`echo x > ${q(join(fx.ws, "home", "scene.json"))}`).code).not.toBe(0);
+    expect(run(`mkdir -p ${q(join(fx.ws, ".claude"))} && echo x > ${q(join(fx.ws, ".claude", "settings.json"))}`).code).not.toBe(0);
+  });
+
+  it("keeps the everyday toolchain working", () => {
+    const r = run([
+      "python3 -c 'print(40+2)'",
+      "git --version >/dev/null && echo git-ok",
+      "sqlite3 :memory: 'select 7*6'",
+    ].join(" && "));
+    expect(r).toMatchObject({ code: 0 });
+    expect(r.out).toContain("42");
+    expect(r.out).toContain("git-ok");
+  });
+
+  it("cannot read a file created in Tomo's home after the policy was built, at any depth", () => {
+    const p = policy();
+    const late = join(fx.tomoHome, "created-later", "deep", "late.txt");
+    write(late, "LATE-SECRET\n");
+    write(join(fx.tomoHome, "late-top.txt"), "LATE-TOP-SECRET\n");
+    const r = run(`cat ${q(late)}; cat ${q(join(fx.tomoHome, "late-top.txt"))}`, p);
+    expect(r.out).not.toContain("LATE-SECRET");
+    expect(r.out).not.toContain("LATE-TOP-SECRET");
+  });
+
+  // NETWORK, with listeners. A child process serves (spawnSync would block a
+  // server in this process); each case first proves the listener answers from
+  // outside the sandbox, then that the group shell cannot reach it.
+  describe("local listeners", () => {
+    // Short and in a granted dir (/tmp): a unix socket path is capped at 104
+    // bytes, and only the network rule should be what refuses the connection.
+    const sock = `/tmp/tomo-sbx-${process.pid}-${Date.now() % 100000}.sock`;
+    let server: ReturnType<typeof spawn> | undefined;
+    let port = 0;
+    beforeAll(async () => {
+      server = spawn(process.execPath, ["-e", `
+        const net = require("node:net");
+        const http = net.createServer((c) => c.end("HTTP/1.1 200 OK\\r\\nContent-Length: 4\\r\\nConnection: close\\r\\n\\r\\npong"));
+        http.listen(0, "127.0.0.1", () => {
+          net.createServer((c) => c.end("pong")).listen(process.argv[1], () => console.log(http.address().port));
+        });
+      `, sock], { stdio: ["ignore", "pipe", "inherit"] });
+      port = await new Promise<number>((resolve) => server!.stdout!.once("data", (d) => resolve(Number(String(d).trim()))));
+    });
+    afterAll(() => {
+      server?.kill();
+      rmSync(sock, { force: true });
+    });
+
+    const tcp = () => `curl -sS -m 3 http://127.0.0.1:${port}/ ; echo " rc=$?"`;
+    const unix = () => `/usr/bin/python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(9).decode())' ${q(sock)} 2>&1; echo " rc=$?"`;
+
+    it("localhost answers outside the sandbox (control)", () => {
+      expect(runWrapped(tcp()).out).toContain("pong");
+    });
+
+    it("localhost is refused from a group shell", () => {
+      const r = run(tcp());
+      expect(r.out).not.toContain("pong");
+      expect(r.out).not.toContain(" rc=0");
+    });
+
+    it("a unix socket answers outside the sandbox (control)", () => {
+      expect(runWrapped(unix()).out).toContain("pong");
+    });
+
+    it("a unix socket is refused from a group shell, though its file is in a granted dir", () => {
+      const r = run(unix());
+      expect(r.out).not.toContain("pong");
+      expect(r.out).not.toContain(" rc=0");
+    });
+  });
+
+  // ENVIRONMENT. The SDK process's env can carry credentials; a group shell
+  // gets an allowlist only.
+  it("drops every environment variable outside the allowlist", () => {
+    const env = { ...process.env, HOME: fx.userHome, TOMO_TEST_SECRET: "env-canary", ANTHROPIC_API_KEY: "sk-fake", SSH_AUTH_SOCK: "/fake/agent.sock" };
+    const plain = spawnSync("/bin/zsh", ["-lc", "env"], { encoding: "utf8", env });
+    // Control: the variables really are in the parent's environment.
+    expect(plain.stdout).toContain("TOMO_TEST_SECRET=env-canary");
+    const wrapped = sandboxedBashCommand("env", policy())!;
+    const r = spawnSync("/bin/zsh", ["-lc", wrapped], { encoding: "utf8", env, cwd: fx.ws });
+    expect(r.status).toBe(0);
+    for (const name of ["TOMO_TEST_SECRET", "ANTHROPIC_API_KEY", "SSH_AUTH_SOCK"]) expect(r.stdout).not.toContain(`${name}=`);
+    expect(r.stdout).not.toContain("env-canary");
+    // What a shell needs survives.
+    expect(r.stdout).toMatch(/^PATH=/m);
+    expect(r.stdout).toContain(`HOME=${fx.userHome}`);
+  });
+
+  // THE KEYCHAIN, with controls. A throwaway keychain file in the fixture's
+  // Library/Keychains, never added to the user's search list (every call names
+  // the file), deleted afterwards.
+  describe("the keychain", () => {
+    const kc = join(KEYCHAINS, "tomo-sandbox-test.keychain-db");
+    const SERVICE = "tomo-sandbox-test";
+    const find = `/usr/bin/security find-generic-password -s ${SERVICE} -a probe ${q(kc)} >/dev/null 2>&1; echo "rc=$?"`;
+    let made = false;
+    try {
+      execFileSync("/usr/bin/security", ["create-keychain", "-p", "test", kc], { stdio: "ignore" });
+      execFileSync("/usr/bin/security", ["add-generic-password", "-s", SERVICE, "-a", "probe", "-w", "value", kc], { stdio: "ignore" });
+      made = true;
+    } catch {
+      // No keychain tooling here: the cases below are skipped.
+    }
+    afterAll(() => {
+      if (made) spawnSync("/usr/bin/security", ["delete-keychain", kc], { stdio: "ignore" });
+    });
+
+    /** The real profile with the keychain dir moved from deny to read. */
+    function profileWithKeychainReadable(keepMachDeny: boolean): string {
+      const p = policy();
+      const resolve = (dirs: readonly string[]) => dirs.map((d) => resolvedDenyDir(d)!).filter(Boolean);
+      const text = sandboxProfileText({
+        readDirs: [...resolve(p.readDirs), resolvedDenyDir(KEYCHAINS)!],
+        readFiles: resolve(p.readFiles),
+        writeDirs: resolve(p.writeDirs),
+        denyDirs: resolve(p.denyDirs.filter((d) => d !== KEYCHAINS)),
+        denyPrefixes: p.denyPrefixes.map((x) => join(resolvedDenyDir(dirname(x))!, basename(x))),
+        writeDenyDirs: resolve(p.writeDenyDirs),
+      });
+      return keepMachDeny ? text : text.split("\n").filter((l) => !l.startsWith("(deny mach-lookup")).join("\n");
+    }
+
+    it.runIf(made)("is readable outside the sandbox (control)", () => {
+      expect(execFileSync("/bin/zsh", ["-c", find], { encoding: "utf8" })).toContain("rc=0");
+    });
+
+    it.runIf(made)("is not readable from a group shell", () => {
+      expect(run(find).out).not.toContain("rc=0");
+    });
+
+    it.runIf(made)("is readable when both locks are removed (control: the probe really works under sandbox-exec)", () => {
+      const wrapped = `${SANDBOX_EXEC_PATH} -p ${q(profileWithKeychainReadable(false))} ${SANDBOX_SHELL_PATH} -f -c -- ${q(find)}`;
+      expect(runWrapped(wrapped).out).toContain("rc=0");
+    });
+
+    it.runIf(made)("is still not readable with the files open, because of the mach deny alone", () => {
+      expect(SANDBOX_MACH_DENY).toContain("com.apple.SecurityServer");
+      const wrapped = `${SANDBOX_EXEC_PATH} -p ${q(profileWithKeychainReadable(true))} ${SANDBOX_SHELL_PATH} -f -c -- ${q(find)}`;
+      expect(runWrapped(wrapped).out).not.toContain("rc=0");
+    });
+  });
+
+  // The mach deny list must not cost the shell https. Skipped without network.
+  const online = spawnSync("/usr/bin/curl", ["-sS", "-m", "5", "-o", "/dev/null", "https://example.com"]).status === 0;
+  it.runIf(online)("keeps https working under the mach deny list (curl, git)", () => {
+    const r = run(`curl -sS -m 10 -o /dev/null -w '%{http_code}' https://example.com && echo && (cd /tmp && git ls-remote https://github.com/git/git HEAD >/dev/null) && echo git-net-ok`);
+    expect(r.out).toContain("200");
+    expect(r.out).toContain("git-net-ok");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The guard: Bash and the file tools on a group turn
+// ---------------------------------------------------------------------------
+
+type Result = { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string; updatedInput?: Record<string, unknown> } };
+type Hook = (input: { tool_name: string; tool_input: unknown }) => Promise<Result>;
+
+const GROUP = "group:test-1";
+function hook(entry?: { extraRead?: string[]; extraWrite?: string[]; unsandboxed?: boolean }): Hook {
+  const groups = entry ? { [GROUP]: { extraRead: entry.extraRead ?? [], extraWrite: entry.extraWrite ?? [], unsandboxed: entry.unsandboxed ?? false } } : {};
+  const hooks = privateMemoryGuardHooks(GROUP, () => "group-session", () => [], () => ({ groups })) as unknown as { PreToolUse: Array<{ hooks: Hook[] }> };
+  return hooks.PreToolUse[0].hooks[0];
+}
+const denied = (r: Result) => r.hookSpecificOutput?.permissionDecision === "deny";
+
+describe("file tools on a sandboxed group turn", () => {
+  it.each([
+    ["the config file", CONFIG],
+    ["the logs", LOG],
+    ["secrets/", SECRET],
+    ["private memory", PRIVATE],
+    ["a keychain", join(homedir(), "Library", "Keychains", "login.keychain-db")],
+    ["~/.ssh", join(homedir(), ".ssh", "id_ed25519")],
+    ["a file outside the workspace", EXTERNAL],
+  ])("Read of %s is denied", async (_what, file) => {
+    expect(denied(await hook()({ tool_name: "Read", tool_input: { file_path: file } }))).toBe(true);
+  });
+
+  it("Write and Edit of the config file are denied", async () => {
+    expect(denied(await hook()({ tool_name: "Write", tool_input: { file_path: CONFIG, content: "{}" } }))).toBe(true);
+    expect(denied(await hook()({ tool_name: "Edit", tool_input: { file_path: CONFIG, old_string: "a", new_string: "b" } }))).toBe(true);
+  });
+
+  it("Read and Write of an ordinary workspace file are allowed", async () => {
+    expect(await hook()({ tool_name: "Read", tool_input: { file_path: PUBLIC } })).toEqual({});
+    expect(await hook()({ tool_name: "Read", tool_input: { file_path: "memory/MEMORY.md" } })).toEqual({});
+    expect(await hook()({ tool_name: "Write", tool_input: { file_path: join(fx.ws, "notes.md"), content: "x" } })).toEqual({});
+  });
+
+  it("a symlink in the workspace pointing at the config file is judged by its target", async () => {
+    const link = join(fx.ws, "innocent.json");
+    symlinkSync(CONFIG, link);
+    expect(denied(await hook()({ tool_name: "Read", tool_input: { file_path: link } }))).toBe(true);
+  });
+
+  it("searches rooted outside the workspace, or above a permanent deny, are denied", async () => {
+    expect(denied(await hook()({ tool_name: "Grep", tool_input: { pattern: "x", path: fx.external } }))).toBe(true);
+    expect(denied(await hook()({ tool_name: "Glob", tool_input: { pattern: "*", path: fx.tomoHome } }))).toBe(true);
+    expect(denied(await hook()({ tool_name: "Glob", tool_input: { pattern: `${fx.tomoHome}/logs/*` } }))).toBe(true);
+    expect(await hook()({ tool_name: "Grep", tool_input: { pattern: "x", path: join(fx.ws, "notes"), glob: "*.md" } })).toEqual({});
+  });
+
+  it("an attachment outside what the group may read is refused", async () => {
+    const send = (path: string) => hook()({ tool_name: "mcp__tomo-internal__send_message", tool_input: { target: "owner", message: `here MEDIA:${path}` } });
+    expect(denied(await send(SECRET))).toBe(true);
+    expect(denied(await send(EXTERNAL))).toBe(true);
+    expect(await send(PUBLIC)).toEqual({});
+  });
+
+  it("the group's extras open the file tools exactly as they open the shell", async () => {
+    const h = hook({ extraRead: [fx.external] });
+    expect(await h({ tool_name: "Read", tool_input: { file_path: EXTERNAL } })).toEqual({});
+    expect(denied(await h({ tool_name: "Write", tool_input: { file_path: EXTERNAL, content: "x" } }))).toBe(true);
+    expect(await hook({ extraWrite: [fx.external] })({ tool_name: "Write", tool_input: { file_path: EXTERNAL, content: "x" } })).toEqual({});
+    // An extra never reaches a permanent deny.
+    expect(denied(await hook({ extraRead: [fx.tomoHome] })({ tool_name: "Read", tool_input: { file_path: CONFIG } }))).toBe(true);
+  });
+
+  it("groupPathDenial says nothing about tools without a path", () => {
+    expect(groupPathDenial("WebSearch", { query: "x" }, fx.ws, policy())).toBeNull();
+  });
+});
+
+describe("an unsandboxed group behaves as before", () => {
+  const h = hook({ unsandboxed: true });
+
+  it("Bash is not rewritten", async () => {
+    expect(await h({ tool_name: "Bash", tool_input: { command: `cat ${CONFIG}` } })).toEqual({});
+  });
+
+  it("file tools keep only the private-memory, data and home guards", async () => {
+    expect(await h({ tool_name: "Read", tool_input: { file_path: EXTERNAL } })).toEqual({});
+    expect(denied(await h({ tool_name: "Read", tool_input: { file_path: PRIVATE } }))).toBe(true);
+    expect(denied(await h({ tool_name: "Read", tool_input: { file_path: DATA } }))).toBe(true);
+  });
+});
+
+describe.runIf(sandboxRuns)("group Bash through the guard, executed", () => {
+  async function exec(command: string, entry?: { extraRead?: string[] }) {
+    const r = await hook(entry)({ tool_name: "Bash", tool_input: { command } });
+    const rewritten = r.hookSpecificOutput?.updatedInput?.command;
+    expect(typeof rewritten).toBe("string");
+    return runWrapped(rewritten as string);
+  }
+
+  it("cannot read the config, secrets or logs; can read the workspace", async () => {
+    for (const [file, marker] of [[CONFIG, "CONFIG-SECRET"], [SECRET, "TOKEN-SECRET"], [LOG, "LOG-SECRET"], [PRIVATE, "PRIVATE-SECRET"]] as const) {
+      const r = await exec(`cat ${q(file)}`);
+      expect(r.code, file).not.toBe(0);
+      expect(r.out).not.toContain(marker);
+    }
+    const ok = await exec(`cat ${q(PUBLIC)}`);
+    expect(ok).toMatchObject({ code: 0 });
+    expect(ok.out).toContain("PUBLIC");
+  });
+});
+
+// Keep the fixture honest: it must not sit inside a dir every group may reach.
+it("the fixture lies outside the temp dirs a group turn is granted", () => {
+  expect(fx.root.startsWith(realpathSync.native(tmpdir()))).toBe(false);
+  expect(fx.root.startsWith("/private/tmp")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// Outbound attachments: a group ships only what it may read
+// ---------------------------------------------------------------------------
+
+describe("attachments from a group turn", () => {
+  const outside = join(fx.userHome, ".aws", "credentials.png");
+  const inside = join(fx.ws, "notes", "cat.png");
+  write(outside, "AWS-SECRET\n");
+  write(inside, "PNG\n");
+  const barred = (path: string, entry?: { extraRead?: string[]; unsandboxed?: boolean }) => attachmentBarredFor(
+    path,
+    "group-session",
+    GROUP,
+    () => undefined,
+    () => ({ groups: entry ? { [GROUP]: { extraRead: entry.extraRead ?? [], extraWrite: [], unsandboxed: entry.unsandboxed ?? false } } : {} }),
+  );
+
+  it("drops a file outside the group's read policy, ships one inside it", () => {
+    expect(barred(outside)).toBe(true);
+    expect(barred(EXTERNAL)).toBe(true);
+    expect(barred(inside)).toBe(false);
+    expect(barred(SECRET)).toBe(true);
+    expect(barred(join(fx.tomoHome, "config.json.bak"))).toBe(true);
+  });
+
+  it("follows the group's extras, and an unsandboxed group keeps only the hard denies", () => {
+    expect(barred(EXTERNAL, { extraRead: [fx.external] })).toBe(false);
+    expect(barred(outside, { unsandboxed: true })).toBe(false);
+    expect(barred(PRIVATE, { unsandboxed: true })).toBe(true);
+  });
+
+  it("reply delivery uses it: the outside picture is dropped, the words still go", async () => {
+    const sent: Array<{ text?: string; photo?: string }> = [];
+    const channel = {
+      name: "telegram",
+      onMessage() {}, onCommand() {},
+      async send(m: { text?: string; photo?: string }) { sent.push(m); },
+      startTyping: () => () => {},
+      async start() {}, closeIngestion() {}, async quiesce() {}, async teardown() {}, async stop() {},
+    };
+    const pipeline = new DeliveryPipeline({ queuePendingErrorNote: () => {} });
+    const sender = pipeline.createBlockSender(channel as never, "-100", { blockPrivateMedia: () => true, attachmentBarred: (p) => barred(p) });
+    await sender.deliver(`here MEDIA:"${outside}" MEDIA:"${inside}"`);
+    expect(sent.filter((m) => m.photo).map((m) => m.photo)).toEqual([inside]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The owner's shell start-up files never run in a group shell
+// ---------------------------------------------------------------------------
+
+describe.runIf(sandboxRuns)("start-up files", () => {
+  write(join(fx.userHome, ".zshenv"), "export ZSHENV_LEAK=from-zshenv\n");
+  write(join(fx.userHome, ".zprofile"), "export ZPROFILE_LEAK=from-zprofile\n");
+
+  it("a login shell with that HOME would export them (control)", () => {
+    const r = spawnSync("/bin/zsh", ["-lc", "env"], { encoding: "utf8", env: { ...process.env, HOME: fx.userHome } });
+    expect(r.stdout).toContain("ZSHENV_LEAK=from-zshenv");
+    expect(r.stdout).toContain("ZPROFILE_LEAK=from-zprofile");
+  });
+
+  it("the group shell does not run them", () => {
+    const r = run("env");
+    expect(r.code).toBe(0);
+    expect(r.out).not.toContain("ZSHENV_LEAK");
+    expect(r.out).not.toContain("ZPROFILE_LEAK");
+  });
+
+  // Second lock, tested on its own: a HOME inside the workspace is readable,
+  // so only `zsh -f` keeps its start-up files from running.
+  it("does not run them even where they are readable", () => {
+    const readableHome = join(fx.ws, "notes", "fake-home");
+    write(join(readableHome, ".zshenv"), "export ZSHENV_LEAK=from-zshenv\n");
+    write(join(readableHome, ".zprofile"), "export ZPROFILE_LEAK=from-zprofile\n");
+    const wrapped = sandboxedBashCommand("env", policy())!;
+    const r = spawnSync("/bin/zsh", ["-lc", wrapped], { encoding: "utf8", cwd: fx.ws, env: { ...process.env, HOME: readableHome } });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain(`HOME=${readableHome}`);
+    expect(r.stdout).not.toContain("ZSHENV_LEAK");
+    expect(r.stdout).not.toContain("ZPROFILE_LEAK");
+  });
+
+  it("git still works without the owner's ~/.gitconfig", () => {
+    const r = run(`cd ${q(join(fx.ws, "notes"))} && git init -q repo && cd repo && git status --short && echo git-ok`);
+    expect(r).toMatchObject({ code: 0 });
+    expect(r.out).toContain("git-ok");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The workspace IS Tomo's home (TOMO_WORKSPACE pointed at it)
+// ---------------------------------------------------------------------------
+
+describe("workspace equal to Tomo's home", () => {
+  const home = join(fx.root, "ws-is-home");
+  const files: Record<string, string> = {
+    "config.json": "CFG",
+    "config.json.bak": "CFG-BAK",
+    "config.json.bak-manual": "CFG-BAK2",
+    "config.json.123.abcd.tmp": "CFG-TMP",
+    "web-token": "WEB-TOKEN",
+    "web-token.abcd.tmp": "WEB-TOKEN-TMP",
+    "web-access.log": "WEB-ACCESS",
+    "web-status.json": "WEB-STATUS",
+    "tomo.pid": "PID",
+    "logs/tomo.log": "LOGS",
+    "data/usage/x.ndjson": "DATA",
+    "secrets/k": "SECRETS",
+  };
+  for (const [rel, body] of Object.entries(files)) write(join(home, rel), `${body}-SECRET\n`);
+  write(join(home, "notes.md"), "NOTES\n");
+  const wsPolicy = () => groupPathPolicy({
+    workspaceDir: home,
+    privateDir: join(home, "memory", "private"),
+    homeSceneDir: join(home, "home"),
+    tomoHome: home,
+    dataDirs: [join(home, "data")],
+    userHome: fx.userHome,
+  });
+
+  it.each(Object.keys(files))("file tools cannot read %s", (rel) => {
+    expect(groupPathDenial("Read", { file_path: join(home, rel) }, home, wsPolicy())).not.toBeNull();
+  });
+
+  it("file tools read an ordinary file there", () => {
+    expect(groupPathDenial("Read", { file_path: join(home, "notes.md") }, home, wsPolicy())).toBeNull();
+  });
+
+  it.runIf(sandboxRuns)("the shell cannot read any of them, at any spelling, and reads the rest", () => {
+    const cmd = Object.keys(files).map((rel) => `cat ${q(join(home, rel))}`).join("; ");
+    const r = run(`${cmd}; cat ${q(join(home, "notes.md"))}`, wsPolicy());
+    for (const body of Object.values(files)) expect(r.out).not.toContain(`${body}-SECRET`);
+    expect(r.out).toContain("NOTES");
+    // A sibling created after the policy was built is covered by the prefix.
+    write(join(home, "config.json.later"), "LATER-SECRET\n");
+    expect(run(`cat ${q(join(home, "config.json.later"))}`, wsPolicy()).out).not.toContain("LATER-SECRET");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A protected entry that is itself a symlink
+// ---------------------------------------------------------------------------
+
+describe("a protected entry in Tomo's home that is a symlink", () => {
+  const home = join(fx.root, "linked-home");
+  const ws = join(home, "workspace");
+  const target = join(ws, "notes", "looks-harmless.json");
+  write(target, "LINKED-SECRET\n");
+  write(join(ws, "notes", "ok.md"), "OK\n");
+  symlinkSync(target, join(home, "config.json"));
+  const linkedPolicy = () => groupPathPolicy({
+    workspaceDir: ws,
+    privateDir: join(ws, "memory", "private"),
+    homeSceneDir: join(ws, "home"),
+    tomoHome: home,
+    dataDirs: [join(home, "data")],
+    userHome: fx.userHome,
+  });
+
+  it("denies the link's target too, for reads and writes", () => {
+    expect(linkedPolicy().denyDirs).toContain(target);
+    expect(groupPathDenial("Read", { file_path: target }, ws, linkedPolicy())).not.toBeNull();
+    expect(groupPathDenial("Write", { file_path: target, content: "x" }, ws, linkedPolicy())).not.toBeNull();
+    expect(groupPathDenial("Read", { file_path: join(ws, "notes", "ok.md") }, ws, linkedPolicy())).toBeNull();
+  });
+
+  it.runIf(sandboxRuns)("the shell can neither read nor write the target", () => {
+    const r = run(`cat ${q(target)}; cat ${q(join(home, "config.json"))}; echo x >> ${q(target)}; cat ${q(join(ws, "notes", "ok.md"))}`, linkedPolicy());
+    expect(r.out).not.toContain("LINKED-SECRET");
+    expect(r.out).toContain("OK");
+    expect(readFileSync(target, "utf8")).toBe("LINKED-SECRET\n");
+  });
+
+  it("a link whose target cannot be resolved fails closed: no file tools, no shell", () => {
+    const dangling = join(fx.root, "dangling-home");
+    mkdirSync(join(dangling, "workspace"), { recursive: true });
+    symlinkSync(join(dangling, "nowhere"), join(dangling, "web-token"));
+    const p = groupPathPolicy({
+      workspaceDir: join(dangling, "workspace"),
+      privateDir: join(dangling, "workspace", "memory", "private"),
+      homeSceneDir: join(dangling, "workspace", "home"),
+      tomoHome: dangling,
+      dataDirs: [],
+      userHome: fx.userHome,
+    });
+    expect(p.unresolvable).toContain("web-token");
+    expect(groupPathDenial("Read", { file_path: join(dangling, "workspace", "a.md") }, join(dangling, "workspace"), p)).toMatch(/cannot be established/);
+    expect(sandboxedBashCommand("ls", p)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Renaming an ancestor of a denied path
+// ---------------------------------------------------------------------------
+
+describe.runIf(sandboxRuns)("ancestors of denied paths", () => {
+  it("cannot rename memory/ (or the workspace) to walk private/ out from under its deny", () => {
+    const r = run(`cd ${q(fx.ws)}; mv memory moved; echo "mv rc=$?"; cat moved/private/note.txt; mv ${q(fx.ws)} ${q(join(fx.tomoHome, "ws-moved"))}; echo "mv ws rc=$?"`);
+    expect(r.out).toContain("mv rc=1");
+    expect(r.out).toContain("mv ws rc=1");
+    expect(r.out).not.toContain("PRIVATE-SECRET");
+    expect(existsSync(join(fx.ws, "memory", "private", "note.txt"))).toBe(true);
+    expect(run(`cat ${q(PRIVATE)}`).out).not.toContain("PRIVATE-SECRET");
+  });
+
+  it("still writes and creates the ancestors' other children", () => {
+    const r = run(`echo fine > ${q(join(fx.ws, "memory", "foo.md"))} && mkdir -p ${q(join(fx.ws, "memory", "sub"))} && cat ${q(join(fx.ws, "memory", "foo.md"))}`);
+    expect(r).toMatchObject({ code: 0 });
+    expect(r.out).toContain("fine");
+  });
+});
+
+describe("file tools and ancestors", () => {
+  it("Write cannot target a directory above a protected path", async () => {
+    expect(denied(await hook()({ tool_name: "Write", tool_input: { file_path: join(fx.ws, "memory"), content: "x" } }))).toBe(true);
+    expect(await hook()({ tool_name: "Write", tool_input: { file_path: join(fx.ws, "memory", "new.md"), content: "x" } })).toEqual({});
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Protected names in a different case
+// ---------------------------------------------------------------------------
+
+describe("protected entries whose name differs only in case", () => {
+  const home = join(fx.root, "case-home");
+  const target = join(home, "notes", "target.json");
+  write(join(home, "notes", "plain.md"), "PLAIN\n");
+  write(target, "CASE-LINK-SECRET\n");
+  write(join(home, "Config.json.upper"), "CASE-SECRET\n");
+  symlinkSync(target, join(home, "CONFIG.json.bak"));
+  // U+017F LATIN SMALL LETTER LONG S folds (NFKC) to "s": a Unicode-equivalent
+  // spelling of a protected prefix must be found too.
+  const unicodeTarget = join(home, "notes", "unicode-target.json");
+  write(unicodeTarget, "UNICODE-LINK-SECRET\n");
+  symlinkSync(unicodeTarget, join(home, "config.j\u017Fon.alt"));
+  const casePolicy = () => groupPathPolicy({
+    workspaceDir: home,
+    privateDir: join(home, "memory", "private"),
+    homeSceneDir: join(home, "home"),
+    tomoHome: home,
+    dataDirs: [],
+    userHome: fx.userHome,
+  });
+
+  it("are found and denied, links included", () => {
+    expect(casePolicy().denyDirs).toEqual(expect.arrayContaining([join(home, "Config.json.upper"), join(home, "CONFIG.json.bak"), target]));
+    for (const p of [join(home, "Config.json.upper"), target]) {
+      expect(groupPathDenial("Read", { file_path: p }, home, casePolicy()), p).not.toBeNull();
+    }
+    expect(groupPathDenial("Read", { file_path: join(home, "notes", "plain.md") }, home, casePolicy())).toBeNull();
+  });
+
+  it("include Unicode-equivalent spellings, whose link targets are denied", () => {
+    expect(casePolicy().denyDirs).toEqual(expect.arrayContaining([unicodeTarget]));
+    expect(groupPathDenial("Read", { file_path: unicodeTarget }, home, casePolicy())).not.toBeNull();
+  });
+
+  it.runIf(sandboxRuns)("are unreadable from the shell", () => {
+    const r = run(`cat ${q(join(home, "Config.json.upper"))}; cat ${q(target)}; cat ${q(join(home, "notes", "plain.md"))}`, casePolicy());
+    expect(r.out).not.toContain("CASE-SECRET");
+    expect(r.out).not.toContain("CASE-LINK-SECRET");
+    expect(r.out).toContain("PLAIN");
+  });
+});

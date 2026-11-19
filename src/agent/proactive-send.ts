@@ -40,6 +40,8 @@ export interface ProactiveSendDeps {
    *  session right now? `Agent.isPrivateMemoryBarred` — the same answer the
    *  PreToolUse guard and the reply pipeline use. */
   isPrivateMemoryBarred(sessionKey: string): boolean;
+  /** On a barred turn, must this attachment be dropped? (Agent.isAttachmentBarred.) */
+  isAttachmentBarred?(sessionKey: string, path: string): boolean;
   getSummonedIdentity(channelName: string, chatId: string): string | undefined;
   getReplyTarget(sessionKey: string): ReplyTarget | undefined;
   deriveReplyTargetFromConfig(identityName: string): ReplyTarget | undefined;
@@ -162,12 +164,15 @@ export class ProactiveSendService {
       ? isGroupSessionKey(sessionKey)
       : this.deps.isPrivateMemoryBarred(callerSessionKey);
     if (callerBarred) {
-      const privatePaths = [...mediaPaths, ...stickerIds].filter((p) => isPrivateAttachmentPath(p));
+      const barredPath = callerSessionKey !== undefined && this.deps.isAttachmentBarred
+        ? (p: string) => this.deps.isAttachmentBarred!(callerSessionKey, p)
+        : isPrivateAttachmentPath;
+      const privatePaths = [...mediaPaths, ...stickerIds].filter((p) => barredPath(p));
       if (privatePaths.length > 0) {
-        log.warn({ sessionKey, callerSessionKey, count: privatePaths.length }, "Direct send refused: attachment lands in memory/private/ and the calling turn may not read it");
+        log.warn({ sessionKey, callerSessionKey, count: privatePaths.length }, "Direct send refused: an attachment is one the calling turn may not read");
         return {
           ok: false,
-          error: `Not sent: ${privatePaths.length === 1 ? "an attachment names" : `${privatePaths.length} attachments name`} a file under \`memory/private/\`, which this turn's audience may not read. Nothing was delivered.`,
+          error: `Not sent: ${privatePaths.length === 1 ? "an attachment names" : `${privatePaths.length} attachments name`} a file this turn's audience may not read (under \`memory/private/\`, or outside what this group may read). Nothing was delivered.`,
         };
       }
     }

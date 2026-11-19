@@ -74,6 +74,7 @@ import { OwnerAdoption } from "./agent/owner-adoption.js";
 import { ContextNudger } from "./agent/context-nudger.js";
 import { RestartCoordinator } from "./agent/restart-coordinator.js";
 import { OwnerNotices } from "./agent/owner-notices.js";
+import { oauthLabel, type McpOAuthLabel } from "./mcp/status-merge.js";
 import { McpAuthPrompts } from "./agent/mcp-auth-prompts.js";
 
 export type { SendResult, SessionCatalog } from "./agent/proactive-send.js";
@@ -315,6 +316,8 @@ export class Agent {
         config.mcpServers ?? {},
         this.liveSessionManager.mountedExternalMcpServers(key),
       ),
+      readLiveMcpStatus: (key) => this.liveSessionManager.readMcpStatus(key),
+      reconnectMcpServer: (key, serverName) => this.liveSessionManager.reconnectMcpServer(key, serverName),
       startExternalMcpLogin: (serverName) => this.mcpOAuthManager.startLogin(
         serverName,
         config.mcpServers ?? {},
@@ -402,6 +405,7 @@ export class Agent {
           log.warn({ serverName, err }, "MCP token refresh after an auth error failed");
           return "failed" as const;
         }),
+      notifyOwner: (text) => this.notifyOwner(text),
     });
     this.proactive = new ProactiveSendService({
       getChannel: (name) => this.getChannel(name),
@@ -2527,6 +2531,23 @@ export class Agent {
   /** Read-only: SDK-reported MCP connection state of live sessions (web Study). */
   readMcpStatuses() {
     return this.liveSessionManager.readMcpStatuses();
+  }
+
+  /**
+   * Tomo's own OAuth state of the configured external servers (no secrets,
+   * no error text), for the web Study to show beside the SDK's live state.
+   */
+  mcpOAuthStates(): Array<{ name: string; oauth: McpOAuthLabel }> {
+    return this.mcpOAuthManager.getServerStatuses(config.mcpServers ?? {}, new Set())
+      .filter((status) => status.oauth)
+      .map((status) => ({ name: status.name, oauth: oauthLabel(status) }));
+  }
+
+  /** An explicit reconnect of one MCP server on the owner's live session (web Study). */
+  reconnectOwnerMcpServer(serverName: string): Promise<"reconnected" | "failed" | "busy" | "no-live-session"> {
+    const key = this.router.ownerSessionKey();
+    if (!key) return Promise.resolve("no-live-session");
+    return this.liveSessionManager.reconnectMcpServer(key, serverName);
   }
 
   watchOverview(): { channels: string[]; sessions: WatchSessionInfo[] } {

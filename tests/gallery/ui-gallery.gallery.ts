@@ -151,6 +151,12 @@ function seedWorkspace(store: SessionStore): string {
   mkdirSync(resolve(mem, "topics"), { recursive: true });
   writeFileSync(resolve(mem, "MEMORY.md"), "# Memory\n\n- Prefers mornings\n- [Garden](topics/garden.md)\n");
   writeFileSync(resolve(mem, "topics", "garden.md"), "# Garden\n\nThree raised beds.\n");
+  // External MCP servers for the Study's MCP page (synthetic; their live state is the supervisor fixture below).
+  writeFileSync(resolve(mockConfig.tomoHome, "config.json"), JSON.stringify({ mcpServers: {
+    docs: { type: "http", url: "https://docs.example/mcp", headers: { Authorization: "Bearer synthetic" } },
+    calendar: { type: "http", url: "https://calendar.example/mcp", oauth: { clientId: "synthetic" } },
+    notes: { command: "notes-mcp", args: ["--stdio"], timeout: 30 },
+  } }));
 
   // The Study's Todos tab: one item per section, one due, one out of snoozes, one of a group, and a short done log.
   const todos = new TodoStore(resolve(mockConfig.tomoHome, "data", "todos"), DEFAULT_TODOS);
@@ -315,7 +321,12 @@ async function boot(options: { conversation: boolean }): Promise<void> {
     outgoingMedia: new OutgoingMediaStore(outgoingImagesDir(mockConfig.workspaceDir), { isPrivate: (path) => path.includes("/memory/private/") }),
     uploads: { dir: uploadsDir(mockConfig.tomoHome), workspaceDir: mockConfig.workspaceDir },
   });
-  supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0, cronStorePath });
+  supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0, cronStorePath,
+    // What the owner's live session reports: one failed, one waiting on sign-in, the in-process server fine.
+    mcpStatus: async () => [{ key: "dm:owner", connections: [{ name: "docs", status: "failed" }, { name: "calendar", status: "needs-auth" },
+      { name: "notes", status: "connected" }, { name: "tomo-internal", status: "connected" }] }],
+    mcpOAuth: () => [{ name: "calendar", oauth: "login-required" }],
+    mcpReconnect: async () => "reconnected" });
   channel.attach(supervisor); theAgent.addChannel(channel); theAgent.addChannel(new MockChannel("telegram"));
   theHome.attachWeb({ publish: (event) => channel.events.publish(event), available: () => supervisor.status().state === "running", mayShowTask: (key) => channel.mayShowTask(key) });
   await channel.start();

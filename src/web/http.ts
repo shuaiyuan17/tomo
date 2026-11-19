@@ -10,8 +10,8 @@ import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
 import { CompressedAssets, IMMUTABLE_CACHE, pickEncoding } from "./static-assets.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
-import { credentialSubmitSchema, permissionDecisionSchema, permissionRevokeSchema, cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
-  type EventEnvelope, type Rpc, type TaskAction, type WebCompaction, type WebHome, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
+import { credentialSubmitSchema, permissionDecisionSchema, permissionRevokeSchema, cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, mcpReconnectSchema, messageInputSchema, modelChangeSchema, WebError,
+  type EventEnvelope, type Rpc, type TaskAction, type WebCompaction, type WebHome, type WebMcpLive, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
 import { homeSceneSchema } from "../home/scene.js";
 import { decodeSnapshotPng } from "../home/snapshot.js";
 
@@ -135,8 +135,8 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         if (url.pathname === "/api/v1/mcp") {
           const saved = await required(deps.data.config).mcp();
           // Live health is whatever the SDK reports; unreachable is "unknown", never healthy.
-          const live = await deps.rpc({ method: "mcp-status" }).then((sessions) => ({ available: true, sessions: sessions as WebMcpLiveSession[] }),
-            () => ({ available: false, sessions: [] }));
+          const live = await deps.rpc({ method: "mcp-status" }).then((value) => ({ available: true, ...value as WebMcpLive }),
+            () => ({ available: false, sessions: [], oauth: [] }));
           json(res, 200, { ...saved, live });
           return;
         }
@@ -271,6 +271,19 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         if (!ownerId) throw new WebError(409, "owner_setup_required");
         if (parsed.data.sessionId !== ownerId) throw new WebError(403, "owner_dm_only");
         json(res, 200, await deps.rpc({ method: "model-switch", epoch, sessionId: parsed.data.sessionId, model: parsed.data.model, from: parsed.data.from }));
+        return;
+      } else if (req.method === "POST" && url.pathname === "/api/v1/mcp/reconnect") {
+        // Reconnect one MCP server on the owner conversation's live session.
+        // The gate of every write: exact Origin (checkRequest), cookie, CSRF,
+        // JSON, the current daemon epoch, a configured owner.
+        csrf.verify(req, session!);
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || epoch !== await deps.rpc({ method: "epoch" })) throw new WebError(409, "epoch_changed");
+        const { ownerId } = deps.data.catalog();
+        if (!ownerId) throw new WebError(409, "owner_setup_required");
+        const parsed = mcpReconnectSchema.safeParse(await body(req));
+        if (!parsed.success) throw new WebError(400, "invalid_mcp_reconnect");
+        json(res, 200, await deps.rpc({ method: "mcp-reconnect", epoch, server: parsed.data.server }));
         return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/home/snapshot") {
         // A picture of the room for Tomo: exact Origin, cookie, CSRF, the

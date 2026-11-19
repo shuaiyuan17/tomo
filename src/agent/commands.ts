@@ -24,6 +24,7 @@ import { shortErrorMessage } from "../error-text.js";
 import { formatTomoEvent } from "../tomo-event.js";
 import { PetStore } from "../mcp/pet-store.js";
 import type { ExternalMcpServerStatus, McpLoginStart } from "../mcp/oauth.js";
+import { mergeMcpStatus, type McpLiveRead, type MergedMcpStatus } from "../mcp/status-merge.js";
 import { ClaudeLoginManager } from "./claude-login.js";
 import { buildUsageReport } from "./usage.js";
 import { limitsLogFor } from "../usage/limits-log.js";
@@ -65,6 +66,10 @@ export interface ChatCommandDeps {
   queuePendingNote(sessionKey: string, note: string): void;
   getExternalMcpStatuses(sessionKey: string): ExternalMcpServerStatus[];
   startExternalMcpLogin(serverName: string): Promise<McpLoginStart>;
+  /** The key's SDK-reported MCP connections: undefined with no live session, null when it did not answer. */
+  readLiveMcpStatus(sessionKey: string): Promise<McpLiveRead>;
+  /** Reconnect one MCP server on the key's live session (never creates one). */
+  reconnectMcpServer(sessionKey: string, serverName: string): Promise<"reconnected" | "failed" | "busy" | "no-live-session">;
   /** One session's tasks from the web Tasks panel's board (`TaskBoard.listFor`);
    *  undefined when there is no board (web UI off). */
   listTasks(sessionKey: string, since: number): SessionTaskList | undefined;
@@ -693,23 +698,36 @@ export class ChatCommandHandler {
     }
 
     const arg = args?.trim() ?? "";
+    const sessionKey = dmSessionKeyForIdentity(identity.name);
     if (!arg) {
-      const sessionKey = dmSessionKeyForIdentity(identity.name);
-      const statuses = this.deps.getExternalMcpStatuses(sessionKey);
-      if (statuses.length === 0) {
-        await channel.send({ chatId, text: "🔌 No external MCP servers are configured." });
+      const live = await this.deps.readLiveMcpStatus(sessionKey);
+      const rows = mergeMcpStatus(live, this.deps.getExternalMcpStatuses(sessionKey));
+      if (rows.length === 0) {
+        await channel.send({ chatId, text: live === undefined
+          ? "🔌 No external MCP servers are configured, and there is no live session to report the built-in ones."
+          : "🔌 No MCP servers are configured or reported by this session." });
         return;
       }
-      await channel.send({
-        chatId,
-        text: ["🔌 External MCP servers", "", ...statuses.map(formatExternalMcpStatus)].join("\n"),
-      });
+      const header = live === undefined ? "🔌 MCP servers — no live session (connection state appears once a conversation starts)"
+        : live === null ? "🔌 MCP servers — the live session did not report its connection state"
+        : "🔌 MCP servers (live session)";
+      await channel.send({ chatId, text: [header, "", ...rows.map(formatMergedMcpStatus)].join("\n") });
+      return;
+    }
+
+    const reconnect = /^reconnect\s+(\S+)$/i.exec(arg);
+    if (reconnect) {
+      const outcome = await this.deps.reconnectMcpServer(sessionKey, reconnect[1]);
+      await channel.send({ chatId, text: outcome === "reconnected" ? `🔌 Reconnected "${reconnect[1]}".`
+        : outcome === "no-live-session" ? "⚠️ There is no live session to reconnect in; a new conversation connects every server afresh."
+        : outcome === "busy" ? "⚠️ A reply is in progress; try again once it has finished."
+        : `⚠️ Reconnecting "${reconnect[1]}" failed. The log has the reason; /new starts a fresh session.` });
       return;
     }
 
     const match = /^login\s+(\S+)$/i.exec(arg);
     if (!match) {
-      await channel.send({ chatId, text: "⚠️ Usage: /mcp or /mcp login <server>" });
+      await channel.send({ chatId, text: "⚠️ Usage: /mcp, /mcp login <server> or /mcp reconnect <server>" });
       return;
     }
 
@@ -780,23 +798,28 @@ export class ChatCommandHandler {
   }
 }
 
-function formatExternalMcpStatus(status: ExternalMcpServerStatus): string {
-  const expiry = status.expiresAt !== undefined ? new Date(status.expiresAt).toLocaleString() : undefined;
-  const lastError = status.lastError ? ` · last error: ${status.lastError}` : "";
-  if (status.state === "auth-pending") {
-    return `• ${status.name} — auth pending since ${new Date(status.startedAt ?? Date.now()).toLocaleString()}`;
-  }
-  if (status.state === "auth-failed") {
-    const when = status.lastErrorAt !== undefined ? ` at ${new Date(status.lastErrorAt).toLocaleString()}` : "";
-    return `• ${status.name} — auth failed${when}: ${status.lastError ?? "login required"}`;
-  }
-  if (status.state === "connected") {
-    const token = status.oauth ? (expiry ? ` · token valid until ${expiry}` : " · OAuth token has no expiry") : " · no OAuth";
-    return `• ${status.name} — connected${token}${lastError}`;
-  }
-  if (status.authRequired) {
-    return `• ${status.name} — not mounted · login required (/mcp login ${status.name})${lastError}`;
-  }
-  const token = status.oauth ? (expiry ? ` · token valid until ${expiry}` : " · OAuth token ready") : "";
-  return `• ${status.name} — not mounted in this session${token}${lastError}`;
+const LIVE_LABEL: Record<MergedMcpStatus["live"], string> = {
+  connected: "connected",
+  failed: "failed",
+  "needs-auth": "needs sign-in",
+  pending: "connecting",
+  disabled: "disabled",
+  "no-live-session": "no live session",
+  unknown: "status unknown",
+  "not-reported": "not loaded in this session",
+};
+
+function formatMergedMcpStatus(row: MergedMcpStatus): string {
+  const parts = [LIVE_LABEL[row.live]];
+  if (row.oauth) {
+    const expiry = row.oauth.expiresAt !== undefined ? new Date(row.oauth.expiresAt).toLocaleString() : undefined;
+    if (row.oauth.state === "ready") parts.push(expiry ? `token valid until ${expiry}` : "OAuth token ready");
+    else if (row.oauth.state === "auth-pending") parts.push("sign-in pending");
+    else if (row.oauth.state === "auth-failed") parts.push(`auth failed${row.oauth.lastError ? `: ${row.oauth.lastError}` : ""}`);
+    else parts.push("login required");
+  } else if (row.configured) parts.push("no OAuth");
+  else parts.push("session-provided");
+  if (row.action === "login") parts.push(row.configured ? `/mcp login ${row.name}` : "sign-in required");
+  if (row.action === "reconnect") parts.push(`/mcp reconnect ${row.name}`);
+  return `• ${row.name} — ${parts.join(" · ")}`;
 }

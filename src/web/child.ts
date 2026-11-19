@@ -2,7 +2,7 @@ import { WebData, type WebDataOptions } from "./data.js";
 import { sweepUploads, uploadsDir } from "./uploads.js";
 import { startWebHttp } from "./http.js";
 import { macScreenSource, ScreenLoop } from "./screen.js";
-import { USAGE_RPC_TIMEOUT_MS, WebError, type EventEnvelope, type Rpc } from "./protocol.js";
+import { MCP_RECONNECT_RPC_TIMEOUT_MS, USAGE_RPC_TIMEOUT_MS, WebError, type EventEnvelope, type Rpc } from "./protocol.js";
 import { loadWebToken, writeWebAccessLinks } from "./token-store.js";
 import { setUnreadableReporter } from "./sdk-transcript.js";
 
@@ -71,7 +71,7 @@ process.on("message", (value: Message) => {
         const id = ++sequence;
         // Usage may wait on the claude.ai endpoint; the daemon answers it within
         // its own deadline, and this stays under the HTTP socket timeout.
-        const timer = setTimeout(() => { pending.delete(id); reject(new WebError(503, "daemon_timeout")); }, input.method === "usage" ? USAGE_RPC_TIMEOUT_MS : 5_000);
+        const timer = setTimeout(() => { pending.delete(id); reject(new WebError(503, "daemon_timeout")); }, input.method === "usage" ? USAGE_RPC_TIMEOUT_MS : input.method === "mcp-reconnect" ? MCP_RECONNECT_RPC_TIMEOUT_MS : 5_000);
         pending.set(id, { resolve, reject, timer });
         try { send({ type: "rpc", id, input }); }
         catch (err) { clearTimeout(timer); pending.delete(id); reject(err); }

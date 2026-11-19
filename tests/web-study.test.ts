@@ -408,12 +408,19 @@ describe("Study HTTP", () => {
   let boot: WebBootstrap;
   let base: string;
   const token = "tomo_web_" + "c".repeat(64);
+  let reconnects: string[] = [];
+  const reconnect = async (body: unknown, headers: Record<string, string> = {}) => {
+    const response = await fetch(base + "/api/v1/mcp/reconnect", { method: "POST", body: JSON.stringify(body), headers: { "x-tomo-request": "1", "sec-fetch-site": "same-origin", cookie,
+      origin: base, "content-type": "application/json", "x-tomo-csrf": boot.csrfToken, "x-tomo-epoch": boot.epoch, ...headers } });
+    return { status: response.status, value: await response.json() as Record<string, unknown> };
+  };
   const call = async (path: string, headers: Record<string, string> = {}) => {
     const response = await fetch(base + "/api/v1" + path, { headers: { "x-tomo-request": "1", "sec-fetch-site": "same-origin", cookie, ...headers } });
     return { status: response.status, value: await response.json() as Record<string, unknown>, text: "" };
   };
   beforeEach(async () => {
     cookie = "";
+    reconnects = [];
     writeFileSync(join(root, "memory", "TODO.md"), "- [ ] LEGACY-MARKDOWN task");
     seedTodos(join(root, "data", "todos"));
     mkdirSync(join(root, "memory", "private"));
@@ -430,8 +437,10 @@ describe("Study HTTP", () => {
     service = await startWebHttp(0, { accessToken: token, assetsDir: root, data,
       subscribe: (fn) => channel.events.subscribe(fn), rpc: async (rpc) => {
         if (rpc.method === "snapshot") return { snapshot: channel.snapshot(), replay: null };
-        if (rpc.method === "mcp-status") return [{ sessionId: boot.ownerId, connections: [{ name: "search", status: "connected" }] }];
+        if (rpc.method === "mcp-status") return { sessions: [{ sessionId: boot.ownerId, connections: [{ name: "search", status: "connected" }] }], oauth: [{ name: "search", oauth: "login-required" }] };
         if (rpc.method === "context-events") return channel.contextEvents(rpc.sessionId);
+        if (rpc.method === "epoch") return channel.events.epoch;
+        if (rpc.method === "mcp-reconnect") { reconnects.push(rpc.server); return { outcome: "reconnected" }; }
         throw new Error("unexpected rpc");
       } });
     base = `http://127.0.0.1:${service.port}`;
@@ -447,6 +456,19 @@ describe("Study HTTP", () => {
       expect((await call(path, { "x-tomo-request": "" })).status, path).toBe(403);
       expect((await call(path)).status, path).toBe(200);
     }
+  });
+
+  it("reconnects an MCP server only behind the write gate: origin, cookie, CSRF, JSON, the current epoch", async () => {
+    expect((await reconnect({ server: "search" }, { cookie: "" })).status).toBe(401);
+    expect((await reconnect({ server: "search" }, { origin: "http://127.0.0.1:1" })).status).toBe(403);
+    expect((await reconnect({ server: "search" }, { "x-tomo-csrf": "bad" })).value).toEqual({ error: "invalid_csrf" });
+    expect((await reconnect({ server: "search" }, { "content-type": "text/plain" })).status).toBe(415);
+    expect((await reconnect({ server: "search" }, { "x-tomo-epoch": "00000000-0000-4000-8000-000000000000" })).value).toEqual({ error: "epoch_changed" });
+    expect((await reconnect({ server: "../etc" })).value).toEqual({ error: "invalid_mcp_reconnect" });
+    expect((await reconnect({ server: "search", extra: 1 })).value).toEqual({ error: "invalid_mcp_reconnect" });
+    expect(reconnects).toEqual([]);
+    expect(await reconnect({ server: "search" })).toEqual({ status: 200, value: { outcome: "reconnected" } });
+    expect(reconnects).toEqual(["search"]);
   });
 
   it("serves real workspace data and never private memory or secrets", async () => {
@@ -466,7 +488,8 @@ describe("Study HTTP", () => {
     expect(everything).not.toContain("sk-synthetic-secret-value-01");
     expect(await call("/memory/file?path=private%2Fnote.md")).toMatchObject({ status: 404, value: { error: "memory_not_found" } });
     expect((await call("/memory/file?path=..%2Fconfig.json")).status).toBe(400);
-    expect((await call("/mcp")).value.live).toEqual({ available: true, sessions: [{ sessionId: boot.ownerId, connections: [{ name: "search", status: "connected" }] }] });
+    expect((await call("/mcp")).value.live).toEqual({ available: true, sessions: [{ sessionId: boot.ownerId, connections: [{ name: "search", status: "connected" }] }],
+      oauth: [{ name: "search", oauth: "login-required" }] });
   });
 
   it("serves the todo store: open items, the done log newest first, and the limits in force", async () => {

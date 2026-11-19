@@ -186,6 +186,8 @@ export interface WebUsage {
  * rather than a dropped connection.
  */
 export const USAGE_RPC_TIMEOUT_MS = 24_000;
+/** An MCP reconnect waits on the SDK (the daemon gives up at 20s); under the HTTP socket timeout too. */
+export const MCP_RECONNECT_RPC_TIMEOUT_MS = 24_000;
 /**
  * `GET /api/v1/cost?from&to`: the Study Cost page, from the usage ledger
  * (`~/.tomo/data/usage/YYYY-MM.ndjson`). Every dollar figure is the SDK's
@@ -477,7 +479,15 @@ export interface WebConfigView { missing: boolean; modifiedAt: number | null; fi
 export type McpConnectionState = "connected" | "failed" | "needs-auth" | "pending" | "disabled";
 export interface WebMcpServer { name: string; enabled: boolean; type: string; oauth: boolean; timeout: number | null; alwaysLoad: boolean; configured: string[] }
 export interface WebMcpLiveSession { sessionId: string; connections: Array<{ name: string; status: McpConnectionState }> | null }
-export interface WebMcpView { missing: boolean; servers: WebMcpServer[]; live: { available: boolean; sessions: WebMcpLiveSession[] } }
+/** Tomo's own OAuth state of a configured server (no token, no error text). */
+export type WebMcpOAuthState = "ready" | "login-required" | "auth-pending" | "auth-failed";
+/** Daemon answer to the `mcp-status` RPC. */
+export interface WebMcpLive { sessions: WebMcpLiveSession[]; oauth: Array<{ name: string; oauth: WebMcpOAuthState }> }
+export interface WebMcpView { missing: boolean; servers: WebMcpServer[]; live: { available: boolean } & WebMcpLive }
+/** The owner pressed Reconnect on one server (POST /api/v1/mcp/reconnect). */
+export const mcpReconnectSchema = z.object({ server: z.string().regex(/^[A-Za-z0-9._-]{1,128}$/) }).strict();
+/** Its answer: what the owner's live session made of it. */
+export interface WebMcpReconnectResult { outcome: "reconnected" | "failed" | "no-live-session" }
 /** One model the Study's Model page offers: an alias target, with every alias naming it. */
 export interface WebModelOption { id: string; label: string; aliases: string[] }
 /** The model of one browser session, and what it can be switched to (GET /models?session=). */
@@ -523,6 +533,8 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("snapshot"), cursor: z.string().max(128).optional() }).strict(),
   /** SDK-reported MCP connection state of live sessions (bounded; never probes). */
   z.object({ method: z.literal("mcp-status") }).strict(),
+  /** Reconnect one MCP server on the owner conversation's live session. */
+  z.object({ method: z.literal("mcp-reconnect"), epoch: z.uuid(), server: z.string().regex(/^[A-Za-z0-9._-]{1,128}$/) }).strict(),
   /** Compactions of one browser session seen on the watch bus. */
   z.object({ method: z.literal("context-events"), sessionId: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict(),
   z.object({ method: z.literal("usage"), refresh: z.boolean() }).strict(),

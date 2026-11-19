@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { WebChannel, WebLifecycle } from "../channels/web.js";
 import type { WebDataOptions } from "./data.js";
 import type { McpConnection } from "../mcp/live-status.js";
-import { MAX_BUFFER_BYTES, rpcSchema, WebError } from "./protocol.js";
+import { MAX_BUFFER_BYTES, rpcSchema, WebError, type WebMcpLive, type WebMcpReconnectResult } from "./protocol.js";
 import { validAccessToken } from "./access.js";
 import { describeUnreadable } from "./sdk-transcript.js";
 import { writeWebStatus, type WebState, type WebStatusRecord } from "./status-file.js";
@@ -22,6 +22,10 @@ export interface WebSupervisorOptions extends WebDataOptions {
   assetsDir?: string;
   /** SDK-reported MCP connection state of live sessions, per daemon key. */
   mcpStatus?: () => Promise<Array<{ key: string; connections: McpConnection[] | null }>>;
+  /** Tomo's own OAuth state of the configured external servers (no secrets). */
+  mcpOAuth?: () => WebMcpLive["oauth"];
+  /** Reconnect one MCP server on the owner conversation's live session. */
+  mcpReconnect?: (server: string) => Promise<WebMcpReconnectResult["outcome"] | "busy">;
   diagnostic?: (message: string, level?: DiagnosticLevel) => void;
 }
 /** Internal timing/entry overrides allow real-process failure tests without
@@ -258,10 +262,24 @@ export class WebSupervisor implements WebLifecycle {
           if (input.method === "context-events") return this.channel.contextEvents(input.sessionId);
           if (input.method === "mcp-status") {
             const live = await this.options.mcpStatus?.() ?? [];
-            return live.flatMap((entry) => {
-              const sessionId = this.channel.sessionIdFor(entry.key);
-              return sessionId ? [{ sessionId, connections: entry.connections }] : [];
-            });
+            const result: WebMcpLive = {
+              sessions: live.flatMap((entry) => {
+                const sessionId = this.channel.sessionIdFor(entry.key);
+                return sessionId ? [{ sessionId, connections: entry.connections }] : [];
+              }),
+              oauth: this.options.mcpOAuth?.() ?? [],
+            };
+            return result;
+          }
+          if (input.method === "mcp-reconnect") {
+            if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
+            if (!this.channel.ownerId) throw new WebError(409, "owner_setup_required");
+            if (!this.options.mcpReconnect) throw new WebError(503, "service_unavailable");
+            const outcome = await this.options.mcpReconnect(input.server);
+            // Never under a running turn: the owner retries after the reply.
+            if (outcome === "busy") throw new WebError(409, "session_busy");
+            const result: WebMcpReconnectResult = { outcome };
+            return result;
           }
           if (input.method === "usage") return this.channel.usage(input.refresh);
           if (input.method === "stop") {

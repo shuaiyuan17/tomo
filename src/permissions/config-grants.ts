@@ -3,7 +3,8 @@ import { dirname } from "node:path";
 import { withConfigLockSync } from "../config-file.js";
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
-import type { GroupSandboxConfig, GroupSandboxEntry } from "../agent/group-fs-policy.js";
+import { randomInt } from "node:crypto";
+import type { GroupGrantRecord, GroupSandboxConfig, GroupSandboxEntry } from "../agent/group-fs-policy.js";
 import type { PermissionAccess } from "./broker.js";
 
 /**
@@ -61,8 +62,46 @@ function update(target: GrantTarget, edit: (groups: Record<string, RawEntry>, le
   }
 }
 
-/** Add `path` to the group's `extraRead` (read) or `extraWrite` (write). */
-export function persistGroupGrant(groupKey: string, access: PermissionAccess, path: string, target: GrantTarget): boolean {
+/** Grant id alphabet: no I/O/0/1. `G-` plus six of these. */
+const GRANT_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+export const GRANT_ID_RE = /^G-[A-HJ-NP-Z2-9]{6}$/;
+
+/** A grant id not used by any group in `config` (or in the file, checked again under the lock). */
+export function newGrantId(config: GroupSandboxConfig): string {
+  const taken = new Set(Object.values(config.groups).flatMap((e) => Object.keys(e.grants ?? {})));
+  for (;;) {
+    let id = "G-";
+    for (let i = 0; i < 6; i++) id += GRANT_ALPHABET[randomInt(GRANT_ALPHABET.length)];
+    if (!taken.has(id)) return id;
+  }
+}
+
+/** The grant with this id, wherever it is. */
+export function findGrant(config: GroupSandboxConfig, grantId: string): { groupKey: string; grant: GroupGrantRecord } | undefined {
+  for (const [groupKey, entry] of Object.entries(config.groups)) {
+    const grant = entry.grants?.[grantId];
+    if (grant) return { groupKey, grant };
+  }
+  return undefined;
+}
+
+/** The grant a request made, if it is in config (a crash between the config write and the ledger leaves only this). */
+export function grantForRequest(config: GroupSandboxConfig, requestId: string): { groupKey: string; grantId: string; grant: GroupGrantRecord } | undefined {
+  for (const [groupKey, entry] of Object.entries(config.groups)) {
+    for (const [grantId, grant] of Object.entries(entry.grants ?? {})) {
+      if (grant.requestId === requestId) return { groupKey, grantId, grant };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Add `path` to the group's `extraRead` (read) or `extraWrite` (write), with a
+ * grant record under `grantId` saying which request made it. The record is
+ * written in the same atomic write as the path, so the two cannot disagree.
+ */
+export function persistGroupGrant(groupKey: string, access: PermissionAccess, path: string, target: GrantTarget,
+  grant?: { id: string; requestId?: string; at?: string }): boolean {
   return update(target, (groups, legacy) => {
     const entry = groups[groupKey] ??= { extraRead: [], extraWrite: [], unsandboxed: legacy.includes(groupKey) };
     const field = access === "write" ? "extraWrite" : "extraRead";
@@ -71,13 +110,21 @@ export function persistGroupGrant(groupKey: string, access: PermissionAccess, pa
     if (!Array.isArray(entry.extraRead)) entry.extraRead = [];
     if (!Array.isArray(entry.extraWrite)) entry.extraWrite = [];
     if (typeof entry.unsandboxed !== "boolean") entry.unsandboxed = false;
-    if (list.includes(path)) return false;
-    list.push(path);
-    return true;
+    let changed = false;
+    if (!list.includes(path)) { list.push(path); changed = true; }
+    if (grant) {
+      const records = (entry.grants && typeof entry.grants === "object" ? entry.grants : {}) as Record<string, GroupGrantRecord>;
+      if (!records[grant.id]) {
+        records[grant.id] = { path, access, ...(grant.requestId ? { requestId: grant.requestId } : {}), ...(grant.at ? { at: grant.at } : {}) };
+        entry.grants = records;
+        changed = true;
+      }
+    }
+    return changed;
   });
 }
 
-/** Remove `path` from the group's `extraRead` and `extraWrite`. */
+/** Remove `path` from the group's `extraRead` and `extraWrite`, and the grant records for it. */
 export function revokeGroupGrant(groupKey: string, path: string, target: GrantTarget): boolean {
   return update(target, (groups) => {
     const entry = groups[groupKey];
@@ -88,6 +135,12 @@ export function revokeGroupGrant(groupKey: string, path: string, target: GrantTa
       if (!Array.isArray(list) || !list.includes(path)) continue;
       entry[field] = list.filter((p) => p !== path);
       changed = true;
+    }
+    if (entry.grants && typeof entry.grants === "object") {
+      const records = entry.grants as Record<string, GroupGrantRecord>;
+      for (const [id, g] of Object.entries(records)) {
+        if (g?.path === path) { delete records[id]; changed = true; }
+      }
     }
     return changed;
   });

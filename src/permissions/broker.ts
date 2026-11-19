@@ -36,7 +36,7 @@ import { scrubKnownSecrets } from "../credentials/redactor.js";
  * One open request per group. Pending requests live in memory; on the next
  * start {@link PermissionBroker.reconcileAfterRestart} records each one the
  * ledger shows as never ended as denied (restart) and tells its session.
- * Revocation: `revoke <code>` in the owner's DM, or the web route.
+ * Revocation: `revoke G-XXXXXX` (the grant id) in the owner's DM, or the web route.
  */
 
 export type PermissionAccess = "read" | "write";
@@ -120,7 +120,7 @@ export type PermissionRequestResult =
   | { status: "denied"; reason: string; path?: string };
 
 export type DecideResult =
-  | { ok: true; outcome: Exclude<PermissionOutcome, "timed_out"> }
+  | { ok: true; outcome: Exclude<PermissionOutcome, "timed_out">; grantId?: string }
   | { ok: false; status: 409 | 410 | 503; code: string };
 
 /** Judges a resolved path for a group: already reachable, never grantable, or askable. */
@@ -135,8 +135,14 @@ export interface PermissionBrokerDeps {
   /** The web card, when the web UI is up. */
   card(): { publish(requests: PermissionRequestView[]): void } | undefined;
   isOwnerSender(channelName: string, senderId: string | undefined): boolean;
-  /** Always allow: write the grant to config (file and live). False when it could not be written. */
-  persistAlways(groupKey: string, access: PermissionAccess, path: string): boolean;
+  /** Always allow: write the grant to config (file and live), recorded under `grant.id`. False when it could not be written. */
+  persistAlways(groupKey: string, access: PermissionAccess, path: string, grant: { id: string; requestId: string }): boolean;
+  /** A grant id no group's config uses yet. */
+  newGrantId(): string;
+  /** Where a grant id points, from config. */
+  findGrant(grantId: string): { groupKey: string; path: string } | undefined;
+  /** The grant id a request's Always allow was saved under, if config has one. */
+  grantForRequest(requestId: string): string | undefined;
   /** Take a permanent grant back (file and live). False when it could not be written. */
   revokeAlways(groupKey: string, path: string): boolean;
   /** Tell the session how its request ended (a `<tomo-event type="permission">` turn). */
@@ -300,7 +306,11 @@ export class PermissionBroker {
       this.expire(id);
       return { ok: false, status: 410, code: "permission_closed" };
     }
-    if (decision === "always" && !this.deps.persistAlways(request.groupKey, request.access, request.path)) {
+    // Config first, ledger second. A crash in between leaves a grant in config
+    // whose request the ledger shows as open; reconcileAfterRestart finds it by
+    // its request id and records it as allowed, not denied.
+    const grantId = decision === "always" ? this.deps.newGrantId() : undefined;
+    if (grantId && !this.deps.persistAlways(request.groupKey, request.access, request.path, { id: grantId, requestId: request.id })) {
       // The request stays open: the owner can try again, or allow once.
       return { ok: false, status: 503, code: "permission_config_unwritable" };
     }
@@ -312,20 +322,32 @@ export class PermissionBroker {
     }
     const outcome = decision === "once" ? "allowed_once" : decision === "always" ? "allowed_always" : "denied";
     this.deps.ledger.append({ event: "decided", id, code: request.code, groupKey: request.groupKey, path: request.path,
-      access: request.access, outcome, via });
+      access: request.access, outcome, via, ...(grantId ? { grantId } : {}) });
     // The Allow once binds to the turn that carries this answer, and to no other.
     this.deps.notifySession(request.sessionKey, request.groupKey, outcome, outcomeText(outcome, request),
       grant ? (turnId) => { if (grant.turn === null) grant.turn = turnId; } : undefined);
     log.info({ code: request.code, outcome, via }, "Permission request answered");
-    return { ok: true, outcome };
+    return { ok: true, outcome, ...(grantId ? { grantId } : {}) };
   }
 
   /** Take back a permanent grant, and any Allow once for the same path. The owner's call only: the web route and the DM command. */
-  revoke(groupKey: string, path: string, via: DecisionChannel | "cli" = "web"): boolean {
+  revoke(groupKey: string, path: string, via: DecisionChannel = "web", grantId?: string): boolean {
     this.grants = this.grants.filter((g) => !(g.groupKey === groupKey && g.path === path));
     const ok = this.deps.revokeAlways(groupKey, path);
-    if (ok) this.deps.ledger.append({ event: "revoked", groupKey, path, via });
+    if (ok) this.deps.ledger.append({ event: "revoked", groupKey, path, via, ...(grantId ? { grantId } : {}) });
     return ok;
+  }
+
+  /**
+   * Revoke an Always allow by its grant id (`G-XXXXXX`, shown when it was
+   * granted and stored with it in config). Ids are unique across groups and
+   * never reused while the grant exists, so this names exactly one grant.
+   * Null when no grant has that id.
+   */
+  revokeGrant(grantId: string, via: DecisionChannel): { groupKey: string; path: string; ok: boolean } | null {
+    const found = this.deps.findGrant(grantId);
+    if (!found) return null;
+    return { ...found, ok: this.revoke(found.groupKey, found.path, via, grantId) };
   }
 
   /**
@@ -364,18 +386,6 @@ export class PermissionBroker {
   }
 
   /**
-   * Revoke the Always allow a request granted, by its code (the DM command
-   * `revoke K7Q`). Looked up in the ledger, so it works after a restart. Null
-   * when that code never granted an Always allow.
-   */
-  revokeByCode(code: string, via: DecisionChannel | "cli"): { groupKey: string; path: string; ok: boolean } | null {
-    const granted = this.deps.ledger.read().filter((r) => r.event === "decided" && r.outcome === "allowed_always"
-      && typeof r.code === "string" && r.code.toUpperCase() === code.toUpperCase()).at(-1);
-    if (!granted || typeof granted.groupKey !== "string" || typeof granted.path !== "string") return null;
-    return { groupKey: granted.groupKey, path: granted.path, ok: this.revoke(granted.groupKey, granted.path, via) };
-  }
-
-  /**
    * After a restart: every request the ledger shows as asked but never ended
    * was lost with the process. Record it as denied (reason: restart), tell its
    * session, and remember its code so a late reply is told it is closed. The
@@ -395,10 +405,19 @@ export class PermissionBroker {
         reason: String(r.reason ?? ""), expiresAt: 0, groupKey: r.groupKey, sessionKey: r.sessionKey };
       this.closed.push(request);
       if (this.closed.length > MAX_CLOSED) this.closed.shift();
-      this.deps.ledger.append({ event: "decided", id: r.id, code: request.code, groupKey: r.groupKey, path: r.path,
-        access, outcome: "denied", reason: "restart" });
-      this.deps.notifySession(r.sessionKey, r.groupKey, "denied",
-        `The request for ${access} access to ${r.path} (${request.code}) was lost when Tomo restarted, so it is denied. Ask again if it is still needed.`);
+      // The owner may have said Always allow and the process died between the
+      // config write and the ledger line: the grant is in force, so say so.
+      const grantId = this.deps.grantForRequest(r.id);
+      if (grantId) {
+        this.deps.ledger.append({ event: "decided", id: r.id, code: request.code, groupKey: r.groupKey, path: r.path,
+          access, outcome: "allowed_always", grantId, reason: "recovered_after_restart" });
+        this.deps.notifySession(r.sessionKey, r.groupKey, "allowed_always", outcomeText("allowed_always", request));
+      } else {
+        this.deps.ledger.append({ event: "decided", id: r.id, code: request.code, groupKey: r.groupKey, path: r.path,
+          access, outcome: "denied", reason: "restart" });
+        this.deps.notifySession(r.sessionKey, r.groupKey, "denied",
+          `The request for ${access} access to ${r.path} (${request.code}) was lost when Tomo restarted, so it is denied. Ask again if it is still needed.`);
+      }
       count++;
     }
     this.publish();
@@ -418,16 +437,17 @@ export class PermissionBroker {
     if (!this.deps.isOwnerSender(channel.name, message.senderId)) return false;
     if (message.rawText === undefined || message.isReaction) return false;
     const text = message.rawText.trim();
-    if (text.length > 12) return false;
+    if (text.length > 24) return false;
 
-    const revoke = new RegExp(`^revoke\\s+(${CODE_RE})$`, "i").exec(text);
+    const revoke = /^revoke\s+(G-[A-Z0-9]{6})$/i.exec(text);
     if (revoke) {
       channel.forgetMessage?.(message.chatId, message.id);
-      const done = this.revokeByCode(revoke[1], channel.name as DecisionChannel);
+      const grantId = revoke[1].toUpperCase();
+      const done = this.revokeGrant(grantId, channel.name as DecisionChannel);
       await this.say(channel, message.chatId, done === null
-        ? `${revoke[1].toUpperCase()} did not grant an "always allow", so there is nothing to revoke.`
-        : done.ok ? `Revoked (${revoke[1].toUpperCase()}): ${this.deps.groupTitle(done.groupKey) || done.groupKey} can no longer reach ${done.path}.`
-          : `Could not revoke ${revoke[1].toUpperCase()}: the config file could not be written.`);
+        ? `No "always allow" has the id ${grantId}, so nothing was revoked.`
+        : done.ok ? `Revoked ${grantId}: ${this.deps.groupTitle(done.groupKey) || done.groupKey} can no longer reach ${done.path}.`
+          : `Could not revoke ${grantId}: the config file could not be written.`);
       return true;
     }
 
@@ -459,7 +479,7 @@ export class PermissionBroker {
         : `Permission request ${request.code} is no longer open. Nothing changed.`);
       return true;
     }
-    await this.say(channel, message.chatId, confirmationText(result.outcome, request));
+    await this.say(channel, message.chatId, confirmationText(result.outcome, request, result.grantId));
     return true;
   }
 
@@ -545,8 +565,8 @@ function outcomeText(outcome: PermissionOutcome, r: PendingRequest): string {
   }
 }
 
-function confirmationText(outcome: Exclude<PermissionOutcome, "timed_out">, r: PendingRequest): string {
+function confirmationText(outcome: Exclude<PermissionOutcome, "timed_out">, r: PendingRequest, grantId?: string): string {
   if (outcome === "allowed_once") return `Allowed once (${r.code}): ${r.group} may ${ACCESS_WORDS[r.access]} ${r.path} for one turn.`;
-  if (outcome === "allowed_always") return `Always allowed (${r.code}): ${r.group} may ${ACCESS_WORDS[r.access]} ${r.path}. Saved to its sandbox config.`;
+  if (outcome === "allowed_always") return `Always allowed (${r.code}): ${r.group} may ${ACCESS_WORDS[r.access]} ${r.path}. Saved to its sandbox config as ${grantId}; reply "revoke ${grantId}" to take it back.`;
   return `Denied (${r.code}).`;
 }

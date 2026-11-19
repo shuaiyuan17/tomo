@@ -92,7 +92,7 @@ export interface SessionContext {
    * grants live on this session (`PermissionBroker.withOnceGrants`).
    * Undefined ⇒ config alone.
    */
-  groupSandbox?: () => GroupSandboxConfig;
+  groupSandbox?: (opts: { once: boolean }) => GroupSandboxConfig;
   /** Told of each sandboxed Bash command and refused file-tool call (the
    *  trigger a later `request_permission` card shows). */
   noteSandboxedCall?: (text: string) => void;
@@ -470,7 +470,7 @@ export function buildHooksOption(args: {
   pluginDirs?: () => readonly string[];
   /** Per-group path policy (extra dirs, or unsandboxed). Read per call; a
    *  missing config means every group gets the default policy. */
-  groupSandbox?: () => GroupSandboxConfig | undefined;
+  groupSandbox?: (opts: { once: boolean }) => GroupSandboxConfig | undefined;
   /** The key the turn in flight is scoped to (see SessionContext). Lets a
    *  summoned turn inherit its steering group's allowlist entry. */
   scopedCallerKey?: () => string;

@@ -48,7 +48,7 @@ vi.mock("../src/workspace/index.js", () => ({
 vi.mock("../src/logger.js", () => ({ log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
 const { PermissionBroker, PermissionLedger, permissionDmText } = await import("../src/permissions/broker.js");
-const { persistGroupGrant, revokeGroupGrant } = await import("../src/permissions/config-grants.js");
+const { persistGroupGrant, revokeGroupGrant, newGrantId, findGrant, grantForRequest } = await import("../src/permissions/config-grants.js");
 const { buildPermissionTools, permissionToolSchema, PERMISSION_NOT_SANDBOXED } = await import("../src/mcp/permission-tools.js");
 const { assessGroupPermission, privateMemoryGuardHooks } = await import("../src/agent/private-memory-guard.js");
 const { effectiveGroupSandbox } = await import("../src/agent/group-fs-policy.js");
@@ -111,7 +111,13 @@ function harness(opts: { timeoutMs?: number; dm?: boolean } = {}): Harness {
     ownerDm: () => opts.dm === false ? undefined : { channel: dm as never, chatId: OWNER_CHAT },
     card: () => ({ publish: (requests) => cards.push(requests) }),
     isOwnerSender: (_channel, senderId) => senderId === OWNER_ID,
-    persistAlways: (groupKey, access, path) => persistGroupGrant(groupKey, access, path, target),
+    persistAlways: (groupKey, access, path, grant) => persistGroupGrant(groupKey, access, path, target, grant),
+    newGrantId: () => newGrantId(live.config.groupSandbox),
+    findGrant: (grantId) => {
+      const found = findGrant(live.config.groupSandbox, grantId);
+      return found ? { groupKey: found.groupKey, path: found.grant.path } : undefined;
+    },
+    grantForRequest: (requestId) => grantForRequest(live.config.groupSandbox, requestId)?.grantId,
     revokeAlways: (groupKey, path) => revokeGroupGrant(groupKey, path, target),
     notifySession: (sessionKey, _groupKey, outcome, body, onTurnBegin) => notes.push({ sessionKey, outcome, body, onTurnBegin }),
     liveTurnIds: (key) => turns.liveTurnIds(key),
@@ -129,16 +135,17 @@ function harness(opts: { timeoutMs?: number; dm?: boolean } = {}): Harness {
   return { broker, dm, turns, notes, cards, now, answerTurn };
 }
 
-/** What the guard applies on `sessionKey`: config (legacy folded in) plus live Allow-once grants — Agent.groupSandboxFor. */
-function sandboxFor(broker: Broker, sessionKey: string) {
-  return broker.withOnceGrants(effectiveGroupSandbox(live.config.groupSandbox, live.config.groupShellAllowlist), sessionKey);
+/** What the guard applies on `sessionKey`: config (legacy folded in) plus live Allow-once grants when `once` — Agent.groupSandboxFor. */
+function sandboxFor(broker: Broker, sessionKey: string, opts: { once: boolean } = { once: true }) {
+  const base = effectiveGroupSandbox(live.config.groupSandbox, live.config.groupShellAllowlist);
+  return opts.once ? broker.withOnceGrants(base, sessionKey) : base;
 }
 
 /** The guard as a group session's live session installs it. */
 function guard(broker: Broker, sessionKey = GROUP) {
-  const hooks = privateMemoryGuardHooks(sessionKey, () => "group-session", () => [], () => sandboxFor(broker, sessionKey), () => sessionKey,
+  const hooks = privateMemoryGuardHooks(sessionKey, () => "group-session", () => [], (opts) => sandboxFor(broker, sessionKey, opts), () => sessionKey,
     (text) => broker.noteCall(sessionKey, text));
-  return hooks.PreToolUse[0].hooks[0] as (input: { tool_name: string; tool_input: unknown }) => Promise<{
+  return hooks.PreToolUse[0].hooks[0] as (input: { tool_name: string; tool_input: unknown; agent_id?: string }) => Promise<{
     hookSpecificOutput?: { permissionDecision?: string; updatedInput?: { command?: string } };
   }>;
 }
@@ -215,6 +222,43 @@ describe("the tool's input", () => {
     const h = harness();
     expect(await h.broker.request({ sessionKey: GROUP, groupKey: GROUP, path: join(fx.ws, "notes"), access: "write", reason: "x" }))
       .toMatchObject({ status: "already_allowed" });
+  });
+});
+
+describe("who an Allow once reaches", () => {
+  it("not a subagent's call, only the main agent's", async () => {
+    const h = harness();
+    const { id } = await ask(h);
+    h.broker.decide(id, "once", "web");
+    const answer = h.answerTurn();
+    const sub = await guard(h.broker)({ tool_name: "Read", tool_input: { file_path: EXTERNAL }, agent_id: "agent-1" });
+    expect(sub.hookSpecificOutput?.permissionDecision).toBe("deny");
+    expect(await readAllowed(h.broker)).toBe(true);
+    h.turns.end(GROUP, answer);
+  });
+
+  it("not a background Bash: its profile is built without the grant", async () => {
+    const h = harness();
+    const { id } = await ask(h);
+    h.broker.decide(id, "once", "web");
+    const answer = h.answerTurn();
+    const grantLine = `(subpath "${fx.external}")`;
+    const fg = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true" } });
+    expect(fg.hookSpecificOutput?.updatedInput?.command).toContain(grantLine);
+    const bg = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "sleep 600; cat x", run_in_background: true } });
+    expect(bg.hookSpecificOutput?.updatedInput?.command).toBeDefined();
+    expect(bg.hookSpecificOutput?.updatedInput?.command).not.toContain(grantLine);
+    const subBash = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true" }, agent_id: "agent-1" });
+    expect(subBash.hookSpecificOutput?.updatedInput?.command).not.toContain(grantLine);
+    h.turns.end(GROUP, answer);
+  });
+
+  it("an Always allow reaches both (it is config)", async () => {
+    const h = harness();
+    const { id } = await ask(h);
+    h.broker.decide(id, "always", "web");
+    const bg = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true", run_in_background: true }, agent_id: "agent-1" });
+    expect(bg.hookSpecificOutput?.updatedInput?.command).toContain(`(subpath "${fx.external}")`);
   });
 });
 
@@ -302,7 +346,7 @@ describe("the three answers", () => {
     const { id } = await ask(h);
     h.broker.decide(id, "once", "web");
     const answer = h.answerTurn();
-    const otherGuard = privateMemoryGuardHooks(OTHER_GROUP, () => "group-session", () => [], () => sandboxFor(h.broker, OTHER_GROUP), () => OTHER_GROUP)
+    const otherGuard = privateMemoryGuardHooks(OTHER_GROUP, () => "group-session", () => [], (opts) => sandboxFor(h.broker, OTHER_GROUP, opts), () => OTHER_GROUP)
       .PreToolUse[0].hooks[0] as (input: { tool_name: string; tool_input: unknown }) => Promise<{ hookSpecificOutput?: { permissionDecision?: string } }>;
     expect((await otherGuard({ tool_name: "Read", tool_input: { file_path: EXTERNAL } })).hookSpecificOutput?.permissionDecision).toBe("deny");
     expect(await readAllowed(h.broker)).toBe(true);
@@ -313,10 +357,12 @@ describe("the three answers", () => {
     const h = harness();
     const before = readFileSync(CONFIG, "utf8");
     const { id } = await ask(h, fx.external, "write");
-    expect(h.broker.decide(id, "always", "web")).toEqual({ ok: true, outcome: "allowed_always" });
+    const decided = h.broker.decide(id, "always", "web") as { ok: true; outcome: string; grantId: string };
+    expect(decided).toMatchObject({ ok: true, outcome: "allowed_always", grantId: expect.stringMatching(/^G-[A-HJ-NP-Z2-9]{6}$/) });
     const written = JSON.parse(readFileSync(CONFIG, "utf8"));
     expect(written.model).toBe("x");
-    expect(written.groupSandbox.groups[GROUP]).toEqual({ extraRead: [], extraWrite: [fx.external], unsandboxed: false });
+    expect(written.groupSandbox.groups[GROUP]).toEqual({ extraRead: [], extraWrite: [fx.external], unsandboxed: false,
+      grants: { [decided.grantId]: { path: fx.external, access: "write", requestId: id } } });
     expect(readFileSync(BACKUP, "utf8")).toBe(before);
     expect(live.config.groupSandbox.groups[GROUP].extraWrite).toEqual([fx.external]);
     const r = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true" } });
@@ -376,28 +422,58 @@ describe("the three answers", () => {
 });
 
 describe("revoking, and a restart", () => {
-  it("the owner's DM `revoke <code>` takes an Always allow back, and only the owner's", async () => {
+  it("Always allow gets a durable grant id, shown in the DM, and `revoke <grant id>` takes it back (the owner's DM only)", async () => {
     const h = harness();
-    const { id, code } = await ask(h);
-    h.broker.decide(id, "always", "web");
+    const { code } = await ask(h);
+    expect(await h.broker.handleInbound(h.dm as never, ownerDm(`2 ${code}`) as never)).toBe(true);
+    const grantId = /revoke (G-[A-Z0-9]{6})/.exec(h.dm.sent.at(-1)!.text)![1];
+    const stored = JSON.parse(readFileSync(CONFIG, "utf8")).groupSandbox.groups[GROUP];
+    expect(stored.grants[grantId]).toMatchObject({ path: fx.external, access: "read" });
     expect(await readAllowed(h.broker)).toBe(true);
-    const groupMessage = { ...ownerDm(`revoke ${code}`), chatId: "-100777", isGroup: true };
+    const groupMessage = { ...ownerDm(`revoke ${grantId}`), chatId: "-100777", isGroup: true };
     expect(await h.broker.handleInbound(chatChannel() as never, groupMessage as never)).toBe(false);
-    expect(await h.broker.handleInbound(h.dm as never, { ...ownerDm(`revoke ${code}`), senderId: "9999" } as never)).toBe(false);
+    expect(await h.broker.handleInbound(h.dm as never, { ...ownerDm(`revoke ${grantId}`), senderId: "9999" } as never)).toBe(false);
+    // The request code is not a revoke handle.
+    expect(await h.broker.handleInbound(h.dm as never, ownerDm(`revoke ${code}`) as never)).toBe(false);
     expect(await readAllowed(h.broker)).toBe(true);
-    expect(await h.broker.handleInbound(h.dm as never, ownerDm(`revoke ${code.toLowerCase()}`) as never)).toBe(true);
-    expect(h.dm.sent.at(-1)?.text).toContain(`Revoked (${code})`);
+    expect(await h.broker.handleInbound(h.dm as never, ownerDm(`revoke ${grantId.toLowerCase()}`) as never)).toBe(true);
+    expect(h.dm.sent.at(-1)?.text).toContain(`Revoked ${grantId}`);
     expect(await readAllowed(h.broker)).toBe(false);
-    expect(JSON.parse(readFileSync(CONFIG, "utf8")).groupSandbox.groups[GROUP].extraRead).toEqual([]);
-    expect(readFileSync(LEDGER, "utf8").trim().split("\n").map((l) => JSON.parse(l)).at(-1)).toMatchObject({ event: "revoked", groupKey: GROUP, via: "telegram" });
+    const after = JSON.parse(readFileSync(CONFIG, "utf8")).groupSandbox.groups[GROUP];
+    expect(after.extraRead).toEqual([]);
+    expect(after.grants).toEqual({});
+    expect(readFileSync(LEDGER, "utf8").trim().split("\n").map((l) => JSON.parse(l)).at(-1)).toMatchObject({ event: "revoked", groupKey: GROUP, grantId, via: "telegram" });
   });
 
-  it("revoking a code that granted no Always allow changes nothing", async () => {
+  it("a grant id names exactly one grant, even when request codes repeat", async () => {
     const h = harness();
-    const { id, code } = await ask(h);
-    h.broker.decide(id, "deny", "web");
-    expect(await h.broker.handleInbound(h.dm as never, ownerDm(`revoke ${code}`) as never)).toBe(true);
-    expect(h.dm.sent.at(-1)?.text).toContain("nothing to revoke");
+    const first = await ask(h);
+    const a = h.broker.decide(first.id, "always", "web") as { grantId: string };
+    const other = await h.broker.request({ sessionKey: OTHER_GROUP, groupKey: OTHER_GROUP, path: fx.external, access: "read", reason: "x" });
+    const b = h.broker.decide((other as { id: string }).id, "always", "web") as { grantId: string };
+    expect(a.grantId).not.toBe(b.grantId);
+    // Pretend both requests had the same code (codes are short and may repeat across restarts): revoke still hits one.
+    expect(h.broker.revokeGrant(b.grantId, "web")).toMatchObject({ groupKey: OTHER_GROUP, ok: true });
+    expect(live.config.groupSandbox.groups[GROUP].extraRead).toEqual([fx.external]);
+    expect(live.config.groupSandbox.groups[OTHER_GROUP].extraRead).toEqual([]);
+    expect(h.broker.revokeGrant("G-ZZZZZZ", "web")).toBeNull();
+    expect(await h.broker.handleInbound(h.dm as never, ownerDm("revoke G-ZZZZZZ") as never)).toBe(true);
+    expect(h.dm.sent.at(-1)?.text).toContain("nothing was revoked");
+  });
+
+  it("an Always allow saved to config before a crash is recovered as allowed, not denied", async () => {
+    rmSync(LEDGER, { force: true });
+    const before = harness();
+    const { id } = await ask(before);
+    // The config write happened; the process died before the ledger line.
+    expect(persistGroupGrant(GROUP, "read", fx.external, { configPath: CONFIG, backupPath: BACKUP, live: live.config }, { id: "G-ABCDEF", requestId: id })).toBe(true);
+    before.broker.shutdown();
+    const after = harness();
+    expect(after.broker.reconcileAfterRestart()).toBe(1);
+    expect(after.notes).toMatchObject([{ sessionKey: GROUP, outcome: "allowed_always" }]);
+    const ledger = readFileSync(LEDGER, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(ledger.at(-1)).toMatchObject({ event: "decided", id, outcome: "allowed_always", grantId: "G-ABCDEF", reason: "recovered_after_restart" });
+    expect(await readAllowed(after.broker)).toBe(true);
   });
 
   it("a request the last run left open is recorded as denied (restart), its session told, and a late reply closed", async () => {

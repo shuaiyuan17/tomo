@@ -354,9 +354,9 @@ export interface WebPermissionRequest { id: string; code: string; group: string;
 /** The card's answer (POST /permissions/<id>). */
 export const permissionDecisionSchema = z.object({ decision: z.enum(["once", "always", "deny"]) }).strict();
 export type WebPermissionDecision = z.infer<typeof permissionDecisionSchema>["decision"];
-export interface WebPermissionResult { status: "allowed_once" | "allowed_always" | "denied" }
-/** Take back a group's Always allow (POST /permissions/revoke). The Permissions page (PR-3) builds on it. */
-export const permissionRevokeSchema = z.object({ groupKey: z.string().min(1).max(256), path: z.string().min(1).max(1024) }).strict();
+export interface WebPermissionResult { status: "allowed_once" | "allowed_always" | "denied"; grantId?: string }
+/** Take back a group's Always allow (POST /permissions/revoke), by its grant id. The Permissions page (PR-3) builds on it. */
+export const permissionRevokeSchema = z.object({ grantId: z.string().regex(/^G-[A-HJ-NP-Z2-9]{6}$/) }).strict();
 export interface WebPermissionRevokeResult { status: "revoked" }
 export type WebEvent =
   /** `images`: ids of pictures this block sent, filed in the outgoing media store (see outgoing-media.ts). */
@@ -547,7 +547,7 @@ export const rpcSchema = z.discriminatedUnion("method", [
   /** The permission card's answer, for the permission broker. */
   z.object({ method: z.literal("permission-decide"), epoch: z.uuid(), id: z.uuid(), decision: permissionDecisionSchema.shape.decision }).strict(),
   /** Revoke a group's Always allow, for the permission broker. */
-  z.object({ method: z.literal("permission-revoke"), epoch: z.uuid(), groupKey: permissionRevokeSchema.shape.groupKey, path: permissionRevokeSchema.shape.path }).strict(),
+  z.object({ method: z.literal("permission-revoke"), epoch: z.uuid(), grantId: permissionRevokeSchema.shape.grantId }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
 export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "rateLimit" | "suggestions" | "reactions" | "credentialRequest" | "permissionRequests">;

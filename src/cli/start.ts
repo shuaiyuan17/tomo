@@ -257,7 +257,10 @@ async function startForeground(): Promise<void> {
         permissions: {
           current: () => agent.permissionBroker.views(),
           decide: (id, decision) => agent.permissionBroker.decide(id, decision, "web"),
-          revoke: (groupKey, path) => agent.permissionBroker.revoke(groupKey, path, "web"),
+          revoke: (grantId) => {
+            const done = agent.permissionBroker.revokeGrant(grantId, "web");
+            return done === null ? "unknown" : done.ok ? "revoked" : "unwritable";
+          },
         },
         // The credential broker's password card: only while the broker is on.
         ...(agent.credentialBroker ? { credentials: {

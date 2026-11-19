@@ -309,7 +309,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         if (!ownerId) throw new WebError(409, "owner_setup_required");
         const parsed = permissionRevokeSchema.safeParse(await body(req));
         if (!parsed.success) throw new WebError(400, "invalid_revoke");
-        json(res, 200, await deps.rpc({ method: "permission-revoke", epoch, groupKey: parsed.data.groupKey, path: parsed.data.path }));
+        json(res, 200, await deps.rpc({ method: "permission-revoke", epoch, grantId: parsed.data.grantId }));
         return;
       } else if (req.method === "POST" && PERMISSION_PATH.test(url.pathname)) {
         // The permission card's answer: the credential route's gate (Origin,

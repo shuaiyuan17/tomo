@@ -154,7 +154,7 @@ export interface LiveSessionManagerDeps {
   scopedCallerKey(key: string): string;
   /** The group sandbox config the guard applies on `key`, per tool call
    *  (config plus live Allow-once grants). Optional: absent ⇒ config alone. */
-  groupSandbox?(key: string): GroupSandboxConfig;
+  groupSandbox?(key: string, opts: { once: boolean }): GroupSandboxConfig;
   /** A sandboxed call on `key`, for a later permission card's trigger line. */
   noteSandboxedCall?(key: string, text: string): void;
   handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult>;
@@ -626,7 +626,7 @@ export class LiveSessionManager {
       group: this.deps.buildGroupContext(key),
       isOwnAudienceTurn: () => this.deps.isOwnAudienceTurn(key),
       scopedCallerKey: () => this.deps.scopedCallerKey(key),
-      ...(this.deps.groupSandbox ? { groupSandbox: () => this.deps.groupSandbox!(key) } : {}),
+      ...(this.deps.groupSandbox ? { groupSandbox: (opts: { once: boolean }) => this.deps.groupSandbox!(key, opts) } : {}),
       ...(this.deps.noteSandboxedCall ? { noteSandboxedCall: (text: string) => this.deps.noteSandboxedCall!(key, text) } : {}),
       onMcpElicitation: (request) => this.deps.handleMcpElicitation(key, request),
       // Late-bound on purpose: the options are built before the session that

@@ -513,6 +513,15 @@ const groupSandboxSchema = z.object({
     extraRead: z.array(extraPathSchema).default([]),
     extraWrite: z.array(extraPathSchema).default([]),
     unsandboxed: z.boolean().default(false),
+    // "Always allow" records (src/permissions/config-grants.ts), by grant id:
+    // what to revoke, and which request made it. The paths in extraRead /
+    // extraWrite are what the sandbox applies; this is their provenance.
+    grants: z.record(z.string(), z.object({
+      path: z.string(),
+      access: z.enum(["read", "write"]),
+      requestId: z.string().optional(),
+      at: z.string().optional(),
+    })).optional(),
   })).default({}),
 });
 

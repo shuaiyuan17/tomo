@@ -207,7 +207,12 @@ export function privateMemoryGuardHooks(
   sessionKey: string | undefined,
   bar: () => PrivateMemoryBar | null,
   pluginDirs: () => readonly string[] = () => [],
-  groupSandbox: () => GroupSandboxConfig | undefined = () => undefined,
+  /**
+   * The group config this call is judged by. `once`: may this call use the
+   * session's Allow-once grants? Only a FOREGROUND call of the MAIN agent may
+   * (see {@link mayUseOnceGrants}); a getter that has no such grants ignores it.
+   */
+  groupSandbox: (opts: { once: boolean }) => GroupSandboxConfig | undefined = () => undefined,
   scopedCallerKey: () => string | undefined = () => undefined,
   /** Told of each sandboxed Bash command and each file-tool call the group
    *  policy refuses: the card of a later `request_permission` shows it as the
@@ -229,7 +234,7 @@ export function privateMemoryGuardHooks(
       // (and under bypassPermissions nothing else stops it). A security guard
       // must deny instead, so a crash here blocks the call.
       onFailure: "block" as const,
-      hooks: [async (input: { tool_name: string; tool_input: unknown }) => {
+      hooks: [async (input: { tool_name: string; tool_input: unknown; agent_id?: string }) => {
         // Cheap check first: `bar()` is a map lookup, `isPrivateMemoryAccess`
         // can hit the filesystem. Order does not affect the outcome.
         const reason = bar();
@@ -249,13 +254,15 @@ export function privateMemoryGuardHooks(
           };
         }
         const isBash = input.tool_name === "Bash";
+        const once = mayUseOnceGrants(input);
+        const sandboxFor = () => groupSandbox({ once });
         if (isBash) {
           // A turn belonging to an allowlisted group runs Bash UNSANDBOXED.
           // That is full trust, not a narrower hole: the Read/Edit/Glob/Grep/
           // MEDIA denials below still fire, but an unsandboxed shell can read
           // the same paths, so allowlisting a group hands its participants the
           // owner's private memory through Bash.
-          const group = groupEntryFor(reason, sessionKey, groupSandbox, scopedCallerKey);
+          const group = groupEntryFor(reason, sessionKey, sandboxFor, scopedCallerKey);
           if (group?.entry.unsandboxed) {
             log.info(
               { key: sessionKey, tool: input.tool_name, allowlistedKey: group.key, bar: reason },
@@ -322,7 +329,7 @@ export function privateMemoryGuardHooks(
           // so the file tools cannot reach what the shell cannot (the config
           // file, secrets/, the keychains, anything outside the workspace).
           // An unsandboxed group keeps the guards above and nothing more.
-          const group = groupEntryFor(reason, sessionKey, groupSandbox, scopedCallerKey);
+          const group = groupEntryFor(reason, sessionKey, sandboxFor, scopedCallerKey);
           if (group?.entry.unsandboxed) return {};
           const denial = groupPathDenial(input.tool_name, input.tool_input, config.workspaceDir, groupPolicy(group?.entry, dataCtx.dataDirs));
           if (!denial) return {};
@@ -380,6 +387,20 @@ function groupEntryFor(
   if (!key) return undefined;
   const entry = groupSandbox()?.groups?.[key];
   return entry ? { key, entry } : undefined;
+}
+
+/**
+ * May this tool call use an Allow-once grant? Only the main agent's own,
+ * foreground calls. A subagent (the hook input carries `agent_id`) is not the
+ * turn the owner answered, and a background shell (`run_in_background`)
+ * outlives the turn: the profile it starts with would keep the grant after
+ * the turn has ended, where nothing can take it back. Always-allow grants are
+ * config, and reach both.
+ */
+export function mayUseOnceGrants(input: { tool_name: string; tool_input: unknown; agent_id?: string }): boolean {
+  if (input.agent_id) return false;
+  const ti = input.tool_input && typeof input.tool_input === "object" ? input.tool_input as Record<string, unknown> : {};
+  return !(input.tool_name === "Bash" && ti.run_in_background === true);
 }
 
 /**

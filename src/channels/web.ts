@@ -59,9 +59,9 @@ export interface WebCredentialAccess {
 export interface WebPermissionAccess {
   /** The open requests the cards show. */
   current(): WebPermissionRequest[];
-  decide(id: string, decision: WebPermissionDecision): { ok: true; outcome: WebPermissionResult["status"] } | { ok: false; status: number; code: string };
-  /** Take back a group's Always allow; false when config.json could not be written. */
-  revoke(groupKey: string, path: string): boolean;
+  decide(id: string, decision: WebPermissionDecision): { ok: true; outcome: WebPermissionResult["status"]; grantId?: string } | { ok: false; status: number; code: string };
+  /** Take back an Always allow by grant id: "unknown" (no such grant), or whether config.json was written. */
+  revoke(grantId: string): "revoked" | "unknown" | "unwritable";
 }
 
 /** The daemon side of Tomo's home (src/home/service.ts) as the browser reaches it. */
@@ -472,9 +472,11 @@ export class WebChannel implements Channel {
   }
 
   /** The owner takes back a group's Always allow. */
-  revokePermission(groupKey: string, path: string): WebPermissionRevokeResult {
+  revokePermission(grantId: string): WebPermissionRevokeResult {
     if (!this.permissions || this.tornDown) throw new WebError(409, "permission_unknown");
-    if (!this.permissions.revoke(groupKey, path)) throw new WebError(503, "permission_config_unwritable");
+    const result = this.permissions.revoke(grantId);
+    if (result === "unknown") throw new WebError(404, "grant_unknown");
+    if (result === "unwritable") throw new WebError(503, "permission_config_unwritable");
     return { status: "revoked" };
   }
 
@@ -483,7 +485,7 @@ export class WebChannel implements Channel {
     if (!this.permissions || this.tornDown) throw new WebError(409, "permission_unknown");
     const result = this.permissions.decide(id, decision);
     if (!result.ok) throw new WebError(result.status, result.code);
-    return { status: result.outcome };
+    return { status: result.outcome, ...(result.grantId ? { grantId: result.grantId } : {}) };
   }
 
   /** The open credential request the card shows (name and purpose only). */

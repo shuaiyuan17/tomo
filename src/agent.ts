@@ -16,7 +16,7 @@ import { privateMemoryBarFor } from "./agent/permissions.js";
 import { assessGroupPermission, attachmentBarredFor } from "./agent/private-memory-guard.js";
 import { effectiveGroupSandbox, type GroupSandboxConfig } from "./agent/group-fs-policy.js";
 import { PermissionBroker, PermissionLedger, permissionLedgerPath, type PermissionAccess, type PermissionAssessment, type PermissionRequestView } from "./permissions/broker.js";
-import { persistGroupGrant, revokeGroupGrant } from "./permissions/config-grants.js";
+import { findGrant, grantForRequest, newGrantId, persistGroupGrant, revokeGroupGrant } from "./permissions/config-grants.js";
 import { OwnerRouter, type SessionResolution } from "./router.js";
 import { ignoredAllowlistDmEntries, isOwnerHandle, ownerSessionKey } from "./owner.js";
 import { BlockedInboundLog, redactChatIdForLog } from "./agent/blocked-inbound-log.js";
@@ -385,7 +385,7 @@ export class Agent {
       buildGroupContext: (key) => this.buildGroupContext(key),
       isOwnAudienceTurn: (key) => this.isOwnAudienceTurn(key),
       scopedCallerKey: (key) => this.scopedCallerKey(key),
-      groupSandbox: (key) => this.groupSandboxFor(key),
+      groupSandbox: (key, opts) => this.groupSandboxFor(key, opts),
       noteSandboxedCall: (key, text) => this.permissionBroker.noteCall(key, text),
       handleMcpElicitation: (key, request) => this.mcpAuthPrompts.handleMcpElicitation(key, request),
       createUnownedTurnRequest: (key) => this.createUnownedTurnRequest(key),
@@ -476,7 +476,13 @@ export class Agent {
           ? { publish: (requests) => web.publishPermissionRequests!(requests) } : undefined;
       },
       isOwnerSender: (channelName, senderId) => this.router.isOwnerSender(channelName, senderId),
-      persistAlways: (groupKey, access, path) => persistGroupGrant(groupKey, access, path, this.grantTarget()),
+      persistAlways: (groupKey, access, path, grant) => persistGroupGrant(groupKey, access, path, this.grantTarget(), { ...grant, at: new Date().toISOString() }),
+      newGrantId: () => newGrantId(config.groupSandbox),
+      findGrant: (grantId) => {
+        const found = findGrant(config.groupSandbox, grantId);
+        return found ? { groupKey: found.groupKey, path: found.grant.path } : undefined;
+      },
+      grantForRequest: (requestId) => grantForRequest(config.groupSandbox, requestId)?.grantId,
       revokeAlways: (groupKey, path) => revokeGroupGrant(groupKey, path, this.grantTarget()),
       notifySession: (sessionKey, groupKey, outcome, body, onTurnBegin) => {
         // Registered with the group as its audience, so a summoned group's
@@ -501,8 +507,9 @@ export class Agent {
    * config's `groupSandbox` (legacy allowlist folded in) plus the Allow-once
    * grants live on this session's turns.
    */
-  groupSandboxFor(sessionKey: string): GroupSandboxConfig {
-    return this.permissionBroker.withOnceGrants(effectiveGroupSandbox(config.groupSandbox, config.groupShellAllowlist), sessionKey);
+  groupSandboxFor(sessionKey: string, opts: { once: boolean } = { once: true }): GroupSandboxConfig {
+    const base = effectiveGroupSandbox(config.groupSandbox, config.groupShellAllowlist);
+    return opts.once ? this.permissionBroker.withOnceGrants(base, sessionKey) : base;
   }
 
   /** Is `path` already reachable for the group, never grantable, or worth asking the owner about? */

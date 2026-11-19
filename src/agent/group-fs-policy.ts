@@ -39,6 +39,17 @@ export interface GroupSandboxEntry {
   /** Full trust: Bash runs unsandboxed and the file tools keep only the
    *  private-memory guards (the old `groupShellAllowlist` behaviour). */
   unsandboxed: boolean;
+  /** "Always allow" grants by durable grant id: provenance and the revoke
+   *  handle. The sandbox reads `extraRead` / `extraWrite`, never this. */
+  grants?: Record<string, GroupGrantRecord>;
+}
+
+export interface GroupGrantRecord {
+  path: string;
+  access: "read" | "write";
+  /** The `request_permission` request that made it. */
+  requestId?: string;
+  at?: string;
 }
 
 export interface GroupSandboxConfig {

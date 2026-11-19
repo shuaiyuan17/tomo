@@ -9,7 +9,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "node:crypto";
 import { log } from "../logger.js";
-import { McpLiveStatus, type McpConnection } from "../mcp/live-status.js";
+import { McpLiveStatus, sanitizeMcpConnections, type McpConnection } from "../mcp/live-status.js";
 import { shortErrorMessage } from "../error-text.js";
 import { watchBus } from "../watch/bus.js";
 import { clip, TOOL_DETAIL_LIMIT } from "../watch/protocol.js";
@@ -209,6 +209,12 @@ export interface LiveSessionSettings {
   resumeFrom?: { sdkSessionId: string; baseline?: UsageBaseline };
   /** One row per SDK result for the usage ledger. Must not throw (it is caught anyway). */
   recordUsage?: UsageRecorder;
+  /**
+   * The SDK reported this session's MCP connection state on its own: the
+   * `mcp_servers` of a system/init message (sanitized: name and state only).
+   * Must not throw (it is caught anyway).
+   */
+  onMcpStatus?: (connections: McpConnection[]) => void;
 }
 
 export class LiveSession {
@@ -313,6 +319,7 @@ export class LiveSession {
   private showThinking: boolean;
   private mcpAuthRefresher: McpAuthRefresher;
   private onToolResult: LiveSessionSettings["onToolResult"];
+  private onMcpStatus: LiveSessionSettings["onMcpStatus"];
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
@@ -350,6 +357,7 @@ export class LiveSession {
     this.showThinking = settings.showThinking ?? false;
     this.mcpAuthRefresher = new McpAuthRefresher(settings.onMcpAuthError, settings.now ?? Date.now);
     this.onToolResult = settings.onToolResult;
+    this.onMcpStatus = settings.onMcpStatus;
     this.recordUsage = settings.recordUsage;
     this.seenUsage = initialUsageCounters(settings.resumeFrom);
     this.committedUsage = initialUsageCounters(settings.resumeFrom);
@@ -971,6 +979,13 @@ export class LiveSession {
           this.awaitingTaskReportSince = Date.now();
         }
         this.notifyBackgroundIdle();
+      }
+    }
+
+    if (event.type === "system" && (event as { subtype?: string }).subtype === "init" && this.onMcpStatus) {
+      const connections = sanitizeMcpConnections((event as { mcp_servers?: unknown }).mcp_servers);
+      if (connections) {
+        try { this.onMcpStatus(connections); } catch (err) { log.warn({ err, session: this.sessionKey }, "MCP status callback threw"); }
       }
     }
 
@@ -1715,6 +1730,18 @@ export class LiveSession {
   /** SDK-reported MCP connection state (bounded, one request in flight); null when unknown. */
   readMcpStatus(): Promise<McpConnection[] | null> {
     return (this.mcpLiveStatus ??= new McpLiveStatus(this.q as unknown as { mcpServerStatus?: () => Promise<unknown> })).read();
+  }
+
+  /**
+   * Reconnect one MCP server of this session (the SDK's `reconnectMcpServer`).
+   * Rejects when the SDK refuses or the reconnect fails, and when this SDK has
+   * no such call.
+   */
+  async reconnectMcpServer(serverName: string): Promise<void> {
+    const runtimeQuery = this.q as unknown as { reconnectMcpServer?: (name: string) => Promise<void> };
+    if (!this.alive) throw new Error("Session is closed");
+    if (typeof runtimeQuery.reconnectMcpServer !== "function") throw new Error("this SDK cannot reconnect an MCP server");
+    await runtimeQuery.reconnectMcpServer.call(this.q, serverName);
   }
 
   /** Replace the live query's complete dynamic MCP set when the SDK supports it. */

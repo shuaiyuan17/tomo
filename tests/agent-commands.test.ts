@@ -209,7 +209,9 @@ describe("chat commands", () => {
     await tg.simulateCommand("mcp", "12345", "Shuai", undefined, "12345");
 
     expect(getServerStatuses).toHaveBeenCalledOnce();
-    expect(tg.sent[0].text).toContain("cloudflare-api — not mounted · login required");
+    // No conversation is running: no live state is invented for it.
+    expect(tg.sent[0].text).toContain("no live session");
+    expect(tg.sent[0].text).toContain("cloudflare-api — no live session · login required · /mcp login cloudflare-api");
 
     await tg.simulateCommand("mcp", "12345", "Shuai", "login cloudflare-api", "12345");
 
@@ -245,7 +247,7 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
-  it("/mcp reports whether a configured server is mounted in the current live session", async () => {
+  it("/mcp reports the live session's real connection state, not whether a server is mounted", async () => {
     resetConfig({
       identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
       mcpServers: {
@@ -259,10 +261,45 @@ describe("chat commands", () => {
     await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: "start session" }));
     await drainQueue(agent);
     tg.clearDelivered();
+    // Mounted in the session, but the SDK says the connection failed; the
+    // in-process server is reported too, though it is not in config.json.
+    mockSdk.mcpStatus = [{ name: "docs", status: "failed" }, { name: "tomo-internal", status: "connected" }];
+    mockSdk.mcpReconnectFails = true;
 
     await tg.simulateCommand("mcp", "12345", "Shuai", undefined, "12345");
 
-    expect(tg.sent[0].text).toContain("docs — connected · no OAuth");
+    expect(tg.sent[0].text).toContain("(live session)");
+    expect(tg.sent[0].text).toContain("docs — failed · no OAuth · /mcp reconnect docs");
+    expect(tg.sent[0].text).not.toContain("docs — connected");
+    expect(tg.sent[0].text).toContain("tomo-internal — connected · session-provided");
+    // Reading the status gave the failed server its automatic reconnect (it failed too).
+    await vi.waitFor(() => expect(mockSdk.mcpReconnects).toEqual(["docs"]));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    mockSdk.mcpReconnectFails = false;
+    await tg.simulateCommand("mcp", "12345", "Shuai", "reconnect docs", "12345");
+    expect(mockSdk.mcpReconnects).toEqual(["docs", "docs"]);
+    expect(tg.sent.at(-1)!.text).toContain('Reconnected "docs"');
+
+    await agent.stop();
+  });
+
+  it("/mcp says when the SDK does not report connection state", async () => {
+    resetConfig({
+      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      mcpServers: { docs: { server: { type: "http", url: "https://docs.example/mcp" } } },
+    });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: "start session" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    await tg.simulateCommand("mcp", "12345", "Shuai", undefined, "12345");
+
+    expect(tg.sent[0].text).toContain("did not report its connection state");
+    expect(tg.sent[0].text).toContain("docs — status unknown · no OAuth");
 
     await agent.stop();
   });

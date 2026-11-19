@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { ChevronRight, FileText, Folder, Lock, RefreshCw, Search, X } from "lucide-react";
-import type { WebConfigField, WebConfigView, WebContext, WebMcpView, WebMemoryFile, WebMemorySearch, WebMemoryTree, WebSession } from "../../src/web/protocol.js";
+import { ApiError, mutate } from "./api.js";
+import type { WebConfigField, WebConfigView, WebContext, WebMcpOAuthState, WebMcpReconnectResult, WebMcpView, WebMemoryFile, WebMemorySearch, WebMemoryTree,
+  WebSession } from "../../src/web/protocol.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -26,7 +28,7 @@ const INTRO: Record<StudyPage, string> = {
   model: "Which model the selected conversation runs on. Your own conversation can be switched here.",
   cost: "What {agent}'s work would cost at API prices, day by day, and how much of your plan it is using.",
   cron: "Scheduled jobs and when they last ran.",
-  mcp: "External tool servers in config.json, and what live sessions report about them.",
+  mcp: "Tool servers in config.json and in live sessions, with the connection state the sessions report.",
   config: "The saved config.json. Only known non-sensitive text is shown; everything else is hidden.",
 };
 
@@ -54,7 +56,7 @@ export function Study({ page, onPage, session, reload, inert, mutator, focus, cr
         {page === "model" && <ModelPage session={session} reload={key} mutator={mutator} />}
         {page === "cost" && <CostPage reload={key} focus={focus ?? null} />}
         {page === "cron" && <Cron reload={key + cronRevision} mutator={mutator} focus={focus ?? null} />}
-        {page === "mcp" && <Mcp reload={key} />}
+        {page === "mcp" && <Mcp reload={key} mutator={mutator} ownerId={mutator.bootstrap?.ownerId} />}
         {page === "config" && <Config reload={key} />}
       </div>
     </Tabs>
@@ -135,29 +137,75 @@ function Context({ session, reload }: { session?: WebSession; reload: number }) 
 }
 
 const MCP_TONE: Record<string, string> = { connected: "bg-primary", failed: "bg-destructive", "needs-auth": "bg-destructive/70", pending: "bg-muted-foreground", disabled: "bg-border" };
+const MCP_LABEL: Record<string, string> = { connected: "Connected", failed: "Failed", "needs-auth": "Needs sign-in", pending: "Connecting", disabled: "Disabled" };
+const MCP_OAUTH: Record<WebMcpOAuthState, string | null> = { ready: null, "login-required": "Sign-in needed", "auth-pending": "Sign-in pending", "auth-failed": "Sign-in failed" };
+const MCP_RECONNECT: Record<WebMcpReconnectResult["outcome"], string> = {
+  reconnected: "Reconnected.", failed: "Reconnect failed. The log has the reason; /new starts a fresh session.",
+  "no-live-session": "There is no live session to reconnect in. A new conversation connects every server afresh.",
+};
 
-function Mcp({ reload }: { reload: number }) {
-  const [resource] = useResource<WebMcpView>("/mcp", reload);
+/** One server's Reconnect button, on the owner conversation's live session. */
+function McpReconnect({ server, mutator, onDone }: { server: string; mutator: Mutator; onDone: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+  const run = async () => {
+    if (!mutator.bootstrap) return;
+    setBusy(true); setNote("");
+    try {
+      const value = await mutate<WebMcpReconnectResult>("/mcp/reconnect", "POST", { server }, mutator.bootstrap, mutator.refresh);
+      setNote(MCP_RECONNECT[value.outcome]); onDone();
+    } catch (err) {
+      setNote(err instanceof ApiError && err.code === "epoch_changed" ? "Tomo restarted since this page loaded. Refresh and try again." : "Reconnect is unavailable right now.");
+    } finally { setBusy(false); }
+  };
+  return <span className="inline-flex items-center gap-2">
+    <Button variant="outline" size="sm" className="h-7 rounded-lg px-2.5 text-[12px]" disabled={busy || !mutator.bootstrap || !mutator.live} onClick={() => void run()}>
+      <RefreshCw className={cn("size-3", busy && "animate-spin")} />{busy ? "Reconnecting…" : "Reconnect"}</Button>
+    {note && <span className={meta} role="status">{note}</span>}</span>;
+}
+
+function Mcp({ reload, mutator, ownerId }: { reload: number; mutator: Mutator; ownerId?: string | null }) {
+  const [resource, refetch] = useResource<WebMcpView>("/mcp", reload);
   const value = resource.state === "ready" ? resource.value : undefined;
-  return <Status resource={resource} empty={value && !value.servers.length ? <Empty>No external MCP servers in config.json.</Empty> : undefined}>
+  // Configured servers, then those only a live session reports (tomo-internal, plugins).
+  const rows = useMemo(() => {
+    if (!value) return [];
+    const known = new Set(value.servers.map((server) => server.name));
+    const extra = [...new Set(value.live.sessions.flatMap((s) => (s.connections ?? []).map((c) => c.name)))].filter((name) => !known.has(name)).sort();
+    return [...value.servers.map((server) => ({ name: server.name, server })), ...extra.map((name) => ({ name, server: undefined }))];
+  }, [value]);
+  const ownerLive = !!value?.live.sessions.some((s) => s.sessionId === ownerId);
+  return <Status resource={resource} empty={value && !rows.length ? <Empty>{value.live.available && !value.live.sessions.length
+    ? "No external MCP servers in config.json, and no live session to report the built-in ones."
+    : "No MCP servers in config.json or reported by a live session."}</Empty> : undefined}>
     {value && <>
-      {!value.live.available && <p className={cn(meta, "mt-0 mb-3")}>Live connection status is unavailable right now.</p>}
-      <ul className="m-0 list-none space-y-3 p-0">{value.servers.map((server) => {
-        const live = value.live.sessions.flatMap((s) => (s.connections ?? []).filter((c) => c.name === server.name).map((c) => ({ sessionId: s.sessionId, status: c.status })));
-        return <li key={server.name} className={cn(card, "px-5 py-4", !server.enabled && "opacity-75")}>
-          <div className="flex flex-wrap items-center gap-2"><h2 className="m-0 font-mono text-[14px] font-medium">{server.name}</h2>
-            <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">{server.type}</Badge>
-            <Badge variant={server.enabled ? "secondary" : "outline"} className="rounded-md text-[10px] font-normal tracking-[0.02em]">{server.enabled ? "Enabled" : "Disabled"}</Badge>
-            {server.oauth && <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">OAuth</Badge>}
-            {server.alwaysLoad && <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">Always loaded</Badge>}</div>
-          <p className={cn(meta, "mt-1.5 mb-0 flex flex-wrap items-center gap-x-1.5")}>
+      {!value.live.available ? <p className={cn(meta, "mt-0 mb-3")}>Live connection status is unavailable right now.</p>
+        : !value.live.sessions.length && <p className={cn(meta, "mt-0 mb-3")}>No live session: connection state appears once a conversation is running.</p>}
+      <ul className="m-0 list-none space-y-3 p-0">{rows.map(({ name, server }) => {
+        const live = value.live.sessions.flatMap((s) => s.connections === null ? [{ sessionId: s.sessionId, status: "unknown" }]
+          : s.connections.filter((c) => c.name === name).map((c) => ({ sessionId: s.sessionId, status: c.status as string })));
+        const oauth = value.live.oauth.find((entry) => entry.name === name)?.oauth;
+        const oauthNote = oauth ? MCP_OAUTH[oauth] : null;
+        const enabled = server?.enabled ?? true;
+        const ownerReports = live.some((item) => item.sessionId === ownerId && item.status !== "unknown" && item.status !== "disabled");
+        return <li key={name} className={cn(card, "px-5 py-4", !enabled && "opacity-75")}>
+          <div className="flex flex-wrap items-center gap-2"><h2 className="m-0 font-mono text-[14px] font-medium">{name}</h2>
+            {server ? <>
+              <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">{server.type}</Badge>
+              <Badge variant={server.enabled ? "secondary" : "outline"} className="rounded-md text-[10px] font-normal tracking-[0.02em]">{server.enabled ? "Enabled" : "Disabled"}</Badge>
+              {server.oauth && <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">OAuth</Badge>}
+              {server.alwaysLoad && <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">Always loaded</Badge>}
+            </> : <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">Session-provided</Badge>}
+            {ownerLive && ownerReports && <span className="ml-auto"><McpReconnect server={name} mutator={mutator} onDone={refetch} /></span>}</div>
+          {server && <p className={cn(meta, "mt-1.5 mb-0 flex flex-wrap items-center gap-x-1.5")}>
             {server.configured.length ? <><Lock className="size-3" />{server.configured.join(" · ")} set</> : "No connection settings"}
-            {server.timeout !== null && <> · timeout {server.timeout}s</>}</p>
-          <div className="mt-3 text-[13px]">{!server.enabled ? <span className="text-muted-foreground">Not loaded while disabled.</span>
-            : !live.length ? <span className="text-muted-foreground">{value.live.available ? "No live session reports it yet." : "Status unknown."}</span>
+            {server.timeout !== null && <> · timeout {server.timeout}s</>}</p>}
+          <div className="mt-3 text-[13px]">{!enabled ? <span className="text-muted-foreground">Not loaded while disabled.</span>
+            : !live.length ? <span className="text-muted-foreground">{!value.live.available ? "Status unknown." : value.live.sessions.length ? "Not loaded in any live session." : "No live session."}</span>
             : <ul className="m-0 flex list-none flex-wrap gap-x-4 gap-y-1 p-0">{live.map((item) => <li key={item.sessionId} className="flex items-center gap-1.5">
-              <i className={cn("size-1.5 rounded-full", MCP_TONE[item.status])} /><span>{item.status === "needs-auth" ? "Needs sign-in" : item.status[0].toUpperCase() + item.status.slice(1)}</span>
-              <span className={meta}>{item.sessionId === live[0].sessionId && live.length === 1 ? "" : item.sessionId.slice(0, 6)}</span></li>)}</ul>}</div>
+              <i className={cn("size-1.5 rounded-full", MCP_TONE[item.status] ?? "bg-border")} /><span>{MCP_LABEL[item.status] ?? "Did not answer"}</span>
+              <span className={meta}>{item.sessionId === ownerId ? (live.length > 1 ? "your conversation" : "") : item.sessionId.slice(0, 6)}</span></li>)}</ul>}
+            {oauthNote && <p className={cn(meta, "mt-1.5 mb-0")}>{oauthNote}: send <span className="font-mono">/mcp login {name}</span> in your private chat.</p>}</div>
         </li>;
       })}</ul></>}
   </Status>;

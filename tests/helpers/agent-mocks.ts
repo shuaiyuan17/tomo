@@ -86,6 +86,11 @@ export const mockSdk = {
   stampUserUuids: false,
   queryControllers: [] as MockQueryController[],
   mcpServerSets: [] as Array<Record<string, unknown>>,
+  /** What `mcpServerStatus()` answers; undefined: the method is absent (an older SDK). */
+  mcpStatus: undefined as Array<{ name: string; status: string }> | undefined,
+  /** Servers `reconnectMcpServer` was called with; `mcpReconnectFails` makes it reject. */
+  mcpReconnects: [] as string[],
+  mcpReconnectFails: false,
   /** Every prompt the mock received, tagged with the session it ran on
    *  (from options.env.TOMO_SESSION_KEY). Lets a test assert WHICH session a
    *  turn ran on without depending on that turn delivering anything — which
@@ -114,6 +119,9 @@ export function resetMockSdk(): void {
   mockSdk.backgroundedToolUses = [];
   mockSdk.taskControlResult = true;
   mockSdk.mcpServerSets = [];
+  mockSdk.mcpStatus = undefined;
+  mockSdk.mcpReconnects = [];
+  mockSdk.mcpReconnectFails = false;
   mockSdk.promptsBySession = [];
   mockSdk.optionsBySession = [];
 }
@@ -348,6 +356,15 @@ function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
     async setMcpServers(servers: Record<string, unknown>) {
       mockSdk.mcpServerSets.push(servers);
       return { added: Object.keys(servers), removed: [], errors: {} };
+    },
+    get mcpServerStatus() {
+      return mockSdk.mcpStatus ? async () => mockSdk.mcpStatus!.map((row) => ({ ...row })) : undefined;
+    },
+    async reconnectMcpServer(name: string) {
+      mockSdk.mcpReconnects.push(name);
+      if (mockSdk.mcpReconnectFails) throw new Error("reconnect refused");
+      const row = mockSdk.mcpStatus?.find((r) => r.name === name);
+      if (row) row.status = "connected";
     },
   };
 

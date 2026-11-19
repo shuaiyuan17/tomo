@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Channel, OutgoingMessage } from "../src/channels/types.js";
+import { replyTargetFromRawSessionKey } from "../src/sessions/keys.js";
 
 // ---------------------------------------------------------------------------
 // THE ATTACHMENT IS THE READ.
@@ -274,8 +275,8 @@ describe("direct send into a group", () => {
       // Only the owner's own DM is unbarred here.
       isPrivateMemoryBarred: (key) => key !== "dm:shuai",
       getSummonedIdentity: () => undefined,
-      getReplyTarget: () => undefined,
-      deriveReplyTargetFromConfig: () => undefined,
+      dmReplyTarget: () => undefined,
+      sessionReplyTarget: (key) => replyTargetFromRawSessionKey(key),
       appendAssistantTranscript: (_k, content) => { transcript.push(content); },
       setChatTitle: () => {},
       listActiveEntries: () => [],

@@ -579,6 +579,54 @@ describe("OwnerRouter", () => {
     });
   });
 
+  describe("dmReplyTarget / sessionReplyTarget", () => {
+    const CONFIGURED = { channelName: "telegram", chatId: "111" };
+    const SAVED = { channelName: "imessage", chatId: "any;-;+15555550123" };
+    type Case = {
+      key: string;
+      saved?: { channelName: string; chatId: string };
+      dm: { channelName: string; chatId: string } | undefined;
+      session: { channelName: string; chatId: string } | undefined;
+    };
+    const cases: Array<[string, Case]> = [
+      ["owner dm key, nothing saved: configured handle", { key: "dm:hank", dm: CONFIGURED, session: CONFIGURED }],
+      ["owner dm key, saved target wins over config", { key: "dm:hank", saved: SAVED, dm: SAVED, session: SAVED }],
+      ["non-owner dm key, nothing saved: nothing", { key: "dm:sam", dm: undefined, session: undefined }],
+      ["raw private key, nothing saved: dm never parses, session parses",
+        { key: "telegram:222", dm: undefined, session: { channelName: "telegram", chatId: "222" } }],
+      ["raw private key, saved target: dm ignores it, session uses it",
+        { key: "telegram:222", saved: SAVED, dm: undefined, session: SAVED }],
+      ["raw group key, nothing saved: dm never yields a group, session parses it",
+        { key: "telegram:-100123", dm: undefined, session: { channelName: "telegram", chatId: "-100123" } }],
+      ["raw group key, saved target: session uses it",
+        { key: "telegram:-100123", saved: SAVED, dm: undefined, session: SAVED }],
+      ["unparseable key: nothing", { key: "garbage", dm: undefined, session: undefined }],
+    ];
+
+    it.each(cases)("%s", (_name, c) => {
+      if (c.saved) {
+        // setReplyTarget only updates an existing session entry.
+        sessions.setSdkSessionId(c.key, `session-${c.key}`);
+        sessions.setReplyTarget(c.key, c.saved);
+      }
+      const router = routerOf(
+        [{ name: "Hank", channels: { telegram: "111", imessage: "+15555550123" }, replyPolicy: "last-active" }],
+        sessions,
+        {},
+      );
+      expect(router.dmReplyTarget(c.key)).toEqual(c.dm);
+      expect(router.sessionReplyTarget(c.key)).toEqual(c.session);
+    });
+
+    it("dm config fallback matches the owner case-insensitively, and only with an owner", () => {
+      const owned = routerOf([{ name: "Hank", channels: { telegram: "111" }, replyPolicy: "last-active" }], sessions, {});
+      expect(owned.dmReplyTarget("dm:HANK")).toEqual(CONFIGURED);
+      const ownerless = routerOf([], sessions, {});
+      expect(ownerless.dmReplyTarget("dm:hank")).toBeUndefined();
+      expect(ownerless.sessionReplyTarget("dm:hank")).toBeUndefined();
+    });
+  });
+
   describe("ownerSessionKey", () => {
     it("is undefined with no owner", () => {
       sessions.setSdkSessionId("dm:alice", "session-1");

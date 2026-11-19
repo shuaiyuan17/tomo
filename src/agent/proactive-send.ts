@@ -8,7 +8,6 @@ import type { ReplyTarget, SessionEntry } from "../sessions/types.js";
 import {
   isGroupSessionKey,
   dmIdentityFromSessionKey,
-  replyTargetFromRawSessionKey,
 } from "../sessions/keys.js";
 import { extractAttachments } from "./text-utils.js";
 import { isPrivateAttachmentPath } from "./permissions.js";
@@ -43,8 +42,10 @@ export interface ProactiveSendDeps {
   /** On a barred turn, must this attachment be dropped? (Agent.isAttachmentBarred.) */
   isAttachmentBarred?(sessionKey: string, path: string): boolean;
   getSummonedIdentity(channelName: string, chatId: string): string | undefined;
-  getReplyTarget(sessionKey: string): ReplyTarget | undefined;
-  deriveReplyTargetFromConfig(identityName: string): ReplyTarget | undefined;
+  /** Router.dmReplyTarget: persisted target, else the owner's configured handle. */
+  dmReplyTarget(sessionKey: string): ReplyTarget | undefined;
+  /** Router.sessionReplyTarget: dm keys as above; raw keys (groups included) persisted, else parsed. */
+  sessionReplyTarget(sessionKey: string): ReplyTarget | undefined;
   appendAssistantTranscript(sessionKey: string, content: string, channelName: string): void;
   setChatTitle(sessionKey: string, title: string): void;
   listActiveEntries(): SessionEntry[];
@@ -571,23 +572,19 @@ export class ProactiveSendService {
   ): { sessionKey: string; replyTarget: ReplyTarget; rawReplyTarget?: ReplyTarget } | undefined {
     const normalized = normalizeSendTarget(target, config.owner);
     if (!normalized) return undefined;
-    const { sessionKey, identityName, rawReplyTarget } = normalized;
+    const { sessionKey, rawReplyTarget } = normalized;
 
-    const dmIdentityName = dmIdentityFromSessionKey(sessionKey);
-    if (dmIdentityName !== undefined) {
+    if (dmIdentityFromSessionKey(sessionKey) !== undefined) {
       // A raw channel:chatId target canonicalized to this dm key keeps its
       // named channel for delivery; router policy only picks the channel
       // when the caller didn't name one.
-      const replyTarget = rawReplyTarget
-        ?? this.deps.getReplyTarget(sessionKey)
-        ?? this.deps.deriveReplyTargetFromConfig(identityName ?? dmIdentityName);
+      const replyTarget = rawReplyTarget ?? this.deps.dmReplyTarget(sessionKey);
       return replyTarget ? { sessionKey, replyTarget, rawReplyTarget } : undefined;
     }
 
     // Non-dm session key (channel:<chatId> form, possibly a group). The caller
     // explicitly named a target, so honor group chats too.
-    const replyTarget = this.deps.getReplyTarget(sessionKey)
-      ?? replyTargetFromRawSessionKey(sessionKey);
+    const replyTarget = this.deps.sessionReplyTarget(sessionKey);
     return replyTarget ? { sessionKey, replyTarget } : undefined;
   }
 

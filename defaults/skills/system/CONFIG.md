@@ -77,6 +77,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 | Field | Type | Allowed values / notes |
 |---|---|---|
 | `model` | string | Claude model IDs/aliases, or a LiteLLM `provider/model` name such as `chatgpt/gpt-5.5`. Default model for every session. |
+| `effort` | string | Optional. `"low"`, `"medium"`, `"high"`, `"xhigh"` or `"max"`: the reasoning effort every session starts with. Unset = the SDK uses the model's default. On a Claude model without effort support, or without that level, the CLI downgrades it (`max` runs as `high`) or sends none; it is not sent to a LiteLLM `provider/model`. **Read at session start only** — `tomo restart` (or a `/model` switch, which restarts that session) applies a change. |
 | `city` | string \| null | Any city name (e.g. `"Seattle"`). Used for weather in continuity pings. `null` or missing = no weather. |
 | `continuity` | boolean | `true` / `false`. Enables periodic proactive heartbeats. Off by default. |
 | `continuityIntervalMinutes` | number | Optional. Minutes between scheduled continuity heartbeats. Default `55`; minimum `1`. Ignored for manual `tomo continuity` triggers. |
@@ -95,6 +96,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 | `owner.imessage` | string[] | The owner's iMessage phone numbers (E.164, `+15551234567`) or Apple ID emails. Only these get DM answers on iMessage. |
 | `identities` | array | Legacy, read-only for compatibility: one identity is read as the owner; with several, `web.ownerIdentity` (else the first) is. Do not add or edit it — write `owner`. `replyPolicy` is ignored: replies go to the channel the owner last used. |
 | `sessionModelOverrides` | object | `{ sessionKey: modelId }` — per-session model override, takes precedence over top-level `model`. Keys are session keys (`dm:alice`, `telegram:12345`, etc.). Written by `/model <name>` for the current chat and by the `tomo config` Sessions menu. |
+| `sessionEffortOverrides` | object | `{ sessionKey: effort }` — per-session `effort`, takes precedence over top-level `effort`. Same levels and keys as above. Edited by hand only. |
 | `litellm.mode` | string | Optional mode label. `"anthropic-compatible"` (default) is a generic proxy; `"chatgpt-subscription"` is the tested OpenAI/ChatGPT subscription path through LiteLLM. Also settable with `TOMO_LITELLM_MODE`. |
 | `litellm.baseUrl` | string | Optional LiteLLM proxy base URL, e.g. `http://localhost:4000`. When set, Tomo still uses Claude Agent SDK but sends SDK model calls to the proxy via `ANTHROPIC_BASE_URL`. |
 | `litellm.apiKey` | string | LiteLLM proxy key sent as `ANTHROPIC_API_KEY`. This is the proxy key, not an Anthropic key. For ChatGPT subscription models, LiteLLM owns the OAuth device flow and token storage. |

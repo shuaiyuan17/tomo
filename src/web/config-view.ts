@@ -63,6 +63,7 @@ export const SHOWN_STRING_PATHS: ShownPath[] = [
   shown("writeRoots"), shown("denyPaths"), shown("denyReadPaths"), shown("groupShellAllowlist"), shown("mcpAllowedTools"),
   shown("continuityScript"), shown("continuityScript.path"), shown("plugins"),
   shown("sessionModelOverrides.*", MODEL_ID, SESSION_KEY),
+  shown("sessionEffortOverrides.*", LOWER_WORD, SESSION_KEY),
   shown("identities.*.name", PERSON_NAME, ANY_INDEX_OR_WORD),
   shown("identities.*.replyPolicy", POLICY, ANY_INDEX_OR_WORD),
   shown("identities.*.channels.*", CHAT_ID, (k) => ANY_INDEX_OR_WORD(k)),

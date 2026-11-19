@@ -2,55 +2,77 @@ import { log } from "../logger.js";
 import type { McpConnection, McpConnectionState } from "../mcp/live-status.js";
 import { shortErrorMessage } from "../error-text.js";
 
-/** Automatic reconnects of one server in one session, per rolling hour. */
+/** Automatic reconnect rounds per server, across every session, per rolling hour. */
 export const MCP_AUTO_RECONNECT_MAX_PER_HOUR = 3;
-/** Wait after the first automatic attempt; doubles with each further one. */
+/** Wait after the first automatic round; doubles with each further one. */
 export const MCP_AUTO_RECONNECT_BASE_BACKOFF_MS = 30_000;
-/** At most one "still failing" owner notice per server in this window. */
+/** How soon a round deferred because every failing session was busy looks again. */
+export const MCP_DEFERRED_RECHECK_MS = 5_000;
+/** At most one delivered "still failing" owner notice per server in this window. */
 export const MCP_GIVE_UP_NOTICE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 
-/** Where a status snapshot came from (logged with each attempt). */
-export type McpStatusTrigger = "init" | "status-read" | "pre-turn";
+/** Where a status snapshot or a round came from (logged). */
+export type McpStatusTrigger = "init" | "status-read" | "pre-turn" | "timer" | "idle";
 
 export interface McpHealthMonitorDeps {
-  /** Ask the key's live session to reconnect one server; rejects on failure. */
+  /**
+   * Reconnect one server on the key's CURRENT live session; rejects on
+   * failure. The monitor only asks while `isIdle(key)` holds.
+   */
   reconnect(key: string, server: string): Promise<void>;
-  /** The existing owner-notice path (Agent.notifyOwner). Must not be called often: see the cooldown. */
-  notifyOwner(text: string): Promise<unknown> | unknown;
+  /** The key has a live session with no turn running (a reconnect would not cut a tool call). */
+  isIdle(key: string): boolean;
+  /** The existing owner-notice path (Agent.notifyOwner): true once delivered. */
+  notifyOwner(text: string): Promise<boolean>;
   now?: () => number;
   maxAttemptsPerHour?: number;
   baseBackoffMs?: number;
   noticeCooldownMs?: number;
 }
 
-export type McpReconnectOutcome = "reconnected" | "failed" | "backoff" | "capped";
+export type McpRoundOutcome = "reconnected" | "failed" | "backoff" | "capped" | "deferred" | "nothing";
+
+interface ServerHealth {
+  /** Start times of automatic rounds in the last hour. Server-wide; a closing session never clears it. */
+  attempts: number[];
+  inFlight?: Promise<McpRoundOutcome>;
+  timer?: ReturnType<typeof setTimeout>;
+  noticeAt?: number;
+  noticeSending?: boolean;
+}
 
 /**
- * Watches the SDK-reported MCP connection state of live sessions:
+ * Health of MCP servers across every live session, PER SERVER: sessions only
+ * report what the SDK says (`observe`); this decides when to reconnect.
  *
- * - logs the lifecycle — what a session started with, each connect /
- *   disconnect transition, each reconnect attempt and its outcome, and the
- *   connections going away with the session;
- * - recovers a server the SDK reports `failed` by calling the session's
- *   `reconnectMcpServer` for it, with exponential backoff and a hard cap per
- *   rolling hour (never a loop: an attempt only happens when a status
- *   snapshot arrives, and the cap holds whatever arrives);
- * - when the cap is spent and the server is still failing, tells the owner
- *   once per server per cooldown through the owner-notice path.
+ * - Lifecycle logs: what a session started with, each connect / disconnect
+ *   transition, each round and reconnect with its outcome, and the
+ *   connections closing with the session.
+ * - A server some session reports `failed` gets automatic reconnect ROUNDS:
+ *   one at a time per server, each reconnecting it in every failing session
+ *   that is idle, with exponential backoff and at most `maxAttempts` rounds
+ *   per rolling hour across all sessions — a shared server going down cannot
+ *   set off one storm per session. A busy session is never reconnected under
+ *   its turn: it stays pending until it is idle (`sessionIdle`, or a short
+ *   recheck timer). Retries are timer-driven, so an idle conversation still
+ *   recovers — and the owner still hears when it does not.
+ * - Budget spent and still failing: one owner notice per server per
+ *   cooldown, counted only once delivered. The cooldown is in memory, so a
+ *   restart can repeat a notice.
  *
- * `needs-auth` is left to the OAuth flow (a reconnect cannot sign in), and
- * `pending` / `disabled` are not failures.
+ * `needs-auth` is left to the OAuth flow; `pending` / `disabled` are not failures.
  */
 export class McpHealthMonitor {
   private readonly states = new Map<string, Map<string, McpConnectionState>>();
-  private readonly attempts = new Map<string, number[]>();
-  private readonly inFlight = new Map<string, Promise<McpReconnectOutcome>>();
-  private readonly noticeAt = new Map<string, number>();
+  /** Bumped by sessionClosed: a reconnect result for an older session of the key is not applied. */
+  private readonly epochs = new Map<string, number>();
+  private readonly servers = new Map<string, ServerHealth>();
   private readonly now: () => number;
   private readonly maxAttempts: number;
   private readonly baseBackoffMs: number;
   private readonly noticeCooldownMs: number;
+  private stopped = false;
 
   constructor(private readonly deps: McpHealthMonitorDeps) {
     this.now = deps.now ?? Date.now;
@@ -59,24 +81,25 @@ export class McpHealthMonitor {
     this.noticeCooldownMs = deps.noticeCooldownMs ?? MCP_GIVE_UP_NOTICE_COOLDOWN_MS;
   }
 
-  /** Last state seen for `server` on `key` (tests and /mcp). */
+  /** Last state seen for `server` on `key`. */
   stateOf(key: string, server: string): McpConnectionState | undefined {
     return this.states.get(key)?.get(server);
   }
 
   /**
-   * One status snapshot from `key`'s live session. Logs what changed since
-   * the last one and starts an automatic reconnect for each failed server
-   * the budget allows. Resolves once those attempts settle; never rejects.
+   * One status snapshot from `key`'s CURRENT live session (the caller checks
+   * that). Logs what changed and starts a round for each failed server.
+   * Resolves once those rounds settle; never rejects.
    */
   async observe(key: string, connections: McpConnection[] | null, trigger: McpStatusTrigger): Promise<void> {
-    if (!connections) return;
+    if (!connections || this.stopped) return;
     const previous = this.states.get(key);
     const next = new Map(connections.map((connection) => [connection.name, connection.status]));
     if (!previous) {
       const byState: Partial<Record<McpConnectionState, string[]>> = {};
       for (const [name, status] of next) (byState[status] ??= []).push(name);
       log.info({ key, trigger, ...byState }, "MCP servers reported by live session");
+      for (const name of byState.failed ?? []) log.warn({ key, server: name, trigger }, "MCP server failed to connect");
     } else {
       for (const [name, status] of next) {
         const before = previous.get(name);
@@ -91,67 +114,93 @@ export class McpHealthMonitor {
     }
     this.states.set(key, next);
     const failed = [...next].filter(([, status]) => status === "failed").map(([name]) => name);
-    if (!previous) for (const name of failed) log.warn({ key, server: name, trigger }, "MCP server failed to connect");
-    await Promise.all(failed.map((name) => this.autoReconnect(key, name, trigger)));
+    await Promise.all(failed.map((name) => this.round(name, trigger)));
   }
 
-  /**
-   * One automatic reconnect of a failed server, if the budget allows it:
-   * at most `maxAttempts` per rolling hour, each later one at least
-   * `baseBackoffMs * 2^(n-1)` after the n-th. One attempt per server and
-   * session at a time.
-   */
-  autoReconnect(key: string, server: string, trigger: McpStatusTrigger): Promise<McpReconnectOutcome> {
-    const id = `${key}\0${server}`;
-    const running = this.inFlight.get(id);
-    if (running) return running;
-    const now = this.now();
-    const recent = (this.attempts.get(id) ?? []).filter((at) => now - at < HOUR_MS);
-    this.attempts.set(id, recent);
-    if (recent.length >= this.maxAttempts) {
-      this.giveUp(key, server, recent.length);
-      return Promise.resolve("capped");
+  /** The key's turn ended: run any reconnect held back while it was busy. */
+  sessionIdle(key: string): void {
+    for (const [server, status] of this.states.get(key) ?? []) {
+      if (status === "failed") void this.round(server, "idle");
     }
-    const last = recent.at(-1);
-    if (last !== undefined && now < last + this.baseBackoffMs * 2 ** (recent.length - 1)) {
-      log.debug({ key, server, attempts: recent.length }, "MCP auto-reconnect waiting out its backoff");
-      return Promise.resolve("backoff");
-    }
-    recent.push(now);
-    const attempt = recent.length;
-    log.info({ key, server, attempt, max: this.maxAttempts, trigger }, "MCP auto-reconnect attempt");
-    const result = this.run(key, server, { attempt, trigger }).then((ok): McpReconnectOutcome => {
-      if (ok) return "reconnected";
-      if (attempt >= this.maxAttempts) this.giveUp(key, server, attempt);
-      return "failed";
-    }).finally(() => this.inFlight.delete(id));
-    this.inFlight.set(id, result);
-    return result;
   }
 
-  /** An explicit reconnect (the web Study's button, `/mcp reconnect`). Outside the automatic budget. */
-  async reconnectNow(key: string, server: string): Promise<boolean> {
-    const id = `${key}\0${server}`;
-    const running = this.inFlight.get(id);
-    if (running) return (await running) === "reconnected";
-    log.info({ key, server }, "MCP reconnect requested by owner");
-    const result = this.run(key, server, { manual: true });
-    this.inFlight.set(id, result.then((ok) => ok ? "reconnected" : "failed"));
-    try { return await result; } finally { this.inFlight.delete(id); }
-  }
-
-  /** The session is gone: its connections closed with it. */
+  /** The session is gone: its connections closed with it. The server budget stays. */
   sessionClosed(key: string): void {
     const states = this.states.get(key);
     if (states?.size) log.info({ key, servers: [...states.keys()] }, "MCP connections closed with live session");
     this.states.delete(key);
-    for (const id of [...this.attempts.keys()]) if (id.startsWith(`${key}\0`)) this.attempts.delete(id);
+    this.epochs.set(key, (this.epochs.get(key) ?? 0) + 1);
+    for (const server of states?.keys() ?? []) if (!this.failingKeys(server).length) this.clearTimer(server);
   }
 
-  private async run(key: string, server: string, context: Record<string, unknown>): Promise<boolean> {
+  /** Shutdown: no more rounds, no timers. */
+  stop(): void {
+    this.stopped = true;
+    for (const server of this.servers.keys()) this.clearTimer(server);
+  }
+
+  /** An explicit reconnect (the web Study's button, `/mcp reconnect`): outside the automatic budget. */
+  async reconnectNow(key: string, server: string): Promise<boolean> {
+    const health = this.health(server);
+    if (health.inFlight) await health.inFlight;
+    log.info({ key, server }, "MCP reconnect requested by owner");
+    return this.reconnectOne(key, server, { manual: true });
+  }
+
+  /**
+   * One automatic round for `server`, if the budget allows and some failing
+   * session is idle; otherwise a timer for when it could run.
+   */
+  round(server: string, trigger: McpStatusTrigger): Promise<McpRoundOutcome> {
+    const health = this.health(server);
+    if (health.inFlight) return health.inFlight;
+    if (this.stopped) return Promise.resolve("nothing");
+    const failing = this.failingKeys(server);
+    if (!failing.length) { this.clearTimer(server); return Promise.resolve("nothing"); }
+    const now = this.now();
+    health.attempts = health.attempts.filter((at) => now - at < HOUR_MS);
+    if (health.attempts.length >= this.maxAttempts) {
+      this.giveUp(server, health.attempts.length);
+      // The budget comes back as the oldest round leaves the window.
+      this.setTimer(server, health.attempts[0] + HOUR_MS - now);
+      return Promise.resolve("capped");
+    }
+    const last = health.attempts.at(-1);
+    const readyAt = last === undefined ? now : last + this.baseBackoffMs * 2 ** (health.attempts.length - 1);
+    if (now < readyAt) {
+      this.setTimer(server, readyAt - now);
+      return Promise.resolve("backoff");
+    }
+    const idle = failing.filter((key) => this.deps.isIdle(key));
+    if (!idle.length) {
+      log.info({ server, sessions: failing, trigger }, "MCP reconnect deferred: every failing session is mid-turn");
+      this.setTimer(server, MCP_DEFERRED_RECHECK_MS);
+      return Promise.resolve("deferred");
+    }
+    this.clearTimer(server);
+    health.attempts.push(now);
+    const attempt = health.attempts.length;
+    log.info({ server, sessions: idle, attempt, max: this.maxAttempts, trigger }, "MCP auto-reconnect round");
+    const run = Promise.all(idle.map((key) => this.reconnectOne(key, server, { attempt, trigger }))).then((results): McpRoundOutcome => {
+      if (results.every(Boolean) && !this.failingKeys(server).length) return "reconnected";
+      if (attempt >= this.maxAttempts) this.giveUp(server, attempt);
+      return "failed";
+    }).finally(() => {
+      health.inFlight = undefined;
+      // Something still failing (here or in a session that was busy): the next round is the timer's.
+      if (!this.stopped && this.failingKeys(server).length) void this.round(server, "timer");
+    });
+    health.inFlight = run;
+    return run;
+  }
+
+  private async reconnectOne(key: string, server: string, context: Record<string, unknown>): Promise<boolean> {
+    const epoch = this.epochs.get(key) ?? 0;
     const started = this.now();
     try {
       await this.deps.reconnect(key, server);
+      // Applied only to the session it was asked of.
+      if ((this.epochs.get(key) ?? 0) !== epoch) return true;
       const before = this.states.get(key)?.get(server) ?? null;
       this.states.get(key)?.set(server, "connected");
       log.info({ key, server, from: before, ms: this.now() - started, ...context }, "MCP reconnect succeeded");
@@ -162,17 +211,45 @@ export class McpHealthMonitor {
     }
   }
 
-  /** Budget spent and still failing: tell the owner, once per server per cooldown. */
-  private giveUp(key: string, server: string, attempts: number): void {
+  private failingKeys(server: string): string[] {
+    return [...this.states].filter(([, states]) => states.get(server) === "failed").map(([key]) => key);
+  }
+
+  private health(server: string): ServerHealth {
+    let health = this.servers.get(server);
+    if (!health) this.servers.set(server, health = { attempts: [] });
+    return health;
+  }
+
+  private setTimer(server: string, delayMs: number): void {
+    const health = this.health(server);
+    if (health.timer || this.stopped) return;
+    health.timer = setTimeout(() => {
+      health.timer = undefined;
+      void this.round(server, "timer");
+    }, Math.max(0, delayMs));
+    health.timer.unref?.();
+  }
+
+  private clearTimer(server: string): void {
+    const health = this.servers.get(server);
+    if (health?.timer) { clearTimeout(health.timer); health.timer = undefined; }
+  }
+
+  /** Budget spent and still failing: tell the owner, once per server per cooldown, counted when delivered. */
+  private giveUp(server: string, attempts: number): void {
+    const health = this.health(server);
     const now = this.now();
-    const last = this.noticeAt.get(server);
-    if (last !== undefined && now - last < this.noticeCooldownMs) return;
-    this.noticeAt.set(server, now);
-    log.error({ key, server, attempts }, "MCP server still failing after automatic reconnects; notifying owner");
+    if (health.noticeSending || (health.noticeAt !== undefined && now - health.noticeAt < this.noticeCooldownMs)) return;
+    health.noticeSending = true;
+    log.error({ server, attempts }, "MCP server still failing after automatic reconnects; notifying owner");
     const text = `⚠️ MCP server "${server}" is down, and ${attempts} automatic reconnect${attempts === 1 ? "" : "s"} in the last hour did not bring it back. `
       + `Its tools fail until it reconnects. Try /mcp reconnect ${server} (or Reconnect on the web MCP page), or /new for a fresh session.`;
-    void Promise.resolve().then(() => this.deps.notifyOwner(text)).catch((err: unknown) => {
+    void Promise.resolve().then(() => this.deps.notifyOwner(text)).then((delivered) => {
+      if (delivered) health.noticeAt = this.now();
+      else log.warn({ server }, "MCP failure notice not delivered; will try again");
+    }, (err: unknown) => {
       log.warn({ server, error: shortErrorMessage(err) }, "Could not send the MCP failure notice");
-    });
+    }).finally(() => { health.noticeSending = false; });
   }
 }

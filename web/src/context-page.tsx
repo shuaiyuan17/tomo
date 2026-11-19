@@ -148,12 +148,14 @@ function Compactions({ value }: { value: WebContext }) {
 
 /** The page for one loaded reading: no fetching, so it can be rendered as is. */
 export function ContextView({ value, title }: { value: WebContext; title: string }) {
-  const parts = composeWindow(value.breakdown, value.used ?? 0, value.max ?? 0);
+  const parts = composeWindow(value.breakdown, value.used ?? 0, value.max ?? 0, value.estimated);
   return <div className="space-y-5">
     <Window value={value} title={title} parts={parts} />
     <div className="grid grid-cols-2 items-start gap-5 max-[1100px]:grid-cols-1">
-      {parts.counted.length > 0 && <Section title="What fills it" aside={<>{formatTokens(value.used ?? 0)} used</>}>
-        <Rows rows={parts.counted} total={value.used ?? 0} label="What fills the window" />
+      {/* A breakdown that does not measure the current reading is shown as the earlier reading it is: its own total, its own shares. */}
+      {parts.counted.length > 0 && <Section title={parts.stale ? "What filled it" : "What fills it"} aside={<>{formatTokens(parts.listed)} {parts.stale ? "at the last full reading" : "used"}</>}>
+        {parts.stale && <p className="mt-0 mb-3 text-[12px] text-muted-foreground" data-stale-breakdown>From the last full reading, not the current figure above{value.estimated ? ", which is an estimate" : ""}. Shares are of that reading.</p>}
+        <Rows rows={parts.counted} total={parts.listed} label={parts.stale ? "What filled the window at the last full reading" : "What fills the window"} />
         {parts.deferred.length > 0 && <div className="mt-5 border-t pt-4">
           <p className="eyebrow">Not loaded</p>
           <p className="mt-1 mb-3 text-[12px] text-muted-foreground">Tool definitions deferred until they are needed. They take no room in the window.</p>

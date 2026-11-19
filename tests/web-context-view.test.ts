@@ -53,12 +53,22 @@ describe("what the window is made of", () => {
     expect(parts.segments.map((s) => [s.kind, s.percent])).toEqual([["conversation", 48.5], ["fixed", 15.7], ["reserved", 1.5]]);
   });
 
-  it("trusts `used` over a breakdown that does not add up to it, and never overflows the window", () => {
-    // An estimated reading: the rows say 50k, the window reading says 100k.
-    const scaled = composeWindow([{ name: "Messages", tokens: 40_000 }, { name: "System prompt", tokens: 10_000 }], 100_000, 200_000);
-    expect(scaled).toMatchObject({ conversation: 80_000, fixed: 20_000, free: 100_000 });
+  it("never rescales a breakdown from another reading to look current: the meter stays undivided and the rows are flagged stale", () => {
+    // The context query failed; only an estimate (100k) is known, and the rows (50k) are from the last full reading.
+    const rows = [{ name: "Messages", tokens: 40_000 }, { name: "System prompt", tokens: 10_000 }];
+    const mismatch = composeWindow(rows, 100_000, 200_000);
+    expect(mismatch).toMatchObject({ stale: true, listed: 50_000, conversation: 0, fixed: 0, free: 100_000 });
+    expect(mismatch.segments).toEqual([{ kind: "used", tokens: 100_000, percent: 50 }]);
+    expect(mismatch.counted.map((row) => row.tokens)).toEqual([40_000, 10_000]);
+    // An estimate is never a measured breakdown, even when the numbers happen to agree.
+    expect(composeWindow(rows, 50_000, 200_000, true)).toMatchObject({ stale: true, conversation: 0 });
+    // Rounding is not staleness.
+    expect(composeWindow(rows, 50_200, 200_000)).toMatchObject({ stale: false, conversation: 40_160, fixed: 10_040 });
+  });
+
+  it("never overflows the window", () => {
     const over = composeWindow([{ name: "Messages", tokens: 300_000 }, { name: "Compact buffer", tokens: 3_000 }], 300_000, 200_000);
-    expect(over).toMatchObject({ conversation: 200_000, reserved: 0, free: 0 });
+    expect(over).toMatchObject({ stale: false, conversation: 200_000, reserved: 0, free: 0 });
     expect(over.segments.reduce((sum, s) => sum + s.percent, 0)).toBe(100);
   });
 
@@ -72,8 +82,9 @@ describe("rollup blocks", () => {
   it("titles a block by the period it covers", () => {
     expect(rollupTitle("daily 2026-11-12", "en-US")).toBe("Thu, Nov 12, 2026");
     expect(rollupTitle("weekly 2026-W45", "en-US")).toBe("Nov 2 – Nov 8, 2026");
-    // ISO week 1 can start in the previous year.
-    expect(rollupTitle("weekly 2026-W01", "en-US")).toBe("Dec 29 – Jan 4, 2026");
+    // ISO week 1 can start in the previous year: both years are named.
+    expect(rollupTitle("weekly 2026-W01", "en-US")).toBe("Dec 29, 2025 – Jan 4, 2026");
+    expect(rollupTitle("weekly 2026-W53", "en-US")).toBe("Dec 28, 2026 – Jan 3, 2027");
     expect(rollupTitle("monthly 2026-10", "en-US")).toBe("October 2026");
     expect(rollupTitle("yearly 2025", "en-US")).toBe("2025");
     expect(rollupTitle("legacy")).toBe("Compact summary");
@@ -116,11 +127,27 @@ describe("the Context page", () => {
   });
 
   it("colours the meter by how full the window is", () => {
-    expect(render(context({ used: 170_000 }))).toMatch(/role="meter"[^>]*data-tone="warn"/);
-    const full = render(context({ used: 196_000 }));
+    // A fuller window whose rows still add up to the reading: the conversation grew.
+    const grown = (used: number) => context({ used, breakdown: BREAKDOWN.map((row) => row.name === "Messages" ? { ...row, tokens: used - 31_400 } : row) });
+    expect(render(grown(170_000))).toMatch(/role="meter"[^>]*data-tone="warn"/);
+    const full = render(grown(196_000));
     expect(full).toMatch(/role="meter"[^>]*data-tone="critical"/);
     expect(full).toContain("Nearly full");
     expect(full).toMatch(/data-segment="conversation"[^>]*class="[^"]*bg-destructive/);
+  });
+
+  // A failed context query leaves an estimate beside the rows of the last full reading: "97.0k · 100%" must not appear.
+  it("shows a breakdown from another reading as that reading, not as the current measurement", () => {
+    const html = render(context({ used: 60_000, estimated: true }));
+    expect(html).toContain(">30%<");
+    expect([...html.matchAll(/data-segment="(\w+)"/g)].map((m) => m[1])).toEqual(["used", "reserved"]);
+    expect(html).toContain("What filled it");
+    expect(html).toContain("data-stale-breakdown");
+    expect(html).toContain("128k at the last full reading");
+    const rows = /<ul aria-label="What filled the window at the last full reading"[^>]*>(.*?)<\/ul>/.exec(html)![1];
+    expect(rows).toMatch(/97\.0k<span[^>]*>76%<\/span>/); // of the 128.4k it was measured with, not of the 60k estimate
+    expect(html).not.toContain("What fills it");
+    expect(render(context())).not.toContain("data-stale-breakdown");
   });
 
   it("says a missing window is unavailable, never 0%", () => {

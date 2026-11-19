@@ -59,15 +59,28 @@ export interface WindowComposition {
   deferred: ContextCategory[];
   /** Left to right; the rest of the meter is free space. Empty without a window. */
   segments: WindowSegment[];
+  /** What the `counted` rows add up to. */
+  listed: number;
+  /**
+   * The rows are not a measurement of `used`: the reading is an estimate, or
+   * the rows do not add up to it (they are kept from the last full reading
+   * when a later one fails). The meter is then one undivided piece and the
+   * rows are to be shown as an earlier reading, with shares of `listed`.
+   */
+  stale: boolean;
 }
 
+/** Rows within this share of `used` count as adding up to it (rounding). */
+const BREAKDOWN_TOLERANCE = 0.01;
+
 /**
- * The window as parts of a whole. `used` is the authority: when the
- * breakdown's own rows do not add up to it (an estimated reading, an older
- * record) they are scaled to it, and without a breakdown the meter is one
- * undivided piece.
+ * The window as parts of a whole. `used` is the authority. The meter is split
+ * into conversation and always-loaded only when the breakdown measures that
+ * same reading; a breakdown from another reading (see `stale`) is never
+ * rescaled to look current, so the meter stays one undivided piece, as it is
+ * without a breakdown.
  */
-export function composeWindow(breakdown: ContextCategory[], used: number, max: number): WindowComposition {
+export function composeWindow(breakdown: ContextCategory[], used: number, max: number, estimated = false): WindowComposition {
   const rows = breakdown.filter((row) => row.tokens > 0);
   const of = (kind: CategoryKind) => rows.filter((row) => categoryKind(row.name) === kind);
   const sum = (list: ContextCategory[]) => list.reduce((total, row) => total + row.tokens, 0);
@@ -76,17 +89,19 @@ export function composeWindow(breakdown: ContextCategory[], used: number, max: n
   const deferred = of("deferred").map((row) => ({ name: row.name.replace(/\s*\(deferred\)\s*$/i, ""), tokens: row.tokens })).sort(bySize);
   const total = Math.max(0, Math.min(used, max > 0 ? max : used));
   const listed = sum(counted);
-  const scale = listed > 0 ? total / listed : 0;
-  const conversation = Math.round(sum(of("conversation")) * scale);
-  const fixed = listed > 0 ? total - conversation : 0;
+  const stale = listed > 0 && (estimated || Math.abs(listed - used) > Math.max(1, used * BREAKDOWN_TOLERANCE));
+  const split = listed > 0 && !stale;
+  // Only rounding, or a reading above the window, is evened out here.
+  const conversation = split ? Math.round(sum(of("conversation")) * total / listed) : 0;
+  const fixed = split ? total - conversation : 0;
   const reserved = Math.max(0, Math.min(sum(of("reserved")), max - total));
   const free = Math.max(0, max - total - reserved);
   const share = (tokens: number) => max > 0 ? tokens / max * 100 : 0;
-  const pieces: WindowSegment[] = listed > 0
+  const pieces: WindowSegment[] = split
     ? [{ kind: "conversation", tokens: conversation, percent: share(conversation) }, { kind: "fixed", tokens: fixed, percent: share(fixed) }]
     : [{ kind: "used", tokens: total, percent: share(total) }];
   pieces.push({ kind: "reserved", tokens: reserved, percent: share(reserved) });
-  return { conversation, fixed, reserved, free, counted, deferred, segments: max > 0 ? pieces.filter((piece) => piece.tokens > 0) : [] };
+  return { conversation, fixed, reserved, free, counted, deferred, listed, stale, segments: max > 0 ? pieces.filter((piece) => piece.tokens > 0) : [] };
 }
 
 const LEVELS = ["daily", "weekly", "monthly", "yearly"] as const;
@@ -101,7 +116,8 @@ function isoWeekStart(year: number, week: number): Date {
 
 /**
  * A rollup block's tag as the period it covers: `daily 2026-11-12` → "Thu,
- * Nov 12, 2026", `weekly 2026-W45` → "Nov 2 – Nov 8, 2026", `monthly 2026-10`
+ * Nov 12, 2026", `weekly 2026-W45` → "Nov 2 – Nov 8, 2026" (both years when the
+ * week spans New Year), `monthly 2026-10`
  * → "October 2026", `yearly 2025` → "2025". A compact summary from before
  * rollups (`legacy`) is named as such; anything else is shown as written.
  */
@@ -118,7 +134,9 @@ export function rollupTitle(tag: string, locale?: string): string {
   if (match && +match[2] >= 1 && +match[2] <= 53) {
     const from = isoWeekStart(+match[1], +match[2]);
     const to = new Date(from); to.setUTCDate(from.getUTCDate() + 6);
-    return `${text(from, { month: "short", day: "numeric" })} – ${text(to, { month: "short", day: "numeric", year: "numeric" })}`;
+    // A week that spans New Year names both years.
+    const sameYear = from.getUTCFullYear() === to.getUTCFullYear();
+    return `${text(from, { month: "short", day: "numeric", ...(sameYear ? {} : { year: "numeric" }) })} – ${text(to, { month: "short", day: "numeric", year: "numeric" })}`;
   }
   match = /^monthly (\d{4})-(\d{2})$/.exec(tag);
   if (match && +match[2] >= 1 && +match[2] <= 12) return text(new Date(Date.UTC(+match[1], +match[2] - 1, 1)), { month: "long", year: "numeric" });

@@ -9,20 +9,20 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Input } from "@/components/ui/input";
-import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import { Text } from "./markdown.js";
+import { ContextView } from "./context-page.js";
 import { CostPage } from "./cost-page.js";
 import type { WebModelChangeResult, WebModelView } from "../../src/web/protocol.js";
 import { modelErrorRefreshes, modelErrorText, pickTarget, switchCopy } from "./model-picker.js";
-import { countTasks, formatTokens, formatWhen, STUDY_LABELS, STUDY_PAGES, useResource, type Resource, type StudyPage } from "./study-data.js";
+import { countTasks, formatWhen, STUDY_LABELS, STUDY_PAGES, useResource, type Resource, type StudyPage } from "./study-data.js";
 
 const INTRO: Record<StudyPage, string> = {
   todos: "Task lists {agent} keeps in memory/TODO*.md. Read-only here.",
   memory: "What {agent} remembers, as it is written in the workspace. Private memory is never shown in the browser.",
-  context: "How full the selected conversation's context window is, and what has been rolled up.",
+  context: "How full the selected conversation's context window is, what fills it, and what has been rolled up.",
   model: "Which model the selected conversation runs on. Your own conversation can be switched here.",
   cost: "What {agent}'s work would cost at API prices, day by day, and how much of your plan it is using.",
   cron: "Scheduled jobs and when they last ran.",
@@ -174,72 +174,10 @@ function Memory({ reload }: { reload: number }) {
   </div>;
 }
 
-/** `Read:14` (the estimator's tool:count) as `Read ×14`. */
-function toolList(tools: string[], limit: number): string {
-  return tools.slice(0, limit).map((tool) => tool.replace(/:(\d+)$/, " ×$1")).join(", ") + (tools.length > limit ? ", …" : "");
-}
-
-function Meter({ used, max }: { used: number; max: number }) {
-  return <Progress max={max} value={Math.min(used, max)} aria-label="Context tokens used" className="h-1.5 bg-border" />;
-}
-
 function Context({ session, reload }: { session?: WebSession; reload: number }) {
   const [resource] = useResource<WebContext>(session ? `/sessions/${session.id}/context` : null, reload);
   if (!session) return <Empty>Choose a conversation in the sidebar.</Empty>;
-  const value = resource.state === "ready" ? resource.value : undefined;
-  const sections = value?.analysis ? [...value.analysis.sections].sort((a, b) => b.tokens - a.tokens).slice(0, 12) : [];
-  const breakdownTotal = value?.breakdown.reduce((sum, item) => sum + item.tokens, 0) ?? 0;
-  return <Status resource={resource}>{value && <div className="space-y-5">
-    <section className={cn(card, "px-6 py-5")} aria-labelledby="ctx-window">
-      <div className="flex flex-wrap items-baseline justify-between gap-2"><p className="eyebrow" id="ctx-window">Context window · {session.title}</p>
-        <span className={meta}>{value.recordedAt ? `Last recorded ${formatWhen(value.recordedAt)}` : "No turn recorded yet"}</span></div>
-      {value.max ? <>
-        <p className="mt-2 mb-3 text-2xl tabular-nums">{value.used!.toLocaleString()} <span className="text-sm text-muted-foreground">/ {value.max.toLocaleString()} · {Math.round(value.used! / value.max * 100)}%</span></p>
-        <Meter used={value.used!} max={value.max} />
-        <p className="mt-3 mb-0 text-[13px] text-muted-foreground">{value.estimated ? "Estimated" : "Reported by the model"} at the end of the last turn.</p>
-      </> : <p className="mt-2 mb-0 text-sm text-muted-foreground">Unavailable until a turn reports its context window.</p>}
-      {value.breakdown.length > 0 && <ul className="mt-5 mb-0 list-none space-y-2 p-0">{value.breakdown.map((item) =>
-        <li key={item.name} className="grid grid-cols-[minmax(0,1fr)_80px] items-center gap-3 text-[13px]">
-          <div className="min-w-0"><div className="flex justify-between gap-2"><span className="truncate">{item.name}</span></div>
-            <div className="mt-1 h-1 rounded-full bg-border"><div className="h-1 rounded-full bg-primary/70" style={{ width: `${breakdownTotal ? item.tokens / breakdownTotal * 100 : 0}%` }} /></div></div>
-          <span className="text-right text-xs tabular-nums text-muted-foreground">{formatTokens(item.tokens)}</span></li>)}</ul>}
-    </section>
-
-    <section className={cn(card, "px-6 py-5")} aria-labelledby="ctx-sections">
-      <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2"><p className="eyebrow" id="ctx-sections">Largest stretches of the transcript</p>
-        {value.analysis && <span className={meta}>{value.analysis.totalMessages.toLocaleString()} messages · ≈{formatTokens(value.analysis.totalTokens)} tokens (estimate)</span>}</div>
-      {value.analysisStatus === "too_large" ? <p className="m-0 text-[13px] text-muted-foreground">The transcript is too large to analyse here. Use <code className="font-mono">tomo lcm stats</code>.</p>
-        : !value.analysis ? <p className="m-0 text-[13px] text-muted-foreground">No transcript to analyse yet.</p>
-        : <ul className="m-0 list-none divide-y p-0">{sections.map((section) =>
-          <li key={section.id} className="grid grid-cols-[48px_minmax(0,1fr)_72px] items-baseline gap-3 py-2 text-[13px]">
-            <span className={meta}>#{section.id}</span>
-            <span className="min-w-0"><span className="block truncate">{section.type === "conversation" ? "Conversation" : section.type === "tool_ops" ? `Tools: ${toolList(section.toolsUsed, 4)}` : `Conversation and tools: ${toolList(section.toolsUsed, 3)}`}</span>
-              <span className={meta}>{section.messageCount} messages{section.toolCallCount ? ` · ${section.toolCallCount} tool calls` : ""} · {formatWhen(Date.parse(section.earliestAt))}</span></span>
-            <span className="text-right text-xs tabular-nums">{formatTokens(section.tokens)}</span></li>)}</ul>}
-    </section>
-
-    <section className={cn(card, "px-6 py-5")} aria-labelledby="ctx-rollups">
-      <p className="eyebrow mb-3" id="ctx-rollups">Rollups</p>
-      {!value.summaries.length ? <p className="m-0 text-[13px] text-muted-foreground">No summary blocks in this session yet.</p>
-        : <ul className="m-0 list-none space-y-1 p-0">{value.summaries.map((block, i) => <li key={`${block.tag}:${block.timestamp}:${i}`}>
-          <Collapsible>
-            <CollapsibleTrigger className="group flex w-full items-center gap-2.5 rounded-lg px-2 py-2 text-left text-[13px] hover:bg-foreground/[0.05]">
-              <ChevronRight className="size-3.5 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-90" />
-              <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">{block.level}</Badge>
-              <span className="min-w-0 flex-1 truncate">{block.tag === "legacy" ? "Compact summary" : block.tag}</span>
-              <span className={meta}>{block.eventsSummarized ? `${block.eventsSummarized} events · ` : ""}{block.timestamp ? formatWhen(Date.parse(block.timestamp)) : ""}</span>
-            </CollapsibleTrigger>
-            <CollapsibleContent className="px-9 pt-1 pb-3"><div className="markdown text-[14px]"><Text>{block.content}</Text></div>
-              {block.truncated && <p className={meta}>Preview shortened.</p>}</CollapsibleContent>
-          </Collapsible></li>)}</ul>}
-      {value.summariesTruncated && <p className={cn(meta, "mt-2 mb-0")}>Only the 100 most recent blocks are listed.</p>}
-      {!!value.recentCompactions?.length && <>
-        <p className="eyebrow mt-5 mb-2">Compactions since Tomo started</p>
-        <ul className="m-0 list-none space-y-1 p-0">{value.recentCompactions.slice().reverse().map((c, i) => <li key={i} className="flex justify-between gap-3 text-[13px]">
-          <span>{formatWhen(c.timestamp)}</span>
-          <span className="text-xs tabular-nums text-muted-foreground">{c.preTokens !== undefined ? formatTokens(c.preTokens) : "?"} → {c.postTokens !== undefined ? formatTokens(c.postTokens) : "?"}</span></li>)}</ul></>}
-    </section>
-  </div>}</Status>;
+  return <Status resource={resource}>{resource.state === "ready" && <ContextView value={resource.value} title={session.title} />}</Status>;
 }
 
 export function cronStatus(job: WebCronJob): { label: string; tone: "ok" | "warn" | "muted" } {

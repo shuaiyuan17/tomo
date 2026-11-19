@@ -10,7 +10,7 @@ const sum = (values: readonly number[]) => values.reduce((a, b) => a + b, 0);
 
 export function Section({ title, aside, children, className, label }: { title: string; aside?: ReactNode; children: ReactNode; className?: string; label?: string }) {
   return <section aria-label={label ?? title} className={cn(card, "min-w-0 px-6 py-5 max-[600px]:px-4 max-[600px]:py-4", className)}>
-    <div className="mb-4 flex items-baseline justify-between gap-3"><h2 className="eyebrow shrink-0 whitespace-nowrap">{title}</h2>{aside && <div className={cn(meta, "text-right")}>{aside}</div>}</div>
+    <div className="mb-4 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1"><h2 className="eyebrow shrink-0 whitespace-nowrap">{title}</h2>{aside && <div className={cn(meta, "text-right")}>{aside}</div>}</div>
     {children}
   </section>;
 }
@@ -26,7 +26,7 @@ export function Legend({ items }: { items: { label: string; color: string; hint?
     <li key={item.label} title={item.hint} className="flex items-center gap-1.5 text-[12px] text-muted-foreground"><span className="size-2.5 rounded-[3px]" style={{ background: item.color }} />{item.label}</li>)}</ul>;
 }
 
-export function Stat({ label, value, note }: { label: string; value: ReactNode; note?: ReactNode }) {
+export function Stat({ label, value, note }: { label: ReactNode; value: ReactNode; note?: ReactNode }) {
   return <div className="min-w-0"><p className={cn(meta, "m-0")}>{label}</p>
     <p className="m-0 mt-0.5 text-[20px] leading-tight font-semibold tracking-[-0.01em] tabular-nums">{value}</p>
     {note && <p className="m-0 mt-0.5 text-[12px] text-muted-foreground">{note}</p>}</div>;

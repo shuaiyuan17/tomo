@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ChevronRight, ShieldQuestion } from "lucide-react";
+import { Check, ChevronRight, Copy, ShieldCheck, ShieldQuestion, X } from "lucide-react";
 import { ApiError, decidePermission, type WebBootstrap } from "./api.js";
 import { useAgentName } from "./agent-name.js";
 import { timeLeft } from "./credential-card.js";
@@ -30,7 +30,9 @@ const DECISIONS: { decision: WebPermissionDecision; label: string; variant: "def
  * call that ran into the sandbox folded away. Three answers, each final: the
  * card goes when the daemon withdraws the request (`permission-requests`).
  */
-export function PermissionCard({ request, bootstrap, refresh }: { request: WebPermissionRequest; bootstrap?: WebBootstrap; refresh: () => Promise<WebBootstrap> }) {
+export function PermissionCard({ request, bootstrap, refresh, onAlways }: { request: WebPermissionRequest; bootstrap?: WebBootstrap; refresh: () => Promise<WebBootstrap>;
+  /** An Always allow was saved: the page keeps its grant id on screen (the request's card is about to go). */
+  onAlways?: (granted: GrantedPermission) => void }) {
   const agent = useAgentName();
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -43,7 +45,10 @@ export function PermissionCard({ request, bootstrap, refresh }: { request: WebPe
   const answer = async (decision: WebPermissionDecision) => {
     if (!bootstrap || busy) return;
     setBusy(true); setError("");
-    try { await decidePermission(request.id, decision, bootstrap, refresh); }
+    try {
+      const result = await decidePermission(request.id, decision, bootstrap, refresh);
+      if (result.status === "allowed_always" && result.grantId) onAlways?.({ grantId: result.grantId, group: request.group, path: request.path });
+    }
     catch (err) { setError(permissionError(err instanceof ApiError ? err.code : "")); }
     finally { setBusy(false); }
   };
@@ -74,6 +79,34 @@ export function PermissionCard({ request, bootstrap, refresh }: { request: WebPe
         className={cn("h-8 rounded-lg", decision === "deny" && "text-muted-foreground hover:text-foreground min-[480px]:ml-auto")}
         onClick={() => void answer(decision)}>{label}</Button>)}
     </div>
+    <p className="m-0 mt-2 text-[11.5px] leading-snug text-muted-foreground">Allow once covers file reads and writes; shell access needs Always allow.</p>
     {error && <p role="status" className="m-0 mt-2 text-[12px] text-destructive">{error}</p>}
+  </section>;
+}
+
+/** An Always allow just saved from a card: what to quote to take it back. */
+export interface GrantedPermission { grantId: string; group: string; path: string }
+
+/**
+ * What stays after an Always allow: the grant id (copyable), until the owner
+ * closes it. Revoke with `revoke <id>` in the DM, or the Permissions page.
+ */
+export function PermissionGranted({ granted, onClose }: { granted: GrantedPermission; onClose: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const copy = () => {
+    void navigator.clipboard?.writeText(granted.grantId).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1_500); }, () => {});
+  };
+  return <section role="status" aria-label="Always allowed" data-testid="permission-granted"
+    className="motion-enter mb-2 flex items-center gap-2.5 rounded-2xl border bg-card py-2 pr-1.5 pl-4 shadow-sm">
+    <ShieldCheck className="size-4 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
+    <div className="min-w-0 flex-1">
+      <p className="m-0 text-[13px] font-medium">Always allowed · ID <code className="font-mono select-all" data-testid="permission-grant-id">{granted.grantId}</code></p>
+      <p className="m-0 truncate text-[11.5px] text-muted-foreground" title={granted.path}>{granted.group} · {granted.path}</p>
+    </div>
+    <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
+      aria-label={copied ? "Copied" : "Copy grant ID"} title="Copy grant ID" onClick={copy}>
+      {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}</Button>
+    <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
+      aria-label="Close" onClick={onClose}><X className="size-3.5" /></Button>
   </section>;
 }

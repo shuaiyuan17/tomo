@@ -12,7 +12,7 @@ import { WebSupervisor } from "../src/web/supervisor.js";
 import { WebChannel } from "../src/channels/web.js";
 import { WatchBus } from "../src/watch/bus.js";
 import type { WebBootstrap, WebPermissionDecision, WebPermissionRequest } from "../src/web/protocol.js";
-import { PermissionCard, permissionError } from "../web/src/permission-card.js";
+import { PermissionCard, PermissionGranted, permissionError } from "../web/src/permission-card.js";
 import { decidePermission } from "../web/src/api.js";
 
 const owner = { name: "owner", telegram: ["1001"], imessage: [] as string[] };
@@ -29,6 +29,15 @@ describe("the permission card", () => {
     for (const text of ["Weekend project", "Write", "/srv/checkouts/app", "run the test suite", "not verified"]) expect(html).toContain(text);
     const buttons = [...html.matchAll(/<button[^>]*>(.*?)<\/button>/g)].map((m) => m[1].replace(/<[^>]+>/g, ""));
     expect(buttons).toEqual(["Triggering call", "Allow once", "Always allow", "Deny"]);
+  });
+
+  it("says what Allow once covers, and an Always allow leaves its grant ID on screen", () => {
+    const html = renderToStaticMarkup(createElement(PermissionCard, { request, bootstrap, refresh: async () => bootstrap }));
+    expect(html).toContain("Allow once covers file reads and writes; shell access needs Always allow.");
+    const done = renderToStaticMarkup(createElement(PermissionGranted, { granted: { grantId: "G-ABCDEF", group: "Weekend project", path: "/srv/checkouts/app" }, onClose: () => {} }));
+    expect(done).toContain("Always allowed · ID");
+    expect(done).toMatch(/data-testid="permission-grant-id">G-ABCDEF</);
+    expect(done).toContain('aria-label="Copy grant ID"');
   });
 
   it("keeps the triggering call folded away until opened", () => {

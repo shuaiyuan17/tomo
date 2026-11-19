@@ -26,7 +26,8 @@ import { scrubKnownSecrets } from "../credentials/redactor.js";
  *
  * WHAT A GRANT IS.
  * - Allow once: in memory only, bound to the one turn that carries the
- *   answer (see {@link OnceGrant}).
+ *   answer (see {@link OnceGrant}), and to the main agent's file tools: never
+ *   a Bash profile (`mayUseOnceGrants`).
  * - Always allow: written to the group's `extraRead` / `extraWrite` in
  *   config.json, through the config writer (lock, backup, atomic write), and
  *   into the live config, so the next Bash or file-tool call sees it. Revoked
@@ -209,7 +210,7 @@ export function permissionDmText(view: PermissionRequestView, minutes: number): 
     `Permission request ${view.code}: a group wants to ${ACCESS_WORDS[view.access]} a path.`,
     `${view.group} · ${view.path}`,
     `Reason (from the agent, not verified): ${view.reason}`,
-    `Reply "1 ${view.code}" allow once, "2 ${view.code}" always allow, "3 ${view.code}" deny, or quote this message. Expires in ${minutes} min.`,
+    `Reply "1 ${view.code}" allow once (file tools only; shell needs always), "2 ${view.code}" always allow, "3 ${view.code}" deny, or quote this. Expires in ${minutes} min.`,
   ].join("\n");
 }
 
@@ -555,7 +556,7 @@ function outcomeText(outcome: PermissionOutcome, r: PendingRequest): string {
   const what = `${r.access} access to ${r.path}`;
   switch (outcome) {
     case "allowed_once":
-      return `The owner allowed ${what} once (request ${r.code}). It is in effect during this turn only and ends with it: retry what needed it now, in this turn.`;
+      return `The owner allowed ${what} once (request ${r.code}). It is in effect during this turn only, for your own file tools (Read, Write, Edit, Grep, Glob): not Bash, not subagents. Retry with those now, in this turn.`;
     case "allowed_always":
       return `The owner always allowed ${what} for this group (request ${r.code}). It is in effect from your next tool call; retry what needed it.`;
     case "denied":
@@ -566,7 +567,7 @@ function outcomeText(outcome: PermissionOutcome, r: PendingRequest): string {
 }
 
 function confirmationText(outcome: Exclude<PermissionOutcome, "timed_out">, r: PendingRequest, grantId?: string): string {
-  if (outcome === "allowed_once") return `Allowed once (${r.code}): ${r.group} may ${ACCESS_WORDS[r.access]} ${r.path} for one turn.`;
+  if (outcome === "allowed_once") return `Allowed once (${r.code}): ${r.group} may ${ACCESS_WORDS[r.access]} ${r.path} for one turn, with file tools (not the shell).`;
   if (outcome === "allowed_always") return `Always allowed (${r.code}): ${r.group} may ${ACCESS_WORDS[r.access]} ${r.path}. Saved to its sandbox config as ${grantId}; reply "revoke ${grantId}" to take it back.`;
   return `Denied (${r.code}).`;
 }

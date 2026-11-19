@@ -305,7 +305,13 @@ async function boot(options: { conversation: boolean }): Promise<void> {
     stop: (key) => theAgent.stopTurn(key),
     models: { view: (key) => theAgent.webModelView(key), switch: (key, model, from) => theAgent.switchModelFromWeb(key, model, from) },
     home: { view: () => theHome.web(), snapshot: (input) => theHome.deliverSnapshot(input) },
-    permissions: { current: () => permissionRequests, decide: () => ({ ok: false, status: 409, code: "permission_unknown" }), revoke: () => "unknown" },
+    permissions: { current: () => permissionRequests, revoke: () => "unknown",
+      decide: (id, decision) => {
+        if (!permissionRequests.some((r) => r.id === id)) return { ok: false, status: 409, code: "permission_unknown" };
+        permissionRequests = permissionRequests.filter((r) => r.id !== id);
+        channel.publishPermissionRequests(permissionRequests);
+        return decision === "always" ? { ok: true, outcome: "allowed_always", grantId: "G-7KQ4MT" } : { ok: true, outcome: decision === "once" ? "allowed_once" : "denied" };
+      } },
     outgoingMedia: new OutgoingMediaStore(outgoingImagesDir(mockConfig.workspaceDir), { isPrivate: (path) => path.includes("/memory/private/") }),
     uploads: { dir: uploadsDir(mockConfig.tomoHome), workspaceDir: mockConfig.workspaceDir },
   });
@@ -526,6 +532,14 @@ async function permissionSteps(page: Page, vp: Viewport, theme: Theme): Promise<
       await page.getByRole("button", { name: "Triggering call" }).click();
       await page.waitForTimeout(300);
       await snap();
+    });
+    await s("permission", "granted", async (snap) => {
+      permissionRequests = [PERMISSION_READ];
+      await reset(page);
+      await page.getByRole("button", { name: "Always allow" }).click();
+      await page.getByTestId("permission-granted").waitFor();
+      await snap();
+      await page.getByRole("button", { name: "Close" }).filter({ visible: true }).last().click();
     });
   } finally { permissionRequests = []; }
 }

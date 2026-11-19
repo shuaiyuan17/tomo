@@ -390,17 +390,20 @@ function groupEntryFor(
 }
 
 /**
- * May this tool call use an Allow-once grant? Only the main agent's own,
- * foreground calls. A subagent (the hook input carries `agent_id`) is not the
- * turn the owner answered, and a background shell (`run_in_background`)
- * outlives the turn: the profile it starts with would keep the grant after
- * the turn has ended, where nothing can take it back. Always-allow grants are
- * config, and reach both.
+ * May this tool call use an Allow-once grant? Only the main agent's own FILE
+ * TOOL calls (Read, Write, Edit, Grep, Glob, ...), never Bash.
+ *
+ * Bash is out entirely, foreground included: a sandbox profile is inherited by
+ * every process the command starts, and a child that detaches (`setsid`,
+ * `nohup … &`, a daemonizing tool) keeps running, with the grant, after the
+ * turn has ended, where neither the turn's end nor a revoke can reach it. A
+ * file-tool call is one operation in this process and ends with the call.
+ * A subagent (the hook input carries `agent_id`) is not the turn the owner
+ * answered. Always-allow grants are config, and reach both.
  */
 export function mayUseOnceGrants(input: { tool_name: string; tool_input: unknown; agent_id?: string }): boolean {
   if (input.agent_id) return false;
-  const ti = input.tool_input && typeof input.tool_input === "object" ? input.tool_input as Record<string, unknown> : {};
-  return !(input.tool_name === "Bash" && ti.run_in_background === true);
+  return input.tool_name !== "Bash";
 }
 
 /**

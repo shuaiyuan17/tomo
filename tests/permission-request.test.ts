@@ -237,19 +237,20 @@ describe("who an Allow once reaches", () => {
     h.turns.end(GROUP, answer);
   });
 
-  it("not a background Bash: its profile is built without the grant", async () => {
+  it("never a Bash profile, foreground or background, main agent or not; the file tools do get it", async () => {
     const h = harness();
-    const { id } = await ask(h);
+    const { id } = await ask(h, fx.external, "write");
     h.broker.decide(id, "once", "web");
     const answer = h.answerTurn();
     const grantLine = `(subpath "${fx.external}")`;
-    const fg = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true" } });
-    expect(fg.hookSpecificOutput?.updatedInput?.command).toContain(grantLine);
-    const bg = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "sleep 600; cat x", run_in_background: true } });
-    expect(bg.hookSpecificOutput?.updatedInput?.command).toBeDefined();
-    expect(bg.hookSpecificOutput?.updatedInput?.command).not.toContain(grantLine);
-    const subBash = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true" }, agent_id: "agent-1" });
-    expect(subBash.hookSpecificOutput?.updatedInput?.command).not.toContain(grantLine);
+    for (const tool_input of [{ command: "true" }, { command: "setsid sleep 600 &", run_in_background: true }]) {
+      const r = await guard(h.broker)({ tool_name: "Bash", tool_input });
+      expect(r.hookSpecificOutput?.updatedInput?.command).toBeDefined();
+      expect(r.hookSpecificOutput?.updatedInput?.command).not.toContain(grantLine);
+    }
+    expect(await readAllowed(h.broker)).toBe(true);
+    const write = await guard(h.broker)({ tool_name: "Write", tool_input: { file_path: join(fx.external, "new.txt"), content: "x" } });
+    expect(write.hookSpecificOutput?.permissionDecision).not.toBe("deny");
     h.turns.end(GROUP, answer);
   });
 
@@ -564,7 +565,7 @@ describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
     return { code: run.status ?? -1, out: `${run.stdout}${run.stderr}` };
   }
 
-  it("after Allow once the target is readable in the answer turn; after it, it is not", async () => {
+  it("after Allow once the shell still cannot read the target, while Read can (in the answer turn only)", async () => {
     const h = harness();
     const turn = h.turns.begin(GROUP, [GROUP]);
     expect((await cat(h.broker)).out).not.toContain("EXTERNAL-CONTENT");
@@ -572,12 +573,13 @@ describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
     h.broker.decide(id, "once", "web");
     h.turns.end(GROUP, turn);
     const answer = h.answerTurn();
-    expect(await cat(h.broker)).toMatchObject({ code: 0, out: "EXTERNAL-CONTENT\n" });
+    const shell = await cat(h.broker);
+    expect(shell.code).not.toBe(0);
+    expect(shell.out).not.toContain("EXTERNAL-CONTENT");
+    expect(await readAllowed(h.broker)).toBe(true);
     h.turns.end(GROUP, answer);
     const later = h.turns.begin(GROUP, [GROUP]);
-    const after = await cat(h.broker);
-    expect(after.code).not.toBe(0);
-    expect(after.out).not.toContain("EXTERNAL-CONTENT");
+    expect(await readAllowed(h.broker)).toBe(false);
     h.turns.end(GROUP, later);
   });
 

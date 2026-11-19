@@ -1,6 +1,13 @@
 import type { ReplyTarget } from "./sessions/types.js";
 import type { SessionStore } from "./sessions/store.js";
-import { extractImessageIdentifier, isGroupSessionKey, legacySessionKeysForBinding } from "./sessions/keys.js";
+import {
+  dmIdentityFromSessionKey,
+  extractImessageIdentifier,
+  isDmSessionKey,
+  isGroupSessionKey,
+  legacySessionKeysForBinding,
+  replyTargetFromRawSessionKey,
+} from "./sessions/keys.js";
 import { SummonStore } from "./sessions/summon-store.js";
 import { log } from "./logger.js";
 import { isOwnerHandle, ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "./owner.js";
@@ -180,7 +187,7 @@ export class OwnerRouter {
       if (summoned) {
         const isOwners = owner !== undefined && summoned === owner.name.toLowerCase();
         const replyTarget = isOwners
-          ? this.sessions.getReplyTarget(ownerSessionKey(owner)) ?? this.deriveReplyTargetFromConfig(summoned)
+          ? this.dmReplyTarget(ownerSessionKey(owner))
           : undefined;
         if (isOwners && replyTarget) {
           // /summon may be the owner's first interaction after an upgrade —
@@ -243,6 +250,32 @@ export class OwnerRouter {
       if (first) return { channelName, chatId: first };
     }
     return undefined;
+  }
+
+  /**
+   * Reply target for a `dm:<identity>` session: the persisted last-active
+   * target, else the owner's configured handle (deriveReplyTargetFromConfig).
+   * Undefined for any non-dm key — it never parses a raw key, so it can never
+   * yield a group. No owner-handle filtering: callers that must only reach a
+   * CURRENT owner handle (permission prompts, owner notices) check that
+   * themselves.
+   */
+  dmReplyTarget(sessionKey: string): ReplyTarget | undefined {
+    const identityName = dmIdentityFromSessionKey(sessionKey);
+    if (identityName === undefined) return undefined;
+    return this.getReplyTarget(sessionKey) ?? this.deriveReplyTargetFromConfig(identityName);
+  }
+
+  /**
+   * Reply target for any session key. A dm: key resolves as dmReplyTarget; a
+   * raw `<channel>:<chatId>` key uses its persisted target, else the key
+   * itself — INCLUDING group chats. Only for callers that explicitly address
+   * that session (send_message to a named key, a turn routed to its own
+   * session); private-only paths must use dmReplyTarget.
+   */
+  sessionReplyTarget(sessionKey: string): ReplyTarget | undefined {
+    if (isDmSessionKey(sessionKey)) return this.dmReplyTarget(sessionKey);
+    return this.getReplyTarget(sessionKey) ?? replyTargetFromRawSessionKey(sessionKey);
   }
 
   /**

@@ -324,7 +324,7 @@ export class Agent {
       ),
       listTasks: (key, since) => this.taskSource?.listFor(key, since),
       sendToOwnerDm: async (owner, text) => {
-        const target = this.router.getReplyTarget(ownerSessionKey(owner)) ?? this.router.deriveReplyTargetFromConfig(owner.name);
+        const target = this.router.dmReplyTarget(ownerSessionKey(owner));
         // Only a private DM: a reply target that is a group must not receive it.
         if (!target || isGroupSessionKey(`${target.channelName}:${target.chatId}`)) return false;
         const dm = this.getChannel(target.channelName);
@@ -412,8 +412,8 @@ export class Agent {
       isPrivateMemoryBarred: (sessionKey) => this.isPrivateMemoryBarred(sessionKey),
       isAttachmentBarred: (sessionKey, path) => this.isAttachmentBarred(sessionKey, path),
       getSummonedIdentity: (channelName, chatId) => this.router.getSummonedIdentity(channelName, chatId),
-      getReplyTarget: (sessionKey) => this.router.getReplyTarget(sessionKey),
-      deriveReplyTargetFromConfig: (identityName) => this.router.deriveReplyTargetFromConfig(identityName),
+      dmReplyTarget: (sessionKey) => this.router.dmReplyTarget(sessionKey),
+      sessionReplyTarget: (sessionKey) => this.router.sessionReplyTarget(sessionKey),
       appendAssistantTranscript: (sessionKey, content, channelName) => {
         this.sessions.append(sessionKey, {
           role: "assistant",
@@ -1266,10 +1266,8 @@ export class Agent {
   ): { channel: Channel; chatId: string } | undefined {
     let target: ReplyTarget | undefined;
 
-    const identityName = dmIdentityFromSessionKey(sessionKey);
-    if (identityName !== undefined) {
-      target = this.router.getReplyTarget(sessionKey)
-        ?? this.router.deriveReplyTargetFromConfig(identityName);
+    if (dmIdentityFromSessionKey(sessionKey) !== undefined) {
+      target = this.router.dmReplyTarget(sessionKey);
       if (!target) {
         log.warn({ sessionKey }, "%s: no reply target for dm session", source);
         return undefined;
@@ -1439,7 +1437,7 @@ export class Agent {
     const owner = config.owner;
     const key = this.router.ownerSessionKey();
     if (!owner || !key) return undefined;
-    return this.router.getReplyTarget(key) ?? this.router.deriveReplyTargetFromConfig(owner.name);
+    return this.router.dmReplyTarget(key);
   }
 
   /**
@@ -2332,16 +2330,12 @@ export class Agent {
         suppressDelivery: true,
         suppressedLog: "Continuity output suppressed from chat delivery (heartbeats speak via send_message)",
         resolveTarget: () => {
-          const identityName = dmIdentityFromSessionKey(key);
-          // Final fallback covers raw keys only (dm: keys don't parse), so
-          // heartbeats — always DM-keyed — are unaffected; it lets a
-          // unsummoned restart notice routed to its initiating group session
-          // (see handleRestartForSession) deliver even without a persisted
-          // reply target.
-          const replyTarget = this.router.getReplyTarget(key)
-            ?? (identityName !== undefined ? this.router.deriveReplyTargetFromConfig(identityName) : undefined)
-            ?? privateReplyTargetFromSessionKey(key)
-            ?? replyTargetFromRawSessionKey(key);
+          // The raw-key fallback (dm: keys don't parse) leaves heartbeats —
+          // always DM-keyed — unaffected; it lets a unsummoned restart notice
+          // routed to its initiating group session (see
+          // handleRestartForSession) deliver even without a persisted reply
+          // target.
+          const replyTarget = this.router.sessionReplyTarget(key);
           if (!replyTarget) return undefined;
           const channel = this.getChannel(replyTarget.channelName);
           return channel ? { channel, chatId: replyTarget.chatId } : undefined;

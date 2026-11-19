@@ -154,12 +154,8 @@ export class OwnerNotices {
     const dmKey = this.router.ownerSessionKey();
     let target: ReplyTarget | undefined;
 
-    if (dmKey) {
-      const identityName = dmIdentityFromSessionKey(dmKey);
-      target = this.router.getReplyTarget(dmKey)
-        ?? (identityName !== undefined ? this.router.deriveReplyTargetFromConfig(identityName) : undefined)
-        ?? privateReplyTargetFromSessionKey(dmKey);
-    }
+    // ownerSessionKey() is always a dm: key, so this never resolves a group.
+    if (dmKey) target = this.router.dmReplyTarget(dmKey);
 
     if (!target && !config.owner) {
       // No owner at all — find the first DM (non-group) session across all

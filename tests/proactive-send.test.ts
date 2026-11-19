@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { Channel, IncomingMessage, MessageReaction, OutgoingMessage, RecentChatMessage } from "../src/channels/types.js";
 import type { SessionEntry } from "../src/sessions/types.js";
+import { replyTargetFromRawSessionKey } from "../src/sessions/keys.js";
 import { FABRICATED_MARKER_NOTICE, formatInboundStamp } from "../src/agent/inbound-markers.js";
 import { log } from "../src/logger.js";
 
@@ -84,8 +85,8 @@ function makeHarness(overrides: Partial<Deps> = {}, channel = new FakeChannel())
     getChannel: (name) => (name === channel.name ? channel : undefined),
     isPrivateMemoryBarred: () => false,
     getSummonedIdentity: () => undefined,
-    getReplyTarget: () => undefined,
-    deriveReplyTargetFromConfig: () => undefined,
+    dmReplyTarget: () => undefined,
+    sessionReplyTarget: (key) => replyTargetFromRawSessionKey(key),
     appendAssistantTranscript: (sessionKey, content, channelName) => {
       transcript.push({ sessionKey, content, channelName });
     },
@@ -431,7 +432,7 @@ describe("ProactiveSendService.delegateToSession", () => {
   it("does not pin delivery for identity or dm targets (reply policy decides)", async () => {
     mockConfig.identities = [{ name: "Shuai", channels: { telegram: "12345" } }];
     try {
-      const h = makeHarness({ deriveReplyTargetFromConfig: () => ({ channelName: "telegram", chatId: "12345" }) });
+      const h = makeHarness({ dmReplyTarget: () => ({ channelName: "telegram", chatId: "12345" }) });
       await h.service.delegateToSession("Shuai", "send the brief");
 
       expect(h.delegated[0].sessionKey).toBe("dm:shuai");

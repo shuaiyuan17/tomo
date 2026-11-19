@@ -9,7 +9,7 @@ body:
         Before filing, try:
         - `tomo update`, then `tomo restart`
         - `tomo status` and `tomo logs` to see whether the daemon is running and what it says
-        - The [Requirements](https://github.com/shuaiyuan17/tomo#requirements) and [Configuration](https://github.com/shuaiyuan17/tomo#configuration) sections of the README
+        - The README [Requirements](https://github.com/shuaiyuan17/tomo#requirements) and the [configuration docs](https://github.com/shuaiyuan17/tomo/blob/main/docs/configuration.md)
   - type: textarea
     id: goal
     attributes:

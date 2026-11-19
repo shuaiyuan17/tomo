@@ -91,7 +91,7 @@ export interface MetricsConfig {
  *                 lives on `git log $(git merge-base main HEAD)`, and v1 is
  *                 aimed at accidents, not at an agent deliberately assembling
  *                 `rm` out of `$(…)`. That is a sandbox's job, not a policy
- *                 layer's — see the "not a sandbox" note in the README.
+ *                 layer's — see "This is policy, not a sandbox" in docs/permissions-and-privacy.md.
  *  - `worktree` — `readonly` minus the must-name-it clause. An ABSOLUTE path
  *                 token on a write command still has to land inside
  *                 `writeRoots`; a RELATIVE one is not judged for the allow side

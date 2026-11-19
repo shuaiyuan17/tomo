@@ -41,7 +41,7 @@ The authoritative reference is [CLAUDE.md](CLAUDE.md), which documents the archi
 
 - ESM, TypeScript strict, imports end in `.js`, named exports only.
 - Log through `log` from `src/logger.ts`.
-- Config is zod-validated in `src/config.ts`; a new key needs a schema entry, a README entry, and a test.
+- Config is zod-validated in `src/config.ts`; a new key needs a schema entry, an entry in `docs/configuration.md` (or the topic doc it belongs to), and a test.
 - Anything that rewrites a session JSONL file must preserve unparseable lines (see the LCM section of CLAUDE.md).
 - Tests live in `tests/` and mirror `src/`. Behavior changes need a test; bug fixes need one that fails before the fix.
 
@@ -51,7 +51,7 @@ The authoritative reference is [CLAUDE.md](CLAUDE.md), which documents the archi
 - Fill in the PR template. The **Evidence** section is what gets read first: a focused test, `tomo logs` output, or a redacted chat transcript beats prose.
 - Title the PR by the user-visible change, optionally prefixed with an area (`telegram:`, `cron:`, `lcm:`), matching the existing history. Conventional Commits prefixes are fine too; neither is enforced.
 - Say which platform you tested on. iMessage paths only run on macOS.
-- Update the README for any new config key, CLI flag, or chat command, and CLAUDE.md if you changed an invariant it documents.
+- Update the docs for any new config key, CLI flag, or chat command (`docs/configuration.md`, `docs/commands.md`; the README only for headline features), and CLAUDE.md if you changed an invariant it documents.
 - Keep tokens, phone numbers, and chat IDs out of the diff, the description, and test fixtures.
 - Leave **Allow edits from maintainers** on so the branch can be finished if you step away.
 

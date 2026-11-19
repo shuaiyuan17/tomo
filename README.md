@@ -11,609 +11,144 @@
 
 <p align="center">
   Powered by <a href="https://platform.claude.com/docs/en/agent-sdk/overview">Claude Agent SDK</a> &middot;
-  Personality system &middot;
-  Persistent memory &middot;
-  Scheduled tasks &middot;
-  Telegram &middot; iMessage
+  Telegram &middot; iMessage &middot; Web
 </p>
 
 ---
 
-## Quick Start
+Tomo is a long-running assistant you text like a friend. It runs as a daemon on your own machine, answers you on Telegram, iMessage or a private local web chat, and keeps **one continuous conversation** with you across all of them. Under the hood it is the full Claude Agent SDK — files, shell, web, subagents, skills, MCP — with a personality, a memory, and a sense of time.
+
+## Why Tomo
+
+- **One conversation, every channel.** Text from your phone on iMessage, pick it up on Telegram or in the browser: it's the same session, and Tomo replies where you last wrote.
+- **Remembers you.** File-based memory you can read and edit, a people registry so you refer to people by name, and hierarchical rollups (daily → weekly → monthly → yearly) instead of lossy auto-compaction. Anything compacted out stays searchable.
+- **Has its own personality.** Three markdown files — `SOUL.md`, `AGENT.md`, `IDENTITY.md` — define who it is. Edit them anytime; changes apply on the next message.
+- **Acts on its own time.** Scheduled tasks ("remind me in 30 minutes", "check the weather every morning at 9"), todos that outlive a conversation, and optional heartbeats that give it unstructured time.
+- **Safe in group chats.** Groups get their own isolated sessions, never see your private memory, and run shell commands in a macOS sandbox. `/summon` brings your personal context into a group on demand.
+- **Robust as a daemon.** A durable inbox survives crashes, mid-turn messages steer the running turn, and interrupted subagents are reported after a restart.
+- **Yours to extend.** Add MCP servers (with managed OAuth), Claude Code plugins, skills, or route through LiteLLM to other model backends.
+
+## Quick start
 
 ```bash
 npm install -g tomo-ai
-tomo init       # Pick Telegram and/or iMessage, set yourself as the owner, choose a model
-tomo start      # Runs in background
 ```
-
-Open the private web access link with `cat ~/.tomo/web-access.log`. It shares
-the owner's DM session; existing groups are read-only. The UI is enabled by
-default and requires the access token stored in `~/.tomo/web-token` (`0600`).
-The listener binds to `127.0.0.1`; optional Tailscale Serve access uses one exact
-HTTPS `web.externalOrigin`. Configure `web.enabled` and `web.port` in
-`config.json`; the web chat is always the owner's.
-See [web UI setup, security, and limits](docs/web-ui.md).
-
-That's it. Message Tomo on the channel you picked. `tomo init` creates your
-owner session (`dm:<name>`) up front, so a channel you connect later
-(`tomo config` → Owner / Channels) joins the same conversation.
-
-## Requirements
-
-- Node.js 22.12+
-- A Claude login or an Anthropic API key. Tomo runs the Claude Code binary bundled with its Agent SDK dependency, so a separate `claude` install is not required; `tomo init` offers to log in through it, and `/login` from your owner DM works later. LiteLLM gateways support other backends.
-- At least one channel:
-  - **Telegram** — bot token from [@BotFather](https://t.me/BotFather)
-  - **iMessage** — the [imsg CLI](https://github.com/openclaw/imsg) on a Mac with iMessage signed in (Tomo needs Full Disk Access)
-
-## CLI
 
 ```bash
-tomo init              # First-time setup
-tomo config            # Interactive settings (authentication, model, LiteLLM, owner, channels, groups)
-tomo start             # Start in background (daemon)
-tomo start -f          # Start in foreground (for dev)
-tomo stop              # Stop the daemon
-tomo restart           # Restart the daemon
-tomo restart --reason "..."  # Restart and tell the agent why afterward
-tomo status            # Show PID and uptime
-tomo watch             # Live mission-control TUI (activity feed, vitals, log tail)
-tomo logs              # View logs (pretty-printed)
-tomo logs -f           # Follow logs live
-tomo sessions list     # Show active sessions
-tomo sessions clear [key]  # Unlink one session (or all sessions)
-tomo cron              # Manage scheduled tasks (add / list / remove / run <id>)
-tomo todo due          # Print todos past their review date (max 3; prints nothing when none are due)
-tomo todo list         # Print every open todo
-tomo continuity        # Manually trigger a continuity heartbeat
-tomo lcm               # Context tools (stats / blocks / compact / search / prune-tools / rollups)
-tomo backup            # Back up all Tomo data (create / list / restore <date>)
-tomo usage backfill    # One-off: rebuild the usage ledger's history from the activity log (--dry-run first)
-tomo migrate           # Import conversation history from other platforms (openclaw <file>)
-tomo update            # Update Tomo to the latest version and restart
-tomo uninstall         # Stop Tomo and remove the login item (keeps your data)
+tomo init       # Pick Telegram and/or iMessage, set yourself as the owner, choose a model
 ```
 
-## Chat Commands
-
-| Command | Description |
-|---------|-------------|
-| `/new` | Start a new conversation (resets session) |
-| `/rewind [N]` | Return to before the last N recorded user messages (default 1; configured owner's private DM only) |
-| `/model` | Switch model (Claude aliases, direct model IDs, or LiteLLM `provider/model` names) |
-| `/restore` | Restore `config.json` from `config.json.bak` and restart |
-| `/login` | Refresh Claude login from a configured owner's private DM (`/login cancel` aborts a pending login) |
-| `/mcp` | Show external MCP health; `/mcp login <server>` starts per-server OAuth (owner DM only) |
-| `/status` | Show session info (model, channel, message count) |
-| `/tasks` | List this chat's running tasks and the last 5 finished today (`/tasks all`: all of today). `/task` works too |
-| `/todo` | List this chat's open todos; `/todo add <text>`, `/todo done <id>`, `/todo drop <id> [reason]`, `/todo all` |
-| `/cost` | Show current-session cost for 1d / 7d / 1mo |
-| `/usage` | Show Claude subscription usage limits (5-hour and weekly windows + reset countdowns) |
-| `/pet` | Check Tomo's pet's mood, growth stage, and stats |
-| `/summon` | (groups) Pull your main DM session into this group temporarily |
-| `/dismiss` | (groups) Hand the group back to its own Tomo session |
-| `/pause` | (groups) Ignore ordinary messages in this group (not read, not remembered) until `/resume`; slash commands, including `/resume`, still work. Any member can use it |
-| `/resume` | (groups) Lift a `/pause` |
-
-**Rewind** — In an owner's Telegram or iMessage DM, `/rewind` branches the conversation before the most recent recorded human message; `/rewind 3` goes back before the last three. All later context is omitted from the new branch. If the chosen message arrived while a tool call was still running, the rewind goes back to the end of the previous complete turn instead, and the reply quotes the message it rewound to. Send your edited request afterward. No model call or automatic retry is needed, so the command also works after an API refusal. If a turn is still running (for example, stuck after a refusal), `/rewind` stops it first; the stopped turn is not retried and sends nothing more, and anything queued for the conversation runs afterwards on the rewound context. It does not undo tools, file changes, messages already sent, or persistent memory. Tomo's chat transcript stays intact; the original SDK session follows the normal 30-day unlinked-session retention. Only human messages with recorded provenance in the current context can be selected; compacted or older messages without provenance cannot. Use `/new` to start fresh when that history is unavailable. Rewinding does not guarantee that a subsequent request will be accepted.
-
-**Tasks** — `/tasks` (or `/task`, any case; `/tasks@yourbot` in Telegram groups) answers from Tomo itself, with no model call: the same list as the web UI's Tasks panel (subagents, background shells, monitors, workflows; watchers left out), one plain-text line each — every running task, then the five that ended most recently today (✗ marks a failure). `/tasks all` lists every task that ended today. Your DM shows your own session's tasks. A group shows only that group's own tasks, never your DM's or another group's — except in a summoned group, where you (the owner) get your own session's list, since the summoned turns run there: it goes to your private DM, and the group sees only "Sent to your DM." It reads the web UI's task board, so it needs the web UI enabled (`web.enabled`, on by default); history starts when Tomo starts. In the web chat itself, `/tasks` is ordinary text (the panel is right there).
-
-**Todo** — `/todo` answers from Tomo itself, with no model call, in plain text: what is waiting on you first, then the first ten of Tomo's own, then a count of the rest (`/todo all` lists everything, including what waits on someone else). `/todo add <text>` adds an item waiting on Tomo, with the text as both title and next step (your items are never refused by the open cap, but they count toward it). `/todo done t-12` and `/todo drop t-12 [reason]` close one. Your DM sees every item. A group sees only its own items, and only you can add, finish or drop there; in a summoned group your full list goes to your private DM and the group sees only "Sent to your DM.". See [Todos](#todos).
-
-**Summon** — `/summon` in a group routes that group's messages into your main `dm:` session, so Tomo answers with your full personal context. Group-facing replies go through an explicit `send_message` direct call; plain output stays in your private DM. `/dismiss` hands back, and the summon auto-expires after `summonExpiryMinutes` (default 60) of group inactivity.
-
-## Features
-
-### Personality
-
-Three markdown files define who your assistant is, all customizable:
-
-| File | Purpose |
-|------|---------|
-| `SOUL.md` | Core personality, values, communication style |
-| `AGENT.md` | Operating rules, response format, behavior |
-| `IDENTITY.md` | Name, vibe, preferences, quirks |
-
-During `tomo init`, you choose a name, your preferred name, and a tone (chill / sharp / warm). These get baked into the templates. Edit them anytime — changes take effect on the next message, no restart needed.
-
-### Memory
-
-File-based persistent memory at `~/.tomo/workspace/memory/`. The `MEMORY.md` index is injected into every conversation. Tomo reads and writes memory files autonomously — it remembers who you are, your preferences, and past context across sessions.
-
-Files under `memory/private/` are **DM-only**: they are stripped from the index a group session sees, and a `PreToolUse` guard blocks them from `Read`/`Grep`/`Glob` and from `MEDIA:` attachments for any turn a group is steering — a group session for its whole life, and your own DM session for the duration of a `/summon`. On those turns Bash still works, but every command is run through a macOS `sandbox-exec` profile that denies `memory/private/` at the kernel level, so a path assembled inside `python3 -c` fails with `EPERM` instead of succeeding the way it would against a filter over command text. The profile is passed inline on the command line, never written to a file — a file would be one more thing the sandboxed shell could edit. If the sandbox cannot be set up, the Bash tool is withheld for the turn rather than run unsandboxed — that covers a host without `sandbox-exec`, a private directory whose real location cannot be established, and the case where the workspace's `.claude/settings.json` or an enabled plugin carries a `PreToolUse` hook: such a hook can rewrite a tool's input after Tomo's own guard has answered, so a barred turn gets no shell rather than one whose sandbox a hook might have removed. If you want a shell on group turns, keep `PreToolUse` hooks out of the workspace settings. The profile is an allowlist: system directories are read-only, the workspace and the temp dirs are read-write, and nothing else is reachable — not your home directory, not Tomo's config file, logs or state, not the login keychains or `~/.ssh`. `memory/private/` and the workspace's `secrets/` stay denied, as do writes to `home/` and `.claude/`. Outbound network works, but connections to localhost and to local Unix sockets do not (services on this machine run outside the sandbox), and the shell gets only an allowlist of environment variables (PATH, HOME, locale and the like), never the credentials the daemon may carry. It starts without your shell start-up files (`zsh -f`), and git there ignores `~/.gitconfig`. The same path policy applies to `Read`/`Write`/`Edit`/`Grep`/`Glob` and to `MEDIA:` attachments on those turns, including the attachments in a group's final reply.
-
-Per group, `groupSandbox.groups["<session key>"]` can add `extraRead` / `extraWrite` directories (absolute or `~/` paths), or set `unsandboxed: true` for a group you fully trust: its Bash then runs unsandboxed, as in your DM, including while it is summoned into your DM session, and its file tools keep only the private-memory guards. The older `groupShellAllowlist` (a list of session keys) is still read and means `unsandboxed: true` for each key not listed in `groupSandbox`.
-
-A group turn that needs a path outside its sandbox can ask with `request_permission` (path, read or write, a reason). You get a four-line DM with a short code, and a card in the web UI, with three answers: **Allow once** (for the one turn that delivers your answer), **Always allow** (added to that group's `extraRead` / `extraWrite` in `config.json`, with a backup) and **Deny**. In the DM, reply `1 <code>`, `2 <code>` or `3 <code>`, or quote the request and reply 1, 2 or 3; a bare reply does not count, and nothing said in a group ever does. A group has at most one open request, and one left unanswered for 5 minutes is denied. Paths no group may reach (private memory, `secrets/`, Tomo's own files, keychains, `~/.ssh`) are refused without asking. An Allow once reaches only the main agent's file tools (Read, Write, Edit, Grep, Glob) in that turn: never the shell (a process it starts could outlive the turn) and not subagents; shell access needs Always allow. Each Always allow gets a grant id (`G-XXXXXX`, shown in the confirmation and stored with it in `config.json`); reply `revoke G-XXXXXX` in your DM, or use the web endpoint `POST /api/v1/permissions/revoke`, to take it back. A revoke applies from the next tool call; a background command already running keeps the access it started with. Every request, answer and revocation is logged to `~/.tomo/data/permissions/group-requests.jsonl`; requests still open when Tomo stops are recorded as denied (restart) on the next start, and their groups are told.
-
-Tomo's own state directory, `~/.tomo/data/` (session transcripts, the inbox, the usage ledger, the cron store, and the sessions directory when it is relocated), is closed to those turns in the same way. The file tools and `MEDIA:` attachments are refused there, and the shell's profile denies reads and writes under it. It holds every conversation, your DMs included. A group gets what it needs from that state through Tomo's tools, never by reading the files.
-
-The profile is a few denies, not a jail — `(allow default)` is deliberate, so that git, gh, curl and the rest of the toolchain keep working on a group's turn. What that leaves reachable from a barred turn's shell is unchanged by this fence and worth knowing: the SDK transcript directory under `~/.claude/projects/` and `~/.tomo/logs/` hold results of private reads from earlier DM turns; `~/.tomo/config.json` is writable; a hardlink to a private file made before the turn, living outside `memory/private/`, still reads. Narrowing those is a separate question from the one this fence answers, which is the directory itself.
-
-Beyond memory files, the `recall_conversation` tool lets Tomo search a session's full message history — including everything compacted out of its context window or archived to monthly transcript files.
-
-### People Registry
-
-Tomo keeps person records at `~/.tomo/workspace/memory/people/*.md` — canonical name, aliases/nicknames, and per-channel handles in frontmatter, freeform notes below. Group messages are annotated with the sender's resolved name, and handles auto-bind the first time a sender's display name matches a record — you only ever refer to people by name. Records meant for your eyes only live under `memory/private/people/` and never enter group chats. Tomo maintains the registry itself via the `list_people` / `upsert_person` tools.
-
-### Channels
-
-- **Telegram** — DM and group chat support
-  - Typing indicators with keepalive and error backoff
-  - Image/photo support (sends to Claude as vision input)
-  - Group chat: defaults to mention-required (only responds when @mentioned or replied to); per-group passive listen mode opt-in via `channels.telegram.passiveGroups`
-  - Markdown rendering with plain-text fallback
-  - Inbound reactions reach Tomo worded like iMessage tapbacks (`[reacting to: "…"] [tapback: love]`). In a group Telegram sends them only when the bot is an admin.
-- **iMessage** — via the local [imsg CLI](https://github.com/openclaw/imsg), enabled with `channels.imessage.provider: "imsg"`
-  - DM and group chat support
-  - Image attachment support
-  - Contact name resolution from Mac contacts
-  - Group chat: observes all messages, only responds when relevant (replies `NO_REPLY` to stay silent)
-  - imsg provider: no external server — Tomo spawns one `imsg rpc` child (needs Full Disk Access); adds inbound tapbacks and built-in reply context, and gates message editing on a live macOS selector probe
-
-### Multi-Channel Sessions
-
-Tomo works for one person, the **owner**. Every owner DM — Telegram, iMessage and the web UI — lands in one session, `dm:<owner.name>`, and Tomo replies on whichever channel you last used.
-
-- The owner's session is created up front (by `tomo init`, or on first start), so a channel connected later joins it instead of starting a new one
-- **Admission fails closed.** Only DMs from the owner's handles are answered. Anyone else gets no reply and no session; Tomo logs one line per sender per hour. A channel with no allowlist is not open
-- Group chats always get their own isolated session, and are off until activated: send the secret passphrase (`tomo config` → Group chats) in the group, which adds it to the channel's `allowlist`. The allowlist only lists groups; DM entries in it are ignored
-- iMessage handles are compared in a normal form, so `+1 (555) 555-0123` and `iMessage;-;+15555550123` match
-- `owner.name` is the session id and never changes; set `owner.displayName` for what Tomo should call you
-- Older configs with `identities` keep working: one identity is read as the owner (same session). With several, `web.ownerIdentity` (or else the first) becomes the owner and Tomo warns at startup; the others' sessions are left untouched but their DMs are no longer answered. Their cron jobs keep firing into those sessions and deliver to that person's last chat (a job whose session has no reply target is skipped with a warning); `tomo config` → Owner → **Convert legacy identities** lists them and offers to disable them
-- `tomo config` → **Owner** shows your session id (read-only), display name, Telegram IDs and iMessage handles. Enabling iMessage in `tomo config` → Channels asks for your handle; going without one needs an explicit confirmation. Channels → **Groups** lists activated groups only
-
-### Tools
-
-Tomo has access to Claude's built-in tools:
-
-| Tool | Capability |
-|------|-----------|
-| Read, Write, Edit | File operations |
-| Bash | Shell commands |
-| Glob, Grep | File search |
-| WebSearch, WebFetch | Web access |
-| Agent | Subagents for complex tasks |
-| Skill | Specialized workflows |
-| TodoWrite | Task tracking within a turn |
-| NotebookEdit | Edit Jupyter notebooks |
-
-Plus a built-in `tomo-internal` MCP server:
-
-| Group | Tool | Capability |
-|-------|------|-----------|
-| Messaging | `send_message` | Message another session — `delegate` mode (recipient's Claude composes) or `direct` mode (verbatim text) |
-| | `list_sessions` | List the owner and active group chats (titles, participants) |
-| | `rename_group_chat` | Rename a real Telegram/iMessage group chat |
-| | `react_to_message` | React/tapback to a message in a session — latest inbound by default, or matched by text |
-| Scheduling | `schedule_create` / `schedule_list` / `schedule_remove` | Manage scheduled tasks (one-shot, interval, or cron) |
-| Todos | `todo_add` / `todo_list` / `todo_resolve` | Commitments that outlive a conversation (see [Todos](#todos)) |
-| People | `list_people` / `upsert_person` | Read and maintain the people registry |
-| History | `recall_conversation` | Search the session's full history, including compacted and archived messages |
-| Pet | `pet_status` / `pet_hatch` / `pet_feed` / `pet_play` / `pet_sleep` | Care for Tomo's virtual pet |
-
-### External MCP Servers
-
-Add remote or local MCP servers directly to `~/.tomo/config.json` under `mcpServers`. Tomo passes them through to the Claude Agent SDK and, by default, auto-allows all tools from each configured server with `mcp__<server>__*`.
-
-```json
-{
-  "mcpServers": {
-    "docs": {
-      "type": "http",
-      "url": "https://code.claude.com/docs/mcp"
-    },
-    "github": {
-      "type": "sse",
-      "url": "https://api.example.com/mcp/sse",
-      "headers": {
-        "Authorization": "Bearer ${GITHUB_TOKEN}"
-      }
-    },
-    "github-copilot": {
-      "type": "http",
-      "url": "https://api.githubcopilot.com/mcp/",
-      "oauth": {
-        "scopes": ["read:user"],
-        "tokenStoreKey": "github-copilot"
-      }
-    },
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "${HOME}/Projects"]
-    }
-  }
-}
+```bash
+tomo start      # Runs in the background
 ```
 
-Use `type: "http"` for streamable HTTP, `type: "sse"` for SSE, or omit `type` for stdio servers. Environment variables in `url`, `headers`, `env`, and `args` are expanded at runtime. To restrict auto-approval, set top-level `mcpAllowedTools`, for example `["mcp__github__list_issues"]`.
+That's it — message Tomo on the channel you picked. `tomo init` creates your owner session up front, so a channel you connect later (`tomo config` → Owner / Channels) joins the same conversation.
 
-Remote HTTP/SSE servers can also use harness-managed OAuth by adding an `oauth` block. Tomo discovers the authorization server from the MCP server's RFC 9728 `WWW-Authenticate` challenge unless `authorizationServer` is set explicitly, uses authorization-code + PKCE, registers a dynamic client when needed, stores tokens in `~/.tomo/workspace/secrets/mcp-oauth.json` with mode `0600`, silently refreshes near-expiry tokens, and injects `Authorization: Bearer <token>` into MCP headers. The agent never sees the tokens.
+**Web chat.** The local web UI is on by default at `127.0.0.1:9465`. Get your private access link with:
 
-If browser login is needed, Tomo forwards the authorize URL to your private chat without blocking the agent session. When the browser is on another device and its localhost redirect cannot reach the Tomo host, paste the full redirect URL back into the configured owner's private DM; Tomo matches its single-use `state`, exchanges the code with the server-side PKCE verifier, and stores the resulting token. Once authentication succeeds, Tomo hot-mounts the server into live sessions through the Agent SDK without waiting for a restart or another session cycle; older SDKs and rejected runtime updates safely fall back to mounting it in the next session. `/mcp` shows configured servers, per-session mount state, token expiry, pending authorization, and the latest auth failure; `/mcp login <server>` starts or reuses one background flow for that server.
-
-### Claude Code Plugins
-
-Tomo can load [Claude Code plugins](https://code.claude.com/docs/en/agent-sdk/plugins) — bundles of skills, agents, slash commands, hooks, and MCP servers — into every session. Add a top-level `plugins` array to `~/.tomo/config.json`:
-
-```json
-{
-  "plugins": [
-    "~/my-plugins/deploy-tools",
-    "code-reviewer@claude-plugins-official",
-    "linear",
-    { "path": "./relative/plugin", "skipMcpDiscovery": true }
-  ]
-}
+```bash
+cat ~/.tomo/web-access.log
 ```
 
-Entries can be:
+### Requirements
 
-- **Local paths** (`~/x`, `./x`, `/x`) — the plugin root directory (the parent of `skills/`, `agents/`, `.claude-plugin/`). Relative paths resolve against `~/.tomo`, not the daemon's working directory.
-- **Installed plugin refs** — plugins you already installed with `claude plugin marketplace add ...` + `claude plugin install ...`. Use the full `name@marketplace` id, or the bare name when it's unambiguous. Tomo resolves the current install path from `~/.claude/plugins/installed_plugins.json` at session start, so plugin updates are picked up automatically on the next session.
-- **Object form** — set `skipMcpDiscovery: true` when Tomo should own the plugin's MCP connections and ignore its bundled `.mcp.json`.
+- **Node.js 22.12+**
+- **A Claude login or an Anthropic API key.** Tomo bundles the Claude Code binary through its Agent SDK dependency, so no separate `claude` install is needed; `tomo init` offers to log in, and `/login` in your DM refreshes it later. [LiteLLM gateways](docs/configuration.md#litellm--chatgpt-subscription-models) support other backends.
+- **At least one messaging channel:**
+  - **Telegram** — a bot token from [@BotFather](https://t.me/BotFather)
+  - **iMessage** — the [imsg CLI](https://github.com/openclaw/imsg) on a Mac signed in to iMessage (Tomo needs Full Disk Access)
 
-Unresolvable entries are skipped with a warning in the logs — a bad plugin ref never blocks startup. Note that plugins whose functionality is defined entirely in their *marketplace entry* (rather than in the plugin directory, e.g. some LSP-only plugins) cannot be loaded this way; Tomo logs a warning when a plugin directory contains no recognizable components.
+## What it can do
 
-### Scheduled Tasks
+Tomo has Claude's built-in tools (Read/Write/Edit, Bash, Glob/Grep, WebSearch/WebFetch, Agent subagents, Skills, TodoWrite, NotebookEdit) plus its own `tomo-internal` MCP server:
 
-Tomo can create scheduled tasks on its own — just ask "remind me in 30 minutes to stretch" or "check the weather every morning at 9am." Supports one-shot reminders, recurring intervals, and cron expressions.
+| Area | Tools |
+|------|-------|
+| Messaging | `send_message` (to another chat, verbatim or composed), `list_sessions`, `react_to_message`, `edit_message`, `unsend_message`, `rename_group_chat` |
+| Scheduling | `schedule_create` / `schedule_list` / `schedule_enable` / `schedule_remove` — one-shot, interval or cron |
+| [Todos](docs/todos.md) | `todo_add` / `todo_list` / `todo_resolve` — commitments with a next step and a review date |
+| People | `list_people` / `upsert_person` — the [people registry](docs/channels.md#people-registry) |
+| Memory | `recall_conversation` (full history search), `lcm_rollup` (summary blocks) |
+| Permissions | `request_permission` (a group asks you for a path), `request_credential` (ask you for a password, [opt-in](docs/permissions-and-privacy.md#credential-broker)) |
+| Home & pet | `home_check` (its 3D room in the web UI), `pet_*` (a Tamagotchi-style virtual pet; check in with `/pet`) |
 
-### Todos
+The **web UI** adds a live Tasks panel (stop or background running subagents), the Study (memory, context usage, cost, cron, todos, model, MCP servers, config) and Tomo's home — a low-poly room it designs itself. See [docs/web-ui.md](docs/web-ui.md).
 
-A todo is one thing that can be finished, whose next step is known, and whose next mover is known: Tomo (`me`), the owner (`owner`) or someone else (`external`). They outlive conversations, unlike `TodoWrite`/`TaskCreate`, which are one turn's plan. Ideas, reference notes, timed reminders (use a scheduled task) and recurring work (cron) are not todos.
-
-The rules are enforced by the tools, not left to the model:
-
-- `todo_add` needs a one-line `title`, a `next` step and `waiting_on`; details go in the file, PR or issue that `ref` points to. There are no notes.
-- Every item has a review date (default 3 days when waiting on Tomo, 7 otherwise). Until then it is silent; once it passes, the item is due.
-- `todo_resolve` has four actions and no fifth: `done` (optional `evidence`), `drop` (a one-sentence `reason`), `snooze` (`until` and `reason`; may replace `next`) and `handoff` (it now waits on the owner). After 3 snoozes only done, drop and handoff remain.
-- At 30 open items `todo_add` refuses and lists the five least recently touched, so one gets resolved first.
-
-Items are stored in `~/.tomo/data/todos/todos.json` (rewritten atomically under a file lock, and checked again just before the rename so a writer that got in meanwhile is never overwritten) and `done.ndjson` (one line per finished item, append-only, fsynced before `todos.json` is rewritten; an id found there counts as closed, so a crash between the two writes heals itself and closing twice records once). There is no Markdown copy. A store that cannot be read is reported as an error, never as an empty list. Tomo cannot write those files directly: on every session a `PreToolUse` guard denies `Write`/`Edit` into the directory and Bash writes into it (redirections, `tee`, `cp`, `mv`, `rm`, `ln`, `sed -i`, `perl -i`, `truncate`, `dd of=`); reading is allowed (see SECURITY.md).
-
-Each item belongs to the conversation that created it. Your DM sees and resolves all of them; a group sees only its own. The CLI follows the same rule: run from an agent's shell it is limited to the session in `$TOMO_SESSION_KEY` (`--session` can narrow that, not widen it); from a terminal with no key it shows everything. `tomo todo due` prints at most three due items (oldest first) and nothing when none are due, so a `continuityScript` can call it to bring due items into the heartbeat. Asking the owner about waiting items on a schedule is left to a cron job, for example a weekly one that calls `todo_list` with `filter: "owner"`.
-
-The limits are in `todos` in `config.json`:
-
-| Key | Default | Meaning |
-|-----|---------|---------|
-| `maxOpen` | `30` | Open items at which `todo_add` refuses |
-| `maxSnoozes` | `3` | Snoozes per item before only done / drop / handoff remain |
-| `titleMaxChars` | `120` | Title length limit |
-| `nextMaxChars` | `200` | Next-step length limit |
-| `reviewDaysSelf` | `3` | Default days to review for an item waiting on Tomo |
-| `reviewDaysWaiting` | `7` | Default days to review for an item waiting on the owner or someone else (also used by `handoff`) |
-| `maxReviewDays` | `90` | Furthest a review or snooze date may be set |
-| `dueMax` | `3` | Items `tomo todo due` prints by default (`--max` overrides) |
-
-### Pet
-
-Tomo can hatch and raise a virtual pet — Tamagotchi-style, with hunger, mood, energy, and growth stages, persisted in `~/.tomo/data/pet.json`. Tomo cares for it with its pet tools; check in with `/pet`.
-
-### Sessions
-
-- Multi-turn conversations via Claude Agent SDK session resume
-- Persistent across restarts
-- `/new` in Telegram to start fresh
-- Unlinked sessions kept for 30 days before cleanup
-
-### Context Management (LCM)
-
-Instead of lossy auto-compaction, long conversations are rolled up into hierarchical summary blocks (daily → weekly → monthly → yearly), so old context degrades gracefully rather than disappearing. The `lcm` config block controls the housekeeping nudges: at `nudgeAtPct` context usage (default 70%) Tomo is prompted to prune bulky tool results or run a rollup, re-arming once usage drops below `nudgeResetPct`; `groupCompactStyle` chooses hierarchical rollups (`"lcm"`, default) or SDK auto-compact (`"sdk"`) for group chats.
-
-### Logging
-
-Structured logs via [pino](https://github.com/pinojs/pino):
-- Tool call summaries
-- Token usage and cost per message
-- Context window tracking with compaction warnings
-
-### Observability
-
-- `tomo watch` opens a live terminal view of the running daemon (activity feed, vitals sidebar, chat line, log tail) over `~/.tomo/watch.sock`.
-- `"metrics": { "enabled": true }` serves Prometheus metrics on `http://127.0.0.1:9464/metrics` (`metrics.port` to change it) and writes an NDJSON activity log to `~/.tomo/logs/activity.ndjson` (`metrics.activityLog`, default `true`; `metrics.includeMessageText`, default `true` — turn it off if the log leaves this machine). A ready-made Grafana / Prometheus / Loki stack is in [`contrib/observability/`](contrib/observability/README.md).
-
-## Architecture
+## How it works
 
 ```
-~/.tomo/
-  config.json                 # Owner, channels, model, settings
-  tomo.pid                    # PID file (when running)
-  workspace/
-    SOUL.md                   # Your personality config
-    AGENT.md                  # Your operating rules
-    IDENTITY.md               # Your identity config
-    CONTINUITY.md             # Standing instructions for continuity heartbeats
-    memory/                   # Persistent memory files
-      people/                 # People registry records (private ones under memory/private/people/)
-    secrets/                  # Harness-managed credentials (e.g. MCP OAuth tokens, mode 0600)
-    .claude/skills/           # Agent skills
-  data/
-    cron/jobs.json            # Scheduled tasks
-    sessions/                 # Transcript logs and session registry
-    pet.json                  # Virtual pet state
-    summons.json              # Active group summons
-    usage/YYYY-MM.ndjson      # Usage ledger: estimated cost and tokens per turn, per model
-    usage/backfill.ndjson     # History from before the ledger started (`tomo usage backfill`, merged, never shrinks)
-  logs/
-    tomo.log                  # Daemon logs
+Telegram ─┐
+iMessage ─┼─► admission ─► owner DM session  dm:<you>  ─► Claude Agent SDK ─► reply on your last channel
+Web UI ───┘      │
+                 └──────► group session  <channel>:<chatId>  (isolated, sandboxed)
 ```
+
+- **One owner.** Tomo answers DMs only from your own handles. Everyone else gets no reply and no session — admission fails closed.
+- **Groups are opt-in.** Send the group passphrase (`tomo config` → Group chats) in a group to activate it. Telegram groups respond when mentioned (or always, with `passiveGroups`); iMessage groups observe and reply only when relevant.
+- **Sessions persist.** Conversations resume across restarts; `/new` starts fresh.
+- **Your data stays local.** Config, memory, transcripts and logs live under `~/.tomo/`. Back up with `tomo backup`.
+
+More: [Channels, sessions and groups](docs/channels.md).
+
+## Security
+
+> [!WARNING]
+> **Tomo runs the Claude Agent SDK with permissions bypassed.** In your own DM, the model can do almost anything your user account can: read and write files, run commands, reach the network. Run it on a machine and account you're comfortable giving it, and treat every inbound message, attachment and web page as untrusted input.
+
+- **Group turns are fenced.** `memory/private/` and Tomo's own state (`~/.tomo/data/`) never reach a group. Group Bash runs under a deny-by-default `sandbox-exec` profile; **where that sandbox can't be set up (non-macOS hosts, or a `PreToolUse` hook in workspace settings or a plugin), Bash is withheld on group turns** rather than run unsandboxed. Per-group exceptions and on-demand permission requests: [Permissions and privacy](docs/permissions-and-privacy.md).
+- **`unsandboxed: true` for a group is full trust** — that group's shell can read anything you can.
+- **The credential broker (off by default) prevents accidents, not a determined model.** See [what it does not stop](SECURITY.md#credential-broker-what-it-does-not-stop).
+- **`agentProfiles` scope subagents by policy, not a sandbox.** They stop an agent accidentally deleting a checkout; they don't contain one that wants out. An agent type with no profile is unconstrained. See [per-agent scoping](docs/permissions-and-privacy.md#per-agent-permission-scoping-agentprofiles).
+- **The web UI binds to loopback only** and needs the private token in `~/.tomo/web-token`. For remote access use [Tailscale Serve with one exact origin](docs/web-ui.md#private-access-through-tailscale-serve) — never Funnel.
+- `config.json` holds channel tokens (and maybe an API key) and is written `0600`.
+
+Trust model and vulnerability reporting: [SECURITY.md](SECURITY.md).
+
+## Everyday use
+
+| CLI | |
+|-----|-|
+| `tomo status` / `tomo logs -f` | Is it running, and what is it saying? |
+| `tomo watch` | Live mission-control TUI (activity feed, vitals, log tail) |
+| `tomo config` | Interactive settings: auth, model, LiteLLM, owner, channels, groups |
+| `tomo restart` / `tomo stop` | Restart or stop the daemon |
+| `tomo update` | Update to the latest version and restart |
+| `tomo backup` | Back up all Tomo data (`list`, `restore <date>`) |
+
+| In chat | |
+|---------|-|
+| `/new` | Start a new conversation |
+| `/rewind [N]` | Branch back before your last N messages (DM only) |
+| `/model` | Switch model |
+| `/status`, `/cost`, `/usage` | Session info, cost, subscription limits |
+| `/tasks`, `/todo` | Running tasks; open todos |
+| `/summon`, `/dismiss` | (groups) Bring your DM session into a group, and hand it back |
+| `/pause`, `/resume` | (groups) Have Tomo ignore a group for a while |
+
+Every command, with details: [docs/commands.md](docs/commands.md).
 
 ## Configuration
 
-Run `tomo config` for interactive setup, or edit `~/.tomo/config.json` directly:
+`tomo config` covers the common settings interactively; everything lives in `~/.tomo/config.json` and most values can be overridden by environment variables. Highlights:
 
-```json
-{
-  "auth": {
-    "method": "api-key",
-    "apiKey": "sk-ant-..."
-  },
-  "owner": {
-    "name": "yourname",
-    "displayName": "Your Name",
-    "telegram": ["123456789"],
-    "imessage": ["+15551234567"]
-  },
-  "channels": {
-    "telegram": {
-      "token": "your-bot-token",
-      "allowlist": ["-1001234567890"],
-      "passiveGroups": ["-1001234567890"]
-    },
-    "imessage": { "provider": "imsg", "allowlist": ["any;+;<group-chat-guid>"] }
-  },
-  "model": "claude-opus-5-5[1m]",
-  "litellm": {
-    "mode": "chatgpt-subscription",
-    "baseUrl": "http://localhost:4000",
-    "apiKey": "sk-tomo-local"
-  },
-  "maxTurns": 50,
-  "agent": { "name": "Claw" },
-  "saveInboundImages": true,
-  "saveInboundFiles": true,
-  "continuity": true,
-  "continuityIntervalMinutes": 55,
-  "continuityScript": {
-    "path": "~/bin/tomo-continuity.sh",
-    "timeoutMs": 30000,
-    "maxOutputChars": 8000
-  },
-  "groupSecret": "tomo-xxxxxxxx",
-  "summonExpiryMinutes": 60,
-  "notifyOwnerOnSuppressedErrors": true,
-  "lcm": {
-    "nudgeAtPct": 70,
-    "nudgeResetPct": 60,
-    "groupCompactStyle": "lcm"
-  },
-  "todos": { "maxOpen": 30, "maxSnoozes": 3 }
-}
-```
+- `model` — default `claude-opus-5-5[1m]`; per-chat with `/model`
+- `mcpServers`, `plugins` — [extend Tomo](docs/configuration.md#external-mcp-servers) with MCP servers and Claude Code plugins
+- `continuity` — [heartbeats](docs/configuration.md#continuity-heartbeats) for autonomous behaviour (off by default)
+- `metrics` — Prometheus exporter + activity log, with a [Grafana stack](contrib/observability/README.md)
 
-To enable iMessage (the Tomo process needs Full Disk Access; advanced features additionally need `imsg launch`), pick it in `tomo init` or `tomo config` → Channels, or edit the config:
+Full reference: [docs/configuration.md](docs/configuration.md).
 
-```json
-{
-  "channels": {
-    "imessage": { "provider": "imsg", "cliPath": "/opt/homebrew/bin/imsg" }
-  },
-  "owner": { "name": "yourname", "imessage": ["+15551234567"] }
-}
-```
+## Documentation
 
-Only the bound handle's DMs are answered; iMessage groups need the group secret (or an explicit `allowlist` entry with the group's chat GUID).
-
-Environment variables override config file values:
-
-| Variable | Description |
-|----------|-------------|
-| `ANTHROPIC_API_KEY` | Use Anthropic API-key authentication; overrides the authentication stored in `config.json` |
-| `TELEGRAM_BOT_TOKEN` | Override Telegram token |
-| `IMESSAGE_PROVIDER` | Set to `imsg` to enable the iMessage channel (unset = iMessage off) |
-| `IMSG_CLI_PATH` | Path to the `imsg` binary (default: `imsg` on PATH) |
-| `IMSG_DB_PATH` | Override chat.db path passed to `imsg rpc --db` |
-| `IMESSAGE_TYPING_START_DELAY_MS` | Delay before showing iMessage typing for ordinary turns (default: `1200`) |
-| `IMESSAGE_PASSIVE_TYPING_START_DELAY_MS` | Delay before showing iMessage typing for passive iMessage group turns (default: `4000`) |
-| `CLAUDE_MODEL` | Override model |
-| `TOMO_LITELLM_BASE_URL` | Route Claude Agent SDK model calls through a LiteLLM proxy |
-| `TOMO_LITELLM_API_KEY` | API key sent to the LiteLLM proxy as `ANTHROPIC_API_KEY` |
-| `TOMO_LITELLM_MODE` | Optional LiteLLM mode: `anthropic-compatible` or `chatgpt-subscription` |
-| `TOMO_WORKSPACE` | Override workspace directory |
-| `TOMO_MAX_TURNS` | Override per-turn tool-use ceiling (default: `50`; `0` = no limit, which also turns off the 75%/90% wrap-up reminders) |
-| `TOMO_STEERING` | Override message steering. Defaults to `true`; set `false` to keep mid-turn messages queued. |
-| `TOMO_INBOX` | Override the durable inbox. Defaults to `true`; set `false` to hold waiting messages in memory only. |
-| `TOMO_INTERRUPTED_AGENTS` | Track running subagents on disk and report the ones a restart or crash cut off. Defaults to `true`. |
-| `TOMO_INBOX_REPLAY_MAX_AGE_MINUTES` | Oldest waiting message answered after a restart (default: `360`; `0` = never replay, only record). |
-| `TOMO_SAVE_INBOUND_FILES` | Override storage of inbound attachments that are neither images nor supported documents. Defaults to whatever `saveInboundImages` is. |
-| `TOMO_NOTIFY_OWNER_ON_SUPPRESSED_ERRORS` | Tell the owner when a failure is kept out of a chat: passive-group turns, group cron/background turns, and silent housekeeping/heartbeat turns on the owner's own DM (an error already shown in a chat is not repeated). Group failures are reported in the owner's DM, never in the group; DM failures in that DM. Each notice names the session, the kind of error, a one-line excerpt and a recovery hint (`/login` for auth failures). At most one notice per session and error kind per 30 minutes; the next one says how many failures were folded in. Defaults to `true` (config key `notifyOwnerOnSuppressedErrors`); set `false` to keep these failures in the log only. |
-| `TOMO_SHOW_THINKING` | Deliver the model's thinking blocks to the chat, prefixed with `💭`. Defaults to `false`; with it off, thinking blocks are dropped (not delivered, not recorded in the transcript), and if the model put its reply in one it is asked to restate it as text — after its next tool call, or in one follow-up turn if the turn ended there (see `showThinking` in `defaults/skills/system/CONFIG.md`). Read at session start. |
-| `TOMO_CONTINUITY_INTERVAL_MINUTES` | Override scheduled continuity heartbeat interval (default: `55`, minimum: `1`) |
-| `TOMO_CONTINUITY_SCRIPT` | Override the optional continuity script path |
-| `TOMO_CONTINUITY_SCRIPT_TIMEOUT_MS` | Override continuity script timeout (default: `30000`) |
-| `TOMO_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS` | Override continuity script stdout/stderr cap (default: `8000`) |
-| `TOMO_LIVE_SESSION_TIMEOUT_MS` | Inactivity timeout for one turn (config key `liveSessionTimeoutMs`, default: `600000`, 10 minutes) |
-| `TOMO_METRICS` | Enable the metrics exporter and activity log (config key `metrics.enabled`, default: `false`) |
-| `TOMO_METRICS_PORT` | Metrics port (config key `metrics.port`, default: `9464`) |
-| `LOG_LEVEL` | Log level (default: `debug`) |
-
-### Credential Broker (`credentialBroker`)
-
-`{ "credentialBroker": { "enabled": true } }` (default `false`) keeps a password you send on request away from the model. The agent calls `request_credential`, and you are asked **where your message came from**:
-
-- **iMessage**: your next message in that private chat is the value. It stays in Messages, so delete it there.
-- **Telegram**: your next message in your private chat with the bot is the value, and Tomo deletes it from the chat (if Telegram refuses, you are told to delete it yourself).
-- **Web UI**: a password card opens above the composer. What you type goes to its own endpoint, never into the chat, the request journal or the transcript.
-
-A scheduled job, a heartbeat or a group turn cannot ask. The value goes in the login keychain (service `tomo-credential-broker`, account = the name), and the agent uses it in Bash only inside a command substitution, `"$(security find-generic-password -s tomo-credential-broker -a <name> -w)"`, so the command text never holds it. Known values are masked in every tool's output (a global `PostToolUse` hook) and in logs. While a request is open, your messages on the other chat channel are dropped (one of them may be the value) and you are told; the web chat keeps working.
-
-This prevents accidents. It does not stop a model trying to get the value: see [SECURITY.md](SECURITY.md).
-
-### Per-Agent Permission Scoping (`agentProfiles`)
-
-Every session runs the Claude Agent SDK in `bypassPermissions` mode, and the SDK propagates that mode into subagents — so a subagent tomo dispatches inherits your whole machine. `AgentDefinition` scopes **tools** and has no notion of a **path**, which means `tools: Read, Grep, Glob, Bash` on an agent described as "read-only reviewer" is a full shell.
-
-`agentProfiles` fences that in, keyed by the agent type name (the `.claude/agents/<name>.md` filename). Enforcement is a `PreToolUse` hook, which the SDK consults *before* `canUseTool` and which a `bypassPermissions` session cannot skip.
-
-```json
-{
-  "agentProfiles": {
-    "ios-reviewer": {
-      "writeRoots": [
-        "~/.tomo/workspace/tmp",
-        "/tmp",
-        "/private/tmp",
-        "$TMPDIR",
-        "~/Library/Developer/Xcode/DerivedData",
-        "~/Library/Developer/CoreSimulator",
-        "~/Library/Caches"
-      ],
-      "denyPaths": [
-        "~/Library/LaunchAgents",
-        "/Applications",
-        "~/.claude",
-        "~/.tomo/workspace/memory",
-        "~/.tomo/workspace/.claude",
-        "~/Developer/bloom",
-        "~/Developer/wayfound"
-      ],
-      "denyReadPaths": [
-        "~/.ssh",
-        "~/.tomo/config.json",
-        "~/.tomo/workspace/memory/private"
-      ],
-      "bash": "readonly"
-    },
-    "ios-implementer": {
-      "writeRoots": [
-        "~/.tomo/workspace/tmp",
-        "/tmp",
-        "/private/tmp",
-        "$TMPDIR",
-        "~/Library/Developer/Xcode/DerivedData",
-        "~/Library/Developer/CoreSimulator",
-        "~/Library/Caches"
-      ],
-      "denyPaths": [
-        "~/Library/LaunchAgents",
-        "/Applications",
-        "~/.claude",
-        "~/.tomo/workspace/memory",
-        "~/.tomo/workspace/.claude"
-      ],
-      "denyReadPaths": [
-        "~/.ssh",
-        "~/.tomo/config.json",
-        "~/.tomo/workspace/memory/private"
-      ],
-      "bash": "worktree"
-    }
-  }
-}
-```
-
-The two profiles differ in exactly two places, and both differences are the point. The reviewer cannot write the shared checkouts under `~/Developer` — but it can and must **read** them, which is why they sit on `denyPaths` and not `denyReadPaths`. The implementer has to write in one of them, so they are off its list entirely, and its Bash mode is `worktree` rather than `readonly`.
-
-Both list `/tmp` **and** `/private/tmp` because `/tmp` is a symlink to the second on macOS, and both list `$TMPDIR` because `xcodebuild` and `simctl` write there constantly. Both fence `~/.tomo/workspace/memory` and `~/.tomo/workspace/.claude`, which is what makes `rm -rf memory` and `git clean -fdx` refusals rather than restore-from-backup — see "relative paths" below.
-
-| Field | Meaning |
-|-------|---------|
-| `writeRoots` | Absolute roots the agent may write into. Empty (or omitted) means it may write nowhere — unless `bash` is `full`, which switches `writeRoots` off entirely. |
-| `denyPaths` | A **write** fence: paths the agent may not write to, by file tool, write verb, or redirection. **Reads are unaffected.** Beats `writeRoots`, and a destructive verb aimed at an *ancestor* of one is denied too, because `rm -rf <parent>` takes the protected path with it. |
-| `denyReadPaths` | The **secrets** list: paths the agent may not *name at all*, by any tool including `Read`/`Grep`/`Glob`. Strictly stronger than `denyPaths`; a path here needs no entry there. |
-| `bash` | `none` \| `readonly` \| `worktree` \| `full`. Defaults to `none`. |
-
-**Why two deny lists.** A reviewer's whole job is to read the checkouts it must never modify. One combined list forces you to choose between "the reviewer cannot review bloom" and "the reviewer can `rm -rf` bloom". `denyPaths` fences the write; `denyReadPaths` is kept for the short list of paths where *reading* is itself the harm.
-
-Bash modes:
-
-- **`none`** — the Bash tool is denied outright.
-- **`readonly`** — a write must **name its destination**, and that destination must be inside `writeRoots`. So `touch /tmp/marker`, `mkdir -p /tmp/dd`, `cp /tmp/a /tmp/b` and `rm -rf /tmp/scratch` are allowed when `/tmp` is a writeRoot, while `rm -rf x`, `rm -rf *` and `mkdir build` are refused — nothing in the daemon can say where those land. `cp /tmp/a /Applications/x` is refused on the target. A `>`/`>>` redirection onto an *absolute* target outside `writeRoots` is refused the same way.
-
-  The commands this recognises as writes: `rm`, `rmdir`, `mv`, `cp`, `tee`, `dd`, `chmod`, `chown`, `ln`, `mkdir`, `touch`, `truncate`, `install`, `unlink`, `shred`, `ditto`, `chflags`, `brew`, `launchctl`, `wget`, `sed -i`, `perl -i`, `find … -delete`, `rsync … --delete`, `curl -o|-O|--output`, `xattr -w|-d`, `git push|commit|checkout|reset|rebase|stash|clean|merge|apply`, `git worktree remove|prune`, `git config --global|--system`, `gh pr merge|close`, `npm install|publish|ci`, `defaults write`, `simctl delete|erase|shutdown|boot`, `xcodebuild clean`, `swift package reset|clean`.
-
-  Command substitution, backticks and pipes are **allowed** — see the note below. `kill`/`killall`/`pkill` are **not** denied: a signal is not a filesystem write, and clearing a wedged simulator is routine reviewer work.
-- **`worktree`** — `readonly` minus the must-name-it clause. An *absolute* path token on a write command must still land inside `writeRoots`, but a relative one is not judged, so `rm -rf build/Old` and `mkdir -p Sources/New` work inside the agent's own worktree.
-
-Both modes refuse a write verb pointed at a `denyPaths` entry, whatever the mode's own rule says — so `git worktree prune`, `git worktree remove ~/Developer/bloom/wt` and `git -C ~/Developer/bloom commit` are all refused for the reviewer profile above, while `git -C ~/Developer/bloom worktree list` and `git -C ~/Developer/bloom log` are not.
-- **`full`** — only `denyPaths` and `denyReadPaths` apply, to Bash *and* to `Write`/`Edit`/`MultiEdit`/`NotebookEdit`.
-
-`git reset --hard` (and `--merge`) and `git clean -fdx` get one extra rule, because they destroy the tree under the cwd while naming neither a path nor a `*`: both are treated as targeting the workspace directory for the deny check. That also refuses `git -C /some/worktree clean -fdx`, which is a real false positive and the conservative direction — guessing from a token scan which `-C`-shaped flag actually repointed the command is wrong in the direction that costs the tree.
-
-**Relative paths, and what `worktree` mode does not fence.** The daemon is never told where a subagent's worktree is — the Agent tool's `isolation: "worktree"` does not report the path back — so a relative token is a path whose destination is unknowable here. It is therefore **never judged on the allow side**: `mkdir -p Sources/New`, `rm -rf build/Old` and `git commit -m msg` all pass, which is what makes the mode usable at all. On the **deny side** a relative write target *is* resolved, against the workspace directory, because that is the cwd a subagent inherits when it has no worktree of its own — so `rm -rf memory`, `rm -rf *`, `rm -rf .` and `git clean -fdx` are refused when the workspace's own trees are on `denyPaths`. The consequence to be clear about: **a `worktree`-mode agent is fenced from the workspace, not from its own worktree.** It can destroy its own working copy, by design, and no rule here can tell it apart from the work it was sent to do.
-
-Paths are expanded at config load: `~`, `~/x`, `$VAR` and `${VAR}`. What happens to one that does not come out absolute depends on which list it is in, and the asymmetry is deliberate — a dropped `writeRoot` only *narrows* the agent, while a dropped deny entry *widens* it:
-
-- a bad **`writeRoots`** entry is dropped with a `log.warn`. This is also what keeps an unset `$TMPDIR` (absent under a bare `launchctl load`) from bricking the daemon.
-- a bad **`denyPaths`/`denyReadPaths`** entry is dropped with a `configIssues` entry, which **refuses daemon startup**.
-
-An agent type with **no profile is unconstrained**. That is the deliberate v1 default: the real tool surface of `general-purpose`, `Explore` and ad-hoc delegations is not known yet, and failing closed would break all of them on the first turn. Instead the daemon logs one `warn` per session per unprofiled agent type, and logs *every* subagent Bash call at `info` with the agent type and the first 120 characters of the command. Read those logs before tightening the default.
-
-> **This is policy, not a sandbox.** The checks run inside the tomo daemon; the thing they constrain is a CLI child process, which is the wrong side of a trust boundary for real isolation. `readonly` deliberately permits `$(…)`, backticks and pipes, because a reviewer's normal working command is `git log $(git merge-base main HEAD)` and refusing substitution refuses the reviewer. A redirection inside a quoted sub-shell (`sh -c 'cat x > /etc/passwd'`) is invisible for the same reason — telling it apart from `awk '$1 > 5' f` means writing a shell parser. The verb list above is a *list*: it is long, it is still incomplete, and every entry is a command someone noticed. An agent that wants out gets out. What this closes is the *accident* — an agent that was told to review a PR deciding to delete a shared checkout, or to write into `/Applications` — which is the failure mode that actually happens.
-
-### Anthropic Authentication
-
-Direct Claude models use your existing Claude Code subscription login by default. To use Anthropic API billing instead, run `tomo config`, choose **Anthropic authentication**, and enter an API key. Tomo stores the selected method under `auth` in `~/.tomo/config.json` and passes the key only to direct Claude Agent SDK child processes. `ANTHROPIC_API_KEY` remains supported and takes precedence over the saved setting.
-
-Because the config contains channel credentials and may now contain an Anthropic API key, Tomo writes both `config.json` and `config.json.bak` with owner-only (`0600`) permissions.
-
-`continuityScript` can also be a simple path string, e.g. `"continuityScript": "~/bin/tomo-continuity.sh"`. Relative paths resolve under `~/.tomo`; the script runs once per scheduled heartbeat and manual `tomo continuity` trigger, and its stdout/stderr or failure status is appended to the normal continuity prompt.
-
-### Steering
-
-By default, messages you send while Tomo is mid-task are steered into the in-flight turn at the next tool-call boundary — so "stop", "wait", or extra context reaches the model immediately instead of waiting for the current turn to finish. If the turn has no tool calls left, the message runs as its own follow-up turn right after. iMessage fragment settling still applies before injection; system-originated turns (cron, continuity) keep their normal queued behavior. Set `"steering": false` or `TOMO_STEERING=false` to keep mid-turn messages queued behind the active turn.
-
-### Durable Inbox
-
-Every message Tomo accepts is written to `~/.tomo/data/inbox.jsonl` (fsynced) before the channel is told it was received, and stays there until a turn has consumed it. If the daemon crashes, is killed or restarts while messages are waiting behind a turn, the next start answers them, with a note to the model that they are late. Messages that pile up still coalesce into one turn, as they would have live.
-
-- A redelivered message (same channel, chat and message id) is answered once.
-- A turn that was already running when the daemon died is not re-run, because it may have called tools or sent part of a reply already. The session is told to check instead.
-- A message older than `inboxReplayMaxAgeMinutes` (default `360`) is recorded in the transcript as not processed rather than answered late.
-- Web UI requests, the group secret and attachment bytes are never written there; attachments are reloaded from their saved copies (`saveInboundImages` / `saveInboundFiles`), and one that was never saved is dropped with a note.
-
-Set `"inbox": false` or `TOMO_INBOX=false` to turn it off. Waiting messages are then held in memory, and a graceful shutdown records them as not processed.
-
-### Interrupted Subagents
-
-Each session's running subagents and background commands are mirrored to `~/.tomo/data/running-agents.json` (atomic write on every start and end), so a crash is covered as well as a restart. On the next start, every session that had some still running gets one `interrupted-agents` event listing their ids, descriptions, types and last activity. Nothing is resumed automatically: the model can continue a subagent with `SendMessage` to its id. Explore/Plan subagents and background commands cannot be resumed. Set `"interruptedAgents": false` or `TOMO_INTERRUPTED_AGENTS=false` to turn it off.
-
-### LiteLLM / ChatGPT Subscription Models
-
-Tomo still runs through Claude Agent SDK, but you can point the SDK at a local LiteLLM proxy and select a LiteLLM model name such as `chatgpt/gpt-5.5`. This keeps Tomo's Claude SDK sessions, memory, workspace, MCP tools, and LCM behavior while LiteLLM translates Anthropic `/v1/messages` streaming calls to the ChatGPT subscription backend.
-
-```yaml
-# ~/litellm-chatgpt.yaml
-environment_variables:
-  CHATGPT_DEFAULT_INSTRUCTIONS: >-
-    Follow the instructions supplied in this request.
-
-model_list:
-  - model_name: chatgpt/gpt-5.5
-    model_info:
-      mode: responses
-    litellm_params:
-      model: chatgpt/gpt-5.5
-
-litellm_settings:
-  drop_params: true
-
-general_settings:
-  master_key: sk-tomo-local
-```
-
-```bash
-litellm --config ~/litellm-chatgpt.yaml
-tomo config   # LiteLLM gateway -> ChatGPT subscription
-```
-
-Then set the default model to `chatgpt/gpt-5.5` from `tomo config`, or use `/model chatgpt/gpt-5.5` in a chat. LiteLLM owns the ChatGPT OAuth device flow and token storage; Tomo only sends Anthropic-compatible requests to the local proxy.
-
-If LiteLLM returns `System messages are not allowed`, use a LiteLLM build that includes ChatGPT system-role normalization. If non-streaming curl checks fail while streaming `/v1/messages` works, that is still compatible with Tomo because Claude Agent SDK uses streaming.
+| Doc | What's in it |
+|-----|--------------|
+| [Configuration](docs/configuration.md) | `config.json`, environment variables, MCP servers, plugins, LiteLLM, inbox, steering, observability, files on disk |
+| [Commands](docs/commands.md) | Every CLI and chat command, with details |
+| [Channels, sessions and groups](docs/channels.md) | Owner session, Telegram, iMessage, group activation, people registry |
+| [Permissions and privacy](docs/permissions-and-privacy.md) | Private memory, group sandbox, permission requests, credential broker, `agentProfiles` |
+| [Todos](docs/todos.md) | The todo model, its rules and limits |
+| [Web UI](docs/web-ui.md) | Web chat, Tasks, the Study, Home, Tailscale access, security |
+| [SECURITY.md](SECURITY.md) | Trust model, known limits, reporting a vulnerability |
 
 ## Development
 
@@ -623,9 +158,11 @@ npm install
 npm run dev    # Foreground with hot reload
 ```
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for checks, conventions and what makes a PR easy to review.
+
 ## Contributing
 
-Issues and pull requests welcome at [github.com/shuaiyuan17/tomo](https://github.com/shuaiyuan17/tomo). See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, conventions, and what makes a PR easy to review, and [SECURITY.md](SECURITY.md) for the trust model and how to report a vulnerability privately.
+Issues and pull requests welcome at [github.com/shuaiyuan17/tomo](https://github.com/shuaiyuan17/tomo). Please report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## License
 

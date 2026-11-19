@@ -187,11 +187,25 @@ function seedConversation(store: SessionStore): void {
   add("user", formatReactionMarker("like", "Short answer: yes."), "web", q + 130_000);
   add("assistant", "NO_REPLY", "web", q + 131_000);
   store.updateStats("dm:owner", { costUsd: 0.4, inputTokens: 1000, outputTokens: 400, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 128_400, contextMax: 200_000,
-    contextBreakdown: [{ name: "System prompt", tokens: 12_000 }, { name: "Messages", tokens: 110_000 }] });
+    // The SDK's real shape: what counts (sums to contextUsed), deferred tool schemas, the reserve and the free rest.
+    contextBreakdown: [{ name: "System prompt", tokens: 9_200 }, { name: "System tools", tokens: 14_400 }, { name: "MCP tools", tokens: 3_400 },
+      { name: "MCP tools (deferred)", tokens: 59_000 }, { name: "System tools (deferred)", tokens: 15_500 }, { name: "Custom agents", tokens: 500 },
+      { name: "Memory files", tokens: 100 }, { name: "Skills", tokens: 3_800 }, { name: "Messages", tokens: 97_000 },
+      { name: "Compact buffer", tokens: 3_000 }, { name: "Free space", tokens: 68_600 }] });
 
   const line = (type: string, ms: number, content: unknown[]) => JSON.stringify({ type, isSidechain: false, timestamp: new Date(ms).toISOString(), message: { role: type, content } }) + "\n";
   mkdirSync(mockConfig.sdkSessionsDir, { recursive: true });
-  let body = line("user", q + 100, [{ type: "text", text: "Walk me through" }]);
+  // Rollup blocks (Study · Context): one per level, as `tomo lcm` writes them.
+  const rollup = (blockTag: string | undefined, ms: number, events: number, text: string) => JSON.stringify({ type: "user", isSidechain: false, isCompactSummary: true,
+    ...(blockTag ? { blockTag } : {}), timestamp: new Date(ms).toISOString(), message: { role: "user", content: `[${blockTag ? `${blockTag} — ` : ""}${events} events summarized]\n\n${text}` } }) + "\n";
+  const DAY = 86_400_000;
+  let body = rollup(undefined, BASE - 200 * DAY, 912, "Earlier conversation, compacted before rollups existed.")
+    + rollup("yearly 2025", BASE - 300 * DAY, 4, "Set up the workspace, the first channels and the memory layout.")
+    + rollup("monthly 2026-10", BASE - 13 * DAY, 5, "**October**: shipped the web UI's Study, moved cron to its own store, and settled the release cadence.\n\n- Study pages: memory, context, cron\n- Weekly release on Fridays")
+    + rollup("weekly 2026-W45", BASE - 6 * DAY, 7, "Transcript rotation landed in three PRs; the session picker was reworked.")
+    + rollup("daily 2026-11-12", BASE - 2 * DAY + 3_600_000, 184, "Reviewed the rename paths with a subagent, fixed a clobber on rotation, and wrote the tests.\n\n- `moveWithoutClobber` now guards every rename\n- 412 tests pass")
+    + rollup("daily 2026-11-13", BASE - DAY + 3_600_000, 236, "Planned the transcript key migration and drafted the table of keys.");
+  body += line("user", q + 100, [{ type: "text", text: "Walk me through" }]);
   const tools: [string, unknown, string, boolean?][] = [
     ["Read", { file_path: "/Users/owner/code/tomo/src/sessions/transcript-names.ts" }, "export function transcriptFileStem(key: string) {\n  ...\n}"],
     ["Grep", { pattern: "transcriptFileStem", path: "src" }, "src/sessions/store.ts:12\nsrc/sessions/transcript-names.ts:40"],
@@ -224,6 +238,9 @@ function seedConversation(store: SessionStore): void {
 }
 
 function publishTasks(): void {
+  // Two compactions since "the daemon started" (Study · Context).
+  watchBus.publish({ type: "compact", ts: BASE - 26 * 3_600_000, sessionKey: "dm:owner", preTokens: 171_300, postTokens: 46_900 });
+  watchBus.publish({ type: "compact", ts: BASE - 3 * 3_600_000, sessionKey: "dm:owner", preTokens: 182_600, postTokens: 96_200 });
   watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
     { taskId: "a1", taskType: "local_agent", subagentType: "Explore", description: "Audit the rename paths and find every place a live transcript could be clobbered", ambient: false, background: true, startedAt: BASE - 95_000, summary: "Reading src/sessions/store.ts" },
     // Nested under the subagent: a command it described in words (shown whole), and a command line.

@@ -100,7 +100,7 @@ function dailyFreshTail(): number {
 
 /** Concatenate text-block content from an event (SDK or simple shape). */
 function extractText(e: SdkEvent): string {
-  return textOfContent(e.message?.content, "");
+  return textOfContent(e.message?.content, "", { missing: "empty", nonString: "stringify" });
 }
 
 /**

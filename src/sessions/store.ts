@@ -602,7 +602,7 @@ export class SessionStore {
         const msg = event.message;
         if (!msg) continue;
 
-        const text = textOfContent(msg.content, " ").trim();
+        const text = textOfContent(msg.content, " ", { missing: "empty", nonString: "stringify" }).trim();
         if (!text) continue;
 
         if (queryLower && !text.toLowerCase().includes(queryLower)) continue;

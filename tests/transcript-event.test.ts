@@ -36,6 +36,34 @@ describe("textOfContent", () => {
   });
 });
 
+describe("textOfContent legacy options", () => {
+  const odd = [
+    { type: "text", text: "a" },
+    { type: "text" },
+    { type: "text", text: null },
+    { type: "text", text: 42 },
+    { type: "text", text: { x: 1 } },
+    { type: "image", text: "no" },
+    { type: "text", text: "b" },
+  ];
+
+  it("defaults to skipping missing and dropping non-string text", () => {
+    expect(textOfContent(odd, "|")).toBe("a|b");
+  });
+
+  it("missing: empty keeps a slot for null/undefined text", () => {
+    expect(textOfContent(odd, "|", { missing: "empty" })).toBe("a|||b");
+  });
+
+  it("nonString: stringify keeps non-string text", () => {
+    expect(textOfContent(odd, "|", { nonString: "stringify" })).toBe("a|42|[object Object]|b");
+  });
+
+  it("both together match the old `text ?? \"\"` reading", () => {
+    expect(textOfContent(odd, "|", { missing: "empty", nonString: "stringify" })).toBe("a|||42|[object Object]|b");
+  });
+});
+
 describe("blocks keeps its empty separator", () => {
   // With a " " separator two empty text blocks would read as " " — non-empty —
   // and a user turn carrying no words would count toward the warm tail.
@@ -46,4 +74,10 @@ describe("blocks keeps its empty separator", () => {
     };
     expect(isWarmTailCandidate(event)).toBe(false);
   });
+
+  it("an assistant turn whose only text is non-string still counts as a reply", () => {
+    const event = { type: "assistant", message: { role: "assistant", content: [{ type: "text", text: 42 }] } };
+    expect(isWarmTailCandidate(event)).toBe(true);
+  });
+
 });

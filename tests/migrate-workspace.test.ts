@@ -82,4 +82,39 @@ describe("tomo migrate openclaw", () => {
 
     vi.restoreAllMocks();
   });
+
+  it("reads text blocks as before: newline-joined, falsy text dropped, other text stringified", async () => {
+    mkdirSync(env.root, { recursive: true });
+    const source = join(env.root, "odd-blocks.jsonl");
+    const line = (id: string, content: unknown) => JSON.stringify({
+      type: "message", id, parentId: null, timestamp: "2026-08-01T10:00:00.000Z",
+      message: { role: "user", content },
+    });
+    writeFileSync(source, [
+      line("1", [
+        { type: "text", text: "one" },
+        { type: "text", text: "" },
+        { type: "text" },
+        { type: "text", text: 0 },
+        { type: "text", text: 42 },
+        { type: "image", text: "not text" },
+        { type: "text", text: "two" },
+      ]),
+      // Non-array content and a null block made the old reader throw, which skipped the line.
+      line("2", "string content is skipped"),
+      line("3", [null, { type: "text", text: "null block skips the line" }]),
+    ].join("\n") + "\n");
+    const logs: string[] = [];
+    vi.spyOn(console, "log").mockImplementation((...a) => { logs.push(a.join(" ")); });
+
+    await migrateCommand.parseAsync(["openclaw", source, "--dry-run"], { from: "user" });
+
+    const out = logs.join("\n");
+    expect(out).toContain("Found 1 messages");
+    expect(out).toContain("User: one\n42\ntwo\n");
+    expect(out).not.toContain("string content is skipped");
+    expect(out).not.toContain("null block skips the line");
+
+    vi.restoreAllMocks();
+  });
 });

@@ -42,8 +42,9 @@ migrateCommand
         const role = obj.message.role;
         if (role !== "user" && role !== "assistant") continue;
 
-        // Empty text blocks are dropped first so they add no blank lines.
-        const text = textOfContent(obj.message.content?.filter((c) => c.text), "\n");
+        // The pre-filter drops empty/falsy text (no blank lines) and, by
+        // throwing on a null block or non-array content, skips such a line.
+        const text = textOfContent(obj.message.content?.filter((c) => c.text), "\n", { nonString: "stringify" });
 
         if (!text) continue;
         textMessages.push({ role, text, timestamp: obj.timestamp });

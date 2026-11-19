@@ -56,6 +56,27 @@ describe("SessionStore.searchArchive", () => {
     expect(hit.timestamp).toBe(0);
   });
 
+  it("keeps a separator for missing text and stringifies non-string text", () => {
+    writeArchive([
+      JSON.stringify({
+        type: "user",
+        message: {
+          role: "user",
+          content: [
+            { type: "text", text: "a" },
+            { type: "text" },
+            { type: "text", text: null },
+            { type: "text", text: 42 },
+            { type: "image", text: "not text" },
+            null,
+            { type: "text", text: "b" },
+          ],
+        },
+      }),
+    ]);
+    expect(store.searchArchive(SDK_ID, {}).map((m) => m.content)).toEqual(["a   42 b"]);
+  });
+
   it("skips malformed lines and non-conversation events", () => {
     writeArchive([
       "{not json",

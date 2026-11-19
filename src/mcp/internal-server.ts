@@ -308,7 +308,8 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
         sdkSessionsDir: config.sdkSessionsDir,
         sessionsDir: config.sessionsDir,
         sessionKey: callerSessionKey,
-        activeBackgroundTasks: () => agent.activeBackgroundTaskCount(callerSessionKey),
+        reserveCompact: (sdkSessionId) => agent.reserveCompact(callerSessionKey, sdkSessionId),
+        finishCompact: (reservation) => agent.finishCompact(reservation),
       }),
       // Group sessions never see private people records through these tools —
       // same boundary as the private memory subtree they live in.

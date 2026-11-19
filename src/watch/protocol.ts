@@ -15,6 +15,7 @@
 // import cycle with the agent modules that publish these events.
 import type { FabricatedMarkerShape } from "../agent/inbound-markers.js";
 import type { SdkSignal } from "../agent/sdk-signals.js";
+import type { CompactReservation } from "../lcm/background-gate.js";
 
 export const WATCH_PROTOCOL_VERSION = 1;
 
@@ -152,17 +153,23 @@ export type ServerFrame =
   | { kind: "snapshot"; snapshot: WatchSnapshot }
   | { kind: "event"; event: WatchEvent }
   | { kind: "send-result"; ok: boolean; error?: string }
-  /** Answer to a `background-tasks` query: live background tasks of that SDK session. */
-  | { kind: "background-tasks"; sdkSessionId: string; count: number };
+  /** Answer to `compact-reserve`: approved (and marked pending) or refused. */
+  | { kind: "compact-reserve"; sdkSessionId: string; reservation: CompactReservation };
 
 export type ClientFrame =
   | { kind: "send"; text: string }
   /**
-   * One-shot query from `tomo lcm`: how many background tasks is the live
-   * session behind this SDK session id running? A rollup reloads the session
-   * and would kill them, so the CLI refuses while the count is above zero.
+   * From `tomo lcm`, before it rewrites a session file: approve the rewrite
+   * and mark a compact pending on the session behind this SDK session id, in
+   * one step — refused while it has background work (agent/compact-
+   * reservations.ts). An approval is held by this connection.
    */
-  | { kind: "background-tasks"; sdkSessionId: string };
+  | { kind: "compact-reserve"; sdkSessionId: string }
+  /**
+   * The rewrite is over. Sent by `tomo lcm` after it; the connection closing
+   * counts the same, so a crashed CLI cannot leave the session locked.
+   */
+  | { kind: "compact-finish"; sdkSessionId: string };
 
 /** Truncation limits keep single frames small; feeds render a line or two. */
 export const TRANSCRIPT_TEXT_LIMIT = 1500;

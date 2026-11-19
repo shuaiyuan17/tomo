@@ -10,6 +10,9 @@ import { config } from "../config.js";
 import { log } from "../logger.js";
 import type { McpConnection } from "../mcp/live-status.js";
 import { checkAndClearCompactTrigger } from "../lcm/index.js";
+import { getCompactTriggerPath } from "../lcm/compact.js";
+import { existsSync } from "node:fs";
+import { CompactReservations, type BackgroundState, type ReserveResult } from "./compact-reservations.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage, UsageBaseline } from "../sessions/types.js";
@@ -174,6 +177,10 @@ export interface LiveSessionManagerDeps {
  */
 export class LiveSessionManager {
   private liveSessions = new Map<string, LiveSession>();
+  /** Sessions with a compact approved and not yet reloaded (rollup gate). */
+  private compactReservations = new CompactReservations(
+    (sdkSessionId) => existsSync(getCompactTriggerPath(sdkSessionId, config.sdkSessionsDir)),
+  );
   /** Keys whose current SDK session id could not be written to the registry; retried on the next turn completion. */
   private unpersistedLinks = new Set<string>();
   private externalMcpServersBySession = new Map<string, ReadonlySet<string>>();
@@ -244,29 +251,52 @@ export class LiveSessionManager {
   }
 
   /**
-   * Live, non-ambient background tasks (subagents, background shells) on the
-   * key's live session; 0 when there is none. A compact/rollup reload closes
-   * the session and kills these, so the rollup paths refuse while it is > 0.
+   * Background work on the key's live session that a compact reload would
+   * cut: live non-ambient tasks, and a drained task whose report turn is
+   * still due (bounded like retireWhenIdle's report wait). Nothing without a
+   * live session.
    */
-  activeBackgroundTaskCount(key: string): number {
+  backgroundState(key: string): BackgroundState {
     const live = this.liveSessions.get(key);
-    return live?.isAlive() ? live.activeBackgroundTaskCount() : 0;
+    if (!live?.isAlive()) return { activeBackgroundTasks: 0, awaitingTaskReport: false };
+    return {
+      activeBackgroundTasks: live.activeBackgroundTaskCount(),
+      awaitingTaskReport: live.isAwaitingTaskReportWithin(PROMPT_RETIRE_REPORT_WAIT_MS),
+    };
   }
 
   /**
-   * Same, addressed by SDK session id — what `tomo lcm` is given. Matches the
-   * live session's own id and the registry link, so a session whose id has not
-   * been persisted yet is still found.
+   * The session key whose live session (or registry link) is this SDK
+   * session id — what `tomo lcm` is given.
    */
-  activeBackgroundTaskCountForSdkSession(sdkSessionId: string): number {
-    let count = 0;
+  keyForSdkSession(sdkSessionId: string): string | undefined {
     for (const [key, live] of this.liveSessions) {
-      if (!live.isAlive()) continue;
-      if (live.getSessionId() === sdkSessionId || this.deps.getSdkSessionId(key) === sdkSessionId) {
-        count += live.activeBackgroundTaskCount();
-      }
+      if (live.isAlive() && live.getSessionId() === sdkSessionId) return key;
     }
-    return count;
+    for (const key of this.liveSessions.keys()) {
+      if (this.deps.getSdkSessionId(key) === sdkSessionId) return key;
+    }
+    return undefined;
+  }
+
+  /**
+   * Approve a session-file rewrite and mark the compact pending, in one
+   * synchronous step (see compact-reservations.ts): refused while background
+   * work runs; once approved, new background launches on the session are
+   * denied until it reloads, the rewrite reports no reload pending, or the
+   * reservation's TTL runs out.
+   */
+  reserveCompact(key: string, sdkSessionId: string): ReserveResult {
+    return this.compactReservations.reserve(key, sdkSessionId, this.backgroundState(key));
+  }
+
+  /** The approved rewrite is over; see CompactReservations.finish. */
+  finishCompact(key: string, reservationId: string): void {
+    this.compactReservations.finish(key, reservationId);
+  }
+
+  isCompactPending(key: string): boolean {
+    return this.compactReservations.isPending(key);
   }
 
   /** Stop one task of the key's live session (never creates one). */
@@ -277,6 +307,8 @@ export class LiveSessionManager {
 
   /** Move the foreground task a tool call started to the background (never creates a session). */
   async backgroundTask(key: string, toolUseId: string): Promise<boolean> {
+    // A backgrounded task would be killed by the pending compact's reload.
+    if (this.compactReservations.isPending(key)) return false;
     const live = this.liveSessions.get(key);
     return live?.isAlive() ? live.backgroundTask(toolUseId) : false;
   }
@@ -571,6 +603,7 @@ export class LiveSessionManager {
       // Late-bound on purpose: the options are built before the session that
       // owns the flag exists. Until it does, nothing was dropped.
       undeliveredReply: () => session?.takeUndeliveredReply() ?? false,
+      backgroundLaunchDenial: () => this.compactReservations.launchDenial(key),
     }, turnBudget, externalMcpServers);
 
     session = new LiveSession(opts, key, turnBudget, () => this.deps.createUnownedTurnRequest(key), {
@@ -1040,9 +1073,10 @@ export class LiveSessionManager {
     // until the session is truly idle.
     const compactedThisTurn = sid ? checkAndClearCompactTrigger(sid, config.sdkSessionsDir) : false;
     if (compactedThisTurn) {
-      // The rollup paths refuse while background tasks run (lcm/background-
-      // gate.ts), so this only fires if one was launched after the rewrite in
-      // the same turn. The reload still has to happen now: the in-memory
+      // The rollup paths refuse while background tasks run and deny new
+      // launches until this reload (compact-reservations.ts), so this only
+      // fires for a rewrite that bypassed the gate (e.g. --no-daemon-check).
+      // The reload still has to happen now: the in-memory
       // session holds the pre-compact chain, and any turn it runs would
       // append events parented on uuids the compact removed.
       if (session.hasActiveBackgroundTasks()) {
@@ -1054,9 +1088,11 @@ export class LiveSessionManager {
             this.closeLiveSession(key);
             log.info({ key }, "Session reloaded after compact (deferred past steered turn)");
           }
+          this.compactReservations.clear(key);
         });
       } else {
         this.closeLiveSession(key);
+        this.compactReservations.clear(key);
         log.info({ key }, "Session reloaded after compact");
       }
       // Skip the context-pressure check for this turn: the compact/prune
@@ -1091,6 +1127,7 @@ export class LiveSessionManager {
     // even though the hot-mount drain below yields before the sessions are
     // closed.
     this.stopping = true;
+    this.compactReservations.dispose();
 
     // NO HOLD OUTLIVES SHUTDOWN. The Agent awaits (bounded) and aborts any
     // rewind before calling this; a rewind still stalled past that budget must

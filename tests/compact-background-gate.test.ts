@@ -17,7 +17,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 
-const paths = vi.hoisted(() => ({ root: "", sdkSessionsDir: "", sessionsDir: "", watchSocketPath: "" }));
+const paths = vi.hoisted(() => ({ root: "", sdkSessionsDir: "", sessionsDir: "", watchSocketPath: "", pidFile: "" }));
 
 vi.mock("../src/config.js", () => ({
   config: {
@@ -28,7 +28,10 @@ vi.mock("../src/config.js", () => ({
 }));
 vi.mock("../src/runtime-paths.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../src/runtime-paths.js")>()),
-  defaultRuntimePaths: { get watchSocketPath() { return paths.watchSocketPath; } },
+  defaultRuntimePaths: {
+    get watchSocketPath() { return paths.watchSocketPath; },
+    get pidFile() { return paths.pidFile; },
+  },
 }));
 vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -36,8 +39,11 @@ vi.mock("../src/logger.js", () => ({
 vi.mock("../src/agent/sdk-options.js", () => ({ usesLcmCompact: () => true }));
 
 const { WatchServer } = await import("../src/watch/server.js");
-const { queryBackgroundTasks } = await import("../src/watch/background-query.js");
-const { backgroundGateRefusal } = await import("../src/lcm/background-gate.js");
+const { reserveCompact } = await import("../src/watch/background-query.js");
+const { compactRefusal } = await import("../src/lcm/background-gate.js");
+const { CompactReservations } = await import("../src/agent/compact-reservations.js");
+import { createServer, createConnection, type Server } from "node:net";
+import type { CompactReservation } from "../src/lcm/background-gate.js";
 const { lcmCommand, LCM_DEFERRED_EXIT_CODE } = await import("../src/cli/lcm.js");
 const { getSdkSessionPath } = await import("../src/sessions/index.js");
 const { getCompactTriggerPath } = await import("../src/lcm/compact.js");
@@ -110,24 +116,50 @@ async function runLcm(argv: string[]): Promise<{ code: number; stderr: string; s
   }
 }
 
-describe("backgroundGateRefusal", () => {
-  it("lets the rewrite through with no background tasks", () => {
-    expect(backgroundGateRefusal(0)).toBeNull();
-  });
-
-  it("refuses with a readable, retryable reason while tasks run", () => {
-    expect(backgroundGateRefusal(1, "daily rollup")).toMatchObject({
+describe("compactRefusal", () => {
+  it("reads as a retryable reason for each refusal", () => {
+    const state = { activeBackgroundTasks: 1, awaitingTaskReport: false };
+    expect(compactRefusal({ ok: false, key: "k", reason: "background-tasks", state }, "daily rollup")).toMatchObject({
       status: "deferred",
       activeBackgroundTasks: 1,
       error: expect.stringContaining("1 background task is still running"),
     });
-    expect(backgroundGateRefusal(3)!.error).toContain("retry after they finish");
+    expect(compactRefusal({ ok: false, key: "k", reason: "awaiting-task-report", state: { ...state, activeBackgroundTasks: 0 } }).error)
+      .toContain("has not been reported");
+    expect(compactRefusal({ ok: false, key: "k", reason: "background-tasks", state: { ...state, activeBackgroundTasks: 3 } }).error)
+      .toContain("retry after they finish");
   });
 });
 
-describe("tomo lcm background-task gate (over the watch socket)", () => {
-  let server: InstanceType<typeof WatchServer> | null = null;
-  let running: Record<string, number>;
+/** A daemon stand-in: the real WatchServer, gated by real CompactReservations. */
+function startDaemon(state: { tasks: number; awaitingReport: boolean }) {
+  const reservations = new CompactReservations(
+    (sid) => existsSync(getCompactTriggerPath(sid, paths.sdkSessionsDir)),
+  );
+  const KEY = "dm:owner";
+  const server = new WatchServer(paths.watchSocketPath, {
+    getSnapshot: () => fakeSnapshot(),
+    sendChat: async () => {},
+    compactGate: {
+      reserve: (sdkSessionId): CompactReservation => {
+        const r = reservations.reserve(KEY, sdkSessionId, { activeBackgroundTasks: state.tasks, awaitingTaskReport: state.awaitingReport });
+        return r.ok ? { ok: true, key: KEY, reservationId: r.reservationId } : { ...r, key: KEY };
+      },
+      finish: (r) => { if (r.ok && r.key && r.reservationId) reservations.finish(r.key, r.reservationId); },
+    },
+  });
+  server.start();
+  return { server, reservations, KEY };
+}
+
+async function until(cond: () => boolean): Promise<void> {
+  for (let i = 0; i < 200 && !cond(); i++) await new Promise((r) => setTimeout(r, 5));
+}
+
+describe("tomo lcm compact gate (over the watch socket)", () => {
+  let daemon: ReturnType<typeof startDaemon> | null = null;
+  let extra: Server | null = null;
+  let state: { tasks: number; awaitingReport: boolean };
   let sessionId: string;
 
   beforeEach(async () => {
@@ -135,72 +167,96 @@ describe("tomo lcm background-task gate (over the watch socket)", () => {
     paths.sdkSessionsDir = join(paths.root, "sdk");
     paths.sessionsDir = join(paths.root, "sessions");
     paths.watchSocketPath = join(paths.root, "watch.sock");
+    paths.pidFile = join(paths.root, "tomo.pid");
     mkdirSync(paths.sdkSessionsDir, { recursive: true });
     mkdirSync(paths.sessionsDir, { recursive: true });
     sessionId = `test-${randomUUID()}`;
-    running = {};
-    server = new WatchServer(paths.watchSocketPath, {
-      getSnapshot: () => fakeSnapshot(),
-      sendChat: async () => {},
-      backgroundTaskCount: (sid) => running[sid] ?? 0,
-    });
-    server.start();
+    state = { tasks: 0, awaitingReport: false };
+    // A live daemon process: this one.
+    writeFileSync(paths.pidFile, `${process.pid}\n`);
+    daemon = startDaemon(state);
     await waitForSocket(paths.watchSocketPath);
   });
 
-  afterEach(() => {
-    server?.stop();
-    server = null;
+  afterEach(async () => {
+    daemon?.server.stop();
+    daemon?.reservations.dispose();
+    daemon = null;
+    if (extra) {
+      extra.close();
+      extra.unref();
+    }
+    extra = null;
     rmSync(paths.root, { recursive: true, force: true });
   });
 
-  it("the daemon answers the query with the session's live count", async () => {
-    running[sessionId] = 2;
-    expect(await queryBackgroundTasks(paths.watchSocketPath, sessionId)).toEqual({ status: "ok", count: 2 });
-    expect(await queryBackgroundTasks(paths.watchSocketPath, "other")).toEqual({ status: "ok", count: 0 });
-  });
-
-  it("an older daemon (no backgroundTaskCount) reads as unsupported, not as a count", async () => {
-    server!.stop();
-    server = new WatchServer(paths.watchSocketPath, { getSnapshot: () => fakeSnapshot(), sendChat: async () => {} });
-    server.start();
-    await waitForSocket(paths.watchSocketPath);
-    expect(await queryBackgroundTasks(paths.watchSocketPath, sessionId)).toEqual({ status: "unsupported" });
-  });
-
-  it("no daemon reads as unreachable", async () => {
-    expect(await queryBackgroundTasks(join(paths.root, "missing.sock"), sessionId)).toEqual({ status: "unreachable" });
-  });
+  const daily = (summary = "9/8: two exchanges.", ...extraArgs: string[]) =>
+    runLcm(["daily", "--session-id", sessionId, "--date", "2026-09-08", "--summary", summary, ...extraArgs]);
 
   it("`tomo lcm daily` refuses while background tasks run and leaves the session untouched", async () => {
     const path = writeSession(sessionId);
     const before = readFileSync(path, "utf8");
-    running[sessionId] = 1;
+    state.tasks = 1;
 
-    const res = await runLcm(["daily", "--session-id", sessionId, "--date", "2026-09-08", "--summary", "9/8."]);
+    const res = await daily();
 
     expect(res.code).toBe(LCM_DEFERRED_EXIT_CODE);
     const body = JSON.parse(res.stderr);
-    expect(body).toMatchObject({ status: "deferred", activeBackgroundTasks: 1 });
+    expect(body).toMatchObject({ status: "deferred", reason: "background-tasks", activeBackgroundTasks: 1 });
     expect(body.error).toContain("1 background task is still running");
     expect(readFileSync(path, "utf8")).toBe(before);
     // No trigger: nothing will reload — and so nothing will be killed.
     expect(existsSync(getCompactTriggerPath(sessionId, paths.sdkSessionsDir))).toBe(false);
+    expect(daemon!.reservations.isPending(daemon!.KEY)).toBe(false);
   });
 
-  it("`tomo lcm daily` proceeds as before with no background tasks", async () => {
+  it("refuses in the report window: tasks drained, their report turn not yet run", async () => {
+    writeSession(sessionId);
+    state.awaitingReport = true;
+    const res = await daily();
+    expect(res.code).toBe(LCM_DEFERRED_EXIT_CODE);
+    expect(JSON.parse(res.stderr).reason).toBe("awaiting-task-report");
+  });
+
+  it("proceeds as before with no background work, and leaves the session marked pending until its reload", async () => {
     const path = writeSession(sessionId);
-    const res = await runLcm(["daily", "--session-id", sessionId, "--date", "2026-09-08", "--summary", "9/8: two exchanges."]);
+    const res = await daily();
     expect(res.code, res.stderr).toBe(0);
     expect(JSON.parse(res.stdout)).toMatchObject({ status: "ok", blockTag: "daily 2026-09-08", eventsRemoved: 4 });
     expect(readFileSync(path, "utf8")).toContain("9/8: two exchanges.");
     expect(existsSync(getCompactTriggerPath(sessionId, paths.sdkSessionsDir))).toBe(true);
+    // TOCTOU: from the approval until the reload, a new background launch is
+    // denied — so the reload has nothing to kill.
+    await until(() => daemon!.reservations.launchDenial(daemon!.KEY) !== null);
+    expect(daemon!.reservations.launchDenial(daemon!.KEY)).toContain("pending");
+    daemon!.reservations.clear(daemon!.KEY); // the reload
+    expect(daemon!.reservations.launchDenial(daemon!.KEY)).toBeNull();
   });
 
-  it("`tomo lcm compact` and `prune-tools` are gated too; a prune dry run is not", async () => {
+  it("a rewrite that changes nothing releases the mark right away", async () => {
+    writeSession(sessionId);
+    const res = await runLcm(["prune-tools", "--session-id", sessionId]);
+    expect(res.code, res.stderr).toBe(0);
+    expect(existsSync(getCompactTriggerPath(sessionId, paths.sdkSessionsDir))).toBe(false);
+    await until(() => !daemon!.reservations.isPending(daemon!.KEY));
+    expect(daemon!.reservations.isPending(daemon!.KEY)).toBe(false);
+  });
+
+  it("a client that dies holding an approval does not leave the session locked", async () => {
+    const socket = createConnection(paths.watchSocketPath);
+    await new Promise((r) => socket.once("connect", r));
+    socket.write(JSON.stringify({ kind: "compact-reserve", sdkSessionId: sessionId }) + "\n");
+    await until(() => daemon!.reservations.isPending(daemon!.KEY));
+    expect(daemon!.reservations.isPending(daemon!.KEY)).toBe(true);
+    socket.destroy(); // crash: no compact-finish
+    await until(() => !daemon!.reservations.isPending(daemon!.KEY));
+    expect(daemon!.reservations.isPending(daemon!.KEY)).toBe(false);
+  });
+
+  it("`compact` and `prune-tools` are gated too; a prune dry run is not", async () => {
     const path = writeSession(sessionId);
     const before = readFileSync(path, "utf8");
-    running[sessionId] = 2;
+    state.tasks = 2;
 
     const compact = await runLcm([
       "compact", "--session-id", sessionId,
@@ -221,11 +277,61 @@ describe("tomo lcm background-task gate (over the watch socket)", () => {
     expect(existsSync(getCompactTriggerPath(sessionId, paths.sdkSessionsDir))).toBe(false);
   });
 
-  it("with no daemon running the rollup proceeds (no live session to reload)", async () => {
-    server!.stop();
-    server = null;
+  it("fails closed against a daemon too old to answer", async () => {
+    daemon!.server.stop();
+    daemon = null;
+    const old = new WatchServer(paths.watchSocketPath, { getSnapshot: () => fakeSnapshot(), sendChat: async () => {} });
+    old.start();
+    await waitForSocket(paths.watchSocketPath);
+    try {
+      const path = writeSession(sessionId);
+      const before = readFileSync(path, "utf8");
+      const res = await daily();
+      expect(res.code).toBe(LCM_DEFERRED_EXIT_CODE);
+      const body = JSON.parse(res.stderr);
+      expect(body.reason).toBe("daemon-unreachable");
+      expect(body.error).toContain("--no-daemon-check");
+      expect(readFileSync(path, "utf8")).toBe(before);
+    } finally {
+      old.stop();
+    }
+  });
+
+  it("fails closed when the daemon does not answer in time", async () => {
+    daemon!.server.stop();
+    daemon = null;
+    extra = createServer((sock) => { sock.on("error", () => {}); /* accept, never answer */ });
+    await new Promise<void>((r) => extra!.listen(paths.watchSocketPath, r));
+    const res = await reserveCompact(paths.watchSocketPath, sessionId, { timeoutMs: 100, daemonAlive: () => true });
+    expect(res).toMatchObject({ status: "unconfirmed", detail: expect.stringContaining("no answer") });
+  });
+
+  it("fails closed when the socket is gone but a daemon process is alive", async () => {
+    daemon!.server.stop();
+    daemon = null;
+    const path = writeSession(sessionId);
+    const before = readFileSync(path, "utf8");
+    const res = await daily();
+    expect(res.code).toBe(LCM_DEFERRED_EXIT_CODE);
+    expect(JSON.parse(res.stderr).reason).toBe("daemon-unreachable");
+    expect(readFileSync(path, "utf8")).toBe(before);
+  });
+
+  it("proceeds when no daemon is running at all (no socket, no live pid)", async () => {
+    daemon!.server.stop();
+    daemon = null;
+    rmSync(paths.pidFile);
     writeSession(sessionId);
-    const res = await runLcm(["daily", "--session-id", sessionId, "--date", "2026-09-08", "--summary", "9/8."]);
+    const res = await daily();
+    expect(res.code, res.stderr).toBe(0);
+    expect(existsSync(getCompactTriggerPath(sessionId, paths.sdkSessionsDir))).toBe(true);
+  });
+
+  it("--no-daemon-check skips the gate", async () => {
+    daemon!.server.stop();
+    daemon = null;
+    writeSession(sessionId);
+    const res = await daily("9/8.", "--no-daemon-check");
     expect(res.code, res.stderr).toBe(0);
     expect(existsSync(getCompactTriggerPath(sessionId, paths.sdkSessionsDir))).toBe(true);
   });
@@ -265,7 +371,7 @@ describe("rollup runner skips sessions with background tasks", () => {
     writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
     const agent = {
       listActiveSessions: () => [["dm:owner", sessionId]] as Array<[string, string]>,
-      activeBackgroundTaskCount: (_key: string) => count(),
+      hasBackgroundWork: (_key: string) => count() > 0,
       handleCronMessage: async (text: string) => { nudges.push(text); return true; },
     };
     const runner = new RollupRunner(agent as never, new NudgeCooldownStore(null));

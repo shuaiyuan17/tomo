@@ -175,7 +175,7 @@ export class RollupRunner {
       // tasks — so `tomo lcm` and `lcm_rollup` refuse while any are running.
       // Asking anyway would only spend a model turn on a refusal; skip the
       // session without arming the cooldown, so the next tick asks again.
-      if (this.agent.activeBackgroundTaskCount(sessionKey) > 0) {
+      if (this.agent.hasBackgroundWork(sessionKey)) {
         log.info({ sessionKey }, "Rollup nudge deferred (session has background tasks running)");
         continue;
       }

@@ -1,4 +1,5 @@
 import type { ElicitationRequest, ElicitationResult, McpSdkServerConfigWithInstance, McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
+import { backgroundLaunchGuardHooks } from "./compact-reservations.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
@@ -89,6 +90,12 @@ export interface SessionContext {
    * tool batch so the model can be told before its next step.
    */
   undeliveredReply?: () => boolean;
+  /**
+   * Per call: why a background launch must be refused right now (a compact is
+   * pending and its reload would kill the task), or null. Undefined ⇒ the
+   * guard is not installed. See compact-reservations.ts.
+   */
+  backgroundLaunchDenial?: () => string | null;
 }
 
 export function sdkOptions(
@@ -286,6 +293,7 @@ export function sdkOptions(
       privateMemoryBar,
       agentProfile,
       undeliveredReply: sessionContext?.undeliveredReply,
+      backgroundLaunchDenial: sessionContext?.backgroundLaunchDenial,
       // Resolved at spawn (above) and handed to the guard as a getter, so the
       // barred-turn Bash arm can spot a plugin that ships PreToolUse hooks
       // without re-resolving install paths on every tool call.
@@ -459,6 +467,8 @@ export function buildHooksOption(args: {
   /** The todo store directory; when set, direct writes into it are denied on
    *  every session (todo-store-guard.ts). */
   todosDir?: () => string;
+  /** Per-call reason to deny a background launch (pending compact), or null. */
+  backgroundLaunchDenial?: () => string | null;
 }) {
   const hooks: Record<string, unknown[]> = {};
   if (args.credentialBroker) {
@@ -473,6 +483,10 @@ export function buildHooksOption(args: {
   }
   if (args.agentProfile) {
     mergeHooks(hooks, agentProfileGuardHooks(args.sessionKey, args.agentProfile));
+  }
+  // Deny-only, like the todo guard below.
+  if (args.backgroundLaunchDenial) {
+    mergeHooks(hooks, backgroundLaunchGuardHooks(args.sessionKey, args.backgroundLaunchDenial));
   }
   // Deny-only, so its place before the private-memory guard costs nothing.
   if (args.todosDir) {

@@ -3,6 +3,7 @@ import { chmodSync, existsSync, unlinkSync } from "node:fs";
 import { log } from "../logger.js";
 import { watchBus, type WatchBus } from "./bus.js";
 import type { ClientFrame, ServerFrame, WatchSnapshot } from "./protocol.js";
+import type { CompactReservation } from "../lcm/background-gate.js";
 
 /**
  * Shape gate for a decoded client line. Only a plain object with a string
@@ -20,10 +21,15 @@ export interface WatchServerDeps {
   /** Route a chat message typed in the TUI into the owner's dm session. */
   sendChat(text: string): Promise<void>;
   /**
-   * Live background tasks of the session behind an SDK session id (the
-   * rollup gate in `tomo lcm`). Absent: the query is answered as unsupported.
+   * The rollup gate for `tomo lcm` (agent/compact-reservations.ts): approve a
+   * rewrite of the session behind an SDK session id and mark it pending, and
+   * finish that approval once the rewrite is over. Absent: `compact-reserve`
+   * is answered as unsupported, which the CLI treats as a refusal.
    */
-  backgroundTaskCount?(sdkSessionId: string): number;
+  compactGate?: {
+    reserve(sdkSessionId: string): CompactReservation;
+    finish(reservation: CompactReservation): void;
+  };
 }
 
 /**
@@ -37,6 +43,7 @@ export interface WatchServerDeps {
 export class WatchServer {
   private server: Server | null = null;
   private clients = new Set<Socket>();
+  private reservationsBySocket = new Map<Socket, Map<string, CompactReservation>>();
   private unsubscribe: (() => void) | null = null;
 
   constructor(
@@ -92,7 +99,16 @@ export class WatchServer {
     this.clients.add(socket);
     socket.setEncoding("utf-8");
     socket.on("error", () => socket.destroy());
-    socket.on("close", () => this.clients.delete(socket));
+    // Compact approvals this connection holds, by SDK session id. Finished
+    // when the client says so or goes away — whichever comes first.
+    const reservations = new Map<string, CompactReservation>();
+    this.reservationsBySocket.set(socket, reservations);
+    socket.on("close", () => {
+      this.clients.delete(socket);
+      this.reservationsBySocket.delete(socket);
+      for (const r of reservations.values()) this.deps.compactGate?.finish(r);
+      reservations.clear();
+    });
 
     let buffer = "";
     socket.on("data", (chunk: string) => {
@@ -159,9 +175,25 @@ export class WatchServer {
       return;
     }
 
-    if (frame.kind === "background-tasks" && typeof frame.sdkSessionId === "string" && this.deps.backgroundTaskCount) {
-      const count = this.deps.backgroundTaskCount(frame.sdkSessionId);
-      this.write(socket, { kind: "background-tasks", sdkSessionId: frame.sdkSessionId, count });
+    const gate = this.deps.compactGate;
+    const held = this.reservationsBySocket.get(socket);
+    if (frame.kind === "compact-reserve" && typeof frame.sdkSessionId === "string" && gate && held) {
+      // A second reserve for the same session on one connection re-asks;
+      // the earlier approval is finished first so it cannot leak.
+      const previous = held.get(frame.sdkSessionId);
+      if (previous) {
+        held.delete(frame.sdkSessionId);
+        gate.finish(previous);
+      }
+      const reservation = gate.reserve(frame.sdkSessionId);
+      if (reservation.ok) held.set(frame.sdkSessionId, reservation);
+      this.write(socket, { kind: "compact-reserve", sdkSessionId: frame.sdkSessionId, reservation });
+      return;
+    }
+    if (frame.kind === "compact-finish" && typeof frame.sdkSessionId === "string" && gate && held) {
+      const reservation = held.get(frame.sdkSessionId);
+      held.delete(frame.sdkSessionId);
+      if (reservation) gate.finish(reservation);
       return;
     }
 

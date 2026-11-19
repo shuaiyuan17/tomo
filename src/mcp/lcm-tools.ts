@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { compactSession } from "../lcm/compact.js";
 import { resolveBlockRange, summaryBudgetCheck, type BlockLevel } from "../lcm/blocks.js";
 import { log } from "../logger.js";
-import { backgroundGateRefusal } from "../lcm/background-gate.js";
+import { compactRefusal, type CompactReservation } from "../lcm/background-gate.js";
 
 export interface LcmToolDeps {
   /** The caller's SDK session id, resolved at call time (it changes on reset). */
@@ -13,11 +13,13 @@ export interface LcmToolDeps {
   sessionsDir: string;
   sessionKey: string;
   /**
-   * Live background tasks on the caller's session, read at call time. The
-   * reload that follows a rollup would kill them, so the tool refuses while
-   * this is above zero (see lcm/background-gate.ts).
+   * Approve the rewrite and mark the compact pending on the caller's session
+   * in one step (agent/compact-reservations.ts): refused while it has
+   * background work, because the reload that follows would kill it.
    */
-  activeBackgroundTasks: () => number;
+  reserveCompact: (sdkSessionId: string) => CompactReservation;
+  /** The approved rewrite is over, whatever its outcome. */
+  finishCompact: (reservation: CompactReservation) => void;
 }
 
 const PERIOD_HINT: Record<BlockLevel, string> = {
@@ -76,11 +78,12 @@ export function buildLcmTools(deps: LcmToolDeps) {
 
         // Before the range is even resolved: nothing may be rewritten while a
         // background task is running, because the reload would kill it.
-        const refusal = backgroundGateRefusal(deps.activeBackgroundTasks(), `${level} rollup`);
-        if (refusal) {
+        const reservation = deps.reserveCompact(sdkSessionId);
+        if (!reservation.ok) {
+          const refusal = compactRefusal(reservation, `${level} rollup`);
           log.info(
-            { key: deps.sessionKey, level, period: args.period, activeBackgroundTasks: refusal.activeBackgroundTasks },
-            "lcm_rollup: deferred while background tasks run",
+            { key: deps.sessionKey, level, period: args.period, reason: refusal.reason },
+            "lcm_rollup: deferred while background work runs",
           );
           return {
             content: [{
@@ -90,22 +93,31 @@ export function buildLcmTools(deps: LcmToolDeps) {
           };
         }
 
-        const resolved = resolveBlockRange(sdkSessionId, level, args.period, deps.sdkSessionsDir);
-        if (!resolved) {
-          return fail(`No events found for ${level} ${args.period ?? "(default period)"}. Period format: ${PERIOD_HINT[level]}.`);
+        let result: ReturnType<typeof compactSession>;
+        let resolved: ReturnType<typeof resolveBlockRange>;
+        try {
+          resolved = resolveBlockRange(sdkSessionId, level, args.period, deps.sdkSessionsDir);
+          if (!resolved) {
+            return fail(`No events found for ${level} ${args.period ?? "(default period)"}. Period format: ${PERIOD_HINT[level]}.`);
+          }
+          result = compactSession({
+            sdkSessionId,
+            sdkSessionsDir: deps.sdkSessionsDir,
+            fromIdx: resolved.fromIdx,
+            toIdx: resolved.toIdx,
+            expectedFirstUuid: resolved.firstUuid,
+            expectedLastUuid: resolved.lastUuid,
+            summary: args.summary,
+            transcriptPath: join(deps.sessionsDir, `_archive_${sdkSessionId}.jsonl`),
+            blockTag: resolved.blockTag,
+            dropUnparseable: false,
+          });
+        } finally {
+          // Every exit — refused range, failed or successful rewrite, throw —
+          // finishes the approval; a successful one stays pending until the
+          // session reloads at the end of this turn.
+          deps.finishCompact(reservation);
         }
-        const result = compactSession({
-          sdkSessionId,
-          sdkSessionsDir: deps.sdkSessionsDir,
-          fromIdx: resolved.fromIdx,
-          toIdx: resolved.toIdx,
-          expectedFirstUuid: resolved.firstUuid,
-          expectedLastUuid: resolved.lastUuid,
-          summary: args.summary,
-          transcriptPath: join(deps.sessionsDir, `_archive_${sdkSessionId}.jsonl`),
-          blockTag: resolved.blockTag,
-          dropUnparseable: false,
-        });
         if (!result.success) return fail(result.error ?? "compaction failed");
 
         const budget = summaryBudgetCheck(level, args.summary);

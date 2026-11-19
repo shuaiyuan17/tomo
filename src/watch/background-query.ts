@@ -1,49 +1,64 @@
-import { createConnection } from "node:net";
+import { createConnection, type Socket } from "node:net";
 import type { ClientFrame, ServerFrame } from "./protocol.js";
+import type { CompactReservation } from "../lcm/background-gate.js";
 
 /**
- * What the daemon said about a session's background tasks:
- * - `ok`: the live count (0 when the session has no live SDK session).
- * - `unreachable`: no daemon on the socket. With no daemon there is no live
- *   session to reload, so nothing can be killed.
- * - `unsupported`: a daemon too old to answer the query.
- * - `timeout`: the daemon accepted the connection but did not answer.
+ * The daemon's answer to `tomo lcm` asking to rewrite a session:
+ * - `approved`: the compact is marked pending on the session; call `finish()`
+ *   once the rewrite is over (closing the process does the same).
+ * - `refused`: the session has background work (see the reservation).
+ * - `no-daemon`: nothing is listening and no daemon process is alive, so
+ *   there is no live session to reload.
+ * - `unconfirmed`: a daemon may be running but did not give an answer
+ *   (timeout, an older daemon, a connection error). Callers fail closed.
  */
-export type BackgroundTaskQueryResult =
-  | { status: "ok"; count: number }
-  | { status: "unreachable" | "unsupported" | "timeout" };
+export type CompactReserveResult =
+  | { status: "approved"; finish(): Promise<void> }
+  | { status: "refused"; reservation: Extract<CompactReservation, { ok: false }> }
+  | { status: "no-daemon" }
+  | { status: "unconfirmed"; detail: string };
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 
+export interface ReserveOptions {
+  timeoutMs?: number;
+  /** Is a daemon process alive (pid file)? Consulted only when the socket refuses. */
+  daemonAlive: () => boolean;
+}
+
 /**
- * Ask the daemon, over the watch socket, how many background tasks the live
- * session behind `sdkSessionId` is running. The socket is the existing
- * CLI ↔ daemon channel (`tomo watch` uses it); the server always opens with a
- * snapshot frame, which this one-shot client ignores.
+ * Ask the daemon over the watch socket — the existing CLI ↔ daemon channel
+ * (`tomo watch` uses it) — to approve a rewrite of `sdkSessionId`. The server
+ * always opens with a snapshot frame, which this client ignores. On approval
+ * the connection stays open: the daemon finishes the reservation when it is
+ * told to, or when the connection drops.
  */
-export function queryBackgroundTasks(
-  socketPath: string,
-  sdkSessionId: string,
-  timeoutMs = DEFAULT_TIMEOUT_MS,
-): Promise<BackgroundTaskQueryResult> {
+export function reserveCompact(socketPath: string, sdkSessionId: string, opts: ReserveOptions): Promise<CompactReserveResult> {
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   return new Promise((resolve) => {
     let settled = false;
-    const socket = createConnection(socketPath);
-    const finish = (result: BackgroundTaskQueryResult) => {
+    let connected = false;
+    const socket: Socket = createConnection(socketPath);
+    const settle = (result: CompactReserveResult, keepOpen = false) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      socket.destroy();
+      if (!keepOpen) socket.destroy();
       resolve(result);
     };
-    const timer = setTimeout(() => finish({ status: "timeout" }), timeoutMs);
+    const timer = setTimeout(
+      () => settle({ status: "unconfirmed", detail: `no answer within ${Math.round(timeoutMs / 1000)}s` }),
+      timeoutMs,
+    );
     socket.setEncoding("utf-8");
     socket.on("connect", () => {
-      const frame: ClientFrame = { kind: "background-tasks", sdkSessionId };
+      connected = true;
+      const frame: ClientFrame = { kind: "compact-reserve", sdkSessionId };
       socket.write(JSON.stringify(frame) + "\n");
     });
     let buffer = "";
     socket.on("data", (chunk: string) => {
+      if (settled) return;
       buffer += chunk;
       let idx: number;
       while ((idx = buffer.indexOf("\n")) !== -1) {
@@ -55,18 +70,41 @@ export function queryBackgroundTasks(
         } catch {
           continue;
         }
-        if (frame.kind === "background-tasks" && frame.sdkSessionId === sdkSessionId) {
-          finish({ status: "ok", count: frame.count });
+        if (frame.kind === "compact-reserve" && frame.sdkSessionId === sdkSessionId) {
+          const reservation = frame.reservation;
+          if (!reservation.ok) {
+            settle({ status: "refused", reservation });
+            return;
+          }
+          // Stop buffering snapshot/event frames we no longer read.
+          socket.removeAllListeners("data");
+          socket.resume();
+          settle({
+            status: "approved",
+            finish: () => new Promise<void>((done) => {
+              if (socket.destroyed) return done();
+              const fin: ClientFrame = { kind: "compact-finish", sdkSessionId };
+              socket.end(JSON.stringify(fin) + "\n", () => done());
+              socket.once("close", () => done());
+            }),
+          }, true);
           return;
         }
-        // A daemon that predates the query answers it with a generic refusal.
+        // A daemon that predates the gate answers with a generic refusal.
         if (frame.kind === "send-result" && !frame.ok) {
-          finish({ status: "unsupported" });
+          settle({ status: "unconfirmed", detail: "the daemon does not support the background-task check (older version?)" });
           return;
         }
       }
     });
-    socket.on("error", () => finish({ status: "unreachable" }));
-    socket.on("close", () => finish({ status: "unreachable" }));
+    socket.on("error", (err: NodeJS.ErrnoException) => {
+      const code = err.code ?? "";
+      if (!connected && (code === "ENOENT" || code === "ECONNREFUSED") && !opts.daemonAlive()) {
+        settle({ status: "no-daemon" });
+      } else {
+        settle({ status: "unconfirmed", detail: `watch socket: ${code || err.message}` });
+      }
+    });
+    socket.on("close", () => settle({ status: "unconfirmed", detail: "the daemon closed the connection" }));
   });
 }

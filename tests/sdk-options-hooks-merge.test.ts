@@ -213,3 +213,25 @@ describe("buildHooksOption — groupShellAllowlist threaded to the guard", () =>
     expect(result).toEqual({});
   });
 });
+
+describe("buildHooksOption — background launch guard (pending compact)", () => {
+  it("is installed when asked for, fails closed, and denies a background launch while the getter says so", async () => {
+    let denial: string | null = "a rollup is pending";
+    const { hooks } = buildHooksOption({
+      maxTurns: 0,
+      sessionKey: "dm:owner",
+      backgroundLaunchDenial: () => denial,
+    }) as { hooks: Record<string, Array<{ onFailure?: string; hooks: Array<(i: unknown) => Promise<unknown>> }>> };
+    expect(hooks.PreToolUse).toHaveLength(1);
+    expect(hooks.PreToolUse[0].onFailure).toBe("block");
+    const hook = hooks.PreToolUse[0].hooks[0];
+    const launch = { tool_name: "Agent", tool_input: { prompt: "x", run_in_background: true } };
+    expect(await hook(launch)).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    denial = null;
+    expect(await hook(launch)).toEqual({});
+  });
+
+  it("is absent without the getter", () => {
+    expect(buildHooksOption({ maxTurns: 0, sessionKey: "dm:owner" })).toEqual({});
+  });
+});

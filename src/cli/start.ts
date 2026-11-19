@@ -253,6 +253,15 @@ async function startForeground(): Promise<void> {
         models: { view: (key) => agent.webModelView(key), switch: (key, model, from) => agent.switchModelFromWeb(key, model, from) },
         sessionKeys: sessionKeysReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
         home: { view: () => home.web(), snapshot: (input) => home.deliverSnapshot(input) },
+        // A sandboxed group's request_permission: Allow once / Always allow / Deny.
+        permissions: {
+          current: () => agent.permissionBroker.views(),
+          decide: (id, decision) => agent.permissionBroker.decide(id, decision, "web"),
+          revoke: (grantId) => {
+            const done = agent.permissionBroker.revokeGrant(grantId, "web");
+            return done === null ? "unknown" : done.ok ? "revoked" : "unwritable";
+          },
+        },
         // The credential broker's password card: only while the broker is on.
         ...(agent.credentialBroker ? { credentials: {
           current: () => agent.credentialBroker?.formRequest("web") ?? null,

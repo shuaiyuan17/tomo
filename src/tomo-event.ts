@@ -48,6 +48,7 @@ export type TomoEventType =
   | "inbox"            // durable-inbox replay after a restart (name = replay|interrupted)
   | "interrupted-agents" // subagents/background commands a restart or crash cut off
   | "credential"       // how a credential request ended (never carries a value)
+  | "permission"       // how a group's request_permission ended
   | "note";            // bare harness aside with no producer of its own
                        //   (appendToTomoEventBody's fallback wrapper)
 

@@ -39,6 +39,17 @@ export interface GroupSandboxEntry {
   /** Full trust: Bash runs unsandboxed and the file tools keep only the
    *  private-memory guards (the old `groupShellAllowlist` behaviour). */
   unsandboxed: boolean;
+  /** "Always allow" grants by durable grant id: provenance and the revoke
+   *  handle. The sandbox reads `extraRead` / `extraWrite`, never this. */
+  grants?: Record<string, GroupGrantRecord>;
+}
+
+export interface GroupGrantRecord {
+  path: string;
+  access: "read" | "write";
+  /** The `request_permission` request that made it. */
+  requestId?: string;
+  at?: string;
 }
 
 export interface GroupSandboxConfig {
@@ -392,4 +403,29 @@ export function groupPathDenial(
 /** Denial text for a file-tool call the group policy refuses. */
 export function groupPathDenialReason(detail: string): string {
   return `Not available on this turn: ${detail}. A group turn can read and write the workspace (except memory/private/ and secrets/), read system directories, and use the temp dirs; anything else needs the owner to add it to this group's sandbox config. Do not retry with a different spelling of the path.`;
+}
+
+/**
+ * Why `path` can never be granted to a group, or null when it can. For
+ * `request_permission` (src/permissions/broker.ts): a request the owner could
+ * approve but that would grant nothing (or something other than what the card
+ * shows) is refused before the owner is asked.
+ *
+ * - Not a valid extra (`/`, the home directory itself, relative, `..`).
+ * - Inside Tomo's home outside the workspace: {@link groupPathPolicy} drops
+ *   such an extra, so approving it would do nothing.
+ * - A permanent deny for this access: what no group may read (or write), or,
+ *   for write, a directory above a protected path. Judged with every allow
+ *   opened up, so only the denies speak.
+ */
+export function permanentGrantDenial(
+  path: string,
+  access: "read" | "write",
+  policy: GroupPathPolicy,
+  opts: { workspaceDir: string; tomoHome?: string; userHome?: string },
+): string | null {
+  if (!isValidExtraPath(path, opts.userHome ?? homedir())) return `${path} is not a path a group can be granted`;
+  if (reachesTomoHome(path, opts.tomoHome, opts.workspaceDir)) return `${path} is inside Tomo's own home, which no group may reach`;
+  const open: GroupPathPolicy = { ...policy, readDirs: ["/"], readFiles: [], writeDirs: ["/"] };
+  return groupPathDenial(access === "write" ? "Write" : "Read", { file_path: path }, opts.workspaceDir, open);
 }

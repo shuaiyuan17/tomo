@@ -10,7 +10,8 @@ export { barredSearch, isHarnessDataAccess, isHomeWrite, isPrivateMemoryAccess, 
 import { join } from "node:path";
 import { landsInPrivate } from "./private-memory-reach.js";
 import { expandTilde } from "./bash-write-targets.js";
-import { groupPathDenial, groupPathDenialReason, groupPathPolicy, type GroupPathPolicy, type GroupSandboxConfig, type GroupSandboxEntry } from "./group-fs-policy.js";
+import { groupPathDenial, groupPathDenialReason, groupPathPolicy, permanentGrantDenial, type GroupPathPolicy, type GroupSandboxConfig, type GroupSandboxEntry } from "./group-fs-policy.js";
+import type { PermissionAssessment } from "../permissions/broker.js";
 
 // ---------------------------------------------------------------------------
 // Group-session guard for memory/private/
@@ -206,8 +207,17 @@ export function privateMemoryGuardHooks(
   sessionKey: string | undefined,
   bar: () => PrivateMemoryBar | null,
   pluginDirs: () => readonly string[] = () => [],
-  groupSandbox: () => GroupSandboxConfig | undefined = () => undefined,
+  /**
+   * The group config this call is judged by. `once`: may this call use the
+   * session's Allow-once grants? Only a FOREGROUND call of the MAIN agent may
+   * (see {@link mayUseOnceGrants}); a getter that has no such grants ignores it.
+   */
+  groupSandbox: (opts: { once: boolean }) => GroupSandboxConfig | undefined = () => undefined,
   scopedCallerKey: () => string | undefined = () => undefined,
+  /** Told of each sandboxed Bash command and each file-tool call the group
+   *  policy refuses: the card of a later `request_permission` shows it as the
+   *  trigger. Observational only; it decides nothing. */
+  noteCall: (text: string) => void = () => {},
 ) {
   const ctx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, privateDir: PRIVATE_MEMORY_DIR };
   const homeCtx = { cwd: config.workspaceDir, homeDir: HOME_SCENE_DIR };
@@ -224,7 +234,7 @@ export function privateMemoryGuardHooks(
       // (and under bypassPermissions nothing else stops it). A security guard
       // must deny instead, so a crash here blocks the call.
       onFailure: "block" as const,
-      hooks: [async (input: { tool_name: string; tool_input: unknown }) => {
+      hooks: [async (input: { tool_name: string; tool_input: unknown; agent_id?: string }) => {
         // Cheap check first: `bar()` is a map lookup, `isPrivateMemoryAccess`
         // can hit the filesystem. Order does not affect the outcome.
         const reason = bar();
@@ -244,13 +254,15 @@ export function privateMemoryGuardHooks(
           };
         }
         const isBash = input.tool_name === "Bash";
+        const once = mayUseOnceGrants(input);
+        const sandboxFor = () => groupSandbox({ once });
         if (isBash) {
           // A turn belonging to an allowlisted group runs Bash UNSANDBOXED.
           // That is full trust, not a narrower hole: the Read/Edit/Glob/Grep/
           // MEDIA denials below still fire, but an unsandboxed shell can read
           // the same paths, so allowlisting a group hands its participants the
           // owner's private memory through Bash.
-          const group = groupEntryFor(reason, sessionKey, groupSandbox, scopedCallerKey);
+          const group = groupEntryFor(reason, sessionKey, sandboxFor, scopedCallerKey);
           if (group?.entry.unsandboxed) {
             log.info(
               { key: sessionKey, tool: input.tool_name, allowlistedKey: group.key, bar: reason },
@@ -263,6 +275,9 @@ export function privateMemoryGuardHooks(
             pluginDirs: pluginDirs(),
           }, groupPolicy(group?.entry, dataCtx.dataDirs));
           if (sandboxed) {
+            if (typeof (input.tool_input as { command?: unknown }).command === "string") {
+              noteCall((input.tool_input as { command: string }).command);
+            }
             log.info(
               { key: sessionKey, tool: input.tool_name, bar: reason },
               "Sandboxed Bash on a private-memory-barred turn",
@@ -314,10 +329,11 @@ export function privateMemoryGuardHooks(
           // so the file tools cannot reach what the shell cannot (the config
           // file, secrets/, the keychains, anything outside the workspace).
           // An unsandboxed group keeps the guards above and nothing more.
-          const group = groupEntryFor(reason, sessionKey, groupSandbox, scopedCallerKey);
+          const group = groupEntryFor(reason, sessionKey, sandboxFor, scopedCallerKey);
           if (group?.entry.unsandboxed) return {};
           const denial = groupPathDenial(input.tool_name, input.tool_input, config.workspaceDir, groupPolicy(group?.entry, dataCtx.dataDirs));
           if (!denial) return {};
+          noteCall(`${input.tool_name} ${toolPathOf(input.tool_input)}`.trim());
           log.warn({ key: sessionKey, tool: input.tool_name, bar: reason }, "Blocked a file-tool call outside the group path policy");
           return {
             hookSpecificOutput: {
@@ -367,15 +383,52 @@ function groupEntryFor(
   groupSandbox: () => GroupSandboxConfig | undefined,
   scopedCallerKey: () => string | undefined,
 ): { key: string; entry: GroupSandboxEntry } | undefined {
-  if (!sessionKey) return undefined;
-  let key = sessionKey;
-  if (reason === "summoned-turn") {
-    const steering = scopedCallerKey();
-    if (!steering || steering === sessionKey || steering === MIXED_AUDIENCE_KEY) return undefined;
-    key = steering;
-  }
+  const key = groupKeyFor(reason, sessionKey, scopedCallerKey);
+  if (!key) return undefined;
   const entry = groupSandbox()?.groups?.[key];
   return entry ? { key, entry } : undefined;
+}
+
+/**
+ * May this tool call use an Allow-once grant? Only the main agent's own FILE
+ * TOOL calls (Read, Write, Edit, Grep, Glob, ...), never Bash.
+ *
+ * Bash is out entirely, foreground included: a sandbox profile is inherited by
+ * every process the command starts, and a child that detaches (`setsid`,
+ * `nohup … &`, a daemonizing tool) keeps running, with the grant, after the
+ * turn has ended, where neither the turn's end nor a revoke can reach it. A
+ * file-tool call is one operation in this process and ends with the call.
+ * A subagent (the hook input carries `agent_id`) is not the turn the owner
+ * answered. Always-allow grants are config, and reach both.
+ */
+export function mayUseOnceGrants(input: { tool_name: string; tool_input: unknown; agent_id?: string }): boolean {
+  if (input.agent_id) return false;
+  return input.tool_name !== "Bash";
+}
+
+/**
+ * The ONE group a barred turn is attributable to, or `undefined` (see
+ * {@link groupEntryFor} for the rules). Exported for `request_permission`,
+ * which must ask on behalf of exactly the group whose policy the guard will
+ * then apply.
+ */
+export function groupKeyFor(
+  reason: PrivateMemoryBar,
+  sessionKey: string | undefined,
+  scopedCallerKey: () => string | undefined,
+): string | undefined {
+  if (!sessionKey) return undefined;
+  if (reason !== "summoned-turn") return sessionKey;
+  const steering = scopedCallerKey();
+  if (!steering || steering === sessionKey || steering === MIXED_AUDIENCE_KEY) return undefined;
+  return steering;
+}
+
+/** The path a file tool was pointed at, for the trigger line on a permission card. */
+function toolPathOf(toolInput: unknown): string {
+  const ti = toolInput && typeof toolInput === "object" ? toolInput as Record<string, unknown> : {};
+  const p = ti.file_path ?? ti.notebook_path ?? ti.path;
+  return typeof p === "string" ? p : "";
 }
 
 /**
@@ -398,6 +451,22 @@ export function attachmentBarredFor(
   const group = groupEntryFor(bar, sessionKey, groupSandbox, scopedCallerKey);
   if (group?.entry.unsandboxed) return false;
   return groupPathDenial("Read", { file_path: expandTilde(path) }, config.workspaceDir, groupPolicy(group?.entry)) !== null;
+}
+
+/**
+ * For `request_permission`: is the (resolved) `path` already within the
+ * group's reach for `access`, never grantable to any group, or worth asking
+ * the owner about? Judged by the same policy the guard applies, so "already
+ * allowed" means the next call really succeeds and "ask" means it really
+ * would not.
+ */
+export function assessGroupPermission(entry: GroupSandboxEntry | undefined, path: string, access: "read" | "write"): PermissionAssessment {
+  if (entry?.unsandboxed) return { verdict: "allowed" };
+  const policy = groupPolicy(entry);
+  const never = permanentGrantDenial(path, access, policy, { workspaceDir: config.workspaceDir, tomoHome: config.tomoHome });
+  if (never) return { verdict: "never", reason: never };
+  const denial = groupPathDenial(access === "write" ? "Write" : "Read", { file_path: path }, config.workspaceDir, policy);
+  return denial === null ? { verdict: "allowed" } : { verdict: "ask" };
 }
 
 /** The group path policy for this turn, from config and the group's entry. */

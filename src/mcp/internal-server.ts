@@ -9,6 +9,8 @@ import { buildPeopleTools } from "./people-tools.js";
 import { buildLcmTools } from "./lcm-tools.js";
 import { buildHomeTools } from "./home-tools.js";
 import { buildCredentialTools } from "./credential-tools.js";
+import { buildPermissionTools, PERMISSION_NO_GROUP, PERMISSION_NOT_SANDBOXED } from "./permission-tools.js";
+import { groupKeyFor, privateMemoryBarFor } from "../agent/private-memory-guard.js";
 import { buildTodoTools } from "./todo-tools.js";
 import { isDmSessionKey, isGroupSessionKey } from "../sessions/keys.js";
 import { ownerSessionKey } from "../owner.js";
@@ -350,6 +352,19 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           origin: () => agent.turnOrigin(callerSessionKey),
         })
         : []),
+      // On every session: a group's own, and the owner's dm: session for a
+      // summoned group's turns. It refuses on a turn that is not sandboxed
+      // (the owner's own) and on one no single group can be held to.
+      ...buildPermissionTools({
+        broker: agent.permissionBroker,
+        sessionKey: callerSessionKey,
+        scope: () => {
+          const bar = privateMemoryBarFor(isGroupSessionKey(callerSessionKey), isOwnAudience);
+          if (!bar) return { refusal: PERMISSION_NOT_SANDBOXED };
+          const groupKey = groupKeyFor(bar, callerSessionKey, () => agent.scopedCallerKey(callerSessionKey));
+          return groupKey ? { groupKey } : { refusal: PERMISSION_NO_GROUP };
+        },
+      }),
     ],
   });
 }

@@ -186,6 +186,8 @@ export function resetConfig(overrides: Partial<typeof mockConfig> = {}) {
     identities: [],
     channelAllowlists: {},
     sessionModelOverrides: {},
+    // Fresh per reset: an "Always allow" writes into the live object.
+    groupSandbox: { groups: {} },
     groupSecret: null,
     ...overrides,
   });

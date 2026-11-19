@@ -14,6 +14,7 @@ import { TasksPanel } from "./tasks-panel.js";
 import { PlanUsage } from "./plan-usage.js";
 import { CompactButton } from "./compact-button.js";
 import { CredentialCard } from "./credential-card.js";
+import { PermissionCard, PermissionGranted, type GrantedPermission } from "./permission-card.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
@@ -173,6 +174,8 @@ export function App() {
   const [draft, setDraft] = useState("");
   /** The message the next send replies to (its quote, as the agent will read it). */
   const [replyingTo, setReplyingTo] = useState<{ id: string; who: string; text: string } | null>(null);
+  /** The last Always allow answered on a card, so its grant ID stays on screen after the card goes. */
+  const [granted, setGranted] = useState<GrantedPermission | null>(null);
   useEffect(() => { setReplyingTo(null); }, [selectedId]);
   const fileInput = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -864,6 +867,8 @@ export function App() {
                 className="absolute top-1 right-1 grid size-6 place-items-center rounded-full bg-foreground/70 text-background transition-colors hover:bg-foreground focus-visible:outline-offset-0"><X className="size-3" strokeWidth={2.5} /></button>
             </li>)}</ul>}
           {attachments.note && <p className="m-0 mb-2 text-[12px] text-muted-foreground" role="status">{attachments.note}</p>}
+          {granted && <PermissionGranted granted={granted} onClose={() => setGranted(null)} />}
+          {web.permissionRequests.map((request) => <PermissionCard key={request.id} request={request} bootstrap={web.bootstrap} refresh={web.refreshBootstrap} onAlways={setGranted} />)}
           {web.credentialRequest && <CredentialCard key={web.credentialRequest.id} request={web.credentialRequest} bootstrap={web.bootstrap} refresh={web.refreshBootstrap} />}
           {replyingTo && session?.writable && <div className="motion-enter mb-2 flex items-center gap-2.5 rounded-2xl border bg-card/70 py-1.5 pr-1.5 pl-3" role="group" aria-label="Replying">
             <Reply className="size-4 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />

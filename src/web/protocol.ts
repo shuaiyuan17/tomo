@@ -345,6 +345,19 @@ export const credentialSubmitSchema = z.union([
 export type WebCredentialSubmit = z.infer<typeof credentialSubmitSchema>;
 /** Answer to the card: the value was stored, or the request was refused. Never echoes the value. */
 export interface WebCredentialResult { status: "stored" | "cancelled" }
+/**
+ * A group's open `request_permission` (src/permissions/broker.ts), for the
+ * owner's card: the group, the path as the harness resolved it, read or
+ * write, the agent's own reason and the triggering call. One per group.
+ */
+export interface WebPermissionRequest { id: string; code: string; group: string; path: string; access: "read" | "write"; reason: string; command?: string; expiresAt: number }
+/** The card's answer (POST /permissions/<id>). */
+export const permissionDecisionSchema = z.object({ decision: z.enum(["once", "always", "deny"]) }).strict();
+export type WebPermissionDecision = z.infer<typeof permissionDecisionSchema>["decision"];
+export interface WebPermissionResult { status: "allowed_once" | "allowed_always" | "denied"; grantId?: string }
+/** Take back a group's Always allow (POST /permissions/revoke), by its grant id. The Permissions page (PR-3) builds on it. */
+export const permissionRevokeSchema = z.object({ grantId: z.string().regex(/^G-[A-HJ-NP-Z2-9]{6}$/) }).strict();
+export interface WebPermissionRevokeResult { status: "revoked" }
 export type WebEvent =
   /** `images`: ids of pictures this block sent, filed in the outgoing media store (see outgoing-media.ts). */
   | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string; images?: string[] }
@@ -369,6 +382,8 @@ export type WebEvent =
   | { type: "home-look"; requestId: string }
   /** The open credential request for the card; null: none (answered, refused, expired). REPLACE semantics. */
   | { type: "credential-request"; request: WebCredentialRequest | null }
+  /** Every open permission request; empty: none. REPLACE semantics. */
+  | { type: "permission-requests"; requests: WebPermissionRequest[] }
   /** All tasks of one session, live and recently ended. REPLACE semantics. */
   | { type: "tasks"; sessionId: string; tasks: WebTask[] }
   /** Tomo reacted to (null: took back its reaction on) one of the owner's web messages. */
@@ -396,6 +411,8 @@ export interface WebBootstrap extends WebCatalog {
   agentName?: string;
   /** The open credential request, so a reload still shows the card (absent: none, or an older daemon). */
   credentialRequest?: WebCredentialRequest | null;
+  /** The open permission requests, so a reload still shows their cards (absent: none, or an older daemon). */
+  permissionRequests?: WebPermissionRequest[];
 }
 /** One tick of the read-only screen view: a JPEG when live, otherwise why there is none. */
 export interface WebScreenFrame { status: "live" | "locked" | "away" | "unconfirmed" | "unavailable" | "too_large"; capturedAt: number; jpeg?: string }
@@ -527,9 +544,13 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("home-snapshot"), epoch: z.uuid(), snapshot: homeSnapshotSchema }).strict(),
   /** The credential card's answer, for the broker. The value goes no further than broker.fulfill. */
   z.object({ method: z.literal("credential-submit"), epoch: z.uuid(), id: z.uuid(), input: credentialSubmitSchema }).strict(),
+  /** The permission card's answer, for the permission broker. */
+  z.object({ method: z.literal("permission-decide"), epoch: z.uuid(), id: z.uuid(), decision: permissionDecisionSchema.shape.decision }).strict(),
+  /** Revoke a group's Always allow, for the permission broker. */
+  z.object({ method: z.literal("permission-revoke"), epoch: z.uuid(), grantId: permissionRevokeSchema.shape.grantId }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
-export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "rateLimit" | "suggestions" | "reactions" | "credentialRequest">;
+export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "rateLimit" | "suggestions" | "reactions" | "credentialRequest" | "permissionRequests">;
 export interface WebSync { snapshot: WebSnapshot; replay: EventEnvelope[] | null }
 /** Daemon answer to the `task` RPC. `sessionKey` stays inside the web process. */
 export interface WebTaskAccess { sessionKey: string; taskType: string; output?: TaskOutput;

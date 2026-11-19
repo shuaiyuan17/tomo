@@ -744,6 +744,11 @@ describe("protected entries whose name differs only in case", () => {
   write(target, "CASE-LINK-SECRET\n");
   write(join(home, "Config.json.upper"), "CASE-SECRET\n");
   symlinkSync(target, join(home, "CONFIG.json.bak"));
+  // U+017F LATIN SMALL LETTER LONG S folds (NFKC) to "s": a Unicode-equivalent
+  // spelling of a protected prefix must be found too.
+  const unicodeTarget = join(home, "notes", "unicode-target.json");
+  write(unicodeTarget, "UNICODE-LINK-SECRET\n");
+  symlinkSync(unicodeTarget, join(home, "config.j\u017Fon.alt"));
   const casePolicy = () => groupPathPolicy({
     workspaceDir: home,
     privateDir: join(home, "memory", "private"),
@@ -759,6 +764,11 @@ describe("protected entries whose name differs only in case", () => {
       expect(groupPathDenial("Read", { file_path: p }, home, casePolicy()), p).not.toBeNull();
     }
     expect(groupPathDenial("Read", { file_path: join(home, "notes", "plain.md") }, home, casePolicy())).toBeNull();
+  });
+
+  it("include Unicode-equivalent spellings, whose link targets are denied", () => {
+    expect(casePolicy().denyDirs).toEqual(expect.arrayContaining([unicodeTarget]));
+    expect(groupPathDenial("Read", { file_path: unicodeTarget }, home, casePolicy())).not.toBeNull();
   });
 
   it.runIf(sandboxRuns)("are unreadable from the shell", () => {

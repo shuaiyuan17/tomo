@@ -185,12 +185,14 @@ export function protectedLinkTargets(tomoHome: string | undefined): { targets: s
   }
   const targets: string[] = [];
   for (const name of names) {
-    // Case-INSENSITIVE, like every deny: on a case-insensitive volume
+    // Case- and Unicode-INSENSITIVE, like every deny: on a case-insensitive volume
     // `Config.json` is opened by `config.json`, and the kernel matches the
     // name as stored, which the exact-case prefix would miss. Such an entry
     // is denied by its own path.
-    const lower = name.toLowerCase();
-    if (!TOMO_HOME_DENY_PREFIXES.some((prefix) => lower.startsWith(prefix.toLowerCase()))) continue;
+    // Folded with foldPath (NFKC + lowercase), the same fold every deny uses,
+    // so Unicode-equivalent spellings (e.g. a long s) cannot slip past.
+    const folded = foldPath(name);
+    if (!TOMO_HOME_DENY_PREFIXES.some((prefix) => folded.startsWith(foldPath(prefix)))) continue;
     const entry = join(tomoHome, name);
     if (!TOMO_HOME_DENY_PREFIXES.some((prefix) => name.startsWith(prefix))) targets.push(entry);
     let link: boolean;

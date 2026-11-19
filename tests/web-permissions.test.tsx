@@ -64,6 +64,7 @@ describe("the permission card through the web process", () => {
   let supervisor: WebSupervisor;
   let open: WebPermissionRequest[];
   let decided: { id: string; decision: WebPermissionDecision }[];
+  let revoked: { groupKey: string; path: string }[];
   let base: string;
   let boot: WebBootstrap;
   let cookie: string;
@@ -75,16 +76,19 @@ describe("the permission card through the web process", () => {
     return await response.json() as WebBootstrap;
   }
   async function answer(id: string, body: unknown, extra: Record<string, string | undefined> = {}) {
+    return post(`/api/v1/permissions/${id}`, body, extra);
+  }
+  async function post(path: string, body: unknown, extra: Record<string, string | undefined> = {}) {
     const headers = Object.fromEntries(Object.entries({ "x-tomo-request": "1", "sec-fetch-site": "same-origin", cookie, origin: base,
       "content-type": "application/json", "x-tomo-csrf": boot.csrfToken, "x-tomo-epoch": boot.epoch, ...extra })
       .filter((e): e is [string, string] => e[1] !== undefined));
-    const response = await fetch(`${base}/api/v1/permissions/${id}`, { method: "POST", headers, body: JSON.stringify(body) });
+    const response = await fetch(`${base}${path}`, { method: "POST", headers, body: JSON.stringify(body) });
     return { status: response.status, body: await response.text() };
   }
 
   beforeEach(async () => {
     root = mkdtempSync(join(tmpdir(), "tomo-web-permissions-"));
-    open = [request]; decided = [];
+    open = [request]; decided = []; revoked = [];
     web = new WebChannel(owner, new WatchBus(), {
       permissions: {
         current: () => open,
@@ -93,6 +97,7 @@ describe("the permission card through the web process", () => {
           decided.push({ id, decision }); open = [];
           return { ok: true, outcome: decision === "once" ? "allowed_once" : decision === "always" ? "allowed_always" : "denied" };
         },
+        revoke: (groupKey, path) => { revoked.push({ groupKey, path }); return !path.includes("unwritable"); },
       },
     });
     web.onMessage(async () => true);
@@ -124,6 +129,20 @@ describe("the permission card through the web process", () => {
     expect(await answer(request.id, { decision: "maybe" })).toEqual({ status: 400, body: JSON.stringify({ error: "invalid_decision" }) });
     expect(await answer(request.id, { decision: "once", extra: 1 })).toEqual({ status: 400, body: JSON.stringify({ error: "invalid_decision" }) });
     expect(decided).toEqual([]);
+  }, 20_000);
+
+  it("revokes an Always allow for the owner, under the same gate", async () => {
+    const revoke = (body: unknown, extra: Record<string, string | undefined> = {}) => post("/api/v1/permissions/revoke", body, extra);
+    const grant = { groupKey: "telegram:-100777", path: "/srv/checkouts/app" };
+    expect((await revoke(grant, { "x-tomo-csrf": "nope" })).status).toBe(403);
+    expect((await revoke(grant, { "x-tomo-epoch": randomUUID() })).status).toBe(409);
+    expect((await revoke(grant, { origin: "http://evil.test" })).status).toBe(403);
+    expect((await revoke(grant, { cookie: undefined })).status).toBe(401);
+    expect(await revoke({ ...grant, extra: 1 })).toEqual({ status: 400, body: JSON.stringify({ error: "invalid_revoke" }) });
+    expect(revoked).toEqual([]);
+    expect(await revoke(grant)).toEqual({ status: 200, body: JSON.stringify({ status: "revoked" }) });
+    expect(revoked).toEqual([grant]);
+    expect(await revoke({ ...grant, path: "/srv/unwritable" })).toEqual({ status: 503, body: JSON.stringify({ error: "permission_config_unwritable" }) });
   }, 20_000);
 
   it("pushes the open requests over the event stream", async () => {

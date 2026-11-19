@@ -355,6 +355,9 @@ export interface WebPermissionRequest { id: string; code: string; group: string;
 export const permissionDecisionSchema = z.object({ decision: z.enum(["once", "always", "deny"]) }).strict();
 export type WebPermissionDecision = z.infer<typeof permissionDecisionSchema>["decision"];
 export interface WebPermissionResult { status: "allowed_once" | "allowed_always" | "denied" }
+/** Take back a group's Always allow (POST /permissions/revoke). The Permissions page (PR-3) builds on it. */
+export const permissionRevokeSchema = z.object({ groupKey: z.string().min(1).max(256), path: z.string().min(1).max(1024) }).strict();
+export interface WebPermissionRevokeResult { status: "revoked" }
 export type WebEvent =
   /** `images`: ids of pictures this block sent, filed in the outgoing media store (see outgoing-media.ts). */
   | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string; images?: string[] }
@@ -543,6 +546,8 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("credential-submit"), epoch: z.uuid(), id: z.uuid(), input: credentialSubmitSchema }).strict(),
   /** The permission card's answer, for the permission broker. */
   z.object({ method: z.literal("permission-decide"), epoch: z.uuid(), id: z.uuid(), decision: permissionDecisionSchema.shape.decision }).strict(),
+  /** Revoke a group's Always allow, for the permission broker. */
+  z.object({ method: z.literal("permission-revoke"), epoch: z.uuid(), groupKey: permissionRevokeSchema.shape.groupKey, path: permissionRevokeSchema.shape.path }).strict(),
 ]);
 export type Rpc = z.infer<typeof rpcSchema>;
 export type WebSnapshot = Pick<WebBootstrap, "epoch" | "cursor" | "requests" | "blocks" | "tasks" | "compact" | "rateLimit" | "suggestions" | "reactions" | "credentialRequest" | "permissionRequests">;

@@ -10,7 +10,7 @@ import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
 import { CompressedAssets, IMMUTABLE_CACHE, pickEncoding } from "./static-assets.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
-import { credentialSubmitSchema, permissionDecisionSchema, cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
+import { credentialSubmitSchema, permissionDecisionSchema, permissionRevokeSchema, cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
   type EventEnvelope, type Rpc, type TaskAction, type WebCompaction, type WebHome, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
 import { homeSceneSchema } from "../home/scene.js";
 import { decodeSnapshotPng } from "../home/snapshot.js";
@@ -299,6 +299,17 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         if (!parsed.success) throw new WebError(400, "invalid_credential");
         const id = CREDENTIAL_PATH.exec(url.pathname)![1];
         json(res, 200, await deps.rpc({ method: "credential-submit", epoch, id, input: parsed.data }));
+        return;
+      } else if (req.method === "POST" && url.pathname === "/api/v1/permissions/revoke") {
+        // Take back a group's Always allow: the owner only, same gate as the card.
+        csrf.verify(req, session!);
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || epoch !== await deps.rpc({ method: "epoch" })) throw new WebError(409, "epoch_changed");
+        const { ownerId } = deps.data.catalog();
+        if (!ownerId) throw new WebError(409, "owner_setup_required");
+        const parsed = permissionRevokeSchema.safeParse(await body(req));
+        if (!parsed.success) throw new WebError(400, "invalid_revoke");
+        json(res, 200, await deps.rpc({ method: "permission-revoke", epoch, groupKey: parsed.data.groupKey, path: parsed.data.path }));
         return;
       } else if (req.method === "POST" && PERMISSION_PATH.test(url.pathname)) {
         // The permission card's answer: the credential route's gate (Origin,

@@ -81,6 +81,25 @@ describe("request_permission through the Agent", () => {
     expect(im.sent.some((m) => m.text.startsWith(`Always allowed (${pending.code})`))).toBe(true);
   });
 
+  it("Allow once holds in the turn that carries the answer, and is gone after it", async () => {
+    const { agent, im, call } = setup();
+    const { code } = JSON.parse((await call(GROUP_KEY, { path: EXTERNAL, access: "read", reason: "x" })).content[0].text) as { code: string };
+    const seen: boolean[] = [];
+    mockSdk.responseFn = () => {
+      seen.push((agent.groupSandboxFor(GROUP_KEY).groups[GROUP_KEY]?.extraRead ?? []).includes(EXTERNAL));
+      return "ok";
+    };
+    await im.simulateMessage(makeMsg({ chatId: OWNER_CHAT, senderId: OWNER, text: `1 ${code}`, rawText: `1 ${code}` }));
+    await drainQueue(agent);
+    expect(permissionPrompts().map((p) => p.sessionKey)).toEqual([GROUP_KEY]);
+    expect(seen).toEqual([true]);
+    expect(agent.groupSandboxFor(GROUP_KEY).groups[GROUP_KEY]).toBeUndefined();
+    // The next group turn does not inherit it.
+    await im.simulateMessage(makeMsg({ chatId: GROUP_CHAT, isGroup: true, senderId: "+15555550999", text: "and now?" }));
+    await drainQueue(agent);
+    expect(seen).toEqual([true, false]);
+  });
+
   it("a group member typing the code in the group approves nothing", async () => {
     const { agent, im, call } = setup();
     const opened = await call(GROUP_KEY, { path: EXTERNAL, access: "read", reason: "x" });

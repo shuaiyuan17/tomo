@@ -23,7 +23,7 @@ import { FALLBACK_MIME, formatFileMarker, sanitizeAttachmentFilename, saveInboun
 import type { ImageAttachment } from "./types.js";
 import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request-journal.js";
 import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
-import type { WebCredentialRequest, WebCredentialResult, WebCredentialSubmit, WebHome, WebModelChangeResult, WebModelView, WebPermissionDecision, WebPermissionRequest, WebPermissionResult } from "../web/protocol.js";
+import type { WebCredentialRequest, WebCredentialResult, WebCredentialSubmit, WebHome, WebModelChangeResult, WebModelView, WebPermissionDecision, WebPermissionRequest, WebPermissionResult, WebPermissionRevokeResult } from "../web/protocol.js";
 import { modelLabel } from "../models.js";
 import { formatReactionMarker, formatReplyContextMarker } from "./text-utils.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WEB_REACTIONS, WEB_REQUEST_QUOTE_LIMIT, WebError, type WebReaction, type WebReply, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type TaskAction, type WebStopResult, type WebTaskActionResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess, type WebFiledFile } from "../web/protocol.js";
@@ -60,6 +60,8 @@ export interface WebPermissionAccess {
   /** The open requests the cards show. */
   current(): WebPermissionRequest[];
   decide(id: string, decision: WebPermissionDecision): { ok: true; outcome: WebPermissionResult["status"] } | { ok: false; status: number; code: string };
+  /** Take back a group's Always allow; false when config.json could not be written. */
+  revoke(groupKey: string, path: string): boolean;
 }
 
 /** The daemon side of Tomo's home (src/home/service.ts) as the browser reaches it. */
@@ -467,6 +469,13 @@ export class WebChannel implements Channel {
   /** The broker opened or closed a permission request. REPLACE semantics, like the snapshot. */
   publishPermissionRequests(requests: readonly WebPermissionRequest[]): void {
     this.publishQuietly({ type: "permission-requests", requests: requests.map(permissionView) });
+  }
+
+  /** The owner takes back a group's Always allow. */
+  revokePermission(groupKey: string, path: string): WebPermissionRevokeResult {
+    if (!this.permissions || this.tornDown) throw new WebError(409, "permission_unknown");
+    if (!this.permissions.revoke(groupKey, path)) throw new WebError(503, "permission_config_unwritable");
+    return { status: "revoked" };
   }
 
   /** The permission card's answer, straight to the broker: no journal, no bubble, no transcript. */

@@ -478,17 +478,16 @@ export class Agent {
       isOwnerSender: (channelName, senderId) => this.router.isOwnerSender(channelName, senderId),
       persistAlways: (groupKey, access, path) => persistGroupGrant(groupKey, access, path, this.grantTarget()),
       revokeAlways: (groupKey, path) => revokeGroupGrant(groupKey, path, this.grantTarget()),
-      notifySession: (sessionKey, groupKey, outcome, body) => {
+      notifySession: (sessionKey, groupKey, outcome, body, onTurnBegin) => {
         // Registered with the group as its audience, so a summoned group's
-        // answer turn stays scoped to that group, and the Allow-once grant
-        // can bind to it (see PermissionBroker.withOnceGrants).
-        this.handleCronMessage(formatTomoEvent("permission", body, { name: outcome }), sessionKey, { showTyping: false, audiences: [groupKey] })
+        // answer turn stays scoped to that group; its turn id is handed back
+        // so an Allow once binds to this one turn (PermissionBroker.withOnceGrants).
+        this.handleCronMessage(formatTomoEvent("permission", body, { name: outcome }), sessionKey,
+          { showTyping: false, audiences: [groupKey], ...(onTurnBegin ? { onTurnBegin } : {}) })
           .catch((err) => log.error({ err, sessionKey }, "Permission result turn failed to queue"));
       },
       liveTurnIds: (sessionKey) => this.turnAudiences.liveTurnIds(sessionKey),
       isTurnLive: (id) => this.turnAudiences.isLive(id),
-      lastTurnId: () => this.turnAudiences.lastTurnId(),
-      firstTurnAfter: (sessionKey, after) => this.turnAudiences.firstTurnAfter(sessionKey, after),
       groupTitle: (groupKey) => this.sessions.getEntry(groupKey)?.chatTitle,
     });
   }
@@ -2146,6 +2145,7 @@ export class Agent {
     // session's own scope — except while a summoned turn overlaps them, which
     // narrows them to that group and which `scopedCallerKey` logs at debug.
     const turnId = options.audiences ? this.turnAudiences.begin(key, options.audiences) : undefined;
+    if (turnId !== undefined) options.onTurnBegin?.(turnId);
     try {
       return await this.turnRunner.runTurn({
         key,
@@ -2620,6 +2620,12 @@ export class Agent {
       this.notifyInterruptedAgents();
     } catch (err) {
       log.warn({ err }, "Could not report interrupted subagents");
+    }
+    try {
+      // Requests the last run left open died with it: denied (restart), and their sessions told.
+      this.permissionBroker.reconcileAfterRestart();
+    } catch (err) {
+      log.warn({ err }, "Could not reconcile the permission ledger");
     }
     this.startMcpTokenRefreshSweep();
     log.info("Tomo is running");

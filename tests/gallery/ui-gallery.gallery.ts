@@ -305,7 +305,7 @@ async function boot(options: { conversation: boolean }): Promise<void> {
     stop: (key) => theAgent.stopTurn(key),
     models: { view: (key) => theAgent.webModelView(key), switch: (key, model, from) => theAgent.switchModelFromWeb(key, model, from) },
     home: { view: () => theHome.web(), snapshot: (input) => theHome.deliverSnapshot(input) },
-    permissions: { current: () => permissionRequests, decide: () => ({ ok: false, status: 409, code: "permission_unknown" }) },
+    permissions: { current: () => permissionRequests, decide: () => ({ ok: false, status: 409, code: "permission_unknown" }), revoke: () => true },
     outgoingMedia: new OutgoingMediaStore(outgoingImagesDir(mockConfig.workspaceDir), { isPrivate: (path) => path.includes("/memory/private/") }),
     uploads: { dir: uploadsDir(mockConfig.tomoHome), workspaceDir: mockConfig.workspaceDir },
   });

@@ -90,7 +90,9 @@ interface Harness {
   broker: Broker;
   dm: ReturnType<typeof chatChannel>;
   turns: InstanceType<typeof TurnAudienceRegistry>;
-  notes: { sessionKey: string; outcome: Outcome; body: string }[];
+  notes: { sessionKey: string; outcome: Outcome; body: string; onTurnBegin?: (turnId: number) => void }[];
+  /** Begins the turn that carries the latest answer, as Agent.processCronMessage does (and reports its id). */
+  answerTurn(): number;
   cards: unknown[][];
   now: { t: number };
 }
@@ -111,16 +113,20 @@ function harness(opts: { timeoutMs?: number; dm?: boolean } = {}): Harness {
     isOwnerSender: (_channel, senderId) => senderId === OWNER_ID,
     persistAlways: (groupKey, access, path) => persistGroupGrant(groupKey, access, path, target),
     revokeAlways: (groupKey, path) => revokeGroupGrant(groupKey, path, target),
-    notifySession: (sessionKey, _groupKey, outcome, body) => notes.push({ sessionKey, outcome, body }),
+    notifySession: (sessionKey, _groupKey, outcome, body, onTurnBegin) => notes.push({ sessionKey, outcome, body, onTurnBegin }),
     liveTurnIds: (key) => turns.liveTurnIds(key),
     isTurnLive: (id) => turns.isLive(id),
-    lastTurnId: () => turns.lastTurnId(),
-    firstTurnAfter: (key, after) => turns.firstTurnAfter(key, after),
     groupTitle: (key) => key === GROUP ? "Weekend project" : undefined,
     now: () => now.t,
     timeoutMs: opts.timeoutMs ?? 300_000,
   });
-  return { broker, dm, turns, notes, cards, now };
+  const answerTurn = () => {
+    const note = notes.at(-1)!;
+    const id = turns.begin(note.sessionKey, [GROUP]);
+    note.onTurnBegin?.(id);
+    return id;
+  };
+  return { broker, dm, turns, notes, cards, now, answerTurn };
 }
 
 /** What the guard applies on `sessionKey`: config (legacy folded in) plus live Allow-once grants — Agent.groupSandboxFor. */
@@ -245,19 +251,19 @@ describe("asking the owner", () => {
 });
 
 describe("the three answers", () => {
-  it("Allow once applies for the rest of the live turn, and not after it", async () => {
+  it("Allow once applies in the turn that carries the answer, and in no other", async () => {
     const h = harness();
-    const turn = h.turns.begin(GROUP, [GROUP]);
+    const asking = h.turns.begin(GROUP, [GROUP]);
     const { id } = await ask(h);
     expect(await readAllowed(h.broker)).toBe(false);
     expect(h.broker.decide(id, "once", "web")).toEqual({ ok: true, outcome: "allowed_once" });
-    expect(await readAllowed(h.broker)).toBe(true);
+    // The asking turn, still running when the owner answered, does not get it.
+    expect(await readAllowed(h.broker)).toBe(false);
     expect(h.notes.at(-1)).toMatchObject({ sessionKey: GROUP, outcome: "allowed_once" });
-    h.turns.end(GROUP, turn);
-    // The answer turn (begun after the approval) still gets it; the one after does not.
-    const answerTurn = h.turns.begin(GROUP, [GROUP]);
+    h.turns.end(GROUP, asking);
+    const answer = h.answerTurn();
     expect(await readAllowed(h.broker)).toBe(true);
-    h.turns.end(GROUP, answerTurn);
+    h.turns.end(GROUP, answer);
     const later = h.turns.begin(GROUP, [GROUP]);
     expect(await readAllowed(h.broker)).toBe(false);
     h.turns.end(GROUP, later);
@@ -265,24 +271,26 @@ describe("the three answers", () => {
     expect(JSON.parse(readFileSync(CONFIG, "utf8")).groupSandbox.groups).toEqual({});
   });
 
-  it("Allow once with no turn running binds to the next turn only", async () => {
+  it("Allow once is not usable while another turn runs beside the answer turn", async () => {
     const h = harness();
     const { id } = await ask(h);
     h.broker.decide(id, "once", "web");
-    expect(await readAllowed(h.broker)).toBe(false); // no registered turn: nothing to scope it to
-    const next = h.turns.begin(GROUP, [GROUP]);
-    expect(await readAllowed(h.broker)).toBe(true);
-    h.turns.end(GROUP, next);
-    const after = h.turns.begin(GROUP, [GROUP]);
+    const answer = h.answerTurn();
+    const concurrent = h.turns.begin(GROUP, [GROUP]);
     expect(await readAllowed(h.broker)).toBe(false);
-    h.turns.end(GROUP, after);
+    h.turns.end(GROUP, concurrent);
+    expect(await readAllowed(h.broker)).toBe(true);
+    h.turns.end(GROUP, answer);
   });
 
-  it("Allow once is not passed on by an answer turn that never used it", async () => {
+  it("Allow once does not pass to the next turn, even if the answer turn never used it", async () => {
     const h = harness();
     const { id } = await ask(h);
     h.broker.decide(id, "once", "web");
-    h.turns.end(GROUP, h.turns.begin(GROUP, [GROUP])); // the answer turn: no file call at all
+    const unrelated = h.turns.begin(GROUP, [GROUP]); // begun after the answer, but not the answer's turn
+    expect(await readAllowed(h.broker)).toBe(false);
+    h.turns.end(GROUP, unrelated);
+    h.turns.end(GROUP, h.answerTurn()); // the answer turn: no file call at all
     const later = h.turns.begin(GROUP, [GROUP]);
     expect(await readAllowed(h.broker)).toBe(false);
     h.turns.end(GROUP, later);
@@ -290,15 +298,15 @@ describe("the three answers", () => {
 
   it("Allow once does not reach a turn of another group running at the same time", async () => {
     const h = harness();
-    const own = h.turns.begin(GROUP, [GROUP]);
     const other = h.turns.begin(OTHER_GROUP, [OTHER_GROUP]);
     const { id } = await ask(h);
     h.broker.decide(id, "once", "web");
+    const answer = h.answerTurn();
     const otherGuard = privateMemoryGuardHooks(OTHER_GROUP, () => "group-session", () => [], () => sandboxFor(h.broker, OTHER_GROUP), () => OTHER_GROUP)
       .PreToolUse[0].hooks[0] as (input: { tool_name: string; tool_input: unknown }) => Promise<{ hookSpecificOutput?: { permissionDecision?: string } }>;
     expect((await otherGuard({ tool_name: "Read", tool_input: { file_path: EXTERNAL } })).hookSpecificOutput?.permissionDecision).toBe("deny");
     expect(await readAllowed(h.broker)).toBe(true);
-    h.turns.end(GROUP, own); h.turns.end(OTHER_GROUP, other);
+    h.turns.end(GROUP, answer); h.turns.end(OTHER_GROUP, other);
   });
 
   it("Always allow is written to config (with a backup) and the next call's profile includes it", async () => {
@@ -367,6 +375,52 @@ describe("the three answers", () => {
   });
 });
 
+describe("revoking, and a restart", () => {
+  it("the owner's DM `revoke <code>` takes an Always allow back, and only the owner's", async () => {
+    const h = harness();
+    const { id, code } = await ask(h);
+    h.broker.decide(id, "always", "web");
+    expect(await readAllowed(h.broker)).toBe(true);
+    const groupMessage = { ...ownerDm(`revoke ${code}`), chatId: "-100777", isGroup: true };
+    expect(await h.broker.handleInbound(chatChannel() as never, groupMessage as never)).toBe(false);
+    expect(await h.broker.handleInbound(h.dm as never, { ...ownerDm(`revoke ${code}`), senderId: "9999" } as never)).toBe(false);
+    expect(await readAllowed(h.broker)).toBe(true);
+    expect(await h.broker.handleInbound(h.dm as never, ownerDm(`revoke ${code.toLowerCase()}`) as never)).toBe(true);
+    expect(h.dm.sent.at(-1)?.text).toContain(`Revoked (${code})`);
+    expect(await readAllowed(h.broker)).toBe(false);
+    expect(JSON.parse(readFileSync(CONFIG, "utf8")).groupSandbox.groups[GROUP].extraRead).toEqual([]);
+    expect(readFileSync(LEDGER, "utf8").trim().split("\n").map((l) => JSON.parse(l)).at(-1)).toMatchObject({ event: "revoked", groupKey: GROUP, via: "telegram" });
+  });
+
+  it("revoking a code that granted no Always allow changes nothing", async () => {
+    const h = harness();
+    const { id, code } = await ask(h);
+    h.broker.decide(id, "deny", "web");
+    expect(await h.broker.handleInbound(h.dm as never, ownerDm(`revoke ${code}`) as never)).toBe(true);
+    expect(h.dm.sent.at(-1)?.text).toContain("nothing to revoke");
+  });
+
+  it("a request the last run left open is recorded as denied (restart), its session told, and a late reply closed", async () => {
+    rmSync(LEDGER, { force: true });
+    const before = harness();
+    const { code } = await ask(before);
+    before.broker.shutdown(); // the process dies with the request open
+    const after = harness();
+    expect(after.broker.reconcileAfterRestart()).toBe(1);
+    expect(after.notes).toMatchObject([{ sessionKey: GROUP, outcome: "denied" }]);
+    expect(after.notes[0].body).toContain("restarted");
+    expect(after.cards.at(-1)).toEqual([]);
+    const ledger = readFileSync(LEDGER, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(ledger.at(-1)).toMatchObject({ event: "decided", code, outcome: "denied", reason: "restart" });
+    expect(await after.broker.handleInbound(after.dm as never, ownerDm(`1 ${code}`) as never)).toBe(true);
+    expect(after.dm.sent.at(-1)?.text).toContain("no longer open");
+    // Once is enough: a second start finds nothing left open.
+    expect(harness().broker.reconcileAfterRestart()).toBe(0);
+    // And the group may ask again.
+    expect((await after.broker.request({ sessionKey: GROUP, groupKey: GROUP, path: fx.external, access: "read", reason: "x" })).status).toBe("pending");
+  });
+});
+
 describe("who can answer", () => {
   it("the owner's DM reply with the code counts, either order", async () => {
     const h = harness();
@@ -383,8 +437,10 @@ describe("who can answer", () => {
     const requestMessage = h.dm.sent[0];
     expect(await h.broker.handleInbound(h.dm as never, ownerDm("1", { replyToId: requestMessage.id, text: `[replying to: "…"] 1` }) as never)).toBe(true);
     expect(h.notes.at(-1)?.outcome).toBe("allowed_once");
-    expect(await readAllowed(h.broker)).toBe(true);
     h.turns.end(GROUP, turn);
+    const answer = h.answerTurn();
+    expect(await readAllowed(h.broker)).toBe(true);
+    h.turns.end(GROUP, answer);
   });
 
   it("a bare reply in the DM does not count and reaches the model as an ordinary message", async () => {
@@ -432,15 +488,16 @@ describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
     return { code: run.status ?? -1, out: `${run.stdout}${run.stderr}` };
   }
 
-  it("after Allow once the target is readable in that turn; after the turn it is not", async () => {
+  it("after Allow once the target is readable in the answer turn; after it, it is not", async () => {
     const h = harness();
     const turn = h.turns.begin(GROUP, [GROUP]);
     expect((await cat(h.broker)).out).not.toContain("EXTERNAL-CONTENT");
     const { id } = await ask(h);
     h.broker.decide(id, "once", "web");
-    expect(await cat(h.broker)).toMatchObject({ code: 0, out: "EXTERNAL-CONTENT\n" });
     h.turns.end(GROUP, turn);
-    h.turns.end(GROUP, h.turns.begin(GROUP, [GROUP])); // the answer turn came and went
+    const answer = h.answerTurn();
+    expect(await cat(h.broker)).toMatchObject({ code: 0, out: "EXTERNAL-CONTENT\n" });
+    h.turns.end(GROUP, answer);
     const later = h.turns.begin(GROUP, [GROUP]);
     const after = await cat(h.broker);
     expect(after.code).not.toBe(0);

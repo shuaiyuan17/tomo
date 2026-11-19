@@ -1,5 +1,5 @@
 import { randomInt, randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize } from "node:path";
 import type { Channel, IncomingMessage } from "../channels/types.js";
 import { log } from "../logger.js";
@@ -25,16 +25,18 @@ import { scrubKnownSecrets } from "../credentials/redactor.js";
  * message).
  *
  * WHAT A GRANT IS.
- * - Allow once: in memory only, tied to turn ids (see {@link OnceGrant}).
+ * - Allow once: in memory only, bound to the one turn that carries the
+ *   answer (see {@link OnceGrant}).
  * - Always allow: written to the group's `extraRead` / `extraWrite` in
  *   config.json, through the config writer (lock, backup, atomic write), and
  *   into the live config, so the next Bash or file-tool call sees it. Revoked
  *   with {@link PermissionBroker.revoke}.
  * - Deny, and a request nobody answered in time: nothing.
  *
- * One open request per group. Pending requests live in memory: a restart
- * drops them (the owner's later reply is told it is no longer open), and the
- * ledger keeps the record.
+ * One open request per group. Pending requests live in memory; on the next
+ * start {@link PermissionBroker.reconcileAfterRestart} records each one the
+ * ledger shows as never ended as denied (restart) and tells its session.
+ * Revocation: `revoke <code>` in the owner's DM, or the web route.
  */
 
 export type PermissionAccess = "read" | "write";
@@ -85,22 +87,20 @@ interface PendingRequest extends PermissionRequestView {
 }
 
 /**
- * An Allow once. Valid while a turn that was live on the requesting session
- * when the owner answered is still live, and during the first turn begun on
- * that session after the answer (normally the turn that delivers it: the
- * requesting turn has usually ended by then, and a grant it alone could use
- * would be gone before the agent could retry). Turn ids are global and never
- * reused, so a grant cannot outlive its turns. If no such turn begins within
- * the request timeout, the grant is dropped.
+ * An Allow once, bound to exactly ONE turn: the one that delivers the answer
+ * to the requesting session (its id is reported when that turn begins, see
+ * `notifySession`'s `onTurnBegin`). Not the turn that asked, not a turn running
+ * beside it, not the turn after it. It applies only while that turn is the
+ * only one live on the session (a tool call cannot be attributed to one of
+ * several concurrent turns, so concurrency fails closed), and is dropped when
+ * that turn ends. Turn ids are global and never reused. If the answer turn has
+ * not begun within the request timeout, the grant is dropped.
  */
 interface OnceGrant {
-  sessionKey: string;
   groupKey: string;
   path: string;
   access: PermissionAccess;
-  turns: Set<number>;
-  after: number;
-  next: number | null;
+  turn: number | null;
   bindBy: number;
 }
 
@@ -140,12 +140,10 @@ export interface PermissionBrokerDeps {
   /** Take a permanent grant back (file and live). False when it could not be written. */
   revokeAlways(groupKey: string, path: string): boolean;
   /** Tell the session how its request ended (a `<tomo-event type="permission">` turn). */
-  notifySession(sessionKey: string, groupKey: string, outcome: PermissionOutcome, body: string): void;
+  /** `onTurnBegin` is called with the id of the turn that carries the answer, when it begins. */
+  notifySession(sessionKey: string, groupKey: string, outcome: PermissionOutcome, body: string, onTurnBegin?: (turnId: number) => void): void;
   liveTurnIds(sessionKey: string): readonly number[];
   isTurnLive(id: number): boolean;
-  lastTurnId(): number;
-  /** The first turn begun on `sessionKey` after turn `after`. */
-  firstTurnAfter(sessionKey: string, after: number): number | undefined;
   groupTitle(groupKey: string): string | undefined;
   now?: () => number;
   timeoutMs?: number;
@@ -162,6 +160,18 @@ export class PermissionLedger {
     } catch (err) {
       log.warn({ err }, "Could not append to the permission ledger");
     }
+  }
+
+  /** Every record, oldest first; unreadable lines skipped. Empty when there is no ledger. */
+  read(): Record<string, unknown>[] {
+    let text: string;
+    try { text = readFileSync(this.path, "utf8"); } catch { return []; }
+    const out: Record<string, unknown>[] = [];
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      try { out.push(JSON.parse(line) as Record<string, unknown>); } catch { /* a torn line */ }
+    }
+    return out;
   }
 }
 
@@ -295,25 +305,26 @@ export class PermissionBroker {
       return { ok: false, status: 503, code: "permission_config_unwritable" };
     }
     this.close(request);
+    let grant: OnceGrant | undefined;
     if (decision === "once") {
-      const live = new Set<number>();
-      for (const turn of this.deps.liveTurnIds(request.sessionKey)) live.add(turn);
-      this.grants.push({ sessionKey: request.sessionKey, groupKey: request.groupKey, path: request.path, access: request.access, turns: live,
-        after: this.deps.lastTurnId(), next: null, bindBy: this.now() + this.timeoutMs });
+      grant = { groupKey: request.groupKey, path: request.path, access: request.access, turn: null, bindBy: this.now() + this.timeoutMs };
+      this.grants.push(grant);
     }
     const outcome = decision === "once" ? "allowed_once" : decision === "always" ? "allowed_always" : "denied";
     this.deps.ledger.append({ event: "decided", id, code: request.code, groupKey: request.groupKey, path: request.path,
       access: request.access, outcome, via });
-    this.deps.notifySession(request.sessionKey, request.groupKey, outcome, outcomeText(outcome, request));
+    // The Allow once binds to the turn that carries this answer, and to no other.
+    this.deps.notifySession(request.sessionKey, request.groupKey, outcome, outcomeText(outcome, request),
+      grant ? (turnId) => { if (grant.turn === null) grant.turn = turnId; } : undefined);
     log.info({ code: request.code, outcome, via }, "Permission request answered");
     return { ok: true, outcome };
   }
 
-  /** Take back a permanent grant, and any Allow once for the same path. */
-  revoke(groupKey: string, path: string): boolean {
+  /** Take back a permanent grant, and any Allow once for the same path. The owner's call only: the web route and the DM command. */
+  revoke(groupKey: string, path: string, via: DecisionChannel | "cli" = "web"): boolean {
     this.grants = this.grants.filter((g) => !(g.groupKey === groupKey && g.path === path));
     const ok = this.deps.revokeAlways(groupKey, path);
-    if (ok) this.deps.ledger.append({ event: "revoked", groupKey, path });
+    if (ok) this.deps.ledger.append({ event: "revoked", groupKey, path, via });
     return ok;
   }
 
@@ -341,20 +352,58 @@ export class PermissionBroker {
     return groups ? { ...config, groups } : config;
   }
 
+  /** Only while the answer turn is the ONE turn live on the session: concurrency fails closed. */
   private activeFor(grant: OnceGrant, live: readonly number[]): boolean {
-    if (live.some((id) => grant.turns.has(id))) return true;
-    return grant.next !== null && live.includes(grant.next);
+    return grant.turn !== null && live.length === 1 && live[0] === grant.turn;
   }
 
-  /** Binds each grant's answer turn once it has begun; drops grants none of whose turns can run again. */
+  /** Drops grants whose answer turn has ended, or never began in time. */
   private prune(): void {
     const now = this.now();
-    this.grants = this.grants.filter((g) => {
-      g.next ??= this.deps.firstTurnAfter(g.sessionKey, g.after) ?? null;
-      if ([...g.turns].some((id) => this.deps.isTurnLive(id))) return true;
-      if (g.next !== null) return this.deps.isTurnLive(g.next);
-      return now <= g.bindBy;
-    });
+    this.grants = this.grants.filter((g) => g.turn !== null ? this.deps.isTurnLive(g.turn) : now <= g.bindBy);
+  }
+
+  /**
+   * Revoke the Always allow a request granted, by its code (the DM command
+   * `revoke K7Q`). Looked up in the ledger, so it works after a restart. Null
+   * when that code never granted an Always allow.
+   */
+  revokeByCode(code: string, via: DecisionChannel | "cli"): { groupKey: string; path: string; ok: boolean } | null {
+    const granted = this.deps.ledger.read().filter((r) => r.event === "decided" && r.outcome === "allowed_always"
+      && typeof r.code === "string" && r.code.toUpperCase() === code.toUpperCase()).at(-1);
+    if (!granted || typeof granted.groupKey !== "string" || typeof granted.path !== "string") return null;
+    return { groupKey: granted.groupKey, path: granted.path, ok: this.revoke(granted.groupKey, granted.path, via) };
+  }
+
+  /**
+   * After a restart: every request the ledger shows as asked but never ended
+   * was lost with the process. Record it as denied (reason: restart), tell its
+   * session, and remember its code so a late reply is told it is closed. The
+   * card starts empty (pending lives in memory) and is republished empty.
+   */
+  reconcileAfterRestart(): number {
+    const records = this.deps.ledger.read();
+    const ended = new Set(records.filter((r) => r.event === "decided").map((r) => r.id));
+    let count = 0;
+    for (const r of records) {
+      if (r.event !== "requested" || typeof r.id !== "string" || ended.has(r.id)) continue;
+      if (typeof r.groupKey !== "string" || typeof r.sessionKey !== "string" || typeof r.path !== "string") continue;
+      if ([...this.pending.values()].some((p) => p.id === r.id)) continue;
+      ended.add(r.id);
+      const access: PermissionAccess = r.access === "write" ? "write" : "read";
+      const request: PendingRequest = { id: r.id, code: String(r.code ?? ""), group: r.groupKey, path: r.path, access,
+        reason: String(r.reason ?? ""), expiresAt: 0, groupKey: r.groupKey, sessionKey: r.sessionKey };
+      this.closed.push(request);
+      if (this.closed.length > MAX_CLOSED) this.closed.shift();
+      this.deps.ledger.append({ event: "decided", id: r.id, code: request.code, groupKey: r.groupKey, path: r.path,
+        access, outcome: "denied", reason: "restart" });
+      this.deps.notifySession(r.sessionKey, r.groupKey, "denied",
+        `The request for ${access} access to ${r.path} (${request.code}) was lost when Tomo restarted, so it is denied. Ask again if it is still needed.`);
+      count++;
+    }
+    this.publish();
+    if (count) log.info({ count }, "Permission requests left open by the last run recorded as denied (restart)");
+    return count;
   }
 
   /**
@@ -370,6 +419,17 @@ export class PermissionBroker {
     if (message.rawText === undefined || message.isReaction) return false;
     const text = message.rawText.trim();
     if (text.length > 12) return false;
+
+    const revoke = new RegExp(`^revoke\\s+(${CODE_RE})$`, "i").exec(text);
+    if (revoke) {
+      channel.forgetMessage?.(message.chatId, message.id);
+      const done = this.revokeByCode(revoke[1], channel.name as DecisionChannel);
+      await this.say(channel, message.chatId, done === null
+        ? `${revoke[1].toUpperCase()} did not grant an "always allow", so there is nothing to revoke.`
+        : done.ok ? `Revoked (${revoke[1].toUpperCase()}): ${this.deps.groupTitle(done.groupKey) || done.groupKey} can no longer reach ${done.path}.`
+          : `Could not revoke ${revoke[1].toUpperCase()}: the config file could not be written.`);
+      return true;
+    }
 
     let decision: PermissionDecision | undefined;
     let request: PendingRequest | undefined;
@@ -475,7 +535,7 @@ function outcomeText(outcome: PermissionOutcome, r: PendingRequest): string {
   const what = `${r.access} access to ${r.path}`;
   switch (outcome) {
     case "allowed_once":
-      return `The owner allowed ${what} once (request ${r.code}). It is in effect for the rest of this turn and ends with it: retry what needed it now, in this turn.`;
+      return `The owner allowed ${what} once (request ${r.code}). It is in effect during this turn only and ends with it: retry what needed it now, in this turn.`;
     case "allowed_always":
       return `The owner always allowed ${what} for this group (request ${r.code}). It is in effect from your next tool call; retry what needed it.`;
     case "denied":
@@ -486,7 +546,7 @@ function outcomeText(outcome: PermissionOutcome, r: PendingRequest): string {
 }
 
 function confirmationText(outcome: Exclude<PermissionOutcome, "timed_out">, r: PendingRequest): string {
-  if (outcome === "allowed_once") return `Allowed once (${r.code}): ${r.group} may ${ACCESS_WORDS[r.access]} ${r.path} for the rest of this turn.`;
+  if (outcome === "allowed_once") return `Allowed once (${r.code}): ${r.group} may ${ACCESS_WORDS[r.access]} ${r.path} for one turn.`;
   if (outcome === "allowed_always") return `Always allowed (${r.code}): ${r.group} may ${ACCESS_WORDS[r.access]} ${r.path}. Saved to its sandbox config.`;
   return `Denied (${r.code}).`;
 }

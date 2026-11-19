@@ -16,6 +16,7 @@ import { resolvePlugins } from "./plugins.js";
 import { SDK_SETTING_SOURCES } from "./setting-sources.js";
 import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
 import { CREDENTIAL_TOOL_NAMES, KEYCHAIN_SERVICE } from "../credentials/names.js";
+import { PERMISSION_TOOL_NAMES } from "../mcp/permission-tools.js";
 import { ensureRedactionReady, redactionReady, scrubDeep, withholdDeep } from "../credentials/redactor.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
@@ -85,6 +86,16 @@ export interface SessionContext {
    * does.
    */
   scopedCallerKey?: () => string;
+  /**
+   * The group sandbox config the private-memory guard applies on this
+   * session, read per tool call: config's `groupSandbox` plus any Allow-once
+   * grants live on this session (`PermissionBroker.withOnceGrants`).
+   * Undefined ⇒ config alone.
+   */
+  groupSandbox?: () => GroupSandboxConfig;
+  /** Told of each sandboxed Bash command and refused file-tool call (the
+   *  trigger a later `request_permission` card shows). */
+  noteSandboxedCall?: (text: string) => void;
   /**
    * Read-and-clear: did the model's last message land in a thinking block and
    * get dropped (see LiveSession.takeUndeliveredReply)? Consulted after every
@@ -231,6 +242,7 @@ export function sdkOptions(
       ...TODO_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`),
       // Registered only on the owner's DM session (internal-server.ts).
       `mcp__${TOMO_INTERNAL_MCP_NAME}__home_check`,
+      ...PERMISSION_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`),
       ...(config.credentialBroker?.enabled ? CREDENTIAL_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`) : []),
       ...externalMcpAllowedTools,
     ],
@@ -302,7 +314,8 @@ export function sdkOptions(
       // Read from config per call, not snapshotted: a config reload mid-session
       // takes effect on the next tool call rather than the next session.
       // The legacy `groupShellAllowlist` is folded in on read (unsandboxed).
-      groupSandbox: () => effectiveGroupSandbox(config.groupSandbox, config.groupShellAllowlist),
+      groupSandbox: sessionContext?.groupSandbox ?? (() => effectiveGroupSandbox(config.groupSandbox, config.groupShellAllowlist)),
+      noteCall: sessionContext?.noteSandboxedCall,
       // Which group is steering a summoned turn, so the group's entry is judged
       // against that group's key rather than the owner's dm: key.
       scopedCallerKey: sessionContext?.scopedCallerKey,
@@ -461,6 +474,8 @@ export function buildHooksOption(args: {
   /** The key the turn in flight is scoped to (see SessionContext). Lets a
    *  summoned turn inherit its steering group's allowlist entry. */
   scopedCallerKey?: () => string;
+  /** See SessionContext.noteSandboxedCall. */
+  noteCall?: (text: string) => void;
   /** Read-and-clear "the model's last message was dropped" flag. Undefined ⇒
    *  the nudge is not installed. */
   undeliveredReply?: () => boolean;
@@ -509,6 +524,7 @@ export function buildHooksOption(args: {
       args.pluginDirs,
       args.groupSandbox,
       args.scopedCallerKey,
+      args.noteCall,
     ));
   }
   return Object.keys(hooks).length > 0 ? { hooks } : {};

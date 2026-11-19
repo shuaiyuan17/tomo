@@ -147,11 +147,17 @@ export class TurnAudienceRegistry {
   /** The chats each live turn's messages came in on (inbound turns only). */
   private origins = new Map<number, TurnOrigin[]>();
   private nextId = 1;
+  /** The most recent turn ids begun per session (bounded), for {@link firstTurnAfter}. */
+  private begun = new Map<string, number[]>();
 
   /** Register a turn. Returns the id to pass to `end`. `origins`: the chat of
    *  each inbound message, for a turn the owner (or a group) is typing in. */
   begin(sessionKey: string, audiences: readonly string[] | undefined, origins?: readonly TurnOrigin[]): number {
     const id = this.nextId++;
+    const recent = this.begun.get(sessionKey) ?? [];
+    recent.push(id);
+    if (recent.length > 32) recent.shift();
+    this.begun.set(sessionKey, recent);
     if (origins?.length) this.origins.set(id, origins.map((o) => ({ ...o })));
     let turns = this.live.get(sessionKey);
     if (!turns) {
@@ -197,6 +203,29 @@ export class TurnAudienceRegistry {
     }
     const distinct = new Set(all.map((o) => `${o.channelName}\u0000${o.chatId}`));
     return distinct.size === 1 ? { ...all[0] } : undefined;
+  }
+
+  /** The ids of the turns registered live on this session right now. Ids are
+   *  unique across sessions and never reused, so a grant tied to them ends
+   *  when its turns do (`src/permissions/broker.ts`). */
+  liveTurnIds(sessionKey: string): number[] {
+    return [...(this.live.get(sessionKey)?.keys() ?? [])];
+  }
+
+  /** Is turn `id` still live, on any session? */
+  isLive(id: number): boolean {
+    for (const turns of this.live.values()) if (turns.has(id)) return true;
+    return false;
+  }
+
+  /** The first turn begun on this session after turn id `after`, if any is remembered. */
+  firstTurnAfter(sessionKey: string, after: number): number | undefined {
+    return this.begun.get(sessionKey)?.find((id) => id > after);
+  }
+
+  /** The id the most recently begun turn got (0 before the first). */
+  lastTurnId(): number {
+    return this.nextId - 1;
   }
 
   /** The audiences of every turn live on this session right now, or

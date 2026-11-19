@@ -23,7 +23,7 @@ import { FALLBACK_MIME, formatFileMarker, sanitizeAttachmentFilename, saveInboun
 import type { ImageAttachment } from "./types.js";
 import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request-journal.js";
 import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
-import type { WebCredentialRequest, WebCredentialResult, WebCredentialSubmit, WebHome, WebModelChangeResult, WebModelView } from "../web/protocol.js";
+import type { WebCredentialRequest, WebCredentialResult, WebCredentialSubmit, WebHome, WebModelChangeResult, WebModelView, WebPermissionDecision, WebPermissionRequest, WebPermissionResult } from "../web/protocol.js";
 import { modelLabel } from "../models.js";
 import { formatReactionMarker, formatReplyContextMarker } from "./text-utils.js";
 import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WEB_REACTIONS, WEB_REQUEST_QUOTE_LIMIT, WebError, type WebReaction, type WebReply, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type TaskAction, type WebStopResult, type WebTaskActionResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess, type WebFiledFile } from "../web/protocol.js";
@@ -53,6 +53,13 @@ export interface WebCredentialAccess {
   current(): WebCredentialRequest | null;
   /** The card's answer. Refusals carry the HTTP status and a fixed code, never the value. */
   submit(id: string, input: WebCredentialSubmit): Promise<{ ok: true; outcome: WebCredentialResult["status"] } | { ok: false; status: number; code: string }>;
+}
+
+/** The permission broker as the browser's card reaches it (src/permissions/broker.ts). */
+export interface WebPermissionAccess {
+  /** The open requests the cards show. */
+  current(): WebPermissionRequest[];
+  decide(id: string, decision: WebPermissionDecision): { ok: true; outcome: WebPermissionResult["status"] } | { ok: false; status: number; code: string };
 }
 
 /** The daemon side of Tomo's home (src/home/service.ts) as the browser reaches it. */
@@ -89,6 +96,12 @@ const keptReply = (reply: WebReply): WebReply => {
  * (only the server writes those, for real uploads): a leading "[" gets a
  * zero-width space in front, which the marker reader does not skip.
  */
+/** Exactly the card's fields, copied: nothing else a caller attached reaches the browser. */
+function permissionView(r: WebPermissionRequest): WebPermissionRequest {
+  return { id: r.id, code: r.code, group: r.group, path: r.path, access: r.access, reason: r.reason,
+    ...(r.command ? { command: r.command } : {}), expiresAt: r.expiresAt };
+}
+
 export function neutralizeMarker(text: string): string {
   return text.startsWith("[") ? `\u200b${text}` : text;
 }
@@ -137,6 +150,7 @@ export class WebChannel implements Channel {
   private readonly sessionKeys: (() => readonly string[]) | undefined;
   private readonly homeAccess: WebHomeAccess | undefined;
   private readonly credentials: WebCredentialAccess | undefined;
+  private readonly permissions: WebPermissionAccess | undefined;
   /** Live and recently ended subagents/background tasks, per visible session. */
   readonly tasks: TaskBoard;
 
@@ -186,10 +200,13 @@ export class WebChannel implements Channel {
       home?: WebHomeAccess;
       /** The credential broker's card; absent: the broker is off (409 on submit). */
       credentials?: WebCredentialAccess;
+      /** The permission broker's cards; absent: 409 on an answer. */
+      permissions?: WebPermissionAccess;
       /** Where Tomo's reactions on web messages are kept (JSON); absent: in memory only. */
       reactionsPath?: string } = {}) {
     this.homeAccess = options.home;
     this.credentials = options.credentials;
+    this.permissions = options.permissions;
     this.models = options.models;
     this.sessionKeys = options.sessionKeys;
     this.usageReader = options.usage;
@@ -438,7 +455,26 @@ export class WebChannel implements Channel {
       ...(this.rateLimit ? { rateLimit: { ...this.rateLimit } } : {}),
       ...(this.suggestions.size ? { suggestions: Object.fromEntries(this.suggestions) } : {}),
       ...(this.reactions.size ? { reactions: Object.fromEntries(this.reactions) } : {}),
-      ...(this.credentialRequest() ? { credentialRequest: this.credentialRequest() } : {}) };
+      ...(this.credentialRequest() ? { credentialRequest: this.credentialRequest() } : {}),
+      ...(this.permissionRequests().length ? { permissionRequests: this.permissionRequests() } : {}) };
+  }
+
+  /** The open permission requests the cards show. */
+  private permissionRequests(): WebPermissionRequest[] {
+    try { return (this.permissions?.current() ?? []).map(permissionView); } catch { return []; }
+  }
+
+  /** The broker opened or closed a permission request. REPLACE semantics, like the snapshot. */
+  publishPermissionRequests(requests: readonly WebPermissionRequest[]): void {
+    this.publishQuietly({ type: "permission-requests", requests: requests.map(permissionView) });
+  }
+
+  /** The permission card's answer, straight to the broker: no journal, no bubble, no transcript. */
+  decidePermission(id: string, decision: WebPermissionDecision): WebPermissionResult {
+    if (!this.permissions || this.tornDown) throw new WebError(409, "permission_unknown");
+    const result = this.permissions.decide(id, decision);
+    if (!result.ok) throw new WebError(result.status, result.code);
+    return { status: result.outcome };
   }
 
   /** The open credential request the card shows (name and purpose only). */

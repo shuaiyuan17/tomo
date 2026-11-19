@@ -1,4 +1,4 @@
-import type { EventEnvelope, MessageInput, WebBootstrap, WebCompactResult, WebCredentialResult, WebCredentialSubmit, WebEvent, WebRequest, TaskAction, WebSnapshot, WebStopResult, WebTaskActionResult } from "../../src/web/protocol.js";
+import type { EventEnvelope, MessageInput, WebBootstrap, WebCompactResult, WebCredentialResult, WebCredentialSubmit, WebEvent, WebPermissionDecision, WebPermissionResult, WebRequest, TaskAction, WebSnapshot, WebStopResult, WebTaskActionResult } from "../../src/web/protocol.js";
 
 export class ApiError extends Error {
   constructor(readonly status: number, readonly code: string) { super(code); }
@@ -54,6 +54,11 @@ export function dismissRequest(requestId: string, bootstrap: WebBootstrap, refre
 /** A picture of Tomo's home, answering a `home-look` (only ever then). Same CSRF/epoch rules as sending a message. */
 export function postHomeSnapshot(input: { requestId?: string; revision: string; png: string }, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<unknown> {
   return mutate<unknown>("/home/snapshot", "POST", input, bootstrap, refresh);
+}
+
+/** The permission card's answer: its own route, like the credential card's. Same CSRF/epoch rules. */
+export function decidePermission(id: string, decision: WebPermissionDecision, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebPermissionResult> {
+  return mutate<WebPermissionResult>(`/permissions/${encodeURIComponent(id)}`, "POST", { decision }, bootstrap, refresh);
 }
 
 /** The credential card's answer: its own route (never /messages, so no bubble and no journal). Same CSRF/epoch rules. */

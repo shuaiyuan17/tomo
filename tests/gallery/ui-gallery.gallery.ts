@@ -38,6 +38,7 @@ import { DEFAULT_TODOS } from "../../src/todos/limits.js";
 import { HomeService } from "../../src/home/service.js";
 import { OutgoingMediaStore, outgoingImagesDir } from "../../src/web/outgoing-media.js";
 import { uploadsDir } from "../../src/web/uploads.js";
+import type { WebPermissionRequest } from "../../src/web/protocol.js";
 
 const OUT = resolve(process.env.GALLERY_DIR || "test-results/gallery");
 const ONLY = (process.env.GALLERY_ONLY ?? "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -73,6 +74,18 @@ let browser: Browser | undefined;
 let url: string;
 let token: string;
 afterEach(async () => { await browser?.close(); home?.stop(); await agent?.stop(); browser = undefined; home = undefined; agent = undefined; });
+
+/** The permission cards the gallery shows (src/permissions/broker.ts); empty except during their steps. */
+let permissionRequests: WebPermissionRequest[] = [];
+const PERMISSION_READ: WebPermissionRequest = {
+  id: "7a1c2a9e-0000-4000-8000-000000000001", code: "K7Q", group: "Weekend climbing crew — Yosemite trip planning 2027 (carpool, gear, permits)",
+  path: "/Users/alex/Projects/trip-planner", access: "read", reason: "Read the itinerary script so I can add the carpool split to it",
+  command: "cd /Users/alex/Projects/trip-planner && python3 scripts/itinerary.py --days 3 --export ./out/itinerary.md", expiresAt: BASE + 4 * 60_000 + 12_000,
+};
+const PERMISSION_WRITE: WebPermissionRequest = {
+  id: "7a1c2a9e-0000-4000-8000-000000000002", code: "M4T", group: "Book club", path: "/Users/alex/Documents/Book club/2027 reading list.numbers",
+  access: "write", reason: "Add next month's pick (Piranesi) to the shared reading list", expiresAt: BASE + 2 * 60_000 + 40_000,
+};
 
 const LONG_MD = `## Plan for the migration
 
@@ -292,6 +305,7 @@ async function boot(options: { conversation: boolean }): Promise<void> {
     stop: (key) => theAgent.stopTurn(key),
     models: { view: (key) => theAgent.webModelView(key), switch: (key, model, from) => theAgent.switchModelFromWeb(key, model, from) },
     home: { view: () => theHome.web(), snapshot: (input) => theHome.deliverSnapshot(input) },
+    permissions: { current: () => permissionRequests, decide: () => ({ ok: false, status: 409, code: "permission_unknown" }) },
     outgoingMedia: new OutgoingMediaStore(outgoingImagesDir(mockConfig.workspaceDir), { isPrivate: (path) => path.includes("/memory/private/") }),
     uploads: { dir: uploadsDir(mockConfig.tomoHome), workspaceDir: mockConfig.workspaceDir },
   });
@@ -496,6 +510,26 @@ async function messageActionSteps(page: Page, vp: Viewport, theme: Theme): Promi
   });
 }
 
+/** The permission cards above the composer: one read request with its trigger folded, then two cards with it open. */
+async function permissionSteps(page: Page, vp: Viewport, theme: Theme): Promise<void> {
+  const s = (surface: string, state: string, act: (snap: Snap) => Promise<void>) => step(page, vp, theme, surface, state, act);
+  try {
+    await s("permission", "card", async (snap) => {
+      permissionRequests = [PERMISSION_READ];
+      await reset(page);
+      await page.getByTestId("permission-card").first().waitFor();
+      await snap();
+    });
+    await s("permission", "two-open", async (snap) => {
+      permissionRequests = [PERMISSION_WRITE, PERMISSION_READ];
+      await reset(page);
+      await page.getByRole("button", { name: "Triggering call" }).click();
+      await page.waitForTimeout(300);
+      await snap();
+    });
+  } finally { permissionRequests = []; }
+}
+
 /** Composer states. Run last: a sent message joins the transcript every later shot would show. */
 async function composerSteps(page: Page, vp: Viewport, theme: Theme): Promise<void> {
   const s = (surface: string, state: string, act: (snap: Snap) => Promise<void>) => step(page, vp, theme, surface, state, act);
@@ -665,6 +699,7 @@ for (const vp of Object.keys(VIEWPORTS) as Viewport[]) for (const theme of THEME
     const page = await open(vp, theme);
     await conversationSteps(page, vp, theme);
     await messageActionSteps(page, vp, theme);
+    await permissionSteps(page, vp, theme);
     await chromeSteps(page, vp, theme);
     await composerSteps(page, vp, theme);
     await page.close();

@@ -20,6 +20,7 @@ import type { UsageLedgerRow } from "../usage/ledger.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, TurnInterruptedError, type McpAuthRefreshOutcome, type QueryResult, type TurnRequest } from "./live-session.js";
 import { SteerDeclinedError } from "./sdk-result.js";
+import type { GroupSandboxConfig } from "./group-fs-policy.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
 
@@ -151,6 +152,11 @@ export interface LiveSessionManagerDeps {
    * `groupSandbox` entry; a live query for the same reason as above.
    */
   scopedCallerKey(key: string): string;
+  /** The group sandbox config the guard applies on `key`, per tool call
+   *  (config plus live Allow-once grants). Optional: absent ⇒ config alone. */
+  groupSandbox?(key: string): GroupSandboxConfig;
+  /** A sandboxed call on `key`, for a later permission card's trigger line. */
+  noteSandboxedCall?(key: string, text: string): void;
   handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult>;
   /** Delivery plumbing for SDK-initiated (unowned) turns. */
   createUnownedTurnRequest(key: string): TurnRequest | undefined;
@@ -620,6 +626,8 @@ export class LiveSessionManager {
       group: this.deps.buildGroupContext(key),
       isOwnAudienceTurn: () => this.deps.isOwnAudienceTurn(key),
       scopedCallerKey: () => this.deps.scopedCallerKey(key),
+      ...(this.deps.groupSandbox ? { groupSandbox: () => this.deps.groupSandbox!(key) } : {}),
+      ...(this.deps.noteSandboxedCall ? { noteSandboxedCall: (text: string) => this.deps.noteSandboxedCall!(key, text) } : {}),
       onMcpElicitation: (request) => this.deps.handleMcpElicitation(key, request),
       // Late-bound on purpose: the options are built before the session that
       // owns the flag exists. Until it does, nothing was dropped.

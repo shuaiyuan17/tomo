@@ -10,11 +10,13 @@ import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
 import { CompressedAssets, IMMUTABLE_CACHE, pickEncoding } from "./static-assets.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
-import { credentialSubmitSchema, cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
+import { credentialSubmitSchema, permissionDecisionSchema, cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, messageInputSchema, modelChangeSchema, WebError,
   type EventEnvelope, type Rpc, type TaskAction, type WebCompaction, type WebHome, type WebMcpLiveSession, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
 import { homeSceneSchema } from "../home/scene.js";
 import { decodeSnapshotPng } from "../home/snapshot.js";
 
+/** The permission card's answer: POST /api/v1/permissions/<request id>. */
+const PERMISSION_PATH = /^\/api\/v1\/permissions\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 /** The credential card's answer: POST /api/v1/credentials/<request id>. */
 const CREDENTIAL_PATH = /^\/api\/v1\/credentials\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
 /** The snapshot route's body: the schema's base64 bound plus the JSON envelope around it. */
@@ -297,6 +299,19 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         if (!parsed.success) throw new WebError(400, "invalid_credential");
         const id = CREDENTIAL_PATH.exec(url.pathname)![1];
         json(res, 200, await deps.rpc({ method: "credential-submit", epoch, id, input: parsed.data }));
+        return;
+      } else if (req.method === "POST" && PERMISSION_PATH.test(url.pathname)) {
+        // The permission card's answer: the credential route's gate (Origin,
+        // cookie, CSRF, epoch, owner), its own route so nothing is journaled.
+        csrf.verify(req, session!);
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || epoch !== await deps.rpc({ method: "epoch" })) throw new WebError(409, "epoch_changed");
+        const { ownerId } = deps.data.catalog();
+        if (!ownerId) throw new WebError(409, "owner_setup_required");
+        const parsed = permissionDecisionSchema.safeParse(await body(req));
+        if (!parsed.success) throw new WebError(400, "invalid_decision");
+        const id = PERMISSION_PATH.exec(url.pathname)![1];
+        json(res, 200, await deps.rpc({ method: "permission-decide", epoch, id, decision: parsed.data.decision }));
         return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/compact-request") {
         // Same gate as sending a message: CSRF, the owner, the daemon epoch.

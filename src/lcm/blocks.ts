@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { config } from "../config.js";
 import { readJsonlFileSync } from "../jsonl.js";
+import { textOfContent, type TranscriptEvent } from "../sessions/transcript-event.js";
 import { estimateTokens } from "./stats.js";
 import { stripLeadingTomoEvents } from "../tomo-event.js";
 
@@ -50,11 +51,8 @@ export interface ResolvedRange {
   description: string;
 }
 
-interface SdkEvent {
+interface SdkEvent extends TranscriptEvent {
   type: string;
-  uuid?: string;
-  timestamp?: string;
-  isCompactSummary?: boolean;
   blockTag?: string;
   [k: string]: any;
 }
@@ -102,15 +100,7 @@ function dailyFreshTail(): number {
 
 /** Concatenate text-block content from an event (SDK or simple shape). */
 function extractText(e: SdkEvent): string {
-  const c = e.message?.content;
-  if (typeof c === "string") return c;
-  if (Array.isArray(c)) {
-    return c
-      .filter((b) => b && typeof b === "object" && b.type === "text")
-      .map((b) => b.text ?? "")
-      .join("");
-  }
-  return "";
+  return textOfContent(e.message?.content, "");
 }
 
 /**

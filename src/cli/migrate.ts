@@ -2,6 +2,7 @@ import { Command } from "commander";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { MEMORY_DIR } from "../workspace/index.js";
+import { textOfContent } from "../sessions/transcript-event.js";
 
 interface OpenClawMessage {
   type: string;
@@ -41,10 +42,8 @@ migrateCommand
         const role = obj.message.role;
         if (role !== "user" && role !== "assistant") continue;
 
-        const text = obj.message.content
-          ?.filter((c) => c.type === "text" && c.text)
-          .map((c) => c.text!)
-          .join("\n");
+        // Empty text blocks are dropped first so they add no blank lines.
+        const text = textOfContent(obj.message.content?.filter((c) => c.text), "\n");
 
         if (!text) continue;
         textMessages.push({ role, text, timestamp: obj.timestamp });

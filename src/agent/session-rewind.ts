@@ -3,17 +3,13 @@ import { readFile } from "node:fs/promises";
 import { deleteSession, forkSession, getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { log } from "../logger.js";
+import { textOfContent, type TranscriptEvent } from "../sessions/transcript-event.js";
 
-interface Entry {
-  type?: string;
+interface Entry extends TranscriptEvent {
   subtype?: string;
-  uuid?: string;
-  parentUuid?: string | null;
   origin?: { kind?: string };
   isMeta?: boolean;
   isSynthetic?: boolean;
-  isCompactSummary?: boolean;
-  message?: { content?: unknown };
 }
 
 /**
@@ -40,10 +36,7 @@ export interface PreparedRewind {
 }
 
 function previewOf(entry: Entry): string {
-  const content = entry.message?.content;
-  const text = typeof content === "string" ? content : Array.isArray(content)
-    ? content.filter((block) => block?.type === "text" && typeof block.text === "string").map((block) => block.text).join(" ")
-    : "";
+  const text = textOfContent(entry.message?.content, " ");
   const flat = text.replace(/\s+/g, " ").trim();
   const chars = [...flat];
   return chars.length > 80 ? `${chars.slice(0, 80).join("").trimEnd()}…` : flat;

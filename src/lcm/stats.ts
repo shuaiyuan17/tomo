@@ -1,15 +1,10 @@
 import { existsSync } from "node:fs";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { readJsonlFileSync } from "../jsonl.js";
+import { isTextBlock, isThinkingBlock } from "../agent/content-blocks.js";
+import type { TranscriptEvent } from "../sessions/transcript-event.js";
 
-export interface SdkEvent {
-  type?: string;
-  uuid?: string;
-  timestamp?: string;
-  message?: {
-    content?: unknown;
-  };
-}
+export type SdkEvent = TranscriptEvent;
 
 export interface ResolvedTimeRange {
   fromIdx: number;
@@ -177,20 +172,20 @@ export function computeContextStatsFromEvents(sdkEvents: Iterable<SdkEvent>): Co
     if (type === "assistant") {
       if (!Array.isArray(content)) continue;
 
-      const hasToolUse = content.some((c: any) => c?.type === "tool_use");
-      const hasText = content.some((c: any) => c?.type === "text" && c.text?.trim());
-      const hasThinking = content.some((c: any) => c?.type === "thinking" && c.thinking?.trim());
+      const hasToolUse = content.some((c) => c?.type === "tool_use");
+      const hasText = content.some((c) => isTextBlock(c) && c.text.trim());
+      const hasThinking = content.some((c) => isThinkingBlock(c) && c.thinking.trim());
 
       // Estimate tokens from content
       let tokens = 0;
       const toolNames: string[] = [];
       for (const c of content) {
-        if (c?.type === "text") tokens += estimateTokens(c.text ?? "");
+        if (isTextBlock(c)) tokens += estimateTokens(c.text);
         else if (c?.type === "tool_use") {
           tokens += estimateTokens(JSON.stringify(c.input || {}));
           toolNames.push(c.name || "unknown");
         }
-        else if (c?.type === "thinking") tokens += estimateTokens(c.thinking ?? "");
+        else if (isThinkingBlock(c)) tokens += estimateTokens(c.thinking);
       }
 
       // ONE event per message, whatever it contains. Pushing one per tool_use
@@ -221,7 +216,7 @@ export function computeContextStatsFromEvents(sdkEvents: Iterable<SdkEvent>): Co
     } else if (type === "user") {
       // User messages: check if it's a tool_result or actual user input
       if (Array.isArray(content)) {
-        const hasToolResult = content.some((c: any) => c?.type === "tool_result");
+        const hasToolResult = content.some((c) => c?.type === "tool_result");
         if (hasToolResult) {
           let tokens = 0;
           for (const c of content) {
@@ -229,7 +224,7 @@ export function computeContextStatsFromEvents(sdkEvents: Iterable<SdkEvent>): Co
             if (typeof tc === "string") tokens += estimateTokens(tc);
             else if (Array.isArray(tc)) {
               for (const inner of tc) {
-                if (inner?.type === "text") tokens += estimateTokens(inner.text ?? "");
+                if (isTextBlock(inner)) tokens += estimateTokens(inner.text);
               }
             }
           }
@@ -242,7 +237,7 @@ export function computeContextStatsFromEvents(sdkEvents: Iterable<SdkEvent>): Co
         } else {
           let tokens = 0;
           for (const c of content) {
-            if (c?.type === "text") tokens += estimateTokens(c.text ?? "");
+            if (isTextBlock(c)) tokens += estimateTokens(c.text);
           }
           events.push({
             type: "user",

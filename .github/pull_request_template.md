@@ -47,6 +47,6 @@ pure refactor but not for a behavior change.
 
 - [ ] `npm run lint && npm run build && npm test` pass locally
 - [ ] Tests added or updated for behavior changes (required for bug fixes)
-- [ ] README updated for any new or changed config key, CLI flag, or chat command, or N/A
+- [ ] Docs (`docs/configuration.md`, `docs/commands.md`, README if user-facing headline) updated for any new or changed config key, CLI flag, or chat command, or N/A
 - [ ] `CLAUDE.md` updated if an architectural invariant changed, or N/A
 - [ ] Nothing in the diff or this description contains a token, key, phone number, or chat ID

@@ -335,6 +335,7 @@ async function startForeground(): Promise<void> {
       nextHeartbeatAt: () => continuity.nextFireAt(),
     }),
     sendChat: (text) => agent.handleWatchChat(text),
+    backgroundTaskCount: (sdkSessionId) => agent.activeBackgroundTaskCountForSdkSession(sdkSessionId),
   });
 
   // Metrics exporter + activity log: two more watch-bus subscribers, for

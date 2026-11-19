@@ -56,7 +56,7 @@ export function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: str
   const lines = [
     `An LCM rollup is due. The completed period \`${p.level} ${p.period}\` has ${p.childCount} ${childLabel} ready to consolidate.`,
     "",
-    "⚠️ Before you run this: a rollup reloads the session and will interrupt any subagent that is currently working — its transcript is saved and it can be resumed, but its in-progress turn is cut. If a subagent is running right now, DEFER this rollup until it finishes; the next heartbeat re-nudges, so nothing is lost by waiting.",
+    "⚠️ Before you run this: a rollup reloads the session and will interrupt any subagent that is currently working — its transcript is saved and it can be resumed, but its in-progress turn is cut. If a subagent is running right now, DEFER this rollup until it finishes; the next heartbeat re-nudges, so nothing is lost by waiting. (The command refuses with status \"deferred\" while background tasks are running; if it does, reply NO_REPLY.)",
     "",
     ...(p.replacesExistingBlock ? [
       `IMPORTANT: \`${p.level} ${p.period}\` already has a rollup block. The command below REPLACES that block; it does not append to it.`,
@@ -171,6 +171,14 @@ export class RollupRunner {
       // Skip sessions on SDK auto-compact (only groups with
       // config.lcm.groupCompactStyle="sdk"; DMs and groups by default use LCM).
       if (!usesLcmCompact(sessionKey)) continue;
+      // A rollup reloads the session, and the reload kills its background
+      // tasks — so `tomo lcm` and `lcm_rollup` refuse while any are running.
+      // Asking anyway would only spend a model turn on a refusal; skip the
+      // session without arming the cooldown, so the next tick asks again.
+      if (this.agent.activeBackgroundTaskCount(sessionKey) > 0) {
+        log.info({ sessionKey }, "Rollup nudge deferred (session has background tasks running)");
+        continue;
+      }
       // Held outside the try so the catch can give the cooldown back. It is
       // armed before the nudge turn is awaited (see below), so an exception
       // out of that await would otherwise leave a 6h debounce on work that

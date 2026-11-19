@@ -56,6 +56,7 @@ function bootRunner(
   const nudges: string[] = [];
   const agent = {
     listActiveSessions: () => [[SESSION, "sdk-session-1"]] as Array<[string, string]>,
+    activeBackgroundTaskCount: () => 0,
     // `false` is how handleCronMessage reports a turn that never happened —
     // no deliverable target, an error result, a throw inside the queue. It
     // does not reject.
@@ -166,6 +167,7 @@ describe("rollup nudge cooldown persistence", () => {
     const nudges: string[] = [];
     const agent = {
       listActiveSessions: () => [[SESSION, "sdk-session-1"]] as Array<[string, string]>,
+      activeBackgroundTaskCount: () => 0,
       handleCronMessage: async (text: string) => {
         nudges.push(text);
         await turnRunning; // a rollup turn queued behind a long-running one

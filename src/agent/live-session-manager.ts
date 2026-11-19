@@ -243,6 +243,32 @@ export class LiveSessionManager {
       || this.liveSessionCreates.has(key) || this.sessionHolds.has(key);
   }
 
+  /**
+   * Live, non-ambient background tasks (subagents, background shells) on the
+   * key's live session; 0 when there is none. A compact/rollup reload closes
+   * the session and kills these, so the rollup paths refuse while it is > 0.
+   */
+  activeBackgroundTaskCount(key: string): number {
+    const live = this.liveSessions.get(key);
+    return live?.isAlive() ? live.activeBackgroundTaskCount() : 0;
+  }
+
+  /**
+   * Same, addressed by SDK session id — what `tomo lcm` is given. Matches the
+   * live session's own id and the registry link, so a session whose id has not
+   * been persisted yet is still found.
+   */
+  activeBackgroundTaskCountForSdkSession(sdkSessionId: string): number {
+    let count = 0;
+    for (const [key, live] of this.liveSessions) {
+      if (!live.isAlive()) continue;
+      if (live.getSessionId() === sdkSessionId || this.deps.getSdkSessionId(key) === sdkSessionId) {
+        count += live.activeBackgroundTaskCount();
+      }
+    }
+    return count;
+  }
+
   /** Stop one task of the key's live session (never creates one). */
   async stopTask(key: string, taskId: string): Promise<boolean> {
     const live = this.liveSessions.get(key);
@@ -1014,6 +1040,14 @@ export class LiveSessionManager {
     // until the session is truly idle.
     const compactedThisTurn = sid ? checkAndClearCompactTrigger(sid, config.sdkSessionsDir) : false;
     if (compactedThisTurn) {
+      // The rollup paths refuse while background tasks run (lcm/background-
+      // gate.ts), so this only fires if one was launched after the rewrite in
+      // the same turn. The reload still has to happen now: the in-memory
+      // session holds the pre-compact chain, and any turn it runs would
+      // append events parented on uuids the compact removed.
+      if (session.hasActiveBackgroundTasks()) {
+        log.warn({ key }, "Compact reload closes a session with background tasks still running");
+      }
       if (session.isBusy()) {
         void session.waitForIdle().then(() => {
           if (this.liveSessions.get(key) === session) {

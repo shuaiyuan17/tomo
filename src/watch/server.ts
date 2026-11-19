@@ -19,6 +19,11 @@ export interface WatchServerDeps {
   getSnapshot(): WatchSnapshot | Promise<WatchSnapshot>;
   /** Route a chat message typed in the TUI into the owner's dm session. */
   sendChat(text: string): Promise<void>;
+  /**
+   * Live background tasks of the session behind an SDK session id (the
+   * rollup gate in `tomo lcm`). Absent: the query is answered as unsupported.
+   */
+  backgroundTaskCount?(sdkSessionId: string): number;
 }
 
 /**
@@ -151,6 +156,12 @@ export class WatchServer {
         log.warn({ err }, "Watch chat send failed");
         this.write(socket, { kind: "send-result", ok: false, error: msg });
       }
+      return;
+    }
+
+    if (frame.kind === "background-tasks" && typeof frame.sdkSessionId === "string" && this.deps.backgroundTaskCount) {
+      const count = this.deps.backgroundTaskCount(frame.sdkSessionId);
+      this.write(socket, { kind: "background-tasks", sdkSessionId: frame.sdkSessionId, count });
       return;
     }
 

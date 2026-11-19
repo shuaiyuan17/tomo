@@ -435,6 +435,11 @@ export class LiveSession {
     return this.backgroundTaskIds.size > 0;
   }
 
+  /** How many live, non-ambient background tasks the SDK last reported. */
+  activeBackgroundTaskCount(): number {
+    return this.backgroundTaskIds.size;
+  }
+
   /**
    * Resolves true once no background task is live (or the session dies),
    * false if `timeoutMs` elapses first.

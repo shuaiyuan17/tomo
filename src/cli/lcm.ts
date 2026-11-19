@@ -7,6 +7,8 @@ import { resolveBlockRange, summaryBudgetCheck, type BlockLevel } from "../lcm/b
 import { SessionStore, getSdkSessionPath } from "../sessions/store.js";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
+import { backgroundGateRefusal } from "../lcm/background-gate.js";
+import { queryBackgroundTasks } from "../watch/background-query.js";
 
 async function getRuntimeDirs(): Promise<{ sessionsDir: string; sdkSessionsDir: string }> {
   const { config } = await import("../config.js");
@@ -14,6 +16,34 @@ async function getRuntimeDirs(): Promise<{ sessionsDir: string; sdkSessionsDir: 
     sessionsDir: config.sessionsDir,
     sdkSessionsDir: config.sdkSessionsDir,
   };
+}
+
+/** Exit code for "deferred, retry later" (EX_TEMPFAIL): distinct from a failed rewrite. */
+export const LCM_DEFERRED_EXIT_CODE = 75;
+
+/**
+ * Refuse before touching the session file when its live session is running
+ * background tasks: the reload that follows every rewrite would kill them (see
+ * lcm/background-gate.ts for why the reload itself cannot simply wait). The
+ * count lives in the daemon, so ask it over the watch socket. No daemon means
+ * no live session to reload, and a daemon too old to answer keeps the old
+ * behaviour — both proceed.
+ */
+async function refuseWhileBackgroundTasks(sessionId: string, what: string): Promise<void> {
+  const { defaultRuntimePaths } = await import("../runtime-paths.js");
+  const answer = await queryBackgroundTasks(defaultRuntimePaths.watchSocketPath, sessionId);
+  if (answer.status === "timeout") {
+    console.error(JSON.stringify({
+      status: "warning",
+      warning: "The daemon did not answer the background-task check; proceeding.",
+    }));
+    return;
+  }
+  if (answer.status !== "ok") return;
+  const refusal = backgroundGateRefusal(answer.count, what);
+  if (!refusal) return;
+  console.error(JSON.stringify(refusal));
+  process.exit(LCM_DEFERRED_EXIT_CODE);
 }
 
 export const lcmCommand = new Command("lcm")
@@ -108,6 +138,8 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
         }));
         process.exit(1);
       }
+
+      await refuseWhileBackgroundTasks(opts.sessionId, `${level} rollup`);
 
       const transcriptPath = join(paths.sessionsDir, `_archive_${opts.sessionId}.jsonl`);
       const result = compactSession({
@@ -240,6 +272,8 @@ lcmCommand
     // and the pattern used by prune-tools. Previously an optional --channel-key
     // branch wrote to `<channelKey>.jsonl`, colliding with the live transcript
     // namespace (e.g. `dm:shuai.jsonl` next to `dm_shuai.jsonl`).
+    await refuseWhileBackgroundTasks(opts.sessionId, "compact");
+
     const transcriptPath = join(paths.sessionsDir, `_archive_${opts.sessionId}.jsonl`);
 
     const result = compactSession({
@@ -345,6 +379,8 @@ lcmCommand
   .option("--drop-unparseable", "Discard lines that cannot be parsed instead of preserving them verbatim. Destructive and not archived — only for corruption that is jamming a session.")
   .action(async (opts) => {
     const paths = await getRuntimeDirs();
+    // A dry run rewrites nothing and leaves no reload behind.
+    if (!opts.dryRun) await refuseWhileBackgroundTasks(opts.sessionId, "prune");
 
     const result = pruneTools({
       sdkSessionId: opts.sessionId,

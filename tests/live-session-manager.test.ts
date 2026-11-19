@@ -68,6 +68,7 @@ vi.mock("../src/agent/live-session.js", () => {
     background = false;
     bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }> = [];
     hasActiveBackgroundTasks() { return this.background; }
+    activeBackgroundTaskCount() { return this.background ? 2 : 0; }
     awaitingReport = false;
     turnWaits: Array<{ timeoutMs: number; resolve: (started: boolean) => void }> = [];
     isAwaitingTaskReport() { return this.awaitingReport; }
@@ -488,6 +489,30 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(manager.isAlive("telegram:1")).toBe(true);
     expect(manager.isBusy("telegram:1")).toBe(true);
     expect(manager.lastResult("telegram:1")).toEqual({ contextUsed: 10, contextMax: 100 });
+  });
+
+  it("counts a live session's background tasks by key and by SDK session id (the rollup gate)", async () => {
+    const manager = new LiveSessionManager(makeDeps({
+      getSdkSessionId: vi.fn((key: string) => (key === "telegram:2" ? "sdk-linked" : undefined)),
+    }));
+    expect(manager.activeBackgroundTaskCount("telegram:1")).toBe(0);
+    expect(manager.activeBackgroundTaskCountForSdkSession("sdk-1")).toBe(0);
+
+    await manager.getOrCreateLiveSession("telegram:1");
+    await manager.getOrCreateLiveSession("telegram:2");
+    const [one, two] = mockState.instances as unknown as Array<FakeSession & { background: boolean }>;
+    two.sessionId = null; // not captured yet: found through the registry link
+    one.background = true;
+    two.background = true;
+
+    expect(manager.activeBackgroundTaskCount("telegram:1")).toBe(2);
+    expect(manager.activeBackgroundTaskCountForSdkSession("sdk-1")).toBe(2);
+    expect(manager.activeBackgroundTaskCountForSdkSession("sdk-linked")).toBe(2);
+    expect(manager.activeBackgroundTaskCountForSdkSession("sdk-unknown")).toBe(0);
+
+    one.close();
+    expect(manager.activeBackgroundTaskCount("telegram:1")).toBe(0);
+    expect(manager.activeBackgroundTaskCountForSdkSession("sdk-1")).toBe(0);
   });
 
   it("hot-mounts an authenticated server with the complete existing MCP map", async () => {

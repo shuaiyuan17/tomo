@@ -2384,6 +2384,16 @@ export class Agent {
     return this.liveSessionManager.taskOutput(sessionKey, taskId);
   }
 
+  /** Live background tasks on the key's live session (rollup gate; 0 without one). */
+  activeBackgroundTaskCount(sessionKey: string): number {
+    return this.liveSessionManager.activeBackgroundTaskCount(sessionKey);
+  }
+
+  /** Same, by SDK session id — answers `tomo lcm` over the watch socket. */
+  activeBackgroundTaskCountForSdkSession(sdkSessionId: string): number {
+    return this.liveSessionManager.activeBackgroundTaskCountForSdkSession(sdkSessionId);
+  }
+
   /** Read-only: SDK-reported MCP connection state of live sessions (web Study). */
   readMcpStatuses() {
     return this.liveSessionManager.readMcpStatuses();

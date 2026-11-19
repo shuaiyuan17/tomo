@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { compactSession } from "../lcm/compact.js";
 import { resolveBlockRange, summaryBudgetCheck, type BlockLevel } from "../lcm/blocks.js";
 import { log } from "../logger.js";
+import { backgroundGateRefusal } from "../lcm/background-gate.js";
 
 export interface LcmToolDeps {
   /** The caller's SDK session id, resolved at call time (it changes on reset). */
@@ -11,6 +12,12 @@ export interface LcmToolDeps {
   sdkSessionsDir: string;
   sessionsDir: string;
   sessionKey: string;
+  /**
+   * Live background tasks on the caller's session, read at call time. The
+   * reload that follows a rollup would kill them, so the tool refuses while
+   * this is above zero (see lcm/background-gate.ts).
+   */
+  activeBackgroundTasks: () => number;
 }
 
 const PERIOD_HINT: Record<BlockLevel, string> = {
@@ -49,6 +56,7 @@ export function buildLcmTools(deps: LcmToolDeps) {
         "",
         "Pass the level and period named in the nudge, and the summary text you would have passed to `--summary`.",
         "One rollup per turn — running two back-to-back can orphan the chain.",
+        "Refuses (status \"deferred\", nothing changed) while this session has background tasks running: the reload would kill them. Retry once they finish.",
       ].join("\n"),
       {
         level: z.enum(["daily", "weekly", "monthly", "yearly"]).describe("Which block level to roll up."),
@@ -65,6 +73,22 @@ export function buildLcmTools(deps: LcmToolDeps) {
           isError: true,
         });
         if (!sdkSessionId) return fail("This session has no SDK session id yet; nothing to roll up.");
+
+        // Before the range is even resolved: nothing may be rewritten while a
+        // background task is running, because the reload would kill it.
+        const refusal = backgroundGateRefusal(deps.activeBackgroundTasks(), `${level} rollup`);
+        if (refusal) {
+          log.info(
+            { key: deps.sessionKey, level, period: args.period, activeBackgroundTasks: refusal.activeBackgroundTasks },
+            "lcm_rollup: deferred while background tasks run",
+          );
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ ...refusal, note: "Reply NO_REPLY to finish the housekeeping turn." }),
+            }],
+          };
+        }
 
         const resolved = resolveBlockRange(sdkSessionId, level, args.period, deps.sdkSessionsDir);
         if (!resolved) {

@@ -151,9 +151,18 @@ export interface WatchSnapshot {
 export type ServerFrame =
   | { kind: "snapshot"; snapshot: WatchSnapshot }
   | { kind: "event"; event: WatchEvent }
-  | { kind: "send-result"; ok: boolean; error?: string };
+  | { kind: "send-result"; ok: boolean; error?: string }
+  /** Answer to a `background-tasks` query: live background tasks of that SDK session. */
+  | { kind: "background-tasks"; sdkSessionId: string; count: number };
 
-export type ClientFrame = { kind: "send"; text: string };
+export type ClientFrame =
+  | { kind: "send"; text: string }
+  /**
+   * One-shot query from `tomo lcm`: how many background tasks is the live
+   * session behind this SDK session id running? A rollup reloads the session
+   * and would kill them, so the CLI refuses while the count is above zero.
+   */
+  | { kind: "background-tasks"; sdkSessionId: string };
 
 /** Truncation limits keep single frames small; feeds render a line or two. */
 export const TRANSCRIPT_TEXT_LIMIT = 1500;

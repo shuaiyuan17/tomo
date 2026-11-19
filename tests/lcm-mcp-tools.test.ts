@@ -72,12 +72,13 @@ describe("lcm_rollup tool", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  function tool(opts: { noSessionId?: boolean } = {}): ToolHandle {
+  function tool(opts: { noSessionId?: boolean; backgroundTasks?: number } = {}): ToolHandle {
     const tools = buildLcmTools({
       sdkSessionIdFor: () => (opts.noSessionId ? undefined : sessionId),
       sdkSessionsDir,
       sessionsDir,
       sessionKey: "telegram:-100",
+      activeBackgroundTasks: () => opts.backgroundTasks ?? 0,
     }) as unknown as ToolHandle[];
     const found = tools.find((t) => t.name === "lcm_rollup");
     if (!found) throw new Error("lcm_rollup not registered");
@@ -108,6 +109,39 @@ describe("lcm_rollup tool", () => {
     const res = await tool().handler({ level: "daily", period: "2026-01-01", summary: "nothing" }, {});
     expect(res.isError).toBe(true);
     expect(res.content[0]!.text).toContain("No events found for daily 2026-01-01");
+  });
+
+  it("defers while background tasks run: nothing rewritten, no reload trigger, a readable reason", async () => {
+    const path = getSdkSessionPath(sessionId, sdkSessionsDir);
+    const before = readFileSync(path, "utf8");
+    const res = await tool({ backgroundTasks: 2 }).handler({ level: "daily", period: "2026-09-08", summary: "9/8." }, {});
+    const body = JSON.parse(res.content[0]!.text);
+    expect(body.status).toBe("deferred");
+    expect(body.activeBackgroundTasks).toBe(2);
+    expect(body.error).toContain("2 background tasks are still running");
+    expect(body.error).toContain("retry after they finish");
+    // The session file is untouched and no reload is armed — the reload is
+    // what would kill the running tasks.
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(existsSync(getCompactTriggerPath(sessionId, sdkSessionsDir))).toBe(false);
+    expect(existsSync(join(sessionsDir, `_archive_${sessionId}.jsonl`))).toBe(false);
+  });
+
+  it("proceeds as before once the background tasks are gone", async () => {
+    let running = 1;
+    const tools = buildLcmTools({
+      sdkSessionIdFor: () => sessionId,
+      sdkSessionsDir,
+      sessionsDir,
+      sessionKey: "telegram:-100",
+      activeBackgroundTasks: () => running,
+    }) as unknown as ToolHandle[];
+    const t = tools.find((x) => x.name === "lcm_rollup")!;
+    const args = { level: "daily", period: "2026-09-08", summary: "9/8: two exchanges." };
+    expect(JSON.parse((await t.handler(args, {})).content[0]!.text).status).toBe("deferred");
+    running = 0; // read at call time, not at build time
+    expect(JSON.parse((await t.handler(args, {})).content[0]!.text).status).toBe("ok");
+    expect(existsSync(getCompactTriggerPath(sessionId, sdkSessionsDir))).toBe(true);
   });
 
   it("refuses when the session has no SDK session id yet", async () => {

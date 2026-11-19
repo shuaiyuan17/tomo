@@ -349,7 +349,7 @@ function ModelPage({ session, reload, mutator }: { session?: WebSession; reload:
       <p className="mt-3 mb-0 text-[13px] text-muted-foreground">{view.overridden
         ? `Chosen for this conversation. Without that choice it would use the default, ${view.defaultModel.label}.`
         : "The default from config.json."}</p>
-      <p className={cn(meta, "mt-2 mb-0")}>Effort: {effortText(view.effort)}</p>
+      <p className={cn(meta, "mt-2 mb-0")} title="What tomo asks for. The model may run lower if it does not support this level.">Requested effort: {effortText(view.effort)}</p>
       {view.busy && view.writable && <p className={cn(meta, "mt-2 mb-0")}>{agent} is replying right now. A switch can be made once the reply has finished.</p>}
       {!view.writable && <p className={cn(meta, "mt-2 mb-0")}>Groups are read-only here. To change a group's model, send /model in that group.</p>}
       {view.writable && !mutator.live && <p className={cn(meta, "mt-2 mb-0")}>Switching is available while connected.</p>}

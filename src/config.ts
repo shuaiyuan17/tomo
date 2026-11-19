@@ -20,6 +20,7 @@ import { log } from "./logger.js";
 import { parseWebConfig, type WebConfig } from "./web/config.js";
 import { normalizeImessageHandle } from "./sessions/keys.js";
 import { resolveOwner, type OwnerConfig, type OwnerNotice, type OwnerSource } from "./owner.js";
+import type { GroupSandboxConfig } from "./agent/group-fs-policy.js";
 
 const HOME = defaultRuntimePaths.homeDir;
 export const TOMO_HOME = defaultRuntimePaths.tomoHome;
@@ -289,11 +290,14 @@ export interface TomoConfig {
    *  (`.claude/agents/<name>.md`). An agent type with no entry here is
    *  UNCONSTRAINED — see {@link AgentProfile}. */
   agentProfiles: Record<string, AgentProfile>;
-  /** Group session keys whose Bash calls skip the `sandbox-exec` wrapper
-   *  entirely — they run unsandboxed, same as DM sessions. The
-   *  Read/Edit/Glob/Grep/MEDIA guards for `memory/private/` still apply;
-   *  only the Bash sandbox is bypassed. */
+  /** DEPRECATED — read as `groupSandbox.groups[key] = { unsandboxed: true }`
+   *  for every key not already in `groupSandbox` (see effectiveGroupSandbox).
+   *  Group session keys whose Bash calls skip the `sandbox-exec` wrapper. */
   groupShellAllowlist: string[];
+  /** Per-group path policy for group turns (`src/agent/group-fs-policy.ts`):
+   *  extra read / write directories, or `unsandboxed` for full trust. A group
+   *  with no entry gets the default: the workspace, minus the permanent denies. */
+  groupSandbox: GroupSandboxConfig;
   /** The credential broker (`src/credentials/`). Off by default: off means no
    *  tools and no inbound interception. See SECURITY.md. */
   credentialBroker: { enabled: boolean };
@@ -494,6 +498,23 @@ const DEFAULT_LCM: LcmConfig = {
   dailyFreshTail: 32,
   globalFreshTail: false,
 };
+
+/** An extra directory for a group: absolute or `~`-rooted, no `..` segment,
+ *  and neither `/` nor the home directory itself. */
+const extraPathSchema = z.string().refine((p) => {
+  if (!p.startsWith("/") && p !== "~" && !p.startsWith("~/")) return false;
+  if (p.split("/").includes("..")) return false;
+  const trimmed = p.replace(/\/+$/, "");
+  return trimmed !== "" && trimmed !== "~";
+}, "must be an absolute (or ~/) path without `..`, and not / or ~ itself");
+
+const groupSandboxSchema = z.object({
+  groups: z.record(z.string(), z.object({
+    extraRead: z.array(extraPathSchema).default([]),
+    extraWrite: z.array(extraPathSchema).default([]),
+    unsandboxed: z.boolean().default(false),
+  })).default({}),
+});
 
 const lcmSchema = z.object({
   nudgeAtPct: z.coerce.number().positive().max(100, "expected a percentage in (0, 100]").default(DEFAULT_LCM.nudgeAtPct),
@@ -1021,6 +1042,7 @@ function buildConfig(): TomoConfig {
     plugins: parsePlugins(file.plugins),
     agentProfiles: parseAgentProfiles(file.agentProfiles),
     groupShellAllowlist: validated("groupShellAllowlist", z.array(z.string()), file.groupShellAllowlist, []),
+    groupSandbox: validated("groupSandbox", groupSandboxSchema, file.groupSandbox, { groups: {} }),
     credentialBroker: validated("credentialBroker", z.object({ enabled: z.boolean().default(false) }), file.credentialBroker, { enabled: false }),
     lcm: validated("lcm", lcmSchema, file.lcm, DEFAULT_LCM),
     metrics: parseMetricsConfig(file.metrics),

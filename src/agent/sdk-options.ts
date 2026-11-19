@@ -6,6 +6,7 @@ import { isDmSessionKey, isGroupSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
 import { litellmRoutesModel } from "../litellm.js";
+import { effectiveGroupSandbox, type GroupSandboxConfig } from "./group-fs-policy.js";
 import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, skillsCanUseTool, todoStoreGuardHooks, type PrivateMemoryBar } from "./permissions.js";
 import { TODO_TOOL_NAMES } from "../mcp/todo-tools.js";
 import { todosDir } from "../todos/store.js";
@@ -79,7 +80,7 @@ export interface SessionContext {
    * session key for its own turns, the steering group's key on a summoned
    * turn, `MIXED_AUDIENCE_KEY` for a mixed batch. A getter for the same reason
    * as `isOwnAudienceTurn`. Read by the private-memory guard so a summoned turn
-   * inherits its group's `groupShellAllowlist` entry; undefined means it never
+   * inherits its group's `groupSandbox` entry; undefined means it never
    * does.
    */
   scopedCallerKey?: () => string;
@@ -292,8 +293,9 @@ export function sdkOptions(
       pluginDirs: () => plugins.map((entry) => entry.path),
       // Read from config per call, not snapshotted: a config reload mid-session
       // takes effect on the next tool call rather than the next session.
-      groupShellAllowlist: () => config.groupShellAllowlist,
-      // Which group is steering a summoned turn, so the allowlist is judged
+      // The legacy `groupShellAllowlist` is folded in on read (unsandboxed).
+      groupSandbox: () => effectiveGroupSandbox(config.groupSandbox, config.groupShellAllowlist),
+      // Which group is steering a summoned turn, so the group's entry is judged
       // against that group's key rather than the owner's dm: key.
       scopedCallerKey: sessionContext?.scopedCallerKey,
       credentialBroker: config.credentialBroker?.enabled === true,
@@ -445,9 +447,9 @@ export function buildHooksOption(args: {
    *  guard scans them for PreToolUse hooks that could overwrite its Bash
    *  rewrite. */
   pluginDirs?: () => readonly string[];
-  /** Group session keys whose Bash calls skip the sandbox-exec wrapper. Read
-   *  per call; a missing list means none. */
-  groupShellAllowlist?: () => readonly string[] | undefined;
+  /** Per-group path policy (extra dirs, or unsandboxed). Read per call; a
+   *  missing config means every group gets the default policy. */
+  groupSandbox?: () => GroupSandboxConfig | undefined;
   /** The key the turn in flight is scoped to (see SessionContext). Lets a
    *  summoned turn inherit its steering group's allowlist entry. */
   scopedCallerKey?: () => string;
@@ -491,7 +493,7 @@ export function buildHooksOption(args: {
       args.sessionKey,
       args.privateMemoryBar,
       args.pluginDirs,
-      args.groupShellAllowlist,
+      args.groupSandbox,
       args.scopedCallerKey,
     ));
   }

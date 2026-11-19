@@ -73,6 +73,8 @@ export const SHOWN_STRING_PATHS: ShownPath[] = [
   shown("channels.*.passiveGroups", CHAT_ID, LOWER_WORD),
   shown("agentProfiles.*.bash", BASH_MODE, ANY_INDEX_OR_WORD),
   shown("agentProfiles.*.writeRoots", FILE_PATH, ANY_INDEX_OR_WORD),
+  shown("groupSandbox.groups.*.extraRead", FILE_PATH, SESSION_KEY),
+  shown("groupSandbox.groups.*.extraWrite", FILE_PATH, SESSION_KEY),
   shown("agentProfiles.*.denyPaths", FILE_PATH, ANY_INDEX_OR_WORD),
   shown("agentProfiles.*.denyReadPaths", FILE_PATH, ANY_INDEX_OR_WORD),
   shown("plugins.*", (v) => FILE_PATH(v) || PACKAGE_NAME(v), (k) => /^\d{1,4}$/.test(k)),

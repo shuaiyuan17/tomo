@@ -10,6 +10,7 @@ export { barredSearch, isHarnessDataAccess, isHomeWrite, isPrivateMemoryAccess, 
 import { join } from "node:path";
 import { landsInPrivate } from "./private-memory-reach.js";
 import { expandTilde } from "./bash-write-targets.js";
+import { groupPathDenial, groupPathDenialReason, groupPathPolicy, type GroupPathPolicy, type GroupSandboxConfig, type GroupSandboxEntry } from "./group-fs-policy.js";
 
 // ---------------------------------------------------------------------------
 // Group-session guard for memory/private/
@@ -205,7 +206,7 @@ export function privateMemoryGuardHooks(
   sessionKey: string | undefined,
   bar: () => PrivateMemoryBar | null,
   pluginDirs: () => readonly string[] = () => [],
-  groupShellAllowlist: () => readonly string[] | undefined = () => [],
+  groupSandbox: () => GroupSandboxConfig | undefined = () => undefined,
   scopedCallerKey: () => string | undefined = () => undefined,
 ) {
   const ctx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, privateDir: PRIVATE_MEMORY_DIR };
@@ -249,10 +250,10 @@ export function privateMemoryGuardHooks(
           // MEDIA denials below still fire, but an unsandboxed shell can read
           // the same paths, so allowlisting a group hands its participants the
           // owner's private memory through Bash.
-          const allowlistedKey = shellAllowlistedKey(reason, sessionKey, groupShellAllowlist, scopedCallerKey);
-          if (allowlistedKey) {
+          const group = groupEntryFor(reason, sessionKey, groupSandbox, scopedCallerKey);
+          if (group?.entry.unsandboxed) {
             log.info(
-              { key: sessionKey, tool: input.tool_name, allowlistedKey, bar: reason },
+              { key: sessionKey, tool: input.tool_name, allowlistedKey: group.key, bar: reason },
               "Bash allowed unsandboxed for allowlisted group",
             );
             return {};
@@ -260,7 +261,7 @@ export function privateMemoryGuardHooks(
           const sandboxed = sandboxedBashInput(input.tool_input, {
             settingsFiles,
             pluginDirs: pluginDirs(),
-          }, dataCtx.dataDirs);
+          }, groupPolicy(group?.entry, dataCtx.dataDirs));
           if (sandboxed) {
             log.info(
               { key: sessionKey, tool: input.tool_name, bar: reason },
@@ -299,13 +300,30 @@ export function privateMemoryGuardHooks(
             };
           }
           // The second barred directory, write-only: Tomo's home.
-          if (!isHomeWrite(input.tool_name, input.tool_input, homeCtx)) return {};
-          log.warn({ key: sessionKey, tool: input.tool_name, bar: reason }, "Blocked a write to the home on a private-memory-barred turn");
+          if (isHomeWrite(input.tool_name, input.tool_input, homeCtx)) {
+            log.warn({ key: sessionKey, tool: input.tool_name, bar: reason }, "Blocked a write to the home on a private-memory-barred turn");
+            return {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse" as const,
+                permissionDecision: "deny" as const,
+                permissionDecisionReason: homeWriteDenialReason(reason),
+              },
+            };
+          }
+          // Everything else: the group path policy the Bash sandbox enforces,
+          // so the file tools cannot reach what the shell cannot (the config
+          // file, secrets/, the keychains, anything outside the workspace).
+          // An unsandboxed group keeps the guards above and nothing more.
+          const group = groupEntryFor(reason, sessionKey, groupSandbox, scopedCallerKey);
+          if (group?.entry.unsandboxed) return {};
+          const denial = groupPathDenial(input.tool_name, input.tool_input, config.workspaceDir, groupPolicy(group?.entry, dataCtx.dataDirs));
+          if (!denial) return {};
+          log.warn({ key: sessionKey, tool: input.tool_name, bar: reason }, "Blocked a file-tool call outside the group path policy");
           return {
             hookSpecificOutput: {
               hookEventName: "PreToolUse" as const,
               permissionDecision: "deny" as const,
-              permissionDecisionReason: homeWriteDenialReason(reason),
+              permissionDecisionReason: groupPathDenialReason(denial),
             },
           };
         }
@@ -328,8 +346,8 @@ export function privateMemoryGuardHooks(
 }
 
 /**
- * The allowlisted group key that exempts this barred turn's Bash from the
- * sandbox, or `undefined` when the turn stays sandboxed.
+ * The group whose sandbox entry governs this barred turn, or `undefined` when
+ * the turn gets the default policy (no extras, sandboxed).
  *
  * - `group-session`: the session IS the group, so its own key decides.
  * - `summoned-turn`: the session key is the owner's `dm:` key and says nothing
@@ -338,17 +356,17 @@ export function privateMemoryGuardHooks(
  *   over `scopedCallerKeyFor`), and counts only when it names exactly one
  *   group. {@link MIXED_AUDIENCE_KEY} (several groups, or a group plus the
  *   owner's DM), the session's own key (no group attributable at this instant)
- *   and no key at all fail closed.
+ *   and no key at all fail closed: the default policy.
  *
- * Both getters are read per call. A missing list is an empty list, never a
+ * Both getters are read per call. A missing config is no entry, never a
  * throw: a guard that throws on a barred turn is the wrong failure mode.
  */
-function shellAllowlistedKey(
+function groupEntryFor(
   reason: PrivateMemoryBar,
   sessionKey: string | undefined,
-  groupShellAllowlist: () => readonly string[] | undefined,
+  groupSandbox: () => GroupSandboxConfig | undefined,
   scopedCallerKey: () => string | undefined,
-): string | undefined {
+): { key: string; entry: GroupSandboxEntry } | undefined {
   if (!sessionKey) return undefined;
   let key = sessionKey;
   if (reason === "summoned-turn") {
@@ -356,7 +374,20 @@ function shellAllowlistedKey(
     if (!steering || steering === sessionKey || steering === MIXED_AUDIENCE_KEY) return undefined;
     key = steering;
   }
-  return (groupShellAllowlist() ?? []).includes(key) ? key : undefined;
+  const entry = groupSandbox()?.groups?.[key];
+  return entry ? { key, entry } : undefined;
+}
+
+/** The group path policy for this turn, from config and the group's entry. */
+export function groupPolicy(entry: Pick<GroupSandboxEntry, "extraRead" | "extraWrite"> | undefined, dataDirs: readonly string[] = harnessDataDirs()): GroupPathPolicy {
+  return groupPathPolicy({
+    workspaceDir: config.workspaceDir,
+    privateDir: PRIVATE_MEMORY_DIR,
+    homeSceneDir: HOME_SCENE_DIR,
+    tomoHome: config.tomoHome,
+    dataDirs,
+    entry,
+  });
 }
 
 /**
@@ -378,13 +409,13 @@ export function sandboxedBashInput(
   // refactor drop the scan and leave the suite green; a required one makes
   // that a type error.
   scan: { settingsFiles: readonly string[]; pluginDirs: readonly string[] },
-  /** Denied for reads and writes besides private memory (Tomo's data/). Required for the same reason. */
-  denyDirs: readonly string[],
+  /** The group path policy the profile enforces. Required for the same reason. */
+  policy: GroupPathPolicy,
 ): Record<string, unknown> | null {
   if (!toolInput || typeof toolInput !== "object") return null;
   const ti = toolInput as Record<string, unknown>;
   if (typeof ti.command !== "string") return null;
-  const command = sandboxedBashCommand(ti.command, undefined, scan, undefined, denyDirs);
+  const command = sandboxedBashCommand(ti.command, policy, scan);
   return command === null ? null : { ...ti, command };
 }
 
@@ -444,6 +475,10 @@ export function isPrivateAttachmentPath(p: string): boolean {
   // sticker sender expands it and opens the real file.
   const path = expandTilde(p);
   if (landsInPrivate(path, { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, privateDir: PRIVATE_MEMORY_DIR })) return true;
-  // Tomo's data/ is barred the same way (transcripts, the usage ledger).
-  return harnessDataDirs().some((dir) => landsInPrivate(path, { cwd: config.workspaceDir, memoryDir: dir, privateDir: dir }));
+  // Tomo's data/ is barred the same way (transcripts, the usage ledger), and
+  // so is every other permanent deny of the group path policy (secrets/, the
+  // config file and the rest of Tomo's home, the keychains, ~/.ssh): what no
+  // group turn may read, no group turn may ship as an attachment either.
+  const denies = [...harnessDataDirs(), ...groupPolicy(undefined).denyDirs];
+  return denies.some((dir) => landsInPrivate(path, { cwd: config.workspaceDir, memoryDir: dir, privateDir: dir }));
 }

@@ -41,7 +41,8 @@ src/
                             #   chat a live turn came in on (null for cron/heartbeat/mixed), for request_credential
     inbound-batcher.ts      # Coalesces messages that pile up behind an in-flight turn
     proactive-send.ts       # send_message service (direct + delegate modes)
-    bash-sandbox.ts         # sandbox-exec wrap for Bash on a private-memory-barred turn
+    bash-sandbox.ts         # sandbox-exec wrap for Bash on a private-memory-barred turn (default-deny profile)
+    group-fs-policy.ts      # the group-turn path policy shared by the Bash profile and the file-tool guard
     setting-sources.ts      # which settings files the query loads (and the hook guard scans)
     permissions.ts          # Re-exports the tool-permission guards: skills-guard, private-memory-guard
                             #   (+ private-memory-reach, permission-paths), agent-profile-guard (+ bash-write-targets)

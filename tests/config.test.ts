@@ -489,3 +489,53 @@ describe("agentProfiles", () => {
     expect(configIssues.join("\n")).toContain("reserved");
   });
 });
+
+describe("groupSandbox", () => {
+  let home = "";
+
+  async function loadWithConfigFile(content: unknown): Promise<typeof import("../src/config.js")> {
+    home = join(tmpdir(), `tomo-gsbx-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
+    mkdirSync(join(home, ".tomo"), { recursive: true });
+    writeFileSync(join(home, ".tomo", "config.json"), JSON.stringify(content));
+    vi.resetModules();
+    vi.stubEnv("HOME", home);
+    return import("../src/config.js");
+  }
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+    if (home) rmSync(home, { recursive: true, force: true });
+    home = "";
+  });
+
+  it("defaults to no groups", async () => {
+    const { config, configIssues } = await loadWithConfigFile({ model: "claude-sonnet-5" });
+    expect(config.groupSandbox).toEqual({ groups: {} });
+    expect(configIssues).toEqual([]);
+  });
+
+  it("parses per-group extras with defaults filled in", async () => {
+    const { config, configIssues } = await loadWithConfigFile({
+      groupSandbox: { groups: { "group:test-1": { extraRead: ["/path/to/project"] } } },
+    });
+    expect(configIssues).toEqual([]);
+    expect(config.groupSandbox.groups["group:test-1"]).toEqual({ extraRead: ["/path/to/project"], extraWrite: [], unsandboxed: false });
+  });
+
+  it("rejects a relative, traversing or whole-home extra and falls back to no groups", async () => {
+    for (const bad of ["relative/dir", "/a/../b", "~", "/"]) {
+      const { config, configIssues } = await loadWithConfigFile({ groupSandbox: { groups: { "group:test-1": { extraWrite: [bad] } } } });
+      expect(config.groupSandbox, bad).toEqual({ groups: {} });
+      expect(configIssues.join("\n"), bad).toContain("groupSandbox");
+    }
+  });
+
+  it("leaves a legacy groupShellAllowlist in place, read as unsandboxed by the guard", async () => {
+    const { config } = await loadWithConfigFile({ groupShellAllowlist: ["group:test-1"] });
+    expect(config.groupShellAllowlist).toEqual(["group:test-1"]);
+    const { effectiveGroupSandbox } = await import("../src/agent/group-fs-policy.js");
+    expect(effectiveGroupSandbox(config.groupSandbox, config.groupShellAllowlist).groups["group:test-1"])
+      .toEqual({ extraRead: [], extraWrite: [], unsandboxed: true });
+  });
+});

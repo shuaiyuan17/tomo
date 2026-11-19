@@ -1,4 +1,4 @@
-import { lazy, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { Fragment, lazy, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
 import { api, ApiError, dismissRequest, sendMessage, stopTurn, taskAction } from "./api.js";
 import { useWeb } from "./use-web.js";
@@ -17,14 +17,15 @@ import { CredentialCard } from "./credential-card.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useAppeared, useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
-import { ArrowUp, FileIcon, ImagePlus, Plus, Reply, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, House, ListChecks, MessageCircle, Monitor, Moon, PanelLeft, Sun, SunMoon } from "lucide-react";
+import { ArrowUp, FileIcon, ImagePlus, Plus, Reply, Sparkles, Square, RotateCw, X, BookOpen, ChevronsUpDown, House, ListChecks, MessageCircle, Monitor, Moon, PanelLeft, Pin, Sun, SunMoon } from "lucide-react";
 import { focusFromHash, STUDY_LABELS, viewFromHash, type StudyPage } from "./study-data.js";
 import { HomePage, useHomeRoute } from "./home/home-page.js";
 import { applyRestored, awaitingOwner, dismissAfterAcceptedSend, missingAttachments, resendAfterSend, historyBadge, pendingLabel, pendingUserMessages, readReceipt, recordedReplyIds, resendAfterDraftChange, type Resend } from "./pending.js";
 import { ReadReceiptMark } from "./read-receipt.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuLabel, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { pinOwnerFirst } from "./session-order";
 import { Progress } from "@/components/ui/progress";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
@@ -625,6 +626,10 @@ export function App() {
   const usage = session?.stats;
   const hasContext = !!usage?.contextMax;
   const sessions = web.bootstrap?.sessions ?? [];
+  const ownerId = web.bootstrap?.ownerId ?? null;
+  // The picker lists the main (owner) session first, set apart; the rest keep the catalog's order.
+  const pickerSessions = pinOwnerFirst(sessions, ownerId);
+  const mainTag = "ml-auto flex shrink-0 items-center gap-1 pl-3 tracking-[0.02em] text-[10px] whitespace-nowrap text-muted-foreground";
   const connectionLabel = web.connection === "live" ? "Connected" : web.connection === "locked" ? "Access link required" : web.connection === "connecting" ? "Connecting…" : "Reconnecting…";
   const notice = "rounded-xl border bg-muted/60 px-4 py-3 text-[13px] [&_code]:whitespace-nowrap";
   return <AgentNameContext.Provider value={agent}><div className="flex h-dvh flex-col">
@@ -677,13 +682,16 @@ export function App() {
         <p className="eyebrow mb-3">Your conversations</p>
         <div className="mb-1.5 flex items-center justify-between gap-2">
           <span id="session-label" className="text-[13px] font-medium">Session</span>
-          {session && <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{session.kind === "group" ? "Read-only" : "Owner DM"}</Badge>}
+          {session?.kind === "group" && <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Read-only</Badge>}
         </div>
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild disabled={!sessions.length}>
             <Button ref={sessionTrigger} variant="outline" aria-labelledby="session-label session-value"
               className="h-11 w-full min-w-0 justify-between rounded-xl bg-card px-3.5 text-[13px] font-normal shadow-xs hover:bg-accent">
-              <span id="session-value" className="truncate" title={session?.title}>{session ? `${session.title}${session.kind === "group" ? " · read-only" : ""}` : "No session available"}</span>
+              <span id="session-value" className="flex min-w-0 flex-1 items-center gap-2">
+                <span className="truncate" title={session?.title}>{session ? `${session.title}${session.kind === "group" ? " · read-only" : ""}` : "No session available"}</span>
+                {session && session.id === ownerId && <span data-testid="session-main" role="img" aria-label="Main session" title="Main session" className="ml-auto flex shrink-0 pl-1"><Pin aria-hidden="true" className="size-3.5 text-primary" strokeWidth={2} /></span>}
+              </span>
               <ChevronsUpDown className="text-muted-foreground" /></Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="start" className="w-auto max-w-[min(22rem,calc(100vw-2rem))] min-w-(--radix-dropdown-menu-trigger-width) rounded-xl p-1"
@@ -696,9 +704,14 @@ export function App() {
               pickedByPointer.current = false; pickedInDrawer.current = false; }}>
             <DropdownMenuLabel className="px-2 py-1.5 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">Conversations</DropdownMenuLabel>
             <DropdownMenuRadioGroup value={selectedId} onValueChange={(value) => { setSelected(value); setFeedback(""); if (drawer) { pickedInDrawer.current = true; closeMenu(!pickedByPointer.current); } }}>
-              {sessions.map((s) => <DropdownMenuRadioItem key={s.id} value={s.id} className="rounded-lg py-2 text-[13px]">
-                <span className="min-w-0 truncate" title={s.title}>{s.title}</span>{s.kind === "group" && <span className="ml-auto shrink-0 pl-3 tracking-[0.02em] text-[10px] whitespace-nowrap text-muted-foreground">read-only</span>}
-              </DropdownMenuRadioItem>)}
+              {pickerSessions.map((s, i) => <Fragment key={s.id}>
+                <DropdownMenuRadioItem value={s.id} className="rounded-lg py-2 text-[13px]">
+                  <span className="min-w-0 truncate" title={s.title}>{s.title}</span>
+                  {s.id === ownerId ? <span className={mainTag}><Pin aria-hidden="true" className="size-3 text-primary" strokeWidth={2} />main</span>
+                    : s.kind === "group" && <span className={mainTag}>read-only</span>}
+                </DropdownMenuRadioItem>
+                {s.id === ownerId && i < pickerSessions.length - 1 && <DropdownMenuSeparator />}
+              </Fragment>)}
             </DropdownMenuRadioGroup>
           </DropdownMenuContent>
         </DropdownMenu>

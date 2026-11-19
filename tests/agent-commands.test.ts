@@ -272,13 +272,12 @@ describe("chat commands", () => {
     expect(tg.sent[0].text).toContain("docs — failed · no OAuth · /mcp reconnect docs");
     expect(tg.sent[0].text).not.toContain("docs — connected");
     expect(tg.sent[0].text).toContain("tomo-internal — connected · session-provided");
-    // Reading the status gave the failed server its automatic reconnect (it failed too).
-    await vi.waitFor(() => expect(mockSdk.mcpReconnects).toEqual(["docs"]));
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Reading the status never reconnects anything by itself.
+    expect(mockSdk.mcpReconnects).toEqual([]);
 
     mockSdk.mcpReconnectFails = false;
     await tg.simulateCommand("mcp", "12345", "Shuai", "reconnect docs", "12345");
-    expect(mockSdk.mcpReconnects).toEqual(["docs", "docs"]);
+    expect(mockSdk.mcpReconnects).toEqual(["docs"]);
     expect(tg.sent.at(-1)!.text).toContain('Reconnected "docs"');
 
     await agent.stop();

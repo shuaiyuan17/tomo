@@ -9,7 +9,7 @@ import type {
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import type { McpConnection } from "../mcp/live-status.js";
-import { McpHealthMonitor, type McpStatusTrigger } from "./mcp-health.js";
+import { McpHealthMonitor, MCP_PRE_TURN_WAIT_MS } from "./mcp-health.js";
 import { checkAndClearCompactTrigger } from "../lcm/index.js";
 import { getCompactTriggerPath } from "../lcm/compact.js";
 import { existsSync } from "node:fs";
@@ -187,10 +187,8 @@ export interface LiveSessionManagerDeps {
   notifyOwner?(text: string): Promise<boolean>;
 }
 
-/** Upper bound on one SDK reconnectMcpServer call (under the web's MCP_RECONNECT_RPC_TIMEOUT_MS). */
-export const MCP_RECONNECT_TIMEOUT_MS = 20_000;
-/** At most one pre-turn MCP check per session in this window. */
-export const MCP_PRE_TURN_CHECK_INTERVAL_MS = 15_000;
+/** How long an explicit (web / chat) reconnect is waited for; under the web's MCP_RECONNECT_RPC_TIMEOUT_MS. */
+export const MCP_MANUAL_RECONNECT_WAIT_MS = 20_000;
 
 /**
  * Owns the LiveSession lifecycle: creation (with SDK-session resume and
@@ -254,15 +252,13 @@ export class LiveSessionManager {
   /** Release for each hold in `sessionHolds` — stop() releases them all. */
   private holdReleases = new Map<string, () => void>();
 
-  /** SDK-reported MCP health: lifecycle logs, automatic reconnect, owner notice. */
+  /** SDK-reported MCP health: lifecycle logs, pre-turn reconnect, owner notice. */
   private readonly mcpHealth: McpHealthMonitor;
-  /** When each key's last pre-turn MCP check ran. */
-  private lastPreTurnMcpCheck = new Map<string, number>();
+  /** Keys held by an explicit MCP reconnect: a turn waits (bounded) for it to finish. */
+  private mcpReservations = new Map<string, Promise<unknown>>();
 
   constructor(private readonly deps: LiveSessionManagerDeps) {
     this.mcpHealth = new McpHealthMonitor({
-      reconnect: (key, server) => this.reconnectOnLiveSession(key, server),
-      isIdle: (key) => this.isMcpIdle(key),
       notifyOwner: async (text) => (await this.deps.notifyOwner?.(text)) === true,
     });
   }
@@ -386,7 +382,7 @@ export class LiveSessionManager {
   /**
    * SDK-reported MCP connection state of up to 32 live sessions (web Study).
    * Never creates a session or probes a server. Each answer also feeds the
-   * health monitor (which may start a reconnect round; not awaited).
+   * health monitor, which only logs state changes (it never reconnects from a read).
    */
   async readMcpStatuses(): Promise<Array<{ key: string; connections: McpConnection[] | null }>> {
     const sessions = [...this.liveSessions].filter(([, session]) => session.isAlive()).slice(0, 32);
@@ -410,54 +406,57 @@ export class LiveSessionManager {
   }
 
   /**
-   * Hand a status answer to the health monitor only if `session` is still the
-   * key's live session: a stale answer must not act on its replacement.
+   * Hand a status answer to the health monitor (logging only) if `session`
+   * is still the key's live session: a stale answer must not speak for its
+   * replacement.
    */
-  private observeMcpStatus(key: string, session: LiveSession, connections: McpConnection[] | null, trigger: McpStatusTrigger): Promise<void> {
-    if (this.liveSessions.get(key) !== session || !session.isAlive()) return Promise.resolve();
-    return this.mcpHealth.observe(key, connections, trigger);
-  }
-
-  /** An explicit reconnect of one server on the key's live session (never creates one). */
-  async reconnectMcpServer(key: string, server: string): Promise<"reconnected" | "failed" | "no-live-session"> {
-    if (!this.liveSessions.get(key)?.isAlive()) return "no-live-session";
-    return await this.mcpHealth.reconnectNow(key, server) ? "reconnected" : "failed";
-  }
-
-  /** No turn running on the key's live session: a reconnect cannot cut a tool call. */
-  private isMcpIdle(key: string): boolean {
-    const session = this.liveSessions.get(key);
-    return !!session?.isAlive() && !session.isBusy();
-  }
-
-  private async reconnectOnLiveSession(key: string, server: string): Promise<void> {
-    const session = this.liveSessions.get(key);
-    if (!session?.isAlive()) throw new Error("no live session");
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        session.reconnectMcpServer(server),
-        new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("reconnect timed out")), MCP_RECONNECT_TIMEOUT_MS); }),
-      ]);
-    } finally { clearTimeout(timer); }
-    // Replaced or closed meanwhile: what reconnected is not the key's session any more.
-    if (this.liveSessions.get(key) !== session || !session.isAlive()) throw new Error("session replaced during reconnect");
+  private observeMcpStatus(key: string, session: LiveSession, connections: McpConnection[] | null, trigger: string): void {
+    if (this.liveSessions.get(key) !== session || !session.isAlive()) return;
+    this.mcpHealth.observe(key, connections, trigger);
   }
 
   /**
-   * Before a turn: read the session's MCP state and, for a failed server,
-   * WAIT for its reconnect round (bounded by the status read's 1s and the
-   * reconnect's MCP_RECONNECT_TIMEOUT_MS) so the turn does not start with
-   * tools that fail silently, nor while a reconnect is still running.
-   * Throttled per key. Never throws.
+   * An explicit reconnect of one server on the key's live session (never
+   * creates one). Only while no turn runs or is on its way: the session is
+   * then reserved, and a turn that arrives waits for the reconnect (bounded
+   * like the pre-turn one).
    */
-  private async preTurnMcpCheck(key: string, session: LiveSession): Promise<void> {
-    const now = Date.now();
-    const last = this.lastPreTurnMcpCheck.get(key);
-    if (last !== undefined && now - last < MCP_PRE_TURN_CHECK_INTERVAL_MS) return;
-    this.lastPreTurnMcpCheck.set(key, now);
+  async reconnectMcpServer(key: string, server: string): Promise<"reconnected" | "failed" | "busy" | "no-live-session"> {
+    const session = this.liveSessions.get(key);
+    if (!session?.isAlive()) return "no-live-session";
+    if (this.hasTurnInFlight(key) || this.mcpReservations.has(key)) return "busy";
+    const run = this.mcpHealth.reconnectNow(key, server, (name) => this.reconnectOn(key, session, name));
+    const reservation = run.finally(() => { if (this.mcpReservations.get(key) === reservation) this.mcpReservations.delete(key); });
+    this.mcpReservations.set(key, reservation);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ok = await Promise.race([run, new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), MCP_MANUAL_RECONNECT_WAIT_MS); })])
+      .finally(() => clearTimeout(timer));
+    return ok ? "reconnected" : "failed";
+  }
+
+  /** Reconnect `server` on exactly `session`, if it is still the key's live session. */
+  private async reconnectOn(key: string, session: LiveSession, server: string): Promise<void> {
+    if (this.liveSessions.get(key) !== session || !session.isAlive()) throw new Error("session replaced");
+    await session.reconnectMcpServer(server);
+  }
+
+  /**
+   * Before a turn, holding the session: wait out an explicit reconnect, then
+   * read the MCP state and let the monitor reconnect failed servers — all
+   * bounded (MCP_PRE_TURN_WAIT_MS) so a hung SDK call cannot hold the turn.
+   * Skipped on a session's first turn (its CLI may still be starting; the
+   * read would only time out). Never throws.
+   */
+  private async preTurnMcp(key: string, session: LiveSession): Promise<void> {
     try {
-      await this.observeMcpStatus(key, session, await session.readMcpStatus(), "pre-turn");
+      const reservation = this.mcpReservations.get(key);
+      if (reservation && !await withTimeout(reservation, MCP_PRE_TURN_WAIT_MS)) {
+        log.warn({ key }, "Explicit MCP reconnect still running; starting the turn anyway");
+      }
+      if (session.lastResult === null || this.liveSessions.get(key) !== session || !session.isAlive()) return;
+      const connections = await session.readMcpStatus();
+      if (this.liveSessions.get(key) !== session || !session.isAlive()) return;
+      await this.mcpHealth.beforeTurn(key, connections, (server) => this.reconnectOn(key, session, server));
     } catch (err) {
       log.warn({ key, err }, "Pre-turn MCP check failed; starting the turn anyway");
     }
@@ -745,7 +744,7 @@ export class LiveSessionManager {
       onMcpAuthError: (serverName) => this.deps.refreshExternalMcpToken(serverName),
       onMcpStatus: (connections) => {
         // Only the key's current session speaks for it.
-        if (session) void this.observeMcpStatus(key, session, connections, "init");
+        if (session) this.observeMcpStatus(key, session, connections, "init");
       },
       onToolResult: (toolName, content, isError) => {
         this.deps.handleToolResult?.(key, toolName, content, isError);
@@ -788,7 +787,6 @@ export class LiveSessionManager {
     // A dead predecessor's connections went with it.
     if (this.liveSessions.has(key)) this.mcpHealth.sessionClosed(key);
     this.liveSessions.set(key, session);
-    this.lastPreTurnMcpCheck.delete(key);
     this.externalMcpServersBySession.set(key, new Set(Object.keys(externalMcpServers)));
     this.mcpServerConfigsBySession.set(key, {
       ...externalMcpServers,
@@ -1021,10 +1019,8 @@ export class LiveSessionManager {
       if (this.stopping && !session.isAlive()) {
         return this.refuseForShutdown(req, "session built after stop() began");
       }
-      // A steer joins a turn already running; only a fresh turn is checked.
-      // A session's first turn is covered by its system/init report instead
-      // (its CLI may still be starting, and the read would only time out).
-      if (!steer && session.isAlive() && !session.isBusy() && session.lastResult !== null) await this.preTurnMcpCheck(key, session);
+      // A steer joins a turn already running; a fresh turn first settles MCP.
+      if (!steer && session.isAlive() && !session.isBusy()) await this.preTurnMcp(key, session);
       if (token.interrupted) throw new TurnInterruptedError();
       return await this.runTurnOnSession(key, session, steer, () => (steer
         ? session!.steer(prompt, images, documents, onBlock, onBlockAbandoned, origin, steerAudience, {
@@ -1208,10 +1204,6 @@ export class LiveSessionManager {
       }
     }
 
-    // A reconnect held back while this turn ran can go now (the next tick:
-    // the session settles its turn state after this returns).
-    setTimeout(() => { if (this.liveSessions.get(key) === session) this.mcpHealth.sessionIdle(key); }, 0).unref?.();
-
     // Save stats
     if (session.lastResult) {
       this.deps.updateStats(key, session.lastResult);
@@ -1281,7 +1273,6 @@ export class LiveSessionManager {
     // closed.
     this.stopping = true;
     this.compactReservations.dispose();
-    this.mcpHealth.stop();
 
     // NO HOLD OUTLIVES SHUTDOWN. The Agent awaits (bounded) and aborts any
     // rewind before calling this; a rewind still stalled past that budget must

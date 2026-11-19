@@ -69,7 +69,7 @@ export interface ChatCommandDeps {
   /** The key's SDK-reported MCP connections: undefined with no live session, null when it did not answer. */
   readLiveMcpStatus(sessionKey: string): Promise<McpLiveRead>;
   /** Reconnect one MCP server on the key's live session (never creates one). */
-  reconnectMcpServer(sessionKey: string, serverName: string): Promise<"reconnected" | "failed" | "no-live-session">;
+  reconnectMcpServer(sessionKey: string, serverName: string): Promise<"reconnected" | "failed" | "busy" | "no-live-session">;
   /** One session's tasks from the web Tasks panel's board (`TaskBoard.listFor`);
    *  undefined when there is no board (web UI off). */
   listTasks(sessionKey: string, since: number): SessionTaskList | undefined;
@@ -720,6 +720,7 @@ export class ChatCommandHandler {
       const outcome = await this.deps.reconnectMcpServer(sessionKey, reconnect[1]);
       await channel.send({ chatId, text: outcome === "reconnected" ? `🔌 Reconnected "${reconnect[1]}".`
         : outcome === "no-live-session" ? "⚠️ There is no live session to reconnect in; a new conversation connects every server afresh."
+        : outcome === "busy" ? "⚠️ A reply is in progress; try again once it has finished."
         : `⚠️ Reconnecting "${reconnect[1]}" failed. The log has the reason; /new starts a fresh session.` });
       return;
     }

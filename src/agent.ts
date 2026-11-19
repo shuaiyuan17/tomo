@@ -2544,7 +2544,7 @@ export class Agent {
   }
 
   /** An explicit reconnect of one MCP server on the owner's live session (web Study). */
-  reconnectOwnerMcpServer(serverName: string): Promise<"reconnected" | "failed" | "no-live-session"> {
+  reconnectOwnerMcpServer(serverName: string): Promise<"reconnected" | "failed" | "busy" | "no-live-session"> {
     const key = this.router.ownerSessionKey();
     if (!key) return Promise.resolve("no-live-session");
     return this.liveSessionManager.reconnectMcpServer(key, serverName);

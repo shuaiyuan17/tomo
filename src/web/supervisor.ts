@@ -25,7 +25,7 @@ export interface WebSupervisorOptions extends WebDataOptions {
   /** Tomo's own OAuth state of the configured external servers (no secrets). */
   mcpOAuth?: () => WebMcpLive["oauth"];
   /** Reconnect one MCP server on the owner conversation's live session. */
-  mcpReconnect?: (server: string) => Promise<WebMcpReconnectResult["outcome"]>;
+  mcpReconnect?: (server: string) => Promise<WebMcpReconnectResult["outcome"] | "busy">;
   diagnostic?: (message: string, level?: DiagnosticLevel) => void;
 }
 /** Internal timing/entry overrides allow real-process failure tests without
@@ -275,7 +275,10 @@ export class WebSupervisor implements WebLifecycle {
             if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
             if (!this.channel.ownerId) throw new WebError(409, "owner_setup_required");
             if (!this.options.mcpReconnect) throw new WebError(503, "service_unavailable");
-            const result: WebMcpReconnectResult = { outcome: await this.options.mcpReconnect(input.server) };
+            const outcome = await this.options.mcpReconnect(input.server);
+            // Never under a running turn: the owner retries after the reply.
+            if (outcome === "busy") throw new WebError(409, "session_busy");
+            const result: WebMcpReconnectResult = { outcome };
             return result;
           }
           if (input.method === "usage") return this.channel.usage(input.refresh);

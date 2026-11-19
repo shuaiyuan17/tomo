@@ -160,3 +160,25 @@ it("a start() during backoff cancels the pending restart instead of racing it", 
   expect(supervisor.status().pid).toBe(pid);
   expect(Number(readFileSync(join(root, "starts"), "utf8"))).toBe(2);
 }, 10_000);
+
+it("an MCP reconnect while the owner's turn runs is a 409, never a reconnect under the turn", async () => {
+  let outcome: "busy" | "reconnected" = "busy";
+  const asked: string[] = [];
+  supervisor = new WebSupervisor(channel, { ...options(), mcpReconnect: async (server) => { asked.push(server); return outcome; } });
+  channel.attach(supervisor); await channel.start();
+  const base = `http://127.0.0.1:${supervisor.status().port}`;
+  const response = await fetch(`${base}/api/v1/bootstrap?t=${readFileSync(join(root, "web-token"), "utf8").trim()}`, { headers });
+  const bootstrap = await response.json() as WebBootstrap;
+  const cookie = response.headers.get("set-cookie")!.split(";")[0];
+  const post = () => fetch(`${base}/api/v1/mcp/reconnect`, { method: "POST",
+    headers: { ...headers, cookie, origin: base, "content-type": "application/json", "x-tomo-csrf": bootstrap.csrfToken, "x-tomo-epoch": bootstrap.epoch },
+    body: JSON.stringify({ server: "docs" }) });
+  const busy = await post();
+  expect(busy.status).toBe(409);
+  expect(await busy.json()).toEqual({ error: "session_busy" });
+  outcome = "reconnected";
+  const ok = await post();
+  expect(ok.status).toBe(200);
+  expect(await ok.json()).toEqual({ outcome: "reconnected" });
+  expect(asked).toEqual(["docs", "docs"]);
+}, 12_000);

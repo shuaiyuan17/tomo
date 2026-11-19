@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
 vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
@@ -7,7 +7,7 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 
 import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockSdk, resetConfig } from "./helpers/agent-harness.js";
 import { log } from "../src/logger.js";
-import { McpHealthMonitor, MCP_AUTO_RECONNECT_BASE_BACKOFF_MS, MCP_DEFERRED_RECHECK_MS } from "../src/agent/mcp-health.js";
+import { McpHealthMonitor } from "../src/agent/mcp-health.js";
 import { mergeMcpStatus } from "../src/mcp/status-merge.js";
 import { sanitizeMcpConnections } from "../src/mcp/live-status.js";
 import type { ExternalMcpServerStatus } from "../src/mcp/oauth.js";
@@ -56,152 +56,125 @@ describe("mergeMcpStatus", () => {
 });
 
 describe("McpHealthMonitor", () => {
-  const T0 = 1_000_000_000_000;
-  let reconnect: ReturnType<typeof vi.fn>;
+  let now = 1_000_000;
   let notifyOwner: ReturnType<typeof vi.fn>;
-  let busy: Set<string>;
   let monitor: McpHealthMonitor;
+  const failing = vi.fn(async (_server: string) => { throw new Error("still down"); });
   beforeEach(() => {
-    vi.useFakeTimers();
-    vi.setSystemTime(T0);
-    busy = new Set();
-    reconnect = vi.fn(async () => { throw new Error("still down"); });
+    now = 1_000_000;
+    failing.mockClear();
     notifyOwner = vi.fn(async () => true);
-    monitor = new McpHealthMonitor({ reconnect, notifyOwner, isIdle: (key) => !busy.has(key), maxAttemptsPerHour: 3 });
+    monitor = new McpHealthMonitor({ notifyOwner, now: () => now, intervalMs: 10 * 60_000, failuresBeforeNotice: 3 });
   });
-  afterEach(() => { monitor.stop(); vi.useRealTimers(); });
   const failed = [{ name: "tomo-internal", status: "failed" as const }];
   const settle = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
 
-  it("retries on a timer with backoff even if nothing else happens, caps per hour, and tells the owner once", async () => {
-    await monitor.observe("dm:owner", failed, "init");
-    expect(reconnect).toHaveBeenCalledTimes(1);
-    // Status arriving inside the backoff does not add attempts.
-    for (let i = 0; i < 5; i++) await monitor.observe("dm:owner", failed, "pre-turn");
-    expect(reconnect).toHaveBeenCalledTimes(1);
-    // No further status at all: the timer retries.
-    await vi.advanceTimersByTimeAsync(MCP_AUTO_RECONNECT_BASE_BACKOFF_MS);
-    expect(reconnect).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(MCP_AUTO_RECONNECT_BASE_BACKOFF_MS); // doubled: not yet
-    expect(reconnect).toHaveBeenCalledTimes(2);
-    await vi.advanceTimersByTimeAsync(MCP_AUTO_RECONNECT_BASE_BACKOFF_MS);
-    expect(reconnect).toHaveBeenCalledTimes(3);
-    await settle();
-    expect(notifyOwner).toHaveBeenCalledTimes(1);
-    expect(notifyOwner.mock.calls[0][0]).toContain('MCP server "tomo-internal" is down');
-    // Capped for the rest of the hour, and no second notice.
-    await vi.advanceTimersByTimeAsync(50 * 60_000);
-    await monitor.observe("dm:owner", failed, "status-read");
-    expect(reconnect).toHaveBeenCalledTimes(3);
-    expect(notifyOwner).toHaveBeenCalledTimes(1);
-    // An hour after the first round it leaves the window: the budget returns.
-    await vi.advanceTimersByTimeAsync(T0 + HOUR - Date.now());
-    expect(reconnect).toHaveBeenCalledTimes(4);
-  });
-
-  it("the budget is per server across sessions, and closing a session does not reset it", async () => {
-    busy.add("dm:owner"); busy.add("telegram:-1");
-    await monitor.observe("dm:owner", failed, "init");
-    await monitor.observe("telegram:-1", failed, "init");
-    busy.clear();
-    await vi.advanceTimersByTimeAsync(MCP_DEFERRED_RECHECK_MS);
-    // One round reconnects it in both sessions, and counts once.
-    expect(reconnect.mock.calls).toEqual([["dm:owner", "tomo-internal"], ["telegram:-1", "tomo-internal"]]);
-    monitor.sessionClosed("telegram:-1");
-    await monitor.observe("telegram:-2", failed, "init");
-    expect(reconnect).toHaveBeenCalledTimes(2);
-    for (let i = 0; i < 6; i++) await vi.advanceTimersByTimeAsync(MCP_AUTO_RECONNECT_BASE_BACKOFF_MS * 4);
-    // 3 rounds in the hour, whatever the number of sessions.
-    expect(reconnect.mock.calls.filter(([key]) => key === "dm:owner")).toHaveLength(3);
-  });
-
-  it("never reconnects under a running turn: it waits for the session to be idle", async () => {
-    busy.add("dm:owner");
-    await monitor.observe("dm:owner", failed, "status-read");
-    await vi.advanceTimersByTimeAsync(20_000);
-    expect(reconnect).not.toHaveBeenCalled();
-    busy.delete("dm:owner");
-    reconnect.mockResolvedValue(undefined);
-    monitor.sessionIdle("dm:owner");
-    await settle();
-    expect(reconnect).toHaveBeenCalledTimes(1);
-    expect(monitor.stateOf("dm:owner", "tomo-internal")).toBe("connected");
-  });
-
-  it("counts the notice cooldown only once the notice was delivered", async () => {
-    notifyOwner.mockResolvedValueOnce(false);
-    monitor = new McpHealthMonitor({ reconnect, notifyOwner, isIdle: () => true, maxAttemptsPerHour: 1 });
-    await monitor.observe("dm:owner", failed, "init");
-    await settle();
-    expect(notifyOwner).toHaveBeenCalledTimes(1);
-    await monitor.observe("dm:owner", failed, "status-read");
-    await settle();
-    expect(notifyOwner).toHaveBeenCalledTimes(2);
-    await monitor.observe("dm:owner", failed, "status-read");
-    await settle();
-    expect(notifyOwner).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not apply a reconnect result to a session that replaced the one asked", async () => {
+  it("N sessions wanting the same server reconnected make one call, and at most one per interval", async () => {
     let release!: () => void;
-    reconnect.mockImplementation(() => new Promise<void>((resolve) => { release = resolve; }));
-    const pending = monitor.observe("dm:owner", failed, "init");
-    await settle();
-    monitor.sessionClosed("dm:owner");
-    void monitor.observe("dm:owner", failed, "init"); // the replacement, also failing; the round is still in flight
+    const slow = vi.fn(() => new Promise<void>((resolve) => { release = resolve; }));
+    const first = monitor.beforeTurn("dm:owner", failed, slow);
+    const others = [monitor.beforeTurn("telegram:-1", failed, slow), monitor.beforeTurn("telegram:-2", failed, slow)];
+    await Promise.all(others); // they skip it rather than run a second call alongside
+    expect(slow).toHaveBeenCalledTimes(1);
     release();
-    await pending;
-    expect(monitor.stateOf("dm:owner", "tomo-internal")).toBe("failed");
+    await first;
+    // Within the interval nobody reconnects it again; after it, one session does.
+    await monitor.beforeTurn("telegram:-1", failed, slow);
+    expect(slow).toHaveBeenCalledTimes(1);
+    now += 10 * 60_000;
+    const again = monitor.beforeTurn("telegram:-1", failed, slow);
+    release();
+    await again;
+    expect(slow).toHaveBeenCalledTimes(2);
   });
 
-  it("does not reconnect needs-auth, pending or disabled servers", async () => {
-    await monitor.observe("dm:owner", [{ name: "a", status: "needs-auth" }, { name: "b", status: "pending" }, { name: "c", status: "disabled" }, { name: "d", status: "connected" }], "init");
-    await vi.advanceTimersByTimeAsync(HOUR);
-    expect(reconnect).not.toHaveBeenCalled();
+  it("never reconnects needs-auth, pending or disabled servers", async () => {
+    await monitor.beforeTurn("dm:owner", [{ name: "a", status: "needs-auth" }, { name: "b", status: "pending" }, { name: "c", status: "disabled" }, { name: "d", status: "connected" }], failing);
+    expect(failing).not.toHaveBeenCalled();
   });
 
-  it("logs connect, disconnect and close", async () => {
-    reconnect.mockResolvedValue(undefined);
-    await monitor.observe("dm:owner", [{ name: "docs", status: "connected" }], "init");
+  it("a hung reconnect lets the turn start after the wait, and still counts as running", async () => {
+    vi.useFakeTimers();
+    try {
+      monitor = new McpHealthMonitor({ notifyOwner, now: () => now, intervalMs: 0, preTurnWaitMs: 20_000 });
+      const hung = vi.fn(() => new Promise<void>(() => {}));
+      const turn = monitor.beforeTurn("dm:owner", failed, hung);
+      await vi.advanceTimersByTimeAsync(20_000);
+      await turn;
+      expect(messages(log.warn)).toContain("MCP reconnect still running; starting the turn anyway");
+      await monitor.beforeTurn("dm:owner", failed, hung); // interval 0, but one is still in flight
+      expect(hung).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("tells the owner after K failures in a row, once, counted only when delivered", async () => {
+    monitor = new McpHealthMonitor({ notifyOwner, now: () => now, intervalMs: 0, failuresBeforeNotice: 3 });
+    notifyOwner.mockResolvedValueOnce(false);
+    for (let i = 0; i < 2; i++) await monitor.beforeTurn("dm:owner", failed, failing);
+    await settle();
+    expect(notifyOwner).not.toHaveBeenCalled();
+    await monitor.beforeTurn("dm:owner", failed, failing);
+    await settle();
+    expect(notifyOwner).toHaveBeenCalledTimes(1); // not delivered
+    await monitor.beforeTurn("telegram:-1", failed, failing); // any session counts
+    await settle();
+    expect(notifyOwner).toHaveBeenCalledTimes(2);
+    expect(notifyOwner.mock.calls[1][0]).toContain('MCP server "tomo-internal" is down');
+    await monitor.beforeTurn("dm:owner", failed, failing);
+    await settle();
+    expect(notifyOwner).toHaveBeenCalledTimes(2);
+    // A success ends the streak; a new streak can notify again.
+    await monitor.reconnectNow("dm:owner", "tomo-internal", async () => {});
+    for (let i = 0; i < 3; i++) await monitor.beforeTurn("dm:owner", failed, failing);
+    await settle();
+    expect(notifyOwner).toHaveBeenCalledTimes(3);
+  });
+
+  it("an explicit reconnect waits for a running one instead of overlapping it", async () => {
+    let release!: () => void;
+    const order: string[] = [];
+    const auto = monitor.beforeTurn("dm:owner", failed, () => new Promise<void>((resolve) => { release = () => { order.push("auto done"); resolve(); }; }));
+    const manual = monitor.reconnectNow("telegram:-1", "tomo-internal", async () => { order.push("manual start"); });
+    await settle();
+    expect(order).toEqual([]);
+    release();
+    await Promise.all([auto, manual]);
+    expect(order).toEqual(["auto done", "manual start"]);
+  });
+
+  it("logs only state changes", async () => {
+    monitor.observe("dm:owner", [{ name: "docs", status: "connected" }], "init");
     expect(messages(log.info)).toContain("MCP servers reported by live session");
-    busy.add("dm:owner");
-    await monitor.observe("dm:owner", [{ name: "docs", status: "failed" }], "status-read");
+    const before = (log.info as ReturnType<typeof vi.fn>).mock.calls.length;
+    monitor.observe("dm:owner", [{ name: "docs", status: "connected" }], "status-read");
+    expect((log.info as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before);
+    monitor.observe("dm:owner", [{ name: "docs", status: "failed" }], "status-read");
     expect(messages(log.warn)).toContain("MCP server disconnected");
-    await monitor.observe("dm:owner", [{ name: "docs", status: "connected" }], "status-read");
+    monitor.observe("dm:owner", [{ name: "docs", status: "connected" }], "status-read");
     expect(messages(log.info)).toContain("MCP server connected");
     monitor.sessionClosed("dm:owner");
     expect(messages(log.info)).toContain("MCP connections closed with live session");
-    expect(monitor.stateOf("dm:owner", "docs")).toBeUndefined();
-  });
-
-  it("an explicit reconnect is outside the automatic budget", async () => {
-    reconnect.mockResolvedValue(undefined);
-    expect(await monitor.reconnectNow("dm:owner", "docs")).toBe(true);
-    reconnect.mockRejectedValue(new Error("no"));
-    expect(await monitor.reconnectNow("dm:owner", "docs")).toBe(false);
-    expect(messages(log.warn)).toContain("MCP reconnect failed");
   });
 });
 
-const HOUR = 60 * 60_000;
+describe("MCP reconnect in a live session", () => {
+  const owner = () => resetConfig({ identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
 
-describe("automatic MCP recovery in a live session", () => {
-  it("reconnects a server system/init reports failed, and checks again before a later turn", async () => {
-    resetConfig({ identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+  it("reconnects before the turn, and the turn waits for it; status reads and init never reconnect", async () => {
+    owner();
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: "hello" }));
     await drainQueue(agent);
+
+    // The SDK reporting a failure on its own (init) or on a read starts nothing.
+    mockSdk.mcpStatus = [{ name: "tomo-internal", status: "connected" }, { name: "docs", status: "failed" }];
+    mockSdk.queryControllers[0].pushEvent({ type: "system", subtype: "init", mcp_servers: [{ name: "docs", status: "failed" }] });
+    await agent.readMcpStatuses();
+    await new Promise((resolve) => setTimeout(resolve, 20));
     expect(mockSdk.mcpReconnects).toEqual([]);
 
-    // The SDK's own report: the in-process server dropped.
-    mockSdk.queryControllers[0].pushEvent({ type: "system", subtype: "init", mcp_servers: [{ name: "tomo-internal", status: "failed" }] });
-    await vi.waitFor(() => expect(mockSdk.mcpReconnects).toEqual(["tomo-internal"]));
-
-    // Before the next turn: the status call says another server failed.
-    mockSdk.mcpStatus = [{ name: "tomo-internal", status: "connected" }, { name: "docs", status: "failed" }];
-    // The turn must not start until the reconnect has finished.
     const promptsWhenReconnected: string[][] = [];
     mockSdk.onMcpReconnect = async () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -209,10 +182,45 @@ describe("automatic MCP recovery in a live session", () => {
     };
     await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: "again" }));
     await drainQueue(agent);
-    expect(mockSdk.mcpReconnects).toEqual(["tomo-internal", "docs"]);
+    expect(mockSdk.mcpReconnects).toEqual(["docs"]);
+    // Serialized: the reconnect finished before the turn's prompt reached the SDK.
     expect(promptsWhenReconnected).toHaveLength(1);
     expect(promptsWhenReconnected[0].some((text) => text.includes("again"))).toBe(false);
     expect(mockSdk.promptsBySession.some((p) => p.text.includes("again"))).toBe(true);
+    await agent.stop();
+  });
+
+  it("an explicit reconnect is refused while a turn runs, and a turn waits for one that is running", async () => {
+    owner();
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: "hello" }));
+    await drainQueue(agent);
+
+    // A turn in flight: busy.
+    let finishTurn!: () => void;
+    mockSdk.responseFn = () => new Promise<string>((resolve) => { finishTurn = () => resolve("done"); });
+    await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: "long one" }));
+    await vi.waitFor(() => expect(mockSdk.promptsBySession.some((p) => p.text.includes("long one"))).toBe(true));
+    expect(await agent.reconnectOwnerMcpServer("docs")).toBe("busy");
+    expect(mockSdk.mcpReconnects).toEqual([]);
+    finishTurn();
+    await drainQueue(agent);
+    mockSdk.responseFn = () => "ok";
+
+    // Idle: it runs, and a turn arriving meanwhile waits for it.
+    let releaseReconnect!: () => void;
+    mockSdk.onMcpReconnect = () => new Promise<void>((resolve) => { releaseReconnect = resolve; });
+    const manual = agent.reconnectOwnerMcpServer("docs");
+    await vi.waitFor(() => expect(mockSdk.mcpReconnects).toEqual(["docs"]));
+    await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: "during" }));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(mockSdk.promptsBySession.some((p) => p.text.includes("during"))).toBe(false);
+    releaseReconnect();
+    expect(await manual).toBe("reconnected");
+    await drainQueue(agent);
+    expect(mockSdk.promptsBySession.some((p) => p.text.includes("during"))).toBe(true);
     await agent.stop();
   });
 });

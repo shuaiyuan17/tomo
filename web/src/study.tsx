@@ -155,7 +155,9 @@ function McpReconnect({ server, mutator, onDone }: { server: string; mutator: Mu
       const value = await mutate<WebMcpReconnectResult>("/mcp/reconnect", "POST", { server }, mutator.bootstrap, mutator.refresh);
       setNote(MCP_RECONNECT[value.outcome]); onDone();
     } catch (err) {
-      setNote(err instanceof ApiError && err.code === "epoch_changed" ? "Tomo restarted since this page loaded. Refresh and try again." : "Reconnect is unavailable right now.");
+      const code = err instanceof ApiError ? err.code : "";
+      setNote(code === "session_busy" ? "A reply is in progress. Try again once it has finished."
+        : code === "epoch_changed" ? "Tomo restarted since this page loaded. Refresh and try again." : "Reconnect is unavailable right now.");
     } finally { setBusy(false); }
   };
   return <span className="inline-flex items-center gap-2">

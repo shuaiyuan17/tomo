@@ -32,6 +32,7 @@ function runnerFor(sessionKey: string): { runner: InstanceType<typeof RollupRunn
   const nudges: Nudge[] = [];
   const agent = {
     listActiveSessions: () => [[sessionKey, "sdk-session-1"]] as Array<[string, string]>,
+    hasBackgroundWork: () => false,
     handleCronMessage: async (_text: string, key: string, options: Nudge["options"]) => {
       nudges.push({ sessionKey: key, options });
       return true;

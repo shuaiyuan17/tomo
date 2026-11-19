@@ -7,6 +7,8 @@ import { resolveBlockRange, summaryBudgetCheck, type BlockLevel } from "../lcm/b
 import { SessionStore, getSdkSessionPath } from "../sessions/store.js";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
+import { compactRefusal, daemonUnreachableRefusal } from "../lcm/background-gate.js";
+import { reserveCompact } from "../watch/background-query.js";
 
 async function getRuntimeDirs(): Promise<{ sessionsDir: string; sdkSessionsDir: string }> {
   const { config } = await import("../config.js");
@@ -15,6 +17,70 @@ async function getRuntimeDirs(): Promise<{ sessionsDir: string; sdkSessionsDir: 
     sdkSessionsDir: config.sdkSessionsDir,
   };
 }
+
+/** Exit code for "deferred, retry later" (EX_TEMPFAIL): distinct from a failed rewrite. */
+export const LCM_DEFERRED_EXIT_CODE = 75;
+
+/**
+ * Ask the daemon to approve a rewrite of this session before touching its
+ * file, and exit with LCM_DEFERRED_EXIT_CODE when it will not. The reload that
+ * follows every rewrite would kill the session's background tasks (see
+ * lcm/background-gate.ts for why the reload itself cannot simply wait), and
+ * the daemon both checks and marks the compact pending in one step, denying
+ * new background launches until the reload (agent/compact-reservations.ts).
+ *
+ * Fails CLOSED: a daemon that may be running but gives no answer (timeout,
+ * an older version, a socket error) is a refusal. Only a provably absent
+ * daemon — nothing listening, and no pid file or one naming a dead process —
+ * lets the rewrite through unasked, because then there is no live session to
+ * reload. An unreadable or malformed pid file counts as "may be running".
+ *
+ * Returns the function to call once the rewrite is over (success or not).
+ */
+async function approveRewrite(sessionId: string, what: string, daemonCheck: boolean): Promise<() => Promise<void>> {
+  const proceed = async () => {};
+  if (!daemonCheck) return proceed;
+  const { defaultRuntimePaths } = await import("../runtime-paths.js");
+  const { daemonMayBeRunning } = await import("./pidfile.js");
+  const answer = await reserveCompact(defaultRuntimePaths.watchSocketPath, sessionId, {
+    daemonAlive: () => daemonMayBeRunning(defaultRuntimePaths.pidFile),
+  });
+  switch (answer.status) {
+    case "approved":
+      return async () => {
+        if (!(await answer.finish())) {
+          console.error(JSON.stringify({
+            status: "warning",
+            warning: "The daemon did not acknowledge the end of the rewrite; background launches on this session stay blocked until its safety timeout or the reload.",
+          }));
+        }
+      };
+    case "no-daemon":
+      return proceed;
+    case "refused":
+      console.error(JSON.stringify(compactRefusal(answer.reservation, what)));
+      return process.exit(LCM_DEFERRED_EXIT_CODE);
+    case "unconfirmed":
+      console.error(JSON.stringify(daemonUnreachableRefusal(answer.detail, what)));
+      return process.exit(LCM_DEFERRED_EXIT_CODE);
+  }
+}
+
+/**
+ * Run a synchronous rewrite; if it throws, report the end of the approved
+ * rewrite before the error propagates, so the session is not left marked.
+ */
+async function runThenFinish<T>(finish: () => Promise<void>, rewrite: () => T): Promise<T> {
+  try {
+    return rewrite();
+  } catch (err) {
+    await finish();
+    throw err;
+  }
+}
+
+const NO_DAEMON_CHECK_HELP =
+  "Skip asking the daemon whether the session has background tasks. Only when you are sure no daemon is running.";
 
 export const lcmCommand = new Command("lcm")
   .description("Context management tools");
@@ -88,6 +154,7 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
     .requiredOption("--session-id <id>", "SDK session ID")
     .requiredOption("--summary <text>", "Summary text")
     .option(periodOpt.flag, periodOpt.desc)
+    .option("--no-daemon-check", NO_DAEMON_CHECK_HELP)
     .option("--drop-unparseable", "Discard lines that cannot be parsed instead of preserving them verbatim. Destructive and not archived — only for corruption that is jamming a session.")
     .action(async (opts) => {
       const paths = await getRuntimeDirs();
@@ -109,8 +176,10 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
         process.exit(1);
       }
 
+      const finish = await approveRewrite(opts.sessionId, `${level} rollup`, opts.daemonCheck !== false);
+
       const transcriptPath = join(paths.sessionsDir, `_archive_${opts.sessionId}.jsonl`);
-      const result = compactSession({
+      const result = await runThenFinish(finish, () => compactSession({
         sdkSessionId: opts.sessionId,
         sdkSessionsDir: paths.sdkSessionsDir,
         fromIdx: resolved.fromIdx,
@@ -121,7 +190,8 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
         transcriptPath,
         blockTag: resolved.blockTag,
         dropUnparseable: opts.dropUnparseable === true,
-      });
+      }));
+      await finish();
 
       if (result.success) {
         const budget = summaryBudgetCheck(level, opts.summary);
@@ -214,6 +284,7 @@ lcmCommand
   .requiredOption("--to-time <iso>", "End timestamp (ISO 8601, e.g. 2026-03-28T19:09)")
   .requiredOption("--summary <text>", "Summary text to replace the range")
   .option("--block-tag <tag>", 'Optional block tag (e.g. "monthly 2026-04") so the resulting summary joins the rollup hierarchy')
+  .option("--no-daemon-check", NO_DAEMON_CHECK_HELP)
   .option("--drop-unparseable", "Discard lines that cannot be parsed instead of preserving them verbatim. Destructive and not archived — only for corruption that is jamming a session.")
   .action(async (opts) => {
     const paths = await getRuntimeDirs();
@@ -240,9 +311,11 @@ lcmCommand
     // and the pattern used by prune-tools. Previously an optional --channel-key
     // branch wrote to `<channelKey>.jsonl`, colliding with the live transcript
     // namespace (e.g. `dm:shuai.jsonl` next to `dm_shuai.jsonl`).
+    const finish = await approveRewrite(opts.sessionId, "compact", opts.daemonCheck !== false);
+
     const transcriptPath = join(paths.sessionsDir, `_archive_${opts.sessionId}.jsonl`);
 
-    const result = compactSession({
+    const result = await runThenFinish(finish, () => compactSession({
       sdkSessionId: opts.sessionId,
       sdkSessionsDir: paths.sdkSessionsDir,
       fromIdx: resolved.fromIdx,
@@ -253,7 +326,8 @@ lcmCommand
       transcriptPath,
       ...(opts.blockTag ? { blockTag: opts.blockTag } : {}),
       dropUnparseable: opts.dropUnparseable === true,
-    });
+    }));
+    await finish();
 
     if (result.success) {
       console.log(JSON.stringify({
@@ -342,11 +416,14 @@ lcmCommand
   .option("--no-images", "Skip pruning base64 images")
   .option("--dry-run", "Preview what would be pruned without modifying")
   .option("--channel-key <key>", "Channel key for archiving originals")
+  .option("--no-daemon-check", NO_DAEMON_CHECK_HELP)
   .option("--drop-unparseable", "Discard lines that cannot be parsed instead of preserving them verbatim. Destructive and not archived — only for corruption that is jamming a session.")
   .action(async (opts) => {
     const paths = await getRuntimeDirs();
+    // A dry run rewrites nothing and leaves no reload behind.
+    const finish = opts.dryRun ? async () => {} : await approveRewrite(opts.sessionId, "prune", opts.daemonCheck !== false);
 
-    const result = pruneTools({
+    const result = await runThenFinish(finish, () => pruneTools({
       sdkSessionId: opts.sessionId,
       sdkSessionsDir: paths.sdkSessionsDir,
       minSize: opts.minSize,
@@ -357,7 +434,8 @@ lcmCommand
         ? join(paths.sessionsDir, `_archive_${opts.sessionId}.jsonl`)
         : undefined,
       dropUnparseable: opts.dropUnparseable === true,
-    });
+    }));
+    await finish();
 
     if (!result.success) {
       console.error(result.error);

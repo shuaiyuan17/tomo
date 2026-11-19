@@ -3,6 +3,7 @@ import { chmodSync, existsSync, unlinkSync } from "node:fs";
 import { log } from "../logger.js";
 import { watchBus, type WatchBus } from "./bus.js";
 import type { ClientFrame, ServerFrame, WatchSnapshot } from "./protocol.js";
+import type { CompactReservation } from "../lcm/background-gate.js";
 
 /**
  * Shape gate for a decoded client line. Only a plain object with a string
@@ -14,11 +15,29 @@ function isClientFrame(value: unknown): value is ClientFrame {
   return typeof (value as { kind?: unknown }).kind === "string";
 }
 
+/** Shape gate for a finish frame's reservation (it comes off the wire). */
+function isApproval(value: unknown): value is CompactReservation {
+  if (value === null || typeof value !== "object") return false;
+  const r = value as { ok?: unknown; key?: unknown; reservationId?: unknown };
+  return r.ok === true && (r.key === null || typeof r.key === "string")
+    && (r.reservationId === null || typeof r.reservationId === "string");
+}
+
 export interface WatchServerDeps {
   /** Built fresh per client connect — includes vitals and feed backfill. */
   getSnapshot(): WatchSnapshot | Promise<WatchSnapshot>;
   /** Route a chat message typed in the TUI into the owner's dm session. */
   sendChat(text: string): Promise<void>;
+  /**
+   * The rollup gate for `tomo lcm` (agent/compact-reservations.ts): approve a
+   * rewrite of the session behind an SDK session id and mark it pending, and
+   * finish that approval once the rewrite is over. Absent: `compact-reserve`
+   * is answered as unsupported, which the CLI treats as a refusal.
+   */
+  compactGate?: {
+    reserve(sdkSessionId: string): CompactReservation;
+    finish(reservation: CompactReservation): void;
+  };
 }
 
 /**
@@ -151,6 +170,21 @@ export class WatchServer {
         log.warn({ err }, "Watch chat send failed");
         this.write(socket, { kind: "send-result", ok: false, error: msg });
       }
+      return;
+    }
+
+    // The rollup gate. An approval is NOT tied to this connection: the CLI
+    // may still be rewriting after it drops, so only an explicit finish (or
+    // the reservation's own safety timeout) resolves it.
+    const gate = this.deps.compactGate;
+    if (frame.kind === "compact-reserve" && typeof frame.sdkSessionId === "string" && gate) {
+      const reservation = gate.reserve(frame.sdkSessionId);
+      this.write(socket, { kind: "compact-reserve", sdkSessionId: frame.sdkSessionId, reservation });
+      return;
+    }
+    if (frame.kind === "compact-finish" && isApproval(frame.reservation) && gate) {
+      gate.finish(frame.reservation);
+      this.write(socket, { kind: "send-result", ok: true });
       return;
     }
 

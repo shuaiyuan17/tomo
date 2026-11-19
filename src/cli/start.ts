@@ -335,6 +335,10 @@ async function startForeground(): Promise<void> {
       nextHeartbeatAt: () => continuity.nextFireAt(),
     }),
     sendChat: (text) => agent.handleWatchChat(text),
+    compactGate: {
+      reserve: (sdkSessionId) => agent.reserveCompactForSdkSession(sdkSessionId),
+      finish: (reservation) => agent.finishCompact(reservation),
+    },
   });
 
   // Metrics exporter + activity log: two more watch-bus subscribers, for

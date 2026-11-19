@@ -72,12 +72,23 @@ describe("lcm_rollup tool", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  function tool(opts: { noSessionId?: boolean } = {}): ToolHandle {
+  let reserveCalls: string[] = [];
+  let finished: unknown[] = [];
+  beforeEach(() => { reserveCalls = []; finished = []; });
+
+  function tool(opts: { noSessionId?: boolean; backgroundTasks?: number } = {}): ToolHandle {
     const tools = buildLcmTools({
       sdkSessionIdFor: () => (opts.noSessionId ? undefined : sessionId),
       sdkSessionsDir,
       sessionsDir,
       sessionKey: "telegram:-100",
+      reserveCompact: (sid) => {
+        reserveCalls.push(sid);
+        return (opts.backgroundTasks ?? 0) > 0
+          ? { ok: false, key: "telegram:-100", reason: "background-tasks", state: { activeBackgroundTasks: opts.backgroundTasks!, awaitingTaskReport: false } }
+          : { ok: true, key: "telegram:-100", reservationId: "r-1" };
+      },
+      finishCompact: (r) => { finished.push(r); },
     }) as unknown as ToolHandle[];
     const found = tools.find((t) => t.name === "lcm_rollup");
     if (!found) throw new Error("lcm_rollup not registered");
@@ -108,6 +119,38 @@ describe("lcm_rollup tool", () => {
     const res = await tool().handler({ level: "daily", period: "2026-01-01", summary: "nothing" }, {});
     expect(res.isError).toBe(true);
     expect(res.content[0]!.text).toContain("No events found for daily 2026-01-01");
+  });
+
+  it("defers while background tasks run: nothing rewritten, no reload trigger, a readable reason", async () => {
+    const path = getSdkSessionPath(sessionId, sdkSessionsDir);
+    const before = readFileSync(path, "utf8");
+    const res = await tool({ backgroundTasks: 2 }).handler({ level: "daily", period: "2026-09-08", summary: "9/8." }, {});
+    const body = JSON.parse(res.content[0]!.text);
+    expect(body.status).toBe("deferred");
+    expect(body.activeBackgroundTasks).toBe(2);
+    expect(body.error).toContain("2 background tasks are still running");
+    expect(body.error).toContain("retry after they finish");
+    // The session file is untouched and no reload is armed — the reload is
+    // what would kill the running tasks.
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(existsSync(getCompactTriggerPath(sessionId, sdkSessionsDir))).toBe(false);
+    expect(existsSync(join(sessionsDir, `_archive_${sessionId}.jsonl`))).toBe(false);
+    // A refusal holds nothing to finish.
+    expect(finished).toHaveLength(0);
+  });
+
+  it("approves through the daemon gate and finishes the approval after the rewrite", async () => {
+    const res = await tool().handler({ level: "daily", period: "2026-09-08", summary: "9/8: two exchanges." }, {});
+    expect(JSON.parse(res.content[0]!.text).status).toBe("ok");
+    expect(reserveCalls).toEqual([sessionId]);
+    expect(finished).toEqual([{ ok: true, key: "telegram:-100", reservationId: "r-1" }]);
+  });
+
+  it("finishes the approval when the rewrite does not happen, so the session is not left locked", async () => {
+    const res = await tool().handler({ level: "daily", period: "2026-01-01", summary: "nothing" }, {});
+    expect(res.isError).toBe(true);
+    expect(finished).toHaveLength(1);
+    expect(existsSync(getCompactTriggerPath(sessionId, sdkSessionsDir))).toBe(false);
   });
 
   it("refuses when the session has no SDK session id yet", async () => {

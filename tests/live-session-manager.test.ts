@@ -42,6 +42,7 @@ const { mockState } = vi.hoisted(() => ({
       errors: Record<string, string>;
     } | null>),
     compactTriggered: false,
+    sessionContexts: [] as Array<{ sessionKey: string; backgroundLaunchDenial?: () => string | null }>,
     onInterrupt: null as null | ((err: Error, session: FakeSession) => void),
   },
 }));
@@ -68,6 +69,10 @@ vi.mock("../src/agent/live-session.js", () => {
     background = false;
     bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }> = [];
     hasActiveBackgroundTasks() { return this.background; }
+    activeBackgroundTaskCount() { return this.background ? 2 : 0; }
+    isAwaitingTaskReportWithin() { return this.awaitingReport; }
+    backgroundMoves: Array<(moved: boolean) => void> = [];
+    backgroundTask() { return new Promise<boolean>((resolve) => this.backgroundMoves.push(resolve)); }
     awaitingReport = false;
     turnWaits: Array<{ timeoutMs: number; resolve: (started: boolean) => void }> = [];
     isAwaitingTaskReport() { return this.awaitingReport; }
@@ -128,7 +133,10 @@ vi.mock("../src/agent/live-session.js", () => {
 
 vi.mock("../src/agent/sdk-options.js", () => ({
   makeTurnBudget: () => ({}),
-  sdkOptions: () => ({ model: "test-model" }),
+  sdkOptions: (_server: unknown, _resume: unknown, _model: unknown, ctx: { sessionKey: string }) => {
+    mockState.sessionContexts.push(ctx);
+    return { model: "test-model" };
+  },
 }));
 
 vi.mock("../src/config.js", () => ({
@@ -188,6 +196,7 @@ beforeEach(() => {
   mockState.mcpSetCalls = [];
   mockState.mcpSetImpl = null;
   mockState.compactTriggered = false;
+  mockState.sessionContexts = [];
   mockState.onInterrupt = null;
 });
 
@@ -488,6 +497,114 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(manager.isAlive("telegram:1")).toBe(true);
     expect(manager.isBusy("telegram:1")).toBe(true);
     expect(manager.lastResult("telegram:1")).toEqual({ contextUsed: 10, contextMax: 100 });
+  });
+
+  it("reports background work by key, counting the report window like retireWhenIdle", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    expect(manager.backgroundState("telegram:1")).toEqual({ activeBackgroundTasks: 0, awaitingTaskReport: false, backgroundingInFlight: 0 });
+    await manager.getOrCreateLiveSession("telegram:1");
+    const s = mockState.instances[0] as unknown as { background: boolean; awaitingReport: boolean };
+    s.background = true;
+    expect(manager.backgroundState("telegram:1")).toEqual({ activeBackgroundTasks: 2, awaitingTaskReport: false, backgroundingInFlight: 0 });
+    s.background = false;
+    s.awaitingReport = true;
+    expect(manager.backgroundState("telegram:1")).toEqual({ activeBackgroundTasks: 0, awaitingTaskReport: true, backgroundingInFlight: 0 });
+  });
+
+  it("finds the key behind an SDK session id: the live id first, then the registry link", async () => {
+    const manager = new LiveSessionManager(makeDeps({
+      getSdkSessionId: vi.fn((key: string) => (key === "telegram:2" ? "sdk-linked" : undefined)),
+    }));
+    await manager.getOrCreateLiveSession("telegram:1");
+    await manager.getOrCreateLiveSession("telegram:2");
+    mockState.instances[1].sessionId = null; // not captured yet
+    expect(manager.keyForSdkSession("sdk-1")).toBe("telegram:1");
+    expect(manager.keyForSdkSession("sdk-linked")).toBe("telegram:2");
+    expect(manager.keyForSdkSession("sdk-unknown")).toBeUndefined();
+  });
+
+  it("refuses a compact while background work runs or its report is due", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.getOrCreateLiveSession("telegram:1");
+    const s = mockState.instances[0] as unknown as { background: boolean; awaitingReport: boolean };
+    s.background = true;
+    expect(manager.reserveCompact("telegram:1", "sdk-1")).toMatchObject({ ok: false, reason: "background-tasks" });
+    s.background = false;
+    s.awaitingReport = true;
+    expect(manager.reserveCompact("telegram:1", "sdk-1")).toMatchObject({ ok: false, reason: "awaiting-task-report" });
+    expect(manager.isCompactPending("telegram:1")).toBe(false);
+  });
+
+  it("while a compact is pending, the session's hook denies background launches and the web cannot background a task", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.getOrCreateLiveSession("telegram:1");
+    const ctx = mockState.sessionContexts.find((c) => c.sessionKey === "telegram:1")!;
+    expect(ctx.backgroundLaunchDenial).toBeTypeOf("function");
+
+    const r = manager.reserveCompact("telegram:1", "sdk-1");
+    expect(r.ok).toBe(true);
+    expect(manager.isCompactPending("telegram:1")).toBe(true);
+    expect(ctx.backgroundLaunchDenial!()).toContain("rollup/compact is pending");
+    expect(await manager.backgroundTask("telegram:1", "toolu_1")).toBe(false);
+
+    // No trigger on disk (/tmp/sdk-sessions): the rewrite did not happen, so
+    // finishing releases the mark at once.
+    if (r.ok) manager.finishCompact("telegram:1", r.reservationId);
+    expect(manager.isCompactPending("telegram:1")).toBe(false);
+    expect(ctx.backgroundLaunchDenial!()).toBeNull();
+  });
+
+  it("a move to the background in flight refuses a reservation that arrives meanwhile", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.getOrCreateLiveSession("telegram:1");
+    const s = mockState.instances[0] as unknown as { backgroundMoves: Array<(moved: boolean) => void> };
+    const moving = manager.backgroundTask("telegram:1", "toolu_1");
+    await flushMicrotasks();
+    expect(s.backgroundMoves).toHaveLength(1);
+    expect(manager.reserveCompact("telegram:1", "sdk-1")).toMatchObject({ ok: false, reason: "backgrounding" });
+
+    s.backgroundMoves[0](true);
+    expect(await moving).toBe(true);
+    // Moved: the SDK has yet to report the task, so the settle window holds.
+    expect(manager.reserveCompact("telegram:1", "sdk-1")).toMatchObject({ ok: false, reason: "recent-launch" });
+  });
+
+  it("after a rewrite, an idle session stays protected until its reload — however long that takes", async () => {
+    vi.useFakeTimers();
+    const { mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+    const sid = `sdk-${Math.random().toString(36).slice(2)}`;
+    const trigger = `/tmp/sdk-sessions/${sid}.compact-trigger`;
+    try {
+      const manager = new LiveSessionManager(makeDeps());
+      await manager.getOrCreateLiveSession("telegram:1");
+      mockState.instances[0].sessionId = sid;
+      const r = manager.reserveCompact("telegram:1", sid);
+      if (!r.ok) throw new Error("expected approval");
+      mkdirSync("/tmp/sdk-sessions", { recursive: true });
+      writeFileSync(trigger, "x"); // the rewrite succeeded
+      manager.finishCompact("telegram:1", r.reservationId);
+      vi.advanceTimersByTime(48 * 60 * 60 * 1000);
+      expect(manager.isCompactPending("telegram:1")).toBe(true);
+
+      // The next turn consumes the trigger and reloads.
+      rmSync(trigger, { force: true });
+      mockState.compactTriggered = true;
+      await manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
+      expect(manager.isCompactPending("telegram:1")).toBe(false);
+    } finally {
+      rmSync(trigger, { force: true });
+      vi.useRealTimers();
+    }
+  });
+
+  it("the compact reload releases the pending mark", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.getOrCreateLiveSession("telegram:1");
+    expect(manager.reserveCompact("telegram:1", "sdk-1").ok).toBe(true);
+    mockState.compactTriggered = true;
+    await manager.runWithRetry({ key: "telegram:1", prompt: "roll up" });
+    expect(mockState.instances[0].closed).toBe(true);
+    expect(manager.isCompactPending("telegram:1")).toBe(false);
   });
 
   it("hot-mounts an authenticated server with the complete existing MCP map", async () => {

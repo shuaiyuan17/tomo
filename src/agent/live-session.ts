@@ -258,6 +258,8 @@ export class LiveSession {
    * the session looks idle while the task's result is still on its way.
    */
   private awaitingTaskReport = false;
+  /** When the background set last drained into `awaitingTaskReport` (ms epoch). */
+  private awaitingTaskReportSince = 0;
   private turnStartWaiters: Array<() => void> = [];
   private parts: ResponseBlock[] = [];
   private sessionId: string | null = null;
@@ -433,6 +435,20 @@ export class LiveSession {
   /** True while the SDK reports live, non-ambient background tasks. */
   hasActiveBackgroundTasks(): boolean {
     return this.backgroundTaskIds.size > 0;
+  }
+
+  /** How many live, non-ambient background tasks the SDK last reported. */
+  activeBackgroundTaskCount(): number {
+    return this.backgroundTaskIds.size;
+  }
+
+  /**
+   * True while a drained task's report turn is still due, but only for
+   * `maxAgeMs` after the drain: the result may instead have been folded into a
+   * turn already running, and then the flag is never cleared by a claim.
+   */
+  isAwaitingTaskReportWithin(maxAgeMs: number): boolean {
+    return this.awaitingTaskReport && Date.now() - this.awaitingTaskReportSince < maxAgeMs;
   }
 
   /**
@@ -950,7 +966,10 @@ export class LiveSession {
       const hadTasks = this.backgroundTaskIds.size > 0;
       this.backgroundTaskIds = new Set(tasks.filter((t) => !t.ambient).map((t) => t.task_id));
       if (this.backgroundTaskIds.size === 0) {
-        if (hadTasks) this.awaitingTaskReport = true;
+        if (hadTasks) {
+          this.awaitingTaskReport = true;
+          this.awaitingTaskReportSince = Date.now();
+        }
         this.notifyBackgroundIdle();
       }
     }

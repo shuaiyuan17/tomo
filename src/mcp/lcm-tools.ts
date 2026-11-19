@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { compactSession } from "../lcm/compact.js";
 import { resolveBlockRange, summaryBudgetCheck, type BlockLevel } from "../lcm/blocks.js";
 import { log } from "../logger.js";
+import { compactRefusal, type CompactReservation } from "../lcm/background-gate.js";
 
 export interface LcmToolDeps {
   /** The caller's SDK session id, resolved at call time (it changes on reset). */
@@ -11,6 +12,14 @@ export interface LcmToolDeps {
   sdkSessionsDir: string;
   sessionsDir: string;
   sessionKey: string;
+  /**
+   * Approve the rewrite and mark the compact pending on the caller's session
+   * in one step (agent/compact-reservations.ts): refused while it has
+   * background work, because the reload that follows would kill it.
+   */
+  reserveCompact: (sdkSessionId: string) => CompactReservation;
+  /** The approved rewrite is over, whatever its outcome. */
+  finishCompact: (reservation: CompactReservation) => void;
 }
 
 const PERIOD_HINT: Record<BlockLevel, string> = {
@@ -49,6 +58,7 @@ export function buildLcmTools(deps: LcmToolDeps) {
         "",
         "Pass the level and period named in the nudge, and the summary text you would have passed to `--summary`.",
         "One rollup per turn — running two back-to-back can orphan the chain.",
+        "Refuses (status \"deferred\", nothing changed) while this session has background tasks running: the reload would kill them. Retry once they finish.",
       ].join("\n"),
       {
         level: z.enum(["daily", "weekly", "monthly", "yearly"]).describe("Which block level to roll up."),
@@ -66,22 +76,48 @@ export function buildLcmTools(deps: LcmToolDeps) {
         });
         if (!sdkSessionId) return fail("This session has no SDK session id yet; nothing to roll up.");
 
-        const resolved = resolveBlockRange(sdkSessionId, level, args.period, deps.sdkSessionsDir);
-        if (!resolved) {
-          return fail(`No events found for ${level} ${args.period ?? "(default period)"}. Period format: ${PERIOD_HINT[level]}.`);
+        // Before the range is even resolved: nothing may be rewritten while a
+        // background task is running, because the reload would kill it.
+        const reservation = deps.reserveCompact(sdkSessionId);
+        if (!reservation.ok) {
+          const refusal = compactRefusal(reservation, `${level} rollup`);
+          log.info(
+            { key: deps.sessionKey, level, period: args.period, reason: refusal.reason },
+            "lcm_rollup: deferred while background work runs",
+          );
+          return {
+            content: [{
+              type: "text" as const,
+              text: JSON.stringify({ ...refusal, note: "Reply NO_REPLY to finish the housekeeping turn." }),
+            }],
+          };
         }
-        const result = compactSession({
-          sdkSessionId,
-          sdkSessionsDir: deps.sdkSessionsDir,
-          fromIdx: resolved.fromIdx,
-          toIdx: resolved.toIdx,
-          expectedFirstUuid: resolved.firstUuid,
-          expectedLastUuid: resolved.lastUuid,
-          summary: args.summary,
-          transcriptPath: join(deps.sessionsDir, `_archive_${sdkSessionId}.jsonl`),
-          blockTag: resolved.blockTag,
-          dropUnparseable: false,
-        });
+
+        let result: ReturnType<typeof compactSession>;
+        let resolved: ReturnType<typeof resolveBlockRange>;
+        try {
+          resolved = resolveBlockRange(sdkSessionId, level, args.period, deps.sdkSessionsDir);
+          if (!resolved) {
+            return fail(`No events found for ${level} ${args.period ?? "(default period)"}. Period format: ${PERIOD_HINT[level]}.`);
+          }
+          result = compactSession({
+            sdkSessionId,
+            sdkSessionsDir: deps.sdkSessionsDir,
+            fromIdx: resolved.fromIdx,
+            toIdx: resolved.toIdx,
+            expectedFirstUuid: resolved.firstUuid,
+            expectedLastUuid: resolved.lastUuid,
+            summary: args.summary,
+            transcriptPath: join(deps.sessionsDir, `_archive_${sdkSessionId}.jsonl`),
+            blockTag: resolved.blockTag,
+            dropUnparseable: false,
+          });
+        } finally {
+          // Every exit — refused range, failed or successful rewrite, throw —
+          // finishes the approval; a successful one stays pending until the
+          // session reloads at the end of this turn.
+          deps.finishCompact(reservation);
+        }
         if (!result.success) return fail(result.error ?? "compaction failed");
 
         const budget = summaryBudgetCheck(level, args.summary);

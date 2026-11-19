@@ -15,6 +15,7 @@
 // import cycle with the agent modules that publish these events.
 import type { FabricatedMarkerShape } from "../agent/inbound-markers.js";
 import type { SdkSignal } from "../agent/sdk-signals.js";
+import type { CompactReservation } from "../lcm/background-gate.js";
 
 export const WATCH_PROTOCOL_VERSION = 1;
 
@@ -151,9 +152,25 @@ export interface WatchSnapshot {
 export type ServerFrame =
   | { kind: "snapshot"; snapshot: WatchSnapshot }
   | { kind: "event"; event: WatchEvent }
-  | { kind: "send-result"; ok: boolean; error?: string };
+  | { kind: "send-result"; ok: boolean; error?: string }
+  /** Answer to `compact-reserve`: approved (and marked pending) or refused. */
+  | { kind: "compact-reserve"; sdkSessionId: string; reservation: CompactReservation };
 
-export type ClientFrame = { kind: "send"; text: string };
+export type ClientFrame =
+  | { kind: "send"; text: string }
+  /**
+   * From `tomo lcm`, before it rewrites a session file: approve the rewrite
+   * and mark a compact pending on the session behind this SDK session id, in
+   * one step — refused while it has background work (agent/compact-
+   * reservations.ts). An approval is held by this connection.
+   */
+  | { kind: "compact-reserve"; sdkSessionId: string }
+  /**
+   * The rewrite is over (whatever its outcome); carries the approval from
+   * `compact-reserve`. Explicit on purpose — a dropped connection does not
+   * mean the rewrite stopped. Answered with a `send-result`.
+   */
+  | { kind: "compact-finish"; sdkSessionId: string; reservation: CompactReservation };
 
 /** Truncation limits keep single frames small; feeds render a line or two. */
 export const TRANSCRIPT_TEXT_LIMIT = 1500;

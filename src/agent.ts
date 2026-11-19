@@ -1,4 +1,5 @@
 import type { Channel, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions } from "./channels/types.js";
+import type { CompactReservation } from "./lcm/background-gate.js";
 import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
@@ -2382,6 +2383,37 @@ export class Agent {
   /** Read-only: a shell/Monitor task's output tail (web task view). */
   readTaskOutput(sessionKey: string, taskId: string): Promise<{ output: string; size: number } | undefined> {
     return this.liveSessionManager.taskOutput(sessionKey, taskId);
+  }
+
+  /** Does the key's live session have background work a compact reload would cut? */
+  hasBackgroundWork(sessionKey: string): boolean {
+    const state = this.liveSessionManager.backgroundState(sessionKey);
+    return state.activeBackgroundTasks > 0 || state.awaitingTaskReport;
+  }
+
+  /**
+   * Approve-and-mark a compact of the session behind `sdkSessionId` (the
+   * rollup gate; see agent/compact-reservations.ts). A session id no key in
+   * this daemon knows has no live session to reload: approved without a mark.
+   */
+  reserveCompactForSdkSession(sdkSessionId: string): CompactReservation {
+    const key = this.liveSessionManager.keyForSdkSession(sdkSessionId)
+      ?? this.listActiveSessions().find(([, sid]) => sid === sdkSessionId)?.[0];
+    if (!key) return { ok: true, key: null, reservationId: null };
+    return this.reserveCompact(key, sdkSessionId);
+  }
+
+  /** Approve-and-mark a compact of the key's session (lcm_rollup). */
+  reserveCompact(sessionKey: string, sdkSessionId: string): CompactReservation {
+    const result = this.liveSessionManager.reserveCompact(sessionKey, sdkSessionId);
+    return result.ok ? { ok: true, key: sessionKey, reservationId: result.reservationId } : { ...result, key: sessionKey };
+  }
+
+  /** The approved rewrite is over (succeeded, failed, or its client went away). */
+  finishCompact(reservation: CompactReservation): void {
+    if (reservation.ok && reservation.key && reservation.reservationId) {
+      this.liveSessionManager.finishCompact(reservation.key, reservation.reservationId);
+    }
   }
 
   /** Read-only: SDK-reported MCP connection state of live sessions (web Study). */

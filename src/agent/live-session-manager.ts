@@ -20,8 +20,10 @@ import type { UsageLedgerRow } from "../usage/ledger.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, TurnInterruptedError, type McpAuthRefreshOutcome, type QueryResult, type TurnRequest } from "./live-session.js";
 import { SteerDeclinedError } from "./sdk-result.js";
+import type { GroupSandboxConfig } from "./group-fs-policy.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
+import { flattenSystemPrompt } from "../workspace/system-prompt-blocks.js";
 
 /**
  * How long a prompt-stale session may wait for its background tasks before it
@@ -108,8 +110,13 @@ export { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
  * context), and the post-turn context-pressure hook.
  */
 export interface LiveSessionManagerDeps {
-  /** Current system prompt — hashed to detect workspace changes. */
-  buildSystemPrompt(): string;
+  /**
+   * Current system prompt — hashed to detect workspace changes. Only the
+   * workspace (static, pre-boundary) prompt belongs here: per-session blocks
+   * and the SDK cache-boundary marker are not workspace changes. A block array
+   * is accepted and flattened, so the marker itself never moves the hash.
+   */
+  buildSystemPrompt(): string | readonly string[];
   getSdkSessionId(key: string): string | undefined;
   setSdkSessionId(key: string, sessionId: string): void;
   clearSdkSessionId(key: string): void;
@@ -151,6 +158,11 @@ export interface LiveSessionManagerDeps {
    * `groupSandbox` entry; a live query for the same reason as above.
    */
   scopedCallerKey(key: string): string;
+  /** The group sandbox config the guard applies on `key`, per tool call
+   *  (config plus live Allow-once grants). Optional: absent ⇒ config alone. */
+  groupSandbox?(key: string, opts: { once: boolean }): GroupSandboxConfig;
+  /** A sandboxed call on `key`, for a later permission card's trigger line. */
+  noteSandboxedCall?(key: string, text: string): void;
   handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult>;
   /** Delivery plumbing for SDK-initiated (unowned) turns. */
   createUnownedTurnRequest(key: string): TurnRequest | undefined;
@@ -516,7 +528,7 @@ export class LiveSessionManager {
    * workspace, so a changed prompt reaches every key by its next idle turn.
    */
   private sweepPromptChanges(): void {
-    const currentHash = this.hashString(this.deps.buildSystemPrompt());
+    const currentHash = this.hashString(flattenSystemPrompt(this.deps.buildSystemPrompt()));
     if (this.lastPromptHash && currentHash !== this.lastPromptHash) {
       log.info("System prompt changed; retiring live sessions at their next idle boundary");
       for (const [key, session] of this.liveSessions) {
@@ -620,6 +632,8 @@ export class LiveSessionManager {
       group: this.deps.buildGroupContext(key),
       isOwnAudienceTurn: () => this.deps.isOwnAudienceTurn(key),
       scopedCallerKey: () => this.deps.scopedCallerKey(key),
+      ...(this.deps.groupSandbox ? { groupSandbox: (opts: { once: boolean }) => this.deps.groupSandbox!(key, opts) } : {}),
+      ...(this.deps.noteSandboxedCall ? { noteSandboxedCall: (text: string) => this.deps.noteSandboxedCall!(key, text) } : {}),
       onMcpElicitation: (request) => this.deps.handleMcpElicitation(key, request),
       // Late-bound on purpose: the options are built before the session that
       // owns the flag exists. Until it does, nothing was dropped.

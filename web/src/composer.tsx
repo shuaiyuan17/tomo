@@ -11,6 +11,7 @@ import { createCompositionGuard } from "./compose-keys.js";
 import { composerStatus, composerStatusIsProblem, requestLabels, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
 import type { SentAttachments } from "./conversation-rows.js";
 import { CredentialCard } from "./credential-card.js";
+import { PermissionCard, PermissionGranted, type GrantedPermission } from "./permission-card.js";
 import { pendingKey } from "./inline-tools.js";
 import { applyRestored, dismissAfterAcceptedSend, missingAttachments, resendAfterDraftChange, resendAfterSend, type Resend } from "./pending.js";
 import { quoteFor } from "./reactions.js";
@@ -108,6 +109,8 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
   const [draft, setDraft] = useState("");
   /** The message the next send replies to (its quote, as the agent will read it). */
   const [replyingTo, setReplyingTo] = useState<{ id: string; who: string; text: string } | null>(null);
+  /** The last Always allow answered on a card, so its grant ID stays on screen after the card goes. */
+  const [granted, setGranted] = useState<GrantedPermission | null>(null);
   const attachments = useAttachments(web.bootstrap, web.refreshBootstrap, writable ? session!.id : undefined, { images: uploadsOn, files: filesOn });
   const input = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -312,6 +315,8 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
       <Button variant="ghost" size="sm" className="h-6 rounded-md px-2 text-[11px]" onClick={endResend}>Not a resend</Button></div>}
     <AttachmentTray items={attachments.items} filesOn={filesOn} onRetry={attachments.retry} onRemove={attachments.remove} />
     {attachments.note && <p className="m-0 mb-2 text-[12px] text-muted-foreground" role="status">{attachments.note}</p>}
+    {granted && <PermissionGranted granted={granted} onClose={() => setGranted(null)} />}
+    {web.permissionRequests.map((request) => <PermissionCard key={request.id} request={request} bootstrap={web.bootstrap} refresh={web.refreshBootstrap} onAlways={setGranted} />)}
     {web.credentialRequest && <CredentialCard key={web.credentialRequest.id} request={web.credentialRequest} bootstrap={web.bootstrap} refresh={web.refreshBootstrap} />}
     {replyingTo && writable && <div className="motion-enter mb-2 flex items-center gap-2.5 rounded-2xl border bg-card/70 py-1.5 pr-1.5 pl-3" role="group" aria-label="Replying">
       <Reply className="size-4 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />

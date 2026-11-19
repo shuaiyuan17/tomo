@@ -402,6 +402,8 @@ export const mockConfig = {
   imessagePassiveTypingStartDelayMs: 4000,
   plugins: [] as Array<{ ref: string; isPath?: boolean; skipMcpDiscovery?: boolean }>,
   sessionModelOverrides: {} as Record<string, string>,
+  effort: null as string | null,
+  sessionEffortOverrides: {} as Record<string, string>,
   channelAllowlists: {} as Record<string, string[]>,
   passiveGroups: {} as Record<string, string[]>,
   groupSecret: null as string | null,

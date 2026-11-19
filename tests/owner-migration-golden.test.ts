@@ -397,6 +397,29 @@ describe("adoption is one-time and carries the session's cron jobs and model ove
     expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toEqual(["dm:owner", "dm:owner"]);
   });
 
+  it("moves the session's effort override with it, so the adopted session keeps its effort", async () => {
+    useRealAdmission();
+    seedPreIdentityInstall();
+    mockConfig.sessionEffortOverrides = { [RAW]: "low", "telegram:-100555": "high" };
+    const file = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as Record<string, unknown>;
+    writeFileSync(agentEnv.configFilePath, JSON.stringify({ ...file, sessionEffortOverrides: { [RAW]: "low", "telegram:-100555": "high" } }, null, 2));
+    const agent = new Agent();
+    agent.prepareOwner();
+
+    expect(mockConfig.sessionEffortOverrides).toEqual({ "dm:owner": "low", "telegram:-100555": "high" });
+    const saved = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as Record<string, unknown>;
+    expect(saved.sessionEffortOverrides).toEqual({ "dm:owner": "low", "telegram:-100555": "high" });
+    expect(saved.sessionModelOverrides).toEqual({ "dm:owner": "claude-opus-5[1m]" });
+
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    mockSdk.responseFn = () => "ok";
+    await tg.simulateMessage(makeMsg({ chatId: TG_ID, senderId: TG_ID, text: "hi" }));
+    await drainQueue(agent);
+    await agent.stop();
+    expect(mockSdk.optionsBySession.map((o) => [o.sessionKey, (o.options as { effort?: string }).effort])).toEqual([["dm:owner", "low"]]);
+  });
+
   it("an adoption interrupted after its re-key finishes the follow-ups on the next start (idempotent)", () => {
     seedPreIdentityInstall();
     const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);

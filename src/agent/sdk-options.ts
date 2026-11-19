@@ -3,6 +3,7 @@ import { backgroundLaunchGuardHooks } from "./compact-reservations.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
+import { assembleSystemPrompt, renderRuntimeSection, renderSessionSection } from "../workspace/system-prompt-blocks.js";
 import { isDmSessionKey, isGroupSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
@@ -12,10 +13,12 @@ import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, s
 import { TODO_TOOL_NAMES } from "../mcp/todo-tools.js";
 import { todosDir } from "../todos/store.js";
 import type { AgentProfile } from "../config.js";
+import { effectiveEffort } from "./effort.js";
 import { resolvePlugins } from "./plugins.js";
 import { SDK_SETTING_SOURCES } from "./setting-sources.js";
 import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
 import { CREDENTIAL_TOOL_NAMES, KEYCHAIN_SERVICE } from "../credentials/names.js";
+import { PERMISSION_TOOL_NAMES } from "../mcp/permission-tools.js";
 import { ensureRedactionReady, redactionReady, scrubDeep, withholdDeep } from "../credentials/redactor.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
@@ -86,6 +89,16 @@ export interface SessionContext {
    */
   scopedCallerKey?: () => string;
   /**
+   * The group sandbox config the private-memory guard applies on this
+   * session, read per tool call: config's `groupSandbox` plus any Allow-once
+   * grants live on this session (`PermissionBroker.withOnceGrants`).
+   * Undefined ⇒ config alone.
+   */
+  groupSandbox?: (opts: { once: boolean }) => GroupSandboxConfig;
+  /** Told of each sandboxed Bash command and refused file-tool call (the
+   *  trigger a later `request_permission` card shows). */
+  noteSandboxedCall?: (text: string) => void;
+  /**
    * Read-and-clear: did the model's last message land in a thinking block and
    * get dropped (see LiveSession.takeUndeliveredReply)? Consulted after every
    * tool batch so the model can be told before its next step.
@@ -108,7 +121,7 @@ export function sdkOptions(
   externalMcpServersOverride?: Record<string, McpServerConfig>,
 ) {
   const isGroup = sessionContext ? isGroupSessionKey(sessionContext.sessionKey) : false;
-  let systemPrompt = buildSystemPrompt({ isGroup });
+  const staticPrompt = buildSystemPrompt({ isGroup });
 
   // Why `memory/private/` is closed for the turn in flight — or null when it is
   // open. INSTALLED FOR EVERY SESSION, and resolved per tool call rather than
@@ -133,33 +146,12 @@ export function sdkOptions(
   // early when the SDK reports no `agent_id`.
   const agentProfile = (agentType: string): AgentProfile | undefined => config.agentProfiles[agentType];
 
-  // Inject the small amount of runtime context that cannot live in the
-  // user-editable workspace prompt.
-  if (sessionContext) {
-    const lines = [
-      "\n\n# SESSION",
-      `- Session key: ${sessionContext.sessionKey}`,
-    ];
-    if (sessionContext.sdkSessionId) {
-      lines.push(`- SDK session ID: ${sessionContext.sdkSessionId}`);
-    }
-    if (sessionContext.group) {
-      const g = sessionContext.group;
-      lines.push("");
-      lines.push("## Group Chat Context");
-      if (g.chatTitle) lines.push(`- Group title: "${g.chatTitle}"`);
-      if (g.participants && g.participants.length > 0) {
-        lines.push(`- Known participants: ${g.participants.join(", ")}`);
-      }
-      lines.push("- Incoming messages identify the sender. A canonical PEOPLE name in parentheses refers to the same person.");
-      if (g.isPassive) {
-        lines.push("- **Listen mode: passive.** You see every message. Reply only when directly addressed or genuinely useful; otherwise reply `NO_REPLY`.");
-      } else {
-        lines.push("- **Listen mode: mention-required.** Every message you receive explicitly tagged you; respond as in a DM.");
-      }
-    }
-    systemPrompt += lines.join("\n");
-  }
+  // The small amount of runtime context that cannot live in the user-editable
+  // workspace prompt. It goes AFTER the cache boundary (see
+  // workspace/system-prompt-blocks.ts): it names this one session, so before
+  // the marker it would stop every other session sharing the prefix.
+  const dynamicSections: string[] = [];
+  if (sessionContext) dynamicSections.push(renderSessionSection(sessionContext));
 
   const configuredMcpServers = Object.fromEntries(
     Object.entries(config.mcpServers ?? {}).map(([name, entry]) => [name, entry.server]),
@@ -179,7 +171,8 @@ export function sdkOptions(
   const resolvedModel = resolveModelName(effectiveModel) ?? effectiveModel;
   const resolvedLabel = modelLabel(resolvedModel);
   const modelDisplay = resolvedLabel === resolvedModel ? resolvedModel : `${resolvedModel} — ${resolvedLabel}`;
-  systemPrompt += `\n\n# RUNTIME\n- Current model: ${modelDisplay}\n- Treat this model value as authoritative.`;
+  dynamicSections.push(renderRuntimeSection(modelDisplay));
+  const systemPrompt = assembleSystemPrompt(staticPrompt, dynamicSections);
 
   const sdkEnv = buildSdkEnv({
     disableAutoCompact: shouldDisableAutoCompact,
@@ -193,6 +186,11 @@ export function sdkOptions(
   // its reply was not delivered (see renderBlock). Resolved at session spawn — a
   // mid-session config change only takes effect on the next session (restart).
   const thinking = adaptiveThinkingForModel(effectiveModel, config.showThinking);
+  // Resolved at session spawn like `thinking`: a config change takes effect on
+  // the next session start (daemon restart, or a `/model` switch, which
+  // restarts the session). Tomo has no live config edit, so nothing calls
+  // `applyFlagSettings({ effortLevel })` mid-session.
+  const effort = effectiveEffort(config, sessionContext?.sessionKey, effectiveModel).level;
 
   // Resolved at session spawn, not config load: CLI-installed plugin paths are
   // version-pinned and change on `claude plugin update` (old dirs are GC'd),
@@ -201,6 +199,7 @@ export function sdkOptions(
 
   return {
     model: effectiveModel,
+    ...(effort ? { effort } : {}),
     cwd: config.workspaceDir,
     systemPrompt,
     permissionMode: "bypassPermissions" as const,
@@ -231,6 +230,7 @@ export function sdkOptions(
       ...TODO_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`),
       // Registered only on the owner's DM session (internal-server.ts).
       `mcp__${TOMO_INTERNAL_MCP_NAME}__home_check`,
+      ...PERMISSION_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`),
       ...(config.credentialBroker?.enabled ? CREDENTIAL_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`) : []),
       ...externalMcpAllowedTools,
     ],
@@ -302,7 +302,8 @@ export function sdkOptions(
       // Read from config per call, not snapshotted: a config reload mid-session
       // takes effect on the next tool call rather than the next session.
       // The legacy `groupShellAllowlist` is folded in on read (unsandboxed).
-      groupSandbox: () => effectiveGroupSandbox(config.groupSandbox, config.groupShellAllowlist),
+      groupSandbox: sessionContext?.groupSandbox ?? (() => effectiveGroupSandbox(config.groupSandbox, config.groupShellAllowlist)),
+      noteCall: sessionContext?.noteSandboxedCall,
       // Which group is steering a summoned turn, so the group's entry is judged
       // against that group's key rather than the owner's dm: key.
       scopedCallerKey: sessionContext?.scopedCallerKey,
@@ -457,10 +458,12 @@ export function buildHooksOption(args: {
   pluginDirs?: () => readonly string[];
   /** Per-group path policy (extra dirs, or unsandboxed). Read per call; a
    *  missing config means every group gets the default policy. */
-  groupSandbox?: () => GroupSandboxConfig | undefined;
+  groupSandbox?: (opts: { once: boolean }) => GroupSandboxConfig | undefined;
   /** The key the turn in flight is scoped to (see SessionContext). Lets a
    *  summoned turn inherit its steering group's allowlist entry. */
   scopedCallerKey?: () => string;
+  /** See SessionContext.noteSandboxedCall. */
+  noteCall?: (text: string) => void;
   /** Read-and-clear "the model's last message was dropped" flag. Undefined ⇒
    *  the nudge is not installed. */
   undeliveredReply?: () => boolean;
@@ -509,6 +512,7 @@ export function buildHooksOption(args: {
       args.pluginDirs,
       args.groupSandbox,
       args.scopedCallerKey,
+      args.noteCall,
     ));
   }
   return Object.keys(hooks).length > 0 ? { hooks } : {};

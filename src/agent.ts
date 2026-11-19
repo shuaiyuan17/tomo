@@ -1,6 +1,6 @@
 import type { Channel, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions } from "./channels/types.js";
 import type { CompactReservation } from "./lcm/background-gate.js";
-import { config, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
+import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { ReplyTarget, SessionMessage, UsageBaseline } from "./sessions/types.js";
@@ -13,8 +13,10 @@ import {
   replyTargetFromRawSessionKey,
 } from "./sessions/keys.js";
 import { privateMemoryBarFor } from "./agent/permissions.js";
-import { attachmentBarredFor } from "./agent/private-memory-guard.js";
-import { effectiveGroupSandbox } from "./agent/group-fs-policy.js";
+import { assessGroupPermission, attachmentBarredFor } from "./agent/private-memory-guard.js";
+import { effectiveGroupSandbox, type GroupSandboxConfig } from "./agent/group-fs-policy.js";
+import { PermissionBroker, PermissionLedger, permissionLedgerPath, type PermissionAccess, type PermissionAssessment, type PermissionRequestView } from "./permissions/broker.js";
+import { findGrant, grantForRequest, newGrantId, persistGroupGrant, revokeGroupGrant } from "./permissions/config-grants.js";
 import { OwnerRouter, type SessionResolution } from "./router.js";
 import { ignoredAllowlistDmEntries, isOwnerHandle, ownerSessionKey } from "./owner.js";
 import { BlockedInboundLog, redactChatIdForLog } from "./agent/blocked-inbound-log.js";
@@ -116,6 +118,8 @@ export class Agent {
   private channels: Channel[] = [];
   /** Null unless `credentialBroker.enabled`. Read by the internal MCP server. */
   readonly credentialBroker: CredentialBroker | null;
+  /** `request_permission`: a sandboxed group asks the owner for a path. Read by the internal MCP server. */
+  readonly permissionBroker: PermissionBroker;
   private sessions: SessionStore;
   private router: OwnerRouter;
   /** Owner-facing, rate-limited trace of inbound messages the admission gate refused. */
@@ -381,6 +385,8 @@ export class Agent {
       buildGroupContext: (key) => this.buildGroupContext(key),
       isOwnAudienceTurn: (key) => this.isOwnAudienceTurn(key),
       scopedCallerKey: (key) => this.scopedCallerKey(key),
+      groupSandbox: (key, opts) => this.groupSandboxFor(key, opts),
+      noteSandboxedCall: (key, text) => this.permissionBroker.noteCall(key, text),
       handleMcpElicitation: (key, request) => this.mcpAuthPrompts.handleMcpElicitation(key, request),
       createUnownedTurnRequest: (key) => this.createUnownedTurnRequest(key),
       handleToolResult: (key, toolName, content, isError) => {
@@ -424,6 +430,7 @@ export class Agent {
     });
 
     this.credentialBroker = this.createCredentialBroker();
+    this.permissionBroker = this.createPermissionBroker();
 
     // Load persistent per-session model overrides
     for (const [key, model] of Object.entries(config.sessionModelOverrides)) {
@@ -454,6 +461,79 @@ export class Agent {
     });
     void broker.primeRedaction();
     return broker;
+  }
+
+  /** The permission broker, always on: it only acts when a group turn calls `request_permission`. */
+  private createPermissionBroker(): PermissionBroker {
+    return new PermissionBroker({
+      ledger: new PermissionLedger(permissionLedgerPath(config.tomoHome)),
+      workspaceDir: config.workspaceDir,
+      assess: (groupKey, sessionKey, path, access) => this.assessPermission(groupKey, sessionKey, path, access),
+      ownerDm: () => this.permissionDmTarget(),
+      card: () => {
+        const web = this.getChannel("web") as (Channel & { publishPermissionRequests?: (r: PermissionRequestView[]) => void }) | undefined;
+        return typeof web?.publishPermissionRequests === "function"
+          ? { publish: (requests) => web.publishPermissionRequests!(requests) } : undefined;
+      },
+      isOwnerSender: (channelName, senderId) => this.router.isOwnerSender(channelName, senderId),
+      persistAlways: (groupKey, access, path, grant) => persistGroupGrant(groupKey, access, path, this.grantTarget(), { ...grant, at: new Date().toISOString() }),
+      newGrantId: () => newGrantId(config.groupSandbox),
+      findGrant: (grantId) => {
+        const found = findGrant(config.groupSandbox, grantId);
+        return found ? { groupKey: found.groupKey, path: found.grant.path } : undefined;
+      },
+      grantForRequest: (requestId) => grantForRequest(config.groupSandbox, requestId)?.grantId,
+      revokeAlways: (groupKey, path) => revokeGroupGrant(groupKey, path, this.grantTarget()),
+      notifySession: (sessionKey, groupKey, outcome, body, onTurnBegin) => {
+        // Registered with the group as its audience, so a summoned group's
+        // answer turn stays scoped to that group; its turn id is handed back
+        // so an Allow once binds to this one turn (PermissionBroker.withOnceGrants).
+        this.handleCronMessage(formatTomoEvent("permission", body, { name: outcome }), sessionKey,
+          { showTyping: false, audiences: [groupKey], ...(onTurnBegin ? { onTurnBegin } : {}) })
+          .catch((err) => log.error({ err, sessionKey }, "Permission result turn failed to queue"));
+      },
+      liveTurnIds: (sessionKey) => this.turnAudiences.liveTurnIds(sessionKey),
+      isTurnLive: (id) => this.turnAudiences.isLive(id),
+      groupTitle: (groupKey) => this.sessions.getEntry(groupKey)?.chatTitle,
+    });
+  }
+
+  private grantTarget() {
+    return { configPath: CONFIG_PATH, backupPath: CONFIG_BACKUP_PATH, live: config };
+  }
+
+  /**
+   * The group sandbox config the guard applies on `sessionKey` right now:
+   * config's `groupSandbox` (legacy allowlist folded in) plus the Allow-once
+   * grants live on this session's turns.
+   */
+  groupSandboxFor(sessionKey: string, opts: { once: boolean } = { once: true }): GroupSandboxConfig {
+    const base = effectiveGroupSandbox(config.groupSandbox, config.groupShellAllowlist);
+    return opts.once ? this.permissionBroker.withOnceGrants(base, sessionKey) : base;
+  }
+
+  /** Is `path` already reachable for the group, never grantable, or worth asking the owner about? */
+  private assessPermission(groupKey: string, sessionKey: string, path: string, access: PermissionAccess): PermissionAssessment {
+    return assessGroupPermission(this.groupSandboxFor(sessionKey).groups[groupKey], path, access);
+  }
+
+  /**
+   * The owner's private chat for a permission request: iMessage or Telegram
+   * only (where a coded reply is read; the web UI has its card), and only a
+   * handle that is still the owner's. The last-active target first, then the
+   * configured one.
+   */
+  private permissionDmTarget(): { channel: Channel; chatId: string } | undefined {
+    const owner = config.owner;
+    const key = this.router.ownerSessionKey();
+    if (!owner || !key) return undefined;
+    for (const target of [this.router.getReplyTarget(key), this.router.deriveReplyTargetFromConfig(owner.name)]) {
+      if (!target || (target.channelName !== "imessage" && target.channelName !== "telegram")) continue;
+      if (!isOwnerHandle(owner, target.channelName, target.chatId)) continue;
+      const channel = this.getChannel(target.channelName);
+      if (channel) return { channel, chatId: target.chatId };
+    }
+    return undefined;
   }
 
   /** Look up a channel by name */
@@ -772,6 +852,11 @@ export class Agent {
     // Before routing, the batcher, the transcript and the log line in
     // handleMessage: a message taken here reaches none of them.
     if (this.credentialBroker && await this.credentialBroker.handleInbound(channel, message)) {
+      return true;
+    }
+    // The owner answering a group's permission request ("1 K7Q", or a quoted
+    // reply). Never a group message: the broker returns before parsing one.
+    if (await this.permissionBroker.handleInbound(channel, message)) {
       return true;
     }
 
@@ -1489,7 +1574,7 @@ export class Agent {
       bar,
       sessionKey,
       () => this.scopedCallerKey(sessionKey),
-      () => effectiveGroupSandbox(config.groupSandbox, config.groupShellAllowlist),
+      () => this.groupSandboxFor(sessionKey),
     );
   }
 
@@ -2067,6 +2152,7 @@ export class Agent {
     // session's own scope — except while a summoned turn overlaps them, which
     // narrows them to that group and which `scopedCallerKey` logs at debug.
     const turnId = options.audiences ? this.turnAudiences.begin(key, options.audiences) : undefined;
+    if (turnId !== undefined) options.onTurnBegin?.(turnId);
     try {
       return await this.turnRunner.runTurn({
         key,
@@ -2542,6 +2628,12 @@ export class Agent {
     } catch (err) {
       log.warn({ err }, "Could not report interrupted subagents");
     }
+    try {
+      // Requests the last run left open died with it: denied (restart), and their sessions told.
+      this.permissionBroker.reconcileAfterRestart();
+    } catch (err) {
+      log.warn({ err }, "Could not reconcile the permission ledger");
+    }
     this.startMcpTokenRefreshSweep();
     log.info("Tomo is running");
 
@@ -2654,6 +2746,7 @@ export class Agent {
     this.detachRunningAgents?.();
     this.detachRunningAgents = undefined;
     this.credentialBroker?.shutdown();
+    this.permissionBroker.shutdown();
     if (this.mcpTokenRefreshTimer) {
       clearInterval(this.mcpTokenRefreshTimer);
       this.mcpTokenRefreshTimer = undefined;

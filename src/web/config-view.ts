@@ -26,6 +26,7 @@ function secretShaped(value: string): boolean {
 /** Value checks for allowlisted paths that contain a wildcard. */
 const MODEL_ID = (v: string) => v.length <= 64 && /^(claude-)?[a-z0-9][a-z0-9.\-[\]]*$/.test(v);
 const LOWER_WORD = (v: string) => /^[a-z]+$/.test(v);
+const EFFORT_LEVEL = (v: string) => ["low", "medium", "high", "xhigh", "max"].includes(v);
 const POLICY = (v: string) => /^[a-z][a-z-]{0,31}$/.test(v);
 const PERSON_NAME = (v: string) => /^[\p{L}\p{N}][\p{L}\p{N} ._'-]{0,63}$/u.test(v);
 /** A Telegram / iMessage chat or user id: a number, a phone number, or an email address. */
@@ -44,7 +45,9 @@ interface ShownPath {
 }
 const shown = (pattern: string, value?: ShownPath["value"], key?: ShownPath["key"]): ShownPath => ({ pattern: pattern.split("."), value, key });
 const ANY_INDEX_OR_WORD = (k: string) => /^\d{1,4}$/.test(k) || /^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(k);
-const SESSION_KEY = (k: string) => k.length <= 128 && /^[a-z]+:[A-Za-z0-9_.@+:-]+$/.test(k);
+/** A session key as src/sessions/keys.ts builds it, including legacy iMessage
+ *  chat keys such as `imessage:any;+;<guid>`. */
+const SESSION_KEY = (k: string) => k.length <= 128 && /^[a-z]+:[A-Za-z0-9_.@+:;-]+$/.test(k);
 
 /**
  * The ONLY config paths whose string values are shown. An allowlist, not a
@@ -63,6 +66,7 @@ export const SHOWN_STRING_PATHS: ShownPath[] = [
   shown("writeRoots"), shown("denyPaths"), shown("denyReadPaths"), shown("groupShellAllowlist"), shown("mcpAllowedTools"),
   shown("continuityScript"), shown("continuityScript.path"), shown("plugins"),
   shown("sessionModelOverrides.*", MODEL_ID, SESSION_KEY),
+  shown("sessionEffortOverrides.*", EFFORT_LEVEL, SESSION_KEY),
   shown("identities.*.name", PERSON_NAME, ANY_INDEX_OR_WORD),
   shown("identities.*.replyPolicy", POLICY, ANY_INDEX_OR_WORD),
   shown("identities.*.channels.*", CHAT_ID, (k) => ANY_INDEX_OR_WORD(k)),

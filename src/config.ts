@@ -33,6 +33,12 @@ const DEFAULT_IMESSAGE_TYPING_START_DELAY_MS = 1200;
 const DEFAULT_IMESSAGE_PASSIVE_TYPING_START_DELAY_MS = 4000;
 const DEFAULT_LIVE_SESSION_TIMEOUT_MS = 10 * 60 * 1000;
 
+/** The reasoning-effort levels the Agent SDK accepts (`EffortLevel` in
+ *  @anthropic-ai/claude-agent-sdk `sdk.d.ts`). */
+export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+const effortSchema = z.enum(EFFORT_LEVELS);
+
 /** Legacy `identities[]` entry. Still read (forever) to derive `owner`; never
  *  consumed at runtime. `replyPolicy` is accepted and ignored. */
 export interface IdentityConfig {
@@ -85,7 +91,7 @@ export interface MetricsConfig {
  *                 lives on `git log $(git merge-base main HEAD)`, and v1 is
  *                 aimed at accidents, not at an agent deliberately assembling
  *                 `rm` out of `$(…)`. That is a sandbox's job, not a policy
- *                 layer's — see the "not a sandbox" note in the README.
+ *                 layer's — see "This is policy, not a sandbox" in docs/permissions-and-privacy.md.
  *  - `worktree` — `readonly` minus the must-name-it clause. An ABSOLUTE path
  *                 token on a write command still has to land inside
  *                 `writeRoots`; a RELATIVE one is not judged for the allow side
@@ -171,6 +177,9 @@ export interface TomoConfig {
   auth: AnthropicAuthConfig;
   telegramToken: string;
   model: string;
+  /** `effort`: reasoning effort passed to the SDK at session start. Null =
+   *  unset, the SDK picks the model's default. */
+  effort: EffortLevel | null;
   workspaceDir: string;
   sessionsDir: string;
   /** Claude Agent SDK JSONL directory derived from workspaceDir. */
@@ -212,6 +221,8 @@ export interface TomoConfig {
   /** Longer delay before showing iMessage typing in passive group turns. */
   imessagePassiveTypingStartDelayMs: number;
   sessionModelOverrides: Record<string, string>;
+  /** Per-session `effort` overrides, keyed like sessionModelOverrides. */
+  sessionEffortOverrides: Record<string, EffortLevel>;
   /** Per-channel GROUP allowlists (activated groups). DM entries are ignored:
    *  only the owner's DMs are answered. */
   channelAllowlists: Record<string, string[]>;
@@ -513,6 +524,15 @@ const groupSandboxSchema = z.object({
     extraRead: z.array(extraPathSchema).default([]),
     extraWrite: z.array(extraPathSchema).default([]),
     unsandboxed: z.boolean().default(false),
+    // "Always allow" records (src/permissions/config-grants.ts), by grant id:
+    // what to revoke, and which request made it. The paths in extraRead /
+    // extraWrite are what the sandbox applies; this is their provenance.
+    grants: z.record(z.string(), z.object({
+      path: z.string(),
+      access: z.enum(["read", "write"]),
+      requestId: z.string().optional(),
+      at: z.string().optional(),
+    })).optional(),
   })).default({}),
 });
 
@@ -931,6 +951,7 @@ function buildConfig(): TomoConfig {
     web: parseWebConfig(file.web, (message) => log.warn(message)),
     telegramToken: envVar("TELEGRAM_BOT_TOKEN") ?? channels.telegram?.token ?? "",
     model,
+    effort: validated("effort", effortSchema, file.effort, null),
     workspaceDir: paths.workspaceDir,
     sessionsDir: paths.sessionsDir,
     sdkSessionsDir: paths.sdkSessionsDir,
@@ -987,6 +1008,7 @@ function buildConfig(): TomoConfig {
       DEFAULT_IMESSAGE_PASSIVE_TYPING_START_DELAY_MS,
     ),
     sessionModelOverrides: validated("sessionModelOverrides", z.record(z.string(), z.string()), file.sessionModelOverrides, {}),
+    sessionEffortOverrides: validated("sessionEffortOverrides", z.record(z.string(), effortSchema), file.sessionEffortOverrides, {}),
     channelAllowlists: Object.fromEntries(
       Object.entries(channels).flatMap(([name, ch]) => (ch.allowlist ? [[name, ch.allowlist]] : [])),
     ),

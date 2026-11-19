@@ -23,12 +23,13 @@ function same(a: unknown, b: unknown): boolean {
 }
 
 /**
- * Arrays that are SETS of chat ids / handles: concurrent additions on both
- * sides must survive (the menu adds group A while the daemon's group secret
- * activates group B). Other arrays (e.g. an MCP server's `args`) are ordered
+ * Arrays that are SETS of chat ids / handles, or of a group's extra sandbox
+ * paths: concurrent additions on both sides must survive (the menu adds group
+ * A while the daemon's group secret activates group B, or an "Always allow"
+ * lands while `tomo config` is open). Other arrays (e.g. an MCP server's `args`) are ordered
  * and stay atomic.
  */
-const SET_ARRAY_KEYS = new Set(["allowlist", "passiveGroups", "groupShellAllowlist", "telegram", "imessage"]);
+const SET_ARRAY_KEYS = new Set(["allowlist", "passiveGroups", "groupShellAllowlist", "telegram", "imessage", "extraRead", "extraWrite"]);
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((v) => typeof v === "string");

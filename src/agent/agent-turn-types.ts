@@ -94,6 +94,9 @@ export interface CronTurnOptions {
    *  for harness-originated turns (the cron scheduler, LCM nudges), which the
    *  owner owns outright. */
   audiences?: string[];
+  /** Called with the turn's registered id when it begins (only when `audiences`
+   *  registers it). A permission answer binds its Allow once to that id. */
+  onTurnBegin?: (turnId: number) => void;
 }
 
 export interface QueuedInboundWork {

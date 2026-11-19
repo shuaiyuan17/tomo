@@ -199,6 +199,19 @@ export class TurnAudienceRegistry {
     return distinct.size === 1 ? { ...all[0] } : undefined;
   }
 
+  /** The ids of the turns registered live on this session right now. Ids are
+   *  unique across sessions and never reused, so a grant tied to them ends
+   *  when its turns do (`src/permissions/broker.ts`). */
+  liveTurnIds(sessionKey: string): number[] {
+    return [...(this.live.get(sessionKey)?.keys() ?? [])];
+  }
+
+  /** Is turn `id` still live, on any session? */
+  isLive(id: number): boolean {
+    for (const turns of this.live.values()) if (turns.has(id)) return true;
+    return false;
+  }
+
   /** The audiences of every turn live on this session right now, or
    *  undefined when none is. */
   liveAudiences(sessionKey: string): string[] | undefined {

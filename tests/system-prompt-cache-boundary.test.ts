@@ -48,6 +48,48 @@ const groupB: SessionContext = {
   group: { chatTitle: "Beta", participants: ["Cy"], isPassive: false },
 };
 
+const dmA: SessionContext = { sessionKey: "dm:owner", sdkSessionId: "sdk-dm-1" };
+const dmB: SessionContext = { sessionKey: "dm:other", sdkSessionId: "sdk-dm-2" };
+
+/** The model string as rendered, so the legacy reference uses the same one. */
+function runtimeModelDisplay(blocks: string[]): string {
+  const m = flattenSystemPrompt(blocks).match(/- Current model: ([^\n]+)/);
+  expect(m).not.toBeNull();
+  return m![1];
+}
+
+/** sdkOptions' system-prompt assembly as it was before the boundary, verbatim. */
+function legacySystemPrompt(base: string, sessionContext: SessionContext | undefined, modelDisplay: string): string {
+  let systemPrompt = base;
+  if (sessionContext) {
+    const lines = [
+      "\n\n# SESSION",
+      `- Session key: ${sessionContext.sessionKey}`,
+    ];
+    if (sessionContext.sdkSessionId) {
+      lines.push(`- SDK session ID: ${sessionContext.sdkSessionId}`);
+    }
+    if (sessionContext.group) {
+      const g = sessionContext.group;
+      lines.push("");
+      lines.push("## Group Chat Context");
+      if (g.chatTitle) lines.push(`- Group title: "${g.chatTitle}"`);
+      if (g.participants && g.participants.length > 0) {
+        lines.push(`- Known participants: ${g.participants.join(", ")}`);
+      }
+      lines.push("- Incoming messages identify the sender. A canonical PEOPLE name in parentheses refers to the same person.");
+      if (g.isPassive) {
+        lines.push("- **Listen mode: passive.** You see every message. Reply only when directly addressed or genuinely useful; otherwise reply `NO_REPLY`.");
+      } else {
+        lines.push("- **Listen mode: mention-required.** Every message you receive explicitly tagged you; respond as in a DM.");
+      }
+    }
+    systemPrompt += lines.join("\n");
+  }
+  systemPrompt += `\n\n# RUNTIME\n- Current model: ${modelDisplay}\n- Treat this model value as authoritative.`;
+  return systemPrompt;
+}
+
 describe("system prompt cache boundary", () => {
   it("uses the SDK's own marker string", async () => {
     const real = await vi.importActual<typeof import("@anthropic-ai/claude-agent-sdk")>("@anthropic-ai/claude-agent-sdk");
@@ -69,15 +111,20 @@ describe("system prompt cache boundary", () => {
     expect(dynamic).toContain("# RUNTIME");
   });
 
-  it("gives two different sessions a byte-identical static prefix", () => {
+  it("gives two DM sessions, and two group sessions, a byte-identical static prefix", () => {
     resetConfig();
-    const a = promptFor(groupA);
-    const b = promptFor(groupB);
-
-    expect(staticPromptBlocks(a)).toEqual(staticPromptBlocks(b));
-    expect(staticPromptBlocks(a)).toEqual(["STATIC WORKSPACE PROMPT (group variant)"]);
-    // ...while everything that differs between them stays after the marker.
-    expect(dynamicBlocks(a)).not.toEqual(dynamicBlocks(b));
+    const pairs: Array<[SessionContext, SessionContext, string]> = [
+      [dmA, dmB, "STATIC WORKSPACE PROMPT (dm variant)"],
+      [groupA, groupB, "STATIC WORKSPACE PROMPT (group variant)"],
+    ];
+    for (const [x, y, expected] of pairs) {
+      const a = promptFor(x);
+      const b = promptFor(y);
+      expect(staticPromptBlocks(a)).toEqual(staticPromptBlocks(b));
+      expect(staticPromptBlocks(a)).toEqual([expected]);
+      // ...while everything that differs between them stays after the marker.
+      expect(dynamicBlocks(a)).not.toEqual(dynamicBlocks(b));
+    }
   });
 
   it("keeps the model out of the static prefix", () => {
@@ -94,7 +141,7 @@ describe("system prompt cache boundary", () => {
   // them) back in front of the marker fails here.
   it("never lets a per-session value reach the static prefix", () => {
     resetConfig();
-    for (const ctx of [groupA, groupB, { sessionKey: "dm:owner", sdkSessionId: "sdk-dm" }]) {
+    for (const ctx of [groupA, groupB, dmA, dmB]) {
       const staticText = staticPromptBlocks(promptFor(ctx, "sonnet")).join("\n\n");
       const perSession = [
         ctx.sessionKey,
@@ -109,17 +156,25 @@ describe("system prompt cache boundary", () => {
     }
   });
 
-  it("flattens to exactly the prompt text tomo sent before the split", () => {
+  // Byte-for-byte against the pre-boundary assembly (legacySystemPrompt
+  // below, copied verbatim from sdk-options.ts before this change). The CLI
+  // joins non-marker blocks with a blank line when it does not use scoped
+  // caching, so the model must read exactly what it read before.
+  it.each([
+    ["DM session", dmA],
+    ["group session, passive", groupA],
+    ["group session, mention-required", groupB],
+    ["no session context", undefined],
+  ] as Array<[string, SessionContext | undefined]>)("flattens to exactly the pre-change prompt: %s", (_name, ctx) => {
     resetConfig();
-    const blocks = promptFor(groupA, "sonnet");
-    const flat = flattenSystemPrompt(blocks);
-    // The pre-boundary assembly: static + "\n\n# SESSION…" + "\n\n# RUNTIME…".
-    // The CLI joins non-marker blocks with a blank line when it does not use
-    // scoped caching, so the model must see the same bytes as before.
-    expect(flat.startsWith("STATIC WORKSPACE PROMPT (group variant)\n\n# SESSION\n- Session key: telegram:-100111\n")).toBe(true);
-    expect(flat).toContain('\n## Group Chat Context\n- Group title: "Alpha"\n- Known participants: Ann, Bo\n');
-    expect(flat).toMatch(/\n\n# RUNTIME\n- Current model: [^\n]+\n- Treat this model value as authoritative\.$/);
-    expect(flat).not.toContain(SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
+    const blocks = promptFor(ctx, "sonnet");
+    const isGroup = ctx?.group !== undefined;
+    const legacy = legacySystemPrompt(
+      isGroup ? "STATIC WORKSPACE PROMPT (group variant)" : "STATIC WORKSPACE PROMPT (dm variant)",
+      ctx,
+      runtimeModelDisplay(blocks),
+    );
+    expect(flattenSystemPrompt(blocks)).toBe(legacy);
   });
 
   it("still marks the boundary when there is no session context", () => {

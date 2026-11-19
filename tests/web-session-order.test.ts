@@ -38,7 +38,7 @@ describe("session picker order: the main session first", () => {
   });
 
   it("the picker renders the pinned list, not the raw catalog order", () => {
-    const main = readFileSync(new URL("../web/src/main.tsx", import.meta.url), "utf8");
+    const main = readFileSync(new URL("../web/src/sidebar.tsx", import.meta.url), "utf8");
     expect(main).toMatch(/pinOwnerFirst\(sessions, ownerId\)/);
     expect(main).toMatch(/pickerSessions\.map\(/);
     expect(main).not.toMatch(/\{sessions\.map\(\(s\) => <DropdownMenuRadioItem/);

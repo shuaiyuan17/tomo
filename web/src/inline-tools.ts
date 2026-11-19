@@ -25,8 +25,11 @@ export function mergeTools(state: ToolsState, page: SessionTools, kind: "full" |
   }
   const seen = new Set(state.items.map((item) => item.id));
   const fresh = page.items.filter((item) => !seen.has(item.id));
+  const end = Math.max(state.end, page.end), unreadable = state.unreadable || !!page.unreadable;
+  // Nothing new (most polls while a turn runs): the same state, so the chat does not re-render for it.
+  if (!fresh.length && end === state.end && unreadable === state.unreadable) return state;
   const items = fresh.length ? [...state.items, ...fresh].slice(-MAX_KEPT_TOOL_ITEMS) : state.items;
-  return { transcript: state.transcript, end: Math.max(state.end, page.end), items, complete: state.complete, unreadable: state.unreadable || !!page.unreadable };
+  return { transcript: state.transcript, end, items, complete: state.complete, unreadable };
 }
 
 /** A tool block in the chat, keyed so its open/closed state survives paging and live updates. */

@@ -1,10 +1,6 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { useAgentName } from "./agent-name.js";
-import { Check, ChevronRight, FileText, Folder, Lock, Pause, Play, RefreshCw, Search, Trash2, X } from "lucide-react";
-import { ApiError, mutate, type WebBootstrap } from "./api.js";
-import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
-import type { WebConfigField, WebConfigView, WebContext, WebCronJob, WebMcpView, WebMemoryFile, WebMemorySearch,
-  WebMemoryTree, WebSession } from "../../src/web/protocol.js";
+import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { ChevronRight, FileText, Folder, Lock, RefreshCw, Search, X } from "lucide-react";
+import type { WebConfigField, WebConfigView, WebContext, WebMcpView, WebMemoryFile, WebMemorySearch, WebMemoryTree, WebSession } from "../../src/web/protocol.js";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -12,13 +8,16 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
+import { useAgentName } from "./agent-name.js";
 import { Text } from "./markdown.js";
 import { ContextView } from "./context-page.js";
 import { CostPage } from "./cost-page.js";
 import { Todos } from "./study-todos.js";
-import type { WebModelChangeResult, WebModelView } from "../../src/web/protocol.js";
-import { effortText, modelErrorRefreshes, modelErrorText, pickTarget, switchCopy } from "./model-picker.js";
-import { formatWhen, STUDY_LABELS, STUDY_PAGES, useResource, type Resource, type StudyPage } from "./study-data.js";
+import { Cron } from "./study-cron.js";
+import { ModelPage } from "./study-model.js";
+import { formatWhen, STUDY_LABELS, STUDY_PAGES, useResource, type StudyPage } from "./study-data.js";
+import { card, Empty, meta, Status, type Mutator } from "./study-ui.js";
+
 
 const INTRO: Record<StudyPage, string> = {
   todos: "What {agent} is keeping track of, and who moves next. Read-only here: todos change in conversation or with /todo.",
@@ -30,29 +29,6 @@ const INTRO: Record<StudyPage, string> = {
   mcp: "External tool servers in config.json, and what live sessions report about them.",
   config: "The saved config.json. Only known non-sensitive text is shown; everything else is hidden.",
 };
-
-const card = "rounded-xl border bg-card shadow-xs";
-const meta = "text-[11px] tracking-[0.02em] text-muted-foreground";
-
-const ERRORS: Record<string, string> = {
-  memory_not_found: "That file is not available.", memory_limit: "That file is too large to show here.",
-  memory_invalid_path: "That path cannot be opened.", cron_unavailable: "The cron store could not be read.",
-  config_invalid: "config.json is not valid JSON.", config_unavailable: "config.json could not be read.",
-  session_not_found: "That conversation is no longer available.", request_limit: "Busy — try again in a moment.",
-};
-
-function Status({ resource, empty, children }: { resource: Resource<unknown>; empty?: ReactNode; children?: ReactNode }) {
-  if (resource.state === "loading") return <p className="text-sm text-muted-foreground" role="status">Loading…</p>;
-  if (resource.state === "error") return <div className={cn(card, "px-4 py-3 text-[13px]")} role="alert">{ERRORS[resource.code] ?? "Unavailable right now."}</div>;
-  return <>{empty ?? children}</>;
-}
-
-function Empty({ children }: { children: ReactNode }) {
-  return <div className={cn(card, "px-5 py-8 text-center text-sm text-muted-foreground")}>{children}</div>;
-}
-
-/** What a Study write needs: the page's bootstrap (CSRF token, daemon epoch) and a way to refresh it. */
-export interface Mutator { bootstrap?: WebBootstrap; refresh: () => Promise<WebBootstrap>; live: boolean }
 
 export function Study({ page, onPage, session, reload, inert, mutator, focus, cronRevision = 0 }: { page: StudyPage; onPage: (page: StudyPage) => void; session?: WebSession; reload: number; inert?: boolean; mutator: Mutator;
   /** An item to scroll to and highlight (`#study/cron/<jobId>`). */ focus?: string | null; cronRevision?: number }) {
@@ -156,253 +132,6 @@ function Context({ session, reload }: { session?: WebSession; reload: number }) 
   const [resource] = useResource<WebContext>(session ? `/sessions/${session.id}/context` : null, reload);
   if (!session) return <Empty>Choose a conversation in the sidebar.</Empty>;
   return <Status resource={resource}>{resource.state === "ready" && <ContextView value={resource.value} title={session.title} />}</Status>;
-}
-
-export function cronStatus(job: WebCronJob): { label: string; tone: "ok" | "warn" | "muted" } {
-  if (job.interruptedAt) return { label: "Interrupted", tone: "warn" };
-  if (job.lastStatus === "error") return { label: "Last run failed", tone: "warn" };
-  if (job.lastStatus === "empty") return { label: "Last run gave no reply", tone: "warn" };
-  if (job.lastStatus === "ok") return { label: "Last run ok", tone: "ok" };
-  return { label: "Not run yet", tone: "muted" };
-}
-
-export function CronJobRow({ job, actions, highlighted }: { job: WebCronJob; actions?: ReactNode; highlighted?: boolean }) {
-  const status = cronStatus(job);
-  return <li id={cronRowId(job.id)} tabIndex={-1} aria-current={highlighted ? "true" : undefined}
-    className={cn(card, "scroll-mt-4 px-5 py-4 transition-[box-shadow,background-color] duration-700", !job.enabled && "opacity-75",
-      // Inset: the Study panel scrolls (overflow), which clips a ring drawn outside the card.
-      highlighted && "bg-accent/60 ring-2 ring-inset ring-primary/50")}>
-    <Collapsible>
-      <div className="flex flex-wrap items-start gap-x-3 gap-y-2">
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2"><h2 className="m-0 text-[15px] font-medium">{job.name}</h2>
-            <Badge variant={job.enabled ? "secondary" : "outline"} className="rounded-md text-[10px] font-normal tracking-[0.02em]">{job.enabled ? "Enabled" : "Paused"}</Badge>
-            {job.deleteAfterRun && <Badge variant="outline" className="rounded-md text-[10px] font-normal tracking-[0.02em]">One-shot</Badge>}</div>
-          <p className={cn(meta, "mt-1 mb-0")}>{job.scheduleLabel} · {job.sessionKey}</p>
-        </div>
-        {actions}
-      </div>
-      <dl className="mt-3 mb-0 grid grid-cols-3 gap-3 text-[13px] max-[600px]:grid-cols-1">
-        <div><dt className={meta}>Next run</dt><dd className="m-0">{job.enabled ? formatWhen(job.nextRunAt) : "—"}</dd></div>
-        <div><dt className={meta}>Last run</dt><dd className="m-0">{formatWhen(job.lastRunAt)}</dd></div>
-        <div><dt className={meta}>Status</dt><dd className={cn("m-0", status.tone === "warn" && "text-destructive")}>{status.label}</dd></div>
-      </dl>
-      <CollapsibleTrigger className="group mt-3 flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
-        <ChevronRight className="size-3.5 transition-transform group-data-[state=open]:rotate-90" />Message</CollapsibleTrigger>
-      <CollapsibleContent><p className="mt-2 mb-0 rounded-lg bg-muted px-4 py-3 text-[13px] whitespace-pre-wrap [overflow-wrap:anywhere]">{job.message}</p></CollapsibleContent>
-    </Collapsible>
-  </li>;
-}
-
-/** DOM id of a job's row, the target of `#study/cron/<jobId>`. */
-export function cronRowId(id: string): string { return `cron-job-${id}`; }
-
-/** How long a linked job stays highlighted. */
-const HIGHLIGHT_MS = 2500;
-
-export function CronList({ jobs, actions, focus = null }: { jobs: WebCronJob[]; actions?: (job: WebCronJob) => ReactNode; focus?: string | null }) {
-  const sorted = useMemo(() => [...jobs].sort((a, b) => Number(b.enabled) - Number(a.enabled) || (a.nextRunAt ?? Infinity) - (b.nextRunAt ?? Infinity)), [jobs]);
-  const [highlighted, setHighlighted] = useState<string | null>(null);
-  const present = !!focus && jobs.some((job) => job.id === focus);
-  // Scroll to and briefly highlight the linked job once it is listed.
-  useEffect(() => {
-    if (!focus || !present) return;
-    const row = document.getElementById(cronRowId(focus));
-    row?.scrollIntoView?.({ block: "center", behavior: "smooth" });
-    row?.focus({ preventScroll: true });
-    setHighlighted(focus);
-    const timer = setTimeout(() => setHighlighted(null), HIGHLIGHT_MS);
-    return () => clearTimeout(timer);
-  }, [focus, present]);
-  if (!jobs.length) return <Empty>No scheduled jobs.</Empty>;
-  return <>
-    {focus && !present && <p className={cn(meta, "mt-0 mb-3")} role="status">That job is no longer scheduled.</p>}
-    <ul className="m-0 list-none space-y-3 p-0">{sorted.map((job) => <CronJobRow key={job.id} job={job} actions={actions?.(job)} highlighted={highlighted === job.id} />)}</ul>
-  </>;
-}
-
-const CRON_ERRORS: Record<string, string> = {
-  cron_changed: "This job changed since you opened it. The list has been refreshed; review it and try again.",
-  job_not_found: "This job no longer exists.",
-  unschedulable: "This schedule has no future run left, so it cannot be resumed.",
-  epoch_changed: "Tomo restarted since this page loaded. The list has been refreshed; review it and try again.",
-  cron_unavailable: "The cron store could not be read or written.",
-};
-
-type CronAction = "pause" | "resume" | "delete";
-
-/** Pause / resume / delete, each behind a confirmation naming the job. */
-function CronActions({ job, mutator, onDone }: { job: WebCronJob; mutator: Mutator; onDone: () => void }) {
-  const [open, setOpen] = useState<CronAction | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const overdueOneShot = job.schedule.kind === "at" && Date.parse(job.schedule.at) <= Date.now();
-  const disabled = !mutator.bootstrap || !mutator.live;
-  const confirm = async () => {
-    if (!open || !mutator.bootstrap) return;
-    setBusy(true); setError("");
-    try {
-      await mutate(`/cron/${encodeURIComponent(job.id)}`, open === "delete" ? "DELETE" : "PATCH",
-        { revision: job.revision, confirm: true, ...(open === "delete" ? {} : { enabled: open === "resume" }) }, mutator.bootstrap, mutator.refresh);
-      setOpen(null); onDone();
-    } catch (err) {
-      const code = err instanceof ApiError ? err.code : "unavailable";
-      setError(CRON_ERRORS[code] ?? "The change could not be confirmed. Refresh and check the job before trying again.");
-      if (code === "cron_changed" || code === "epoch_changed" || code === "job_not_found") onDone();
-    } finally { setBusy(false); }
-  };
-  const copy: Record<CronAction, { title: string; body: string; action: string }> = {
-    pause: { title: `Pause “${job.name}”?`, action: "Pause job",
-      body: "It will not run again until you resume it. A run already in progress is not stopped." },
-    resume: { title: `Resume “${job.name}”?`, action: "Resume job",
-      body: overdueOneShot ? "Its scheduled time has passed, so it will run at the scheduler's next check, within about 30 seconds." : "It will run again on its schedule." },
-    delete: { title: `Delete “${job.name}”?`, action: "Delete job",
-      body: "The job is removed from the schedule. This cannot be undone from here. A run already in progress is not stopped." },
-  };
-  const toggle: CronAction = job.enabled ? "pause" : "resume";
-  const iconButton = "size-8 rounded-lg text-muted-foreground max-[600px]:size-10 hover:bg-foreground/[0.07] hover:text-foreground";
-  return <AlertDialog open={open !== null} onOpenChange={(value) => { if (!value && !busy) { setOpen(null); setError(""); } }}>
-    <div className="flex shrink-0 items-center gap-1">
-      <AlertDialogTrigger asChild><Button variant="ghost" size="icon" className={iconButton} disabled={disabled} onClick={() => setOpen(toggle)}
-        aria-label={`${job.enabled ? "Pause" : "Resume"} ${job.name}`} title={job.enabled ? "Pause" : "Resume"}>{job.enabled ? <Pause strokeWidth={1.75} /> : <Play strokeWidth={1.75} />}</Button></AlertDialogTrigger>
-      <AlertDialogTrigger asChild><Button variant="ghost" size="icon" className={cn(iconButton, "hover:text-destructive")} disabled={disabled} onClick={() => setOpen("delete")}
-        aria-label={`Delete ${job.name}`} title="Delete"><Trash2 strokeWidth={1.75} /></Button></AlertDialogTrigger>
-    </div>
-    {open && <AlertDialogContent className="rounded-2xl bg-card sm:max-w-md">
-      <AlertDialogHeader>
-        <AlertDialogTitle className="font-serif text-[22px] leading-snug font-normal">{copy[open].title}</AlertDialogTitle>
-        <AlertDialogDescription className="text-[13px] leading-relaxed">{copy[open].body}</AlertDialogDescription>
-      </AlertDialogHeader>
-      <dl className="m-0 grid grid-cols-[88px_minmax(0,1fr)] items-baseline gap-x-3 gap-y-1 rounded-xl bg-muted px-4 py-3 text-[13px]">
-        <dt className={meta}>Schedule</dt><dd className="m-0 font-mono text-xs [overflow-wrap:anywhere]">{job.scheduleLabel}</dd>
-        <dt className={meta}>Session</dt><dd className="m-0 font-mono text-xs [overflow-wrap:anywhere]">{job.sessionKey}</dd>
-        <dt className={meta}>Message</dt><dd className="m-0 line-clamp-3 [overflow-wrap:anywhere]">{job.message}</dd>
-      </dl>
-      {error && <p className="m-0 text-[13px] text-destructive" role="alert">{error}</p>}
-      <AlertDialogFooter>
-        <AlertDialogCancel disabled={busy} className="rounded-xl">Cancel</AlertDialogCancel>
-        <AlertDialogAction disabled={busy || !!error} onClick={(event) => { event.preventDefault(); void confirm(); }}
-          className={cn("rounded-xl", open === "delete" && "bg-destructive text-white hover:bg-destructive/90")}>{busy ? "Working…" : copy[open].action}</AlertDialogAction>
-      </AlertDialogFooter>
-    </AlertDialogContent>}
-  </AlertDialog>;
-}
-
-function Cron({ reload, mutator, focus }: { reload: number; mutator: Mutator; focus: string | null }) {
-  const [resource, refetch] = useResource<{ jobs: WebCronJob[] }>("/cron", reload);
-  return <Status resource={resource}>{resource.state === "ready" && <>
-    {!mutator.live && <p className={cn(meta, "mt-0 mb-3")}>Changes are available while connected.</p>}
-    <CronList jobs={resource.value.jobs} focus={focus} actions={(job) => <CronActions job={job} mutator={mutator} onDone={refetch} />} />
-  </>}</Status>;
-}
-
-type ModelRef = { id: string; label: string };
-
-/**
- * The selected conversation's model, and (owner conversation only) a switch:
- * pick a listed model or type an id, confirm, and the next message runs on
- * it. The confirm is inline, not a Radix dialog: a modal overlay injects a
- * style the CSP refuses.
- */
-function ModelPage({ session, reload, mutator }: { session?: WebSession; reload: number; mutator: Mutator }) {
-  const agent = useAgentName();
-  const [resource, refetch] = useResource<WebModelView>(session ? `/models?session=${encodeURIComponent(session.id)}` : null, reload);
-  const [target, setTarget] = useState<ModelRef | null>(null);
-  const [draft, setDraft] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  const [result, setResult] = useState<WebModelChangeResult | null>(null);
-  const confirmButton = useRef<HTMLButtonElement>(null);
-  useEffect(() => { setTarget(null); setResult(null); setError(""); setDraft(""); }, [session?.id]);
-  useEffect(() => { if (target) confirmButton.current?.focus(); }, [target]);
-  if (!session) return <Empty>Choose a conversation in the sidebar.</Empty>;
-  // A view still loaded for the previously selected conversation is not shown as this one's.
-  const view = resource.state === "ready" && resource.value.sessionId === session.id ? resource.value : undefined;
-  if (!view) return <Status resource={resource.state === "ready" ? { state: "loading" } : resource} />;
-  const canSwitch = view.writable && mutator.live && !!mutator.bootstrap;
-  const choose = (next: ModelRef) => { setResult(null); setError(""); setTarget(next); };
-  const cancel = () => { if (!busy) { setTarget(null); setError(""); } };
-  const confirm = async () => {
-    if (!target || !mutator.bootstrap) return;
-    setBusy(true); setError("");
-    try {
-      const value = await mutate<WebModelChangeResult>("/models", "POST",
-        { sessionId: view.sessionId, model: target.id, from: view.model.id, confirm: true }, mutator.bootstrap, mutator.refresh);
-      setResult(value); setTarget(null); setDraft(""); refetch();
-    } catch (err) {
-      const code = err instanceof ApiError ? err.code : "unavailable";
-      setError(modelErrorText(code, agent));
-      if (modelErrorRefreshes(code)) refetch();
-    } finally { setBusy(false); }
-  };
-  const submit = (event: FormEvent) => {
-    event.preventDefault();
-    const next = pickTarget(view, draft);
-    if (next) choose(next);
-  };
-  const copy = target ? switchCopy(view.model, target) : undefined;
-  return <div className="space-y-5">
-    <section className={cn(card, "px-6 py-5")} aria-labelledby="model-current">
-      <p className="eyebrow" id="model-current">Model · {session.title}</p>
-      <p className="mt-2 mb-1 text-2xl">{view.model.label}</p>
-      <p className="m-0 font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]">{view.model.id}</p>
-      <p className="mt-3 mb-0 text-[13px] text-muted-foreground">{view.overridden
-        ? `Chosen for this conversation. Without that choice it would use the default, ${view.defaultModel.label}.`
-        : "The default from config.json."}</p>
-      <p className={cn(meta, "mt-2 mb-0")} title="What tomo asks for. The model may run lower if it does not support this level.">Requested effort: {effortText(view.effort)}</p>
-      {view.busy && view.writable && <p className={cn(meta, "mt-2 mb-0")}>{agent} is replying right now. A switch can be made once the reply has finished.</p>}
-      {!view.writable && <p className={cn(meta, "mt-2 mb-0")}>Groups are read-only here. To change a group's model, send /model in that group.</p>}
-      {view.writable && !mutator.live && <p className={cn(meta, "mt-2 mb-0")}>Switching is available while connected.</p>}
-      {result && <p className="mt-3 mb-0 text-[13px]" role="status">{result.status === "switched"
-        ? `Switched from ${result.previous.label} to ${result.model.label}. The next message runs on it.`
-        : `Already on ${result.model.label}; nothing changed.`}</p>}
-    </section>
-
-    {target && copy && <section role="group" aria-labelledby="model-confirm-title" className={cn(card, "rounded-2xl px-6 py-5")}
-      onKeyDown={(event) => { if (event.key === "Escape") { event.preventDefault(); cancel(); } }}>
-      <h2 id="model-confirm-title" className="mt-0 mb-2 font-serif text-[22px] leading-snug font-normal">{copy.title}</h2>
-      <p className="mt-0 mb-3 text-[13px] leading-relaxed text-muted-foreground">{copy.body}</p>
-      <dl className="m-0 grid grid-cols-[56px_minmax(0,1fr)] gap-x-3 gap-y-1 rounded-xl bg-muted px-4 py-3 text-[13px]">
-        <dt className={meta}>From</dt><dd className="m-0">{view.model.label} <span className="font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]">{view.model.id}</span></dd>
-        <dt className={meta}>To</dt><dd className="m-0">{target.label === target.id ? <span className="font-mono text-xs [overflow-wrap:anywhere]">{target.id}</span>
-          : <>{target.label} <span className="font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]">{target.id}</span></>}</dd>
-      </dl>
-      {error && <p className="mt-3 mb-0 text-[13px] text-destructive" role="alert">{error}</p>}
-      <div className="mt-4 flex justify-end gap-2">
-        <Button variant="outline" className="rounded-xl" disabled={busy} onClick={cancel}>Cancel</Button>
-        <Button ref={confirmButton} className="rounded-xl" disabled={busy || !!error || !canSwitch} onClick={() => void confirm()}>{busy ? "Switching…" : "Switch model"}</Button>
-      </div>
-    </section>}
-
-    <section className={cn(card, "px-6 py-5")} aria-labelledby="model-options">
-      <p className="eyebrow mb-2" id="model-options">Models</p>
-      <ul className="m-0 list-none divide-y p-0">{view.options.map((option) => {
-        const active = option.id === view.model.id;
-        return <li key={option.id}>
-          <button type="button" disabled={!canSwitch || active || busy} aria-current={active ? "true" : undefined}
-            onClick={() => choose({ id: option.id, label: option.label })}
-            className="grid w-full grid-cols-[minmax(0,1fr)_auto_20px] items-center gap-3 rounded-lg px-2 py-2.5 text-left text-[13px] enabled:hover:bg-foreground/[0.05] disabled:cursor-default max-[600px]:grid-cols-[minmax(0,1fr)_20px]">
-            <span className="min-w-0"><span className="block truncate">{option.label}</span>
-              <span className={meta}>{option.aliases.join(" · ")}</span></span>
-            <span className="font-mono text-xs text-muted-foreground max-[600px]:hidden">{option.id}</span>
-            <span className="flex justify-end">{active && <Check className="size-4 text-primary" strokeWidth={2} aria-label="Active" />}</span>
-          </button></li>;
-      })}</ul>
-      {view.writable && <form onSubmit={submit} className="mt-4 border-t pt-4">
-        <label htmlFor="model-other" className="mb-1.5 block text-[13px]">Another model</label>
-        <div className="flex gap-2">
-          {/* text-base below md: a focused input under 16px makes iOS Safari zoom the page. */}
-          <Input id="model-other" value={draft} onChange={(e) => setDraft(e.target.value)} maxLength={200} autoComplete="off" spellCheck={false}
-            placeholder="Model id, e.g. claude-opus-4-8" disabled={!canSwitch || busy} className="h-10 rounded-xl bg-card font-mono" />
-          <Button type="submit" variant="outline" className="h-10 rounded-xl" disabled={!canSwitch || busy || !draft.trim()}>Switch…</Button>
-        </div>
-        <p className={cn(meta, "mt-2 mb-0")}>{view.gateway.configured
-          ? view.gateway.chatgptOnly ? `The LiteLLM gateway routes chatgpt/* models only, e.g. ${view.gateway.example}.`
-            : `LiteLLM provider/model names are accepted too, e.g. ${view.gateway.example}.`
-          : "Any direct Claude model id is accepted; it is checked before anything is saved."}</p>
-      </form>}
-    </section>
-  </div>;
 }
 
 const MCP_TONE: Record<string, string> = { connected: "bg-primary", failed: "bg-destructive", "needs-auth": "bg-destructive/70", pending: "bg-muted-foreground", disabled: "bg-border" };

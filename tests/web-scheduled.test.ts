@@ -53,14 +53,14 @@ describe("jumping to a job", () => {
   });
 
   it("renders each job's row with the id the link scrolls to, and says when the linked job is gone", async () => {
-    const { CronList, cronRowId } = await import("../web/src/study.js");
+    const { CronList, cronRowId } = await import("../web/src/study-cron.js");
     const html = renderToStaticMarkup(createElement(CronList, { jobs: [job("abc-123", 1)], focus: "abc-123" }));
     expect(html).toContain(`id="${cronRowId("abc-123")}"`);
     expect(html).not.toContain("no longer scheduled");
     expect(renderToStaticMarkup(createElement(CronList, { jobs: [job("abc-123", 1)], focus: "gone" }))).toContain("That job is no longer scheduled.");
   });
   it("draws the linked job's highlight inside the card, so the scrolling panel cannot clip its sides", async () => {
-    const { CronJobRow } = await import("../web/src/study.js");
+    const { CronJobRow } = await import("../web/src/study-cron.js");
     const html = renderToStaticMarkup(createElement(CronJobRow, { job: job("abc-123", 1), highlighted: true }));
     const row = /<li[^>]*aria-current="true"[^>]*>/.exec(html)?.[0] ?? "";
     expect(row).toMatch(/\bring-2\b/);

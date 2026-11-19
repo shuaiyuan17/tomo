@@ -1,8 +1,8 @@
 import { realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { expandTilde } from "./bash-write-targets.js";
-import { abs, isInside, isInsideExact, realResolve } from "./permission-paths.js";
+import { abs, foldPath, isInside, isInsideExact, realResolve } from "./permission-paths.js";
 import { attachmentPathsIn, barredSearch, effectiveSearchRoot, SEARCH_TOOLS, SEND_MESSAGE_TOOL } from "./private-memory-access.js";
 
 /**
@@ -83,8 +83,19 @@ export const SYSTEM_READ_DIRS: readonly string[] = [
   "/Applications/Xcode.app",
 ];
 
-/** Files under the home directory a login shell and git read at start-up. */
-const HOME_STARTUP_FILES: readonly string[] = [".zshenv", ".zprofile", ".zlogin", ".gitconfig"];
+/**
+ * Names directly in Tomo's home that are denied BY PREFIX: each file Tomo
+ * writes there, together with the siblings its writers create — the config's
+ * `.bak` and hand-made `.bak-*` copies, the atomic writer's `<name>.<pid>.<uuid>.tmp`,
+ * and the `<name>.lock` directories. A prefix, so a sibling made later is
+ * covered without being listed. `data/` and `logs/` are denied as subpaths.
+ *
+ * Normally Tomo's home is outside every allow and these are a second lock. When
+ * the workspace IS Tomo's home (or contains it), they are the only lock.
+ */
+export const TOMO_HOME_DENY_PREFIXES: readonly string[] = [
+  "config.json", "web-token", "web-access.log", "web-status.json", "tomo.pid", "watch.sock",
+];
 
 export interface GroupPathPolicy {
   /** Read-only allows. */
@@ -95,6 +106,8 @@ export interface GroupPathPolicy {
   writeDirs: string[];
   /** Permanent read + write denies; emitted after every allow. */
   denyDirs: string[];
+  /** Permanent read + write denies of every path STARTING WITH one of these. */
+  denyPrefixes: string[];
   /** Permanent write denies; emitted after every allow. */
   writeDenyDirs: string[];
 }
@@ -153,8 +166,11 @@ export function groupPathPolicy(input: GroupPathPolicyInput): GroupPathPolicy {
   const extraRead = (input.entry?.extraRead ?? []).filter(keep).map(expandTilde);
   const extraWrite = (input.entry?.extraWrite ?? []).filter(keep).map(expandTilde);
   return {
-    readDirs: [...SYSTEM_READ_DIRS, join(home, ".config", "git"), ...extraRead],
-    readFiles: HOME_STARTUP_FILES.map((f) => join(home, f)),
+    readDirs: [...SYSTEM_READ_DIRS, ...extraRead],
+    // Nothing from the owner's home: a login shell's start-up files can export
+    // credentials, so the group shell is started without them (`zsh -f`), and
+    // git is pointed away from ~/.gitconfig (GIT_CONFIG_GLOBAL=/dev/null).
+    readFiles: [],
     writeDirs: ["/dev", ...(input.tempDirs ?? defaultTempDirs()), input.workspaceDir, ...extraWrite],
     // FIXED PATHS, never an enumeration of what exists now: a deny list built
     // from `readdir` misses whatever is created after it is built. Everything
@@ -164,10 +180,11 @@ export function groupPathPolicy(input: GroupPathPolicyInput): GroupPathPolicy {
       input.privateDir,
       join(input.workspaceDir, "secrets"),
       ...input.dataDirs,
-      ...(input.tomoHome ? [join(input.tomoHome, "config.json"), join(input.tomoHome, "logs"), join(input.tomoHome, "data")] : []),
+      ...(input.tomoHome ? [join(input.tomoHome, "logs"), join(input.tomoHome, "data")] : []),
       join(home, "Library", "Keychains"),
       join(home, ".ssh"),
     ],
+    denyPrefixes: input.tomoHome ? TOMO_HOME_DENY_PREFIXES.map((name) => join(input.tomoHome!, name)) : [],
     writeDenyDirs: [input.homeSceneDir, join(input.workspaceDir, ".claude")],
   };
 }
@@ -231,6 +248,7 @@ export interface ResolvedGroupPathPolicy {
   readFiles: string[];
   write: string[];
   deny: string[];
+  denyPrefixes: string[];
   writeDeny: string[];
 }
 
@@ -240,15 +258,24 @@ export function resolveGroupPathPolicy(policy: GroupPathPolicy, cwd: string): Re
     readFiles: resolvedAllowDirs(policy.readFiles, cwd),
     write: resolvedAllowDirs(policy.writeDirs, cwd),
     deny: resolvedDenyDirs(policy.denyDirs, cwd),
+    denyPrefixes: policy.denyPrefixes.flatMap((p) => resolvedDenyDirs([dirname(p)], cwd).map((d) => foldPath(join(d, basename(p))))),
     writeDeny: resolvedDenyDirs(policy.writeDenyDirs, cwd),
   };
+}
+
+/** Starts with a denied prefix, as spelled OR as resolved? Case-folded, like
+ *  every deny. */
+function hitsDenyPrefix(p: { spelled: string; real: string }, prefixes: readonly string[]): boolean {
+  const spelled = foldPath(p.spelled);
+  const real = foldPath(p.real);
+  return prefixes.some((pre) => spelled.startsWith(pre) || real.startsWith(pre));
 }
 
 /** Why `p` may not be read on this group turn, or null when it may. */
 function readDenial(p: string, cwd: string, r: ResolvedGroupPathPolicy): string | null {
   const s = spellingsOf(p, cwd);
   if (s === null) return `${p} could not be resolved`;
-  if (hitsDeny(s, r.deny)) return `${p} is never readable from a group turn`;
+  if (hitsDeny(s, r.deny) || hitsDenyPrefix(s, r.denyPrefixes)) return `${p} is never readable from a group turn`;
   if (!inAllow(s, r.read, r.readFiles)) return `${p} is outside what this group may read`;
   return null;
 }
@@ -256,7 +283,7 @@ function readDenial(p: string, cwd: string, r: ResolvedGroupPathPolicy): string 
 function writeDenial(p: string, cwd: string, r: ResolvedGroupPathPolicy): string | null {
   const s = spellingsOf(p, cwd);
   if (s === null) return `${p} could not be resolved`;
-  if (hitsDeny(s, r.deny) || hitsDeny(s, r.writeDeny)) return `${p} is never writable from a group turn`;
+  if (hitsDeny(s, r.deny) || hitsDenyPrefix(s, r.denyPrefixes) || hitsDeny(s, r.writeDeny)) return `${p} is never writable from a group turn`;
   if (!inAllow(s, r.write)) return `${p} is outside what this group may write`;
   return null;
 }
@@ -290,7 +317,7 @@ export function groupPathDenial(
     return WRITE_TOOLS.has(toolName) ? writeDenial(p, cwd, r) : readDenial(p, cwd, r);
   }
   if (isSearch) {
-    if (barredSearch(toolName, toolInput, { cwd, barredDirs: policy.denyDirs })) {
+    if (barredSearch(toolName, toolInput, { cwd, barredDirs: [...policy.denyDirs, ...policy.denyPrefixes] })) {
       return "the search would reach a directory that is never readable from a group turn";
     }
     return readDenial(effectiveSearchRoot(toolName, toolInput, cwd), cwd, r);

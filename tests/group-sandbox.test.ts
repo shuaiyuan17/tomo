@@ -2,7 +2,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 // ---------------------------------------------------------------------------
 // The group path policy (src/agent/group-fs-policy.ts), end to end: the Bash
@@ -54,7 +54,8 @@ vi.mock("../src/logger.js", () => ({
 
 const { groupPathPolicy, groupPathDenial, effectiveGroupSandbox, isValidExtraPath, reachesTomoHome } = await import("../src/agent/group-fs-policy.js");
 const { sandboxedBashCommand, sandboxProfileText, SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH, SANDBOX_MACH_DENY, resolvedDenyDir, shellSingleQuote } = await import("../src/agent/bash-sandbox.js");
-const { privateMemoryGuardHooks } = await import("../src/agent/private-memory-guard.js");
+const { privateMemoryGuardHooks, attachmentBarredFor } = await import("../src/agent/private-memory-guard.js");
+const { DeliveryPipeline } = await import("../src/agent/delivery-pipeline.js");
 
 const CONFIG = join(fx.tomoHome, "config.json");
 const LOG = join(fx.tomoHome, "logs", "tomo.log");
@@ -138,7 +139,8 @@ describe("isValidExtraPath", () => {
 
 describe("Tomo's home: fixed denies, no extra over it", () => {
   it("names the config file, logs and data as fixed paths", () => {
-    expect(policy().denyDirs).toEqual(expect.arrayContaining([CONFIG, join(fx.tomoHome, "logs"), join(fx.tomoHome, "data")]));
+    expect(policy().denyDirs).toEqual(expect.arrayContaining([join(fx.tomoHome, "logs"), join(fx.tomoHome, "data")]));
+    expect(policy().denyPrefixes).toEqual(expect.arrayContaining([CONFIG, join(fx.tomoHome, "web-token")]));
   });
 
   it.each([
@@ -364,6 +366,7 @@ describe.runIf(sandboxRuns)("group Bash under a real sandbox-exec", () => {
         readFiles: resolve(p.readFiles),
         writeDirs: resolve(p.writeDirs),
         denyDirs: resolve(p.denyDirs.filter((d) => d !== KEYCHAINS)),
+        denyPrefixes: p.denyPrefixes.map((x) => join(resolvedDenyDir(dirname(x))!, basename(x))),
         writeDenyDirs: resolve(p.writeDenyDirs),
       });
       return keepMachDeny ? text : text.split("\n").filter((l) => !l.startsWith("(deny mach-lookup")).join("\n");
@@ -378,13 +381,13 @@ describe.runIf(sandboxRuns)("group Bash under a real sandbox-exec", () => {
     });
 
     it.runIf(made)("is readable when both locks are removed (control: the probe really works under sandbox-exec)", () => {
-      const wrapped = `${SANDBOX_EXEC_PATH} -p ${q(profileWithKeychainReadable(false))} ${SANDBOX_SHELL_PATH} -lc -- ${q(find)}`;
+      const wrapped = `${SANDBOX_EXEC_PATH} -p ${q(profileWithKeychainReadable(false))} ${SANDBOX_SHELL_PATH} -f -c -- ${q(find)}`;
       expect(runWrapped(wrapped).out).toContain("rc=0");
     });
 
     it.runIf(made)("is still not readable with the files open, because of the mach deny alone", () => {
       expect(SANDBOX_MACH_DENY).toContain("com.apple.SecurityServer");
-      const wrapped = `${SANDBOX_EXEC_PATH} -p ${q(profileWithKeychainReadable(true))} ${SANDBOX_SHELL_PATH} -lc -- ${q(find)}`;
+      const wrapped = `${SANDBOX_EXEC_PATH} -p ${q(profileWithKeychainReadable(true))} ${SANDBOX_SHELL_PATH} -f -c -- ${q(find)}`;
       expect(runWrapped(wrapped).out).not.toContain("rc=0");
     });
   });
@@ -509,4 +512,143 @@ describe.runIf(sandboxRuns)("group Bash through the guard, executed", () => {
 it("the fixture lies outside the temp dirs a group turn is granted", () => {
   expect(fx.root.startsWith(realpathSync.native(tmpdir()))).toBe(false);
   expect(fx.root.startsWith("/private/tmp")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// Outbound attachments: a group ships only what it may read
+// ---------------------------------------------------------------------------
+
+describe("attachments from a group turn", () => {
+  const outside = join(fx.userHome, ".aws", "credentials.png");
+  const inside = join(fx.ws, "notes", "cat.png");
+  write(outside, "AWS-SECRET\n");
+  write(inside, "PNG\n");
+  const barred = (path: string, entry?: { extraRead?: string[]; unsandboxed?: boolean }) => attachmentBarredFor(
+    path,
+    "group-session",
+    GROUP,
+    () => undefined,
+    () => ({ groups: entry ? { [GROUP]: { extraRead: entry.extraRead ?? [], extraWrite: [], unsandboxed: entry.unsandboxed ?? false } } : {} }),
+  );
+
+  it("drops a file outside the group's read policy, ships one inside it", () => {
+    expect(barred(outside)).toBe(true);
+    expect(barred(EXTERNAL)).toBe(true);
+    expect(barred(inside)).toBe(false);
+    expect(barred(SECRET)).toBe(true);
+    expect(barred(join(fx.tomoHome, "config.json.bak"))).toBe(true);
+  });
+
+  it("follows the group's extras, and an unsandboxed group keeps only the hard denies", () => {
+    expect(barred(EXTERNAL, { extraRead: [fx.external] })).toBe(false);
+    expect(barred(outside, { unsandboxed: true })).toBe(false);
+    expect(barred(PRIVATE, { unsandboxed: true })).toBe(true);
+  });
+
+  it("reply delivery uses it: the outside picture is dropped, the words still go", async () => {
+    const sent: Array<{ text?: string; photo?: string }> = [];
+    const channel = {
+      name: "telegram",
+      onMessage() {}, onCommand() {},
+      async send(m: { text?: string; photo?: string }) { sent.push(m); },
+      startTyping: () => () => {},
+      async start() {}, closeIngestion() {}, async quiesce() {}, async teardown() {}, async stop() {},
+    };
+    const pipeline = new DeliveryPipeline({ queuePendingErrorNote: () => {} });
+    const sender = pipeline.createBlockSender(channel as never, "-100", { blockPrivateMedia: () => true, attachmentBarred: (p) => barred(p) });
+    await sender.deliver(`here MEDIA:"${outside}" MEDIA:"${inside}"`);
+    expect(sent.filter((m) => m.photo).map((m) => m.photo)).toEqual([inside]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The owner's shell start-up files never run in a group shell
+// ---------------------------------------------------------------------------
+
+describe.runIf(sandboxRuns)("start-up files", () => {
+  write(join(fx.userHome, ".zshenv"), "export ZSHENV_LEAK=from-zshenv\n");
+  write(join(fx.userHome, ".zprofile"), "export ZPROFILE_LEAK=from-zprofile\n");
+
+  it("a login shell with that HOME would export them (control)", () => {
+    const r = spawnSync("/bin/zsh", ["-lc", "env"], { encoding: "utf8", env: { ...process.env, HOME: fx.userHome } });
+    expect(r.stdout).toContain("ZSHENV_LEAK=from-zshenv");
+    expect(r.stdout).toContain("ZPROFILE_LEAK=from-zprofile");
+  });
+
+  it("the group shell does not run them", () => {
+    const r = run("env");
+    expect(r.code).toBe(0);
+    expect(r.out).not.toContain("ZSHENV_LEAK");
+    expect(r.out).not.toContain("ZPROFILE_LEAK");
+  });
+
+  // Second lock, tested on its own: a HOME inside the workspace is readable,
+  // so only `zsh -f` keeps its start-up files from running.
+  it("does not run them even where they are readable", () => {
+    const readableHome = join(fx.ws, "notes", "fake-home");
+    write(join(readableHome, ".zshenv"), "export ZSHENV_LEAK=from-zshenv\n");
+    write(join(readableHome, ".zprofile"), "export ZPROFILE_LEAK=from-zprofile\n");
+    const wrapped = sandboxedBashCommand("env", policy())!;
+    const r = spawnSync("/bin/zsh", ["-lc", wrapped], { encoding: "utf8", cwd: fx.ws, env: { ...process.env, HOME: readableHome } });
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain(`HOME=${readableHome}`);
+    expect(r.stdout).not.toContain("ZSHENV_LEAK");
+    expect(r.stdout).not.toContain("ZPROFILE_LEAK");
+  });
+
+  it("git still works without the owner's ~/.gitconfig", () => {
+    const r = run(`cd ${q(join(fx.ws, "notes"))} && git init -q repo && cd repo && git status --short && echo git-ok`);
+    expect(r).toMatchObject({ code: 0 });
+    expect(r.out).toContain("git-ok");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The workspace IS Tomo's home (TOMO_WORKSPACE pointed at it)
+// ---------------------------------------------------------------------------
+
+describe("workspace equal to Tomo's home", () => {
+  const home = join(fx.root, "ws-is-home");
+  const files: Record<string, string> = {
+    "config.json": "CFG",
+    "config.json.bak": "CFG-BAK",
+    "config.json.bak-manual": "CFG-BAK2",
+    "config.json.123.abcd.tmp": "CFG-TMP",
+    "web-token": "WEB-TOKEN",
+    "web-token.abcd.tmp": "WEB-TOKEN-TMP",
+    "web-access.log": "WEB-ACCESS",
+    "web-status.json": "WEB-STATUS",
+    "tomo.pid": "PID",
+    "logs/tomo.log": "LOGS",
+    "data/usage/x.ndjson": "DATA",
+    "secrets/k": "SECRETS",
+  };
+  for (const [rel, body] of Object.entries(files)) write(join(home, rel), `${body}-SECRET\n`);
+  write(join(home, "notes.md"), "NOTES\n");
+  const wsPolicy = () => groupPathPolicy({
+    workspaceDir: home,
+    privateDir: join(home, "memory", "private"),
+    homeSceneDir: join(home, "home"),
+    tomoHome: home,
+    dataDirs: [join(home, "data")],
+    userHome: fx.userHome,
+  });
+
+  it.each(Object.keys(files))("file tools cannot read %s", (rel) => {
+    expect(groupPathDenial("Read", { file_path: join(home, rel) }, home, wsPolicy())).not.toBeNull();
+  });
+
+  it("file tools read an ordinary file there", () => {
+    expect(groupPathDenial("Read", { file_path: join(home, "notes.md") }, home, wsPolicy())).toBeNull();
+  });
+
+  it.runIf(sandboxRuns)("the shell cannot read any of them, at any spelling, and reads the rest", () => {
+    const cmd = Object.keys(files).map((rel) => `cat ${q(join(home, rel))}`).join("; ");
+    const r = run(`${cmd}; cat ${q(join(home, "notes.md"))}`, wsPolicy());
+    for (const body of Object.values(files)) expect(r.out).not.toContain(`${body}-SECRET`);
+    expect(r.out).toContain("NOTES");
+    // A sibling created after the policy was built is covered by the prefix.
+    write(join(home, "config.json.later"), "LATER-SECRET\n");
+    expect(run(`cat ${q(join(home, "config.json.later"))}`, wsPolicy()).out).not.toContain("LATER-SECRET");
+  });
 });

@@ -357,6 +357,8 @@ export interface TurnRunnerDeps {
    *  the outbound half of the fence whose inbound half is the PreToolUse guard
    *  in agent/permissions.ts. */
   isPrivateMemoryBarred(sessionKey: string): boolean;
+  /** On a barred turn, must this attachment be dropped? (Agent.isAttachmentBarred.) */
+  isAttachmentBarred?(sessionKey: string, path: string): boolean;
   delivery: DeliveryPipeline;
   /**
    * Pause before the one re-send of a block whose send put nothing on the
@@ -750,6 +752,7 @@ export class TurnRunner {
             {
               ...(reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {}),
               blockPrivateMedia: () => this.deps.isPrivateMemoryBarred(spec.key),
+              ...(this.deps.isAttachmentBarred ? { attachmentBarred: (p: string) => this.deps.isAttachmentBarred!(spec.key, p) } : {}),
             },
           );
           if (spec.transcript === "on-delivery") {
@@ -882,6 +885,7 @@ export class TurnRunner {
           {
             ...(reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {}),
             blockPrivateMedia: () => this.deps.isPrivateMemoryBarred(spec.key),
+            ...(this.deps.isAttachmentBarred ? { attachmentBarred: (p: string) => this.deps.isAttachmentBarred!(spec.key, p) } : {}),
           },
         );
       }

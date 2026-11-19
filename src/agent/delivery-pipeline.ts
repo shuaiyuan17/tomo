@@ -203,6 +203,12 @@ export interface DeliverOptions {
    * Left undefined (tests, callers with no audience notion) nothing is dropped.
    */
   blockPrivateMedia?: () => boolean;
+  /**
+   * Given that the turn is barred, must this attachment path be dropped? The
+   * group-aware question (`Agent.isAttachmentBarred`): a sandboxed group may
+   * ship only what it may read. Absent, the private-memory check alone.
+   */
+  attachmentBarred?: (path: string) => boolean;
 }
 
 /**
@@ -374,7 +380,7 @@ export class DeliveryPipeline {
           // the segment stays not-known-delivered and the transcript records
           // the picture as unsent — while the caption falls through to
           // `deliverText` below and the reader still gets the words.
-          if (barred && isPrivateAttachmentPath(path)) {
+          if (barred && (options.attachmentBarred ?? isPrivateAttachmentPath)(path)) {
             log.warn({ chatId, path }, "Dropped a private-memory attachment: this turn's audience may not read memory/private/");
             withheld = true;
             continue;
@@ -443,7 +449,7 @@ export class DeliveryPipeline {
           // back to a plain attachment send), so it is the same read a MEDIA:
           // path is and gets the same check. Dropped like a private picture:
           // never attempted, recorded as not delivered.
-          if (barred && isPrivateAttachmentPath(id)) {
+          if (barred && (options.attachmentBarred ?? isPrivateAttachmentPath)(id)) {
             log.warn({ chatId, sticker: id }, "Dropped a private-memory sticker: this turn's audience may not read memory/private/");
             withheld = true;
             continue;

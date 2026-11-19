@@ -11,7 +11,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 // ---------------------------------------------------------------------------
@@ -85,16 +85,17 @@ const { SYSTEM_READ_DIRS, defaultTempDirs } = await import("../src/agent/group-f
 function policyFor(privateDir: string, writeOnly: readonly string[] = [], deny: readonly string[] = []) {
   return {
     readDirs: [...SYSTEM_READ_DIRS],
-    readFiles: [".zshenv", ".zprofile", ".zlogin", ".gitconfig"].map((f) => join(homedir(), f)),
+    readFiles: [] as string[],
     writeDirs: ["/dev", ...defaultTempDirs()],
     denyDirs: [privateDir, ...deny],
+    denyPrefixes: [] as string[],
     writeDenyDirs: [...writeOnly],
   };
 }
 
 /** A resolved policy for the pure profile-text tests. */
-function resolvedProfile(over: Partial<{ readDirs: string[]; readFiles: string[]; writeDirs: string[]; denyDirs: string[]; writeDenyDirs: string[] }> = {}) {
-  return { readDirs: [], readFiles: [], writeDirs: [], denyDirs: [], writeDenyDirs: [], ...over };
+function resolvedProfile(over: Partial<{ readDirs: string[]; readFiles: string[]; writeDirs: string[]; denyDirs: string[]; denyPrefixes: string[]; writeDenyDirs: string[] }> = {}) {
+  return { readDirs: [], readFiles: [], writeDirs: [], denyDirs: [], denyPrefixes: [], writeDenyDirs: [], ...over };
 }
 
 const scratch: string[] = [OLD_TOMO_HOME];
@@ -131,8 +132,8 @@ describe("wrapWithSandbox — the exact command the Bash tool will run", () => {
     // of the same turn ran unsandboxed. `-p` puts the policy in this process's
     // argv, where the sandboxed command cannot reach it at all.
     const wrapped = wrapWithSandbox("ls -la /tmp", PROFILE);
-    expect(wrapped).toBe(`${ENV_ALLOWLIST_PREFIX} /usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- 'ls -la /tmp'`);
-    expect(wrapped).not.toContain("-f ");
+    expect(wrapped).toBe(`${ENV_ALLOWLIST_PREFIX} /usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -f -c -- 'ls -la /tmp'`);
+    expect(wrapped).not.toMatch(/sandbox-exec -f /);
     expect(wrapped).not.toContain(".sb");
   });
 
@@ -140,20 +141,20 @@ describe("wrapWithSandbox — the exact command the Bash tool will run", () => {
     // Without it, `zsh -lc '-n …'` is `zsh: bad option string` and the command
     // never runs at all — zsh reads the leading dash as one of its own flags.
     expect(wrapWithSandbox("-n true || echo fell-through", PROFILE))
-      .toBe(`${ENV_ALLOWLIST_PREFIX} /usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- '-n true || echo fell-through'`);
+      .toBe(`${ENV_ALLOWLIST_PREFIX} /usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -f -c -- '-n true || echo fell-through'`);
   });
 
   it("escapes single quotes by closing, quoting and reopening", () => {
     // `'` → `'\''`: the only character a single-quoted shell word cannot hold.
     expect(wrapWithSandbox(`echo 'hi there'`, PROFILE)).toBe(
-      `${ENV_ALLOWLIST_PREFIX} /usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- 'echo '\\''hi there'\\'''`,
+      `${ENV_ALLOWLIST_PREFIX} /usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -f -c -- 'echo '\\''hi there'\\'''`,
     );
   });
 
   it("carries a multi-line heredoc through unchanged", () => {
     const heredoc = ["cat <<'EOF'", "line one with 'quotes'", "  line two", "EOF"].join("\n");
     expect(wrapWithSandbox(heredoc, PROFILE)).toBe(
-      `${ENV_ALLOWLIST_PREFIX} /usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -lc -- `
+      `${ENV_ALLOWLIST_PREFIX} /usr/bin/sandbox-exec -p ${QUOTED} /bin/zsh -f -c -- `
       + `'cat <<'\\''EOF'\\''\nline one with '\\''quotes'\\''\n  line two\nEOF'`,
     );
   });
@@ -443,6 +444,7 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
       readFiles: policy.readFiles.map((d) => resolvedDenyDir(d)!),
       writeDirs: policy.writeDirs.map((d) => resolvedDenyDir(d)!),
       denyDirs: [dir],
+      denyPrefixes: [],
       writeDenyDirs: [home],
     })));
   });

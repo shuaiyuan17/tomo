@@ -68,11 +68,14 @@ export const SANDBOX_EXEC_PATH = "/usr/bin/sandbox-exec";
 
 /** The shell the wrapped command is handed to, also absolute.
  *
- *  `-l` and not just `-c`: the Bash tool's own shell is a login shell, and a
- *  command that resolves a tool through `~/.zprofile`'s PATH must keep
- *  resolving it. Non-interactive, so `~/.zshrc` is not read and nothing
- *  interactive can print into the captured output. */
+ *  Started with `-f` (no start-up files) and `-c`, NOT as a login shell: the
+ *  owner's `~/.zshenv` / `~/.zprofile` run as the owner and can export
+ *  credentials straight back into an environment `env -i` just emptied. PATH
+ *  comes from the Bash tool's own shell through the env allowlist instead. */
 export const SANDBOX_SHELL_PATH = "/bin/zsh";
+
+/** The inner shell's flags: no start-up files, run the script. */
+export const SANDBOX_SHELL_FLAGS: readonly string[] = ["-f", "-c"];
 
 /**
  * Mach services a group shell may not look up, though `mach-lookup` is
@@ -105,6 +108,8 @@ export interface ResolvedSandboxPolicy {
   readFiles: readonly string[];
   writeDirs: readonly string[];
   denyDirs: readonly string[];
+  /** Read + write denies of every path starting with one of these. */
+  denyPrefixes: readonly string[];
   writeDenyDirs: readonly string[];
 }
 
@@ -151,6 +156,10 @@ export function sandboxProfileText(policy: ResolvedSandboxPolicy): string {
     ...policy.denyDirs.flatMap((dir) => [
       `(deny file-read* ${sub(dir)})`,
       `(deny file-write* ${sub(dir)})`,
+    ]),
+    ...policy.denyPrefixes.flatMap((prefix) => [
+      `(deny file-read* (prefix ${sandboxLiteral(prefix)}))`,
+      `(deny file-write* (prefix ${sandboxLiteral(prefix)}))`,
     ]),
     ...policy.writeDenyDirs.map((dir) => `(deny file-write* ${sub(dir)})`),
     ...SANDBOX_MACH_DENY.map((name) => `(deny mach-lookup (global-name ${sandboxLiteral(name)}))`),
@@ -207,6 +216,9 @@ export const ENV_ALLOWLIST_PREFIX = [
   "/usr/bin/env",
   "-i",
   ...SANDBOX_ENV_ALLOWLIST.map((name) => "${" + name + "+\"" + name + "=$" + name + "\"}"),
+  // git reads ~/.gitconfig on every run and stops when it cannot; the owner's
+  // home is not readable, so point it at nothing.
+  "GIT_CONFIG_GLOBAL=/dev/null",
 ].join(" ");
 
 /**
@@ -226,7 +238,7 @@ export function wrapWithSandbox(command: string, profileText: string): string {
     "-p",
     shellSingleQuote(profileText),
     SANDBOX_SHELL_PATH,
-    "-lc",
+    ...SANDBOX_SHELL_FLAGS,
     "--",
     shellSingleQuote(command),
   ].join(" ");
@@ -456,6 +468,14 @@ export function sandboxedBashCommand(
     if (resolved === null) return warnOnce(`cannot resolve the real path of ${dir}, so its subpath cannot be denied`);
     denyDirs.push(resolved);
   }
+  // A prefix is resolved through its directory: the kernel matches the real
+  // path, and the last component is a name prefix, not a directory.
+  const denyPrefixes: string[] = [];
+  for (const prefix of policy.denyPrefixes) {
+    const dir = resolvedDenyDir(dirname(prefix));
+    if (dir === null) return warnOnce(`cannot resolve the real path of ${dirname(prefix)}, so ${basename(prefix)}* cannot be denied`);
+    denyPrefixes.push(join(dir, basename(prefix)));
+  }
   const writeDenyDirs: string[] = [];
   for (const dir of policy.writeDenyDirs) {
     const resolved = resolvedDenyDir(dir);
@@ -472,6 +492,7 @@ export function sandboxedBashCommand(
       readFiles: allow(policy.readFiles),
       writeDirs: allow(policy.writeDirs),
       denyDirs,
+      denyPrefixes,
       writeDenyDirs,
     }));
   } catch {

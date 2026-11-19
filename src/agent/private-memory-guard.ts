@@ -378,6 +378,28 @@ function groupEntryFor(
   return entry ? { key, entry } : undefined;
 }
 
+/**
+ * May this barred turn SHIP `path` as an attachment (`MEDIA:` / `STICKER:`)?
+ * True when it must be dropped. The attachment is a read — the channel opens
+ * the file and puts it in the chat — so a sandboxed group is held to the same
+ * read policy as its file tools (allowed roots and extras, minus the permanent
+ * denies); an unsandboxed group to the private-memory and permanent denies
+ * alone. Used by reply delivery and by direct sends; the tool guard judges
+ * `send_message` the same way.
+ */
+export function attachmentBarredFor(
+  path: string,
+  bar: PrivateMemoryBar,
+  sessionKey: string,
+  scopedCallerKey: () => string | undefined,
+  groupSandbox: () => GroupSandboxConfig | undefined,
+): boolean {
+  if (isPrivateAttachmentPath(path)) return true;
+  const group = groupEntryFor(bar, sessionKey, groupSandbox, scopedCallerKey);
+  if (group?.entry.unsandboxed) return false;
+  return groupPathDenial("Read", { file_path: expandTilde(path) }, config.workspaceDir, groupPolicy(group?.entry)) !== null;
+}
+
 /** The group path policy for this turn, from config and the group's entry. */
 export function groupPolicy(entry: Pick<GroupSandboxEntry, "extraRead" | "extraWrite"> | undefined, dataDirs: readonly string[] = harnessDataDirs()): GroupPathPolicy {
   return groupPathPolicy({
@@ -479,6 +501,8 @@ export function isPrivateAttachmentPath(p: string): boolean {
   // so is every other permanent deny of the group path policy (secrets/, the
   // config file and the rest of Tomo's home, the keychains, ~/.ssh): what no
   // group turn may read, no group turn may ship as an attachment either.
-  const denies = [...harnessDataDirs(), ...groupPolicy(undefined).denyDirs];
-  return denies.some((dir) => landsInPrivate(path, { cwd: config.workspaceDir, memoryDir: dir, privateDir: dir }));
+  const policy = groupPolicy(undefined);
+  const denies = [...harnessDataDirs(), ...policy.denyDirs];
+  if (denies.some((dir) => landsInPrivate(path, { cwd: config.workspaceDir, memoryDir: dir, privateDir: dir }))) return true;
+  return groupPathDenial("Read", { file_path: path }, config.workspaceDir, { ...policy, readDirs: ["/"], writeDirs: [] }) !== null;
 }

@@ -504,5 +504,5 @@ export function isPrivateAttachmentPath(p: string): boolean {
   const policy = groupPolicy(undefined);
   const denies = [...harnessDataDirs(), ...policy.denyDirs];
   if (denies.some((dir) => landsInPrivate(path, { cwd: config.workspaceDir, memoryDir: dir, privateDir: dir }))) return true;
-  return groupPathDenial("Read", { file_path: path }, config.workspaceDir, { ...policy, readDirs: ["/"], writeDirs: [] }) !== null;
+  return groupPathDenial("Read", { file_path: path }, config.workspaceDir, { ...policy, readDirs: ["/"], writeDirs: [], unresolvable: undefined }) !== null;
 }

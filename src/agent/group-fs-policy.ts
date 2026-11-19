@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { expandTilde } from "./bash-write-targets.js";
@@ -110,6 +110,9 @@ export interface GroupPathPolicy {
   denyPrefixes: string[];
   /** Permanent write denies; emitted after every allow. */
   writeDenyDirs: string[];
+  /** Set when a protected entry is a symlink whose target cannot be
+   *  established: the turn gets no shell and no file tools (fail closed). */
+  unresolvable?: string;
 }
 
 export interface GroupPathPolicyInput {
@@ -160,8 +163,49 @@ export function reachesTomoHome(extra: string, tomoHome: string | undefined, wor
   return isInside(e, home) && !isInside(e, ws);
 }
 
+/**
+ * The targets of protected entries in Tomo's home that are SYMLINKS.
+ *
+ * A prefix deny is matched against the path the kernel opens, and a symlink is
+ * opened at its target: `~/.tomo/config.json -> <workspace>/x` would leave the
+ * config readable through the workspace allow. So every entry a prefix covers
+ * is lstat'd, and a link's real target is denied too. A link whose target
+ * cannot be resolved (dangling, a loop), or a home that cannot be listed,
+ * yields `unresolvable`: no shell, no file tools, rather than a deny that
+ * might name the wrong place. A missing home has nothing to protect.
+ */
+export function protectedLinkTargets(tomoHome: string | undefined): { targets: string[]; unresolvable?: string } {
+  if (!tomoHome) return { targets: [] };
+  let names: string[];
+  try {
+    names = readdirSync(tomoHome);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { targets: [] };
+    return { targets: [], unresolvable: `Tomo's home (${tomoHome}) cannot be listed` };
+  }
+  const targets: string[] = [];
+  for (const name of names) {
+    if (!TOMO_HOME_DENY_PREFIXES.some((prefix) => name.startsWith(prefix))) continue;
+    const entry = join(tomoHome, name);
+    let link: boolean;
+    try {
+      link = lstatSync(entry).isSymbolicLink();
+    } catch {
+      continue; // gone since readdir
+    }
+    if (!link) continue;
+    try {
+      targets.push(realpathSync.native(entry));
+    } catch {
+      return { targets, unresolvable: `${entry} is a symlink whose target cannot be resolved` };
+    }
+  }
+  return { targets };
+}
+
 export function groupPathPolicy(input: GroupPathPolicyInput): GroupPathPolicy {
   const home = input.userHome ?? homedir();
+  const links = protectedLinkTargets(input.tomoHome);
   const keep = (p: string) => isValidExtraPath(p, home) && !reachesTomoHome(expandTilde(p), input.tomoHome, input.workspaceDir);
   const extraRead = (input.entry?.extraRead ?? []).filter(keep).map(expandTilde);
   const extraWrite = (input.entry?.extraWrite ?? []).filter(keep).map(expandTilde);
@@ -183,9 +227,11 @@ export function groupPathPolicy(input: GroupPathPolicyInput): GroupPathPolicy {
       ...(input.tomoHome ? [join(input.tomoHome, "logs"), join(input.tomoHome, "data")] : []),
       join(home, "Library", "Keychains"),
       join(home, ".ssh"),
+      ...links.targets,
     ],
     denyPrefixes: input.tomoHome ? TOMO_HOME_DENY_PREFIXES.map((name) => join(input.tomoHome!, name)) : [],
     writeDenyDirs: [input.homeSceneDir, join(input.workspaceDir, ".claude")],
+    ...(links.unresolvable ? { unresolvable: links.unresolvable } : {}),
   };
 }
 
@@ -310,6 +356,7 @@ export function groupPathDenial(
   const pathTool = READ_TOOLS.has(toolName) || WRITE_TOOLS.has(toolName);
   const isSearch = SEARCH_TOOLS.has(toolName);
   if (!pathTool && !isSearch && toolName !== SEND_MESSAGE_TOOL) return null;
+  if (policy.unresolvable) return `the sandbox for this turn cannot be established (${policy.unresolvable})`;
   const r = resolveGroupPathPolicy(policy, cwd);
   if (pathTool) {
     const p = toolName === "NotebookEdit" ? ti.notebook_path : ti.file_path;

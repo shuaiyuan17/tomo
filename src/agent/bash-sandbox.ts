@@ -457,6 +457,7 @@ export function sandboxedBashCommand(
   // A foreign PreToolUse hook can overwrite our rewrite — see
   // `foreignPreToolUseHookSource`. Checked before the wrap is built, because the
   // answer is "no shell", not "a different shell".
+  if (policy.unresolvable) return warnOnce(policy.unresolvable);
   const foreign = scan ? foreignPreToolUseHookSource(scan) : null;
   if (foreign) {
     return warnOnce(`a foreign PreToolUse hook could rewrite the sandbox away: ${foreign}`);

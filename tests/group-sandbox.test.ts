@@ -652,3 +652,55 @@ describe("workspace equal to Tomo's home", () => {
     expect(run(`cat ${q(join(home, "config.json.later"))}`, wsPolicy()).out).not.toContain("LATER-SECRET");
   });
 });
+
+// ---------------------------------------------------------------------------
+// A protected entry that is itself a symlink
+// ---------------------------------------------------------------------------
+
+describe("a protected entry in Tomo's home that is a symlink", () => {
+  const home = join(fx.root, "linked-home");
+  const ws = join(home, "workspace");
+  const target = join(ws, "notes", "looks-harmless.json");
+  write(target, "LINKED-SECRET\n");
+  write(join(ws, "notes", "ok.md"), "OK\n");
+  symlinkSync(target, join(home, "config.json"));
+  const linkedPolicy = () => groupPathPolicy({
+    workspaceDir: ws,
+    privateDir: join(ws, "memory", "private"),
+    homeSceneDir: join(ws, "home"),
+    tomoHome: home,
+    dataDirs: [join(home, "data")],
+    userHome: fx.userHome,
+  });
+
+  it("denies the link's target too, for reads and writes", () => {
+    expect(linkedPolicy().denyDirs).toContain(target);
+    expect(groupPathDenial("Read", { file_path: target }, ws, linkedPolicy())).not.toBeNull();
+    expect(groupPathDenial("Write", { file_path: target, content: "x" }, ws, linkedPolicy())).not.toBeNull();
+    expect(groupPathDenial("Read", { file_path: join(ws, "notes", "ok.md") }, ws, linkedPolicy())).toBeNull();
+  });
+
+  it.runIf(sandboxRuns)("the shell can neither read nor write the target", () => {
+    const r = run(`cat ${q(target)}; cat ${q(join(home, "config.json"))}; echo x >> ${q(target)}; cat ${q(join(ws, "notes", "ok.md"))}`, linkedPolicy());
+    expect(r.out).not.toContain("LINKED-SECRET");
+    expect(r.out).toContain("OK");
+    expect(readFileSync(target, "utf8")).toBe("LINKED-SECRET\n");
+  });
+
+  it("a link whose target cannot be resolved fails closed: no file tools, no shell", () => {
+    const dangling = join(fx.root, "dangling-home");
+    mkdirSync(join(dangling, "workspace"), { recursive: true });
+    symlinkSync(join(dangling, "nowhere"), join(dangling, "web-token"));
+    const p = groupPathPolicy({
+      workspaceDir: join(dangling, "workspace"),
+      privateDir: join(dangling, "workspace", "memory", "private"),
+      homeSceneDir: join(dangling, "workspace", "home"),
+      tomoHome: dangling,
+      dataDirs: [],
+      userHome: fx.userHome,
+    });
+    expect(p.unresolvable).toContain("web-token");
+    expect(groupPathDenial("Read", { file_path: join(dangling, "workspace", "a.md") }, join(dangling, "workspace"), p)).toMatch(/cannot be established/);
+    expect(sandboxedBashCommand("ls", p)).toBeNull();
+  });
+});

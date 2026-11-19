@@ -27,7 +27,8 @@ describe("the permission card", () => {
   it("shows the group, the access, the path and the unverified reason, with exactly three answers", () => {
     const html = renderToStaticMarkup(createElement(PermissionCard, { request, bootstrap, refresh: async () => bootstrap }));
     for (const text of ["Weekend project", "Write", "/srv/checkouts/app", "run the test suite", "not verified"]) expect(html).toContain(text);
-    const buttons = [...html.matchAll(/<button[^>]*>(.*?)<\/button>/g)].map((m) => m[1].replace(/<[^>]+>/g, ""));
+    // A button's label is its text between tags (icons render as empty <svg> elements).
+    const buttons = [...html.matchAll(/<button[^>]*>(.*?)<\/button>/g)].map((m) => m[1].split(/<[^>]*>/).filter(Boolean).join(""));
     expect(buttons).toEqual(["Triggering call", "Allow once", "Always allow", "Deny"]);
   });
 

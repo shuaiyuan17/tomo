@@ -55,6 +55,8 @@ const { effectiveGroupSandbox } = await import("../src/agent/group-fs-policy.js"
 const { TurnAudienceRegistry } = await import("../src/agent/audience.js");
 const { SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH, shellSingleQuote } = await import("../src/agent/bash-sandbox.js");
 type Broker = InstanceType<typeof PermissionBroker>;
+/** Profile TEXT exists only where Bash is really rewritten (macOS with sandbox-exec); elsewhere the guard withholds the shell. */
+const sandboxRuns = process.platform === "darwin" && existsSync(SANDBOX_EXEC_PATH) && existsSync(SANDBOX_SHELL_PATH);
 type Outcome = "allowed_once" | "allowed_always" | "denied" | "timed_out";
 
 const GROUP = "telegram:-100777";
@@ -141,13 +143,18 @@ function sandboxFor(broker: Broker, sessionKey: string, opts: { once: boolean } 
   return opts.once ? broker.withOnceGrants(base, sessionKey) : base;
 }
 
+/** The `once` flag the guard asked the config with, per call (platform-neutral: no profile needed). */
+const onceAsked: { tool: string; once: boolean }[] = [];
+
 /** The guard as a group session's live session installs it. */
 function guard(broker: Broker, sessionKey = GROUP) {
-  const hooks = privateMemoryGuardHooks(sessionKey, () => "group-session", () => [], (opts) => sandboxFor(broker, sessionKey, opts), () => sessionKey,
+  let tool = "";
+  const hooks = privateMemoryGuardHooks(sessionKey, () => "group-session", () => [], (opts) => { onceAsked.push({ tool, once: opts.once }); return sandboxFor(broker, sessionKey, opts); }, () => sessionKey,
     (text) => broker.noteCall(sessionKey, text));
-  return hooks.PreToolUse[0].hooks[0] as (input: { tool_name: string; tool_input: unknown; agent_id?: string }) => Promise<{
+  const hook = hooks.PreToolUse[0].hooks[0] as (input: { tool_name: string; tool_input: unknown; agent_id?: string }) => Promise<{
     hookSpecificOutput?: { permissionDecision?: string; updatedInput?: { command?: string } };
   }>;
+  return (input: { tool_name: string; tool_input: unknown; agent_id?: string }) => { tool = input.tool_name; return hook(input); };
 }
 
 async function readAllowed(broker: Broker, path = EXTERNAL): Promise<boolean> {
@@ -237,20 +244,38 @@ describe("who an Allow once reaches", () => {
     h.turns.end(GROUP, answer);
   });
 
-  it("never a Bash profile, foreground or background, main agent or not; the file tools do get it", async () => {
+  it("never a Bash call, foreground or background, main agent or not; the file tools do get it", async () => {
     const h = harness();
     const { id } = await ask(h, fx.external, "write");
     h.broker.decide(id, "once", "web");
     const answer = h.answerTurn();
-    const grantLine = `(subpath "${fx.external}")`;
+    onceAsked.length = 0;
     for (const tool_input of [{ command: "true" }, { command: "setsid sleep 600 &", run_in_background: true }]) {
-      const r = await guard(h.broker)({ tool_name: "Bash", tool_input });
-      expect(r.hookSpecificOutput?.updatedInput?.command).toBeDefined();
-      expect(r.hookSpecificOutput?.updatedInput?.command).not.toContain(grantLine);
+      await guard(h.broker)({ tool_name: "Bash", tool_input });
     }
+    const bashAsked = onceAsked.filter((a) => a.tool === "Bash");
+    expect(bashAsked.length).toBeGreaterThan(0);
+    expect(bashAsked.every((a) => a.once === false)).toBe(true);
+    // What a once:false caller gets has no trace of the grant.
+    const shellView = sandboxFor(h.broker, GROUP, { once: false }).groups[GROUP];
+    expect([...(shellView?.extraRead ?? []), ...(shellView?.extraWrite ?? [])]).not.toContain(fx.external);
+    expect(sandboxFor(h.broker, GROUP, { once: true }).groups[GROUP].extraWrite).toContain(fx.external);
     expect(await readAllowed(h.broker)).toBe(true);
     const write = await guard(h.broker)({ tool_name: "Write", tool_input: { file_path: join(fx.external, "new.txt"), content: "x" } });
     expect(write.hookSpecificOutput?.permissionDecision).not.toBe("deny");
+    h.turns.end(GROUP, answer);
+  });
+
+  it.runIf(sandboxRuns)("…and the Bash profile text has no trace of it (macOS)", async () => {
+    const h = harness();
+    const { id } = await ask(h, fx.external, "write");
+    h.broker.decide(id, "once", "web");
+    const answer = h.answerTurn();
+    for (const tool_input of [{ command: "true" }, { command: "setsid sleep 600 &", run_in_background: true }]) {
+      const r = await guard(h.broker)({ tool_name: "Bash", tool_input });
+      expect(r.hookSpecificOutput?.updatedInput?.command).toBeDefined();
+      expect(r.hookSpecificOutput?.updatedInput?.command).not.toContain(`(subpath "${fx.external}")`);
+    }
     h.turns.end(GROUP, answer);
   });
 
@@ -258,15 +283,19 @@ describe("who an Allow once reaches", () => {
     const h = harness();
     const { id } = await ask(h);
     h.broker.decide(id, "always", "web");
-    const bg = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true", run_in_background: true }, agent_id: "agent-1" });
-    expect(bg.hookSpecificOutput?.updatedInput?.command).toContain(`(subpath "${fx.external}")`);
+    expect(sandboxFor(h.broker, GROUP, { once: false }).groups[GROUP].extraRead).toContain(fx.external);
+    if (sandboxRuns) {
+      const bg = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true", run_in_background: true }, agent_id: "agent-1" });
+      expect(bg.hookSpecificOutput?.updatedInput?.command).toContain(`(subpath "${fx.external}")`);
+    }
   });
 });
 
 describe("asking the owner", () => {
   it("DMs four lines with a code and opens a card with the resolved path", async () => {
     const h = harness();
-    await guard(h.broker)({ tool_name: "Bash", tool_input: { command: `cat ${EXTERNAL}` } });
+    // The trigger: a file-tool call the policy refused (a sandboxed Bash command is noted the same way on macOS).
+    await guard(h.broker)({ tool_name: "Read", tool_input: { file_path: EXTERNAL } });
     const pending = await ask(h);
     expect(pending.code).toMatch(/^[A-HJ-NP-Z][2-9][A-HJ-NP-Z]$/);
     expect(h.dm.sent).toHaveLength(1);
@@ -277,7 +306,7 @@ describe("asking the owner", () => {
     expect(lines[2]).toContain("not verified");
     expect(lines[3]).toContain(`"1 ${pending.code}"`);
     const view = h.broker.views()[0];
-    expect(view).toMatchObject({ group: "Weekend project", path: fx.external, access: "read", command: `cat ${EXTERNAL}` });
+    expect(view).toMatchObject({ group: "Weekend project", path: fx.external, access: "read", command: `Read ${EXTERNAL}` });
     expect(h.cards.at(-1)).toEqual([view]);
     const ledger = readFileSync(LEDGER, "utf8").trim().split("\n").map((l) => JSON.parse(l));
     expect(ledger.at(-1)).toMatchObject({ event: "requested", code: pending.code, path: fx.external, access: "read" });
@@ -366,8 +395,11 @@ describe("the three answers", () => {
       grants: { [decided.grantId]: { path: fx.external, access: "write", requestId: id } } });
     expect(readFileSync(BACKUP, "utf8")).toBe(before);
     expect(live.config.groupSandbox.groups[GROUP].extraWrite).toEqual([fx.external]);
-    const r = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true" } });
-    expect(r.hookSpecificOutput?.updatedInput?.command).toContain(`(allow file-read* file-write* (subpath "${fx.external}"))`);
+    expect(sandboxFor(h.broker, GROUP, { once: false }).groups[GROUP].extraWrite).toEqual([fx.external]);
+    if (sandboxRuns) {
+      const r = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true" } });
+      expect(r.hookSpecificOutput?.updatedInput?.command).toContain(`(allow file-read* file-write* (subpath "${fx.external}"))`);
+    }
     expect(await readAllowed(h.broker)).toBe(true);
     expect(h.notes.at(-1)?.outcome).toBe("allowed_always");
   });
@@ -554,7 +586,6 @@ describe("who can answer", () => {
 // The kernel: the grant reaches the sandbox profile of the next Bash call.
 // ---------------------------------------------------------------------------
 
-const sandboxRuns = process.platform === "darwin" && existsSync(SANDBOX_EXEC_PATH) && existsSync(SANDBOX_SHELL_PATH);
 
 describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
   async function cat(broker: Broker) {

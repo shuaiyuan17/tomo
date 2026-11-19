@@ -17,6 +17,23 @@ export function focusFromHash(hash: string): string | null {
   const match = STUDY_HASH.exec(hash);
   return match && viewFromHash(hash) === match[1] ? match[2] ?? null : null;
 }
+
+/** The Study page the hash names (null: not in the Study), a way to go to one, and the item to focus. */
+export function useStudyRoute(): [StudyPage | null, (page: StudyPage | null) => void, string | null] {
+  const [page, setPage] = useState(() => viewFromHash(window.location.hash));
+  const [focus, setFocus] = useState(() => focusFromHash(window.location.hash));
+  useEffect(() => {
+    const update = () => { setPage(viewFromHash(window.location.hash)); setFocus(focusFromHash(window.location.hash)); };
+    window.addEventListener("hashchange", update);
+    return () => window.removeEventListener("hashchange", update);
+  }, []);
+  const go = (next: StudyPage | null) => {
+    window.location.hash = next ? `study/${next}` : "";
+    if (!next) history.replaceState(null, "", window.location.pathname + window.location.search);
+    setPage(next); setFocus(null);
+  };
+  return [page, go, focus];
+}
 /** Link to one cron job in the Study's Cron tab. */
 export function cronJobHash(id: string): string {
   return /^[A-Za-z0-9_-]{1,64}$/.test(id) ? `#study/cron/${id}` : "#study/cron";

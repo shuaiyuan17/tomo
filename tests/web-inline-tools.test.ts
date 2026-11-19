@@ -69,6 +69,13 @@ describe("mergeTools", () => {
     expect(mergeTools(capped, page(call("b", "Bash", 2), 20), "newer").complete).toBe(false);
     expect(mergeTools(capped, page([], 30), "full").complete).toBe(true);
   });
+  it("a tail that brings nothing new returns the same state, so the chat does not re-render for a quiet poll", () => {
+    const full = mergeTools(NO_TOOLS, page(call("a", "Read", 1), 10), "full");
+    expect(mergeTools(full, page([], 10), "newer")).toBe(full);
+    expect(mergeTools(full, page(full.items, 10), "newer")).toBe(full);
+    expect(mergeTools(full, page([], 12), "newer")).not.toBe(full);
+    expect(mergeTools(full, { ...page([], 10), unreadable: true }, "newer").unreadable).toBe(true);
+  });
 });
 
 describe("new-message counter", () => {

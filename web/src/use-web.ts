@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, readBootstrap, stream, type WebBootstrap } from "./api.js";
 import type { WebCompactState, WebCredentialRequest, WebEvent, WebRateLimit, WebReaction, WebRequest, WebSnapshot, WebTask } from "../../src/web/protocol.js";
 import { replaceSessionTasks } from "./tasks.js";
@@ -26,8 +26,16 @@ export function useWeb() {
   /** Tomo's reactions on the owner's web messages, by request id. */
   const [reactions, setReactions] = useState<Record<string, WebReaction>>({});
   const [activity, setActivity] = useState<Record<string, string>>({});
-  /** Bumped per session on every tool event: the chat re-reads its inline tool calls. */
-  const [toolTicks, setToolTicks] = useState<Record<string, number>>({});
+  /**
+   * Tool events, per session. They only make the chat re-read its inline tool
+   * calls, so they go to listeners, not state: a turn's burst of them does not
+   * re-render the whole page.
+   */
+  const toolListeners = useRef(new Set<(sessionId: string) => void>());
+  const onToolEvent = useCallback((listener: (sessionId: string) => void) => {
+    toolListeners.current.add(listener);
+    return () => { toolListeners.current.delete(listener); };
+  }, []);
   const [tasks, setTasks] = useState<WebTask[]>([]);
   const [compact, setCompact] = useState<WebCompactState>();
   /** The open credential request (the password card); null: none. Never a value. */
@@ -115,7 +123,7 @@ export function useWeb() {
       if (event.type === "home-look") { const { requestId } = event; setHome((old) => ({ ...old, look: { requestId, seq: (old.look?.seq ?? 0) + 1 } })); }
       // Tool calls show inline in the chat (the running one in its group's
       // summary), not as a separate line above the composer.
-      if (event.type === "tool") setToolTicks((old) => ({ ...old, [event.sessionId]: (old[event.sessionId] ?? 0) + 1 }));
+      if (event.type === "tool") for (const listener of toolListeners.current) listener(event.sessionId);
       if (event.type === "compact") setCompact(event.request);
       if (event.type === "credential-request") setCredentialRequest(event.request);
       if (event.type === "tasks") setTasks((old) => replaceSessionTasks(old, event.sessionId, event.tasks));
@@ -162,5 +170,5 @@ export function useWeb() {
     });
     return () => { controller.abort(); stopResume(); clearTimeout(invalidation); clearTimeout(retryTimer); };
   }, []);
-  return { bootstrap, connection, blocks, requests, reactions, activity, toolTicks, tasks, compact, credentialRequest, turns, rateLimit, suggestions, revision, cronRevision, home, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
+  return { bootstrap, connection, blocks, requests, reactions, activity, onToolEvent, tasks, compact, credentialRequest, turns, rateLimit, suggestions, revision, cronRevision, home, discardRecordedBlocks, refreshBootstrap, acceptRequest, applyRequest };
 }

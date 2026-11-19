@@ -34,7 +34,7 @@ describe("web fonts", () => {
   });
 
   it("Tomo's replies use the serif reading style; user messages do not", () => {
-    const main = readFileSync(resolve(import.meta.dirname, "../web/src/main.tsx"), "utf8");
+    const main = readFileSync(resolve(import.meta.dirname, "../web/src/conversation-rows.tsx"), "utf8");
     expect(main).toContain('message.role === "assistant" && "reading"');
     expect(css).toMatch(/\.reading\s*{[^}]*font-serif/);
   });

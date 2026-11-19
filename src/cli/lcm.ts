@@ -31,8 +31,9 @@ export const LCM_DEFERRED_EXIT_CODE = 75;
  *
  * Fails CLOSED: a daemon that may be running but gives no answer (timeout,
  * an older version, a socket error) is a refusal. Only a provably absent
- * daemon — nothing listening and no live daemon process — lets the rewrite
- * through unasked, because then there is no live session to reload.
+ * daemon — nothing listening, and no pid file or one naming a dead process —
+ * lets the rewrite through unasked, because then there is no live session to
+ * reload. An unreadable or malformed pid file counts as "may be running".
  *
  * Returns the function to call once the rewrite is over (success or not).
  */
@@ -40,16 +41,20 @@ async function approveRewrite(sessionId: string, what: string, daemonCheck: bool
   const proceed = async () => {};
   if (!daemonCheck) return proceed;
   const { defaultRuntimePaths } = await import("../runtime-paths.js");
-  const { readPidFileRecord, isRecordedProcessLive } = await import("./pidfile.js");
+  const { daemonMayBeRunning } = await import("./pidfile.js");
   const answer = await reserveCompact(defaultRuntimePaths.watchSocketPath, sessionId, {
-    daemonAlive: () => {
-      const record = readPidFileRecord(defaultRuntimePaths.pidFile);
-      return record !== null && isRecordedProcessLive(record);
-    },
+    daemonAlive: () => daemonMayBeRunning(defaultRuntimePaths.pidFile),
   });
   switch (answer.status) {
     case "approved":
-      return answer.finish;
+      return async () => {
+        if (!(await answer.finish())) {
+          console.error(JSON.stringify({
+            status: "warning",
+            warning: "The daemon did not acknowledge the end of the rewrite; background launches on this session stay blocked until its safety timeout or the reload.",
+          }));
+        }
+      };
     case "no-daemon":
       return proceed;
     case "refused":
@@ -62,14 +67,14 @@ async function approveRewrite(sessionId: string, what: string, daemonCheck: bool
 }
 
 /**
- * Run a synchronous rewrite; if it throws, finish the approval before the
- * error propagates (the daemon would also release it when the process exits).
+ * Run a synchronous rewrite; if it throws, report the end of the approved
+ * rewrite before the error propagates, so the session is not left marked.
  */
-function runThenFinish<T>(finish: () => Promise<void>, rewrite: () => T): T {
+async function runThenFinish<T>(finish: () => Promise<void>, rewrite: () => T): Promise<T> {
   try {
     return rewrite();
   } catch (err) {
-    void finish();
+    await finish();
     throw err;
   }
 }
@@ -174,7 +179,7 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
       const finish = await approveRewrite(opts.sessionId, `${level} rollup`, opts.daemonCheck !== false);
 
       const transcriptPath = join(paths.sessionsDir, `_archive_${opts.sessionId}.jsonl`);
-      const result = runThenFinish(finish, () => compactSession({
+      const result = await runThenFinish(finish, () => compactSession({
         sdkSessionId: opts.sessionId,
         sdkSessionsDir: paths.sdkSessionsDir,
         fromIdx: resolved.fromIdx,
@@ -310,7 +315,7 @@ lcmCommand
 
     const transcriptPath = join(paths.sessionsDir, `_archive_${opts.sessionId}.jsonl`);
 
-    const result = runThenFinish(finish, () => compactSession({
+    const result = await runThenFinish(finish, () => compactSession({
       sdkSessionId: opts.sessionId,
       sdkSessionsDir: paths.sdkSessionsDir,
       fromIdx: resolved.fromIdx,
@@ -418,7 +423,7 @@ lcmCommand
     // A dry run rewrites nothing and leaves no reload behind.
     const finish = opts.dryRun ? async () => {} : await approveRewrite(opts.sessionId, "prune", opts.daemonCheck !== false);
 
-    const result = runThenFinish(finish, () => pruneTools({
+    const result = await runThenFinish(finish, () => pruneTools({
       sdkSessionId: opts.sessionId,
       sdkSessionsDir: paths.sdkSessionsDir,
       minSize: opts.minSize,

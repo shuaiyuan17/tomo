@@ -178,9 +178,15 @@ export interface LiveSessionManagerDeps {
 export class LiveSessionManager {
   private liveSessions = new Map<string, LiveSession>();
   /** Sessions with a compact approved and not yet reloaded (rollup gate). */
-  private compactReservations = new CompactReservations(
-    (sdkSessionId) => existsSync(getCompactTriggerPath(sdkSessionId, config.sdkSessionsDir)),
-  );
+  private compactReservations = new CompactReservations((key, sdkSessionId) => {
+    if (!existsSync(getCompactTriggerPath(sdkSessionId, config.sdkSessionsDir))) return false;
+    // A key that has moved on to another SDK session (reset, fork) will never
+    // consume the old session's trigger, so it no longer has a reload pending.
+    const currentId = this.liveSessions.get(key)?.getSessionId() ?? this.deps.getSdkSessionId(key);
+    return !currentId || currentId === sdkSessionId;
+  });
+  /** Per key: web "move to background" requests still waiting on the SDK. */
+  private backgroundingInFlight = new Map<string, number>();
   /** Keys whose current SDK session id could not be written to the registry; retried on the next turn completion. */
   private unpersistedLinks = new Set<string>();
   private externalMcpServersBySession = new Map<string, ReadonlySet<string>>();
@@ -258,10 +264,12 @@ export class LiveSessionManager {
    */
   backgroundState(key: string): BackgroundState {
     const live = this.liveSessions.get(key);
-    if (!live?.isAlive()) return { activeBackgroundTasks: 0, awaitingTaskReport: false };
+    const backgroundingInFlight = this.backgroundingInFlight.get(key) ?? 0;
+    if (!live?.isAlive()) return { activeBackgroundTasks: 0, awaitingTaskReport: false, backgroundingInFlight };
     return {
       activeBackgroundTasks: live.activeBackgroundTaskCount(),
       awaitingTaskReport: live.isAwaitingTaskReportWithin(PROMPT_RETIRE_REPORT_WAIT_MS),
+      backgroundingInFlight,
     };
   }
 
@@ -310,7 +318,20 @@ export class LiveSessionManager {
     // A backgrounded task would be killed by the pending compact's reload.
     if (this.compactReservations.isPending(key)) return false;
     const live = this.liveSessions.get(key);
-    return live?.isAlive() ? live.backgroundTask(toolUseId) : false;
+    if (!live?.isAlive()) return false;
+    // In flight from here until the SDK answers: a reservation arriving in
+    // between is refused (backgroundState), and a successful move starts the
+    // settle window that covers the lag before the SDK reports the task.
+    this.backgroundingInFlight.set(key, (this.backgroundingInFlight.get(key) ?? 0) + 1);
+    try {
+      const moved = await live.backgroundTask(toolUseId);
+      if (moved) this.compactReservations.noteLaunch(key);
+      return moved;
+    } finally {
+      const left = (this.backgroundingInFlight.get(key) ?? 1) - 1;
+      if (left > 0) this.backgroundingInFlight.set(key, left);
+      else this.backgroundingInFlight.delete(key);
+    }
   }
 
   /** A shell/Monitor task's output tail from the key's live session; never creates one. */
@@ -1073,6 +1094,9 @@ export class LiveSessionManager {
     // until the session is truly idle.
     const compactedThisTurn = sid ? checkAndClearCompactTrigger(sid, config.sdkSessionsDir) : false;
     if (compactedThisTurn) {
+      // The trigger is consumed now; keep background launches denied until
+      // the close below has actually happened.
+      this.compactReservations.holdForReload(key);
       // The rollup paths refuse while background tasks run and deny new
       // launches until this reload (compact-reservations.ts), so this only
       // fires for a rewrite that bypassed the gate (e.g. --no-daemon-check).

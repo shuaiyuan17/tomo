@@ -5,7 +5,8 @@ import type { CompactReservation } from "../lcm/background-gate.js";
 /**
  * The daemon's answer to `tomo lcm` asking to rewrite a session:
  * - `approved`: the compact is marked pending on the session; call `finish()`
- *   once the rewrite is over (closing the process does the same).
+ *   once the rewrite is over, whatever its outcome. Exiting without it leaves
+ *   the session marked until the daemon's safety timeout.
  * - `refused`: the session has background work (see the reservation).
  * - `no-daemon`: nothing is listening and no daemon process is alive, so
  *   there is no live session to reload.
@@ -13,7 +14,7 @@ import type { CompactReservation } from "../lcm/background-gate.js";
  *   (timeout, an older daemon, a connection error). Callers fail closed.
  */
 export type CompactReserveResult =
-  | { status: "approved"; finish(): Promise<void> }
+  | { status: "approved"; finish(): Promise<boolean> }
   | { status: "refused"; reservation: Extract<CompactReservation, { ok: false }> }
   | { status: "no-daemon" }
   | { status: "unconfirmed"; detail: string };
@@ -29,9 +30,7 @@ export interface ReserveOptions {
 /**
  * Ask the daemon over the watch socket — the existing CLI ↔ daemon channel
  * (`tomo watch` uses it) — to approve a rewrite of `sdkSessionId`. The server
- * always opens with a snapshot frame, which this client ignores. On approval
- * the connection stays open: the daemon finishes the reservation when it is
- * told to, or when the connection drops.
+ * always opens with a snapshot frame, which this client ignores.
  */
 export function reserveCompact(socketPath: string, sdkSessionId: string, opts: ReserveOptions): Promise<CompactReserveResult> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -39,11 +38,11 @@ export function reserveCompact(socketPath: string, sdkSessionId: string, opts: R
     let settled = false;
     let connected = false;
     const socket: Socket = createConnection(socketPath);
-    const settle = (result: CompactReserveResult, keepOpen = false) => {
+    const settle = (result: CompactReserveResult) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (!keepOpen) socket.destroy();
+      socket.destroy();
       resolve(result);
     };
     const timer = setTimeout(
@@ -76,18 +75,10 @@ export function reserveCompact(socketPath: string, sdkSessionId: string, opts: R
             settle({ status: "refused", reservation });
             return;
           }
-          // Stop buffering snapshot/event frames we no longer read.
-          socket.removeAllListeners("data");
-          socket.resume();
           settle({
             status: "approved",
-            finish: () => new Promise<void>((done) => {
-              if (socket.destroyed) return done();
-              const fin: ClientFrame = { kind: "compact-finish", sdkSessionId };
-              socket.end(JSON.stringify(fin) + "\n", () => done());
-              socket.once("close", () => done());
-            }),
-          }, true);
+            finish: () => sendFinish(socketPath, { kind: "compact-finish", sdkSessionId, reservation }, timeoutMs),
+          });
           return;
         }
         // A daemon that predates the gate answers with a generic refusal.
@@ -106,5 +97,41 @@ export function reserveCompact(socketPath: string, sdkSessionId: string, opts: R
       }
     });
     socket.on("close", () => settle({ status: "unconfirmed", detail: "the daemon closed the connection" }));
+  });
+}
+
+/**
+ * Report the end of an approved rewrite on a fresh connection (the approval is
+ * not tied to the one it came on). True once the daemon acknowledged it.
+ */
+function sendFinish(socketPath: string, frame: ClientFrame, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const socket = createConnection(socketPath);
+    const settle = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(ok);
+    };
+    const timer = setTimeout(() => settle(false), timeoutMs);
+    socket.setEncoding("utf-8");
+    socket.on("connect", () => socket.write(JSON.stringify(frame) + "\n"));
+    let buffer = "";
+    socket.on("data", (chunk: string) => {
+      buffer += chunk;
+      let idx: number;
+      while ((idx = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 1);
+        try {
+          const reply = JSON.parse(line) as ServerFrame;
+          if (reply.kind === "send-result") return settle(reply.ok);
+        } catch { /* torn frame */ }
+      }
+    });
+    socket.on("error", () => settle(false));
+    socket.on("close", () => settle(false));
   });
 }

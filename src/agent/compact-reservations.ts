@@ -11,23 +11,33 @@ import { log } from "../logger.js";
  * same turn, or while the rewrite runs) is still killed by the reload. So the
  * check and a mark are ONE synchronous step here (`reserve`), and while the
  * mark stands every new background launch on that session is denied by a
- * PreToolUse hook (`launchDenial`). The mark lives from the approval until the
- * reload, and can never outlive its purpose:
+ * PreToolUse hook (`launchDenial`).
  *
- * - `finish` after the rewrite: no reload pending (the rewrite failed or never
- *   happened) releases it at once; a pending reload keeps it until `clear`.
- * - `clear` when the session reloads after the compact.
- * - a TTL on each phase, so a crashed or hung CLI cannot lock the session.
+ * The mark's lifetime is tied to the thing it protects, the pending reload,
+ * not to a clock or a connection:
  *
- * The opposite race is covered too: a launch the hook allowed can take a
- * moment to show up in the SDK's background set, so `reserve` also refuses for
- * a short settle window after any allowed launch.
+ * 1. `rewriting` — approved, the rewrite may be running. Left only by an
+ *    explicit `finish` from the rewriter, or by a long safety timeout for a
+ *    rewriter that died without saying so. Neither releases while a compact
+ *    trigger is on disk: then the phase becomes `awaiting-reload` instead.
+ *    A dropped connection means nothing here — the CLI may still be writing.
+ * 2. `awaiting-reload` — the trigger is on disk. Held, with no timeout, for as
+ *    long as the trigger exists for the session's current SDK session id.
+ * 3. `reloading` — the turn-end path consumed the trigger and is about to
+ *    close the session (possibly after a steered turn). Held until `clear`.
+ *
+ * The opposite race is covered too: a launch the hook allowed (or a task the
+ * owner is moving to the background) can take a moment to show up in the
+ * SDK's background set, so `reserve` also refuses while a move is in flight
+ * and for a short settle window after any allowed launch.
  */
 
-/** A reserved rewrite that never reports back is released after this. */
-export const COMPACT_RESERVATION_REWRITE_TTL_MS = 10 * 60 * 1000;
-/** A rewritten session whose reload never happens is released after this. */
-export const COMPACT_RESERVATION_RELOAD_TTL_MS = 60 * 60 * 1000;
+/**
+ * A `rewriting` reservation whose rewriter never reports back is resolved
+ * after this: held on if a trigger appeared, released if none did. Long, so a
+ * slow rewrite of a big session is never cut short.
+ */
+export const COMPACT_RESERVATION_REWRITE_SAFETY_MS = 30 * 60 * 1000;
 /** After an allowed background launch, refuse reservations this long. */
 export const BACKGROUND_LAUNCH_SETTLE_MS = 30 * 1000;
 
@@ -41,17 +51,25 @@ export interface BackgroundState {
   activeBackgroundTasks: number;
   /** Background set drained, the SDK's follow-up report turn not yet started. */
   awaitingTaskReport: boolean;
+  /** Foreground tasks being moved to the background right now (web action). */
+  backgroundingInFlight: number;
 }
 
 export type ReserveResult =
   | { ok: true; reservationId: string }
-  | { ok: false; reason: "background-tasks" | "awaiting-task-report" | "recent-launch" | "already-pending"; state: BackgroundState };
+  | {
+    ok: false;
+    reason: "background-tasks" | "awaiting-task-report" | "backgrounding" | "recent-launch" | "already-pending";
+    state: BackgroundState;
+  };
+
+type Phase = "rewriting" | "awaiting-reload" | "reloading";
 
 interface Reservation {
   id: string;
-  sdkSessionId: string;
-  phase: "rewriting" | "awaiting-reload";
-  timer: ReturnType<typeof setTimeout>;
+  sdkSessionId: string | null;
+  phase: Phase;
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
 export class CompactReservations {
@@ -59,8 +77,11 @@ export class CompactReservations {
   private lastLaunchAt = new Map<string, number>();
 
   constructor(
-    /** Is a compact trigger (a pending reload) on disk for this SDK session? */
-    private readonly reloadPending: (sdkSessionId: string) => boolean,
+    /**
+     * Is a reload still pending for this key's SDK session: a compact trigger
+     * on disk for it, and it is still the key's current SDK session?
+     */
+    private readonly reloadPending: (key: string, sdkSessionId: string) => boolean,
     private readonly now: () => number = Date.now,
   ) {}
 
@@ -68,50 +89,64 @@ export class CompactReservations {
   reserve(key: string, sdkSessionId: string, state: BackgroundState): ReserveResult {
     if (state.activeBackgroundTasks > 0) return { ok: false, reason: "background-tasks", state };
     if (state.awaitingTaskReport) return { ok: false, reason: "awaiting-task-report", state };
+    if (state.backgroundingInFlight > 0) return { ok: false, reason: "backgrounding", state };
     const launched = this.lastLaunchAt.get(key);
     if (launched !== undefined && this.now() - launched < BACKGROUND_LAUNCH_SETTLE_MS) {
       return { ok: false, reason: "recent-launch", state };
     }
     // One rewrite at a time per session: two back-to-back compacts race the
     // SDK's in-memory state (see the rollup runner).
-    if (this.byKey.has(key)) return { ok: false, reason: "already-pending", state };
+    if (this.current(key)) return { ok: false, reason: "already-pending", state };
     const id = randomUUID();
-    this.byKey.set(key, {
-      id,
-      sdkSessionId,
-      phase: "rewriting",
-      timer: this.expireAfter(key, id, COMPACT_RESERVATION_REWRITE_TTL_MS),
-    });
+    const reservation: Reservation = { id, sdkSessionId, phase: "rewriting", timer: null };
+    reservation.timer = setTimeout(() => {
+      reservation.timer = null;
+      if (this.byKey.get(key) !== reservation || reservation.phase !== "rewriting") return;
+      log.warn({ key }, "Compact rewriter never reported back; resolving its reservation");
+      this.settleRewrite(key, reservation);
+    }, COMPACT_RESERVATION_REWRITE_SAFETY_MS);
+    reservation.timer.unref?.();
+    this.byKey.set(key, reservation);
     return { ok: true, reservationId: id };
   }
 
   /**
-   * The rewrite is over (or its client went away). Keep the mark only while a
-   * reload is actually pending; otherwise nothing will reload and launches
-   * are safe again.
+   * The rewriter is done (succeeded, failed, or never started). With a
+   * trigger on disk the mark is held until the reload; without one nothing
+   * will reload and launches are safe again.
    */
   finish(key: string, reservationId: string): void {
     const r = this.byKey.get(key);
-    if (!r || r.id !== reservationId) return;
-    clearTimeout(r.timer);
-    if (this.reloadPending(r.sdkSessionId)) {
-      r.phase = "awaiting-reload";
-      r.timer = this.expireAfter(key, r.id, COMPACT_RESERVATION_RELOAD_TTL_MS);
-    } else {
-      this.byKey.delete(key);
+    if (!r || r.id !== reservationId || r.phase !== "rewriting") return;
+    this.settleRewrite(key, r);
+  }
+
+  /**
+   * The turn-end path consumed this key's trigger and will close the session
+   * (now, or after a steered turn). Hold the mark — creating one if the
+   * rewrite bypassed the gate — until `clear`.
+   */
+  holdForReload(key: string): void {
+    const r = this.byKey.get(key);
+    if (r) {
+      if (r.timer) clearTimeout(r.timer);
+      r.timer = null;
+      r.phase = "reloading";
+      return;
     }
+    this.byKey.set(key, { id: randomUUID(), sdkSessionId: null, phase: "reloading", timer: null });
   }
 
   /** The session reloaded after its compact: release whatever is held. */
   clear(key: string): void {
     const r = this.byKey.get(key);
     if (!r) return;
-    clearTimeout(r.timer);
+    if (r.timer) clearTimeout(r.timer);
     this.byKey.delete(key);
   }
 
   isPending(key: string): boolean {
-    return this.byKey.has(key);
+    return this.current(key) !== undefined;
   }
 
   /**
@@ -120,26 +155,44 @@ export class CompactReservations {
    * allowed launch starts the settle window `reserve` honours.
    */
   launchDenial(key: string): string | null {
-    if (this.byKey.has(key)) return BACKGROUND_LAUNCH_DENIAL;
-    this.lastLaunchAt.set(key, this.now());
+    if (this.current(key)) return BACKGROUND_LAUNCH_DENIAL;
+    this.noteLaunch(key);
     return null;
+  }
+
+  /** A background task was just started some other way (web "move to background"). */
+  noteLaunch(key: string): void {
+    this.lastLaunchAt.set(key, this.now());
   }
 
   /** Drop every timer (daemon shutdown). */
   dispose(): void {
-    for (const r of this.byKey.values()) clearTimeout(r.timer);
+    for (const r of this.byKey.values()) if (r.timer) clearTimeout(r.timer);
     this.byKey.clear();
   }
 
-  private expireAfter(key: string, id: string, ms: number): ReturnType<typeof setTimeout> {
-    const timer = setTimeout(() => {
-      const r = this.byKey.get(key);
-      if (r?.id !== id) return;
+  private settleRewrite(key: string, r: Reservation): void {
+    if (r.timer) clearTimeout(r.timer);
+    r.timer = null;
+    if (r.sdkSessionId && this.reloadPending(key, r.sdkSessionId)) {
+      r.phase = "awaiting-reload";
+    } else {
       this.byKey.delete(key);
-      log.warn({ key, phase: r.phase }, "Compact reservation expired; background launches allowed again");
-    }, ms);
-    timer.unref?.();
-    return timer;
+    }
+  }
+
+  /**
+   * The key's live reservation. An `awaiting-reload` one lasts exactly as
+   * long as its trigger: once the trigger is gone (consumed by a reload) or
+   * the key has moved to another SDK session, no reload is pending any more.
+   */
+  private current(key: string): Reservation | undefined {
+    const r = this.byKey.get(key);
+    if (r?.phase === "awaiting-reload" && !(r.sdkSessionId && this.reloadPending(key, r.sdkSessionId))) {
+      this.byKey.delete(key);
+      return undefined;
+    }
+    return r;
   }
 }
 

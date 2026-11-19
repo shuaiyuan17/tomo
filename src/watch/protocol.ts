@@ -166,10 +166,11 @@ export type ClientFrame =
    */
   | { kind: "compact-reserve"; sdkSessionId: string }
   /**
-   * The rewrite is over. Sent by `tomo lcm` after it; the connection closing
-   * counts the same, so a crashed CLI cannot leave the session locked.
+   * The rewrite is over (whatever its outcome); carries the approval from
+   * `compact-reserve`. Explicit on purpose — a dropped connection does not
+   * mean the rewrite stopped. Answered with a `send-result`.
    */
-  | { kind: "compact-finish"; sdkSessionId: string };
+  | { kind: "compact-finish"; sdkSessionId: string; reservation: CompactReservation };
 
 /** Truncation limits keep single frames small; feeds render a line or two. */
 export const TRANSCRIPT_TEXT_LIMIT = 1500;

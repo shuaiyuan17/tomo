@@ -87,6 +87,26 @@ export function readPidFileRecord(pidFile: string = PID_FILE): PidFileRecord | n
 }
 
 /**
+ * Could a daemon be running? Only a pid file that does not EXIST, or one that
+ * names a process that is provably gone, says no. A file that cannot be read
+ * or does not parse is not evidence of absence: it answers yes, so a caller
+ * deciding whether it may skip asking the daemon fails closed.
+ */
+export function daemonMayBeRunning(pidFile: string = PID_FILE): boolean {
+  let raw: string;
+  try {
+    raw = readFileSync(pidFile, "utf-8");
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ENOENT";
+  }
+  const [pidLine, identityLine] = raw.split("\n");
+  const pid = Number((pidLine ?? "").trim());
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  const identity = (identityLine ?? "").trim();
+  return isRecordedProcessLive({ pid, identity: identity || null });
+}
+
+/**
  * True when the process the pid file describes is still the one running.
  *
  * Degrades to plain liveness when no identity was recorded (a legacy pid file)

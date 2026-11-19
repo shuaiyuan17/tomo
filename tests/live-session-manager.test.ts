@@ -71,6 +71,8 @@ vi.mock("../src/agent/live-session.js", () => {
     hasActiveBackgroundTasks() { return this.background; }
     activeBackgroundTaskCount() { return this.background ? 2 : 0; }
     isAwaitingTaskReportWithin() { return this.awaitingReport; }
+    backgroundMoves: Array<(moved: boolean) => void> = [];
+    backgroundTask() { return new Promise<boolean>((resolve) => this.backgroundMoves.push(resolve)); }
     awaitingReport = false;
     turnWaits: Array<{ timeoutMs: number; resolve: (started: boolean) => void }> = [];
     isAwaitingTaskReport() { return this.awaitingReport; }
@@ -499,14 +501,14 @@ describe("LiveSessionManager session lifecycle", () => {
 
   it("reports background work by key, counting the report window like retireWhenIdle", async () => {
     const manager = new LiveSessionManager(makeDeps());
-    expect(manager.backgroundState("telegram:1")).toEqual({ activeBackgroundTasks: 0, awaitingTaskReport: false });
+    expect(manager.backgroundState("telegram:1")).toEqual({ activeBackgroundTasks: 0, awaitingTaskReport: false, backgroundingInFlight: 0 });
     await manager.getOrCreateLiveSession("telegram:1");
     const s = mockState.instances[0] as unknown as { background: boolean; awaitingReport: boolean };
     s.background = true;
-    expect(manager.backgroundState("telegram:1")).toEqual({ activeBackgroundTasks: 2, awaitingTaskReport: false });
+    expect(manager.backgroundState("telegram:1")).toEqual({ activeBackgroundTasks: 2, awaitingTaskReport: false, backgroundingInFlight: 0 });
     s.background = false;
     s.awaitingReport = true;
-    expect(manager.backgroundState("telegram:1")).toEqual({ activeBackgroundTasks: 0, awaitingTaskReport: true });
+    expect(manager.backgroundState("telegram:1")).toEqual({ activeBackgroundTasks: 0, awaitingTaskReport: true, backgroundingInFlight: 0 });
   });
 
   it("finds the key behind an SDK session id: the live id first, then the registry link", async () => {
@@ -550,6 +552,49 @@ describe("LiveSessionManager session lifecycle", () => {
     if (r.ok) manager.finishCompact("telegram:1", r.reservationId);
     expect(manager.isCompactPending("telegram:1")).toBe(false);
     expect(ctx.backgroundLaunchDenial!()).toBeNull();
+  });
+
+  it("a move to the background in flight refuses a reservation that arrives meanwhile", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.getOrCreateLiveSession("telegram:1");
+    const s = mockState.instances[0] as unknown as { backgroundMoves: Array<(moved: boolean) => void> };
+    const moving = manager.backgroundTask("telegram:1", "toolu_1");
+    await flushMicrotasks();
+    expect(s.backgroundMoves).toHaveLength(1);
+    expect(manager.reserveCompact("telegram:1", "sdk-1")).toMatchObject({ ok: false, reason: "backgrounding" });
+
+    s.backgroundMoves[0](true);
+    expect(await moving).toBe(true);
+    // Moved: the SDK has yet to report the task, so the settle window holds.
+    expect(manager.reserveCompact("telegram:1", "sdk-1")).toMatchObject({ ok: false, reason: "recent-launch" });
+  });
+
+  it("after a rewrite, an idle session stays protected until its reload — however long that takes", async () => {
+    vi.useFakeTimers();
+    const { mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+    const sid = `sdk-${Math.random().toString(36).slice(2)}`;
+    const trigger = `/tmp/sdk-sessions/${sid}.compact-trigger`;
+    try {
+      const manager = new LiveSessionManager(makeDeps());
+      await manager.getOrCreateLiveSession("telegram:1");
+      mockState.instances[0].sessionId = sid;
+      const r = manager.reserveCompact("telegram:1", sid);
+      if (!r.ok) throw new Error("expected approval");
+      mkdirSync("/tmp/sdk-sessions", { recursive: true });
+      writeFileSync(trigger, "x"); // the rewrite succeeded
+      manager.finishCompact("telegram:1", r.reservationId);
+      vi.advanceTimersByTime(48 * 60 * 60 * 1000);
+      expect(manager.isCompactPending("telegram:1")).toBe(true);
+
+      // The next turn consumes the trigger and reloads.
+      rmSync(trigger, { force: true });
+      mockState.compactTriggered = true;
+      await manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
+      expect(manager.isCompactPending("telegram:1")).toBe(false);
+    } finally {
+      rmSync(trigger, { force: true });
+      vi.useRealTimers();
+    }
   });
 
   it("the compact reload releases the pending mark", async () => {

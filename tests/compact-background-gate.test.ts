@@ -134,7 +134,7 @@ describe("compactRefusal", () => {
 /** A daemon stand-in: the real WatchServer, gated by real CompactReservations. */
 function startDaemon(state: { tasks: number; awaitingReport: boolean }) {
   const reservations = new CompactReservations(
-    (sid) => existsSync(getCompactTriggerPath(sid, paths.sdkSessionsDir)),
+    (_key, sid) => existsSync(getCompactTriggerPath(sid, paths.sdkSessionsDir)),
   );
   const KEY = "dm:owner";
   const server = new WatchServer(paths.watchSocketPath, {
@@ -142,7 +142,7 @@ function startDaemon(state: { tasks: number; awaitingReport: boolean }) {
     sendChat: async () => {},
     compactGate: {
       reserve: (sdkSessionId): CompactReservation => {
-        const r = reservations.reserve(KEY, sdkSessionId, { activeBackgroundTasks: state.tasks, awaitingTaskReport: state.awaitingReport });
+        const r = reservations.reserve(KEY, sdkSessionId, { activeBackgroundTasks: state.tasks, awaitingTaskReport: state.awaitingReport, backgroundingInFlight: 0 });
         return r.ok ? { ok: true, key: KEY, reservationId: r.reservationId } : { ...r, key: KEY };
       },
       finish: (r) => { if (r.ok && r.key && r.reservationId) reservations.finish(r.key, r.reservationId); },
@@ -242,15 +242,42 @@ describe("tomo lcm compact gate (over the watch socket)", () => {
     expect(daemon!.reservations.isPending(daemon!.KEY)).toBe(false);
   });
 
-  it("a client that dies holding an approval does not leave the session locked", async () => {
+  it("a dropped connection does NOT release an approval (the CLI may still be writing); an explicit finish does", async () => {
     const socket = createConnection(paths.watchSocketPath);
     await new Promise((r) => socket.once("connect", r));
+    let reply = "";
+    socket.setEncoding("utf-8");
+    socket.on("data", (c: string) => { reply += c; });
     socket.write(JSON.stringify({ kind: "compact-reserve", sdkSessionId: sessionId }) + "\n");
-    await until(() => daemon!.reservations.isPending(daemon!.KEY));
+    await until(() => reply.includes('"kind":"compact-reserve"'));
+    const frame = reply.split("\n").map((l) => (l ? JSON.parse(l) : null)).find((f) => f?.kind === "compact-reserve");
+    expect(frame.reservation.ok).toBe(true);
+    socket.destroy();
+    await new Promise((r) => setTimeout(r, 50));
     expect(daemon!.reservations.isPending(daemon!.KEY)).toBe(true);
-    socket.destroy(); // crash: no compact-finish
+    expect(daemon!.reservations.launchDenial(daemon!.KEY)).not.toBeNull();
+
+    // The rewrite later ends without a trigger (it failed): an explicit
+    // finish on a fresh connection releases it.
+    const fin = createConnection(paths.watchSocketPath);
+    await new Promise((r) => fin.once("connect", r));
+    fin.write(JSON.stringify({ kind: "compact-finish", sdkSessionId: sessionId, reservation: frame.reservation }) + "\n");
     await until(() => !daemon!.reservations.isPending(daemon!.KEY));
+    fin.destroy();
     expect(daemon!.reservations.isPending(daemon!.KEY)).toBe(false);
+  });
+
+  it("an unreadable or malformed pid file is not proof of absence: fail closed", async () => {
+    daemon!.server.stop();
+    daemon = null;
+    const path = writeSession(sessionId);
+    const before = readFileSync(path, "utf8");
+    writeFileSync(paths.pidFile, "not-a-pid\n");
+    expect((await daily()).code).toBe(LCM_DEFERRED_EXIT_CODE);
+    rmSync(paths.pidFile);
+    mkdirSync(paths.pidFile); // EISDIR on read
+    expect((await daily()).code).toBe(LCM_DEFERRED_EXIT_CODE);
+    expect(readFileSync(path, "utf8")).toBe(before);
   });
 
   it("`compact` and `prune-tools` are gated too; a prune dry run is not", async () => {
@@ -320,7 +347,7 @@ describe("tomo lcm compact gate (over the watch socket)", () => {
   it("proceeds when no daemon is running at all (no socket, no live pid)", async () => {
     daemon!.server.stop();
     daemon = null;
-    rmSync(paths.pidFile);
+    rmSync(paths.pidFile); // no pid file at all: the only "absent" answer
     writeSession(sessionId);
     const res = await daily();
     expect(res.code, res.stderr).toBe(0);

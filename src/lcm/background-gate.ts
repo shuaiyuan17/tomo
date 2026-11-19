@@ -19,6 +19,7 @@
 export type CompactRefusalReason =
   | "background-tasks"
   | "awaiting-task-report"
+  | "backgrounding"
   | "recent-launch"
   | "already-pending"
   | "daemon-unreachable";
@@ -34,7 +35,7 @@ export type CompactReservation =
     ok: false;
     key: string | null;
     reason: Exclude<CompactRefusalReason, "daemon-unreachable">;
-    state: { activeBackgroundTasks: number; awaitingTaskReport: boolean };
+    state: { activeBackgroundTasks: number; awaitingTaskReport: boolean; backgroundingInFlight?: number };
   };
 
 export interface CompactRefusal {
@@ -71,6 +72,12 @@ export function compactRefusal(
         reason: res.reason,
         activeBackgroundTasks: 0,
         error: `A background task just finished and its result has not been reported to this session yet. Not running the ${what}: it reloads the session, which would lose that report. ${RETRY}`,
+      };
+    case "backgrounding":
+      return {
+        status: "deferred",
+        reason: res.reason,
+        error: `A task in this session is being moved to the background right now. Not running the ${what}: it reloads the session, which would kill it. ${RETRY}`,
       };
     case "recent-launch":
       return {

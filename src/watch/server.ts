@@ -15,6 +15,14 @@ function isClientFrame(value: unknown): value is ClientFrame {
   return typeof (value as { kind?: unknown }).kind === "string";
 }
 
+/** Shape gate for a finish frame's reservation (it comes off the wire). */
+function isApproval(value: unknown): value is CompactReservation {
+  if (value === null || typeof value !== "object") return false;
+  const r = value as { ok?: unknown; key?: unknown; reservationId?: unknown };
+  return r.ok === true && (r.key === null || typeof r.key === "string")
+    && (r.reservationId === null || typeof r.reservationId === "string");
+}
+
 export interface WatchServerDeps {
   /** Built fresh per client connect — includes vitals and feed backfill. */
   getSnapshot(): WatchSnapshot | Promise<WatchSnapshot>;
@@ -43,7 +51,6 @@ export interface WatchServerDeps {
 export class WatchServer {
   private server: Server | null = null;
   private clients = new Set<Socket>();
-  private reservationsBySocket = new Map<Socket, Map<string, CompactReservation>>();
   private unsubscribe: (() => void) | null = null;
 
   constructor(
@@ -99,16 +106,7 @@ export class WatchServer {
     this.clients.add(socket);
     socket.setEncoding("utf-8");
     socket.on("error", () => socket.destroy());
-    // Compact approvals this connection holds, by SDK session id. Finished
-    // when the client says so or goes away — whichever comes first.
-    const reservations = new Map<string, CompactReservation>();
-    this.reservationsBySocket.set(socket, reservations);
-    socket.on("close", () => {
-      this.clients.delete(socket);
-      this.reservationsBySocket.delete(socket);
-      for (const r of reservations.values()) this.deps.compactGate?.finish(r);
-      reservations.clear();
-    });
+    socket.on("close", () => this.clients.delete(socket));
 
     let buffer = "";
     socket.on("data", (chunk: string) => {
@@ -175,25 +173,18 @@ export class WatchServer {
       return;
     }
 
+    // The rollup gate. An approval is NOT tied to this connection: the CLI
+    // may still be rewriting after it drops, so only an explicit finish (or
+    // the reservation's own safety timeout) resolves it.
     const gate = this.deps.compactGate;
-    const held = this.reservationsBySocket.get(socket);
-    if (frame.kind === "compact-reserve" && typeof frame.sdkSessionId === "string" && gate && held) {
-      // A second reserve for the same session on one connection re-asks;
-      // the earlier approval is finished first so it cannot leak.
-      const previous = held.get(frame.sdkSessionId);
-      if (previous) {
-        held.delete(frame.sdkSessionId);
-        gate.finish(previous);
-      }
+    if (frame.kind === "compact-reserve" && typeof frame.sdkSessionId === "string" && gate) {
       const reservation = gate.reserve(frame.sdkSessionId);
-      if (reservation.ok) held.set(frame.sdkSessionId, reservation);
       this.write(socket, { kind: "compact-reserve", sdkSessionId: frame.sdkSessionId, reservation });
       return;
     }
-    if (frame.kind === "compact-finish" && typeof frame.sdkSessionId === "string" && gate && held) {
-      const reservation = held.get(frame.sdkSessionId);
-      held.delete(frame.sdkSessionId);
-      if (reservation) gate.finish(reservation);
+    if (frame.kind === "compact-finish" && isApproval(frame.reservation) && gate) {
+      gate.finish(frame.reservation);
+      this.write(socket, { kind: "send-result", ok: true });
       return;
     }
 

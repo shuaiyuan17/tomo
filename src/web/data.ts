@@ -238,9 +238,9 @@ export class WebData {
    * The Study Todos page: the todo store, read and never written. Scoped to
    * what the owner's own conversation sees (see `readWebTodos`).
    */
-  todos(): WebTodos {
+  todos(): Promise<WebTodos> {
     const { tomoHome, owner, todoLimits } = this.options;
-    if (!tomoHome) throw new WebError(503, "todos_unavailable");
+    if (!tomoHome) return Promise.reject(new WebError(503, "todos_unavailable"));
     const titles = new Map(SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir).map((e) => [e.channelKey, e.chatTitle]));
     return readWebTodos({
       dir: todosDirIn(tomoHome), limits: todoLimits,

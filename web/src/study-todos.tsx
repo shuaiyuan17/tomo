@@ -57,7 +57,7 @@ export function Todos({ reload }: { reload: number }) {
       </ul>
     </section>)}
     {summary.hidden > 0 && <p className={cn(meta, "m-0 px-1")}>{summary.hidden} more open in conversations that are not shown here.</p>}
-    {value.recent.length > 0 && <Recent recent={value.recent} total={value.resolvedTotal} now={now} agent={agent} />}
+    {value.recent.length > 0 && <Recent recent={value.recent} more={value.moreResolved} now={now} agent={agent} />}
   </div>;
 }
 
@@ -130,12 +130,12 @@ function TodoRow({ item, now, maxSnoozes }: { item: WebTodoItem; now: number; ma
   </li>;
 }
 
-function Recent({ recent, total, now, agent }: { recent: WebTodoResolution[]; total: number; now: number; agent: string }) {
+function Recent({ recent, more, now, agent }: { recent: WebTodoResolution[]; more: boolean; now: number; agent: string }) {
   return <Collapsible asChild><section className={card} aria-label="Recently closed">
     <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-2.5 rounded-xl px-5 py-3.5 text-left hover:bg-foreground/[0.04] max-[600px]:px-4">
       <ChevronRight className="size-3.5 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-90" />
       <span className="eyebrow">Recently closed</span>
-      <span className={cn(meta, "ml-auto tabular-nums")}>{total > recent.length ? `Latest ${recent.length} of ${total}` : `${total}`}</span>
+      <span className={cn(meta, "ml-auto tabular-nums")}>{more ? `Latest ${recent.length}` : recent.length}</span>
     </CollapsibleTrigger>
     <CollapsibleContent>
       <ul className="m-0 list-none divide-y border-t p-0">{recent.map((item) => {

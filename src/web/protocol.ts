@@ -432,8 +432,8 @@ export interface WebTodos {
   openTotal: number;
   /** The most recently finished items, newest first (at most MAX_WEB_TODO_RESOLUTIONS). */
   recent: WebTodoResolution[];
-  /** How many finished items there are in all. */
-  resolvedTotal: number;
+  /** The done log holds more finished items than `recent` (only its tail is read, so there is no total). */
+  moreResolved: boolean;
   limits: { maxOpen: number; maxSnoozes: number };
 }
 /** Finished todos one `/todos` response carries. */

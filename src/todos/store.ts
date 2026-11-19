@@ -144,10 +144,54 @@ const fileSchema = z.looseObject({
   items: z.array(itemSchema),
 });
 
-interface StoreFile {
+export interface StoreFile {
   version: 1;
   next_id: number;
   items: TodoItem[];
+}
+
+/**
+ * The text of `todos.json` as a checked store file. Throws TodoStoreReadError
+ * (naming `path`) for anything that is not one. Pure: a reader that must not
+ * block (the web UI) reads the bytes itself and parses them with this.
+ */
+export function parseTodoFile(raw: string, path: string): StoreFile {
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch (err) {
+    throw new TodoStoreReadError(path, err);
+  }
+  const parsed = fileSchema.safeParse(data);
+  if (!parsed.success) throw new TodoStoreReadError(path, new Error(parsed.error.issues[0]?.message ?? "invalid shape"));
+  const file = parsed.data as unknown as StoreFile;
+  const ids = new Set<string>();
+  for (const item of file.items) {
+    if (ids.has(item.id)) throw new TodoStoreReadError(path, new Error(`duplicate id ${item.id}`));
+    ids.add(item.id);
+    if (Number(item.id.slice(2)) >= file.next_id) {
+      throw new TodoStoreReadError(path, new Error(`${item.id} is not below next_id ${file.next_id}`));
+    }
+  }
+  return file;
+}
+
+/**
+ * Whole records in a stretch of `done.ndjson`, oldest first, for views of the
+ * history. Each line is checked before ids are compared: a line that is torn
+ * or not a whole record is left out and does not stand in for a later, whole
+ * record of the same id. The first whole record of an id wins.
+ */
+export function parseResolutions(raw: string): TodoResolution[] {
+  const records = new Map<string, TodoResolution>();
+  for (const text of raw.split("\n")) {
+    if (!text.trim()) continue;
+    let data: unknown;
+    try { data = JSON.parse(text); } catch { continue; }
+    const parsed = resolutionSchema.safeParse(data);
+    if (parsed.success && !records.has(parsed.data.id)) records.set(parsed.data.id, parsed.data as unknown as TodoResolution);
+  }
+  return [...records.values()];
 }
 
 interface StoreState {
@@ -268,19 +312,6 @@ export class TodoStore {
   /** Every open item, oldest id first. Throws TodoStoreReadError. */
   list(): TodoItem[] {
     return this.read().items;
-  }
-
-  /**
-   * Finished items (done or dropped), oldest first, as `done.ndjson` logged
-   * them. Read-only, for views of the history: a line that is torn or not a
-   * whole record is left out. Throws TodoStoreReadError.
-   */
-  resolved(): TodoResolution[] {
-    const records: TodoResolution[] = [];
-    for (const record of this.readClosed().values()) {
-      if (resolutionSchema.safeParse(record).success) records.push(record);
-    }
-    return records;
   }
 
   /** Items whose review time has passed, longest overdue first. */
@@ -468,23 +499,7 @@ export class TodoStore {
     const raw = this.rawNow();
     const closed = this.readClosed();
     if (raw === null) return { file: { version: 1, next_id: 1, items: [] }, raw, closed };
-    let data: unknown;
-    try {
-      data = JSON.parse(raw);
-    } catch (err) {
-      throw new TodoStoreReadError(this.path, err);
-    }
-    const parsed = fileSchema.safeParse(data);
-    if (!parsed.success) throw new TodoStoreReadError(this.path, new Error(parsed.error.issues[0]?.message ?? "invalid shape"));
-    const file = parsed.data as unknown as StoreFile;
-    const ids = new Set<string>();
-    for (const item of file.items) {
-      if (ids.has(item.id)) throw new TodoStoreReadError(this.path, new Error(`duplicate id ${item.id}`));
-      ids.add(item.id);
-      if (Number(item.id.slice(2)) >= file.next_id) {
-        throw new TodoStoreReadError(this.path, new Error(`${item.id} is not below next_id ${file.next_id}`));
-      }
-    }
+    const file = parseTodoFile(raw, this.path);
     // Self-heal a close interrupted between its two writes: logged means closed.
     file.items = file.items.filter((item) => !closed.has(item.id));
     return { file, raw, closed };

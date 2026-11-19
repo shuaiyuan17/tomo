@@ -35,6 +35,8 @@ const cases = [
   ["history-recovery","web/src/main.tsx","error instanceof ApiError && error.status === 409 && error.code === \"history_changed\"","false","e2e"],
   ["todos-owner-scope", "src/web/todos-view.ts", "ownerKey !== undefined && canSeeTodo(item, ownerKey)", "true", "tests/web-study.test.ts"],
   ["todos-unreadable-store", "src/web/todos-view.ts", "if (error instanceof TodoStoreError) throw new WebError(503, \"todos_unavailable\");", "if (error instanceof TodoStoreError) { open = []; closed = []; } else", "tests/web-study.test.ts"],
+  ["todos-validate-before-dedupe", "src/todos/store.ts", "if (parsed.success && !records.has(parsed.data.id)) records.set(parsed.data.id, parsed.data as unknown as TodoResolution);", "const first = data as TodoResolution; if (typeof first?.id === \"string\" && !records.has(first.id)) records.set(first.id, first);", "tests/web-study.test.ts"],
+  ["todos-done-log-tail", "src/web/todos-view.ts", "const start = Math.max(0, stat.size - max);", "const start = 0;", "tests/web-study.test.ts"],
   ["todos-due-first", "web/src/todos.ts", "a.reviewAt - b.reviewAt || idNumber(a) - idNumber(b)", "idNumber(a) - idNumber(b)", "tests/web-study-todos.test.ts"],
   ["enabled-default", "src/web/config.ts", "enabled: z.boolean().default(true)", "enabled: z.boolean().default(false)", "tests/web-channel.test.ts"],
   ["unique-owner", "src/web/owner.ts", "candidates.length === 1 ? candidates[0] : undefined", "candidates[0]", "tests/web-channel.test.ts"],

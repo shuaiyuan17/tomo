@@ -5,10 +5,11 @@ import {
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getSdkSessionPath } from "../sessions/index.js";
-import { writeFileAtomicSync } from "../fs-utils.js";
+import { writeFileAtomicSync, isEnoent } from "../fs-utils.js";
 import { log } from "../logger.js";
 import type { TranscriptEvent } from "../sessions/transcript-event.js";
 import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord, type RawJsonlLine } from "../jsonl.js";
+import { errorMessage } from "../error-text.js";
 
 /** Path to the compact trigger file for a given session */
 export function getCompactTriggerPath(sdkSessionId: string, sdkSessionsDir: string): string {
@@ -25,7 +26,7 @@ export function checkAndClearCompactTrigger(sdkSessionId: string, sdkSessionsDir
     unlinkSync(triggerPath);
     return true;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if (isEnoent(err)) return false;
     throw err;
   }
 }
@@ -450,7 +451,7 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
       eventsRemoved: 0,
       eventsAfter: allEvents.length,
       error: `Could not archive removed events to ${req.transcriptPath}: ` +
-        `${err instanceof Error ? err.message : String(err)}; session left unchanged`,
+        `${errorMessage(err)}; session left unchanged`,
     };
   }
 

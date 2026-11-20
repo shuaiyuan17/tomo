@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { DAEMON_STOP_TIMEOUT_MS, isPidAlive, isRecordedProcessLive, readPidFileRecord, stopRecordedDaemon } from "./pidfile.js";
+import { sleep } from "../sleep.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -113,7 +114,7 @@ export async function restartAutostart(): Promise<void> {
   const deadline = Date.now() + DAEMON_STOP_TIMEOUT_MS;
   let waitingOn = oldPid;
   for (let tick = 1; Date.now() < deadline; tick++) {
-    await new Promise((r) => setTimeout(r, 300));
+    await sleep(300);
     if (waitingOn !== null && isPidAlive(waitingOn)) {
       // The poll is cheap liveness; every ~3s confirm it is still OUR daemon
       // on that pid, so a recycled pid cannot hold the wait for the whole

@@ -2,6 +2,7 @@ import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { basename, dirname, join, sep } from "node:path";
 import { log } from "../logger.js";
 import type { GroupPathPolicy } from "./group-fs-policy.js";
+import { isEnoent } from "../fs-utils.js";
 
 /**
  * Kernel-level scoping for the shell on a private-memory-barred turn.
@@ -352,7 +353,7 @@ export function resolvedDenyDir(privateDir: string): string | null {
     } catch (err) {
       // A link whose target cannot be resolved names a place we cannot deny.
       if (isSymlink(cur)) return null;
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") return null;
+      if (!isEnoent(err)) return null;
       const parent = dirname(cur);
       if (parent === cur) return null;
       tail.unshift(basename(cur));

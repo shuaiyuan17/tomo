@@ -3,6 +3,7 @@ import { open } from "node:fs/promises";
 import { join } from "node:path";
 import { isSecretFieldName, scrubSecretValues } from "../redact.js";
 import { WebError, type WebConfigField, type WebConfigView, type WebMcpServer } from "./protocol.js";
+import { isEnoent } from "../fs-utils.js";
 
 const MAX_CONFIG_BYTES = 1024 * 1024;
 const MAX_FIELDS = 500;
@@ -163,7 +164,7 @@ export class WebConfigReader {
     let file;
     try { file = await open(join(this.tomoHome, "config.json"), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { value: null, modifiedAt: null };
+      if (isEnoent(error)) return { value: null, modifiedAt: null };
       throw new WebError(503, "config_unavailable");
     }
     try {

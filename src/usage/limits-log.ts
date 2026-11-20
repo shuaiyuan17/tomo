@@ -5,6 +5,7 @@ import { usageWindows, type UsageResponse } from "../agent/usage.js";
 import { log } from "../logger.js";
 import { appendLineSerial } from "./append.js";
 import { usageDataDir } from "./dir.js";
+import { errorMessage } from "../error-text.js";
 
 /** Bump when a line's shape changes incompatibly. */
 export const LIMITS_LOG_VERSION = 1;
@@ -130,7 +131,7 @@ export class LimitsLog {
   }
 
   private async warn(err: unknown): Promise<void> {
-    log.warn({ err: err instanceof Error ? err.message : String(err), path: this.path }, "Could not record a usage-limit sample");
+    log.warn({ err: errorMessage(err), path: this.path }, "Could not record a usage-limit sample");
   }
 }
 

@@ -1,5 +1,6 @@
 import { renameSync, statSync, unlinkSync } from "node:fs";
 import type { SessionEntry } from "./types.js";
+import { isEnoent } from "../fs-utils.js";
 
 /**
  * Shared private types and small filesystem helpers for SessionStore (store.ts).
@@ -12,7 +13,7 @@ export function renameIfPresent(from: string, to: string): boolean {
     renameSync(from, to);
     return true;
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    if (isEnoent(err)) return false;
     throw err;
   }
 }
@@ -123,7 +124,7 @@ export function unlinkIfPresent(path: string): void {
   try {
     unlinkSync(path);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    if (!isEnoent(err)) throw err;
   }
 }
 

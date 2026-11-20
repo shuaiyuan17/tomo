@@ -2,6 +2,7 @@ import { mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, st
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
+import { isEnoent } from "./fs-utils.js";
 
 /**
  * Is `pid` a process we can see? EPERM means it exists and is simply owned by
@@ -176,7 +177,7 @@ function acquire(lockPath: string, opts: FileLockOptions): string {
         // under us — either way retry. Anything else (EACCES on the lock
         // directory) is not going to fix itself, so fall through to the
         // deadline rather than spinning on it.
-        reclaimed = (err as NodeJS.ErrnoException).code === "ENOENT";
+        reclaimed = isEnoent(err);
       }
       // The rename now either replaces the emptied lock or finds a new holder.
       if (reclaimed) continue;

@@ -2,6 +2,7 @@ import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child
 import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { errorMessage } from "../error-text.js";
 
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const LOGIN_URL_RE = /https:\/\/claude\.com\/cai\/oauth\/authorize\?[^\s]+/;
@@ -208,7 +209,7 @@ export class ClaudeLoginManager {
     } catch (err) {
       return {
         verified: false,
-        verificationError: err instanceof Error ? err.message : String(err),
+        verificationError: errorMessage(err),
         verificationFailure: err,
       };
     }

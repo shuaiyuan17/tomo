@@ -62,3 +62,8 @@ function fileMode(path: string): number | undefined {
     return undefined;
   }
 }
+
+/** True when a filesystem call failed because the path does not exist. */
+export function isEnoent(err: unknown): boolean {
+  return (err as NodeJS.ErrnoException | null)?.code === "ENOENT";
+}

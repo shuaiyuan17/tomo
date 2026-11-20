@@ -2,6 +2,7 @@ import * as p from "@clack/prompts";
 import { SessionStore } from "../../sessions/store.js";
 import { loadConfig, saveConfig, modelLabel, SESSIONS_DIR, SDK_SESSIONS_DIR } from "./shared.js";
 import { promptForModel } from "./model-picker.js";
+import { errorMessage } from "../../error-text.js";
 
 export async function configSessions(): Promise<void> {
   const store = new SessionStore(SESSIONS_DIR, 0, SDK_SESSIONS_DIR);
@@ -88,7 +89,7 @@ export async function configSessions(): Promise<void> {
       } catch (err) {
         p.log.error(
           "Model override removed, but the session could not be cleared: " +
-          `${err instanceof Error ? err.message : String(err)}`,
+          `${errorMessage(err)}`,
         );
         process.exitCode = 1;
       }

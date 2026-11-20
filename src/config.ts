@@ -22,6 +22,7 @@ import { parseWebConfig, type WebConfig } from "./web/config.js";
 import { normalizeImessageHandle } from "./sessions/keys.js";
 import { resolveOwner, type OwnerConfig, type OwnerNotice, type OwnerSource } from "./owner.js";
 import type { GroupSandboxConfig } from "./agent/group-fs-policy.js";
+import { errorMessage } from "./error-text.js";
 
 const HOME = defaultRuntimePaths.homeDir;
 export const TOMO_HOME = defaultRuntimePaths.tomoHome;
@@ -684,7 +685,7 @@ function loadConfigFile(): Record<string, unknown> {
   try {
     parsed = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
   } catch (err) {
-    issues.push(`${CONFIG_PATH} is not valid JSON: ${err instanceof Error ? err.message : String(err)} (ignoring the file)`);
+    issues.push(`${CONFIG_PATH} is not valid JSON: ${errorMessage(err)} (ignoring the file)`);
     return {};
   }
   if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {

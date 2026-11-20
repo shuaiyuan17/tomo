@@ -4,9 +4,10 @@ import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { Cron } from "croner";
 import type { CronJob, CronOutcome, CronSchedule, InterruptNotice, InterruptedRun, InterruptedSkip, SkipNotice } from "./types.js";
-import { writeJsonAtomicSync } from "../fs-utils.js";
+import { writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
 import { log } from "../logger.js";
 import { withFileLockSync } from "../file-lock.js";
+import { errorMessage } from "../error-text.js";
 
 const DEFAULT_STORE_PATH = join(homedir(), ".tomo", "data", "cron", "jobs.json");
 /** The store file the daemon's scheduler uses. Passed explicitly to the web
@@ -885,7 +886,7 @@ function readStore(path: string): { jobs: CronJob[]; revision: number } {
   } catch (err) {
     // Absent is a normal state — a fresh install has no jobs file. Anything
     // else (EACCES, EIO, a directory in the way) is a failure, not emptiness.
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { jobs: [], revision: 0 };
+    if (isEnoent(err)) return { jobs: [], revision: 0 };
     throw new CronStoreReadError(path, err);
   }
   return parseCronStore(path, raw);
@@ -1200,7 +1201,7 @@ export function parseCreatableSchedule(text: string, fromMs = Date.now()): Creat
     schedule = parseScheduleString(text);
     reason = unschedulableReason(schedule, fromMs);
   } catch (err) {
-    return { kind: "unparseable", detail: err instanceof Error ? err.message : String(err) };
+    return { kind: "unparseable", detail: errorMessage(err) };
   }
   return reason === null ? { kind: "ok", schedule } : { kind: "unschedulable", reason };
 }

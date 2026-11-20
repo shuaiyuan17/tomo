@@ -3,6 +3,7 @@ import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { landsInPrivate } from "../agent/private-memory-reach.js";
 import { isPrivateIndexLine, PRIVATE_MEMORY_SUBDIR } from "./private-memory.js";
+import { isEnoent } from "../fs-utils.js";
 
 export class MemoryReadError extends Error {
   constructor(readonly code: "invalid_path" | "not_found" | "unavailable" | "limit") { super(code); }
@@ -78,7 +79,7 @@ export class MemoryReader {
       } finally { await file.close(); }
     } catch (error) {
       if (error instanceof MemoryReadError) throw error;
-      throw new MemoryReadError((error as NodeJS.ErrnoException).code === "ENOENT" ? "not_found" : "unavailable");
+      throw new MemoryReadError(isEnoent(error) ? "not_found" : "unavailable");
     }
   }
   async tree(): Promise<{ entries: MemoryEntry[]; truncated: boolean; missing: boolean }> {
@@ -102,7 +103,7 @@ export class MemoryReader {
       await walk("", 0);
       return { entries, truncated, missing: false };
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return { entries: [], truncated: false, missing: true };
+      if (isEnoent(error)) return { entries: [], truncated: false, missing: true };
       if (error instanceof MemoryReadError) throw error;
       throw new MemoryReadError("unavailable");
     }

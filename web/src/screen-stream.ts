@@ -1,5 +1,7 @@
 import type { WebScreenFrame } from "../../src/web/protocol.js";
 import { ApiError } from "./api.js";
+import { i18n } from "./i18n/index.js";
+import { formatRelative } from "./i18n/format.js";
 
 export const SCREEN_RATES = [0.5, 1, 2] as const;
 export type ScreenRate = typeof SCREEN_RATES[number];
@@ -7,10 +9,18 @@ export type ScreenRate = typeof SCREEN_RATES[number];
 /** "Updated 4s ago" / "Updated 2 min ago". */
 export function updatedAgo(capturedAt: number, now: number): string {
   const seconds = Math.max(0, Math.round((now - capturedAt) / 1000));
-  if (seconds < 2) return "Updated just now";
-  if (seconds < 60) return `Updated ${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  return minutes < 60 ? `Updated ${minutes} min ago` : `Updated ${Math.floor(minutes / 60)} h ago`;
+  if (seconds < 2) return i18n.t("common:usage.updatedJustNow");
+  // Whole seconds, then whole minutes, then whole hours (Intl.RelativeTimeFormat words them).
+  const rounded = seconds < 60 ? seconds * 1000 : seconds < 3600 ? Math.floor(seconds / 60) * 60_000 : Math.floor(seconds / 3600) * 3_600_000;
+  return i18n.t("common:usage.updated", { when: formatRelative(-rounded, "narrow") });
+}
+
+/** "4s ago" / "2m ago": how old the last picture is (Intl.RelativeTimeFormat). */
+export function pictureAge(capturedAt: number, now: number): string {
+  const seconds = Math.max(0, Math.round((now - capturedAt) / 1000));
+  if (seconds < 2) return i18n.t("screen:justNow");
+  const rounded = seconds < 60 ? seconds * 1000 : seconds < 3600 ? Math.floor(seconds / 60) * 60_000 : Math.floor(seconds / 3600) * 3_600_000;
+  return formatRelative(-rounded, "narrow");
 }
 
 /**

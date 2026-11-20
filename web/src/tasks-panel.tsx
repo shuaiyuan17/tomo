@@ -10,7 +10,8 @@ import { isShellTask, shellLabel } from "./shell.js";
 import { ShellPill } from "./shell-pill.js";
 import { ChunkBoundary } from "./chunk-boundary.js";
 import { ModelBadge } from "./model-badge.js";
-import { type TaskRow, type TreeGuide, buildTaskView, elapsed, formatElapsed, lastStep, STATE_LABELS, taskKind, treeGuides } from "./tasks.js";
+import { type TaskRow, type TreeGuide, buildTaskView, elapsed, formatElapsed, lastStep, stateLabel, taskKind, treeGuides } from "./tasks.js";
+import { i18n, useTranslation } from "./i18n/index.js";
 import { toolIcon } from "./tool-calls.js";
 
 /** A task's transcript view: its own chunk, fetched when a task is opened. */
@@ -21,6 +22,7 @@ const SubagentView = lazy(() => import("./subagent-view.js").then((m) => ({ defa
  * conversation can be stopped or moved to the background (`control`, see TaskControls).
  */
 export function TasksPanel({ tasks, sessions, onClose, footer, control }: { tasks: WebTask[]; sessions: WebSession[]; onClose?: () => void; footer?: ReactNode; control?: TaskControl }) {
+  const { t } = useTranslation("tasks");
   const [showAmbient, setShowAmbient] = useState(false);
   /** Open "N shell commands done" rows, per session and parent. */
   const [openFolds, setOpenFolds] = useState<Record<string, boolean>>({});
@@ -42,25 +44,25 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control }: { task
     return () => clearInterval(timer);
   }, [ticking]);
   const ambient = tasks.some((task) => task.ambient);
-  const close = onClose && <Button data-tasks-close variant="ghost" size="icon" aria-label="Close tasks" title="Close" onClick={onClose}
+  const close = onClose && <Button data-tasks-close variant="ghost" size="icon" aria-label={t("close")} title={t("closeTitle")} onClick={onClose}
     className="size-8 rounded-lg max-[600px]:size-10 hover:bg-foreground/[0.07] active:bg-foreground/[0.11] [&_svg:not([class*='size-'])]:size-5"><X strokeWidth={1.75} /></Button>;
   // Task list ↔ task view slide: in from the right when opening, from the left when going back.
   if (openTask) return <div className="motion-from-right relative flex min-h-0 flex-1 flex-col">
     <div className="absolute top-0 right-1">{close}</div>
-    <ChunkBoundary what="The task view" className="min-h-0 flex-1"><SubagentView key={`${openTask.sessionId}/${openTask.taskId}`} task={openTask} control={control} onBack={() => { setCameBack(true); setOpened(undefined); }} /></ChunkBoundary>
+    <ChunkBoundary what={t("view")} className="min-h-0 flex-1"><SubagentView key={`${openTask.sessionId}/${openTask.taskId}`} task={openTask} control={control} onBack={() => { setCameBack(true); setOpened(undefined); }} /></ChunkBoundary>
   </div>;
   return <section className={cn("flex min-h-0 flex-1 flex-col", cameBack && "motion-from-left")} aria-labelledby="tasks-heading">
     <div className="mb-1.5 flex items-center justify-between gap-3 pr-1 pl-2.5">
-      <h2 id="tasks-heading" className="m-0 text-base font-semibold tracking-[-0.1px]">Tasks</h2>
+      <h2 id="tasks-heading" className="m-0 text-base font-semibold tracking-[-0.1px]">{t("heading")}</h2>
       {close}
     </div>
     {ambient && <label className="mb-2.5 flex cursor-pointer items-center gap-2 px-2.5 tracking-[0.02em] text-[10px] text-muted-foreground">
       <Checkbox checked={showAmbient} onCheckedChange={(value) => setShowAmbient(value === true)} className="size-3.5 rounded-[4px]" />
-      Show watchers{view.hiddenAmbient ? ` (${view.hiddenAmbient})` : ""}</label>}
-    <div className="min-h-0 flex-1 overflow-y-auto pr-2.5 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] focus-visible:outline-offset-0" tabIndex={0} aria-label="Task list">
-      {view.groups.length === 0 ? <p className="m-0 px-2.5 text-[13px] text-muted-foreground">Nothing running in the background.</p>
+      {view.hiddenAmbient ? t("watchersCount", { count: view.hiddenAmbient }) : t("watchers")}</label>}
+    <div className="min-h-0 flex-1 overflow-y-auto pr-2.5 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] focus-visible:outline-offset-0" tabIndex={0} aria-label={t("list")}>
+      {view.groups.length === 0 ? <p className="m-0 px-2.5 text-[13px] text-muted-foreground">{t("empty")}</p>
         : view.groups.map((group) => <div className="[&+&]:mt-4" key={group.sessionId}>
-          <p className="mt-1 mb-1 px-2.5 tracking-[0.02em] text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{group.title}{group.kind === "group" ? <span> · group</span> : null}</p>
+          <p className="mt-1 mb-1 px-2.5 tracking-[0.02em] text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{group.title}{group.kind === "group" ? <span>{t("groupTag")}</span> : null}</p>
           <GroupRows sessionId={group.sessionId} rows={group.rows} now={now} openFolds={openFolds} setOpenFolds={setOpenFolds}
             onOpen={(task) => setOpened({ sessionId: task.sessionId, taskId: task.taskId })} />
         </div>)}
@@ -99,24 +101,25 @@ function kindIcon(taskType: string): { Icon: ReturnType<typeof toolIcon>; kind: 
 }
 
 function TaskCard({ task, depth, guide, now, onOpen, motion }: { task: WebTask; depth: number; guide?: TreeGuide; now: number; onOpen: () => void; motion?: string }) {
+  const { t } = useTranslation("tasks");
   const step = lastStep(task);
   const time = formatElapsed(elapsed(task, now));
   const running = task.state === "running";
   const shell = isShellTask(task.taskType);
   const icon = shell ? undefined : kindIcon(task.taskType);
   return <li ref={motion?.includes("motion-exit") ? measureExit : undefined} style={{ marginLeft: depth * INDENT }} className={cn("relative", motion)}>
-    <button type="button" title={shell ? `${shellLabel(task.description)}\n\n${task.description}\n\nOpen to see the full command` : taskKind(task)} onClick={onOpen}
+    <button type="button" title={shell ? t("shellTitle", { label: shellLabel(task.description), command: task.description }) : taskKind(task)} onClick={onOpen}
       className={cn("block w-full cursor-pointer rounded-xl px-2.5 py-2 text-left transition-colors hover:bg-foreground/[0.06] focus-visible:outline-offset-0", "transition-[background-color,opacity] duration-200")}>
       <div className="flex min-w-0 items-baseline justify-between gap-2.5">
         {shell ? <span className="min-w-0"><ShellPill command={task.description} /></span>
           : <span className={cn("text-[13px] leading-normal font-medium [overflow-wrap:anywhere]", !running && "text-muted-foreground")}>
             {icon && <icon.Icon data-task-icon={icon.kind} aria-hidden="true" className="mr-1.5 inline-block size-3.5 align-[-2px] text-muted-foreground" />}
-            {task.description || "Untitled task"}<ModelBadge model={task.model} /></span>}
+            {task.description || t("untitled")}<ModelBadge model={task.model} /></span>}
         {running && <span className="shrink-0 tracking-[0.02em] text-[10px] text-muted-foreground tabular-nums">
-          {task.background && <span data-testid="task-background" title="Keeps running after Tomo has replied">background · </span>}{time}</span>}
+          {task.background && <span data-testid="task-background" title={t("backgroundTitle")}>{t("backgroundTag")}</span>}{time}</span>}
       </div>
       <p className="mt-0.5 mb-0 text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]">
-        {running ? <><span className="shimmer">Working</span>{step && <> · {step}</>}</> : <>{STATE_LABELS[task.state]} · {time}</>}
+        {running ? <><span className="shimmer">{t("working")}</span>{step && <> · {step}</>}</> : <>{stateLabel(task.state)} · {time}</>}
       </p>
     </button>
     {guide && <TreeLines depth={depth} guide={guide} elbowY={18} />}
@@ -130,7 +133,7 @@ function FoldedShells({ count, depth, guide, open, onToggle, motion }:
     <button type="button" aria-expanded={open} onClick={onToggle}
       className="flex w-full cursor-pointer items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground">
       <ChevronRight className={cn("size-3.5 shrink-0 transition-transform", open && "rotate-90")} />
-      <TerminalIcon className="size-3 shrink-0" aria-hidden="true" />{count} shell commands done</button>
+      <TerminalIcon className="size-3 shrink-0" aria-hidden="true" />{i18n.t("tasks:foldedShells", { count })}</button>
     {guide && <TreeLines depth={depth} guide={guide} elbowY={15} />}
   </li>;
 }

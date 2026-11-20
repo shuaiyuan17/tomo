@@ -19,6 +19,21 @@ const MIN_COMPRESS_BYTES = 1024;
 const WARM_MAX_BYTES = 16 * 1024 * 1024;
 export type Encoding = "br" | "gzip";
 
+/**
+ * The page's language, known before any script runs: config `locale` on the
+ * `<html>` element (`lang`, and `data-tomo-locale` for the bundle's i18n init
+ * to read synchronously), so the first paint is already in that language. An
+ * attribute, not an inline script, so the CSP stays `script-src 'self'`.
+ * Without a configured locale the page is served as built and the browser's
+ * own language decides.
+ */
+export function localizeIndexHtml(html: Buffer, locale: string | undefined): Buffer {
+  if (!locale || !/^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$/.test(locale)) return html;
+  const text = html.toString("utf8");
+  const tagged = text.replace(/<html\b[^>]*>/i, `<html lang="${locale}" data-tomo-locale="${locale}">`);
+  return tagged === text ? html : Buffer.from(tagged, "utf8");
+}
+
 /** The best encoding the request accepts: brotli, then gzip, else none (`q=0` refuses one). */
 export function pickEncoding(header: string | string[] | undefined): Encoding | undefined {
   const accepted = new Map<string, number>();

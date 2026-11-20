@@ -1,3 +1,4 @@
+import { i18n } from "./i18n/index.js";
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent, type MouseEvent, type PointerEvent } from "react";
 
 /** Tasks rail width the owner chose by dragging, kept across reloads. */
@@ -146,7 +147,7 @@ export function useRailWidth(options: { enabled: boolean; sidebar: () => number 
   const separator = bounds ? {
     role: "separator" as const,
     tabIndex: 0,
-    "aria-label": "Resize the Tasks panel",
+    "aria-label": i18n.t("common:tasksRail.resize"),
     "aria-orientation": "vertical" as const,
     "aria-valuenow": current,
     "aria-valuemin": bounds.min,

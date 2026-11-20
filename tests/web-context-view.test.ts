@@ -123,7 +123,7 @@ describe("the Context page", () => {
     const fills = /<ul aria-label="What fills the window"[^>]*>(.*?)<\/ul>/.exec(html)![1];
     expect(fills).toContain("Messages");
     expect(fills).not.toMatch(/Free space|Compact buffer|deferred/);
-    expect(/<ul aria-label="Deferred, not in the window"[^>]*>(.*?)<\/ul>/.exec(html)![1]).toContain("59.0k");
+    expect(/<ul aria-label="Deferred, not in the window"[^>]*>(.*?)<\/ul>/.exec(html)![1]).toContain("59K");
   });
 
   it("colours the meter by how full the window is", () => {
@@ -143,9 +143,9 @@ describe("the Context page", () => {
     expect([...html.matchAll(/data-segment="(\w+)"/g)].map((m) => m[1])).toEqual(["used", "reserved"]);
     expect(html).toContain("What filled it");
     expect(html).toContain("data-stale-breakdown");
-    expect(html).toContain("128k at the last full reading");
+    expect(html).toContain("128K at the last full reading");
     const rows = /<ul aria-label="What filled the window at the last full reading"[^>]*>(.*?)<\/ul>/.exec(html)![1];
-    expect(rows).toMatch(/97\.0k<span[^>]*>76%<\/span>/); // of the 128.4k it was measured with, not of the 60k estimate
+    expect(rows).toMatch(/97K<span[^>]*>76%<\/span>/); // of the 128.4k it was measured with, not of the 60k estimate
     expect(html).not.toContain("What fills it");
     expect(render(context())).not.toContain("data-stale-breakdown");
   });

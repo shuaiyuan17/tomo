@@ -484,6 +484,12 @@ export interface UsageWindowView {
   /** session = the 5-hour window, weekly = 7-day; scoped = per model/surface. */
   group: "session" | "weekly" | "other";
   scoped: boolean;
+  /** The limit's kind as the endpoint names it ("session", "weekly_all", "weekly_scoped", …), so a
+   *  client can word the window itself instead of showing the English `label`. */
+  kind?: string;
+  /** What a scoped window is scoped to (a model name, a surface), as data. */
+  model?: string;
+  surface?: string;
   /** 0–100, or null when the endpoint gave none. */
   percent: number | null;
   /** ms epoch, or null. */
@@ -510,6 +516,9 @@ export function usageWindows(data: UsageResponse | null | undefined): UsageWindo
       return {
         id: `${limit.kind || "limit"}:${limit.modelName}:${limit.surface}:${index}`,
         label: limitLabel(limit),
+        kind: limit.kind || undefined,
+        ...(limit.modelName ? { model: limit.modelName } : {}),
+        ...(limit.surface ? { surface: limit.surface } : {}),
         group: rank === 0 ? "session" : rank === 1 ? "weekly" : "other",
         scoped: !!(limit.modelName || limit.surface) || limit.kind.endsWith("_scoped"),
         percent: limit.percent,
@@ -519,14 +528,14 @@ export function usageWindows(data: UsageResponse | null | undefined): UsageWindo
       };
     });
   }
-  const legacy: Array<[string, string, UsageWindowView["group"], boolean, UsageWindow | null | undefined]> = [
-    ["five_hour", "Session (5h)", "session", false, d.five_hour],
-    ["seven_day", "Weekly (all)", "weekly", false, d.seven_day],
-    ["seven_day_opus", "Weekly · Opus", "weekly", true, d.seven_day_opus],
-    ["seven_day_sonnet", "Weekly · Sonnet", "weekly", true, d.seven_day_sonnet],
+  const legacy: Array<[string, string, UsageWindowView["group"], boolean, UsageWindow | null | undefined, string | undefined]> = [
+    ["five_hour", "Session (5h)", "session", false, d.five_hour, undefined],
+    ["seven_day", "Weekly (all)", "weekly", false, d.seven_day, undefined],
+    ["seven_day_opus", "Weekly · Opus", "weekly", true, d.seven_day_opus, "Opus"],
+    ["seven_day_sonnet", "Weekly · Sonnet", "weekly", true, d.seven_day_sonnet, "Sonnet"],
   ];
-  return legacy.filter(([, , , , w]) => w && typeof w === "object").map(([id, label, group, scoped, w]) => ({
-    id, label, group, scoped,
+  return legacy.filter(([, , , , w]) => w && typeof w === "object").map(([id, label, group, scoped, w, model]) => ({
+    id, label, group, scoped, kind: scoped ? "weekly_scoped" : group === "session" ? "session" : "weekly_all", ...(model ? { model } : {}),
     percent: typeof w!.utilization === "number" && Number.isFinite(w!.utilization) ? w!.utilization : null,
     resetsAt: resets(w!.resets_at), active: false, elevated: false,
   }));

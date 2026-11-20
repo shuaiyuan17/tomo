@@ -9,6 +9,7 @@ import { cronFlashing, homeCaption, localizeHomeStatus, newerStatus, type LocalH
 import { HOME_SNAPSHOT_MAX_BYTES } from "./contract.js";
 import { snapshotBody } from "./snapshot.js";
 import type { RoomFailure, RoomHandle } from "./room-view.js";
+import { i18n } from "../i18n/index.js";
 
 /**
  * The Home page: Tomo's room, drawn from the scene Tomo wrote, and one line
@@ -81,7 +82,7 @@ export function HomePage({ events, bootstrap, refresh, inert }: {
   const status = newerStatus(fetched, events.status)?.status;
   // Never behind the status itself (the ticker may be older than the answer it reads).
   const now = Math.max(useNow(!!status && cronFlashing(status, Date.now())), status?.at ?? 0);
-  const caption = status ? homeCaption(status, now) : loaded.state === "error" ? `Can't tell what ${agent} is doing right now` : "…";
+  const caption = status ? homeCaption(status, now) : loaded.state === "error" ? i18n.t("home:unknownStatus", { agent }) : "…";
 
   // three.js arrives in its own chunk, only now.
   const [room, setRoom] = useState<RoomModule | null>(null);
@@ -116,23 +117,23 @@ export function HomePage({ events, bootstrap, refresh, inert }: {
 
   const home = loaded.state === "ready" ? loaded.home : undefined;
   const backdrop = home?.scene.room.backdrop ?? "#1b1a19";
-  const failureText = failure === "chunk" ? "The room's drawing code didn't load."
-    : failure === "webgl" ? "This browser can't draw the 3D room (WebGL is unavailable)."
-    : failure === "lost" ? "The room stopped drawing (the graphics context was lost)." : null;
+  const failureText = failure === "chunk" ? i18n.t("home:failure.chunk")
+    : failure === "webgl" ? i18n.t("home:failure.webgl")
+    : failure === "lost" ? i18n.t("home:failure.lost") : null;
   const working = !!status && (status.working || status.compacting);
   return <main id="home" tabIndex={-1} inert={inert} className="flex min-h-0 min-w-0 flex-1 flex-col px-8 pt-6 pb-4 max-[1024px]:px-6 max-[800px]:px-5 max-[600px]:px-0 max-[600px]:pt-0 max-[600px]:pb-[max(0.75rem,env(safe-area-inset-bottom))]">
-    <h1 className="sr-only">{agent}'s home</h1>
+    <h1 className="sr-only">{i18n.t("home:heading", { agent })}</h1>
     <div className={cn("relative min-h-0 flex-1 overflow-hidden rounded-2xl border max-[600px]:rounded-none max-[600px]:border-x-0 max-[600px]:border-t-0", (failureText || loaded.state === "error") && "bg-muted/40")}
       style={failureText || loaded.state === "error" ? undefined : { backgroundColor: backdrop }} data-testid="home-room">
       {failureText ? <div className="flex size-full flex-col items-center justify-center gap-3 p-6 text-center text-[13px] text-muted-foreground" role="note">
-          <p className="m-0 max-w-80">{failureText} What {agent} is doing is still written below.</p>
-          {failure !== "webgl" && <Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { if (failure === "chunk") window.location.reload(); else { setFailure(null); setRoom(null); setAttempt((n) => n + 1); } }}>Try again</Button>}</div>
+          <p className="m-0 max-w-80">{i18n.t("home:failure.note", { failure: failureText, agent })}</p>
+          {failure !== "webgl" && <Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { if (failure === "chunk") window.location.reload(); else { setFailure(null); setRoom(null); setAttempt((n) => n + 1); } }}>{i18n.t("home:retry")}</Button>}</div>
         : loaded.state === "error" ? <div className="flex size-full flex-col items-center justify-center gap-3 p-6 text-center text-[13px] text-muted-foreground" role="note">
-          <p className="m-0 max-w-80">{loaded.code === "not_found" ? `This ${agent} doesn't serve a home yet.` : `${agent}'s home couldn't be read.`}</p>
-          <Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => setLocal((n) => n + 1)}>Try again</Button></div>
+          <p className="m-0 max-w-80">{loaded.code === "not_found" ? i18n.t("home:notFound", { agent }) : i18n.t("home:unreadable", { agent })}</p>
+          <Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => setLocal((n) => n + 1)}>{i18n.t("home:retry")}</Button></div>
         : home && room && status ? <room.RoomView key={attempt} scene={home.scene} revision={home.revision} status={status} now={now}
-          label={`${agent}'s home, ${home.scene.name ?? "a small room"}. ${caption}.`} handle={handle} onFailure={setFailure} onReady={() => setDrawn(true)} />
-        : <p className="sr-only" role="status">Opening the room…</p>}
+          label={i18n.t("home:roomLabel", { agent, name: home.scene.name ?? i18n.t("home:smallRoom"), caption })} handle={handle} onFailure={setFailure} onReady={() => setDrawn(true)} />
+        : <p className="sr-only" role="status">{i18n.t("home:opening")}</p>}
     </div>
     <div className="w-full px-1 pt-3 max-[600px]:px-4">
       <p className="m-0 flex items-baseline gap-2 text-[13px] leading-relaxed text-muted-foreground" role="status" aria-live="polite">
@@ -140,10 +141,10 @@ export function HomePage({ events, bootstrap, refresh, inert }: {
         <span className="min-w-0 flex-1" data-testid="home-caption">{caption}</span>
         {home?.scene.name && <span className="shrink-0 text-[11px] tracking-[0.02em] max-[600px]:hidden">{home.scene.name}</span>}</p>
       {home?.problems?.length ? <details className="mt-1 text-[12px] text-muted-foreground">
-          <summary className="cursor-pointer select-none">{agent}'s latest change has a problem; showing the last good room.</summary>
+          <summary className="cursor-pointer select-none">{i18n.t("home:problem", { agent })}</summary>
           <ul className="mt-1 mb-0 pl-5">{home.problems.slice(0, 20).map((problem, i) => <li key={i} className="[overflow-wrap:anywhere]">{problem}</li>)}</ul></details>
         : null}
-      {home?.starter && <p className="m-0 mt-1 text-[12px] text-muted-foreground">This is the starter room; {agent} hasn't made one of its own yet.</p>}
+      {home?.starter && <p className="m-0 mt-1 text-[12px] text-muted-foreground">{i18n.t("home:starter", { agent })}</p>}
     </div>
   </main>;
 }

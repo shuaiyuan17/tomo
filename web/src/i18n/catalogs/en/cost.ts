@@ -1,0 +1,53 @@
+/** The Study's Cost page. */
+export const cost = {
+  category: {
+    you: "You", youHint: "Turns started by a message: yours, or one in a group",
+    background: "Background", backgroundHint: "Heartbeats and turns that pick up finished background work",
+    scheduled: "Scheduled", scheduledHint: "Cron jobs and other scheduled turns",
+  },
+  lessThan: "<{{value}}", resetsAt: "resets {{when}}",
+  day: { today: "Today so far", yesterday: "Yesterday", other: "That day" },
+  typical: { above: "{{ratio}}× a typical day", below: "{{percent}}% below a typical day", about: "About a typical day" },
+  turn: {
+    heartbeat: "Heartbeat", background: "Background work finished", restart: "After a restart", delegate: "Delegated message",
+    cron: "Scheduled job", scheduled: "Scheduled turn", other: "Turn",
+    tools_one: "{{count}} tool", tools_other: "{{count}} tools", backfilled: "from the activity log",
+  },
+  est: { label: "est.", title: "Estimated at API list prices by the Claude SDK. On a subscription this is not what you pay." },
+  heatmap: {
+    nothing: "{{day}}: nothing recorded", title: "{{day}}: {{cost}}", overcountedTitle: "{{day}}: {{cost}} (over-counted, before the Sep 23 fix)",
+    overcountedLabel: "{{day}}: {{cost}}, over-counted", top: "{{cost}}+", overcounted: "over-counted (before #389)",
+  },
+  byHour: "by hour", byHourLabel: "Cost by hour", loading: "Loading cost",
+  error: { cost_unavailable: "Cost data is not available on this install.", invalid_range: "That day cannot be shown.", other: "Cost is unavailable right now." },
+  empty: { heading: "Nothing recorded yet", body: "Every turn from now on is written to the usage ledger, and its estimated cost shows up here as soon as it finishes." },
+  calendar: { heading: "Ten weeks", since: "since {{day}}", pick: "pick a day" },
+  footnote: "Dollar figures are the Claude SDK's estimate at API list prices. On a subscription you pay a flat fee, so read them as how much work was done, not as a bill. Before Sep 23 resumed sessions were over-counted (#389); those days are shown dashed and never compared.",
+  quota: { sampled: "Sampled {{when}}", asOf: " · as of {{when}}" },
+  glance: {
+    heading: "At a glance", apiEquivalent: "API-equivalent", thisWeek: "This week", noComparison: "No fair comparison yet", weekBefore: "{{cost}} the week before",
+    days30: "30 days", includesOvercounted: "includes over-counted days", recorded_one: "{{count}} day recorded", recorded_other: "{{count}} days recorded",
+    perDay: "{{cost}} a day", typical: "Typical day", median_one: "median, {{count}} day", median_other: "median, {{count}} days",
+    noFairDays: "no fair days yet", busiest: "Busiest",
+  },
+  dayPanel: {
+    notRecorded: "Nothing was recorded this day: the usage ledger starts later.",
+    overcounted: "Over-counted: until the fix on Sep 23 (#389) a resumed session was charged its whole history, so this day is too high and is never compared.",
+    noTurns: "No turns this day.",
+    turns_one: "{{count}} turn", turns_other: "{{count}} turns",
+    turnsPeak_one: "{{count}} turn · busiest around {{hour}}", turnsPeak_other: "{{count}} turns · busiest around {{hour}}",
+    whereHeading: "Where it went", costliest: "Costliest turns",
+    all_one: "All {{count}} turn.", all_other: "All {{count}} turns.",
+    largest_one: "The {{top}} largest of {{count}} turn: {{share}}% of the day.", largest_other: "The {{top}} largest of {{count}} turns: {{share}}% of the day.",
+    subagents: " A turn's figure includes subagents that finished while it ran.",
+  },
+  period: {
+    label: "Period", days_one: "{{count}} day", days_other: "{{count}} days", who: "Who started it", whoLabel: "Cost by who started it",
+    noTurns_one: "No turns in the last {{count}} day.", noTurns_other: "No turns in the last {{count}} days.",
+    note_one: "{{turns}} turn. Background is heartbeats and turns that pick up finished subagents.",
+    note_other: "{{turns}} turns. Background is heartbeats and turns that pick up finished subagents.",
+    overcounted: " Includes over-counted days.",
+    scheduled: "Scheduled jobs", scheduledLabel: "Cost by scheduled job", last_one: "last {{count}} day", last_other: "last {{count}} days",
+    runs_one: "{{count}} run", runs_other: "{{count}} runs", runsEach_one: "{{count}} run · {{each}} each", runsEach_other: "{{count}} runs · {{each}} each",
+  },
+} as const;

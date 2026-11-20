@@ -1,4 +1,8 @@
 import type { HomeSky, HomeStatus } from "../../../src/home/status.js";
+import { i18n } from "../i18n/index.js";
+
+/** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
+// i18n-dynamic: home:weather.*
 
 /**
  * What is outside the window, without three.js: the sky the daemon reported
@@ -44,11 +48,13 @@ export function skyLight(sky: Sky): { factor: number; tint: string; tintAmount: 
   return { factor: phase.factor * weather, tint: phase.tintAmount ? phase.tint : "#b9c6d8", tintAmount: phase.tintAmount || cool };
 }
 
-const WORDS: Record<HomeSky["weather"], string> = { clear: "clear", clouds: "cloudy", overcast: "overcast", fog: "foggy", rain: "raining", snow: "snowing", storm: "stormy" };
+const WORDS = { clear: "home:weather.clear", clouds: "home:weather.clouds", overcast: "home:weather.overcast", fog: "home:weather.fog",
+  rain: "home:weather.rain", snow: "home:weather.snow", storm: "home:weather.storm" } as const satisfies Record<HomeSky["weather"], string>;
 /** "12°C, raining" — only when the daemon reported the weather. */
 export function weatherWords(sky: Sky): string {
   if (!sky.known) return "";
-  return sky.tempC === undefined ? WORDS[sky.weather] : `${Math.round(sky.tempC)}°C, ${WORDS[sky.weather]}`;
+  const words = i18n.t(WORDS[sky.weather]);
+  return sky.tempC === undefined ? words : i18n.t("home:weather.withTemp", { temp: Math.round(sky.tempC), words });
 }
 
 /** The weather moves (rain, snow, drifting cloud, a storm's flashes); a clear sky stands still. */

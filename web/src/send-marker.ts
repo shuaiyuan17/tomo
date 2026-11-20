@@ -1,3 +1,4 @@
+import { i18n } from "./i18n/index.js";
 /**
  * The marker the daemon puts in front of a message Tomo sent on its own
  * (src/agent/proactive-send.ts, `send_message` direct mode) when it records
@@ -20,5 +21,5 @@ export function parseSendMarker(role: string, content: string): { sent?: SendMar
 
 /** The label a marked message carries in its header. */
 export function sendMarkerLabel(sent: SendMarker): string {
-  return sent.kind === "proactive" ? "Sent proactively" : `Sent from ${sent.from}`;
+  return sent.kind === "proactive" ? i18n.t("chat:message.proactive") : i18n.t("chat:message.sentFrom", { from: sent.from });
 }

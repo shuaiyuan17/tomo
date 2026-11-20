@@ -1,0 +1,53 @@
+/** The Study's shell and its Memory, MCP and Config pages, plus the page states they share. */
+export const study = {
+  page: { todos: "Todos", memory: "Memory", context: "Context", model: "Model", cost: "Cost", cron: "Cron", mcp: "MCP servers", config: "Config" },
+  intro: {
+    todos: "What {{agent}} is keeping track of, and who moves next. Read-only here: todos change in conversation or with /todo.",
+    memory: "What {{agent}} remembers, as it is written in the workspace. Private memory is never shown in the browser.",
+    context: "How full the selected conversation's context window is, what fills it, and what has been rolled up.",
+    model: "Which model the selected conversation runs on. Your own conversation can be switched here.",
+    cost: "What {{agent}}'s work would cost at API prices, day by day, and how much of your plan it is using.",
+    cron: "Scheduled jobs and when they last ran.",
+    mcp: "Tool servers in config.json and in live sessions, with the connection state the sessions report.",
+    config: "This browser's language, and the saved config.json. Only known non-sensitive text is shown; everything else is hidden.",
+  },
+  refresh: "Refresh", sections: "Study sections", chooseConversation: "Choose a conversation in the sidebar.",
+  error: {
+    memory_not_found: "That file is not available.", memory_limit: "That file is too large to show here.",
+    memory_invalid_path: "That path cannot be opened.", cron_unavailable: "The cron store could not be read.",
+    config_invalid: "config.json is not valid JSON.", config_unavailable: "config.json could not be read.",
+    session_not_found: "That conversation is no longer available.", request_limit: "Busy — try again in a moment.",
+    other: "Unavailable right now.",
+  },
+  memory: {
+    missing: "The workspace has no memory folder yet.", search: "Search memory", clearSearch: "Clear search", noMatches: "No matches.",
+    searchTruncated: "Showing the first matches only.", treeTruncated: "The tree is large; only part of it is listed.",
+    choose: "Choose a file to read it.", updated: "Updated {{when}}",
+    hiddenLines_one: "{{count}} line links to private memory and is not shown.", hiddenLines_other: "{{count}} lines link to private memory and are not shown.",
+  },
+  mcp: {
+    status: { connected: "Connected", failed: "Failed", needsAuth: "Needs sign-in", pending: "Connecting", disabled: "Disabled", noAnswer: "Did not answer" },
+    oauth: { loginRequired: "Sign-in needed", authPending: "Sign-in pending", authFailed: "Sign-in failed", hint: "{{state}}: send <cmd>/mcp login {{name}}</cmd> in your private chat." },
+    reconnect: {
+      action: "Reconnect", running: "Reconnecting…", reconnected: "Reconnected.",
+      failed: "Reconnect failed. The log has the reason; /new starts a fresh session.",
+      noLiveSession: "There is no live session to reconnect in. A new conversation connects every server afresh.",
+      busy: "A reply is in progress. Try again once it has finished.",
+      restarted: "Tomo restarted since this page loaded. Refresh and try again.", unavailable: "Reconnect is unavailable right now.",
+    },
+    emptyNoSession: "No external MCP servers in config.json, and no live session to report the built-in ones.",
+    empty: "No MCP servers in config.json or reported by a live session.",
+    liveUnavailable: "Live connection status is unavailable right now.",
+    noLiveSession: "No live session: connection state appears once a conversation is running.",
+    enabled: "Enabled", disabled: "Disabled", alwaysLoaded: "Always loaded", sessionProvided: "Session-provided",
+    configured: "{{names}} set", noSettings: "No connection settings", timeout: " · timeout {{seconds}}s",
+    notLoadedDisabled: "Not loaded while disabled.", statusUnknown: "Status unknown.", notLoaded: "Not loaded in any live session.",
+    noSession: "No live session.", yourConversation: "your conversation",
+  },
+  config: {
+    notSet: "Not set", hidden: "Hidden", chars_one: "{{count}} char", chars_other: "{{count}} chars", set: "Set", empty: "empty",
+    missing: "No config.json yet.", general: "general",
+    note: "Read-only · saved {{when}} · values the daemon is running with may differ until it restarts.",
+    truncated: "Only the first 500 settings are listed.",
+  },
+} as const;

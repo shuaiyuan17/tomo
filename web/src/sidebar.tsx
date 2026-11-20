@@ -12,11 +12,17 @@ import { PlanUsage } from "./plan-usage.js";
 import { pinOwnerFirst } from "./session-order.js";
 import type { Theme } from "./theme.js";
 import type { useWeb } from "./use-web.js";
+import { useTranslation } from "./i18n/index.js";
+import { formatNumber } from "./i18n/format.js";
+
+/** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
+// i18n-dynamic: common:nav.*
+// i18n-dynamic: common:theme.*
 
 type Web = ReturnType<typeof useWeb>;
 
-const THEMES = [["system", "System theme", SunMoon], ["light", "Light theme", Sun], ["dark", "Dark theme", Moon]] as const;
-const NAVIGATION = [["conversation", "Conversation", MessageCircle], ["home", "Home", House], ["study", "The Study", BookOpen]] as const;
+const THEMES = [["system", "theme.system", SunMoon], ["light", "theme.light", Sun], ["dark", "theme.dark", Moon]] as const;
+const NAVIGATION = [["conversation", "nav.conversation", MessageCircle], ["home", "nav.home", House], ["study", "nav.study", BookOpen]] as const;
 
 /**
  * The sidebar: where to go (conversation, Home, the Study), which
@@ -31,31 +37,32 @@ export function Sidebar({ sidebarRef, view, onNavigate, drawer, phone, inert, se
   theme: Theme; onTheme: (theme: Theme) => void;
   web: Pick<Web, "bootstrap" | "refreshBootstrap" | "compact" | "tasks" | "connection" | "rateLimit">;
 }) {
+  const { t } = useTranslation();
   return <aside ref={sidebarRef} id="sidebar" data-state={drawer ? "open" : "closed"} {...(drawer ? { role: "dialog", "aria-modal": true } : {})}
     className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:fixed max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:bottom-0 max-[600px]:left-0 max-[600px]:z-30 max-[600px]:w-[min(320px,86vw)] max-[600px]:bg-background max-[600px]:px-5 max-[600px]:pt-5 max-[600px]:pb-[max(1.25rem,env(safe-area-inset-bottom))] max-[600px]:shadow-2xl max-[600px]:transition-transform max-[600px]:duration-[220ms] max-[600px]:data-[state=closed]:-translate-x-full max-[600px]:data-[state=closed]:shadow-none"
-    aria-label="Conversation details" inert={inert || (phone && !drawer)} aria-hidden={phone && !drawer ? true : undefined}>
-    <nav aria-label="Workspace" className="mb-7 flex flex-col gap-0.5">
+    aria-label={t("sidebar.label")} inert={inert || (phone && !drawer)} aria-hidden={phone && !drawer ? true : undefined}>
+    <nav aria-label={t("sidebar.workspace")} className="mb-7 flex flex-col gap-0.5">
       {NAVIGATION.map(([target, label, Icon]) =>
         <Button key={label} variant="ghost" aria-current={view === target ? "page" : undefined} onClick={() => { onNavigate(target); if (drawer) closeDrawer(false); }}
           className="h-9 justify-start gap-2.5 rounded-xl px-3 text-[13px] font-normal text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground aria-[current=page]:bg-foreground/[0.08] aria-[current=page]:font-medium aria-[current=page]:text-foreground max-[600px]:h-10 max-[600px]:text-[14px]">
-          <Icon strokeWidth={1.75} /><span>{label}</span></Button>)}
+          <Icon strokeWidth={1.75} /><span>{t(label)}</span></Button>)}
     </nav>
-    <p className="eyebrow mb-3">Your conversations</p>
+    <p className="eyebrow mb-3">{t("sidebar.conversations")}</p>
     <div className="mb-1.5 flex items-center justify-between gap-2">
-      <span id="session-label" className="text-[13px] font-medium">Session</span>
-      {session?.kind === "group" && <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">Read-only</Badge>}
+      <span id="session-label" className="text-[13px] font-medium">{t("sidebar.session")}</span>
+      {session?.kind === "group" && <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{t("sidebar.readOnly")}</Badge>}
     </div>
     <SessionPicker sessions={sessions} ownerId={ownerId} session={session} onSelect={onSelect} drawer={drawer} closeDrawer={closeDrawer} />
-    {session?.kind === "group" && <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">Shared history. Messages can be sent from the group's messaging channel.</p>}
+    {session?.kind === "group" && <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{t("sidebar.groupNote")}</p>}
     <ContextWindow session={session} web={web} />
     <PlanUsage ready={!!web.bootstrap} locked={web.connection === "locked"} live={web.rateLimit} />
     {/* Theme: pinned to the bottom of the sidebar (and of the phone drawer). */}
     <div className="mt-auto flex items-center justify-between gap-3 border-t pt-4 max-[600px]:mt-8">
-      <span className="eyebrow">Theme</span>
-      <ToggleGroup type="single" aria-label="Color theme" value={theme} onValueChange={(value) => { if (value) onTheme(value as Theme); }}
+      <span className="eyebrow">{t("theme.heading")}</span>
+      <ToggleGroup type="single" aria-label={t("theme.label")} value={theme} onValueChange={(value) => { if (value) onTheme(value as Theme); }}
         className="rounded-xl bg-foreground/[0.05] p-0.5 max-[600px]:rounded-[13px]">
         {THEMES.map(([value, label, Icon]) =>
-          <ToggleGroupItem key={value} value={value} aria-label={label} title={label}
+          <ToggleGroupItem key={value} value={value} aria-label={t(label)} title={t(label)}
             className="size-7 rounded-[9px]! px-0 text-muted-foreground max-[600px]:size-10 max-[600px]:rounded-[11px]! hover:bg-transparent hover:text-foreground data-[state=on]:bg-card data-[state=on]:text-foreground data-[state=on]:shadow-sm dark:data-[state=on]:bg-foreground/[0.13] [&_svg:not([class*='size-'])]:size-3.5 max-[600px]:[&_svg:not([class*='size-'])]:size-[18px]">
             <Icon strokeWidth={1.75} /></ToggleGroupItem>)}
       </ToggleGroup>
@@ -75,14 +82,15 @@ function SessionPicker({ sessions, ownerId, session, onSelect, drawer, closeDraw
   // A pick in the phone drawer: the drawer closed and its menu button took focus already.
   const pickedInDrawer = useRef(false);
   const trigger = useRef<HTMLButtonElement>(null);
+  const { t } = useTranslation();
   const pickerSessions = pinOwnerFirst(sessions, ownerId);
   return <DropdownMenu modal={false}>
     <DropdownMenuTrigger asChild disabled={!sessions.length}>
       <Button ref={trigger} variant="outline" aria-labelledby="session-label session-value"
         className="h-11 w-full min-w-0 justify-between rounded-xl bg-card px-3.5 text-[13px] font-normal shadow-xs hover:bg-accent">
         <span id="session-value" className="flex min-w-0 flex-1 items-center gap-2">
-          <span className="truncate" title={session?.title}>{session ? `${session.title}${session.kind === "group" ? " · read-only" : ""}` : "No session available"}</span>
-          {session && session.id === ownerId && <span data-testid="session-main" role="img" aria-label="Main session" title="Main session" className="ml-auto flex shrink-0 pl-1"><Pin aria-hidden="true" className="size-3.5 text-primary" strokeWidth={2} /></span>}
+          <span className="truncate" title={session?.title}>{session ? session.kind === "group" ? t("sidebar.groupTitle", { title: session.title }) : session.title : t("sidebar.noSession")}</span>
+          {session && session.id === ownerId && <span data-testid="session-main" role="img" aria-label={t("sidebar.mainSession")} title={t("sidebar.mainSession")} className="ml-auto flex shrink-0 pl-1"><Pin aria-hidden="true" className="size-3.5 text-primary" strokeWidth={2} /></span>}
         </span>
         <ChevronsUpDown className="text-muted-foreground" /></Button>
     </DropdownMenuTrigger>
@@ -94,13 +102,13 @@ function SessionPicker({ sessions, ownerId, session, onSelect, drawer, closeDraw
         if (pickedInDrawer.current) event.preventDefault();
         else if (pickedByPointer.current) { event.preventDefault(); trigger.current?.focus({ focusVisible: false } as FocusOptions); }
         pickedByPointer.current = false; pickedInDrawer.current = false; }}>
-      <DropdownMenuLabel className="px-2 py-1.5 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">Conversations</DropdownMenuLabel>
+      <DropdownMenuLabel className="px-2 py-1.5 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">{t("sidebar.picker")}</DropdownMenuLabel>
       <DropdownMenuRadioGroup value={session?.id ?? ""} onValueChange={(value) => { onSelect(value); if (drawer) { pickedInDrawer.current = true; closeDrawer(!pickedByPointer.current); } }}>
         {pickerSessions.map((s, i) => <Fragment key={s.id}>
           <DropdownMenuRadioItem value={s.id} className="rounded-lg py-2 text-[13px]">
             <span className="min-w-0 truncate" title={s.title}>{s.title}</span>
-            {s.id === ownerId ? <span className={mainTag}><Pin aria-hidden="true" className="size-3 text-primary" strokeWidth={2} />main</span>
-              : s.kind === "group" && <span className={mainTag}>read-only</span>}
+            {s.id === ownerId ? <span className={mainTag}><Pin aria-hidden="true" className="size-3 text-primary" strokeWidth={2} />{t("sidebar.mainTag")}</span>
+              : s.kind === "group" && <span className={mainTag}>{t("sidebar.readOnlyTag")}</span>}
           </DropdownMenuRadioItem>
           {s.id === ownerId && i < pickerSessions.length - 1 && <DropdownMenuSeparator />}
         </Fragment>)}
@@ -111,20 +119,21 @@ function SessionPicker({ sessions, ownerId, session, onSelect, drawer, closeDraw
 
 /** The selected conversation's context window, with Compact for the owner's own. */
 function ContextWindow({ session, web }: { session?: WebSession; web: Pick<Web, "bootstrap" | "refreshBootstrap" | "compact" | "tasks"> }) {
+  const { t } = useTranslation();
   const usage = session?.stats;
   const ownerId = web.bootstrap?.ownerId;
   return <section className="mt-8 border-t pt-7" aria-labelledby="context-heading">
-    <div className="mb-3 flex items-center justify-between gap-2"><p className="eyebrow m-0" id="context-heading">Context window</p>
+    <div className="mb-3 flex items-center justify-between gap-2"><p className="eyebrow m-0" id="context-heading">{t("context.heading")}</p>
       <CompactButton bootstrap={web.bootstrap} refresh={web.refreshBootstrap} ownerSession={!!session && session.id === ownerId}
         running={web.tasks.filter((t) => t.sessionId === ownerId && t.state === "running" && !t.ambient).length}
         request={web.compact} /></div>
     {usage?.contextMax ? <>
-      <p className="mb-3 text-lg tabular-nums" title={`${usage.contextEstimated ? "Estimated" : "Reported"} tokens, last recorded turn`}>
-        {usage.contextEstimated ? "~" : ""}{usage.contextUsed.toLocaleString()} <span className="text-xs text-muted-foreground">/ {usage.contextMax.toLocaleString()}</span></p>
-      <Progress max={usage.contextMax} value={Math.min(usage.contextUsed, usage.contextMax)} aria-label="Context tokens used" className="h-1.5 bg-border" />
+      <p className="mb-3 text-lg tabular-nums" title={usage.contextEstimated ? t("context.estimated") : t("context.reported")}>
+        {usage.contextEstimated ? "~" : ""}{formatNumber(usage.contextUsed)} <span className="text-xs text-muted-foreground">/ {formatNumber(usage.contextMax)}</span></p>
+      <Progress max={usage.contextMax} value={Math.min(usage.contextUsed, usage.contextMax)} aria-label={t("context.progress")} className="h-1.5 bg-border" />
     </> : <>
-      <p className="mb-3 text-lg tabular-nums">Unavailable</p>
-      <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">Usage appears after a turn reports its context window.</p>
+      <p className="mb-3 text-lg tabular-nums">{t("context.unavailable")}</p>
+      <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{t("context.empty")}</p>
     </>}
   </section>;
 }

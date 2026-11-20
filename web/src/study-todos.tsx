@@ -6,9 +6,15 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { useAgentName } from "./agent-name.js";
+import { useTranslation } from "./i18n/index.js";
+import { formatDate } from "./i18n/format.js";
 import { LINK_PROPS } from "./links.js";
 import { useResource } from "./study-data.js";
 import { closedLabel, groupTodos, isDue, refTarget, reviewLabel, snoozeLabel, summarizeTodos, type TodoSummary, type WaitingOn } from "./todos.js";
+
+/** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
+// i18n-dynamic: todos:recent.done
+// i18n-dynamic: todos:recent.dropped
 
 const card = "rounded-xl border bg-card shadow-xs";
 const meta = "text-[11px] tracking-[0.02em] text-muted-foreground";
@@ -32,31 +38,32 @@ function useNow(resource: unknown): number {
 export function Todos({ reload }: { reload: number }) {
   const [resource] = useResource<WebTodos>("/todos", reload);
   const agent = useAgentName();
+  const { t } = useTranslation(["todos", "common", "study"]);
   const now = useNow(resource);
-  if (resource.state === "loading") return <p className="text-sm text-muted-foreground" role="status">Loading…</p>;
+  if (resource.state === "loading") return <p className="text-sm text-muted-foreground" role="status">{t("common:state.loading")}</p>;
   if (resource.state === "error") {
     return <div className={cn(card, "px-4 py-3 text-[13px]")} role="alert">{resource.code === "todos_unavailable"
-      ? "The todo store could not be read. Nothing was changed." : resource.code === "request_limit" ? "Busy — try again in a moment." : "Unavailable right now."}</div>;
+      ? t("error.unavailable") : resource.code === "request_limit" ? t("study:error.request_limit") : t("study:error.other")}</div>;
   }
   const value = resource.value;
   const summary = summarizeTodos(value, now);
   const groups = groupTodos(value.items, now);
-  const headings: Record<WaitingOn, string> = { owner: "Waiting on you", me: `Waiting on ${agent}`, external: "Waiting on others" };
+  const headings: Record<WaitingOn, string> = { owner: t("waiting.owner"), me: t("waiting.me", { agent }), external: t("waiting.external") };
   return <div className="space-y-6">
     <Summary summary={summary} agent={agent} />
     {groups.length === 0 && <div className={cn(card, "px-5 py-8 text-center text-sm text-muted-foreground")}>
-      {summary.hidden > 0 ? "No open todos in your conversations." : `No open todos. Ask ${agent} to keep track of something, or send /todo add.`}</div>}
+      {summary.hidden > 0 ? t("empty.hidden") : t("empty.none", { agent })}</div>}
     {groups.map((group) => <section key={group.waitingOn} aria-labelledby={`todos-${group.waitingOn}`}>
       <div className="mb-2 flex items-baseline gap-2 px-1">
         <h2 id={`todos-${group.waitingOn}`} className="eyebrow">{headings[group.waitingOn]}</h2>
         <span className={cn(meta, "tabular-nums")}>{group.items.length}</span>
-        {group.due > 0 && <span className="text-[11px] font-medium tracking-[0.02em] text-warn tabular-nums">{group.due} due</span>}
+        {group.due > 0 && <span className="text-[11px] font-medium tracking-[0.02em] text-warn tabular-nums">{t("groupDue", { count: group.due })}</span>}
       </div>
       <ul className={cn(card, "m-0 list-none divide-y p-0")}>
         {group.items.map((item) => <TodoRow key={item.id} item={item} now={now} maxSnoozes={value.limits.maxSnoozes} />)}
       </ul>
     </section>)}
-    {summary.hidden > 0 && <p className={cn(meta, "m-0 px-1")}>{summary.hidden} more open in conversations that are not shown here.</p>}
+    {summary.hidden > 0 && <p className={cn(meta, "m-0 px-1")}>{t("hidden", { count: summary.hidden })}</p>}
     {value.recent.length > 0 && <Recent recent={value.recent} more={value.moreResolved} now={now} agent={agent} />}
   </div>;
 }
@@ -70,18 +77,19 @@ function Stat({ label, children, note, className }: { label: string; children: R
 }
 
 function Summary({ summary, agent }: { summary: TodoSummary; agent: string }) {
+  const { t } = useTranslation(["todos", "common", "study"]);
   const left = summary.max - summary.open;
-  return <section aria-label="Summary" className={cn(card, "grid grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,1fr)] max-[600px]:grid-cols-2")}>
-    <Stat label="Open" className="border-r max-[600px]:col-span-2 max-[600px]:border-r-0 max-[600px]:border-b" note={summary.cap === "full" ? `At the limit: ${agent} cannot add another until one is resolved.`
-      : summary.cap === "near" ? `${left} left before ${agent} has to resolve one first.` : `${left} left before the limit.`}>
+  return <section aria-label={t("summary.label")} className={cn(card, "grid grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,1fr)] max-[600px]:grid-cols-2")}>
+    <Stat label={t("summary.open")} className="border-r max-[600px]:col-span-2 max-[600px]:border-r-0 max-[600px]:border-b" note={summary.cap === "full" ? t("summary.full", { agent })
+      : summary.cap === "near" ? t("summary.near", { count: left, agent }) : t("summary.left", { count: left })}>
       <p className="m-0 text-2xl tabular-nums" data-testid="todo-open">{summary.open} <span className="text-sm text-muted-foreground">/ {summary.max}</span></p>
-      <Progress value={summary.percent} aria-label={`${summary.open} of ${summary.max} open todos`}
+      <Progress value={summary.percent} aria-label={t("summary.progress", { open: summary.open, max: summary.max })}
         className={cn("mt-2.5 h-1.5", summary.cap !== "ok" && "bg-warn/20 [&>[data-slot=progress-indicator]]:bg-warn", summary.cap === "full" && "bg-destructive/20 [&>[data-slot=progress-indicator]]:bg-destructive")} />
     </Stat>
-    <Stat label="Due for review" className="border-r" note={summary.due ? "Past their review date." : "Nothing is past its review date."}>
+    <Stat label={t("summary.due")} className="border-r" note={summary.due ? t("summary.dueNote") : t("summary.dueNone")}>
       <p className={cn("m-0 text-2xl tabular-nums", summary.due > 0 && "text-warn")} data-testid="todo-due">{summary.due}</p>
     </Stat>
-    <Stat label="Waiting on you" note={`${summary.waiting.me} on ${agent} · ${summary.waiting.external} on others`}>
+    <Stat label={t("waiting.owner")} note={t("summary.waitingNote", { me: summary.waiting.me, agent, external: summary.waiting.external })}>
       <p className="m-0 text-2xl tabular-nums">{summary.waiting.owner}</p>
     </Stat>
   </section>;
@@ -106,6 +114,7 @@ function MetaLine({ children }: { children: ReactNode[] }) {
 }
 
 function TodoRow({ item, now, maxSnoozes }: { item: WebTodoItem; now: number; maxSnoozes: number }) {
+  const { t } = useTranslation(["todos", "common", "study"]);
   const due = isDue(item, now);
   const snooze = snoozeLabel(item.snoozes, maxSnoozes);
   const review = new Date(item.reviewAt);
@@ -115,15 +124,15 @@ function TodoRow({ item, now, maxSnoozes }: { item: WebTodoItem; now: number; ma
     <div className="min-w-0">
       <p className="m-0 text-sm leading-snug font-medium [overflow-wrap:anywhere]">{item.title}</p>
       {item.next !== item.title && <p className="mt-1 mb-0 text-[13px] leading-snug text-muted-foreground [overflow-wrap:anywhere]">
-        <span className="mr-1.5 text-[10.5px] font-medium tracking-[0.08em] uppercase">Next</span><span className="text-foreground/85">{item.next}</span></p>}
+        <span className="mr-1.5 text-[10.5px] font-medium tracking-[0.08em] uppercase">{t("next")}</span><span className="text-foreground/85">{item.next}</span></p>}
       <MetaLine>
         {item.ref && <Ref value={item.ref} />}
-        {snooze && <span className={cn(snooze.last && "text-warn")}>{snooze.text}{snooze.last ? ", none left" : ""}{item.snoozeReason ? `: ${item.snoozeReason}` : ""}</span>}
-        {item.group && <span>In {item.group}</span>}
-        {item.source === "owner" && <span>Added by you</span>}
+        {snooze && <span className={cn(snooze.last && "text-warn")}>{snooze.last ? t("snoozeLast", { snooze: snooze.text }) : snooze.text}{item.snoozeReason ? t("snoozeReason", { reason: item.snoozeReason }) : ""}</span>}
+        {item.group && <span>{t("inGroup", { group: item.group })}</span>}
+        {item.source === "owner" && <span>{t("addedByYou")}</span>}
       </MetaLine>
     </div>
-    <time dateTime={review.toISOString()} title={review.toLocaleString()} className="max-[600px]:col-start-2 max-[600px]:mt-1.5 max-[600px]:justify-self-start">
+    <time dateTime={review.toISOString()} title={formatDate(review, { dateStyle: "medium", timeStyle: "short" })} className="max-[600px]:col-start-2 max-[600px]:mt-1.5 max-[600px]:justify-self-start">
       {due ? <Badge variant="outline" className="rounded-md border-warn/40 bg-warn/10 text-[11px] font-medium text-warn">{reviewLabel(item.reviewAt, now)}</Badge>
         : <span className={cn(meta, "whitespace-nowrap")}>{reviewLabel(item.reviewAt, now)}</span>}
     </time>
@@ -131,11 +140,12 @@ function TodoRow({ item, now, maxSnoozes }: { item: WebTodoItem; now: number; ma
 }
 
 function Recent({ recent, more, now, agent }: { recent: WebTodoResolution[]; more: boolean; now: number; agent: string }) {
-  return <Collapsible asChild><section className={card} aria-label="Recently closed">
+  const { t } = useTranslation(["todos", "common", "study"]);
+  return <Collapsible asChild><section className={card} aria-label={t("recent.heading")}>
     <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-2.5 rounded-xl px-5 py-3.5 text-left hover:bg-foreground/[0.04] max-[600px]:px-4">
       <ChevronRight className="size-3.5 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-90" />
-      <span className="eyebrow">Recently closed</span>
-      <span className={cn(meta, "ml-auto tabular-nums")}>{more ? `Latest ${recent.length}` : recent.length}</span>
+      <span className="eyebrow">{t("recent.heading")}</span>
+      <span className={cn(meta, "ml-auto tabular-nums")}>{more ? t("recent.latest", { count: recent.length }) : recent.length}</span>
     </CollapsibleTrigger>
     <CollapsibleContent>
       <ul className="m-0 list-none divide-y border-t p-0">{recent.map((item) => {
@@ -148,12 +158,12 @@ function Recent({ recent, more, now, agent }: { recent: WebTodoResolution[]; mor
             <MetaLine>
               {item.reason && <span className="[overflow-wrap:anywhere]">{item.reason}</span>}
               {item.evidence && <Ref value={item.evidence} />}
-              {item.group && <span>In {item.group}</span>}
+              {item.group && <span>{t("inGroup", { group: item.group })}</span>}
             </MetaLine>
           </div>
-          <time dateTime={at.toISOString()} title={at.toLocaleString()} className={cn(meta, "inline-flex items-center gap-1 whitespace-nowrap max-[600px]:col-start-2 max-[600px]:mt-1")}>
+          <time dateTime={at.toISOString()} title={formatDate(at, { dateStyle: "medium", timeStyle: "short" })} className={cn(meta, "inline-flex items-center gap-1 whitespace-nowrap max-[600px]:col-start-2 max-[600px]:mt-1")}>
             {done ? <Check className="size-3 translate-y-px text-primary" strokeWidth={2} aria-hidden="true" /> : <X className="size-3 translate-y-px" strokeWidth={2} aria-hidden="true" />}
-            {done ? "Done" : "Dropped"} {closedLabel(item.resolvedAt, now)} · by {item.resolvedBy === "owner" ? "you" : agent}
+            {t(done ? "recent.done" : "recent.dropped", { when: closedLabel(item.resolvedAt, now), who: item.resolvedBy === "owner" ? t("recent.you") : agent })}
           </time>
         </li>;
       })}</ul>

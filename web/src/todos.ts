@@ -1,5 +1,7 @@
 import type { WebTodoItem, WebTodos } from "../../src/web/protocol.js";
 import { safeHref } from "./links.js";
+import { formatLocale, i18n } from "./i18n/index.js";
+import { formatDate } from "./i18n/format.js";
 
 export type WaitingOn = WebTodoItem["waitingOn"];
 
@@ -70,33 +72,32 @@ function calendarDays(at: number, now: number): number {
 
 function shortDate(at: number, now: number): string {
   const date = new Date(at);
-  return date.toLocaleDateString("en-US", { month: "short", day: "numeric", ...(date.getFullYear() !== new Date(now).getFullYear() ? { year: "numeric" } : {}) });
+  return formatDate(date, { month: "short", day: "numeric", ...(date.getFullYear() !== new Date(now).getFullYear() ? { year: "numeric" } : {}) });
+}
+
+/** -1 → "yesterday", 0 → "today", 5 → "in 5 days" (Intl). */
+function relativeDays(days: number): string {
+  return new Intl.RelativeTimeFormat(formatLocale(), { numeric: "auto" }).format(days, "day");
 }
 
 /** "Due 3 days ago" / "Due today" for a passed review time; "Review tomorrow" / "Review in 5 days" / "Review Dec 3" otherwise. */
 export function reviewLabel(reviewAt: number, now: number): string {
   const days = calendarDays(reviewAt, now);
-  if (reviewAt <= now) {
-    if (days >= 0) return "Due today";
-    if (days === -1) return "Due yesterday";
-    return `Due ${-days} days ago`;
-  }
-  if (days <= 0) return "Review today";
-  if (days === 1) return "Review tomorrow";
-  if (days <= 14) return `Review in ${days} days`;
-  return `Review ${shortDate(reviewAt, now)}`;
+  if (reviewAt <= now) return i18n.t("todos:due", { when: relativeDays(Math.min(0, days)) });
+  if (days <= 14) return i18n.t("todos:review", { when: relativeDays(Math.max(0, days)) });
+  return i18n.t("todos:reviewOn", { date: shortDate(reviewAt, now) });
 }
 
 /** "Nov 17" (with the year when it is not this one): when an item was closed. */
 export function closedLabel(at: number, now: number): string {
   const days = calendarDays(at, now);
-  return days === 0 ? "today" : days === -1 ? "yesterday" : shortDate(at, now);
+  return days === 0 || days === -1 ? relativeDays(days) : shortDate(at, now);
 }
 
 /** "Snoozed 2 of 3", or null for an item never snoozed. `last` when no snooze is left. */
 export function snoozeLabel(snoozes: number, max: number): { text: string; last: boolean } | null {
   if (snoozes <= 0) return null;
-  return { text: `Snoozed ${snoozes} of ${max}`, last: snoozes >= max };
+  return { text: i18n.t("todos:snoozed", { count: snoozes, max }), last: snoozes >= max };
 }
 
 export interface RefTarget { label: string; href?: string }

@@ -127,7 +127,7 @@ Environment variables override config file values:
 | `TOMO_CONTINUITY_SCRIPT` | Optional continuity script path |
 | `TOMO_CONTINUITY_SCRIPT_TIMEOUT_MS` | Continuity script timeout (default: `30000`) |
 | `TOMO_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS` | Continuity script stdout/stderr cap (default: `8000`) |
-| `TOMO_LOCALE` | Language for Tomo's own fixed text (config key `locale`; `"en"` or `"zh-Hans"`; default: unset). Chat-command replies and Tomo's notices to the owner (permission and credential requests, error, MCP, cron, pet and update notices) are written in it; it is also passed to the web UI's bootstrap. Model-facing text, logs and the CLI stay English |
+| `TOMO_LOCALE` | Language for Tomo's own fixed text (config key `locale`; `"en"` or `"zh-Hans"`; default: unset). Chat-command replies and Tomo's notices to the owner (permission and credential requests, error, MCP, cron, pet and update notices) are written in it, and it sets the web UI's default language (a browser's own pick in the Study's Config tab wins; unset, the browser's language decides). Model-facing text, logs and the CLI stay English |
 | `TOMO_CITY` | City for weather in continuity heartbeats and the web UI's Home sky, from wttr.in (config key `city`, default: unset) |
 | `TOMO_LIVE_SESSION_TIMEOUT_MS` | Inactivity timeout for one turn (config key `liveSessionTimeoutMs`, default: `600000`, 10 minutes) |
 | `TOMO_METRICS` | Enable the metrics exporter and activity log (config key `metrics.enabled`, default: `false`) |

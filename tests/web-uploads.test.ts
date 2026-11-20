@@ -10,7 +10,7 @@ import { messageInputSchema, type WebEvent } from "../src/web/protocol.js";
 import { isImageFiledFor } from "../src/channels/imageStore.js";
 import { imageSessionKeys, imagePaths, WEB_IMAGE_KEY } from "../src/web/data.js";
 import { neutralizeMarker } from "../src/channels/web.js";
-import { captureSend, takeSent, addFiles, attachmentLabel, canSendWith, dragHasFiles, imageFiles, MAX_ATTACHMENTS, uploadIds, type Attachment } from "../web/src/uploads.js";
+import { captureSend, takeSent, addFiles, attachmentLabel, canSendWith, dragHasFiles, imageFiles, MAX_ATTACHMENTS, uploadIds, noteText, type Attachment } from "../web/src/uploads.js";
 import type { IncomingMessage } from "../src/channels/types.js";
 import { WebRequestJournal } from "../src/web/request-journal.js";
 import { dismissAfterAcceptedSend, pendingUserMessages, resendAfterDraftChange } from "../web/src/pending.js";
@@ -240,9 +240,9 @@ describe("composer attachments (browser, pure)", () => {
     const many = Array.from({ length: 8 }, (_, i) => file(`${i}.png`, "image/png"));
     const out = addFiles([], [...many, file("big.jpg", "image/jpeg", 21 * 1024 * 1024), file("x.svg", "image/svg+xml")], make);
     expect(out.next).toHaveLength(MAX_ATTACHMENTS);
-    expect(out.note).toContain("Up to 6");
-    expect(out.note).toContain("20 MB");
-    expect(out.note).toContain("Only PNG");
+    expect(noteText(out.note)).toContain("Up to 6");
+    expect(noteText(out.note)).toContain("20 MB");
+    expect(noteText(out.note)).toContain("Only PNG");
   });
   it("a send takes only what it captured: an image pasted while it was sending stays", () => {
     const before = [item("a", "done", "u1"), item("b", "done", "u2")];

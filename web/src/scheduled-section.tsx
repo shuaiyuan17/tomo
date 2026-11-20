@@ -4,6 +4,7 @@ import type { WebCronJob } from "../../src/web/protocol.js";
 import { Button } from "@/components/ui/button";
 import { formatUntil, upcomingJobs } from "./scheduled.js";
 import { cronJobHash, useResource } from "./study-data.js";
+import { useTranslation } from "./i18n/index.js";
 
 /** Re-read /cron at least this often while the rail is open (writes from the Study or the CLI emit no event). */
 const REFRESH_MS = 60_000;
@@ -14,6 +15,7 @@ const REFRESH_MS = 60_000;
  * Read-only: a row opens that job in the Study. Hidden when nothing is scheduled.
  */
 export function ScheduledSection({ revision, onNavigate }: { revision: number; onNavigate?: () => void }) {
+  const { t } = useTranslation("tasks");
   const [tick, setTick] = useState(0);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -25,7 +27,7 @@ export function ScheduledSection({ revision, onNavigate }: { revision: number; o
   if (!jobs.length) return null;
   const go = (hash: string) => { window.location.hash = hash; onNavigate?.(); };
   return <section className="mt-3 border-t pt-3 pr-2.5" aria-labelledby="scheduled-heading">
-    <h3 id="scheduled-heading" className="eyebrow mb-1 px-2.5">Scheduled</h3>
+    <h3 id="scheduled-heading" className="eyebrow mb-1 px-2.5">{t("scheduled.heading")}</h3>
     <ul className="m-0 list-none space-y-0.5 p-0">{jobs.map((job) => {
       const oneShot = job.schedule.kind === "at" || job.deleteAfterRun;
       const Icon = oneShot ? CalendarClock : Repeat;
@@ -36,12 +38,12 @@ export function ScheduledSection({ revision, onNavigate }: { revision: number; o
           <span className="mt-0.5 flex items-center gap-1.5 text-xs text-muted-foreground">
             <time dateTime={new Date(job.nextRunAt!).toISOString()} className="tabular-nums">{formatUntil(job.nextRunAt!, now)}</time>
             <span aria-hidden="true">·</span>
-            <Icon className="size-3 shrink-0" strokeWidth={1.75} aria-hidden="true" /><span>{oneShot ? "Once" : "Repeats"}</span>
+            <Icon className="size-3 shrink-0" strokeWidth={1.75} aria-hidden="true" /><span>{oneShot ? t("scheduled.once") : t("scheduled.repeats")}</span>
           </span>
         </button>
       </li>;
     })}</ul>
     <Button variant="ghost" size="sm" onClick={() => go("#study/cron")}
-      className="mt-1 h-8 gap-1 rounded-lg px-2.5 text-xs text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground">View all<ChevronRight className="size-3.5" /></Button>
+      className="mt-1 h-8 gap-1 rounded-lg px-2.5 text-xs text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground">{t("scheduled.viewAll")}<ChevronRight className="size-3.5" /></Button>
   </section>;
 }

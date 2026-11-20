@@ -42,6 +42,8 @@ import type { WebPermissionRequest } from "../../src/web/protocol.js";
 
 const OUT = resolve(process.env.GALLERY_DIR || "test-results/gallery");
 const ONLY = (process.env.GALLERY_ONLY ?? "").split(",").map((s) => s.trim()).filter(Boolean);
+/** The browser's language (GALLERY_LOCALE, default en-US): `zh-CN` shoots the UI in Simplified Chinese. Steps find controls by their English names, so some fail under another language. */
+const LOCALE = process.env.GALLERY_LOCALE || "en-US";
 mkdirSync(OUT, { recursive: true });
 
 /** The frozen "now" of every shot: Sat 14 Nov 2026, 10:30 in Los Angeles. */
@@ -343,7 +345,7 @@ interface PageOptions { noWebgl?: boolean; signedIn?: boolean; hash?: string }
 /** A fresh browser context at the viewport and theme, with the clock frozen and usage stubbed. */
 async function open(vp: Viewport, theme: Theme, options: PageOptions = {}): Promise<Page> {
   const page = await browser!.newPage({ viewport: VIEWPORTS[vp], deviceScaleFactor: 2, hasTouch: touch(vp), colorScheme: theme,
-    timezoneId: TIME_ZONE, locale: "en-US", reducedMotion: "reduce" });
+    timezoneId: TIME_ZONE, locale: LOCALE, reducedMotion: "reduce" });
   // A step whose control is gone should fail fast, not hold the pass for Playwright's 30 s.
   page.setDefaultTimeout(8_000);
   await page.clock.setFixedTime(BASE);
@@ -371,7 +373,7 @@ async function open(vp: Viewport, theme: Theme, options: PageOptions = {}): Prom
   });
   if (options.signedIn === false) { await page.goto(`${url}/${options.hash ?? ""}`); return page; }
   await page.goto(`${url}/?t=${token}${options.hash ?? ""}`);
-  await browserExpect(page.getByText("Connected", { exact: true })).toBeAttached();
+  await browserExpect(page.locator('[data-connection="live"]')).toBeAttached();
   await page.waitForTimeout(400);
   return page;
 }
@@ -379,7 +381,7 @@ async function open(vp: Viewport, theme: Theme, options: PageOptions = {}): Prom
 /** Back to a clean page of the same context (the session cookie is kept). */
 async function reset(page: Page, hash = ""): Promise<void> {
   await page.goto(`${url}/${hash}`);
-  await browserExpect(page.getByText("Connected", { exact: true })).toBeAttached();
+  await browserExpect(page.locator('[data-connection="live"]')).toBeAttached();
   await page.waitForTimeout(400);
 }
 
@@ -415,11 +417,10 @@ async function step(page: Page, vp: Viewport, theme: Theme, surface: string, sta
   }
 }
 
-const MENU = /^Menu/;
 /** Opens the Tasks rail unless it is already open (the page remembers it across reloads). */
 async function openTasks(page: Page): Promise<void> {
   const item = page.getByText(/^Audit the rename paths/).filter({ visible: true });
-  if (await item.count() === 0) await page.getByRole("button", { name: /^Tasks/ }).click();
+  if (await item.count() === 0) await page.locator('button[aria-controls="tasks-rail"]').click();
   await item.first().waitFor();
 }
 
@@ -560,7 +561,7 @@ async function composerSteps(page: Page, vp: Viewport, theme: Theme): Promise<vo
   const s = (surface: string, state: string, act: (snap: Snap) => Promise<void>) => step(page, vp, theme, surface, state, act);
   await s("composer", "focus", async (snap) => {
     await reset(page);
-    const input = page.getByRole("textbox", { name: "Message Tomo" });
+    const input = page.locator("textarea#message");
     await input.fill("x");
     await input.focus(); await page.keyboard.press("Tab");
     await snap();
@@ -569,7 +570,7 @@ async function composerSteps(page: Page, vp: Viewport, theme: Theme): Promise<vo
     await reset(page);
     await page.route("**/api/v1/messages", (route) => route.fulfill({ status: 413, contentType: "application/json", body: '{"error":"body_too_large"}' }));
     try {
-      await page.getByRole("textbox", { name: "Message Tomo" }).fill("Keep this draft");
+      await page.locator("textarea#message").fill("Keep this draft");
       await page.getByRole("button", { name: "Send", exact: true }).click();
       await page.waitForTimeout(500);
       await snap();
@@ -579,7 +580,7 @@ async function composerSteps(page: Page, vp: Viewport, theme: Theme): Promise<vo
     await reset(page);
     await page.route("**/api/v1/messages", (route) => route.abort("connectionfailed"));
     try {
-      await page.getByRole("textbox", { name: "Message Tomo" }).fill("Did this one arrive?");
+      await page.locator("textarea#message").fill("Did this one arrive?");
       await page.getByRole("button", { name: "Send", exact: true }).click();
       await page.waitForTimeout(800);
       await snap();
@@ -590,7 +591,7 @@ async function composerSteps(page: Page, vp: Viewport, theme: Theme): Promise<vo
     let release: (() => void) | undefined;
     mockSdk.responseFn = () => new Promise((r) => { release = () => r("Done now."); });
     try {
-      const input = page.getByRole("textbox", { name: "Message Tomo" });
+      const input = page.locator("textarea#message");
       await input.fill("Kick it off");
       await input.press("Enter");
       await page.waitForTimeout(600);
@@ -608,19 +609,19 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
   if (phone) {
     await s("drawer", "open", async (snap) => {
       await reset(page);
-      await page.getByRole("button", { name: MENU }).click();
+      await page.locator('button[aria-controls="sidebar"]').click();
       await snap();
     });
     await s("drawer", "sessions", async (snap) => {
       await reset(page);
-      await page.getByRole("button", { name: MENU }).click();
-      await page.getByRole("button", { name: /^Session/ }).click();
+      await page.locator('button[aria-controls="sidebar"]').click();
+      await page.locator('button[aria-labelledby="session-label session-value"]').click();
       await snap();
     });
   } else {
     await s("sessions", "menu", async (snap) => {
       await reset(page);
-      await page.getByRole("button", { name: /^Session/ }).click();
+      await page.locator('button[aria-labelledby="session-label session-value"]').click();
       await page.getByRole("menuitemradio").nth(1).hover();
       await snap({ keepPointer: true });
     });
@@ -657,7 +658,7 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
   }
   await s("screen", "open", async (snap) => {
     await reset(page);
-    await page.getByRole("button", { name: /^Screen/ }).click({ timeout: 5000 });
+    await page.locator('button[aria-controls="screen-window"]').click({ timeout: 5000 });
     await page.waitForTimeout(1200);
     await snap();
     // Close it again (the page remembers it); resetChrome() would too, but a step cleans up after itself.
@@ -668,8 +669,8 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
   await s("group", "readonly", async (snap) => {
     const group = await open(vp, theme);
     try {
-      if (phone) await group.getByRole("button", { name: MENU }).click();
-      await group.getByRole("button", { name: /^Session/ }).click();
+      if (phone) await group.locator('button[aria-controls="sidebar"]').click();
+      await group.locator('button[aria-labelledby="session-label session-value"]').click();
       await group.getByRole("menuitemradio", { name: /climbing/ }).click();
       if (phone) await group.keyboard.press("Escape");
       await group.waitForTimeout(600);
@@ -680,7 +681,7 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
     await s("study", tab, async (snap) => {
       await page.goto(`${url}/#study/${tab}`);
       await page.waitForTimeout(900);
-      if (tab === "cost") await page.getByRole("list", { name: "Costliest turns" }).waitFor();
+      if (tab === "cost") await page.locator('[data-testid="day-cost"]').waitFor();
       if (tab === "cron") await page.getByText("Dentist reminder", { exact: true }).filter({ visible: true }).first().waitFor();
       await snap();
     });
@@ -698,7 +699,7 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
   await s("scheduled", "list", async (snap) => {
     await reset(page);
     await openTasks(page);
-    await page.getByText("Scheduled", { exact: true }).first().evaluate((el) => el.scrollIntoView({ block: "start" }));
+    await page.locator("#scheduled-heading").first().evaluate((el) => el.scrollIntoView({ block: "start" }));
     await page.waitForTimeout(300);
     await snap();
   });
@@ -711,7 +712,7 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
     await s("home", "drawer", async (snap) => {
       await page.goto(`${url}/#home`);
       await page.waitForTimeout(2000);
-      await page.getByRole("button", { name: MENU }).click();
+      await page.locator('button[aria-controls="sidebar"]').click();
       await snap();
       await page.keyboard.press("Escape");
     });

@@ -1,6 +1,7 @@
 import type { HistoryMessage, SessionTools, SubagentItem } from "../../src/web/protocol.js";
 import { groupRows, viewRows, type ViewBlock } from "./subagent.js";
 import { appendedIds } from "./motion.js";
+import { i18n } from "./i18n/index.js";
 
 /**
  * The main chat's inline tool calls: pure state, kept out of React so it is
@@ -91,5 +92,5 @@ export function jumpVisible(input: { canScrollEnd: boolean; lastRowVisible: bool
 }
 
 export function jumpLabel(unseen: number): string {
-  return unseen === 1 ? "1 new message" : unseen > 1 ? `${unseen} new messages` : "";
+  return unseen > 0 ? i18n.t("chat:scroll.newMessages", { count: unseen }) : "";
 }

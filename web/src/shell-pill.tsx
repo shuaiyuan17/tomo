@@ -3,6 +3,7 @@ import { api } from "./api.js";
 import { TerminalIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { isProseDescription, shellLabel, shortenPaths } from "./shell.js";
+import { i18n } from "./i18n/index.js";
 
 /**
  * A shell task as a compact pill: terminal icon + its label (shellLabel). A command line is set in
@@ -29,13 +30,13 @@ export function CommandBrief({ base, fallback }: { base: string; fallback: strin
     return () => controller.abort();
   }, [base]);
   const text = command?.text ?? fallback;
-  return <section aria-label="Command" className="mx-2.5 mb-2.5 rounded-lg border bg-card/70 px-2.5 py-2">
+  return <section aria-label={i18n.t("tasks:command.heading")} className="mx-2.5 mb-2.5 rounded-lg border bg-card/70 px-2.5 py-2">
     <div className="mb-1 flex items-center justify-between gap-2">
-      <p className="m-0 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">Command</p>
+      <p className="m-0 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">{i18n.t("tasks:command.heading")}</p>
       <button type="button" aria-expanded={open} onClick={() => setOpen((v) => !v)}
-        className="rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground">{open ? "Show less" : "Show more"}</button>
+        className="rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground">{open ? i18n.t("tasks:brief.less") : i18n.t("tasks:brief.more")}</button>
     </div>
     <pre className={cn("m-0 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]", open ? "max-h-[40vh] overflow-y-auto" : "line-clamp-2")}>
-      {open ? text : shortenPaths(text)}{open && command?.truncated ? "\n… (truncated)" : ""}</pre>
+      {open ? text : shortenPaths(text)}{open && command?.truncated ? i18n.t("tasks:command.truncated") : ""}</pre>
   </section>;
 }

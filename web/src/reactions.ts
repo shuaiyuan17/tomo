@@ -2,6 +2,7 @@ import type { HistoryMessage, WebReaction, WebRequest } from "../../src/web/prot
 // Not from protocol.ts: a value import from there would bring zod (and its eval probe) into the page.
 import { WEB_REPLY_TEXT_LIMIT } from "../../src/web/reply-limits.js";
 import { findQuoted, parseReply, quotableText, type ReplyContext } from "./reply.js";
+import { i18n } from "./i18n/index.js";
 
 /**
  * Tapbacks in the chat. The owner's reactions (from this page, or an iMessage
@@ -17,12 +18,12 @@ export interface ReactionKind { kind?: WebReaction; emoji: string; label: string
 
 /** iMessage's six tapbacks, in its order. */
 export const REACTIONS: ReadonlyArray<ReactionKind & { kind: WebReaction }> = [
-  { kind: "love", emoji: "❤️", label: "Love", verb: "loved" },
-  { kind: "like", emoji: "👍", label: "Like", verb: "liked" },
-  { kind: "dislike", emoji: "👎", label: "Dislike", verb: "disliked" },
-  { kind: "laugh", emoji: "😂", label: "Ha ha", verb: "laughed at" },
-  { kind: "emphasize", emoji: "‼️", label: "Emphasize", verb: "emphasized" },
-  { kind: "question", emoji: "❓", label: "Question", verb: "questioned" },
+  { kind: "love", emoji: "❤️", get label() { return i18n.t("chat:reaction.label.love"); }, get verb() { return i18n.t("chat:reaction.verb.love"); } },
+  { kind: "like", emoji: "👍", get label() { return i18n.t("chat:reaction.label.like"); }, get verb() { return i18n.t("chat:reaction.verb.like"); } },
+  { kind: "dislike", emoji: "👎", get label() { return i18n.t("chat:reaction.label.dislike"); }, get verb() { return i18n.t("chat:reaction.verb.dislike"); } },
+  { kind: "laugh", emoji: "😂", get label() { return i18n.t("chat:reaction.label.laugh"); }, get verb() { return i18n.t("chat:reaction.verb.laugh"); } },
+  { kind: "emphasize", emoji: "‼️", get label() { return i18n.t("chat:reaction.label.emphasize"); }, get verb() { return i18n.t("chat:reaction.verb.emphasize"); } },
+  { kind: "question", emoji: "❓", get label() { return i18n.t("chat:reaction.label.question"); }, get verb() { return i18n.t("chat:reaction.verb.question"); } },
 ];
 /** Names a recorded tapback may carry beyond ours (imsg's spellings). */
 const ALIASES: Record<string, WebReaction> = { loved: "love", heart: "love", liked: "like", thumbsup: "like", disliked: "dislike",
@@ -32,7 +33,8 @@ const ALIASES: Record<string, WebReaction> = { loved: "love", heart: "love", lik
 export function reactionKind(name: string): ReactionKind {
   const key = name.trim().toLowerCase();
   const found = REACTIONS.find((r) => r.kind === key || r.kind === ALIASES[key]);
-  return found ?? { emoji: name.trim(), label: name.trim(), verb: "reacted to" };
+  // The verb is read when shown (a getter, like the six), so a parsed and cached tapback follows a language switch.
+  return found ?? { emoji: name.trim(), label: name.trim(), get verb() { return i18n.t("chat:reaction.verb.other"); } };
 }
 
 const TAPBACK = /^\[tapback: ([^\]\n]+?)\]\s*$/;

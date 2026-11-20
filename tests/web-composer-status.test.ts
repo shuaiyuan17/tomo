@@ -2,14 +2,15 @@ import { describe, expect, it } from "vitest";
 import type { WebRequest } from "../src/web/protocol.js";
 import { composerStatus, composerStatusIsProblem, elapsedLabel, rateLimitNotice, requestStamp, toolName, turnDetail, turnOutcome, TYPING_ACTIVITY, type ComposerNote, type TurnStatus } from "../web/src/composer-status.js";
 import { modelLabel } from "../web/src/tasks.js";
+import { deferred } from "../web/src/i18n/message.js";
 
 const req = (state: WebRequest["state"], requestId = "r1"): WebRequest => ({ requestId, state, sessionId: "s" });
 
 describe("composer status: one line, one source", () => {
   it("follows the latest request through its whole life, then clears once settled", () => {
     const at = (latest: WebRequest | undefined, extra: Partial<Parameters<typeof composerStatus>[0]> = {}) =>
-      composerStatus({ activity: undefined, note: { text: "", at: "" }, latest, settled: null, ...extra });
-    expect(at(undefined, { note: { text: "Sending…", at: "" } })).toBe("Sending…");
+      composerStatus({ activity: undefined, note: { text: null, at: "" }, latest, settled: null, ...extra });
+    expect(at(undefined, { note: { text: deferred.t("chat:composer.sending"), at: "" } })).toBe("Sending…");
     expect(at(req("queued"))).toBe("Queued");
     expect(at(req("running"))).toBe("Tomo is working…");
     expect(at(req("running"), { activity: "Bash · running" })).toBe("Bash · running");
@@ -21,32 +22,32 @@ describe("composer status: one line, one source", () => {
 
   it("states that need the owner's attention never clear on their own", () => {
     for (const state of ["failed", "interrupted", "unknown", "refused"] as const) {
-      expect(composerStatus({ activity: undefined, note: { text: "", at: "" }, latest: req(state), settled: "r1" })).not.toBe("");
+      expect(composerStatus({ activity: undefined, note: { text: null, at: "" }, latest: req(state), settled: "r1" })).not.toBe("");
     }
   });
 
   it("a note the page just produced wins over the request state it was written at", () => {
     const latest = req("completed");
-    const note: ComposerNote = { text: "Message is too large.", at: requestStamp(latest) };
-    expect(composerStatus({ activity: undefined, note, latest, settled: null })).toBe("Message is too large.");
+    const note: ComposerNote = { text: deferred.t("chat:composer.failure.tooLarge"), at: requestStamp(latest) };
+    expect(composerStatus({ activity: undefined, note, latest, settled: null })).toBe("Message is too large. Shorten it and send again; your draft is kept.");
   });
 
   it("a note never holds back the request: Queued → Running → Completed each show, then it clears", () => {
     // The note was written while the request was queued (e.g. a check that came back "Queued").
     const queued = req("queued");
-    const note: ComposerNote = { text: "Queued", at: requestStamp(queued) };
+    const note: ComposerNote = { text: deferred.t("chat:request.queued"), at: requestStamp(queued) };
     const line = (latest: WebRequest, settled: string | null = null) => composerStatus({ activity: undefined, note, latest, settled });
     expect(line(queued)).toBe("Queued");
     expect(line(req("running"))).toBe("Tomo is working…");
     expect(line(req("completed"))).toBe("Completed");
     expect(line(req("completed"), "r1")).toBe("");
     // A note written before the request was accepted lapses once it is.
-    expect(composerStatus({ activity: undefined, note: { text: "Sending…", at: "" }, latest: queued, settled: null })).toBe("Queued");
+    expect(composerStatus({ activity: undefined, note: { text: deferred.t("chat:composer.sending"), at: "" }, latest: queued, settled: null })).toBe("Queued");
   });
 });
 
 describe("composer status: what the SDK says about the turn", () => {
-  const none: ComposerNote = { text: "", at: "" };
+  const none: ComposerNote = { text: null, at: "" };
   const line = (latest: WebRequest | undefined, turn: TurnStatus | undefined, extra: Partial<Parameters<typeof composerStatus>[0]> = {}) =>
     composerStatus({ activity: undefined, note: none, latest, settled: null, turn, now: 10_000, ...extra });
 
@@ -97,7 +98,7 @@ describe("composer status: what the SDK says about the turn", () => {
 
 describe("composer status: problems read as problems", () => {
   const problem = (latest: WebRequest | undefined, extra: Partial<Parameters<typeof composerStatus>[0]> = {}) =>
-    composerStatusIsProblem({ activity: undefined, note: { text: "", at: "" }, latest, settled: null, now: 10_000, ...extra });
+    composerStatusIsProblem({ activity: undefined, note: { text: null, at: "" }, latest, settled: null, now: 10_000, ...extra });
   it("marks failed, refused, unknown and interrupted requests; never progress or success", () => {
     for (const state of ["failed", "refused", "unknown", "interrupted"] as const) expect(problem(req(state))).toBe(true);
     for (const state of ["queued", "running", "completed"] as const) expect(problem(req(state))).toBe(false);
@@ -113,9 +114,9 @@ describe("composer status: problems read as problems", () => {
     expect(problem(req("running"), { turn: { status: { kind: "retry", attempt: 2, max: 10, delayMs: 1, error: "overloaded" }, at: 0 } })).toBe(false);
   });
   it("follows the note that is shown: a warning note is a problem, a neutral one is not", () => {
-    expect(problem(undefined, { note: { text: "Message is too large.", at: "", warn: true } })).toBe(true);
-    expect(problem(undefined, { note: { text: "Sending…", at: "" } })).toBe(false);
-    expect(problem(req("failed"), { note: { text: "Review the message", at: requestStamp(req("failed")) } })).toBe(false);
-    expect(problem(req("completed"), { note: { text: "Cannot check yet.", at: "old", warn: true } })).toBe(false);
+    expect(problem(undefined, { note: { text: deferred.t("chat:composer.failure.tooLarge"), at: "", warn: true } })).toBe(true);
+    expect(problem(undefined, { note: { text: deferred.t("chat:composer.sending"), at: "" } })).toBe(false);
+    expect(problem(req("failed"), { note: { text: deferred.t("chat:composer.resendReview"), at: requestStamp(req("failed")) } })).toBe(false);
+    expect(problem(req("completed"), { note: { text: deferred.t("chat:composer.checkFailed"), at: "old", warn: true } })).toBe(false);
   });
 });

@@ -1,4 +1,9 @@
 import type { ContextCategory } from "../../src/sessions/types.js";
+import { i18n, formatLocale as activeLocale } from "./i18n/index.js";
+import { matchLocale } from "../../src/i18n/locales.js";
+
+/** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
+// i18n-dynamic: context:fill.*
 
 /** Pure helpers for the Study's Context page: how full, made of what, rolled up into what. */
 
@@ -8,7 +13,9 @@ export type FillTone = "calm" | "warn" | "critical";
 export const CONTEXT_WARN_PERCENT = 80;
 /** From here it is "nearly full". */
 export const CONTEXT_CRITICAL_PERCENT = 95;
-export const FILL_LABELS: Record<FillTone, string> = { calm: "Room to spare", warn: "Filling up", critical: "Nearly full" };
+const FILL_LABELS = { calm: "context:fill.calm", warn: "context:fill.warn", critical: "context:fill.critical" } as const satisfies Record<FillTone, string>;
+/** The fill state in words: "Room to spare", "Filling up", "Nearly full". */
+export function fillLabel(tone: FillTone): string { return i18n.t(FILL_LABELS[tone]); }
 
 /** Used share of the window, 0–100 (0 without a window; never above 100). */
 export function fillPercent(used: number, max: number): number {
@@ -121,8 +128,8 @@ function isoWeekStart(year: number, week: number): Date {
  * → "October 2026", `yearly 2025` → "2025". A compact summary from before
  * rollups (`legacy`) is named as such; anything else is shown as written.
  */
-export function rollupTitle(tag: string, locale?: string): string {
-  if (tag === "legacy") return "Compact summary";
+export function rollupTitle(tag: string, locale: string = activeLocale()): string {
+  if (tag === "legacy") return i18n.t("context:rollups.legacy");
   const text = (date: Date, options: Intl.DateTimeFormatOptions) => new Intl.DateTimeFormat(locale, { ...options, timeZone: "UTC" }).format(date);
   const valid = (date: Date) => !Number.isNaN(date.getTime());
   let match = /^daily (\d{4})-(\d{2})-(\d{2})$/.exec(tag);
@@ -136,7 +143,7 @@ export function rollupTitle(tag: string, locale?: string): string {
     const to = new Date(from); to.setUTCDate(from.getUTCDate() + 6);
     // A week that spans New Year names both years.
     const sameYear = from.getUTCFullYear() === to.getUTCFullYear();
-    return `${text(from, { month: "short", day: "numeric", ...(sameYear ? {} : { year: "numeric" }) })} – ${text(to, { month: "short", day: "numeric", year: "numeric" })}`;
+    return i18n.t("common:format.range", { lng: matchLocale(locale) ?? undefined, from: text(from, { month: "short", day: "numeric", ...(sameYear ? {} : { year: "numeric" }) }), to: text(to, { month: "short", day: "numeric", year: "numeric" }) });
   }
   match = /^monthly (\d{4})-(\d{2})$/.exec(tag);
   if (match && +match[2] >= 1 && +match[2] <= 12) return text(new Date(Date.UTC(+match[1], +match[2] - 1, 1)), { month: "long", year: "numeric" });

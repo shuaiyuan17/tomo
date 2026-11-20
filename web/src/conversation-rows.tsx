@@ -13,6 +13,7 @@ import { ReadReceiptMark } from "./read-receipt.js";
 import { findQuoted, messageText, parseReply, type ReplyContext } from "./reply.js";
 import { parseSendMarker, sendMarkerLabel, type SendMarker } from "./send-marker.js";
 import { formatSize } from "./uploads.js";
+import { i18n, useTranslation } from "./i18n/index.js";
 
 /**
  * The chat's rows: recorded messages, this tab's pending ones, and the reply
@@ -76,12 +77,12 @@ const smallButton = "h-7 rounded-lg text-xs";
 function InterruptedActions({ request, agent, writable, confirming, actions }: { request?: WebRequest; agent: string; writable: boolean; confirming: boolean; actions: RowActions }) {
   if (!request) return null;
   return <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-    <span>Not answered. {agent} may have started on it — check before resending.</span>
-    <Button variant="outline" size="sm" className={smallButton} onClick={() => actions.resend(request)} disabled={!writable}>Resend…</Button>
+    <span>{i18n.t("chat:interrupted.note", { agent })}</span>
+    <Button variant="outline" size="sm" className={smallButton} onClick={() => actions.resend(request)} disabled={!writable}>{i18n.t("chat:interrupted.resend")}</Button>
     {confirming
-      ? <><Button variant="outline" size="sm" className={smallButton} onClick={() => actions.dismiss(request.requestId)}>Dismiss it</Button>
-        <Button variant="ghost" size="sm" className={smallButton} onClick={() => actions.confirmDismiss(null)}>Keep</Button></>
-      : <Button variant="ghost" size="sm" className={smallButton} onClick={() => actions.confirmDismiss(request.requestId)}>Dismiss</Button>}
+      ? <><Button variant="outline" size="sm" className={smallButton} onClick={() => actions.dismiss(request.requestId)}>{i18n.t("chat:interrupted.dismissConfirm")}</Button>
+        <Button variant="ghost" size="sm" className={smallButton} onClick={() => actions.confirmDismiss(null)}>{i18n.t("chat:interrupted.keep")}</Button></>
+      : <Button variant="ghost" size="sm" className={smallButton} onClick={() => actions.confirmDismiss(request.requestId)}>{i18n.t("chat:interrupted.dismiss")}</Button>}
   </div>;
 }
 
@@ -115,6 +116,8 @@ export interface RecordedMessageProps {
 /** A recorded message: a tapback line, "No reply", or a message with its header, actions and reactions. */
 export const RecordedMessage = memo(function RecordedMessage(props: RecordedMessageProps) {
   const { message, parsed, quotedId, request, reactions, afterTapback, enter, flash, confirming, receipts, agent, group, writable, live, sessionId, actions } = props;
+  // Memoized: subscribe, so a language switch re-renders the row.
+  useTranslation();
   const { sent, reply, body, tapback } = parsed;
   const interrupted = request && awaitingOwner(request) ? request : undefined;
   const onQuote = quotedId ? () => actions.showMessage(quotedId) : undefined;
@@ -123,7 +126,7 @@ export const RecordedMessage = memo(function RecordedMessage(props: RecordedMess
   const when = <><time dateTime={new Date(message.timestamp).toISOString()} title={messageDateTime(message.timestamp)} className="tabular-nums">{messageTime(message.timestamp)}</time><span>{channelLabel(message.channel)}</span></>;
   const interruptedActions = <InterruptedActions request={interrupted} agent={agent} writable={writable} confirming={confirming} actions={actions} />;
   if (tapback) return <article id={`msg-${message.id}`} className={articleClass("mb-5")}>
-    <TapbackLine who={group ? "Someone" : "You"} reaction={tapback.reaction} quote={tapback.reply?.excerpt}
+    <TapbackLine who={group ? i18n.t("chat:reaction.who.participant") : i18n.t("chat:reaction.who.you")} reaction={tapback.reaction} quote={tapback.reply?.excerpt}
       meta={<span className="flex shrink-0 items-baseline gap-3 text-[11px] tracking-[0.02em]">{when}</span>} onQuote={onQuote} />
     {interruptedActions}</article>;
   const silent = message.role === "assistant" && body.trim() === "NO_REPLY";
@@ -138,13 +141,13 @@ export const RecordedMessage = memo(function RecordedMessage(props: RecordedMess
   const content = <div className={cn("markdown", user && userBubble, message.role === "assistant" && "reading")}>
     {silent
       // A turn that ended without a reply (silent by choice, or stopped): said plainly, not as the agent's words.
-      ? <p className="m-0 font-sans text-[12.5px] text-muted-foreground">No reply</p>
+      ? <p className="m-0 font-sans text-[12.5px] text-muted-foreground">{i18n.t("chat:message.noReply")}</p>
       : <MessageBody body={body} reply={reply} sessionId={sessionId} onQuote={onQuote} thinking={message.role === "assistant" ? "joined" : undefined} />}</div>;
   return <article id={`msg-${message.id}`} className={articleClass("mb-7")}>
-    <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : user ? (group ? "Participant" : "You") : "System"}</span>{when}
+    <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{message.role === "assistant" ? agent : user ? (group ? i18n.t("chat:message.participant") : i18n.t("chat:reaction.who.you")) : i18n.t("chat:message.system")}</span>{when}
       {sent && <Badge variant="outline" className={metaBadge}>{sendMarkerLabel(sent)}</Badge>}
       {badge && <Badge variant="outline" className={metaBadge}>{badge}</Badge>}
-      {actionable && <MessageActions aria-label="Message actions" className="-my-1.5 ml-auto self-center">
+      {actionable && <MessageActions aria-label={i18n.t("chat:message.actions")} className="-my-1.5 ml-auto self-center">
         {writable && live && <>
           <ReplyAction onReply={() => actions.startReply(message)} />
           <ReactAction current={mine} onReact={(kind) => actions.react(quoteFor(message), kind)} /></>}
@@ -175,18 +178,18 @@ export function PendingMessage({ request, sent, reactions, receipts, confirming,
   const interruptedActions = <InterruptedActions request={awaitingOwner(request) ? request : undefined} agent={agent} writable={writable} confirming={confirming} actions={actions} />;
   const quote = request.reply?.text.replace(/\s+/g, " ").trim() || null;
   if (request.reply?.reaction) return <article className="message user tapback motion-enter mx-auto mb-5 max-w-[740px]" data-request-id={request.requestId}>
-    <TapbackLine who="You" reaction={reactionKind(request.reply.reaction)} quote={quote}
+    <TapbackLine who={i18n.t("chat:reaction.who.you")} reaction={reactionKind(request.reply.reaction)} quote={quote}
       meta={<Badge variant="outline" className={cn(metaBadge, "shrink-0")}>{pendingLabel(request)}</Badge>} />
     {interruptedActions}</article>;
   const files = sent?.files ?? (request.files ?? []).map((file): { name: string; size?: number } => ({ name: file.name, size: file.size }));
   return <article className="message user motion-enter mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId}>
-    <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">You</span><span>Web</span>
+    <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{i18n.t("chat:reaction.who.you")}</span><span>{channelLabel("web")}</span>
       <Badge variant="outline" className={metaBadge}>{pendingLabel(request)}</Badge></div>
     {/* Another tab's send (or a reload): the images by where they were filed. */}
     {!sent?.images && request.images?.length ? <div className="mb-2 opacity-80"><MessageBody sessionId={sessionId}
       body={`[Sent ${request.images.length === 1 ? "an image" : `${request.images.length} images`}, saved to: ${request.images.join(", ")}]`} /></div> : null}
     {sent?.images && <div className="mb-2 flex flex-wrap gap-2 opacity-80">{sent.images.map((src, i) =>
-      <img key={i} src={src} alt="Image" className="block max-h-[280px] max-w-[280px] rounded-xl border object-contain" />)}</div>}
+      <img key={i} src={src} alt={i18n.t("chat:image.alt")} className="block max-h-[280px] max-w-[280px] rounded-xl border object-contain" />)}</div>}
     {files.length > 0 && <div className="mb-2 flex flex-wrap gap-2 opacity-80">
       {files.map((file, i) => <FileCard key={i} name={file.name} size={file.size === undefined ? undefined : formatSize(file.size)} />)}</div>}
     <OwnBubble receipts={receipts} receipt={readReceipt(request.requestId, [request])} agent={agent}>{request.text ? <div className={cn("markdown opacity-80", userBubble)}>
@@ -198,7 +201,8 @@ export function PendingMessage({ request, sent, reactions, receipts, confirming,
 
 /** A block of the reply streaming in, until the transcript records the turn. */
 export const LiveReply = memo(function LiveReply({ block, agent, sessionId }: { block: WebSnapshot["blocks"][number]; agent: string; sessionId: string }) {
+  const { t } = useTranslation("chat");
   return <article className="message assistant motion-enter mx-auto mb-7 max-w-[740px]">
-    <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{agent}</span><span>Reply in progress</span></div>
+    <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{agent}</span><span>{t("message.inProgress")}</span></div>
     <div className="markdown reading"><MessageBody body={[block.text, ...(block.images ?? []).map((id) => `MEDIA:web:${id}`)].filter(Boolean).join("\n")} sessionId={sessionId} thinking="block" /></div></article>;
 });

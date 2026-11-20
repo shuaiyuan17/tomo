@@ -1,6 +1,6 @@
 import { canSeeTodo, formatTodoLine, formatTodoList } from "../todos/format.js";
-import { TodoRuleError, TodoStoreError, type TodoStore } from "../todos/store.js";
-import { ownerLocale, ownerT, raw, type Locale, type OwnerText } from "../i18n/index.js";
+import { TodoRuleError, TodoStoreError, type TodoRule, type TodoStore } from "../todos/store.js";
+import { joinText, ownerLocale, ownerT, type Locale, type OwnerT, type OwnerText } from "../i18n/index.js";
 
 /** The `/todo` usage line. */
 export function todoUsage(locale: Locale = ownerLocale()): OwnerText {
@@ -69,8 +69,34 @@ export function runTodoCommand(command: TodoCommand, deps: { store: TodoStore; s
     }
   } catch (err) {
     if (err instanceof TodoStoreError) return todoUnavailable(err.message, locale);
-    // The store's rule messages are written for the model's todo tools too, and stay English.
-    if (err instanceof TodoRuleError) return raw(err.message);
+    // The error's English message is what the model's todo tools return; the owner gets the rule in their language.
+    if (err instanceof TodoRuleError) return todoRuleText(t, err.rule);
     throw err;
+  }
+}
+
+/** A store rule refusal, in the owner's language. */
+function todoRuleText(t: OwnerT<"todo">, rule: TodoRule): OwnerText {
+  switch (rule.kind) {
+    case "not_real_date": return t("rule.notRealDate", { input: rule.input });
+    case "not_review_time": return t("rule.notReviewTime", { input: rule.input });
+    case "not_future": return t("rule.notFuture", { input: rule.input });
+    case "too_far": return t("rule.tooFar", { input: rule.input, maxDays: rule.maxDays });
+    case "required": return t("rule.required", { field: rule.field });
+    case "one_line": return t("rule.oneLine", { field: rule.field });
+    case "too_long": return t("rule.tooLong", { field: rule.field, length: rule.length, max: rule.max });
+    case "waiting_on_invalid": return t("rule.waitingOnInvalid", { allowed: rule.allowed });
+    case "no_session": return t("rule.noSession");
+    case "open_limit": return rule.stale.length
+      ? t("rule.openLimitStale", { open: rule.open, max: rule.max, list: joinText(rule.stale.map((item) => t("rule.staleItem", item))) })
+      : t("rule.openLimit", { open: rule.open, max: rule.max });
+    case "action_invalid": return t("rule.actionInvalid", { allowed: rule.allowed });
+    case "drop_needs_reason": return t("rule.dropNeedsReason");
+    case "snooze_needs_until": return t("rule.snoozeNeedsUntil");
+    case "snooze_needs_reason": return t("rule.snoozeNeedsReason");
+    case "next_with_close": return t("rule.nextWithClose", { action: rule.action });
+    case "not_found": return t("rule.notFound", { id: rule.id });
+    case "snooze_limit": return t("rule.snoozeLimit", { id: rule.id, snoozes: rule.snoozes });
+    case "already_owner": return t("rule.alreadyOwner", { id: rule.id });
   }
 }

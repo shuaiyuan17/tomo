@@ -11,7 +11,7 @@ export const commands = {
     usage: "Usage: /rewind or /rewind <positive integer>",
     failed: "⚠️ Could not rewind: {{error}}",
     dropped_one: " {{count}} message you sent while it ran went with it; resend it if still needed.",
-    dropped_other: " {{count}} messages you sent while it ran went with them; resend them if still needed.",
+    dropped_other: " {{count}} messages you sent while it ran went with it; resend them if still needed.",
     nothing: "⏹️ Stopped the turn that was still running; it will send nothing more.{{dropped}} This conversation had no earlier history to rewind to, so nothing was rewound. Send your request again to continue.",
     target: " (\"{{preview}}\")",
     moved: " That is further back than the {{asked}} you asked for: the later message arrived during a tool call, so it went back to the end of the previous complete turn.",

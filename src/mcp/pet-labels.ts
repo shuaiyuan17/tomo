@@ -1,6 +1,5 @@
 import type { OwnerT, OwnerText } from "../i18n/index.js";
-import { raw } from "../i18n/index.js";
-import type { PetStage } from "./pet-store.js";
+import type { PetMood, PetStage } from "./pet-store.js";
 
 /** The pet's stage, for /pet and the pet's notices. */
 export function petStageLabel(t: OwnerT<"commands">, stage: PetStage): OwnerText {
@@ -15,7 +14,7 @@ export function petStageLabel(t: OwnerT<"commands">, stage: PetStage): OwnerText
 }
 
 /** The pet's mood word (PetStore.computeMood), for /pet. */
-export function petMoodLabel(t: OwnerT<"commands">, mood: string): OwnerText {
+export function petMoodLabel(t: OwnerT<"commands">, mood: PetMood): OwnerText {
   switch (mood) {
     case "sleeping": return t("pet.mood.sleeping");
     case "recovering": return t("pet.mood.recovering");
@@ -27,6 +26,5 @@ export function petMoodLabel(t: OwnerT<"commands">, mood: string): OwnerText {
     case "bored": return t("pet.mood.bored");
     case "sad": return t("pet.mood.sad");
     case "miserable": return t("pet.mood.miserable");
-    default: return raw(mood);
   }
 }

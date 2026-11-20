@@ -6,7 +6,16 @@ export const usage = {
   titlePlan: "📊 Claude 用量（{{plan}}）\n",
   failure: {
     apiKey: "📊 正在使用 API key 认证，没有订阅额度限制。用量按 token 计费，详见 console.anthropic.com/settings/usage",
-    credentials: "无法获取 Claude 用量：{{detail}}",
+    credential: {
+      securityMissing: "无法获取 Claude 用量：PATH 里找不到 `security` 命令。",
+      keychainTimeout: "无法获取 Claude 用量：读取 macOS 钥匙串超时。请解锁钥匙串后再试 /usage。",
+      keychainNotFound: "无法获取 Claude 用量：macOS 钥匙串里没有 Claude Code 凭据。请先用 Claude Code 登录。",
+      keychainLocked: "无法获取 Claude 用量：macOS 钥匙串已锁定或拒绝访问。请解锁后再试 /usage。",
+      keychainUnreadable: "无法获取 Claude 用量：无法从 macOS 钥匙串读取 Claude Code 凭据。",
+      keychainJson: "无法获取 Claude 用量：钥匙串里的凭据不是有效的 JSON。",
+      fileMissing: "无法获取 Claude 用量：没有找到 Claude Code 凭据。请先用 Claude Code 登录。",
+      fileJson: "无法获取 Claude 用量：Claude Code 凭据文件不是有效的 JSON。",
+    },
     credentialsGeneric: "无法获取 Claude 用量：读取不到 Claude Code 凭据。",
     malformed: "无法获取 Claude 用量：Claude Code 凭据格式有误。请重新登录 Claude Code（`claude` → /login）。",
     noToken: "无法获取 Claude 用量：没有找到 Claude Code 凭据。请先用 Claude Code 登录。",

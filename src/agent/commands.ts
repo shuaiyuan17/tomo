@@ -13,7 +13,7 @@ import type { PauseStore } from "../sessions/pause-store.js";
 import { dmSessionKeyForIdentity, isGroupSessionKey } from "../sessions/keys.js";
 import { writeRestartReasonFile } from "../restart-reason.js";
 import { DEFAULT_MODEL, MODEL_ALIASES } from "../models.js";
-import { formatDateTime, formatNumber, joinText, ownerLocale, ownerT, raw, type OwnerT, type OwnerText } from "../i18n/index.js";
+import { formatDateTime, formatLocale, formatNumber, joinText, ownerT, raw, type OwnerT, type OwnerText } from "../i18n/index.js";
 import { switchSessionModel, type ModelSwitchRefusal } from "./model-switch.js";
 import { buildSessionCostReport } from "../costs.js";
 import {
@@ -309,7 +309,7 @@ export class ChatCommandHandler {
       const session = this.deps.sessions.get(key);
       const entry = this.deps.sessions.getEntry(key);
 
-      const locale = ownerLocale();
+      const locale = formatLocale();
       const lines: OwnerText[] = [];
       lines.push(t("status.title"));
       lines.push(t("status.session", { key }));
@@ -344,7 +344,7 @@ export class ChatCommandHandler {
         lines.push(t("status.tokens", { input: formatNumber(s.totalInputTokens, locale), output: formatNumber(s.totalOutputTokens, locale) }));
         if (s.contextMax > 0) {
           lines.push(t("status.context", {
-            percent: formatNumber(s.contextUsed / s.contextMax, locale, { style: "percent", maximumFractionDigits: 0 }),
+            percent: `${((s.contextUsed / s.contextMax) * 100).toFixed(0)}%`,
             used: formatNumber(s.contextUsed, locale), max: formatNumber(s.contextMax, locale),
           }));
         }
@@ -393,7 +393,7 @@ export class ChatCommandHandler {
       await this.reply(channel, chatId, t("tasks.unavailable"));
       return;
     }
-    const text = formatTaskList(list, { now, all: arg === "all", locale: ownerLocale() });
+    const text = formatTaskList(list, { now, all: arg === "all", locale: formatLocale() });
     if (ownerDm) {
       let sent = false;
       try { sent = await this.deps.sendToOwnerDm(ownerDm, text); } catch (err) {

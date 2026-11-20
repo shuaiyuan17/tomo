@@ -1,5 +1,5 @@
 import { execFile, spawn, type ExecFileException } from "node:child_process";
-import { joinText, ownerLocale, ownerT, raw, type Locale, type OwnerT, type OwnerText } from "../i18n/index.js";
+import { formatLocale, joinText, ownerT, type Locale, type OwnerT, type OwnerText } from "../i18n/index.js";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
@@ -123,15 +123,16 @@ interface UsageDeps {
  * error, non-200) resolves to a friendly one-line message.
  */
 export async function buildUsageReport(deps: UsageDeps = {}): Promise<OwnerText> {
-  const locale = deps.locale ?? ownerLocale();
+  // Unset: English text, and the system default for clock times, as before.
+  const locale = deps.locale ?? formatLocale();
   const result = await fetchUsage(deps);
-  if (!result.ok) return result.render ? result.render(locale) : raw(result.message);
+  if (!result.ok) return result.render(locale ?? "en");
   // The format phase must not throw out of the never-throws boundary: malformed
   // endpoint data is guarded per-field, and this catch is the final backstop.
   try {
     return formatUsageReport(result.data, (deps.now ?? Date.now)(), result.subscriptionType, deps.gatewayActive, locale);
   } catch {
-    return ownerT("usage", locale)("failure.badResponse");
+    return ownerT("usage", locale ?? "en")("failure.badResponse");
   }
 }
 
@@ -141,11 +142,12 @@ export type UsageFailure =
   | "unauthorized" | "network" | "timeout" | "http_error" | "bad_response";
 export type UsageResult =
   | { ok: true; data: UsageResponse; subscriptionType?: string }
-  /** `message` is English (the web card's text); `render` writes it in another locale. */
-  | { ok: false; reason: UsageFailure; message: string; render?: (locale: Locale) => OwnerText };
+  /** `message` is English (the web card's text); `render` writes it in any locale. */
+  | { ok: false; reason: UsageFailure; message: string; render: (locale: Locale) => OwnerText };
 const fail = (reason: UsageFailure, text: (t: OwnerT<"usage">) => OwnerText): UsageResult =>
   ({ ok: false, reason, message: text(ownerT("usage", "en")), render: (locale) => text(ownerT("usage", locale)) });
-const requestFailure = (kind: "timeout" | "network"): UsageResult =>
+/** A failed request (the web card's fallback uses it too). */
+export const requestFailure = (kind: "timeout" | "network"): UsageResult =>
   kind === "timeout" ? fail("timeout", (t: OwnerT<"usage">) => t("failure.timeout")) : fail("network", (t: OwnerT<"usage">) => t("failure.network"));
 
 /**
@@ -169,10 +171,10 @@ export async function fetchUsage(deps: UsageDeps = {}): Promise<UsageResult> {
   try {
     creds = await loadCredentials();
   } catch (err) {
-    const detail = err instanceof UsageCredentialError ? err.message : undefined;
-    const reason = detail !== undefined && /no Claude Code credentials/.test(detail) ? "no_token" : "credentials_unreadable";
-    // The credential reader's detail (Keychain, file) is passed through as written.
-    return fail(reason, (t: OwnerT<"usage">) => detail !== undefined ? t("failure.credentials", { detail }) : t("failure.credentialsGeneric"));
+    if (!(err instanceof UsageCredentialError)) return fail("credentials_unreadable", (t: OwnerT<"usage">) => t("failure.credentialsGeneric"));
+    const kind = err.kind;
+    return fail(kind === "keychain_not_found" || kind === "file_missing" ? "no_token" : "credentials_unreadable",
+      (t: OwnerT<"usage">) => credentialFailureText(t, kind));
   }
 
   // Parsed JSON can be semantically malformed (e.g. a literal `null`, which is
@@ -431,9 +433,9 @@ export function formatUsageReport(
   now: number,
   subscriptionType?: string,
   gatewayActive?: boolean,
-  locale: Locale = "en",
+  locale?: Locale,
 ): OwnerText {
-  const t = ownerT("usage", locale);
+  const t = ownerT("usage", locale ?? "en");
   // Endpoint data is untrusted: a JSON body of literal `null`, or fields with
   // the wrong type (e.g. group: 7), must degrade gracefully rather than throw
   // out of the never-throws boundary. Coerce to a safe object up front and
@@ -537,7 +539,7 @@ export function usageWindows(data: UsageResponse | null | undefined): UsageWindo
  * Returns an empty array for a null/absent window (used to omit per-model rows).
  * When `compact` is set, the two lines are joined so per-model rows stay tight.
  */
-function windowLines(t: OwnerT<"usage">, label: string, window: UsageWindow | null | undefined, now: number, locale: Locale, compact = false): OwnerText[] {
+function windowLines(t: OwnerT<"usage">, label: string, window: UsageWindow | null | undefined, now: number, locale: Locale | undefined, compact = false): OwnerText[] {
   if (!window || typeof window !== "object") return [];
   const percent = typeof window.utilization === "number" && Number.isFinite(window.utilization)
     ? `${Math.round(window.utilization)}%`
@@ -595,7 +597,7 @@ function toSafeLimit(raw: unknown): SafeLimit | null {
  * Render the `limits` array, one line per entry, grouped session-then-weekly
  * (then anything else), with the label column padded so percents align.
  */
-function renderLimits(t: OwnerT<"usage">, limits: SafeLimit[], now: number, locale: Locale): OwnerText[] {
+function renderLimits(t: OwnerT<"usage">, limits: SafeLimit[], now: number, locale: Locale | undefined): OwnerText[] {
   // Stable sort (V8 Array.sort is stable): session group first, weekly next,
   // unknown groups last — original order preserved within each group.
   const sorted = [...limits].sort((a, b) => groupRank(a) - groupRank(b));
@@ -614,8 +616,8 @@ function groupRank(limit: SafeLimit): number {
 }
 
 /** Build a human label from a limit's kind + scope (e.g. "Weekly · Fable"). */
-function limitLabel(limit: SafeLimit, locale: Locale = "en"): string {
-  const t = ownerT("usage", locale);
+function limitLabel(limit: SafeLimit, locale?: Locale): string {
+  const t = ownerT("usage", locale ?? "en");
   let base: string;
   switch (limit.kind) {
     case "session": base = t("limit.session"); break;
@@ -641,7 +643,7 @@ function prettifyKind(kind: string): string | undefined {
  *   `Weekly · Fable:      43%  ← active · resets in 5d 16h (Aug 2, 7:59 AM)`
  * Elevated severity prefixes the line with ⚠️.
  */
-function renderLimitLine(t: OwnerT<"usage">, limit: SafeLimit, label: string, colWidth: number, now: number, locale: Locale): OwnerText {
+function renderLimitLine(t: OwnerT<"usage">, limit: SafeLimit, label: string, colWidth: number, now: number, locale: Locale | undefined): OwnerText {
   const pct = limit.percent !== null ? `${Math.round(limit.percent)}%` : t("noPercent");
   const reset = limit.resetsAt ? formatReset(limit.resetsAt, now, locale) : null;
 
@@ -664,18 +666,19 @@ function isElevatedSeverity(severity: string): boolean {
 }
 
 /** Format an ISO reset timestamp into a human countdown + local clock time. */
-export function formatReset(resetsAt: string, now: number, locale: Locale = "en"): { countdown: string; clock: string } {
+/** `locale` undefined (unset): English, and the system's own clock format. */
+export function formatReset(resetsAt: string, now: number, locale?: Locale): { countdown: string; clock: string } {
   const resetMs = Date.parse(resetsAt);
   if (!Number.isFinite(resetMs)) {
-    const unknown = ownerT("usage", locale)("countdown.unknown");
+    const unknown = ownerT("usage", locale ?? "en")("countdown.unknown");
     return { countdown: unknown, clock: unknown };
   }
   return { countdown: formatCountdown(resetMs - now, locale), clock: formatLocalClock(resetMs, now, locale) };
 }
 
 /** "5d 23h" / "5h 12m" / "47m" / "now". Two coarsest non-zero units. */
-export function formatCountdown(ms: number, locale: Locale = "en"): string {
-  const t = ownerT("usage", locale);
+export function formatCountdown(ms: number, locale?: Locale): string {
+  const t = ownerT("usage", locale ?? "en");
   if (ms <= 0) return t("countdown.now");
   const totalMinutes = Math.floor(ms / 60000);
   const days = Math.floor(totalMinutes / (60 * 24));
@@ -691,15 +694,14 @@ export function formatCountdown(ms: number, locale: Locale = "en"): string {
  * Local-zone clock for a reset instant. Shows the date when it is not today,
  * e.g. "7:59 PM" (today) vs "Aug 2, 7:59 AM" (another day).
  */
-function formatLocalClock(resetMs: number, now: number, locale: Locale): string {
+function formatLocalClock(resetMs: number, now: number, locale: Locale | undefined): string {
   const reset = new Date(resetMs);
-  // English keeps the system's own conventions, as before; other locales say it their way.
-  const tag = locale === "en" ? undefined : locale;
-  const time = reset.toLocaleTimeString(tag, { hour: "numeric", minute: "2-digit" });
+  // Unset (undefined): the system's own conventions, as before.
+  const time = reset.toLocaleTimeString(locale, { hour: "numeric", minute: "2-digit" });
   const sameDay = new Date(now).toDateString() === reset.toDateString();
   if (sameDay) return time;
-  const date = reset.toLocaleDateString(tag, { month: "short", day: "numeric" });
-  return ownerT("usage", locale)("dateTime", { date, time });
+  const date = reset.toLocaleDateString(locale, { month: "short", day: "numeric" });
+  return ownerT("usage", locale ?? "en")("dateTime", { date, time });
 }
 
 export function subscriptionLabel(subscriptionType?: string): string {
@@ -747,35 +749,37 @@ function readKeychainCredentials(): Promise<ClaudeCredentials> {
           // a string "ENOENT" code; a real Keychain error carries a numeric
           // exit code instead.
           if (code === "ENOENT") {
-            reject(new UsageCredentialError("`security` command not found on PATH.", true));
+            reject(new UsageCredentialError("security_missing", true));
             return;
           }
           // Operational Keychain failures (item-not-found, locked, access
           // denied, timeout) must NOT fall back to a possibly-stale on-disk
           // credential — surface an actionable message instead.
-          reject(new UsageCredentialError(keychainErrorMessage(err, stderr), false));
+          reject(new UsageCredentialError(keychainErrorKind(err, stderr), false));
           return;
         }
         try {
           const parsed: unknown = JSON.parse(stdout.trim());
           if (!parsed || typeof parsed !== "object") {
-            reject(new UsageCredentialError(
-              "Claude Code credentials were malformed. Re-login to Claude Code (`claude` → /login).",
-              false,
-            ));
+            reject(new UsageCredentialError("malformed", false));
             return;
           }
           resolve(parsed as ClaudeCredentials);
         } catch {
-          reject(new UsageCredentialError("Keychain credentials were not valid JSON.", false));
+          reject(new UsageCredentialError("keychain_json", false));
         }
       },
     );
   });
 }
 
-/** Map a `security` non-ENOENT failure to a fixed, actionable message. */
+/** Map a `security` non-ENOENT failure to a fixed, actionable message (English). */
 export function keychainErrorMessage(err: ExecFileException, stderr: string | Buffer | undefined): string {
+  return CREDENTIAL_MESSAGES[keychainErrorKind(err, stderr)];
+}
+
+/** Which fixed failure a `security` non-ENOENT exit is. */
+function keychainErrorKind(err: ExecFileException, stderr: string | Buffer | undefined): CredentialFailure {
   // When Node's own execFile `timeout` fires, it kills the child and sets
   // killed=true WITH the kill signal — that pair is the timeout signature.
   // Require both: a child terminated externally by SIGTERM has killed=false
@@ -783,18 +787,18 @@ export function keychainErrorMessage(err: ExecFileException, stderr: string | Bu
   // through to the generic message. Checked first because a timeout usually
   // leaves stderr empty, which the stderr branches can't distinguish.
   if (err.killed === true && err.signal != null) {
-    return "the macOS Keychain lookup timed out — unlock the Keychain and try /usage again.";
+    return "keychain_timeout";
   }
   const code = err.code;
   const text = String(stderr ?? "").toLowerCase();
   // errSecItemNotFound → exit 44, or the tool prints "could not be found".
   if (code === 44 || code === "44" || text.includes("could not be found")) {
-    return "no Claude Code credentials in the macOS Keychain. Log in with Claude Code first.";
+    return "keychain_not_found";
   }
   if (text.includes("interaction is not allowed") || text.includes("denied") || text.includes("locked")) {
-    return "the macOS Keychain is locked or denied access — unlock it and try /usage again.";
+    return "keychain_locked";
   }
-  return "could not read Claude Code credentials from the macOS Keychain.";
+  return "keychain_unreadable";
 }
 
 async function readFileCredentials(): Promise<ClaudeCredentials> {
@@ -802,30 +806,57 @@ async function readFileCredentials(): Promise<ClaudeCredentials> {
   try {
     raw = await readFile(CREDENTIALS_FILE, "utf-8");
   } catch {
-    throw new UsageCredentialError(
-      "no Claude Code credentials found. Log in with Claude Code first.",
-      false,
-    );
+    throw new UsageCredentialError("file_missing", false);
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new UsageCredentialError("Claude Code credentials file was not valid JSON.", false);
+    throw new UsageCredentialError("file_json", false);
   }
   if (!parsed || typeof parsed !== "object") {
-    throw new UsageCredentialError(
-      "Claude Code credentials were malformed. Re-login to Claude Code (`claude` → /login).",
-      false,
-    );
+    throw new UsageCredentialError("malformed", false);
   }
   return parsed as ClaudeCredentials;
 }
 
-/** Credential-loading failure carrying a chat-friendly message. */
+/** Why the Claude Code credentials could not be read: each is a fixed message of ours. */
+type CredentialFailure =
+  | "security_missing" | "keychain_timeout" | "keychain_not_found" | "keychain_locked" | "keychain_unreadable"
+  | "keychain_json" | "malformed" | "file_missing" | "file_json";
+
+/** The English text of each (the web card's message; also `Error.message`). */
+const CREDENTIAL_MESSAGES: Record<CredentialFailure, string> = {
+  security_missing: "`security` command not found on PATH.",
+  keychain_timeout: "the macOS Keychain lookup timed out — unlock the Keychain and try /usage again.",
+  keychain_not_found: "no Claude Code credentials in the macOS Keychain. Log in with Claude Code first.",
+  keychain_locked: "the macOS Keychain is locked or denied access — unlock it and try /usage again.",
+  keychain_unreadable: "could not read Claude Code credentials from the macOS Keychain.",
+  keychain_json: "Keychain credentials were not valid JSON.",
+  malformed: "Claude Code credentials were malformed. Re-login to Claude Code (`claude` → /login).",
+  file_missing: "no Claude Code credentials found. Log in with Claude Code first.",
+  file_json: "Claude Code credentials file was not valid JSON.",
+};
+
+/** A credential failure, in the reply's language. */
+function credentialFailureText(t: OwnerT<"usage">, kind: CredentialFailure): OwnerText {
+  switch (kind) {
+    case "security_missing": return t("failure.credential.securityMissing");
+    case "keychain_timeout": return t("failure.credential.keychainTimeout");
+    case "keychain_not_found": return t("failure.credential.keychainNotFound");
+    case "keychain_locked": return t("failure.credential.keychainLocked");
+    case "keychain_unreadable": return t("failure.credential.keychainUnreadable");
+    case "keychain_json": return t("failure.credential.keychainJson");
+    case "malformed": return t("failure.malformed");
+    case "file_missing": return t("failure.credential.fileMissing");
+    case "file_json": return t("failure.credential.fileJson");
+  }
+}
+
+/** Credential-loading failure: a fixed kind, so the reply can be written in any language. */
 class UsageCredentialError extends Error {
-  constructor(message: string, readonly tryFile: boolean) {
-    super(message);
+  constructor(readonly kind: CredentialFailure, readonly tryFile: boolean) {
+    super(CREDENTIAL_MESSAGES[kind]);
     this.name = "UsageCredentialError";
   }
 }

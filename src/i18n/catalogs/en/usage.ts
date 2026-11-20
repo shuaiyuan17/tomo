@@ -4,7 +4,16 @@ export const usage = {
   titlePlan: "📊 Claude usage ({{plan}})\n",
   failure: {
     apiKey: "📊 API-key auth — no subscription limits. Usage is billed per-token; see console.anthropic.com/settings/usage",
-    credentials: "Claude usage unavailable: {{detail}}",
+    credential: {
+      securityMissing: "Claude usage unavailable: `security` command not found on PATH.",
+      keychainTimeout: "Claude usage unavailable: the macOS Keychain lookup timed out — unlock the Keychain and try /usage again.",
+      keychainNotFound: "Claude usage unavailable: no Claude Code credentials in the macOS Keychain. Log in with Claude Code first.",
+      keychainLocked: "Claude usage unavailable: the macOS Keychain is locked or denied access — unlock it and try /usage again.",
+      keychainUnreadable: "Claude usage unavailable: could not read Claude Code credentials from the macOS Keychain.",
+      keychainJson: "Claude usage unavailable: Keychain credentials were not valid JSON.",
+      fileMissing: "Claude usage unavailable: no Claude Code credentials found. Log in with Claude Code first.",
+      fileJson: "Claude usage unavailable: Claude Code credentials file was not valid JSON.",
+    },
     credentialsGeneric: "Claude usage unavailable: could not read Claude Code credentials.",
     malformed: "Claude usage unavailable: Claude Code credentials were malformed. Re-login to Claude Code (`claude` → /login).",
     noToken: "Claude usage unavailable: no Claude Code credentials found. Log in with Claude Code first.",

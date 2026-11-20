@@ -91,6 +91,20 @@ describe("/todo chat command", () => {
     await agent.stop();
   });
 
+  it("under config locale zh-Hans, replies and the store's rule errors are Chinese; the model's tools keep the English message", async () => {
+    const { agent, tg, store } = setup();
+    resetConfig({ locale: "zh-Hans" });
+    await tg.simulateCommand("todo", OWNER_ID, "Shuai", "done t-99", OWNER_ID);
+    expect(tg.sent[0].text).toBe("这个对话里没有未完成的待办 t-99。");
+    await tg.simulateCommand("todo", OWNER_ID, "Shuai", `add ${"x".repeat(400)}`, OWNER_ID);
+    expect(tg.sent[1].text).toMatch(/^title 有 400 个字符，上限是 \d+。/);
+    await tg.simulateCommand("todo", OWNER_ID, "Shuai", "done t-1", OWNER_ID);
+    expect(tg.sent[2].text).toBe("已完成：t-1 owner private errand");
+    // The same refusal, as the model's todo tools see it.
+    expect(() => store.resolve("t-99", { action: "done", by: "self" })).toThrow("No open todo t-99 in this conversation.");
+    await agent.stop();
+  });
+
   it("in a group, shows only that group's items, and only the owner may change them", async () => {
     const { agent, tg, store } = setup();
     await tg.simulateCommand("todo", GROUP, "Member", undefined, "99999");

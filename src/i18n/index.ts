@@ -77,12 +77,21 @@ export function ownerT<NS extends ServerNamespace>(ns: NS, locale: Locale = owne
   return (key, options) => fixed(key as string, options) as OwnerText;
 }
 
-/** A date and time as `locale` writes it (`toLocaleString`, with the locale passed explicitly). */
-export function formatDateTime(value: number | Date, locale: Locale = ownerLocale(), options?: Intl.DateTimeFormatOptions): string {
+/**
+ * The locale to hand `Intl` for dates and numbers: config `locale` when it
+ * is set, else undefined, the system's own default, exactly as before
+ * there was a setting. (Text falls back to English instead: {@link ownerLocale}.)
+ */
+export function formatLocale(): Locale | undefined {
+  return config.locale ?? undefined;
+}
+
+/** A date and time as `locale` writes it (`toLocaleString`); undefined is the system default. */
+export function formatDateTime(value: number | Date, locale: Locale | undefined = formatLocale(), options?: Intl.DateTimeFormatOptions): string {
   return new Date(value).toLocaleString(locale, options);
 }
 
-/** A number as `locale` writes it (`Intl.NumberFormat`). */
-export function formatNumber(value: number, locale: Locale = ownerLocale(), options?: Intl.NumberFormatOptions): string {
+/** A number as `locale` writes it (`Intl.NumberFormat`); undefined is the system default. */
+export function formatNumber(value: number, locale: Locale | undefined = formatLocale(), options?: Intl.NumberFormatOptions): string {
   return new Intl.NumberFormat(locale, options).format(value);
 }

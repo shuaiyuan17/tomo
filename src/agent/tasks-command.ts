@@ -37,8 +37,9 @@ function duration(t: OwnerT<"tasks">, ms: number): string {
   return t("hoursMinutes", { h: Math.floor(minutes / 60), m: String(minutes % 60).padStart(2, "0") });
 }
 
-function clock(at: number, locale: Locale, timeZone?: string): string {
-  return new Date(at).toLocaleTimeString(locale === "en" ? "en-US" : locale, { ...(timeZone ? { timeZone } : {}), hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+function clock(at: number, locale: Locale | undefined, timeZone?: string): string {
+  // Unset: the 24-hour US clock /tasks has always used.
+  return new Date(at).toLocaleTimeString(locale ?? "en-US", { ...(timeZone ? { timeZone } : {}), hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 }
 
 function describe(t: OwnerT<"tasks">, task: WebTask): string {
@@ -52,9 +53,10 @@ function describe(t: OwnerT<"tasks">, task: WebTask): string {
  * line per task. Every running task; then the RECENT_ENDED_LIMIT most recent
  * ended ones from `list.ended` (all of them with `all`).
  */
+/** `locale`: config `locale`; undefined (unset) is English text and the clock /tasks always used. */
 export function formatTaskList(list: SessionTaskList, options: { now: number; all?: boolean; timeZone?: string; locale?: Locale }): OwnerText {
-  const locale = options.locale ?? "en";
-  const t = ownerT("tasks", locale);
+  const locale = options.locale;
+  const t = ownerT("tasks", locale ?? "en");
   const { running, ended } = list;
   if (!running.length && !ended.length) return t("none");
   const failed = ended.filter((task) => task.state === "failed").length;

@@ -14,16 +14,10 @@ import { findEscapeHatches, readSources, type Source } from "./helpers/i18n-ast.
  * src/i18n/index.ts (named, renamed or namespace), not by text matching.
  */
 const RAW_ALLOWLIST: Record<string, number> = {
-  // The Claude and MCP login links a /login or /mcp login reply carries.
+  // The Claude and MCP login links a /login or /mcp login reply carries (URLs from the login flow).
   "src/agent/commands.ts": 2,
-  // An MCP server's authorize link, and an elicitation's own message and link.
+  // An MCP server's authorize link, and an elicitation's own message and link (the server's words).
   "src/agent/mcp-auth-prompts.ts": 3,
-  // The todo store's rule errors: also the model's todo tools' text, so English.
-  "src/agent/todo-command.ts": 1,
-  // A usage failure built without a renderer (the web card's own cache): its English message.
-  "src/agent/usage.ts": 1,
-  // A pet mood word PetStore added after the catalog.
-  "src/mcp/pet-labels.ts": 1,
 };
 
 const I18N_MODULE = resolve(import.meta.dirname, "../src/i18n/index.ts");

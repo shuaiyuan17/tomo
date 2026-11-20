@@ -9,7 +9,7 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 
 import { Agent, MockChannel, agentEnv, installAgentTestHooks, mockSdk, resetConfig, sdkMock } from "./helpers/agent-harness.js";
 import { TodoStore, todosDir } from "../src/todos/store.js";
-import { parseTodoArgs, TODO_USAGE } from "../src/agent/todo-command.js";
+import { parseTodoArgs, todoUsage } from "../src/agent/todo-command.js";
 import { CHAT_COMMAND_NAMES } from "../src/channels/chat-commands.js";
 
 installAgentTestHooks();
@@ -80,7 +80,7 @@ describe("/todo chat command", () => {
     await tg.simulateCommand("todo", OWNER_ID, "Shuai", "done t-99", OWNER_ID);
     expect(tg.sent[3].text).toBe("No open todo t-99 in this conversation.");
     await tg.simulateCommand("todo", OWNER_ID, "Shuai", "snooze t-1", OWNER_ID);
-    expect(tg.sent[4].text).toBe(TODO_USAGE);
+    expect(tg.sent[4].text).toBe(todoUsage("en"));
     expect(store.list().map((i) => i.id)).toEqual(["t-1", "t-3"]);
     const log = readFileSync(join(todosDir(), "done.ndjson"), "utf-8").trim().split("\n").map((l) => JSON.parse(l));
     expect(log).toEqual([

@@ -1,4 +1,5 @@
 import { execFile, spawn, type ExecFileException } from "node:child_process";
+import { joinText, ownerLocale, ownerT, raw, type Locale, type OwnerT, type OwnerText } from "../i18n/index.js";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
@@ -7,7 +8,6 @@ import { join } from "node:path";
 const USAGE_ENDPOINT = "https://api.anthropic.com/api/oauth/usage";
 const OAUTH_BETA = "oauth-2025-04-20";
 const REQUEST_TIMEOUT_MS = 10_000;
-const TIMEOUT_MESSAGE = "Claude usage unavailable: usage request timed out.";
 const KEYCHAIN_SERVICE = "Claude Code-credentials";
 /** Deadline for the delegated `claude -p /usage` token refresh (normally ~1s). */
 const REFRESH_TIMEOUT_MS = 30_000;
@@ -112,35 +112,9 @@ interface UsageDeps {
    * bill through the gateway rather than the subscription.
    */
   gatewayActive?: boolean;
+  /** Language of the `/usage` reply (default: config `locale`). */
+  locale?: Locale;
 }
-
-const API_KEY_MESSAGE =
-  "📊 API-key auth — no subscription limits. Usage is billed per-token; see console.anthropic.com/settings/usage";
-const RELOGIN_HINT = "Re-login to Claude Code (`claude` → /login).";
-/**
- * The stored access token is stale but Claude Code never got to refresh it
- * here (the refresh timed out or couldn't start). It refreshes on the agent's
- * next API call, so this is not yet a reason to re-login.
- */
-const REFRESH_PENDING_MESSAGE =
-  "Claude usage unavailable: the stored Claude Code access token is stale and couldn't be refreshed just now. " +
-  "It refreshes automatically on the next agent turn — send a message, then try /usage again.";
-/** Claude Code ran its refresh and the token is still expired. */
-const REFRESH_FAILED_MESSAGE =
-  "Claude usage unavailable: the access token is expired and Claude Code's token refresh failed. " +
-  `Try again after the next agent turn; if this persists, ${RELOGIN_HINT.charAt(0).toLowerCase()}${RELOGIN_HINT.slice(1)}`;
-/**
- * The refresh ran, but re-reading the credentials afterwards failed (e.g. the
- * Keychain was momentarily locked). Says nothing about the token's health.
- */
-const REREAD_FAILED_MESSAGE =
-  "Claude usage unavailable: couldn't read the Claude Code credentials after refreshing them. Try /usage again.";
-/** Claude Code ran its refresh, but the usage endpoint still rejects the token. */
-const REJECTED_AFTER_REFRESH_MESSAGE =
-  "Claude usage unavailable: the usage endpoint rejected the stored access token (401) and Claude Code's refresh didn't replace it. " +
-  `If this persists, ${RELOGIN_HINT.charAt(0).toLowerCase()}${RELOGIN_HINT.slice(1)}`;
-const GATEWAY_CAVEAT =
-  "(gateway mode active — these are your Claude subscription limits, not necessarily what this session bills to)";
 
 /**
  * Reads the current Claude subscription usage (5-hour and 7-day windows) and
@@ -148,15 +122,16 @@ const GATEWAY_CAVEAT =
  * mode (missing Keychain entry, non-macOS, expired/invalid token, network
  * error, non-200) resolves to a friendly one-line message.
  */
-export async function buildUsageReport(deps: UsageDeps = {}): Promise<string> {
+export async function buildUsageReport(deps: UsageDeps = {}): Promise<OwnerText> {
+  const locale = deps.locale ?? ownerLocale();
   const result = await fetchUsage(deps);
-  if (!result.ok) return result.message;
+  if (!result.ok) return result.render ? result.render(locale) : raw(result.message);
   // The format phase must not throw out of the never-throws boundary: malformed
   // endpoint data is guarded per-field, and this catch is the final backstop.
   try {
-    return formatUsageReport(result.data, (deps.now ?? Date.now)(), result.subscriptionType, deps.gatewayActive);
+    return formatUsageReport(result.data, (deps.now ?? Date.now)(), result.subscriptionType, deps.gatewayActive, locale);
   } catch {
-    return "Claude usage unavailable: could not parse the usage response.";
+    return ownerT("usage", locale)("failure.badResponse");
   }
 }
 
@@ -166,9 +141,12 @@ export type UsageFailure =
   | "unauthorized" | "network" | "timeout" | "http_error" | "bad_response";
 export type UsageResult =
   | { ok: true; data: UsageResponse; subscriptionType?: string }
-  | { ok: false; reason: UsageFailure; message: string };
-const fail = (reason: UsageFailure, message: string): UsageResult => ({ ok: false, reason, message });
-const requestFailure = (message: string): UsageResult => fail(message === TIMEOUT_MESSAGE ? "timeout" : "network", message);
+  /** `message` is English (the web card's text); `render` writes it in another locale. */
+  | { ok: false; reason: UsageFailure; message: string; render?: (locale: Locale) => OwnerText };
+const fail = (reason: UsageFailure, text: (t: OwnerT<"usage">) => OwnerText): UsageResult =>
+  ({ ok: false, reason, message: text(ownerT("usage", "en")), render: (locale) => text(ownerT("usage", locale)) });
+const requestFailure = (kind: "timeout" | "network"): UsageResult =>
+  kind === "timeout" ? fail("timeout", (t: OwnerT<"usage">) => t("failure.timeout")) : fail("network", (t: OwnerT<"usage">) => t("failure.network"));
 
 /**
  * The structured half of `/usage`: credentials (with Claude Code's delegated
@@ -184,28 +162,30 @@ export async function fetchUsage(deps: UsageDeps = {}): Promise<UsageResult> {
   // instead of an empty or zeroed subscription block. Authoritative config
   // signal, so it wins even if a stale Keychain OAuth token is still present.
   if (deps.authMethod === "api-key") {
-    return fail("api_key", API_KEY_MESSAGE);
+    return fail("api_key", (t: OwnerT<"usage">) => t("failure.apiKey"));
   }
 
   let creds: ClaudeCredentials;
   try {
     creds = await loadCredentials();
   } catch (err) {
-    const message = usageError(err);
-    return fail(/no Claude Code credentials/.test(message) ? "no_token" : "credentials_unreadable", message);
+    const detail = err instanceof UsageCredentialError ? err.message : undefined;
+    const reason = detail !== undefined && /no Claude Code credentials/.test(detail) ? "no_token" : "credentials_unreadable";
+    // The credential reader's detail (Keychain, file) is passed through as written.
+    return fail(reason, (t: OwnerT<"usage">) => detail !== undefined ? t("failure.credentials", { detail }) : t("failure.credentialsGeneric"));
   }
 
   // Parsed JSON can be semantically malformed (e.g. a literal `null`, which is
   // typeof "object"): accessing `.claudeAiOauth` on it would throw outside any
   // catch. Guard the shape before extraction.
   if (!creds || typeof creds !== "object") {
-    return fail("credentials_unreadable", "Claude usage unavailable: Claude Code credentials were malformed. Re-login to Claude Code (`claude` → /login).");
+    return fail("credentials_unreadable", (t: OwnerT<"usage">) => t("failure.malformed"));
   }
 
   let oauth = creds.claudeAiOauth;
   const initialToken = oauth?.accessToken;
   if (!initialToken) {
-    return fail("no_token", "Claude usage unavailable: no Claude Code credentials found. Log in with Claude Code first.");
+    return fail("no_token", (t: OwnerT<"usage">) => t("failure.noToken"));
   }
   let token: string = initialToken;
 
@@ -219,13 +199,13 @@ export async function fetchUsage(deps: UsageDeps = {}): Promise<UsageResult> {
   let lastOutcome: RefreshOutcome | undefined;
   if (isExpired(oauth?.expiresAt, now())) {
     if (!oauth?.refreshToken) {
-      return fail("token_expired", `Claude usage unavailable: access token expired. ${RELOGIN_HINT}`);
+      return fail("token_expired", (t: OwnerT<"usage">) => t("failure.expired"));
     }
     refreshAttempted = true;
     const { outcome, oauth: fresh, readFailed } = await refreshAndReload(deps, loadCredentials);
-    if (readFailed) return fail("credentials_unreadable", REREAD_FAILED_MESSAGE);
+    if (readFailed) return fail("credentials_unreadable", (t: OwnerT<"usage">) => t("failure.rereadFailed"));
     if (!fresh?.accessToken || isExpired(fresh.expiresAt, now())) {
-      return outcome === "completed" ? fail("token_expired", REFRESH_FAILED_MESSAGE) : fail("refresh_pending", REFRESH_PENDING_MESSAGE);
+      return outcome === "completed" ? fail("token_expired", (t: OwnerT<"usage">) => t("failure.refreshFailed")) : fail("refresh_pending", (t: OwnerT<"usage">) => t("failure.refreshPending"));
     }
     lastOutcome = outcome;
     oauth = fresh;
@@ -240,7 +220,7 @@ export async function fetchUsage(deps: UsageDeps = {}): Promise<UsageResult> {
   // Code one chance to refresh, and retry once only if the token changed.
   if (res.status === 401 && oauth?.refreshToken && !refreshAttempted) {
     const { outcome, oauth: fresh, readFailed } = await refreshAndReload(deps, loadCredentials);
-    if (readFailed) return fail("credentials_unreadable", REREAD_FAILED_MESSAGE);
+    if (readFailed) return fail("credentials_unreadable", (t: OwnerT<"usage">) => t("failure.rereadFailed"));
     lastOutcome = outcome;
     if (fresh?.accessToken && fresh.accessToken !== token && !isExpired(fresh.expiresAt, now())) {
       oauth = fresh;
@@ -253,21 +233,21 @@ export async function fetchUsage(deps: UsageDeps = {}): Promise<UsageResult> {
   if (res.status === 401 && oauth?.refreshToken) {
     // Only claim "it'll refresh next turn" when Claude Code never got to try;
     // once it ran and the token is still rejected, say so honestly.
-    return lastOutcome === "completed" ? fail("unauthorized", REJECTED_AFTER_REFRESH_MESSAGE) : fail("refresh_pending", REFRESH_PENDING_MESSAGE);
+    return lastOutcome === "completed" ? fail("unauthorized", (t: OwnerT<"usage">) => t("failure.rejectedAfterRefresh")) : fail("refresh_pending", (t: OwnerT<"usage">) => t("failure.refreshPending"));
   }
   if (res.status === 401 || res.status === 403) {
-    return fail("unauthorized", `Claude usage unavailable: token expired or unauthorized. ${RELOGIN_HINT}`);
+    return fail("unauthorized", (t: OwnerT<"usage">) => t("failure.unauthorized"));
   }
   if (!res.ok) {
-    return fail("http_error", `Claude usage unavailable: usage endpoint returned HTTP ${res.status}.`);
+    return fail("http_error", (t: OwnerT<"usage">) => t("failure.http", { status: res.status }));
   }
 
   let data: unknown;
   try {
     data = await res.json();
   } catch (err) {
-    if (isTimeout(err)) return fail("timeout", TIMEOUT_MESSAGE);
-    return fail("bad_response", "Claude usage unavailable: could not parse the usage response.");
+    if (isTimeout(err)) return requestFailure("timeout");
+    return fail("bad_response", (t: OwnerT<"usage">) => t("failure.badResponse"));
   }
   // A body of literal `null` is not an error here: `/usage` renders it as an
   // empty report, and the web card as "no usage data".
@@ -286,7 +266,7 @@ function isExpired(expiresAt: number | undefined, nowMs: number): boolean {
  * network failure / timeout. The body must be read before the deadline too:
  * the signal is tied to the response stream, so a stalled body aborts as well.
  */
-async function requestUsage(fetchImpl: typeof fetch, token: string): Promise<Response | string> {
+async function requestUsage(fetchImpl: typeof fetch, token: string): Promise<Response | "timeout" | "network"> {
   // Without a deadline, /usage could hang indefinitely on an unresponsive
   // endpoint.
   const signal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
@@ -301,10 +281,10 @@ async function requestUsage(fetchImpl: typeof fetch, token: string): Promise<Res
       signal,
     });
   } catch (err) {
-    if (isTimeout(err)) return TIMEOUT_MESSAGE;
+    if (isTimeout(err)) return "timeout";
     // Never interpolate the raw error: a future fetch wrapper that echoed
     // request headers could leak the bearer token through err.message.
-    return "Claude usage unavailable: network error.";
+    return "network";
   }
 }
 
@@ -451,7 +431,9 @@ export function formatUsageReport(
   now: number,
   subscriptionType?: string,
   gatewayActive?: boolean,
-): string {
+  locale: Locale = "en",
+): OwnerText {
+  const t = ownerT("usage", locale);
   // Endpoint data is untrusted: a JSON body of literal `null`, or fields with
   // the wrong type (e.g. group: 7), must degrade gracefully rather than throw
   // out of the never-throws boundary. Coerce to a safe object up front and
@@ -459,7 +441,7 @@ export function formatUsageReport(
   const d: UsageResponse = data && typeof data === "object" ? data : {};
 
   const planLabel = subscriptionLabel(subscriptionType);
-  const lines: string[] = [`📊 Claude usage${planLabel ? ` (${planLabel})` : ""}`, ""];
+  const lines: OwnerText[] = [planLabel ? t("titlePlan", { plan: planLabel }) : t("title")];
 
   const limits = (Array.isArray(d.limits) ? d.limits : [])
     .map(toSafeLimit)
@@ -467,14 +449,14 @@ export function formatUsageReport(
   if (limits.length > 0) {
     // Primary path: render every limit entry so nothing (esp. active scoped
     // caps like a Fable weekly wall) is silently dropped.
-    lines.push(...renderLimits(limits, now));
+    lines.push(...renderLimits(t, limits, now, locale));
   } else {
     // Fallback for account shapes that don't return `limits`.
-    lines.push(...windowLines("Session (5h): ", d.five_hour, now));
-    lines.push(...windowLines("Weekly (7d):  ", d.seven_day, now));
-    const opus = windowLines("  Opus (7d):  ", d.seven_day_opus, now, true);
+    lines.push(...windowLines(t, t("window.session"), d.five_hour, now, locale));
+    lines.push(...windowLines(t, t("window.weekly"), d.seven_day, now, locale));
+    const opus = windowLines(t, t("window.opus"), d.seven_day_opus, now, locale, true);
     if (opus.length > 0) lines.push(...opus);
-    const sonnet = windowLines("  Sonnet (7d):", d.seven_day_sonnet, now, true);
+    const sonnet = windowLines(t, t("window.sonnet"), d.seven_day_sonnet, now, locale, true);
     if (sonnet.length > 0) lines.push(...sonnet);
   }
 
@@ -485,16 +467,12 @@ export function formatUsageReport(
     const currency = typeof extra.currency === "string" && extra.currency && extra.currency !== "USD"
       ? `${extra.currency} `
       : "$";
-    lines.push("");
-    lines.push(`Extra usage: ${currency}${used.toFixed(2)} / ${currency}${limit} this month`);
+    lines.push(t("extra", { used: `${currency}${used.toFixed(2)}`, limit: `${currency}${limit}` }));
   }
 
-  if (gatewayActive) {
-    lines.push("");
-    lines.push(GATEWAY_CAVEAT);
-  }
+  if (gatewayActive) lines.push(t("gateway"));
 
-  return lines.join("\n");
+  return joinText(lines);
 }
 
 /** One usage window as structured data (the web card's rows). */
@@ -559,19 +537,21 @@ export function usageWindows(data: UsageResponse | null | undefined): UsageWindo
  * Returns an empty array for a null/absent window (used to omit per-model rows).
  * When `compact` is set, the two lines are joined so per-model rows stay tight.
  */
-function windowLines(label: string, window: UsageWindow | null | undefined, now: number, compact = false): string[] {
+function windowLines(t: OwnerT<"usage">, label: string, window: UsageWindow | null | undefined, now: number, locale: Locale, compact = false): OwnerText[] {
   if (!window || typeof window !== "object") return [];
-  const pct = typeof window.utilization === "number" && Number.isFinite(window.utilization)
+  const percent = typeof window.utilization === "number" && Number.isFinite(window.utilization)
     ? `${Math.round(window.utilization)}%`
-    : "n/a";
-  const reset = typeof window.resets_at === "string" ? formatReset(window.resets_at, now) : null;
+    : t("noPercent");
+  const reset = typeof window.resets_at === "string" ? formatReset(window.resets_at, now, locale) : null;
+  // The legacy labels share one column; compact rows (per model) are indented under the weekly one.
+  const column = (compact ? `  ${label}` : label).padEnd(14);
 
   if (compact) {
-    return [reset ? `${label} ${pct} — resets in ${reset.countdown} (${reset.clock})` : `${label} ${pct}`];
+    return [reset ? t("windowLineReset", { label: column, percent, countdown: reset.countdown, clock: reset.clock }) : t("windowLine", { label: column, percent })];
   }
 
-  const out = [`${label} ${pct}`];
-  if (reset) out.push(`  resets in ${reset.countdown}  (${reset.clock})`);
+  const out = [t("windowLine", { label: column, percent })];
+  if (reset) out.push(t("resetLine", { countdown: reset.countdown, clock: reset.clock }));
   return out;
 }
 
@@ -615,13 +595,13 @@ function toSafeLimit(raw: unknown): SafeLimit | null {
  * Render the `limits` array, one line per entry, grouped session-then-weekly
  * (then anything else), with the label column padded so percents align.
  */
-function renderLimits(limits: SafeLimit[], now: number): string[] {
+function renderLimits(t: OwnerT<"usage">, limits: SafeLimit[], now: number, locale: Locale): OwnerText[] {
   // Stable sort (V8 Array.sort is stable): session group first, weekly next,
   // unknown groups last — original order preserved within each group.
   const sorted = [...limits].sort((a, b) => groupRank(a) - groupRank(b));
-  const labels = sorted.map(limitLabel);
+  const labels = sorted.map((limit) => limitLabel(limit, locale));
   const colWidth = Math.max(...labels.map((l) => l.length + 1)) + 2; // +1 colon, +2 gap
-  return sorted.map((limit, i) => renderLimitLine(limit, labels[i], colWidth, now));
+  return sorted.map((limit, i) => renderLimitLine(t, limit, labels[i], colWidth, now, locale));
 }
 
 /** Rank a limit's group for ordering: session (0), weekly (1), other (2). */
@@ -634,13 +614,14 @@ function groupRank(limit: SafeLimit): number {
 }
 
 /** Build a human label from a limit's kind + scope (e.g. "Weekly · Fable"). */
-function limitLabel(limit: SafeLimit): string {
+function limitLabel(limit: SafeLimit, locale: Locale = "en"): string {
+  const t = ownerT("usage", locale);
   let base: string;
   switch (limit.kind) {
-    case "session": base = "Session (5h)"; break;
-    case "weekly_all": base = "Weekly (all)"; break;
-    case "weekly_scoped": base = "Weekly"; break;
-    default: base = prettifyKind(limit.kind);
+    case "session": base = t("limit.session"); break;
+    case "weekly_all": base = t("limit.weeklyAll"); break;
+    case "weekly_scoped": base = t("limit.weekly"); break;
+    default: base = prettifyKind(limit.kind) ?? t("limit.fallback");
   }
   const parts = [base];
   if (limit.modelName) parts.push(limit.modelName);
@@ -649,9 +630,9 @@ function limitLabel(limit: SafeLimit): string {
 }
 
 /** Turn an unknown kind like "five_hour_scoped" into "Five Hour Scoped". */
-function prettifyKind(kind: string): string {
+function prettifyKind(kind: string): string | undefined {
   const words = kind.split(/[_\s]+/).filter(Boolean);
-  if (words.length === 0) return "Usage";
+  if (words.length === 0) return undefined;
   return words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
 }
 
@@ -660,17 +641,19 @@ function prettifyKind(kind: string): string {
  *   `Weekly · Fable:      43%  ← active · resets in 5d 16h (Aug 2, 7:59 AM)`
  * Elevated severity prefixes the line with ⚠️.
  */
-function renderLimitLine(limit: SafeLimit, label: string, colWidth: number, now: number): string {
-  const pct = limit.percent !== null ? `${Math.round(limit.percent)}%` : "n/a";
-  const reset = limit.resetsAt ? formatReset(limit.resetsAt, now) : null;
+function renderLimitLine(t: OwnerT<"usage">, limit: SafeLimit, label: string, colWidth: number, now: number, locale: Locale): OwnerText {
+  const pct = limit.percent !== null ? `${Math.round(limit.percent)}%` : t("noPercent");
+  const reset = limit.resetsAt ? formatReset(limit.resetsAt, now, locale) : null;
 
-  let line = `${label}:`.padEnd(colWidth) + pct.padEnd(5);
-  if (limit.isActive) line += "← active ";
-  if (reset) line += `· resets in ${reset.countdown} (${reset.clock})`;
-  line = line.replace(/\s+$/, "");
-
-  if (isElevatedSeverity(limit.severity)) line = `⚠️ ${line}`;
-  return line;
+  const line = {
+    column: `${label}:`.padEnd(colWidth) + pct.padEnd(5),
+    active: limit.isActive ? t("active") : "",
+    resets: reset ? t("resetsIn", { countdown: reset.countdown, clock: reset.clock }) : "",
+  };
+  // The trailing pad goes when nothing follows it.
+  if (!line.resets && line.active) line.active = line.active.trimEnd();
+  else if (!line.resets) line.column = line.column.trimEnd();
+  return isElevatedSeverity(limit.severity) ? t("limitLineElevated", line) : t("limitLine", line);
 }
 
 /** Any severity other than normal/none is treated as elevated (⚠️). */
@@ -681,36 +664,42 @@ function isElevatedSeverity(severity: string): boolean {
 }
 
 /** Format an ISO reset timestamp into a human countdown + local clock time. */
-export function formatReset(resetsAt: string, now: number): { countdown: string; clock: string } {
+export function formatReset(resetsAt: string, now: number, locale: Locale = "en"): { countdown: string; clock: string } {
   const resetMs = Date.parse(resetsAt);
-  if (!Number.isFinite(resetMs)) return { countdown: "unknown", clock: "unknown" };
-  return { countdown: formatCountdown(resetMs - now), clock: formatLocalClock(resetMs, now) };
+  if (!Number.isFinite(resetMs)) {
+    const unknown = ownerT("usage", locale)("countdown.unknown");
+    return { countdown: unknown, clock: unknown };
+  }
+  return { countdown: formatCountdown(resetMs - now, locale), clock: formatLocalClock(resetMs, now, locale) };
 }
 
 /** "5d 23h" / "5h 12m" / "47m" / "now". Two coarsest non-zero units. */
-export function formatCountdown(ms: number): string {
-  if (ms <= 0) return "now";
+export function formatCountdown(ms: number, locale: Locale = "en"): string {
+  const t = ownerT("usage", locale);
+  if (ms <= 0) return t("countdown.now");
   const totalMinutes = Math.floor(ms / 60000);
   const days = Math.floor(totalMinutes / (60 * 24));
   const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
   const minutes = totalMinutes % 60;
 
-  if (days > 0) return `${days}d ${hours}h`;
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  return `${minutes}m`;
+  if (days > 0) return t("countdown.daysHours", { d: days, h: hours });
+  if (hours > 0) return t("countdown.hoursMinutes", { h: hours, m: minutes });
+  return t("countdown.minutes", { m: minutes });
 }
 
 /**
  * Local-zone clock for a reset instant. Shows the date when it is not today,
  * e.g. "7:59 PM" (today) vs "Aug 2, 7:59 AM" (another day).
  */
-function formatLocalClock(resetMs: number, now: number): string {
+function formatLocalClock(resetMs: number, now: number, locale: Locale): string {
   const reset = new Date(resetMs);
-  const time = reset.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  // English keeps the system's own conventions, as before; other locales say it their way.
+  const tag = locale === "en" ? undefined : locale;
+  const time = reset.toLocaleTimeString(tag, { hour: "numeric", minute: "2-digit" });
   const sameDay = new Date(now).toDateString() === reset.toDateString();
   if (sameDay) return time;
-  const date = reset.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  return `${date}, ${time}`;
+  const date = reset.toLocaleDateString(tag, { month: "short", day: "numeric" });
+  return ownerT("usage", locale)("dateTime", { date, time });
 }
 
 export function subscriptionLabel(subscriptionType?: string): string {
@@ -852,7 +841,3 @@ function isTimeout(err: unknown): boolean {
  * a fixed string. This structurally guarantees no arbitrary err.message (which
  * a future layer could populate with sensitive data) reaches the chat.
  */
-function usageError(err: unknown): string {
-  const detail = err instanceof UsageCredentialError ? err.message : "could not read Claude Code credentials.";
-  return `Claude usage unavailable: ${detail}`;
-}

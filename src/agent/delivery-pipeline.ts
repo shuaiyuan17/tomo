@@ -12,7 +12,7 @@ import {
 } from "../channels/types.js";
 import { deliverText } from "../channels/delivery.js";
 import { DELIVERY_FAILED_MARKER } from "./block-transcript.js";
-import { isSafeguardError, withRecoveryHint } from "./api-errors.js";
+import { formatVisibleError, isSafeguardError } from "./api-errors.js";
 import { isPrivateAttachmentPath } from "./permissions.js";
 import {
   endsWithTrailingNoReply,
@@ -274,8 +274,8 @@ export class DeliveryPipeline {
     options: DeliverOptions = {},
   ): Promise<DeliveryReceipt | void> {
     if (isAgentErrorResponse(response)) {
-      const visibleError = `[error] ${withRecoveryHint(response)}`;
-      if (!isSafeguardError(response)) this.deps.queuePendingErrorNote(sessionKey, visibleError);
+      const visibleError = formatVisibleError("reply", response);
+      if (!isSafeguardError(response)) this.deps.queuePendingErrorNote(sessionKey, formatVisibleError("reply", response, "en"));
       await replyChannel.send({ chatId: replyChatId, text: visibleError });
       return;
     }

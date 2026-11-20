@@ -1,5 +1,23 @@
 import type { Locale } from "./locales.js";
 import type { Translation } from "./catalog.js";
+import { permissions as enPermissions } from "./catalogs/en/permissions.js";
+import { permissions as zhPermissions } from "./catalogs/zh-Hans/permissions.js";
+import { notices as enNotices } from "./catalogs/en/notices.js";
+import { notices as zhNotices } from "./catalogs/zh-Hans/notices.js";
+import { menu as enMenu } from "./catalogs/en/menu.js";
+import { menu as zhMenu } from "./catalogs/zh-Hans/menu.js";
+import { credentials as enCredentials } from "./catalogs/en/credentials.js";
+import { credentials as zhCredentials } from "./catalogs/zh-Hans/credentials.js";
+import { commands as enCommands } from "./catalogs/en/commands.js";
+import { commands as zhCommands } from "./catalogs/zh-Hans/commands.js";
+import { cost as enCost } from "./catalogs/en/cost.js";
+import { cost as zhCost } from "./catalogs/zh-Hans/cost.js";
+import { tasks as enTasks } from "./catalogs/en/tasks.js";
+import { tasks as zhTasks } from "./catalogs/zh-Hans/tasks.js";
+import { todo as enTodo } from "./catalogs/en/todo.js";
+import { todo as zhTodo } from "./catalogs/zh-Hans/todo.js";
+import { usage as enUsage } from "./catalogs/en/usage.js";
+import { usage as zhUsage } from "./catalogs/zh-Hans/usage.js";
 
 /**
  * Every daemon-side catalog, by locale and namespace (one namespace per
@@ -12,11 +30,31 @@ import type { Translation } from "./catalog.js";
  * as const`), `catalogs/zh-Hans/<ns>.ts` (the same name, `satisfies
  * Translation<typeof en>`), and one entry per locale below.
  */
-const en = {} as const;
+const en = {
+  permissions: enPermissions,
+  notices: enNotices,
+  menu: enMenu,
+  credentials: enCredentials,
+  commands: enCommands,
+  cost: enCost,
+  tasks: enTasks,
+  todo: enTodo,
+  usage: enUsage,
+} as const;
 
 export const resources = {
   en,
-  "zh-Hans": {},
+  "zh-Hans": {
+    permissions: zhPermissions,
+    notices: zhNotices,
+    menu: zhMenu,
+    credentials: zhCredentials,
+    commands: zhCommands,
+    cost: zhCost,
+    tasks: zhTasks,
+    todo: zhTodo,
+    usage: zhUsage,
+  },
 } satisfies { en: typeof en } & Record<Exclude<Locale, "en">, Translation<typeof en>>;
 
 export type ServerResources = typeof en;

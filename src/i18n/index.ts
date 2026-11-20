@@ -76,3 +76,13 @@ export function ownerT<NS extends ServerNamespace>(ns: NS, locale: Locale = owne
   const fixed = i18n.getFixedT(locale, ns) as unknown as (key: string, options?: TOptions) => string;
   return (key, options) => fixed(key as string, options) as OwnerText;
 }
+
+/** A date and time as `locale` writes it (`toLocaleString`, with the locale passed explicitly). */
+export function formatDateTime(value: number | Date, locale: Locale = ownerLocale(), options?: Intl.DateTimeFormatOptions): string {
+  return new Date(value).toLocaleString(locale, options);
+}
+
+/** A number as `locale` writes it (`Intl.NumberFormat`). */
+export function formatNumber(value: number, locale: Locale = ownerLocale(), options?: Intl.NumberFormatOptions): string {
+  return new Intl.NumberFormat(locale, options).format(value);
+}

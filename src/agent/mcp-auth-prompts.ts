@@ -3,6 +3,7 @@ import type { Channel } from "../channels/types.js";
 import { shortErrorMessage } from "../error-text.js";
 import { log } from "../logger.js";
 import type { ReplyTarget } from "../sessions/types.js";
+import { joinText, ownerT, raw, type OwnerText } from "../i18n/index.js";
 
 export interface McpAuthPromptsDeps {
   resolvePrivateReplyTarget(key: string): ReplyTarget | undefined;
@@ -29,23 +30,19 @@ export class McpAuthPrompts {
     return this.deps.getChannel(name);
   }
 
+  /** Every message here goes to the owner's private chat. */
+  private async say(channel: Channel, chatId: string, text: OwnerText): Promise<void> {
+    await channel.send({ chatId, text });
+  }
+
   async forwardMcpAuthorizeUrl(key: string, serverName: string, url: string): Promise<void> {
     const target = this.resolvePrivateReplyTarget(key);
     if (!target) throw new Error(`No private reply target is available for MCP OAuth login (${serverName})`);
     const channel = this.getChannel(target.channelName);
     if (!channel) throw new Error(`Channel "${target.channelName}" is not connected for MCP OAuth login (${serverName})`);
 
-    await channel.send({
-      chatId: target.chatId,
-      text: [
-        `MCP login required for ${serverName}.`,
-        "",
-        url,
-        "",
-        "Open the link and finish login. If the browser is on another device, paste the full localhost redirect URL back into this private DM so Tomo can complete the callback.",
-        "The current turn will continue without this server. After login, Tomo will attach it to live sessions automatically; if runtime hot-mounting is unavailable, the next session will use it.",
-      ].join("\n"),
-    });
+    const t = ownerT("notices");
+    await this.say(channel, target.chatId, joinText([t("mcpOAuth.authorize", { server: serverName }), raw(url), t("mcpOAuth.authorizeInstructions")]));
   }
 
   async handleMcpAuthFailure(serverName: string, err: unknown): Promise<void> {
@@ -57,10 +54,7 @@ export class McpAuthPrompts {
     const channel = this.getChannel(target.channelName);
     if (!channel) return;
 
-    await channel.send({
-      chatId: target.chatId,
-      text: `MCP server "${serverName}" is unavailable because OAuth failed or timed out: ${detail}. Continuing without that server.`,
-    });
+    await this.say(channel, target.chatId, ownerT("notices")("mcpOAuth.failed", { server: serverName, error: detail }));
   }
 
   async handleMcpElicitation(key: string, request: ElicitationRequest): Promise<ElicitationResult> {
@@ -76,24 +70,16 @@ export class McpAuthPrompts {
       return { action: "decline" };
     }
 
+    const t = ownerT("notices");
     if (request.mode === "url" && request.url) {
-      const lines = [
-        `MCP login required for ${request.serverName}.`,
-        request.message,
-        "",
-        request.url,
-        "",
-        "Open the link and finish login. If Tomo does not continue automatically, retry your request after login completes.",
-      ];
-      await channel.send({ chatId: target.chatId, text: lines.filter(Boolean).join("\n") });
+      // The server's own message and link are passed through as it wrote them.
+      const lines = [t("mcpOAuth.elicitation", { server: request.serverName }), ...(request.message ? [raw(request.message)] : []), raw(request.url), t("mcpOAuth.elicitationInstructions")];
+      await this.say(channel, target.chatId, joinText(lines));
       log.info({ key, server: request.serverName }, "Forwarded MCP login URL to user");
       return { action: "accept" };
     }
 
-    await channel.send({
-      chatId: target.chatId,
-      text: `MCP server ${request.serverName} requested additional input, but Tomo can only forward browser login links right now.`,
-    });
+    await this.say(channel, target.chatId, t("mcpOAuth.unsupported", { server: request.serverName }));
     log.warn({ key, server: request.serverName, mode: request.mode }, "Declined unsupported MCP elicitation");
     return { action: "decline" };
   }

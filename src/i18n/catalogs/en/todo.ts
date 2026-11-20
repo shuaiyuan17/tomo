@@ -1,0 +1,23 @@
+/** The `/todo` reply (src/agent/todo-command.ts, src/todos/format.ts). The model's todo tools read the English lines. */
+export const todo = {
+  usage: "Usage: /todo, /todo all, /todo add <text>, /todo done <id>, /todo drop <id> [reason]",
+  unavailable: "Todos are unavailable: {{error}}",
+  added: "Added {{line}}",
+  done: "Done: {{id}} {{title}}",
+  dropped: "Dropped: {{id}} {{title}}",
+  line: "{{id}} {{title}}{{next}} · {{waiting}} · {{review}}{{snoozed}}{{ref}}",
+  next: " · next: {{next}}",
+  waitingOn: { me: "waiting on me", owner: "waiting on owner", external: "waiting on external" },
+  due: "due {{date}}",
+  review: "review {{date}}",
+  snoozed: " · snoozed {{snoozes}}",
+  snoozedOf: " · snoozed {{snoozes}}/{{max}}",
+  ref: " · {{ref}}",
+  none: "No open todos.",
+  header: "Todos · {{count}} open ({{owner}} waiting on you, {{mine}} on me, {{external}} on others)",
+  waitingOnYou: "\nWaiting on you:",
+  mine: "\nMine:",
+  waitingOnOthers: "\nWaiting on others:",
+  more: "\n{{count}} more (/todo all)",
+  hints: "\n/todo add <text> · /todo done <id> · /todo drop <id> [reason]",
+} as const;

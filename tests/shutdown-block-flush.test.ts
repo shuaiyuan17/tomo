@@ -214,7 +214,7 @@ function rig(buildExternalMcpServers?: Deps["buildExternalMcpServers"]): Rig {
     silentMatcher: isSilentReply,
     transcript: "always",
     errors: {
-      visiblePrefix: "[error] ",
+      visibleError: "reply",
       response: "deliver",
       thrown: "deliver",
       thrownLogMessage: "Error handling message",

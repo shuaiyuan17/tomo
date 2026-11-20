@@ -1,5 +1,6 @@
 import type { Channel } from "../channels/types.js";
 import { log } from "../logger.js";
+import type { OwnerText } from "../i18n/index.js";
 import type { CaptureChannel, CredentialRequestView } from "./broker.js";
 
 /** What the web channel offers the broker (src/channels/web.ts). */
@@ -27,7 +28,7 @@ export function webCaptureChannel(card: CredentialCard): CaptureChannel {
  * came in on, and their next typed message there is the value.
  */
 export function chatCaptureChannel(channel: Channel, chatId: string): CaptureChannel {
-  const send = (text: string) => channel.send({ chatId, text });
+  const send = (text: OwnerText) => channel.send({ chatId, text });
   return {
     name: channel.name,
     kind: "message",

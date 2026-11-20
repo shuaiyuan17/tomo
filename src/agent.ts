@@ -1,3 +1,4 @@
+import { formatDateTime, ownerT, type OwnerText } from "./i18n/index.js";
 import type { Channel, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions } from "./channels/types.js";
 import type { CompactReservation } from "./lcm/background-gate.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
@@ -640,7 +641,7 @@ export class Agent {
       // listed it, e.g. hand-edited since startup).
       this.router.addToAllowlist(channel.name, chatId);
       log.info({ channel: channel.name, chatId }, "Group chat activated via secret");
-      await channel.send({ chatId, text: "Tomo activated in this group." });
+      await channel.send({ chatId, text: ownerT("notices")("group.activated") });
     } catch (err) {
       log.error({ err }, "Failed to activate group");
     }
@@ -921,8 +922,7 @@ export class Agent {
         // update first), so refusing would only lose it now instead of on a
         // crash. Process it in memory as before, and say so loudly.
         this.reportInboxFault(
-          `Tomo could not save an incoming ${channel.name} message to disk before answering it. `
-            + "It is being answered now, but would be lost if Tomo crashed first. Check the disk under ~/.tomo/data.",
+          ownerT("notices")("inbox.unsaved", { channel: channel.name }),
           { channel: channel.name, messageId: message.id },
         );
       }
@@ -976,42 +976,42 @@ export class Agent {
   private async handlePastedMcpCallback(channel: Channel, message: IncomingMessage): Promise<boolean> {
     const result = await this.mcpOAuthManager.completeAuthorizationFromChat(message.text);
     if (result.status === "not-matched") return false;
+    const t = ownerT("notices");
     if (result.status === "unknown-state") {
       log.warn({ channel: channel.name, chatId: message.chatId }, "Ignored MCP OAuth callback with no matching pending state");
       await channel.send({
         chatId: message.chatId,
-        text: "⚠️ That MCP OAuth callback does not match an active login. Start a new flow with /mcp login <server> and paste its full redirect URL.",
+        text: t("mcpOAuth.callbackUnknown"),
       });
       return true;
     }
     if (result.status === "ambiguous") {
       await channel.send({
         chatId: message.chatId,
-        text: "⚠️ More than one MCP login is pending. Paste the full localhost redirect URL so its state can identify the server.",
+        text: t("mcpOAuth.callbackAmbiguous"),
       });
       return true;
     }
     if (result.status === "already-completed") {
       await channel.send({
         chatId: message.chatId,
-        text: `⚠️ MCP login for "${result.serverName}" was already completed; this callback is single-use.`,
+        text: t("mcpOAuth.callbackUsed", { server: result.serverName }),
       });
       return true;
     }
     if (result.status === "failed") {
       await channel.send({
         chatId: message.chatId,
-        text: `⚠️ [error] MCP login for "${result.serverName}" failed: ${result.error}`,
+        text: t("mcpOAuth.callbackFailed", { server: result.serverName, error: result.error }),
       });
       return true;
     }
 
-    const expiry = result.expiresAt !== undefined
-      ? ` Token valid until ${new Date(result.expiresAt).toLocaleString()}.`
-      : "";
     await channel.send({
       chatId: message.chatId,
-      text: `✅ MCP login completed for "${result.serverName}".${expiry} Tomo will attach it to live sessions automatically; if runtime hot-mounting is unavailable, the next session will use it.`,
+      text: result.expiresAt !== undefined
+        ? t("mcpOAuth.completedUntil", { server: result.serverName, at: formatDateTime(result.expiresAt) })
+        : t("mcpOAuth.completed", { server: result.serverName }),
     });
     return true;
   }
@@ -1112,8 +1112,7 @@ export class Agent {
     const unwritten = this.inbox?.markStarted(ids) ?? [];
     if (unwritten.length === 0) return;
     this.reportInboxFault(
-      `Tomo could not record on disk that it started answering ${unwritten.length === 1 ? "a message" : `${unwritten.length} messages`} in ${sessionKey}. `
-        + "The reply is going ahead; if Tomo crashes before it finishes, the message may be answered twice after the restart. Check the disk under ~/.tomo/data.",
+      ownerT("notices")("inbox.unmarked", { count: unwritten.length, session: sessionKey }),
       { sessionKey, ids: unwritten },
     );
   }
@@ -1123,12 +1122,12 @@ export class Agent {
    * as an error and tell the owner (at most once per INBOX_FAULT_NOTICE_MS —
    * a dead disk fails every message, and one DM says it).
    */
-  private reportInboxFault(text: string, context: Record<string, unknown>): void {
+  private reportInboxFault(text: OwnerText, context: Record<string, unknown>): void {
     log.error(context, `Durable inbox fault: ${text}`);
     const now = Date.now();
     if (now - this.lastInboxFaultNoticeAt < INBOX_FAULT_NOTICE_MS) return;
     this.lastInboxFaultNoticeAt = now;
-    void this.notifyOwner(`⚠️ ${text}`).catch((err) => log.warn({ err }, "Could not send durable inbox fault notice"));
+    void this.notifyOwner(text).catch((err) => log.warn({ err }, "Could not send durable inbox fault notice"));
   }
 
   /**
@@ -1213,7 +1212,7 @@ export class Agent {
     if (!notifyGroup) return;
     const channel = this.getChannel(channelName);
     if (!channel) return;
-    channel.send({ chatId, text: "Summon expired after inactivity — handed back to this group's own Tomo session." })
+    channel.send({ chatId, text: ownerT("notices")("group.summonExpired") })
       .catch((err) => log.warn({ err, channel: channelName, chatId }, "Could not post summon expiry notice"));
   }
 
@@ -1402,7 +1401,7 @@ export class Agent {
         // Nothing is delivered for a failed background turn, on any session,
         // so nobody hears of it unless the owner is told.
         if (!(err instanceof TurnInterruptedError)) {
-          const target = this.ownerNoticeTarget(key, "A background task turn");
+          const target = this.ownerNoticeTarget(key, ownerT("notices")("suppressed.turn.backgroundTask"));
           if (target) this.reportSuppressedError(key, target, shortErrorMessage(err));
         }
         await stop();
@@ -1608,7 +1607,7 @@ export class Agent {
         onShutdown: (kind: ShutdownTurnEnd) => { if (kind === "interrupted") req.inboxHooks?.cutShort(); },
       } : {}),
       errors: {
-        visiblePrefix: "[error] ",
+        visibleError: "reply",
         // Agent-error responses stream back like any text and are handled by
         // DeliveryPipeline.deliverResponse; this only covers thrown errors.
         response: "deliver",
@@ -1741,7 +1740,7 @@ export class Agent {
         audiences,
         origins: [{ channelName: channel.name, chatId: message.chatId }],
         suppressErrors: isPassiveGroup,
-        ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, "A message turn", `${channel.name}:${message.chatId}`) } : {}),
+        ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, ownerT("notices")("suppressed.turn.message"), `${channel.name}:${message.chatId}`) } : {}),
         errorLogMessage: "Error handling message",
         steer,
         steerAudience: audience,
@@ -1904,7 +1903,7 @@ export class Agent {
       audiences,
       origins: items.map((it) => ({ channelName: it.channel.name, chatId: it.message.chatId })),
       suppressErrors: isPassiveGroup,
-      ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, "A message turn", `${lastChannel.name}:${lastMessage.chatId}`) } : {}),
+      ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, ownerT("notices")("suppressed.turn.message"), `${lastChannel.name}:${lastMessage.chatId}`) } : {}),
       errorLogMessage: "Error handling batched messages",
       steer,
       // PER ITEM, not per batch, IN `numbered`'s ORDER. `summonTargets` (the
@@ -2191,7 +2190,7 @@ export class Agent {
         silentLog: "Cron completed silently (no reply sent)",
         transcript: "on-delivery",
         errors: {
-          visiblePrefix: "[error] cron failed: ",
+          visibleError: "cron",
           response: suppressErrorDelivery ? "note-only" : "deliver",
           responseSuppressedLog: "Cron error suppressed from chat delivery",
           thrown: suppressErrorDelivery ? "note-only" : "deliver",
@@ -2205,7 +2204,7 @@ export class Agent {
             ? {
               ownerNotice: this.ownerNoticeTarget(
                 key,
-                options.jobName ? `Cron job "${options.jobName}"` : "A background turn",
+                options.jobName ? ownerT("notices")("suppressed.turn.cronJob", { name: options.jobName }) : ownerT("notices")("suppressed.turn.background"),
                 // A group's turn handed to the summoned dm: session (or a
                 // group's delegate) is still the group's failure.
                 options.audiences?.find((a) => isGroupSessionKey(a)),
@@ -2235,7 +2234,7 @@ export class Agent {
       key = `${channel.name}:${chatId}`;
     }
 
-    return this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "A heartbeat turn", "heartbeat"))
+    return this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, ownerT("notices")("suppressed.turn.heartbeat"), "heartbeat"))
       .catch((err) => {
         log.error({ err, sessionKey: key }, "Continuity failed in queue");
       });
@@ -2272,7 +2271,7 @@ export class Agent {
     // group is summoned, is the group's turn wherever it runs — same rule as
     // the cron handoff in processCronMessage.
     const audiences = summonedKey ? [sessionKey] : undefined;
-    return this.enqueueForSession(targetKey, () => this.processContinuity(routedPrompt, targetKey, audiences, "A restart notice turn", "restart"))
+    return this.enqueueForSession(targetKey, () => this.processContinuity(routedPrompt, targetKey, audiences, ownerT("notices")("suppressed.turn.restart"), "restart"))
       .catch((err) => {
         log.error({ err, sessionKey: targetKey }, "Restart notice failed in queue");
       });
@@ -2282,7 +2281,7 @@ export class Agent {
     prompt: string,
     key: string,
     audiences: string[] | undefined,
-    turnKind: string,
+    turnKind: OwnerText,
     usageSource: UsageSource,
   ): Promise<void> {
     const turnId = audiences ? this.turnAudiences.begin(key, audiences) : undefined;
@@ -2299,7 +2298,7 @@ export class Agent {
   private async runContinuityTurn(
     prompt: string,
     key: string,
-    turnKind: string,
+    turnKind: OwnerText,
     usageSource: UsageSource,
     noticeGroupKey?: string,
   ): Promise<void> {
@@ -2344,7 +2343,7 @@ export class Agent {
       silentMatcher: isSilentReply,
       transcript: "on-delivery",
       errors: {
-        visiblePrefix: "[error] continuity failed: ",
+        visibleError: "continuity",
         response: "note-only",
         responseSuppressedLog: "Continuity returned an agent error response",
         thrown: "ignore",
@@ -2589,7 +2588,7 @@ export class Agent {
       silentLog: "Watch chat completed silently (no reply sent)",
       transcript: "on-delivery",
       errors: {
-        visiblePrefix: "[error] ",
+        visibleError: "reply",
         response: "deliver",
         thrown: "deliver",
         thrownLogMessage: "Watch chat turn failed",
@@ -2600,7 +2599,7 @@ export class Agent {
   }
 
   /** See OwnerNotices.ownerNoticeTarget. */
-  private ownerNoticeTarget(sessionKey: string, turnKind: string, groupKey?: string): OwnerNoticeTarget {
+  private ownerNoticeTarget(sessionKey: string, turnKind: OwnerText, groupKey?: string): OwnerNoticeTarget {
     return this.ownerNotices.ownerNoticeTarget(sessionKey, turnKind, groupKey);
   }
 
@@ -2613,12 +2612,12 @@ export class Agent {
    * DM the configured OWNER (no agent query); never falls back to another
    * private chat. Resolves false when nothing was sent.
    */
-  async notifyOwner(text: string): Promise<boolean> {
+  async notifyOwner(text: OwnerText): Promise<boolean> {
     return this.ownerNotices.notifyOwner(text);
   }
 
   /** Send a direct notification to the user's DM channel (no agent query) */
-  async sendNotification(text: string): Promise<void> {
+  async sendNotification(text: OwnerText): Promise<void> {
     return this.ownerNotices.sendNotification(text);
   }
 
@@ -3018,7 +3017,7 @@ export class Agent {
       { name: "check" },
     );
     for (const key of owed) {
-      this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, "An interrupted-subagents notice turn", "restart"))
+      this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, ownerT("notices")("suppressed.turn.interruptedAgents"), "restart"))
         .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"));
     }
   }

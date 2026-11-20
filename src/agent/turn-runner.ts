@@ -15,7 +15,8 @@ import { type BlockSender, DeliveryPipeline, PartialDeliveryError, isAgentErrorR
 import { isNothingSent, partsSent } from "../channels/types.js";
 import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { formatInboundStamp } from "./inbound-markers.js";
-import { isSafeguardError, withRecoveryHint } from "./api-errors.js";
+import type { OwnerText } from "../i18n/index.js";
+import { formatVisibleError, isSafeguardError, type VisibleErrorKind } from "./api-errors.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
 export interface RunWithRetryRequest {
@@ -214,7 +215,7 @@ function isSuppressed(delivery: TurnDelivery): delivery is SendTurnDelivery | De
 export interface TurnErrorPolicy {
   /** Prefix for pending error notes and user-visible error messages,
    *  e.g. "[error] " or "[error] cron failed: ". */
-  visiblePrefix: string;
+  visibleError: VisibleErrorKind;
   /** Agent-error RESPONSE handling. "deliver" sends the visible error to the
    *  chat; "note-only" only queues the pending error note. */
   response: "deliver" | "note-only";
@@ -241,8 +242,9 @@ export interface TurnErrorPolicy {
 /** The parts of an owner notice the spec builder knows (see SuppressedErrorReport). */
 export interface OwnerNoticeTarget {
   noticeKey: string;
-  label: string;
-  turnKind: string;
+  /** Where it failed, and what kind of turn it was: both read by the owner. */
+  label: OwnerText;
+  turnKind: OwnerText;
   rewindable?: boolean;
   /** dm: session whose own chat receives the notice; absent → the owner's
    *  default notification target. */
@@ -697,8 +699,8 @@ export class TurnRunner {
     }
 
     if (isAgentErrorResponse(response)) {
-      const visibleError = `${spec.errors.visiblePrefix}${withRecoveryHint(response)}`;
-      if (!isSafeguardError(response)) this.deps.queuePendingErrorNote(spec.key, visibleError);
+      const visibleError = formatVisibleError(spec.errors.visibleError, response);
+      if (!isSafeguardError(response)) this.deps.queuePendingErrorNote(spec.key, formatVisibleError(spec.errors.visibleError, response, "en"));
       if (spec.errors.response === "note-only") {
         if (spec.errors.responseSuppressedLog) {
           log.warn({ sessionKey: spec.key }, spec.errors.responseSuppressedLog);
@@ -1035,8 +1037,8 @@ export class TurnRunner {
       return false;
     }
 
-    const visibleError = `${spec.errors.visiblePrefix}${withRecoveryHint(detail)}`;
-    if (!isSafeguardError(detail)) this.deps.queuePendingErrorNote(spec.key, visibleError);
+    const visibleError = formatVisibleError(spec.errors.visibleError, detail);
+    if (!isSafeguardError(detail)) this.deps.queuePendingErrorNote(spec.key, formatVisibleError(spec.errors.visibleError, detail, "en"));
 
     if (spec.errors.thrown === "note-only") {
       if (spec.errors.thrownSuppressedLog) {

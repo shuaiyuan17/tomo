@@ -1,3 +1,4 @@
+import type { OwnerText } from "../i18n/index.js";
 import { createHash } from "node:crypto";
 import type {
   ElicitationRequest,
@@ -184,7 +185,7 @@ export interface LiveSessionManagerDeps {
    * The owner-notice path (Agent.notifyOwner), for an MCP server automatic
    * reconnects could not bring back. Absent: logged only.
    */
-  notifyOwner?(text: string): Promise<boolean>;
+  notifyOwner?(text: OwnerText): Promise<boolean>;
 }
 
 /** How long an explicit (web / chat) reconnect is waited for; under the web's MCP_RECONNECT_RPC_TIMEOUT_MS. */

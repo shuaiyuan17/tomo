@@ -1,3 +1,4 @@
+import { ownerT, type OwnerText } from "../i18n/index.js";
 import { log } from "../logger.js";
 import type { McpConnection, McpConnectionState } from "../mcp/live-status.js";
 import { shortErrorMessage } from "../error-text.js";
@@ -11,7 +12,7 @@ export const MCP_FAILURES_BEFORE_NOTICE = 3;
 
 export interface McpHealthMonitorDeps {
   /** The owner-notice path (Agent.notifyOwner): true once delivered. */
-  notifyOwner(text: string): Promise<boolean>;
+  notifyOwner(text: OwnerText): Promise<boolean>;
   now?: () => number;
   intervalMs?: number;
   preTurnWaitMs?: number;
@@ -168,8 +169,7 @@ export class McpHealthMonitor {
   private notice(server: string, health: ServerHealth): void {
     if (health.noticeDelivered || health.noticeSending) return;
     health.noticeSending = true;
-    const text = `⚠️ MCP server "${server}" is down: ${health.failures} reconnects in a row failed. Its tools fail until it reconnects. `
-      + `Try /mcp reconnect ${server} (or Reconnect on the web MCP page), or /new for a fresh session.`;
+    const text = ownerT("notices")("mcpDown", { server, failures: health.failures });
     void Promise.resolve().then(() => this.deps.notifyOwner(text)).then((delivered) => {
       if (delivered) { health.noticeDelivered = true; log.warn({ server, failures: health.failures }, "Owner told an MCP server is down"); }
     }, (err: unknown) => {

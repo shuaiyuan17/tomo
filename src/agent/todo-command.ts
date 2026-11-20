@@ -1,7 +1,16 @@
 import { canSeeTodo, formatTodoLine, formatTodoList } from "../todos/format.js";
 import { TodoRuleError, TodoStoreError, type TodoStore } from "../todos/store.js";
+import { ownerLocale, ownerT, raw, type Locale, type OwnerText } from "../i18n/index.js";
 
-export const TODO_USAGE = "Usage: /todo, /todo all, /todo add <text>, /todo done <id>, /todo drop <id> [reason]";
+/** The `/todo` usage line. */
+export function todoUsage(locale: Locale = ownerLocale()): OwnerText {
+  return ownerT("todo", locale)("usage");
+}
+
+/** "Todos are unavailable: …" around a store error. */
+export function todoUnavailable(error: string, locale: Locale = ownerLocale()): OwnerText {
+  return ownerT("todo", locale)("unavailable", { error });
+}
 
 /** What a `/todo` invocation asks for. */
 export type TodoCommand =
@@ -35,30 +44,33 @@ export function parseTodoArgs(args: string | undefined): TodoCommand | undefined
  * return the plain-text reply. Owner commands: items added here are
  * `source: owner`, waiting on Tomo, and never refused by the open cap.
  */
-export function runTodoCommand(command: TodoCommand, deps: { store: TodoStore; scopeKey: string; now: number }): string {
+export function runTodoCommand(command: TodoCommand, deps: { store: TodoStore; scopeKey: string; now: number; locale?: Locale }): OwnerText {
   const { store, scopeKey, now } = deps;
+  const locale = deps.locale ?? ownerLocale();
+  const t = ownerT("todo", locale);
   const visible = (item: { session: string }) => canSeeTodo(item, scopeKey);
   const maxSnoozes = store.limits.maxSnoozes;
   try {
     switch (command.kind) {
       case "list":
-        return formatTodoList(store.list().filter(visible), { now, all: command.all, maxSnoozes });
+        return formatTodoList(store.list().filter(visible), { now, all: command.all, maxSnoozes, locale });
       case "add": {
         const item = store.add({ title: command.text, waiting_on: "me", session: scopeKey, source: "owner" }, now, visible);
-        return `Added ${formatTodoLine(item, now, maxSnoozes)}`;
+        return t("added", { line: formatTodoLine(item, now, maxSnoozes, locale) });
       }
       case "done": {
         const { item } = store.resolve(command.id, { action: "done", by: "owner" }, now, visible);
-        return `Done: ${item.id} ${item.title}`;
+        return t("done", { id: item.id, title: item.title });
       }
       case "drop": {
         const { item } = store.resolve(command.id, { action: "drop", reason: command.reason ?? "Dropped by the owner.", by: "owner" }, now, visible);
-        return `Dropped: ${item.id} ${item.title}`;
+        return t("dropped", { id: item.id, title: item.title });
       }
     }
   } catch (err) {
-    if (err instanceof TodoStoreError) return `Todos are unavailable: ${err.message}`;
-    if (err instanceof TodoRuleError) return err.message;
+    if (err instanceof TodoStoreError) return todoUnavailable(err.message, locale);
+    // The store's rule messages are written for the model's todo tools too, and stay English.
+    if (err instanceof TodoRuleError) return raw(err.message);
     throw err;
   }
 }

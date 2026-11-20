@@ -99,6 +99,11 @@ describe("local HTTP boundary", () => {
     expect(text.indexOf("event: snapshot")).toBeLessThan(text.indexOf("event: update"));
     expect(text).not.toContain("already settled");
   });
+  it("leaves locale out of bootstrap when config has none, so the browser's language decides", async () => {
+    const fresh = JSON.parse((await call("/api/v1/bootstrap")).text) as WebBootstrap;
+    expect(fresh).not.toHaveProperty("locale");
+    expect(new WebData({ sessionsDir: "/nonexistent", sdkSessionsDir: "/nonexistent", locale: "zh-Hans" }).locale()).toBe("zh-Hans");
+  });
   it("serves current tasks in bootstrap and the SSE snapshot, without replaying stale task lists", async () => {
     const { watchBus } = await import("../src/watch/bus.js");
     const task = (taskId: string) => ({ taskId, taskType: "local_agent", description: `work ${taskId}`, ambient: false, background: true, startedAt: 1 });

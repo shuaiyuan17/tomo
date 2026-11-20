@@ -2,10 +2,9 @@ import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, rea
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { isGroupSessionKey } from "../sessions/keys.js";
-import { writeFileAtomicSync } from "../fs-utils.js";
+import { isEnoent, writeFileAtomicSync } from "../fs-utils.js";
 import { BACKFILL_FILE, LEDGER_DIR_MODE, LEDGER_FILE_MODE, readLedgerStarted, triggerSnippet, USAGE_LEDGER_VERSION, type UsageLedgerRow, type UsageSource } from "./ledger.js";
 import { localParts } from "./local-time.js";
-import { isEnoent } from "../fs-utils.js";
 
 /**
  * One-off: rebuild the usage ledger's history from the activity log

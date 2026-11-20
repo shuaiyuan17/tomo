@@ -1,8 +1,7 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
-import { writeFileAtomicSync } from "../fs-utils.js";
+import { isEnoent, writeFileAtomicSync } from "../fs-utils.js";
 import { webReplySchema, type RequestState, type WebFiledFile, type WebReply } from "./protocol.js";
-import { isEnoent } from "../fs-utils.js";
 
 const isFiledFile = (value: unknown): value is WebFiledFile => {
   const file = value as Partial<WebFiledFile> | null;

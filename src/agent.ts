@@ -47,6 +47,7 @@ import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import type { TaskBoard } from "./web/tasks.js";
 import { describeSessionModel, switchSessionModel, type ModelSwitchOutcome } from "./agent/model-switch.js";
 import { prepareSettledSessionRewind } from "./agent/settled-rewind.js";
+import { RewindError } from "./agent/session-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
@@ -796,7 +797,7 @@ export class Agent {
   }
 
   private async rewindSessionNow(key: string, count: number): Promise<RewindOutcome> {
-    const stopping = () => new Error("Tomo is stopping. Try again after restart.");
+    const stopping = () => new RewindError({ kind: "stopping" });
     if (this.stopping) throw stopping();
     // A brand-new conversation has no stored SDK id until its first turn
     // returns a result — so a FIRST turn that is stuck has none either. There
@@ -809,10 +810,10 @@ export class Agent {
       if (this.stopping) throw stopping();
       const sid = this.sessions.getSdkSessionId(key);
       if (stopOnly && !sid) {
-        if (!suspension.stoppedTurn) throw new Error("No active conversation to rewind.");
+        if (!suspension.stoppedTurn) throw new RewindError({ kind: "no_conversation" });
         return { count: 0, preview: "", stoppedTurn: suspension.stoppedTurn, droppedMessages: suspension.droppedMessages, nothingToRewind: true };
       }
-      if (!sid) throw new Error("No active conversation to rewind.");
+      if (!sid) throw new RewindError({ kind: "no_conversation" });
       const rewind = await prepareSettledSessionRewind(sid, count, config.workspaceDir, config.sdkSessionsDir, (prepared) => {
         if (this.stopping) throw stopping();
         prepared.assertUnchanged();

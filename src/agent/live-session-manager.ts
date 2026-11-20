@@ -1,3 +1,4 @@
+import { RewindError } from "./session-rewind.js";
 import type { OwnerText } from "../i18n/index.js";
 import { createHash } from "node:crypto";
 import type {
@@ -566,8 +567,8 @@ export class LiveSessionManager {
    * `release()` MUST be called (finally) — held turns are waiting on it.
    */
   async suspendForRewind(key: string, timeoutMs = REWIND_SUSPEND_TIMEOUT_MS): Promise<{ stoppedTurn: boolean; droppedMessages: number; release: () => void }> {
-    if (this.stopping) throw new Error("Tomo is stopping. Try again after restart.");
-    if (this.sessionHolds.has(key)) throw new Error("A rewind is already in progress.");
+    if (this.stopping) throw new RewindError({ kind: "stopping" });
+    if (this.sessionHolds.has(key)) throw new RewindError({ kind: "in_progress" });
     let releaseHold!: () => void;
     const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
     this.sessionHolds.set(key, hold);

@@ -1,9 +1,9 @@
 import type { ElicitationRequest, ElicitationResult } from "@anthropic-ai/claude-agent-sdk";
 import type { Channel } from "../channels/types.js";
-import { shortErrorMessage } from "../error-text.js";
 import { log } from "../logger.js";
 import type { ReplyTarget } from "../sessions/types.js";
 import { joinText, ownerT, raw, type OwnerText } from "../i18n/index.js";
+import { errorDetail } from "../i18n/error-detail.js";
 
 export interface McpAuthPromptsDeps {
   resolvePrivateReplyTarget(key: string): ReplyTarget | undefined;
@@ -46,7 +46,7 @@ export class McpAuthPrompts {
   }
 
   async handleMcpAuthFailure(serverName: string, err: unknown): Promise<void> {
-    const detail = shortErrorMessage(err);
+    const detail = errorDetail(err);
     log.warn({ serverName, err }, "External MCP server omitted after OAuth failure");
 
     const target = this.findPrivateReplyTarget();

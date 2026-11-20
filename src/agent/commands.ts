@@ -13,6 +13,7 @@ import type { PauseStore } from "../sessions/pause-store.js";
 import { dmSessionKeyForIdentity, isGroupSessionKey } from "../sessions/keys.js";
 import { writeRestartReasonFile } from "../restart-reason.js";
 import { DEFAULT_MODEL, MODEL_ALIASES } from "../models.js";
+import { errorDetail } from "../i18n/error-detail.js";
 import { formatDateTime, formatLocale, formatNumber, joinText, ownerT, raw, type OwnerT, type OwnerText } from "../i18n/index.js";
 import { switchSessionModel, type ModelSwitchRefusal } from "./model-switch.js";
 import { buildSessionCostReport } from "../costs.js";
@@ -21,7 +22,6 @@ import {
   liteLlmModeLabel,
 } from "../litellm.js";
 import { log } from "../logger.js";
-import { shortErrorMessage } from "../error-text.js";
 import { formatTomoEvent } from "../tomo-event.js";
 import { PetStore } from "../mcp/pet-store.js";
 import { petMoodLabel, petStageLabel } from "../mcp/pet-labels.js";
@@ -150,7 +150,7 @@ export class ChatCommandHandler {
         rewound = await this.deps.rewindSession(dmSessionKeyForIdentity(identity.name), Number(arg));
       } catch (err) {
         log.warn({ err }, "Session rewind failed");
-        await this.reply(channel, chatId, t("rewind.failed", { error: shortErrorMessage(err) }));
+        await this.reply(channel, chatId, t("rewind.failed", { error: errorDetail(err) }));
         return;
       }
       const dropped = rewound.droppedMessages ? t("rewind.dropped", { count: rewound.droppedMessages }) : "";
@@ -440,7 +440,7 @@ export class ChatCommandHandler {
       text = runTodoCommand(parsed, { store, scopeKey: key, now: Date.now() });
     } catch (err) {
       log.warn({ err }, "/todo failed");
-      text = todoUnavailable(shortErrorMessage(err));
+      text = todoUnavailable(errorDetail(err));
     }
     if (ownerDm) {
       let sent = false;
@@ -633,10 +633,10 @@ export class ChatCommandHandler {
       });
       await this.reply(channel, chatId, completion.verified
         ? t("login.verified")
-        : completion.verificationError ? t("login.unverifiedDetail", { error: completion.verificationError }) : t("login.unverified"));
+        : completion.verificationError ? t("login.unverifiedDetail", { error: errorDetail(completion.verificationFailure ?? completion.verificationError) }) : t("login.unverified"));
       this.scheduleRestart();
     } catch (err) {
-      const detail = shortErrorMessage(err);
+      const detail = errorDetail(err);
       log.warn({ err, identity: identity.name }, "Claude login command failed");
       await this.reply(channel, chatId, t("login.failed", { error: detail }));
     }
@@ -702,7 +702,7 @@ export class ChatCommandHandler {
       ]));
     } catch (err) {
       log.warn({ err, serverName }, "External MCP login command failed");
-      await this.reply(channel, chatId, t("mcp.loginFailed", { error: shortErrorMessage(err) }));
+      await this.reply(channel, chatId, t("mcp.loginFailed", { error: errorDetail(err) }));
     }
   }
 
@@ -749,7 +749,7 @@ export class ChatCommandHandler {
       this.scheduleRestart();
     } catch (err) {
       log.warn({ err }, "/restore failed");
-      await this.reply(channel, chatId, t("restore.failed", { error: shortErrorMessage(err) }));
+      await this.reply(channel, chatId, t("restore.failed", { error: errorDetail(err) }));
     }
   }
 }

@@ -105,6 +105,19 @@ describe("/todo chat command", () => {
     await agent.stop();
   });
 
+  it("an unreadable store: Chinese guidance under zh-Hans, the path and the parser's detail as they are", async () => {
+    const { agent, tg } = setup();
+    const file = join(todosDir(), "todos.json");
+    writeFileSync(file, "{ not json");
+    await tg.simulateCommand("todo", OWNER_ID, "Shuai", "", OWNER_ID);
+    expect(tg.sent[0].text).toMatch(new RegExp(`^Todos are unavailable: todo store could not be read: ${file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} \\(.+\\)\\. Nothing was changed; fix or restore the file\\.$`));
+    resetConfig({ locale: "zh-Hans" });
+    await tg.simulateCommand("todo", OWNER_ID, "Shuai", "", OWNER_ID);
+    expect(tg.sent[1].text.startsWith(`无法读取待办：无法读取待办存储：${file}（`)).toBe(true);
+    expect(tg.sent[1].text.endsWith("）。没有做任何改动，请修复或恢复这个文件。")).toBe(true);
+    await agent.stop();
+  });
+
   it("in a group, shows only that group's items, and only the owner may change them", async () => {
     const { agent, tg, store } = setup();
     await tg.simulateCommand("todo", GROUP, "Member", undefined, "99999");

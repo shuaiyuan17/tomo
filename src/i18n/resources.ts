@@ -1,5 +1,7 @@
 import type { Locale } from "./locales.js";
 import type { Translation } from "./catalog.js";
+import { errors as enErrors } from "./catalogs/en/errors.js";
+import { errors as zhErrors } from "./catalogs/zh-Hans/errors.js";
 import { permissions as enPermissions } from "./catalogs/en/permissions.js";
 import { permissions as zhPermissions } from "./catalogs/zh-Hans/permissions.js";
 import { notices as enNotices } from "./catalogs/en/notices.js";
@@ -31,6 +33,7 @@ import { usage as zhUsage } from "./catalogs/zh-Hans/usage.js";
  * Translation<typeof en>`), and one entry per locale below.
  */
 const en = {
+  errors: enErrors,
   permissions: enPermissions,
   notices: enNotices,
   menu: enMenu,
@@ -45,6 +48,7 @@ const en = {
 export const resources = {
   en,
   "zh-Hans": {
+    errors: zhErrors,
     permissions: zhPermissions,
     notices: zhNotices,
     menu: zhMenu,

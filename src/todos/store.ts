@@ -85,11 +85,14 @@ export class TodoStoreError extends Error {}
 /** The store file could not be read or parsed. Never treated as empty. */
 export class TodoStoreReadError extends TodoStoreError {
   readonly path: string;
+  /** What went wrong reading it: the file system's or the parser's own words. */
+  readonly detail: string;
   constructor(path: string, cause: unknown) {
     const detail = cause instanceof Error ? cause.message : String(cause);
     super(`todo store could not be read: ${path} (${detail}). Nothing was changed; fix or restore the file.`, { cause });
     this.name = "TodoStoreReadError";
     this.path = path;
+    this.detail = detail;
   }
 }
 
@@ -100,7 +103,7 @@ export class TodoStoreReadError extends TodoStoreError {
  * if it keeps happening.
  */
 export class TodoStoreConflictError extends TodoStoreError {
-  constructor(path: string) {
+  constructor(readonly path: string) {
     super(`todo store changed while it was being written: ${path}. Nothing was overwritten; try again.`);
     this.name = "TodoStoreConflictError";
   }

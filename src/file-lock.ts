@@ -48,6 +48,7 @@ export class FileLockTimeoutError extends Error {
   readonly path: string;
   /** The pid recorded in the lock, when it could be read. */
   readonly holderPid: number | null;
+  readonly timeoutMs: number;
 
   constructor(path: string, timeoutMs: number, holderPid: number | null) {
     super(
@@ -57,6 +58,7 @@ export class FileLockTimeoutError extends Error {
     this.name = "FileLockTimeoutError";
     this.path = path;
     this.holderPid = holderPid;
+    this.timeoutMs = timeoutMs;
   }
 }
 

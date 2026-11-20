@@ -1,5 +1,6 @@
 import { canSeeTodo, formatTodoLine, formatTodoList } from "../todos/format.js";
 import { TodoRuleError, TodoStoreError, type TodoRule, type TodoStore } from "../todos/store.js";
+import { errorDetail } from "../i18n/error-detail.js";
 import { joinText, ownerLocale, ownerT, type Locale, type OwnerT, type OwnerText } from "../i18n/index.js";
 
 /** The `/todo` usage line. */
@@ -68,7 +69,7 @@ export function runTodoCommand(command: TodoCommand, deps: { store: TodoStore; s
       }
     }
   } catch (err) {
-    if (err instanceof TodoStoreError) return todoUnavailable(err.message, locale);
+    if (err instanceof TodoStoreError) return todoUnavailable(errorDetail(err, locale), locale);
     // The error's English message is what the model's todo tools return; the owner gets the rule in their language.
     if (err instanceof TodoRuleError) return todoRuleText(t, err.rule);
     throw err;

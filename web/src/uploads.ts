@@ -1,5 +1,6 @@
 import type { WebFiledFile } from "../../src/web/protocol.js";
 import { i18n } from "./i18n/index.js";
+import { deferred, say, type Message } from "./i18n/message.js";
 
 /**
  * Files attached in the composer ("+", drop, paste): pure state, kept out of
@@ -27,7 +28,8 @@ export interface Attachment {
   /** 0–1 while uploading. */
   progress: number;
   uploadId?: string;
-  error?: string;
+  /** Why the upload failed, worded when shown. */
+  error?: Message;
   /** Resending an interrupted message: a file it already filed, attached again from where it is (no upload). */
   filed?: WebFiledFile;
 }
@@ -73,7 +75,7 @@ export function dragHasFiles(types: ArrayLike<string> | null | undefined): boole
  */
 export function addFiles(current: readonly Attachment[], files: readonly File[], make: (file: File) => Attachment,
   allow: { images?: boolean; files?: boolean } = { images: true }):
-  { next: Attachment[]; added: Attachment[]; note: string } {
+  { next: Attachment[]; added: Attachment[]; note: Message[] } {
   const added: Attachment[] = [];
   let skippedType = 0, skippedSize = 0, skippedFileSize = 0, skippedCount = 0;
   for (const file of files) {
@@ -86,12 +88,12 @@ export function addFiles(current: readonly Attachment[], files: readonly File[],
     added.push(make(file));
   }
   const notes = [
-    skippedCount && (allow.files ? i18n.t("chat:attach.maxAttachments", { count: MAX_ATTACHMENTS }) : i18n.t("chat:attach.maxImages", { count: MAX_ATTACHMENTS })),
-    skippedSize && i18n.t("chat:attach.imageSize", { mb: MAX_ATTACHMENT_BYTES / 1024 / 1024 }),
-    skippedFileSize && i18n.t("chat:attach.fileSize", { mb: MAX_FILE_BYTES / 1024 / 1024 }),
-    skippedType && i18n.t("chat:attach.types"),
-  ].filter(Boolean);
-  return { next: [...current, ...added], added, note: notes.join(" ") };
+    skippedCount ? (allow.files ? deferred.t("chat:attach.maxAttachments", { count: MAX_ATTACHMENTS }) : deferred.t("chat:attach.maxImages", { count: MAX_ATTACHMENTS })) : null,
+    skippedSize ? deferred.t("chat:attach.imageSize", { mb: MAX_ATTACHMENT_BYTES / 1024 / 1024 }) : null,
+    skippedFileSize ? deferred.t("chat:attach.fileSize", { mb: MAX_FILE_BYTES / 1024 / 1024 }) : null,
+    skippedType ? deferred.t("chat:attach.types") : null,
+  ].filter((note): note is Message => note !== null);
+  return { next: [...current, ...added], added, note: notes };
 }
 
 export function updateAttachment(list: readonly Attachment[], key: string, change: Partial<Attachment>): Attachment[] {
@@ -106,6 +108,11 @@ export function canSendWith(text: string, list: readonly Attachment[]): boolean 
 
 export function uploadIds(list: readonly Attachment[]): string[] {
   return list.flatMap((item) => (item.status === "done" && item.uploadId ? [item.uploadId] : []));
+}
+
+/** The tray's note about files that were not added, in the current language. */
+export function noteText(notes: readonly Message[]): string {
+  return notes.map(say).join(" ");
 }
 
 /** What a screen reader hears for a tray item. */

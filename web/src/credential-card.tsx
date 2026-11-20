@@ -33,19 +33,20 @@ export function CredentialCard({ request, bootstrap, refresh }: { request: WebCr
   const agent = useAgentName();
   const { t } = useTranslation("chat");
   const field = useRef<HTMLInputElement>(null);
-  const [error, setError] = useState("");
+  /** The daemon's refusal code (worded at render, so it follows the language); null: none. */
+  const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [now, setNow] = useState(() => Date.now());
-  useEffect(() => { setError(""); setBusy(false); field.current?.focus(); }, [request.id]);
+  useEffect(() => { setError(null); setBusy(false); field.current?.focus(); }, [request.id]);
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1_000); return () => clearInterval(t); }, []);
   // Whatever happens, the field never outlives the card.
   useEffect(() => () => { if (field.current) field.current.value = ""; }, []);
 
   const answer = async (input: { value: string } | { cancel: true }) => {
     if (!bootstrap || busy) return;
-    setBusy(true); setError("");
+    setBusy(true); setError(null);
     try { await submitCredential(request.id, input, bootstrap, refresh); }
-    catch (err) { setError(credentialError(err instanceof ApiError ? err.code : "")); }
+    catch (err) { setError(err instanceof ApiError ? err.code : ""); }
     finally { setBusy(false); }
   };
   const store = (event: FormEvent) => {
@@ -71,6 +72,6 @@ export function CredentialCard({ request, bootstrap, refresh }: { request: WebCr
       <Button type="submit" size="sm" className="h-9 rounded-lg" disabled={busy}>{t("credential.store")}</Button>
       <Button type="button" variant="ghost" size="sm" className="h-9 rounded-lg" disabled={busy} onClick={() => { if (field.current) field.current.value = ""; void answer({ cancel: true }); }}>{t("credential.refuse")}</Button>
     </div>
-    {error && <p role="status" className="m-0 mt-2 text-[12px] text-destructive">{error}</p>}
+    {error !== null && <p role="status" className="m-0 mt-2 text-[12px] text-destructive">{credentialError(error)}</p>}
   </form>;
 }

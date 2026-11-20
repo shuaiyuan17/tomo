@@ -7,7 +7,7 @@ import type { WebData } from "./data.js";
 import { SCREEN_RATES, type ScreenLoop, type ScreenRate } from "./screen.js";
 import { MemoryReadError } from "../workspace/memory-reader.js";
 import { checkRequest, CsrfTokens, securityHeaders } from "./security.js";
-import { CompressedAssets, IMMUTABLE_CACHE, pickEncoding } from "./static-assets.js";
+import { CompressedAssets, IMMUTABLE_CACHE, localizeIndexHtml, pickEncoding } from "./static-assets.js";
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
 import { credentialSubmitSchema, permissionDecisionSchema, permissionRevokeSchema, cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, mcpReconnectSchema, messageInputSchema, modelChangeSchema, WebError,
@@ -517,13 +517,14 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
     try {
       const stat = await file.stat();
       if (!stat.isFile() || stat.size > MAX_BUFFER_BYTES) throw new WebError(404, "not_found");
-      const bytes = await file.readFile();
+      const locale = relative === "index.html" ? deps.data.locale() : undefined;
+      const bytes = relative === "index.html" ? localizeIndexHtml(await file.readFile(), locale) : await file.readFile();
       const ext = relative.split(".").pop()!;
       // Hashed bundle files never change under their name; everything else keeps no-store.
       const hashed = relative.startsWith("assets/");
       const compressible = CompressedAssets.compressible(ext, bytes.length);
       const encoding = compressible ? pickEncoding(req.headers["accept-encoding"]) : undefined;
-      const body = encoding ? await compressed.get(relative, `${stat.size}:${stat.mtimeMs}`, encoding, bytes) : bytes;
+      const body = encoding ? await compressed.get(relative, `${stat.size}:${stat.mtimeMs}:${locale ?? ""}`, encoding, bytes) : bytes;
       res.writeHead(200, { "content-type": ({ html: "text/html; charset=utf-8", js: "text/javascript; charset=utf-8",
         css: "text/css; charset=utf-8", woff2: "font/woff2", svg: "image/svg+xml", ico: "image/x-icon", png: "image/png",
         webmanifest: "application/manifest+json" } as Record<string, string>)[ext], "content-length": body.length,

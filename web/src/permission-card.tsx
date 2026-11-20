@@ -41,22 +41,23 @@ export function PermissionCard({ request, bootstrap, refresh, onAlways }: { requ
   onAlways?: (granted: GrantedPermission) => void }) {
   const agent = useAgentName();
   const { t } = useTranslation("chat");
-  const [error, setError] = useState("");
+  /** The daemon's refusal code (worded at render, so it follows the language); null: none. */
+  const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [now, setNow] = useState(() => Date.now());
-  useEffect(() => { setError(""); setBusy(false); }, [request.id]);
+  useEffect(() => { setError(null); setBusy(false); }, [request.id]);
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1_000); return () => clearInterval(t); }, []);
   const write = request.access === "write";
   const titleId = `permission-title-${request.id}`;
 
   const answer = async (decision: WebPermissionDecision) => {
     if (!bootstrap || busy) return;
-    setBusy(true); setError("");
+    setBusy(true); setError(null);
     try {
       const result = await decidePermission(request.id, decision, bootstrap, refresh);
       if (result.status === "allowed_always" && result.grantId) onAlways?.({ grantId: result.grantId, group: request.group, path: request.path });
     }
-    catch (err) { setError(permissionError(err instanceof ApiError ? err.code : "")); }
+    catch (err) { setError(err instanceof ApiError ? err.code : ""); }
     finally { setBusy(false); }
   };
 
@@ -87,7 +88,7 @@ export function PermissionCard({ request, bootstrap, refresh, onAlways }: { requ
         onClick={() => void answer(decision)}>{t(label)}</Button>)}
     </div>
     <p className="m-0 mt-2 text-[11.5px] leading-snug text-muted-foreground">{t("permission.hint")}</p>
-    {error && <p role="status" className="m-0 mt-2 text-[12px] text-destructive">{error}</p>}
+    {error !== null && <p role="status" className="m-0 mt-2 text-[12px] text-destructive">{permissionError(error)}</p>}
   </section>;
 }
 

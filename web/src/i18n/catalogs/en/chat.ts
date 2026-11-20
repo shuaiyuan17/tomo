@@ -153,5 +153,6 @@ export const chat = {
   receipt: { read: "Read by {{agent}}" },
   history: { earlier: "Load earlier messages", olderTools: "Older tool calls not shown", unavailable: "History is unavailable.", opening: "Opening your conversation…" },
   empty: { heading: "Start wherever you are.", group: "There are no recorded messages in this group yet.", body: "A question, a half-formed idea, or something on your mind." },
-  markdown: { done: "Completed task", open: "Incomplete task" },
+  markdown: { done: "Completed task", open: "Incomplete task", image: "[Image: {{alt}}]", imageNotLoaded: "[Image: not loaded]" },
+  composerWho: { earlier: "an earlier message", self: "yourself", agent: "{{agent}}" },
 } as const;

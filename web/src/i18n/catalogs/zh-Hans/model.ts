@@ -21,10 +21,10 @@ export const model = {
     body: "这个对话会从 {{from}} 换到 {{to}}。从下一条消息起使用新模型，聊天记录保留。",
   },
   effort: {
-    session: "{{level}}，为这个对话单独设置（sessionEffortOverrides）。", global: "{{level}}，config.json 里的默认值。",
+    session: "{{level}}，为这个 session 单独设置（sessionEffortOverrides）。", global: "{{level}}，config.json 里的默认值。",
     sdkDefault: "未设置，使用模型自己的默认值。", notSupported: "不发送，这个模型不支持 effort 设置。",
   },
-  current: "模型 · {{title}}", overridden: "为这个对话单独选的。不选的话会用默认的 {{model}}。",
+  current: "模型 · {{title}}", overridden: "为这个 session 单独选的。不选的话会用默认的 {{model}}。",
   default: "config.json 里的默认值。",
   effortTitle: "这是 tomo 请求的级别。如果模型不支持，实际可能更低。", effortLine: "请求的 effort：{{effort}}",
   busy: "{{agent}} 正在回复。回复结束后才能切换。",

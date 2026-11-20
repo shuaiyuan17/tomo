@@ -20,7 +20,8 @@ export function CompactButton({ bootstrap, refresh, ownerSession, running, reque
   const [open, setOpen] = useState(false);
   const agent = useAgentName();
   const { t } = useTranslation();
-  const [error, setError] = useState("");
+  /** The refusal code (worded at render); null: none. */
+  const [error, setError] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
   // When this browser saw the request reach its current state (local clock).
   const [seenAt, setSeenAt] = useState(() => Date.now());
@@ -29,10 +30,10 @@ export function CompactButton({ bootstrap, refresh, ownerSession, running, reque
   const button = compactButton({ ownerSession, running, request, seenAt, now });
   if (button.state === "hidden") return null;
   const confirm = async () => {
-    setOpen(false); setError("");
+    setOpen(false); setError(null);
     if (!bootstrap) return;
     try { await requestCompact(bootstrap, refresh); }
-    catch (err) { setError(compactError(err instanceof ApiError ? err.code : "")); setTimeout(() => setError(""), 6_000); }
+    catch (err) { setError(err instanceof ApiError ? err.code : ""); setTimeout(() => setError(null), 6_000); }
   };
   return <span className="relative">
     <Popover open={open} onOpenChange={setOpen}>
@@ -52,7 +53,7 @@ export function CompactButton({ bootstrap, refresh, ownerSession, running, reque
     </Popover>
     {button.state === "requested" && <span className="absolute top-1/2 right-full mr-1 -translate-y-1/2 text-[11px] whitespace-nowrap"><span className="shimmer">{t("compact.requested")}</span></span>}
     {button.state === "done" && <span role="status" className="absolute top-1/2 right-full mr-1 -translate-y-1/2 text-[11px] whitespace-nowrap text-muted-foreground">{t("compact.done")}</span>}
-    {button.state === "ready" && button.note && !error && <span role="status" className="absolute top-7 right-0 z-10 w-52 rounded-lg border bg-popover px-2 py-1.5 text-[11.5px] text-muted-foreground shadow-sm">{button.note}</span>}
-    {error && <span role="status" className="absolute top-7 right-0 z-10 w-52 rounded-lg border bg-popover px-2 py-1.5 text-[11.5px] text-muted-foreground shadow-sm">{error}</span>}
+    {button.state === "ready" && button.note && error === null && <span role="status" className="absolute top-7 right-0 z-10 w-52 rounded-lg border bg-popover px-2 py-1.5 text-[11.5px] text-muted-foreground shadow-sm">{button.note}</span>}
+    {error !== null && <span role="status" className="absolute top-7 right-0 z-10 w-52 rounded-lg border bg-popover px-2 py-1.5 text-[11.5px] text-muted-foreground shadow-sm">{compactError(error)}</span>}
   </span>;
 }

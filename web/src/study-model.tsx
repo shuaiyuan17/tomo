@@ -26,28 +26,29 @@ export function ModelPage({ session, reload, mutator }: { session?: WebSession; 
   const [target, setTarget] = useState<ModelRef | null>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  /** The refusal code (worded at render); null: none. */
+  const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<WebModelChangeResult | null>(null);
   const confirmButton = useRef<HTMLButtonElement>(null);
-  useEffect(() => { setTarget(null); setResult(null); setError(""); setDraft(""); }, [session?.id]);
+  useEffect(() => { setTarget(null); setResult(null); setError(null); setDraft(""); }, [session?.id]);
   useEffect(() => { if (target) confirmButton.current?.focus(); }, [target]);
   if (!session) return <Empty>{t("study:chooseConversation")}</Empty>;
   // A view still loaded for the previously selected conversation is not shown as this one's.
   const view = resource.state === "ready" && resource.value.sessionId === session.id ? resource.value : undefined;
   if (!view) return <Status resource={resource.state === "ready" ? { state: "loading" } : resource} />;
   const canSwitch = view.writable && mutator.live && !!mutator.bootstrap;
-  const choose = (next: ModelRef) => { setResult(null); setError(""); setTarget(next); };
-  const cancel = () => { if (!busy) { setTarget(null); setError(""); } };
+  const choose = (next: ModelRef) => { setResult(null); setError(null); setTarget(next); };
+  const cancel = () => { if (!busy) { setTarget(null); setError(null); } };
   const confirm = async () => {
     if (!target || !mutator.bootstrap) return;
-    setBusy(true); setError("");
+    setBusy(true); setError(null);
     try {
       const value = await mutate<WebModelChangeResult>("/models", "POST",
         { sessionId: view.sessionId, model: target.id, from: view.model.id, confirm: true }, mutator.bootstrap, mutator.refresh);
       setResult(value); setTarget(null); setDraft(""); refetch();
     } catch (err) {
       const code = err instanceof ApiError ? err.code : "unavailable";
-      setError(modelErrorText(code, agent));
+      setError(code);
       if (modelErrorRefreshes(code)) refetch();
     } finally { setBusy(false); }
   };
@@ -83,10 +84,10 @@ export function ModelPage({ session, reload, mutator }: { session?: WebSession; 
         <dt className={meta}>{t("to")}</dt><dd className="m-0">{target.label === target.id ? <span className="font-mono text-xs [overflow-wrap:anywhere]">{target.id}</span>
           : <>{target.label} <span className="font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]">{target.id}</span></>}</dd>
       </dl>
-      {error && <p className="mt-3 mb-0 text-[13px] text-destructive" role="alert">{error}</p>}
+      {error !== null && <p className="mt-3 mb-0 text-[13px] text-destructive" role="alert">{modelErrorText(error, agent)}</p>}
       <div className="mt-4 flex justify-end gap-2">
         <Button variant="outline" className="rounded-xl" disabled={busy} onClick={cancel}>{t("common:action.cancel")}</Button>
-        <Button ref={confirmButton} className="rounded-xl" disabled={busy || !!error || !canSwitch} onClick={() => void confirm()}>{busy ? t("switching") : t("switch")}</Button>
+        <Button ref={confirmButton} className="rounded-xl" disabled={busy || error !== null || !canSwitch} onClick={() => void confirm()}>{busy ? t("switching") : t("switch")}</Button>
       </div>
     </section>}
 

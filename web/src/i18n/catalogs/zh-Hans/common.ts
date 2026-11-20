@@ -18,7 +18,7 @@ export const common = {
   },
   tasksRail: { resize: "调整任务面板宽度" },
   sidebar: {
-    label: "对话详情", workspace: "工作区", conversations: "你的对话", session: "Session",
+    label: "对话详情", workspace: "工作区", conversations: "你的对话", session: "session",
     readOnly: "只读", groupNote: "共享的聊天记录。消息需要从群所在的聊天应用里发送。",
     groupTitle: "{{title}} · 只读", noSession: "没有可用的 session", mainSession: "主 session",
     picker: "对话", mainTag: "主", readOnlyTag: "只读",

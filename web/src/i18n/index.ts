@@ -26,8 +26,16 @@ function browserLanguages(): string[] {
   return [...(navigator.languages ?? []), navigator.language].filter(Boolean);
 }
 
-/** config `locale` from bootstrap, once it has arrived. */
-let configured: string | undefined;
+/**
+ * config `locale` as the daemon served it on `<html data-tomo-locale>` (see
+ * localizeIndexHtml), read before the first render, so the first paint is in
+ * that language; bootstrap's `locale` updates it later.
+ */
+export function servedLocale(): string | undefined {
+  if (typeof document === "undefined") return undefined;
+  return document.documentElement.dataset.tomoLocale || undefined;
+}
+let configured: string | undefined = servedLocale();
 
 /**
  * The UI's locale: the Settings choice, else config `locale`, else the
@@ -39,7 +47,7 @@ export function pickLocale(choice: Locale | null, config: string | undefined, br
 
 export const i18n = i18next.createInstance();
 void i18n.use(initReactI18next).init({
-  lng: pickLocale(storedLocale(), undefined, browserLanguages()),
+  lng: pickLocale(storedLocale(), configured, browserLanguages()),
   fallbackLng: DEFAULT_LOCALE,
   supportedLngs: [...LOCALES],
   load: "currentOnly",

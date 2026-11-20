@@ -154,5 +154,6 @@ export const chat = {
   receipt: { read: "{{agent}} 已读" },
   history: { earlier: "加载更早的消息", olderTools: "更早的工具调用未显示", unavailable: "聊天记录暂时不可用。", opening: "正在打开对话…" },
   empty: { heading: "从哪儿开始都行。", group: "这个群还没有记录的消息。", body: "一个问题、一个没想清楚的念头，或者随便想到的事。" },
-  markdown: { done: "已完成的任务", open: "未完成的任务" },
+  markdown: { done: "已完成的任务", open: "未完成的任务", image: "［图片：{{alt}}］", imageNotLoaded: "［图片：未加载］" },
+  composerWho: { earlier: "之前的一条消息", self: "你自己", agent: "{{agent}}" },
 } satisfies Translation<typeof en>;

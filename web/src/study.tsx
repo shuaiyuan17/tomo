@@ -19,6 +19,7 @@ import { Cron } from "./study-cron.js";
 import { ModelPage } from "./study-model.js";
 import { formatWhen, studyLabel, STUDY_PAGES, useResource, type StudyPage } from "./study-data.js";
 import { i18n, Trans, useTranslation } from "./i18n/index.js";
+import { deferred, say, type Message } from "./i18n/message.js";
 
 import { card, Empty, meta, Status, type Mutator } from "./study-ui.js";
 
@@ -146,30 +147,31 @@ const MCP_LABEL: Record<string, "mcp.status.connected" | "mcp.status.failed" | "
   connected: "mcp.status.connected", failed: "mcp.status.failed", "needs-auth": "mcp.status.needsAuth", pending: "mcp.status.pending", disabled: "mcp.status.disabled" };
 const MCP_OAUTH = { ready: null, "login-required": "mcp.oauth.loginRequired", "auth-pending": "mcp.oauth.authPending", "auth-failed": "mcp.oauth.authFailed" } as const satisfies Record<WebMcpOAuthState, string | null>;
 const MCP_RECONNECT = {
-  reconnected: "mcp.reconnect.reconnected", failed: "mcp.reconnect.failed", "no-live-session": "mcp.reconnect.noLiveSession",
+  reconnected: "study:mcp.reconnect.reconnected", failed: "study:mcp.reconnect.failed", "no-live-session": "study:mcp.reconnect.noLiveSession",
 } as const satisfies Record<WebMcpReconnectResult["outcome"], string>;
 
 /** One server's Reconnect button, on the owner conversation's live session. */
 function McpReconnect({ server, mutator, onDone }: { server: string; mutator: Mutator; onDone: () => void }) {
   const { t } = useTranslation(["study", "common"]);
   const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState("");
+  /** How the reconnect went, worded at render. */
+  const [note, setNote] = useState<Message | null>(null);
   const run = async () => {
     if (!mutator.bootstrap) return;
-    setBusy(true); setNote("");
+    setBusy(true); setNote(null);
     try {
       const value = await mutate<WebMcpReconnectResult>("/mcp/reconnect", "POST", { server }, mutator.bootstrap, mutator.refresh);
-      setNote(t(MCP_RECONNECT[value.outcome])); onDone();
+      setNote(deferred.t(MCP_RECONNECT[value.outcome])); onDone();
     } catch (err) {
       const code = err instanceof ApiError ? err.code : "";
-      setNote(code === "session_busy" ? t("mcp.reconnect.busy")
-        : code === "epoch_changed" ? t("mcp.reconnect.restarted") : t("mcp.reconnect.unavailable"));
+      setNote(deferred.t(code === "session_busy" ? "study:mcp.reconnect.busy"
+        : code === "epoch_changed" ? "study:mcp.reconnect.restarted" : "study:mcp.reconnect.unavailable"));
     } finally { setBusy(false); }
   };
   return <span className="inline-flex items-center gap-2">
     <Button variant="outline" size="sm" className="h-7 rounded-lg px-2.5 text-[12px]" disabled={busy || !mutator.bootstrap || !mutator.live} onClick={() => void run()}>
       <RefreshCw className={cn("size-3", busy && "animate-spin")} />{busy ? t("mcp.reconnect.running") : t("mcp.reconnect.action")}</Button>
-    {note && <span className={meta} role="status">{note}</span>}</span>;
+    {note && <span className={meta} role="status">{say(note)}</span>}</span>;
 }
 
 function Mcp({ reload, mutator, ownerId }: { reload: number; mutator: Mutator; ownerId?: string | null }) {

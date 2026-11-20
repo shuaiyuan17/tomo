@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import type { WebRateLimit, WebRequest, WebTurnStatus } from "../../src/web/protocol.js";
 import { formatElapsed, modelLabel } from "./tasks.js";
 import { i18n } from "./i18n/index.js";
+import { deferred, say, type Message } from "./i18n/message.js";
 
 /** How long "Completed" stays before it fades out (plus the fade itself). */
 export const COMPLETED_VISIBLE_MS = 2000;
@@ -14,6 +15,18 @@ export function requestLabels(agent = "Tomo"): Record<WebRequest["state"], strin
     unknown: i18n.t("chat:request.unknown", { agent }),
     interrupted: i18n.t("chat:request.interrupted", { agent }) };
 }
+/** A request state as a status note, for state (worded when shown). */
+export function requestMessage(state: WebRequest["state"], agent: string): Message {
+  switch (state) {
+    case "queued": return deferred.t("chat:request.queued");
+    case "running": return deferred.t("chat:request.running", { agent });
+    case "completed": return deferred.t("chat:request.completed");
+    case "failed": return deferred.t("chat:request.failed");
+    case "refused": return deferred.t("chat:request.refused");
+    case "unknown": return deferred.t("chat:request.unknown", { agent });
+    case "interrupted": return deferred.t("chat:request.interrupted", { agent });
+  }
+}
 /** The typing indicator's activity value; the status line words it with the agent's name. */
 export const TYPING_ACTIVITY = "typing";
 
@@ -24,7 +37,7 @@ export function requestStamp(latest: WebRequest | undefined): string {
 
 /** A one-off note from the page (sending, a refusal, a failed check), and the request stamp it was written at. */
 /** `warn`: the note says something failed (shown in the destructive colour, `text-destructive`). */
-export interface ComposerNote { text: string; at: string; warn?: boolean }
+export interface ComposerNote { text: Message | null; at: string; warn?: boolean }
 
 /** A turn status as the page holds it: `at` is when it arrived (local clock). */
 export interface TurnStatus { status: WebTurnStatus; at: number }
@@ -137,7 +150,7 @@ export function composerStatus(input: {
   const detail = working ? turnDetail(input.turn, input.now ?? Date.now()) : "";
   if (input.activity === TYPING_ACTIVITY) return detail ? `${labels.running} ${detail}` : labels.running;
   if (input.activity) return input.activity;
-  if (input.note.text && input.note.at === requestStamp(latest)) return input.note.text;
+  if (input.note.text && input.note.at === requestStamp(latest)) return say(input.note.text);
   // How the turn went, in the SDK's own terms, outranks the bare request state
   // (a stopped turn "completed"; a typed error "failed"); never while one runs.
   // A completed request's line clears once settled, whatever it said.

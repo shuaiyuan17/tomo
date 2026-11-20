@@ -3,15 +3,18 @@ import type { WebBootstrap } from "./api.js";
 import { ApiError, discardUpload, uploadImage } from "./api.js";
 import type { WebFiledFile } from "../../src/web/protocol.js";
 import { addFiles, filedAttachment, isAttachableImage, replaceItems, takeSent, updateAttachment, type Attachment } from "./uploads.js";
-import { i18n } from "./i18n/index.js";
+import { deferred, type Message } from "./i18n/message.js";
 
 const failure = (error: unknown) => {
-  if (!(error instanceof ApiError)) return i18n.t("chat:attach.failed");
-  return error.code === "not_image" ? i18n.t("chat:attach.error.notImage")
-    : error.code === "too_large" ? i18n.t("chat:attach.error.tooLarge")
-    : error.code === "uploads_disabled" ? i18n.t("chat:attach.error.disabled")
-    : error.code === "epoch_changed" ? i18n.t("chat:attach.error.restarted")
-    : error.code === "upload_limit" ? i18n.t("chat:attach.error.limit") : i18n.t("chat:attach.failed");
+  if (!(error instanceof ApiError)) return deferred.t("chat:attach.failed");
+  switch (error.code) {
+    case "not_image": return deferred.t("chat:attach.error.notImage");
+    case "too_large": return deferred.t("chat:attach.error.tooLarge");
+    case "uploads_disabled": return deferred.t("chat:attach.error.disabled");
+    case "epoch_changed": return deferred.t("chat:attach.error.restarted");
+    case "upload_limit": return deferred.t("chat:attach.error.limit");
+    default: return deferred.t("chat:attach.failed");
+  }
 };
 
 /**
@@ -21,7 +24,8 @@ const failure = (error: unknown) => {
 export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () => Promise<WebBootstrap>, targetId: string | undefined,
   allow: { images: boolean; files: boolean } = { images: true, files: false }) {
   const [items, setItems] = useState<Attachment[]>([]);
-  const [note, setNote] = useState("");
+  /** Why some files were not added, worded when shown (see noteText). */
+  const [note, setNote] = useState<Message[]>([]);
   /**
    * The ONE source of truth for the tray. Every change goes through `commit`,
    * which updates it synchronously and only then schedules the render, so two
@@ -44,7 +48,7 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
   }, [bootstrap]);
 
   const upload = useCallback((item: Attachment) => {
-    if (!bootstrap || !targetId) { commit((old) => updateAttachment(old, item.key, { status: "failed", error: i18n.t("chat:attach.error.offline") })); return; }
+    if (!bootstrap || !targetId) { commit((old) => updateAttachment(old, item.key, { status: "failed", error: deferred.t("chat:attach.error.offline") })); return; }
     const controller = new AbortController();
     aborts.current.set(item.key, controller);
     commit((old) => updateAttachment(old, item.key, { status: "uploading", progress: 0, error: undefined }));
@@ -86,7 +90,7 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
     const { next, dropped } = replaceItems(list.current, dropKeys, added);
     for (const item of dropped) release(item);
     commit(() => next);
-    if (dropped.length) setNote("");
+    if (dropped.length) setNote([]);
     return added.map((item) => item.key);
   }, [commit, release]);
 
@@ -95,7 +99,7 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
     if (!item) return;
     release(item);
     commit((old) => old.filter((entry) => entry.key !== key));
-    setNote("");
+    setNote([]);
   }, [commit, release]);
 
   const retry = useCallback((key: string) => {
@@ -111,7 +115,7 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
   const take = useCallback((keys: readonly string[]): Attachment[] => {
     const { taken, kept } = takeSent(list.current, keys);
     commit(() => kept);
-    if (!kept.length) setNote("");
+    if (!kept.length) setNote([]);
     return taken;
   }, [commit]);
 

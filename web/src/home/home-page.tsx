@@ -82,7 +82,7 @@ export function HomePage({ events, bootstrap, refresh, inert }: {
   const status = newerStatus(fetched, events.status)?.status;
   // Never behind the status itself (the ticker may be older than the answer it reads).
   const now = Math.max(useNow(!!status && cronFlashing(status, Date.now())), status?.at ?? 0);
-  const caption = status ? homeCaption(status, now) : loaded.state === "error" ? `Can't tell what ${agent} is doing right now` : "…";
+  const caption = status ? homeCaption(status, now) : loaded.state === "error" ? i18n.t("home:unknownStatus", { agent }) : "…";
 
   // three.js arrives in its own chunk, only now.
   const [room, setRoom] = useState<RoomModule | null>(null);

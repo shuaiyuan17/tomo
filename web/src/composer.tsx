@@ -8,17 +8,18 @@ import { cn } from "@/lib/utils";
 import { api, ApiError, dismissRequest, sendMessage, stopTurn } from "./api.js";
 import { AttachmentTray } from "./attachment-tray.js";
 import { createCompositionGuard } from "./compose-keys.js";
-import { composerStatus, composerStatusIsProblem, requestLabels, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
+import { composerStatus, composerStatusIsProblem, requestMessage, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
 import type { SentAttachments } from "./conversation-rows.js";
 import { CredentialCard } from "./credential-card.js";
 import { PermissionCard, PermissionGranted, type GrantedPermission } from "./permission-card.js";
 import { pendingKey } from "./inline-tools.js";
 import { applyRestored, dismissAfterAcceptedSend, missingAttachments, resendAfterDraftChange, resendAfterSend, type Resend } from "./pending.js";
 import { quoteFor } from "./reactions.js";
-import { canSendWith, captureSend, imageFiles, pastedFiles } from "./uploads.js";
+import { canSendWith, captureSend, imageFiles, noteText, pastedFiles } from "./uploads.js";
 import { useAttachments } from "./use-attachments.js";
 import type { useWeb } from "./use-web.js";
 import { i18n } from "./i18n/index.js";
+import { deferred, say, type Message } from "./i18n/message.js";
 
 /**
  * The composer: the draft and its attachments, the reply being written, the
@@ -48,19 +49,19 @@ type Refusal = "interrupted_backlog" | "journal_unavailable" | "persist_failed";
 const REFUSALS: readonly string[] = ["interrupted_backlog", "journal_unavailable", "persist_failed"] satisfies Refusal[];
 const refusal = (err: unknown): Refusal | undefined => err instanceof ApiError && err.status === 503 && REFUSALS.includes(err.code) ? err.code as Refusal : undefined;
 /** A refusal said about a send: the draft is kept. */
-function sendRefusal(code: Refusal): string {
+function sendRefusal(code: Refusal): Message {
   switch (code) {
-    case "interrupted_backlog": return i18n.t("chat:composer.refusal.interrupted_backlog");
-    case "journal_unavailable": return i18n.t("chat:composer.refusal.journal_unavailable");
-    case "persist_failed": return i18n.t("chat:composer.refusal.persist_failed");
+    case "interrupted_backlog": return deferred.t("chat:composer.refusal.interrupted_backlog");
+    case "journal_unavailable": return deferred.t("chat:composer.refusal.journal_unavailable");
+    case "persist_failed": return deferred.t("chat:composer.refusal.persist_failed");
   }
 }
 /** The same refusal said about a reaction, which has no draft. */
-function reactRefusal(code: Refusal): string {
+function reactRefusal(code: Refusal): Message {
   switch (code) {
-    case "interrupted_backlog": return i18n.t("chat:composer.reactRefusal.interrupted_backlog");
-    case "journal_unavailable": return i18n.t("chat:composer.reactRefusal.journal_unavailable");
-    case "persist_failed": return i18n.t("chat:composer.reactRefusal.persist_failed");
+    case "interrupted_backlog": return deferred.t("chat:composer.reactRefusal.interrupted_backlog");
+    case "journal_unavailable": return deferred.t("chat:composer.reactRefusal.journal_unavailable");
+    case "persist_failed": return deferred.t("chat:composer.reactRefusal.persist_failed");
   }
 }
 
@@ -69,31 +70,35 @@ function reactRefusal(code: Refusal): string {
  * (nothing was accepted), so the request is not kept as uncertain; otherwise
  * it may have arrived and the owner checks before sending again.
  */
-export function sendFailure(err: unknown, unknownLabel: string): { text: string; warn: boolean; definite: boolean } {
+export function sendFailure(err: unknown, unknownLabel: Message): { text: Message; warn: boolean; definite: boolean } {
   const refused = refusal(err);
   if (refused) return { text: sendRefusal(refused), warn: true, definite: true };
   if (err instanceof ApiError && [400, 401, 403, 409, 413, 415, 429].includes(err.status)) {
-    const text = err.status === 413 ? i18n.t("chat:composer.failure.tooLarge")
-      : err.status === 401 ? i18n.t("chat:composer.failure.unauthorized")
-      : err.code === "owner_dm_only" ? i18n.t("chat:composer.failure.groupReadOnly")
-      : err.code === "upload_missing" ? i18n.t("chat:composer.failure.uploadMissing")
-      : err.code === "uploads_disabled" ? i18n.t("chat:composer.failure.uploadsDisabled")
-      : i18n.t("chat:composer.failure.other");
+    const text = err.status === 413 ? deferred.t("chat:composer.failure.tooLarge")
+      : err.status === 401 ? deferred.t("chat:composer.failure.unauthorized")
+      : err.code === "owner_dm_only" ? deferred.t("chat:composer.failure.groupReadOnly")
+      : err.code === "upload_missing" ? deferred.t("chat:composer.failure.uploadMissing")
+      : err.code === "uploads_disabled" ? deferred.t("chat:composer.failure.uploadsDisabled")
+      : deferred.t("chat:composer.failure.other");
     return { text, warn: err.code !== "owner_dm_only", definite: true };
   }
   return { text: unknownLabel, warn: true, definite: false };
 }
 
 /** Why a reaction failed: never "your draft is kept" (a reaction has no draft). */
-export function reactFailure(err: unknown): string {
+export function reactFailure(err: unknown): Message {
   const refused = refusal(err);
   return refused ? reactRefusal(refused)
-    : err instanceof ApiError ? i18n.t("chat:composer.reactFailed")
-    : i18n.t("chat:composer.reactUncertain");
+    : err instanceof ApiError ? deferred.t("chat:composer.reactFailed")
+    : deferred.t("chat:composer.reactUncertain");
 }
 
 /** A resend that could not bring all of the original's attachments back (a failed read, a full tray). */
-const missingNote = (missing: number) => i18n.t("chat:composer.missing", { count: missing });
+/** Who a reply quotes, worded when shown. */
+const selfMessage = deferred.t("chat:composerWho.self");
+const agentMessage = (agent: string) => deferred.t("chat:composerWho.agent", { agent });
+
+const missingNote = (missing: number) => deferred.t("chat:composer.missing", { count: missing });
 
 const COMPOSER_MAX_HEIGHT = 240;
 function fitComposer(element: HTMLTextAreaElement | null) {
@@ -115,12 +120,11 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
   /** Previews of what a send carried, for its pending bubble. */ onSent: (requestId: string, sent: SentAttachments) => void;
   /** A dismissal starts (any confirmation on a bubble closes). */ onDismiss: () => void;
 }) {
-  const labels = requestLabels(agent);
   const live = web.connection === "live";
   const writable = !!session?.writable;
   const [draft, setDraft] = useState("");
   /** The message the next send replies to (its quote, as the agent will read it). */
-  const [replyingTo, setReplyingTo] = useState<{ id: string; who: string; text: string } | null>(null);
+  const [replyingTo, setReplyingTo] = useState<{ id: string; who: Message; text: string } | null>(null);
   /** The last Always allow answered on a card, so its grant ID stays on screen after the card goes. */
   const [granted, setGranted] = useState<GrantedPermission | null>(null);
   const attachments = useAttachments(web.bootstrap, web.refreshBootstrap, writable ? session!.id : undefined, { images: uploadsOn, files: filesOn });
@@ -138,12 +142,12 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
   };
   // One-off notes for the status line, stamped with where the latest request
   // stood; composerStatus drops a note as soon as the request moves on.
-  const [note, setNote] = useState<ComposerNote>({ text: "", at: "" });
+  const [note, setNote] = useState<ComposerNote>({ text: null, at: "" });
   const stamp = useRef("");
   useEffect(() => { stamp.current = requestStamp(latest); });
-  const setFeedback = (text: string, warn = false) => setNote({ text, at: stamp.current, warn });
+  const setFeedback = (text: Message | null, warn = false) => setNote({ text, at: stamp.current, warn });
   // Another conversation: the reply and a one-off note belonged to the last one.
-  useEffect(() => { setReplyingTo(null); setNote({ text: "", at: "" }); }, [sessionId]);
+  useEffect(() => { setReplyingTo(null); setNote({ text: null, at: "" }); }, [sessionId]);
   /** Interrupted request being resent from the composer (dismissed once the resend is accepted). */
   const [resending, setResending] = useState<Resend | null>(null);
   /** The current restore; bumped whenever the resend is replaced or ends, so a late result is dropped. */
@@ -182,7 +186,7 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
     const sentAs = resending;
     const replyTo = replyingTo;
     const requestId = crypto.randomUUID();
-    setSending(true); setFeedback(i18n.t("chat:composer.sending")); remember(requestId);
+    setSending(true); setFeedback(deferred.t("chat:composer.sending")); remember(requestId);
     // Sending is the reader's own move: it takes them to the end, wherever they were reading.
     // Claimed before the request goes out: the live stream can show its bubble before the POST returns.
     claim(pendingKey({ requestId }));
@@ -205,9 +209,9 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
       setResending((old) => resendAfterSend(old, sentAs));
       setDraft((old) => old.trim() === text ? "" : old);
       setReplyingTo((old) => old === replyTo ? null : old);
-      setFeedback(""); remember(null); onAccepted();
+      setFeedback(null); remember(null); onAccepted();
     } catch (err) {
-      const failure = sendFailure(err, labels.unknown);
+      const failure = sendFailure(err, deferred.t("chat:request.unknown", { agent }));
       if (failure.definite) remember(null);
       setFeedback(failure.text, failure.warn);
     } finally { setSending(false); }
@@ -217,7 +221,7 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
     if (!web.bootstrap) return;
     onDismiss();
     try { web.applyRequest(await dismissRequest(requestId, web.bootstrap, web.refreshBootstrap)); }
-    catch { if (!quiet) setFeedback(i18n.t("chat:composer.dismissFailed"), true); }
+    catch { if (!quiet) setFeedback(deferred.t("chat:composer.dismissFailed"), true); }
   };
 
   /**
@@ -269,11 +273,11 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
     const expected = (request.images?.length ?? 0) + (request.files?.length ?? 0);
     setResending({ requestId: request.requestId, original: request.text ?? "", ...(fileKeys.length ? { fileKeys } : {}), ...(restoringImages ? { restoring: true } : {}), ...(expected ? { expected } : {}), token });
     setDraft(request.text ?? ""); input.current?.focus();
-    setReplyingTo(request.reply ? { id: "", who: "an earlier message", text: request.reply.text } : null);
+    setReplyingTo(request.reply ? { id: "", who: deferred.t("chat:composerWho.earlier"), text: request.reply.text } : null);
     // Its images come back too: read from where they were filed, attached (uploaded) again.
     // Until every one is back, Send stays off — a send now would leave them behind.
     if (restoringImages) void reattach(request.images!, { fileKeys, expected, token });
-    setFeedback(i18n.t("chat:composer.resendReview"));
+    setFeedback(deferred.t("chat:composer.resendReview"));
   };
 
   const checkOutcome = async () => {
@@ -282,26 +286,26 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
       const request = await api<WebRequest>(`/messages/${uncertain}`);
       // The answer goes into the request stream, so the status line shows it
       // live (and follows it to Completed) instead of a frozen copy.
-      if (request.sessionId) { web.acceptRequest(request); setFeedback(""); }
-      else setFeedback(labels[request.state], request.state !== "completed" && request.state !== "running" && request.state !== "queued");
+      if (request.sessionId) { web.acceptRequest(request); setFeedback(null); }
+      else setFeedback(requestMessage(request.state, agent), request.state !== "completed" && request.state !== "running" && request.state !== "queued");
       // Unknown stays unresolved; refused and interrupted were not answered, so the draft is kept.
       if (request.state !== "unknown") { remember(null); if (request.state !== "refused" && request.state !== "interrupted") setDraft(""); }
       onAccepted();
-    } catch { setFeedback(i18n.t("chat:composer.checkFailed"), true); }
+    } catch { setFeedback(deferred.t("chat:composer.checkFailed"), true); }
   };
 
   const stop = async () => {
     if (!web.bootstrap || stopping) return;
-    setStopping(true); setFeedback(i18n.t("chat:composer.stopping"));
+    setStopping(true); setFeedback(deferred.t("chat:composer.stopping"));
     try {
       const { stopped } = await stopTurn(web.bootstrap, web.refreshBootstrap);
-      if (!stopped) { setStopping(false); setFeedback(i18n.t("chat:composer.nothingToStop")); }
-    } catch { setStopping(false); setFeedback(i18n.t("chat:composer.stopFailed"), true); }
+      if (!stopped) { setStopping(false); setFeedback(deferred.t("chat:composer.nothingToStop")); }
+    } catch { setStopping(false); setFeedback(deferred.t("chat:composer.stopFailed"), true); }
   };
 
   useImperativeHandle(handle, () => ({
     startReply: (message) => {
-      setReplyingTo({ id: message.id, who: message.role === "assistant" ? agent : "yourself", text: quoteFor(message) });
+      setReplyingTo({ id: message.id, who: message.role === "assistant" ? agentMessage(agent) : selfMessage, text: quoteFor(message) });
       input.current?.focus();
     },
     react: (quote, reaction, replaces) => void react(quote, reaction, replaces),
@@ -323,17 +327,17 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
     {resending && <div className="mb-2 flex items-center gap-2 tracking-[0.02em] text-[11px] text-muted-foreground">
       <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{i18n.t("chat:composer.resending")}</Badge>
       <span role="status" className={cn(missingAttachments(resending) > 0 && "text-destructive")}>{restoring ? i18n.t("chat:composer.restoring")
-        : missingAttachments(resending) > 0 ? missingNote(missingAttachments(resending)) : i18n.t("chat:composer.resendNote")}</span>
+        : missingAttachments(resending) > 0 ? say(missingNote(missingAttachments(resending))) : i18n.t("chat:composer.resendNote")}</span>
       <Button variant="ghost" size="sm" className="h-6 rounded-md px-2 text-[11px]" onClick={endResend}>{i18n.t("chat:composer.notResend")}</Button></div>}
     <AttachmentTray items={attachments.items} filesOn={filesOn} onRetry={attachments.retry} onRemove={attachments.remove} />
-    {attachments.note && <p className="m-0 mb-2 text-[12px] text-muted-foreground" role="status">{attachments.note}</p>}
+    {attachments.note.length > 0 && <p className="m-0 mb-2 text-[12px] text-muted-foreground" role="status">{noteText(attachments.note)}</p>}
     {granted && <PermissionGranted granted={granted} onClose={() => setGranted(null)} />}
     {web.permissionRequests.map((request) => <PermissionCard key={request.id} request={request} bootstrap={web.bootstrap} refresh={web.refreshBootstrap} onAlways={setGranted} />)}
     {web.credentialRequest && <CredentialCard key={web.credentialRequest.id} request={web.credentialRequest} bootstrap={web.bootstrap} refresh={web.refreshBootstrap} />}
     {replyingTo && writable && <div className="motion-enter mb-2 flex items-center gap-2.5 rounded-2xl border bg-card/70 py-1.5 pr-1.5 pl-3" role="group" aria-label={i18n.t("chat:composer.replying")}>
       <Reply className="size-4 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
       <div className="min-w-0 flex-1 border-l-2 border-muted-foreground/40 pl-2.5">
-        <span className="block text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">{i18n.t("chat:composer.replyingTo", { who: replyingTo.who })}</span>
+        <span className="block text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">{i18n.t("chat:composer.replyingTo", { who: say(replyingTo.who) })}</span>
         <span className="block truncate text-[12.5px] leading-snug text-foreground/80">{replyingTo.text || i18n.t("chat:reaction.earlier")}</span></div>
       <Button type="button" variant="ghost" size="icon" aria-label={i18n.t("chat:composer.cancelReply")} title={i18n.t("chat:composer.cancelReplyTitle")} onClick={() => { setReplyingTo(null); input.current?.focus(); }}
         className="size-7 shrink-0 rounded-full text-muted-foreground hover:text-foreground"><X className="size-3.5" strokeWidth={2} /></Button></div>}
@@ -365,7 +369,7 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
         className="size-9 shrink-0 rounded-full transition-[background-color,transform] hover:bg-primary/85 active:scale-[0.94] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100 [&_svg:not([class*='size-'])]:size-[18px]"
         title={restoring ? i18n.t("chat:composer.restoring") : undefined} disabled={!canSend}><ArrowUp strokeWidth={2.2} /></Button>}
     </form>
-    {uncertain && !sending && <div className="mt-2 flex flex-wrap gap-2"><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => void checkOutcome()}>{i18n.t("chat:composer.check")}</Button><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { remember(null); setFeedback(i18n.t("chat:composer.keptNote")); }}>{i18n.t("chat:composer.keep")}</Button></div>}
+    {uncertain && !sending && <div className="mt-2 flex flex-wrap gap-2"><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => void checkOutcome()}>{i18n.t("chat:composer.check")}</Button><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { remember(null); setFeedback(deferred.t("chat:composer.keptNote")); }}>{i18n.t("chat:composer.keep")}</Button></div>}
   </div>;
 }
 

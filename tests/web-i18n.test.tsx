@@ -90,3 +90,50 @@ describe("the Plan usage card words the daemon's windows itself", () => {
     expect(windowTitle({ ...base, group: "session", scoped: true, kind: "session", model: "Opus", label: "Session (5h) · Opus" })).toBe("5 小时 · Opus");
   });
 });
+
+describe("copy kept in state follows a language switch", () => {
+  it("a refused send's note is stored as a message and worded when shown", async () => {
+    const { ApiError } = await import("../web/src/api.js");
+    const { sendFailure, reactFailure } = await import("../web/src/composer.js");
+    const { composerStatus } = await import("../web/src/composer-status.js");
+    const { deferred } = await import("../web/src/i18n/message.js");
+    // What the composer puts in state when a send is refused (nothing translated yet).
+    const failure = sendFailure(new ApiError(413, "too_large"), deferred.t("chat:request.unknown", { agent: "Tomo" }));
+    const note = { text: failure.text, at: "" };
+    const line = () => composerStatus({ activity: undefined, note, latest: undefined, settled: null });
+    expect(line()).toContain("Message is too large");
+    await i18n.changeLanguage("zh-Hans");
+    expect(line()).toBe("消息太长了。缩短后再发，草稿已保留。");
+    expect(JSON.stringify(reactFailure(new ApiError(409, "epoch_changed")))).not.toMatch(/[一-鿿]/);
+  });
+
+  it("a failed upload and a refused card answer keep codes, worded at render", async () => {
+    const { say, deferred } = await import("../web/src/i18n/message.js");
+    const { permissionError } = await import("../web/src/permission-card.js");
+    const { modelErrorText } = await import("../web/src/model-picker.js");
+    const stored = { code: "permission_closed", upload: deferred.t("chat:attach.error.tooLarge") };
+    expect([permissionError(stored.code), say(stored.upload), modelErrorText("turn_in_flight", "Tomo")].join(" ")).not.toMatch(/[一-鿿]/);
+    await i18n.changeLanguage("zh-Hans");
+    expect(permissionError(stored.code)).toBe("这个请求已经结束：已回复或已过期。");
+    expect(say(stored.upload)).toContain("太大了");
+    expect(modelErrorText("turn_in_flight", "Tomo")).toContain("Tomo 正在回复中");
+  });
+
+  it("no component puts translated text into state", async () => {
+    const { readdirSync, readFileSync, statSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const offenders: string[] = [];
+    const walk = (dir: string) => { for (const name of readdirSync(dir)) {
+      const path = join(dir, name);
+      if (statSync(path).isDirectory()) { if (name !== "i18n") walk(path); continue; }
+      if (!/\.tsx?$/.test(name)) continue;
+      readFileSync(path, "utf8").split("\n").forEach((line, i) => {
+        // A state setter fed translated words: `setX(t(...))`, `setX(i18n.t(...))`, `setX(someError(code))`.
+        // (reactFailure / sendFailure return a Message, not words.)
+        if (/\bset[A-Z]\w*\(\s*(i18n\.t|t|say|(?!reactFailure|sendFailure)[a-z]\w*(Error|Failure|Text|Label|Notice))\(/.test(line)) offenders.push(`${path}:${i + 1}`);
+      });
+    } };
+    walk("web/src");
+    expect(offenders).toEqual([]);
+  });
+});

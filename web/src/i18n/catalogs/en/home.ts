@@ -22,4 +22,5 @@ export const home = {
   problem: "{{agent}}'s latest change has a problem; showing the last good room.",
   starter: "This is the starter room; {{agent}} hasn't made one of its own yet.",
   viewLabel: "{{label}}. Arrow keys turn the room, plus and minus zoom, Home resets the view.", resetView: "Reset view", dragHint: "Drag to turn · pinch to zoom",
+  unknownStatus: "Can't tell what {{agent}} is doing right now",
 } as const;

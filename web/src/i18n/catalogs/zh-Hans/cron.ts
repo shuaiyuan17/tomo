@@ -21,5 +21,5 @@ export const cron = {
     deleteBody: "任务会从计划中移除，这里无法撤销。已经在运行的不会被停止。",
   },
   pause: "暂停", resume: "恢复", delete: "删除", pauseLabel: "暂停 {{name}}", resumeLabel: "恢复 {{name}}", deleteLabel: "删除 {{name}}",
-  schedule: "计划", session: "Session", working: "处理中…", offline: "连接后才能修改。",
+  schedule: "计划", session: "session", working: "处理中…", offline: "连接后才能修改。",
 } satisfies Translation<typeof en>;

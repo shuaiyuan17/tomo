@@ -3,6 +3,7 @@ import type { HistoryMessage, HistoryPage } from "../src/web/protocol.js";
 import { mergeLatest, mergeOlder } from "../web/src/use-history.js";
 import { parseHistory } from "../web/src/conversation-rows.js";
 import { reactFailure, sendFailure } from "../web/src/composer.js";
+import { deferred, say } from "../web/src/i18n/message.js";
 import { ApiError } from "../web/src/api.js";
 
 const msg = (id: string, content = id, extra: Partial<HistoryMessage> = {}): HistoryMessage =>
@@ -60,22 +61,28 @@ describe("parseHistory", () => {
 });
 
 describe("send and reaction failures", () => {
+  const unknown = deferred.t("chat:request.unknown", { agent: "Tomo" });
   it("a named refusal is definite: the draft is kept, nothing is left to check", () => {
-    expect(sendFailure(new ApiError(503, "interrupted_backlog"), "unknown")).toMatchObject({ definite: true, warn: true, text: expect.stringContaining("your draft is kept") });
-    expect(sendFailure(new ApiError(413, "too_large"), "unknown")).toMatchObject({ definite: true, text: expect.stringContaining("too large") });
+    const backlog = sendFailure(new ApiError(503, "interrupted_backlog"), unknown);
+    expect(backlog).toMatchObject({ definite: true, warn: true });
+    expect(say(backlog.text)).toContain("your draft is kept");
+    const large = sendFailure(new ApiError(413, "too_large"), unknown);
+    expect(large.definite).toBe(true);
+    expect(say(large.text)).toContain("too large");
     // A group is read-only by design: said plainly, not as a warning.
-    expect(sendFailure(new ApiError(403, "owner_dm_only"), "unknown")).toEqual({ definite: true, warn: false, text: "Group conversations are read-only." });
+    const group = sendFailure(new ApiError(403, "owner_dm_only"), unknown);
+    expect({ ...group, text: say(group.text) }).toEqual({ definite: true, warn: false, text: "Group conversations are read-only." });
   });
   it("anything else may have arrived: the request stays uncertain and the owner checks", () => {
-    expect(sendFailure(new TypeError("network"), "Outcome unknown")).toEqual({ definite: false, warn: true, text: "Outcome unknown" });
-    expect(sendFailure(new ApiError(500, "unavailable"), "Outcome unknown").definite).toBe(false);
+    expect(sendFailure(new TypeError("network"), unknown)).toEqual({ definite: false, warn: true, text: unknown });
+    expect(sendFailure(new ApiError(500, "unavailable"), unknown).definite).toBe(false);
   });
   it("a reaction has no draft to keep", () => {
-    expect(reactFailure(new ApiError(503, "interrupted_backlog"))).toContain("; the reaction was not sent.");
-    // The phrase at the start of a sentence is replaced too, keeping its capital.
-    expect(reactFailure(new ApiError(503, "persist_failed"))).toBe("Not sent: Tomo could not record the message safely. The reaction was not sent; try again.");
-    for (const code of ["interrupted_backlog", "journal_unavailable", "persist_failed"]) expect(reactFailure(new ApiError(503, code))).not.toMatch(/draft/i);
-    expect(reactFailure(new ApiError(409, "epoch_changed"))).toBe("Reaction was not sent. Reconnect or try again.");
-    expect(reactFailure(new TypeError("network"))).toMatch(/may not have been sent/);
+    const react = (err: unknown) => say(reactFailure(err));
+    expect(react(new ApiError(503, "interrupted_backlog"))).toContain("; the reaction was not sent.");
+    expect(react(new ApiError(503, "persist_failed"))).toBe("Not sent: Tomo could not record the message safely. The reaction was not sent; try again.");
+    for (const code of ["interrupted_backlog", "journal_unavailable", "persist_failed"]) expect(react(new ApiError(503, code))).not.toMatch(/draft/i);
+    expect(react(new ApiError(409, "epoch_changed"))).toBe("Reaction was not sent. Reconnect or try again.");
+    expect(react(new TypeError("network"))).toMatch(/may not have been sent/);
   });
 });

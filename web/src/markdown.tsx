@@ -5,7 +5,7 @@ import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
 import { CodeBlock, codeBlockInfo } from "./code-block.js";
 import { LINK_PROPS, safeHref } from "./links.js";
-import { i18n } from "./i18n/index.js";
+import { i18n, useTranslation } from "./i18n/index.js";
 
 /**
  * remark-gfm's parsing half. remark-gfm also registers GFM serializers
@@ -21,10 +21,10 @@ function remarkGfm(this: { data(): object }) {
 // Module constants: the same plugin lists and renderers for every message.
 const PLUGINS = [remarkGfm];
 const PLUGINS_WITH_BREAKS = [remarkGfm, remarkBreaks];
-const COMPONENTS: Components = {
+const markdownComponents: Components = {
   // Remote images would disclose local reading activity. Links require a
   // deliberate click and cannot take control of the local window.
-  img: ({ alt }) => <span className="text-[13px] text-muted-foreground">[Image: {alt || "not loaded"}]</span>,
+  img: ({ alt }) => <span className="text-[13px] text-muted-foreground">{alt ? i18n.t("chat:markdown.image", { alt }) : i18n.t("chat:markdown.imageNotLoaded")}</span>,
   a: ({ href, children }) => safeHref(href)
     ? <a href={href} {...LINK_PROPS}>{children}</a> : <span>{children}</span>,
   input: ({ checked }) => <input type="checkbox" checked={checked ?? false} disabled aria-label={checked ? i18n.t("chat:markdown.done") : i18n.t("chat:markdown.open")} />,
@@ -44,5 +44,7 @@ const COMPONENTS: Components = {
  * parsed again.
  */
 export const Text = memo(function Text({ children, breaks = false }: { children: string; breaks?: boolean }) {
-  return <Markdown remarkPlugins={breaks ? PLUGINS_WITH_BREAKS : PLUGINS} skipHtml components={COMPONENTS}>{children}</Markdown>;
+  // Subscribed, so a language switch re-words its image and checkbox labels and the code copy button.
+  useTranslation();
+  return <Markdown remarkPlugins={breaks ? PLUGINS_WITH_BREAKS : PLUGINS} skipHtml components={markdownComponents}>{children}</Markdown>;
 });

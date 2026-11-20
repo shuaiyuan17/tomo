@@ -24,4 +24,5 @@ export const home = {
   problem: "{{agent}} 最近的改动有问题，显示的是上一个正常的房间。",
   starter: "这是初始房间，{{agent}} 还没布置自己的。",
   viewLabel: "{{label}}。方向键旋转房间，加减号缩放，Home 键重置视角。", resetView: "重置视角", dragHint: "拖动旋转 · 双指缩放",
+  unknownStatus: "暂时不知道 {{agent}} 在做什么",
 } satisfies Translation<typeof en>;

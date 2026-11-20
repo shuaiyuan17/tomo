@@ -78,6 +78,7 @@ export function CronList({ jobs, actions, focus = null }: { jobs: WebCronJob[]; 
   </>;
 }
 
+// i18n-dynamic: cron:error.*
 const CRON_ERRORS: Record<string, `cron:error.${string}`> = {
   cron_changed: "cron:error.cron_changed",
   job_not_found: "cron:error.job_not_found",
@@ -93,20 +94,20 @@ function CronActions({ job, mutator, onDone }: { job: WebCronJob; mutator: Mutat
   const { t } = useTranslation(["cron", "common"]);
   const [open, setOpen] = useState<CronAction | null>(null);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
+  /** The refusal code (worded at render); null: none. */
+  const [error, setError] = useState<string | null>(null);
   const overdueOneShot = job.schedule.kind === "at" && Date.parse(job.schedule.at) <= Date.now();
   const disabled = !mutator.bootstrap || !mutator.live;
   const confirm = async () => {
     if (!open || !mutator.bootstrap) return;
-    setBusy(true); setError("");
+    setBusy(true); setError(null);
     try {
       await mutate(`/cron/${encodeURIComponent(job.id)}`, open === "delete" ? "DELETE" : "PATCH",
         { revision: job.revision, confirm: true, ...(open === "delete" ? {} : { enabled: open === "resume" }) }, mutator.bootstrap, mutator.refresh);
       setOpen(null); onDone();
     } catch (err) {
       const code = err instanceof ApiError ? err.code : "unavailable";
-      // i18n-dynamic: cron:error.*
-      setError(t((CRON_ERRORS[code] ?? "cron:error.other") as "cron:error.other"));
+      setError(code);
       if (code === "cron_changed" || code === "epoch_changed" || code === "job_not_found") onDone();
     } finally { setBusy(false); }
   };
@@ -118,7 +119,7 @@ function CronActions({ job, mutator, onDone }: { job: WebCronJob; mutator: Mutat
   };
   const toggle: CronAction = job.enabled ? "pause" : "resume";
   const iconButton = "size-8 rounded-lg text-muted-foreground max-[600px]:size-10 hover:bg-foreground/[0.07] hover:text-foreground";
-  return <AlertDialog open={open !== null} onOpenChange={(value) => { if (!value && !busy) { setOpen(null); setError(""); } }}>
+  return <AlertDialog open={open !== null} onOpenChange={(value) => { if (!value && !busy) { setOpen(null); setError(null); } }}>
     <div className="flex shrink-0 items-center gap-1">
       <AlertDialogTrigger asChild><Button variant="ghost" size="icon" className={iconButton} disabled={disabled} onClick={() => setOpen(toggle)}
         aria-label={job.enabled ? t("pauseLabel", { name: job.name }) : t("resumeLabel", { name: job.name })} title={job.enabled ? t("pause") : t("resume")}>{job.enabled ? <Pause strokeWidth={1.75} /> : <Play strokeWidth={1.75} />}</Button></AlertDialogTrigger>
@@ -135,10 +136,10 @@ function CronActions({ job, mutator, onDone }: { job: WebCronJob; mutator: Mutat
         <dt className={meta}>{t("session")}</dt><dd className="m-0 font-mono text-xs [overflow-wrap:anywhere]">{job.sessionKey}</dd>
         <dt className={meta}>{t("message")}</dt><dd className="m-0 line-clamp-3 [overflow-wrap:anywhere]">{job.message}</dd>
       </dl>
-      {error && <p className="m-0 text-[13px] text-destructive" role="alert">{error}</p>}
+      {error !== null && <p className="m-0 text-[13px] text-destructive" role="alert">{t((CRON_ERRORS[error] ?? "cron:error.other") as "cron:error.other")}</p>}
       <AlertDialogFooter>
         <AlertDialogCancel disabled={busy} className="rounded-xl">{t("common:action.cancel")}</AlertDialogCancel>
-        <AlertDialogAction disabled={busy || !!error} onClick={(event) => { event.preventDefault(); void confirm(); }}
+        <AlertDialogAction disabled={busy || error !== null} onClick={(event) => { event.preventDefault(); void confirm(); }}
           className={cn("rounded-xl", open === "delete" && "bg-destructive text-white hover:bg-destructive/90")}>{busy ? t("working") : copy[open].action}</AlertDialogAction>
       </AlertDialogFooter>
     </AlertDialogContent>}

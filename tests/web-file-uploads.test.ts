@@ -15,7 +15,7 @@ import { WebData } from "../src/web/data.js";
 import { webSessionId } from "../src/web/owner.js";
 import type { IncomingMessage } from "../src/channels/types.js";
 import { splitAttachments } from "../web/src/attachments.js";
-import { addFiles, captureSend, filedAttachment, formatSize, pastedFiles, replaceItems, type Attachment } from "../web/src/uploads.js";
+import { addFiles, captureSend, filedAttachment, formatSize, pastedFiles, replaceItems, type Attachment , noteText } from "../web/src/uploads.js";
 import { applyRestored, dismissAfterAcceptedSend, missingAttachments, resendAfterDraftChange, resendAfterSend } from "../web/src/pending.js";
 
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
@@ -313,7 +313,7 @@ describe("the page's side", () => {
     const make = (f: File): Attachment => ({ key: `k${n++}`, file: f, preview: "", status: "uploading", progress: 0 });
     const out = addFiles([], [file("notes.md", "text/markdown"), file("a.png", "image/png"), file("huge.zip", "application/zip", 33 * 1024 * 1024)], make, { images: true, files: true });
     expect(out.next.map((item) => item.file.name)).toEqual(["notes.md", "a.png"]);
-    expect(out.note).toContain("Files must be under 32 MB.");
+    expect(noteText(out.note)).toContain("Files must be under 32 MB.");
     expect(addFiles([], [file("notes.md", "text/markdown")], make).next).toHaveLength(0);
     const md = file("notes.md", "text/markdown");
     expect(pastedFiles([{ kind: "string", type: "text/plain", getAsFile: () => null }, { kind: "file", type: "text/markdown", getAsFile: () => md }])).toEqual([md]);

@@ -32,7 +32,6 @@ export function ScheduledSection({ revision, onNavigate }: { revision: number; o
       const oneShot = job.schedule.kind === "at" || job.deleteAfterRun;
       const Icon = oneShot ? CalendarClock : Repeat;
       return <li key={job.id}>
-        {/* eslint-disable-next-line i18next/no-literal-string -- data only: the schedule and the session key, one per line */}
         <button type="button" onClick={() => go(cronJobHash(job.id))} title={`${job.scheduleLabel}\n${job.sessionKey}`}
           className="block w-full cursor-pointer rounded-xl px-2.5 py-2 text-left transition-colors hover:bg-foreground/[0.06] focus-visible:outline-offset-0">
           <span className="block text-[13px] leading-normal font-medium [overflow-wrap:anywhere]">{job.name}</span>

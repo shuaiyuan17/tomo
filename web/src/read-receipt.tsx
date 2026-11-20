@@ -2,10 +2,11 @@ import { useState } from "react";
 import { Check, CheckCheck } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ReadReceipt } from "./pending.js";
+import { i18n } from "./i18n/index.js";
 
 /** Read receipt text, for the tooltip and assistive tech. */
 export function readReceiptLabel(receipt: ReadReceipt, agent: string): string {
-  return receipt === "read" ? `Read by ${agent}` : receipt === "sent" ? "Sent" : "Queued";
+  return receipt === "read" ? i18n.t("chat:receipt.read", { agent }) : receipt === "sent" ? i18n.t("chat:pending.sent") : i18n.t("chat:pending.queued");
 }
 
 /**

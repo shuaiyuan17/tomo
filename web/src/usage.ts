@@ -1,4 +1,9 @@
 import type { WebUsage, WebUsageWindow } from "../../src/web/protocol.js";
+import { i18n } from "./i18n/index.js";
+import { formatRelative, formatUnit, formatUnitPair } from "./i18n/format.js";
+
+/** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
+// i18n-dynamic: common:usage.state.*
 
 /** Pure helpers for the Plan usage card. */
 
@@ -55,26 +60,29 @@ export function isWarn(window: WebUsageWindow): boolean {
   return window.elevated || (window.percent !== null && window.percent >= USAGE_WARN_PERCENT);
 }
 
-/** "2h 14m", "5d 3h", "12m", "now". */
+/** "2h 14m", "5d 3h", "12m", "now" (in the active locale, through Intl units). */
 export function formatSpan(ms: number): string {
-  if (ms <= 60_000) return ms <= 0 ? "now" : "1m";
+  if (ms <= 0) return i18n.t("common:usage.now");
+  if (ms <= 60_000) return formatUnit(1, "minute");
   const minutes = Math.floor(ms / 60_000), days = Math.floor(minutes / 1440), hours = Math.floor((minutes % 1440) / 60);
-  if (days) return `${days}d ${hours}h`;
-  if (hours) return `${hours}h ${minutes % 60}m`;
-  return `${minutes}m`;
+  if (days) return formatUnitPair(formatUnit(days, "day"), formatUnit(hours, "hour"));
+  if (hours) return formatUnitPair(formatUnit(hours, "hour"), formatUnit(minutes % 60, "minute"));
+  return formatUnit(minutes, "minute");
 }
-export function resetLabel(window: WebUsageWindow, now: number): string | undefined {
+/** "Resets in 2h 14m"; `inline` is the lower-case form shown after a window's name. */
+export function resetLabel(window: WebUsageWindow, now: number, inline = false): string | undefined {
   if (window.resetsAt === null) return undefined;
   const ms = window.resetsAt - now;
-  return ms <= 0 ? "Resetting now" : `Resets in ${formatSpan(ms)}`;
+  if (inline) return ms <= 0 ? i18n.t("common:usage.resettingNowInline") : i18n.t("common:usage.resetsInInline", { span: formatSpan(ms) });
+  return ms <= 0 ? i18n.t("common:usage.resettingNow") : i18n.t("common:usage.resetsIn", { span: formatSpan(ms) });
 }
 export function updatedLabel(updatedAt: number | null, now: number): string {
-  if (updatedAt === null) return "Not updated yet";
+  if (updatedAt === null) return i18n.t("common:usage.notUpdated");
   const ms = Math.max(0, now - updatedAt);
-  if (ms < 60_000) return "Updated just now";
-  const minutes = Math.floor(ms / 60_000);
-  if (minutes < 60) return `Updated ${minutes} min ago`;
-  return `Updated ${Math.floor(minutes / 60)} h ago`;
+  if (ms < 60_000) return i18n.t("common:usage.updatedJustNow");
+  // Whole minutes below an hour, whole hours above.
+  const rounded = ms < 3_600_000 ? Math.floor(ms / 60_000) * 60_000 : Math.floor(ms / 3_600_000) * 3_600_000;
+  return i18n.t("common:usage.updated", { when: formatRelative(-rounded, "narrow") });
 }
 
 /** Main rows (5-hour, 7-day) and per-model rows (shown folded). */
@@ -84,28 +92,33 @@ export function splitWindows(windows: WebUsageWindow[]): { main: WebUsageWindow[
 
 /** Short labels for the main windows. */
 export function windowTitle(window: WebUsageWindow): string {
-  if (!window.scoped && window.group === "session") return "5-hour";
-  if (!window.scoped && window.group === "weekly") return "7-day";
+  if (!window.scoped && window.group === "session") return i18n.t("common:usage.fiveHour");
+  if (!window.scoped && window.group === "weekly") return i18n.t("common:usage.sevenDay");
+  // A scoped window is named by what it is scoped to (model and surface are names, not copy).
+  const scope = [window.model, window.surface].filter(Boolean).join(" · ");
+  if (window.kind === "weekly_scoped" && scope) return scope;
+  if (window.kind === "session" && scope) return i18n.t("common:usage.scoped", { window: i18n.t("common:usage.fiveHour"), scope });
+  // An older daemon, or a kind this page does not know: the daemon's own label.
   return window.label.replace(/^Weekly · /, "");
 }
 
-const MESSAGES: Record<Exclude<WebUsage["state"], "ok">, string> = {
-  empty: "claude.ai returned no usage windows.",
-  api_key: "API-key auth has no subscription limits.",
-  no_token: "No Claude Code login on this machine. Log in with Claude Code.",
-  credentials_unreadable: "Couldn't read the Claude Code login (is the Keychain locked?).",
-  token_expired: "The Claude Code login has expired. Log in again.",
-  refresh_pending: "The login is refreshing. Try again after the next message.",
-  unauthorized: "claude.ai refused the Claude Code login. Log in again.",
-  network: "Couldn't reach claude.ai.",
-  timeout: "claude.ai didn't answer in time.",
-  http_error: "claude.ai returned an error.",
-  bad_response: "claude.ai sent a response that couldn't be read.",
-  unavailable: "Usage isn't available here.",
-};
+const MESSAGES = {
+  empty: "common:usage.state.empty",
+  api_key: "common:usage.state.api_key",
+  no_token: "common:usage.state.no_token",
+  credentials_unreadable: "common:usage.state.credentials_unreadable",
+  token_expired: "common:usage.state.token_expired",
+  refresh_pending: "common:usage.state.refresh_pending",
+  unauthorized: "common:usage.state.unauthorized",
+  network: "common:usage.state.network",
+  timeout: "common:usage.state.timeout",
+  http_error: "common:usage.state.http_error",
+  bad_response: "common:usage.state.bad_response",
+  unavailable: "common:usage.state.unavailable",
+} as const satisfies Record<Exclude<WebUsage["state"], "ok">, string>;
 /** What to say for a state other than ok; undefined for ok. */
 export function usageNotice(usage: WebUsage): string | undefined {
-  return usage.state === "ok" ? undefined : MESSAGES[usage.state];
+  return usage.state === "ok" ? undefined : i18n.t(MESSAGES[usage.state]);
 }
 
 /**

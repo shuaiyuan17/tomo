@@ -11,8 +11,10 @@ import { useLayoutEffect, useRef } from "react";
 import { TerminalIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { stripAnsi } from "../../subagent.js";
+import { useTranslation } from "../../i18n/index.js";
 
 export function Terminal({ output, size, className }: { output: string; size: number; className?: string }) {
+  const { t } = useTranslation("chat");
   const body = useRef<HTMLPreElement>(null);
   const pinned = useRef(true);
   useLayoutEffect(() => {
@@ -22,8 +24,8 @@ export function Terminal({ output, size, className }: { output: string; size: nu
   const tailOnly = size > new TextEncoder().encode(output).length;
   return <div className={cn("overflow-hidden rounded-xl border bg-card", className)}>
     <div className="flex items-center gap-2 border-b px-3 py-1.5 font-mono text-[10px] text-muted-foreground">
-      <TerminalIcon className="size-3.5" />Output{tailOnly ? " · last part" : ""}</div>
-    <pre ref={body} tabIndex={0} aria-label="Task output" onScroll={() => { const e = body.current!; pinned.current = e.scrollHeight - e.scrollTop - e.clientHeight < 24; }}
-      className="m-0 max-h-[60vh] overflow-auto px-3 py-2 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">{stripAnsi(output) || "(no output yet)"}</pre>
+      <TerminalIcon className="size-3.5" />{tailOnly ? t("trace.outputTail") : t("trace.output")}</div>
+    <pre ref={body} tabIndex={0} aria-label={t("trace.taskOutput")} onScroll={() => { const e = body.current!; pinned.current = e.scrollHeight - e.scrollTop - e.clientHeight < 24; }}
+      className="m-0 max-h-[60vh] overflow-auto px-3 py-2 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">{stripAnsi(output) || t("trace.noOutput")}</pre>
   </div>;
 }

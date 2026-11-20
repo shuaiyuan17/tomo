@@ -5,8 +5,12 @@ import { ApiError, type WebBootstrap } from "./api.js";
 import { Button } from "@/components/ui/button";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
-import { clampGeometry, readGeometry, readScreen, SCREEN_RATES, streamWanted, TITLE_BAR, updatedAgo, windowHeight, writeGeometry,
+import { clampGeometry, pictureAge, readGeometry, readScreen, SCREEN_RATES, streamWanted, TITLE_BAR, updatedAgo, windowHeight, writeGeometry,
   type ScreenGeometry, type ScreenRate } from "./screen-stream.js";
+import { i18n } from "./i18n/index.js";
+
+/** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
+// i18n-dynamic: screen:notice.*
 
 function storedRate(): ScreenRate {
   try { const value = Number(localStorage.getItem("tomo-screen-fps")); return (SCREEN_RATES as readonly number[]).includes(value) ? value as ScreenRate : 1; }
@@ -25,14 +29,12 @@ function usePageVisible(): boolean {
   return visible;
 }
 
-const UNAVAILABLE = "Screen viewing is not available on this machine.";
-const NOTICE: Record<Exclude<WebScreenFrame["status"], "live">, string> = {
-  locked: "The Mac is locked. This is not a live picture.",
-  away: "No one is signed in at the Mac's screen. This is not a live picture.",
-  unconfirmed: "Can't confirm the screen is unlocked, so nothing is being captured.",
-  unavailable: "The screen could not be captured. Tomo may lack the Screen Recording permission.",
-  too_large: "This frame was too large to send.",
-};
+/** The stream's trouble, worded where it is shown. */
+type StreamError = "" | "unavailable" | "reconnecting";
+const NOTICE = {
+  locked: "screen:notice.locked", away: "screen:notice.away", unconfirmed: "screen:notice.unconfirmed",
+  unavailable: "screen:notice.unavailable", too_large: "screen:notice.too_large",
+} as const satisfies Record<Exclude<WebScreenFrame["status"], "live">, string>;
 
 /**
  * The Mac's main display in a floating, non-modal window: read-only, no
@@ -47,7 +49,7 @@ export function ScreenWindow({ bootstrap, refresh, live, compact, onClose }: {
   const [paused, setPaused] = useState(false);
   const [frame, setFrame] = useState<WebScreenFrame>();
   const [image, setImage] = useState<{ src: string; capturedAt: number }>();
-  const [error, setError] = useState("");
+  const [error, setError] = useState<StreamError>("");
   const [now, setNow] = useState(() => Date.now());
   const [geometry, setGeometry] = useState<ScreenGeometry>(() => readGeometry(safeStorage(), viewport()));
   const visible = usePageVisible();
@@ -77,8 +79,8 @@ export function ScreenWindow({ bootstrap, refresh, live, compact, onClose }: {
       }).catch((err: unknown) => {
         if (controller.signal.aborted) return;
         if (err instanceof ApiError && err.code === "epoch_changed") { void refresh().catch(() => {}); return; }
-        if (err instanceof ApiError && err.code === "screen_unavailable") { setError(UNAVAILABLE); return; }
-        setError("Reconnecting…");
+        if (err instanceof ApiError && err.code === "screen_unavailable") { setError("unavailable"); return; }
+        setError("reconnecting");
         retry = setTimeout(open, 3000);
       });
     };
@@ -109,10 +111,11 @@ export function ScreenWindow({ bootstrap, refresh, live, compact, onClose }: {
   const fullscreen = () => { if (document.fullscreenElement) void document.exitFullscreen(); else void picture.current?.requestFullscreen?.(); };
 
   const stale = frame && frame.status !== "live";
-  const status = !live ? "Disconnected" : paused ? "Paused" : !visible ? "Paused (tab hidden)"
-    : error === UNAVAILABLE ? "Unavailable" : error || (frame?.status === "live" ? updatedAgo(frame.capturedAt, now) : frame ? "Not live" : "Connecting…");
+  const errorText = error === "unavailable" ? i18n.t("screen:unavailable") : error === "reconnecting" ? i18n.t("common:connection.reconnecting") : "";
+  const status = !live ? i18n.t("screen:status.disconnected") : paused ? i18n.t("screen:status.paused") : !visible ? i18n.t("screen:status.hidden")
+    : error === "unavailable" ? i18n.t("screen:status.unavailable") : errorText || (frame?.status === "live" ? updatedAgo(frame.capturedAt, now) : frame ? i18n.t("screen:status.notLive") : i18n.t("common:connection.connecting"));
   const iconButton = "size-7 rounded-lg text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground [&_svg:not([class*='size-'])]:size-4";
-  return <div ref={root} id="screen-window" role="dialog" aria-label="Screen, read-only" tabIndex={-1}
+  return <div ref={root} id="screen-window" role="dialog" aria-label={i18n.t("screen:label")} tabIndex={-1}
     onKeyDown={(event) => { if (event.key === "Escape" && !document.fullscreenElement) { event.stopPropagation(); onClose(); } }}
     style={compact ? undefined : { left: geometry.x, top: geometry.y, width: geometry.width, height: windowHeight(geometry.width) }}
     className={cn("fixed z-40 flex flex-col overflow-hidden border bg-card shadow-2xl outline-none",
@@ -120,27 +123,27 @@ export function ScreenWindow({ bootstrap, refresh, live, compact, onClose }: {
     <div onPointerDown={track("move")} style={compact ? undefined : { height: TITLE_BAR }}
       className={cn("flex shrink-0 items-center gap-2 border-b px-3 select-none", compact ? "h-12" : "cursor-grab active:cursor-grabbing")}>
       <i className={cn("size-1.5 shrink-0 rounded-full border border-muted-foreground", streaming && frame?.status === "live" && "border-primary bg-primary")} />
-      <span className="text-[13px] font-medium">Screen</span>
+      <span className="text-[13px] font-medium">{i18n.t("common:header.screen")}</span>
       <span className="min-w-0 flex-1 truncate text-[11px] tracking-[0.02em] text-muted-foreground" role="status" aria-live="polite">{status}</span>
-      <ToggleGroup type="single" aria-label="Frame rate" value={String(rate)} onValueChange={(value) => { if (value) setRate(Number(value) as ScreenRate); }}
+      <ToggleGroup type="single" aria-label={i18n.t("screen:rate")} value={String(rate)} onValueChange={(value) => { if (value) setRate(Number(value) as ScreenRate); }}
         className="rounded-lg bg-foreground/[0.05] p-0.5">
-        {SCREEN_RATES.map((value) => <ToggleGroupItem key={value} value={String(value)} aria-label={`${value} frames per second`} title={`${value} fps`}
+        {SCREEN_RATES.map((value) => <ToggleGroupItem key={value} value={String(value)} aria-label={i18n.t("screen:rateLabel", { count: value })} title={i18n.t("screen:fps", { value })}
           className="h-6 rounded-md! px-1.5 text-[11px] tracking-[0.02em] tabular-nums text-muted-foreground hover:bg-transparent hover:text-foreground data-[state=on]:bg-card data-[state=on]:text-foreground data-[state=on]:shadow-sm dark:data-[state=on]:bg-foreground/[0.13]">{value}</ToggleGroupItem>)}
       </ToggleGroup>
       <Button variant="ghost" size="icon" className={iconButton} onClick={() => setPaused((value) => !value)} aria-pressed={paused}
-        aria-label={paused ? "Resume" : "Pause"} title={paused ? "Resume" : "Pause"}>{paused ? <Play strokeWidth={1.75} /> : <Pause strokeWidth={1.75} />}</Button>
-      <Button variant="ghost" size="icon" className={iconButton} onClick={fullscreen} aria-label="Full screen" title="Full screen" disabled={!image}><Maximize2 strokeWidth={1.75} /></Button>
-      <Button variant="ghost" size="icon" className={iconButton} onClick={onClose} aria-label="Close screen" title="Close"><X strokeWidth={1.75} /></Button>
+        aria-label={paused ? i18n.t("cron:resume") : i18n.t("cron:pause")} title={paused ? i18n.t("cron:resume") : i18n.t("cron:pause")}>{paused ? <Play strokeWidth={1.75} /> : <Pause strokeWidth={1.75} />}</Button>
+      <Button variant="ghost" size="icon" className={iconButton} onClick={fullscreen} aria-label={i18n.t("screen:fullscreen")} title={i18n.t("screen:fullscreen")} disabled={!image}><Maximize2 strokeWidth={1.75} /></Button>
+      <Button variant="ghost" size="icon" className={iconButton} onClick={onClose} aria-label={i18n.t("screen:close")} title={i18n.t("tasks:closeTitle")}><X strokeWidth={1.75} /></Button>
     </div>
     <div ref={picture} onDoubleClick={fullscreen}
       className="relative flex min-h-0 flex-1 items-center justify-center bg-black/[0.04] dark:bg-black/30 [&:fullscreen]:bg-black">
-      {image ? <img src={image.src} alt="The Mac's screen" draggable={false}
-        title="Only the desktop picture, no windows? macOS hides them without the Screen Recording permission."
+      {image ? <img src={image.src} alt={i18n.t("screen:alt")} draggable={false}
+        title={i18n.t("screen:permissionHint")}
         className={cn("block max-h-full max-w-full object-contain", compact && "max-h-[calc(70dvh-48px)]", (stale || paused) && "opacity-50 grayscale")} />
-        : <p className="m-0 px-6 py-10 text-center text-[13px] text-muted-foreground">{frame && frame.status !== "live" ? NOTICE[frame.status] : paused ? "Paused." : error || "Waiting for the first picture…"}</p>}
+        : <p className="m-0 px-6 py-10 text-center text-[13px] text-muted-foreground">{frame && frame.status !== "live" ? i18n.t(NOTICE[frame.status]) : paused ? i18n.t("screen:pausedNote") : errorText || i18n.t("screen:waiting")}</p>}
       {image && (stale || paused) && <span className="absolute top-2 left-2 max-w-[calc(100%-1rem)] rounded-lg bg-card/90 px-2 py-1 text-[11px] text-foreground shadow-sm">
-        {stale ? NOTICE[frame!.status as Exclude<WebScreenFrame["status"], "live">] : "Paused"} · last picture {updatedAgo(image.capturedAt, now).replace("Updated ", "")}</span>}
-      {!compact && <span onPointerDown={track("resize")} aria-hidden="true" title="Resize"
+        {i18n.t("screen:lastPicture", { state: stale ? i18n.t(NOTICE[frame!.status as Exclude<WebScreenFrame["status"], "live">]) : i18n.t("screen:status.paused"), age: pictureAge(image.capturedAt, now) })}</span>}
+      {!compact && <span onPointerDown={track("resize")} aria-hidden="true" title={i18n.t("screen:resize")}
         className="absolute right-0.5 bottom-0.5 size-4 cursor-nwse-resize bg-[linear-gradient(135deg,transparent_42%,var(--muted-foreground)_42%,var(--muted-foreground)_50%,transparent_50%,transparent_67%,var(--muted-foreground)_67%,var(--muted-foreground)_75%,transparent_75%)] opacity-50 transition-opacity hover:opacity-90" />}
     </div>
   </div>;

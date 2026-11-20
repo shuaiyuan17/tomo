@@ -1,9 +1,19 @@
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "./api.js";
+import { i18n } from "./i18n/index.js";
+import { formatCompact, formatDate, formatNumber } from "./i18n/format.js";
+
+/** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
+// i18n-dynamic: study:page.*
 
 export const STUDY_PAGES = ["todos", "memory", "context", "model", "cost", "cron", "mcp", "config"] as const;
 export type StudyPage = typeof STUDY_PAGES[number];
-export const STUDY_LABELS: Record<StudyPage, string> = { todos: "Todos", memory: "Memory", context: "Context", model: "Model", cost: "Cost", cron: "Cron", mcp: "MCP servers", config: "Config" };
+const STUDY_LABELS = {
+  todos: "study:page.todos", memory: "study:page.memory", context: "study:page.context", model: "study:page.model",
+  cost: "study:page.cost", cron: "study:page.cron", mcp: "study:page.mcp", config: "study:page.config",
+} as const satisfies Record<StudyPage, string>;
+/** A Study page's name in the active locale. */
+export function studyLabel(page: StudyPage): string { return i18n.t(STUDY_LABELS[page]); }
 
 /** `#study/<page>[/<item>]`: the Study is linkable and the back button leaves it. */
 const STUDY_HASH = /^#study(?:\/([a-z]+)(?:\/([A-Za-z0-9_-]{1,64}))?)?$/;
@@ -73,11 +83,10 @@ export function formatWhen(ms: number | null | undefined, now = Date.now()): str
   if (!ms) return "—";
   const date = new Date(ms);
   const sameDay = new Date(now).toDateString() === date.toDateString();
-  return sameDay ? date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-    : date.toLocaleDateString([], { month: "short", day: "numeric", ...(date.getFullYear() !== new Date(now).getFullYear() ? { year: "numeric" } : {}) })
-      + " " + date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return sameDay ? formatDate(date, { hour: "2-digit", minute: "2-digit" })
+    : formatDate(date, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", ...(date.getFullYear() !== new Date(now).getFullYear() ? { year: "numeric" } : {}) });
 }
 
 export function formatTokens(value: number): string {
-  return value >= 10_000 ? `${(value / 1000).toFixed(value >= 100_000 ? 0 : 1)}k` : value.toLocaleString();
+  return value >= 10_000 ? formatCompact(value, value >= 100_000 ? 0 : 1) : formatNumber(value);
 }

@@ -2,7 +2,8 @@
 import { useState, type ReactNode } from "react";
 import type { WebCostDay } from "../../src/web/protocol.js";
 import { cn } from "@/lib/utils";
-import { bin, calendarWeeks, longDay, monthOf, niceMax, shortDay, usd } from "./cost.js";
+import { bin, calendarWeeks, longDay, monthOf, niceMax, shortDay, usd, weekdayName } from "./cost.js";
+import { i18n, useTranslation } from "./i18n/index.js";
 
 export const card = "rounded-xl border bg-card shadow-xs";
 export const meta = "text-[11px] tracking-[0.02em] text-muted-foreground";
@@ -17,8 +18,9 @@ export function Section({ title, aside, children, className, label }: { title: s
 
 /** "EST.": every dollar figure on the page is an estimate at API list prices, never a bill. */
 export function Est({ className }: { className?: string }) {
-  return <span title="Estimated at API list prices by the Claude SDK. On a subscription this is not what you pay."
-    className={cn("ml-1.5 rounded-[5px] border px-1 py-px align-middle font-sans text-[10px] font-medium tracking-[0.04em] text-muted-foreground uppercase", className)}>est.</span>;
+  const { t } = useTranslation("cost");
+  return <span title={t("est.title")}
+    className={cn("ml-1.5 rounded-[5px] border px-1 py-px align-middle font-sans text-[10px] font-medium tracking-[0.04em] text-muted-foreground uppercase", className)}>{t("est.label")}</span>;
 }
 
 export function Legend({ items }: { items: { label: string; color: string; hint?: string }[] }) {
@@ -40,11 +42,12 @@ const lastPart = (parts: number[]) => { let last = 0; parts.forEach((p, i) => { 
  */
 export function Columns({ columns, colors, names, height = 150, format = usd, labelEvery }: { columns: Column[]; colors: string[]; names: string[]; height?: number;
   format?: (v: number) => string; labelEvery?: (index: number) => boolean }) {
+  const { t } = useTranslation("cost");
   const [hover, setHover] = useState<number | null>(null);
   const scale = niceMax(Math.max(0, ...columns.map((c) => sum(c.parts))));
   const lines = [0, scale / 2, scale];
   const active = hover != null ? columns[hover] : null;
-  return <div className="relative" role="group" aria-label="Cost by hour">
+  return <div className="relative" role="group" aria-label={t("byHourLabel")}>
     <div className="relative ml-9" style={{ height }}>
       {lines.map((value) => <div key={value} className="absolute right-0 -left-9 flex items-center" style={{ bottom: `${(value / scale) * 100}%`, transform: "translateY(50%)" }}>
         <span className="w-8 pr-1.5 text-right text-[10.5px] tabular-nums text-muted-foreground">{format(value)}</span>
@@ -85,11 +88,12 @@ export function Ranked({ rows, color = "var(--series-1)", format = usd, label }:
   </li>)}</ul>;
 }
 
-const WEEKDAYS = ["Mon", "", "Wed", "", "Fri", "", "Sun"];
+/** Every other weekday is labelled: Mon, Wed, Fri, Sun. */
+const WEEKDAY_LABELED = [true, false, true, false, true, false, true];
 const OVERCOUNTED = "border border-dashed border-muted-foreground/50";
 function dayTitle(day: WebCostDay): string {
-  if (!day.recorded) return `${shortDay(day.date)}: nothing recorded`;
-  return `${shortDay(day.date)}: ${usd(day.costUsd)}${day.overcounted ? " (over-counted, before the Sep 23 fix)" : ""}`;
+  if (!day.recorded) return i18n.t("cost:heatmap.nothing", { day: shortDay(day.date) });
+  return day.overcounted ? i18n.t("cost:heatmap.overcountedTitle", { day: shortDay(day.date), cost: usd(day.costUsd) }) : i18n.t("cost:heatmap.title", { day: shortDay(day.date), cost: usd(day.costUsd) });
 }
 
 /**
@@ -97,10 +101,11 @@ function dayTitle(day: WebCostDay): string {
  * ledger started is a faint, unpickable cell; an over-counted one a dashed box.
  */
 export function Heatmap({ days, today, selected, onSelect }: { days: readonly WebCostDay[]; today: string; selected: string; onSelect: (date: string) => void }) {
+  const { t } = useTranslation("cost");
   const weeks = calendarWeeks(days, today);
   return <div>
     <div className="flex gap-[3px]">
-      <div className="mr-1 flex flex-col gap-[3px] pt-[18px]" aria-hidden="true">{WEEKDAYS.map((name, i) => <span key={i} className="flex flex-1 items-center text-[10px] text-muted-foreground">{name}</span>)}</div>
+      <div className="mr-1 flex flex-col gap-[3px] pt-[18px]" aria-hidden="true">{WEEKDAY_LABELED.map((labeled, i) => <span key={i} className="flex flex-1 items-center text-[10px] text-muted-foreground">{labeled ? weekdayName(i) : ""}</span>)}</div>
       {weeks.map((week, index) => {
         const first = week.find(Boolean);
         const startsMonth = first && (Number(first.date.slice(8)) <= 7 || index === 0);
@@ -109,15 +114,15 @@ export function Heatmap({ days, today, selected, onSelect }: { days: readonly We
           {week.map((day, weekday) => !day ? <span key={weekday} className="aspect-square w-full" />
             : !day.recorded ? <span key={weekday} title={dayTitle(day)} data-day={day.date} className="aspect-square w-full rounded-[4px] bg-foreground/[0.035]" />
             : <button key={weekday} type="button" data-day={day.date} onClick={() => onSelect(day.date)} aria-pressed={selected === day.date}
-              title={dayTitle(day)} aria-label={`${longDay(day.date)}: ${usd(day.costUsd)}${day.overcounted ? ", over-counted" : ""}`}
+              title={dayTitle(day)} aria-label={day.overcounted ? t("heatmap.overcountedLabel", { day: longDay(day.date), cost: usd(day.costUsd) }) : t("heatmap.title", { day: longDay(day.date), cost: usd(day.costUsd) })}
               className={cn("aspect-square w-full cursor-pointer rounded-[4px] transition-transform outline-offset-2 hover:scale-110", selected === day.date && "ring-2 ring-foreground ring-offset-2 ring-offset-card", day.overcounted && OVERCOUNTED)}
               style={{ background: day.overcounted ? "transparent" : `var(--seq-${bin(day.costUsd)})` }} />)}
         </div>;
       })}
     </div>
     <div className="mt-4 flex flex-wrap items-center justify-between gap-x-4 gap-y-2" aria-hidden="true">
-      <span className="flex items-center gap-1.5 text-[10.5px] text-muted-foreground">$0{[0, 1, 2, 3, 4, 5].map((step) => <span key={step} className="size-3 rounded-[3px]" style={{ background: `var(--seq-${step})` }} />)}$200+</span>
+      <span className="flex items-center gap-1.5 text-[10.5px] text-muted-foreground">{usd(0)}{[0, 1, 2, 3, 4, 5].map((step) => <span key={step} className="size-3 rounded-[3px]" style={{ background: `var(--seq-${step})` }} />)}{t("heatmap.top", { cost: usd(200) })}</span>
     </div>
-    {days.some((d) => d.overcounted) && <p className="m-0 mt-2 flex items-center gap-1.5 text-[10.5px] text-muted-foreground"><span className={cn("size-3 shrink-0 rounded-[3px]", OVERCOUNTED)} />over-counted (before #389)</p>}
+    {days.some((d) => d.overcounted) && <p className="m-0 mt-2 flex items-center gap-1.5 text-[10.5px] text-muted-foreground"><span className={cn("size-3 shrink-0 rounded-[3px]", OVERCOUNTED)} />{t("heatmap.overcounted")}</p>}
   </div>;
 }

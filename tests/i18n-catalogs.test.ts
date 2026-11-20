@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { resources as daemonResources } from "../src/i18n/resources.js";
+import { resources as webResources } from "../web/src/i18n/resources.js";
 import { catalogProblems, readSources, type CatalogSet } from "./helpers/i18n-catalogs.js";
 import { LOCALES } from "../src/i18n/locales.js";
 
 /** Every shipped catalog set. tsc already rejects a missing or extra key; this adds placeholders and unused keys. */
 const SETS: CatalogSet[] = [
   { name: "daemon", resources: daemonResources, sources: readSources(["src"]) },
+  { name: "web", resources: webResources, sources: readSources(["web/src"]), defaultNS: "common" },
 ];
 
 // Parsing every source file for translator calls takes a few hundred ms here, more on a slow CI runner.

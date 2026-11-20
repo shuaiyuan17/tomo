@@ -3,14 +3,15 @@ import type { WebBootstrap } from "./api.js";
 import { ApiError, discardUpload, uploadImage } from "./api.js";
 import type { WebFiledFile } from "../../src/web/protocol.js";
 import { addFiles, filedAttachment, isAttachableImage, replaceItems, takeSent, updateAttachment, type Attachment } from "./uploads.js";
+import { i18n } from "./i18n/index.js";
 
 const failure = (error: unknown) => {
-  if (!(error instanceof ApiError)) return "Upload failed";
-  return error.code === "not_image" ? "Not an image this can send"
-    : error.code === "too_large" ? "Too large (images 20 MB, other files 32 MB at most)"
-    : error.code === "uploads_disabled" ? "Attachments are off in config"
-    : error.code === "epoch_changed" ? "Tomo restarted — try again"
-    : error.code === "upload_limit" ? "Too many uploads waiting — send or remove some" : "Upload failed";
+  if (!(error instanceof ApiError)) return i18n.t("chat:attach.failed");
+  return error.code === "not_image" ? i18n.t("chat:attach.error.notImage")
+    : error.code === "too_large" ? i18n.t("chat:attach.error.tooLarge")
+    : error.code === "uploads_disabled" ? i18n.t("chat:attach.error.disabled")
+    : error.code === "epoch_changed" ? i18n.t("chat:attach.error.restarted")
+    : error.code === "upload_limit" ? i18n.t("chat:attach.error.limit") : i18n.t("chat:attach.failed");
 };
 
 /**
@@ -43,7 +44,7 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
   }, [bootstrap]);
 
   const upload = useCallback((item: Attachment) => {
-    if (!bootstrap || !targetId) { commit((old) => updateAttachment(old, item.key, { status: "failed", error: "Not connected" })); return; }
+    if (!bootstrap || !targetId) { commit((old) => updateAttachment(old, item.key, { status: "failed", error: i18n.t("chat:attach.error.offline") })); return; }
     const controller = new AbortController();
     aborts.current.set(item.key, controller);
     commit((old) => updateAttachment(old, item.key, { status: "uploading", progress: 0, error: undefined }));

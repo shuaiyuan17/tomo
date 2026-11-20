@@ -7,7 +7,8 @@ import { TasksPanel } from "./tasks-panel.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
-import { STUDY_LABELS, useStudyRoute } from "./study-data.js";
+import { studyLabel, useStudyRoute } from "./study-data.js";
+import { applyConfiguredLocale, useTranslation } from "./i18n/index.js";
 import { HomePage, useHomeRoute } from "./home/home-page.js";
 import "./styles.css";
 import { useRailWidth } from "./rail-width.js";
@@ -34,6 +35,8 @@ const scrim = "fixed inset-0 top-[72px] compact:top-[calc(3rem+env(safe-area-ins
  */
 export function App() {
   const web = useWeb();
+  const { t, i18n } = useTranslation();
+  useEffect(() => applyConfiguredLocale(web.bootstrap?.locale), [web.bootstrap?.locale]);
   const agent = agentNameOf(web.bootstrap?.agentName);
   const [study, setStudy, studyFocus] = useStudyRoute();
   const home = useHomeRoute() && !study;
@@ -115,8 +118,8 @@ export function App() {
   }), []);
   // The tab says where you are: a Study page or a group being read.
   useEffect(() => {
-    document.title = study ? `${STUDY_LABELS[study]} · The Study · Tomo` : home ? "Home · Tomo" : session?.kind === "group" ? `${session.title} · Tomo` : "Tomo";
-  }, [study, home, session?.kind, session?.title]);
+    document.title = study ? t("title.study", { page: studyLabel(study) }) : home ? t("title.home") : session?.kind === "group" ? t("title.group", { title: session.title }) : t("title.app");
+  }, [study, home, session?.kind, session?.title, t, i18n.language]);
 
   const navigate = (target: View) => {
     if (target === "home") window.location.hash = "home";
@@ -124,9 +127,9 @@ export function App() {
   };
   const skipTarget = study ? "study" : home ? "home" : "conversation";
   return <AgentNameContext.Provider value={agent}><div className="flex h-dvh flex-col">
-    <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href={`#${skipTarget}`} onClick={(e) => { e.preventDefault(); document.getElementById(skipTarget)?.focus(); }}>{study ? `Skip to ${STUDY_LABELS[study]}` : home ? "Skip to Home" : "Skip to conversation"}</a>
+    <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href={`#${skipTarget}`} onClick={(e) => { e.preventDefault(); document.getElementById(skipTarget)?.focus(); }}>{study ? t("skip.to", { target: studyLabel(study) }) : home ? t("skip.home") : t("skip.conversation")}</a>
     <AppHeader headerRef={header} view={view} connection={web.connection}
-      phoneTitle={home ? "Home" : !study && session?.kind === "group" ? session.title : undefined}
+      phoneTitle={home ? t("nav.home") : !study && session?.kind === "group" ? session.title : undefined}
       menu={{ ref: menuButton, pressed: drawer, onToggle: () => { setTasksOpen(false); setHomeChatOpen(false); setMenuOpen((open) => !open); } }}
       chat={home ? { ref: chatButton, pressed: chatPanel, unread: chatUnread, onToggle: () => { setMenuOpen(false); if (overlay) setTasksOpen(false); setHomeChatOpen((open) => !open); } } : undefined}
       tasks={{ ref: tasksButton, pressed: tasksOpen, running, onToggle: () => { setMenuOpen(false); if (overlay) setHomeChatOpen(false); setTasksOpen((open) => !open); } }}
@@ -136,7 +139,7 @@ export function App() {
         className="fixed inset-0 top-[calc(3rem+env(safe-area-inset-top))] z-20 bg-black/20 transition-opacity dark:bg-black/45 duration-[220ms] data-[state=closed]:opacity-0" />}
       <Sidebar sidebarRef={sidebar} view={view} onNavigate={navigate} drawer={drawer} phone={phone} inert={tasksModal || chatModal}
         sessions={sessions} ownerId={ownerId} session={session} onSelect={setSelected} closeDrawer={closeMenu} theme={theme} onTheme={setTheme} web={web} />
-      {study && <ChunkBoundary what="The Study" className="min-h-0 min-w-0 flex-1"><Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} focus={studyFocus} cronRevision={web.cronRevision}
+      {study && <ChunkBoundary what={t("nav.study")} className="min-h-0 min-w-0 flex-1"><Study page={study} onPage={(page) => setStudy(page)} session={session} reload={web.revision} inert={modal} focus={studyFocus} cronRevision={web.cronRevision}
         mutator={{ bootstrap: web.bootstrap, refresh: web.refreshBootstrap, live: web.connection === "live" }} /></ChunkBoundary>}
       {home && <HomePage events={web.home} bootstrap={web.bootstrap} refresh={web.refreshBootstrap} inert={modal} />}
       {chatModal && <div aria-hidden="true" data-testid="chat-scrim" onClick={closeChat} className={`${scrim} motion-enter`} />}
@@ -149,7 +152,7 @@ export function App() {
           mounted for the closing transition. */}
       {railMotion.mounted && overlay && <div aria-hidden="true" onClick={closeTasks} data-state={railMotion.shown ? "open" : "closed"}
         className={`${scrim} transition-opacity duration-[220ms] data-[state=closed]:opacity-0`} />}
-      {railMotion.mounted && <aside ref={rail} id="tasks-rail" aria-label="Tasks" data-state={railMotion.shown ? "open" : "closed"} {...(modal ? { role: "dialog", "aria-modal": true } : {})}
+      {railMotion.mounted && <aside ref={rail} id="tasks-rail" aria-label={t("header.tasks")} data-state={railMotion.shown ? "open" : "closed"} {...(modal ? { role: "dialog", "aria-modal": true } : {})}
         style={railSize.width !== null ? { width: railSize.width } : undefined}
         className="group/rail relative flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 max-[1024px]:fixed max-[1024px]:top-[72px] compact:top-[calc(3rem+env(safe-area-inset-top))] max-[1024px]:right-0 max-[1024px]:bottom-0 max-[1024px]:z-30 max-[1024px]:w-[min(340px,88vw)] max-[1024px]:bg-background max-[1024px]:pt-3 max-[1024px]:pl-2.5 max-[1024px]:shadow-2xl max-[1024px]:transition-transform max-[1024px]:duration-[220ms] max-[1024px]:data-[state=closed]:translate-x-full max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:pb-[max(1.5rem,env(safe-area-inset-bottom))]">
         <div className="flex min-h-0 min-w-[246px] flex-1 flex-col transition-[opacity,transform] duration-[220ms] min-[1025px]:group-data-[state=closed]/rail:translate-x-4 min-[1025px]:group-data-[state=closed]/rail:opacity-0"><TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks} control={taskControl}
@@ -160,7 +163,7 @@ export function App() {
       {/* While dragging only this guide moves (a transform); the rail and the chat resize once, on release. */}
       {railSize.separator && <div ref={railSize.guide} hidden aria-hidden="true" className="pointer-events-none fixed inset-y-0 left-0 z-40 w-0.5 bg-primary/70" />}
     </div>
-    {screen && <ChunkBoundary what="The screen view" className="fixed right-4 bottom-4 z-40 rounded-xl border bg-card shadow-md"><ScreenWindow bootstrap={web.bootstrap} refresh={web.refreshBootstrap} live={web.connection === "live"} compact={phone} onClose={closeScreen} /></ChunkBoundary>}
+    {screen && <ChunkBoundary what={t("chunk.screen")} className="fixed right-4 bottom-4 z-40 rounded-xl border bg-card shadow-md"><ScreenWindow bootstrap={web.bootstrap} refresh={web.refreshBootstrap} live={web.connection === "live"} compact={phone} onClose={closeScreen} /></ChunkBoundary>}
   </div></AgentNameContext.Provider>;
 }
 

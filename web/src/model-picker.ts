@@ -1,22 +1,24 @@
 import type { WebModelView } from "../../src/web/protocol.js";
+import { i18n } from "./i18n/index.js";
 
 /** What the Study's Model page says when a switch is refused, by error code. */
-const MODEL_ERRORS: Record<string, string> = {
-  turn_in_flight: "{agent} is in the middle of a reply. Try again once it has finished; nothing was changed.",
-  model_changed: "The model changed since this page loaded. The page has been refreshed; review it and try again.",
-  unknown_model: "That is not a model name {agent} recognises. Use an alias from the list or a full model id.",
-  gateway_required: "That model needs a LiteLLM gateway. Set one up with tomo config first.",
-  gateway_unroutable: "The configured ChatGPT subscription gateway only routes chatgpt/* models.",
-  owner_dm_only: "Only your own conversation can be switched from the browser.",
-  owner_setup_required: "No owner is configured yet.",
-  epoch_changed: "{agent} restarted since this page loaded. The page has been refreshed; review it and try again.",
-  persist_failed: "config.json could not be written, so the model is unchanged.",
-  session_not_found: "That conversation is no longer available.",
-  invalid_model_change: "That model name is too long or empty.",
+const MODEL_ERRORS: Record<string, `model:error.${string}`> = {
+  turn_in_flight: "model:error.turn_in_flight",
+  model_changed: "model:error.model_changed",
+  unknown_model: "model:error.unknown_model",
+  gateway_required: "model:error.gateway_required",
+  gateway_unroutable: "model:error.gateway_unroutable",
+  owner_dm_only: "model:error.owner_dm_only",
+  owner_setup_required: "model:error.owner_setup_required",
+  epoch_changed: "model:error.epoch_changed",
+  persist_failed: "model:error.persist_failed",
+  session_not_found: "model:error.session_not_found",
+  invalid_model_change: "model:error.invalid_model_change",
 };
 
 export function modelErrorText(code: string, agent: string): string {
-  return (MODEL_ERRORS[code] ?? "The switch could not be confirmed. Refresh and check the model before trying again.").replaceAll("{agent}", agent);
+  // i18n-dynamic: model:error.*
+  return i18n.t((MODEL_ERRORS[code] ?? "model:error.other") as "model:error.other", { agent });
 }
 
 /** Codes after which the page re-reads the model before anything else. */
@@ -40,17 +42,17 @@ export function pickTarget(view: Pick<WebModelView, "options">, input: string): 
 /** The confirmation for a switch: names both models and when the new one applies. */
 export function switchCopy(from: { id: string; label: string }, to: { id: string; label: string }): { title: string; body: string } {
   return {
-    title: `Switch to ${to.label}?`,
-    body: `This conversation moves from ${from.label} to ${to.label}. It continues on the new model from the next message; the history is kept.`,
+    title: i18n.t("model:confirm.title", { to: to.label }),
+    body: i18n.t("model:confirm.body", { from: from.label, to: to.label }),
   };
 }
 
 /** The Model page's effort line: the level the conversation starts with and where it comes from. */
 export function effortText(effort: WebModelView["effort"]): string {
   switch (effort.source) {
-    case "session": return `${effort.level}, chosen for this conversation (sessionEffortOverrides).`;
-    case "global": return `${effort.level}, the default from config.json.`;
-    case "sdk-default": return "not set; the model's own default applies.";
-    case "not-supported": return "not sent; this model does not take an effort setting.";
+    case "session": return i18n.t("model:effort.session", { level: effort.level ?? "" });
+    case "global": return i18n.t("model:effort.global", { level: effort.level ?? "" });
+    case "sdk-default": return i18n.t("model:effort.sdkDefault");
+    case "not-supported": return i18n.t("model:effort.notSupported");
   }
 }

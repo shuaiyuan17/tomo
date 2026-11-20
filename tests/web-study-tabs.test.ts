@@ -8,7 +8,7 @@ import { join } from "node:path";
 describe("Study tab strip", () => {
   it("scrolls horizontally only", () => {
     const source = readFileSync(join(__dirname, "..", "web", "src", "study.tsx"), "utf8");
-    const line = source.split("\n").find((l) => l.includes('aria-label="Study sections"')) ?? "";
+    const line = source.split("\n").find((l) => l.includes('aria-label={t("sections")}')) ?? "";
     expect(line).toContain("overflow-x-auto");
     expect(line).toContain("overflow-y-hidden");
     expect(line).toContain("touch-pan-x");

@@ -1,0 +1,68 @@
+import type { Translation } from "../../../../../src/i18n/catalog.js";
+import type { common as en } from "../en/common.js";
+
+export const common = {
+  title: { app: "Tomo", home: "小屋 · Tomo", study: "{{page}} · 书房 · Tomo", group: "{{title}} · Tomo" },
+  skip: { to: "跳到{{target}}", home: "跳到小屋", conversation: "跳到对话" },
+  nav: { conversation: "对话", home: "小屋", study: "书房" },
+  action: { cancel: "取消", reload: "重新加载" },
+  state: { loading: "加载中…" },
+  format: { unitPair: "{{first}}{{second}}", separator: " · ", range: "{{from}} – {{to}}", listSeparator: "、" },
+  chunk: { failed: "{{what}}没加载出来，刷新页面再试一次。", screen: "屏幕画面" },
+  connection: { live: "已连接", locked: "需要访问链接", connecting: "连接中…", reconnecting: "重新连接中…" },
+  header: {
+    menu: "菜单", menuLabel: "菜单：对话、书房、用量和主题", homeLink: "Tomo 首页",
+    chat: "在房间旁打开对话", chatUnread: "在房间旁打开对话，有新消息",
+    tasks: "任务", tasksRunning_other: "任务，{{count}} 个进行中",
+    screen: "屏幕", screenLabel: "屏幕（只读实时画面）",
+  },
+  tasksRail: { resize: "调整任务面板宽度" },
+  sidebar: {
+    label: "对话详情", workspace: "工作区", conversations: "你的对话", session: "Session",
+    readOnly: "只读", groupNote: "共享的聊天记录。消息需要从群所在的聊天应用里发送。",
+    groupTitle: "{{title}} · 只读", noSession: "没有可用的 session", mainSession: "主 session",
+    picker: "对话", mainTag: "主", readOnlyTag: "只读",
+  },
+  context: {
+    heading: "上下文窗口", estimated: "估算的 token 数，最近一轮", reported: "上报的 token 数，最近一轮",
+    progress: "已用上下文 token", unavailable: "暂无数据", empty: "有一轮对话上报上下文窗口后，这里会显示用量。",
+  },
+  theme: { heading: "主题", label: "颜色主题", system: "跟随系统", light: "浅色", dark: "深色" },
+  language: { heading: "语言", default: "默认" },
+  usage: {
+    heading: "套餐用量", refresh: "刷新", refreshLabel: "刷新套餐用量", refreshTitle: "刷新 · {{updated}}",
+    unreachable: "连不上 Tomo，拿不到用量。", locked: "连接后显示。",
+    byModel_other: "按模型（{{count}}）",
+    stale: "{{notice}}显示的是上一次的数据。", rowLabel: "{{title}}用量",
+    scoped: "{{window}} · {{scope}}", fiveHour: "5 小时", sevenDay: "7 天", now: "现在",
+    resetsIn: "{{span}}后重置", resettingNow: "正在重置", resetsInInline: "{{span}}后重置", resettingNowInline: "正在重置",
+    notUpdated: "还没更新", updatedJustNow: "刚刚更新", updated: "{{when}}更新",
+    state: {
+      empty: "claude.ai 没有返回用量窗口。",
+      api_key: "API key 认证没有订阅额度限制。",
+      no_token: "这台机器上没有 Claude Code 登录。请用 Claude Code 登录。",
+      credentials_unreadable: "读不到 Claude Code 的登录信息（钥匙串是不是锁了？）。",
+      token_expired: "Claude Code 登录已过期，请重新登录。",
+      refresh_pending: "登录正在刷新，下一条消息之后再试。",
+      unauthorized: "claude.ai 拒绝了 Claude Code 的登录，请重新登录。",
+      network: "连不上 claude.ai。",
+      timeout: "claude.ai 没有及时响应。",
+      http_error: "claude.ai 返回了错误。",
+      bad_response: "claude.ai 返回的内容无法读取。",
+      unavailable: "这里看不了用量。",
+    },
+  },
+  compact: {
+    label: "压缩上下文", requestedLabel: "已请求压缩…", requested: "已请求…", done: "已压缩",
+    confirm: "让 {{agent}} 现在压缩上下文？", action: "压缩",
+    unverified: "Tomo 已完成，但上下文还没看到减少，可能跳过了（有任务在运行）。",
+    busy_other: "{{count}} 个任务进行中，等它们结束",
+    failed: "压缩没有完成，请再试一次。", declined: "当时有任务在运行，等结束后再试。",
+    error: {
+      tasks_running: "还有任务在运行，等结束后再试。",
+      epoch_changed: "Tomo 重启了，刷新页面后再试。",
+      owner_setup_required: "没有可以压缩的主人 session。",
+      other: "没能让 Tomo 压缩，请再试一次。",
+    },
+  },
+} satisfies Translation<typeof en>;

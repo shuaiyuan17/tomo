@@ -8,6 +8,7 @@ import { useAgentName } from "./agent-name.js";
 import { ApiError, mutate } from "./api.js";
 import { effortText, modelErrorRefreshes, modelErrorText, pickTarget, switchCopy } from "./model-picker.js";
 import { useResource } from "./study-data.js";
+import { useTranslation } from "./i18n/index.js";
 import { card, Empty, meta, Status, type Mutator } from "./study-ui.js";
 
 type ModelRef = { id: string; label: string };
@@ -20,6 +21,7 @@ type ModelRef = { id: string; label: string };
  */
 export function ModelPage({ session, reload, mutator }: { session?: WebSession; reload: number; mutator: Mutator }) {
   const agent = useAgentName();
+  const { t } = useTranslation(["model", "common", "study"]);
   const [resource, refetch] = useResource<WebModelView>(session ? `/models?session=${encodeURIComponent(session.id)}` : null, reload);
   const [target, setTarget] = useState<ModelRef | null>(null);
   const [draft, setDraft] = useState("");
@@ -29,7 +31,7 @@ export function ModelPage({ session, reload, mutator }: { session?: WebSession; 
   const confirmButton = useRef<HTMLButtonElement>(null);
   useEffect(() => { setTarget(null); setResult(null); setError(""); setDraft(""); }, [session?.id]);
   useEffect(() => { if (target) confirmButton.current?.focus(); }, [target]);
-  if (!session) return <Empty>Choose a conversation in the sidebar.</Empty>;
+  if (!session) return <Empty>{t("study:chooseConversation")}</Empty>;
   // A view still loaded for the previously selected conversation is not shown as this one's.
   const view = resource.state === "ready" && resource.value.sessionId === session.id ? resource.value : undefined;
   if (!view) return <Status resource={resource.state === "ready" ? { state: "loading" } : resource} />;
@@ -57,19 +59,19 @@ export function ModelPage({ session, reload, mutator }: { session?: WebSession; 
   const copy = target ? switchCopy(view.model, target) : undefined;
   return <div className="space-y-5">
     <section className={cn(card, "px-6 py-5")} aria-labelledby="model-current">
-      <p className="eyebrow" id="model-current">Model · {session.title}</p>
+      <p className="eyebrow" id="model-current">{t("current", { title: session.title })}</p>
       <p className="mt-2 mb-1 text-2xl">{view.model.label}</p>
       <p className="m-0 font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]">{view.model.id}</p>
       <p className="mt-3 mb-0 text-[13px] text-muted-foreground">{view.overridden
-        ? `Chosen for this conversation. Without that choice it would use the default, ${view.defaultModel.label}.`
-        : "The default from config.json."}</p>
-      <p className={cn(meta, "mt-2 mb-0")} title="What tomo asks for. The model may run lower if it does not support this level.">Requested effort: {effortText(view.effort)}</p>
-      {view.busy && view.writable && <p className={cn(meta, "mt-2 mb-0")}>{agent} is replying right now. A switch can be made once the reply has finished.</p>}
-      {!view.writable && <p className={cn(meta, "mt-2 mb-0")}>Groups are read-only here. To change a group's model, send /model in that group.</p>}
-      {view.writable && !mutator.live && <p className={cn(meta, "mt-2 mb-0")}>Switching is available while connected.</p>}
+        ? t("overridden", { model: view.defaultModel.label })
+        : t("default")}</p>
+      <p className={cn(meta, "mt-2 mb-0")} title={t("effortTitle")}>{t("effortLine", { effort: effortText(view.effort) })}</p>
+      {view.busy && view.writable && <p className={cn(meta, "mt-2 mb-0")}>{t("busy", { agent })}</p>}
+      {!view.writable && <p className={cn(meta, "mt-2 mb-0")}>{t("readOnly")}</p>}
+      {view.writable && !mutator.live && <p className={cn(meta, "mt-2 mb-0")}>{t("offline")}</p>}
       {result && <p className="mt-3 mb-0 text-[13px]" role="status">{result.status === "switched"
-        ? `Switched from ${result.previous.label} to ${result.model.label}. The next message runs on it.`
-        : `Already on ${result.model.label}; nothing changed.`}</p>}
+        ? t("switched", { from: result.previous.label, to: result.model.label })
+        : t("unchanged", { model: result.model.label })}</p>}
     </section>
 
     {target && copy && <section role="group" aria-labelledby="model-confirm-title" className={cn(card, "rounded-2xl px-6 py-5")}
@@ -77,19 +79,19 @@ export function ModelPage({ session, reload, mutator }: { session?: WebSession; 
       <h2 id="model-confirm-title" className="mt-0 mb-2 font-serif text-[22px] leading-snug font-normal">{copy.title}</h2>
       <p className="mt-0 mb-3 text-[13px] leading-relaxed text-muted-foreground">{copy.body}</p>
       <dl className="m-0 grid grid-cols-[56px_minmax(0,1fr)] gap-x-3 gap-y-1 rounded-xl bg-muted px-4 py-3 text-[13px]">
-        <dt className={meta}>From</dt><dd className="m-0">{view.model.label} <span className="font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]">{view.model.id}</span></dd>
-        <dt className={meta}>To</dt><dd className="m-0">{target.label === target.id ? <span className="font-mono text-xs [overflow-wrap:anywhere]">{target.id}</span>
+        <dt className={meta}>{t("from")}</dt><dd className="m-0">{view.model.label} <span className="font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]">{view.model.id}</span></dd>
+        <dt className={meta}>{t("to")}</dt><dd className="m-0">{target.label === target.id ? <span className="font-mono text-xs [overflow-wrap:anywhere]">{target.id}</span>
           : <>{target.label} <span className="font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]">{target.id}</span></>}</dd>
       </dl>
       {error && <p className="mt-3 mb-0 text-[13px] text-destructive" role="alert">{error}</p>}
       <div className="mt-4 flex justify-end gap-2">
-        <Button variant="outline" className="rounded-xl" disabled={busy} onClick={cancel}>Cancel</Button>
-        <Button ref={confirmButton} className="rounded-xl" disabled={busy || !!error || !canSwitch} onClick={() => void confirm()}>{busy ? "Switching…" : "Switch model"}</Button>
+        <Button variant="outline" className="rounded-xl" disabled={busy} onClick={cancel}>{t("common:action.cancel")}</Button>
+        <Button ref={confirmButton} className="rounded-xl" disabled={busy || !!error || !canSwitch} onClick={() => void confirm()}>{busy ? t("switching") : t("switch")}</Button>
       </div>
     </section>}
 
     <section className={cn(card, "px-6 py-5")} aria-labelledby="model-options">
-      <p className="eyebrow mb-2" id="model-options">Models</p>
+      <p className="eyebrow mb-2" id="model-options">{t("options")}</p>
       <ul className="m-0 list-none divide-y p-0">{view.options.map((option) => {
         const active = option.id === view.model.id;
         return <li key={option.id}>
@@ -99,21 +101,21 @@ export function ModelPage({ session, reload, mutator }: { session?: WebSession; 
             <span className="min-w-0"><span className="block truncate">{option.label}</span>
               <span className={meta}>{option.aliases.join(" · ")}</span></span>
             <span className="font-mono text-xs text-muted-foreground max-[600px]:hidden">{option.id}</span>
-            <span className="flex justify-end">{active && <Check className="size-4 text-primary" strokeWidth={2} aria-label="Active" />}</span>
+            <span className="flex justify-end">{active && <Check className="size-4 text-primary" strokeWidth={2} aria-label={t("active")} />}</span>
           </button></li>;
       })}</ul>
       {view.writable && <form onSubmit={submit} className="mt-4 border-t pt-4">
-        <label htmlFor="model-other" className="mb-1.5 block text-[13px]">Another model</label>
+        <label htmlFor="model-other" className="mb-1.5 block text-[13px]">{t("other")}</label>
         <div className="flex gap-2">
           {/* text-base below md: a focused input under 16px makes iOS Safari zoom the page. */}
           <Input id="model-other" value={draft} onChange={(e) => setDraft(e.target.value)} maxLength={200} autoComplete="off" spellCheck={false}
-            placeholder="Model id, e.g. claude-opus-4-8" disabled={!canSwitch || busy} className="h-10 rounded-xl bg-card font-mono" />
-          <Button type="submit" variant="outline" className="h-10 rounded-xl" disabled={!canSwitch || busy || !draft.trim()}>Switch…</Button>
+            placeholder={t("otherPlaceholder")} disabled={!canSwitch || busy} className="h-10 rounded-xl bg-card font-mono" />
+          <Button type="submit" variant="outline" className="h-10 rounded-xl" disabled={!canSwitch || busy || !draft.trim()}>{t("switchOther")}</Button>
         </div>
         <p className={cn(meta, "mt-2 mb-0")}>{view.gateway.configured
-          ? view.gateway.chatgptOnly ? `The LiteLLM gateway routes chatgpt/* models only, e.g. ${view.gateway.example}.`
-            : `LiteLLM provider/model names are accepted too, e.g. ${view.gateway.example}.`
-          : "Any direct Claude model id is accepted; it is checked before anything is saved."}</p>
+          ? view.gateway.chatgptOnly ? t("gateway.chatgptOnly", { example: view.gateway.example })
+            : t("gateway.litellm", { example: view.gateway.example })
+          : t("gateway.none")}</p>
       </form>}
     </section>
   </div>;

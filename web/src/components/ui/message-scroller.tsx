@@ -9,6 +9,7 @@ import { ArrowDownIcon } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
+import { i18n } from "../../i18n/index.js"
 
 /*
  * shadcn's Message Scroller (new-york-v4), adapted to Tomo:
@@ -117,7 +118,7 @@ function MessageScrollerButton({
         <>
           <ArrowDownIcon />
           <span className="sr-only">
-            {direction === "end" ? "Scroll to end" : "Scroll to start"}
+            {direction === "end" ? i18n.t("chat:scroll.toEnd") : i18n.t("chat:scroll.toStart")}
           </span>
         </>
       )}

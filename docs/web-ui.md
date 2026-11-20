@@ -130,6 +130,10 @@ A sandboxed group's `request_permission` (`src/permissions/broker.ts`) is shown 
 - **`POST /api/v1/permissions/revoke`**, body `{ grantId }` (`G-XXXXXX`; `permissionRevokeSchema`, strict), same gate. RPC `permission-revoke` → `broker.revokeGrant(…, "web")`: removes the grant's path and record from the group's `groupSandbox` entry (config file and live policy) and logs it. `200 { status: "revoked" }`, `404 grant_unknown`, `503 permission_config_unwritable`, `400 invalid_revoke`. An Always allow answered on the card returns its `grantId`. No page uses it yet (the Permissions page is next).
 - **The page** (`web/src/permission-card.tsx`): the group, Read / Write, the path, the reason, the folded trigger, a countdown, Allow once / Always allow / Deny (no second confirmation), and one line saying Allow once covers file reads and writes while shell access needs Always allow. After an Always allow, a small notice keeps the grant ID on screen (copyable) until closed.
 
+## Language
+
+The UI is in English and Simplified Chinese (简体中文). It uses, in order: the language picked under **Language** at the bottom of the sidebar (kept per browser; **Default** forgets the pick), config `locale` (`TOMO_LOCALE`), the browser's own language, else English. Traditional Chinese browsers get English rather than Simplified text. Dates, times and numbers follow the browser's regional format when it speaks the UI language (an en-GB browser keeps day-month dates), else the UI language's own. What Tomo writes (its replies, memory, file names) is shown as written.
+
 ## Phones
 
 Form fields render at 16px on touch devices (iOS Safari zooms the whole page, and stays zoomed, when a focused field's text is smaller). At phone width the header is a single 48px bar and the page respects the safe-area insets (`viewport-fit=cover`). The sidebar (Conversation / Home / The Study, the conversation picker, the context window, Plan usage and the theme switch) is a drawer behind the menu button at the top left, so the chat has the rest of the screen; Home, or a group being read, is named in the header beside the logo. The header's buttons, the drawer's theme switch and its small icon buttons are at least 36px (the header's 44px) to tap. While the page is not connected the header says so in words, not only by the dot. The drawer is a modal layer like the Tasks overlay: the page under it is inert, focus stays in it, Escape or the backdrop closes it, and choosing a destination or a conversation closes it too; it and Tasks are never open together. While the reader is at the end of the conversation the view stays at the end as a picture takes its real height, so a just-sent image is not left cut off.
@@ -208,7 +212,7 @@ npm run web:gallery -- --dir /tmp/gallery-after  # another folder (or GALLERY_DI
 node scripts/ui-gallery.mjs --sheet-only         # rebuild index.html from the PNGs already there
 ```
 
-`--only` keeps the folder's other shots; without it the folder is emptied first. For a before/after comparison, run it from two checkouts (for example a `git worktree` of `main` and your branch) into two folders, then open the two `index.html` files side by side:
+`GALLERY_LOCALE=zh-CN` gives the browser another language (the UI follows it; steps that find a control by its English name then fail and are listed). `--only` keeps the folder's other shots; without it the folder is emptied first. For a before/after comparison, run it from two checkouts (for example a `git worktree` of `main` and your branch) into two folders, then open the two `index.html` files side by side:
 
 ```sh
 (cd ../tomo-main && npm ci && npm run web:gallery -- --dir /tmp/gallery-before)

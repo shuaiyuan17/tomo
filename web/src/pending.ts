@@ -1,4 +1,5 @@
 import type { HistoryPage, WebRequest } from "../../src/web/protocol.js";
+import { i18n } from "./i18n/index.js";
 
 /** Request and turn ids of assistant replies the canonical history records. */
 export function recordedReplyIds(history: HistoryPage): Set<string> {
@@ -12,9 +13,15 @@ export function pendingUserMessages(requests: WebRequest[], history: HistoryPage
   return requests.filter((r) => r.sessionId === sessionId && (r.text || r.images?.length || r.files?.length || r.reply?.reaction || withImages.has(r.requestId)) && !recorded.has(r.requestId) && r.state !== "refused");
 }
 export function pendingLabel(request: WebRequest): string {
-  if (request.joined) return "Joined the running turn";
-  return ({ queued: "Queued", running: "Sent", completed: "Sent", failed: "Not delivered", refused: "Not accepted",
-    unknown: "Outcome unknown — may have run", interrupted: "Interrupted by a restart — may have run" } as const)[request.state];
+  if (request.joined) return i18n.t("chat:pending.joined");
+  switch (request.state) {
+    case "queued": return i18n.t("chat:pending.queued");
+    case "running": case "completed": return i18n.t("chat:pending.sent");
+    case "failed": return i18n.t("chat:pending.failed");
+    case "refused": return i18n.t("chat:pending.refused");
+    case "unknown": return i18n.t("chat:pending.unknown");
+    case "interrupted": return i18n.t("chat:pending.interrupted");
+  }
 }
 /**
  * Badge for a recorded history bubble whose request did not end cleanly, by
@@ -23,7 +30,7 @@ export function pendingLabel(request: WebRequest): string {
 export function historyBadge(requestId: string | undefined, requests: WebRequest[]): string | undefined {
   if (!requestId) return undefined;
   const state = requests.find((r) => r.requestId === requestId)?.state;
-  return state === "interrupted" ? "Interrupted" : state === "unknown" ? "Outcome unknown" : undefined;
+  return state === "interrupted" ? i18n.t("chat:pending.badgeInterrupted") : state === "unknown" ? i18n.t("chat:pending.badgeUnknown") : undefined;
 }
 /** An interrupted request the owner can still resend or dismiss (it has its text). */
 export function awaitingOwner(request: WebRequest): boolean {

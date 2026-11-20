@@ -150,7 +150,7 @@ describe("Plan usage scheduling", () => {
     const local = localizeUsage(answer({ serverNow: server, expiresAt: server + 600_000, updatedAt: server - 120_000,
       windows: [{ id: "s", label: "Session (5h)", group: "session", scoped: false, percent: 1, resetsAt: server + 3_600_000, active: false, elevated: false }] }), browser);
     expect(nextUsageDelay({ usage: local, failed: false, lastAttemptAt: browser }, browser)).toBe(600_000 + USAGE_MARGIN_MS);
-    expect(updatedLabel(local.updatedAt, browser)).toBe("Updated 2 min ago");
+    expect(updatedLabel(local.updatedAt, browser)).toBe("Updated 2m ago");
     expect(resetLabel(local.windows[0], browser)).toBe("Resets in 1h 0m");
   });
   it("a tab back after the expiry reads at once; before it, waits only until then", () => {
@@ -181,7 +181,7 @@ describe("Plan usage card helpers", () => {
     expect(resetLabel(w({ resetsAt: 1_000 + 134 * 60_000 }), 1_000)).toBe("Resets in 2h 14m");
     expect(resetLabel(w({ resetsAt: null }), 0)).toBeUndefined();
     expect([updatedLabel(null, 0), updatedLabel(0, 59_000), updatedLabel(0, 5 * 60_000), updatedLabel(0, 3 * 3_600_000)])
-      .toEqual(["Not updated yet", "Updated just now", "Updated 5 min ago", "Updated 3 h ago"]);
+      .toEqual(["Not updated yet", "Updated just now", "Updated 5m ago", "Updated 3h ago"]);
   });
   it("has a distinct notice per failure", () => {
     const base = { windows: [], fetchedAt: 0, updatedAt: null, nextRefreshAt: 0, expiresAt: 0, serverNow: 0 };

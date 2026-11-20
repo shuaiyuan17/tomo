@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { WebRateLimit, WebRequest, WebTurnStatus } from "../../src/web/protocol.js";
-import { modelLabel } from "./tasks.js";
+import { formatElapsed, modelLabel } from "./tasks.js";
+import { i18n } from "./i18n/index.js";
 
 /** How long "Completed" stays before it fades out (plus the fade itself). */
 export const COMPLETED_VISIBLE_MS = 2000;
@@ -8,12 +9,11 @@ export const COMPLETED_FADE_MS = 200;
 
 /** The request states as the status line words them, naming the agent (see agent-name.ts). */
 export function requestLabels(agent = "Tomo"): Record<WebRequest["state"], string> {
-  return { queued: "Queued", running: `${agent} is working…`, completed: "Completed",
-    failed: "Delivery failed — check the conversation before sending again", refused: "Message was not accepted",
-    unknown: `Outcome unknown — ${agent} may already have acted on it. Check the conversation before sending again`,
-    interrupted: `Interrupted by a restart and not answered — ${agent} may have started on it. Check before sending again` };
+  return { queued: i18n.t("chat:request.queued"), running: i18n.t("chat:request.running", { agent }), completed: i18n.t("chat:request.completed"),
+    failed: i18n.t("chat:request.failed"), refused: i18n.t("chat:request.refused"),
+    unknown: i18n.t("chat:request.unknown", { agent }),
+    interrupted: i18n.t("chat:request.interrupted", { agent }) };
 }
-export const REQUEST_LABELS = requestLabels();
 /** The typing indicator's activity value; the status line words it with the agent's name. */
 export const TYPING_ACTIVITY = "typing";
 
@@ -30,28 +30,28 @@ export interface ComposerNote { text: string; at: string; warn?: boolean }
 export interface TurnStatus { status: WebTurnStatus; at: number }
 
 /** The SDK's typed API errors, as the owner should read them. */
-const ERROR_TEXT: Record<string, string> = {
-  authentication_failed: "Claude login expired. Send /login to sign in again",
-  oauth_org_not_allowed: "This Claude account's organization is not allowed here",
-  account_on_hold: "The Claude account is on hold",
-  verification_required: "The Claude account needs verification",
-  billing_error: "Billing problem on the Claude account",
-  rate_limit: "Usage limit reached",
-  overloaded: "Claude is overloaded",
-  invalid_request: "The request was rejected as invalid",
-  model_not_found: "This model is not available",
-  server_error: "Claude had a server error",
-  max_output_tokens: "The reply hit the output limit",
-  cloud_credential_error: "Cloud credentials were rejected",
+const ERROR_TEXT: Record<string, `chat:apiError.${string}`> = {
+  authentication_failed: "chat:apiError.authentication_failed",
+  oauth_org_not_allowed: "chat:apiError.oauth_org_not_allowed",
+  account_on_hold: "chat:apiError.account_on_hold",
+  verification_required: "chat:apiError.verification_required",
+  billing_error: "chat:apiError.billing_error",
+  rate_limit: "chat:apiError.rate_limit",
+  overloaded: "chat:apiError.overloaded",
+  invalid_request: "chat:apiError.invalid_request",
+  model_not_found: "chat:apiError.model_not_found",
+  server_error: "chat:apiError.server_error",
+  max_output_tokens: "chat:apiError.max_output_tokens",
+  cloud_credential_error: "chat:apiError.cloud_credential_error",
 };
-export function errorText(error: string): string { return ERROR_TEXT[error] ?? "The model returned an error"; }
+export function errorText(error: string): string {
+  // i18n-dynamic: chat:apiError.*
+  return i18n.t((ERROR_TEXT[error] ?? "chat:apiError.other") as "chat:apiError.other");
+}
 
 /** "42s", "3m 05s", "1h 02m". */
 export function elapsedLabel(seconds: number): string {
-  const s = Math.max(0, Math.floor(seconds));
-  if (s < 60) return `${s}s`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
-  return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}m`;
+  return formatElapsed(Math.max(0, Math.floor(seconds)) * 1000);
 }
 
 /** `mcp__server__tool` reads as "tool"; built-in names stay. */
@@ -67,12 +67,12 @@ export const TOOL_PROGRESS_SHOWN_AFTER_S = 10;
 export function turnDetail(turn: TurnStatus | undefined, now: number): string {
   if (!turn) return "";
   const { status } = turn;
-  if (status.kind === "retry") return `Retrying ${status.attempt}/${status.max} · ${errorText(status.error).toLowerCase()}`;
+  if (status.kind === "retry") return i18n.t("chat:turn.retrying", { attempt: status.attempt, max: status.max, error: errorText(status.error).toLowerCase() });
   if (status.kind === "tool") {
     const elapsed = status.elapsed + Math.max(0, (now - turn.at) / 1000);
     return elapsed >= TOOL_PROGRESS_SHOWN_AFTER_S ? `${toolName(status.tool)} · ${elapsedLabel(elapsed)}` : "";
   }
-  if (status.kind === "refusal" && status.fallbackModel) return `${modelLabel(status.model)} declined · continuing on ${modelLabel(status.fallbackModel)}`;
+  if (status.kind === "refusal" && status.fallbackModel) return i18n.t("chat:turn.declinedContinuing", { model: modelLabel(status.model), fallback: modelLabel(status.fallbackModel) });
   return "";
 }
 
@@ -80,33 +80,36 @@ export function turnDetail(turn: TurnStatus | undefined, now: number): string {
 export function turnOutcome(turn: TurnStatus | undefined): string {
   if (!turn) return "";
   const { status } = turn;
-  if (status.kind === "stopped") return "Stopped";
-  if (status.kind === "error") return `${errorText(status.error)} — not answered`;
+  if (status.kind === "stopped") return i18n.t("chat:turn.stopped");
+  if (status.kind === "error") return i18n.t("chat:turn.error", { error: errorText(status.error) });
   if (status.kind === "refusal") {
-    return status.fallbackModel ? `${modelLabel(status.model)} declined this; answered by ${modelLabel(status.fallbackModel)}`
-      : `${modelLabel(status.model)} declined this request`;
+    return status.fallbackModel ? i18n.t("chat:turn.declinedAnswered", { model: modelLabel(status.model), fallback: modelLabel(status.fallbackModel) })
+      : i18n.t("chat:turn.declined", { model: modelLabel(status.model) });
   }
   return "";
 }
 
 /** A rate-limit window's name as the Plan usage card words it. */
-const LIMIT_NAMES: Record<string, string> = { five_hour: "5-hour limit", seven_day: "Weekly limit", seven_day_opus: "Weekly Opus limit",
-  seven_day_sonnet: "Weekly Sonnet limit", seven_day_overage_included: "Weekly limit", overage: "Extra usage" };
+const LIMIT_NAMES: Record<string, `chat:limit.${string}`> = { five_hour: "chat:limit.fiveHour", seven_day: "chat:limit.weekly", seven_day_opus: "chat:limit.weeklyOpus",
+  seven_day_sonnet: "chat:limit.weeklySonnet", seven_day_overage_included: "chat:limit.weekly", overage: "chat:limit.overage" };
 /** "in 2h 05m" / "in 12 min" / "" when unknown or past. */
 export function resetsIn(resetsAt: number | undefined, now: number): string {
   if (!resetsAt || resetsAt <= now) return "";
   const minutes = Math.ceil((resetsAt - now) / 60_000);
-  if (minutes < 60) return `in ${minutes} min`;
-  if (minutes < 48 * 60) return `in ${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
-  return `in ${Math.round(minutes / 1440)} days`;
+  if (minutes < 60) return i18n.t("tasks:scheduled.inMinutes", { count: minutes });
+  if (minutes < 48 * 60) return i18n.t("chat:limit.inSpan", { span: formatElapsed(minutes * 60_000) });
+  return i18n.t("chat:limit.inDays", { count: Math.round(minutes / 1440) });
 }
 /** The live rate-limit line for the Plan usage card; "" while all is well. `shift`: daemon clock → local. */
 export function rateLimitNotice(limit: WebRateLimit | undefined, now: number): string {
   if (!limit || limit.status === "allowed") return "";
-  const name = (limit.limit && LIMIT_NAMES[limit.limit]) || "Usage limit";
+  // i18n-dynamic: chat:limit.*
+  const name = i18n.t(((limit.limit && LIMIT_NAMES[limit.limit]) || "chat:limit.usage") as "chat:limit.usage");
   const reset = resetsIn(limit.resetsAt, now);
-  if (limit.status === "rejected") return `${name} reached${reset ? ` · resets ${reset}` : ""}`;
-  return `${name} almost reached${limit.utilization !== undefined ? ` · ${limit.utilization}%` : ""}${reset ? ` · resets ${reset}` : ""}`;
+  const parts: string[] = [limit.status === "rejected" ? i18n.t("chat:limit.reached", { name }) : i18n.t("chat:limit.almost", { name })];
+  if (limit.status !== "rejected" && limit.utilization !== undefined) parts.push(`${limit.utilization}%`);
+  if (reset) parts.push(i18n.t("chat:limit.resets", { when: reset }));
+  return parts.join(" · ");
 }
 
 /**

@@ -3,6 +3,8 @@ import { ChevronRight, RefreshCw } from "lucide-react";
 import type { WebRateLimit, WebUsage } from "../../src/web/protocol.js";
 import { rateLimitNotice } from "./composer-status.js";
 import { api } from "./api.js";
+import { useTranslation } from "./i18n/index.js";
+import { formatNumber } from "./i18n/format.js";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Progress } from "@/components/ui/progress";
@@ -19,6 +21,7 @@ export function PlanUsage({ ready, locked, live }: { ready: boolean;
   locked?: boolean;
   /** The rate-limit state the SDK last pushed (`rate_limit_event`): shown at once, and the bars are re-read when it changes. */
   live?: WebRateLimit }) {
+  const { t } = useTranslation();
   const [usage, setUsage] = useState<WebUsage>();
   const [loading, setLoading] = useState(false);
   // The refresh icon spins while loading and finishes its turn instead of
@@ -84,35 +87,36 @@ export function PlanUsage({ ready, locked, live }: { ready: boolean;
   }, [liveKey, ready, load]);
   const liveNotice = rateLimitNotice(live, now);
   const { main, scoped } = splitWindows(usage?.windows ?? []);
-  const notice = failed ? "Couldn't reach Tomo for usage." : usage && usageNotice(usage);
+  const notice = failed ? t("usage.unreachable") : usage && usageNotice(usage);
   return <section className="mt-8 border-t pt-7" aria-labelledby="usage-heading">
     <div className="mb-3 flex items-center justify-between gap-2">
-      <p className="eyebrow m-0" id="usage-heading">Plan usage{usage?.plan ? <span className="normal-case tracking-normal"> · {planName(usage.plan)}</span> : null}</p>
-      <Button variant="ghost" size="icon" aria-label="Refresh plan usage" title={usage ? `Refresh · ${updatedLabel(usage.updatedAt, now)}` : "Refresh"} disabled={loading || !ready} onClick={() => void load(true)}
+      <p className="eyebrow m-0" id="usage-heading">{t("usage.heading")}{usage?.plan ? <span className="normal-case tracking-normal">{t("format.separator")}{planName(usage.plan)}</span> : null}</p>
+      <Button variant="ghost" size="icon" aria-label={t("usage.refreshLabel")} title={usage ? t("usage.refreshTitle", { updated: updatedLabel(usage.updatedAt, now) }) : t("usage.refresh")} disabled={loading || !ready} onClick={() => void load(true)}
         className="-my-1 size-7 rounded-lg text-muted-foreground max-[600px]:-my-2 max-[600px]:size-9 hover:bg-foreground/[0.07] hover:text-foreground [&_svg:not([class*='size-'])]:size-3.5">
         <RefreshCw className={cn(spinning && "animate-spin")} onAnimationIteration={() => { if (!loading) setSpinning(false); }} strokeWidth={1.75} /></Button>
     </div>
     {liveNotice && <p className="m-0 mb-3 text-[12px] leading-relaxed font-medium text-warn" role="status">{liveNotice}</p>}
-    {!usage && !failed && <p className="m-0 text-[13px] text-muted-foreground" role="status">{locked ? "Shown once connected." : "Loading…"}</p>}
+    {!usage && !failed && <p className="m-0 text-[13px] text-muted-foreground" role="status">{locked ? t("usage.locked") : t("state.loading")}</p>}
     {main.length > 0 && <div className="space-y-3.5">{main.map((window) => <UsageRow key={window.id} title={windowTitle(window)} window={window} now={now} />)}</div>}
     {scoped.length > 0 && <Collapsible className="group/models mt-3">
       <CollapsibleTrigger className="flex items-center gap-1 rounded-md px-0.5 py-0.5 text-[12px] max-[600px]:-my-2 max-[600px]:py-2.5 text-muted-foreground transition-colors hover:text-foreground">
-        <ChevronRight className="size-3.5 transition-transform group-data-[state=open]/models:rotate-90" />By model ({scoped.length})</CollapsibleTrigger>
+        <ChevronRight className="size-3.5 transition-transform group-data-[state=open]/models:rotate-90" />{t("usage.byModel", { count: scoped.length })}</CollapsibleTrigger>
       <CollapsibleContent className="mt-2.5 space-y-3">{scoped.map((window) => <UsageRow key={window.id} title={windowTitle(window)} window={window} now={now} compact />)}</CollapsibleContent>
     </Collapsible>}
-    {notice && <p className={cn("m-0 text-[12px] leading-relaxed text-muted-foreground", main.length && "mt-3")} role="status">{usage?.stale ? `${notice} Showing the last reading.` : notice}</p>}
+    {notice && <p className={cn("m-0 text-[12px] leading-relaxed text-muted-foreground", main.length && "mt-3")} role="status">{usage?.stale ? t("usage.stale", { notice }) : notice}</p>}
   </section>;
 }
 
 function UsageRow({ title, window, now, compact }: { title: string; window: WebUsage["windows"][number]; now: number; compact?: boolean }) {
+  const { t } = useTranslation();
   const warn = isWarn(window);
-  const reset = resetLabel(window, now)?.replace(/^R/, "r");
+  const reset = resetLabel(window, now, true);
   return <div>
     <div className="mb-1.5 flex items-baseline justify-between gap-2">
       <span className={cn("min-w-0 truncate text-[13px]", compact && "text-[12px]")}>{title}{reset && <span className="ml-2 text-[11px] text-muted-foreground">{reset}</span>}</span>
-      <span className={cn("text-[13px] tabular-nums", warn ? "font-medium text-warn" : "text-muted-foreground")}>{window.percent === null ? "—" : `${Math.round(window.percent)}%`}</span>
+      <span className={cn("text-[13px] tabular-nums", warn ? "font-medium text-warn" : "text-muted-foreground")}>{window.percent === null ? "—" : formatNumber(Math.round(window.percent) / 100, { style: "percent" })}</span>
     </div>
-    {window.percent !== null && <Progress max={100} value={Math.min(100, Math.max(0, window.percent))} aria-label={`${title} usage`}
+    {window.percent !== null && <Progress max={100} value={Math.min(100, Math.max(0, window.percent))} aria-label={t("usage.rowLabel", { title })}
       className={cn("h-1.5 bg-border", warn && "[&>[data-slot=progress-indicator]]:bg-warn")} />}
   </div>;
 }

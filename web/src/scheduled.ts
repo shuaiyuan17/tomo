@@ -1,4 +1,5 @@
 import type { WebCronJob } from "../../src/web/protocol.js";
+import { i18n, formatLocale as activeLocale } from "./i18n/index.js";
 
 /** How many upcoming jobs the Tasks rail shows. */
 export const SCHEDULED_LIMIT = 5;
@@ -18,14 +19,15 @@ function startOfDay(ms: number): number { const date = new Date(ms); date.setHou
  * (under 6 h the same day), "Today 3:00 PM", "Tomorrow 8:00 AM", "Mon 8:00 AM"
  * (this week), else "Nov 20, 8:00 AM". `locale` is for tests.
  */
-export function formatUntil(at: number, now: number, locale?: string): string {
+export function formatUntil(at: number, now: number, locale: string = activeLocale()): string {
   const diff = at - now;
-  if (diff < MINUTE) return diff < -MINUTE ? "overdue" : "due now";
-  if (diff < 60 * MINUTE) return `in ${Math.round(diff / MINUTE)} min`;
-  const time = new Date(at).toLocaleTimeString(locale, { hour: "numeric", minute: "2-digit" });
+  if (diff < MINUTE) return diff < -MINUTE ? i18n.t("tasks:scheduled.overdue") : i18n.t("tasks:scheduled.dueNow");
+  if (diff < 60 * MINUTE) return i18n.t("tasks:scheduled.inMinutes", { count: Math.round(diff / MINUTE) });
+  const format = (options: Intl.DateTimeFormatOptions) => new Intl.DateTimeFormat(locale, options).format(at);
+  const time = format({ hour: "numeric", minute: "2-digit" });
   const days = Math.round((startOfDay(at) - startOfDay(now)) / 86_400_000);
-  if (days === 0) return diff < 6 * 60 * MINUTE ? `in ${Math.floor(diff / (60 * MINUTE))} h` : `Today ${time}`;
-  if (days === 1) return `Tomorrow ${time}`;
-  if (days < 7) return `${new Date(at).toLocaleDateString(locale, { weekday: "short" })} ${time}`;
-  return `${new Date(at).toLocaleDateString(locale, { month: "short", day: "numeric" })}, ${time}`;
+  if (days === 0) return diff < 6 * 60 * MINUTE ? i18n.t("tasks:scheduled.inHours", { count: Math.floor(diff / (60 * MINUTE)) }) : i18n.t("tasks:scheduled.today", { time });
+  if (days === 1) return i18n.t("tasks:scheduled.tomorrow", { time });
+  if (days < 7) return format({ weekday: "short", hour: "numeric", minute: "2-digit" });
+  return format({ month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 }

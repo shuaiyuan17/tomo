@@ -2,6 +2,8 @@
  * How a message's meta line words its channel and time, and where the
  * conversation gets a day divider. Pure, so it is unit-tested.
  */
+import { i18n, formatLocale as activeLocale } from "./i18n/index.js";
+import { matchLocale } from "../../src/i18n/locales.js";
 
 const CHANNEL_NAMES: Record<string, string> = { web: "Web", telegram: "Telegram", imessage: "iMessage" };
 
@@ -26,7 +28,7 @@ const formatters = new Map<string, Intl.DateTimeFormat>();
  */
 let zone: { name: string; checked: number } | undefined;
 const ZONE_CHECK_MS = 60_000;
-function formatter(shape: "time" | "dateTime", locale: string | undefined): Intl.DateTimeFormat {
+function formatter(shape: "time" | "dateTime", locale: string = activeLocale()): Intl.DateTimeFormat {
   const now = Date.now();
   if (!zone || now - zone.checked >= ZONE_CHECK_MS || now < zone.checked) {
     const name = new Intl.DateTimeFormat().resolvedOptions().timeZone;
@@ -59,10 +61,10 @@ export function differentDay(a: number, b: number): boolean {
 }
 
 /** "Today", "Yesterday", "Wednesday" (within the week), "Sat, Nov 8", or with the year once it is not this year's. */
-export function dayLabel(timestamp: number, now = Date.now(), locale?: string): string {
+export function dayLabel(timestamp: number, now = Date.now(), locale: string = activeLocale()): string {
   const days = Math.round((dayStart(now) - dayStart(timestamp)) / 86_400_000);
-  if (days === 0) return "Today";
-  if (days === 1) return "Yesterday";
+  if (days === 0) return i18n.t("chat:day.today", { lng: matchLocale(locale) ?? undefined });
+  if (days === 1) return i18n.t("chat:day.yesterday", { lng: matchLocale(locale) ?? undefined });
   const date = new Date(timestamp);
   if (days > 1 && days < 7) return date.toLocaleDateString(locale, { weekday: "long" });
   const sameYear = date.getFullYear() === new Date(now).getFullYear();

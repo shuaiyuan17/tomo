@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode, type RefObject } from "react";
 import { CheckIcon, CopyIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useTranslation } from "./i18n/index.js";
 
 /**
  * A fenced code block in rendered markdown: the code as react-markdown
@@ -33,6 +34,7 @@ function CopyButton({ value, fallback }: { value: string; fallback: RefObject<HT
     const timer = setTimeout(() => setCopied(false), 2000);
     return () => clearTimeout(timer);
   }, [copied]);
+  const { t } = useTranslation("chat");
   const copy = () => {
     // Without the async clipboard (a page that is not a secure context), select the code so the reader can copy it.
     const select = () => { const node = fallback.current; const range = document.createRange(); if (!node) return;
@@ -41,11 +43,11 @@ function CopyButton({ value, fallback }: { value: string; fallback: RefObject<HT
     navigator.clipboard.writeText(value).then(() => setCopied(true), select);
   };
   return <>
-    <button type="button" data-slot="code-block-copy-button" aria-label={copied ? "Copied" : "Copy code"} title={copied ? "Copied" : "Copy"} onClick={copy}
+    <button type="button" data-slot="code-block-copy-button" aria-label={copied ? t("actions.copied") : t("actions.copyCode")} title={copied ? t("actions.copied") : t("actions.copy")} onClick={copy}
       className="grid size-6 place-items-center rounded-md bg-background/80 text-muted-foreground ring-1 ring-foreground/10 transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none">
       {copied ? <CheckIcon className="size-3.5" aria-hidden="true" /> : <CopyIcon className="size-3.5" aria-hidden="true" />}
     </button>
-    <span aria-live="polite" className="sr-only">{copied ? "Copied" : ""}</span>
+    <span aria-live="polite" className="sr-only">{copied ? t("actions.copied") : ""}</span>
   </>;
 }
 

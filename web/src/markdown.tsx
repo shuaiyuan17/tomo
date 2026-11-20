@@ -5,6 +5,7 @@ import { gfmFromMarkdown } from "mdast-util-gfm";
 import { gfm } from "micromark-extension-gfm";
 import { CodeBlock, codeBlockInfo } from "./code-block.js";
 import { LINK_PROPS, safeHref } from "./links.js";
+import { i18n } from "./i18n/index.js";
 
 /**
  * remark-gfm's parsing half. remark-gfm also registers GFM serializers
@@ -26,7 +27,7 @@ const COMPONENTS: Components = {
   img: ({ alt }) => <span className="text-[13px] text-muted-foreground">[Image: {alt || "not loaded"}]</span>,
   a: ({ href, children }) => safeHref(href)
     ? <a href={href} {...LINK_PROPS}>{children}</a> : <span>{children}</span>,
-  input: ({ checked }) => <input type="checkbox" checked={checked ?? false} disabled aria-label={checked ? "Completed task" : "Incomplete task"} />,
+  input: ({ checked }) => <input type="checkbox" checked={checked ?? false} disabled aria-label={checked ? i18n.t("chat:markdown.done") : i18n.t("chat:markdown.open")} />,
   pre: ({ node, children }) => <CodeBlock {...codeBlockInfo(node)}>{children}</CodeBlock>,
 };
 

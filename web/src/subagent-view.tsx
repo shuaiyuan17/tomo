@@ -12,8 +12,12 @@ import { Terminal } from "@/components/ai/terminal";
 import { TurnBlock, UnreadableNote } from "./tool-calls.js";
 import { followStep, groupRows, INITIAL_TRANSCRIPT, isOutputTask, POLL_MS, transcriptReducer, viewRows,
   type TranscriptAction } from "./subagent.js";
-import { STATE_LABELS, taskKind } from "./tasks.js";
+import { stateLabel, taskKind } from "./tasks.js";
+import { i18n, useTranslation } from "./i18n/index.js";
 import { useAgentName } from "./agent-name.js";
+
+/** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
+// i18n-dynamic: tasks:control.*
 
 /**
  * While the task runs, poll for new lines every POLL_MS (`after=<end>` reads
@@ -28,10 +32,10 @@ type Status = "loading" | "ready" | "missing" | "error" | "gone";
 /** How the task view acts on a task: the owner conversation's id, and the call that does it. */
 export interface TaskControl { ownerId: string | undefined; act: (task: WebTask, action: TaskAction) => Promise<boolean> }
 
-const ACTION_FAILED: Record<TaskAction, string> = {
-  stop: "Couldn't stop it. It may have just finished.",
-  background: "Couldn't move it. It may have finished, or is no longer in the foreground.",
-};
+const ACTION_FAILED = {
+  stop: "tasks:control.stopFailed",
+  background: "tasks:control.backgroundFailed",
+} as const satisfies Record<TaskAction, string>;
 
 /**
  * Stop, and (for a task the turn is waiting on) Move to background. Shown only for a running task
@@ -39,6 +43,7 @@ const ACTION_FAILED: Record<TaskAction, string> = {
  * success needs no message here.
  */
 function TaskControls({ task, control }: { task: WebTask; control: TaskControl }) {
+  const { t } = useTranslation("tasks");
   const [busy, setBusy] = useState<TaskAction>();
   const [failed, setFailed] = useState<TaskAction>();
   const run = (action: TaskAction) => {
@@ -49,12 +54,12 @@ function TaskControls({ task, control }: { task: WebTask; control: TaskControl }
   return <div className="mb-2 px-1">
     <div className="flex flex-wrap items-center gap-1">
       {!task.background && <Button variant="ghost" size="sm" disabled={!!busy} onClick={() => run("background")} className={button}
-        title="Tomo stops waiting for it; it keeps running and reports back when it is done">
-        <ArrowDownToLine className="size-3.5" strokeWidth={1.75} />Move to background</Button>}
+        title={t("control.backgroundTitle")}>
+        <ArrowDownToLine className="size-3.5" strokeWidth={1.75} />{t("control.background")}</Button>}
       <Button variant="ghost" size="sm" disabled={!!busy} onClick={() => run("stop")} className={button}>
-        <Square className="size-3 fill-current" strokeWidth={1.75} />Stop task</Button>
+        <Square className="size-3 fill-current" strokeWidth={1.75} />{t("control.stop")}</Button>
     </div>
-    {failed && <p role="status" className="m-0 mt-1 px-1.5 text-[11px] leading-snug text-muted-foreground">{ACTION_FAILED[failed]}</p>}
+    {failed && <p role="status" className="m-0 mt-1 px-1.5 text-[11px] leading-snug text-muted-foreground">{i18n.t(ACTION_FAILED[failed])}</p>}
   </div>;
 }
 
@@ -62,21 +67,22 @@ function TaskControls({ task, control }: { task: WebTask; control: TaskControl }
 export function SubagentView({ task, onBack, control }: { task: WebTask; onBack: () => void; control?: TaskControl }) {
   const base = `/sessions/${task.sessionId}/tasks/${encodeURIComponent(task.taskId)}`;
   const running = task.state === "running";
+  const { t } = useTranslation("tasks");
   return <section className="flex min-h-0 flex-1 flex-col" aria-labelledby="subagent-heading">
     <div className="mb-2 flex items-start gap-1.5 pr-2.5">
-      <Button variant="ghost" size="sm" onClick={onBack} aria-label="Back to tasks"
+      <Button variant="ghost" size="sm" onClick={onBack} aria-label={t("back")}
         className="h-8 shrink-0 gap-1 rounded-lg px-2 text-[13px] text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground">
-        <ArrowLeft className="size-4" strokeWidth={1.75} />Tasks</Button>
+        <ArrowLeft className="size-4" strokeWidth={1.75} />{t("heading")}</Button>
     </div>
     <div className="mb-3 px-2.5">
       <h2 id="subagent-heading" className="m-0 text-[15px] leading-snug font-semibold [overflow-wrap:anywhere]">{isShellTask(task.taskType) ? <ShellPill command={task.description} className="text-[12.5px]" />
-        : <>{task.description || "Untitled task"}<ModelBadge model={task.model} className="align-[2px]" /></>}</h2>
-      <p className="m-0 mt-0.5 tracking-[0.02em] text-[10px] text-muted-foreground">{taskKind(task)} · {running ? <><span className="shimmer">Working</span>{task.background && " · background"}</> : STATE_LABELS[task.state]}</p>
+        : <>{task.description || t("untitled")}<ModelBadge model={task.model} className="align-[2px]" /></>}</h2>
+      <p className="m-0 mt-0.5 tracking-[0.02em] text-[10px] text-muted-foreground">{taskKind(task)} · {running ? <><span className="shimmer">{t("working")}</span>{task.background && t("backgroundSuffix")}</> : stateLabel(task.state)}</p>
     </div>
     {running && control && task.sessionId === control.ownerId && <TaskControls task={task} control={control} />}
     {isShellTask(task.taskType) && <CommandBrief base={base} fallback={task.description} />}
     {!isOutputTask(task.taskType) && <Brief base={base} />}
-    {task.summary && running && <p className="m-0 mx-2.5 mb-2 text-[12px] leading-snug text-muted-foreground [overflow-wrap:anywhere]"><span className="font-medium text-foreground/80">Now:</span> {task.summary}</p>}
+    {task.summary && running && <p className="m-0 mx-2.5 mb-2 text-[12px] leading-snug text-muted-foreground [overflow-wrap:anywhere]"><span className="font-medium text-foreground/80">{t("now")}</span> {task.summary}</p>}
     {isOutputTask(task.taskType) ? <OutputTail base={base} running={running} /> : <Transcript base={base} running={running} />}
   </section>;
 }
@@ -175,23 +181,24 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
   const jump = () => { pinned.current = true; apply({ type: "jump" }); };
 
   const agent = useAgentName();
+  const { t } = useTranslation(["tasks", "common"]);
   const rows = viewRows(state.items);
   const blocks = groupRows(rows);
   // The turn still running: everything after the last message sent to the subagent.
   const lastTurn = blocks.map((block) => block.kind).lastIndexOf("message");
   const gone = state.status === "gone";
-  return <div ref={scroll} tabIndex={0} aria-label="Subagent transcript" onScroll={() => { const e = scroll.current!; pinned.current = e.scrollHeight - e.scrollTop - e.clientHeight < 40; }}
+  return <div ref={scroll} tabIndex={0} aria-label={t("transcript.label")} onScroll={() => { const e = scroll.current!; pinned.current = e.scrollHeight - e.scrollTop - e.clientHeight < 40; }}
     className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-2.5 pl-1 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]">
-    {gone && <p role="status" className="m-0 mb-2 ml-1.5 rounded-lg bg-muted/70 px-2.5 py-2 text-[12px] text-muted-foreground">This task has left the panel, so nothing more can be loaded. What was read stays here.</p>}
-    {!gone && state.hasEarlier && <Button variant="outline" size="sm" className="mx-auto mb-2 flex h-7 rounded-full text-[11px]" disabled={loadingOlder} onClick={() => void older()}>{loadingOlder ? "Loading…" : "Load earlier"}</Button>}
+    {gone && <p role="status" className="m-0 mb-2 ml-1.5 rounded-lg bg-muted/70 px-2.5 py-2 text-[12px] text-muted-foreground">{t("transcript.goneKept")}</p>}
+    {!gone && state.hasEarlier && <Button variant="outline" size="sm" className="mx-auto mb-2 flex h-7 rounded-full text-[11px]" disabled={loadingOlder} onClick={() => void older()}>{loadingOlder ? t("common:state.loading") : t("transcript.earlier")}</Button>}
     {state.unreadable && <UnreadableNote className="mb-2 px-1.5" />}
     {(state.status === "loading" || state.status === "missing" || state.status === "error") && !state.items.length && <Note status={state.status} />}
-    {state.status === "ready" && rows.length === 0 && <p className="m-0 px-1.5 text-[13px] text-muted-foreground">{running ? "Nothing yet." : "No recorded steps."}</p>}
+    {state.status === "ready" && rows.length === 0 && <p className="m-0 px-1.5 text-[13px] text-muted-foreground">{running ? t("transcript.nothingYet") : t("transcript.noSteps")}</p>}
     {blocks.map((block, index) => {
       const last = index === blocks.length - 1;
       if (block.kind === "text") return <div key={block.row.id} className="markdown px-1.5 py-1 text-[13px]! leading-relaxed"><Text>{block.row.text + (block.row.truncated ? "\n\n…" : "")}</Text></div>;
       if (block.kind === "message") return <div key={block.row.id} className="my-1.5 ml-1.5 rounded-xl bg-muted px-3 py-2">
-        <p className="m-0 mb-0.5 text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">Message from {agent}</p>
+        <p className="m-0 mb-0.5 text-[10.5px] font-medium tracking-[0.02em] text-muted-foreground">{t("transcript.messageFrom", { agent })}</p>
         <div className="markdown text-[13px]! leading-relaxed"><Text>{block.row.text + (block.row.truncated ? "\n\n…" : "")}</Text></div></div>;
       // A group is running only while it is the last block; a todo list for as long as its turn is the last one.
       const live = running && (block.kind === "todos" ? index > lastTurn : block.kind === "group" ? last : true);
@@ -199,7 +206,7 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
         choices={openGroups} onChoice={(key, value) => setOpenGroups((old) => ({ ...old, [key]: value }))} />;
     })}
     {!gone && state.mode === "browse" && <Button variant="secondary" size="sm" onClick={jump}
-      className="sticky bottom-1 mx-auto mt-2 flex h-7 rounded-full text-[11px] shadow-sm">↓ Jump to latest</Button>}
+      className="sticky bottom-1 mx-auto mt-2 flex h-7 rounded-full text-[11px] shadow-sm">{t("transcript.jump")}</Button>}
   </div>;
 }
 
@@ -215,20 +222,22 @@ function Brief({ base }: { base: string }) {
     void api<SubagentBrief>(`${base}/brief`, { signal: controller.signal }).then(setBrief, () => {});
     return () => controller.abort();
   }, [base]);
+  const { t } = useTranslation("tasks");
   if (!brief) return null;
-  return <section aria-label="Brief" className="mx-2.5 mb-2.5 rounded-lg border bg-card/70 px-2.5 py-2">
+  return <section aria-label={t("brief.heading")} className="mx-2.5 mb-2.5 rounded-lg border bg-card/70 px-2.5 py-2">
     <div className="mb-1 flex items-center justify-between gap-2">
-      <p className="m-0 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">Brief</p>
+      <p className="m-0 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">{t("brief.heading")}</p>
       <button type="button" aria-expanded={open} onClick={() => setOpen((v) => !v)}
-        className="rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground">{open ? "Show less" : "Show more"}</button>
+        className="rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground">{open ? t("brief.less") : t("brief.more")}</button>
     </div>
     <div className={cn("markdown text-[12.5px]! leading-relaxed", open ? "max-h-[40vh] overflow-y-auto pr-1" : "line-clamp-3")}>
-      <Text>{brief.text + (brief.truncated ? "\n\n… (truncated)" : "")}</Text></div>
+      <Text>{brief.truncated ? t("brief.truncated", { text: brief.text }) : brief.text}</Text></div>
   </section>;
 }
 
 function Note({ status }: { status: Status }) {
-  const text = status === "loading" ? "Opening…" : status === "missing" ? "Nothing recorded for this task yet."
-    : status === "gone" ? "This task has left the panel, so nothing more can be loaded." : "This task can't be shown right now.";
+  const { t } = useTranslation("tasks");
+  const text = status === "loading" ? t("note.loading") : status === "missing" ? t("note.missing")
+    : status === "gone" ? t("note.gone") : t("note.error");
   return <p className="m-0 px-1.5 text-[13px] text-muted-foreground" role="status">{text}</p>;
 }

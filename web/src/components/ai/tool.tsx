@@ -12,20 +12,22 @@
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 import { preview } from "../../subagent.js";
+import { useTranslation } from "../../i18n/index.js";
 
 /** A labelled, scrollable block of text with a capped "Show more". */
 export function ToolSection({ label, text, truncated, error }:
   { label: string; text: string; truncated?: boolean; error?: boolean }) {
+  const { t } = useTranslation(["chat", "tasks"]);
   const [expanded, setExpanded] = useState(false);
   const long = preview(text, false).more;
   const shown = preview(text, expanded).text;
   return <div className="space-y-1">
     <p className="m-0 font-mono text-[10px] tracking-[0.12em] text-muted-foreground uppercase">{label}</p>
     <pre className={cn("m-0 max-h-72 overflow-auto rounded-lg px-3 py-2 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]",
-      error ? "bg-destructive/10 text-destructive" : "bg-muted/70 text-foreground")}>{shown || "(empty)"}</pre>
+      error ? "bg-destructive/10 text-destructive" : "bg-muted/70 text-foreground")}>{shown || t("trace.empty")}</pre>
     {(long || truncated) && <p className="m-0 flex items-center gap-2 font-mono text-[10px] text-muted-foreground">
-      {long && <button type="button" className="rounded px-1 underline-offset-2 hover:text-foreground hover:underline" onClick={() => setExpanded((v) => !v)}>{expanded ? "Show less" : "Show more"}</button>}
-      {truncated && (expanded || !long) && <span>Truncated</span>}
+      {long && <button type="button" className="rounded px-1 underline-offset-2 hover:text-foreground hover:underline" onClick={() => setExpanded((v) => !v)}>{expanded ? t("tasks:brief.less") : t("tasks:brief.more")}</button>}
+      {truncated && (expanded || !long) && <span>{t("trace.truncated")}</span>}
     </p>}
   </div>;
 }

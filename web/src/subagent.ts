@@ -1,5 +1,7 @@
 import type { SubagentItem, SubagentPage, TodoEntry, WebSource } from "../../src/web/protocol.js";
 import { safeHref } from "./links.js";
+import { i18n } from "./i18n/index.js";
+import { formatUnit, formatUnitPair } from "./i18n/format.js";
 
 /** Pure state for the read-only subagent view, kept out of React so it is testable. */
 
@@ -160,10 +162,10 @@ export function elapsedSince(start: number | undefined, now: number): string | u
 export function formatDuration(ms: number): string | undefined {
   if (!Number.isFinite(ms) || ms < 1_000) return undefined;
   const seconds = Math.round(ms / 1_000);
-  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 60) return formatUnit(seconds, "second");
   const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return seconds % 60 ? `${minutes}m ${seconds % 60}s` : `${minutes}m`;
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  if (minutes < 60) return seconds % 60 ? formatUnitPair(formatUnit(minutes, "minute"), formatUnit(seconds % 60, "second")) : formatUnit(minutes, "minute");
+  return formatUnitPair(formatUnit(Math.floor(minutes / 60), "hour"), formatUnit(minutes % 60, "minute"));
 }
 
 /** Collapsed tool rows show this much of an input/output; "Show more" reveals the rest (already capped server-side). */
@@ -323,7 +325,7 @@ export function sourcesOf(tools: readonly ToolRow[]): WebSource[] {
 /** A todo list's summary: "3 of 7 done". */
 export function todoSummary(row: Pick<TodosRow, "todos" | "more">): string {
   const done = row.todos.filter((todo) => todo.status === "completed").length;
-  return `${done} of ${row.todos.length + row.more} done`;
+  return i18n.t("chat:trace.todoSummary", { done, count: row.todos.length + row.more });
 }
 
 /** What a todo list shows: the item in progress, what is left, what is done (each in the agent's order). */
@@ -332,30 +334,37 @@ export function todoSections(todos: readonly TodoEntry[]): { active: TodoEntry[]
     done: todos.filter((todo) => todo.status === "completed") };
 }
 
-/** What a tool call was, for counting: [verb, singular, plural]. Anything unlisted is "used N tools". */
-const TOOL_KINDS: Record<string, readonly [string, string, string]> = {
-  Bash: ["ran", "command", "commands"],
-  Read: ["read", "file", "files"],
-  Edit: ["edited", "file", "files"], Write: ["edited", "file", "files"], MultiEdit: ["edited", "file", "files"], NotebookEdit: ["edited", "file", "files"],
-  Grep: ["ran", "search", "searches"], Glob: ["ran", "search", "searches"],
-  WebSearch: ["looked up", "page", "pages"], WebFetch: ["looked up", "page", "pages"],
-  Agent: ["started", "subagent", "subagents"], Task: ["started", "subagent", "subagents"],
-  SubagentMessage: ["heard from", "subagent", "subagents"], BackgroundTask: ["finished", "background task", "background tasks"],
+/** What a tool call did, for counting. Anything unlisted is "used N tools". */
+type ToolKind = "command" | "read" | "edit" | "search" | "page" | "started" | "heard" | "background" | "other";
+const TOOL_KINDS: Record<string, ToolKind> = {
+  Bash: "command", Read: "read",
+  Edit: "edit", Write: "edit", MultiEdit: "edit", NotebookEdit: "edit",
+  Grep: "search", Glob: "search", WebSearch: "page", WebFetch: "page",
+  Agent: "started", Task: "started", SubagentMessage: "heard", BackgroundTask: "background",
 };
-const OTHER_KIND = ["used", "tool", "tools"] as const;
+/** One kind's count in words: "ran 5 commands", "edited a file". */
+function kindText(kind: ToolKind, count: number): string {
+  switch (kind) {
+    case "command": return i18n.t("chat:trace.kind.command", { count });
+    case "read": return i18n.t("chat:trace.kind.read", { count });
+    case "edit": return i18n.t("chat:trace.kind.edit", { count });
+    case "search": return i18n.t("chat:trace.kind.search", { count });
+    case "page": return i18n.t("chat:trace.kind.page", { count });
+    case "started": return i18n.t("chat:trace.kind.started", { count });
+    case "heard": return i18n.t("chat:trace.kind.heard", { count });
+    case "background": return i18n.t("chat:trace.kind.background", { count });
+    case "other": return i18n.t("chat:trace.kind.other", { count });
+  }
+}
 
 /** "Ran 5 commands, read 3 files, edited a file" — by what the calls did, in order of first use. */
 export function groupSummary(tools: ToolRow[]): string {
-  const counts = new Map<string, { kind: readonly [string, string, string]; n: number }>();
+  const counts = new Map<ToolKind, number>();
   for (const tool of tools) {
-    const kind = TOOL_KINDS[tool.name] ?? OTHER_KIND;
-    const key = `${kind[0]} ${kind[1]}`;
-    const entry = counts.get(key) ?? { kind, n: 0 };
-    entry.n++;
-    counts.set(key, entry);
+    const kind = TOOL_KINDS[tool.name] ?? "other";
+    counts.set(kind, (counts.get(kind) ?? 0) + 1);
   }
-  const parts = [...counts.values()].map(({ kind, n }) => `${kind[0]} ${n === 1 ? `${/^[aeiou]/.test(kind[1]) ? "an" : "a"} ${kind[1]}` : `${n} ${kind[2]}`}`);
-  const text = parts.join(", ");
+  const text = [...counts].map(([kind, n]) => kindText(kind, n)).join(i18n.t("common:format.listSeparator"));
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 

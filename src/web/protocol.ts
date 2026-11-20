@@ -151,6 +151,9 @@ export interface TaskOutput { output: string; size: number }
 /** One subscription usage window for the Plan usage card. */
 export interface WebUsageWindow {
   id: string; label: string; group: "session" | "weekly" | "other"; scoped: boolean;
+  /** The endpoint's limit kind and scope, for a client to word the window in its own language
+   *  (`label` is the daemon's English wording; absent on older daemons). */
+  kind?: string; model?: string; surface?: string;
   /** 0–100, or null. */
   percent: number | null;
   /** ms epoch, or null. */

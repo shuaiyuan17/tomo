@@ -270,7 +270,7 @@ describe("browser helpers", () => {
   it("says how fresh the picture is", () => {
     expect(updatedAgo(10_000, 10_500)).toBe("Updated just now");
     expect(updatedAgo(10_000, 17_000)).toBe("Updated 7s ago");
-    expect(updatedAgo(0, 125_000)).toBe("Updated 2 min ago");
+    expect(updatedAgo(0, 125_000)).toBe("Updated 2m ago");
   });
 });
 

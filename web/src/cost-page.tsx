@@ -8,19 +8,26 @@ import { addDays, busiestHour, calendarStart, CATEGORIES, categoryOf, clock, cos
   quotaWindows, resetsIn, share, shortDay, turnMeta, turnTitle, usd, versusTypical } from "./cost.js";
 import { card, Columns, Est, Heatmap, Legend, meta, Ranked, Section, Stat } from "./cost-charts.js";
 import { useResource, type Resource } from "./study-data.js";
+import { i18n, useTranslation } from "./i18n/index.js";
+import { formatDate, formatNumber } from "./i18n/format.js";
 
-const ERRORS: Record<string, string> = { cost_unavailable: "Cost data is not available on this install.", invalid_range: "That day cannot be shown." };
+/** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
+// i18n-dynamic: cost:error.*
+
+const ERRORS: Record<string, "error.cost_unavailable" | "error.invalid_range"> = { cost_unavailable: "error.cost_unavailable", invalid_range: "error.invalid_range" };
 /** Calendar request: far enough back for ten Monday-to-Sunday weeks whatever the browser's own date is. */
 const CALENDAR_SPAN_DAYS = 72;
 const TOP_TURNS = 6;
 type Range = "7" | "30";
 
 function Failed({ resource }: { resource: Resource<unknown> }) {
+  const { t } = useTranslation("cost");
   if (resource.state !== "error") return null;
-  return <div className={cn(card, "px-4 py-3 text-[13px]")} role="alert">{ERRORS[resource.code] ?? "Cost is unavailable right now."}</div>;
+  return <div className={cn(card, "px-4 py-3 text-[13px]")} role="alert">{t(ERRORS[resource.code] ?? "error.other")}</div>;
 }
 
 export function CostPage({ reload, focus }: { reload: number; focus: string | null }) {
+  const { t } = useTranslation("cost");
   const [calendar] = useResource<WebCost>(`/cost?from=${addDays(localDate(), -CALENDAR_SPAN_DAYS)}&top=0`, reload);
   const cal = calendar.state === "ready" ? calendar.value : undefined;
   const today = cal?.glance.today;
@@ -43,8 +50,8 @@ export function CostPage({ reload, focus }: { reload: number; focus: string | nu
   const quota = value.limits ? <QuotaBar limits={value.limits} /> : null;
   if (value.recordedSince === null) return <div className="space-y-4">{quota}
     <div className={cn(card, "px-6 py-10 text-center")} role="status">
-      <p className="m-0 font-serif text-[20px]">Nothing recorded yet</p>
-      <p className="mx-auto mt-2 mb-0 max-w-[420px] text-[13px] leading-relaxed text-muted-foreground">Every turn from now on is written to the usage ledger, and its estimated cost shows up here as soon as it finishes.</p>
+      <p className="m-0 font-serif text-[20px]">{t("empty.heading")}</p>
+      <p className="mx-auto mt-2 mb-0 max-w-[420px] text-[13px] leading-relaxed text-muted-foreground">{t("empty.body")}</p>
     </div></div>;
 
   const calendarDays = value.days.filter((d) => d.date >= calendarStart(value.glance.today));
@@ -52,20 +59,20 @@ export function CostPage({ reload, focus }: { reload: number; focus: string | nu
   return <div className="viz space-y-4">
     {quota}
     <div className="grid grid-cols-[minmax(0,340px)_minmax(0,1fr)] grid-rows-[auto_auto_1fr] items-start gap-4 [grid-template-areas:'cal_day'_'glance_day'_'range_day'] max-[900px]:grid-cols-2 max-[900px]:grid-rows-none max-[900px]:[grid-template-areas:'cal_glance'_'day_day'_'range_range'] max-[600px]:grid-cols-1 max-[600px]:[grid-template-areas:'cal'_'glance'_'day'_'range']">
-      <Section title="Ten weeks" aside={recordedDays < 14 ? `since ${shortDay(localDate(value.recordedSince))}` : "pick a day"} className="[grid-area:cal]">
+      <Section title={t("calendar.heading")} aside={recordedDays < 14 ? t("calendar.since", { day: shortDay(localDate(value.recordedSince)) }) : t("calendar.pick")} className="[grid-area:cal]">
         <Heatmap days={calendarDays} today={value.glance.today} selected={selected!} onSelect={select} />
       </Section>
       <Glance cost={value} onSelect={select} />
       <div className="min-w-0 [grid-area:day]"><DayPanel resource={day} date={selected!} today={value.glance.today} typical={value.glance.typicalDay?.costUsd} /></div>
       <PeriodCards resource={period} range={range} onRange={setRange} />
     </div>
-    <p className={cn(meta, "px-1 leading-relaxed")}>Dollar figures are the Claude SDK's estimate at API list prices. On a subscription you pay a flat fee, so read them as how much work was done, not as a bill. Before Sep 23 resumed sessions were over-counted (#389); those days are shown dashed and never compared.</p>
+    <p className={cn(meta, "px-1 leading-relaxed")}>{t("footnote")}</p>
   </div>;
 }
 
 function CostSkeleton() {
   const block = "animate-pulse rounded-md bg-foreground/[0.05]";
-  return <div className="grid grid-cols-[minmax(0,340px)_minmax(0,1fr)] items-start gap-4 max-[900px]:grid-cols-1" role="status" aria-label="Loading cost">
+  return <div className="grid grid-cols-[minmax(0,340px)_minmax(0,1fr)] items-start gap-4 max-[900px]:grid-cols-1" role="status" aria-label={i18n.t("cost:loading")}>
     <div className={cn(card, "px-6 py-5")}><div className={cn(block, "mb-5 h-3 w-24")} /><div className={cn(block, "aspect-[10/7] w-full")} /></div>
     <div className={cn(card, "px-6 py-6")}><div className={cn(block, "h-3 w-28")} /><div className={cn(block, "mt-3 h-7 w-64")} /><div className={cn(block, "mt-5 h-12 w-40")} /><div className={cn(block, "mt-8 h-[150px] w-full")} /></div>
   </div>;
@@ -76,18 +83,19 @@ function QuotaBar({ limits }: { limits: WebCostLimits }) {
   const windows = quotaWindows(limits.windows);
   if (!windows.length) return null;
   const now = Date.now();
+  const { t } = useTranslation(["cost", "common"]);
   const sampled = Date.parse(limits.sampledAt);
-  return <section aria-label="Plan usage" className={cn(card, "flex flex-wrap items-center gap-x-8 gap-y-3 px-6 py-3.5 max-[600px]:px-4")}>
-    <p className="eyebrow shrink-0 max-[1100px]:w-full" title={Number.isFinite(sampled) ? `Sampled ${new Date(sampled).toLocaleString("en-US")}` : undefined}>Plan usage
-      {Number.isFinite(sampled) && <span className="normal-case tracking-normal"> · as of {new Date(sampled).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })}{now - sampled > 86_400_000 ? `, ${new Date(sampled).toLocaleDateString("en-US", { month: "short", day: "numeric" })}` : ""}</span>}</p>
+  return <section aria-label={t("common:usage.heading")} className={cn(card, "flex flex-wrap items-center gap-x-8 gap-y-3 px-6 py-3.5 max-[600px]:px-4")}>
+    <p className="eyebrow shrink-0 max-[1100px]:w-full" title={Number.isFinite(sampled) ? t("quota.sampled", { when: formatDate(sampled, { dateStyle: "medium", timeStyle: "medium" }) }) : undefined}>{t("common:usage.heading")}
+      {Number.isFinite(sampled) && <span className="normal-case tracking-normal">{t("quota.asOf", { when: formatDate(sampled, now - sampled > 86_400_000 ? { hour: "numeric", minute: "2-digit", month: "short", day: "numeric" } : { hour: "numeric", minute: "2-digit" }) })}</span>}</p>
     <div className="grid min-w-0 flex-1 grid-cols-2 gap-x-8 gap-y-2.5 max-[1100px]:grid-cols-1">{windows.map(({ title, window }) => {
       const percent = Math.min(100, Math.max(0, window.percent!));
       const warn = percent >= 80 || window.status === "elevated" || window.status === "allowed_warning" || window.status === "rejected";
       const reset = resetsIn(window.resetsAt, now);
       return <div key={title} className="flex min-w-0 items-center gap-3">
         <span className="w-12 shrink-0 text-[13px]">{title}</span>
-        <Progress max={100} value={percent} aria-label={`${title} usage`} className={cn("h-1.5 min-w-[60px] flex-1 bg-border", warn && "[&>[data-slot=progress-indicator]]:bg-warn")} />
-        <span className={cn("shrink-0 text-[13px] tabular-nums", warn ? "font-medium text-warn" : "text-muted-foreground")}>{Math.round(percent)}%</span>
+        <Progress max={100} value={percent} aria-label={t("common:usage.rowLabel", { title })} className={cn("h-1.5 min-w-[60px] flex-1 bg-border", warn && "[&>[data-slot=progress-indicator]]:bg-warn")} />
+        <span className={cn("shrink-0 text-[13px] tabular-nums", warn ? "font-medium text-warn" : "text-muted-foreground")}>{formatNumber(Math.round(percent) / 100, { style: "percent" })}</span>
         {reset && <span className={cn(meta, "shrink-0 max-[600px]:hidden")}>{reset}</span>}
       </div>;
     })}</div>
@@ -96,22 +104,24 @@ function QuotaBar({ limits }: { limits: WebCostLimits }) {
 
 function Glance({ cost, onSelect }: { cost: WebCost; onSelect: (date: string) => void }) {
   const { thisWeek, lastWeek, last30, typicalDay, busiestDay } = cost.glance;
+  const { t } = useTranslation("cost");
   const recorded30 = cost.days.filter((d) => d.date >= last30.from && d.recorded).length;
-  return <Section title="At a glance" aside={<><span className="min-[601px]:max-[900px]:hidden">API-equivalent</span><Est /></>} className="[grid-area:glance]">
+  return <Section title={t("glance.heading")} aside={<><span className="min-[601px]:max-[900px]:hidden">{t("glance.apiEquivalent")}</span><Est /></>} className="[grid-area:glance]">
     <div className="grid grid-cols-2 gap-x-4 gap-y-4">
-      <Stat label="This week" value={usd(thisWeek.costUsd)} note={!thisWeek.comparable || !lastWeek.comparable ? "No fair comparison yet"
-        : `${usd(lastWeek.costUsd)} the week before`} />
-      <Stat label="30 days" value={usd(last30.costUsd)} note={!last30.comparable ? "includes over-counted days"
-        : recorded30 > 0 && recorded30 < 30 ? `${recorded30} day${recorded30 === 1 ? "" : "s"} recorded` : `${usd(last30.costUsd / 30)} a day`} />
-      <Stat label="Typical day" value={typicalDay ? usd(typicalDay.costUsd) : "—"} note={typicalDay ? `median, ${typicalDay.days} day${typicalDay.days === 1 ? "" : "s"}` : "no fair days yet"} />
-      <Stat label="Busiest" value={busiestDay ? usd(busiestDay.costUsd) : "—"} note={busiestDay
+      <Stat label={t("glance.thisWeek")} value={usd(thisWeek.costUsd)} note={!thisWeek.comparable || !lastWeek.comparable ? t("glance.noComparison")
+        : t("glance.weekBefore", { cost: usd(lastWeek.costUsd) })} />
+      <Stat label={t("glance.days30")} value={usd(last30.costUsd)} note={!last30.comparable ? t("glance.includesOvercounted")
+        : recorded30 > 0 && recorded30 < 30 ? t("glance.recorded", { count: recorded30 }) : t("glance.perDay", { cost: usd(last30.costUsd / 30) })} />
+      <Stat label={t("glance.typical")} value={typicalDay ? usd(typicalDay.costUsd) : "—"} note={typicalDay ? t("glance.median", { count: typicalDay.days }) : t("glance.noFairDays")} />
+      <Stat label={t("glance.busiest")} value={busiestDay ? usd(busiestDay.costUsd) : "—"} note={busiestDay
         ? <button type="button" className="cursor-pointer underline decoration-primary/40 underline-offset-[3px] hover:decoration-primary" onClick={() => onSelect(busiestDay.date)}>{shortDay(busiestDay.date)}</button>
-        : "no fair days yet"} />
+        : t("glance.noFairDays")} />
     </div>
   </Section>;
 }
 
 function DayPanel({ resource, date, today, typical }: { resource: Resource<WebCost>; date: string; today: string; typical: number | undefined }) {
+  const { t } = useTranslation(["cost", "common"]);
   const value = resource.state === "ready" && resource.value.from === date ? resource.value : undefined;
   const header = (body: ReactNode) => <section key={date} aria-label={longDay(date)} className={cn(card, "motion-enter min-w-0 px-6 py-6 max-[600px]:px-4 max-[600px]:py-5")}>
     <p className="eyebrow">{dayEyebrow(date, today)}</p>
@@ -119,13 +129,13 @@ function DayPanel({ resource, date, today, typical }: { resource: Resource<WebCo
     {body}
   </section>;
   if (resource.state === "error") return header(<div className="mt-4"><Failed resource={resource} /></div>);
-  if (!value) return header(<p className="mt-4 mb-0 text-sm text-muted-foreground" role="status">Loading…</p>);
+  if (!value) return header(<p className="mt-4 mb-0 text-sm text-muted-foreground" role="status">{t("common:state.loading")}</p>);
   const info = value.days[0];
   const turns = value.totals.turns;
   const peak = busiestHour(value.hours);
-  const note = !info?.recorded ? "Nothing was recorded this day: the usage ledger starts later."
-    : info.overcounted ? "Over-counted: until the fix on Sep 23 (#389) a resumed session was charged its whole history, so this day is too high and is never compared."
-    : turns === 0 ? "No turns this day." : undefined;
+  const note = !info?.recorded ? t("dayPanel.notRecorded")
+    : info.overcounted ? t("dayPanel.overcounted")
+    : turns === 0 ? t("dayPanel.noTurns") : undefined;
   const top = value.topTurns;
   const topShare = share(top.reduce((s, t) => s + t.costUsd, 0), value.totals.costUsd);
   return header(<>
@@ -133,16 +143,16 @@ function DayPanel({ resource, date, today, typical }: { resource: Resource<WebCo
       <p className="m-0 text-[48px] leading-none font-semibold tracking-[-0.03em] tabular-nums max-[600px]:text-[40px]" data-testid="day-cost">{usd(value.totals.costUsd)}<Est className="align-[12px]" /></p>
       <p className="m-0 max-w-[360px] pb-1 text-[13px] leading-snug text-muted-foreground">
         {note ?? <>{versusTypical(value.totals.costUsd, typical) && <span className="font-medium text-foreground">{versusTypical(value.totals.costUsd, typical)} · </span>}
-          {turns} turn{turns === 1 ? "" : "s"}{peak !== undefined ? ` · busiest around ${hourLabel(peak)}` : ""}</>}</p>
+          {peak !== undefined ? t("dayPanel.turnsPeak", { count: turns, hour: hourLabel(peak) }) : t("dayPanel.turns", { count: turns })}</>}</p>
     </div>
     {turns > 0 && <>
-      <div className="mt-6 mb-3 flex flex-wrap items-center justify-between gap-2"><Legend items={CATEGORIES.map((c) => ({ label: c.label, color: c.color, hint: c.hint }))} /><span className={meta}>by hour</span></div>
+      <div className="mt-6 mb-3 flex flex-wrap items-center justify-between gap-2"><Legend items={CATEGORIES.map((c) => ({ label: c.label, color: c.color, hint: c.hint }))} /><span className={meta}>{t("byHour")}</span></div>
       <Columns columns={value.hours.map((h) => ({ key: String(h.hour), label: String(h.hour), title: `${hourLabel(h.hour)}–${hourLabel(h.hour + 1)}`,
         parts: CATEGORIES.map((c) => h.byCategory[c.key]) }))} colors={CATEGORIES.map((c) => c.color)} names={CATEGORIES.map((c) => c.label)} labelEvery={(i) => i % 3 === 0} />
     </>}
     {top.length > 0 && <>
-      <h3 className="eyebrow mt-7 mb-1">Where it went</h3>
-      <ol className="m-0 list-none p-0" aria-label="Costliest turns">{top.map((turn) => {
+      <h3 className="eyebrow mt-7 mb-1">{t("dayPanel.whereHeading")}</h3>
+      <ol className="m-0 list-none p-0" aria-label={t("dayPanel.costliest")}>{top.map((turn) => {
         const category = categoryOf(turn.category);
         return <li key={`${turn.ts}:${turn.session.label}`} className="flex items-baseline gap-3 border-b py-2.5 last:border-b-0">
           <span className="w-[62px] shrink-0 text-[12px] tabular-nums text-muted-foreground">{clock(turn.ts, value.timeZone)}</span>
@@ -151,31 +161,32 @@ function DayPanel({ resource, date, today, typical }: { resource: Resource<WebCo
             <span className="block truncate text-[11px] text-muted-foreground">{turnMeta(turn)}</span></span>
           <span className="shrink-0 text-[13px] font-medium tabular-nums">{usd(turn.costUsd, true)}</span></li>;
       })}</ol>
-      <p className={cn(meta, "mt-2 mb-0 leading-relaxed")}>{top.length === turns ? `All ${turns} turn${turns === 1 ? "" : "s"}.` : `The ${top.length} largest of ${turns} turns: ${topShare}% of the day.`} A turn's figure includes subagents that finished while it ran.</p>
+      <p className={cn(meta, "mt-2 mb-0 leading-relaxed")}>{top.length === turns ? t("dayPanel.all", { count: turns }) : t("dayPanel.largest", { count: turns, top: top.length, share: topShare })}{t("dayPanel.subagents")}</p>
     </>}
   </>);
 }
 
 /** A's "Who started it" and "Scheduled jobs", over the last 7 or 30 days. */
 function PeriodCards({ resource, range, onRange }: { resource: Resource<WebCost>; range: Range; onRange: (range: Range) => void }) {
+  const { t } = useTranslation(["cost", "common"]);
   const value = resource.state === "ready" ? resource.value : undefined;
-  const toggle = <ToggleGroup type="single" value={range} onValueChange={(next) => next && onRange(next as Range)} variant="outline" size="sm" aria-label="Period" className="mb-1">
-    <ToggleGroupItem value="7" className="h-7 px-2.5 text-[12px]">7 days</ToggleGroupItem>
-    <ToggleGroupItem value="30" className="h-7 px-2.5 text-[12px]">30 days</ToggleGroupItem>
+  const toggle = <ToggleGroup type="single" value={range} onValueChange={(next) => next && onRange(next as Range)} variant="outline" size="sm" aria-label={t("period.label")} className="mb-1">
+    <ToggleGroupItem value="7" className="h-7 px-2.5 text-[12px]">{t("period.days", { count: 7 })}</ToggleGroupItem>
+    <ToggleGroupItem value="30" className="h-7 px-2.5 text-[12px]">{t("period.days", { count: 30 })}</ToggleGroupItem>
   </ToggleGroup>;
   const total = value?.totals.costUsd ?? 0;
   const overcounted = !!value && value.totals.overcountedCostUsd > 0;
   return <div className="min-w-0 space-y-4 [grid-area:range] max-[900px]:grid max-[900px]:grid-cols-2 max-[900px]:items-start max-[900px]:gap-4 max-[900px]:space-y-0 max-[600px]:grid-cols-1">
-    <Section title="Who started it" aside={toggle}>
+    <Section title={t("period.who")} aside={toggle}>
       {resource.state === "error" ? <Failed resource={resource} />
-        : !value ? <p className="m-0 text-sm text-muted-foreground" role="status">Loading…</p>
-        : !value.totals.turns ? <p className="m-0 text-[13px] text-muted-foreground">No turns in the last {range} days.</p>
-        : <><Ranked label="Cost by who started it" rows={CATEGORIES.map((c) => ({ name: c.label, value: value.totals.byCategory[c.key], note: `${share(value.totals.byCategory[c.key], total)}%`, swatch: c.color, hint: c.hint }))} />
-          <p className={cn(meta, "mt-4 mb-0 leading-relaxed")}>{value.totals.turns.toLocaleString("en-US")} turns. Background is heartbeats and turns that pick up finished subagents.{overcounted ? " Includes over-counted days." : ""}</p></>}
+        : !value ? <p className="m-0 text-sm text-muted-foreground" role="status">{t("common:state.loading")}</p>
+        : !value.totals.turns ? <p className="m-0 text-[13px] text-muted-foreground">{t("period.noTurns", { count: Number(range) })}</p>
+        : <><Ranked label={t("period.whoLabel")} rows={CATEGORIES.map((c) => ({ name: c.label, value: value.totals.byCategory[c.key], note: formatNumber(share(value.totals.byCategory[c.key], total) / 100, { style: "percent" }), swatch: c.color, hint: c.hint }))} />
+          <p className={cn(meta, "mt-4 mb-0 leading-relaxed")}>{t("period.note", { count: value.totals.turns, turns: formatNumber(value.totals.turns) })}{overcounted ? t("period.overcounted") : ""}</p></>}
     </Section>
-    {value && value.crons.length > 0 && <Section title="Scheduled jobs" aside={`last ${range} days`}>
-      <Ranked label="Cost by scheduled job" color="var(--series-3)" rows={value.crons.slice(0, 6).map((cron) => ({ name: cron.name, value: cron.costUsd,
-        note: `${cron.runs} run${cron.runs === 1 ? "" : "s"}${cron.runs > 1 ? ` · ${usd(cron.costUsd / cron.runs, true)} each` : ""}` }))} />
+    {value && value.crons.length > 0 && <Section title={t("period.scheduled")} aside={t("period.last", { count: Number(range) })}>
+      <Ranked label={t("period.scheduledLabel")} color="var(--series-3)" rows={value.crons.slice(0, 6).map((cron) => ({ name: cron.name, value: cron.costUsd,
+        note: cron.runs > 1 ? t("period.runsEach", { count: cron.runs, each: usd(cron.costUsd / cron.runs, true) }) : t("period.runs", { count: cron.runs }) }))} />
     </Section>}
   </div>;
 }

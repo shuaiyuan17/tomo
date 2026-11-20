@@ -29,10 +29,12 @@ export default defineConfig({
     // is its own chunk: its name (hash) survives app releases, so a browser
     // keeps it in cache (hashed assets are served immutable) across upgrades.
     // The largest chunk is the home room's three.js (~530 kB, lazy, only on
-    // #home); every chunk the chat loads is under 400 kB.
+    // #home); the chat's own chunk (with both languages' copy) is under 600 kB.
     chunkSizeWarningLimit: 600,
     rollupOptions: {
-      output: { advancedChunks: { groups: [{ name: "react", test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/ }] } },
+      // i18next is its own chunk for the same reason (a stable vendor hash); the catalogs stay with the app.
+      output: { advancedChunks: { groups: [{ name: "react", test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/ },
+        { name: "i18n", test: /node_modules[\\/](i18next|react-i18next|html-parse-stringify|void-elements)[\\/]/ }] } },
       // Radix ships "use client" for React Server Components; meaningless in a client-only bundle.
       onwarn(warning, warn) { if (warning.code !== "MODULE_LEVEL_DIRECTIVE") warn(warning); },
     },

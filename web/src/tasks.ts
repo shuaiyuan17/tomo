@@ -1,5 +1,9 @@
 import type { WebSession, WebTask } from "../../src/web/protocol.js";
 import { isShellTask } from "./shell.js";
+import { formatLocale, i18n } from "./i18n/index.js";
+
+/** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
+// i18n-dynamic: tasks:state.*
 
 /** Render logic for the Tasks panel, kept pure so it is testable. */
 
@@ -21,25 +25,32 @@ export function replaceSessionTasks(old: WebTask[], sessionId: string, tasks: We
   return [...old.filter((task) => task.sessionId !== sessionId), ...tasks];
 }
 
-const TASK_TYPES: Record<string, string> = {
-  local_agent: "subagent", local_bash: "shell", local_workflow: "workflow", monitor: "monitor",
-  mcp_task: "MCP task", remote_agent: "remote agent",
+const TASK_TYPES: Record<string, `tasks:type.${string}`> = {
+  local_agent: "tasks:type.local_agent", local_bash: "tasks:type.local_bash", local_workflow: "tasks:type.local_workflow", monitor: "tasks:type.monitor",
+  mcp_task: "tasks:type.mcp_task", remote_agent: "tasks:type.remote_agent",
 };
 export function taskKind(task: WebTask): string {
-  return task.subagentType || TASK_TYPES[task.taskType] || task.taskType || "task";
+  // i18n-dynamic: tasks:type.*
+  const type = TASK_TYPES[task.taskType] as "tasks:type.local_agent" | undefined;
+  return task.subagentType || (type && i18n.t(type)) || task.taskType || i18n.t("tasks:type.task");
 }
 
-export const STATE_LABELS: Record<WebTask["state"], string> = {
-  running: "Running", completed: "Done", failed: "Failed", stopped: "Stopped", ended: "Ended",
-};
+const STATE_LABELS = {
+  running: "tasks:state.running", completed: "tasks:state.completed", failed: "tasks:state.failed", stopped: "tasks:state.stopped", ended: "tasks:state.ended",
+} as const satisfies Record<WebTask["state"], string>;
+/** A task's state in words: "Running", "Done", "Failed", "Stopped", "Ended". */
+export function stateLabel(state: WebTask["state"]): string { return i18n.t(STATE_LABELS[state]); }
 
+/** "1h 02m", "1m 05s", "9s": the clock beside a task, units through Intl, minutes and seconds padded so it does not jump. */
 export function formatElapsed(ms: number): string {
   const total = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(total / 3600), m = Math.floor((total % 3600) / 60), s = total % 60;
-  const pad = (n: number) => String(n).padStart(2, "0");
-  if (h) return `${h}h ${pad(m)}m`;
-  if (m) return `${m}m ${pad(s)}s`;
-  return `${s}s`;
+  const unit = (value: number, unit: "hour" | "minute" | "second", pad = false) =>
+    new Intl.NumberFormat(formatLocale(), { style: "unit", unit, unitDisplay: "narrow", minimumIntegerDigits: pad ? 2 : 1 }).format(value);
+  const pair = (first: string, second: string) => i18n.t("common:format.unitPair", { first, second });
+  if (h) return pair(unit(h, "hour"), unit(m, "minute", true));
+  if (m) return pair(unit(m, "minute"), unit(s, "second", true));
+  return unit(s, "second");
 }
 
 /** Ended tasks stop the clock at their end time. */
@@ -50,7 +61,7 @@ export function elapsed(task: WebTask, now: number): number {
 /** What a running task is doing now, when progress reported anything. */
 export function lastStep(task: WebTask): string | undefined {
   if (task.summary) return task.summary;
-  if (task.lastTool) return `${task.lastTool}${task.toolUses ? ` · ${task.toolUses} tool uses` : ""}`;
+  if (task.lastTool) return task.toolUses ? i18n.t("tasks:lastStep", { tool: task.lastTool, count: task.toolUses }) : task.lastTool;
   return undefined;
 }
 
@@ -67,7 +78,7 @@ export function buildTaskView(tasks: WebTask[], sessions: WebSession[], showAmbi
   const catalog = new Map(sessions.map((session) => [session.id, session]));
   const groups: TaskGroup[] = [...bySession].map(([sessionId, list]) => {
     const session = catalog.get(sessionId);
-    return { sessionId, title: session?.title ?? "Conversation", kind: session?.kind ?? "group", rows: tree(list) };
+    return { sessionId, title: session?.title ?? i18n.t("common:nav.conversation"), kind: session?.kind ?? "group", rows: tree(list) };
   });
   groups.sort((a, b) => (a.kind === b.kind ? a.title.localeCompare(b.title) : a.kind === "dm" ? -1 : 1));
   return {

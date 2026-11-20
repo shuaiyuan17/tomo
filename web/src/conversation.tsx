@@ -19,6 +19,7 @@ import { dragHasFiles, imageFiles } from "./uploads.js";
 import type { useHistory } from "./use-history.js";
 import { useSessionTools } from "./use-session-tools.js";
 import type { useWeb } from "./use-web.js";
+import { i18n, Trans } from "./i18n/index.js";
 
 type Web = ReturnType<typeof useWeb>;
 const NO_REACTIONS: readonly ShownReaction[] = [];
@@ -143,29 +144,29 @@ export function Conversation({ web, agent, session, sessionId, ownerConversation
     confirming={confirmDismiss === request.requestId} {...rowProps} />;
 
   return <main ref={main} id="conversation" hidden={hidden} {...dragProps} tabIndex={-1} inert={inert}
-    {...(panel ? { "aria-label": "Conversation", ...(panel.modal ? { role: "dialog", "aria-modal": true } : {}) } : {})}
+    {...(panel ? { "aria-label": i18n.t("common:nav.conversation"), ...(panel.modal ? { role: "dialog", "aria-modal": true } : {}) } : {})}
     // Beside the room: a column on the right (the canvas re-fits to what is left, by its own ResizeObserver);
     // narrow, a sheet over the room from the right, and on a phone a drawer up from the bottom.
     className={panel
       ? "relative flex min-h-0 w-[400px] shrink-0 flex-col overscroll-contain border-l px-4 pt-2 pb-4 max-[1024px]:fixed max-[1024px]:top-[72px] compact:top-[calc(3rem+env(safe-area-inset-top))] max-[1024px]:right-0 max-[1024px]:bottom-0 max-[1024px]:z-30 max-[1024px]:w-[min(440px,92vw)] max-[1024px]:bg-background max-[1024px]:shadow-2xl motion-enter max-[600px]:top-auto max-[600px]:left-0 max-[600px]:h-[min(85dvh,calc(100dvh-3rem-env(safe-area-inset-top)-1rem))] max-[600px]:w-full max-[600px]:rounded-t-2xl max-[600px]:border-t max-[600px]:border-l-0 max-[600px]:px-3.5 max-[600px]:pb-[max(0.625rem,env(safe-area-inset-bottom))]"
       : "relative mx-auto flex min-w-0 max-w-[980px] flex-1 flex-col px-12 pt-6 pb-6 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:min-h-0 max-[600px]:w-full max-[600px]:px-3.5 max-[600px]:pt-2 max-[600px]:pb-[max(0.625rem,env(safe-area-inset-bottom))]"}>
     {panel && <div className="flex shrink-0 items-center justify-between pb-2">
-      <h2 className="m-0 text-[13px] font-medium text-muted-foreground">{group ? session!.title : "Conversation"}</h2>
-      <Button variant="ghost" size="icon" data-chat-close aria-label="Close conversation" title="Close (Esc)" onClick={panel.onClose}
+      <h2 className="m-0 text-[13px] font-medium text-muted-foreground">{group ? session!.title : i18n.t("common:nav.conversation")}</h2>
+      <Button variant="ghost" size="icon" data-chat-close aria-label={i18n.t("chat:panel.close")} title={i18n.t("chat:panel.closeTitle")} onClick={panel.onClose}
         className="size-8 rounded-lg text-muted-foreground hover:text-foreground"><X strokeWidth={1.75} /></Button></div>}
     {dragging && <div aria-hidden="true" className="pointer-events-none absolute inset-3 z-20 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary/60 bg-background/80 text-[15px] font-medium text-foreground motion-enter">
-      <span className="flex items-center gap-2"><ImagePlus className="size-5" strokeWidth={1.75} />Drop to attach</span></div>}
-    {web.bootstrap?.setupRequired && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Choose an owner in <code>web.ownerIdentity</code> and restart Tomo. An unambiguous owner is required to chat.</div>}
-    {web.connection === "locked" && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert">Open the access link in Tomo's private <code>web-access.log</code> to connect. The link includes your private access token.</div>}
+      <span className="flex items-center gap-2"><ImagePlus className="size-5" strokeWidth={1.75} />{i18n.t("chat:composer.drop")}</span></div>}
+    {web.bootstrap?.setupRequired && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert"><Trans ns="chat" i18nKey="notice.setup" components={{ code: <code /> }} /></div>}
+    {web.connection === "locked" && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert"><Trans ns="chat" i18nKey="notice.locked" components={{ code: <code /> }} /></div>}
     {/* A conversation (and a rewritten history) opens afresh: at its last turn. */}
     <ChatScroller key={`${sessionId}:${history.revision ?? ""}`} handle={scroller} busy={turnActive} lastRowId={rows.at(-1)?.id}
       keys={[...history.messages.map(messageKey), ...pendingUsers.map(pendingKey), ...blocks.map(blockKey)]} top={<>
-      {history.nextCursor && <Button variant="outline" size="sm" className="mx-auto mb-6 flex rounded-full text-xs" onClick={() => void loadOlder()} disabled={historyStatus === "loading-older"}>{historyStatus === "loading-older" ? "Loading…" : "Load earlier messages"}</Button>}
-      {!tools.complete && <p className="mx-auto mb-4 max-w-[740px] text-center text-[11.5px] text-muted-foreground" role="note">Older tool calls not shown</p>}
+      {history.nextCursor && <Button variant="outline" size="sm" className="mx-auto mb-6 flex rounded-full text-xs" onClick={() => void loadOlder()} disabled={historyStatus === "loading-older"}>{historyStatus === "loading-older" ? i18n.t("common:state.loading") : i18n.t("chat:history.earlier")}</Button>}
+      {!tools.complete && <p className="mx-auto mb-4 max-w-[740px] text-center text-[11.5px] text-muted-foreground" role="note">{i18n.t("chat:history.olderTools")}</p>}
       {tools.unreadable && <ToolsUnreadableNote />}
-      {historyStatus === "error" && <div className={cn(notice, "mx-auto mb-4 flex max-w-[740px] items-center gap-3")} role="alert">History is unavailable. <Button variant="outline" size="sm" className="rounded-lg" onClick={reload}>Try again</Button></div>}
-      {historyStatus === "loading" && sessionId && <p className="text-center text-sm text-muted-foreground" role="status">Opening your conversation…</p>}
-      {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && pendingUsers.length === 0 && <div className="m-auto flex h-full min-h-56 max-w-md flex-col items-center justify-center pb-12 text-center"><Mark className="mb-4 size-16 stroke-[1.3]" /><h2 className="mt-2 mb-3 font-serif text-[28px] font-normal">Start wherever you are.</h2><p className="m-0 max-w-80 text-sm text-muted-foreground">{group ? "There are no recorded messages in this group yet." : "A question, a half-formed idea, or something on your mind."}</p></div>}
+      {historyStatus === "error" && <div className={cn(notice, "mx-auto mb-4 flex max-w-[740px] items-center gap-3")} role="alert">{i18n.t("chat:history.unavailable")} <Button variant="outline" size="sm" className="rounded-lg" onClick={reload}>{i18n.t("home:retry")}</Button></div>}
+      {historyStatus === "loading" && sessionId && <p className="text-center text-sm text-muted-foreground" role="status">{i18n.t("chat:history.opening")}</p>}
+      {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && pendingUsers.length === 0 && <div className="m-auto flex h-full min-h-56 max-w-md flex-col items-center justify-center pb-12 text-center"><Mark className="mb-4 size-16 stroke-[1.3]" /><h2 className="mt-2 mb-3 font-serif text-[28px] font-normal">{i18n.t("chat:empty.heading")}</h2><p className="m-0 max-w-80 text-sm text-muted-foreground">{group ? i18n.t("chat:empty.group") : i18n.t("chat:empty.body")}</p></div>}
       {/* The first shown row's day, outside the rows: on "Load earlier" only its text changes. */}
       {dividers.first && <DayDivider label={dividers.first} />}
       </>}>

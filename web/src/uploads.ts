@@ -1,4 +1,5 @@
 import type { WebFiledFile } from "../../src/web/protocol.js";
+import { i18n } from "./i18n/index.js";
 
 /**
  * Files attached in the composer ("+", drop, paste): pure state, kept out of
@@ -85,10 +86,10 @@ export function addFiles(current: readonly Attachment[], files: readonly File[],
     added.push(make(file));
   }
   const notes = [
-    skippedCount && `Up to ${MAX_ATTACHMENTS} ${allow.files ? "attachments" : "images"} per message.`,
-    skippedSize && `Images must be under ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB.`,
-    skippedFileSize && `Files must be under ${MAX_FILE_BYTES / 1024 / 1024} MB.`,
-    skippedType && "Only PNG, JPEG, GIF, WebP and HEIC images can be attached.",
+    skippedCount && (allow.files ? i18n.t("chat:attach.maxAttachments", { count: MAX_ATTACHMENTS }) : i18n.t("chat:attach.maxImages", { count: MAX_ATTACHMENTS })),
+    skippedSize && i18n.t("chat:attach.imageSize", { mb: MAX_ATTACHMENT_BYTES / 1024 / 1024 }),
+    skippedFileSize && i18n.t("chat:attach.fileSize", { mb: MAX_FILE_BYTES / 1024 / 1024 }),
+    skippedType && i18n.t("chat:attach.types"),
   ].filter(Boolean);
   return { next: [...current, ...added], added, note: notes.join(" ") };
 }
@@ -109,10 +110,10 @@ export function uploadIds(list: readonly Attachment[]): string[] {
 
 /** What a screen reader hears for a tray item. */
 export function attachmentLabel(item: Attachment, index: number): string {
-  const name = item.file.name || `${item.kind === "file" ? "File" : "Image"} ${index + 1}`;
-  if (item.status === "uploading") return `${name}, uploading ${Math.round(item.progress * 100)}%`;
-  if (item.status === "failed") return `${name}, upload failed`;
-  return `${name}, attached`;
+  const name = item.file.name || (item.kind === "file" ? i18n.t("chat:attach.fileN", { n: index + 1 }) : i18n.t("chat:attach.imageN", { n: index + 1 }));
+  if (item.status === "uploading") return i18n.t("chat:attach.uploading", { name, percent: Math.round(item.progress * 100) });
+  if (item.status === "failed") return i18n.t("chat:attach.uploadFailed", { name });
+  return i18n.t("chat:attach.attached", { name });
 }
 
 /** What a send captured, split from what was added meanwhile (which stays in the tray). */

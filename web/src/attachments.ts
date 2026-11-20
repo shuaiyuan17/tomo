@@ -1,3 +1,4 @@
+import { i18n } from "./i18n/index.js";
 /**
  * Attachment markers tomo writes into transcripts for things sent from a
  * messaging channel (see src/channels/imageStore.ts, documentStore.ts,
@@ -49,13 +50,13 @@ export function splitAttachments(content: string): MessagePart[] {
       shown += missing;
       parts.push({ kind: "images", paths, sticker: noun.includes("sticker"), missing, more: Math.max(0, count(noun) - paths.length - missing) });
     } else if (/document/.test(noun)) {
-      parts.push({ kind: "attachment", label: count(noun) > 1 ? `${count(noun)} documents` : "Document", names: savedPaths(rest).map(fileName) });
+      parts.push({ kind: "attachment", label: i18n.t("chat:file.documents", { count: count(noun) }), names: savedPaths(rest).map(fileName) });
     } else {
       // fileStore's notice: "<name> (<type>, <size>) saved to …" — the name is sanitised to [A-Za-z0-9._-].
       const files = [...rest.matchAll(/(?:^:\s*|;\s*)([A-Za-z0-9._-]+) \((?:[^()]*), ([^(),]+)\)/g)].map((m) => ({ name: m[1], size: m[2].trim() }));
       const names = files.length ? files.map((file) => file.name)
         : [...rest.matchAll(/(?:^:\s*|;\s*)([^;—]+?)\s+—/g)].map((m) => m[1].trim()).filter(Boolean);
-      parts.push({ kind: "attachment", label: count(noun) > 1 ? `${count(noun)} files` : "File", names, ...(files.length ? { files } : {}) });
+      parts.push({ kind: "attachment", label: i18n.t("chat:file.files", { count: count(noun) }), names, ...(files.length ? { files } : {}) });
     }
   }
   const after = content.slice(last);

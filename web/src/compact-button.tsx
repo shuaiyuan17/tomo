@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useAgentName } from "./agent-name.js";
+import { useTranslation } from "./i18n/index.js";
 import { FoldVertical } from "lucide-react";
 import { ApiError, requestCompact, type WebBootstrap } from "./api.js";
 import { Button } from "@/components/ui/button";
@@ -18,6 +19,7 @@ export function CompactButton({ bootstrap, refresh, ownerSession, running, reque
   { bootstrap?: WebBootstrap; refresh: () => Promise<WebBootstrap>; ownerSession: boolean; running: number; request?: WebCompactState }) {
   const [open, setOpen] = useState(false);
   const agent = useAgentName();
+  const { t } = useTranslation();
   const [error, setError] = useState("");
   const [now, setNow] = useState(() => Date.now());
   // When this browser saw the request reach its current state (local clock).
@@ -41,15 +43,15 @@ export function CompactButton({ bootstrap, refresh, ownerSession, running, reque
           <FoldVertical strokeWidth={1.75} className={cn(button.state === "requested" && "animate-pulse")} /></Button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-56 rounded-xl p-3 text-[13px]">
-        <p className="m-0 mb-2.5">Ask {agent} to compact now?</p>
+        <p className="m-0 mb-2.5">{t("compact.confirm", { agent })}</p>
         <div className="flex justify-end gap-2">
-          <Button variant="ghost" size="sm" className="h-7 rounded-lg text-[12px]" onClick={() => setOpen(false)}>Cancel</Button>
-          <Button size="sm" className="h-7 rounded-lg text-[12px]" onClick={() => void confirm()}>Compact</Button>
+          <Button variant="ghost" size="sm" className="h-7 rounded-lg text-[12px]" onClick={() => setOpen(false)}>{t("action.cancel")}</Button>
+          <Button size="sm" className="h-7 rounded-lg text-[12px]" onClick={() => void confirm()}>{t("compact.action")}</Button>
         </div>
       </PopoverContent>
     </Popover>
-    {button.state === "requested" && <span className="absolute top-1/2 right-full mr-1 -translate-y-1/2 text-[11px] whitespace-nowrap"><span className="shimmer">Requested…</span></span>}
-    {button.state === "done" && <span role="status" className="absolute top-1/2 right-full mr-1 -translate-y-1/2 text-[11px] whitespace-nowrap text-muted-foreground">Compacted</span>}
+    {button.state === "requested" && <span className="absolute top-1/2 right-full mr-1 -translate-y-1/2 text-[11px] whitespace-nowrap"><span className="shimmer">{t("compact.requested")}</span></span>}
+    {button.state === "done" && <span role="status" className="absolute top-1/2 right-full mr-1 -translate-y-1/2 text-[11px] whitespace-nowrap text-muted-foreground">{t("compact.done")}</span>}
     {button.state === "ready" && button.note && !error && <span role="status" className="absolute top-7 right-0 z-10 w-52 rounded-lg border bg-popover px-2 py-1.5 text-[11.5px] text-muted-foreground shadow-sm">{button.note}</span>}
     {error && <span role="status" className="absolute top-7 right-0 z-10 w-52 rounded-lg border bg-popover px-2 py-1.5 text-[11.5px] text-muted-foreground shadow-sm">{error}</span>}
   </span>;

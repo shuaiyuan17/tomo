@@ -1,4 +1,6 @@
 import type { WebCostCategory, WebCostDay, WebCostHour, WebCostLimitWindow, WebCostTurn } from "../../src/web/protocol.js";
+import { formatLocale, i18n } from "./i18n/index.js";
+import { formatDate, formatUnit, formatUnitPair } from "./i18n/format.js";
 
 /**
  * Pure helpers for the Study's Cost page (cost-page.tsx). Every dollar figure
@@ -6,10 +8,11 @@ import type { WebCostCategory, WebCostDay, WebCostHour, WebCostLimitWindow, WebC
  * owner's local `YYYY-MM-DD` as the API sends them.
  */
 
-export const CATEGORIES: { key: WebCostCategory; label: string; hint: string; color: string }[] = [
-  { key: "you", label: "You", hint: "Turns started by a message: yours, or one in a group", color: "var(--series-1)" },
-  { key: "background", label: "Background", hint: "Heartbeats and turns that pick up finished background work", color: "var(--series-2)" },
-  { key: "scheduled", label: "Scheduled", hint: "Cron jobs and other scheduled turns", color: "var(--series-3)" },
+/** Who started a turn; `label` and `hint` are read in the active locale. */
+export const CATEGORIES: { readonly key: WebCostCategory; readonly label: string; readonly hint: string; readonly color: string }[] = [
+  { key: "you", get label() { return i18n.t("cost:category.you"); }, get hint() { return i18n.t("cost:category.youHint"); }, color: "var(--series-1)" },
+  { key: "background", get label() { return i18n.t("cost:category.background"); }, get hint() { return i18n.t("cost:category.backgroundHint"); }, color: "var(--series-2)" },
+  { key: "scheduled", get label() { return i18n.t("cost:category.scheduled"); }, get hint() { return i18n.t("cost:category.scheduledHint"); }, color: "var(--series-3)" },
 ];
 export const categoryOf = (key: WebCostCategory) => CATEGORIES.find((c) => c.key === key)!;
 
@@ -60,40 +63,47 @@ export function pickDay(requested: string | null | undefined, today: string): st
 /** The Cost tab showing `date` (today's link carries no date). */
 export const costDayHash = (date: string | null) => (date ? `#study/cost/${date}` : "#study/cost");
 
+/** Dollars in the active locale's digits ("$1,234", "$3.46"); always US dollars, the SDK's unit. */
+const dollars = (value: number, digits: number) => new Intl.NumberFormat(formatLocale(), { style: "currency", currency: "USD", currencyDisplay: "narrowSymbol",
+  minimumFractionDigits: digits, maximumFractionDigits: digits }).format(value);
 export function usd(value: number, precise = false): string {
-  if (value === 0) return "$0";
-  if (Math.abs(value) < 0.005) return "<$0.01";
-  if (precise || value < 10) return `$${value.toFixed(2)}`;
-  return `$${Math.round(value).toLocaleString("en-US")}`;
+  if (value === 0) return dollars(0, 0);
+  if (Math.abs(value) < 0.005) return i18n.t("cost:lessThan", { value: dollars(0.01, 2) });
+  if (precise || value < 10) return dollars(value, 2);
+  return dollars(Math.round(value), 0);
 }
 export function duration(ms: number | undefined): string | undefined {
   if (ms == null) return undefined;
   const s = Math.round(ms / 1000);
-  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  return s < 60 ? formatUnit(s, "second") : s < 3600 ? formatUnitPair(formatUnit(Math.floor(s / 60), "minute"), formatUnit(s % 60, "second"))
+    : formatUnitPair(formatUnit(Math.floor(s / 3600), "hour"), formatUnit(Math.floor((s % 3600) / 60), "minute"));
 }
 
 const atNoon = (date: string) => new Date(`${date}T12:00:00Z`);
-export const shortDay = (date: string) => atNoon(date).toLocaleDateString("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
-export const longDay = (date: string) => atNoon(date).toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric", timeZone: "UTC" });
-export const monthOf = (date: string) => atNoon(date).toLocaleDateString("en-US", { month: "short", timeZone: "UTC" });
+export const shortDay = (date: string) => formatDate(atNoon(date), { month: "short", day: "numeric", timeZone: "UTC" });
+export const longDay = (date: string) => formatDate(atNoon(date), { weekday: "long", month: "long", day: "numeric", timeZone: "UTC" });
+export const monthOf = (date: string) => formatDate(atNoon(date), { month: "short", timeZone: "UTC" });
+/** A short weekday name, Monday = 0 (2024-01-01 was a Monday). */
+export const weekdayName = (day: number) => formatDate(atNoon(addDays("2024-01-01", day)), { weekday: "short", timeZone: "UTC" });
 /** A turn's clock time on the owner's clock (the zone the days are split in). */
 export function clock(ts: number, timeZone: string): string {
-  try { return new Date(ts).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit", timeZone }); }
-  catch { return new Date(ts).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }); }
+  try { return formatDate(ts, { hour: "numeric", minute: "2-digit", timeZone }); }
+  catch { return formatDate(ts, { hour: "numeric", minute: "2-digit" }); }
 }
 
 /** The eyebrow over a day: "Today so far", "Yesterday" or "That day". */
 export function dayEyebrow(date: string, today: string): string {
-  return date === today ? "Today so far" : date === addDays(today, -1) ? "Yesterday" : "That day";
+  return date === today ? i18n.t("cost:day.today") : date === addDays(today, -1) ? i18n.t("cost:day.yesterday") : i18n.t("cost:day.other");
 }
 
 /** "1.7× a typical day", "40% below a typical day", "About a typical day". */
 export function versusTypical(cost: number, typical: number | undefined): string | undefined {
   if (!typical || typical <= 0) return undefined;
   const ratio = cost / typical;
-  if (ratio >= 1.15) return `${ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)}× a typical day`;
-  if (ratio <= 0.85) return `${Math.round((1 - ratio) * 100)}% below a typical day`;
-  return "About a typical day";
+  const digits = ratio >= 10 ? 0 : 1;
+  if (ratio >= 1.15) return i18n.t("cost:typical.above", { ratio: new Intl.NumberFormat(formatLocale(), { minimumFractionDigits: digits, maximumFractionDigits: digits }).format(ratio) });
+  if (ratio <= 0.85) return i18n.t("cost:typical.below", { percent: Math.round((1 - ratio) * 100) });
+  return i18n.t("cost:typical.about");
 }
 
 /** The hour with the most cost, or undefined for an empty day. */
@@ -109,20 +119,20 @@ export function turnTitle(turn: WebCostTurn): string {
   if (turn.trigger) return turn.trigger;
   if (turn.jobName) return turn.jobName;
   switch (turn.source) {
-    case "heartbeat": return "Heartbeat";
-    case "background": return "Background work finished";
-    case "restart": return "After a restart";
-    case "delegate": return "Delegated message";
-    case "cron": return "Scheduled job";
-    default: return turn.category === "scheduled" ? "Scheduled turn" : "Turn";
+    case "heartbeat": return i18n.t("cost:turn.heartbeat");
+    case "background": return i18n.t("cost:turn.background");
+    case "restart": return i18n.t("cost:turn.restart");
+    case "delegate": return i18n.t("cost:turn.delegate");
+    case "cron": return i18n.t("cost:turn.cron");
+    default: return turn.category === "scheduled" ? i18n.t("cost:turn.scheduled") : i18n.t("cost:turn.other");
   }
 }
 export function turnMeta(turn: WebCostTurn): string {
   const parts = [categoryOf(turn.category).label, turn.session.label];
   const took = duration(turn.durationMs);
   if (took) parts.push(took);
-  if (turn.tools !== undefined) parts.push(`${turn.tools} tool${turn.tools === 1 ? "" : "s"}`);
-  if (turn.backfilled) parts.push("from the activity log");
+  if (turn.tools !== undefined) parts.push(i18n.t("cost:turn.tools", { count: turn.tools }));
+  if (turn.backfilled) parts.push(i18n.t("cost:turn.backfilled"));
   return parts.join(" · ");
 }
 
@@ -132,7 +142,7 @@ export function quotaWindows(windows: readonly WebCostLimitWindow[]): { title: s
     : w.group === "session" || w.window === "five_hour" ? "session"
     : w.group === "weekly" || w.window === "seven_day" ? "weekly" : undefined;
   const out: { title: string; window: WebCostLimitWindow }[] = [];
-  for (const [want, title] of [["session", "5-hour"], ["weekly", "7-day"]] as const) {
+  for (const [want, title] of [["session", i18n.t("common:usage.fiveHour")], ["weekly", i18n.t("common:usage.sevenDay")]] as const) {
     const window = windows.find((w) => kind(w) === want && typeof w.percent === "number" && Number.isFinite(w.percent));
     if (window) out.push({ title, window });
   }
@@ -146,9 +156,9 @@ export function resetsIn(resetsAt: string | undefined, now: number): string | un
   const ms = at - now;
   if (ms < 24 * 3_600_000) {
     const h = Math.floor(ms / 3_600_000), m = Math.max(1, Math.round((ms % 3_600_000) / 60_000));
-    return h ? `resets in ${h}h ${m}m` : `resets in ${m}m`;
+    return i18n.t("common:usage.resetsInInline", { span: h ? formatUnitPair(formatUnit(h, "hour"), formatUnit(m, "minute")) : formatUnit(m, "minute") });
   }
-  return `resets ${new Date(at).toLocaleString("en-US", { weekday: "short", hour: "numeric", minute: "2-digit" })}`;
+  return i18n.t("cost:resetsAt", { when: formatDate(at, { weekday: "short", hour: "numeric", minute: "2-digit" }) });
 }
 
 /** A recorded day's share of a whole, rounded; 0 for an empty whole. */

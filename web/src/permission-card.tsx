@@ -8,21 +8,27 @@ import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 import type { WebPermissionDecision, WebPermissionRequest } from "../../src/web/protocol.js";
+import { i18n, Trans, useTranslation } from "./i18n/index.js";
+
+/** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
+// i18n-dynamic: chat:permission.once
+// i18n-dynamic: chat:permission.always
+// i18n-dynamic: chat:permission.deny
 
 /** What the card says when the daemon refuses an answer (fixed codes only). */
 export function permissionError(code: string): string {
-  if (code === "permission_closed") return "This request is over: it was answered or it expired.";
-  if (code === "permission_unknown") return "This request is no longer open.";
-  if (code === "permission_config_unwritable") return "Could not save to config.json. Try again, or allow once.";
-  if (code === "epoch_changed") return "Tomo restarted, so this request is gone.";
-  return "Could not send. Try again.";
+  if (code === "permission_closed") return i18n.t("chat:permission.error.closed");
+  if (code === "permission_unknown") return i18n.t("chat:permission.error.unknown");
+  if (code === "permission_config_unwritable") return i18n.t("chat:permission.error.unwritable");
+  if (code === "epoch_changed") return i18n.t("chat:permission.error.restarted");
+  return i18n.t("chat:permission.error.other");
 }
 
-const DECISIONS: { decision: WebPermissionDecision; label: string; variant: "default" | "outline" | "ghost" }[] = [
-  { decision: "once", label: "Allow once", variant: "default" },
-  { decision: "always", label: "Always allow", variant: "outline" },
-  { decision: "deny", label: "Deny", variant: "ghost" },
-];
+const DECISIONS = [
+  { decision: "once", label: "permission.once", variant: "default" },
+  { decision: "always", label: "permission.always", variant: "outline" },
+  { decision: "deny", label: "permission.deny", variant: "ghost" },
+] as const satisfies readonly { decision: WebPermissionDecision; label: string; variant: "default" | "outline" | "ghost" }[];
 
 /**
  * A sandboxed group's `request_permission`: which group, which path (as the
@@ -34,6 +40,7 @@ export function PermissionCard({ request, bootstrap, refresh, onAlways }: { requ
   /** An Always allow was saved: the page keeps its grant id on screen (the request's card is about to go). */
   onAlways?: (granted: GrantedPermission) => void }) {
   const agent = useAgentName();
+  const { t } = useTranslation("chat");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [now, setNow] = useState(() => Date.now());
@@ -58,18 +65,18 @@ export function PermissionCard({ request, bootstrap, refresh, onAlways }: { requ
     <div className="flex items-center gap-2">
       <ShieldQuestion className="size-4 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
       <h2 id={titleId} className="m-0 min-w-0 truncate text-[13px] font-medium">{request.group}</h2>
-      <span className="ml-auto shrink-0 text-[11px] text-muted-foreground tabular-nums" aria-label="Time left">{timeLeft(request.expiresAt, now)}</span>
+      <span className="ml-auto shrink-0 text-[11px] text-muted-foreground tabular-nums" aria-label={t("card.timeLeft")}>{timeLeft(request.expiresAt, now)}</span>
     </div>
     <div className="mt-2 flex items-start gap-2">
       <Badge variant="outline" className={cn("mt-px rounded-md px-1.5 text-[11px] font-medium",
-        write ? "border-warn/40 bg-warn/10 text-warn" : "text-muted-foreground")}>{write ? "Write" : "Read"}</Badge>
+        write ? "border-warn/40 bg-warn/10 text-warn" : "text-muted-foreground")}>{write ? t("permission.write") : t("permission.read")}</Badge>
       <code className="min-w-0 flex-1 font-mono text-[12.5px] leading-snug text-foreground [overflow-wrap:anywhere]" data-testid="permission-path">{request.path}</code>
     </div>
     <p className="mt-1.5 mb-0 text-[12.5px] leading-snug text-muted-foreground [overflow-wrap:anywhere]">
-      <span className="text-foreground/80">{request.reason}</span> <span className="whitespace-nowrap">(from {agent}, not verified)</span></p>
+      <span className="text-foreground/80">{request.reason}</span> <span className="whitespace-nowrap">{t("permission.unverified", { agent })}</span></p>
     {request.command && <Collapsible>
       <CollapsibleTrigger className="group mt-2 flex cursor-pointer items-center gap-1 rounded text-[11.5px] text-muted-foreground hover:text-foreground">
-        <ChevronRight className="size-3.5 transition-transform group-data-[state=open]:rotate-90" aria-hidden="true" />Triggering call</CollapsibleTrigger>
+        <ChevronRight className="size-3.5 transition-transform group-data-[state=open]:rotate-90" aria-hidden="true" />{t("permission.call")}</CollapsibleTrigger>
       <CollapsibleContent>
         <pre className="m-0 mt-1.5 max-h-40 overflow-y-auto rounded-lg bg-muted/60 px-2.5 py-2 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]">{request.command}</pre>
       </CollapsibleContent>
@@ -77,9 +84,9 @@ export function PermissionCard({ request, bootstrap, refresh, onAlways }: { requ
     <div className="mt-3 grid grid-cols-3 gap-2 min-[480px]:flex">
       {DECISIONS.map(({ decision, label, variant }) => <Button key={decision} type="button" size="sm" variant={variant} disabled={busy}
         className={cn("h-8 rounded-lg", decision === "deny" && "text-muted-foreground hover:text-foreground min-[480px]:ml-auto")}
-        onClick={() => void answer(decision)}>{label}</Button>)}
+        onClick={() => void answer(decision)}>{t(label)}</Button>)}
     </div>
-    <p className="m-0 mt-2 text-[11.5px] leading-snug text-muted-foreground">Allow once covers file reads and writes; shell access needs Always allow.</p>
+    <p className="m-0 mt-2 text-[11.5px] leading-snug text-muted-foreground">{t("permission.hint")}</p>
     {error && <p role="status" className="m-0 mt-2 text-[12px] text-destructive">{error}</p>}
   </section>;
 }
@@ -92,21 +99,22 @@ export interface GrantedPermission { grantId: string; group: string; path: strin
  * closes it. Revoke with `revoke <id>` in the DM, or the Permissions page.
  */
 export function PermissionGranted({ granted, onClose }: { granted: GrantedPermission; onClose: () => void }) {
+  const { t } = useTranslation("chat");
   const [copied, setCopied] = useState(false);
   const copy = () => {
     void navigator.clipboard?.writeText(granted.grantId).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1_500); }, () => {});
   };
-  return <section role="status" aria-label="Always allowed" data-testid="permission-granted"
+  return <section role="status" aria-label={t("permission.granted")} data-testid="permission-granted"
     className="motion-enter mb-2 flex items-center gap-2.5 rounded-2xl border bg-card py-2 pr-1.5 pl-4 shadow-sm">
     <ShieldCheck className="size-4 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden="true" />
     <div className="min-w-0 flex-1">
-      <p className="m-0 text-[13px] font-medium">Always allowed · ID <code className="font-mono select-all" data-testid="permission-grant-id">{granted.grantId}</code></p>
+      <p className="m-0 text-[13px] font-medium"><Trans t={t} ns="chat" i18nKey="permission.grantedId" values={{ id: granted.grantId }} components={{ id: <code className="font-mono select-all" data-testid="permission-grant-id" /> }} /></p>
       <p className="m-0 truncate text-[11.5px] text-muted-foreground" title={granted.path}>{granted.group} · {granted.path}</p>
     </div>
     <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
-      aria-label={copied ? "Copied" : "Copy grant ID"} title="Copy grant ID" onClick={copy}>
+      aria-label={copied ? t("actions.copied") : t("permission.copyId")} title={t("permission.copyId")} onClick={copy}>
       {copied ? <Check className="size-3.5" /> : <Copy className="size-3.5" />}</Button>
     <Button type="button" variant="ghost" size="icon" className="size-8 shrink-0 rounded-full text-muted-foreground hover:text-foreground"
-      aria-label="Close" onClick={onClose}><X className="size-3.5" /></Button>
+      aria-label={t("card.close")} onClick={onClose}><X className="size-3.5" /></Button>
   </section>;
 }

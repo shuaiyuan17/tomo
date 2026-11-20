@@ -86,7 +86,7 @@ function replySpec(h: Harness, overrides: Partial<TurnSpec> = {}): TurnSpec {
     silentMatcher: isSilentReply,
     transcript: "always",
     errors: {
-      visiblePrefix: "[error] ",
+      visibleError: "reply",
       response: "deliver",
       thrown: "deliver",
       thrownLogMessage: "Error handling message",
@@ -105,7 +105,7 @@ function sendSpec(h: Harness, overrides: Partial<TurnSpec> = {}): TurnSpec {
     silentMatcher: isSilentReply,
     transcript: "on-delivery",
     errors: {
-      visiblePrefix: "[error] cron failed: ",
+      visibleError: "cron",
       response: "deliver",
       thrown: "deliver",
       thrownLogMessage: "Cron message handling failed",
@@ -162,7 +162,7 @@ describe("SDK error results through the turn pipeline", () => {
       key: "telegram:-100group",
       delivery: { kind: "send", channel: h.channel, chatId: "-100group" },
       errors: {
-        visiblePrefix: "[error] cron failed: ",
+        visibleError: "cron",
         response: "note-only",
         thrown: "note-only",
         thrownLogMessage: "Cron message handling failed",
@@ -183,7 +183,7 @@ describe("SDK error results through the turn pipeline", () => {
     const ok = await h.runner.runTurn(sendSpec(h, {
       delivery: { kind: "deferred-send", resolveTarget: () => ({ channel: h.channel, chatId: "123" }) },
       errors: {
-        visiblePrefix: "[error] continuity failed: ",
+        visibleError: "continuity",
         response: "note-only",
         thrown: "ignore",
         thrownLogMessage: "Continuity failed",
@@ -375,7 +375,7 @@ describe("TurnRunner reply turns", () => {
   it("suppresses thrown errors entirely for passive groups (thrown: ignore)", async () => {
     const h = makeHarness(async () => { throw new Error("boom"); });
     const result = await h.runner.runTurn(replySpec(h, {
-      errors: { visiblePrefix: "[error] ", response: "deliver", thrown: "ignore", thrownLogMessage: "Error handling message" },
+      errors: { visibleError: "reply", response: "deliver", thrown: "ignore", thrownLogMessage: "Error handling message" },
     }));
 
     expect(result).toBe(false);
@@ -460,7 +460,7 @@ describe("TurnRunner send turns", () => {
     const h = makeHarness(async () => "API Error: 529 overloaded");
     const result = await h.runner.runTurn(sendSpec(h, {
       errors: {
-        visiblePrefix: "[error] cron failed: ",
+        visibleError: "cron",
         response: "note-only",
         thrown: "note-only",
         thrownLogMessage: "Cron message handling failed",
@@ -476,7 +476,7 @@ describe("TurnRunner send turns", () => {
     const h = makeHarness(async () => { throw new Error("boom"); });
     const result = await h.runner.runTurn(sendSpec(h, {
       errors: {
-        visiblePrefix: "[error] cron failed: ",
+        visibleError: "cron",
         response: "note-only",
         thrown: "note-only",
         thrownLogMessage: "Cron message handling failed",
@@ -507,7 +507,7 @@ describe("TurnRunner deferred-send turns (continuity)", () => {
       silentMatcher: isSilentReply,
       transcript: "on-delivery",
       errors: {
-        visiblePrefix: "[error] continuity failed: ",
+        visibleError: "continuity",
         response: "note-only",
         thrown: "ignore",
         thrownLogMessage: "Continuity heartbeat failed",

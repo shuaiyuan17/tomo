@@ -427,6 +427,31 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
+  it("replies in the configured locale: Chinese under zh-Hans, English when unset", async () => {
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await drainQueue(agent);
+    tg.clearDelivered();
+
+    await tg.simulateCommand("new", "12345", "TestUser");
+    await tg.simulateCommand("status", "12345", "TestUser");
+    expect(tg.sent[0].text).toBe("🆕 New session started.");
+    expect(tg.sent[1].text).toMatch(/^📋 Status\n\nSession: /);
+
+    resetConfig({ locale: "zh-Hans" });
+    await tg.simulateCommand("new", "12345", "TestUser");
+    await tg.simulateCommand("status", "12345", "TestUser");
+    await tg.simulateCommand("pause", "12345", "TestUser");
+    expect(tg.sent[2].text).toBe("🆕 已开始新的 session。");
+    expect(tg.sent[3].text).toMatch(/^📋 状态\n\nSession：telegram:12345\n渠道：telegram\n模型：/);
+    expect(tg.sent[3].text).toContain("活跃：");
+    expect(tg.sent[4].text).toBe("⚠️ /pause 只能在群聊里使用。");
+
+    await agent.stop();
+  });
+
   it("/cost shows current-session cost windows", async () => {
     const logsDir = join(agentEnv.tmpDir, "logs");
     mkdirSync(logsDir, { recursive: true });

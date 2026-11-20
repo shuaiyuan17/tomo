@@ -1,3 +1,4 @@
+import { ownerT, type OwnerText } from "../i18n/index.js";
 import type { Channel } from "../channels/types.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
@@ -65,7 +66,8 @@ export class OwnerNotices {
    * Callers attach a target only where the turn's policy suppresses errors;
    * an error delivered visibly is never reported again.
    */
-  ownerNoticeTarget(sessionKey: string, turnKind: string, groupKey?: string): OwnerNoticeTarget {
+  ownerNoticeTarget(sessionKey: string, turnKind: OwnerText, groupKey?: string): OwnerNoticeTarget {
+    const t = ownerT("notices");
     const noticeKey = groupKey !== undefined && isGroupSessionKey(groupKey) ? groupKey : sessionKey;
     // The turn ran on an identity's dm: session (its own turn, or a summoned
     // group's): the notice goes to THAT identity's DM, where /rewind works.
@@ -75,13 +77,13 @@ export class OwnerNotices {
       const title = this.sessions.getEntry(noticeKey)?.chatTitle;
       return {
         noticeKey,
-        label: title ? `group "${title}" (${noticeKey})` : `group ${noticeKey}`,
+        label: title ? t("suppressed.label.group", { title, key: noticeKey }) : t("suppressed.label.groupUntitled", { key: noticeKey }),
         turnKind,
         ...deliver,
       };
     }
-    if (ranOnDm) return { noticeKey, label: `this DM session (${noticeKey})`, turnKind, ...deliver };
-    return { noticeKey, label: `private chat ${noticeKey}`, turnKind };
+    if (ranOnDm) return { noticeKey, label: t("suppressed.label.dm", { key: noticeKey }), turnKind, ...deliver };
+    return { noticeKey, label: t("suppressed.label.privateChat", { key: noticeKey }), turnKind };
   }
 
   /**
@@ -115,7 +117,7 @@ export class OwnerNotices {
   }
 
   /** Deliver an owner notice; false (nothing sent) when no owner target. */
-  async sendOwnerNotice(text: string, deliverTo: string | undefined): Promise<boolean> {
+  async sendOwnerNotice(text: OwnerText, deliverTo: string | undefined): Promise<boolean> {
     const target = this.resolveOwnerNoticeTarget(deliverTo);
     if (!target) {
       log.warn({ deliverTo }, "Owner error notice dropped: no configured owner identity with a reachable DM");
@@ -145,12 +147,12 @@ export class OwnerNotices {
    * the owner's business only. Resolves false when nothing was sent (no
    * owner, or no reachable owner DM).
    */
-  async notifyOwner(text: string): Promise<boolean> {
+  async notifyOwner(text: OwnerText): Promise<boolean> {
     return this.sendOwnerNotice(text, undefined);
   }
 
   /** Send a direct notification to the user's DM channel (no agent query) */
-  async sendNotification(text: string): Promise<void> {
+  async sendNotification(text: OwnerText): Promise<void> {
     const dmKey = this.router.ownerSessionKey();
     let target: ReplyTarget | undefined;
 

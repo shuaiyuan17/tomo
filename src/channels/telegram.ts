@@ -1,6 +1,6 @@
 import { API_CONSTANTS, Bot, GrammyError, type Context } from "grammy";
 import { existsSync } from "node:fs";
-import type { MessageReactionUpdated, ReactionType, ReactionTypeEmoji } from "grammy/types";
+import type { LanguageCode, MessageReactionUpdated, ReactionType, ReactionTypeEmoji } from "grammy/types";
 import type { AdmissionPredicate, Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, MessageReaction, RecentChatMessage } from "./types.js";
 import { AttachmentUnreadableError, PartialSendError, markDefiniteFailure, markNothingSent, markPartsSent } from "./types.js";
 import { formatImageMarker } from "./imageStore.js";
@@ -15,7 +15,7 @@ import { log } from "../logger.js";
 import { scrubSecretValues } from "../redact.js";
 import { formatReactionMarker, splitText } from "./text-utils.js";
 import { formatMimeToken, sanitizeAttachmentFilename } from "./fileStore.js";
-import { CHAT_COMMANDS, CHAT_COMMAND_NAMES, parseTasksCommand, TASKS_COMMAND } from "./chat-commands.js";
+import { CHAT_COMMANDS, CHAT_COMMAND_NAMES, LOCALIZED_CHAT_COMMAND_MENUS, parseTasksCommand, TASKS_COMMAND } from "./chat-commands.js";
 import { startTypingLoop } from "./typing-loop.js";
 
 /**
@@ -889,8 +889,12 @@ export class TelegramChannel implements Channel {
     this.botUsername = this.bot.botInfo.username;
     log.info({ username: this.botUsername }, "Bot identity loaded");
 
-    // Register commands with Telegram so they show in the menu
+    // Register commands with Telegram so they show in the menu: English by
+    // default, and a translated menu for clients set to each other language.
     await this.bot.api.setMyCommands([...CHAT_COMMANDS]);
+    for (const menu of LOCALIZED_CHAT_COMMAND_MENUS) {
+      await this.bot.api.setMyCommands(menu.commands, { language_code: menu.languageCode as LanguageCode });
+    }
 
     this.startPolling();
   }

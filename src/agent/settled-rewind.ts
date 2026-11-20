@@ -1,7 +1,7 @@
 import { statSync } from "node:fs";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { log } from "../logger.js";
-import { prepareSessionRewind, SessionHistoryChangedError, type PreparedRewind } from "./session-rewind.js";
+import { prepareSessionRewind, RewindError, rewindFailureMessage, SessionHistoryChangedError, type PreparedRewind } from "./session-rewind.js";
 
 export interface SettleOptions {
   /** The transcript must be unchanged for this long before it is read. */
@@ -16,11 +16,11 @@ export interface SettleOptions {
   signal?: AbortSignal;
 }
 
-export const REWIND_ABORTED = "Tomo is stopping. Try again after restart.";
+export const REWIND_ABORTED = rewindFailureMessage({ kind: "stopping" });
 
 const DEFAULTS: Required<Omit<SettleOptions, "signal">> = { quietMs: 500, maxWaitMs: 5_000, pollMs: 50, attempts: 3 };
 
-export const HISTORY_KEPT_CHANGING = "Session history kept changing during rewind. Try again in a moment.";
+export const HISTORY_KEPT_CHANGING = rewindFailureMessage({ kind: "kept_changing" });
 
 function fileVersion(path: string): { version: string; mtimeMs: number } {
   try {
@@ -76,7 +76,7 @@ export async function prepareSettledSessionRewind(
 ): Promise<PreparedRewind> {
   const { quietMs, maxWaitMs, pollMs, attempts } = { ...DEFAULTS, ...options };
   const { signal } = options;
-  const aborted = () => new Error(REWIND_ABORTED);
+  const aborted = () => new RewindError({ kind: "stopping" });
   const path = getSdkSessionPath(sessionId, sdkSessionsDir);
   for (let attempt = 1; ; attempt++) {
     if (signal?.aborted) throw aborted();
@@ -98,7 +98,7 @@ export async function prepareSettledSessionRewind(
       if (!(err instanceof SessionHistoryChangedError)) throw err;
       if (attempt >= attempts) {
         log.warn({ sessionId, attempts }, "Rewind: transcript kept changing; giving up");
-        throw new SessionHistoryChangedError(HISTORY_KEPT_CHANGING);
+        throw new SessionHistoryChangedError("kept_changing");
       }
       log.info({ sessionId, attempt }, "Rewind: transcript changed while preparing; retrying");
     }

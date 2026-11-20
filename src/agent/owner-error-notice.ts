@@ -1,3 +1,4 @@
+import { joinText, ownerT, type OwnerT, type OwnerText } from "../i18n/index.js";
 import { log } from "../logger.js";
 import { classifyTurnError, type TurnErrorClass } from "./api-errors.js";
 
@@ -32,9 +33,9 @@ export interface SuppressedErrorReport {
    *  to (for a summoned group, the group's key, not the dm: key it ran on). */
   noticeKey: string;
   /** Human label for the session, e.g. `group "Family" (imessage:…)`. */
-  label: string;
+  label: OwnerText;
   /** What failed, sentence-initial: "A message turn", "Cron job \"x\"". */
-  turnKind: string;
+  turnKind: OwnerText;
   /** The error text (thrown message or agent-error response). */
   detail: string;
   /** SDK session id of the session the turn ran on, for the compact hint. */
@@ -52,7 +53,7 @@ export interface SuppressedErrorReport {
 export interface OwnerErrorNotifierDeps {
   /** Deliver a DM to the owner (Agent.sendNotification). Resolving false
    *  means there was no owner target; it counts as a failed send. */
-  send(text: string, report: SuppressedErrorReport): Promise<boolean | void>;
+  send(text: OwnerText, report: SuppressedErrorReport): Promise<boolean | void>;
   /** Config gate, read per report so a config reload applies. */
   enabled(): boolean;
   now?: () => number;
@@ -65,12 +66,14 @@ interface WindowState {
   dropped: number;
 }
 
-const CLASS_LABEL: Record<TurnErrorClass, string> = {
-  safeguard: "safety classifier refusal",
-  auth: "authentication failure",
-  "usage-limit": "usage limit reached",
-  other: "error",
-};
+function classLabel(t: OwnerT<"notices">, cls: TurnErrorClass): OwnerText {
+  switch (cls) {
+    case "safeguard": return t("suppressed.class.safeguard");
+    case "auth": return t("suppressed.class.auth");
+    case "usage-limit": return t("suppressed.class.usageLimit");
+    case "other": return t("suppressed.class.other");
+  }
+}
 
 /** Local wall-clock ISO 8601 with offset, to the millisecond — what
  *  `tomo lcm compact --from-time/--to-time` parses, as an exact instant (so
@@ -90,7 +93,7 @@ export function errorExcerpt(detail: string): string {
   return line.length > EXCERPT_MAX_CHARS ? `${line.slice(0, EXCERPT_MAX_CHARS - 1)}…` : line;
 }
 
-function recoveryHint(cls: TurnErrorClass, report: SuppressedErrorReport, failedAt: number): string {
+function recoveryHint(t: OwnerT<"notices">, cls: TurnErrorClass, report: SuppressedErrorReport, failedAt: number): OwnerText {
   switch (cls) {
     case "safeguard": {
       const sid = report.sdkSessionId ?? "<session-id>";
@@ -99,32 +102,30 @@ function recoveryHint(cls: TurnErrorClass, report: SuppressedErrorReport, failed
       const from = report.lastGoodTurnAt !== undefined
         ? localIsoTime(report.lastGoodTurnAt)
         : "<time of the last turn that worked>";
-      const compact = `compact the range since the last good turn: tomo lcm compact --session-id ${sid} --from-time ${from} --to-time ${localIsoTime(failedAt)} --summary "<summary>"`;
-      const rewind = report.rewindable ? " — or send /rewind in this DM" : "";
-      return `Recovery: ${compact}${rewind}. Until that is done and the session reloads, the next turn there may still be refused.`;
+      const command = `tomo lcm compact --session-id ${sid} --from-time ${from} --to-time ${localIsoTime(failedAt)} --summary "<summary>"`;
+      return report.rewindable ? t("suppressed.recoverySafeguardRewind", { command }) : t("suppressed.recoverySafeguard", { command });
     }
     case "auth":
       // /login is a harness command (ChatCommandHandler), not a model turn,
       // so it works while every model turn is failing on auth.
-      return "Recovery: send /login in this DM to refresh the Claude login (handled by Tomo directly, no model turn needed). If that fails, run `claude auth login` on the host.";
+      return t("suppressed.recoveryAuth");
     case "usage-limit":
-      return "Recovery: wait for the usage window to reset (/usage shows when).";
+      return t("suppressed.recoveryUsageLimit");
     default:
-      return "Recovery: check the Tomo log (~/.tomo/logs/tomo.log) for details.";
+      return t("suppressed.recoveryOther");
   }
 }
 
-export function formatOwnerNotice(report: SuppressedErrorReport, cls: TurnErrorClass, dropped: number, failedAt: number = Date.now()): string {
+export function formatOwnerNotice(report: SuppressedErrorReport, cls: TurnErrorClass, dropped: number, failedAt: number = Date.now()): OwnerText {
+  const t = ownerT("notices");
   const lines = [
-    `⚠️ ${report.turnKind} in ${report.label} failed; the error was kept out of that chat.`,
-    `Kind: ${CLASS_LABEL[cls]}`,
-    `Error: ${errorExcerpt(report.detail)}`,
+    t("suppressed.header", { turn: report.turnKind, label: report.label }),
+    t("suppressed.kind", { kind: classLabel(t, cls) }),
+    t("suppressed.error", { error: errorExcerpt(report.detail) }),
   ];
-  if (dropped > 0) {
-    lines.push(`This kind of failure happened ${dropped} more time${dropped === 1 ? "" : "s"} there since the last notice.`);
-  }
-  lines.push(recoveryHint(cls, report, failedAt));
-  return lines.join("\n");
+  if (dropped > 0) lines.push(t("suppressed.dropped", { count: dropped }));
+  lines.push(recoveryHint(t, cls, report, failedAt));
+  return joinText(lines);
 }
 
 export class OwnerErrorNotifier {

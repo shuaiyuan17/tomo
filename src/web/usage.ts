@@ -1,4 +1,4 @@
-import { subscriptionLabel, usageWindows, type UsageResult } from "../agent/usage.js";
+import { requestFailure, subscriptionLabel, usageWindows, type UsageResult } from "../agent/usage.js";
 import type { WebUsage } from "./protocol.js";
 
 /** Served from cache this long; the card refreshes on its own every 30 minutes. */
@@ -62,7 +62,7 @@ export class UsageCache {
   private async load(): Promise<WebUsage> {
     let result: UsageResult;
     try { result = await this.fetchUsage(); }
-    catch { result = { ok: false, reason: "network", message: "Claude usage unavailable: network error." }; }
+    catch { result = requestFailure("network"); }
     const now = this.now();
     if (result.ok) {
       const windows = usageWindows(result.data);

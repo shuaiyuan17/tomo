@@ -1,3 +1,5 @@
+import { RewindError } from "./session-rewind.js";
+import type { OwnerText } from "../i18n/index.js";
 import { createHash } from "node:crypto";
 import type {
   ElicitationRequest,
@@ -184,7 +186,7 @@ export interface LiveSessionManagerDeps {
    * The owner-notice path (Agent.notifyOwner), for an MCP server automatic
    * reconnects could not bring back. Absent: logged only.
    */
-  notifyOwner?(text: string): Promise<boolean>;
+  notifyOwner?(text: OwnerText): Promise<boolean>;
 }
 
 /** How long an explicit (web / chat) reconnect is waited for; under the web's MCP_RECONNECT_RPC_TIMEOUT_MS. */
@@ -565,8 +567,8 @@ export class LiveSessionManager {
    * `release()` MUST be called (finally) — held turns are waiting on it.
    */
   async suspendForRewind(key: string, timeoutMs = REWIND_SUSPEND_TIMEOUT_MS): Promise<{ stoppedTurn: boolean; droppedMessages: number; release: () => void }> {
-    if (this.stopping) throw new Error("Tomo is stopping. Try again after restart.");
-    if (this.sessionHolds.has(key)) throw new Error("A rewind is already in progress.");
+    if (this.stopping) throw new RewindError({ kind: "stopping" });
+    if (this.sessionHolds.has(key)) throw new RewindError({ kind: "in_progress" });
     let releaseHold!: () => void;
     const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
     this.sessionHolds.set(key, hold);

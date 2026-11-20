@@ -175,7 +175,7 @@ describe("TurnRunner hands suppressed errors to the owner notifier", () => {
       silentMatcher: isSilentReply,
       transcript: "always",
       errors: {
-        visiblePrefix: "[error] ",
+        visibleError: "reply",
         response: "deliver",
         thrown: "ignore",
         thrownLogMessage: "Error handling message",

@@ -1,3 +1,4 @@
+import { LOCALES, ownerLocale, ownerT, type Locale, type OwnerT, type OwnerText } from "../i18n/index.js";
 import { randomInt, randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize } from "node:path";
@@ -202,16 +203,19 @@ export function resolveRequestedPath(p: string, workspaceDir: string): string | 
   return real;
 }
 
-const ACCESS_WORDS: Record<PermissionAccess, string> = { read: "read", write: "read and write" };
+function accessWords(t: OwnerT<"permissions">, access: PermissionAccess): OwnerText {
+  return access === "write" ? t("access.write") : t("access.read");
+}
 
-/** The four-line DM the owner gets for a request. */
-export function permissionDmText(view: PermissionRequestView, minutes: number): string {
-  return [
-    `Permission request ${view.code}: a group wants to ${ACCESS_WORDS[view.access]} a path.`,
-    `${view.group} · ${view.path}`,
-    `Reason (from the agent, not verified): ${view.reason}`,
-    `Reply "1 ${view.code}" allow once (file tools only; shell needs always), "2 ${view.code}" always allow, "3 ${view.code}" deny, or quote this. Expires in ${minutes} min.`,
-  ].join("\n");
+/** The four-line DM the owner gets for a request, in the owner's language (default: config `locale`). */
+export function permissionDmText(view: PermissionRequestView, minutes: number, locale: Locale = ownerLocale()): OwnerText {
+  const t = ownerT("permissions", locale);
+  return t("dm", { code: view.code, access: accessWords(t, view.access), group: view.group, path: view.path, reason: view.reason, minutes });
+}
+
+/** Does `text` quote request `code`'s DM? Checked in every locale: the DM may predate a language change. */
+function quotesRequest(text: string, code: string): boolean {
+  return LOCALES.some((locale) => text.includes(ownerT("permissions", locale)("marker", { code })));
 }
 
 function oneLine(s: string, max: number): string {
@@ -440,15 +444,16 @@ export class PermissionBroker {
     const text = message.rawText.trim();
     if (text.length > 24) return false;
 
+    const t = ownerT("permissions");
     const revoke = /^revoke\s+(G-[A-Z0-9]{6})$/i.exec(text);
     if (revoke) {
       channel.forgetMessage?.(message.chatId, message.id);
       const grantId = revoke[1].toUpperCase();
       const done = this.revokeGrant(grantId, channel.name as DecisionChannel);
       await this.say(channel, message.chatId, done === null
-        ? `No "always allow" has the id ${grantId}, so nothing was revoked.`
-        : done.ok ? `Revoked ${grantId}: ${this.deps.groupTitle(done.groupKey) || done.groupKey} can no longer reach ${done.path}.`
-          : `Could not revoke ${grantId}: the config file could not be written.`);
+        ? t("revokeUnknown", { grant: grantId })
+        : done.ok ? t("revoked", { grant: grantId, group: this.deps.groupTitle(done.groupKey) || done.groupKey, path: done.path })
+          : t("revokeFailed", { grant: grantId }));
       return true;
     }
 
@@ -470,14 +475,14 @@ export class PermissionBroker {
 
     channel.forgetMessage?.(message.chatId, message.id);
     if (!this.isOpen(request)) {
-      await this.say(channel, message.chatId, `Permission request ${request.code} is no longer open (it was answered or it expired). Nothing changed.`);
+      await this.say(channel, message.chatId, t("closedLate", { code: request.code }));
       return true;
     }
     const result = this.decide(request.id, decision, channel.name as DecisionChannel);
     if (!result.ok) {
       await this.say(channel, message.chatId, result.code === "permission_config_unwritable"
-        ? `Could not save "always allow" for ${request.code}: the config file could not be written. The request is still open; reply again, or allow once.`
-        : `Permission request ${request.code} is no longer open. Nothing changed.`);
+        ? t("alwaysUnwritable", { code: request.code })
+        : t("closed", { code: request.code }));
       return true;
     }
     await this.say(channel, message.chatId, confirmationText(result.outcome, request, result.grantId));
@@ -494,7 +499,7 @@ export class PermissionBroker {
       ?? message.text.slice(0, Math.max(0, message.text.length - (message.rawText ?? "").length));
     const all = [...this.pending.values(), ...this.closed];
     return all.find((r) => r.dm?.channel === channel.name && r.dm.chatId === message.chatId
-      && quotedText.includes(`Permission request ${r.code}`));
+      && quotesRequest(quotedText, r.code));
   }
 
   private isOpen(request: PendingRequest): boolean {
@@ -536,7 +541,7 @@ export class PermissionBroker {
     }
   }
 
-  private async say(channel: Channel, chatId: string, text: string): Promise<void> {
+  private async say(channel: Channel, chatId: string, text: OwnerText): Promise<void> {
     try {
       await channel.send({ chatId, text });
     } catch {
@@ -566,8 +571,9 @@ function outcomeText(outcome: PermissionOutcome, r: PendingRequest): string {
   }
 }
 
-function confirmationText(outcome: Exclude<PermissionOutcome, "timed_out">, r: PendingRequest, grantId?: string): string {
-  if (outcome === "allowed_once") return `Allowed once (${r.code}): ${r.group} may ${ACCESS_WORDS[r.access]} ${r.path} for one turn, with file tools (not the shell).`;
-  if (outcome === "allowed_always") return `Always allowed (${r.code}): ${r.group} may ${ACCESS_WORDS[r.access]} ${r.path}. Saved to its sandbox config as ${grantId}; reply "revoke ${grantId}" to take it back.`;
-  return `Denied (${r.code}).`;
+function confirmationText(outcome: Exclude<PermissionOutcome, "timed_out">, r: PendingRequest, grantId?: string): OwnerText {
+  const t = ownerT("permissions");
+  if (outcome === "allowed_once") return t("allowedOnce", { code: r.code, group: r.group, access: accessWords(t, r.access), path: r.path });
+  if (outcome === "allowed_always") return t("allowedAlways", { code: r.code, group: r.group, access: accessWords(t, r.access), path: r.path, grant: grantId });
+  return t("denied", { code: r.code });
 }

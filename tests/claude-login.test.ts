@@ -79,6 +79,7 @@ describe("ClaudeLoginManager", () => {
     await expect(manager.complete("shuai", "one-time-code#test-state")).resolves.toEqual({
       verified: false,
       verificationError: "verification network unavailable",
+      verificationFailure: expect.objectContaining({ message: "verification network unavailable" }),
     });
   });
 

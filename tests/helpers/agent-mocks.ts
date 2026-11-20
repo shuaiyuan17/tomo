@@ -389,6 +389,8 @@ export const mockConfig = {
     error: null as string | null,
   },
   telegramToken: "test-token",
+  /** config `locale`: null is unset, which is English. */
+  locale: null as "en" | "zh-Hans" | null,
   model: "claude-sonnet-5[1m]",
   workspaceDir: "",
   sessionsDir: "",

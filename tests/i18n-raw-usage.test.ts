@@ -13,7 +13,12 @@ import { findEscapeHatches, readSources, type Source } from "./helpers/i18n-ast.
  * found in the AST and resolved through the file's imports of
  * src/i18n/index.ts (named, renamed or namespace), not by text matching.
  */
-const RAW_ALLOWLIST: Record<string, number> = {};
+const RAW_ALLOWLIST: Record<string, number> = {
+  // The Claude and MCP login links a /login or /mcp login reply carries (URLs from the login flow).
+  "src/agent/commands.ts": 2,
+  // An MCP server's authorize link, and an elicitation's own message and link (the server's words).
+  "src/agent/mcp-auth-prompts.ts": 3,
+};
 
 const I18N_MODULE = resolve(import.meta.dirname, "../src/i18n/index.ts");
 

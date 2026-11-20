@@ -9,7 +9,7 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 
 import { Agent, MockChannel, agentEnv, installAgentTestHooks, mockSdk, resetConfig, sdkMock } from "./helpers/agent-harness.js";
 import { TodoStore, todosDir } from "../src/todos/store.js";
-import { parseTodoArgs, TODO_USAGE } from "../src/agent/todo-command.js";
+import { parseTodoArgs, todoUsage } from "../src/agent/todo-command.js";
 import { CHAT_COMMAND_NAMES } from "../src/channels/chat-commands.js";
 
 installAgentTestHooks();
@@ -80,7 +80,7 @@ describe("/todo chat command", () => {
     await tg.simulateCommand("todo", OWNER_ID, "Shuai", "done t-99", OWNER_ID);
     expect(tg.sent[3].text).toBe("No open todo t-99 in this conversation.");
     await tg.simulateCommand("todo", OWNER_ID, "Shuai", "snooze t-1", OWNER_ID);
-    expect(tg.sent[4].text).toBe(TODO_USAGE);
+    expect(tg.sent[4].text).toBe(todoUsage("en"));
     expect(store.list().map((i) => i.id)).toEqual(["t-1", "t-3"]);
     const log = readFileSync(join(todosDir(), "done.ndjson"), "utf-8").trim().split("\n").map((l) => JSON.parse(l));
     expect(log).toEqual([
@@ -88,6 +88,33 @@ describe("/todo chat command", () => {
       expect.objectContaining({ id: "t-2", resolution: "drop", reason: "changed plans", resolved_by: "owner" }),
     ]);
     expect(queryCalls()).toBe(before);
+    await agent.stop();
+  });
+
+  it("under config locale zh-Hans, replies and the store's rule errors are Chinese; the model's tools keep the English message", async () => {
+    const { agent, tg, store } = setup();
+    resetConfig({ locale: "zh-Hans" });
+    await tg.simulateCommand("todo", OWNER_ID, "Shuai", "done t-99", OWNER_ID);
+    expect(tg.sent[0].text).toBe("这个对话里没有未完成的待办 t-99。");
+    await tg.simulateCommand("todo", OWNER_ID, "Shuai", `add ${"x".repeat(400)}`, OWNER_ID);
+    expect(tg.sent[1].text).toMatch(/^title 有 400 个字符，上限是 \d+。/);
+    await tg.simulateCommand("todo", OWNER_ID, "Shuai", "done t-1", OWNER_ID);
+    expect(tg.sent[2].text).toBe("已完成：t-1 owner private errand");
+    // The same refusal, as the model's todo tools see it.
+    expect(() => store.resolve("t-99", { action: "done", by: "self" })).toThrow("No open todo t-99 in this conversation.");
+    await agent.stop();
+  });
+
+  it("an unreadable store: Chinese guidance under zh-Hans, the path and the parser's detail as they are", async () => {
+    const { agent, tg } = setup();
+    const file = join(todosDir(), "todos.json");
+    writeFileSync(file, "{ not json");
+    await tg.simulateCommand("todo", OWNER_ID, "Shuai", "", OWNER_ID);
+    expect(tg.sent[0].text).toMatch(new RegExp(`^Todos are unavailable: todo store could not be read: ${file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} \\(.+\\)\\. Nothing was changed; fix or restore the file\\.$`));
+    resetConfig({ locale: "zh-Hans" });
+    await tg.simulateCommand("todo", OWNER_ID, "Shuai", "", OWNER_ID);
+    expect(tg.sent[1].text.startsWith(`无法读取待办：无法读取待办存储：${file}（`)).toBe(true);
+    expect(tg.sent[1].text.endsWith("）。没有做任何改动，请修复或恢复这个文件。")).toBe(true);
     await agent.stop();
   });
 

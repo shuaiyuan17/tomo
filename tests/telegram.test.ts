@@ -1211,3 +1211,22 @@ describe("TelegramChannel.startTyping", () => {
     expect(calls).toHaveLength(atCap);
   });
 });
+
+describe("the Telegram command menu", () => {
+  it("registers the English menu as the default and a Chinese one for zh clients, same commands", async () => {
+    const channel = new TelegramChannel("000000:test-token");
+    const bot = (channel as unknown as { bot: { init: () => Promise<void>; botInfo: unknown; api: unknown } }).bot;
+    const calls: Array<[Array<{ command: string; description: string }>, { language_code?: string } | undefined]> = [];
+    bot.init = async () => { bot.botInfo = { id: 1, is_bot: true, first_name: "Tomo", username: "mybot" }; };
+    bot.api = { setMyCommands: async (commands: Array<{ command: string; description: string }>, other?: { language_code?: string }) => { calls.push([commands, other]); return true; } };
+    (channel as unknown as { startPolling: () => void }).startPolling = () => {};
+
+    await channel.start();
+
+    expect(calls.map(([, other]) => other?.language_code)).toEqual([undefined, "zh"]);
+    const [[english], [chinese]] = calls;
+    expect(chinese.map((c) => c.command)).toEqual(english.map((c) => c.command));
+    expect(english.find((c) => c.command === "new")?.description).toBe("Start a new conversation");
+    expect(chinese.find((c) => c.command === "new")?.description).toBe("开始新对话");
+  });
+});

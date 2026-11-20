@@ -1,29 +1,17 @@
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
 import { baseKey, flattenCatalog, isOptionalPluralForm, placeholdersOf } from "../../src/i18n/catalog.js";
+import { findUsedKeys, isDynamic, type Source } from "./i18n-ast.js";
+
+export { readSources, type Source } from "./i18n-ast.js";
 
 /** One app's catalogs and the source that uses them. */
 export interface CatalogSet {
   name: string;
   /** locale → namespace → catalog; `en` is the source. */
   resources: Record<string, Record<string, object>>;
-  /** The concatenated source the keys must appear in (catalog files excluded). */
-  source: string;
-}
-
-/** Every .ts/.tsx file under `roots`, minus any path containing `/catalogs/`, concatenated. */
-export function readSource(roots: readonly string[]): string {
-  const out: string[] = [];
-  const walk = (dir: string) => {
-    for (const name of readdirSync(dir)) {
-      const path = join(dir, name);
-      if (name === "node_modules" || path.includes("/catalogs")) continue;
-      if (statSync(path).isDirectory()) walk(path);
-      else if (/\.(ts|tsx)$/.test(name) && !name.endsWith(".d.ts")) out.push(readFileSync(path, "utf8"));
-    }
-  };
-  for (const root of roots) walk(root);
-  return out.join("\n");
+  /** The source files whose translator calls must use every key (catalog files excluded). */
+  sources: readonly Source[];
+  /** The namespace a bare, unbound `t("key")` call means (the web UI's `defaultNS`). */
+  defaultNS?: string;
 }
 
 const same = (a: Set<string>, b: Set<string>) => a.size === b.size && [...a].every((x) => b.has(x));
@@ -38,7 +26,8 @@ function pluralCategory(key: string, keys: ReadonlyMap<string, string>): string 
 /**
  * Problems inside one locale's catalog: empty texts; a plural form for a
  * category the language does not have (`Intl.PluralRules`: Chinese has only
- * `other`, so a Chinese `_one` is dead copy); and a form whose placeholders
+ * `other`, so a Chinese `_one` is dead copy; `_zero` is allowed everywhere,
+ * because i18next tries it first for `count: 0` whatever CLDR says); and a form whose placeholders
  * differ from its family's `_other` beyond `count`. Only the `zero` / `one` /
  * `two` forms may drop `{{count}}` ("One message"), because each stands for
  * a single number.
@@ -50,7 +39,7 @@ function localProblems(prefix: string, locale: string, flat: ReadonlyMap<string,
     if (!text.trim()) problems.push(`${prefix}: "${key}" is empty`);
     const category = pluralCategory(key, flat);
     if (!category) continue;
-    if (!categories.has(category)) problems.push(`${prefix}: "${key}" is a "${category}" form, which ${locale} does not have`);
+    if (category !== "zero" && !categories.has(category)) problems.push(`${prefix}: "${key}" is a "${category}" form, which ${locale} does not have`);
     const other = flat.get(`${baseKey(key, flat)}_other`);
     if (category === "other" || other === undefined) continue;
     const want = placeholdersOf(other);
@@ -70,8 +59,9 @@ function localProblems(prefix: string, locale: string, flat: ReadonlyMap<string,
  * - each translated text has exactly the placeholders of the same English
  *   form (a form English lacks is compared with the family's `_other`);
  * - the per-locale checks above, English included;
- * - every English key is used somewhere in the source as a literal (keys
- *   are written out in full, never built at runtime).
+ * - every English key is used: a translator call bound to its namespace
+ *   with the key as a literal (see findUsedKeys), or declared dynamic with
+ *   an `// i18n-dynamic: ns:prefix*` comment.
  */
 export function catalogProblems(set: CatalogSet): string[] {
   const problems: string[] = [];
@@ -97,11 +87,11 @@ export function catalogProblems(set: CatalogSet): string[] {
       problems.push(...localProblems(prefix, locale, target));
     }
   }
+  const uses = findUsedKeys(set.sources, new Set(Object.keys(en)), set.defaultNS);
   for (const [ns, catalog] of Object.entries(en)) {
     const flat = flattenCatalog(catalog);
     for (const key of new Set([...flat.keys()].map((k) => baseKey(k, flat)))) {
-      const used = [`"${key}"`, `'${key}'`, `\`${key}\``, `"${ns}:${key}"`].some((needle) => set.source.includes(needle));
-      if (!used) problems.push(`${set.name} en ${ns}: "${key}" is never used`);
+      if (!uses.used.get(ns)?.has(key) && !isDynamic(uses, ns, key)) problems.push(`${set.name} en ${ns}: "${key}" is never used`);
     }
   }
   return problems;

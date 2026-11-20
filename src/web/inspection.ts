@@ -9,6 +9,7 @@ import { computeContextStatsFromEvents, type SdkEvent } from "../lcm/stats.js";
 import { summaryBlocksFromEvents, type SummaryBlock } from "../lcm/summary-reader.js";
 import type { SessionEntry } from "../sessions/types.js";
 import { WebError, type WebContext, type WebCronJob } from "./protocol.js";
+import { isEnoent } from "../fs-utils.js";
 
 /**
  * Optimistic concurrency over what the owner reviewed — the job's intent —
@@ -54,7 +55,7 @@ export class WebCron {
     let file;
     try { file = await open(this.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
     catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      if (isEnoent(error)) return [];
       throw new WebError(503, "cron_unavailable");
     }
     try {
@@ -162,7 +163,7 @@ export async function readSessionContext(entry: SessionEntry | undefined, sdkSes
     } finally { await file.close(); }
   } catch (error) {
     if (error instanceof WebError && error.code === "context_limit") return { ...none, analysisStatus: "too_large" };
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ...none, analysisStatus: "unavailable" };
+    if (isEnoent(error)) return { ...none, analysisStatus: "unavailable" };
     throw error;
   }
 }

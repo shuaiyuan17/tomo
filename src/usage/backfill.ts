@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { isGroupSessionKey } from "../sessions/keys.js";
 import { BACKFILL_FILE, LEDGER_DIR_MODE, LEDGER_FILE_MODE, readLedgerStarted, triggerSnippet, USAGE_LEDGER_VERSION, type UsageLedgerRow, type UsageSource } from "./ledger.js";
 import { localParts } from "./local-time.js";
+import { isEnoent } from "../fs-utils.js";
 
 /**
  * One-off: rebuild the usage ledger's history from the activity log
@@ -321,7 +322,7 @@ export function backfillUsage(options: BackfillOptions): BackfillReport {
     const target = join(options.usageDir, BACKFILL_FILE);
     let text = "";
     try { text = readFileSync(target, "utf8"); }
-    catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+    catch (err) { if (!isEnoent(err)) throw err; }
     const merged: { id: string; ts: number; line: string; row?: Partial<UsageLedgerRow> }[] = [];
     const ids = new Set<string>();
     for (const line of text.split("\n")) {

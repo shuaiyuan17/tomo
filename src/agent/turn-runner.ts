@@ -17,6 +17,7 @@ import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROC
 import { formatInboundStamp } from "./inbound-markers.js";
 import type { OwnerText } from "../i18n/index.js";
 import { formatVisibleError, isSafeguardError, type VisibleErrorKind } from "./api-errors.js";
+import { sleep } from "../sleep.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
 export interface RunWithRetryRequest {
@@ -952,7 +953,7 @@ export class TurnRunner {
         } else if (retryableBlockFailure(err)) {
           const delay = blockRetryDelay(err, this.deps.blockRetryDelayMs ?? DEFAULT_BLOCK_RETRY_DELAY_MS);
           log.warn({ err, sessionKey: spec.key, delayMs: delay }, "Block delivery refused before anything went out; re-sending once");
-          if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+          if (delay > 0) await sleep(delay);
           if (givenUp()) {
             log.warn({ sessionKey: spec.key }, "Block given up on during the re-send back-off; not re-sending");
           } else {

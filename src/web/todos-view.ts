@@ -6,6 +6,7 @@ import { DEFAULT_TODOS, type TodoConfig } from "../todos/limits.js";
 import { parseResolutions, parseTodoFile, TodoStoreError, type TodoItem, type TodoResolution } from "../todos/store.js";
 import { isGroupSessionKey } from "../sessions/keys.js";
 import { MAX_WEB_TODO_RESOLUTIONS, WebError, type WebTodoItem, type WebTodoResolution, type WebTodos } from "./protocol.js";
+import { isEnoent } from "../fs-utils.js";
 
 /** `todos.json` holds a few dozen one-line items; anything larger is not read. */
 export const MAX_TODO_FILE_BYTES = 1024 * 1024;
@@ -30,7 +31,7 @@ async function readTail(path: string, max: number, limit?: number): Promise<{ te
   let file;
   try { file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
   catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    if (isEnoent(error)) return null;
     throw new WebError(503, "todos_unavailable");
   }
   try {

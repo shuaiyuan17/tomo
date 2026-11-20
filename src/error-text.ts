@@ -132,3 +132,12 @@ function clip(text: string, max: number): string {
 function clipStart(text: string, max: number): string {
   return text.length > max ? `…${text.slice(text.length - max + 1)}` : text;
 }
+
+/**
+ * The bare message of a thrown value: `err.message` for an Error, `String()`
+ * for anything else. For logs and plain-text reasons that want ONLY the
+ * message; `describeError` is the one that adds the structured fields.
+ */
+export function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}

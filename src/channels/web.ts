@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
-import { writeJsonAtomicSync } from "../fs-utils.js";
+import { writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
 import { log } from "../logger.js";
 import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
 import type { Channel, CommandHandler, IncomingMessage, MessageHandler, MessageReaction, OutgoingMessage } from "./types.js";
@@ -784,7 +784,7 @@ export class WebChannel implements Channel {
   private loadReactions(path: string): void {
     let raw: string;
     try { raw = readFileSync(path, "utf8"); } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") this.reactionsPath = path;
+      if (isEnoent(err)) this.reactionsPath = path;
       else log.warn({ err, path }, "Web reactions file unreadable; Tomo's reactions on web messages are kept in memory only");
       return;
     }

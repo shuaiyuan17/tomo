@@ -10,6 +10,7 @@ import {
   promptTelegramUserId,
   type PromptPort,
 } from "./config/owner-setup.js";
+import { errorMessage } from "../error-text.js";
 
 export type InitChannel = "telegram" | "imessage";
 
@@ -213,7 +214,7 @@ export async function checkClaudeRuntime(deps: {
   try {
     version = await getVersion(exe);
   } catch (err) {
-    return { kind: "missing", error: err instanceof Error ? err.message : String(err) };
+    return { kind: "missing", error: errorMessage(err) };
   }
   if ((deps.env ?? process.env).ANTHROPIC_API_KEY?.trim()) return { kind: "ok", version, auth: "api-key" };
   try {
@@ -221,7 +222,7 @@ export async function checkClaudeRuntime(deps: {
     return { kind: "ok", version, auth: "logged-in" };
   } catch (err) {
     const reason = classifyVerifyFailure(err);
-    if (reason) return { kind: "unverified", version, reason, detail: err instanceof Error ? err.message : String(err) };
+    if (reason) return { kind: "unverified", version, reason, detail: errorMessage(err) };
     return { kind: "not-logged-in", version };
   }
 }

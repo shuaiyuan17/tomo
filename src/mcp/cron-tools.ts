@@ -4,6 +4,7 @@ import { CronStore, CronStoreReadError, parseCreatableSchedule, parseStaleAfter,
 import { canManageJob, isStorableSessionKey } from "../cron/scope.js";
 import { MIXED_AUDIENCE_KEY } from "../agent/audience.js";
 import type { CronJob, CronRunStatus } from "../cron/types.js";
+import { errorMessage } from "../error-text.js";
 
 /**
  * MCP tool factories for the cron store. Registered onto the
@@ -194,7 +195,7 @@ export function buildCronTools(
           // rewrites a perfectly good schedule string forever.
           const detail = err instanceof CronStoreReadError
             ? `the schedule store could not be read (${err.path}) — the schedule itself is valid`
-            : err instanceof Error ? err.message : String(err);
+            : errorMessage(err);
           return {
             content: [{ type: "text" as const, text: `schedule_create failed: ${detail}` }],
             isError: true,

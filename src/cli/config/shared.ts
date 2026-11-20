@@ -1,7 +1,7 @@
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { MODEL_ALIASES, modelLabel } from "../../models.js";
-import { backupFileIfExistsSync, writeJsonAtomicSync } from "../../fs-utils.js";
+import { backupFileIfExistsSync, writeJsonAtomicSync, isEnoent } from "../../fs-utils.js";
 import { defaultRuntimePaths } from "../../runtime-paths.js";
 import { threeWayMerge, withConfigLockSync } from "../../config-file.js";
 
@@ -43,7 +43,7 @@ function readConfigFile(path: string): Record<string, unknown> | undefined {
   try {
     raw = readFileSync(path, "utf-8");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if (isEnoent(err)) return undefined;
     throw new ConfigReadError(path, err);
   }
   let data: unknown;

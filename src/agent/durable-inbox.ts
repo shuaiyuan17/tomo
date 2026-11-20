@@ -18,6 +18,7 @@ import type { DocumentAttachment, ImageAttachment, IncomingMessage } from "../ch
 import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord } from "../jsonl.js";
 import { log } from "../logger.js";
 import type { SessionResolution } from "../router.js";
+import { isEnoent } from "../fs-utils.js";
 
 /**
  * DURABLE INBOUND INBOX.
@@ -495,7 +496,7 @@ export class DurableInbox {
     try {
       text = readFileSync(this.path, "utf8");
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+      if (isEnoent(err)) return;
       this.readFailed = true;
       log.error({ err, path: this.path }, "Durable inbox: log unreadable; replay and dedup are off for this run, compaction disabled");
       return;

@@ -1,5 +1,6 @@
 import { appendFile, chmod, mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
+import { isEnoent } from "../fs-utils.js";
 
 const chains = new Map<string, Promise<unknown>>();
 
@@ -12,7 +13,7 @@ async function inspect(path: string): Promise<{ torn: boolean; mode: number } | 
   try {
     handle = await open(path, "r");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if (isEnoent(err)) return undefined;
     throw err;
   }
   try {

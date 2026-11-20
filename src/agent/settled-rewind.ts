@@ -2,6 +2,7 @@ import { statSync } from "node:fs";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { log } from "../logger.js";
 import { prepareSessionRewind, RewindError, rewindFailureMessage, SessionHistoryChangedError, type PreparedRewind } from "./session-rewind.js";
+import { sleep } from "../sleep.js";
 
 export interface SettleOptions {
   /** The transcript must be unchanged for this long before it is read. */
@@ -44,7 +45,7 @@ export async function waitForQuietFile(path: string, quietMs: number, maxWaitMs:
   let quietSince = Math.min(Date.now(), initial.mtimeMs);
   while (Date.now() - quietSince < quietMs) {
     if (Date.now() >= deadline || signal?.aborted) return false;
-    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    await sleep(pollMs);
     const next = fileVersion(path).version;
     if (next !== version) {
       version = next;

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { statSync } from "node:fs";
 import { dirname } from "node:path";
+import { errorMessage } from "./error-text.js";
 
 export const DEFAULT_CONTINUITY_SCRIPT_TIMEOUT_MS = 30_000;
 /**
@@ -50,7 +51,7 @@ export async function runContinuityScript(script: ContinuityScriptConfig): Promi
       return formatPreflightFailure(scriptPath, "path is not a file");
     }
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err);
+    const detail = errorMessage(err);
     return formatPreflightFailure(scriptPath, detail);
   }
 

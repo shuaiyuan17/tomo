@@ -4,6 +4,7 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import { expandTilde } from "./bash-write-targets.js";
 import { abs, foldPath, isInside, isInsideExact, realResolve } from "./permission-paths.js";
 import { attachmentPathsIn, barredSearch, effectiveSearchRoot, SEARCH_TOOLS, SEND_MESSAGE_TOOL } from "./private-memory-access.js";
+import { isEnoent } from "../fs-utils.js";
 
 /**
  * The ONE path policy for a group turn, shared by the Bash sandbox profile
@@ -191,7 +192,7 @@ export function protectedLinkTargets(tomoHome: string | undefined): { targets: s
   try {
     names = readdirSync(tomoHome);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { targets: [] };
+    if (isEnoent(err)) return { targets: [] };
     return { targets: [], unresolvable: `Tomo's home (${tomoHome}) cannot be listed` };
   }
   const targets: string[] = [];

@@ -5,6 +5,7 @@ import { defaultRuntimePaths } from "../runtime-paths.js";
 import { acquirePidFile, readPidFileRecord, releasePidFile } from "./pidfile.js";
 import { getRunningPid } from "./status-info.js";
 import type { CronJob } from "../cron/types.js";
+import { sleep } from "../sleep.js";
 
 const TOMO_HOME = defaultRuntimePaths.tomoHome;
 const PID_FILE = defaultRuntimePaths.pidFile;
@@ -513,7 +514,7 @@ export async function awaitBackgroundClaim(opts: {
     if (readPidFileRecord(opts.pidFile)?.pid === opts.childPid) return { kind: "claimed" };
     // Let a settled `exited` land before judging; a child that exits 1 the
     // instant after our poll must be reported as exited, not as slow.
-    await new Promise((r) => setTimeout(r, 0));
+    await sleep(0);
     if (exitCode !== undefined) {
       // One last look: the child may have claimed and been killed in the gap.
       if (readPidFileRecord(opts.pidFile)?.pid === opts.childPid) return { kind: "claimed" };
@@ -521,6 +522,6 @@ export async function awaitBackgroundClaim(opts: {
     }
     const waitedMs = Date.now() - started;
     if (waitedMs >= timeoutMs) return { kind: "timeout", waitedMs };
-    await new Promise((r) => setTimeout(r, Math.min(pollMs, timeoutMs - waitedMs)));
+    await sleep(Math.min(pollMs, timeoutMs - waitedMs));
   }
 }

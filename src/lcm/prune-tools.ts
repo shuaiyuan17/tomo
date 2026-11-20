@@ -13,6 +13,7 @@ import {
 import { log } from "../logger.js";
 import type { TranscriptEvent } from "../sessions/transcript-event.js";
 import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord } from "../jsonl.js";
+import { errorMessage } from "../error-text.js";
 
 export interface PruneToolsRequest {
   sdkSessionId: string;
@@ -252,7 +253,7 @@ function pruneToolsWithFd(req: PruneToolsRequest, path: string, sourceFd: number
         pruned: [],
         totalCharsRemoved: 0,
         error: `Could not archive the pre-prune snapshot to ${req.archivePath}: ` +
-          `${err instanceof Error ? err.message : String(err)}; session left unchanged`,
+          `${errorMessage(err)}; session left unchanged`,
       };
     }
   }

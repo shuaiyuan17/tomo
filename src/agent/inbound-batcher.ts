@@ -2,6 +2,7 @@ import type { Channel, IncomingMessage } from "../channels/types.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import type { SessionResolution } from "../router.js";
+import { sleep } from "../sleep.js";
 
 export interface InboundItem {
   channel: Channel;
@@ -222,7 +223,7 @@ export class InboundBatcher {
       const delay = settleUntil - Date.now();
       if (delay <= 0) return;
 
-      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+      await sleep(delay);
     }
   }
 

@@ -9,7 +9,7 @@ import {
   parseJsonl, readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync,
   isRawJsonlLine, reportRawJsonlLines, serializeJsonlRecord, type RawJsonlLine,
 } from "../jsonl.js";
-import { writeJsonAtomicSync } from "../fs-utils.js";
+import { writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
 import { FileLockTimeoutError, isFileLockHeldSync, withFileLockSync, type FileLockOptions } from "../file-lock.js";
 import { watchBus } from "../watch/bus.js";
 import { clip, TRANSCRIPT_TEXT_LIMIT } from "../watch/protocol.js";
@@ -1966,7 +1966,7 @@ export class SessionStore {
       const s = statSync(file);
       stat = { mtimeMs: s.mtimeMs, size: s.size };
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      if (!isEnoent(err)) {
         this.onRegistryLoadFailure(err);
         return;
       }

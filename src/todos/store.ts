@@ -4,7 +4,8 @@ import { z } from "zod";
 import { config, TOMO_HOME } from "../config.js";
 import { DEFAULT_TODOS, type TodoConfig } from "./limits.js";
 import { withFileLockSync, type FileLockOptions } from "../file-lock.js";
-import { writeJsonAtomicSync } from "../fs-utils.js";
+import { writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
+import { errorMessage } from "../error-text.js";
 
 /**
  * The todo primitive's store: commitments that outlive a conversation.
@@ -88,7 +89,7 @@ export class TodoStoreReadError extends TodoStoreError {
   /** What went wrong reading it: the file system's or the parser's own words. */
   readonly detail: string;
   constructor(path: string, cause: unknown) {
-    const detail = cause instanceof Error ? cause.message : String(cause);
+    const detail = errorMessage(cause);
     super(`todo store could not be read: ${path} (${detail}). Nothing was changed; fix or restore the file.`, { cause });
     this.name = "TodoStoreReadError";
     this.path = path;
@@ -544,7 +545,7 @@ export class TodoStore {
     try {
       return readFileSync(this.path, "utf-8");
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      if (isEnoent(err)) return null;
       throw new TodoStoreReadError(this.path, err);
     }
   }
@@ -569,7 +570,7 @@ export class TodoStore {
     try {
       raw = readFileSync(this.donePath, "utf-8");
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return closed;
+      if (isEnoent(err)) return closed;
       throw new TodoStoreReadError(this.donePath, err);
     }
     for (const text of raw.split("\n")) {

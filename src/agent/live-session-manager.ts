@@ -27,6 +27,7 @@ import type { GroupSandboxConfig } from "./group-fs-policy.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
 import { flattenSystemPrompt } from "../workspace/system-prompt-blocks.js";
+import { errorMessage } from "../error-text.js";
 
 /**
  * How long a prompt-stale session may wait for its background tasks before it
@@ -877,7 +878,7 @@ export class LiveSessionManager {
           failures.push({ key, error: result.errors[serverName] ?? "server was removed" });
         }
       } catch (err) {
-        failures.push({ key, error: err instanceof Error ? err.message : String(err) });
+        failures.push({ key, error: errorMessage(err) });
       }
     }
 

@@ -6,6 +6,7 @@ import { writeFileAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import type { ExternalMcpServerConfig, McpOAuthConfig } from "./external-config.js";
+import { errorMessage } from "../error-text.js";
 
 const TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 const AUTH_TIMEOUT_MS = 10 * 60 * 1000;
@@ -1065,10 +1066,6 @@ function parsePastedCallback(text: string): { code: string; state?: string } | n
   // convenience form is deliberately limited to an explicit bare `code=`.
   if (urlForm && !state) return null;
   return { code, state };
-}
-
-function errorMessage(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
 
 function normalizeToken(

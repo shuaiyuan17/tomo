@@ -2,6 +2,7 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, un
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import { webReplySchema, type RequestState, type WebFiledFile, type WebReply } from "./protocol.js";
+import { isEnoent } from "../fs-utils.js";
 
 const isFiledFile = (value: unknown): value is WebFiledFile => {
   const file = value as Partial<WebFiledFile> | null;
@@ -97,7 +98,7 @@ export class WebRequestJournal {
   load(): JournalLoad {
     let raw = "";
     try { raw = readFileSync(this.path, "utf8"); } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw new JournalUnavailableError(err);
+      if (!isEnoent(err)) throw new JournalUnavailableError(err);
     }
     const entries = new Map<string, Entry>();
     const lines = raw.split("\n");

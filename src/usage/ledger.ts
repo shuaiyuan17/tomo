@@ -7,6 +7,7 @@ import { appendLineSerial } from "./append.js";
 import type { ModelTurnUsage } from "../agent/sdk-result.js";
 import type { UsageBaseline } from "../sessions/types.js";
 import { parseTomoEvent } from "../tomo-event.js";
+import { errorMessage } from "../error-text.js";
 
 /**
  * Usage ledger: one NDJSON line per SDK result, appended to
@@ -191,7 +192,7 @@ export class UsageLedger {
     try {
       writeLedgerStarted(this.dir, now);
     } catch (err) {
-      log.warn({ err: err instanceof Error ? err.message : String(err), dir: this.dir }, "Could not record when the usage ledger started");
+      log.warn({ err: errorMessage(err), dir: this.dir }, "Could not record when the usage ledger started");
     }
   }
 
@@ -311,7 +312,7 @@ export class UsageLedger {
     if (this.failing) return;
     this.failing = true;
     log.warn(
-      { err: err instanceof Error ? err.message : String(err), dir: this.dir, sessionKey },
+      { err: errorMessage(err), dir: this.dir, sessionKey },
       "Could not write the usage ledger; this turn's usage is not recorded",
     );
   }

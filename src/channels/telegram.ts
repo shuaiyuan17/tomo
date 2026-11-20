@@ -17,6 +17,7 @@ import { formatReactionMarker, splitText } from "./text-utils.js";
 import { formatMimeToken, sanitizeAttachmentFilename } from "./fileStore.js";
 import { CHAT_COMMANDS, CHAT_COMMAND_NAMES, LOCALIZED_CHAT_COMMAND_MENUS, parseTasksCommand, TASKS_COMMAND } from "./chat-commands.js";
 import { startTypingLoop } from "./typing-loop.js";
+import { errorMessage } from "../error-text.js";
 
 /**
  * A Bot API 400 whose description names an entity-parsing failure — the one
@@ -204,19 +205,10 @@ export class TelegramChannel implements Channel {
       }
       if (ctx.message.text.startsWith("/")) return;
 
-      const isGroup = isGroupChatType(ctx.chat.type);
-      const isMentioned = this.checkMentioned(ctx);
 
       this.dispatch({
-        id: String(ctx.message.message_id),
-        chatId: String(ctx.chat.id),
-        senderName: this.getSenderName(ctx),
-        senderId: this.getSenderId(ctx),
+        ...this.baseInbound(ctx),
         text: this.cleanMention(ctx.message.text),
-        timestamp: ctx.message.date * 1000,
-        isGroup,
-        isMentioned,
-        chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
         // What was typed, for the credential broker (Telegram puts no marker in `text`).
         rawText: ctx.message.text,
         attachmentCount: 0,
@@ -226,8 +218,6 @@ export class TelegramChannel implements Channel {
 
     // Photo messages
     this.bot.on("message:photo", (ctx) => this.ingest(String(ctx.chat.id), String(ctx.message.message_id), async () => {
-      const isGroup = isGroupChatType(ctx.chat.type);
-      const isMentioned = this.checkMentioned(ctx);
       const photos = ctx.message.photo;
       const largest = photos[photos.length - 1];
       // Anyone on Telegram can message a bot, and getFile + the file download
@@ -244,18 +234,11 @@ export class TelegramChannel implements Channel {
       const text = caption ? `${marker} ${caption}` : marker;
 
       this.dispatch({
-        id: String(ctx.message.message_id),
-        chatId: String(ctx.chat.id),
-        senderName: this.getSenderName(ctx),
-        senderId: this.getSenderId(ctx),
+        ...this.baseInbound(ctx),
         text,
         images: image ? [image] : undefined,
         rawText: ctx.message.caption ?? "",
         attachmentCount: 1,
-        timestamp: ctx.message.date * 1000,
-        isGroup,
-        isMentioned,
-        chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
       });
     }));
 
@@ -263,8 +246,6 @@ export class TelegramChannel implements Channel {
     // exposes generic file attachments under `message:document`; we ingest
     // only the MIME types Anthropic accepts as document content blocks.
     this.bot.on("message:document", (ctx) => this.ingest(String(ctx.chat.id), String(ctx.message.message_id), async () => {
-      const isGroup = isGroupChatType(ctx.chat.type);
-      const isMentioned = this.checkMentioned(ctx);
       const doc = ctx.message.document;
 
       // Skip silently if it's not a supported document MIME — emit a plain
@@ -274,17 +255,10 @@ export class TelegramChannel implements Channel {
         const caption = this.cleanMention(ctx.message.caption ?? "");
         const note = formatUnsupportedDocumentNotice(doc.file_name, doc.mime_type);
         this.dispatch({
-          id: String(ctx.message.message_id),
-          chatId: String(ctx.chat.id),
-          senderName: this.getSenderName(ctx),
-          senderId: this.getSenderId(ctx),
+          ...this.baseInbound(ctx),
           text: caption ? `${note} ${caption}` : note,
           rawText: ctx.message.caption ?? "",
           attachmentCount: 1,
-          timestamp: ctx.message.date * 1000,
-          isGroup,
-          isMentioned,
-          chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
         });
         return;
       }
@@ -307,33 +281,21 @@ export class TelegramChannel implements Channel {
       const text = caption ? `${marker} ${caption}` : marker;
 
       this.dispatch({
-        id: String(ctx.message.message_id),
-        chatId: String(ctx.chat.id),
-        senderName: this.getSenderName(ctx),
-        senderId: this.getSenderId(ctx),
+        ...this.baseInbound(ctx),
         text,
         documents: document ? [document] : undefined,
         rawText: ctx.message.caption ?? "",
         attachmentCount: 1,
-        timestamp: ctx.message.date * 1000,
-        isGroup,
-        isMentioned,
-        chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
       });
     }));
 
     // Sticker messages. We do not download sticker artwork here; the file_id
     // is enough for Tomo to understand and resend it later via STICKER:<id>.
     this.bot.on("message:sticker", (ctx) => this.ingest(String(ctx.chat.id), String(ctx.message.message_id), async () => {
-      const isGroup = isGroupChatType(ctx.chat.type);
-      const isMentioned = this.checkMentioned(ctx);
       const sticker = ctx.message.sticker;
 
       this.dispatch({
-        id: String(ctx.message.message_id),
-        chatId: String(ctx.chat.id),
-        senderName: this.getSenderName(ctx),
-        senderId: this.getSenderId(ctx),
+        ...this.baseInbound(ctx),
         text: this.describeSticker({
           fileId: sticker.file_id,
           emoji: sticker.emoji,
@@ -342,10 +304,6 @@ export class TelegramChannel implements Channel {
           isAnimated: sticker.is_animated,
           isVideo: sticker.is_video,
         }),
-        timestamp: ctx.message.date * 1000,
-        isGroup,
-        isMentioned,
-        chatTitle: isGroup ? ("title" in ctx.chat ? ctx.chat.title : undefined) : undefined,
       });
     }));
 
@@ -419,6 +377,26 @@ export class TelegramChannel implements Channel {
   private getSenderName(ctx: Context): string {
     const from = ctx.from!;
     return from.first_name + (from.last_name ? ` ${from.last_name}` : "");
+  }
+
+  /**
+   * The fields every ordinary message update shares, whatever it carries:
+   * who sent it, where, when, and whether it summons Tomo.
+   */
+  private baseInbound(ctx: Context): Pick<IncomingMessage, "id" | "chatId" | "senderName" | "senderId" | "timestamp" | "isGroup" | "isMentioned" | "chatTitle"> {
+    const chat = ctx.chat!;
+    const message = ctx.message!;
+    const isGroup = isGroupChatType(chat.type);
+    return {
+      id: String(message.message_id),
+      chatId: String(chat.id),
+      senderName: this.getSenderName(ctx),
+      senderId: this.getSenderId(ctx),
+      timestamp: message.date * 1000,
+      isGroup,
+      isMentioned: this.checkMentioned(ctx),
+      chatTitle: isGroup && "title" in chat ? chat.title : undefined,
+    };
   }
 
   private getSenderId(ctx: Context): string | undefined {
@@ -804,7 +782,7 @@ export class TelegramChannel implements Channel {
     try {
       await this.bot.api.setMessageReaction(chatId, Number(messageId), reactions satisfies ReactionType[]);
     } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
+      const detail = errorMessage(err);
       if (/REACTION_INVALID/i.test(detail)) {
         throw new Error("Telegram rejected that reaction; this chat may not allow it", { cause: err });
       }

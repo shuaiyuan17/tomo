@@ -7,6 +7,8 @@ import { randomUUID } from "node:crypto";
 import { basename, dirname, join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { isPidAlive } from "../file-lock.js";
+import { isEnoent } from "../fs-utils.js";
+import { sleep } from "../sleep.js";
 
 const PID_FILE = defaultRuntimePaths.pidFile;
 
@@ -97,7 +99,7 @@ export function daemonMayBeRunning(pidFile: string = PID_FILE): boolean {
   try {
     raw = readFileSync(pidFile, "utf-8");
   } catch (err) {
-    return (err as NodeJS.ErrnoException).code !== "ENOENT";
+    return !isEnoent(err);
   }
   const [pidLine, identityLine] = raw.split("\n");
   const pid = Number((pidLine ?? "").trim());
@@ -146,7 +148,7 @@ export async function waitForExit(
   for (;;) {
     if (!alive(pid)) return true;
     if (Date.now() >= deadline) return !alive(pid);
-    await new Promise((r) => setTimeout(r, Math.min(pollMs, Math.max(0, deadline - Date.now()))));
+    await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
   }
 }
 
@@ -280,7 +282,7 @@ function withPidFileLock<T>(pidFile: string, fn: () => T): T | undefined {
     writeFileSync(join(prepared, ownerName), `${process.pid}\n${processIdentity(process.pid) ?? ""}\n`);
   } catch (err) {
     rmSync(prepared, { recursive: true, force: true });
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if (isEnoent(err)) return undefined;
     throw err;
   }
   const deadline = Date.now() + LOCK_WAIT_MS;
@@ -388,7 +390,7 @@ export function acquirePidFile(pidFile: string = PID_FILE, pid: number = process
         try {
           unlinkSync(pidFile);
         } catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          if (!isEnoent(err)) throw err;
         }
       }
       // Five rounds with no live holder means the file is being churned by

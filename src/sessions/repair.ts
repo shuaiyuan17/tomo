@@ -3,6 +3,7 @@ import { log } from "../logger.js";
 import { writeFileAtomicSync } from "../fs-utils.js";
 import type { SessionMessage } from "./types.js";
 import { getSdkSessionPath } from "./store.js";
+import { errorMessage } from "../error-text.js";
 
 const EMPTY_TEXT_PLACEHOLDER = "[empty text block repaired by Tomo]";
 
@@ -58,7 +59,7 @@ export function repairSdkSessionFile(path: string, transcript: SessionMessage[] 
     try {
       event = JSON.parse(line);
     } catch (err) {
-      result.error = `Could not parse SDK session JSONL line ${i + 1}: ${err instanceof Error ? err.message : String(err)}`;
+      result.error = `Could not parse SDK session JSONL line ${i + 1}: ${errorMessage(err)}`;
       return result;
     }
 

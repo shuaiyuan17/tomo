@@ -2,6 +2,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { log } from "../logger.js";
+import { isEnoent } from "../fs-utils.js";
 
 /** Normalized plugin entry from ~/.tomo/config.json `plugins`.
  *
@@ -90,7 +91,7 @@ function readInstalledPlugins(claudePluginsDir: string): Record<string, Installe
     const plugins = parsed.plugins;
     return typeof plugins === "object" && plugins !== null ? plugins : {};
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+    if (!isEnoent(err)) {
       log.warn({ file, err: String(err) }, "Failed to read installed_plugins.json");
     }
     return {};

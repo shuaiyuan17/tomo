@@ -4,6 +4,7 @@ import { log } from "../logger.js";
 import { watchBus, type WatchBus } from "./bus.js";
 import type { ClientFrame, ServerFrame, WatchSnapshot } from "./protocol.js";
 import type { CompactReservation } from "../lcm/background-gate.js";
+import { errorMessage } from "../error-text.js";
 
 /**
  * Shape gate for a decoded client line. Only a plain object with a string
@@ -166,7 +167,7 @@ export class WatchServer {
         await this.deps.sendChat(frame.text);
         this.write(socket, { kind: "send-result", ok: true });
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        const msg = errorMessage(err);
         log.warn({ err }, "Watch chat send failed");
         this.write(socket, { kind: "send-result", ok: false, error: msg });
       }

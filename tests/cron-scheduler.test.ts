@@ -506,10 +506,19 @@ describe("CronScheduler", () => {
     store.add({ name: "monthly", schedule: { kind: "cron", expr: "0 9 1 * *" }, message: "monthly", sessionKey: "dm:alice" });
     every("always", DAY, { staleAfterMs: 0 });   // missed by 14h -> explicitly always catches up
     const lateBy: Record<string, number> = {
-      backup: 9 * HOUR, brief: 14 * HOUR, hourly: 3 * HOUR, fortnightly: 10 * DAY, monthly: 20 * DAY, always: 14 * HOUR,
+      backup: 9 * HOUR, brief: 14 * HOUR, hourly: 3 * HOUR, fortnightly: 10 * DAY, always: 14 * HOUR,
     };
     const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
     const now = Date.now();
+    // The monthly job's missed slot must be a real occurrence: its period is
+    // measured from the slot to the next one, so an arbitrary `now - 20d`
+    // landing just before a 1st-of-month 09:00 reads as a sub-day period
+    // (and the job as skippable) depending on when the suite runs.
+    const lastMonthFirst = new Date(now);
+    lastMonthFirst.setDate(1);
+    lastMonthFirst.setMonth(lastMonthFirst.getMonth() - 1);
+    lastMonthFirst.setHours(9, 0, 0, 0);
+    lateBy.monthly = now - lastMonthFirst.getTime();
     for (const job of raw.jobs) job.nextRunAt = now - lateBy[job.name];
     writeFileSync(TEST_PATH, JSON.stringify(raw));
 

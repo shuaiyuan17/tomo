@@ -580,6 +580,35 @@ describe("who can answer", () => {
     const text = permissionDmText({ id: "x", code: "K7Q", group: "G", path: "/p", access: "write", reason: "r", expiresAt: 0 }, 5);
     expect(text.split("\n")[0]).toBe("Permission request K7Q: a group wants to read and write a path.");
   });
+
+  describe("under config locale zh-Hans", () => {
+    afterEach(() => { (live.config as { locale?: string | null }).locale = null; });
+
+    it("the DM, a quoted reply and the confirmation are Chinese; the reply syntax is unchanged", async () => {
+      (live.config as { locale?: string | null }).locale = "zh-Hans";
+      expect(permissionDmText({ id: "x", code: "K7Q", group: "G", path: "/p", access: "write", reason: "r", expiresAt: 0 }, 5))
+        .toBe("权限请求 K7Q：一个群想要读写一个路径。\nG · /p\n理由（agent 填写，未经核实）：r\n"
+          + "回复“1 K7Q”允许一次（仅限文件工具；shell 需要“总是允许”），“2 K7Q”总是允许，“3 K7Q”拒绝，也可以引用这条消息回复。5 分钟后失效。");
+      const h = harness();
+      const { code } = await ask(h);
+      const requestMessage = h.dm.sent[0];
+      expect(requestMessage.text.startsWith(`权限请求 ${code}：`)).toBe(true);
+      expect(await h.broker.handleInbound(h.dm as never, ownerDm("3", { replyToId: requestMessage.id, text: `[replying to: "…"] 3` }) as never)).toBe(true);
+      expect(h.dm.sent.at(-1)?.text).toBe(`已拒绝（${code}）。`);
+      // What the requesting agent is told stays English: it is model-facing.
+      expect(h.notes.at(-1)?.outcome).toBe("denied");
+    });
+
+    it("a quoted reply to a DM sent in English before the switch still counts", async () => {
+      const h = harness();
+      await ask(h);
+      const requestMessage = h.dm.sent[0];
+      expect(requestMessage.text.startsWith("Permission request ")).toBe(true);
+      (live.config as { locale?: string | null }).locale = "zh-Hans";
+      expect(await h.broker.handleInbound(h.dm as never, ownerDm("3", { replyToId: requestMessage.id, text: `[replying to: "…"] 3` }) as never)).toBe(true);
+      expect(h.notes.at(-1)?.outcome).toBe("denied");
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

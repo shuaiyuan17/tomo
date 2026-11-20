@@ -1,3 +1,5 @@
+import { joinText, ownerT, type OwnerText } from "../i18n/index.js";
+import { petStageLabel } from "./pet-labels.js";
 import { PetStore } from "./pet-store.js";
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
@@ -55,28 +57,30 @@ export class PetScheduler {
     state = store.tick(state);
     store.save(state);
 
-    const alerts: string[] = [];
+    const t = ownerT("notices");
+    const name = state.name;
+    const alerts: OwnerText[] = [];
     if (state.stage !== prevStage) {
-      alerts.push(`✨ ${state.name} evolved into a ${state.stage}!`);
+      alerts.push(t("pet.evolved", { name, stage: petStageLabel(ownerT("commands"), state.stage) }));
     }
     if (state.hunger < 20) {
-      alerts.push(`${state.name} is hungry (hunger: ${Math.round(state.hunger)})`);
+      alerts.push(t("pet.hungry", { name, hunger: Math.round(state.hunger) }));
     }
     if (Math.round(state.health) < prevHealth - 5) {
-      alerts.push(`${state.name}'s health dropped to ${Math.round(state.health)}`);
+      alerts.push(t("pet.healthDropped", { name, health: Math.round(state.health) }));
     }
     if (!prevRecovering && state.recovering) {
-      alerts.push(`${state.name} collapsed and needs recovery care`);
+      alerts.push(t("pet.collapsed", { name }));
     }
     if (prevRecovering && !state.recovering) {
-      alerts.push(`${state.name} is out of recovery`);
+      alerts.push(t("pet.recovered", { name }));
     }
     if (state.happiness < 20) {
-      alerts.push(`${state.name} seems very unhappy`);
+      alerts.push(t("pet.unhappy", { name }));
     }
 
     if (alerts.length > 0) {
-      const message = alerts.join("\n");
+      const message = joinText(alerts);
       log.info({ pet: state.name }, "Pet alert: %s", message);
       this.agent.sendNotification(message).catch((err) => {
         log.warn({ err }, "Pet scheduler: failed to send notification");

@@ -36,7 +36,7 @@ describe("/rewind", () => {
       expect(store.getSdkSessionId("dm:example")).toBe("fork-example");
       expect(discard).not.toHaveBeenCalled();
       expect(channel.sent[0].text).toContain("completed actions and file changes are not undone");
-      expect(channel.sent[0].text).toContain('before the last 2 user message(s) ("Request to edit").');
+      expect(channel.sent[0].text).toContain('before the last 2 user messages ("Request to edit").');
       expect(channel.sent[0].text).not.toContain("further back");
       await channel.simulateMessage(makeMsg({ chatId: "owner-example", senderId: "owner-example", text: "Edited request" }));
       await drainQueue(agent);
@@ -50,7 +50,7 @@ describe("/rewind", () => {
       prepare.mockResolvedValueOnce({ sessionId: "fork-example", count: 3, preview: "Start work", assertUnchanged: () => {}, discard });
       await command(channel);
       expect(store.getSdkSessionId("dm:example")).toBe("fork-example");
-      expect(channel.sent.at(-1)?.text).toContain('before the last 3 user message(s) ("Start work"). That is further back than the 1 you asked for');
+      expect(channel.sent.at(-1)?.text).toContain('before the last 3 user messages ("Start work"). That is further back than the 1 you asked for');
     } finally { await agent.stop(); }
   });
 
@@ -145,7 +145,7 @@ describe("/rewind", () => {
       expect(store.getSdkSessionId("dm:example")).toBe("fork-example");
       expect(channel.sent).toHaveLength(1);
       expect(channel.sent[0].text).toContain("Context rewound");
-      expect(channel.sent[0].text).toContain("The turn that was still running was stopped first and will send nothing more. 1 message(s) you sent while it ran went with it");
+      expect(channel.sent[0].text).toContain("The turn that was still running was stopped first and will send nothing more. 1 message you sent while it ran went with it");
 
       release();
       await cron;

@@ -1,3 +1,4 @@
+import { ownerT } from "./i18n/index.js";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -168,7 +169,7 @@ export class VersionChecker {
   }
 
   private async notify(current: string, latest: string): Promise<void> {
-    const text = `Tomo v${latest} is available (current: v${current}).\nRun: tomo update`;
+    const text = ownerT("notices")("update", { latest, current });
     log.info({ current, latest }, "New version available, notifying user");
     try {
       await this.agent.sendNotification(text);

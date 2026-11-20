@@ -85,11 +85,14 @@ export class TodoStoreError extends Error {}
 /** The store file could not be read or parsed. Never treated as empty. */
 export class TodoStoreReadError extends TodoStoreError {
   readonly path: string;
+  /** What went wrong reading it: the file system's or the parser's own words. */
+  readonly detail: string;
   constructor(path: string, cause: unknown) {
     const detail = cause instanceof Error ? cause.message : String(cause);
     super(`todo store could not be read: ${path} (${detail}). Nothing was changed; fix or restore the file.`, { cause });
     this.name = "TodoStoreReadError";
     this.path = path;
+    this.detail = detail;
   }
 }
 
@@ -100,16 +103,68 @@ export class TodoStoreReadError extends TodoStoreError {
  * if it keeps happening.
  */
 export class TodoStoreConflictError extends TodoStoreError {
-  constructor(path: string) {
+  constructor(readonly path: string) {
     super(`todo store changed while it was being written: ${path}. Nothing was overwritten; try again.`);
     this.name = "TodoStoreConflictError";
   }
 }
 
 /** A write the rules refuse. The message is meant for the model or the owner. */
+/**
+ * Why the store refused: a kind plus what the message needs. The message is
+ * English and is what the model's todo tools return; `/todo` translates the
+ * rule for the owner instead (src/agent/todo-command.ts).
+ */
+export type TodoRule =
+  | { kind: "not_real_date"; input: string }
+  | { kind: "not_review_time"; input: string }
+  | { kind: "not_future"; input: string }
+  | { kind: "too_far"; input: string; maxDays: number }
+  | { kind: "required"; field: string }
+  | { kind: "one_line"; field: string }
+  | { kind: "too_long"; field: string; length: number; max: number }
+  | { kind: "waiting_on_invalid"; allowed: string }
+  | { kind: "no_session" }
+  | { kind: "open_limit"; open: number; max: number; stale: Array<{ id: string; title: string }> }
+  | { kind: "action_invalid"; allowed: string }
+  | { kind: "drop_needs_reason" }
+  | { kind: "snooze_needs_until" }
+  | { kind: "snooze_needs_reason" }
+  | { kind: "next_with_close"; action: string }
+  | { kind: "not_found"; id: string }
+  | { kind: "snooze_limit"; id: string; snoozes: number }
+  | { kind: "already_owner"; id: string };
+
+/** The English text of a rule (unchanged from before rules had kinds). */
+export function todoRuleMessage(rule: TodoRule): string {
+  switch (rule.kind) {
+    case "not_real_date": return `"${rule.input}" is not a real date.`;
+    case "not_review_time": return `"${rule.input}" is not a review time. Use a number of days or weeks ("3d", "2w") or a date ("2026-12-01").`;
+    case "not_future": return `"${rule.input}" is not in the future.`;
+    case "too_far": return `"${rule.input}" is more than ${rule.maxDays} days away; pick a nearer review date.`;
+    case "required": return `${rule.field} is required.`;
+    case "one_line": return `${rule.field} must be one line. Details belong in the file or issue \`ref\` points to.`;
+    case "too_long": return `${rule.field} is ${rule.length} characters; the limit is ${rule.max}. Details belong in the file or issue \`ref\` points to.`;
+    case "waiting_on_invalid": return `waiting_on must be one of ${rule.allowed}.`;
+    case "no_session": return "a todo needs the session it belongs to.";
+    case "open_limit": {
+      const list = rule.stale.length ? ` Least recently touched:\n${rule.stale.map((item) => `- ${item.id} ${item.title}`).join("\n")}` : "";
+      return `${rule.open} todos are open; the limit is ${rule.max}. Resolve one first (todo_resolve: done, drop, snooze or handoff).${list}`;
+    }
+    case "action_invalid": return `action must be one of ${rule.allowed}.`;
+    case "drop_needs_reason": return "drop needs a reason (one sentence).";
+    case "snooze_needs_until": return "snooze needs `until` (\"3d\", \"2w\" or a date).";
+    case "snooze_needs_reason": return "snooze needs a reason (one sentence).";
+    case "next_with_close": return `${rule.action} closes the item; \`next\` only goes with snooze or handoff.`;
+    case "not_found": return `No open todo ${rule.id} in this conversation.`;
+    case "snooze_limit": return `${rule.id} has been snoozed ${rule.snoozes} times, the limit. Decide: done, drop, or handoff to the owner.`;
+    case "already_owner": return `${rule.id} is already waiting on the owner.`;
+  }
+}
+
 export class TodoRuleError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(readonly rule: TodoRule) {
+    super(todoRuleMessage(rule));
     this.name = "TodoRuleError";
   }
 }
@@ -223,15 +278,15 @@ export function parseReviewWhen(input: string, now: number, limits: TodoConfig =
   } else if (date) {
     const d = new Date(Number(date[1]), Number(date[2]) - 1, Number(date[3]));
     if (d.getMonth() !== Number(date[2]) - 1 || d.getDate() !== Number(date[3])) {
-      throw new TodoRuleError(`"${input}" is not a real date.`);
+      throw new TodoRuleError({ kind: "not_real_date", input });
     }
     at = d.getTime();
   } else {
-    throw new TodoRuleError(`"${input}" is not a review time. Use a number of days or weeks ("3d", "2w") or a date ("2026-12-01").`);
+    throw new TodoRuleError({ kind: "not_review_time", input });
   }
-  if (at <= now) throw new TodoRuleError(`"${input}" is not in the future.`);
+  if (at <= now) throw new TodoRuleError({ kind: "not_future", input });
   if (at > now + limits.maxReviewDays * DAY_MS) {
-    throw new TodoRuleError(`"${input}" is more than ${limits.maxReviewDays} days away; pick a nearer review date.`);
+    throw new TodoRuleError({ kind: "too_far", input, maxDays: limits.maxReviewDays });
   }
   return at;
 }
@@ -242,13 +297,13 @@ function line(field: string, value: string | undefined, max: number, required: f
 function line(field: string, value: string | undefined, max: number, required: boolean): string | undefined {
   const text = value?.trim() ?? "";
   if (!text) {
-    if (required) throw new TodoRuleError(`${field} is required.`);
+    if (required) throw new TodoRuleError({ kind: "required", field });
     return undefined;
   }
-  if (/[\r\n]/.test(text)) throw new TodoRuleError(`${field} must be one line. Details belong in the file or issue \`ref\` points to.`);
+  if (/[\r\n]/.test(text)) throw new TodoRuleError({ kind: "one_line", field });
   const length = [...text].length;
   if (length > max) {
-    throw new TodoRuleError(`${field} is ${length} characters; the limit is ${max}. Details belong in the file or issue \`ref\` points to.`);
+    throw new TodoRuleError({ kind: "too_long", field, length, max });
   }
   return text;
 }
@@ -328,10 +383,10 @@ export class TodoStore {
     const next = input.source === "owner"
       ? line("next", input.next ?? title, Math.max(limits.nextMaxChars, limits.titleMaxChars), true)
       : line("next", input.next, limits.nextMaxChars, true);
-    if (!WAITING_ON.includes(input.waiting_on)) throw new TodoRuleError(`waiting_on must be one of ${WAITING_ON.join(", ")}.`);
+    if (!WAITING_ON.includes(input.waiting_on)) throw new TodoRuleError({ kind: "waiting_on_invalid", allowed: WAITING_ON.join(", ") });
     const ref = line("ref", input.ref, REF_MAX_CHARS, false);
     const session = input.session.trim();
-    if (!session) throw new TodoRuleError("a todo needs the session it belongs to.");
+    if (!session) throw new TodoRuleError({ kind: "no_session" });
     const reviewAt = input.review_in !== undefined
       ? parseReviewWhen(input.review_in, now, limits)
       : now + (input.waiting_on === "me" ? limits.reviewDaysSelf : limits.reviewDaysWaiting) * DAY_MS;
@@ -340,8 +395,7 @@ export class TodoStore {
       // The owner is never refused (their items still count toward the cap).
       if (input.source === "self" && file.items.length >= limits.maxOpen) {
         const stale = file.items.filter(visible).sort(byUpdated).slice(0, 5);
-        const list = stale.length ? ` Least recently touched:\n${stale.map((item) => `- ${item.id} ${item.title}`).join("\n")}` : "";
-        throw new TodoRuleError(`${file.items.length} todos are open; the limit is ${limits.maxOpen}. Resolve one first (todo_resolve: done, drop, snooze or handoff).${list}`);
+        throw new TodoRuleError({ kind: "open_limit", open: file.items.length, max: limits.maxOpen, stale: stale.map(({ id, title }) => ({ id, title })) });
       }
       const stamp = new Date(now).toISOString();
       const item: TodoItem = {
@@ -372,19 +426,19 @@ export class TodoStore {
     const limits = this.limits;
     const key = id.trim().toLowerCase();
     if (!TODO_ACTIONS.includes(input.action)) {
-      throw new TodoRuleError(`action must be one of ${TODO_ACTIONS.join(", ")}.`);
+      throw new TodoRuleError({ kind: "action_invalid", allowed: TODO_ACTIONS.join(", ") });
     }
     // Validate the arguments before taking the lock.
     const reason = line("reason", input.reason, REASON_MAX_CHARS, false);
     const evidence = line("evidence", input.evidence, REF_MAX_CHARS, false);
     const next = line("next", input.next, limits.nextMaxChars, false);
-    if (input.action === "drop" && !reason) throw new TodoRuleError("drop needs a reason (one sentence).");
+    if (input.action === "drop" && !reason) throw new TodoRuleError({ kind: "drop_needs_reason" });
     if (input.action === "snooze") {
-      if (!input.until) throw new TodoRuleError("snooze needs `until` (\"3d\", \"2w\" or a date).");
-      if (!reason) throw new TodoRuleError("snooze needs a reason (one sentence).");
+      if (!input.until) throw new TodoRuleError({ kind: "snooze_needs_until" });
+      if (!reason) throw new TodoRuleError({ kind: "snooze_needs_reason" });
     }
     if ((input.action === "done" || input.action === "drop") && next) {
-      throw new TodoRuleError(`${input.action} closes the item; \`next\` only goes with snooze or handoff.`);
+      throw new TodoRuleError({ kind: "next_with_close", action: input.action });
     }
     const until = input.action === "snooze" ? parseReviewWhen(input.until!, now, limits) : undefined;
 
@@ -397,7 +451,7 @@ export class TodoStore {
         if (done && visible(done) && (input.action === "done" || input.action === "drop")) {
           return { action: done.resolution, item: stripResolution(done) };
         }
-        throw new TodoRuleError(`No open todo ${id.trim()} in this conversation.`);
+        throw new TodoRuleError({ kind: "not_found", id: id.trim() });
       }
       const stamp = new Date(now).toISOString();
 
@@ -421,7 +475,7 @@ export class TodoStore {
 
       if (input.action === "snooze") {
         if (found.snoozes >= limits.maxSnoozes) {
-          throw new TodoRuleError(`${found.id} has been snoozed ${found.snoozes} times, the limit. Decide: done, drop, or handoff to the owner.`);
+          throw new TodoRuleError({ kind: "snooze_limit", id: found.id, snoozes: found.snoozes });
         }
         const updated: TodoItem = {
           ...found,
@@ -436,7 +490,7 @@ export class TodoStore {
       }
 
       // handoff
-      if (found.waiting_on === "owner") throw new TodoRuleError(`${found.id} is already waiting on the owner.`);
+      if (found.waiting_on === "owner") throw new TodoRuleError({ kind: "already_owner", id: found.id });
       const updated: TodoItem = {
         ...found,
         ...(next ? { next } : {}),

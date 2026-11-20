@@ -12,7 +12,9 @@ import type { SessionStore } from "../sessions/index.js";
 import type { PauseStore } from "../sessions/pause-store.js";
 import { dmSessionKeyForIdentity, isGroupSessionKey } from "../sessions/keys.js";
 import { writeRestartReasonFile } from "../restart-reason.js";
-import { DEFAULT_MODEL, MODEL_ALIASES, modelHelpText } from "../models.js";
+import { DEFAULT_MODEL, MODEL_ALIASES } from "../models.js";
+import { errorDetail } from "../i18n/error-detail.js";
+import { formatDateTime, formatLocale, formatNumber, joinText, ownerT, raw, type OwnerT, type OwnerText } from "../i18n/index.js";
 import { switchSessionModel, type ModelSwitchRefusal } from "./model-switch.js";
 import { buildSessionCostReport } from "../costs.js";
 import {
@@ -20,9 +22,9 @@ import {
   liteLlmModeLabel,
 } from "../litellm.js";
 import { log } from "../logger.js";
-import { shortErrorMessage } from "../error-text.js";
 import { formatTomoEvent } from "../tomo-event.js";
 import { PetStore } from "../mcp/pet-store.js";
+import { petMoodLabel, petStageLabel } from "../mcp/pet-labels.js";
 import type { ExternalMcpServerStatus, McpLoginStart } from "../mcp/oauth.js";
 import { mergeMcpStatus, type McpLiveRead, type MergedMcpStatus } from "../mcp/status-merge.js";
 import { ClaudeLoginManager } from "./claude-login.js";
@@ -32,22 +34,22 @@ import { litellmRoutesModel } from "../litellm.js";
 import { TASKS_COMMAND } from "../channels/chat-commands.js";
 import type { SessionTaskList } from "../web/tasks.js";
 import { formatTaskList, startOfLocalDay } from "./tasks-command.js";
-import { parseTodoArgs, runTodoCommand, TODO_USAGE } from "./todo-command.js";
+import { parseTodoArgs, runTodoCommand, todoUnavailable, todoUsage } from "./todo-command.js";
 import { TodoStore } from "../todos/store.js";
 
 /** Back up ~/.tomo/config.json before a programmatic rewrite. */
 export { backupConfigFile } from "./model-switch.js";
 
-/** The chat reply for a refused /model switch (texts unchanged since before the shared switch). */
-function modelRefusalText(reason: ModelSwitchRefusal, arg: string, resolved: string): string {
+/** The chat reply for a refused /model switch. */
+function modelRefusalText(t: OwnerT<"commands">, reason: ModelSwitchRefusal, arg: string, resolved: string): OwnerText {
   switch (reason) {
-    case "unknown_model": return `⚠️ Unknown model "${arg}". Use ${modelHelpText()}.`;
-    case "gateway_required": return `⚠️ "${resolved}" needs a LiteLLM gateway. Run \`tomo config\` → LiteLLM gateway to set one up first.`;
-    case "gateway_unroutable": return `⚠️ The configured ChatGPT subscription gateway only routes chatgpt/* models, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}.`;
-    case "persist_failed": return "⚠️ [error] Could not save the model override to ~/.tomo/config.json — model unchanged. Check the file (or /restore) and try again.";
+    case "unknown_model": return t("model.unknown", { arg, aliases: Object.keys(MODEL_ALIASES).join(", "), direct: DEFAULT_MODEL, gateway: CHATGPT_SUBSCRIPTION_DEFAULT_MODEL });
+    case "gateway_required": return t("model.gatewayRequired", { model: resolved });
+    case "gateway_unroutable": return t("model.gatewayUnroutable", { example: CHATGPT_SUBSCRIPTION_DEFAULT_MODEL });
+    case "persist_failed": return t("model.persistFailed");
     // Only reachable with options /model does not pass.
-    case "turn_in_flight": return "⚠️ A reply is still running; try again once it has finished.";
-    case "model_changed": return "⚠️ The model changed meanwhile; check /model and try again.";
+    case "turn_in_flight": return t("model.turnInFlight");
+    case "model_changed": return t("model.modelChanged");
   }
 }
 
@@ -74,7 +76,7 @@ export interface ChatCommandDeps {
    *  undefined when there is no board (web UI off). */
   listTasks(sessionKey: string, since: number): SessionTaskList | undefined;
   /** Send plain text to the owner's private DM (its reply target); false when there is none. */
-  sendToOwnerDm(owner: OwnerConfig, text: string): Promise<boolean>;
+  sendToOwnerDm(owner: OwnerConfig, text: OwnerText): Promise<boolean>;
   /** The todo store `/todo` reads and writes (tests); defaults to `<tomoHome>/data/todos`. */
   todoStore?: () => TodoStore;
 }
@@ -99,7 +101,13 @@ export class ChatCommandHandler {
     this.claudeLogin.stop();
   }
 
+  /** Every command reply goes out here: only translated text (or text marked `raw`) is accepted. */
+  private async reply(channel: Channel, chatId: string, text: OwnerText): Promise<void> {
+    await channel.send({ chatId, text });
+  }
+
   async handle(channel: Channel, command: string, chatId: string, senderName: string, args?: string, senderId?: string): Promise<void> {
+    const t = ownerT("commands");
     // Commands obey the same channel allowlist as inbound messages
     // (Agent.enqueueMessage): check channel+chatId BEFORE resolving, so a
     // disallowed chat can't touch routing state, and drop silently — the
@@ -110,7 +118,7 @@ export class ChatCommandHandler {
     }
 
     if (this.restoringConfig) {
-      await channel.send({ chatId, text: "♻️ Restore is already in progress. Restarting Tomo..." });
+      await this.reply(channel, chatId, t("restoring"));
       return;
     }
 
@@ -129,12 +137,12 @@ export class ChatCommandHandler {
     if (command === "rewind") {
       const identity = this.ownerFor(channel, senderId);
       if (isGroupSessionKey(`${channel.name}:${chatId}`) || !identity) {
-        await channel.send({ chatId, text: "⚠️ /rewind is only available in an owner's private DM." });
+        await this.reply(channel, chatId, t("dmOnly", { command: "rewind" }));
         return;
       }
       const arg = args?.trim() || "1";
       if (!/^[1-9]\d*$/.test(arg) || !Number.isSafeInteger(Number(arg))) {
-        await channel.send({ chatId, text: "Usage: /rewind or /rewind <positive integer>" });
+        await this.reply(channel, chatId, t("rewind.usage"));
         return;
       }
       let rewound: { count: number; preview: string; stoppedTurn?: boolean; droppedMessages?: number; nothingToRewind?: boolean };
@@ -142,24 +150,18 @@ export class ChatCommandHandler {
         rewound = await this.deps.rewindSession(dmSessionKeyForIdentity(identity.name), Number(arg));
       } catch (err) {
         log.warn({ err }, "Session rewind failed");
-        await channel.send({ chatId, text: `⚠️ Could not rewind: ${shortErrorMessage(err)}` });
+        await this.reply(channel, chatId, t("rewind.failed", { error: errorDetail(err) }));
         return;
       }
-      const dropped = rewound.droppedMessages
-        ? ` ${rewound.droppedMessages} message(s) you sent while it ran went with it; resend them if still needed.`
-        : "";
+      const dropped = rewound.droppedMessages ? t("rewind.dropped", { count: rewound.droppedMessages }) : "";
       if (rewound.nothingToRewind) {
-        await channel.send({ chatId, text: `⏹️ Stopped the turn that was still running; it will send nothing more.${dropped} This conversation had no earlier history to rewind to, so nothing was rewound. Send your request again to continue.` });
+        await this.reply(channel, chatId, t("rewind.nothing", { dropped }));
         return;
       }
-      const target = rewound.preview ? ` ("${rewound.preview}")` : "";
-      const moved = rewound.count > Number(arg)
-        ? ` That is further back than the ${arg} you asked for: the later message arrived during a tool call, so it went back to the end of the previous complete turn.`
-        : "";
-      const stopped = rewound.stoppedTurn
-        ? ` The turn that was still running was stopped first and will send nothing more.${dropped}`
-        : "";
-      await channel.send({ chatId, text: `↩️ Context rewound to before the last ${rewound.count} user message(s)${target}.${moved}${stopped} Send an edited request to continue. Chat history is kept; completed actions and file changes are not undone.` });
+      const target = rewound.preview ? t("rewind.target", { preview: rewound.preview }) : "";
+      const moved = rewound.count > Number(arg) ? t("rewind.moved", { asked: arg }) : "";
+      const stopped = rewound.stoppedTurn ? t("rewind.stopped", { dropped }) : "";
+      await this.reply(channel, chatId, t("rewind.done", { count: rewound.count, target, moved, stopped }));
       return;
     }
 
@@ -189,33 +191,28 @@ export class ChatCommandHandler {
       this.deps.closeLiveSession(key);
       this.deps.sessions.clearSdkSessionId(key);
       log.info({ channel: channel.name, chatId, sender: senderName }, "New session started via /new");
-      await channel.send({ chatId, text: "🆕 New session started." });
+      await this.reply(channel, chatId, t("newSession"));
       return;
     }
 
     if (command === "model") {
       if (!this.isOwner(channel, senderId)) {
         log.info({ channel: channel.name, chatId, sender: senderName }, "/model refused (sender is not the owner)");
-        await channel.send({ chatId, text: !config.owner
-          ? "⚠️ No owner is configured, so /model is locked. On the machine running Tomo, run `tomo config` and set yourself as the owner (bind your handle on this channel), then try again."
-          : "⚠️ Only the owner can change the model." });
+        await this.reply(channel, chatId, !config.owner ? t("noOwner", { command: "model" }) : t("model.ownerOnly"));
         return;
       }
       const arg = args?.trim();
       if (!arg) {
         const current = this.deps.modelOverrides.get(key) ?? config.model;
-        const lines = [`🧠 Current: ${current}`, "", "Switch with: /model <name>", ""];
+        const lines = [t("model.current", { model: current })];
         for (const [shortName, fullName] of Object.entries(MODEL_ALIASES)) {
-          const marker = fullName === current ? " (active)" : "";
-          lines.push(`  ${shortName} — ${fullName}${marker}`);
+          lines.push(fullName === current ? t("model.aliasActive", { alias: shortName, model: fullName }) : t("model.alias", { alias: shortName, model: fullName }));
         }
         if (config.litellm?.baseUrl) {
-          lines.push("");
-          lines.push(`LiteLLM gateway models are also accepted, e.g. ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}`);
+          lines.push(t("model.gatewayModels", { example: CHATGPT_SUBSCRIPTION_DEFAULT_MODEL }));
         }
-        lines.push("");
-        lines.push(`You can also pass any direct model ID, e.g. ${DEFAULT_MODEL}.`);
-        await channel.send({ chatId, text: lines.join("\n") });
+        lines.push(t("model.directIds", { example: DEFAULT_MODEL }));
+        await this.reply(channel, chatId, joinText(lines));
         return;
       }
 
@@ -223,21 +220,19 @@ export class ChatCommandHandler {
       const outcome = switchSessionModel({ modelOverrides: this.deps.modelOverrides,
         closeLiveSession: (sessionKey) => this.deps.closeLiveSession(sessionKey) }, key, arg);
       if (!outcome.ok) {
-        await channel.send({ chatId, text: modelRefusalText(outcome.reason, arg, outcome.model ?? arg) });
+        await this.reply(channel, chatId, modelRefusalText(t, outcome.reason, arg, outcome.model ?? arg));
         return;
       }
       const resolved = outcome.model;
       log.info({ channel: channel.name, chatId, model: resolved }, "Model switched via /model");
-      await channel.send({ chatId, text: `🔄 Switched to ${resolved}` });
+      await this.reply(channel, chatId, t("model.switched", { model: resolved }));
       return;
     }
 
     if (command === "restore") {
       if (!this.isOwner(channel, senderId)) {
         log.info({ channel: channel.name, chatId, sender: senderName }, "/restore refused (sender is not the owner)");
-        await channel.send({ chatId, text: !config.owner
-          ? "⚠️ No owner is configured, so /restore is locked. On the machine running Tomo, run `tomo config` and set yourself as the owner (bind your handle on this channel), then try again."
-          : "⚠️ Only the owner can restore config." });
+        await this.reply(channel, chatId, !config.owner ? t("noOwner", { command: "restore" }) : t("restore.ownerOnly"));
         return;
       }
       await this.restoreConfigAndRestart(channel, chatId, key);
@@ -248,7 +243,7 @@ export class ChatCommandHandler {
       const store = new PetStore(join(config.tomoHome, "data", "pet.json"));
       let pet = store.load();
       if (!pet) {
-        await channel.send({ chatId, text: "🦀 Tomo doesn't have a pet yet. Ask Tomo to hatch one!" });
+        await this.reply(channel, chatId, t("pet.none"));
         return;
       }
 
@@ -258,28 +253,27 @@ export class ChatCommandHandler {
       const ageDays = Math.max(0, Math.floor(
         (Date.now() - new Date(pet.born_at).getTime()) / (24 * 60 * 60 * 1000),
       ));
-      const dayLabel = ageDays === 1 ? "day" : "days";
       const lines = [
-        `🦀 ${pet.name} the ${pet.species}`,
-        `Stage: ${pet.stage} · Age: ${ageDays} ${dayLabel} · Mood: ${store.computeMood(pet)}`,
-        `Hunger: ${Math.round(pet.hunger)}/100 · Happiness: ${Math.round(pet.happiness)}/100`,
-        `Energy: ${Math.round(pet.energy)}/100 · Health: ${Math.round(pet.health)}/100`,
-        `Bond: ${store.effectiveAffection(pet)} · Care mistakes: ${pet.care_mistakes}`,
+        t("pet.title", { name: pet.name, species: pet.species }),
+        t("pet.stageLine", { count: ageDays, stage: petStageLabel(t, pet.stage), mood: petMoodLabel(t, store.computeMood(pet)) }),
+        t("pet.hungerLine", { hunger: Math.round(pet.hunger), happiness: Math.round(pet.happiness) }),
+        t("pet.energyLine", { energy: Math.round(pet.energy), health: Math.round(pet.health) }),
+        t("pet.bondLine", { bond: store.effectiveAffection(pet), mistakes: pet.care_mistakes }),
       ];
 
       if (pet.sleeping && pet.sleep_until) {
-        lines.push(`Sleeping until: ${new Date(pet.sleep_until).toLocaleString()}`);
+        lines.push(t("pet.sleeping", { until: formatDateTime(new Date(pet.sleep_until).getTime()) }));
       } else if (pet.recovering) {
-        lines.push("Recovering: yes");
+        lines.push(t("pet.recovering"));
       }
 
-      await channel.send({ chatId, text: lines.join("\n") });
+      await this.reply(channel, chatId, joinText(lines));
       return;
     }
 
     if (command === "cost") {
       const logPath = join(config.logsDir, "tomo.log");
-      await channel.send({ chatId, text: `💰 ${buildSessionCostReport(key, { logPath })}` });
+      await this.reply(channel, chatId, buildSessionCostReport(key, { logPath }));
       return;
     }
 
@@ -290,29 +284,23 @@ export class ChatCommandHandler {
       // default to open, so a bare DM must not read the owner's subscription
       // state). A group is shared, so any member is refused regardless.
       if (isGroupSessionKey(`${channel.name}:${chatId}`)) {
-        await channel.send({ chatId, text: "⚠️ /usage is only available in an owner's private DM." });
+        await this.reply(channel, chatId, t("dmOnly", { command: "usage" }));
         return;
       }
       const usageIdentity = this.ownerFor(channel, senderId);
       if (!usageIdentity) {
         log.info({ channel: channel.name, chatId, sender: senderName }, "/usage refused (sender is not the owner)");
-        const text = !config.owner
-          ? "⚠️ No owner is configured, so /usage is locked. On the machine running Tomo, run `tomo config` and set yourself as the owner (bind your handle on this channel), then try /usage again."
-          : "⚠️ Only the owner can view usage.";
-        await channel.send({ chatId, text });
+        await this.reply(channel, chatId, !config.owner ? t("noOwnerRetry", { command: "usage" }) : t("usage.ownerOnly"));
         return;
       }
       // Classify gateway routing the same way the SDK does — from the session's
       // effective model, not merely "is a gateway configured".
       const effectiveModel = this.deps.modelOverrides.get(key) ?? config.model;
-      await channel.send({
-        chatId,
-        text: await buildUsageReport({
+      await this.reply(channel, chatId, await buildUsageReport({
           authMethod: config.auth.method,
           gatewayActive: litellmRoutesModel(config.litellm, effectiveModel),
           onData: (data) => { void limitsLogFor(config.tomoHome).recordOAuthUsage(data); },
-        }),
-      });
+        }));
       return;
     }
 
@@ -321,47 +309,48 @@ export class ChatCommandHandler {
       const session = this.deps.sessions.get(key);
       const entry = this.deps.sessions.getEntry(key);
 
-      const lines: string[] = [];
-      lines.push("📋 Status");
-      lines.push("");
-      lines.push(`Session: ${key}`);
-      lines.push(`Channel: ${channel.name}`);
+      const locale = formatLocale();
+      const lines: OwnerText[] = [];
+      lines.push(t("status.title"));
+      lines.push(t("status.session", { key }));
+      lines.push(t("status.channel", { channel: channel.name }));
       const summoned = this.deps.router.getSummonedIdentity(channel.name, chatId);
-      if (summoned) lines.push(`Summoned: messages route to dm:${summoned} (/dismiss to hand back)`);
+      if (summoned) lines.push(t("status.summoned", { identity: summoned }));
       if (this.deps.pauses.isPaused(`${channel.name}:${chatId}`)) {
-        lines.push("Paused: yes — group messages are being ignored (/resume to lift)");
+        lines.push(t("status.paused"));
       }
-      lines.push(`Model: ${model}`);
+      lines.push(t("status.model", { model }));
       if (config.litellm?.baseUrl) {
-        lines.push(`Gateway: LiteLLM (${liteLlmModeLabel(config.litellm.mode)})`);
+        lines.push(t("status.gateway", { mode: liteLlmModeLabel(config.litellm.mode) }));
       }
-      lines.push(`Live: ${this.deps.isSessionLive(key) ? "yes" : "no"}`);
+      lines.push(this.deps.isSessionLive(key) ? t("status.liveYes") : t("status.liveNo"));
 
       // Count from the transcript file, not session.messages — the in-memory
       // session holds only the recent tail.
       const msgCount = this.deps.sessions.countRecentUserMessages(key);
-      lines.push(`Messages: ${msgCount} user turns`);
+      lines.push(t("status.messages", { count: msgCount }));
 
       if (session.createdAt) {
-        lines.push(`Created: ${new Date(session.createdAt).toLocaleString()}`);
+        lines.push(t("status.created", { at: formatDateTime(session.createdAt, locale) }));
       }
       if (session.updatedAt) {
-        lines.push(`Last active: ${new Date(session.updatedAt).toLocaleString()}`);
+        lines.push(t("status.lastActive", { at: formatDateTime(session.updatedAt, locale) }));
       }
 
       if (entry?.stats) {
         const s = entry.stats;
-        lines.push("");
-        lines.push(`Queries: ${s.totalQueries}`);
-        lines.push(`Cost: $${s.totalCostUsd.toFixed(4)}`);
-        lines.push(`Tokens: ${s.totalInputTokens.toLocaleString()} in / ${s.totalOutputTokens.toLocaleString()} out`);
+        lines.push(t("status.queries", { count: s.totalQueries }));
+        lines.push(t("status.cost", { cost: `$${s.totalCostUsd.toFixed(4)}` }));
+        lines.push(t("status.tokens", { input: formatNumber(s.totalInputTokens, locale), output: formatNumber(s.totalOutputTokens, locale) }));
         if (s.contextMax > 0) {
-          const pct = ((s.contextUsed / s.contextMax) * 100).toFixed(0);
-          lines.push(`Context: ${pct}% (${s.contextUsed.toLocaleString()} / ${s.contextMax.toLocaleString()})`);
+          lines.push(t("status.context", {
+            percent: `${((s.contextUsed / s.contextMax) * 100).toFixed(0)}%`,
+            used: formatNumber(s.contextUsed, locale), max: formatNumber(s.contextMax, locale),
+          }));
         }
       }
 
-      await channel.send({ chatId, text: lines.join("\n") });
+      await this.reply(channel, chatId, joinText(lines));
       return;
     }
   }
@@ -378,9 +367,10 @@ export class ChatCommandHandler {
    * `/tasks all` lists every task that ended today instead of the last few.
    */
   private async handleTasksCommand(channel: Channel, chatId: string, resolvedKey: string, args: string | undefined, senderId?: string): Promise<void> {
+    const t = ownerT("commands");
     const arg = args?.trim().toLowerCase() ?? "";
     if (arg !== "" && arg !== "all") {
-      await channel.send({ chatId, text: "Usage: /tasks or /tasks all" });
+      await this.reply(channel, chatId, t("tasks.usage"));
       return;
     }
     let key = resolvedKey;
@@ -400,19 +390,19 @@ export class ChatCommandHandler {
     const now = Date.now();
     const list = this.deps.listTasks(key, startOfLocalDay(now));
     if (!list) {
-      await channel.send({ chatId, text: "Tasks are unavailable: /tasks reads the web UI's Tasks panel, and the web UI is off." });
+      await this.reply(channel, chatId, t("tasks.unavailable"));
       return;
     }
-    const text = formatTaskList(list, { now, all: arg === "all" });
+    const text = formatTaskList(list, { now, all: arg === "all", locale: formatLocale() });
     if (ownerDm) {
       let sent = false;
       try { sent = await this.deps.sendToOwnerDm(ownerDm, text); } catch (err) {
         log.warn({ err }, "/tasks: could not send the list to the owner's DM");
       }
-      await channel.send({ chatId, text: sent ? "Sent to your DM." : "Couldn't reach your DM." });
+      await this.reply(channel, chatId, sent ? t("sentToDm") : t("dmUnreachable"));
       return;
     }
-    await channel.send({ chatId, text });
+    await this.reply(channel, chatId, text);
   }
 
   /**
@@ -424,9 +414,10 @@ export class ChatCommandHandler {
    * DM and only "Sent to your DM." in the group.
    */
   private async handleTodoCommand(channel: Channel, chatId: string, resolvedKey: string, args: string | undefined, senderId?: string): Promise<void> {
+    const t = ownerT("commands");
     const parsed = parseTodoArgs(args);
     if (!parsed) {
-      await channel.send({ chatId, text: TODO_USAGE });
+      await this.reply(channel, chatId, todoUsage());
       return;
     }
     let key = resolvedKey;
@@ -439,27 +430,27 @@ export class ChatCommandHandler {
         key = dmSessionKeyForIdentity(owner.name);
         ownerDm = owner;
       } else if (parsed.kind !== "list" && !owner) {
-        await channel.send({ chatId, text: "Only the owner can change todos." });
+        await this.reply(channel, chatId, t("todo.ownerOnly"));
         return;
       }
     }
-    let text: string;
+    let text: OwnerText;
     try {
       const store = this.deps.todoStore?.() ?? new TodoStore();
       text = runTodoCommand(parsed, { store, scopeKey: key, now: Date.now() });
     } catch (err) {
       log.warn({ err }, "/todo failed");
-      text = `Todos are unavailable: ${shortErrorMessage(err)}`;
+      text = todoUnavailable(errorDetail(err));
     }
     if (ownerDm) {
       let sent = false;
       try { sent = await this.deps.sendToOwnerDm(ownerDm, text); } catch (err) {
         log.warn({ err }, "/todo: could not send the reply to the owner's DM");
       }
-      await channel.send({ chatId, text: sent ? "Sent to your DM." : "Couldn't reach your DM." });
+      await this.reply(channel, chatId, sent ? t("sentToDm") : t("dmUnreachable"));
       return;
     }
-    await channel.send({ chatId, text });
+    await this.reply(channel, chatId, text);
   }
 
   /**
@@ -475,9 +466,10 @@ export class ChatCommandHandler {
     senderName: string,
     senderId?: string,
   ): Promise<void> {
+    const t = ownerT("commands");
     const rawKey = `${channel.name}:${chatId}`;
     if (!isGroupSessionKey(rawKey)) {
-      await channel.send({ chatId, text: `⚠️ /${command} only works in group chats.` });
+      await this.reply(channel, chatId, t("groupOnly", { command }));
       return;
     }
     if (!this.deps.router.isAllowed(channel.name, chatId)) {
@@ -490,7 +482,7 @@ export class ChatCommandHandler {
     if (command === "dismiss") {
       const summoned = this.deps.router.getSummonedIdentity(channel.name, chatId);
       if (!summoned) {
-        await channel.send({ chatId, text: "⚠️ No main session is summoned here." });
+        await this.reply(channel, chatId, t("summon.noneHere"));
         return;
       }
       this.deps.router.dismissGroup(channel.name, chatId);
@@ -502,20 +494,20 @@ export class ChatCommandHandler {
           { name: rawKey },
         ),
       );
-      await channel.send({ chatId, text: "👋 Handed back to this group's own Tomo session." });
+      await this.reply(channel, chatId, t("summon.dismissed"));
       return;
     }
 
     const identity = this.ownerFor(channel, senderId);
     if (!identity) {
       log.info({ channel: channel.name, chatId, sender: senderName }, "/summon refused (sender is not the owner)");
-      await channel.send({ chatId, text: "⚠️ Only the owner can summon the main session." });
+      await this.reply(channel, chatId, t("summon.ownerOnly"));
       return;
     }
 
     const already = this.deps.router.getSummonedIdentity(channel.name, chatId);
     if (already) {
-      await channel.send({ chatId, text: `⚠️ Main session dm:${already} is already summoned here. /dismiss first to hand back.` });
+      await this.reply(channel, chatId, t("summon.already", { identity: already }));
       return;
     }
 
@@ -532,10 +524,9 @@ export class ChatCommandHandler {
       ),
     );
     log.info({ channel: channel.name, chatId, identity: identity.name, sender: senderName }, "Group summoned via /summon");
-    await channel.send({
-      chatId,
-      text: `📞 ${ownerDisplayName(identity)}'s main Tomo session is now handling this group. /dismiss hands back to the group's own session${expiryNote ? `; it also hands back automatically after ${config.summonExpiryMinutes}m of inactivity` : ""}.`,
-    });
+    await this.reply(channel, chatId, expiryNote
+      ? t("summon.summonedExpiry", { owner: ownerDisplayName(identity), minutes: config.summonExpiryMinutes })
+      : t("summon.summoned", { owner: ownerDisplayName(identity) }));
   }
 
   /**
@@ -551,35 +542,30 @@ export class ChatCommandHandler {
     chatId: string,
     senderName: string,
   ): Promise<void> {
+    const t = ownerT("commands");
     const rawKey = `${channel.name}:${chatId}`;
     if (!isGroupSessionKey(rawKey)) {
-      await channel.send({ chatId, text: `⚠️ /${command} only works in group chats.` });
+      await this.reply(channel, chatId, t("groupOnly", { command }));
       return;
     }
 
     if (command === "pause") {
       if (this.deps.pauses.isPaused(rawKey)) {
-        await channel.send({ chatId, text: "⚠️ Tomo is already paused here. Send /resume to bring it back." });
+        await this.reply(channel, chatId, t("pause.already"));
         return;
       }
       this.deps.pauses.pause(rawKey, senderName);
       log.info({ channel: channel.name, chatId, sender: senderName }, "Group paused via /pause");
-      await channel.send({
-        chatId,
-        text: "⏸️ Tomo is paused in this group. Messages sent here will be completely ignored (not read, not remembered) until someone sends /resume.",
-      });
+      await this.reply(channel, chatId, t("pause.paused"));
       return;
     }
 
     if (!this.deps.pauses.resume(rawKey)) {
-      await channel.send({ chatId, text: "⚠️ Tomo isn't paused in this group." });
+      await this.reply(channel, chatId, t("pause.notPaused"));
       return;
     }
     log.info({ channel: channel.name, chatId, sender: senderName }, "Group resumed via /resume");
-    await channel.send({
-      chatId,
-      text: "▶️ Tomo is back. Messages sent while paused were ignored; new messages will be handled normally.",
-    });
+    await this.reply(channel, chatId, t("pause.resumed"));
   }
 
   /** Gate for config-mutating commands (/model, /restore): the sender must be
@@ -600,9 +586,10 @@ export class ChatCommandHandler {
     senderId?: string,
     args?: string,
   ): Promise<void> {
+    const t = ownerT("commands");
     const rawKey = `${channel.name}:${chatId}`;
     if (isGroupSessionKey(rawKey)) {
-      await channel.send({ chatId, text: "⚠️ /login is only available in an owner's private DM." });
+      await this.reply(channel, chatId, t("dmOnly", { command: "login" }));
       return;
     }
 
@@ -612,39 +599,25 @@ export class ChatCommandHandler {
       // /login mutates Claude credentials, so unlike /model and /restore it
       // never falls open when no identities exist — instead point the user at
       // the setup path.
-      const text = !config.owner
-        ? "⚠️ No owner is configured, so /login is locked. On the machine running Tomo, run `tomo config` and set yourself as the owner (bind your handle on this channel), then try /login again."
-        : "⚠️ Only the owner can refresh Claude login.";
-      await channel.send({ chatId, text });
+      await this.reply(channel, chatId, !config.owner ? t("noOwnerRetry", { command: "login" }) : t("login.ownerOnly"));
       return;
     }
 
     const arg = args?.trim() ?? "";
     if (arg.toLowerCase() === "cancel") {
       const cancelled = this.claudeLogin.cancel(identity.name);
-      await channel.send({
-        chatId,
-        text: cancelled ? "🔑 Claude login cancelled." : "⚠️ No Claude login is currently waiting.",
-      });
+      await this.reply(channel, chatId, cancelled ? t("login.cancelled") : t("login.noneWaiting"));
       return;
     }
 
     try {
       if (!arg) {
         const { url, reused } = await this.claudeLogin.start(identity.name);
-        await channel.send({
-          chatId,
-          text: [
-            reused ? "🔑 Claude login is already waiting." : "🔑 Claude login started.",
-            "",
-            url,
-            "",
-            "Authorize in your browser, then send the returned code here as:",
-            "/login <code>",
-            "",
-            "The request expires after 10 minutes. Use /login cancel to abort it.",
-          ].join("\n"),
-        });
+        await this.reply(channel, chatId, joinText([
+          reused ? t("login.alreadyWaiting") : t("login.started"),
+          raw(url),
+          t("login.instructions"),
+        ]));
         return;
       }
 
@@ -658,20 +631,14 @@ export class ChatCommandHandler {
         reason,
         sessionKey: dmSessionKeyForIdentity(identity.name),
       });
-      await channel.send({
-        chatId,
-        text: completion.verified
-          ? "Claude login verified. Restarting Tomo..."
-          : [
-            "[warning] Claude credentials were saved, but the verification probe failed. Restarting Tomo...",
-            completion.verificationError ? `\n${completion.verificationError}` : "",
-          ].join(""),
-      });
+      await this.reply(channel, chatId, completion.verified
+        ? t("login.verified")
+        : completion.verificationError ? t("login.unverifiedDetail", { error: errorDetail(completion.verificationFailure ?? completion.verificationError) }) : t("login.unverified"));
       this.scheduleRestart();
     } catch (err) {
-      const detail = shortErrorMessage(err);
+      const detail = errorDetail(err);
       log.warn({ err, identity: identity.name }, "Claude login command failed");
-      await channel.send({ chatId, text: `⚠️ [error] Claude login failed: ${detail}` });
+      await this.reply(channel, chatId, t("login.failed", { error: detail }));
     }
   }
 
@@ -681,19 +648,17 @@ export class ChatCommandHandler {
     senderId?: string,
     args?: string,
   ): Promise<void> {
+    const t = ownerT("commands");
     const rawKey = `${channel.name}:${chatId}`;
     if (isGroupSessionKey(rawKey)) {
-      await channel.send({ chatId, text: "⚠️ /mcp is only available in an owner's private DM." });
+      await this.reply(channel, chatId, t("dmOnly", { command: "mcp" }));
       return;
     }
 
     const identity = this.ownerFor(channel, senderId);
     if (!identity) {
       log.warn({ channel: channel.name, chatId }, "/mcp refused (sender is not the owner)");
-      const text = !config.owner
-        ? "⚠️ No owner is configured, so /mcp is locked. On the machine running Tomo, run `tomo config` and set yourself as the owner (bind your handle on this channel), then try /mcp again."
-        : "⚠️ Only the owner can inspect or re-authenticate external MCP servers.";
-      await channel.send({ chatId, text });
+      await this.reply(channel, chatId, !config.owner ? t("noOwnerRetry", { command: "mcp" }) : t("mcp.ownerOnly"));
       return;
     }
 
@@ -703,51 +668,41 @@ export class ChatCommandHandler {
       const live = await this.deps.readLiveMcpStatus(sessionKey);
       const rows = mergeMcpStatus(live, this.deps.getExternalMcpStatuses(sessionKey));
       if (rows.length === 0) {
-        await channel.send({ chatId, text: live === undefined
-          ? "🔌 No external MCP servers are configured, and there is no live session to report the built-in ones."
-          : "🔌 No MCP servers are configured or reported by this session." });
+        await this.reply(channel, chatId, live === undefined ? t("mcp.noneNoSession") : t("mcp.none"));
         return;
       }
-      const header = live === undefined ? "🔌 MCP servers — no live session (connection state appears once a conversation starts)"
-        : live === null ? "🔌 MCP servers — the live session did not report its connection state"
-        : "🔌 MCP servers (live session)";
-      await channel.send({ chatId, text: [header, "", ...rows.map(formatMergedMcpStatus)].join("\n") });
+      const header = live === undefined ? t("mcp.headerNoSession") : live === null ? t("mcp.headerNoReport") : t("mcp.header");
+      await this.reply(channel, chatId, joinText([header, ...rows.map((row) => formatMergedMcpStatus(t, row))]));
       return;
     }
 
     const reconnect = /^reconnect\s+(\S+)$/i.exec(arg);
     if (reconnect) {
       const outcome = await this.deps.reconnectMcpServer(sessionKey, reconnect[1]);
-      await channel.send({ chatId, text: outcome === "reconnected" ? `🔌 Reconnected "${reconnect[1]}".`
-        : outcome === "no-live-session" ? "⚠️ There is no live session to reconnect in; a new conversation connects every server afresh."
-        : outcome === "busy" ? "⚠️ A reply is in progress; try again once it has finished."
-        : `⚠️ Reconnecting "${reconnect[1]}" failed. The log has the reason; /new starts a fresh session.` });
+      await this.reply(channel, chatId, outcome === "reconnected" ? t("mcp.reconnected", { server: reconnect[1] })
+        : outcome === "no-live-session" ? t("mcp.reconnectNoSession")
+        : outcome === "busy" ? t("mcp.reconnectBusy")
+        : t("mcp.reconnectFailed", { server: reconnect[1] }));
       return;
     }
 
     const match = /^login\s+(\S+)$/i.exec(arg);
     if (!match) {
-      await channel.send({ chatId, text: "⚠️ Usage: /mcp, /mcp login <server> or /mcp reconnect <server>" });
+      await this.reply(channel, chatId, t("mcp.usage"));
       return;
     }
 
     const serverName = match[1];
     try {
       const login = await this.deps.startExternalMcpLogin(serverName);
-      await channel.send({
-        chatId,
-        text: [
-          login.reused ? `🔑 MCP login for "${serverName}" is already waiting.` : `🔑 MCP login started for "${serverName}".`,
-          "",
-          login.url,
-          "",
-          "Complete authorization in your browser, then paste the full localhost redirect URL back into this private DM.",
-          "The request expires after 10 minutes. Tomo will attach the server to live sessions after login; if runtime hot-mounting is unavailable, the next session will use it.",
-        ].join("\n"),
-      });
+      await this.reply(channel, chatId, joinText([
+        login.reused ? t("mcp.loginWaiting", { server: serverName }) : t("mcp.loginStarted", { server: serverName }),
+        raw(login.url),
+        t("mcp.loginInstructions"),
+      ]));
     } catch (err) {
       log.warn({ err, serverName }, "External MCP login command failed");
-      await channel.send({ chatId, text: `⚠️ [error] MCP login failed: ${shortErrorMessage(err)}` });
+      await this.reply(channel, chatId, t("mcp.loginFailed", { error: errorDetail(err) }));
     }
   }
 
@@ -768,8 +723,9 @@ export class ChatCommandHandler {
   }
 
   private async restoreConfigAndRestart(channel: Channel, chatId: string, sessionKey: string): Promise<void> {
+    const t = ownerT("commands");
     if (!existsSync(CONFIG_BACKUP_PATH)) {
-      await channel.send({ chatId, text: "⚠️ No config backup found at ~/.tomo/config.json.bak." });
+      await this.reply(channel, chatId, t("restore.noBackup"));
       return;
     }
 
@@ -788,38 +744,40 @@ export class ChatCommandHandler {
       writeRestartReasonFile(RESTART_REASON_FILE, { reason, sessionKey });
 
       this.restoringConfig = true;
-      await channel.send({ chatId, text: "♻️ Restored config.json from config.json.bak. Restarting Tomo..." });
+      await this.reply(channel, chatId, t("restore.done"));
 
       this.scheduleRestart();
     } catch (err) {
       log.warn({ err }, "/restore failed");
-      await channel.send({ chatId, text: `⚠️ [error] restore failed: ${shortErrorMessage(err)}` });
+      await this.reply(channel, chatId, t("restore.failed", { error: errorDetail(err) }));
     }
   }
 }
 
-const LIVE_LABEL: Record<MergedMcpStatus["live"], string> = {
-  connected: "connected",
-  failed: "failed",
-  "needs-auth": "needs sign-in",
-  pending: "connecting",
-  disabled: "disabled",
-  "no-live-session": "no live session",
-  unknown: "status unknown",
-  "not-reported": "not loaded in this session",
-};
+function liveLabel(t: OwnerT<"commands">, live: MergedMcpStatus["live"]): OwnerText {
+  switch (live) {
+    case "connected": return t("mcp.live.connected");
+    case "failed": return t("mcp.live.failed");
+    case "needs-auth": return t("mcp.live.needsAuth");
+    case "pending": return t("mcp.live.pending");
+    case "disabled": return t("mcp.live.disabled");
+    case "no-live-session": return t("mcp.live.noLiveSession");
+    case "unknown": return t("mcp.live.unknown");
+    case "not-reported": return t("mcp.live.notReported");
+  }
+}
 
-function formatMergedMcpStatus(row: MergedMcpStatus): string {
-  const parts = [LIVE_LABEL[row.live]];
+function formatMergedMcpStatus(t: OwnerT<"commands">, row: MergedMcpStatus): OwnerText {
+  const parts: OwnerText[] = [liveLabel(t, row.live)];
   if (row.oauth) {
-    const expiry = row.oauth.expiresAt !== undefined ? new Date(row.oauth.expiresAt).toLocaleString() : undefined;
-    if (row.oauth.state === "ready") parts.push(expiry ? `token valid until ${expiry}` : "OAuth token ready");
-    else if (row.oauth.state === "auth-pending") parts.push("sign-in pending");
-    else if (row.oauth.state === "auth-failed") parts.push(`auth failed${row.oauth.lastError ? `: ${row.oauth.lastError}` : ""}`);
-    else parts.push("login required");
-  } else if (row.configured) parts.push("no OAuth");
-  else parts.push("session-provided");
-  if (row.action === "login") parts.push(row.configured ? `/mcp login ${row.name}` : "sign-in required");
-  if (row.action === "reconnect") parts.push(`/mcp reconnect ${row.name}`);
-  return `• ${row.name} — ${parts.join(" · ")}`;
+    const expiry = row.oauth.expiresAt !== undefined ? formatDateTime(row.oauth.expiresAt) : undefined;
+    if (row.oauth.state === "ready") parts.push(expiry ? t("mcp.tokenUntil", { at: expiry }) : t("mcp.tokenReady"));
+    else if (row.oauth.state === "auth-pending") parts.push(t("mcp.signInPending"));
+    else if (row.oauth.state === "auth-failed") parts.push(row.oauth.lastError ? t("mcp.authFailedDetail", { error: row.oauth.lastError }) : t("mcp.authFailed"));
+    else parts.push(t("mcp.loginRequired"));
+  } else if (row.configured) parts.push(t("mcp.noOAuth"));
+  else parts.push(t("mcp.sessionProvided"));
+  if (row.action === "login") parts.push(row.configured ? t("mcp.loginCommand", { name: row.name }) : t("mcp.signInRequired"));
+  if (row.action === "reconnect") parts.push(t("mcp.reconnectCommand", { name: row.name }));
+  return t("mcp.row", { name: row.name, parts: joinText(parts, " · ") });
 }

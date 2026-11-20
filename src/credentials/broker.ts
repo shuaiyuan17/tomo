@@ -1,3 +1,4 @@
+import { joinText, ownerT, type OwnerT, type OwnerText } from "../i18n/index.js";
 import { randomUUID } from "node:crypto";
 import type { Channel, IncomingMessage } from "../channels/types.js";
 import { isDefiniteFailure } from "../channels/types.js";
@@ -42,11 +43,11 @@ export interface CaptureChannel {
   readonly kind: "message" | "form";
   /** Show the request: `prompt` is the chat text; a form shows `view`. Throws
    *  like `Channel.send`, so a definite failure closes the request. */
-  open(view: CredentialRequestView, prompt: string): Promise<void>;
+  open(view: CredentialRequestView, prompt: OwnerText): Promise<void>;
   /** The request ended, however it ended. A form withdraws its card. */
   close(): void;
   /** Tell the owner something on this channel. Never throws. */
-  notify(text: string): Promise<void>;
+  notify(text: OwnerText): Promise<void>;
 }
 
 export interface BrokerDeps {
@@ -58,7 +59,7 @@ export interface BrokerDeps {
   /** Tell a session's model how a request ended. Never carries a value. */
   notifySession(sessionKey: string, body: string): void;
   /** A notice for the owner that needs no model turn (agent.sendNotification). */
-  notifyOwner?(text: string): void;
+  notifyOwner?(text: OwnerText): void;
   now?: () => number;
   timeoutMs?: number;
 }
@@ -157,7 +158,7 @@ export class CredentialBroker {
     if (!this.redactionAlerted) {
       this.redactionAlerted = true;
       log.error("Credential redaction is not ready: stored values could not be loaded, so they would not be masked in tool output. Retrying; output of commands that read the keychain is withheld meanwhile.");
-      this.deps.notifyOwner?.("Tomo could not load its stored credentials (the keychain or ~/.tomo/data/credentials/state.json is unavailable), so it cannot mask them in tool output yet. It keeps retrying, and hides the output of any command that reads the keychain until then.");
+      this.deps.notifyOwner?.(ownerT("notices")("credentialsUnavailable"));
     }
     return false;
   }
@@ -210,17 +211,12 @@ export class CredentialBroker {
 
     const replaces = this.state.names.includes(name);
     const minutes = Math.round(this.timeoutMs / 60_000);
-    const prompt = capture.kind === "form" ? "" : [
-      "Tomo is asking for a credential.",
-      `Name: ${name}`,
-      `Purpose (written by the agent, not verified): ${cleanPurpose}`,
-      ...(replaces ? ["Your reply replaces the value already stored under this name."] : []),
-      "",
-      capture.name === "telegram"
-        ? "Your next message in this chat is stored as this credential and is not shown to the model. Tomo deletes it from the chat once it is stored."
-        : "Your next message in this chat is stored as this credential and is not shown to the model. It stays in Messages, so delete it afterwards.",
-      `Reply "cancel" to refuse. Expires in ${minutes} minutes.`,
-    ].join("\n");
+    const t = ownerT("credentials");
+    const prompt = capture.kind === "form" ? joinText([]) /* a form shows `view`, not text */ : joinText([
+      replaces ? t("promptReplaces", { name, purpose: cleanPurpose }) : t("prompt", { name, purpose: cleanPurpose }),
+      capture.name === "telegram" ? t("promptTelegram") : t("promptMessages"),
+      t("promptCancel", { minutes }),
+    ]);
     const ref = secretRefFor(name);
     try {
       await capture.open(viewOf(pending), prompt);
@@ -272,7 +268,8 @@ export class CredentialBroker {
       if (!isOwnerDm || !this.held.has(channel.name)) return false;
       channel.settleMessage?.(message.id, "refused");
       const removed = await this.removeMessage(channel, message);
-      await this.say(channel, message.chatId, `Tomo's credential state is unreadable, so this message was held back and not shown to the model.${removed ? " It was deleted from this chat." : ""} Repair or remove ~/.tomo/data/credentials/state.json.`);
+      const t = ownerT("credentials");
+      await this.say(channel, message.chatId, t("heldBack", { deleted: removed ? t("deleted") : "" }));
       return true;
     }
 
@@ -313,7 +310,8 @@ export class CredentialBroker {
     this.markConsumed(channel, message);
     channel.settleMessage?.(message.id, "refused");
     const removed = await this.removeMessage(channel, message);
-    await this.say(channel, message.chatId, `A message sent around the time the request for ${window.name} expired arrived late. It was not stored and not shown to the model.${removed ? " It was deleted from this chat." : ""} If it was something else, send it again.`);
+    const t = ownerT("credentials");
+    await this.say(channel, message.chatId, t("late", { name: window.name, deleted: removed ? t("deleted") : "" }));
     this.deps.notifySession(window.sessionKey, `The owner's reply to the request for ${secretRefFor(window.name)} arrived after it expired and was discarded. Ask again if it is still needed.`);
     return true;
   }
@@ -322,8 +320,9 @@ export class CredentialBroker {
     this.markConsumed(channel, message);
     channel.settleMessage?.(message.id, "refused");
     const removed = await this.removeMessage(channel, message);
-    const where = pending.channel === "web" ? "the web UI's card" : pending.channel === "telegram" ? "Telegram" : "iMessage";
-    await this.say(channel, message.chatId, `Tomo is waiting for ${pending.name} in ${where}, so this message was dropped and not shown to the model.${removed ? " It was deleted from this chat." : ""} Answer there, or cancel there.`);
+    const t = ownerT("credentials");
+    const where = pending.channel === "web" ? t("where.web") : pending.channel === "telegram" ? t("where.telegram") : t("where.imessage");
+    await this.say(channel, message.chatId, t("offChannel", { name: pending.name, where, deleted: removed ? t("deleted") : "" }));
     return true;
   }
 
@@ -341,22 +340,23 @@ export class CredentialBroker {
     const cancelled = CANCEL_WORDS.has(value.toLowerCase());
     if (cancelled || valid) this.endRequest(pending);
 
+    const t = ownerT("credentials");
     if (cancelled) {
-      await this.say(channel, message.chatId, `Cancelled the request for ${pending.name}.`);
+      await this.say(channel, message.chatId, t("cancelled", { name: pending.name }));
       this.deps.notifySession(pending.sessionKey, `The owner refused the request for ${ref}.`);
       return true;
     }
     const removed = await this.removeMessage(channel, message);
-    const tidy = removed ? "Your message was deleted from this chat." : deletionAdvice(channel.name);
+    const tidy = removed ? t("tidyDeleted") : deletionAdvice(t, channel.name);
     if (!valid) {
-      await this.say(channel, message.chatId, `That was not stored and not shown to the model. ${tidy} ${pending.name} needs plain text (printable ASCII, ${MIN_SECRET_LENGTH} to ${MAX_SECRET_LENGTH} characters) and no attachment. Send it again, or reply "cancel".`);
+      await this.say(channel, message.chatId, t("invalid", { tidy, name: pending.name, min: MIN_SECRET_LENGTH, max: MAX_SECRET_LENGTH }));
       return true;
     }
     if (!await this.store(pending, value)) {
-      await this.say(channel, message.chatId, `Could not store ${pending.name}: the credential store is unavailable. Nothing was shown to the model. ${tidy}`);
+      await this.say(channel, message.chatId, t("storeFailed", { name: pending.name, tidy }));
       return true;
     }
-    await this.say(channel, message.chatId, `Stored as ${pending.name}. ${tidy}`);
+    await this.say(channel, message.chatId, t("stored", { name: pending.name, tidy }));
     return true;
   }
 
@@ -408,7 +408,7 @@ export class CredentialBroker {
     if (!pending) return;
     this.closeWindow(pending);
     const capture = this.deps.captureChannel({ channelName: pending.channel, chatId: pending.chatId });
-    if (capture?.kind === "message") await capture.notify(`The request for ${pending.name} expired. Do NOT send it now: messages here go to the model again.`);
+    if (capture?.kind === "message") await capture.notify(ownerT("credentials")("expired", { name: pending.name }));
     this.deps.notifySession(pending.sessionKey, `The request for ${secretRefFor(pending.name)} timed out with no answer.`);
   }
 
@@ -448,7 +448,7 @@ export class CredentialBroker {
     }
   }
 
-  private async say(channel: Channel, chatId: string, text: string): Promise<void> {
+  private async say(channel: Channel, chatId: string, text: OwnerText): Promise<void> {
     if (channel.name === "web") return;
     try {
       await channel.send({ chatId, text });
@@ -466,10 +466,8 @@ function acceptableValue(value: string): boolean {
   return value.length >= MIN_SECRET_LENGTH && value.length <= MAX_SECRET_LENGTH && isStorableValue(value);
 }
 
-function deletionAdvice(channelName: string): string {
-  return channelName === "telegram"
-    ? "Tomo could not delete your message, so delete it from this chat yourself."
-    : "Your message is still in Messages, so delete it there.";
+function deletionAdvice(t: OwnerT<"credentials">, channelName: string): OwnerText {
+  return channelName === "telegram" ? t("tidyTelegram") : t("tidyMessages");
 }
 
 /**

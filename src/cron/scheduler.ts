@@ -5,6 +5,7 @@ import type { Agent } from "../agent.js";
 import { formatTomoEvent } from "../tomo-event.js";
 import { watchBus } from "../watch/bus.js";
 import { formatDuration } from "./format.js";
+import { formatDateTime, joinText, ownerT, type OwnerText } from "../i18n/index.js";
 
 /**
  * Due-scan cadence. Exported because it is also the floor on how often a job
@@ -202,63 +203,56 @@ export class CronScheduler {
     }
     if (parked.length === 0 && skips.length === 0 && interrupted.length === 0) return;
 
-    const sections: string[] = [];
+    const t = ownerT("notices");
+    const at = (ms: number) => formatDateTime(ms);
+    const next = (job: CronJob) => job.nextRunAt ? t("cron.next", { at: at(job.nextRunAt) }) : "";
+    const sections: OwnerText[] = [];
     if (skips.length > 0) {
-      sections.push([
-        `${skips.length === 1 ? "A scheduled run was" : `${skips.length} scheduled runs were`} ` +
-          "missed (Tomo was down or behind) by more than the job's catch-up window, so " +
-          `${skips.length === 1 ? "it was" : "they were"} skipped rather than run late:`,
+      sections.push(joinText([
+        t("cron.skipped", { count: skips.length }),
         ...skips.map((job) => {
           const { lateByMs, windowMs, count } = job.skipNotice!;
-          const next = job.nextRunAt ? `; next run ${new Date(job.nextRunAt).toLocaleString()}` : "";
-          const times = count > 1 ? `${count} runs skipped, latest ` : "";
-          return `- "${job.name}" [${job.id}]: ${times}${formatDuration(lateByMs)} late, window ${formatDuration(windowMs)}${next}`;
+          return t("cron.skipItem", {
+            name: job.name, id: job.id, times: count > 1 ? t("cron.skipTimes", { count }) : "",
+            late: formatDuration(lateByMs), window: formatDuration(windowMs), next: next(job),
+          });
         }),
-        "If one is still needed, ask me to do it now. To make a job always catch up: `tomo cron edit <id> --stale-after 0`.",
-      ].join("\n"));
+        t("cron.skipFooter"),
+      ]));
     }
     if (parked.length > 0) {
-      sections.push([
-        `${parked.length === 1 ? "A scheduled one-time task was" : `${parked.length} scheduled one-time tasks were`} ` +
-          "interrupted (by a restart, or stopped from the web UI) and did NOT finish. It may have partly run, so it will not be re-run on its own:",
+      sections.push(joinText([
+        t("cron.parked", { count: parked.length }),
         ...parked.map((job) => {
           const started = job.lastStartedAt ?? job.lastRunAt;
           const interrupted = job.lastRunAt != null && job.lastRunAt !== started ? job.lastRunAt : null;
-          const when = started
-            ? ` (started ${new Date(started).toLocaleString()}${interrupted ? `, interrupted ${new Date(interrupted).toLocaleString()}` : ""})`
-            : "";
-          return `- "${job.name}" [${job.id}]${when}: ${excerpt(job.message)}`;
+          const when = !started ? ""
+            : interrupted ? t("cron.parkedStartedInterrupted", { started: at(started), interrupted: at(interrupted) })
+            : t("cron.parkedStarted", { started: at(started) });
+          return t("cron.parkedItem", { name: job.name, id: job.id, when, excerpt: excerpt(job.message) });
         }),
-        "Should I run it again? Tell me and I will do it now, or remove it with `tomo cron remove <id>`. (`tomo cron enable <id>` re-runs a dated one-shot right away; a recurring-pattern one waits for its next slot.)",
-      ].join("\n"));
+        t("cron.parkedFooter"),
+      ]));
     }
     if (interrupted.length > 0) {
-      sections.push([
-        `${interrupted.length === 1 ? "A recurring task's run was" : `${interrupted.length} recurring tasks' runs were`} ` +
-          "interrupted (by a restart, or stopped from the web UI) and did NOT finish. It may have partly run. It will not be re-run; " +
-          `${interrupted.length === 1 ? "the job continues" : "the jobs continue"} at the next normal time:`,
+      sections.push(joinText([
+        t("cron.interrupted", { count: interrupted.length }),
         ...interrupted.map((job) => {
           const { count, runs } = job.interruptNotice!;
-          const describe = ({ startedAt, interruptedAt, missed }: InterruptedRun) => {
-            const started = startedAt ? `started ${new Date(startedAt).toLocaleString()}, ` : "";
-            const stopped = interruptedAt
-              ? `interrupted ${new Date(interruptedAt).toLocaleString()}`
-              : "interrupted when Tomo went down (time unknown)";
-            const gap = missed && missed.count > 0
-              ? ` — ${missed.count} later scheduled run${missed.count === 1 ? "" : "s"} missed while Tomo was down (${
-                missed.count === 1
-                  ? new Date(missed.from).toLocaleString()
-                  : `${new Date(missed.from).toLocaleString()} to ${new Date(missed.to).toLocaleString()}`
-              }), not run`
-              : "";
-            return `${started}${stopped}${gap}`;
-          };
-          const times = count > 1 ? `interrupted ${count} times${runs.length < count ? ` (latest ${runs.length} shown)` : ""}: ` : "";
-          const next = job.nextRunAt ? `; next run ${new Date(job.nextRunAt).toLocaleString()}` : "";
-          return `- "${job.name}" [${job.id}]: ${times}${runs.map(describe).join("; ")}${next}`;
+          const describe = ({ startedAt, interruptedAt, missed }: InterruptedRun) => t("cron.run", {
+            started: startedAt ? t("cron.runStarted", { at: at(startedAt) }) : "",
+            stopped: interruptedAt ? t("cron.runStopped", { at: at(interruptedAt) }) : t("cron.runStoppedUnknown"),
+            gap: missed && missed.count > 0
+              ? t("cron.runGap", { count: missed.count, range: missed.count === 1 ? at(missed.from) : t("cron.runGapRange", { from: at(missed.from), to: at(missed.to) }) })
+              : "",
+          });
+          const times = count <= 1 ? ""
+            : runs.length < count ? t("cron.interruptedTimesShown", { count, shown: runs.length })
+            : t("cron.interruptedTimes", { count });
+          return t("cron.interruptedItem", { name: job.name, id: job.id, times, runs: joinText(runs.map(describe), t("cron.runSeparator")), next: next(job) });
         }),
-        "If the missed run is still needed, ask me to do it now.",
-      ].join("\n"));
+        t("cron.interruptedFooter"),
+      ]));
     }
     const ids = {
       skipped: skips.map((job) => job.id),
@@ -273,7 +267,7 @@ export class CronScheduler {
     let delivered: boolean;
     try {
       // Owner only: the excerpts may come from any session's jobs.
-      delivered = await this.agent.notifyOwner(sections.join("\n\n"));
+      delivered = await this.agent.notifyOwner(joinText(sections, "\n\n"));
     } catch (err) {
       log.error({ err, ...ids }, "Could not tell the owner about skipped or interrupted cron runs; will retry");
       return;

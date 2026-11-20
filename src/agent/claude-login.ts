@@ -21,6 +21,42 @@ interface PendingLogin {
   rejectCompletion: (err: Error) => void;
 }
 
+/** Why /login could not go on: a fixed kind, so the reply can say it in any language. */
+export type ClaudeLoginFailure =
+  | { kind: "other_owner_in_progress" } | { kind: "expired" }
+  | { kind: "submit_failed"; detail: string } | { kind: "start_failed"; detail: string }
+  | { kind: "exited"; signal?: string; code?: number | null }
+  | { kind: "none_waiting" } | { kind: "other_owner" } | { kind: "verifying" } | { kind: "invalid_code" } | { kind: "state_mismatch" }
+  | { kind: "cancelled" } | { kind: "stopped" } | { kind: "verification_failed"; detail?: string };
+
+/** The English text of each (the error's message, as before kinds). */
+export function claudeLoginFailureMessage(failure: ClaudeLoginFailure): string {
+  switch (failure.kind) {
+    case "other_owner_in_progress": return "Another owner already has a Claude login in progress";
+    case "expired": return "Claude login expired after 10 minutes; run /login again";
+    case "submit_failed": return `Could not submit Claude login code: ${failure.detail}`;
+    case "start_failed": return `Could not start Claude login: ${failure.detail}`;
+    case "exited": return `Claude login did not complete (${failure.signal ? `signal ${failure.signal}` : `exit code ${failure.code ?? "unknown"}`})`;
+    case "none_waiting": return "No Claude login is waiting; send /login first";
+    case "other_owner": return "This Claude login belongs to another owner";
+    case "verifying": return "That Claude login code is already being verified";
+    case "invalid_code": return "Invalid authorization code; paste the complete code returned by Claude";
+    case "state_mismatch": return "Authorization code does not match the active /login request";
+    case "cancelled": return "Claude login cancelled";
+    case "stopped": return "Tomo stopped during Claude login";
+    case "verification_failed": return `Claude login verification failed${failure.detail ? `: ${failure.detail}` : ""}`;
+  }
+}
+
+/** A /login failure of ours; `detail` fields carry the CLI's or the OS's own words. */
+export class ClaudeLoginError extends Error {
+  timedOut?: boolean;
+  constructor(readonly failure: ClaudeLoginFailure) {
+    super(claudeLoginFailureMessage(failure));
+    this.name = "ClaudeLoginError";
+  }
+}
+
 export interface ClaudeLoginManagerOptions {
   spawnLogin?: () => ChildProcessWithoutNullStreams;
   verifyLogin?: () => Promise<void>;
@@ -35,6 +71,8 @@ export interface ClaudeLoginStart {
 export interface ClaudeLoginCompletion {
   verified: boolean;
   verificationError?: string;
+  /** The verification error itself, for a reply in the owner's language (src/i18n/error-detail.ts). */
+  verificationFailure?: unknown;
 }
 
 /**
@@ -60,7 +98,7 @@ export class ClaudeLoginManager {
     const normalizedOwner = owner.toLowerCase();
     if (this.pending) {
       if (this.pending.owner !== normalizedOwner) {
-        throw new Error("Another owner already has a Claude login in progress");
+        throw new ClaudeLoginError({ kind: "other_owner_in_progress" });
       }
       return {
         url: this.pending.url ?? await this.pending.urlPromise,
@@ -91,7 +129,7 @@ export class ClaudeLoginManager {
       output: "",
       codeSubmitted: false,
       timeout: setTimeout(() => {
-        const err = new Error("Claude login expired after 10 minutes; run /login again");
+        const err = new ClaudeLoginError({ kind: "expired" });
         rejectUrl(err);
         rejectCompletion(err);
         child.kill();
@@ -118,11 +156,11 @@ export class ClaudeLoginManager {
     child.stdout.on("data", capture);
     child.stderr.on("data", capture);
     child.stdin.on("error", (err) => {
-      pending.rejectCompletion(new Error(`Could not submit Claude login code: ${err.message}`));
+      pending.rejectCompletion(new ClaudeLoginError({ kind: "submit_failed", detail: err.message }));
     });
 
     child.once("error", (err) => {
-      pending.rejectUrl(new Error(`Could not start Claude login: ${err.message}`));
+      pending.rejectUrl(new ClaudeLoginError({ kind: "start_failed", detail: err.message }));
       pending.rejectCompletion(err);
       this.clearPending(pending);
     });
@@ -132,8 +170,7 @@ export class ClaudeLoginManager {
       if (code === 0 && pending.codeSubmitted) {
         pending.resolveCompletion();
       } else {
-        const reason = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
-        const err = new Error(`Claude login did not complete (${reason})`);
+        const err = new ClaudeLoginError({ kind: "exited", ...(signal ? { signal } : { code }) });
         pending.rejectUrl(err);
         pending.rejectCompletion(err);
       }
@@ -145,21 +182,21 @@ export class ClaudeLoginManager {
 
   async complete(owner: string, code: string): Promise<ClaudeLoginCompletion> {
     const pending = this.pending;
-    if (!pending) throw new Error("No Claude login is waiting; send /login first");
+    if (!pending) throw new ClaudeLoginError({ kind: "none_waiting" });
     if (pending.owner !== owner.toLowerCase()) {
-      throw new Error("This Claude login belongs to another owner");
+      throw new ClaudeLoginError({ kind: "other_owner" });
     }
-    if (pending.codeSubmitted) throw new Error("That Claude login code is already being verified");
+    if (pending.codeSubmitted) throw new ClaudeLoginError({ kind: "verifying" });
 
     const trimmed = code.trim();
     const hash = trimmed.lastIndexOf("#");
     if (hash <= 0 || hash === trimmed.length - 1 || /\s/.test(trimmed)) {
-      throw new Error("Invalid authorization code; paste the complete code returned by Claude");
+      throw new ClaudeLoginError({ kind: "invalid_code" });
     }
     const expectedState = pending.url ? new URL(pending.url).searchParams.get("state") : null;
     const receivedState = trimmed.slice(hash + 1);
     if (!expectedState || receivedState !== expectedState) {
-      throw new Error("Authorization code does not match the active /login request");
+      throw new ClaudeLoginError({ kind: "state_mismatch" });
     }
 
     pending.codeSubmitted = true;
@@ -172,6 +209,7 @@ export class ClaudeLoginManager {
       return {
         verified: false,
         verificationError: err instanceof Error ? err.message : String(err),
+        verificationFailure: err,
       };
     }
   }
@@ -179,7 +217,7 @@ export class ClaudeLoginManager {
   cancel(owner: string): boolean {
     const pending = this.pending;
     if (!pending || pending.owner !== owner.toLowerCase()) return false;
-    const err = new Error("Claude login cancelled");
+    const err = new ClaudeLoginError({ kind: "cancelled" });
     pending.rejectUrl(err);
     pending.rejectCompletion(err);
     pending.child.kill();
@@ -190,7 +228,7 @@ export class ClaudeLoginManager {
   stop(): void {
     const pending = this.pending;
     if (!pending) return;
-    const err = new Error("Tomo stopped during Claude login");
+    const err = new ClaudeLoginError({ kind: "stopped" });
     pending.rejectUrl(err);
     pending.rejectCompletion(err);
     pending.child.kill();
@@ -215,7 +253,7 @@ export function verifyClaudeLogin(): Promise<void> {
           return;
         }
         const detail = `${stderr || stdout}`.trim().split("\n")[0]?.slice(0, 300);
-        const failure = new Error(`Claude login verification failed${detail ? `: ${detail}` : ""}`) as Error & { timedOut?: boolean };
+        const failure = new ClaudeLoginError({ kind: "verification_failed", ...(detail ? { detail } : {}) });
         // execFile's timeout kills the child: say so, so callers can tell a
         // slow/unreachable service from a missing login.
         if ((err as { killed?: boolean }).killed) failure.timedOut = true;

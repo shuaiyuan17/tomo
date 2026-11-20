@@ -1,3 +1,4 @@
+import { joinText, ownerLocale, ownerT, type Locale, type OwnerText } from "./i18n/index.js";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { defaultRuntimePaths } from "./runtime-paths.js";
@@ -89,27 +90,29 @@ export function buildCostSummary(entries: CostEntry[]): string {
 
 export function buildSessionCostReport(
   sessionKey: string,
-  opts: { logPath?: string; entries?: CostEntry[]; now?: number } = {},
-): string {
+  opts: { logPath?: string; entries?: CostEntry[]; now?: number; locale?: Locale } = {},
+): OwnerText {
+  const t = ownerT("cost", opts.locale ?? ownerLocale());
   const allEntries = opts.entries ?? parseCostEntries(opts.logPath);
   const sessionEntries = allEntries.filter((e) => e.session === sessionKey);
   const now = opts.now ?? Date.now();
-  const ranges: Array<{ label: string; range: CostRange }> = [
-    { label: "1d", range: "day" },
-    { label: "7d", range: "week" },
-    { label: "1mo", range: "month" },
+  const ranges: Array<{ label: OwnerText; range: CostRange }> = [
+    { label: t("range.day"), range: "day" },
+    { label: t("range.week"), range: "week" },
+    { label: t("range.month"), range: "month" },
   ];
 
-  const lines = [`Cost for ${sessionKey}`];
+  const lines = [t("title", { session: sessionKey })];
   for (const { label, range } of ranges) {
     const entries = filterCostEntriesByRange(sessionEntries, range, now);
     const total = totalCostFor(entries);
     const count = entries.length;
-    const avg = count > 0 ? `, ${formatCost(total / count)}/run` : "";
-    lines.push(`${label}: ${formatCost(total)} (${count} ${count === 1 ? "run" : "runs"}${avg})`);
+    lines.push(count > 0
+      ? t("lineAvg", { range: label, total: formatCost(total), count, avg: formatCost(total / count) })
+      : t("line", { range: label, total: formatCost(total), count }));
   }
 
-  return lines.join("\n");
+  return joinText(lines);
 }
 
 function parseCostValue(raw: unknown): number | null {

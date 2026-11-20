@@ -98,6 +98,23 @@ class OAuthTokenExchangeError extends Error {
  * next login, a false negative a login link that can never work — but a 401
  * that names some OTHER error is taken at its word.
  */
+
+/** Why `/mcp login` could not start, a fixed kind of ours (the OAuth protocol's own failures are not). */
+export type McpLoginFailure = "unknown_server" | "no_oauth" | "no_headers" | "not_interactive";
+const MCP_LOGIN_MESSAGES: Record<McpLoginFailure, (server: string) => string> = {
+  unknown_server: (server) => `Unknown external MCP server "${server}"`,
+  no_oauth: (server) => `MCP server "${server}" does not use OAuth`,
+  no_headers: (server) => `MCP server "${server}" cannot use OAuth headers`,
+  not_interactive: (server) => `MCP server "${server}" did not start an interactive OAuth flow`,
+};
+
+export class McpLoginError extends Error {
+  constructor(readonly kind: McpLoginFailure, readonly server: string) {
+    super(MCP_LOGIN_MESSAGES[kind](server));
+    this.name = "McpLoginError";
+  }
+}
+
 function isClientRejection(error: unknown): boolean {
   if (!(error instanceof OAuthTokenExchangeError)) return false;
   if (error.code !== undefined) return error.code === "invalid_client";
@@ -303,9 +320,9 @@ export class McpOAuthManager {
     servers: Record<string, ExternalMcpServerConfig>,
   ): Promise<McpLoginStart> {
     const entry = servers[serverName];
-    if (!entry) throw new Error(`Unknown external MCP server "${serverName}"`);
-    if (!entry.oauth) throw new Error(`MCP server "${serverName}" does not use OAuth`);
-    if (!supportsHeaders(entry.server)) throw new Error(`MCP server "${serverName}" cannot use OAuth headers`);
+    if (!entry) throw new McpLoginError("unknown_server", serverName);
+    if (!entry.oauth) throw new McpLoginError("no_oauth", serverName);
+    if (!supportsHeaders(entry.server)) throw new McpLoginError("no_headers", serverName);
 
     const existing = this.serverAuthBuilds.get(serverName);
     if (existing) {
@@ -327,7 +344,7 @@ export class McpOAuthManager {
     const url = build.authorizeUrl ?? await build.authorizeUrlReady;
     if (!url) {
       await build.promise;
-      throw new Error(`MCP server "${serverName}" did not start an interactive OAuth flow`);
+      throw new McpLoginError("not_interactive", serverName);
     }
     return { url, reused: false, startedAt: build.startedAt };
   }

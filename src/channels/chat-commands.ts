@@ -1,26 +1,42 @@
+import { ownerT, type Locale } from "../i18n/index.js";
+
 /**
  * The chat slash commands every channel recognizes, in menu order, with the
- * description Telegram shows in its command menu. The handlers live in
- * `src/agent/commands.ts`; a command added there must be added here too, or
- * no channel will route it.
+ * description Telegram shows in its command menu (in `locale`). The handlers
+ * live in `src/agent/commands.ts`; a command added there must be added here
+ * too, or no channel will route it.
  */
-export const CHAT_COMMANDS: readonly { command: string; description: string }[] = [
-  { command: "new", description: "Start a new conversation" },
-  { command: "rewind", description: "Rewind context by N user messages (default 1, owner DM only)" },
-  { command: "model", description: "Switch model (Claude aliases or LiteLLM provider/model)" },
-  { command: "restore", description: "Restore config from backup and restart" },
-  { command: "login", description: "Refresh Claude login (owner DM only)" },
-  { command: "mcp", description: "Inspect or re-authenticate external MCP servers" },
-  { command: "status", description: "Show current session status" },
-  { command: "tasks", description: "List this chat's running and recent tasks (/tasks all: all of today)" },
-  { command: "todo", description: "Open todos (/todo add <text>, /todo done <id>, /todo drop <id>, /todo all)" },
-  { command: "cost", description: "Show current session costs" },
-  { command: "usage", description: "Show Claude subscription usage limits" },
-  { command: "pet", description: "Check on Tomo's pet" },
-  { command: "summon", description: "Pull your main Tomo session into this group" },
-  { command: "dismiss", description: "Hand this group back to its own Tomo session" },
-  { command: "pause", description: "Pause Tomo in this group (messages ignored until /resume)" },
-  { command: "resume", description: "Resume Tomo in this group after /pause" },
+export function chatCommandMenu(locale: Locale = "en"): { command: string; description: string }[] {
+  const t = ownerT("menu", locale);
+  return [
+    { command: "new", description: t("new") },
+    { command: "rewind", description: t("rewind") },
+    { command: "model", description: t("model") },
+    { command: "restore", description: t("restore") },
+    { command: "login", description: t("login") },
+    { command: "mcp", description: t("mcp") },
+    { command: "status", description: t("status") },
+    { command: "tasks", description: t("tasks") },
+    { command: "todo", description: t("todo") },
+    { command: "cost", description: t("cost") },
+    { command: "usage", description: t("usage") },
+    { command: "pet", description: t("pet") },
+    { command: "summon", description: t("summon") },
+    { command: "dismiss", description: t("dismiss") },
+    { command: "pause", description: t("pause") },
+    { command: "resume", description: t("resume") },
+  ];
+}
+
+/** The English menu (Telegram's default, for clients in any other language). */
+export const CHAT_COMMANDS: readonly { command: string; description: string }[] = chatCommandMenu("en");
+
+/**
+ * The menu per Telegram `language_code` (an IETF tag, language only) beyond
+ * the default: a client whose language is Chinese sees the zh-Hans one.
+ */
+export const LOCALIZED_CHAT_COMMAND_MENUS: readonly { languageCode: string; commands: { command: string; description: string }[] }[] = [
+  { languageCode: "zh", commands: chatCommandMenu("zh-Hans") },
 ];
 
 export const CHAT_COMMAND_NAMES: readonly string[] = CHAT_COMMANDS.map((c) => c.command);

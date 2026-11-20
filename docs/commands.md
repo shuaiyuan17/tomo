@@ -32,7 +32,7 @@ tomo uninstall         # Stop Tomo and remove the login item (keeps your data)
 
 ## Chat commands
 
-These are answered by Tomo itself, without a model call.
+These are answered by Tomo itself, without a model call. Replies follow config `locale` (`"en"` or `"zh-Hans"`; unset is English); the command names and reply syntax stay the same in every language. Telegram's command menu is English by default and Chinese for clients set to Chinese.
 
 | Command | Description |
 |---------|-------------|

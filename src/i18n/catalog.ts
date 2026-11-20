@@ -15,14 +15,25 @@
  * one, the rest are optional (Chinese has no `_one`).
  */
 export const PLURAL_SUFFIXES = ["_zero", "_one", "_two", "_few", "_many", "_other"] as const;
-type OptionalPluralSuffix = "_zero" | "_one" | "_two" | "_few" | "_many";
-type IsOptionalPlural<K> = K extends `${string}${OptionalPluralSuffix}` ? true : false;
+const OPTIONAL_PLURAL_SUFFIXES = ["_zero", "_one", "_two", "_few", "_many"] as const;
+
+/** `K` without an optional plural suffix (`msgs_one` → `msgs`); never when it has none. */
+type StripOptionalPlural<K> =
+  K extends `${infer B}_zero` ? B : K extends `${infer B}_one` ? B : K extends `${infer B}_two` ? B
+    : K extends `${infer B}_few` ? B : K extends `${infer B}_many` ? B : never;
+/**
+ * True for a plural form a language may leave out: an optional suffix AND an
+ * `_other` in the same family. `step_one` with no `step_other` is an
+ * ordinary key, required like any other.
+ */
+type IsOptionalPlural<T, K> = [StripOptionalPlural<K>] extends [never] ? false
+  : `${StripOptionalPlural<K> & string}_other` extends keyof T ? true : false;
 
 /** A catalog with the same keys as `T`, every leaf a string. */
 export type Translation<T> = {
-  -readonly [K in keyof T as IsOptionalPlural<K> extends true ? never : K]: T[K] extends string ? string : Translation<T[K]>;
+  -readonly [K in keyof T as IsOptionalPlural<T, K> extends true ? never : K]: T[K] extends string ? string : Translation<T[K]>;
 } & {
-  -readonly [K in keyof T as IsOptionalPlural<K> extends true ? K : never]?: string;
+  -readonly [K in keyof T as IsOptionalPlural<T, K> extends true ? K : never]?: string;
 };
 
 /** A nested catalog as `key.path → text` (leaves only). */
@@ -36,10 +47,23 @@ export function flattenCatalog(catalog: object, prefix = ""): Map<string, string
   return out;
 }
 
-/** A key without its plural suffix: what call sites write (`t("msgs", { count })`). */
-export function baseKey(key: string): string {
-  for (const suffix of PLURAL_SUFFIXES) if (key.endsWith(suffix)) return key.slice(0, -suffix.length);
+/**
+ * The key call sites write for `key` (`t("msgs", { count })` for `msgs_one`):
+ * the plural suffix is dropped only when `key` is `_other` or its family
+ * has an `_other` among `keys` (the flattened catalog it comes from), the
+ * same rule {@link Translation} uses.
+ */
+export function baseKey(key: string, keys: ReadonlySet<string> | ReadonlyMap<string, unknown>): string {
+  if (key.endsWith("_other")) return key.slice(0, -"_other".length);
+  for (const suffix of OPTIONAL_PLURAL_SUFFIXES) {
+    if (key.endsWith(suffix) && keys.has(`${key.slice(0, -suffix.length)}_other`)) return key.slice(0, -suffix.length);
+  }
   return key;
+}
+
+/** True when `key` is a plural form a translation may omit (see {@link Translation}). */
+export function isOptionalPluralForm(key: string, keys: ReadonlySet<string> | ReadonlyMap<string, unknown>): boolean {
+  return !key.endsWith("_other") && baseKey(key, keys) !== key;
 }
 
 /** The `{{name}}` / `{{name, format}}` placeholders a text interpolates. */

@@ -194,10 +194,10 @@ export interface TomoConfig {
   /** Optional local script to run once per continuity heartbeat and append to the heartbeat prompt. */
   continuityScript: ContinuityScriptConfig | null;
   city: string | null;
-  /** `locale`: the language of the fixed text Tomo writes to people (chat-command
-   *  replies, owner notices) and the web UI's default. Null = unset: English
-   *  for chat, the browser's language for the web UI. Never the language of
-   *  model-facing text (system prompt, tomo-events), which stays English. */
+  /** `locale`: the language for the fixed text Tomo writes to people (`ownerT`,
+   *  src/i18n/) and the web UI's default (sent in the bootstrap). Null =
+   *  unset: English. Never the language of model-facing text (system prompt,
+   *  tomo-events), which stays English. */
   locale: Locale | null;
   /** `agent.name`: what the web UI calls the agent. Unset: IDENTITY.md's Name line, else "Tomo". */
   agentName: string | null;

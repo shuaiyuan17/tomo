@@ -127,7 +127,7 @@ Environment variables override config file values:
 | `TOMO_CONTINUITY_SCRIPT` | Optional continuity script path |
 | `TOMO_CONTINUITY_SCRIPT_TIMEOUT_MS` | Continuity script timeout (default: `30000`) |
 | `TOMO_CONTINUITY_SCRIPT_MAX_OUTPUT_CHARS` | Continuity script stdout/stderr cap (default: `8000`) |
-| `TOMO_LOCALE` | Language of Tomo's own fixed text: chat-command replies, owner notices, and the web UI's default (config key `locale`; `"en"` or `"zh-Hans"`; default: unset, which is English in chat and the browser's language in the web UI). Model-facing text and logs stay English |
+| `TOMO_LOCALE` | Language for Tomo's own fixed text (config key `locale`; `"en"` or `"zh-Hans"`; default: unset). Validated and passed to the web UI's bootstrap; no text is translated yet, so for now it changes nothing visible. Model-facing text and logs will stay English |
 | `TOMO_CITY` | City for weather in continuity heartbeats and the web UI's Home sky, from wttr.in (config key `city`, default: unset) |
 | `TOMO_LIVE_SESSION_TIMEOUT_MS` | Inactivity timeout for one turn (config key `liveSessionTimeoutMs`, default: `600000`, 10 minutes) |
 | `TOMO_METRICS` | Enable the metrics exporter and activity log (config key `metrics.enabled`, default: `false`) |

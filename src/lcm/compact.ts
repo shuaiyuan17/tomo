@@ -736,7 +736,7 @@ const STAGING_CORPSE_MAX_AGE_MS = 60 * 60 * 1000;
 /**
  * Names every session-rewrite staging file this codebase produces:
  * `<sessionId>.jsonl` plus a per-call suffix and `.tmp` — the
- * `.<pid>.<uuid>.tmp` of `writeFileAtomicSync`, prune-tools' `.pruning.tmp`,
+ * `.<pid>.<uuid>.tmp` of `writeFileAtomicSync`, the `.pruning.tmp` prune-tools used to write,
  * and the `.compacting.tmp` compact used to write (both the historical fixed
  * name and the pid+uuid one). Anchored on `.jsonl.` so it can never match a
  * session file itself.

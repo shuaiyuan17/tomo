@@ -33,7 +33,8 @@ const ALIASES: Record<string, WebReaction> = { loved: "love", heart: "love", lik
 export function reactionKind(name: string): ReactionKind {
   const key = name.trim().toLowerCase();
   const found = REACTIONS.find((r) => r.kind === key || r.kind === ALIASES[key]);
-  return found ?? { emoji: name.trim(), label: name.trim(), verb: i18n.t("chat:reaction.verb.other") };
+  // The verb is read when shown (a getter, like the six), so a parsed and cached tapback follows a language switch.
+  return found ?? { emoji: name.trim(), label: name.trim(), get verb() { return i18n.t("chat:reaction.verb.other"); } };
 }
 
 const TAPBACK = /^\[tapback: ([^\]\n]+?)\]\s*$/;

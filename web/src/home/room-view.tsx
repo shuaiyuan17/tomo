@@ -4,7 +4,7 @@ import type { HomeStatus } from "../../../src/home/status.js";
 import { homeConditions, signValues } from "./evaluate.js";
 import { skyOf } from "./sky.js";
 import { HomeStage, type StageState } from "./three/stage.js";
-import { i18n } from "../i18n/index.js";
+import { i18n, useTranslation } from "../i18n/index.js";
 
 /**
  * The room itself: the only module that loads three.js, in its own chunk
@@ -81,7 +81,10 @@ export function RoomView({ scene, revision, status, now, label, handle, onFailur
   useEffect(() => { if (ready) { stage.current?.setScene(scene, revision); onReady?.(); } }, [scene, revision, ready]);
 
   // Pure evaluation; the stage only hears about it when something it shows changed.
-  const state = useMemo<StageState>(() => ({ conditions: homeConditions(status, now), values: signValues(status, now), subagents: status.subagents, hasPet: !!status.pet, sky: skyOf(status, now) }), [status, now]);
+  // The sign values are words (an idle span, the caption): worked out again when the language changes.
+  const { i18n: language } = useTranslation();
+  const state = useMemo<StageState>(() => ({ conditions: homeConditions(status, now), values: signValues(status, now), subagents: status.subagents, hasPet: !!status.pet, sky: skyOf(status, now) }),
+    [status, now, language.language]);
   // The sun and moon move slowly: their place is rounded so a tick does not redraw the window for nothing.
   const signature = JSON.stringify([[...state.conditions].sort(), state.values, state.subagents, state.hasPet, { ...state.sky, progress: Math.round(state.sky.progress * 200) }]);
   useEffect(() => { if (ready) stage.current?.setState(state); }, [signature, ready, scene, revision]);

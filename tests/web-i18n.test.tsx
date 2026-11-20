@@ -137,3 +137,21 @@ describe("copy kept in state follows a language switch", () => {
     expect(offenders).toEqual([]);
   });
 });
+
+describe("a custom emoji tapback follows a language switch", () => {
+  it("parses once (cached) and words its verb when rendered", async () => {
+    const { formatReactionMarker } = await import("../src/channels/text-utils.js");
+    const { parseHistory } = await import("../web/src/conversation-rows.js");
+    const { TapbackLine } = await import("../web/src/components/ai/message-actions.js");
+    const history = [{ id: "m1", role: "user" as const, content: formatReactionMarker("🔥", "hi"), timestamp: 1 }];
+    const line = () => {
+      const tapback = parseHistory(history as never)[0]!.parsed.tapback!;
+      return renderToStaticMarkup(createElement(TapbackLine, { who: "You", reaction: tapback.reaction, quote: tapback.reply?.excerpt }));
+    };
+    expect(line()).toContain("reacted to");
+    await i18n.changeLanguage("zh-Hans");
+    // The same message object: the parse is served from the cache, the verb is not.
+    expect(line()).toContain("回应了");
+    expect(line()).not.toContain("reacted to");
+  });
+});

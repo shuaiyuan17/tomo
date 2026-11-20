@@ -1,6 +1,6 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeSync, chmodSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, writeSync } from "node:fs";
 import { dirname } from "node:path";
-import { randomUUID } from "node:crypto";
+import { writeFileAtomicSync } from "../fs-utils.js";
 import { webReplySchema, type RequestState, type WebFiledFile, type WebReply } from "./protocol.js";
 
 const isFiledFile = (value: unknown): value is WebFiledFile => {
@@ -251,17 +251,11 @@ export class WebRequestJournal {
       if (entry.resolved) lines.push(JSON.stringify({ op: "resolve", id: entry.requestId, how: entry.resolved }));
       if (entry.notified) lines.push(JSON.stringify({ op: "notified", id: entry.requestId }));
     }
-    const tmp = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
     try {
       mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });
-      const fd = openSync(tmp, "w", 0o600);
-      try { writeSync(fd, lines.length ? `${lines.join("\n")}\n` : ""); fsyncSync(fd); } finally { closeSync(fd); }
-      renameSync(tmp, this.path);
-      chmodSync(this.path, 0o600);
-      try { const dir = openSync(dirname(this.path), "r"); try { fsyncSync(dir); } finally { closeSync(dir); } } catch { /* Directory fsync is advisory on some filesystems. */ }
+      writeFileAtomicSync(this.path, lines.length ? `${lines.join("\n")}\n` : "", { mode: 0o600, fsync: true });
     } catch {
       // Compaction is an optimisation: the append-only file stays valid.
-      try { unlinkSync(tmp); } catch { /* best effort */ }
     }
   }
 }

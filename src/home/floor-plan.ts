@@ -106,12 +106,20 @@ export function renderFloorPlan(scene: HomeScene): string {
   const lines: string[] = [];
   const [w, h, d] = scene.room.size;
   const placement = placeScene(scene);
-  const label = (index: number) => scene.objects[index].id ?? (scene.objects[index].kind ? `(${scene.objects[index].kind})` : `objects[${index}]`);
+  const label = (index: number): string => {
+    const object = scene.objects[index];
+    const fallback = object.kind ? `(${object.kind})` : `objects[${index}]`;
+    return object.id ?? fallback;
+  };
 
-  lines.push(`${scene.name ? `"${scene.name}": ` : ""}room ${num(w)} m wide × ${num(d)} m deep × ${num(h)} m high; floor ${scene.room.floor}, walls ${scene.room.walls}${scene.room.backdrop ? `, backdrop ${scene.room.backdrop}` : ""}.`);
+  const title = scene.name ? `"${scene.name}": ` : "";
+  const backdrop = scene.room.backdrop ? `, backdrop ${scene.room.backdrop}` : "";
+  lines.push(`${title}room ${num(w)} m wide × ${num(d)} m deep × ${num(h)} m high; floor ${scene.room.floor}, walls ${scene.room.walls}${backdrop}.`);
   if (scene.light) {
     const l = scene.light;
-    lines.push(`Light: ${l.color ?? "default colour"}${l.angle !== undefined ? `, from ${num(l.angle)}° around the room` : ""}${l.level !== undefined ? `, level ${num(l.level)}` : ""}.`);
+    const from = l.angle !== undefined ? `, from ${num(l.angle)}° around the room` : "";
+    const level = l.level !== undefined ? `, level ${num(l.level)}` : "";
+    lines.push(`Light: ${l.color ?? "default colour"}${from}${level}.`);
   }
   lines.push("");
 
@@ -168,7 +176,11 @@ export function renderFloorPlan(scene: HomeScene): string {
     const extent = object.box && (!shaped || (part.scale ?? 1) !== 1)
       ? `, takes up ${num(object.box.max[0] - object.box.min[0])} m wide × ${num(object.box.max[2] - object.box.min[2])} m deep × ${num(object.box.max[1] - object.box.min[1])} m high` : "";
     const where = object.box ? `${region(centre(object.box), scene)}, base at ${vec(object.frame.t)}, top at ${num(object.box.max[1])} m${extent}` : `base at ${vec(object.frame.t)}, draws nothing`;
-    lines.push(`- ${mark ? `[${mark}] ` : ""}${label(object.index)}: ${describePart(part)}; ${where}${object.on !== undefined ? `; on ${label(object.on)}` : part.on ? `; on ${part.on} (not found: on the floor)` : ""}.`);
+    let on = "";
+    if (object.on !== undefined) on = `; on ${label(object.on)}`;
+    else if (part.on) on = `; on ${part.on} (not found: on the floor)`;
+    const marked = mark ? `[${mark}] ` : "";
+    lines.push(`- ${marked}${label(object.index)}: ${describePart(part)}; ${where}${on}.`);
     for (const reaction of part.reactions ?? []) lines.push(`    ${describeReaction(reaction)}`);
     let listed = 0;
     let more = 0;
@@ -176,7 +188,11 @@ export function renderFloorPlan(scene: HomeScene): string {
       for (const sub of parts ?? []) {
         if (listed >= PARTS_LISTED) { more++; walk(sub.parts, depth + 1); continue; }
         listed++;
-        lines.push(`${"    ".repeat(depth)}  part${sub.id ? ` ${sub.id}` : ""}: ${describePart(sub)} at ${vec(sub.at ?? [0, 0, 0])}${(sub.reactions ?? []).length ? `; ${(sub.reactions ?? []).map(describeReaction).join("; ")}` : ""}`);
+        const indent = "    ".repeat(depth);
+        const name = sub.id ? ` ${sub.id}` : "";
+        const reactions = (sub.reactions ?? []).map(describeReaction);
+        const reacts = reactions.length ? `; ${reactions.join("; ")}` : "";
+        lines.push(`${indent}  part${name}: ${describePart(sub)} at ${vec(sub.at ?? [0, 0, 0])}${reacts}`);
         walk(sub.parts, depth + 1);
       }
     };

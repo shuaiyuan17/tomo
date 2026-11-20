@@ -1,7 +1,8 @@
-import { chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, writeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { isGroupSessionKey } from "../sessions/keys.js";
+import { writeFileAtomicSync } from "../fs-utils.js";
 import { BACKFILL_FILE, LEDGER_DIR_MODE, LEDGER_FILE_MODE, readLedgerStarted, triggerSnippet, USAGE_LEDGER_VERSION, type UsageLedgerRow, type UsageSource } from "./ledger.js";
 import { localParts } from "./local-time.js";
 
@@ -267,26 +268,6 @@ function tighten(path: string, mode: number): void {
   if ((statSync(path).mode & 0o777 & ~mode) !== 0) chmodSync(path, mode);
 }
 
-/** Replace `path` with `text` whole: temp file, fsync, rename, fsync the directory. */
-function replaceFile(path: string, text: string): void {
-  const tmp = `${path}.${process.pid}.tmp`;
-  const fd = openSync(tmp, "w", LEDGER_FILE_MODE);
-  try {
-    writeSync(fd, text);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  try {
-    renameSync(tmp, path);
-  } catch (err) {
-    rmSync(tmp, { force: true });
-    throw err;
-  }
-  const dirFd = openSync(join(path, ".."), "r");
-  try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-}
-
 /**
  * Merge this run's rows from the activity log into backfill.ndjson and write
  * it back whole (atomically). Only adds: a row already there (same id) is
@@ -363,7 +344,7 @@ export function backfillUsage(options: BackfillOptions): BackfillReport {
       costUsd += typeof row.costUsd === "number" ? row.costUsd : 0;
     }
     if (!options.dryRun) {
-      if (added > 0 || !existsSync(target)) replaceFile(target, merged.map((m) => `${m.line}\n`).join(""));
+      if (added > 0 || !existsSync(target)) writeFileAtomicSync(target, merged.map((m) => `${m.line}\n`).join(""), { mode: LEDGER_FILE_MODE, fsync: true });
       // Every run, new rows or not: a file or directory left wider (an older
       // build, a restore, by hand) is tightened.
       tighten(options.usageDir, LEDGER_DIR_MODE);

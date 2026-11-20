@@ -1,6 +1,6 @@
-import { writeFileSync, appendFileSync, existsSync, mkdirSync, openSync, closeSync, renameSync, unlinkSync } from "node:fs";
+import { writeFileSync, appendFileSync, existsSync, mkdirSync, openSync, closeSync } from "node:fs";
 import { dirname } from "node:path";
-import { randomUUID } from "node:crypto";
+import { writeFileAtomicSync } from "../fs-utils.js";
 import { getSdkSessionPath } from "../sessions/index.js";
 import {
   drainOldInodeAfterRename,
@@ -259,17 +259,10 @@ function pruneToolsWithFd(req: PruneToolsRequest, path: string, sourceFd: number
 
   // Atomic write: stage in a sibling temp file and rename into place, so the
   // SDK's appender sees the old file fully or the new file fully — never a
-  // half-written state. The temp name is per-process/per-call so two
+  // half-written state. The helper's temp name is per-process/per-call, so two
   // concurrent prune invocations can't overwrite or rename each other's file.
   const output = [...events, ...lateEvents].map(serializeJsonlRecord).join("\n") + "\n";
-  const tmp = `${path}.${process.pid}.${randomUUID()}.pruning.tmp`;
-  try {
-    writeFileSync(tmp, output);
-    renameSync(tmp, path);
-  } catch (err) {
-    try { unlinkSync(tmp); } catch { /* best-effort cleanup */ }
-    throw err;
-  }
+  writeFileAtomicSync(path, output);
 
   // Drain any appends that landed on the old inode around the rename.
   const postRenameDrain = drainOldInodeAfterRename({

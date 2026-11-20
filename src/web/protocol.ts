@@ -3,6 +3,7 @@ import type { ContextCategory, SessionMessage, SessionStats } from "../sessions/
 import type { CronRunStatus, CronSchedule } from "../cron/types.js";
 import type { HomeScene } from "../home/scene.js";
 import type { HomeStatus } from "../home/status.js";
+import type { Locale } from "../i18n/locales.js";
 import type { ContextSection } from "../lcm/stats.js";
 import type { SummaryBlock } from "../lcm/summary-reader.js";
 import type { MessageReaction } from "../channels/types.js";
@@ -411,6 +412,8 @@ export interface WebBootstrap extends WebCatalog {
   reactions?: Record<string, WebReaction>;
   /** What the UI calls the agent (config `agent.name`, else IDENTITY.md, else "Tomo"); absent on older daemons. */
   agentName?: string;
+  /** Config `locale`: the UI's default language (absent: unset, or an older daemon — the browser's language). */
+  locale?: Locale;
   /** The open credential request, so a reload still shows the card (absent: none, or an older daemon). */
   credentialRequest?: WebCredentialRequest | null;
   /** The open permission requests, so a reload still shows their cards (absent: none, or an older daemon). */

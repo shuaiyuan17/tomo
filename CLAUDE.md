@@ -228,6 +228,19 @@ Any code path that rewrites a JSONL file it just read must call `parseJsonl(text
 
 The harness emits context nudges at `lcm.nudgeAtPct` usage (default 70%, `src/config.ts`), escalating prune → daily rollup → full compact at 80% (decision logic in `src/agent/context-nudge.ts`).
 
+### Localization (i18n)
+
+i18next on both sides, English as the source. Locales: `en`, `zh-Hans` (`src/i18n/locales.ts`).
+
+- **What is translated**: fixed text Tomo writes to people. The web UI, chat-command replies, the Telegram command menu, and harness notices to the owner (permission DM, error and MCP notices, cron notices).
+- **What is NOT**: anything for the model (system prompt, tomo-event bodies, heartbeat prompts, tool descriptions and results, permission outcomes told to the agent), model output, logs, and the CLI. These stay English.
+- **Catalogs**: one namespace per feature, as TS files. `src/i18n/catalogs/<locale>/<ns>.ts` (daemon) and `web/src/i18n/catalogs/<locale>/<ns>.ts` (web). English is `export const <ns> = { ... } as const`; a translation exports the same name `satisfies Translation<typeof en>` (`src/i18n/catalog.ts`). A missing, extra or misspelled key fails `tsc`. Register each namespace in that side's `resources.ts`.
+- **Keys** are written out in full at the call site (`t("status.title")`), never built at runtime: `tests/i18n-catalogs.test.ts` fails on a key nothing uses, and on placeholders that differ between locales.
+- **Plurals and values**: i18next CLDR plurals (`key_one` / `key_other` + `{ count }`; Chinese needs only `_other`). Interpolate with `{{name}}`, never concatenate translated fragments. Numbers, dates and relative times go through `Intl`, with the active locale passed explicitly.
+- **Daemon**: no global language. `ownerT(ns)` (`src/i18n/index.ts`) translates into `config.locale` (unset: English). Owner-facing outlets take `OwnerText`, which only `ownerT(...)` produces. Model output or a value typed by a person passes through `raw(text)`; never wrap fixed copy in `raw`.
+- **Web**: locale = the Settings choice (localStorage), else config `locale` (bootstrap), else `navigator.language`, else English. `eslint-plugin-i18next` flags literal JSX text and user-visible attributes.
+- **Chinese copy**: short and natural, as a Chinese app would say it, with full-width punctuation. Keep product terms in English where people say them that way (session, agent, MCP, token, cron, Telegram).
+
 ## Code Conventions
 
 - ESM throughout (`"type": "module"` in package.json)

@@ -28,6 +28,7 @@ import { usageDataDir } from "../usage/dir.js";
 import { readLatestLimitSample } from "../usage/limits-log.js";
 import { findPersonByName, loadPeople, personTimeZone } from "../people.js";
 import type { WebCost } from "./protocol.js";
+import type { Locale } from "../i18n/locales.js";
 
 export interface WebDataOptions {
   sessionsDir: string;
@@ -40,6 +41,8 @@ export interface WebDataOptions {
   tomoHome?: string;
   /** `agent.name` from config (null/undefined: read IDENTITY.md in workspaceDir). */
   agentName?: string | null;
+  /** `locale` from config: the web UI's default language (null/undefined: the browser's). */
+  locale?: Locale | null;
   /** The scheduler's cron store file, passed by the daemon (the web process never derives it). */
   cronStorePath?: string;
   /** The todo limits in force (config `todos`), passed by the daemon; absent: the defaults. */
@@ -251,6 +254,8 @@ export class WebData {
 
   /** What the UI calls the agent (re-read per call; IDENTITY.md is cached by mtime). */
   agentName(): string { return this.agent.name(); }
+  /** The configured locale, if any (the browser falls back to its own language). */
+  locale(): Locale | undefined { return this.options.locale ?? undefined; }
 
   /** Context usage, estimated breakdown and rollups of a session the catalog shows. */
   async context(id: string): Promise<WebContext> {

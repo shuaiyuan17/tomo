@@ -15,6 +15,7 @@ import { DEFAULT_CONTINUITY_INTERVAL_MINUTES, MIN_CONTINUITY_INTERVAL_MINUTES } 
 import { parseAnthropicAuthConfig, type AnthropicAuthConfig } from "./auth.js";
 import { defaultRuntimePaths } from "./runtime-paths.js";
 import { DEFAULT_MODEL } from "./models.js";
+import { LOCALES, type Locale } from "./i18n/locales.js";
 import { redactSecrets } from "./redact.js";
 import { log } from "./logger.js";
 import { parseWebConfig, type WebConfig } from "./web/config.js";
@@ -193,6 +194,11 @@ export interface TomoConfig {
   /** Optional local script to run once per continuity heartbeat and append to the heartbeat prompt. */
   continuityScript: ContinuityScriptConfig | null;
   city: string | null;
+  /** `locale`: the language of the fixed text Tomo writes to people (chat-command
+   *  replies, owner notices) and the web UI's default. Null = unset: English
+   *  for chat, the browser's language for the web UI. Never the language of
+   *  model-facing text (system prompt, tomo-events), which stays English. */
+  locale: Locale | null;
   /** `agent.name`: what the web UI calls the agent. Unset: IDENTITY.md's Name line, else "Tomo". */
   agentName: string | null;
   /** The one person Tomo works for (see src/owner.ts), resolved from `owner`
@@ -962,6 +968,7 @@ function buildConfig(): TomoConfig {
     continuityIntervalMs: Math.round(Math.max(continuityIntervalMinutes, MIN_CONTINUITY_INTERVAL_MINUTES) * 60_000),
     continuityScript: parseContinuityScriptConfig(file.continuityScript),
     city: validated("city (TOMO_CITY)", z.string().nullable(), envVar("TOMO_CITY") ?? file.city, null),
+    locale: validated("locale (TOMO_LOCALE)", z.enum(LOCALES).nullable(), envVar("TOMO_LOCALE") ?? file.locale, null),
     agentName: validated("agent.name", z.string().trim().min(1, "expected a non-empty name").max(64, "expected at most 64 characters"),
       file.agent && typeof file.agent === "object" ? (file.agent as { name?: unknown }).name : undefined, null),
     ...resolveOwnerConfig(file, channels),

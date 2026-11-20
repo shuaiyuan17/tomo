@@ -31,7 +31,7 @@ async function loadConfigWith(
   // hermetic under any shell. TOMO_WORKSPACE/SESSIONS_DIR are cleared rather
   // than pointed somewhere: these tests assert the ~/.tomo defaults.
   for (const name of [
-    "TELEGRAM_BOT_TOKEN", "CLAUDE_MODEL", "TOMO_CITY",
+    "TELEGRAM_BOT_TOKEN", "CLAUDE_MODEL", "TOMO_CITY", "TOMO_LOCALE",
     "TOMO_LITELLM_BASE_URL", "TOMO_LITELLM_API_KEY", "TOMO_LITELLM_MODE",
     "TOMO_CONTINUITY_SCRIPT", "TOMO_WORKSPACE", "SESSIONS_DIR",
   ]) {
@@ -95,6 +95,24 @@ describe("empty-string env overrides", () => {
   it("keeps the configured city when TOMO_CITY is empty", async () => {
     const { config } = await loadConfigWith({ city: "Brooklyn" }, { TOMO_CITY: "" });
     expect(config.city).toBe("Brooklyn");
+  });
+
+  it("keeps the configured locale when TOMO_LOCALE is empty", async () => {
+    const { config } = await loadConfigWith({ locale: "zh-Hans" }, { TOMO_LOCALE: "" });
+    expect(config.locale).toBe("zh-Hans");
+  });
+
+  it("leaves locale unset by default, so chat stays English", async () => {
+    const { config, configIssues } = await loadConfigWith({}, {});
+    expect(config.locale).toBeNull();
+    expect(configIssues.join("\n")).not.toContain("locale");
+  });
+
+  it("lets TOMO_LOCALE override the file, and reports a locale Tomo does not ship", async () => {
+    expect((await loadConfigWith({ locale: "en" }, { TOMO_LOCALE: "zh-Hans" })).config.locale).toBe("zh-Hans");
+    const bad = await loadConfigWith({ locale: "zh-CN" }, {});
+    expect(bad.config.locale).toBeNull();
+    expect(bad.configIssues.join("\n")).toContain("locale");
   });
 
   it("keeps the configured continuity script when TOMO_CONTINUITY_SCRIPT is empty", async () => {

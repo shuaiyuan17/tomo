@@ -151,7 +151,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           const csrfToken = csrf.bootstrap(session!);
           const { sessions, ownerId, setupRequired } = deps.data.catalog();
           const { snapshot } = await deps.rpc({ method: "snapshot" }) as WebSync;
-          json(res, 200, { sessions, ownerId, setupRequired, ...snapshot, csrfToken, capabilities: { screen: !!deps.screen, uploads: !!deps.uploadsDir && uploadKinds.images, files: !!deps.uploadsDir && uploadKinds.files }, agentName: deps.data.agentName() });
+          json(res, 200, { sessions, ownerId, setupRequired, ...snapshot, csrfToken, capabilities: { screen: !!deps.screen, uploads: !!deps.uploadsDir && uploadKinds.images, files: !!deps.uploadsDir && uploadKinds.files }, agentName: deps.data.agentName(), locale: deps.data.locale() });
           return;
         }
         if (url.pathname === "/api/v1/sessions") {

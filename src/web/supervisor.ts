@@ -346,8 +346,8 @@ export class WebSupervisor implements WebLifecycle {
         settle();
       });
       child.once("exit", onGone);
-      const { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath, todoLimits, agentName, uploadsEnabled, fileUploadsEnabled } = this.options;
-      send({ type: "init", options: { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath, todoLimits, agentName, uploadsEnabled, fileUploadsEnabled,
+      const { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath, todoLimits, agentName, locale, uploadsEnabled, fileUploadsEnabled } = this.options;
+      send({ type: "init", options: { sessionsDir, sdkSessionsDir, owner, port, tomoHome, externalOrigin, workspaceDir, cronStorePath, todoLimits, agentName, locale, uploadsEnabled, fileUploadsEnabled,
         assetsDir: this.options.assetsDir ?? fileURLToPath(new URL("../../dist/web-assets/", import.meta.url)) } });
     });
   }

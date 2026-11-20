@@ -22,6 +22,7 @@ import { i18n, Trans, useTranslation } from "./i18n/index.js";
 import { deferred, say, type Message } from "./i18n/message.js";
 
 import { card, Empty, meta, Status, type Mutator } from "./study-ui.js";
+import { LanguageSetting } from "./language-setting.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
 // i18n-dynamic: study:intro.*
@@ -245,7 +246,9 @@ function Config({ reload }: { reload: number }) {
     }
     return [...map].sort(([a], [b]) => a === "general" ? -1 : b === "general" ? 1 : a.localeCompare(b));
   }, [value]);
-  return <Status resource={resource} empty={value?.missing ? <Empty>{t("config.missing")}</Empty> : undefined}>
+  return <>
+    <LanguageSetting />
+    <Status resource={resource} empty={value?.missing ? <Empty>{t("config.missing")}</Empty> : undefined}>
     {value && <>
       <p className={cn(meta, "mt-0 mb-4")}>{t("config.note", { when: formatWhen(value.modifiedAt) })}</p>
       <div className="space-y-3">{groups.map(([group, fields], index) => <Collapsible key={group} defaultOpen={index < 3} className={card}>
@@ -259,5 +262,5 @@ function Config({ reload }: { reload: number }) {
       </Collapsible>)}</div>
       {value.truncated && <p className={cn(meta, "mt-3")}>{t("config.truncated")}</p>}
     </>}
-  </Status>;
+  </Status></>;
 }

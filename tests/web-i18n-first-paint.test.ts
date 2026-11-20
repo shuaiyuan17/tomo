@@ -68,3 +68,29 @@ describe("the first paint's language", () => {
     expect(localizeIndexHtml(html, '"><script>')).toBe(html);
   });
 });
+
+describe("bootstrap and the served locale", () => {
+  /** The page as served with config zh-Hans, in an English browser with nothing stored, then `bootstrap` (or none). */
+  async function after(bootstrap: { locale?: string } | null | undefined): Promise<{ update: unknown; language: string }> {
+    vi.stubGlobal("window", {});
+    vi.stubGlobal("navigator", { language: "en-US", languages: ["en-US"] });
+    vi.stubGlobal("localStorage", { getItem: () => null, setItem: () => {}, removeItem: () => {} });
+    vi.stubGlobal("document", { documentElement: { dataset: { tomoLocale: "zh-Hans" }, lang: "" } });
+    vi.resetModules();
+    const { i18n, applyConfiguredLocale, configuredLocaleUpdate } = await import("../web/src/i18n/index.js");
+    // What main.tsx does on every render's effect.
+    const update = configuredLocaleUpdate(bootstrap);
+    if (update !== "keep") applyConfiguredLocale(update.locale);
+    return { update, language: i18n.language };
+  }
+
+  it("keeps the served locale until a bootstrap has arrived (connecting, locked, failed)", async () => {
+    expect(await after(undefined)).toEqual({ update: "keep", language: "zh-Hans" });
+    expect(await after(null)).toEqual({ update: "keep", language: "zh-Hans" });
+  });
+
+  it("follows an arrived bootstrap: its locale, or the browser's language when it has none", async () => {
+    expect(await after({ locale: "zh-Hans" })).toEqual({ update: { locale: "zh-Hans" }, language: "zh-Hans" });
+    expect(await after({})).toEqual({ update: { locale: undefined }, language: "en" });
+  });
+});

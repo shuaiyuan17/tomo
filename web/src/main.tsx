@@ -8,7 +8,7 @@ import { ScheduledSection } from "./scheduled-section.js";
 import { useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
 import { studyLabel, useStudyRoute } from "./study-data.js";
-import { applyConfiguredLocale, useTranslation } from "./i18n/index.js";
+import { applyConfiguredLocale, configuredLocaleUpdate, useTranslation } from "./i18n/index.js";
 import { HomePage, useHomeRoute } from "./home/home-page.js";
 import "./styles.css";
 import { useRailWidth } from "./rail-width.js";
@@ -36,7 +36,12 @@ const scrim = "fixed inset-0 top-[72px] compact:top-[calc(3rem+env(safe-area-ins
 export function App() {
   const web = useWeb();
   const { t, i18n } = useTranslation();
-  useEffect(() => applyConfiguredLocale(web.bootstrap?.locale), [web.bootstrap?.locale]);
+  // Only an arrived bootstrap changes the configured locale; before that the one served on <html> stands.
+  const bootstrapped = !!web.bootstrap;
+  useEffect(() => {
+    const update = configuredLocaleUpdate(web.bootstrap);
+    if (update !== "keep") applyConfiguredLocale(update.locale);
+  }, [bootstrapped, web.bootstrap?.locale]);
   const agent = agentNameOf(web.bootstrap?.agentName);
   const [study, setStudy, studyFocus] = useStudyRoute();
   const home = useHomeRoute() && !study;

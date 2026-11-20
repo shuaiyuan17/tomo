@@ -28,7 +28,7 @@ export const common = {
     progress: "已用上下文 token", unavailable: "暂无数据", empty: "有一轮对话上报上下文窗口后，这里会显示用量。",
   },
   theme: { heading: "主题", label: "颜色主题", system: "跟随系统", light: "浅色", dark: "深色" },
-  language: { heading: "语言", default: "默认" },
+  language: { heading: "语言", default: "默认", note: "只对这个浏览器生效。“默认”会先用配置里的 locale，其次用浏览器的语言。" },
   usage: {
     heading: "套餐用量", refresh: "刷新", refreshLabel: "刷新套餐用量", refreshTitle: "刷新 · {{updated}}",
     unreachable: "连不上 Tomo，拿不到用量。", locked: "连接后显示。",

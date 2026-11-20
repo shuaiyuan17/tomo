@@ -11,7 +11,7 @@ export const study = {
     cost: "按 API 价格算，{{agent}} 每天的工作值多少钱，以及用了多少套餐额度。",
     cron: "定时任务，以及它们上次运行的时间。",
     mcp: "config.json 和运行中 session 里的工具服务器，以及 session 报告的连接状态。",
-    config: "已保存的 config.json。只显示已知不敏感的文本，其余都隐藏。",
+    config: "这个浏览器的界面语言，以及已保存的 config.json。只显示已知不敏感的文本，其余都隐藏。",
   },
   refresh: "刷新", sections: "书房分区", chooseConversation: "在侧边栏选一个对话。",
   error: {

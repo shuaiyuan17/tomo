@@ -132,7 +132,7 @@ A sandboxed group's `request_permission` (`src/permissions/broker.ts`) is shown 
 
 ## Language
 
-The UI is in English and Simplified Chinese (简体中文). It uses, in order: the language picked under **Language** at the bottom of the sidebar (kept per browser; **Default** forgets the pick), config `locale` (`TOMO_LOCALE`), the browser's own language, else English. Traditional Chinese browsers get English rather than Simplified text. Dates, times and numbers follow the browser's regional format when it speaks the UI language (an en-GB browser keeps day-month dates), else the UI language's own. What Tomo writes (its replies, memory, file names) is shown as written.
+The UI is in English and Simplified Chinese (简体中文). It uses, in order: the language picked under **Language** at the top of the Study's **Config** tab (the page's settings; kept per browser; **Default** forgets the pick), config `locale` (`TOMO_LOCALE`), the browser's own language, else English. Traditional Chinese browsers get English rather than Simplified text. Dates, times and numbers follow the browser's regional format when it speaks the UI language (an en-GB browser keeps day-month dates), else the UI language's own. What Tomo writes (its replies, memory, file names) is shown as written.
 
 ## Phones
 

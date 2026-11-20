@@ -89,6 +89,17 @@ export function formatLocale(): string {
   return formatLocaleFor(locale(), typeof window === "undefined" || typeof navigator === "undefined" ? undefined : navigator.language);
 }
 
+/**
+ * What a bootstrap means for the configured locale. Until one has arrived
+ * (still connecting, locked out, or the connection failed: undefined or
+ * null) "keep": the value the daemon served on `<html>` stands. Once one
+ * has, its `locale` is the configuration, and unset means none (the
+ * browser's language then decides).
+ */
+export function configuredLocaleUpdate(bootstrap: { locale?: string } | null | undefined): "keep" | { locale: string | undefined } {
+  return bootstrap ? { locale: bootstrap.locale } : "keep";
+}
+
 /** Bootstrap arrived: config `locale` applies unless this browser picked one. */
 export function applyConfiguredLocale(value: string | undefined): void {
   if (configured === value) return;

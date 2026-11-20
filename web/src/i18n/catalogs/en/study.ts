@@ -9,7 +9,7 @@ export const study = {
     cost: "What {{agent}}'s work would cost at API prices, day by day, and how much of your plan it is using.",
     cron: "Scheduled jobs and when they last ran.",
     mcp: "Tool servers in config.json and in live sessions, with the connection state the sessions report.",
-    config: "The saved config.json. Only known non-sensitive text is shown; everything else is hidden.",
+    config: "This browser's language, and the saved config.json. Only known non-sensitive text is shown; everything else is hidden.",
   },
   refresh: "Refresh", sections: "Study sections", chooseConversation: "Choose a conversation in the sidebar.",
   error: {

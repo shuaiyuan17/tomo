@@ -26,7 +26,7 @@ export const common = {
     progress: "Context tokens used", unavailable: "Unavailable", empty: "Usage appears after a turn reports its context window.",
   },
   theme: { heading: "Theme", label: "Color theme", system: "System theme", light: "Light theme", dark: "Dark theme" },
-  language: { heading: "Language", default: "Default" },
+  language: { heading: "Language", default: "Default", note: "This browser only. Default follows config locale, then the browser's language." },
   usage: {
     heading: "Plan usage", refresh: "Refresh", refreshLabel: "Refresh plan usage", refreshTitle: "Refresh · {{updated}}",
     unreachable: "Couldn't reach Tomo for usage.", locked: "Shown once connected.",

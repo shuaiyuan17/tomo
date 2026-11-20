@@ -12,7 +12,7 @@ import { PlanUsage } from "./plan-usage.js";
 import { pinOwnerFirst } from "./session-order.js";
 import type { Theme } from "./theme.js";
 import type { useWeb } from "./use-web.js";
-import { LOCALES, localeName, useLocaleChoice, useTranslation, type Locale } from "./i18n/index.js";
+import { useTranslation } from "./i18n/index.js";
 import { formatNumber } from "./i18n/format.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
@@ -56,9 +56,8 @@ export function Sidebar({ sidebarRef, view, onNavigate, drawer, phone, inert, se
     {session?.kind === "group" && <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{t("sidebar.groupNote")}</p>}
     <ContextWindow session={session} web={web} />
     <PlanUsage ready={!!web.bootstrap} locked={web.connection === "locked"} live={web.rateLimit} />
-    {/* Language and theme: pinned to the bottom of the sidebar (and of the phone drawer). */}
-    <LanguagePicker />
-    <div className="flex items-center justify-between gap-3 pt-3">
+    {/* Theme: pinned to the bottom of the sidebar (and of the phone drawer). */}
+    <div className="mt-auto flex items-center justify-between gap-3 border-t pt-4 max-[600px]:mt-8">
       <span className="eyebrow">{t("theme.heading")}</span>
       <ToggleGroup type="single" aria-label={t("theme.label")} value={theme} onValueChange={(value) => { if (value) onTheme(value as Theme); }}
         className="rounded-xl bg-foreground/[0.05] p-0.5 max-[600px]:rounded-[13px]">
@@ -69,21 +68,6 @@ export function Sidebar({ sidebarRef, view, onNavigate, drawer, phone, inert, se
       </ToggleGroup>
     </div>
   </aside>;
-}
-
-/** The UI language for this browser: the default (config `locale`, else the browser's), or a pick. */
-function LanguagePicker() {
-  const { t } = useTranslation();
-  const [choice, setChoice] = useLocaleChoice();
-  const value = choice ?? "default";
-  return <div className="mt-auto flex items-center justify-between gap-3 border-t pt-4 max-[600px]:mt-8">
-    <label htmlFor="language-picker" className="eyebrow">{t("language.heading")}</label>
-    <select id="language-picker" value={value} onChange={(event) => setChoice(event.target.value === "default" ? null : event.target.value as Locale)}
-      className="h-7 rounded-[9px] border-0 bg-foreground/[0.05] px-2 text-[12px] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring max-[600px]:h-10 max-[600px]:text-[14px]">
-      <option value="default">{t("language.default")}</option>
-      {LOCALES.map((locale) => <option key={locale} value={locale}>{localeName(locale)}</option>)}
-    </select>
-  </div>;
 }
 
 const mainTag = "ml-auto flex shrink-0 items-center gap-1 pl-3 tracking-[0.02em] text-[10px] whitespace-nowrap text-muted-foreground";

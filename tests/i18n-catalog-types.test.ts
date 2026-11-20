@@ -27,6 +27,11 @@ describe("Translation<typeof en>", () => {
   it("accepts a translation without the plural forms its language lacks", () => {
     expect(errorsFor(`{ msgs_other: "{{count}}", step_one: "第一步", title: "费用" }`)).toEqual([]);
   });
+  it("accepts a `_zero` (or `_few`) English lacks, beside an English `_other`, but not beside an ordinary key", () => {
+    expect(errorsFor(`{ msgs_zero: "没有", msgs_other: "{{count}}", step_one: "第一步", title: "费用" }`)).toEqual([]);
+    expect(errorsFor(`{ msgs_few: "{{count}}", msgs_other: "{{count}}", step_one: "第一步", title: "费用" }`)).toEqual([]);
+    expect(errorsFor(`{ msgs_other: "{{count}}", step_one: "第一步", title: "费用", title_zero: "零" }`).join("\n")).toContain("'title_zero' does not exist");
+  });
   it("rejects a missing ordinary key", () => {
     expect(errorsFor(`{ msgs_other: "{{count}}", step_one: "第一步" }`).join("\n")).toContain("'title' is missing");
   });

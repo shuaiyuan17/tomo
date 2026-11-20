@@ -65,6 +65,11 @@ describe("the catalog check itself", () => {
   it("allows `_zero` in every language (i18next tries it first for count 0), next to an `_other`", () => {
     expect(check({ ...zhOk, msgs_zero: "{{name}} 没有发来消息" }, { ...en, msgs_zero: "No messages from {{name}}" })).toEqual([]);
   });
+  it("lets a translation add a `_zero` English does not have, beside English's `_other`", () => {
+    expect(check({ ...zhOk, msgs_zero: "{{name}} 没有发来消息" })).toEqual([]);
+    expect(check({ ...zhOk, msgs_zero: "没有消息" })).toEqual(['fixture zh-Hans ns: "msgs_zero" placeholders {} ≠ English {count,name}', 'fixture zh-Hans ns: "msgs_zero" placeholders {} ≠ its _other {count,name}']);
+    expect(check({ ...zhOk, greet_zero: "零" })).toEqual(['fixture zh-Hans ns: "greet_zero" is not in English']);
+  });
   it("catches an English key no source uses", () => {
     expect(check(zhOk, en, `const t = ownerT("ns"); t("greet"); t("step_one");`))
       .toEqual(['fixture en ns: "msgs" is never used', 'fixture en ns: "page.title" is never used']);
@@ -92,7 +97,14 @@ describe("the catalog check itself", () => {
       expect(unused(`t("title"); const x = <><Trans i18nKey="only_a" /><Trans ns="b" i18nKey="title" /></>;`, "a")).toEqual([]);
     });
     it("needs an `i18n-dynamic` declaration for keys built at runtime", () => {
-      expect(unused(`const t = ownerT("a"); t(\`only_\${x}\`); ownerT("b")("title");`)).toEqual(['fx en a: "title" is never used', 'fx en a: "only_a" is never used']);
+      expect(unused(`const t = ownerT("a"); t(\`only_\${x}\`); ownerT("b")("title");`)).toEqual([
+        'fx: a.tsx:1 builds a key at runtime with no "// i18n-dynamic: ns:prefix*" declaration in its file',
+        'fx en a: "title" is never used', 'fx en a: "only_a" is never used',
+      ]);
+      // Every key used statically does not excuse an undeclared runtime key.
+      expect(unused(`const t = ownerT("a"); t("title"); t("only_a"); ownerT("b")("title"); t(key);`)).toEqual([
+        'fx: a.tsx:1 builds a key at runtime with no "// i18n-dynamic: ns:prefix*" declaration in its file',
+      ]);
       expect(unused(`// i18n-dynamic: a:only_*\n// i18n-dynamic: a:title\nconst t = ownerT("a"); t(\`only_\${x}\`); ownerT("b")("title");`)).toEqual([]);
     });
   });

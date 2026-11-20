@@ -18,6 +18,7 @@ export const PLURAL_SUFFIXES = ["_zero", "_one", "_two", "_few", "_many", "_othe
 const OPTIONAL_PLURAL_SUFFIXES = ["_zero", "_one", "_two", "_few", "_many"] as const;
 
 /** `K` without an optional plural suffix (`msgs_one` → `msgs`); never when it has none. */
+type OptionalPluralSuffix = typeof OPTIONAL_PLURAL_SUFFIXES[number];
 type StripOptionalPlural<K> =
   K extends `${infer B}_zero` ? B : K extends `${infer B}_one` ? B : K extends `${infer B}_two` ? B
     : K extends `${infer B}_few` ? B : K extends `${infer B}_many` ? B : never;
@@ -29,11 +30,19 @@ type StripOptionalPlural<K> =
 type IsOptionalPlural<T, K> = [StripOptionalPlural<K>] extends [never] ? false
   : `${StripOptionalPlural<K> & string}_other` extends keyof T ? true : false;
 
-/** A catalog with the same keys as `T`, every leaf a string. */
+/**
+ * A catalog with the same keys as `T`, every leaf a string. Beside any
+ * `${base}_other` a translation may also add plural forms English does not
+ * have (`_zero`, which i18next tries first for `count: 0`, or the `_few` /
+ * `_many` other languages need); which ones a language may really use is
+ * checked by tests/i18n-catalogs.test.ts against `Intl.PluralRules`.
+ */
 export type Translation<T> = {
   -readonly [K in keyof T as IsOptionalPlural<T, K> extends true ? never : K]: T[K] extends string ? string : Translation<T[K]>;
 } & {
   -readonly [K in keyof T as IsOptionalPlural<T, K> extends true ? K : never]?: string;
+} & {
+  -readonly [K in keyof T as K extends `${infer B}_other` ? `${B}${OptionalPluralSuffix}` : never]?: string;
 };
 
 /** A nested catalog as `key.path → text` (leaves only). */

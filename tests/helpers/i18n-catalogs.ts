@@ -61,7 +61,9 @@ function localProblems(prefix: string, locale: string, flat: ReadonlyMap<string,
  * - the per-locale checks above, English included;
  * - every English key is used: a translator call bound to its namespace
  *   with the key as a literal (see findUsedKeys), or declared dynamic with
- *   an `// i18n-dynamic: ns:prefix*` comment.
+ *   an `// i18n-dynamic: ns:prefix*` comment;
+ * - every translator call with a non-literal key is in a file that declares
+ *   which keys it can be.
  */
 export function catalogProblems(set: CatalogSet): string[] {
   const problems: string[] = [];
@@ -80,14 +82,21 @@ export function catalogProblems(set: CatalogSet): string[] {
         const english = source.get(key) ?? (pluralCategory(key, source) ? undefined : null);
         const fallback = source.get(`${baseKey(key, source)}_other`);
         if (english === null || (english === undefined && fallback === undefined)) { problems.push(`${prefix}: "${key}" is not in English`); continue; }
+        // A form English lacks (a `_zero` beside its `_other`) is compared with `_other`, by the
+        // same rule as within one locale: a zero/one/two form may drop `{{count}}`.
+        const mayDropCount = english === undefined && ["zero", "one", "two"].includes(pluralCategory(key, source) ?? "");
         const want = placeholdersOf(english ?? fallback!);
         const got = placeholdersOf(text);
-        if (!same(want, got)) problems.push(`${prefix}: "${key}" placeholders ${list(got)} ≠ English ${list(want)}`);
+        if (mayDropCount ? !same(without(want, "count"), without(got, "count")) || (got.has("count") && !want.has("count")) : !same(want, got)) problems.push(`${prefix}: "${key}" placeholders ${list(got)} ≠ English ${list(want)}`);
       }
       problems.push(...localProblems(prefix, locale, target));
     }
   }
   const uses = findUsedKeys(set.sources, new Set(Object.keys(en)), set.defaultNS);
+  // A key built at runtime is invisible to the unused-key check, so its file must say which keys it can be.
+  for (const call of uses.unresolved) {
+    if (!uses.dynamic.some((d) => d.file === call.file)) problems.push(`${set.name}: ${call.at} builds a key at runtime with no "// i18n-dynamic: ns:prefix*" declaration in its file`);
+  }
   for (const [ns, catalog] of Object.entries(en)) {
     const flat = flattenCatalog(catalog);
     for (const key of new Set([...flat.keys()].map((k) => baseKey(k, flat)))) {

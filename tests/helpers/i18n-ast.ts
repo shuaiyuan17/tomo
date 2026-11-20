@@ -102,9 +102,9 @@ export interface KeyUses {
   /** namespace → keys used with a literal (base keys: `t("msgs", { count })` is `msgs`). */
   used: Map<string, Set<string>>;
   /** Declared dynamic keys: `// i18n-dynamic: ns:prefix*` (a trailing `*` matches any rest). */
-  dynamic: Array<{ ns: string; pattern: string }>;
-  /** Translator calls whose namespace or key could not be read, as `file:line`. */
-  unresolved: string[];
+  dynamic: Array<{ ns: string; pattern: string; file: string }>;
+  /** Translator calls whose key is not a literal (built at runtime). */
+  unresolved: Array<{ file: string; at: string }>;
 }
 
 /** The namespace(s) a translator-producing expression binds, if it is one. */
@@ -189,7 +189,7 @@ export function findUsedKeys(sources: readonly Source[], namespaces: ReadonlySet
     if (ns) add(ns, key);
   };
   for (const source of sources) {
-    for (const m of source.text.matchAll(/\/\/\s*i18n-dynamic:\s*([\w-]+):(\S+)/g)) uses.dynamic.push({ ns: m[1]!, pattern: m[2]! });
+    for (const m of source.text.matchAll(/\/\/\s*i18n-dynamic:\s*([\w-]+):(\S+)/g)) uses.dynamic.push({ ns: m[1]!, pattern: m[2]!, file: source.file });
     const sf = parse(source);
     const cache = new Map<ts.Node, Map<string, string[]>>();
     const where = (node: ts.Node) => `${source.file}:${sf.getLineAndCharacterOfPosition(node.getStart()).line + 1}`;
@@ -209,7 +209,7 @@ export function findUsedKeys(sources: readonly Source[], namespaces: ReadonlySet
         }
         if (!isTranslator || node.arguments.length === 0) return;
         const key = literalText(node.arguments[0]);
-        if (key === undefined) uses.unresolved.push(where(node));
+        if (key === undefined) uses.unresolved.push({ file: source.file, at: where(node) });
         else record(bound, key);
       }
       if (ts.isJsxAttribute(node) && ts.isIdentifier(node.name) && node.name.text === "i18nKey" && node.initializer && ts.isStringLiteral(node.initializer)) {

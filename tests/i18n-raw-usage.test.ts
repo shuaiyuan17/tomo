@@ -17,7 +17,8 @@ const RAW_ALLOWLIST: Record<string, number> = {};
 
 const I18N_MODULE = resolve(import.meta.dirname, "../src/i18n/index.ts");
 
-describe("the OwnerText escape hatches in src/", () => {
+// Parses every file under src/: a few hundred ms here, more on a slow CI runner.
+describe("the OwnerText escape hatches in src/", { timeout: 30_000 }, () => {
   const uses = findEscapeHatches(readSources(["src"]), I18N_MODULE);
 
   it("raw() is called only where the allowlist says, as many times as it says", () => {

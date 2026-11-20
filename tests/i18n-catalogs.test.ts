@@ -8,7 +8,8 @@ const SETS: CatalogSet[] = [
   { name: "daemon", resources: daemonResources, sources: readSources(["src"]) },
 ];
 
-describe("the shipped catalogs", () => {
+// Parsing every source file for translator calls takes a few hundred ms here, more on a slow CI runner.
+describe("the shipped catalogs", { timeout: 30_000 }, () => {
   for (const set of SETS) {
     it(`${set.name}: every locale is present`, () => {
       expect(Object.keys(set.resources).sort()).toEqual([...LOCALES].sort());

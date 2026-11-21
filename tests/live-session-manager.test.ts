@@ -75,7 +75,9 @@ vi.mock("../src/agent/live-session.js", () => {
     noteActivity() { this.lastActivity = Date.now(); }
     lastActivityAt() { return this.lastActivity; }
     activeBackgroundTaskCount() { return this.background ? 2 : 0; }
-    isAwaitingTaskReportWithin() { return this.awaitingReport; }
+    /** How long ago the drain that set `awaitingReport` happened (for the bounded check). */
+    awaitingReportAgeMs = 0;
+    isAwaitingTaskReportWithin(maxAgeMs: number) { return this.awaitingReport && this.awaitingReportAgeMs < maxAgeMs; }
     backgroundMoves: Array<(moved: boolean) => void> = [];
     backgroundTask() { return new Promise<boolean>((resolve) => this.backgroundMoves.push(resolve)); }
     awaitingReport = false;
@@ -987,6 +989,15 @@ describe("LiveSessionManager idle reaper", () => {
     Object.assign(fake, { busy: false, background: false, ambient: false, awaitingReport: false });
     expect(manager.reapIdleSessions(fake.lastActivityAt() + 1000)).toEqual([]);
     expect(fake.closed).toBe(false);
+  });
+
+  it("stops waiting for a task report once the report window has passed", async () => {
+    // The report was folded into a turn that was already running, so the flag
+    // never clears: past the window it must not keep the session alive.
+    const { manager, fake, key } = await idleSession();
+    Object.assign(fake, { awaitingReport: true, awaitingReportAgeMs: PROMPT_RETIRE_REPORT_WAIT_MS });
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+    expect(fake.closed).toBe(true);
   });
 
   it("keeps a session whose compact is waiting on its reload", async () => {

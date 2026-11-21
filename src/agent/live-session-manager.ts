@@ -848,7 +848,11 @@ export class LiveSessionManager {
     const reaped: string[] = [];
     for (const [key, session] of [...this.liveSessions]) {
       if (!session.isAlive() || this.promptStale.has(session)) continue;
-      if (this.hasTurnInFlight(key) || session.hasAnyLiveTasks() || session.isAwaitingTaskReport()
+      // The report wait is BOUNDED, as in backgroundState(): a result folded
+      // into a turn that was already running never clears the flag, and an
+      // unbounded check would keep such a session alive forever.
+      if (this.hasTurnInFlight(key) || session.hasAnyLiveTasks()
+        || session.isAwaitingTaskReportWithin(PROMPT_RETIRE_REPORT_WAIT_MS)
         || (this.backgroundingInFlight.get(key) ?? 0) > 0 || this.isCompactPending(key)) {
         session.noteActivity();
         continue;

@@ -7,9 +7,10 @@ on:
     branches: [main]
 
 # A new push to a PR cancels the run still going for its previous commit.
-# Runs on main are never cancelled, so every merge keeps its own result.
+# Runs on main are never cancelled or replaced: each gets its own group (run_id),
+# so every merge keeps its own result.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -54,6 +55,7 @@ jobs:
   # home + home-real ≈150 s, the rest ≈40 s); "other" is everything not
   # named elsewhere, so a new e2e file is never left out.
   e2e:
+    name: e2e (${{ matrix.group }})
     runs-on: ubuntu-latest
 
     strategy:
@@ -65,7 +67,7 @@ jobs:
           - group: home
             files: tests/e2e/home.e2e.ts tests/e2e/home-real.e2e.ts
           - group: other
-            files: --exclude tests/e2e/chat.e2e.ts --exclude 'tests/e2e/home*.e2e.ts'
+            files: --exclude tests/e2e/chat.e2e.ts --exclude tests/e2e/home.e2e.ts --exclude tests/e2e/home-real.e2e.ts
 
     steps:
       - uses: actions/checkout@v7

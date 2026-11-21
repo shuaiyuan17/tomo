@@ -90,6 +90,12 @@ describe("home floor plan", () => {
     expect(text).toContain("- 2 seat: at (1, 0.45, -1), back right, facing 0° (toward the viewer); a perch: a 0.");
     expect(text).toContain("- 3 den: at (0, 0, 1.6), front centre, facing 0° (toward the viewer); Tomo: cannot be walked to from rug (it fades out and back in); the pet: on the floor.");
     expect(text).toMatch(/Walks from rug: to seat: [\d.]+ m on foot and a [\d.]+ m hop up; to den: it cannot walk \(it fades out and back in\)\./);
+    // Tomo and the visitors are the same size but start on either side of the wall: one map each, each labelled with its own start.
+    const apart = renderFloorPlan({ ...scene, spots: { ...scene.spots, hall: { at: [0, 0, 1.6] }, seat2: { at: [-1, 0, 1.6] } },
+      characters: { tomo: scene.characters!.tomo, visitors: { kind: "me", spots: ["seat2"], overflow: "hall" } } });
+    expect(apart).toContain("Floor Tomo can walk on (Tomo's size), from rug:");
+    expect(apart).toContain("Floor the visitors can walk on (Tomo's size), from hall:");
+    expect(text.match(/^Floor .* can walk on/gm)).toHaveLength(2);
     // No characters, no walking map.
     expect(renderFloorPlan({ ...scene, characters: undefined })).not.toContain("can walk on");
   });

@@ -244,15 +244,19 @@ function inRoom(grid: NavGrid, x: number, z: number): boolean {
  */
 export function clearHop(grid: NavGrid, at: Vec3, point: FloorPoint): boolean {
   if (!inRoom(grid, at[0], at[2]) || !inRoom(grid, point[0], point[1])) return false;
-  return hopBlockers(grid, at, point).length === 0;
+  const blocks = hopBlocks(grid, at, point);
+  return !grid.hurdles.some(blocks);
 }
 /** What the straight hop between the perch `at` and a floor point crosses (clearHop's rule, leaving out the room's walls). */
 export function hopBlockers(grid: NavGrid, at: Vec3, point: FloorPoint): Hurdle[] {
+  return grid.hurdles.filter(hopBlocks(grid, at, point));
+}
+function hopBlocks(grid: NavGrid, at: Vec3, point: FloorPoint): (h: Hurdle) => boolean {
   const under = (h: Hurdle) => Math.abs(h.top - at[1]) <= NAV_PERCH_TOLERANCE
     && at[0] >= h.min[0] && at[0] <= h.max[0] && at[2] >= h.min[1] && at[2] <= h.max[1];
   // The hop's top: the arc lifts the whole walker, so its head reaches arc + its own height.
   const apex = Math.max(at[1], 0) + NAV_HOP_ARC + grid.headroom;
-  return grid.hurdles.filter((h) => h.bottom < apex && !under(h) && segmentMeetsBox([at[0], at[2]], point, h));
+  return (h) => h.bottom < apex && !under(h) && segmentMeetsBox([at[0], at[2]], point, h);
 }
 /** Whether segment a–b meets the inside of a footprint (Liang–Barsky; grazing an edge does not count). */
 function segmentMeetsBox(a: FloorPoint, b: FloorPoint, box: Footprint): boolean {

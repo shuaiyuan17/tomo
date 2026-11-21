@@ -1,7 +1,7 @@
 import type { HomePart, HomeReaction, HomeScene } from "./scene.js";
 import { centre, num, placeScene, vec, whatOf, type Box } from "./geometry.js";
-import { landings, NAV_PET, type NavGrid } from "./nav.js";
-import { characterStarts, characterUses, MOVER_NAMES, SceneReach, walkerOf, type Mover, type Reach } from "./reach.js";
+import { landings, NAV_PET, type NavGrid, type RouteResult, type WalkerSize } from "./nav.js";
+import { characterStarts, characterUses, MOVER_NAMES, SceneReach, walkerOf, type Mover } from "./reach.js";
 
 /**
  * The floor plan: the text Tomo "sees" of its home when there is no picture.
@@ -170,16 +170,23 @@ export function renderFloorPlan(scene: HomeScene): string {
   // ---- where the characters can walk: one map per walker size in use ----
   const reach = new SceneReach(scene, placement);
   const starts = characterStarts(scene);
-  for (const walker of [...new Set(starts.map((s) => walkerOf(s.who)))]) {
-    const start = starts.find((s) => walkerOf(s.who) === walker)!;
-    const who = starts.filter((s) => walkerOf(s.who) === walker).map((s) => ({ tomo: "Tomo", visitors: "the visitors", pet: "the pet" })[s.who]);
-    const map = walkableMap(reach.grid(walker), scene.spots![start.spot].at, cols, rows, w, d);
+  // One map per walker size and the floor its start can walk on: characters that share both share a map.
+  const maps: { walker: WalkerSize; regions: number[]; starts: typeof starts }[] = [];
+  for (const start of starts) {
+    const walker = walkerOf(start.who), regions = reach.regions(start.points[0].at, walker);
+    const same = maps.find((m) => m.walker === walker && m.regions.join() === regions.join());
+    if (same) same.starts.push(start); else maps.push({ walker, regions, starts: [start] });
+  }
+  for (const { walker, starts: sharing } of maps) {
+    const who = sharing.map((s) => ({ tomo: "Tomo", visitors: "the visitors", pet: "the pet" })[s.who]);
+    const from = [...new Set(sharing.map((s) => s.spot))];
+    const map = walkableMap(reach.grid(walker), sharing[0].points[0].at, cols, rows, w, d);
     spotNames.forEach((name, i) => {
       const at = scene.spots![name].at;
       if (Math.abs(at[0]) > w / 2 || Math.abs(at[2]) > d / 2) return;
       map[clampR(row(at[2]))][clampC(col(at[0]))] = i < 9 ? String(i + 1) : "*";
     });
-    lines.push(`Floor ${who.join(" and ")} can walk on (${walker === NAV_PET ? "the pet's size" : "Tomo's size"}), from ${start.spot}: . walkable, # in the way, ~ floor cut off from there, digits are spots:`);
+    lines.push(`Floor ${who.join(" and ")} can walk on (${walker === NAV_PET ? "the pet's size" : "Tomo's size"}), from ${from.join(" and ")}: . walkable, # in the way, ~ floor cut off from there, digits are spots:`);
     lines.push(`+${"-".repeat(cols)}+`);
     for (const r of map) lines.push(`|${r.join("")}|`);
     lines.push(`+${"-".repeat(cols)}+`);
@@ -235,10 +242,10 @@ export function renderFloorPlan(scene: HomeScene): string {
   if (spotNames.length === 0) lines.push("  (none)");
   const uses = characterUses(scene);
   // Every move, once: from each start to each spot its character uses (and to the start itself, for how it stands there).
-  const moves: { who: Mover; from: string; to: string; found: Reach }[] = [];
+  const moves: { who: Mover; from: string; to: string; found: RouteResult }[] = [];
   for (const start of starts) {
     for (const to of [start.spot, ...uses.filter((u) => u.who === start.who).map((u) => u.to)]) {
-      moves.push({ who: start.who, from: start.spot, to, found: reach.reach(start.spot, to, walkerOf(start.who)) });
+      moves.push({ who: start.who, from: start.spot, to, found: reach.route(start.points[0].at, to === start.spot ? start.points[0].at : reach.spotAt(to), walkerOf(start.who)) });
     }
   }
   spotNames.forEach((name, i) => {
@@ -306,13 +313,13 @@ function walkableMap(grid: NavGrid, from: readonly [number, number, number], col
   }));
 }
 /** How a character stands at a spot it walks to: on the floor, on a perch it hops to, or not walked to at all. */
-function standing(found: Reach, from: string, to: string): string {
+function standing(found: RouteResult, from: string, to: string): string {
   if (!found.ok) return found.reason === "stuck" ? `cannot be walked to (it cannot walk anywhere from ${from})` : `cannot be walked to from ${from} (it fades out and back in)`;
   const hop = from === to ? Math.max(found.route.hopOn, found.route.hopOff) : found.route.hopOn;
   return hop > 0 ? `a perch: a ${num(hop)} m hop from the floor` : "on the floor";
 }
 /** One trip in words: "1.7 m on foot and a 1.16 m hop up". */
-function trip(found: Reach): string {
+function trip(found: RouteResult): string {
   if (!found.ok) return "it cannot walk (it fades out and back in)";
   const { length, hopOff, hopOn } = found.route;
   const bits = [hopOff > 0 ? `a ${num(hopOff)} m hop down` : "", `${num(length)} m on foot`, hopOn > 0 ? `a ${num(hopOn)} m hop up` : ""].filter(Boolean);

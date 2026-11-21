@@ -25,7 +25,7 @@ Floor plan from above (back wall at the top, the viewer at the bottom; letters a
 One column is 0.17 m across, one row 0.33 m deep.
 Legend: A desk, B lamp, C (chair), D big-chair, E window, F board, G poster, H shelf, 1 spot desk-chair, 2 spot rug, 3 spot seat-1, 4 spot hall.
 
-Floor Tomo and the visitors can walk on (Tomo's size), from rug: . walkable, # in the way, ~ floor cut off from there, digits are spots:
+Floor Tomo and the visitors can walk on (Tomo's size), from rug and hall: . walkable, # in the way, ~ floor cut off from there, digits are spots:
 +------------------------------------------------+
 |#..############.....................############|
 |#..############................................#|
@@ -83,14 +83,14 @@ Kinds (4): chair (2 parts: box 0.5×0.45×0.5 m, #553311; box 0.5×0.5×0.05 m),
 Spots (4):
 - 1 desk-chair: at (-2.5, 0, -1.1), back left, facing 180° (toward the back wall); cannot be walked to from rug (it fades out and back in).
 - 2 rug: at (1, 0, 0.8), middle of the room, facing 0° (toward the viewer); on the floor.
-- 3 seat-1: at (2, 0, 0.5), right side, facing 270° (toward the left wall); Tomo: on the floor; a visitor: cannot be walked to (it cannot walk anywhere from hall).
-- 4 hall: at (3.5, 0, 2.2), front right, facing 0° (toward the viewer); a visitor: cannot be walked to (it cannot walk anywhere from hall); the pet: on the floor.
+- 3 seat-1: at (2, 0, 0.5), right side, facing 270° (toward the left wall); on the floor.
+- 4 hall: at (3.5, 0, 2.2), front right, facing 0° (toward the viewer); on the floor.
 
 Who goes where:
 - Tomo (a me): at desk-chair while working; otherwise at seat-1 just after a scheduled job fires; otherwise at rug.
     Walks from rug: to desk-chair: it cannot walk (it fades out and back in); to seat-1: 1.04 m on foot.
 - Subagents (a guest; explore as a guest): one each at seat-1, in order; the rest wait at hall.
-    Walks from hall: to seat-1: it cannot walk (it fades out and back in).
+    Walks from hall: to seat-1: 2.23 m on foot.
 - The pet (a cat), when Tomo has one: at hall while the pet is sleeping; otherwise at desk-chair at night (outside the window) and while the pet is not hungry; otherwise at rug.
     Walks from rug: to hall: 2.87 m on foot; to desk-chair: it cannot walk (it fades out and back in)."
 `;

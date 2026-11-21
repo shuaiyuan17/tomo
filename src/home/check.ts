@@ -6,7 +6,7 @@ import {
 import { centre, num, placeScene, roomBox, vec, whatOf, type Box, type Placement } from "./geometry.js";
 import { describeReaction } from "./floor-plan.js";
 import { NAV_MAX_HOP, type Hurdle } from "./nav.js";
-import { characterStarts, characterUses, MOVER_NAMES, SceneReach, walkerOf, type Unreachable } from "./reach.js";
+import { characterStarts, characterUses, MOVER_NAMES, SceneReach, walkerOf, type Mover, type SpotStart, type StartPoint, type Unreachable } from "./reach.js";
 
 /**
  * The whole-scene check: everything the zod schema cannot see because it
@@ -503,38 +503,69 @@ function checkPlacement(scene: HomeScene, report: Report): void {
  */
 function checkReach(scene: HomeScene, report: Report): void {
   const reach = new SceneReach(scene);
-  const stuck = new Set<string>();
+  const room = scene.room.size;
+  const extent = `x from ${num(-room[0] / 2)} to ${num(room[0] / 2)}, z from ${num(-room[2] / 2)} to ${num(room[2] / 2)}`;
+  const say = (found: Unreachable, noun: string, radius: number, queue: boolean) =>
+    `${whyNot(found, scene, reach.placement, noun, extent)} ${found.reason === "stuck" ? "Every move from there fades out and back in instead" : "It fades out and back in there instead"} (it still gets there). ${howToFix(found, radius, reach.placement, queue)}`;
+  /** Where a start point is, in words: the spot, or a place in the visitors' queue there. */
+  const fromWords = (start: SpotStart, point: StartPoint) => point.queue
+    ? `${ordinal(point.queue + 1)} in the queue at ${JSON.stringify(start.spot)}, at ${vec(point.at)},` : JSON.stringify(start.spot);
+  const usable = new Map<Mover, { start: SpotStart; points: StartPoint[] }>();
   for (const start of characterStarts(scene)) {
-    const found = reach.reach(start.spot, start.spot, walkerOf(start.who));
-    if (found.ok || found.reason !== "stuck") continue;
-    stuck.add(start.who);
-    const who = MOVER_NAMES[start.who];
-    const what = found.why === "hop" || found.why === "far" ? `cannot get down from ${JSON.stringify(start.spot)} to the floor` : `cannot walk anywhere from ${JSON.stringify(start.spot)}`;
-    report.warn(`${start.place}: ${who} ${what}: ${whyNot(found, scene, reach.placement)} Every move from there fades out and back in instead (it still gets there). ${howToFix(found, walkerOf(start.who).radius, reach.placement)}`);
+    const walker = walkerOf(start.who);
+    const ok: StartPoint[] = [];
+    const queued: { point: StartPoint; found: Unreachable }[] = [];
+    for (const point of start.points) {
+      const found = reach.leave(point.at, walker);
+      if (found.ok) { ok.push(point); continue; }
+      // Later places in the queue: one warning for all of them, below.
+      if (point.queue) { queued.push({ point, found }); continue; }
+      const what = found.why === "hop" || found.why === "far" ? `cannot get down from ${fromWords(start, point)} to the floor` : `cannot walk anywhere from ${fromWords(start, point)}`;
+      report.warn(`${start.place}: ${MOVER_NAMES[start.who]} ${what}: ${say(found, "the spot", walker.radius, false)}`);
+    }
+    if (queued.length) {
+      const [first] = queued;
+      const places = queued.map((q) => ordinal(q.point.queue! + 1));
+      const listed = places.length > 1 ? `${places.slice(0, -1).join(", ")} or ${places.at(-1)}` : places[0];
+      const where = queued.length > 1 ? ` cannot walk anywhere (the ${places[0]} is at ${vec(first.point.at)})` : `, at ${vec(first.point.at)}, cannot walk anywhere`;
+      report.warn(`${start.place}: ${MOVER_NAMES[start.who]} waiting ${listed} in the queue at ${JSON.stringify(start.spot)}${where}: ${say(first.found, "the place", walker.radius, true)}`);
+    }
+    usable.set(start.who, { start, points: ok });
   }
   for (const use of characterUses(scene)) {
-    if (stuck.has(use.who)) continue;
-    const found = reach.reach(use.from, use.to, walkerOf(use.who));
-    if (found.ok) continue;
-    const who = MOVER_NAMES[use.who];
-    report.warn(`${use.place}: ${who} cannot walk from ${JSON.stringify(use.from)} to ${JSON.stringify(use.to)}: ${whyNot(found, scene, reach.placement)} It fades out and back in there instead (it still gets there). ${howToFix(found, walkerOf(use.who).radius, reach.placement)}`);
+    const from = usable.get(use.who)!;
+    const walker = walkerOf(use.who);
+    for (const point of from.points) {
+      const found = reach.reach(point.at, reach.spotAt(use.to), walker);
+      if (found.ok) continue;
+      const origin = point.queue ? `the ${fromWords(from.start, point).replace(" in the queue", " place in the queue")}` : fromWords(from.start, point);
+      report.warn(`${use.place}: ${MOVER_NAMES[use.who]} cannot walk from ${origin} to ${JSON.stringify(use.to)}: ${say(found, "the spot", walker.radius, false)}`);
+      break; // One warning a spot: the first place it cannot be walked to from.
+    }
   }
 }
-function whyNot(found: Unreachable, scene: HomeScene, placement: Placement): string {
-  const near = Number.isFinite(found.nearest) ? `${num(found.nearest)} m from the spot` : "nowhere (there is no free floor)";
+function ordinal(n: number): string {
+  const tens = n % 100;
+  return `${n}${tens >= 11 && tens <= 13 ? "th" : ["th", "st", "nd", "rd"][n % 10] ?? "th"}`;
+}
+function whyNot(found: Unreachable, scene: HomeScene, placement: Placement, noun: string, extent: string): string {
+  const near = Number.isFinite(found.nearest) ? `${num(found.nearest)} m from ${noun}` : "nowhere (there is no free floor)";
   const what = blockerWords(found.blockers, scene, placement);
   switch (found.why) {
+    case "outside": return `${noun} is outside the room (${extent}).`;
     case "hop": return `the nearest floor it can reach is ${near}, but every hop from the floor within ${num(NAV_MAX_HOP)} m of it is blocked by ${what}.`;
     case "far": return `the nearest floor it can reach is ${near} (it hops at most ${num(NAV_MAX_HOP)} m)${what ? `; the nearest thing in the way is ${what}` : ""}.`;
-    case "crowded": return `the spot is on the floor but too close to ${what || "the wall"} for it to stand there.`;
-    case "walled": return `the spot is on the floor, cut off from where it can walk; the nearest floor it can reach is ${near}${what ? `, and the nearest thing in the way is ${what}` : ""}.`;
+    case "crowded": return `${noun} is on the floor but too close to ${what || "the wall"} for it to stand there.`;
+    case "walled": return `${noun} is on the floor, cut off from where it can walk; the nearest floor it can reach is ${near}${what ? `, and the nearest thing in the way is ${what}` : ""}.`;
   }
 }
-function howToFix(found: Unreachable, radius: number, placement: Placement): string {
+function howToFix(found: Unreachable, radius: number, placement: Placement, queue: boolean): string {
   const gap = num(Math.ceil((2 * radius + 0.1) * 10 - 1e-9) / 10);
-  const fix = found.why === "hop" ? "Move the spot, or move what is in the way of the hop."
-    : found.why === "crowded" ? "Move the spot into the open, or move what it is too close to."
-      : `Move the spot, or open a gap at least ${gap} m wide next to it.`;
+  const fix = queue ? "Move the overflow spot, or turn it so the queue runs into the open."
+    : found.why === "outside" ? "Move the spot inside the room."
+      : found.why === "hop" ? "Move the spot, or move what is in the way of the hop."
+        : found.why === "crowded" ? "Move the spot into the open, or move what it is too close to."
+          : `Move the spot, or open a gap at least ${gap} m wide next to it.`;
   const toggled = found.blockers.some((h) => placement.objects[h.object]?.leaves[h.leaf]?.toggles);
   return toggled ? `${fix} A part that is shown or hidden by a reaction is in the way even while it is not drawn.` : fix;
 }

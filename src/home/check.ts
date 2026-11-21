@@ -3,7 +3,10 @@ import {
   ASSET_NAME, CONDITIONS, homeSceneSchema, MAX_DEPTH, MAX_KINDS, MAX_OBJECTS, MAX_REACTIONS, MAX_SCENE_BYTES, MAX_SIGN_CHARS,
   MAX_SPOTS, REACTION_DEFAULTS, REACTIONS, SHAPES, SIGN_VALUES, SLUG, type HomePart, type HomeScene,
 } from "./scene.js";
-import { centre, num, placeScene, roomBox, vec, whatOf, type Box } from "./geometry.js";
+import { centre, num, placeScene, roomBox, vec, whatOf, type Box, type Placement } from "./geometry.js";
+import { describeReaction } from "./floor-plan.js";
+import { NAV_MAX_HOP, type Hurdle } from "./nav.js";
+import { characterStarts, characterUses, MOVER_NAMES, SceneReach, walkerOf, type Unreachable } from "./reach.js";
 
 /**
  * The whole-scene check: everything the zod schema cannot see because it
@@ -294,6 +297,7 @@ function checkWhole(scene: HomeScene, options: HomeCheckOptions, report: Report)
   checkCharacters(scene, usedKinds, report);
   for (const name of kindNames) if (!usedKinds.has(name)) report.warn(`kinds.${name} is defined but nothing uses it; remove it, or use it with "kind": ${JSON.stringify(name)}.`);
   checkPlacement(scene, report);
+  if (report.problems.length === 0) checkReach(scene, report);
 }
 
 /** The visitors' kinds and every kind they are built from: a `{task}` sign in any of them is on a visitor. */
@@ -490,6 +494,67 @@ function checkPlacement(scene: HomeScene, report: Report): void {
       }
     }
   }
+}
+
+/**
+ * Spots a character cannot walk to from its default spot (the visitors: from
+ * their overflow spot), at its own size. Only warnings: the page fades it
+ * out and back in there instead.
+ */
+function checkReach(scene: HomeScene, report: Report): void {
+  const reach = new SceneReach(scene);
+  const stuck = new Set<string>();
+  for (const start of characterStarts(scene)) {
+    const found = reach.reach(start.spot, start.spot, walkerOf(start.who));
+    if (found.ok || found.reason !== "stuck") continue;
+    stuck.add(start.who);
+    const who = MOVER_NAMES[start.who];
+    const what = found.why === "hop" || found.why === "far" ? `cannot get down from ${JSON.stringify(start.spot)} to the floor` : `cannot walk anywhere from ${JSON.stringify(start.spot)}`;
+    report.warn(`${start.place}: ${who} ${what}: ${whyNot(found, scene, reach.placement)} Every move from there fades out and back in instead (it still gets there). ${howToFix(found, walkerOf(start.who).radius, reach.placement)}`);
+  }
+  for (const use of characterUses(scene)) {
+    if (stuck.has(use.who)) continue;
+    const found = reach.reach(use.from, use.to, walkerOf(use.who));
+    if (found.ok) continue;
+    const who = MOVER_NAMES[use.who];
+    report.warn(`${use.place}: ${who} cannot walk from ${JSON.stringify(use.from)} to ${JSON.stringify(use.to)}: ${whyNot(found, scene, reach.placement)} It fades out and back in there instead (it still gets there). ${howToFix(found, walkerOf(use.who).radius, reach.placement)}`);
+  }
+}
+function whyNot(found: Unreachable, scene: HomeScene, placement: Placement): string {
+  const near = Number.isFinite(found.nearest) ? `${num(found.nearest)} m from the spot` : "nowhere (there is no free floor)";
+  const what = blockerWords(found.blockers, scene, placement);
+  switch (found.why) {
+    case "hop": return `the nearest floor it can reach is ${near}, but every hop from the floor within ${num(NAV_MAX_HOP)} m of it is blocked by ${what}.`;
+    case "far": return `the nearest floor it can reach is ${near} (it hops at most ${num(NAV_MAX_HOP)} m)${what ? `; the nearest thing in the way is ${what}` : ""}.`;
+    case "crowded": return `the spot is on the floor but too close to ${what || "the wall"} for it to stand there.`;
+    case "walled": return `the spot is on the floor, cut off from where it can walk; the nearest floor it can reach is ${near}${what ? `, and the nearest thing in the way is ${what}` : ""}.`;
+  }
+}
+function howToFix(found: Unreachable, radius: number, placement: Placement): string {
+  const gap = num(Math.ceil((2 * radius + 0.1) * 10 - 1e-9) / 10);
+  const fix = found.why === "hop" ? "Move the spot, or move what is in the way of the hop."
+    : found.why === "crowded" ? "Move the spot into the open, or move what it is too close to."
+      : `Move the spot, or open a gap at least ${gap} m wide next to it.`;
+  const toggled = found.blockers.some((h) => placement.objects[h.object]?.leaves[h.leaf]?.toggles);
+  return toggled ? `${fix} A part that is shown or hidden by a reaction is in the way even while it is not drawn.` : fix;
+}
+/** "objects[31] (a tidepool), with parts shown only while the pet is sleeping", for at most three objects. */
+function blockerWords(blockers: readonly Hurdle[], scene: HomeScene, placement: Placement): string {
+  const byObject = new Map<number, Set<string>>();
+  for (const h of blockers) {
+    const words = byObject.get(h.object) ?? new Set<string>();
+    const leaf = placement.objects[h.object]?.leaves[h.leaf];
+    for (const toggle of leaf?.toggles ?? []) words.add(describeReaction(toggle));
+    byObject.set(h.object, words);
+  }
+  const named = [...byObject].slice(0, 3).map(([index, toggles]) => {
+    const object = scene.objects[index];
+    const name = `objects[${index}]${object.id ? ` ${JSON.stringify(object.id)}` : object.kind ? ` (a ${object.kind})` : ""}`;
+    const list = [...toggles];
+    return list.length ? `${name}, including a part ${list.length > 1 ? `${list.slice(0, -1).join(", ")} and another ${list.at(-1)}` : list[0]}` : name;
+  });
+  const more = byObject.size > 3 ? ` and ${byObject.size - 3} more` : "";
+  return named.length ? `${named.join("; ")}${more}` : "";
 }
 
 function overlap(left: { box: Box; solid: boolean }[], right: { box: Box; solid: boolean }[]): number[] | undefined {

@@ -1,4 +1,4 @@
-import type { HomePart, HomeScene } from "./scene.js";
+import type { HomePart, HomeReaction, HomeScene } from "./scene.js";
 
 /**
  * Where every part of a scene ends up, as the whole-scene check and the floor
@@ -93,6 +93,8 @@ export interface PlacedLeaf {
   box: Box;
   /** A shape (pictures and signs are flat panels, not solid). */
   solid: boolean;
+  /** The show and hide reactions on it and on what it is part of: when present, it is drawn only some of the time. */
+  toggles?: HomeReaction[];
 }
 export interface PlacedObject {
   index: number;
@@ -125,16 +127,18 @@ export function placeScene(scene: HomeScene): Placement {
   const ids = new Map<string, number>();
   scene.objects.forEach((object, index) => { if (object.id && !ids.has(object.id)) ids.set(object.id, index); });
 
-  const walk = (part: HomePart, frame: Frame, object: number, leaves: PlacedLeaf[], stack: string[]): void => {
+  const walk = (part: HomePart, frame: Frame, object: number, leaves: PlacedLeaf[], stack: string[], above: HomeReaction[]): void => {
     if (--budget < 0) { truncated = true; return; }
     const what = whatOf(part);
+    const own = (part.reactions ?? []).filter((r) => r.do === "show" || r.do === "hide");
+    const toggles = own.length ? [...above, ...own] : above;
     if (what.includes("shape") || what.includes("picture") || what.includes("sign") || what.includes("window")) {
-      leaves.push({ object, part, box: boxIn(frame, leafBox(part)), solid: what.includes("shape") });
+      leaves.push({ object, part, box: boxIn(frame, leafBox(part)), solid: what.includes("shape"), ...(toggles.length ? { toggles } : {}) });
     }
     if (part.kind !== undefined && kinds[part.kind] && !stack.includes(part.kind)) {
-      for (const sub of kinds[part.kind].parts) walk(sub, child(frame, sub.at, sub.turn, sub.scale), object, leaves, [...stack, part.kind]);
+      for (const sub of kinds[part.kind].parts) walk(sub, child(frame, sub.at, sub.turn, sub.scale), object, leaves, [...stack, part.kind], toggles);
     }
-    for (const sub of part.parts ?? []) walk(sub, child(frame, sub.at, sub.turn, sub.scale), object, leaves, stack);
+    for (const sub of part.parts ?? []) walk(sub, child(frame, sub.at, sub.turn, sub.scale), object, leaves, stack, toggles);
   };
 
   const placed = new Map<number, PlacedObject>();
@@ -156,7 +160,7 @@ export function placeScene(scene: HomeScene): Placement {
     placing.delete(index);
     const frame = child(base, part.at, part.turn, part.scale);
     const leaves: PlacedLeaf[] = [];
-    walk(part, frame, index, leaves, []);
+    walk(part, frame, index, leaves, [], []);
     let box: Box | undefined;
     for (const leaf of leaves) box = union(box, leaf.box);
     const result: PlacedObject = { index, part, frame, leaves, ...(box ? { box } : {}), ...(on !== undefined ? { on } : {}) };

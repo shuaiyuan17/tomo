@@ -27,7 +27,7 @@ const SCENE: HomeScene = {
     { id: "poster", picture: "poster.png", size: [0.8, 1, 0.02], at: [-3.95, 1.2, 0.5], turn: [0, 90, 0] },
     { id: "shelf", parts: [{ shape: "box", size: [1.2, 0.04, 0.3] }, { shape: "box", size: [1.2, 0.04, 0.3], at: [0, 0.4, 0], reactions: [{ when: "night", do: "hide" }] }], at: [2.8, 0.5, -2.3] },
   ],
-  spots: { "desk-chair": { at: [-2.5, 0, -1.1], facing: 180 }, rug: { at: [0, 0, 1], facing: 0 }, "seat-1": { at: [2, 0, 0.5], facing: 270 }, hall: { at: [3.5, 0, 2.2] } },
+  spots: { "desk-chair": { at: [-2.5, 0, -1.1], facing: 180 }, rug: { at: [1, 0, 0.8], facing: 0 }, "seat-1": { at: [2, 0, 0.5], facing: 270 }, hall: { at: [3.5, 0, 2.2] } },
   characters: {
     tomo: { kind: "me", spot: "rug", rules: [{ when: "working", spot: "desk-chair" }, { when: "cron", spot: "seat-1" }] },
     visitors: { kind: "guest", kinds: { explore: "guest" }, spots: ["seat-1"], overflow: "hall" },
@@ -64,5 +64,33 @@ describe("home floor plan", () => {
   });
   it("lists windows as windows the app draws", () => {
     expect(renderFloorPlan(SCENE)).toContain("window 1.8×1.2 m (the app draws the sky in it)");
+  });
+  it("maps where each size of character can walk, says which spots are hopped to, and how far each trip is", () => {
+    const scene: HomeScene = {
+      version: 1,
+      room: { size: [4, 3, 4], floor: "#a9825b", walls: "#d9cdb6" },
+      kinds: { me: { parts: [{ shape: "sphere", size: [0.6, 0.6, 0.6] }] } },
+      objects: [
+        { id: "stool", shape: "box", size: [0.4, 0.45, 0.4], at: [1, 0, -1] },
+        // A wall across the room with a 0.4 m gap: the pet's size gets through, Tomo's does not.
+        { id: "wall-left", shape: "box", size: [1.8, 1, 0.2], at: [-1.1, 0, 1] },
+        { id: "wall-right", shape: "box", size: [1.8, 1, 0.2], at: [1.1, 0, 1] },
+      ],
+      spots: { rug: { at: [0, 0, 0] }, seat: { at: [1, 0.45, -1] }, den: { at: [0, 0, 1.6] } },
+      characters: { tomo: { kind: "me", spot: "rug", rules: [{ when: "working", spot: "seat" }, { when: "night", spot: "den" }] }, pet: { kind: "me", spot: "rug", rules: [{ when: "pet:sleeping", spot: "den" }] } },
+    };
+    const text = renderFloorPlan(scene);
+    expect(text).toContain("Floor Tomo can walk on (Tomo's size), from rug: . walkable, # in the way, ~ floor cut off from there, digits are spots:");
+    expect(text).toContain("Floor the pet can walk on (the pet's size), from rug:");
+    // Tomo's map: the den side is cut off (~); the pet's: it is not.
+    const [, tomoMap, petMap] = text.split(/^Floor (?=Tomo |the pet )/m);
+    const body = (map: string) => map.split("\n\n")[0].split("\n").filter((line) => line.startsWith("|")).join("\n");
+    expect(body(tomoMap)).toContain("~");
+    expect(body(petMap)).not.toContain("~");
+    expect(text).toContain("- 2 seat: at (1, 0.45, -1), back right, facing 0° (toward the viewer); a perch: a 0.");
+    expect(text).toContain("- 3 den: at (0, 0, 1.6), front centre, facing 0° (toward the viewer); Tomo: cannot be walked to from rug (it fades out and back in); the pet: on the floor.");
+    expect(text).toMatch(/Walks from rug: to seat: [\d.]+ m on foot and a [\d.]+ m hop up; to den: it cannot walk \(it fades out and back in\)\./);
+    // No characters, no walking map.
+    expect(renderFloorPlan({ ...scene, characters: undefined })).not.toContain("can walk on");
   });
 });

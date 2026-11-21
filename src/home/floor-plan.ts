@@ -1,5 +1,7 @@
 import type { HomePart, HomeReaction, HomeScene } from "./scene.js";
 import { centre, num, placeScene, vec, whatOf, type Box } from "./geometry.js";
+import { landings, NAV_PET, type NavGrid } from "./nav.js";
+import { characterStarts, characterUses, MOVER_NAMES, SceneReach, walkerOf, type Mover, type Reach } from "./reach.js";
 
 /**
  * The floor plan: the text Tomo "sees" of its home when there is no picture.
@@ -165,6 +167,25 @@ export function renderFloorPlan(scene: HomeScene): string {
   if (legend.length) lines.push(`Legend: ${legend.join(", ")}.`);
   lines.push("");
 
+  // ---- where the characters can walk: one map per walker size in use ----
+  const reach = new SceneReach(scene, placement);
+  const starts = characterStarts(scene);
+  for (const walker of [...new Set(starts.map((s) => walkerOf(s.who)))]) {
+    const start = starts.find((s) => walkerOf(s.who) === walker)!;
+    const who = starts.filter((s) => walkerOf(s.who) === walker).map((s) => ({ tomo: "Tomo", visitors: "the visitors", pet: "the pet" })[s.who]);
+    const map = walkableMap(reach.grid(walker), scene.spots![start.spot].at, cols, rows, w, d);
+    spotNames.forEach((name, i) => {
+      const at = scene.spots![name].at;
+      if (Math.abs(at[0]) > w / 2 || Math.abs(at[2]) > d / 2) return;
+      map[clampR(row(at[2]))][clampC(col(at[0]))] = i < 9 ? String(i + 1) : "*";
+    });
+    lines.push(`Floor ${who.join(" and ")} can walk on (${walker === NAV_PET ? "the pet's size" : "Tomo's size"}), from ${start.spot}: . walkable, # in the way, ~ floor cut off from there, digits are spots:`);
+    lines.push(`+${"-".repeat(cols)}+`);
+    for (const r of map) lines.push(`|${r.join("")}|`);
+    lines.push(`+${"-".repeat(cols)}+`);
+    lines.push("");
+  }
+
   // ---- the objects ----
   lines.push(`Objects (${scene.objects.length}):`);
   if (scene.objects.length === 0) lines.push("  (none)");
@@ -212,33 +233,90 @@ export function renderFloorPlan(scene: HomeScene): string {
   // ---- spots and characters ----
   lines.push(`Spots (${spotNames.length}):`);
   if (spotNames.length === 0) lines.push("  (none)");
+  const uses = characterUses(scene);
+  // Every move, once: from each start to each spot its character uses (and to the start itself, for how it stands there).
+  const moves: { who: Mover; from: string; to: string; found: Reach }[] = [];
+  for (const start of starts) {
+    for (const to of [start.spot, ...uses.filter((u) => u.who === start.who).map((u) => u.to)]) {
+      moves.push({ who: start.who, from: start.spot, to, found: reach.reach(start.spot, to, walkerOf(start.who)) });
+    }
+  }
   spotNames.forEach((name, i) => {
     const spot = scene.spots![name];
     const facing = spot.facing ?? 0;
     const towards = facingWords(facing);
-    lines.push(`- ${i < 9 ? i + 1 : "*"} ${name}: at ${vec(spot.at)}, ${region(spot.at, scene)}, facing ${num(facing)}° (${towards}).`);
+    const how = [...new Set(moves.filter((m) => m.to === name).map((m) => `${MOVER_NAMES[m.who]}: ${standing(m.found, m.from, m.to)}`))];
+    const what = new Set(how.map((h) => h.slice(h.indexOf(": ") + 2)));
+    const words = what.size === 1 ? `; ${[...what][0]}` : how.length ? `; ${how.join("; ")}` : "";
+    lines.push(`- ${i < 9 ? i + 1 : "*"} ${name}: at ${vec(spot.at)}, ${region(spot.at, scene)}, facing ${num(facing)}° (${towards})${words}.`);
   });
   lines.push("");
   lines.push("Who goes where:");
   const c = scene.characters;
+  const walks = (who: Mover) => {
+    const list = moves.filter((m) => m.who === who && m.to !== m.from);
+    if (list.length) lines.push(`    Walks from ${list[0].from}: ${list.map((m) => `to ${m.to}: ${trip(m.found)}`).join("; ")}.`);
+  };
   if (!c || (!c.tomo && !c.visitors && !c.pet)) lines.push("  Nobody: there are no characters, so Tomo is not drawn.");
   if (c?.tomo) {
     const rules = (c.tomo.rules ?? []).map((rule) => `at ${rule.spot} ${describeWhen(rule.when)}`);
     lines.push(`- Tomo (a ${c.tomo.kind}): ${rules.length ? `${rules.join("; otherwise ")}; otherwise ` : ""}at ${c.tomo.spot}.`);
+    walks("tomo");
   }
   if (c?.visitors) {
     const v = c.visitors;
     const kinds = Object.entries(v.kinds ?? {});
     lines.push(`- Subagents (a ${v.kind}${kinds.length ? `; ${kinds.map(([type, kind]) => `${type} as a ${kind}`).join(", ")}` : ""}): one each at ${v.spots.join(", ")}, in order; ${v.overflow ? `the rest wait at ${v.overflow}` : `more than ${v.spots.length} are not drawn`}.`);
+    walks("visitors");
   }
   if (c?.pet) {
     const rules = (c.pet.rules ?? []).map((rule) => `at ${rule.spot} ${describeWhen(rule.when)}`);
     lines.push(`- The pet (a ${c.pet.kind}), when Tomo has one: ${rules.length ? `${rules.join("; otherwise ")}; otherwise ` : ""}at ${c.pet.spot}.`);
+    walks("pet");
   }
 
   let text = lines.join("\n");
   if (text.length > MAX_PLAN_CHARS) text = `${text.slice(0, MAX_PLAN_CHARS - 40)}\n…(floor plan cut short here)`;
   return text;
+}
+
+/**
+ * The walkable-floor map at the floor plan's own size: a map cell is `.` when
+ * any grid cell under it is floor the walker can reach from `from`, `~` when
+ * any is free floor cut off from there, `#` when all are in the way.
+ */
+function walkableMap(grid: NavGrid, from: readonly [number, number, number], cols: number, rows: number, w: number, d: number): string[][] {
+  const reached = new Set(landings(grid, [from[0], from[1], from[2]]).map((l) => grid.region[l.cell]));
+  return Array.from({ length: rows }, (_, r) => Array.from({ length: cols }, (_, c) => {
+    const x0 = -w / 2 + (c * w) / cols, x1 = -w / 2 + ((c + 1) * w) / cols;
+    const z0 = -d / 2 + (r * d) / rows, z1 = -d / 2 + ((r + 1) * d) / rows;
+    // The grid cells the map cell overlaps (at least the one under its centre).
+    const c0 = Math.floor((x0 - grid.origin[0]) / grid.cell + 1e-9), c1 = Math.max(c0, Math.ceil((x1 - grid.origin[0]) / grid.cell - 1e-9) - 1);
+    const r0 = Math.floor((z0 - grid.origin[1]) / grid.cell + 1e-9), r1 = Math.max(r0, Math.ceil((z1 - grid.origin[1]) / grid.cell - 1e-9) - 1);
+    let mark = "#";
+    for (let gr = Math.max(0, r0); gr <= Math.min(grid.rows - 1, r1); gr++) {
+      for (let gc = Math.max(0, c0); gc <= Math.min(grid.cols - 1, c1); gc++) {
+        const region = grid.region[gr * grid.cols + gc];
+        if (region < 0) continue;
+        if (reached.has(region)) return ".";
+        mark = "~";
+      }
+    }
+    return mark;
+  }));
+}
+/** How a character stands at a spot it walks to: on the floor, on a perch it hops to, or not walked to at all. */
+function standing(found: Reach, from: string, to: string): string {
+  if (!found.ok) return found.reason === "stuck" ? `cannot be walked to (it cannot walk anywhere from ${from})` : `cannot be walked to from ${from} (it fades out and back in)`;
+  const hop = from === to ? Math.max(found.route.hopOn, found.route.hopOff) : found.route.hopOn;
+  return hop > 0 ? `a perch: a ${num(hop)} m hop from the floor` : "on the floor";
+}
+/** One trip in words: "1.7 m on foot and a 1.16 m hop up". */
+function trip(found: Reach): string {
+  if (!found.ok) return "it cannot walk (it fades out and back in)";
+  const { length, hopOff, hopOn } = found.route;
+  const bits = [hopOff > 0 ? `a ${num(hopOff)} m hop down` : "", `${num(length)} m on foot`, hopOn > 0 ? `a ${num(hopOn)} m hop up` : ""].filter(Boolean);
+  return bits.length > 1 ? `${bits.slice(0, -1).join(", ")} and ${bits.at(-1)}` : bits[0];
 }
 
 function facingWords(degrees: number): string {

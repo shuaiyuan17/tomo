@@ -15,8 +15,8 @@ Floor plan from above (back wall at the top, the viewer at the bottom; letters a
 |...............................................F|
 |G..............................................F|
 |G..............................................F|
-|G...................................3..........F|
-|G.......................2.......................|
+|G.............................2.....3..........F|
+|G...............................................|
 |..................DDDDDD........................|
 |..................DDDDDD........................|
 |..................DDDDDD........................|
@@ -24,6 +24,44 @@ Floor plan from above (back wall at the top, the viewer at the bottom; letters a
 +------------------------------------------------+  viewer's side
 One column is 0.17 m across, one row 0.33 m deep.
 Legend: A desk, B lamp, C (chair), D big-chair, E window, F board, G poster, H shelf, 1 spot desk-chair, 2 spot rug, 3 spot seat-1, 4 spot hall.
+
+Floor Tomo and the visitors can walk on (Tomo's size), from rug: . walkable, # in the way, ~ floor cut off from there, digits are spots:
++------------------------------------------------+
+|#..############.....................############|
+|#..############................................#|
+|#..############................................#|
+|#.....######...................................#|
+|#.....###1##...................................#|
+|#..............................................#|
+|#..............................................#|
+|#..............................................#|
+|#..............................................#|
+|#.............................2.....3..........#|
+|#..............................................#|
+|#................########......................#|
+|#................########......................#|
+|#.................######.......................#|
+|#.................######.....................4.#|
++------------------------------------------------+
+
+Floor the pet can walk on (the pet's size), from rug: . walkable, # in the way, ~ floor cut off from there, digits are spots:
++------------------------------------------------+
+|....##########..................................|
+|....##########..................................|
+|....##########..................................|
+|.......####.....................................|
+|.......##1#.....................................|
+|................................................|
+|................................................|
+|................................................|
+|................................................|
+|..............................2.....3...........|
+|................................................|
+|..................######........................|
+|..................######........................|
+|................................................|
+|.............................................4..|
++------------------------------------------------+
 
 Objects (8):
 - [A] desk: box 1.6×0.75×0.8 m, #8a6244; back left, base at (-2.5, 0, -1.9), top at 0.75 m.
@@ -43,13 +81,16 @@ Objects (8):
 Kinds (4): chair (2 parts: box 0.5×0.45×0.5 m, #553311; box 0.5×0.5×0.05 m), me (1 part: sphere 0.6×0.6×0.6 m, #5f7a4f), guest (2 parts: cone 0.4×0.7×0.4 m, #c98a4b; sign "{task}" 1.6×0.15 m), cat (1 part: sphere 0.3×0.25×0.4 m, #333333).
 
 Spots (4):
-- 1 desk-chair: at (-2.5, 0, -1.1), back left, facing 180° (toward the back wall).
-- 2 rug: at (0, 0, 1), front centre, facing 0° (toward the viewer).
-- 3 seat-1: at (2, 0, 0.5), right side, facing 270° (toward the left wall).
-- 4 hall: at (3.5, 0, 2.2), front right, facing 0° (toward the viewer).
+- 1 desk-chair: at (-2.5, 0, -1.1), back left, facing 180° (toward the back wall); cannot be walked to from rug (it fades out and back in).
+- 2 rug: at (1, 0, 0.8), middle of the room, facing 0° (toward the viewer); on the floor.
+- 3 seat-1: at (2, 0, 0.5), right side, facing 270° (toward the left wall); Tomo: on the floor; a visitor: cannot be walked to (it cannot walk anywhere from hall).
+- 4 hall: at (3.5, 0, 2.2), front right, facing 0° (toward the viewer); a visitor: cannot be walked to (it cannot walk anywhere from hall); the pet: on the floor.
 
 Who goes where:
 - Tomo (a me): at desk-chair while working; otherwise at seat-1 just after a scheduled job fires; otherwise at rug.
+    Walks from rug: to desk-chair: it cannot walk (it fades out and back in); to seat-1: 1.04 m on foot.
 - Subagents (a guest; explore as a guest): one each at seat-1, in order; the rest wait at hall.
-- The pet (a cat), when Tomo has one: at hall while the pet is sleeping; otherwise at desk-chair at night (outside the window) and while the pet is not hungry; otherwise at rug."
+    Walks from hall: to seat-1: it cannot walk (it fades out and back in).
+- The pet (a cat), when Tomo has one: at hall while the pet is sleeping; otherwise at desk-chair at night (outside the window) and while the pet is not hungry; otherwise at rug.
+    Walks from rug: to hall: 2.87 m on foot; to desk-chair: it cannot walk (it fades out and back in)."
 `;

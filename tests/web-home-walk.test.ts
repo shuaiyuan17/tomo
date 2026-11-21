@@ -272,3 +272,39 @@ describe("walk: a new target mid-move", () => {
     for (let i = 1; i < all.length; i++) expect(Math.abs(all[i].bob - all[i - 1].bob)).toBeLessThan(0.005);
   });
 });
+
+describe("walk: the body, not just its centre and feet", () => {
+  it("does not bounce into something overhead on the way to a raised floor spot", () => {
+    // A slab from 0.98 m over the way: clear of a bounce from the floor (0.9 + 0.07), not from a 0.1 m floor spot (a pet bed).
+    const slab: HomePart = { shape: "box", size: [2, 0.05, 2], at: [0, 0.98, 0] };
+    const grid = buildNavGrid(room([slab]));
+    const plan = planMove(grid, [-2, 0, 0], [0.5, 0.1, 0], 0, 0);
+    expect(plan.kind).toBe("walk");
+    for (const s of samples(plan)) expect(s.bob).toBe(0);
+  });
+  it("keeps its whole body above a wide perch's top while over it, hopping on and off", () => {
+    const box = { x0: -0.8, x1: 0.8, z0: -0.8, z1: 0.8 }, top = 0.8;
+    const grid = buildNavGrid(room([block(box.x0, box.x1, box.z0, box.z1, top)]));
+    const perch: Vec3 = [0, top, 0];
+    // Within the walker's radius of the block's footprint.
+    const near = ([x, , z]: Vec3) => Math.hypot(Math.max(box.x0 - x, 0, x - box.x1), Math.max(box.z0 - z, 0, z - box.z1)) < NAV_RADIUS;
+    for (const plan of [planMove(grid, [-2.5, 0, 0], perch, 0, 0), planMove(grid, perch, [-2.5, 0, 0], 0, 0)]) {
+      const over = samples(plan).filter((s) => near(s.position));
+      expect(over.length).toBeGreaterThan(0);
+      for (const s of over) expect(s.position[1]).toBeGreaterThanOrEqual(top - 1e-9);
+      expect(maxHeight(plan)).toBeCloseTo(top + NAV_HOP_ARC, 4);
+    }
+  });
+});
+
+describe("walk: a hop never leaps", () => {
+  it("rises smoothly even where the floor end is under the perch (a pet under a seat)", () => {
+    const seat: HomePart = { shape: "box", size: [0.6, 0.05, 0.6], at: [0, 0.4, 0] };
+    const grid = buildNavGrid(room([seat]), { walker: NAV_PET });
+    for (const plan of [planMove(grid, [-2, 0, 0], [0, 0.45, 0], 0, 0), planMove(grid, [0, 0.45, 0], [-2, 0, 0], 0, 0)]) {
+      expect(plan.kind).toBe("walk");
+      const all = samples(plan);
+      for (let i = 1; i < all.length; i++) expect(Math.abs(all[i].position[1] - all[i - 1].position[1])).toBeLessThan(0.02);
+    }
+  });
+});

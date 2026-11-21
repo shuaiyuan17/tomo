@@ -143,7 +143,9 @@ function hopPhase(role: "off" | "on", from: Vec3, to: Vec3, start: number, yaw0:
   // Over what it perches on, the feet stay above the perch: the arc tops out before it gets there (hopping on), or
   // only after it has left it (hopping off), so that part of the arc is the side between the peak and the perch.
   const over = overBoxes(from, to, perch);
-  if (over) apexAt = role === "on" ? Math.min(apexAt, over[0]) : Math.max(apexAt, over[1]);
+  // Not when the floor end is already under it (a pet under a seat): that would leap straight up.
+  if (over && role === "on" && over[0] > 0.05) apexAt = Math.min(apexAt, over[0]);
+  if (over && role === "off" && over[1] < 0.95) apexAt = Math.max(apexAt, over[1]);
   const duration = HOP_MIN_DURATION + (HOP_MAX_DURATION - HOP_MIN_DURATION) * Math.min(1, dist3(from, to) / NAV_MAX_HOP);
   return { kind: "hop", role, start, duration, from, to, peak, apexAt, yaw0, yaw1 };
 }
@@ -238,22 +240,29 @@ function move(grid: NavGrid | null, from: Vec3, to: Vec3, fromYaw: number, toYaw
   if (!grid || !found?.ok) return planBlink(from, to, fromYaw, toYaw);
   const { points } = found.route;
   return planRoute(found.route, from, to, fromYaw, toYaw, {
-    speed, bounce: !lowOverhead(grid, points),
+    speed, bounce: !lowOverhead(grid, points, Math.max(isFloor(from) ? from[1] : 0, isFloor(to) ? to[1] : 0, 0)),
     perchOff: isFloor(from) ? [] : perchedOn(grid, from), perchOn: isFloor(to) ? [] : perchedOn(grid, to),
   });
 }
-/** What `at` perches on, by nav.ts's rule (clearHop): its footprint holds `at`, its top is within NAV_PERCH_TOLERANCE of it. */
+/**
+ * What `at` perches on, by nav.ts's rule (clearHop): its footprint holds
+ * `at`, its top is within NAV_PERCH_TOLERANCE of it. Grown by the walker's
+ * radius: the body is over it before the feet are.
+ */
 function perchedOn(grid: NavGrid, at: Vec3): Footprint[] {
+  const r = grid.radius;
   return grid.hurdles.filter((h) => Math.abs(h.top - at[1]) <= NAV_PERCH_TOLERANCE
-    && at[0] >= h.min[0] && at[0] <= h.max[0] && at[2] >= h.min[1] && at[2] <= h.max[1]);
+    && at[0] >= h.min[0] && at[0] <= h.max[0] && at[2] >= h.min[1] && at[2] <= h.max[1])
+    .map((h): Footprint => ({ min: [h.min[0] - r, h.min[1] - r], max: [h.max[0] + r, h.max[1] + r] }));
 }
 /**
  * Whether anything the walk passes under (within its radius) starts less
- * than a step bounce above its head room: the grid let it walk under that,
- * but not bounce into it.
+ * than a step bounce above its head room, from the highest its feet get
+ * (`feet`: a raised floor spot, a pet bed, at either end): the grid let it
+ * walk under that, but not bounce into it.
  */
-function lowOverhead(grid: NavGrid, points: readonly FloorPoint[]): boolean {
-  const low = grid.hurdles.filter((h) => h.bottom >= grid.headroom && h.bottom < grid.headroom + STEP_HEIGHT);
+function lowOverhead(grid: NavGrid, points: readonly FloorPoint[], feet: number): boolean {
+  const low = grid.hurdles.filter((h) => h.bottom >= grid.headroom && h.bottom < grid.headroom + feet + STEP_HEIGHT);
   if (!low.length) return false;
   for (let i = 1; i < points.length; i++) {
     const [a, b] = [points[i - 1], points[i]];

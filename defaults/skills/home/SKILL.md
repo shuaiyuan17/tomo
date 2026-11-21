@@ -105,6 +105,26 @@ Under `characters`:
 
   Every spot a pet rule names must exist; `home_check` says so if one does not, and warns about a mood the pet never has.
 
+Tomo and the pet can also have `walk` and `wander`:
+
+{{home:walk-wander}}
+
+With `wander`, when no rule holds it strolls between its wander spots instead of standing at its `spot`: it stays a while at one, then walks to another picked at random (never the one it is at, never one where someone else is or is going, never one it cannot walk to from there). You wander only while idle; the pet may wander while you work. The moment a rule holds, it stops and goes to the rule's spot; when the rule ends it stays once where it is, then wanders on. Under the viewer's reduced-motion setting nobody wanders: they stand at their spot. To keep a pet still at times, give it a rule (`pet:sleeping` → its nest). A smaller pet that wanders slower over a smaller range: a lower `walk.speed`, and a few spots close together.
+
+  **Example: you stroll by day between three spots; the pet pads between two near its bed.**
+
+  ```json
+  "spots": { "chair": { "at": [0, 0, -1] }, "window": { "at": [2, 0, -2.2] }, "rug": { "at": [-1, 0, 1] },
+    "bed": { "at": [2, 0, 1.5] }, "corner": { "at": [2.4, 0, 0.6] } },
+  "characters": {
+    "tomo": { "kind": "me", "spot": "rug", "rules": [{ "when": "working", "spot": "chair" }],
+      "walk": { "speed": 0.8 }, "wander": { "spots": ["chair", "window", "rug"], "every": [30, 90], "when": "day" } },
+    "pet": { "kind": "cat", "spot": "bed", "walk": { "speed": 0.4 }, "wander": { "spots": ["bed", "corner"], "every": [60, 180] } }
+  }
+  ```
+
+  The floor plan says under "Who goes where" how each one wanders and how fast it walks. `home_check` warns about a wander spot it cannot walk to (it leaves that one out from where it cannot get there).
+
 Spots are named places under `spots`: `{ "at": [x, 0, z], "facing": degrees }` (0 faces the viewer, 180 the back wall). Every kind and spot a character names must exist.
 
 ## Pictures

@@ -262,3 +262,75 @@ describe("home scene check", () => {
     });
   });
 });
+
+describe("walk and wander", () => {
+  const wander = (change: (s: any) => void) => (s: any) => {
+    s.spots.window = { at: [2, 0, -2] }; s.spots["pool-side"] = { at: [-2, 0, 1.5] };
+    s.characters.tomo.walk = { speed: 0.8, radius: 0.3 };
+    s.characters.tomo.wander = { spots: ["chair", "window", "pool-side"], every: [30, 90], when: "day" };
+    change(s);
+  };
+  it("a scene with walk and wander checks clean; both are optional", () => {
+    expect(check(wander(() => {}))).toMatchObject({ ok: true, problems: [], warnings: [] });
+    expect(check(wander((s) => { delete s.characters.tomo.wander.every; delete s.characters.tomo.wander.when; delete s.characters.tomo.walk; })).ok).toBe(true);
+    expect(check(wander((s) => { s.characters.pet = { kind: "guest", spot: "seat", walk: { speed: 0.4 }, wander: { spots: ["seat", "window"], every: [60, 180] } }; })).problems).toEqual([]);
+  });
+  it("schema problems say where and how to fix it", () => {
+    expect(one(wander((s) => { s.characters.tomo.wander.spots[2] = "pool-sid"; })))
+      .toBe('characters.tomo.wander.spots[2]: spot "pool-sid" is not defined (did you mean "pool-side"?); add it under spots, or use one of chair, seat, window, pool-side.');
+    expect(one(wander((s) => { s.characters.tomo.wander.spots = ["chair"]; })))
+      .toBe("characters.tomo.wander.spots has 1 entry; the least is 2. With one spot there is nowhere to walk to: add another, or remove wander.");
+    expect(one(wander((s) => { s.characters.tomo.wander.spots = Array.from({ length: 9 }, () => "chair"); })))
+      .toBe("characters.tomo.wander.spots has 9 entries; the most is 8. Keep the spots it strolls between to a few.");
+    expect(one(wander((s) => { s.characters.tomo.wander.every = [90, 30]; })))
+      .toBe("characters.tomo.wander.every: [90,30] has the shortest stay after the longest; write it as [shortest, longest] in seconds, like [30, 90].");
+    expect(one(wander((s) => { s.characters.tomo.wander.every = [30]; })))
+      .toBe("characters.tomo.wander.every must be two numbers [shortest, longest], the seconds it stays at each spot, like [30, 90]; it has 1.");
+    expect(one(wander((s) => { s.characters.tomo.wander.every = [1, 30]; }))).toBe("characters.tomo.wander.every[0]: 1 is too small; the least is 5.");
+    expect(one(wander((s) => { s.characters.tomo.wander.every = [30, 7200]; }))).toBe("characters.tomo.wander.every[1]: 7200 is too large; the most is 3600.");
+    expect(one(wander((s) => { s.characters.tomo.walk.speed = 12; }))).toBe("characters.tomo.walk.speed: 12 is too large; the most is 3.");
+    expect(one(wander((s) => { s.characters.tomo.walk.radius = 0.05; }))).toBe("characters.tomo.walk.radius: 0.05 is too small; the least is 0.1.");
+    expect(one(wander((s) => { s.characters.tomo.wandr = s.characters.tomo.wander; delete s.characters.tomo.wander; })))
+      .toContain('"wandr" is not part of the scene format (did you mean "wander"?)');
+    expect(one(wander((s) => { s.characters.tomo.wander.evry = [30, 90]; }))).toContain('(did you mean "every"?)');
+    expect(one(wander((s) => { s.characters.visitors.wander = { spots: ["seat", "chair"] }; }))).toContain('characters.visitors: "wander" is not part of the scene format');
+  });
+  it("warns about a spot listed twice, and a when that never holds while Tomo is idle", () => {
+    expect(check(wander((s) => { s.characters.tomo.wander.spots = ["chair", "window", "window"]; })).warnings)
+      .toEqual(['characters.tomo.wander.spots[2]: "window" is listed twice; list each spot once.']);
+    expect(check(wander((s) => { s.characters.tomo.wander.when = ["day", "working"]; })).warnings)
+      .toEqual(['characters.tomo.wander.when: "working" never holds while you are idle, and you only wander while idle, so you never wander; remove it from when.']);
+    // The pet wanders whatever Tomo is doing.
+    expect(check(wander((s) => { s.characters.pet = { kind: "guest", spot: "seat", wander: { spots: ["seat", "window"], when: "working" } }; })).warnings).toEqual([]);
+    expect(check(wander((s) => { s.characters.pet = { kind: "guest", spot: "seat", wander: { spots: ["seat", "window"], when: "pet:dozing" } }; })).warnings.join())
+      .toContain("characters.pet.wander.when: pet:dozing can never hold");
+  });
+  it("wander spots are places the character can be: each pair is checked, and one it only wanders to is left out, not faded to", () => {
+    // A wall across z = 1 with a 0.4 m gap: "den" behind it is cut off for Tomo.
+    const result = check(wander((s) => {
+      s.objects.push({ id: "wall-left", shape: "box", size: [2.8, 1, 0.2], at: [-1.6, 0, 1] }, { id: "wall-right", shape: "box", size: [2.8, 1, 0.2], at: [1.6, 0, 1] });
+      s.spots.den = { at: [0, 0, 2.2] };
+      s.characters.tomo.walk = { speed: 0.8 };
+      s.characters.tomo.wander = { spots: ["chair", "window", "den"] };
+    }));
+    expect(result.ok).toBe(true);
+    const tomo = result.warnings.filter((w) => w.startsWith("characters.tomo"));
+    expect(tomo).toEqual([
+      'characters.tomo.spot: Tomo cannot walk to "chair" from "den": the spot is on the floor, cut off from where it can walk; the nearest floor it can reach is 2.45 m from the spot, and the nearest thing in the way is objects[0] "desk". It fades out and back in instead (it still gets there). Move the spot, or open a gap at least 0.6 m wide next to it.',
+      'characters.tomo.wander.spots[1]: Tomo cannot walk to "window" from "den": the spot is on the floor, cut off from where it can walk; the nearest floor it can reach is 3.45 m from the spot, and the nearest thing in the way is objects[0] "desk". So it does not wander there from there. Move the spot, or open a gap at least 0.6 m wide next to it.',
+      'characters.tomo.wander.spots[2]: Tomo cannot walk to "den" from "chair" or "window": the spot is on the floor, cut off from where it can walk; the nearest floor it can reach is 1.65 m from the spot, and the nearest thing in the way is objects[2] "wall-left". So it does not wander there from those places. Move the spot, or open a gap at least 0.6 m wide next to it.',
+    ]);
+  });
+  it("walk.radius is the size it is checked at: a wider walker no longer fits a gap", () => {
+    const gap = (radius?: number) => check((s) => {
+      // A 0.7 m gap between two blocks, "far" behind it.
+      s.objects.push({ shape: "box", size: [2.65, 1, 0.2], at: [-1.675, 0, 1] }, { shape: "box", size: [2.65, 1, 0.2], at: [1.675, 0, 1] });
+      s.spots.far = { at: [0, 0, 2.2] };
+      s.characters.tomo.rules = [{ when: "working", spot: "far" }];
+      if (radius !== undefined) s.characters.tomo.walk = { radius };
+    }).warnings.filter((w) => w.startsWith("characters.tomo"));
+    expect(gap()).toEqual([]);
+    expect(gap(0.4).join("\n")).toContain('Tomo cannot walk to "far" from "chair"');
+    expect(gap(0.4).join("\n")).toContain("open a gap at least 0.9 m wide");
+  });
+});

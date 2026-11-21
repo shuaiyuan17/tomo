@@ -1,7 +1,9 @@
 import {
   ASSET_NAME, CONDITIONS, HOME_SCENE_VERSION, MAX_DEPTH, MAX_KINDS, MAX_OBJECTS, MAX_PARTS_PER_NODE, MAX_REACTIONS, MAX_SCENE_BYTES,
   MAX_SIGN_CHARS, MAX_SPOTS, REACTION_DEFAULTS, REACTIONS, ROOM_MAX, ROOM_MIN, SHAPES, SIGN_VALUES, SIZE_MAX,
+  WALK_RADIUS_LIMITS, WALK_RULE_FACTOR, WALK_SPEED_LIMITS, WANDER_EVERY_LIMITS, WANDER_SPOT_LIMITS,
 } from "./scene.js";
+import { NAV_PET, NAV_WALKER } from "./nav.js";
 import { PET_MOODS } from "./check.js";
 import { MAX_ASSET_BYTES } from "./files.js";
 import { STARTER_SCENE } from "./starter.js";
@@ -101,6 +103,13 @@ export const HOME_SKILL_VALUES: Record<string, () => string> = {
     ["reactions on one part", `at most ${MAX_REACTIONS}`],
     ["sign text", `at most ${MAX_SIGN_CHARS} characters`],
     ["a picture file", `at most ${MAX_ASSET_BYTES / 1024} KiB`],
+  ]),
+  "walk-wander": () => list([
+    ["walk.speed", `metres a second when it wanders, ${WALK_SPEED_LIMITS.min}–${WALK_SPEED_LIMITS.max}, default ${WALK_SPEED_LIMITS.default}; a move a rule makes goes ${WALK_RULE_FACTOR} times as fast, and takes a few seconds at most however far`],
+    ["walk.radius", `how much floor it needs round its middle to get past things, in metres, ${WALK_RADIUS_LIMITS.min}–${WALK_RADIUS_LIMITS.max}; default ${NAV_WALKER.radius} for you, ${NAV_PET.radius} for the pet (not worked out from the body: a crab's claws would make it too wide to pass anything)`],
+    ["wander.spots", `the spots it strolls between, ${WANDER_SPOT_LIMITS.min}–${WANDER_SPOT_LIMITS.max} of them, each once; your own \`spot\` may be one of them`],
+    ["wander.every", `[shortest, longest] seconds it stays at each, ${WANDER_EVERY_LIMITS.min}–${WANDER_EVERY_LIMITS.max}, default [${WANDER_EVERY_LIMITS.default.join(", ")}]`],
+    ["wander.when", "optional: a condition (or up to four) that must also hold, like `day`"],
   ]),
   starter: () => JSON.stringify(STARTER_SCENE, null, 2),
 };

@@ -95,4 +95,26 @@ describe("home floor plan", () => {
     // No characters, no walking map.
     expect(renderFloorPlan({ ...scene, characters: undefined })).not.toContain("can walk on");
   });
+
+  it("says under Who goes where how a character wanders and how fast it walks; wander spots are places it walks between", () => {
+    const scene = structuredClone(SCENE);
+    scene.characters!.tomo!.walk = { speed: 0.8 };
+    scene.characters!.tomo!.wander = { spots: ["rug", "seat-1", "hall"], every: [30, 90] };
+    scene.characters!.pet!.walk = { speed: 0.4, radius: 0.15 };
+    scene.characters!.pet!.wander = { spots: ["rug", "hall"], every: [60, 180], when: "day" };
+    const text = renderFloorPlan(scene);
+    const who = text.slice(text.indexOf("Who goes where:"));
+    expect(who).toContain("- Tomo (a me): at desk-chair while working; otherwise at seat-1 just after a scheduled job fires; otherwise at rug, or wandering.\n"
+      + "    When no rule holds, it wanders between rug, seat-1 and hall while idle, staying 30–90 s at each; it walks at 0.8 m/s (1.2 m/s when a rule sends it somewhere). Not under the viewer's reduced-motion setting: then it stays at its spot.\n"
+      + "    Walks from rug: to desk-chair: ");
+    // hall is only a wander spot for Tomo, and it is in the walks too (cut off for Tomo's size here).
+    const tomoWalks = who.split("\n").find((l) => l.startsWith("    Walks from rug:"))!;
+    expect(tomoWalks).toContain("to hall: it cannot walk there (so it does not wander there from here).");
+    expect(who).toContain("When no rule holds, it wanders between rug and hall by day (outside the window), staying 60–180 s at each; it walks at 0.4 m/s (0.6 m/s when a rule sends it somewhere), with a 0.15 m footprint radius.");
+    // The pet's own size gets its own walkable-floor map.
+    expect(text).toContain("Floor the pet can walk on (a 0.15 m footprint radius)");
+    // Walk alone: just the pace.
+    delete scene.characters!.tomo!.wander;
+    expect(renderFloorPlan(scene)).toContain("otherwise at rug.\n    It walks at 0.8 m/s (1.2 m/s when a rule sends it somewhere).\n");
+  });
 });

@@ -2,7 +2,7 @@ import { Color, DirectionalLight, Group, HemisphereLight, MathUtils, Mesh, PCFSo
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { HomeScene } from "../../../../src/home/scene.js";
 import type { HomeSubagent } from "../../../../src/home/status.js";
-import { fillSign, partEffects, seatVisitors, characterSpot, visitorKind, type Conditions, type SignValues, type Vec3 } from "../evaluate.js";
+import { fillSign, partEffects, seatVisitors, visitorKind, type Conditions, type SignValues, type Vec3 } from "../evaluate.js";
 import { MAX_WAITING_DRAWN, waitingPosition } from "../../../../src/home/waiting.js";
 import { layoutKind, layoutScene } from "../layout.js";
 import { buildNodes, redrawSigns, retarget, signPixels, signScaleFor, stepPart, updateSigns, type Built } from "./build.js";
@@ -12,7 +12,10 @@ import { skyLight, skyMoves, type Sky } from "../sky.js";
 import { base64Bytes } from "../snapshot.js";
 import { planMove, poseAt, smooth, type WalkPlan, type WalkPose } from "../walk.js";
 import { placeScene, type Placement } from "../../../../src/home/geometry.js";
-import { buildNavGrid, NAV_PET, NAV_WALKER, type NavGrid, type WalkerSize } from "../../../../src/home/nav.js";
+import { buildNavGrid, findRoute, type NavGrid, type WalkerSize } from "../../../../src/home/nav.js";
+import { walkerOf } from "../../../../src/home/reach.js";
+import { WALK_RULE_FACTOR, WALK_SPEED_DEFAULT } from "../contract.js";
+import { placeCharacter, type Placing, type Random, type WanderState } from "../wander.js";
 
 /**
  * The room as three.js draws it. It renders only while something changes
@@ -66,6 +69,8 @@ interface Character {
   to: Vec3; toYaw: number;
   /** The move under way (see walk.ts), started at `start`; null when it is standing at `to`. */
   plan: WalkPlan | null; start: number;
+  /** Tomo and the pet: the spot it is at or heading to, why (wander.ts), and its wander (null when not wandering). */
+  spot?: string; by?: Placing["by"]; wander: WanderState | null;
   appear: number; leaving: boolean; task: string;
 }
 
@@ -85,6 +90,13 @@ export class HomeStage {
   private grids = new Map<WalkerSize, NavGrid | null>();
   private placement: Placement | null = null;
   private seats = new Map<string, number>();
+  /** Whether a walker can walk from one spot to another, per scene (for picking where to wander). */
+  private walkable = new Map<string, boolean>();
+  /** Wakes the stage when a wander's stay is over; `wanderDue` if that happened while paused. */
+  private wanderTimer: ReturnType<typeof setTimeout> | null = null;
+  private wanderDue = false;
+  /** Where the next wander goes (wander.ts takes its dice from the caller). */
+  random: Random = Math.random;
   private state: StageState | null = null;
   private light = { hemi: 2, sun: 2, color: new Color("#fff6ea") };
   private skyDrawnAt = -1;
@@ -112,7 +124,12 @@ export class HomeStage {
   onView: ((view: StageView) => void) | undefined;
   get reducedMotion(): boolean { return this.reduced; }
   /** Reduced motion: the view stops where the owner lets go (no inertia). */
-  set reducedMotion(value: boolean) { this.reduced = value; this.controls.enableDamping = !value; }
+  set reducedMotion(value: boolean) {
+    const changed = value !== this.reduced;
+    this.reduced = value; this.controls.enableDamping = !value;
+    // Wandering stops (it stands at its spot at once) or starts again.
+    if (changed && this.state && this.home && this.built) { this.placeCharacters(this.state, false); this.invalidate(); }
+  }
 
   constructor(canvas: HTMLCanvasElement, private readonly assetUrl: (name: string) => string) {
     // Throws without WebGL: the caller says so in words.
@@ -143,7 +160,7 @@ export class HomeStage {
   setScene(home: HomeScene, revision: string): void {
     this.clearWorld();
     this.home = home;
-    this.grids.clear(); this.placement = null;
+    this.grids.clear(); this.placement = null; this.walkable.clear();
     this.resources = new Resources((name) => `${this.assetUrl(name)}?r=${encodeURIComponent(revision)}`, () => this.invalidate());
     const layout = layoutScene(home);
     const [w, h, d] = home.room.size;
@@ -202,13 +219,12 @@ export class HomeStage {
 
   private placeCharacters(state: StageState, immediate: boolean): void {
     const home = this.home!, spots = home.spots ?? {}, cast = home.characters ?? {};
-    const wanted = new Map<string, { kind: string; at: Vec3; facing: number; task: string }>();
+    type Want = { kind: string; at: Vec3; facing: number; task: string; walker: WalkerSize; spot?: string; by?: Placing["by"]; wander?: WanderState | null; speed?: number; plan?: WalkPlan };
+    const wanted = new Map<string, Want>();
     const spotAt = (name: string | undefined) => name ? spots[name] : undefined;
-    if (cast.tomo) {
-      const spot = spotAt(characterSpot(cast.tomo, state.conditions)) ?? spotAt(cast.tomo.spot);
-      if (spot) wanted.set("tomo", { kind: cast.tomo.kind, at: spot.at, facing: spot.facing ?? 0, task: "" });
-    }
+    const now = this.now();
     if (cast.visitors) {
+      const walker = walkerOf("visitors", home);
       const seating = seatVisitors(state.subagents, cast.visitors.spots.length, this.seats);
       this.seats = seating.seated;
       const overflow = spotAt(cast.visitors.overflow);
@@ -217,22 +233,42 @@ export class HomeStage {
         const seat = seating.seated.get(sub.id);
         const waitingIndex = seating.waiting.indexOf(sub.id);
         const spot = seat !== undefined ? spotAt(cast.visitors.spots[seat]) : undefined;
-        if (spot) wanted.set(`visitor:${sub.id}`, { kind, at: spot.at, facing: spot.facing ?? 0, task: sub.task ?? "" });
+        if (spot) wanted.set(`visitor:${sub.id}`, { kind, at: spot.at, facing: spot.facing ?? 0, task: sub.task ?? "", walker });
         else if (overflow && waitingIndex >= 0 && waitingIndex < MAX_WAITING_DRAWN)
-          wanted.set(`visitor:${sub.id}`, { kind, at: waitingPosition(overflow, waitingIndex, home.room.size), facing: overflow.facing ?? 0, task: sub.task ?? "" });
+          wanted.set(`visitor:${sub.id}`, { kind, at: waitingPosition(overflow, waitingIndex, home.room.size), facing: overflow.facing ?? 0, task: sub.task ?? "", walker });
       }
     }
-    if (cast.pet && state.hasPet) { const spot = spotAt(characterSpot(cast.pet, state.conditions)) ?? spotAt(cast.pet.spot); if (spot) wanted.set("pet", { kind: cast.pet.kind, at: spot.at, facing: spot.facing ?? 0, task: "" }); }
+    // Tomo and the pet: a rule's spot, a wander spot, or their own (wander.ts).
+    const mover = (key: "tomo" | "pet", who: NonNullable<typeof cast.tomo>) => {
+      const existing = this.characters.get(key);
+      const walker = walkerOf(key, home), speed = who.walk?.speed ?? WALK_SPEED_DEFAULT;
+      let stroll: WalkPlan | undefined;
+      const placing = placeCharacter(who, state.conditions, existing?.wander ?? null, now, this.random, {
+        tomo: key === "tomo", reduced: this.reducedMotion, at: existing?.spot,
+        allowed: (from, to) => this.canWander(key, walker, from, to, wanted),
+        // The stroll there, planned now: it stays once it has arrived.
+        travel: (_from, to) => {
+          const target = spots[to];
+          if (!existing || !target) return 0;
+          const here = this.pose(existing, now);
+          stroll = planMove(this.grid(walker), here.position, target.at, here.yaw, (target.facing ?? 0) * RAD, { speed, maxDuration: Infinity, fade: here.fade, bob: here.bob });
+          return stroll.duration;
+        },
+      });
+      const spot = spotAt(placing.spot) ?? spotAt(who.spot);
+      if (spot) wanted.set(key, { kind: who.kind, at: spot.at, facing: spot.facing ?? 0, task: "", walker, spot: placing.spot, by: placing.by, wander: placing.wander, speed, plan: stroll });
+    };
+    if (cast.tomo) mover("tomo", cast.tomo);
+    if (cast.pet && state.hasPet) mover("pet", cast.pet);
 
-    const now = this.now();
-    for (const [key, character] of this.characters) if (!wanted.has(key) && !character.leaving) { character.leaving = true; if (immediate) character.appear = 0; }
+    for (const [key, character] of this.characters) if (!wanted.has(key) && !character.leaving) { character.leaving = true; character.wander = null; if (immediate) character.appear = 0; }
     for (const [key, want] of wanted) {
       let character = this.characters.get(key);
       const to: Vec3 = [...want.at], yaw = want.facing * RAD;
       if (character && character.kind !== want.kind) { this.dropCharacter(character); character = undefined; }
       if (!character) {
-        character = { key, kind: want.kind, anchor: new Group(), body: null, walker: key === "pet" ? NAV_PET : NAV_WALKER, to, toYaw: yaw, plan: null, start: now,
-          appear: immediate ? 1 : 0, leaving: false, task: want.task };
+        character = { key, kind: want.kind, anchor: new Group(), body: null, walker: want.walker, to, toYaw: yaw, plan: null, start: now,
+          spot: want.spot, by: want.by, wander: want.wander ?? null, appear: immediate ? 1 : 0, leaving: false, task: want.task };
         const node = layoutKind(home, want.kind, key);
         if (node) {
           character.body = buildNodes([node], this.resources!);
@@ -245,15 +281,65 @@ export class HomeStage {
         continue;
       }
       character.leaving = false; character.task = want.task;
+      // A rule taking over a stroll goes at once, at a rule's pace, even to the same spot.
+      const hurried = want.by !== undefined && want.by !== "wander" && character.by === "wander" && character.plan !== null;
+      character.spot = want.spot; character.by = want.by; character.wander = want.wander ?? null;
       const [ox, oy, oz] = character.to;
-      if (Math.hypot(ox - to[0], oy - to[1], oz - to[2]) > 0.001 || Math.abs(character.toYaw - yaw) > 0.001) {
+      if (hurried || Math.hypot(ox - to[0], oy - to[1], oz - to[2]) > 0.001 || Math.abs(character.toYaw - yaw) > 0.001) {
         // From wherever it has got to (mid-walk, mid-hop, half faded), round the furniture; reduced motion goes straight there.
+        // A stroll goes at the character's own speed, however long it takes; anything else half as fast again, and in a few seconds at most.
         const here = this.pose(character, now);
-        const plan = immediate || this.reducedMotion ? null : planMove(this.grid(character.walker), here.position, to, here.yaw, yaw, { fade: here.fade, bob: here.bob });
+        const pace = want.by === "wander" ? { speed: want.speed, maxDuration: Infinity } : { speed: want.speed !== undefined ? want.speed * WALK_RULE_FACTOR : undefined };
+        const plan = immediate || this.reducedMotion ? null : want.plan ?? planMove(this.grid(character.walker), here.position, to, here.yaw, yaw, { ...pace, fade: here.fade, bob: here.bob });
         character.to = to; character.toYaw = yaw; character.start = now;
         character.plan = plan && plan.duration > 0 ? plan : null;
       }
     }
+    this.scheduleWander();
+  }
+
+  /**
+   * Whether `key` may wander from spot `from` to spot `to`: it can walk
+   * there (no fading in and out on a stroll), and no other character is
+   * there or heading there.
+   */
+  private canWander(key: string, walker: WalkerSize, from: string, to: string, wanted: ReadonlyMap<string, { at: Vec3 }>): boolean {
+    const spots = this.home?.spots ?? {};
+    const a = spots[from]?.at, b = spots[to]?.at;
+    if (!a || !b) return false;
+    const near = (p: Vec3) => Math.hypot(p[0] - b[0], p[1] - b[1], p[2] - b[2]) < 0.05;
+    for (const [other, want] of wanted) if (other !== key && near(want.at)) return false;
+    for (const [other, character] of this.characters) if (other !== key && !character.leaving && !wanted.has(other) && near(character.to)) return false;
+    const cacheKey = `${walker.radius}/${walker.headroom}/${from}/${to}`;
+    let ok = this.walkable.get(cacheKey);
+    if (ok === undefined) {
+      const grid = this.grid(walker);
+      ok = !!grid && findRoute(grid, a, b).ok;
+      this.walkable.set(cacheKey, ok);
+    }
+    return ok;
+  }
+
+  /** Wakes the stage when the next wander's stay is over (while paused: once it resumes). */
+  private scheduleWander(): void {
+    if (this.wanderTimer) clearTimeout(this.wanderTimer);
+    this.wanderTimer = null;
+    if (this.disposed) return;
+    let next = Infinity;
+    for (const character of this.characters.values()) if (character.wander && !character.leaving) next = Math.min(next, character.wander.leaveAt);
+    if (!Number.isFinite(next)) return;
+    this.wanderTimer = setTimeout(() => {
+      this.wanderTimer = null;
+      if (this.paused) { this.wanderDue = true; return; }
+      this.wanderNow();
+    }, Math.max(0, next - this.now()) * 1000 + 20);
+  }
+  /** The next step of every wander that is due: from where it is now, nothing missed is played back. */
+  private wanderNow(): void {
+    this.wanderDue = false;
+    if (!this.state || !this.home || !this.built || this.disposed) return;
+    this.placeCharacters(this.state, false);
+    this.invalidate();
   }
 
   /** The way round the furniture for a walker of this size, built once per scene (null if the scene defeats it: then it blinks). */
@@ -469,7 +555,7 @@ export class HomeStage {
   }
 
   pause(): void { this.paused = true; if (this.frame) cancelAnimationFrame(this.frame); this.frame = 0; this.lastTime = 0; }
-  resume(): void { if (!this.paused) return; this.paused = false; this.invalidate(); }
+  resume(): void { if (!this.paused) return; this.paused = false; if (this.wanderDue) this.wanderNow(); this.invalidate(); }
 
   /**
    * A picture of the room as it is now, as base64 PNG no larger than
@@ -502,6 +588,8 @@ export class HomeStage {
     if (this.world) this.scene.remove(this.world);
     this.characters.clear();
     this.seats = new Map();
+    if (this.wanderTimer) clearTimeout(this.wanderTimer);
+    this.wanderTimer = null; this.wanderDue = false;
     this.resources?.dispose();
     this.resources = null; this.world = null; this.built = null;
   }

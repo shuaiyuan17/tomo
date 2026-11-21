@@ -308,3 +308,12 @@ describe("walk: a hop never leaps", () => {
     }
   });
 });
+
+describe("walk: a stroll has no time limit", () => {
+  it("a rule's move is walked faster to arrive in WALK_MAX_DURATION; a stroll (maxDuration Infinity) takes as long as its speed says", () => {
+    const grid = buildNavGrid(room());
+    const from: Vec3 = [-2.5, 0, 0], to: Vec3 = [2.5, 0, 0];
+    expect(planMove(grid, from, to, 0, 0, { speed: 0.5 }).duration).toBeCloseTo(WALK_MAX_DURATION, 6);
+    expect(planMove(grid, from, to, 0, 0, { speed: 0.5, maxDuration: Infinity }).duration).toBeCloseTo(5 / 0.5, 6);
+  });
+});

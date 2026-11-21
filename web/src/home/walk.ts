@@ -87,13 +87,15 @@ export interface Carry { fade?: number; bob?: number }
 
 export interface RouteOptions {
   speed?: number;
+  /** The longest the move may take (a longer way is walked faster). Default WALK_MAX_DURATION; a wandering stroll has none. */
+  maxDuration?: number;
   /** Bounce per step (off where something hangs just above its head room). Default true. */
   bounce?: boolean;
   /** The footprints of what the start, and the target, perch on: the hop stays above their top while over them. */
   perchOff?: readonly Footprint[];
   perchOn?: readonly Footprint[];
 }
-export interface MoveOptions { speed?: number; fade?: number; bob?: number }
+export interface MoveOptions { speed?: number; maxDuration?: number; fade?: number; bob?: number }
 
 export interface WalkPose {
   /** Where it is, without the step bounce. */
@@ -198,7 +200,7 @@ export function planRoute(route: NavRoute, from: Vec3, to: Vec3, fromYaw: number
   if (length > 0) {
     let duration = length / speed;
     duration = Math.max(duration, WALK_MIN_DURATION - hopTime);
-    duration = Math.min(duration, Math.max(0.1, WALK_MAX_DURATION - hopTime));
+    duration = Math.min(duration, Math.max(0.1, (options.maxDuration ?? WALK_MAX_DURATION) - hopTime));
     const headings: number[] = [], yaws: number[] = [];
     for (let i = 0; i + 1 < ground.length; i++) {
       headings.push(heading(ground[i], ground[i + 1], i ? headings[i - 1] : yaw));
@@ -232,15 +234,15 @@ function walkYaw(walk: WalkPhase, d: number): number {
  * same place is no move (or a turn), no route is a blink, else the walk.
  */
 export function planMove(grid: NavGrid | null, from: Vec3, to: Vec3, fromYaw: number, toYaw: number, options: MoveOptions = {}): WalkPlan {
-  return withCarry(move(grid, from, to, fromYaw, toYaw, options.speed), { fade: options.fade, bob: options.bob });
+  return withCarry(move(grid, from, to, fromYaw, toYaw, options.speed, options.maxDuration), { fade: options.fade, bob: options.bob });
 }
-function move(grid: NavGrid | null, from: Vec3, to: Vec3, fromYaw: number, toYaw: number, speed?: number): WalkPlan {
+function move(grid: NavGrid | null, from: Vec3, to: Vec3, fromYaw: number, toYaw: number, speed?: number, maxDuration?: number): WalkPlan {
   if (dist3(from, to) < SAME) return Math.abs(angleLerp(fromYaw, toYaw, 1) - fromYaw) > 0.001 ? planTurn(to, fromYaw, toYaw) : planStill(to, toYaw);
   const found = grid ? findRoute(grid, from, to) : null;
   if (!grid || !found?.ok) return planBlink(from, to, fromYaw, toYaw);
   const { points } = found.route;
   return planRoute(found.route, from, to, fromYaw, toYaw, {
-    speed, bounce: !lowOverhead(grid, points, Math.max(isFloor(from) ? from[1] : 0, isFloor(to) ? to[1] : 0, 0)),
+    speed, maxDuration, bounce: !lowOverhead(grid, points, Math.max(isFloor(from) ? from[1] : 0, isFloor(to) ? to[1] : 0, 0)),
     perchOff: isFloor(from) ? [] : perchedOn(grid, from), perchOn: isFloor(to) ? [] : perchedOn(grid, to),
   });
 }

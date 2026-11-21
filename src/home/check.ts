@@ -6,7 +6,7 @@ import {
 import { centre, num, placeScene, roomBox, vec, whatOf, type Box, type Placement } from "./geometry.js";
 import { describeReaction } from "./floor-plan.js";
 import { NAV_MAX_HOP, type Hurdle } from "./nav.js";
-import { characterReach, MOVER_NAMES, SceneReach, walkerOf, type CharacterPlace, type Unreachable } from "./reach.js";
+import { characterReach, MOVER_NAMES, SceneReach, walkerOf, wanderOnly, type CharacterPlace, type Unreachable } from "./reach.js";
 
 /**
  * The whole-scene check: everything the zod schema cannot see because it
@@ -42,7 +42,7 @@ export const PET_MOODS = ["sleeping", "recovering", "blissful", "happy", "conten
 
 const PART_KEYS = ["id", "shape", "kind", "picture", "sign", "window", "background", "size", "scale", "at", "turn", "color", "on", "reactions", "parts"];
 const KNOWN_KEYS = [...PART_KEYS, "version", "name", "room", "light", "kinds", "objects", "spots", "characters", "floor", "walls", "backdrop",
-  "angle", "level", "when", "do", "amount", "speed", "facing", "tomo", "visitors", "pet", "spot", "rules", "overflow"];
+  "angle", "level", "when", "do", "amount", "speed", "facing", "tomo", "visitors", "pet", "spot", "rules", "overflow", "walk", "wander", "radius", "every"];
 /** Rough width of the text a `{value}` turns into, in characters. */
 /** The smallest a sign's text is drawn, as a share of the panel's height, before it is cut with an ellipsis. */
 export const SIGN_MIN_TEXT_HEIGHT = 0.3;
@@ -193,6 +193,11 @@ function describeIssue(issue: core.$ZodIssue, root: unknown): string {
         const n = Array.isArray(value) ? value.length : 0;
         if (field === "size" || field === "at" || field === "turn") return `${place} must be exactly three numbers [x, y, z]; it has ${n}.`;
         if (field === "reactions") return `${place} has ${n} reactions; the most is ${MAX_REACTIONS}. Split them over parts.`;
+        if (field === "every") return `${place} must be two numbers [shortest, longest], the seconds it stays at each spot, like [30, 90]; it has ${n}.`;
+        if (field === "spots" && parent === "wander") {
+          return big ? `${place} has ${n} entries; the most is ${String(limit)}. Keep the spots it strolls between to a few.`
+            : `${place} has ${n} ${n === 1 ? "entry" : "entries"}; the least is ${String(limit)}. With one spot there is nowhere to walk to: add another, or remove wander.`;
+        }
         return `${place} has ${n} entries; the ${big ? "most" : "least"} is ${String(limit)}.`;
       }
       if (issue.origin === "string") {
@@ -204,6 +209,9 @@ function describeIssue(issue: core.$ZodIssue, root: unknown): string {
     case "invalid_union":
       if (field === "when") return `${place}: ${shown(value)} should be a condition, or a list of one to four conditions; a condition is ${formatHint("when", undefined)}.`;
       return `${place}: ${shown(value)} is not in a shape the format accepts.`;
+    case "custom":
+      if (field === "every" && Array.isArray(value)) return `${place}: ${shown(value)} has the shortest stay after the longest; write it as [shortest, longest] in seconds, like [${num(Math.min(...value as number[]))}, ${num(Math.max(...value as number[]))}].`;
+      return `${place}: ${issue.message}.`;
     default:
       return `${place}: ${issue.message}.`;
   }
@@ -412,18 +420,34 @@ function checkCharacters(scene: HomeScene, usedKinds: Set<string>, report: Repor
   const needSpot = (place: string, name: string) => {
     if (!spots[name]) report.problem(`${place}: spot ${JSON.stringify(name)} is not defined${didYouMean(name, spotNames)}; add it under spots, or use one of ${spotNames.length ? spotNames.join(", ") : "(none defined)"}.`);
   };
-  /** A rule's spot must exist, and a `pet:` mood it names must be one the pet can have. */
-  const checkRule = (place: string, rule: { when: string | string[]; spot: string }) => {
-    needSpot(`${place}.spot`, rule.spot);
-    for (const condition of Array.isArray(rule.when) ? rule.when : [rule.when]) {
+  /** A `pet:` mood a condition names must be one the pet can have. */
+  const checkMoods = (place: string, when: string | string[]) => {
+    for (const condition of Array.isArray(when) ? when : [when]) {
       const mood = /^(?:not:)?pet:(.+)$/.exec(condition)?.[1];
       if (mood && !(PET_MOODS as readonly string[]).includes(mood)) report.warn(`${place}: pet:${mood} can never hold; the pet's moods are ${PET_MOODS.join(", ")}.`);
     }
+  };
+  /** A rule's spot must exist, and its moods be real. */
+  const checkRule = (place: string, rule: { when: string | string[]; spot: string }) => {
+    needSpot(`${place}.spot`, rule.spot);
+    checkMoods(place, rule.when);
+  };
+  /** Every wander spot must exist, each listed once; its `when` must be able to hold (Tomo wanders only while idle). */
+  const checkWander = (place: string, wander: NonNullable<NonNullable<typeof characters.tomo>["wander"]>, tomo: boolean) => {
+    wander.spots.forEach((spot, i) => {
+      needSpot(`${place}.spots[${i}]`, spot);
+      if (wander.spots.indexOf(spot) !== i) report.warn(`${place}.spots[${i}]: ${JSON.stringify(spot)} is listed twice; list each spot once.`);
+    });
+    if (wander.when === undefined) return;
+    checkMoods(`${place}.when`, wander.when);
+    const never = (Array.isArray(wander.when) ? wander.when : [wander.when]).find((c) => c === "working" || c === "not:idle" || /^by:/.test(c));
+    if (tomo && never) report.warn(`${place}.when: ${JSON.stringify(never)} never holds while you are idle, and you only wander while idle, so you never wander; remove it from when.`);
   };
   if (characters.tomo) {
     needKind("characters.tomo.kind", characters.tomo.kind);
     needSpot("characters.tomo.spot", characters.tomo.spot);
     (characters.tomo.rules ?? []).forEach((rule, i) => checkRule(`characters.tomo.rules[${i}]`, rule));
+    if (characters.tomo.wander) checkWander("characters.tomo.wander", characters.tomo.wander, true);
   }
   if (characters.visitors) {
     const visitors = characters.visitors;
@@ -439,6 +463,7 @@ function checkCharacters(scene: HomeScene, usedKinds: Set<string>, report: Repor
     needKind("characters.pet.kind", characters.pet.kind);
     needSpot("characters.pet.spot", characters.pet.spot);
     (characters.pet.rules ?? []).forEach((rule, i) => checkRule(`characters.pet.rules[${i}]`, rule));
+    if (characters.pet.wander) checkWander("characters.pet.wander", characters.pet.wander, false);
   }
 }
 
@@ -497,26 +522,31 @@ function checkPlacement(scene: HomeScene, report: Report): void {
 }
 
 /**
- * Spots a character cannot walk to from its default spot (the visitors: from
- * their overflow spot), at its own size. Only warnings: the page fades it
- * out and back in there instead.
+ * Places a character cannot walk between, at its own size (reach.ts: every
+ * pair of its places). Only warnings: the page fades it out and back in
+ * there instead, or, for a place it only wanders to, does not wander there.
  */
 function checkReach(scene: HomeScene, report: Report): void {
   const reach = new SceneReach(scene);
   const room = scene.room.size;
   const extent = `x from ${num(-room[0] / 2)} to ${num(room[0] / 2)}, z from ${num(-room[2] / 2)} to ${num(room[2] / 2)}`;
-  const say = (found: Unreachable, noun: string, radius: number, queue: boolean, stuck: boolean) =>
-    `${whyNot(found, scene, reach.placement, noun, extent)} ${stuck ? "Every move to or from there fades out and back in instead" : "It fades out and back in instead"} (it still gets there). ${howToFix(found, radius, reach.placement, queue)}`;
+  const say = (found: Unreachable, at: CharacterPlace, radius: number, stuck: boolean, many: boolean) => {
+    const noun = at.queue ? "the place" : "the spot";
+    const instead = wanderOnly(at)
+      ? (stuck ? "So it never wanders there." : `So it does not wander there from ${many ? "those places" : "there"}.`)
+      : `${stuck ? "Every move to or from there fades out and back in instead" : "It fades out and back in instead"} (it still gets there).`;
+    return `${whyNot(found, scene, reach.placement, noun, extent)} ${instead} ${howToFix(found, radius, reach.placement, !!at.queue)}`;
+  };
   for (const { who, stuck, cut } of characterReach(reach, scene)) {
-    const radius = walkerOf(who).radius;
+    const radius = walkerOf(who, scene).radius;
     for (const { at, found } of stuck) {
-      report.warn(`${at.place}: ${MOVER_NAMES[who]} cannot walk to or from ${placeWords(at)}: ${say(found, at.queue ? "the place" : "the spot", radius, !!at.queue, true)}`);
+      report.warn(`${at.place}: ${MOVER_NAMES[who]} cannot walk to or from ${placeWords(at)}: ${say(found, at, radius, true, false)}`);
     }
     for (const { to, from, found } of cut) {
       const list = from.slice(0, 4).map(placeWords);
       const more = from.length > 4 ? ` or ${from.length - 4} more places` : "";
       const froms = list.length > 1 && !more ? `${list.slice(0, -1).join(", ")} or ${list.at(-1)}` : `${list.join(", ")}${more}`;
-      report.warn(`${to.place}: ${MOVER_NAMES[who]} cannot walk to ${placeWords(to)} from ${froms}: ${say(found, to.queue ? "the place" : "the spot", radius, !!to.queue, false)}`);
+      report.warn(`${to.place}: ${MOVER_NAMES[who]} cannot walk to ${placeWords(to)} from ${froms}: ${say(found, to, radius, false, from.length > 1)}`);
     }
   }
 }

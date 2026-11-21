@@ -125,6 +125,14 @@ describe("wander: the dice and the clock are the caller's", () => {
     }
     expect([...seen].sort()).toEqual(["bookshelf", "cushion", "pool-side"]);
   });
+
+  it("the first placement keeps to the same rules as every step: not even its own spot when someone else is there", () => {
+    const taken = new Set(["cushion", "window"]);
+    for (let seed = 0; seed < 100; seed++) {
+      const state = startWander(WANDER, "cushion", 0, seeded(seed), { first: true, allowed: (_from, to) => !taken.has(to) });
+      expect(["pool-side", "bookshelf"]).toContain(state.spot);
+    }
+  });
 });
 
 describe("wander: rules come first, and only some times", () => {

@@ -75,11 +75,13 @@ export function wanders(character: Wanderer, conditions: Conditions, options: { 
 /**
  * A wander starting now from `at`. `first` (the page has just opened): it
  * is put straight at one of its wander spots it can get to from `at` (or
- * `at`, if none), with no walk. Either way it then stays there once.
+ * `at`, if none), with no walk; `allowed(at, at)` says whether `at` itself
+ * is free. Either way it then stays there once.
  */
 export function startWander(wander: HomeWander, at: string, now: number, random: Random, options: { first?: boolean; allowed?: Allowed } = {}): WanderState {
   const allowed = options.allowed ?? (() => true);
-  const spot = options.first ? pickNext(wander.spots, undefined, random, (to) => to === at || allowed(at, to)) ?? at : at;
+  // Its own spot too only if allowed (someone else may be standing there); none allowed: its own spot, as without wander.
+  const spot = options.first ? pickNext(wander.spots, undefined, random, (to) => allowed(at, to)) ?? at : at;
   return { spot, leaveAt: now + stayFor(wander.every, random) };
 }
 
@@ -106,14 +108,16 @@ export interface Placing {
  * Where a character goes now. The first rule that holds wins (and drops the
  * wander: it goes there at once); otherwise it wanders if it may, else it
  * stands at its own spot. `at` is the spot it is at or heading to now
- * (undefined: it is new on the page, so `first`).
+ * (undefined: it is new on the page, so `first`). `hold`: a wander under
+ * way stays as it is (rules still win).
  */
 export function placeCharacter(character: Wanderer, conditions: Conditions, previous: WanderState | null, now: number, random: Random,
-  options: { tomo: boolean; reduced: boolean; at?: string; allowed?: Allowed; travel?: Travel }): Placing {
+  options: { tomo: boolean; reduced: boolean; at?: string; allowed?: Allowed; travel?: Travel; hold?: boolean }): Placing {
   const rule = character.rules?.find((r) => holds(r.when, conditions));
   if (rule) return { spot: rule.spot, by: "rule", wander: null };
   if (!character.wander || !wanders(character, conditions, options)) return { spot: character.spot, by: "spot", wander: null };
   const state = previous ?? startWander(character.wander, options.at ?? character.spot, now, random, { first: options.at === undefined, allowed: options.allowed });
-  const next = stepWander(state, character.wander, now, random, { allowed: options.allowed, travel: options.travel });
+  // `hold` (the page is hidden): a wander under way does not move on, however late it is.
+  const next = options.hold && previous ? previous : stepWander(state, character.wander, now, random, { allowed: options.allowed, travel: options.travel });
   return { spot: next.spot, by: "wander", wander: next };
 }

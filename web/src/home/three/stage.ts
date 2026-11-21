@@ -92,9 +92,8 @@ export class HomeStage {
   private seats = new Map<string, number>();
   /** Whether a walker can walk from one spot to another, per scene (for picking where to wander). */
   private walkable = new Map<string, boolean>();
-  /** Wakes the stage when a wander's stay is over; `wanderDue` if that happened while paused. */
+  /** Wakes the stage when a wander's stay is over (none while paused). */
   private wanderTimer: ReturnType<typeof setTimeout> | null = null;
-  private wanderDue = false;
   /** Where the next wander goes (wander.ts takes its dice from the caller). */
   random: Random = Math.random;
   private state: StageState | null = null;
@@ -244,7 +243,7 @@ export class HomeStage {
       const walker = walkerOf(key, home), speed = who.walk?.speed ?? WALK_SPEED_DEFAULT;
       let stroll: WalkPlan | undefined;
       const placing = placeCharacter(who, state.conditions, existing?.wander ?? null, now, this.random, {
-        tomo: key === "tomo", reduced: this.reducedMotion, at: existing?.spot,
+        tomo: key === "tomo", reduced: this.reducedMotion, at: existing?.spot, hold: this.paused,
         allowed: (from, to) => this.canWander(key, walker, from, to, wanted),
         // The stroll there, planned now: it stays once it has arrived.
         travel: (_from, to) => {
@@ -310,6 +309,7 @@ export class HomeStage {
     const near = (p: Vec3) => Math.hypot(p[0] - b[0], p[1] - b[1], p[2] - b[2]) < 0.05;
     for (const [other, want] of wanted) if (other !== key && near(want.at)) return false;
     for (const [other, character] of this.characters) if (other !== key && !character.leaving && !wanted.has(other) && near(character.to)) return false;
+    if (from === to) return true;
     const cacheKey = `${walker.radius}/${walker.headroom}/${from}/${to}`;
     let ok = this.walkable.get(cacheKey);
     if (ok === undefined) {
@@ -320,24 +320,19 @@ export class HomeStage {
     return ok;
   }
 
-  /** Wakes the stage when the next wander's stay is over (while paused: once it resumes). */
+  /** Wakes the stage when the next wander's stay is over. Not while paused: resume takes the step that is due. */
   private scheduleWander(): void {
     if (this.wanderTimer) clearTimeout(this.wanderTimer);
     this.wanderTimer = null;
-    if (this.disposed) return;
+    if (this.disposed || this.paused) return;
     let next = Infinity;
     for (const character of this.characters.values()) if (character.wander && !character.leaving) next = Math.min(next, character.wander.leaveAt);
     if (!Number.isFinite(next)) return;
-    this.wanderTimer = setTimeout(() => {
-      this.wanderTimer = null;
-      if (this.paused) { this.wanderDue = true; return; }
-      this.wanderNow();
-    }, Math.max(0, next - this.now()) * 1000 + 20);
+    this.wanderTimer = setTimeout(() => { this.wanderTimer = null; this.wanderNow(); }, Math.max(0, next - this.now()) * 1000 + 20);
   }
   /** The next step of every wander that is due: from where it is now, nothing missed is played back. */
   private wanderNow(): void {
-    this.wanderDue = false;
-    if (!this.state || !this.home || !this.built || this.disposed) return;
+    if (this.paused || !this.state || !this.home || !this.built || this.disposed) return;
     this.placeCharacters(this.state, false);
     this.invalidate();
   }
@@ -554,8 +549,13 @@ export class HomeStage {
     if (busy || moving || gliding) this.invalidate(); else this.lastTime = 0;
   }
 
-  pause(): void { this.paused = true; if (this.frame) cancelAnimationFrame(this.frame); this.frame = 0; this.lastTime = 0; }
-  resume(): void { if (!this.paused) return; this.paused = false; if (this.wanderDue) this.wanderNow(); this.invalidate(); }
+  pause(): void {
+    this.paused = true; if (this.frame) cancelAnimationFrame(this.frame); this.frame = 0; this.lastTime = 0;
+    // Wandering stands still while the page is hidden (placeCharacters holds it too).
+    if (this.wanderTimer) clearTimeout(this.wanderTimer);
+    this.wanderTimer = null;
+  }
+  resume(): void { if (!this.paused) return; this.paused = false; this.wanderNow(); this.invalidate(); }
 
   /**
    * A picture of the room as it is now, as base64 PNG no larger than
@@ -589,7 +589,7 @@ export class HomeStage {
     this.characters.clear();
     this.seats = new Map();
     if (this.wanderTimer) clearTimeout(this.wanderTimer);
-    this.wanderTimer = null; this.wanderDue = false;
+    this.wanderTimer = null;
     this.resources?.dispose();
     this.resources = null; this.world = null; this.built = null;
   }

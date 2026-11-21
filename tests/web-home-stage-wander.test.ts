@@ -126,6 +126,22 @@ describe("the stage wanders", () => {
     expect(tomo().spot).toBe("cushion");
   });
 
+  it("paused, status updates and the clock do not move the wander on; back on the page it takes one step", async () => {
+    const { made, tomo, wait } = await stage();
+    const before = { spot: tomo().spot, wander: { ...tomo().wander! } };
+    made.pause();
+    wait(tomo().wander!.leaveAt - clock + 500);
+    // A status update arrives while the tab is hidden.
+    made.setState(state(["idle", "day"]));
+    expect(tomo().spot).toBe(before.spot);
+    expect(tomo().wander).toEqual(before.wander);
+    made.setState(state(["idle", "day"]));
+    expect(tomo().wander).toEqual(before.wander);
+    made.resume();
+    expect(tomo().spot).not.toBe(before.spot);
+    expect(tomo().wander!.leaveAt - clock).toBeGreaterThanOrEqual(30);
+  });
+
   it("paused (the tab hidden), a due wander waits for the page to come back, and then takes one step", async () => {
     const { made, tomo, wait } = await stage();
     const before = tomo().spot;

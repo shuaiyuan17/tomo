@@ -54,6 +54,7 @@ export const NAV_WALKER: WalkerSize = { radius: NAV_RADIUS, headroom: NAV_HEADRO
  * crab smaller): it walks under a desk or a stool's seat, and through a
  * 0.4 m door under a 0.4 m lintel, such as the starter cat hut's.
  */
+// Known limitation: smaller than the cat itself (half-width 0.17 m, ears 0.42 m), so it fits the hut door; its ears clip the 0.4 m lintel.
 export const NAV_PET: WalkerSize = { radius: 0.1, headroom: 0.35 };
 /** The longest hop (horizontal) between a perch and the floor. */
 export const NAV_MAX_HOP = 1.2;
@@ -89,7 +90,7 @@ export interface NavGrid {
   region: Int32Array;
   /** Cells in each region. */
   regionSizes: number[];
-  /** Every obstacle (what navObstacles finds), with its top: what a hop may not cross. */
+  /** Every solid part above NAV_STEP, overhead or not (head room is for walking), with its top: what a hop may not cross. */
   hurdles: Hurdle[];
   /** The room's width and depth, centred on the origin. */
   room: FloorPoint;
@@ -163,7 +164,8 @@ export function buildNavGrid(scene: HomeScene, options: NavOptions = {}): NavGri
       if (x0(c) < origin[0] + radius - EPS || x0(c + 1) > w / 2 - radius + EPS || z0(r) < origin[1] + radius - EPS || z0(r + 1) > d / 2 - radius + EPS) blocked[r * cols + c] = 1;
     }
   }
-  const found = obstacles(options.placement ?? placeScene(scene), headroom);
+  const placement = options.placement ?? placeScene(scene);
+  const found = obstacles(placement, headroom);
   for (const { min, max } of found) {
     const c0 = Math.max(0, Math.floor((min[0] - radius - origin[0]) / cell));
     const c1 = Math.min(cols - 1, Math.floor((max[0] + radius - origin[0]) / cell));
@@ -200,7 +202,7 @@ export function buildNavGrid(scene: HomeScene, options: NavOptions = {}): NavGri
     }
     regionSizes.push(size);
   }
-  return { cell, radius, headroom, cols, rows, origin, blocked, region, regionSizes, hurdles: found, room: [w, d] };
+  return { cell, radius, headroom, cols, rows, origin, blocked, region, regionSizes, hurdles: obstacles(placement, Infinity), room: [w, d] };
 }
 
 /** The cell under a floor point, or -1 outside the grid. */

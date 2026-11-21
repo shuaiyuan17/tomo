@@ -247,6 +247,20 @@ describe("home navigation: routes", () => {
     expect(findRoute(grid, [0, 0, -1], [0, 0.45, 0.4])).toMatchObject({ ok: false, reason: "unreachable" });
   });
 
+  it("does not hop through something a pet walks under", () => {
+    // A seat against the open front, walled on both sides; the only way to it
+    // is from the room side, under a slab from 0.4 m up that reaches over the
+    // seat's front edge. The pet walks under the slab, but cannot hop through it.
+    const scene = room([
+      block(-0.2, 0.2, 2.6, 3, 0.45),
+      block(-0.4, -0.25, 2.3, 3), block(0.25, 0.4, 2.3, 3),
+      { shape: "box", size: [6, 0.1, 1.1], at: [0, 0.4, 2.1] },
+    ]);
+    const grid = buildNavGrid(scene, { walker: NAV_PET });
+    expect(onFloor(grid, [0, 0, 2.4])).toBe(true);
+    expect(findRoute(grid, [0, 0, 0], [0, 0.45, 2.8])).toMatchObject({ ok: false, reason: "unreachable" });
+  });
+
   it("does not hop out of the room to a perch beyond its walls or open front", () => {
     const grid = buildNavGrid(room());
     expect(findRoute(grid, [0, 0, 0], [0, 0.5, 3.3])).toMatchObject({ ok: false, reason: "unreachable" });

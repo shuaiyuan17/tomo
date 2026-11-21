@@ -74,11 +74,19 @@ export const REWIND_SUSPEND_TIMEOUT_MS = 10_000;
 export const IDLE_REAP_SWEEP_MS = 60_000;
 
 /**
- * Upper bound on how long a message for a reaped key waits for the old CLI
- * child to exit before resuming. The SDK's own cleanup already bounds the
- * exit wait (about 2s); this is the belt to that.
+ * How long the SDK can take to get rid of a closed CLI child: it ends stdin,
+ * waits ~2s, sends SIGTERM, and SIGKILLs ~5s after that (ProcessTransport's
+ * close() in @anthropic-ai/claude-agent-sdk). A child can be alive, and
+ * writing its transcript, for about this long after close().
  */
-export const IDLE_REAP_CLOSE_WAIT_MS = 5_000;
+export const SDK_CLI_KILL_MS = 7_000;
+
+/**
+ * Upper bound on how long a message (or a /rewind) for a reaped key waits for
+ * the old CLI child to exit before resuming. Above SDK_CLI_KILL_MS, so it
+ * only gives up on a child the SDK's own SIGKILL did not end.
+ */
+export const IDLE_REAP_CLOSE_WAIT_MS = 10_000;
 
 /** Resolves true if `promise` settled within `ms`, false on timeout. Never rejects. */
 async function withTimeout(promise: Promise<unknown>, ms: number): Promise<boolean> {
@@ -590,7 +598,8 @@ export class LiveSessionManager {
    * bounded, for the session's SDK event loop to end so nothing more is
    * handled or delivered from it. The CLI child can still be appending its
    * exit-time records after that — the caller waits for the transcript itself
-   * to go quiet.
+   * to go quiet. A session the idle reaper already closed is waited for here
+   * (its child's exit, bounded) before returning.
    *
    * `release()` MUST be called (finally) — held turns are waiting on it.
    */
@@ -624,6 +633,12 @@ export class LiveSessionManager {
       if (creating && !await withTimeout(creating, timeoutMs)) {
         log.warn({ key, timeoutMs }, "Rewind: a session still being built did not finish in time; continuing");
       }
+      // The idle reaper closed this key's session and its CLI child may still
+      // be exiting, appending to the very transcript the rewind is about to
+      // snapshot and fork: wait for it first (bounded by
+      // IDLE_REAP_CLOSE_WAIT_MS). Only reapClosings: the key's other wait,
+      // sessionHolds, is this rewind's own hold.
+      for (let closing = this.reapClosings.get(key); closing; closing = this.reapClosings.get(key)) await closing;
       const session = this.liveSessions.get(key);
       let stoppedTurn = dispatched.length > 0;
       let droppedMessages = 0;

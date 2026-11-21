@@ -169,7 +169,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 const { config: mockConfig } = await import("../src/config.js") as unknown as { config: { liveSessionIdleTimeoutMs: number } };
-const { LiveSessionManager, IDLE_REAP_SWEEP_MS, IDLE_REAP_CLOSE_WAIT_MS, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED, PROMPT_RETIRE_BACKGROUND_WAIT_MS, PROMPT_RETIRE_REPORT_WAIT_MS } = await import("../src/agent/live-session-manager.js");
+const { LiveSessionManager, IDLE_REAP_SWEEP_MS, IDLE_REAP_CLOSE_WAIT_MS, SDK_CLI_KILL_MS, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED, PROMPT_RETIRE_BACKGROUND_WAIT_MS, PROMPT_RETIRE_REPORT_WAIT_MS } = await import("../src/agent/live-session-manager.js");
 const { log } = await import("../src/logger.js");
 const { SdkResultError } = await import("../src/agent/live-session.js");
 type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
@@ -1064,8 +1064,9 @@ describe("LiveSessionManager idle reaper", () => {
     let resumed = false;
     const next = manager.getOrCreateLiveSession(key).then((s) => { resumed = true; return s; });
     await flushMicrotasks(); // parked on the reap close
-    const { release } = await manager.suspendForRewind(key);
+    const suspending = manager.suspendForRewind(key); // takes the hold now, then waits on the same close
     exited();
+    const { release } = await suspending;
     await new Promise((r) => setTimeout(r, 10));
     // Woken by the close, it must see the rewind's hold: nothing built on the pre-rewind conversation.
     expect(resumed).toBe(false);
@@ -1073,6 +1074,39 @@ describe("LiveSessionManager idle reaper", () => {
     release();
     expect(await next).not.toBe(fake);
     expect(mockState.instances).toHaveLength(2);
+  });
+
+  it("waits out a child that takes until the SDK's SIGKILL to exit", async () => {
+    vi.useFakeTimers();
+    try {
+      // close → ~2s grace → SIGTERM → 5s → SIGKILL: a child can take ~7s.
+      mockState.closeGate = new Promise<void>((r) => { setTimeout(r, SDK_CLI_KILL_MS + 500); });
+      const { manager, fake, key } = await idleSession();
+      expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+      let resumed = false;
+      const next = manager.getOrCreateLiveSession(key).then((s) => { resumed = true; return s; });
+      await vi.advanceTimersByTimeAsync(SDK_CLI_KILL_MS + 400);
+      expect(resumed).toBe(false);
+      expect(mockState.instances).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await next).not.toBe(fake);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a rewind of a reaped key waits for its CLI to exit before snapshotting", async () => {
+    let exited!: () => void;
+    mockState.closeGate = new Promise<void>((r) => { exited = r; });
+    const { manager, fake, key } = await idleSession();
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+    let suspended = false;
+    const suspend = manager.suspendForRewind(key).then((r) => { suspended = true; return r; });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(suspended).toBe(false); // the old CLI may still be writing the transcript being forked
+    exited();
+    (await suspend).release();
+    expect(suspended).toBe(true);
   });
 
   it("gives up waiting on a reaped session that never finishes exiting", async () => {

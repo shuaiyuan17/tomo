@@ -246,9 +246,9 @@ export class HomeStage {
       character.leaving = false; character.task = want.task;
       const [ox, oy, oz] = character.to;
       if (Math.hypot(ox - to[0], oy - to[1], oz - to[2]) > 0.001 || Math.abs(character.toYaw - yaw) > 0.001) {
-        // From wherever it has got to (mid-walk, mid-hop), round the furniture; reduced motion goes straight there.
+        // From wherever it has got to (mid-walk, mid-hop, half faded), round the furniture; reduced motion goes straight there.
         const here = this.pose(character, now);
-        const plan = immediate || this.reducedMotion ? null : planMove(this.grid(character.walker), here.position, to, here.yaw, yaw);
+        const plan = immediate || this.reducedMotion ? null : planMove(this.grid(character.walker), here.position, to, here.yaw, yaw, { fade: here.fade, bob: here.bob });
         character.to = to; character.toYaw = yaw; character.start = now;
         character.plan = plan && plan.duration > 0 ? plan : null;
       }

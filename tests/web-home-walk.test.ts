@@ -4,7 +4,7 @@ import { buildNavGrid, findRoute, NAV_HOP_ARC, NAV_PET, NAV_RADIUS, type FloorPo
 import type { HomePart, HomeScene } from "../src/home/scene.js";
 import { STARTER_SCENE } from "../src/home/starter.js";
 import {
-  ARRIVE_TURN, BLINK_TIME, HOP_MAX_DURATION, planMove, planRoute, poseAt, STEP_HEIGHT, WALK_MAX_DURATION, WALK_MIN_DURATION, WALK_SPEED,
+  ARRIVE_TURN, BLINK_TIME, HOP_MAX_DURATION, planBlink, planMove, planRoute, poseAt, STEP_HEIGHT, WALK_MAX_DURATION, WALK_MIN_DURATION, WALK_SPEED,
   type WalkPlan,
 } from "../web/src/home/walk.js";
 
@@ -219,5 +219,56 @@ describe("walk: round the furniture", () => {
     const plan = planMove(grid, spots["pet-bed"].at, spots["pet-nest"].at, 0, 0);
     expect(plan.kind).toBe("walk");
     expect(plan.hopsOn).toBe(false);
+  });
+});
+
+describe("walk: what the animation adds stays inside what nav.ts checked", () => {
+  it("does not bounce its head into something just above the head room it walks under", () => {
+    // A slab from 0.93 m: above NAV_WALKER's 0.9 m head room (so walked under), below it plus a step bounce.
+    const slab: HomePart = { shape: "box", size: [2, 0.05, 2], at: [0, 0.93, 0] };
+    const grid = buildNavGrid(room([slab]));
+    const plan = planMove(grid, [-2, 0, 0], [2, 0, 0], 0, 0);
+    expect(plan.kind).toBe("walk");
+    for (const s of samples(plan)) expect(s.position[1] + s.bob).toBeLessThanOrEqual(1e-9);
+    // In the open it still bounces.
+    expect(Math.max(...samples(planMove(buildNavGrid(room()), [-2, 0, 0], [2, 0, 0], 0, 0)).map((s) => s.bob))).toBeGreaterThan(0);
+  });
+  it("hops onto a wide perch over its top, not through its side, and off it the same way", () => {
+    // A 1.6 m square block 0.8 m high, the perch in its middle: the hop crosses 0.8 m of the block's footprint.
+    const box = { x0: -0.8, x1: 0.8, z0: -0.8, z1: 0.8 }, top = 0.8;
+    const grid = buildNavGrid(room([block(box.x0, box.x1, box.z0, box.z1, top)]));
+    const perch: Vec3 = [0, top, 0];
+    const inside = ([x, , z]: Vec3) => x > box.x0 && x < box.x1 && z > box.z0 && z < box.z1;
+    for (const plan of [planMove(grid, [-2.5, 0, 0], perch, 0, 0), planMove(grid, perch, [-2.5, 0, 0], 0, 0)]) {
+      expect(plan.kind).toBe("walk");
+      const over = samples(plan).filter((s) => inside(s.position));
+      expect(over.length).toBeGreaterThan(0);
+      for (const s of over) expect(s.position[1]).toBeGreaterThanOrEqual(top - 1e-9);
+      expect(maxHeight(plan)).toBeCloseTo(top + NAV_HOP_ARC, 4);
+    }
+  });
+});
+
+describe("walk: a new target mid-move", () => {
+  it("carries on from how faded it was, instead of snapping back to full size", () => {
+    const old = planBlink([0, 0, 0], [2, 0, 0], 0, 0);
+    const here = poseAt(old, BLINK_TIME * 0.5);
+    expect(here.fade).toBeLessThan(0.9);
+    for (const next of [planMove(null, here.position, [-2, 0, 0], here.yaw, 0, { fade: here.fade, bob: here.bob }), planMove(buildNavGrid(room()), here.position, [-2, 0, 0], here.yaw, 0, { fade: here.fade }), planMove(null, here.position, here.position, here.yaw, here.yaw, { fade: here.fade })]) {
+      expect(poseAt(next, 0).fade).toBeCloseTo(here.fade, 9);
+      const all = samples(next);
+      for (let i = 1; i < all.length; i++) expect(Math.abs(all[i].fade - all[i - 1].fade)).toBeLessThan(0.02);
+      expect(all.at(-1)!.fade).toBe(1);
+    }
+  });
+  it("carries on from mid-step, instead of dropping to the floor", () => {
+    const old = planRoute(route([[-2, 0], [2, 0]]), [-2, 0, 0], [2, 0, 0], 0, 0);
+    const t = samples(old).reduce((a, s) => (s.bob > a.bob ? s : a)).t;
+    const here = poseAt(old, t);
+    expect(here.bob).toBeGreaterThan(STEP_HEIGHT * 0.9);
+    const next = planMove(buildNavGrid(room()), here.position, [-2, 0, -2], here.yaw, 0, { fade: here.fade, bob: here.bob });
+    expect(poseAt(next, 0).bob).toBeCloseTo(here.bob, 9);
+    const all = samples(next);
+    for (let i = 1; i < all.length; i++) expect(Math.abs(all[i].bob - all[i - 1].bob)).toBeLessThan(0.005);
   });
 });

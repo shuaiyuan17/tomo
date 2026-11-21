@@ -32,6 +32,15 @@ export function scrubKnownSecrets(text: string): string {
   return out;
 }
 
+/** How deep scrubDeep and withholdDeep walk. Past it they fail closed: a
+ *  subtree they did not walk is replaced by TOO_DEEP_OUTPUT (scrubDeep) or the
+ *  withheld notice, clean or not. No search of a serialised copy instead: JSON
+ *  escapes quotes and backslashes, so a value holding them would not match.
+ *  Real tool output is not nested this deep. */
+const MAX_WALK_DEPTH = 32;
+
+export const TOO_DEEP_OUTPUT = "[output withheld: nested too deeply for Tomo's credential redaction to check]";
+
 /**
  * `value` with every string leaf scrubbed and its shape untouched, or the same
  * reference when nothing changed. The CLI checks a PostToolUse rewrite against
@@ -41,14 +50,24 @@ export function scrubKnownSecrets(text: string): string {
 export function scrubDeep<T>(value: T, depth = 0): T {
   if (secrets.size === 0) return value;
   if (typeof value === "string") return scrubKnownSecrets(value) as unknown as T;
-  if (depth > 32 || value === null || typeof value !== "object") return value;
+  if (value === null || typeof value !== "object") return value;
+  if (depth > MAX_WALK_DEPTH) return TOO_DEEP_OUTPUT as unknown as T;
   if (Array.isArray(value)) {
     const next = value.map((item) => scrubDeep(item, depth + 1));
     return next.some((item, i) => item !== value[i]) ? (next as unknown as T) : value;
   }
+  // Keys too: a known value can be a key (an env map, a JSON object keyed by token).
   const entries = Object.entries(value as Record<string, unknown>);
-  const next = entries.map(([key, item]) => [key, scrubDeep(item, depth + 1)] as const);
-  return next.some(([, item], i) => item !== entries[i][1]) ? (Object.fromEntries(next) as T) : value;
+  const next = entries.map(([key, item]) => [scrubKnownSecrets(key), scrubDeep(item, depth + 1)] as const);
+  if (!next.some(([key, item], i) => key !== entries[i][0] || item !== entries[i][1])) return value;
+  // Two keys can scrub to the same text; keep both rather than drop one.
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of next) {
+    let name = key;
+    for (let n = 2; Object.hasOwn(out, name); n++) name = `${key} #${n}`;
+    out[name] = item;
+  }
+  return out as T;
 }
 
 /**
@@ -56,8 +75,7 @@ export function scrubDeep<T>(value: T, depth = 0): T {
  * learns them from the keychain (`CredentialBroker.primeRedaction`); until that
  * has succeeded it does not, and a value printed meanwhile would pass the
  * literal match. While not ready, `ensureRedactionReady` retries the load (with
- * backoff) and the PostToolUse hook withholds output that went near the
- * keychain (`withholdDeep`).
+ * backoff) and the PostToolUse hook withholds every tool output (`withholdDeep`).
  */
 interface Readiness { retry: (() => Promise<boolean>) | null; nextAt: number; backoffMs: number; inFlight?: Promise<boolean> }
 const MIN_BACKOFF_MS = 5_000;
@@ -98,13 +116,69 @@ export async function ensureRedactionReady(now = Date.now()): Promise<boolean> {
   return r.inFlight;
 }
 
-export const WITHHELD_OUTPUT = "[withheld: Tomo's credential redaction is not ready, so output of a command that reads the keychain is not shown]";
+export const WITHHELD_OUTPUT = "[output withheld: Tomo's credential redaction is not ready, so tool output is hidden until it is]";
 
-/** `value` with every string leaf replaced, its shape kept (see scrubDeep). */
+/**
+ * `value` with every string leaf replaced, its shape kept (see scrubDeep).
+ * Never throws: a field that cannot be read becomes the notice, and a node that
+ * cannot be walked at all becomes the notice in its place. This is the
+ * fail-closed path, so it must not fail itself.
+ */
 export function withholdDeep<T>(value: T, depth = 0): T {
   if (typeof value === "string") return (value ? WITHHELD_OUTPUT : value) as unknown as T;
-  if (depth > 32 || value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map((item) => withholdDeep(item, depth + 1)) as unknown as T;
-  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, withholdDeep(v, depth + 1)])) as T;
+  // A value can be a number (a PIN, an account number); the type is kept for the schema.
+  if (typeof value === "number") return 0 as unknown as T;
+  if (typeof value === "bigint") return 0n as unknown as T;
+  if (value === null || typeof value !== "object") return value;
+  // Past the limit the subtree is not walked, so it is not passed on either.
+  if (depth > MAX_WALK_DEPTH) return WITHHELD_OUTPUT as unknown as T;
+  try {
+    if (Array.isArray(value)) {
+      const out: unknown[] = [];
+      for (let i = 0; i < value.length; i++) out.push(withholdField(value as unknown as Record<number, unknown>, i, depth));
+      return out as unknown as T;
+    }
+    // Keys can hold a value too. Identifier-like keys are kept, because a tool's
+    // output schema needs its field names (stdout, stderr, …); every other key
+    // is renamed k0, k1, … in order, skipping names already taken.
+    const keys = Object.keys(value);
+    const used = new Set(keys.filter((key) => SCHEMA_KEY.test(key)));
+    const out: Record<string, unknown> = {};
+    let n = 0;
+    for (const key of keys) {
+      let name = key;
+      if (!SCHEMA_KEY.test(key)) {
+        while (used.has(`k${n}`)) n++;
+        name = `k${n}`;
+        used.add(name);
+      }
+      out[name] = withholdField(value as Record<string, unknown>, key, depth);
+    }
+    return out as T;
+  } catch {
+    return WITHHELD_OUTPUT as unknown as T;
+  }
+}
+
+/** A key withholdDeep keeps: shaped like a schema field name. A credential that
+ *  is itself shaped like this and used as a key still passes (accepted). */
+const SCHEMA_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,31}$/;
+
+function withholdField(parent: Record<string | number, unknown>, key: string | number, depth: number): unknown {
+  let item: unknown;
+  try { item = parent[key]; } catch { return WITHHELD_OUTPUT; }
+  return withholdDeep(item, depth + 1);
+}
+
+/**
+ * The last resort when the output cannot be walked at all: a fixed replacement
+ * that does not touch the original. The CLI checks a rewrite against the tool's
+ * output schema and keeps the ORIGINAL on a mismatch; this shape is the one
+ * Bash's schema accepts (stdout, stderr and interrupted are required), and an
+ * in-process MCP tool accepts any shape. A built-in tool with another schema
+ * would still fall back to its original output (pinned in the e2e tests).
+ */
+export function withheldFallbackOutput(): { stdout: string; stderr: string; interrupted: boolean } {
+  return { stdout: WITHHELD_OUTPUT, stderr: "", interrupted: false };
 }
 

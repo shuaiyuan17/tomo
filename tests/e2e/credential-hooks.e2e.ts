@@ -16,7 +16,7 @@ const home = vi.hoisted(() => {
 
 import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk";
 import { buildHooksOption } from "../../src/agent/sdk-options.js";
-import { clearSecretValuesForTests, markRedactionReady, registerSecretValue } from "../../src/credentials/redactor.js";
+import { clearSecretValuesForTests, markRedactionReady, registerSecretValue, WITHHELD_OUTPUT, withheldFallbackOutput } from "../../src/credentials/redactor.js";
 
 const FAKE = "fake-e2e-credential-3f9a1c7d";
 type Step = { name: string; input: Record<string, unknown> };
@@ -181,3 +181,40 @@ it("scrubs an in-process MCP tool's result", async () => {
   expect(results).not.toContain(FAKE);
   expect(files).not.toContain(FAKE);
 }, 60_000);
+
+// Tripwire: `onFailure: "block"` on PostToolUse does NOT replace the output. A
+// callback that throws under "block" adds a failure notice, and the ORIGINAL
+// result still reaches the model and the session file. That is why the redactor
+// withholds inside its own callback instead of relying on "block". If this
+// starts failing, the CLI now drops output on a blocked PostToolUse.
+it("pins that a throwing PostToolUse callback under onFailure: block still delivers the original output", async () => {
+  let fired = 0;
+  const throwing = { hooks: { PostToolUse: [{ onFailure: "block", hooks: [async () => { fired++; throw new Error("e2e boom"); }] }] } };
+  const { results, files } = await runSteps(
+    [{ name: "Bash", input: { command: 'printf "got %s\\n" "$FAKE_E2E_VALUE"', description: "probe" } }],
+    throwing,
+  );
+  expect(fired).toBe(1);
+  expect(results).toContain("blocking because onFailure is");
+  expect(results).toContain(FAKE);
+  expect(files).toContain(FAKE);
+}, 60_000);
+
+// The redactor's last-resort replacement must pass the CLI's output-schema
+// check, or the CLI keeps the original. Bash's schema needs stdout, stderr and
+// interrupted (a bare string or `{ stdout }` alone is rejected); an in-process
+// MCP tool takes any shape.
+for (const step of [
+  { name: "Bash", input: { command: 'printf "got %s\\n" "$FAKE_E2E_VALUE"', description: "probe" } },
+  { name: "mcp__probe__leak", input: {} },
+]) {
+  it(`the fixed withheld replacement is accepted for ${step.name}`, async () => {
+    const fallback = { hooks: { PostToolUse: [{ hooks: [async () => ({
+      hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: withheldFallbackOutput() },
+    })] }] } };
+    const { results, files } = await runSteps([step], fallback);
+    expect(results).toContain(WITHHELD_OUTPUT.slice(0, 40));
+    expect(results).not.toContain(FAKE);
+    expect(files).not.toContain(FAKE);
+  }, 60_000);
+}

@@ -603,7 +603,7 @@ describe("CredentialBroker", () => {
   describe("redaction after a restart that could not load the values", () => {
     afterEach(() => { vi.restoreAllMocks(); });
 
-    it("retries with backoff, withholds keychain output while not ready, tells the owner once, then masks", async () => {
+    it("retries with backoff, withholds all output while not ready, tells the owner once, then masks", async () => {
       const first = make();
       await first.request("x", "p", SESSION, IM);
       await first.handleInbound(im.ch, reply());
@@ -624,8 +624,10 @@ describe("CredentialBroker", () => {
       const keychainCall = { tool_input: { command: `echo "$(${keychainReadCommand("x")})"` }, tool_response: { stdout: `${FAKE}\n`, stderr: "" } };
       // Not ready, retry not yet due: the keychain command's output is withheld, shape kept.
       expect(await hook(keychainCall)).toEqual({ hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { stdout: WITHHELD_OUTPUT, stderr: "" } } });
-      // Other output is not withheld (it cannot hold the value unless the model fetched it some other way).
-      expect(await hook({ tool_input: { command: "ls" }, tool_response: { stdout: "a b" } })).toEqual({});
+      // Other output is withheld too (Codex #593 P1): a value written to a file
+      // by one command and read back by another is not registered yet either.
+      expect(await hook({ tool_input: { command: "cat /tmp/token" }, tool_response: { stdout: "a b" } }))
+        .toEqual({ hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { stdout: WITHHELD_OUTPUT } } });
 
       let clock = Date.now();
       vi.spyOn(Date, "now").mockImplementation(() => clock);

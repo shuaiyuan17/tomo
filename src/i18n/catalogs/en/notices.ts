@@ -85,7 +85,7 @@ export const notices = {
     runGapRange: "{{from}} to {{to}}",
     interruptedFooter: "If the missed run is still needed, ask me to do it now.",
   },
-  credentialsUnavailable: "Tomo could not load its stored credentials (the keychain or ~/.tomo/data/credentials/state.json is unavailable), so it cannot mask them in tool output yet. It keeps retrying, and hides the output of any command that reads the keychain until then.",
+  credentialsUnavailable: "Tomo could not load its stored credentials (the keychain or ~/.tomo/data/credentials/state.json is unavailable), so it cannot mask them in tool output yet. It keeps retrying, and hides all tool output until then.",
   pet: {
     evolved: "✨ {{name}} evolved into a {{stage}}!",
     hungry: "{{name}} is hungry (hunger: {{hunger}})",

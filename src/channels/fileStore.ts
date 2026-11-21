@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { log } from "../logger.js";
-import { writeWithoutOverwrite } from "./attachment-write.js";
+import { localDateFolder, localTimeStamp, sanitize, writeWithoutOverwrite } from "./attachment-write.js";
 import { documentMimeToExt, MAX_DOCUMENT_BYTES } from "./documentStore.js";
 import { neutralizeMarkerDelimiters } from "./text-utils.js";
 
@@ -98,24 +98,6 @@ export interface FileSaveMeta {
   filename?: string;
   /** When the file was received. Defaults to now. */
   timestamp?: Date;
-}
-
-function pad(n: number, width = 2): string {
-  return String(n).padStart(width, "0");
-}
-
-function localDateFolder(d: Date): string {
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
-
-function localTimeStamp(d: Date): string {
-  return `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-}
-
-function sanitize(part: string | undefined, fallback: string): string {
-  if (!part) return fallback;
-  const cleaned = part.replace(/[^A-Za-z0-9._-]/g, "_");
-  return cleaned.length > 0 ? cleaned : fallback;
 }
 
 /** What an unrecognisable or absent MIME type is reported as. */

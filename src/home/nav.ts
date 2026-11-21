@@ -25,16 +25,16 @@ import type { HomeScene } from "./scene.js";
  *   never squeezes between two blocked corners and regions are exactly what
  *   a walk can reach.
  *
- * A place that is not on free floor (a seat, a cushion, the inside of a hut)
- * is a perch: the walk ends on a landing cell near it and the character hops
- * the rest, at most NAV_MAX_HOP, and never through something that stands on
- * the floor and rises NAV_HOP_CLEAR above the perch (a wall, a desk side;
- * what the perch itself stands on or in does not count). A
- * place on free floor is never hopped to: it is walked to, or it is
- * unreachable. The landing is looked for in the walker's
- * own region, among every free cell within NAV_APPROACH_SLACK of the nearest
- * one, and the search picks whichever makes the whole trip shortest (a hop
- * weighing NAV_HOP_COST times a walk).
+ * A place at most NAV_STEP high is floor: it is walked to (its cell must be
+ * free and in the walker's region) or it is unreachable, never hopped to. A
+ * place higher than that is a perch (a seat, a cushion): it must be inside
+ * the room, the walk ends on a landing cell near it, and the character hops
+ * the rest, at most NAV_MAX_HOP, in a straight line that crosses no obstacle
+ * but the one it lands on (see clearHop). The landing is looked for in the
+ * walker's own region, among every free cell within NAV_APPROACH_SLACK of
+ * the nearest one, and the search picks whichever makes the whole trip
+ * shortest (a hop weighing NAV_HOP_COST times a walk). The same holds for a
+ * start: on the floor it must be on a free cell, on a perch it hops down.
  */
 
 export const NAV_CELL = 0.1;
@@ -54,14 +54,14 @@ export const NAV_APPROACH_SLACK = 0.3;
  * goes on to the nearer one instead of hopping from further out.
  */
 export const NAV_HOP_COST = 1.5;
-/** A hop clears what stands on the floor up to this far above the higher end of it. */
-export const NAV_HOP_CLEAR = 0.3;
+/** An obstacle is what a perch is on when its top is within this of the perch's height (and its footprint holds it). */
+export const NAV_PERCH_TOLERANCE = 0.15;
 
 /** A point on the floor: [x, z]. */
 export type FloorPoint = [number, number];
 /** An obstacle seen from above. */
 export interface Footprint { min: FloorPoint; max: FloorPoint }
-/** An obstacle that stands on the floor, and how high it rises: what a hop must not pass through. */
+/** An obstacle, with the height of its top. */
 export interface Hurdle extends Footprint { top: number }
 
 export interface NavGrid {
@@ -77,8 +77,10 @@ export interface NavGrid {
   region: Int32Array;
   /** Cells in each region. */
   regionSizes: number[];
-  /** The obstacles that start below NAV_STEP. */
+  /** Every obstacle (what navObstacles finds), with its top: what a hop may not cross. */
   hurdles: Hurdle[];
+  /** The room's width and depth, centred on the origin. */
+  room: FloorPoint;
 }
 
 /** A free cell to hop to or from, and how far the hop is. */
@@ -118,12 +120,12 @@ export interface NavOptions {
 export function navObstacles(scene: HomeScene, placement: Placement = placeScene(scene)): Footprint[] {
   return obstacles(placement).map(({ min, max }) => ({ min, max }));
 }
-function obstacles(placement: Placement): (Hurdle & { bottom: number })[] {
-  const out: (Hurdle & { bottom: number })[] = [];
+function obstacles(placement: Placement): Hurdle[] {
+  const out: Hurdle[] = [];
   for (const object of placement.objects) {
     for (const leaf of object.leaves) {
       if (!leaf.solid || leaf.box.max[1] <= NAV_STEP || leaf.box.min[1] >= NAV_HEADROOM) continue;
-      out.push({ min: [leaf.box.min[0], leaf.box.min[2]], max: [leaf.box.max[0], leaf.box.max[2]], top: leaf.box.max[1], bottom: leaf.box.min[1] });
+      out.push({ min: [leaf.box.min[0], leaf.box.min[2]], max: [leaf.box.max[0], leaf.box.max[2]], top: leaf.box.max[1] });
     }
   }
   return out;
@@ -184,8 +186,7 @@ export function buildNavGrid(scene: HomeScene, options: NavOptions = {}): NavGri
     }
     regionSizes.push(size);
   }
-  const hurdles = found.filter((o) => o.bottom < NAV_STEP).map(({ min, max, top }) => ({ min, max, top }));
-  return { cell, radius, cols, rows, origin, blocked, region, regionSizes, hurdles };
+  return { cell, radius, cols, rows, origin, blocked, region, regionSizes, hurdles: found, room: [w, d] };
 }
 
 /** The cell under a floor point, or -1 outside the grid. */
@@ -201,22 +202,31 @@ function isFree(grid: NavGrid, c: number, r: number): boolean {
   return c >= 0 && r >= 0 && c < grid.cols && r < grid.rows && !grid.blocked[r * grid.cols + c];
 }
 
-/** Whether `at` stands on free floor (no hop to or from it). */
+/** Whether `at` is a floor place (at most NAV_STEP high): walked to, never hopped to. */
+export function isFloor(at: Vec3): boolean {
+  return at[1] <= NAV_STEP;
+}
+/** Whether `at` is a floor place on a free cell. */
 export function onFloor(grid: NavGrid, at: Vec3): boolean {
   const cell = cellAt(grid, at[0], at[2]);
-  return at[1] <= NAV_STEP && cell >= 0 && !grid.blocked[cell];
+  return isFloor(at) && cell >= 0 && !grid.blocked[cell];
+}
+/** Whether a floor point is inside the room's walls (and its open front). */
+function inRoom(grid: NavGrid, x: number, z: number): boolean {
+  return Math.abs(x) <= grid.room[0] / 2 && Math.abs(z) <= grid.room[1] / 2;
 }
 
 /**
- * Whether the hop between `at` and a floor point passes through no hurdle
- * that rises NAV_HOP_CLEAR above it. What `at` stands on or in (a hurdle
- * whose footprint holds it: a seat, a basket) is what the hop is onto, so it
- * does not count.
+ * Whether the straight hop between the perch `at` and a floor point crosses
+ * no obstacle except what the perch is on: one whose footprint holds `at`
+ * and whose top is within NAV_PERCH_TOLERANCE of its height. Both ends are
+ * inside the room (the room is a rectangle), so the hop is too.
  */
 export function clearHop(grid: NavGrid, at: Vec3, point: FloorPoint): boolean {
-  const clear = Math.max(at[1], 0) + NAV_HOP_CLEAR;
-  const holds = (h: Footprint) => at[0] >= h.min[0] && at[0] <= h.max[0] && at[2] >= h.min[1] && at[2] <= h.max[1];
-  return grid.hurdles.every((h) => h.top <= clear || holds(h) || !segmentMeetsBox([at[0], at[2]], point, h));
+  if (!inRoom(grid, at[0], at[2]) || !inRoom(grid, point[0], point[1])) return false;
+  const under = (h: Hurdle) => Math.abs(h.top - at[1]) <= NAV_PERCH_TOLERANCE
+    && at[0] >= h.min[0] && at[0] <= h.max[0] && at[2] >= h.min[1] && at[2] <= h.max[1];
+  return grid.hurdles.every((h) => under(h) || !segmentMeetsBox([at[0], at[2]], point, h));
 }
 /** Whether segment a–b meets the inside of a footprint (Liang–Barsky; grazing an edge does not count). */
 function segmentMeetsBox(a: FloorPoint, b: FloorPoint, box: Footprint): boolean {
@@ -238,18 +248,19 @@ function segmentMeetsBox(a: FloorPoint, b: FloorPoint, box: Footprint): boolean 
 }
 
 /**
- * The free cells to hop between `at` and the floor: for each region (only
- * `regions`, when given), every cell within `slack` of that region's
- * nearest with a clear hop (clearHop), and none further than `maxHop`. A
- * place on free floor lands on itself (hop 0) when its region is allowed,
- * and has no landings when it is not: floor is walked to, never hopped to.
+ * The free cells to hop between the perch `at` and the floor: for each
+ * region (only `regions`, when given), every cell within `slack` of that
+ * region's nearest with a clear hop (clearHop), and none further than
+ * `maxHop`. A floor place lands on its own cell (hop 0) when that is free
+ * and in an allowed region, and has no landings otherwise.
  */
 export function landings(grid: NavGrid, at: Vec3, options: { regions?: readonly number[]; slack?: number; maxHop?: number } = {}): Landing[] {
   const slack = options.slack ?? NAV_APPROACH_SLACK;
   const maxHop = options.maxHop ?? NAV_MAX_HOP;
   const allowed = (region: number) => region >= 0 && (!options.regions || options.regions.includes(region));
   const own = cellAt(grid, at[0], at[2]);
-  if (onFloor(grid, at)) return allowed(grid.region[own]) ? [{ cell: own, point: [at[0], at[2]], hop: 0 }] : [];
+  if (isFloor(at)) return own >= 0 && allowed(grid.region[own]) ? [{ cell: own, point: [at[0], at[2]], hop: 0 }] : [];
+  if (!inRoom(grid, at[0], at[2])) return [];
   const near = new Map<number, number>();
   const all: Landing[] = [];
   for (let k = 0; k < grid.blocked.length; k++) {

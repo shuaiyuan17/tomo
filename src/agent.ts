@@ -1836,8 +1836,11 @@ export class Agent {
       // Kept exactly as the batch path always wrote it; if web ever reaches
       // this path, its records would lack the requestId the browser pairs on,
       // so say so loudly instead of silently writing them.
+      // Diagnostic only: a logging failure must not abort the batch.
       if (channel.name === "web") {
-        log.error({ sessionKey: key, messageId: message.id }, "Web message reached the batch path; its transcript record has no requestId (canCoalesce should exclude web)");
+        try {
+          log.error({ sessionKey: key, messageId: message.id }, "Web message reached the batch path; its transcript record has no requestId (canCoalesce should exclude web)");
+        } catch { /* ignore */ }
       }
       this.appendInboundUser(key, channel, message, transcriptText, { webRequestId: false });
     }

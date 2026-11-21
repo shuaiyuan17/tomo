@@ -59,7 +59,7 @@ export type ReserveResult =
   | { ok: true; reservationId: string }
   | {
     ok: false;
-    reason: "background-tasks" | "awaiting-task-report" | "backgrounding" | "recent-launch" | "already-pending";
+    reason: "background-tasks" | "awaiting-task-report" | "backgrounding" | "recent-launch" | "already-pending" | "session-closing";
     state: BackgroundState;
   };
 

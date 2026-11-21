@@ -1109,6 +1109,33 @@ describe("LiveSessionManager idle reaper", () => {
     expect(suspended).toBe(true);
   });
 
+  it("refuses a compact reservation while a reaped session is exiting, and approves it once it is gone", async () => {
+    let exited!: () => void;
+    mockState.closeGate = new Promise<void>((r) => { exited = r; });
+    const { manager, fake, key } = await idleSession();
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+    // The CLI rollup would rename the transcript the old child is still writing.
+    expect(manager.reserveCompact(key, "sdk-1")).toMatchObject({ ok: false, reason: "session-closing" });
+    exited();
+    await flushMicrotasks();
+    expect(manager.reserveCompact(key, "sdk-1").ok).toBe(true); // the retry
+  });
+
+  it("keeps the closing entry where the next lookup finds it", async () => {
+    let exited!: () => void;
+    mockState.closeGate = new Promise<void>((r) => { exited = r; });
+    const { manager, fake, key } = await idleSession();
+    manager.reapIdleSessions(fake.lastActivityAt() + HOUR);
+    expect(manager.keyForSdkSession("sdk-1")).toBe(key);
+    manager.closeLiveSession(key); // e.g. a model switch: must not drop the closing entry
+    let resumed = false;
+    const next = manager.getOrCreateLiveSession(key).then((s) => { resumed = true; return s; });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(resumed).toBe(false);
+    exited();
+    expect(await next).not.toBe(fake);
+  });
+
   it("gives up waiting on a reaped session that never finishes exiting", async () => {
     vi.useFakeTimers();
     mockState.closeGate = new Promise<void>(() => {});

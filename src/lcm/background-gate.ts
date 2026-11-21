@@ -22,6 +22,7 @@ export type CompactRefusalReason =
   | "backgrounding"
   | "recent-launch"
   | "already-pending"
+  | "session-closing"
   | "daemon-unreachable";
 
 /**
@@ -90,6 +91,12 @@ export function compactRefusal(
         status: "deferred",
         reason: res.reason,
         error: `Another compact/rollup of this session is already in progress. Not running the ${what}: two back-to-back rewrites can orphan the chain. ${RETRY}`,
+      };
+    case "session-closing":
+      return {
+        status: "deferred",
+        reason: res.reason,
+        error: `This session was just closed for being idle and its process is still exiting (it may still write the session file). Not running the ${what} until it is gone, a few seconds at most. ${RETRY}`,
       };
   }
 }

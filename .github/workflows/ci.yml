@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+# A new push to a PR cancels the run still going for its previous commit.
+# Runs on main are never cancelled, so every merge keeps its own result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -24,24 +30,67 @@ jobs:
           cache: npm
 
       - run: npm ci
+      # Lint does not depend on the Node version: run it once.
       - run: npm run lint
+        if: matrix.node-version == 24
       - run: npm run build
+      # Coverage is uploaded from one version only, so only that one pays for
+      # the instrumentation.
       - run: npm run test:coverage
-      - name: Install browser
-        if: matrix.node-version == 24
-        run: npx playwright install --with-deps chromium
-      - name: Browser chat tests
-        if: matrix.node-version == 24
-        run: npm run test:e2e
-      - name: Upload browser evidence
-        if: always() && matrix.node-version == 24
-        uses: actions/upload-artifact@v7
-        with:
-          name: browser-evidence
-          path: test-results/
+        if: matrix.node-version == '22.12.0'
+      - run: npm test
+        if: matrix.node-version != '22.12.0'
       - name: Upload coverage
         if: matrix.node-version == '22.12.0'
         uses: actions/upload-artifact@v7
         with:
           name: coverage
           path: coverage/
+
+  # The browser tests run beside the unit tests, split over runners. Each
+  # group runs its files one at a time (vitest.e2e.config.ts), and the Home
+  # files' software WebGL gets a runner of its own instead of starving the
+  # chat tests. Groups are balanced on measured times (chat ≈150 s,
+  # home + home-real ≈150 s, the rest ≈40 s); "other" is everything not
+  # named elsewhere, so a new e2e file is never left out.
+  e2e:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - group: chat
+            files: tests/e2e/chat.e2e.ts
+          - group: home
+            files: tests/e2e/home.e2e.ts tests/e2e/home-real.e2e.ts
+          - group: other
+            files: --exclude tests/e2e/chat.e2e.ts --exclude 'tests/e2e/home*.e2e.ts'
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Cache browser
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+      - name: Install browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser tests (${{ matrix.group }})
+        run: npm run test:e2e:ci -- ${{ matrix.files }}
+      - name: Upload browser evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-evidence-${{ matrix.group }}
+          path: test-results/

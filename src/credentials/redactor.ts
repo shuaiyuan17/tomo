@@ -32,6 +32,25 @@ export function scrubKnownSecrets(text: string): string {
   return out;
 }
 
+/** How deep scrubDeep and withholdDeep walk. Past it they fail closed: a
+ *  subtree they did not walk is not passed on unchecked. */
+const MAX_WALK_DEPTH = 32;
+
+export const TOO_DEEP_OUTPUT = "[output withheld: nested too deeply for Tomo's credential redaction to check]";
+
+/**
+ * A subtree past the walk limit: kept as is only when its serialisation holds
+ * no known value (the native serialiser has no such limit), otherwise, or when
+ * it cannot be serialised, replaced by a notice.
+ */
+function tooDeep<T>(value: T): T {
+  try {
+    const text = JSON.stringify(value);
+    if (text === undefined || scrubKnownSecrets(text) === text) return value;
+  } catch { /* fall through: unchecked is not passed on */ }
+  return TOO_DEEP_OUTPUT as unknown as T;
+}
+
 /**
  * `value` with every string leaf scrubbed and its shape untouched, or the same
  * reference when nothing changed. The CLI checks a PostToolUse rewrite against
@@ -41,7 +60,8 @@ export function scrubKnownSecrets(text: string): string {
 export function scrubDeep<T>(value: T, depth = 0): T {
   if (secrets.size === 0) return value;
   if (typeof value === "string") return scrubKnownSecrets(value) as unknown as T;
-  if (depth > 32 || value === null || typeof value !== "object") return value;
+  if (value === null || typeof value !== "object") return value;
+  if (depth > MAX_WALK_DEPTH) return tooDeep(value);
   if (Array.isArray(value)) {
     const next = value.map((item) => scrubDeep(item, depth + 1));
     return next.some((item, i) => item !== value[i]) ? (next as unknown as T) : value;
@@ -107,7 +127,9 @@ export const WITHHELD_OUTPUT = "[output withheld: Tomo's credential redaction is
  */
 export function withholdDeep<T>(value: T, depth = 0): T {
   if (typeof value === "string") return (value ? WITHHELD_OUTPUT : value) as unknown as T;
-  if (depth > 32 || value === null || typeof value !== "object") return value;
+  if (value === null || typeof value !== "object") return value;
+  // Past the limit the subtree is not walked, so it is not passed on either.
+  if (depth > MAX_WALK_DEPTH) return WITHHELD_OUTPUT as unknown as T;
   try {
     if (Array.isArray(value)) {
       const out: unknown[] = [];

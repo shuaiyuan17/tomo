@@ -10,7 +10,7 @@ vi.mock("../src/credentials/redactor.js", async (importOriginal) => {
 });
 
 import {
-  clearSecretValuesForTests, markRedactionNotReady, markRedactionReady, registerSecretValue, scrubDeep, WITHHELD_OUTPUT,
+  clearSecretValuesForTests, markRedactionNotReady, markRedactionReady, registerSecretValue, scrubDeep, TOO_DEEP_OUTPUT, WITHHELD_OUTPUT,
 } from "../src/credentials/redactor.js";
 import { KEYCHAIN_SERVICE } from "../src/credentials/names.js";
 import { credentialRedactionHooks, REDACTION_READY_TIMEOUT_MS } from "../src/agent/sdk-options.js";
@@ -20,6 +20,12 @@ const REDACTED = "[REDACTED secret://x]";
 const keychainInput = { command: `security find-generic-password -s ${KEYCHAIN_SERVICE} -a x -w` };
 type Hook = (input: { tool_input?: unknown; tool_response?: unknown }) => Promise<Record<string, unknown>>;
 const hook = () => credentialRedactionHooks().PostToolUse[0].hooks[0] as Hook;
+/** `{ n: { n: … { stdout: leaf } } }`, `levels` objects deep. */
+const nested = (levels: number, leaf: string): Record<string, unknown> => {
+  let node: Record<string, unknown> = { stdout: leaf };
+  for (let i = 0; i < levels; i++) node = { n: node };
+  return node;
+};
 const withheld = (stdout: unknown) => ({ hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { stdout } } });
 
 beforeEach(() => {
@@ -103,6 +109,26 @@ describe("credential redaction hook fails closed", () => {
     expect(out).toEqual({
       hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { stdout: WITHHELD_OUTPUT, stderr: "", interrupted: false } },
     });
+  });
+
+  // Codex #593 round 2: past the depth limit both walks returned the subtree
+  // unchanged, so a value nested deep in (say) an MCP result passed through.
+  it("withholds a value nested past the depth limit while not ready", async () => {
+    const out = await hook()({ tool_response: nested(40, FAKE) });
+    expect(JSON.stringify(out)).not.toContain(FAKE);
+    expect(JSON.stringify(out)).toContain(WITHHELD_OUTPUT);
+  });
+
+  it("does not pass a known value nested past the depth limit when ready", async () => {
+    markRedactionReady();
+    const out = await hook()({ tool_response: nested(40, FAKE) });
+    expect(JSON.stringify(out)).not.toContain(FAKE);
+    expect(JSON.stringify(out)).toContain(TOO_DEEP_OUTPUT);
+  });
+
+  it("leaves a clean output nested past the depth limit untouched when ready", async () => {
+    markRedactionReady();
+    expect(await hook()({ tool_response: nested(40, "clean") })).toEqual({});
   });
 
   it("leaves the normal path unchanged: clean output untouched, dirty output scrubbed", async () => {

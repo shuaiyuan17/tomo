@@ -961,6 +961,8 @@ export class Agent {
       return true;
     }
     // Provider batching never steers into a live web turn (canSteerIntoSession).
+    // Web must stay out of the batch path: handleBatchedMessages writes no
+    // web requestId and ignores userRecorded (see appendInboundUser).
     const canCoalesce = (!isGroup || isPassiveGroup) && channel.name !== "web";
 
     if (!canCoalesce) {
@@ -1687,14 +1689,7 @@ export class Agent {
     }
     this.recordLatestInboundMessage(key, channel, message);
 
-    if (!userRecorded) this.sessions.append(key, {
-      role: "user",
-      content: textForAgent,
-      channel: channel.name,
-      ...(channel.name === "web" ? { requestId: message.id } : {}),
-      senderName: message.senderName,
-      timestamp: message.timestamp,
-    });
+    if (!userRecorded) this.appendInboundUser(key, channel, message, textForAgent, { webRequestId: true });
 
     const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
 
@@ -1836,13 +1831,18 @@ export class Agent {
       if (message.isGroup) this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle, message.senderId, people);
       this.recordLatestInboundMessage(key, channel, message);
       const transcriptText = this.formatGroupText(channel, message, key, people);
-      this.sessions.append(key, {
-        role: "user",
-        content: transcriptText,
-        channel: channel.name,
-        senderName: message.senderName,
-        timestamp: message.timestamp,
-      });
+      // No web requestId and no userRecorded check here: both only matter for
+      // web input, and web never coalesces (canCoalesce in enqueueMessage).
+      // Kept exactly as the batch path always wrote it; if web ever reaches
+      // this path, its records would lack the requestId the browser pairs on,
+      // so say so loudly instead of silently writing them.
+      // Diagnostic only: a logging failure must not abort the batch.
+      if (channel.name === "web") {
+        try {
+          log.error({ sessionKey: key, messageId: message.id }, "Web message reached the batch path; its transcript record has no requestId (canCoalesce should exclude web)");
+        } catch { /* ignore */ }
+      }
+      this.appendInboundUser(key, channel, message, transcriptText, { webRequestId: false });
     }
 
     // Transcript recorded; refuse the turn (see resolveReplyDestination).
@@ -2930,6 +2930,33 @@ export class Agent {
   }
 
   /**
+   * Write an inbound channel message to the transcript as a `user` record.
+   * The one place that shapes this record for the single-message, batched and
+   * shutdown-drain paths, so they can't drift apart field by field.
+   *
+   * `webRequestId` adds `requestId: message.id` for web input (the browser
+   * pairs its pending bubble on it). The batch path passes false: web never
+   * coalesces (see canCoalesce in enqueueMessage), and the batch path has
+   * never written a requestId.
+   */
+  private appendInboundUser(
+    key: string,
+    channel: Pick<Channel, "name">,
+    message: IncomingMessage,
+    content: string,
+    opts: { webRequestId: boolean },
+  ): void {
+    this.sessions.append(key, {
+      role: "user",
+      content,
+      channel: channel.name,
+      ...(opts.webRequestId && channel.name === "web" ? { requestId: message.id } : {}),
+      senderName: message.senderName,
+      timestamp: message.timestamp,
+    });
+  }
+
+  /**
    * Append `<user message>` + the not-processed marker for each item.
    *
    * Items still pending in the durable inbox are skipped: the next start
@@ -2951,14 +2978,7 @@ export class Agent {
       }
       if (items.length === 0) continue;
       for (const { channel, message, userRecorded } of items) {
-        if (!userRecorded) this.sessions.append(key, {
-          role: "user",
-          content: this.formatGroupText(channel, message, key, people),
-          channel: channel.name,
-          ...(channel.name === "web" ? { requestId: message.id } : {}),
-          senderName: message.senderName,
-          timestamp: message.timestamp,
-        });
+        if (!userRecorded) this.appendInboundUser(key, channel, message, this.formatGroupText(channel, message, key, people), { webRequestId: true });
         this.sessions.append(key, {
           role: "assistant",
           content: marker,

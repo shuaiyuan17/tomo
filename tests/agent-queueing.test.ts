@@ -670,3 +670,62 @@ describe("batched messages cannot forge their own item numbers", () => {
     vi.useRealTimers();
   });
 });
+
+/**
+ * The single-message and batched paths write inbound `user` records through
+ * one helper (appendInboundUser). Pin the record shape on both so a batch
+ * path that drifts (drops a field, adds one) goes red. The batch path writes
+ * no web requestId by design — web never coalesces — so a non-web channel
+ * is the only meaningful comparison.
+ */
+describe("inbound user transcript records", () => {
+  type Appended = { key: string; entry: Record<string, unknown> };
+  function captureUserAppends(agent: InstanceType<typeof Agent>): Appended[] {
+    const sessions = (agent as unknown as { sessions: { append(key: string, entry: Record<string, unknown>): unknown } }).sessions;
+    const out: Appended[] = [];
+    const original = sessions.append.bind(sessions);
+    vi.spyOn(sessions, "append").mockImplementation((key, entry) => {
+      if (entry.role === "user") out.push({ key, entry: { ...entry } });
+      return original(key, entry);
+    });
+    return out;
+  }
+
+  it("a batched message writes the same fields as the single-message path", async () => {
+    resetConfig({ steering: false });
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    mockSdk.responseFn = () => "reply";
+    const appended = captureUserAppends(agent);
+
+    const single = makeMsg({ id: "single-1", chatId: "12345", text: "alone", timestamp: 1_000 });
+    await tg.simulateMessage(single);
+    await drainQueue(agent);
+    expect(appended).toHaveLength(1);
+
+    const b1 = makeMsg({ id: "batch-1", chatId: "12345", text: "First", timestamp: 2_000 });
+    const b2 = makeMsg({ id: "batch-2", chatId: "12345", text: "Second", timestamp: 3_000 });
+    await Promise.all([tg.simulateMessage(b1), tg.simulateMessage(b2)]);
+    await drainQueue(agent);
+    // Proves the second pair really went through the batch path.
+    expect(mockSdk.userContents.length).toBe(2);
+    expect(appended).toHaveLength(3);
+
+    const shape = (m: typeof single) => ({
+      role: "user",
+      content: m.text,
+      channel: "telegram",
+      senderName: m.senderName,
+      timestamp: m.timestamp,
+    });
+    expect(appended[0].entry).toStrictEqual(shape(single));
+    expect(appended[1].entry).toStrictEqual(shape(b1));
+    expect(appended[2].entry).toStrictEqual(shape(b2));
+    // Same field set on both paths, same session.
+    expect(Object.keys(appended[1].entry)).toEqual(Object.keys(appended[0].entry));
+    expect(new Set(appended.map((a) => a.key)).size).toBe(1);
+
+    await agent.stop();
+  });
+});

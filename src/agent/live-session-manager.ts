@@ -886,7 +886,8 @@ export class LiveSessionManager {
    * Only a session with NOTHING going on is closed: no turn in any phase
    * (`hasTurnInFlight`), no live task, ambient watchers included (closing
    * kills them), no task report still due, no compact waiting on its reload,
-   * no explicit MCP reconnect running on it (`mcpReservations`), and no
+   * no explicit MCP reconnect running on it (`mcpReservations`), no SDK id
+   * the registry has not stored yet (`unpersistedLinks`), and no
    * prompt-stale retirement already in charge of it.
    *
    * The CLI child is still exiting after close() (and may append exit-time
@@ -913,7 +914,10 @@ export class LiveSessionManager {
       // The report wait is BOUNDED, as in backgroundState(): a result folded
       // into a turn that was already running never clears the flag, and an
       // unbounded check would keep such a session alive forever.
-      if (this.hasTurnInFlight(key) || this.mcpReservations.has(key) || session.hasAnyLiveTasks()
+      // unpersistedLinks: the registry refused this session's id, so the live
+      // session holds the only usable one until a later turn stores it.
+      if (this.hasTurnInFlight(key) || this.mcpReservations.has(key) || this.unpersistedLinks.has(key)
+        || session.hasAnyLiveTasks()
         || session.isAwaitingTaskReportWithin(PROMPT_RETIRE_REPORT_WAIT_MS)
         || (this.backgroundingInFlight.get(key) ?? 0) > 0 || this.isCompactPending(key)) {
         session.noteActivity();

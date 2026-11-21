@@ -1008,6 +1008,21 @@ describe("LiveSessionManager idle reaper", () => {
     expect(fake.closed).toBe(true);
   });
 
+  it("keeps a session whose SDK id the registry has not stored yet, and restarts its clock", async () => {
+    // The registry refused the link after a turn: the live session holds the
+    // only usable id, and closing it would resume an older one or start fresh.
+    const deps = makeDeps();
+    deps.setSdkSessionId = vi.fn(() => { throw new Error("session registry could not be read"); });
+    const manager = new LiveSessionManager(deps);
+    mockState.sendImpl = async () => "hello";
+    await manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
+    const fake = mockState.instances[0];
+    const later = fake.lastActivityAt() + 2 * HOUR;
+    expect(manager.reapIdleSessions(later)).toEqual([]);
+    expect(fake.closed).toBe(false);
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + 1000)).toEqual([]);
+  });
+
   it("keeps a session whose compact is waiting on its reload", async () => {
     const { manager, fake, key } = await idleSession();
     expect(manager.reserveCompact(key, "sdk-1").ok).toBe(true);

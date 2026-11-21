@@ -17,9 +17,9 @@ import { effectiveEffort } from "./effort.js";
 import { resolvePlugins } from "./plugins.js";
 import { SDK_SETTING_SOURCES } from "./setting-sources.js";
 import { TOMO_DAEMON_PID_ENV, TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
-import { CREDENTIAL_TOOL_NAMES, KEYCHAIN_SERVICE } from "../credentials/names.js";
+import { CREDENTIAL_TOOL_NAMES } from "../credentials/names.js";
 import { PERMISSION_TOOL_NAMES } from "../mcp/permission-tools.js";
-import { ensureRedactionReady, redactionReady, scrubDeep, withholdDeep } from "../credentials/redactor.js";
+import { ensureRedactionReady, redactionReady, scrubDeep, WITHHELD_OUTPUT, withheldFallbackOutput, withholdDeep } from "../credentials/redactor.js";
 
 // DM sessions run our custom hierarchical LCM (daily/weekly/monthly/yearly
 // rollups via skill), so SDK auto-compact is disabled for them via the
@@ -577,21 +577,31 @@ export function credentialRedactionHooks() {
       // path; this is the backstop for anything that escapes it.
       onFailure: "block" as const,
       hooks: [async (input: { tool_input?: unknown; tool_response?: unknown }) => {
-        // Not ready (a restart could not load the stored values): retry, with
-        // backoff and a cap; still not ready, fail closed on output that went
-        // near the keychain, the one way a value is meant to enter a command.
+        // Not ready (a restart could not load the stored values yet): retry,
+        // with backoff and a cap; still not ready, withhold EVERY output. A
+        // value that is not registered yet passes the literal match, and it can
+        // arrive through any command (written to a file by one, read back by
+        // the next), so the command's input is no guide.
         const ready = await redactionReadyWithin(REDACTION_READY_TIMEOUT_MS);
         let rewritten: unknown;
         try {
-          rewritten = scrubDeep(input.tool_response);
-          if (!ready && JSON.stringify(input.tool_input ?? "").includes(KEYCHAIN_SERVICE)) {
-            log.warn("Withheld a tool result that read the keychain: credential redaction is not ready");
+          if (ready) {
+            rewritten = scrubDeep(input.tool_response);
+          } else {
+            log.warn("Withheld a tool result: credential redaction is not ready");
             rewritten = withholdDeep(input.tool_response);
           }
         } catch (err) {
           // Fail closed: an output we could not check is not passed through.
           log.warn({ err }, "Withheld a tool result: credential redaction failed");
           rewritten = withholdDeep(input.tool_response);
+        }
+        // withholdDeep never throws, but it puts the notice in place of a node
+        // it cannot walk; for an object output that is a bare string at the
+        // top, which a built-in tool's schema rejects (the CLI would then keep
+        // the original), so use the fixed replacement instead.
+        if (rewritten === WITHHELD_OUTPUT && typeof input.tool_response === "object" && input.tool_response !== null) {
+          rewritten = withheldFallbackOutput();
         }
         if (rewritten === input.tool_response) return {};
         return {

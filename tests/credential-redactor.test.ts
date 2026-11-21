@@ -7,7 +7,7 @@ vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js"
 vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
-import { clearSecretValuesForTests, registerSecretValue, scrubDeep, scrubKnownSecrets } from "../src/credentials/redactor.js";
+import { clearSecretValuesForTests, markRedactionReady, registerSecretValue, scrubDeep, scrubKnownSecrets } from "../src/credentials/redactor.js";
 import { CredentialStoreError, isStorableValue, KeychainBackend } from "../src/credentials/store.js";
 import { keychainReadCommand } from "../src/credentials/names.js";
 import { buildHooksOption, credentialRedactionHooks } from "../src/agent/sdk-options.js";
@@ -34,6 +34,8 @@ let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "tomo-broker-redactor-"));
   registerSecretValue(FAKE, "x");
+  // As after the broker's first successful load: while not ready, every output is withheld.
+  markRedactionReady();
 });
 afterEach(() => {
   clearSecretValuesForTests();

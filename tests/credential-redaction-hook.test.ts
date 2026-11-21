@@ -66,11 +66,43 @@ describe("credential redaction hook fails closed", () => {
     expect(await hook()({ tool_response: { stdout: FAKE } })).toEqual(withheld(WITHHELD_OUTPUT));
   });
 
-  it("withholds when the tool input cannot be serialised", async () => {
-    // Not ready, no retry registered yet: the keychain check has to serialise the input.
-    const circular: Record<string, unknown> = { command: "x" };
-    circular.self = circular;
-    expect(await hook()({ tool_input: circular, tool_response: { stdout: FAKE } })).toEqual(withheld(WITHHELD_OUTPUT));
+  // Codex #593 P1: the value need not come from a keychain command. Written to
+  // a file by one command and read back by another while the retry still runs,
+  // it is not registered yet and the reading command's input looks harmless.
+  it("withholds EVERY tool output once the cap passes, not only keychain reads", async () => {
+    vi.useFakeTimers();
+    markRedactionNotReady(() => new Promise<boolean>(() => {}), Date.now() - 60_000);
+    let result: unknown;
+    void hook()({ tool_input: { command: "cat /tmp/token" }, tool_response: { stdout: "value-not-yet-known" } }).then((r) => { result = r; });
+    await vi.advanceTimersByTimeAsync(REDACTION_READY_TIMEOUT_MS);
+    expect(result).toEqual(withheld(WITHHELD_OUTPUT));
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("withholds every tool output while the first load is still running, and says why", async () => {
+    // Fresh process: not ready, no retry registered yet.
+    const out = await hook()({ tool_input: { command: "ls" }, tool_response: { stdout: "a b", stderr: "", interrupted: false } });
+    expect(out).toEqual({ hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { stdout: WITHHELD_OUTPUT, stderr: "", interrupted: false } } });
+    expect(WITHHELD_OUTPUT).toMatch(/withheld/i);
+    expect(WITHHELD_OUTPUT).toMatch(/not ready/i);
+  });
+
+  // Codex #593 P2: the fallback walked the same object and could throw again.
+  it("withholds leaf by leaf when reading a field throws, without throwing itself", async () => {
+    markRedactionReady();
+    const response = { stdout: FAKE, get stderr(): string { throw new Error("getter"); }, interrupted: false };
+    expect(await hook()({ tool_response: response })).toEqual({
+      hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { stdout: WITHHELD_OUTPUT, stderr: WITHHELD_OUTPUT, interrupted: false } },
+    });
+  });
+
+  it("falls back to a fixed Bash-shaped notice when the output cannot be walked at all", async () => {
+    markRedactionReady();
+    const response = new Proxy({ stdout: FAKE }, { ownKeys() { throw new Error("ownKeys"); } });
+    const out = await hook()({ tool_response: response });
+    expect(out).toEqual({
+      hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { stdout: WITHHELD_OUTPUT, stderr: "", interrupted: false } },
+    });
   });
 
   it("leaves the normal path unchanged: clean output untouched, dirty output scrubbed", async () => {

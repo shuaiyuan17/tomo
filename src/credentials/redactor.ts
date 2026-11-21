@@ -56,8 +56,7 @@ export function scrubDeep<T>(value: T, depth = 0): T {
  * learns them from the keychain (`CredentialBroker.primeRedaction`); until that
  * has succeeded it does not, and a value printed meanwhile would pass the
  * literal match. While not ready, `ensureRedactionReady` retries the load (with
- * backoff) and the PostToolUse hook withholds output that went near the
- * keychain (`withholdDeep`).
+ * backoff) and the PostToolUse hook withholds every tool output (`withholdDeep`).
  */
 interface Readiness { retry: (() => Promise<boolean>) | null; nextAt: number; backoffMs: number; inFlight?: Promise<boolean> }
 const MIN_BACKOFF_MS = 5_000;
@@ -98,13 +97,46 @@ export async function ensureRedactionReady(now = Date.now()): Promise<boolean> {
   return r.inFlight;
 }
 
-export const WITHHELD_OUTPUT = "[withheld: Tomo's credential redaction is not ready, so output of a command that reads the keychain is not shown]";
+export const WITHHELD_OUTPUT = "[output withheld: Tomo's credential redaction is not ready, so tool output is hidden until it is]";
 
-/** `value` with every string leaf replaced, its shape kept (see scrubDeep). */
+/**
+ * `value` with every string leaf replaced, its shape kept (see scrubDeep).
+ * Never throws: a field that cannot be read becomes the notice, and a node that
+ * cannot be walked at all becomes the notice in its place. This is the
+ * fail-closed path, so it must not fail itself.
+ */
 export function withholdDeep<T>(value: T, depth = 0): T {
   if (typeof value === "string") return (value ? WITHHELD_OUTPUT : value) as unknown as T;
   if (depth > 32 || value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) return value.map((item) => withholdDeep(item, depth + 1)) as unknown as T;
-  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, withholdDeep(v, depth + 1)])) as T;
+  try {
+    if (Array.isArray(value)) {
+      const out: unknown[] = [];
+      for (let i = 0; i < value.length; i++) out.push(withholdField(value as unknown as Record<number, unknown>, i, depth));
+      return out as unknown as T;
+    }
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value)) out[key] = withholdField(value as Record<string, unknown>, key, depth);
+    return out as T;
+  } catch {
+    return WITHHELD_OUTPUT as unknown as T;
+  }
+}
+
+function withholdField(parent: Record<string | number, unknown>, key: string | number, depth: number): unknown {
+  let item: unknown;
+  try { item = parent[key]; } catch { return WITHHELD_OUTPUT; }
+  return withholdDeep(item, depth + 1);
+}
+
+/**
+ * The last resort when the output cannot be walked at all: a fixed replacement
+ * that does not touch the original. The CLI checks a rewrite against the tool's
+ * output schema and keeps the ORIGINAL on a mismatch; this shape is the one
+ * Bash's schema accepts (stdout, stderr and interrupted are required), and an
+ * in-process MCP tool accepts any shape. A built-in tool with another schema
+ * would still fall back to its original output (pinned in the e2e tests).
+ */
+export function withheldFallbackOutput(): { stdout: string; stderr: string; interrupted: boolean } {
+  return { stdout: WITHHELD_OUTPUT, stderr: "", interrupted: false };
 }
 

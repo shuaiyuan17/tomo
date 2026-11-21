@@ -131,8 +131,8 @@ export class CredentialBroker {
    * So a value still in a running child or a file is scrubbed after a restart.
    * True when every stored value is known to the redactor. On failure (state
    * unreadable, keychain unavailable) the redactor is marked not ready: the
-   * PostToolUse hook retries this with backoff and, meanwhile, withholds the
-   * output of commands that read the keychain. The owner is told once.
+   * PostToolUse hook retries this with backoff and, meanwhile, withholds every
+   * tool output. The owner is told once.
    */
   async primeRedaction(): Promise<boolean> {
     if (this.held) this.loadState();
@@ -157,7 +157,7 @@ export class CredentialBroker {
     markRedactionNotReady(() => this.primeRedaction());
     if (!this.redactionAlerted) {
       this.redactionAlerted = true;
-      log.error("Credential redaction is not ready: stored values could not be loaded, so they would not be masked in tool output. Retrying; output of commands that read the keychain is withheld meanwhile.");
+      log.error("Credential redaction is not ready: stored values could not be loaded, so they would not be masked in tool output. Retrying; tool output is withheld meanwhile.");
       this.deps.notifyOwner?.(ownerT("notices")("credentialsUnavailable"));
     }
     return false;

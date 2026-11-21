@@ -73,7 +73,7 @@ export const notices = {
     runGapRange: "{{from}} 至 {{to}}",
     interruptedFooter: "如果错过的运行还需要，跟我说一声，我马上做。",
   },
-  credentialsUnavailable: "Tomo 读取不到保存的凭据（钥匙串或 ~/.tomo/data/credentials/state.json 不可用），所以暂时无法在工具输出里遮盖它们。Tomo 会继续重试，在那之前，读取钥匙串的命令输出都会被隐藏。",
+  credentialsUnavailable: "Tomo 读取不到保存的凭据（钥匙串或 ~/.tomo/data/credentials/state.json 不可用），所以暂时无法在工具输出里遮盖它们。Tomo 会继续重试，在那之前，所有工具输出都会被隐藏。",
   pet: {
     evolved: "✨ {{name}} 进化到了{{stage}}阶段！",
     hungry: "{{name}} 饿了（饱腹：{{hunger}}）",

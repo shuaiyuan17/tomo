@@ -126,9 +126,25 @@ describe("credential redaction hook fails closed", () => {
     expect(JSON.stringify(out)).toContain(TOO_DEEP_OUTPUT);
   });
 
-  it("leaves a clean output nested past the depth limit untouched when ready", async () => {
+  // Codex #593 round 3: no matching past the limit (JSON escapes quotes and
+  // backslashes, so a serialised search misses such a value); the unwalked
+  // subtree is replaced, clean or not.
+  it("replaces even a clean subtree past the depth limit when ready", async () => {
     markRedactionReady();
-    expect(await hook()({ tool_response: nested(40, "clean") })).toEqual({});
+    const out = JSON.stringify(await hook()({ tool_response: nested(40, "clean") }));
+    expect(out).toContain(TOO_DEEP_OUTPUT);
+    expect(out).not.toContain("clean");
+  });
+
+  it("does not pass a deeply nested value that holds quotes and backslashes", async () => {
+    const quoted = 'p"a\\ss\\"w0rd-91b4';
+    registerSecretValue(quoted, "q");
+    markRedactionReady();
+    const out = await hook()({ tool_response: nested(40, quoted) });
+    expect(out).not.toEqual({});
+    expect(JSON.stringify(out)).toContain(TOO_DEEP_OUTPUT);
+    // Neither the raw value nor its JSON-escaped form survives.
+    expect(JSON.stringify(out)).not.toContain(JSON.stringify(quoted).slice(1, -1));
   });
 
   it("leaves the normal path unchanged: clean output untouched, dirty output scrubbed", async () => {

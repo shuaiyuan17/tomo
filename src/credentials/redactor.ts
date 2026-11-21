@@ -33,23 +33,13 @@ export function scrubKnownSecrets(text: string): string {
 }
 
 /** How deep scrubDeep and withholdDeep walk. Past it they fail closed: a
- *  subtree they did not walk is not passed on unchecked. */
+ *  subtree they did not walk is replaced by TOO_DEEP_OUTPUT (scrubDeep) or the
+ *  withheld notice, clean or not. No search of a serialised copy instead: JSON
+ *  escapes quotes and backslashes, so a value holding them would not match.
+ *  Real tool output is not nested this deep. */
 const MAX_WALK_DEPTH = 32;
 
 export const TOO_DEEP_OUTPUT = "[output withheld: nested too deeply for Tomo's credential redaction to check]";
-
-/**
- * A subtree past the walk limit: kept as is only when its serialisation holds
- * no known value (the native serialiser has no such limit), otherwise, or when
- * it cannot be serialised, replaced by a notice.
- */
-function tooDeep<T>(value: T): T {
-  try {
-    const text = JSON.stringify(value);
-    if (text === undefined || scrubKnownSecrets(text) === text) return value;
-  } catch { /* fall through: unchecked is not passed on */ }
-  return TOO_DEEP_OUTPUT as unknown as T;
-}
 
 /**
  * `value` with every string leaf scrubbed and its shape untouched, or the same
@@ -61,7 +51,7 @@ export function scrubDeep<T>(value: T, depth = 0): T {
   if (secrets.size === 0) return value;
   if (typeof value === "string") return scrubKnownSecrets(value) as unknown as T;
   if (value === null || typeof value !== "object") return value;
-  if (depth > MAX_WALK_DEPTH) return tooDeep(value);
+  if (depth > MAX_WALK_DEPTH) return TOO_DEEP_OUTPUT as unknown as T;
   if (Array.isArray(value)) {
     const next = value.map((item) => scrubDeep(item, depth + 1));
     return next.some((item, i) => item !== value[i]) ? (next as unknown as T) : value;

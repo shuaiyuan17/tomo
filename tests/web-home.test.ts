@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { Box3, Group, Mesh, BoxGeometry } from "three";
-import { MAX_SIGN_CHARS, REACTION_DEFAULTS, REACTIONS, SHAPES, SIGN_VALUES, WEATHERS, homeSceneSchema, type HomePart, type HomeScene } from "../src/home/scene.js";
+import { MAX_SIGN_CHARS, REACTION_DEFAULTS, REACTIONS, SHAPES, SIGN_VALUES, WALK_RULE_FACTOR, WALK_SPEED_LIMITS, WANDER_EVERY_LIMITS, WEATHERS, homeSceneSchema, type HomePart, type HomeScene } from "../src/home/scene.js";
 import { HOME_SNAPSHOT_MAX_BYTES } from "../src/web/protocol.js";
 import { STARTER_SCENE } from "../src/home/starter.js";
 import type { HomeStatus } from "../src/home/status.js";
@@ -22,6 +22,9 @@ describe("home contract copies", () => {
     expect(contract.MAX_SIGN_CHARS).toBe(MAX_SIGN_CHARS);
     expect(contract.HOME_SNAPSHOT_MAX_BYTES).toBe(HOME_SNAPSHOT_MAX_BYTES);
     expect(contract.REACTION_DEFAULTS).toEqual(REACTION_DEFAULTS);
+    expect(contract.WALK_SPEED_DEFAULT).toBe(WALK_SPEED_LIMITS.default);
+    expect(contract.WALK_RULE_FACTOR).toBe(WALK_RULE_FACTOR);
+    expect(contract.WANDER_EVERY_DEFAULT).toEqual(WANDER_EVERY_LIMITS.default);
   });
 });
 

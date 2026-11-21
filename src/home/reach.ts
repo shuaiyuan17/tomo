@@ -9,11 +9,12 @@ import { MAX_WAITING_DRAWN, waitingPosition } from "./waiting.js";
 /**
  * Which places each character can walk between, for home_check's warnings
  * and the floor plan. A character can be at its default spot, at any spot
- * its rules name, and a visitor at any seat or any place in the queue at the
- * overflow spot (where the page stands it: waiting.ts). It may have to walk
- * from any of these to any other, so every ordered pair is checked, at the
- * character's own size: Tomo and the visitors NAV_WALKER, the pet NAV_PET,
- * as the page does (web/src/home/three/stage.ts). Where it cannot, the page
+ * its rules name, at any of its wander spots, and a visitor at any seat or
+ * any place in the queue at the overflow spot (where the page stands it:
+ * waiting.ts). It may have to walk from any of these to any other, so every
+ * ordered pair is checked, at the character's own size (walkerOf: Tomo and
+ * the visitors NAV_WALKER, the pet NAV_PET, with the radius its `walk`
+ * gives), as the page does (web/src/home/three/stage.ts). Where it cannot, the page
  * fades it out and back in; this says why, naming what is in the way.
  *
  * Whether a place can be reached needs only the grid's regions and the
@@ -24,8 +25,25 @@ import { MAX_WAITING_DRAWN, waitingPosition } from "./waiting.js";
 export type Mover = "tomo" | "visitors" | "pet";
 export const MOVER_NAMES: Record<Mover, string> = { tomo: "Tomo", visitors: "a visitor", pet: "the pet" };
 
-export function walkerOf(who: Mover): WalkerSize {
-  return who === "pet" ? NAV_PET : NAV_WALKER;
+const sized = new Map<string, WalkerSize>();
+/**
+ * A character's size for finding its way: the preset for its sort, with the
+ * footprint radius its `walk.radius` gives. The same size is the same object
+ * (grids are kept per size).
+ */
+export function walkerOf(who: Mover, scene?: HomeScene): WalkerSize {
+  const preset = who === "pet" ? NAV_PET : NAV_WALKER;
+  const radius = who === "visitors" ? undefined : scene?.characters?.[who]?.walk?.radius;
+  if (radius === undefined || radius === preset.radius) return preset;
+  const key = `${radius}/${preset.headroom}`;
+  let walker = sized.get(key);
+  if (!walker) { walker = { radius, headroom: preset.headroom }; sized.set(key, walker); }
+  return walker;
+}
+
+/** Whether a place is there only because the character wanders to it (no rule or own spot names it). */
+export function wanderOnly(at: CharacterPlace): boolean {
+  return /^characters\.[a-z]+\.wander\./.test(at.place);
 }
 
 /** A place a character can be: a spot, or (`queue`, 0-based) a place in the visitors' queue at one; `place` is where the scene names it. */
@@ -45,6 +63,7 @@ export function characterPlaces(scene: HomeScene): Map<Mover, CharacterPlace[]> 
   if (c?.tomo) {
     add("tomo", c.tomo.spot, "characters.tomo.spot");
     (c.tomo.rules ?? []).forEach((rule, i) => add("tomo", rule.spot, `characters.tomo.rules[${i}]`));
+    (c.tomo.wander?.spots ?? []).forEach((spot, i) => add("tomo", spot, `characters.tomo.wander.spots[${i}]`));
   }
   if (c?.visitors) {
     c.visitors.spots.forEach((spot, i) => add("visitors", spot, `characters.visitors.spots[${i}]`));
@@ -56,6 +75,7 @@ export function characterPlaces(scene: HomeScene): Map<Mover, CharacterPlace[]> 
   if (c?.pet) {
     add("pet", c.pet.spot, "characters.pet.spot");
     (c.pet.rules ?? []).forEach((rule, i) => add("pet", rule.spot, `characters.pet.rules[${i}]`));
+    (c.pet.wander?.spots ?? []).forEach((spot, i) => add("pet", spot, `characters.pet.wander.spots[${i}]`));
   }
   return out;
 }
@@ -74,7 +94,7 @@ export interface CharacterReach {
 export function characterReach(reach: SceneReach, scene: HomeScene): CharacterReach[] {
   const out: CharacterReach[] = [];
   for (const [who, places] of characterPlaces(scene)) {
-    const walker = walkerOf(who);
+    const walker = walkerOf(who, scene);
     const stuck: CharacterReach["stuck"] = [];
     const free: CharacterPlace[] = [];
     for (const at of places) {

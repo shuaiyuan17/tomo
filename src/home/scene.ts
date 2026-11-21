@@ -185,9 +185,50 @@ const spot = z.object({
   facing: degrees.optional(),
 }).strict();
 
+/**
+ * How a character walks: `speed` in m/s, `radius` its footprint for finding
+ * a way round the furniture (not worked out from its body: a crab's claws
+ * would make it too wide to pass anything). A wandering stroll goes at
+ * `speed`; a move a rule makes goes WALK_RULE_FACTOR times as fast, and
+ * takes at most a few seconds however far it is.
+ */
+export const WALK_SPEED_LIMITS = { min: 0.2, max: 3, default: 1 } as const;
+export const WALK_RULE_FACTOR = 1.5;
+export const WALK_RADIUS_LIMITS = { min: 0.1, max: 0.6 } as const;
+const walk = z.object({
+  speed: z.number().finite().min(WALK_SPEED_LIMITS.min).max(WALK_SPEED_LIMITS.max).optional(),
+  radius: z.number().finite().min(WALK_RADIUS_LIMITS.min).max(WALK_RADIUS_LIMITS.max).optional(),
+}).strict();
+export type HomeWalk = z.infer<typeof walk>;
+
+/**
+ * Wandering: while no rule holds (and `when` does, if given), the character
+ * strolls between `spots` instead of standing at its own spot, staying a
+ * random time from `every` = [shortest, longest] seconds at each. Tomo
+ * wanders only while idle; under the viewer's reduced-motion setting nobody
+ * does (they stand at their spot).
+ */
+export const WANDER_SPOT_LIMITS = { min: 2, max: 8 } as const;
+export const WANDER_EVERY_LIMITS = { min: 5, max: 3600, default: [30, 90] as readonly [number, number] } as const;
+const seconds = z.number().finite().min(WANDER_EVERY_LIMITS.min).max(WANDER_EVERY_LIMITS.max);
+const wander = z.object({
+  spots: z.array(slug).min(WANDER_SPOT_LIMITS.min).max(WANDER_SPOT_LIMITS.max),
+  every: z.tuple([seconds, seconds]).refine(([a, b]) => a <= b, { message: "shortest after longest" }).optional(),
+  when: when.optional(),
+}).strict();
+export type HomeWander = z.infer<typeof wander>;
+
+const mover = z.object({
+  kind: slug,
+  spot: slug,
+  rules: z.array(z.object({ when, spot: slug }).strict()).max(8).optional(),
+  walk: walk.optional(),
+  wander: wander.optional(),
+}).strict();
+
 const characters = z.object({
-  /** Tomo itself. The first rule whose condition holds decides where it is; otherwise `spot`. */
-  tomo: z.object({ kind: slug, spot: slug, rules: z.array(z.object({ when, spot: slug }).strict()).max(8).optional() }).strict().optional(),
+  /** Tomo itself. The first rule whose condition holds decides where it is; otherwise it wanders (`wander`) or stands at `spot`. */
+  tomo: mover.optional(),
   /**
    * One copy per running subagent, seated at `spots` in order; the rest wait
    * at `overflow` (or are not drawn). `kinds` gives a subagent type its own
@@ -201,10 +242,11 @@ const characters = z.object({
   }).strict().optional(),
   /**
    * Tomo's pet, when it has one. Like Tomo, the first rule whose condition
-   * holds decides where it is, otherwise `spot`: a pet with a nest goes to
-   * the nest's spot `when: "pet:sleeping"`.
+   * holds decides where it is, otherwise it wanders or stands at `spot`: a
+   * pet with a nest goes to the nest's spot `when: "pet:sleeping"`. Unlike
+   * Tomo it may wander while Tomo works.
    */
-  pet: z.object({ kind: slug, spot: slug, rules: z.array(z.object({ when, spot: slug }).strict()).max(8).optional() }).strict().optional(),
+  pet: mover.optional(),
 }).strict();
 
 export const homeSceneSchema = z.object({

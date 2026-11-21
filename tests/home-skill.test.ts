@@ -64,6 +64,28 @@ describe("the tomo-home skill", () => {
     expect(result.warnings).toEqual([]);
   });
 
+  it("explains walk and wander from the constants, and its example is a scene that checks clean", async () => {
+    const { WALK_RADIUS_LIMITS, WALK_RULE_FACTOR, WALK_SPEED_LIMITS, WANDER_EVERY_LIMITS, WANDER_SPOT_LIMITS } = await import("../src/home/scene.js");
+    const { NAV_PET, NAV_WALKER } = await import("../src/home/nav.js");
+    expect(TEMPLATE).toContain("{{home:walk-wander}}");
+    const line = (name: string) => RENDERED.split("\n").find((l) => l.startsWith(`- \`${name}\`: `)) ?? "";
+    expect(line("walk.speed")).toContain(`${WALK_SPEED_LIMITS.min}–${WALK_SPEED_LIMITS.max}, default ${WALK_SPEED_LIMITS.default}`);
+    expect(line("walk.speed")).toContain(`${WALK_RULE_FACTOR} times as fast`);
+    expect(line("walk.radius")).toContain(`${WALK_RADIUS_LIMITS.min}–${WALK_RADIUS_LIMITS.max}; default ${NAV_WALKER.radius} for you, ${NAV_PET.radius} for the pet`);
+    expect(line("wander.spots")).toContain(`${WANDER_SPOT_LIMITS.min}–${WANDER_SPOT_LIMITS.max} of them`);
+    expect(line("wander.every")).toContain(`${WANDER_EVERY_LIMITS.min}–${WANDER_EVERY_LIMITS.max}, default [${WANDER_EVERY_LIMITS.default.join(", ")}]`);
+    expect(line("wander.when")).not.toBe("");
+    expect(RENDERED).toContain("You wander only while idle");
+    expect(RENDERED).toContain("Under the viewer's reduced-motion setting nobody wanders");
+    const example = /\*\*Example: you stroll[\s\S]*?```json\n([\s\S]*?)```/.exec(RENDERED)![1];
+    const fragment = JSON.parse(`{${example}}`);
+    expect(fragment.characters.tomo.wander.every).toEqual([30, 90]);
+    const result = checkHomeScene({ version: 1, room: { size: [6, 3, 6], floor: "#a9825b", walls: "#d9cdb6" }, objects: [],
+      kinds: { me: { parts: [{ shape: "sphere", size: [0.6, 0.6, 0.6] }] }, cat: { parts: [{ shape: "sphere", size: [0.3, 0.25, 0.4] }] } }, ...fragment });
+    expect(result.problems).toEqual([]);
+    expect(result.warnings).toEqual([]);
+  });
+
   it("explains windows, the weather and pictures", () => {
     expect(RENDERED).toContain('"window": true');
     expect(RENDERED).toContain("conditions hold only when a city is configured");

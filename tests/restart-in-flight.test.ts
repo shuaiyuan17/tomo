@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi, afterAll } from "vitest";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { EventEmitter } from "node:events";
 
 // Same discipline as tests/workspace.test.ts: `restart-request.ts` derives its
 // request directory from `defaultRuntimePaths`, a module-level const built from
@@ -13,17 +14,23 @@ vi.stubEnv("HOME", TEST_HOME);
 vi.stubEnv("TOMO_WORKSPACE", join(TEST_HOME, ".tomo", "workspace"));
 vi.resetModules();
 
-const hoisted = vi.hoisted(() => ({ spawnCalls: [] as string[][] }));
+const hoisted = vi.hoisted(() => ({
+  spawnCalls: [] as string[][],
+  children: [] as import("node:events").EventEmitter[],
+}));
 
 vi.mock("node:child_process", async (importActual) => {
   const actual = await importActual<typeof import("node:child_process")>();
   return {
     ...actual,
     // The restart helper is spawned detached; in a test it must never become a
-    // real process. Record the invocation instead.
+    // real process. Record the invocation and hand back a fake child whose
+    // `error` / `exit` / stderr events the tests fire by hand.
     spawn: vi.fn((_command: string, args: string[]) => {
       hoisted.spawnCalls.push(args);
-      return { stderr: null, on: vi.fn(), once: vi.fn(), unref: vi.fn() };
+      const child = Object.assign(new EventEmitter(), { stderr: new EventEmitter(), unref: vi.fn() });
+      hoisted.children.push(child);
+      return child;
     }),
   };
 });
@@ -38,6 +45,7 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 // developer's real HOME before the stub ever ran.
 const { Agent, installAgentTestHooks } = await import("./helpers/agent-harness.js");
 const { createRestartRequest, formatRestartRequestResult, sweepStaleRestartRequests } = await import("../src/restart-request.js");
+const { RestartCoordinator } = await import("../src/agent/restart-coordinator.js");
 
 /** Requests are only actionable by the daemon that filed them. */
 const DAEMON = process.pid;
@@ -60,6 +68,7 @@ interface RestartHandlers {
 
 beforeEach(() => {
   hoisted.spawnCalls.length = 0;
+  hoisted.children.length = 0;
   rmSync(REQUEST_DIR, { recursive: true, force: true });
 });
 
@@ -212,5 +221,90 @@ describe("background restarts report through BashOutput", () => {
     expect(hoisted.spawnCalls).toEqual([]);
     // Untouched — the end-of-turn fallback is what will collect it.
     expect(pending()).toHaveLength(1);
+  });
+});
+
+describe("a failed restart helper is reported once and frees the next restart", () => {
+  function makeCoordinator() {
+    const notes: string[] = [];
+    const coordinator = new RestartCoordinator({
+      isStopping: () => false,
+      queuePendingErrorNote: (_key, note) => notes.push(note),
+    });
+    const restart = (reason: string) => {
+      file("dm:shuai", reason);
+      coordinator.handleTurnComplete("dm:shuai");
+    };
+    return { notes, restart };
+  }
+  const lastChild = () => hoisted.children[hoisted.children.length - 1]!;
+
+  it("reports a non-zero exit with the helper's stderr, then lets a new request restart", () => {
+    const { notes, restart } = makeCoordinator();
+    restart("first");
+    lastChild().stderr.emit("data", Buffer.from("  daemon is not running\n"));
+    lastChild().emit("exit", 1, null);
+
+    expect(notes).toEqual(["Scheduled Tomo restart failed: daemon is not running"]);
+    // restartInFlight was reset: the next request launches a helper instead
+    // of being drained as superseded.
+    restart("second");
+    expect(hoisted.spawnCalls).toHaveLength(2);
+    expect(pending()).toEqual([]);
+  });
+
+  it("falls back to the exit code or signal when stderr is empty", () => {
+    const { notes, restart } = makeCoordinator();
+    restart("by code");
+    lastChild().emit("exit", 3, null);
+    restart("by signal");
+    lastChild().emit("exit", null, "SIGKILL");
+
+    expect(notes).toEqual([
+      "Scheduled Tomo restart failed: restart helper exited with code 3",
+      "Scheduled Tomo restart failed: restart helper exited with signal SIGKILL",
+    ]);
+  });
+
+  it("reports an `error` event once even when `exit` follows it", () => {
+    const { notes, restart } = makeCoordinator();
+    restart("first");
+    const failed = lastChild();
+    failed.emit("error", new Error("spawn ENOENT"));
+    expect(notes).toEqual(["Scheduled Tomo restart failed: spawn ENOENT"]);
+
+    // A new restart is now in flight. The dead helper's late `exit` must not
+    // report a second failure, nor clear the flag the new restart holds.
+    restart("second");
+    failed.emit("exit", 1, null);
+    expect(notes).toHaveLength(1);
+    restart("third");
+    expect(hoisted.spawnCalls).toHaveLength(2);
+  });
+
+  it("stays in flight after a clean exit", () => {
+    const { notes, restart } = makeCoordinator();
+    restart("first");
+    lastChild().emit("exit", 0, null);
+    restart("second");
+
+    expect(notes).toEqual([]);
+    expect(hoisted.spawnCalls).toHaveLength(1);
+  });
+
+  it("reports a missing CLI entry point without spawning, and frees the next restart", () => {
+    const { notes, restart } = makeCoordinator();
+    const argv1 = process.argv[1];
+    process.argv[1] = "";
+    try {
+      restart("first");
+    } finally {
+      process.argv[1] = argv1!;
+    }
+
+    expect(notes).toEqual(["Scheduled Tomo restart failed: CLI entry point is unavailable"]);
+    expect(hoisted.spawnCalls).toEqual([]);
+    restart("second");
+    expect(hoisted.spawnCalls).toHaveLength(1);
   });
 });

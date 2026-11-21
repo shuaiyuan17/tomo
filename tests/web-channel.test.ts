@@ -244,6 +244,53 @@ describe("web task panel feed", () => {
       expect(JSON.stringify(channel.snapshot())).not.toContain("legacy secret");
     } finally { vi.useRealTimers(); rmSync(root, { recursive: true, force: true }); }
   });
+  it("stops re-checking the owner rule once no DM task is on the board, and starts again with the next one", () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      let reads = 0;
+      const { bus } = setup(owner, () => { reads++; return "dm:owner"; });
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a")] });
+      vi.advanceTimersByTime(3 * OWNER_KEY_CHECK_MS);
+      expect(reads).toBeGreaterThanOrEqual(3); // ticking while a DM task is held
+
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [], ended: [{ taskId: "a", status: "completed" }] });
+      vi.advanceTimersByTime(TASK_RETENTION_MS + OWNER_KEY_CHECK_MS); // the ended task leaves the board
+      const settled = reads;
+      vi.advanceTimersByTime(60 * OWNER_KEY_CHECK_MS);
+      expect(reads).toBe(settled); // idle: no reads at all
+
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("b")] });
+      const rearmed = reads;
+      vi.advanceTimersByTime(2 * OWNER_KEY_CHECK_MS);
+      expect(reads).toBeGreaterThan(rearmed);
+    } finally { vi.useRealTimers(); }
+  });
+  it("the real registry reader parses the registry only when the file changed", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { SessionStore } = await import("../src/sessions/store.js");
+    const { ownerSessionKeyReader } = await import("../src/web/data.js");
+    const root = mkdtempSync(join(tmpdir(), "tomo-web-owner-cache-"));
+    const parse = vi.spyOn(SessionStore, "readSnapshot");
+    try {
+      const sessionsDir = join(root, "sessions"), sdkSessionsDir = join(root, "sdk");
+      const store = new SessionStore(sessionsDir, 20, sdkSessionsDir);
+      store.setSdkSessionId("telegram:test-owner", "sdk-legacy");
+      const read = ownerSessionKeyReader({ owner, sessionsDir, sdkSessionsDir });
+      parse.mockClear();
+      for (let i = 0; i < 5; i++) expect(read()).toBe("telegram:test-owner");
+      expect(parse).toHaveBeenCalledTimes(1);
+
+      store.setSdkSessionId("dm:owner", "sdk-owner");
+      expect(read()).toBe("dm:owner");
+      expect(parse).toHaveBeenCalledTimes(2);
+
+      rmSync(SessionStore.registryFile(sessionsDir));
+      read(); read(); // no file: nothing to key a cache on, read each time
+      expect(parse).toHaveBeenCalledTimes(4);
+    } finally { parse.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+  });
   it("keeps recording a hidden DM's events, so it is correct when it becomes visible again", () => {
     vi.useFakeTimers({ now: 0 });
     try {

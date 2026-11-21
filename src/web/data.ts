@@ -1,4 +1,4 @@
-import { constants } from "node:fs";
+import { constants, statSync } from "node:fs";
 import { open, realpath, type FileHandle } from "node:fs/promises";
 import { basename, extname, join, sep } from "node:path";
 import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
@@ -68,22 +68,52 @@ export function selectOwnerSessionKey(owner: OwnerConfig | undefined, keys: read
 }
 
 /**
- * Reads the owner key from the session registry on every call — no cache, so
- * a registry change is honoured by the very next task event (fails closed).
+ * The active registry keys, re-read only when the registry FILE changed.
+ *
+ * The web task gate asks for the owner key once a second while a DM task is
+ * on the board, and a fresh `readSnapshot` is a whole read and JSON parse of
+ * `_sessions.json` each time. Keyed on inode, size, mtime and ctime (ns): the
+ * registry is published by atomic rename, so every write is a new inode, and
+ * a permission change moves ctime — so a change is still seen by the very
+ * next call, exactly as with no cache. Only a successful read is remembered;
+ * a missing or unreadable file goes the uncached way every time (fails closed).
+ */
+function registryKeysReader(options: WebDataOptions): () => string[] {
+  const file = SessionStore.registryFile(options.sessionsDir);
+  let cached: { signature: string; keys: string[] } | undefined;
+  return () => {
+    let signature: string | undefined;
+    try {
+      const st = statSync(file, { bigint: true });
+      signature = `${st.ino}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+    } catch { signature = undefined; }
+    if (signature !== undefined && cached?.signature === signature) return [...cached.keys];
+    cached = undefined;
+    const keys = SessionStore.readSnapshot(options.sessionsDir, options.sdkSessionsDir).map((e) => e.channelKey);
+    if (signature !== undefined) cached = { signature, keys: [...keys] };
+    return keys;
+  };
+}
+
+/**
+ * Reads the owner key from the session registry on every call — re-parsed
+ * only when the file changed (see registryKeysReader), so a registry change
+ * is still honoured by the very next task event (fails closed).
  */
 export function ownerSessionKeyReader(options: WebDataOptions): () => string | undefined {
+  const keys = registryKeysReader(options);
   return () => {
     try {
-      return selectOwnerSessionKey(options.owner,
-        SessionStore.readSnapshot(options.sessionsDir, options.sdkSessionsDir).map((e) => e.channelKey));
+      return selectOwnerSessionKey(options.owner, keys());
     } catch { return undefined; }
   };
 }
 
-/** Every key in the session registry, read fresh on each call (daemon side; unreadable reads as none). */
+/** Every key in the session registry, current on each call (daemon side; unreadable reads as none). */
 export function sessionKeysReader(options: WebDataOptions): () => string[] {
+  const keys = registryKeysReader(options);
   return () => {
-    try { return SessionStore.readSnapshot(options.sessionsDir, options.sdkSessionsDir).map((e) => e.channelKey); }
+    try { return keys(); }
     catch { return []; }
   };
 }

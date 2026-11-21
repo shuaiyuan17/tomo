@@ -70,6 +70,9 @@ function sameServerConfig(a: McpServerConfig | undefined, b: McpServerConfig): b
 /** Upper bound on how long /rewind waits for a stopped session to wind down. */
 export const REWIND_SUSPEND_TIMEOUT_MS = 10_000;
 
+/** How often the idle reaper looks (capped by the timeout itself). */
+export const IDLE_REAP_SWEEP_MS = 60_000;
+
 /** Resolves true if `promise` settled within `ms`, false on timeout. Never rejects. */
 async function withTimeout(promise: Promise<unknown>, ms: number): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -254,6 +257,8 @@ export class LiveSessionManager {
   private generations = new Map<string, number>();
   /** Release for each hold in `sessionHolds` — stop() releases them all. */
   private holdReleases = new Map<string, () => void>();
+  /** The idle reaper's timer; armed with the first live session, cleared by stop(). */
+  private idleReapTimer: ReturnType<typeof setInterval> | undefined;
 
   /** SDK-reported MCP health: lifecycle logs, pre-turn reconnect, owner notice. */
   private readonly mcpHealth: McpHealthMonitor;
@@ -530,7 +535,7 @@ export class LiveSessionManager {
       this.sweepPromptChanges();
 
       const session = this.liveSessions.get(key);
-      if (session?.isAlive()) return session;
+      if (session?.isAlive()) { session.noteActivity(); return session; }
 
       const created = await (this.liveSessionCreates.get(key) ?? this.startCreate(key));
       // Built for the pre-rewind conversation and discarded by createLiveSession
@@ -798,6 +803,7 @@ export class LiveSessionManager {
     // A dead predecessor's connections went with it.
     if (this.liveSessions.has(key)) this.mcpHealth.sessionClosed(key);
     this.liveSessions.set(key, session);
+    this.armIdleReaper();
     this.externalMcpServersBySession.set(key, new Set(Object.keys(externalMcpServers)));
     this.mcpServerConfigsBySession.set(key, {
       ...externalMcpServers,
@@ -813,6 +819,51 @@ export class LiveSessionManager {
       "Live session created",
     );
     return session;
+  }
+
+  /**
+   * IDLE SESSIONS ARE CLOSED, NOT KEPT FOREVER. Every live session is a CLI
+   * child process (plus one process per stdio MCP server), and before this a
+   * group that spoke once kept its whole tree resident until the next prompt
+   * change or shutdown. Closing one costs little: the next message resumes it
+   * from disk, and the prompt cache is server-side, so it outlives the child
+   * up to its own TTL either way.
+   *
+   * Only a session with NOTHING going on is closed: no turn in any phase
+   * (`hasTurnInFlight`), no live task, ambient watchers included (closing
+   * kills them), no task report still due, no compact waiting on its reload,
+   * and no prompt-stale retirement already in charge of it.
+   */
+  private armIdleReaper(): void {
+    const timeoutMs = config.liveSessionIdleTimeoutMs;
+    if (this.idleReapTimer || this.stopping || !timeoutMs || timeoutMs <= 0) return;
+    this.idleReapTimer = setInterval(() => this.reapIdleSessions(), Math.min(IDLE_REAP_SWEEP_MS, timeoutMs));
+    this.idleReapTimer.unref?.();
+  }
+
+  /** One reaper pass; public for tests. Returns the keys it closed. */
+  reapIdleSessions(now = Date.now()): string[] {
+    const timeoutMs = config.liveSessionIdleTimeoutMs;
+    if (this.stopping || !timeoutMs || timeoutMs <= 0) return [];
+    const reaped: string[] = [];
+    for (const [key, session] of [...this.liveSessions]) {
+      if (!session.isAlive() || this.promptStale.has(session)) continue;
+      if (this.hasTurnInFlight(key) || session.hasAnyLiveTasks() || session.isAwaitingTaskReport()
+        || (this.backgroundingInFlight.get(key) ?? 0) > 0 || this.isCompactPending(key)) {
+        session.noteActivity();
+        continue;
+      }
+      const idleMs = now - session.lastActivityAt();
+      if (idleMs < timeoutMs) continue;
+      this.closeLiveSession(key);
+      reaped.push(key);
+      log.info({ key, idleMinutes: Math.round(idleMs / 60_000) }, "Closed idle live session; the next message resumes it");
+    }
+    if (this.liveSessions.size === 0 && this.idleReapTimer) {
+      clearInterval(this.idleReapTimer);
+      this.idleReapTimer = undefined;
+    }
+    return reaped;
   }
 
   closeLiveSession(key: string): void {
@@ -1284,6 +1335,7 @@ export class LiveSessionManager {
     // closed.
     this.stopping = true;
     this.compactReservations.dispose();
+    if (this.idleReapTimer) { clearInterval(this.idleReapTimer); this.idleReapTimer = undefined; }
 
     // NO HOLD OUTLIVES SHUTDOWN. The Agent awaits (bounded) and aborts any
     // rewind before calling this; a rewind still stalled past that budget must

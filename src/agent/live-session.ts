@@ -254,6 +254,18 @@ export class LiveSession {
    * end while these keep running; closing the session then kills them.
    */
   private backgroundTaskIds = new Set<string>();
+  /**
+   * Live AMBIENT tasks (watchers the model left running on purpose). They do
+   * not hold a compact or a prompt retirement, but closing the session kills
+   * them too, so the idle reaper must not (see LiveSessionManager).
+   */
+  private ambientTaskIds = new Set<string>();
+  /**
+   * Last time anything happened on this session: created, handed out for a
+   * turn (`noteActivity`), or an SDK event arrived. What the idle reaper
+   * measures from.
+   */
+  private lastActivity = Date.now();
   /** Full task records for the web "working now" panel (see task-tracker.ts). */
   private taskTracker = new TaskTracker();
   private backgroundIdleWaiters: Array<() => void> = [];
@@ -443,6 +455,21 @@ export class LiveSession {
   /** True while the SDK reports live, non-ambient background tasks. */
   hasActiveBackgroundTasks(): boolean {
     return this.backgroundTaskIds.size > 0;
+  }
+
+  /** True while the SDK reports ANY live background task, ambient ones included. */
+  hasAnyLiveTasks(): boolean {
+    return this.backgroundTaskIds.size > 0 || this.ambientTaskIds.size > 0;
+  }
+
+  /** Record that the session is in use (a turn is about to run on it). */
+  noteActivity(): void {
+    this.lastActivity = Date.now();
+  }
+
+  /** Epoch ms of the last activity — see `lastActivity`. */
+  lastActivityAt(): number {
+    return this.lastActivity;
   }
 
   /** How many live, non-ambient background tasks the SDK last reported. */
@@ -872,6 +899,7 @@ export class LiveSession {
   }
 
   private async handleEvent(event: SDKMessage): Promise<void> {
+    this.lastActivity = Date.now();
     // A RETIRED SESSION HANDLES NOTHING. close() rejected every request, but
     // the SDK can still hand over events it had already buffered — and the
     // event loop may have been parked in `await onBlock` when close() ran.
@@ -973,6 +1001,7 @@ export class LiveSession {
       const tasks = (event as { tasks?: Array<{ task_id: string; ambient?: boolean }> }).tasks ?? [];
       const hadTasks = this.backgroundTaskIds.size > 0;
       this.backgroundTaskIds = new Set(tasks.filter((t) => !t.ambient).map((t) => t.task_id));
+      this.ambientTaskIds = new Set(tasks.filter((t) => t.ambient).map((t) => t.task_id));
       if (this.backgroundTaskIds.size === 0) {
         if (hadTasks) {
           this.awaitingTaskReport = true;

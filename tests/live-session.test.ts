@@ -204,6 +204,34 @@ describe("LiveSession background-task tracking", () => {
     session.close();
   });
 
+  it("counts ambient watchers as live tasks for the idle reaper, and SDK events as activity", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const { session, harness } = makeSession({});
+      const created = session.lastActivityAt();
+      expect(session.hasAnyLiveTasks()).toBe(false);
+
+      vi.setSystemTime(created + 60_000);
+      harness.pushEvent({
+        type: "system", subtype: "background_tasks_changed", session_id: "s", uuid: "u1",
+        tasks: [{ task_id: "w1", task_type: "monitor", description: "watcher", ambient: true }],
+      });
+      await waitFor(() => session.hasAnyLiveTasks());
+      expect(session.hasActiveBackgroundTasks()).toBe(false);
+      expect(session.lastActivityAt()).toBe(created + 60_000);
+
+      harness.pushEvent({ type: "system", subtype: "background_tasks_changed", session_id: "s", uuid: "u2", tasks: [] });
+      await waitFor(() => !session.hasAnyLiveTasks());
+
+      vi.setSystemTime(created + 120_000);
+      session.noteActivity();
+      expect(session.lastActivityAt()).toBe(created + 120_000);
+      session.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("marks a drain as awaiting the report turn; a user turn doesn't clear it, an SDK-initiated one does", async () => {
     const factory = vi.fn(() => ({ resolve: () => {}, reject: () => {}, onBlock: () => {} }));
     const session = new LiveSession({} as never, "dm:owner", undefined, factory);

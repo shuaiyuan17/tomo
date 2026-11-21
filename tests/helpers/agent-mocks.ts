@@ -442,6 +442,7 @@ export const mockConfig = {
   interruptedAgents: false,
   notifyOwnerOnSuppressedErrors: true,
   liveSessionTimeoutMs: 10 * 60 * 1000,
+  liveSessionIdleTimeoutMs: 0,
   litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,
   /** External MCP servers (src/mcp/external-config.ts shape); undefined = none configured. */
   mcpServers: undefined as undefined | Record<string, {

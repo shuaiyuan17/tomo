@@ -258,6 +258,11 @@ export class SessionStore {
     return store.registry.filter((entry) => entry.unlinkedAt === null);
   }
 
+  /** Where the registry lives under a sessions directory (for stat-keyed callers). */
+  static registryFile(dir: string): string {
+    return join(dir, "_sessions.json");
+  }
+
   /** Shared ownership/read-set rules for off-thread history readers. Paths
    * stay internal; they must never be accepted from an HTTP request. */
   static readHistoryFiles(dir: string, sdkSessionsDir: string, key: string): string[] {
@@ -1359,7 +1364,7 @@ export class SessionStore {
   // --- Registry persistence ---
 
   private get registryPath(): string {
-    return join(this.dir, "_sessions.json");
+    return SessionStore.registryFile(this.dir);
   }
 
   /** Advisory lock serializing registry read-modify-write against other processes. */

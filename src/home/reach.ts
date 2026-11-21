@@ -7,13 +7,14 @@ import type { HomeScene } from "./scene.js";
 import { MAX_WAITING_DRAWN, waitingPosition } from "./waiting.js";
 
 /**
- * Which spots each character can walk to, for home_check's warnings and the
- * floor plan. A character walks from its default spot to each spot its rules
- * name; a visitor from its place in the queue at the overflow spot (where
- * the page stands it: waiting.ts) to each seat. Each at its own size: Tomo
- * and the visitors NAV_WALKER, the pet NAV_PET, as the page does
- * (web/src/home/three/stage.ts). Where it cannot, the page fades it out and
- * back in; this says why, naming what is in the way.
+ * Which places each character can walk between, for home_check's warnings
+ * and the floor plan. A character can be at its default spot, at any spot
+ * its rules name, and a visitor at any seat or any place in the queue at the
+ * overflow spot (where the page stands it: waiting.ts). It may have to walk
+ * from any of these to any other, so every ordered pair is checked, at the
+ * character's own size: Tomo and the visitors NAV_WALKER, the pet NAV_PET,
+ * as the page does (web/src/home/three/stage.ts). Where it cannot, the page
+ * fades it out and back in; this says why, naming what is in the way.
  *
  * Whether a place can be reached needs only the grid's regions and the
  * landings (as findRoute decides it before its search), so the check never
@@ -27,43 +28,76 @@ export function walkerOf(who: Mover): WalkerSize {
   return who === "pet" ? NAV_PET : NAV_WALKER;
 }
 
-/** A move a character makes: from its start spot to another, named at `place` in the scene. */
-export interface SpotUse { who: Mover; place: string; from: string; to: string }
-/** Where a character starts from: its spot, and for the visitors each place in the queue there (`queue` is the 0-based place). */
-export interface StartPoint { at: Vec3; queue?: number }
-/** Where a character starts, named at `place`. */
-export interface SpotStart { who: Mover; place: string; spot: string; points: StartPoint[] }
+/** A place a character can be: a spot, or (`queue`, 0-based) a place in the visitors' queue at one; `place` is where the scene names it. */
+export interface CharacterPlace { who: Mover; spot: string; at: Vec3; place: string; queue?: number }
 
-/** Each character's start, when it moves at all and the spot is defined (the visitors only move with an overflow spot). */
-export function characterStarts(scene: HomeScene): SpotStart[] {
+/** Every place each character can be, in the scene's order, each once (defined spots only). */
+export function characterPlaces(scene: HomeScene): Map<Mover, CharacterPlace[]> {
   const c = scene.characters, spots = scene.spots ?? {};
-  const out: SpotStart[] = [];
-  if (c?.tomo && spots[c.tomo.spot]) out.push({ who: "tomo", place: "characters.tomo.spot", spot: c.tomo.spot, points: [{ at: spots[c.tomo.spot].at }] });
-  const overflow = c?.visitors?.overflow;
-  if (overflow !== undefined && spots[overflow]) {
-    const points: StartPoint[] = [];
-    for (let queue = 0; queue < MAX_WAITING_DRAWN; queue++) {
-      const at = waitingPosition(spots[overflow], queue, scene.room.size);
-      if (!points.some((p) => Math.hypot(p.at[0] - at[0], p.at[2] - at[2]) < 1e-6)) points.push({ at, queue });
-    }
-    out.push({ who: "visitors", place: "characters.visitors.overflow", spot: overflow, points });
+  const out = new Map<Mover, CharacterPlace[]>();
+  const add = (who: Mover, spot: string, place: string, at: Vec3 | undefined = spots[spot]?.at, queue?: number) => {
+    if (!at) return;
+    const list = out.get(who) ?? [];
+    if (list.some((p) => Math.hypot(p.at[0] - at[0], p.at[1] - at[1], p.at[2] - at[2]) < 1e-6)) return;
+    list.push({ who, spot, at, place, ...(queue !== undefined ? { queue } : {}) });
+    out.set(who, list);
+  };
+  if (c?.tomo) {
+    add("tomo", c.tomo.spot, "characters.tomo.spot");
+    (c.tomo.rules ?? []).forEach((rule, i) => add("tomo", rule.spot, `characters.tomo.rules[${i}]`));
   }
-  if (c?.pet && spots[c.pet.spot]) out.push({ who: "pet", place: "characters.pet.spot", spot: c.pet.spot, points: [{ at: spots[c.pet.spot].at }] });
+  if (c?.visitors) {
+    c.visitors.spots.forEach((spot, i) => add("visitors", spot, `characters.visitors.spots[${i}]`));
+    const overflow = c.visitors.overflow;
+    if (overflow !== undefined && spots[overflow]) {
+      for (let queue = 0; queue < MAX_WAITING_DRAWN; queue++) add("visitors", overflow, "characters.visitors.overflow", waitingPosition(spots[overflow], queue, scene.room.size), queue);
+    }
+  }
+  if (c?.pet) {
+    add("pet", c.pet.spot, "characters.pet.spot");
+    (c.pet.rules ?? []).forEach((rule, i) => add("pet", rule.spot, `characters.pet.rules[${i}]`));
+  }
   return out;
 }
 
-/** Every move from a start to another defined spot, each target once per character. */
-export function characterUses(scene: HomeScene): SpotUse[] {
-  const c = scene.characters, spots = scene.spots ?? {};
-  const out: SpotUse[] = [];
-  const add = (who: Mover, from: string, place: string, to: string) => {
-    if (to === from || !spots[to] || out.some((u) => u.who === who && u.to === to)) return;
-    out.push({ who, place, from, to });
-  };
-  for (const start of characterStarts(scene)) {
-    if (start.who === "tomo") (c!.tomo!.rules ?? []).forEach((rule, i) => add("tomo", start.spot, `characters.tomo.rules[${i}]`, rule.spot));
-    if (start.who === "visitors") c!.visitors!.spots.forEach((spot, i) => add("visitors", start.spot, `characters.visitors.spots[${i}]`, spot));
-    if (start.who === "pet") (c!.pet!.rules ?? []).forEach((rule, i) => add("pet", start.spot, `characters.pet.rules[${i}]`, rule.spot));
+/** What a character cannot do: the places it cannot leave, and for each other place it cannot walk to, from where (merged by spot). */
+export interface CharacterReach {
+  who: Mover;
+  places: CharacterPlace[];
+  stuck: { at: CharacterPlace; found: Unreachable }[];
+  /** Per target spot: the first place there it cannot walk to, every place it cannot walk to it from, and why (for the first pair). */
+  cut: { to: CharacterPlace; from: CharacterPlace[]; found: Unreachable }[];
+  /** The places in each area of the floor they share (an area is a set of grid regions), for places that can get to the floor. */
+  areas: CharacterPlace[][];
+}
+
+export function characterReach(reach: SceneReach, scene: HomeScene): CharacterReach[] {
+  const out: CharacterReach[] = [];
+  for (const [who, places] of characterPlaces(scene)) {
+    const walker = walkerOf(who);
+    const stuck: CharacterReach["stuck"] = [];
+    const free: CharacterPlace[] = [];
+    for (const at of places) {
+      const found = reach.leave(at.at, walker);
+      if (found.ok) free.push(at); else stuck.push({ at, found });
+    }
+    const cut: CharacterReach["cut"] = [];
+    for (const to of free) {
+      for (const from of free) {
+        if (from === to) continue;
+        const found = reach.reach(from.at, to.at, walker);
+        if (found.ok) continue;
+        const entry = cut.find((c) => c.to.spot === to.spot);
+        if (!entry) cut.push({ to, from: [from], found });
+        else if (!entry.from.includes(from)) entry.from.push(from);
+      }
+    }
+    const areas = new Map<string, CharacterPlace[]>();
+    for (const at of free) {
+      const key = reach.regions(at.at, walker).join();
+      areas.set(key, [...(areas.get(key) ?? []), at]);
+    }
+    out.push({ who, places, stuck, cut, areas: [...areas.values()] });
   }
   return out;
 }
@@ -92,6 +126,7 @@ export class SceneReach {
   readonly placement: Placement;
   private grids = new Map<WalkerSize, NavGrid>();
   private regionsOf = new Map<string, number[]>();
+  private landsIn = new Map<string, boolean>();
   constructor(readonly scene: HomeScene, placement?: Placement) {
     this.placement = placement ?? placeScene(scene);
   }
@@ -122,7 +157,11 @@ export class SceneReach {
     const regions = this.regions(from, walker);
     if (!regions.length) return explain(this.grid(walker), from, undefined, "stuck");
     const grid = this.grid(walker);
-    return landings(grid, to, { regions }).length ? { ok: true } : explain(grid, to, regions, "unreachable");
+    // Whether `to` has a landing in these regions: the same for every start in them.
+    const key = `${walker.radius}/${walker.headroom}/${to.join(",")}/${regions.join(",")}`;
+    let lands = this.landsIn.get(key);
+    if (lands === undefined) { lands = landings(grid, to, { regions }).length > 0; this.landsIn.set(key, lands); }
+    return lands ? { ok: true } : explain(grid, to, regions, "unreachable");
   }
   /** The way itself, for the floor plan's lengths. */
   route(from: Vec3, to: Vec3, walker: WalkerSize): RouteResult {

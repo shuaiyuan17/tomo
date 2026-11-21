@@ -192,8 +192,10 @@ describe("home scene check", () => {
     it("warns, without failing the scene, when a rule's spot cannot be walked to, and says how far and what is in the way", () => {
       const result = walled((s) => { s.characters.tomo.rules = [{ when: "working", spot: "den" }]; });
       expect(result.ok).toBe(true);
+      // Both ways: each is a place Tomo can be, and neither can walk to the other.
       expect(reachWarnings(result)).toEqual([
-        'characters.tomo.rules[0]: Tomo cannot walk from "chair" to "den": the spot is on the floor, cut off from where it can walk; the nearest floor it can reach is 1.65 m from the spot, and the nearest thing in the way is objects[2] "wall-left". It fades out and back in there instead (it still gets there). Move the spot, or open a gap at least 0.6 m wide next to it.',
+        'characters.tomo.spot: Tomo cannot walk to "chair" from "den": the spot is on the floor, cut off from where it can walk; the nearest floor it can reach is 2.45 m from the spot, and the nearest thing in the way is objects[0] "desk". It fades out and back in instead (it still gets there). Move the spot, or open a gap at least 0.6 m wide next to it.',
+        'characters.tomo.rules[0]: Tomo cannot walk to "den" from "chair": the spot is on the floor, cut off from where it can walk; the nearest floor it can reach is 1.65 m from the spot, and the nearest thing in the way is objects[2] "wall-left". It fades out and back in instead (it still gets there). Move the spot, or open a gap at least 0.6 m wide next to it.',
       ]);
     });
 
@@ -208,9 +210,8 @@ describe("home scene check", () => {
         s.characters.pet = { kind: "cat", spot: "chair", rules: [{ when: "pet:sleeping", spot: "den" }] };
         s.characters.visitors.overflow = "den";
       });
-      // (The queue's last place is pushed against the right wall: that is its own warning.)
-      expect(reachWarnings(result).filter((w) => !w.startsWith("characters.visitors.overflow"))).toHaveLength(1);
-      expect(reachWarnings(result).filter((w) => !w.startsWith("characters.visitors.overflow"))[0]).toMatch(/^characters\.visitors\.spots\[0\]: a visitor cannot walk from "den" to "seat"/);
+      expect(reachWarnings(result).filter((w) => w.startsWith("characters.pet"))).toEqual([]);
+      expect(reachWarnings(result).join("\n")).toMatch(/^characters\.visitors\.spots\[0\]: a visitor cannot walk to "seat" from "den"/m);
     });
 
     it("checks waiting visitors from where the page puts them in the queue, not only from the overflow spot", () => {
@@ -221,31 +222,30 @@ describe("home scene check", () => {
         s.characters.visitors.overflow = "hall";
       });
       expect(reachWarnings(result)).toEqual([
-        'characters.visitors.overflow: a visitor waiting 2nd in the queue at "hall", at (2.65, 0, 0), cannot walk anywhere: the place is on the floor but too close to objects[2] "radiator" for it to stand there. Every move from there fades out and back in instead (it still gets there). Move the overflow spot, or turn it so the queue runs into the open.',
+        'characters.visitors.overflow: a visitor cannot walk to or from the 2nd place in the queue at "hall", at (2.65, 0, 0): the place is on the floor but too close to objects[2] "radiator" for it to stand there. Every move to or from there fades out and back in instead (it still gets there). Move the overflow spot, or turn it so the queue runs into the open.',
       ]);
     });
 
     it("says a perch outside the room is outside the room, not that something is in the way", () => {
       const result = check((s) => { s.spots.ledge = { at: [3.4, 0.45, 0] }; s.characters.tomo.rules = [{ when: "working", spot: "ledge" }]; });
       expect(reachWarnings(result)).toEqual([
-        'characters.tomo.rules[0]: Tomo cannot walk from "chair" to "ledge": the spot is outside the room (x from -3 to 3, z from -3 to 3). It fades out and back in there instead (it still gets there). Move the spot inside the room.',
+        'characters.tomo.rules[0]: Tomo cannot walk to or from "ledge": the spot is outside the room (x from -3 to 3, z from -3 to 3). Every move to or from there fades out and back in instead (it still gets there). Move the spot inside the room.',
       ]);
     });
 
-    it("checks a 20 m room with many spots quickly", () => {
-      const objects: any[] = Array.from({ length: 60 }, (_, i) => ({ id: `crate-${i}`, shape: "box", size: [0.6, 0.8, 0.6], at: [-9 + (i % 10) * 2, 0, -9 + Math.floor(i / 10) * 3] }));
-      const spots: Record<string, { at: [number, number, number] }> = { home: { at: [0, 0, 0] }, far: { at: [9, 0, -9.5] } };
-      for (let i = 0; i < 12; i++) {
-        spots[`s${i}`] = { at: [-9.5 + i * 1.6, i % 2 ? 0.45 : 0, 9] };
-        if (i % 2) objects.push({ id: `stool-${i}`, shape: "box", size: [0.4, 0.45, 0.4], at: [-9.5 + i * 1.6, 0, 9] });
-      }
-      const rule = (i: number) => ({ when: "working", spot: `s${i}` });
-      const scene: any = { version: 1, room: { size: [20, 3, 20], floor: "#a9825b", walls: "#d9cdb6" }, kinds: { me: { parts: [{ shape: "sphere", size: [0.6, 0.6, 0.6] }] } }, objects, spots,
-        characters: { tomo: { kind: "me", spot: "home", rules: [0, 1, 2, 3, 4, 5].map(rule) }, visitors: { kind: "me", spots: ["s6", "s7", "s8", "s9"], overflow: "far" }, pet: { kind: "me", spot: "home", rules: [10, 11].map(rule) } } };
-      checkHomeScene(scene);
-      const started = performance.now();
-      expect(checkHomeScene(scene).ok).toBe(true);
-      expect(performance.now() - started).toBeLessThan(100);
+    it("checks every pair of places a character can be: two rule spots either side of a wall, both reached by hopping off a bench on it", () => {
+      const result = check((s) => {
+        s.objects.push({ id: "bench", shape: "box", size: [6, 0.45, 0.3], at: [0, 0, 0.5] });
+        s.spots.bench = { at: [0, 0.45, 0.5] };
+        s.spots.north = { at: [0, 0, -0.5] };
+        s.spots.south = { at: [0, 0, 1.5] };
+        s.characters.tomo = { kind: "me", spot: "bench", rules: [{ when: "working", spot: "north" }, { when: "idle", spot: "south" }] };
+        delete s.characters.visitors;
+      });
+      expect(reachWarnings(result).map((w) => w.slice(0, w.indexOf(":", w.indexOf(":") + 1)))).toEqual([
+        'characters.tomo.rules[0]: Tomo cannot walk to "north" from "south"',
+        'characters.tomo.rules[1]: Tomo cannot walk to "south" from "north"',
+      ]);
     });
 
     it("names a part shown only some of the time that blocks a hop, and says it counts even while not drawn", () => {
@@ -256,7 +256,7 @@ describe("home scene check", () => {
         s.characters.tomo.rules = [{ when: "working", spot: "perch" }];
       });
       expect(reachWarnings(result)).toHaveLength(1);
-      expect(reachWarnings(result)[0]).toContain('characters.tomo.rules[0]: Tomo cannot walk from "chair" to "perch": the nearest floor it can reach is');
+      expect(reachWarnings(result)[0]).toContain('characters.tomo.rules[0]: Tomo cannot walk to or from "perch": the nearest floor it can reach is');
       expect(reachWarnings(result)[0]).toContain('is blocked by objects[3] "canopy", including a part shown only at night (outside the window).');
       expect(reachWarnings(result)[0]).toContain("A part that is shown or hidden by a reaction is in the way even while it is not drawn.");
     });

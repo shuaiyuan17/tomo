@@ -6,7 +6,7 @@ import {
 import { centre, num, placeScene, roomBox, vec, whatOf, type Box, type Placement } from "./geometry.js";
 import { describeReaction } from "./floor-plan.js";
 import { NAV_MAX_HOP, type Hurdle } from "./nav.js";
-import { characterStarts, characterUses, MOVER_NAMES, SceneReach, walkerOf, type Mover, type SpotStart, type StartPoint, type Unreachable } from "./reach.js";
+import { characterReach, MOVER_NAMES, SceneReach, walkerOf, type CharacterPlace, type Unreachable } from "./reach.js";
 
 /**
  * The whole-scene check: everything the zod schema cannot see because it
@@ -505,44 +505,24 @@ function checkReach(scene: HomeScene, report: Report): void {
   const reach = new SceneReach(scene);
   const room = scene.room.size;
   const extent = `x from ${num(-room[0] / 2)} to ${num(room[0] / 2)}, z from ${num(-room[2] / 2)} to ${num(room[2] / 2)}`;
-  const say = (found: Unreachable, noun: string, radius: number, queue: boolean) =>
-    `${whyNot(found, scene, reach.placement, noun, extent)} ${found.reason === "stuck" ? "Every move from there fades out and back in instead" : "It fades out and back in there instead"} (it still gets there). ${howToFix(found, radius, reach.placement, queue)}`;
-  /** Where a start point is, in words: the spot, or a place in the visitors' queue there. */
-  const fromWords = (start: SpotStart, point: StartPoint) => point.queue
-    ? `${ordinal(point.queue + 1)} in the queue at ${JSON.stringify(start.spot)}, at ${vec(point.at)},` : JSON.stringify(start.spot);
-  const usable = new Map<Mover, { start: SpotStart; points: StartPoint[] }>();
-  for (const start of characterStarts(scene)) {
-    const walker = walkerOf(start.who);
-    const ok: StartPoint[] = [];
-    const queued: { point: StartPoint; found: Unreachable }[] = [];
-    for (const point of start.points) {
-      const found = reach.leave(point.at, walker);
-      if (found.ok) { ok.push(point); continue; }
-      // Later places in the queue: one warning for all of them, below.
-      if (point.queue) { queued.push({ point, found }); continue; }
-      const what = found.why === "hop" || found.why === "far" ? `cannot get down from ${fromWords(start, point)} to the floor` : `cannot walk anywhere from ${fromWords(start, point)}`;
-      report.warn(`${start.place}: ${MOVER_NAMES[start.who]} ${what}: ${say(found, "the spot", walker.radius, false)}`);
+  const say = (found: Unreachable, noun: string, radius: number, queue: boolean, stuck: boolean) =>
+    `${whyNot(found, scene, reach.placement, noun, extent)} ${stuck ? "Every move to or from there fades out and back in instead" : "It fades out and back in instead"} (it still gets there). ${howToFix(found, radius, reach.placement, queue)}`;
+  for (const { who, stuck, cut } of characterReach(reach, scene)) {
+    const radius = walkerOf(who).radius;
+    for (const { at, found } of stuck) {
+      report.warn(`${at.place}: ${MOVER_NAMES[who]} cannot walk to or from ${placeWords(at)}: ${say(found, at.queue ? "the place" : "the spot", radius, !!at.queue, true)}`);
     }
-    if (queued.length) {
-      const [first] = queued;
-      const places = queued.map((q) => ordinal(q.point.queue! + 1));
-      const listed = places.length > 1 ? `${places.slice(0, -1).join(", ")} or ${places.at(-1)}` : places[0];
-      const where = queued.length > 1 ? ` cannot walk anywhere (the ${places[0]} is at ${vec(first.point.at)})` : `, at ${vec(first.point.at)}, cannot walk anywhere`;
-      report.warn(`${start.place}: ${MOVER_NAMES[start.who]} waiting ${listed} in the queue at ${JSON.stringify(start.spot)}${where}: ${say(first.found, "the place", walker.radius, true)}`);
-    }
-    usable.set(start.who, { start, points: ok });
-  }
-  for (const use of characterUses(scene)) {
-    const from = usable.get(use.who)!;
-    const walker = walkerOf(use.who);
-    for (const point of from.points) {
-      const found = reach.reach(point.at, reach.spotAt(use.to), walker);
-      if (found.ok) continue;
-      const origin = point.queue ? `the ${fromWords(from.start, point).replace(" in the queue", " place in the queue")}` : fromWords(from.start, point);
-      report.warn(`${use.place}: ${MOVER_NAMES[use.who]} cannot walk from ${origin} to ${JSON.stringify(use.to)}: ${say(found, "the spot", walker.radius, false)}`);
-      break; // One warning a spot: the first place it cannot be walked to from.
+    for (const { to, from, found } of cut) {
+      const list = from.slice(0, 4).map(placeWords);
+      const more = from.length > 4 ? ` or ${from.length - 4} more places` : "";
+      const froms = list.length > 1 && !more ? `${list.slice(0, -1).join(", ")} or ${list.at(-1)}` : `${list.join(", ")}${more}`;
+      report.warn(`${to.place}: ${MOVER_NAMES[who]} cannot walk to ${placeWords(to)} from ${froms}: ${say(found, to.queue ? "the place" : "the spot", radius, !!to.queue, false)}`);
     }
   }
+}
+/** A place in words: `"desk-chair"`, or `the 3rd place in the queue at "hall", at (x, y, z)`. */
+function placeWords(at: CharacterPlace): string {
+  return at.queue ? `the ${ordinal(at.queue + 1)} place in the queue at ${JSON.stringify(at.spot)}, at ${vec(at.at)}` : JSON.stringify(at.spot);
 }
 function ordinal(n: number): string {
   const tens = n % 100;

@@ -80,21 +80,17 @@ describe("home floor plan", () => {
       characters: { tomo: { kind: "me", spot: "rug", rules: [{ when: "working", spot: "seat" }, { when: "night", spot: "den" }] }, pet: { kind: "me", spot: "rug", rules: [{ when: "pet:sleeping", spot: "den" }] } },
     };
     const text = renderFloorPlan(scene);
-    expect(text).toContain("Floor Tomo can walk on (Tomo's size), from rug: . walkable, # in the way, ~ floor cut off from there, digits are spots:");
-    expect(text).toContain("Floor the pet can walk on (the pet's size), from rug:");
-    // Tomo's map: the den side is cut off (~); the pet's: it is not.
-    const [, tomoMap, petMap] = text.split(/^Floor (?=Tomo |the pet )/m);
-    const body = (map: string) => map.split("\n\n")[0].split("\n").filter((line) => line.startsWith("|")).join("\n");
-    expect(body(tomoMap)).toContain("~");
-    expect(body(petMap)).not.toContain("~");
+    expect(text).toContain("Floor Tomo can walk on (Tomo's size): . floor one of its spots leads to, # in the way, ~ floor none of them gets to, digits are spots. Its spots are in 2 areas that cannot reach each other: rug and seat; den.");
+    expect(text).toContain("Floor the pet can walk on (the pet's size): . floor one of its spots leads to");
+    expect(text.split(/^Floor the pet/m)[1].split("\n\n")[0]).not.toContain("areas that cannot reach");
     expect(text).toContain("- 2 seat: at (1, 0.45, -1), back right, facing 0° (toward the viewer); a perch: a 0.");
-    expect(text).toContain("- 3 den: at (0, 0, 1.6), front centre, facing 0° (toward the viewer); Tomo: cannot be walked to from rug (it fades out and back in); the pet: on the floor.");
+    expect(text).toContain("- 3 den: at (0, 0, 1.6), front centre, facing 0° (toward the viewer); Tomo: on the floor, but cannot be walked to from rug or seat; the pet: on the floor.");
     expect(text).toMatch(/Walks from rug: to seat: [\d.]+ m on foot and a [\d.]+ m hop up; to den: it cannot walk \(it fades out and back in\)\./);
-    // Tomo and the visitors are the same size but start on either side of the wall: one map each, each labelled with its own start.
+    // Tomo and the visitors are the same size: one map, whose areas say whose spots each holds.
     const apart = renderFloorPlan({ ...scene, spots: { ...scene.spots, hall: { at: [0, 0, 1.6] }, seat2: { at: [-1, 0, 1.6] } },
-      characters: { tomo: scene.characters!.tomo, visitors: { kind: "me", spots: ["seat2"], overflow: "hall" } } });
-    expect(apart).toContain("Floor Tomo can walk on (Tomo's size), from rug:");
-    expect(apart).toContain("Floor the visitors can walk on (Tomo's size), from hall:");
+      characters: { tomo: { kind: "me", spot: "rug", rules: [{ when: "working", spot: "seat" }] }, visitors: { kind: "me", spots: ["seat2"], overflow: "hall" } } });
+    expect(apart).toContain("Floor Tomo and the visitors can walk on (Tomo's size): . floor one of their spots leads to, # in the way, ~ floor none of them gets to, digits are spots. Their spots are in 2 areas that cannot reach each other: rug and seat; seat2 and the queue at hall.");
+    expect(apart.match(/^Floor .* can walk on/gm)).toHaveLength(1);
     expect(text.match(/^Floor .* can walk on/gm)).toHaveLength(2);
     // No characters, no walking map.
     expect(renderFloorPlan({ ...scene, characters: undefined })).not.toContain("can walk on");

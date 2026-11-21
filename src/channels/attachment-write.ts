@@ -27,6 +27,47 @@ import { log } from "../logger.js";
  * unchanged in behaviour so the two older siblings get the same guarantee.
  */
 
+/*
+ * Name-building helpers shared by all three inbound stores. The image store's
+ * names are reverse-parsed by isImageFiledFor (web media view), so any change
+ * to these formats is a change to that parser's contract too.
+ */
+
+/** Zero-padded date/time parts in local timezone. */
+function pad(n: number, width = 2): string {
+  return String(n).padStart(width, "0");
+}
+
+/** `YYYY-MM-DD` in local time: the per-day folder an attachment is filed under. */
+export function localDateFolder(d: Date): string {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** `HHMMSS` in local time: the leading part of an attachment's filename. */
+export function localTimeStamp(d: Date): string {
+  return `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+/**
+ * Replace every character outside `[A-Za-z0-9._-]` with `_`; `fallback` when
+ * `part` is undefined or empty. Not the same rules as the stores' filename
+ * sanitizers (sanitizeFilenameStem / sanitizeAttachmentFilename), which also
+ * strip paths and cap length.
+ */
+export function sanitize(part: string | undefined, fallback: string): string {
+  if (!part) return fallback;
+  const cleaned = part.replace(/[^A-Za-z0-9._-]/g, "_");
+  return cleaned.length > 0 ? cleaned : fallback;
+}
+
+/** First 8 dash-free characters of an upstream guid, or "unknown". */
+export function shortGuid(guid: string | undefined): string {
+  if (!guid) return "unknown";
+  // Strip dashes for compactness; first 8 chars is enough to disambiguate within a second.
+  const compact = guid.replace(/-/g, "");
+  return compact.slice(0, 8) || "unknown";
+}
+
 /** How many `name-1`, `name-2`, … variants to try before giving up. */
 export const MAX_COLLISION_ATTEMPTS = 50;
 

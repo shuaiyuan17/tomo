@@ -1,6 +1,12 @@
 import { join } from "node:path";
 import { log } from "../logger.js";
-import { writeWithoutOverwrite } from "./attachment-write.js";
+import {
+  localDateFolder,
+  localTimeStamp,
+  sanitize,
+  shortGuid,
+  writeWithoutOverwrite,
+} from "./attachment-write.js";
 import { formatSavedAndPending } from "./imageStore.js";
 
 export interface DocumentSaveMeta {
@@ -62,30 +68,6 @@ export function documentMimeToExt(mimeType: string | undefined): string {
     return sub.replace(/[^a-z0-9]/g, "").slice(0, MAX_MIME_EXT_LENGTH) || "bin";
   }
   return "bin";
-}
-
-function pad(n: number, width = 2): string {
-  return String(n).padStart(width, "0");
-}
-
-function localDateFolder(d: Date): string {
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
-
-function localTimeStamp(d: Date): string {
-  return `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-}
-
-function sanitize(part: string | undefined, fallback: string): string {
-  if (!part) return fallback;
-  const cleaned = part.replace(/[^A-Za-z0-9._-]/g, "_");
-  return cleaned.length > 0 ? cleaned : fallback;
-}
-
-function shortGuid(guid: string | undefined): string {
-  if (!guid) return "unknown";
-  const compact = guid.replace(/-/g, "");
-  return compact.slice(0, 8) || "unknown";
 }
 
 /**

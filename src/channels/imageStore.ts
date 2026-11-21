@@ -6,7 +6,13 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import { log } from "../logger.js";
 import { SIPS_TIMEOUT_MS } from "./heic.js";
-import { writeWithoutOverwrite } from "./attachment-write.js";
+import {
+  localDateFolder,
+  localTimeStamp,
+  sanitize,
+  shortGuid,
+  writeWithoutOverwrite,
+} from "./attachment-write.js";
 
 const execFileP = promisify(execFile);
 
@@ -34,32 +40,6 @@ export function mimeToExt(mimeType: string | undefined): string {
   // Generic image/<subtype> → use <subtype>
   if (m.startsWith("image/")) return m.slice(6).replace(/[^a-z0-9]/g, "") || "bin";
   return "bin";
-}
-
-/** Zero-padded date/time parts in local timezone. */
-function pad(n: number, width = 2): string {
-  return String(n).padStart(width, "0");
-}
-
-function localDateFolder(d: Date): string {
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
-
-function localTimeStamp(d: Date): string {
-  return `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-}
-
-function sanitize(part: string | undefined, fallback: string): string {
-  if (!part) return fallback;
-  const cleaned = part.replace(/[^A-Za-z0-9._-]/g, "_");
-  return cleaned.length > 0 ? cleaned : fallback;
-}
-
-function shortGuid(guid: string | undefined): string {
-  if (!guid) return "unknown";
-  // Strip dashes for compactness; first 8 chars is enough to disambiguate within a second.
-  const compact = guid.replace(/-/g, "");
-  return compact.slice(0, 8) || "unknown";
 }
 
 /** The `{session}` part of an inbound image's filename for a given meta.sessionKey. */

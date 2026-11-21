@@ -273,6 +273,11 @@ describe("home navigation: routes", () => {
     const scene = room([block(-0.2, 0.2, -0.2, 0.2, 0.45), { shape: "box", size: [6, 0.1, 6], at: [0, 1.25, 0] }]);
     expect(findRoute(buildNavGrid(scene), [-2, 0, 0], [0, 0.45, 0])).toMatchObject({ ok: false, reason: "unreachable" });
     expect(findRoute(buildNavGrid(scene, { walker: NAV_PET }), [-2, 0, 0], [0, 0.45, 0]).ok).toBe(true);
+    // The arc lifts the whole body: at the top of the hop Tomo's head is at 0.45 + 0.3 + 0.9 = 1.65 m,
+    // so a slab at 1.5 m still blocks it, while one at 1.8 m does not.
+    const at = (y: number) => room([block(-0.2, 0.2, -0.2, 0.2, 0.45), { shape: "box", size: [6, 0.1, 6], at: [0, y, 0] }]);
+    expect(findRoute(buildNavGrid(at(1.5)), [-2, 0, 0], [0, 0.45, 0])).toMatchObject({ ok: false, reason: "unreachable" });
+    expect(findRoute(buildNavGrid(at(1.8)), [-2, 0, 0], [0, 0.45, 0]).ok).toBe(true);
   });
 
   it("does not hop out of the room to a perch beyond its walls or open front", () => {

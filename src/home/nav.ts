@@ -246,8 +246,8 @@ export function clearHop(grid: NavGrid, at: Vec3, point: FloorPoint): boolean {
   if (!inRoom(grid, at[0], at[2]) || !inRoom(grid, point[0], point[1])) return false;
   const under = (h: Hurdle) => Math.abs(h.top - at[1]) <= NAV_PERCH_TOLERANCE
     && at[0] >= h.min[0] && at[0] <= h.max[0] && at[2] >= h.min[1] && at[2] <= h.max[1];
-  // The hop's top: its arc, or the walker's own height when that is more (its head goes up with it).
-  const apex = Math.max(at[1], 0) + Math.max(NAV_HOP_ARC, grid.headroom);
+  // The hop's top: the arc lifts the whole walker, so its head reaches arc + its own height.
+  const apex = Math.max(at[1], 0) + NAV_HOP_ARC + grid.headroom;
   return grid.hurdles.every((h) => h.bottom >= apex || under(h) || !segmentMeetsBox([at[0], at[2]], point, h));
 }
 /** Whether segment a–b meets the inside of a footprint (Liang–Barsky; grazing an edge does not count). */

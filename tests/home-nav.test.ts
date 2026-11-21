@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { placeScene, type Vec3 } from "../src/home/geometry.js";
 import {
-  buildNavGrid, clearLine, findRoute, landings, navObstacles, NAV_MAX_HOP, NAV_RADIUS, onFloor,
+  buildNavGrid, clearLine, findRoute, landings, navObstacles, NAV_MAX_HOP, NAV_PET, NAV_RADIUS, NAV_WALKER, onFloor,
   type FloorPoint, type NavGrid, type NavRoute,
 } from "../src/home/nav.js";
 import type { HomePart, HomeScene } from "../src/home/scene.js";
@@ -25,10 +25,10 @@ function walk(grid: NavGrid, from: Vec3, to: Vec3): NavRoute {
  * nearer than `radius` to a wall or to any part in the way, measured on the
  * scene's own placement (not on the grid the route was found on).
  */
-function expectClear(scene: HomeScene, route: NavRoute, radius = NAV_RADIUS): void {
+function expectClear(scene: HomeScene, route: NavRoute, radius = NAV_RADIUS, headroom = 0.9): void {
   const [w, , d] = scene.room.size;
   const boxes = placeScene(scene).objects.flatMap((o) => o.leaves)
-    .filter((l) => l.solid && l.box.max[1] > 0.12 && l.box.min[1] < 0.9).map((l) => l.box);
+    .filter((l) => l.solid && l.box.max[1] > 0.12 && l.box.min[1] < headroom).map((l) => l.box);
   const samples: FloorPoint[] = [...route.points];
   for (let i = 1; i < route.points.length; i++) {
     const [a, b] = [route.points[i - 1], route.points[i]];
@@ -163,7 +163,7 @@ describe("home navigation: routes", () => {
     // With no radius (and cells of 0.25 m, exact in binary), the two boxes
     // leave free cells touching only diagonally at (0, 0).
     const scene = room([block(-1, 0, -1, 0), block(0, 1, 0, 1)]);
-    const grid = buildNavGrid(scene, { radius: 0, cell: 0.25 });
+    const grid = buildNavGrid(scene, { walker: { radius: 0, headroom: 0.9 }, cell: 0.25 });
     expect(clearLine(grid, [-0.5, 0.5], [0.5, -0.5])).toBe(false);
     const route = walk(grid, [-0.5, 0, 0.5], [0.5, 0, -0.5]);
     expectClear(scene, route, 0);
@@ -173,7 +173,7 @@ describe("home navigation: routes", () => {
   it("does not run along a grid line beside a blocked cell", () => {
     // Cells of 0.25 m: z = 0 and x = 0 are grid lines exactly. Block the row
     // just behind z = 0 and the column just left of x = 0, by hand.
-    const grid = buildNavGrid(room(), { radius: 0, cell: 0.25 });
+    const grid = buildNavGrid(room(), { walker: { radius: 0, headroom: 0.9 }, cell: 0.25 });
     for (let c = 10; c <= 13; c++) grid.blocked[11 * grid.cols + c] = 1;
     for (let r = 4; r <= 7; r++) grid.blocked[r * grid.cols + 11] = 1;
     expect(clearLine(grid, [-0.5, 0], [0.5, 0])).toBe(false);
@@ -284,22 +284,41 @@ describe("home navigation: the starter room", () => {
     expect([...used].sort()).toEqual(Object.keys(spots).sort());
   });
 
-  // The cat's hut: its spot is at floor height (0.09 m) under a roof that
-  // starts at 0.5 m, below head room, so its floor is blocked and, being
-  // floor, it is not hopped to. Pinned so a change to that is noticed.
-  const UNREACHABLE = ["pet-nest"];
-  it("cannot walk into the cat's hut", () => {
-    for (const name of UNREACHABLE) expect(findRoute(grid, spots[chars.pet!.spot].at, spots[name].at)).toMatchObject({ ok: false, reason: "unreachable" });
+  it("walks a pet into the cat's hut, which Tomo's size does not fit", () => {
+    // Its spot is at floor height (0.09 m), under a roof from 0.5 m and a
+    // door 0.4 m wide under a lintel at 0.4 m.
+    const nest = spots["pet-nest"].at, bed = spots[chars.pet!.spot].at;
+    expect(findRoute(buildNavGrid(STARTER_SCENE, { walker: NAV_WALKER }), bed, nest)).toMatchObject({ ok: false, reason: "unreachable" });
+    const pet = buildNavGrid(STARTER_SCENE, { walker: NAV_PET });
+    expect(onFloor(pet, nest)).toBe(true);
+    const route = walk(pet, bed, nest);
+    expect(route.hopOn).toBe(0);
+    expectClear(STARTER_SCENE, route, NAV_PET.radius, NAV_PET.headroom);
   });
+
+  // Tomo's size: everywhere Tomo and the visitors go, from both homes.
+  const forTomo = [...used].filter((n) => n !== "pet-nest");
   for (const home of [chars.tomo!.spot, chars.pet!.spot]) {
-    for (const name of [...used].filter((n) => !UNREACHABLE.includes(n))) {
-      it(`gets from ${home} to ${name}, on foot or with a hop`, () => {
+    for (const name of forTomo) {
+      it(`gets Tomo's size from ${home} to ${name}, on foot or with a hop`, () => {
         const route = walk(grid, spots[home].at, spots[name].at);
         expectClear(STARTER_SCENE, route);
         expect(route.hopOn).toBeLessThanOrEqual(NAV_MAX_HOP);
         expect(route.hopOff).toBeLessThanOrEqual(NAV_MAX_HOP);
         if (onFloor(grid, spots[name].at)) expect(route.hopOn).toBe(0);
         else expect(landings(grid, spots[name].at).length).toBeGreaterThan(0);
+      });
+    }
+  }
+
+  // A pet's size: everywhere the pet goes.
+  const petGrid = buildNavGrid(STARTER_SCENE, { walker: NAV_PET });
+  const forPet = [chars.pet!.spot, ...(chars.pet!.rules ?? []).map((r) => r.spot)];
+  for (const from of forPet) {
+    for (const to of forPet) {
+      it(`gets a pet from ${from} to ${to}`, () => {
+        const route = walk(petGrid, spots[from].at, spots[to].at);
+        expectClear(STARTER_SCENE, route, NAV_PET.radius, NAV_PET.headroom);
       });
     }
   }

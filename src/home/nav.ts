@@ -12,7 +12,7 @@ import type { HomeScene } from "./scene.js";
  *   the viewer, as in the scene);
  * - an obstacle is a solid leaf (a shape; pictures, signs and windows are
  *   flat panels) whose world box reaches above NAV_STEP and starts below
- *   NAV_HEADROOM: rugs and a pet bed can be walked on, a wall shelf or a
+ *   the walker's head room (NAV_HEADROOM for Tomo's size): rugs and a pet bed can be walked on, a wall shelf or a
  *   window sill is overhead, a desk top blocks (nobody walks under it). Its
  *   footprint is its box seen from above, so round parts count as squares;
  * - a cell is blocked when any part of it is nearer than the walker's
@@ -40,10 +40,21 @@ import type { HomeScene } from "./scene.js";
 export const NAV_CELL = 0.1;
 /** Taller than this is in the way; lower can be stepped over. */
 export const NAV_STEP = 0.12;
-/** Starting at or above this is overhead; a character walks under it. */
+/** Starting at or above this is overhead; a Tomo-sized character walks under it. */
 export const NAV_HEADROOM = 0.9;
-/** A character's footprint radius when the scene does not say. */
+/** A Tomo-sized character's footprint radius. */
 export const NAV_RADIUS = 0.25;
+
+/** How much room a walker needs: its footprint radius, and the height it walks under. */
+export interface WalkerSize { radius: number; headroom: number }
+/** Tomo, a visitor: the default. */
+export const NAV_WALKER: WalkerSize = { radius: NAV_RADIUS, headroom: NAV_HEADROOM };
+/**
+ * A pet (the starter's cat is 0.34 m wide and 0.42 m to its ears, a tiny
+ * crab smaller): it walks under a desk or a stool's seat, and through a
+ * 0.4 m door under a 0.4 m lintel, such as the starter cat hut's.
+ */
+export const NAV_PET: WalkerSize = { radius: 0.1, headroom: 0.35 };
 /** The longest hop (horizontal) between a perch and the floor. */
 export const NAV_MAX_HOP = 1.2;
 /** Landing cells considered beyond the nearest one. */
@@ -67,6 +78,7 @@ export interface Hurdle extends Footprint { top: number }
 export interface NavGrid {
   cell: number;
   radius: number;
+  headroom: number;
   cols: number;
   rows: number;
   /** [x, z] of the outer corner of cell 0 (the room's back left corner). */
@@ -108,23 +120,23 @@ export type RouteResult =
   | { ok: false; reason: "stuck" | "unreachable"; nearest: number };
 
 export interface NavOptions {
-  /** Footprint radius of the walker, metres. Default NAV_RADIUS. */
-  radius?: number;
+  /** The walker's size. Default NAV_WALKER. */
+  walker?: WalkerSize;
   /** Cell size, metres. Default NAV_CELL. */
   cell?: number;
   /** A placement already computed for this scene. */
   placement?: Placement;
 }
 
-/** The footprints of everything in the way (see the model above). */
-export function navObstacles(scene: HomeScene, placement: Placement = placeScene(scene)): Footprint[] {
-  return obstacles(placement).map(({ min, max }) => ({ min, max }));
+/** The footprints of everything in the way of a walker with this head room (see the model above). */
+export function navObstacles(scene: HomeScene, headroom = NAV_HEADROOM, placement: Placement = placeScene(scene)): Footprint[] {
+  return obstacles(placement, headroom).map(({ min, max }) => ({ min, max }));
 }
-function obstacles(placement: Placement): Hurdle[] {
+function obstacles(placement: Placement, headroom: number): Hurdle[] {
   const out: Hurdle[] = [];
   for (const object of placement.objects) {
     for (const leaf of object.leaves) {
-      if (!leaf.solid || leaf.box.max[1] <= NAV_STEP || leaf.box.min[1] >= NAV_HEADROOM) continue;
+      if (!leaf.solid || leaf.box.max[1] <= NAV_STEP || leaf.box.min[1] >= headroom) continue;
       out.push({ min: [leaf.box.min[0], leaf.box.min[2]], max: [leaf.box.max[0], leaf.box.max[2]], top: leaf.box.max[1] });
     }
   }
@@ -133,7 +145,9 @@ function obstacles(placement: Placement): Hurdle[] {
 
 export function buildNavGrid(scene: HomeScene, options: NavOptions = {}): NavGrid {
   const cell = options.cell ?? NAV_CELL;
-  const radius = Math.max(0, options.radius ?? NAV_RADIUS);
+  const walker = options.walker ?? NAV_WALKER;
+  const radius = Math.max(0, walker.radius);
+  const headroom = walker.headroom;
   const [w, , d] = scene.room.size;
   const cols = Math.max(1, Math.ceil(w / cell - 1e-9));
   const rows = Math.max(1, Math.ceil(d / cell - 1e-9));
@@ -149,7 +163,7 @@ export function buildNavGrid(scene: HomeScene, options: NavOptions = {}): NavGri
       if (x0(c) < origin[0] + radius - EPS || x0(c + 1) > w / 2 - radius + EPS || z0(r) < origin[1] + radius - EPS || z0(r + 1) > d / 2 - radius + EPS) blocked[r * cols + c] = 1;
     }
   }
-  const found = obstacles(options.placement ?? placeScene(scene));
+  const found = obstacles(options.placement ?? placeScene(scene), headroom);
   for (const { min, max } of found) {
     const c0 = Math.max(0, Math.floor((min[0] - radius - origin[0]) / cell));
     const c1 = Math.min(cols - 1, Math.floor((max[0] + radius - origin[0]) / cell));
@@ -186,7 +200,7 @@ export function buildNavGrid(scene: HomeScene, options: NavOptions = {}): NavGri
     }
     regionSizes.push(size);
   }
-  return { cell, radius, cols, rows, origin, blocked, region, regionSizes, hurdles: found, room: [w, d] };
+  return { cell, radius, headroom, cols, rows, origin, blocked, region, regionSizes, hurdles: found, room: [w, d] };
 }
 
 /** The cell under a floor point, or -1 outside the grid. */

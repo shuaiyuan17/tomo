@@ -1,4 +1,4 @@
-import type { HomeCharacters, HomeReaction, HomeSpot } from "../../../src/home/scene.js";
+import type { HomeCharacters, HomeReaction } from "../../../src/home/scene.js";
 import { MAX_SIGN_CHARS, REACTION_DEFAULTS, SIGN_VALUES } from "./contract.js";
 import type { HomeStatus, HomeSubagent } from "../../../src/home/status.js";
 import { cronFlashing, homeCaption, idleValue, nextJobValue } from "./caption.js";
@@ -133,17 +133,3 @@ export function visitorKind(visitors: NonNullable<HomeCharacters["visitors"]>, t
   return (type && visitors.kinds?.[type.toLowerCase()]) || visitors.kind;
 }
 
-/** Waiting visitors drawn at most (the caption still counts them all). */
-export const MAX_WAITING_DRAWN = 8;
-export const WAITING_GAP = 0.7;
-/**
- * Where the `index`-th waiting visitor stands: in a row through the
- * overflow spot, across the way it faces (0, right, left, further right…),
- * kept inside the room.
- */
-export function waitingPosition(spot: HomeSpot, index: number, room: Vec3): Vec3 {
-  const step = Math.ceil(index / 2) * (index % 2 ? 1 : -1) * WAITING_GAP;
-  const facing = (spot.facing ?? 0) * Math.PI / 180;
-  const clamp = (value: number, half: number) => Math.max(-half + 0.3, Math.min(half - 0.3, value));
-  return [clamp(spot.at[0] + Math.cos(facing) * step, room[0] / 2), spot.at[1], clamp(spot.at[2] - Math.sin(facing) * step, room[2] / 2)];
-}

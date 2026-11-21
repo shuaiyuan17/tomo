@@ -2,7 +2,8 @@ import { Color, DirectionalLight, Group, HemisphereLight, MathUtils, Mesh, PCFSo
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { HomeScene } from "../../../../src/home/scene.js";
 import type { HomeSubagent } from "../../../../src/home/status.js";
-import { fillSign, MAX_WAITING_DRAWN, partEffects, seatVisitors, characterSpot, visitorKind, waitingPosition, type Conditions, type SignValues, type Vec3 } from "../evaluate.js";
+import { fillSign, partEffects, seatVisitors, characterSpot, visitorKind, type Conditions, type SignValues, type Vec3 } from "../evaluate.js";
+import { MAX_WAITING_DRAWN, waitingPosition } from "../../../../src/home/waiting.js";
 import { layoutKind, layoutScene } from "../layout.js";
 import { buildNodes, redrawSigns, retarget, signPixels, signScaleFor, stepPart, updateSigns, type Built } from "./build.js";
 import { Resources, SIGN_FONT } from "./resources.js";

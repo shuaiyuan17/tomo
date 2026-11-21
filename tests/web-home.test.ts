@@ -6,7 +6,8 @@ import { STARTER_SCENE } from "../src/home/starter.js";
 import type { HomeStatus } from "../src/home/status.js";
 import * as contract from "../web/src/home/contract.js";
 import { cronFlashing, formatHomeSpan, homeCaption, localizeHomeStatus, newerStatus } from "../web/src/home/caption.js";
-import { fillSign, holds, homeConditions, partEffects, seatVisitors, signValues, characterSpot, visitorKind, waitingPosition } from "../web/src/home/evaluate.js";
+import { fillSign, holds, homeConditions, partEffects, seatVisitors, signValues, characterSpot, visitorKind } from "../web/src/home/evaluate.js";
+import { waitingPosition } from "../src/home/waiting.js";
 import { layoutKind, layoutScene, rotationRows, transformBox, type LayoutNode } from "../web/src/home/layout.js";
 import { localSky, skyLight, skyOf, weatherWords } from "../web/src/home/sky.js";
 import { base64Bytes, snapshotBody } from "../web/src/home/snapshot.js";
@@ -157,7 +158,8 @@ describe("characters", () => {
     expect(waitingPosition(spot, 0, [6, 3, 6])).toEqual([0, 0, 2]);
     expect(waitingPosition(spot, 1, [6, 3, 6])[0]).toBeCloseTo(0.7);
     expect(waitingPosition(spot, 2, [6, 3, 6])[0]).toBeCloseTo(-0.7);
-    expect(waitingPosition({ at: [2.5, 0, 0], facing: 0 }, 1, [6, 3, 6])[0]).toBe(2.7);
+    // Kept a walker's radius and a grid cell from the wall, so it stands on floor it can walk from.
+    expect(waitingPosition({ at: [2.5, 0, 0], facing: 0 }, 1, [6, 3, 6])[0]).toBeCloseTo(2.65);
     const turned = waitingPosition({ at: [0, 0, 0], facing: 90 }, 1, [6, 3, 6]);
     expect(turned[0]).toBeCloseTo(0); expect(turned[2]).toBeCloseTo(-0.7);
   });

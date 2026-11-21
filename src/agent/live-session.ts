@@ -217,6 +217,25 @@ export interface LiveSessionSettings {
   onMcpStatus?: (connections: McpConnection[]) => void;
 }
 
+/**
+ * What whenClosed() needs of the CLI child: the SDK's SpawnedProcess wrapper
+ * (no pid; its "exit" fires once the child has exited and its stderr closed).
+ */
+interface CliChild {
+  exitCode: number | null;
+  signalCode?: string | null;
+  once(event: "exit" | "error", listener: () => void): unknown;
+}
+
+/** Resolves when the child has exited (or failed to start). Never rejects. */
+function childExited(child: CliChild): Promise<void> {
+  if (child.exitCode !== null || (child.signalCode ?? null) !== null) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    child.once("exit", resolve);
+    child.once("error", resolve);
+  });
+}
+
 export class LiveSession {
   private q: Query;
   // Input messages waiting for the SDK to pull them through messageGenerator.
@@ -1754,9 +1773,15 @@ export class LiveSession {
   /**
    * Resolves once a CLOSED session is fully gone: its event loop has ended
    * AND the CLI child has exited, so it can no longer append exit-time
-   * records to the transcript. Rides on the SDK's own cleanup, which waits
-   * for the exit (bounded, about 2s). Never rejects. Call it after close();
-   * on a live session it resolves at once (there is nothing to wait for).
+   * records to the transcript. Never rejects. Call it after close(); on a
+   * live session it resolves at once (there is nothing to wait for).
+   *
+   * WAITS ON THE CHILD ITSELF, UNBOUNDED. The SDK's cleanup (asyncDispose)
+   * stops waiting for the exit after about 2s, so on its own it can resolve
+   * while the child is still writing. The child is read off the runtime
+   * Query (`transport.process`, not in the SDK's types, so probed like
+   * setMcpServers); without it, the SDK's bounded wait is all there is.
+   * Callers bound the whole wait (IDLE_REAP_CLOSE_WAIT_MS).
    */
   whenClosed(): Promise<void> {
     return this.closedSettled ?? Promise.resolve();
@@ -1764,12 +1789,19 @@ export class LiveSession {
 
   private closedSettled: Promise<void> | undefined;
 
-  private async settleClose(): Promise<void> {
+  private async settleClose(child: CliChild | undefined): Promise<void> {
     const dispose = (this.q as unknown as { [Symbol.asyncDispose]?: () => Promise<void> })[Symbol.asyncDispose];
     await Promise.allSettled([
       typeof dispose === "function" ? dispose.call(this.q) : undefined,
       this.eventLoopDone,
+      child ? childExited(child) : undefined,
     ]);
+  }
+
+  /** The CLI child process the runtime Query holds, when it exposes one. */
+  private cliChild(): CliChild | undefined {
+    const child = (this.q as unknown as { transport?: { process?: unknown } }).transport?.process as Partial<CliChild> | undefined;
+    return child && typeof child.once === "function" && "exitCode" in child ? child as CliChild : undefined;
   }
 
   isAlive(): boolean {
@@ -1837,6 +1869,8 @@ export class LiveSession {
    * decided to exit, which is exactly the window shutdown does not have.
    */
   close(): void {
+    // Read before q.close(): the transport is the SDK's, and closing may drop it.
+    const child = this.closedSettled ? undefined : this.cliChild();
     this.alive = false;
     this.publishTasks(this.taskTracker.reset());
     this.notifyBackgroundIdle();
@@ -1846,6 +1880,6 @@ export class LiveSession {
     this.inputWaiter?.();
     this.q.close();
     this.failTurn(new Error("Session is closed"));
-    this.closedSettled ??= this.settleClose();
+    this.closedSettled ??= this.settleClose(child);
   }
 }

@@ -1056,6 +1056,25 @@ describe("LiveSessionManager idle reaper", () => {
     }
   });
 
+  it("a rewind that starts while a reaped session is exiting still holds the key", async () => {
+    let exited!: () => void;
+    mockState.closeGate = new Promise<void>((r) => { exited = r; });
+    const { manager, fake, key } = await idleSession();
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+    let resumed = false;
+    const next = manager.getOrCreateLiveSession(key).then((s) => { resumed = true; return s; });
+    await flushMicrotasks(); // parked on the reap close
+    const { release } = await manager.suspendForRewind(key);
+    exited();
+    await new Promise((r) => setTimeout(r, 10));
+    // Woken by the close, it must see the rewind's hold: nothing built on the pre-rewind conversation.
+    expect(resumed).toBe(false);
+    expect(mockState.instances).toHaveLength(1);
+    release();
+    expect(await next).not.toBe(fake);
+    expect(mockState.instances).toHaveLength(2);
+  });
+
   it("gives up waiting on a reaped session that never finishes exiting", async () => {
     vi.useFakeTimers();
     mockState.closeGate = new Promise<void>(() => {});

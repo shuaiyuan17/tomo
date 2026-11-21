@@ -540,10 +540,11 @@ export class LiveSessionManager {
    */
   async getOrCreateLiveSession(key: string, abandon?: () => boolean): Promise<LiveSession> {
     for (;;) {
-      // A rewind holds this key: wait, then use the rewound conversation.
-      for (let hold = this.sessionHolds.get(key); hold; hold = this.sessionHolds.get(key)) await hold;
-      // A reaped session is still exiting: resume only once it is gone.
-      for (let closing = this.reapClosings.get(key); closing; closing = this.reapClosings.get(key)) await closing;
+      // A rewind holds this key (wait, then use the rewound conversation), or
+      // a reaped session is still exiting (resume only once it is gone).
+      // ONE loop, re-checking BOTH after every wake: a rewind can begin while
+      // we wait on a close, and a single pass would walk past its hold.
+      for (let wait = this.keyWait(key); wait; wait = this.keyWait(key)) await wait;
 
       // Checked on every message (not just on creation): a lone session that is
       // only ever reused would otherwise never notice a workspace change and
@@ -561,6 +562,11 @@ export class LiveSessionManager {
       if (!created.isAlive() && !this.stopping && !abandon?.()) continue;
       return created;
     }
+  }
+
+  /** What a new session for `key` must wait on first, if anything. */
+  private keyWait(key: string): Promise<void> | undefined {
+    return this.sessionHolds.get(key) ?? this.reapClosings.get(key);
   }
 
   private async startCreate(key: string): Promise<LiveSession> {

@@ -22,7 +22,8 @@
     "lint": "eslint src/ tests/ web/",
     "prepublishOnly": "npm run build",
     "postinstall": "echo '\n  Welcome to Tomo! 🤖\n\n  First time?  tomo init\n  Start:       tomo start\n  Upgraded?    tomo restart\n  Help:        tomo --help\n'",
-    "test:e2e": "npm run build && vitest run --config vitest.e2e.config.ts",
+    "test:e2e": "npm run build && npm run test:e2e:ci",
+    "test:e2e:ci": "vitest run --config vitest.e2e.config.ts",
     "web:gallery": "npm run build && node scripts/ui-gallery.mjs",
     "test:web:mutations": "node scripts/test-web-mutations.mjs"
   },

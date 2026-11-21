@@ -9,6 +9,10 @@ export const notices = {
     unmarked_one: "⚠️ Tomo could not record on disk that it started answering a message in {{session}}. The reply is going ahead; if Tomo crashes before it finishes, the message may be answered twice after the restart. Check the disk under ~/.tomo/data.",
     unmarked_other: "⚠️ Tomo could not record on disk that it started answering {{count}} messages in {{session}}. The reply is going ahead; if Tomo crashes before it finishes, the message may be answered twice after the restart. Check the disk under ~/.tomo/data.",
   },
+  sdkInformational: {
+    hookCallbackFailed: "⚠️ A Tomo hook failed in {{session}}, so the check it runs may not have happened. Claude Code said: {{text}}",
+    settingsNotInEffect: "⚠️ Some settings Tomo passed to Claude Code did not take effect in {{session}}. Claude Code said: {{text}}",
+  },
   mcpDown: "⚠️ MCP server \"{{server}}\" is down: {{failures}} reconnects in a row failed. Its tools fail until it reconnects. Try /mcp reconnect {{server}} (or Reconnect on the web MCP page), or /new for a fresh session.",
   mcpOAuth: {
     authorize: "MCP login required for {{server}}.\n",

@@ -68,13 +68,15 @@ export const NAV_APPROACH_SLACK = 0.3;
 export const NAV_HOP_COST = 1.5;
 /** An obstacle is what a perch is on when its top is within this of the perch's height (and its footprint holds it). */
 export const NAV_PERCH_TOLERANCE = 0.15;
+/** A hop rises this far above the perch; what starts higher than that is above it. */
+export const NAV_HOP_ARC = 0.3;
 
 /** A point on the floor: [x, z]. */
 export type FloorPoint = [number, number];
 /** An obstacle seen from above. */
 export interface Footprint { min: FloorPoint; max: FloorPoint }
 /** An obstacle, with the height of its top. */
-export interface Hurdle extends Footprint { top: number }
+export interface Hurdle extends Footprint { top: number; bottom: number }
 
 export interface NavGrid {
   cell: number;
@@ -90,7 +92,7 @@ export interface NavGrid {
   region: Int32Array;
   /** Cells in each region. */
   regionSizes: number[];
-  /** Every solid part above NAV_STEP, overhead or not (head room is for walking), with its top: what a hop may not cross. */
+  /** Every solid part above NAV_STEP, overhead or not (head room is for walking), with its top and bottom: what a hop may not cross, unless it starts above the hop (NAV_HOP_ARC). */
   hurdles: Hurdle[];
   /** The room's width and depth, centred on the origin. */
   room: FloorPoint;
@@ -138,7 +140,7 @@ function obstacles(placement: Placement, headroom: number): Hurdle[] {
   for (const object of placement.objects) {
     for (const leaf of object.leaves) {
       if (!leaf.solid || leaf.box.max[1] <= NAV_STEP || leaf.box.min[1] >= headroom) continue;
-      out.push({ min: [leaf.box.min[0], leaf.box.min[2]], max: [leaf.box.max[0], leaf.box.max[2]], top: leaf.box.max[1] });
+      out.push({ min: [leaf.box.min[0], leaf.box.min[2]], max: [leaf.box.max[0], leaf.box.max[2]], top: leaf.box.max[1], bottom: leaf.box.min[1] });
     }
   }
   return out;
@@ -234,7 +236,8 @@ function inRoom(grid: NavGrid, x: number, z: number): boolean {
 
 /**
  * Whether the straight hop between the perch `at` and a floor point crosses
- * no obstacle except what the perch is on: one whose footprint holds `at`
+ * no solid part that starts below its apex (NAV_HOP_ARC above the perch)
+ * except what the perch is on: one whose footprint holds `at`
  * and whose top is within NAV_PERCH_TOLERANCE of its height. Both ends are
  * inside the room (the room is a rectangle), so the hop is too.
  */
@@ -242,7 +245,8 @@ export function clearHop(grid: NavGrid, at: Vec3, point: FloorPoint): boolean {
   if (!inRoom(grid, at[0], at[2]) || !inRoom(grid, point[0], point[1])) return false;
   const under = (h: Hurdle) => Math.abs(h.top - at[1]) <= NAV_PERCH_TOLERANCE
     && at[0] >= h.min[0] && at[0] <= h.max[0] && at[2] >= h.min[1] && at[2] <= h.max[1];
-  return grid.hurdles.every((h) => under(h) || !segmentMeetsBox([at[0], at[2]], point, h));
+  const apex = Math.max(at[1], 0) + NAV_HOP_ARC;
+  return grid.hurdles.every((h) => h.bottom >= apex || under(h) || !segmentMeetsBox([at[0], at[2]], point, h));
 }
 /** Whether segment a–b meets the inside of a footprint (Liang–Barsky; grazing an edge does not count). */
 function segmentMeetsBox(a: FloorPoint, b: FloorPoint, box: Footprint): boolean {

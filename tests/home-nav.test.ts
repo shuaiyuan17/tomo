@@ -261,6 +261,12 @@ describe("home navigation: routes", () => {
     expect(findRoute(grid, [0, 0, 0], [0, 0.45, 2.8])).toMatchObject({ ok: false, reason: "unreachable" });
   });
 
+  it("hops under what is well above it, such as a ceiling plate", () => {
+    // A plate 2.5 m up over the whole room: far above a hop to a 0.45 m seat.
+    const scene = room([block(-0.2, 0.2, -0.2, 0.2, 0.45), { shape: "box", size: [6, 0.1, 6], at: [0, 2.5, 0] }]);
+    expect(findRoute(buildNavGrid(scene), [-2, 0, 0], [0, 0.45, 0]).ok).toBe(true);
+  });
+
   it("does not hop out of the room to a perch beyond its walls or open front", () => {
     const grid = buildNavGrid(room());
     expect(findRoute(grid, [0, 0, 0], [0, 0.5, 3.3])).toMatchObject({ ok: false, reason: "unreachable" });

@@ -6,6 +6,10 @@ export const notices = {
     unsaved: "⚠️ Tomo 没能在回复前把一条收到的 {{channel}} 消息存到磁盘。现在正在回复它，但如果 Tomo 先崩溃，这条消息会丢失。请检查 ~/.tomo/data 所在的磁盘。",
     unmarked_other: "⚠️ Tomo 没能在磁盘上记下它已开始回复 {{session}} 里的 {{count}} 条消息。回复会照常进行；如果 Tomo 在回复完成前崩溃，重启后这些消息可能会被回复两次。请检查 ~/.tomo/data 所在的磁盘。",
   },
+  sdkInformational: {
+    hookCallbackFailed: "⚠️ {{session}} 里有一个 Tomo 钩子执行失败，它负责的检查可能没有生效。Claude Code 的原话：{{text}}",
+    settingsNotInEffect: "⚠️ Tomo 传给 Claude Code 的部分设置在 {{session}} 里没有生效。Claude Code 的原话：{{text}}",
+  },
   mcpDown: "⚠️ MCP 服务器“{{server}}”挂了：连续 {{failures}} 次重连失败。重新连上之前，它的工具都用不了。可以试试 /mcp reconnect {{server}}（或在 web 的 MCP 页面点“重新连接”），或用 /new 开一个新的 session。",
   mcpOAuth: {
     authorize: "{{server}} 需要 MCP 登录。\n",

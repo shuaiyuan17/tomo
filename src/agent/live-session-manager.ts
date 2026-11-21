@@ -12,6 +12,7 @@ import { config } from "../config.js";
 import { log } from "../logger.js";
 import type { McpConnection } from "../mcp/live-status.js";
 import { McpHealthMonitor, MCP_PRE_TURN_WAIT_MS } from "./mcp-health.js";
+import { InformationalNotices } from "./sdk-informational.js";
 import { checkAndClearCompactTrigger } from "../lcm/index.js";
 import { getCompactTriggerPath } from "../lcm/compact.js";
 import { existsSync } from "node:fs";
@@ -257,11 +258,16 @@ export class LiveSessionManager {
 
   /** SDK-reported MCP health: lifecycle logs, pre-turn reconnect, owner notice. */
   private readonly mcpHealth: McpHealthMonitor;
+  /** Owner notices for SDK informational warnings, deduped per tag and session. */
+  private readonly informationalNotices: InformationalNotices;
   /** Keys held by an explicit MCP reconnect: a turn waits (bounded) for it to finish. */
   private mcpReservations = new Map<string, Promise<unknown>>();
 
   constructor(private readonly deps: LiveSessionManagerDeps) {
     this.mcpHealth = new McpHealthMonitor({
+      notifyOwner: async (text) => (await this.deps.notifyOwner?.(text)) === true,
+    });
+    this.informationalNotices = new InformationalNotices({
       notifyOwner: async (text) => (await this.deps.notifyOwner?.(text)) === true,
     });
   }
@@ -757,6 +763,7 @@ export class LiveSessionManager {
         // Only the key's current session speaks for it.
         if (session) this.observeMcpStatus(key, session, connections, "init");
       },
+      onInformational: (message) => this.informationalNotices.observe(key, message),
       onToolResult: (toolName, content, isError) => {
         this.deps.handleToolResult?.(key, toolName, content, isError);
       },

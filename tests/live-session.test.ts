@@ -124,6 +124,7 @@ function makeSession(settings?: {
     };
   };
   recordUsage?: (build: () => UsageLedgerRow | undefined, onWritten: () => void) => void;
+  onInformational?: (message: import("@anthropic-ai/claude-agent-sdk").SDKInformationalMessage) => void;
 }) {
   const session = new LiveSession({} as never, "test:session", undefined, undefined, settings);
   const harness = harnessRef.current!;
@@ -1966,5 +1967,42 @@ describe("LiveSession usage ledger rows", () => {
     await expect(p).resolves.toBe("fine");
     expect(session.lastResult?.costUsd).toBeCloseTo(0.4);
     expect(log.warn).toHaveBeenCalledWith(expect.objectContaining({ session: "test:session" }), "Usage ledger row failed; turn unaffected");
+  });
+});
+
+describe("LiveSession system/informational", () => {
+  const informational = (over: Record<string, unknown>) => ({
+    type: "system", subtype: "informational", uuid: "u-info", session_id: "s1", content: "hook X failed", level: "warning", ...over,
+  });
+
+  it("logs a warning line as warn with tag, text and session, and hands it to the callback", async () => {
+    const seen: unknown[] = [];
+    const { session, harness } = makeSession({ onInformational: (m) => seen.push(m) });
+    const p = session.send("hi");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent(informational({ tag: "hook_callback_failed" }));
+    harness.pushEvent(assistantEvent("fine"));
+    harness.pushEvent(resultEvent());
+    await expect(p).resolves.toBe("fine");
+    expect(log.warn).toHaveBeenCalledWith(
+      { session: "test:session", tag: "hook_callback_failed", level: "warning", text: "hook X failed" },
+      "SDK informational warning",
+    );
+    expect(seen).toEqual([expect.objectContaining({ tag: "hook_callback_failed" })]);
+  });
+
+  it("logs an unknown tag at its level and does not end the turn", async () => {
+    const { session, harness } = makeSession();
+    const p = session.send("hi");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent(informational({ tag: "something_new", level: "notice", content: "fyi" }));
+    harness.pushEvent(assistantEvent("fine"));
+    harness.pushEvent(resultEvent());
+    await expect(p).resolves.toBe("fine");
+    expect(log.info).toHaveBeenCalledWith(
+      { session: "test:session", tag: "something_new", level: "notice", text: "fyi" },
+      "SDK informational",
+    );
+    expect(log.warn).not.toHaveBeenCalledWith(expect.anything(), "SDK informational warning");
   });
 });

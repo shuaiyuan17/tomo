@@ -4,6 +4,7 @@ import {
   type McpSetServersResult,
   type Query,
   type SDKUserMessage,
+  type SDKInformationalMessage,
   type SDKMessage,
   type SDKMessageOrigin,
 } from "@anthropic-ai/claude-agent-sdk";
@@ -37,6 +38,7 @@ import { summarizeToolInput, summarizeToolResult } from "./tool-summary.js";
 import { buildContentBlocks, isTextBlock, isThinkingBlock, isToolUseBlock } from "./content-blocks.js";
 import { isTaskSystemMessage, TaskTracker, type TaskChange, type TaskSystemMessage } from "./task-tracker.js";
 import { sdkSignalOf, type SdkSignal } from "./sdk-signals.js";
+import { logInformational } from "./sdk-informational.js";
 import { ReadReceiptTracker } from "./read-receipts.js";
 
 // Re-exported so existing `./live-session.js` imports keep working.
@@ -215,6 +217,11 @@ export interface LiveSessionSettings {
    * Must not throw (it is caught anyway).
    */
   onMcpStatus?: (connections: McpConnection[]) => void;
+  /**
+   * The SDK sent a `system/informational` line (already logged by the
+   * session). Must not throw (it is caught anyway).
+   */
+  onInformational?: (message: SDKInformationalMessage) => void;
 }
 
 export class LiveSession {
@@ -320,6 +327,7 @@ export class LiveSession {
   private mcpAuthRefresher: McpAuthRefresher;
   private onToolResult: LiveSessionSettings["onToolResult"];
   private onMcpStatus: LiveSessionSettings["onMcpStatus"];
+  private onInformational: LiveSessionSettings["onInformational"];
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
@@ -358,6 +366,7 @@ export class LiveSession {
     this.mcpAuthRefresher = new McpAuthRefresher(settings.onMcpAuthError, settings.now ?? Date.now);
     this.onToolResult = settings.onToolResult;
     this.onMcpStatus = settings.onMcpStatus;
+    this.onInformational = settings.onInformational;
     this.recordUsage = settings.recordUsage;
     this.seenUsage = initialUsageCounters(settings.resumeFrom);
     this.committedUsage = initialUsageCounters(settings.resumeFrom);
@@ -987,6 +996,11 @@ export class LiveSession {
       if (connections) {
         try { this.onMcpStatus(connections); } catch (err) { log.warn({ err, session: this.sessionKey }, "MCP status callback threw"); }
       }
+    }
+
+    if (event.type === "system" && event.subtype === "informational") {
+      logInformational(event, this.sessionKey);
+      try { this.onInformational?.(event); } catch (err) { log.warn({ err, session: this.sessionKey }, "Informational callback threw"); }
     }
 
     if (event.type === "system" && (event as { subtype?: string }).subtype === "compact_boundary") {

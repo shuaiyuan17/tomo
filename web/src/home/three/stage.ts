@@ -9,6 +9,9 @@ import { Resources, SIGN_FONT } from "./resources.js";
 import { drawSky } from "./sky-canvas.js";
 import { skyLight, skyMoves, type Sky } from "../sky.js";
 import { base64Bytes } from "../snapshot.js";
+import { planMove, poseAt, smooth, type WalkPlan, type WalkPose } from "../walk.js";
+import { placeScene, type Placement } from "../../../../src/home/geometry.js";
+import { buildNavGrid, NAV_PET, NAV_WALKER, type NavGrid, type WalkerSize } from "../../../../src/home/nav.js";
 
 /**
  * The room as three.js draws it. It renders only while something changes
@@ -51,17 +54,19 @@ export function elevationFor(aspect: number): number {
   return 0.5 + t * 0.55;
 }
 const FOV = 36;
-const WALK_SPEED = 1.5;
 const GLOW_LIGHTS = 2;
 const RAD = Math.PI / 180;
 
 interface Character {
   key: string; kind: string; anchor: Group; body: Built | null;
-  from: Vector3; to: Vector3; fromYaw: number; toYaw: number; start: number; duration: number;
+  /** Its size for finding a way round the furniture. */
+  walker: WalkerSize;
+  /** Where it is headed (its spot), and the way it will face there. */
+  to: Vec3; toYaw: number;
+  /** The move under way (see walk.ts), started at `start`; null when it is standing at `to`. */
+  plan: WalkPlan | null; start: number;
   appear: number; leaving: boolean; task: string;
 }
-const angleLerp = (a: number, b: number, t: number) => { const d = ((b - a + Math.PI * 3) % (Math.PI * 2)) - Math.PI; return a + d * t; };
-const smooth = (t: number) => t * t * (3 - 2 * t);
 
 export class HomeStage {
   readonly renderer: WebGLRenderer;
@@ -75,6 +80,9 @@ export class HomeStage {
   private built: Built | null = null;
   private home: HomeScene | null = null;
   private characters = new Map<string, Character>();
+  /** Where each size of walker can go in this scene: built when first needed, kept until the scene changes. */
+  private grids = new Map<WalkerSize, NavGrid | null>();
+  private placement: Placement | null = null;
   private seats = new Map<string, number>();
   private state: StageState | null = null;
   private light = { hemi: 2, sun: 2, color: new Color("#fff6ea") };
@@ -134,6 +142,7 @@ export class HomeStage {
   setScene(home: HomeScene, revision: string): void {
     this.clearWorld();
     this.home = home;
+    this.grids.clear(); this.placement = null;
     this.resources = new Resources((name) => `${this.assetUrl(name)}?r=${encodeURIComponent(revision)}`, () => this.invalidate());
     const layout = layoutScene(home);
     const [w, h, d] = home.room.size;
@@ -218,10 +227,10 @@ export class HomeStage {
     for (const [key, character] of this.characters) if (!wanted.has(key) && !character.leaving) { character.leaving = true; if (immediate) character.appear = 0; }
     for (const [key, want] of wanted) {
       let character = this.characters.get(key);
-      const to = new Vector3(...want.at), yaw = want.facing * RAD;
+      const to: Vec3 = [...want.at], yaw = want.facing * RAD;
       if (character && character.kind !== want.kind) { this.dropCharacter(character); character = undefined; }
       if (!character) {
-        character = { key, kind: want.kind, anchor: new Group(), body: null, from: to.clone(), to, fromYaw: yaw, toYaw: yaw, start: now, duration: 0,
+        character = { key, kind: want.kind, anchor: new Group(), body: null, walker: key === "pet" ? NAV_PET : NAV_WALKER, to, toYaw: yaw, plan: null, start: now,
           appear: immediate ? 1 : 0, leaving: false, task: want.task };
         const node = layoutKind(home, want.kind, key);
         if (node) {
@@ -229,18 +238,38 @@ export class HomeStage {
           character.anchor.add(character.body.root);
           for (const part of character.body.parts) retarget(part, partEffects(part.node.reactions, state.conditions));
         }
-        character.anchor.position.copy(to); character.anchor.rotation.y = yaw;
+        character.anchor.position.set(...to); character.anchor.rotation.y = yaw;
         this.world!.add(character.anchor);
         this.characters.set(key, character);
         continue;
       }
       character.leaving = false; character.task = want.task;
-      if (character.to.distanceTo(to) > 0.001 || Math.abs(character.toYaw - yaw) > 0.001) {
-        character.from.copy(character.anchor.position); character.fromYaw = character.anchor.rotation.y;
+      const [ox, oy, oz] = character.to;
+      if (Math.hypot(ox - to[0], oy - to[1], oz - to[2]) > 0.001 || Math.abs(character.toYaw - yaw) > 0.001) {
+        // From wherever it has got to (mid-walk, mid-hop), round the furniture; reduced motion goes straight there.
+        const here = this.pose(character, now);
+        const plan = immediate || this.reducedMotion ? null : planMove(this.grid(character.walker), here.position, to, here.yaw, yaw);
         character.to = to; character.toYaw = yaw; character.start = now;
-        character.duration = immediate ? 0 : Math.min(3.5, Math.max(0.45, character.from.distanceTo(to) / WALK_SPEED));
+        character.plan = plan && plan.duration > 0 ? plan : null;
       }
     }
+  }
+
+  /** The way round the furniture for a walker of this size, built once per scene (null if the scene defeats it: then it blinks). */
+  private grid(walker: WalkerSize): NavGrid | null {
+    if (!this.home) return null;
+    if (!this.grids.has(walker)) {
+      try {
+        this.placement ??= placeScene(this.home);
+        this.grids.set(walker, buildNavGrid(this.home, { walker, placement: this.placement }));
+      } catch { this.grids.set(walker, null); }
+    }
+    return this.grids.get(walker) ?? null;
+  }
+
+  /** Where a character is at `now`: along its move, or standing at its spot. */
+  private pose(character: Character, now: number): WalkPose {
+    return character.plan ? poseAt(character.plan, now - character.start) : { position: [...character.to], bob: 0, yaw: character.toYaw, fade: 1 };
   }
 
   private dropCharacter(character: Character): void {
@@ -248,7 +277,7 @@ export class HomeStage {
     this.characters.delete(character.key);
   }
 
-  /** One frame of a character: walking (a little hop per step), turning, appearing or leaving. */
+  /** One frame of a character: walking its way round the furniture (walk.ts), turning, appearing or leaving. */
   private stepCharacter(character: Character, now: number, dt: number): boolean {
     const reduced = this.reducedMotion;
     let busy = false;
@@ -256,19 +285,15 @@ export class HomeStage {
     character.appear = reduced ? goal : character.appear + Math.sign(goal - character.appear) * Math.min(Math.abs(goal - character.appear), dt * 4);
     if (character.appear !== goal) busy = true;
     if (character.leaving && character.appear === 0) { this.dropCharacter(character); return false; }
-    const s = smooth(Math.min(1, character.appear));
+    // Reduced motion (even switched on mid-walk) is there at once.
+    if (character.plan && (reduced || now - character.start >= character.plan.duration)) character.plan = null;
+    if (character.plan) busy = true;
+    const pose = this.pose(character, now);
+    const s = smooth(Math.min(1, character.appear)) * pose.fade;
     character.anchor.scale.set(0.6 + 0.4 * s, s, 0.6 + 0.4 * s);
-    character.anchor.visible = character.appear > 0.01;
-    const p = reduced || character.duration === 0 ? 1 : Math.min(1, (now - character.start) / character.duration);
-    const distance = character.from.distanceTo(character.to);
-    character.anchor.position.lerpVectors(character.from, character.to, smooth(p));
-    if (p < 1) {
-      busy = true;
-      const steps = Math.max(1, Math.round(distance / 0.32));
-      character.anchor.position.y += Math.abs(Math.sin(p * Math.PI * steps)) * 0.07;
-      const travel = distance > 0.05 ? Math.atan2(character.to.x - character.from.x, character.to.z - character.from.z) : character.toYaw;
-      character.anchor.rotation.y = p < 0.8 ? angleLerp(character.fromYaw, travel, Math.min(1, p / 0.15)) : angleLerp(travel, character.toYaw, smooth((p - 0.8) / 0.2));
-    } else character.anchor.rotation.y = character.toYaw;
+    character.anchor.visible = s > 0.01;
+    character.anchor.position.set(pose.position[0], pose.position[1] + pose.bob, pose.position[2]);
+    character.anchor.rotation.y = pose.yaw;
     return busy;
   }
 

@@ -56,9 +56,18 @@ export function scrubDeep<T>(value: T, depth = 0): T {
     const next = value.map((item) => scrubDeep(item, depth + 1));
     return next.some((item, i) => item !== value[i]) ? (next as unknown as T) : value;
   }
+  // Keys too: a known value can be a key (an env map, a JSON object keyed by token).
   const entries = Object.entries(value as Record<string, unknown>);
-  const next = entries.map(([key, item]) => [key, scrubDeep(item, depth + 1)] as const);
-  return next.some(([, item], i) => item !== entries[i][1]) ? (Object.fromEntries(next) as T) : value;
+  const next = entries.map(([key, item]) => [scrubKnownSecrets(key), scrubDeep(item, depth + 1)] as const);
+  if (!next.some(([key, item], i) => key !== entries[i][0] || item !== entries[i][1])) return value;
+  // Two keys can scrub to the same text; keep both rather than drop one.
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of next) {
+    let name = key;
+    for (let n = 2; Object.hasOwn(out, name); n++) name = `${key} #${n}`;
+    out[name] = item;
+  }
+  return out as T;
 }
 
 /**
@@ -117,6 +126,9 @@ export const WITHHELD_OUTPUT = "[output withheld: Tomo's credential redaction is
  */
 export function withholdDeep<T>(value: T, depth = 0): T {
   if (typeof value === "string") return (value ? WITHHELD_OUTPUT : value) as unknown as T;
+  // A value can be a number (a PIN, an account number); the type is kept for the schema.
+  if (typeof value === "number") return 0 as unknown as T;
+  if (typeof value === "bigint") return 0n as unknown as T;
   if (value === null || typeof value !== "object") return value;
   // Past the limit the subtree is not walked, so it is not passed on either.
   if (depth > MAX_WALK_DEPTH) return WITHHELD_OUTPUT as unknown as T;
@@ -126,13 +138,31 @@ export function withholdDeep<T>(value: T, depth = 0): T {
       for (let i = 0; i < value.length; i++) out.push(withholdField(value as unknown as Record<number, unknown>, i, depth));
       return out as unknown as T;
     }
+    // Keys can hold a value too. Identifier-like keys are kept, because a tool's
+    // output schema needs its field names (stdout, stderr, …); every other key
+    // is renamed k0, k1, … in order, skipping names already taken.
+    const keys = Object.keys(value);
+    const used = new Set(keys.filter((key) => SCHEMA_KEY.test(key)));
     const out: Record<string, unknown> = {};
-    for (const key of Object.keys(value)) out[key] = withholdField(value as Record<string, unknown>, key, depth);
+    let n = 0;
+    for (const key of keys) {
+      let name = key;
+      if (!SCHEMA_KEY.test(key)) {
+        while (used.has(`k${n}`)) n++;
+        name = `k${n}`;
+        used.add(name);
+      }
+      out[name] = withholdField(value as Record<string, unknown>, key, depth);
+    }
     return out as T;
   } catch {
     return WITHHELD_OUTPUT as unknown as T;
   }
 }
+
+/** A key withholdDeep keeps: shaped like a schema field name. A credential that
+ *  is itself shaped like this and used as a key still passes (accepted). */
+const SCHEMA_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,31}$/;
 
 function withholdField(parent: Record<string | number, unknown>, key: string | number, depth: number): unknown {
   let item: unknown;

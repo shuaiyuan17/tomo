@@ -147,6 +147,21 @@ describe("credential redaction hook fails closed", () => {
     expect(JSON.stringify(out)).not.toContain(JSON.stringify(quoted).slice(1, -1));
   });
 
+  // Codex #593 round 4: while not ready, keys and numbers were kept as is.
+  it("while not ready, zeroes numbers and renames keys that are not identifiers", async () => {
+    const response = { stdout: "x", [FAKE]: "v", pid: 918273645, big: 12n, ok: true, none: null, k0: "kept" };
+    const out = await hook()({ tool_response: response }) as { hookSpecificOutput: { updatedToolOutput: Record<string, unknown> } };
+    const rewritten = out.hookSpecificOutput.updatedToolOutput;
+    expect(Object.keys(rewritten)).not.toContain(FAKE);
+    expect(rewritten).toEqual({ stdout: WITHHELD_OUTPUT, k1: WITHHELD_OUTPUT, pid: 0, big: 0n, ok: true, none: null, k0: WITHHELD_OUTPUT });
+  });
+
+  it("when ready, scrubs a known value used as a key", async () => {
+    markRedactionReady();
+    const out = await hook()({ tool_response: { stdout: "x", [FAKE]: "v" } });
+    expect(out).toEqual({ hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { stdout: "x", [REDACTED]: "v" } } });
+  });
+
   it("leaves the normal path unchanged: clean output untouched, dirty output scrubbed", async () => {
     vi.useFakeTimers();
     markRedactionReady();

@@ -71,6 +71,24 @@ function sameServerConfig(a: McpServerConfig | undefined, b: McpServerConfig): b
 /** Upper bound on how long /rewind waits for a stopped session to wind down. */
 export const REWIND_SUSPEND_TIMEOUT_MS = 10_000;
 
+/** How often the idle reaper looks (capped by the timeout itself). */
+export const IDLE_REAP_SWEEP_MS = 60_000;
+
+/**
+ * How long the SDK can take to get rid of a closed CLI child: it ends stdin,
+ * waits ~2s, sends SIGTERM, and SIGKILLs ~5s after that (ProcessTransport's
+ * close() in @anthropic-ai/claude-agent-sdk). A child can be alive, and
+ * writing its transcript, for about this long after close().
+ */
+export const SDK_CLI_KILL_MS = 7_000;
+
+/**
+ * Upper bound on how long a message (or a /rewind) for a reaped key waits for
+ * the old CLI child to exit before resuming. Above SDK_CLI_KILL_MS, so it
+ * only gives up on a child the SDK's own SIGKILL did not end.
+ */
+export const IDLE_REAP_CLOSE_WAIT_MS = 10_000;
+
 /** Resolves true if `promise` settled within `ms`, false on timeout. Never rejects. */
 async function withTimeout(promise: Promise<unknown>, ms: number): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -255,6 +273,17 @@ export class LiveSessionManager {
   private generations = new Map<string, number>();
   /** Release for each hold in `sessionHolds` — stop() releases them all. */
   private holdReleases = new Map<string, () => void>();
+  /** The idle reaper's timer; armed with the first live session, cleared by stop(). */
+  private idleReapTimer: ReturnType<typeof setInterval> | undefined;
+  /**
+   * The CLOSING state of a reaped session. The reaper closes the session but
+   * leaves it in `liveSessions` until its CLI child has exited (bounded by
+   * IDLE_REAP_CLOSE_WAIT_MS), because that child may still append exit-time
+   * records to the transcript. Every path that looks the key up therefore
+   * still finds the entry and handles it (see `closingWait`); this marks
+   * which dead entry is closing and holds the promise its removal rides on.
+   */
+  private closing = new WeakMap<LiveSession, Promise<void>>();
 
   /** SDK-reported MCP health: lifecycle logs, pre-turn reconnect, owner notice. */
   private readonly mcpHealth: McpHealthMonitor;
@@ -318,7 +347,8 @@ export class LiveSessionManager {
    */
   keyForSdkSession(sdkSessionId: string): string | undefined {
     for (const [key, live] of this.liveSessions) {
-      if (live.isAlive() && live.getSessionId() === sdkSessionId) return key;
+      // A closing (reaped) session still owns its file until its CLI exits.
+      if ((live.isAlive() || this.closing.has(live)) && live.getSessionId() === sdkSessionId) return key;
     }
     for (const key of this.liveSessions.keys()) {
       if (this.deps.getSdkSessionId(key) === sdkSessionId) return key;
@@ -334,6 +364,9 @@ export class LiveSessionManager {
    * reservation's TTL runs out.
    */
   reserveCompact(key: string, sdkSessionId: string): ReserveResult {
+    // A reaped session's CLI may still be writing the file a rewrite would
+    // rename: refused like any other "not now", and the next nudge retries.
+    if (this.closingWait(key)) return { ok: false, reason: "session-closing", state: this.backgroundState(key) };
     return this.compactReservations.reserve(key, sdkSessionId, this.backgroundState(key));
   }
 
@@ -527,8 +560,11 @@ export class LiveSessionManager {
    */
   async getOrCreateLiveSession(key: string, abandon?: () => boolean): Promise<LiveSession> {
     for (;;) {
-      // A rewind holds this key: wait, then use the rewound conversation.
-      for (let hold = this.sessionHolds.get(key); hold; hold = this.sessionHolds.get(key)) await hold;
+      // A rewind holds this key (wait, then use the rewound conversation), or
+      // a reaped session is still exiting (resume only once it is gone).
+      // ONE loop, re-checking BOTH after every wake: a rewind can begin while
+      // we wait on a close, and a single pass would walk past its hold.
+      for (let wait = this.keyWait(key); wait; wait = this.keyWait(key)) await wait;
 
       // Checked on every message (not just on creation): a lone session that is
       // only ever reused would otherwise never notice a workspace change and
@@ -536,7 +572,7 @@ export class LiveSessionManager {
       this.sweepPromptChanges();
 
       const session = this.liveSessions.get(key);
-      if (session?.isAlive()) return session;
+      if (session?.isAlive()) { session.noteActivity(); return session; }
 
       const created = await (this.liveSessionCreates.get(key) ?? this.startCreate(key));
       // Built for the pre-rewind conversation and discarded by createLiveSession
@@ -546,6 +582,20 @@ export class LiveSessionManager {
       if (!created.isAlive() && !this.stopping && !abandon?.()) continue;
       return created;
     }
+  }
+
+  /** What a new session for `key` must wait on first, if anything. */
+  private keyWait(key: string): Promise<void> | undefined {
+    return this.sessionHolds.get(key) ?? this.closingWait(key);
+  }
+
+  /**
+   * The key's map entry is a reaped session whose CLI child is still exiting:
+   * resolves once it is gone (and out of the map). Undefined otherwise.
+   */
+  private closingWait(key: string): Promise<void> | undefined {
+    const session = this.liveSessions.get(key);
+    return session && !session.isAlive() ? this.closing.get(session) : undefined;
   }
 
   private async startCreate(key: string): Promise<LiveSession> {
@@ -569,7 +619,8 @@ export class LiveSessionManager {
    * bounded, for the session's SDK event loop to end so nothing more is
    * handled or delivered from it. The CLI child can still be appending its
    * exit-time records after that — the caller waits for the transcript itself
-   * to go quiet.
+   * to go quiet. A session the idle reaper already closed is waited for here
+   * (its child's exit, bounded) before returning.
    *
    * `release()` MUST be called (finally) — held turns are waiting on it.
    */
@@ -603,6 +654,12 @@ export class LiveSessionManager {
       if (creating && !await withTimeout(creating, timeoutMs)) {
         log.warn({ key, timeoutMs }, "Rewind: a session still being built did not finish in time; continuing");
       }
+      // The key's entry is a reaped session still closing: its CLI child may
+      // be appending to the very transcript the rewind is about to snapshot
+      // and fork. Wait for it first (bounded by IDLE_REAP_CLOSE_WAIT_MS).
+      // Only the closing wait: the key's other wait is this rewind's own hold.
+      const closing = this.closingWait(key);
+      if (closing) await closing;
       const session = this.liveSessions.get(key);
       let stoppedTurn = dispatched.length > 0;
       let droppedMessages = 0;
@@ -645,7 +702,9 @@ export class LiveSessionManager {
     if (this.lastPromptHash && currentHash !== this.lastPromptHash) {
       log.info("System prompt changed; retiring live sessions at their next idle boundary");
       for (const [key, session] of this.liveSessions) {
-        if (this.promptStale.has(session)) continue;
+        // A closing (reaped) entry is already on its way out; retiring it
+        // would drop it from the map before its CLI has exited.
+        if (this.promptStale.has(session) || this.closing.has(session)) continue;
         this.promptStale.add(session);
         void this.retireWhenIdle(key, session);
       }
@@ -805,6 +864,7 @@ export class LiveSessionManager {
     // A dead predecessor's connections went with it.
     if (this.liveSessions.has(key)) this.mcpHealth.sessionClosed(key);
     this.liveSessions.set(key, session);
+    this.armIdleReaper();
     this.externalMcpServersBySession.set(key, new Set(Object.keys(externalMcpServers)));
     this.mcpServerConfigsBySession.set(key, {
       ...externalMcpServers,
@@ -822,8 +882,91 @@ export class LiveSessionManager {
     return session;
   }
 
+  /**
+   * IDLE SESSIONS ARE CLOSED, NOT KEPT FOREVER. Every live session is a CLI
+   * child process (plus one process per stdio MCP server), and before this a
+   * group that spoke once kept its whole tree resident until the next prompt
+   * change or shutdown. Closing one costs little: the next message resumes it
+   * from disk, and the prompt cache is server-side, so it outlives the child
+   * up to its own TTL either way.
+   *
+   * Only a session with NOTHING going on is closed: no turn in any phase
+   * (`hasTurnInFlight`), no live task, ambient watchers included (closing
+   * kills them), no task report still due, no compact waiting on its reload,
+   * no explicit MCP reconnect running on it (`mcpReservations`), no SDK id
+   * the registry has not stored yet (`unpersistedLinks`), and no
+   * prompt-stale retirement already in charge of it.
+   *
+   * The CLI child is still exiting after close() (and may append exit-time
+   * records to the transcript), so the reaped session STAYS in the map, marked
+   * closing, until the child has exited (bounded). Whatever finds it there
+   * follows its usual rule for a key with a session: a message waits before
+   * resuming, a /rewind waits before its snapshot, a compact reservation is
+   * refused ("session-closing", retried later like any other refusal).
+   */
+  private armIdleReaper(): void {
+    const timeoutMs = config.liveSessionIdleTimeoutMs;
+    if (this.idleReapTimer || this.stopping || !timeoutMs || timeoutMs <= 0) return;
+    this.idleReapTimer = setInterval(() => this.reapIdleSessions(), Math.min(IDLE_REAP_SWEEP_MS, timeoutMs));
+    this.idleReapTimer.unref?.();
+  }
+
+  /** One reaper pass; public for tests. Returns the keys it closed. */
+  reapIdleSessions(now = Date.now()): string[] {
+    const timeoutMs = config.liveSessionIdleTimeoutMs;
+    if (this.stopping || !timeoutMs || timeoutMs <= 0) return [];
+    const reaped: string[] = [];
+    for (const [key, session] of [...this.liveSessions]) {
+      if (!session.isAlive() || this.promptStale.has(session)) continue;
+      // The report wait is BOUNDED, as in backgroundState(): a result folded
+      // into a turn that was already running never clears the flag, and an
+      // unbounded check would keep such a session alive forever.
+      // unpersistedLinks: the registry refused this session's id, so the live
+      // session holds the only usable one until a later turn stores it.
+      if (this.hasTurnInFlight(key) || this.mcpReservations.has(key) || this.unpersistedLinks.has(key)
+        || session.hasAnyLiveTasks()
+        || session.isAwaitingTaskReportWithin(PROMPT_RETIRE_REPORT_WAIT_MS)
+        || (this.backgroundingInFlight.get(key) ?? 0) > 0 || this.isCompactPending(key)) {
+        session.noteActivity();
+        continue;
+      }
+      const idleMs = now - session.lastActivityAt();
+      if (idleMs < timeoutMs) continue;
+      this.closeReaped(key, session);
+      reaped.push(key);
+      log.info({ key, idleMinutes: Math.round(idleMs / 60_000) }, "Closed idle live session; the next message resumes it");
+    }
+    // "No LIVE session", not "empty map": a session that died on its own
+    // stays in the map (lastResult, keyForSdkSession and createLiveSession's
+    // predecessor check read it), and must not keep the timer running. The
+    // next session built re-arms it.
+    if (this.idleReapTimer && ![...this.liveSessions.values()].some((s) => s.isAlive())) {
+      clearInterval(this.idleReapTimer);
+      this.idleReapTimer = undefined;
+    }
+    return reaped;
+  }
+
+  /** Close a reaped session, keeping its entry (closing) until its CLI has exited. */
+  private closeReaped(key: string, session: LiveSession): void {
+    this.promptStale.delete(session);
+    session.close();
+    this.externalMcpServersBySession.delete(key);
+    this.mcpServerConfigsBySession.delete(key);
+    this.mcpHealth.sessionClosed(key);
+    const gone: Promise<void> = withTimeout(session.whenClosed(), IDLE_REAP_CLOSE_WAIT_MS).then((exited) => {
+      if (!exited) log.warn({ key, timeoutMs: IDLE_REAP_CLOSE_WAIT_MS }, "Reaped session's CLI did not exit in time; resuming anyway");
+      this.closing.delete(session);
+      if (this.liveSessions.get(key) === session) this.liveSessions.delete(key);
+    });
+    this.closing.set(session, gone);
+  }
+
   closeLiveSession(key: string): void {
     const session = this.liveSessions.get(key);
+    // Already closing (reaped): its own exit removes it, and until then it
+    // must stay where the key's next session will look for it.
+    if (session && this.closingWait(key)) return;
     if (session) {
       this.promptStale.delete(session);
       session.close();
@@ -1291,6 +1434,7 @@ export class LiveSessionManager {
     // closed.
     this.stopping = true;
     this.compactReservations.dispose();
+    if (this.idleReapTimer) { clearInterval(this.idleReapTimer); this.idleReapTimer = undefined; }
 
     // NO HOLD OUTLIVES SHUTDOWN. The Agent awaits (bounded) and aborts any
     // rewind before calling this; a rewind still stalled past that budget must

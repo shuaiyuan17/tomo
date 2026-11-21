@@ -974,8 +974,16 @@ export class WebChannel implements Channel {
     this.lookUpModels(key, event.tasks);
     // The owner rule can change with no task event at all; re-run the gate so
     // a DM that stops being the owner conversation is withdrawn promptly.
+    // Only while the board holds a DM's tasks: with none, there is nothing a
+    // changed owner rule could withdraw, and the next DM task event re-arms it.
     if (!isGroupSessionKey(key) && !this.ownerKeyTimer) {
-      this.ownerKeyTimer = setInterval(() => this.tasks.publish(), OWNER_KEY_CHECK_MS);
+      this.ownerKeyTimer = setInterval(() => {
+        this.tasks.publish();
+        if (!this.tasks.holdsAny((slot) => !isGroupSessionKey(slot))) {
+          clearInterval(this.ownerKeyTimer);
+          this.ownerKeyTimer = undefined;
+        }
+      }, OWNER_KEY_CHECK_MS);
       this.ownerKeyTimer.unref?.();
     }
   }

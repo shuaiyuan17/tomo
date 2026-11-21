@@ -34,6 +34,7 @@ const DEFAULT_IMESSAGE_INBOUND_MAX_SETTLE_MS = 5000;
 const DEFAULT_IMESSAGE_TYPING_START_DELAY_MS = 1200;
 const DEFAULT_IMESSAGE_PASSIVE_TYPING_START_DELAY_MS = 4000;
 const DEFAULT_LIVE_SESSION_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_LIVE_SESSION_IDLE_TIMEOUT_MS = 60 * 60 * 1000;
 
 /** The reasoning-effort levels the Agent SDK accepts (`EffortLevel` in
  *  @anthropic-ai/claude-agent-sdk `sdk.d.ts`). */
@@ -294,6 +295,13 @@ export interface TomoConfig {
   notifyOwnerOnSuppressedErrors: boolean;
   /** Inactivity timeout for one LiveSession send()/steer() turn. Default 10 minutes. */
   liveSessionTimeoutMs: number;
+  /**
+   * Close a live session (its CLI child and MCP servers) after this long with
+   * no activity, no background or ambient tasks and no pending compact. The
+   * next message resumes it from disk. 0 keeps idle sessions forever.
+   * Default 60 minutes.
+   */
+  liveSessionIdleTimeoutMs: number;
   /** Optional LiteLLM gateway. Keeps Claude Agent SDK as the runtime while routing model calls through LiteLLM. */
   litellm: LiteLlmConfig | null;
   /** External MCP servers from ~/.tomo/config.json. */
@@ -1065,6 +1073,12 @@ function buildConfig(): TomoConfig {
       positiveInt,
       envVar("TOMO_LIVE_SESSION_TIMEOUT_MS") ?? file.liveSessionTimeoutMs,
       DEFAULT_LIVE_SESSION_TIMEOUT_MS,
+    ),
+    liveSessionIdleTimeoutMs: validated(
+      "liveSessionIdleTimeoutMs (TOMO_LIVE_SESSION_IDLE_TIMEOUT_MS)",
+      nonNegativeInt,
+      envVar("TOMO_LIVE_SESSION_IDLE_TIMEOUT_MS") ?? file.liveSessionIdleTimeoutMs,
+      DEFAULT_LIVE_SESSION_IDLE_TIMEOUT_MS,
     ),
     litellm: parseLiteLlmConfig(file.litellm, model),
     mcpServers,

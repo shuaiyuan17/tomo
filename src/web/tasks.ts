@@ -125,6 +125,12 @@ export class TaskBoard {
   /** The tool_use id a task was started by, if known. */
   toolUseOf(slot: string, taskId: string): string | undefined { return this.toolUses.get(slot)?.get(taskId); }
 
+  /** Does the board hold any task (live or retained) under a slot `match` accepts? */
+  holdsAny(match: (slot: string) => boolean): boolean {
+    for (const slot of this.sessions.keys()) if (match(slot)) return true;
+    return false;
+  }
+
   /** Whether the board still holds this task (live or recently ended). */
   holds(slot: string, taskId: string): boolean { return this.sessions.get(slot)?.has(taskId) ?? false; }
 

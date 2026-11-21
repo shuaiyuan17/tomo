@@ -7,9 +7,16 @@ vi.mock("../src/config.js", () => ({
   config: { lcm: { dailyFreshTail: 32, globalFreshTail: false } },
 }));
 
+// A pass-through spy, so the cache tests can count real reads of a file.
+vi.mock("../src/jsonl.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/jsonl.js")>();
+  return { ...actual, readJsonlFileSync: vi.fn(actual.readJsonlFileSync) };
+});
+
 import {
   resolveBlockRange as resolveBlockRangeImpl,
   findDuePromotions as findDuePromotionsImpl,
+  clearDuePromotionCache,
   isWarmTailCandidate,
   globalFreshTailStartIdx,
   summaryBudgetCheck,
@@ -19,8 +26,9 @@ import {
 import { compactSession } from "../src/lcm/compact.js";
 import { formatTomoEvent } from "../src/tomo-event.js";
 import { config as mockedConfig } from "../src/config.js";
+import { readJsonlFileSync } from "../src/jsonl.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
-import { writeFileSync, readFileSync, mkdirSync, mkdtempSync, unlinkSync, existsSync, rmSync } from "node:fs";
+import { writeFileSync, readFileSync, mkdirSync, mkdtempSync, unlinkSync, existsSync, rmSync, statSync, utimesSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
@@ -170,6 +178,85 @@ describe("resolveBlockRange — daily fresh-tail behavior", () => {
     expect(result).not.toBeNull();
     expect(result!.description).toContain("50 events");
     expect(result!.description).not.toContain("kept raw");
+  });
+});
+
+describe("findDuePromotions — cached per unchanged file", () => {
+  let sessionId: string;
+  let archivePath: string;
+  const pastDay = "2026-04-15";
+  const day = (n: number) => Array.from({ length: n }, (_, i) =>
+    mkTextEvent(pastDay, 9, i % 2 === 0 ? "user" : "assistant", `[imessage · x] msg ${i}`));
+  const dailyCount = (due: ReturnType<typeof findDuePromotions>) =>
+    due.find((d) => d.level === "daily" && d.period === pastDay)?.childCount;
+
+  beforeEach(() => {
+    sessionId = `test-blocks-cache-${randomUUID()}`;
+    clearDuePromotionCache();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    if (archivePath && existsSync(archivePath)) unlinkSync(archivePath);
+  });
+
+  it("does not re-read an unchanged file", () => {
+    archivePath = writeArchive(sessionId, day(10));
+    const reads = vi.mocked(readJsonlFileSync);
+    reads.mockClear();
+    expect(dailyCount(findDuePromotions(sessionId))).toBe(10);
+    expect(dailyCount(findDuePromotions(sessionId))).toBe(10);
+    expect(reads.mock.calls.filter(([p]) => p === archivePath)).toHaveLength(1);
+  });
+
+  it("recomputes after a same-length in-place rewrite with the mtime put back", () => {
+    // Inode, size and mtime all unchanged (a rewrite inside the mtime's
+    // granularity looks exactly like this): only ctime moved.
+    archivePath = writeArchive(sessionId, day(10));
+    utimesSync(archivePath, 1_700_000_000, 1_700_000_000); // a whole second: restorable exactly
+    expect(dailyCount(findDuePromotions(sessionId))).toBe(10);
+    const { size, ino } = statSync(archivePath);
+    writeFileSync(archivePath, "x".repeat(size - 1) + "\n");
+    utimesSync(archivePath, 1_700_000_000, 1_700_000_000);
+    expect(statSync(archivePath).ino).toBe(ino);
+    expect(dailyCount(findDuePromotions(sessionId))).toBeUndefined();
+  });
+
+  it("recomputes after an append", () => {
+    archivePath = writeArchive(sessionId, day(10));
+    expect(dailyCount(findDuePromotions(sessionId))).toBe(10);
+    appendFileSync(archivePath, JSON.stringify(mkTextEvent(pastDay, 10, "user", "[imessage · x] one more")) + "\n");
+    expect(dailyCount(findDuePromotions(sessionId))).toBe(11);
+  });
+
+  it("recomputes when the local date changes", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(2026, 3, 15, 12)); // the day itself: not past yet
+    archivePath = writeArchive(sessionId, day(10));
+    expect(dailyCount(findDuePromotions(sessionId))).toBeUndefined();
+    vi.setSystemTime(new Date(2026, 3, 16, 12));
+    expect(dailyCount(findDuePromotions(sessionId))).toBe(10);
+  });
+
+  it("recomputes when the lcm config changes", () => {
+    archivePath = writeArchive(sessionId, day(10));
+    const before = findDuePromotions(sessionId);
+    const lcm = mockedConfig.lcm as { globalFreshTail: boolean };
+    lcm.globalFreshTail = true;
+    try {
+      // 10 turns all inside the 32-event warm tail: nothing is due any more.
+      expect(dailyCount(findDuePromotions(sessionId))).not.toBe(dailyCount(before));
+    } finally {
+      lcm.globalFreshTail = false;
+    }
+  });
+
+  it("hands out copies, so a caller cannot edit the cached answer", () => {
+    archivePath = writeArchive(sessionId, day(10));
+    const first = findDuePromotions(sessionId);
+    first[0].childCount = 999;
+    first.length = 0;
+    expect(dailyCount(findDuePromotions(sessionId))).toBe(10);
   });
 });
 

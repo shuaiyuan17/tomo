@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { config } from "../config.js";
 import { readJsonlFileSync } from "../jsonl.js";
@@ -452,7 +452,62 @@ export interface DuePromotion {
   replacesExistingBlock: boolean;
 }
 
+/**
+ * The last answer per session file, and what it was computed from.
+ *
+ * WHY: the rollup runner asks this every hour for every active session, and
+ * answering means reading and parsing the whole SDK JSONL synchronously on
+ * the daemon's only thread — a file that grows with every tool result. Most
+ * sessions did not change in that hour, so most of those parses produced the
+ * answer they produced last time.
+ *
+ * WHAT THE ANSWER DEPENDS ON, and so what the signature holds: the file's
+ * bytes (inode, size, and modification and change times, in ns — an append
+ * or an atomic rewrite changes at least one, and ctime catches a same-length
+ * in-place rewrite inside mtime's granularity or with mtime put back, as the
+ * registry cache in web/data.ts does), today's local date (week, month and year derive from
+ * it) and the `lcm` config (fresh-tail settings). Nothing else is read.
+ *
+ * Read-only callers only. `resolveBlockRange` is NOT cached: the compact path
+ * rewrites the file from the indices it returns.
+ */
+const duePromotionCache = new Map<string, { signature: string; due: DuePromotion[] }>();
+const DUE_PROMOTION_CACHE_MAX = 64;
+
+function duePromotionSignature(path: string, now: Date): string | null {
+  try {
+    const st = statSync(path, { bigint: true });
+    return JSON.stringify([String(st.ino), String(st.size), String(st.mtimeNs), String(st.ctimeNs), localDateTag(now), config.lcm]);
+  } catch {
+    return null;
+  }
+}
+
+/** Test hook: forget every cached answer. */
+export function clearDuePromotionCache(): void {
+  duePromotionCache.clear();
+}
+
 export function findDuePromotions(sdkSessionId: string, sdkSessionsDir: string): DuePromotion[] {
+  const path = getSdkSessionPath(sdkSessionId, sdkSessionsDir);
+  const signature = duePromotionSignature(path, new Date());
+  if (signature === null) {
+    duePromotionCache.delete(path);
+    return computeDuePromotions(sdkSessionId, sdkSessionsDir);
+  }
+  const hit = duePromotionCache.get(path);
+  if (hit && hit.signature === signature) return hit.due.map((p) => ({ ...p }));
+  const due = computeDuePromotions(sdkSessionId, sdkSessionsDir);
+  duePromotionCache.delete(path);
+  if (duePromotionCache.size >= DUE_PROMOTION_CACHE_MAX) {
+    const oldest = duePromotionCache.keys().next().value;
+    if (oldest !== undefined) duePromotionCache.delete(oldest);
+  }
+  duePromotionCache.set(path, { signature, due: due.map((p) => ({ ...p })) });
+  return due;
+}
+
+function computeDuePromotions(sdkSessionId: string, sdkSessionsDir: string): DuePromotion[] {
   const events = loadEvents(sdkSessionId, sdkSessionsDir);
   if (events.length === 0) return [];
 

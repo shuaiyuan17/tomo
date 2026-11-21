@@ -224,6 +224,25 @@ export interface LiveSessionSettings {
   onInformational?: (message: SDKInformationalMessage) => void;
 }
 
+/**
+ * What whenClosed() needs of the CLI child: the SDK's SpawnedProcess wrapper
+ * (no pid; its "exit" fires once the child has exited and its stderr closed).
+ */
+interface CliChild {
+  exitCode: number | null;
+  signalCode?: string | null;
+  once(event: "exit" | "error", listener: () => void): unknown;
+}
+
+/** Resolves when the child has exited (or failed to start). Never rejects. */
+function childExited(child: CliChild): Promise<void> {
+  if (child.exitCode !== null || (child.signalCode ?? null) !== null) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    child.once("exit", resolve);
+    child.once("error", resolve);
+  });
+}
+
 export class LiveSession {
   private q: Query;
   // Input messages waiting for the SDK to pull them through messageGenerator.
@@ -261,6 +280,18 @@ export class LiveSession {
    * end while these keep running; closing the session then kills them.
    */
   private backgroundTaskIds = new Set<string>();
+  /**
+   * Live AMBIENT tasks (watchers the model left running on purpose). They do
+   * not hold a compact or a prompt retirement, but closing the session kills
+   * them too, so the idle reaper must not (see LiveSessionManager).
+   */
+  private ambientTaskIds = new Set<string>();
+  /**
+   * Last time anything happened on this session: created, handed out for a
+   * turn (`noteActivity`), or an SDK event arrived. What the idle reaper
+   * measures from.
+   */
+  private lastActivity = Date.now();
   /** Full task records for the web "working now" panel (see task-tracker.ts). */
   private taskTracker = new TaskTracker();
   private backgroundIdleWaiters: Array<() => void> = [];
@@ -452,6 +483,21 @@ export class LiveSession {
   /** True while the SDK reports live, non-ambient background tasks. */
   hasActiveBackgroundTasks(): boolean {
     return this.backgroundTaskIds.size > 0;
+  }
+
+  /** True while the SDK reports ANY live background task, ambient ones included. */
+  hasAnyLiveTasks(): boolean {
+    return this.backgroundTaskIds.size > 0 || this.ambientTaskIds.size > 0;
+  }
+
+  /** Record that the session is in use (a turn is about to run on it). */
+  noteActivity(): void {
+    this.lastActivity = Date.now();
+  }
+
+  /** Epoch ms of the last activity — see `lastActivity`. */
+  lastActivityAt(): number {
+    return this.lastActivity;
   }
 
   /** How many live, non-ambient background tasks the SDK last reported. */
@@ -881,6 +927,7 @@ export class LiveSession {
   }
 
   private async handleEvent(event: SDKMessage): Promise<void> {
+    this.lastActivity = Date.now();
     // A RETIRED SESSION HANDLES NOTHING. close() rejected every request, but
     // the SDK can still hand over events it had already buffered — and the
     // event loop may have been parked in `await onBlock` when close() ran.
@@ -982,6 +1029,7 @@ export class LiveSession {
       const tasks = (event as { tasks?: Array<{ task_id: string; ambient?: boolean }> }).tasks ?? [];
       const hadTasks = this.backgroundTaskIds.size > 0;
       this.backgroundTaskIds = new Set(tasks.filter((t) => !t.ambient).map((t) => t.task_id));
+      this.ambientTaskIds = new Set(tasks.filter((t) => t.ambient).map((t) => t.task_id));
       if (this.backgroundTaskIds.size === 0) {
         if (hadTasks) {
           this.awaitingTaskReport = true;
@@ -1736,6 +1784,40 @@ export class LiveSession {
     return this.eventLoopDone;
   }
 
+  /**
+   * Resolves once a CLOSED session is fully gone: its event loop has ended
+   * AND the CLI child has exited, so it can no longer append exit-time
+   * records to the transcript. Never rejects. Call it after close(); on a
+   * live session it resolves at once (there is nothing to wait for).
+   *
+   * WAITS ON THE CHILD ITSELF, UNBOUNDED. The SDK's cleanup (asyncDispose)
+   * stops waiting for the exit after about 2s, so on its own it can resolve
+   * while the child is still writing. The child is read off the runtime
+   * Query (`transport.process`, not in the SDK's types, so probed like
+   * setMcpServers); without it, the SDK's bounded wait is all there is.
+   * Callers bound the whole wait (IDLE_REAP_CLOSE_WAIT_MS).
+   */
+  whenClosed(): Promise<void> {
+    return this.closedSettled ?? Promise.resolve();
+  }
+
+  private closedSettled: Promise<void> | undefined;
+
+  private async settleClose(child: CliChild | undefined): Promise<void> {
+    const dispose = (this.q as unknown as { [Symbol.asyncDispose]?: () => Promise<void> })[Symbol.asyncDispose];
+    await Promise.allSettled([
+      typeof dispose === "function" ? dispose.call(this.q) : undefined,
+      this.eventLoopDone,
+      child ? childExited(child) : undefined,
+    ]);
+  }
+
+  /** The CLI child process the runtime Query holds, when it exposes one. */
+  private cliChild(): CliChild | undefined {
+    const child = (this.q as unknown as { transport?: { process?: unknown } }).transport?.process as Partial<CliChild> | undefined;
+    return child && typeof child.once === "function" && "exitCode" in child ? child as CliChild : undefined;
+  }
+
   isAlive(): boolean {
     return this.alive;
   }
@@ -1801,6 +1883,8 @@ export class LiveSession {
    * decided to exit, which is exactly the window shutdown does not have.
    */
   close(): void {
+    // Read before q.close(): the transport is the SDK's, and closing may drop it.
+    const child = this.closedSettled ? undefined : this.cliChild();
     this.alive = false;
     this.publishTasks(this.taskTracker.reset());
     this.notifyBackgroundIdle();
@@ -1810,5 +1894,6 @@ export class LiveSession {
     this.inputWaiter?.();
     this.q.close();
     this.failTurn(new Error("Session is closed"));
+    this.closedSettled ??= this.settleClose(child);
   }
 }

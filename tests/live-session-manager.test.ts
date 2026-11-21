@@ -44,6 +44,10 @@ const { mockState } = vi.hoisted(() => ({
     compactTriggered: false,
     sessionContexts: [] as Array<{ sessionKey: string; backgroundLaunchDenial?: () => string | null }>,
     onInterrupt: null as null | ((err: Error, session: FakeSession) => void),
+    /** When set, every closed session's whenClosed() waits on it (the CLI child still exiting). */
+    closeGate: null as null | Promise<void>,
+    /** When set, reconnectMcpServer() waits on it (a reconnect still running). */
+    reconnectGate: null as null | Promise<void>,
   },
 }));
 
@@ -69,8 +73,15 @@ vi.mock("../src/agent/live-session.js", () => {
     background = false;
     bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }> = [];
     hasActiveBackgroundTasks() { return this.background; }
+    ambient = false;
+    hasAnyLiveTasks() { return this.background || this.ambient; }
+    lastActivity = Date.now();
+    noteActivity() { this.lastActivity = Date.now(); }
+    lastActivityAt() { return this.lastActivity; }
     activeBackgroundTaskCount() { return this.background ? 2 : 0; }
-    isAwaitingTaskReportWithin() { return this.awaitingReport; }
+    /** How long ago the drain that set `awaitingReport` happened (for the bounded check). */
+    awaitingReportAgeMs = 0;
+    isAwaitingTaskReportWithin(maxAgeMs: number) { return this.awaitingReport && this.awaitingReportAgeMs < maxAgeMs; }
     backgroundMoves: Array<(moved: boolean) => void> = [];
     backgroundTask() { return new Promise<boolean>((resolve) => this.backgroundMoves.push(resolve)); }
     awaitingReport = false;
@@ -86,6 +97,8 @@ vi.mock("../src/agent/live-session.js", () => {
     interruptedWith: Error | null = null;
     interrupt(err: Error) { this.interruptedWith = err; this.closed = true; mockState.onInterrupt?.(err, this); }
     whenEventLoopDone() { return Promise.resolve(); }
+    whenClosed() { return mockState.closeGate ?? Promise.resolve(); }
+    async reconnectMcpServer(_name: string) { await mockState.reconnectGate; }
     steeredRequestCount() { return 0; }
     waitForIdle() { return new Promise<void>((r) => this.idleResolvers.push(r)); }
     getSessionId() { return this.sessionId; }
@@ -140,7 +153,7 @@ vi.mock("../src/agent/sdk-options.js", () => ({
 }));
 
 vi.mock("../src/config.js", () => ({
-  config: { sdkSessionsDir: "/tmp/sdk-sessions", liveSessionTimeoutMs: 1000 },
+  config: { sdkSessionsDir: "/tmp/sdk-sessions", liveSessionTimeoutMs: 1000, liveSessionIdleTimeoutMs: 60 * 60 * 1000 },
 }));
 
 vi.mock("../src/sessions/repair.js", () => ({
@@ -155,7 +168,8 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { LiveSessionManager, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED, PROMPT_RETIRE_BACKGROUND_WAIT_MS, PROMPT_RETIRE_REPORT_WAIT_MS } = await import("../src/agent/live-session-manager.js");
+const { config: mockConfig } = await import("../src/config.js") as unknown as { config: { liveSessionIdleTimeoutMs: number } };
+const { LiveSessionManager, IDLE_REAP_SWEEP_MS, IDLE_REAP_CLOSE_WAIT_MS, SDK_CLI_KILL_MS, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED, PROMPT_RETIRE_BACKGROUND_WAIT_MS, PROMPT_RETIRE_REPORT_WAIT_MS } = await import("../src/agent/live-session-manager.js");
 const { log } = await import("../src/logger.js");
 const { SdkResultError } = await import("../src/agent/live-session.js");
 type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
@@ -198,6 +212,9 @@ beforeEach(() => {
   mockState.compactTriggered = false;
   mockState.sessionContexts = [];
   mockState.onInterrupt = null;
+  mockState.closeGate = null;
+  mockState.reconnectGate = null;
+  mockConfig.liveSessionIdleTimeoutMs = 60 * 60 * 1000;
 });
 
 describe("LiveSessionManager session lifecycle", () => {
@@ -924,6 +941,277 @@ describe("LiveSessionManager session lifecycle", () => {
       failureMessage,
     );
     expect(vi.mocked(log.warn).mock.calls.filter(([, message]) => message === failureMessage)).toHaveLength(1);
+  });
+});
+
+describe("LiveSessionManager idle reaper", () => {
+  const HOUR = 60 * 60 * 1000;
+
+  async function idleSession(key = "telegram:-100") {
+    const manager = new LiveSessionManager(makeDeps());
+    const session = await manager.getOrCreateLiveSession(key);
+    const fake = mockState.instances[mockState.instances.length - 1];
+    return { manager, session, fake, key };
+  }
+
+  it("closes a session idle past the timeout, and the next message builds a fresh one", async () => {
+    const { manager, fake, key } = await idleSession();
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR - 1)).toEqual([]);
+    expect(fake.closed).toBe(false);
+
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+    expect(fake.closed).toBe(true);
+    expect(manager.isAlive(key)).toBe(false);
+
+    const next = await manager.getOrCreateLiveSession(key);
+    expect(next).not.toBe(fake);
+    expect(mockState.instances).toHaveLength(2);
+  });
+
+  it("measures idleness from the last hand-out, not from creation", async () => {
+    vi.useFakeTimers();
+    try {
+      const { manager, fake, key } = await idleSession();
+      const created = fake.lastActivityAt();
+      vi.advanceTimersByTime(HOUR - 1000);
+      await manager.getOrCreateLiveSession(key); // a turn reuses it
+      expect(manager.reapIdleSessions(created + HOUR + 1)).toEqual([]);
+      expect(fake.closed).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    ["a turn is running", (f: FakeSession & Record<string, unknown>) => { f.busy = true; }],
+    ["background tasks are live", (f: FakeSession & Record<string, unknown>) => { f.background = true; }],
+    ["an ambient watcher is live", (f: FakeSession & Record<string, unknown>) => { f.ambient = true; }],
+    ["a task report is still due", (f: FakeSession & Record<string, unknown>) => { f.awaitingReport = true; }],
+  ])("keeps an idle-looking session while %s, and restarts its clock", async (_label, arrange) => {
+    const { manager, fake } = await idleSession();
+    arrange(fake as FakeSession & Record<string, unknown>);
+    const later = fake.lastActivityAt() + 2 * HOUR;
+    expect(manager.reapIdleSessions(later)).toEqual([]);
+    expect(fake.closed).toBe(false);
+    // The clock restarted at that sweep: settling down does not reap at once.
+    Object.assign(fake, { busy: false, background: false, ambient: false, awaitingReport: false });
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + 1000)).toEqual([]);
+    expect(fake.closed).toBe(false);
+  });
+
+  it("stops waiting for a task report once the report window has passed", async () => {
+    // The report was folded into a turn that was already running, so the flag
+    // never clears: past the window it must not keep the session alive.
+    const { manager, fake, key } = await idleSession();
+    Object.assign(fake, { awaitingReport: true, awaitingReportAgeMs: PROMPT_RETIRE_REPORT_WAIT_MS });
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+    expect(fake.closed).toBe(true);
+  });
+
+  it("keeps a session whose SDK id the registry has not stored yet, and restarts its clock", async () => {
+    // The registry refused the link after a turn: the live session holds the
+    // only usable id, and closing it would resume an older one or start fresh.
+    const deps = makeDeps();
+    deps.setSdkSessionId = vi.fn(() => { throw new Error("session registry could not be read"); });
+    const manager = new LiveSessionManager(deps);
+    mockState.sendImpl = async () => "hello";
+    await manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
+    const fake = mockState.instances[0];
+    const later = fake.lastActivityAt() + 2 * HOUR;
+    expect(manager.reapIdleSessions(later)).toEqual([]);
+    expect(fake.closed).toBe(false);
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + 1000)).toEqual([]);
+  });
+
+  it("keeps a session whose compact is waiting on its reload", async () => {
+    const { manager, fake, key } = await idleSession();
+    expect(manager.reserveCompact(key, "sdk-1").ok).toBe(true);
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + 2 * HOUR)).toEqual([]);
+    expect(fake.closed).toBe(false);
+  });
+
+  it("leaves a prompt-stale session to its own retirement", async () => {
+    let prompt = "v1";
+    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    await manager.getOrCreateLiveSession("telegram:1");
+    const stale = mockState.instances[0];
+    stale.busy = true;
+    prompt = "v2";
+    await manager.getOrCreateLiveSession("telegram:2");
+    stale.busy = false; // idle, but retireWhenIdle is still parked on waitForIdle
+    expect(manager.reapIdleSessions(stale.lastActivityAt() + 2 * HOUR)).not.toContain("telegram:1");
+  });
+
+  it("does nothing when the timeout is 0", async () => {
+    mockConfig.liveSessionIdleTimeoutMs = 0;
+    const { manager, fake } = await idleSession();
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + 100 * HOUR)).toEqual([]);
+    expect(fake.closed).toBe(false);
+  });
+
+  it("a message that arrives while a reaped session is still exiting waits for it, then resumes", async () => {
+    let exited!: () => void;
+    mockState.closeGate = new Promise<void>((r) => { exited = r; });
+    try {
+      const { manager, fake, key } = await idleSession();
+      expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+      let resumed = false;
+      const next = manager.getOrCreateLiveSession(key).then((s) => { resumed = true; return s; });
+      await flushMicrotasks();
+      await new Promise((r) => setTimeout(r, 10));
+      // The old CLI may still append exit-time records: no second child on the same transcript yet.
+      expect(resumed).toBe(false);
+      expect(mockState.instances).toHaveLength(1);
+      exited();
+      const session = await next;
+      expect(session).not.toBe(fake);
+      expect(mockState.instances).toHaveLength(2);
+    } finally {
+      mockState.closeGate = null;
+    }
+  });
+
+  it("a rewind that starts while a reaped session is exiting still holds the key", async () => {
+    let exited!: () => void;
+    mockState.closeGate = new Promise<void>((r) => { exited = r; });
+    const { manager, fake, key } = await idleSession();
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+    let resumed = false;
+    const next = manager.getOrCreateLiveSession(key).then((s) => { resumed = true; return s; });
+    await flushMicrotasks(); // parked on the reap close
+    const suspending = manager.suspendForRewind(key); // takes the hold now, then waits on the same close
+    exited();
+    const { release } = await suspending;
+    await new Promise((r) => setTimeout(r, 10));
+    // Woken by the close, it must see the rewind's hold: nothing built on the pre-rewind conversation.
+    expect(resumed).toBe(false);
+    expect(mockState.instances).toHaveLength(1);
+    release();
+    expect(await next).not.toBe(fake);
+    expect(mockState.instances).toHaveLength(2);
+  });
+
+  it("waits out a child that takes until the SDK's SIGKILL to exit", async () => {
+    vi.useFakeTimers();
+    try {
+      // close → ~2s grace → SIGTERM → 5s → SIGKILL: a child can take ~7s.
+      mockState.closeGate = new Promise<void>((r) => { setTimeout(r, SDK_CLI_KILL_MS + 500); });
+      const { manager, fake, key } = await idleSession();
+      expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+      let resumed = false;
+      const next = manager.getOrCreateLiveSession(key).then((s) => { resumed = true; return s; });
+      await vi.advanceTimersByTimeAsync(SDK_CLI_KILL_MS + 400);
+      expect(resumed).toBe(false);
+      expect(mockState.instances).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(await next).not.toBe(fake);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a rewind of a reaped key waits for its CLI to exit before snapshotting", async () => {
+    let exited!: () => void;
+    mockState.closeGate = new Promise<void>((r) => { exited = r; });
+    const { manager, fake, key } = await idleSession();
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+    let suspended = false;
+    const suspend = manager.suspendForRewind(key).then((r) => { suspended = true; return r; });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(suspended).toBe(false); // the old CLI may still be writing the transcript being forked
+    exited();
+    (await suspend).release();
+    expect(suspended).toBe(true);
+  });
+
+  it("refuses a compact reservation while a reaped session is exiting, and approves it once it is gone", async () => {
+    let exited!: () => void;
+    mockState.closeGate = new Promise<void>((r) => { exited = r; });
+    const { manager, fake, key } = await idleSession();
+    expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+    // The CLI rollup would rename the transcript the old child is still writing.
+    expect(manager.reserveCompact(key, "sdk-1")).toMatchObject({ ok: false, reason: "session-closing" });
+    exited();
+    await flushMicrotasks();
+    expect(manager.reserveCompact(key, "sdk-1").ok).toBe(true); // the retry
+  });
+
+  it("keeps the closing entry where the next lookup finds it", async () => {
+    let exited!: () => void;
+    mockState.closeGate = new Promise<void>((r) => { exited = r; });
+    const { manager, fake, key } = await idleSession();
+    manager.reapIdleSessions(fake.lastActivityAt() + HOUR);
+    expect(manager.keyForSdkSession("sdk-1")).toBe(key);
+    manager.closeLiveSession(key); // e.g. a model switch: must not drop the closing entry
+    let resumed = false;
+    const next = manager.getOrCreateLiveSession(key).then((s) => { resumed = true; return s; });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(resumed).toBe(false);
+    exited();
+    expect(await next).not.toBe(fake);
+  });
+
+  it("gives up waiting on a reaped session that never finishes exiting", async () => {
+    vi.useFakeTimers();
+    mockState.closeGate = new Promise<void>(() => {});
+    try {
+      const { manager, fake, key } = await idleSession();
+      expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+      const next = manager.getOrCreateLiveSession(key);
+      await vi.advanceTimersByTimeAsync(IDLE_REAP_CLOSE_WAIT_MS);
+      expect(await next).not.toBe(fake);
+    } finally {
+      mockState.closeGate = null;
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a session while an explicit MCP reconnect is running on it", async () => {
+    let done!: () => void;
+    mockState.reconnectGate = new Promise<void>((r) => { done = r; });
+    try {
+      const { manager, fake, key } = await idleSession();
+      const reconnect = manager.reconnectMcpServer(key, "github");
+      await flushMicrotasks();
+      expect(manager.reapIdleSessions(fake.lastActivityAt() + 2 * HOUR)).toEqual([]);
+      expect(fake.closed).toBe(false);
+      done();
+      await reconnect;
+    } finally {
+      mockState.reconnectGate = null;
+    }
+  });
+
+  it("stops its timer once no session is alive, even if a dead one is still in the map", async () => {
+    vi.useFakeTimers();
+    try {
+      mockConfig.liveSessionIdleTimeoutMs = 5 * IDLE_REAP_SWEEP_MS;
+      const { fake } = await idleSession();
+      fake.closed = true; // died on its own (crash, error path): nothing reaps it
+      vi.advanceTimersByTime(IDLE_REAP_SWEEP_MS);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("runs on its own timer, and stop() ends it", async () => {
+    vi.useFakeTimers();
+    try {
+      mockConfig.liveSessionIdleTimeoutMs = 5 * IDLE_REAP_SWEEP_MS;
+      const { manager, fake } = await idleSession();
+      vi.advanceTimersByTime(5 * IDLE_REAP_SWEEP_MS);
+      expect(fake.closed).toBe(true);
+      await flushMicrotasks(); // the (bounded) wait for the closed CLI to exit settles
+      expect(vi.getTimerCount()).toBe(0); // nothing left to watch: the timer stops itself
+
+      await manager.getOrCreateLiveSession("telegram:2");
+      expect(vi.getTimerCount()).toBe(1);
+      await manager.stop();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

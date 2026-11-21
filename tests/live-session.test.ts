@@ -26,6 +26,12 @@ const mcpRuntime = vi.hoisted(() => ({
 }));
 
 const interruptState = vi.hoisted(() => ({ calls: 0, fail: false }));
+/** The CLI child's exit, as the SDK's asyncDispose waits for it; null: already exited. */
+const exitState = vi.hoisted(() => ({
+  gate: null as Promise<void> | null,
+  /** The CLI child the runtime Query holds (q.transport.process); undefined: none exposed. */
+  child: undefined as undefined | { exitCode: number | null; signalCode: string | null; once(e: string, l: () => void): unknown },
+}));
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   query: vi.fn(({ prompt }: { prompt: AsyncGenerator<{ message: { content: Array<{ type: string; text?: string }> }; priority?: string; origin?: unknown; uuid?: string }> }) => {
     const inputs: string[] = [];
@@ -73,6 +79,8 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
         }
       },
       close: () => { done = true; wake?.(); },
+      [Symbol.asyncDispose]: async () => { await exitState.gate; },
+      transport: { process: exitState.child },
       interrupt: async () => { interruptState.calls++; if (interruptState.fail) throw new Error("not connected"); },
       getContextUsage: async () => ({ totalTokens: 100, maxTokens: 1000, percentage: 10, categories: [] }),
       getTaskOutput: async (taskId: string) => taskId === "b1" ? { output: "line 1\nline 2", size: 4096 } : { output: 7 },
@@ -203,6 +211,84 @@ describe("LiveSession background-task tracking", () => {
     expect(await drained).toBe(true);
     expect(session.hasActiveBackgroundTasks()).toBe(false);
     session.close();
+  });
+
+  it("counts ambient watchers as live tasks for the idle reaper, and SDK events as activity", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const { session, harness } = makeSession({});
+      const created = session.lastActivityAt();
+      expect(session.hasAnyLiveTasks()).toBe(false);
+
+      vi.setSystemTime(created + 60_000);
+      harness.pushEvent({
+        type: "system", subtype: "background_tasks_changed", session_id: "s", uuid: "u1",
+        tasks: [{ task_id: "w1", task_type: "monitor", description: "watcher", ambient: true }],
+      });
+      await waitFor(() => session.hasAnyLiveTasks());
+      expect(session.hasActiveBackgroundTasks()).toBe(false);
+      expect(session.lastActivityAt()).toBe(created + 60_000);
+
+      harness.pushEvent({ type: "system", subtype: "background_tasks_changed", session_id: "s", uuid: "u2", tasks: [] });
+      await waitFor(() => !session.hasAnyLiveTasks());
+
+      vi.setSystemTime(created + 120_000);
+      session.noteActivity();
+      expect(session.lastActivityAt()).toBe(created + 120_000);
+      session.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("whenClosed() waits for the CLI child to exit after close()", async () => {
+    let exit!: () => void;
+    exitState.gate = new Promise<void>((r) => { exit = r; });
+    try {
+      const { session } = makeSession({});
+      session.close();
+      let gone = false;
+      void session.whenClosed().then(() => { gone = true; });
+      await session.whenEventLoopDone();
+      await new Promise((r) => setTimeout(r, 5));
+      expect(gone).toBe(false); // event loop over, child still exiting
+      exit();
+      await session.whenClosed();
+      expect(gone).toBe(true);
+    } finally {
+      exitState.gate = null;
+    }
+  });
+
+  it("whenClosed() waits for the CLI child itself, past the SDK's own bounded exit wait", async () => {
+    const { EventEmitter } = await import("node:events");
+    const child = Object.assign(new EventEmitter(), { exitCode: null as number | null, signalCode: null as string | null });
+    exitState.child = child;
+    try {
+      const { session } = makeSession({});
+      session.close(); // the SDK's dispose resolves at once (its ~2s wait already gave up)
+      let gone = false;
+      void session.whenClosed().then(() => { gone = true; });
+      await new Promise((r) => setTimeout(r, 5));
+      expect(gone).toBe(false); // the child is still running: it may still write the transcript
+      child.exitCode = 0;
+      child.emit("exit", 0, null);
+      await session.whenClosed();
+      expect(gone).toBe(true);
+    } finally {
+      exitState.child = undefined;
+    }
+  });
+
+  it("whenClosed() does not wait on a child that has already exited", async () => {
+    exitState.child = { exitCode: 0, signalCode: null, once: () => undefined };
+    try {
+      const { session } = makeSession({});
+      session.close();
+      await session.whenClosed();
+    } finally {
+      exitState.child = undefined;
+    }
   });
 
   it("marks a drain as awaiting the report turn; a user turn doesn't clear it, an SDK-initiated one does", async () => {

@@ -18,7 +18,7 @@ const OWNER_NOTICE_TAGS = new Set(["hook_callback_failed", "settings_not_in_effe
 
 /**
  * Log one `system/informational` line from the SDK: warnings as warn,
- * notices and suggestions as info, plain info lines as debug.
+ * everything else (info, notice, suggestion) as info.
  */
 export function logInformational(message: SDKInformationalMessage, sessionKey: string | undefined): void {
   const fields = {
@@ -28,7 +28,6 @@ export function logInformational(message: SDKInformationalMessage, sessionKey: s
     text: clip(message.content, INFORMATIONAL_TEXT_LIMIT),
   };
   if (message.level === "warning") log.warn(fields, "SDK informational warning");
-  else if (message.level === "info") log.debug(fields, "SDK informational");
   else log.info(fields, "SDK informational");
 }
 
@@ -42,8 +41,11 @@ export interface InformationalNoticesDeps {
 /**
  * Owner notices for the informational tags in OWNER_NOTICE_TAGS, at most one
  * per tag and session per interval. The slot is taken when a notice is
- * attempted and given back if nothing was delivered, so a burst sends one
- * notice. In memory: a restart can repeat a notice.
+ * attempted, so a burst sends one notice. It is given back only when the
+ * notice was definitely not sent (notifyOwner resolved false: no owner or no
+ * reachable owner DM). A rejected send keeps it: a timeout or channel error
+ * may still have reached the owner, and a duplicate is worse than a gap.
+ * In memory: a restart can repeat a notice.
  */
 export class InformationalNotices {
   private readonly lastNoticeAt = new Map<string, number>();
@@ -73,7 +75,6 @@ export class InformationalNotices {
       if (delivered) log.warn({ session: sessionKey, tag }, "Owner told about an SDK informational warning");
       else release();
     }, (err: unknown) => {
-      release();
       log.warn({ session: sessionKey, tag, error: shortErrorMessage(err) }, "Could not send the SDK informational notice");
     });
   }

@@ -5,7 +5,8 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { InformationalNotices, INFORMATIONAL_NOTICE_INTERVAL_MS } = await import("../src/agent/sdk-informational.js");
+const { InformationalNotices, INFORMATIONAL_NOTICE_INTERVAL_MS, logInformational } = await import("../src/agent/sdk-informational.js");
+const { log } = await import("../src/logger.js");
 
 function message(tag: string | undefined, content = "callback threw"): SDKInformationalMessage {
   return {
@@ -15,10 +16,14 @@ function message(tag: string | undefined, content = "callback threw"): SDKInform
   };
 }
 
-function setup(delivered = true) {
+function setup(delivered: boolean | Error = true) {
   let now = 1_000_000;
   const sent: string[] = [];
-  const notifyOwner = vi.fn(async (text: string) => { sent.push(text); return delivered; });
+  const notifyOwner = vi.fn(async (text: string) => {
+    sent.push(text);
+    if (delivered instanceof Error) throw delivered;
+    return delivered;
+  });
   const notices = new InformationalNotices({ notifyOwner, now: () => now });
   return { notices, sent, notifyOwner, advance: (ms: number) => { now += ms; } };
 }
@@ -61,12 +66,32 @@ describe("InformationalNotices", () => {
     expect(notifyOwner).not.toHaveBeenCalled();
   });
 
-  it("an undelivered notice frees the slot for the next one", async () => {
+  it("a send that failed or timed out keeps the slot: it may have reached the owner", async () => {
+    const { notices, notifyOwner } = setup(new Error("imsg rpc send timed out after 60000ms"));
+    notices.observe("dm:owner", message("hook_callback_failed"));
+    await flush();
+    notices.observe("dm:owner", message("hook_callback_failed"));
+    await flush();
+    expect(notifyOwner).toHaveBeenCalledTimes(1);
+  });
+
+  it("a notice that was definitely not sent (no owner target) frees the slot for the next one", async () => {
     const { notices, notifyOwner } = setup(false);
     notices.observe("dm:owner", message("settings_not_in_effect"));
     await flush();
     notices.observe("dm:owner", message("settings_not_in_effect"));
     await flush();
     expect(notifyOwner).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("logInformational", () => {
+  it("logs info, notice and suggestion lines at info, warning at warn", () => {
+    vi.mocked(log.info).mockClear();
+    for (const level of ["info", "notice", "suggestion"] as const) logInformational({ ...message("x"), level }, "dm:owner");
+    expect(vi.mocked(log.info)).toHaveBeenCalledTimes(3);
+    expect(log.debug).not.toHaveBeenCalled();
+    logInformational(message("x"), "dm:owner");
+    expect(log.warn).toHaveBeenCalledWith(expect.objectContaining({ tag: "x", level: "warning" }), "SDK informational warning");
   });
 });

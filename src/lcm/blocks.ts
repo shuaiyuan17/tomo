@@ -462,8 +462,10 @@ export interface DuePromotion {
  * answer they produced last time.
  *
  * WHAT THE ANSWER DEPENDS ON, and so what the signature holds: the file's
- * bytes (inode, size and modification time — an append or an atomic rewrite
- * changes at least one), today's local date (week, month and year derive from
+ * bytes (inode, size, and modification and change times, in ns — an append
+ * or an atomic rewrite changes at least one, and ctime catches a same-length
+ * in-place rewrite inside mtime's granularity or with mtime put back, as the
+ * registry cache in web/data.ts does), today's local date (week, month and year derive from
  * it) and the `lcm` config (fresh-tail settings). Nothing else is read.
  *
  * Read-only callers only. `resolveBlockRange` is NOT cached: the compact path
@@ -475,7 +477,7 @@ const DUE_PROMOTION_CACHE_MAX = 64;
 function duePromotionSignature(path: string, now: Date): string | null {
   try {
     const st = statSync(path, { bigint: true });
-    return JSON.stringify([String(st.ino), String(st.size), String(st.mtimeNs), localDateTag(now), config.lcm]);
+    return JSON.stringify([String(st.ino), String(st.size), String(st.mtimeNs), String(st.ctimeNs), localDateTag(now), config.lcm]);
   } catch {
     return null;
   }

@@ -73,6 +73,13 @@ export const REWIND_SUSPEND_TIMEOUT_MS = 10_000;
 /** How often the idle reaper looks (capped by the timeout itself). */
 export const IDLE_REAP_SWEEP_MS = 60_000;
 
+/**
+ * Upper bound on how long a message for a reaped key waits for the old CLI
+ * child to exit before resuming. The SDK's own cleanup already bounds the
+ * exit wait (about 2s); this is the belt to that.
+ */
+export const IDLE_REAP_CLOSE_WAIT_MS = 5_000;
+
 /** Resolves true if `promise` settled within `ms`, false on timeout. Never rejects. */
 async function withTimeout(promise: Promise<unknown>, ms: number): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -259,6 +266,13 @@ export class LiveSessionManager {
   private holdReleases = new Map<string, () => void>();
   /** The idle reaper's timer; armed with the first live session, cleared by stop(). */
   private idleReapTimer: ReturnType<typeof setInterval> | undefined;
+  /**
+   * Keys whose session the idle reaper closed and whose CLI child may still
+   * be exiting (and appending exit-time records to the transcript). A new
+   * session for the key waits for this, bounded, before resuming the same
+   * transcript — like a turn waits for a rewind's hold.
+   */
+  private reapClosings = new Map<string, Promise<void>>();
 
   /** SDK-reported MCP health: lifecycle logs, pre-turn reconnect, owner notice. */
   private readonly mcpHealth: McpHealthMonitor;
@@ -528,6 +542,8 @@ export class LiveSessionManager {
     for (;;) {
       // A rewind holds this key: wait, then use the rewound conversation.
       for (let hold = this.sessionHolds.get(key); hold; hold = this.sessionHolds.get(key)) await hold;
+      // A reaped session is still exiting: resume only once it is gone.
+      for (let closing = this.reapClosings.get(key); closing; closing = this.reapClosings.get(key)) await closing;
 
       // Checked on every message (not just on creation): a lone session that is
       // only ever reused would otherwise never notice a workspace change and
@@ -832,7 +848,12 @@ export class LiveSessionManager {
    * Only a session with NOTHING going on is closed: no turn in any phase
    * (`hasTurnInFlight`), no live task, ambient watchers included (closing
    * kills them), no task report still due, no compact waiting on its reload,
-   * and no prompt-stale retirement already in charge of it.
+   * no explicit MCP reconnect running on it (`mcpReservations`), and no
+   * prompt-stale retirement already in charge of it.
+   *
+   * The CLI child is still exiting after close() (and may append exit-time
+   * records to the transcript), so a message that arrives meanwhile waits for
+   * it, bounded, before resuming the same transcript (`reapClosings`).
    */
   private armIdleReaper(): void {
     const timeoutMs = config.liveSessionIdleTimeoutMs;
@@ -851,7 +872,7 @@ export class LiveSessionManager {
       // The report wait is BOUNDED, as in backgroundState(): a result folded
       // into a turn that was already running never clears the flag, and an
       // unbounded check would keep such a session alive forever.
-      if (this.hasTurnInFlight(key) || session.hasAnyLiveTasks()
+      if (this.hasTurnInFlight(key) || this.mcpReservations.has(key) || session.hasAnyLiveTasks()
         || session.isAwaitingTaskReportWithin(PROMPT_RETIRE_REPORT_WAIT_MS)
         || (this.backgroundingInFlight.get(key) ?? 0) > 0 || this.isCompactPending(key)) {
         session.noteActivity();
@@ -860,14 +881,27 @@ export class LiveSessionManager {
       const idleMs = now - session.lastActivityAt();
       if (idleMs < timeoutMs) continue;
       this.closeLiveSession(key);
+      this.trackReapClosing(key, session);
       reaped.push(key);
       log.info({ key, idleMinutes: Math.round(idleMs / 60_000) }, "Closed idle live session; the next message resumes it");
     }
-    if (this.liveSessions.size === 0 && this.idleReapTimer) {
+    // "No LIVE session", not "empty map": a session that died on its own
+    // stays in the map (lastResult, keyForSdkSession and createLiveSession's
+    // predecessor check read it), and must not keep the timer running. The
+    // next session built re-arms it.
+    if (this.idleReapTimer && ![...this.liveSessions.values()].some((s) => s.isAlive())) {
       clearInterval(this.idleReapTimer);
       this.idleReapTimer = undefined;
     }
     return reaped;
+  }
+
+  private trackReapClosing(key: string, session: LiveSession): void {
+    const closing: Promise<void> = withTimeout(session.whenClosed(), IDLE_REAP_CLOSE_WAIT_MS).then((exited) => {
+      if (!exited) log.warn({ key, timeoutMs: IDLE_REAP_CLOSE_WAIT_MS }, "Reaped session's CLI did not exit in time; resuming anyway");
+      if (this.reapClosings.get(key) === closing) this.reapClosings.delete(key);
+    });
+    this.reapClosings.set(key, closing);
   }
 
   closeLiveSession(key: string): void {

@@ -26,6 +26,8 @@ const mcpRuntime = vi.hoisted(() => ({
 }));
 
 const interruptState = vi.hoisted(() => ({ calls: 0, fail: false }));
+/** The CLI child's exit, as the SDK's asyncDispose waits for it; null: already exited. */
+const exitState = vi.hoisted(() => ({ gate: null as Promise<void> | null }));
 vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   query: vi.fn(({ prompt }: { prompt: AsyncGenerator<{ message: { content: Array<{ type: string; text?: string }> }; priority?: string; origin?: unknown; uuid?: string }> }) => {
     const inputs: string[] = [];
@@ -73,6 +75,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
         }
       },
       close: () => { done = true; wake?.(); },
+      [Symbol.asyncDispose]: async () => { await exitState.gate; },
       interrupt: async () => { interruptState.calls++; if (interruptState.fail) throw new Error("not connected"); },
       getContextUsage: async () => ({ totalTokens: 100, maxTokens: 1000, percentage: 10, categories: [] }),
       getTaskOutput: async (taskId: string) => taskId === "b1" ? { output: "line 1\nline 2", size: 4096 } : { output: 7 },
@@ -229,6 +232,25 @@ describe("LiveSession background-task tracking", () => {
       session.close();
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it("whenClosed() waits for the CLI child to exit after close()", async () => {
+    let exit!: () => void;
+    exitState.gate = new Promise<void>((r) => { exit = r; });
+    try {
+      const { session } = makeSession({});
+      session.close();
+      let gone = false;
+      void session.whenClosed().then(() => { gone = true; });
+      await session.whenEventLoopDone();
+      await new Promise((r) => setTimeout(r, 5));
+      expect(gone).toBe(false); // event loop over, child still exiting
+      exit();
+      await session.whenClosed();
+      expect(gone).toBe(true);
+    } finally {
+      exitState.gate = null;
     }
   });
 

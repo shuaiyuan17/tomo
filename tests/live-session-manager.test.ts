@@ -44,6 +44,10 @@ const { mockState } = vi.hoisted(() => ({
     compactTriggered: false,
     sessionContexts: [] as Array<{ sessionKey: string; backgroundLaunchDenial?: () => string | null }>,
     onInterrupt: null as null | ((err: Error, session: FakeSession) => void),
+    /** When set, every closed session's whenClosed() waits on it (the CLI child still exiting). */
+    closeGate: null as null | Promise<void>,
+    /** When set, reconnectMcpServer() waits on it (a reconnect still running). */
+    reconnectGate: null as null | Promise<void>,
   },
 }));
 
@@ -93,6 +97,8 @@ vi.mock("../src/agent/live-session.js", () => {
     interruptedWith: Error | null = null;
     interrupt(err: Error) { this.interruptedWith = err; this.closed = true; mockState.onInterrupt?.(err, this); }
     whenEventLoopDone() { return Promise.resolve(); }
+    whenClosed() { return mockState.closeGate ?? Promise.resolve(); }
+    async reconnectMcpServer(_name: string) { await mockState.reconnectGate; }
     steeredRequestCount() { return 0; }
     waitForIdle() { return new Promise<void>((r) => this.idleResolvers.push(r)); }
     getSessionId() { return this.sessionId; }
@@ -163,7 +169,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 const { config: mockConfig } = await import("../src/config.js") as unknown as { config: { liveSessionIdleTimeoutMs: number } };
-const { LiveSessionManager, IDLE_REAP_SWEEP_MS, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED, PROMPT_RETIRE_BACKGROUND_WAIT_MS, PROMPT_RETIRE_REPORT_WAIT_MS } = await import("../src/agent/live-session-manager.js");
+const { LiveSessionManager, IDLE_REAP_SWEEP_MS, IDLE_REAP_CLOSE_WAIT_MS, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED, PROMPT_RETIRE_BACKGROUND_WAIT_MS, PROMPT_RETIRE_REPORT_WAIT_MS } = await import("../src/agent/live-session-manager.js");
 const { log } = await import("../src/logger.js");
 const { SdkResultError } = await import("../src/agent/live-session.js");
 type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
@@ -206,6 +212,8 @@ beforeEach(() => {
   mockState.compactTriggered = false;
   mockState.sessionContexts = [];
   mockState.onInterrupt = null;
+  mockState.closeGate = null;
+  mockState.reconnectGate = null;
   mockConfig.liveSessionIdleTimeoutMs = 60 * 60 * 1000;
 });
 
@@ -1026,6 +1034,72 @@ describe("LiveSessionManager idle reaper", () => {
     expect(fake.closed).toBe(false);
   });
 
+  it("a message that arrives while a reaped session is still exiting waits for it, then resumes", async () => {
+    let exited!: () => void;
+    mockState.closeGate = new Promise<void>((r) => { exited = r; });
+    try {
+      const { manager, fake, key } = await idleSession();
+      expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+      let resumed = false;
+      const next = manager.getOrCreateLiveSession(key).then((s) => { resumed = true; return s; });
+      await flushMicrotasks();
+      await new Promise((r) => setTimeout(r, 10));
+      // The old CLI may still append exit-time records: no second child on the same transcript yet.
+      expect(resumed).toBe(false);
+      expect(mockState.instances).toHaveLength(1);
+      exited();
+      const session = await next;
+      expect(session).not.toBe(fake);
+      expect(mockState.instances).toHaveLength(2);
+    } finally {
+      mockState.closeGate = null;
+    }
+  });
+
+  it("gives up waiting on a reaped session that never finishes exiting", async () => {
+    vi.useFakeTimers();
+    mockState.closeGate = new Promise<void>(() => {});
+    try {
+      const { manager, fake, key } = await idleSession();
+      expect(manager.reapIdleSessions(fake.lastActivityAt() + HOUR)).toEqual([key]);
+      const next = manager.getOrCreateLiveSession(key);
+      await vi.advanceTimersByTimeAsync(IDLE_REAP_CLOSE_WAIT_MS);
+      expect(await next).not.toBe(fake);
+    } finally {
+      mockState.closeGate = null;
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps a session while an explicit MCP reconnect is running on it", async () => {
+    let done!: () => void;
+    mockState.reconnectGate = new Promise<void>((r) => { done = r; });
+    try {
+      const { manager, fake, key } = await idleSession();
+      const reconnect = manager.reconnectMcpServer(key, "github");
+      await flushMicrotasks();
+      expect(manager.reapIdleSessions(fake.lastActivityAt() + 2 * HOUR)).toEqual([]);
+      expect(fake.closed).toBe(false);
+      done();
+      await reconnect;
+    } finally {
+      mockState.reconnectGate = null;
+    }
+  });
+
+  it("stops its timer once no session is alive, even if a dead one is still in the map", async () => {
+    vi.useFakeTimers();
+    try {
+      mockConfig.liveSessionIdleTimeoutMs = 5 * IDLE_REAP_SWEEP_MS;
+      const { fake } = await idleSession();
+      fake.closed = true; // died on its own (crash, error path): nothing reaps it
+      vi.advanceTimersByTime(IDLE_REAP_SWEEP_MS);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("runs on its own timer, and stop() ends it", async () => {
     vi.useFakeTimers();
     try {
@@ -1033,6 +1107,7 @@ describe("LiveSessionManager idle reaper", () => {
       const { manager, fake } = await idleSession();
       vi.advanceTimersByTime(5 * IDLE_REAP_SWEEP_MS);
       expect(fake.closed).toBe(true);
+      await flushMicrotasks(); // the (bounded) wait for the closed CLI to exit settles
       expect(vi.getTimerCount()).toBe(0); // nothing left to watch: the timer stops itself
 
       await manager.getOrCreateLiveSession("telegram:2");

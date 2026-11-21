@@ -7,6 +7,12 @@ vi.mock("../src/config.js", () => ({
   config: { lcm: { dailyFreshTail: 32, globalFreshTail: false } },
 }));
 
+// A pass-through spy, so the cache tests can count real reads of a file.
+vi.mock("../src/jsonl.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/jsonl.js")>();
+  return { ...actual, readJsonlFileSync: vi.fn(actual.readJsonlFileSync) };
+});
+
 import {
   resolveBlockRange as resolveBlockRangeImpl,
   findDuePromotions as findDuePromotionsImpl,
@@ -20,6 +26,7 @@ import {
 import { compactSession } from "../src/lcm/compact.js";
 import { formatTomoEvent } from "../src/tomo-event.js";
 import { config as mockedConfig } from "../src/config.js";
+import { readJsonlFileSync } from "../src/jsonl.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import { writeFileSync, readFileSync, mkdirSync, mkdtempSync, unlinkSync, existsSync, rmSync, statSync, utimesSync, appendFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -193,17 +200,26 @@ describe("findDuePromotions — cached per unchanged file", () => {
     if (archivePath && existsSync(archivePath)) unlinkSync(archivePath);
   });
 
-  it("does not re-read a file whose inode, size and mtime are unchanged", () => {
+  it("does not re-read an unchanged file", () => {
+    archivePath = writeArchive(sessionId, day(10));
+    const reads = vi.mocked(readJsonlFileSync);
+    reads.mockClear();
+    expect(dailyCount(findDuePromotions(sessionId))).toBe(10);
+    expect(dailyCount(findDuePromotions(sessionId))).toBe(10);
+    expect(reads.mock.calls.filter(([p]) => p === archivePath)).toHaveLength(1);
+  });
+
+  it("recomputes after a same-length in-place rewrite with the mtime put back", () => {
+    // Inode, size and mtime all unchanged (a rewrite inside the mtime's
+    // granularity looks exactly like this): only ctime moved.
     archivePath = writeArchive(sessionId, day(10));
     utimesSync(archivePath, 1_700_000_000, 1_700_000_000); // a whole second: restorable exactly
     expect(dailyCount(findDuePromotions(sessionId))).toBe(10);
-
-    // Same bytes count, same inode, mtime put back: the cache answers, so
-    // the scrambled content is never parsed (it would report nothing due).
-    const { size } = statSync(archivePath);
+    const { size, ino } = statSync(archivePath);
     writeFileSync(archivePath, "x".repeat(size - 1) + "\n");
     utimesSync(archivePath, 1_700_000_000, 1_700_000_000);
-    expect(dailyCount(findDuePromotions(sessionId))).toBe(10);
+    expect(statSync(archivePath).ino).toBe(ino);
+    expect(dailyCount(findDuePromotions(sessionId))).toBeUndefined();
   });
 
   it("recomputes after an append", () => {

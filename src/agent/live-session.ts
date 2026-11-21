@@ -1751,6 +1751,27 @@ export class LiveSession {
     return this.eventLoopDone;
   }
 
+  /**
+   * Resolves once a CLOSED session is fully gone: its event loop has ended
+   * AND the CLI child has exited, so it can no longer append exit-time
+   * records to the transcript. Rides on the SDK's own cleanup, which waits
+   * for the exit (bounded, about 2s). Never rejects. Call it after close();
+   * on a live session it resolves at once (there is nothing to wait for).
+   */
+  whenClosed(): Promise<void> {
+    return this.closedSettled ?? Promise.resolve();
+  }
+
+  private closedSettled: Promise<void> | undefined;
+
+  private async settleClose(): Promise<void> {
+    const dispose = (this.q as unknown as { [Symbol.asyncDispose]?: () => Promise<void> })[Symbol.asyncDispose];
+    await Promise.allSettled([
+      typeof dispose === "function" ? dispose.call(this.q) : undefined,
+      this.eventLoopDone,
+    ]);
+  }
+
   isAlive(): boolean {
     return this.alive;
   }
@@ -1825,5 +1846,6 @@ export class LiveSession {
     this.inputWaiter?.();
     this.q.close();
     this.failTurn(new Error("Session is closed"));
+    this.closedSettled ??= this.settleClose();
   }
 }

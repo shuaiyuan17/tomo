@@ -544,17 +544,53 @@ export function mergeHooks(
  * Bash command that prints a value and then exits non-zero is not scrubbed
  * (pinned in tests/e2e/credential-hooks.e2e.ts). No matcher, so every tool.
  */
+/** How long the hook waits for a readiness retry (a keychain read, which can
+ *  sit on an authorisation prompt) before treating the redactor as not ready.
+ *  The CLI's own hook timeout is no help: on a PostToolUse timeout it keeps the
+ *  ORIGINAL tool result. */
+export const REDACTION_READY_TIMEOUT_MS = 5_000;
+
+/** `ensureRedactionReady`, capped at `ms`; a timeout reads as not ready. The
+ *  retry itself keeps running, and the next call joins it (`inFlight`). */
+async function redactionReadyWithin(ms: number): Promise<boolean> {
+  if (redactionReady()) return true;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      ensureRedactionReady(),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), ms); }),
+    ]);
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function credentialRedactionHooks() {
   return {
     PostToolUse: [{
+      // Blocking adds a failure notice for the model, but it does NOT replace
+      // the output: with the SDK this was written against, a PostToolUse
+      // callback that throws under "block" still delivers the original tool
+      // result. So the callback itself must not throw past its own withhold
+      // path; this is the backstop for anything that escapes it.
+      onFailure: "block" as const,
       hooks: [async (input: { tool_input?: unknown; tool_response?: unknown }) => {
         // Not ready (a restart could not load the stored values): retry, with
-        // backoff; still not ready, fail closed on output that went near the
-        // keychain, the one way a value is meant to enter a command.
-        const ready = redactionReady() || await ensureRedactionReady();
-        let rewritten = scrubDeep(input.tool_response);
-        if (!ready && JSON.stringify(input.tool_input ?? "").includes(KEYCHAIN_SERVICE)) {
-          log.warn("Withheld a tool result that read the keychain: credential redaction is not ready");
+        // backoff and a cap; still not ready, fail closed on output that went
+        // near the keychain, the one way a value is meant to enter a command.
+        const ready = await redactionReadyWithin(REDACTION_READY_TIMEOUT_MS);
+        let rewritten: unknown;
+        try {
+          rewritten = scrubDeep(input.tool_response);
+          if (!ready && JSON.stringify(input.tool_input ?? "").includes(KEYCHAIN_SERVICE)) {
+            log.warn("Withheld a tool result that read the keychain: credential redaction is not ready");
+            rewritten = withholdDeep(input.tool_response);
+          }
+        } catch (err) {
+          // Fail closed: an output we could not check is not passed through.
+          log.warn({ err }, "Withheld a tool result: credential redaction failed");
           rewritten = withholdDeep(input.tool_response);
         }
         if (rewritten === input.tool_response) return {};

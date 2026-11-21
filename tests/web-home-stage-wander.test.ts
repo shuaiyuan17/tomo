@@ -153,3 +153,25 @@ describe("the stage wanders", () => {
     expect(tomo().wander!.leaveAt - clock).toBeGreaterThanOrEqual(30);
   });
 });
+
+describe("the stage keeps characters apart", () => {
+  it("on first load Tomo's random pick avoids where the pet's rules put it (placed after Tomo)", async () => {
+    const { HomeStage } = await import("../web/src/home/three/stage.js");
+    const scene = structuredClone(SCENE);
+    scene.kinds!.cat = { parts: [{ shape: "sphere", size: [0.2, 0.2, 0.2] }] };
+    // The pet stands at "window" (its own spot) and goes to "pool-side" to sleep: both are wander spots of Tomo's.
+    scene.characters!.pet = { kind: "cat", spot: "window", rules: [{ when: "pet:sleeping", spot: "pool-side" }] };
+    for (const [conditions, taken] of [[["idle", "day"], "window"], [["idle", "day", "pet:sleeping"], "pool-side"]] as const) {
+      for (let seed = 0; seed < 40; seed++) {
+        const made = new HomeStage({} as HTMLCanvasElement, (name) => name);
+        made.random = seeded(seed);
+        made.setScene(scene, "r1");
+        made.setState({ ...state([...conditions]), hasPet: true });
+        const cast = (made as unknown as { characters: Map<string, { spot?: string }> }).characters;
+        expect(cast.get("pet")!.spot).toBe(taken);
+        expect(cast.get("tomo")!.spot).not.toBe(taken);
+        made.dispose();
+      }
+    }
+  });
+});

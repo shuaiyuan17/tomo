@@ -2,7 +2,7 @@ import { Color, DirectionalLight, Group, HemisphereLight, MathUtils, Mesh, PCFSo
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { HomeScene } from "../../../../src/home/scene.js";
 import type { HomeSubagent } from "../../../../src/home/status.js";
-import { fillSign, partEffects, seatVisitors, visitorKind, type Conditions, type SignValues, type Vec3 } from "../evaluate.js";
+import { fillSign, holds, partEffects, seatVisitors, visitorKind, type Conditions, type SignValues, type Vec3 } from "../evaluate.js";
 import { MAX_WAITING_DRAWN, waitingPosition } from "../../../../src/home/waiting.js";
 import { layoutKind, layoutScene } from "../layout.js";
 import { buildNodes, redrawSigns, retarget, signPixels, signScaleFor, stepPart, updateSigns, type Built } from "./build.js";
@@ -15,7 +15,7 @@ import { placeScene, type Placement } from "../../../../src/home/geometry.js";
 import { buildNavGrid, findRoute, type NavGrid, type WalkerSize } from "../../../../src/home/nav.js";
 import { walkerOf } from "../../../../src/home/reach.js";
 import { WALK_RULE_FACTOR, WALK_SPEED_DEFAULT } from "../contract.js";
-import { placeCharacter, type Placing, type Random, type WanderState } from "../wander.js";
+import { placeCharacter, wanders, type Placing, type Random, type WanderState } from "../wander.js";
 
 /**
  * The room as three.js draws it. It renders only while something changes
@@ -238,6 +238,15 @@ export class HomeStage {
       }
     }
     // Tomo and the pet: a rule's spot, a wander spot, or their own (wander.ts).
+    // First, where each one's rules put it without any dice (a rule's spot, or its own when it will not wander):
+    // no random pick may land there, whoever is placed first.
+    const movers = ([["tomo", cast.tomo], ["pet", state.hasPet ? cast.pet : undefined]] as const).filter((m): m is readonly ["tomo" | "pet", NonNullable<typeof cast.tomo>] => !!m[1]);
+    for (const [key, who] of movers) {
+      const rule = who.rules?.find((r) => holds(r.when, state.conditions));
+      const fixed = rule ? rule.spot : wanders(who, state.conditions, { tomo: key === "tomo", reduced: this.reducedMotion }) ? undefined : who.spot;
+      const at = spotAt(fixed)?.at;
+      if (at) wanted.set(`reserved:${key}`, { kind: "", at, facing: 0, task: "", walker: walkerOf(key, home) });
+    }
     const mover = (key: "tomo" | "pet", who: NonNullable<typeof cast.tomo>) => {
       const existing = this.characters.get(key);
       const walker = walkerOf(key, home), speed = who.walk?.speed ?? WALK_SPEED_DEFAULT;
@@ -257,8 +266,8 @@ export class HomeStage {
       const spot = spotAt(placing.spot) ?? spotAt(who.spot);
       if (spot) wanted.set(key, { kind: who.kind, at: spot.at, facing: spot.facing ?? 0, task: "", walker, spot: placing.spot, by: placing.by, wander: placing.wander, speed, plan: stroll });
     };
-    if (cast.tomo) mover("tomo", cast.tomo);
-    if (cast.pet && state.hasPet) mover("pet", cast.pet);
+    for (const [key, who] of movers) mover(key, who);
+    for (const [key] of movers) wanted.delete(`reserved:${key}`);
 
     for (const [key, character] of this.characters) if (!wanted.has(key) && !character.leaving) { character.leaving = true; character.wander = null; if (immediate) character.appear = 0; }
     for (const [key, want] of wanted) {
@@ -307,7 +316,7 @@ export class HomeStage {
     const a = spots[from]?.at, b = spots[to]?.at;
     if (!a || !b) return false;
     const near = (p: Vec3) => Math.hypot(p[0] - b[0], p[1] - b[1], p[2] - b[2]) < 0.05;
-    for (const [other, want] of wanted) if (other !== key && near(want.at)) return false;
+    for (const [other, want] of wanted) if (other !== key && other !== `reserved:${key}` && near(want.at)) return false;
     for (const [other, character] of this.characters) if (other !== key && !character.leaving && !wanted.has(other) && near(character.to)) return false;
     if (from === to) return true;
     const cacheKey = `${walker.radius}/${walker.headroom}/${from}/${to}`;

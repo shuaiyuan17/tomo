@@ -236,7 +236,8 @@ function inRoom(grid: NavGrid, x: number, z: number): boolean {
 
 /**
  * Whether the straight hop between the perch `at` and a floor point crosses
- * no solid part that starts below its apex (NAV_HOP_ARC above the perch)
+ * no solid part that starts below its apex (NAV_HOP_ARC or the walker's
+ * head room above the perch, whichever is more)
  * except what the perch is on: one whose footprint holds `at`
  * and whose top is within NAV_PERCH_TOLERANCE of its height. Both ends are
  * inside the room (the room is a rectangle), so the hop is too.
@@ -245,7 +246,8 @@ export function clearHop(grid: NavGrid, at: Vec3, point: FloorPoint): boolean {
   if (!inRoom(grid, at[0], at[2]) || !inRoom(grid, point[0], point[1])) return false;
   const under = (h: Hurdle) => Math.abs(h.top - at[1]) <= NAV_PERCH_TOLERANCE
     && at[0] >= h.min[0] && at[0] <= h.max[0] && at[2] >= h.min[1] && at[2] <= h.max[1];
-  const apex = Math.max(at[1], 0) + NAV_HOP_ARC;
+  // The hop's top: its arc, or the walker's own height when that is more (its head goes up with it).
+  const apex = Math.max(at[1], 0) + Math.max(NAV_HOP_ARC, grid.headroom);
   return grid.hurdles.every((h) => h.bottom >= apex || under(h) || !segmentMeetsBox([at[0], at[2]], point, h));
 }
 /** Whether segment a–b meets the inside of a footprint (Liang–Barsky; grazing an edge does not count). */

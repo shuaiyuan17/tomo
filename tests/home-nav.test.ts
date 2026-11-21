@@ -267,6 +267,14 @@ describe("home navigation: routes", () => {
     expect(findRoute(buildNavGrid(scene), [-2, 0, 0], [0, 0.45, 0]).ok).toBe(true);
   });
 
+  it("does not hop up where its head does not fit, by the walker's own height", () => {
+    // A slab 0.8 m above a 0.45 m seat (its underside at 1.25 m), over the whole room:
+    // overhead for walking, but too low for Tomo's 0.9 m to sit under; a pet fits.
+    const scene = room([block(-0.2, 0.2, -0.2, 0.2, 0.45), { shape: "box", size: [6, 0.1, 6], at: [0, 1.25, 0] }]);
+    expect(findRoute(buildNavGrid(scene), [-2, 0, 0], [0, 0.45, 0])).toMatchObject({ ok: false, reason: "unreachable" });
+    expect(findRoute(buildNavGrid(scene, { walker: NAV_PET }), [-2, 0, 0], [0, 0.45, 0]).ok).toBe(true);
+  });
+
   it("does not hop out of the room to a perch beyond its walls or open front", () => {
     const grid = buildNavGrid(room());
     expect(findRoute(grid, [0, 0, 0], [0, 0.5, 3.3])).toMatchObject({ ok: false, reason: "unreachable" });

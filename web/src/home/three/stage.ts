@@ -10,7 +10,7 @@ import { Resources, SIGN_FONT } from "./resources.js";
 import { drawSky } from "./sky-canvas.js";
 import { skyLight, skyMoves, type Sky } from "../sky.js";
 import { base64Bytes } from "../snapshot.js";
-import { planMove, poseAt, smooth, type WalkPlan, type WalkPose } from "../walk.js";
+import { movingAt, planMove, poseAt, smooth, type WalkPlan, type WalkPose } from "../walk.js";
 import { placeScene, type Placement } from "../../../../src/home/geometry.js";
 import { buildNavGrid, findRoute, type NavGrid, type WalkerSize } from "../../../../src/home/nav.js";
 import { moversOf, walkerOf, type Mover } from "../../../../src/home/reach.js";
@@ -71,7 +71,7 @@ interface Character {
   plan: WalkPlan | null; start: number;
   /** Tomo, the pet and the others: the spot it is at or heading to, why (wander.ts), and its wander (null when not wandering). */
   spot?: string; by?: Placing["by"]; wander: WanderState | null;
-  /** Whether its body's reactions were last aimed with `walking` holding (it has a move under way). */
+  /** Whether its body's reactions were last aimed with `walking` holding (it is walking or hopping: walk.ts movingAt). */
   walking: boolean;
   appear: number; leaving: boolean; task: string;
 }
@@ -312,11 +312,11 @@ export class HomeStage {
 
   /**
    * Aims a character's body reactions at what holds for it: the stage's
-   * conditions, and `walking` while it has a move under way. Only when that
-   * changed, unless `always`.
+   * conditions, and `walking` while it walks or hops (not while it turns on
+   * the spot, blinks or stands). Only when that changed, unless `always`.
    */
-  private aimBody(character: Character, always = false): void {
-    const walking = character.plan !== null;
+  private aimBody(character: Character, always = false, now = this.now()): void {
+    const walking = movingAt(character.plan, now - character.start);
     if (!always && walking === character.walking) return;
     character.walking = walking;
     if (!character.body || !this.state) return;
@@ -397,8 +397,8 @@ export class HomeStage {
     // Reduced motion (even switched on mid-walk) is there at once.
     if (character.plan && (reduced || now - character.start >= character.plan.duration)) character.plan = null;
     if (character.plan) busy = true;
-    // Arrived: `walking` stops holding on its body.
-    if (character.walking !== (character.plan !== null)) { this.aimBody(character); busy = true; }
+    // Started or stopped walking (arrived, or only the arrival turn or a fade is left): `walking` follows on its body.
+    if (character.walking !== movingAt(character.plan, now - character.start)) { this.aimBody(character, false, now); busy = true; }
     const pose = this.pose(character, now);
     const s = smooth(Math.min(1, character.appear)) * pose.fade;
     character.anchor.scale.set(0.6 + 0.4 * s, s, 0.6 + 0.4 * s);

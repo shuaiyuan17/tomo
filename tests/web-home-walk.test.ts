@@ -4,7 +4,7 @@ import { buildNavGrid, findRoute, NAV_HOP_ARC, NAV_PET, NAV_RADIUS, type FloorPo
 import type { HomePart, HomeScene } from "../src/home/scene.js";
 import { STARTER_SCENE } from "../src/home/starter.js";
 import {
-  ARRIVE_TURN, BLINK_TIME, HOP_MAX_DURATION, planBlink, planMove, planRoute, poseAt, STEP_HEIGHT, WALK_MAX_DURATION, WALK_MIN_DURATION, WALK_SPEED,
+  ARRIVE_TURN, BLINK_TIME, HOP_MAX_DURATION, movingAt, planBlink, planMove, planRoute, poseAt, STEP_HEIGHT, WALK_MAX_DURATION, WALK_MIN_DURATION, WALK_SPEED,
   type WalkPlan,
 } from "../web/src/home/walk.js";
 
@@ -315,5 +315,28 @@ describe("walk: a stroll has no time limit", () => {
     const from: Vec3 = [-2.5, 0, 0], to: Vec3 = [2.5, 0, 0];
     expect(planMove(grid, from, to, 0, 0, { speed: 0.5 }).duration).toBeCloseTo(WALK_MAX_DURATION, 6);
     expect(planMove(grid, from, to, 0, 0, { speed: 0.5, maxDuration: Infinity }).duration).toBeCloseTo(5 / 0.5, 6);
+  });
+});
+
+describe("walk: movingAt (the body's walking condition)", () => {
+  it("holds through a walk's phases, hops included, and not before, after, or past them in a carried-over fade", () => {
+    const plan = planRoute(route([[-1, 0], [2, 0]], 0, 0), [-1, 0, 0], [2, 0.45, 0], 0, Math.PI);
+    expect(plan.kind).toBe("walk");
+    expect(plan.hopsOn).toBe(true);
+    for (const t of [0, plan.duration / 2, plan.duration - 0.01]) expect(movingAt(plan, t)).toBe(true);
+    expect(movingAt(plan, -0.1)).toBe(false);
+    expect(movingAt(plan, plan.duration)).toBe(false);
+    const short = planMove(null, [0, 0, 0], [0, 0, 0], 0, 0, { fade: 0.2 });
+    expect(short.duration).toBeGreaterThan(0);
+    expect(movingAt(short, short.duration / 2)).toBe(false);
+  });
+  it("never holds for a blink, a turn on the spot, standing still, or no move", () => {
+    const blink = planMove(null, [0, 0, 0], [2, 0, 2], 0, 0);
+    const turnOnSpot = planMove(null, [1, 0, 1], [1, 0, 1], 0, Math.PI / 2);
+    const still = planMove(null, [1, 0, 1], [1, 0, 1], 0, 0);
+    expect([blink.kind, turnOnSpot.kind, still.kind]).toEqual(["blink", "turn", "still"]);
+    for (const plan of [blink, turnOnSpot]) for (const f of [0, 0.25, 0.5, 0.75]) expect(movingAt(plan, plan.duration * f)).toBe(false);
+    expect(movingAt(still, 0)).toBe(false);
+    expect(movingAt(null, 0)).toBe(false);
   });
 });

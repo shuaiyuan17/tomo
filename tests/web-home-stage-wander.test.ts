@@ -327,3 +327,38 @@ describe("the walking condition", () => {
     made.dispose();
   });
 });
+
+describe("the walking condition, not walking", () => {
+  it("does not hold while a character blinks to a spot it cannot walk to, or turns on the spot", async () => {
+    const scene = structuredClone(SCENE);
+    scene.kinds!.crab = { parts: [{ shape: "sphere", size: [0.5, 0.3, 0.4] },
+      { shape: "box", size: [0.1, 0.1, 0.1], reactions: [{ when: "walking", do: "show" }] }] };
+    // A pen sealed all round: "pen" cannot be walked to, so working blinks Tomo there.
+    scene.objects.push({ shape: "box", size: [1.2, 1, 0.1], at: [2, 0, 1.4] }, { shape: "box", size: [1.2, 1, 0.1], at: [2, 0, 2.6] },
+      { shape: "box", size: [0.1, 1, 1.2], at: [1.4, 0, 2] }, { shape: "box", size: [0.1, 1, 1.2], at: [2.6, 0, 2] });
+    scene.spots!.pen = { at: [2, 0, 2] };
+    // Same place as cushion, facing the other way: by:cron only turns it round.
+    scene.spots!["cushion-back"] = { at: [0, 0, 0.5], facing: 180 };
+    scene.characters!.tomo = { kind: "crab", spot: "cushion", rules: [{ when: "by:cron", spot: "cushion-back" }, { when: "working", spot: "pen" }] };
+    const { HomeStage } = await import("../web/src/home/three/stage.js");
+    type Body = { walking: boolean; plan: { kind: string; duration: number } | null; start: number; body: { parts: Array<{ node: { reactions?: unknown[] }; target: { visible: boolean } }> } };
+    for (const [conditions, kind] of [[["working", "by:owner", "day"], "blink"], [["working", "by:cron", "day"], "turn"]] as const) {
+      const made = new HomeStage({} as HTMLCanvasElement, (name) => name);
+      made.setScene(scene, "r1");
+      made.setState(state(["idle", "day"]));
+      const tomo = () => (made as unknown as { characters: Map<string, Body> }).characters.get("tomo")!;
+      const step = () => (made as unknown as { stepCharacter: (c: Body, now: number, dt: number) => boolean }).stepCharacter(tomo(), clock, 1 / 60);
+      const marker = tomo().body.parts.find((p) => p.node.reactions?.length)!;
+      made.setState(state([...conditions]));
+      expect(tomo().plan?.kind).toBe(kind);
+      const end = tomo().start + tomo().plan!.duration;
+      for (const f of [0, 0.3, 0.6, 0.9]) {
+        clock = tomo().start + (end - tomo().start) * f;
+        step();
+        expect(tomo().walking).toBe(false);
+        expect(marker.target.visible).toBe(false);
+      }
+      made.dispose();
+    }
+  });
+});

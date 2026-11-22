@@ -173,6 +173,55 @@ describe("lcm_rollup tool", () => {
     expect(existsSync(getCompactTriggerPath(sessionId, sdkSessionsDir))).toBe(false);
   });
 
+  const archiveLines = () => {
+    const file = join(sessionsDir, `_archive_${sessionId}.jsonl`);
+    return existsSync(file) ? readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l)) : [];
+  };
+
+  it("a first rollup supersedes nothing: no superseded record, no replaced field", async () => {
+    const res = await tool().handler({ level: "daily", period: "2026-09-08", summary: "9/8: first take." }, {});
+    const body = JSON.parse(res.content[0]!.text);
+    expect(body.status).toBe("ok");
+    expect(body.replaced).toBeUndefined();
+    expect(archiveLines().some((l) => l._superseded)).toBe(false);
+  });
+
+  it("rerunning the same day archives the replaced summary as superseded and reports it", async () => {
+    const first = await tool().handler({ level: "daily", period: "2026-09-08", summary: "9/8: first take." }, {});
+    expect(JSON.parse(first.content[0]!.text).status).toBe("ok");
+    const oldBlock = readFileSync(getSdkSessionPath(sessionId, sdkSessionsDir), "utf8").trim().split("\n")
+      .map((l) => JSON.parse(l)).find((l) => l.isCompactSummary);
+    const oldText: string = oldBlock.message.content;
+
+    const res = await tool().handler({ level: "daily", period: "2026-09-08", summary: "9/8: second take." }, {});
+    const body = JSON.parse(res.content[0]!.text);
+    expect(body.status, res.content[0]!.text).toBe("ok");
+    expect(body.replaced).toEqual([{ blockTag: "daily 2026-09-08", length: oldText.length }]);
+
+    const superseded = archiveLines().filter((l) => l._superseded);
+    expect(superseded).toHaveLength(1);
+    expect(superseded[0]).toMatchObject({
+      _superseded: true,
+      blockTag: "daily 2026-09-08",
+      supersededUuid: oldBlock.uuid,
+      summary: oldText,
+    });
+    expect(superseded[0].summary).toContain("9/8: first take.");
+    expect(Date.parse(superseded[0]._archivedAt)).not.toBeNaN();
+  });
+
+  it("a rerun refused by the chain check writes nothing to the archive", async () => {
+    const first = await tool().handler({ level: "daily", period: "2026-09-08", summary: "9/8: first take." }, {});
+    expect(JSON.parse(first.content[0]!.text).status).toBe("ok");
+    const archive = join(sessionsDir, `_archive_${sessionId}.jsonl`);
+    const archiveBefore = readFileSync(archive, "utf8");
+
+    const res = await tool({ workspaceDir: join(root, "elsewhere") })
+      .handler({ level: "daily", period: "2026-09-08", summary: "9/8: second take." }, {});
+    expect(res.isError).toBe(true);
+    expect(readFileSync(archive, "utf8")).toBe(archiveBefore);
+  });
+
   it("refuses when the session has no SDK session id yet", async () => {
     const res = await tool({ noSessionId: true }).handler({ level: "daily", summary: "x" }, {});
     expect(res.isError).toBe(true);

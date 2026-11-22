@@ -137,6 +137,7 @@ export function buildLcmTools(deps: LcmToolDeps) {
               description: resolved.description,
               eventsRemoved: result.eventsRemoved,
               eventsAfter: result.eventsAfter,
+              ...(result.replaced ? { replaced: result.replaced } : {}),
               summaryTokens: budget.tokens,
               summaryBudget: budget.budget,
               ...(budget.overBudget ? {

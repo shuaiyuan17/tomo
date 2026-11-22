@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
-  compactSession, readSinceOffset, readWholeFile,
+  compactSession, compactSessionGated, readSinceOffset, readWholeFile,
   checkAndClearCompactTrigger, getCompactTriggerPath,
 } from "../src/lcm/compact.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
@@ -443,6 +443,67 @@ describe("compactSession", () => {
     expect(out[0].isCompactSummary).toBe(true);
     expect(out[0].blockTag).toBe("weekly 2026-W19");
     expect(out[1].uuid).toBe(rawAfter.uuid);
+  });
+
+  describe("superseded blocks", () => {
+    const archived = () => existsSync(archivePath)
+      ? readFileSync(archivePath, "utf-8").trim().split("\n").map((l) => JSON.parse(l))
+      : [];
+    function seedRerun() {
+      const oldDaily = { ...mkSummaryEvent(null, "2026-05-04T08:00:00.000Z", "[daily 2026-05-04 — 2 events summarized]\n\nold take"), blockTag: "daily 2026-05-04" };
+      (oldDaily as any).message = { role: "user", content: "[daily 2026-05-04 — 2 events summarized]\n\nold take" };
+      const late = mkUserEvent(oldDaily.uuid, "2026-05-04T20:00:00.000Z", "late on the 4th");
+      const next = mkUserEvent(late.uuid, "2026-05-05T09:00:00.000Z", "the 5th");
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, [oldDaily, late, next].map((e) => JSON.stringify(e)).join("\n") + "\n");
+      return { oldDaily, late };
+    }
+
+    it("a gate refusal on a rerun writes nothing to the archive", async () => {
+      const { late } = seedRerun();
+      const before = readFileSync(path, "utf-8");
+      const result = await compactSessionGated({
+        sdkSessionId: sessionId, sdkSessionsDir, fromIdx: 1, toIdx: 1,
+        expectedFirstUuid: late.uuid, expectedLastUuid: late.uuid,
+        summary: "new take", transcriptPath: archivePath, blockTag: "daily 2026-05-04",
+      }, async () => "refused for test");
+      expect(result.success).toBe(false);
+      expect(result.replaced).toBeUndefined();
+      expect(existsSync(archivePath)).toBe(false);
+      expect(readFileSync(path, "utf-8")).toBe(before);
+    });
+
+    it("records the replaced block once even when the same rerun is retried", async () => {
+      const { oldDaily, late } = seedRerun();
+      const req = {
+        sdkSessionId: sessionId, sdkSessionsDir, fromIdx: 1, toIdx: 1,
+        expectedFirstUuid: late.uuid, expectedLastUuid: late.uuid,
+        summary: "new take", transcriptPath: archivePath, blockTag: "daily 2026-05-04",
+      };
+      // First attempt archives, then fails before the rename publishes it.
+      expect(() => compactSession({ ...req, beforeRenameForTest: () => { throw new Error("rename blew up"); } })).toThrow();
+      const result = compactSession(req);
+      expect(result.success).toBe(true);
+      expect(result.replaced).toEqual([{ blockTag: "daily 2026-05-04", length: oldDaily.message.content.length }]);
+      const records = archived().filter((l) => l._superseded);
+      expect(records).toHaveLength(1);
+      expect(records[0]).toMatchObject({ blockTag: "daily 2026-05-04", supersededUuid: oldDaily.uuid, summary: oldDaily.message.content });
+    });
+
+    it("blocks consumed under a different tag are not superseded", () => {
+      const daily1 = mkSummaryEvent(null, "2026-05-04T00:00:00.000Z", "Mon", "daily 2026-05-04");
+      const daily2 = mkSummaryEvent(daily1.uuid, "2026-05-05T00:00:00.000Z", "Tue", "daily 2026-05-05");
+      const rawAfter = mkUserEvent(daily2.uuid, "2026-05-06T00:00:00.000Z", "after");
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, [daily1, daily2, rawAfter].map((e) => JSON.stringify(e)).join("\n") + "\n");
+      const result = compactSession({
+        sdkSessionId: sessionId, sdkSessionsDir, fromIdx: 0, toIdx: 1,
+        summary: "weekly rollup", transcriptPath: archivePath, blockTag: "weekly 2026-W19",
+      });
+      expect(result.success).toBe(true);
+      expect(result.replaced).toBeUndefined();
+      expect(archived().some((l) => l._superseded)).toBe(false);
+    });
   });
 
   it("aborts (does not rename) when the file ends in a partial SDK write", () => {

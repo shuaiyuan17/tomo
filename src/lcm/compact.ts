@@ -75,6 +75,11 @@ export interface CompactRequest {
    */
   expectedFirstUuid?: string;
   expectedLastUuid?: string;
+  /**
+   * @internal Test hook: mutate the rewritten event list before it is checked
+   * or published, to simulate a bug in the rewrite (e.g. a missed re-point).
+   */
+  corruptRewriteForTest?: (events: SdkEntry[]) => void;
   /** @internal Test hook for simulating SDK appends in the final pre-rename window. */
   beforeRenameForTest?: () => void;
   /** @internal Test hook for simulating SDK writes through a pre-rename fd. */
@@ -104,6 +109,101 @@ interface SdkEvent extends TranscriptEvent {
  * summary message, fixes the parentUuid chain, and archives the originals.
  */
 export function compactSession(req: CompactRequest): CompactResult {
+  const opened = openForRewrite(req);
+  if ("success" in opened) return opened;
+  const { path, sourceFd } = opened;
+  try {
+    const prepared = prepareRewrite(req, sourceFd);
+    if ("success" in prepared) return prepared;
+    return publishRewrite(req, path, sourceFd, prepared);
+  } finally {
+    // Holding this fd keeps the old inode readable after rename, so we can
+    // drain SDK writes that land there. Once closed, any SDK writer that had
+    // opened the old path pre-rename but delayed writing past our drain window
+    // can still write unreachable bytes. Without SDK lock cooperation, that
+    // "fd opened but idle" tail is the remaining residual boundary.
+    closeSync(sourceFd);
+  }
+}
+
+/** What a gate sees of a rewrite that is staged but not yet published. */
+export interface StagedRewrite {
+  /** The rewritten file content as built from the snapshot. */
+  output: string;
+  /** uuid of the summary event the rewrite inserts. */
+  summaryUuid: string;
+  /** uuids of every event the rewrite removes (including a rebuilt block). */
+  removedUuids: ReadonlySet<string>;
+}
+
+/**
+ * `compactSession` with an async gate between building the rewrite and
+ * publishing it. The gate returns undefined to let the rewrite publish, or an
+ * error to refuse it: a refused rewrite archives nothing, renames nothing and
+ * writes no trigger — the session file is untouched. Anything the SDK appends
+ * while the gate runs is picked up by the same late-arrival splice that covers
+ * appends during the rewrite itself.
+ */
+export async function compactSessionGated(
+  req: CompactRequest,
+  gate: (staged: StagedRewrite) => Promise<string | undefined>,
+): Promise<CompactResult> {
+  const opened = openForRewrite(req);
+  if ("success" in opened) return opened;
+  const { path, sourceFd } = opened;
+  try {
+    const prepared = prepareRewrite(req, sourceFd);
+    if ("success" in prepared) return prepared;
+    const refusal = await gate({
+      output: prepared.newEvents.map(serializeJsonlRecord).join("\n") + "\n",
+      summaryUuid: prepared.summaryUuid,
+      removedUuids: prepared.removedUuids,
+    });
+    const refused = (error: string): CompactResult =>
+      ({ success: false, eventsRemoved: 0, eventsAfter: prepared.allEvents.length, error });
+    if (refusal !== undefined) return refused(refusal);
+
+    const spliced = spliceLateAppends(req, sourceFd, prepared);
+    if ("success" in spliced) return spliced;
+    // Lines the SDK appended while the gate ran are now part of the output
+    // (re-pointed by the usual rule). They can move the leaf — a new branch —
+    // so what would be published is no longer what was checked: check the
+    // final content again. Usually nothing arrived and this costs nothing.
+    if (spliced.lateAppended > 0) {
+      const second = await gate({
+        output: prepared.newEvents.map(serializeJsonlRecord).join("\n") + "\n",
+        summaryUuid: prepared.summaryUuid,
+        removedUuids: prepared.removedUuids,
+      });
+      if (second !== undefined) return refused(second);
+    }
+
+    // The gate is async: another rewriter (a `--no-daemon-check` CLI run, a
+    // restore) may have replaced the session file meanwhile. Publishing now
+    // would overwrite that file with a rewrite of the one before it.
+    if (!pathStillOnInode(path, sourceFd)) {
+      log.warn({ sessionId: req.sdkSessionId }, "Compact aborted: session file replaced during validation");
+      return refused("Session transcript was replaced during validation; nothing was written — re-resolve the range and retry");
+    }
+    return commitRewrite(req, path, sourceFd, prepared, spliced);
+  } finally {
+    closeSync(sourceFd); // see compactSession
+  }
+}
+
+/** True while `path` still names the inode `fd` was opened on (same dev + ino). */
+function pathStillOnInode(path: string, fd: number): boolean {
+  try {
+    const opened = fstatSync(fd);
+    const current = statSync(path);
+    return opened.dev === current.dev && opened.ino === current.ino;
+  } catch {
+    return false;
+  }
+}
+
+/** Validation shared by both entry points, then the source fd the rewrite reads through. */
+function openForRewrite(req: CompactRequest): CompactResult | { path: string; sourceFd: number } {
   // Before anything else: clear out staging corpses. A compact/prune killed
   // between writing its temp file and renaming it (SIGKILL, an OOM, a laptop
   // lid) leaves a FULL COPY of the session file behind under a name nothing
@@ -130,20 +230,19 @@ export function compactSession(req: CompactRequest): CompactResult {
     return { success: false, eventsRemoved: 0, eventsAfter: 0, error: "Session file not found" };
   }
 
-  const sourceFd = openSync(path, "r");
-  try {
-    return compactSessionWithFd(req, path, sourceFd);
-  } finally {
-    // Holding this fd keeps the old inode readable after rename, so we can
-    // drain SDK writes that land there. Once closed, any SDK writer that had
-    // opened the old path pre-rename but delayed writing past our drain window
-    // can still write unreachable bytes. Without SDK lock cooperation, that
-    // "fd opened but idle" tail is the remaining residual boundary.
-    closeSync(sourceFd);
-  }
+  return { path, sourceFd: openSync(path, "r") };
 }
 
-function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: number): CompactResult {
+interface PreparedRewrite {
+  allEvents: SdkEntry[];
+  removeSet: Set<number>;
+  removedUuids: Set<string>;
+  summaryUuid: string;
+  newEvents: SdkEntry[];
+  bytesAtRead: number;
+}
+
+function prepareRewrite(req: CompactRequest, sourceFd: number): PreparedRewrite | CompactResult {
   // Atomic read: open once, fstat the FD, then read exactly that many bytes.
   // `bytesAtRead` is pinned to the last-newline boundary (NOT current EOF) so
   // that any partial mid-write tail stays *outside* the snapshot — the
@@ -352,6 +451,24 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
     newEvents.push(event);
   }
 
+  req.corruptRewriteForTest?.(newEvents);
+  return { allEvents, removeSet, removedUuids, summaryUuid, newEvents, bytesAtRead };
+}
+
+function publishRewrite(req: CompactRequest, path: string, sourceFd: number, prepared: PreparedRewrite): CompactResult {
+  const spliced = spliceLateAppends(req, sourceFd, prepared);
+  if ("success" in spliced) return spliced;
+  return commitRewrite(req, path, sourceFd, prepared, spliced);
+}
+
+interface LateSplice {
+  cursor: number;
+  lateAppended: number;
+  seenLateUuids: Set<string>;
+}
+
+function spliceLateAppends(req: CompactRequest, sourceFd: number, prepared: PreparedRewrite): LateSplice | CompactResult {
+  const { allEvents, removedUuids, summaryUuid, newEvents, bytesAtRead } = prepared;
   // Late-arrival splice: re-read any bytes the SDK appended after our initial
   // read. These are events written while we were processing — typically the
   // agent's own thinking/tool_use that triggered this compact via Bash. If we
@@ -417,6 +534,15 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
     };
   }
 
+  return { cursor, lateAppended, seenLateUuids };
+}
+
+function commitRewrite(
+  req: CompactRequest, path: string, sourceFd: number, prepared: PreparedRewrite, spliced: LateSplice,
+): CompactResult {
+  const { allEvents, removeSet, removedUuids, summaryUuid, newEvents } = prepared;
+  const { cursor, seenLateUuids } = spliced;
+  let { lateAppended } = spliced;
   // Archive the removed events to the transcript BEFORE the rewrite is
   // published. The ordering picks between two failure modes and this is the
   // recoverable one:

@@ -1,7 +1,7 @@
 import { Command } from "commander";
 import { computeContextStats, resolveTimeRange } from "../lcm/stats.js";
 import { readSummaryBlocks } from "../lcm/summary-reader.js";
-import { compactSession } from "../lcm/compact.js";
+import { compactSessionChecked } from "../lcm/chain-check.js";
 import { pruneTools } from "../lcm/prune-tools.js";
 import { resolveBlockRange, summaryBudgetCheck, type BlockLevel } from "../lcm/blocks.js";
 import { SessionStore, getSdkSessionPath } from "../sessions/store.js";
@@ -10,11 +10,12 @@ import { existsSync } from "node:fs";
 import { compactRefusal, daemonUnreachableRefusal } from "../lcm/background-gate.js";
 import { reserveCompact } from "../watch/background-query.js";
 
-async function getRuntimeDirs(): Promise<{ sessionsDir: string; sdkSessionsDir: string }> {
+async function getRuntimeDirs(): Promise<{ sessionsDir: string; sdkSessionsDir: string; workspaceDir: string }> {
   const { config } = await import("../config.js");
   return {
     sessionsDir: config.sessionsDir,
     sdkSessionsDir: config.sdkSessionsDir,
+    workspaceDir: config.workspaceDir,
   };
 }
 
@@ -67,12 +68,12 @@ async function approveRewrite(sessionId: string, what: string, daemonCheck: bool
 }
 
 /**
- * Run a synchronous rewrite; if it throws, report the end of the approved
+ * Run a rewrite (sync, or async for the chain-checked compact); if it throws, report the end of the approved
  * rewrite before the error propagates, so the session is not left marked.
  */
-async function runThenFinish<T>(finish: () => Promise<void>, rewrite: () => T): Promise<T> {
+async function runThenFinish<T>(finish: () => Promise<void>, rewrite: () => T | Promise<T>): Promise<T> {
   try {
-    return rewrite();
+    return await rewrite();
   } catch (err) {
     await finish();
     throw err;
@@ -179,7 +180,7 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
       const finish = await approveRewrite(opts.sessionId, `${level} rollup`, opts.daemonCheck !== false);
 
       const transcriptPath = join(paths.sessionsDir, `_archive_${opts.sessionId}.jsonl`);
-      const result = await runThenFinish(finish, () => compactSession({
+      const result = await runThenFinish(finish, () => compactSessionChecked({
         sdkSessionId: opts.sessionId,
         sdkSessionsDir: paths.sdkSessionsDir,
         fromIdx: resolved.fromIdx,
@@ -190,7 +191,7 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
         transcriptPath,
         blockTag: resolved.blockTag,
         dropUnparseable: opts.dropUnparseable === true,
-      }));
+      }, { workspaceDir: paths.workspaceDir }));
       await finish();
 
       if (result.success) {
@@ -315,7 +316,7 @@ lcmCommand
 
     const transcriptPath = join(paths.sessionsDir, `_archive_${opts.sessionId}.jsonl`);
 
-    const result = await runThenFinish(finish, () => compactSession({
+    const result = await runThenFinish(finish, () => compactSessionChecked({
       sdkSessionId: opts.sessionId,
       sdkSessionsDir: paths.sdkSessionsDir,
       fromIdx: resolved.fromIdx,
@@ -326,7 +327,7 @@ lcmCommand
       transcriptPath,
       ...(opts.blockTag ? { blockTag: opts.blockTag } : {}),
       dropUnparseable: opts.dropUnparseable === true,
-    }));
+    }, { workspaceDir: paths.workspaceDir }));
     await finish();
 
     if (result.success) {

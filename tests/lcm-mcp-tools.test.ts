@@ -5,13 +5,14 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 vi.mock("../src/config.js", () => ({
   config: { lcm: { dailyFreshTail: 1, globalFreshTail: false } },
 }));
-import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { buildLcmTools } from "../src/mcp/lcm-tools.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import { getCompactTriggerPath } from "../src/lcm/compact.js";
+import { sdkSessionsDirForWorkspace } from "../src/runtime-paths.js";
 
 interface ToolHandle {
   name: string;
@@ -39,12 +40,16 @@ describe("lcm_rollup tool", () => {
   let sessionId: string;
 
   beforeEach(() => {
-    root = join(tmpdir(), `tomo-test-lcm-tool-${randomUUID()}`);
-    sdkSessionsDir = join(root, "sdk");
+    // The rewrite is checked with the SDK's loader before it is published, so
+    // the session lives where the SDK resolves the workspace to (realpath: on
+    // macOS tmpdir() is a /var symlink) and has a session id it accepts.
+    root = realpathSync(mkdtempSync(join(tmpdir(), "tomo-test-lcm-tool-")));
+    vi.stubEnv("CLAUDE_CONFIG_DIR", join(root, "home", ".claude"));
+    sdkSessionsDir = sdkSessionsDirForWorkspace(join(root, "workspace"), join(root, "home"));
     sessionsDir = join(root, "sessions");
     mkdirSync(sdkSessionsDir, { recursive: true });
     mkdirSync(sessionsDir, { recursive: true });
-    sessionId = `test-${randomUUID()}`;
+    sessionId = randomUUID();
     // Two exchanges on 9/8 and one on 9/9: the 9/8 ones are the completed
     // period, the 9/9 one is the live tail that must survive.
     const events: unknown[] = [];
@@ -69,6 +74,7 @@ describe("lcm_rollup tool", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -76,10 +82,11 @@ describe("lcm_rollup tool", () => {
   let finished: unknown[] = [];
   beforeEach(() => { reserveCalls = []; finished = []; });
 
-  function tool(opts: { noSessionId?: boolean; backgroundTasks?: number } = {}): ToolHandle {
+  function tool(opts: { noSessionId?: boolean; backgroundTasks?: number; workspaceDir?: string } = {}): ToolHandle {
     const tools = buildLcmTools({
       sdkSessionIdFor: () => (opts.noSessionId ? undefined : sessionId),
       sdkSessionsDir,
+      workspaceDir: opts.workspaceDir ?? join(root, "workspace"),
       sessionsDir,
       sessionKey: "telegram:-100",
       reserveCompact: (sid) => {
@@ -113,6 +120,19 @@ describe("lcm_rollup tool", () => {
     expect(existsSync(getCompactTriggerPath(sessionId, sdkSessionsDir))).toBe(true);
     // The archive holds the originals.
     expect(existsSync(join(sessionsDir, `_archive_${sessionId}.jsonl`))).toBe(true);
+  });
+
+  it("reports a refused chain check as an error and leaves the session untouched", async () => {
+    const path = getSdkSessionPath(sessionId, sdkSessionsDir);
+    const original = readFileSync(path, "utf8");
+    // A workspace the SDK does not resolve to this session: the check cannot run, so nothing is published.
+    const res = await tool({ workspaceDir: join(root, "elsewhere") })
+      .handler({ level: "daily", period: "2026-09-08", summary: "9/8: two exchanges." }, {});
+    expect(res.isError).toBe(true);
+    expect(JSON.parse(res.content[0]!.text)).toMatchObject({ status: "error", error: expect.stringMatching(/Chain check unavailable/) });
+    expect(readFileSync(path, "utf8")).toBe(original);
+    expect(existsSync(getCompactTriggerPath(sessionId, sdkSessionsDir))).toBe(false);
+    expect(finished).toHaveLength(1);
   });
 
   it("reports an error instead of throwing when the period has no events", async () => {

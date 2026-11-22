@@ -12,17 +12,18 @@
  * lcm-mcp-tools.test.ts), and the rollup runner does not even nudge.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 
-const paths = vi.hoisted(() => ({ root: "", sdkSessionsDir: "", sessionsDir: "", watchSocketPath: "", pidFile: "" }));
+const paths = vi.hoisted(() => ({ root: "", sdkSessionsDir: "", workspaceDir: "", sessionsDir: "", watchSocketPath: "", pidFile: "" }));
 
 vi.mock("../src/config.js", () => ({
   config: {
     lcm: { dailyFreshTail: 1, globalFreshTail: false },
     get sdkSessionsDir() { return paths.sdkSessionsDir; },
+    get workspaceDir() { return paths.workspaceDir; },
     get sessionsDir() { return paths.sessionsDir; },
   },
 }));
@@ -50,6 +51,7 @@ const { getCompactTriggerPath } = await import("../src/lcm/compact.js");
 const { RollupRunner } = await import("../src/lcm/runner.js");
 const { NudgeCooldownStore } = await import("../src/lcm/nudge-cooldown-store.js");
 import type { WatchSnapshot } from "../src/watch/protocol.js";
+import { sdkSessionsDirForWorkspace } from "../src/runtime-paths.js";
 
 function fakeSnapshot(): WatchSnapshot {
   return {
@@ -163,14 +165,19 @@ describe("tomo lcm compact gate (over the watch socket)", () => {
   let sessionId: string;
 
   beforeEach(async () => {
-    paths.root = mkdtempSync(join(tmpdir(), "tomo-bg-gate-"));
-    paths.sdkSessionsDir = join(paths.root, "sdk");
+    // The rewrite is checked with the SDK's loader before it is published, so
+    // the session lives where the SDK resolves the workspace to (realpath: on
+    // macOS tmpdir() is a /var symlink) and has a session id it accepts.
+    paths.root = realpathSync(mkdtempSync(join(tmpdir(), "tomo-bg-gate-")));
+    vi.stubEnv("CLAUDE_CONFIG_DIR", join(paths.root, "home", ".claude"));
+    paths.workspaceDir = join(paths.root, "workspace");
+    paths.sdkSessionsDir = sdkSessionsDirForWorkspace(paths.workspaceDir, join(paths.root, "home"));
     paths.sessionsDir = join(paths.root, "sessions");
     paths.watchSocketPath = join(paths.root, "watch.sock");
     paths.pidFile = join(paths.root, "tomo.pid");
     mkdirSync(paths.sdkSessionsDir, { recursive: true });
     mkdirSync(paths.sessionsDir, { recursive: true });
-    sessionId = `test-${randomUUID()}`;
+    sessionId = randomUUID();
     state = { tasks: 0, awaitingReport: false };
     // A live daemon process: this one.
     writeFileSync(paths.pidFile, `${process.pid}\n`);
@@ -187,6 +194,7 @@ describe("tomo lcm compact gate (over the watch socket)", () => {
       extra.unref();
     }
     extra = null;
+    vi.unstubAllEnvs();
     rmSync(paths.root, { recursive: true, force: true });
   });
 

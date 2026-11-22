@@ -308,6 +308,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       ...buildLcmTools({
         sdkSessionIdFor: () => agent.sdkSessionIdFor(callerSessionKey),
         sdkSessionsDir: config.sdkSessionsDir,
+        workspaceDir: config.workspaceDir,
         sessionsDir: config.sessionsDir,
         sessionKey: callerSessionKey,
         reserveCompact: (sdkSessionId) => agent.reserveCompact(callerSessionKey, sdkSessionId),

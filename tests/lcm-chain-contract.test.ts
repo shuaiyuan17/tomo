@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
 import { checkRewrittenChain, compactSessionChecked } from "../src/lcm/chain-check.js";
 import { compactSession, getCompactTriggerPath, type CompactRequest } from "../src/lcm/compact.js";
+import { loaderVisibleIds, removedLoaderIds } from "../src/lcm/loader-ids.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import { isRawJsonlLine } from "../src/jsonl.js";
 import { sdkSessionsDirForWorkspace } from "../src/runtime-paths.js";
@@ -62,6 +63,8 @@ interface Fixture {
   oldBlockUuid: string;
   day1Uuids: string[];
   tailUuids: string[];
+  /** File uuid of the day-1 queued_command attachment (with `queuedCommandInDay1`). */
+  queuedFileUuid?: string;
 }
 
 /**
@@ -70,7 +73,7 @@ interface Fixture {
  * SDK's bookkeeping records (attachment, queue-operation, last-prompt)
  * between the messages, then the next day's fresh tail.
  */
-function buildFixture(sessionId = randomUUID(), cwd = "/workspace"): Fixture {
+function buildFixture(sessionId = randomUUID(), cwd = "/workspace", opts: { queuedCommandInDay1?: boolean; metaCopyInTail?: boolean } = {}): Fixture {
   const lines: string[] = [];
   let parent: string | null = null;
   let n = 0;
@@ -96,6 +99,23 @@ function buildFixture(sessionId = randomUUID(), cwd = "/workspace"): Fixture {
     push({ parentUuid: parent, ...envelope, type: "attachment", attachment: { type: "date", date: at(day, 0).slice(0, 10) }, uuid, timestamp: at(day, ++n) });
     parent = uuid;
   };
+  // A message typed while a turn was running: the SDK records it as a
+  // queued_command attachment, and its loader turns that into a user message
+  // whose uuid is the attachment's source_uuid, not the event's own uuid.
+  let queuedFileUuid: string | undefined;
+  let queuedSourceUuid: string | undefined;
+  const queuedCommand = (day: number, prompt: string) => {
+    const uuid = randomUUID();
+    const sourceUuid = randomUUID();
+    queuedSourceUuid = sourceUuid;
+    push({
+      parentUuid: parent, ...envelope, type: "attachment", uuid, timestamp: at(day, ++n),
+      attachment: { type: "queued_command", prompt, source_uuid: sourceUuid, commandMode: "prompt" },
+    });
+    parent = uuid;
+    queuedFileUuid = uuid;
+    return sourceUuid;
+  };
 
   const oldBlockUuid = msg("user", 18, "[daily 2026-11-18 — 12 events summarized]\n\nEarlier day.", { isCompactSummary: true, blockTag: "daily 2026-11-18" });
 
@@ -105,6 +125,8 @@ function buildFixture(sessionId = randomUUID(), cwd = "/workspace"): Fixture {
   day1.push(msg("assistant", 19, [{ type: "thinking", thinking: "Read them first.", signature: "sig" }, { type: "tool_use", id: "toolu_01", name: "Read", input: { file_path: "/repo/CHANGELOG.md" } }]));
   day1.push(msg("user", 19, [{ type: "tool_result", tool_use_id: "toolu_01", content: "## 0.14.0" }], { toolUseResult: { type: "text" } }));
   push({ type: "queue-operation", operation: "enqueue", timestamp: at(19, ++n), sessionId });
+  // Delivered mid-turn, answered by the reply that follows: the loader shows it.
+  if (opts.queuedCommandInDay1) day1.push(queuedCommand(19, "Also check the migration guide."));
   day1.push(msg("assistant", 19, [{ type: "text", text: "0.14.0 is the latest." }]));
   day1.push(msg("user", 19, "Thanks."));
   day1.push(msg("assistant", 19, [{ type: "text", text: "Any time." }]));
@@ -113,6 +135,16 @@ function buildFixture(sessionId = randomUUID(), cwd = "/workspace"): Fixture {
   const tail: string[] = [];
   attachment(20);
   tail.push(msg("user", 20, "Morning."));
+  if (opts.metaCopyInTail && queuedSourceUuid) {
+    // An isMeta queued_command (kept, in the tail) with the same source_uuid:
+    // the loader never converts it, so it must not stand in for the removed one.
+    const uuid = randomUUID();
+    push({
+      parentUuid: parent, ...envelope, type: "attachment", uuid, timestamp: at(20, ++n),
+      attachment: { type: "queued_command", prompt: "meta", source_uuid: queuedSourceUuid, isMeta: true, commandMode: "prompt" },
+    });
+    parent = uuid;
+  }
   tail.push(msg("assistant", 20, [{ type: "tool_use", id: "toolu_02", name: "Bash", input: { command: "date" } }]));
   tail.push(msg("user", 20, [{ type: "tool_result", tool_use_id: "toolu_02", content: "Fri Nov 20" }], { toolUseResult: { type: "text" } }));
   tail.push(msg("assistant", 20, [{ type: "text", text: "Good morning — it is Friday." }]));
@@ -121,7 +153,7 @@ function buildFixture(sessionId = randomUUID(), cwd = "/workspace"): Fixture {
   const toIdx = convUuids.indexOf(day1[day1.length - 1]);
   return {
     sessionId, text: lines.join("\n") + "\n", fromIdx, toIdx,
-    firstUuid: day1[0], lastUuid: day1[day1.length - 1], oldBlockUuid, day1Uuids: day1, tailUuids: tail,
+    firstUuid: day1[0], lastUuid: day1[day1.length - 1], oldBlockUuid, day1Uuids: day1, tailUuids: tail, queuedFileUuid,
   };
 }
 
@@ -389,6 +421,49 @@ describe("LCM rewrite, checked by the SDK's own loader before it is published", 
     expectUntouched(f, path);
   });
 
+  it("a queued_command inside the range: the loader's id for it is its source_uuid, and the rollup passes", async () => {
+    const f = buildFixture(undefined, undefined, { queuedCommandInDay1: true });
+    const path = writeFixture(f);
+    // The loader shows the attachment as a user message under its source_uuid.
+    const sourceUuid = f.day1Uuids[3];
+    expect(sourceUuid).not.toBe(f.queuedFileUuid);
+    expect(await chain(f.sessionId)).toEqual([f.oldBlockUuid, ...f.day1Uuids, ...f.tailUuids]);
+
+    const result = await compactSessionChecked(request(f), { workspaceDir: workspace });
+
+    expect(result).toMatchObject({ success: true });
+    expect(await chain(f.sessionId)).toEqual([f.oldBlockUuid, summaryUuidIn(path), ...f.tailUuids]);
+    expect(readFileSync(path, "utf8")).not.toContain(sourceUuid);
+  });
+
+  for (const [label, opts] of [
+    ["", { queuedCommandInDay1: true }],
+    [" (an isMeta queued_command with the same source_uuid in the tail does not mask it)", { queuedCommandInDay1: true, metaCopyInTail: true }],
+  ] as const) it(`a removed queued_command that stays on the chain is refused${label}`, async () => {
+    const f = buildFixture(undefined, undefined, opts);
+    const path = writeFixture(f);
+    if ("metaCopyInTail" in opts) {
+      // The meta copy is not shown: the live chain is unchanged by it.
+      expect(await chain(f.sessionId)).toEqual([f.oldBlockUuid, ...f.day1Uuids, ...f.tailUuids]);
+    }
+    const original = f.text.split("\n").filter(Boolean).map((l) => JSON.parse(l)).find((e) => e.uuid === f.queuedFileUuid);
+    // Broken removal: the attachment survives, moved into the fresh tail where
+    // a reply follows it, so the loader still shows it (under its source_uuid).
+    const result = await compactSessionChecked(request(f, {
+      corruptRewriteForTest: (events) => {
+        const at = events.findIndex((e) => !isRawJsonlLine(e) && e.uuid === f.tailUuids[0]);
+        const next = events.find((e) => !isRawJsonlLine(e) && e.parentUuid === f.tailUuids[0]);
+        if (at < 0 || !next || isRawJsonlLine(next)) throw new Error("fixture: no tail");
+        next.parentUuid = original.uuid;
+        events.splice(at + 1, 0, { ...original, parentUuid: f.tailUuids[0] });
+      },
+    }), { workspaceDir: workspace });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/1 removed event\(s\) still on the chain/);
+    expectUntouched(f, path);
+  });
+
   it("refuses a range that is not on the current chain", async () => {
     // Day 1 becomes a dead branch: the next day's first message hangs off the older block.
     const f = buildFixture();
@@ -411,7 +486,7 @@ describe("LCM rewrite, checked by the SDK's own loader before it is published", 
 describe("checkRewrittenChain", () => {
   const removed = new Set(["r1", "r2"]);
   const check = (after: string[], before = ["h1", "r1", "r2", "t1", "t2"]) =>
-    checkRewrittenChain({ before, after, summaryUuid: "S", removedUuids: removed });
+    checkRewrittenChain({ before, after, summaryUuid: "S", removedIds: removed });
 
   it("accepts the collapsed chain, with appends at the end", () => {
     expect(check(["h1", "S", "t1", "t2"]).ok).toBe(true);
@@ -432,5 +507,35 @@ describe("checkRewrittenChain", () => {
     expect(verdict.problems).toEqual(expect.arrayContaining([
       "the selected range is not on the current chain", "summary block is not on the loaded chain",
     ]));
+  });
+});
+
+describe("loaderVisibleIds / removedLoaderIds", () => {
+  const queued = (uuid: string, source_uuid?: string, extra: Record<string, unknown> = {}) =>
+    ({ type: "attachment", uuid, attachment: { type: "queued_command", prompt: "p", ...(source_uuid === undefined ? {} : { source_uuid }), ...extra } });
+
+  it("maps a convertible queued_command to its source_uuid and everything else to its uuid", () => {
+    const events = [{ type: "user", uuid: "u1" }, queued("a1", "src1"), queued("a2", ""), { type: "attachment", uuid: "a3", attachment: { type: "date" } }];
+    expect(loaderVisibleIds(events)).toEqual(["u1", "src1", "a2", "a3"]);
+  });
+
+  it("keeps the own uuid for a queued_command the loader does not convert", () => {
+    expect(loaderVisibleIds([
+      queued("m1", "s1", { isMeta: true }),
+      queued("f1", "s2", { forwardedIntent: { lineage: "x" } }),
+      queued("p1", "s3", { prompt: 42 }),
+      { type: "user", uuid: "u1" }, queued("c1", "u1"), // source_uuid collides with another event
+      queued("d1", "s4"), queued("d2", "s4"), // the first copy takes the id
+    ])).toEqual(["m1", "f1", "p1", "u1", "c1", "s4", "d2"]);
+  });
+
+  it("converts an isMeta queued_command whose origin the loader keeps", () => {
+    expect(loaderVisibleIds([queued("m1", "s1", { isMeta: true, origin: { kind: "channel" } })])).toEqual(["s1"]);
+  });
+
+  it("an isMeta copy does not mask the removed one, and a collision does not mask a removed user message", () => {
+    expect(removedLoaderIds([queued("a1", "s1"), queued("m1", "s1", { isMeta: true })], (i) => i === 0).has("s1")).toBe(true);
+    expect(removedLoaderIds([{ type: "user", uuid: "u1" }, queued("c1", "u1")], (i) => i === 0).has("u1")).toBe(true);
+    expect(removedLoaderIds([{ type: "user", uuid: "u1" }, queued("c1", "u1")], (i) => i === 1)).toEqual(new Set(["c1"]));
   });
 });

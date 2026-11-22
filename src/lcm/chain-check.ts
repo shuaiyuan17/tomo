@@ -74,23 +74,28 @@ export function checkRewrittenChain(args: {
   before: readonly string[];
   after: readonly string[];
   summaryUuid: string;
-  removedUuids: ReadonlySet<string>;
+  /**
+   * Loader-visible ids of the removed events (`removedLoaderIds`), not file
+   * uuids: the loader shows a queued_command attachment under its
+   * source_uuid, and `before`/`after` are the loader's ids.
+   */
+  removedIds: ReadonlySet<string>;
 }): ChainVerdict {
-  const { before, after, summaryUuid, removedUuids } = args;
+  const { before, after, summaryUuid, removedIds } = args;
   const problems: string[] = [];
   const position = new Map<string, number>();
   after.forEach((uuid, i) => { if (!position.has(uuid)) position.set(uuid, i); });
 
-  const firstRemoved = before.findIndex((uuid) => removedUuids.has(uuid));
+  const firstRemoved = before.findIndex((uuid) => removedIds.has(uuid));
   if (firstRemoved < 0) problems.push("the selected range is not on the current chain");
   const summaryAt = position.get(summaryUuid);
   if (summaryAt === undefined) problems.push("summary block is not on the loaded chain");
 
-  const stillThere = after.filter((uuid) => removedUuids.has(uuid));
+  const stillThere = after.filter((uuid) => removedIds.has(uuid));
   if (stillThere.length > 0) problems.push(`${stillThere.length} removed event(s) still on the chain`);
 
   const head = firstRemoved < 0 ? [] : before.slice(0, firstRemoved);
-  const tail = (firstRemoved < 0 ? before : before.slice(firstRemoved)).filter((uuid) => !removedUuids.has(uuid));
+  const tail = (firstRemoved < 0 ? before : before.slice(firstRemoved)).filter((uuid) => !removedIds.has(uuid));
 
   const missingHead = head.filter((uuid) => !position.has(uuid));
   if (missingHead.length > 0) problems.push(`${missingHead.length} event(s) before the summary dropped off the chain`);
@@ -183,7 +188,7 @@ async function checkStaged(
       return fail(`the SDK could not load the staged rewrite (${errorMessage(err)})`);
     }
     if (after.length === 0) return fail("the SDK loader sees no messages in the staged rewrite");
-    return checkRewrittenChain({ before, after, summaryUuid: staged.summaryUuid, removedUuids: staged.removedUuids });
+    return checkRewrittenChain({ before, after, summaryUuid: staged.summaryUuid, removedIds: staged.removedLoaderIds });
   } catch (err) {
     return fail(`could not stage the rewrite for checking (${errorMessage(err)})`);
   } finally {

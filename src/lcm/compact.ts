@@ -1,6 +1,6 @@
 import {
   writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync,
-  openSync, fstatSync, readSync, closeSync, readdirSync, statSync, linkSync,
+  openSync, fstatSync, readSync, closeSync, readdirSync, statSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -75,6 +75,11 @@ export interface CompactRequest {
    */
   expectedFirstUuid?: string;
   expectedLastUuid?: string;
+  /**
+   * @internal Test hook: mutate the rewritten event list before it is checked
+   * or published, to simulate a bug in the rewrite (e.g. a missed re-point).
+   */
+  corruptRewriteForTest?: (events: SdkEntry[]) => void;
   /** @internal Test hook for simulating SDK appends in the final pre-rename window. */
   beforeRenameForTest?: () => void;
   /** @internal Test hook for simulating SDK writes through a pre-rename fd. */
@@ -104,39 +109,67 @@ interface SdkEvent extends TranscriptEvent {
  * summary message, fixes the parentUuid chain, and archives the originals.
  */
 export function compactSession(req: CompactRequest): CompactResult {
-  return compactSessionCapturing(req);
+  const opened = openForRewrite(req);
+  if ("success" in opened) return opened;
+  const { path, sourceFd } = opened;
+  try {
+    const prepared = prepareRewrite(req, sourceFd);
+    if ("success" in prepared) return prepared;
+    return publishRewrite(req, path, sourceFd, prepared);
+  } finally {
+    // Holding this fd keeps the old inode readable after rename, so we can
+    // drain SDK writes that land there. Once closed, any SDK writer that had
+    // opened the old path pre-rename but delayed writing past our drain window
+    // can still write unreachable bytes. Without SDK lock cooperation, that
+    // "fd opened but idle" tail is the remaining residual boundary.
+    closeSync(sourceFd);
+  }
+}
+
+/** What a gate sees of a rewrite that is staged but not yet published. */
+export interface StagedRewrite {
+  /** The rewritten file content as built from the snapshot. */
+  output: string;
+  /** uuid of the summary event the rewrite inserts. */
+  summaryUuid: string;
+  /** uuids of every event the rewrite removes (including a rebuilt block). */
+  removedUuids: ReadonlySet<string>;
 }
 
 /**
- * What a published rewrite leaves behind for the post-rewrite chain check
- * (lcm/chain-check.ts) to verify it and, if it fails, undo it.
- *
- * @internal Filled in by `compactSessionCapturing` only once the rewrite has
- * been published; an unpublished (failed) compact leaves `published` false.
+ * `compactSession` with an async gate between building the rewrite and
+ * publishing it. The gate returns undefined to let the rewrite publish, or an
+ * error to refuse it: a refused rewrite archives nothing, renames nothing and
+ * writes no trigger — the session file is untouched. Anything the SDK appends
+ * while the gate runs is picked up by the same late-arrival splice that covers
+ * appends during the rewrite itself.
  */
-export interface RewriteCapture {
-  published: boolean;
-  /** uuid of the summary event the rewrite inserted. */
-  summaryUuid?: string;
-  /** uuids of the events the rewrite removed (including a rebuilt block). */
-  removedUuids?: ReadonlySet<string>;
-  /**
-   * A hard link to the pre-rewrite inode, taken just before the rename, so it
-   * also holds anything the SDK wrote to the old inode after the rename.
-   * Undefined when the link could not be made (the check is then skipped).
-   * Named like a staging file so `sweepStaleStagingFiles` reaps it if the
-   * process dies before it is removed.
-   */
-  backupPath?: string;
-  /** Size and inode of the published file after the old-inode drain. */
-  publishedSize?: number;
-  publishedIno?: number;
-  /** Whether a reload trigger already existed before this rewrite wrote one. */
-  triggerExisted?: boolean;
+export async function compactSessionGated(
+  req: CompactRequest,
+  gate: (staged: StagedRewrite) => Promise<string | undefined>,
+): Promise<CompactResult> {
+  const opened = openForRewrite(req);
+  if ("success" in opened) return opened;
+  const { path, sourceFd } = opened;
+  try {
+    const prepared = prepareRewrite(req, sourceFd);
+    if ("success" in prepared) return prepared;
+    const refusal = await gate({
+      output: prepared.newEvents.map(serializeJsonlRecord).join("\n") + "\n",
+      summaryUuid: prepared.summaryUuid,
+      removedUuids: prepared.removedUuids,
+    });
+    if (refusal !== undefined) {
+      return { success: false, eventsRemoved: 0, eventsAfter: prepared.allEvents.length, error: refusal };
+    }
+    return publishRewrite(req, path, sourceFd, prepared);
+  } finally {
+    closeSync(sourceFd); // see compactSession
+  }
 }
 
-/** @internal `compactSession`, optionally keeping what a rollback needs. */
-export function compactSessionCapturing(req: CompactRequest, capture?: RewriteCapture): CompactResult {
+/** Validation shared by both entry points, then the source fd the rewrite reads through. */
+function openForRewrite(req: CompactRequest): CompactResult | { path: string; sourceFd: number } {
   // Before anything else: clear out staging corpses. A compact/prune killed
   // between writing its temp file and renaming it (SIGKILL, an OOM, a laptop
   // lid) leaves a FULL COPY of the session file behind under a name nothing
@@ -163,22 +196,19 @@ export function compactSessionCapturing(req: CompactRequest, capture?: RewriteCa
     return { success: false, eventsRemoved: 0, eventsAfter: 0, error: "Session file not found" };
   }
 
-  const sourceFd = openSync(path, "r");
-  try {
-    return compactSessionWithFd(req, path, sourceFd, capture);
-  } finally {
-    // Holding this fd keeps the old inode readable after rename, so we can
-    // drain SDK writes that land there. Once closed, any SDK writer that had
-    // opened the old path pre-rename but delayed writing past our drain window
-    // can still write unreachable bytes. Without SDK lock cooperation, that
-    // "fd opened but idle" tail is the remaining residual boundary.
-    closeSync(sourceFd);
-  }
+  return { path, sourceFd: openSync(path, "r") };
 }
 
-function compactSessionWithFd(
-  req: CompactRequest, path: string, sourceFd: number, capture?: RewriteCapture,
-): CompactResult {
+interface PreparedRewrite {
+  allEvents: SdkEntry[];
+  removeSet: Set<number>;
+  removedUuids: Set<string>;
+  summaryUuid: string;
+  newEvents: SdkEntry[];
+  bytesAtRead: number;
+}
+
+function prepareRewrite(req: CompactRequest, sourceFd: number): PreparedRewrite | CompactResult {
   // Atomic read: open once, fstat the FD, then read exactly that many bytes.
   // `bytesAtRead` is pinned to the last-newline boundary (NOT current EOF) so
   // that any partial mid-write tail stays *outside* the snapshot — the
@@ -387,6 +417,12 @@ function compactSessionWithFd(
     newEvents.push(event);
   }
 
+  req.corruptRewriteForTest?.(newEvents);
+  return { allEvents, removeSet, removedUuids, summaryUuid, newEvents, bytesAtRead };
+}
+
+function publishRewrite(req: CompactRequest, path: string, sourceFd: number, prepared: PreparedRewrite): CompactResult {
+  const { allEvents, removeSet, removedUuids, summaryUuid, newEvents, bytesAtRead } = prepared;
   // Late-arrival splice: re-read any bytes the SDK appended after our initial
   // read. These are events written while we were processing — typically the
   // agent's own thinking/tool_use that triggered this compact via Bash. If we
@@ -505,13 +541,7 @@ function compactSessionWithFd(
   // unlinks its own corpse on failure instead of leaving a full copy of the
   // session beside it, and preserves the file's mode across the rename.
   const output = newEvents.map(serializeJsonlRecord).join("\n") + "\n";
-  const backupPath = capture ? linkPreRewriteBackup(path, req.sdkSessionId) : undefined;
-  try {
-    writeFileAtomicSync(path, output, { beforeRename: req.beforeRenameForTest });
-  } catch (err) {
-    if (backupPath) { try { unlinkSync(backupPath); } catch { /* best-effort */ } }
-    throw err;
-  }
+  writeFileAtomicSync(path, output, { beforeRename: req.beforeRenameForTest });
   req.afterRenameForTest?.();
 
   // The final pre-rename tail read still has a tiny race: the SDK can open
@@ -537,17 +567,6 @@ function compactSessionWithFd(
     }, "Post-rename old-inode drain stopped with partial SDK write still pending");
   }
 
-  if (capture) {
-    const published = statSync(path);
-    capture.published = true;
-    capture.summaryUuid = summaryUuid;
-    capture.removedUuids = removedUuids;
-    capture.backupPath = backupPath;
-    capture.publishedSize = published.size;
-    capture.publishedIno = published.ino;
-    capture.triggerExisted = existsSync(getCompactTriggerPath(req.sdkSessionId, req.sdkSessionsDir));
-  }
-
   // Write trigger file so the harness knows to reload the session
   writeFileSync(getCompactTriggerPath(req.sdkSessionId, req.sdkSessionsDir), new Date().toISOString());
 
@@ -569,24 +588,6 @@ function compactSessionWithFd(
     eventsRemoved,
     eventsAfter,
   };
-}
-
-/**
- * Hard-link the session file under a staging-corpse name before it is
- * replaced. A link, not a copy: no bytes are duplicated, and the backup IS the
- * old inode, so SDK appends that land on it after the rename are in it too.
- * Returns undefined (and the rewrite proceeds unchecked, as it always did)
- * when the filesystem refuses the link.
- */
-function linkPreRewriteBackup(path: string, sessionId: string): string | undefined {
-  const backupPath = `${path}.lcm-backup.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    linkSync(path, backupPath);
-    return backupPath;
-  } catch (err) {
-    log.warn({ err, sessionId }, "Could not link a pre-rewrite backup; the chain check is skipped for this rewrite");
-    return undefined;
-  }
 }
 
 function findUnrelatedSummaryInExpansionGap(

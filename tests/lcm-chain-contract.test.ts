@@ -3,12 +3,13 @@ import {
   appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
 import { checkRewrittenChain, compactSessionChecked } from "../src/lcm/chain-check.js";
 import { compactSession, getCompactTriggerPath, type CompactRequest } from "../src/lcm/compact.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
+import { isRawJsonlLine } from "../src/jsonl.js";
 import { sdkSessionsDirForWorkspace } from "../src/runtime-paths.js";
 
 /**
@@ -155,22 +156,33 @@ function summaryUuidIn(path: string): string {
 }
 
 /**
- * Undo the rewrite's parentUuid re-pointing in the published file: every
- * event that now hangs off the summary goes back to pointing at the last
- * removed event, which no longer exists — exactly the bug the check exists for.
+ * Undo the rewrite's parentUuid re-pointing: every event that hangs off the
+ * new summary goes back to pointing at the last removed event, which no
+ * longer exists — exactly the bug the check exists for.
  */
-function breakRepointing(path: string, f: Fixture): () => void {
-  return () => {
-    const lines = readFileSync(path, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
-    const summary = lines.find((e) => e.blockTag === "daily 2026-11-19");
-    for (const e of lines) if (e.parentUuid === summary.uuid) e.parentUuid = f.lastUuid;
-    writeFileSync(path, lines.map((e) => JSON.stringify(e)).join("\n") + "\n");
+function breakRepointing(f: Fixture): CompactRequest["corruptRewriteForTest"] {
+  return (events) => {
+    const summary = events.find((e) => !isRawJsonlLine(e) && e.blockTag === "daily 2026-11-19");
+    if (!summary || isRawJsonlLine(summary)) throw new Error("fixture: no summary");
+    for (const e of events) if (!isRawJsonlLine(e) && e.parentUuid === summary.uuid) e.parentUuid = f.lastUuid;
   };
 }
 
-const leftovers = (dir = sdkSessionsDir) => readdirSync(dir).filter((name) => name.endsWith(".tmp"));
+/** Nothing left behind: no staging files beside the session, no verify dirs beside the project. */
+function expectNoLeftovers() {
+  expect(readdirSync(sdkSessionsDir).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+  expect(readdirSync(dirname(sdkSessionsDir)).filter((name) => name.includes("-lcm-verify-"))).toEqual([]);
+}
 
-describe("LCM rewrite, read back by the SDK's own loader", () => {
+/** A refused rewrite: original bytes, no trigger, nothing archived, nothing left behind. */
+function expectUntouched(f: Fixture, path: string) {
+  expect(readFileSync(path, "utf8")).toBe(f.text);
+  expect(existsSync(getCompactTriggerPath(f.sessionId, sdkSessionsDir))).toBe(false);
+  expect(existsSync(join(sessionsDir, `_archive_${f.sessionId}.jsonl`))).toBe(false);
+  expectNoLeftovers();
+}
+
+describe("LCM rewrite, checked by the SDK's own loader before it is published", () => {
   it("contract: the loader sees [older block, new summary, fresh tail] after one rollup", async () => {
     const f = buildFixture();
     const path = writeFixture(f);
@@ -185,16 +197,15 @@ describe("LCM rewrite, read back by the SDK's own loader", () => {
     const summary = messages[1].message as { content: string };
     expect(summary.content).toContain("[daily 2026-11-19 — ");
     expect(summary.content).toContain("Release notes checked");
-    // Nothing left behind but the reload trigger.
-    expect(leftovers()).toEqual([]);
     expect(existsSync(getCompactTriggerPath(f.sessionId, sdkSessionsDir))).toBe(true);
+    expectNoLeftovers();
   });
 
   it("the loader really loses the summary when re-pointing is skipped (what the check guards against)", async () => {
     const f = buildFixture();
     const path = writeFixture(f);
     // The unchecked rewrite, with the same break: it reports success.
-    const result = compactSession(request(f, { afterRenameForTest: breakRepointing(path, f) }));
+    const result = compactSession(request(f, { corruptRewriteForTest: breakRepointing(f) }));
     expect(result.success).toBe(true);
     const after = await chain(f.sessionId);
     expect(after).not.toContain(summaryUuidIn(path));
@@ -202,68 +213,43 @@ describe("LCM rewrite, read back by the SDK's own loader", () => {
     expect(after).toEqual(f.tailUuids);
   });
 
-  it("red/green: broken re-pointing is caught, rolled back to the exact pre-rewrite bytes, and reported", async () => {
+  it("red/green: broken re-pointing is refused before publish and the file stays byte-identical", async () => {
     const f = buildFixture();
     const path = writeFixture(f);
-    const before = await chain(f.sessionId);
 
     const result = await compactSessionChecked(
-      request(f, { afterRenameForTest: breakRepointing(path, f) }),
+      request(f, { corruptRewriteForTest: breakRepointing(f) }),
       { workspaceDir: workspace },
     );
 
     expect(result.success).toBe(false);
     expect(result.eventsRemoved).toBe(0);
-    expect(result.error).toMatch(/Chain check failed/);
+    expect(result.error).toMatch(/Chain check failed, rewrite not published/);
     expect(result.error).toMatch(/summary block is not on the loaded chain/);
-    expect(result.error).toMatch(/fresh tail broken|before the summary dropped/);
-    expect(result.error).toMatch(/restored to its pre-rewrite state/);
-    expect(readFileSync(path, "utf8")).toBe(f.text);
-    expect(await chain(f.sessionId)).toEqual(before);
-    // No half-done state: no reload trigger, no backup or staging file.
-    expect(existsSync(getCompactTriggerPath(f.sessionId, sdkSessionsDir))).toBe(false);
-    expect(leftovers()).toEqual([]);
+    expect(result.error).toMatch(/before the summary dropped/);
+    expectUntouched(f, path);
   });
 
-  it("a retry after a rollback succeeds and archives no event twice", async () => {
+  it("splices lines the SDK appends while the check runs, like any other late append", async () => {
     const f = buildFixture();
     const path = writeFixture(f);
-    await compactSessionChecked(request(f, { afterRenameForTest: breakRepointing(path, f) }), { workspaceDir: workspace });
-    const archive = join(sessionsDir, `_archive_${f.sessionId}.jsonl`);
-    const archivedUuids = () => readFileSync(archive, "utf8").split("\n").filter(Boolean)
-      .map((l) => JSON.parse(l).uuid).filter((uuid): uuid is string => typeof uuid === "string");
-    const once = archivedUuids();
-    expect(once).toEqual(expect.arrayContaining(f.day1Uuids));
-
-    const retry = await compactSessionChecked(request(f), { workspaceDir: workspace });
-
-    expect(retry.success).toBe(true);
-    // Records without a uuid (queue-operation) are re-archived by design; nothing with one is.
-    expect(archivedUuids()).toEqual(once);
-    expect(await chain(f.sessionId)).toEqual([f.oldBlockUuid, summaryUuidIn(path), ...f.tailUuids]);
-  });
-
-  it("rollback keeps lines the SDK appended to the published file while the check ran", async () => {
-    const f = buildFixture();
-    const path = writeFixture(f);
+    const lateUuid = randomUUID();
     const late = JSON.stringify({
-      parentUuid: f.tailUuids[f.tailUuids.length - 1], type: "user", uuid: randomUUID(), isSidechain: false,
+      parentUuid: f.tailUuids[f.tailUuids.length - 1], type: "user", uuid: lateUuid, isSidechain: false,
       sessionId: f.sessionId, timestamp: new Date(2026, 10, 20, 10).toISOString(), message: { role: "user", content: "One more thing." },
     }) + "\n";
     let calls = 0;
-    const result = await compactSessionChecked(
-      request(f, { afterRenameForTest: breakRepointing(path, f) }),
-      {
-        workspaceDir: workspace,
-        loadChain: async (sid, dir) => {
-          if (++calls === 2) appendFileSync(path, late); // the live turn writes during the check
-          return getSessionMessages(sid, { dir });
-        },
+    const result = await compactSessionChecked(request(f), {
+      workspaceDir: workspace,
+      loadChain: async (sid, dir) => {
+        if (++calls === 2) appendFileSync(path, late); // the live turn writes during the staged check
+        return getSessionMessages(sid, { dir });
       },
-    );
+    });
 
-    expect(result.success).toBe(false);
-    expect(readFileSync(path, "utf8")).toBe(f.text + late);
+    expect(result.success).toBe(true);
+    expect(readFileSync(path, "utf8").endsWith(late)).toBe(true);
+    expect(await chain(f.sessionId)).toEqual([f.oldBlockUuid, summaryUuidIn(path), ...f.tailUuids, lateUuid]);
   });
 
   it("happy path writes exactly what the unchecked rewrite writes", async () => {
@@ -285,15 +271,63 @@ describe("LCM rewrite, read back by the SDK's own loader", () => {
     expect(checked).toBe(plain);
   });
 
-  it("runs unchecked, as before, when the loader cannot see the session", async () => {
+  it("fails closed when the loader cannot see the session", async () => {
     const f = buildFixture();
     const path = writeFixture(f);
     // A workspace the SDK resolves to a different project dir: it finds nothing.
-    const elsewhere = join(root, "elsewhere");
-    mkdirSync(elsewhere);
-    const result = await compactSessionChecked(request(f), { workspaceDir: elsewhere });
-    expect(result.success).toBe(true);
-    expect(await chain(f.sessionId)).toEqual([f.oldBlockUuid, summaryUuidIn(path), ...f.tailUuids]);
+    const result = await compactSessionChecked(request(f), { workspaceDir: join(root, "elsewhere") });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/Chain check unavailable, rewrite not published: the SDK loader sees no messages/);
+    expectUntouched(f, path);
+  });
+
+  it("fails closed when the loader throws, before or after staging", async () => {
+    for (const failingCall of [1, 2]) {
+      const f = buildFixture();
+      const path = writeFixture(f);
+      let calls = 0;
+      const result = await compactSessionChecked(request(f), {
+        workspaceDir: workspace,
+        loadChain: async (sid, dir) => {
+          if (++calls === failingCall) throw new Error("loader exploded");
+          return getSessionMessages(sid, { dir });
+        },
+      });
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/loader exploded/);
+      expectUntouched(f, path);
+    }
+  });
+
+  it("fails closed when the staged rewrite loads as nothing", async () => {
+    const f = buildFixture();
+    const path = writeFixture(f);
+    let calls = 0;
+    const result = await compactSessionChecked(request(f), {
+      workspaceDir: workspace,
+      loadChain: async (sid, dir) => (++calls === 2 ? [] : getSessionMessages(sid, { dir })),
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/sees no messages in the staged rewrite/);
+    expectUntouched(f, path);
+  });
+
+  it("refuses a range that is not on the current chain", async () => {
+    // Day 1 becomes a dead branch: the next day's first message hangs off the older block.
+    const f = buildFixture();
+    const lines = f.text.split("\n").filter(Boolean).map((l) => JSON.parse(l));
+    const tailHead = lines.find((e) => e.uuid === f.tailUuids[0]);
+    const tailAttachment = lines.find((e) => e.uuid === tailHead.parentUuid);
+    tailAttachment.parentUuid = f.oldBlockUuid;
+    f.text = lines.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    const path = writeFixture(f);
+    expect(await chain(f.sessionId)).toEqual([f.oldBlockUuid, ...f.tailUuids]);
+
+    const result = await compactSessionChecked(request(f), { workspaceDir: workspace });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/the selected range is not on the current chain/);
+    expectUntouched(f, path);
   });
 });
 
@@ -302,7 +336,7 @@ describe("checkRewrittenChain", () => {
   const check = (after: string[], before = ["h1", "r1", "r2", "t1", "t2"]) =>
     checkRewrittenChain({ before, after, summaryUuid: "S", removedUuids: removed });
 
-  it("accepts the collapsed chain, with late appends at the end", () => {
+  it("accepts the collapsed chain, with appends at the end", () => {
     expect(check(["h1", "S", "t1", "t2"]).ok).toBe(true);
     expect(check(["h1", "S", "t1", "t2", "late"]).ok).toBe(true);
   });
@@ -314,5 +348,12 @@ describe("checkRewrittenChain", () => {
     expect(check(["h1", "S", "t2"])).toMatchObject({ ok: false, tailExpected: 2, tailFound: 1 });
     expect(check(["h1", "r2", "S", "t1", "t2"]).problems).toContain("1 removed event(s) still on the chain");
     expect(check(["h1", "S", "t2", "t1"]).problems).toContain("surviving events are out of their original order");
+  });
+
+  it("requires the summary even when the range was not on the chain, and flags that range", () => {
+    const verdict = check(["h1", "t1"], ["h1", "t1"]);
+    expect(verdict.problems).toEqual(expect.arrayContaining([
+      "the selected range is not on the current chain", "summary block is not on the loaded chain",
+    ]));
   });
 });

@@ -1,20 +1,16 @@
-import {
-  appendFileSync, closeSync, existsSync, fstatSync, openSync, readSync, renameSync, statSync, unlinkSync,
-} from "node:fs";
+import { mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { getSessionMessages, type SessionMessage } from "@anthropic-ai/claude-agent-sdk";
 import { log } from "../logger.js";
 import { errorMessage } from "../error-text.js";
-import { getSdkSessionPath } from "../sessions/index.js";
-import {
-  compactSessionCapturing, getCompactTriggerPath,
-  type CompactRequest, type CompactResult, type RewriteCapture,
-} from "./compact.js";
+import { compactSessionGated, type CompactRequest, type CompactResult, type StagedRewrite } from "./compact.js";
 
 /**
- * Post-rewrite chain check: after LCM rewrites a session file, ask the SDK's
+ * Pre-publish chain check: before LCM replaces a session file, ask the SDK's
  * own loader (`getSessionMessages`, the public reader that rebuilds the
- * parentUuid chain the agent will resume on) whether the result is still one
- * intact conversation, and put the pre-rewrite file back if it is not.
+ * parentUuid chain the agent will resume on) whether the rewritten file is
+ * still one intact conversation. Only a rewrite that passes is published.
  *
  * Why the SDK and not our own parser: the failure this guards against is the
  * SDK reading the file differently from how we wrote it. A summary whose
@@ -24,13 +20,23 @@ import {
  * can say what it will load, and it says so the same way after an SDK upgrade
  * changes the format (tests/lcm-chain-contract.test.ts pins this).
  *
- * What "intact" means, comparing the loader's chain before and after:
+ * How: the staged rewrite is written, under the same session id, into a
+ * throwaway project directory next to the real one — the layout the SDK
+ * resolves a `dir` to — and loaded from there. The real session file is not
+ * touched until the check has passed.
+ *
+ * What "intact" means, comparing the loader's chain of the live file with the
+ * chain of the staged copy:
  *   - the new summary block is on the chain;
  *   - no removed event is still on it;
  *   - every event that was on the chain and was not removed still is, in the
  *     same order — the older blocks before the summary, the fresh tail after
  *     it (a missing one is an orphaned segment).
- * Events the SDK appended in between (a live turn keeps writing) are allowed.
+ * Events the SDK appended between the first read and the snapshot are allowed.
+ *
+ * Fail closed: when either read throws or comes back empty, or the range is
+ * not on the current chain at all, the rewrite is refused. An unverifiable
+ * rewrite is not published.
  */
 
 export interface ChainCheckOptions {
@@ -53,8 +59,12 @@ export interface ChainVerdict {
 
 const sdkLoadChain = (sessionId: string, dir: string) => getSessionMessages(sessionId, { dir });
 
+/** Suffix of the throwaway workspace path / project directory a staged rewrite is loaded from. */
+const VERIFY_MARK = "-lcm-verify-";
+const VERIFY_DIR_MAX_AGE_MS = 60 * 60 * 1000;
+
 /**
- * Compare the loader's chain after a rewrite with the chain before it.
+ * Compare the loader's chain of the rewritten file with the chain before it.
  * Pure, exported for tests.
  */
 export function checkRewrittenChain(args: {
@@ -69,17 +79,15 @@ export function checkRewrittenChain(args: {
   after.forEach((uuid, i) => { if (!position.has(uuid)) position.set(uuid, i); });
 
   const firstRemoved = before.findIndex((uuid) => removedUuids.has(uuid));
-  // Nothing removed was on the chain (a range entirely off the main branch):
-  // there is no position the summary must hold, only the survivors to check.
-  const rangeOnChain = firstRemoved >= 0;
+  if (firstRemoved < 0) problems.push("the selected range is not on the current chain");
   const summaryAt = position.get(summaryUuid);
-  if (rangeOnChain && summaryAt === undefined) problems.push("summary block is not on the loaded chain");
+  if (summaryAt === undefined) problems.push("summary block is not on the loaded chain");
 
   const stillThere = after.filter((uuid) => removedUuids.has(uuid));
   if (stillThere.length > 0) problems.push(`${stillThere.length} removed event(s) still on the chain`);
 
-  const head = rangeOnChain ? before.slice(0, firstRemoved) : [];
-  const tail = (rangeOnChain ? before.slice(firstRemoved) : before).filter((uuid) => !removedUuids.has(uuid));
+  const head = firstRemoved < 0 ? [] : before.slice(0, firstRemoved);
+  const tail = (firstRemoved < 0 ? before : before.slice(firstRemoved)).filter((uuid) => !removedUuids.has(uuid));
 
   const missingHead = head.filter((uuid) => !position.has(uuid));
   if (missingHead.length > 0) problems.push(`${missingHead.length} event(s) before the summary dropped off the chain`);
@@ -100,117 +108,97 @@ export function checkRewrittenChain(args: {
 }
 
 /**
- * `compactSession`, then verify the published file with the SDK's loader and
- * roll back to the pre-rewrite file when the chain is broken.
- *
- * On the happy path the session file is exactly what `compactSession` writes.
- * When the loader cannot see the session at all before the rewrite (a session
- * id it does not accept, a workspace it resolves elsewhere), there is nothing
- * to compare against: the rewrite runs unchecked, as it did before, with a
- * warning.
+ * `compactSession`, published only after the SDK's loader has accepted the
+ * staged result. On the happy path the session file ends up exactly as
+ * `compactSession` would leave it; on any failure it is not touched.
  */
 export async function compactSessionChecked(req: CompactRequest, opts: ChainCheckOptions): Promise<CompactResult> {
   const loadChain = opts.loadChain ?? sdkLoadChain;
-  let before: string[] | undefined;
+  const refuse = (error: string): CompactResult => ({ success: false, eventsRemoved: 0, eventsAfter: 0, error });
+
+  // Read BEFORE the rewrite takes its snapshot: an SDK append that lands in
+  // between is then an extra at the end of the staged chain (allowed), never
+  // an event the staged copy lacks.
+  let before: string[];
   try {
     before = (await loadChain(req.sdkSessionId, opts.workspaceDir)).map((m) => m.uuid);
   } catch (err) {
-    log.warn({ err, sessionId: req.sdkSessionId }, "Chain check unavailable: the SDK could not load the session before the rewrite");
+    return refuseLogged(req, `the SDK could not load the session (${errorMessage(err)})`, refuse);
   }
-  if (!before || before.length === 0) {
-    if (before) log.warn({ sessionId: req.sdkSessionId }, "Chain check unavailable: the SDK loader sees no messages for this session");
-    return compactSessionCapturing(req);
-  }
-
-  const capture: RewriteCapture = { published: false };
-  const result = compactSessionCapturing(req, capture);
-  if (!result.success || !capture.published || !capture.backupPath) return result;
-  const backupPath = capture.backupPath;
-
-  const startedAt = performance.now();
-  let verdict: ChainVerdict;
-  try {
-    const after = (await loadChain(req.sdkSessionId, opts.workspaceDir)).map((m) => m.uuid);
-    verdict = checkRewrittenChain({
-      before, after, summaryUuid: capture.summaryUuid!, removedUuids: capture.removedUuids!,
-    });
-  } catch (err) {
-    verdict = { ok: false, problems: [`SDK loader threw: ${errorMessage(err)}`], tailExpected: 0, tailFound: 0 };
-  }
-  const checkMs = Math.round(performance.now() - startedAt);
-
-  if (verdict.ok) {
-    try { unlinkSync(backupPath); } catch { /* swept as a staging corpse later */ }
-    log.info({ sessionId: req.sdkSessionId, checkMs, tail: verdict.tailExpected }, "Rewrite chain check passed");
-    return result;
+  if (before.length === 0) {
+    return refuseLogged(req, "the SDK loader sees no messages for this session (wrong workspace, or not a session id it accepts)", refuse);
   }
 
-  const rolledBack = rollBack(req, capture as Required<RewriteCapture>);
-  log.error({
-    sessionId: req.sdkSessionId,
-    problems: verdict.problems,
-    tailExpected: verdict.tailExpected,
-    tailFound: verdict.tailFound,
-    rolledBack: rolledBack.ok,
-    rollbackError: rolledBack.error,
-    checkMs,
-  }, "Rewrite chain check failed: the SDK loader does not see an intact chain");
-  return {
-    success: false,
-    eventsRemoved: 0,
-    eventsAfter: result.eventsAfter,
-    error: `Chain check failed after the rewrite (${verdict.problems.join("; ")}). ` +
-      (rolledBack.ok
-        ? "The session file was restored to its pre-rewrite state; the removed events stay in the archive, which a retry does not duplicate."
-        : `Could not restore the pre-rewrite file: ${rolledBack.error}. The pre-rewrite copy is at ${backupPath}.`),
-  };
+  sweepStaleVerifyDirs(req.sdkSessionsDir);
+
+  return compactSessionGated(req, async (staged) => {
+    const startedAt = performance.now();
+    const outcome = await checkStaged(req, opts.workspaceDir, loadChain, before, staged);
+    const checkMs = Math.round(performance.now() - startedAt);
+    if (outcome.ok) {
+      log.info({ sessionId: req.sdkSessionId, checkMs, tail: outcome.tailExpected }, "Rewrite chain check passed");
+      return undefined;
+    }
+    log.error({
+      sessionId: req.sdkSessionId,
+      problems: outcome.problems,
+      tailExpected: outcome.tailExpected,
+      tailFound: outcome.tailFound,
+      checkMs,
+    }, "Rewrite refused: the SDK loader does not see an intact chain in the staged rewrite");
+    return `Chain check failed, rewrite not published (${outcome.problems.join("; ")}). The session file is unchanged.`;
+  });
 }
 
-/**
- * Put the pre-rewrite inode back at the session path.
- *
- * Lines the SDK appended to the published file after the rewrite (a live turn
- * keeps writing) are carried onto the backup first: they were written against
- * the SDK's in-memory chain, which is the pre-rewrite one, so they belong
- * there. Then the rename swaps the backup in atomically and the reload
- * trigger this rewrite wrote is withdrawn — the in-memory session already
- * matches the restored file. Refuses when the published file is no longer the
- * one this rewrite published (another rewriter got there first).
- */
-function rollBack(req: CompactRequest, capture: Required<RewriteCapture>): { ok: boolean; error?: string } {
-  const path = getSdkSessionPath(req.sdkSessionId, req.sdkSessionsDir);
-  try {
-    if (statSync(path).ino !== capture.publishedIno) {
-      return { ok: false, error: "the session file was replaced again after the rewrite" };
-    }
-    const appended = readCompleteLinesFrom(path, capture.publishedSize);
-    if (appended.length > 0) appendFileSync(capture.backupPath, appended);
-    renameSync(capture.backupPath, path);
-    if (!capture.triggerExisted) {
-      const trigger = getCompactTriggerPath(req.sdkSessionId, req.sdkSessionsDir);
-      if (existsSync(trigger)) unlinkSync(trigger);
-    }
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: errorMessage(err) };
-  }
+function refuseLogged(req: CompactRequest, reason: string, refuse: (error: string) => CompactResult): CompactResult {
+  log.error({ sessionId: req.sdkSessionId, reason }, "Rewrite refused: the chain cannot be verified");
+  return refuse(`Chain check unavailable, rewrite not published: ${reason}. The session file is unchanged.`);
 }
 
-function readCompleteLinesFrom(path: string, offset: number): Buffer {
-  const fd = openSync(path, "r");
+/** Load the staged output from a throwaway project dir with the SDK and compare. */
+async function checkStaged(
+  req: CompactRequest,
+  workspaceDir: string,
+  loadChain: (sessionId: string, dir: string) => Promise<SessionMessage[]>,
+  before: string[],
+  staged: StagedRewrite,
+): Promise<ChainVerdict> {
+  const fail = (problem: string): ChainVerdict => ({ ok: false, problems: [problem], tailExpected: 0, tailFound: 0 });
+  // The SDK turns `dir` into `<projects>/<dir with / and . as ->`. Appending
+  // only letters, digits and dashes to the workspace path appends the same to
+  // its project dir name, so this sibling is where the SDK will look.
+  const mark = `${VERIFY_MARK}${randomUUID().replace(/-/g, "")}`;
+  const verifyProjectDir = join(dirname(req.sdkSessionsDir), `${basename(req.sdkSessionsDir)}${mark}`);
   try {
-    const size = fstatSync(fd).size;
-    if (size <= offset) return Buffer.alloc(0);
-    const buf = Buffer.alloc(size - offset);
-    let total = 0;
-    while (total < buf.length) {
-      const n = readSync(fd, buf, total, buf.length - total, offset + total);
-      if (n === 0) break;
-      total += n;
+    mkdirSync(verifyProjectDir, { recursive: true });
+    writeFileSync(join(verifyProjectDir, `${req.sdkSessionId}.jsonl`), staged.output);
+    let after: string[];
+    try {
+      after = (await loadChain(req.sdkSessionId, `${workspaceDir}${mark}`)).map((m) => m.uuid);
+    } catch (err) {
+      return fail(`the SDK could not load the staged rewrite (${errorMessage(err)})`);
     }
-    const lastNl = buf.subarray(0, total).lastIndexOf(0x0A);
-    return lastNl < 0 ? Buffer.alloc(0) : buf.subarray(0, lastNl + 1);
+    if (after.length === 0) return fail("the SDK loader sees no messages in the staged rewrite");
+    return checkRewrittenChain({ before, after, summaryUuid: staged.summaryUuid, removedUuids: staged.removedUuids });
+  } catch (err) {
+    return fail(`could not stage the rewrite for checking (${errorMessage(err)})`);
   } finally {
-    closeSync(fd);
+    rmSync(verifyProjectDir, { recursive: true, force: true });
+  }
+}
+
+/** Remove verify dirs a killed process left behind (each holds a full session copy). */
+function sweepStaleVerifyDirs(sdkSessionsDir: string, now = Date.now()): void {
+  const projects = dirname(sdkSessionsDir);
+  const prefix = `${basename(sdkSessionsDir)}${VERIFY_MARK}`;
+  let names: string[];
+  try { names = readdirSync(projects); } catch { return; }
+  for (const name of names) {
+    if (!name.startsWith(prefix)) continue;
+    const full = join(projects, name);
+    try {
+      if (now - statSync(full).mtimeMs < VERIFY_DIR_MAX_AGE_MS) continue;
+      rmSync(full, { recursive: true, force: true });
+    } catch { /* raced with another sweep */ }
   }
 }

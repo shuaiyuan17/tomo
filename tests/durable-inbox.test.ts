@@ -85,6 +85,23 @@ describe("DurableInbox: crash and replay", () => {
     expect(next.isPending(rec.id)).toBe(false);
   });
 
+  it("keeps a started record's self-restart mark across a restart and a compaction", () => {
+    const first = reopen();
+    const a = first.accept("imessage", msg("a"), resolution);
+    const b = first.accept("imessage", msg("b"), resolution);
+    if (a.status !== "accepted" || b.status !== "accepted") throw new Error("expected accepted");
+    first.markStarted([a.id]);
+    // Only a started record can have been cut short by its own turn's restart.
+    first.markSelfRestart([a.id, b.id], "deploy");
+
+    const next = reopen(); // load() compacts
+    expect(next.pending().map((r) => [r.message.id, r.status, r.selfRestart])).toEqual([
+      ["a", "started", { reason: "deploy" }],
+      ["b", "received", undefined],
+    ]);
+    expect(reopen().pending()[0].selfRestart).toEqual({ reason: "deploy" });
+  });
+
   it("returns pending records oldest first", () => {
     let t = 100;
     const first = reopen({ now: () => t });

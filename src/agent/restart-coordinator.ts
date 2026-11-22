@@ -8,6 +8,10 @@ import {
   type RestartRequest,
   type RestartRequestDiscard,
 } from "../restart-request.js";
+import type { ReplyContext } from "./live-session.js";
+
+/** The part of a turn's reply context the coordinator may mark. */
+type RestartInitiator = Pick<ReplyContext, "initiatedRestart">;
 
 export interface RestartCoordinatorDeps {
   /** True once `Agent.stop()` has begun: a stop outranks any restart. */
@@ -51,12 +55,21 @@ export class RestartCoordinator {
    * `BashOutput` is accepted alongside `Bash`: a backgrounded
    * `tomo restart &`-style invocation returns its marker through the
    * background-output tool, not the original call.
+   *
+   * `turn` is the reply context of the running turn whose own Bash call
+   * produced this result (LiveSession attributes it; anything it cannot tie to
+   * the turn arrives without one). When this result launches the restart and
+   * the helper has actually started, that turn is flagged as the initiator
+   * (ReplyContext.initiatedRestart), so the note after the restart says the
+   * turn restarted Tomo itself. Nothing else changes for it: the turn is
+   * still interrupted. Without a turn, nothing is flagged.
    */
   handleToolResult(
     sessionKey: string,
     toolName: string,
     content: unknown,
     isError: boolean,
+    turn?: RestartInitiator,
   ): void {
     if ((toolName !== "Bash" && toolName !== "BashOutput") || isError) return;
     if (this.stopping) {
@@ -89,7 +102,7 @@ export class RestartCoordinator {
       return;
     }
     this.restartInFlight = true;
-    this.launchAcknowledgedRestart(request);
+    this.launchAcknowledgedRestart(request, turn);
   }
 
   /**
@@ -166,7 +179,7 @@ export class RestartCoordinator {
     this.launchAcknowledgedRestart(request);
   }
 
-  private launchAcknowledgedRestart(request: RestartRequest): void {
+  private launchAcknowledgedRestart(request: RestartRequest, initiator?: RestartInitiator): void {
     const cliPath = process.argv[1];
     if (!cliPath) {
       this.reportScheduledRestartFailure(request.sessionKey, "CLI entry point is unavailable");
@@ -187,8 +200,14 @@ export class RestartCoordinator {
     const reportFailure = (detail: string) => {
       if (failureReported) return;
       failureReported = true;
+      // A restart that did not happen was not caused by this turn.
+      if (initiator) delete initiator.initiatedRestart;
       this.reportScheduledRestartFailure(request.sessionKey, detail);
     };
+    // Only a helper that actually started can be the cause of the shutdown.
+    child.once("spawn", () => {
+      if (initiator && !failureReported) initiator.initiatedRestart = request.reason ? { reason: request.reason } : {};
+    });
     child.once("error", (err) => reportFailure(err.message));
     child.once("exit", (code, signal) => {
       if (code === 0) return;

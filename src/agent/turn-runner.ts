@@ -314,8 +314,11 @@ export interface TurnSpec {
    *   reads as a successful silent turn.
    *
    * The cron scheduler uses it to avoid recording either as a finished run.
+   *
+   * `selfRestart`: an `"interrupted"` turn whose own Bash call ran the
+   * `tomo restart` behind this shutdown (ReplyContext.initiatedRestart).
    */
-  onShutdown?: (kind: ShutdownTurnEnd) => void;
+  onShutdown?: (kind: ShutdownTurnEnd, selfRestart?: { reason?: string }) => void;
   /**
    * The turn ended with no reply text anywhere, and not by the model's choice
    * (EMPTY_REPLY). Nothing was delivered; the turn still returns true, so a
@@ -573,7 +576,10 @@ export class TurnRunner {
         } } : {}),
         onPromptHandedOff: () => { spec.promptTaken = true; spec.onPromptHandedOff?.(); },
         flushOnShutdown: sink.flushBlockTranscript,
-        onShutdownInterrupted: () => { spec.shutdownInterrupted = true; spec.onShutdown?.("interrupted"); },
+        onShutdownInterrupted: () => {
+          spec.shutdownInterrupted = true;
+          spec.onShutdown?.("interrupted", spec.replyContext?.initiatedRestart);
+        },
         ...(reply
           ? {
             images: reply.images,

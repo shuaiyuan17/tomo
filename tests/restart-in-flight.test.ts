@@ -62,7 +62,7 @@ afterAll(() => {
 /** The two restart entry points are private; this is the seam under test. */
 interface RestartHandlers {
   handleTurnComplete(key: string): void;
-  handleToolResult(key: string, toolName: string, content: unknown, isError: boolean): void;
+  handleToolResult(key: string, toolName: string, content: unknown, isError: boolean, turn?: { initiatedRestart?: { reason?: string } }): void;
   stop(): Promise<void>;
 }
 
@@ -169,6 +169,47 @@ describe("a previous daemon's requests never reach a turn end", () => {
     const agent = makeAgent();
     agent.handleTurnComplete("dm:shuai");
     expect(hoisted.spawnCalls).toHaveLength(1);
+  });
+});
+
+describe("the turn that launched the restart is flagged as its initiator", () => {
+  type Initiator = { initiatedRestart?: { reason?: string } };
+  const lastChild = () => hoisted.children[hoisted.children.length - 1]!;
+
+  it("flags the turn only once the helper has actually started", () => {
+    const agent = makeAgent();
+    const own: Initiator = {};
+    agent.handleToolResult("dm:owner", "Bash", formatRestartRequestResult(file("dm:owner", "deploy")), false, own);
+    expect(hoisted.spawnCalls).toHaveLength(1);
+    expect(own.initiatedRestart).toBeUndefined();
+    lastChild().emit("spawn");
+    expect(own.initiatedRestart).toEqual({ reason: "deploy" });
+  });
+
+  it("does not flag (or un-flags) the turn when the helper fails", () => {
+    const agent = makeAgent();
+    const never: Initiator = {};
+    agent.handleToolResult("dm:owner", "Bash", formatRestartRequestResult(file("dm:owner", "a")), false, never);
+    lastChild().emit("error", new Error("spawn ENOENT"));
+    lastChild().emit("spawn");
+    expect(never.initiatedRestart).toBeUndefined();
+
+    const later: Initiator = {};
+    agent.handleToolResult("dm:owner", "Bash", formatRestartRequestResult(file("dm:owner", "b")), false, later);
+    lastChild().emit("spawn");
+    expect(later.initiatedRestart).toEqual({ reason: "b" });
+    lastChild().emit("exit", 1, null);
+    expect(later.initiatedRestart).toBeUndefined();
+  });
+
+  it("does not flag a second session's turn while a restart is already in flight", () => {
+    const agent = makeAgent();
+    agent.handleToolResult("dm:owner", "Bash", formatRestartRequestResult(file("dm:owner", "deploy")), false, {});
+    lastChild().emit("spawn");
+    const other: Initiator = {};
+    agent.handleToolResult("telegram:9", "Bash", formatRestartRequestResult(file("telegram:9", "late")), false, other);
+    expect(hoisted.spawnCalls).toHaveLength(1);
+    expect(other.initiatedRestart).toBeUndefined();
   });
 });
 

@@ -683,6 +683,24 @@ describe("TurnRunner: notes taken by a turn that did not finish", () => {
     expect(calls).toEqual(["interrupted"]);
   });
 
+  it("tells onShutdown when the turn was cut short by the restart it ran itself", async () => {
+    const shutdowns: unknown[][] = [];
+    const run = async (flag: boolean) => {
+      const { h, calls } = harness(async (req) => {
+        req.onPromptHandedOff?.();
+        if (flag) req.replyContext!.initiatedRestart = { reason: "deploy" };
+        req.onShutdownInterrupted?.();
+        return "NO_REPLY";
+      });
+      await h.runner.runTurn(replySpec(h, { onShutdown: (...args) => { shutdowns.push(args); } }));
+      return calls;
+    };
+    // Still an interruption either way: the notes stay, marked.
+    expect(await run(true)).toEqual(["interrupted"]);
+    expect(await run(false)).toEqual(["interrupted"]);
+    expect(shutdowns).toEqual([["interrupted", { reason: "deploy" }], ["interrupted", undefined]]);
+  });
+
   it("keeps them (marked) when the turn failed after taking them", async () => {
     const { h, calls } = harness(async (req) => { req.onPromptHandedOff?.(); throw new Error("aborted"); });
     await h.runner.runTurn(replySpec(h));

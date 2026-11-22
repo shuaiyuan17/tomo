@@ -134,6 +134,27 @@ describe("closing an item survives a crash between its two writes", () => {
     expect(doneLines()).toHaveLength(3);
   });
 
+  it("keeps the whole record when a bad record of the same id comes first", () => {
+    const store = new TodoStore(dir);
+    store.add(input("a"));
+    store.add(input("b"));
+    hook.crash = true;
+    expect(() => store.resolve("t-1", { action: "drop", reason: "no longer needed", by: "owner" })).toThrow("simulated crash");
+    // A line that has an id and a session but is not a whole record (no
+    // resolution, no timestamp) sits ahead of the real record for t-1.
+    const good = readFileSync(join(dir, "done.ndjson"), "utf-8");
+    writeFileSync(join(dir, "done.ndjson"), `${JSON.stringify({ id: "t-1", session: "dm:shuai", title: "a" })}\n${good}`);
+
+    const reloaded = new TodoStore(dir);
+    // Still closed: todos.json heals from the whole record.
+    expect(reloaded.list().map((i) => i.id)).toEqual(["t-2"]);
+    // The no-op re-close answers from the whole record, not the bad one.
+    const again = reloaded.resolve("t-1", { action: "done", by: "self" });
+    expect(again.action).toBe("drop");
+    expect(again.item).toMatchObject({ id: "t-1", title: "a" });
+    expect(doneLines()).toHaveLength(2);
+  });
+
   it("skips a torn last line in done.ndjson", () => {
     const store = new TodoStore(dir);
     store.add(input("a"));

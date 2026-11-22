@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { ImsgChannel, type ImsgCapabilities, type ImsgChannelConfig } from "../src/channels/imessage-imsg.js";
-import { AttachmentUnreadableError, isNothingSent, partsSent } from "../src/channels/types.js";
+import { AttachmentUnreadableError, isNothingSent, partsSent, type ChannelFaultNotice } from "../src/channels/types.js";
 import { NULL_SERVICE_LOOKUP, type ServiceLookup } from "../src/channels/imsg-satellite.js";
 import { NULL_ATTACHMENT_LOOKUP } from "../src/channels/imsg-attachment-lookup.js";
 import { log } from "../src/logger.js";
@@ -147,7 +147,24 @@ function makeChannel(options: {
     attachmentLookup: NULL_ATTACHMENT_LOOKUP,
     ...options.config,
   });
-  return { channel, children, spawnFn, requests: () => children.flatMap((c) => c.stdin.lines.map((l) => JSON.parse(l) as RpcRequest)) };
+  return {
+    channel,
+    children,
+    spawnFn,
+    requests: () => children.flatMap((c) => c.stdin.lines.map((l) => JSON.parse(l) as RpcRequest)),
+    /** Children that carry the watch stream (they subscribed). */
+    watchChildren: () => children.filter(isWatchChild),
+    /** Children that carry mutations (never subscribed). */
+    mutationChildren: () => children.filter((c) => !isWatchChild(c)),
+  };
+}
+
+const isWatchChild = (child: FakeChild): boolean => child.stdin.lines.some((l) => (JSON.parse(l) as RpcRequest).method === "watch.subscribe");
+
+/** The channel's mutation child (spawned now if there is none), as its fake. */
+function mutationChildOf(channel: ImsgChannel): FakeChild {
+  const rpc = (channel as unknown as { rpc: { mutationChild(): { child: unknown } | null } }).rpc;
+  return rpc.mutationChild()!.child as FakeChild;
 }
 
 const DM_GUID = "any;-;+15551234567";
@@ -4184,29 +4201,29 @@ describe("imsg rpc child lifecycle", () => {
 
   it("restarts the child with backoff after a crash and resubscribes from the cursor", async () => {
     vi.useFakeTimers();
-    const { channel, children, spawnFn } = makeChannel({ config: { restartDelaysMs: [1_000, 5_000] } });
+    const { channel, children, watchChildren } = makeChannel({ config: { restartDelaysMs: [1_000, 5_000] } });
     await channel.start();
     channel.onMessage(vi.fn(async () => true));
-    expect(spawnFn).toHaveBeenCalledTimes(1);
+    expect(watchChildren()).toHaveLength(1);
 
     children[0].notifyMessage(inboundMessage({ id: 777, guid: "pre-crash" }));
     await settle();
 
     children[0].emit("exit", 1, null);
-    expect(spawnFn).toHaveBeenCalledTimes(1); // waits out the backoff first
+    expect(watchChildren()).toHaveLength(1); // waits out the backoff first
 
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(spawnFn).toHaveBeenCalledTimes(2);
+    expect(watchChildren()).toHaveLength(2);
 
     // The replacement child resubscribes strictly after the last seen rowid.
-    const resubscribe = JSON.parse(children[1].stdin.lines[0]) as RpcRequest;
+    const resubscribe = JSON.parse(watchChildren()[1].stdin.lines[0]) as RpcRequest;
     expect(resubscribe.method).toBe("watch.subscribe");
     expect(resubscribe.params.since_rowid).toBe(777);
 
     // The new child works: inbound flows again.
     const handler = vi.fn(async () => true);
     channel.onMessage(handler);
-    children[1].notifyMessage(inboundMessage({ id: 778, guid: "post-crash" }));
+    watchChildren()[1].notifyMessage(inboundMessage({ id: 778, guid: "post-crash" }));
     await settle();
     expect(handler).toHaveBeenCalledTimes(1);
 
@@ -4235,9 +4252,10 @@ describe("imsg rpc child lifecycle", () => {
 
   it("rejects in-flight requests when the child dies and does not restart after stop", async () => {
     vi.useFakeTimers();
-    const { channel, children, spawnFn } = makeChannel({
+    const { channel, children, spawnFn, mutationChildren } = makeChannel({
       responder: (req, child) => {
         if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        if (req.method === "watch.unsubscribe") return child.respond(req.id, { ok: true });
         // never answer send — leave it in flight
       },
     });
@@ -4246,12 +4264,13 @@ describe("imsg rpc child lifecycle", () => {
     const inFlight = channel.send({ chatId: DM_GUID, text: "hi" });
     const rejection = expect(inFlight).rejects.toThrow(/imsg rpc child exited/);
     await settle();
-    children[0].emit("exit", 0, null);
+    mutationChildren()[0].emit("exit", 0, null);
     await rejection;
 
     await channel.stop();
+    children[0].emit("exit", 0, null);
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(spawnFn).toHaveBeenCalledTimes(1);
+    expect(spawnFn).toHaveBeenCalledTimes(2); // the watch child and the one mutation child
   });
 
   it("rejects in-flight requests on stop() instead of leaving them hanging", async () => {
@@ -4309,7 +4328,7 @@ describe("imsg rpc child lifecycle", () => {
       },
     });
     await channel.start();
-    const child0 = children[0];
+    const child0 = mutationChildOf(channel);
 
     // The next write (a send) backpressures — write() returns false and its
     // chain link parks on 'drain' (which will never fire for this child).
@@ -4319,18 +4338,16 @@ describe("imsg rpc child lifecycle", () => {
     expect(child0.stdin.listenerCount("drain")).toBeGreaterThan(0);
 
     // The child dies before draining. The parked write must not wedge the
-    // global write chain, or the restarted subscribe would queue behind it.
+    // write chain: the next request goes out on a new mutation child.
     child0.emit("exit", 1, null);
     await settle();
     expect(child0.stdin.listenerCount("drain")).toBe(0); // parked wait released
 
-    // Restart: the new child's watch.subscribe actually goes out.
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(children).toHaveLength(2);
-    await vi.waitFor(() => {
-      const sub = children[1].stdin.lines.map((l) => JSON.parse(l) as RpcRequest).find((r) => r.method === "watch.subscribe");
-      expect(sub).toBeDefined();
-    });
+    void channel.send({ chatId: DM_GUID, text: "next" }).catch(() => {});
+    await settle();
+    expect(children).toHaveLength(3);
+    expect(children[2].stdin.lines.map((l) => (JSON.parse(l) as RpcRequest).params.text)).toEqual(["next"]);
+    void subCount;
     await channel.stop();
   });
 
@@ -4363,6 +4380,337 @@ describe("imsg rpc child lifecycle", () => {
 });
 
 // --- recentMessages addressing ---------------------------------------------------
+
+describe("imsg rpc restart on -32004 Mutation lane blocked", () => {
+  // children[0] is the watch child; mutation children follow, spawned on use.
+  const blockedResponder = (isBlocked: (childIndex: number, req: RpcRequest) => boolean, childIndex: (child: FakeChild) => number): Responder =>
+    (req, child) => {
+      if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+      if (req.method === "send" && isBlocked(childIndex(child), req)) {
+        return child.respondError(req.id, -32004, "Mutation lane blocked", { lane: "send", reason: "busy" });
+      }
+      child.respond(req.id, { ok: true });
+    };
+
+  function laneChannel(isBlocked: (childIndex: number, req: RpcRequest) => boolean, config: Partial<ImsgChannelConfig> = {}) {
+    let children: FakeChild[] = [];
+    const made = makeChannel({ responder: blockedResponder(isBlocked, (c) => children.indexOf(c)), config });
+    children = made.children;
+    const sends = () => made.requests().filter((r) => r.method === "send");
+    return { ...made, sends };
+  }
+
+  it("restarts only the mutation child and retries the refused send there once; the watch stream is untouched", async () => {
+    const { channel, children, sends, watchChildren, mutationChildren } = laneChannel((i) => i === 1);
+    await channel.start();
+    const handler = vi.fn(async () => true);
+    channel.onMessage(handler);
+
+    await expect(channel.send({ chatId: DM_GUID, text: "hello" })).resolves.toBeUndefined();
+
+    // The blocked mutation child was replaced; the retry went to the new one.
+    expect(mutationChildren()).toHaveLength(2);
+    expect(mutationChildren()[0].killed).toBe(true);
+    expect(sends().map((r) => r.params.text)).toEqual(["hello", "hello"]);
+    expect(mutationChildren()[1].stdin.lines.map((l) => (JSON.parse(l) as RpcRequest).method)).toEqual(["send"]);
+
+    // The watch child: never killed, subscribed once, still delivering.
+    expect(watchChildren()).toHaveLength(1);
+    expect(children[0].killed).toBe(false);
+    expect(children[0].stdin.lines.map((l) => (JSON.parse(l) as RpcRequest).method)).toEqual(["watch.subscribe"]);
+    children[0].notifyMessage(inboundMessage({ id: 801, guid: "after-restart" }));
+    await settle(20);
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    await channel.stop();
+  });
+
+  it("retries only the refused part of a long text, never a part already sent", async () => {
+    let sendsOnFirstMutationChild = 0;
+    const { channel, sends } = laneChannel((i) => i === 1 && ++sendsOnFirstMutationChild === 2);
+    await channel.start();
+
+    // Three parts, each with different words.
+    const text = Array.from({ length: 1_700 }, (_, i) => `w${i}`).join(" ");
+    await expect(channel.send({ chatId: DM_GUID, text })).resolves.toBeUndefined();
+
+    const parts = sends().map((r) => r.params.text as string);
+    // Part 1 once, part 2 refused then retried, part 3 once: nothing doubled.
+    expect(parts).toHaveLength(4);
+    expect(parts[1]).toBe(parts[2]);
+    expect(new Set(parts).size).toBe(3);
+
+    await channel.stop();
+  });
+
+  it("retries at most once: a second refusal fails as nothing-sent, with no third attempt", async () => {
+    const { channel, sends, mutationChildren } = laneChannel(() => true);
+    await channel.start();
+
+    const err = await channel.send({ chatId: DM_GUID, text: "hi" }).then(() => null, (e: unknown) => e as Error & { rpcCode?: number });
+    expect(err?.rpcCode).toBe(-32004);
+    expect(isNothingSent(err)).toBe(true);
+    expect(sends()).toHaveLength(2);
+    expect(mutationChildren()).toHaveLength(2);
+
+    await channel.stop();
+  });
+
+  it("does not retry when the retried send's outcome is unknown (timeout)", async () => {
+    vi.useFakeTimers();
+    const { channel, children, mutationChildren } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        // First mutation child: lane blocked. Second: takes the send and never answers.
+        if (req.method === "send" && children.indexOf(child) === 1) return child.respondError(req.id, -32004, "Mutation lane blocked");
+        if (req.method !== "send") child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const pending = channel.send({ chatId: DM_GUID, text: "hi" }).then(() => null, (e: unknown) => e as Error);
+    await vi.advanceTimersByTimeAsync(31_000);
+    const err = await pending;
+    expect(err?.message).toMatch(/timed out/);
+    // May have been delivered: not nothing-sent, and never sent a third time.
+    expect(isNothingSent(err)).toBe(false);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(children.flatMap((c) => c.stdin.lines).map((l) => (JSON.parse(l) as RpcRequest).method).filter((m) => m === "send")).toHaveLength(2);
+    expect(mutationChildren()).toHaveLength(2);
+
+    await channel.stop();
+  });
+
+  it("does not restart or retry on an ambiguous failure (no response)", async () => {
+    vi.useFakeTimers();
+    const { channel, requests, mutationChildren } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        // Takes the send and never answers it.
+        if (req.method !== "send") child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const pending = channel.send({ chatId: DM_GUID, text: "hi" }).then(() => null, (e: unknown) => e as Error);
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect((await pending)?.message).toMatch(/timed out/);
+    expect(requests().filter((r) => r.method === "send")).toHaveLength(1);
+    expect(mutationChildren()).toHaveLength(1);
+    expect(mutationChildren()[0].killed).toBe(false);
+
+    await channel.stop();
+  });
+
+  it("waits for other in-flight requests before killing the mutation child, so their outcome stays known", async () => {
+    let held: { id: number; child: FakeChild } | null = null;
+    const { channel, children, mutationChildren } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        if (req.method === "send" && children.indexOf(child) === 1) {
+          if (req.params.text === "slow") { held = { id: req.id, child }; return; }
+          return child.respondError(req.id, -32004, "Mutation lane blocked");
+        }
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const slow = channel.send({ chatId: DM_GUID, text: "slow" });
+    await settle();
+    const blocked = channel.send({ chatId: DM_GUID, text: "blocked" });
+    await settle(20);
+    // The refused send is waiting; the old mutation child is still up for "slow".
+    expect(mutationChildren()).toHaveLength(1);
+    expect(mutationChildren()[0].killed).toBe(false);
+
+    held!.child.respond(held!.id, { ok: true });
+    await expect(slow).resolves.toBeUndefined();
+    await expect(blocked).resolves.toBeUndefined();
+    expect(mutationChildren()).toHaveLength(2);
+    expect(mutationChildren()[0].killed).toBe(true);
+
+    await channel.stop();
+  });
+
+  it("holds a request issued during the restart and sends it on the new mutation child", async () => {
+    let held: { id: number; child: FakeChild } | null = null;
+    const { channel, children, mutationChildren } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        if (req.method === "send" && children.indexOf(child) === 1) {
+          if (req.params.text === "slow") { held = { id: req.id, child }; return; }
+          return child.respondError(req.id, -32004, "Mutation lane blocked");
+        }
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const slow = channel.send({ chatId: DM_GUID, text: "slow" });
+    await settle();
+    const blocked = channel.send({ chatId: DM_GUID, text: "blocked" });
+    await settle(20);
+    // Issued while the restart waits for "slow": queued, not written to the old child.
+    const queued = channel.send({ chatId: DM_GUID, text: "queued" });
+    await settle(20);
+    const oldTexts = () => mutationChildren()[0].stdin.lines.map((l) => (JSON.parse(l) as RpcRequest).params.text);
+    expect(oldTexts()).toEqual(["slow", "blocked"]);
+
+    held!.child.respond(held!.id, { ok: true });
+    await expect(Promise.all([slow, blocked, queued])).resolves.toBeDefined();
+    expect(oldTexts()).toEqual(["slow", "blocked"]);
+    expect(mutationChildren()[1].stdin.lines.map((l) => (JSON.parse(l) as RpcRequest).params.text).sort()).toEqual(["blocked", "queued"]);
+
+    await channel.stop();
+  });
+
+  it("fails a request held during the restart as not sent when the channel stops first", async () => {
+    let held: { id: number; child: FakeChild } | null = null;
+    const { channel, children, mutationChildren } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        if (req.method === "send" && children.indexOf(child) === 1) {
+          if (req.params.text === "slow") { held = { id: req.id, child }; return; }
+          return child.respondError(req.id, -32004, "Mutation lane blocked");
+        }
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const slow = channel.send({ chatId: DM_GUID, text: "slow" }).catch((e: unknown) => e);
+    await settle();
+    const blocked = channel.send({ chatId: DM_GUID, text: "blocked" }).then(() => null, (e: unknown) => e as Error);
+    await settle(20);
+    const queued = channel.send({ chatId: DM_GUID, text: "queued" }).then(() => null, (e: unknown) => e as Error);
+    await settle(20);
+
+    await channel.stop(); // kills the old mutation child: "slow" is rejected, the restart finds the channel gone
+    void held;
+    await slow;
+    const queuedErr = await queued;
+    expect(queuedErr?.message).toMatch(/not sent/);
+    expect(isNothingSent(queuedErr)).toBe(true);
+    expect(isNothingSent(await blocked)).toBe(true);
+    expect(mutationChildren()).toHaveLength(1); // no new child after teardown
+    expect(children.flatMap((c) => c.stdin.lines).some((l) => l.includes('"queued"'))).toBe(false);
+  });
+
+  it("reports a send as not sent when the new mutation child fails to start", async () => {
+    const children: FakeChild[] = [];
+    const spawnFn = vi.fn(() => {
+      const child = new FakeChild();
+      const index = children.length;
+      children.push(child);
+      child.stdin.onLine = (req) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        if (index === 1 && req.method === "send") return child.respondError(req.id, -32004, "Mutation lane blocked");
+        child.respond(req.id, { ok: true });
+      };
+      if (index >= 2) {
+        // ENOENT-style spawn failure (the binary went away): no pid, 'error'
+        // before anything is answered.
+        child.stdin.onLine = null;
+        queueMicrotask(() => child.emit("error", Object.assign(new Error("spawn imsg ENOENT"), { code: "ENOENT" })));
+      }
+      return child;
+    });
+    const channel = new ImsgChannel({
+      cliPath: "imsg",
+      spawnFn: spawnFn as never,
+      probeCapabilities: async () => CAPS_FULL,
+      serviceLookup: NULL_SERVICE_LOOKUP,
+      attachmentLookup: NULL_ATTACHMENT_LOOKUP,
+    });
+    await channel.start();
+
+    const err = await channel.send({ chatId: DM_GUID, text: "hi" }).then(() => null, (e: unknown) => e as Error);
+    expect(err?.message).toMatch(/not sent/);
+    expect(isNothingSent(err)).toBe(true);
+    expect(children[0].killed).toBe(false);
+
+    await channel.stop();
+  });
+
+  it("holds a send issued during start() until the watch is subscribed", async () => {
+    let finishProbe!: () => void;
+    const probe = new Promise<ImsgCapabilities>((resolve) => { finishProbe = () => resolve(CAPS_FULL); });
+    const { channel, requests, mutationChildren } = makeChannel({ config: { probeCapabilities: () => probe } });
+
+    const started = channel.start();
+    const sent = channel.send({ chatId: DM_GUID, text: "early" });
+    await settle(20);
+    // Nothing goes out before the watch can see the reply.
+    expect(requests().some((r) => r.method === "send")).toBe(false);
+    expect(mutationChildren()).toHaveLength(0);
+
+    finishProbe();
+    await started;
+    await expect(sent).resolves.toBeUndefined();
+    const methods = requests().map((r) => r.method);
+    expect(methods.indexOf("watch.subscribe")).toBeLessThan(methods.indexOf("send"));
+
+    await channel.stop();
+  });
+
+  it("fails a send issued during a start() that fails as not sent", async () => {
+    const { channel, requests } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respondError(req.id, -32603, "Internal error", "Full Disk Access required");
+        child.respond(req.id, { ok: true });
+      },
+    });
+
+    const started = channel.start().catch((e: unknown) => e);
+    const err = await channel.send({ chatId: DM_GUID, text: "early" }).then(() => null, (e: unknown) => e as Error);
+    expect(await started).toBeInstanceOf(Error);
+    expect(err?.message).toMatch(/not sent/);
+    expect(isNothingSent(err)).toBe(true);
+    expect(requests().some((r) => r.method === "send")).toBe(false);
+
+    await channel.stop();
+  });
+
+  it("caps restarts within the window, then tells the owner once and stops restarting", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-21T10:00:00Z"));
+    const { channel, sends, mutationChildren, watchChildren } = laneChannel((i) => i >= 1, { laneRestartLimit: 3, laneRestartWindowMs: 10 * 60_000 });
+    const notices: ChannelFaultNotice[] = [];
+    channel.onOwnerNotice((notice) => { notices.push(notice); return Promise.resolve(true); });
+    await channel.start();
+
+    const fail = () => channel.send({ chatId: DM_GUID, text: "x" }).then(() => null, (e: unknown) => e as Error & { rpcCode?: number });
+    for (let i = 0; i < 3; i++) expect((await fail())?.rpcCode).toBe(-32004);
+    expect(mutationChildren()).toHaveLength(4);
+    expect(notices).toHaveLength(0);
+
+    // Fourth refusal inside the window: no restart, no retry, one notice.
+    const before = sends().length;
+    const err = await fail();
+    expect(err?.rpcCode).toBe(-32004);
+    expect(isNothingSent(err)).toBe(true);
+    expect(mutationChildren()).toHaveLength(4);
+    expect(sends().length).toBe(before + 1);
+    await settle();
+    expect(notices).toEqual([{ kind: "imsgLaneBlocked", restarts: 3, windowMs: 10 * 60_000 }]);
+
+    // Further refusals in the same window do not notify again.
+    await fail();
+    await settle();
+    expect(notices).toHaveLength(1);
+    expect(mutationChildren()).toHaveLength(4);
+
+    // Once the oldest restart leaves the window, restarting resumes.
+    vi.setSystemTime(new Date("2026-11-21T10:10:01Z"));
+    await fail();
+    expect(mutationChildren()).toHaveLength(5);
+    // The watch stream never restarted through any of it.
+    expect(watchChildren()).toHaveLength(1);
+
+    await channel.stop();
+  });
+});
 
 describe("imsg recent-message cache addressing", () => {
   it("resolves a bare DM handle to its chat-GUID ring, but never a group", async () => {
@@ -4653,7 +5001,7 @@ describe("imsg at-least-once persist ordering", () => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-stalegen-"));
     const cursorStorePath = join(dir, "cursor.json");
     try {
-      const { channel, children } = makeChannel({ config: { cursorStorePath, restartDelaysMs: [1_000] } });
+      const { channel, watchChildren } = makeChannel({ config: { cursorStorePath, restartDelaysMs: [1_000] } });
       await channel.start();
 
       const seen: string[] = [];
@@ -4670,33 +5018,33 @@ describe("imsg at-least-once persist ordering", () => {
       });
 
       // Old generation: row 500 arrives and hangs mid-dispatch.
-      children[0].notifyMessage(inboundMessage({ id: 500, guid: "row-500", text: "row 500" }));
+      watchChildren()[0].notifyMessage(inboundMessage({ id: 500, guid: "row-500", text: "row 500" }));
       await vi.waitFor(() => expect(gateReject).not.toBeNull());
 
       // The child restarts (generation bump). The new child replays 500 + 600
       // successfully, advancing the committed cursor to 600.
       allowReplay = true;
-      children[0].emit("exit", 1, null);
+      watchChildren()[0].emit("exit", 1, null);
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(children).toHaveLength(2);
-      children[1].notifyMessage(inboundMessage({ id: 500, guid: "row-500", text: "row 500" }));
-      children[1].notifyMessage(inboundMessage({ id: 600, guid: "row-600", text: "row 600" }));
+      expect(watchChildren()).toHaveLength(2);
+      watchChildren()[1].notifyMessage(inboundMessage({ id: 500, guid: "row-500", text: "row 500" }));
+      watchChildren()[1].notifyMessage(inboundMessage({ id: 600, guid: "row-600", text: "row 600" }));
       await vi.waitFor(() => {
         expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(600);
       });
 
       // NOW the OLD row 500 finally rejects. Because its generation is stale, it
       // must be a no-op: no floor, no kill, no cursor wedge.
-      const childCountBefore = children.length;
+      const childCountBefore = watchChildren().length;
       gateReject!(new Error("stale boom"));
       await settle();
 
       expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(600);
       expect((channel as unknown as { rpc: { failedRowId: number | null } }).rpc.failedRowId).toBeNull();
-      expect(children).toHaveLength(childCountBefore); // no extra restart from the stale failure
+      expect(watchChildren()).toHaveLength(childCountBefore); // no extra restart from the stale failure
 
       // The cursor keeps advancing — not wedged.
-      children[1].notifyMessage(inboundMessage({ id: 700, guid: "row-700", text: "row 700" }));
+      watchChildren()[1].notifyMessage(inboundMessage({ id: 700, guid: "row-700", text: "row 700" }));
       await vi.waitFor(() => {
         expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(700);
       });
@@ -4801,14 +5149,14 @@ describe("imsg stdin backpressure", () => {
     // Hold send responses: an immediate response would (correctly) release the
     // parked write via the response path, hiding the drain gate under test.
     const heldSends: Array<{ id: number }> = [];
-    const { channel, children } = makeChannel({
+    const { channel } = makeChannel({
       responder: (req, child) => {
         if (req.method === "send") { heldSends.push({ id: req.id }); return; }
         child.respond(req.id, req.method === "watch.subscribe" ? { subscription: 1 } : { ok: true });
       },
     });
     await channel.start();
-    const child = children[0];
+    const child = mutationChildOf(channel);
     const sentTexts = () => child.stdin.lines
       .map((l) => JSON.parse(l) as RpcRequest)
       .filter((r) => r.method === "send")
@@ -4860,14 +5208,14 @@ describe("imsg stdin backpressure", () => {
     vi.useFakeTimers();
     // Sends stay unanswered: a response to the first send would settle its
     // parked link and release the queued second write before the timeout.
-    const { channel, children } = makeChannel({
+    const { channel } = makeChannel({
       responder: (req, child) => {
         if (req.method === "send") return;
         child.respond(req.id, req.method === "watch.subscribe" ? { subscription: 1 } : { ok: true });
       },
     });
     await channel.start();
-    const child = children[0];
+    const child = mutationChildOf(channel);
     const sentTexts = () => child.stdin.lines
       .map((l) => JSON.parse(l) as RpcRequest)
       .filter((r) => r.method === "send")
@@ -4903,14 +5251,14 @@ describe("imsg stdin backpressure", () => {
     vi.useFakeTimers();
     // Answer only watch.subscribe/unsubscribe; sends stay pending so responses
     // can't resolve the parked link out from under the test.
-    const { channel, children } = makeChannel({
+    const { channel } = makeChannel({
       responder: (req, child) => {
         if (req.method === "send") return;
         child.respond(req.id, req.method === "watch.subscribe" ? { subscription: 1 } : { ok: true });
       },
     });
     await channel.start();
-    const child = children[0];
+    const child = mutationChildOf(channel);
     const sentTexts = () => child.stdin.lines
       .map((l) => JSON.parse(l) as RpcRequest)
       .filter((r) => r.method === "send")
@@ -4942,9 +5290,9 @@ describe("imsg stdin backpressure", () => {
     // defaultResponder answers every request — the response itself (proof the
     // child consumed the line) must settle the parked link, so the next write
     // goes out even though 'drain' never fires.
-    const { channel, children } = makeChannel();
+    const { channel } = makeChannel();
     await channel.start();
-    const child = children[0];
+    const child = mutationChildOf(channel);
     const sentTexts = () => child.stdin.lines
       .map((l) => JSON.parse(l) as RpcRequest)
       .filter((r) => r.method === "send")
@@ -4959,7 +5307,7 @@ describe("imsg stdin backpressure", () => {
     await channel.stop();
   });
 
-  it("restarts a live child that stops draining so the write chain recovers (round-4 #2b)", async () => {
+  it("replaces a live mutation child that stops draining so the write chain recovers (round-4 #2b)", async () => {
     vi.useFakeTimers();
     let subCount = 0;
     const { channel, children } = makeChannel({
@@ -4971,7 +5319,7 @@ describe("imsg stdin backpressure", () => {
       },
     });
     await channel.start();
-    const child0 = children[0];
+    const child0 = mutationChildOf(channel);
 
     // A send parks on 'drain', and the (alive) child never drains.
     child0.stdin.backpressureWrites = 1;
@@ -4985,13 +5333,13 @@ describe("imsg stdin backpressure", () => {
     expect(child0.killed).toBe(true);
     expect(await p).toBeInstanceOf(Error); // the stuck send is rejected on teardown
 
-    // Restart backoff → a fresh child subscribes; the write chain works again.
-    await vi.advanceTimersByTimeAsync(1_000);
-    expect(children).toHaveLength(2);
-    await vi.waitFor(() => {
-      const sub = children[1].stdin.lines.map((l) => JSON.parse(l) as RpcRequest).find((r) => r.method === "watch.subscribe");
-      expect(sub).toBeDefined();
-    });
+    // The watch child is untouched; the next send gets a fresh mutation child.
+    expect(children[0].killed).toBe(false);
+    void channel.send({ chatId: DM_GUID, text: "next" }).catch(() => {});
+    await settle();
+    expect(children).toHaveLength(3);
+    expect(children[2].stdin.lines.map((l) => (JSON.parse(l) as RpcRequest).params.text)).toEqual(["next"]);
+    void subCount;
     await channel.stop();
   });
 });
@@ -5044,11 +5392,11 @@ describe("imsg failed-subscribe child cleanup", () => {
     await channel.stop();
   });
 
-  it("rejects in-flight requests when a RESTART's subscribe fails (no hang) (round-2 #2)", async () => {
+  it("keeps sending through a watch restart whose subscribe fails (mutations have their own child)", async () => {
     vi.useFakeTimers();
     let failSubscribe = false;
     let releaseSubscribe: (() => void) | null = null;
-    const { channel, children } = makeChannel({
+    const { channel, children, watchChildren } = makeChannel({
       config: { restartDelaysMs: [1_000] },
       responder: (req, child) => {
         if (req.method === "watch.subscribe") {
@@ -5057,31 +5405,25 @@ describe("imsg failed-subscribe child cleanup", () => {
           releaseSubscribe = () => child.respondError(req.id, -32603, "err", "nope");
           return;
         }
-        // sends are never answered
+        child.respond(req.id, { ok: true });
       },
     });
     await channel.start();
 
-    // Crash the healthy child; the restart's subscribe will hang, then fail.
+    // Crash the healthy watch child; the restart's subscribe will hang, then fail.
     failSubscribe = true;
     children[0].emit("exit", 1, null);
-    await vi.advanceTimersByTimeAsync(1_000); // spawn child 1, subscribe held
-    expect(children).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(watchChildren()).toHaveLength(2);
 
-    // A request issued to the new child while subscribe is still in flight.
-    const sendP = channel.send({ chatId: DM_GUID, text: "during restart" });
-    let settled = false;
-    void sendP.then(() => { settled = true; }, () => { settled = true; });
-    await settle();
-    expect(settled).toBe(false); // pending while subscribe is in flight
+    // A send issued while the watch restart is in flight goes to the mutation
+    // child and is answered, whatever happens to the watch.
+    await expect(channel.send({ chatId: DM_GUID, text: "during restart" })).resolves.toBeUndefined();
 
-    // The subscribe now fails → the failed-subscribe path must reject the
-    // in-flight send rather than leaving it to hang until timeout.
     releaseSubscribe!();
     await settle();
-    expect(settled).toBe(true);
-    await expect(sendP).rejects.toThrow(/subscribe failed/);
-    expect(children[1].killed).toBe(true);
+    expect(watchChildren()[1].killed).toBe(true); // the failed subscribe's child is not leaked
+    await expect(channel.send({ chatId: DM_GUID, text: "after" })).resolves.toBeUndefined();
     await channel.stop();
   });
 });

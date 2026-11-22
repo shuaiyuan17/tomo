@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename } from "node:path";
-import type { AdmissionPredicate, Channel, IncomingMessage, OutgoingMessage, SendResult, MessageHandler, CommandHandler, MessageReaction, RecentChatMessage, StopTyping } from "./types.js";
+import type { AdmissionPredicate, Channel, OwnerNotify, IncomingMessage, OutgoingMessage, SendResult, MessageHandler, CommandHandler, MessageReaction, RecentChatMessage, StopTyping } from "./types.js";
 import { AttachmentUnreadableError, PartialSendError, markNothingSent, markPartsSent } from "./types.js";
 import { formatFileMarker } from "./fileStore.js";
 import { log } from "../logger.js";
@@ -114,6 +114,7 @@ export class ImsgChannel implements Channel {
     // Loads the persisted watch cursor (last, as before the split).
     this.rpc = new ImsgRpcClient(config, {
       onWatchMessage: (data, generation) => this.handleWatchMessage(data, generation),
+      onLaneRestartsExhausted: ({ restarts, windowMs }) => this.reportLaneRestartsExhausted(restarts, windowMs),
     });
   }
 
@@ -136,6 +137,28 @@ export class ImsgChannel implements Channel {
 
   onAdmission(predicate: AdmissionPredicate): void {
     this.admissionPredicate = predicate;
+  }
+
+  /** Set by the Agent (onOwnerNotice). Absent = the fault is only logged. */
+  private ownerNotify: OwnerNotify | undefined;
+
+  onOwnerNotice(notify: OwnerNotify): void {
+    this.ownerNotify = notify;
+  }
+
+  /**
+   * The -32004 restarts ran out: tell the owner. If the owner's DM is on
+   * this same channel the notice may itself be refused; that is logged, and
+   * the failed reply is still reported through the delivery path.
+   */
+  private reportLaneRestartsExhausted(restarts: number, windowMs: number): void {
+    const notify = this.ownerNotify;
+    if (!notify) return;
+    void notify({ kind: "imsgLaneBlocked", restarts, windowMs }).then((delivered) => {
+      if (!delivered) log.warn("imsg lane-blocked owner notice was not delivered");
+    }, (err: unknown) => {
+      log.warn({ err }, "imsg lane-blocked owner notice failed");
+    });
   }
 
   /** Fails CLOSED: a predicate that throws leaves admission unknown, and an

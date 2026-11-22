@@ -32,7 +32,7 @@ Needs a bot token from [@BotFather](https://t.me/BotFather).
 
 ## iMessage
 
-Uses the local [imsg CLI](https://github.com/openclaw/imsg) on a Mac signed in to iMessage, enabled with `channels.imessage.provider: "imsg"`. No external server: Tomo spawns one `imsg rpc` child, so the Tomo process needs **Full Disk Access** (advanced features additionally need `imsg launch`).
+Uses the local [imsg CLI](https://github.com/openclaw/imsg) on a Mac signed in to iMessage, enabled with `channels.imessage.provider: "imsg"`. No external server: Tomo spawns two `imsg rpc` children, one for the inbound watch stream and one for sends and other mutations (so a blocked mutation lane, `-32004`, is cleared by restarting only the second), and the Tomo process needs **Full Disk Access** (advanced features additionally need `imsg launch`).
 
 - DM and group chat support, with image attachments
 - Contact name resolution from Mac contacts

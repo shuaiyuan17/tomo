@@ -336,6 +336,18 @@ export type CommandHandler = (command: string, chatId: string, senderName: strin
  */
 export type AdmissionPredicate = (chatId: string) => boolean;
 
+/**
+ * A fault in a channel that only the owner can act on. Structured rather than
+ * text: the Agent words it in the owner's language (ownerT), which keeps this
+ * module free of the i18n module the web build must not pull in.
+ */
+export type ChannelFaultNotice =
+  /** imsg kept refusing with -32004 and its restarts for the window ran out. */
+  | { kind: "imsgLaneBlocked"; restarts: number; windowMs: number };
+
+/** The owner-notice path a channel is handed; resolves false when nothing was delivered. */
+export type OwnerNotify = (notice: ChannelFaultNotice) => Promise<boolean>;
+
 export interface Channel {
   /** Channel identifier (e.g. "telegram", "imessage") */
   readonly name: string;
@@ -374,6 +386,14 @@ export interface Channel {
    * agent-side allowlist check.
    */
   onAdmission?(predicate: AdmissionPredicate): void;
+
+  /**
+   * Register how this channel tells the owner about a fault in the channel
+   * itself, one it cannot fix on its own (imsg: the -32004 lane restarts ran
+   * out). The Agent registers its owner-notice path; resolving false means
+   * nothing was delivered. Optional on both sides.
+   */
+  onOwnerNotice?(notify: OwnerNotify): void;
 
   /**
    * Send a message through this channel.

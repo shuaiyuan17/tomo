@@ -488,6 +488,11 @@ describe("compactSession", () => {
       const records = archived().filter((l) => l._superseded);
       expect(records).toHaveLength(1);
       expect(records[0]).toMatchObject({ blockTag: "daily 2026-05-04", supersededUuid: oldDaily.uuid, summary: oldDaily.message.content });
+      // The first attempt's summary uuid was never published; no record may name it.
+      const published = new Set(readFileSync(path, "utf-8").trim().split("\n").map((l) => JSON.parse(l).uuid));
+      for (const value of Object.values(records[0])) {
+        if (typeof value === "string" && /^[0-9a-f-]{36}$/.test(value)) expect(value === oldDaily.uuid || published.has(value)).toBe(true);
+      }
     });
 
     it("blocks consumed under a different tag are not superseded", () => {

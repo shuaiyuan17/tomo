@@ -3,7 +3,7 @@ import {
   openSync, fstatSync, readSync, closeSync, readdirSync, statSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { writeFileAtomicSync, isEnoent } from "../fs-utils.js";
 import { log } from "../logger.js";
@@ -673,19 +673,24 @@ function commitRewrite(
 /**
  * One archive line recording a summary block that a rebuild replaced. The
  * removed block is archived as an ordinary `_archived` event too; this record
- * is what marks it as superseded (by which block, when) and carries its text
- * in plain form, so a worse rerun can be undone by hand.
+ * is what marks it as superseded (which block, when) and carries its text in
+ * plain form, so a worse rerun can be undone by hand.
+ *
+ * It names no replacement block: it is written before the rename publishes,
+ * and a publish that fails leaves the record behind while the retry builds a
+ * new summary uuid — a pointer to the replacement would name a block that was
+ * never published.
  *
  * Deliberately has no `type` / `uuid`: the archive search only reads
  * user/assistant events (the `_archived` copy already covers that), and the
- * archive dedupe keys on `uuid` — the superseded uuid is `supersededUuid`.
+ * archive dedupe keys on `uuid`. Superseded records dedupe on
+ * (`supersededUuid`, hash of `summary`) instead.
  */
 interface SupersededRecord {
   _superseded: true;
   _archivedAt: string;
   blockTag: string;
   supersededUuid?: string;
-  supersededBy: string;
   supersededTimestamp?: string;
   summary: string;
   length: number;
@@ -706,7 +711,6 @@ function supersededRecords(req: CompactRequest, prepared: PreparedRewrite): Supe
       _archivedAt: new Date().toISOString(),
       blockTag: req.blockTag,
       ...(event.uuid ? { supersededUuid: event.uuid } : {}),
-      supersededBy: prepared.summaryUuid,
       ...(event.timestamp ? { supersededTimestamp: event.timestamp } : {}),
       summary,
       length: summary.length,
@@ -1015,10 +1019,12 @@ function archivedUuidsInTail(transcriptPath: string): Set<string> {
     for (const line of lines.slice(-ARCHIVE_DEDUPE_TAIL_LINES)) {
       if (!line) continue;
       try {
-        const parsed = JSON.parse(line) as { uuid?: unknown; _superseded?: unknown; supersededUuid?: unknown };
+        const parsed = JSON.parse(line) as {
+          uuid?: unknown; _superseded?: unknown; supersededUuid?: unknown; summary?: unknown;
+        };
         if (typeof parsed?.uuid === "string") uuids.add(parsed.uuid);
-        if (parsed?._superseded === true && typeof parsed.supersededUuid === "string") {
-          uuids.add(supersededKey(parsed.supersededUuid));
+        if (parsed?._superseded === true && typeof parsed.summary === "string") {
+          uuids.add(supersededKey(typeof parsed.supersededUuid === "string" ? parsed.supersededUuid : undefined, parsed.summary));
         }
       } catch { /* a line we cannot read is a line we cannot dedupe on */ }
     }
@@ -1030,9 +1036,14 @@ function archivedUuidsInTail(transcriptPath: string): Set<string> {
   return uuids;
 }
 
-/** Dedupe key for a superseded record, kept apart from plain event uuids. */
-function supersededKey(uuid: string): string {
-  return `superseded:${uuid}`;
+/**
+ * Dedupe key for a superseded record: the replaced block's uuid plus a hash of
+ * its text, kept apart from plain event uuids. A retried rerun replaces the
+ * same block with the same text, so it maps to the same key.
+ */
+function supersededKey(uuid: string | undefined, summary: string): string {
+  const hash = createHash("sha256").update(summary).digest("hex");
+  return `superseded:${uuid ?? ""}:${hash}`;
 }
 
 /**
@@ -1075,7 +1086,7 @@ function archiveEvents(
   // Superseded-block records, deduped the same way so a retried rerun does
   // not record the same replaced block twice. Same append as the events.
   for (const record of superseded) {
-    if (record.supersededUuid && alreadyArchived.has(supersededKey(record.supersededUuid))) { skipped++; continue; }
+    if (alreadyArchived.has(supersededKey(record.supersededUuid, record.summary))) { skipped++; continue; }
     archiveLines.push(JSON.stringify(record));
   }
 

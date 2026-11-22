@@ -10,6 +10,7 @@ import { log } from "../logger.js";
 import type { TranscriptEvent } from "../sessions/transcript-event.js";
 import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord, type RawJsonlLine } from "../jsonl.js";
 import { errorMessage } from "../error-text.js";
+import { removedLoaderIds } from "./loader-ids.js";
 
 /** Path to the compact trigger file for a given session */
 export function getCompactTriggerPath(sdkSessionId: string, sdkSessionsDir: string): string {
@@ -132,8 +133,12 @@ export interface StagedRewrite {
   output: string;
   /** uuid of the summary event the rewrite inserts. */
   summaryUuid: string;
-  /** uuids of every event the rewrite removes (including a rebuilt block). */
-  removedUuids: ReadonlySet<string>;
+  /**
+   * Loader-visible ids (see `loaderVisibleId`) of every event the rewrite
+   * removes, including a rebuilt block: what the SDK's loader will no longer
+   * show. Not the same as the file uuids used for parentUuid re-pointing.
+   */
+  removedLoaderIds: ReadonlySet<string>;
 }
 
 /**
@@ -154,10 +159,11 @@ export async function compactSessionGated(
   try {
     const prepared = prepareRewrite(req, sourceFd);
     if ("success" in prepared) return prepared;
+    const removedIds = removedLoaderIds(prepared.allEvents, (i) => prepared.removeSet.has(i));
     const refusal = await gate({
       output: prepared.newEvents.map(serializeJsonlRecord).join("\n") + "\n",
       summaryUuid: prepared.summaryUuid,
-      removedUuids: prepared.removedUuids,
+      removedLoaderIds: removedIds,
     });
     const refused = (error: string): CompactResult =>
       ({ success: false, eventsRemoved: 0, eventsAfter: prepared.allEvents.length, error });
@@ -173,7 +179,7 @@ export async function compactSessionGated(
       const second = await gate({
         output: prepared.newEvents.map(serializeJsonlRecord).join("\n") + "\n",
         summaryUuid: prepared.summaryUuid,
-        removedUuids: prepared.removedUuids,
+        removedLoaderIds: removedIds,
       });
       if (second !== undefined) return refused(second);
     }

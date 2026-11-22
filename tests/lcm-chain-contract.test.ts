@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
 import { checkRewrittenChain, compactSessionChecked } from "../src/lcm/chain-check.js";
 import { compactSession, getCompactTriggerPath, type CompactRequest } from "../src/lcm/compact.js";
+import { removedLoaderIds } from "../src/lcm/loader-ids.js";
 import { getSdkSessionPath } from "../src/sessions/index.js";
 import { isRawJsonlLine } from "../src/jsonl.js";
 import { sdkSessionsDirForWorkspace } from "../src/runtime-paths.js";
@@ -62,6 +63,8 @@ interface Fixture {
   oldBlockUuid: string;
   day1Uuids: string[];
   tailUuids: string[];
+  /** File uuid of the day-1 queued_command attachment (with `queuedCommandInDay1`). */
+  queuedFileUuid?: string;
 }
 
 /**
@@ -70,7 +73,7 @@ interface Fixture {
  * SDK's bookkeeping records (attachment, queue-operation, last-prompt)
  * between the messages, then the next day's fresh tail.
  */
-function buildFixture(sessionId = randomUUID(), cwd = "/workspace"): Fixture {
+function buildFixture(sessionId = randomUUID(), cwd = "/workspace", opts: { queuedCommandInDay1?: boolean } = {}): Fixture {
   const lines: string[] = [];
   let parent: string | null = null;
   let n = 0;
@@ -96,6 +99,21 @@ function buildFixture(sessionId = randomUUID(), cwd = "/workspace"): Fixture {
     push({ parentUuid: parent, ...envelope, type: "attachment", attachment: { type: "date", date: at(day, 0).slice(0, 10) }, uuid, timestamp: at(day, ++n) });
     parent = uuid;
   };
+  // A message typed while a turn was running: the SDK records it as a
+  // queued_command attachment, and its loader turns that into a user message
+  // whose uuid is the attachment's source_uuid, not the event's own uuid.
+  let queuedFileUuid: string | undefined;
+  const queuedCommand = (day: number, prompt: string) => {
+    const uuid = randomUUID();
+    const sourceUuid = randomUUID();
+    push({
+      parentUuid: parent, ...envelope, type: "attachment", uuid, timestamp: at(day, ++n),
+      attachment: { type: "queued_command", prompt, source_uuid: sourceUuid, commandMode: "prompt" },
+    });
+    parent = uuid;
+    queuedFileUuid = uuid;
+    return sourceUuid;
+  };
 
   const oldBlockUuid = msg("user", 18, "[daily 2026-11-18 — 12 events summarized]\n\nEarlier day.", { isCompactSummary: true, blockTag: "daily 2026-11-18" });
 
@@ -105,6 +123,8 @@ function buildFixture(sessionId = randomUUID(), cwd = "/workspace"): Fixture {
   day1.push(msg("assistant", 19, [{ type: "thinking", thinking: "Read them first.", signature: "sig" }, { type: "tool_use", id: "toolu_01", name: "Read", input: { file_path: "/repo/CHANGELOG.md" } }]));
   day1.push(msg("user", 19, [{ type: "tool_result", tool_use_id: "toolu_01", content: "## 0.14.0" }], { toolUseResult: { type: "text" } }));
   push({ type: "queue-operation", operation: "enqueue", timestamp: at(19, ++n), sessionId });
+  // Delivered mid-turn, answered by the reply that follows: the loader shows it.
+  if (opts.queuedCommandInDay1) day1.push(queuedCommand(19, "Also check the migration guide."));
   day1.push(msg("assistant", 19, [{ type: "text", text: "0.14.0 is the latest." }]));
   day1.push(msg("user", 19, "Thanks."));
   day1.push(msg("assistant", 19, [{ type: "text", text: "Any time." }]));
@@ -121,7 +141,7 @@ function buildFixture(sessionId = randomUUID(), cwd = "/workspace"): Fixture {
   const toIdx = convUuids.indexOf(day1[day1.length - 1]);
   return {
     sessionId, text: lines.join("\n") + "\n", fromIdx, toIdx,
-    firstUuid: day1[0], lastUuid: day1[day1.length - 1], oldBlockUuid, day1Uuids: day1, tailUuids: tail,
+    firstUuid: day1[0], lastUuid: day1[day1.length - 1], oldBlockUuid, day1Uuids: day1, tailUuids: tail, queuedFileUuid,
   };
 }
 
@@ -389,6 +409,42 @@ describe("LCM rewrite, checked by the SDK's own loader before it is published", 
     expectUntouched(f, path);
   });
 
+  it("a queued_command inside the range: the loader's id for it is its source_uuid, and the rollup passes", async () => {
+    const f = buildFixture(undefined, undefined, { queuedCommandInDay1: true });
+    const path = writeFixture(f);
+    // The loader shows the attachment as a user message under its source_uuid.
+    const sourceUuid = f.day1Uuids[3];
+    expect(sourceUuid).not.toBe(f.queuedFileUuid);
+    expect(await chain(f.sessionId)).toEqual([f.oldBlockUuid, ...f.day1Uuids, ...f.tailUuids]);
+
+    const result = await compactSessionChecked(request(f), { workspaceDir: workspace });
+
+    expect(result).toMatchObject({ success: true });
+    expect(await chain(f.sessionId)).toEqual([f.oldBlockUuid, summaryUuidIn(path), ...f.tailUuids]);
+    expect(readFileSync(path, "utf8")).not.toContain(sourceUuid);
+  });
+
+  it("a removed queued_command that stays on the chain is refused", async () => {
+    const f = buildFixture(undefined, undefined, { queuedCommandInDay1: true });
+    const path = writeFixture(f);
+    const original = f.text.split("\n").filter(Boolean).map((l) => JSON.parse(l)).find((e) => e.uuid === f.queuedFileUuid);
+    // Broken removal: the attachment survives, moved into the fresh tail where
+    // a reply follows it, so the loader still shows it (under its source_uuid).
+    const result = await compactSessionChecked(request(f, {
+      corruptRewriteForTest: (events) => {
+        const at = events.findIndex((e) => !isRawJsonlLine(e) && e.uuid === f.tailUuids[0]);
+        const next = events.find((e) => !isRawJsonlLine(e) && e.uuid === f.tailUuids[1]);
+        if (at < 0 || !next || isRawJsonlLine(next)) throw new Error("fixture: no tail");
+        next.parentUuid = original.uuid;
+        events.splice(at + 1, 0, { ...original, parentUuid: f.tailUuids[0] });
+      },
+    }), { workspaceDir: workspace });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/1 removed event\(s\) still on the chain/);
+    expectUntouched(f, path);
+  });
+
   it("refuses a range that is not on the current chain", async () => {
     // Day 1 becomes a dead branch: the next day's first message hangs off the older block.
     const f = buildFixture();
@@ -411,7 +467,7 @@ describe("LCM rewrite, checked by the SDK's own loader before it is published", 
 describe("checkRewrittenChain", () => {
   const removed = new Set(["r1", "r2"]);
   const check = (after: string[], before = ["h1", "r1", "r2", "t1", "t2"]) =>
-    checkRewrittenChain({ before, after, summaryUuid: "S", removedUuids: removed });
+    checkRewrittenChain({ before, after, summaryUuid: "S", removedIds: removed });
 
   it("accepts the collapsed chain, with appends at the end", () => {
     expect(check(["h1", "S", "t1", "t2"]).ok).toBe(true);
@@ -432,5 +488,21 @@ describe("checkRewrittenChain", () => {
     expect(verdict.problems).toEqual(expect.arrayContaining([
       "the selected range is not on the current chain", "summary block is not on the loaded chain",
     ]));
+  });
+});
+
+describe("removedLoaderIds", () => {
+  const queued = (uuid: string, source_uuid?: string) =>
+    ({ type: "attachment", uuid, attachment: { type: "queued_command", prompt: "p", ...(source_uuid === undefined ? {} : { source_uuid }) } });
+
+  it("maps a queued_command to its source_uuid and everything else to its uuid", () => {
+    const events = [{ type: "user", uuid: "u1" }, queued("a1", "src1"), queued("a2", ""), { type: "attachment", uuid: "a3", attachment: { type: "date" } }];
+    expect([...removedLoaderIds(events, () => true)].sort()).toEqual(["a2", "a3", "src1", "u1"]);
+  });
+
+  it("counts an id as removed only when every file event shown under it is removed", () => {
+    const events = [{ type: "user", uuid: "u1" }, queued("a1", "u1")];
+    expect(removedLoaderIds(events, (i) => i === 1).has("u1")).toBe(false);
+    expect(removedLoaderIds(events, () => true).has("u1")).toBe(true);
   });
 });

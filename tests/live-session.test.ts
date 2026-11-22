@@ -183,7 +183,8 @@ describe("LiveSession tool-result observation", () => {
     harness.pushEvent(toolResultEvent("tool-1", "scheduled"));
 
     await waitFor(() => onToolResult.mock.calls.length === 1);
-    expect(onToolResult).toHaveBeenCalledWith("Bash", "scheduled", false);
+    // No turn is running here, so there is no reply context to hand over.
+    expect(onToolResult).toHaveBeenCalledWith("Bash", "scheduled", false, undefined);
     session.close();
   });
 });

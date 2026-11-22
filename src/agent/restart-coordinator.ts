@@ -8,6 +8,7 @@ import {
   type RestartRequest,
   type RestartRequestDiscard,
 } from "../restart-request.js";
+import type { ReplyContext } from "./live-session.js";
 
 export interface RestartCoordinatorDeps {
   /** True once `Agent.stop()` has begun: a stop outranks any restart. */
@@ -51,12 +52,20 @@ export class RestartCoordinator {
    * `BashOutput` is accepted alongside `Bash`: a backgrounded
    * `tomo restart &`-style invocation returns its marker through the
    * background-output tool, not the original call.
+   *
+   * `turn` is the reply context of the turn the result arrived in. When this
+   * result launches the restart, that turn is flagged as its initiator: the
+   * shutdown about to cut it short is its own doing, so it ends as completed
+   * rather than interrupted (see ReplyContext.initiatedRestart). Without a
+   * turn (a background result arriving between turns) nothing is flagged and
+   * any turn the restart cuts short is reported as before.
    */
   handleToolResult(
     sessionKey: string,
     toolName: string,
     content: unknown,
     isError: boolean,
+    turn?: Pick<ReplyContext, "initiatedRestart">,
   ): void {
     if ((toolName !== "Bash" && toolName !== "BashOutput") || isError) return;
     if (this.stopping) {
@@ -89,6 +98,7 @@ export class RestartCoordinator {
       return;
     }
     this.restartInFlight = true;
+    if (turn) turn.initiatedRestart = true;
     this.launchAcknowledgedRestart(request);
   }
 

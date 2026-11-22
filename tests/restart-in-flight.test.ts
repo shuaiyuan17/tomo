@@ -62,7 +62,7 @@ afterAll(() => {
 /** The two restart entry points are private; this is the seam under test. */
 interface RestartHandlers {
   handleTurnComplete(key: string): void;
-  handleToolResult(key: string, toolName: string, content: unknown, isError: boolean): void;
+  handleToolResult(key: string, toolName: string, content: unknown, isError: boolean, turn?: { initiatedRestart?: boolean }): void;
   stop(): Promise<void>;
 }
 
@@ -169,6 +169,23 @@ describe("a previous daemon's requests never reach a turn end", () => {
     const agent = makeAgent();
     agent.handleTurnComplete("dm:shuai");
     expect(hoisted.spawnCalls).toHaveLength(1);
+  });
+});
+
+describe("the turn that launched the restart is flagged as its initiator", () => {
+  it("flags only the turn whose marker launched the restart", () => {
+    const agent = makeAgent();
+    const own = {} as { initiatedRestart?: boolean };
+    agent.handleToolResult("dm:owner", "Bash", formatRestartRequestResult(file("dm:owner", "deploy")), false, own);
+    expect(hoisted.spawnCalls).toHaveLength(1);
+    expect(own.initiatedRestart).toBe(true);
+
+    // A second session's marker while that restart is in flight launches
+    // nothing, so its turn did not cause the shutdown and stays unflagged.
+    const other = {} as { initiatedRestart?: boolean };
+    agent.handleToolResult("telegram:9", "Bash", formatRestartRequestResult(file("telegram:9", "late")), false, other);
+    expect(hoisted.spawnCalls).toHaveLength(1);
+    expect(other.initiatedRestart).toBeUndefined();
   });
 });
 

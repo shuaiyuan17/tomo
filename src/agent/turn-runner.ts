@@ -573,7 +573,19 @@ export class TurnRunner {
         } } : {}),
         onPromptHandedOff: () => { spec.promptTaken = true; spec.onPromptHandedOff?.(); },
         flushOnShutdown: sink.flushBlockTranscript,
-        onShutdownInterrupted: () => { spec.shutdownInterrupted = true; spec.onShutdown?.("interrupted"); },
+        onShutdownInterrupted: () => {
+          // A turn cut short by the restart it asked for itself (it ran
+          // `tomo restart`) is not interrupted: the cut was its own last act.
+          // It ends as a completed turn, so its inbox record is done, its
+          // notes are settled and a cron run is recorded, with nothing to
+          // report after the restart. Any other turn is interrupted as before.
+          if (spec.replyContext?.initiatedRestart) {
+            log.info({ key: spec.key, source: spec.source }, "turn ended by the restart it requested; treated as completed");
+            return;
+          }
+          spec.shutdownInterrupted = true;
+          spec.onShutdown?.("interrupted");
+        },
         ...(reply
           ? {
             images: reply.images,

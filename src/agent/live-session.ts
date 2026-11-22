@@ -84,7 +84,15 @@ export interface ReplyContext { turnId: string; channel: string; requestId?: str
    * request's own context, never on the session: completion bookkeeping can
    * close and replace the session (a compact reload) before the caller looks.
    */
-  stopped?: boolean }
+  stopped?: boolean;
+  /**
+   * Set when THIS turn ran `tomo restart` and the restart it asked for was
+   * launched (RestartCoordinator). The shutdown that restart brings cuts the
+   * turn short by the turn's own request, so it ends as a completed turn, not
+   * an interrupted one: no durable-inbox `interrupted` note, no interrupted
+   * cron run. Rides on the request's context for the same reason as `stopped`.
+   */
+  initiatedRestart?: boolean }
 /** How owner web input joins a running turn (see LiveSession.steer). */
 export interface SteerJoin {
   replyContext?: ReplyContext;
@@ -201,7 +209,8 @@ export interface LiveSessionSettings {
   onMcpAuthError?: (serverName: string) => Promise<McpAuthRefreshOutcome> | McpAuthRefreshOutcome;
   /** Clock for the MCP auth-refresh rate window. Injected by tests. */
   now?: () => number;
-  onToolResult?: (toolName: string, content: unknown, isError: boolean) => void;
+  /** `turn`: the reply context of the turn the result arrived in, when one is running. */
+  onToolResult?: (toolName: string, content: unknown, isError: boolean, turn?: ReplyContext) => void;
   /**
    * Set when this session RESUMES an existing SDK session: its id and the
    * usage baseline persisted for it, if any. The SDK's first result on a
@@ -1348,7 +1357,7 @@ export class LiveSession {
           ...(startedAt !== undefined ? { durationMs: Date.now() - startedAt } : {}),
           ...(agent ? { agent } : {}),
         });
-        this.onToolResult?.(name ?? "?", tr.content, tr.is_error === true);
+        this.onToolResult?.(name ?? "?", tr.content, tr.is_error === true, this.currentRequest?.replyContext);
       }
     }
   }

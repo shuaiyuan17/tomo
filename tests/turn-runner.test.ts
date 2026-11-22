@@ -683,6 +683,34 @@ describe("TurnRunner: notes taken by a turn that did not finish", () => {
     expect(calls).toEqual(["interrupted"]);
   });
 
+  it("settles them when the shutdown came from a restart this turn asked for", async () => {
+    // The turn ran `tomo restart` itself (RestartCoordinator flags its reply
+    // context); the restart that then cuts it short is its own doing, so it
+    // ends as a completed turn: no interrupted outcome, notes consumed.
+    const shutdowns: string[] = [];
+    const { h, calls } = harness(async (req) => {
+      req.onPromptHandedOff?.();
+      req.replyContext!.initiatedRestart = true;
+      req.onShutdownInterrupted?.();
+      return "NO_REPLY";
+    });
+    await h.runner.runTurn(replySpec(h, { onShutdown: (kind) => { shutdowns.push(kind); } }));
+    expect(calls).toEqual(["settle"]);
+    expect(shutdowns).toEqual([]);
+  });
+
+  it("still reports the cut as interrupted for a turn that did not ask for the restart", async () => {
+    const shutdowns: string[] = [];
+    const { h, calls } = harness(async (req) => {
+      req.onPromptHandedOff?.();
+      req.onShutdownInterrupted?.();
+      return "NO_REPLY";
+    });
+    await h.runner.runTurn(replySpec(h, { onShutdown: (kind) => { shutdowns.push(kind); } }));
+    expect(calls).toEqual(["interrupted"]);
+    expect(shutdowns).toEqual(["interrupted"]);
+  });
+
   it("keeps them (marked) when the turn failed after taking them", async () => {
     const { h, calls } = harness(async (req) => { req.onPromptHandedOff?.(); throw new Error("aborted"); });
     await h.runner.runTurn(replySpec(h));

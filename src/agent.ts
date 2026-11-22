@@ -37,7 +37,7 @@ import { createTomoInternalMcpServer } from "./mcp/internal-server.js";
 import { McpOAuthManager, TOKEN_REFRESH_SWEEP_INTERVAL_MS } from "./mcp/oauth.js";
 import { log } from "./logger.js";
 import { shortErrorMessage } from "./error-text.js";
-import { SteerDeclinedError, TurnInterruptedError, type QueryResult, type TurnRequest } from "./agent/live-session.js";
+import { SteerDeclinedError, TurnInterruptedError, type QueryResult, type ReplyContext, type TurnRequest } from "./agent/live-session.js";
 import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote, TurnAudienceRegistry, type TurnOrigin } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
@@ -394,8 +394,8 @@ export class Agent {
       noteSandboxedCall: (key, text) => this.permissionBroker.noteCall(key, text),
       handleMcpElicitation: (key, request) => this.mcpAuthPrompts.handleMcpElicitation(key, request),
       createUnownedTurnRequest: (key) => this.createUnownedTurnRequest(key),
-      handleToolResult: (key, toolName, content, isError) => {
-        this.handleToolResult(key, toolName, content, isError);
+      handleToolResult: (key, toolName, content, isError, turn) => {
+        this.handleToolResult(key, toolName, content, isError, turn);
       },
       handleTurnComplete: (key) => {
         this.handleTurnComplete(key);
@@ -2453,8 +2453,9 @@ export class Agent {
     toolName: string,
     content: unknown,
     isError: boolean,
+    turn?: ReplyContext,
   ): void {
-    this.restarts.handleToolResult(sessionKey, toolName, content, isError);
+    this.restarts.handleToolResult(sessionKey, toolName, content, isError, turn);
   }
 
   /** End-of-turn restart fallback — see RestartCoordinator. */

@@ -22,7 +22,7 @@ import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage, UsageBaseline } from "../sessions/types.js";
 import type { UsageLedgerRow } from "../usage/ledger.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
-import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, TurnInterruptedError, type McpAuthRefreshOutcome, type QueryResult, type TurnRequest } from "./live-session.js";
+import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, TurnInterruptedError, type McpAuthRefreshOutcome, type QueryResult, type ReplyContext, type TurnRequest } from "./live-session.js";
 import { SteerDeclinedError } from "./sdk-result.js";
 import type { GroupSandboxConfig } from "./group-fs-policy.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
@@ -190,7 +190,7 @@ export interface LiveSessionManagerDeps {
   /** Delivery plumbing for SDK-initiated (unowned) turns. */
   createUnownedTurnRequest(key: string): TurnRequest | undefined;
   /** Observe persisted SDK tool-result events for daemon control handshakes. */
-  handleToolResult?(key: string, toolName: string, content: unknown, isError: boolean): void;
+  handleToolResult?(key: string, toolName: string, content: unknown, isError: boolean, turn?: ReplyContext): void;
   /** A turn on this session just finished (successfully or with an SDK error). */
   handleTurnComplete?(key: string): void;
   /** Post-turn context-pressure check (Agent.maybeNudgeCompact). */
@@ -823,8 +823,8 @@ export class LiveSessionManager {
         if (session) this.observeMcpStatus(key, session, connections, "init");
       },
       onInformational: (message) => this.informationalNotices.observe(key, message),
-      onToolResult: (toolName, content, isError) => {
-        this.deps.handleToolResult?.(key, toolName, content, isError);
+      onToolResult: (toolName, content, isError, turn) => {
+        this.deps.handleToolResult?.(key, toolName, content, isError, turn);
       },
       ...(resumeId ? { resumeFrom: { sdkSessionId: resumeId, baseline: resumeBaseline } } : {}),
       ...(this.deps.recordUsage

@@ -105,11 +105,26 @@ Under `characters`:
 
   Every spot a pet rule names must exist; `home_check` says so if one does not, and warns about a mood the pet never has.
 
-Tomo and the pet can also have `walk` and `wander`:
+- `others`: more characters, by name, at most {{home:max-others}}: a dog, a second cat. `{ "<name>": { "kind": "<kind>", "spot": "<spot>", "rules": [...] } }`, each exactly like the pet (rules first, then `wander`, then its own `spot`; it may wander while you work), except that it is always drawn and its size for getting past furniture is yours unless its `walk` says otherwise. Give a big one a larger `walk.radius`.
+
+  **Example: a dog that lies on its rug at night and roams by day, and closes its eyes only while it stands still.**
+
+  ```json
+  "kinds": { "dog": { "parts": [
+    { "shape": "sphere", "size": [0.5, 0.35, 0.9], "color": "#d9a35b" },
+    { "shape": "box", "size": [0.3, 0.04, 0.02], "at": [0, 0.3, 0.45], "color": "#1d1b19",
+      "reactions": [{ "when": "not:walking", "do": "show" }] }
+  ] } },
+  "spots": { "dog-rug": { "at": [1.5, 0, 1.5] }, "door": { "at": [-1.5, 0, 1.8] }, "middle": { "at": [0, 0, 0.5] } },
+  "characters": { "others": { "dog": { "kind": "dog", "spot": "dog-rug", "rules": [{ "when": "night", "spot": "dog-rug" }],
+    "walk": { "speed": 1.1, "radius": 0.35 }, "wander": { "spots": ["dog-rug", "door", "middle"], "every": [20, 60] } } } }
+  ```
+
+Tomo, the pet and the others can also have `walk` and `wander`:
 
 {{home:walk-wander}}
 
-With `wander`, when no rule holds it strolls between its wander spots instead of standing at its `spot`: it stays a while at one, then walks to another picked at random (never the one it is at, never one where someone else is or is going, never one it cannot walk to from there). You wander only while idle; the pet may wander while you work. The moment a rule holds, it stops and goes to the rule's spot; when the rule ends it stays once where it is, then wanders on. Under the viewer's reduced-motion setting nobody wanders: they stand at their spot. To keep a pet still at times, give it a rule (`pet:sleeping` → its nest). A smaller pet that wanders slower over a smaller range: a lower `walk.speed`, and a few spots close together.
+With `wander`, when no rule holds it strolls between its wander spots instead of standing at its `spot`: it stays a while at one, then walks to another picked at random (never the one it is at, never one where someone else is or is going, never one it cannot walk to from there). You wander only while idle; the pet and the others may wander while you work. The moment a rule holds, it stops and goes to the rule's spot; when the rule ends it stays once where it is, then wanders on. Under the viewer's reduced-motion setting nobody wanders: they stand at their spot. To keep a pet still at times, give it a rule (`pet:sleeping` → its nest). A smaller pet that wanders slower over a smaller range: a lower `walk.speed`, and a few spots close together.
 
   **Example: you stroll by day between three spots; the pet pads between two near its bed.**
 

@@ -71,7 +71,7 @@ describe("the tomo-home skill", () => {
     const line = (name: string) => RENDERED.split("\n").find((l) => l.startsWith(`- \`${name}\`: `)) ?? "";
     expect(line("walk.speed")).toContain(`${WALK_SPEED_LIMITS.min}–${WALK_SPEED_LIMITS.max}, default ${WALK_SPEED_LIMITS.default}`);
     expect(line("walk.speed")).toContain(`${WALK_RULE_FACTOR} times as fast`);
-    expect(line("walk.radius")).toContain(`${WALK_RADIUS_LIMITS.min}–${WALK_RADIUS_LIMITS.max}; default ${NAV_WALKER.radius} for you, ${NAV_PET.radius} for the pet`);
+    expect(line("walk.radius")).toContain(`${WALK_RADIUS_LIMITS.min}–${WALK_RADIUS_LIMITS.max}; default ${NAV_WALKER.radius} for you and the others, ${NAV_PET.radius} for the pet`);
     expect(line("wander.spots")).toContain(`${WANDER_SPOT_LIMITS.min}–${WANDER_SPOT_LIMITS.max} of them`);
     expect(line("wander.every")).toContain(`${WANDER_EVERY_LIMITS.min}–${WANDER_EVERY_LIMITS.max}, default [${WANDER_EVERY_LIMITS.default.join(", ")}]`);
     expect(line("wander.when")).not.toBe("");
@@ -82,6 +82,25 @@ describe("the tomo-home skill", () => {
     expect(fragment.characters.tomo.wander.every).toEqual([30, 90]);
     const result = checkHomeScene({ version: 1, room: { size: [6, 3, 6], floor: "#a9825b", walls: "#d9cdb6" }, objects: [],
       kinds: { me: { parts: [{ shape: "sphere", size: [0.6, 0.6, 0.6] }] }, cat: { parts: [{ shape: "sphere", size: [0.3, 0.25, 0.4] }] } }, ...fragment });
+    expect(result.problems).toEqual([]);
+    expect(result.warnings).toEqual([]);
+  });
+
+  it("explains characters.others, walk.height and walking from the constants, and the dog example checks clean", async () => {
+    const { MAX_OTHERS, WALK_HEIGHT_LIMITS } = await import("../src/home/scene.js");
+    const { NAV_PET, NAV_WALKER } = await import("../src/home/nav.js");
+    const line = (name: string) => RENDERED.split("\n").find((l) => l.startsWith(`- \`${name}\`: `)) ?? "";
+    expect(line("others")).toContain(`at most ${MAX_OTHERS}`);
+    expect(line("characters.others")).toContain(`at most ${MAX_OTHERS}`);
+    expect(line("walk.height")).toContain(`${WALK_HEIGHT_LIMITS.min}–${WALK_HEIGHT_LIMITS.max}`);
+    expect(line("walk.height")).toContain(`default ${NAV_WALKER.headroom} for you and the others, ${NAV_PET.headroom} for the pet`);
+    expect(line("walking")).toContain("own body");
+    expect(RENDERED).toContain("the pet and the others may wander while you work");
+    const example = /\*\*Example: a dog[\s\S]*?```json\n([\s\S]*?)```/.exec(RENDERED)![1];
+    const fragment = JSON.parse(`{${example}}`);
+    expect(fragment.characters.others.dog.kind).toBe("dog");
+    expect(JSON.stringify(fragment.kinds.dog)).toContain('"not:walking"');
+    const result = checkHomeScene({ version: 1, room: { size: [6, 3, 6], floor: "#a9825b", walls: "#d9cdb6" }, objects: [], ...fragment });
     expect(result.problems).toEqual([]);
     expect(result.warnings).toEqual([]);
   });

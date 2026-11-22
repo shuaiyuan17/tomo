@@ -3,7 +3,7 @@ import {
   buildNavGrid, cellAt, cellCentre, findRoute, hopBlockers, isFloor, landings, NAV_MAX_HOP, NAV_PERCH_TOLERANCE, NAV_PET, NAV_WALKER,
   type FloorPoint, type Hurdle, type NavGrid, type RouteResult, type WalkerSize,
 } from "./nav.js";
-import type { HomeScene } from "./scene.js";
+import type { HomeMover, HomeScene } from "./scene.js";
 import { MAX_WAITING_DRAWN, waitingPosition } from "./waiting.js";
 
 /**
@@ -12,8 +12,8 @@ import { MAX_WAITING_DRAWN, waitingPosition } from "./waiting.js";
  * its rules name, at any of its wander spots, and a visitor at any seat or
  * any place in the queue at the overflow spot (where the page stands it:
  * waiting.ts). It may have to walk from any of these to any other, so every
- * ordered pair is checked, at the character's own size (walkerOf: Tomo and
- * the visitors NAV_WALKER, the pet NAV_PET, with the radius its `walk`
+ * ordered pair is checked, at the character's own size (walkerOf: the pet
+ * NAV_PET, everyone else NAV_WALKER, with the radius and height its `walk`
  * gives), as the page does (web/src/home/three/stage.ts). Where it cannot, the page
  * fades it out and back in; this says why, naming what is in the way.
  *
@@ -22,28 +22,51 @@ import { MAX_WAITING_DRAWN, waitingPosition } from "./waiting.js";
  * searches a path; the floor plan does, for the lengths it prints.
  */
 
-export type Mover = "tomo" | "visitors" | "pet";
-export const MOVER_NAMES: Record<Mover, string> = { tomo: "Tomo", visitors: "a visitor", pet: "the pet" };
+/** Who walks: Tomo, the visitors, the pet, or one of `characters.others` (`others.<name>`, its place under characters). */
+export type Mover = "tomo" | "visitors" | "pet" | `others.${string}`;
+const NAMES: Record<"tomo" | "visitors" | "pet", string> = { tomo: "Tomo", visitors: "a visitor", pet: "the pet" };
+/** "Tomo", "a visitor", "the pet", "momo". */
+export function moverName(who: Mover): string {
+  return who.startsWith("others.") ? who.slice("others.".length) : NAMES[who as keyof typeof NAMES];
+}
+
+/** The characters that have rules, wander and walk (all but the visitors), in the scene's order: Tomo, the pet, then the others. */
+export function moversOf(scene: HomeScene | undefined): Array<[Mover, HomeMover]> {
+  const c = scene?.characters;
+  const out: Array<[Mover, HomeMover]> = [];
+  if (c?.tomo) out.push(["tomo", c.tomo]);
+  if (c?.pet) out.push(["pet", c.pet]);
+  for (const [name, other] of Object.entries(c?.others ?? {})) out.push([`others.${name}`, other]);
+  return out;
+}
+function moverOf(scene: HomeScene | undefined, who: Mover): HomeMover | undefined {
+  const c = scene?.characters;
+  if (who === "visitors") return undefined;
+  if (who === "tomo" || who === "pet") return c?.[who];
+  return c?.others?.[who.slice("others.".length)];
+}
 
 const sized = new Map<string, WalkerSize>();
 /**
- * A character's size for finding its way: the preset for its sort, with the
- * footprint radius its `walk.radius` gives. The same size is the same object
- * (grids are kept per size).
+ * A character's size for finding its way: the preset for its sort (the pet
+ * NAV_PET, everyone else NAV_WALKER), with the footprint radius and height
+ * its `walk` gives. The same size is the same object (grids are kept per
+ * size).
  */
 export function walkerOf(who: Mover, scene?: HomeScene): WalkerSize {
   const preset = who === "pet" ? NAV_PET : NAV_WALKER;
-  const radius = who === "visitors" ? undefined : scene?.characters?.[who]?.walk?.radius;
-  if (radius === undefined || radius === preset.radius) return preset;
-  const key = `${radius}/${preset.headroom}`;
+  const walk = moverOf(scene, who)?.walk;
+  const radius = walk?.radius ?? preset.radius, headroom = walk?.height ?? preset.headroom;
+  if (radius === preset.radius && headroom === preset.headroom) return preset;
+  const key = `${radius}/${headroom}`;
   let walker = sized.get(key);
-  if (!walker) { walker = { radius, headroom: preset.headroom }; sized.set(key, walker); }
+  if (!walker) { walker = { radius, headroom }; sized.set(key, walker); }
   return walker;
 }
 
 /** Whether a place is there only because the character wanders to it (no rule or own spot names it). */
 export function wanderOnly(at: CharacterPlace): boolean {
-  return /^characters\.[a-z]+\.wander\./.test(at.place);
+  return /^characters\.(?:others\.[a-z][a-z0-9-]*|[a-z]+)\.wander\./.test(at.place);
 }
 
 /** A place a character can be: a spot, or (`queue`, 0-based) a place in the visitors' queue at one; `place` is where the scene names it. */
@@ -60,11 +83,12 @@ export function characterPlaces(scene: HomeScene): Map<Mover, CharacterPlace[]> 
     list.push({ who, spot, at, place, ...(queue !== undefined ? { queue } : {}) });
     out.set(who, list);
   };
-  if (c?.tomo) {
-    add("tomo", c.tomo.spot, "characters.tomo.spot");
-    (c.tomo.rules ?? []).forEach((rule, i) => add("tomo", rule.spot, `characters.tomo.rules[${i}]`));
-    (c.tomo.wander?.spots ?? []).forEach((spot, i) => add("tomo", spot, `characters.tomo.wander.spots[${i}]`));
-  }
+  const addMover = (who: Mover, m: HomeMover) => {
+    add(who, m.spot, `characters.${who}.spot`);
+    (m.rules ?? []).forEach((rule, i) => add(who, rule.spot, `characters.${who}.rules[${i}]`));
+    (m.wander?.spots ?? []).forEach((spot, i) => add(who, spot, `characters.${who}.wander.spots[${i}]`));
+  };
+  if (c?.tomo) addMover("tomo", c.tomo);
   if (c?.visitors) {
     c.visitors.spots.forEach((spot, i) => add("visitors", spot, `characters.visitors.spots[${i}]`));
     const overflow = c.visitors.overflow;
@@ -72,11 +96,7 @@ export function characterPlaces(scene: HomeScene): Map<Mover, CharacterPlace[]> 
       for (let queue = 0; queue < MAX_WAITING_DRAWN; queue++) add("visitors", overflow, "characters.visitors.overflow", waitingPosition(spots[overflow], queue, scene.room.size), queue);
     }
   }
-  if (c?.pet) {
-    add("pet", c.pet.spot, "characters.pet.spot");
-    (c.pet.rules ?? []).forEach((rule, i) => add("pet", rule.spot, `characters.pet.rules[${i}]`));
-    (c.pet.wander?.spots ?? []).forEach((spot, i) => add("pet", spot, `characters.pet.wander.spots[${i}]`));
-  }
+  for (const [who, m] of moversOf(scene)) if (who !== "tomo") addMover(who, m);
   return out;
 }
 

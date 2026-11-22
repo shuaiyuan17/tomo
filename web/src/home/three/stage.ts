@@ -2,7 +2,7 @@ import { Color, DirectionalLight, Group, HemisphereLight, MathUtils, Mesh, PCFSo
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { HomeScene } from "../../../../src/home/scene.js";
 import type { HomeSubagent } from "../../../../src/home/status.js";
-import { fillSign, holds, partEffects, seatVisitors, visitorKind, type Conditions, type SignValues, type Vec3 } from "../evaluate.js";
+import { bodyConditions, fillSign, holds, partEffects, seatVisitors, visitorKind, type Conditions, type SignValues, type Vec3 } from "../evaluate.js";
 import { MAX_WAITING_DRAWN, waitingPosition } from "../../../../src/home/waiting.js";
 import { layoutKind, layoutScene } from "../layout.js";
 import { buildNodes, redrawSigns, retarget, signPixels, signScaleFor, stepPart, updateSigns, type Built } from "./build.js";
@@ -13,7 +13,7 @@ import { base64Bytes } from "../snapshot.js";
 import { planMove, poseAt, smooth, type WalkPlan, type WalkPose } from "../walk.js";
 import { placeScene, type Placement } from "../../../../src/home/geometry.js";
 import { buildNavGrid, findRoute, type NavGrid, type WalkerSize } from "../../../../src/home/nav.js";
-import { walkerOf } from "../../../../src/home/reach.js";
+import { moversOf, walkerOf, type Mover } from "../../../../src/home/reach.js";
 import { WALK_RULE_FACTOR, WALK_SPEED_DEFAULT } from "../contract.js";
 import { placeCharacter, wanders, type Placing, type Random, type WanderState } from "../wander.js";
 
@@ -69,8 +69,10 @@ interface Character {
   to: Vec3; toYaw: number;
   /** The move under way (see walk.ts), started at `start`; null when it is standing at `to`. */
   plan: WalkPlan | null; start: number;
-  /** Tomo and the pet: the spot it is at or heading to, why (wander.ts), and its wander (null when not wandering). */
+  /** Tomo, the pet and the others: the spot it is at or heading to, why (wander.ts), and its wander (null when not wandering). */
   spot?: string; by?: Placing["by"]; wander: WanderState | null;
+  /** Whether its body's reactions were last aimed with `walking` holding (it has a move under way). */
+  walking: boolean;
   appear: number; leaving: boolean; task: string;
 }
 
@@ -206,8 +208,9 @@ export class HomeStage {
   setState(state: StageState, immediate = false): void {
     this.state = state;
     if (!this.home || !this.built) return;
-    for (const part of this.allParts()) retarget(part, partEffects(part.node.reactions, state.conditions));
+    for (const part of this.built.parts) retarget(part, partEffects(part.node.reactions, state.conditions));
     this.placeCharacters(state, immediate);
+    for (const character of this.characters.values()) this.aimBody(character, true);
     updateSigns(this.built.signs, (sign) => fillSign(sign.node.sign!, state.values));
     this.applySky();
     this.drawWindows(this.now(), true);
@@ -237,17 +240,17 @@ export class HomeStage {
           wanted.set(`visitor:${sub.id}`, { kind, at: waitingPosition(overflow, waitingIndex, home.room.size), facing: overflow.facing ?? 0, task: sub.task ?? "", walker });
       }
     }
-    // Tomo and the pet: a rule's spot, a wander spot, or their own (wander.ts).
+    // Tomo, the pet and the others: a rule's spot, a wander spot, or their own (wander.ts).
     // First, where each one's rules put it without any dice (a rule's spot, or its own when it will not wander):
     // no random pick may land there, whoever is placed first.
-    const movers = ([["tomo", cast.tomo], ["pet", state.hasPet ? cast.pet : undefined]] as const).filter((m): m is readonly ["tomo" | "pet", NonNullable<typeof cast.tomo>] => !!m[1]);
+    const movers = moversOf(home).filter(([key]) => key !== "pet" || state.hasPet);
     for (const [key, who] of movers) {
       const rule = who.rules?.find((r) => holds(r.when, state.conditions));
       const fixed = rule ? rule.spot : wanders(who, state.conditions, { tomo: key === "tomo", reduced: this.reducedMotion }) ? undefined : who.spot;
       const at = spotAt(fixed)?.at;
       if (at) wanted.set(`reserved:${key}`, { kind: "", at, facing: 0, task: "", walker: walkerOf(key, home) });
     }
-    const mover = (key: "tomo" | "pet", who: NonNullable<typeof cast.tomo>) => {
+    const mover = (key: Mover, who: NonNullable<typeof cast.tomo>) => {
       const existing = this.characters.get(key);
       const walker = walkerOf(key, home), speed = who.walk?.speed ?? WALK_SPEED_DEFAULT;
       let stroll: WalkPlan | undefined;
@@ -276,12 +279,12 @@ export class HomeStage {
       if (character && character.kind !== want.kind) { this.dropCharacter(character); character = undefined; }
       if (!character) {
         character = { key, kind: want.kind, anchor: new Group(), body: null, walker: want.walker, to, toYaw: yaw, plan: null, start: now,
-          spot: want.spot, by: want.by, wander: want.wander ?? null, appear: immediate ? 1 : 0, leaving: false, task: want.task };
+          spot: want.spot, by: want.by, wander: want.wander ?? null, walking: false, appear: immediate ? 1 : 0, leaving: false, task: want.task };
         const node = layoutKind(home, want.kind, key);
         if (node) {
           character.body = buildNodes([node], this.resources!);
           character.anchor.add(character.body.root);
-          for (const part of character.body.parts) retarget(part, partEffects(part.node.reactions, state.conditions));
+          this.aimBody(character, true);
         }
         character.anchor.position.set(...to); character.anchor.rotation.y = yaw;
         this.world!.add(character.anchor);
@@ -301,9 +304,24 @@ export class HomeStage {
         const plan = immediate || this.reducedMotion ? null : want.plan ?? planMove(this.grid(character.walker), here.position, to, here.yaw, yaw, { ...pace, fade: here.fade, bob: here.bob });
         character.to = to; character.toYaw = yaw; character.start = now;
         character.plan = plan && plan.duration > 0 ? plan : null;
+        this.aimBody(character);
       }
     }
     this.scheduleWander();
+  }
+
+  /**
+   * Aims a character's body reactions at what holds for it: the stage's
+   * conditions, and `walking` while it has a move under way. Only when that
+   * changed, unless `always`.
+   */
+  private aimBody(character: Character, always = false): void {
+    const walking = character.plan !== null;
+    if (!always && walking === character.walking) return;
+    character.walking = walking;
+    if (!character.body || !this.state) return;
+    const conditions = bodyConditions(this.state.conditions, walking);
+    for (const part of character.body.parts) retarget(part, partEffects(part.node.reactions, conditions));
   }
 
   /**
@@ -379,6 +397,8 @@ export class HomeStage {
     // Reduced motion (even switched on mid-walk) is there at once.
     if (character.plan && (reduced || now - character.start >= character.plan.duration)) character.plan = null;
     if (character.plan) busy = true;
+    // Arrived: `walking` stops holding on its body.
+    if (character.walking !== (character.plan !== null)) { this.aimBody(character); busy = true; }
     const pose = this.pose(character, now);
     const s = smooth(Math.min(1, character.appear)) * pose.fade;
     character.anchor.scale.set(0.6 + 0.4 * s, s, 0.6 + 0.4 * s);

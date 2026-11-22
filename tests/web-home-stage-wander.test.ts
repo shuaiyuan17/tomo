@@ -175,3 +175,155 @@ describe("the stage keeps characters apart", () => {
     }
   });
 });
+
+describe("the stage's others", () => {
+  type Cast = Map<string, { spot?: string; by?: string; to: number[]; plan: { duration: number } | null; wander: { leaveAt: number } | null; leaving: boolean;
+    walking: boolean; body: { parts: Array<{ target: { visible: boolean } }> } | null }>;
+  const crowd = (): HomeScene => {
+    const scene = structuredClone(SCENE);
+    scene.kinds!.dog = { parts: [{ shape: "sphere", size: [0.5, 0.35, 0.9] }] };
+    scene.kinds!.cat = { parts: [{ shape: "sphere", size: [0.2, 0.2, 0.2] }] };
+    scene.spots!.rug = { at: [1, 0, 1.5] };
+    const spots = ["cushion", "window", "pool-side", "rug"];
+    scene.characters!.pet = { kind: "cat", spot: "pool-side", wander: { spots, every: [5, 10] } };
+    scene.characters!.tomo!.wander = { spots, every: [5, 10] };
+    scene.characters!.others = {
+      momo: { kind: "dog", spot: "window", walk: { speed: 1.1, radius: 0.35 }, wander: { spots, every: [5, 10] } },
+      rex: { kind: "dog", spot: "rug", wander: { spots, every: [5, 10] } },
+    };
+    return scene;
+  };
+  const make = async (scene: HomeScene, seed: number, conditions = ["idle", "day"], hasPet = true, reduced = false) => {
+    const { HomeStage } = await import("../web/src/home/three/stage.js");
+    const made = new HomeStage({} as HTMLCanvasElement, (name) => name);
+    made.random = seeded(seed);
+    made.reducedMotion = reduced;
+    made.setScene(scene, "r1");
+    made.setState({ ...state(conditions), hasPet });
+    return { made, cast: (made as unknown as { characters: Cast }).characters };
+  };
+  /** Where every character still on the stage is at or heading to: no two the same. */
+  const apart = (cast: Cast) => {
+    const targets = [...cast.values()].filter((c) => !c.leaving).map((c) => c.to.join(","));
+    expect(new Set(targets).size).toBe(targets.length);
+  };
+
+  it("are drawn whether or not there is a pet, keyed by name, and wander like the pet", async () => {
+    const { cast } = await make(crowd(), 3, ["idle", "day"], false);
+    expect([...cast.keys()].sort()).toEqual(["others.momo", "others.rex", "tomo"]);
+    expect(cast.get("others.momo")!.by).toBe("wander");
+    // While Tomo works, the others still wander (Tomo goes to its rule's spot).
+    const working = await make(crowd(), 3, ["working", "by:owner", "day"]);
+    expect(working.cast.get("tomo")!.by).toBe("rule");
+    expect(working.cast.get("others.rex")!.by).toBe("wander");
+  });
+
+  it("four characters wandering over four spots never stand at, or head for, the same one: from the first placement, and on every step", async () => {
+    for (let seed = 0; seed < 25; seed++) {
+      const { made, cast } = await make(crowd(), seed);
+      expect(cast.size).toBe(4);
+      apart(cast);
+      let moved = 0;
+      for (let step = 0; step < 12; step++) {
+        const before = [...cast.values()].map((c) => c.spot).join();
+        const next = Math.min(...[...cast.values()].map((c) => c.wander?.leaveAt ?? Infinity));
+        clock = Math.max(clock, next) + 0.05; vi.advanceTimersByTime(Math.max(0, (next - clock) * 1000) + 100);
+        made.setState({ ...state(["idle", "day"]), hasPet: true });
+        apart(cast);
+        if ([...cast.values()].map((c) => c.spot).join() !== before) moved++;
+      }
+      // Four characters on four spots can never move (each spot is taken); they stay put, apart.
+      expect(moved).toBe(0);
+      made.dispose();
+    }
+  });
+
+  it("with a spot to spare they take turns moving, and still never share one; a rule's spot is kept free of random picks", async () => {
+    for (let seed = 0; seed < 25; seed++) {
+      const scene = crowd();
+      scene.spots!.corner = { at: [2.2, 0, 2.2] };
+      scene.spots!.door = { at: [-2.2, 0, 2.4] };
+      for (const who of [scene.characters!.tomo!, scene.characters!.pet!, ...Object.values(scene.characters!.others!)]) who.wander!.spots.push("corner", "door");
+      // rex goes to the window at night (a rule): nobody else may be put there.
+      scene.characters!.others!.rex.rules = [{ when: "night", spot: "window" }];
+      const { made, cast } = await make(scene, seed, ["idle", "night"]);
+      expect(cast.get("others.rex")).toMatchObject({ spot: "window", by: "rule" });
+      apart(cast);
+      let moved = 0;
+      for (let step = 0; step < 10; step++) {
+        const before = [...cast.values()].map((c) => c.spot).join();
+        const next = Math.min(...[...cast.values()].map((c) => c.wander?.leaveAt ?? Infinity));
+        clock = Math.max(clock, next) + 0.05; vi.advanceTimersByTime(100);
+        made.setState({ ...state(["idle", "night"]), hasPet: true });
+        apart(cast);
+        for (const [key, c] of cast) if (key !== "others.rex") expect(c.spot).not.toBe("window");
+        if ([...cast.values()].map((c) => c.spot).join() !== before) moved++;
+      }
+      expect(moved).toBeGreaterThan(0);
+      made.dispose();
+    }
+  });
+
+  it("under reduced motion the others stand at their spots too", async () => {
+    const { cast } = await make(crowd(), 1, ["idle", "day"], true, true);
+    expect(cast.get("others.momo")).toMatchObject({ spot: "window", by: "spot", wander: null, plan: null });
+    expect(cast.get("others.rex")).toMatchObject({ spot: "rug", by: "spot", wander: null, plan: null });
+  });
+});
+
+describe("the walking condition", () => {
+  it("holds on a character's body while it walks, and stops holding when it arrives", async () => {
+    const scene = structuredClone(SCENE);
+    // Eyes open while walking, closed (the lid shown) while standing.
+    scene.kinds!.crab = { parts: [{ shape: "sphere", size: [0.5, 0.3, 0.4] },
+      { shape: "box", size: [0.2, 0.04, 0.02], at: [0, 0.3, 0.2], reactions: [{ when: ["idle", "not:walking"], do: "show" }] },
+      { shape: "box", size: [0.1, 0.1, 0.1], at: [0, 0.3, 0.2], reactions: [{ when: "walking", do: "show" }] }] };
+    const { HomeStage } = await import("../web/src/home/three/stage.js");
+    const made = new HomeStage({} as HTMLCanvasElement, (name) => name);
+    made.random = seeded(7);
+    made.setScene(scene, "r1");
+    made.setState(state(["idle", "day"]));
+    type Body = { walking: boolean; plan: { duration: number } | null; start: number; body: { parts: Array<{ node: { reactions?: unknown[] }; target: { visible: boolean } }> } };
+    const tomo = () => (made as unknown as { characters: Map<string, Body> }).characters.get("tomo")!;
+    const step = () => (made as unknown as { stepCharacter: (c: Body, now: number, dt: number) => boolean }).stepCharacter(tomo(), clock, 1 / 60);
+    const [lid, open] = tomo().body.parts.filter((p) => p.node.reactions?.length);
+    const look = () => ({ walking: tomo().walking, lid: lid.target.visible, open: open.target.visible });
+    // Placed on the page: standing.
+    expect(look()).toEqual({ walking: false, lid: true, open: false });
+    // Its stay is over: it strolls off.
+    clock = (made as unknown as { characters: Map<string, { wander: { leaveAt: number } }> }).characters.get("tomo")!.wander.leaveAt + 0.05;
+    vi.advanceTimersByTime(100_000);
+    expect(tomo().plan).not.toBeNull();
+    expect(look()).toEqual({ walking: true, lid: false, open: true });
+    // A status update mid-walk keeps it walking.
+    made.setState(state(["idle", "day"]));
+    expect(look()).toEqual({ walking: true, lid: false, open: true });
+    // Arrived: standing again.
+    clock = tomo().start + tomo().plan!.duration + 0.01;
+    step();
+    expect(tomo().plan).toBeNull();
+    expect(look()).toEqual({ walking: false, lid: true, open: false });
+    made.dispose();
+  });
+
+  it("never holds on the room's own parts, and not under reduced motion (nothing walks)", async () => {
+    const scene = structuredClone(SCENE);
+    scene.objects.push({ id: "sign", shape: "box", size: [0.2, 0.2, 0.2], at: [2, 0, 2], reactions: [{ when: "walking", do: "show" }] });
+    scene.kinds!.crab.parts.push({ shape: "box", size: [0.1, 0.1, 0.1], reactions: [{ when: "walking", do: "show" }] });
+    const { HomeStage } = await import("../web/src/home/three/stage.js");
+    const made = new HomeStage({} as HTMLCanvasElement, (name) => name);
+    made.random = seeded(7);
+    made.setScene(scene, "r1");
+    made.setState(state(["idle", "day"]));
+    const internals = made as unknown as { built: { parts: Array<{ node: { reactions?: unknown[] }; target: { visible: boolean } }> }; characters: Map<string, { plan: unknown; wander: { leaveAt: number }; body: { parts: Array<{ node: { reactions?: unknown[] }; target: { visible: boolean } }> } }> };
+    clock = internals.characters.get("tomo")!.wander.leaveAt + 0.05;
+    vi.advanceTimersByTime(100_000);
+    expect(internals.characters.get("tomo")!.plan).not.toBeNull();
+    expect(internals.built.parts.find((p) => p.node.reactions?.length)!.target.visible).toBe(false);
+    expect(internals.characters.get("tomo")!.body.parts.find((p) => p.node.reactions?.length)!.target.visible).toBe(true);
+    made.reducedMotion = true;
+    expect(internals.characters.get("tomo")!.plan).toBeNull();
+    expect(internals.characters.get("tomo")!.body.parts.find((p) => p.node.reactions?.length)!.target.visible).toBe(false);
+    made.dispose();
+  });
+});

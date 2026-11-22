@@ -159,12 +159,46 @@ export async function compactSessionGated(
       summaryUuid: prepared.summaryUuid,
       removedUuids: prepared.removedUuids,
     });
-    if (refusal !== undefined) {
-      return { success: false, eventsRemoved: 0, eventsAfter: prepared.allEvents.length, error: refusal };
+    const refused = (error: string): CompactResult =>
+      ({ success: false, eventsRemoved: 0, eventsAfter: prepared.allEvents.length, error });
+    if (refusal !== undefined) return refused(refusal);
+
+    const spliced = spliceLateAppends(req, sourceFd, prepared);
+    if ("success" in spliced) return spliced;
+    // Lines the SDK appended while the gate ran are now part of the output
+    // (re-pointed by the usual rule). They can move the leaf — a new branch —
+    // so what would be published is no longer what was checked: check the
+    // final content again. Usually nothing arrived and this costs nothing.
+    if (spliced.lateAppended > 0) {
+      const second = await gate({
+        output: prepared.newEvents.map(serializeJsonlRecord).join("\n") + "\n",
+        summaryUuid: prepared.summaryUuid,
+        removedUuids: prepared.removedUuids,
+      });
+      if (second !== undefined) return refused(second);
     }
-    return publishRewrite(req, path, sourceFd, prepared);
+
+    // The gate is async: another rewriter (a `--no-daemon-check` CLI run, a
+    // restore) may have replaced the session file meanwhile. Publishing now
+    // would overwrite that file with a rewrite of the one before it.
+    if (!pathStillOnInode(path, sourceFd)) {
+      log.warn({ sessionId: req.sdkSessionId }, "Compact aborted: session file replaced during validation");
+      return refused("Session transcript was replaced during validation; nothing was written — re-resolve the range and retry");
+    }
+    return commitRewrite(req, path, sourceFd, prepared, spliced);
   } finally {
     closeSync(sourceFd); // see compactSession
+  }
+}
+
+/** True while `path` still names the inode `fd` was opened on (same dev + ino). */
+function pathStillOnInode(path: string, fd: number): boolean {
+  try {
+    const opened = fstatSync(fd);
+    const current = statSync(path);
+    return opened.dev === current.dev && opened.ino === current.ino;
+  } catch {
+    return false;
   }
 }
 
@@ -422,7 +456,19 @@ function prepareRewrite(req: CompactRequest, sourceFd: number): PreparedRewrite 
 }
 
 function publishRewrite(req: CompactRequest, path: string, sourceFd: number, prepared: PreparedRewrite): CompactResult {
-  const { allEvents, removeSet, removedUuids, summaryUuid, newEvents, bytesAtRead } = prepared;
+  const spliced = spliceLateAppends(req, sourceFd, prepared);
+  if ("success" in spliced) return spliced;
+  return commitRewrite(req, path, sourceFd, prepared, spliced);
+}
+
+interface LateSplice {
+  cursor: number;
+  lateAppended: number;
+  seenLateUuids: Set<string>;
+}
+
+function spliceLateAppends(req: CompactRequest, sourceFd: number, prepared: PreparedRewrite): LateSplice | CompactResult {
+  const { allEvents, removedUuids, summaryUuid, newEvents, bytesAtRead } = prepared;
   // Late-arrival splice: re-read any bytes the SDK appended after our initial
   // read. These are events written while we were processing — typically the
   // agent's own thinking/tool_use that triggered this compact via Bash. If we
@@ -488,6 +534,15 @@ function publishRewrite(req: CompactRequest, path: string, sourceFd: number, pre
     };
   }
 
+  return { cursor, lateAppended, seenLateUuids };
+}
+
+function commitRewrite(
+  req: CompactRequest, path: string, sourceFd: number, prepared: PreparedRewrite, spliced: LateSplice,
+): CompactResult {
+  const { allEvents, removeSet, removedUuids, summaryUuid, newEvents } = prepared;
+  const { cursor, seenLateUuids } = spliced;
+  let { lateAppended } = spliced;
   // Archive the removed events to the transcript BEFORE the rewrite is
   // published. The ordering picks between two failure modes and this is the
   // recoverable one:

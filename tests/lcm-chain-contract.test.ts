@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync,
+  appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, utimesSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -250,6 +250,83 @@ describe("LCM rewrite, checked by the SDK's own loader before it is published", 
     expect(result.success).toBe(true);
     expect(readFileSync(path, "utf8").endsWith(late)).toBe(true);
     expect(await chain(f.sessionId)).toEqual([f.oldBlockUuid, summaryUuidIn(path), ...f.tailUuids, lateUuid]);
+  });
+
+  it("re-checks after splicing late lines, and refuses when they move the leaf off the summary", async () => {
+    const f = buildFixture();
+    const path = writeFixture(f);
+    // A late line that starts a new root: the loader's leaf is now on another branch.
+    const late = JSON.stringify({
+      parentUuid: null, type: "user", uuid: randomUUID(), isSidechain: false,
+      sessionId: f.sessionId, timestamp: new Date(2026, 10, 20, 10).toISOString(), message: { role: "user", content: "Detached." },
+    }) + "\n";
+    let calls = 0;
+    const result = await compactSessionChecked(request(f), {
+      workspaceDir: workspace,
+      loadChain: async (sid, dir) => {
+        if (++calls === 2) appendFileSync(path, late);
+        return getSessionMessages(sid, { dir });
+      },
+    });
+
+    expect(calls).toBe(3); // live read, staged check, re-check of the spliced output
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/summary block is not on the loaded chain/);
+    // Only the SDK's own append happened; the rewrite published nothing.
+    expect(readFileSync(path, "utf8")).toBe(f.text + late);
+    expect(existsSync(getCompactTriggerPath(f.sessionId, sdkSessionsDir))).toBe(false);
+    expectNoLeftovers();
+  });
+
+  it("refuses to publish when the session file was replaced during validation", async () => {
+    const f = buildFixture();
+    const path = writeFixture(f);
+    const replacement = buildFixture(f.sessionId).text;
+    let calls = 0;
+    const result = await compactSessionChecked(request(f), {
+      workspaceDir: workspace,
+      loadChain: async (sid, dir) => {
+        if (++calls === 2) { // another rewriter swaps the file in while the staged copy is checked
+          writeFileSync(`${path}.other`, replacement);
+          renameSync(`${path}.other`, path);
+        }
+        return getSessionMessages(sid, { dir });
+      },
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/replaced during validation/);
+    expect(readFileSync(path, "utf8")).toBe(replacement);
+    expect(existsSync(getCompactTriggerPath(f.sessionId, sdkSessionsDir))).toBe(false);
+    expect(existsSync(join(sessionsDir, `_archive_${f.sessionId}.jsonl`))).toBe(false);
+  });
+
+  it("sweeps only its own stale verify dirs, never a real project dir with a similar name", async () => {
+    const projects = dirname(sdkSessionsDir);
+    const base = sdkSessionsDir.slice(projects.length + 1);
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    const make = (name: string, marker: boolean) => {
+      const dir = join(projects, name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, `${randomUUID()}.jsonl`), "{}\n");
+      if (marker) writeFileSync(join(dir, ".tomo-lcm-verify"), "");
+      utimesSync(dir, old, old);
+      return dir;
+    };
+    const hex = "0123456789abcdef0123456789abcdef";
+    const realLookalike = make(`${base}-lcm-verify-client`, false);
+    const realWithMarker = make(`${base}-lcm-verify-client`.replace("client", "client2"), true);
+    const unmarked = make(`${base}-lcm-verify-${hex}`, false);
+    const ours = make(`${base}-lcm-verify-${hex.replace("0", "f")}`, true);
+
+    const f = buildFixture();
+    writeFixture(f);
+    expect((await compactSessionChecked(request(f), { workspaceDir: workspace })).success).toBe(true);
+
+    expect(existsSync(realLookalike)).toBe(true);
+    expect(existsSync(realWithMarker)).toBe(true);
+    expect(existsSync(unmarked)).toBe(true);
+    expect(existsSync(ours)).toBe(false);
   });
 
   it("happy path writes exactly what the unchecked rewrite writes", async () => {

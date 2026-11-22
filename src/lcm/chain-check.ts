@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { getSessionMessages, type SessionMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -61,6 +61,9 @@ const sdkLoadChain = (sessionId: string, dir: string) => getSessionMessages(sess
 
 /** Suffix of the throwaway workspace path / project directory a staged rewrite is loaded from. */
 const VERIFY_MARK = "-lcm-verify-";
+/** A verify dir is `<project dir>-lcm-verify-<32 hex>` holding this marker; nothing else is ever swept. */
+const VERIFY_MARKER_FILE = ".tomo-lcm-verify";
+const VERIFY_SUFFIX_RE = /^-lcm-verify-[0-9a-f]{32}$/;
 const VERIFY_DIR_MAX_AGE_MS = 60 * 60 * 1000;
 
 /**
@@ -171,6 +174,7 @@ async function checkStaged(
   const verifyProjectDir = join(dirname(req.sdkSessionsDir), `${basename(req.sdkSessionsDir)}${mark}`);
   try {
     mkdirSync(verifyProjectDir, { recursive: true });
+    writeFileSync(join(verifyProjectDir, VERIFY_MARKER_FILE), "");
     writeFileSync(join(verifyProjectDir, `${req.sdkSessionId}.jsonl`), staged.output);
     let after: string[];
     try {
@@ -187,16 +191,23 @@ async function checkStaged(
   }
 }
 
-/** Remove verify dirs a killed process left behind (each holds a full session copy). */
-function sweepStaleVerifyDirs(sdkSessionsDir: string, now = Date.now()): void {
+/**
+ * Remove verify dirs a killed process left behind (each holds a full session
+ * copy). Only a dir whose name is exactly `<project dir>-lcm-verify-<32 hex>`
+ * AND that holds our marker file is ours: a real project dir that merely
+ * starts with the same prefix (a workspace named `…-lcm-verify-client`) is
+ * never touched. Exported for tests.
+ */
+export function sweepStaleVerifyDirs(sdkSessionsDir: string, now = Date.now()): void {
   const projects = dirname(sdkSessionsDir);
-  const prefix = `${basename(sdkSessionsDir)}${VERIFY_MARK}`;
+  const base = basename(sdkSessionsDir);
   let names: string[];
   try { names = readdirSync(projects); } catch { return; }
   for (const name of names) {
-    if (!name.startsWith(prefix)) continue;
+    if (!name.startsWith(base) || !VERIFY_SUFFIX_RE.test(name.slice(base.length))) continue;
     const full = join(projects, name);
     try {
+      if (!existsSync(join(full, VERIFY_MARKER_FILE))) continue;
       if (now - statSync(full).mtimeMs < VERIFY_DIR_MAX_AGE_MS) continue;
       rmSync(full, { recursive: true, force: true });
     } catch { /* raced with another sweep */ }

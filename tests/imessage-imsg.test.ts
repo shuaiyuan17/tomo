@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { ImsgChannel, type ImsgCapabilities, type ImsgChannelConfig } from "../src/channels/imessage-imsg.js";
-import { AttachmentUnreadableError, isNothingSent, partsSent } from "../src/channels/types.js";
+import { AttachmentUnreadableError, isNothingSent, partsSent, type ChannelFaultNotice } from "../src/channels/types.js";
 import { NULL_SERVICE_LOOKUP, type ServiceLookup } from "../src/channels/imsg-satellite.js";
 import { NULL_ATTACHMENT_LOOKUP } from "../src/channels/imsg-attachment-lookup.js";
 import { log } from "../src/logger.js";
@@ -4363,6 +4363,186 @@ describe("imsg rpc child lifecycle", () => {
 });
 
 // --- recentMessages addressing ---------------------------------------------------
+
+describe("imsg rpc restart on -32004 Mutation lane blocked", () => {
+  /** A responder that refuses a send with -32004 when `isBlocked` says so. */
+  const laneBlockedOn = (isBlocked: (childIndex: number, req: RpcRequest) => boolean, childIndex: (child: FakeChild) => number): Responder =>
+    (req, child) => {
+      if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+      if (req.method === "send" && isBlocked(childIndex(child), req)) {
+        return child.respondError(req.id, -32004, "Mutation lane blocked", { lane: "send", reason: "busy" });
+      }
+      child.respond(req.id, { ok: true });
+    };
+
+  function laneChannel(isBlocked: (childIndex: number, req: RpcRequest) => boolean, config: Partial<ImsgChannelConfig> = {}) {
+    let children: FakeChild[] = [];
+    const made = makeChannel({ responder: laneBlockedOn(isBlocked, (c) => children.indexOf(c)), config });
+    children = made.children;
+    const sends = () => made.requests().filter((r) => r.method === "send");
+    return { ...made, sends };
+  }
+
+  it("restarts the child and retries the refused send once on the new child", async () => {
+    const { channel, children, spawnFn, sends } = laneChannel((i) => i === 0);
+    await channel.start();
+
+    await expect(channel.send({ chatId: DM_GUID, text: "hello" })).resolves.toBeUndefined();
+
+    expect(spawnFn).toHaveBeenCalledTimes(2);
+    expect(children[0].killed).toBe(true);
+    // The new child resubscribed before the retry went out on it.
+    expect((JSON.parse(children[1].stdin.lines[0]) as RpcRequest).method).toBe("watch.subscribe");
+    expect(sends().map((r) => r.params.text)).toEqual(["hello", "hello"]);
+    expect(children[1].stdin.lines.map((l) => (JSON.parse(l) as RpcRequest).method)).toEqual(["watch.subscribe", "send"]);
+
+    await channel.stop();
+  });
+
+  it("retries only the refused part of a long text, never a part already sent", async () => {
+    let sendsOnFirstChild = 0;
+    const { channel, sends } = laneChannel((i) => i === 0 && ++sendsOnFirstChild === 2);
+    await channel.start();
+
+    // Three parts, each with different words.
+    const text = Array.from({ length: 1_700 }, (_, i) => `w${i}`).join(" ");
+    await expect(channel.send({ chatId: DM_GUID, text })).resolves.toBeUndefined();
+
+    const parts = sends().map((r) => r.params.text as string);
+    // Part 1 once, part 2 refused then retried, part 3 once: nothing doubled.
+    expect(parts).toHaveLength(4);
+    expect(parts[1]).toBe(parts[2]);
+    expect(new Set(parts).size).toBe(3);
+
+    await channel.stop();
+  });
+
+  it("retries at most once: a second refusal fails as nothing-sent, with no third attempt", async () => {
+    const { channel, spawnFn, sends } = laneChannel(() => true);
+    await channel.start();
+
+    const err = await channel.send({ chatId: DM_GUID, text: "hi" }).then(() => null, (e: unknown) => e as Error & { rpcCode?: number });
+    expect(err?.rpcCode).toBe(-32004);
+    expect(isNothingSent(err)).toBe(true);
+    expect(sends()).toHaveLength(2);
+    expect(spawnFn).toHaveBeenCalledTimes(2);
+
+    await channel.stop();
+  });
+
+  it("does not retry when the retried send's outcome is unknown (timeout)", async () => {
+    vi.useFakeTimers();
+    const { channel, spawnFn, children } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        // First child: lane blocked. Second child: takes the send and never answers.
+        if (req.method === "send" && children.indexOf(child) === 0) return child.respondError(req.id, -32004, "Mutation lane blocked");
+        if (req.method !== "send") child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const pending = channel.send({ chatId: DM_GUID, text: "hi" }).then(() => null, (e: unknown) => e as Error);
+    await vi.advanceTimersByTimeAsync(31_000);
+    const err = await pending;
+    expect(err?.message).toMatch(/timed out/);
+    // May have been delivered: not nothing-sent, and never sent a third time.
+    expect(isNothingSent(err)).toBe(false);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(children.flatMap((c) => c.stdin.lines).map((l) => (JSON.parse(l) as RpcRequest).method).filter((m) => m === "send")).toHaveLength(2);
+    expect(spawnFn).toHaveBeenCalledTimes(2);
+
+    await channel.stop();
+  });
+
+  it("does not restart or retry on an ambiguous failure (no response)", async () => {
+    vi.useFakeTimers();
+    const { channel, spawnFn, requests } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        // Takes the send and never answers it.
+        if (req.method !== "send") child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const pending = channel.send({ chatId: DM_GUID, text: "hi" }).then(() => null, (e: unknown) => e as Error);
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect((await pending)?.message).toMatch(/timed out/);
+    expect(requests().filter((r) => r.method === "send")).toHaveLength(1);
+    expect(spawnFn).toHaveBeenCalledTimes(1);
+
+    await channel.stop();
+  });
+
+  it("waits for other in-flight requests before killing the child, so their outcome stays known", async () => {
+    let held: { id: number; child: FakeChild } | null = null;
+    const { channel, children, spawnFn } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
+        if (req.method === "send" && children.indexOf(child) === 0) {
+          if (req.params.text === "slow") { held = { id: req.id, child }; return; }
+          return child.respondError(req.id, -32004, "Mutation lane blocked");
+        }
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const slow = channel.send({ chatId: DM_GUID, text: "slow" });
+    await settle();
+    const blocked = channel.send({ chatId: DM_GUID, text: "blocked" });
+    await settle(20);
+    // The refused send is waiting; the old child is still up for "slow".
+    expect(spawnFn).toHaveBeenCalledTimes(1);
+    expect(children[0].killed).toBe(false);
+
+    held!.child.respond(held!.id, { ok: true });
+    await expect(slow).resolves.toBeUndefined();
+    await expect(blocked).resolves.toBeUndefined();
+    expect(spawnFn).toHaveBeenCalledTimes(2);
+    expect(children[0].killed).toBe(true);
+
+    await channel.stop();
+  });
+
+  it("caps restarts within the window, then tells the owner once and stops restarting", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-21T10:00:00Z"));
+    const { channel, spawnFn, sends } = laneChannel(() => true, { laneRestartLimit: 3, laneRestartWindowMs: 10 * 60_000 });
+    const notices: ChannelFaultNotice[] = [];
+    channel.onOwnerNotice((notice) => { notices.push(notice); return Promise.resolve(true); });
+    await channel.start();
+
+    const fail = () => channel.send({ chatId: DM_GUID, text: "x" }).then(() => null, (e: unknown) => e as Error & { rpcCode?: number });
+    for (let i = 0; i < 3; i++) expect((await fail())?.rpcCode).toBe(-32004);
+    expect(spawnFn).toHaveBeenCalledTimes(4);
+    expect(notices).toHaveLength(0);
+
+    // Fourth refusal inside the window: no restart, no retry, one notice.
+    const before = sends().length;
+    const err = await fail();
+    expect(err?.rpcCode).toBe(-32004);
+    expect(isNothingSent(err)).toBe(true);
+    expect(spawnFn).toHaveBeenCalledTimes(4);
+    expect(sends().length).toBe(before + 1);
+    await settle();
+    expect(notices).toEqual([{ kind: "imsgLaneBlocked", restarts: 3, windowMs: 10 * 60_000 }]);
+
+    // Further refusals in the same window do not notify again.
+    await fail();
+    await settle();
+    expect(notices).toHaveLength(1);
+    expect(spawnFn).toHaveBeenCalledTimes(4);
+
+    // Once the oldest restart leaves the window, restarting resumes.
+    vi.setSystemTime(new Date("2026-11-21T10:10:01Z"));
+    await fail();
+    expect(spawnFn).toHaveBeenCalledTimes(5);
+
+    await channel.stop();
+  });
+});
 
 describe("imsg recent-message cache addressing", () => {
   it("resolves a bare DM handle to its chat-GUID ring, but never a group", async () => {

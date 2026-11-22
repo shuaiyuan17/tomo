@@ -1,5 +1,5 @@
 import { formatDateTime, ownerT, type OwnerText } from "./i18n/index.js";
-import type { Channel, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions } from "./channels/types.js";
+import type { Channel, ChannelFaultNotice, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions } from "./channels/types.js";
 import type { CompactReservation } from "./lcm/background-gate.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildSystemPrompt } from "./workspace/index.js";
@@ -661,6 +661,8 @@ export class Agent {
     // is advisory: the channel still dispatches, and the decision below is
     // still the one that counts.
     channel.onAdmission?.((chatId) => this.router.isAllowed(channel.name, chatId));
+    // A channel fault the channel cannot fix itself goes to the owner's DM.
+    channel.onOwnerNotice?.((notice) => this.notifyOwner(channelFaultText(notice)));
     channel.onCommand((cmd, chatId, senderName, args, senderId) =>
       this.commands.handle(channel, cmd, chatId, senderName, args, senderId));
     this.channels.push(channel);
@@ -3139,6 +3141,14 @@ export class Agent {
  * parts — never truncated: the note is the message's only remaining copy.
  */
 const INTERRUPTED_NOTE_CHUNK = 16_000;
+
+/** A channel's fault notice, worded for the owner. */
+function channelFaultText(notice: ChannelFaultNotice): OwnerText {
+  switch (notice.kind) {
+    case "imsgLaneBlocked":
+      return ownerT("notices")("imsgLaneBlocked", { restarts: notice.restarts, minutes: Math.round(notice.windowMs / 60_000) });
+  }
+}
 
 /** One interrupted message as quoted in the note, in full: sender, text, saved attachments. */
 function formatInterruptedMessage(rec: InboxRecord, i: number, total: number): string {

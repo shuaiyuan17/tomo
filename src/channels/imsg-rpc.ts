@@ -44,6 +44,14 @@ const DEFAULT_CAPABILITY_RETRY_DELAYS_MS = [2_000, 5_000, 10_000, 15_000, 30_000
 // call, while still picking a late-appearing bridge up within ~30s of the
 // next gated call.
 const DEFAULT_CAPABILITY_REPROBE_MIN_INTERVAL_MS = 30_000;
+// imsg's "Mutation lane blocked" refusal: a mutation on the child's lane is
+// still held, and every later send on it is refused until the child goes.
+// The client restarts the child and retries the refused request once, at
+// most DEFAULT_LANE_RESTART_LIMIT times per DEFAULT_LANE_RESTART_WINDOW_MS;
+// past that it stops restarting and tells the owner.
+export const MUTATION_LANE_BLOCKED = -32004;
+const DEFAULT_LANE_RESTART_LIMIT = 3;
+const DEFAULT_LANE_RESTART_WINDOW_MS = 10 * 60_000;
 
 /**
  * A JSON-RPC error RESPONSE from the imsg child: the request was received,
@@ -131,6 +139,16 @@ interface PendingRequest {
 export interface ImsgRpcDeps {
   /** Handle one `watch.subscribe` row. Called on the watch FIFO, in rowid order. */
   onWatchMessage(data: Record<string, unknown>, generation: number): Promise<void>;
+  /**
+   * The lane-blocked restarts ran out for this window: the client has stopped
+   * restarting and lets -32004 refusals through. Called once per such stretch.
+   */
+  onLaneRestartsExhausted?(info: { restarts: number; windowMs: number }): void;
+}
+
+/** True for imsg's -32004 "Mutation lane blocked" error response. */
+export function isMutationLaneBlocked(err: unknown): boolean {
+  return err instanceof ImsgRpcResponseError && err.rpcCode === MUTATION_LANE_BLOCKED;
 }
 
 /**
@@ -193,6 +211,18 @@ export class ImsgRpcClient {
   // Serializes stdin writes so we can honor backpressure (await 'drain' when
   // write() returns false) instead of unboundedly buffering in the pipe.
   private writeChain: Promise<void> = Promise.resolve();
+  // Requests written to the current child and not yet settled. A lane restart
+  // waits for them before killing the child, so it never turns a send whose
+  // outcome would have been known into one whose outcome is unknown.
+  private inFlight = new Set<Promise<unknown>>();
+  private readonly laneRestartLimit: number;
+  private readonly laneRestartWindowMs: number;
+  /** When each lane-blocked restart started (epoch ms), pruned to the window. */
+  private laneRestarts: number[] = [];
+  /** The lane restart in progress; requests issued meanwhile wait for it. */
+  private laneRecovery: Promise<boolean> | null = null;
+  /** The owner has been told the restarts ran out (reset by the next restart). */
+  private laneExhaustedReported = false;
 
   constructor(config: ImsgChannelConfig, private readonly deps: ImsgRpcDeps) {
     this.cliPath = config.cliPath ?? "imsg";
@@ -204,6 +234,8 @@ export class ImsgRpcClient {
     this.capabilityRetryDelaysMs = config.capabilityRetryDelaysMs ?? DEFAULT_CAPABILITY_RETRY_DELAYS_MS;
     this.capabilityReprobeMinIntervalMs = config.capabilityReprobeMinIntervalMs ?? DEFAULT_CAPABILITY_REPROBE_MIN_INTERVAL_MS;
     this.drainWaitTimeoutMs = config.drainWaitTimeoutMs ?? DEFAULT_DRAIN_WAIT_TIMEOUT_MS;
+    this.laneRestartLimit = config.laneRestartLimit ?? DEFAULT_LANE_RESTART_LIMIT;
+    this.laneRestartWindowMs = config.laneRestartWindowMs ?? DEFAULT_LANE_RESTART_WINDOW_MS;
     this.loadCursor();
   }
 
@@ -385,7 +417,9 @@ export class ImsgRpcClient {
     // persisted cursor so messages that arrived while we were down replay
     // (the GUID dedupe store drops any we already dispatched).
     try {
-      const result = await this.request("watch.subscribe", {
+      // Straight to the wire: a lane restart awaits this subscribe, so it must
+      // not queue behind that restart.
+      const result = await this.wireRequest("watch.subscribe", {
         attachments: true,
         convert_attachments: true,
         include_reactions: true,
@@ -482,9 +516,122 @@ export class ImsgRpcClient {
     child.kill();
   }
 
+  // --- Mutation lane blocked (-32004) ---
+
+  /**
+   * Refused with -32004 → restart the child, then send the same request once
+   * more on the new child.
+   *
+   * The retry is safe from double delivery for the same reason the send
+   * fallbacks are: -32004 is an error RESPONSE, so the child processed the
+   * request and refused it, and nothing went out. Only that refusal is
+   * retried. A timeout, a dead child or a failed write may have delivered,
+   * and is never retried here; nor is the retry itself, whatever its outcome.
+   */
+  private async requestWithLaneRetry(method: string, params: Record<string, unknown>, timeoutMs: number): Promise<Record<string, unknown>> {
+    try {
+      return await this.wireRequest(method, params, timeoutMs);
+    } catch (err) {
+      if (!isMutationLaneBlocked(err)) throw err;
+      if (!(await this.recoverFromLaneBlocked())) throw err;
+      return await this.wireRequest(method, params, timeoutMs);
+    }
+  }
+
+  /**
+   * Restart the child for a blocked lane, or join the restart already under
+   * way (several requests refused together share one). Resolves true when a
+   * fresh, subscribed child is up; false when the restarts for this window
+   * are used up (the owner is told once), the channel is stopping, or the
+   * restart did not produce a child — the caller then reports the refusal.
+   */
+  private recoverFromLaneBlocked(): Promise<boolean> {
+    if (this.laneRecovery) return this.laneRecovery;
+    if (this.stopping) return Promise.resolve(false);
+    const now = Date.now();
+    this.laneRestarts = this.laneRestarts.filter((at) => now - at < this.laneRestartWindowMs);
+    if (this.laneRestarts.length >= this.laneRestartLimit) {
+      log.error(
+        { restarts: this.laneRestarts.length, windowMs: this.laneRestartWindowMs },
+        "imsg mutation lane still blocked (-32004) after the restart limit; not restarting the rpc child again in this window",
+      );
+      if (!this.laneExhaustedReported) {
+        this.laneExhaustedReported = true;
+        try {
+          this.deps.onLaneRestartsExhausted?.({ restarts: this.laneRestarts.length, windowMs: this.laneRestartWindowMs });
+        } catch (err) {
+          log.warn({ err }, "imsg lane-blocked owner notice failed");
+        }
+      }
+      return Promise.resolve(false);
+    }
+    this.laneRestarts.push(now);
+    this.laneExhaustedReported = false;
+    const recovery = this.restartForBlockedLane(this.laneRestarts.length).finally(() => {
+      if (this.laneRecovery === recovery) this.laneRecovery = null;
+    });
+    this.laneRecovery = recovery;
+    return recovery;
+  }
+
+  private async restartForBlockedLane(attempt: number): Promise<boolean> {
+    // Let the requests already on the wire settle first: killing the child
+    // under them would make a delivered-or-refused send an unknown one. Each
+    // has its own timeout; the backstop only covers a timer that never fires.
+    const others = [...this.inFlight];
+    if (others.length > 0) {
+      let backstop: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        Promise.allSettled(others),
+        new Promise<void>((resolve) => {
+          backstop = setTimeout(resolve, DEFAULT_RPC_TIMEOUT_MS * 2);
+          backstop.unref?.();
+        }),
+      ]);
+      clearTimeout(backstop);
+    }
+    const old = this.child;
+    // Stopping, or the child died meanwhile (its crash restart owns it now).
+    if (this.stopping || !old) return false;
+    log.warn(
+      { attempt, limit: this.laneRestartLimit, windowMs: this.laneRestartWindowMs },
+      "imsg mutation lane blocked (-32004); restarting the rpc child",
+    );
+    // The same teardown as a crash (handleChildDown), minus the backoff: queued
+    // watch rows are abandoned and replay from the cursor on resubscribe.
+    this.child = null;
+    this.subscriptionId = null;
+    this.watchGeneration++;
+    this.watchChain = Promise.resolve();
+    this.writeChain = Promise.resolve();
+    this.rejectAllPending("restarted (mutation lane blocked)");
+    old.kill();
+    try {
+      await this.spawnChildAndSubscribe();
+    } catch (err) {
+      log.error({ err }, "imsg rpc child restart after a blocked mutation lane failed");
+      this.scheduleRestart("lane restart failed");
+      return false;
+    }
+    return !this.stopping && this.child !== null;
+  }
+
   // --- JSON-RPC over stdio (newline-delimited JSON) ---
 
+  /**
+   * One JSON-RPC request. A -32004 refusal restarts the child and retries the
+   * request once (see requestWithLaneRetry); a request issued while such a
+   * restart is under way waits for the new child instead of writing to the
+   * one being replaced.
+   */
   request(method: string, params: Record<string, unknown>, timeoutMs = DEFAULT_RPC_TIMEOUT_MS): Promise<Record<string, unknown>> {
+    const recovery = this.laneRecovery;
+    if (recovery) return recovery.then(() => this.requestWithLaneRetry(method, params, timeoutMs));
+    return this.requestWithLaneRetry(method, params, timeoutMs);
+  }
+
+  /** One request on the current child, no lane handling. */
+  private wireRequest(method: string, params: Record<string, unknown>, timeoutMs = DEFAULT_RPC_TIMEOUT_MS): Promise<Record<string, unknown>> {
     const child = this.child;
     if (!child || !child.stdin.writable) {
       return Promise.reject(new Error(`imsg rpc child is not running (${method})`));
@@ -497,7 +644,7 @@ export class ImsgRpcClient {
     const id = this.nextRequestId++;
     const line = `${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`;
 
-    return new Promise<Record<string, unknown>>((resolve, reject) => {
+    const sent = new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         // Settle this request's write link if it is still parked on 'drain':
@@ -520,6 +667,10 @@ export class ImsgRpcClient {
         }
       });
     });
+    this.inFlight.add(sent);
+    const done = () => { this.inFlight.delete(sent); };
+    sent.then(done, done);
+    return sent;
   }
 
   /**

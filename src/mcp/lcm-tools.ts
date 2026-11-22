@@ -1,7 +1,8 @@
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { join } from "node:path";
-import { compactSession } from "../lcm/compact.js";
+import { compactSessionChecked } from "../lcm/chain-check.js";
+import type { CompactResult } from "../lcm/compact.js";
 import { resolveBlockRange, summaryBudgetCheck, type BlockLevel } from "../lcm/blocks.js";
 import { log } from "../logger.js";
 import { compactRefusal, type CompactReservation } from "../lcm/background-gate.js";
@@ -10,6 +11,8 @@ export interface LcmToolDeps {
   /** The caller's SDK session id, resolved at call time (it changes on reset). */
   sdkSessionIdFor: () => string | undefined;
   sdkSessionsDir: string;
+  /** The workspace the SDK resolves this session's transcript under (for the post-rewrite chain check). */
+  workspaceDir: string;
   sessionsDir: string;
   sessionKey: string;
   /**
@@ -93,14 +96,14 @@ export function buildLcmTools(deps: LcmToolDeps) {
           };
         }
 
-        let result: ReturnType<typeof compactSession>;
+        let result: CompactResult;
         let resolved: ReturnType<typeof resolveBlockRange>;
         try {
           resolved = resolveBlockRange(sdkSessionId, level, args.period, deps.sdkSessionsDir);
           if (!resolved) {
             return fail(`No events found for ${level} ${args.period ?? "(default period)"}. Period format: ${PERIOD_HINT[level]}.`);
           }
-          result = compactSession({
+          result = await compactSessionChecked({
             sdkSessionId,
             sdkSessionsDir: deps.sdkSessionsDir,
             fromIdx: resolved.fromIdx,
@@ -111,7 +114,7 @@ export function buildLcmTools(deps: LcmToolDeps) {
             transcriptPath: join(deps.sessionsDir, `_archive_${sdkSessionId}.jsonl`),
             blockTag: resolved.blockTag,
             dropUnparseable: false,
-          });
+          }, { workspaceDir: deps.workspaceDir });
         } finally {
           // Every exit — refused range, failed or successful rewrite, throw —
           // finishes the approval; a successful one stays pending until the

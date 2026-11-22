@@ -80,6 +80,7 @@ describe("lcm_rollup tool", () => {
     const tools = buildLcmTools({
       sdkSessionIdFor: () => (opts.noSessionId ? undefined : sessionId),
       sdkSessionsDir,
+      workspaceDir: join(root, "workspace"),
       sessionsDir,
       sessionKey: "telegram:-100",
       reserveCompact: (sid) => {

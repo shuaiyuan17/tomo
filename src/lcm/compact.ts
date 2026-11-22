@@ -1,6 +1,6 @@
 import {
   writeFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync,
-  openSync, fstatSync, readSync, closeSync, readdirSync, statSync,
+  openSync, fstatSync, readSync, closeSync, readdirSync, statSync, linkSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -104,6 +104,39 @@ interface SdkEvent extends TranscriptEvent {
  * summary message, fixes the parentUuid chain, and archives the originals.
  */
 export function compactSession(req: CompactRequest): CompactResult {
+  return compactSessionCapturing(req);
+}
+
+/**
+ * What a published rewrite leaves behind for the post-rewrite chain check
+ * (lcm/chain-check.ts) to verify it and, if it fails, undo it.
+ *
+ * @internal Filled in by `compactSessionCapturing` only once the rewrite has
+ * been published; an unpublished (failed) compact leaves `published` false.
+ */
+export interface RewriteCapture {
+  published: boolean;
+  /** uuid of the summary event the rewrite inserted. */
+  summaryUuid?: string;
+  /** uuids of the events the rewrite removed (including a rebuilt block). */
+  removedUuids?: ReadonlySet<string>;
+  /**
+   * A hard link to the pre-rewrite inode, taken just before the rename, so it
+   * also holds anything the SDK wrote to the old inode after the rename.
+   * Undefined when the link could not be made (the check is then skipped).
+   * Named like a staging file so `sweepStaleStagingFiles` reaps it if the
+   * process dies before it is removed.
+   */
+  backupPath?: string;
+  /** Size and inode of the published file after the old-inode drain. */
+  publishedSize?: number;
+  publishedIno?: number;
+  /** Whether a reload trigger already existed before this rewrite wrote one. */
+  triggerExisted?: boolean;
+}
+
+/** @internal `compactSession`, optionally keeping what a rollback needs. */
+export function compactSessionCapturing(req: CompactRequest, capture?: RewriteCapture): CompactResult {
   // Before anything else: clear out staging corpses. A compact/prune killed
   // between writing its temp file and renaming it (SIGKILL, an OOM, a laptop
   // lid) leaves a FULL COPY of the session file behind under a name nothing
@@ -132,7 +165,7 @@ export function compactSession(req: CompactRequest): CompactResult {
 
   const sourceFd = openSync(path, "r");
   try {
-    return compactSessionWithFd(req, path, sourceFd);
+    return compactSessionWithFd(req, path, sourceFd, capture);
   } finally {
     // Holding this fd keeps the old inode readable after rename, so we can
     // drain SDK writes that land there. Once closed, any SDK writer that had
@@ -143,7 +176,9 @@ export function compactSession(req: CompactRequest): CompactResult {
   }
 }
 
-function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: number): CompactResult {
+function compactSessionWithFd(
+  req: CompactRequest, path: string, sourceFd: number, capture?: RewriteCapture,
+): CompactResult {
   // Atomic read: open once, fstat the FD, then read exactly that many bytes.
   // `bytesAtRead` is pinned to the last-newline boundary (NOT current EOF) so
   // that any partial mid-write tail stays *outside* the snapshot — the
@@ -470,7 +505,13 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
   // unlinks its own corpse on failure instead of leaving a full copy of the
   // session beside it, and preserves the file's mode across the rename.
   const output = newEvents.map(serializeJsonlRecord).join("\n") + "\n";
-  writeFileAtomicSync(path, output, { beforeRename: req.beforeRenameForTest });
+  const backupPath = capture ? linkPreRewriteBackup(path, req.sdkSessionId) : undefined;
+  try {
+    writeFileAtomicSync(path, output, { beforeRename: req.beforeRenameForTest });
+  } catch (err) {
+    if (backupPath) { try { unlinkSync(backupPath); } catch { /* best-effort */ } }
+    throw err;
+  }
   req.afterRenameForTest?.();
 
   // The final pre-rename tail read still has a tiny race: the SDK can open
@@ -496,6 +537,17 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
     }, "Post-rename old-inode drain stopped with partial SDK write still pending");
   }
 
+  if (capture) {
+    const published = statSync(path);
+    capture.published = true;
+    capture.summaryUuid = summaryUuid;
+    capture.removedUuids = removedUuids;
+    capture.backupPath = backupPath;
+    capture.publishedSize = published.size;
+    capture.publishedIno = published.ino;
+    capture.triggerExisted = existsSync(getCompactTriggerPath(req.sdkSessionId, req.sdkSessionsDir));
+  }
+
   // Write trigger file so the harness knows to reload the session
   writeFileSync(getCompactTriggerPath(req.sdkSessionId, req.sdkSessionsDir), new Date().toISOString());
 
@@ -517,6 +569,24 @@ function compactSessionWithFd(req: CompactRequest, path: string, sourceFd: numbe
     eventsRemoved,
     eventsAfter,
   };
+}
+
+/**
+ * Hard-link the session file under a staging-corpse name before it is
+ * replaced. A link, not a copy: no bytes are duplicated, and the backup IS the
+ * old inode, so SDK appends that land on it after the rename are in it too.
+ * Returns undefined (and the rewrite proceeds unchecked, as it always did)
+ * when the filesystem refuses the link.
+ */
+function linkPreRewriteBackup(path: string, sessionId: string): string | undefined {
+  const backupPath = `${path}.lcm-backup.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    linkSync(path, backupPath);
+    return backupPath;
+  } catch (err) {
+    log.warn({ err, sessionId }, "Could not link a pre-rewrite backup; the chain check is skipped for this rewrite");
+    return undefined;
+  }
 }
 
 function findUnrelatedSummaryInExpansionGap(

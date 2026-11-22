@@ -1,7 +1,7 @@
 import { WALK_RULE_FACTOR, WALK_SPEED_LIMITS, WANDER_EVERY_LIMITS, type HomePart, type HomeReaction, type HomeScene, type HomeWalk, type HomeWander } from "./scene.js";
 import { centre, num, placeScene, vec, whatOf, type Box, type Vec3 } from "./geometry.js";
 import { landings, NAV_PET, NAV_WALKER, type NavGrid, type RouteResult, type WalkerSize } from "./nav.js";
-import { characterReach, MOVER_NAMES, SceneReach, walkerOf, wanderOnly, type CharacterPlace, type Mover } from "./reach.js";
+import { characterReach, moverName, moversOf, SceneReach, walkerOf, wanderOnly, type CharacterPlace, type Mover } from "./reach.js";
 
 /**
  * The floor plan: the text Tomo "sees" of its home when there is no picture.
@@ -34,6 +34,7 @@ export function describeCondition(condition: string): string {
     trouble: ["while in trouble (retrying, rate-limited or errored)", "while not in trouble"],
     day: ["by day (outside the window)", "except by day"],
     night: ["at night (outside the window)", "except at night"],
+    walking: ["while the character it is on walks", "while the character it is on stands still"],
   };
   if (words[bare]) return words[bare][negated ? 1 : 0];
   const by = /^by:(.+)$/.exec(bare);
@@ -170,7 +171,7 @@ export function renderFloorPlan(scene: HomeScene): string {
   // ---- where the characters can walk: one map per walker size in use ----
   const reach = new SceneReach(scene, placement);
   const reached = characterReach(reach, scene);
-  const NAMES: Record<Mover, string> = { tomo: "Tomo", visitors: "the visitors", pet: "the pet" };
+  const names = (who: Mover) => who === "visitors" ? "the visitors" : moverName(who);
   for (const walker of [...new Set(reached.map((r) => walkerOf(r.who, scene)))]) {
     const sharing = reached.filter((r) => walkerOf(r.who, scene) === walker);
     const grid = reach.grid(walker);
@@ -190,7 +191,7 @@ export function renderFloorPlan(scene: HomeScene): string {
     const one = sharing.length === 1;
     const split = areas.size > 1
       ? ` ${one ? "Its" : "Their"} spots are in ${areas.size} areas that cannot reach each other: ${[...areas.values()].map(areaWords).join("; ")}.` : "";
-    lines.push(`Floor ${sharing.map((r) => NAMES[r.who]).join(" and ")} can walk on (${sizeWords(walker)}): . floor one of ${one ? "its" : "their"} spots leads to, # in the way, ~ floor none of them gets to, digits are spots.${split}`);
+    lines.push(`Floor ${sharing.map((r) => names(r.who)).join(" and ")} can walk on (${sizeWords(walker)}): . floor one of ${one ? "its" : "their"} spots leads to, # in the way, ~ floor none of them gets to, digits are spots.${split}`);
     lines.push(`+${"-".repeat(cols)}+`);
     for (const r of map) lines.push(`|${r.join("")}|`);
     lines.push(`+${"-".repeat(cols)}+`);
@@ -262,7 +263,7 @@ export function renderFloorPlan(scene: HomeScene): string {
     const spot = scene.spots![name];
     const facing = spot.facing ?? 0;
     const towards = facingWords(facing);
-    const how = [...(standings.get(name) ?? new Map<Mover, string>())].map(([who, words]) => `${MOVER_NAMES[who]}: ${words}`);
+    const how = [...(standings.get(name) ?? new Map<Mover, string>())].map(([who, words]) => `${moverName(who)}: ${words}`);
     const what = new Set(how.map((h) => h.slice(h.indexOf(": ") + 2)));
     const words = what.size === 1 ? `; ${[...what][0]}` : how.length ? `; ${how.join("; ")}` : "";
     lines.push(`- ${i < 9 ? i + 1 : "*"} ${name}: at ${vec(spot.at)}, ${region(spot.at, scene)}, facing ${num(facing)}° (${towards})${words}.`);
@@ -281,7 +282,7 @@ export function renderFloorPlan(scene: HomeScene): string {
   // How it wanders, and how fast it walks.
   const strolls = (wander: HomeWander | undefined, walk: HomeWalk | undefined, tomo: boolean) => {
     const speed = walk?.speed ?? WALK_SPEED_LIMITS.default;
-    const pace = `walks at ${num(speed)} m/s (${num(speed * WALK_RULE_FACTOR)} m/s when a rule sends it somewhere)${walk?.radius !== undefined ? `, with a ${num(walk.radius)} m footprint radius` : ""}`;
+    const pace = `walks at ${num(speed)} m/s (${num(speed * WALK_RULE_FACTOR)} m/s when a rule sends it somewhere)${walk?.radius !== undefined ? `, with a ${num(walk.radius)} m footprint radius` : ""}${walk?.height !== undefined ? `, needing ${num(walk.height)} m above it to pass under something` : ""}`;
     if (!wander) { if (walk) lines.push(`    It ${pace}.`); return; }
     const [low, high] = wander.every ?? WANDER_EVERY_LIMITS.default;
     const spots = [...new Set(wander.spots)];
@@ -289,7 +290,7 @@ export function renderFloorPlan(scene: HomeScene): string {
     const when = [tomo ? "while idle" : "", wander.when !== undefined ? describeWhen(wander.when) : ""].filter(Boolean).join(" and ");
     lines.push(`    When no rule holds, it wanders between ${between}${when ? ` ${when}` : ""}, staying ${num(low)}–${num(high)} s at each; it ${pace}. Not under the viewer's reduced-motion setting: then it stays at its spot.`);
   };
-  if (!c || (!c.tomo && !c.visitors && !c.pet)) lines.push("  Nobody: there are no characters, so Tomo is not drawn.");
+  if (!c || (!c.tomo && !c.visitors && !c.pet && !Object.keys(c.others ?? {}).length)) lines.push("  Nobody: there are no characters, so Tomo is not drawn.");
   if (c?.tomo) {
     const rules = (c.tomo.rules ?? []).map((rule) => `at ${rule.spot} ${describeWhen(rule.when)}`);
     lines.push(`- Tomo (a ${c.tomo.kind}): ${rules.length ? `${rules.join("; otherwise ")}; otherwise ` : ""}at ${c.tomo.spot}${c.tomo.wander ? ", or wandering" : ""}.`);
@@ -307,6 +308,13 @@ export function renderFloorPlan(scene: HomeScene): string {
     lines.push(`- The pet (a ${c.pet.kind}), when Tomo has one: ${rules.length ? `${rules.join("; otherwise ")}; otherwise ` : ""}at ${c.pet.spot}${c.pet.wander ? ", or wandering" : ""}.`);
     strolls(c.pet.wander, c.pet.walk, false);
     walks("pet");
+  }
+  for (const [who, other] of moversOf(scene)) {
+    if (!who.startsWith("others.")) continue;
+    const rules = (other.rules ?? []).map((rule) => `at ${rule.spot} ${describeWhen(rule.when)}`);
+    lines.push(`- ${moverName(who)} (a ${other.kind}, one of the others): ${rules.length ? `${rules.join("; otherwise ")}; otherwise ` : ""}at ${other.spot}${other.wander ? ", or wandering" : ""}.`);
+    strolls(other.wander, other.walk, false);
+    walks(who);
   }
 
   let text = lines.join("\n");
@@ -342,7 +350,9 @@ function walkableMap(grid: NavGrid, reached: ReadonlySet<number>, cols: number, 
 function sizeWords(walker: WalkerSize): string {
   if (walker === NAV_PET) return "the pet's size";
   if (walker === NAV_WALKER) return "Tomo's size";
-  return `a ${num(walker.radius)} m footprint radius`;
+  // The clearance only when it is not a preset's (a pet with its own radius keeps the pet's).
+  const own = walker.headroom !== NAV_WALKER.headroom && walker.headroom !== NAV_PET.headroom;
+  return `a ${num(walker.radius)} m footprint radius${own ? `, ${num(walker.headroom)} m tall` : ""}`;
 }
 /** How a character stands at a place it can get to the floor from: on the floor, or on a perch it hops to. */
 function standing(grid: NavGrid, at: Vec3): string {

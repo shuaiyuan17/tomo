@@ -334,3 +334,85 @@ describe("walk and wander", () => {
     expect(gap(0.4).join("\n")).toContain("open a gap at least 0.9 m wide");
   });
 });
+
+describe("characters.others and walking", () => {
+  /** room() with a dog under characters.others that strolls between the chair, the seat and the window. */
+  const others = (change: (s: any) => void = () => {}) => check((s) => {
+    s.spots.window = { at: [0, 0, -2.3] };
+    s.kinds.dog = { parts: [{ shape: "sphere", size: [0.5, 0.35, 0.9] }] };
+    s.characters.others = { momo: { kind: "dog", spot: "seat", rules: [{ when: "night", spot: "window" }], walk: { speed: 1.1, radius: 0.35 }, wander: { spots: ["seat", "window", "chair"], every: [20, 60] } } };
+    change(s);
+  });
+
+  it("a scene with others checks clean; others is optional, and so is everything but kind and spot", () => {
+    expect(others()).toMatchObject({ ok: true, problems: [], warnings: [] });
+    expect(others((s) => { s.characters.others.momo = { kind: "dog", spot: "seat" }; })).toMatchObject({ ok: true, problems: [], warnings: [] });
+    expect(others((s) => { s.characters.others = {}; })).toMatchObject({ ok: true, problems: [] });
+  });
+
+  it("problems name the other by name and say how to fix it", () => {
+    expect(one((s) => { s.kinds.dog = { parts: [{ shape: "box" }] }; s.characters.others = { momo: { kind: "dogg", spot: "seat" } }; }))
+      .toBe('characters.others.momo.kind: kind "dogg" is not defined (did you mean "dog"?); add it under kinds, or use one of me, guest, dog.');
+    expect(one((s) => { s.kinds.dog = { parts: [{ shape: "box" }] }; s.characters.others = { momo: { kind: "dog", spot: "sat" } }; }))
+      .toBe('characters.others.momo.spot: spot "sat" is not defined (did you mean "seat"?); add it under spots, or use one of chair, seat.');
+    expect(others((s) => { s.characters.others.momo.wander.spots[1] = "windw"; }).problems)
+      .toEqual(['characters.others.momo.wander.spots[1]: spot "windw" is not defined (did you mean "window"?); add it under spots, or use one of chair, seat, window.']);
+    expect(others((s) => { s.characters.others.momo.rules[0].spot = "nowhere"; }).problems.join()).toContain("characters.others.momo.rules[0].spot: spot \"nowhere\" is not defined");
+    expect(others((s) => { s.characters.others.momo.walk.speed = 9; }).problems).toEqual(["characters.others.momo.walk.speed: 9 is too large; the most is 3."]);
+    expect(others((s) => { s.characters.others.momo.wnader = {}; }).problems.join()).toContain('characters.others.momo: "wnader" is not part of the scene format (did you mean "wander"?)');
+    expect(others((s) => { s.characters.othrs = s.characters.others; delete s.characters.others; }).problems.join()).toContain('(did you mean "others"?)');
+    expect(others((s) => { s.characters.others.Momo = s.characters.others.momo; delete s.characters.others.momo; }).problems.join())
+      .toContain('the name "Momo" should be lowercase letters, digits and dashes');
+  });
+
+  it("at most four others", () => {
+    const five = others((s) => { for (const name of ["a", "b", "c", "d"]) s.characters.others[name] = { kind: "dog", spot: "chair" }; });
+    expect(five.problems).toEqual(["characters.others has 5 entries; the most is 4. Keep the ones that matter most."]);
+    expect(others((s) => { for (const name of ["a", "b", "c"]) s.characters.others[name] = { kind: "dog", spot: "chair" }; }).problems).toEqual([]);
+  });
+
+  it("walk.height is checked and is the clearance it is checked at: a tall walker does not pass under a low shelf", () => {
+    expect(others((s) => { s.characters.others.momo.walk.height = 0.1; }).problems).toEqual(["characters.others.momo.walk.height: 0.1 is too small; the least is 0.2."]);
+    expect(others((s) => { s.characters.others.momo.walk.heigt = 1; }).problems.join()).toContain('(did you mean "height"?)');
+    // A shelf from 0.5 m up spans the room across z = 1 (no way round it): "den" behind it.
+    const under = (height?: number) => check((s) => {
+      s.kinds.dog = { parts: [{ shape: "sphere", size: [0.5, 0.35, 0.9] }] };
+      s.objects.push({ shape: "box", size: [6, 0.1, 0.4], at: [0, 0.5, 1] });
+      s.spots.den = { at: [0, 0, 2.2] };
+      s.characters.others = { momo: { kind: "dog", spot: "seat", rules: [{ when: "night", spot: "den" }], ...(height ? { walk: { height } } : {}) } };
+    }).warnings.filter((w) => w.startsWith("characters.others"));
+    expect(under(0.45)).toEqual([]);
+    expect(under().join("\n")).toContain('characters.others.momo.rules[0]: momo cannot walk to "den" from "seat"');
+  });
+
+  it("others are reach-checked at their own size, named by name; a place only wandered to is left out", () => {
+    const result = others((s) => {
+      // A wall across z = 1 with a 0.7 m gap: fine at Tomo's size, too narrow for a 0.4 m radius.
+      s.objects.push({ shape: "box", size: [2.65, 1, 0.2], at: [-1.675, 0, 1] }, { shape: "box", size: [2.65, 1, 0.2], at: [1.675, 0, 1] });
+      s.spots.den = { at: [0, 0, 2.2] };
+      s.characters.tomo.rules = [{ when: "working", spot: "den" }];
+      s.characters.others.momo.walk.radius = 0.4;
+      s.characters.others.momo.wander.spots = ["seat", "window", "den"];
+    });
+    expect(result.ok).toBe(true);
+    expect(result.warnings.filter((w) => w.startsWith("characters.tomo"))).toEqual([]);
+    const momo = result.warnings.filter((w) => w.startsWith("characters.others.momo"));
+    expect(momo.length).toBeGreaterThan(0);
+    expect(momo.join("\n")).toMatch(/^characters\.others\.momo\.wander\.spots\[2\]: momo cannot walk to "den" from "seat" or "window": .* So it does not wander there from those places\. .*open a gap at least 0\.9 m wide/m);
+  });
+
+  it("walking holds only on a character's body: elsewhere, and in a rule or wander.when, it is a warning", () => {
+    // On the body of Tomo, a visitor, the pet or one of the others: fine, also inside a kind the body is built from.
+    const eyes = { shape: "box", size: [0.2, 0.04, 0.02], reactions: [{ when: ["idle", "not:walking"], do: "show" }] };
+    expect(others((s) => { s.kinds.dog.parts.push(eyes); s.kinds.me.parts.push(eyes); s.kinds.guest.parts.push({ kind: "eyes" }); s.kinds.eyes = { parts: [eyes] }; }).warnings).toEqual([]);
+    expect(others((s) => { s.objects[1].reactions = [{ when: "walking", do: "glow" }]; }).warnings)
+      .toEqual(['objects[1] "screen".reactions[0]: walking only holds on a character\'s own body (a part of the kind it is drawn with), and this is an object in the room, so it never holds here; move the reaction into the character\'s kind, or remove it.']);
+    expect(others((s) => { s.kinds.lamp = { parts: [eyes] }; s.objects.push({ kind: "lamp", at: [2, 0, 2] }); }).warnings)
+      .toEqual(['kinds.lamp.parts[0].reactions[0]: walking only holds on a character\'s own body (a part of the kind it is drawn with), and this is in kind "lamp", which no character is drawn with, so not:walking always holds here; move the reaction into the character\'s kind, or remove it.']);
+    expect(others((s) => { s.characters.others.momo.rules[0].when = ["night", "walking"]; }).warnings)
+      .toEqual(["characters.others.momo.rules[0].when: walking only holds for reactions on a character's own body; where a character goes cannot depend on it, so here it never holds (and not:walking always does). Remove it."]);
+    expect(others((s) => { s.characters.others.momo.wander.when = "not:walking"; }).warnings)
+      .toEqual(["characters.others.momo.wander.when: walking only holds for reactions on a character's own body; where a character goes cannot depend on it, so here it never holds (and not:walking always does). Remove it."]);
+    expect(one((s) => { s.objects[1].reactions = [{ when: "walkng", do: "glow" }]; })).toContain("should be a condition");
+  });
+});

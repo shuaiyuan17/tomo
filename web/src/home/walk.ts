@@ -287,6 +287,17 @@ function withCarry(plan: WalkPlan, carry: Carry): WalkPlan {
   return { ...plan, duration, carry: { fade, bob } };
 }
 
+/**
+ * Whether the character is walking or hopping `t` seconds into the move:
+ * only during a walk's own phases. A turn on the spot, a blink, standing
+ * still, and the easing a carried-over fade or bounce adds past the last
+ * phase, are not walking.
+ */
+export function movingAt(plan: WalkPlan | null, t: number): boolean {
+  if (!plan || plan.kind !== "walk" || t < 0) return false;
+  return plan.phases.some((p) => t >= p.start && t < p.start + p.duration);
+}
+
 /** Where the move has got to `t` seconds after it started. */
 export function poseAt(plan: WalkPlan, t: number): WalkPose {
   const pose = basePose(plan, t);

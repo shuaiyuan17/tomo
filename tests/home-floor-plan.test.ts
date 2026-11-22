@@ -117,4 +117,23 @@ describe("home floor plan", () => {
     delete scene.characters!.tomo!.wander;
     expect(renderFloorPlan(scene)).toContain("otherwise at rug.\n    It walks at 0.8 m/s (1.2 m/s when a rule sends it somewhere).\n");
   });
+
+  it("puts the others under Who goes where by name, maps the floor at their own size, and says where they stand", () => {
+    const scene = structuredClone(SCENE);
+    scene.kinds!.dog = { parts: [{ shape: "sphere", size: [0.5, 0.35, 0.9] }] };
+    scene.characters!.others = { momo: { kind: "dog", spot: "rug", rules: [{ when: "night", spot: "seat-1" }], walk: { speed: 1.1, radius: 0.35, height: 0.6 }, wander: { spots: ["rug", "hall"], every: [20, 60] } } };
+    const text = renderFloorPlan(scene);
+    const who = text.slice(text.indexOf("Who goes where:"));
+    expect(who).toContain("- momo (a dog, one of the others): at seat-1 at night (outside the window); otherwise at rug, or wandering.\n"
+      + "    When no rule holds, it wanders between rug and hall, staying 20–60 s at each; it walks at 1.1 m/s (1.65 m/s when a rule sends it somewhere), with a 0.35 m footprint radius, needing 0.6 m above it to pass under something. Not under the viewer's reduced-motion setting: then it stays at its spot.\n"
+      + "    Walks from rug: to seat-1: ");
+    expect(text).toContain("Floor momo can walk on (a 0.35 m footprint radius, 0.6 m tall)");
+    // Spots name each character's standing when they differ (Tomo and momo on the floor at rug alike).
+    expect(text).toMatch(/- \d rug: at .*; on the floor\./);
+    // Others alone still count as characters.
+    const alone = structuredClone(scene);
+    alone.characters = { others: alone.characters!.others };
+    expect(renderFloorPlan(alone)).not.toContain("Nobody: there are no characters");
+    expect(renderFloorPlan(alone)).toContain("- momo (a dog, one of the others)");
+  });
 });

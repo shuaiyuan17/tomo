@@ -80,14 +80,17 @@ export type HomeShape = typeof SHAPES[number];
  * weather:clear|clouds|overcast|fog|rain|snow|storm
  *                       the weather outside, when a city is configured and
  *                       the weather is known; none of them holds otherwise
+ * walking               on a character's own body only (a part of the kind
+ *                       it is drawn with): it is walking or hopping right
+ *                       now. Anywhere else it never holds.
  */
 export const WEATHERS = ["clear", "clouds", "overcast", "fog", "rain", "snow", "storm"] as const;
 export type HomeWeather = typeof WEATHERS[number];
 export const CONDITIONS = ["working", "idle", "by:owner", "by:cron", "by:heartbeat", "by:group",
   "tool:shell", "tool:files", "tool:web", "tool:search", "tool:subagent", "tool:other",
   "subagents", "tasks", "cron", "compacting", "trouble", "day", "night",
-  "weather:clear", "weather:clouds", "weather:overcast", "weather:fog", "weather:rain", "weather:snow", "weather:storm"] as const;
-export const CONDITION = /^(not:)?(working|idle|by:(owner|cron|heartbeat|group)|tool:(shell|files|web|search|subagent|other)|subagents|tasks|cron|compacting|trouble|day|night|weather:(clear|clouds|overcast|fog|rain|snow|storm)|pet:[a-z]{1,20})$/;
+  "weather:clear", "weather:clouds", "weather:overcast", "weather:fog", "weather:rain", "weather:snow", "weather:storm", "walking"] as const;
+export const CONDITION = /^(not:)?(working|idle|by:(owner|cron|heartbeat|group)|tool:(shell|files|web|search|subagent|other)|subagents|tasks|cron|compacting|trouble|day|night|weather:(clear|clouds|overcast|fog|rain|snow|storm)|walking|pet:[a-z]{1,20})$/;
 const condition = z.string().regex(CONDITION);
 /** One condition, or several that must all hold. */
 const when = z.union([condition, z.array(condition).min(1).max(4)]);
@@ -188,16 +191,21 @@ const spot = z.object({
 /**
  * How a character walks: `speed` in m/s, `radius` its footprint for finding
  * a way round the furniture (not worked out from its body: a crab's claws
- * would make it too wide to pass anything). A wandering stroll goes at
+ * would make it too wide to pass anything), `height` the clearance it needs
+ * (it walks under anything that starts at least this high; lower is in its
+ * way). Both default to its sort's size (nav.ts NAV_WALKER, the pet
+ * NAV_PET). A wandering stroll goes at
  * `speed`; a move a rule makes goes WALK_RULE_FACTOR times as fast, and
  * takes at most a few seconds however far it is.
  */
 export const WALK_SPEED_LIMITS = { min: 0.2, max: 3, default: 1 } as const;
 export const WALK_RULE_FACTOR = 1.5;
 export const WALK_RADIUS_LIMITS = { min: 0.1, max: 0.6 } as const;
+export const WALK_HEIGHT_LIMITS = { min: 0.2, max: 2.5 } as const;
 const walk = z.object({
   speed: z.number().finite().min(WALK_SPEED_LIMITS.min).max(WALK_SPEED_LIMITS.max).optional(),
   radius: z.number().finite().min(WALK_RADIUS_LIMITS.min).max(WALK_RADIUS_LIMITS.max).optional(),
+  height: z.number().finite().min(WALK_HEIGHT_LIMITS.min).max(WALK_HEIGHT_LIMITS.max).optional(),
 }).strict();
 export type HomeWalk = z.infer<typeof walk>;
 
@@ -217,6 +225,9 @@ const wander = z.object({
   when: when.optional(),
 }).strict();
 export type HomeWander = z.infer<typeof wander>;
+
+/** At most this many characters under `characters.others` (check.ts says so). */
+export const MAX_OTHERS = 4;
 
 const mover = z.object({
   kind: slug,
@@ -247,6 +258,13 @@ const characters = z.object({
    * Tomo it may wander while Tomo works.
    */
   pet: mover.optional(),
+  /**
+   * More characters, by name (a slug): a dog, a second cat. Each is like the
+   * pet (rules, then wander, then its own spot; it may wander while Tomo
+   * works) but always drawn, and its size defaults to Tomo's. At most
+   * MAX_OTHERS.
+   */
+  others: z.record(slug, mover).optional(),
 }).strict();
 
 export const homeSceneSchema = z.object({
@@ -277,3 +295,4 @@ export const homeSceneSchema = z.object({
 export type HomeScene = z.infer<typeof homeSceneSchema>;
 export type HomeSpot = z.infer<typeof spot>;
 export type HomeCharacters = z.infer<typeof characters>;
+export type HomeMover = z.infer<typeof mover>;

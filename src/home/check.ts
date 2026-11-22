@@ -1,12 +1,12 @@
 import type { core } from "zod";
 import {
-  ASSET_NAME, CONDITIONS, homeSceneSchema, MAX_DEPTH, MAX_KINDS, MAX_OBJECTS, MAX_REACTIONS, MAX_SCENE_BYTES, MAX_SIGN_CHARS,
+  ASSET_NAME, CONDITIONS, homeSceneSchema, MAX_DEPTH, MAX_KINDS, MAX_OBJECTS, MAX_OTHERS, MAX_REACTIONS, MAX_SCENE_BYTES, MAX_SIGN_CHARS,
   MAX_SPOTS, REACTION_DEFAULTS, REACTIONS, SHAPES, SIGN_VALUES, SLUG, type HomePart, type HomeScene,
 } from "./scene.js";
 import { centre, num, placeScene, roomBox, vec, whatOf, type Box, type Placement } from "./geometry.js";
 import { describeReaction } from "./floor-plan.js";
 import { NAV_MAX_HOP, type Hurdle } from "./nav.js";
-import { characterReach, MOVER_NAMES, SceneReach, walkerOf, wanderOnly, type CharacterPlace, type Unreachable } from "./reach.js";
+import { characterReach, moverName, moversOf, SceneReach, walkerOf, wanderOnly, type CharacterPlace, type Unreachable } from "./reach.js";
 
 /**
  * The whole-scene check: everything the zod schema cannot see because it
@@ -42,7 +42,7 @@ export const PET_MOODS = ["sleeping", "recovering", "blissful", "happy", "conten
 
 const PART_KEYS = ["id", "shape", "kind", "picture", "sign", "window", "background", "size", "scale", "at", "turn", "color", "on", "reactions", "parts"];
 const KNOWN_KEYS = [...PART_KEYS, "version", "name", "room", "light", "kinds", "objects", "spots", "characters", "floor", "walls", "backdrop",
-  "angle", "level", "when", "do", "amount", "speed", "facing", "tomo", "visitors", "pet", "spot", "rules", "overflow", "walk", "wander", "radius", "every"];
+  "angle", "level", "when", "do", "amount", "speed", "facing", "tomo", "visitors", "pet", "spot", "rules", "overflow", "walk", "wander", "radius", "every", "others", "height"];
 /** Rough width of the text a `{value}` turns into, in characters. */
 /** The smallest a sign's text is drawn, as a share of the panel's height, before it is cut with an ellipsis. */
 export const SIGN_MIN_TEXT_HEIGHT = 0.3;
@@ -227,7 +227,8 @@ function checkWhole(scene: HomeScene, options: HomeCheckOptions, report: Report)
   const kinds = scene.kinds ?? {};
   const kindNames = Object.keys(kinds);
   const spots = scene.spots ?? {};
-  const visitorKinds = visitorKindSet(scene);
+  const visitorKinds = bodyKindSet(scene, "visitors");
+  const bodyKinds = bodyKindSet(scene, "all");
 
   if (kindNames.length > MAX_KINDS) report.problem(`kinds has ${kindNames.length} entries; the most is ${MAX_KINDS}. Merge kinds that look alike.`);
   if (Object.keys(spots).length > MAX_SPOTS) report.problem(`spots has ${Object.keys(spots).length} entries; the most is ${MAX_SPOTS}. Remove spots nothing uses.`);
@@ -287,6 +288,9 @@ function checkWhole(scene: HomeScene, options: HomeCheckOptions, report: Report)
         const mood = /^(?:not:)?pet:(.+)$/.exec(condition)?.[1];
         if (mood && !(PET_MOODS as readonly string[]).includes(mood)) report.warn(`${place}.reactions[${i}]: pet:${mood} can never hold; the pet's moods are ${PET_MOODS.join(", ")}.`);
       }
+      if (asksWalking(reaction.when) && (kind === undefined || !bodyKinds.has(kind))) {
+        report.warn(`${place}.reactions[${i}]: walking only holds on a character's own body (a part of the kind it is drawn with), and this is ${kind === undefined ? "an object in the room" : `in kind ${JSON.stringify(kind)}, which no character is drawn with`}, so ${reaction.when.includes("not:walking") ? "not:walking always holds" : "it never holds"} here; move the reaction into the character's kind, or remove it.`);
+      }
     });
   }
 
@@ -308,11 +312,12 @@ function checkWhole(scene: HomeScene, options: HomeCheckOptions, report: Report)
   if (report.problems.length === 0) checkReach(scene, report);
 }
 
-/** The visitors' kinds and every kind they are built from: a `{task}` sign in any of them is on a visitor. */
-function visitorKindSet(scene: HomeScene): Set<string> {
-  const visitors = scene.characters?.visitors;
+/** The kinds characters are drawn with and every kind those are built from: `{task}` on a visitor, `walking` on any character. */
+function bodyKindSet(scene: HomeScene, which: "visitors" | "all"): Set<string> {
+  const c = scene.characters;
+  const visitors = c?.visitors ? [c.visitors.kind, ...Object.values(c.visitors.kinds ?? {})] : [];
+  const queue = which === "visitors" ? visitors : [...visitors, ...moversOf(scene).map(([, m]) => m.kind)];
   const found = new Set<string>();
-  const queue = visitors ? [visitors.kind, ...Object.values(visitors.kinds ?? {})] : [];
   const visit = (parts: readonly HomePart[] | undefined): void => {
     for (const part of parts ?? []) { if (part.kind) queue.push(part.kind); visit(part.parts); }
   };
@@ -323,6 +328,11 @@ function visitorKindSet(scene: HomeScene): Set<string> {
     visit(scene.kinds?.[name]?.parts);
   }
   return found;
+}
+
+/** Whether a `when` asks `walking` (or `not:walking`). */
+function asksWalking(when: string | readonly string[]): boolean {
+  return (typeof when === "string" ? [when] : when).some((c) => c === "walking" || c === "not:walking");
 }
 
 function checkSign(part: HomePart, place: string, onVisitor: boolean, report: Report): void {
@@ -427,10 +437,15 @@ function checkCharacters(scene: HomeScene, usedKinds: Set<string>, report: Repor
       if (mood && !(PET_MOODS as readonly string[]).includes(mood)) report.warn(`${place}: pet:${mood} can never hold; the pet's moods are ${PET_MOODS.join(", ")}.`);
     }
   };
+  /** `walking` says how a body looks on the way; where a character goes cannot hang on it. */
+  const noWalking = (place: string, when: string | string[]) => {
+    if (asksWalking(when)) report.warn(`${place}: walking only holds for reactions on a character's own body; where a character goes cannot depend on it, so here it never holds (and not:walking always does). Remove it.`);
+  };
   /** A rule's spot must exist, and its moods be real. */
   const checkRule = (place: string, rule: { when: string | string[]; spot: string }) => {
     needSpot(`${place}.spot`, rule.spot);
     checkMoods(place, rule.when);
+    noWalking(`${place}.when`, rule.when);
   };
   /** Every wander spot must exist, each listed once; its `when` must be able to hold (Tomo wanders only while idle). */
   const checkWander = (place: string, wander: NonNullable<NonNullable<typeof characters.tomo>["wander"]>, tomo: boolean) => {
@@ -440,15 +455,20 @@ function checkCharacters(scene: HomeScene, usedKinds: Set<string>, report: Repor
     });
     if (wander.when === undefined) return;
     checkMoods(`${place}.when`, wander.when);
+    noWalking(`${place}.when`, wander.when);
     const never = (Array.isArray(wander.when) ? wander.when : [wander.when]).find((c) => c === "working" || c === "not:idle" || /^by:/.test(c));
     if (tomo && never) report.warn(`${place}.when: ${JSON.stringify(never)} never holds while you are idle, and you only wander while idle, so you never wander; remove it from when.`);
   };
-  if (characters.tomo) {
-    needKind("characters.tomo.kind", characters.tomo.kind);
-    needSpot("characters.tomo.spot", characters.tomo.spot);
-    (characters.tomo.rules ?? []).forEach((rule, i) => checkRule(`characters.tomo.rules[${i}]`, rule));
-    if (characters.tomo.wander) checkWander("characters.tomo.wander", characters.tomo.wander, true);
-  }
+  const others = Object.keys(characters.others ?? {});
+  if (others.length > MAX_OTHERS) report.problem(`characters.others has ${others.length} entries; the most is ${MAX_OTHERS}. Keep the ones that matter most.`);
+  const checkMover = (who: string, mover: NonNullable<typeof characters.tomo>) => {
+    const place = `characters.${who}`;
+    needKind(`${place}.kind`, mover.kind);
+    needSpot(`${place}.spot`, mover.spot);
+    (mover.rules ?? []).forEach((rule, i) => checkRule(`${place}.rules[${i}]`, rule));
+    if (mover.wander) checkWander(`${place}.wander`, mover.wander, who === "tomo");
+  };
+  if (characters.tomo) checkMover("tomo", characters.tomo);
   if (characters.visitors) {
     const visitors = characters.visitors;
     needKind("characters.visitors.kind", visitors.kind);
@@ -459,12 +479,7 @@ function checkCharacters(scene: HomeScene, usedKinds: Set<string>, report: Repor
     });
     if (visitors.overflow !== undefined) needSpot("characters.visitors.overflow", visitors.overflow);
   }
-  if (characters.pet) {
-    needKind("characters.pet.kind", characters.pet.kind);
-    needSpot("characters.pet.spot", characters.pet.spot);
-    (characters.pet.rules ?? []).forEach((rule, i) => checkRule(`characters.pet.rules[${i}]`, rule));
-    if (characters.pet.wander) checkWander("characters.pet.wander", characters.pet.wander, false);
-  }
+  for (const [who, mover] of moversOf(scene)) if (who !== "tomo") checkMover(who, mover);
 }
 
 function outsideBy(point: readonly number[], room: Box): { axis: number; side: "min" | "max"; by: number } | undefined {
@@ -540,13 +555,13 @@ function checkReach(scene: HomeScene, report: Report): void {
   for (const { who, stuck, cut } of characterReach(reach, scene)) {
     const radius = walkerOf(who, scene).radius;
     for (const { at, found } of stuck) {
-      report.warn(`${at.place}: ${MOVER_NAMES[who]} cannot walk to or from ${placeWords(at)}: ${say(found, at, radius, true, false)}`);
+      report.warn(`${at.place}: ${moverName(who)} cannot walk to or from ${placeWords(at)}: ${say(found, at, radius, true, false)}`);
     }
     for (const { to, from, found } of cut) {
       const list = from.slice(0, 4).map(placeWords);
       const more = from.length > 4 ? ` or ${from.length - 4} more places` : "";
       const froms = list.length > 1 && !more ? `${list.slice(0, -1).join(", ")} or ${list.at(-1)}` : `${list.join(", ")}${more}`;
-      report.warn(`${to.place}: ${MOVER_NAMES[who]} cannot walk to ${placeWords(to)} from ${froms}: ${say(found, to, radius, false, from.length > 1)}`);
+      report.warn(`${to.place}: ${moverName(who)} cannot walk to ${placeWords(to)} from ${froms}: ${say(found, to, radius, false, from.length > 1)}`);
     }
   }
 }

@@ -1,7 +1,7 @@
 import {
   ASSET_NAME, CONDITIONS, HOME_SCENE_VERSION, MAX_DEPTH, MAX_KINDS, MAX_OBJECTS, MAX_PARTS_PER_NODE, MAX_REACTIONS, MAX_SCENE_BYTES,
   MAX_SIGN_CHARS, MAX_SPOTS, REACTION_DEFAULTS, REACTIONS, ROOM_MAX, ROOM_MIN, SHAPES, SIGN_VALUES, SIZE_MAX,
-  WALK_RADIUS_LIMITS, WALK_RULE_FACTOR, WALK_SPEED_LIMITS, WANDER_EVERY_LIMITS, WANDER_SPOT_LIMITS,
+  MAX_OTHERS, WALK_HEIGHT_LIMITS, WALK_RADIUS_LIMITS, WALK_RULE_FACTOR, WALK_SPEED_LIMITS, WANDER_EVERY_LIMITS, WANDER_SPOT_LIMITS,
 } from "./scene.js";
 import { NAV_PET, NAV_WALKER } from "./nav.js";
 import { PET_MOODS } from "./check.js";
@@ -46,6 +46,7 @@ const CONDITION_WORDS: Record<typeof CONDITIONS[number], string> = {
   "weather:rain": "rain or drizzle outside",
   "weather:snow": "snow or sleet outside",
   "weather:storm": "a thunderstorm outside",
+  walking: "only on a character's own body (a part of the kind it is drawn with): it is walking or hopping right now. Use `not:walking` to keep, say, closed eyes for when it stands still. Anywhere else it never holds, and a rule or `wander.when` cannot use it",
 };
 const REACTION_WORDS: Record<typeof REACTIONS[number], string> = {
   show: "visible only while the condition holds",
@@ -86,6 +87,7 @@ export const HOME_SKILL_VALUES: Record<string, () => string> = {
   conditions: () => list(CONDITIONS.map((c) => [c, CONDITION_WORDS[c]])),
   reactions: () => list(REACTIONS.map((r) => [r, `${REACTION_WORDS[r]}${defaultsOf(r)}`])),
   "scale-range": () => "0.1–10",
+  "max-others": () => String(MAX_OTHERS),
   "sign-values": () => list(SIGN_VALUES.map((v) => [`{${v}}`, SIGN_WORDS[v]])),
   "pet-moods": () => PET_MOODS.map((m) => `\`${m}\``).join(", "),
   "asset-name": () => `\`${ASSET_NAME.source}\``,
@@ -100,13 +102,15 @@ export const HOME_SKILL_VALUES: Record<string, () => string> = {
     ["parts directly in one object or kind", `at most ${MAX_PARTS_PER_NODE}`],
     ["kinds", `at most ${MAX_KINDS}`],
     ["spots", `at most ${MAX_SPOTS}`],
+    ["characters.others", `at most ${MAX_OTHERS}`],
     ["reactions on one part", `at most ${MAX_REACTIONS}`],
     ["sign text", `at most ${MAX_SIGN_CHARS} characters`],
     ["a picture file", `at most ${MAX_ASSET_BYTES / 1024} KiB`],
   ]),
   "walk-wander": () => list([
     ["walk.speed", `metres a second when it wanders, ${WALK_SPEED_LIMITS.min}–${WALK_SPEED_LIMITS.max}, default ${WALK_SPEED_LIMITS.default}; a move a rule makes goes ${WALK_RULE_FACTOR} times as fast, and takes a few seconds at most however far`],
-    ["walk.radius", `how much floor it needs round its middle to get past things, in metres, ${WALK_RADIUS_LIMITS.min}–${WALK_RADIUS_LIMITS.max}; default ${NAV_WALKER.radius} for you, ${NAV_PET.radius} for the pet (not worked out from the body: a crab's claws would make it too wide to pass anything)`],
+    ["walk.radius", `how much floor it needs round its middle to get past things, in metres, ${WALK_RADIUS_LIMITS.min}–${WALK_RADIUS_LIMITS.max}; default ${NAV_WALKER.radius} for you and the others, ${NAV_PET.radius} for the pet (not worked out from the body: a crab's claws would make it too wide to pass anything)`],
+    ["walk.height", `how much clearance it needs, in metres, ${WALK_HEIGHT_LIMITS.min}–${WALK_HEIGHT_LIMITS.max}: it walks under anything that starts at least this high, and anything lower is in its way; default ${NAV_WALKER.headroom} for you and the others, ${NAV_PET.headroom} for the pet`],
     ["wander.spots", `the spots it strolls between, ${WANDER_SPOT_LIMITS.min}–${WANDER_SPOT_LIMITS.max} of them, each once; your own \`spot\` may be one of them`],
     ["wander.every", `[shortest, longest] seconds it stays at each, ${WANDER_EVERY_LIMITS.min}–${WANDER_EVERY_LIMITS.max}, default [${WANDER_EVERY_LIMITS.default.join(", ")}]`],
     ["wander.when", "optional: a condition (or up to four) that must also hold, like `day`"],

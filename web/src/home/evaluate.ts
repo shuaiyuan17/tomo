@@ -35,6 +35,14 @@ export function homeConditions(status: HomeStatus, now: number): Set<string> {
   return set;
 }
 
+/** What holds on a character's own body: everything that holds, and `walking` while it walks (scene.ts CONDITIONS). */
+export function bodyConditions(conditions: Conditions, walking: boolean): Conditions {
+  if (!walking) return conditions;
+  const set = new Set(conditions);
+  set.add("walking");
+  return set;
+}
+
 /** One condition (with an optional `not:`), or a list that must all hold. */
 export function holds(when: string | readonly string[], conditions: Conditions): boolean {
   if (typeof when !== "string") return when.every((one) => holds(one, conditions));

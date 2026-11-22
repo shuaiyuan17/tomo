@@ -561,26 +561,20 @@ export class TodoStore {
   }
 
   /**
-   * done.ndjson by id. A line that does not parse is skipped — the torn tail
-   * of an append cut short — rather than failing every read over history.
+   * done.ndjson by id, read the way parseResolutions reads it: each line is
+   * checked as a whole record before ids are compared, so a torn line or a
+   * line that is not a whole record (the tail of an append cut short) is
+   * skipped and does not hold the id against a later, whole record of it.
    */
   private readClosed(): Map<string, TodoResolution> {
-    const closed = new Map<string, TodoResolution>();
     let raw: string;
     try {
       raw = readFileSync(this.donePath, "utf-8");
     } catch (err) {
-      if (isEnoent(err)) return closed;
+      if (isEnoent(err)) return new Map();
       throw new TodoStoreReadError(this.donePath, err);
     }
-    for (const text of raw.split("\n")) {
-      if (!text.trim()) continue;
-      try {
-        const record = JSON.parse(text) as TodoResolution;
-        if (typeof record?.id === "string" && typeof record.session === "string" && !closed.has(record.id)) closed.set(record.id, record);
-      } catch { /* torn line */ }
-    }
-    return closed;
+    return new Map(parseResolutions(raw).map((record) => [record.id, record]));
   }
 }
 

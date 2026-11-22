@@ -36,14 +36,11 @@ export interface ImsgChannelConfig {
   /** Max time to wait for a `drain` on a parked write before treating the child
    *  as wedged and restarting it. Default 10s. */
   drainWaitTimeoutMs?: number;
-  /** Lane-blocked (-32004) restarts allowed per window before the client stops
-   *  restarting and tells the owner. Default 3. */
+  /** Lane-blocked (-32004) restarts of the mutation child allowed per window
+   *  before the client stops restarting it and tells the owner. Default 3. */
   laneRestartLimit?: number;
   /** The window for {@link laneRestartLimit}. Default 10 minutes. */
   laneRestartWindowMs?: number;
-  /** Test seam: chat.db's current max message rowid (null when unknown).
-   *  Defaults to a read-only query of `dbPath` (or the standard chat.db). */
-  maxRowIdLookup?: () => number | null;
   /**
    * Test seam: message-service lookup for satellite (iMessageLite) detection.
    * Defaults to a read-only chat.db-backed lookup over `dbPath` (or the

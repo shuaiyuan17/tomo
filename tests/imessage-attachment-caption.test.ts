@@ -116,7 +116,6 @@ function makeChannel(options: { refuseText?: boolean } = {}) {
     spawnFn: spawnFn as never,
     probeCapabilities: async () => CAPS_FULL,
     serviceLookup: NULL_SERVICE_LOOKUP as never,
-    maxRowIdLookup: () => null,
   });
   return {
     channel,

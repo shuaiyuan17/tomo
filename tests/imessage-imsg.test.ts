@@ -4633,6 +4633,45 @@ describe("imsg rpc restart on -32004 Mutation lane blocked", () => {
     await channel.stop();
   });
 
+  it("holds a send issued during start() until the watch is subscribed", async () => {
+    let finishProbe!: () => void;
+    const probe = new Promise<ImsgCapabilities>((resolve) => { finishProbe = () => resolve(CAPS_FULL); });
+    const { channel, requests, mutationChildren } = makeChannel({ config: { probeCapabilities: () => probe } });
+
+    const started = channel.start();
+    const sent = channel.send({ chatId: DM_GUID, text: "early" });
+    await settle(20);
+    // Nothing goes out before the watch can see the reply.
+    expect(requests().some((r) => r.method === "send")).toBe(false);
+    expect(mutationChildren()).toHaveLength(0);
+
+    finishProbe();
+    await started;
+    await expect(sent).resolves.toBeUndefined();
+    const methods = requests().map((r) => r.method);
+    expect(methods.indexOf("watch.subscribe")).toBeLessThan(methods.indexOf("send"));
+
+    await channel.stop();
+  });
+
+  it("fails a send issued during a start() that fails as not sent", async () => {
+    const { channel, requests } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") return child.respondError(req.id, -32603, "Internal error", "Full Disk Access required");
+        child.respond(req.id, { ok: true });
+      },
+    });
+
+    const started = channel.start().catch((e: unknown) => e);
+    const err = await channel.send({ chatId: DM_GUID, text: "early" }).then(() => null, (e: unknown) => e as Error);
+    expect(await started).toBeInstanceOf(Error);
+    expect(err?.message).toMatch(/not sent/);
+    expect(isNothingSent(err)).toBe(true);
+    expect(requests().some((r) => r.method === "send")).toBe(false);
+
+    await channel.stop();
+  });
+
   it("caps restarts within the window, then tells the owner once and stops restarting", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-11-21T10:00:00Z"));

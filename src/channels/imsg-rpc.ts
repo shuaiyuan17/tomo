@@ -145,6 +145,13 @@ export class ImsgRpcClient {
   private laneRecovery: Promise<boolean> | null = null;
   /** The owner has been told the restarts ran out (reset by the next restart). */
   private laneExhaustedReported = false;
+  /**
+   * Settles once start() has finished: true when the watch is subscribed.
+   * Mutations wait for it, so nothing is sent before the watch can see the
+   * reply (the mutation child is spawned on demand, not by start()).
+   */
+  private startup: Promise<boolean> | null = null;
+  private startupOk: boolean | null = null;
   private stopping = false;
   private restartAttempt = 0;
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
@@ -226,6 +233,12 @@ export class ImsgRpcClient {
    * subscribe (must succeed), then arm the quiet capability retry loop.
    */
   async start(): Promise<void> {
+    const run = this.startOnce();
+    this.startup = run.then(() => true, () => false).then((ok) => { this.startupOk = ok; return ok; });
+    await run;
+  }
+
+  private async startOnce(): Promise<void> {
     // Capability probe: `imsg status --json` reports the injected bridge's
     // selector availability. Failure is non-fatal — the channel degrades to
     // basic send/watch (AppleScript transport needs no bridge). A degraded
@@ -525,6 +538,14 @@ export class ImsgRpcClient {
    * channel tears down meanwhile.
    */
   request(method: string, params: Record<string, unknown>, timeoutMs = DEFAULT_RPC_TIMEOUT_MS): Promise<Record<string, unknown>> {
+    // Not before the watch is subscribed: a reply arriving earlier would be missed.
+    if (!this.startup) return Promise.reject(notSentError(method, "the iMessage channel has not started"));
+    if (this.startupOk === null) {
+      return this.startup.then((ok) => ok
+        ? this.request(method, params, timeoutMs)
+        : Promise.reject(notSentError(method, "the iMessage channel failed to start")));
+    }
+    if (!this.startupOk) return Promise.reject(notSentError(method, "the iMessage channel failed to start"));
     const recovery = this.laneRecovery;
     if (recovery) {
       return recovery.then(() => this.tornDown

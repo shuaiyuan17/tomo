@@ -41,6 +41,9 @@ export interface ImsgChannelConfig {
   laneRestartLimit?: number;
   /** The window for {@link laneRestartLimit}. Default 10 minutes. */
   laneRestartWindowMs?: number;
+  /** Test seam: chat.db's current max message rowid (null when unknown).
+   *  Defaults to a read-only query of `dbPath` (or the standard chat.db). */
+  maxRowIdLookup?: () => number | null;
   /**
    * Test seam: message-service lookup for satellite (iMessageLite) detection.
    * Defaults to a read-only chat.db-backed lookup over `dbPath` (or the

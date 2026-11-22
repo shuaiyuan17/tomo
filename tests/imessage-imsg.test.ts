@@ -145,6 +145,7 @@ function makeChannel(options: {
     // lookup so satellite detection is off unless a test injects its own.
     serviceLookup: NULL_SERVICE_LOOKUP,
     attachmentLookup: NULL_ATTACHMENT_LOOKUP,
+    maxRowIdLookup: () => null,
     ...options.config,
   });
   return { channel, children, spawnFn, requests: () => children.flatMap((c) => c.stdin.lines.map((l) => JSON.parse(l) as RpcRequest)) };
@@ -4502,6 +4503,116 @@ describe("imsg rpc restart on -32004 Mutation lane blocked", () => {
     await expect(blocked).resolves.toBeUndefined();
     expect(spawnFn).toHaveBeenCalledTimes(2);
     expect(children[0].killed).toBe(true);
+
+    await channel.stop();
+  });
+
+  it("lets an inbound row already being dispatched finish, and does not replay it on the new child", async () => {
+    let release!: (accepted: boolean) => void;
+    const handler = vi.fn(() => new Promise<boolean>((resolve) => { release = resolve; }));
+    const { channel, children } = makeChannel({
+      responder: (req, child) => {
+        if (req.method === "watch.subscribe") {
+          child.respond(req.id, { subscription: 1 });
+          // imsg replays every row after since_rowid (an omitted one counts as 0).
+          const since = typeof req.params.since_rowid === "number" ? req.params.since_rowid : 0;
+          if (children.indexOf(child) === 1 && since < 500) queueMicrotask(() => child.notifyMessage(inboundMessage({ id: 500, guid: "mid-dispatch" })));
+          return;
+        }
+        if (req.method === "send" && children.indexOf(child) === 0) return child.respondError(req.id, -32004, "Mutation lane blocked");
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+    channel.onMessage(handler);
+
+    children[0].notifyMessage(inboundMessage({ id: 500, guid: "mid-dispatch" }));
+    await settle(20);
+    expect(handler).toHaveBeenCalledTimes(1); // handed to the agent, not yet accepted
+
+    await expect(channel.send({ chatId: DM_GUID, text: "hello" })).resolves.toBeUndefined();
+    expect(children).toHaveLength(2);
+    // The new child picks up after the rows the old one already delivered.
+    expect((JSON.parse(children[1].stdin.lines[0]) as RpcRequest).params.since_rowid).toBe(500);
+
+    release(true);
+    await settle(20);
+    expect(handler).toHaveBeenCalledTimes(1);
+
+    await channel.stop();
+  });
+
+  it("resumes after the starting row when there is no cursor yet, so rows in the gap are not lost", async () => {
+    const { channel, children } = laneChannel((i) => i === 0, { maxRowIdLookup: () => 900 });
+    await channel.start();
+    // First subscribe as before: no cursor, no since_rowid.
+    expect((JSON.parse(children[0].stdin.lines[0]) as RpcRequest).params.since_rowid).toBeUndefined();
+
+    await channel.send({ chatId: DM_GUID, text: "hello" });
+    expect((JSON.parse(children[1].stdin.lines[0]) as RpcRequest).params.since_rowid).toBe(900);
+
+    await channel.stop();
+  });
+
+  it("keeps queued requests waiting through a failed restart, then sends them on the backoff restart", async () => {
+    vi.useFakeTimers();
+    const { channel, children } = makeChannel({
+      config: { restartDelaysMs: [1_000] },
+      responder: (req, child) => {
+        const i = children.indexOf(child);
+        if (req.method === "watch.subscribe") {
+          if (i === 1) return child.respondError(req.id, -32603, "subscribe failed");
+          return child.respond(req.id, { subscription: 1 });
+        }
+        if (req.method === "send" && i === 0) return child.respondError(req.id, -32004, "Mutation lane blocked");
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const first = channel.send({ chatId: DM_GUID, text: "first" }).then(() => "ok", (e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(0);
+    const queued = channel.send({ chatId: DM_GUID, text: "queued" }).then(() => "ok", (e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(children).toHaveLength(2); // the lane restart's subscribe failed
+
+    await vi.advanceTimersByTimeAsync(1_000); // the backoff restart comes up
+    expect(children).toHaveLength(3);
+    expect(await first).toBe("ok");
+    expect(await queued).toBe("ok");
+    expect(children[2].stdin.lines.map((l) => JSON.parse(l) as RpcRequest).filter((r) => r.method === "send").map((r) => r.params.text).sort())
+      .toEqual(["first", "queued"]);
+
+    await channel.stop();
+  });
+
+  it("fails a queued request as not sent when no child comes back in time", async () => {
+    vi.useFakeTimers();
+    const { channel, children } = makeChannel({
+      config: { restartDelaysMs: [120_000] },
+      responder: (req, child) => {
+        const i = children.indexOf(child);
+        if (req.method === "watch.subscribe") {
+          if (i >= 1) return child.respondError(req.id, -32603, "subscribe failed");
+          return child.respond(req.id, { subscription: 1 });
+        }
+        if (req.method === "send" && i === 0) return child.respondError(req.id, -32004, "Mutation lane blocked");
+        child.respond(req.id, { ok: true });
+      },
+    });
+    await channel.start();
+
+    const first = channel.send({ chatId: DM_GUID, text: "first" }).then(() => null, (e: unknown) => e as Error);
+    await vi.advanceTimersByTimeAsync(0);
+    const queued = channel.send({ chatId: DM_GUID, text: "queued" }).then(() => null, (e: unknown) => e as Error);
+    await vi.advanceTimersByTimeAsync(31_000);
+
+    const queuedErr = await queued;
+    expect(queuedErr?.message).toMatch(/not sent/);
+    expect(isNothingSent(queuedErr)).toBe(true);
+    expect(isNothingSent(await first)).toBe(true);
+    // "queued" never reached any child.
+    expect(children.flatMap((c) => c.stdin.lines).some((l) => l.includes("\"queued\""))).toBe(false);
 
     await channel.stop();
   });

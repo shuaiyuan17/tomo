@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { markDefiniteFailure } from "./types.js";
+import type { SqliteModule } from "./imsg-satellite.js";
+import { createRequire } from "node:module";
 import { describeError, shortErrorMessage } from "../error-text.js";
 import { log } from "../logger.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
@@ -146,6 +148,26 @@ export interface ImsgRpcDeps {
   onLaneRestartsExhausted?(info: { restarts: number; windowMs: number }): void;
 }
 
+/**
+ * chat.db's highest message ROWID right now, or null when it cannot be read.
+ * Opened read-only per call: it is read once per subscribe that has no
+ * cursor, which is rare.
+ */
+export function readChatDbMaxRowId(dbPath: string, loadSqlite?: () => SqliteModule): number | null {
+  let db: { prepare(sql: string): { get(): Record<string, unknown> | undefined }; close(): void } | null = null;
+  try {
+    const sqlite = loadSqlite ? loadSqlite() : createRequire(import.meta.url)("node:sqlite") as SqliteModule;
+    db = new sqlite.DatabaseSync(dbPath, { readOnly: true });
+    const max = db.prepare("SELECT MAX(ROWID) AS max FROM message").get()?.max;
+    return typeof max === "number" && Number.isFinite(max) ? max : typeof max === "bigint" ? Number(max) : null;
+  } catch (err) {
+    log.debug({ err }, "imsg could not read the chat.db max rowid");
+    return null;
+  } finally {
+    try { db?.close(); } catch { /* ignore */ }
+  }
+}
+
 /** True for imsg's -32004 "Mutation lane blocked" error response. */
 export function isMutationLaneBlocked(err: unknown): boolean {
   return err instanceof ImsgRpcResponseError && err.rpcCode === MUTATION_LANE_BLOCKED;
@@ -223,6 +245,16 @@ export class ImsgRpcClient {
   private laneRecovery: Promise<boolean> | null = null;
   /** The owner has been told the restarts ran out (reset by the next restart). */
   private laneExhaustedReported = false;
+  private readonly maxRowIdLookup: () => number | null;
+  // Where the current subscription's stream starts: its since_rowid, or (when
+  // it had none) chat.db's max rowid read just before subscribing. Together
+  // with lastSeenRowId this is where a lane restart resumes, so rows that
+  // arrive during the restart are neither lost nor replayed twice.
+  private streamFloor = 0;
+  /** Highest rowid the current subscription has delivered (not yet committed). */
+  private lastSeenRowId = 0;
+  /** Settled when a child is up and subscribed again, or the channel stops. */
+  private childWaiters: Array<() => void> = [];
 
   constructor(config: ImsgChannelConfig, private readonly deps: ImsgRpcDeps) {
     this.cliPath = config.cliPath ?? "imsg";
@@ -236,6 +268,7 @@ export class ImsgRpcClient {
     this.drainWaitTimeoutMs = config.drainWaitTimeoutMs ?? DEFAULT_DRAIN_WAIT_TIMEOUT_MS;
     this.laneRestartLimit = config.laneRestartLimit ?? DEFAULT_LANE_RESTART_LIMIT;
     this.laneRestartWindowMs = config.laneRestartWindowMs ?? DEFAULT_LANE_RESTART_WINDOW_MS;
+    this.maxRowIdLookup = config.maxRowIdLookup ?? (() => readChatDbMaxRowId(this.dbPath ?? DEFAULT_CHAT_DB_PATH));
     this.loadCursor();
   }
 
@@ -312,6 +345,7 @@ export class ImsgRpcClient {
   /** Ingestion is closing: refuse new rows and stop every restart/retry timer. */
   closeIngestion(): void {
     this.stopping = true;
+    this.releaseChildWaiters();
     if (this.restartTimer) {
       clearTimeout(this.restartTimer);
       this.restartTimer = null;
@@ -325,6 +359,7 @@ export class ImsgRpcClient {
   /** First step of teardown: mark stopping and unsubscribe (best-effort). */
   async beginTeardown(): Promise<void> {
     this.stopping = true;
+    this.releaseChildWaiters();
     if (this.child && this.subscriptionId !== null) {
       try {
         await this.request("watch.unsubscribe", { subscription: this.subscriptionId }, 3_000);
@@ -353,7 +388,12 @@ export class ImsgRpcClient {
 
   // --- imsg rpc child lifecycle ---
 
-  private async spawnChildAndSubscribe(): Promise<void> {
+  /**
+   * Spawn a child and subscribe. `sinceRowId` overrides where the stream
+   * resumes (a lane restart passes the last row already received); by default
+   * it resumes from the committed cursor, or from "now" when there is none.
+   */
+  private async spawnChildAndSubscribe(sinceRowId?: number): Promise<void> {
     const args = ["rpc", ...(this.dbPath ? ["--db", this.dbPath] : [])];
     const child = this.spawnFn(this.cliPath, args, { stdio: ["pipe", "pipe", "pipe"] });
     this.child = child;
@@ -416,6 +456,12 @@ export class ImsgRpcClient {
     // Subscribe to the all-chat watch stream. `since_rowid` resumes from the
     // persisted cursor so messages that arrived while we were down replay
     // (the GUID dedupe store drops any we already dispatched).
+    const since = sinceRowId ?? (this.lastRowId > 0 ? this.lastRowId : undefined);
+    // With no since_rowid imsg starts at chat.db's current end. Note where that
+    // is (just before, so it is never past imsg's own start), so a later lane
+    // restart can resume from it instead of from "now".
+    this.streamFloor = since ?? this.maxRowIdLookup() ?? 0;
+    this.lastSeenRowId = 0;
     try {
       // Straight to the wire: a lane restart awaits this subscribe, so it must
       // not queue behind that restart.
@@ -423,11 +469,12 @@ export class ImsgRpcClient {
         attachments: true,
         convert_attachments: true,
         include_reactions: true,
-        ...(this.lastRowId > 0 ? { since_rowid: this.lastRowId } : {}),
+        ...(since !== undefined ? { since_rowid: since } : {}),
       });
       const subscription = result.subscription;
       this.subscriptionId = typeof subscription === "number" ? subscription : null;
-      log.info({ subscription: this.subscriptionId, sinceRowId: this.lastRowId || undefined }, "imsg watch subscribed");
+      log.info({ subscription: this.subscriptionId, sinceRowId: since }, "imsg watch subscribed");
+      this.releaseChildWaiters();
     } catch (err) {
       // The child spawned but the subscribe failed (FDA missing, startup
       // error, ...). Kill the child we just started before propagating —
@@ -574,6 +621,28 @@ export class ImsgRpcClient {
     return recovery;
   }
 
+  /** Wake everything waiting for a subscribed child (see waitForChild). */
+  private releaseChildWaiters(): void {
+    const waiters = this.childWaiters;
+    this.childWaiters = [];
+    for (const wake of waiters) wake();
+  }
+
+  /** Wait (at most `timeoutMs`) for a subscribed child; true when one is up. */
+  private waitForChild(timeoutMs: number): Promise<boolean> {
+    const up = () => !this.stopping && this.child !== null && this.subscriptionId !== null;
+    if (up() || this.stopping) return Promise.resolve(up());
+    return new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => {
+        this.childWaiters = this.childWaiters.filter((w) => w !== wake);
+        resolve(up());
+      }, timeoutMs);
+      timer.unref?.();
+      const wake = () => { clearTimeout(timer); resolve(up()); };
+      this.childWaiters.push(wake);
+    });
+  }
+
   private async restartForBlockedLane(attempt: number): Promise<boolean> {
     // Let the requests already on the wire settle first: killing the child
     // under them would make a delivered-or-refused send an unknown one. Each
@@ -590,28 +659,39 @@ export class ImsgRpcClient {
       ]);
       clearTimeout(backstop);
     }
+    if (this.stopping) return false;
     const old = this.child;
-    // Stopping, or the child died meanwhile (its crash restart owns it now).
-    if (this.stopping || !old) return false;
+    // The child died meanwhile: its crash restart owns it now; wait for that.
+    if (!old) return this.waitForChild(DEFAULT_RPC_TIMEOUT_MS);
     log.warn(
       { attempt, limit: this.laneRestartLimit, windowMs: this.laneRestartWindowMs },
       "imsg mutation lane blocked (-32004); restarting the rpc child",
     );
-    // The same teardown as a crash (handleChildDown), minus the backoff: queued
-    // watch rows are abandoned and replay from the cursor on resubscribe.
+    // Unlike a crash, the watch rows already received are KEPT: they finish on
+    // the watch chain under the same generation and commit their own cursor,
+    // and the new child resumes after the last row received. Abandoning them
+    // and replaying from the committed cursor would hand a row that was
+    // mid-dispatch to the agent a second time. A pending failed-row floor
+    // (recoverFromGap) still replays from the committed cursor, as before.
+    const keepRows = this.failedRowId === null;
+    const since = keepRows ? Math.max(this.lastRowId, this.streamFloor, this.lastSeenRowId) : this.lastRowId;
     this.child = null;
     this.subscriptionId = null;
-    this.watchGeneration++;
-    this.watchChain = Promise.resolve();
+    if (!keepRows) {
+      this.watchGeneration++;
+      this.watchChain = Promise.resolve();
+    }
     this.writeChain = Promise.resolve();
     this.rejectAllPending("restarted (mutation lane blocked)");
     old.kill();
     try {
-      await this.spawnChildAndSubscribe();
+      await this.spawnChildAndSubscribe(since > 0 ? since : undefined);
     } catch (err) {
-      log.error({ err }, "imsg rpc child restart after a blocked mutation lane failed");
+      // The backoff restart takes over. Requests waiting on this recovery keep
+      // waiting for it (bounded), rather than failing against no child.
+      log.error({ err }, "imsg rpc child restart after a blocked mutation lane failed; waiting for the backoff restart");
       this.scheduleRestart("lane restart failed");
-      return false;
+      return this.waitForChild(DEFAULT_RPC_TIMEOUT_MS);
     }
     return !this.stopping && this.child !== null;
   }
@@ -626,7 +706,15 @@ export class ImsgRpcClient {
    */
   request(method: string, params: Record<string, unknown>, timeoutMs = DEFAULT_RPC_TIMEOUT_MS): Promise<Record<string, unknown>> {
     const recovery = this.laneRecovery;
-    if (recovery) return recovery.then(() => this.requestWithLaneRetry(method, params, timeoutMs));
+    if (recovery) {
+      return recovery.then((up) => (up || this.child)
+        ? this.requestWithLaneRetry(method, params, timeoutMs)
+        // Never written to any child, so certainly not sent.
+        : Promise.reject(new ImsgRpcResponseError(
+          `imsg rpc ${method} not sent: the rpc child did not come back after a blocked mutation lane`,
+          { publicMessage: `imsg rpc ${method} not sent: the rpc child did not come back after a blocked mutation lane` },
+        )));
+    }
     return this.requestWithLaneRetry(method, params, timeoutMs);
   }
 
@@ -821,6 +909,7 @@ export class ImsgRpcClient {
       const params = payload.params as Record<string, unknown> | undefined;
       const message = params?.message as Record<string, unknown> | undefined;
       if (!message) return;
+      if (typeof message.id === "number" && message.id > this.lastSeenRowId) this.lastSeenRowId = message.id;
       // Serialize through a FIFO chain: rows arrive in rowid order, but each
       // handler awaits attachment IO, so without this a later row could reach
       // the agent before an earlier one. Capture the generation so that if the

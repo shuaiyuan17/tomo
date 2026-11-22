@@ -3,7 +3,7 @@ import {
   openSync, fstatSync, readSync, closeSync, readdirSync, statSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { getSdkSessionPath } from "../sessions/index.js";
 import { writeFileAtomicSync, isEnoent } from "../fs-utils.js";
 import { log } from "../logger.js";
@@ -92,6 +92,19 @@ export interface CompactResult {
   eventsRemoved: number;
   eventsAfter: number;
   error?: string;
+  /**
+   * Existing summary blocks with the request's blockTag that this rewrite
+   * replaced (a rerun of the same rollup). Each was also written to the
+   * archive as a `_superseded` record. Absent when nothing was replaced.
+   */
+  replaced?: ReplacedBlock[];
+}
+
+/** A summary block a rebuild replaced, as reported to the caller. */
+export interface ReplacedBlock {
+  blockTag: string;
+  /** Length (characters) of the replaced block's summary text. */
+  length: number;
 }
 
 interface SdkEvent extends TranscriptEvent {
@@ -570,8 +583,12 @@ function commitRewrite(
   // A failure here is therefore reported, not thrown, and leaves the session
   // file exactly as it was: everything above this line is undone by simply
   // not renaming.
+  // Replaced blocks (a rerun of the same rollup) are recorded as superseded
+  // in the same append, so they share this ordering: written only once the
+  // gate has passed, and before the rewrite is published.
+  const superseded = supersededRecords(req, prepared);
   try {
-    archiveEvents(req.transcriptPath, allEvents, removeSet);
+    archiveEvents(req.transcriptPath, allEvents, removeSet, superseded);
   } catch (err) {
     log.warn({
       err,
@@ -644,11 +661,62 @@ function commitRewrite(
     postRenamePartialPending: postRenameDrain.partialStillPending,
   }, "Session compacted");
 
+  const replaced = superseded.map((r) => ({ blockTag: r.blockTag, length: r.length }));
   return {
     success: true,
     eventsRemoved,
     eventsAfter,
+    ...(replaced.length > 0 ? { replaced } : {}),
   };
+}
+
+/**
+ * One archive line recording a summary block that a rebuild replaced. The
+ * removed block is archived as an ordinary `_archived` event too; this record
+ * is what marks it as superseded (which block, when) and carries its text in
+ * plain form, so a worse rerun can be undone by hand.
+ *
+ * It names no replacement block: it is written before the rename publishes,
+ * and a publish that fails leaves the record behind while the retry builds a
+ * new summary uuid — a pointer to the replacement would name a block that was
+ * never published.
+ *
+ * Deliberately has no `type` / `uuid`: the archive search only reads
+ * user/assistant events (the `_archived` copy already covers that), and the
+ * archive dedupe keys on `uuid`. Superseded records dedupe on
+ * (`supersededUuid`, hash of `summary`) instead.
+ */
+interface SupersededRecord {
+  _superseded: true;
+  _archivedAt: string;
+  blockTag: string;
+  supersededUuid?: string;
+  supersededTimestamp?: string;
+  summary: string;
+  length: number;
+}
+
+/** The blocks a rebuild replaces: removed summary events carrying the request's blockTag. */
+function supersededRecords(req: CompactRequest, prepared: PreparedRewrite): SupersededRecord[] {
+  if (!req.blockTag) return [];
+  const records: SupersededRecord[] = [];
+  for (const idx of Array.from(prepared.removeSet).sort((a, b) => a - b)) {
+    const event = prepared.allEvents[idx];
+    if (isRawJsonlLine(event)) continue;
+    if (!event.isCompactSummary || event.blockTag !== req.blockTag) continue;
+    const content = event.message?.content;
+    const summary = typeof content === "string" ? content : JSON.stringify(content ?? "");
+    records.push({
+      _superseded: true,
+      _archivedAt: new Date().toISOString(),
+      blockTag: req.blockTag,
+      ...(event.uuid ? { supersededUuid: event.uuid } : {}),
+      ...(event.timestamp ? { supersededTimestamp: event.timestamp } : {}),
+      summary,
+      length: summary.length,
+    });
+  }
+  return records;
 }
 
 function findUnrelatedSummaryInExpansionGap(
@@ -951,8 +1019,13 @@ function archivedUuidsInTail(transcriptPath: string): Set<string> {
     for (const line of lines.slice(-ARCHIVE_DEDUPE_TAIL_LINES)) {
       if (!line) continue;
       try {
-        const parsed = JSON.parse(line) as { uuid?: unknown };
+        const parsed = JSON.parse(line) as {
+          uuid?: unknown; _superseded?: unknown; supersededUuid?: unknown; summary?: unknown;
+        };
         if (typeof parsed?.uuid === "string") uuids.add(parsed.uuid);
+        if (parsed?._superseded === true && typeof parsed.summary === "string") {
+          uuids.add(supersededKey(typeof parsed.supersededUuid === "string" ? parsed.supersededUuid : undefined, parsed.summary));
+        }
       } catch { /* a line we cannot read is a line we cannot dedupe on */ }
     }
   } catch (err) {
@@ -964,6 +1037,16 @@ function archivedUuidsInTail(transcriptPath: string): Set<string> {
 }
 
 /**
+ * Dedupe key for a superseded record: the replaced block's uuid plus a hash of
+ * its text, kept apart from plain event uuids. A retried rerun replaces the
+ * same block with the same text, so it maps to the same key.
+ */
+function supersededKey(uuid: string | undefined, summary: string): string {
+  const hash = createHash("sha256").update(summary).digest("hex");
+  return `superseded:${uuid ?? ""}:${hash}`;
+}
+
+/**
  * Archive removed events to a transcript JSONL file.
  *
  * Idempotent over the archive's tail: an event whose uuid is already there is
@@ -972,7 +1055,12 @@ function archivedUuidsInTail(transcriptPath: string): Set<string> {
  * fails to publish can simply be re-run, instead of leaving the events in
  * neither place if the ordering were reversed and the archive threw.
  */
-function archiveEvents(transcriptPath: string, allEvents: readonly SdkEntry[], removeSet: Set<number>): void {
+function archiveEvents(
+  transcriptPath: string,
+  allEvents: readonly SdkEntry[],
+  removeSet: Set<number>,
+  superseded: readonly SupersededRecord[] = [],
+): void {
   const dir = dirname(transcriptPath);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
@@ -993,6 +1081,13 @@ function archiveEvents(transcriptPath: string, allEvents: readonly SdkEntry[], r
       _originalIdx: idx,
       ...event,
     }));
+  }
+
+  // Superseded-block records, deduped the same way so a retried rerun does
+  // not record the same replaced block twice. Same append as the events.
+  for (const record of superseded) {
+    if (alreadyArchived.has(supersededKey(record.supersededUuid, record.summary))) { skipped++; continue; }
+    archiveLines.push(JSON.stringify(record));
   }
 
   if (skipped > 0) {

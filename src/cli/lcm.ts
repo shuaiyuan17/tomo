@@ -202,6 +202,7 @@ function registerBlockLevel(level: BlockLevel, periodOpt: { flag: string; desc: 
           description: resolved.description,
           eventsRemoved: result.eventsRemoved,
           eventsAfter: result.eventsAfter,
+          ...(result.replaced ? { replaced: result.replaced } : {}),
           summaryTokens: budget.tokens,
           summaryBudget: budget.budget,
           ...(budget.overBudget ? {
@@ -337,6 +338,7 @@ lcmCommand
         eventsAfter: result.eventsAfter,
         timeRange: { from: fromTime, to: toTime },
         ...(opts.blockTag ? { blockTag: opts.blockTag } : {}),
+        ...(result.replaced ? { replaced: result.replaced } : {}),
       }));
     } else {
       console.error(JSON.stringify({ status: "error", error: result.error }));

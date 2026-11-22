@@ -100,6 +100,12 @@ export interface InboxRecord {
   status: InboxStatus;
   startedAt?: number;
   /**
+   * The started turn was cut short by a `tomo restart` it ran itself, with
+   * that restart's reason. Only words the note after the restart; the record
+   * is otherwise an ordinary interrupted one.
+   */
+  selfRestart?: { reason?: string };
+  /**
    * In memory only: the `start` mark could not be written, so the log on disk
    * may still say `received`. The record is treated as started everywhere in
    * this process (never handed to a replay, rewritten as started by the next
@@ -110,7 +116,8 @@ export interface InboxRecord {
 
 type RecvLine = { op: "recv"; v: 1; rec: Omit<InboxRecord, "status" | "startedAt"> };
 type MarkLine = { op: "start" | "done" | "seen"; id: string; at: number };
-type LogLine = RecvLine | MarkLine;
+type SelfRestartLine = { op: "selfRestart"; id: string; at: number; reason?: string };
+type LogLine = RecvLine | MarkLine | SelfRestartLine;
 
 export type AcceptResult =
   | { status: "accepted"; id: string }
@@ -420,6 +427,20 @@ export class DurableInbox {
     return unwritten.map((r) => r.id);
   }
 
+  /**
+   * These started records' turn was cut short by the `tomo restart` it ran
+   * itself. Best effort: a mark that cannot be written leaves an ordinary
+   * interrupted record, which is the old behaviour.
+   */
+  markSelfRestart(ids: readonly string[], reason?: string): void {
+    for (const id of ids) {
+      const rec = this.live.get(id);
+      if (!rec || rec.status !== "started") continue;
+      const mark = reason ? { reason } : {};
+      if (this.tryAppend({ op: "selfRestart", id, at: this.now(), ...mark })) rec.selfRestart = mark;
+    }
+  }
+
   /** Consumed (answered, dropped, or recorded). Kept only as a dedup tombstone. */
   markDone(ids: readonly string[]): void {
     let changed = false;
@@ -530,6 +551,11 @@ export class DurableInbox {
         if (rec) { rec.status = "started"; rec.startedAt = line.at; }
         return;
       }
+      case "selfRestart": {
+        const rec = this.live.get(line.id);
+        if (rec && rec.status === "started") rec.selfRestart = typeof line.reason === "string" ? { reason: line.reason } : {};
+        return;
+      }
       case "done":
       case "seen": {
         this.live.delete(line.id);
@@ -573,9 +599,10 @@ export class DurableInbox {
     const lines: LogLine[] = [];
     for (const [id, at] of this.seen) lines.push({ op: "seen", id, at });
     for (const rec of this.pending()) {
-      const { status, startedAt, ...base } = rec;
+      const { status, startedAt, selfRestart, ...base } = rec;
       lines.push({ op: "recv", v: 1, rec: base });
       if (status === "started") lines.push({ op: "start", id: rec.id, at: startedAt ?? rec.receivedAt });
+      if (status === "started" && selfRestart) lines.push({ op: "selfRestart", id: rec.id, at: startedAt ?? rec.receivedAt, ...selfRestart });
     }
 
     if (lines.length === 0 && !existsSync(this.path)) return true;

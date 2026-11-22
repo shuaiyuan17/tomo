@@ -12,16 +12,22 @@ vi.stubEnv("HOME", TEST_HOME);
 vi.stubEnv("TOMO_WORKSPACE", join(TEST_HOME, ".tomo", "workspace"));
 vi.resetModules();
 
-const hoisted = vi.hoisted(() => ({ spawnCalls: [] as string[][] }));
+const hoisted = vi.hoisted(() => ({ spawnCalls: [] as string[][], helperFails: false }));
 
 vi.mock("node:child_process", async (importActual) => {
   const actual = await importActual<typeof import("node:child_process")>();
   return {
     ...actual,
-    // The restart helper must never become a real process in a test.
+    // The restart helper must never become a real process in a test. The fake
+    // reports that it started (or, with helperFails, that it could not).
     spawn: vi.fn((_command: string, args: string[]) => {
       hoisted.spawnCalls.push(args);
-      return Object.assign(new EventEmitter(), { stderr: new EventEmitter(), unref: vi.fn() });
+      const child = Object.assign(new EventEmitter(), { stderr: new EventEmitter(), unref: vi.fn() });
+      setImmediate(() => {
+        if (hoisted.helperFails) child.emit("error", new Error("spawn ENOENT"));
+        else child.emit("spawn");
+      });
+      return child;
     }),
   };
 });
@@ -45,27 +51,30 @@ afterAll(() => {
 
 beforeEach(() => {
   hoisted.spawnCalls.length = 0;
+  hoisted.helperFails = false;
   rmSync(REQUEST_DIR, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------------------
 // A turn that runs `tomo restart` itself is cut short by the restart it asked
-// for. That is not an interruption: after the restart the durable inbox must
-// not hand the session an `interrupted` note for it. A turn some OTHER
-// session was running at the same moment really was interrupted, and still is
-// reported. A restart that names no turn (a terminal `tomo restart`) keeps the
-// old behaviour.
+// for. It is still an interrupted turn (work after the restart call may be
+// unfinished, so the note and the inbox record stay), but the note says the
+// turn restarted Tomo itself instead of reading like an accident, and nothing
+// reaches the owner. Attribution needs the turn's own main-thread Bash call
+// and a helper that actually started; anything else keeps the old wording.
 // ---------------------------------------------------------------------------
 
 type AgentInstance = InstanceType<typeof Agent>;
 
-async function boot(): Promise<{ agent: AgentInstance; channel: InstanceType<typeof MockChannel> }> {
+async function boot(): Promise<{ agent: AgentInstance; channel: InstanceType<typeof MockChannel>; ownerNotices: string[] }> {
   resetConfig({ inbox: true, imessageInboundSettleMs: 0, tomoHome: mockConfig.tomoHome });
   const agent = new Agent();
+  const ownerNotices: string[] = [];
+  vi.spyOn(agent, "notifyOwner").mockImplementation(async (text) => { ownerNotices.push(JSON.stringify(text)); return true; });
   const channel = new MockChannel("imessage");
   agent.addChannel(channel);
   await agent.start();
-  return { agent, channel };
+  return { agent, channel, ownerNotices };
 }
 
 function openInbox(): InstanceType<typeof DurableInbox> {
@@ -78,51 +87,105 @@ function controllerFor(sessionKey: string) {
   return mockSdk.queryControllers[i];
 }
 
-/** What the SDK streams when the model runs `tomo restart` in a session's shell and the CLI defers it. */
-function runTomoRestartIn(sessionKey: string, toolUseId: string): void {
+/**
+ * What the SDK streams when the model runs `tomo restart` in a session's shell
+ * and the CLI defers it. `tool` is the tool whose result carries the marker:
+ * `Bash` for the turn's own call, `BashOutput` for a backgrounded one.
+ */
+function runTomoRestartIn(sessionKey: string, toolUseId: string, tool: "Bash" | "BashOutput" = "Bash"): void {
   const request = createRestartRequest({ sessionKey, daemonPid: process.pid, reason: "deploy" }, REQUEST_DIR);
   const query = controllerFor(sessionKey);
-  query.pushEvent({ type: "assistant", message: { content: [{ type: "tool_use", id: toolUseId, name: "Bash", input: { command: "tomo restart --reason deploy" } }] } });
+  query.pushEvent({ type: "assistant", message: { content: [{ type: "tool_use", id: toolUseId, name: tool, input: { command: "tomo restart --reason deploy" } }] } });
   query.pushEvent({ type: "user", message: { content: [{ type: "tool_result", tool_use_id: toolUseId, content: formatRestartRequestResult(request) }] } });
 }
 
 const interruptedNote = (agent: AgentInstance, key: string) =>
   peekPendingNotes(agent, key).filter((n) => n.includes('name="interrupted"')).join("\n");
 
+const SELF = "This turn restarted Tomo itself (reason: deploy)";
+const ACCIDENT = "Your reply may be missing or incomplete";
+
+async function startTurn(channel: InstanceType<typeof MockChannel>, id: string, chatId: string, text: string): Promise<void> {
+  await channel.simulateMessage(makeMsg({ id, chatId, text }));
+  await waitFor(() => expect(mockSdk.promptsBySession.some((p) => p.sessionKey === `imessage:${chatId}`)).toBe(true));
+}
+
+/** The restart helper's SIGTERM, then the next start. */
+async function restart(first: { agent: AgentInstance }): Promise<{ agent: AgentInstance; ownerNotices: string[]; leftOver: string[][] }> {
+  await new Promise((r) => setImmediate(r)); // let the helper report it started
+  await first.agent.stop();
+  const leftOver = openInbox().pending().map((r) => [r.message.id, r.status]);
+  return { ...(await boot()), leftOver };
+}
+
 describe("durable inbox: a restart the turn asked for itself", () => {
-  it("does not report the initiating turn as interrupted, but still reports another session's turn", async () => {
+  it("says so in the note, keeps the work, tells the owner nothing; another session's turn is unchanged", async () => {
     const first = await boot();
     mockSdk.responseFn = () => new Promise(() => {}); // Both turns stay mid-flight.
-    await first.channel.simulateMessage(makeMsg({ id: "self1", chatId: "701", text: "please restart tomo" }));
-    await waitFor(() => expect(mockSdk.promptsBySession.some((p) => p.sessionKey === "imessage:701")).toBe(true));
-    await first.channel.simulateMessage(makeMsg({ id: "other1", chatId: "702", text: "long running job" }));
-    await waitFor(() => expect(mockSdk.promptsBySession.some((p) => p.sessionKey === "imessage:702")).toBe(true));
+    await startTurn(first.channel, "self1", "701", "please restart tomo");
+    await startTurn(first.channel, "other1", "702", "long running job");
 
     runTomoRestartIn("imessage:701", "tu-restart");
     await waitFor(() => expect(hoisted.spawnCalls).toHaveLength(1));
 
-    // The helper's SIGTERM: graceful shutdown cuts both turns short.
-    await first.agent.stop();
-    expect(openInbox().pending().map((r) => [r.message.id, r.status])).toEqual([["other1", "started"]]);
-
-    const second = await boot();
-    expect(interruptedNote(second.agent, "imessage:701")).toBe("");
-    expect(interruptedNote(second.agent, "imessage:702")).toContain("long running job");
+    const second = await restart(first);
+    // Neither turn is written off as done: both are still owed a check.
+    expect(second.leftOver).toEqual([["self1", "started"], ["other1", "started"]]);
+    const own = interruptedNote(second.agent, "imessage:701");
+    expect(own).toContain(SELF);
+    expect(own).toContain("otherwise reply NO_REPLY");
+    expect(own).toContain("please restart tomo"); // the message still travels with it
+    expect(own).not.toContain(ACCIDENT);
+    const other = interruptedNote(second.agent, "imessage:702");
+    expect(other).toContain(ACCIDENT);
+    expect(other).toContain("long running job");
+    expect(other).not.toContain("restarted Tomo itself");
+    expect([...first.ownerNotices, ...second.ownerNotices]).toEqual([]);
     await second.agent.stop();
   });
 
-  it("keeps the old behaviour for a restart that names no turn", async () => {
+  it("keeps the old note for a restart that names no turn", async () => {
     const first = await boot();
     mockSdk.responseFn = () => new Promise(() => {});
-    await first.channel.simulateMessage(makeMsg({ id: "plain1", chatId: "703", text: "halfway there" }));
-    await waitFor(() => expect(mockSdk.promptsBySession.some((p) => p.sessionKey === "imessage:703")).toBe(true));
+    await startTurn(first.channel, "plain1", "703", "halfway there");
 
     // A terminal `tomo restart`: no request, no marker, just the SIGTERM.
-    await first.agent.stop();
-    expect(openInbox().pending().map((r) => [r.message.id, r.status])).toEqual([["plain1", "started"]]);
+    const second = await restart(first);
+    const note = interruptedNote(second.agent, "imessage:703");
+    expect(note).toContain(ACCIDENT);
+    expect(note).toContain("halfway there");
+    await second.agent.stop();
+  });
 
-    const second = await boot();
-    expect(interruptedNote(second.agent, "imessage:703")).toContain("halfway there");
+  it("does not count a marker that came back through background output", async () => {
+    const first = await boot();
+    mockSdk.responseFn = () => new Promise(() => {});
+    await startTurn(first.channel, "bg1", "704", "restart in the background");
+
+    runTomoRestartIn("imessage:704", "tu-bg", "BashOutput");
+    await waitFor(() => expect(hoisted.spawnCalls).toHaveLength(1));
+
+    const second = await restart(first);
+    const note = interruptedNote(second.agent, "imessage:704");
+    expect(note).toContain(ACCIDENT);
+    expect(note).not.toContain("restarted Tomo itself");
+    await second.agent.stop();
+  });
+
+  it("does not count a restart whose helper failed to start", async () => {
+    hoisted.helperFails = true;
+    const first = await boot();
+    mockSdk.responseFn = () => new Promise(() => {});
+    await startTurn(first.channel, "fail1", "705", "restart that fails");
+
+    runTomoRestartIn("imessage:705", "tu-fail");
+    await waitFor(() => expect(hoisted.spawnCalls).toHaveLength(1));
+
+    // The restart never happened; the turn is cut by an unrelated shutdown.
+    const second = await restart(first);
+    const note = interruptedNote(second.agent, "imessage:705");
+    expect(note).toContain(ACCIDENT);
+    expect(note).not.toContain("restarted Tomo itself");
     await second.agent.stop();
   });
 });

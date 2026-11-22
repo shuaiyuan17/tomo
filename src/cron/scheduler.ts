@@ -361,15 +361,11 @@ export class CronScheduler {
       // - refused before it reached the model: nothing happened, so
       //   markStarted is rolled back and the job simply runs after the
       //   restart, as scheduled;
-      // - cut short mid-turn by a restart some other turn asked for (or a
-      //   stop, an update): it may have partly run, so it is NEVER re-run
+      // - cut short mid-turn (whoever asked for the restart, the job's own
+      //   turn included): it may have partly run, so it is NEVER re-run
       //   automatically. A one-shot is parked and the owner is asked after the
       //   restart; a recurring job records "interrupted" and waits for its
       //   next normal slot.
-      //
-      //   A run whose own turn ran `tomo restart` (a deploy job) is not cut
-      //   short: TurnRunner reports no shutdown for it, and it is acked as
-      //   finished like any other run (see ReplyContext.initiatedRestart).
       if (shutdown === "refused") {
         try {
           this.store.rollbackStarted(jobId, runId, prior);

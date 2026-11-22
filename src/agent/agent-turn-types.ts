@@ -125,7 +125,11 @@ export type RewindOutcome = {
  */
 export interface InboxTurnHooks {
   notConsumed(): void;
-  /** Graceful shutdown stopped the turn mid-flight (TurnSpec.onShutdown "interrupted"). */
-  cutShort(): void;
+  /**
+   * Graceful shutdown stopped the turn mid-flight (TurnSpec.onShutdown
+   * "interrupted"). `selfRestart`: the shutdown is the `tomo restart` this
+   * turn ran itself.
+   */
+  cutShort(selfRestart?: { reason?: string }): void;
   onPromptHandedOff(): void;
 }

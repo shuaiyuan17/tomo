@@ -86,13 +86,14 @@ export interface ReplyContext { turnId: string; channel: string; requestId?: str
    */
   stopped?: boolean;
   /**
-   * Set when THIS turn ran `tomo restart` and the restart it asked for was
-   * launched (RestartCoordinator). The shutdown that restart brings cuts the
-   * turn short by the turn's own request, so it ends as a completed turn, not
-   * an interrupted one: no durable-inbox `interrupted` note, no interrupted
-   * cron run. Rides on the request's context for the same reason as `stopped`.
+   * Set when THIS turn's own Bash call ran `tomo restart` and the restart
+   * helper it asked for has launched (RestartCoordinator). The shutdown that
+   * follows still interrupts the turn — work after the restart call may be
+   * unfinished — but the durable inbox words its note as a restart the turn
+   * asked for itself. Rides on the request's context for the same reason as
+   * `stopped`.
    */
-  initiatedRestart?: boolean }
+  initiatedRestart?: { reason?: string } }
 /** How owner web input joins a running turn (see LiveSession.steer). */
 export interface SteerJoin {
   replyContext?: ReplyContext;
@@ -209,7 +210,12 @@ export interface LiveSessionSettings {
   onMcpAuthError?: (serverName: string) => Promise<McpAuthRefreshOutcome> | McpAuthRefreshOutcome;
   /** Clock for the MCP auth-refresh rate window. Injected by tests. */
   now?: () => number;
-  /** `turn`: the reply context of the turn the result arrived in, when one is running. */
+  /**
+   * `turn`: the running turn's reply context, ONLY for a main-thread `Bash`
+   * result whose tool_use was issued by that same, still-running turn.
+   * Anything that cannot be tied to the turn (background output, subagent
+   * calls, a result arriving after its turn ended) carries none.
+   */
   onToolResult?: (toolName: string, content: unknown, isError: boolean, turn?: ReplyContext) => void;
   /**
    * Set when this session RESUMES an existing SDK session: its id and the
@@ -371,6 +377,8 @@ export class LiveSession {
   // Maps tool_use_id → tool name so we can label tool_result log lines
   // (the result event only carries the use id, not the original name).
   private pendingToolNames = new Map<string, string>();
+  /** Main-thread tool_use id → the reply context of the turn that issued it. */
+  private pendingToolTurns = new Map<string, ReplyContext>();
   /** tool_use_id → start time, for tool.end durations on the watch bus. */
   private pendingToolStarts = new Map<string, number>();
   /** Agent tool_use id → subagent_type, so a subagent's tool logs can name which agent ran them. */
@@ -1012,6 +1020,8 @@ export class LiveSession {
         } else if (isToolUseBlock(block)) {
           this.toolUsesSinceResult++;
           if (block.id) this.pendingToolNames.set(block.id, block.name);
+          const issuer = this.currentRequest?.replyContext;
+          if (block.id && issuer) this.pendingToolTurns.set(block.id, issuer);
           if (block.id && (block.name === "Agent" || block.name === "Task")) {
             const subType = (block.input as { subagent_type?: string } | undefined)?.subagent_type;
             if (subType) this.subagentTypeById.set(block.id, subType);
@@ -1338,7 +1348,9 @@ export class LiveSession {
         const tr = block as { tool_use_id?: string; content?: unknown; is_error?: boolean };
         const name = tr.tool_use_id ? this.pendingToolNames.get(tr.tool_use_id) : undefined;
         const startedAt = tr.tool_use_id ? this.pendingToolStarts.get(tr.tool_use_id) : undefined;
+        const issuer = tr.tool_use_id ? this.pendingToolTurns.get(tr.tool_use_id) : undefined;
         if (tr.tool_use_id) {
+          this.pendingToolTurns.delete(tr.tool_use_id);
           this.pendingToolNames.delete(tr.tool_use_id);
           this.pendingToolStarts.delete(tr.tool_use_id);
           this.subagentTypeById.delete(tr.tool_use_id);
@@ -1357,7 +1369,11 @@ export class LiveSession {
           ...(startedAt !== undefined ? { durationMs: Date.now() - startedAt } : {}),
           ...(agent ? { agent } : {}),
         });
-        this.onToolResult?.(name ?? "?", tr.content, tr.is_error === true, this.currentRequest?.replyContext);
+        // Attributed to a turn only when that turn's own Bash call produced
+        // it and the turn is still the one running.
+        const turn = !agent && name === "Bash" && issuer !== undefined && issuer === this.currentRequest?.replyContext
+          ? issuer : undefined;
+        this.onToolResult?.(name ?? "?", tr.content, tr.is_error === true, turn);
       }
     }
   }

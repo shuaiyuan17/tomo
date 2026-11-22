@@ -1067,7 +1067,14 @@ export class Agent {
     const hooks: InboxTurnHooks | undefined = inboxIds.length > 0
       ? {
         notConsumed: () => { progress.unconsumed = true; },
-        cutShort: () => { progress.cutShort = true; },
+        cutShort: (selfRestart) => {
+          progress.cutShort = true;
+          // Written now, while the inbox is still open (shutdown closes it
+          // after the sessions), so the note after the restart can say this
+          // turn restarted Tomo itself. Best effort: lost, it reads as an
+          // ordinary interruption.
+          if (selfRestart) this.inbox?.markSelfRestart(inboxIds, selfRestart.reason);
+        },
         onPromptHandedOff: () => { progress.handedOff = true; this.markInboxStarted(routedKey, inboxIds); },
       }
       : undefined;
@@ -1609,7 +1616,7 @@ export class Agent {
       transcript: "always",
       ...(req.inboxHooks ? {
         onPromptHandedOff: req.inboxHooks.onPromptHandedOff,
-        onShutdown: (kind: ShutdownTurnEnd) => { if (kind === "interrupted") req.inboxHooks?.cutShort(); },
+        onShutdown: (kind: ShutdownTurnEnd, selfRestart?: { reason?: string }) => { if (kind === "interrupted") req.inboxHooks?.cutShort(selfRestart); },
       } : {}),
       errors: {
         visibleError: "reply",
@@ -3066,13 +3073,19 @@ export class Agent {
 
     const maxAgeMs = config.inboxReplayMaxAgeMinutes * 60_000;
     const now = Date.now();
-    const interrupted = new Map<string, InboxRecord[]>();
+    // Per session, and apart: a turn cut short by the `tomo restart` it ran
+    // itself gets its own wording (see selfRestartLead).
+    const interrupted = new Map<string, { session: string; selfRestart: boolean; recs: InboxRecord[] }>();
     const stale = new Map<string, Array<{ channel: Pick<Channel, "name">; message: IncomingMessage; inboxId: string }>>();
     const replay: Array<{ rec: InboxRecord; channel: Channel }> = [];
     for (const rec of records) {
       const key = rec.resolution.sessionKey;
       if (rec.status === "started") {
-        interrupted.set(key, [...(interrupted.get(key) ?? []), rec]);
+        const selfRestart = rec.selfRestart !== undefined;
+        const groupKey = `${selfRestart ? "self" : "cut"}:${key}`;
+        const group = interrupted.get(groupKey) ?? { session: key, selfRestart, recs: [] };
+        group.recs.push(rec);
+        interrupted.set(groupKey, group);
         continue;
       }
       const channel = this.getChannel(rec.channel);
@@ -3083,7 +3096,7 @@ export class Agent {
       replay.push({ rec, channel });
     }
 
-    for (const [key, recs] of interrupted) {
+    for (const { session: key, selfRestart, recs } of interrupted.values()) {
       const oldest = new Date(recs[0].receivedAt).toISOString();
       // The messages themselves travel with the note: the turn may have died
       // before the prompt ever reached the transcript, and a note that only
@@ -3101,14 +3114,12 @@ export class Agent {
         const part = chunks.length > 1
           ? ` (part ${i + 1} of ${chunks.length}; the quoted text continues across parts exactly where each one ends)`
           : "";
-        const ok = this.queuePendingNote(key, formatTomoEvent(
-          "inbox",
-          `Tomo restarted while a turn was handling ${recs.length === 1 ? "a message" : `${recs.length} messages`} received from ${oldest}${part}. `
+        const lead = selfRestart
+          ? selfRestartLead(recs, oldest, part)
+          : `Tomo restarted while a turn was handling ${recs.length === 1 ? "a message" : `${recs.length} messages`} received from ${oldest}${part}. `
             + "Your reply may be missing or incomplete; check the conversation before assuming it was answered, "
-            + "and answer now if it was not.\n"
-            + chunk,
-          { name: "interrupted" },
-        ));
+            + "and answer now if it was not.\n";
+        const ok = this.queuePendingNote(key, formatTomoEvent("inbox", lead + chunk, { name: "interrupted" }));
         persisted &&= ok;
       });
       if (persisted) {
@@ -3116,7 +3127,7 @@ export class Agent {
       } else {
         log.error({ sessionKey: key, count: recs.length }, "Durable inbox: could not persist the interrupted-turn note; the inbox record is kept so the next start tells the session again");
       }
-      log.warn({ sessionKey: key, count: recs.length }, "Durable inbox: turn was interrupted by a restart; session notified, not re-run");
+      log.warn({ sessionKey: key, count: recs.length, selfRestart }, "Durable inbox: turn was interrupted by a restart; session notified, not re-run");
     }
 
     if (stale.size > 0) this.recordInboundItems(stale, INBOX_STALE_NOT_PROCESSED);
@@ -3142,6 +3153,18 @@ export class Agent {
  * parts — never truncated: the note is the message's only remaining copy.
  */
 const INTERRUPTED_NOTE_CHUNK = 16_000;
+
+/**
+ * Lead of the `interrupted` note for a turn that ran `tomo restart` itself.
+ * The restart was its own doing, so this is not reported as an accident; but
+ * whatever the turn meant to do after the restart call never ran.
+ */
+function selfRestartLead(recs: InboxRecord[], oldest: string, part: string): string {
+  const reason = recs.find((r) => r.selfRestart?.reason)?.selfRestart?.reason;
+  return `This turn restarted Tomo itself${reason ? ` (reason: ${reason})` : ""}, while handling `
+    + `${recs.length === 1 ? "a message" : `${recs.length} messages`} received from ${oldest}${part}. `
+    + "If anything after the restart call was unfinished, continue it now; otherwise reply NO_REPLY.\n";
+}
 
 /** A channel's fault notice, worded for the owner. */
 function channelFaultText(notice: ChannelFaultNotice): OwnerText {

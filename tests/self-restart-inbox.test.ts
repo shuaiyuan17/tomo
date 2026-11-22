@@ -133,7 +133,8 @@ describe("durable inbox: a restart the turn asked for itself", () => {
     expect(second.leftOver).toEqual([["self1", "started"], ["other1", "started"]]);
     const own = interruptedNote(second.agent, "imessage:701");
     expect(own).toContain(SELF);
-    expect(own).toContain("otherwise reply NO_REPLY");
+    expect(own).toContain("if the sender has not yet received the answer");
+    expect(own).toContain("reply NO_REPLY only when nothing is owed");
     expect(own).toContain("please restart tomo"); // the message still travels with it
     expect(own).not.toContain(ACCIDENT);
     const other = interruptedNote(second.agent, "imessage:702");

@@ -3163,7 +3163,8 @@ function selfRestartLead(recs: InboxRecord[], oldest: string, part: string): str
   const reason = recs.find((r) => r.selfRestart?.reason)?.selfRestart?.reason;
   return `This turn restarted Tomo itself${reason ? ` (reason: ${reason})` : ""}, while handling `
     + `${recs.length === 1 ? "a message" : `${recs.length} messages`} received from ${oldest}${part}. `
-    + "If anything after the restart call was unfinished, continue it now; otherwise reply NO_REPLY.\n";
+    + "Check the conversation: if the sender has not yet received the answer, or anything after the restart call "
+    + "was unfinished, deliver or continue it now; reply NO_REPLY only when nothing is owed.\n";
 }
 
 /** A channel's fault notice, worded for the owner. */

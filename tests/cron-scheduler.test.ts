@@ -1,6 +1,7 @@
 import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { CronScheduler } from "../src/cron/scheduler.js";
-import { CronStore, ONE_SHOT_STALE_AFTER_MS, isInterrupted } from "../src/cron/store.js";
+import { CronStore, isInterrupted } from "../src/cron/store.js";
+import { ONE_SHOT_STALE_AFTER_MS } from "../src/cron/schedule.js";
 import { log } from "../src/logger.js";
 import { parseTomoEvent } from "../src/tomo-event.js";
 import type { Agent } from "../src/agent.js";

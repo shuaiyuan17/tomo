@@ -67,6 +67,7 @@ src/
   mcp/                # tomo-internal in-process MCP server (internal-server.ts) + tool factories
                       #   (cron-, people-, recall-, pet-, todo-tools); external-config.ts, oauth.ts
   cron/               # Scheduler (30s poll → agent.handleCronMessage) + store (data/cron/jobs.json)
+                      #   + schedule.ts (next-run / staleness math, schedule-string parsing)
   todos/              # Todo primitive: store.ts (data/todos/todos.json under withFileLockSync + atomic write,
                       #   done.ndjson append-only; unreadable = error, never empty; all rules: required fields,
                       #   length limits, open cap, snooze cap, four actions), limits.ts (defaults for config

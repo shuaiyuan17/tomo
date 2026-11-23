@@ -1,5 +1,6 @@
 import * as p from "@clack/prompts";
-import { CronStore, CronStoreReadError, unschedulableReason } from "../../cron/store.js";
+import { CronStore, CronStoreReadError } from "../../cron/store.js";
+import { unschedulableReason } from "../../cron/schedule.js";
 import { cronStoreErrorMessage } from "../cron-errors.js";
 import type { CronJob } from "../../cron/types.js";
 import { formatSchedule, formatRelative } from "../../cron/format.js";

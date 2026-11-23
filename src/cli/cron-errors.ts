@@ -1,4 +1,5 @@
-import { CronStoreReadError, type CreatableSchedule } from "../cron/store.js";
+import { CronStoreReadError } from "../cron/store.js";
+import type { CreatableSchedule } from "../cron/schedule.js";
 import type { CronJob } from "../cron/types.js";
 
 /**

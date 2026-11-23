@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { parseScheduleString, parseStaleAfter } from "../src/cron/schedule.js";
+import { parseScheduleString, parseStaleAfter, unschedulableReason } from "../src/cron/schedule.js";
 
-// Every unit spelling the schedule grammar accepts, with its size in ms. Each
-// is also tried with a trailing plural "s" ("mins", "hrs", "days", ...).
+// Every unit spelling the schedule grammar accepts, with its size in ms. The
+// word spellings are also tried with a trailing plural "s" ("secs", "mins",
+// "hrs", "days"); single letters take no plural.
 const UNITS: ReadonlyArray<readonly [unit: string, ms: number]> = [
   ["s", 1_000],
   ["sec", 1_000],
@@ -13,10 +14,13 @@ const UNITS: ReadonlyArray<readonly [unit: string, ms: number]> = [
   ["d", 86_400_000],
   ["day", 86_400_000],
 ];
-const SPELLINGS = UNITS.flatMap(([unit, ms]) => [
-  { unit, ms },
-  { unit: `${unit}s`, ms },
-]);
+const SPELLINGS = UNITS.flatMap(([unit, ms]) =>
+  unit.length > 1 ? [{ unit, ms }, { unit: `${unit}s`, ms }] : [{ unit, ms }],
+);
+
+// A bare letter followed by "s" used to be read as that letter's plural:
+// "5ms" meant five minutes and "3ss" three seconds. Both are refused now.
+const PLURAL_LETTERS = ["5ms", "3ss", "2hs", "1ds"];
 
 const NOW = Date.UTC(2026, 0, 15, 12, 0, 0);
 
@@ -45,5 +49,18 @@ describe("parseStaleAfter units", () => {
     expect(parseStaleAfter("0")).toBe(0);
     expect(parseStaleAfter("99999999999999999d")).toBeNull();
     expect(parseStaleAfter("3w")).toBeNull();
+  });
+});
+
+describe("single-letter units take no plural", () => {
+  // An unmatched string falls through to "cron expression", which croner then
+  // rejects as malformed — the same refusal any other typo gets.
+  it.each(PLURAL_LETTERS)("refuses %s everywhere", (text) => {
+    for (const input of [`in ${text}`, `every ${text}`]) {
+      const parsed = parseScheduleString(input);
+      expect(parsed.kind).toBe("cron");
+      expect(() => unschedulableReason(parsed, NOW)).toThrow(/CronPattern/);
+    }
+    expect(parseStaleAfter(text)).toBeNull();
   });
 });

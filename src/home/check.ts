@@ -1,7 +1,7 @@
 import type { core } from "zod";
 import {
   ASSET_NAME, CONDITIONS, homeSceneSchema, MAX_DEPTH, MAX_KINDS, MAX_OBJECTS, MAX_OTHERS, MAX_REACTIONS, MAX_SCENE_BYTES, MAX_SIGN_CHARS,
-  MAX_SPOTS, REACTION_DEFAULTS, REACTIONS, SHAPES, SIGN_VALUES, SLUG, type HomePart, type HomeScene,
+  MAX_SPOTS, REACTION_DEFAULTS, REACTIONS, SHAPES, SIGN_VALUES, type HomePart, type HomeScene,
 } from "./scene.js";
 import { centre, num, placeScene, roomBox, vec, whatOf, type Box, type Placement } from "./geometry.js";
 import { describeReaction } from "./floor-plan.js";
@@ -628,6 +628,3 @@ function overlap(left: { box: Box; solid: boolean }[], right: { box: Box; solid:
   }
   return undefined;
 }
-
-/** Exported for the skill text: the slug rule in words. */
-export const SLUG_RULE = `lowercase letters, digits and dashes, starting with a letter, at most 40 characters (${SLUG.source})`;

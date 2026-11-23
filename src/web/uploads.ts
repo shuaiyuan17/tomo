@@ -26,10 +26,8 @@ import { sniffImageType } from "./data.js";
  * executable, never run.
  */
 export const MAX_UPLOAD_BYTES = 20 * 1024 * 1024;
-export const MAX_UPLOAD_IMAGES = 6;
 /** Non-image files: the iMessage channel's inbound file cap (channels/fileStore.ts). */
 export const MAX_UPLOAD_FILE_BYTES = MAX_FILE_BYTES;
-export const MAX_UPLOAD_FILES = 6;
 /** The staged extension of a non-image file. */
 const FILE_EXT = "bin";
 export const UPLOAD_TTL_MS = 60 * 60 * 1000;

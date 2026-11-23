@@ -63,7 +63,5 @@ export interface HomeStatus {
   at: number;
 }
 
-export const IDLE_HOME_STATUS: Omit<HomeStatus, "at"> = { working: false, subagents: [], tasks: 0, compacting: false };
-
 /** How long after a scheduled job fires the `cron` condition holds. */
 export const CRON_FLASH_MS = 6_000;

@@ -577,6 +577,16 @@ const DEFAULT_METRICS: MetricsConfig = {
   includeMessageText: true,
 };
 
+/** Field by field, like metrics: one bad number falls back alone. */
+function parseTodoConfig(raw: unknown): TodoConfig {
+  const entry = validated("todos", z.looseObject({}), raw, {}) as Record<string, unknown>;
+  const out = { ...DEFAULT_TODOS };
+  for (const key of Object.keys(DEFAULT_TODOS) as (keyof TodoConfig)[]) {
+    out[key] = validated(`todos.${key}`, positiveInt, entry[key], DEFAULT_TODOS[key]);
+  }
+  return out;
+}
+
 /**
  * Validate the metrics block field by field.
  *
@@ -588,16 +598,6 @@ const DEFAULT_METRICS: MetricsConfig = {
  * the offending field, as parseIdentities and parsePlugins already do — each
  * bad field still raises its own configIssue.
  */
-/** Field by field, like metrics: one bad number falls back alone. */
-function parseTodoConfig(raw: unknown): TodoConfig {
-  const entry = validated("todos", z.looseObject({}), raw, {}) as Record<string, unknown>;
-  const out = { ...DEFAULT_TODOS };
-  for (const key of Object.keys(DEFAULT_TODOS) as (keyof TodoConfig)[]) {
-    out[key] = validated(`todos.${key}`, positiveInt, entry[key], DEFAULT_TODOS[key]);
-  }
-  return out;
-}
-
 function parseMetricsConfig(raw: unknown): MetricsConfig {
   const entry = validated("metrics", z.looseObject({}), raw, {}) as Record<string, unknown>;
   return {

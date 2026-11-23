@@ -1,5 +1,3 @@
-import { CHATGPT_SUBSCRIPTION_DEFAULT_MODEL } from "./litellm.js";
-
 /**
  * The 5.5 family, 1M context on by default.
  *
@@ -86,12 +84,4 @@ export function resolveModelName(input: string): string | null {
 
 export function modelLabel(model: string): string {
   return MODEL_LABELS[model] ?? model;
-}
-
-export function modelHelpText(): string {
-  return [
-    Object.keys(MODEL_ALIASES).join(", "),
-    `any direct model ID like ${DEFAULT_MODEL}`,
-    `or a LiteLLM provider/model name like ${CHATGPT_SUBSCRIPTION_DEFAULT_MODEL}`,
-  ].join(", ");
 }

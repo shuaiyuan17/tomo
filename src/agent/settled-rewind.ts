@@ -17,8 +17,6 @@ export interface SettleOptions {
   signal?: AbortSignal;
 }
 
-export const REWIND_ABORTED = rewindFailureMessage({ kind: "stopping" });
-
 const DEFAULTS: Required<Omit<SettleOptions, "signal">> = { quietMs: 500, maxWaitMs: 5_000, pollMs: 50, attempts: 3 };
 
 export const HISTORY_KEPT_CHANGING = rewindFailureMessage({ kind: "kept_changing" });

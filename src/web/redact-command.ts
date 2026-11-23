@@ -67,9 +67,3 @@ export function redactToolInput(input: Record<string, unknown>): Record<string, 
   };
   return walk(input, "", 0) as Record<string, unknown>;
 }
-
-/** A redacted preview for a tooltip: at most `limit` characters. */
-export function commandPreview(command: string, limit = 200): string {
-  const red = redactCommand(command);
-  return red.length > limit ? `${red.slice(0, limit)}…` : red;
-}

@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.15.0 (2026-11-23)
+
+### Features
+
+- **Todos** (#558, #567, #602): a todo store with three tools, `/todo` in chat and `tomo todo due`; every item names its next step and who moves next. The Study's Todos page reads it.
+- **Group sandbox** (#569): **Behaviour change:** group-turn Bash and file tools are deny-by-default (workspace and temp dirs only). Widen a group with `groupSandbox.groups[<key>]`; existing `groupShellAllowlist` entries stay unsandboxed.
+- **Permission requests** (#570): a sandboxed group turn can ask the owner for a path on the web card or DM: Allow once, Always allow (revocable) or Deny.
+- **Languages** (#579, #581, #582): the web UI, command replies and owner notices in English and Simplified Chinese via `locale` (`en`, `zh-Hans`). Unset, chat stays English.
+- **Credential broker** (#506): off by default. With `credentialBroker.enabled`, `request_credential` asks the owner for a secret, keeps it in the keychain and masks it in tool output.
+- **MCP status** (#573): `/mcp` and the Study show live connection state, with per-server reconnect; a failed server is retried before the next turn.
+- **Home walking** (#590, #595–#597, #603): characters walk round furniture, wander when idle, and `characters.others` adds up to four more.
+- **Idle sessions close** (#591): **On by default** after 60 idle minutes; the next message resumes from disk. Turn off with `liveSessionIdleTimeoutMs: 0`.
+
+### Bug fixes
+
+- The `effort` setting now reaches the SDK, plus `sessionEffortOverrides` (#571); `maxTurns: 0` means no limit (#557).
+- LCM rewrites are checked with the SDK's loader before publishing (#604, #606), wait for background tasks (#568), and archive a replaced rollup block (#607).
+- iMessage sends run in their own `imsg` process, restarted on "Mutation lane blocked" (#605).
+- Cron `5ms` no longer parses as five minutes (#614); clearer inbox note after a self-restart (#609).
+- Web chat no longer re-renders everything while typing (#575); Telegram typing calls no longer pile up (#576).
+
+### Security
+
+- The credential redaction hook fails closed (#593).
+- MCP server configs go over stdin, never argv or disk (#556).
+- `zod` 4.6.7 fixes GHSA-mrhx-c7xc-m3w5 (#608).
+
+### Other
+
+- README is now a landing page; reference moved to `docs/` (#574). The Study's Context page and session picker are clearer (#565, #566).
+- The system prompt marks the SDK cache boundary, so new sessions reuse the cached prefix (#572); hook and settings failures notify the owner (#594).
+- CI takes about half as long (#592); internal cleanups (#576–#589, #611–#613).
+
+### Dependencies
+
+- `@anthropic-ai/claude-agent-sdk` 0.3.325 → 0.3.330. `zod` 4.4.3 → 4.6.7, still exact-pinned; the SDK's bundled zod no longer needs the #359 pin.
+- New: `i18next` 27.2.6, `react-i18next` 18.0.3.
+- Minor bumps: `grammy` 1.48.0, `typescript-eslint` 8.74.0, `vitest` 5.1.1, `lucide-react` 1.78.0; transitive refresh.
+
 ## 0.14.0 (2026-11-16)
 
 ### Features

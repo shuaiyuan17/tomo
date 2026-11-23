@@ -1,6 +1,6 @@
 {
   "name": "tomo-ai",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "Personal assistant powered by Claude Agent SDK",
   "type": "module",
   "bin": {

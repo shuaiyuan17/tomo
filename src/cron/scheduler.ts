@@ -1,4 +1,5 @@
-import { CronStore, type StaleSkip } from "./store.js";
+import { CronStore } from "./store.js";
+import type { StaleSkip } from "./schedule.js";
 import type { CronJob, CronOutcome, InterruptedRun } from "./types.js";
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
@@ -9,7 +10,7 @@ import { formatDateTime, joinText, ownerT, type OwnerText } from "../i18n/index.
 
 /**
  * Due-scan cadence. Exported because it is also the floor on how often a job
- * can fire: `MIN_EVERY_MS` in store.ts mirrors it, and a test pins the two
+ * can fire: `MIN_EVERY_MS` in schedule.ts mirrors it, and a test pins the two
  * together so shortening one without the other cannot go unnoticed.
  */
 export const POLL_INTERVAL_MS = 30_000; // Check every 30s

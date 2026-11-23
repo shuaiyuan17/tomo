@@ -2,20 +2,22 @@ import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vites
 import {
   CronStore,
   CronStoreReadError,
-  ONE_SHOT_STALE_AFTER_MS,
   InvalidScheduleError,
-  MAX_EVERY_MS,
-  MIN_EVERY_MS,
   isInterrupted,
   mergeWithDisk,
   ONE_SHOT_MAX_RETRIES,
   ONE_SHOT_RETRY_DELAY_MS,
+} from "../src/cron/store.js";
+import {
+  ONE_SHOT_STALE_AFTER_MS,
+  MAX_EVERY_MS,
+  MIN_EVERY_MS,
   parseScheduleString,
   parseCreatableSchedule,
   parseStaleAfter,
   staleWindowMs,
   unschedulableReason,
-} from "../src/cron/store.js";
+} from "../src/cron/schedule.js";
 import { POLL_INTERVAL_MS } from "../src/cron/scheduler.js";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { cronAddRefusal, readCronJobsSafely } from "../src/cli/cron-errors.js";

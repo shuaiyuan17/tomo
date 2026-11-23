@@ -72,7 +72,7 @@ export interface CronJob {
    * run missed by more (the daemon was down, the store unreadable) is skipped
    * to the next slot instead of firing late; an interrupted one-shot older
    * than this is not retried. Absent = the default, which scales with the
-   * job's period (see staleWindowMs in store.ts); 0 = never stale (always
+   * job's period (see staleWindowMs in schedule.ts); 0 = never stale (always
    * catch up, always retry once).
    */
   staleAfterMs?: number;

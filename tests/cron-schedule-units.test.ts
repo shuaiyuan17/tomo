@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { parseScheduleString, parseStaleAfter } from "../src/cron/store.js";
+import { parseScheduleString, parseStaleAfter } from "../src/cron/schedule.js";
 
 // Every unit spelling the schedule grammar accepts, with its size in ms. Each
 // is also tried with a trailing plural "s" ("mins", "hrs", "days", ...).

@@ -84,6 +84,9 @@ export function staleWindowMs(
  * h/hr, d/day (any case; the grammar's regexes decide which spellings reach
  * here).
  */
+// Units: s/sec, m/min, h/hr, d/day. Only the word spellings take a plural
+// "s" (secs, mins, hrs, days); a bare letter does not, so "5ms" and "3ss" are
+// refused instead of being read as 5 minutes and 3 seconds.
 function unitMs(unit: string): number {
   const u = unit.toLowerCase();
   return u.startsWith("s") ? 1000
@@ -99,7 +102,7 @@ function unitMs(unit: string): number {
 export function parseStaleAfter(text: string): number | null {
   const trimmed = text.trim();
   if (trimmed === "0") return 0;
-  const match = /^(\d+)\s*(s|sec|m|min|h|hr|d|day)s?$/i.exec(trimmed);
+  const match = /^(\d+)\s*(s|secs?|m|mins?|h|hrs?|d|days?)$/i.exec(trimmed);
   if (!match) return null;
   const val = Number(match[1]);
   const ms = val * unitMs(match[2]);
@@ -285,7 +288,7 @@ export function computeNextRun(schedule: CronSchedule, fromMs: number): number |
 
 export function parseScheduleString(input: string): CronSchedule {
   // "in 20m", "in 2h", "in 1d"
-  const relMatch = input.match(/^in\s+(\d+)\s*(m|min|h|hr|d|day|s|sec)s?$/i);
+  const relMatch = input.match(/^in\s+(\d+)\s*(s|secs?|m|mins?|h|hrs?|d|days?)$/i);
   if (relMatch) {
     const val = Number(relMatch[1]);
     const ms = val * unitMs(relMatch[2]);
@@ -293,7 +296,7 @@ export function parseScheduleString(input: string): CronSchedule {
   }
 
   // "every 30m", "every 2h"
-  const everyMatch = input.match(/^every\s+(\d+)\s*(m|min|h|hr|d|day|s|sec)s?$/i);
+  const everyMatch = input.match(/^every\s+(\d+)\s*(s|secs?|m|mins?|h|hrs?|d|days?)$/i);
   if (everyMatch) {
     const val = Number(everyMatch[1]);
     const ms = val * unitMs(everyMatch[2]);

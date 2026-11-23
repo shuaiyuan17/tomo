@@ -310,6 +310,9 @@ export function installAgentTestHooks(): void {
     admissionState.restore?.();
     admissionState.restore = null;
     vi.useRealTimers();
-    rmSync(agentEnv.tmpDir, { recursive: true, force: true });
+    // A turn's fire-and-forget writes (transcript, inbox) can still be landing
+    // in data/ when the test ends; a single rmdir then races them and fails
+    // with ENOTEMPTY. Node retries ENOTEMPTY/EBUSY when maxRetries is set.
+    rmSync(agentEnv.tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   });
 }

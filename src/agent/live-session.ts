@@ -1040,6 +1040,23 @@ export class LiveSession {
       this.logToolResults(event.message.content);
     }
 
+    this.handleSystemEvent(event);
+
+    if (event.type === "tool_use_summary") {
+      log.debug((event as { summary: string }).summary);
+    }
+
+    if (event.type === "result") {
+      await this.handleResult(event as unknown as SdkResultLike);
+    }
+  }
+
+  /**
+   * The `system` events handleEvent reacts to: task tracking, background
+   * task changes, MCP init status, informational notices, compaction.
+   * Synchronous, in the order handleEvent has always run them.
+   */
+  private handleSystemEvent(event: SDKMessage): void {
     if (isTaskSystemMessage(event as { type?: string; subtype?: string })) {
       this.publishTasks(this.taskTracker.apply(event as unknown as TaskSystemMessage));
     }
@@ -1083,141 +1100,137 @@ export class LiveSession {
         postTokens: compact.compact_metadata?.post_tokens,
       });
     }
+  }
 
-    if (event.type === "tool_use_summary") {
-      log.debug((event as { summary: string }).summary);
+  /** The end of a turn: a `result` event that belongs to this session's current turn. */
+  private async handleResult(result: SdkResultLike): Promise<void> {
+    if (this.attributeResult(result) === "foreign") return;
+    this.turnSawAssistant = false;
+    this.publishTasks(this.taskTracker.endTurn());
+
+    if (result.session_id) {
+      this.sessionId = result.session_id;
     }
 
-    if (event.type === "result") {
-      const result = event as unknown as SdkResultLike;
-      if (this.attributeResult(result) === "foreign") return;
-      this.turnSawAssistant = false;
-      this.publishTasks(this.taskTracker.endTurn());
+    const {
+      costUsd: turnCost,
+      totalCost,
+      tokens: { input, output, cacheRead, cacheCreated },
+      baseline,
+    } = this.turnUsage(result);
+    this.recordResultUsage(result);
 
-      if (result.session_id) {
-        this.sessionId = result.session_id;
-      }
+    // A NON-SUCCESS RESULT IS STILL THE END OF THE TURN — but not a
+    // successful one. `subtype` names why the CLI stopped early (max turns,
+    // budget, an execution error); `is_error` on a `success` result marks a
+    // turn that ended on an API error, with the error text in `result`.
+    // Neither throws: the SDK yields these like any other result, so
+    // without this branch they resolved as ordinary turns — the owner got
+    // partial text or the generic "I'm not sure how to respond to that.",
+    // cron recorded a clean run, and nothing was logged.
+    // A turn the owner stopped ends on an error-shaped result (the CLI was
+    // interrupted). That is what he asked for: no failure, no error notice.
+    const stopped = this.stopRequestedFor !== null && this.stopRequestedFor === this.currentRequest;
+    this.stopRequestedFor = null;
+    if (stopped) {
+      this.publishSignal({ kind: "stopped" });
+      if (this.currentRequest?.replyContext) this.currentRequest.replyContext.stopped = true;
+    }
+    const failure = stopped ? null : describeResultFailure(result);
+    if (failure) {
+      log.warn(
+        { session: this.sessionKey, subtype: result.subtype, errors: result.errors, turns: result.num_turns },
+        "SDK turn ended on an error result",
+      );
+    }
 
-      const {
-        costUsd: turnCost,
-        totalCost,
-        tokens: { input, output, cacheRead, cacheCreated },
-        baseline,
-      } = this.turnUsage(result);
-      this.recordResultUsage(result);
+    // Store result stats, get context usage, then resolve
+    this.lastResult = {
+      costUsd: turnCost,
+      inputTokens: input,
+      outputTokens: output,
+      cacheReadTokens: cacheRead,
+      cacheCreationTokens: cacheCreated,
+      contextUsed: 0,
+      contextMax: 0,
+      usageBaseline: baseline,
+    };
 
-      // A NON-SUCCESS RESULT IS STILL THE END OF THE TURN — but not a
-      // successful one. `subtype` names why the CLI stopped early (max turns,
-      // budget, an execution error); `is_error` on a `success` result marks a
-      // turn that ended on an API error, with the error text in `result`.
-      // Neither throws: the SDK yields these like any other result, so
-      // without this branch they resolved as ordinary turns — the owner got
-      // partial text or the generic "I'm not sure how to respond to that.",
-      // cron recorded a clean run, and nothing was logged.
-      // A turn the owner stopped ends on an error-shaped result (the CLI was
-      // interrupted). That is what he asked for: no failure, no error notice.
-      const stopped = this.stopRequestedFor !== null && this.stopRequestedFor === this.currentRequest;
-      this.stopRequestedFor = null;
-      if (stopped) {
-        this.publishSignal({ kind: "stopped" });
-        if (this.currentRequest?.replyContext) this.currentRequest.replyContext.stopped = true;
-      }
-      const failure = stopped ? null : describeResultFailure(result);
-      if (failure) {
-        log.warn(
-          { session: this.sessionKey, subtype: result.subtype, errors: result.errors, turns: result.num_turns },
-          "SDK turn ended on an error result",
-        );
-      }
+    // Await context usage before resolving so stats are complete
+    await this.logContextUsage(result, turnCost, totalCost, input, output, cacheRead, cacheCreated);
 
-      // Store result stats, get context usage, then resolve
-      this.lastResult = {
-        costUsd: turnCost,
-        inputTokens: input,
-        outputTokens: output,
-        cacheReadTokens: cacheRead,
-        cacheCreationTokens: cacheCreated,
-        contextUsed: 0,
-        contextMax: 0,
-        usageBaseline: baseline,
-      };
+    // The turn is over. Its blocks have ALREADY shipped, one by one, as they
+    // completed; what is assembled here is only the response string — the
+    // transcript, the log line, and the value send()/steer() resolve with.
+    // TEXT ONLY IN THE RESULT. When no assistant frame carried text but the
+    // result has some (it is the turn's final text), it becomes the turn's
+    // closing text block and goes through the same path as any other:
+    // rendered (scaffold filter, fabricated-marker advisory), shipped to the
+    // sink, and joined into the response below. Never when frames did carry
+    // text: the result repeats it.
+    if (!failure && !stopped && !this.parts.some((part) => part.type === "text")) {
+      const finalText = result.result?.trim();
+      if (finalText) {
+        this.parts.push({ type: "text", text: finalText });
+        await this.shipBlock({ type: "text", text: finalText });
+      }
+    }
+    const rendered = renderResponseBlocks(this.parts, this.showThinking);
+    if (rendered.scaffoldFiltered) {
+      log.warn({ sessionKey: this.sessionKey }, "model scaffold leak filtered");
+    }
+    // A turn whose only content was a dropped thinking block resolves as a
+    // bare NO_REPLY — silent to the channel, honest in the transcript —
+    // rather than the generic fallback, which the runner WOULD deliver.
+    // A turn that ended with NO text at all used to resolve as "I'm not
+    // sure how to respond to that.", which the runner delivered. Every time
+    // that line reached a channel it was a symptom (a result that belonged
+    // to another turn, 2026-11-14), never an answer. Now it resolves
+    // EMPTY_REPLY: silent to the channel, reported as not-a-success.
+    // A turn the model ended on purpose (literal NO_REPLY, or a dropped
+    // thinking block) stays an ordinary silent NO_REPLY.
+    if (!rendered.text && !failure && !stopped && !this.droppedThinkingThisTurn) {
+      log.warn(
+        { session: this.sessionKey, turns: result.num_turns, subtype: result.subtype },
+        "Turn ended with no reply text; resolving as an empty reply",
+      );
+    }
+    const response = rendered.text || (this.droppedThinkingThisTurn || stopped ? "NO_REPLY" : EMPTY_REPLY);
+    this.droppedThinkingThisTurn = false;
+    this.parts = [];
+    this.unownedTurnDropLogged = false;
+    const req = this.currentRequest;
+    if (this.pendingSteers.length === 0) this.clearActivityTimeout();
+    // A failed turn REJECTS its owner (blocks already shipped stay shipped;
+    // the sink flushes their transcript slots on the rejection path) rather
+    // than resolving with a note the block sink would deliver as if the
+    // model had said it — bypassing the turn's error policy and reporting
+    // a clean run to cron.
+    if (failure) await req?.reject(failure);
+    else await req?.resolve(response);
+    for (const m of this.mergedRequests) {
+      if (failure && m.onJoined) await m.reject(failure);
+      else await m.resolve(STEER_MERGED);
+    }
+    this.mergedRequests = [];
+    this.currentRequest = null;
+    this.promotedSteerText = null;
 
-      // Await context usage before resolving so stats are complete
-      await this.logContextUsage(result, turnCost, totalCost, input, output, cacheRead, cacheCreated);
-
-      // The turn is over. Its blocks have ALREADY shipped, one by one, as they
-      // completed; what is assembled here is only the response string — the
-      // transcript, the log line, and the value send()/steer() resolve with.
-      // TEXT ONLY IN THE RESULT. When no assistant frame carried text but the
-      // result has some (it is the turn's final text), it becomes the turn's
-      // closing text block and goes through the same path as any other:
-      // rendered (scaffold filter, fabricated-marker advisory), shipped to the
-      // sink, and joined into the response below. Never when frames did carry
-      // text: the result repeats it.
-      if (!failure && !stopped && !this.parts.some((part) => part.type === "text")) {
-        const finalText = result.result?.trim();
-        if (finalText) {
-          this.parts.push({ type: "text", text: finalText });
-          await this.shipBlock({ type: "text", text: finalText });
-        }
-      }
-      const rendered = renderResponseBlocks(this.parts, this.showThinking);
-      if (rendered.scaffoldFiltered) {
-        log.warn({ sessionKey: this.sessionKey }, "model scaffold leak filtered");
-      }
-      // A turn whose only content was a dropped thinking block resolves as a
-      // bare NO_REPLY — silent to the channel, honest in the transcript —
-      // rather than the generic fallback, which the runner WOULD deliver.
-      // A turn that ended with NO text at all used to resolve as "I'm not
-      // sure how to respond to that.", which the runner delivered. Every time
-      // that line reached a channel it was a symptom (a result that belonged
-      // to another turn, 2026-11-14), never an answer. Now it resolves
-      // EMPTY_REPLY: silent to the channel, reported as not-a-success.
-      // A turn the model ended on purpose (literal NO_REPLY, or a dropped
-      // thinking block) stays an ordinary silent NO_REPLY.
-      if (!rendered.text && !failure && !stopped && !this.droppedThinkingThisTurn) {
-        log.warn(
-          { session: this.sessionKey, turns: result.num_turns, subtype: result.subtype },
-          "Turn ended with no reply text; resolving as an empty reply",
-        );
-      }
-      const response = rendered.text || (this.droppedThinkingThisTurn || stopped ? "NO_REPLY" : EMPTY_REPLY);
-      this.droppedThinkingThisTurn = false;
-      this.parts = [];
-      this.unownedTurnDropLogged = false;
-      const req = this.currentRequest;
-      if (this.pendingSteers.length === 0) this.clearActivityTimeout();
-      // A failed turn REJECTS its owner (blocks already shipped stay shipped;
-      // the sink flushes their transcript slots on the rejection path) rather
-      // than resolving with a note the block sink would deliver as if the
-      // model had said it — bypassing the turn's error policy and reporting
-      // a clean run to cron.
-      if (failure) await req?.reject(failure);
-      else await req?.resolve(response);
-      for (const m of this.mergedRequests) {
-        if (failure && m.onJoined) await m.reject(failure);
-        else await m.resolve(STEER_MERGED);
-      }
-      this.mergedRequests = [];
-      this.currentRequest = null;
-      this.promotedSteerText = null;
-
-      if (this.pendingSteers.length > 0) {
-        // Steered messages that missed this turn's tool boundaries were
-        // queued by the CLI and run next. Promote only the FIRST as the
-        // next turn's owner (it resolves with that turn's response); the rest
-        // stay pending — if the CLI batches them into the promoted turn we
-        // detect it via replay echoes (see matchSteerEchoes), otherwise
-        // they're promoted in order by subsequent results.
-        const [first, ...rest] = this.pendingSteers;
-        this.pendingSteers = rest;
-        this.currentRequest = first.req;
-        this.onTurnClaimed();
-        this.promotedSteerText = first.text;
-      } else {
-        this.clearActivityTimeout();
-        this.notifyIdle();
-      }
+    if (this.pendingSteers.length > 0) {
+      // Steered messages that missed this turn's tool boundaries were
+      // queued by the CLI and run next. Promote only the FIRST as the
+      // next turn's owner (it resolves with that turn's response); the rest
+      // stay pending — if the CLI batches them into the promoted turn we
+      // detect it via replay echoes (see matchSteerEchoes), otherwise
+      // they're promoted in order by subsequent results.
+      const [first, ...rest] = this.pendingSteers;
+      this.pendingSteers = rest;
+      this.currentRequest = first.req;
+      this.onTurnClaimed();
+      this.promotedSteerText = first.text;
+    } else {
+      this.clearActivityTimeout();
+      this.notifyIdle();
     }
   }
 

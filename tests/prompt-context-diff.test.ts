@@ -77,4 +77,20 @@ describe("classifyPromptContextChange", () => {
     expect(classifyPromptContextChange(base, { memory: [...base.memory, huge], people: base.people }))
       .toEqual({ kind: "retire", reason: "too-large" });
   });
+
+  it("gives the full heading path, so a repeated subheading is not ambiguous", () => {
+    const before = { memory: ["## Work", "### Contacts", "- [W](w.md)", "## Home", "### Contacts", "- [H](h.md)"], people: [] };
+    const work = body(classifyPromptContextChange(before, {
+      memory: ["## Work", "### Contacts", "- [W](w.md)", "- [A](a.md)", "## Home", "### Contacts", "- [H](h.md)"], people: [] }));
+    const home = body(classifyPromptContextChange(before, { memory: [...before.memory, "- [A](a.md)"], people: [] }));
+    expect(work).toContain('+ - [A](a.md)   (under "## Work > ### Contacts")');
+    expect(home).toContain('+ - [A](a.md)   (under "## Home > ### Contacts")');
+  });
+
+  it("counts the heading path toward the size cap", () => {
+    const heading = `## ${"h".repeat(400)}`;
+    const before = { memory: [heading, "- [A](a.md)"], people: [] };
+    const after = { memory: [heading, "- [A](a.md)", ...Array.from({ length: 6 }, (_, i) => `- [N${i}](n${i}.md)`)], people: [] };
+    expect(classifyPromptContextChange(before, after)).toEqual({ kind: "retire", reason: "too-large" });
+  });
 });

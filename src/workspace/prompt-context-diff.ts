@@ -5,8 +5,8 @@
  *
  * A note is only ever a list of whole lines added or removed. That is exact
  * only for a SMALL change that leaves the structure alone: a line's meaning in
- * the index can depend on where it sits (the heading above it), so each
- * noted line carries the heading it sits under. A change is noted only when
+ * the index can depend on where it sits (the headings above it), so each
+ * noted line carries the full heading path it sits under. A change is noted only when
  * every kept line keeps its relative order and count, no heading line is
  * added or removed, and at most MAX_NOTED_LINES lines (MAX_NOTED_CHARS
  * characters) change in all. Anything else retires the session as before,
@@ -23,8 +23,9 @@ export interface PromptContextLines {
 
 /** Most lines (added + removed, both sections together) a note may carry. */
 export const MAX_NOTED_LINES = 10;
-/** Most characters of changed lines a note may carry: it is prefixed whole to
- *  the next turn, and one huge line must not crowd the conversation out. */
+/** Most characters of changed lines, as rendered (heading paths included), a
+ *  note may carry: it is prefixed whole to the next turn, and must not crowd
+ *  the conversation out. */
 export const MAX_NOTED_CHARS = 2_000;
 
 export type PromptContextChange =
@@ -54,10 +55,18 @@ function diffLines(before: string[], after: string[]): LineDiff {
   const keptAfter = a.filter((l) => bSet.has(l));
   const notIn = (lines: string[], other: Set<string>) => {
     const out: LineDiff["added"] = [];
-    let under: string | undefined;
+    // The full heading path ("## Work > ### Contacts"): the leaf alone can
+    // repeat under different parents.
+    const path: Array<{ level: number; text: string }> = [];
     for (const line of lines) {
-      if (isHeading(line)) under = line.trim();
-      else if (!other.has(line)) out.push(under ? { line, under } : { line });
+      if (isHeading(line)) {
+        const text = line.trim();
+        const level = /^#+/.exec(text)![0].length;
+        while (path.length > 0 && path[path.length - 1].level >= level) path.pop();
+        path.push({ level, text });
+      } else if (!other.has(line)) {
+        out.push(path.length > 0 ? { line, under: path.map((h) => h.text).join(" > ") } : { line });
+      }
     }
     // A heading itself never goes into a note (it retires), but count it.
     return [...out, ...lines.filter((l) => isHeading(l) && !other.has(l)).map((line) => ({ line }))];
@@ -69,11 +78,15 @@ function diffLines(before: string[], after: string[]): LineDiff {
   };
 }
 
-function renderSection(title: string, diff: LineDiff): string | undefined {
-  if (diff.added.length + diff.removed.length === 0) return undefined;
+/** The section's changed lines as the note shows them (heading path included). */
+function renderedLines(diff: LineDiff): string[] {
   const render = (sign: string) => (e: { line: string; under?: string }) =>
     e.under ? `${sign} ${e.line}   (under "${e.under}")` : `${sign} ${e.line}`;
-  const lines = [...diff.added.map(render("+")), ...diff.removed.map(render("-"))];
+  return [...diff.added.map(render("+")), ...diff.removed.map(render("-"))];
+}
+
+function renderSection(title: string, lines: string[]): string | undefined {
+  if (lines.length === 0) return undefined;
   return `${title} (+ added, - removed):\n${lines.join("\n")}`;
 }
 
@@ -87,9 +100,12 @@ export function classifyPromptContextChange(before: PromptContextLines, after: P
   if (count === 0) return { kind: "none" };
   if (diffs.some((d) => [...d.added, ...d.removed].some((e) => isHeading(e.line)))) return { kind: "retire", reason: "heading" };
   if (count > MAX_NOTED_LINES) return { kind: "retire", reason: "too-many" };
-  const chars = diffs.reduce((n, d) => n + [...d.added, ...d.removed].reduce((m, e) => m + e.line.length, 0), 0);
+  const memoryLines = renderedLines(memory);
+  const peopleLines = renderedLines(people);
+  // Measured as rendered: the heading path repeats on every line.
+  const chars = [...memoryLines, ...peopleLines].reduce((n, l) => n + l.length, 0);
   if (chars > MAX_NOTED_CHARS) return { kind: "retire", reason: "too-large" };
-  const sections = [renderSection("MEMORY.md", memory), renderSection("People registry", people)]
+  const sections = [renderSection("MEMORY.md", memoryLines), renderSection("People registry", peopleLines)]
     .filter((s): s is string => s !== undefined);
   return {
     kind: "note",

@@ -17,7 +17,8 @@ import {
 import { SubsessionService, type TaskTurnOutcome } from "./agent/subsessions/service.js";
 import { SubsessionStore } from "./agent/subsessions/store.js";
 import { buildSubsessionPrompt } from "./agent/subsessions/prompt.js";
-import { CronStore, CRON_STORE_PATH } from "./cron/store.js";
+import { CRON_STORE_PATH } from "./cron/store.js";
+import { createTaskCronLink } from "./agent/subsessions/cron-link.js";
 import { EFFORT_LEVELS, type EffortLevel } from "./config.js";
 import type { SessionContext } from "./agent/sdk-options.js";
 import { privateMemoryBarFor } from "./agent/permissions.js";
@@ -482,15 +483,7 @@ export class Agent {
    * would report, notify and be fenced through its group.
    */
   private createSubsessionService(): SubsessionService {
-    const cron = new CronStore(CRON_STORE_PATH);
-    const cronJobsFor = (key: string) => {
-      try {
-        return cron.list().filter((job) => job.sessionKey === key);
-      } catch (err) {
-        log.warn({ err, key }, "Sub-session: cron store unreadable");
-        return [];
-      }
-    };
+    const cron = createTaskCronLink(CRON_STORE_PATH);
     return new SubsessionService({
       store: new SubsessionStore(join(config.tomoHome, "data", "subsessions.json")),
       config: () => config.subsessions,
@@ -519,10 +512,8 @@ export class Agent {
         const last = this.liveSessionManager.lastResult(key);
         return last ? { used: last.contextUsed, estimated: last.contextEstimated === true } : undefined;
       },
-      cronJobCount: (key) => cronJobsFor(key).filter((job) => job.enabled).length,
-      removeCronJobs: (key) => {
-        for (const job of cronJobsFor(key)) cron.remove(job.id);
-      },
+      cronJobCount: (key) => cron.count(key),
+      removeCronJobs: (key) => cron.removeAll(key),
       stopSession: (key, timeoutMs) => this.stopTaskSession(key, timeoutMs),
       hasSdkSession: (key) => this.sessions.getSdkSessionId(key) !== undefined,
       ensureRegistryEntry: (key) => this.sessions.ensureEntry(key),

@@ -308,6 +308,25 @@ describe("SubsessionService", () => {
     expect(h.turns[2].prompt).toContain('type="subsession-start"');
   });
 
+  it("gives up on a finished task's answer after two failed turns, or at once when stopped, and says so", async () => {
+    const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, "ok")));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)?.status).toBe("finished");
+    h.onTurn = () => ({ ok: false });
+    h.service.relay(t.id, "one more thing");
+    await flush();
+    expect(h.turns).toHaveLength(3);
+    expect(h.store.get(t.id)).toMatchObject({ status: "finished", pendingInput: [], failStreak: 0 });
+    expect(h.notices.at(-1)?.text).toContain("Couldn't answer the message it was sent");
+    h.onTurn = () => ({ ok: false, stopped: true });
+    h.service.relay(t.id, "and another");
+    await flush();
+    expect(h.turns).toHaveLength(4);
+    expect(h.store.get(t.id)?.pendingInput).toEqual([]);
+  });
+
   it("a background report on a task waiting on something external queues it with a continue", async () => {
     let n = 0;
     const h = harness({}, working((turn, hh) => {

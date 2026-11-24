@@ -4,6 +4,7 @@ import type { subsessions as en } from "../en/subsessions.js";
 export const subsessions = {
   stuck: "[{{id}} · {{title}}] 已暂停：连续 {{turns}} 轮没有进展。告诉我怎么继续，或者取消。",
   failing: "[{{id}} · {{title}}] 已暂停：最近几轮都失败了。说一声我就继续，或者取消。",
+  finishedUnanswered: "[{{id}} · {{title}}] 没能回复发给它的消息，它仍是已完成状态。再发一次可以重试。",
   stopped: "[{{id}} · {{title}}] 已停下。说一声我就继续，或者取消。",
   selfRestart: "[{{id}} · {{title}}] Tomo 按这个任务自己的要求重启了，所以先暂停。准备好了说一声继续。",
   failedInterrupted: "[{{id}} · {{title}}] 放弃了：连续 {{restarts}} 次被重启打断。还需要的话再说一次。",

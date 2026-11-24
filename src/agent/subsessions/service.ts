@@ -594,6 +594,10 @@ export class SubsessionService {
     }
 
     let record: SubsessionRecord | undefined;
+    // A finished task's answer to a relay that keeps failing (or that the
+    // owner stopped) is given up rather than retried forever: plan() would run
+    // a finished task again at once while its input is pending.
+    let gaveUp = false;
     try {
       record = this.store.update(id, (r) => {
         if (outcome.ok) {
@@ -604,7 +608,12 @@ export class SubsessionService {
           if (turn.afterCompact) r.postCompactReminder = false;
         } else {
           r.failStreak += 1;
-          if (turn.inputs.length > 0) r.pendingInput = [...turn.inputs, ...r.pendingInput];
+          if (r.status === "finished" && (outcome.stopped || r.failStreak >= MAX_FAIL_STREAK)) {
+            r.failStreak = 0;
+            gaveUp = turn.inputs.length > 0;
+          } else if (turn.inputs.length > 0) {
+            r.pendingInput = [...turn.inputs, ...r.pendingInput];
+          }
         }
         const usage = this.deps.contextUsage(r.sessionKey);
         if (outcome.ok && usage && !usage.estimated && usage.used > this.deps.config().maxContextTokens && !r.compactPending) {
@@ -618,6 +627,7 @@ export class SubsessionService {
     }
     if (!record || record.status !== "active") {
       this.continueOwed.delete(id);
+      if (record && gaveUp) void this.tellScope(record, ownerT("subsessions")("finishedUnanswered", { id: record.id, title: record.title }));
       return;
     }
 

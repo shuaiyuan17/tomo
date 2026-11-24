@@ -2,6 +2,7 @@
 export const subsessions = {
   stuck: "[{{id}} · {{title}}] Paused: {{turns}} turns in a row with no progress. Tell me how to go on, or cancel it.",
   failing: "[{{id}} · {{title}}] Paused: its last turns failed. Tell me to go on, or cancel it.",
+  finishedUnanswered: "[{{id}} · {{title}}] Couldn't answer the message it was sent; it stays finished. Send it again to retry.",
   stopped: "[{{id}} · {{title}}] Stopped. Tell me to go on, or cancel it.",
   selfRestart: "[{{id}} · {{title}}] Tomo restarted at this task's own request, so it is paused. Tell me to go on when you're ready.",
   failedInterrupted: "[{{id}} · {{title}}] Gave up: restarts cut it short {{restarts}} times in a row. Ask again if it is still needed.",

@@ -29,12 +29,26 @@ export interface SubsessionSentMessage {
 export interface SubsessionInput {
   seq: number;
   text: string;
+  /**
+   * "owner": the owner's word (a relay from the owning session, or a message
+   * from the owner). A turn carrying one is never held by the wall-clock cap
+   * or the quota gate, and a failed task hands it back to the owner.
+   * Unset: the harness's own (a check-back, a background report).
+   */
+  from?: "owner";
+  /** For an owner input: what was said, without the event wrapper (quoted back if it is never answered). */
+  words?: string;
 }
 
 /** Append an input: the only way one is added. */
-export function appendInput(record: SubsessionRecord, text: string): void {
-  record.pendingInput.push({ seq: record.nextInputSeq, text });
+export function appendInput(record: SubsessionRecord, text: string, origin?: { from: "owner"; words: string }): void {
+  record.pendingInput.push({ seq: record.nextInputSeq, text, ...(origin ? { from: origin.from, words: origin.words } : {}) });
   record.nextInputSeq += 1;
+}
+
+/** Active time, the current stretch included. */
+export function activeTotalMs(record: SubsessionRecord, now: number): number {
+  return record.activeMs + (record.activeSince !== undefined ? Math.max(0, now - record.activeSince) : 0);
 }
 
 /** The highest seq pending (0 when none). */
@@ -83,6 +97,12 @@ export interface SubsessionRecord {
   /** Set while active: when the current active stretch began. */
   activeSince?: number;
   /**
+   * `activeTotalMs` when the owner last said something to the task (unset:
+   * never). The wall-clock cap (`subsessions.maxActiveHours`) counts the
+   * active time since then: the owner's word buys it another full stretch.
+   */
+  activeAtOwnerInputMs?: number;
+  /**
    * A restart cut this task's work short: the next turn it gets is a resume
    * (check side effects first), not a start. Set with the restart transition
    * (active → queued), cleared by the first turn that completes.
@@ -105,6 +125,18 @@ export interface SubsessionRecord {
   report?: string;
   /** Counts the task's reports (a finished task can be woken and finish again); its report note is named by it. */
   reportSeq?: number;
+  /**
+   * Earlier reports a later task_finish replaced while they were still
+   * unread (their note still waiting, or never written), oldest first, at
+   * kept until read. task_status shows them; they go with the record.
+   * `noted`: its note was written (once that note is read, the entry may go).
+   */
+  earlierReports?: Array<{ seq: number; text: string; noted?: boolean }>;
+  /**
+   * A failed task's unanswered owner input was handed back in full (a pinned
+   * `subsession-handback` note on disk): until then the record is not forgotten.
+   */
+  handedBack?: boolean;
   reportDelivered: boolean;
   /** A `/compact` turn is due (context over subsessions.maxContextTokens). */
   compactPending: boolean;

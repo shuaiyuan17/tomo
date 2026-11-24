@@ -71,6 +71,7 @@ import { ProactiveSendService, type SendResult, type SessionCatalog } from "./ag
 import { appendToTomoEventBody, formatTomoEvent, markOwnerAudience } from "./tomo-event.js";
 import { UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
 import { usageDataDir } from "./usage/dir.js";
+import { readSessionWindowPercent } from "./usage/limits-log.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
@@ -410,7 +411,9 @@ export class Agent {
       ...(this.runningAgents && config.interruptedAgentsAutoResume
         ? { resumeGate: (key: string, taskId: string) => this.runningAgents?.gateResume(key, taskId) ?? null }
         : {}),
-      buildExternalMcpServers: (key) => this.mcpOAuthManager.buildServersWithAuth(
+      // A sub-session gets no external MCP server (sdk-options.ts drops them
+      // too): nothing is built for it, so no OAuth prompt is started for it.
+      buildExternalMcpServers: async (key) => isTaskSessionKey(key) ? {} : this.mcpOAuthManager.buildServersWithAuth(
         config.mcpServers ?? {},
         (serverName, url) => this.mcpAuthPrompts.forwardMcpAuthorizeUrl(key, serverName, url),
         // Interactive OAuth may wait ten minutes for a browser callback. Never
@@ -526,6 +529,7 @@ export class Agent {
       unlinkRegistryEntry: (key) => this.sessions.clearSdkSessionId(key),
       registryTaskKeys: () => this.sessions.listActiveEntries().map((e) => e.channelKey).filter(isTaskSessionKey),
       isStopping: () => this.stopping,
+      sessionQuotaPercent: () => readSessionWindowPercent(join(usageDataDir(config.tomoHome), "limits.ndjson")),
     });
   }
 

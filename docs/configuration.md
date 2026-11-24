@@ -241,10 +241,10 @@ Set `"interruptedAgents": false` (or `{ "enabled": false }`) or `TOMO_INTERRUPTE
 
 ## Sub-sessions
 
-Off by default. With them on, the owner's own conversation gets `task_spawn`, `task_status`, `task_cancel` and `task_message`: Tomo can hand a long task (a PR to write and see through review, a long investigation) to a separate session that works in the background, survives restarts, and reports back. Each runs under the key `task:<id>` (`s1`, `s2`, …); its messages reach you with a `[s1 · title]` prefix, and its report comes back to the main conversation, which tells you the result and decides what to remember. Sub-sessions don't write memory.
+On by default (`"subsessions": { "enabled": false }` turns them off). The owner's own conversation gets `task_spawn`, `task_status`, `task_cancel` and `task_message`: Tomo can hand a long task (a PR to write and see through review, a long investigation) to a separate session that works in the background, survives restarts, and reports back. Each runs under the key `task:<id>` (`s1`, `s2`, …); its messages reach you with a `[s1 · title]` prefix, and its report comes back to the main conversation, which tells you the result and decides what to remember. Sub-sessions don't write memory.
 
 ```json
-{ "subsessions": { "enabled": true, "maxRunning": 2, "maxOpen": 5, "maxTurns": 200, "maxContextTokens": 500000, "defaultModel": null } }
+{ "subsessions": { "enabled": true, "maxRunning": 2, "maxOpen": 5, "maxTurns": 200, "maxContextTokens": 500000, "defaultModel": null, "maxActiveHours": 24 } }
 ```
 
 - `maxRunning`: tasks working on their own at once; more wait queued. A message to a task is never queued.
@@ -252,6 +252,9 @@ Off by default. With them on, the owner's own conversation gets `task_spawn`, `t
 - `maxTurns`: the SDK's turn cap per task turn (`0`: none).
 - `maxContextTokens`: between turns, a task over this is compacted with `/compact`.
 - `defaultModel`: model for a task that names none (unset follows `model`). Haiku is refused.
+- `maxActiveHours`: a task that has been working on its own this many hours (active time, counted since your last message to it) pauses and tells you; your next message to it gives it another stretch. `0`: no cap.
+
+A task runs unattended, so it gets fewer tools than the main conversation: no external MCP servers (neither `mcpServers` nor any a plugin or a settings file brings) and no claude.ai connectors (Gmail, Calendar, Drive…), only Tomo's own tools plus the built-in ones. Its own turns also pause (and you are told once) while 80% or more of the 5-hour usage window is used, as last recorded in `~/.tomo/data/usage/limits.ndjson`; if that can't be read, they run. A message from you to the task always goes through.
 
 State lives in `~/.tomo/data/subsessions.json` (fsynced, with a `.bak`). If it cannot be read at start, sub-sessions stay off until it is repaired and nothing is unlinked or cancelled.
 

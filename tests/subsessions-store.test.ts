@@ -122,7 +122,8 @@ describe("SubsessionStore", () => {
     expect(store.get(t.id)?.activeSince).toBeUndefined();
   });
 
-  it("caps the transition log", () => {
+  // 81 locked, fsynced writes: seconds on a slow disk under a full parallel run.
+  it("caps the transition log", { timeout: 30_000 }, () => {
     const store = new SubsessionStore(path);
     const t = store.create({ parentKey: "dm:owner", title: "a", brief: "b" });
     store.transition(t.id, "start");

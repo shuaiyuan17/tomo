@@ -24,10 +24,20 @@ afterEach(() => {
 });
 
 describe("subsessions config", () => {
-  it("is off by default, with the design's defaults", async () => {
+  it("is on by default, with the design's defaults", async () => {
     const { config, DEFAULT_SUBSESSIONS } = await loadConfigWith({});
     expect(config.subsessions).toEqual(DEFAULT_SUBSESSIONS);
-    expect(DEFAULT_SUBSESSIONS).toEqual({ enabled: false, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null });
+    expect(config.subsessions.enabled).toBe(true);
+    expect(DEFAULT_SUBSESSIONS).toEqual({ enabled: true, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null, maxActiveHours: 24 });
+  });
+
+  it("can be turned off, and takes a wall-clock cap (0 = none)", async () => {
+    const { config, configIssues } = await loadConfigWith({ subsessions: { enabled: false, maxActiveHours: 0 } });
+    expect(config.subsessions).toMatchObject({ enabled: false, maxActiveHours: 0 });
+    expect(configIssues.join("\n")).not.toContain("subsessions");
+    const bad = await loadConfigWith({ subsessions: { maxActiveHours: -1 } });
+    expect(bad.config.subsessions.maxActiveHours).toBe(24);
+    expect(bad.configIssues.join("\n")).toContain("subsessions.maxActiveHours");
   });
 
   it("takes overrides and drops only a bad field", async () => {

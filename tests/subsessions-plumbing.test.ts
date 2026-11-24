@@ -82,6 +82,14 @@ describe("pending notes: sub-session reports", () => {
     expect(q.peekNotes("dm:owner")).toContain(report);
   });
 
+  it("a failed task's handback note is pinned too", () => {
+    const q = new PendingNotesQueue(memoryStore() as never);
+    const handback = formatTomoEvent("subsession-handback", "1. the owner's message", { name: "s1" });
+    q.queueNote("dm:owner", handback);
+    for (let i = 0; i < 40; i++) q.queueNote("dm:owner", formatTomoEvent("note", `filler ${i}`));
+    expect(q.peekNotes("dm:owner")).toContain(handback);
+  });
+
   it("hasNote sees queued and in-flight notes", () => {
     const q = new PendingNotesQueue(memoryStore() as never);
     q.queueNote("dm:owner", "marker-a");
@@ -152,6 +160,12 @@ describe("sub-session tools", () => {
     expect((await call(group, "task_cancel", { id: "s1" })).isError).toBe(true);
     expect((await call(group, "task_message", { id: "s1", text: "hi" })).isError).toBe(true);
     expect((await call(owner, "task_status", { id: "s1" })).content[0].text).toContain("Mine");
+  });
+
+  it("task_spawn tells the model to tell the owner before starting a task on its own", () => {
+    const tools = buildTaskOwnerTools({ service: () => undefined, scope: () => "dm:owner" });
+    const description = (tools.find((t) => t.name === "task_spawn") as unknown as { description: string }).description;
+    expect(description).toMatch(/on your own[^.]*must tell the owner first/);
   });
 
   it("refuses a turn that may not manage sub-sessions", async () => {

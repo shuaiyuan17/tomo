@@ -17,7 +17,7 @@ import {
   formatResumeEvent,
   formatStartEvent,
 } from "./prompt.js";
-import { OPEN_STATUSES, PENDING_INPUT_MAX, TERMINAL_STATUSES, appendInput, lastInputSeq, type SubsessionRecord } from "./types.js";
+import { OPEN_STATUSES, PENDING_INPUT_MAX, TERMINAL_STATUSES, activeTotalMs, appendInput, lastInputSeq, type SubsessionInput, type SubsessionRecord } from "./types.js";
 
 /** How a task turn ended, as the agent's turn runner saw it. */
 export interface TaskTurnOutcome {
@@ -80,6 +80,12 @@ export interface SubsessionServiceDeps {
   /** Active registry keys that are task keys. */
   registryTaskKeys(): string[];
   isStopping(): boolean;
+  /**
+   * The newest reading of the subscription's 5-hour window, 0–100; undefined
+   * when there is none (no quota samples yet, API-key auth). Throws when the
+   * samples cannot be read: the gate then lets the turn run (fail open).
+   */
+  sessionQuotaPercent?(): number | undefined;
   now?(): number;
 }
 
@@ -100,6 +106,11 @@ export const REPORT_RETRY_MAX = 5;
 export const SETTLE_RETRY_MS = 60_000;
 /** Turns held while the session registry cannot be read: how soon it is looked at again. */
 export const REGISTRY_RECHECK_MS = 60_000;
+/** At this share of the 5-hour window, a task's own turns pause for the owner. */
+export const QUOTA_PAUSE_PERCENT = 80;
+/** How much of each unanswered message a failure notice quotes. */
+const UNANSWERED_EXCERPT = 300;
+const UNANSWERED_MAX = 5;
 /** How much of an undelivered message the next turn is shown. */
 const LOST_ANSWER_EXCERPT = 1500;
 const ACTIVITY_NOTE_EXCERPT = 1500;
@@ -178,6 +189,8 @@ export class SubsessionService {
    */
   private readonly registryHeld = new Set<string>();
   private registryHoldTold = false;
+  /** The quota samples could not be read last time: logged once per failing stretch. */
+  private quotaReadFailing = false;
   /**
    * Startup is two steps. `recoverAtStartup()` (before any channel ingests)
    * reads the table and runs recovery, reconcile and the sweep: from then on
@@ -324,7 +337,7 @@ export class SubsessionService {
   /** The owning session passes something on (Phase 1a: how the owner answers). */
   relay(id: string, text: string): TransitionOutcome {
     if (!this.available()) return { ok: false, from: null };
-    return this.deliverInput(id, "relay", formatRelayEvent(text));
+    return this.deliverInput(id, "relay", formatRelayEvent(text), text);
   }
 
   // ---------------------------------------------------------------------
@@ -397,7 +410,23 @@ export class SubsessionService {
     if (!record) return { ok: false, from: null };
     const outcome = this.store.transition(record.id, "finish", {
       // A live ending: the status no longer comes from a backup.
-      patch: (r) => { r.reportSeq = (r.reportSeq ?? (r.report !== undefined ? 1 : 0)) + 1; r.report = report.trim(); r.reportDelivered = false; delete r.restored; },
+      patch: (r) => {
+        const previous = r.reportSeq ?? (r.report !== undefined ? 1 : 0);
+        // A report not yet read (its note still waiting, or never written)
+        // is kept beside the new one, never replaced: its note quotes only
+        // the start and points to task_status for the rest.
+        // Every one still unread is kept (no cap: each is bounded by an
+        // unread note, or by a report that never got one); a read one goes.
+        const kept = (r.earlierReports ?? []).filter((e) => e.seq !== previous && (!e.noted || this.notePending(r.parentKey, `${r.id}#${e.seq}`)));
+        if (r.report !== undefined && previous > 0 && (!r.reportDelivered || this.reportNotePending({ ...r, reportSeq: previous }))) {
+          kept.push({ seq: previous, text: r.report, ...(r.reportDelivered ? { noted: true } : {}) });
+        }
+        r.earlierReports = kept.length > 0 ? kept : undefined;
+        r.reportSeq = previous + 1;
+        r.report = report.trim();
+        r.reportDelivered = false;
+        delete r.restored;
+      },
     });
     if (!outcome.ok) return outcome;
     this.continueOwed.delete(record.id);
@@ -819,12 +848,15 @@ export class SubsessionService {
       // Nor is a task archived or forgotten while its report note is still
       // unread: the note holds only the start of the report, and points to
       // task_status for the rest.
-      if (this.reportNotePending(task)) continue;
+      if (this.reportNotePending(task) || this.earlierReportPending(task)) continue;
       if (task.status === "finished" && task.reportDelivered && task.pendingInput.length === 0
         && now - (task.endedAt ?? task.lastActivityAt) > FINISHED_KEEP_MS) {
         const outcome = this.store.transition(task.id, "archive", { reason: "finished more than 7 days ago" });
         if (outcome.ok) this.safely(() => this.deps.unlinkRegistryEntry(task.sessionKey), "unlink archived");
       } else if (TERMINAL_STATUSES.has(task.status) && now - (task.endedAt ?? task.lastActivityAt) > ENDED_KEEP_MS) {
+        // A failed task's unanswered owner input goes only once it is handed
+        // back in full; a handback that could not be written is tried again here.
+        if (task.status === "failed" && !task.handedBack && task.pendingInput.some(isOwnerInput) && !this.handBack(task)) continue;
         forget.push(task.id);
       }
     }
@@ -951,11 +983,16 @@ export class SubsessionService {
     this.registryRecheckTimer.unref?.();
   }
 
-  private deliverInput(id: string, event: Extract<SubsessionEvent, "relay" | "owner_message">, prompt: string): TransitionOutcome {
+  private deliverInput(id: string, event: Extract<SubsessionEvent, "relay" | "owner_message">, prompt: string, words: string): TransitionOutcome {
+    const now = this.now();
     const outcome = this.store.transition(id, event, {
       reason: event === "relay" ? "a message from the main session" : "a message from the owner",
       guard: inputQueueFull,
-      patch: (r) => { appendInput(r, prompt); },
+      patch: (r) => {
+        appendInput(r, prompt, { from: "owner", words });
+        // The owner's word: the wall-clock cap counts from here again.
+        r.activeAtOwnerInputMs = activeTotalMs(r, now);
+      },
     });
     if (!outcome.ok) return outcome;
     // Queued: it waits for its slot, and the message goes with its first turn.
@@ -987,6 +1024,20 @@ export class SubsessionService {
       const turn = this.plan(record);
       if (!turn) return;
       if (this.mayRun(record) !== "run") return;
+      // A turn the task gives itself (a continue, a check-back, its start)
+      // first passes the wall-clock cap and the quota gate.
+      let gate: "run" | "paused" | "again";
+      try {
+        gate = this.gateOwnTurn(record);
+      } catch (err) {
+        // The pause could not be written: no turn now (it would run past the
+        // gate), and none at once (that would spin); the retry timer asks again.
+        log.error({ err, id }, "Could not pause a sub-session at its cap or quota gate; trying again later");
+        this.retryAfterSettleFailure(id);
+        return;
+      }
+      if (gate === "paused") return;
+      if (gate === "again") continue;
       // Nothing is written before the turn, and nothing it owes is forgotten
       // before it: its inputs, and a "continue" owed, leave with the write
       // that records its result (a retry after a failed write finds them).
@@ -1239,6 +1290,13 @@ export class SubsessionService {
    * redelivery can meet the normal one).
    */
   private deliverReport(record: SubsessionRecord): void {
+    // An earlier report kept unread whose own note was never written (it
+    // failed, and died with the process) gets that note first: until it is
+    // on disk, nothing else holds its text once the record goes.
+    if (!this.deliverEarlierReports(record)) {
+      this.retryReport(record.id);
+      return;
+    }
     let present = this.reportNotePending(record);
     if (present && this.unpersistedReports.has(record.id)) {
       // The note found is our own, held in memory after its write failed: it
@@ -1254,9 +1312,11 @@ export class SubsessionService {
     if (!present) {
       const report = record.report ?? "";
       const excerpt = report.length > REPORT_NOTE_EXCERPT ? `${report.slice(0, REPORT_NOTE_EXCERPT - 1)}…` : report;
+      const earlier = (record.earlierReports ?? []).map((e) => `#${e.seq}`);
       const note = formatTomoEvent("subsession-report", [
-        `Sub-session ${record.id} ("${record.title}") finished. Its report${report.length > REPORT_NOTE_EXCERPT ? " (start; read the whole report with task_status)" : ""}:`,
+        `Sub-session ${record.id} ("${record.title}") finished. Its report #${record.reportSeq ?? 1}${report.length > REPORT_NOTE_EXCERPT ? " (start; read the whole report with task_status)" : ""}:`,
         excerpt,
+        ...(earlier.length > 0 ? [`Its earlier report${earlier.length === 1 ? "" : "s"} ${earlier.join(", ")} ${earlier.length === 1 ? "is" : "are"} kept too: task_status shows ${earlier.length === 1 ? "it" : "them"}.`] : []),
       ].join("\n"), { name: reportNoteName(record) });
       if (!this.deps.queuePendingNote(record.parentKey, note)) {
         this.unpersistedReports.add(record.id);
@@ -1273,10 +1333,47 @@ export class SubsessionService {
     this.safely(() => this.store.update(record.id, (r) => { r.reportDelivered = true; }), "mark report delivered");
   }
 
+  /** Writes the note of every kept earlier report that has none on disk. False when one could not be written. */
+  private deliverEarlierReports(record: SubsessionRecord): boolean {
+    const missing = (record.earlierReports ?? []).filter((e) => !e.noted);
+    if (missing.length === 0) return true;
+    for (const e of missing) {
+      const name = `${record.id}#${e.seq}`;
+      const ok = this.notePending(record.parentKey, name)
+        // Found in memory: held after a failed write, so written again.
+        ? this.deps.persistPendingNotes?.(record.parentKey) ?? false
+        : this.deps.queuePendingNote(record.parentKey, formatTomoEvent("subsession-report", [
+          `Sub-session ${record.id} ("${record.title}") finished earlier. Its report #${e.seq}, replaced by a later one before it was read:`,
+          e.text.length > REPORT_NOTE_EXCERPT ? `${e.text.slice(0, REPORT_NOTE_EXCERPT - 1)}… (read the whole report with task_status)` : e.text,
+        ].join("\n"), { name }));
+      if (!ok) return false;
+    }
+    const seqs = new Set(missing.map((e) => e.seq));
+    try {
+      this.store.update(record.id, (r) => {
+        for (const e of r.earlierReports ?? []) if (seqs.has(e.seq)) e.noted = true;
+      });
+    } catch (err) {
+      log.error({ err, id: record.id }, "Could not mark an earlier sub-session report noted");
+      return false;
+    }
+    return true;
+  }
+
   /** This report's own note (by report seq): an unread earlier report of the same task is another note. */
   private reportNotePending(record: SubsessionRecord): boolean {
-    const marker = `<tomo-event type="subsession-report" name="${reportNoteName(record)}"`;
-    return this.deps.hasPendingNote(record.parentKey, (n) => n.includes(marker));
+    return this.notePending(record.parentKey, reportNoteName(record));
+  }
+
+  /** An earlier report a later finish kept (see finish) is still unread. */
+  private earlierReportPending(record: SubsessionRecord): boolean {
+    // One whose note was never written is outstanding too.
+    return (record.earlierReports ?? []).some((e) => !e.noted || this.notePending(record.parentKey, `${record.id}#${e.seq}`));
+  }
+
+  private notePending(parentKey: string, name: string): boolean {
+    const marker = `<tomo-event type="subsession-report" name="${name}"`;
+    return this.deps.hasPendingNote(parentKey, (n) => n.includes(marker));
   }
 
   private wakeForReport(record: SubsessionRecord): void {
@@ -1317,8 +1414,86 @@ export class SubsessionService {
     this.reportAttempts.delete(id);
   }
 
+  /**
+   * A task that failed may still hold what the owner said to it and it never
+   * answered: the notice hands that back (the record, and those inputs with
+   * it, is forgotten 30 days on).
+   */
   private reportFailure(record: SubsessionRecord, notice: OwnerText): void {
-    this.tellScope(record, notice);
+    const unanswered = record.pendingInput.filter(isOwnerInput);
+    if (unanswered.length === 0) {
+      this.tellScope(record, notice);
+      return;
+    }
+    const list = unanswered.slice(0, UNANSWERED_MAX).map((i) => `• ${truncate((i.words ?? i.text).trim(), UNANSWERED_EXCERPT)}`).join("\n");
+    this.tellScope(record, ownerT("subsessions")("withUnanswered", { notice, count: unanswered.length, list }));
+    this.handBack(record);
+  }
+
+  /**
+   * The owner's unanswered input, in full, to the owning session as a pinned
+   * note: the one copy that outlives the record. Marked on the record once the
+   * note is on disk; until then the sweep keeps the record and tries again.
+   */
+  private handBack(record: SubsessionRecord): boolean {
+    const unanswered = record.pendingInput.filter(isOwnerInput);
+    const note = formatTomoEvent("subsession-handback", [
+      `Sub-session ${record.id} ("${record.title}") failed before it answered ${unanswered.length === 1 ? "this message" : `these ${unanswered.length} messages`} passed on for the owner. Here in full; decide with the owner whether ${unanswered.length === 1 ? "it still needs" : "they still need"} doing:`,
+      ...unanswered.map((i, n) => `${n + 1}. ${(i.words ?? i.text).trim()}`),
+    ].join("\n\n"), { name: record.id });
+    if (!this.deps.queuePendingNote(record.parentKey, note)) {
+      log.warn({ id: record.id }, "Could not write a failed sub-session's handback note; the record is kept and it is tried again");
+      return false;
+    }
+    try {
+      this.store.update(record.id, (r) => { r.handedBack = true; });
+    } catch (err) {
+      log.error({ err, id: record.id }, "Could not mark a sub-session's input handed back");
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * A turn the task gives itself (no owner input in it) is held when it has
+   * been active on its own past `maxActiveHours`, or when the 5-hour window
+   * is at QUOTA_PAUSE_PERCENT or more: it pauses for the owner (one notice),
+   * whose word wakes it. "again": the pause was refused (the owner's input
+   * just landed): plan the turn afresh.
+   */
+  private gateOwnTurn(record: SubsessionRecord): "run" | "paused" | "again" {
+    if (record.status !== "active" || record.pendingInput.some(isOwnerInput)) return "run";
+    const capHours = this.deps.config().maxActiveHours;
+    if (capHours > 0) {
+      const ownMs = activeTotalMs(record, this.now()) - (record.activeAtOwnerInputMs ?? 0);
+      if (ownMs >= capHours * 3_600_000) {
+        log.info({ id: record.id, ownMs, capHours }, "Sub-session over its wall-clock cap; pausing for the owner");
+        return this.pause(record, `active ${capHours}h on its own (subsessions.maxActiveHours)`,
+          ownerT("subsessions")("activeCap", { id: record.id, title: record.title, hours: capHours }), hasOwnerInput) ? "paused" : "again";
+      }
+    }
+    const percent = this.quotaPercent();
+    if (percent !== undefined && percent >= QUOTA_PAUSE_PERCENT) {
+      log.info({ id: record.id, percent }, "5-hour quota window nearly used; pausing a sub-session for the owner");
+      return this.pause(record, `the 5-hour quota window is at ${Math.round(percent)}%`,
+        ownerT("subsessions")("quotaHigh", { id: record.id, title: record.title, percent: Math.round(percent) }), hasOwnerInput) ? "paused" : "again";
+    }
+    return "run";
+  }
+
+  /** The 5-hour window's share used, or undefined: none known, or unreadable (fail open, logged). */
+  private quotaPercent(): number | undefined {
+    if (!this.deps.sessionQuotaPercent) return undefined;
+    try {
+      const percent = this.deps.sessionQuotaPercent();
+      this.quotaReadFailing = false;
+      return percent;
+    } catch (err) {
+      if (!this.quotaReadFailing) log.warn({ err }, "Could not read the quota samples; sub-session turns are not held for quota");
+      else log.debug({ err }, "Quota samples still unreadable");
+      this.quotaReadFailing = true;
+      return undefined;
+    }
   }
 
   /** A harness notice to the owner, and a note so the owning session knows it was said. */
@@ -1352,6 +1527,15 @@ export class SubsessionService {
 
 function inputQueueFull(record: SubsessionRecord): string | undefined {
   return record.pendingInput.length >= PENDING_INPUT_MAX ? `${record.pendingInput.length} inputs already waiting (limit ${PENDING_INPUT_MAX})` : undefined;
+}
+
+function isOwnerInput(input: SubsessionInput): boolean {
+  // A relay written before inputs carried their origin is still the owner's.
+  return input.from === "owner" || input.text.includes('<tomo-event type="subsession-relay"');
+}
+
+function hasOwnerInput(record: SubsessionRecord): string | undefined {
+  return record.pendingInput.some(isOwnerInput) ? "the owner's input is pending" : undefined;
 }
 
 function hasPendingInput(record: SubsessionRecord): string | undefined {

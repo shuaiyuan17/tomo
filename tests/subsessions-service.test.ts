@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
-import { CRON_RECHECK_MS, FINISHED_KEEP_MS, MAX_INTERRUPT_STREAK, REGISTRY_RECHECK_MS, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
+import { CRON_RECHECK_MS, ENDED_KEEP_MS, FINISHED_KEEP_MS, MAX_INTERRUPT_STREAK, REGISTRY_RECHECK_MS, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { PENDING_INPUT_MAX, appendInput } from "../src/agent/subsessions/types.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 
@@ -41,6 +41,8 @@ interface Harness {
   /** Sends that throw (a channel failure surfacing as an exception). */
   sendThrows: number;
   registryReadable: boolean;
+  /** The 5-hour window's share used; "throw": the samples cannot be read. */
+  quota?: number | "throw";
 }
 
 let dir = "";
@@ -120,6 +122,10 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
     unlinkRegistryEntry: (key) => { h.unlinked.push(key); h.registry.delete(key); h.sdk.delete(key); },
     registryTaskKeys: () => [...h.registry],
     isStopping: () => false,
+    sessionQuotaPercent: () => {
+      if (h.quota === "throw") throw new Error("limits.ndjson unreadable");
+      return h.quota;
+    },
   });
   return h;
 }
@@ -1540,5 +1546,301 @@ describe("SubsessionService: a record from before report seqs", () => {
     h.store.update(t.id, (r) => { r.report = "first"; delete r.reportSeq; });
     h.service.finish(t.sessionKey, "second");
     expect(h.store.get(t.id)?.reportSeq).toBe(2);
+  });
+});
+
+describe("SubsessionService: the wall-clock cap", () => {
+  const HOUR = 3_600_000;
+  it("pauses a task for the owner once it has been active on its own past maxActiveHours; the owner's word buys another stretch", async () => {
+    let n = 0;
+    const h = harness({ maxActiveHours: 24 }, working((turn, hh) => {
+      n += 1;
+      // Its first turn takes it past the cap.
+      if (n === 1) hh.store.update("s1", (r) => { r.activeMs = 25 * HOUR; });
+      if (n === 3) hh.service.finish(turn.key, "done");
+    }));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    // The continue after that first turn is not run.
+    expect(h.turns).toHaveLength(1);
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+    expect(h.store.get(t.id)?.waitingReason).toContain("maxActiveHours");
+    expect(h.notices).toHaveLength(1);
+    expect(h.notices[0].text).toContain("24 hours");
+
+    // The owner says go on: that turn runs, and so does the continue after it.
+    expect(h.service.relay(t.id, "keep going").ok).toBe(true);
+    await flush();
+    expect(h.turns).toHaveLength(3);
+    expect(h.turns[1].prompt).toContain("keep going");
+    expect(h.turns[2].prompt).toContain('type="subsession-continue"');
+    expect(h.store.get(t.id)?.status).toBe("finished");
+    expect(h.notices).toHaveLength(1);
+  });
+
+  it("is off at 0", async () => {
+    let n = 0;
+    const h = harness({ maxActiveHours: 0 }, working((turn, hh) => {
+      n += 1;
+      if (n === 1) hh.store.update("s1", (r) => { r.activeMs = 1000 * HOUR; });
+      if (n === 2) hh.service.finish(turn.key, "done");
+    }));
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(h.turns).toHaveLength(2);
+    expect(h.store.get("s1")?.status).toBe("finished");
+  });
+});
+
+describe("SubsessionService: the quota gate", () => {
+  it("pauses a task's own turn at 80% of the 5-hour window, and tells the owner once", async () => {
+    const h = harness({}, working());
+    h.quota = 80;
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    // Not even its first turn runs.
+    expect(h.turns).toHaveLength(0);
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+    expect(h.store.get(t.id)?.waitingReason).toContain("80%");
+    expect(h.notices.map((x) => x.text)).toEqual([expect.stringContaining("80%")]);
+  });
+
+  it("lets the owner's own word through, and runs below the threshold", async () => {
+    let n = 0;
+    const h = harness({}, working((turn, hh) => { n += 1; if (n === 2) hh.service.finish(turn.key, "done"); }));
+    h.quota = 95;
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.turns).toHaveLength(0);
+    // The owner's word runs (it carries the start too); the continue after it is held again.
+    expect(h.service.relay(t.id, "go anyway").ok).toBe(true);
+    await flush();
+    expect(h.turns).toHaveLength(1);
+    expect(h.turns[0].prompt).toContain("go anyway");
+    expect(h.turns[0].prompt).toContain('type="subsession-start"');
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+    expect(h.notices).toHaveLength(2);
+    // Quota freed: the owner's next word, and the continue after it, run.
+    h.quota = 79;
+    expect(h.service.relay(t.id, "now go").ok).toBe(true);
+    await flush();
+    expect(h.turns).toHaveLength(2);
+    expect(h.store.get(t.id)?.status).toBe("finished");
+  });
+
+  it("a pause that cannot be written runs no turn and does not spin; the retry timer pauses it", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness({}, working());
+      h.quota = 90;
+      const real = h.store.transition.bind(h.store);
+      let failures = 1;
+      vi.spyOn(h.store, "transition").mockImplementation((id, event, opts) => {
+        if (event === "stuck" && failures > 0) { failures -= 1; throw new Error("disk full"); }
+        return real(id, event, opts);
+      });
+      h.service.start();
+      const t = spawn(h);
+      await flush();
+      expect(h.turns).toHaveLength(0);
+      expect(h.store.get(t.id)?.status).toBe("active");
+      vi.advanceTimersByTime(SETTLE_RETRY_MS);
+      await flush();
+      expect(h.turns).toHaveLength(0);
+      expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails open when the quota samples cannot be read", async () => {
+    const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, "done")));
+    h.quota = "throw";
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(h.turns).toHaveLength(1);
+    expect(h.store.get("s1")?.status).toBe("finished");
+  });
+});
+
+describe("SubsessionService: a later task_finish keeps an unread report", () => {
+  it("keeps the first report beside the second while its note is unread; task_status shows both", async () => {
+    let n = 0;
+    const h = harness({}, working((turn, hh) => {
+      n += 1;
+      if (n === 2) hh.service.reopen(turn.key);
+      hh.service.finish(turn.key, `report ${n}`);
+    }));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.service.relay(t.id, "one more thing").ok).toBe(true);
+    await flush();
+    const record = h.store.get(t.id)!;
+    expect(record).toMatchObject({ report: "report 2", reportSeq: 2, earlierReports: [{ seq: 1, text: "report 1" }] });
+    const { formatTaskDetail } = await import("../src/mcp/subsession-tools.js");
+    const detail = formatTaskDetail(record);
+    expect(detail).toContain("Earlier report #1");
+    expect(detail).toContain("report 1");
+    expect(detail).toContain("Report #2:");
+    const notes = (h.notes.get("dm:owner") ?? []).filter((x) => x.includes('name="s1#2"'));
+    expect(notes[0]).toContain("#1");
+
+    // Once both are read, a third finish keeps nothing new.
+    h.notes.set("dm:owner", []);
+    h.service.relay(t.id, "and again");
+    h.onTurn = working((turn, hh) => { hh.service.reopen(turn.key); hh.service.finish(turn.key, "report 3"); });
+    await flush();
+    expect(h.store.get(t.id)).toMatchObject({ report: "report 3", reportSeq: 3 });
+    expect(h.store.get(t.id)?.earlierReports).toBeUndefined();
+  });
+
+  it("keeps every unread earlier report, however many (no cap drops one)", async () => {
+    const h = harness({}, working((turn, hh) => { hh.service.finish(turn.key, "report 1"); }));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    for (let n = 2; n <= 12; n++) {
+      h.onTurn = working((turn, hh) => { hh.service.reopen(turn.key); hh.service.finish(turn.key, `report ${n}`); });
+      expect(h.service.relay(t.id, `again ${n}`).ok).toBe(true);
+      await flush();
+    }
+    const record = h.store.get(t.id)!;
+    expect(record.reportSeq).toBe(12);
+    expect(record.earlierReports?.map((e) => e.seq)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    expect(record.earlierReports?.[0].text).toBe("report 1");
+  });
+
+  it("writes the note of a kept earlier report whose own note was lost, before the later report's", async () => {
+    const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, "report 1")));
+    h.noteWriteFails = 100; // report 1's note never reaches disk
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)).toMatchObject({ status: "finished", reportDelivered: false });
+    // Woken and reopened; Tomo restarts mid-turn, and the memory-only note dies with it.
+    h.onTurn = (turn, hh) => { hh.service.reopen(turn.key); return new Promise(() => {}); };
+    expect(h.service.relay(t.id, "one more thing").ok).toBe(true);
+    await flush();
+    expect(h.store.get(t.id)?.status).toBe("active");
+    h.service.stop();
+
+    const h2 = harness({}, working((turn, hh) => hh.service.finish(turn.key, "report 2")));
+    h2.sdk.add(t.sessionKey);
+    h2.service.recoverAtStartup();
+    h2.service.start();
+    await flush();
+    expect(h2.store.get(t.id)).toMatchObject({ status: "finished", reportSeq: 2, reportDelivered: true, earlierReports: [{ seq: 1, text: "report 1", noted: true }] });
+    const notes = (h2.notes.get("dm:owner") ?? []).filter((n) => n.includes('type="subsession-report"'));
+    expect(notes.find((n) => n.includes('name="s1#1"'))).toContain("report 1");
+    expect(notes.find((n) => n.includes('name="s1#2"'))).toContain("report 2");
+  });
+
+  it("never archives a task holding an earlier report whose note was never written", async () => {
+    const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, "report 2")));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.store.update(t.id, (r) => { r.earlierReports = [{ seq: 1, text: "report 1" }]; r.endedAt = Date.now() - FINISHED_KEEP_MS - 60_000; });
+    const h2 = harness(); // every note read
+    h2.service.recoverAtStartup();
+    expect(h2.store.get(t.id)?.status).toBe("finished");
+  });
+
+  it("keeps a finished task while an earlier kept report is unread", async () => {
+    let n = 0;
+    const h = harness({}, working((turn, hh) => {
+      n += 1;
+      if (n === 2) hh.service.reopen(turn.key);
+      hh.service.finish(turn.key, `report ${n}`);
+    }));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.service.relay(t.id, "one more thing");
+    await flush();
+    // The second report's note was read, the first's was not.
+    h.notes.set("dm:owner", (h.notes.get("dm:owner") ?? []).filter((x) => !x.includes('name="s1#2"')));
+    h.store.update(t.id, (r) => { r.endedAt = Date.now() - FINISHED_KEEP_MS - 60_000; });
+    const h2 = harness();
+    h2.notes = h.notes;
+    h2.service.recoverAtStartup();
+    expect(h2.store.get(t.id)?.status).toBe("finished");
+  });
+});
+
+describe("SubsessionService: a failed task hands back what it never answered", () => {
+  it("quotes the owner's unanswered messages in the failure notice", async () => {
+    const h = harness();
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    // Waiting for the owner now (no progress).
+    expect(h.store.get(t.id)?.status).toBe("waiting");
+    // The owner answers; before its turn runs, the conversation is gone.
+    h.onTurn = () => new Promise(() => {});
+    h.sdk.delete(t.sessionKey);
+    h.notices.length = 0;
+    expect(h.service.relay(t.id, "use the staging database, not prod").ok).toBe(true);
+    await flush();
+    expect(h.store.get(t.id)?.status).toBe("failed");
+    expect(h.notices).toHaveLength(1);
+    expect(h.notices[0].text).toContain("use the staging database, not prod");
+    // The owning session's note says the same.
+    expect((h.notes.get("dm:owner") ?? []).at(-1)).toContain("use the staging database, not prod");
+    expect(h.store.get(t.id)?.handedBack).toBe(true);
+  });
+
+  it("hands every unanswered message back in full, in a pinned note; the record is forgotten only once that note is written", async () => {
+    const h = harness();
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)?.status).toBe("waiting");
+    h.onTurn = () => new Promise(() => {});
+    // Six long messages: the notice shows a few excerpts, the note has them all.
+    const long = (n: number) => `message ${n}: ${"x".repeat(500)} END-${n}`;
+    h.store.update(t.id, (r) => { for (let n = 1; n <= 5; n++) appendInput(r, `<relay>${long(n)}</relay>`, { from: "owner", words: long(n) }); });
+    h.sdk.delete(t.sessionKey);
+    h.noteWriteFails = 2; // the activity note and the handback note both fail to write
+    expect(h.service.relay(t.id, long(6)).ok).toBe(true);
+    await flush();
+    expect(h.store.get(t.id)).toMatchObject({ status: "failed" });
+    expect(h.store.get(t.id)?.handedBack).toBeUndefined();
+    // 30 days on, the sweep tries the handback again before it forgets.
+    h.store.update(t.id, (r) => { r.endedAt = Date.now() - ENDED_KEEP_MS - 60_000; });
+    const h2 = harness();
+    h2.notes = h.notes;
+    h2.noteWriteFails = 1;
+    h2.service.recoverAtStartup();
+    expect(h2.store.get(t.id)?.status).toBe("failed"); // kept: the handback could not be written
+    const h3 = harness();
+    h3.service.recoverAtStartup();
+    expect(h3.store.get(t.id)).toBeUndefined();
+    const handback = (h3.notes.get("dm:owner") ?? []).find((n) => n.includes('type="subsession-handback"'))!;
+    for (let n = 1; n <= 6; n++) expect(handback).toContain(`END-${n}`);
+  });
+
+  it("says nothing extra when nothing of the owner's is pending", async () => {
+    // It schedules a check-back and waits on it.
+    const h = harness({}, working((turn, hh) => { hh.cron.set(turn.key, 1); }));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "external" });
+    h.sdk.delete(t.sessionKey);
+    h.notices.length = 0;
+    // The check-back (not the owner's) wakes it into the missing conversation.
+    h.service.onCronFire(t.sessionKey, "check CI");
+    await flush();
+    expect(h.store.get(t.id)?.status).toBe("failed");
+    expect(h.notices).toHaveLength(1);
+    expect(h.notices[0].text).not.toContain("check CI");
   });
 });

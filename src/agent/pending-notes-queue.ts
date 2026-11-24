@@ -47,7 +47,9 @@ function isPinnedNote(note: string): boolean {
   // `includes`, not `startsWith`: an interrupted note carries the marker first.
   return note.includes('<tomo-event type="inbox"')
     || note.includes('<tomo-event type="interrupted-agents"')
-    || note.includes('<tomo-event type="subsession-report"');
+    || note.includes('<tomo-event type="subsession-report"')
+    // A failed task's unanswered messages: the record is forgotten once this is on disk.
+    || note.includes('<tomo-event type="subsession-handback"');
 }
 
 /** Drop oldest unpinned notes until `arr` fits the cap (pinned ones always stay). */

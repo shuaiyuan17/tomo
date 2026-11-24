@@ -52,6 +52,27 @@ describe("sub-sessions through the Agent", () => {
     await agent.stop();
   });
 
+  it("gives a task session no external MCP server and no claude.ai connector", async () => {
+    resetConfig({
+      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      subsessions: { ...mockConfig.subsessions, enabled: true },
+      tomoHome: mockConfig.tomoHome,
+      mcpServers: { linear: { server: { type: "http", url: "https://example.invalid/mcp" } } },
+    } as never);
+    const agent = new Agent();
+    agent.addChannel(new MockChannel("telegram"));
+    await agent.start();
+    mockSdk.responseFn = () => new Promise(() => {});
+    agent.subsessions!.spawn("dm:alex", { title: "Mine", brief: "b" });
+    await waitFor(() => expect(mockSdk.optionsBySession.some((o) => o.sessionKey === "task:s1")).toBe(true));
+    const options = mockSdk.optionsBySession.find((o) => o.sessionKey === "task:s1")!.options as {
+      mcpServers: Record<string, unknown>; settings: { disableClaudeAiConnectors?: boolean };
+    };
+    expect(Object.keys(options.mcpServers)).toEqual(["tomo-internal"]);
+    expect(options.settings.disableClaudeAiConnectors).toBe(true);
+    await agent.stop();
+  });
+
   it("follows the owning scope for privacy, failing closed for an unknown task", async () => {
     const { agent } = await boot();
     mockSdk.responseFn = () => new Promise(() => {});

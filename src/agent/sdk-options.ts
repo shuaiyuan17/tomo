@@ -193,11 +193,15 @@ export function sdkOptions(
   const configuredMcpServers = Object.fromEntries(
     Object.entries(config.mcpServers ?? {}).map(([name, entry]) => [name, entry.server]),
   ) as Record<string, McpServerConfig>;
-  const externalMcpServers = Object.fromEntries(
+  // A sub-session gets no external MCP server at all (and no claude.ai
+  // connector, below): it runs unattended for hours, and those reach the
+  // owner's accounts and outside services. Its tools are the internal ones.
+  const unattended = subsession !== undefined || (sessionContext !== undefined && isTaskSessionKey(sessionContext.sessionKey));
+  const externalMcpServers = unattended ? {} : Object.fromEntries(
     Object.entries(externalMcpServersOverride ?? configuredMcpServers)
       .filter(([name]) => name !== TOMO_INTERNAL_MCP_NAME),
   );
-  const externalMcpAllowedTools = Array.isArray(config.mcpAllowedTools) ? config.mcpAllowedTools : [];
+  const externalMcpAllowedTools = !unattended && Array.isArray(config.mcpAllowedTools) ? config.mcpAllowedTools : [];
   const shouldDisableAutoCompact = Boolean(sessionContext && usesLcmCompact(sessionContext.sessionKey));
   const effectiveModel = model ?? config.model;
 
@@ -232,7 +236,10 @@ export function sdkOptions(
   // Resolved at session spawn, not config load: CLI-installed plugin paths are
   // version-pinned and change on `claude plugin update` (old dirs are GC'd),
   // so a long-running daemon must re-resolve rather than cache paths.
-  const plugins = resolvePlugins(config.plugins ?? [], undefined, config.tomoHome || undefined);
+  // A sub-session keeps a plugin's skills, hooks and agents, never its MCP
+  // servers (the same fence as externalMcpServers above).
+  const plugins = resolvePlugins(config.plugins ?? [], undefined, config.tomoHome || undefined)
+    .map((entry) => (unattended ? { ...entry, skipMcpDiscovery: true } : entry));
 
   return {
     model: effectiveModel,
@@ -282,6 +289,9 @@ export function sdkOptions(
     skills: "all" as const,
     ...(plugins.length > 0 ? { plugins } : {}),
     mcpServers: { ...externalMcpServers, [TOMO_INTERNAL_MCP_NAME]: internalMcpServer },
+    // Nothing the CLI would discover on its own either (project .mcp.json,
+    // user settings, plugins, agent frontmatter): only the servers above.
+    ...(unattended ? { strictMcpConfig: true } : {}),
     // External entries never reach the CLI's argv: LiveSession sends them
     // over stdin in the initialize request (mcpServersDelivery: "initialize"),
     // because an OAuth server's entry carries its bearer token.
@@ -299,7 +309,8 @@ export function sdkOptions(
       // would not drop them. They reach the owner's private accounts, so a
       // group's own session never loads them. Session-level: a group
       // summoned into the owner's DM keeps them on purpose (owner present).
-      ...(isGroup ? { disableClaudeAiConnectors: true } : {}),
+      // A sub-session never loads them, whatever its scope (see externalMcpServers).
+      ...(isGroup || unattended ? { disableClaudeAiConnectors: true } : {}),
       attribution: {
         commit: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
         pr: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",

@@ -41,7 +41,8 @@ export function formatTaskDetail(r: SubsessionRecord, now = Date.now()): string 
   if (r.model) lines.push(`Model: ${r.model}`);
   if (r.progress) lines.push(`Progress: ${r.progress}`);
   if (r.checkpoint) lines.push("Checkpoint:", r.checkpoint);
-  if (r.report) lines.push("Report:", r.report);
+  for (const e of r.earlierReports ?? []) lines.push(`Earlier report #${e.seq} (replaced by a later one before it was read):`, e.text);
+  if (r.report) lines.push(r.reportSeq ? `Report #${r.reportSeq}:` : "Report:", r.report);
   if (r.sent.length > 0) {
     lines.push("Messages sent to the owner (newest last):");
     for (const m of r.sent.slice(-5)) lines.push(`- ${new Date(m.at).toISOString()}: ${m.text}`);
@@ -164,6 +165,8 @@ export function buildTaskOwnerTools(deps: { service: () => SubsessionService | u
         "Start a sub-session: a separate session that works on one long task in the background and reports back. For work that takes many steps or a long time (a PR to write and see through review, a long investigation), so this conversation stays free. Not for a quick question.",
         "",
         "The task gets no memory and none of this conversation: `brief` must say everything it needs (goal, where things are, what done looks like, what it may do without asking). Put the owner's own words about the task in `quote`, verbatim, so the task sees what they actually asked.",
+        "",
+        "When you start a task on your own (the owner did not ask for one), you must tell the owner first, in this conversation, what you are starting and why. Never start one silently.",
         "",
         "It starts when a slot is free. It reports with task_finish; you get the report as a note and tell the owner.",
       ].join("\n"),

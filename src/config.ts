@@ -339,7 +339,7 @@ export interface TomoConfig {
   metrics: MetricsConfig;
   todos: TodoConfig;
   /** Sub-sessions (`task:<id>` sessions for long tasks, src/agent/subsessions/).
-   *  Off by default. File key `subsessions: { enabled?, maxRunning?, ... }`. */
+   *  On by default. File key `subsessions: { enabled?, maxRunning?, ... }`. */
   subsessions: SubsessionConfig;
 }
 
@@ -358,15 +358,22 @@ export interface SubsessionConfig {
   maxContextTokens: number;
   /** Model for a task that names none; unset follows `model`. */
   defaultModel: string | null;
+  /**
+   * Hours a task may spend active (running turns) on its own before it is
+   * paused for the owner, counted since the owner's last word to it. 0 = no
+   * cap. Default 24.
+   */
+  maxActiveHours: number;
 }
 
 export const DEFAULT_SUBSESSIONS: SubsessionConfig = {
-  enabled: false,
+  enabled: true,
   maxRunning: 2,
   maxOpen: 5,
   maxTurns: 200,
   maxContextTokens: 500_000,
   defaultModel: null,
+  maxActiveHours: 24,
 };
 
 // ---------------------------------------------------------------------------
@@ -625,6 +632,7 @@ function parseSubsessionConfig(raw: unknown): SubsessionConfig {
     maxContextTokens: validated("subsessions.maxContextTokens", positiveInt, entry.maxContextTokens, DEFAULT_SUBSESSIONS.maxContextTokens),
     defaultModel: validated("subsessions.defaultModel", z.string().trim().min(1, "expected a model name").nullable(),
       entry.defaultModel ?? null, DEFAULT_SUBSESSIONS.defaultModel),
+    maxActiveHours: validated("subsessions.maxActiveHours", z.number().finite().min(0), entry.maxActiveHours, DEFAULT_SUBSESSIONS.maxActiveHours),
   };
 }
 

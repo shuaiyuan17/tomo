@@ -413,6 +413,12 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
     seenThrough: Math.max(0, Math.floor(num("seenThrough", 0))),
     ...(typeof r.heldThrough === "number" && Number.isFinite(r.heldThrough) ? { heldThrough: Math.max(0, Math.floor(r.heldThrough)) } : { heldThrough: undefined }),
     ...(r.restored === true ? { restored: true } : {}),
+    ...(typeof r.activeAtOwnerInputMs === "number" && Number.isFinite(r.activeAtOwnerInputMs) ? { activeAtOwnerInputMs: r.activeAtOwnerInputMs } : { activeAtOwnerInputMs: undefined }),
+    ...(Array.isArray(r.earlierReports)
+      ? { earlierReports: (r.earlierReports as unknown[]).filter((e): e is { seq: number; text: string } =>
+        !!e && typeof e === "object" && typeof (e as { seq?: unknown }).seq === "number" && typeof (e as { text?: unknown }).text === "string") }
+      : { earlierReports: undefined }),
+    ...(r.handedBack === true ? { handedBack: true } : { handedBack: undefined }),
     sent: Array.isArray(r.sent) ? r.sent as SubsessionRecord["sent"] : [],
     transitions: Array.isArray(r.transitions) ? r.transitions as SubsessionRecord["transitions"] : [],
   };
@@ -429,15 +435,17 @@ function parseInputs(raw: unknown): SubsessionInput[] {
   for (const entry of raw) {
     let seq: number | undefined;
     let text: string | undefined;
+    let owner: { from: "owner"; words: string } | undefined;
     if (typeof entry === "string") text = entry;
     else if (entry && typeof entry === "object") {
       const e = entry as Record<string, unknown>;
       if (typeof e.text === "string") text = e.text;
       if (typeof e.seq === "number" && Number.isInteger(e.seq) && e.seq > last) seq = e.seq;
+      if (e.from === "owner") owner = { from: "owner", words: typeof e.words === "string" ? e.words : (text ?? "") };
     }
     if (text === undefined) continue;
     last = seq ?? last + 1;
-    out.push({ seq: last, text });
+    out.push({ seq: last, text, ...(owner ?? {}) });
   }
   return out;
 }

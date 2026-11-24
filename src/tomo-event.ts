@@ -58,6 +58,7 @@ export type TomoEventType =
   | "subsession-redelivery" // marks sub-session inputs sent again after a cut-short turn (at-least-once delivery)
   | "subsession-report"   // a sub-session finished; told to its owning session (name = task id#report seq, e.g. s3#1)
   | "subsession-activity" // something a sub-session said to the owner, told to its owning session (name = task id)
+  | "subsession-handback" // a failed sub-session's unanswered messages from the owner, in full (name = task id)
   | "note";            // bare harness aside with no producer of its own
                        //   (appendToTomoEventBody's fallback wrapper)
 

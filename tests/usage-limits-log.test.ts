@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,7 +8,7 @@ vi.mock("../src/logger.js", () => ({ log: { warn, info: vi.fn(), error: vi.fn(),
 
 import { fetchUsage } from "../src/agent/usage.js";
 import { sdkSignalOf } from "../src/agent/sdk-signals.js";
-import { LIMITS_REPEAT_MS, LimitsLog, type LimitSample } from "../src/usage/limits-log.js";
+import { LIMITS_REPEAT_MS, LimitsLog, readSessionWindowPercent, type LimitSample } from "../src/usage/limits-log.js";
 import { usageDataDir } from "../src/usage/dir.js";
 
 const NOW = Date.parse("2026-11-15T20:00:00.000Z");
@@ -117,5 +117,38 @@ describe("fetchUsage onData", () => {
   it("a throwing observer does not break the read", async () => {
     const result = await fetchUsage({ now: () => NOW, loadCredentials: async () => CREDS, fetchImpl: ok as never, onData: () => { throw new Error("boom"); } });
     expect(result).toMatchObject({ ok: true, data: OAUTH });
+  });
+});
+
+describe("readSessionWindowPercent (the sub-session quota gate's reading)", () => {
+  it("reads the newest 5-hour reading, from either source", async () => {
+    const log = new LimitsLog(home, () => clock);
+    expect(readSessionWindowPercent(log.path, NOW)).toBeUndefined();
+    await log.recordOAuthUsage(OAUTH);
+    expect(readSessionWindowPercent(log.path, NOW)).toBe(36);
+    clock += 60_000;
+    await log.recordSignal(RATE);
+    expect(readSessionWindowPercent(log.path, clock)).toBe(90);
+    // A rate-limit line for another window does not speak for the 5-hour one.
+    clock += 60_000;
+    await log.recordSignal({ ...RATE, limit: "seven_day", utilization: 10 });
+    expect(readSessionWindowPercent(log.path, clock)).toBe(90);
+  });
+
+  it("reads 0 once the window has reset, or when the newest usage read has no 5-hour window", async () => {
+    const log = new LimitsLog(home, () => clock);
+    await log.recordSignal(RATE);
+    expect(readSessionWindowPercent(log.path, Date.parse("2026-11-15T22:00:01Z"))).toBe(0);
+    expect(readSessionWindowPercent(log.path, NOW + 5 * 3_600_000)).toBe(0);
+    clock += 60_000;
+    await log.recordOAuthUsage({ limits: [OAUTH.limits[1]] });
+    expect(readSessionWindowPercent(log.path, clock)).toBe(0);
+  });
+
+  it("throws when the file exists but cannot be read", () => {
+    const dir = join(home, "data", "usage", "limits.ndjson");
+    // A directory where the file should be: open() fails with EISDIR, not ENOENT.
+    mkdirSync(dir, { recursive: true });
+    expect(() => readSessionWindowPercent(dir, NOW)).toThrow();
   });
 });

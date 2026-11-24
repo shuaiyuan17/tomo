@@ -1,5 +1,5 @@
 import { describe, it, expect, afterAll, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -32,7 +32,8 @@ vi.stubEnv("TOMO_WORKSPACE", TOMO_WORKSPACE);
 // `isolate: true` staying on. Same guard as tests/config.test.ts.
 vi.resetModules();
 
-const { buildSystemPrompt } = await import("../src/workspace/index.js");
+const { buildSystemPrompt, buildIdentityPrompt, promptContextSnapshot } = await import("../src/workspace/index.js");
+const { classifyPromptContextChange } = await import("../src/workspace/prompt-context-diff.js");
 
 afterAll(() => {
   vi.unstubAllEnvs();
@@ -114,6 +115,65 @@ describe("buildSystemPrompt", () => {
     });
   });
 
+  describe("prompt context snapshot", () => {
+    const memoryDir = join(TOMO_WORKSPACE, "memory");
+    const memoryFile = join(memoryDir, "MEMORY.md");
+    const peopleDir = join(memoryDir, "people");
+
+    beforeEach(() => mkdirSync(memoryDir, { recursive: true }));
+    afterEach(() => {
+      rmSync(memoryFile, { force: true });
+      rmSync(peopleDir, { recursive: true, force: true });
+    });
+
+    it("hands over the lines the prompt was built from, cut where the prompt cuts them", () => {
+      const lines = Array.from({ length: 201 }, (_, i) => `- line ${i + 1}`);
+      writeFileSync(memoryFile, lines.join("\n") + "\n");
+      mkdirSync(peopleDir, { recursive: true });
+      writeFileSync(join(peopleDir, "alice.md"), "---\nname: Alice\n---\n");
+      let built: { memory: string[]; people: string[] } | undefined;
+      const prompt = buildSystemPrompt({ onContext: (c) => { built = c; } });
+      expect(built!.memory).toHaveLength(200);
+      expect(built!.memory).not.toContain("- line 201");
+      expect(prompt).toContain("- line 200");
+      expect(prompt).not.toContain("- line 201");
+      expect(built!.people.join("\n")).toContain("Alice");
+      // The before-turn re-read cuts the same way.
+      expect(promptContextSnapshot({ strict: true })).toEqual(built);
+      // A line moving into view reads as added.
+      writeFileSync(memoryFile, lines.slice(1).join("\n") + "\n");
+      const change = classifyPromptContextChange(built!, promptContextSnapshot({ strict: true }));
+      expect(change.kind).toBe("note");
+      expect(change.kind === "note" && change.body).toContain("+ - line 201");
+    });
+
+    it("a strict read throws on an unreadable people directory; the lenient one returns what it could", () => {
+      writeFileSync(peopleDir, "not a directory");
+      expect(() => promptContextSnapshot({ strict: true })).toThrow();
+      expect(promptContextSnapshot().people).toEqual([]);
+    });
+
+    it("a strict read fails on a MEMORY.md it cannot stat instead of reading it as empty", () => {
+      // A self-referencing symlink: existsSync says false (ELOOP), like it
+      // does for an inaccessible path (EACCES); only ENOENT means "no index".
+      symlinkSync(memoryFile, memoryFile);
+      expect(() => promptContextSnapshot({ strict: true })).toThrow();
+      expect(promptContextSnapshot().memory).toEqual([]);
+      rmSync(memoryFile, { force: true });
+      expect(promptContextSnapshot({ strict: true }).memory).toEqual([]);
+    });
+
+    it("a strict read throws on an unreadable person record instead of dropping it", () => {
+      mkdirSync(peopleDir, { recursive: true });
+      writeFileSync(join(peopleDir, "alice.md"), "---\nname: Alice\n---\n");
+      // A directory where a record should be: reading it fails (EISDIR).
+      mkdirSync(join(peopleDir, "bob.md"));
+      expect(() => promptContextSnapshot({ strict: true })).toThrow();
+      const lenient = promptContextSnapshot().people.join("\n");
+      expect(lenient).toContain("Alice");
+    });
+  });
+
   describe("private memory filtering for group sessions", () => {
     const memoryDir = join(TOMO_WORKSPACE, "memory");
     const memoryFile = join(memoryDir, "MEMORY.md");
@@ -143,6 +203,25 @@ describe("buildSystemPrompt", () => {
       expect(prompt).toContain("visible everywhere");
       expect(prompt).not.toContain("DM only");
       expect(prompt).not.toContain("DM only too");
+    });
+
+    it("the identity prompt (what retires sessions) leaves MEMORY.md out", () => {
+      const identity = buildIdentityPrompt();
+      expect(identity).toContain("HARNESS");
+      expect(identity).not.toContain("visible everywhere");
+      expect(identity).not.toContain("# MEMORY");
+      expect(identity).not.toContain("# PEOPLE");
+    });
+
+    it("the context snapshot matches what each audience's prompt holds", () => {
+      for (const isGroup of [false, true]) {
+        let built: { memory: string[] } | undefined;
+        buildSystemPrompt({ isGroup, onContext: (c) => { built = c; } });
+        expect(promptContextSnapshot({ isGroup }).memory).toEqual(built!.memory);
+      }
+      expect(promptContextSnapshot({ isGroup: false }).memory).toHaveLength(3);
+      const group = promptContextSnapshot({ isGroup: true }).memory;
+      expect(group).toEqual(["- [Public](public.md) — visible everywhere"]);
     });
 
     it("DM prompt tells the agent to use memory/private/ for sensitive notes", () => {

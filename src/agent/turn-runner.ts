@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { ReplyContext, TurnRequest } from "./live-session.js";
+import type { PromptContextTicket } from "./live-session-manager.js";
 import type { Channel, IncomingMessage, StopTyping } from "../channels/types.js";
 import { log } from "../logger.js";
 import { shortErrorMessage } from "../error-text.js";
@@ -21,6 +22,9 @@ import { sleep } from "../sleep.js";
 
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
 export interface RunWithRetryRequest {
+  /** The memory-change note at the head of `prompt`, if any: dropped from the
+   *  prompt if the turn lands on another session than it was written for. */
+  contextNote?: PromptContextTicket;
   replyContext?: ReplyContext;
   onJoined?: TurnRequest["onJoined"];
   /** See SteerJoin.onHandedOff. */
@@ -350,6 +354,12 @@ export interface TurnRunnerDeps {
   /** The prompt carrying the notes reached the model but the turn did not
    *  finish normally: put them back, marked as possibly partly answered. */
   restoreInterruptedPendingNotes?(sessionKey: string, drained: string): void;
+  /** A memory-change note for the key's live session (never durable: see
+   *  LiveSessionManager.takePromptContextNote), put ahead of the notes. */
+  takePromptContextNote?(sessionKey: string): PromptContextTicket | undefined;
+  /** The turn that carried the note ended: `told` when it ran to its normal
+   *  result, else the session goes back to its earlier snapshot. */
+  settlePromptContextNote?(ticket: PromptContextTicket, told: boolean): void;
   runWithRetry(req: RunWithRetryRequest): Promise<string>;
   /** Append an assistant response to the session transcript. */
   appendAssistantTranscript(sessionKey: string, content: string, channelName: string, correlation?: { requestId?: string; turnId: string }): void;
@@ -470,14 +480,16 @@ export class TurnRunner {
     let ok = false;
     let declined = false;
     let notes = "";
+    let contextNote: PromptContextTicket | undefined;
     try {
       notes = this.deps.drainPendingNotes(spec.key);
-      const prompt = notes
+      contextNote = this.deps.takePromptContextNote?.(spec.key);
+      const prompt = (contextNote?.prefix ?? "") + notes
         + (spec.stampChannelName !== undefined
           ? injectTimestamp(spec.prompt, spec.stampChannelName, spec.stampSenderTimeZone)
           : spec.prompt);
 
-      ok = await this.runDelivery(spec, prompt, stopTyping);
+      ok = await this.runDelivery(spec, prompt, stopTyping, contextNote);
       return ok;
     } catch (err) {
       // A steer declined before injection never became a turn: the caller
@@ -486,6 +498,7 @@ export class TurnRunner {
         declined = true;
         // Nothing reached the model: the notes drained for it go back.
         if (notes) this.deps.restorePendingNotes?.(spec.key, notes);
+        if (contextNote) this.deps.settlePromptContextNote?.(contextNote, false);
         await stopTyping({ clear: true });
         if (spec.requestId) watchBus.publish({ type: "turn.requeue", sessionKey: spec.key, requestId: spec.requestId });
         throw err;
@@ -509,6 +522,14 @@ export class TurnRunner {
           if (!spec.promptTaken) this.deps.restorePendingNotes?.(spec.key, notes);
           else if (spec.completed && !spec.shutdownInterrupted) this.deps.settlePendingNotes?.(spec.key, notes);
           else this.deps.restoreInterruptedPendingNotes?.(spec.key, notes);
+        }
+        // Unlike the notes above, a STOPPED turn does not count as told: Stop
+        // says this turn needs no further answer, not that the model took in
+        // the memory change it carried. Rolled back, it is told again.
+        if (contextNote) {
+          this.deps.settlePromptContextNote?.(contextNote,
+            spec.promptTaken === true && spec.completed === true && !spec.shutdownInterrupted
+              && !spec.replyContext?.stopped);
         }
         this.deps.recordTurnOutcome?.(spec.key, ok);
         watchBus.publish({
@@ -545,6 +566,7 @@ export class TurnRunner {
     spec: TurnSpec,
     prompt: string,
     stopTyping: StopTyping,
+    contextNote?: PromptContextTicket,
   ): Promise<boolean> {
     const delivery = spec.delivery;
     const reply = delivery.kind === "reply" ? delivery : undefined;
@@ -558,6 +580,7 @@ export class TurnRunner {
       rawResponse = await this.deps.runWithRetry({
         key: spec.key,
         prompt,
+        ...(contextNote ? { contextNote } : {}),
         origin: originForSource(spec.source),
         silentDelivery: isSuppressed(delivery),
         onBlock: sink.onBlock,

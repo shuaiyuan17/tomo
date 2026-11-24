@@ -204,14 +204,18 @@ function warnOncePerPath(path: string, reason: string, emit: () => void): void {
   emit();
 }
 
-function loadDir(dir: string, isPrivate: boolean, budget: { remaining: number }): PersonRecord[] {
-  if (!existsSync(dir)) return [];
+function loadDir(dir: string, isPrivate: boolean, budget: { remaining: number }, strict: boolean): PersonRecord[] {
+  // Strict: only ENOENT means "no directory" (below). existsSync is false for
+  // an inaccessible path too (EACCES), which would read as nobody there.
+  if (!strict && !existsSync(dir)) return [];
   const records: PersonRecord[] = [];
   let files: string[];
   try {
     files = readdirSync(dir).filter((f) => f.endsWith(".md")).sort();
   } catch (err) {
+    if (strict && (err as NodeJS.ErrnoException).code === "ENOENT") return [];
     warnOncePerPath(dir, "unreadable-dir", () => log.warn({ err, dir }, "Failed to read people directory"));
+    if (strict) throw err;
     return [];
   }
   warnedPeoplePaths.delete(dir);
@@ -241,18 +245,24 @@ function loadDir(dir: string, isPrivate: boolean, budget: { remaining: number })
       }
     } catch (err) {
       warnOncePerPath(filePath, "unreadable", () => log.warn({ err, filePath }, "Failed to read person file"));
+      if (strict) throw err;
     }
   }
   return records;
 }
 
 /** Load all person records. Group-session callers must pass
- *  `includePrivate: false` so private people never leak into group flows. */
-export function loadPeople(opts: { includePrivate: boolean; dirs?: PeopleDirs }): PersonRecord[] {
+ *  `includePrivate: false` so private people never leak into group flows.
+ *  `strict`: throw when a directory or record cannot be READ (an I/O error),
+ *  instead of leaving it out — for callers to whom a partial roster would mean
+ *  "these people are gone". Oversized or malformed records are skipped either
+ *  way: that is the file's content, not a failed read. */
+export function loadPeople(opts: { includePrivate: boolean; dirs?: PeopleDirs; strict?: boolean }): PersonRecord[] {
   const dirs = opts.dirs ?? defaultPeopleDirs();
   const budget = { remaining: MAX_PEOPLE_FILES };
-  const records = loadDir(dirs.publicDir, false, budget);
-  if (opts.includePrivate) records.push(...loadDir(dirs.privateDir, true, budget));
+  const strict = !!opts.strict;
+  const records = loadDir(dirs.publicDir, false, budget, strict);
+  if (opts.includePrivate) records.push(...loadDir(dirs.privateDir, true, budget, strict));
   return records;
 }
 

@@ -2,7 +2,7 @@ import { formatDateTime, ownerT, type OwnerText } from "./i18n/index.js";
 import type { Channel, ChannelFaultNotice, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions } from "./channels/types.js";
 import type { CompactReservation } from "./lcm/background-gate.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
-import { buildSystemPrompt } from "./workspace/index.js";
+import { buildIdentityPrompt, promptContextSnapshot } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { ReplyTarget, SessionMessage, UsageBaseline } from "./sessions/types.js";
 import {
@@ -261,6 +261,16 @@ export class Agent {
       restorePendingNotes: (sessionKey, drained) => this.pendingNotesQueue.restore(sessionKey, drained),
       settlePendingNotes: (sessionKey, drained) => this.pendingNotesQueue.settle(sessionKey, drained),
       restoreInterruptedPendingNotes: (sessionKey, drained) => this.pendingNotesQueue.restoreInterrupted(sessionKey, drained),
+      // A live session keeps the MEMORY.md / roster it was built with; a small
+      // change rides in ahead of the turn as a note. NOT through the durable
+      // queue: replayed after a restart it would describe a prompt the new
+      // session does not have. A turn that did not complete rolls the
+      // session's snapshot back instead.
+      takePromptContextNote: (sessionKey) => this.liveSessionManager.takePromptContextNote(sessionKey),
+      settlePromptContextNote: (ticket, told) => {
+        if (told) this.liveSessionManager.settlePromptContextNote(ticket);
+        else this.liveSessionManager.restorePromptContextNote(ticket);
+      },
       // Persisted (sessions' pending-notes file): a reply the owner never got
       // must still be known to the next turn if the daemon restarts first.
       queueDeliveryFailureNote: (sessionKey, note) => this.queuePendingNote(
@@ -342,7 +352,8 @@ export class Agent {
         this.liveSessionManager.hotMountExternalMcpServer(serverName, server),
     });
     this.liveSessionManager = new LiveSessionManager({
-      buildSystemPrompt: () => buildSystemPrompt(),
+      buildIdentityPrompt: () => buildIdentityPrompt(),
+      promptContextSnapshot: (key, { strict }) => promptContextSnapshot({ isGroup: isGroupSessionKey(key), strict }),
       getSdkSessionId: (key) => this.sessions.getSdkSessionId(key),
       setSdkSessionId: (key, sessionId) => this.sessions.setSdkSessionId(key, sessionId),
       clearSdkSessionId: (key) => this.sessions.clearSdkSessionId(key),

@@ -12,6 +12,8 @@ import {
   type TurnRunnerDeps,
   type TurnSpec,
 } from "../src/agent/turn-runner.js";
+import type { PromptContextTicket } from "../src/agent/live-session-manager.js";
+import { SteerDeclinedError } from "../src/agent/sdk-result.js";
 
 vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -705,5 +707,52 @@ describe("TurnRunner: notes taken by a turn that did not finish", () => {
     const { h, calls } = harness(async (req) => { req.onPromptHandedOff?.(); throw new Error("aborted"); });
     await h.runner.runTurn(replySpec(h));
     expect(calls).toEqual(["interrupted"]);
+  });
+});
+
+describe("TurnRunner: the memory change note", () => {
+  function contextHarness(respond: (req: RunWithRetryRequest) => Promise<string>) {
+    const h = makeHarness(respond);
+    const ticket = { prefix: "[memory]\n\n" } as unknown as PromptContextTicket;
+    const settled: boolean[] = [];
+    const deps = (h.runner as unknown as { deps: TurnRunnerDeps }).deps;
+    deps.takePromptContextNote = () => ticket;
+    deps.settlePromptContextNote = (t, told) => { expect(t).toBe(ticket); settled.push(told); };
+    return { h, ticket, settled };
+  }
+
+  it("goes first, travels with the request as its ticket, and is told once the turn completes", async () => {
+    const { h, ticket, settled } = contextHarness(async (req) => { req.onPromptHandedOff?.(); return "ok"; });
+    await h.runner.runTurn(replySpec(h));
+    expect(h.prompts[0].prompt.startsWith("[memory]\n\n[note]\n\n")).toBe(true);
+    expect(h.prompts[0].contextNote).toBe(ticket);
+    expect(settled).toEqual([true]);
+  });
+
+  it("is rolled back when the owner stopped the turn, though its pending notes settle", async () => {
+    const { h, settled } = contextHarness(async (req) => {
+      req.onPromptHandedOff?.();
+      req.replyContext!.stopped = true;
+      return "NO_REPLY";
+    });
+    const notesSettled: string[] = [];
+    (h.runner as unknown as { deps: TurnRunnerDeps }).deps.settlePendingNotes = (_k, d) => { notesSettled.push(d); };
+    await h.runner.runTurn(replySpec(h));
+    expect(notesSettled).toEqual(["[note]\n\n"]);
+    expect(settled).toEqual([false]);
+  });
+
+  it("is rolled back when the turn failed, never reached the model, or was declined", async () => {
+    const failed = contextHarness(async (req) => { req.onPromptHandedOff?.(); throw new Error("boom"); });
+    await failed.h.runner.runTurn(replySpec(failed.h));
+    expect(failed.settled).toEqual([false]);
+
+    const untaken = contextHarness(async () => "NO_REPLY");
+    await untaken.h.runner.runTurn(replySpec(untaken.h));
+    expect(untaken.settled).toEqual([false]);
+
+    const declined = contextHarness(async () => { throw new SteerDeclinedError(); });
+    await expect(declined.h.runner.runTurn(replySpec(declined.h))).rejects.toBeInstanceOf(SteerDeclinedError);
+    expect(declined.settled).toEqual([false]);
   });
 });

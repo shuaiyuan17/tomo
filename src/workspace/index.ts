@@ -35,8 +35,9 @@ function load(name: string): string {
   return "";
 }
 
-function loadMemory(isGroup: boolean): string {
-  mkdirSync(MEMORY_DIR, { recursive: true });
+/** `lines`: MEMORY.md as this audience sees it (memoryIndexLines), read once
+ *  by buildSystemPrompt so the prompt and its context snapshot agree. */
+function loadMemory(isGroup: boolean, lines: string[] | null): string {
 
   const privacySection = isGroup
     ? `\n## Private memories (DM-only)\n\nMemory files under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` are restricted to DM sessions. They are not listed in the index below, and you cannot read them from this group session — the harness will deny the tool call. Two consequences worth knowing before you reach for them: the **shell here runs sandboxed** (every Bash command is wrapped in a \`sandbox-exec\` profile that makes those files unreadable at the kernel level, so assembling the path in an interpreter fails with EPERM rather than working; if the sandbox cannot be set up the Bash tool is withheld for the turn instead), and a \`MEDIA:\` attachment pointing into \`memory/${PRIVATE_MEMORY_SUBDIR}/\` is dropped before it is sent, since attaching a file is a way of reading it out loud.\n`
@@ -93,30 +94,47 @@ Don't wait to be told "remember this." Save durable personal details, preference
 - Organize by topic, not chronology`.trim();
 
   let memoryContent: string;
-  if (existsSync(MEMORY_ENTRYPOINT)) {
-    const raw = readFileSync(MEMORY_ENTRYPOINT, "utf-8").trim();
-    let lines = raw.split("\n");
-    if (isGroup) {
-      lines = lines.filter(line => !isPrivateIndexLine(line));
-    }
-    if (lines.length > MAX_MEMORY_LINES) {
-      memoryContent = lines.slice(0, MAX_MEMORY_LINES).join("\n") + `\n\n(truncated — ${lines.length - MAX_MEMORY_LINES} lines omitted)`;
-    } else {
-      memoryContent = lines.join("\n");
-    }
-  } else {
+  if (lines === null) {
     memoryContent = "(currently empty)";
+  } else if (lines.length > MAX_MEMORY_LINES) {
+    memoryContent = lines.slice(0, MAX_MEMORY_LINES).join("\n") + `\n\n(truncated — ${lines.length - MAX_MEMORY_LINES} lines omitted)`;
+  } else {
+    memoryContent = lines.join("\n");
   }
 
   return `${instructions}\n\n## Current MEMORY.md\n\n${memoryContent}`;
 }
 
-function loadPeopleSection(isGroup: boolean): string {
-  const dirs = defaultPeopleDirs();
+/** MEMORY.md as this audience sees it (private lines stripped for groups); null when absent.
+ *  `strict`: only ENOENT counts as absent — `existsSync` also says false for
+ *  an inaccessible path (EACCES), which a strict read must not take for an
+ *  empty index. */
+function memoryIndexLines(isGroup: boolean, strict = false): string[] | null {
+  let raw: string;
+  if (strict) {
+    try {
+      raw = readFileSync(MEMORY_ENTRYPOINT, "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  } else {
+    if (!existsSync(MEMORY_ENTRYPOINT)) return null;
+    raw = readFileSync(MEMORY_ENTRYPOINT, "utf-8");
+  }
+  const lines = raw.trim().split("\n");
+  return isGroup ? lines.filter((line) => !isPrivateIndexLine(line)) : lines;
+}
+
+function peopleRosterLines(isGroup: boolean, strict = false): string[] {
   // Private people records never enter group prompts; in DMs the full
   // registry (including private records) is listed.
-  const people = loadPeople({ includePrivate: !isGroup });
-  const roster = people.length > 0 ? renderPeopleRoster(people).join("\n") : "(no people records yet)";
+  return renderPeopleRoster(loadPeople({ includePrivate: !isGroup, strict }));
+}
+
+function loadPeopleSection(isGroup: boolean, rosterLines: string[]): string {
+  const dirs = defaultPeopleDirs();
+  const roster = rosterLines.length > 0 ? rosterLines.join("\n") : "(no people records yet)";
   const privacyNote = isGroup
     ? `Records under \`memory/${PRIVATE_MEMORY_SUBDIR}/people/\` are DM-only — they are not listed here and cannot be read from this group session.`
     : `For people whose details shouldn't surface in group chats, keep their record under \`memory/${PRIVATE_MEMORY_SUBDIR}/people/\` instead — group sessions never see those records.`;
@@ -207,9 +225,61 @@ export const HOME_NOTE = `## Your Home
 
 You have a home: a small 3D room the owner can open in the web UI, which you design as data in \`~/.tomo/workspace/home/scene.json\` and which shows what you are doing. Load the \`tomo-home\` skill before changing it, and check your work with \`home_check\`.`;
 
-export function buildSystemPrompt(opts: { isGroup?: boolean } = {}): string {
+/**
+ * The parts of the system prompt whose change RETIRES live sessions: SOUL,
+ * AGENT, IDENTITY and the harness rules. MEMORY.md and the people roster are
+ * deliberately not here — they change often (the model itself saves memories
+ * as it goes), and retiring every session on each save threw away every
+ * session's prompt cache and restarted its CLI and MCP servers. A live session
+ * keeps the memory and roster it was built with and is told what changed
+ * through {@link promptContextSnapshot}; its next rebuild (idle reap, compact,
+ * restart) picks the new text up in the prompt itself.
+ */
+export function buildIdentityPrompt(): string {
+  return [load("SOUL"), load("AGENT"), load("IDENTITY"), HARNESS_INSTRUCTIONS, HOME_NOTE]
+    .filter(Boolean).join("\n\n---\n\n");
+}
+
+/** What a session of this audience has in its prompt for MEMORY.md and PEOPLE. */
+export interface PromptContextSnapshot {
+  memory: string[];
+  people: string[];
+}
+
+/**
+ * The MEMORY.md / roster lines a prompt built now would hold — the before-turn
+ * re-read compared against a live session's snapshot (which comes from
+ * buildSystemPrompt's `onContext`). Read-only: never creates the memory
+ * directory. `memory` is only what the prompt shows (the first
+ * MAX_MEMORY_LINES lines).
+ *
+ * `strict` throws when MEMORY.md, the people directory or a record cannot be
+ * read (only ENOENT counts as missing), instead of returning the partial
+ * result the prompt builder settles for: compared against the snapshot, a
+ * partial roster would read as everyone it could not read being removed.
+ * Without `strict` it reads exactly as buildSystemPrompt does.
+ */
+export function promptContextSnapshot(opts: { isGroup?: boolean; strict?: boolean } = {}): PromptContextSnapshot {
   const isGroup = !!opts.isGroup;
-  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup), loadPeopleSection(isGroup),
+  const strict = !!opts.strict;
+  const memory = (memoryIndexLines(isGroup, strict) ?? []).slice(0, MAX_MEMORY_LINES);
+  return { memory, people: peopleRosterLines(isGroup, strict) };
+}
+
+/**
+ * `onContext` receives the MEMORY.md and roster lines this prompt was built
+ * from — the same read, filtered for the audience and cut at MAX_MEMORY_LINES
+ * exactly as the prompt shows them. A live session keeps that as its snapshot
+ * (see LiveSessionManager.takePromptContextNote): a second read could see
+ * different files than the prompt did.
+ */
+export function buildSystemPrompt(opts: { isGroup?: boolean; onContext?: (context: PromptContextSnapshot) => void } = {}): string {
+  const isGroup = !!opts.isGroup;
+  mkdirSync(MEMORY_DIR, { recursive: true });
+  const memoryLines = memoryIndexLines(isGroup);
+  const rosterLines = peopleRosterLines(isGroup);
+  opts.onContext?.({ memory: (memoryLines ?? []).slice(0, MAX_MEMORY_LINES), people: rosterLines });
+  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup, memoryLines), loadPeopleSection(isGroup, rosterLines),
     isGroup ? HARNESS_INSTRUCTIONS : `${HARNESS_INSTRUCTIONS}\n\n${HOME_NOTE}`].filter(Boolean);
   return sections.join("\n\n---\n\n");
 }

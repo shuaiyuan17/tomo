@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -9,6 +9,7 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 
 import { Agent, MockChannel, installAgentTestHooks, makeMsg, mockConfig, mockSdk, resetConfig, waitFor } from "./helpers/agent-harness.js";
 import { watchBus } from "../src/watch/bus.js";
+import { MAX_AUTO_RESUMES, type RunningAgentsLedger } from "../src/agent/running-agents-ledger.js";
 import type { WatchTask } from "../src/watch/protocol.js";
 
 installAgentTestHooks();
@@ -20,8 +21,8 @@ installAgentTestHooks();
 
 const ledgerPath = () => join(mockConfig.tomoHome, "data", "running-agents.json");
 
-async function boot(): Promise<{ agent: Agent; channel: MockChannel }> {
-  resetConfig({ interruptedAgents: true, tomoHome: mockConfig.tomoHome });
+async function boot(overrides: Record<string, unknown> = {}): Promise<{ agent: Agent; channel: MockChannel }> {
+  resetConfig({ interruptedAgents: true, tomoHome: mockConfig.tomoHome, ...overrides });
   const agent = new Agent();
   const channel = new MockChannel("imessage");
   agent.addChannel(channel);
@@ -169,3 +170,171 @@ describe("interrupted subagents across a restart", () => {
     await second.agent.stop();
   });
 });
+
+describe("auto-resume of interrupted subagents", () => {
+  afterEach(() => vi.restoreAllMocks());
+  const checkTurn = (key: string) => notices(key).find((p) => p.text.includes('name="check"'));
+  const ledgerOf = (agent: Agent) => (agent as unknown as { runningAgents: RunningAgentsLedger }).runningAgents;
+  const gateOf = (agent: Agent) => (agent as unknown as { liveSessionManager: { deps: { resumeGate?: (k: string, id: string) => string | null } } })
+    .liveSessionManager.deps.resumeGate;
+
+  it("on (default): the note and the check turn ask for each resumable subagent to be resumed now", async () => {
+    const first = await boot();
+    await haveSession(first.channel, "710");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:710", tasks: [task("resume710"), task("explore710", { subagentType: "Explore" })] });
+    crash(first.agent);
+
+    mockSdk.promptsBySession = [];
+    const second = await boot();
+    await waitFor(() => expect(checkTurn("imessage:710")).toBeDefined());
+    const text = checkTurn("imessage:710")!.text;
+    expect(text).toContain("for each resumable one use SendMessage to resume it right away, unless the owner has explicitly said not to, or it has already been resumed or has finished since");
+    expect(text).toContain("tell it it was interrupted by a restart, have it first check how far it got and which side effects");
+    expect(text).toMatch(/resume710 "job resume710" \(general-purpose[^\n]*\)\n/);
+    expect(text).toMatch(/explore710 "job explore710" \(Explore[^\n]* — cannot be resumed/);
+    expect(text).not.toContain("Nothing has been resumed");
+    // The gate is wired into the session options.
+    expect(gateOf(second.agent)?.("imessage:710", "resume710")).toBeNull();
+    expect(ledgerOf(second.agent).resumeCount("imessage:710", "resume710")).toBe(1);
+    await second.agent.stop();
+  });
+
+  it("off: wording, ledger and options are as on main", async () => {
+    const first = await boot({ interruptedAgentsAutoResume: false });
+    await haveSession(first.channel, "711");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:711", tasks: [task("keep711")] });
+    crash(first.agent);
+
+    mockSdk.promptsBySession = [];
+    const second = await boot({ interruptedAgentsAutoResume: false });
+    await waitFor(() => expect(checkTurn("imessage:711")).toBeDefined());
+    const text = checkTurn("imessage:711")!.text;
+    expect(text).toContain("Startup check after a restart: if a note above lists interrupted subagents or commands, decide whether each is still worth continuing; otherwise there is nothing to do.");
+    expect(text).toContain("Nothing has been resumed. To continue a resumable subagent, SendMessage to its id");
+    expect(text).not.toMatch(/right away|FAILED|type unknown/);
+    expect(gateOf(second.agent)).toBeUndefined();
+    expect(JSON.parse(readFileSync(ledgerPath(), "utf8"))).not.toHaveProperty("resumes");
+    await second.agent.stop();
+  });
+
+  it(`a subagent cut off again after ${MAX_AUTO_RESUMES} resumes is refused by the gate and reported to the owner`, async () => {
+    const owner = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(true);
+    let run = await boot();
+    await haveSession(run.channel, "712");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:712", tasks: [task("loop712")] });
+    crash(run.agent);
+
+    // Each start: the model resumes it through SendMessage (the gate allows it),
+    // it runs again under the same id, and the daemon dies again.
+    for (let i = 0; i < MAX_AUTO_RESUMES; i++) {
+      mockSdk.promptsBySession = [];
+      run = await boot();
+      await waitFor(() => expect(checkTurn("imessage:712")).toBeDefined());
+      expect(checkTurn("imessage:712")!.text).not.toContain("FAILED");
+      expect(gateOf(run.agent)!("imessage:712", "loop712")).toBeNull();
+      watchBus.publish({ type: "tasks", sessionKey: "imessage:712", tasks: [task("loop712")] });
+      crash(run.agent);
+    }
+    expect(owner).not.toHaveBeenCalled();
+
+    mockSdk.promptsBySession = [];
+    run = await boot();
+    await waitFor(() => expect(checkTurn("imessage:712")).toBeDefined());
+    expect(checkTurn("imessage:712")!.text).toMatch(/loop712 [^\n]* — FAILED: cut off again after 3 resumes; do not resume it/);
+    expect(gateOf(run.agent)!("imessage:712", "loop712")).toMatch(/already been resumed 3 times/);
+    await waitFor(() => expect(owner).toHaveBeenCalledOnce());
+    expect(String(owner.mock.calls[0][0])).toContain("loop712");
+    expect(String(owner.mock.calls[0][0])).toContain("imessage:712");
+    await run.agent.stop();
+
+    // Told once: the next start does not tell the owner again.
+    const again = await boot();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(owner).toHaveBeenCalledOnce();
+    await again.agent.stop();
+  });
+
+  it("a failure notice that could not be sent is sent on the next start", async () => {
+    const owner = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(false);
+    let run = await boot();
+    await haveSession(run.channel, "719");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:719", tasks: [task("lost719")] });
+    crash(run.agent);
+    for (let i = 0; i <= MAX_AUTO_RESUMES; i++) {
+      run = await boot();
+      gateOf(run.agent)!("imessage:719", "lost719");
+      watchBus.publish({ type: "tasks", sessionKey: "imessage:719", tasks: [task("lost719")] });
+      crash(run.agent);
+    }
+    await waitFor(() => expect(owner).toHaveBeenCalledOnce());
+    owner.mockResolvedValue(true);
+    run = await boot();
+    await waitFor(() => expect(owner).toHaveBeenCalledTimes(2));
+    await run.agent.stop();
+    const last = await boot();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(owner).toHaveBeenCalledTimes(2);
+    await last.agent.stop();
+  });
+
+  it("a resumed subagent that then finishes on its own starts its count afresh", async () => {
+    let run = await boot();
+    await haveSession(run.channel, "713");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:713", tasks: [task("fin713")] });
+    crash(run.agent);
+    for (let i = 0; i < MAX_AUTO_RESUMES + 1; i++) {
+      run = await boot();
+      expect(gateOf(run.agent)!("imessage:713", "fin713")).toBeNull();
+      // Resumed, completes, is started again, and the daemon dies while it runs.
+      watchBus.publish({ type: "tasks", sessionKey: "imessage:713", tasks: [task("fin713")] });
+      watchBus.publish({ type: "tasks", sessionKey: "imessage:713", tasks: [], ended: [{ taskId: "fin713", status: "completed" }] });
+      watchBus.publish({ type: "tasks", sessionKey: "imessage:713", tasks: [task("fin713")] });
+      crash(run.agent);
+    }
+    await run.agent.stop();
+  });
+
+  it("a note still owed when auto-resume is turned off instructs nothing", async () => {
+    const first = await boot();
+    await haveSession(first.channel, "720");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:720", tasks: [task("owed720")] });
+    crash(first.agent);
+    // The check turn never finishes; the daemon dies again.
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = () => new Promise(() => {});
+    const second = await boot();
+    await waitFor(() => expect(checkTurn("imessage:720")).toBeDefined());
+    crash(second.agent);
+
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = async () => "ok";
+    const off = await boot({ interruptedAgentsAutoResume: false });
+    await waitFor(() => expect(checkTurn("imessage:720")).toBeDefined());
+    const text = checkTurn("imessage:720")!.text;
+    expect(text).toContain("owed720");
+    expect(text).toContain("decide whether each is still worth continuing");
+    expect(text).not.toContain("right away");
+    await off.agent.stop();
+  });
+
+  it("turning tracking off removes the old records, so turning it back on revives nothing", async () => {
+    const first = await boot();
+    await haveSession(first.channel, "718");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:718", tasks: [task("old718")] });
+    crash(first.agent);
+    expect(existsSync(ledgerPath())).toBe(true);
+
+    const off = await boot({ interruptedAgents: false });
+    expect(existsSync(ledgerPath())).toBe(false);
+    await off.agent.stop();
+
+    mockSdk.promptsBySession = [];
+    const on = await boot();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(notices("imessage:718")).toEqual([]);
+    expect(gateOf(on.agent)!("imessage:718", "old718")).toBeNull();
+    expect(ledgerOf(on.agent).resumeCount("imessage:718", "old718")).toBe(0);
+    await on.agent.stop();
+  });
+});
+

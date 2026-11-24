@@ -4,6 +4,10 @@
  * (group activation, summon expiry, a failed reply's error prefix).
  */
 export const notices = {
+  interruptedAgents: {
+    autoResumeFailed_one: "⚠️ A subagent in {{session}} was cut off by a restart again after {{max}} automatic resumes, so Tomo has stopped resuming it and counts it as failed:\n{{agents}}\nIf it is still needed, ask for it to be resumed or rerun.",
+    autoResumeFailed_other: "⚠️ {{count}} subagents in {{session}} were cut off by a restart again after {{max}} automatic resumes, so Tomo has stopped resuming them and counts them as failed:\n{{agents}}\nIf they are still needed, ask for them to be resumed or rerun.",
+  },
   inbox: {
     unsaved: "⚠️ Tomo could not save an incoming {{channel}} message to disk before answering it. It is being answered now, but would be lost if Tomo crashed first. Check the disk under ~/.tomo/data.",
     unmarked_one: "⚠️ Tomo could not record on disk that it started answering a message in {{session}}. The reply is going ahead; if Tomo crashes before it finishes, the message may be answered twice after the restart. Check the disk under ~/.tomo/data.",

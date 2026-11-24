@@ -445,6 +445,7 @@ export const mockConfig = {
   inboxReplayMaxAgeMinutes: 360,
   /** Off by default here; tests/interrupted-agents-agent.test.ts turns it on. */
   interruptedAgents: false,
+  interruptedAgentsAutoResume: true,
   notifyOwnerOnSuppressedErrors: true,
   liveSessionTimeoutMs: 10 * 60 * 1000,
   liveSessionIdleTimeoutMs: 0,

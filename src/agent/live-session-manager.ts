@@ -185,6 +185,8 @@ export interface LiveSessionManagerDeps {
   getModelOverride(key: string): string | undefined;
   /** Per-session internal MCP server bound to the caller's session key. */
   createInternalMcpServer(key: string): McpSdkServerConfigWithInstance;
+  /** The resume cap's SendMessage gate for a session (see sdk-options resumeGate). Undefined ⇒ not installed. */
+  resumeGate?: (key: string, taskId: string) => string | null;
   /** External MCP servers with OAuth, authorize-URL forwarding bound to the key. */
   buildExternalMcpServers(key: string): Promise<Record<string, McpServerConfig>>;
   /** Group metadata snapshot for the system prompt — undefined for non-groups. */
@@ -967,6 +969,7 @@ export class LiveSessionManager {
       // owns the flag exists. Until it does, nothing was dropped.
       undeliveredReply: () => session?.takeUndeliveredReply() ?? false,
       backgroundLaunchDenial: () => this.compactReservations.launchDenial(key),
+      ...(this.deps.resumeGate ? { resumeGate: (taskId: string) => this.deps.resumeGate!(key, taskId) } : {}),
     }, turnBudget, externalMcpServers);
 
     session = new LiveSession(opts, key, turnBudget, () => this.deps.createUnownedTurnRequest(key), {

@@ -2,6 +2,9 @@ import type { Translation } from "../../catalog.js";
 import type { notices as en } from "../en/notices.js";
 
 export const notices = {
+  interruptedAgents: {
+    autoResumeFailed_other: "⚠️ {{session}} 里有 {{count}} 个 subagent 已自动续跑 {{max}} 次，又被重启打断，Tomo 不再续它们，记为失败：\n{{agents}}\n如果还需要，请让我续上或重跑。",
+  },
   inbox: {
     unsaved: "⚠️ Tomo 没能在回复前把一条收到的 {{channel}} 消息存到磁盘。现在正在回复它，但如果 Tomo 先崩溃，这条消息会丢失。请检查 ~/.tomo/data 所在的磁盘。",
     unmarked_other: "⚠️ Tomo 没能在磁盘上记下它已开始回复 {{session}} 里的 {{count}} 条消息。回复会照常进行；如果 Tomo 在回复完成前崩溃，重启后这些消息可能会被回复两次。请检查 ~/.tomo/data 所在的磁盘。",

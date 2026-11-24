@@ -299,6 +299,29 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(manager.takePromptContextNote("telegram:2")).toBeUndefined();
   });
 
+  it("tells a change again when the turn that carried it did not complete, but only the same session", async () => {
+    let memory = ["- [Travel](travel.md)"];
+    const manager = new LiveSessionManager(makeDeps({
+      buildIdentityPrompt: () => "identity-v1",
+      promptContextSnapshot: () => ({ memory, people: [] }),
+    }));
+    await manager.getOrCreateLiveSession("dm:owner");
+
+    memory = [...memory, "- [Coffee](coffee.md)"];
+    expect(manager.takePromptContextNote("dm:owner")).toContain("+ - [Coffee](coffee.md)");
+    // The turn failed: the next one describes the change again, from the
+    // files as they are by then.
+    manager.restorePromptContextNote("dm:owner");
+    memory = ["- [Coffee](coffee.md)"];
+    const again = manager.takePromptContextNote("dm:owner")!;
+    expect(again).toContain("+ - [Coffee](coffee.md)");
+    expect(again).toContain("- - [Travel](travel.md)");
+    // Completed: told, not repeated.
+    manager.settlePromptContextNote("dm:owner");
+    manager.restorePromptContextNote("dm:owner");
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+  });
+
   it("still retires live sessions when SOUL/AGENT/IDENTITY or the harness rules change", async () => {
     let identity = "identity-v1";
     const manager = new LiveSessionManager(makeDeps({

@@ -252,6 +252,10 @@ export class LiveSessionManager {
   private promptStale = new Set<LiveSession>();
   /** The memory index and roster each live session was built with (or last told about). */
   private promptContext = new WeakMap<LiveSession, PromptContextLines>();
+  /** What `promptContext` was before a change note that is in flight: put
+   *  back if the turn carrying it did not complete, so the change is told
+   *  again. Keyed by the session, so a replacement session never inherits it. */
+  private promptContextUntold = new WeakMap<LiveSession, PromptContextLines>();
   private liveSessionCreates = new Map<string, Promise<LiveSession>>();
   private lastPromptHash: string = "";
   private stopping = false;
@@ -758,8 +762,33 @@ export class LiveSessionManager {
     if (!now) return undefined;
     const body = describePromptContextChange(before, now);
     if (!body) return undefined;
+    if (!this.promptContextUntold.has(session)) this.promptContextUntold.set(session, before);
     this.promptContext.set(session, now);
     return formatTomoEvent("memory", body, { name: "changed" });
+  }
+
+  /** The turn that carried the last change note completed: it is told. */
+  settlePromptContextNote(key: string): void {
+    const session = this.liveSessions.get(key);
+    if (session) this.promptContextUntold.delete(session);
+  }
+
+  /**
+   * The turn that carried the last change note did not complete. The note is
+   * not kept anywhere durable: it describes one session's prompt, and replayed
+   * to a replacement session (built from the current files) it would claim
+   * lines that may since have changed again. Instead, the same live session
+   * goes back to its earlier snapshot, and its next turn describes the change
+   * again from the files as they are then. A replaced session has nothing to
+   * roll back.
+   */
+  restorePromptContextNote(key: string): void {
+    const session = this.liveSessions.get(key);
+    if (!session) return;
+    const before = this.promptContextUntold.get(session);
+    if (!before) return;
+    this.promptContextUntold.delete(session);
+    if (session.isAlive()) this.promptContext.set(session, before);
   }
 
   /**

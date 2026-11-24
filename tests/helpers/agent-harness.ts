@@ -302,6 +302,7 @@ export function installAgentTestHooks(): void {
     mkdirSync(agentEnv.tmpDir, { recursive: true });
     resetConfig();
     mockWorkspace.systemPrompt = "Test system prompt";
+    mockWorkspace.promptContext = { memory: [], people: [] };
     resetMockSdk();
     queryState.reset();
   });

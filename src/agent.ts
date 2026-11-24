@@ -166,6 +166,8 @@ export class Agent {
   private readonly ownerNotices: OwnerNotices;
   private readonly mcpAuthPrompts: McpAuthPrompts;
   private pendingNotesQueue: PendingNotesQueue;
+  /** Per key: the memory-change note prefixed to the turn in flight (see drainPendingNotes). */
+  private readonly inFlightContextNotes = new Map<string, string>();
   /**
    * Durable record of every accepted inbound message until a turn consumes
    * it (see DurableInbox). Undefined when `config.inbox` is off or the log
@@ -258,9 +260,15 @@ export class Agent {
     // time (tests replace it on the instance).
     this.turnRunner = new TurnRunner({
       drainPendingNotes: (sessionKey) => this.drainPendingNotes(sessionKey),
-      restorePendingNotes: (sessionKey, drained) => this.pendingNotesQueue.restore(sessionKey, drained),
-      settlePendingNotes: (sessionKey, drained) => this.pendingNotesQueue.settle(sessionKey, drained),
-      restoreInterruptedPendingNotes: (sessionKey, drained) => this.pendingNotesQueue.restoreInterrupted(sessionKey, drained),
+      restorePendingNotes: (sessionKey, drained) => {
+        this.pendingNotesQueue.restore(sessionKey, this.takeBackContextNote(sessionKey, drained, false));
+      },
+      settlePendingNotes: (sessionKey, drained) => {
+        this.pendingNotesQueue.settle(sessionKey, this.takeBackContextNote(sessionKey, drained, true));
+      },
+      restoreInterruptedPendingNotes: (sessionKey, drained) => {
+        this.pendingNotesQueue.restoreInterrupted(sessionKey, this.takeBackContextNote(sessionKey, drained, false));
+      },
       // Persisted (sessions' pending-notes file): a reply the owner never got
       // must still be known to the next turn if the daemon restarts first.
       queueDeliveryFailureNote: (sessionKey, note) => this.queuePendingNote(
@@ -2474,10 +2482,28 @@ export class Agent {
   /** Drain notes queued for this session and return them as a prefix. */
   private drainPendingNotes(sessionKey: string): string {
     // A live session keeps the MEMORY.md / roster it was built with; what
-    // changed since rides in with this turn's notes (see buildIdentityPrompt).
+    // changed since rides in ahead of this turn's notes (see
+    // buildIdentityPrompt). It is NOT queued: the queue is durable, and a
+    // change note replayed after a restart would describe a prompt the new
+    // session does not have. If the turn does not complete, the live session's
+    // snapshot is rolled back instead (takeBackContextNote).
+    const drained = this.pendingNotesQueue.drain(sessionKey);
     const contextNote = this.liveSessionManager.takePromptContextNote(sessionKey);
-    if (contextNote) this.pendingNotesQueue.queueNote(sessionKey, contextNote);
-    return this.pendingNotesQueue.drain(sessionKey);
+    if (!contextNote) return drained;
+    const prefix = `${contextNote}\n\n`;
+    this.inFlightContextNotes.set(sessionKey, prefix);
+    return prefix + drained;
+  }
+
+  /** Strip this turn's memory-change note off the drained prefix before it
+   *  goes back to the queue, and settle or roll back the snapshot it told. */
+  private takeBackContextNote(sessionKey: string, drained: string, completed: boolean): string {
+    const prefix = this.inFlightContextNotes.get(sessionKey);
+    if (prefix === undefined || !drained.startsWith(prefix)) return drained;
+    this.inFlightContextNotes.delete(sessionKey);
+    if (completed) this.liveSessionManager.settlePromptContextNote(sessionKey);
+    else this.liveSessionManager.restorePromptContextNote(sessionKey);
+    return drained.slice(prefix.length);
   }
 
   /** Channel + per-session vitals snapshot for the watch server. */

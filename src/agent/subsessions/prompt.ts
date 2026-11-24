@@ -84,8 +84,8 @@ export function formatResumeEvent(record: SubsessionRecord): string {
  */
 export function formatRedeliveryNote(count: number): string {
   return formatTomoEvent("subsession-redelivery", count === 1
-    ? "The next message was already sent to you once, in a turn that was cut short. You may have acted on it: check before doing it again."
-    : `The next ${count} messages were already sent to you once, in a turn that was cut short. You may have acted on them: check before doing anything twice.`);
+    ? "The next message was already sent to you once, in a turn that did not complete (cut short by a restart, failed, or its result could not be saved). You may have acted on it: check before doing it again."
+    : `The next ${count} messages were already sent to you once, in a turn that did not complete (cut short by a restart, failed, or its result could not be saved). You may have acted on them: check before doing anything twice.`);
 }
 
 /** Separates redelivered inputs from the ones that are new. */

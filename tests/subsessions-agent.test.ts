@@ -65,7 +65,7 @@ describe("sub-sessions through the Agent", () => {
     if (!spawned.ok) throw new Error(spawned.error);
     // Not waiting on anything external: the fire is taken while it runs.
     expect(await agent.handleCronMessage("check CI", "task:s1")).toBe(true);
-    expect(agent.subsessions!.get("s1")?.pendingInput.some((p) => p.includes("check CI"))).toBe(true);
+    expect(agent.subsessions!.get("s1")?.pendingInput.some((p) => p.text.includes("check CI"))).toBe(true);
     expect(channel.delivered).toHaveLength(0);
     expect(await agent.handleCronMessage("check CI", "task:s42")).toBe(false);
     await agent.stop();

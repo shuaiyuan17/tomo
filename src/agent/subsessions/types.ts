@@ -25,6 +25,23 @@ export interface SubsessionSentMessage {
   text: string;
 }
 
+/** One input owed to the task. */
+export interface SubsessionInput {
+  seq: number;
+  text: string;
+}
+
+/** Append an input: the only way one is added. */
+export function appendInput(record: SubsessionRecord, text: string): void {
+  record.pendingInput.push({ seq: record.nextInputSeq, text });
+  record.nextInputSeq += 1;
+}
+
+/** The highest seq pending (0 when none). */
+export function lastInputSeq(record: SubsessionRecord): number {
+  return record.pendingInput.at(-1)?.seq ?? 0;
+}
+
 /** One status change, kept on the record (the newest TRANSITION_LOG_KEEP). */
 export interface SubsessionTransition {
   at: number;
@@ -92,30 +109,33 @@ export interface SubsessionRecord {
   /** The next turn carries the task-record reminder and does not count. */
   postCompactReminder: boolean;
   /**
-   * Prompts owed to the task: a cron check-back, a relay, a message that
-   * arrived while it had no turn to take them (queued, or between turns).
-   * An input leaves this list only when a turn that carried it COMPLETED, so
-   * a crash at any point loses none (at-least-once). Never trimmed: when it
-   * holds PENDING_INPUT_MAX entries, new input is refused, not dropped.
+   * Prompts owed to the task (a cron check-back, a relay, a message), in the
+   * order they arrived. APPEND-ONLY: a turn only reads them and remembers, in
+   * memory, the highest seq it carried. Entries leave the list only in the
+   * one atomic write that records that turn's completed result, so a crash at
+   * any point loses none (at-least-once), and nothing is written before a
+   * turn starts. Never trimmed: at PENDING_INPUT_MAX, new input is refused.
    */
-  pendingInput: string[];
+  pendingInput: SubsessionInput[];
+  /** The seq the next input gets (per task, never reused). */
+  nextInputSeq: number;
   /**
-   * The first N entries of pendingInput went out with the turn in flight.
-   * Written before the turn starts; cleared when it ends. Non-zero at start
-   * means that turn was cut short by a crash or a shutdown.
+   * Inputs with seq up to this went out in a turn that did not complete (cut
+   * short by a restart, failed, or its result could not be saved): the task
+   * may have acted on them, and the next turn says so. Raised only, together
+   * with the outcome that justifies it (a failed turn's write, or startup
+   * recovery).
    */
-  inflightInputs: number;
+  seenThrough: number;
   /**
-   * The first turn was handed to the SDK. With `startDelivered` false, it was
-   * cut short: it may have done things, so without its conversation the task
-   * cannot be started over safely.
+   * Set by a pause that keeps what the task owes for the owner's wake (it was
+   * stopped, its turns kept failing, it restarted Tomo itself), in the same
+   * transition: inputs with seq up to this, and an undelivered start, are
+   * held on purpose. Unset: nothing was ever held. Startup recovery requeues
+   * a waiting task only for what is NOT held, which a turn cut short (one
+   * that called task_ask) left unconsumed.
    */
-  startDispatched: boolean;
-  /**
-   * The first N entries of pendingInput already went out once, in a turn a
-   * restart cut short: the task may have acted on them. The next turn says so.
-   */
-  redeliveredInputs: number;
+  heldThrough?: number;
   /** Recent messages the task sent out, newest last (at most SENT_KEEP). */
   sent: SubsessionSentMessage[];
   /** The newest status changes, oldest first. */

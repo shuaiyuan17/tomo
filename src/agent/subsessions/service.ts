@@ -16,7 +16,7 @@ import {
   formatResumeEvent,
   formatStartEvent,
 } from "./prompt.js";
-import { OPEN_STATUSES, PENDING_INPUT_MAX, TERMINAL_STATUSES, type SubsessionRecord } from "./types.js";
+import { OPEN_STATUSES, PENDING_INPUT_MAX, TERMINAL_STATUSES, appendInput, lastInputSeq, type SubsessionRecord } from "./types.js";
 
 /** How a task turn ended, as the agent's turn runner saw it. */
 export interface TaskTurnOutcome {
@@ -88,6 +88,8 @@ const REPORT_NOTE_EXCERPT = 600;
 /** A report note that could not be written is retried in-process, this often, this many times. */
 export const REPORT_RETRY_MS = 60_000;
 export const REPORT_RETRY_MAX = 5;
+/** A turn whose result could not be written: how soon the task gets its next turn. */
+export const SETTLE_RETRY_MS = 60_000;
 const ACTIVITY_NOTE_EXCERPT = 1500;
 
 /** Models a task may use: aliases opus / sonnet / fable, or any full id that is not a Haiku model. */
@@ -105,10 +107,11 @@ interface PlannedTurn {
   kind: "compact" | "wake" | "continue";
   prompt: string;
   /**
-   * The leading pendingInput entries this turn carries. They stay on the
-   * record (marked in flight) until the turn completes.
+   * The highest input seq this turn carries (0: none). Held in memory only:
+   * the inputs stay on the record until the write that records this turn's
+   * result removes them.
    */
-  inputs: string[];
+  throughSeq: number;
   /** Carries the post-compact reminder: does not count as progress or as no progress. */
   afterCompact: boolean;
   resume: boolean;
@@ -137,6 +140,14 @@ export class SubsessionService {
   /** Reports whose note write failed: the note may sit in memory only. */
   private readonly unpersistedReports = new Set<string>();
   private cronRecheckTimer?: NodeJS.Timeout;
+  /**
+   * Inputs a completed turn carried whose result could not be written: they
+   * are still on the record, and the next turn in this process says they may
+   * have been acted on. (After a restart, recovery marks them on disk.)
+   */
+  private readonly unsavedSeen = new Map<string, number>();
+  /** Tasks whose last result could not be written: no turn until the retry timer. */
+  private readonly settleTimers = new Map<string, NodeJS.Timeout>();
   private started = false;
   /** The table could not be read at start: the feature stays off until the next start. */
   private broken = false;
@@ -318,7 +329,7 @@ export class SubsessionService {
     const outcome = this.store.transition(record.id, "cron_wake", {
       reason: "scheduled check-back",
       guard: inputQueueFull,
-      patch: (r) => { r.pendingInput.push(prompt); },
+      patch: (r) => { appendInput(r, prompt); },
     });
     if (!outcome.ok) {
       if (outcome.refused) void this.tellScope(record, ownerT("subsessions")("inputFull", { id: record.id, title: record.title, max: PENDING_INPUT_MAX }));
@@ -346,7 +357,7 @@ export class SubsessionService {
       patch: (r) => {
         const last = r.transitions.at(-1);
         if (r.status === "queued" && last?.event === "background_report" && last.at === r.lastActivityAt) {
-          r.pendingInput.push(formatTomoEvent("subsession-continue", "A background task of yours reported back. Continue with the task: finish it, or schedule a check-back if you still have to wait."));
+          appendInput(r, formatTomoEvent("subsession-continue", "A background task of yours reported back. Continue with the task: finish it, or schedule a check-back if you still have to wait."));
         }
       },
     });
@@ -387,7 +398,11 @@ export class SubsessionService {
   // Lifecycle of the service
   // ---------------------------------------------------------------------
 
-  /** Reconcile, recover from the restart, sweep, schedule. Called once, after channels are up. */
+  /**
+   * Startup, in a fixed order: recovery (synchronous, idempotent) runs to
+   * completion first; then reconcile and the sweep, which never schedule;
+   * then the one schedule() call. Called once, after channels are up.
+   */
   start(): void {
     if (this.started || !this.deps.config().enabled) return;
     this.started = true;
@@ -403,10 +418,17 @@ export class SubsessionService {
       void this.noticeOwner(ownerT("subsessions")("tableUnreadable"));
       return;
     }
-    let cutShort = new Set<string>();
-    this.safely(() => { cutShort = this.recoverInflight(); }, "in-flight input recovery");
+    try {
+      this.recover();
+    } catch (err) {
+      // Half a recovery must not be scheduled on: what is left is done by the
+      // next start (recovery is idempotent).
+      this.broken = true;
+      log.error({ err }, "Sub-session restart recovery could not finish; sub-sessions are off until the next start");
+      void this.noticeOwner(ownerT("subsessions")("recoveryFailed"));
+      return;
+    }
     this.safely(() => this.reconcile(startState), "reconcile");
-    this.safely(() => this.recoverFromRestart(cutShort), "restart recovery");
     this.safely(() => this.sweep(), "sweep");
     this.schedule();
     // A finished task that still owes an answer (its turn was cut short) has
@@ -427,28 +449,72 @@ export class SubsessionService {
     this.reportTimers.clear();
     this.reportAttempts.clear();
     this.unpersistedReports.clear();
+    for (const timer of this.settleTimers.values()) clearTimeout(timer);
+    this.settleTimers.clear();
     if (this.cronRecheckTimer) clearTimeout(this.cronRecheckTimer);
     this.cronRecheckTimer = undefined;
   }
 
   /**
-   * No turn runs at start, so inputs marked in flight belong to a turn that a
-   * crash or a shutdown cut short. They are still on the record (inputs leave
-   * it only after a completed turn) and go out again, marked as possibly
-   * seen, so the task checks before acting on them twice.
+   * Restart recovery: one synchronous pass over the table, before reconcile
+   * and before anything is scheduled. No turn runs at start, so:
+   * - an ACTIVE task was cut short: it is queued to resume (or waits for the
+   *   owner, if it restarted Tomo itself; or fails after too many restarts);
+   * - a WAITING task that still owes inputs (or its start) it does not hold
+   *   on purpose (`heldThrough`) had its last turn cut short after that turn
+   *   moved it to waiting (task_ask): they are still owed a completed turn,
+   *   so it is queued to resume too;
+   * - every input still pending on those, and on a finished task, may have
+   *   gone out in the turn that was cut short: `seenThrough` says so.
+   * Each task's decision is ONE transition (or update) that also moves it
+   * out of the state that triggers it, so running this twice (a crash in the
+   * middle of it) gives the same table as running it once.
    */
-  private recoverInflight(): Set<string> {
-    const cutShort = new Set<string>();
+  private recover(): void {
     for (const task of this.store.list()) {
-      if (task.inflightInputs === 0) continue;
-      cutShort.add(task.id);
-      log.warn({ id: task.id, inputs: task.inflightInputs }, "Sub-session turn was cut short with inputs in flight; redelivering them");
-      this.store.update(task.id, (r) => {
-        r.redeliveredInputs = Math.min(r.pendingInput.length, Math.max(r.redeliveredInputs, r.inflightInputs));
-        r.inflightInputs = 0;
-      });
+      const last = lastInputSeq(task);
+      // Owed and not held: inputs above heldThrough, or a start no turn
+      // completed when nothing was ever held.
+      const cutShortWaiting = task.status === "waiting"
+        && (last > (task.heldThrough ?? 0) || (!task.startDelivered && task.heldThrough === undefined));
+      if (task.status === "active" && task.restartRequested) {
+        const outcome = this.store.transition(task.id, "self_restart", {
+          reason: "it restarted Tomo itself",
+          expectFrom: ["active"],
+          patch: (r) => {
+            r.restartRequested = false;
+            // Waiting on the owner now: anything it held is the owner's to wake.
+            r.seenThrough = Math.max(r.seenThrough, lastInputSeq(r));
+            r.heldThrough = lastInputSeq(r);
+          },
+        });
+        if (outcome.ok && outcome.changed) void this.tellScope(outcome.record, ownerT("subsessions")("selfRestart", { id: task.id, title: task.title }));
+        continue;
+      }
+      if (task.status === "active" || cutShortWaiting) {
+        if (task.interruptStreak + 1 > MAX_INTERRUPT_STREAK) {
+          const failed = this.store.transition(task.id, "fail", { reason: `interrupted by ${MAX_INTERRUPT_STREAK + 1} restarts in a row`, expectFrom: [task.status] });
+          if (failed.ok && failed.changed) this.reportFailure(failed.record, ownerT("subsessions")("failedInterrupted", { id: task.id, title: task.title, restarts: MAX_INTERRUPT_STREAK + 1 }));
+          continue;
+        }
+        if (cutShortWaiting) log.warn({ id: task.id, inputs: task.pendingInput.length }, "Sub-session's last turn was cut short while it waited; resuming it");
+        this.store.transition(task.id, cutShortWaiting ? "recover_cut_short" : "restart", {
+          reason: cutShortWaiting ? "Tomo restarted before its last turn completed" : "Tomo restarted",
+          expectFrom: [task.status],
+          patch: (r) => {
+            r.resumeNeeded = true;
+            r.interruptStreak += 1;
+            r.restartRequested = false;
+            r.seenThrough = Math.max(r.seenThrough, lastInputSeq(r));
+          },
+        });
+        continue;
+      }
+      if (task.status === "finished" && last > task.seenThrough) {
+        // Its answer turn may have been cut short with these in it.
+        this.store.update(task.id, (r) => { r.seenThrough = Math.max(r.seenThrough, lastInputSeq(r)); });
+      }
     }
-    return cutShort;
   }
 
   /**
@@ -499,20 +565,23 @@ export class SubsessionService {
         this.wakeForReport(task);
       }
       if (OPEN_STATUSES.has(task.status) && !this.deps.hasSdkSession(task.sessionKey)) {
-        if (task.startDelivered || task.startDispatched) {
-          // A turn ran (completed, or handed to the SDK and cut short), so it
-          // may have done things, and the registry came back without its
-          // conversation: it cannot resume, and starting it over without that
-          // history could repeat what it did.
+        if (task.startDelivered) {
+          // A turn completed, so it did things, and the registry came back
+          // without its conversation: it cannot resume, and starting it over
+          // without that history could repeat what it did.
           const failed = this.store.transition(task.id, "fail", { reason: "its conversation could not be found after a restart" });
           if (failed.ok) this.reportFailure(failed.record, ownerT("subsessions")("failedNoSession", { id: task.id, title: task.title }));
           continue;
         }
-        // The first turn was never handed to the SDK (the daemon stopped
-        // between the start and the dispatch): nothing ran, so nothing to lose.
+        // No turn of it ever completed. If its first turn was cut short, the
+        // SDK session id is linked as soon as the SDK reports it (before any
+        // tool call), so without one that turn almost surely did nothing; it
+        // starts over, and recovery has set resumeNeeded, so the new first
+        // turn also tells it to check for side effects first.
         this.safely(() => this.deps.ensureRegistryEntry(task.sessionKey), "registry entry");
       }
     }
+    // Queues what it wakes; start() schedules once everything here is done.
     this.checkExternalWaits("after a restart");
   }
 
@@ -520,7 +589,8 @@ export class SubsessionService {
    * A task waiting on its check-back whose job is gone (the cron store is
    * not fsynced, or was unreadable when the task parked) would wait forever:
    * let it run again and schedule a new one itself. A store that still
-   * cannot be read is looked at again shortly, in this process.
+   * cannot be read is looked at again shortly, in this process. Never
+   * schedules: the caller does, once it is safe to.
    */
   private checkExternalWaits(when: string): void {
     let unknown = false;
@@ -532,11 +602,10 @@ export class SubsessionService {
       this.store.transition(task.id, "cron_wake", {
         reason: `its check-back job was missing ${when}`,
         guard: inputQueueFull,
-        patch: (r) => { r.pendingInput.push(formatTomoEvent("subsession-continue", "Your scheduled check-back is missing (lost in a restart, or never saved). Check on what you were waiting for, and schedule a new check-back if you still need to wait.")); },
+        patch: (r) => { appendInput(r, formatTomoEvent("subsession-continue", "Your scheduled check-back is missing (lost in a restart, or never saved). Check on what you were waiting for, and schedule a new check-back if you still need to wait.")); },
       });
     }
     if (unknown) this.armCronRecheck();
-    this.schedule();
   }
 
   private armCronRecheck(): void {
@@ -544,37 +613,9 @@ export class SubsessionService {
     this.cronRecheckTimer = setTimeout(() => {
       this.cronRecheckTimer = undefined;
       this.safely(() => this.checkExternalWaits("once the cron store could be read again"), "cron recheck");
+      this.schedule();
     }, CRON_RECHECK_MS);
     this.cronRecheckTimer.unref?.();
-  }
-
-  /** Active at shutdown: resume through the scheduler, unless the task asked for the restart itself. */
-  private recoverFromRestart(cutShort: ReadonlySet<string>): void {
-    for (const task of this.store.list()) {
-      // Waiting with a turn cut short (it asked the owner, or paused, and the
-      // turn never completed): its inputs are owed that turn, and nothing
-      // autonomous wakes waiting(owner). It resumes like an active task.
-      const waitingCutShort = task.status === "waiting"
-        && (cutShort.has(task.id) || (task.startDispatched && !task.startDelivered));
-      if (task.status !== "active" && !waitingCutShort) continue;
-      if (task.restartRequested && !waitingCutShort) {
-        const outcome = this.store.transition(task.id, "self_restart", {
-          reason: "it restarted Tomo itself",
-          patch: (r) => { r.restartRequested = false; },
-        });
-        if (outcome.ok) void this.tellScope(outcome.record, ownerT("subsessions")("selfRestart", { id: task.id, title: task.title }));
-        continue;
-      }
-      if (task.interruptStreak + 1 > MAX_INTERRUPT_STREAK) {
-        const failed = this.store.transition(task.id, "fail", { reason: `interrupted by ${MAX_INTERRUPT_STREAK + 1} restarts in a row` });
-        if (failed.ok) this.reportFailure(failed.record, ownerT("subsessions")("failedInterrupted", { id: task.id, title: task.title, restarts: MAX_INTERRUPT_STREAK + 1 }));
-        continue;
-      }
-      this.store.transition(task.id, waitingCutShort ? "recover_cut_short" : "restart", {
-        reason: waitingCutShort ? "Tomo restarted before its last turn completed" : "Tomo restarted",
-        patch: (r) => { r.resumeNeeded = true; r.interruptStreak += 1; r.restartRequested = false; },
-      });
-    }
   }
 
   /** Archive finished tasks after 7 days; forget ended ones after 30. */
@@ -637,7 +678,7 @@ export class SubsessionService {
     const outcome = this.store.transition(id, event, {
       reason: event === "relay" ? "a message from the main session" : "a message from the owner",
       guard: inputQueueFull,
-      patch: (r) => { r.pendingInput.push(prompt); },
+      patch: (r) => { appendInput(r, prompt); },
     });
     if (!outcome.ok) return outcome;
     // Queued: it waits for its slot, and the message goes with its first turn.
@@ -647,7 +688,7 @@ export class SubsessionService {
 
   /** Run the task's driver unless one is running. */
   private kick(id: string): void {
-    if (this.driving.has(id) || this.deps.isStopping()) return;
+    if (this.driving.has(id) || this.settleTimers.has(id) || this.deps.isStopping()) return;
     this.driving.add(id);
     void this.drive(id)
       .catch((err) => log.error({ err, id }, "Sub-session driver failed"))
@@ -667,19 +708,13 @@ export class SubsessionService {
       if (!record || record.status === "queued" || TERMINAL_STATUSES.has(record.status)) return;
       const turn = this.plan(record);
       if (!turn) return;
-      // Marked, never removed: they leave the record when this turn completes.
-      if (turn.inputs.length > 0 || turn.start) {
-        this.store.update(id, (r) => {
-          r.inflightInputs = turn.inputs.length;
-          if (turn.start) r.startDispatched = true;
-        });
-      }
+      // Nothing is written before the turn: its inputs are only read here,
+      // and leave the record with the write that records its result.
       if (turn.kind === "continue") this.continueOwed.delete(id);
       this.toolCalls.delete(id);
       this.progressChanged.delete(id);
       const outcome = await this.deps.runTaskTurn(record.sessionKey, turn.prompt, { bare: turn.kind === "compact" });
-      this.afterTurn(id, turn, outcome);
-      if (outcome.shutdown) return;
+      if (!this.afterTurn(id, turn, outcome)) return;
     }
   }
 
@@ -693,37 +728,45 @@ export class SubsessionService {
     // A first turn cut short gets both: the start event (it never completed)
     // and the resume warning (it may have done things before it was cut).
     const resume = active && record.resumeNeeded;
-    const inputs = [...record.pendingInput];
+    const inputs = record.pendingInput;
+    const throughSeq = inputs.at(-1)?.seq ?? 0;
     const owed = record.status === "active" && this.continueOwed.has(record.id);
     if (!start && !resume && inputs.length === 0 && !owed) return undefined;
     // Compact first, but only ahead of a turn the task has anyway: an idle or
     // finished task is not woken just to be compacted.
     if (record.compactPending) {
-      return { kind: "compact", prompt: `/compact ${compactInstructions(record)}`, inputs: [], afterCompact: false, resume: false, start: false };
+      return { kind: "compact", prompt: `/compact ${compactInstructions(record)}`, throughSeq: 0, afterCompact: false, resume: false, start: false };
     }
     const afterCompact = record.postCompactReminder;
     const parts: string[] = [];
     if (afterCompact) parts.push(formatPostCompactReminder(record));
     if (start) parts.push(formatStartEvent(record));
     if (resume) parts.push(formatResumeEvent(record));
-    const seen = Math.min(record.redeliveredInputs, inputs.length);
+    // Seq order: the inputs that may have been seen are a prefix.
+    const seenThrough = Math.max(record.seenThrough, this.unsavedSeen.get(record.id) ?? 0);
+    const seen = inputs.filter((i) => i.seq <= seenThrough).length;
     if (seen > 0) {
       parts.push(formatRedeliveryNote(seen));
-      parts.push(...inputs.slice(0, seen));
-      if (inputs.length > seen) parts.push(formatNewInputNote(), ...inputs.slice(seen));
+      parts.push(...inputs.slice(0, seen).map((i) => i.text));
+      if (inputs.length > seen) parts.push(formatNewInputNote(), ...inputs.slice(seen).map((i) => i.text));
     } else {
-      parts.push(...inputs);
+      parts.push(...inputs.map((i) => i.text));
     }
     const kind = start || resume || inputs.length > 0 ? "wake" : "continue";
     if (kind === "continue") parts.push(formatContinueEvent());
-    return { kind, prompt: parts.join("\n\n"), inputs, afterCompact, resume, start };
+    return { kind, prompt: parts.join("\n\n"), throughSeq, afterCompact, resume, start };
   }
 
-  private afterTurn(id: string, turn: PlannedTurn, outcome: TaskTurnOutcome): void {
+  /**
+   * Record a turn's result. The inputs it carried leave the record in this
+   * one write, with everything else the result changes; until it succeeds,
+   * none of them is consumed. Returns false when the driver must stop.
+   */
+  private afterTurn(id: string, turn: PlannedTurn, outcome: TaskTurnOutcome): boolean {
     if (outcome.shutdown) {
-      // Never an outcome. Its inputs are still on the record, marked in
-      // flight; the next start redelivers them as possibly seen.
-      return;
+      // Never an outcome. Its inputs are still on the record; the next
+      // start's recovery marks them as possibly seen.
+      return false;
     }
     const tools = this.toolCalls.get(id) ?? 0;
     const progressed = tools > 0 || this.progressChanged.has(id);
@@ -731,11 +774,17 @@ export class SubsessionService {
     this.progressChanged.delete(id);
 
     if (turn.kind === "compact") {
-      this.safely(() => this.store.update(id, (r) => {
-        r.compactPending = false;
-        if (outcome.ok) r.postCompactReminder = true;
-      }), "after compact");
-      return;
+      try {
+        this.store.update(id, (r) => {
+          r.compactPending = false;
+          if (outcome.ok) r.postCompactReminder = true;
+        });
+      } catch (err) {
+        log.error({ err, id }, "Could not record a sub-session compact; trying again later");
+        this.retryAfterSettleFailure(id);
+        return false;
+      }
+      return true;
     }
 
     let record: SubsessionRecord | undefined;
@@ -745,12 +794,11 @@ export class SubsessionService {
     let gaveUp = false;
     try {
       record = this.store.update(id, (r) => {
-        const carried = Math.min(turn.inputs.length, r.pendingInput.length);
         const consume = () => {
-          r.pendingInput = r.pendingInput.slice(carried);
-          r.redeliveredInputs = Math.max(0, r.redeliveredInputs - carried);
+          const before = r.pendingInput.length;
+          r.pendingInput = r.pendingInput.filter((i) => i.seq > turn.throughSeq);
+          return r.pendingInput.length < before;
         };
-        r.inflightInputs = 0;
         if (outcome.ok) {
           r.failStreak = 0;
           r.interruptStreak = 0;
@@ -762,12 +810,11 @@ export class SubsessionService {
           r.failStreak += 1;
           if (r.status === "finished" && (outcome.stopped || r.failStreak >= MAX_FAIL_STREAK)) {
             r.failStreak = 0;
-            gaveUp = carried > 0;
-            consume();
+            gaveUp = consume();
           } else {
             // They stay first in line for the next turn, marked as possibly
             // seen: a failed turn may have acted on part of them.
-            r.redeliveredInputs = Math.max(r.redeliveredInputs, carried);
+            r.seenThrough = Math.max(r.seenThrough, turn.throughSeq);
           }
         }
         const usage = this.deps.contextUsage(r.sessionKey);
@@ -777,31 +824,37 @@ export class SubsessionService {
         }
       });
     } catch (err) {
-      log.error({ err, id }, "Could not record a sub-session turn's outcome");
-      return;
+      // Nothing was consumed: the inputs go out again, said to be possibly
+      // seen (this turn may have acted on them), after a pause so a disk that
+      // keeps failing does not spin the task.
+      log.error({ err, id }, "Could not record a sub-session turn's result; its inputs stay and go out again");
+      if (turn.throughSeq > 0) this.unsavedSeen.set(id, Math.max(this.unsavedSeen.get(id) ?? 0, turn.throughSeq));
+      this.retryAfterSettleFailure(id);
+      return false;
     }
+    this.unsavedSeen.delete(id);
     if (!record || record.status !== "active") {
       this.continueOwed.delete(id);
       if (record && gaveUp) void this.tellScope(record, ownerT("subsessions")("finishedUnanswered", { id: record.id, title: record.title }));
-      return;
+      return true;
     }
 
     if (!outcome.ok) {
       if (outcome.stopped) {
         this.pause(record, "stopped by the owner", ownerT("subsessions")("stopped", { id: record.id, title: record.title }));
-        return;
+        return true;
       }
       if (record.failStreak >= MAX_FAIL_STREAK) {
         this.pause(record, "its turns keep failing", ownerT("subsessions")("failing", { id: record.id, title: record.title }));
-        return;
+        return true;
       }
       this.continueOwed.add(id);
-      return;
+      return true;
     }
     // Input that arrived during the turn gets a turn before any wait: the
     // waits below are also guarded under the lock, for input that lands
     // between this read and the transition.
-    if (record.pendingInput.length > 0) return;
+    if (record.pendingInput.length > 0) return true;
     const jobs = this.deps.cronJobCount(record.sessionKey);
     if (jobs === undefined || jobs > 0) {
       // Unknown (the cron store cannot be read) parks it too: auto-continuing
@@ -812,21 +865,33 @@ export class SubsessionService {
         expectFrom: ["active"],
         guard: hasPendingInput,
       });
-      if (!waited.ok && waited.refused) return;
+      if (!waited.ok && waited.refused) return true;
       if (jobs === undefined) this.armCronRecheck();
       this.continueOwed.delete(id);
       this.schedule();
-      return;
+      return true;
     }
     if (!turn.afterCompact) {
       const streak = progressed ? 0 : record.turnsWithoutProgress + 1;
       this.store.update(id, (r) => { r.turnsWithoutProgress = streak; });
       if (streak >= MAX_TURNS_WITHOUT_PROGRESS) {
         this.pause(record, `${streak} turns in a row without progress`, ownerT("subsessions")("stuck", { id: record.id, title: record.title, turns: streak }), true);
-        return;
+        return true;
       }
     }
     this.continueOwed.add(id);
+    return true;
+  }
+
+  /** The result could not be written: no turn for this task until a timer gives it one. */
+  private retryAfterSettleFailure(id: string): void {
+    if (this.settleTimers.has(id) || this.deps.isStopping()) return;
+    const timer = setTimeout(() => {
+      this.settleTimers.delete(id);
+      this.kick(id);
+    }, SETTLE_RETRY_MS);
+    timer.unref?.();
+    this.settleTimers.set(id, timer);
   }
 
   /**
@@ -836,7 +901,14 @@ export class SubsessionService {
    */
   private pause(record: SubsessionRecord, reason: string, notice: OwnerText, unlessInput = false): void {
     this.continueOwed.delete(record.id);
-    const outcome = this.store.transition(record.id, "stuck", { reason, expectFrom: ["active"], ...(unlessInput ? { guard: hasPendingInput } : {}) });
+    const outcome = this.store.transition(record.id, "stuck", {
+      reason,
+      expectFrom: ["active"],
+      ...(unlessInput ? { guard: hasPendingInput } : {}),
+      // What it holds now waits for the owner's wake; restart recovery must
+      // not take it for a turn cut short.
+      patch: (r) => { r.heldThrough = lastInputSeq(r); },
+    });
     if (outcome.ok) void this.tellScope(outcome.record, notice);
     this.schedule();
   }

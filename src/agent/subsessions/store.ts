@@ -9,6 +9,7 @@ import {
   SENT_KEEP,
   SUBSESSION_STATUSES,
   TRANSITION_LOG_KEEP,
+  type SubsessionInput,
   type SubsessionRecord,
   type SubsessionStatus,
   type SubsessionTable,
@@ -135,9 +136,8 @@ export class SubsessionStore {
         compactPending: false,
         postCompactReminder: false,
         pendingInput: [],
-        inflightInputs: 0,
-        redeliveredInputs: 0,
-        startDispatched: false,
+        nextInputSeq: 1,
+        seenThrough: 0,
         sent: [],
         transitions: [{ at: now, from: null, to: "queued", event: "spawn" }],
       };
@@ -381,7 +381,8 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
   if (!(SUBSESSION_STATUSES as readonly string[]).includes(status)) throw new Error(`task ${index}: unknown status ${status}`);
   const id = str("id");
   const createdAt = num("createdAt", 0);
-  const pendingInput = Array.isArray(r.pendingInput) ? r.pendingInput.filter((p): p is string => typeof p === "string") : [];
+  const pendingInput = parseInputs(r.pendingInput);
+  const lastSeq = pendingInput.at(-1)?.seq ?? 0;
   return {
     ...(r as unknown as SubsessionRecord),
     id,
@@ -403,12 +404,36 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
     compactPending: r.compactPending === true,
     postCompactReminder: r.postCompactReminder === true,
     pendingInput,
-    inflightInputs: Math.min(pendingInput.length, Math.max(0, Math.floor(num("inflightInputs", 0)))),
-    redeliveredInputs: Math.min(pendingInput.length, Math.max(0, Math.floor(num("redeliveredInputs", 0)))),
-    startDispatched: r.startDispatched === true,
+    nextInputSeq: Math.max(lastSeq + 1, Math.floor(num("nextInputSeq", 1))),
+    seenThrough: Math.max(0, Math.floor(num("seenThrough", 0))),
+    ...(typeof r.heldThrough === "number" && Number.isFinite(r.heldThrough) ? { heldThrough: Math.max(0, Math.floor(r.heldThrough)) } : { heldThrough: undefined }),
     sent: Array.isArray(r.sent) ? r.sent as SubsessionRecord["sent"] : [],
     transitions: Array.isArray(r.transitions) ? r.transitions as SubsessionRecord["transitions"] : [],
   };
+}
+
+/**
+ * Inputs, in seq order. Malformed entries are dropped; a plain string (no
+ * seq) gets the next seq after the ones before it, so order is kept.
+ */
+function parseInputs(raw: unknown): SubsessionInput[] {
+  if (!Array.isArray(raw)) return [];
+  const out: SubsessionInput[] = [];
+  let last = 0;
+  for (const entry of raw) {
+    let seq: number | undefined;
+    let text: string | undefined;
+    if (typeof entry === "string") text = entry;
+    else if (entry && typeof entry === "object") {
+      const e = entry as Record<string, unknown>;
+      if (typeof e.text === "string") text = e.text;
+      if (typeof e.seq === "number" && Number.isInteger(e.seq) && e.seq > last) seq = e.seq;
+    }
+    if (text === undefined) continue;
+    last = seq ?? last + 1;
+    out.push({ seq: last, text });
+  }
+  return out;
 }
 
 /** The capped logs. pendingInput is NOT one of them: accepted input is never dropped. */

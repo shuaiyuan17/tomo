@@ -1,4 +1,4 @@
-import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync, openSync, closeSync, linkSync, copyFileSync } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync, openSync, closeSync, linkSync, copyFileSync, type BigIntStats } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
 import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget, UsageBaseline } from "./types.js";
@@ -150,6 +150,24 @@ function registryLinkSignature(entries: SessionEntry[]): string {
  * the last state we successfully loaded, which is strictly better than `[]`,
  * but nothing may be persisted from it until the file can be read again.
  */
+/** What identifies one published version of the registry file. */
+interface RegistryFileIdentity {
+  dev: bigint;
+  ino: bigint;
+  size: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+}
+
+function registryFileIdentity(s: BigIntStats): RegistryFileIdentity {
+  return { dev: s.dev, ino: s.ino, size: s.size, mtimeNs: s.mtimeNs, ctimeNs: s.ctimeNs };
+}
+
+function sameRegistryFile(a: RegistryFileIdentity | null, b: RegistryFileIdentity): boolean {
+  return a !== null && a.dev === b.dev && a.ino === b.ino && a.size === b.size
+    && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
+}
+
 export class SessionRegistryReadError extends Error {
   readonly path: string;
   constructor(path: string, cause: unknown) {
@@ -195,11 +213,16 @@ export class SessionStore {
    * save, which is what publishes it.
    */
   private registryDirty = false;
-  // Stat of the registry file as of the last read/write. loadRegistry() is
+  // Identity of the registry file as of the last read/write. loadRegistry() is
   // called on nearly every store operation to pick up external changes
-  // (e.g. `tomo sessions clear`); the stat check lets those calls skip the
-  // full read+parse when the file hasn't changed since we last touched it.
-  private registryStat: { mtimeMs: number; size: number } | null = null;
+  // (e.g. `tomo sessions clear`); the check lets those calls skip the full
+  // read+parse when the file hasn't changed since we last touched it. Every
+  // writer publishes by atomic rename, so each write is a NEW inode: comparing
+  // device+inode (plus size and nanosecond mtime/ctime) sees a same-size write
+  // inside one mtime tick, which an mtime/size check could not. It is only
+  // ever recorded for a file this process read, or wrote while holding the
+  // lock, so it never vouches for another process's write.
+  private registryStat: RegistryFileIdentity | null = null;
   /** One warn per streak for a `_sessions.json.bak` write that failed. */
   private registryBackupErrorLogged = false;
   /** A link change this process made (or tried) that `.bak` may not hold yet:
@@ -1226,6 +1249,10 @@ export class SessionStore {
   setReplyTarget(key: string, target: ReplyTarget): void {
     // mutateRegistry's guards run BEFORE ensureActiveEntry, which would
     // otherwise push a stub into the in-memory registry we cannot persist.
+    // Runs on every inbound DM: answer an unchanged target from the cached
+    // registry, without the lock or a write.
+    const cached = this.cachedActiveEntry(key)?.replyTarget;
+    if (cached && cached.channelName === target.channelName && cached.chatId === target.chatId) return;
     this.mutateRegistry("setReplyTarget", "bookkeeping", () => {
       const entry = this.ensureActiveEntry(key);
       const prev = entry.replyTarget;
@@ -1237,6 +1264,7 @@ export class SessionStore {
 
   /** Persist a friendly chat title for a session (mainly groups). No-op if unchanged. */
   setChatTitle(key: string, title: string): void {
+    if (this.cachedActiveEntry(key)?.chatTitle === title) return;
     this.mutateRegistry("setChatTitle", "bookkeeping", () => {
       const entry = this.ensureActiveEntry(key);
       if (entry.chatTitle !== title) {
@@ -1252,6 +1280,10 @@ export class SessionStore {
     // Bookkeeping, and on the INBOUND path: updateGroupContext calls this
     // before the message is appended to the transcript, and the rejection is
     // swallowed upstream — a throw here silently drops the message.
+    // Runs on every group message; nearly always nothing new is learned.
+    const cached = this.cachedActiveEntry(key);
+    if (cached?.participants?.includes(name)
+      && (!senderId || cached.participantIds?.[senderId]?.includes(name))) return;
     this.mutateRegistry("addParticipant", "bookkeeping", () => {
       const entry = this.ensureActiveEntry(key);
       let changed = false;
@@ -1273,6 +1305,28 @@ export class SessionStore {
 
       if (changed) this.saveRegistryBestEffort("addParticipant");
     });
+  }
+
+  /**
+   * The active entry as the registry file holds it right now, for a
+   * bookkeeping mutator's "nothing to change" fast path. `loadRegistry()`
+   * re-reads unless the file is the exact one this process last read or wrote
+   * under the lock (see `registryStat`), so a hit describes the latest
+   * PUBLISHED registry. Undefined while the registry is unreadable or this
+   * process holds a change not saved yet (memory is not the file then), so
+   * those cases still go through `mutateRegistry`, which owns them.
+   *
+   * A writer in the middle of its own locked cycle (`tomo sessions clear`) has
+   * not published yet; answering from the file before its rename is the same
+   * outcome as this call landing just before that writer took the lock — the
+   * two overlap, and either order is a valid one. A no-op never writes, so it
+   * cannot undo anything that writer publishes.
+   */
+  private cachedActiveEntry(key: string): SessionEntry | undefined {
+    if (this.readOnly) return undefined;
+    this.loadRegistry();
+    if (this.registryLoadError !== null || this.registryDirty) return undefined;
+    return this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
   }
 
   /** Active entry for a key, creating a metadata-only stub (empty sdkSessionId)
@@ -1492,7 +1546,22 @@ export class SessionStore {
       else if (!this.canWriteRegistry(op)) return undefined;
       const savesBefore = this.registrySaveCount;
       if (strict) this.registryBackupStale = true;
-      const result = fn();
+      let result: T;
+      try {
+        result = fn();
+      } catch (err) {
+        // A link change that threw (its save failed: ENOSPC, EROFS) reported
+        // failure, so it must not survive in memory: the fast paths
+        // (`cachedActiveEntry`) trust memory whenever the file's identity still
+        // matches, and that unsaved state is not the file. Drop it by
+        // re-reading. Unsaved bookkeeping (`registryDirty`) is kept, as
+        // before: it is meant to ride the next successful save.
+        if (strict && !this.registryDirty) {
+          this.registryStat = null;
+          this.loadRegistry();
+        }
+        throw err;
+      }
       // After a save (the outermost frame only), refresh the backup the next
       // start recovers from if the registry is found 0-byte or corrupt —
       // whenever a link change is not in it yet, including one whose own
@@ -2044,10 +2113,9 @@ export class SessionStore {
     // conflating them is the whole bug: only the first one legitimately means
     // there are no sessions. statSync's own errors have to be split the same
     // way — an EACCES on the directory is not an absent registry.
-    let stat: { mtimeMs: number; size: number } | null;
+    let stat: RegistryFileIdentity | null;
     try {
-      const s = statSync(file);
-      stat = { mtimeMs: s.mtimeMs, size: s.size };
+      stat = registryFileIdentity(statSync(file, { bigint: true }));
     } catch (err) {
       if (!isEnoent(err)) {
         this.onRegistryLoadFailure(err);
@@ -2065,7 +2133,7 @@ export class SessionStore {
       if (!this.readOnly) this.migrateOldFormat();
       return;
     }
-    if (stat.size === 0) {
+    if (stat.size === 0n) {
       // A zero-byte registry is ambiguous, and JSON.parse("") throws — so
       // without this it would be a permanent refusal with no way to self-heal.
       // The usual cause is a crash or power loss right after a write that was
@@ -2102,10 +2170,7 @@ export class SessionStore {
     }
     // Skip the stat cache while we are in a failed state: the point of every
     // subsequent call is to find out whether the file has become readable.
-    if (this.registryLoadError === null
-      && this.registryStat
-      && this.registryStat.mtimeMs === stat.mtimeMs
-      && this.registryStat.size === stat.size) {
+    if (this.registryLoadError === null && sameRegistryFile(this.registryStat, stat)) {
       return;
     }
     let text: string;
@@ -2415,16 +2480,25 @@ export class SessionStore {
     // that cannot be created falls through to the bare write, which then
     // reports the real reason the directory is unusable.
     let written = false;
+    // Record our own write's identity so the next loadRegistry() doesn't
+    // re-read what we just wrote — taken INSIDE the lock, right after the
+    // rename: once the lock is released (the outermost frame here, as from
+    // `migrateOldFormat`) another process may publish, and a stat taken then
+    // would vouch for ITS file while memory still holds ours.
+    let ownStat: RegistryFileIdentity | null = null;
     try {
       withFileLockSync(this.registryLockPath, () => {
         written = true;
         writeJsonAtomicSync(this.registryPath, data, { fsync: true });
+        ownStat = this.statRegistry();
       }, REGISTRY_LOCK_OPTIONS);
     } catch (err) {
       // Past the lock: the write itself failed, and that is the caller's news.
       if (written) throw err;
       // A live holder is a refusal, not a reason to publish anyway.
       if (err instanceof FileLockTimeoutError) throw err;
+      // No exclusion: nothing guarantees the file is still ours by the time
+      // we stat it, so do not cache an identity — the next load re-reads.
       writeJsonAtomicSync(this.registryPath, data, { fsync: true });
     }
     this.registryDirty = false;
@@ -2433,17 +2507,12 @@ export class SessionStore {
       this.registryWriteErrorLogged = false;
       log.info({ file: this.registryPath }, "Session-registry writes succeeding again");
     }
-    // Record our own write's stat so the next loadRegistry() doesn't re-read
-    // what we just wrote. An external writer landing in the stat window would
-    // be missed until its next write — the same read-modify-write race the
-    // uncached path had, so no new hazard.
-    this.registryStat = this.statRegistry();
+    this.registryStat = ownStat;
   }
 
-  private statRegistry(): { mtimeMs: number; size: number } | null {
+  private statRegistry(): RegistryFileIdentity | null {
     try {
-      const s = statSync(this.registryPath);
-      return { mtimeMs: s.mtimeMs, size: s.size };
+      return registryFileIdentity(statSync(this.registryPath, { bigint: true }));
     } catch {
       return null;
     }

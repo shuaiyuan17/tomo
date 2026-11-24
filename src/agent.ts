@@ -3072,9 +3072,11 @@ export class Agent {
       "interrupted-agents",
       config.interruptedAgentsAutoResume
         ? "Startup check after a restart: if a note above lists interrupted subagents, for each resumable one use SendMessage to resume it right away, "
-          + "unless the owner has explicitly said not to: tell it it was interrupted by a restart, have it first check how far it got "
-          + "and what side effects already happened, then continue. Skip any the note marks otherwise; Explore/Plan subagents and "
-          + `background commands cannot be resumed. If no note lists any, there is nothing to do. ${CONTINUITY_DELIVERY_NOTE}`
+          + "unless the owner has explicitly said not to, or it has already been resumed or has finished since (check the conversation): "
+          + "tell it it was interrupted by a restart, have it first check how far it got and which side effects "
+          + "(commits, pushes, messages sent, files changed) already happened, then continue without redoing them. "
+          + "Skip any the note marks otherwise; Explore/Plan subagents and background commands cannot be resumed. "
+          + `If no note lists any, there is nothing to do. ${CONTINUITY_DELIVERY_NOTE}`
         : "Startup check after a restart: if a note above lists interrupted subagents or commands, decide whether each is "
           + `still worth continuing; otherwise there is nothing to do. ${CONTINUITY_DELIVERY_NOTE}`,
       { name: "check" },

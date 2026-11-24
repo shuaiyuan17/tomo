@@ -33,8 +33,10 @@ import type { WatchTask } from "../watch/protocol.js";
  * before the call is allowed (a failed write denies it). Past
  * MAX_AUTO_RESUMES the call is denied, whichever turn makes it, so a subagent
  * that itself brings the daemon down (`tomo restart`, a deploy, exhausting
- * the machine) cannot be revived on every start. The entry is dropped when
- * the agent ends on its own (anything but a shutdown).
+ * the machine) cannot be revived on every start. An agent that disappears
+ * without completing while the daemon runs (its CLI died, the session was
+ * closed) is gated the same way. The entry is dropped only when the agent
+ * completes.
  */
 
 export type InterruptedKind = "agent" | "command";
@@ -188,12 +190,12 @@ export class RunningAgentsLedger {
   /** Mirror `tasks` events from the watch bus. Returns the unsubscribe. */
   attach(bus: WatchBus): () => void {
     return bus.subscribe((event) => {
-      if (event.type === "tasks") this.observe(event.sessionKey, event.tasks);
+      if (event.type === "tasks") this.observe(event.sessionKey, event.tasks, event.ended);
     });
   }
 
-  /** A session's full live task set after a change (REPLACE semantics). */
-  observe(sessionKey: string, tasks: readonly WatchTask[]): void {
+  /** A session's full live task set after a change (REPLACE semantics); `ended`: runs that ended with it. */
+  observe(sessionKey: string, tasks: readonly WatchTask[], ended: readonly { taskId: string; status: string }[] = []): void {
     if (this.frozen) return;
     const now = this.now();
     const old = this.running.get(sessionKey) ?? new Map<string, RunningTaskRecord>();
@@ -234,12 +236,23 @@ export class RunningAgentsLedger {
       if (progressed) activityChanged = true;
       next.set(task.taskId, rec);
     }
-    for (const id of old.keys()) {
+    // A background run that ended stays listed with its status; a foreground one is reported in `ended`.
+    const completed = new Set([
+      ...tasks.filter((t) => t.status === "completed").map((t) => t.taskId),
+      ...ended.filter((e) => e.status === "completed").map((e) => e.taskId),
+    ]);
+    for (const [id, prev] of old) {
       if (next.has(id)) continue;
       membershipChanged = true;
       this.progress.delete(`${sessionKey}\0${id}`);
-      // Ended on its own (a shutdown is frozen out above): no longer gated.
-      this.resumes.delete(idOf(sessionKey, id));
+      if (completed.has(id)) {
+        // Ended on its own: no longer gated.
+        this.resumes.delete(idOf(sessionKey, id));
+      } else if (this.opts.autoResume && isResumable(prev) && !this.resumes.has(idOf(sessionKey, id))) {
+        // Gone without completing (its CLI died, the session was closed, it
+        // failed or was stopped): resuming it is a resume like any other.
+        this.resumes.set(idOf(sessionKey, id), { sessionKey, taskId: id, count: 0 });
+      }
     }
     if (next.size > 0) this.running.set(sessionKey, next);
     else this.running.delete(sessionKey);
@@ -355,9 +368,11 @@ function minutes(ms: number): string {
 
 /**
  * Body of the `interrupted-agents` tomo-event for one session. Without
- * `autoResume` the model is only told, and decides. With it, the notice asks
- * for each resumable subagent to be resumed now; `failed` are those past
- * their resume limit (the SendMessage hook would refuse them anyway).
+ * `autoResume` the model is only told, and decides. With it, the list marks
+ * what must not be resumed (`failed`: past the resume limit, which the
+ * SendMessage hook would refuse anyway); the instruction to resume is only in
+ * the startup check turn, which is not stored, so a note delivered again
+ * later (or after auto-resume was turned off) instructs nothing.
  */
 export function formatInterruptedAgentsNotice(
   records: readonly RunningTaskRecord[],
@@ -385,10 +400,8 @@ export function formatInterruptedAgentsNotice(
     return [
       "When Tomo last restarted or crashed, these were still running in this conversation and were cut off:",
       ...lines,
-      "For each resumable subagent above that is not marked otherwise, use SendMessage to its id right away to resume it "
-        + "(names do not survive a restart; use the id), unless the owner has explicitly said not to. "
-        + "Tell it it was interrupted by a restart, have it first check how far it got and which side effects "
-        + "(commits, pushes, messages sent, files changed) already happened, then continue without redoing them. "
+      "The startup check says which to resume (SendMessage to the id; names do not survive a restart). "
+        + "Resume none that has already been resumed or has finished since, and none marked otherwise. "
         + "Explore/Plan subagents and background commands cannot be resumed; rerun them if still needed.",
     ].join("\n");
   }

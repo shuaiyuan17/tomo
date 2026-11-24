@@ -188,8 +188,8 @@ describe("auto-resume of interrupted subagents", () => {
     const second = await boot();
     await waitFor(() => expect(checkTurn("imessage:710")).toBeDefined());
     const text = checkTurn("imessage:710")!.text;
-    expect(text).toContain("for each resumable one use SendMessage to resume it right away, unless the owner has explicitly said not to");
-    expect(text).toContain("tell it it was interrupted by a restart, have it first check how far it got and what side effects already happened, then continue");
+    expect(text).toContain("for each resumable one use SendMessage to resume it right away, unless the owner has explicitly said not to, or it has already been resumed or has finished since");
+    expect(text).toContain("tell it it was interrupted by a restart, have it first check how far it got and which side effects");
     expect(text).toMatch(/resume710 "job resume710" \(general-purpose[^\n]*\)\n/);
     expect(text).toMatch(/explore710 "job explore710" \(Explore[^\n]* — cannot be resumed/);
     expect(text).not.toContain("Nothing has been resumed");
@@ -292,6 +292,29 @@ describe("auto-resume of interrupted subagents", () => {
       crash(run.agent);
     }
     await run.agent.stop();
+  });
+
+  it("a note still owed when auto-resume is turned off instructs nothing", async () => {
+    const first = await boot();
+    await haveSession(first.channel, "720");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:720", tasks: [task("owed720")] });
+    crash(first.agent);
+    // The check turn never finishes; the daemon dies again.
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = () => new Promise(() => {});
+    const second = await boot();
+    await waitFor(() => expect(checkTurn("imessage:720")).toBeDefined());
+    crash(second.agent);
+
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = async () => "ok";
+    const off = await boot({ interruptedAgentsAutoResume: false });
+    await waitFor(() => expect(checkTurn("imessage:720")).toBeDefined());
+    const text = checkTurn("imessage:720")!.text;
+    expect(text).toContain("owed720");
+    expect(text).toContain("decide whether each is still worth continuing");
+    expect(text).not.toContain("right away");
+    await off.agent.stop();
   });
 
   it("turning tracking off removes the old records, so turning it back on revives nothing", async () => {

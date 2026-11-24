@@ -146,16 +146,15 @@ describe("running-agents ledger", () => {
       expect(body).not.toMatch(/FAILED|right away|type unknown/);
     });
 
-    it("on: asks for each resumable subagent to be resumed now; failed and untyped ones are marked", () => {
+    it("on: the stored note marks failed and untyped ones and instructs nothing (the check turn does)", () => {
       const body = formatInterruptedAgentsNotice(recs, "UTC", { failed: new Set(["a2"]) });
       expect(body).toContain('- a1 "fix bug" (general-purpose, ran 0m, last activity 01/01 00:00 UTC)\n');
       expect(body).toContain(`- a2 "loops" (general-purpose, ran 0m, last activity 01/01 00:00 UTC) — FAILED: cut off again after ${MAX_AUTO_RESUMES} resumes; do not resume it`);
       expect(body).toMatch(/e1 "look" \(Explore[^\n]* — cannot be resumed\n/);
       expect(body).toContain("u1 \"untyped\" (subagent, ran 0m, last activity 01/01 00:00 UTC) — type unknown (could be Explore/Plan); do not resume it automatically");
-      expect(body).toContain("use SendMessage to its id right away to resume it");
-      expect(body).toContain("unless the owner has explicitly said not to");
-      expect(body).toMatch(/Tell it it was interrupted by a restart, have it first check how far it got and which side effects/);
-      expect(body).not.toContain("Nothing has been resumed");
+      expect(body).toContain("The startup check says which to resume");
+      expect(body).toContain("Resume none that has already been resumed or has finished since");
+      expect(body).not.toMatch(/right away|Nothing has been resumed/);
     });
 
     it(`the gate allows ${MAX_AUTO_RESUMES} resumes of an interrupted agent, counted on disk, then denies`, () => {
@@ -216,6 +215,39 @@ describe("running-agents ledger", () => {
       expect(ledger.resumeCount("dm:owner", "a1")).toBe(0);
       expect(openOn().gateResume("dm:owner", "a1")).toBeNull();
       expect(openOn().resumeCount("dm:owner", "a1")).toBe(0);
+    });
+
+    it("an agent that disappears without completing (its CLI died, session closed) is gated too", () => {
+      const ledger = openOn();
+      ledger.observe("dm:owner", [agent("a1"), agent("a2"), agent("e1", { subagentType: "Explore" })]);
+      // The CLI died: an empty snapshot, no end status.
+      ledger.observe("dm:owner", []);
+      expect(ledger.gateResume("dm:owner", "a1")).toBeNull();
+      expect(ledger.resumeCount("dm:owner", "a1")).toBe(1);
+      expect(ledger.resumeCount("dm:owner", "e1")).toBe(0);
+      // Failed or stopped is not completed: still gated.
+      ledger.observe("dm:owner", [agent("a2")]);
+      ledger.observe("dm:owner", [agent("a2", { status: "failed" })]);
+      ledger.gateResume("dm:owner", "a2");
+      expect(ledger.resumeCount("dm:owner", "a2")).toBe(1);
+      // A foreground run reported completed in `ended` clears it.
+      ledger.observe("dm:owner", [agent("a1")]);
+      ledger.observe("dm:owner", [], [{ taskId: "a1", status: "completed" }]);
+      expect(ledger.resumeCount("dm:owner", "a1")).toBe(0);
+      expect(ledger.gateResume("dm:owner", "a1")).toBeNull();
+      expect(ledger.resumeCount("dm:owner", "a1")).toBe(0);
+    });
+
+    it("the same agent dying with its CLI again and again hits the cap within one run", () => {
+      const ledger = openOn();
+      ledger.observe("dm:owner", [agent("a1")]);
+      ledger.observe("dm:owner", []);
+      for (let i = 0; i < MAX_AUTO_RESUMES; i++) {
+        expect(ledger.gateResume("dm:owner", "a1")).toBeNull();
+        ledger.observe("dm:owner", [agent("a1")]);
+        ledger.observe("dm:owner", []);
+      }
+      expect(ledger.gateResume("dm:owner", "a1")).toMatch(/already been resumed/);
     });
 
     it("one cut off again past the limit is owed a failure notice until it is sent", () => {

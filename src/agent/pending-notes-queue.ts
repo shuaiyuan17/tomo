@@ -57,52 +57,6 @@ function capNotes(arr: string[]): number {
   return dropped;
 }
 
-const EVENT_OPEN = "<tomo-event ";
-const EVENT_CLOSE = "</tomo-event>";
-/** The errors block `drain` renders, exactly as it renders it. */
-const RENDERED_ERRORS_BLOCK = /^<tomo-event type="errors" ts="[^"]*">\nRecent Tomo errors before this turn/;
-
-/**
- * Remove rendered errors blocks from a stored note. Error notes are
- * memory-only, but before put-back split batches into their parts a failed
- * turn's whole prefix, errors block included, went back as one durable note,
- * so a store written then can still hold them. Only top-level envelopes are
- * looked at (each skipped whole: bodies escape the closing tag, so the first
- * one is the envelope's own), so text inside a message is never touched.
- */
-function stripStoredErrors(note: string): string {
-  let out = "";
-  let i = 0;
-  for (;;) {
-    const open = note.indexOf(EVENT_OPEN, i);
-    const close = open < 0 ? -1 : note.indexOf(EVENT_CLOSE, open);
-    if (close < 0) return out + note.slice(i);
-    const end = close + EVENT_CLOSE.length;
-    const before = note.slice(0, open);
-    const atBoundary = open === 0 || before.endsWith("\n\n") || before.endsWith(`${INTERRUPTED_NOTE_MARKER}\n`);
-    if (!atBoundary || !RENDERED_ERRORS_BLOCK.test(note.slice(open, end))) {
-      out += note.slice(i, end);
-      i = end;
-      continue;
-    }
-    // Drop the block and the separator after it; keep the one before it
-    // only when something follows.
-    out += note.slice(i, open);
-    const sep = /\s*$/.exec(out)?.[0] ?? "";
-    out = out.slice(0, out.length - sep.length);
-    i = end;
-    while (i < note.length && /\s/.test(note[i])) i++;
-    if (i < note.length && out) out += sep;
-  }
-}
-
-/** Strip errors blocks left in stored notes by older versions; drop notes left empty. */
-function withoutStoredErrors(notes: string[]): string[] {
-  return notes
-    .map((note) => (note.includes('<tomo-event type="errors"') ? stripStoredErrors(note) : note))
-    .filter((note) => note.trim() !== "" && note.trim() !== INTERRUPTED_NOTE_MARKER);
-}
-
 /**
  * Prepended to a note whose turn took it but did not finish (crash, graceful
  * shutdown, abort): the model may already have acted on it, partly or fully.
@@ -141,8 +95,6 @@ export class PendingNotesQueue {
   private inflight = new Map<string, InFlightBatch[]>();
   private errorNotes = new Map<string, ErrorNote[]>();
   private errorSeq = 0;
-  /** Sessions whose legacy cleanup is not on disk yet (its write failed). */
-  private unsavedCleanup = new Set<string>();
 
   constructor(private store: DurablePendingNotesStore) {}
 
@@ -150,14 +102,7 @@ export class PendingNotesQueue {
     let arr = this.notes.get(sessionKey);
     if (!arr) {
       try {
-        const stored = this.store.getPendingNotes(sessionKey);
-        arr = withoutStoredErrors(stored);
-        // Write the cleaned list back now: nothing else may persist this
-        // session soon (an error-only store drains to an empty prefix).
-        if (arr.length !== stored.length || arr.some((n, idx) => n !== stored[idx])) {
-          this.notes.set(sessionKey, arr);
-          if (!this.persist(sessionKey)) this.unsavedCleanup.add(sessionKey);
-        }
+        arr = this.store.getPendingNotes(sessionKey);
       } catch (err) {
         log.warn({ err, sessionKey }, "Could not load durable pending notes");
         arr = [];
@@ -175,7 +120,6 @@ export class PendingNotesQueue {
     ];
     try {
       this.store.setPendingNotes(sessionKey, all);
-      this.unsavedCleanup.delete(sessionKey);
       return true;
     } catch (err) {
       log.warn({ err, sessionKey }, "Could not persist pending notes");
@@ -221,11 +165,7 @@ export class PendingNotesQueue {
     }
 
     const prefix = parts.map((n) => `${n}\n\n`).join("");
-    if (!prefix) {
-      // Nothing to hand over, so nothing else would write: retry a failed cleanup.
-      if (this.unsavedCleanup.has(sessionKey)) this.persist(sessionKey);
-      return prefix;
-    }
+    if (!prefix) return prefix;
     // Every non-empty prefix is tracked, so a put-back can split it into its
     // parts again. Only the durable notes reach the store (error notes are
     // memory-only to begin with).

@@ -245,53 +245,27 @@ describe("PendingNotesQueue", () => {
     expect(next).not.toContain("older-");
     expect(next.indexOf("newer-0")).toBeLessThan(next.indexOf("newer-2"));
   });
-  it("strips errors blocks an older version left inside stored notes", () => {
+  it("an errors block an older version stored inside a note no longer grows, and goes on the next settle", () => {
     const store = new MemoryPendingNotesStore();
     const errors = '<tomo-event type="errors" ts="x">\nRecent Tomo errors before this turn (newest last, capped):\n- [error] old-boom\n</tomo-event>';
     const inbox = '<tomo-event type="inbox" name="interrupted" ts="x">\nthe message\n</tomo-event>';
-    store.setPendingNotes("k", [
-      `${INTERRUPTED_NOTE_MARKER}\n${inbox}\n\n${errors}\n\n${errors}`,
-      `${INTERRUPTED_NOTE_MARKER}\n${errors}`,
-    ]);
+    const legacy = `${INTERRUPTED_NOTE_MARKER}\n${inbox}\n\n${errors}`;
+    store.setPendingNotes("k", [legacy]);
     const queue = new PendingNotesQueue(store);
-    const drained = queue.drain("k");
-    expect(drained).toContain("the message");
-    expect(drained).not.toContain("old-boom");
-    expect(drained.split(INTERRUPTED_NOTE_MARKER)).toHaveLength(2);
-    queue.restoreInterrupted("k", drained);
-    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\n${inbox}`]);
-  });
-  it("never strips an errors tag that is text inside a stored message", () => {
-    const store = new MemoryPendingNotesStore();
-    const inbox = '<tomo-event type="inbox" name="interrupted" ts="x">\nlook: <tomo-event type="errors" ts="y">\nRecent Tomo errors before this turn and more text\n</tomo-event>';
-    store.setPendingNotes("k", [inbox, "plain"]);
-    const queue = new PendingNotesQueue(store);
-    expect(queue.drain("k")).toContain("and more text");
-    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\n${inbox}`, `${INTERRUPTED_NOTE_MARKER}\nplain`]);
-  });
 
-  it("clears an error-only legacy store from disk as soon as it is loaded", () => {
-    const store = new MemoryPendingNotesStore();
-    const errors = '<tomo-event type="errors" ts="x">\nRecent Tomo errors before this turn (newest last, capped):\n- [error] old-boom\n</tomo-event>';
-    store.setPendingNotes("k", [`${INTERRUPTED_NOTE_MARKER}\n${errors}`]);
-    const queue = new PendingNotesQueue(store);
-    expect(queue.drain("k")).toBe("");
+    // Turns keep failing: the stored note comes back unchanged every time.
+    for (let i = 0; i < 10; i++) {
+      const drained = queue.drain("k");
+      queue.queueError("k", `[error] new-${i}`);
+      queue.restoreInterrupted("k", drained);
+      expect(store.getPendingNotes("k")).toEqual([legacy]);
+    }
+
+    // A turn that ends normally consumes it, errors block and all.
+    const drained = queue.drain("k");
+    expect(drained.match(/<tomo-event type="errors"/g)).toHaveLength(2);
+    queue.settle("k", drained);
     expect(store.getPendingNotes("k")).toEqual([]);
-  });
-  it("retries a legacy cleanup whose first write failed", () => {
-    const store = new MemoryPendingNotesStore();
-    const errors = '<tomo-event type="errors" ts="x">\nRecent Tomo errors before this turn (newest last, capped):\n- [error] old-boom\n</tomo-event>';
-    store.setPendingNotes("k", [errors]);
-    const realSet = store.setPendingNotes.bind(store);
-    let failNext = true;
-    store.setPendingNotes = (key, notes) => {
-      if (failNext) { failNext = false; throw new Error("disk full"); }
-      realSet(key, notes);
-    };
-    const queue = new PendingNotesQueue(store);
-    // The write on load fails; the empty drain retries it.
     expect(queue.drain("k")).toBe("");
-    expect(failNext).toBe(false);
-    expect(store.getPendingNotes("k")).toEqual([]);
   });
 });

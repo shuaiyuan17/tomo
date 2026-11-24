@@ -1,4 +1,34 @@
-import { afterAll, describe, it, expect, beforeEach, afterEach } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+// Lets a test make one registry write fail (ENOSPC) without chmod, which
+// cannot fail a write for root.
+const failWrite = vi.hoisted(() => ({ path: null as string | null }));
+vi.mock("../src/fs-utils.js", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("../src/fs-utils.js")>();
+  return {
+    ...orig,
+    writeJsonAtomicSync: (...args: Parameters<typeof orig.writeJsonAtomicSync>) => {
+      if (failWrite.path !== null && args[0] === failWrite.path) {
+        throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+      }
+      return orig.writeJsonAtomicSync(...args);
+    },
+  };
+});
+// Lets a test run another writer in the gap between a process's first read and
+// its taking the registry lock.
+const beforeLock = vi.hoisted(() => ({ once: null as (() => void) | null }));
+vi.mock("../src/file-lock.js", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("../src/file-lock.js")>();
+  return {
+    ...orig,
+    withFileLockSync: (...args: Parameters<typeof orig.withFileLockSync>) => {
+      const hook = beforeLock.once;
+      if (hook) { beforeLock.once = null; hook(); }
+      return orig.withFileLockSync(...args);
+    },
+  };
+});
 import {
   SessionStore as SessionStoreImpl,
   SessionRegistryReadError,
@@ -383,6 +413,45 @@ describe("session registry durability (fsync + backup)", () => {
     writeFileSync(REGISTRY, "{ half");
     expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
     expect(readFileSync(REGISTRY, "utf-8")).toBe("{ half");
+  });
+
+  it("keeps the bad registry in place when the recovered copy cannot be written", () => {
+    seed();
+    const backup = readFileSync(BACKUP, "utf-8");
+    writeFileSync(REGISTRY, "");
+
+    failWrite.path = REGISTRY;
+    try {
+      const store = new SessionStore(TEST_DIR);
+      // Not renamed away: a missing registry would read as empty and the next
+      // link save would overwrite the backup.
+      expect(readFileSync(REGISTRY, "utf-8")).toBe("");
+      expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
+    } finally {
+      failWrite.path = null;
+    }
+    expect(readFileSync(BACKUP, "utf-8")).toBe(backup);
+    // Failed attempts leave no extra copies behind.
+    expect(readdirSync(TEST_DIR).filter((n) => n.startsWith("_sessions.json.corrupt-"))).toHaveLength(0);
+
+    // Once the disk takes writes again, the next start recovers every link.
+    const store = new SessionStore(TEST_DIR);
+    expect(store.getSdkSessionId("telegram:1")).toBe("sdk-aaa");
+    expect(store.getSdkSessionId("imessage:3")).toBe("sdk-ccc");
+  });
+
+  it("does not overwrite a newer backup another writer made while the seed waited for the lock", () => {
+    seed();
+    rmSync(BACKUP);
+    // This process reads the registry (three links, no backup), and before it
+    // takes the lock to seed, another process changes a link and writes the
+    // backup that goes with it.
+    beforeLock.once = () => {
+      new SessionStore(TEST_DIR).clearSdkSessionId("telegram:2");
+    };
+    new SessionStore(TEST_DIR);
+    expect(linksOn(BACKUP)).toEqual({ "telegram:1": "sdk-aaa", "imessage:3": "sdk-ccc" });
+    expect(linksOn(BACKUP)).toEqual(linksOn(REGISTRY));
   });
 
   it("seeds a backup on the first start after upgrading", () => {

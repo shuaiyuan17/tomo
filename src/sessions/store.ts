@@ -1,4 +1,4 @@
-import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync, openSync, closeSync, linkSync } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync, openSync, closeSync, linkSync, copyFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
 import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget, UsageBaseline } from "./types.js";
@@ -2145,9 +2145,30 @@ export class SessionStore {
           return true;
         }
 
+        // Keep the bad file under a second name, never rename it away: the
+        // primary path must exist until the recovered registry replaces it. A
+        // missing `_sessions.json` reads as a legitimately empty registry, so a
+        // failed write (ENOSPC) or a crash between a rename and the write would
+        // turn into "start empty", and the next link save would overwrite the
+        // backup. A hard link costs no space; the atomic write below then swaps
+        // a new inode in at the primary path and the link keeps the old one.
         const aside = `${file}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-        try { renameSync(file, aside); } catch (err) { if (!isEnoent(err)) throw err; }
-        writeJsonAtomicSync(file, { version: 1, sessions: parsed.sessions } satisfies SessionRegistry, { fsync: true });
+        let asideMade = false;
+        try {
+          try { linkSync(file, aside); } catch (err) {
+            if (isEnoent(err)) throw err;
+            copyFileSync(file, aside);
+          }
+          asideMade = true;
+        } catch (err) { if (!isEnoent(err)) throw err; }
+        try {
+          writeJsonAtomicSync(file, { version: 1, sessions: parsed.sessions } satisfies SessionRegistry, { fsync: true });
+        } catch (err) {
+          // The bad file is still at the primary path, so the next load retries
+          // or refuses; drop the extra name so retries do not pile copies up.
+          if (asideMade) { try { unlinkSync(aside); } catch { /* best effort */ } }
+          throw err;
+        }
         this.registry = parsed.sessions;
         this.registryStat = this.statRegistry();
         this.clearRegistryLoadError();
@@ -2186,7 +2207,16 @@ export class SessionStore {
     if (this.registryLoadError !== null || !this.registry.some((e) => e.sdkSessionId)) return;
     if (existsSync(this.registryBackupPath)) return;
     try {
-      withFileLockSync(this.registryLockPath, () => this.writeRegistryBackup("seed"), REGISTRY_LOCK_OPTIONS);
+      withFileLockSync(this.registryLockPath, () => {
+        // Re-check under the lock: another writer may have changed a link and
+        // written the backup since our first look, and seeding from the state
+        // we read before the lock would overwrite that newer backup.
+        if (existsSync(this.registryBackupPath)) return;
+        this.registryStat = null;
+        this.loadRegistry();
+        if (this.registryLoadError !== null || !this.registry.some((e) => e.sdkSessionId)) return;
+        this.writeRegistryBackup("seed");
+      }, REGISTRY_LOCK_OPTIONS);
     } catch (err) {
       log.debug({ err }, "Skipped seeding the session registry backup: lock unavailable");
     }

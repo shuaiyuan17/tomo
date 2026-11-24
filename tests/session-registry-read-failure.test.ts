@@ -477,8 +477,9 @@ describe("session registry durability (fsync + backup)", () => {
       '{"sessions":[null]}', '{"sessions":[1]}', '{"sessions":[[]]}',
       entry({ channelKey: 5 }), entry({ sdkSessionId: null }), entry({ expiresAt: "soon" }), entry({ stats: null }),
       // Missing lifecycle fields: `unlinkedAt === null` is what marks a link active.
-      entry({ unlinkedAt: undefined }), entry({ expiresAt: undefined }), entry({ createdAt: undefined }),
-      entry({ stats: undefined }),
+      entry({ unlinkedAt: undefined }), entry({ expiresAt: undefined }),
+      // Optional bookkeeping, but the wrong type when present.
+      entry({ createdAt: "yesterday" }), entry({ stats: [] }),
     ];
     for (const bad of bads) {
       // Healthy primary: startup compares the backup and rewrites it.
@@ -505,6 +506,20 @@ describe("session registry durability (fsync + backup)", () => {
     const store = new SessionStore(TEST_DIR);
     expect(store.getSdkSessionId("telegram:2")).toBe("sdk-bbb");
     expect(readFileSync(BACKUP, "utf-8")).toBe(good);
+  });
+
+  it("seeds from, and recovers from, older entries without stats or timestamps", () => {
+    // An entry from an older registry: only the link-defining fields.
+    writeFileSync(REGISTRY, JSON.stringify({ version: 1, sessions: [
+      { channelKey: "telegram:1", sdkSessionId: "sdk-old", unlinkedAt: null, expiresAt: null },
+    ] }));
+    new SessionStore(TEST_DIR);
+    expect(linksOn(BACKUP)).toEqual({ "telegram:1": "sdk-old" });
+
+    writeFileSync(REGISTRY, "");
+    const store = new SessionStore(TEST_DIR);
+    expect(store.getSdkSessionId("telegram:1")).toBe("sdk-old");
+    expect(() => store.updateStats("telegram:1", STATS)).not.toThrow();
   });
 
   it("retries a failed start-up backup refresh on the next bookkeeping save", () => {

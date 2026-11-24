@@ -109,19 +109,28 @@ function parseRegistryText(
   return { ok: true, sessions: data.sessions ?? [] };
 }
 
-/** The required `SessionEntry` fields, present and in the shape the store
- *  writes them (lookups test `unlinkedAt === null`, so an absent one would
- *  restore a link nothing can find). Checked on a backup before it is
- *  compared with the registry or restored over it; anything else refuses. */
+/**
+ * Whether a backup entry is safe to compare with the registry or restore over
+ * it. Two tiers, so an entry from an older registry still restores:
+ *  - what decides which link exists and whether it is active is REQUIRED:
+ *    `channelKey`, `sdkSessionId`, and `unlinkedAt`/`expiresAt` present as a
+ *    number or null (lookups test `unlinkedAt === null`, so an absent one
+ *    would restore a link nothing can find);
+ *  - bookkeeping the store already tolerates missing (`stats`, which
+ *    `updateStats` initialises; the timestamps) is type-checked only when
+ *    present.
+ * Anything else refuses recovery.
+ */
 function isRestorableEntry(e: unknown): boolean {
   if (e === null || typeof e !== "object" || Array.isArray(e)) return false;
   const r = e as Record<string, unknown>;
   const numOrNull = (v: unknown) => v === null || typeof v === "number";
+  const optNum = (v: unknown) => v === undefined || typeof v === "number";
   return typeof r.channelKey === "string"
     && typeof r.sdkSessionId === "string"
-    && typeof r.createdAt === "number" && typeof r.lastActiveAt === "number"
     && numOrNull(r.unlinkedAt) && numOrNull(r.expiresAt)
-    && r.stats !== null && typeof r.stats === "object" && !Array.isArray(r.stats);
+    && optNum(r.createdAt) && optNum(r.lastActiveAt)
+    && (r.stats === undefined || (r.stats !== null && typeof r.stats === "object" && !Array.isArray(r.stats)));
 }
 
 /** What the backup must agree with the registry on: which session holds

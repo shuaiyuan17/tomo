@@ -26,7 +26,7 @@ export function writeFileAtomicSync(path: string, content: string, opts?: Atomic
   try {
     if (opts?.fsync) {
       const fd = openSync(tmp, "w", mode ?? 0o666);
-      try { writeSync(fd, content); fsyncSync(fd); } finally { closeSync(fd); }
+      try { writeAllSync(fd, Buffer.from(content, "utf8")); fsyncSync(fd); } finally { closeSync(fd); }
     } else if (mode === undefined) {
       writeFileSync(tmp, content);
     } else {
@@ -42,6 +42,17 @@ export function writeFileAtomicSync(path: string, content: string, opts?: Atomic
   } catch (err) {
     try { unlinkSync(tmp); } catch { /* best-effort cleanup */ }
     throw err;
+  }
+}
+
+/** `writeSync` may write fewer bytes than asked (a full disk, a signal);
+ *  keep writing until all of `buf` is out, or let the error throw. */
+function writeAllSync(fd: number, buf: Buffer): void {
+  let off = 0;
+  while (off < buf.length) {
+    const n = writeSync(fd, buf, off, buf.length - off);
+    if (n <= 0) throw Object.assign(new Error(`short write: ${off} of ${buf.length} bytes`), { code: "EIO" });
+    off += n;
   }
 }
 

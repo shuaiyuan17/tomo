@@ -454,6 +454,58 @@ describe("session registry durability (fsync + backup)", () => {
     expect(linksOn(BACKUP)).toEqual(linksOn(REGISTRY));
   });
 
+  it("does not recover from a backup with no `sessions` array", () => {
+    for (const bad of ["{}", '{"version":1}', "null", '{"sessions":null}']) {
+      seed();
+      writeFileSync(REGISTRY, "");
+      writeFileSync(BACKUP, bad);
+      const store = new SessionStore(TEST_DIR);
+      expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
+      expect(readFileSync(REGISTRY, "utf-8")).toBe("");
+      expect(readFileSync(BACKUP, "utf-8")).toBe(bad);
+      rmSync(TEST_DIR, { recursive: true, force: true });
+      mkdirSync(TEST_DIR, { recursive: true });
+    }
+  });
+
+  it("retries a failed backup write on the next save, even a bookkeeping one", () => {
+    const store = seed();
+    failWrite.path = BACKUP;
+    try {
+      store.setSdkSessionId("telegram:9", "sdk-new");
+    } finally {
+      failWrite.path = null;
+    }
+    expect(linksOn(REGISTRY)["telegram:9"]).toBe("sdk-new");
+    expect(linksOn(BACKUP)["telegram:9"]).toBeUndefined();
+
+    // No further link change: an ordinary bookkeeping save catches it up.
+    store.touchSession("telegram:1");
+    expect(linksOn(BACKUP)).toEqual(linksOn(REGISTRY));
+    // And once caught up, bookkeeping stops rewriting it.
+    const ino = statSync(BACKUP, { bigint: true }).ino;
+    store.touchSession("telegram:1");
+    expect(statSync(BACKUP, { bigint: true }).ino).toBe(ino);
+  });
+
+  it("rewrites a backup left behind by a process that exited after its backup write failed", () => {
+    const store = seed();
+    failWrite.path = BACKUP;
+    try {
+      store.setSdkSessionId("telegram:9", "sdk-new");
+    } finally {
+      failWrite.path = null;
+    }
+    expect(linksOn(BACKUP)["telegram:9"]).toBeUndefined();
+
+    new SessionStore(TEST_DIR);
+    expect(linksOn(BACKUP)).toEqual(linksOn(REGISTRY));
+    // A backup that already holds every link is not rewritten at start.
+    const ino = statSync(BACKUP, { bigint: true }).ino;
+    new SessionStore(TEST_DIR);
+    expect(statSync(BACKUP, { bigint: true }).ino).toBe(ino);
+  });
+
   it("seeds a backup on the first start after upgrading", () => {
     seed();
     rmSync(BACKUP);

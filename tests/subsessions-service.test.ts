@@ -1,9 +1,9 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
-import { MAX_INTERRUPT_STREAK, REPORT_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
+import { CRON_RECHECK_MS, MAX_INTERRUPT_STREAK, REPORT_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { PENDING_INPUT_MAX } from "../src/agent/subsessions/types.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 
@@ -32,7 +32,10 @@ interface Harness {
   onCronCount?: (key: string) => void;
   /** null: the cron store is unreadable. */
   cronUnknown: boolean;
+  /** Note writes that fail: the note is still held in memory, like the real queue. */
   noteWriteFails: number;
+  /** Later re-writes of the held notes that fail. */
+  persistFails: number;
 }
 
 let dir = "";
@@ -68,6 +71,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
     onTurn,
     cronUnknown: false,
     noteWriteFails: 0,
+    persistFails: 0,
   } as Harness;
   h.service = new SubsessionService({
     store,
@@ -83,8 +87,12 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
     noticeToScope: async (to, text) => { h.notices.push({ to, text }); },
     noticeOwner: async (text) => { h.notices.push({ to: "owner", text }); },
     queuePendingNote: (key, note) => {
-      if (h.noteWriteFails > 0) { h.noteWriteFails -= 1; return false; }
       h.notes.set(key, [...(h.notes.get(key) ?? []), note]);
+      if (h.noteWriteFails > 0) { h.noteWriteFails -= 1; return false; }
+      return true;
+    },
+    persistPendingNotes: () => {
+      if (h.persistFails > 0) { h.persistFails -= 1; return false; }
       return true;
     },
     hasPendingNote: (key, pred) => (h.notes.get(key) ?? []).some(pred),
@@ -492,6 +500,78 @@ describe("SubsessionService: inputs are never lost", () => {
     }
   });
 
+  it("does not take a note held in memory after a failed write for a durable one", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, "the result")));
+      h.noteWriteFails = 1;
+      h.persistFails = 1;
+      h.service.start();
+      const t = spawn(h);
+      await flush();
+      // The note sits in memory (the write failed): not delivered.
+      expect(h.notes.get("dm:owner")?.filter((n) => n.includes('type="subsession-report"'))).toHaveLength(1);
+      vi.advanceTimersByTime(REPORT_RETRY_MS);
+      // The re-write failed too: still not delivered, no wake.
+      expect(h.store.get(t.id)?.reportDelivered).toBe(false);
+      expect(h.wakes).toEqual([]);
+      vi.advanceTimersByTime(2 * REPORT_RETRY_MS);
+      expect(h.store.get(t.id)?.reportDelivered).toBe(true);
+      expect(h.wakes).toEqual(["dm:owner"]);
+      // Re-written, never queued twice.
+      expect(h.notes.get("dm:owner")?.filter((n) => n.includes('type="subsession-report"'))).toHaveLength(1);
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("looks at a task parked on an unreadable cron store again, in-process, and wakes it when no job exists", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let calls = 0;
+      const h = harness({}, working((turn, hh) => { calls += 1; if (calls > 1) hh.service.finish(turn.key, "ok"); }));
+      h.cronUnknown = true;
+      h.service.start();
+      const t = spawn(h);
+      await flush();
+      expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "external" });
+      // Still unreadable at the first look: stays parked, looked at again.
+      vi.advanceTimersByTime(CRON_RECHECK_MS);
+      await flush();
+      expect(h.turns).toHaveLength(1);
+      h.cronUnknown = false; // readable now, and the job was never saved
+      vi.advanceTimersByTime(CRON_RECHECK_MS);
+      await flush();
+      expect(h.turns).toHaveLength(2);
+      expect(h.turns[1].prompt).toContain("check-back is missing");
+      expect(h.store.get(t.id)?.status).toBe("finished");
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("leaves a parked task alone when the check-back job turns out to exist", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness({}, working());
+      h.cronUnknown = true;
+      h.service.start();
+      const t = spawn(h);
+      await flush();
+      h.cronUnknown = false;
+      h.cron.set(t.sessionKey, 1);
+      vi.advanceTimersByTime(CRON_RECHECK_MS);
+      await flush();
+      expect(h.turns).toHaveLength(1);
+      expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "external" });
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("withdraws the task's restart claim when the restart was not launched", () => {
     const h = harness();
     const t = h.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
@@ -568,6 +648,132 @@ describe("SubsessionService start: restart recovery and reconcile", () => {
     expect(h.registry.has(t.sessionKey)).toBe(true);
   });
 
+  it("fails a task whose first turn was handed to the SDK but never completed, when its conversation is gone", async () => {
+    const h = harness();
+    const t = h.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    h.store.transition(t.id, "start");
+    h.store.update(t.id, (r) => { r.startDispatched = true; }); // it may have done things
+    h.service.start();
+    await flush();
+    expect(h.store.get(t.id)?.status).toBe("failed");
+    expect(h.turns).toHaveLength(0);
+  });
+
+  it("marks the first turn dispatched before the SDK runs it", async () => {
+    let seen: boolean | undefined;
+    const h = harness({}, (turn, hh) => { seen = hh.store.get("s1")?.startDispatched; hh.service.finish(turn.key, "ok"); return { ok: true }; });
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(seen).toBe(true);
+  });
+
+  it("resumes a task that asked the owner during a turn a crash cut short, with that turn's input", async () => {
+    const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, "ok")));
+    const id = seed(h, "active", (s, i) => {
+      s.update(i, (r) => { r.pendingInput = ["the owner's message"]; r.inflightInputs = 1; });
+      s.transition(i, "ask"); // task_ask ran; the turn never settled
+    });
+    h.service.start();
+    await flush();
+    expect(h.turns).toHaveLength(1);
+    expect(h.turns[0].prompt).toContain("the owner's message");
+    expect(h.turns[0].prompt).toContain('type="subsession-resume"');
+    expect(h.store.get(id)).toMatchObject({ status: "finished", pendingInput: [], inflightInputs: 0 });
+  });
+
+  it("resumes a task that asked the owner during a first turn a crash cut short", async () => {
+    const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, "ok")));
+    const t = h.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    h.store.transition(t.id, "start");
+    h.store.update(t.id, (r) => { r.startDispatched = true; });
+    h.store.transition(t.id, "ask");
+    h.registry.add(t.sessionKey);
+    h.sdk.add(t.sessionKey);
+    h.service.start();
+    await flush();
+    expect(h.turns[0].prompt).toContain('type="subsession-start"');
+    expect(h.turns[0].prompt).toContain('type="subsession-resume"');
+    expect(h.store.get(t.id)?.status).toBe("finished");
+  });
+
+  it("leaves a task that asked the owner in a completed turn waiting", async () => {
+    const h = harness();
+    const id = seed(h, "active", (s, i) => s.transition(i, "ask"));
+    h.service.start();
+    await flush();
+    expect(h.turns).toHaveLength(0);
+    expect(h.store.get(id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+  });
+
+  it("wakes the owning session again at start for a delivered report whose note is still unread", () => {
+    const h = harness();
+    seed(h, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
+    h.notes.set("dm:owner", ['<tomo-event type="subsession-report" name="s1" ts="x">R</tomo-event>']);
+    h.service.start();
+    expect(h.wakes).toEqual(["dm:owner"]);
+    expect(h.notes.get("dm:owner")).toHaveLength(1);
+  });
+
+  it("does not wake for a delivered report the owning session already read", () => {
+    const h = harness();
+    seed(h, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
+    h.service.start();
+    expect(h.wakes).toEqual([]);
+  });
+
+  it("never unlinks orphans of a table recovered from an older backup, on this start or the next", async () => {
+    const h0 = harness();
+    seed(h0, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
+    copyFileSync(path, `${path}.bak`); // the backup: s1 only
+    writeFileSync(path, "{broken");    // the primary, which also knew s2, is lost
+    const registry = new Set(["task:s1", "task:s2"]);
+    const startAgain = (): Harness => {
+      const h = harness();
+      for (const k of registry) { h.registry.add(k); h.sdk.add(k); }
+      h.service.start();
+      return h;
+    };
+    const h1 = startAgain();
+    expect(h1.unlinked).toEqual([]);
+    expect(h1.notices.filter((n) => n.to === "owner")).toHaveLength(1);
+    expect(h1.store.read().untrusted).toMatchObject({ reason: "recovered" });
+    // The next start reads a clean-looking table: the mark is what keeps it safe.
+    const h2 = startAgain();
+    expect(h2.store.state()).toBe("ok");
+    expect(h2.unlinked).toEqual([]);
+    expect(h2.notices).toHaveLength(0);
+    expect(h2.service.spawn("dm:owner", { title: "x", brief: "y" })).toMatchObject({ ok: true, record: { id: "s3" } });
+    const h3 = startAgain();
+    expect(h3.unlinked).toEqual([]);
+  });
+
+  it("keeps the recovered mark when restart recovery writes the table before reconcile", async () => {
+    const h0 = harness();
+    seed(h0, "active", (s, i) => s.update(i, (r) => { r.pendingInput = ["m"]; r.inflightInputs = 1; }));
+    copyFileSync(path, `${path}.bak`);
+    writeFileSync(path, "");
+    const h1 = harness(undefined, () => new Promise(() => {}));
+    h1.registry.add("task:s1"); h1.sdk.add("task:s1"); h1.registry.add("task:s2");
+    h1.service.start();
+    expect(h1.unlinked).toEqual([]);
+    const h2 = harness(undefined, () => new Promise(() => {}));
+    h2.registry.add("task:s1"); h2.sdk.add("task:s1"); h2.registry.add("task:s2");
+    h2.service.start();
+    expect(h2.unlinked).toEqual([]);
+    expect(h2.store.read().untrusted).toBeDefined();
+  });
+
+  it("trusts the table again once the registry holds no task it does not know", () => {
+    const h0 = harness();
+    seed(h0, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
+    h0.store.markUntrusted("lost");
+    const h = harness();
+    h.registry.add("task:s1"); h.sdk.add("task:s1");
+    h.service.start();
+    expect(h.store.read().untrusted).toBeUndefined();
+  });
+
   it("keeps a new task off the ids of task conversations the lost table no longer knows", () => {
     const h = harness();
     h.registry.add("task:s3");
@@ -589,7 +795,7 @@ describe("SubsessionService start: restart recovery and reconcile", () => {
     const id = seed(h, "waiting-external");
     h.service.start();
     await flush();
-    expect(h.turns[0].prompt).toContain("check-back was lost");
+    expect(h.turns[0].prompt).toContain("check-back is missing");
     expect(h.store.get(id)?.status).toBe("finished");
   });
 

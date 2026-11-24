@@ -47,6 +47,12 @@ export interface SubsessionServiceDeps {
   noticeToScope(parentKey: string, text: OwnerText): Promise<void>;
   queuePendingNote(key: string, note: string): boolean;
   hasPendingNote(key: string, predicate: (note: string) => boolean): boolean;
+  /**
+   * Write the session's pending notes (queued and in flight) to disk again.
+   * A note whose first write failed is still held in memory, so finding it
+   * there does not mean it is durable. Returns false when the write fails.
+   */
+  persistPendingNotes?(key: string): boolean;
   /** A harness notice to the owner's own chat (no task to attribute it to). */
   noticeOwner(text: OwnerText): Promise<void>;
   /** A silent turn on the owning session that reads the notes queued for it. */
@@ -73,6 +79,8 @@ export const STOP_TIMEOUT_MS = 30_000;
 export const FINISHED_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
 export const ENDED_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
+/** A task parked while the cron store could not be read: how soon it is looked at again. */
+export const CRON_RECHECK_MS = 60_000;
 export const MAX_INTERRUPT_STREAK = 3;
 export const MAX_TURNS_WITHOUT_PROGRESS = 3;
 export const MAX_FAIL_STREAK = 2;
@@ -126,6 +134,9 @@ export class SubsessionService {
   private sweepTimer?: NodeJS.Timeout;
   private readonly reportTimers = new Map<string, NodeJS.Timeout>();
   private readonly reportAttempts = new Map<string, number>();
+  /** Reports whose note write failed: the note may sit in memory only. */
+  private readonly unpersistedReports = new Set<string>();
+  private cronRecheckTimer?: NodeJS.Timeout;
   private started = false;
   /** The table could not be read at start: the feature stays off until the next start. */
   private broken = false;
@@ -380,17 +391,22 @@ export class SubsessionService {
   start(): void {
     if (this.started || !this.deps.config().enabled) return;
     this.started = true;
+    let startState: ReturnType<SubsessionStore["state"]>;
     try {
       this.store.read();
+      // Captured before anything below writes: a write turns "recovered" or
+      // "missing" into "ok", and reconcile must judge the table as it was read.
+      startState = this.store.state();
     } catch (err) {
       this.broken = true;
       log.error({ err, path: this.store.path }, "Sub-session table unreadable; sub-sessions are off until it is repaired. Nothing was unlinked or cancelled.");
       void this.noticeOwner(ownerT("subsessions")("tableUnreadable"));
       return;
     }
-    this.safely(() => this.recoverInflight(), "in-flight input recovery");
-    this.safely(() => this.reconcile(), "reconcile");
-    this.safely(() => this.recoverFromRestart(), "restart recovery");
+    let cutShort = new Set<string>();
+    this.safely(() => { cutShort = this.recoverInflight(); }, "in-flight input recovery");
+    this.safely(() => this.reconcile(startState), "reconcile");
+    this.safely(() => this.recoverFromRestart(cutShort), "restart recovery");
     this.safely(() => this.sweep(), "sweep");
     this.schedule();
     // A finished task that still owes an answer (its turn was cut short) has
@@ -410,6 +426,9 @@ export class SubsessionService {
     for (const timer of this.reportTimers.values()) clearTimeout(timer);
     this.reportTimers.clear();
     this.reportAttempts.clear();
+    this.unpersistedReports.clear();
+    if (this.cronRecheckTimer) clearTimeout(this.cronRecheckTimer);
+    this.cronRecheckTimer = undefined;
   }
 
   /**
@@ -418,15 +437,18 @@ export class SubsessionService {
    * it only after a completed turn) and go out again, marked as possibly
    * seen, so the task checks before acting on them twice.
    */
-  private recoverInflight(): void {
+  private recoverInflight(): Set<string> {
+    const cutShort = new Set<string>();
     for (const task of this.store.list()) {
       if (task.inflightInputs === 0) continue;
+      cutShort.add(task.id);
       log.warn({ id: task.id, inputs: task.inflightInputs }, "Sub-session turn was cut short with inputs in flight; redelivering them");
       this.store.update(task.id, (r) => {
         r.redeliveredInputs = Math.min(r.pendingInput.length, Math.max(r.redeliveredInputs, r.inflightInputs));
         r.inflightInputs = 0;
       });
     }
+    return cutShort;
   }
 
   /**
@@ -435,23 +457,33 @@ export class SubsessionService {
    * table read cleanly AND holds tasks: an empty or recovered table next to
    * task entries in the registry is a lost table, not a cleanup.
    */
-  private reconcile(): void {
+  private reconcile(startState: ReturnType<SubsessionStore["state"]>): void {
     const table = this.store.read();
-    const state = this.store.state();
     const known = new Set(table.tasks.map((t) => t.sessionKey));
     const orphans = this.deps.registryTaskKeys().filter((k) => !known.has(k));
-    if (orphans.length > 0) {
+    if (orphans.length === 0) {
+      if (table.untrusted) {
+        log.info({ since: table.untrusted.since, reason: table.untrusted.reason }, "Every registry task session is known to the task table again; trusting it");
+        this.store.clearUntrusted();
+      }
+    } else {
       // Whatever happens to them, no new task may take one of their ids.
       const highest = Math.max(0, ...orphans.map(taskNumber));
       if (highest >= table.nextId) this.store.reserveIdsThrough(highest);
-      if (state === "ok" && table.tasks.length > 0) {
+      // "ok" as it was READ at start, and never recovered or lost since (the
+      // mark survives every write and restart): a table recovered from an
+      // older backup is "ok" on disk after its first write.
+      const trusted = startState === "ok" && !table.untrusted && table.tasks.length > 0;
+      if (trusted) {
         for (const key of orphans) {
           log.warn({ key }, "Registry has a task session the task table does not know; unlinking it");
           this.safely(() => this.deps.unlinkRegistryEntry(key), "unlink orphan");
         }
       } else {
-        log.error({ orphans, state, tasks: table.tasks.length }, "Task table looks lost or recovered while the registry has task sessions; unlinking nothing");
-        void this.noticeOwner(ownerT("subsessions")("tableLost", { count: orphans.length }));
+        log.error({ orphans, startState, untrusted: table.untrusted, tasks: table.tasks.length }, "Task table looks lost or recovered while the registry has task sessions; unlinking nothing");
+        // Told once per loss: a later start finds the mark and stays quiet.
+        if (!table.untrusted || startState === "recovered") void this.noticeOwner(ownerT("subsessions")("tableLost", { count: orphans.length }));
+        if (!table.untrusted) this.store.markUntrusted(startState === "recovered" ? "recovered" : "lost");
       }
     }
     for (const task of this.store.list()) {
@@ -460,36 +492,72 @@ export class SubsessionService {
         if (this.deps.cronJobCount(task.sessionKey) !== 0) this.safely(() => this.deps.removeCronJobs(task.sessionKey), "remove cron jobs");
       }
       if (task.status === "finished" && !task.reportDelivered) this.deliverReport(task);
+      else if (task.status === "finished" && this.reportNotePending(task)) {
+        // Delivered, and its note still unread: the wake that was queued for
+        // it lived in memory and may have died with the process. The note is
+        // on disk, so the wake is owed again.
+        this.wakeForReport(task);
+      }
       if (OPEN_STATUSES.has(task.status) && !this.deps.hasSdkSession(task.sessionKey)) {
-        if (task.startDelivered) {
-          // A turn completed, so there was a conversation, and the registry
-          // came back without its link: it cannot resume, and starting it
-          // over would repeat side effects.
+        if (task.startDelivered || task.startDispatched) {
+          // A turn ran (completed, or handed to the SDK and cut short), so it
+          // may have done things, and the registry came back without its
+          // conversation: it cannot resume, and starting it over without that
+          // history could repeat what it did.
           const failed = this.store.transition(task.id, "fail", { reason: "its conversation could not be found after a restart" });
           if (failed.ok) this.reportFailure(failed.record, ownerT("subsessions")("failedNoSession", { id: task.id, title: task.title }));
           continue;
         }
-        // No turn ever completed (the daemon stopped before or during the
-        // first one): nothing to lose. It starts again, with the resume
-        // warning when a turn may have begun (restart recovery sets it).
+        // The first turn was never handed to the SDK (the daemon stopped
+        // between the start and the dispatch): nothing ran, so nothing to lose.
         this.safely(() => this.deps.ensureRegistryEntry(task.sessionKey), "registry entry");
       }
-      if (task.status === "waiting" && task.waitingOn === "external" && this.deps.cronJobCount(task.sessionKey) === 0) {
-        // The check-back job is gone (the cron store is not fsynced): let the
-        // task run again and schedule a new one itself.
-        this.store.transition(task.id, "cron_wake", {
-          reason: "its check-back job was missing after a restart",
-          patch: (r) => { r.pendingInput.push(formatTomoEvent("subsession-continue", "Your scheduled check-back was lost in a restart. Check on what you were waiting for, and schedule a new check-back if you still need to wait.")); },
-        });
-      }
     }
+    this.checkExternalWaits("after a restart");
+  }
+
+  /**
+   * A task waiting on its check-back whose job is gone (the cron store is
+   * not fsynced, or was unreadable when the task parked) would wait forever:
+   * let it run again and schedule a new one itself. A store that still
+   * cannot be read is looked at again shortly, in this process.
+   */
+  private checkExternalWaits(when: string): void {
+    let unknown = false;
+    for (const task of this.store.list()) {
+      if (task.status !== "waiting" || task.waitingOn !== "external") continue;
+      const jobs = this.deps.cronJobCount(task.sessionKey);
+      if (jobs === undefined) { unknown = true; continue; }
+      if (jobs > 0) continue;
+      this.store.transition(task.id, "cron_wake", {
+        reason: `its check-back job was missing ${when}`,
+        guard: inputQueueFull,
+        patch: (r) => { r.pendingInput.push(formatTomoEvent("subsession-continue", "Your scheduled check-back is missing (lost in a restart, or never saved). Check on what you were waiting for, and schedule a new check-back if you still need to wait.")); },
+      });
+    }
+    if (unknown) this.armCronRecheck();
+    this.schedule();
+  }
+
+  private armCronRecheck(): void {
+    if (this.cronRecheckTimer || this.deps.isStopping()) return;
+    this.cronRecheckTimer = setTimeout(() => {
+      this.cronRecheckTimer = undefined;
+      this.safely(() => this.checkExternalWaits("once the cron store could be read again"), "cron recheck");
+    }, CRON_RECHECK_MS);
+    this.cronRecheckTimer.unref?.();
   }
 
   /** Active at shutdown: resume through the scheduler, unless the task asked for the restart itself. */
-  private recoverFromRestart(): void {
+  private recoverFromRestart(cutShort: ReadonlySet<string>): void {
     for (const task of this.store.list()) {
-      if (task.status !== "active") continue;
-      if (task.restartRequested) {
+      // Waiting with a turn cut short (it asked the owner, or paused, and the
+      // turn never completed): its inputs are owed that turn, and nothing
+      // autonomous wakes waiting(owner). It resumes like an active task.
+      const waitingCutShort = task.status === "waiting"
+        && (cutShort.has(task.id) || (task.startDispatched && !task.startDelivered));
+      if (task.status !== "active" && !waitingCutShort) continue;
+      if (task.restartRequested && !waitingCutShort) {
         const outcome = this.store.transition(task.id, "self_restart", {
           reason: "it restarted Tomo itself",
           patch: (r) => { r.restartRequested = false; },
@@ -502,9 +570,9 @@ export class SubsessionService {
         if (failed.ok) this.reportFailure(failed.record, ownerT("subsessions")("failedInterrupted", { id: task.id, title: task.title, restarts: MAX_INTERRUPT_STREAK + 1 }));
         continue;
       }
-      this.store.transition(task.id, "restart", {
-        reason: "Tomo restarted",
-        patch: (r) => { r.resumeNeeded = true; r.interruptStreak += 1; },
+      this.store.transition(task.id, waitingCutShort ? "recover_cut_short" : "restart", {
+        reason: waitingCutShort ? "Tomo restarted before its last turn completed" : "Tomo restarted",
+        patch: (r) => { r.resumeNeeded = true; r.interruptStreak += 1; r.restartRequested = false; },
       });
     }
   }
@@ -600,7 +668,12 @@ export class SubsessionService {
       const turn = this.plan(record);
       if (!turn) return;
       // Marked, never removed: they leave the record when this turn completes.
-      if (turn.inputs.length > 0) this.store.update(id, (r) => { r.inflightInputs = turn.inputs.length; });
+      if (turn.inputs.length > 0 || turn.start) {
+        this.store.update(id, (r) => {
+          r.inflightInputs = turn.inputs.length;
+          if (turn.start) r.startDispatched = true;
+        });
+      }
       if (turn.kind === "continue") this.continueOwed.delete(id);
       this.toolCalls.delete(id);
       this.progressChanged.delete(id);
@@ -740,6 +813,7 @@ export class SubsessionService {
         guard: hasPendingInput,
       });
       if (!waited.ok && waited.refused) return;
+      if (jobs === undefined) this.armCronRecheck();
       this.continueOwed.delete(id);
       this.schedule();
       return;
@@ -779,8 +853,18 @@ export class SubsessionService {
    * redelivery can meet the normal one).
    */
   private deliverReport(record: SubsessionRecord): void {
-    const marker = `<tomo-event type="subsession-report" name="${record.id}"`;
-    const present = this.deps.hasPendingNote(record.parentKey, (n) => n.includes(marker));
+    let present = this.reportNotePending(record);
+    if (present && this.unpersistedReports.has(record.id)) {
+      // The note found is our own, held in memory after its write failed: it
+      // is not durable until a write succeeds.
+      if (!this.deps.persistPendingNotes?.(record.parentKey)) {
+        if (!this.deps.persistPendingNotes) present = false;
+        else {
+          this.retryReport(record.id);
+          return;
+        }
+      }
+    }
     if (!present) {
       const report = record.report ?? "";
       const excerpt = report.length > REPORT_NOTE_EXCERPT ? `${report.slice(0, REPORT_NOTE_EXCERPT - 1)}…` : report;
@@ -789,17 +873,29 @@ export class SubsessionService {
         excerpt,
       ].join("\n"), { name: record.id });
       if (!this.deps.queuePendingNote(record.parentKey, note)) {
+        this.unpersistedReports.add(record.id);
         this.retryReport(record.id);
         return;
       }
     }
+    this.unpersistedReports.delete(record.id);
     this.clearReportRetry(record.id);
-    // Wake first, then mark: a crash between the two redelivers (the note is
-    // not queued twice) rather than leaving a note nobody is woken to read.
+    // Wake first, then mark. The wake itself is in memory; what makes it
+    // durable is the note: every start wakes the owning session again for a
+    // delivered report whose note is still unread (see reconcile).
+    this.wakeForReport(record);
+    this.safely(() => this.store.update(record.id, (r) => { r.reportDelivered = true; }), "mark report delivered");
+  }
+
+  private reportNotePending(record: SubsessionRecord): boolean {
+    const marker = `<tomo-event type="subsession-report" name="${record.id}"`;
+    return this.deps.hasPendingNote(record.parentKey, (n) => n.includes(marker));
+  }
+
+  private wakeForReport(record: SubsessionRecord): void {
     this.deps.wakeScope(record.parentKey, formatTomoEvent("subsession-report",
       "A sub-session finished; its report is in a note above. Tell the owner the result in a few lines, in your own words, and read the full report with task_status if they will want details. Decide what, if anything, belongs in memory.",
       { name: "check" }));
-    this.safely(() => this.store.update(record.id, (r) => { r.reportDelivered = true; }), "mark report delivered");
   }
 
   /** The report note could not be written: try again in-process, a few times, then on the next start. */

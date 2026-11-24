@@ -30,6 +30,7 @@ export const SUBSESSION_EVENTS = [
   "background_report",
   "restart",
   "self_restart",
+  "recover_cut_short",
   "cancel",
   "fail",
   "archive",
@@ -84,6 +85,11 @@ export function nextStatus(status: SubsessionStatus, waitingOn: WaitingOn | unde
       return status === "queued" || status === "active" || status === "finished" ? "same" : null;
     case "restart":
       return status === "active" ? QUEUED : null;
+    case "recover_cut_short":
+      // Not a wake: the task's own turn moved it to waiting (task_ask, a
+      // pause) and a crash cut that turn short. Its inputs are still owed a
+      // completed turn, and only restart recovery sends this.
+      return waiting ? QUEUED : null;
     case "self_restart":
       return status === "active" ? WAIT_OWNER : null;
     case "cancel":

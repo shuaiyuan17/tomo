@@ -106,6 +106,12 @@ export interface SubsessionRecord {
    */
   inflightInputs: number;
   /**
+   * The first turn was handed to the SDK. With `startDelivered` false, it was
+   * cut short: it may have done things, so without its conversation the task
+   * cannot be started over safely.
+   */
+  startDispatched: boolean;
+  /**
    * The first N entries of pendingInput already went out once, in a turn a
    * restart cut short: the task may have acted on them. The next turn says so.
    */
@@ -121,6 +127,14 @@ export interface SubsessionTable {
   /** Next numeric id (s<nextId>). Never reused, across every scope. */
   nextId: number;
   tasks: SubsessionRecord[];
+  /**
+   * Set when this table may be missing tasks: it was recovered from `.bak`,
+   * or it was missing while the registry held task sessions. Kept across
+   * every write and restart, so no later start unlinks a registry entry the
+   * table does not know (it may be a task the lost table had). Cleared once
+   * no such entry is left.
+   */
+  untrusted?: { since: number; reason: "recovered" | "lost" };
 }
 
 export const SENT_KEEP = 20;

@@ -504,6 +504,7 @@ export class Agent {
       noticeOwner: async (text) => { await this.notifyOwner(text); },
       queuePendingNote: (key, note) => this.queuePendingNote(key, note),
       hasPendingNote: (key, predicate) => this.pendingNotesQueue.hasNote(key, predicate),
+      persistPendingNotes: (key) => this.pendingNotesQueue.persistNow(key),
       wakeScope: (parentKey, prompt) => {
         const body = appendToTomoEventBody(prompt, CONTINUITY_DELIVERY_NOTE);
         this.enqueueForSession(parentKey, () => this.processContinuity(body, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionReport"), "background"))

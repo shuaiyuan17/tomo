@@ -137,6 +137,7 @@ export class SubsessionStore {
         pendingInput: [],
         inflightInputs: 0,
         redeliveredInputs: 0,
+        startDispatched: false,
         sent: [],
         transitions: [{ at: now, from: null, to: "queued", event: "spawn" }],
       };
@@ -265,7 +266,7 @@ export class SubsessionStore {
       const backup = readTable(this.backupPath);
       if (backup.kind === "ok") {
         log.warn({ path: this.path }, "Sub-session table missing; recovered from its backup");
-        return this.remember(backup.table, "recovered");
+        return this.remember(this.untrust(backup.table), "recovered");
       }
       if (backup.kind === "missing") return this.remember(EMPTY(), "missing");
       // No primary, and a backup that exists but cannot be read: there WAS a
@@ -280,10 +281,26 @@ export class SubsessionStore {
       const corrupt = `${this.path}.corrupt-${this.now()}`;
       try { copyFileSync(this.path, corrupt); } catch (err) { log.warn({ err, corrupt }, "Could not keep a copy of the unreadable sub-session table"); }
       log.error({ path: this.path, cause: primary.cause, corrupt }, "Sub-session table unreadable; recovered from its backup");
-      return this.remember(backup.table, "recovered");
+      return this.remember(this.untrust(backup.table), "recovered");
     }
     this.lastState = "unreadable";
     throw new SubsessionStoreError(`Sub-session table ${this.path} is unreadable and has no usable backup`, primary.cause);
+  }
+
+  /** A table read from `.bak` may be missing tasks: it says so from here on, in every write. */
+  private untrust(table: SubsessionTable): SubsessionTable {
+    if (!table.untrusted) table.untrusted = { since: this.now(), reason: "recovered" };
+    return table;
+  }
+
+  /** Mark the table as possibly missing tasks (see `SubsessionTable.untrusted`). */
+  markUntrusted(reason: "recovered" | "lost"): void {
+    this.mutate((table) => { if (!table.untrusted) table.untrusted = { since: this.now(), reason }; });
+  }
+
+  /** Nothing left to protect: every registry task session is one the table knows. */
+  clearUntrusted(): void {
+    this.mutate((table) => { delete table.untrusted; });
   }
 
   private remember(table: SubsessionTable, state: SubsessionStoreState): SubsessionTable {
@@ -339,7 +356,17 @@ export function parseTable(raw: unknown): SubsessionTable {
   if (typeof t.nextId !== "number" || !Number.isInteger(t.nextId) || t.nextId < 1) throw new Error("bad nextId");
   if (!Array.isArray(t.tasks)) throw new Error("tasks is not an array");
   const tasks = t.tasks.map((entry, i) => parseRecord(entry, i));
-  return { version: 1, nextId: t.nextId, tasks };
+  const untrusted = parseUntrusted(t.untrusted);
+  return { version: 1, nextId: t.nextId, tasks, ...(untrusted ? { untrusted } : {}) };
+}
+
+function parseUntrusted(raw: unknown): SubsessionTable["untrusted"] {
+  if (raw === undefined) return undefined;
+  const u = raw as Record<string, unknown> | null;
+  // Present but malformed still means "do not trust": never dropped silently.
+  const since = u && typeof u.since === "number" && Number.isFinite(u.since) ? u.since : 0;
+  const reason = u && u.reason === "lost" ? "lost" : "recovered";
+  return { since, reason };
 }
 
 function parseRecord(raw: unknown, index: number): SubsessionRecord {
@@ -378,6 +405,7 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
     pendingInput,
     inflightInputs: Math.min(pendingInput.length, Math.max(0, Math.floor(num("inflightInputs", 0)))),
     redeliveredInputs: Math.min(pendingInput.length, Math.max(0, Math.floor(num("redeliveredInputs", 0)))),
+    startDispatched: r.startDispatched === true,
     sent: Array.isArray(r.sent) ? r.sent as SubsessionRecord["sent"] : [],
     transitions: Array.isArray(r.transitions) ? r.transitions as SubsessionRecord["transitions"] : [],
   };

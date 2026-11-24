@@ -29,6 +29,7 @@ const EXPECTED: Record<SubsessionEvent, Record<State, string>> = {
   background_report: { queued: "=", active: "=", "waiting(owner)": "=", "waiting(external)": "queued", finished: "=", cancelled: "-", failed: "-", archived: "-" },
   restart:           { queued: "-", active: "queued", "waiting(owner)": "-", "waiting(external)": "-", finished: "-", cancelled: "-", failed: "-", archived: "-" },
   self_restart:      { queued: "-", active: "waiting(owner)", "waiting(owner)": "-", "waiting(external)": "-", finished: "-", cancelled: "-", failed: "-", archived: "-" },
+  recover_cut_short: { queued: "-", active: "-", "waiting(owner)": "queued", "waiting(external)": "queued", finished: "-", cancelled: "-", failed: "-", archived: "-" },
   cancel:            { queued: "cancelled", active: "cancelled", "waiting(owner)": "cancelled", "waiting(external)": "cancelled", finished: "cancelled", cancelled: "=", failed: "-", archived: "-" },
   fail:              { queued: "failed", active: "failed", "waiting(owner)": "failed", "waiting(external)": "failed", finished: "failed", cancelled: "-", failed: "-", archived: "-" },
   archive:           { queued: "-", active: "-", "waiting(owner)": "-", "waiting(external)": "-", finished: "archived", cancelled: "-", failed: "-", archived: "-" },

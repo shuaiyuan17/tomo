@@ -131,6 +131,13 @@ export class PendingNotesQueue {
     }
   }
 
+  /** Write the session's notes to disk again (after a failed write left
+   *  them in memory only). Returns false when the write fails. */
+  persistNow(sessionKey: string): boolean {
+    this.queued(sessionKey);
+    return this.persist(sessionKey);
+  }
+
   /** Queue a note for the session's next turn. Returns false when it could
    *  not be persisted (it is still held in memory for this process). */
   queueNote(sessionKey: string, note: string): boolean {

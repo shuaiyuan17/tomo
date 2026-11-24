@@ -1,5 +1,5 @@
 import { log } from "../logger.js";
-import { formatTomoEvent } from "../tomo-event.js";
+import { formatTomoEvent, isOwnerAudienceNote } from "../tomo-event.js";
 
 export interface DurablePendingNotesStore {
   getPendingNotes(key: string): string[];
@@ -39,11 +39,17 @@ function capErrorNotes(notes: ErrorNote[]): ErrorNote[] {
  * Notes the cap never drops: a durable-inbox `replay`/`interrupted` note is
  * the only remaining copy of a message (its inbox record is already done), so
  * losing it to the cap would lose the message. Same for an
- * `interrupted-agents` note: its ledger entry is already gone.
+ * `interrupted-agents` note: its ledger entry is already gone. And a
+ * `subsession-report` note: the task record says the report was delivered
+ * once the note is on disk.
  */
 function isPinnedNote(note: string): boolean {
   // `includes`, not `startsWith`: an interrupted note carries the marker first.
-  return note.includes('<tomo-event type="inbox"') || note.includes('<tomo-event type="interrupted-agents"');
+  return note.includes('<tomo-event type="inbox"')
+    || note.includes('<tomo-event type="interrupted-agents"')
+    || note.includes('<tomo-event type="subsession-report"')
+    // A failed task's unanswered messages: the record is forgotten once this is on disk.
+    || note.includes('<tomo-event type="subsession-handback"');
 }
 
 /** Drop oldest unpinned notes until `arr` fits the cap (pinned ones always stay). */
@@ -127,6 +133,13 @@ export class PendingNotesQueue {
     }
   }
 
+  /** Write the session's notes to disk again (after a failed write left
+   *  them in memory only). Returns false when the write fails. */
+  persistNow(sessionKey: string): boolean {
+    this.queued(sessionKey);
+    return this.persist(sessionKey);
+  }
+
   /** Queue a note for the session's next turn. Returns false when it could
    *  not be persisted (it is still held in memory for this process). */
   queueNote(sessionKey: string, note: string): boolean {
@@ -148,10 +161,13 @@ export class PendingNotesQueue {
    * in the durable store until {@link settle} (or {@link restore}) is called
    * with the same prefix.
    */
-  drain(sessionKey: string): string {
+  drain(sessionKey: string, opts: { holdOwnerAudience?: boolean } = {}): string {
     const notes = this.queued(sessionKey);
-    const drained = [...notes];
-    this.notes.set(sessionKey, []);
+    // A turn that is not the owner's own (a summoned group on the owner's
+    // session) gets no owner-only note: those stay queued for the next one.
+    const held = opts.holdOwnerAudience ? notes.filter(isOwnerAudienceNote) : [];
+    const drained = held.length > 0 ? notes.filter((n) => !isOwnerAudienceNote(n)) : [...notes];
+    this.notes.set(sessionKey, held);
 
     const errorNotes = this.errorNotes.get(sessionKey) ?? [];
     const parts = [...drained];
@@ -246,6 +262,12 @@ export class PendingNotesQueue {
     // while in flight. Capping now would drop exactly them (they are the
     // oldest) in favour of notes queued during the turn.
     if (!this.persist(sessionKey)) log.warn({ sessionKey }, "Could not persist restored pending notes");
+  }
+
+  /** Is a note matching `predicate` queued or in flight for the session? */
+  hasNote(sessionKey: string, predicate: (note: string) => boolean): boolean {
+    if (this.queued(sessionKey).some(predicate)) return true;
+    return (this.inflight.get(sessionKey) ?? []).some((b) => b.notes.some(predicate));
   }
 
   /** Test/support helper for observing queued durable notes without draining. */

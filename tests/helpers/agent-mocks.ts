@@ -455,6 +455,9 @@ export const mockConfig = {
     server: { type: "http"; url: string };
     oauth?: { clientId?: string; scopes: string[]; tokenStoreKey: string };
   }>,
+  /** Sub-sessions on, as by default (src/config.ts DEFAULT_SUBSESSIONS), so
+   *  every agent test runs with them; tests/subsessions-agent.test.ts also turns them off. */
+  subsessions: { enabled: true, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null as string | null, maxActiveHours: 24 },
   lcm: {
     nudgeAtPct: 70,
     nudgeResetPct: 60,
@@ -484,6 +487,8 @@ export function configModuleMock() {
     get CONFIG_BACKUP_PATH() { return agentEnv.configBackupPath; },
     TOMO_HOME: "/tmp/tomo-mock",
     get RESTART_REASON_FILE() { return agentEnv.restartReasonFilePath; },
+    // The sub-session tools' schema reads it (owner turns build them when sub-sessions are on).
+    EFFORT_LEVELS: ["low", "medium", "high", "xhigh", "max"] as const,
   };
 }
 

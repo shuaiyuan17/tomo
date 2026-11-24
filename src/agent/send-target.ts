@@ -1,4 +1,4 @@
-import { dmSessionKeyForIdentity, isDmSessionKey } from "../sessions/keys.js";
+import { dmSessionKeyForIdentity, isDmSessionKey, isTaskSessionKey } from "../sessions/keys.js";
 import { isOwnerHandle, ownerSessionKey, type OwnerConfig } from "../owner.js";
 
 /**
@@ -32,6 +32,8 @@ export interface NormalizedSendTarget {
  *   key would split the conversation's history across two transcripts and
  *   hide the sent message from `recall_conversation` (#203). Other raw keys
  *   (groups, other chats) are returned unchanged.
+ * - **`task:<id>` key**: `null`. A sub-session has no chat to send to; the
+ *   owner talks to one through the task tools, never `send_message`.
  */
 export function normalizeSendTarget(
   target: string,
@@ -47,6 +49,7 @@ export function normalizeSendTarget(
   if (isDmSessionKey(target)) {
     return { sessionKey: dmSessionKeyForIdentity(target.slice(3)) };
   }
+  if (isTaskSessionKey(target)) return null;
 
   const sep = target.indexOf(":");
   const channelName = target.slice(0, sep);

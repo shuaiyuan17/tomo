@@ -20,6 +20,7 @@ import { CompactReservations, type BackgroundState, type ReserveResult } from ".
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage, UsageBaseline } from "../sessions/types.js";
+import { isTaskSessionKey } from "../sessions/keys.js";
 import type { UsageLedgerRow } from "../usage/ledger.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, TurnInterruptedError, type McpAuthRefreshOutcome, type QueryResult, type ReplyContext, type TurnRequest } from "./live-session.js";
@@ -192,6 +193,13 @@ export interface LiveSessionManagerDeps {
   /** Group metadata snapshot for the system prompt — undefined for non-groups. */
   buildGroupContext(key: string): SessionContext["group"];
   /**
+   * A sub-session's own prompt and limits — undefined for every other key.
+   * Such a session gets no MEMORY.md / roster snapshot (its prompt has
+   * neither), so it never takes memory-change notes, and an identity-prompt
+   * change does not retire it (its prompt does not include the identity).
+   */
+  subsessionContext?(key: string): SessionContext["subsession"];
+  /**
    * Does the turn currently in flight on `key` belong to that session?
    * (`Agent.isOwnAudienceTurn`.) False while a summoned group is steering a
    * dm: session, and for a batch spanning several audiences. Read per tool
@@ -331,6 +339,11 @@ export class LiveSessionManager {
     this.informationalNotices = new InformationalNotices({
       notifyOwner: async (text) => (await this.deps.notifyOwner?.(text)) === true,
     });
+  }
+
+  /** The key has a live session in memory (its history is there; nothing to resume). */
+  hasLiveSession(key: string): boolean {
+    return this.liveSessions.get(key)?.isAlive() === true;
   }
 
   /** Is a live turn currently in flight on this session? (steering target check) */
@@ -744,6 +757,7 @@ export class LiveSessionManager {
         // A closing (reaped) entry is already on its way out; retiring it
         // would drop it from the map before its CLI has exited.
         if (this.promptStale.has(session) || this.closing.has(session)) continue;
+        if (isTaskSessionKey(key)) continue;
         this.markPromptStale(key, session);
       }
     }
@@ -955,9 +969,10 @@ export class LiveSessionManager {
     // The lines the prompt is built from, from the build itself: a second
     // read could see other files than the prompt did.
     let promptContext: PromptContextLines | undefined;
+    const subsession = this.deps.subsessionContext?.(key);
     const opts = sdkOptions(internalMcpServer, resumeId ?? undefined, model, {
       sessionKey: key,
-      onPromptContext: (context) => { promptContext = context; },
+      ...(subsession ? { subsession } : { onPromptContext: (context: PromptContextLines) => { promptContext = context; } }),
       sdkSessionId: resumeId ?? undefined,
       group: this.deps.buildGroupContext(key),
       isOwnAudienceTurn: () => this.deps.isOwnAudienceTurn(key),

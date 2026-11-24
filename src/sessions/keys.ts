@@ -9,6 +9,51 @@ export function isDmSessionKey(key: string): boolean {
   return key.startsWith("dm:");
 }
 
+/**
+ * Sub-session keys: `task:<id>`, where `<id>` is the short id the sub-session
+ * store hands out (`s1`, `s2`, …). Ids are unique across every owning scope;
+ * which session opened the task lives only in the task record (`parentKey`),
+ * never in the key. A task key is neither a DM nor a channel conversation: it
+ * has no chat of its own, so no reply target can be derived from it.
+ */
+export const TASK_SESSION_KEY_PREFIX = "task:";
+
+export function isTaskSessionKey(key: string): boolean {
+  return key.startsWith(TASK_SESSION_KEY_PREFIX);
+}
+
+export function taskSessionKey(id: string): string {
+  return `${TASK_SESSION_KEY_PREFIX}${id}`;
+}
+
+const TASK_ID_RE = /^s[1-9][0-9]*$/;
+
+/** The short ids the sub-session store hands out: `s1`, `s2`, … */
+export function isWellFormedTaskId(id: string): boolean {
+  return TASK_ID_RE.test(id);
+}
+
+export function taskIdFromSessionKey(key: string): string | undefined {
+  if (!isTaskSessionKey(key)) return undefined;
+  const id = key.slice(TASK_SESSION_KEY_PREFIX.length);
+  return isWellFormedTaskId(id) ? id : undefined;
+}
+
+export type SessionKind = "owner-dm" | "group" | "task" | "raw";
+
+/**
+ * The one classification of a session key. `raw` is a `<channel>:<chatId>`
+ * key that is not a group (legacy per-channel DM history). Decisions that
+ * need a stance on every kind should switch on this rather than chain the
+ * individual predicates, so a new kind cannot fall through to "raw DM".
+ */
+export function sessionKind(key: string): SessionKind {
+  if (isDmSessionKey(key)) return "owner-dm";
+  if (isTaskSessionKey(key)) return "task";
+  if (isGroupSessionKey(key)) return "group";
+  return "raw";
+}
+
 /** Canonical dm key: `dm:` + a slug. Deliberately narrow — see below. */
 const CANONICAL_DM_KEY_RE = /^dm:[a-z0-9_-]+$/;
 
@@ -39,9 +84,9 @@ export function dmSessionKeyForIdentity(identityName: string): string {
   return `dm:${identityName.toLowerCase()}`;
 }
 
-/** Parse a raw "<channel>:<chatId>" session key. Returns undefined for dm: keys. */
+/** Parse a raw "<channel>:<chatId>" session key. Returns undefined for dm: and task: keys. */
 export function parseRawSessionKey(key: string): ParsedSessionKey | undefined {
-  if (isDmSessionKey(key)) return undefined;
+  if (isDmSessionKey(key) || isTaskSessionKey(key)) return undefined;
   const colonIdx = key.indexOf(":");
   if (colonIdx < 0) return undefined;
   const channelName = key.slice(0, colonIdx);

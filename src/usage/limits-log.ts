@@ -153,6 +153,22 @@ const LIMITS_TAIL_BYTES = 256 * 1024;
  * undefined when there is none or the file cannot be read.
  */
 export function readLatestLimitSample(path: string): LimitSample | undefined {
+  let samples: LimitSample[];
+  try {
+    samples = readTailSamples(path);
+  } catch {
+    return undefined;
+  }
+  let fallback: LimitSample | undefined;
+  for (const sample of samples) {
+    if (sample.source === "oauth-usage") return sample;
+    fallback ??= sample;
+  }
+  return fallback;
+}
+
+/** The well-formed samples in the file's tail, newest first. [] for no file; throws when it cannot be read. */
+function readTailSamples(path: string): LimitSample[] {
   let text: string;
   let fd: number | undefined;
   try {
@@ -167,19 +183,51 @@ export function readLatestLimitSample(path: string): LimitSample | undefined {
       read += n;
     }
     text = buffer.toString("utf8", 0, read);
-  } catch {
-    return undefined;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw err;
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
-  let fallback: LimitSample | undefined;
+  const out: LimitSample[] = [];
   const lines = text.split("\n");
   for (let i = lines.length - 1; i >= 0; i--) {
     let sample: LimitSample;
     try { sample = JSON.parse(lines[i]) as LimitSample; } catch { continue; }
     if (!sample || typeof sample.ts !== "string" || !Array.isArray(sample.windows)) continue;
-    if (sample.source === "oauth-usage") return sample;
-    fallback ??= sample;
+    out.push(sample);
   }
-  return fallback;
+  return out;
+}
+
+const FIVE_HOURS_MS = 5 * 60 * 60_000;
+
+/** The account-wide 5-hour window of a sample, if it has one with a reading. */
+function sessionWindow(sample: LimitSample): LimitWindowSample | undefined {
+  return sample.windows.find((w) => typeof w.percent === "number" && Number.isFinite(w.percent)
+    && (sample.source === "oauth-usage" ? w.group === "session" && !w.scoped : w.window === "five_hour"));
+}
+
+/**
+ * The share of the 5-hour window used (0–100), from the newest sample that
+ * speaks for it: an SDK rate_limit_event with a five_hour reading, or any
+ * `/api/oauth/usage` read (all windows at once: one with no 5-hour window
+ * says there is none in force, read as 0). A window that has reset since
+ * (its `resetsAt` is past, or the sample is older than five hours) reads 0.
+ * Undefined when no sample speaks for it (no file, API-key auth). Throws
+ * when the file exists but cannot be read.
+ */
+export function readSessionWindowPercent(path: string, now = Date.now()): number | undefined {
+  for (const sample of readTailSamples(path)) {
+    const window = sessionWindow(sample);
+    if (!window) {
+      if (sample.source === "oauth-usage") return 0;
+      continue;
+    }
+    const resetsAt = window.resetsAt ? Date.parse(window.resetsAt) : NaN;
+    const sampledAt = Date.parse(sample.ts);
+    if ((Number.isFinite(resetsAt) && resetsAt <= now) || (Number.isFinite(sampledAt) && now - sampledAt >= FIVE_HOURS_MS)) return 0;
+    return window.percent;
+  }
+  return undefined;
 }

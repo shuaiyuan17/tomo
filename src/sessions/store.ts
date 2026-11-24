@@ -1019,6 +1019,16 @@ export class SessionStore {
       .map((e) => [e.channelKey, e.sdkSessionId]);
   }
 
+  /**
+   * Whether the registry file reads right now. While it does not, every
+   * reader answers from the last good state (or an empty one), which must not
+   * be taken for the truth by a caller that acts on absence.
+   */
+  registryReadable(): boolean {
+    this.loadRegistry();
+    return this.registryLoadError === null;
+  }
+
   /** Active registry entries (linked sessions AND metadata-only stubs). */
   listActiveEntries(): SessionEntry[] {
     this.loadRegistry();

@@ -50,6 +50,15 @@ export type TomoEventType =
   | "credential"       // how a credential request ended (never carries a value)
   | "permission"       // how a group's request_permission ended
   | "memory"           // MEMORY.md / people roster lines changed since the session's prompt was built
+  | "subsession-start"    // a sub-session's first turn: brief + the owner's quoted words (name = task id)
+  | "subsession-resume"   // a restart cut a sub-session's work short (name = task id)
+  | "subsession-continue" // auto-continue turn of an active sub-session
+  | "subsession-relay"    // the owning session passing something to a sub-session
+  | "subsession-record"   // the task record, injected after a /compact (name = task id)
+  | "subsession-redelivery" // marks sub-session inputs sent again after a cut-short turn (at-least-once delivery)
+  | "subsession-report"   // a sub-session finished; told to its owning session (name = task id#report seq, e.g. s3#1)
+  | "subsession-activity" // something a sub-session said to the owner, told to its owning session (name = task id)
+  | "subsession-handback" // a failed sub-session's unanswered messages from the owner, in full (name = task id)
   | "note";            // bare harness aside with no producer of its own
                        //   (appendToTomoEventBody's fallback wrapper)
 
@@ -129,6 +138,27 @@ export function formatTomoEvent(type: TomoEventType, body: string, opts: TomoEve
   const name = opts.name !== undefined ? ` name="${escapeAttr(opts.name)}"` : "";
   const ts = isoTimestampWithOffset(opts.ts);
   return `${TOMO_EVENT_OPEN_TAG} type="${type}"${name} ts="${ts}">\n${escapeBody(body)}\n</tomo-event>`;
+}
+
+const OWNER_AUDIENCE_ATTR = ' audience="owner"';
+const LEADING_OPEN_TAG_RE = /^<tomo-event\b[^>]*>/;
+
+/**
+ * Mark a pending note as the owner's alone (a message the owner wrote to a
+ * sub-session, a task's words). Such a note is held back from a turn on the
+ * owner's session that is not the owner's own (a summoned group steering
+ * it), and waits for the owner's next turn. Only a note that starts with an
+ * envelope can be marked; anything else is returned unchanged.
+ */
+export function markOwnerAudience(note: string): string {
+  const m = LEADING_OPEN_TAG_RE.exec(note);
+  if (!m || m[0].includes(OWNER_AUDIENCE_ATTR)) return note;
+  return `${m[0].slice(0, -1)}${OWNER_AUDIENCE_ATTR}>${note.slice(m[0].length)}`;
+}
+
+/** Does the note carry the owner-only mark (anywhere in an opening tag, so an interrupted-note prefix does not hide it)? */
+export function isOwnerAudienceNote(note: string): boolean {
+  return /<tomo-event\b[^>]*\baudience="owner"/.test(note);
 }
 
 export interface ParsedTomoEvent {

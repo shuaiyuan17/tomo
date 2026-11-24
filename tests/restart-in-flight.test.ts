@@ -333,6 +333,20 @@ describe("a failed restart helper is reported once and frees the next restart", 
     expect(hoisted.spawnCalls).toHaveLength(1);
   });
 
+  it("withdraws the session's restart claim when the restart fails", () => {
+    const claims: string[] = [];
+    const coordinator = new RestartCoordinator({
+      isStopping: () => false,
+      queuePendingErrorNote: () => {},
+      onRestartClaimed: (key) => claims.push(`claimed ${key}`),
+      onRestartClaimFailed: (key) => claims.push(`withdrawn ${key}`),
+    });
+    file("dm:shuai", "first");
+    coordinator.handleTurnComplete("dm:shuai");
+    lastChild().emit("exit", 1, null);
+    expect(claims).toEqual(["claimed dm:shuai", "withdrawn dm:shuai"]);
+  });
+
   it("reports a missing CLI entry point without spawning, and frees the next restart", () => {
     const { notes, restart } = makeCoordinator();
     const argv1 = process.argv[1];

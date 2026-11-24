@@ -338,7 +338,43 @@ export interface TomoConfig {
   lcm: LcmConfig;
   metrics: MetricsConfig;
   todos: TodoConfig;
+  /** Sub-sessions (`task:<id>` sessions for long tasks, src/agent/subsessions/).
+   *  On by default. File key `subsessions: { enabled?, maxRunning?, ... }`. */
+  subsessions: SubsessionConfig;
 }
+
+export interface SubsessionConfig {
+  /** Off: no task tools, no task turns; existing task records are left alone. */
+  enabled: boolean;
+  /** Tasks working on their own at once; more wait as queued. Not a process cap:
+   *  a waiting or finished task still answers a message. Default 2. */
+  maxRunning: number;
+  /** Tasks not yet finished, cancelled or failed; task_spawn refuses beyond it. Default 5. */
+  maxOpen: number;
+  /** The SDK's maxTurns for a task session (0 = no limit). Default 200. */
+  maxTurns: number;
+  /** Between turns, a task whose context is over this many tokens is compacted
+   *  with `/compact`. Default 500000. */
+  maxContextTokens: number;
+  /** Model for a task that names none; unset follows `model`. */
+  defaultModel: string | null;
+  /**
+   * Hours a task may spend active (running turns) on its own before it is
+   * paused for the owner, counted since the owner's last word to it. 0 = no
+   * cap. Default 24.
+   */
+  maxActiveHours: number;
+}
+
+export const DEFAULT_SUBSESSIONS: SubsessionConfig = {
+  enabled: true,
+  maxRunning: 2,
+  maxOpen: 5,
+  maxTurns: 200,
+  maxContextTokens: 500_000,
+  defaultModel: null,
+  maxActiveHours: 24,
+};
 
 // ---------------------------------------------------------------------------
 // Validation plumbing
@@ -584,6 +620,21 @@ const DEFAULT_METRICS: MetricsConfig = {
   activityLog: true,
   includeMessageText: true,
 };
+
+/** Field by field: one bad value falls back alone. */
+function parseSubsessionConfig(raw: unknown): SubsessionConfig {
+  const entry = validated("subsessions", z.looseObject({}), raw, {}) as Record<string, unknown>;
+  return {
+    enabled: validated("subsessions.enabled", boolLike, entry.enabled, DEFAULT_SUBSESSIONS.enabled),
+    maxRunning: validated("subsessions.maxRunning", positiveInt, entry.maxRunning, DEFAULT_SUBSESSIONS.maxRunning),
+    maxOpen: validated("subsessions.maxOpen", positiveInt, entry.maxOpen, DEFAULT_SUBSESSIONS.maxOpen),
+    maxTurns: validated("subsessions.maxTurns", nonNegativeInt, entry.maxTurns, DEFAULT_SUBSESSIONS.maxTurns),
+    maxContextTokens: validated("subsessions.maxContextTokens", positiveInt, entry.maxContextTokens, DEFAULT_SUBSESSIONS.maxContextTokens),
+    defaultModel: validated("subsessions.defaultModel", z.string().trim().min(1, "expected a model name").nullable(),
+      entry.defaultModel ?? null, DEFAULT_SUBSESSIONS.defaultModel),
+    maxActiveHours: validated("subsessions.maxActiveHours", z.number().finite().min(0), entry.maxActiveHours, DEFAULT_SUBSESSIONS.maxActiveHours),
+  };
+}
 
 /** Field by field, like metrics: one bad number falls back alone. */
 function parseTodoConfig(raw: unknown): TodoConfig {
@@ -1107,6 +1158,7 @@ function buildConfig(): TomoConfig {
     lcm: validated("lcm", lcmSchema, file.lcm, DEFAULT_LCM),
     metrics: parseMetricsConfig(file.metrics),
     todos: parseTodoConfig(file.todos),
+    subsessions: parseSubsessionConfig(file.subsessions),
   };
 }
 

@@ -12,7 +12,8 @@ import { buildCredentialTools } from "./credential-tools.js";
 import { buildPermissionTools, PERMISSION_NO_GROUP, PERMISSION_NOT_SANDBOXED } from "./permission-tools.js";
 import { groupKeyFor, privateMemoryBarFor } from "../agent/private-memory-guard.js";
 import { buildTodoTools } from "./todo-tools.js";
-import { isDmSessionKey, isGroupSessionKey } from "../sessions/keys.js";
+import { isDmSessionKey, isGroupSessionKey, isTaskSessionKey } from "../sessions/keys.js";
+import { buildTaskOwnerTools, buildTaskSelfTools } from "./subsession-tools.js";
 import { ownerSessionKey } from "../owner.js";
 import { homeService } from "../home/service.js";
 
@@ -43,6 +44,8 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
   const isOwnAudience = (): boolean => agent.isOwnAudienceTurn(callerSessionKey);
   /** The owner's own DM session: the only one that gets Tomo's home. */
   const ownerSession = !!config.owner && callerSessionKey === ownerSessionKey(config.owner);
+
+  if (isTaskSessionKey(callerSessionKey)) return createSubsessionMcpServer(agent, callerSessionKey);
 
   return createSdkMcpServer({
     name: TOMO_INTERNAL_MCP_NAME,
@@ -304,6 +307,13 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       // dm: session, so the key alone would give the group the owner's scope.
       ...buildCronTools(undefined, () => agent.scopedCallerKey(callerSessionKey)),
       ...buildTodoTools({ caller: () => agent.scopedCallerKey(callerSessionKey) }),
+      // The owner's DM spawns and steers sub-sessions; a summoned group's turn
+      // on it may not (scope undefined). Group-scoped spawning is future work:
+      // the records already carry their owning scope (parentKey).
+      ...(ownerSession && agent.subsessions ? buildTaskOwnerTools({
+        service: () => agent.subsessions,
+        scope: () => (isOwnAudience() ? callerSessionKey : undefined),
+      }) : []),
       ...buildPetTools(),
       ...buildLcmTools({
         sdkSessionIdFor: () => agent.sdkSessionIdFor(callerSessionKey),
@@ -366,6 +376,31 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           return groupKey ? { groupKey } : { refusal: PERMISSION_NO_GROUP };
         },
       }),
+    ],
+  });
+}
+
+/**
+ * A sub-session's server: a whitelist, not the main set minus a few. It
+ * reports through its task_* tools, schedules check-backs on its own key,
+ * reads the people roster. No send_message (it speaks
+ * only to its owning scope, through task_notify), no memory or people writes,
+ * no todos, no home, no credentials.
+ */
+function createSubsessionMcpServer(agent: Agent, taskKey: string): McpSdkServerConfigWithInstance {
+  // Privacy follows the owning scope; unknown fails closed (as a group).
+  const groupScope = (): boolean => agent.isPrivateMemoryBarred(taskKey);
+  return createSdkMcpServer({
+    name: TOMO_INTERNAL_MCP_NAME,
+    version: "0.1.0",
+    tools: [
+      ...buildTaskSelfTools({ service: () => agent.subsessions, key: taskKey }),
+      // Bound to the task key: a task schedules check-backs on itself only.
+      ...buildCronTools(undefined, taskKey),
+      // No recall: a task's turns are not recorded in a Tomo transcript (its
+      // output never reaches a chat), so there is nothing to search; its
+      // record (task_status) and the SDK's own context are what it has.
+      ...buildPeopleTools({ includePrivate: () => !groupScope() }).filter((t) => t.name === "list_people"),
     ],
   });
 }

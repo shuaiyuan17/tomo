@@ -1,3 +1,6 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
@@ -110,6 +113,51 @@ describe("sdkOptions claude.ai connectors", () => {
     const dm = sdkOptions(internalServer, undefined, undefined, { sessionKey: "dm:shuai" });
     expect(dm.settings).not.toHaveProperty("disableClaudeAiConnectors");
     expect(sdkOptions(internalServer).settings).not.toHaveProperty("disableClaudeAiConnectors");
+  });
+});
+
+describe("sdkOptions sub-session (task:) sessions", () => {
+  const subsession = { staticPrompt: "task prompt", groupScope: false, maxTurns: 200 };
+  const external = { gmail: { type: "http", url: "https://example.invalid/mcp" } } as never;
+
+  it("loads no claude.ai connector and no external MCP server, even scoped to the owner's DM", () => {
+    resetConfig();
+    mockConfig.mcpServers = { gmail: { server: { type: "http", url: "https://example.invalid/mcp" } } } as never;
+    mockConfig.mcpAllowedTools = ["mcp__gmail__send"] as never;
+    // A plugin that carries its own .mcp.json.
+    const pluginDir = mkdtempSync(join(tmpdir(), "tomo-plugin-"));
+    mkdirSync(join(pluginDir, "skills"));
+    writeFileSync(join(pluginDir, ".mcp.json"), JSON.stringify({ mcpServers: { mail: { type: "http", url: "https://example.invalid/mcp" } } }));
+    mockConfig.plugins = [{ ref: pluginDir, isPath: true }];
+    try {
+      for (const opts of [
+        sdkOptions(internalServer, undefined, undefined, { sessionKey: "task:s1", subsession }),
+        sdkOptions(internalServer, undefined, undefined, { sessionKey: "task:s1", subsession }, undefined, external),
+        // A task key without its context still fails closed.
+        sdkOptions(internalServer, undefined, undefined, { sessionKey: "task:s1" }, undefined, external),
+      ]) {
+        expect((opts.settings as { disableClaudeAiConnectors?: boolean }).disableClaudeAiConnectors).toBe(true);
+        expect(Object.keys(opts.mcpServers)).toEqual(["tomo-internal"]);
+        expect(opts.allowedTools).not.toContain("mcp__gmail__send");
+        // The internal allowlist is unchanged.
+        expect(opts.allowedTools).toContain("mcp__tomo-internal__task_finish");
+        // Nothing the CLI discovers itself: no project/user MCP config, no plugin's MCP servers.
+        expect((opts as { strictMcpConfig?: boolean }).strictMcpConfig).toBe(true);
+        expect(opts.plugins).toEqual([{ type: "local", path: pluginDir, skipMcpDiscovery: true }]);
+      }
+      // The owner's DM keeps both.
+      const dm = sdkOptions(internalServer, undefined, undefined, { sessionKey: "dm:shuai" }, undefined, external);
+      expect(Object.keys(dm.mcpServers)).toContain("gmail");
+      expect(dm.settings).not.toHaveProperty("disableClaudeAiConnectors");
+      expect(dm).not.toHaveProperty("strictMcpConfig");
+      expect(dm.plugins).toEqual([{ type: "local", path: pluginDir }]);
+    } finally {
+      rmSync(pluginDir, { recursive: true, force: true });
+      mockConfig.plugins = [];
+      mockConfig.mcpServers = undefined;
+      mockConfig.mcpAllowedTools = undefined as never;
+      resetConfig();
+    }
   });
 });
 

@@ -17,6 +17,15 @@ export interface RestartCoordinatorDeps {
   /** True once `Agent.stop()` has begun: a stop outranks any restart. */
   isStopping(): boolean;
   queuePendingErrorNote(sessionKey: string, visibleError: string): void;
+  /**
+   * The restart of `sessionKey`'s request is about to be launched: called
+   * once, before the helper is spawned, so the session can record that the
+   * restart is its own (a sub-session then waits for the owner after it,
+   * instead of resuming into a loop).
+   */
+  onRestartClaimed?(sessionKey: string): void;
+  /** The restart claimed by `onRestartClaimed` did not happen: the claim is withdrawn. */
+  onRestartClaimFailed?(sessionKey: string): void;
 }
 
 /**
@@ -180,6 +189,13 @@ export class RestartCoordinator {
   }
 
   private launchAcknowledgedRestart(request: RestartRequest, initiator?: RestartInitiator): void {
+    if (request.sessionKey) {
+      try {
+        this.deps.onRestartClaimed?.(request.sessionKey);
+      } catch (err) {
+        log.warn({ err, sessionKey: request.sessionKey }, "Restart claim hook failed");
+      }
+    }
     const cliPath = process.argv[1];
     if (!cliPath) {
       this.reportScheduledRestartFailure(request.sessionKey, "CLI entry point is unavailable");
@@ -221,6 +237,13 @@ export class RestartCoordinator {
     this.restartInFlight = false;
     const message = `Scheduled Tomo restart failed: ${detail}`;
     log.error({ sessionKey, detail }, "Scheduled restart failed");
+    if (sessionKey) {
+      try {
+        this.deps.onRestartClaimFailed?.(sessionKey);
+      } catch (err) {
+        log.warn({ err, sessionKey }, "Restart claim withdrawal failed");
+      }
+    }
     this.queuePendingErrorNote(sessionKey, message);
   }
 }

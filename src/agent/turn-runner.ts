@@ -337,6 +337,12 @@ export interface TurnSpec {
    * record an interruption, never "ok".
    */
   onStopped?: () => void;
+  /**
+   * Send `prompt` exactly as given: no pending notes, no memory-change note,
+   * no stamp in front of it. For an SDK slash command (a sub-session's
+   * `/compact <instructions>`), which only works when it leads the message.
+   */
+  bare?: boolean;
 }
 
 /**
@@ -482,9 +488,9 @@ export class TurnRunner {
     let notes = "";
     let contextNote: PromptContextTicket | undefined;
     try {
-      notes = this.deps.drainPendingNotes(spec.key);
-      contextNote = this.deps.takePromptContextNote?.(spec.key);
-      const prompt = (contextNote?.prefix ?? "") + notes
+      notes = spec.bare ? "" : this.deps.drainPendingNotes(spec.key);
+      contextNote = spec.bare ? undefined : this.deps.takePromptContextNote?.(spec.key);
+      const prompt = spec.bare ? spec.prompt : (contextNote?.prefix ?? "") + notes
         + (spec.stampChannelName !== undefined
           ? injectTimestamp(spec.prompt, spec.stampChannelName, spec.stampSenderTimeZone)
           : spec.prompt);

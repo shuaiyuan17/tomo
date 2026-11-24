@@ -6,7 +6,7 @@ import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
 import type { PromptContextLines } from "../workspace/prompt-context-diff.js";
 import { assembleSystemPrompt, renderRuntimeSection, renderSessionSection } from "../workspace/system-prompt-blocks.js";
-import { isDmSessionKey, isGroupSessionKey } from "../sessions/keys.js";
+import { isDmSessionKey, isGroupSessionKey, isTaskSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
 import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
 import { litellmRoutesModel } from "../litellm.js";
@@ -14,7 +14,9 @@ import { effectiveGroupSandbox, type GroupSandboxConfig } from "./group-fs-polic
 import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, skillsCanUseTool, todoStoreGuardHooks, type PrivateMemoryBar } from "./permissions.js";
 import { TODO_TOOL_NAMES } from "../mcp/todo-tools.js";
 import { todosDir } from "../todos/store.js";
-import type { AgentProfile } from "../config.js";
+import type { AgentProfile, EffortLevel } from "../config.js";
+import { subsessionMemoryGuardHooks } from "./subsessions/memory-guard.js";
+import { SUBSESSION_TASK_TOOL_NAMES } from "../mcp/subsession-tools.js";
 import { effectiveEffort } from "./effort.js";
 import { resolvePlugins } from "./plugins.js";
 import { SDK_SETTING_SOURCES } from "./setting-sources.js";
@@ -34,6 +36,10 @@ import { ensureRedactionReady, redactionReady, scrubDeep, WITHHELD_OUTPUT, withh
  *  unless config.lcm.groupCompactStyle="sdk"). When false, SDK auto-compact is
  *  in charge and the harness skips its compaction nudges. */
 export function usesLcmCompact(sessionKey: string): boolean {
+  // A sub-session is compacted by the harness with `/compact` at
+  // subsessions.maxContextTokens; SDK auto-compact stays on as the backstop
+  // for a model whose window is smaller than that limit.
+  if (isTaskSessionKey(sessionKey)) return false;
   if (!isGroupSessionKey(sessionKey)) return true;
   return config.lcm.groupCompactStyle !== "sdk";
 }
@@ -121,6 +127,20 @@ export interface SessionContext {
    * not installed.
    */
   resumeGate?: (taskId: string) => string | null;
+  /**
+   * Present on a sub-session (`task:` key) only. Its prompt is the fixed
+   * sub-session prompt, not buildSystemPrompt(): no SOUL/AGENT/IDENTITY, no
+   * memory index, no roster, so no `onPromptContext` either.
+   */
+  subsession?: {
+    staticPrompt: string;
+    /** The owning scope is a group: the same bar as a group session (private
+     *  memory closed, claude.ai connectors off). False for the owner's DM. */
+    groupScope: boolean;
+    /** subsessions.maxTurns (0 = no limit). */
+    maxTurns: number;
+    effort?: EffortLevel;
+  };
 }
 
 export function sdkOptions(
@@ -131,8 +151,14 @@ export function sdkOptions(
   turnBudget?: TurnBudget,
   externalMcpServersOverride?: Record<string, McpServerConfig>,
 ) {
-  const isGroup = sessionContext ? isGroupSessionKey(sessionContext.sessionKey) : false;
-  const staticPrompt = buildSystemPrompt({ isGroup, onContext: sessionContext?.onPromptContext });
+  const subsession = sessionContext?.subsession;
+  // A sub-session takes its owning scope's group-ness: privacy follows the
+  // scope that spawned it (parentKey), never the task key itself.
+  const isGroup = subsession ? subsession.groupScope : sessionContext ? isGroupSessionKey(sessionContext.sessionKey) : false;
+  const staticPrompt = subsession
+    ? subsession.staticPrompt
+    : buildSystemPrompt({ isGroup, onContext: sessionContext?.onPromptContext });
+  const maxTurns = subsession ? subsession.maxTurns : config.maxTurns;
 
   // Why `memory/private/` is closed for the turn in flight — or null when it is
   // open. INSTALLED FOR EVERY SESSION, and resolved per tool call rather than
@@ -167,11 +193,15 @@ export function sdkOptions(
   const configuredMcpServers = Object.fromEntries(
     Object.entries(config.mcpServers ?? {}).map(([name, entry]) => [name, entry.server]),
   ) as Record<string, McpServerConfig>;
-  const externalMcpServers = Object.fromEntries(
+  // A sub-session gets no external MCP server at all (and no claude.ai
+  // connector, below): it runs unattended for hours, and those reach the
+  // owner's accounts and outside services. Its tools are the internal ones.
+  const unattended = subsession !== undefined || (sessionContext !== undefined && isTaskSessionKey(sessionContext.sessionKey));
+  const externalMcpServers = unattended ? {} : Object.fromEntries(
     Object.entries(externalMcpServersOverride ?? configuredMcpServers)
       .filter(([name]) => name !== TOMO_INTERNAL_MCP_NAME),
   );
-  const externalMcpAllowedTools = Array.isArray(config.mcpAllowedTools) ? config.mcpAllowedTools : [];
+  const externalMcpAllowedTools = !unattended && Array.isArray(config.mcpAllowedTools) ? config.mcpAllowedTools : [];
   const shouldDisableAutoCompact = Boolean(sessionContext && usesLcmCompact(sessionContext.sessionKey));
   const effectiveModel = model ?? config.model;
 
@@ -201,12 +231,15 @@ export function sdkOptions(
   // the next session start (daemon restart, or a `/model` switch, which
   // restarts the session). Tomo has no live config edit, so nothing calls
   // `applyFlagSettings({ effortLevel })` mid-session.
-  const effort = effectiveEffort(config, sessionContext?.sessionKey, effectiveModel).level;
+  const effort = subsession?.effort ?? effectiveEffort(config, sessionContext?.sessionKey, effectiveModel).level;
 
   // Resolved at session spawn, not config load: CLI-installed plugin paths are
   // version-pinned and change on `claude plugin update` (old dirs are GC'd),
   // so a long-running daemon must re-resolve rather than cache paths.
-  const plugins = resolvePlugins(config.plugins ?? [], undefined, config.tomoHome || undefined);
+  // A sub-session keeps a plugin's skills, hooks and agents, never its MCP
+  // servers (the same fence as externalMcpServers above).
+  const plugins = resolvePlugins(config.plugins ?? [], undefined, config.tomoHome || undefined)
+    .map((entry) => (unattended ? { ...entry, skipMcpDiscovery: true } : entry));
 
   return {
     model: effectiveModel,
@@ -239,6 +272,9 @@ export function sdkOptions(
       `mcp__${TOMO_INTERNAL_MCP_NAME}__upsert_person`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__lcm_rollup`,
       ...TODO_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`),
+      // Registered per session kind (internal-server.ts): the task_* tools a
+      // sub-session reports through, and the owner's task_spawn/status/cancel/message.
+      ...SUBSESSION_TASK_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`),
       // Registered only on the owner's DM session (internal-server.ts).
       `mcp__${TOMO_INTERNAL_MCP_NAME}__home_check`,
       ...PERMISSION_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`),
@@ -253,6 +289,9 @@ export function sdkOptions(
     skills: "all" as const,
     ...(plugins.length > 0 ? { plugins } : {}),
     mcpServers: { ...externalMcpServers, [TOMO_INTERNAL_MCP_NAME]: internalMcpServer },
+    // Nothing the CLI would discover on its own either (project .mcp.json,
+    // user settings, plugins, agent frontmatter): only the servers above.
+    ...(unattended ? { strictMcpConfig: true } : {}),
     // External entries never reach the CLI's argv: LiveSession sends them
     // over stdin in the initialize request (mcpServersDelivery: "initialize"),
     // because an OAuth server's entry carries its bearer token.
@@ -270,7 +309,8 @@ export function sdkOptions(
       // would not drop them. They reach the owner's private accounts, so a
       // group's own session never loads them. Session-level: a group
       // summoned into the owner's DM keeps them on purpose (owner present).
-      ...(isGroup ? { disableClaudeAiConnectors: true } : {}),
+      // A sub-session never loads them, whatever its scope (see externalMcpServers).
+      ...(isGroup || unattended ? { disableClaudeAiConnectors: true } : {}),
       attribution: {
         commit: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
         pr: "Made by [Tomo](https://github.com/shuaiyuan17/tomo)",
@@ -297,10 +337,10 @@ export function sdkOptions(
     ...(sessionContext && isDmSessionKey(sessionContext.sessionKey) && config.web?.enabled ? { perTaskStopAffordance: true } : {}),
     ...(thinking ? { thinking } : {}),
     // 0 = no limit: leave maxTurns out so the CLI gets no --max-turns at all.
-    ...(config.maxTurns > 0 ? { maxTurns: config.maxTurns } : {}),
+    ...(maxTurns > 0 ? { maxTurns } : {}),
     ...buildHooksOption({
       turnBudget,
-      maxTurns: config.maxTurns,
+      maxTurns,
       sessionKey: sessionContext?.sessionKey,
       privateMemoryBar,
       agentProfile,
@@ -321,6 +361,7 @@ export function sdkOptions(
       scopedCallerKey: sessionContext?.scopedCallerKey,
       credentialBroker: config.credentialBroker?.enabled === true,
       todosDir: () => todosDir(),
+      subsessionMemoryGuard: subsession !== undefined,
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     env: sdkEnv,
@@ -488,6 +529,8 @@ export function buildHooksOption(args: {
   backgroundLaunchDenial?: () => string | null;
   /** Per-SendMessage reason to deny a resume (the resume cap), or null. */
   resumeGate?: (taskId: string) => string | null;
+  /** A sub-session: memory and the workspace prompt files are read-only to it. */
+  subsessionMemoryGuard?: boolean;
 }) {
   const hooks: Record<string, unknown[]> = {};
   if (args.credentialBroker) {
@@ -514,6 +557,10 @@ export function buildHooksOption(args: {
   // Deny-only, so its place before the private-memory guard costs nothing.
   if (args.todosDir) {
     mergeHooks(hooks, todoStoreGuardHooks(args.sessionKey, config.workspaceDir, args.todosDir));
+  }
+  // Deny-only, like the todo guard above.
+  if (args.subsessionMemoryGuard && args.sessionKey) {
+    mergeHooks(hooks, subsessionMemoryGuardHooks(args.sessionKey, config.workspaceDir, config.workspaceDir));
   }
   // THE PRIVATE-MEMORY GUARD GOES LAST, and the order is load-bearing now that it
   // returns `updatedInput` (the `sandbox-exec` rewrite, see permissions.ts).

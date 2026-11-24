@@ -141,6 +141,8 @@ export class PendingNotesQueue {
   private inflight = new Map<string, InFlightBatch[]>();
   private errorNotes = new Map<string, ErrorNote[]>();
   private errorSeq = 0;
+  /** Sessions whose legacy cleanup is not on disk yet (its write failed). */
+  private unsavedCleanup = new Set<string>();
 
   constructor(private store: DurablePendingNotesStore) {}
 
@@ -154,7 +156,7 @@ export class PendingNotesQueue {
         // session soon (an error-only store drains to an empty prefix).
         if (arr.length !== stored.length || arr.some((n, idx) => n !== stored[idx])) {
           this.notes.set(sessionKey, arr);
-          this.persist(sessionKey);
+          if (!this.persist(sessionKey)) this.unsavedCleanup.add(sessionKey);
         }
       } catch (err) {
         log.warn({ err, sessionKey }, "Could not load durable pending notes");
@@ -173,6 +175,7 @@ export class PendingNotesQueue {
     ];
     try {
       this.store.setPendingNotes(sessionKey, all);
+      this.unsavedCleanup.delete(sessionKey);
       return true;
     } catch (err) {
       log.warn({ err, sessionKey }, "Could not persist pending notes");
@@ -218,7 +221,11 @@ export class PendingNotesQueue {
     }
 
     const prefix = parts.map((n) => `${n}\n\n`).join("");
-    if (!prefix) return prefix;
+    if (!prefix) {
+      // Nothing to hand over, so nothing else would write: retry a failed cleanup.
+      if (this.unsavedCleanup.has(sessionKey)) this.persist(sessionKey);
+      return prefix;
+    }
     // Every non-empty prefix is tracked, so a put-back can split it into its
     // parts again. Only the durable notes reach the store (error notes are
     // memory-only to begin with).

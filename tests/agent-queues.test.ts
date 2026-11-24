@@ -278,4 +278,20 @@ describe("PendingNotesQueue", () => {
     expect(queue.drain("k")).toBe("");
     expect(store.getPendingNotes("k")).toEqual([]);
   });
+  it("retries a legacy cleanup whose first write failed", () => {
+    const store = new MemoryPendingNotesStore();
+    const errors = '<tomo-event type="errors" ts="x">\nRecent Tomo errors before this turn (newest last, capped):\n- [error] old-boom\n</tomo-event>';
+    store.setPendingNotes("k", [errors]);
+    const realSet = store.setPendingNotes.bind(store);
+    let failNext = true;
+    store.setPendingNotes = (key, notes) => {
+      if (failNext) { failNext = false; throw new Error("disk full"); }
+      realSet(key, notes);
+    };
+    const queue = new PendingNotesQueue(store);
+    // The write on load fails; the empty drain retries it.
+    expect(queue.drain("k")).toBe("");
+    expect(failNext).toBe(false);
+    expect(store.getPendingNotes("k")).toEqual([]);
+  });
 });

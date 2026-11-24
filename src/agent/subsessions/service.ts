@@ -277,10 +277,34 @@ export class SubsessionService {
     if (open >= cfg.maxOpen) {
       return { ok: false, error: `${open} sub-sessions are already open (limit ${cfg.maxOpen}). Finish or cancel one first.` };
     }
+    // A new id must not land on a task session the registry still links
+    // (a lost table, say): the new task would resume that conversation's
+    // history. From an unreadable registry nothing is known about those, so
+    // no new id is given out at all, and the caller is told so.
+    if (!this.reserveRegistryIds()) {
+      return { ok: false, error: "The session registry can't be read right now, so no new sub-session can be started safely. Try again later." };
+    }
     const record = this.store.create({ parentKey, ...input, ...(input.model ? { model: input.model.trim() } : {}) });
     this.deps.ensureRegistryEntry(record.sessionKey);
     this.schedule();
     return { ok: true, record: this.store.get(record.id) ?? record };
+  }
+
+  /**
+   * Moves the next id past every task session the registry links. False when
+   * the registry can't be read (or the reservation can't be written): no new
+   * id may be given out then.
+   */
+  private reserveRegistryIds(): boolean {
+    try {
+      if (!this.deps.registryReadable()) return false;
+      const highest = Math.max(0, ...this.deps.registryTaskKeys().map(taskNumber));
+      if (highest >= this.store.read().nextId) this.store.reserveIdsThrough(highest);
+      return true;
+    } catch (err) {
+      log.error({ err }, "Could not reserve sub-session ids past the registry's task sessions");
+      return false;
+    }
   }
 
   async cancel(id: string, reason: string): Promise<TransitionOutcome> {

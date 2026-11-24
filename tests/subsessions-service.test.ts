@@ -1458,3 +1458,29 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     expect(h.store.get(t.id)?.status).toBe("finished");
   });
 });
+
+describe("SubsessionService: no new task id while the registry can't be read", () => {
+  it("refuses task_spawn with a lost table and an unreadable registry, and never reuses task:s1 once it can be read", async () => {
+    const h = harness();
+    // The table and its backup are gone; the registry still links an old task's conversation.
+    h.registry.add("task:s1");
+    h.sdk.add("task:s1");
+    h.registryReadable = false;
+    h.service.start();
+    await flush();
+    const refused = h.service.spawn("dm:owner", { title: "New job", brief: "Do the new thing." });
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.error).toMatch(/registry can't be read/);
+    expect(h.store.list()).toHaveLength(0);
+    expect(h.store.read().nextId).toBe(1);
+    expect(h.turns).toHaveLength(0);
+
+    // Readable again: the new task gets an id past every linked task session.
+    h.registryReadable = true;
+    const record = spawn(h, "New job");
+    expect(record.id).toBe("s2");
+    expect(record.sessionKey).toBe("task:s2");
+    await flush();
+    expect(h.turns.map((t) => t.key)).not.toContain("task:s1");
+  });
+});

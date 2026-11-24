@@ -1273,6 +1273,8 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     expect(h.turns[2].prompt).toContain('name="answer"');
     expect(h.turns[2].prompt).toContain("the answer to your question");
     expect(h.turns[2].prompt).not.toContain("unrelated: tests are running");
+    // Quoted without the harness prefix, so a copy of it is not sent with two.
+    expect(h.turns[2].prompt).not.toContain("[s1 · Fix the bug] the answer");
     expect(h.sent.map((m) => m.text).filter((x) => x.includes("the answer to your question"))).toHaveLength(1);
     expect(h.store.get(t.id)).toMatchObject({ status: "finished", pendingInput: [] });
   });
@@ -1349,6 +1351,60 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
       expect(h.turns).toHaveLength(1);
       expect(h.turns[0].prompt).toContain('type="subsession-resume"');
       expect(h.store.get(id)?.status).toBe("finished");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds a finished task's turn while the registry is unreadable without spinning, and answers once it can be read", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness({}, (turn, hh) => { void hh.service.notify(turn.key, "answer"); return { ok: true }; });
+      const id = seed(h, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
+      h.service.start();
+      let asked = 0;
+      h.registryReadable = false;
+      const readable = (h.service as unknown as { deps: { registryReadable: () => boolean } }).deps;
+      const real = readable.registryReadable;
+      readable.registryReadable = () => {
+        asked += 1;
+        if (asked > 50) throw new Error("the driver is spinning on a held turn");
+        return real();
+      };
+      expect(h.service.relay(id, "one more thing").ok).toBe(true);
+      await flush();
+      expect(asked).toBeLessThan(5);
+      expect(h.turns).toHaveLength(0);
+      expect(h.service.isHeld(id)).toBe(true);
+      expect(h.store.get(id)).toMatchObject({ status: "finished", pendingInput: [{ seq: 1 }] });
+      // Still unreadable at the recheck: held again, once.
+      vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
+      await flush();
+      expect(h.turns).toHaveLength(0);
+      h.registryReadable = true;
+      vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
+      await flush();
+      expect(h.turns).toHaveLength(1);
+      expect(h.store.get(id)).toMatchObject({ status: "finished", pendingInput: [] });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("makes an owner's start that the registry held past the slot cap once it can be read", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness({ maxRunning: 0 }, working((turn, hh) => hh.service.finish(turn.key, "ok")));
+      const t = h.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+      h.service.start();
+      h.registryReadable = false;
+      expect(h.service.startTask(t.id, "the owner started it")).toBe(false);
+      expect(h.service.isHeld(t.id)).toBe(true);
+      h.registryReadable = true;
+      vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
+      await flush();
+      expect(h.turns).toHaveLength(1);
+      expect(h.store.get(t.id)?.status).toBe("finished");
     } finally {
       vi.useRealTimers();
     }

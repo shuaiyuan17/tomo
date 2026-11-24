@@ -170,8 +170,13 @@ export class SubsessionService {
   private readonly undelivered = new Map<string, Set<string>>();
   /** The last turn's messages that could not be delivered: the next turn is shown them. */
   private readonly answerLost = new Map<string, string[]>();
-  /** Turns held because the session registry could not be read (see resumeCheck). */
+  /** Turns held because the session registry could not be read (see mayRun). */
   private registryRecheckTimer?: NodeJS.Timeout;
+  /**
+   * Tasks whose turn mayRun is holding: kick() leaves them alone until the
+   * recheck (a driver re-kicked at once would spin without ever yielding).
+   */
+  private readonly registryHeld = new Set<string>();
   private registryHoldTold = false;
   /**
    * Startup is two steps. `recoverAtStartup()` (before any channel ingests)
@@ -186,7 +191,8 @@ export class SubsessionService {
   private open = false;
   /**
    * Starts asked for past the slot cap (the owner's) while dispatch was still
-   * closed: start() makes them first, so the owner never waits for a slot.
+   * closed, or while mayRun held them: made first, the moment dispatch opens
+   * or the hold ends, so the owner never waits for a slot.
    */
   private readonly startsOwed = new Map<string, string>();
   /** Outward effects (notices, wakes) recovery produced before start(): sent once the channels are up. */
@@ -330,14 +336,18 @@ export class SubsessionService {
     } catch (err) {
       result = { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
+    // Keyed (and later quoted) without the harness prefix: a model that
+    // copies the quote back must not send the prefix twice.
+    const prefix = `${taskPrefix(record)} `;
+    const words = text.startsWith(prefix) ? text.slice(prefix.length) : text;
     const failed = this.undelivered.get(record.id);
     if (result.ok) {
-      failed?.delete(text);
+      failed?.delete(words);
       if (failed?.size === 0) this.undelivered.delete(record.id);
     } else if (failed) {
-      failed.add(text);
+      failed.add(words);
     } else {
-      this.undelivered.set(record.id, new Set([text]));
+      this.undelivered.set(record.id, new Set([words]));
     }
     return result;
   }
@@ -600,6 +610,7 @@ export class SubsessionService {
     this.cronRecheckTimer = undefined;
     if (this.registryRecheckTimer) clearTimeout(this.registryRecheckTimer);
     this.registryRecheckTimer = undefined;
+    this.registryHeld.clear();
   }
 
   /**
@@ -821,12 +832,22 @@ export class SubsessionService {
       .sort((a, b) => Number(b.resumeNeeded) - Number(a.resumeNeeded) || a.createdAt - b.createdAt);
     for (const task of queued) {
       if (active >= this.deps.config().maxRunning) break;
-      if (this.startTask(task.id, "a slot is free")) active += 1;
+      if (this.startQueued(task.id, "a slot is free", false)) active += 1;
     }
   }
 
   /** queued → active and run. `/s <id> start` (Phase 1b) calls this past the slot cap. */
   startTask(id: string, reason: string): boolean {
+    return this.startQueued(id, reason, true);
+  }
+
+  /**
+   * `owed`: a start that does not wait for a slot (the owner's, or one owed
+   * from before dispatch opened). Held by mayRun, it stays owed and is made
+   * past the cap the moment the hold ends; the scheduler's own starts are
+   * simply asked again by the next schedule().
+   */
+  private startQueued(id: string, reason: string, owed: boolean): boolean {
     if (!this.open) {
       // Before start(): owed, and made the moment dispatch opens.
       if (!this.recovered || this.deps.isStopping()) return false;
@@ -834,7 +855,13 @@ export class SubsessionService {
       return true;
     }
     const record = this.safeGet(id);
-    if (!record || record.status !== "queued" || !this.mayRun(record)) return false;
+    if (!record || record.status !== "queued") return false;
+    const may = this.mayRun(record);
+    if (may !== "run") {
+      if (may === "held" && owed) this.startsOwed.set(id, reason);
+      return false;
+    }
+    this.startsOwed.delete(id);
     const outcome = this.store.transition(id, "start", { reason, expectFrom: ["queued"] });
     if (!outcome.ok) return false;
     this.kick(id);
@@ -851,23 +878,29 @@ export class SubsessionService {
    * repeat what it did, so it fails, said plainly. Every dispatch (a start,
    * every driver turn) asks here first.
    */
-  private mayRun(record: SubsessionRecord): boolean {
-    if (this.deps.hasLiveSession?.(record.sessionKey)) return true;
+  private mayRun(record: SubsessionRecord): "run" | "held" | "failed" {
+    if (this.deps.hasLiveSession?.(record.sessionKey)) return "run";
     if (!this.deps.registryReadable()) {
       log.error({ id: record.id }, "Session registry unreadable; holding a sub-session turn rather than start it without its history");
       if (!this.registryHoldTold) {
         this.registryHoldTold = true;
         this.noticeOwner(ownerT("subsessions")("registryHold"));
       }
+      this.registryHeld.add(record.id);
       this.armRegistryRecheck();
-      return false;
+      return "held";
     }
     if (record.startDelivered && !this.deps.hasSdkSession(record.sessionKey)) {
       const failed = this.store.transition(record.id, "fail", { reason: "its conversation could not be found" });
       if (failed.ok) this.reportFailure(failed.record, ownerT("subsessions")("failedNoSession", { id: record.id, title: record.title }));
-      return false;
+      return "failed";
     }
-    return true;
+    return "run";
+  }
+
+  /** A turn of this task is held until the session registry can be read again. */
+  isHeld(id: string): boolean {
+    return this.registryHeld.has(id);
   }
 
   private armRegistryRecheck(): void {
@@ -876,6 +909,10 @@ export class SubsessionService {
       this.registryRecheckTimer = undefined;
       if (this.deps.isStopping()) return;
       if (this.deps.registryReadable()) this.registryHoldTold = false;
+      // Every held task is asked again (mayRun holds it afresh if it must).
+      this.registryHeld.clear();
+      const owed = [...this.startsOwed];
+      for (const [id, reason] of owed) this.safely(() => { this.startQueued(id, reason, true); }, "owed start");
       this.schedule();
       this.safely(() => {
         for (const task of this.store.list()) {
@@ -901,7 +938,7 @@ export class SubsessionService {
   /** Run the task's driver unless one is running. */
   private kick(id: string): void {
     // Closed until start(): start() kicks every task with a turn owed.
-    if (!this.open || this.driving.has(id) || this.settleTimers.has(id) || this.deps.isStopping()) return;
+    if (!this.open || this.driving.has(id) || this.settleTimers.has(id) || this.registryHeld.has(id) || this.deps.isStopping()) return;
     this.driving.add(id);
     void this.drive(id)
       .catch((err) => log.error({ err, id }, "Sub-session driver failed"))
@@ -921,7 +958,7 @@ export class SubsessionService {
       if (!record || record.status === "queued" || TERMINAL_STATUSES.has(record.status)) return;
       const turn = this.plan(record);
       if (!turn) return;
-      if (!this.mayRun(record)) return;
+      if (this.mayRun(record) !== "run") return;
       // Nothing is written before the turn, and nothing it owes is forgotten
       // before it: its inputs, and a "continue" owed, leave with the write
       // that records its result (a retry after a failed write finds them).

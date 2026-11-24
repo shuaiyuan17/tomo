@@ -102,7 +102,23 @@ function parseRegistryText(
     || (opts?.requireSessions && !Array.isArray(data.sessions))) {
     return { ok: false, err: new Error("missing or malformed `sessions` array") };
   }
+  if (opts?.requireSessions) {
+    const bad = (data.sessions as unknown[]).findIndex((e) => !isRestorableEntry(e));
+    if (bad !== -1) return { ok: false, err: new Error(`malformed entry at sessions[${bad}]`) };
+  }
   return { ok: true, sessions: data.sessions ?? [] };
+}
+
+/** The fields the store dereferences, in the shape it writes them. Checked on
+ *  a backup before it is compared with the registry or restored over it. */
+function isRestorableEntry(e: unknown): boolean {
+  if (e === null || typeof e !== "object" || Array.isArray(e)) return false;
+  const r = e as Record<string, unknown>;
+  const optNum = (v: unknown) => v === undefined || v === null || typeof v === "number";
+  return typeof r.channelKey === "string"
+    && typeof r.sdkSessionId === "string"
+    && optNum(r.unlinkedAt) && optNum(r.expiresAt)
+    && (r.stats === undefined || (r.stats !== null && typeof r.stats === "object"));
 }
 
 /** What the backup must agree with the registry on: which session holds
@@ -2229,9 +2245,12 @@ export class SessionStore {
    *  Only when the registry holds a link: metadata-only stubs have nothing to
    *  lose. A backup that differs only in stats/titles is left alone. */
   private seedRegistryBackup(): void {
-    if (this.registryLoadError !== null || !this.registry.some((e) => e.sdkSessionId)) return;
-    if (this.registryBackupHoldsLinks()) return;
     try {
+      if (this.registryLoadError !== null || !this.registry.some((e) => e.sdkSessionId)) return;
+      if (this.registryBackupHoldsLinks()) return;
+      // Behind from here until a backup write succeeds: if this attempt fails
+      // (or cannot take the lock), the next save of any kind retries it.
+      this.registryBackupStale = true;
       withFileLockSync(this.registryLockPath, () => {
         // Re-check under the lock, against a fresh read: the primary is always
         // written before the backup, so a fresh good primary is never older
@@ -2239,11 +2258,12 @@ export class SessionStore {
         this.registryStat = null;
         this.loadRegistry();
         if (this.registryLoadError !== null || !this.registry.some((e) => e.sdkSessionId)) return;
-        if (this.registryBackupHoldsLinks()) return;
+        if (this.registryBackupHoldsLinks()) { this.registryBackupStale = false; return; }
         this.writeRegistryBackup("seed");
       }, REGISTRY_LOCK_OPTIONS);
     } catch (err) {
-      log.debug({ err }, "Skipped seeding the session registry backup: lock unavailable");
+      // Runs from the constructor: never let it stop the store starting.
+      log.debug({ err }, "Skipped seeding the session registry backup");
     }
   }
 

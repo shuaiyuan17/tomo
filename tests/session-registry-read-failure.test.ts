@@ -468,6 +468,49 @@ describe("session registry durability (fsync + backup)", () => {
     }
   });
 
+  it("neither crashes on nor restores from a backup whose entries are malformed", () => {
+    const entry = (over: Record<string, unknown>) => JSON.stringify({ version: 1, sessions: [{
+      sdkSessionId: "sdk-aaa", channelKey: "telegram:1", createdAt: 1, lastActiveAt: 1,
+      unlinkedAt: null, expiresAt: null, stats: {}, ...over,
+    }] });
+    const bads = [
+      '{"sessions":[null]}', '{"sessions":[1]}', '{"sessions":[[]]}',
+      entry({ channelKey: 5 }), entry({ sdkSessionId: null }), entry({ expiresAt: "soon" }), entry({ stats: null }),
+    ];
+    for (const bad of bads) {
+      // Healthy primary: startup compares the backup and rewrites it.
+      seed();
+      writeFileSync(BACKUP, bad);
+      expect(() => new SessionStore(TEST_DIR)).not.toThrow();
+      expect(linksOn(BACKUP)).toEqual(linksOn(REGISTRY));
+      // Corrupt primary: the backup is not restored over it.
+      writeFileSync(BACKUP, bad);
+      writeFileSync(REGISTRY, "");
+      let store!: SessionStore;
+      expect(() => { store = new SessionStore(TEST_DIR); }).not.toThrow();
+      expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
+      expect(readFileSync(REGISTRY, "utf-8")).toBe("");
+      rmSync(TEST_DIR, { recursive: true, force: true });
+      mkdirSync(TEST_DIR, { recursive: true });
+    }
+  });
+
+  it("retries a failed start-up backup refresh on the next bookkeeping save", () => {
+    const store = seed();
+    failWrite.path = BACKUP;
+    try {
+      store.setSdkSessionId("telegram:9", "sdk-new");
+      // A fresh start finds the backup behind, and cannot refresh it either.
+      const next = new SessionStore(TEST_DIR);
+      failWrite.path = null;
+      expect(linksOn(BACKUP)["telegram:9"]).toBeUndefined();
+      next.touchSession("telegram:1");
+      expect(linksOn(BACKUP)).toEqual(linksOn(REGISTRY));
+    } finally {
+      failWrite.path = null;
+    }
+  });
+
   it("retries a failed backup write on the next save, even a bookkeeping one", () => {
     const store = seed();
     failWrite.path = BACKUP;

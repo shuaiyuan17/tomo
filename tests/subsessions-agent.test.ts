@@ -132,4 +132,29 @@ describe("sub-sessions through the Agent", () => {
     expect(ownerTurn).toContain("SECRET-REPORT");
     await agent.stop();
   });
+
+  it("keeps a task's own words, sent to the owner, out of a summoned group's turn", async () => {
+    const { agent, channel } = await boot();
+    const internals = agent as unknown as {
+      router: { summonGroup(channel: string, chatId: string, identity: string): void };
+      subsessions: { deps: { sendToScope(parentKey: string, text: string, taskKey: string, noteFrom: string): Promise<{ ok: boolean }> } };
+    };
+    internals.router.summonGroup("telegram", "-100271", "alex");
+    mockSdk.responseFn = () => "NO_REPLY";
+    await channel.simulateMessage(makeMsg({ chatId: "12345", text: "hi" }));
+    await drainQueue(agent);
+    mockSdk.promptsBySession = [];
+    // The task tells the owner something private (task_notify's path).
+    expect((await internals.subsessions.deps.sendToScope("dm:alex", "[s1 · t] SECRET-WORDS", "task:s1", "Your sub-session s1")).ok).toBe(true);
+    expect(await agent.handleCronMessage("Scheduled group task", "telegram:-100271", { waitForHandoff: true })).toBe(true);
+    const groupTurn = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex").map((p) => p.text).join("\n");
+    expect(groupTurn).toContain("Scheduled group task");
+    expect(groupTurn).not.toContain("SECRET-WORDS");
+    mockSdk.promptsBySession = [];
+    await channel.simulateMessage(makeMsg({ chatId: "12345", text: "anything new?" }));
+    await drainQueue(agent);
+    const ownerTurn = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex").map((p) => p.text).join("\n");
+    expect(ownerTurn).toContain("SECRET-WORDS");
+    await agent.stop();
+  });
 });

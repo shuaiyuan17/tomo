@@ -300,9 +300,12 @@ export class SubsessionStore {
     this.mutate((table) => { if (!table.untrusted) table.untrusted = { since: this.now(), reason }; });
   }
 
-  /** Nothing left to protect: every registry task session is one the table knows. */
+  /**
+   * Nothing left to protect: every registry task session is one the table
+   * knows, and no record is still `restored` (refused while one is).
+   */
   clearUntrusted(): void {
-    this.mutate((table) => { delete table.untrusted; });
+    this.mutate((table) => { if (!table.tasks.some((t) => t.restored)) delete table.untrusted; });
   }
 
   private remember(table: SubsessionTable, state: SubsessionStoreState): SubsessionTable {

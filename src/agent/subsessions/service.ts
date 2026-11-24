@@ -64,6 +64,11 @@ export interface SubsessionServiceDeps {
   removeCronJobs(key: string): void;
   /** Soft-stop the key's live session, then close it; hard close after `timeoutMs`. */
   stopSession(key: string, timeoutMs: number): Promise<void>;
+  /**
+   * Registry: could it be read? An unreadable registry answers from an empty
+   * or stale state, so nothing it says about task sessions is acted on.
+   */
+  registryReadable(): boolean;
   /** Registry: does the key have an SDK session to resume? */
   hasSdkSession(key: string): boolean;
   ensureRegistryEntry(key: string): void;
@@ -167,6 +172,11 @@ export class SubsessionService {
   private recovered = false;
   private started = false;
   private open = false;
+  /**
+   * Starts asked for past the slot cap (the owner's) while dispatch was still
+   * closed: start() makes them first, so the owner never waits for a slot.
+   */
+  private readonly startsOwed = new Map<string, string>();
   /** Outward effects (notices, wakes) recovery produced before start(): sent once the channels are up. */
   private live = false;
   private deferred: Array<() => void> = [];
@@ -285,14 +295,30 @@ export class SubsessionService {
     if (TERMINAL_STATUSES.has(record.status)) return { ok: false, error: `This task is ${record.status}; nothing more is sent.` };
     const body = text.trim();
     if (!body) return { ok: false, error: "text is empty" };
-    const result = await this.deps.sendToScope(record.parentKey, `${taskPrefix(record)} ${body}`, key,
-      `Your sub-session ${record.id} ("${record.title}")`);
+    const result = await this.sendOut(record, `${taskPrefix(record)} ${body}`);
     if (result.ok) {
-      this.store.update(record.id, (r) => { r.sent.push({ at: this.now(), kind: "notify", text: body }); });
-    } else {
-      // Part of the turn's result: the inputs this turn answers stay owed.
-      this.undelivered.add(record.id);
+      this.safely(() => this.store.update(record.id, (r) => { r.sent.push({ at: this.now(), kind: "notify", text: body }); }), "record a sent message");
     }
+    return result;
+  }
+
+  /**
+   * EVERY send of a task's words to its owning scope goes through here. A
+   * send that fails, by its result or by throwing, marks the turn's answer
+   * as undelivered (part of the turn's result: the inputs it answers stay
+   * owed); a later send in the same turn that goes out clears the mark (the
+   * model was told the first one failed, and spoke again).
+   */
+  private async sendOut(record: SubsessionRecord, text: string): Promise<{ ok: boolean; error?: string }> {
+    let result: { ok: boolean; error?: string };
+    try {
+      result = await this.deps.sendToScope(record.parentKey, text, record.sessionKey,
+        `Your sub-session ${record.id} ("${record.title}")`);
+    } catch (err) {
+      result = { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+    if (result.ok) this.undelivered.delete(record.id);
+    else this.undelivered.add(record.id);
     return result;
   }
 
@@ -500,6 +526,9 @@ export class SubsessionService {
     for (const effect of deferred) this.safely(effect, "deferred notice");
     if (!this.recovered) return;
     this.open = true;
+    const owed = [...this.startsOwed];
+    this.startsOwed.clear();
+    for (const [id, reason] of owed) this.safely(() => { this.startTask(id, reason); }, "owed start");
     this.schedule();
     this.safely(() => {
       for (const task of this.store.list()) {
@@ -538,6 +567,7 @@ export class SubsessionService {
 
   stop(): void {
     this.open = false;
+    this.startsOwed.clear();
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     this.sweepTimer = undefined;
     for (const timer of this.reportTimers.values()) clearTimeout(timer);
@@ -620,10 +650,18 @@ export class SubsessionService {
    */
   private reconcile(startState: ReturnType<SubsessionStore["state"]>): void {
     const table = this.store.read();
+    // What the registry says (which task sessions it has, whether a task's
+    // conversation is there) decides unlinks, the untrusted mark and failing
+    // a task: from an unreadable registry, it says "nothing", which is not
+    // true. None of it runs then; the next start reconciles again.
+    const registryReadable = this.deps.registryReadable();
+    if (!registryReadable) log.error("Session registry unreadable at start; sub-session reconcile acts on nothing it says");
     const known = new Set(table.tasks.map((t) => t.sessionKey));
-    const orphans = this.deps.registryTaskKeys().filter((k) => !known.has(k));
-    if (orphans.length === 0) {
-      if (table.untrusted) {
+    const orphans = registryReadable ? this.deps.registryTaskKeys().filter((k) => !known.has(k)) : [];
+    if (!registryReadable) {
+      // Nothing known about orphans: no unlink, and the mark stays.
+    } else if (orphans.length === 0) {
+      if (table.untrusted && !table.tasks.some((t) => t.restored)) {
         log.info({ since: table.untrusted.since, reason: table.untrusted.reason }, "Every registry task session is known to the task table again; trusting it");
         this.store.clearUntrusted();
       }
@@ -658,7 +696,7 @@ export class SubsessionService {
         // on disk, so the wake is owed again.
         this.wakeForReport(task);
       }
-      if (OPEN_STATUSES.has(task.status) && !this.deps.hasSdkSession(task.sessionKey)) {
+      if (registryReadable && OPEN_STATUSES.has(task.status) && !this.deps.hasSdkSession(task.sessionKey)) {
         if (task.startDelivered) {
           // A turn completed, so it did things, and the registry came back
           // without its conversation: it cannot resume, and starting it over
@@ -763,7 +801,12 @@ export class SubsessionService {
 
   /** queued → active and run. `/s <id> start` (Phase 1b) calls this past the slot cap. */
   startTask(id: string, reason: string): boolean {
-    if (!this.open) return false;
+    if (!this.open) {
+      // Before start(): owed, and made the moment dispatch opens.
+      if (!this.recovered || this.deps.isStopping()) return false;
+      this.startsOwed.set(id, reason);
+      return true;
+    }
     const outcome = this.store.transition(id, "start", { reason, expectFrom: ["queued"] });
     if (!outcome.ok) return false;
     this.kick(id);
@@ -893,8 +936,9 @@ export class SubsessionService {
 
     let record: SubsessionRecord | undefined;
     // A completed turn whose message could not be delivered did not answer
-    // what it carried: like a failed turn, it keeps its inputs.
-    const lost = this.undelivered.has(id);
+    // what it carried: like a failed turn, it keeps its inputs. A turn that
+    // carried none has nothing to keep.
+    const lost = this.undelivered.has(id) && turn.throughSeq > 0;
     this.undelivered.delete(id);
     const keep = !outcome.ok || lost;
     // A finished task's answer that keeps failing (or that the owner
@@ -920,7 +964,9 @@ export class SubsessionService {
           r.seenThrough = Math.max(r.seenThrough, turn.throughSeq);
           if (r.status === "finished" && (outcome.stopped || r.failStreak >= MAX_FAIL_STREAK)) {
             r.failStreak = 0;
-            r.heldThrough = Math.max(r.heldThrough ?? 0, lastInputSeq(r));
+            // What this turn carried, and nothing newer: input that arrived
+            // during it was never part of the failing answer and gets a turn.
+            r.heldThrough = Math.max(r.heldThrough ?? 0, turn.throughSeq);
             held = turn.throughSeq > 0;
           }
         }
@@ -943,30 +989,46 @@ export class SubsessionService {
     this.unsavedSeen.delete(id);
     if (lost && !held) this.answerLost.add(id);
     else if (!keep || held) this.answerLost.delete(id);
-    // The continue this turn was is no longer owed (the result is on disk).
-    if (turn.kind === "continue") this.continueOwed.delete(id);
     if (!record || record.status !== "active") {
       this.continueOwed.delete(id);
       if (record && held) this.tellScope(record, ownerT("subsessions")("finishedUnanswered", { id: record.id, title: record.title }));
       return true;
     }
+    // Still active, so it owes a continue until a transition out of active is
+    // WRITTEN. Marked before anything below writes: a pause, a wait or the
+    // progress count that throws leaves the task with a turn owed, never
+    // active with no driver and nothing planned.
+    this.continueOwed.add(id);
+    try {
+      this.afterActiveTurn(record, turn, keep, outcome.stopped === true, progressed);
+    } catch (err) {
+      log.error({ err, id }, "Could not record what follows a sub-session turn; it stays active and continues");
+    }
+    return true;
+  }
 
+  /** The rest of a completed active turn's result: a pause, a wait, or nothing (it continues). */
+  private afterActiveTurn(record: SubsessionRecord, turn: PlannedTurn, keep: boolean, stopped: boolean, progressed: boolean): void {
+    const id = record.id;
+    // Input that arrived during the turn (a relay, a check-back) was not
+    // part of what was stopped or failed: it gets its turn first.
+    const carried = turn.throughSeq;
+    const newInput = (why: string) => (r: SubsessionRecord) => (r.pendingInput.some((i) => i.seq > carried) ? why : undefined);
     if (keep) {
-      if (outcome.stopped) {
-        this.pause(record, "stopped by the owner", ownerT("subsessions")("stopped", { id: record.id, title: record.title }));
-        return true;
+      if (stopped) {
+        this.pause(record, "stopped by the owner", ownerT("subsessions")("stopped", { id: record.id, title: record.title }),
+          newInput("new input arrived during the stopped turn"));
+      } else if (record.failStreak >= MAX_FAIL_STREAK) {
+        // A failed turn's own inputs are still pending, and stay for the wake.
+        this.pause(record, "its turns keep failing", ownerT("subsessions")("failing", { id: record.id, title: record.title }),
+          newInput("new input arrived during the failed turn"));
       }
-      if (record.failStreak >= MAX_FAIL_STREAK) {
-        this.pause(record, "its turns keep failing", ownerT("subsessions")("failing", { id: record.id, title: record.title }));
-        return true;
-      }
-      this.continueOwed.add(id);
-      return true;
+      return;
     }
     // Input that arrived during the turn gets a turn before any wait: the
     // waits below are also guarded under the lock, for input that lands
     // between this read and the transition.
-    if (record.pendingInput.length > 0) return true;
+    if (record.pendingInput.length > 0) return;
     const jobs = this.deps.cronJobCount(record.sessionKey);
     if (jobs === undefined || jobs > 0) {
       // Unknown (the cron store cannot be read) parks it too: auto-continuing
@@ -977,22 +1039,19 @@ export class SubsessionService {
         expectFrom: ["active"],
         guard: hasPendingInput,
       });
-      if (!waited.ok && waited.refused) return true;
-      if (jobs === undefined) this.armCronRecheck();
+      if (!waited.ok) return;
       this.continueOwed.delete(id);
+      if (jobs === undefined) this.armCronRecheck();
       this.schedule();
-      return true;
+      return;
     }
     if (!turn.afterCompact) {
       const streak = progressed ? 0 : record.turnsWithoutProgress + 1;
       this.store.update(id, (r) => { r.turnsWithoutProgress = streak; });
       if (streak >= MAX_TURNS_WITHOUT_PROGRESS) {
-        this.pause(record, `${streak} turns in a row without progress`, ownerT("subsessions")("stuck", { id: record.id, title: record.title, turns: streak }), true);
-        return true;
+        this.pause(record, `${streak} turns in a row without progress`, ownerT("subsessions")("stuck", { id: record.id, title: record.title, turns: streak }), hasPendingInput);
       }
     }
-    this.continueOwed.add(id);
-    return true;
   }
 
   /** The result could not be written: no turn for this task until a timer gives it one. */
@@ -1007,22 +1066,26 @@ export class SubsessionService {
   }
 
   /**
-   * active → waiting(owner), and say why. `unlessInput`: not while input is
-   * pending (it gets a turn first). The failure and stop pauses go anyway:
-   * their own inputs are still pending, and stay for the next wake.
+   * active → waiting(owner), and say why. `guard`: judged under the lock; an
+   * answer refuses the pause (input that has to get a turn first). The
+   * continue owed leaves only with the written transition. Returns whether
+   * it paused.
    */
-  private pause(record: SubsessionRecord, reason: string, notice: OwnerText, unlessInput = false): void {
-    this.continueOwed.delete(record.id);
+  private pause(record: SubsessionRecord, reason: string, notice: OwnerText, guard?: (r: SubsessionRecord) => string | undefined): boolean {
     const outcome = this.store.transition(record.id, "stuck", {
       reason,
       expectFrom: ["active"],
-      ...(unlessInput ? { guard: hasPendingInput } : {}),
+      ...(guard ? { guard } : {}),
       // What it holds now waits for the owner's wake; restart recovery must
       // not take it for a turn cut short.
       patch: (r) => { r.heldThrough = lastInputSeq(r); },
     });
-    if (outcome.ok) this.tellScope(outcome.record, notice);
+    if (outcome.ok) {
+      this.continueOwed.delete(record.id);
+      this.tellScope(outcome.record, notice);
+    }
     this.schedule();
+    return outcome.ok;
   }
 
   // ---------------------------------------------------------------------

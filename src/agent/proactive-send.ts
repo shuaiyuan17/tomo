@@ -15,7 +15,7 @@ import { DELIVERY_FAILED_MARKER } from "./block-transcript.js";
 import type { DeliverySegment } from "./delivery-pipeline.js";
 import { detectFabricatedMarkers, markFabricatedText, recordFabricatedMarkers } from "./inbound-markers.js";
 import { normalizeSendTarget } from "./send-target.js";
-import { formatTomoEvent } from "../tomo-event.js";
+import { formatTomoEvent, markOwnerAudience } from "../tomo-event.js";
 
 export type SendResult = { ok: true; note?: string } | { ok: false; error: string };
 
@@ -85,8 +85,10 @@ export class ProactiveSendService {
   /**
    * `options.noteFrom` names the sender in the note the target session gets
    * ("Your sub-session s3 (...)"), in place of "Tomo from another session".
+   * `options.ownerOnlyNote` marks that note for the owner's own turns: a
+   * summoned group's turn on the same session never drains it.
    */
-  async sendToSession(target: string, rawText: string, callerSessionKey?: string, options?: { replyTo?: string; effect?: string; noteFrom?: string }): Promise<SendResult> {
+  async sendToSession(target: string, rawText: string, callerSessionKey?: string, options?: { replyTo?: string; effect?: string; noteFrom?: string; ownerOnlyNote?: boolean }): Promise<SendResult> {
     const text = rawText;
     const resolved = this.resolveSendTarget(target);
     if (!resolved) {
@@ -296,13 +298,14 @@ export class ProactiveSendService {
       log.warn({ err, sessionKey }, "Message delivered but transcript persistence failed");
     }
 
-    this.deps.queuePendingNote(sessionKey, formatTomoEvent("direct-send", fromSummoner
+    const sendNote = formatTomoEvent("direct-send", fromSummoner
       ? `Tomo from ${summoned}'s main session (dm:${summoned}), summoned into this group at the time, sent the following message here: "${deliveredText}"`
       : callerSessionKey === sessionKey
         ? `You sent the following message to this conversation earlier as a direct send: "${deliveredText}"`
         : options?.noteFrom
           ? `${options.noteFrom} sent the following message to this conversation earlier: "${deliveredText}"`
-          : `Tomo from another session sent the following message to this conversation earlier: "${deliveredText}"`));
+          : `Tomo from another session sent the following message to this conversation earlier: "${deliveredText}"`);
+    this.deps.queuePendingNote(sessionKey, options?.ownerOnlyNote ? markOwnerAudience(sendNote) : sendNote);
 
     log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length, effect, fabricatedMarkers: fabricated.length || undefined }, "Message sent (direct)");
     const note = [fabricatedNote, effectNote, attachmentNote].filter((n): n is string => n !== undefined).join(" ");

@@ -121,6 +121,7 @@ describe("sub-session tools", () => {
       cronJobCount: () => 0,
       removeCronJobs: () => {},
       stopSession: async () => {},
+      registryReadable: () => true,
       hasSdkSession: () => false,
       ensureRegistryEntry: () => {},
       unlinkRegistryEntry: () => {},

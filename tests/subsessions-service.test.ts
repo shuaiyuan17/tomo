@@ -38,6 +38,9 @@ interface Harness {
   persistFails: number;
   /** The next N sends to the owning scope fail. */
   sendFails: number;
+  /** Sends that throw (a channel failure surfacing as an exception). */
+  sendThrows: number;
+  registryReadable: boolean;
 }
 
 let dir = "";
@@ -75,6 +78,8 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
     noteWriteFails: 0,
     persistFails: 0,
     sendFails: 0,
+    sendThrows: 0,
+    registryReadable: true,
   } as Harness;
   h.service = new SubsessionService({
     store,
@@ -88,6 +93,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
     },
     sendToScope: async (parentKey, text) => {
       if (h.sendFails > 0) { h.sendFails -= 1; return { ok: false, error: "channel down" }; }
+      if (h.sendThrows > 0) { h.sendThrows -= 1; throw new Error("channel send threw"); }
       h.sent.push({ parentKey, text });
       return { ok: true };
     },
@@ -108,6 +114,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
     cronJobCount: (key) => { h.onCronCount?.(key); return h.cronUnknown ? undefined : h.cron.get(key) ?? 0; },
     removeCronJobs: (key) => { h.cron.delete(key); },
     stopSession: async (key) => { h.stopped.push(key); },
+    registryReadable: () => h.registryReadable,
     hasSdkSession: (key) => h.sdk.has(key),
     ensureRegistryEntry: (key) => { h.registry.add(key); },
     unlinkRegistryEntry: (key) => { h.unlinked.push(key); h.registry.delete(key); h.sdk.delete(key); },
@@ -1134,17 +1141,16 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
       return h;
     };
     const h1 = startAgain();
-    expect(h1.store.state()).toBe("ok");
     expect(h1.store.get(id)).toMatchObject({ status: "finished", restored: true });
     expect(h1.unlinked).toEqual([]);
     expect(h1.cron.get("task:s1")).toBe(1);
     // Its check-back fires: ignored, and the job is not removed either.
     expect(h1.service.onCronFire("task:s1", "check")).toBe(false);
     expect(h1.cron.get("task:s1")).toBe(1);
-    // The next start reads a clean table with nothing unknown in the registry:
-    // the table is trusted again, the restored record still is not.
+    // The next start finds nothing unknown in the registry, but the table is
+    // not trusted again while a record is still restored.
     const h2 = startAgain();
-    expect(h2.store.read().untrusted).toBeUndefined();
+    expect(h2.store.read().untrusted).toBeDefined();
     expect(h2.store.get(id)).toMatchObject({ status: "finished", restored: true });
     expect(h2.unlinked).toEqual([]);
     expect(h2.cron.get("task:s1")).toBe(1);
@@ -1181,5 +1187,126 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // Fresh review of round 5
+  // -------------------------------------------------------------------------
+
+  it("keeps the input when the send of its answer throws, not only when it fails", async () => {
+    let n = 0;
+    const h = harness({}, async (turn, hh) => {
+      n += 1;
+      if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
+      const sent = await hh.service.notify(turn.key, `answer ${n}`);
+      if (n === 2) expect(sent.ok).toBe(false);
+      if (n >= 3) hh.service.finish(turn.key, "done");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.sendThrows = 1;
+    h.service.relay(t.id, "what is the status?");
+    await flush();
+    expect(h.turns).toHaveLength(3);
+    expect(h.turns[2].prompt).toContain("what is the status?");
+    expect(h.turns[2].prompt).toContain('name="answer"');
+    expect(h.sent.map((m) => m.text).join()).toContain("answer 3");
+  });
+
+  it("counts an answer as delivered when a later send in the same turn went out, and a turn with no input never keeps anything", async () => {
+    let n = 0;
+    const h = harness({}, async (turn, hh) => {
+      n += 1;
+      if (n === 1) {
+        // No input carried: a failed send here is no lost answer.
+        hh.sendFails = 1;
+        await hh.service.notify(turn.key, "progress");
+        hh.service.noteToolUse(turn.key);
+        hh.store.transition("s1", "stuck");
+        return { ok: true };
+      }
+      hh.sendFails = 1;
+      await hh.service.notify(turn.key, "first try");
+      await hh.service.notify(turn.key, "second try");
+      hh.service.finish(turn.key, "done");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", failStreak: 0 });
+    h.service.relay(t.id, "status?");
+    await flush();
+    expect(h.turns).toHaveLength(2);
+    expect(h.store.get(t.id)).toMatchObject({ status: "finished", pendingInput: [] });
+  });
+
+  it("holds a finished task's failing answer only through what that turn carried: input that arrived during it gets a turn", async () => {
+    const h = harness();
+    seed(h, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
+    let n = 0;
+    h.onTurn = (turn, hh) => {
+      n += 1;
+      if (n === 2) hh.service.relay("s1", "newer question");
+      if (n <= 2) return { ok: false };
+      void hh.service.notify(turn.key, "both answered");
+      return { ok: true };
+    };
+    h.service.start();
+    h.service.relay("s1", "first question");
+    await flush();
+    expect(h.turns).toHaveLength(3);
+    expect(h.turns[2].prompt).toContain("first question");
+    expect(h.turns[2].prompt).toContain("newer question");
+    expect(h.store.get("s1")).toMatchObject({ status: "finished", heldThrough: 1, pendingInput: [] });
+  });
+
+  it("still continues an active task when what follows its turn's result cannot be written", async () => {
+    let n = 0;
+    const h = harness({}, working((turn, hh) => {
+      n += 1;
+      if (n === 1) hh.cron.set(turn.key, 1);
+      else { hh.cron.delete(turn.key); hh.service.finish(turn.key, "ok"); }
+    }));
+    const realTransition = h.store.transition.bind(h.store);
+    let failWait = true;
+    h.store.transition = ((...args: Parameters<typeof realTransition>) => {
+      if (args[1] === "wait_external" && failWait) { failWait = false; throw new Error("disk full"); }
+      return realTransition(...args);
+    }) as typeof realTransition;
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.turns).toHaveLength(2);
+    expect(h.turns[1].prompt).toContain('type="subsession-continue"');
+    expect(h.store.get(t.id)?.status).toBe("finished");
+  });
+
+  it("does not take an unreadable registry for an empty one at start: nothing is failed, unlinked or trusted again", () => {
+    const h0 = harness();
+    const id = seed(h0, "active");
+    h0.store.markUntrusted("lost");
+    const h = harness();
+    h.registryReadable = false; // and so it answers: no task sessions at all
+    h.service.start();
+    expect(h.store.get(id)?.status).not.toBe("failed");
+    expect(h.unlinked).toEqual([]);
+    expect(h.store.read().untrusted).toBeDefined();
+  });
+
+  it("makes a start asked for before dispatch opened as soon as start() opens it, past the slot cap", async () => {
+    const h = harness({ maxRunning: 0 }, working((turn, hh) => hh.service.finish(turn.key, "ok")));
+    const t = h.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    h.service.recoverAtStartup();
+    expect(h.service.startTask(t.id, "the owner started it")).toBe(true);
+    expect(h.store.get(t.id)?.status).toBe("queued");
+    await flush();
+    expect(h.turns).toHaveLength(0);
+    h.service.start();
+    await flush();
+    expect(h.turns).toHaveLength(1);
+    expect(h.store.get(t.id)?.status).toBe("finished");
   });
 });

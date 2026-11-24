@@ -490,7 +490,7 @@ export class Agent {
       config: () => config.subsessions,
       runTaskTurn: (key, prompt, opts) => this.runTaskTurn(key, prompt, opts),
       sendToScope: async (parentKey, text, taskKey, noteFrom) => {
-        const result = await this.proactive.sendToSession(parentKey, text, taskKey, { noteFrom });
+        const result = await this.proactive.sendToSession(parentKey, text, taskKey, { noteFrom, ownerOnlyNote: isDmSessionKey(parentKey) });
         return result.ok ? { ok: true } : { ok: false, error: result.error };
       },
       noticeToScope: async (parentKey, text) => {
@@ -519,6 +519,7 @@ export class Agent {
       cronJobCount: (key) => cron.count(key),
       removeCronJobs: (key) => cron.removeAll(key),
       stopSession: (key, timeoutMs) => this.stopTaskSession(key, timeoutMs),
+      registryReadable: () => this.sessions.registryReadable(),
       hasSdkSession: (key) => this.sessions.getSdkSessionId(key) !== undefined,
       ensureRegistryEntry: (key) => this.sessions.ensureEntry(key),
       unlinkRegistryEntry: (key) => this.sessions.clearSdkSessionId(key),

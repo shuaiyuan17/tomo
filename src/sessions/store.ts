@@ -93,6 +93,21 @@ export function getSdkSessionPath(
  * the last state we successfully loaded, which is strictly better than `[]`,
  * but nothing may be persisted from it until the file can be read again.
  */
+/** Parse registry file text; `ok: false` for anything that is not one. */
+function parseRegistryText(text: string): { ok: true; sessions: SessionEntry[] } | { ok: false; err: Error } {
+  let data: SessionRegistry;
+  try {
+    data = JSON.parse(text) as SessionRegistry;
+  } catch (err) {
+    return { ok: false, err: err instanceof Error ? err : new Error(String(err)) };
+  }
+  if (data === null || typeof data !== "object"
+    || (data.sessions !== undefined && !Array.isArray(data.sessions))) {
+    return { ok: false, err: new Error("missing or malformed `sessions` array") };
+  }
+  return { ok: true, sessions: data.sessions ?? [] };
+}
+
 export class SessionRegistryReadError extends Error {
   readonly path: string;
   constructor(path: string, cause: unknown) {
@@ -143,6 +158,11 @@ export class SessionStore {
   // (e.g. `tomo sessions clear`); the stat check lets those calls skip the
   // full read+parse when the file hasn't changed since we last touched it.
   private registryStat: { mtimeMs: number; size: number } | null = null;
+  /** One warn per streak for a `_sessions.json.bak` write that failed. */
+  private registryBackupErrorLogged = false;
+  /** Successful registry saves this process has made; lets a link mutator
+   *  tell whether it actually changed the file before refreshing the backup. */
+  private registrySaveCount = 0;
   private dir: string;
   private sdkSessionsDir: string;
   private tailLimit: number;
@@ -248,7 +268,10 @@ export class SessionStore {
     this.rotateBytes = opts?.rotateBytes ?? TRANSCRIPT_ROTATE_BYTES;
     if (!this.readOnly) mkdirSync(dir, { recursive: true });
     this.loadRegistry();
-    if (!this.readOnly) this.cleanupExpired();
+    if (!this.readOnly) {
+      this.seedRegistryBackup();
+      this.cleanupExpired();
+    }
   }
 
   /** Fresh metadata for read services, without cleanup, migration, or writes. */
@@ -1420,7 +1443,13 @@ export class SessionStore {
       this.loadRegistry();
       if (strict) this.assertRegistryLoaded();
       else if (!this.canWriteRegistry(op)) return undefined;
-      return fn();
+      const savesBefore = this.registrySaveCount;
+      const result = fn();
+      // A link change (the outermost frame only, and only if it saved)
+      // refreshes the backup the next start recovers from if the registry is
+      // found 0-byte or corrupt.
+      if (strict && !nested && this.registrySaveCount !== savesBefore) this.writeRegistryBackup(op);
+      return result;
     };
 
     let entered = false;
@@ -1988,21 +2017,33 @@ export class SessionStore {
       return;
     }
     if (stat.size === 0) {
-      if (this.readOnly) { this.onRegistryLoadFailure(new Error("Empty session registry")); return; }
       // A zero-byte registry is ambiguous, and JSON.parse("") throws — so
       // without this it would be a permanent refusal with no way to self-heal.
-      // There is no `.bak` for the registry to arbitrate with, so prior good
-      // state is the only signal available:
-      //  - holding nothing: an interrupted first write on a fresh install.
-      //    Reading it as empty loses nothing and recovers on the next save.
-      //  - holding entries: something truncated a real registry, and reading
-      //    it as empty is exactly the loss this class exists to prevent.
-      // Recovery from the refusing case is to delete the file — that reads as
+      // The usual cause is a crash or power loss right after a write that was
+      // not on disk yet:
+      //  - holding entries: something truncated a real registry under a
+      //    running process, and reading it as empty is exactly the loss this
+      //    class exists to prevent. Refuse.
+      //  - holding nothing, `.bak` usable: a restart after that power loss.
+      //    Recover the links from the backup.
+      //  - holding nothing, but this directory has history (a `.bak` we could
+      //    not use, or transcripts): NOT a fresh install. Reading it as empty
+      //    would let the next save drop every session→SDK-session link. Refuse.
+      //  - holding nothing, no history: an interrupted first write on a fresh
+      //    install. Reading it as empty loses nothing.
+      // Recovery from a refusing case is to delete the file — that reads as
       // ENOENT, i.e. legitimately empty.
       if (this.registry.length > 0) {
         this.onRegistryLoadFailure(
           new Error(`registry file is 0 bytes while ${this.registry.length} session(s) are held in memory`),
         );
+        return;
+      }
+      if (this.recoverRegistryFromBackup("registry file is 0 bytes")) return;
+      if (this.readOnly || this.sessionsDirHasHistory()) {
+        this.onRegistryLoadFailure(new Error(
+          "registry file is 0 bytes and this sessions directory has history; refusing to start from an empty registry",
+        ));
         return;
       }
       this.registry = [];
@@ -2018,21 +2059,137 @@ export class SessionStore {
       && this.registryStat.size === stat.size) {
       return;
     }
-    let data: SessionRegistry;
+    let text: string;
     try {
-      data = JSON.parse(readFileSync(file, "utf-8")) as SessionRegistry;
+      text = readFileSync(file, "utf-8");
     } catch (err) {
+      // An I/O failure (EIO, EMFILE, EACCES) says nothing about the content:
+      // refuse, never recover over it.
       this.onRegistryLoadFailure(err);
       return;
     }
-    if (data === null || typeof data !== "object"
-      || (data.sessions !== undefined && !Array.isArray(data.sessions))) {
-      this.onRegistryLoadFailure(new Error("missing or malformed `sessions` array"));
+    const parsed = parseRegistryText(text);
+    if (!parsed.ok) {
+      // Content that is not a registry. A process that has not had a good read
+      // yet (a start after a crash) recovers from the backup; one that has
+      // keeps refusing, so an operator editing the file is never overwritten
+      // under them.
+      if (this.registry.length === 0 && this.recoverRegistryFromBackup("registry file is corrupt")) return;
+      this.onRegistryLoadFailure(parsed.err);
       return;
     }
-    this.registry = data.sessions ?? [];
+    this.registry = parsed.sessions;
     this.registryStat = stat;
     this.clearRegistryLoadError();
+  }
+
+  private get registryBackupPath(): string {
+    return `${this.registryPath}.bak`;
+  }
+
+  /**
+   * True when this sessions directory has been used before: a backup exists
+   * (usable or not) or any transcript does. Used to tell a 0-byte registry left
+   * by a crash from one left by an interrupted first write.
+   */
+  private sessionsDirHasHistory(): boolean {
+    if (existsSync(this.registryBackupPath)) return true;
+    try {
+      return readdirSync(this.dir).some((name) => name.endsWith(".jsonl"));
+    } catch {
+      // Cannot tell: assume history, which refuses rather than loses links.
+      return true;
+    }
+  }
+
+  /**
+   * Replace a 0-byte or corrupt registry with `_sessions.json.bak`, the copy
+   * written after every link change. Only called while this process holds no
+   * entries. The bad file is kept as `_sessions.json.corrupt-<ts>`, never
+   * deleted. Returns false (and changes nothing) when there is no usable
+   * backup, or when the lock cannot be taken — the caller then refuses as
+   * before. A read-only store (the web process) never recovers: it fails
+   * closed, and the daemon's next start does the recovery.
+   */
+  private recoverRegistryFromBackup(reason: string): boolean {
+    if (this.readOnly) return false;
+    const bak = this.registryBackupPath;
+    let text: string;
+    try {
+      text = readFileSync(bak, "utf-8");
+    } catch (err) {
+      if (!isEnoent(err)) log.error({ err, file: bak }, "Session registry backup unreadable; cannot recover from it");
+      return false;
+    }
+    const parsed = parseRegistryText(text);
+    if (!parsed.ok) {
+      log.error({ err: parsed.err, file: bak }, "Session registry backup is corrupt; cannot recover from it");
+      return false;
+    }
+
+    const file = this.registryPath;
+    try {
+      return withFileLockSync(this.registryLockPath, () => {
+        // Another process may have repaired it while we waited for the lock.
+        let current: ReturnType<typeof parseRegistryText> | null = null;
+        try {
+          const now = readFileSync(file, "utf-8");
+          if (now.length > 0) current = parseRegistryText(now);
+        } catch (err) {
+          if (!isEnoent(err)) throw err;
+        }
+        if (current?.ok) {
+          this.registry = current.sessions;
+          this.registryStat = this.statRegistry();
+          this.clearRegistryLoadError();
+          return true;
+        }
+
+        const aside = `${file}.corrupt-${new Date().toISOString().replace(/[:.]/g, "-")}`;
+        try { renameSync(file, aside); } catch (err) { if (!isEnoent(err)) throw err; }
+        writeJsonAtomicSync(file, { version: 1, sessions: parsed.sessions } satisfies SessionRegistry, { fsync: true });
+        this.registry = parsed.sessions;
+        this.registryStat = this.statRegistry();
+        this.clearRegistryLoadError();
+        log.error(
+          { file, backup: bak, setAside: aside, sessions: parsed.sessions.length, reason },
+          "Session registry recovered from its backup; stats and titles since the last link change may be stale",
+        );
+        return true;
+      }, REGISTRY_LOCK_OPTIONS);
+    } catch (err) {
+      log.error({ err, file, backup: bak, reason }, "Could not recover the session registry from its backup");
+      return false;
+    }
+  }
+
+  /**
+   * Write `_sessions.json.bak` from the in-memory registry. Called under the
+   * registry lock after a link change, so the backup holds every link the
+   * registry does. Best effort: the registry itself is already saved.
+   */
+  private writeRegistryBackup(op: string): void {
+    if (this.readOnly || this.registryLoadError !== null) return;
+    try {
+      writeJsonAtomicSync(this.registryBackupPath, { version: 1, sessions: this.registry } satisfies SessionRegistry, { fsync: true });
+      this.registryBackupErrorLogged = false;
+    } catch (err) {
+      if (this.registryBackupErrorLogged) return;
+      this.registryBackupErrorLogged = true;
+      log.warn({ err, file: this.registryBackupPath, op }, "Could not write the session registry backup");
+    }
+  }
+
+  /** First start on a registry from before backups existed: write one now.
+   *  Only when it holds a link — metadata-only stubs have nothing to lose. */
+  private seedRegistryBackup(): void {
+    if (this.registryLoadError !== null || !this.registry.some((e) => e.sdkSessionId)) return;
+    if (existsSync(this.registryBackupPath)) return;
+    try {
+      withFileLockSync(this.registryLockPath, () => this.writeRegistryBackup("seed"), REGISTRY_LOCK_OPTIONS);
+    } catch (err) {
+      log.debug({ err }, "Skipped seeding the session registry backup: lock unavailable");
+    }
   }
 
   /**
@@ -2148,6 +2305,9 @@ export class SessionStore {
   }
 
   private saveRegistry(): void {
+    // fsynced: a rename the disk never saw leaves a 0-byte file after power
+    // loss, and this file holds every session→SDK-session link.
+    //
     // Refuse to publish state we could not read. Loud beats silent here: the
     // alternative is writing `{version:1,sessions:[]}` over a file that still
     // holds every session→SDK-session link, which is unrecoverable and, as
@@ -2163,16 +2323,17 @@ export class SessionStore {
     try {
       withFileLockSync(this.registryLockPath, () => {
         written = true;
-        writeJsonAtomicSync(this.registryPath, data);
+        writeJsonAtomicSync(this.registryPath, data, { fsync: true });
       }, REGISTRY_LOCK_OPTIONS);
     } catch (err) {
       // Past the lock: the write itself failed, and that is the caller's news.
       if (written) throw err;
       // A live holder is a refusal, not a reason to publish anyway.
       if (err instanceof FileLockTimeoutError) throw err;
-      writeJsonAtomicSync(this.registryPath, data);
+      writeJsonAtomicSync(this.registryPath, data, { fsync: true });
     }
     this.registryDirty = false;
+    this.registrySaveCount++;
     if (this.registryWriteErrorLogged) {
       this.registryWriteErrorLogged = false;
       log.info({ file: this.registryPath }, "Session-registry writes succeeding again");

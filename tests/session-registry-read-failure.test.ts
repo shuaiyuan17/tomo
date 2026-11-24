@@ -3,7 +3,7 @@ import {
   SessionStore as SessionStoreImpl,
   SessionRegistryReadError,
 } from "../src/sessions/store.js";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { SessionStore as RawSessionStore } from "../src/sessions/store.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -12,6 +12,7 @@ const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-registry-read-failure-"))
 // The root is unique to this run, so nothing else will clean it up.
 afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 const REGISTRY = join(TEST_DIR, "_sessions.json");
+const BACKUP = `${REGISTRY}.bak`;
 
 class SessionStore extends SessionStoreImpl {
   constructor(dir: string, historyLimit = 20, sdkSessionsDir = join(dir, "sdk-sessions")) {
@@ -250,6 +251,8 @@ describe("session registry read failure", () => {
     writeFileSync(REGISTRY, JSON.stringify(parsed));
     const expired = readFileSync(REGISTRY, "utf-8");
     writeFileSync(REGISTRY, "{ not json");
+    // No backup to recover from (that path has its own tests below).
+    rmSync(BACKUP, { force: true });
 
     new SessionStore(TEST_DIR);
     expect(existsSync(sdkFile)).toBe(true);
@@ -287,11 +290,106 @@ describe("session registry read failure", () => {
   it("constructs without throwing when the registry is unreadable at startup", () => {
     seed();
     writeFileSync(REGISTRY, "{{{");
+    rmSync(BACKUP, { force: true });
     // A read error at boot must not take the daemon down...
     const store = new SessionStore(TEST_DIR);
     // ...but nothing may be written from the empty state it starts with.
     expect(() => store.setSdkSessionId("telegram:1", "sdk-zzz")).toThrow(SessionRegistryReadError);
     expect(readFileSync(REGISTRY, "utf-8")).toBe("{{{");
+  });
+});
+
+describe("session registry durability (fsync + backup)", () => {
+  beforeEach(() => {
+    mkdirSync(TEST_DIR, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(TEST_DIR, { recursive: true, force: true });
+  });
+
+  const linksOn = (path: string): Record<string, string> => Object.fromEntries(
+    (JSON.parse(readFileSync(path, "utf-8")) as { sessions: Array<{ channelKey: string; sdkSessionId: string | null; unlinkedAt: number | null }> })
+      .sessions.filter((e) => e.unlinkedAt === null && e.sdkSessionId).map((e) => [e.channelKey, e.sdkSessionId!]),
+  );
+
+  it("keeps a backup that follows every link change", () => {
+    const store = seed();
+    expect(linksOn(BACKUP)).toEqual({ "telegram:1": "sdk-aaa", "telegram:2": "sdk-bbb", "imessage:3": "sdk-ccc" });
+    store.clearSdkSessionId("telegram:2");
+    expect(linksOn(BACKUP)).toEqual({ "telegram:1": "sdk-aaa", "imessage:3": "sdk-ccc" });
+  });
+
+  it("recovers the links from the backup when a restart finds a 0-byte registry (power loss)", () => {
+    seed();
+    writeFileSync(REGISTRY, "");
+
+    const store = new SessionStore(TEST_DIR);
+    expect(store.getSdkSessionId("telegram:1")).toBe("sdk-aaa");
+    expect(store.getSdkSessionId("imessage:3")).toBe("sdk-ccc");
+    // Restored on disk, and the bad file is kept, not deleted.
+    expect(linksOn(REGISTRY)).toEqual(linksOn(BACKUP));
+    const aside = readdirSync(TEST_DIR).filter((n) => n.startsWith("_sessions.json.corrupt-"));
+    expect(aside).toHaveLength(1);
+    // And the next link change saves normally on top of it.
+    store.setSdkSessionId("telegram:9", "sdk-new");
+    expect(linksOn(REGISTRY)["telegram:9"]).toBe("sdk-new");
+  });
+
+  it("recovers from the backup when a restart finds a corrupt registry", () => {
+    seed();
+    writeFileSync(REGISTRY, '{"version":1,"sessions":[{"sdkSess');
+    const store = new SessionStore(TEST_DIR);
+    expect(store.getSdkSessionId("telegram:2")).toBe("sdk-bbb");
+    expect(() => store.setSdkSessionId("telegram:9", "sdk-x")).not.toThrow();
+  });
+
+  it("never recovers in a read-only reader: it fails closed and writes nothing", () => {
+    seed();
+    writeFileSync(REGISTRY, "");
+    expect(() => SessionStoreImpl.readSnapshot(TEST_DIR, join(TEST_DIR, "sdk-sessions"))).toThrow(SessionRegistryReadError);
+    expect(readFileSync(REGISTRY, "utf-8")).toBe("");
+  });
+
+  it("does not rewrite the backup when a link mutator changed nothing", () => {
+    const store = seed();
+    const before = statSync(BACKUP, { bigint: true });
+    store.retireSdkSessionId("telegram:absent");
+    expect(statSync(BACKUP, { bigint: true }).ino).toBe(before.ino);
+  });
+
+  it("refuses, rather than starting empty, on a 0-byte registry in a directory with history and no usable backup", () => {
+    seed();
+    writeFileSync(join(TEST_DIR, "telegram_1.jsonl"), "{}\n");
+    writeFileSync(REGISTRY, "");
+    rmSync(BACKUP);
+
+    const store = new SessionStore(TEST_DIR);
+    expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
+    expect(readFileSync(REGISTRY, "utf-8")).toBe("");
+  });
+
+  it("refuses when the backup is itself corrupt", () => {
+    seed();
+    writeFileSync(REGISTRY, "");
+    writeFileSync(BACKUP, "{{");
+    const store = new SessionStore(TEST_DIR);
+    expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
+    expect(readFileSync(REGISTRY, "utf-8")).toBe("");
+  });
+
+  it("does not recover over a registry that goes bad under a running process", () => {
+    const store = seed();
+    writeFileSync(REGISTRY, "{ half");
+    expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
+    expect(readFileSync(REGISTRY, "utf-8")).toBe("{ half");
+  });
+
+  it("seeds a backup on the first start after upgrading", () => {
+    seed();
+    rmSync(BACKUP);
+    new SessionStore(TEST_DIR);
+    expect(linksOn(BACKUP)).toEqual(linksOn(REGISTRY));
   });
 });
 

@@ -118,6 +118,7 @@ Environment variables override config file values:
 | `TOMO_INBOX` | Durable inbox (default `true`; `false` holds waiting messages in memory only). See [Durable inbox](#durable-inbox) |
 | `TOMO_INBOX_REPLAY_MAX_AGE_MINUTES` | Oldest waiting message answered after a restart (default: `360`; `0` = never replay, only record) |
 | `TOMO_INTERRUPTED_AGENTS` | Track running subagents on disk and report the ones a restart or crash cut off (default `true`) |
+| `TOMO_INTERRUPTED_AGENTS_AUTO_RESUME` | After a restart, tell each session to resume its resumable subagents right away (config key `interruptedAgents.autoResume`, default `true`) |
 | `TOMO_SUMMON_EXPIRY_MINUTES` | Group inactivity after which a `/summon` expires (config key `summonExpiryMinutes`, default: `60`) |
 | `TOMO_SAVE_INBOUND_FILES` | Override storage of inbound attachments that are neither images nor supported documents. Defaults to whatever `saveInboundImages` is |
 | `TOMO_NOTIFY_OWNER_ON_SUPPRESSED_ERRORS` | Tell the owner when a failure is kept out of a chat (config key `notifyOwnerOnSuppressedErrors`, default `true`). See below |
@@ -228,7 +229,15 @@ Set `"inbox": false` or `TOMO_INBOX=false` to turn it off. Waiting messages are 
 
 ## Interrupted subagents
 
-Each session's running subagents and background commands are mirrored to `~/.tomo/data/running-agents.json` (atomic write on every start and end), so a crash is covered as well as a restart. On the next start, every session that had some still running gets one `interrupted-agents` event listing their ids, descriptions, types and last activity. Nothing is resumed automatically: the model can continue a subagent with `SendMessage` to its id. Explore/Plan subagents and background commands cannot be resumed. Set `"interruptedAgents": false` or `TOMO_INTERRUPTED_AGENTS=false` to turn it off.
+Each session's running subagents and background commands are mirrored to `~/.tomo/data/running-agents.json` (atomic write on every start and end), so a crash is covered as well as a restart. On the next start, every session that had some still running gets one `interrupted-agents` event listing their ids, descriptions, types and last activity. With `interruptedAgents.autoResume` on (the default), the event tells the model to resume each resumable subagent right away with `SendMessage` to its id, unless the owner has said not to, and to have it first check how far it got and which side effects already happened. Explore/Plan subagents and background commands cannot be resumed. The limit is enforced by a hook on `SendMessage`, whichever turn sends it: each resume of an interrupted subagent is counted in the same file before it is allowed (if the count cannot be written, the resume is refused), and after 3 the hook refuses further resumes. A subagent cut off again after 3 resumes is reported to the owner as failed. The count is cleared when the subagent ends on its own.
+
+With `autoResume` off, nothing is resumed automatically: the model is told and decides, and can continue a subagent with `SendMessage` to its id.
+
+```json
+{ "interruptedAgents": { "enabled": true, "autoResume": false } }
+```
+
+Set `"interruptedAgents": false` (or `{ "enabled": false }`) or `TOMO_INTERRUPTED_AGENTS=false` to turn it all off; the file is then removed, so turning it back on starts clean.
 
 ## Context management (LCM)
 

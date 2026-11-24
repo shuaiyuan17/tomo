@@ -277,8 +277,16 @@ export interface TomoConfig {
   inboxReplayMaxAgeMinutes: number;
   /** Keep a running list of each session's subagents and background commands
    *  on disk (~/.tomo/data/running-agents.json), and on the next start tell
-   *  each session which ones a restart or crash cut off. Default true. */
+   *  each session which ones a restart or crash cut off. Default true.
+   *  File key: `interruptedAgents: true|false`, or an object
+   *  `{ enabled?, autoResume? }`. */
   interruptedAgents: boolean;
+  /** With `interruptedAgents` on: the startup notice tells the session to
+   *  resume each resumable subagent right away (unless the owner said not
+   *  to), up to a per-agent cap of consecutive automatic resumes. Off: the
+   *  model is only told, and decides. File key `interruptedAgents.autoResume`.
+   *  Default true. */
+  interruptedAgentsAutoResume: boolean;
   /** Deliver the model's `thinking` content blocks to the chat alongside its
    *  `text` blocks. Default false.
    *
@@ -936,6 +944,10 @@ function buildConfig(): TomoConfig {
   checkWorkspaceDirRenderable(paths.workspaceDir);
   const channels = parseChannels(file.channels);
   const mcp = (file.mcp ?? {}) as Record<string, unknown>;
+  // `interruptedAgents` is either the on/off switch or `{ enabled?, autoResume? }`.
+  const interruptedAgentsBlock = file.interruptedAgents && typeof file.interruptedAgents === "object" && !Array.isArray(file.interruptedAgents)
+    ? file.interruptedAgents as { enabled?: unknown; autoResume?: unknown }
+    : undefined;
   const mcpServers = parseExternalMcpServers(file.mcpServers ?? mcp.servers);
   const mcpAllowedTools = validated(
     "mcpAllowedTools",
@@ -1059,7 +1071,11 @@ function buildConfig(): TomoConfig {
     ),
     interruptedAgents: validated(
       "interruptedAgents (TOMO_INTERRUPTED_AGENTS)", boolLike,
-      envVar("TOMO_INTERRUPTED_AGENTS") ?? file.interruptedAgents, true,
+      envVar("TOMO_INTERRUPTED_AGENTS") ?? (interruptedAgentsBlock ? interruptedAgentsBlock.enabled : file.interruptedAgents), true,
+    ),
+    interruptedAgentsAutoResume: validated(
+      "interruptedAgents.autoResume (TOMO_INTERRUPTED_AGENTS_AUTO_RESUME)", boolLike,
+      envVar("TOMO_INTERRUPTED_AGENTS_AUTO_RESUME") ?? interruptedAgentsBlock?.autoResume, true,
     ),
     showThinking: validated("showThinking (TOMO_SHOW_THINKING)", boolLike, envVar("TOMO_SHOW_THINKING") ?? file.showThinking, false),
     notifyOwnerOnSuppressedErrors: validated(

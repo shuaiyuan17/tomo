@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { formatInterruptedAgentsNotice, RunningAgentsLedger } from "../src/agent/running-agents-ledger.js";
+import { formatInterruptedAgentsNotice, MAX_AUTO_RESUMES, resumeGateHooks, RunningAgentsLedger, type RunningTaskRecord } from "../src/agent/running-agents-ledger.js";
+import { buildHooksOption } from "../src/agent/sdk-options.js";
 import { WatchBus } from "../src/watch/bus.js";
 import type { WatchTask } from "../src/watch/protocol.js";
 
@@ -122,4 +123,145 @@ describe("running-agents ledger", () => {
     expect(body).toMatch(/b1 "npm test" \(background command.*rerun/);
     expect(body).toContain("SendMessage to its id");
   });
+
+  describe("auto-resume", () => {
+    const openOn = (warn = vi.fn()) => new RunningAgentsLedger({ path, now: () => clock, warn, autoResume: true });
+    /** The agent was running when the daemon died: the next process gates it. */
+    const crashWith = (...ids: string[]) => { openOn().observe("dm:owner", ids.map((id) => agent(id))); return openOn(); };
+    const recs: RunningTaskRecord[] = [
+      { sessionKey: "k", taskId: "a1", kind: "agent", taskType: "local_agent", subagentType: "general-purpose", description: "fix bug", startedAt: 0, lastActivityAt: 0 },
+      { sessionKey: "k", taskId: "a2", kind: "agent", taskType: "local_agent", subagentType: "general-purpose", description: "loops", startedAt: 0, lastActivityAt: 0 },
+      { sessionKey: "k", taskId: "e1", kind: "agent", taskType: "local_agent", subagentType: "Explore", description: "look", startedAt: 0, lastActivityAt: 0 },
+      { sessionKey: "k", taskId: "u1", kind: "agent", taskType: "local_agent", description: "untyped", startedAt: 0, lastActivityAt: 0 },
+      { sessionKey: "k", taskId: "b1", kind: "command", taskType: "local_bash", description: "npm test", startedAt: 0, lastActivityAt: 0 },
+    ];
+
+    it("off: the notice reads exactly as on main", () => {
+      const body = formatInterruptedAgentsNotice(recs, "UTC");
+      expect(body.split("\n").at(-1)).toBe(
+        "Nothing has been resumed. To continue a resumable subagent, SendMessage to its id (names do not survive a restart; use the id) and it picks up from its saved transcript. "
+        + "Explore/Plan subagents and background commands cannot be resumed; rerun them if still needed. "
+        + "Decide for each whether it is still worth continuing.");
+      expect(body).toContain('- u1 "untyped" (subagent, ran 0m, last activity 01/01 00:00 UTC)\n');
+      expect(body).not.toMatch(/FAILED|right away|type unknown/);
+    });
+
+    it("on: asks for each resumable subagent to be resumed now; failed and untyped ones are marked", () => {
+      const body = formatInterruptedAgentsNotice(recs, "UTC", { failed: new Set(["a2"]) });
+      expect(body).toContain('- a1 "fix bug" (general-purpose, ran 0m, last activity 01/01 00:00 UTC)\n');
+      expect(body).toContain(`- a2 "loops" (general-purpose, ran 0m, last activity 01/01 00:00 UTC) — FAILED: cut off again after ${MAX_AUTO_RESUMES} resumes; do not resume it`);
+      expect(body).toMatch(/e1 "look" \(Explore[^\n]* — cannot be resumed\n/);
+      expect(body).toContain("u1 \"untyped\" (subagent, ran 0m, last activity 01/01 00:00 UTC) — type unknown (could be Explore/Plan); do not resume it automatically");
+      expect(body).toContain("use SendMessage to its id right away to resume it");
+      expect(body).toContain("unless the owner has explicitly said not to");
+      expect(body).toMatch(/Tell it it was interrupted by a restart, have it first check how far it got and which side effects/);
+      expect(body).not.toContain("Nothing has been resumed");
+    });
+
+    it(`the gate allows ${MAX_AUTO_RESUMES} resumes of an interrupted agent, counted on disk, then denies`, () => {
+      let ledger = crashWith("a1");
+      for (let i = 1; i <= MAX_AUTO_RESUMES; i++) {
+        expect(ledger.gateResume("dm:owner", "a1")).toBeNull();
+        // Counted before the call runs: a crash right now still has it.
+        expect(openOn().resumeCount("dm:owner", "a1")).toBe(i);
+        // Resumed (running again), and the daemon dies again.
+        ledger.observe("dm:owner", [agent("a1")]);
+        ledger = openOn();
+      }
+      const reason = ledger.gateResume("dm:owner", "a1");
+      expect(reason).toMatch(new RegExp(`already been resumed ${MAX_AUTO_RESUMES} times`));
+      expect(ledger.resumeCount("dm:owner", "a1")).toBe(MAX_AUTO_RESUMES);
+      // Every turn hits the same gate: a second try is denied too.
+      expect(ledger.gateResume("dm:owner", "a1")).not.toBeNull();
+    });
+
+    it("the gate counts per session and agent, and leaves other SendMessage calls alone", () => {
+      const ledger = crashWith("a1");
+      expect(ledger.gateResume("dm:owner", "other")).toBeNull();
+      expect(ledger.gateResume("telegram:1", "a1")).toBeNull();
+      expect(ledger.resumeCount("telegram:1", "a1")).toBe(0);
+      // A message to the agent while it runs is not a resume.
+      ledger.observe("dm:owner", [agent("a1")]);
+      expect(ledger.gateResume("dm:owner", "a1")).toBeNull();
+      expect(ledger.resumeCount("dm:owner", "a1")).toBe(0);
+    });
+
+    it("Explore/Plan agents and commands are not gated", () => {
+      openOn().observe("dm:owner", [agent("e1", { subagentType: "Explore" }), agent("b1", { taskType: "local_bash" })]);
+      const ledger = openOn();
+      expect(ledger.gateResume("dm:owner", "e1")).toBeNull();
+      expect(ledger.gateResume("dm:owner", "b1")).toBeNull();
+      expect(onDisk()).not.toHaveProperty("resumes");
+    });
+
+    it("a count that cannot be written denies the resume and is not kept", () => {
+      const ledger = crashWith("a1");
+      rmSync(path); mkdirSync(path);  // the ledger path is now a directory: every write fails
+      expect(ledger.gateResume("dm:owner", "a1")).toMatch(/could not record/);
+      expect(ledger.resumeCount("dm:owner", "a1")).toBe(0);
+    });
+
+    it("an agent that ends on its own clears its count; a shutdown does not", () => {
+      let ledger = crashWith("a1");
+      ledger.gateResume("dm:owner", "a1");
+      ledger.observe("dm:owner", [agent("a1")]);
+      ledger.freeze();
+      ledger.observe("dm:owner", []);
+      ledger = openOn();
+      expect(ledger.resumeCount("dm:owner", "a1")).toBe(1);
+
+      ledger.gateResume("dm:owner", "a1");
+      ledger.observe("dm:owner", [agent("a1")]);
+      ledger.observe("dm:owner", [agent("a1", { status: "completed" })]);
+      expect(ledger.resumeCount("dm:owner", "a1")).toBe(0);
+      expect(openOn().gateResume("dm:owner", "a1")).toBeNull();
+      expect(openOn().resumeCount("dm:owner", "a1")).toBe(0);
+    });
+
+    it("one cut off again past the limit is owed a failure notice until it is sent", () => {
+      let ledger = crashWith("a1");
+      for (let i = 0; i < MAX_AUTO_RESUMES; i++) {
+        expect(ledger.owedFailureNotices()).toEqual([]);
+        ledger.gateResume("dm:owner", "a1");
+        ledger.observe("dm:owner", [agent("a1")]);
+        ledger = openOn();
+      }
+      expect(ledger.owedFailureNotices()).toEqual([{ sessionKey: "dm:owner", taskId: "a1" }]);
+      expect(openOn().owedFailureNotices()).toEqual([{ sessionKey: "dm:owner", taskId: "a1" }]);
+      ledger = openOn();
+      ledger.failureNoticeSent("dm:owner", ["a1"]);
+      expect(openOn().owedFailureNotices()).toEqual([]);
+    });
+
+    it("off: no counts are kept or written, and nothing is gated", () => {
+      crashWith("a1").gateResume("dm:owner", "a1");
+      const off = open();
+      expect(off.gateResume("dm:owner", "a1")).toBeNull();
+      off.observe("dm:owner", [agent("a2")]);
+      expect(onDisk()).not.toHaveProperty("resumes");
+    });
+
+    it("discard removes the file", () => {
+      open().observe("dm:owner", [agent("a1")]);
+      RunningAgentsLedger.discard(path);
+      expect(existsSync(path)).toBe(false);
+      expect(open().pendingBySession().size).toBe(0);
+    });
+
+    it("the hook denies SendMessage with the gate's reason and passes everything else", async () => {
+      const gate = vi.fn((id: string) => (id === "bad" ? "no" : null));
+      const hook = resumeGateHooks(gate).PreToolUse[0].hooks[0];
+      expect(await hook({ tool_name: "SendMessage", tool_input: { to: "bad", message: "x" } })).toEqual({
+        hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "no" },
+      });
+      expect(await hook({ tool_name: "SendMessage", tool_input: { to: "ok" } })).toEqual({});
+      expect(await hook({ tool_name: "Bash", tool_input: { to: "bad" } })).toEqual({});
+      expect(gate).toHaveBeenCalledTimes(2);
+      // Installed through the SDK options only when a gate is given.
+      const hooks = (buildHooksOption({ maxTurns: 0, resumeGate: gate }) as { hooks?: { PreToolUse?: { matcher?: string }[] } }).hooks;
+      expect(hooks?.PreToolUse?.map((h) => h.matcher)).toContain("SendMessage");
+      expect(buildHooksOption({ maxTurns: 0 })).toEqual({});
+    });
+  });
 });
+

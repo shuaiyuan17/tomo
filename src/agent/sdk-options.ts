@@ -1,5 +1,6 @@
 import type { ElicitationRequest, ElicitationResult, McpSdkServerConfigWithInstance, McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import { backgroundLaunchGuardHooks } from "./compact-reservations.js";
+import { resumeGateHooks } from "./running-agents-ledger.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
@@ -114,6 +115,12 @@ export interface SessionContext {
    * guard is not installed. See compact-reservations.ts.
    */
   backgroundLaunchDenial?: () => string | null;
+  /**
+   * Per SendMessage: null to allow, or why a resume of an interrupted subagent
+   * is refused (running-agents-ledger.ts, RESUME CAP). Undefined ⇒ the hook is
+   * not installed.
+   */
+  resumeGate?: (taskId: string) => string | null;
 }
 
 export function sdkOptions(
@@ -299,6 +306,7 @@ export function sdkOptions(
       agentProfile,
       undeliveredReply: sessionContext?.undeliveredReply,
       backgroundLaunchDenial: sessionContext?.backgroundLaunchDenial,
+      resumeGate: sessionContext?.resumeGate,
       // Resolved at spawn (above) and handed to the guard as a getter, so the
       // barred-turn Bash arm can spot a plugin that ships PreToolUse hooks
       // without re-resolving install paths on every tool call.
@@ -478,6 +486,8 @@ export function buildHooksOption(args: {
   todosDir?: () => string;
   /** Per-call reason to deny a background launch (pending compact), or null. */
   backgroundLaunchDenial?: () => string | null;
+  /** Per-SendMessage reason to deny a resume (the resume cap), or null. */
+  resumeGate?: (taskId: string) => string | null;
 }) {
   const hooks: Record<string, unknown[]> = {};
   if (args.credentialBroker) {
@@ -496,6 +506,10 @@ export function buildHooksOption(args: {
   // Deny-only, like the todo guard below.
   if (args.backgroundLaunchDenial) {
     mergeHooks(hooks, backgroundLaunchGuardHooks(args.sessionKey, args.backgroundLaunchDenial));
+  }
+  // Deny-only, like the todo guard below.
+  if (args.resumeGate) {
+    mergeHooks(hooks, resumeGateHooks(args.resumeGate));
   }
   // Deny-only, so its place before the private-memory guard costs nothing.
   if (args.todosDir) {

@@ -41,7 +41,7 @@ import { SteerDeclinedError, TurnInterruptedError, type QueryResult, type ReplyC
 import { isSilentReply } from "./agent/text-utils.js";
 import { audienceOf, audienceSwitchNote, TurnAudienceRegistry, type TurnOrigin } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
-import { formatInterruptedAgentsNotice, RunningAgentsLedger, type RunningTaskRecord } from "./agent/running-agents-ledger.js";
+import { formatInterruptedAgentsNotice, isResumable, MAX_AUTO_RESUMES, RunningAgentsLedger, type RunningTaskRecord } from "./agent/running-agents-ledger.js";
 import { DurableInbox, INBOX_STALE_NOT_PROCESSED, restoreMessage, type InboxRecord } from "./agent/durable-inbox.js";
 import { ChatCommandHandler, backupConfigFile } from "./agent/commands.js";
 import type { TaskBoard } from "./web/tasks.js";
@@ -245,11 +245,14 @@ export class Agent {
             return sdkSessionId ? join(config.sdkSessionsDir, sdkSessionId, "subagents", `agent-${taskId}.jsonl`) : undefined;
           },
           warn: (obj, msg) => log.warn(obj, msg),
+          autoResume: config.interruptedAgentsAutoResume,
         });
         this.detachRunningAgents = this.runningAgents.attach(watchBus);
       } catch (err) {
         log.warn({ err }, "Running-agents ledger unavailable; interrupted subagents will not be reported after a restart");
       }
+    } else {
+      RunningAgentsLedger.discard(join(config.tomoHome, "data", "running-agents.json"), (obj, msg) => log.warn(obj, msg));
     }
     this.delivery = new DeliveryPipeline({
       queuePendingErrorNote: (sessionKey, visibleError) => this.queuePendingErrorNote(sessionKey, visibleError),
@@ -390,6 +393,9 @@ export class Agent {
       getSessionMessages: (key) => this.sessions.get(key).messages,
       getModelOverride: (key) => this.modelOverrides.get(key),
       createInternalMcpServer: (key) => createTomoInternalMcpServer(this, key),
+      ...(this.runningAgents && config.interruptedAgentsAutoResume
+        ? { resumeGate: (key: string, taskId: string) => this.runningAgents?.gateResume(key, taskId) ?? null }
+        : {}),
       buildExternalMcpServers: (key) => this.mcpOAuthManager.buildServersWithAuth(
         config.mcpServers ?? {},
         (serverName, url) => this.mcpAuthPrompts.forwardMcpAuthorizeUrl(key, serverName, url),
@@ -3029,6 +3035,12 @@ export class Agent {
    * entry dropped; a note that could not be persisted leaves the entry, so the
    * next start tells the session again. A background turn is then queued so
    * the note reaches the model now rather than at the next message.
+   *
+   * With `interruptedAgents.autoResume` the note and the turn ask for each
+   * resumable subagent to be resumed right away. They only remind: the resume
+   * cap is enforced by the SendMessage hook (RunningAgentsLedger.gateResume),
+   * so a repeated reminder is harmless. An agent found interrupted again past
+   * its limit is reported to the owner directly, until that send succeeds.
    */
   private notifyInterruptedAgents(): void {
     const ledger = this.runningAgents;
@@ -3044,7 +3056,10 @@ export class Agent {
         ledger.acknowledge(key);
         continue;
       }
-      if (!this.queuePendingNote(key, formatTomoEvent("interrupted-agents", formatInterruptedAgentsNotice(records)))) {
+      const autoResume = config.interruptedAgentsAutoResume
+        ? { failed: new Set(records.filter((r) => isResumable(r) && ledger.resumeCount(key, r.taskId) >= MAX_AUTO_RESUMES).map((r) => r.taskId)) }
+        : undefined;
+      if (!this.queuePendingNote(key, formatTomoEvent("interrupted-agents", formatInterruptedAgentsNotice(records, undefined, autoResume)))) {
         log.error({ sessionKey: key }, "Could not persist the interrupted-subagents note; kept for the next start");
         continue;
       }
@@ -3052,15 +3067,35 @@ export class Agent {
       owed.add(key);
       log.info({ sessionKey: key, ids: records.map((r: RunningTaskRecord) => r.taskId) }, "Reporting subagents interrupted by the last restart");
     }
+    this.sendOwedResumeFailures(ledger);
     const prompt = formatTomoEvent(
       "interrupted-agents",
-      "Startup check after a restart: if a note above lists interrupted subagents or commands, decide whether each is "
-        + `still worth continuing; otherwise there is nothing to do. ${CONTINUITY_DELIVERY_NOTE}`,
+      config.interruptedAgentsAutoResume
+        ? "Startup check after a restart: if a note above lists interrupted subagents, for each resumable one use SendMessage to resume it right away, "
+          + "unless the owner has explicitly said not to: tell it it was interrupted by a restart, have it first check how far it got "
+          + "and what side effects already happened, then continue. Skip any the note marks otherwise; Explore/Plan subagents and "
+          + `background commands cannot be resumed. If no note lists any, there is nothing to do. ${CONTINUITY_DELIVERY_NOTE}`
+        : "Startup check after a restart: if a note above lists interrupted subagents or commands, decide whether each is "
+          + `still worth continuing; otherwise there is nothing to do. ${CONTINUITY_DELIVERY_NOTE}`,
       { name: "check" },
     );
     for (const key of owed) {
       this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, ownerT("notices")("suppressed.turn.interruptedAgents"), "restart"))
         .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"));
+    }
+  }
+
+  /** Tell the owner (no model turn) which subagents failed past their resume limit; unsent ones are tried again next start. */
+  private sendOwedResumeFailures(ledger: RunningAgentsLedger): void {
+    const bySession = new Map<string, string[]>();
+    for (const { sessionKey, taskId } of ledger.owedFailureNotices()) bySession.set(sessionKey, [...(bySession.get(sessionKey) ?? []), taskId]);
+    for (const [sessionKey, ids] of bySession) {
+      log.warn({ sessionKey, ids }, "Interrupted subagents are past their resume limit; reporting them as failed");
+      void this.notifyOwner(ownerT("notices")("interruptedAgents.autoResumeFailed", {
+        count: ids.length, session: sessionKey, max: MAX_AUTO_RESUMES, agents: ids.join("\n"),
+      }))
+        .then((sent) => { if (sent) ledger.failureNoticeSent(sessionKey, ids); })
+        .catch((err) => log.warn({ err, sessionKey }, "Could not tell the owner about failed interrupted subagents"));
     }
   }
 

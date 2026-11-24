@@ -103,6 +103,8 @@ export interface SubsessionRecord {
   /** Goal, progress, next step and side effects (task_checkpoint). */
   checkpoint?: string;
   report?: string;
+  /** Counts the task's reports (a finished task can be woken and finish again); its report note is named by it. */
+  reportSeq?: number;
   reportDelivered: boolean;
   /** A `/compact` turn is due (context over subsessions.maxContextTokens). */
   compactPending: boolean;

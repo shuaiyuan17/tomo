@@ -397,7 +397,7 @@ export class SubsessionService {
     if (!record) return { ok: false, from: null };
     const outcome = this.store.transition(record.id, "finish", {
       // A live ending: the status no longer comes from a backup.
-      patch: (r) => { r.report = report.trim(); r.reportDelivered = false; delete r.restored; },
+      patch: (r) => { r.reportSeq = (r.reportSeq ?? (r.report !== undefined ? 1 : 0)) + 1; r.report = report.trim(); r.reportDelivered = false; delete r.restored; },
     });
     if (!outcome.ok) return outcome;
     this.continueOwed.delete(record.id);
@@ -816,6 +816,10 @@ export class SubsessionService {
       // A finished task still owing an answer (pending, or held for the
       // owner's next message) stays finished: archived, it could never be
       // woken to give it, and its input would go with the record.
+      // Nor is a task archived or forgotten while its report note is still
+      // unread: the note holds only the start of the report, and points to
+      // task_status for the rest.
+      if (this.reportNotePending(task)) continue;
       if (task.status === "finished" && task.reportDelivered && task.pendingInput.length === 0
         && now - (task.endedAt ?? task.lastActivityAt) > FINISHED_KEEP_MS) {
         const outcome = this.store.transition(task.id, "archive", { reason: "finished more than 7 days ago" });
@@ -1253,7 +1257,7 @@ export class SubsessionService {
       const note = formatTomoEvent("subsession-report", [
         `Sub-session ${record.id} ("${record.title}") finished. Its report${report.length > REPORT_NOTE_EXCERPT ? " (start; read the whole report with task_status)" : ""}:`,
         excerpt,
-      ].join("\n"), { name: record.id });
+      ].join("\n"), { name: reportNoteName(record) });
       if (!this.deps.queuePendingNote(record.parentKey, note)) {
         this.unpersistedReports.add(record.id);
         this.retryReport(record.id);
@@ -1269,8 +1273,9 @@ export class SubsessionService {
     this.safely(() => this.store.update(record.id, (r) => { r.reportDelivered = true; }), "mark report delivered");
   }
 
+  /** This report's own note (by report seq): an unread earlier report of the same task is another note. */
   private reportNotePending(record: SubsessionRecord): boolean {
-    const marker = `<tomo-event type="subsession-report" name="${record.id}"`;
+    const marker = `<tomo-event type="subsession-report" name="${reportNoteName(record)}"`;
     return this.deps.hasPendingNote(record.parentKey, (n) => n.includes(marker));
   }
 
@@ -1351,6 +1356,11 @@ function inputQueueFull(record: SubsessionRecord): string | undefined {
 
 function hasPendingInput(record: SubsessionRecord): string | undefined {
   return record.pendingInput.length > 0 ? "input is pending" : undefined;
+}
+
+/** A report note's name: the task id and which of its reports (`s3#2`). */
+function reportNoteName(record: SubsessionRecord): string {
+  return `${record.id}#${record.reportSeq ?? 1}`;
 }
 
 /** `s12` → 12 (0 for anything else). */

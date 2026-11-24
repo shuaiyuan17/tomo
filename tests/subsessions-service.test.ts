@@ -150,7 +150,7 @@ describe("SubsessionService", () => {
     expect(h.turns[0].prompt).toContain("> please fix it");
     const done = h.store.get(t.id)!;
     expect(done).toMatchObject({ status: "finished", report: "Done: PR #1", reportDelivered: true, startDelivered: true });
-    const note = h.notes.get("dm:owner")!.find((n) => n.includes('type="subsession-report" name="s1"'));
+    const note = h.notes.get("dm:owner")!.find((n) => n.includes('type="subsession-report" name="s1#1"'));
     expect(note).toContain("Done: PR #1");
     expect(h.wakes).toEqual(["dm:owner"]);
   });
@@ -771,7 +771,7 @@ describe("SubsessionService start: restart recovery and reconcile", () => {
   it("wakes the owning session again at start for a delivered report whose note is still unread", () => {
     const h = harness();
     seed(h, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
-    h.notes.set("dm:owner", ['<tomo-event type="subsession-report" name="s1" ts="x">R</tomo-event>']);
+    h.notes.set("dm:owner", ['<tomo-event type="subsession-report" name="s1#1" ts="x">R</tomo-event>']);
     h.service.start();
     expect(h.wakes).toEqual(["dm:owner"]);
     expect(h.notes.get("dm:owner")).toHaveLength(1);
@@ -1482,5 +1482,63 @@ describe("SubsessionService: no new task id while the registry can't be read", (
     expect(record.sessionKey).toBe("task:s2");
     await flush();
     expect(h.turns.map((t) => t.key)).not.toContain("task:s1");
+  });
+});
+
+describe("SubsessionService: report notes are matched by report, and an unread one keeps its task", () => {
+  it("never archives (or forgets) a finished task while its report note is unread", async () => {
+    const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, "the whole report")));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)).toMatchObject({ status: "finished", reportDelivered: true });
+    h.store.update(t.id, (r) => { r.endedAt = Date.now() - FINISHED_KEEP_MS - 24 * 60 * 60 * 1000; });
+
+    // A restart with the note still unread: the task stays finished.
+    const h2 = harness();
+    h2.notes = h.notes;
+    h2.service.recoverAtStartup(); // the sweep runs here
+    expect(h2.store.get(t.id)?.status).toBe("finished");
+    expect(h2.unlinked).toEqual([]);
+
+    // Read: the next start archives it.
+    const h3 = harness();
+    h3.service.recoverAtStartup();
+    expect(h3.store.get(t.id)?.status).toBe("archived");
+  });
+
+  it("delivers a second report while the first one's note is still unread", async () => {
+    let n = 0;
+    const h = harness({}, working((turn, hh) => {
+      n += 1;
+      if (n === 2) hh.service.reopen(turn.key);
+      hh.service.finish(turn.key, `report ${n}`);
+    }));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)).toMatchObject({ status: "finished", reportSeq: 1, reportDelivered: true });
+    // Woken again before the owning session read the first report.
+    expect(h.service.relay(t.id, "one more thing").ok).toBe(true);
+    await flush();
+    expect(h.store.get(t.id)).toMatchObject({ status: "finished", report: "report 2", reportSeq: 2, reportDelivered: true });
+    const reports = (h.notes.get("dm:owner") ?? []).filter((note) => note.includes('type="subsession-report"'));
+    expect(reports).toHaveLength(2);
+    expect(reports[0]).toContain('name="s1#1"');
+    expect(reports[0]).toContain("report 1");
+    expect(reports[1]).toContain('name="s1#2"');
+    expect(reports[1]).toContain("report 2");
+    expect(h.wakes).toEqual(["dm:owner", "dm:owner"]);
+  });
+});
+
+describe("SubsessionService: a record from before report seqs", () => {
+  it("numbers the next report past an older one that has no seq", async () => {
+    const h = harness({}, working((turn, hh) => { hh.service.reopen(turn.key); hh.service.finish(turn.key, "second"); }));
+    h.service.start();
+    const t = spawn(h);
+    h.store.update(t.id, (r) => { r.report = "first"; delete r.reportSeq; });
+    h.service.finish(t.sessionKey, "second");
+    expect(h.store.get(t.id)?.reportSeq).toBe(2);
   });
 });

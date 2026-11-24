@@ -32,7 +32,7 @@ vi.stubEnv("TOMO_WORKSPACE", TOMO_WORKSPACE);
 // `isolate: true` staying on. Same guard as tests/config.test.ts.
 vi.resetModules();
 
-const { buildSystemPrompt } = await import("../src/workspace/index.js");
+const { buildSystemPrompt, buildIdentityPrompt, promptContextSnapshot } = await import("../src/workspace/index.js");
 
 afterAll(() => {
   vi.unstubAllEnvs();
@@ -143,6 +143,20 @@ describe("buildSystemPrompt", () => {
       expect(prompt).toContain("visible everywhere");
       expect(prompt).not.toContain("DM only");
       expect(prompt).not.toContain("DM only too");
+    });
+
+    it("the identity prompt (what retires sessions) leaves MEMORY.md out", () => {
+      const identity = buildIdentityPrompt();
+      expect(identity).toContain("HARNESS");
+      expect(identity).not.toContain("visible everywhere");
+      expect(identity).not.toContain("# MEMORY");
+      expect(identity).not.toContain("# PEOPLE");
+    });
+
+    it("the context snapshot matches what each audience's prompt holds", () => {
+      expect(promptContextSnapshot({ isGroup: false }).memory).toHaveLength(3);
+      const group = promptContextSnapshot({ isGroup: true }).memory;
+      expect(group).toEqual(["- [Public](public.md) — visible everywhere"]);
     });
 
     it("DM prompt tells the agent to use memory/private/ for sensitive notes", () => {

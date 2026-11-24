@@ -484,6 +484,8 @@ export function configModuleMock() {
 export function workspaceModuleMock() {
   return {
     buildSystemPrompt: () => mockWorkspace.systemPrompt,
+    buildIdentityPrompt: () => mockWorkspace.systemPrompt,
+    promptContextSnapshot: () => ({ memory: [], people: [] }),
     PRIVATE_MEMORY_SUBDIR: "private",
     PRIVATE_MEMORY_DIR: "/tmp/tomo-mock/workspace/memory/private",
     MEMORY_DIR: "/tmp/tomo-mock/workspace/memory",

@@ -2,7 +2,7 @@ import { formatDateTime, ownerT, type OwnerText } from "./i18n/index.js";
 import type { Channel, ChannelFaultNotice, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions } from "./channels/types.js";
 import type { CompactReservation } from "./lcm/background-gate.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
-import { buildSystemPrompt } from "./workspace/index.js";
+import { buildIdentityPrompt, promptContextSnapshot } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { ReplyTarget, SessionMessage, UsageBaseline } from "./sessions/types.js";
 import {
@@ -342,7 +342,8 @@ export class Agent {
         this.liveSessionManager.hotMountExternalMcpServer(serverName, server),
     });
     this.liveSessionManager = new LiveSessionManager({
-      buildSystemPrompt: () => buildSystemPrompt(),
+      buildIdentityPrompt: () => buildIdentityPrompt(),
+      promptContextSnapshot: (key) => promptContextSnapshot({ isGroup: isGroupSessionKey(key) }),
       getSdkSessionId: (key) => this.sessions.getSdkSessionId(key),
       setSdkSessionId: (key, sessionId) => this.sessions.setSdkSessionId(key, sessionId),
       clearSdkSessionId: (key) => this.sessions.clearSdkSessionId(key),
@@ -2472,6 +2473,10 @@ export class Agent {
 
   /** Drain notes queued for this session and return them as a prefix. */
   private drainPendingNotes(sessionKey: string): string {
+    // A live session keeps the MEMORY.md / roster it was built with; what
+    // changed since rides in with this turn's notes (see buildIdentityPrompt).
+    const contextNote = this.liveSessionManager.takePromptContextNote(sessionKey);
+    if (contextNote) this.pendingNotesQueue.queueNote(sessionKey, contextNote);
     return this.pendingNotesQueue.drain(sessionKey);
   }
 

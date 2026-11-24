@@ -92,31 +92,36 @@ Don't wait to be told "remember this." Save durable personal details, preference
 - Remove stale memories when you notice they're outdated
 - Organize by topic, not chronology`.trim();
 
+  const lines = memoryIndexLines(isGroup);
   let memoryContent: string;
-  if (existsSync(MEMORY_ENTRYPOINT)) {
-    const raw = readFileSync(MEMORY_ENTRYPOINT, "utf-8").trim();
-    let lines = raw.split("\n");
-    if (isGroup) {
-      lines = lines.filter(line => !isPrivateIndexLine(line));
-    }
-    if (lines.length > MAX_MEMORY_LINES) {
-      memoryContent = lines.slice(0, MAX_MEMORY_LINES).join("\n") + `\n\n(truncated — ${lines.length - MAX_MEMORY_LINES} lines omitted)`;
-    } else {
-      memoryContent = lines.join("\n");
-    }
-  } else {
+  if (lines === null) {
     memoryContent = "(currently empty)";
+  } else if (lines.length > MAX_MEMORY_LINES) {
+    memoryContent = lines.slice(0, MAX_MEMORY_LINES).join("\n") + `\n\n(truncated — ${lines.length - MAX_MEMORY_LINES} lines omitted)`;
+  } else {
+    memoryContent = lines.join("\n");
   }
 
   return `${instructions}\n\n## Current MEMORY.md\n\n${memoryContent}`;
 }
 
-function loadPeopleSection(isGroup: boolean): string {
-  const dirs = defaultPeopleDirs();
+/** MEMORY.md as this audience sees it (private lines stripped for groups); null when absent. */
+function memoryIndexLines(isGroup: boolean): string[] | null {
+  if (!existsSync(MEMORY_ENTRYPOINT)) return null;
+  const lines = readFileSync(MEMORY_ENTRYPOINT, "utf-8").trim().split("\n");
+  return isGroup ? lines.filter((line) => !isPrivateIndexLine(line)) : lines;
+}
+
+function peopleRosterLines(isGroup: boolean): string[] {
   // Private people records never enter group prompts; in DMs the full
   // registry (including private records) is listed.
-  const people = loadPeople({ includePrivate: !isGroup });
-  const roster = people.length > 0 ? renderPeopleRoster(people).join("\n") : "(no people records yet)";
+  return renderPeopleRoster(loadPeople({ includePrivate: !isGroup }));
+}
+
+function loadPeopleSection(isGroup: boolean): string {
+  const dirs = defaultPeopleDirs();
+  const rosterLines = peopleRosterLines(isGroup);
+  const roster = rosterLines.length > 0 ? rosterLines.join("\n") : "(no people records yet)";
   const privacyNote = isGroup
     ? `Records under \`memory/${PRIVATE_MEMORY_SUBDIR}/people/\` are DM-only — they are not listed here and cannot be read from this group session.`
     : `For people whose details shouldn't surface in group chats, keep their record under \`memory/${PRIVATE_MEMORY_SUBDIR}/people/\` instead — group sessions never see those records.`;
@@ -206,6 +211,33 @@ An inbound iMessage sticker arrives as \`[Sent a sticker, saved to: <path>]\`; r
 export const HOME_NOTE = `## Your Home
 
 You have a home: a small 3D room the owner can open in the web UI, which you design as data in \`~/.tomo/workspace/home/scene.json\` and which shows what you are doing. Load the \`tomo-home\` skill before changing it, and check your work with \`home_check\`.`;
+
+/**
+ * The parts of the system prompt whose change RETIRES live sessions: SOUL,
+ * AGENT, IDENTITY and the harness rules. MEMORY.md and the people roster are
+ * deliberately not here — they change often (the model itself saves memories
+ * as it goes), and retiring every session on each save threw away every
+ * session's prompt cache and restarted its CLI and MCP servers. A live session
+ * keeps the memory and roster it was built with and is told what changed
+ * through {@link promptContextSnapshot}; its next rebuild (idle reap, compact,
+ * restart) picks the new text up in the prompt itself.
+ */
+export function buildIdentityPrompt(): string {
+  return [load("SOUL"), load("AGENT"), load("IDENTITY"), HARNESS_INSTRUCTIONS, HOME_NOTE]
+    .filter(Boolean).join("\n\n---\n\n");
+}
+
+/** What a session of this audience has in its prompt for MEMORY.md and PEOPLE. */
+export interface PromptContextSnapshot {
+  memory: string[];
+  people: string[];
+}
+
+/** Read-only: never creates the memory directory. */
+export function promptContextSnapshot(opts: { isGroup?: boolean } = {}): PromptContextSnapshot {
+  const isGroup = !!opts.isGroup;
+  return { memory: memoryIndexLines(isGroup) ?? [], people: peopleRosterLines(isGroup) };
+}
 
 export function buildSystemPrompt(opts: { isGroup?: boolean } = {}): string {
   const isGroup = !!opts.isGroup;

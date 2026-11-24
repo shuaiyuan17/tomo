@@ -49,6 +49,7 @@ export type TomoEventType =
   | "interrupted-agents" // subagents/background commands a restart or crash cut off
   | "credential"       // how a credential request ended (never carries a value)
   | "permission"       // how a group's request_permission ended
+  | "memory"           // MEMORY.md / people roster lines changed since the session's prompt was built
   | "note";            // bare harness aside with no producer of its own
                        //   (appendToTomoEventBody's fallback wrapper)
 

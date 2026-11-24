@@ -28,6 +28,8 @@ import type { GroupSandboxConfig } from "./group-fs-policy.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
 import { flattenSystemPrompt } from "../workspace/system-prompt-blocks.js";
+import { describePromptContextChange, type PromptContextLines } from "../workspace/prompt-context-diff.js";
+import { formatTomoEvent } from "../tomo-event.js";
 import { errorMessage } from "../error-text.js";
 
 /**
@@ -134,12 +136,20 @@ export { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
  */
 export interface LiveSessionManagerDeps {
   /**
-   * Current system prompt — hashed to detect workspace changes. Only the
-   * workspace (static, pre-boundary) prompt belongs here: per-session blocks
-   * and the SDK cache-boundary marker are not workspace changes. A block array
+   * The workspace prompt parts whose change retires live sessions (SOUL,
+   * AGENT, IDENTITY, harness rules) — hashed to detect a change. NOT MEMORY.md
+   * or the people roster: those reach a live session as a note instead (see
+   * `promptContextSnapshot` and `takePromptContextNote`). Per-session blocks
+   * and the SDK cache-boundary marker do not belong here either. A block array
    * is accepted and flattened, so the marker itself never moves the hash.
    */
-  buildSystemPrompt(): string | readonly string[];
+  buildIdentityPrompt(): string | readonly string[];
+  /**
+   * MEMORY.md and roster lines as a session for `key` gets them in its prompt.
+   * Snapshotted when the session is built and compared before each turn.
+   * Optional: without it no change note is produced.
+   */
+  promptContextSnapshot?(key: string): PromptContextLines;
   getSdkSessionId(key: string): string | undefined;
   setSdkSessionId(key: string, sessionId: string): void;
   clearSdkSessionId(key: string): void;
@@ -240,6 +250,8 @@ export class LiveSessionManager {
   // their steering target; each is retired at its next idle boundary instead
   // of all at once — see sweepPromptChanges().
   private promptStale = new Set<LiveSession>();
+  /** The memory index and roster each live session was built with (or last told about). */
+  private promptContext = new WeakMap<LiveSession, PromptContextLines>();
   private liveSessionCreates = new Map<string, Promise<LiveSession>>();
   private lastPromptHash: string = "";
   private stopping = false;
@@ -686,7 +698,14 @@ export class LiveSessionManager {
   }
 
   /**
-   * Detect system-prompt changes and mark every current session prompt-stale
+   * Detect changes to the prompt's IDENTITY parts (SOUL, AGENT, IDENTITY,
+   * harness rules — `buildIdentityPrompt`) and mark every current session
+   * prompt-stale. MEMORY.md and people-roster edits do not count: they used to
+   * retire every live session (the model saves memories as it goes), wiping
+   * every session's prompt cache and restarting its CLI and MCP servers for a
+   * one-line change. A live session is now told about those as a note before
+   * its next turn (`takePromptContextNote`). For an identity change: mark every
+   * current session prompt-stale
    * instead of retiring them all on the spot. Retiring en masse dropped every
    * MCP connection and prompt-cache prefix at once, and yanking a busy session
    * out of the map orphaned its in-flight turn as a steering target — the next
@@ -698,7 +717,7 @@ export class LiveSessionManager {
    * workspace, so a changed prompt reaches every key by its next idle turn.
    */
   private sweepPromptChanges(): void {
-    const currentHash = this.hashString(flattenSystemPrompt(this.deps.buildSystemPrompt()));
+    const currentHash = this.hashString(flattenSystemPrompt(this.deps.buildIdentityPrompt()));
     if (this.lastPromptHash && currentHash !== this.lastPromptHash) {
       log.info("System prompt changed; retiring live sessions at their next idle boundary");
       for (const [key, session] of this.liveSessions) {
@@ -710,6 +729,37 @@ export class LiveSessionManager {
       }
     }
     this.lastPromptHash = currentHash;
+  }
+
+  /** The key's current memory index and roster, or undefined (no dep, or unreadable). */
+  private readPromptContext(key: string): PromptContextLines | undefined {
+    if (!this.deps.promptContextSnapshot) return undefined;
+    try {
+      return this.deps.promptContextSnapshot(key);
+    } catch (err) {
+      log.warn({ err, key }, "Could not read the memory index / people roster for the change check");
+      return undefined;
+    }
+  }
+
+  /**
+   * A note for the key's live session saying what changed in MEMORY.md and the
+   * people roster since its prompt was built (or since it was last told), or
+   * undefined when nothing did, or when no live session will take the turn —
+   * a session built next reads the current text into its prompt anyway.
+   * Remembers what it reported, so each change is told once.
+   */
+  takePromptContextNote(key: string): string | undefined {
+    const session = this.liveSessions.get(key);
+    if (!session?.isAlive()) return undefined;
+    const before = this.promptContext.get(session);
+    if (!before) return undefined;
+    const now = this.readPromptContext(key);
+    if (!now) return undefined;
+    const body = describePromptContextChange(before, now);
+    if (!body) return undefined;
+    this.promptContext.set(session, now);
+    return formatTomoEvent("memory", body, { name: "changed" });
   }
 
   /**
@@ -799,6 +849,9 @@ export class LiveSessionManager {
     // Per-session server instance: binds the caller's session key so tool
     // handlers (e.g. send_message) can attribute cross-session sends.
     const internalMcpServer = this.deps.createInternalMcpServer(key);
+    // Taken BEFORE the prompt is built: a change landing in between is then
+    // told once more, never missed.
+    const promptContext = this.readPromptContext(key);
     const opts = sdkOptions(internalMcpServer, resumeId ?? undefined, model, {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
@@ -864,6 +917,7 @@ export class LiveSessionManager {
     // A dead predecessor's connections went with it.
     if (this.liveSessions.has(key)) this.mcpHealth.sessionClosed(key);
     this.liveSessions.set(key, session);
+    if (promptContext) this.promptContext.set(session, promptContext);
     this.armIdleReaper();
     this.externalMcpServersBySession.set(key, new Set(Object.keys(externalMcpServers)));
     this.mcpServerConfigsBySession.set(key, {

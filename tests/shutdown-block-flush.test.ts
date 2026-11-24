@@ -113,7 +113,7 @@ type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
 function makeManagerDeps(buildExternalMcpServers?: Deps["buildExternalMcpServers"]): Deps {
   return {
     buildExternalMcpServers: buildExternalMcpServers ?? (async () => ({})),
-    buildSystemPrompt: () => "prompt-v1",
+    buildIdentityPrompt: () => "prompt-v1",
     getSdkSessionId: () => undefined,
     setSdkSessionId: vi.fn(),
     clearSdkSessionId: vi.fn(),

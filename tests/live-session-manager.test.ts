@@ -176,7 +176,7 @@ type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
 
 function makeDeps(overrides: Partial<Deps> = {}): Deps {
   return {
-    buildSystemPrompt: () => "prompt-v1",
+    buildIdentityPrompt: () => "prompt-v1",
     getSdkSessionId: vi.fn(() => undefined),
     setSdkSessionId: vi.fn(),
     clearSdkSessionId: vi.fn(),
@@ -256,7 +256,7 @@ describe("LiveSessionManager session lifecycle", () => {
 
   it("retires idle sessions immediately when the system prompt changes", async () => {
     let prompt = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
 
     await manager.getOrCreateLiveSession("telegram:1");
     const first = mockState.instances[0];
@@ -271,10 +271,64 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(replacement).not.toBe(first);
   });
 
+  it("keeps live sessions when only MEMORY.md or the roster changes, and tells each one once", async () => {
+    let memory = ["- [Travel](travel.md)"];
+    const manager = new LiveSessionManager(makeDeps({
+      buildIdentityPrompt: () => "identity-v1",
+      promptContextSnapshot: () => ({ memory, people: ["- Alice"] }),
+    }));
+
+    const dm = await manager.getOrCreateLiveSession("dm:owner");
+    const group = await manager.getOrCreateLiveSession("telegram:-1");
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+
+    memory = ["- [Travel](travel.md)", "- [Coffee](coffee.md)"];
+    // The next message reuses both sessions: nothing is retired.
+    expect(await manager.getOrCreateLiveSession("dm:owner")).toBe(dm);
+    expect(await manager.getOrCreateLiveSession("telegram:-1")).toBe(group);
+    expect(dm.closed).toBe(false);
+    expect(group.closed).toBe(false);
+
+    // Each session hears about the change once, as a memory event.
+    const note = manager.takePromptContextNote("dm:owner")!;
+    expect(note).toContain('<tomo-event type="memory" name="changed"');
+    expect(note).toContain("+ - [Coffee](coffee.md)");
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+    expect(manager.takePromptContextNote("telegram:-1")).toContain("Coffee");
+    // No live session for the key: the next one is built with the current text.
+    expect(manager.takePromptContextNote("telegram:2")).toBeUndefined();
+  });
+
+  it("still retires live sessions when SOUL/AGENT/IDENTITY or the harness rules change", async () => {
+    let identity = "identity-v1";
+    const manager = new LiveSessionManager(makeDeps({
+      buildIdentityPrompt: () => identity,
+      promptContextSnapshot: () => ({ memory: [], people: [] }),
+    }));
+    const first = await manager.getOrCreateLiveSession("dm:owner");
+    identity = "identity-v2";
+    const second = await manager.getOrCreateLiveSession("dm:owner");
+    expect(first.closed).toBe(true);
+    expect(second).not.toBe(first);
+  });
+
+  it("skips the change note when the memory index cannot be read", async () => {
+    let fail = false;
+    const manager = new LiveSessionManager(makeDeps({
+      promptContextSnapshot: () => {
+        if (fail) throw new Error("EIO");
+        return { memory: ["a"], people: [] };
+      },
+    }));
+    await manager.getOrCreateLiveSession("dm:owner");
+    fail = true;
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+  });
+
   it("does not read the cache-boundary marker as a prompt change", async () => {
     const BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
     let prompt: string | string[] = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
 
     const first = await manager.getOrCreateLiveSession("telegram:1");
 
@@ -292,7 +346,7 @@ describe("LiveSessionManager session lifecycle", () => {
 
   it("notices a prompt change even when the session would just be reused", async () => {
     let prompt = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
 
     const first = await manager.getOrCreateLiveSession("telegram:1");
 
@@ -305,7 +359,7 @@ describe("LiveSessionManager session lifecycle", () => {
 
   it("keeps a busy session serving its in-flight conversation across a prompt change", async () => {
     let prompt = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
 
     await manager.getOrCreateLiveSession("telegram:1");
     const busySession = mockState.instances[0];
@@ -333,7 +387,7 @@ describe("LiveSessionManager session lifecycle", () => {
 
   it("does not retire sessions created after the change — they already have the fresh prompt", async () => {
     let prompt = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
 
     await manager.getOrCreateLiveSession("telegram:1");
     prompt = "v2";
@@ -348,7 +402,7 @@ describe("LiveSessionManager session lifecycle", () => {
 
   it("defers closing a busy retired session until it goes idle", async () => {
     let prompt = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
 
     await manager.getOrCreateLiveSession("telegram:1");
     const busySession = mockState.instances[0];
@@ -367,7 +421,7 @@ describe("LiveSessionManager session lifecycle", () => {
 
   it("waits for background tasks before retiring an idle prompt-stale session", async () => {
     let prompt = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
 
     await manager.getOrCreateLiveSession("telegram:1");
     const session = mockState.instances[0] as FakeSession & {
@@ -409,7 +463,7 @@ describe("LiveSessionManager session lifecycle", () => {
 
   it("retires without the report turn once the report wait runs out", async () => {
     let prompt = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
     await manager.getOrCreateLiveSession("telegram:1");
     const session = mockState.instances[0] as FakeSession & {
       awaitingReport: boolean;
@@ -428,7 +482,7 @@ describe("LiveSessionManager session lifecycle", () => {
 
   it("does not close a session whose new turn started while the background wait timed out", async () => {
     let prompt = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
     await manager.getOrCreateLiveSession("telegram:1");
     const session = mockState.instances[0] as FakeSession & {
       background: boolean;
@@ -456,7 +510,7 @@ describe("LiveSessionManager session lifecycle", () => {
     vi.useFakeTimers();
     try {
       let prompt = "v1";
-      const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+      const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
       await manager.getOrCreateLiveSession("telegram:1");
       const session = mockState.instances[0] as FakeSession & {
         background: boolean;
@@ -483,7 +537,7 @@ describe("LiveSessionManager session lifecycle", () => {
 
   it("retires a prompt-stale session anyway when background tasks outlive the wait cap", async () => {
     let prompt = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
 
     await manager.getOrCreateLiveSession("telegram:1");
     const session = mockState.instances[0] as FakeSession & {
@@ -505,7 +559,7 @@ describe("LiveSessionManager session lifecycle", () => {
 
   it("stop() also closes sessions still retiring after a prompt change", async () => {
     let prompt = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
 
     await manager.getOrCreateLiveSession("telegram:1");
     const busySession = mockState.instances[0];
@@ -1032,7 +1086,7 @@ describe("LiveSessionManager idle reaper", () => {
 
   it("leaves a prompt-stale session to its own retirement", async () => {
     let prompt = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildSystemPrompt: () => prompt }));
+    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
     await manager.getOrCreateLiveSession("telegram:1");
     const stale = mockState.instances[0];
     stale.busy = true;

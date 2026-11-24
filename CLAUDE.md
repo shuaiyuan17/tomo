@@ -41,6 +41,11 @@ src/
                             #   chat a live turn came in on (null for cron/heartbeat/mixed), for request_credential
     inbound-batcher.ts      # Coalesces messages that pile up behind an in-flight turn
     proactive-send.ts       # send_message service (direct + delegate modes)
+    subsessions/            # Sub-sessions (config `subsessions`, off by default): one long task per `task:<id>` key.
+                            #   store.ts (data/subsessions.json: lock, fsync, .bak, unreadable ≠ empty),
+                            #   state-machine.ts (the one transition table), service.ts (scheduler, driver,
+                            #   restart recovery, reconcile, report delivery), prompt.ts, memory-guard.ts.
+                            #   Tools in mcp/subsession-tools.ts. See "Sub-sessions" below
     bash-sandbox.ts         # sandbox-exec wrap for Bash on a private-memory-barred turn (default-deny profile)
     group-fs-policy.ts      # the group-turn path policy shared by the Bash profile and the file-tool guard
     setting-sources.ts      # which settings files the query loads (and the hook guard scans)
@@ -213,6 +218,15 @@ Changes to workspace files take effect on next message (no restart needed) — t
 ### Cron System
 
 Users ask Tomo to schedule things via chat. The agent CRUDs jobs with the `schedule_create` / `schedule_list` / `schedule_remove` MCP tools (`src/mcp/cron-tools.ts`), backed by `~/.tomo/data/cron/jobs.json` (the `tomo cron` CLI is a parallel surface on the same store). The `CronScheduler` polls every 30s and fires due jobs via `agent.handleCronMessage()`, which delivers the response through the appropriate channel. A run is recorded on disk *before* it is dispatched (`markStarted`), so a daemon that restarts mid-run can tell "was running" from "never ran": on start, `recoverInterrupted()` settles those runs before any due-scan, and a graceful shutdown that cuts a cron turn short settles it the same way (`markInterruptedByShutdown`). An interrupted run is never re-run automatically: a one-shot is parked (`lastStatus: "interrupted"`, disabled) and the owner is asked whether to run it again, a recurring job records `interrupted`, moves to its next normal slot and the owner is told once (`interruptNotice`). `schedule_enable` is how a parked job is brought back. Store writes hold an advisory cross-process lock (`jobs.json.lock`, `src/file-lock.ts`) for the whole read-merge-write, so the daemon and a `tomo cron` CLI can never be inside one at the same time; within it, writes still merge three-way against the file under an optimistic `revision` check (re-verified just before the rename, now belt-and-braces against writers that skip the lock), so a CLI process with a stale snapshot cannot erase a dispatch record. An unreadable file throws rather than reading as empty. A recurring (`every`) interval is bounded by `MIN_EVERY_MS` (30s — equal to the poll, since a job cannot fire more often than the scan that dispatches it) and `MAX_EVERY_MS` (366 days, which also catches intervals that multiply past `Number.MAX_SAFE_INTEGER`); the bound is enforced in `unschedulableReason` for the creation surfaces, in `CronStore.add` for anything that skipped them, and on `load()`, where a job already on disk with a bad interval is held disabled (warn logged once) instead of firing or failing the whole read.
+
+### Sub-sessions
+
+A long task runs in its own SDK session under `task:<id>` (`s1`, `s2`…, ids global across scopes). `sessionKind(key)` (`src/sessions/keys.ts`) is `owner-dm | group | task | raw`; a task key is not a DM, not a group and has no chat (no reply target, no `send_message` target). The task's OWNING scope lives only in its record (`parentKey`, today always the owner's `dm:` key): delivery, notices, the report and the privacy bar are all resolved from it, an unknown task counting as a group (fail closed).
+
+- **The table is the truth.** `data/subsessions.json` holds the lifecycle (`queued | active | waiting(owner|external) | finished | cancelled | failed | archived`); whether a turn is in flight is runtime state, never persisted. Every status change goes through `SubsessionStore.transition` (compare-and-set under the lock, table in `state-machine.ts`, the last 50 changes kept on the record). Strict mode (tests) throws on an illegal transition; production logs and refuses.
+- **One scheduler.** Every autonomous start (spawn, cron check-back, background report on a task waiting on something external, resume after a restart) lands in `queued` and only `schedule()` makes it `active`, under `maxRunning`. A relay from the owning session is never queued; it wakes a waiting task. Nothing but the owner wakes `waiting(owner)`.
+- **Turns are silent.** A task turn runs through the TurnRunner with delivery suppressed; a task speaks only through `task_notify` (`[s3 · title]` prefix) and reports with `task_finish` (a pinned `subsession-report` note to the owning session plus a silent wake there). No LCM: the harness sends a bare `/compact <instructions>` between turns when the context is over `maxContextTokens`, SDK auto-compact stays as the backstop.
+- **Restarts.** An active task goes back to `queued` with `resumeNeeded` (more than 3 in a row → failed); a task that restarted Tomo itself (`RestartCoordinator` → `restartRequested`) waits for the owner. At start, `reconcile()` never unlinks a registry entry unless the table read cleanly and holds tasks.
 
 ### Tomo's home
 

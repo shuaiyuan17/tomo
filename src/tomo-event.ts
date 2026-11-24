@@ -50,6 +50,13 @@ export type TomoEventType =
   | "credential"       // how a credential request ended (never carries a value)
   | "permission"       // how a group's request_permission ended
   | "memory"           // MEMORY.md / people roster lines changed since the session's prompt was built
+  | "subsession-start"    // a sub-session's first turn: brief + the owner's quoted words (name = task id)
+  | "subsession-resume"   // a restart cut a sub-session's work short (name = task id)
+  | "subsession-continue" // auto-continue turn of an active sub-session
+  | "subsession-relay"    // the owning session passing something to a sub-session
+  | "subsession-record"   // the task record, injected after a /compact (name = task id)
+  | "subsession-report"   // a sub-session finished; told to its owning session (name = task id)
+  | "subsession-activity" // something a sub-session said to the owner, told to its owning session (name = task id)
   | "note";            // bare harness aside with no producer of its own
                        //   (appendToTomoEventBody's fallback wrapper)
 

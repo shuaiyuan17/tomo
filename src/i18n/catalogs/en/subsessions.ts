@@ -1,0 +1,12 @@
+/** Harness notices about sub-sessions, to the chat of the scope that owns the task (src/agent/subsessions/service.ts). */
+export const subsessions = {
+  stuck: "[{{id}} · {{title}}] Paused: {{turns}} turns in a row with no progress. Tell me how to go on, or cancel it.",
+  failing: "[{{id}} · {{title}}] Paused: its last turns failed. Tell me to go on, or cancel it.",
+  stopped: "[{{id}} · {{title}}] Stopped. Tell me to go on, or cancel it.",
+  selfRestart: "[{{id}} · {{title}}] Tomo restarted at this task's own request, so it is paused. Tell me to go on when you're ready.",
+  failedInterrupted: "[{{id}} · {{title}}] Gave up: restarts cut it short {{restarts}} times in a row. Ask again if it is still needed.",
+  failedNoSession: "[{{id}} · {{title}}] Gave up: its conversation could not be found after a restart, and starting over could repeat what it already did. Ask again if it is still needed.",
+  tableUnreadable: "⚠️ Tomo could not read its sub-session list (~/.tomo/data/subsessions.json), so sub-sessions are off until it is repaired. Nothing was cancelled or deleted.",
+  tableLost_one: "⚠️ Tomo's sub-session list looks lost or restored from a backup, but {{count}} sub-session conversation still exists. Nothing was deleted; check ~/.tomo/data/subsessions.json.",
+  tableLost_other: "⚠️ Tomo's sub-session list looks lost or restored from a backup, but {{count}} sub-session conversations still exist. Nothing was deleted; check ~/.tomo/data/subsessions.json.",
+} as const;

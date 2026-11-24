@@ -82,7 +82,11 @@ export class ProactiveSendService {
    * No Claude query is invoked for the recipient — the message arrives as-is.
    * A pending note is queued so the recipient's next Claude turn has context.
    */
-  async sendToSession(target: string, rawText: string, callerSessionKey?: string, options?: { replyTo?: string; effect?: string }): Promise<SendResult> {
+  /**
+   * `options.noteFrom` names the sender in the note the target session gets
+   * ("Your sub-session s3 (...)"), in place of "Tomo from another session".
+   */
+  async sendToSession(target: string, rawText: string, callerSessionKey?: string, options?: { replyTo?: string; effect?: string; noteFrom?: string }): Promise<SendResult> {
     const text = rawText;
     const resolved = this.resolveSendTarget(target);
     if (!resolved) {
@@ -296,7 +300,9 @@ export class ProactiveSendService {
       ? `Tomo from ${summoned}'s main session (dm:${summoned}), summoned into this group at the time, sent the following message here: "${deliveredText}"`
       : callerSessionKey === sessionKey
         ? `You sent the following message to this conversation earlier as a direct send: "${deliveredText}"`
-        : `Tomo from another session sent the following message to this conversation earlier: "${deliveredText}"`));
+        : options?.noteFrom
+          ? `${options.noteFrom} sent the following message to this conversation earlier: "${deliveredText}"`
+          : `Tomo from another session sent the following message to this conversation earlier: "${deliveredText}"`));
 
     log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length, effect, fabricatedMarkers: fabricated.length || undefined }, "Message sent (direct)");
     const note = [fabricatedNote, effectNote, attachmentNote].filter((n): n is string => n !== undefined).join(" ");

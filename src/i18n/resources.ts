@@ -20,6 +20,8 @@ import { todo as enTodo } from "./catalogs/en/todo.js";
 import { todo as zhTodo } from "./catalogs/zh-Hans/todo.js";
 import { usage as enUsage } from "./catalogs/en/usage.js";
 import { usage as zhUsage } from "./catalogs/zh-Hans/usage.js";
+import { subsessions as enSubsessions } from "./catalogs/en/subsessions.js";
+import { subsessions as zhSubsessions } from "./catalogs/zh-Hans/subsessions.js";
 
 /**
  * Every daemon-side catalog, by locale and namespace (one namespace per
@@ -43,6 +45,7 @@ const en = {
   tasks: enTasks,
   todo: enTodo,
   usage: enUsage,
+  subsessions: enSubsessions,
 } as const;
 
 export const resources = {
@@ -58,6 +61,7 @@ export const resources = {
     tasks: zhTasks,
     todo: zhTodo,
     usage: zhUsage,
+    subsessions: zhSubsessions,
   },
 } satisfies { en: typeof en } & Record<Exclude<Locale, "en">, Translation<typeof en>>;
 

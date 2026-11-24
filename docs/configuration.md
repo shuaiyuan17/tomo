@@ -239,6 +239,22 @@ With `autoResume` off, nothing is resumed automatically: the model is told and d
 
 Set `"interruptedAgents": false` (or `{ "enabled": false }`) or `TOMO_INTERRUPTED_AGENTS=false` to turn it all off; the file is then removed, so turning it back on starts clean.
 
+## Sub-sessions
+
+Off by default. With them on, the owner's own conversation gets `task_spawn`, `task_status`, `task_cancel` and `task_message`: Tomo can hand a long task (a PR to write and see through review, a long investigation) to a separate session that works in the background, survives restarts, and reports back. Each runs under the key `task:<id>` (`s1`, `s2`, …); its messages reach you with a `[s1 · title]` prefix, and its report comes back to the main conversation, which tells you the result and decides what to remember. Sub-sessions don't write memory.
+
+```json
+{ "subsessions": { "enabled": true, "maxRunning": 2, "maxOpen": 5, "maxTurns": 200, "maxContextTokens": 500000, "defaultModel": null } }
+```
+
+- `maxRunning`: tasks working on their own at once; more wait queued. A message to a task is never queued.
+- `maxOpen`: tasks not yet finished, cancelled or failed; `task_spawn` refuses beyond it.
+- `maxTurns`: the SDK's turn cap per task turn (`0`: none).
+- `maxContextTokens`: between turns, a task over this is compacted with `/compact`.
+- `defaultModel`: model for a task that names none (unset follows `model`). Haiku is refused.
+
+State lives in `~/.tomo/data/subsessions.json` (fsynced, with a `.bak`). If it cannot be read at start, sub-sessions stay off until it is repaired and nothing is unlinked or cancelled.
+
 ## Context management (LCM)
 
 Instead of lossy auto-compaction, long conversations are rolled up into hierarchical summary blocks (daily → weekly → monthly → yearly), so old context degrades gracefully rather than disappearing. Anything compacted out stays searchable with the `recall_conversation` tool.
@@ -312,6 +328,7 @@ If LiteLLM returns `System messages are not allowed`, use a LiteLLM build that i
     sessions/                 # Transcript logs and session registry
     inbox.jsonl               # Durable inbox
     running-agents.json       # Subagents running right now (for crash recovery)
+    subsessions.json          # Sub-session task table (+ .bak)
     permissions/              # Group permission request log
     pet.json                  # Virtual pet state
     summons.json              # Active group summons

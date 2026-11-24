@@ -43,10 +43,11 @@ export const notices = {
       message: "A message turn", background: "A background turn", backgroundTask: "A background task turn",
       cronJob: "Cron job \"{{name}}\"", heartbeat: "A heartbeat turn", restart: "A restart notice turn",
       interruptedAgents: "An interrupted-subagents notice turn",
+      subsessionReport: "A sub-session report turn",
     },
     label: {
       group: "group \"{{title}}\" ({{key}})", groupUntitled: "group {{key}}",
-      dm: "this DM session ({{key}})", privateChat: "private chat {{key}}",
+      dm: "this DM session ({{key}})", subsession: "sub-session {{key}}", privateChat: "private chat {{key}}",
     },
     class: { safeguard: "safety classifier refusal", auth: "authentication failure", usageLimit: "usage limit reached", other: "error" },
     recoverySafeguard: "Recovery: compact the range since the last good turn: {{command}}. Until that is done and the session reloads, the next turn there may still be refused.",

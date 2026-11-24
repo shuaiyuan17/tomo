@@ -10,6 +10,7 @@ import {
   dmSessionKeyForIdentity,
   isDmSessionKey,
   isGroupSessionKey,
+  sessionKind,
   privateReplyTargetFromSessionKey,
 } from "../sessions/keys.js";
 import type { ReplyTarget } from "../sessions/types.js";
@@ -82,8 +83,16 @@ export class OwnerNotices {
         ...deliver,
       };
     }
-    if (ranOnDm) return { noticeKey, label: t("suppressed.label.dm", { key: noticeKey }), turnKind, ...deliver };
-    return { noticeKey, label: t("suppressed.label.privateChat", { key: noticeKey }), turnKind };
+    switch (sessionKind(noticeKey)) {
+      case "owner-dm":
+        return { noticeKey, label: t("suppressed.label.dm", { key: noticeKey }), turnKind, ...deliver };
+      case "task":
+        // A sub-session has no chat: its errors are reported to the owner.
+        return { noticeKey, label: t("suppressed.label.subsession", { key: noticeKey }), turnKind };
+      case "group": // handled above; kept so every kind takes a stance
+      case "raw":
+        return { noticeKey, label: t("suppressed.label.privateChat", { key: noticeKey }), turnKind };
+    }
   }
 
   /**

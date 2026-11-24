@@ -12,7 +12,14 @@ import {
   parseRawSessionKey,
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
+  isTaskSessionKey,
 } from "./sessions/keys.js";
+import { SubsessionService, type TaskTurnOutcome } from "./agent/subsessions/service.js";
+import { SubsessionStore } from "./agent/subsessions/store.js";
+import { buildSubsessionPrompt } from "./agent/subsessions/prompt.js";
+import { CronStore, CRON_STORE_PATH } from "./cron/store.js";
+import { EFFORT_LEVELS, type EffortLevel } from "./config.js";
+import type { SessionContext } from "./agent/sdk-options.js";
 import { privateMemoryBarFor } from "./agent/permissions.js";
 import { assessGroupPermission, attachmentBarredFor } from "./agent/private-memory-guard.js";
 import { effectiveGroupSandbox, type GroupSandboxConfig } from "./agent/group-fs-policy.js";
@@ -163,6 +170,8 @@ export class Agent {
   private readonly ownerAdoption: OwnerAdoption;
   private readonly contextNudger: ContextNudger;
   private readonly restarts: RestartCoordinator;
+  /** Sub-sessions (long tasks in their own `task:` sessions); undefined while `subsessions.enabled` is off. */
+  readonly subsessions: SubsessionService | undefined;
   private readonly ownerNotices: OwnerNotices;
   private readonly mcpAuthPrompts: McpAuthPrompts;
   private pendingNotesQueue: PendingNotesQueue;
@@ -222,6 +231,7 @@ export class Agent {
     this.restarts = new RestartCoordinator({
       isStopping: () => this.stopping,
       queuePendingErrorNote: (sessionKey, visibleError) => this.queuePendingErrorNote(sessionKey, visibleError),
+      onRestartClaimed: (sessionKey) => { if (isTaskSessionKey(sessionKey)) this.subsessions?.onRestartClaimed(sessionKey); },
     });
     this.mcpAuthPrompts = new McpAuthPrompts({
       resolvePrivateReplyTarget: (key) => this.resolvePrivateReplyTarget(key),
@@ -391,7 +401,9 @@ export class Agent {
         });
       },
       getSessionMessages: (key) => this.sessions.get(key).messages,
-      getModelOverride: (key) => this.modelOverrides.get(key),
+      // A sub-session runs on the model its task record names (or subsessions.defaultModel).
+      getModelOverride: (key) => (isTaskSessionKey(key) ? this.subsessions?.modelFor(key) : this.modelOverrides.get(key)),
+      subsessionContext: (key) => this.subsessionContext(key),
       createInternalMcpServer: (key) => createTomoInternalMcpServer(this, key),
       ...(this.runningAgents && config.interruptedAgentsAutoResume
         ? { resumeGate: (key: string, taskId: string) => this.runningAgents?.gateResume(key, taskId) ?? null }
@@ -459,6 +471,141 @@ export class Agent {
     for (const [key, model] of Object.entries(config.sessionModelOverrides)) {
       this.modelOverrides.set(key, model);
     }
+
+    this.subsessions = config.subsessions.enabled ? this.createSubsessionService() : undefined;
+  }
+
+  /**
+   * The sub-session service and everything it needs from the agent. Every
+   * dependency resolves the task's owning scope from its record (parentKey),
+   * never from a hardcoded owner key, so a group-scoped task (future work)
+   * would report, notify and be fenced through its group.
+   */
+  private createSubsessionService(): SubsessionService {
+    const cron = new CronStore(CRON_STORE_PATH);
+    const cronJobsFor = (key: string) => {
+      try {
+        return cron.list().filter((job) => job.sessionKey === key);
+      } catch (err) {
+        log.warn({ err, key }, "Sub-session: cron store unreadable");
+        return [];
+      }
+    };
+    return new SubsessionService({
+      store: new SubsessionStore(join(config.tomoHome, "data", "subsessions.json")),
+      config: () => config.subsessions,
+      runTaskTurn: (key, prompt, opts) => this.runTaskTurn(key, prompt, opts),
+      sendToScope: async (parentKey, text, taskKey, noteFrom) => {
+        const result = await this.proactive.sendToSession(parentKey, text, taskKey, { noteFrom });
+        return result.ok ? { ok: true } : { ok: false, error: result.error };
+      },
+      noticeToScope: async (parentKey, text) => {
+        if (parentKey === this.router.ownerSessionKey()) {
+          await this.notifyOwner(text);
+          return;
+        }
+        const target = this.resolveDeliveryTargetForSession(parentKey, "Sub-session notice");
+        if (target) await target.channel.send({ chatId: target.chatId, text });
+      },
+      noticeOwner: async (text) => { await this.notifyOwner(text); },
+      queuePendingNote: (key, note) => this.queuePendingNote(key, note),
+      hasPendingNote: (key, predicate) => this.pendingNotesQueue.hasNote(key, predicate),
+      wakeScope: (parentKey, prompt) => {
+        const body = appendToTomoEventBody(prompt, CONTINUITY_DELIVERY_NOTE);
+        this.enqueueForSession(parentKey, () => this.processContinuity(body, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionReport"), "background"))
+          .catch((err) => log.error({ err, sessionKey: parentKey }, "Sub-session report turn failed in queue"));
+      },
+      contextUsage: (key) => {
+        const last = this.liveSessionManager.lastResult(key);
+        return last ? { used: last.contextUsed, estimated: last.contextEstimated === true } : undefined;
+      },
+      cronJobCount: (key) => cronJobsFor(key).filter((job) => job.enabled).length,
+      removeCronJobs: (key) => {
+        for (const job of cronJobsFor(key)) cron.remove(job.id);
+      },
+      stopSession: (key, timeoutMs) => this.stopTaskSession(key, timeoutMs),
+      hasSdkSession: (key) => this.sessions.getSdkSessionId(key) !== undefined,
+      ensureRegistryEntry: (key) => this.sessions.ensureEntry(key),
+      unlinkRegistryEntry: (key) => this.sessions.clearSdkSessionId(key),
+      registryTaskKeys: () => this.sessions.listActiveEntries().map((e) => e.channelKey).filter(isTaskSessionKey),
+      isStopping: () => this.stopping,
+    });
+  }
+
+  /** A sub-session's prompt and limits; undefined for every other key (see LiveSessionManager). */
+  private subsessionContext(key: string): SessionContext["subsession"] {
+    if (!isTaskSessionKey(key)) return undefined;
+    const effort = this.subsessions?.effortFor(key);
+    return {
+      staticPrompt: buildSubsessionPrompt({
+        agentName: config.agentName ?? "Tomo",
+        ownerName: config.owner?.displayName ?? config.owner?.name ?? "the owner",
+      }),
+      groupScope: this.taskScopeIsGroup(key),
+      maxTurns: config.subsessions.maxTurns,
+      ...(effort && (EFFORT_LEVELS as readonly string[]).includes(effort) ? { effort: effort as EffortLevel } : {}),
+    };
+  }
+
+  /**
+   * Is a task's owning scope a group? Privacy follows the scope that spawned
+   * the task. An unknown scope (no record, unreadable table) counts as a
+   * group: fail closed.
+   */
+  private taskScopeIsGroup(key: string): boolean {
+    const parent = this.subsessions?.parentKeyOf(key);
+    return parent === undefined ? true : isGroupSessionKey(parent);
+  }
+
+  /**
+   * One silent turn on a task key, queued on that key. Nothing it writes
+   * reaches a chat (a task speaks through task_notify); errors are kept to a
+   * pending note on the task itself, and the service decides what follows.
+   */
+  private runTaskTurn(key: string, prompt: string, opts: { bare: boolean }): Promise<TaskTurnOutcome> {
+    return this.enqueueForSession(key, async () => {
+      let stopped = false;
+      let shutdown = false;
+      const ok = await this.turnRunner.runTurn({
+        key,
+        source: "continuity",
+        usage: { source: "background" },
+        prompt,
+        bare: opts.bare,
+        delivery: {
+          kind: "deferred-send",
+          suppressDelivery: true,
+          suppressedLog: "Sub-session output kept out of chat (a task speaks through task_notify)",
+          resolveTarget: () => undefined,
+        },
+        silentMatcher: isSilentReply,
+        transcript: "on-delivery",
+        errors: {
+          visibleError: "continuity",
+          response: "note-only",
+          responseSuppressedLog: "Sub-session turn returned an agent error response",
+          thrown: "ignore",
+          thrownLogMessage: "Sub-session turn failed",
+        },
+        onShutdown: () => { shutdown = true; },
+        onStopped: () => { stopped = true; },
+      });
+      return { ok: ok && !stopped && !shutdown, stopped, shutdown };
+    }).catch((err): TaskTurnOutcome => {
+      log.error({ err, sessionKey: key }, "Sub-session turn failed in queue");
+      return { ok: false, shutdown: this.stopping };
+    });
+  }
+
+  /** Soft stop (the SDK's interrupt), then close; closed anyway after `timeoutMs`. */
+  private async stopTaskSession(key: string, timeoutMs: number): Promise<void> {
+    await this.liveSessionManager.stopTurn(key).catch(() => false);
+    const deadline = Date.now() + timeoutMs;
+    while (this.liveSessionManager.hasTurnInFlight(key) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    if (this.liveSessionManager.hasTurnInFlight(key)) log.warn({ key }, "Sub-session did not stop in time; closing its session");
+    this.liveSessionManager.closeLiveSession(key);
   }
 
   /** The broker when `credentialBroker.enabled`, else null. */
@@ -1348,6 +1495,7 @@ export class Agent {
   }
 
   private createUnownedTurnRequest(key: string): TurnRequest | undefined {
+    if (isTaskSessionKey(key)) return this.createTaskBackgroundRequest(key);
     const target = this.resolveDeliveryTargetForSession(key, "Background task");
     if (!target) return undefined;
 
@@ -1434,6 +1582,31 @@ export class Agent {
           if (target) this.reportSuppressedError(key, target, shortErrorMessage(err));
         }
         await stop();
+      },
+    };
+  }
+
+  /**
+   * A turn the SDK starts on its own on a task key (a background subagent
+   * reporting back). Silent like every task turn: nothing reaches a chat. When
+   * it ends, the service hears of it (a task waiting on something external is
+   * active again, and gets its auto-continue).
+   */
+  private createTaskBackgroundRequest(key: string): TurnRequest {
+    let settled = false;
+    return {
+      onBlock: async () => {},
+      onBlockAbandoned: () => {},
+      resolve: async () => {
+        if (settled) return;
+        settled = true;
+        log.info({ session: key }, "Sub-session background turn ended");
+        this.subsessions?.onBackgroundReport(key);
+      },
+      reject: async (err) => {
+        if (settled) return;
+        settled = true;
+        if (!(err instanceof TurnInterruptedError)) log.error({ err, key }, "Sub-session background turn failed");
       },
     };
   }
@@ -1586,7 +1759,7 @@ export class Agent {
    */
   isPrivateMemoryBarred(sessionKey: string): boolean {
     return privateMemoryBarFor(
-      isGroupSessionKey(sessionKey),
+      this.isGroupScoped(sessionKey),
       () => this.isOwnAudienceTurn(sessionKey),
     ) !== null;
   }
@@ -1597,7 +1770,7 @@ export class Agent {
    * `attachmentBarredFor`: a sandboxed group ships only what it may read.
    */
   isAttachmentBarred(sessionKey: string, path: string): boolean {
-    const bar = privateMemoryBarFor(isGroupSessionKey(sessionKey), () => this.isOwnAudienceTurn(sessionKey));
+    const bar = privateMemoryBarFor(this.isGroupScoped(sessionKey), () => this.isOwnAudienceTurn(sessionKey));
     if (bar === null) return false;
     return attachmentBarredFor(
       path,
@@ -1606,6 +1779,11 @@ export class Agent {
       () => this.scopedCallerKey(sessionKey),
       () => this.groupSandboxFor(sessionKey),
     );
+  }
+
+  /** A group session, or a sub-session whose owning scope is a group (or unknown). */
+  private isGroupScoped(sessionKey: string): boolean {
+    return isTaskSessionKey(sessionKey) ? this.taskScopeIsGroup(sessionKey) : isGroupSessionKey(sessionKey);
   }
 
   private async runUserTurnInner(req: UserTurnRequest): Promise<void> {
@@ -2059,6 +2237,9 @@ export class Agent {
   }
 
   async handleCronMessage(message: string, sessionKey: string, options: CronTurnOptions = {}): Promise<boolean> {
+    // A sub-session's check-back is a lifecycle event, not a turn of its own:
+    // the service wakes the task through its scheduler (slots, quota).
+    if (isTaskSessionKey(sessionKey)) return this.subsessions?.onCronFire(sessionKey, message) ?? false;
     return this.enqueueForSession(sessionKey, () => this.processCronMessage(message, sessionKey, options))
       .catch((err) => {
         log.error({ err, sessionKey }, "Cron message failed in queue");
@@ -2279,6 +2460,12 @@ export class Agent {
    * prevent.
    */
   handleRestartForSession(prompt: string, sessionKey: string): Promise<void> {
+    // A sub-session that restarted Tomo is recovered by the sub-session
+    // service (it waits for the owner); its reason is in the log.
+    if (isTaskSessionKey(sessionKey)) {
+      log.info({ sessionKey }, "Restart reason from a sub-session; the sub-session service handles its recovery");
+      return Promise.resolve();
+    }
     const known = this.sessions.listActiveEntries().some((e) => e.channelKey === sessionKey);
     if (!known) {
       log.warn({ sessionKey }, "Restart reason attributed to unknown session; dropping instead of rerouting");
@@ -2399,7 +2586,7 @@ export class Agent {
   // delegates so the MCP server wiring keeps calling Agent's public surface.
   // See agent/proactive-send.ts.
 
-  async sendToSession(target: string, text: string, callerSessionKey?: string, options?: { replyTo?: string; effect?: string }): Promise<SendResult> {
+  async sendToSession(target: string, text: string, callerSessionKey?: string, options?: { replyTo?: string; effect?: string; noteFrom?: string }): Promise<SendResult> {
     return this.proactive.sendToSession(target, text, callerSessionKey, options);
   }
 
@@ -2480,6 +2667,7 @@ export class Agent {
     turn?: ReplyContext,
   ): void {
     this.restarts.handleToolResult(sessionKey, toolName, content, isError, turn);
+    if (isTaskSessionKey(sessionKey)) this.subsessions?.noteToolUse(sessionKey);
   }
 
   /** End-of-turn restart fallback — see RestartCoordinator. */
@@ -2671,6 +2859,13 @@ export class Agent {
       log.warn({ err }, "Could not report interrupted subagents");
     }
     try {
+      // After the channels and the inbox: recovery may tell the owner things
+      // and wake the owning session with a report.
+      this.subsessions?.start();
+    } catch (err) {
+      log.error({ err }, "Sub-session start failed");
+    }
+    try {
       // Requests the last run left open died with it: denied (restart), and their sessions told.
       this.permissionBroker.reconcileAfterRestart();
     } catch (err) {
@@ -2782,6 +2977,7 @@ export class Agent {
     // ends runs the deferred-restart check. From here on a restart request is
     // dropped rather than honoured, so `tomo stop` cannot be reversed by one.
     this.stopping = true;
+    this.subsessions?.stop();
     // Before any session is closed: closing empties its task set, and what is
     // still running now was interrupted, not finished.
     this.runningAgents?.freeze();
@@ -3082,6 +3278,9 @@ export class Agent {
       { name: "check" },
     );
     for (const key of owed) {
+      // A sub-session's note waits for its own next turn (the resume after
+      // this restart): it is not woken outside its scheduler.
+      if (isTaskSessionKey(key)) continue;
       this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, ownerT("notices")("suppressed.turn.interruptedAgents"), "restart"))
         .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"));
     }

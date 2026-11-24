@@ -1,4 +1,4 @@
-import { isCanonicalDmSessionKey, isDmSessionKey, parseRawSessionKey } from "../sessions/keys.js";
+import { isCanonicalDmSessionKey, isDmSessionKey, isTaskSessionKey, parseRawSessionKey, taskIdFromSessionKey } from "../sessions/keys.js";
 import type { CronJob } from "./types.js";
 
 /**
@@ -92,7 +92,7 @@ function hasControlChars(value: string): boolean {
  * fire, discovered much later.
  *
  * Accepted: a `dm:` key whose identity part is non-empty and colon-free, or a
- * `<channel>:<chatId>` raw key. Note the `dm:` branch is deliberately LOOSER
+ * `<channel>:<chatId>` raw key, or a well-formed `task:<id>` sub-session key. Note the `dm:` branch is deliberately LOOSER
  * than `isCanonicalDmSessionKey`: identity names are free-form in config, so
  * `dm:shuai yuan` is a legitimate delivery target even though it is not a
  * slug. It simply does not earn owner authority in `canManageJob` — shape
@@ -105,5 +105,7 @@ export function isStorableSessionKey(key: string): boolean {
     const identity = key.slice(3);
     return identity.length > 0 && !identity.includes(":");
   }
+  // A sub-session's own check-back jobs (`schedule_create` from a task turn).
+  if (isTaskSessionKey(key)) return taskIdFromSessionKey(key) !== undefined;
   return parseRawSessionKey(key) !== undefined;
 }

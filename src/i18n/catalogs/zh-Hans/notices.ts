@@ -38,10 +38,11 @@ export const notices = {
       message: "一个消息回合", background: "一个后台回合", backgroundTask: "一个后台任务回合",
       cronJob: "cron 任务“{{name}}”", heartbeat: "一个心跳回合", restart: "一个重启通知回合",
       interruptedAgents: "一个中断 subagent 通知回合",
+      subsessionReport: "一个子会话汇报回合",
     },
     label: {
       group: "群“{{title}}”（{{key}}）", groupUntitled: "群 {{key}}",
-      dm: "这个私聊 session（{{key}}）", privateChat: "私聊 {{key}}",
+      dm: "这个私聊 session（{{key}}）", subsession: "子会话 {{key}}", privateChat: "私聊 {{key}}",
     },
     class: { safeguard: "被安全分类器拒绝", auth: "认证失败", usageLimit: "达到用量上限", other: "错误" },
     recoverySafeguard: "恢复方法：压缩上次正常回合以来的内容：{{command}}。在完成压缩并重新加载 session 之前，那里的下一个回合仍可能被拒绝。",

@@ -455,6 +455,9 @@ export const mockConfig = {
     server: { type: "http"; url: string };
     oauth?: { clientId?: string; scopes: string[]; tokenStoreKey: string };
   }>,
+  /** Sub-sessions off, as by default (src/config.ts DEFAULT_SUBSESSIONS);
+   *  tests/subsessions-agent.test.ts turns them on. */
+  subsessions: { enabled: false, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null as string | null },
   lcm: {
     nudgeAtPct: 70,
     nudgeResetPct: 60,

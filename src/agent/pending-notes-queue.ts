@@ -16,13 +16,19 @@ function truncateForPendingError(text: string, maxChars: number): string {
   return text.length <= maxChars ? text : `${text.slice(0, Math.max(0, maxChars - 15))}...[truncated]`;
 }
 
-function pendingErrorChars(notes: string[]): number {
-  return notes.reduce((sum, note) => sum + note.length, 0);
+/** An error note, with the order it was queued in (a put-back can come out of order). */
+interface ErrorNote {
+  seq: number;
+  text: string;
 }
 
-/** Keep the newest error notes within the count and character caps. */
-function capErrorNotes(notes: string[]): string[] {
-  const capped = notes.slice(-MAX_PENDING_ERROR_NOTES);
+function pendingErrorChars(notes: ErrorNote[]): number {
+  return notes.reduce((sum, note) => sum + note.text.length, 0);
+}
+
+/** Keep the newest error notes (by queue order) within the count and character caps. */
+function capErrorNotes(notes: ErrorNote[]): ErrorNote[] {
+  const capped = [...notes].sort((a, b) => a.seq - b.seq).slice(-MAX_PENDING_ERROR_NOTES);
   while (capped.length > 1 && pendingErrorChars(capped) > MAX_PENDING_ERROR_CHARS) {
     capped.shift();
   }
@@ -67,7 +73,7 @@ interface InFlightBatch {
   /** Durable notes in this prefix, in order. Persisted while in flight. */
   notes: string[];
   /** Error notes rendered into this prefix. Memory-only, like the queue they came from. */
-  errors: string[];
+  errors: ErrorNote[];
 }
 
 /**
@@ -87,7 +93,8 @@ export class PendingNotesQueue {
   /** Queued, not yet drained. Absent: not loaded from the store this process. */
   private notes = new Map<string, string[]>();
   private inflight = new Map<string, InFlightBatch[]>();
-  private errorNotes = new Map<string, string[]>();
+  private errorNotes = new Map<string, ErrorNote[]>();
+  private errorSeq = 0;
 
   constructor(private store: DurablePendingNotesStore) {}
 
@@ -133,7 +140,7 @@ export class PendingNotesQueue {
   queueError(sessionKey: string, visibleError: string): void {
     const normalized = visibleError.replace(/\s+/g, " ").trim();
     const clipped = truncateForPendingError(normalized, MAX_SINGLE_PENDING_ERROR_CHARS);
-    this.errorNotes.set(sessionKey, capErrorNotes([...(this.errorNotes.get(sessionKey) ?? []), clipped]));
+    this.errorNotes.set(sessionKey, capErrorNotes([...(this.errorNotes.get(sessionKey) ?? []), { seq: this.errorSeq++, text: clipped }]));
   }
 
   /**
@@ -152,7 +159,7 @@ export class PendingNotesQueue {
       this.errorNotes.delete(sessionKey);
       parts.push(formatTomoEvent("errors", [
         "Recent Tomo errors before this turn (newest last, capped):",
-        ...errorNotes.map((note) => `- ${note}`),
+        ...errorNotes.map((note) => `- ${note.text}`),
         "Use this as operational context; do not repeat the raw error unless it helps the user.",
       ].join("\n")));
     }
@@ -227,16 +234,17 @@ export class PendingNotesQueue {
     }
 
     if (batch.errors.length > 0) {
-      // Older than anything queued since the drain, so they go first and the
-      // caps drop them first.
+      // Merged by queue order, not prepended: another batch drained later may
+      // already be back, and the caps must still drop the oldest errors.
       this.errorNotes.set(sessionKey, capErrorNotes([...batch.errors, ...(this.errorNotes.get(sessionKey) ?? [])]));
     }
 
     if (batch.notes.length === 0) return;
     const arr = this.queued(sessionKey);
     arr.unshift(...(interrupted ? batch.notes.map(markInterrupted) : batch.notes));
-    const dropped = capNotes(arr);
-    if (dropped > 0) log.debug({ sessionKey, dropped }, "Pending notes capped at limit after put-back; dropped oldest");
+    // No cap here: these notes were already admitted, and the store kept them
+    // while in flight. Capping now would drop exactly them (they are the
+    // oldest) in favour of notes queued during the turn.
     if (!this.persist(sessionKey)) log.warn({ sessionKey }, "Could not persist restored pending notes");
   }
 

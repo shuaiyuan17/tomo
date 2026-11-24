@@ -218,4 +218,31 @@ describe("PendingNotesQueue", () => {
     queue.restore("k", drained);
     expect(store.getPendingNotes("k")).toEqual(["a", "b", "c"]);
   });
+  it("keeps every restored note when the queue filled up while the batch was in flight", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    for (let i = 0; i < 15; i++) queue.queueNote("k", `old-${i}`);
+    const drained = queue.drain("k");
+    for (let i = 0; i < 15; i++) queue.queueNote("k", `new-${i}`);
+    queue.restore("k", drained);
+    const stored = store.getPendingNotes("k");
+    for (let i = 0; i < 15; i++) expect(stored).toContain(`old-${i}`);
+    expect(stored[0]).toBe("old-0");
+    expect(stored.at(-1)).toBe("new-14");
+  });
+
+  it("keeps the newest errors when overlapping batches are restored in drain order", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    for (let i = 0; i < 3; i++) queue.queueError("k", `[error] older-${i}`);
+    const first = queue.drain("k");
+    for (let i = 0; i < 3; i++) queue.queueError("k", `[error] newer-${i}`);
+    const second = queue.drain("k");
+    queue.restore("k", first);
+    queue.restore("k", second);
+    const next = queue.drain("k");
+    for (let i = 0; i < 3; i++) expect(next).toContain(`newer-${i}`);
+    expect(next).not.toContain("older-");
+    expect(next.indexOf("newer-0")).toBeLessThan(next.indexOf("newer-2"));
+  });
 });

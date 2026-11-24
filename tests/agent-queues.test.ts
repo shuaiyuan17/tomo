@@ -154,4 +154,68 @@ describe("PendingNotesQueue", () => {
     expect(drained).not.toContain("err-0");
     expect(drained).toContain("err-9");
   });
+  it("puts error notes back under their caps when a failing turn is restored, instead of a durable blob", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", "n1");
+
+    // Ten turns in a row fail: each drains, queues a new error, then is put back.
+    for (let i = 0; i < 10; i++) {
+      const drained = queue.drain("k");
+      queue.queueError("k", `[error] err-${i} ${"x".repeat(300)}`);
+      queue.restoreInterrupted("k", drained);
+    }
+
+    // The durable store only ever holds the one real note, marked once.
+    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nn1`]);
+
+    const next = queue.drain("k");
+    expect(next.match(/<tomo-event type="errors"/g)).toHaveLength(1);
+    expect(next.match(/\n- \[error\]/g)?.length ?? 0).toBeLessThanOrEqual(3);
+    expect(next.length).toBeLessThan(2000);
+    expect(next).toContain("err-9");
+    expect(next).not.toContain("err-0");
+    expect(next.split(INTERRUPTED_NOTE_MARKER)).toHaveLength(2);
+  });
+
+  it("restores an error-only prefix to the error queue, never to the durable store", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueError("k", "[error] boom");
+    const drained = queue.drain("k");
+    expect(drained).toContain("boom");
+
+    queue.restoreInterrupted("k", drained);
+    expect(store.getPendingNotes("k")).toEqual([]);
+    expect(queue.peekNotes("k")).toEqual([]);
+    expect(queue.drain("k")).toContain("boom");
+  });
+
+  it("does not let a pinned inbox note carry a restored error block with it", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    const inbox = '<tomo-event type="inbox" name="interrupted" ts="x">\nthe message\n</tomo-event>';
+    queue.queueNote("k", inbox);
+    queue.queueError("k", "[error] boom");
+    const drained = queue.drain("k");
+    queue.restoreInterrupted("k", drained);
+    const stored = store.getPendingNotes("k");
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).toContain("the message");
+    expect(stored[0]).not.toContain('type="errors"');
+  });
+
+  it("restores a multi-note batch as separate notes, in order, ahead of newer ones", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", "a");
+    queue.queueNote("k", "b");
+    const drained = queue.drain("k");
+    queue.queueNote("k", "c");
+    queue.restore("k", drained);
+    expect(store.getPendingNotes("k")).toEqual(["a", "b", "c"]);
+    // A second put-back of the same prefix is a no-op, not a duplicate.
+    queue.restore("k", drained);
+    expect(store.getPendingNotes("k")).toEqual(["a", "b", "c"]);
+  });
 });

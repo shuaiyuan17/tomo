@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,7 +9,31 @@ import { fileURLToPath } from "node:url";
  * A one-shot hook that fires inside an atomic write, so a test can look at the
  * filesystem at the moment a store is publishing.
  */
-const hook = { beforeWrite: null as null | ((path: string) => void) };
+const hook = {
+  beforeWrite: null as null | ((path: string) => void),
+  /** One-shot: fires right after the outermost registry lock is released —
+   *  the first instant another process could take it and publish. */
+  afterRegistryUnlock: null as null | (() => void),
+};
+
+vi.mock("../src/file-lock.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/file-lock.js")>();
+  return {
+    ...actual,
+    withFileLockSync: <T>(lockPath: string, fn: () => T, opts?: Parameters<typeof actual.withFileLockSync>[2]): T => {
+      const outermost = !actual.isFileLockHeldSync(lockPath);
+      try {
+        return actual.withFileLockSync(lockPath, fn, opts);
+      } finally {
+        if (outermost && lockPath.endsWith("_sessions.json.lock")) {
+          const fire = hook.afterRegistryUnlock;
+          hook.afterRegistryUnlock = null;
+          fire?.();
+        }
+      }
+    },
+  };
+});
 
 vi.mock("../src/fs-utils.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/fs-utils.js")>();
@@ -32,10 +56,12 @@ let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "tomo-store-lock-"));
   hook.beforeWrite = null;
+  hook.afterRegistryUnlock = null;
 });
 
 afterEach(() => {
   hook.beforeWrite = null;
+  hook.afterRegistryUnlock = null;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -132,6 +158,138 @@ describe("registry writes under the advisory lock", () => {
     // Once the holder is gone, everything works again.
     store.setChatTitle("telegram:1", "Ops");
     expect(registryOnDisk().sessions[0].chatTitle).toBe("Ops");
+  });
+});
+
+describe("registry hot path: no lock when nothing changes", () => {
+  function holdLockAsAnotherProcess(): () => void {
+    mkdirSync(`${REGISTRY()}.lock`, { recursive: true });
+    writeFileSync(
+      join(`${REGISTRY()}.lock`, "owner.other"),
+      `${JSON.stringify({ pid: process.pid, ts: Date.now(), host: hostname() })}\n`,
+    );
+    return () => rmSync(`${REGISTRY()}.lock`, { recursive: true, force: true });
+  }
+
+  it("does not let a later bookkeeping save publish a link change whose own save failed", () => {
+    const store = newSessionStore();
+    store.setSdkSessionId("telegram:-1", "sess-aaaa");
+    store.setChatTitle("telegram:-1", "Old title");
+
+    hook.beforeWrite = () => {
+      throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+    };
+    expect(() => store.clearSdkSessionId("telegram:-1")).toThrow(/ENOSPC/);
+
+    // The unlink reported failure: it is not in memory, and an unrelated
+    // title change does not publish it.
+    expect(store.getSdkSessionId("telegram:-1")).toBe("sess-aaaa");
+    store.setChatTitle("telegram:-1", "New title");
+    const onDisk = JSON.parse(readFileSync(REGISTRY(), "utf-8")) as {
+      sessions: Array<{ channelKey: string; sdkSessionId: string | null; unlinkedAt: number | null; chatTitle?: string }>;
+    };
+    const active = onDisk.sessions.filter((e) => e.channelKey === "telegram:-1" && e.unlinkedAt === null);
+    expect(active).toHaveLength(1);
+    expect(active[0]!.sdkSessionId).toBe("sess-aaaa");
+  });
+
+  it("answers an unchanged reply target, title and participant without waiting for the lock", () => {
+    const store = newSessionStore();
+    store.setSdkSessionId("telegram:-1", "sess-aaaa");
+    store.setReplyTarget("telegram:-1", { channelName: "telegram", chatId: "-1" });
+    store.setChatTitle("telegram:-1", "Ops");
+    store.addParticipant("telegram:-1", "Ada", "u1");
+
+    const release = holdLockAsAnotherProcess();
+    try {
+      const started = Date.now();
+      for (let i = 0; i < 20; i++) {
+        store.setReplyTarget("telegram:-1", { channelName: "telegram", chatId: "-1" });
+        store.setChatTitle("telegram:-1", "Ops");
+        store.addParticipant("telegram:-1", "Ada", "u1");
+      }
+      // One lock wait is 2s; sixty of them would be two minutes.
+      expect(Date.now() - started).toBeLessThan(1_000);
+    } finally {
+      release();
+    }
+  });
+
+  it("still writes a real change (a new participant id) through the lock", () => {
+    const store = newSessionStore();
+    store.addParticipant("telegram:-1", "Ada");
+    store.addParticipant("telegram:-1", "Ada", "u1");
+    const entry = registryOnDisk().sessions.find((e) => e.channelKey === "telegram:-1") as unknown as { participantIds?: Record<string, string[]> };
+    expect(entry.participantIds).toEqual({ u1: ["Ada"] });
+  });
+
+  it("never caches the identity of a file another process published after our unlocked save", () => {
+    // `migrateOldFormat` saves straight out of `loadRegistry`, so that save is
+    // the OUTERMOST lock frame: the lock is gone the moment it returns, and
+    // another process may publish before we look. The identity must be the
+    // one of OUR write, taken under the lock — otherwise the cache vouches for
+    // the other file while memory still holds ours, and every later read (and
+    // the no-lock fast path) answers from the stale copy.
+    // (Constructed first: the constructor's own locked cleanup re-reads under
+    // the lock, which would hide the stale identity.)
+    const store = newSessionStore();
+    writeFileSync(join(dir, "_sdk_sessions.json"), JSON.stringify({ "telegram:1": "sess-aaaa" }));
+    hook.afterRegistryUnlock = () => {
+      const tmp = `${REGISTRY()}.other.tmp`;
+      writeFileSync(tmp, readFileSync(REGISTRY(), "utf-8").replace("sess-aaaa", "sess-bbbb"));
+      renameSync(tmp, REGISTRY());
+    };
+    // This read migrates (and is answered from what it migrated); the other
+    // process publishes the moment the save's lock is released.
+    expect(store.getSdkSessionId("telegram:1")).toBe("sess-aaaa");
+    expect(registryOnDisk().sessions[0].sdkSessionId).toBe("sess-bbbb");
+    expect(store.getSdkSessionId("telegram:1")).toBe("sess-bbbb");
+    // ...and the no-lock fast path answers from the published file too.
+    store.setChatTitle("telegram:1", "Ops");
+    expect(registryOnDisk().sessions[0].chatTitle).toBe("Ops");
+  });
+
+  it("does not answer the fast path from a link change whose save failed", () => {
+    // A failed migrateSessionKey leaves memory holding the entry under the new
+    // key while the file (whose identity still matches) does not. The fast
+    // path must not take that for the file and skip the write.
+    const store = newSessionStore();
+    store.setSdkSessionId("telegram:old", "sess-aaaa");
+    store.setReplyTarget("telegram:old", { channelName: "telegram", chatId: "-1" });
+
+    const failRegistryWrite = (path: string): void => {
+      if (path !== REGISTRY()) { hook.beforeWrite = failRegistryWrite; return; } // re-arm past other files
+      throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+    };
+    hook.beforeWrite = failRegistryWrite;
+    expect(() => store.migrateSessionKey("telegram:old", "telegram:new")).toThrow(/ENOSPC/);
+
+    store.setReplyTarget("telegram:new", { channelName: "telegram", chatId: "-1" });
+    const onDisk = JSON.parse(readFileSync(REGISTRY(), "utf-8")) as {
+      sessions: Array<{ channelKey: string; unlinkedAt: number | null; replyTarget?: { chatId: string } }>;
+    };
+    const moved = onDisk.sessions.find((e) => e.channelKey === "telegram:new" && e.unlinkedAt === null);
+    expect(moved?.replyTarget?.chatId).toBe("-1");
+    hook.beforeWrite = null;
+  });
+
+  it("sees another process's atomic write even at the same size and mtime", () => {
+    const store = newSessionStore();
+    store.setSdkSessionId("telegram:1", "sess-aaaa");
+    const pinnedSec = Math.floor(Date.now() / 1000) - 1;
+    utimesSync(REGISTRY(), pinnedSec, pinnedSec);
+    expect(store.getSdkSessionId("telegram:1")).toBe("sess-aaaa");
+
+    // Published the way every writer publishes: a temp file renamed over it.
+    const tmp = `${REGISTRY()}.other.tmp`;
+    writeFileSync(tmp, readFileSync(REGISTRY(), "utf-8").replace("sess-aaaa", "sess-bbbb"));
+    utimesSync(tmp, pinnedSec, pinnedSec);
+    renameSync(tmp, REGISTRY());
+
+    store.setChatTitle("telegram:1", "Ops");
+    const entry = registryOnDisk().sessions.find((e) => e.channelKey === "telegram:1")!;
+    expect(entry.sdkSessionId).toBe("sess-bbbb");
+    expect(entry.chatTitle).toBe("Ops");
   });
 });
 

@@ -6,7 +6,6 @@ import { log } from "../../logger.js";
 import { taskSessionKey } from "../../sessions/keys.js";
 import { IllegalTransitionError, nextStatus, type SubsessionEvent } from "./state-machine.js";
 import {
-  PENDING_INPUT_KEEP,
   SENT_KEEP,
   SUBSESSION_STATUSES,
   TRANSITION_LOG_KEEP,
@@ -51,11 +50,17 @@ export interface TransitionOptions {
   expectFrom?: readonly SubsessionStatus[];
   /** Field changes written in the same write as the status change. */
   patch?: (record: SubsessionRecord) => void;
+  /**
+   * Judged under the lock after the state machine allowed the event: a
+   * non-empty answer refuses the transition (nothing is written) and comes
+   * back as `refused`.
+   */
+  guard?: (record: SubsessionRecord) => string | undefined;
 }
 
 export type TransitionOutcome =
   | { ok: true; changed: boolean; from: SubsessionStatus; record: SubsessionRecord }
-  | { ok: false; from: SubsessionStatus | null; record?: SubsessionRecord };
+  | { ok: false; from: SubsessionStatus | null; record?: SubsessionRecord; refused?: string };
 
 const EMPTY: () => SubsessionTable = () => ({ version: 1, nextId: 1, tasks: [] });
 
@@ -130,6 +135,8 @@ export class SubsessionStore {
         compactPending: false,
         postCompactReminder: false,
         pendingInput: [],
+        inflightInputs: 0,
+        redeliveredInputs: 0,
         sent: [],
         transitions: [{ at: now, from: null, to: "queued", event: "spawn" }],
       };
@@ -185,6 +192,11 @@ export class SubsessionStore {
         log.warn({ id, event, from, waitingOn: record.waitingOn, reason: opts.reason }, "Sub-session transition refused: not allowed from this status");
         return { ok: false, from, record: clone(record) };
       }
+      const refused = opts.guard?.(record);
+      if (refused) {
+        log.info({ id, event, from, refused }, "Sub-session transition refused by its guard");
+        return { ok: false, from, record: clone(record), refused };
+      }
       const now = this.now();
       if (target !== "same") {
         if (from === "active" && record.activeSince !== undefined) {
@@ -219,6 +231,15 @@ export class SubsessionStore {
     });
   }
 
+  /**
+   * Make sure no new task gets an id at or below `n` (`s<n>`). For ids the
+   * registry still holds while the table lost them: reusing one would put a
+   * new task on an old task's conversation.
+   */
+  reserveIdsThrough(n: number): void {
+    this.mutate((table) => { if (table.nextId <= n) table.nextId = n + 1; });
+  }
+
   /** Drop records for good (terminal ones past retention). */
   remove(ids: readonly string[]): void {
     if (ids.length === 0) return;
@@ -246,7 +267,11 @@ export class SubsessionStore {
         log.warn({ path: this.path }, "Sub-session table missing; recovered from its backup");
         return this.remember(backup.table, "recovered");
       }
-      return this.remember(EMPTY(), "missing");
+      if (backup.kind === "missing") return this.remember(EMPTY(), "missing");
+      // No primary, and a backup that exists but cannot be read: there WAS a
+      // table. Empty would reuse s1 over a live task:s1 conversation.
+      this.lastState = "unreadable";
+      throw new SubsessionStoreError(`Sub-session table ${this.path} is missing and its backup is unreadable`, backup.cause);
     }
     const backup = readTable(this.backupPath);
     if (backup.kind === "ok") {
@@ -329,6 +354,7 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
   if (!(SUBSESSION_STATUSES as readonly string[]).includes(status)) throw new Error(`task ${index}: unknown status ${status}`);
   const id = str("id");
   const createdAt = num("createdAt", 0);
+  const pendingInput = Array.isArray(r.pendingInput) ? r.pendingInput.filter((p): p is string => typeof p === "string") : [];
   return {
     ...(r as unknown as SubsessionRecord),
     id,
@@ -349,16 +375,18 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
     reportDelivered: r.reportDelivered === true,
     compactPending: r.compactPending === true,
     postCompactReminder: r.postCompactReminder === true,
-    pendingInput: Array.isArray(r.pendingInput) ? r.pendingInput.filter((p): p is string => typeof p === "string") : [],
+    pendingInput,
+    inflightInputs: Math.min(pendingInput.length, Math.max(0, Math.floor(num("inflightInputs", 0)))),
+    redeliveredInputs: Math.min(pendingInput.length, Math.max(0, Math.floor(num("redeliveredInputs", 0)))),
     sent: Array.isArray(r.sent) ? r.sent as SubsessionRecord["sent"] : [],
     transitions: Array.isArray(r.transitions) ? r.transitions as SubsessionRecord["transitions"] : [],
   };
 }
 
+/** The capped logs. pendingInput is NOT one of them: accepted input is never dropped. */
 function trimLists(record: SubsessionRecord): void {
   if (record.sent.length > SENT_KEEP) record.sent = record.sent.slice(-SENT_KEEP);
   if (record.transitions.length > TRANSITION_LOG_KEEP) record.transitions = record.transitions.slice(-TRANSITION_LOG_KEEP);
-  if (record.pendingInput.length > PENDING_INPUT_KEEP) record.pendingInput = record.pendingInput.slice(-PENDING_INPUT_KEEP);
 }
 
 function clone<T>(value: T): T {

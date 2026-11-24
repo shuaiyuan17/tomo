@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CronStore } from "../src/cron/store.js";
@@ -31,5 +31,13 @@ describe("a task's cron jobs", () => {
     add(writer, "task:s1"); add(writer, "task:s1"); add(writer, "task:s2");
     link.removeAll("task:s1");
     expect(new CronStore(path).list().map((j) => j.sessionKey)).toEqual(["task:s2"]);
+  });
+
+  it("answers unknown, not zero, when the cron store cannot be read, and refuses to remove", () => {
+    const link = createTaskCronLink(path);
+    add(new CronStore(path), "task:s1");
+    writeFileSync(path, "{broken");
+    expect(link.count("task:s1")).toBeUndefined();
+    expect(() => link.removeAll("task:s1")).toThrow();
   });
 });

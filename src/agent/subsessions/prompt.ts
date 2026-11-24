@@ -78,6 +78,21 @@ export function formatResumeEvent(record: SubsessionRecord): string {
   ].join("\n"), { name: record.id });
 }
 
+/**
+ * Inputs are delivered at least once: the `count` messages that follow went
+ * out before, in a turn a restart or a failure cut short.
+ */
+export function formatRedeliveryNote(count: number): string {
+  return formatTomoEvent("subsession-redelivery", count === 1
+    ? "The next message was already sent to you once, in a turn that was cut short. You may have acted on it: check before doing it again."
+    : `The next ${count} messages were already sent to you once, in a turn that was cut short. You may have acted on them: check before doing anything twice.`);
+}
+
+/** Separates redelivered inputs from the ones that are new. */
+export function formatNewInputNote(): string {
+  return formatTomoEvent("subsession-redelivery", "Messages after this point are new.", { name: "new" });
+}
+
 export function formatContinueEvent(): string {
   return formatTomoEvent("subsession-continue", "Continue with the task. If it is done, call task_finish. If you are waiting on something external, schedule a check-back and end the turn.");
 }

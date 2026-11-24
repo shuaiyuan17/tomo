@@ -224,6 +224,7 @@ export function buildTaskOwnerTools(deps: { service: () => SubsessionService | u
         const record = own(c.s, c.scope, id);
         if (!record) return fail("task_message", `no task ${id} in this conversation.`);
         const outcome = c.s.relay(record.id, text);
+        if (!outcome.ok && outcome.refused) return fail("task_message", `${record.id} was not given the message: ${outcome.refused}. Wait for it to catch up, or cancel it.`);
         if (!outcome.ok) return fail("task_message", `${record.id} is ${outcome.from ?? "unknown"}; it takes no more messages.`);
         return ok(outcome.record.status === "queued" ? `${record.id} is queued; it gets the message with its first turn.` : `Passed to ${record.id}.`);
       },

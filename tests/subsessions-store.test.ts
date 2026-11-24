@@ -49,6 +49,34 @@ describe("SubsessionStore", () => {
     expect(store.state()).toBe("recovered");
   });
 
+  it("refuses a missing primary next to an unreadable backup, instead of reading it as empty", () => {
+    new SubsessionStore(path).create({ parentKey: "dm:owner", title: "a", brief: "b" });
+    rmSync(path);
+    writeFileSync(`${path}.bak`, "{broken");
+    const store = new SubsessionStore(path);
+    expect(() => store.list()).toThrow(SubsessionStoreError);
+    expect(store.state()).toBe("unreadable");
+    expect(() => store.create({ parentKey: "dm:owner", title: "x", brief: "y" })).toThrow(SubsessionStoreError);
+  });
+
+  it("never drops accepted input, and a guard refuses a transition without writing", () => {
+    const store = new SubsessionStore(path, { strictTransitions: true });
+    const t = store.create({ parentKey: "dm:owner", title: "a", brief: "b" });
+    for (let i = 0; i < 30; i++) store.transition(t.id, "relay", { patch: (r) => { r.pendingInput.push(`m${i}`); } });
+    expect(store.get(t.id)?.pendingInput).toHaveLength(30);
+    const refused = store.transition(t.id, "relay", { guard: () => "full", patch: (r) => { r.pendingInput.push("x"); } });
+    expect(refused).toMatchObject({ ok: false, refused: "full" });
+    expect(store.get(t.id)?.pendingInput).toHaveLength(30);
+  });
+
+  it("reserves ids so a new task never reuses one the registry still holds", () => {
+    const store = new SubsessionStore(path);
+    store.reserveIdsThrough(4);
+    expect(store.create({ parentKey: "dm:owner", title: "a", brief: "b" }).id).toBe("s5");
+    store.reserveIdsThrough(2);
+    expect(store.create({ parentKey: "dm:owner", title: "a", brief: "b" }).id).toBe("s6");
+  });
+
   it("recovers a 0-byte table from its backup and keeps the bad file", () => {
     new SubsessionStore(path).create({ parentKey: "dm:owner", title: "a", brief: "b" });
     writeFileSync(path, "");

@@ -233,6 +233,7 @@ export class Agent {
       isStopping: () => this.stopping,
       queuePendingErrorNote: (sessionKey, visibleError) => this.queuePendingErrorNote(sessionKey, visibleError),
       onRestartClaimed: (sessionKey) => { if (isTaskSessionKey(sessionKey)) this.subsessions?.onRestartClaimed(sessionKey); },
+      onRestartClaimFailed: (sessionKey) => { if (isTaskSessionKey(sessionKey)) this.subsessions?.onRestartClaimFailed(sessionKey); },
     });
     this.mcpAuthPrompts = new McpAuthPrompts({
       resolvePrivateReplyTarget: (key) => this.resolvePrivateReplyTarget(key),

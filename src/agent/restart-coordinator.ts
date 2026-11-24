@@ -24,6 +24,8 @@ export interface RestartCoordinatorDeps {
    * instead of resuming into a loop).
    */
   onRestartClaimed?(sessionKey: string): void;
+  /** The restart claimed by `onRestartClaimed` did not happen: the claim is withdrawn. */
+  onRestartClaimFailed?(sessionKey: string): void;
 }
 
 /**
@@ -235,6 +237,13 @@ export class RestartCoordinator {
     this.restartInFlight = false;
     const message = `Scheduled Tomo restart failed: ${detail}`;
     log.error({ sessionKey, detail }, "Scheduled restart failed");
+    if (sessionKey) {
+      try {
+        this.deps.onRestartClaimFailed?.(sessionKey);
+      } catch (err) {
+        log.warn({ err, sessionKey }, "Restart claim withdrawal failed");
+      }
+    }
     this.queuePendingErrorNote(sessionKey, message);
   }
 }

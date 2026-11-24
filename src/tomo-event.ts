@@ -55,6 +55,7 @@ export type TomoEventType =
   | "subsession-continue" // auto-continue turn of an active sub-session
   | "subsession-relay"    // the owning session passing something to a sub-session
   | "subsession-record"   // the task record, injected after a /compact (name = task id)
+  | "subsession-redelivery" // marks sub-session inputs sent again after a cut-short turn (at-least-once delivery)
   | "subsession-report"   // a sub-session finished; told to its owning session (name = task id)
   | "subsession-activity" // something a sub-session said to the owner, told to its owning session (name = task id)
   | "note";            // bare harness aside with no producer of its own

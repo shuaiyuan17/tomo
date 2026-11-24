@@ -92,11 +92,24 @@ export interface SubsessionRecord {
   /** The next turn carries the task-record reminder and does not count. */
   postCompactReminder: boolean;
   /**
-   * Prompts owed to the task's next turn: a cron check-back or a relay that
+   * Prompts owed to the task: a cron check-back, a relay, a message that
    * arrived while it had no turn to take them (queued, or between turns).
-   * Persisted so a restart does not lose them.
+   * An input leaves this list only when a turn that carried it COMPLETED, so
+   * a crash at any point loses none (at-least-once). Never trimmed: when it
+   * holds PENDING_INPUT_MAX entries, new input is refused, not dropped.
    */
   pendingInput: string[];
+  /**
+   * The first N entries of pendingInput went out with the turn in flight.
+   * Written before the turn starts; cleared when it ends. Non-zero at start
+   * means that turn was cut short by a crash or a shutdown.
+   */
+  inflightInputs: number;
+  /**
+   * The first N entries of pendingInput already went out once, in a turn a
+   * restart cut short: the task may have acted on them. The next turn says so.
+   */
+  redeliveredInputs: number;
   /** Recent messages the task sent out, newest last (at most SENT_KEEP). */
   sent: SubsessionSentMessage[];
   /** The newest status changes, oldest first. */
@@ -112,4 +125,5 @@ export interface SubsessionTable {
 
 export const SENT_KEEP = 20;
 export const TRANSITION_LOG_KEEP = 50;
-export const PENDING_INPUT_KEEP = 20;
+/** Inputs a task may have owed at once; more are refused (never silently dropped). */
+export const PENDING_INPUT_MAX = 50;

@@ -276,20 +276,29 @@ describe("registry hot path: no lock when nothing changes", () => {
   it("sees another process's atomic write even at the same size and mtime", () => {
     const store = newSessionStore();
     store.setSdkSessionId("telegram:1", "sess-aaaa");
+    store.setChatTitle("telegram:1", "Ops");
     const pinnedSec = Math.floor(Date.now() / 1000) - 1;
     utimesSync(REGISTRY(), pinnedSec, pinnedSec);
     expect(store.getSdkSessionId("telegram:1")).toBe("sess-aaaa");
 
     // Published the way every writer publishes: a temp file renamed over it.
+    // Same size, same mtime: only the identity (a new inode) gives it away.
     const tmp = `${REGISTRY()}.other.tmp`;
-    writeFileSync(tmp, readFileSync(REGISTRY(), "utf-8").replace("sess-aaaa", "sess-bbbb"));
+    const before = readFileSync(REGISTRY(), "utf-8");
+    const after = before.replace("sess-aaaa", "sess-bbbb").replace('"Ops"', '"Dev"');
+    expect(after.length).toBe(before.length);
+    writeFileSync(tmp, after);
     utimesSync(tmp, pinnedSec, pinnedSec);
     renameSync(tmp, REGISTRY());
 
+    // The no-lock fast path sees it: "Ops" is what memory held, but no longer
+    // what the file holds, so this is a real change and is written...
     store.setChatTitle("telegram:1", "Ops");
     const entry = registryOnDisk().sessions.find((e) => e.channelKey === "telegram:1")!;
     expect(entry.sdkSessionId).toBe("sess-bbbb");
     expect(entry.chatTitle).toBe("Ops");
+    // ...and so does a plain read.
+    expect(store.getSdkSessionId("telegram:1")).toBe("sess-bbbb");
   });
 });
 

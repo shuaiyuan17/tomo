@@ -57,19 +57,50 @@ function capNotes(arr: string[]): number {
   return dropped;
 }
 
+const EVENT_OPEN = "<tomo-event ";
+const EVENT_CLOSE = "</tomo-event>";
+/** The errors block `drain` renders, exactly as it renders it. */
+const RENDERED_ERRORS_BLOCK = /^<tomo-event type="errors" ts="[^"]*">\nRecent Tomo errors before this turn/;
+
 /**
- * A rendered errors block. Error notes are memory-only, but before put-back
- * split batches into their parts a failed turn's whole prefix, errors block
- * included, went back as one durable note — so a store written then can
- * still hold them. The body is escaped, so the first closing tag is its own.
+ * Remove rendered errors blocks from a stored note. Error notes are
+ * memory-only, but before put-back split batches into their parts a failed
+ * turn's whole prefix, errors block included, went back as one durable note,
+ * so a store written then can still hold them. Only top-level envelopes are
+ * looked at (each skipped whole: bodies escape the closing tag, so the first
+ * one is the envelope's own), so text inside a message is never touched.
  */
-const STORED_ERRORS_BLOCK = /<tomo-event type="errors"[^>]*>[\s\S]*?<\/tomo-event>\s*/g;
+function stripStoredErrors(note: string): string {
+  let out = "";
+  let i = 0;
+  for (;;) {
+    const open = note.indexOf(EVENT_OPEN, i);
+    const close = open < 0 ? -1 : note.indexOf(EVENT_CLOSE, open);
+    if (close < 0) return out + note.slice(i);
+    const end = close + EVENT_CLOSE.length;
+    const before = note.slice(0, open);
+    const atBoundary = open === 0 || before.endsWith("\n\n") || before.endsWith(`${INTERRUPTED_NOTE_MARKER}\n`);
+    if (!atBoundary || !RENDERED_ERRORS_BLOCK.test(note.slice(open, end))) {
+      out += note.slice(i, end);
+      i = end;
+      continue;
+    }
+    // Drop the block and the separator after it; keep the one before it
+    // only when something follows.
+    out += note.slice(i, open);
+    const sep = /\s*$/.exec(out)?.[0] ?? "";
+    out = out.slice(0, out.length - sep.length);
+    i = end;
+    while (i < note.length && /\s/.test(note[i])) i++;
+    if (i < note.length && out) out += sep;
+  }
+}
 
 /** Strip errors blocks left in stored notes by older versions; drop notes left empty. */
 function withoutStoredErrors(notes: string[]): string[] {
   return notes
-    .map((note) => (note.includes('<tomo-event type="errors"') ? note.replace(STORED_ERRORS_BLOCK, "").trim() : note))
-    .filter((note) => note !== "" && note !== INTERRUPTED_NOTE_MARKER);
+    .map((note) => (note.includes('<tomo-event type="errors"') ? stripStoredErrors(note) : note))
+    .filter((note) => note.trim() !== "" && note.trim() !== INTERRUPTED_NOTE_MARKER);
 }
 
 /**
@@ -117,7 +148,14 @@ export class PendingNotesQueue {
     let arr = this.notes.get(sessionKey);
     if (!arr) {
       try {
-        arr = withoutStoredErrors(this.store.getPendingNotes(sessionKey));
+        const stored = this.store.getPendingNotes(sessionKey);
+        arr = withoutStoredErrors(stored);
+        // Write the cleaned list back now: nothing else may persist this
+        // session soon (an error-only store drains to an empty prefix).
+        if (arr.length !== stored.length || arr.some((n, idx) => n !== stored[idx])) {
+          this.notes.set(sessionKey, arr);
+          this.persist(sessionKey);
+        }
       } catch (err) {
         log.warn({ err, sessionKey }, "Could not load durable pending notes");
         arr = [];

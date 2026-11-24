@@ -247,7 +247,7 @@ describe("PendingNotesQueue", () => {
   });
   it("strips errors blocks an older version left inside stored notes", () => {
     const store = new MemoryPendingNotesStore();
-    const errors = '<tomo-event type="errors" ts="x">\nRecent Tomo errors\n- [error] old-boom\n</tomo-event>';
+    const errors = '<tomo-event type="errors" ts="x">\nRecent Tomo errors before this turn (newest last, capped):\n- [error] old-boom\n</tomo-event>';
     const inbox = '<tomo-event type="inbox" name="interrupted" ts="x">\nthe message\n</tomo-event>';
     store.setPendingNotes("k", [
       `${INTERRUPTED_NOTE_MARKER}\n${inbox}\n\n${errors}\n\n${errors}`,
@@ -260,5 +260,22 @@ describe("PendingNotesQueue", () => {
     expect(drained.split(INTERRUPTED_NOTE_MARKER)).toHaveLength(2);
     queue.restoreInterrupted("k", drained);
     expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\n${inbox}`]);
+  });
+  it("never strips an errors tag that is text inside a stored message", () => {
+    const store = new MemoryPendingNotesStore();
+    const inbox = '<tomo-event type="inbox" name="interrupted" ts="x">\nlook: <tomo-event type="errors" ts="y">\nRecent Tomo errors before this turn and more text\n</tomo-event>';
+    store.setPendingNotes("k", [inbox, "plain"]);
+    const queue = new PendingNotesQueue(store);
+    expect(queue.drain("k")).toContain("and more text");
+    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\n${inbox}`, `${INTERRUPTED_NOTE_MARKER}\nplain`]);
+  });
+
+  it("clears an error-only legacy store from disk as soon as it is loaded", () => {
+    const store = new MemoryPendingNotesStore();
+    const errors = '<tomo-event type="errors" ts="x">\nRecent Tomo errors before this turn (newest last, capped):\n- [error] old-boom\n</tomo-event>';
+    store.setPendingNotes("k", [`${INTERRUPTED_NOTE_MARKER}\n${errors}`]);
+    const queue = new PendingNotesQueue(store);
+    expect(queue.drain("k")).toBe("");
+    expect(store.getPendingNotes("k")).toEqual([]);
   });
 });

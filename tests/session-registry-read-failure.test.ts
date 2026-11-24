@@ -1,9 +1,39 @@
-import { afterAll, describe, it, expect, beforeEach, afterEach } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+// Lets a test make one registry write fail (ENOSPC) without chmod, which
+// cannot fail a write for root.
+const failWrite = vi.hoisted(() => ({ path: null as string | null }));
+vi.mock("../src/fs-utils.js", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("../src/fs-utils.js")>();
+  return {
+    ...orig,
+    writeJsonAtomicSync: (...args: Parameters<typeof orig.writeJsonAtomicSync>) => {
+      if (failWrite.path !== null && args[0] === failWrite.path) {
+        throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+      }
+      return orig.writeJsonAtomicSync(...args);
+    },
+  };
+});
+// Lets a test run another writer in the gap between a process's first read and
+// its taking the registry lock.
+const beforeLock = vi.hoisted(() => ({ once: null as (() => void) | null }));
+vi.mock("../src/file-lock.js", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("../src/file-lock.js")>();
+  return {
+    ...orig,
+    withFileLockSync: (...args: Parameters<typeof orig.withFileLockSync>) => {
+      const hook = beforeLock.once;
+      if (hook) { beforeLock.once = null; hook(); }
+      return orig.withFileLockSync(...args);
+    },
+  };
+});
 import {
   SessionStore as SessionStoreImpl,
   SessionRegistryReadError,
 } from "../src/sessions/store.js";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { SessionStore as RawSessionStore } from "../src/sessions/store.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -12,6 +42,7 @@ const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-registry-read-failure-"))
 // The root is unique to this run, so nothing else will clean it up.
 afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 const REGISTRY = join(TEST_DIR, "_sessions.json");
+const BACKUP = `${REGISTRY}.bak`;
 
 class SessionStore extends SessionStoreImpl {
   constructor(dir: string, historyLimit = 20, sdkSessionsDir = join(dir, "sdk-sessions")) {
@@ -250,6 +281,8 @@ describe("session registry read failure", () => {
     writeFileSync(REGISTRY, JSON.stringify(parsed));
     const expired = readFileSync(REGISTRY, "utf-8");
     writeFileSync(REGISTRY, "{ not json");
+    // No backup to recover from (that path has its own tests below).
+    rmSync(BACKUP, { force: true });
 
     new SessionStore(TEST_DIR);
     expect(existsSync(sdkFile)).toBe(true);
@@ -287,11 +320,267 @@ describe("session registry read failure", () => {
   it("constructs without throwing when the registry is unreadable at startup", () => {
     seed();
     writeFileSync(REGISTRY, "{{{");
+    rmSync(BACKUP, { force: true });
     // A read error at boot must not take the daemon down...
     const store = new SessionStore(TEST_DIR);
     // ...but nothing may be written from the empty state it starts with.
     expect(() => store.setSdkSessionId("telegram:1", "sdk-zzz")).toThrow(SessionRegistryReadError);
     expect(readFileSync(REGISTRY, "utf-8")).toBe("{{{");
+  });
+});
+
+describe("session registry durability (fsync + backup)", () => {
+  beforeEach(() => {
+    mkdirSync(TEST_DIR, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(TEST_DIR, { recursive: true, force: true });
+  });
+
+  const linksOn = (path: string): Record<string, string> => Object.fromEntries(
+    (JSON.parse(readFileSync(path, "utf-8")) as { sessions: Array<{ channelKey: string; sdkSessionId: string | null; unlinkedAt: number | null }> })
+      .sessions.filter((e) => e.unlinkedAt === null && e.sdkSessionId).map((e) => [e.channelKey, e.sdkSessionId!]),
+  );
+
+  it("keeps a backup that follows every link change", () => {
+    const store = seed();
+    expect(linksOn(BACKUP)).toEqual({ "telegram:1": "sdk-aaa", "telegram:2": "sdk-bbb", "imessage:3": "sdk-ccc" });
+    store.clearSdkSessionId("telegram:2");
+    expect(linksOn(BACKUP)).toEqual({ "telegram:1": "sdk-aaa", "imessage:3": "sdk-ccc" });
+  });
+
+  it("recovers the links from the backup when a restart finds a 0-byte registry (power loss)", () => {
+    seed();
+    writeFileSync(REGISTRY, "");
+
+    const store = new SessionStore(TEST_DIR);
+    expect(store.getSdkSessionId("telegram:1")).toBe("sdk-aaa");
+    expect(store.getSdkSessionId("imessage:3")).toBe("sdk-ccc");
+    // Restored on disk, and the bad file is kept, not deleted.
+    expect(linksOn(REGISTRY)).toEqual(linksOn(BACKUP));
+    const aside = readdirSync(TEST_DIR).filter((n) => n.startsWith("_sessions.json.corrupt-"));
+    expect(aside).toHaveLength(1);
+    // And the next link change saves normally on top of it.
+    store.setSdkSessionId("telegram:9", "sdk-new");
+    expect(linksOn(REGISTRY)["telegram:9"]).toBe("sdk-new");
+  });
+
+  it("recovers from the backup when a restart finds a corrupt registry", () => {
+    seed();
+    writeFileSync(REGISTRY, '{"version":1,"sessions":[{"sdkSess');
+    const store = new SessionStore(TEST_DIR);
+    expect(store.getSdkSessionId("telegram:2")).toBe("sdk-bbb");
+    expect(() => store.setSdkSessionId("telegram:9", "sdk-x")).not.toThrow();
+  });
+
+  it("never recovers in a read-only reader: it fails closed and writes nothing", () => {
+    seed();
+    writeFileSync(REGISTRY, "");
+    expect(() => SessionStoreImpl.readSnapshot(TEST_DIR, join(TEST_DIR, "sdk-sessions"))).toThrow(SessionRegistryReadError);
+    expect(readFileSync(REGISTRY, "utf-8")).toBe("");
+  });
+
+  it("does not rewrite the backup when a link mutator changed nothing", () => {
+    const store = seed();
+    const before = statSync(BACKUP, { bigint: true });
+    store.retireSdkSessionId("telegram:absent");
+    expect(statSync(BACKUP, { bigint: true }).ino).toBe(before.ino);
+  });
+
+  it("refuses, rather than starting empty, on a 0-byte registry in a directory with history and no usable backup", () => {
+    seed();
+    writeFileSync(join(TEST_DIR, "telegram_1.jsonl"), "{}\n");
+    writeFileSync(REGISTRY, "");
+    rmSync(BACKUP);
+
+    const store = new SessionStore(TEST_DIR);
+    expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
+    expect(readFileSync(REGISTRY, "utf-8")).toBe("");
+  });
+
+  it("refuses when the backup is itself corrupt", () => {
+    seed();
+    writeFileSync(REGISTRY, "");
+    writeFileSync(BACKUP, "{{");
+    const store = new SessionStore(TEST_DIR);
+    expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
+    expect(readFileSync(REGISTRY, "utf-8")).toBe("");
+  });
+
+  it("does not recover over a registry that goes bad under a running process", () => {
+    const store = seed();
+    writeFileSync(REGISTRY, "{ half");
+    expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
+    expect(readFileSync(REGISTRY, "utf-8")).toBe("{ half");
+  });
+
+  it("keeps the bad registry in place when the recovered copy cannot be written", () => {
+    seed();
+    const backup = readFileSync(BACKUP, "utf-8");
+    writeFileSync(REGISTRY, "");
+
+    failWrite.path = REGISTRY;
+    try {
+      const store = new SessionStore(TEST_DIR);
+      // Not renamed away: a missing registry would read as empty and the next
+      // link save would overwrite the backup.
+      expect(readFileSync(REGISTRY, "utf-8")).toBe("");
+      expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
+    } finally {
+      failWrite.path = null;
+    }
+    expect(readFileSync(BACKUP, "utf-8")).toBe(backup);
+    // Failed attempts leave no extra copies behind.
+    expect(readdirSync(TEST_DIR).filter((n) => n.startsWith("_sessions.json.corrupt-"))).toHaveLength(0);
+
+    // Once the disk takes writes again, the next start recovers every link.
+    const store = new SessionStore(TEST_DIR);
+    expect(store.getSdkSessionId("telegram:1")).toBe("sdk-aaa");
+    expect(store.getSdkSessionId("imessage:3")).toBe("sdk-ccc");
+  });
+
+  it("does not overwrite a newer backup another writer made while the seed waited for the lock", () => {
+    seed();
+    rmSync(BACKUP);
+    // This process reads the registry (three links, no backup), and before it
+    // takes the lock to seed, another process changes a link and writes the
+    // backup that goes with it.
+    beforeLock.once = () => {
+      new SessionStore(TEST_DIR).clearSdkSessionId("telegram:2");
+    };
+    new SessionStore(TEST_DIR);
+    expect(linksOn(BACKUP)).toEqual({ "telegram:1": "sdk-aaa", "imessage:3": "sdk-ccc" });
+    expect(linksOn(BACKUP)).toEqual(linksOn(REGISTRY));
+  });
+
+  it("does not recover from a backup with no `sessions` array", () => {
+    for (const bad of ["{}", '{"version":1}', "null", '{"sessions":null}']) {
+      seed();
+      writeFileSync(REGISTRY, "");
+      writeFileSync(BACKUP, bad);
+      const store = new SessionStore(TEST_DIR);
+      expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
+      expect(readFileSync(REGISTRY, "utf-8")).toBe("");
+      expect(readFileSync(BACKUP, "utf-8")).toBe(bad);
+      rmSync(TEST_DIR, { recursive: true, force: true });
+      mkdirSync(TEST_DIR, { recursive: true });
+    }
+  });
+
+  it("neither crashes on nor restores from a backup whose entries are malformed", () => {
+    const entry = (over: Record<string, unknown>) => JSON.stringify({ version: 1, sessions: [{
+      sdkSessionId: "sdk-aaa", channelKey: "telegram:1", createdAt: 1, lastActiveAt: 1,
+      unlinkedAt: null, expiresAt: null, stats: {}, ...over,
+    }] });
+    const bads = [
+      '{"sessions":[null]}', '{"sessions":[1]}', '{"sessions":[[]]}',
+      entry({ channelKey: 5 }), entry({ sdkSessionId: null }), entry({ expiresAt: "soon" }), entry({ stats: null }),
+      // Missing lifecycle fields: `unlinkedAt === null` is what marks a link active.
+      entry({ unlinkedAt: undefined }), entry({ expiresAt: undefined }),
+      // Optional bookkeeping, but the wrong type when present.
+      entry({ createdAt: "yesterday" }), entry({ stats: [] }),
+    ];
+    for (const bad of bads) {
+      // Healthy primary: startup compares the backup and rewrites it.
+      seed();
+      writeFileSync(BACKUP, bad);
+      expect(() => new SessionStore(TEST_DIR)).not.toThrow();
+      expect(linksOn(BACKUP)).toEqual(linksOn(REGISTRY));
+      // Corrupt primary: the backup is not restored over it.
+      writeFileSync(BACKUP, bad);
+      writeFileSync(REGISTRY, "");
+      let store!: SessionStore;
+      expect(() => { store = new SessionStore(TEST_DIR); }).not.toThrow();
+      expect(() => store.setSdkSessionId("telegram:9", "sdk-new")).toThrow(SessionRegistryReadError);
+      expect(readFileSync(REGISTRY, "utf-8")).toBe("");
+      rmSync(TEST_DIR, { recursive: true, force: true });
+      mkdirSync(TEST_DIR, { recursive: true });
+    }
+  });
+
+  it("restores a backup whose entries carry every required field", () => {
+    seed();
+    const good = readFileSync(BACKUP, "utf-8");
+    writeFileSync(REGISTRY, "");
+    const store = new SessionStore(TEST_DIR);
+    expect(store.getSdkSessionId("telegram:2")).toBe("sdk-bbb");
+    expect(readFileSync(BACKUP, "utf-8")).toBe(good);
+  });
+
+  it("seeds from, and recovers from, older entries without stats or timestamps", () => {
+    // An entry from an older registry: only the link-defining fields.
+    writeFileSync(REGISTRY, JSON.stringify({ version: 1, sessions: [
+      { channelKey: "telegram:1", sdkSessionId: "sdk-old", unlinkedAt: null, expiresAt: null },
+    ] }));
+    new SessionStore(TEST_DIR);
+    expect(linksOn(BACKUP)).toEqual({ "telegram:1": "sdk-old" });
+
+    writeFileSync(REGISTRY, "");
+    const store = new SessionStore(TEST_DIR);
+    expect(store.getSdkSessionId("telegram:1")).toBe("sdk-old");
+    expect(() => store.updateStats("telegram:1", STATS)).not.toThrow();
+  });
+
+  it("retries a failed start-up backup refresh on the next bookkeeping save", () => {
+    const store = seed();
+    failWrite.path = BACKUP;
+    try {
+      store.setSdkSessionId("telegram:9", "sdk-new");
+      // A fresh start finds the backup behind, and cannot refresh it either.
+      const next = new SessionStore(TEST_DIR);
+      failWrite.path = null;
+      expect(linksOn(BACKUP)["telegram:9"]).toBeUndefined();
+      next.touchSession("telegram:1");
+      expect(linksOn(BACKUP)).toEqual(linksOn(REGISTRY));
+    } finally {
+      failWrite.path = null;
+    }
+  });
+
+  it("retries a failed backup write on the next save, even a bookkeeping one", () => {
+    const store = seed();
+    failWrite.path = BACKUP;
+    try {
+      store.setSdkSessionId("telegram:9", "sdk-new");
+    } finally {
+      failWrite.path = null;
+    }
+    expect(linksOn(REGISTRY)["telegram:9"]).toBe("sdk-new");
+    expect(linksOn(BACKUP)["telegram:9"]).toBeUndefined();
+
+    // No further link change: an ordinary bookkeeping save catches it up.
+    store.touchSession("telegram:1");
+    expect(linksOn(BACKUP)).toEqual(linksOn(REGISTRY));
+    // And once caught up, bookkeeping stops rewriting it.
+    const ino = statSync(BACKUP, { bigint: true }).ino;
+    store.touchSession("telegram:1");
+    expect(statSync(BACKUP, { bigint: true }).ino).toBe(ino);
+  });
+
+  it("rewrites a backup left behind by a process that exited after its backup write failed", () => {
+    const store = seed();
+    failWrite.path = BACKUP;
+    try {
+      store.setSdkSessionId("telegram:9", "sdk-new");
+    } finally {
+      failWrite.path = null;
+    }
+    expect(linksOn(BACKUP)["telegram:9"]).toBeUndefined();
+
+    new SessionStore(TEST_DIR);
+    expect(linksOn(BACKUP)).toEqual(linksOn(REGISTRY));
+    // A backup that already holds every link is not rewritten at start.
+    const ino = statSync(BACKUP, { bigint: true }).ino;
+    new SessionStore(TEST_DIR);
+    expect(statSync(BACKUP, { bigint: true }).ino).toBe(ino);
+  });
+
+  it("seeds a backup on the first start after upgrading", () => {
+    seed();
+    rmSync(BACKUP);
+    new SessionStore(TEST_DIR);
+    expect(linksOn(BACKUP)).toEqual(linksOn(REGISTRY));
   });
 });
 

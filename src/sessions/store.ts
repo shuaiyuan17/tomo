@@ -109,16 +109,19 @@ function parseRegistryText(
   return { ok: true, sessions: data.sessions ?? [] };
 }
 
-/** The fields the store dereferences, in the shape it writes them. Checked on
- *  a backup before it is compared with the registry or restored over it. */
+/** The required `SessionEntry` fields, present and in the shape the store
+ *  writes them (lookups test `unlinkedAt === null`, so an absent one would
+ *  restore a link nothing can find). Checked on a backup before it is
+ *  compared with the registry or restored over it; anything else refuses. */
 function isRestorableEntry(e: unknown): boolean {
   if (e === null || typeof e !== "object" || Array.isArray(e)) return false;
   const r = e as Record<string, unknown>;
-  const optNum = (v: unknown) => v === undefined || v === null || typeof v === "number";
+  const numOrNull = (v: unknown) => v === null || typeof v === "number";
   return typeof r.channelKey === "string"
     && typeof r.sdkSessionId === "string"
-    && optNum(r.unlinkedAt) && optNum(r.expiresAt)
-    && (r.stats === undefined || (r.stats !== null && typeof r.stats === "object"));
+    && typeof r.createdAt === "number" && typeof r.lastActiveAt === "number"
+    && numOrNull(r.unlinkedAt) && numOrNull(r.expiresAt)
+    && r.stats !== null && typeof r.stats === "object" && !Array.isArray(r.stats);
 }
 
 /** What the backup must agree with the registry on: which session holds

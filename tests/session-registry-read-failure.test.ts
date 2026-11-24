@@ -476,6 +476,9 @@ describe("session registry durability (fsync + backup)", () => {
     const bads = [
       '{"sessions":[null]}', '{"sessions":[1]}', '{"sessions":[[]]}',
       entry({ channelKey: 5 }), entry({ sdkSessionId: null }), entry({ expiresAt: "soon" }), entry({ stats: null }),
+      // Missing lifecycle fields: `unlinkedAt === null` is what marks a link active.
+      entry({ unlinkedAt: undefined }), entry({ expiresAt: undefined }), entry({ createdAt: undefined }),
+      entry({ stats: undefined }),
     ];
     for (const bad of bads) {
       // Healthy primary: startup compares the backup and rewrites it.
@@ -493,6 +496,15 @@ describe("session registry durability (fsync + backup)", () => {
       rmSync(TEST_DIR, { recursive: true, force: true });
       mkdirSync(TEST_DIR, { recursive: true });
     }
+  });
+
+  it("restores a backup whose entries carry every required field", () => {
+    seed();
+    const good = readFileSync(BACKUP, "utf-8");
+    writeFileSync(REGISTRY, "");
+    const store = new SessionStore(TEST_DIR);
+    expect(store.getSdkSessionId("telegram:2")).toBe("sdk-bbb");
+    expect(readFileSync(BACKUP, "utf-8")).toBe(good);
   });
 
   it("retries a failed start-up backup refresh on the next bookkeeping save", () => {

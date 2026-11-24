@@ -33,7 +33,7 @@ vi.stubEnv("TOMO_WORKSPACE", TOMO_WORKSPACE);
 vi.resetModules();
 
 const { buildSystemPrompt, buildIdentityPrompt, promptContextSnapshot } = await import("../src/workspace/index.js");
-const { describePromptContextChange } = await import("../src/workspace/prompt-context-diff.js");
+const { classifyPromptContextChange } = await import("../src/workspace/prompt-context-diff.js");
 
 afterAll(() => {
   vi.unstubAllEnvs();
@@ -126,16 +126,25 @@ describe("buildSystemPrompt", () => {
       rmSync(peopleDir, { recursive: true, force: true });
     });
 
-    it("holds only the MEMORY.md lines the prompt shows, so a line moving into view reads as added", () => {
+    it("hands over the lines the prompt was built from, cut where the prompt cuts them", () => {
       const lines = Array.from({ length: 201 }, (_, i) => `- line ${i + 1}`);
       writeFileSync(memoryFile, lines.join("\n") + "\n");
-      const before = promptContextSnapshot();
-      expect(before.memory).toHaveLength(200);
-      expect(before.memory).not.toContain("- line 201");
+      mkdirSync(peopleDir, { recursive: true });
+      writeFileSync(join(peopleDir, "alice.md"), "---\nname: Alice\n---\n");
+      let built: { memory: string[]; people: string[] } | undefined;
+      const prompt = buildSystemPrompt({ onContext: (c) => { built = c; } });
+      expect(built!.memory).toHaveLength(200);
+      expect(built!.memory).not.toContain("- line 201");
+      expect(prompt).toContain("- line 200");
+      expect(prompt).not.toContain("- line 201");
+      expect(built!.people.join("\n")).toContain("Alice");
+      // The before-turn re-read cuts the same way.
+      expect(promptContextSnapshot({ strict: true })).toEqual(built);
+      // A line moving into view reads as added.
       writeFileSync(memoryFile, lines.slice(1).join("\n") + "\n");
-      const note = describePromptContextChange(before, promptContextSnapshot())!;
-      expect(note).toContain("+ - line 201");
-      expect(note).toMatch(/^- - line 1$/m);
+      const change = classifyPromptContextChange(built!, promptContextSnapshot({ strict: true }));
+      expect(change.kind).toBe("note");
+      expect(change.kind === "note" && change.body).toContain("+ - line 201");
     });
 
     it("a strict read throws on an unreadable people directory; the lenient one returns what it could", () => {
@@ -205,6 +214,11 @@ describe("buildSystemPrompt", () => {
     });
 
     it("the context snapshot matches what each audience's prompt holds", () => {
+      for (const isGroup of [false, true]) {
+        let built: { memory: string[] } | undefined;
+        buildSystemPrompt({ isGroup, onContext: (c) => { built = c; } });
+        expect(promptContextSnapshot({ isGroup }).memory).toEqual(built!.memory);
+      }
       expect(promptContextSnapshot({ isGroup: false }).memory).toHaveLength(3);
       const group = promptContextSnapshot({ isGroup: true }).memory;
       expect(group).toEqual(["- [Public](public.md) — visible everywhere"]);

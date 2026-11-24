@@ -43,6 +43,8 @@ const { mockState } = vi.hoisted(() => ({
     } | null>),
     compactTriggered: false,
     sessionContexts: [] as Array<{ sessionKey: string; backgroundLaunchDenial?: () => string | null }>,
+    /** What the (mocked) prompt build hands the session as its snapshot. */
+    buildContext: null as null | ((key: string) => { memory: string[]; people: string[] }),
     onInterrupt: null as null | ((err: Error, session: FakeSession) => void),
     /** When set, every closed session's whenClosed() waits on it (the CLI child still exiting). */
     closeGate: null as null | Promise<void>,
@@ -146,8 +148,12 @@ vi.mock("../src/agent/live-session.js", () => {
 
 vi.mock("../src/agent/sdk-options.js", () => ({
   makeTurnBudget: () => ({}),
-  sdkOptions: (_server: unknown, _resume: unknown, _model: unknown, ctx: { sessionKey: string }) => {
+  sdkOptions: (_server: unknown, _resume: unknown, _model: unknown, ctx: {
+    sessionKey: string;
+    onPromptContext?: (c: { memory: string[]; people: string[] }) => void;
+  }) => {
     mockState.sessionContexts.push(ctx);
+    if (mockState.buildContext) ctx.onPromptContext?.(mockState.buildContext(ctx.sessionKey));
     return { model: "test-model" };
   },
 }));
@@ -211,6 +217,7 @@ beforeEach(() => {
   mockState.mcpSetImpl = null;
   mockState.compactTriggered = false;
   mockState.sessionContexts = [];
+  mockState.buildContext = null;
   mockState.onInterrupt = null;
   mockState.closeGate = null;
   mockState.reconnectGate = null;
@@ -271,164 +278,6 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(replacement).not.toBe(first);
   });
 
-  it("keeps live sessions when only MEMORY.md or the roster changes, and tells each one once", async () => {
-    let memory = ["- [Travel](travel.md)"];
-    const manager = new LiveSessionManager(makeDeps({
-      buildIdentityPrompt: () => "identity-v1",
-      promptContextSnapshot: () => ({ memory, people: ["- Alice"] }),
-    }));
-
-    const dm = await manager.getOrCreateLiveSession("dm:owner");
-    const group = await manager.getOrCreateLiveSession("telegram:-1");
-    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
-
-    memory = ["- [Travel](travel.md)", "- [Coffee](coffee.md)"];
-    // The next message reuses both sessions: nothing is retired.
-    expect(await manager.getOrCreateLiveSession("dm:owner")).toBe(dm);
-    expect(await manager.getOrCreateLiveSession("telegram:-1")).toBe(group);
-    expect(dm.closed).toBe(false);
-    expect(group.closed).toBe(false);
-
-    // Each session hears about the change once, as a memory event.
-    const taken = manager.takePromptContextNote("dm:owner")!;
-    expect(taken.note).toContain('<tomo-event type="memory" name="changed"');
-    expect(taken.note).toContain("+ - [Coffee](coffee.md)");
-    manager.settlePromptContextNote(taken.ticket);
-    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
-    expect(manager.takePromptContextNote("telegram:-1")?.note).toContain("Coffee");
-    // No live session for the key: the next one is built with the current text.
-    expect(manager.takePromptContextNote("telegram:2")).toBeUndefined();
-  });
-
-  it("tells a change again when the turn that carried it did not complete, but only the same session", async () => {
-    let memory = ["- [Travel](travel.md)"];
-    const manager = new LiveSessionManager(makeDeps({
-      buildIdentityPrompt: () => "identity-v1",
-      promptContextSnapshot: () => ({ memory, people: [] }),
-    }));
-    await manager.getOrCreateLiveSession("dm:owner");
-
-    memory = [...memory, "- [Coffee](coffee.md)"];
-    const first = manager.takePromptContextNote("dm:owner")!;
-    expect(first.note).toContain("+ - [Coffee](coffee.md)");
-    // The turn failed: the next one describes the change again, from the
-    // files as they are by then.
-    manager.restorePromptContextNote(first.ticket);
-    memory = ["- [Coffee](coffee.md)"];
-    const again = manager.takePromptContextNote("dm:owner")!;
-    expect(again.note).toContain("+ - [Coffee](coffee.md)");
-    expect(again.note).toContain("- - [Travel](travel.md)");
-    // Completed: told, not repeated (a stale ticket changes nothing).
-    manager.settlePromptContextNote(again.ticket);
-    manager.restorePromptContextNote(again.ticket);
-    manager.restorePromptContextNote(first.ticket);
-    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
-  });
-
-  it("holds a second change note while one is in flight, and tells it after the first settles", async () => {
-    let memory = ["- [Travel](travel.md)"];
-    const manager = new LiveSessionManager(makeDeps({
-      promptContextSnapshot: () => ({ memory, people: [] }),
-    }));
-    await manager.getOrCreateLiveSession("dm:owner");
-
-    memory = [...memory, "- [Coffee](coffee.md)"];
-    const first = manager.takePromptContextNote("dm:owner")!;
-    memory = [...memory, "- [Tea](tea.md)"];
-    // A steered turn while the first is in flight: no second note.
-    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
-    manager.settlePromptContextNote(first.ticket);
-    const next = manager.takePromptContextNote("dm:owner")!;
-    expect(next.note).toContain("+ - [Tea](tea.md)");
-    expect(next.note).not.toContain("Coffee");
-  });
-
-  it("a group session's note does not send it to the raw MEMORY.md", async () => {
-    let memory = ["## Work", "- [A](a.md)", "## Home"];
-    const manager = new LiveSessionManager(makeDeps({
-      promptContextSnapshot: () => ({ memory, people: [] }),
-    }));
-    await manager.getOrCreateLiveSession("telegram:-100");
-    await manager.getOrCreateLiveSession("dm:owner");
-    memory = ["## Work", "## Home", "- [A](a.md)"];
-    expect(manager.takePromptContextNote("telegram:-100")!.note).not.toContain("memory/MEMORY.md");
-    expect(manager.takePromptContextNote("dm:owner")!.note).toContain("memory/MEMORY.md");
-  });
-
-  it("a stale ticket of the same session neither settles nor rolls back the note in flight", async () => {
-    let memory = ["a"];
-    const manager = new LiveSessionManager(makeDeps({
-      promptContextSnapshot: () => ({ memory, people: [] }),
-    }));
-    await manager.getOrCreateLiveSession("dm:owner");
-    memory = ["a", "b"];
-    const t1 = manager.takePromptContextNote("dm:owner")!.ticket;
-    manager.restorePromptContextNote(t1);
-    const t2 = manager.takePromptContextNote("dm:owner")!.ticket;
-    memory = ["a", "b", "c"];
-    // t1's turn reports late: t2 is still in flight.
-    manager.settlePromptContextNote(t1);
-    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
-    manager.settlePromptContextNote(t2);
-    const t3 = manager.takePromptContextNote("dm:owner")!;
-    expect(t3.note).toContain("+ c");
-    expect(t3.note).not.toContain("+ b");
-    // A stale restore must not roll t3 back to the snapshot before b.
-    manager.restorePromptContextNote(t1);
-    manager.restorePromptContextNote(t2);
-    manager.settlePromptContextNote(t3.ticket);
-    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
-  });
-
-  it("a ticket from a replaced session does not touch its replacement", async () => {
-    let memory = ["a"];
-    const manager = new LiveSessionManager(makeDeps({
-      promptContextSnapshot: () => ({ memory, people: [] }),
-    }));
-    const old = await manager.getOrCreateLiveSession("dm:owner");
-    memory = ["a", "b"];
-    const stale = manager.takePromptContextNote("dm:owner")!;
-    old.closed = true;
-    await manager.getOrCreateLiveSession("dm:owner");
-    memory = ["a", "b", "c"];
-    const fresh = manager.takePromptContextNote("dm:owner")!;
-    expect(fresh.note).toContain("+ c");
-    expect(fresh.note).not.toContain("+ b");
-    // The old turn settles late: the new session's note stays in flight, so
-    // it can still be rolled back.
-    manager.settlePromptContextNote(stale.ticket);
-    manager.restorePromptContextNote(fresh.ticket);
-    expect(manager.takePromptContextNote("dm:owner")?.note).toContain("+ c");
-  });
-
-  it("re-reads the snapshot after the prompt build when the first read fails, so the session still hears of changes", async () => {
-    let reads = 0;
-    let memory = ["a"];
-    const manager = new LiveSessionManager(makeDeps({
-      promptContextSnapshot: () => {
-        reads++;
-        if (reads === 1) throw new Error("EIO");
-        return { memory, people: [] };
-      },
-    }));
-    await manager.getOrCreateLiveSession("dm:owner");
-    memory = ["a", "b"];
-    expect(manager.takePromptContextNote("dm:owner")?.note).toContain("+ b");
-  });
-
-  it("reads strictly before a turn, leniently when building the session", async () => {
-    const calls: boolean[] = [];
-    const manager = new LiveSessionManager(makeDeps({
-      promptContextSnapshot: (_key, { strict }) => {
-        calls.push(strict);
-        return { memory: [], people: [] };
-      },
-    }));
-    await manager.getOrCreateLiveSession("dm:owner");
-    manager.takePromptContextNote("dm:owner");
-    expect(calls).toEqual([false, true]);
-  });
-
   it("still retires live sessions when SOUL/AGENT/IDENTITY or the harness rules change", async () => {
     let identity = "identity-v1";
     const manager = new LiveSessionManager(makeDeps({
@@ -442,18 +291,6 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(second).not.toBe(first);
   });
 
-  it("skips the change note when the memory index cannot be read", async () => {
-    let fail = false;
-    const manager = new LiveSessionManager(makeDeps({
-      promptContextSnapshot: () => {
-        if (fail) throw new Error("EIO");
-        return { memory: ["a"], people: [] };
-      },
-    }));
-    await manager.getOrCreateLiveSession("dm:owner");
-    fail = true;
-    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
-  });
 
   it("does not read the cache-boundary marker as a prompt change", async () => {
     const BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
@@ -1399,66 +1236,208 @@ describe("LiveSessionManager idle reaper", () => {
   });
 });
 
-describe("LiveSessionManager.runWithRetry", () => {
-  describe("memory change note on a session that gets replaced", () => {
-    function setup() {
-      let memory = ["a"];
-      let identity = "identity-v1";
-      const manager = new LiveSessionManager(makeDeps({
-        buildIdentityPrompt: () => identity,
-        promptContextSnapshot: () => ({ memory, people: [] }),
-      }));
+describe("LiveSessionManager memory change notes", () => {
+  type Lines = { memory: string[]; people: string[] };
+  /** Prompt build and the before-turn re-read see the same files by default;
+   *  `strictRead` overrides what the strict re-read returns (or throws). */
+  function setup(initial: Lines, opts: { strictRead?: () => Lines; identity?: () => string } = {}) {
+    let files = initial;
+    mockState.buildContext = () => files;
+    const manager = new LiveSessionManager(makeDeps({
+      ...(opts.identity ? { buildIdentityPrompt: opts.identity } : {}),
+      promptContextSnapshot: (_key, { strict }) => (strict && opts.strictRead ? opts.strictRead() : files),
+    }));
+    return { manager, set: (next: Lines) => { files = next; } };
+  }
+  const mem = (...memory: string[]): Lines => ({ memory, people: [] });
+
+  it("tells each live session a small added line once, and keeps it", async () => {
+    const { manager, set } = setup(mem("- [Travel](travel.md)"));
+    const dm = await manager.getOrCreateLiveSession("dm:owner");
+    const group = await manager.getOrCreateLiveSession("telegram:-1");
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+
+    set(mem("- [Travel](travel.md)", "- [Coffee](coffee.md)"));
+    expect(await manager.getOrCreateLiveSession("dm:owner")).toBe(dm);
+    const ticket = manager.takePromptContextNote("dm:owner")!;
+    expect(ticket.prefix).toContain('<tomo-event type="memory" name="changed"');
+    expect(ticket.prefix).toContain("+ - [Coffee](coffee.md)");
+    expect(ticket.prefix.endsWith("\n\n")).toBe(true);
+    manager.settlePromptContextNote(ticket);
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+    expect(manager.takePromptContextNote("telegram:-1")?.prefix).toContain("Coffee");
+    expect(dm.closed).toBe(false);
+    expect(group.closed).toBe(false);
+    // No live session for the key: the next one is built with the current text.
+    expect(manager.takePromptContextNote("telegram:2")).toBeUndefined();
+  });
+
+  it("snapshots the lines the prompt was built from, not a second read", async () => {
+    let built = mem("- a");
+    mockState.buildContext = () => built;
+    const manager = new LiveSessionManager(makeDeps({
+      promptContextSnapshot: () => mem("- a", "- b"),
+    }));
+    await manager.getOrCreateLiveSession("dm:owner");
+    built = mem("- a", "- b");
+    // The prompt holds only "- a": "- b" must be told.
+    expect(manager.takePromptContextNote("dm:owner")?.prefix).toContain("+ - b");
+  });
+
+  it("tells a change again when its turn did not complete; stale tickets cross nothing", async () => {
+    const { manager, set } = setup(mem("- a"));
+    await manager.getOrCreateLiveSession("dm:owner");
+    set(mem("- a", "- b"));
+    const t1 = manager.takePromptContextNote("dm:owner")!;
+    manager.restorePromptContextNote(t1);
+    const t2 = manager.takePromptContextNote("dm:owner")!;
+    expect(t2.prefix).toContain("+ - b");
+    set(mem("- a", "- b", "- c"));
+    // One note in flight: a steered turn gets none, and t1's late settle
+    // does not release t2.
+    manager.settlePromptContextNote(t1);
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+    manager.settlePromptContextNote(t2);
+    const t3 = manager.takePromptContextNote("dm:owner")!;
+    expect(t3.prefix).toContain("+ - c");
+    expect(t3.prefix).not.toContain("+ - b");
+    // A stale restore must not roll t3 back to the snapshot before b.
+    manager.restorePromptContextNote(t1);
+    manager.restorePromptContextNote(t2);
+    manager.settlePromptContextNote(t3);
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+  });
+
+  it("a ticket from a replaced session does not touch its replacement", async () => {
+    const { manager, set } = setup(mem("- a"));
+    const old = await manager.getOrCreateLiveSession("dm:owner");
+    set(mem("- a", "- b"));
+    const stale = manager.takePromptContextNote("dm:owner")!;
+    old.closed = true;
+    await manager.getOrCreateLiveSession("dm:owner");
+    set(mem("- a", "- b", "- c"));
+    const fresh = manager.takePromptContextNote("dm:owner")!;
+    expect(fresh.prefix).toContain("+ - c");
+    expect(fresh.prefix).not.toContain("+ - b");
+    manager.settlePromptContextNote(stale);
+    manager.restorePromptContextNote(fresh);
+    expect(manager.takePromptContextNote("dm:owner")?.prefix).toContain("+ - c");
+  });
+
+  it.each([
+    ["lines reordered", mem("## Work", "- a", "## Home"), mem("## Work", "## Home", "- a")],
+    ["a heading added", mem("- a"), mem("## New", "- a")],
+    ["a heading removed", mem("## Work", "- a"), mem("- a")],
+    ["more lines than a note may carry", mem("- a"),
+      mem("- a", ...Array.from({ length: 11 }, (_, i) => `- n${i}`))],
+  ])("retires the session instead of noting %s", async (_what, before, after) => {
+    const { manager, set } = setup(before);
+    const first = await manager.getOrCreateLiveSession("dm:owner");
+    set(after);
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+    // Idle: retired at once, so the turn runs on a session built from the
+    // current files.
+    expect(first.closed).toBe(true);
+    const second = await manager.getOrCreateLiveSession("dm:owner");
+    expect(second).not.toBe(first);
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+  });
+
+  it("notes up to the line limit", async () => {
+    const { manager, set } = setup(mem("- a"));
+    const first = await manager.getOrCreateLiveSession("dm:owner");
+    set(mem("- a", ...Array.from({ length: 10 }, (_, i) => `- n${i}`)));
+    expect(manager.takePromptContextNote("dm:owner")?.prefix).toContain("+ - n9");
+    expect(first.closed).toBe(false);
+  });
+
+  it("a busy session too big to note is retired once its turn ends, and gets no note meanwhile", async () => {
+    const { manager, set } = setup(mem("- a"));
+    const first = await manager.getOrCreateLiveSession("dm:owner");
+    first.busy = true;
+    set(mem("- a", "# Heading"));
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+    expect(first.closed).toBe(false);
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+    first.busy = false;
+    first.releaseIdle();
+    await flushMicrotasks();
+    expect(first.closed).toBe(true);
+  });
+
+  describe("when the strict re-read fails", () => {
+    const failing = () => { throw new Error("EACCES"); };
+
+    it("sends no note, and keeps the session when a rebuilt prompt would be the same", async () => {
+      const { manager } = setup(mem("- a"), { strictRead: failing });
+      const first = await manager.getOrCreateLiveSession("dm:owner");
+      expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+      expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+      expect(first.closed).toBe(false);
+    });
+
+    it("sends no note, and retires the session when a rebuilt prompt would differ", async () => {
+      const { manager, set } = setup(mem("- a"), { strictRead: failing });
+      const first = await manager.getOrCreateLiveSession("dm:owner");
+      set(mem("- a", "- b"));
+      expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+      expect(first.closed).toBe(true);
+    });
+  });
+
+  describe("on a session that gets replaced", () => {
+    function recordSends() {
       const sent: Array<{ prompt: string; session: unknown }> = [];
-      return {
-        manager, sent,
-        setMemory: (m: string[]) => { memory = m; },
-        setIdentity: (v: string) => { identity = v; },
-      };
+      return sent;
     }
 
     it("keeps the note when the turn runs on the session it was written for", async () => {
-      const { manager, sent, setMemory } = setup();
+      const { manager, set } = setup(mem("- a"));
       await manager.getOrCreateLiveSession("dm:owner");
-      setMemory(["a", "b"]);
-      const taken = manager.takePromptContextNote("dm:owner")!;
+      set(mem("- a", "- b"));
+      const ticket = manager.takePromptContextNote("dm:owner")!;
+      const sent = recordSends();
       mockState.sendImpl = async (prompt, session) => { sent.push({ prompt, session }); return "ok"; };
-      await manager.runWithRetry({ key: "dm:owner", prompt: `${taken.ticket.prefix}hi` });
-      expect(sent).toHaveLength(1);
-      expect(sent[0].prompt).toBe(`${taken.ticket.prefix}hi`);
+      await manager.runWithRetry({ key: "dm:owner", prompt: `${ticket.prefix}hi`, contextNote: ticket });
+      expect(sent.map((x) => x.prompt)).toEqual([`${ticket.prefix}hi`]);
     });
 
     it("drops it when an identity change retires the session before the turn reaches it", async () => {
-      const { manager, sent, setMemory, setIdentity } = setup();
+      let identity = "identity-v1";
+      const { manager, set } = setup(mem("- a"), { identity: () => identity });
       const old = await manager.getOrCreateLiveSession("dm:owner");
-      setMemory(["a", "b"]);
-      setIdentity("identity-v2");
-      const taken = manager.takePromptContextNote("dm:owner")!;
-      expect(taken).toBeDefined();
+      set(mem("- a", "- b"));
+      identity = "identity-v2";
+      const ticket = manager.takePromptContextNote("dm:owner")!;
+      const sent = recordSends();
       mockState.sendImpl = async (prompt, session) => { sent.push({ prompt, session }); return "ok"; };
-      await manager.runWithRetry({ key: "dm:owner", prompt: `${taken.ticket.prefix}hi` });
+      await manager.runWithRetry({ key: "dm:owner", prompt: `${ticket.prefix}hi`, contextNote: ticket });
       expect(sent).toHaveLength(1);
       expect(sent[0].session).not.toBe(old);
       expect(sent[0].prompt).toBe("hi");
     });
 
     it("drops it from the retry after a session error", async () => {
-      const { manager, sent, setMemory } = setup();
+      const { manager, set } = setup(mem("- a"));
       await manager.getOrCreateLiveSession("dm:owner");
-      setMemory(["a", "b"]);
-      const taken = manager.takePromptContextNote("dm:owner")!;
+      set(mem("- a", "- b"));
+      const ticket = manager.takePromptContextNote("dm:owner")!;
+      const sent = recordSends();
       mockState.sendImpl = async (prompt, session) => {
         sent.push({ prompt, session });
         if (sent.length === 1) throw new Error("Session is closed");
         return "ok";
       };
-      await manager.runWithRetry({ key: "dm:owner", prompt: `${taken.ticket.prefix}hi` });
+      await manager.runWithRetry({ key: "dm:owner", prompt: `${ticket.prefix}hi`, contextNote: ticket });
       expect(sent).toHaveLength(2);
-      expect(sent[0].prompt).toBe(`${taken.ticket.prefix}hi`);
+      expect(sent[0].prompt).toBe(`${ticket.prefix}hi`);
       expect(sent[1].session).not.toBe(sent[0].session);
       expect(sent[1].prompt).toBe("hi");
     });
   });
+});
 
+describe("LiveSessionManager.runWithRetry", () => {
   it("records the new SDK session id, stats, and context nudge on success", async () => {
     const deps = makeDeps();
     const manager = new LiveSessionManager(deps);

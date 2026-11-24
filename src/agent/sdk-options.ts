@@ -3,6 +3,7 @@ import { backgroundLaunchGuardHooks } from "./compact-reservations.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
 import { buildSystemPrompt } from "../workspace/index.js";
+import type { PromptContextLines } from "../workspace/prompt-context-diff.js";
 import { assembleSystemPrompt, renderRuntimeSection, renderSessionSection } from "../workspace/system-prompt-blocks.js";
 import { isDmSessionKey, isGroupSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
@@ -60,6 +61,9 @@ export function resetTurnBudget(b: TurnBudget): void {
 export interface SessionContext {
   sessionKey: string;
   sdkSessionId?: string;
+  /** Receives the MEMORY.md / roster lines the system prompt was built from
+   *  (buildSystemPrompt's `onContext`): the live session's snapshot. */
+  onPromptContext?: (context: PromptContextLines) => void;
   /** Group metadata snapshot — present only for group sessions. */
   group?: {
     chatTitle?: string;
@@ -121,7 +125,7 @@ export function sdkOptions(
   externalMcpServersOverride?: Record<string, McpServerConfig>,
 ) {
   const isGroup = sessionContext ? isGroupSessionKey(sessionContext.sessionKey) : false;
-  const staticPrompt = buildSystemPrompt({ isGroup });
+  const staticPrompt = buildSystemPrompt({ isGroup, onContext: sessionContext?.onPromptContext });
 
   // Why `memory/private/` is closed for the turn in flight — or null when it is
   // open. INSTALLED FOR EVERY SESSION, and resolved per tool call rather than

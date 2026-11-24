@@ -488,7 +488,10 @@ export function configModuleMock() {
 
 export function workspaceModuleMock() {
   return {
-    buildSystemPrompt: () => mockWorkspace.systemPrompt,
+    buildSystemPrompt: (opts?: { onContext?: (c: { memory: string[]; people: string[] }) => void }) => {
+      opts?.onContext?.(mockWorkspace.promptContext);
+      return mockWorkspace.systemPrompt;
+    },
     buildIdentityPrompt: () => mockWorkspace.systemPrompt,
     promptContextSnapshot: () => mockWorkspace.promptContext,
     PRIVATE_MEMORY_SUBDIR: "private",

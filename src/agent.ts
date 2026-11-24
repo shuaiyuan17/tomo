@@ -58,7 +58,7 @@ import { CredentialBroker } from "./credentials/broker.js";
 import { captureChannelFor } from "./credentials/capture.js";
 import { BrokerStateFile, KeychainBackend } from "./credentials/store.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
-import { LiveSessionManager, type PromptContextTicket } from "./agent/live-session-manager.js";
+import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { appendToTomoEventBody, formatTomoEvent } from "./tomo-event.js";
 import { UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
@@ -166,10 +166,6 @@ export class Agent {
   private readonly ownerNotices: OwnerNotices;
   private readonly mcpAuthPrompts: McpAuthPrompts;
   private pendingNotesQueue: PendingNotesQueue;
-  /** Per key: each memory-change note prefixed to a turn still in flight,
-   *  one entry per drained batch (turns for one key overlap: a steer joins
-   *  the running turn). See drainPendingNotes. */
-  private readonly inFlightContextNotes = new Map<string, Array<{ prefix: string; ticket: PromptContextTicket }>>();
   /**
    * Durable record of every accepted inbound message until a turn consumes
    * it (see DurableInbox). Undefined when `config.inbox` is off or the log
@@ -262,14 +258,18 @@ export class Agent {
     // time (tests replace it on the instance).
     this.turnRunner = new TurnRunner({
       drainPendingNotes: (sessionKey) => this.drainPendingNotes(sessionKey),
-      restorePendingNotes: (sessionKey, drained) => {
-        this.pendingNotesQueue.restore(sessionKey, this.takeBackContextNote(sessionKey, drained, false));
-      },
-      settlePendingNotes: (sessionKey, drained) => {
-        this.pendingNotesQueue.settle(sessionKey, this.takeBackContextNote(sessionKey, drained, true));
-      },
-      restoreInterruptedPendingNotes: (sessionKey, drained) => {
-        this.pendingNotesQueue.restoreInterrupted(sessionKey, this.takeBackContextNote(sessionKey, drained, false));
+      restorePendingNotes: (sessionKey, drained) => this.pendingNotesQueue.restore(sessionKey, drained),
+      settlePendingNotes: (sessionKey, drained) => this.pendingNotesQueue.settle(sessionKey, drained),
+      restoreInterruptedPendingNotes: (sessionKey, drained) => this.pendingNotesQueue.restoreInterrupted(sessionKey, drained),
+      // A live session keeps the MEMORY.md / roster it was built with; a small
+      // change rides in ahead of the turn as a note. NOT through the durable
+      // queue: replayed after a restart it would describe a prompt the new
+      // session does not have. A turn that did not complete rolls the
+      // session's snapshot back instead.
+      takePromptContextNote: (sessionKey) => this.liveSessionManager.takePromptContextNote(sessionKey),
+      settlePromptContextNote: (ticket, told) => {
+        if (told) this.liveSessionManager.settlePromptContextNote(ticket);
+        else this.liveSessionManager.restorePromptContextNote(ticket);
       },
       // Persisted (sessions' pending-notes file): a reply the owner never got
       // must still be known to the next turn if the daemon restarts first.
@@ -2483,33 +2483,7 @@ export class Agent {
 
   /** Drain notes queued for this session and return them as a prefix. */
   private drainPendingNotes(sessionKey: string): string {
-    // A live session keeps the MEMORY.md / roster it was built with; what
-    // changed since rides in ahead of this turn's notes (see
-    // buildIdentityPrompt). It is NOT queued: the queue is durable, and a
-    // change note replayed after a restart would describe a prompt the new
-    // session does not have. If the turn does not complete, the live session's
-    // snapshot is rolled back instead (takeBackContextNote).
-    const drained = this.pendingNotesQueue.drain(sessionKey);
-    const taken = this.liveSessionManager.takePromptContextNote(sessionKey);
-    if (!taken) return drained;
-    const { prefix } = taken.ticket;
-    const inFlight = this.inFlightContextNotes.get(sessionKey) ?? [];
-    inFlight.push({ prefix, ticket: taken.ticket });
-    this.inFlightContextNotes.set(sessionKey, inFlight);
-    return prefix + drained;
-  }
-
-  /** Strip this turn's memory-change note off the drained prefix before it
-   *  goes back to the queue, and settle or roll back the snapshot it told. */
-  private takeBackContextNote(sessionKey: string, drained: string, completed: boolean): string {
-    const inFlight = this.inFlightContextNotes.get(sessionKey);
-    const i = inFlight?.findIndex((entry) => drained.startsWith(entry.prefix)) ?? -1;
-    if (!inFlight || i < 0) return drained;
-    const [{ prefix, ticket }] = inFlight.splice(i, 1);
-    if (inFlight.length === 0) this.inFlightContextNotes.delete(sessionKey);
-    if (completed) this.liveSessionManager.settlePromptContextNote(ticket);
-    else this.liveSessionManager.restorePromptContextNote(ticket);
-    return drained.slice(prefix.length);
+    return this.pendingNotesQueue.drain(sessionKey);
   }
 
   /** Channel + per-session vitals snapshot for the watch server. */

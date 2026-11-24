@@ -35,8 +35,9 @@ function load(name: string): string {
   return "";
 }
 
-function loadMemory(isGroup: boolean): string {
-  mkdirSync(MEMORY_DIR, { recursive: true });
+/** `lines`: MEMORY.md as this audience sees it (memoryIndexLines), read once
+ *  by buildSystemPrompt so the prompt and its context snapshot agree. */
+function loadMemory(isGroup: boolean, lines: string[] | null): string {
 
   const privacySection = isGroup
     ? `\n## Private memories (DM-only)\n\nMemory files under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` are restricted to DM sessions. They are not listed in the index below, and you cannot read them from this group session — the harness will deny the tool call. Two consequences worth knowing before you reach for them: the **shell here runs sandboxed** (every Bash command is wrapped in a \`sandbox-exec\` profile that makes those files unreadable at the kernel level, so assembling the path in an interpreter fails with EPERM rather than working; if the sandbox cannot be set up the Bash tool is withheld for the turn instead), and a \`MEDIA:\` attachment pointing into \`memory/${PRIVATE_MEMORY_SUBDIR}/\` is dropped before it is sent, since attaching a file is a way of reading it out loud.\n`
@@ -92,7 +93,6 @@ Don't wait to be told "remember this." Save durable personal details, preference
 - Remove stale memories when you notice they're outdated
 - Organize by topic, not chronology`.trim();
 
-  const lines = memoryIndexLines(isGroup);
   let memoryContent: string;
   if (lines === null) {
     memoryContent = "(currently empty)";
@@ -132,9 +132,8 @@ function peopleRosterLines(isGroup: boolean, strict = false): string[] {
   return renderPeopleRoster(loadPeople({ includePrivate: !isGroup, strict }));
 }
 
-function loadPeopleSection(isGroup: boolean): string {
+function loadPeopleSection(isGroup: boolean, rosterLines: string[]): string {
   const dirs = defaultPeopleDirs();
-  const rosterLines = peopleRosterLines(isGroup);
   const roster = rosterLines.length > 0 ? rosterLines.join("\n") : "(no people records yet)";
   const privacyNote = isGroup
     ? `Records under \`memory/${PRIVATE_MEMORY_SUBDIR}/people/\` are DM-only — they are not listed here and cannot be read from this group session.`
@@ -248,17 +247,17 @@ export interface PromptContextSnapshot {
 }
 
 /**
- * Read-only: never creates the memory directory. `memory` is only the part of
- * MEMORY.md the prompt shows (the first MAX_MEMORY_LINES lines), so an edit
- * that moves a line across that boundary reads as that line added or removed.
+ * The MEMORY.md / roster lines a prompt built now would hold — the before-turn
+ * re-read compared against a live session's snapshot (which comes from
+ * buildSystemPrompt's `onContext`). Read-only: never creates the memory
+ * directory. `memory` is only what the prompt shows (the first
+ * MAX_MEMORY_LINES lines).
  *
- * `strict` (the before-turn re-read) throws when the people directory or a
- * record cannot be read, instead of returning the partial roster the prompt
- * builder settles for (and only ENOENT counts as a missing file or
- * directory): compared against the session's snapshot, a partial
- * roster would tell the model that everyone it could not read was removed.
- * The snapshot taken when a session is built is NOT strict: it has to match
- * the prompt, which was built from the partial roster.
+ * `strict` throws when MEMORY.md, the people directory or a record cannot be
+ * read (only ENOENT counts as missing), instead of returning the partial
+ * result the prompt builder settles for: compared against the snapshot, a
+ * partial roster would read as everyone it could not read being removed.
+ * Without `strict` it reads exactly as buildSystemPrompt does.
  */
 export function promptContextSnapshot(opts: { isGroup?: boolean; strict?: boolean } = {}): PromptContextSnapshot {
   const isGroup = !!opts.isGroup;
@@ -267,9 +266,20 @@ export function promptContextSnapshot(opts: { isGroup?: boolean; strict?: boolea
   return { memory, people: peopleRosterLines(isGroup, strict) };
 }
 
-export function buildSystemPrompt(opts: { isGroup?: boolean } = {}): string {
+/**
+ * `onContext` receives the MEMORY.md and roster lines this prompt was built
+ * from — the same read, filtered for the audience and cut at MAX_MEMORY_LINES
+ * exactly as the prompt shows them. A live session keeps that as its snapshot
+ * (see LiveSessionManager.takePromptContextNote): a second read could see
+ * different files than the prompt did.
+ */
+export function buildSystemPrompt(opts: { isGroup?: boolean; onContext?: (context: PromptContextSnapshot) => void } = {}): string {
   const isGroup = !!opts.isGroup;
-  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup), loadPeopleSection(isGroup),
+  mkdirSync(MEMORY_DIR, { recursive: true });
+  const memoryLines = memoryIndexLines(isGroup);
+  const rosterLines = peopleRosterLines(isGroup);
+  opts.onContext?.({ memory: (memoryLines ?? []).slice(0, MAX_MEMORY_LINES), people: rosterLines });
+  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup, memoryLines), loadPeopleSection(isGroup, rosterLines),
     isGroup ? HARNESS_INSTRUCTIONS : `${HARNESS_INSTRUCTIONS}\n\n${HOME_NOTE}`].filter(Boolean);
   return sections.join("\n\n---\n\n");
 }

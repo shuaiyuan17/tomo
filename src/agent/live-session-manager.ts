@@ -342,6 +342,11 @@ export class LiveSessionManager {
   }
 
   /** Is a live turn currently in flight on this session? (steering target check) */
+  /** The key has a live session in memory (its history is there; nothing to resume). */
+  hasLiveSession(key: string): boolean {
+    return this.liveSessions.get(key)?.isAlive() === true;
+  }
+
   isBusy(key: string): boolean {
     const live = this.liveSessions.get(key);
     return !!live?.isAlive() && live.isBusy();

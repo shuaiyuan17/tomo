@@ -9,6 +9,7 @@ export const subsessions = {
   selfRestart: "[{{id}} · {{title}}] Tomo 按这个任务自己的要求重启了，所以先暂停。准备好了说一声继续。",
   failedInterrupted: "[{{id}} · {{title}}] 放弃了：连续 {{restarts}} 次被重启打断。还需要的话再说一次。",
   failedNoSession: "[{{id}} · {{title}}] 放弃了：重启后找不到它的 session，重新开始可能会重复已经做过的事。还需要的话再说一次。",
+  registryHold: "⚠️ 读不了 session 列表（~/.tomo/data/sessions/_sessions.json），子会话先暂停：现在跑会丢掉它们之前的上下文。能读了就自动继续，什么都没取消。",
   inputFull: "[{{id}} · {{title}}] 丢掉了一次定时检查：已经有 {{max}} 条消息在等它处理，先处理完这些。",
   recoveryFailed: "⚠️ 重启后子会话没能恢复完（列表存不进去），先关掉，下次启动再试。没有取消或删除任何东西。",
   tableUnreadable: "⚠️ 读不了子会话列表（~/.tomo/data/subsessions.json），子会话先关掉，修好再开。没有取消或删除任何东西。",

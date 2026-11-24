@@ -9,6 +9,7 @@ import type { SubsessionEvent } from "./state-machine.js";
 import {
   compactInstructions,
   formatContinueEvent,
+  formatLostAnswerNote,
   formatPostCompactReminder,
   formatNewInputNote,
   formatRedeliveryNote,
@@ -71,6 +72,8 @@ export interface SubsessionServiceDeps {
   registryReadable(): boolean;
   /** Registry: does the key have an SDK session to resume? */
   hasSdkSession(key: string): boolean;
+  /** The key's conversation is live in memory (a turn there needs no resume). */
+  hasLiveSession?(key: string): boolean;
   ensureRegistryEntry(key: string): void;
   /** Unlink the key's registry entry (it then expires with the usual 30-day TTL). */
   unlinkRegistryEntry(key: string): void;
@@ -95,6 +98,10 @@ export const REPORT_RETRY_MS = 60_000;
 export const REPORT_RETRY_MAX = 5;
 /** A turn whose result could not be written: how soon the task gets its next turn. */
 export const SETTLE_RETRY_MS = 60_000;
+/** Turns held while the session registry cannot be read: how soon it is looked at again. */
+export const REGISTRY_RECHECK_MS = 60_000;
+/** How much of an undelivered message the next turn is shown. */
+const LOST_ANSWER_EXCERPT = 1500;
 const ACTIVITY_NOTE_EXCERPT = 1500;
 
 /** Models a task may use: aliases opus / sonnet / fable, or any full id that is not a Haiku model. */
@@ -154,13 +161,18 @@ export class SubsessionService {
   /** Tasks whose last result could not be written: no turn until the retry timer. */
   private readonly settleTimers = new Map<string, NodeJS.Timeout>();
   /**
-   * Messages the task sent in the turn in flight that could not be delivered:
-   * the turn's result keeps the inputs it carried (a completed turn whose
-   * answer was lost is not an answered turn).
+   * Messages the task sent in the turn in flight that could not be delivered,
+   * by their text: the turn's result keeps the inputs it carried (a
+   * completed turn whose answer was lost is not an answered turn). Only a
+   * later send of the SAME text clears one: a send of anything else answers
+   * something else, and leaves the lost one lost.
    */
-  private readonly undelivered = new Set<string>();
-  /** The last turn's answer could not be delivered: the next turn says so. */
-  private readonly answerLost = new Set<string>();
+  private readonly undelivered = new Map<string, Set<string>>();
+  /** The last turn's messages that could not be delivered: the next turn is shown them. */
+  private readonly answerLost = new Map<string, string[]>();
+  /** Turns held because the session registry could not be read (see resumeCheck). */
+  private registryRecheckTimer?: NodeJS.Timeout;
+  private registryHoldTold = false;
   /**
    * Startup is two steps. `recoverAtStartup()` (before any channel ingests)
    * reads the table and runs recovery, reconcile and the sweep: from then on
@@ -305,9 +317,10 @@ export class SubsessionService {
   /**
    * EVERY send of a task's words to its owning scope goes through here. A
    * send that fails, by its result or by throwing, marks the turn's answer
-   * as undelivered (part of the turn's result: the inputs it answers stay
-   * owed); a later send in the same turn that goes out clears the mark (the
-   * model was told the first one failed, and spoke again).
+   * as undelivered (part of the turn's result: the inputs it carried stay
+   * owed). Only a later send of the same text that goes out clears that
+   * mark (the model was told the send failed, and sent it again); a send of
+   * other words, which answers something else, does not.
    */
   private async sendOut(record: SubsessionRecord, text: string): Promise<{ ok: boolean; error?: string }> {
     let result: { ok: boolean; error?: string };
@@ -317,8 +330,15 @@ export class SubsessionService {
     } catch (err) {
       result = { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
-    if (result.ok) this.undelivered.delete(record.id);
-    else this.undelivered.add(record.id);
+    const failed = this.undelivered.get(record.id);
+    if (result.ok) {
+      failed?.delete(text);
+      if (failed?.size === 0) this.undelivered.delete(record.id);
+    } else if (failed) {
+      failed.add(text);
+    } else {
+      this.undelivered.set(record.id, new Set([text]));
+    }
     return result;
   }
 
@@ -578,6 +598,8 @@ export class SubsessionService {
     this.settleTimers.clear();
     if (this.cronRecheckTimer) clearTimeout(this.cronRecheckTimer);
     this.cronRecheckTimer = undefined;
+    if (this.registryRecheckTimer) clearTimeout(this.registryRecheckTimer);
+    this.registryRecheckTimer = undefined;
   }
 
   /**
@@ -756,7 +778,11 @@ export class SubsessionService {
     const forget: string[] = [];
     for (const task of this.store.list()) {
       if (!this.mayCleanUp(task)) continue;
-      if (task.status === "finished" && task.reportDelivered && now - (task.endedAt ?? task.lastActivityAt) > FINISHED_KEEP_MS) {
+      // A finished task still owing an answer (pending, or held for the
+      // owner's next message) stays finished: archived, it could never be
+      // woken to give it, and its input would go with the record.
+      if (task.status === "finished" && task.reportDelivered && task.pendingInput.length === 0
+        && now - (task.endedAt ?? task.lastActivityAt) > FINISHED_KEEP_MS) {
         const outcome = this.store.transition(task.id, "archive", { reason: "finished more than 7 days ago" });
         if (outcome.ok) this.safely(() => this.deps.unlinkRegistryEntry(task.sessionKey), "unlink archived");
       } else if (TERMINAL_STATUSES.has(task.status) && now - (task.endedAt ?? task.lastActivityAt) > ENDED_KEEP_MS) {
@@ -807,10 +833,57 @@ export class SubsessionService {
       this.startsOwed.set(id, reason);
       return true;
     }
+    const record = this.safeGet(id);
+    if (!record || record.status !== "queued" || !this.mayRun(record)) return false;
     const outcome = this.store.transition(id, "start", { reason, expectFrom: ["queued"] });
     if (!outcome.ok) return false;
     this.kick(id);
     return true;
+  }
+
+  /**
+   * May the task run a turn now, on its own history? A turn on a key with no
+   * live session resumes the SDK session the registry links. While the
+   * registry cannot be read, that link is unknown (a fresh process holds an
+   * empty last-good state), and a turn would start a NEW conversation: the
+   * task is held, and looked at again shortly. Readable, with no link, for a
+   * task that completed a turn: its history is gone, and starting over could
+   * repeat what it did, so it fails, said plainly. Every dispatch (a start,
+   * every driver turn) asks here first.
+   */
+  private mayRun(record: SubsessionRecord): boolean {
+    if (this.deps.hasLiveSession?.(record.sessionKey)) return true;
+    if (!this.deps.registryReadable()) {
+      log.error({ id: record.id }, "Session registry unreadable; holding a sub-session turn rather than start it without its history");
+      if (!this.registryHoldTold) {
+        this.registryHoldTold = true;
+        this.noticeOwner(ownerT("subsessions")("registryHold"));
+      }
+      this.armRegistryRecheck();
+      return false;
+    }
+    if (record.startDelivered && !this.deps.hasSdkSession(record.sessionKey)) {
+      const failed = this.store.transition(record.id, "fail", { reason: "its conversation could not be found" });
+      if (failed.ok) this.reportFailure(failed.record, ownerT("subsessions")("failedNoSession", { id: record.id, title: record.title }));
+      return false;
+    }
+    return true;
+  }
+
+  private armRegistryRecheck(): void {
+    if (this.registryRecheckTimer || this.deps.isStopping()) return;
+    this.registryRecheckTimer = setTimeout(() => {
+      this.registryRecheckTimer = undefined;
+      if (this.deps.isStopping()) return;
+      if (this.deps.registryReadable()) this.registryHoldTold = false;
+      this.schedule();
+      this.safely(() => {
+        for (const task of this.store.list()) {
+          if (task.status !== "queued" && !TERMINAL_STATUSES.has(task.status) && this.plan(task)) this.kick(task.id);
+        }
+      }, "resume held turns");
+    }, REGISTRY_RECHECK_MS);
+    this.registryRecheckTimer.unref?.();
   }
 
   private deliverInput(id: string, event: Extract<SubsessionEvent, "relay" | "owner_message">, prompt: string): TransitionOutcome {
@@ -848,6 +921,7 @@ export class SubsessionService {
       if (!record || record.status === "queued" || TERMINAL_STATUSES.has(record.status)) return;
       const turn = this.plan(record);
       if (!turn) return;
+      if (!this.mayRun(record)) return;
       // Nothing is written before the turn, and nothing it owes is forgotten
       // before it: its inputs, and a "continue" owed, leave with the write
       // that records its result (a retry after a failed write finds them).
@@ -896,9 +970,8 @@ export class SubsessionService {
     } else {
       parts.push(...inputs.map((i) => i.text));
     }
-    if (this.answerLost.has(record.id) && seen > 0) {
-      parts.push(formatTomoEvent("subsession-redelivery", "Your last message to the owner could not be sent: they have not seen it. Send it again, with task_notify.", { name: "answer" }));
-    }
+    const lostAnswer = this.answerLost.get(record.id);
+    if (lostAnswer && seen > 0) parts.push(formatLostAnswerNote(lostAnswer, LOST_ANSWER_EXCERPT));
     const kind = start || resume || inputs.length > 0 ? "wake" : "continue";
     if (kind === "continue") parts.push(formatContinueEvent());
     return { kind, prompt: parts.join("\n\n"), throughSeq, afterCompact, resume, start };
@@ -938,7 +1011,8 @@ export class SubsessionService {
     // A completed turn whose message could not be delivered did not answer
     // what it carried: like a failed turn, it keeps its inputs. A turn that
     // carried none has nothing to keep.
-    const lost = this.undelivered.has(id) && turn.throughSeq > 0;
+    const failedTexts = [...(this.undelivered.get(id) ?? [])];
+    const lost = failedTexts.length > 0 && turn.throughSeq > 0;
     this.undelivered.delete(id);
     const keep = !outcome.ok || lost;
     // A finished task's answer that keeps failing (or that the owner
@@ -982,12 +1056,12 @@ export class SubsessionService {
       // keeps failing does not spin the task. A "continue" owed is still owed.
       log.error({ err, id }, "Could not record a sub-session turn's result; its inputs stay and go out again");
       if (turn.throughSeq > 0) this.unsavedSeen.set(id, Math.max(this.unsavedSeen.get(id) ?? 0, turn.throughSeq));
-      if (lost) this.answerLost.add(id);
+      if (lost) this.answerLost.set(id, failedTexts);
       this.retryAfterSettleFailure(id);
       return false;
     }
     this.unsavedSeen.delete(id);
-    if (lost && !held) this.answerLost.add(id);
+    if (lost && !held) this.answerLost.set(id, failedTexts);
     else if (!keep || held) this.answerLost.delete(id);
     if (!record || record.status !== "active") {
       this.continueOwed.delete(id);

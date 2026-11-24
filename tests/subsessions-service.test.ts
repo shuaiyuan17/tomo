@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
-import { CRON_RECHECK_MS, FINISHED_KEEP_MS, MAX_INTERRUPT_STREAK, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
+import { CRON_RECHECK_MS, FINISHED_KEEP_MS, MAX_INTERRUPT_STREAK, REGISTRY_RECHECK_MS, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { PENDING_INPUT_MAX, appendInput } from "../src/agent/subsessions/types.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 
@@ -1075,6 +1075,8 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     const t = h.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
     h.store.transition(t.id, "start");
     h.store.update(t.id, (r) => { r.startDelivered = true; });
+    // A completed turn: its conversation is linked in the registry.
+    h.sdk.add(t.sessionKey);
     if (state === "finished") h.store.transition(t.id, "finish", { patch: (r) => { r.report = "R"; } });
     patch?.(h.store, t.id);
     return t.id;
@@ -1215,7 +1217,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     expect(h.sent.map((m) => m.text).join()).toContain("answer 3");
   });
 
-  it("counts an answer as delivered when a later send in the same turn went out, and a turn with no input never keeps anything", async () => {
+  it("counts an answer as delivered when the same message is sent again and goes out, and a turn with no input never keeps anything", async () => {
     let n = 0;
     const h = harness({}, async (turn, hh) => {
       n += 1;
@@ -1228,8 +1230,8 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
         return { ok: true };
       }
       hh.sendFails = 1;
-      await hh.service.notify(turn.key, "first try");
-      await hh.service.notify(turn.key, "second try");
+      await hh.service.notify(turn.key, "status: halfway");
+      await hh.service.notify(turn.key, "status: halfway");
       hh.service.finish(turn.key, "done");
       return { ok: true };
     });
@@ -1240,6 +1242,38 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     h.service.relay(t.id, "status?");
     await flush();
     expect(h.turns).toHaveLength(2);
+    expect(h.store.get(t.id)).toMatchObject({ status: "finished", pendingInput: [] });
+  });
+
+  it("keeps the input when a send failed and a later send of OTHER words went out: that one answered something else", async () => {
+    let n = 0;
+    const h = harness({}, async (turn, hh) => {
+      n += 1;
+      if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
+      if (n === 2) {
+        hh.sendFails = 1;
+        expect((await hh.service.notify(turn.key, "the answer to your question")).ok).toBe(false);
+        expect((await hh.service.notify(turn.key, "unrelated: tests are running")).ok).toBe(true);
+        hh.service.noteToolUse(turn.key);
+        return { ok: true };
+      }
+      await hh.service.notify(turn.key, "the answer to your question");
+      hh.service.finish(turn.key, "done");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.service.relay(t.id, "what is the answer?");
+    await flush();
+    // The turn that lost its answer kept the input; the next one got it
+    // again, shown the message that never went out.
+    expect(h.turns).toHaveLength(3);
+    expect(h.turns[2].prompt).toContain("what is the answer?");
+    expect(h.turns[2].prompt).toContain('name="answer"');
+    expect(h.turns[2].prompt).toContain("the answer to your question");
+    expect(h.turns[2].prompt).not.toContain("unrelated: tests are running");
+    expect(h.sent.map((m) => m.text).filter((x) => x.includes("the answer to your question"))).toHaveLength(1);
     expect(h.store.get(t.id)).toMatchObject({ status: "finished", pendingInput: [] });
   });
 
@@ -1284,16 +1318,74 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     expect(h.store.get(t.id)?.status).toBe("finished");
   });
 
-  it("does not take an unreadable registry for an empty one at start: nothing is failed, unlinked or trusted again", () => {
+  it("does not take an unreadable registry for an empty one at start: nothing is failed, unlinked, trusted again, or run without its history", async () => {
     const h0 = harness();
     const id = seed(h0, "active");
     h0.store.markUntrusted("lost");
-    const h = harness();
-    h.registryReadable = false; // and so it answers: no task sessions at all
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, "ok")));
+      h.sdk.delete("task:s1"); // a fresh process: the unreadable registry's last-good state is empty
+      h.registryReadable = false; // and so it answers: no task sessions at all
+      h.service.start();
+      await flush();
+      expect(h.store.get(id)?.status).not.toBe("failed");
+      expect(h.unlinked).toEqual([]);
+      expect(h.store.read().untrusted).toBeDefined();
+      // Not dispatched: a turn now would start a new conversation without its history.
+      expect(h.turns).toHaveLength(0);
+      expect(h.store.get(id)?.status).toBe("queued");
+      expect(h.notices.filter((n) => n.to === "owner" && n.text.includes("on hold"))).toHaveLength(1);
+      // An owner start is held the same way.
+      expect(h.service.startTask(id, "the owner started it")).toBe(false);
+      vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
+      await flush();
+      expect(h.turns).toHaveLength(0);
+      // Readable again, with its conversation: it resumes.
+      h.registryReadable = true;
+      h.sdk.add("task:s1");
+      vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
+      await flush();
+      expect(h.turns).toHaveLength(1);
+      expect(h.turns[0].prompt).toContain('type="subsession-resume"');
+      expect(h.store.get(id)?.status).toBe("finished");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("fails a task with history whose conversation the readable registry no longer has, rather than start it over", async () => {
+    const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, "ok")));
+    const id = seed(h, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
     h.service.start();
-    expect(h.store.get(id)?.status).not.toBe("failed");
-    expect(h.unlinked).toEqual([]);
-    expect(h.store.read().untrusted).toBeDefined();
+    h.sdk.delete("task:s1"); // lost after start (another process cleared it)
+    h.service.relay(id, "one more thing");
+    await flush();
+    expect(h.turns).toHaveLength(0);
+    expect(h.store.get(id)?.status).toBe("failed");
+    expect(h.notices.some((n) => n.text.includes("could not be found"))).toBe(true);
+  });
+
+  it("never archives a finished task that still owes an answer, pending or held, however old", () => {
+    const old = Date.now() - FINISHED_KEEP_MS - 24 * 60 * 60 * 1000;
+    const h = harness();
+    const held = seed(h, "finished", (s, i) => s.update(i, (r) => {
+      r.reportDelivered = true;
+      r.endedAt = old;
+      appendInput(r, "unanswered question");
+      r.heldThrough = 1;
+    }));
+    const pending = seed(h, "finished", (s, i) => s.update(i, (r) => {
+      r.reportDelivered = true;
+      r.endedAt = old;
+      appendInput(r, "still owed");
+    }));
+    const idle = seed(h, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; r.endedAt = old; }));
+    h.service.recoverAtStartup(); // the sweep runs here
+    expect(h.store.get(held)).toMatchObject({ status: "finished", pendingInput: [{ seq: 1, text: "unanswered question" }] });
+    expect(h.store.get(pending)).toMatchObject({ status: "finished", pendingInput: [{ seq: 1, text: "still owed" }] });
+    expect(h.store.get(idle)?.status).toBe("archived");
+    expect(h.unlinked).toEqual(["task:s3"]);
   });
 
   it("makes a start asked for before dispatch opened as soon as start() opens it, past the slot cap", async () => {

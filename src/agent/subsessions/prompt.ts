@@ -88,6 +88,17 @@ export function formatRedeliveryNote(count: number): string {
     : `The next ${count} messages were already sent to you once, in a turn that did not complete (cut short by a restart, failed, or its result could not be saved). You may have acted on them: check before doing anything twice.`);
 }
 
+/**
+ * The last turn's messages to the owner that could not be sent (each cut to
+ * `excerpt` characters): they have not seen them.
+ */
+export function formatLostAnswerNote(texts: string[], excerpt = 1500): string {
+  const quoted = texts.map((t) => (t.length > excerpt ? `${t.slice(0, excerpt)}…` : t)).join("\n\n");
+  return formatTomoEvent("subsession-redelivery", texts.length === 1
+    ? `Your last turn's message to the owner could not be sent: they have not seen it. Send it again, with task_notify. It was:\n\n${quoted}`
+    : `Your last turn's ${texts.length} messages to the owner could not be sent: they have not seen them. Send them again, with task_notify. They were:\n\n${quoted}`, { name: "answer" });
+}
+
 /** Separates redelivered inputs from the ones that are new. */
 export function formatNewInputNote(): string {
   return formatTomoEvent("subsession-redelivery", "Messages after this point are new.", { name: "new" });

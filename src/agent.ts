@@ -521,6 +521,7 @@ export class Agent {
       stopSession: (key, timeoutMs) => this.stopTaskSession(key, timeoutMs),
       registryReadable: () => this.sessions.registryReadable(),
       hasSdkSession: (key) => this.sessions.getSdkSessionId(key) !== undefined,
+      hasLiveSession: (key) => this.liveSessionManager.hasLiveSession(key),
       ensureRegistryEntry: (key) => this.sessions.ensureEntry(key),
       unlinkRegistryEntry: (key) => this.sessions.clearSdkSessionId(key),
       registryTaskKeys: () => this.sessions.listActiveEntries().map((e) => e.channelKey).filter(isTaskSessionKey),

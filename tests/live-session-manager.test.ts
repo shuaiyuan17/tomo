@@ -1343,6 +1343,22 @@ describe("LiveSessionManager memory change notes", () => {
     expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
   });
 
+  it("gives a summoned group's turn on the dm: session no note, and keeps the change for the owner's next turn", async () => {
+    let own = true;
+    let files = mem("- a");
+    mockState.buildContext = () => files;
+    const manager = new LiveSessionManager(makeDeps({
+      isOwnAudienceTurn: () => own,
+      promptContextSnapshot: () => files,
+    }));
+    await manager.getOrCreateLiveSession("dm:owner");
+    files = mem("- a", "- [Secret](private/secret.md)");
+    own = false;
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+    own = true;
+    expect(manager.takePromptContextNote("dm:owner")?.prefix).toContain("+ - [Secret](private/secret.md)");
+  });
+
   it("notes up to the line limit", async () => {
     const { manager, set } = setup(mem("- a"));
     const first = await manager.getOrCreateLiveSession("dm:owner");

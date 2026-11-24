@@ -784,7 +784,8 @@ export class LiveSessionManager {
    *   persistently unreadable record does not retire it on every turn.
    *
    * Undefined too when no live session will take the turn (the next one is
-   * built from the current files anyway), or it is already being retired.
+   * built from the current files anyway), when it is already being retired,
+   * and when the turn is not the session's own audience (below).
    *
    * ONE NOTE IN FLIGHT PER SESSION. Turns for one key overlap (a steer joins
    * the turn running), and two notes in flight could not be rolled back
@@ -793,6 +794,11 @@ export class LiveSessionManager {
    * changed meanwhile is handled by the first turn after it ends.
    */
   takePromptContextNote(key: string): PromptContextTicket | undefined {
+    // Only a turn of the session's own audience: a summoned group's turn (or
+    // a mixed batch) on a dm: session must not be handed private index lines
+    // or private people. Nothing is read and the snapshot stays, so the
+    // change waits for the owner's next turn.
+    if (!this.deps.isOwnAudienceTurn(key)) return undefined;
     const session = this.liveSessions.get(key);
     if (!session?.isAlive() || this.promptStale.has(session)) return undefined;
     if (this.promptContextUntold.has(session)) return undefined;

@@ -523,9 +523,13 @@ export class TurnRunner {
           else if (spec.completed && !spec.shutdownInterrupted) this.deps.settlePendingNotes?.(spec.key, notes);
           else this.deps.restoreInterruptedPendingNotes?.(spec.key, notes);
         }
+        // Unlike the notes above, a STOPPED turn does not count as told: Stop
+        // says this turn needs no further answer, not that the model took in
+        // the memory change it carried. Rolled back, it is told again.
         if (contextNote) {
           this.deps.settlePromptContextNote?.(contextNote,
-            spec.promptTaken === true && spec.completed === true && !spec.shutdownInterrupted);
+            spec.promptTaken === true && spec.completed === true && !spec.shutdownInterrupted
+              && !spec.replyContext?.stopped);
         }
         this.deps.recordTurnOutcome?.(spec.key, ok);
         watchBus.publish({

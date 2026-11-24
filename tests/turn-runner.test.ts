@@ -729,6 +729,19 @@ describe("TurnRunner: the memory change note", () => {
     expect(settled).toEqual([true]);
   });
 
+  it("is rolled back when the owner stopped the turn, though its pending notes settle", async () => {
+    const { h, settled } = contextHarness(async (req) => {
+      req.onPromptHandedOff?.();
+      req.replyContext!.stopped = true;
+      return "NO_REPLY";
+    });
+    const notesSettled: string[] = [];
+    (h.runner as unknown as { deps: TurnRunnerDeps }).deps.settlePendingNotes = (_k, d) => { notesSettled.push(d); };
+    await h.runner.runTurn(replySpec(h));
+    expect(notesSettled).toEqual(["[note]\n\n"]);
+    expect(settled).toEqual([false]);
+  });
+
   it("is rolled back when the turn failed, never reached the model, or was declined", async () => {
     const failed = contextHarness(async (req) => { req.onPromptHandedOff?.(); throw new Error("boom"); });
     await failed.h.runner.runTurn(replySpec(failed.h));

@@ -16,8 +16,23 @@ function truncateForPendingError(text: string, maxChars: number): string {
   return text.length <= maxChars ? text : `${text.slice(0, Math.max(0, maxChars - 15))}...[truncated]`;
 }
 
-function pendingErrorChars(notes: string[]): number {
-  return notes.reduce((sum, note) => sum + note.length, 0);
+/** An error note, with the order it was queued in (a put-back can come out of order). */
+interface ErrorNote {
+  seq: number;
+  text: string;
+}
+
+function pendingErrorChars(notes: ErrorNote[]): number {
+  return notes.reduce((sum, note) => sum + note.text.length, 0);
+}
+
+/** Keep the newest error notes (by queue order) within the count and character caps. */
+function capErrorNotes(notes: ErrorNote[]): ErrorNote[] {
+  const capped = [...notes].sort((a, b) => a.seq - b.seq).slice(-MAX_PENDING_ERROR_NOTES);
+  while (capped.length > 1 && pendingErrorChars(capped) > MAX_PENDING_ERROR_CHARS) {
+    capped.shift();
+  }
+  return capped;
 }
 
 /**
@@ -27,7 +42,7 @@ function pendingErrorChars(notes: string[]): number {
  * `interrupted-agents` note: its ledger entry is already gone.
  */
 function isPinnedNote(note: string): boolean {
-  // `includes`, not `startsWith`: a restored prefix bundles several notes.
+  // `includes`, not `startsWith`: an interrupted note carries the marker first.
   return note.includes('<tomo-event type="inbox"') || note.includes('<tomo-event type="interrupted-agents"');
 }
 
@@ -55,7 +70,10 @@ function markInterrupted(note: string): string {
 
 interface InFlightBatch {
   prefix: string;
+  /** Durable notes in this prefix, in order. Persisted while in flight. */
   notes: string[];
+  /** Error notes rendered into this prefix. Memory-only, like the queue they came from. */
+  errors: ErrorNote[];
 }
 
 /**
@@ -75,7 +93,8 @@ export class PendingNotesQueue {
   /** Queued, not yet drained. Absent: not loaded from the store this process. */
   private notes = new Map<string, string[]>();
   private inflight = new Map<string, InFlightBatch[]>();
-  private errorNotes = new Map<string, string[]>();
+  private errorNotes = new Map<string, ErrorNote[]>();
+  private errorSeq = 0;
 
   constructor(private store: DurablePendingNotesStore) {}
 
@@ -121,12 +140,7 @@ export class PendingNotesQueue {
   queueError(sessionKey: string, visibleError: string): void {
     const normalized = visibleError.replace(/\s+/g, " ").trim();
     const clipped = truncateForPendingError(normalized, MAX_SINGLE_PENDING_ERROR_CHARS);
-    const notes = [...(this.errorNotes.get(sessionKey) ?? []), clipped].slice(-MAX_PENDING_ERROR_NOTES);
-
-    while (notes.length > 1 && pendingErrorChars(notes) > MAX_PENDING_ERROR_CHARS) {
-      notes.shift();
-    }
-    this.errorNotes.set(sessionKey, notes);
+    this.errorNotes.set(sessionKey, capErrorNotes([...(this.errorNotes.get(sessionKey) ?? []), { seq: this.errorSeq++, text: clipped }]));
   }
 
   /**
@@ -139,26 +153,27 @@ export class PendingNotesQueue {
     const drained = [...notes];
     this.notes.set(sessionKey, []);
 
-    const errorNotes = this.errorNotes.get(sessionKey);
+    const errorNotes = this.errorNotes.get(sessionKey) ?? [];
     const parts = [...drained];
-    if (errorNotes && errorNotes.length > 0) {
+    if (errorNotes.length > 0) {
       this.errorNotes.delete(sessionKey);
       parts.push(formatTomoEvent("errors", [
         "Recent Tomo errors before this turn (newest last, capped):",
-        ...errorNotes.map((note) => `- ${note}`),
+        ...errorNotes.map((note) => `- ${note.text}`),
         "Use this as operational context; do not repeat the raw error unless it helps the user.",
       ].join("\n")));
     }
 
     const prefix = parts.map((n) => `${n}\n\n`).join("");
-    // Error notes are memory-only to begin with; only durable notes ride in flight.
-    if (drained.length > 0) {
-      const batches = this.inflight.get(sessionKey) ?? [];
-      batches.push({ prefix, notes: drained });
-      this.inflight.set(sessionKey, batches);
-      // On disk they now read as interrupted: true from here unless settle runs.
-      this.persist(sessionKey);
-    }
+    if (!prefix) return prefix;
+    // Every non-empty prefix is tracked, so a put-back can split it into its
+    // parts again. Only the durable notes reach the store (error notes are
+    // memory-only to begin with).
+    const batches = this.inflight.get(sessionKey) ?? [];
+    batches.push({ prefix, notes: drained, errors: errorNotes });
+    this.inflight.set(sessionKey, batches);
+    // On disk they now read as interrupted: true from here unless settle runs.
+    if (drained.length > 0) this.persist(sessionKey);
     return prefix;
   }
 
@@ -178,14 +193,16 @@ export class PendingNotesQueue {
    * this runs they are still in the durable store, so a crash re-delivers them.
    */
   settle(sessionKey: string, prefix: string): void {
-    if (!prefix || !this.takeInFlight(sessionKey, prefix)) return;
-    this.persist(sessionKey);
+    if (!prefix) return;
+    const batch = this.takeInFlight(sessionKey, prefix);
+    if (batch && batch.notes.length > 0) this.persist(sessionKey);
   }
 
   /**
-   * Put a drained prefix back at the FRONT of the queue: the turn it was
-   * drained for never reached the model (a declined steer). Kept as one note,
-   * so its notes stay together and ahead of anything queued since.
+   * Put a drained prefix back: the turn it was drained for never reached the
+   * model (a declined steer). Its durable notes go back at the FRONT of the
+   * queue, in order, ahead of anything queued since; its error notes go back
+   * to the error queue.
    */
   restore(sessionKey: string, drainedPrefix: string): void {
     this.putBack(sessionKey, drainedPrefix, false);
@@ -200,13 +217,34 @@ export class PendingNotesQueue {
     this.putBack(sessionKey, drainedPrefix, true);
   }
 
+  /**
+   * Split the batch drained as `drainedPrefix` back into its parts: durable
+   * notes one by one at the front of the queue, error notes back under the
+   * error caps. Never the rendered prefix as one note — that would turn the
+   * memory-only error block into a durable, uncapped note that grows with
+   * every failed turn (and that the pin rule could keep forever).
+   */
   private putBack(sessionKey: string, drainedPrefix: string, interrupted: boolean): void {
-    this.takeInFlight(sessionKey, drainedPrefix);
-    const trimmed = drainedPrefix.trim();
-    const note = trimmed && interrupted ? markInterrupted(trimmed) : trimmed;
-    if (!note) return;
+    if (!drainedPrefix) return;
+    const batch = this.takeInFlight(sessionKey, drainedPrefix);
+    if (!batch) {
+      // Already settled or put back (or never drained here): nothing to return.
+      log.debug({ sessionKey }, "Put-back of a pending-notes prefix that is not in flight; ignored");
+      return;
+    }
+
+    if (batch.errors.length > 0) {
+      // Merged by queue order, not prepended: another batch drained later may
+      // already be back, and the caps must still drop the oldest errors.
+      this.errorNotes.set(sessionKey, capErrorNotes([...batch.errors, ...(this.errorNotes.get(sessionKey) ?? [])]));
+    }
+
+    if (batch.notes.length === 0) return;
     const arr = this.queued(sessionKey);
-    arr.unshift(note);
+    arr.unshift(...(interrupted ? batch.notes.map(markInterrupted) : batch.notes));
+    // No cap here: these notes were already admitted, and the store kept them
+    // while in flight. Capping now would drop exactly them (they are the
+    // oldest) in favour of notes queued during the turn.
     if (!this.persist(sessionKey)) log.warn({ sessionKey }, "Could not persist restored pending notes");
   }
 

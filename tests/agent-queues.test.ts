@@ -154,4 +154,118 @@ describe("PendingNotesQueue", () => {
     expect(drained).not.toContain("err-0");
     expect(drained).toContain("err-9");
   });
+  it("puts error notes back under their caps when a failing turn is restored, instead of a durable blob", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", "n1");
+
+    // Ten turns in a row fail: each drains, queues a new error, then is put back.
+    for (let i = 0; i < 10; i++) {
+      const drained = queue.drain("k");
+      queue.queueError("k", `[error] err-${i} ${"x".repeat(300)}`);
+      queue.restoreInterrupted("k", drained);
+    }
+
+    // The durable store only ever holds the one real note, marked once.
+    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nn1`]);
+
+    const next = queue.drain("k");
+    expect(next.match(/<tomo-event type="errors"/g)).toHaveLength(1);
+    expect(next.match(/\n- \[error\]/g)?.length ?? 0).toBeLessThanOrEqual(3);
+    expect(next.length).toBeLessThan(2000);
+    expect(next).toContain("err-9");
+    expect(next).not.toContain("err-0");
+    expect(next.split(INTERRUPTED_NOTE_MARKER)).toHaveLength(2);
+  });
+
+  it("restores an error-only prefix to the error queue, never to the durable store", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueError("k", "[error] boom");
+    const drained = queue.drain("k");
+    expect(drained).toContain("boom");
+
+    queue.restoreInterrupted("k", drained);
+    expect(store.getPendingNotes("k")).toEqual([]);
+    expect(queue.peekNotes("k")).toEqual([]);
+    expect(queue.drain("k")).toContain("boom");
+  });
+
+  it("does not let a pinned inbox note carry a restored error block with it", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    const inbox = '<tomo-event type="inbox" name="interrupted" ts="x">\nthe message\n</tomo-event>';
+    queue.queueNote("k", inbox);
+    queue.queueError("k", "[error] boom");
+    const drained = queue.drain("k");
+    queue.restoreInterrupted("k", drained);
+    const stored = store.getPendingNotes("k");
+    expect(stored).toHaveLength(1);
+    expect(stored[0]).toContain("the message");
+    expect(stored[0]).not.toContain('type="errors"');
+  });
+
+  it("restores a multi-note batch as separate notes, in order, ahead of newer ones", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", "a");
+    queue.queueNote("k", "b");
+    const drained = queue.drain("k");
+    queue.queueNote("k", "c");
+    queue.restore("k", drained);
+    expect(store.getPendingNotes("k")).toEqual(["a", "b", "c"]);
+    // A second put-back of the same prefix is a no-op, not a duplicate.
+    queue.restore("k", drained);
+    expect(store.getPendingNotes("k")).toEqual(["a", "b", "c"]);
+  });
+  it("keeps every restored note when the queue filled up while the batch was in flight", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    for (let i = 0; i < 15; i++) queue.queueNote("k", `old-${i}`);
+    const drained = queue.drain("k");
+    for (let i = 0; i < 15; i++) queue.queueNote("k", `new-${i}`);
+    queue.restore("k", drained);
+    const stored = store.getPendingNotes("k");
+    for (let i = 0; i < 15; i++) expect(stored).toContain(`old-${i}`);
+    expect(stored[0]).toBe("old-0");
+    expect(stored.at(-1)).toBe("new-14");
+  });
+
+  it("keeps the newest errors when overlapping batches are restored in drain order", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    for (let i = 0; i < 3; i++) queue.queueError("k", `[error] older-${i}`);
+    const first = queue.drain("k");
+    for (let i = 0; i < 3; i++) queue.queueError("k", `[error] newer-${i}`);
+    const second = queue.drain("k");
+    queue.restore("k", first);
+    queue.restore("k", second);
+    const next = queue.drain("k");
+    for (let i = 0; i < 3; i++) expect(next).toContain(`newer-${i}`);
+    expect(next).not.toContain("older-");
+    expect(next.indexOf("newer-0")).toBeLessThan(next.indexOf("newer-2"));
+  });
+  it("an errors block an older version stored inside a note no longer grows, and goes on the next settle", () => {
+    const store = new MemoryPendingNotesStore();
+    const errors = '<tomo-event type="errors" ts="x">\nRecent Tomo errors before this turn (newest last, capped):\n- [error] old-boom\n</tomo-event>';
+    const inbox = '<tomo-event type="inbox" name="interrupted" ts="x">\nthe message\n</tomo-event>';
+    const legacy = `${INTERRUPTED_NOTE_MARKER}\n${inbox}\n\n${errors}`;
+    store.setPendingNotes("k", [legacy]);
+    const queue = new PendingNotesQueue(store);
+
+    // Turns keep failing: the stored note comes back unchanged every time.
+    for (let i = 0; i < 10; i++) {
+      const drained = queue.drain("k");
+      queue.queueError("k", `[error] new-${i}`);
+      queue.restoreInterrupted("k", drained);
+      expect(store.getPendingNotes("k")).toEqual([legacy]);
+    }
+
+    // A turn that ends normally consumes it, errors block and all.
+    const drained = queue.drain("k");
+    expect(drained.match(/<tomo-event type="errors"/g)).toHaveLength(2);
+    queue.settle("k", drained);
+    expect(store.getPendingNotes("k")).toEqual([]);
+    expect(queue.drain("k")).toBe("");
+  });
 });

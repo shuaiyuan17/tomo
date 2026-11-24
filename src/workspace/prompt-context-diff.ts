@@ -57,9 +57,18 @@ function renderSection(title: string, diff: LineDiff, whereToLook: string): stri
  * The note body for a session built with `before`, or undefined when nothing
  * it can see has changed.
  */
-export function describePromptContextChange(before: PromptContextLines, after: PromptContextLines): string | undefined {
+export function describePromptContextChange(
+  before: PromptContextLines,
+  after: PromptContextLines,
+  opts: { isGroup?: boolean } = {},
+): string | undefined {
+  // A group's prompt filters private lines out of the index; the raw file does
+  // not, and nothing filters a direct read of it. Never send a group there.
+  const memoryWhere = opts.isGroup
+    ? "The full current index is not shown in this conversation; treat the index in your system prompt as out of date."
+    : "Read memory/MEMORY.md for the current index.";
   const sections = [
-    renderSection("MEMORY.md", diffLines(before.memory, after.memory), "Read memory/MEMORY.md for the current index."),
+    renderSection("MEMORY.md", diffLines(before.memory, after.memory), memoryWhere),
     renderSection("People registry", diffLines(before.people, after.people), "Use list_people for the current records."),
   ].filter((s): s is string => s !== undefined);
   if (sections.length === 0) return undefined;

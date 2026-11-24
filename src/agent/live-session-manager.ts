@@ -18,6 +18,7 @@ import { getCompactTriggerPath } from "../lcm/compact.js";
 import { existsSync } from "node:fs";
 import { CompactReservations, type BackgroundState, type ReserveResult } from "./compact-reservations.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
+import { isGroupSessionKey } from "../sessions/keys.js";
 import { repairSdkSessionForResume } from "../sessions/repair.js";
 import type { SessionMessage, UsageBaseline } from "../sessions/types.js";
 import type { UsageLedgerRow } from "../usage/ledger.js";
@@ -785,7 +786,7 @@ export class LiveSessionManager {
     if (!before) return undefined;
     const now = this.readPromptContext(key, true);
     if (!now) return undefined;
-    const body = describePromptContextChange(before, now);
+    const body = describePromptContextChange(before, now, { isGroup: isGroupSessionKey(key) });
     if (!body) return undefined;
     const note = formatTomoEvent("memory", body, { name: "changed" });
     const ticket: PromptContextTicket = { session, before, prefix: `${note}\n\n` };

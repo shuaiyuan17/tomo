@@ -343,6 +343,18 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(next.note).not.toContain("Coffee");
   });
 
+  it("a group session's note does not send it to the raw MEMORY.md", async () => {
+    let memory = ["## Work", "- [A](a.md)", "## Home"];
+    const manager = new LiveSessionManager(makeDeps({
+      promptContextSnapshot: () => ({ memory, people: [] }),
+    }));
+    await manager.getOrCreateLiveSession("telegram:-100");
+    await manager.getOrCreateLiveSession("dm:owner");
+    memory = ["## Work", "## Home", "- [A](a.md)"];
+    expect(manager.takePromptContextNote("telegram:-100")!.note).not.toContain("memory/MEMORY.md");
+    expect(manager.takePromptContextNote("dm:owner")!.note).toContain("memory/MEMORY.md");
+  });
+
   it("a stale ticket of the same session neither settles nor rolls back the note in flight", async () => {
     let memory = ["a"];
     const manager = new LiveSessionManager(makeDeps({

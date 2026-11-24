@@ -56,4 +56,16 @@ describe("describePromptContextChange", () => {
     expect(removal).toContain("- - y");
     expect(removal).not.toContain("reordered");
   });
+
+  it("never points a group session at the raw MEMORY.md (it holds the private lines its prompt filters out)", () => {
+    const before = { memory: ["## Work", "- [A](a.md)", "## Home", "- [B](b.md)"], people: [] };
+    const reordered = { memory: ["## Work", "## Home", "- [A](a.md)", "- [B](b.md)"], people: [] };
+    const rewritten = { memory: Array.from({ length: MAX_CONTEXT_DIFF_LINES + 5 }, (_, i) => `- [N${i}](n${i}.md)`), people: [] };
+    for (const after of [reordered, rewritten]) {
+      expect(describePromptContextChange(before, after)).toContain("memory/MEMORY.md");
+      const group = describePromptContextChange(before, after, { isGroup: true })!;
+      expect(group).not.toContain("memory/MEMORY.md");
+      expect(group).toContain("out of date");
+    }
+  });
 });

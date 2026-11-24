@@ -245,4 +245,20 @@ describe("PendingNotesQueue", () => {
     expect(next).not.toContain("older-");
     expect(next.indexOf("newer-0")).toBeLessThan(next.indexOf("newer-2"));
   });
+  it("strips errors blocks an older version left inside stored notes", () => {
+    const store = new MemoryPendingNotesStore();
+    const errors = '<tomo-event type="errors" ts="x">\nRecent Tomo errors\n- [error] old-boom\n</tomo-event>';
+    const inbox = '<tomo-event type="inbox" name="interrupted" ts="x">\nthe message\n</tomo-event>';
+    store.setPendingNotes("k", [
+      `${INTERRUPTED_NOTE_MARKER}\n${inbox}\n\n${errors}\n\n${errors}`,
+      `${INTERRUPTED_NOTE_MARKER}\n${errors}`,
+    ]);
+    const queue = new PendingNotesQueue(store);
+    const drained = queue.drain("k");
+    expect(drained).toContain("the message");
+    expect(drained).not.toContain("old-boom");
+    expect(drained.split(INTERRUPTED_NOTE_MARKER)).toHaveLength(2);
+    queue.restoreInterrupted("k", drained);
+    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\n${inbox}`]);
+  });
 });

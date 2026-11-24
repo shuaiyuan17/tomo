@@ -58,6 +58,21 @@ function capNotes(arr: string[]): number {
 }
 
 /**
+ * A rendered errors block. Error notes are memory-only, but before put-back
+ * split batches into their parts a failed turn's whole prefix, errors block
+ * included, went back as one durable note — so a store written then can
+ * still hold them. The body is escaped, so the first closing tag is its own.
+ */
+const STORED_ERRORS_BLOCK = /<tomo-event type="errors"[^>]*>[\s\S]*?<\/tomo-event>\s*/g;
+
+/** Strip errors blocks left in stored notes by older versions; drop notes left empty. */
+function withoutStoredErrors(notes: string[]): string[] {
+  return notes
+    .map((note) => (note.includes('<tomo-event type="errors"') ? note.replace(STORED_ERRORS_BLOCK, "").trim() : note))
+    .filter((note) => note !== "" && note !== INTERRUPTED_NOTE_MARKER);
+}
+
+/**
  * Prepended to a note whose turn took it but did not finish (crash, graceful
  * shutdown, abort): the model may already have acted on it, partly or fully.
  */
@@ -102,7 +117,7 @@ export class PendingNotesQueue {
     let arr = this.notes.get(sessionKey);
     if (!arr) {
       try {
-        arr = this.store.getPendingNotes(sessionKey);
+        arr = withoutStoredErrors(this.store.getPendingNotes(sessionKey));
       } catch (err) {
         log.warn({ err, sessionKey }, "Could not load durable pending notes");
         arr = [];

@@ -5,11 +5,12 @@
  *
  * A note is only ever a list of whole lines added or removed. That is exact
  * only for a SMALL change that leaves the structure alone: a line's meaning in
- * the index can depend on where it sits (the heading above it), and a note
- * does not carry position. So a change is noted only when every kept line
- * keeps its relative order and count, no heading line is added or removed,
- * and at most MAX_NOTED_LINES lines change in all. Anything else retires the
- * session as before, and the next one is built from the current files.
+ * the index can depend on where it sits (the heading above it), so each
+ * noted line carries the heading it sits under. A change is noted only when
+ * every kept line keeps its relative order and count, no heading line is
+ * added or removed, and at most MAX_NOTED_LINES lines (MAX_NOTED_CHARS
+ * characters) change in all. Anything else retires the session as before,
+ * and the next one is built from the current files.
  *
  * Pure: no filesystem access, so it is safe to import where the workspace
  * module is mocked.
@@ -22,15 +23,20 @@ export interface PromptContextLines {
 
 /** Most lines (added + removed, both sections together) a note may carry. */
 export const MAX_NOTED_LINES = 10;
+/** Most characters of changed lines a note may carry: it is prefixed whole to
+ *  the next turn, and one huge line must not crowd the conversation out. */
+export const MAX_NOTED_CHARS = 2_000;
 
 export type PromptContextChange =
   | { kind: "none" }
   | { kind: "note"; body: string }
-  | { kind: "retire"; reason: "reordered" | "heading" | "too-many" };
+  | { kind: "retire"; reason: "reordered" | "heading" | "too-many" | "too-large" };
 
 interface LineDiff {
-  added: string[];
-  removed: string[];
+  /** Each with the heading it sits under (in the new / old text), if any:
+   *  the same entry means something else under `## Work` than `## Home`. */
+  added: Array<{ line: string; under?: string }>;
+  removed: Array<{ line: string; under?: string }>;
   /** Lines in both, but not in the same order or number (an entry moved
    *  under another heading, a line duplicated): invisible to added/removed. */
   moved: boolean;
@@ -46,16 +52,28 @@ function diffLines(before: string[], after: string[]): LineDiff {
   const aSet = new Set(a);
   const keptBefore = b.filter((l) => aSet.has(l));
   const keptAfter = a.filter((l) => bSet.has(l));
+  const notIn = (lines: string[], other: Set<string>) => {
+    const out: LineDiff["added"] = [];
+    let under: string | undefined;
+    for (const line of lines) {
+      if (isHeading(line)) under = line.trim();
+      else if (!other.has(line)) out.push(under ? { line, under } : { line });
+    }
+    // A heading itself never goes into a note (it retires), but count it.
+    return [...out, ...lines.filter((l) => isHeading(l) && !other.has(l)).map((line) => ({ line }))];
+  };
   return {
-    added: a.filter((l) => !bSet.has(l)),
-    removed: b.filter((l) => !aSet.has(l)),
+    added: notIn(a, bSet),
+    removed: notIn(b, aSet),
     moved: keptBefore.length !== keptAfter.length || keptBefore.some((l, i) => l !== keptAfter[i]),
   };
 }
 
 function renderSection(title: string, diff: LineDiff): string | undefined {
   if (diff.added.length + diff.removed.length === 0) return undefined;
-  const lines = [...diff.added.map((l) => `+ ${l}`), ...diff.removed.map((l) => `- ${l}`)];
+  const render = (sign: string) => (e: { line: string; under?: string }) =>
+    e.under ? `${sign} ${e.line}   (under "${e.under}")` : `${sign} ${e.line}`;
+  const lines = [...diff.added.map(render("+")), ...diff.removed.map(render("-"))];
   return `${title} (+ added, - removed):\n${lines.join("\n")}`;
 }
 
@@ -67,8 +85,10 @@ export function classifyPromptContextChange(before: PromptContextLines, after: P
   const count = diffs.reduce((n, d) => n + d.added.length + d.removed.length, 0);
   if (diffs.some((d) => d.moved)) return { kind: "retire", reason: "reordered" };
   if (count === 0) return { kind: "none" };
-  if (diffs.some((d) => [...d.added, ...d.removed].some(isHeading))) return { kind: "retire", reason: "heading" };
+  if (diffs.some((d) => [...d.added, ...d.removed].some((e) => isHeading(e.line)))) return { kind: "retire", reason: "heading" };
   if (count > MAX_NOTED_LINES) return { kind: "retire", reason: "too-many" };
+  const chars = diffs.reduce((n, d) => n + [...d.added, ...d.removed].reduce((m, e) => m + e.line.length, 0), 0);
+  if (chars > MAX_NOTED_CHARS) return { kind: "retire", reason: "too-large" };
   const sections = [renderSection("MEMORY.md", memory), renderSection("People registry", people)]
     .filter((s): s is string => s !== undefined);
   return {

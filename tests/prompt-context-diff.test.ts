@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { classifyPromptContextChange, MAX_NOTED_LINES, type PromptContextChange } from "../src/workspace/prompt-context-diff.js";
+import { classifyPromptContextChange, MAX_NOTED_CHARS, MAX_NOTED_LINES, type PromptContextChange } from "../src/workspace/prompt-context-diff.js";
 
 const body = (c: PromptContextChange) => {
   if (c.kind !== "note") throw new Error(`expected a note, got ${c.kind}`);
@@ -58,5 +58,23 @@ describe("classifyPromptContextChange", () => {
     expect(classifyPromptContextChange(base, atLimit).kind).toBe("note");
     const over = { memory: [...base.memory, ...added(MAX_NOTED_LINES)], people: [...base.people, "- Bob"] };
     expect(classifyPromptContextChange(base, over)).toEqual({ kind: "retire", reason: "too-many" });
+  });
+
+  it("tells which heading an added or removed line sits under", () => {
+    const before = { memory: ["## Work", "- [W](w.md)", "## Home", "- [H](h.md)"], people: [] };
+    const underWork = body(classifyPromptContextChange(before, {
+      memory: ["## Work", "- [W](w.md)", "- [A](a.md)", "## Home", "- [H](h.md)"], people: [] }));
+    const underHome = body(classifyPromptContextChange(before, {
+      memory: ["## Work", "- [W](w.md)", "## Home", "- [H](h.md)", "- [A](a.md)"], people: [] }));
+    expect(underWork).toContain('+ - [A](a.md)   (under "## Work")');
+    expect(underHome).toContain('+ - [A](a.md)   (under "## Home")');
+    const removed = body(classifyPromptContextChange(before, { memory: ["## Work", "## Home", "- [H](h.md)"], people: [] }));
+    expect(removed).toContain('- - [W](w.md)   (under "## Work")');
+  });
+
+  it("retires rather than prefix one oversized line to the turn", () => {
+    const huge = `- [Big](big.md) — ${"x".repeat(MAX_NOTED_CHARS)}`;
+    expect(classifyPromptContextChange(base, { memory: [...base.memory, huge], people: base.people }))
+      .toEqual({ kind: "retire", reason: "too-large" });
   });
 });

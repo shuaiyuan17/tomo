@@ -1,5 +1,5 @@
 import { describe, it, expect, afterAll, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -33,6 +33,7 @@ vi.stubEnv("TOMO_WORKSPACE", TOMO_WORKSPACE);
 vi.resetModules();
 
 const { buildSystemPrompt, buildIdentityPrompt, promptContextSnapshot } = await import("../src/workspace/index.js");
+const { describePromptContextChange } = await import("../src/workspace/prompt-context-diff.js");
 
 afterAll(() => {
   vi.unstubAllEnvs();
@@ -111,6 +112,56 @@ describe("buildSystemPrompt", () => {
     it("includes memory entry in prompt", () => {
       const prompt = buildSystemPrompt();
       expect(prompt).toContain("test memory");
+    });
+  });
+
+  describe("prompt context snapshot", () => {
+    const memoryDir = join(TOMO_WORKSPACE, "memory");
+    const memoryFile = join(memoryDir, "MEMORY.md");
+    const peopleDir = join(memoryDir, "people");
+
+    beforeEach(() => mkdirSync(memoryDir, { recursive: true }));
+    afterEach(() => {
+      rmSync(memoryFile, { force: true });
+      rmSync(peopleDir, { recursive: true, force: true });
+    });
+
+    it("holds only the MEMORY.md lines the prompt shows, so a line moving into view reads as added", () => {
+      const lines = Array.from({ length: 201 }, (_, i) => `- line ${i + 1}`);
+      writeFileSync(memoryFile, lines.join("\n") + "\n");
+      const before = promptContextSnapshot();
+      expect(before.memory).toHaveLength(200);
+      expect(before.memory).not.toContain("- line 201");
+      writeFileSync(memoryFile, lines.slice(1).join("\n") + "\n");
+      const note = describePromptContextChange(before, promptContextSnapshot())!;
+      expect(note).toContain("+ - line 201");
+      expect(note).toMatch(/^- - line 1$/m);
+    });
+
+    it("a strict read throws on an unreadable people directory; the lenient one returns what it could", () => {
+      writeFileSync(peopleDir, "not a directory");
+      expect(() => promptContextSnapshot({ strict: true })).toThrow();
+      expect(promptContextSnapshot().people).toEqual([]);
+    });
+
+    it("a strict read fails on a MEMORY.md it cannot stat instead of reading it as empty", () => {
+      // A self-referencing symlink: existsSync says false (ELOOP), like it
+      // does for an inaccessible path (EACCES); only ENOENT means "no index".
+      symlinkSync(memoryFile, memoryFile);
+      expect(() => promptContextSnapshot({ strict: true })).toThrow();
+      expect(promptContextSnapshot().memory).toEqual([]);
+      rmSync(memoryFile, { force: true });
+      expect(promptContextSnapshot({ strict: true }).memory).toEqual([]);
+    });
+
+    it("a strict read throws on an unreadable person record instead of dropping it", () => {
+      mkdirSync(peopleDir, { recursive: true });
+      writeFileSync(join(peopleDir, "alice.md"), "---\nname: Alice\n---\n");
+      // A directory where a record should be: reading it fails (EISDIR).
+      mkdirSync(join(peopleDir, "bob.md"));
+      expect(() => promptContextSnapshot({ strict: true })).toThrow();
+      const lenient = promptContextSnapshot().people.join("\n");
+      expect(lenient).toContain("Alice");
     });
   });
 

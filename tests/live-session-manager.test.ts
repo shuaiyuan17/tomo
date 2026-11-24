@@ -290,11 +290,12 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(group.closed).toBe(false);
 
     // Each session hears about the change once, as a memory event.
-    const note = manager.takePromptContextNote("dm:owner")!;
-    expect(note).toContain('<tomo-event type="memory" name="changed"');
-    expect(note).toContain("+ - [Coffee](coffee.md)");
+    const taken = manager.takePromptContextNote("dm:owner")!;
+    expect(taken.note).toContain('<tomo-event type="memory" name="changed"');
+    expect(taken.note).toContain("+ - [Coffee](coffee.md)");
+    manager.settlePromptContextNote(taken.ticket);
     expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
-    expect(manager.takePromptContextNote("telegram:-1")).toContain("Coffee");
+    expect(manager.takePromptContextNote("telegram:-1")?.note).toContain("Coffee");
     // No live session for the key: the next one is built with the current text.
     expect(manager.takePromptContextNote("telegram:2")).toBeUndefined();
   });
@@ -308,18 +309,112 @@ describe("LiveSessionManager session lifecycle", () => {
     await manager.getOrCreateLiveSession("dm:owner");
 
     memory = [...memory, "- [Coffee](coffee.md)"];
-    expect(manager.takePromptContextNote("dm:owner")).toContain("+ - [Coffee](coffee.md)");
+    const first = manager.takePromptContextNote("dm:owner")!;
+    expect(first.note).toContain("+ - [Coffee](coffee.md)");
     // The turn failed: the next one describes the change again, from the
     // files as they are by then.
-    manager.restorePromptContextNote("dm:owner");
+    manager.restorePromptContextNote(first.ticket);
     memory = ["- [Coffee](coffee.md)"];
     const again = manager.takePromptContextNote("dm:owner")!;
-    expect(again).toContain("+ - [Coffee](coffee.md)");
-    expect(again).toContain("- - [Travel](travel.md)");
-    // Completed: told, not repeated.
-    manager.settlePromptContextNote("dm:owner");
-    manager.restorePromptContextNote("dm:owner");
+    expect(again.note).toContain("+ - [Coffee](coffee.md)");
+    expect(again.note).toContain("- - [Travel](travel.md)");
+    // Completed: told, not repeated (a stale ticket changes nothing).
+    manager.settlePromptContextNote(again.ticket);
+    manager.restorePromptContextNote(again.ticket);
+    manager.restorePromptContextNote(first.ticket);
     expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+  });
+
+  it("holds a second change note while one is in flight, and tells it after the first settles", async () => {
+    let memory = ["- [Travel](travel.md)"];
+    const manager = new LiveSessionManager(makeDeps({
+      promptContextSnapshot: () => ({ memory, people: [] }),
+    }));
+    await manager.getOrCreateLiveSession("dm:owner");
+
+    memory = [...memory, "- [Coffee](coffee.md)"];
+    const first = manager.takePromptContextNote("dm:owner")!;
+    memory = [...memory, "- [Tea](tea.md)"];
+    // A steered turn while the first is in flight: no second note.
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+    manager.settlePromptContextNote(first.ticket);
+    const next = manager.takePromptContextNote("dm:owner")!;
+    expect(next.note).toContain("+ - [Tea](tea.md)");
+    expect(next.note).not.toContain("Coffee");
+  });
+
+  it("a stale ticket of the same session neither settles nor rolls back the note in flight", async () => {
+    let memory = ["a"];
+    const manager = new LiveSessionManager(makeDeps({
+      promptContextSnapshot: () => ({ memory, people: [] }),
+    }));
+    await manager.getOrCreateLiveSession("dm:owner");
+    memory = ["a", "b"];
+    const t1 = manager.takePromptContextNote("dm:owner")!.ticket;
+    manager.restorePromptContextNote(t1);
+    const t2 = manager.takePromptContextNote("dm:owner")!.ticket;
+    memory = ["a", "b", "c"];
+    // t1's turn reports late: t2 is still in flight.
+    manager.settlePromptContextNote(t1);
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+    manager.settlePromptContextNote(t2);
+    const t3 = manager.takePromptContextNote("dm:owner")!;
+    expect(t3.note).toContain("+ c");
+    expect(t3.note).not.toContain("+ b");
+    // A stale restore must not roll t3 back to the snapshot before b.
+    manager.restorePromptContextNote(t1);
+    manager.restorePromptContextNote(t2);
+    manager.settlePromptContextNote(t3.ticket);
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+  });
+
+  it("a ticket from a replaced session does not touch its replacement", async () => {
+    let memory = ["a"];
+    const manager = new LiveSessionManager(makeDeps({
+      promptContextSnapshot: () => ({ memory, people: [] }),
+    }));
+    const old = await manager.getOrCreateLiveSession("dm:owner");
+    memory = ["a", "b"];
+    const stale = manager.takePromptContextNote("dm:owner")!;
+    old.closed = true;
+    await manager.getOrCreateLiveSession("dm:owner");
+    memory = ["a", "b", "c"];
+    const fresh = manager.takePromptContextNote("dm:owner")!;
+    expect(fresh.note).toContain("+ c");
+    expect(fresh.note).not.toContain("+ b");
+    // The old turn settles late: the new session's note stays in flight, so
+    // it can still be rolled back.
+    manager.settlePromptContextNote(stale.ticket);
+    manager.restorePromptContextNote(fresh.ticket);
+    expect(manager.takePromptContextNote("dm:owner")?.note).toContain("+ c");
+  });
+
+  it("re-reads the snapshot after the prompt build when the first read fails, so the session still hears of changes", async () => {
+    let reads = 0;
+    let memory = ["a"];
+    const manager = new LiveSessionManager(makeDeps({
+      promptContextSnapshot: () => {
+        reads++;
+        if (reads === 1) throw new Error("EIO");
+        return { memory, people: [] };
+      },
+    }));
+    await manager.getOrCreateLiveSession("dm:owner");
+    memory = ["a", "b"];
+    expect(manager.takePromptContextNote("dm:owner")?.note).toContain("+ b");
+  });
+
+  it("reads strictly before a turn, leniently when building the session", async () => {
+    const calls: boolean[] = [];
+    const manager = new LiveSessionManager(makeDeps({
+      promptContextSnapshot: (_key, { strict }) => {
+        calls.push(strict);
+        return { memory: [], people: [] };
+      },
+    }));
+    await manager.getOrCreateLiveSession("dm:owner");
+    manager.takePromptContextNote("dm:owner");
+    expect(calls).toEqual([false, true]);
   });
 
   it("still retires live sessions when SOUL/AGENT/IDENTITY or the harness rules change", async () => {
@@ -1293,6 +1388,65 @@ describe("LiveSessionManager idle reaper", () => {
 });
 
 describe("LiveSessionManager.runWithRetry", () => {
+  describe("memory change note on a session that gets replaced", () => {
+    function setup() {
+      let memory = ["a"];
+      let identity = "identity-v1";
+      const manager = new LiveSessionManager(makeDeps({
+        buildIdentityPrompt: () => identity,
+        promptContextSnapshot: () => ({ memory, people: [] }),
+      }));
+      const sent: Array<{ prompt: string; session: unknown }> = [];
+      return {
+        manager, sent,
+        setMemory: (m: string[]) => { memory = m; },
+        setIdentity: (v: string) => { identity = v; },
+      };
+    }
+
+    it("keeps the note when the turn runs on the session it was written for", async () => {
+      const { manager, sent, setMemory } = setup();
+      await manager.getOrCreateLiveSession("dm:owner");
+      setMemory(["a", "b"]);
+      const taken = manager.takePromptContextNote("dm:owner")!;
+      mockState.sendImpl = async (prompt, session) => { sent.push({ prompt, session }); return "ok"; };
+      await manager.runWithRetry({ key: "dm:owner", prompt: `${taken.ticket.prefix}hi` });
+      expect(sent).toHaveLength(1);
+      expect(sent[0].prompt).toBe(`${taken.ticket.prefix}hi`);
+    });
+
+    it("drops it when an identity change retires the session before the turn reaches it", async () => {
+      const { manager, sent, setMemory, setIdentity } = setup();
+      const old = await manager.getOrCreateLiveSession("dm:owner");
+      setMemory(["a", "b"]);
+      setIdentity("identity-v2");
+      const taken = manager.takePromptContextNote("dm:owner")!;
+      expect(taken).toBeDefined();
+      mockState.sendImpl = async (prompt, session) => { sent.push({ prompt, session }); return "ok"; };
+      await manager.runWithRetry({ key: "dm:owner", prompt: `${taken.ticket.prefix}hi` });
+      expect(sent).toHaveLength(1);
+      expect(sent[0].session).not.toBe(old);
+      expect(sent[0].prompt).toBe("hi");
+    });
+
+    it("drops it from the retry after a session error", async () => {
+      const { manager, sent, setMemory } = setup();
+      await manager.getOrCreateLiveSession("dm:owner");
+      setMemory(["a", "b"]);
+      const taken = manager.takePromptContextNote("dm:owner")!;
+      mockState.sendImpl = async (prompt, session) => {
+        sent.push({ prompt, session });
+        if (sent.length === 1) throw new Error("Session is closed");
+        return "ok";
+      };
+      await manager.runWithRetry({ key: "dm:owner", prompt: `${taken.ticket.prefix}hi` });
+      expect(sent).toHaveLength(2);
+      expect(sent[0].prompt).toBe(`${taken.ticket.prefix}hi`);
+      expect(sent[1].session).not.toBe(sent[0].session);
+      expect(sent[1].prompt).toBe("hi");
+    });
+  });
+
   it("records the new SDK session id, stats, and context nudge on success", async () => {
     const deps = makeDeps();
     const manager = new LiveSessionManager(deps);

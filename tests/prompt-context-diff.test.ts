@@ -33,4 +33,27 @@ describe("describePromptContextChange", () => {
     expect(body).toContain("Read memory/MEMORY.md");
     expect(body).not.toContain("n3.md");
   });
+
+  it("says so when unchanged lines only moved (an entry now under another heading)", () => {
+    const before = { memory: ["## Work", "- [A](a.md)", "## Home", "- [B](b.md)"], people: [] };
+    const after = { memory: ["## Work", "## Home", "- [A](a.md)", "- [B](b.md)"], people: [] };
+    const body = describePromptContextChange(before, after)!;
+    expect(body).toContain("MEMORY.md: existing lines were reordered");
+    expect(body).toContain("Read memory/MEMORY.md");
+  });
+
+  it("counts a duplicated line as a change", () => {
+    const before = { memory: ["- [A](a.md)"], people: [] };
+    expect(describePromptContextChange(before, { memory: ["- [A](a.md)", "- [A](a.md)"], people: [] })).toBeDefined();
+  });
+
+  it("mentions a reorder next to added lines, and stays quiet when only a removal shifts positions", () => {
+    const before = { memory: ["- x", "- y", "- z"], people: [] };
+    const both = describePromptContextChange(before, { memory: ["- z", "- y", "- x", "- new"], people: [] })!;
+    expect(both).toContain("+ - new");
+    expect(both).toContain("also reordered");
+    const removal = describePromptContextChange(before, { memory: ["- x", "- z"], people: [] })!;
+    expect(removal).toContain("- - y");
+    expect(removal).not.toContain("reordered");
+  });
 });

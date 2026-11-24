@@ -19,7 +19,7 @@ import {
   type PersonRecord,
 } from "../src/people.js";
 import { normalizeImessageHandle } from "../src/sessions/keys.js";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -630,5 +630,26 @@ describe("iMessage handles: one normal form shared with sessions/keys", () => {
     writePerson(dirs.publicDir, "omar.md", "---\nname: Omar\n---\n");
     const bound = autoBindHandle("imessage", wire("+86 138 0013 8000"), "Omar", dirs);
     expect(bound?.handles.imessage).toBe("+8613800138000");
+  });
+});
+
+describe("loadPeople strict", () => {
+  const root = join(TEST_DIR, "strict");
+  const strictDirs: PeopleDirs = { publicDir: join(root, "pub", "people"), privateDir: join(root, "priv", "people") };
+  afterEach(() => {
+    if (existsSync(join(root, "pub"))) chmodSync(join(root, "pub"), 0o755);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("a missing directory is an empty roster, strict or not", () => {
+    expect(loadPeople({ includePrivate: true, dirs: strictDirs, strict: true })).toEqual([]);
+  });
+
+  it("an inaccessible parent (existsSync says false) throws instead of reading as nobody", () => {
+    if (process.getuid?.() === 0) return; // root reads through chmod 000
+    writePerson(strictDirs.publicDir, "kevin.md", KEVIN);
+    chmodSync(join(root, "pub"), 0o000);
+    expect(() => loadPeople({ includePrivate: false, dirs: strictDirs, strict: true })).toThrow();
+    expect(loadPeople({ includePrivate: false, dirs: strictDirs })).toEqual([]);
   });
 });

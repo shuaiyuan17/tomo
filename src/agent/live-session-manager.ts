@@ -129,6 +129,15 @@ export const SHUTDOWN_FLUSH_TIMEOUT_MS = Math.min(DELIVERY_TIMEOUT_MS, 5_000);
  *  free. */
 export { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 
+/** One change note in flight (see LiveSessionManager.takePromptContextNote). */
+export interface PromptContextTicket {
+  readonly session: LiveSession;
+  /** The snapshot before the note: restored if its turn did not complete. */
+  readonly before: PromptContextLines;
+  /** What goes ahead of the turn's prompt: the note and a blank line. */
+  readonly prefix: string;
+}
+
 /**
  * The narrow surface the session lifecycle needs from the Agent: the durable
  * SDK-session registry, per-session option assembly (MCP wiring, group
@@ -146,10 +155,12 @@ export interface LiveSessionManagerDeps {
   buildIdentityPrompt(): string | readonly string[];
   /**
    * MEMORY.md and roster lines as a session for `key` gets them in its prompt.
-   * Snapshotted when the session is built and compared before each turn.
-   * Optional: without it no change note is produced.
+   * Snapshotted when the session is built (`strict: false`, the same lenient
+   * read the prompt builder does) and compared before each turn (`strict:
+   * true`: throws rather than return a roster missing records it could not
+   * read). Optional: without it no change note is produced.
    */
-  promptContextSnapshot?(key: string): PromptContextLines;
+  promptContextSnapshot?(key: string, opts: { strict: boolean }): PromptContextLines;
   getSdkSessionId(key: string): string | undefined;
   setSdkSessionId(key: string, sessionId: string): void;
   clearSdkSessionId(key: string): void;
@@ -252,10 +263,14 @@ export class LiveSessionManager {
   private promptStale = new Set<LiveSession>();
   /** The memory index and roster each live session was built with (or last told about). */
   private promptContext = new WeakMap<LiveSession, PromptContextLines>();
-  /** What `promptContext` was before a change note that is in flight: put
-   *  back if the turn carrying it did not complete, so the change is told
-   *  again. Keyed by the session, so a replacement session never inherits it. */
-  private promptContextUntold = new WeakMap<LiveSession, PromptContextLines>();
+  /** The change note in flight for a session, at most one: put back (its
+   *  `before` restored) if the turn carrying it did not complete, so the
+   *  change is told again. Keyed by the session, so a replacement session
+   *  never inherits it. */
+  private promptContextUntold = new WeakMap<LiveSession, PromptContextTicket>();
+  /** Per key, the change notes in flight, so a prompt that ends up on ANOTHER
+   *  session than the note was written for loses it (see promptForSession). */
+  private promptContextInFlight = new Map<string, Set<PromptContextTicket>>();
   private liveSessionCreates = new Map<string, Promise<LiveSession>>();
   private lastPromptHash: string = "";
   private stopping = false;
@@ -736,10 +751,10 @@ export class LiveSessionManager {
   }
 
   /** The key's current memory index and roster, or undefined (no dep, or unreadable). */
-  private readPromptContext(key: string): PromptContextLines | undefined {
+  private readPromptContext(key: string, strict: boolean): PromptContextLines | undefined {
     if (!this.deps.promptContextSnapshot) return undefined;
     try {
-      return this.deps.promptContextSnapshot(key);
+      return this.deps.promptContextSnapshot(key, { strict });
     } catch (err) {
       log.warn({ err, key }, "Could not read the memory index / people roster for the change check");
       return undefined;
@@ -752,25 +767,67 @@ export class LiveSessionManager {
    * undefined when nothing did, or when no live session will take the turn —
    * a session built next reads the current text into its prompt anyway.
    * Remembers what it reported, so each change is told once.
+   *
+   * ONE NOTE IN FLIGHT PER SESSION. Turns for one key overlap (a steer joins
+   * the turn running), and two notes in flight could not be rolled back
+   * independently: one snapshot cannot say "the first change is untold, the
+   * second is told". While a note is in flight a later turn gets none; what
+   * changed meanwhile is told by the first turn after it ends (from the newer
+   * snapshot if it completed, from the older one if it did not).
+   *
+   * The returned ticket goes back to settle/restorePromptContextNote.
    */
-  takePromptContextNote(key: string): string | undefined {
+  takePromptContextNote(key: string): { note: string; ticket: PromptContextTicket } | undefined {
     const session = this.liveSessions.get(key);
     if (!session?.isAlive()) return undefined;
+    if (this.promptContextUntold.has(session)) return undefined;
     const before = this.promptContext.get(session);
     if (!before) return undefined;
-    const now = this.readPromptContext(key);
+    const now = this.readPromptContext(key, true);
     if (!now) return undefined;
     const body = describePromptContextChange(before, now);
     if (!body) return undefined;
-    if (!this.promptContextUntold.has(session)) this.promptContextUntold.set(session, before);
+    const note = formatTomoEvent("memory", body, { name: "changed" });
+    const ticket: PromptContextTicket = { session, before, prefix: `${note}\n\n` };
+    this.promptContextUntold.set(session, ticket);
     this.promptContext.set(session, now);
-    return formatTomoEvent("memory", body, { name: "changed" });
+    let inFlight = this.promptContextInFlight.get(key);
+    if (!inFlight) this.promptContextInFlight.set(key, inFlight = new Set());
+    inFlight.add(ticket);
+    return { note, ticket };
   }
 
-  /** The turn that carried the last change note completed: it is told. */
-  settlePromptContextNote(key: string): void {
-    const session = this.liveSessions.get(key);
-    if (session) this.promptContextUntold.delete(session);
+  private dropInFlightTicket(ticket: PromptContextTicket): void {
+    for (const [key, inFlight] of this.promptContextInFlight) {
+      if (!inFlight.delete(ticket)) continue;
+      if (inFlight.size === 0) this.promptContextInFlight.delete(key);
+      return;
+    }
+  }
+
+  /**
+   * The prompt as `session` should get it. The change note is drained before
+   * the turn has its session, and the session can still be replaced after
+   * that (an identity change retires it in getOrCreateLiveSession, a session
+   * error retries on a new one). A replacement is built from the current
+   * files, so a note written for its predecessor would tell it its prompt
+   * shows text it does not: strip it. Its ticket still settles or restores
+   * the predecessor, which is gone, so nothing else changes.
+   */
+  private promptForSession(key: string, session: LiveSession, prompt: string): string {
+    for (const ticket of this.promptContextInFlight.get(key) ?? []) {
+      if (ticket.session !== session && prompt.startsWith(ticket.prefix)) {
+        log.info({ key }, "Dropping a memory change note written for a session that was replaced");
+        return prompt.slice(ticket.prefix.length);
+      }
+    }
+    return prompt;
+  }
+
+  /** The turn that carried this change note completed: it is told. */
+  settlePromptContextNote(ticket: PromptContextTicket): void {
+    this.dropInFlightTicket(ticket);
+    if (this.promptContextUntold.get(ticket.session) === ticket) this.promptContextUntold.delete(ticket.session);
   }
 
   /**
@@ -782,13 +839,12 @@ export class LiveSessionManager {
    * again from the files as they are then. A replaced session has nothing to
    * roll back.
    */
-  restorePromptContextNote(key: string): void {
-    const session = this.liveSessions.get(key);
-    if (!session) return;
-    const before = this.promptContextUntold.get(session);
-    if (!before) return;
+  restorePromptContextNote(ticket: PromptContextTicket): void {
+    this.dropInFlightTicket(ticket);
+    const { session } = ticket;
+    if (this.promptContextUntold.get(session) !== ticket) return;
     this.promptContextUntold.delete(session);
-    if (session.isAlive()) this.promptContext.set(session, before);
+    if (session.isAlive()) this.promptContext.set(session, ticket.before);
   }
 
   /**
@@ -880,7 +936,7 @@ export class LiveSessionManager {
     const internalMcpServer = this.deps.createInternalMcpServer(key);
     // Taken BEFORE the prompt is built: a change landing in between is then
     // told once more, never missed.
-    const promptContext = this.readPromptContext(key);
+    let promptContext = this.readPromptContext(key, false);
     const opts = sdkOptions(internalMcpServer, resumeId ?? undefined, model, {
       sessionKey: key,
       sdkSessionId: resumeId ?? undefined,
@@ -895,6 +951,10 @@ export class LiveSessionManager {
       undeliveredReply: () => session?.takeUndeliveredReply() ?? false,
       backgroundLaunchDenial: () => this.compactReservations.launchDenial(key),
     }, turnBudget, externalMcpServers);
+    // That read failed (a transient error): read again now the prompt is
+    // built. Synchronously after it, so no write of this process lands in
+    // between; without a snapshot the session would never hear of a change.
+    promptContext ??= this.readPromptContext(key, false);
 
     session = new LiveSession(opts, key, turnBudget, () => this.deps.createUnownedTurnRequest(key), {
       timeoutMs: config.liveSessionTimeoutMs,
@@ -1266,12 +1326,13 @@ export class LiveSessionManager {
       // A steer joins a turn already running; a fresh turn first settles MCP.
       if (!steer && session.isAlive() && !session.isBusy()) await this.preTurnMcp(key, session);
       if (token.interrupted) throw new TurnInterruptedError();
+      const sessionPrompt = this.promptForSession(key, session, prompt);
       return await this.runTurnOnSession(key, session, steer, () => (steer
-        ? session!.steer(prompt, images, documents, onBlock, onBlockAbandoned, origin, steerAudience, {
+        ? session!.steer(sessionPrompt, images, documents, onBlock, onBlockAbandoned, origin, steerAudience, {
           replyContext: req.replyContext, onJoined: req.onJoined, onHandedOff: req.onHandedOff,
           onPromptHandedOff: req.onPromptHandedOff,
           canJoin: () => this.deps.isOwnAudienceTurn(key) })
-        : session!.send(prompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery, req.replyContext, req.onPromptHandedOff)));
+        : session!.send(sessionPrompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery, req.replyContext, req.onPromptHandedOff)));
     } catch (err) {
       // Declined before injection: nothing ran. The caller re-queues it.
       if (err instanceof SteerDeclinedError) throw err;
@@ -1383,8 +1444,9 @@ export class LiveSessionManager {
         // nothing, so this retry is the first and only delivery of the turn.
         // Same bookkeeping as the first attempt — a retry that ends on an SDK
         // error result still ran, and its (new) session id must be kept.
+        const retryPrompt = this.promptForSession(key, retrySession, prompt);
         return await this.runTurnOnSession(key, retrySession, false, () =>
-          retrySession.send(prompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery));
+          retrySession.send(retryPrompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery));
       }
 
       throw err;

@@ -105,17 +105,31 @@ Don't wait to be told "remember this." Save durable personal details, preference
   return `${instructions}\n\n## Current MEMORY.md\n\n${memoryContent}`;
 }
 
-/** MEMORY.md as this audience sees it (private lines stripped for groups); null when absent. */
-function memoryIndexLines(isGroup: boolean): string[] | null {
-  if (!existsSync(MEMORY_ENTRYPOINT)) return null;
-  const lines = readFileSync(MEMORY_ENTRYPOINT, "utf-8").trim().split("\n");
+/** MEMORY.md as this audience sees it (private lines stripped for groups); null when absent.
+ *  `strict`: only ENOENT counts as absent — `existsSync` also says false for
+ *  an inaccessible path (EACCES), which a strict read must not take for an
+ *  empty index. */
+function memoryIndexLines(isGroup: boolean, strict = false): string[] | null {
+  let raw: string;
+  if (strict) {
+    try {
+      raw = readFileSync(MEMORY_ENTRYPOINT, "utf-8");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  } else {
+    if (!existsSync(MEMORY_ENTRYPOINT)) return null;
+    raw = readFileSync(MEMORY_ENTRYPOINT, "utf-8");
+  }
+  const lines = raw.trim().split("\n");
   return isGroup ? lines.filter((line) => !isPrivateIndexLine(line)) : lines;
 }
 
-function peopleRosterLines(isGroup: boolean): string[] {
+function peopleRosterLines(isGroup: boolean, strict = false): string[] {
   // Private people records never enter group prompts; in DMs the full
   // registry (including private records) is listed.
-  return renderPeopleRoster(loadPeople({ includePrivate: !isGroup }));
+  return renderPeopleRoster(loadPeople({ includePrivate: !isGroup, strict }));
 }
 
 function loadPeopleSection(isGroup: boolean): string {
@@ -233,10 +247,24 @@ export interface PromptContextSnapshot {
   people: string[];
 }
 
-/** Read-only: never creates the memory directory. */
-export function promptContextSnapshot(opts: { isGroup?: boolean } = {}): PromptContextSnapshot {
+/**
+ * Read-only: never creates the memory directory. `memory` is only the part of
+ * MEMORY.md the prompt shows (the first MAX_MEMORY_LINES lines), so an edit
+ * that moves a line across that boundary reads as that line added or removed.
+ *
+ * `strict` (the before-turn re-read) throws when the people directory or a
+ * record cannot be read, instead of returning the partial roster the prompt
+ * builder settles for (and only ENOENT counts as a missing file or
+ * directory): compared against the session's snapshot, a partial
+ * roster would tell the model that everyone it could not read was removed.
+ * The snapshot taken when a session is built is NOT strict: it has to match
+ * the prompt, which was built from the partial roster.
+ */
+export function promptContextSnapshot(opts: { isGroup?: boolean; strict?: boolean } = {}): PromptContextSnapshot {
   const isGroup = !!opts.isGroup;
-  return { memory: memoryIndexLines(isGroup) ?? [], people: peopleRosterLines(isGroup) };
+  const strict = !!opts.strict;
+  const memory = (memoryIndexLines(isGroup, strict) ?? []).slice(0, MAX_MEMORY_LINES);
+  return { memory, people: peopleRosterLines(isGroup, strict) };
 }
 
 export function buildSystemPrompt(opts: { isGroup?: boolean } = {}): string {

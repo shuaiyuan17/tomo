@@ -58,7 +58,7 @@ import { CredentialBroker } from "./credentials/broker.js";
 import { captureChannelFor } from "./credentials/capture.js";
 import { BrokerStateFile, KeychainBackend } from "./credentials/store.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
-import { LiveSessionManager } from "./agent/live-session-manager.js";
+import { LiveSessionManager, type PromptContextTicket } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { appendToTomoEventBody, formatTomoEvent } from "./tomo-event.js";
 import { UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
@@ -166,8 +166,10 @@ export class Agent {
   private readonly ownerNotices: OwnerNotices;
   private readonly mcpAuthPrompts: McpAuthPrompts;
   private pendingNotesQueue: PendingNotesQueue;
-  /** Per key: the memory-change note prefixed to the turn in flight (see drainPendingNotes). */
-  private readonly inFlightContextNotes = new Map<string, string>();
+  /** Per key: each memory-change note prefixed to a turn still in flight,
+   *  one entry per drained batch (turns for one key overlap: a steer joins
+   *  the running turn). See drainPendingNotes. */
+  private readonly inFlightContextNotes = new Map<string, Array<{ prefix: string; ticket: PromptContextTicket }>>();
   /**
    * Durable record of every accepted inbound message until a turn consumes
    * it (see DurableInbox). Undefined when `config.inbox` is off or the log
@@ -351,7 +353,7 @@ export class Agent {
     });
     this.liveSessionManager = new LiveSessionManager({
       buildIdentityPrompt: () => buildIdentityPrompt(),
-      promptContextSnapshot: (key) => promptContextSnapshot({ isGroup: isGroupSessionKey(key) }),
+      promptContextSnapshot: (key, { strict }) => promptContextSnapshot({ isGroup: isGroupSessionKey(key), strict }),
       getSdkSessionId: (key) => this.sessions.getSdkSessionId(key),
       setSdkSessionId: (key, sessionId) => this.sessions.setSdkSessionId(key, sessionId),
       clearSdkSessionId: (key) => this.sessions.clearSdkSessionId(key),
@@ -2488,21 +2490,25 @@ export class Agent {
     // session does not have. If the turn does not complete, the live session's
     // snapshot is rolled back instead (takeBackContextNote).
     const drained = this.pendingNotesQueue.drain(sessionKey);
-    const contextNote = this.liveSessionManager.takePromptContextNote(sessionKey);
-    if (!contextNote) return drained;
-    const prefix = `${contextNote}\n\n`;
-    this.inFlightContextNotes.set(sessionKey, prefix);
+    const taken = this.liveSessionManager.takePromptContextNote(sessionKey);
+    if (!taken) return drained;
+    const { prefix } = taken.ticket;
+    const inFlight = this.inFlightContextNotes.get(sessionKey) ?? [];
+    inFlight.push({ prefix, ticket: taken.ticket });
+    this.inFlightContextNotes.set(sessionKey, inFlight);
     return prefix + drained;
   }
 
   /** Strip this turn's memory-change note off the drained prefix before it
    *  goes back to the queue, and settle or roll back the snapshot it told. */
   private takeBackContextNote(sessionKey: string, drained: string, completed: boolean): string {
-    const prefix = this.inFlightContextNotes.get(sessionKey);
-    if (prefix === undefined || !drained.startsWith(prefix)) return drained;
-    this.inFlightContextNotes.delete(sessionKey);
-    if (completed) this.liveSessionManager.settlePromptContextNote(sessionKey);
-    else this.liveSessionManager.restorePromptContextNote(sessionKey);
+    const inFlight = this.inFlightContextNotes.get(sessionKey);
+    const i = inFlight?.findIndex((entry) => drained.startsWith(entry.prefix)) ?? -1;
+    if (!inFlight || i < 0) return drained;
+    const [{ prefix, ticket }] = inFlight.splice(i, 1);
+    if (inFlight.length === 0) this.inFlightContextNotes.delete(sessionKey);
+    if (completed) this.liveSessionManager.settlePromptContextNote(ticket);
+    else this.liveSessionManager.restorePromptContextNote(ticket);
     return drained.slice(prefix.length);
   }
 

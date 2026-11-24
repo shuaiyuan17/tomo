@@ -20,6 +20,9 @@ export const MAX_CONTEXT_DIFF_CHARS = 3_000;
 interface LineDiff {
   added: string[];
   removed: string[];
+  /** Lines in both, but not in the same order or number (an entry moved
+   *  under another heading, a line duplicated): invisible to added/removed. */
+  moved: boolean;
 }
 
 function diffLines(before: string[], after: string[]): LineDiff {
@@ -28,21 +31,26 @@ function diffLines(before: string[], after: string[]): LineDiff {
   const a = clean(after);
   const bSet = new Set(b);
   const aSet = new Set(a);
+  const keptBefore = b.filter((l) => aSet.has(l));
+  const keptAfter = a.filter((l) => bSet.has(l));
   return {
     added: a.filter((l) => !bSet.has(l)),
     removed: b.filter((l) => !aSet.has(l)),
+    moved: keptBefore.length !== keptAfter.length || keptBefore.some((l, i) => l !== keptAfter[i]),
   };
 }
 
 function renderSection(title: string, diff: LineDiff, whereToLook: string): string | undefined {
   const count = diff.added.length + diff.removed.length;
-  if (count === 0) return undefined;
+  if (count === 0 && !diff.moved) return undefined;
+  if (count === 0) return `${title}: existing lines were reordered (an entry may now sit under a different heading). ${whereToLook}`;
   const lines = [...diff.added.map((l) => `+ ${l}`), ...diff.removed.map((l) => `- ${l}`)];
   const body = lines.join("\n");
   if (count > MAX_CONTEXT_DIFF_LINES || body.length > MAX_CONTEXT_DIFF_CHARS) {
     return `${title}: changed substantially (${diff.added.length} line(s) added, ${diff.removed.length} removed). ${whereToLook}`;
   }
-  return `${title} (+ added, - removed):\n${body}`;
+  const movedNote = diff.moved ? `\nExisting lines were also reordered. ${whereToLook}` : "";
+  return `${title} (+ added, - removed):\n${body}${movedNote}`;
 }
 
 /**

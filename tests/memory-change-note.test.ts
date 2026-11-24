@@ -64,4 +64,76 @@ describe("memory change note on a live session", () => {
     expect(mockSdk.promptsBySession.map((p) => p.text).join("\n")).not.toContain(MEMORY_EVENT);
     await agent.stop();
   });
+
+  // Steering makes turns for one key overlap. Two change notes in flight at
+  // once could not be taken back separately: the second overwrote the first,
+  // whose prefix then went to the durable store on restore (or left the
+  // durable batch it rode with stuck in flight on settle).
+  describe("with two turns in flight for one key", () => {
+    type Internals = {
+      drainPendingNotes(key: string): string;
+      queuePendingNote(key: string, note: string): boolean;
+      turnRunner: { deps: {
+        settlePendingNotes(key: string, drained: string): void;
+        restoreInterruptedPendingNotes(key: string, drained: string): void;
+      } };
+      pendingNotesQueue: { peekNotes(key: string): string[]; inflight: Map<string, unknown[]> };
+    };
+
+    async function liveAgent() {
+      resetConfig();
+      const agent = new Agent();
+      const tg = new MockChannel("telegram");
+      agent.addChannel(tg);
+      mockWorkspace.promptContext = { memory: ["- [Travel](travel.md)"], people: [] };
+      await tg.simulateMessage(makeMsg({ text: "hello" }));
+      await drainQueue(agent);
+      const key = mockSdk.promptsBySession.at(-1)!.sessionKey;
+      return { agent, key, a: agent as unknown as Internals };
+    }
+
+    it("a steered turn carries no second note; the first settles with its durable batch", async () => {
+      const { agent, key, a } = await liveAgent();
+      mockWorkspace.promptContext = { memory: ["- [Travel](travel.md)", "- [Coffee](coffee.md)"], people: [] };
+      a.queuePendingNote(key, "durable note");
+      const first = a.drainPendingNotes(key);
+      expect(first).toContain("+ - [Coffee](coffee.md)");
+      expect(first).toContain("durable note");
+
+      mockWorkspace.promptContext = { memory: ["- [Travel](travel.md)", "- [Coffee](coffee.md)", "- [Tea](tea.md)"], people: [] };
+      const steered = a.drainPendingNotes(key);
+      expect(steered).not.toContain(MEMORY_EVENT);
+
+      a.turnRunner.deps.settlePendingNotes(key, first);
+      a.turnRunner.deps.settlePendingNotes(key, steered);
+      // The durable batch is settled, nothing stranded in flight or requeued.
+      expect(a.pendingNotesQueue.inflight.get(key) ?? []).toHaveLength(0);
+      expect(a.pendingNotesQueue.peekNotes(key)).toEqual([]);
+      // The change made meanwhile is told by the next turn, and only it.
+      const next = a.drainPendingNotes(key);
+      expect(next).toContain("+ - [Tea](tea.md)");
+      expect(next).not.toContain("Coffee");
+      await agent.stop();
+    });
+
+    it("a first turn that did not complete puts back only its durable note, and both changes are told again", async () => {
+      const { agent, key, a } = await liveAgent();
+      mockWorkspace.promptContext = { memory: ["- [Travel](travel.md)", "- [Coffee](coffee.md)"], people: [] };
+      a.queuePendingNote(key, "durable note");
+      const first = a.drainPendingNotes(key);
+      mockWorkspace.promptContext = { memory: ["- [Travel](travel.md)", "- [Coffee](coffee.md)", "- [Tea](tea.md)"], people: [] };
+      const steered = a.drainPendingNotes(key);
+
+      a.turnRunner.deps.settlePendingNotes(key, steered);
+      a.turnRunner.deps.restoreInterruptedPendingNotes(key, first);
+      const durable = a.pendingNotesQueue.peekNotes(key).join("\n");
+      expect(durable).toContain("durable note");
+      expect(durable).not.toContain(MEMORY_EVENT);
+
+      const next = a.drainPendingNotes(key);
+      expect(next).toContain("+ - [Coffee](coffee.md)");
+      expect(next).toContain("+ - [Tea](tea.md)");
+      await agent.stop();
+    });
+  });
 });

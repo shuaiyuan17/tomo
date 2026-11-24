@@ -1,5 +1,5 @@
 import { log } from "../logger.js";
-import { formatTomoEvent } from "../tomo-event.js";
+import { formatTomoEvent, isOwnerAudienceNote } from "../tomo-event.js";
 
 export interface DurablePendingNotesStore {
   getPendingNotes(key: string): string[];
@@ -159,10 +159,13 @@ export class PendingNotesQueue {
    * in the durable store until {@link settle} (or {@link restore}) is called
    * with the same prefix.
    */
-  drain(sessionKey: string): string {
+  drain(sessionKey: string, opts: { holdOwnerAudience?: boolean } = {}): string {
     const notes = this.queued(sessionKey);
-    const drained = [...notes];
-    this.notes.set(sessionKey, []);
+    // A turn that is not the owner's own (a summoned group on the owner's
+    // session) gets no owner-only note: those stay queued for the next one.
+    const held = opts.holdOwnerAudience ? notes.filter(isOwnerAudienceNote) : [];
+    const drained = held.length > 0 ? notes.filter((n) => !isOwnerAudienceNote(n)) : [...notes];
+    this.notes.set(sessionKey, held);
 
     const errorNotes = this.errorNotes.get(sessionKey) ?? [];
     const parts = [...drained];

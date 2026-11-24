@@ -487,6 +487,8 @@ export function configModuleMock() {
     get CONFIG_BACKUP_PATH() { return agentEnv.configBackupPath; },
     TOMO_HOME: "/tmp/tomo-mock",
     get RESTART_REASON_FILE() { return agentEnv.restartReasonFilePath; },
+    // The sub-session tools' schema reads it (owner turns build them when sub-sessions are on).
+    EFFORT_LEVELS: ["low", "medium", "high", "xhigh", "max"] as const,
   };
 }
 

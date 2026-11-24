@@ -287,9 +287,11 @@ export class SubsessionStore {
     throw new SubsessionStoreError(`Sub-session table ${this.path} is unreadable and has no usable backup`, primary.cause);
   }
 
-  /** A table read from `.bak` may be missing tasks: it says so from here on, in every write. */
+  /** A table read from `.bak` may be missing tasks, and its records may be stale: it says so from here on, in every write. */
   private untrust(table: SubsessionTable): SubsessionTable {
     if (!table.untrusted) table.untrusted = { since: this.now(), reason: "recovered" };
+    // Every status in it may be older than what happened since.
+    for (const task of table.tasks) task.restored = true;
     return table;
   }
 
@@ -407,6 +409,7 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
     nextInputSeq: Math.max(lastSeq + 1, Math.floor(num("nextInputSeq", 1))),
     seenThrough: Math.max(0, Math.floor(num("seenThrough", 0))),
     ...(typeof r.heldThrough === "number" && Number.isFinite(r.heldThrough) ? { heldThrough: Math.max(0, Math.floor(r.heldThrough)) } : { heldThrough: undefined }),
+    ...(r.restored === true ? { restored: true } : {}),
     sent: Array.isArray(r.sent) ? r.sent as SubsessionRecord["sent"] : [],
     transitions: Array.isArray(r.transitions) ? r.transitions as SubsessionRecord["transitions"] : [],
   };

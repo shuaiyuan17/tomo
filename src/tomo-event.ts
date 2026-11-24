@@ -139,6 +139,27 @@ export function formatTomoEvent(type: TomoEventType, body: string, opts: TomoEve
   return `${TOMO_EVENT_OPEN_TAG} type="${type}"${name} ts="${ts}">\n${escapeBody(body)}\n</tomo-event>`;
 }
 
+const OWNER_AUDIENCE_ATTR = ' audience="owner"';
+const LEADING_OPEN_TAG_RE = /^<tomo-event\b[^>]*>/;
+
+/**
+ * Mark a pending note as the owner's alone (a message the owner wrote to a
+ * sub-session, a task's words). Such a note is held back from a turn on the
+ * owner's session that is not the owner's own (a summoned group steering
+ * it), and waits for the owner's next turn. Only a note that starts with an
+ * envelope can be marked; anything else is returned unchanged.
+ */
+export function markOwnerAudience(note: string): string {
+  const m = LEADING_OPEN_TAG_RE.exec(note);
+  if (!m || m[0].includes(OWNER_AUDIENCE_ATTR)) return note;
+  return `${m[0].slice(0, -1)}${OWNER_AUDIENCE_ATTR}>${note.slice(m[0].length)}`;
+}
+
+/** Does the note carry the owner-only mark (anywhere in an opening tag, so an interrupted-note prefix does not hide it)? */
+export function isOwnerAudienceNote(note: string): boolean {
+  return /<tomo-event\b[^>]*\baudience="owner"/.test(note);
+}
+
 export interface ParsedTomoEvent {
   type: string;
   name?: string;

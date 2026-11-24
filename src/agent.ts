@@ -68,7 +68,7 @@ import { BrokerStateFile, KeychainBackend } from "./credentials/store.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
-import { appendToTomoEventBody, formatTomoEvent } from "./tomo-event.js";
+import { appendToTomoEventBody, formatTomoEvent, markOwnerAudience } from "./tomo-event.js";
 import { UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
 import { usageDataDir } from "./usage/dir.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
@@ -502,7 +502,9 @@ export class Agent {
         if (target) await target.channel.send({ chatId: target.chatId, text });
       },
       noticeOwner: async (text) => { await this.notifyOwner(text); },
-      queuePendingNote: (key, note) => this.queuePendingNote(key, note),
+      // A task owned by the owner's DM speaks for the owner alone: its notes
+      // never drain into a summoned group's turn on that session.
+      queuePendingNote: (key, note) => this.queuePendingNote(key, isDmSessionKey(key) ? markOwnerAudience(note) : note),
       hasPendingNote: (key, predicate) => this.pendingNotesQueue.hasNote(key, predicate),
       persistPendingNotes: (key) => this.pendingNotesQueue.persistNow(key),
       wakeScope: (parentKey, prompt) => {
@@ -2670,7 +2672,7 @@ export class Agent {
 
   /** Drain notes queued for this session and return them as a prefix. */
   private drainPendingNotes(sessionKey: string): string {
-    return this.pendingNotesQueue.drain(sessionKey);
+    return this.pendingNotesQueue.drain(sessionKey, { holdOwnerAudience: !this.isOwnAudienceTurn(sessionKey) });
   }
 
   /** Channel + per-session vitals snapshot for the watch server. */
@@ -2839,6 +2841,14 @@ export class Agent {
     // dispatched by live ingress, and replaying it too would run it twice (or
     // misread its fresh turn as interrupted).
     const recovered = this.inbox?.pending() ?? [];
+    try {
+      // Sub-session restart recovery runs BEFORE any channel ingests, so no
+      // input can reach a task recovery has not looked at yet. It schedules
+      // nothing: dispatch opens with start() below, after the inbox replay.
+      this.subsessions?.recoverAtStartup();
+    } catch (err) {
+      log.error({ err }, "Sub-session recovery failed");
+    }
     await Promise.all(this.channels.map((ch) => ch.start()));
     try {
       this.replayInbox(recovered);
@@ -2852,8 +2862,8 @@ export class Agent {
       log.warn({ err }, "Could not report interrupted subagents");
     }
     try {
-      // After the channels and the inbox: recovery may tell the owner things
-      // and wake the owning session with a report.
+      // After the channels and the inbox: opens dispatch, and sends what
+      // recovery had to tell the owner (a report's wake among them).
       this.subsessions?.start();
     } catch (err) {
       log.error({ err }, "Sub-session start failed");

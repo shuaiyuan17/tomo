@@ -5,7 +5,10 @@ vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/agent-mocks.js")).sdkModuleMock());
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
-import { Agent, MockChannel, installAgentTestHooks, mockConfig, mockSdk, resetConfig, waitFor } from "./helpers/agent-harness.js";
+import { join } from "node:path";
+import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockConfig, mockSdk, resetConfig, waitFor } from "./helpers/agent-harness.js";
+import { SubsessionStore } from "../src/agent/subsessions/store.js";
+import { formatTomoEvent } from "../src/tomo-event.js";
 
 installAgentTestHooks();
 
@@ -68,6 +71,65 @@ describe("sub-sessions through the Agent", () => {
     expect(agent.subsessions!.get("s1")?.pendingInput.some((p) => p.text.includes("check CI"))).toBe(true);
     expect(channel.delivered).toHaveLength(0);
     expect(await agent.handleCronMessage("check CI", "task:s42")).toBe(false);
+    await agent.stop();
+  });
+
+  it("recovers sub-sessions before any channel ingests, and runs no task turn until start() opens dispatch", async () => {
+    resetConfig({
+      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      subsessions: { ...mockConfig.subsessions, enabled: true },
+      tomoHome: mockConfig.tomoHome,
+    });
+    // The last run left a task in the middle of a turn.
+    const store = new SubsessionStore(join(mockConfig.tomoHome, "data", "subsessions.json"));
+    const t = store.create({ parentKey: "dm:alex", title: "t", brief: "b" });
+    store.transition(t.id, "start");
+    mockSdk.responseFn = () => new Promise(() => {});
+    const agent = new Agent();
+    const channel = new MockChannel("telegram");
+    const during: { available?: boolean; status?: string; relayed?: boolean; turns?: number } = {};
+    // A channel that delivers input while it is still starting.
+    channel.start = async () => {
+      during.available = agent.subsessions!.available();
+      during.status = agent.subsessions!.get("s1")?.status;
+      during.relayed = agent.subsessions!.relay("s1", "early word").ok;
+      await new Promise((r) => setImmediate(r));
+      during.turns = taskPrompts("task:s1").length;
+    };
+    agent.addChannel(channel);
+    await agent.start();
+    expect(during).toEqual({ available: true, status: "queued", relayed: true, turns: 0 });
+    await waitFor(() => expect(taskPrompts("task:s1")).toHaveLength(1));
+    expect(taskPrompts("task:s1")[0].text).toContain("early word");
+    expect(taskPrompts("task:s1")[0].text).toContain('type="subsession-resume"');
+    await agent.stop();
+  });
+
+  it("keeps a task's report out of a summoned group's turn on the owner's session, for the owner's next turn", async () => {
+    const { agent, channel } = await boot();
+    const internals = agent as unknown as {
+      router: { summonGroup(channel: string, chatId: string, identity: string): void };
+      subsessions: { deps: { queuePendingNote(key: string, note: string): boolean } };
+    };
+    internals.router.summonGroup("telegram", "-100271", "alex");
+    mockSdk.responseFn = () => "NO_REPLY";
+    await channel.simulateMessage(makeMsg({ chatId: "12345", text: "hi" }));
+    await drainQueue(agent);
+    mockSdk.promptsBySession = [];
+    // A task finished: its report note waits on the owner's session (the
+    // service's own dep, so the agent's wiring marks it).
+    internals.subsessions.deps.queuePendingNote("dm:alex", formatTomoEvent("subsession-report", "Sub-session s1 finished. Its report:\nSECRET-REPORT", { name: "s1" }));
+    // The summoned group's turn runs first, on dm:alex, with the group's audience.
+    expect(await agent.handleCronMessage("Scheduled group task", "telegram:-100271", { waitForHandoff: true })).toBe(true);
+    const groupTurn = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex").map((p) => p.text).join("\n");
+    expect(groupTurn).toContain("Scheduled group task");
+    expect(groupTurn).not.toContain("SECRET-REPORT");
+    // The owner's own next turn gets it.
+    mockSdk.promptsBySession = [];
+    await channel.simulateMessage(makeMsg({ chatId: "12345", text: "anything new?" }));
+    await drainQueue(agent);
+    const ownerTurn = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex").map((p) => p.text).join("\n");
+    expect(ownerTurn).toContain("SECRET-REPORT");
     await agent.stop();
   });
 });

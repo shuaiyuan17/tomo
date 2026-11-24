@@ -107,7 +107,7 @@ describe("sub-session tools", () => {
 
   function service(): SubsessionService {
     dir = mkdtempSync(join(tmpdir(), "tomo-subtools-"));
-    return new SubsessionService({
+    const svc = new SubsessionService({
       store: new SubsessionStore(join(dir, "t.json")),
       config: () => ({ ...DEFAULT_SUBSESSIONS, enabled: true, maxRunning: 0 + 1 }),
       runTaskTurn: () => new Promise(() => {}),
@@ -127,6 +127,9 @@ describe("sub-session tools", () => {
       registryTaskKeys: () => [],
       isStopping: () => false,
     });
+    // Recovery done (the tools work from here); dispatch stays closed.
+    svc.recoverAtStartup();
+    return svc;
   }
   const call = (tools: ReturnType<typeof buildTaskOwnerTools>, name: string, args: Record<string, unknown>) =>
     tools.find((t) => t.name === name)!.handler(args as never, undefined as never) as Promise<{ content: Array<{ text: string }>; isError?: boolean }>;

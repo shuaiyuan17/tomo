@@ -136,6 +136,13 @@ export interface SubsessionRecord {
    * that called task_ask) left unconsumed.
    */
   heldThrough?: number;
+  /**
+   * The record came from `.bak` (the primary table was lost or unreadable):
+   * its status may be older than what happened, so no cleanup acts on it
+   * (archive, forget, unlink, cron removal). Cleared only by an ending this
+   * process saw happen (task_finish, a cancel).
+   */
+  restored?: boolean;
   /** Recent messages the task sent out, newest last (at most SENT_KEEP). */
   sent: SubsessionSentMessage[];
   /** The newest status changes, oldest first. */
@@ -152,7 +159,7 @@ export interface SubsessionTable {
    * or it was missing while the registry held task sessions. Kept across
    * every write and restart, so no later start unlinks a registry entry the
    * table does not know (it may be a task the lost table had). Cleared once
-   * no such entry is left.
+   * no such entry is left and no record is still `restored`.
    */
   untrusted?: { since: number; reason: "recovered" | "lost" };
 }

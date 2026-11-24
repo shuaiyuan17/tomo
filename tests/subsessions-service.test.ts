@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
-import { CRON_RECHECK_MS, MAX_INTERRUPT_STREAK, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
+import { CRON_RECHECK_MS, FINISHED_KEEP_MS, MAX_INTERRUPT_STREAK, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { PENDING_INPUT_MAX, appendInput } from "../src/agent/subsessions/types.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 
@@ -36,6 +36,8 @@ interface Harness {
   noteWriteFails: number;
   /** Later re-writes of the held notes that fail. */
   persistFails: number;
+  /** The next N sends to the owning scope fail. */
+  sendFails: number;
 }
 
 let dir = "";
@@ -72,6 +74,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
     cronUnknown: false,
     noteWriteFails: 0,
     persistFails: 0,
+    sendFails: 0,
   } as Harness;
   h.service = new SubsessionService({
     store,
@@ -83,7 +86,11 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
       await new Promise((r) => setImmediate(r));
       return h.onTurn(turn, h);
     },
-    sendToScope: async (parentKey, text) => { h.sent.push({ parentKey, text }); return { ok: true }; },
+    sendToScope: async (parentKey, text) => {
+      if (h.sendFails > 0) { h.sendFails -= 1; return { ok: false, error: "channel down" }; }
+      h.sent.push({ parentKey, text });
+      return { ok: true };
+    },
     noticeToScope: async (to, text) => { h.notices.push({ to, text }); },
     noticeOwner: async (text) => { h.notices.push({ to: "owner", text }); },
     queuePendingNote: (key, note) => {
@@ -332,7 +339,7 @@ describe("SubsessionService", () => {
     expect(h.turns[2].prompt).toContain('type="subsession-start"');
   });
 
-  it("gives up on a finished task's answer after two failed turns, or at once when stopped, and says so", async () => {
+  it("holds a finished task's unanswered input after two failed turns, or at once when stopped, and says so", async () => {
     const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, "ok")));
     h.service.start();
     const t = spawn(h);
@@ -342,12 +349,62 @@ describe("SubsessionService", () => {
     h.service.relay(t.id, "one more thing");
     await flush();
     expect(h.turns).toHaveLength(3);
-    expect(h.store.get(t.id)).toMatchObject({ status: "finished", pendingInput: [], failStreak: 0 });
+    // Never deleted: held, and no further turn until the owner writes again.
+    let record = h.store.get(t.id)!;
+    expect(record).toMatchObject({ status: "finished", failStreak: 0, heldThrough: 1 });
+    expect(record.pendingInput.map((i) => i.text).join()).toContain("one more thing");
     expect(h.notices.at(-1)?.text).toContain("Couldn't answer the message it was sent");
     h.onTurn = () => ({ ok: false, stopped: true });
     h.service.relay(t.id, "and another");
     await flush();
     expect(h.turns).toHaveLength(4);
+    record = h.store.get(t.id)!;
+    expect(record.pendingInput).toHaveLength(2);
+    expect(record.heldThrough).toBe(2);
+    // The next message brings everything held back, said to be possibly seen.
+    h.onTurn = () => ({ ok: true });
+    h.service.relay(t.id, "third");
+    await flush();
+    expect(h.turns).toHaveLength(5);
+    expect(h.turns[4].prompt).toContain("one more thing");
+    expect(h.turns[4].prompt).toContain("and another");
+    expect(h.turns[4].prompt).toContain('type="subsession-redelivery"');
+    expect(h.store.get(t.id)?.pendingInput).toEqual([]);
+    // Held inputs survive a restart without a turn being started for them.
+    h.onTurn = () => ({ ok: false, stopped: true });
+    h.service.relay(t.id, "fourth");
+    await flush();
+    expect(h.turns).toHaveLength(6);
+    h.service.stop();
+    const h2 = harness();
+    h2.service.start();
+    await flush();
+    expect(h2.turns).toHaveLength(0);
+    expect(h2.store.get(t.id)?.pendingInput.map((i) => i.text).join()).toContain("fourth");
+  });
+
+  it("keeps the input a turn answered when its message could not be delivered, and sends it again", async () => {
+    let n = 0;
+    const h = harness({}, async (turn, hh) => {
+      n += 1;
+      if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
+      // Answer the relay; the send may fail.
+      await hh.service.notify(turn.key, `answer ${n}`);
+      if (n >= 3) hh.service.finish(turn.key, "done");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)?.waitingOn).toBe("owner");
+    h.sendFails = 1;
+    h.service.relay(t.id, "what is the status?");
+    await flush();
+    // Turn 2's answer was lost: the relay stayed and turn 3 got it again.
+    expect(h.turns).toHaveLength(3);
+    expect(h.turns[2].prompt).toContain("what is the status?");
+    expect(h.turns[2].prompt).toContain('name="answer"');
+    expect(h.sent.map((m) => m.text).join()).toContain("answer 3");
     expect(h.store.get(t.id)?.pendingInput).toEqual([]);
   });
 
@@ -1001,5 +1058,128 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     await flush();
     expect(h2.turns).toHaveLength(0);
     expect(h2.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner", pendingInput: [{ seq: 1 }] });
+  });
+
+  // -------------------------------------------------------------------------
+  // Round 5: the invariants, each driven from its real entry point
+  // -------------------------------------------------------------------------
+
+  function seed(h: Harness, state: "active" | "finished", patch?: (s: SubsessionStore, id: string) => void): string {
+    const t = h.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    h.store.transition(t.id, "start");
+    h.store.update(t.id, (r) => { r.startDelivered = true; });
+    if (state === "finished") h.store.transition(t.id, "finish", { patch: (r) => { r.report = "R"; } });
+    patch?.(h.store, t.id);
+    return t.id;
+  }
+
+  it("admits nothing before recovery and runs no turn before start(), so recovery never touches a live task", async () => {
+    const h0 = harness();
+    seed(h0, "active"); // s1: its turn was cut short by the restart
+    const w = h0.store.create({ parentKey: "dm:owner", title: "w", brief: "b" }); // s2: waits for the owner
+    h0.store.transition(w.id, "start");
+    h0.store.update(w.id, (r) => { r.startDelivered = true; });
+    h0.store.transition(w.id, "stuck", { patch: (r) => { r.heldThrough = 0; } });
+    const h = harness({ maxRunning: 3 }, working((turn, hh) => hh.service.finish(turn.key, "ok")));
+    for (const k of ["task:s1", "task:s2"]) { h.registry.add(k); h.sdk.add(k); }
+    // Channels not up yet, recovery not run: every entry point refuses.
+    expect(h.service.available()).toBe(false);
+    expect(h.service.relay("s2", "too early").ok).toBe(false);
+    expect(h.service.spawn("dm:owner", { title: "x", brief: "y" }).ok).toBe(false);
+    expect(h.service.onCronFire("task:s2", "check")).toBe(false);
+    expect(h.store.get("s2")?.pendingInput).toEqual([]);
+    h.service.recoverAtStartup();
+    expect(h.store.get("s1")).toMatchObject({ status: "queued", resumeNeeded: true });
+    // Channels ingest from here: input is taken, nothing runs until start().
+    expect(h.service.relay("s2", "while starting").ok).toBe(true);
+    expect(h.service.spawn("dm:owner", { title: "x", brief: "y" }).ok).toBe(true);
+    await flush();
+    expect(h.turns).toHaveLength(0);
+    expect(h.store.get("s2")).toMatchObject({ status: "active", resumeNeeded: false });
+    // Recovery is done with: calling it again does not mistake s2 for a turn cut short.
+    h.service.recoverAtStartup();
+    expect(h.store.get("s2")).toMatchObject({ status: "active", resumeNeeded: false, interruptStreak: 0 });
+    h.service.start();
+    await flush();
+    expect(new Set(h.turns.map((t) => t.key))).toEqual(new Set(["task:s1", "task:s2", "task:s3"]));
+    const s2 = h.turns.find((t) => t.key === "task:s2")!.prompt;
+    expect(s2).toContain("while starting");
+    expect(s2).not.toContain('type="subsession-resume"');
+    expect(h.turns.find((t) => t.key === "task:s1")!.prompt).toContain('type="subsession-resume"');
+  });
+
+  it("holds recovery's notices and report wakes until start()", () => {
+    const h0 = harness();
+    seed(h0, "finished"); // its report was never delivered
+    const h = harness();
+    h.registry.add("task:s1"); h.sdk.add("task:s1");
+    h.service.recoverAtStartup();
+    expect(h.notes.get("dm:owner")?.some((n) => n.includes('type="subsession-report"'))).toBe(true);
+    expect(h.wakes).toEqual([]);
+    h.service.start();
+    expect(h.wakes).toEqual(["dm:owner"]);
+  });
+
+  it("does no destructive cleanup of a task restored from a backup, on this start or the next", () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const h0 = harness();
+    const id = seed(h0, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; r.endedAt = Date.now() - FINISHED_KEEP_MS - DAY; }));
+    copyFileSync(path, `${path}.bak`); // the backup says finished 8 days ago
+    writeFileSync(path, "{broken");    // the lost primary had reopened it
+    const startAgain = (): Harness => {
+      const h = harness();
+      h.registry.add("task:s1"); h.sdk.add("task:s1");
+      h.cron.set("task:s1", 1);
+      h.service.start();
+      return h;
+    };
+    const h1 = startAgain();
+    expect(h1.store.state()).toBe("ok");
+    expect(h1.store.get(id)).toMatchObject({ status: "finished", restored: true });
+    expect(h1.unlinked).toEqual([]);
+    expect(h1.cron.get("task:s1")).toBe(1);
+    // Its check-back fires: ignored, and the job is not removed either.
+    expect(h1.service.onCronFire("task:s1", "check")).toBe(false);
+    expect(h1.cron.get("task:s1")).toBe(1);
+    // The next start reads a clean table with nothing unknown in the registry:
+    // the table is trusted again, the restored record still is not.
+    const h2 = startAgain();
+    expect(h2.store.read().untrusted).toBeUndefined();
+    expect(h2.store.get(id)).toMatchObject({ status: "finished", restored: true });
+    expect(h2.unlinked).toEqual([]);
+    expect(h2.cron.get("task:s1")).toBe(1);
+  });
+
+  it("still owes a continue turn after that turn's result could not be written", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let failNext = false;
+      let n = 0;
+      const h = harness({}, working((turn, hh) => {
+        n += 1;
+        if (n === 2) failNext = true;
+        if (n === 3) hh.service.finish(turn.key, "ok");
+      }));
+      const realUpdate = h.store.update.bind(h.store);
+      h.store.update = ((...args: Parameters<typeof realUpdate>) => {
+        if (failNext) { failNext = false; throw new Error("disk full"); }
+        return realUpdate(...args);
+      }) as typeof realUpdate;
+      h.service.start();
+      const t = spawn(h);
+      await flush();
+      // Turn 2 was a continue with no input, and its result was not written.
+      expect(h.turns).toHaveLength(2);
+      expect(h.turns[1].prompt).toContain('type="subsession-continue"');
+      expect(h.store.get(t.id)?.status).toBe("active");
+      vi.advanceTimersByTime(SETTLE_RETRY_MS);
+      await flush();
+      expect(h.turns).toHaveLength(3);
+      expect(h.turns[2].prompt).toContain('type="subsession-continue"');
+      expect(h.store.get(t.id)?.status).toBe("finished");
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

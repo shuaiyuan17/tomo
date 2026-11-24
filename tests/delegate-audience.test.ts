@@ -124,11 +124,13 @@ describe("send_message(delegate) carries the caller's audience", () => {
     let delegateResult: ToolResult | undefined;
     let scopedDuringDelegatedTurn: string | undefined;
     let listedDuringDelegatedTurn: ToolResult | undefined;
+    let barredDuringDelegatedTurn: boolean | undefined;
 
     mockSdk.responseFn = async (text: string) => {
       if (text.includes("From your other conversation")) {
         // The delegated turn, running on dm:shuai.
         scopedDuringDelegatedTurn = agent.scopedCallerKey(OWNER);
+        barredDuringDelegatedTurn = agent.isPrivateMemoryBarred(OWNER);
         listedDuringDelegatedTurn = await tools.get("schedule_list")!.handler({}, {});
         return "NO_REPLY";
       }
@@ -161,6 +163,41 @@ describe("send_message(delegate) carries the caller's audience", () => {
     const listed = listedDuringDelegatedTurn!.content[0].text;
     expect(listed).not.toContain("clinic");
     expect(JSON.parse(listed.split("\n\n")[0])).toHaveLength(0);
+    // ...and memory/private/ is closed to it, as on any group turn.
+    expect(barredDuringDelegatedTurn).toBe(true);
+
+    await agent.stop();
+  });
+
+  it("keeps a group session's own delegate to the owner barred from private memory", async () => {
+    ownerConfig();
+    const agent = new Agent();
+    const tg = new MockChannel("telegram");
+    agent.addChannel(tg);
+    // The dm: session needs a reply target for the handed-off turn.
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "hi" }));
+    await drainQueue(agent);
+
+    let barred: boolean | undefined;
+    let ownerBarredOnOwnTurn: boolean | undefined;
+    mockSdk.responseFn = async (text: string) => {
+      if (text.includes("From your other conversation")) barred = agent.isPrivateMemoryBarred(OWNER);
+      if (text.includes("owner says hello")) ownerBarredOnOwnTurn = agent.isPrivateMemoryBarred(OWNER);
+      return "NO_REPLY";
+    };
+
+    // The group's own session (not a summon) hands a turn to the owner's DM.
+    const result = await internalTools(agent, GROUP).get("send_message")!.handler({
+      target: "shuai", mode: "delegate", message: "tell the owner the quota note",
+    }, {});
+    expect(result.isError).toBeFalsy();
+    await drainQueue(agent);
+    expect(barred).toBe(true);
+
+    // Control: the owner's own DM turn on the same session is not barred.
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "owner says hello" }));
+    await drainQueue(agent);
+    expect(ownerBarredOnOwnTurn).toBe(false);
 
     await agent.stop();
   });

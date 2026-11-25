@@ -18,7 +18,7 @@ let root: string;
 let web: WebService;
 let channel: WebChannel;
 let handoff: ReturnType<typeof vi.fn>;
-/** Every write RPC that reached the daemon (one carrying the page's epoch): a refused write must send none. */
+/** Every write RPC that reached the daemon (one carrying the page's epoch): a refused write must send none. The cron and upload routes write without an RPC, so for them only the response guards the refusal. */
 let writeRpcs: string[];
 let bootstrap: WebBootstrap;
 const accessToken = WEB_TEST_TOKEN;

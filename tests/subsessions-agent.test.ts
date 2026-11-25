@@ -7,11 +7,11 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 
 import { join } from "node:path";
 import type { OutgoingMessage, SendResult } from "../src/channels/types.js";
-import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockConfig, mockSdk, resetConfig, waitFor } from "./helpers/agent-harness.js";
+import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockConfig, mockSdk, peekPendingNotes, resetConfig, waitFor } from "./helpers/agent-harness.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { formatTomoEvent } from "../src/tomo-event.js";
 import { DurableInbox, INBOX_STALE_NOT_PROCESSED } from "../src/agent/durable-inbox.js";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 
 installAgentTestHooks();
 
@@ -310,6 +310,31 @@ describe("sub-sessions through the Agent", () => {
       await agent.stop();
     });
 
+    it("warns by task id on replay even when the task table cannot be read", async () => {
+      resetConfig({
+        identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+        subsessions: { ...mockConfig.subsessions, enabled: true },
+        inbox: true,
+        tomoHome: mockConfig.tomoHome,
+      });
+      // A table that cannot be parsed: sub-sessions stay unavailable this run.
+      mkdirSync(join(mockConfig.tomoHome, "data"), { recursive: true });
+      writeFileSync(join(mockConfig.tomoHome, "data", "subsessions.json"), "{ not json");
+      const inbox = new DurableInbox({ path: join(mockConfig.tomoHome, "data", "inbox.jsonl") });
+      inbox.accept("telegram", { ...owner("main", { id: "r4", replyToId: "provider-9" }), taskSendsInFlight: ["s7"] },
+        { sessionKey: "dm:alex", replyTarget: { channelName: "telegram", chatId: "12345" }, identityName: "alex" });
+      inbox.close();
+      const ownerTexts: string[] = [];
+      mockSdk.responseFn = (text) => { ownerTexts.push(text); return "ok"; };
+      const agent = new Agent();
+      agent.addChannel(new MockChannel("telegram"));
+      await agent.start();
+      expect(agent.subsessions?.available()).toBe(false);
+      await waitFor(() => expect(ownerTexts.some((x) => x.includes("main"))).toBe(true));
+      expect(ownerTexts.find((x) => x.includes("main"))).toContain("/s s7 <message>");
+      await agent.stop();
+    });
+
     it("leaves /s alone when sub-sessions are off", async () => {
       const { agent, channel } = await boot(false);
       mockSdk.responseFn = () => "ok";
@@ -346,6 +371,10 @@ describe("sub-sessions through the Agent", () => {
     expect(mine).toContain("sub-session s1");
     expect(mine).toContain(INBOX_STALE_NOT_PROCESSED);
     expect(transcript("task:s1")).not.toContain("use plan B");
+    // And the owner's session is told, so the owner hears it never arrived.
+    const told = peekPendingNotes(agent, "dm:alex").find((n) => n.includes("stale-task-message"));
+    expect(told).toContain("use plan B");
+    expect(told).toContain("/s s1");
     await agent.stop();
   });
 

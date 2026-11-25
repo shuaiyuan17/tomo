@@ -1252,13 +1252,15 @@ export class Agent {
    * settled): the owner's session is told the owner may be answering one.
    */
   private warnUnmatchedReply(scope: string, ref: string, taskIds: string[]): void {
-    const sending = taskIds.map((id) => {
-      try { return this.subsessions?.get(id); } catch { return undefined; }
-    }).filter((t): t is NonNullable<typeof t> => !!t);
-    if (sending.length === 0) return;
-    const names = sending.map((t) => `${t.id} ("${t.title}")`).join(", ");
-    const resend = sending.map((t) => `/s ${t.id} <message>`).join(" or ");
-    log.warn({ ref, tasks: sending.map((t) => t.id) }, "Owner reply matched no task while a task send was in flight; it stays with the owner's session");
+    if (!this.subsessions || taskIds.length === 0) return;
+    // Named by id alone when the task table cannot be read (or the task is gone).
+    const names = taskIds.map((id) => {
+      let title: string | undefined;
+      try { title = this.subsessions?.available() ? this.subsessions.get(id)?.title : undefined; } catch { /* unreadable */ }
+      return title ? `${id} ("${title}")` : id;
+    }).join(", ");
+    const resend = taskIds.map((id) => `/s ${id} <message>`).join(" or ");
+    log.warn({ ref, tasks: taskIds }, "Owner reply matched no task while a task send was in flight; it stays with the owner's session");
     this.queuePendingNote(scope, markOwnerAudience(formatTomoEvent("subsession-activity",
       `The owner's next message replies to a message Tomo could not match. Sub-session ${names} was sending a message to the owner at the time, so the owner may be answering it. If so, tell them it reached you instead, and ask them to send it again as ${resend}: only then does it reach the task as their own words.`)));
   }
@@ -1267,8 +1269,8 @@ export class Agent {
   private replayResolution(channelName: string, message: IncomingMessage, resolution: SessionResolution): SessionResolution {
     const scope = this.router.ownerSessionKey();
     const ref = message.replyToId ?? message.reactedToId;
-    if (!this.subsessions?.available() || !scope || !ref || resolution.sessionKey !== scope || message.isGroup) return resolution;
-    const task = this.subsessions.taskForReply(scope, channelName, ref);
+    if (!this.subsessions || !scope || !ref || resolution.sessionKey !== scope || message.isGroup) return resolution;
+    const task = this.subsessions.available() ? this.subsessions.taskForReply(scope, channelName, ref) : undefined;
     if (task) return { ...resolution, sessionKey: task.sessionKey };
     // Sent while a task's send was in flight, and the restart came before it matched.
     this.warnUnmatchedReply(scope, ref, message.taskSendsInFlight ?? []);
@@ -3545,7 +3547,13 @@ export class Agent {
         const owner = isTaskSessionKey(key) ? this.router.ownerSessionKey() : undefined;
         if (owner) {
           recordAt = owner;
-          message = { ...message, text: `[The owner sent this to sub-session ${taskIdFromSessionKey(key) ?? key}; it was too old to deliver after the restart.]\n${message.text}` };
+          const id = taskIdFromSessionKey(key) ?? key;
+          const typed = message.text;
+          message = { ...message, text: `[The owner sent this to sub-session ${id}; it was too old to deliver after the restart.]\n${message.text}` };
+          // And the owner's session is told, so the owner hears it was never delivered.
+          this.queuePendingNote(owner, markOwnerAudience(formatTomoEvent("inbox",
+            `Before Tomo restarted the owner sent this to sub-session ${id}, and it was too old to deliver after the restart, so the task never got it. Tell the owner, and ask whether to send it again (/s ${id} <message>):\n\n${typed}`,
+            { name: "stale-task-message" })));
         }
         stale.set(recordAt, [...(stale.get(recordAt) ?? []), { channel: channel ?? { name: rec.channel }, message, inboxId: rec.id }]);
         continue;

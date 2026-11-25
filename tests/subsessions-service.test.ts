@@ -1422,6 +1422,20 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     }
   });
 
+  it("an owner's start keeps its gate pass through a /compact that runs first", async () => {
+    const h = harness({ maxRunning: 0 }, working((turn, hh) => { if (!turn.bare) hh.service.finish(turn.key, "ok"); }));
+    const t = h.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    h.store.update(t.id, (r) => { r.compactPending = true; });
+    h.service.start();
+    h.quota = 95;
+    expect(h.service.startTask(t.id, "the owner started it")).toBe(true);
+    await flush();
+    // The compact, then its first real turn: not paused at the gate in between.
+    expect(h.turns.some((x) => x.prompt.startsWith("/compact"))).toBe(true);
+    expect(h.turns.some((x) => x.prompt.includes("subsession-start"))).toBe(true);
+    expect(h.store.get(t.id)?.status).toBe("finished");
+  });
+
   it("makes an owner's start that the registry held past the slot cap once it can be read", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {

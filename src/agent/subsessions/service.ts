@@ -1245,7 +1245,7 @@ export class SubsessionService {
       // first passes the wall-clock cap and the quota gate.
       let gate: "run" | "paused" | "again";
       try {
-        gate = this.gateOwnTurn(record);
+        gate = this.gateOwnTurn(record, turn.kind === "compact");
       } catch (err) {
         // The pause could not be written: no turn now (it would run past the
         // gate), and none at once (that would spin); the retry timer asks again.
@@ -1735,9 +1735,10 @@ export class SubsessionService {
    * whose word wakes it. "again": the pause was refused (the owner's input
    * just landed): plan the turn afresh.
    */
-  private gateOwnTurn(record: SubsessionRecord): "run" | "paused" | "again" {
-    // The owner started it (/s start): its first turn is theirs.
-    const startedByOwner = this.ownerStarted.delete(record.id);
+  private gateOwnTurn(record: SubsessionRecord, compact: boolean): "run" | "paused" | "again" {
+    // The owner started it (/s start): its first turn is theirs, and a
+    // /compact before that turn does not use the pass up.
+    const startedByOwner = compact ? this.ownerStarted.has(record.id) : this.ownerStarted.delete(record.id);
     if (startedByOwner || record.status !== "active" || record.pendingInput.some(isOwnerInput)) return "run";
     const capHours = this.deps.config().maxActiveHours;
     if (capHours > 0) {

@@ -123,6 +123,8 @@ function tree(list: WebTask[]): TaskRow[] {
     let end = task.endedAt;
     const later = (at: number | undefined) => { if (at !== undefined && (end === undefined || at > end)) end = at; };
     for (const child of children.get(task.taskId) ?? []) {
+      // A watcher (ambient) is not work it waits on, shown or not (src/web/tasks.ts settledTimes).
+      if (child.ambient) continue;
       if (child.state === "running") { running = true; continue; }
       const sub = settle(child, seen);
       if (sub.running) running = true;

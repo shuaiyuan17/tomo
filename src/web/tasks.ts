@@ -213,10 +213,13 @@ export class TaskBoard {
   private store(sessionId: string, next: Map<string, WebTask>): void {
     // Per session, live tasks first, then the most recently ended.
     const list = [...next.values()];
-    const live = list.filter((task) => task.endedAt === undefined);
-    const done = list.filter((task) => task.endedAt !== undefined).sort((a, b) => b.endedAt! - a.endedAt!);
+    // An ended task whose work runs on counts as live here, so the cap never drops it before that work.
+    const settled = settledTimes(next);
+    const live = list.filter((task) => settled.get(task.taskId) === undefined);
+    const done = list.filter((task) => settled.get(task.taskId) !== undefined)
+      .sort((a, b) => settled.get(b.taskId)! - settled.get(a.taskId)!);
     const kept = [...live, ...done].slice(0, MAX_SESSION_TASKS);
-    this.remember(sessionId, done);
+    this.remember(sessionId, list.filter((task) => task.endedAt !== undefined));
     if (kept.length) this.sessions.set(sessionId, new Map(kept.map((task) => [task.taskId, task])));
     else this.sessions.delete(sessionId);
     this.publish();
@@ -331,13 +334,16 @@ export class TaskBoard {
  * work it started (its listed descendants), whichever is later; undefined
  * while it or any of that work still runs. An ended subagent whose background
  * command runs on stays listed (the rail shows it working) and leaves the
- * retention window after the last of it ends. Parent cycles are cut.
+ * retention window after the last of it ends. Ambient descendants (watchers)
+ * are not counted, as the rail does not count them (web/src/tasks.ts).
+ * Parent cycles are cut.
  */
 export function settledTimes(tasks: ReadonlyMap<string, WebTask>): Map<string, number | undefined> {
   const children = new Map<string, WebTask[]>();
   for (const task of tasks.values()) {
     const parent = task.parentTaskId;
-    if (parent && parent !== task.taskId && tasks.has(parent)) children.set(parent, [...(children.get(parent) ?? []), task]);
+    // Watchers (ambient) do not hold their parent: the rail does not show them as its work by default.
+    if (parent && parent !== task.taskId && tasks.has(parent) && !task.ambient) children.set(parent, [...(children.get(parent) ?? []), task]);
   }
   const result = new Map<string, number | undefined>();
   const visiting = new Set<string>();

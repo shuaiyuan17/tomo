@@ -72,6 +72,9 @@ describe("task panel view", () => {
     expect(ended.childrenRunning).toBeUndefined();
     expect(ended.settledAt).toBe(245_000);
     expect(rowElapsed(ended, 300_000)).toBe(245_000);
+    // A watcher under it does not count, shown or not.
+    const watched = buildTaskView([task("agent", { state: "completed", endedAt: 6_000 }), task("w", { taskType: "monitor", ambient: true, parentTaskId: "agent" })], sessions, true);
+    expect(watched.groups[0].rows[0].childrenRunning).toBeUndefined();
     // A parent cycle does not loop.
     expect(() => buildTaskView([task("a", { state: "completed", endedAt: 1, parentTaskId: "b" }), task("b", { state: "completed", endedAt: 1, parentTaskId: "a" })], sessions, false)).not.toThrow();
   });

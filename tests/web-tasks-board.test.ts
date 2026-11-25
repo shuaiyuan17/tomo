@@ -63,11 +63,29 @@ describe("TaskBoard", () => {
     b.dispose();
   });
 
+  it("the per-session cap never drops an ended task whose work still runs", () => {
+    vi.useFakeTimers({ now: 10_000 });
+    const { b } = board();
+    const child = task("c", { taskType: "local_bash", parentTaskId: "p", startedAt: 2_000 });
+    b.apply("s1", [task("p", { startedAt: 1_000 }), child]);
+    b.apply("s1", [child]);
+    // Many more tasks end after it.
+    for (let i = 0; i < MAX_SESSION_TASKS + 5; i++) {
+      vi.advanceTimersByTime(10);
+      b.apply("s1", [child, task(`x${i}`)]);
+      b.apply("s1", [child]);
+    }
+    expect(b.snapshot().map((t) => t.taskId)).toContain("p");
+    b.dispose();
+  });
+
   it("settles a task at its own end or its descendants' last, never while one runs", () => {
     const t = (id: string, extra: Partial<WebTask> = {}): WebTask => ({ sessionId: "s", taskId: id, taskType: "local_agent", description: id, ambient: false, startedAt: 0, state: "completed", endedAt: 5, ...extra });
     const map = (...list: WebTask[]) => new Map(list.map((x) => [x.taskId, x]));
     expect(settledTimes(map(t("p"), t("c", { parentTaskId: "p", endedAt: 9 })))).toEqual(new Map([["p", 9], ["c", 9]]));
     expect(settledTimes(map(t("p"), t("c", { parentTaskId: "p", state: "running", endedAt: undefined }))).get("p")).toBeUndefined();
+    // A watcher does not hold its parent.
+    expect(settledTimes(map(t("p"), t("w", { parentTaskId: "p", ambient: true, state: "running", endedAt: undefined }))).get("p")).toBe(5);
     // A parent cycle is cut, not followed forever.
     expect(settledTimes(map(t("a", { parentTaskId: "b" }), t("b", { parentTaskId: "a" }))).get("a")).toBe(5);
   });

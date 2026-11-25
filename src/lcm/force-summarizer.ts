@@ -36,6 +36,17 @@ export interface ForceSummarizerOptions {
   timeoutMs?: number;
   /** Shutdown: aborts the call. */
   signal?: AbortSignal;
+  /** What the call cost, from its SDK result (success or not): for the usage ledger. */
+  onUsage?: (u: ForceSummaryUsage) => void;
+}
+
+export interface ForceSummaryUsage {
+  costUsd: number;
+  tokens: { input: number; output: number; cacheRead: number; cacheCreated: number };
+  durationMs?: number;
+  numTurns?: number;
+  subtype: string;
+  model: string;
 }
 
 /** Build the summary function `forceCompactSession` is given. Throws on any failure (the caller falls back to archiving). */
@@ -87,6 +98,22 @@ export function sdkForceSummarizer(opts: ForceSummarizerOptions): (stretch: Stre
       let text = "";
       for await (const msg of q) {
         if (msg.type === "result") {
+          const r = msg as unknown as { total_cost_usd?: number; usage?: Record<string, number>; duration_ms?: number; num_turns?: number; subtype: string };
+          try {
+            opts.onUsage?.({
+              costUsd: r.total_cost_usd ?? 0,
+              tokens: {
+                input: r.usage?.input_tokens ?? 0, output: r.usage?.output_tokens ?? 0,
+                cacheRead: r.usage?.cache_read_input_tokens ?? 0, cacheCreated: r.usage?.cache_creation_input_tokens ?? 0,
+              },
+              ...(r.duration_ms !== undefined ? { durationMs: r.duration_ms } : {}),
+              ...(r.num_turns !== undefined ? { numTurns: r.num_turns } : {}),
+              subtype: r.subtype,
+              model,
+            });
+          } catch (err) {
+            log.warn({ err: errorMessage(err) }, "Forced compaction: could not record the summary call's usage");
+          }
           if (msg.subtype !== "success" || msg.is_error) {
             const detail = msg.subtype === "success" ? msg.result : (msg as { errors?: string[] }).errors?.join("; ");
             throw new Error(`summary call failed (${msg.subtype}): ${detail ?? "no detail"}`);

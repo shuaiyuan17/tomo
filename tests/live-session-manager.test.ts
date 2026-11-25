@@ -2140,12 +2140,13 @@ describe("LiveSessionManager forced compaction", () => {
     const manager = new LiveSessionManager(makeDeps({ onContextOverflow }));
     mockState.sendImpl = async () => { throw new SdkResultError("Prompt is too long", "success"); };
     await expect(manager.runWithRetry({ key: "dm:owner", prompt: "hi" })).rejects.toThrow("Prompt is too long");
-    expect(onContextOverflow).toHaveBeenCalledWith("dm:owner", null, "prompt-too-long");
+    expect(onContextOverflow.mock.calls).toEqual([["dm:owner", null, "prompt-too-long"]]);
 
     onContextOverflow.mockClear();
     mockState.sendImpl = async () => { throw new SdkResultError("API Error: 500 overloaded", "success"); };
     await expect(manager.runWithRetry({ key: "dm:owner", prompt: "hi" })).rejects.toThrow("overloaded");
-    expect(onContextOverflow).not.toHaveBeenCalledWith("dm:owner", expect.anything(), "prompt-too-long");
+    // Reported once, as what it was: neither a normal end nor a size refusal.
+    expect(onContextOverflow.mock.calls.map((c) => c[2])).toEqual(["turn-failed"]);
   });
 
   it("holds the key: a turn waits, the live session is closed after beforeClose, and the turn runs on a new session after release", async () => {

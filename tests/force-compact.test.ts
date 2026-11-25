@@ -205,17 +205,40 @@ describe("selectOldestStretch", () => {
     expect(s2.text).toContain("Morning: decided X.");
   });
 
-  it("extends the stretch through a same-day block that sits AFTER it (the rewrite would remove what lies between)", () => {
+  it("takes only a run of raw events: stops at any block, and never tags it so a later same-day block is absorbed", () => {
     const b = build({ chars: 4000 });
     const events = fileEvents(b.sessionId);
-    const lastOf22 = events.findIndex((e) => e.uuid === b.uuidsByDay.get(22)!.at(-1));
-    events.splice(lastOf22 + 1, 0, { type: "user", uuid: "late", isCompactSummary: true, blockTag: "daily 2026-11-22", timestamp: DAY(22, 23, 0), message: { role: "user", content: "[daily 2026-11-22]\n\nevening" } });
-    const s = selectOldestStretch(events, { freshTail: 4, maxInputTokens: 3_000 })!;
-    expect(s.blockTag).toBe("daily 2026-11-22");
-    // Every raw event the expansion removes was in the summary input.
-    expect(s.lastUuid).toBe(b.uuidsByDay.get(22)!.at(-1));
-    expect(s.text).toContain(`day 22 #${5}`);
-    expect(s.existingBlock).toBe("evening");
+    const day22 = b.uuidsByDay.get(22)!;
+    const at = events.findIndex((e) => e.uuid === day22[6]);
+    events.splice(at, 0,
+      { type: "user", uuid: "wk", isCompactSummary: true, blockTag: "weekly 2026-W47", timestamp: DAY(22, 12, 0), message: { role: "user", content: "[weekly]\n\nWEEKLY-TEXT" } },
+      { type: "user", uuid: "late", isCompactSummary: true, blockTag: "daily 2026-11-22", timestamp: DAY(22, 12, 1), message: { role: "user", content: "[daily]\n\nevening" } });
+    const s = selectOldestStretch(events, { freshTail: 4, maxInputTokens: 150_000 })!;
+    const range = events.filter((e) => e.type === "user" || e.type === "assistant").slice(s.fromConv, s.toConv + 1);
+    expect(range.some((e) => e.isCompactSummary)).toBe(false);
+    expect(s.lastUuid).toBe(day22[5]);
+    // The day's own block sits after the run: the day's tag would make the rewrite absorb it (and the weekly between).
+    expect(s.blockTag).toBeUndefined();
+    expect(s.text).not.toContain("WEEKLY-TEXT");
+  });
+
+  it("does not end a run on a tool call whose result sits behind a summary block", () => {
+    const b = build({ chars: 4000 });
+    const events = fileEvents(b.sessionId);
+    const resultAt = events.findIndex((e) => JSON.stringify(e.message?.content ?? "").includes("tool_result"));
+    events.splice(resultAt, 0, { type: "user", uuid: "blk", isCompactSummary: true, blockTag: "weekly 2026-W47", timestamp: DAY(22, 9, 2), message: { role: "user", content: "[weekly]" } });
+    const s = selectOldestStretch(events, { freshTail: 4, maxInputTokens: 150_000 });
+    const call = events[resultAt - 1];
+    expect(JSON.stringify(call.message.content)).toContain("tool_use");
+    expect(s?.lastUuid).not.toBe(call.uuid);
+  });
+
+  it("starts on a turn boundary, never on a leftover tool result", () => {
+    const b = build();
+    const events = fileEvents(b.sessionId);
+    const resultAt = events.findIndex((e) => JSON.stringify(e.message?.content ?? "").includes("tool_result"));
+    const s = selectOldestStretch(events.slice(resultAt), { freshTail: 4, maxInputTokens: 150_000 })!;
+    expect(s.firstUuid).not.toBe(events[resultAt].uuid);
   });
 
   it("starts after the last SDK compact boundary (nothing before it is on the chain)", () => {

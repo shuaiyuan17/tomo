@@ -82,7 +82,8 @@ export interface StretchForSummary {
 }
 
 interface Stretch extends StretchForSummary {
-  blockTag: string;
+  /** Undefined: written untagged (a same-day block elsewhere would be absorbed by the day's tag). */
+  blockTag?: string;
   fromConv: number;
   toConv: number;
   firstUuid?: string;
@@ -117,7 +118,7 @@ export interface ForceCompactStep {
   from: string;
   to: string;
   events: number;
-  blockTag: string;
+  blockTag?: string;
 }
 
 export interface ForceCompactReport {
@@ -202,9 +203,18 @@ export function selectOldestStretch(events: Ev[], opts: { freshTail: number; max
   }
   const tailStart = globalFreshTailStartIdx(events.slice(boundary) as never, opts.freshTail) + boundary;
   const isConv = (e: Ev) => e.type === "user" || e.type === "assistant";
+  // The run starts at the oldest raw event that opens a turn (never a tool
+  // result, never the middle of one assistant message); a summary block in
+  // front of it is never part of it.
   let start = -1;
   for (let i = boundary; i < tailStart; i++) {
-    if (isConv(events[i]) && !events[i].isCompactSummary) { start = i; break; }
+    const e = events[i];
+    if (!isConv(e) || e.isCompactSummary || isToolResultTurn(e)) continue;
+    let prev: Ev | undefined;
+    for (let j = i - 1; j >= boundary; j--) if (isConv(events[j])) { prev = events[j]; break; }
+    if (e.type === "assistant" && prev?.type === "assistant" && !!e.message?.id && prev.message?.id === e.message.id) continue;
+    start = i;
+    break;
   }
   if (start < 0) return null;
   const day = events[start].timestamp ? localDateTag(new Date(events[start].timestamp!)) : undefined;
@@ -217,11 +227,7 @@ export function selectOldestStretch(events: Ev[], opts: { freshTail: number; max
   for (let i = start; i < tailStart; i++) {
     const e = events[i];
     if (!isConv(e)) continue;
-    if (e.isCompactSummary) {
-      if (e.blockTag === blockTag) continue; // absorbed by the rewrite's own expansion
-      wholeDay = false;
-      break;
-    }
+    if (e.isCompactSummary) { wholeDay = false; break; } // a run of raw events only: stop at any block
     if (e.timestamp && localDateTag(new Date(e.timestamp)) !== day) break;
     const t = estimateTokens(renderEventForSummary(e));
     if (included.length > 0 && tokens + t > opts.maxInputTokens) { wholeDay = false; break; }
@@ -241,8 +247,10 @@ export function selectOldestStretch(events: Ev[], opts: { freshTail: number; max
     wholeDay = false;
   }
 
+  // The next RAW event: a summary block in between does not pair anything,
+  // so a tool result behind it is still orphaned by removing its call.
   const nextConv = (after: number): Ev | undefined => {
-    for (let i = after + 1; i < events.length; i++) if (isConv(events[i])) return events[i];
+    for (let i = after + 1; i < events.length; i++) if (isConv(events[i]) && !events[i].isCompactSummary) return events[i];
     return undefined;
   };
   const badCut = (endIdx: number): boolean => {
@@ -275,31 +283,32 @@ export function selectOldestStretch(events: Ev[], opts: { freshTail: number; max
   let conv = 0;
   const convIdx = new Map<number, number>();
   for (let i = 0; i < events.length; i++) if (isConv(events[i])) convIdx.set(i, conv++);
-  // The rewrite absorbs every block with the same tag, and everything between
-  // it and the range. A same-day block BEFORE the stretch only spans non-raw
-  // events (the stretch starts at the oldest raw one). One AFTER it would pull
-  // in raw events the summary call never saw: the stretch is extended through
-  // them instead (past the input cap if need be — a summary call that cannot
-  // take it fails, and the archive fallback keeps the block's text), and
-  // refused when that would reach into the fresh tail.
-  const sameDay = events.map((e, i) => (e.isCompactSummary && e.blockTag === blockTag ? i : -1)).filter((i) => i >= 0);
-  const laterBlock = sameDay.filter((i) => i > chosen[chosen.length - 1]).pop();
-  if (laterBlock !== undefined) {
-    if (laterBlock >= tailStart) return null;
-    for (let i = chosen[chosen.length - 1] + 1; i < laterBlock; i++) {
-      if (isConv(events[i]) && !events[i].isCompactSummary) chosen.push(i);
-    }
-    wholeDay = false;
-  }
+  // No extension, ever: the range is exactly the raw run the summary call
+  // reads. But the rewrite ABSORBS every block carrying the tag it is given
+  // (and everything between it and the range). So the day's tag is used only
+  // when each same-day block sits directly in front of the run, with nothing
+  // but other such blocks (and non-conversation records) in between — then
+  // its text is merged into the input. Anywhere else, the block is written
+  // untagged, and nothing outside the range can be absorbed.
   const first = chosen[0];
   const last = chosen[chosen.length - 1];
-  const existingBlock = sameDay
+  const sameDay = events.map((e, i) => (e.isCompactSummary && e.blockTag === blockTag ? i : -1)).filter((i) => i >= 0);
+  const adjacent = sameDay.every((b) => {
+    if (b > first) return false;
+    for (let i = b + 1; i < first; i++) {
+      const e = events[i];
+      if (isConv(e) && !(e.isCompactSummary && e.blockTag === blockTag)) return false;
+    }
+    return true;
+  });
+  const tag = adjacent ? blockTag : undefined;
+  const existingBlock = (tag ? sameDay : [])
     .map((i) => textOfContent(events[i].message?.content, "\n").replace(/^\[[^\]\n]*\]\s*/, "").trim())
     .filter(Boolean).join("\n\n") || undefined;
   const lines = chosen.map((i) => renderEventForSummary(events[i])).filter(Boolean);
   if (existingBlock) lines.unshift(`[earlier summary of ${day}, to be merged into the new block]\n${existingBlock}`);
   return {
-    blockTag,
+    blockTag: tag,
     fromConv: convIdx.get(first)!,
     toConv: convIdx.get(last)!,
     firstUuid: events[first].uuid,

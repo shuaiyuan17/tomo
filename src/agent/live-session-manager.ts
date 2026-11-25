@@ -246,7 +246,7 @@ export interface LiveSessionManagerDeps {
    * (agent/force-compactor.ts)? True when a forced compaction was started —
    * then the nudge ladder is skipped for this turn. Absent: never.
    */
-  onContextOverflow?(key: string, reading: QueryResult | null, reason: "threshold" | "prompt-too-long"): boolean;
+  onContextOverflow?(key: string, reading: QueryResult | null, reason: "threshold" | "prompt-too-long" | "turn-failed"): boolean;
   /**
    * A mounted external MCP server rejected a tool call for authorization
    * reasons: refresh its OAuth token (non-interactively) so the refreshed
@@ -1640,12 +1640,11 @@ export class LiveSessionManager {
       // A failed resume ran nothing and is about to be retried: recording it
       // would count one turn twice and persist nothing useful.
       if (err instanceof SdkResultError && !err.isResumeMissing) {
-        this.recordTurnCompletion(key, session);
         // The CLI refused the turn for size (often locally, with no API call):
-        // the session cannot run another one, at any usage reading.
-        if (isContextOverflowError(err.message) || err.errors.some(isContextOverflowError)) {
-          this.deps.onContextOverflow?.(key, session.lastResult, "prompt-too-long");
-        }
+        // the session cannot run another one, at any usage reading. Any other
+        // error result is told as such: neither may pass for a normal end.
+        const overflow = isContextOverflowError(err.message) || err.errors.some(isContextOverflowError);
+        this.recordTurnCompletion(key, session, overflow ? "prompt-too-long" : "turn-failed");
       }
       throw err;
     }
@@ -1654,7 +1653,7 @@ export class LiveSessionManager {
     return response;
   }
 
-  private recordTurnCompletion(key: string, session: LiveSession): void {
+  private recordTurnCompletion(key: string, session: LiveSession, outcome: "threshold" | "prompt-too-long" | "turn-failed" = "threshold"): void {
     // Capture session ID if new — or if an earlier capture could not be
     // persisted. The registry may refuse a link change while its file is
     // unreadable (SessionRegistryReadError); by the time we are here the model
@@ -1725,7 +1724,7 @@ export class LiveSessionManager {
 
     // Past lcm.forceCompactAtPct the harness compacts the session itself;
     // the nudge would only ask a model that has no room left.
-    if (this.deps.onContextOverflow?.(key, session.lastResult, "threshold")) return;
+    if (this.deps.onContextOverflow?.(key, session.lastResult, outcome)) return;
 
     // Fire-and-forget context-pressure check — don't block the current
     // reply on the nudge. Pass this turn's result explicitly.

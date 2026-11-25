@@ -208,7 +208,10 @@ describe("ForceCompactor run", () => {
     await fc.running("dm:owner");
     expect(a.deps.notifyOwner).not.toHaveBeenCalled();
     // A locally refused turn: no tokens, then the prompt-too-long call.
-    fc.maybeStart("dm:owner", reading(990, 1000, false, 0), "threshold");
+    // Another kind of failed turn judges nothing.
+    fc.maybeStart("dm:owner", reading(300), "turn-failed");
+    expect(a.deps.notifyOwner).not.toHaveBeenCalled();
+    fc.maybeStart("dm:owner", reading(990, 1000, false, 0), "prompt-too-long");
     await vi.waitFor(() => expect(a.deps.notifyOwner).toHaveBeenCalledTimes(1));
     expect(String(a.deps.notifyOwner.mock.calls[0][0])).toMatch(/still refused/);
     expect(log.error).toHaveBeenCalledWith(expect.objectContaining({ result: "still-over" }), "Forced compaction result");
@@ -222,6 +225,18 @@ describe("ForceCompactor run", () => {
     expect(log.info).toHaveBeenCalledWith(expect.objectContaining({ result: "recovered" }), "Forced compaction result");
     fc2.maybeStart("dm:owner", reading(300), "threshold");
     expect(b.deps.notifyOwner).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the ledger cut-off until a CLI that outlived the close has exited", async () => {
+    let exit!: () => void;
+    const untilExit = new Promise<void>((r) => { exit = r; });
+    const { deps } = makeDeps({ quiesce: vi.fn(async (h: { untilExit?: Promise<void> }, beforeClose: () => boolean) => { beforeClose(); h.untilExit = untilExit; return null; }) as never });
+    const fc = new ForceCompactor(deps);
+    fc.maybeStart("dm:owner", reading(990), "threshold");
+    await fc.running("dm:owner");
+    expect(deps.sessionClosed).not.toHaveBeenCalled();
+    exit();
+    await vi.waitFor(() => expect(deps.sessionClosed).toHaveBeenCalledWith("dm:owner"));
   });
 
   it("tells the session about an archive fallback and a still-high result", () => {

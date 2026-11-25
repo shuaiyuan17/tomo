@@ -82,7 +82,7 @@ import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/bl
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { appendToTomoEventBody, formatTomoEvent, markOwnerAudience } from "./tomo-event.js";
-import { UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
+import { USAGE_LEDGER_VERSION, UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
 import { usageDataDir } from "./usage/dir.js";
 import { readSessionWindowPercent } from "./usage/limits-log.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
@@ -487,7 +487,7 @@ export class Agent {
       quiesce: (hold, beforeClose) => this.liveSessionManager.quiesceForForceCompact(hold, beforeClose),
       markInterrupted: (key) => this.runningAgents ? this.runningAgents.markSessionInterrupted(key) : [],
       sessionClosed: (key) => this.runningAgents?.sessionClosed(key),
-      compact: ({ sdkSessionId, contextUsed, contextMax, signal }) => forceCompactSession({
+      compact: ({ key, sdkSessionId, contextUsed, contextMax, signal }) => forceCompactSession({
         sdkSessionId,
         sdkSessionsDir: config.sdkSessionsDir,
         sessionsDir: config.sessionsDir,
@@ -495,7 +495,19 @@ export class Agent {
         contextUsed,
         contextMax,
         freshTail: config.lcm.dailyFreshTail,
-        summarize: sdkForceSummarizer({ model: config.lcm.forceCompactModel, signal }),
+        summarize: sdkForceSummarizer({
+          model: config.lcm.forceCompactModel,
+          signal,
+          // A separate CLI, outside LiveSession's recorder: its cost lands in
+          // the usage ledger under the session it compacted.
+          onUsage: (u) => void this.usageLedger.append({
+            v: USAGE_LEDGER_VERSION, ts: Date.now(), sessionKey: key, source: "background", trigger: "force-compact",
+            ...(u.subtype !== "success" ? { subtype: u.subtype } : {}),
+            costUsd: u.costUsd, tokens: u.tokens,
+            ...(u.durationMs !== undefined ? { durationMs: u.durationMs } : {}),
+            ...(u.numTurns !== undefined ? { numTurns: u.numTurns } : {}),
+          }),
+        }),
         signal,
       }),
       persistedWindow: (key) => this.sessions.getEntry(key)?.stats?.contextMax,

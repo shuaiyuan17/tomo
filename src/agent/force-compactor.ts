@@ -62,7 +62,8 @@ export interface ForceCompactorDeps {
   now?: () => number;
 }
 
-export type ForceCompactReason = "threshold" | "prompt-too-long";
+/** threshold: a turn that reached its result; prompt-too-long: refused for size; turn-failed: any other error result (judges nothing). */
+export type ForceCompactReason = "threshold" | "prompt-too-long" | "turn-failed";
 
 export class ForceCompactor {
   private inFlight = new Map<string, Promise<void>>();
@@ -116,6 +117,7 @@ export class ForceCompactor {
   maybeStart(key: string, reading: QueryResult | null, reason: ForceCompactReason): boolean {
     if (!ForceCompactor.enabled() || this.shutdown.signal.aborted) return false;
     this.verify(key, reading, reason);
+    if (reason === "turn-failed") return false;
     const real = reading && !reading.contextEstimated && reading.contextMax > 0 ? reading : null;
     if (real) this.windows.set(key, real.contextMax);
     if (this.inFlight.has(key)) return true;
@@ -177,7 +179,8 @@ export class ForceCompactor {
     } catch (err) {
       failure = errorMessage(err);
     } finally {
-      this.deps.sessionClosed(key);
+      // The ledger ignores the cut-off tasks until the old CLI is really gone.
+      void (hold.untilExit ?? Promise.resolve()).then(() => this.deps.sessionClosed(key));
       // Still inside the hold: the notes are on disk before any turn can run.
       // (A resume turn queued here waits for the hold like any other turn.)
       try {
@@ -232,10 +235,12 @@ export class ForceCompactor {
     const pending = this.pendingVerify.get(key);
     if (!pending || this.inFlight.has(key)) return;
     const reachedApi = !!reading && reading.inputTokens + reading.cacheReadTokens + reading.cacheCreationTokens > 0;
-    // A turn with no tokens in never reached the API: the CLI refused it locally.
-    if (reason === "threshold" && reading === null) return;
+    // Judged once, on the turn's real outcome: a turn that ended normally
+    // after reaching the API recovered; one refused for size is still over.
+    // Any other failure says nothing about size — wait for the next turn.
+    if (reason === "turn-failed" || (reason === "threshold" && !reachedApi)) return;
     this.pendingVerify.delete(key);
-    const recovered = reason === "threshold" && reachedApi;
+    const recovered = reason === "threshold";
     const t = ownerT("notices");
     log[recovered ? "info" : "error"]({ key, result: recovered ? "recovered" : "still-over", before: pending.before, after: pending.after }, "Forced compaction result");
     const text = recovered ? pending.notice : t("forceCompact.stillOver", { session: pending.session, before: pending.before, after: pending.after });
@@ -277,7 +282,7 @@ export function sessionNote(
     : `the context reached ${args.beforePct}%`;
   const done: string[] = [];
   if (report.pruned) done.push(`pruned ${report.pruned.entries} bulky tool results / images`);
-  for (const s of report.summarized) done.push(`summarized ${s.from} → ${s.to} (${s.events} events) into the "${s.blockTag}" block, written by a separate summary model`);
+  for (const s of report.summarized) done.push(`summarized ${s.from} → ${s.to} (${s.events} events) into ${s.blockTag ? `the "${s.blockTag}" block` : "an untagged summary block"}, written by a separate summary model`);
   for (const s of report.archived) done.push(`archived ${s.from} → ${s.to} (${s.events} events) without a summary — use \`tomo lcm search\` to recall it`);
   if (done.length === 0) done.push("found nothing to remove");
   const lines = [

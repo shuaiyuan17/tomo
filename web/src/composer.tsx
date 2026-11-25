@@ -175,7 +175,8 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
     return () => observer.disconnect();
   }, []);
 
-  const canSend = writable && canSendWith(draft, attachments.items) && !sending && !restoring && !uncertain && live;
+  // After a reload, the tray's kept uploads are still coming back: a send now would leave them behind.
+  const canSend = writable && canSendWith(draft, attachments.items) && !sending && !restoring && !attachments.restoring && !uncertain && live;
 
   const send = async (event: FormEvent) => {
     event.preventDefault();
@@ -368,7 +369,7 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
         <Square fill="currentColor" strokeWidth={0} /></Button> :
       <Button type="submit" size="icon" aria-label={i18n.t("chat:composer.send")} aria-busy={sending}
         className={cn(COMPOSER_SEND, "[&_svg:not([class*='size-'])]:size-[18px]")}
-        title={restoring ? i18n.t("chat:composer.restoring") : undefined} disabled={!canSend}><ArrowUp strokeWidth={2.2} /></Button>}
+        title={restoring || attachments.restoring ? i18n.t("chat:composer.restoring") : undefined} disabled={!canSend}><ArrowUp strokeWidth={2.2} /></Button>}
     </form>
     {uncertain && !sending && <div className="mt-2 flex flex-wrap gap-2"><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => void checkOutcome()}>{i18n.t("chat:composer.check")}</Button><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { remember(null); setFeedback(deferred.t("chat:composer.keptNote")); }}>{i18n.t("chat:composer.keep")}</Button></div>}
   </div>;

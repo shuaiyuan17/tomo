@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { WebBootstrap } from "./api.js";
 import { ApiError, discardUpload, readStagedUpload, uploadImage } from "./api.js";
 import type { WebFiledFile } from "../../src/web/protocol.js";
-import { addFiles, filedAttachment, MAX_ATTACHMENTS, isAttachableImage, keptUploads, parseKeptUploads, replaceItems, restoredAttachment, takeSent, updateAttachment, type Attachment } from "./uploads.js";
+import { addFiles, filedAttachment, MAX_ATTACHMENTS, type KeptUpload, isAttachableImage, keptUploads, parseKeptUploads, replaceItems, restoredAttachment, takeSent, updateAttachment, type Attachment } from "./uploads.js";
 import { deferred, type Message } from "./i18n/message.js";
 
 const failure = (error: unknown) => {
@@ -37,11 +37,15 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
   const storageKey = targetId ? `tomo-tray:${targetId}` : undefined;
   const kept = useRef(storageKey);
   kept.current = storageKey;
+  /** Kept uploads a restore could not read back (a network error): still kept, for the next reload. */
+  const unresolved = useRef<KeptUpload[]>([]);
+  /** True while a reload's kept uploads are being read back: Send waits, or the message would go without them. */
+  const [restoring, setRestoring] = useState(false);
   const commit = useCallback((change: (current: readonly Attachment[]) => Attachment[]) => {
     list.current = change(list.current);
     setItems(list.current);
     if (kept.current) {
-      const keep = keptUploads(list.current);
+      const keep = [...keptUploads(list.current), ...unresolved.current.filter((u) => !list.current.some((item) => item.uploadId === u.uploadId))];
       try { if (keep.length) sessionStorage.setItem(kept.current, JSON.stringify(keep)); else sessionStorage.removeItem(kept.current); }
       catch { /* Storage can be unavailable: the tray just does not survive a reload. */ }
     }
@@ -140,23 +144,35 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
     let wanted: ReturnType<typeof parseKeptUploads>;
     try { wanted = parseKeptUploads(sessionStorage.getItem(storageKey)); } catch { return; }
     if (!wanted.length) return;
-    void Promise.all(wanted.map(async (item) => {
-      try {
-        const found = await readStagedUpload(item.uploadId);
-        if (!found) return null;
-        return found.kind === "image" ? restoredAttachment("", item, URL.createObjectURL(found.blob), found.blob.size)
-          : restoredAttachment("", { ...item, kind: "file" }, "", found.size);
-      } catch { return null; }
-    })).then((back) => {
+    setRestoring(true);
+    const failed: KeptUpload[] = [];
+    // A few tries each: a 404 can be a claim that is about to be released (a send that failed),
+    // and a network error is not an answer. What still errs stays kept; only a settled 404 drops it.
+    const readBack = async (item: KeptUpload): Promise<Attachment | null> => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const found = await readStagedUpload(item.uploadId);
+          if (found) return found.kind === "image" ? restoredAttachment("", item, URL.createObjectURL(found.blob), found.blob.size)
+            : restoredAttachment("", { ...item, kind: "file" }, "", found.size);
+          if (attempt >= 2) return null;
+        } catch {
+          if (attempt >= 2) { failed.push(item); return null; }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+      }
+    };
+    void Promise.all(wanted.map(readBack)).then((back) => {
       const items = back.filter((item): item is Attachment => !!item);
+      if (kept.current === storageKey) unresolved.current = failed;
       // Another conversation by now (or a full tray): what did not go back stays staged until it expires.
       const fits = kept.current === storageKey ? items.filter((item) => !list.current.some((entry) => entry.uploadId === item.uploadId))
         .slice(0, Math.max(0, MAX_ATTACHMENTS - list.current.length)) : [];
       for (const item of items) if (!fits.includes(item) && item.preview) URL.revokeObjectURL(item.preview);
-      if (fits.length) commit((old) => [...fits.map((item) => ({ ...item, key: `a${++counter.current}` })), ...old]);
-    });
+      // Committed even when nothing came back: storage then holds exactly what is still kept.
+      if (kept.current === storageKey) commit((old) => [...fits.map((item) => ({ ...item, key: `a${++counter.current}` })), ...old]);
+    }).finally(() => setRestoring(false));
   }, [storageKey, commit]);
 
   useEffect(() => () => { for (const controller of aborts.current.values()) controller.abort(); }, []);
-  return { items, note, add, replaceAll, remove, retry, take };
+  return { items, note, add, replaceAll, remove, retry, take, restoring };
 }

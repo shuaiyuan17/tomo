@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
@@ -141,6 +141,29 @@ describe("interrupted subagents across a restart", () => {
     const third = await boot();
     await waitFor(() => expect(notices("imessage:706").some((p) => p.text.includes("ratelimited706"))).toBe(true));
     await third.agent.stop();
+  });
+
+  it("with the pending notes unreadable at start, the check waits, then tells the session once they read", async () => {
+    const first = await boot();
+    await haveSession(first.channel, "707");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:707", tasks: [task("unreadable707")] });
+    crash(first.agent);
+
+    const notesFile = join(mockConfig.sessionsDir, "_pending_notes.json");
+    mkdirSync(notesFile); // reads fail with EISDIR
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = async () => "ok";
+    const second = await boot();
+    await expectNoChangeFor(() => expect(notices("imessage:707")).toEqual([]), 50);
+    // Not acknowledged: nothing could be written for it.
+    expect(JSON.parse(readFileSync(ledgerPath(), "utf8")).interrupted.map((r: { taskId: string }) => r.taskId)).toEqual(["unreadable707"]);
+
+    rmSync(notesFile, { recursive: true });
+    (second.agent as unknown as { retryInterruptedAgentsNotes(keys: Set<string>): void })
+      .retryInterruptedAgentsNotes(new Set(["imessage:707"]));
+    await waitFor(() => expect(notices("imessage:707").some((p) => p.text.includes("unreadable707"))).toBe(true));
+    expect(JSON.parse(readFileSync(ledgerPath(), "utf8")).interrupted).toEqual([]);
+    await second.agent.stop();
   });
 
   it("only the session that owned the agent is told", async () => {

@@ -326,6 +326,13 @@ export class PendingNotesQueue {
     return this.unloaded.has(sessionKey) ? whenUnreadable : false;
   }
 
+  /** Can the session's stored notes be read (tried again now if they could
+   *  not)? While false, what this queue says about them covers memory only. */
+  storedReadable(sessionKey: string): boolean {
+    this.queued(sessionKey);
+    return !this.unloaded.has(sessionKey);
+  }
+
   /** Queued durable notes, without draining. Only the ones in memory while
    *  the session's stored notes cannot be read. */
   peekNotes(sessionKey: string): string[] {

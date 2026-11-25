@@ -135,6 +135,8 @@ const REWIND_SHUTDOWN_TIMEOUT_MS = 3_000;
  * than a "first N keys" counter because it needs no hook on the message path.
  */
 const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
+/** How often the interrupted-subagents startup check is retried for sessions whose pending notes could not be read. */
+const INTERRUPTED_AGENTS_RETRY_MS = 60_000;
 
 /**
  * How long a reply that matches no task waits for task sends still in flight
@@ -244,6 +246,8 @@ export class Agent {
   /** Re-logs the full migration status once, after the first keys have been
    *  touched (see `start`). Unref'd, and cleared by `stop`. */
   private migrationStatusTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Re-runs the interrupted-subagents startup check for sessions whose pending notes could not be read. */
+  private interruptedAgentsRetryTimer: ReturnType<typeof setTimeout> | undefined;
   /** The most recent sweep — awaited (bounded) by stop() so none is abandoned mid-write. */
   private mcpSweepInFlight: Promise<void> | undefined;
 
@@ -3348,6 +3352,10 @@ export class Agent {
       clearInterval(this.mcpTokenRefreshTimer);
       this.mcpTokenRefreshTimer = undefined;
     }
+    if (this.interruptedAgentsRetryTimer) {
+      clearTimeout(this.interruptedAgentsRetryTimer);
+      this.interruptedAgentsRetryTimer = undefined;
+    }
     if (this.migrationStatusTimer) {
       clearTimeout(this.migrationStatusTimer);
       this.migrationStatusTimer = undefined;
@@ -3601,28 +3609,88 @@ export class Agent {
     const ledger = this.runningAgents;
     if (!ledger) return;
     const known = new Set(this.sessions.listActiveEntries().map((e) => e.channelKey));
+    // A session whose stored notes cannot be read is settled later, once
+    // they read (`retryInterruptedAgentsNotes`): until then neither "a note
+    // is owed" nor "none is" is known, and a new note could not be written.
+    const unreadable = new Set([...known].filter((key) => !this.pendingNotesQueue.storedReadable(key)));
     // A note an earlier start handed off but no turn finished with is still
     // owed: give it its turn again now, not only at the next message.
-    const owed = new Set([...known].filter((key) =>
-      this.pendingNotesQueue.peekNotes(key).some((n) => n.includes('<tomo-event type="interrupted-agents"'))));
+    const owed = new Set([...known].filter((key) => !unreadable.has(key) && this.hasInterruptedAgentsNote(key)));
     for (const [key, records] of ledger.pendingBySession()) {
       if (!known.has(key)) {
         log.warn({ sessionKey: key, count: records.length }, "Interrupted subagents belong to an unknown session; dropping the notice");
         ledger.acknowledge(key);
         continue;
       }
-      const autoResume = config.interruptedAgentsAutoResume
-        ? { failed: new Set(records.filter((r) => isResumable(r) && ledger.resumeCount(key, r.taskId) >= MAX_AUTO_RESUMES).map((r) => r.taskId)) }
-        : undefined;
-      if (!this.queuePendingNote(key, formatTomoEvent("interrupted-agents", formatInterruptedAgentsNotice(records, undefined, autoResume)))) {
-        log.error({ sessionKey: key }, "Could not persist the interrupted-subagents note; kept for the next start");
-        continue;
-      }
-      ledger.acknowledge(key);
-      owed.add(key);
-      log.info({ sessionKey: key, ids: records.map((r: RunningTaskRecord) => r.taskId) }, "Reporting subagents interrupted by the last restart");
+      if (unreadable.has(key)) continue;
+      if (this.queueInterruptedAgentsNote(ledger, key, records)) owed.add(key);
     }
     this.sendOwedResumeFailures(ledger);
+    for (const key of owed) this.wakeForInterruptedAgents(key);
+    if (unreadable.size > 0) {
+      log.warn({ sessions: [...unreadable] }, "Pending notes unreadable; the interrupted-subagents check for these sessions waits until they read");
+      this.scheduleInterruptedAgentsRetry(unreadable);
+    }
+  }
+
+  private hasInterruptedAgentsNote(key: string): boolean {
+    return this.pendingNotesQueue.hasNote(key, (n) => n.includes('<tomo-event type="interrupted-agents"'));
+  }
+
+  /** Queue the notice for `records` and acknowledge them. False when the note could not be persisted (kept for the next start). */
+  private queueInterruptedAgentsNote(ledger: RunningAgentsLedger, key: string, records: RunningTaskRecord[]): boolean {
+    const autoResume = config.interruptedAgentsAutoResume
+      ? { failed: new Set(records.filter((r) => isResumable(r) && ledger.resumeCount(key, r.taskId) >= MAX_AUTO_RESUMES).map((r) => r.taskId)) }
+      : undefined;
+    if (!this.queuePendingNote(key, formatTomoEvent("interrupted-agents", formatInterruptedAgentsNotice(records, undefined, autoResume)))) {
+      log.error({ sessionKey: key }, "Could not persist the interrupted-subagents note; kept for the next start");
+      return false;
+    }
+    ledger.acknowledge(key);
+    log.info({ sessionKey: key, ids: records.map((r: RunningTaskRecord) => r.taskId) }, "Reporting subagents interrupted by the last restart");
+    return true;
+  }
+
+  /**
+   * The startup check for sessions whose stored notes could not be read:
+   * looked at again every `INTERRUPTED_AGENTS_RETRY_MS` until each reads, then
+   * settled the way `notifyInterruptedAgents` would have (queue the notice for
+   * what the ledger still holds, wake the session if a notice is owed).
+   */
+  private scheduleInterruptedAgentsRetry(keys: Set<string>): void {
+    if (this.interruptedAgentsRetryTimer) clearTimeout(this.interruptedAgentsRetryTimer);
+    this.interruptedAgentsRetryTimer = setTimeout(() => {
+      this.interruptedAgentsRetryTimer = undefined;
+      try {
+        this.retryInterruptedAgentsNotes(keys);
+      } catch (err) {
+        log.error({ err }, "Interrupted-subagents retry failed");
+      }
+    }, INTERRUPTED_AGENTS_RETRY_MS);
+    this.interruptedAgentsRetryTimer.unref();
+  }
+
+  private retryInterruptedAgentsNotes(keys: Set<string>): void {
+    const ledger = this.runningAgents;
+    if (!ledger) return;
+    const pending = ledger.pendingBySession();
+    const still = new Set<string>();
+    for (const key of keys) {
+      if (!this.pendingNotesQueue.storedReadable(key)) {
+        still.add(key);
+        continue;
+      }
+      const records = pending.get(key);
+      if (records && !this.queueInterruptedAgentsNote(ledger, key, records)) continue;
+      if (this.hasInterruptedAgentsNote(key)) this.wakeForInterruptedAgents(key);
+    }
+    if (still.size > 0) this.scheduleInterruptedAgentsRetry(still);
+  }
+
+  private wakeForInterruptedAgents(key: string): void {
+    // A sub-session's note waits for its own next turn (the resume after
+    // this restart): it is not woken outside its scheduler.
+    if (isTaskSessionKey(key)) return;
     const prompt = formatTomoEvent(
       "interrupted-agents",
       config.interruptedAgentsAutoResume
@@ -3636,13 +3704,8 @@ export class Agent {
           + `still worth continuing; otherwise there is nothing to do. ${CONTINUITY_DELIVERY_NOTE}`,
       { name: "check" },
     );
-    for (const key of owed) {
-      // A sub-session's note waits for its own next turn (the resume after
-      // this restart): it is not woken outside its scheduler.
-      if (isTaskSessionKey(key)) continue;
-      this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, ownerT("notices")("suppressed.turn.interruptedAgents"), "restart"))
-        .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"));
-    }
+    this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, ownerT("notices")("suppressed.turn.interruptedAgents"), "restart"))
+      .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"));
   }
 
   /** Tell the owner (no model turn) which subagents failed past their resume limit; unsent ones are tried again next start. */

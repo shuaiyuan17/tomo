@@ -334,7 +334,7 @@ export class SessionStore {
   private sidecarMessages = new WeakSet<SessionMessage>();
   /** The unreadable `_pending_notes.json` bytes last kept in a `.corrupt-`
    *  sibling, so a write-back that keeps failing does not copy them again. */
-  private pendingNotesKeptRaw: string | null = null;
+  private pendingNotesKeptRaw: Buffer | null = null;
   private readonly registryLockOptions: FileLockOptions;
   private readonly transcriptLockOptions: FileLockOptions;
   private readonly ledgerLockOptions: FileLockOptions;
@@ -1447,6 +1447,17 @@ export class SessionStore {
       );
     }
 
+    // The old key's pending notes move with it, so read them BEFORE anything
+    // moves. An unreadable file refuses the re-key (retried like the refusals
+    // around it): going ahead would leave `oldKey`'s notes under a key nothing
+    // routes to again, and the migration would never be repeated to carry them.
+    let pendingNotes: Record<string, string[]>;
+    try {
+      pendingNotes = this.loadPendingNotes();
+    } catch (err) {
+      throw new Error(`cannot re-key session ${oldKey} to ${newKey}: its pending notes could not be read`, { cause: err });
+    }
+
     // Re-keying is the registry forgetting `oldKey`: the `migratedFrom`
     // breadcrumb below is only kept for a non-DM→DM unification, so for every
     // other re-key nothing would remember that `oldKey` once owned its legacy
@@ -1507,17 +1518,9 @@ export class SessionStore {
       );
     }
 
-    // An unreadable notes file is left exactly as it is (rewriting it from
-    // `{}` would drop every session's notes); the registry and transcripts
-    // have already moved, so this must not fail the migration either.
-    let pendingNotes: Record<string, string[]> | null = null;
-    try {
-      pendingNotes = this.loadPendingNotes();
-    } catch (err) {
-      log.error({ err, oldKey, newKey }, "Pending notes could not be read; the old key's notes were not carried over");
-    }
-    const oldNotes = pendingNotes?.[oldKey];
-    if (pendingNotes && oldNotes) {
+    // `pendingNotes` was read before anything moved (see above).
+    const oldNotes = pendingNotes[oldKey];
+    if (oldNotes) {
       pendingNotes[newKey] = [...(pendingNotes[newKey] ?? []), ...oldNotes];
       delete pendingNotes[oldKey];
       writeJsonAtomicSync(this.pendingNotesPath, {
@@ -1677,7 +1680,8 @@ export class SessionStore {
    *  - missing → `{}` (nothing queued);
    *  - a read error (EACCES, EIO, …) → `PendingNotesReadError`, and the file
    *    is left alone; a write refuses with the same error until it reads;
-   *  - unparseable, the wrong shape, or a row that is not a list of strings →
+   *  - not valid UTF-8, unparseable, the wrong shape, or a row that is not a
+   *    list of strings →
    *    the bytes are kept verbatim in a `.corrupt-<ts>` sibling first, the
    *    good rows are written back, and only those are returned. If the
    *    sibling cannot be written, this throws like a read error: the
@@ -1685,9 +1689,9 @@ export class SessionStore {
    */
   private loadPendingNotes(): Record<string, string[]> {
     const path = this.pendingNotesPath;
-    let raw: string;
+    let raw: Buffer;
     try {
-      raw = readFileSync(path, "utf-8");
+      raw = readFileSync(path);
     } catch (err) {
       if (isEnoent(err)) return {};
       throw new PendingNotesReadError(path, err);
@@ -1697,7 +1701,10 @@ export class SessionStore {
     let bad = false;
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw);
+      // `fatal`: invalid UTF-8 is corruption, not text to repair. A lenient
+      // decode turns it into U+FFFD, which can still parse and would then be
+      // written back as a different note.
+      parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
     } catch {
       bad = true;
     }
@@ -1720,7 +1727,7 @@ export class SessionStore {
    *  sibling, then write back only the rows that read (see
    *  `loadPendingNotes`). Throws `PendingNotesReadError` when the bytes could
    *  not be kept, leaving the original untouched. */
-  private quarantinePendingNotes(raw: string, good: Record<string, string[]>): void {
+  private quarantinePendingNotes(raw: Buffer, good: Record<string, string[]>): void {
     const path = this.pendingNotesPath;
     if (this.readOnly) {
       log.warn({ file: path }, "Pending notes file could not be read in full; read-only store, left as it is");
@@ -1729,7 +1736,8 @@ export class SessionStore {
     let aside: string | null = null;
     // Already kept these exact bytes (the write-back below failed last time):
     // one copy is enough.
-    if (raw.trim() !== "" && raw !== this.pendingNotesKeptRaw) {
+    const blank = raw.toString("latin1").trim() === "";
+    if (!blank && !(this.pendingNotesKeptRaw?.equals(raw) ?? false)) {
       try {
         aside = this.keepCorruptPendingNotes(raw);
         this.pendingNotesKeptRaw = raw;
@@ -1755,7 +1763,7 @@ export class SessionStore {
 
   /** Write `raw` to a free `_pending_notes.json.corrupt-<ts>[-<n>]`, fsynced,
    *  never over an existing file. Returns its path. */
-  private keepCorruptPendingNotes(raw: string): string {
+  private keepCorruptPendingNotes(raw: Buffer): string {
     const ts = fileTimestamp();
     for (let n = 0; n < 100; n++) {
       const to = n === 0 ? `${this.pendingNotesPath}.corrupt-${ts}` : `${this.pendingNotesPath}.corrupt-${ts}-${n}`;

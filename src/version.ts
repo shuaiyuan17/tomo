@@ -49,17 +49,36 @@ function writeCache(cache: VersionCache): void {
   writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
 }
 
-/** A version's three numeric core parts and its prerelease identifiers
- *  (empty for a release). Build metadata (`+...`) is dropped: it carries no
- *  precedence. Null when the core is not three plain numbers. */
-function parseVersion(v: string): { core: number[]; pre: string[] } | null {
-  const noBuild = v.split("+", 1)[0];
-  const dash = noBuild.indexOf("-");
-  const coreText = dash < 0 ? noBuild : noBuild.slice(0, dash);
-  const preText = dash < 0 ? "" : noBuild.slice(dash + 1);
-  const core = coreText.split(".");
-  if (core.length !== 3 || !core.every((p) => /^\d+$/.test(p))) return null;
-  return { core: core.map(Number), pre: preText ? preText.split(".") : [] };
+/**
+ * A complete semver 2.0.0 version (semver.org's own pattern): no leading
+ * zeroes in numeric parts, no empty identifiers, build metadata optional
+ * after any prerelease. No `v` prefix. Used both to accept the registry's
+ * answer and to compare versions, so the two can never disagree.
+ */
+const SEMVER_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?$/;
+
+/** Longer than any real version; also bounds the work SEMVER_RE does. */
+const MAX_VERSION_LENGTH = 256;
+
+function isSemver(v: string): boolean {
+  return v.length <= MAX_VERSION_LENGTH && SEMVER_RE.test(v);
+}
+
+/** A version's three core parts and its prerelease identifiers (empty for a
+ *  release), or null when it is not a complete semver version. Build
+ *  metadata carries no precedence and is dropped. */
+function parseVersion(v: string): { core: string[]; pre: string[] } | null {
+  const m = isSemver(v) ? SEMVER_RE.exec(v) : null;
+  if (!m) return null;
+  return { core: [m[1], m[2], m[3]], pre: m[4] ? m[4].split(".") : [] };
+}
+
+/** Compare two numeric identifiers without leading zeroes (as SEMVER_RE
+ *  guarantees) exactly: by length, then digit by digit. `Number` would lose
+ *  precision past 2^53. */
+function compareNumeric(a: string, b: string): number {
+  if (a.length !== b.length) return a.length < b.length ? -1 : 1;
+  return a === b ? 0 : a < b ? -1 : 1;
 }
 
 /** Semver precedence of two prerelease identifier lists (both non-empty).
@@ -72,8 +91,8 @@ function comparePrerelease(a: string[], b: string[]): number {
     const aNum = /^\d+$/.test(a[i]);
     const bNum = /^\d+$/.test(b[i]);
     if (aNum && bNum) {
-      const diff = Number(a[i]) - Number(b[i]);
-      if (diff !== 0) return Math.sign(diff);
+      const diff = compareNumeric(a[i], b[i]);
+      if (diff !== 0) return diff;
     } else if (aNum !== bNum) {
       return aNum ? -1 : 1;
     } else if (a[i] !== b[i]) {
@@ -86,31 +105,25 @@ function comparePrerelease(a: string[], b: string[]): number {
 /**
  * Is `latest` a higher version than `current`, by semver precedence? A
  * release outranks its own prereleases (`1.0.0` > `1.0.0-rc.2`), so someone
- * running an RC is told about the final release. Anything that does not
- * parse as a version is never newer.
+ * running an RC is told about the final release. Anything that is not a
+ * complete semver version is never newer, and is never older either.
  */
 export function isNewer(latest: string, current: string): boolean {
   const a = parseVersion(latest);
   const b = parseVersion(current);
   if (!a || !b) return false;
   for (let i = 0; i < 3; i++) {
-    if (a.core[i] !== b.core[i]) return a.core[i] > b.core[i];
+    const diff = compareNumeric(a.core[i], b.core[i]);
+    if (diff !== 0) return diff > 0;
   }
   if (a.pre.length === 0) return b.pre.length > 0;
   if (b.pre.length === 0) return false;
   return comparePrerelease(a.pre, b.pre) > 0;
 }
 
-/**
- * A registry `version` we are willing to act on: semver, optionally with a
- * prerelease/build tail.
- *
- * The registry response is remote input and was previously returned with no
- * shape check at all, then interpolated into a command line and compared by
- * `isNewer`. Refusing anything that is not a version keeps a malformed or
- * hostile response from reaching either.
- */
-const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
+// The registry response is remote input: it was once returned with no shape
+// check at all, then interpolated into a command line and compared by
+// `isNewer`. Only a complete version (SEMVER_RE above) is acted on.
 
 export async function fetchLatestVersion(): Promise<string | null> {
   try {
@@ -118,7 +131,7 @@ export async function fetchLatestVersion(): Promise<string | null> {
     if (!res.ok) return null;
     const data = (await res.json()) as { version?: string };
     const version = data.version;
-    if (typeof version !== "string" || !SEMVER_RE.test(version)) {
+    if (typeof version !== "string" || !isSemver(version)) {
       if (version !== undefined) {
         log.warn({ version: String(version).slice(0, 100) }, "Ignoring malformed version from npm registry");
       }

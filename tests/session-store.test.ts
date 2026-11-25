@@ -136,6 +136,24 @@ describe("SessionStore", () => {
     expect(readdirSync(TEST_DIR).filter((f) => f.startsWith("_pending_notes.json.corrupt-"))).toHaveLength(1);
   });
 
+  it("a pending notes file that is not valid UTF-8 is kept byte for byte, even when it would still parse", () => {
+    const file = join(TEST_DIR, "_pending_notes.json");
+    // 0xff is never valid UTF-8; a lenient decode reads it as U+FFFD inside a
+    // JSON string, which parses, and would be written back as another note.
+    const raw = Buffer.concat([
+      Buffer.from('{"version":1,"notes":{"dm:alice":["caf'),
+      Buffer.from([0xff]),
+      Buffer.from('"]}}'),
+    ]);
+    writeFileSync(file, raw);
+    const store = makeSessionStore(TEST_DIR);
+
+    expect(store.getPendingNotes("dm:alice")).toEqual([]);
+    const asides = readdirSync(TEST_DIR).filter((f) => f.startsWith("_pending_notes.json.corrupt-"));
+    expect(asides).toHaveLength(1);
+    expect(readFileSync(join(TEST_DIR, asides[0])).equals(raw)).toBe(true);
+  });
+
   it("a pending notes row of the wrong shape is kept aside; the other sessions' rows survive a write", () => {
     const file = join(TEST_DIR, "_pending_notes.json");
     const raw = JSON.stringify({ version: 1, notes: { "dm:alice": ["keep me"], "dm:bob": [42] } });
@@ -390,16 +408,24 @@ describe("SessionStore", () => {
     expect(store.getPendingNotes("dm:alice")).toEqual(["queued before migration"]);
   });
 
-  it("a migration with an unreadable pending notes file still re-keys the session and leaves the file alone", () => {
+  it("a migration with an unreadable pending notes file is refused before anything moves, and succeeds once it reads", () => {
     const store = makeSessionStore(TEST_DIR);
     store.setSdkSessionId("telegram:111", "session-old");
+    store.setPendingNotes("telegram:111", ["queued before migration"]);
     const file = join(TEST_DIR, "_pending_notes.json");
+    const saved = readFileSync(file);
+    rmSync(file);
     mkdirSync(file); // EISDIR on read
 
-    store.migrateSessionKey("telegram:111", "dm:alice");
+    expect(() => store.migrateSessionKey("telegram:111", "dm:alice")).toThrow(/pending notes could not be read/);
+    expect(store.getSdkSessionId("telegram:111")).toBe("session-old");
+    expect(store.getSdkSessionId("dm:alice")).toBeUndefined();
 
+    rmSync(file, { recursive: true });
+    writeFileSync(file, saved);
+    store.migrateSessionKey("telegram:111", "dm:alice");
     expect(store.getSdkSessionId("dm:alice")).toBe("session-old");
-    expect(statSync(file).isDirectory()).toBe(true);
+    expect(store.getPendingNotes("dm:alice")).toEqual(["queued before migration"]);
   });
 
   it("remembers the raw key a unified session was migrated from, across chained migrations", () => {

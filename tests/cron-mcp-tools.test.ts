@@ -259,7 +259,7 @@ describe("cron MCP tools", () => {
     // future occurrence (null). Both are refusals now: a job the tool reports
     // as scheduled must be one the scan can actually pick up.
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toMatch(/invalid schedule/i);
+    expect(result.content[0].text).toContain("invalid schedule");
     const list = findTool("schedule_list");
     const listResult = await list.handler({}, {});
     expect(JSON.parse(listResult.content[0].text)).toHaveLength(0);
@@ -280,7 +280,7 @@ describe("cron MCP tools", () => {
     }, {});
 
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toMatch(/invalid schedule/i);
+    expect(result.content[0].text).toContain("invalid schedule");
     expect(result.content[0].text).toMatch(/in the past/i);
 
     // Nothing landed — not even a disabled record.
@@ -318,7 +318,9 @@ describe("cron MCP tools", () => {
     const viaCli = jobs.find((j: { name: string }) => j.name === "via-cli");
     expect(viaCli).toMatchObject({ lifecycle: "once", sessionKey: "dm:alice", enabled: true });
     expect(viaCli.nextRunAt).toBeTruthy();
-    expect(jobs.find((j: { name: string }) => j.name === "via-mcp").lifecycle).toBe("recurring");
+    const viaMcp = jobs.find((j: { name: string }) => j.name === "via-mcp");
+    expect(viaMcp).toMatchObject({ lifecycle: "recurring", sessionKey: "dm:alice" });
+    expect(viaMcp.nextRunAt).toBeTruthy();
   });
 });
 

@@ -8,6 +8,22 @@ afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 
 vi.mock("../src/config.js", () => ({ config: { tomoHome: ROOT }, TOMO_HOME: ROOT }));
 
+// An injected read failure, root-safe (chmod refuses nothing as root): while
+// `eaccesPath` is set, reading exactly that file throws EACCES.
+const fsFault = vi.hoisted(() => ({ eaccesPath: null as string | null }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    readFileSync: ((p: Parameters<typeof actual.readFileSync>[0], opts?: unknown) => {
+      if (fsFault.eaccesPath !== null && String(p) === fsFault.eaccesPath) {
+        throw Object.assign(new Error(`EACCES: permission denied, open '${String(p)}'`), { code: "EACCES" });
+      }
+      return (actual.readFileSync as (a: unknown, b: unknown) => unknown)(p, opts);
+    }) as typeof actual.readFileSync,
+  };
+});
+
 const { TodoStore, TodoRuleError, TodoStoreReadError, parseReviewWhen, todosDir } = await import("../src/todos/store.js");
 const { DEFAULT_TODOS } = await import("../src/todos/limits.js");
 const { canSeeTodo, formatDue, formatTodoList } = await import("../src/todos/format.js");
@@ -274,6 +290,21 @@ describe("an unreadable store is an error, never an empty list", () => {
     expect(readdirSync(file)).toEqual([]);
     rmSync(file, { recursive: true });
     writeFileSync(file, content);
+    expect(store.list()).toHaveLength(1);
+  });
+
+  it("an unreadable file (EACCES, injected) is an error too, and nothing is written", () => {
+    add();
+    const file = join(dir, "todos.json");
+    const content = readFileSync(file, "utf-8");
+    fsFault.eaccesPath = file;
+    try {
+      expect(() => store.list()).toThrow(TodoStoreReadError);
+      expect(() => add()).toThrow(TodoStoreReadError);
+    } finally {
+      fsFault.eaccesPath = null;
+    }
+    expect(readFileSync(file, "utf-8")).toBe(content);
     expect(store.list()).toHaveLength(1);
   });
 });

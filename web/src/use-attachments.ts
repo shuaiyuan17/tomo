@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { WebBootstrap } from "./api.js";
 import { ApiError, discardUpload, readStagedUpload, uploadImage } from "./api.js";
 import type { WebFiledFile } from "../../src/web/protocol.js";
-import { addFiles, filedAttachment, MAX_ATTACHMENTS, type KeptUpload, isAttachableImage, keptUploads, parseKeptUploads, replaceItems, keptExpired, restoredAttachment, restoringAttachment, takeSent, updateAttachment, type Attachment } from "./uploads.js";
+import { addFiles, filedAttachment, MAX_ATTACHMENTS, type KeptUpload, isAttachableImage, keptUploads, parseKeptUploads, replaceItems, restoredAttachment, restoringAttachment, takeSent, updateAttachment, type Attachment } from "./uploads.js";
 import { deferred, type Message } from "./i18n/message.js";
 
 const failure = (error: unknown) => {
@@ -49,13 +49,7 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
   const readBack = useCallback(async (key: string, item: KeptUpload) => {
     let found: Awaited<ReturnType<typeof readStagedUpload>>;
     try { found = await readStagedUpload(item.uploadId); }
-    catch {
-      // No clear answer. Past its TTL by this tab's clock: gone (its record of going may have expired too).
-      // Within it: kept, failed, with Retry.
-      if (keptExpired(item)) commit((old) => old.filter((entry) => entry.key !== key));
-      else commit((old) => updateAttachment(old, key, { status: "failed", error: deferred.t("chat:attach.failed") }));
-      return;
-    }
+    catch { commit((old) => updateAttachment(old, key, { status: "failed", error: deferred.t("chat:attach.failed") })); return; }
     if (!list.current.some((entry) => entry.key === key)) return;
     if (!found) { commit((old) => old.filter((entry) => entry.key !== key)); return; }
     const preview = found.kind === "image" ? URL.createObjectURL(found.blob) : "";
@@ -83,7 +77,7 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
         // The server decides what it is by its bytes: a file the browser called an image may come back a plain file.
         const kind = value.kind ?? "image";
         if (kind === "file" && item.preview) URL.revokeObjectURL(item.preview);
-        commit((old) => updateAttachment(old, item.key, { status: "done", progress: 1, uploadId: value.uploadId, uploadedAt: Date.now(), kind, ...(kind === "file" ? { preview: "" } : {}) }));
+        commit((old) => updateAttachment(old, item.key, { status: "done", progress: 1, uploadId: value.uploadId, kind, ...(kind === "file" ? { preview: "" } : {}) }));
       }, (error) => {
         if (controller.signal.aborted) return;
         commit((old) => updateAttachment(old, item.key, { status: "failed", error: failure(error) }));
@@ -161,8 +155,6 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
     restored.current = storageKey;
     let wanted: KeptUpload[];
     try { wanted = parseKeptUploads(sessionStorage.getItem(storageKey)); } catch { return; }
-    // Every one is asked about, even one that looks expired by this tab's clock (which can be wrong):
-    // only an unclear answer for an apparently expired one drops it (readBack).
     const fresh = wanted.filter((item) => !list.current.some((entry) => entry.uploadId === item.uploadId))
       .slice(0, Math.max(0, MAX_ATTACHMENTS - list.current.length)).map((item) => restoringAttachment(`a${++counter.current}`, item));
     if (!fresh.length) return;

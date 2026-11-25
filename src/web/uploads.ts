@@ -52,8 +52,12 @@ export class UploadError extends Error {
  * staged or claimed file is removed, and never by a claim or its release —
  * so "gone" is one file's existence, not an inference from two lookups that
  * a claim landing and releasing in between can fool (see peekUpload).
- * Tombstones expire with the same TTL.
+ * Tombstones are kept GONE_TTL_MS (a week: empty files, at most a few
+ * hundred), far longer than any tab keeps a tray, so a kept upload's answer
+ * is definite; past that it is "unsettled", which the page keeps as failed
+ * (Retry / ×) rather than guessing.
  */
+export const GONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const goneDir = (dir: string) => join(dirname(dir), `${basename(dir)}.gone`);
 function markGone(dir: string, uploadId: string): void {
   if (!UPLOAD_ID.test(uploadId)) return;
@@ -68,7 +72,7 @@ export function sweepUploads(dir: string, now = Date.now()): number {
   // Old tombstones first: the ones this sweep writes are new.
   try {
     for (const name of readdirSync(goneDir(dir))) {
-      try { if (now - statSync(join(goneDir(dir), name)).mtimeMs > UPLOAD_TTL_MS) unlinkSync(join(goneDir(dir), name)); } catch { /* raced */ }
+      try { if (now - statSync(join(goneDir(dir), name)).mtimeMs > GONE_TTL_MS) unlinkSync(join(goneDir(dir), name)); } catch { /* raced */ }
     }
   } catch { /* none yet */ }
   let names: string[];

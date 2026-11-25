@@ -161,7 +161,9 @@ export class PendingNotesQueue {
     // then remove it undelivered if it were queued too) is that same note.
     // Two notes that merely read the same are two notes.
     const here = new Set([...arr, ...(this.inflight.get(sessionKey) ?? []).flatMap((b) => b.notes)].map((n) => n.id));
-    arr.unshift(...stored.filter((n) => !here.has(n.id)));
+    // Nor one a turn already carried to its end while the file would not read.
+    const settled = this.settledIds.get(sessionKey);
+    arr.unshift(...stored.filter((n) => !here.has(n.id) && !settled?.has(n.id)));
     return true;
   }
 

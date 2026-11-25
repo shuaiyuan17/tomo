@@ -824,8 +824,12 @@ export class SubsessionService {
         // the start and points to task_status for the rest.
         // Every one still unread is kept (no cap: each is bounded by an
         // unread note, or by a report that never got one); a read one goes.
-        const kept = (r.earlierReports ?? []).filter((e) => e.seq !== previous && (!e.noted || this.notePending(r.parentKey, `${r.id}#${e.seq}`)));
-        if (r.report !== undefined && previous > 0 && (!r.reportDelivered || this.reportNotePending({ ...r, reportSeq: previous }))) {
+        // While the notes file is lost (it may be the read just below that
+        // finds it unreadable and moves it aside), "no note" means nothing:
+        // every earlier report is kept, as if unread.
+        const noteUnread = (name: string): boolean => this.notePending(r.parentKey, name) || this.notesLost;
+        const kept = (r.earlierReports ?? []).filter((e) => e.seq !== previous && (!e.noted || noteUnread(`${r.id}#${e.seq}`)));
+        if (r.report !== undefined && previous > 0 && (!r.reportDelivered || noteUnread(reportNoteName({ ...r, reportSeq: previous })))) {
           kept.push({ seq: previous, text: r.report, ...(r.reportDelivered ? { noted: true } : {}) });
         }
         r.earlierReports = kept.length > 0 ? kept : undefined;
@@ -1039,8 +1043,11 @@ export class SubsessionService {
       }
     }, "todo resync");
     this.safely(() => this.reconcile(startState), "reconcile");
-    this.safely(() => this.sweep(), "sweep");
+    // The notes file was moved aside before recovery (or during it): its
+    // notes are written again now, before the sweep judges what was read.
     this.recovered = true;
+    if (this.notesLost) this.flushLostNotes();
+    this.safely(() => this.sweep(), "sweep");
   }
 
   /**
@@ -2111,19 +2118,22 @@ export class SubsessionService {
   pendingNotesLost(): void {
     if (this.notesLost) return;
     this.notesLost = true;
-    queueMicrotask(() => {
-      try {
-        this.resendLostNotes();
-      } catch (err) {
-        log.error({ err }, "Could not write the sub-session notes again after the pending notes file was moved aside");
-      } finally {
-        this.notesLost = false;
-      }
-    });
+    queueMicrotask(() => this.flushLostNotes());
+  }
+
+  /** Before recovery, kept owed: recoverAtStartup runs it. */
+  private flushLostNotes(): void {
+    if (!this.notesLost || !this.recovered || this.broken) return;
+    try {
+      this.resendLostNotes();
+    } catch (err) {
+      log.error({ err }, "Could not write the sub-session notes again after the pending notes file was moved aside");
+    } finally {
+      this.notesLost = false;
+    }
   }
 
   private resendLostNotes(): void {
-    if (!this.recovered || this.broken) return;
     const woken = new Set<string>();
     for (const task of this.store.list()) {
       if (task.status === "finished" && (task.reportDelivered || (task.earlierReports ?? []).some((e) => e.noted))) {
@@ -2395,10 +2405,10 @@ function reportNoteName(record: SubsessionRecord): string {
   return `${record.id}#${record.reportSeq ?? 1}`;
 }
 
-/** The pending-note id of report `name` (`s3#2`): one note per report, however often it is delivered. */
 /** Added to a note written again after the notes file was lost. */
 const LOST_NOTE_LINE = "(Written again from the task record: the pending notes file was lost. It may already have been told to the owner.)";
 
+/** The pending-note id of report `name` (`s3#2`): one note per report, however often it is delivered. */
 function reportNoteId(name: string): string {
   return `subsession-report:${name}`;
 }

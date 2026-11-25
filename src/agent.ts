@@ -283,9 +283,10 @@ export class Agent {
     });
     this.pendingNotesQueue = new PendingNotesQueue(this.sessions);
     this.sessions.onPendingNotesQuarantined = (aside) => {
-      this.notePendingNotesQuarantined(aside);
-      // Called from inside a read of the notes: the fresh file gets what is
-      // in memory, and the sub-session notes it lost, once that read is over.
+      // Called from inside a read of the notes (maybe under a store lock):
+      // only flags are set here. The sub-session service stops cleaning up
+      // at once; the fresh file gets what is in memory, the lost sub-session
+      // notes are written again, and the owner is told, once that read is over.
       this.subsessions?.pendingNotesLost();
       queueMicrotask(() => {
         try {
@@ -293,6 +294,7 @@ export class Agent {
         } catch (err) {
           log.error({ err }, "Could not write the loaded pending notes to the fresh file");
         }
+        this.notePendingNotesQuarantined(aside);
       });
     };
     if (config.inbox) {

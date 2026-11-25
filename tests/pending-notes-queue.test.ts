@@ -413,6 +413,24 @@ describe("PendingNotesQueue while the stored notes cannot be read", () => {
     expect(store.texts("other")).toEqual(["report"]);
   });
 
+  it("a note carried to its end while the file would not read is not put back when it reads again", () => {
+    const store = new MemoryPendingNotesStore();
+    store.seed("k", ["the message"], ["inbox-interrupted:h:0"]);
+    let readable = false;
+    const real = store.getPendingNotes.bind(store);
+    store.getPendingNotes = (key: string) => {
+      if (!readable) throw new Error("EIO");
+      return real(key);
+    };
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", "the message", "inbox-interrupted:h:0");
+    const prefix = queue.drain("k");
+    expect(prefix).toContain("the message");
+    queue.settle("k", prefix);
+    readable = true;
+    expect(queue.drain("k")).toBe("");
+  });
+
   it("persistLoaded writes every loaded session again, queued and in flight (a fresh file after one was moved aside)", () => {
     const store = new MemoryPendingNotesStore();
     const queue = new PendingNotesQueue(store);

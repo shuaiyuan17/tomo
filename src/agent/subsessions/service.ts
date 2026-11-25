@@ -285,6 +285,12 @@ function messageNoteName(id: string, kind: SpeakKind, body: string, through: num
   return `${id}:${kind}:${through}:${createHash("sha256").update(body).digest("hex").slice(0, 16)}`;
 }
 
+/** A message note name's parts (see messageNoteName); undefined for any other name. */
+function parseMessageNoteName(name: string): { id: string; kind: string; through: number; digest: string } | undefined {
+  const m = /^([^:]+):([a-z]+):(\d+):([0-9a-f]+)$/.exec(name);
+  return m ? { id: m[1], kind: m[2], through: Number(m[3]), digest: m[4] } : undefined;
+}
+
 /** The name of a task_ask note, or undefined for any other note. */
 function askNoteName(note: string): string | undefined {
   const name = messageNoteNameOf(note);
@@ -800,8 +806,11 @@ export class SubsessionService {
     if (through === undefined) return false;
     let current: SubsessionRecord | undefined;
     try { current = this.store.get(record.id); } catch { current = record; }
-    const owner = (current ?? record).pendingInput.filter((i) => i.seq <= through && i.from === "owner");
-    return owner.at(-1)?.source === "panel";
+    // The owner's own messages the turn carries (not relays): only when all
+    // of them came from the panel. Mixed with one from the phone, which
+    // answer is which cannot be told, so it goes through the main session.
+    const owner = (current ?? record).pendingInput.filter((i) => i.seq <= through && i.from === "owner" && i.text.includes(OWNER_MESSAGE_MARKER));
+    return owner.length > 0 && owner.every((i) => i.source === "panel");
   }
 
   /**
@@ -869,7 +878,19 @@ export class SubsessionService {
     // another message are another message.
     const through = this.inflightThrough.get(record.id) ?? 0;
     const name = messageNoteName(record.id, kind, body, through);
-    const own = (n: string) => messageNoteNameOf(n) === name;
+    // An unread note of the same words from an earlier attempt of this turn
+    // (named by inputs this turn carries again, the ones that may have been
+    // seen) is the same message, even if newer input joined the batch.
+    const current = this.safeGet(record.id) ?? record;
+    const first = current.pendingInput.at(0)?.seq ?? Infinity;
+    const seenThrough = Math.max(current.seenThrough, this.unsavedSeen.get(record.id) ?? 0);
+    const own = (n: string) => {
+      const other = messageNoteNameOf(n);
+      if (other === name) return true;
+      const parsed = other ? parseMessageNoteName(other) : undefined;
+      return !!parsed && parsed.id === record.id && parsed.kind === kind && parsed.digest === name.slice(name.lastIndexOf(":") + 1)
+        && parsed.through >= first && parsed.through <= seenThrough;
+    };
     const already = this.deps.hasPendingNote(record.parentKey, own);
     if (!already) {
       const note = formatMessageNote(record, kind, body, name, this.inflightRetry.has(record.id));
@@ -1643,6 +1664,9 @@ export class SubsessionService {
       // unread: the note holds only the start of the report, and points to
       // task_status for the rest.
       if (this.reportNotePending(task) || this.earlierReportPending(task)) continue;
+      // Nor while a message it handed over is unread: restart recovery finds
+      // the session to wake through its tasks' records.
+      if (this.deps.hasPendingNote(task.parentKey, (n) => messageNoteNameOf(n)?.startsWith(`${task.id}:`) === true)) continue;
       if (task.status === "finished" && task.reportDelivered && task.pendingInput.length === 0
         && now - (task.endedAt ?? task.lastActivityAt) > FINISHED_KEEP_MS) {
         const outcome = this.transition(task.id, "archive", { reason: "finished more than 7 days ago" });

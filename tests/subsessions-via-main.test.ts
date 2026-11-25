@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
-import { MESSAGE_NOTE_MARKER, SETTLE_RETRY_MS, SubsessionService, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
+import { ENDED_KEEP_MS, MESSAGE_NOTE_MARKER, SETTLE_RETRY_MS, SubsessionService, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { buildSubsessionPrompt } from "../src/agent/subsessions/prompt.js";
 
@@ -757,5 +757,82 @@ describe("via-main: nothing lost, nothing twice", () => {
     await flush();
     expect(n).toBe(2);
     expect(h.store.get(t.id)!.conversation.filter((e) => e.from === "task" && e.text === "done")).toHaveLength(2);
+  });
+
+  it("a retry carrying a newer message too does not hand the earlier answer over again while its note is unread", async () => {
+    let n = 0;
+    let release!: () => void;
+    const h = harness({}, async (key, prompt) => {
+      if (!prompt.includes("subsession-owner-message")) return { ok: true };
+      n += 1;
+      if (n === 1) {
+        await h.service.reply(key, "A: yes");
+        await new Promise<void>((r) => { release = r; });
+        return { ok: false, error: "boom" };
+      }
+      await h.service.reply(key, "A: yes");
+      await h.service.reply(key, "B: no");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "A?");
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "B?");
+    release();
+    await flush();
+    expect(n).toBe(2);
+    expect(messageNotes(h, "dm:owner").filter((x) => x.includes("A: yes"))).toHaveLength(1);
+    expect(messageNotes(h, "dm:owner").filter((x) => x.includes("B: no"))).toHaveLength(1);
+  });
+
+  it("a turn carrying both a phone and a panel message answers through the main session", async () => {
+    let release!: () => void;
+    let n = 0;
+    const h = harness({}, async (key, prompt) => {
+      if (!prompt.includes("subsession-owner-message")) return { ok: true };
+      n += 1;
+      if (n === 1) { await new Promise<void>((r) => { release = r; }); return { ok: true }; }
+      await h.service.reply(key, "both answered");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    // A first message holds a turn; a phone and a panel message then wait together for the next one.
+    h.service.ownerMessage("dm:owner", t.id, "hold");
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "from the phone");
+    h.service.ownerMessage("dm:owner", t.id, "from the panel", { source: "panel" });
+    release();
+    await flush();
+    expect(h.store.get(t.id)!.sent.at(-1)).toMatchObject({ text: "both answered", via: "main" });
+    expect(messageNotes(h, "dm:owner").some((x) => x.includes("both answered"))).toBe(true);
+  });
+
+  it("the sweep does not forget an ended task while a message it handed over is unread", async () => {
+    const disk = new Map<string, string[]>();
+    const sdk = new Set<string>();
+    const h = harness({}, sayOnFirstTurn("notify", "LAST WORDS"), { disk, sdk });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    await h.service.cancel(t.id, "test");
+    h.service.stop();
+    h.store.update(t.id, (r) => { r.endedAt = Date.now() - ENDED_KEEP_MS - 60_000; });
+    // Only the task's message is left unread.
+    disk.set("dm:owner", disk.get("dm:owner")!.filter((x) => x.includes("LAST WORDS")));
+    expect(disk.get("dm:owner")).toHaveLength(1);
+    const h2 = harness({}, undefined, { disk, sdk });
+    h2.service.start();
+    expect(h2.store.get(t.id)).toBeDefined();
+    expect(h2.messageWakes).toEqual(["dm:owner"]);
+    // Read: the next sweep forgets it.
+    disk.set("dm:owner", []);
+    h2.service.stop();
+    const h3 = harness({}, undefined, { disk, sdk });
+    h3.service.start();
+    expect(h3.store.get(t.id)).toBeUndefined();
   });
 });

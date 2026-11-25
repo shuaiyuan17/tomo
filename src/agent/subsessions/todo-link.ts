@@ -24,8 +24,9 @@ export function createTodoLink(store: TodoStore): SubsessionTodoLink {
    * owning scope. A ref alone is not enough, since any conversation can
    * write one, and a group's item must never carry a private task's words.
    */
+  const titleOf = (record: SubsessionRecord) => clip(`${record.title} (${record.id})`, store.limits.titleMaxChars);
   const ownTodo = (record: SubsessionRecord) => store.list().find((item) =>
-    item.ref === record.sessionKey && item.session === record.parentKey && item.source === "self");
+    item.ref === record.sessionKey && item.session === record.parentKey && item.source === "self" && item.title === titleOf(record));
   return {
     find(record: SubsessionRecord): string | undefined {
       try {
@@ -42,7 +43,7 @@ export function createTodoLink(store: TodoStore): SubsessionTodoLink {
         if (existing) return existing.id;
         const limits = store.limits;
         const item = store.add({
-          title: clip(`${record.title} (${record.id})`, limits.titleMaxChars),
+          title: titleOf(record),
           next: clip(`${record.id} is working on it (/s ${record.id})`, limits.nextMaxChars),
           waiting_on: "external",
           ref: record.sessionKey,

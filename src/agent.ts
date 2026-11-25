@@ -596,7 +596,8 @@ export class Agent {
       { name: "check" }), CONTINUITY_DELIVERY_NOTE);
     this.enqueueForSession(parentKey, async () => {
       this.mirrorWakeQueued.delete(parentKey);
-      if (this.stopping || !this.subsessions?.hasUnseenMirror(parentKey)) return;
+      // Only for words the owner wrote (another turn may have shown them meanwhile).
+      if (this.stopping || !this.subsessions?.hasUnseenOwnerWords(parentKey)) return;
       // Asked again here: the quota window can fill while the wake waits.
       if (!this.subsessions.mirrorTurnAllowed()) return;
       await this.processContinuity(prompt, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionMirror"), "background");

@@ -10,7 +10,7 @@ import {
   type TaskTurnOutcome,
 } from "../src/agent/subsessions/service.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
-import { ACTIVE_HEARTBEAT_MS } from "../src/agent/subsessions/service.js";
+import { ACTIVE_HEARTBEAT_MS, REGISTRY_RECHECK_MS } from "../src/agent/subsessions/service.js";
 import { createTodoLink } from "../src/agent/subsessions/todo-link.js";
 import { formatMirrorNote, MIRROR_ENTRY_MAX } from "../src/agent/subsessions/prompt.js";
 import { TodoStore } from "../src/todos/store.js";
@@ -108,6 +108,36 @@ describe("an owner message to a queued task", () => {
     expect(h.prompts.some((p) => p.includes("please do this one now"))).toBe(true);
     expect(h.service.get(waiting.id)?.pendingInput).toEqual([]);
     h.service.stop();
+  });
+});
+
+describe("an owner message whose start cannot be written", () => {
+  it("is still delivered (never handed to the owning session too), and the start is made at the recheck", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness({ maxRunning: 0 });
+      h.onTurn = () => new Promise(() => {});
+      h.service.start();
+      const task = spawn(h);
+      await flush();
+      expect(h.service.get(task.id)?.status).toBe("queued");
+      const store = h.store as unknown as { transition: (id: string, event: string, ...rest: unknown[]) => unknown };
+      const real = store.transition.bind(h.store);
+      let fail = true;
+      store.transition = (id, event, ...rest) => {
+        if (event === "start" && fail) { fail = false; throw new Error("disk full"); }
+        return real(id, event, ...rest);
+      };
+      expect(h.service.ownerMessage("dm:owner", task.id, "do it now")).toMatchObject({ ok: true });
+      expect(h.service.get(task.id)?.pendingInput.some((i) => i.text.includes("do it now"))).toBe(true);
+      vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
+      await flush();
+      expect(h.service.get(task.id)?.status).toBe("active");
+      expect(h.prompts.some((p) => p.includes("do it now"))).toBe(true);
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -312,6 +342,19 @@ describe("the todo link", () => {
     expect(mine).toBeDefined();
     expect(mine).not.toBe(foreign.id);
     expect(todos.list().find((i) => i.id === mine)).toMatchObject({ session: "dm:owner" });
+    h.service.stop();
+  });
+
+  it("never adopts the owning scope's own todo that merely mentions the task", () => {
+    const todos = new TodoStore(join(dir, "todos"), DEFAULT_TODOS);
+    const link = createTodoLink(todos);
+    const seed = harness({}, { todos: link });
+    const t = seed.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    const unrelated = todos.add({ title: "Check what s1 found", next: "x", waiting_on: "me", ref: t.sessionKey, session: "dm:owner", source: "self" });
+    const h = harness({ maxRunning: 0 }, { todos: link });
+    h.service.start();
+    expect(h.store.get(t.id)?.todoId).not.toBe(unrelated.id);
+    expect(todos.list().find((i) => i.id === unrelated.id)).toMatchObject({ next: "x", waiting_on: "me" });
     h.service.stop();
   });
 

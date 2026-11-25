@@ -374,6 +374,21 @@ describe("sub-sessions through the Agent", () => {
       await agent.stop();
     });
 
+    it("a queued mirror turn does not run once only the task's own words are left unseen", async () => {
+      const { agent, channel } = await boot(true, new IdChannel("telegram"));
+      mockSdk.responseFn = (text) => (text.includes("subsession-start") ? new Promise(() => {}) : "ok");
+      await channel.simulateMessage(owner("hi"));
+      await drainQueue(agent);
+      agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
+      expect((await agent.subsessions!.reply("task:s1", "Using main.")).ok).toBe(true);
+      expect(agent.subsessions!.hasUnseenMirror("dm:alex")).toBe(true);
+      const before = ownerPrompts().length;
+      (agent as unknown as { mirrorWake(k: string): void }).mirrorWake("dm:alex");
+      await new Promise((r) => setTimeout(r, 100));
+      expect(ownerPrompts()).toHaveLength(before);
+      await agent.stop();
+    });
+
     it("leaves /s alone when sub-sessions are off", async () => {
       const { agent, channel } = await boot(false);
       mockSdk.responseFn = () => "ok";

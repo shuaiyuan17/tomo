@@ -1322,7 +1322,16 @@ export class SubsessionService {
     // owner's message never waits for a slot: it starts the task, like
     // `/s <id> start`.
     if (event === "owner_message") {
-      this.startTask(id, "the owner wrote to it");
+      try {
+        this.startTask(id, "the owner wrote to it");
+      } catch (err) {
+        // The message is on the task already: it must not be reported as
+        // undelivered (the caller would hand it to the owning session too).
+        // The start is owed, and made again at the next recheck.
+        log.error({ err, id }, "Could not start a queued sub-session for the owner's message; trying again shortly");
+        this.startsOwed.set(id, "the owner wrote to it");
+        this.armRegistryRecheck();
+      }
       return { ...outcome, record: this.safeGet(id) ?? outcome.record };
     }
     return outcome;
@@ -1707,6 +1716,15 @@ export class SubsessionService {
     }
     if (shown.length === 0) return undefined;
     return { text: formatMirrorNote(shown), upTo };
+  }
+
+  /** Does the scope have unseen words the owner wrote to one of its tasks (what a mirror turn is for)? */
+  hasUnseenOwnerWords(scope: string): boolean {
+    try {
+      return this.store.list().some((t) => t.parentKey === scope && t.conversation.some((e) => e.seq > t.mirrorSeenSeq && e.from === "owner"));
+    } catch {
+      return false;
+    }
   }
 
   /** Does the scope have conversation it has not seen? */

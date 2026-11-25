@@ -19,7 +19,7 @@ import {
   formatMirrorNote,
   formatStartEvent,
 } from "./prompt.js";
-import { OPEN_STATUSES, OWNER_ACTION_MAX, PENDING_INPUT_MAX, needsOwner, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, STEP_RESULT_MAX, TERMINAL_STATUSES, oneLine, type SubsessionPlanStep, activeTotalMs, appendInput, lastInputSeq, type SubsessionConversationEntry, type SubsessionInput, type SubsessionRecord, type SubsessionStatus } from "./types.js";
+import { OPEN_STATUSES, OWNER_ACTION_MAX, PENDING_INPUT_MAX, needsOwner, reportNumber, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, STEP_RESULT_MAX, TERMINAL_STATUSES, oneLine, type SubsessionPlanStep, activeTotalMs, appendInput, lastInputSeq, type SubsessionConversationEntry, type SubsessionInput, type SubsessionRecord, type SubsessionStatus } from "./types.js";
 
 const OWNER_MESSAGE_MARKER = '<tomo-event type="subsession-owner-message"';
 
@@ -243,6 +243,8 @@ export class SubsessionService {
   /** Which task each send in flight belongs to (see `sendingTasks`). */
   private readonly sendOwners = new Map<Promise<unknown>, string>();
   private sweepTimer?: NodeJS.Timeout;
+  /** Set while the startup hook's work is incomplete: no record is forgotten, so a later start can still match against it. */
+  private keepEndedRecords = false;
   private readonly reportTimers = new Map<string, NodeJS.Timeout>();
   private readonly reportAttempts = new Map<string, number>();
   /** The highest input seq the turn in flight carries, per task (runtime only). */
@@ -457,24 +459,34 @@ export class SubsessionService {
    * The owner did what a finished task's report asked of them, or says it no
    * longer needs doing (`/s <id> done`, or task_done from the owning
    * session): the task stops showing as "Needs you". `scope` is the session
-   * that asked; a task of another scope is unknown here. Not a transition:
-   * the task stays finished, and archives like any other.
+   * that asked; a task of another scope is unknown here. `report` is the
+   * report seq the owner answered (task_done carries the one its note
+   * named): a newer report's ask is never cleared by an answer to an older
+   * one (reason "newer", with the record). Without it (`/s <id> done`, where
+   * the owner answers what the task shows now) the report read here counts.
+   * Not a transition: the task stays finished, and archives like any other.
    */
-  markDone(scope: string, id: string): { ok: true; record: SubsessionRecord } | { ok: false; reason: "unknown" | "nothing" | "unreadable" } {
+  markDone(scope: string, id: string, report?: number): { ok: true; record: SubsessionRecord } | { ok: false; reason: "unknown" | "nothing" | "unreadable" } | { ok: false; reason: "newer"; record: SubsessionRecord } {
     if (!this.available()) return { ok: false, reason: "unreadable" };
     const record = this.store.get(id);
     if (!record || record.parentKey !== scope) return { ok: false, reason: "unknown" };
     if (!needsOwner(record)) return { ok: false, reason: "nothing" };
-    // Under the lock, and only the ask of the report the owner saw: a
-    // task_finish that landed meanwhile is a new report (a new reportSeq)
-    // whose ask they have not answered, even when its words are the same.
-    const seq = record.reportSeq;
+    // Under the lock, and only the ask of the report the owner answered: a
+    // task_finish that landed since is a new report (a new reportSeq) whose
+    // ask they have not answered, even when its words are the same.
+    const seq = report ?? reportNumber(record);
+    // A number past the latest report answers nothing the task asked.
+    if (seq > reportNumber(record)) return { ok: false, reason: "nothing" };
+    if (reportNumber(record) !== seq) return { ok: false, reason: "newer", record };
     let cleared = false;
+    let newer = false;
     const updated = this.store.update(id, (r) => {
-      if (r.status !== "finished" || r.reportSeq !== seq || !r.ownerAction) return;
+      if (r.status !== "finished" || !r.ownerAction) return;
+      if (reportNumber(r) !== seq) { newer = true; return; }
       delete r.ownerAction;
       cleared = true;
     });
+    if (updated && newer) return { ok: false, reason: "newer", record: updated };
     if (!updated || !cleared) return { ok: false, reason: "nothing" };
     log.info({ id }, "Sub-session marked done by the owner");
     return { ok: true, record: updated };
@@ -1000,8 +1012,19 @@ export class SubsessionService {
    * what they would tell the owner waits for start(). Until this returns,
    * `available()` is false, so no input reaches a task recovery has not
    * looked at. Safe to call more than once.
+   *
+   * `onTableRead` is handed the records exactly as read, before recovery,
+   * reconcile or the sweep change or forget any (a migration that has to see
+   * every task: dropping the todos the old todo link made), and `keepAsk`,
+   * which moves an ask onto a finished task's record (its `ownerAction`,
+   * left as it is when the record already has one; once per record, so an
+   * ask the owner cleared never comes back). Only records the table can be
+   * trusted with are handed over (not one read from the backup). It answers whether its
+   * work is complete: until it is (false, or a throw), the sweep forgets no
+   * record in this process, so the next start can still match against them.
+   * Called only when the table could be read.
    */
-  recoverAtStartup(): void {
+  recoverAtStartup(onTableRead?: (records: readonly SubsessionRecord[], keepAsk: (id: string, action: string) => boolean) => boolean): void {
     if (this.recovered || this.broken || !this.deps.config().enabled) return;
     let startState: ReturnType<SubsessionStore["state"]>;
     try {
@@ -1011,6 +1034,18 @@ export class SubsessionService {
       startState = this.store.state();
       this.startState = startState;
       this.trustedAtStart = (startState === "ok" || startState === "missing") && !table.untrusted;
+      if (onTableRead) {
+        // A table recovered from its backup, or a record read from it, may
+        // hold an older status than what happened: the hook acts on neither
+        // (it runs again next start), so its work is not complete.
+        this.keepEndedRecords = true;
+        const trusted = this.trustedAtStart ? table.tasks.filter((r) => !r.restored) : [];
+        const whole = this.trustedAtStart && trusted.length === table.tasks.length;
+        this.safely(() => {
+          const done = onTableRead(trusted, (id, action) => this.keepAsk(id, action));
+          this.keepEndedRecords = !(done && whole);
+        }, "startup hook");
+      }
     } catch (err) {
       this.broken = true;
       log.error({ err, path: this.store.path }, "Sub-session table unreadable; sub-sessions are off until it is repaired. Nothing was unlinked or cancelled.");
@@ -1313,6 +1348,21 @@ export class SubsessionService {
     this.cronRecheckTimer.unref?.();
   }
 
+  /** onTableRead's keepAsk: true once the finished task's old ask has been moved onto it (now or by an earlier start), false when it is not finished or the write failed. */
+  private keepAsk(id: string, action: string): boolean {
+    try {
+      const updated = this.store.update(id, (r) => {
+        if (r.status !== "finished" || r.legacyAskMoved) return;
+        if (!r.ownerAction) r.ownerAction = oneLine(action, OWNER_ACTION_MAX);
+        r.legacyAskMoved = true;
+      });
+      return !!updated && updated.status === "finished" && !!updated.legacyAskMoved;
+    } catch (err) {
+      log.warn({ err, id }, "Could not move a sub-session's old todo onto its record");
+      return false;
+    }
+  }
+
   /** Archive finished tasks after 7 days; forget ended ones after 30. Only what mayCleanUp allows. */
   private sweep(): void {
     const now = this.now();
@@ -1333,7 +1383,7 @@ export class SubsessionService {
         && now - (task.endedAt ?? task.lastActivityAt) > FINISHED_KEEP_MS) {
         const outcome = this.store.transition(task.id, "archive", { reason: "finished more than 7 days ago" });
         if (outcome.ok) this.safely(() => this.deps.unlinkRegistryEntry(task.sessionKey), "unlink archived");
-      } else if (TERMINAL_STATUSES.has(task.status) && now - (task.endedAt ?? task.lastActivityAt) > ENDED_KEEP_MS) {
+      } else if (!this.keepEndedRecords && TERMINAL_STATUSES.has(task.status) && now - (task.endedAt ?? task.lastActivityAt) > ENDED_KEEP_MS) {
         // A failed task's unanswered owner input goes only once it is handed
         // back in full; a handback that could not be written is tried again here.
         if (task.status === "failed" && !task.handedBack && task.pendingInput.some(isOwnerInput) && !this.handBack(task)) continue;
@@ -2020,7 +2070,7 @@ export class SubsessionService {
         excerpt,
         ...(earlier.length > 0 ? [`Its earlier report${earlier.length === 1 ? "" : "s"} ${earlier.join(", ")} ${earlier.length === 1 ? "is" : "are"} kept too: task_status shows ${earlier.length === 1 ? "it" : "them"}.`] : []),
         needsOwner(record)
-          ? `It needs the owner to: ${needsOwner(record)!.replace(/[.。]+$/, "")}. Tell them. The task shows as "Needs you" until they do it: once they say it is done (or no longer needed), call task_done("${record.id}").`
+          ? `It needs the owner to: ${needsOwner(record)!.replace(/[.。]+$/, "")}. Tell them. The task shows as "Needs you" until they do it: once they say it is done (or no longer needed), call task_done("${record.id}", ${reportNumber(record)}).`
           : "It needs nothing from the owner.",
       ].join("\n"), { name: reportNoteName(record) });
       if (!this.deps.queuePendingNote(record.parentKey, note)) {

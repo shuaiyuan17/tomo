@@ -3192,9 +3192,10 @@ export class Agent {
       // Sub-session restart recovery runs BEFORE any channel ingests, so no
       // input can reach a task recovery has not looked at yet. It schedules
       // nothing: dispatch opens with start() below, after the inbox replay.
-      this.subsessions?.recoverAtStartup();
-      // The todos the old per-task todo link made would never close now (the task record is the card).
-      if (this.subsessions?.available()) dropLegacyTaskTodos(new TodoStore(), this.subsessions.list());
+      // The todos the old per-task todo link made would never close now (the
+      // task record is the card). Dropped from the table as read, before the
+      // sweep forgets a task whose todo is still open.
+      this.subsessions?.recoverAtStartup((records, keepAsk) => dropLegacyTaskTodos(new TodoStore(), records, keepAsk).complete);
     } catch (err) {
       log.error({ err }, "Sub-session recovery failed");
     }

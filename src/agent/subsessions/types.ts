@@ -199,8 +199,14 @@ export interface SubsessionRecord {
    * while the task is finished, read through `needsOwner`.
    */
   ownerAction?: string;
-  /** Counts the task's reports (a finished task can be woken and finish again); its report note is named by it. */
+  /** Counts the task's reports (a finished task can be woken and finish again); its report note is named by it. Read through `reportNumber`. */
   reportSeq?: number;
+  /**
+   * Set once a start moved the old todo link's "Read sN's result" onto this
+   * record as its `ownerAction`: never moved again (an ask the owner has
+   * since cleared stays cleared, even while that todo could not be dropped).
+   */
+  legacyAskMoved?: true;
   /**
    * Earlier reports a later task_finish replaced while they were still
    * unread (their note still waiting, or never written), oldest first, at
@@ -324,6 +330,11 @@ export const OWNER_ACTION_MAX = 300;
  * or undefined when it asks nothing or the task is not finished. A task that
  * returns one is the owner's: shown as "Needs you" and never archived.
  */
+/** The number of the task's latest report: `reportSeq`, or 1 for a record written before reports were counted. */
+export function reportNumber(record: Pick<SubsessionRecord, "reportSeq">): number {
+  return record.reportSeq ?? 1;
+}
+
 export function needsOwner(record: Pick<SubsessionRecord, "status" | "ownerAction">): string | undefined {
   return record.status === "finished" && record.ownerAction ? record.ownerAction : undefined;
 }

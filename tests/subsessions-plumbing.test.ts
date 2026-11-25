@@ -197,16 +197,17 @@ describe("sub-session tools", () => {
     const owner = buildTaskOwnerTools({ service: () => svc, scope: () => "dm:owner" });
     const group = buildTaskOwnerTools({ service: () => svc, scope: () => "telegram:-100123" });
     await call(owner, "task_spawn", { title: "Mine", brief: "b" });
-    expect((await call(owner, "task_done", { id: "s1" })).content[0].text).toContain("asks nothing of the owner");
+    expect((await call(owner, "task_done", { id: "s1", report: 1 })).content[0].text).toContain("asks nothing of the owner");
     // As its first turn leaves it (dispatch is not open here, so nothing else starts it).
     (svc as unknown as { store: { transition: (id: string, e: string) => unknown } }).store.transition("s1", "start");
     const self = buildTaskSelfTools({ service: () => svc, key: "task:s1" });
     const out = await call(self as never, "task_finish", { report: "PR #4 is open.", owner_action: "Merge PR #4" });
     expect(out.content[0].text).toContain("needing the owner");
     expect(svc.get("s1")).toMatchObject({ status: "finished", ownerAction: "Merge PR #4" });
-    expect((await call(group, "task_done", { id: "s1" })).isError).toBe(true);
+    expect((await call(group, "task_done", { id: "s1", report: 1 })).isError).toBe(true);
     expect(svc.get("s1")?.ownerAction).toBe("Merge PR #4");
-    const done = await call(owner, "task_done", { id: "s1" });
+    const report = svc.get("s1")!.reportSeq!;
+    const done = await call(owner, "task_done", { id: "s1", report });
     expect(done.isError).toBeUndefined();
     expect(svc.get("s1")?.ownerAction).toBeUndefined();
   });

@@ -9,9 +9,12 @@ import {
   type TaskTurnOutcome,
 } from "../src/agent/subsessions/service.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
-import { ACTIVE_HEARTBEAT_MS, FINISHED_KEEP_MS, REGISTRY_RECHECK_MS } from "../src/agent/subsessions/service.js";
+import { ACTIVE_HEARTBEAT_MS, ENDED_KEEP_MS, FINISHED_KEEP_MS, REGISTRY_RECHECK_MS } from "../src/agent/subsessions/service.js";
 import { formatMirrorNote, formatOwnerMessageEvent, MIRROR_ENTRY_MAX } from "../src/agent/subsessions/prompt.js";
 import { appendInput, needsOwner, type SubsessionRecord } from "../src/agent/subsessions/types.js";
+import { dropLegacyTaskTodos } from "../src/agent/subsessions/legacy-todos.js";
+import { TodoStore } from "../src/todos/store.js";
+import { DEFAULT_TODOS } from "../src/todos/limits.js";
 
 let dir = "";
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "tomo-subp2-")); });
@@ -383,7 +386,7 @@ describe("a task is its own card", () => {
     const task = await finished(h, "Review and merge PR #12\n(and nothing past the first line)");
     expect(needsOwner(task)).toBe("Review and merge PR #12");
     expect(h.notes.at(-1)).toContain("It needs the owner to: Review and merge PR #12.");
-    expect(h.notes.at(-1)).toContain(`task_done("${task.id}")`);
+    expect(h.notes.at(-1)).toContain(`task_done("${task.id}", ${h.store.get(task.id)!.reportSeq})`);
     h.service.stop();
   });
 
@@ -432,9 +435,23 @@ describe("a task is its own card", () => {
     h.store.transition(task.id, "finish", { patch: (r) => { r.reportSeq = (r.reportSeq ?? 1) + 1; r.ownerAction = "Review and merge the PR"; } });
     const get = h.store.get.bind(h.store);
     h.store.get = (id: string) => (id === task.id ? seen : get(id));
-    expect(h.service.markDone("dm:owner", task.id)).toEqual({ ok: false, reason: "nothing" });
+    expect(h.service.markDone("dm:owner", task.id)).toMatchObject({ ok: false, reason: "newer" });
     h.store.get = get;
     expect(needsOwner(h.store.get(task.id)!)).toBe("Review and merge the PR");
+    h.service.stop();
+  });
+
+  it("done from the owning session clears the report the owner answered, never one that came after it", async () => {
+    const h = harness();
+    const task = await finished(h, "Merge PR #12");
+    const first = h.store.get(task.id)!.reportSeq!;
+    expect(h.notes.at(-1)).toContain(`task_done("${task.id}", ${first})`);
+    // Reopened and finished again before the owning session acted on the owner's "merged #12".
+    h.store.transition(task.id, "reopen");
+    h.store.transition(task.id, "finish", { patch: (r) => { r.reportSeq = first + 1; r.ownerAction = "Merge PR #13"; } });
+    expect(h.service.markDone("dm:owner", task.id, first)).toMatchObject({ ok: false, reason: "newer", record: { reportSeq: first + 1 } });
+    expect(needsOwner(h.store.get(task.id)!)).toBe("Merge PR #13");
+    expect(h.service.markDone("dm:owner", task.id, first + 1).ok).toBe(true);
     h.service.stop();
   });
 
@@ -456,6 +473,91 @@ describe("a task is its own card", () => {
     after.service.start();
     expect(after.service.get(task.id)?.status).toBe("archived");
     after.service.stop();
+  });
+
+  it("hands startup the table as read, before the sweep forgets an old task (its old todo can still be matched)", async () => {
+    const seed = harness();
+    const task = await finished(seed, undefined);
+    seed.store.transition(task.id, "archive");
+    seed.service.stop();
+    const h = harness({}, { clock: 1_000_000 + ENDED_KEEP_MS + 60_000 });
+    let seen: string[] = [];
+    h.service.recoverAtStartup((records) => { seen = records.map((r) => r.id); return true; });
+    expect(seen).toContain(task.id);
+    expect(h.service.get(task.id)).toBeUndefined();
+    h.service.stop();
+  });
+
+  it("forgets no record while the startup hook's work is incomplete, so the next start can still match against it", async () => {
+    const seed = harness();
+    const task = await finished(seed, undefined);
+    seed.store.transition(task.id, "archive");
+    seed.service.stop();
+    const later = 1_000_000 + ENDED_KEEP_MS + 60_000;
+    const failing = harness({}, { clock: later });
+    failing.service.recoverAtStartup(() => false);
+    expect(failing.service.get(task.id)?.status).toBe("archived");
+    failing.service.stop();
+    const throwing = harness({}, { clock: later });
+    throwing.service.recoverAtStartup(() => { throw new Error("todo list unreadable"); });
+    expect(throwing.service.get(task.id)?.status).toBe("archived");
+    throwing.service.stop();
+  });
+
+  it("moves an old todo's unread result onto a finished task: Needs you, and its own ask is never overwritten", async () => {
+    const seed = harness();
+    const plain = await finished(seed, undefined);
+    seed.service.stop();
+    const h = harness();
+    h.service.recoverAtStartup((_records, keepAsk) => keepAsk(plain.id, `Read ${plain.id}'s result`));
+    expect(needsOwner(h.store.get(plain.id)!)).toBe(`Read ${plain.id}'s result`);
+    h.service.stop();
+    const again = harness();
+    again.service.recoverAtStartup((_records, keepAsk) => keepAsk(plain.id, "Something else"));
+    expect(needsOwner(again.store.get(plain.id)!)).toBe(`Read ${plain.id}'s result`);
+    again.service.stop();
+    // Moved once: an ask the owner cleared stays cleared, even when a later start still finds the old todo.
+    const owner = harness();
+    owner.service.start();
+    expect(owner.service.markDone("dm:owner", plain.id).ok).toBe(true);
+    owner.service.stop();
+    const later = harness();
+    let answer: boolean | undefined;
+    later.service.recoverAtStartup((_records, keepAsk) => { answer = keepAsk(plain.id, `Read ${plain.id}'s result`); return true; });
+    expect(answer).toBe(true);
+    expect(needsOwner(later.store.get(plain.id)!)).toBeUndefined();
+    later.service.stop();
+  });
+
+  it("hands the startup hook no record read from the backup, and forgets nothing while it holds any", async () => {
+    const seed = harness();
+    const old = await finished(seed, undefined);
+    seed.store.transition(old.id, "archive");
+    const fresh = spawn(seed);
+    seed.store.update(fresh.id, (r) => { r.restored = true; });
+    seed.service.stop();
+    const h = harness({}, { clock: 1_000_000 + ENDED_KEEP_MS + 60_000 });
+    let seen: string[] = [];
+    h.service.recoverAtStartup((records) => { seen = records.map((r) => r.id); return true; });
+    expect(seen).toContain(old.id);
+    expect(seen).not.toContain(fresh.id);
+    expect(h.service.get(old.id)?.status).toBe("archived");
+    h.service.stop();
+  });
+
+  it("upgrades a finished task's old todo into Needs you, with the real todo list", async () => {
+    const seed = harness();
+    const task = await finished(seed, undefined);
+    seed.service.stop();
+    const todos = new TodoStore(join(dir, "todos"), DEFAULT_TODOS);
+    const item = todos.add({ title: `${task.title} (${task.id})`, next: `Read ${task.id}'s result, then close this`, waiting_on: "owner", ref: task.sessionKey, session: task.parentKey, source: "self" });
+    const h = harness();
+    h.service.recoverAtStartup((records, keepAsk) => dropLegacyTaskTodos(todos, records, keepAsk).complete);
+    expect(needsOwner(h.store.get(task.id)!)).toBe(`Read ${task.id}'s result`);
+    expect(todos.list().map((i) => i.id)).not.toContain(item.id);
+    h.service.start();
+    expect(h.service.markDone("dm:owner", task.id, 1).ok).toBe(true);
+    h.service.stop();
   });
 });
 

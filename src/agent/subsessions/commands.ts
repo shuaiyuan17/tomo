@@ -56,6 +56,7 @@ export async function taskCommandReply(
       if (result.ok) return t("cmd.done", { id: record.id, title: record.title });
       if (result.reason === "unknown") return t("cmd.unknown", { id: record.id });
       if (result.reason === "unreadable") return t("cmd.unavailable");
+      if (result.reason === "newer") return t("cmd.newerReport", { id: record.id, action: needsOwner(result.record) ?? "" });
       return t("cmd.nothingToDo", { id: record.id, status: statusWord(t, service.get(record.id) ?? record) });
     }
     case "model": {

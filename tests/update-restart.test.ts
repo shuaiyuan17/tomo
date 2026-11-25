@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { fetchLatestVersion } from "../src/version.js";
+import { fetchLatestVersion, isNewer } from "../src/version.js";
 import { spawnPostUpdateRestart } from "../src/cli/update.js";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -10,6 +10,30 @@ const registryReturns = (body: unknown): void => {
     json: async () => body,
   })));
 };
+
+describe("isNewer — semver precedence", () => {
+  it.each([
+    ["a higher patch", "0.9.2", "0.9.1", true],
+    ["the same release", "0.9.2", "0.9.2", false],
+    ["an older release", "0.9.1", "0.9.2", false],
+    ["minor outranks patch", "0.10.0", "0.9.9", true],
+    // Someone running an RC used to never hear about the final release.
+    ["a release over its own prerelease", "0.9.2", "0.9.2-rc.1", true],
+    ["a later release over a prerelease", "0.9.3", "0.9.2-rc.1", true],
+    ["a prerelease is below its release", "0.9.2-rc.1", "0.9.2", false],
+    ["a prerelease of a later version", "1.0.0-rc.1", "0.9.2", true],
+    ["numeric identifiers compare as numbers", "1.0.0-rc.10", "1.0.0-rc.2", true],
+    ["numeric identifiers rank below alphanumeric", "1.0.0-alpha", "1.0.0-1", true],
+    ["alphanumeric identifiers compare in ASCII order", "1.0.0-beta", "1.0.0-alpha", true],
+    ["a longer identifier list ranks higher", "1.0.0-alpha.1", "1.0.0-alpha", true],
+    ["the same prerelease", "1.0.0-rc.2", "1.0.0-rc.2", false],
+    ["build metadata carries no precedence", "1.0.0+build.2", "1.0.0+build.1", false],
+    ["an unparseable latest is never newer", "garbage", "0.9.2", false],
+    ["an unparseable current is never older", "0.9.2", "test", false],
+  ])("%s: isNewer(%s, %s) is %s", (_label, latest, current, expected) => {
+    expect(isNewer(latest, current)).toBe(expected);
+  });
+});
 
 describe("fetchLatestVersion — registry response is remote input", () => {
   // A malformed value used to be returned verbatim and interpolated into a

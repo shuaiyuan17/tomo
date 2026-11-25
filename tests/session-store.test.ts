@@ -1,9 +1,10 @@
 import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import type { SessionMessage } from "../src/sessions/types.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { makeSessionStore, writeTranscript as writeTranscriptIn } from "./helpers/session-store-fixtures.js";
+import { PendingNotesReadError } from "../src/sessions/store.js";
 
 const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-sessions-"));
 // The root is unique to this run, so nothing else will clean it up.
@@ -116,6 +117,48 @@ describe("SessionStore", () => {
     store2.setPendingNotes("telegram:-987", []);
     const store3 = makeSessionStore(TEST_DIR);
     expect(store3.getPendingNotes("telegram:-987")).toEqual([]);
+  });
+
+  it("a pending notes file that will not parse is kept verbatim, not overwritten by the next write", () => {
+    const file = join(TEST_DIR, "_pending_notes.json");
+    const corrupt = '{"version":1,"notes":{"dm:alice":["only copy of a replayed message"]'; // truncated
+    writeFileSync(file, corrupt);
+    const store = makeSessionStore(TEST_DIR);
+
+    expect(store.getPendingNotes("dm:alice")).toEqual([]);
+    store.setPendingNotes("telegram:-987", ["new"]);
+
+    const asides = readdirSync(TEST_DIR).filter((f) => f.startsWith("_pending_notes.json.corrupt-"));
+    expect(asides).toHaveLength(1);
+    expect(readFileSync(join(TEST_DIR, asides[0]), "utf-8")).toBe(corrupt);
+    expect(store.getPendingNotes("telegram:-987")).toEqual(["new"]);
+    // Read again: the file is clean now, no second copy is made.
+    expect(readdirSync(TEST_DIR).filter((f) => f.startsWith("_pending_notes.json.corrupt-"))).toHaveLength(1);
+  });
+
+  it("a pending notes row of the wrong shape is kept aside; the other sessions' rows survive a write", () => {
+    const file = join(TEST_DIR, "_pending_notes.json");
+    const raw = JSON.stringify({ version: 1, notes: { "dm:alice": ["keep me"], "dm:bob": [42] } });
+    writeFileSync(file, raw);
+    const store = makeSessionStore(TEST_DIR);
+
+    store.setPendingNotes("telegram:-987", ["new"]);
+
+    expect(store.getPendingNotes("dm:alice")).toEqual(["keep me"]);
+    expect(store.getPendingNotes("telegram:-987")).toEqual(["new"]);
+    const asides = readdirSync(TEST_DIR).filter((f) => f.startsWith("_pending_notes.json.corrupt-"));
+    expect(asides).toHaveLength(1);
+    expect(readFileSync(join(TEST_DIR, asides[0]), "utf-8")).toBe(raw);
+  });
+
+  it("a pending notes file that cannot be read throws, and a write leaves it untouched", () => {
+    const file = join(TEST_DIR, "_pending_notes.json");
+    mkdirSync(file); // readFileSync fails with EISDIR, not ENOENT
+    const store = makeSessionStore(TEST_DIR);
+
+    expect(() => store.getPendingNotes("dm:alice")).toThrow(PendingNotesReadError);
+    expect(() => store.setPendingNotes("dm:alice", ["new"])).toThrow(PendingNotesReadError);
+    expect(statSync(file).isDirectory()).toBe(true);
   });
 
   it("list APIs see external registry changes from another store instance", () => {

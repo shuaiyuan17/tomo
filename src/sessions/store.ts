@@ -1,4 +1,4 @@
-import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync, openSync, closeSync, linkSync, copyFileSync, type BigIntStats } from "node:fs";
+import { mkdirSync, appendFileSync, readFileSync, writeFileSync, existsSync, unlinkSync, renameSync, statSync, readdirSync, openSync, closeSync, fsyncSync, linkSync, copyFileSync, type BigIntStats } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
 import type { Session, SessionMessage, SessionEntry, SessionRegistry, ReplyTarget, UsageBaseline } from "./types.js";
@@ -173,6 +173,17 @@ export class SessionRegistryReadError extends Error {
   constructor(path: string, cause: unknown) {
     super(`session registry could not be read: ${path}`, { cause });
     this.name = "SessionRegistryReadError";
+    this.path = path;
+  }
+}
+
+/** `_pending_notes.json` exists but could not be read, or could not be
+ *  set aside when it would not parse. Nothing was written over it. */
+export class PendingNotesReadError extends Error {
+  readonly path: string;
+  constructor(path: string, cause: unknown) {
+    super(`pending notes could not be read: ${path}`, { cause });
+    this.name = "PendingNotesReadError";
     this.path = path;
   }
 }
@@ -781,13 +792,16 @@ export class SessionStore {
   }
 
   /** Load prompt notes that must survive daemon restarts until the session's
-   *  next turn drains them. Returns a defensive copy. */
+   *  next turn drains them. Returns a defensive copy. Throws
+   *  `PendingNotesReadError` while the file cannot be read. */
   getPendingNotes(key: string): string[] {
     return [...(this.loadPendingNotes()[key] ?? [])];
   }
 
   /** Replace the durable prompt-note queue for one session. An empty list
-   *  removes the key and deletes the sidecar when no queues remain. */
+   *  removes the key and deletes the sidecar when no queues remain. Throws
+   *  `PendingNotesReadError`, writing nothing, while the file cannot be read:
+   *  the other sessions' rows come from that read. */
   setPendingNotes(key: string, notes: string[]): void {
     const data = this.loadPendingNotes();
     if (notes.length > 0) {
@@ -1490,9 +1504,17 @@ export class SessionStore {
       );
     }
 
-    const pendingNotes = this.loadPendingNotes();
-    const oldNotes = pendingNotes[oldKey];
-    if (oldNotes) {
+    // An unreadable notes file is left exactly as it is (rewriting it from
+    // `{}` would drop every session's notes); the registry and transcripts
+    // have already moved, so this must not fail the migration either.
+    let pendingNotes: Record<string, string[]> | null = null;
+    try {
+      pendingNotes = this.loadPendingNotes();
+    } catch (err) {
+      log.error({ err, oldKey, newKey }, "Pending notes could not be read; the old key's notes were not carried over");
+    }
+    const oldNotes = pendingNotes?.[oldKey];
+    if (pendingNotes && oldNotes) {
       pendingNotes[newKey] = [...(pendingNotes[newKey] ?? []), ...oldNotes];
       delete pendingNotes[oldKey];
       writeJsonAtomicSync(this.pendingNotesPath, {
@@ -1640,20 +1662,113 @@ export class SessionStore {
     return join(this.dir, "_pending_notes.json");
   }
 
+  /**
+   * Every session's durable prompt notes, read off `_pending_notes.json`.
+   *
+   * AN UNREADABLE FILE IS NOT AN EMPTY ONE. Every writer of this file
+   * rewrites it whole from what this returned, so answering `{}` for a file
+   * that would not parse used to make the next `setPendingNotes` for ANY
+   * session overwrite every other session's notes — and some of them (an
+   * inbox replay note, a task report) are the only remaining copy of what
+   * they carry. So:
+   *  - missing → `{}` (nothing queued);
+   *  - a read error (EACCES, EIO, …) → `PendingNotesReadError`, and the file
+   *    is left alone; a write refuses with the same error until it reads;
+   *  - unparseable, the wrong shape, or a row that is not a list of strings →
+   *    the bytes are kept verbatim in a `.corrupt-<ts>` sibling first, the
+   *    good rows are written back, and only those are returned. If the
+   *    sibling cannot be written, this throws like a read error: the
+   *    original is never replaced before its bytes are safe elsewhere.
+   */
   private loadPendingNotes(): Record<string, string[]> {
-    if (!existsSync(this.pendingNotesPath)) return {};
+    const path = this.pendingNotesPath;
+    let raw: string;
     try {
-      const data = JSON.parse(readFileSync(this.pendingNotesPath, "utf-8")) as Partial<PendingNotesFile>;
-      if (!data.notes || typeof data.notes !== "object") return {};
-      return Object.fromEntries(
-        Object.entries(data.notes)
-          .filter((entry): entry is [string, string[]] =>
-            Array.isArray(entry[1]) && entry[1].every((note) => typeof note === "string")),
-      );
+      raw = readFileSync(path, "utf-8");
     } catch (err) {
-      log.warn({ err, file: this.pendingNotesPath }, "Could not load pending notes");
-      return {};
+      if (isEnoent(err)) return {};
+      throw new PendingNotesReadError(path, err);
     }
+
+    const good: Record<string, string[]> = {};
+    let bad = false;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      bad = true;
+    }
+    if (!bad) {
+      const notes = parsed && typeof parsed === "object" ? (parsed as Partial<PendingNotesFile>).notes : undefined;
+      if (!notes || typeof notes !== "object" || Array.isArray(notes)) {
+        bad = true;
+      } else {
+        for (const [key, value] of Object.entries(notes)) {
+          if (Array.isArray(value) && value.every((note) => typeof note === "string")) good[key] = value;
+          else bad = true;
+        }
+      }
+    }
+    if (bad) this.quarantinePendingNotes(raw, good);
+    return good;
+  }
+
+  /** Keep an unreadable `_pending_notes.json` verbatim in a `.corrupt-<ts>`
+   *  sibling, then write back only the rows that read (see
+   *  `loadPendingNotes`). Throws `PendingNotesReadError` when the bytes could
+   *  not be kept, leaving the original untouched. */
+  private quarantinePendingNotes(raw: string, good: Record<string, string[]>): void {
+    const path = this.pendingNotesPath;
+    if (this.readOnly) {
+      log.warn({ file: path }, "Pending notes file could not be read in full; read-only store, left as it is");
+      return;
+    }
+    let aside: string | null = null;
+    if (raw.trim() !== "") {
+      try {
+        aside = this.keepCorruptPendingNotes(raw);
+      } catch (err) {
+        throw new PendingNotesReadError(path, err);
+      }
+    }
+    log.warn(
+      { file: path, aside, keptSessions: Object.keys(good).length },
+      "Pending notes file could not be read in full; kept it verbatim beside it and kept only the rows that read",
+    );
+    try {
+      if (Object.keys(good).length === 0) {
+        unlinkSync(path);
+      } else {
+        writeJsonAtomicSync(path, { version: 1, notes: good } satisfies PendingNotesFile, { fsync: true });
+      }
+    } catch (err) {
+      // The bytes are safe in the sibling; the next read tries again.
+      log.warn({ err, file: path }, "Could not write back the readable pending notes");
+    }
+  }
+
+  /** Write `raw` to a free `_pending_notes.json.corrupt-<ts>[-<n>]`, fsynced,
+   *  never over an existing file. Returns its path. */
+  private keepCorruptPendingNotes(raw: string): string {
+    const ts = fileTimestamp();
+    for (let n = 0; n < 100; n++) {
+      const to = n === 0 ? `${this.pendingNotesPath}.corrupt-${ts}` : `${this.pendingNotesPath}.corrupt-${ts}-${n}`;
+      let fd: number;
+      try {
+        fd = openSync(to, "wx", 0o600);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "EEXIST") continue;
+        throw err;
+      }
+      try {
+        writeFileSync(fd, raw);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      return to;
+    }
+    throw new Error("no free name for the pending notes .corrupt- copy");
   }
 
   // --- Legacy stem ownership ledger (see LegacyStemLedgerFile) ---

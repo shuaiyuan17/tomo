@@ -49,14 +49,56 @@ function writeCache(cache: VersionCache): void {
   writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
 }
 
-function isNewer(latest: string, current: string): boolean {
-  const a = latest.split(".").map(Number);
-  const b = current.split(".").map(Number);
-  for (let i = 0; i < 3; i++) {
-    if ((a[i] ?? 0) > (b[i] ?? 0)) return true;
-    if ((a[i] ?? 0) < (b[i] ?? 0)) return false;
+/** A version's three numeric core parts and its prerelease identifiers
+ *  (empty for a release). Build metadata (`+...`) is dropped: it carries no
+ *  precedence. Null when the core is not three plain numbers. */
+function parseVersion(v: string): { core: number[]; pre: string[] } | null {
+  const noBuild = v.split("+", 1)[0];
+  const dash = noBuild.indexOf("-");
+  const coreText = dash < 0 ? noBuild : noBuild.slice(0, dash);
+  const preText = dash < 0 ? "" : noBuild.slice(dash + 1);
+  const core = coreText.split(".");
+  if (core.length !== 3 || !core.every((p) => /^\d+$/.test(p))) return null;
+  return { core: core.map(Number), pre: preText ? preText.split(".") : [] };
+}
+
+/** Semver precedence of two prerelease identifier lists (both non-empty).
+ *  Numeric identifiers compare numerically and rank below alphanumeric ones,
+ *  which compare in ASCII order; a shorter list that is a prefix ranks lower. */
+function comparePrerelease(a: string[], b: string[]): number {
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if (i >= a.length) return -1;
+    if (i >= b.length) return 1;
+    const aNum = /^\d+$/.test(a[i]);
+    const bNum = /^\d+$/.test(b[i]);
+    if (aNum && bNum) {
+      const diff = Number(a[i]) - Number(b[i]);
+      if (diff !== 0) return Math.sign(diff);
+    } else if (aNum !== bNum) {
+      return aNum ? -1 : 1;
+    } else if (a[i] !== b[i]) {
+      return a[i] < b[i] ? -1 : 1;
+    }
   }
-  return false;
+  return 0;
+}
+
+/**
+ * Is `latest` a higher version than `current`, by semver precedence? A
+ * release outranks its own prereleases (`1.0.0` > `1.0.0-rc.2`), so someone
+ * running an RC is told about the final release. Anything that does not
+ * parse as a version is never newer.
+ */
+export function isNewer(latest: string, current: string): boolean {
+  const a = parseVersion(latest);
+  const b = parseVersion(current);
+  if (!a || !b) return false;
+  for (let i = 0; i < 3; i++) {
+    if (a.core[i] !== b.core[i]) return a.core[i] > b.core[i];
+  }
+  if (a.pre.length === 0) return b.pre.length > 0;
+  if (b.pre.length === 0) return false;
+  return comparePrerelease(a.pre, b.pre) > 0;
 }
 
 /**
@@ -65,10 +107,8 @@ function isNewer(latest: string, current: string): boolean {
  *
  * The registry response is remote input and was previously returned with no
  * shape check at all, then interpolated into a command line and compared by
- * `isNewer` (which coerces each dot-segment with `Number`, so a non-numeric
- * segment silently becomes NaN and every comparison is false). Refusing
- * anything that is not a version keeps a malformed or hostile response from
- * reaching either.
+ * `isNewer`. Refusing anything that is not a version keeps a malformed or
+ * hostile response from reaching either.
  */
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 

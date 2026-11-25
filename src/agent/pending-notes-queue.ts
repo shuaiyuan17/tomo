@@ -101,6 +101,9 @@ export class PendingNotesQueue {
   private inflight = new Map<string, InFlightBatch[]>();
   private errorNotes = new Map<string, ErrorNote[]>();
   private errorSeq = 0;
+  /** Sessions whose stored notes could not be read: held in memory only,
+   *  never written, until a read succeeds (see `retryLoad`). */
+  private unloaded = new Set<string>();
 
   constructor(private store: DurablePendingNotesStore) {}
 
@@ -112,14 +115,42 @@ export class PendingNotesQueue {
       } catch (err) {
         log.warn({ err, sessionKey }, "Could not load durable pending notes");
         arr = [];
+        this.unloaded.add(sessionKey);
       }
       this.notes.set(sessionKey, arr);
+    } else if (this.unloaded.has(sessionKey)) {
+      this.retryLoad(sessionKey);
     }
     return arr;
   }
 
+  /**
+   * Read a session's stored notes again after a failed load, and put them
+   * ahead of the ones queued in memory since (they are older). True once
+   * they are loaded. Until then the session is never written: its stored
+   * row is unknown, and writing the memory-only list would replace it.
+   */
+  private retryLoad(sessionKey: string): boolean {
+    if (!this.unloaded.has(sessionKey)) return true;
+    let stored: string[];
+    try {
+      stored = this.store.getPendingNotes(sessionKey);
+    } catch {
+      return false;
+    }
+    this.unloaded.delete(sessionKey);
+    const arr = this.notes.get(sessionKey);
+    if (arr) arr.unshift(...stored);
+    else this.notes.set(sessionKey, stored);
+    return true;
+  }
+
   /** Write in-flight + queued notes for this session. Returns false on failure. */
   private persist(sessionKey: string): boolean {
+    if (!this.retryLoad(sessionKey)) {
+      log.warn({ sessionKey }, "Pending notes not persisted: the stored ones could not be read");
+      return false;
+    }
     const all = [
       ...(this.inflight.get(sessionKey) ?? []).flatMap((b) => b.notes.map(markInterrupted)),
       ...(this.notes.get(sessionKey) ?? []),

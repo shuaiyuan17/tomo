@@ -252,14 +252,30 @@ describe("PendingNotesQueue when the durable store fails", () => {
     expect(store.getPendingNotes("k")).toEqual(["n1"]);
   });
 
-  it("an unreadable store is read as empty: new notes still queue and drain", () => {
+  it("an unreadable store: new notes still queue and drain, but the stored row is never written over", () => {
     const store = new FlakyStore();
     store.notes.set("k", ["from disk"]);
     store.failReads = true;
     const queue = new PendingNotesQueue(store);
 
-    expect(queue.queueNote("k", "n1")).toBe(true);
+    // Not persisted: writing the memory-only list would replace "from disk".
+    expect(queue.queueNote("k", "n1")).toBe(false);
+    expect(store.notes.get("k")).toEqual(["from disk"]);
     expect(queue.drain("k")).toBe("n1\n\n");
+    expect(store.notes.get("k")).toEqual(["from disk"]);
+  });
+
+  it("once the store reads again, the stored notes come back ahead of the ones queued meanwhile", () => {
+    const store = new FlakyStore();
+    store.notes.set("k", ["from disk"]);
+    store.failReads = true;
+    const queue = new PendingNotesQueue(store);
+
+    expect(queue.queueNote("k", "n1")).toBe(false);
+    store.failReads = false;
+    expect(queue.queueNote("k", "n2")).toBe(true);
+    expect(store.getPendingNotes("k")).toEqual(["from disk", "n1", "n2"]);
+    expect(queue.drain("k")).toBe("from disk\n\nn1\n\nn2\n\n");
   });
 });
 

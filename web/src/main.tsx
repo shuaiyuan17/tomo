@@ -4,6 +4,7 @@ import { messageSubsession, taskAction } from "./api.js";
 import { activeSubsessions, useSubsessions } from "./subsessions.js";
 import { useWeb } from "./use-web.js";
 import { onResume, repaint } from "./resume.js";
+import { trackKeyboardViewport } from "./keyboard-viewport.js";
 import { TasksPanel } from "./tasks-panel.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useMountedFor } from "./motion.js";
@@ -130,6 +131,8 @@ export function App() {
     if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
     repaint(header.current);
   }), []);
+  // The on-screen keyboard shrinks the app, not scrolls the page (keyboard-viewport.ts).
+  useEffect(() => trackKeyboardViewport(), []);
   // The tab says where you are: a Study page or a group being read.
   useEffect(() => {
     document.title = study ? t("title.study", { page: studyLabel(study) }) : home ? t("title.home") : session?.kind === "group" ? t("title.group", { title: session.title }) : t("title.app");
@@ -140,7 +143,7 @@ export function App() {
     else setStudy(target === "conversation" ? null : study ?? "todos");
   };
   const skipTarget = study ? "study" : home ? "home" : "conversation";
-  return <AgentNameContext.Provider value={agent}><div className="flex h-dvh flex-col">
+  return <AgentNameContext.Provider value={agent}><div data-app-shell className="flex h-[var(--app-height,100dvh)] [transform:var(--app-shift,none)] flex-col">
     <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href={`#${skipTarget}`} onClick={(e) => { e.preventDefault(); document.getElementById(skipTarget)?.focus(); }}>{study ? t("skip.to", { target: studyLabel(study) }) : home ? t("skip.home") : t("skip.conversation")}</a>
     <AppHeader headerRef={header} view={view} connection={web.connection}
       phoneTitle={home ? t("nav.home") : !study && session?.kind === "group" ? session.title : undefined}
@@ -168,7 +171,7 @@ export function App() {
         className={`${scrim} transition-opacity duration-[220ms] data-[state=closed]:opacity-0`} />}
       {railMotion.mounted && <aside ref={rail} id="tasks-rail" aria-label={t("header.tasks")} data-state={railMotion.shown ? "open" : "closed"} {...(modal ? { role: "dialog", "aria-modal": true } : {})}
         style={railSize.width !== null ? { width: railSize.width } : undefined}
-        className="group/rail relative flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 max-[1024px]:fixed max-[1024px]:top-[72px] compact:top-[calc(3rem+env(safe-area-inset-top))] max-[1024px]:right-0 max-[1024px]:bottom-0 max-[1024px]:z-30 max-[1024px]:w-[min(340px,88vw)] max-[1024px]:bg-background max-[1024px]:pt-3 max-[1024px]:pl-2.5 max-[1024px]:shadow-2xl max-[1024px]:transition-transform max-[1024px]:duration-[220ms] max-[1024px]:data-[state=closed]:translate-x-full max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+        className="group/rail relative flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 max-[1024px]:fixed max-[1024px]:top-[72px] max-[1024px]:compact:top-[calc(3rem+env(safe-area-inset-top))] max-[1024px]:right-0 max-[1024px]:bottom-0 max-[1024px]:z-30 max-[1024px]:w-[min(340px,88vw)] max-[1024px]:bg-background max-[1024px]:pt-3 max-[1024px]:pl-2.5 max-[1024px]:shadow-2xl max-[1024px]:transition-transform max-[1024px]:duration-[220ms] max-[1024px]:data-[state=closed]:translate-x-full max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:pb-[max(1.5rem,env(safe-area-inset-bottom))]">
         <div className="flex min-h-0 min-w-[246px] flex-1 flex-col transition-[opacity,transform] duration-[220ms] min-[1025px]:group-data-[state=closed]/rail:translate-x-4 min-[1025px]:group-data-[state=closed]/rail:opacity-0"><TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks} control={taskControl} subsessions={railSubsessions}
           footer={<ScheduledSection revision={web.cronRevision} onNavigate={() => { if (overlay) setTasksOpen(false); }} />} /></div>
         {railSize.separator && <div {...railSize.separator}

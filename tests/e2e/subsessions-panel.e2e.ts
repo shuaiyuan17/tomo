@@ -66,6 +66,9 @@ it("lists the owner's sub-sessions in their own group and opens one as a chat in
   await browserExpect(chat.getByLabel("Brief")).toContainText("start the 1.9 notes");
   // The DM stays on screen and usable beside it.
   await browserExpect(page.locator("#message")).toBeVisible();
+  // Both input bars, empty, are the same height and share a bottom edge (composer-frame.ts).
+  const bar = (field: string) => page.locator(field).evaluate((el) => { const r = el.closest("form")!.getBoundingClientRect(); return [Math.round(r.height), Math.round(r.bottom)]; });
+  expect(await bar("[data-testid=subsession-input]")).toEqual(await bar("#message"));
 
   const input = chat.getByTestId("subsession-input");
   await input.fill("Lead with the web panel");

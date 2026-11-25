@@ -185,6 +185,23 @@ function isToolResultTurn(e: Ev | undefined): boolean {
 }
 
 /**
+ * The uuids on the active chain: parentUuid walked back from the newest
+ * conversation record. Records off it (an abandoned branch) are never what a
+ * compaction is aimed at, and do not count toward the estimate. Exported for tests.
+ */
+export function activeChainUuids(events: readonly Ev[]): Set<string> {
+  const byUuid = new Map<string, Ev>();
+  for (const e of events) if (e.uuid) byUuid.set(e.uuid, e);
+  let leaf: Ev | undefined;
+  for (let i = events.length - 1; i >= 0; i--) {
+    if ((events[i].type === "user" || events[i].type === "assistant") && events[i].uuid) { leaf = events[i]; break; }
+  }
+  const on = new Set<string>();
+  for (let e = leaf; e?.uuid && !on.has(e.uuid); e = e.parentUuid ? byUuid.get(e.parentUuid as string) : undefined) on.add(e.uuid);
+  return on;
+}
+
+/**
  * The oldest raw stretch to compact, or null. Exported for tests.
  *
  * Starts at the oldest raw (non-summary) user/assistant event after the last
@@ -205,8 +222,9 @@ export function selectOldestStretch(events: Ev[], opts: { freshTail: number; max
   // A run that cannot be cut safely (a tool call whose result sits behind a
   // block) is skipped: the next safe run after it is tried instead, so one
   // such spot cannot hold off every later stretch.
+  const onChain = activeChainUuids(events);
   for (let from = boundary; from < tailStart;) {
-    const r = selectRunFrom(events, boundary, from, tailStart, opts.maxInputTokens);
+    const r = selectRunFrom(events, boundary, from, tailStart, opts.maxInputTokens, onChain);
     if (r === null) return null;
     if ("skipTo" in r) { from = r.skipTo; continue; }
     return r;
@@ -214,9 +232,12 @@ export function selectOldestStretch(events: Ev[], opts: { freshTail: number; max
   return null;
 }
 
-function selectRunFrom(events: Ev[], boundary: number, from: number, tailStart: number, maxInputTokens: number): Stretch | { skipTo: number } | null {
+function selectRunFrom(
+  events: Ev[], boundary: number, from: number, tailStart: number, maxInputTokens: number, onChain: ReadonlySet<string>,
+): Stretch | { skipTo: number } | null {
   const opts = { maxInputTokens };
-  const isConv = (e: Ev) => e.type === "user" || e.type === "assistant";
+  // Off the active chain = not part of the conversation: neither a start nor summary input.
+  const isConv = (e: Ev) => (e.type === "user" || e.type === "assistant") && (!e.uuid || onChain.has(e.uuid));
   // The run starts at the oldest raw event that opens a turn (never a tool
   // result, never the middle of one assistant message); a summary block in
   // front of it is never part of it.
@@ -374,7 +395,8 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
     for (let i = events.length - 1; i >= 0; i--) {
       if (events[i].type === "system" && events[i].subtype === "compact_boundary") { start = i + 1; break; }
     }
-    return computeContextStatsFromEvents(events.slice(start)).totalTokens;
+    const onChain = activeChainUuids(events);
+    return computeContextStatsFromEvents(events.slice(start).filter((e) => !e.uuid || onChain.has(e.uuid))).totalTokens;
   };
   const est0 = fileEstimate();
   const overhead = o.contextUsed && o.contextUsed > 0

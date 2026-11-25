@@ -95,6 +95,13 @@ function build(opts: { perDay?: number; chars?: number; giantToolResult?: number
   return { sessionId, uuidsByDay, lastAssistantUuid };
 }
 
+/** Splice records into a chain at `at`, re-linking parentUuid so they stay on it. */
+function insertOnChain(events: Array<Record<string, any>>, at: number, ...records: Array<Record<string, any>>): void {
+  let parent = at > 0 ? events[at - 1].uuid : null;
+  for (const r of records) { r.parentUuid = parent; parent = r.uuid; }
+  if (events[at]) events[at].parentUuid = parent;
+  events.splice(at, 0, ...records);
+}
 const fileEvents = (sessionId: string) => readFileSync(getSdkSessionPath(sessionId, sdkSessionsDir), "utf8").trim().split("\n").map((l) => JSON.parse(l));
 const chain = async (sessionId: string) => (await getSessionMessages(sessionId, { dir: workspace })).map((m) => m.uuid);
 const estimate = (sessionId: string) => computeContextStats(sessionId, sdkSessionsDir)!.totalTokens;
@@ -210,7 +217,7 @@ describe("selectOldestStretch", () => {
     const events = fileEvents(b.sessionId);
     const day22 = b.uuidsByDay.get(22)!;
     const at = events.findIndex((e) => e.uuid === day22[6]);
-    events.splice(at, 0,
+    insertOnChain(events, at,
       { type: "user", uuid: "wk", isCompactSummary: true, blockTag: "weekly 2026-W47", timestamp: DAY(22, 12, 0), message: { role: "user", content: "[weekly]\n\nWEEKLY-TEXT" } },
       { type: "user", uuid: "late", isCompactSummary: true, blockTag: "daily 2026-11-22", timestamp: DAY(22, 12, 1), message: { role: "user", content: "[daily]\n\nevening" } });
     const s = selectOldestStretch(events, { freshTail: 4, maxInputTokens: 150_000 })!;
@@ -238,7 +245,7 @@ describe("selectOldestStretch", () => {
     const all = fileEvents(b.sessionId);
     const resultAt = all.findIndex((e) => JSON.stringify(e.message?.content ?? "").includes("tool_result"));
     const events = all.slice(resultAt - 1);
-    events.splice(1, 0, { type: "user", uuid: "blk", isCompactSummary: true, blockTag: "weekly 2026-W47", timestamp: DAY(22, 9, 2), message: { role: "user", content: "[weekly]" } });
+    insertOnChain(events, 1, { type: "user", uuid: "blk", isCompactSummary: true, blockTag: "weekly 2026-W47", timestamp: DAY(22, 9, 2), message: { role: "user", content: "[weekly]" } });
     const s = selectOldestStretch(events, { freshTail: 4, maxInputTokens: 150_000 })!;
     expect(s).not.toBeNull();
     const firstAt = events.findIndex((e) => e.uuid === s.firstUuid);
@@ -255,6 +262,15 @@ describe("selectOldestStretch", () => {
     const sliced = [call, blk, second, ...events.slice(callAt + 1)];
     const s = selectOldestStretch(sliced, { freshTail: 4, maxInputTokens: 150_000 })!;
     expect(s.firstUuid).not.toBe(second.uuid);
+  });
+
+  it("aims at the active chain: an abandoned branch is neither a start nor summary input", () => {
+    const b = build({ perDay: 2 });
+    const events = fileEvents(b.sessionId);
+    const orphan = { ...events[0], uuid: randomUUID(), parentUuid: null, timestamp: DAY(21, 9, 0), message: { role: "user", content: "ABANDONED-BRANCH" } };
+    const s = selectOldestStretch([orphan, ...events], { freshTail: 1, maxInputTokens: 150_000 })!;
+    expect(s.blockTag).toBe("daily 2026-11-22");
+    expect(s.text).not.toContain("ABANDONED-BRANCH");
   });
 
   it("starts on a turn boundary, never on a leftover tool result", () => {

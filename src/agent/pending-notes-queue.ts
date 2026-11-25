@@ -146,14 +146,19 @@ export class PendingNotesQueue {
     }
     // A note queued again while the row was unreadable (a caller that found
     // no copy and wrote one) is already among the stored ones: once is enough.
-    const remaining = [...stored];
-    const fresh = arr.filter((note) => {
-      const i = remaining.indexOf(note);
-      if (i < 0) return true;
-      remaining.splice(i, 1);
-      return false;
-    });
-    arr.splice(0, arr.length, ...stored, ...fresh);
+    // If that copy is already in flight, the stored one is dropped instead,
+    // or settling the turn would leave it queued and deliver it twice.
+    const take = (from: string[], note: string): boolean => {
+      const i = from.findIndex((s) => s === note || s === markInterrupted(note));
+      if (i < 0) return false;
+      from.splice(i, 1);
+      return true;
+    };
+    const kept = [...stored];
+    for (const batch of this.inflight.get(sessionKey) ?? []) for (const note of batch.notes) take(kept, note);
+    const unmatched = [...kept];
+    const fresh = arr.filter((note) => !take(unmatched, note));
+    arr.splice(0, arr.length, ...kept, ...fresh);
     return true;
   }
 

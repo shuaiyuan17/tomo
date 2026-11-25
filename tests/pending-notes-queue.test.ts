@@ -315,6 +315,21 @@ describe("PendingNotesQueue while the stored notes cannot be read", () => {
     expect(queue.persistNow("k")).toBe(true);
     expect(store.getPendingNotes("k")).toEqual(["report s1#1"]);
   });
+
+  it("a stored note whose re-queued copy is already in flight is not delivered again after settle", () => {
+    const store = new UnreadableStore();
+    store.notes.set("k", ["report s1#1"]);
+    const queue = new PendingNotesQueue(store);
+
+    queue.queueNote("k", "report s1#1");
+    const prefix = queue.drain("k");
+    store.failReads = false;
+    expect(queue.persistNow("k")).toBe(true);
+    queue.settle("k", prefix);
+
+    expect(store.getPendingNotes("k")).toEqual([]);
+    expect(queue.drain("k")).toBe("");
+  });
 });
 
 describe("PendingNotesQueue holdOwnerAudience", () => {

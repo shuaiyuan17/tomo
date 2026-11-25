@@ -145,6 +145,73 @@ describe("an owner message whose start cannot be written", () => {
   });
 });
 
+describe("an owner message to a queued task whose record can't be read just then", () => {
+  async function setup() {
+    const h = harness({ maxRunning: 0 });
+    h.onTurn = () => new Promise(() => {});
+    h.service.start();
+    const task = spawn(h);
+    await flush();
+    const store = h.store as unknown as Record<string, (...a: unknown[]) => unknown>;
+    const fails = { get: 0, list: 0 };
+    for (const what of ["get", "list"] as const) {
+      const real = store[what]!.bind(h.store);
+      store[what] = (...a: unknown[]) => { if (fails[what] > 0) { fails[what] -= 1; throw new Error("EIO"); } return real(...a); };
+    }
+    return { h, task, fails };
+  }
+
+  it("is started at the recheck when the start's own read fails", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const { h, task, fails } = await setup();
+      const deliver = h.service.ownerMessage.bind(h.service);
+      // The message lands; the read the start makes right after fails.
+      const real = (h.store as unknown as { transition: (...a: unknown[]) => unknown }).transition.bind(h.store);
+      (h.store as unknown as { transition: (...a: unknown[]) => unknown }).transition = (...a: unknown[]) => {
+        const out = real(...a);
+        if (a[1] === "owner_message") fails.get = 1;
+        return out;
+      };
+      expect(deliver("dm:owner", task.id, "do it now")).toMatchObject({ ok: true });
+      await flush();
+      expect(h.service.get(task.id)?.status).toBe("queued");
+      vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
+      await flush();
+      expect(h.service.get(task.id)?.status).toBe("active");
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("is started at a later recheck when the scheduler's own read fails at the first", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const { h, task, fails } = await setup();
+      const real = (h.store as unknown as { transition: (...a: unknown[]) => unknown }).transition.bind(h.store);
+      (h.store as unknown as { transition: (...a: unknown[]) => unknown }).transition = (...a: unknown[]) => {
+        const out = real(...a);
+        if (a[1] === "owner_message") fails.get = 1;
+        return out;
+      };
+      expect(h.service.ownerMessage("dm:owner", task.id, "do it now")).toMatchObject({ ok: true });
+      await flush();
+      // The first recheck's scheduler can't read the table either.
+      fails.list = 1;
+      vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
+      await flush();
+      expect(h.service.get(task.id)?.status).toBe("queued");
+      vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
+      await flush();
+      expect(h.service.get(task.id)?.status).toBe("active");
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("an owner message to a queued task, across a restart", () => {
   it("is started past the slot cap when dispatch opens, from what the table holds", async () => {
     const seed = harness({ maxRunning: 0 });

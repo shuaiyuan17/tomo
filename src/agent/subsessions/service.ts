@@ -1187,7 +1187,10 @@ export class SubsessionService {
     try {
       tasks = this.store.list();
     } catch (err) {
-      log.error({ err }, "Sub-session scheduler could not read the task table");
+      // Looked at again shortly: a queued task holding the owner's message
+      // must not wait for some later event to come along.
+      log.error({ err }, "Sub-session scheduler could not read the task table; trying again shortly");
+      this.armRegistryRecheck();
       return;
     }
     let active = tasks.filter((t) => t.status === "active").length;
@@ -1230,7 +1233,16 @@ export class SubsessionService {
       this.startsOwed.set(id, reason);
       return true;
     }
-    const record = this.safeGet(id);
+    let record: SubsessionRecord | undefined;
+    try {
+      record = this.store.get(id);
+    } catch (err) {
+      // Unreadable just now: nothing else may come along to start it (an
+      // owner's message to a queued task waits on exactly this), so look again.
+      log.warn({ err, id }, "Could not read a queued sub-session to start it; trying again shortly");
+      this.armRegistryRecheck();
+      return false;
+    }
     if (!record || record.status !== "queued") return false;
     const may = this.mayRun(record);
     if (may !== "run") {

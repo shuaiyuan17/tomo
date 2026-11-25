@@ -1,7 +1,7 @@
 import { joinText, type OwnerT, type OwnerText } from "../../i18n/index.js";
 import type { TaskAddress } from "./address.js";
 import type { SubsessionService } from "./service.js";
-import { currentStep, TERMINAL_STATUSES, type SubsessionRecord } from "./types.js";
+import { currentStep, needsOwner, TERMINAL_STATUSES, type SubsessionRecord } from "./types.js";
 
 /** The newest tasks `/s` lists; older ones are counted. */
 const LIST_MAX = 12;
@@ -47,6 +47,13 @@ export async function taskCommandReply(
       if (service.isHeld(record.id)) return t("cmd.held", { id: record.id });
       return t("cmd.notQueued", { id: record.id, status: statusWord(t, service.get(record.id) ?? record) });
     }
+    case "done": {
+      const result = service.markDone(scope, record.id);
+      if (result.ok) return t("cmd.done", { id: record.id, title: record.title });
+      if (result.reason === "unknown") return t("cmd.unknown", { id: record.id });
+      if (result.reason === "unreadable") return t("cmd.unavailable");
+      return t("cmd.nothingToDo", { id: record.id, status: statusWord(t, service.get(record.id) ?? record) });
+    }
     case "model": {
       const result = service.setModel(scope, record.id, address.model);
       if (result.ok) return t("cmd.modelSet", { id: record.id, model: address.model });
@@ -65,7 +72,7 @@ function statusWord(t: OwnerT<"subsessions">, r: SubsessionRecord, background = 
     case "queued": return t("status.queued");
     case "active": return t("status.active");
     case "waiting": return r.waitingOn === "external" ? t("status.waitingExternal") : t("status.waitingOwner");
-    case "finished": return t("status.finished");
+    case "finished": return needsOwner(r) ? t("status.needsOwner") : t("status.finished");
     case "cancelled": return t("status.cancelled");
     case "failed": return t("status.failed");
     case "archived": return t("status.archived");
@@ -84,6 +91,8 @@ function taskDetail(t: OwnerT<"subsessions">, r: SubsessionRecord, background: b
   if (r.status === "waiting" && r.waitingReason) {
     lines.push(background ? t("cmd.detailFallback", { reason: r.waitingReason }) : t("cmd.detailWaiting", { reason: r.waitingReason }));
   }
+  const action = needsOwner(r);
+  if (action) lines.push(t("cmd.detailNeedsOwner", { action, id: r.id }));
   const step = currentStep(r);
   if (step) lines.push(t("cmd.detailStep", { step }));
   if (r.model) lines.push(t("cmd.detailModel", { model: r.model }));

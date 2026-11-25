@@ -1,4 +1,4 @@
-import { copyFileSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,16 +6,12 @@ import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
 import {
   SubsessionService,
   type ScopeSendResult,
-  type SubsessionTodoLink,
   type TaskTurnOutcome,
 } from "../src/agent/subsessions/service.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
-import { ACTIVE_HEARTBEAT_MS, REGISTRY_RECHECK_MS } from "../src/agent/subsessions/service.js";
-import { createTodoLink } from "../src/agent/subsessions/todo-link.js";
+import { ACTIVE_HEARTBEAT_MS, FINISHED_KEEP_MS, REGISTRY_RECHECK_MS } from "../src/agent/subsessions/service.js";
 import { formatMirrorNote, formatOwnerMessageEvent, MIRROR_ENTRY_MAX } from "../src/agent/subsessions/prompt.js";
-import { TodoStore } from "../src/todos/store.js";
-import { DEFAULT_TODOS } from "../src/todos/limits.js";
-import { appendInput, type SubsessionRecord } from "../src/agent/subsessions/types.js";
+import { appendInput, needsOwner, type SubsessionRecord } from "../src/agent/subsessions/types.js";
 
 let dir = "";
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "tomo-subp2-")); });
@@ -36,22 +32,17 @@ interface H {
   notices: string[];
   wakes: string[];
   clock: number;
-  todoCalls: string[];
+  /** Pending notes queued for the owning session. */
+  notes: string[];
   cronJobs: number;
   onTurn: (prompt: string, key: string) => TaskTurnOutcome | Promise<TaskTurnOutcome>;
   /** The 5-hour window's share used, as the quota gate reads it. */
   quota?: number;
 }
 
-function harness(cfg: Partial<SubsessionConfig> = {}, opts: { todos?: SubsessionTodoLink; registry?: Set<string>; unlinked?: string[] } = {}): H {
-  const h = { prompts: [], sent: [], notices: [], wakes: [], clock: 1_000_000, todoCalls: [], onTurn: () => ({ ok: true }) } as unknown as H;
+function harness(cfg: Partial<SubsessionConfig> = {}, opts: { registry?: Set<string>; unlinked?: string[]; clock?: number } = {}): H {
+  const h = { prompts: [], sent: [], notices: [], wakes: [], notes: [], clock: opts.clock ?? 1_000_000, onTurn: () => ({ ok: true }) } as unknown as H;
   h.store = new SubsessionStore(join(dir, "t.json"), { strictTransitions: true, now: () => h.clock });
-  const recording: SubsessionTodoLink = {
-    open: (r) => { h.todoCalls.push(`open ${r.id}`); return "t-1"; },
-    find: () => undefined,
-    set: (id, on, next) => { h.todoCalls.push(`set ${id} ${on} ${next}`); },
-    close: (id, reason) => { h.todoCalls.push(`close ${id} ${reason}`); },
-  };
   h.service = new SubsessionService({
     store: h.store,
     config: () => ({ ...DEFAULT_SUBSESSIONS, enabled: true, ...cfg }),
@@ -66,7 +57,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, opts: { todos?: Subsession
     },
     noticeToScope: async (_parent, text) => { h.notices.push(text); },
     noticeOwner: async () => {},
-    queuePendingNote: () => true,
+    queuePendingNote: (_parent, note) => { h.notes.push(note); return true; },
     hasPendingNote: () => false,
     wakeScope: () => {},
     contextUsage: () => undefined,
@@ -80,7 +71,6 @@ function harness(cfg: Partial<SubsessionConfig> = {}, opts: { todos?: Subsession
     registryTaskKeys: () => [...(opts.registry ?? [])],
     isStopping: () => false,
     now: () => h.clock,
-    todos: opts.todos ?? recording,
     mirrorWake: (parent) => { h.wakes.push(parent); },
     sessionQuotaPercent: () => h.quota,
   });
@@ -356,131 +346,98 @@ describe("active time (the maxActiveHours cap counts it)", () => {
   });
 });
 
-describe("the todo link", () => {
-  it("opens a todo at spawn and follows the task: owner while it asks, external while it works, owner for the result", async () => {
-    const h = harness();
-    h.onTurn = async (prompt, key) => {
-      if (prompt.includes("subsession-start")) await h.service.ask(key, "Which branch?");
-      else h.service.finish(key, "Merged.");
+describe("a task is its own card", () => {
+  /** A task that finishes with `action` (or none) on its first turn. */
+  async function finished(h: H, action?: string): Promise<SubsessionRecord> {
+    h.onTurn = (prompt, key) => {
+      if (prompt.includes("subsession-start")) h.service.finish(key, "PR #12 is open.", action);
       return { ok: true };
     };
     h.service.start();
     const task = spawn(h);
-    expect(h.service.get(task.id)?.todoId).toBe("t-1");
     await flush();
-    h.service.ownerMessage("dm:owner", task.id, "main");
-    await flush();
-    expect(h.todoCalls).toEqual([
-      `open ${task.id}`,
-      `set t-1 external ${task.id} is working on it (/s ${task.id})`,
-      `set t-1 owner Answer ${task.id}: asked the owner: Which branch?`,
-      `set t-1 external ${task.id} is working on it (/s ${task.id})`,
-      `set t-1 owner Read ${task.id}'s result, then close this`,
-    ]);
-    h.service.stop();
-  });
+    return h.service.get(task.id)!;
+  }
 
-  it("drops it when the task is cancelled, and makes none when todos are off", async () => {
-    const h = harness();
-    h.service.start();
-    const task = spawn(h);
-    await h.service.cancel(task.id, "no longer needed");
-    expect(h.todoCalls.at(-1)).toBe(`close t-1 sub-session ${task.id} cancelled`);
-    h.service.stop();
-
-    const off = harness({ todos: false });
-    off.service.start();
-    const other = spawn(off);
-    expect(off.service.get(other.id)?.todoId).toBeUndefined();
-    expect(off.todoCalls).toEqual([]);
-    off.service.stop();
-  });
-
-  it("a restart fixes the todo of a task that ended just before the crash", () => {
+  it("makes no todo, and an old record's todo id is read without it", () => {
     const seed = harness();
     const t = seed.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
-    seed.store.update(t.id, (r) => { r.todoId = "t-1"; });
-    seed.store.transition(t.id, "cancel", { reason: "stopped" }); // the todo update never happened
+    const raw = JSON.parse(readFileSync(join(dir, "t.json"), "utf8")) as { tasks: Array<Record<string, unknown>> };
+    raw.tasks[0].todoId = "t-1";
+    writeFileSync(join(dir, "t.json"), JSON.stringify(raw));
     const h = harness();
-    h.service.start();
-    expect(h.todoCalls).toContain(`close t-1 sub-session ${t.id} cancelled`);
+    expect(h.store.get(t.id)).not.toHaveProperty("todoId");
+  });
+
+  it("a report that needs nothing from the owner just finishes, and says so", async () => {
+    const h = harness();
+    const task = await finished(h);
+    expect(task.status).toBe("finished");
+    expect(needsOwner(task)).toBeUndefined();
+    expect(h.notes.at(-1)).toContain("It needs nothing from the owner.");
     h.service.stop();
   });
 
-  it("a todo made just before a crash, its id never on the record, is adopted instead of made twice", () => {
-    const todos = new TodoStore(join(dir, "todos"), DEFAULT_TODOS);
-    const link = createTodoLink(todos);
-    const seed = harness({}, { todos: link });
-    const t = seed.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
-    const made = link.open(seed.store.get(t.id)!)!; // ...and the crash before the record got it
-    const h = harness({ maxRunning: 0 }, { todos: link });
-    h.service.start();
-    expect(h.store.get(t.id)?.todoId).toBe(made);
-    expect(todos.list().filter((i) => i.ref === t.sessionKey)).toHaveLength(1);
+  it("a report that needs the owner keeps one line of it, and the note tells the main session", async () => {
+    const h = harness();
+    const task = await finished(h, "Review and merge PR #12\n(and nothing past the first line)");
+    expect(needsOwner(task)).toBe("Review and merge PR #12");
+    expect(h.notes.at(-1)).toContain("It needs the owner to: Review and merge PR #12.");
+    expect(h.notes.at(-1)).toContain(`task_done("${task.id}")`);
     h.service.stop();
   });
 
-  it("never adopts a todo another scope wrote with the task's ref", () => {
-    const todos = new TodoStore(join(dir, "todos"), DEFAULT_TODOS);
-    const link = createTodoLink(todos);
-    const seed = harness({}, { todos: link });
-    const t = seed.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
-    const foreign = todos.add({ title: "group thing", next: "x", waiting_on: "external", ref: t.sessionKey, session: "telegram:-100", source: "self" });
-    const h = harness({ maxRunning: 0 }, { todos: link });
-    h.service.start();
-    const mine = h.store.get(t.id)?.todoId;
-    expect(mine).toBeDefined();
-    expect(mine).not.toBe(foreign.id);
-    expect(todos.list().find((i) => i.id === mine)).toMatchObject({ session: "dm:owner" });
+  it("is cleared by the owner's word, only in its own scope, and only once", async () => {
+    const h = harness();
+    const task = await finished(h, "Merge PR #12");
+    expect(h.service.markDone("telegram:-100", task.id)).toEqual({ ok: false, reason: "unknown" });
+    expect(needsOwner(h.service.get(task.id)!)).toBe("Merge PR #12");
+    const done = h.service.markDone("dm:owner", task.id);
+    expect(done.ok).toBe(true);
+    expect(h.service.get(task.id)).toMatchObject({ status: "finished" });
+    expect(h.service.get(task.id)?.ownerAction).toBeUndefined();
+    expect(h.service.markDone("dm:owner", task.id)).toEqual({ ok: false, reason: "nothing" });
     h.service.stop();
   });
 
-  it("never adopts the owning scope's own todo that merely mentions the task", () => {
-    const todos = new TodoStore(join(dir, "todos"), DEFAULT_TODOS);
-    const link = createTodoLink(todos);
-    const seed = harness({}, { todos: link });
-    const t = seed.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
-    const unrelated = todos.add({ title: "Check what s1 found", next: "x", waiting_on: "me", ref: t.sessionKey, session: "dm:owner", source: "self" });
-    const h = harness({ maxRunning: 0 }, { todos: link });
-    h.service.start();
-    expect(h.store.get(t.id)?.todoId).not.toBe(unrelated.id);
-    expect(todos.list().find((i) => i.id === unrelated.id)).toMatchObject({ next: "x", waiting_on: "me" });
+  it("each finish says afresh what it asks: a later report without one clears it, reopening clears it", async () => {
+    const h = harness();
+    const task = await finished(h, "Merge PR #12");
+    // Woken while finished: it reopens to report again (what the prompt tells it to do).
+    h.onTurn = (_prompt, key) => { h.service.reopen(key); h.service.finish(key, "Merged, all done."); return { ok: true }; };
+    h.service.ownerMessage("dm:owner", task.id, "merged it");
+    await flush();
+    expect(needsOwner(h.service.get(task.id)!)).toBeUndefined();
+
+    h.onTurn = (_prompt, key) => { h.service.reopen(key); h.service.finish(key, "Another PR.", "Merge PR #13"); return { ok: true }; };
+    h.service.ownerMessage("dm:owner", task.id, "one more fix");
+    await flush();
+    expect(needsOwner(h.service.get(task.id)!)).toBe("Merge PR #13");
+    h.onTurn = (_prompt, key) => { h.service.reopen(key); return { ok: true }; };
+    h.service.ownerMessage("dm:owner", task.id, "actually keep going");
+    await flush();
+    expect(h.service.get(task.id)?.ownerAction).toBeUndefined();
     h.service.stop();
   });
 
-  it("an ended task whose todo id never reached the record finds it and closes it, and makes none", () => {
-    const todos = new TodoStore(join(dir, "todos"), DEFAULT_TODOS);
-    const link = createTodoLink(todos);
-    const seed = harness({}, { todos: link });
-    const t = seed.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
-    link.open(seed.store.get(t.id)!);
-    seed.store.transition(t.id, "cancel", { reason: "stopped" });
-    const other = seed.store.create({ parentKey: "dm:owner", title: "u", brief: "b" });
-    seed.store.transition(other.id, "cancel", { reason: "stopped" }); // never had one
-    const h = harness({ maxRunning: 0 }, { todos: link });
+  it("is never archived while it needs the owner; once they say it is done, it archives as usual", async () => {
+    const seed = harness();
+    const task = await finished(seed, "Merge PR #12");
+    seed.service.stop();
+    const later = 1_000_000 + FINISHED_KEEP_MS + 60_000;
+    const h = harness({}, { clock: later });
     h.service.start();
-    expect(todos.list()).toEqual([]);
+    expect(h.service.get(task.id)?.status).toBe("finished");
     h.service.stop();
-  });
 
-  it("writes real todos through the store, and a todo the owner closed is left alone", async () => {
-    const todos = new TodoStore(join(dir, "todos"), DEFAULT_TODOS);
-    const link = createTodoLink(todos);
-    const h = harness({}, { todos: link });
-    h.service.start();
-    const task = spawn(h, "A very long title ".repeat(10));
-    const todoId = h.service.get(task.id)!.todoId!;
-    const item = todos.list().find((i) => i.id === todoId)!;
-    expect(item).toMatchObject({ waiting_on: "external", session: "dm:owner", ref: task.sessionKey, source: "self" });
-    expect([...item.title].length).toBeLessThanOrEqual(DEFAULT_TODOS.titleMaxChars);
-
-    link.set(todoId, "owner", "Answer it");
-    expect(todos.list()[0]).toMatchObject({ waiting_on: "owner", next: "Answer it" });
-    todos.resolve(todoId, { action: "done", by: "owner" });
-    link.set(todoId, "external", "working");
-    link.close(todoId, "cancelled");
-    expect(todos.list()).toEqual([]);
-    h.service.stop();
+    const other = harness();
+    other.service.start();
+    expect(other.service.markDone("dm:owner", task.id).ok).toBe(true);
+    other.service.stop();
+    const after = harness({}, { clock: later });
+    after.service.start();
+    expect(after.service.get(task.id)?.status).toBe("archived");
+    after.service.stop();
   });
 });
 

@@ -241,11 +241,11 @@ Set `"interruptedAgents": false` (or `{ "enabled": false }`) or `TOMO_INTERRUPTE
 
 ## Sub-sessions
 
-On by default (`"subsessions": { "enabled": false }` turns them off). The owner's own conversation gets `task_spawn`, `task_status`, `task_cancel` and `task_message`: Tomo can hand a long task (a PR to write and see through review, a long investigation) to a separate session that works in the background, survives restarts, and reports back. Each runs under the key `task:<id>` (`s1`, `s2`, …); its messages reach you with a `[s1 · title]` prefix, and its report comes back to the main conversation, which tells you the result and decides what to remember. Sub-sessions don't write memory.
+On by default (`"subsessions": { "enabled": false }` turns them off). The owner's own conversation gets `task_spawn`, `task_status`, `task_cancel`, `task_message` and `task_done`: Tomo can hand a long task (a PR to write and see through review, a long investigation) to a separate session that works in the background, survives restarts, and reports back. Each runs under the key `task:<id>` (`s1`, `s2`, …); its messages reach you with a `[s1 · title]` prefix, and its report comes back to the main conversation, which tells you the result and decides what to remember. Sub-sessions don't write memory.
 
 ```json
 { "subsessions": { "enabled": true, "maxRunning": 2, "maxOpen": 5, "maxTurns": 200, "maxContextTokens": 500000, "defaultModel": null,
-  "mirror": "turn", "maxActiveHours": 24, "todos": true } }
+  "mirror": "turn", "maxActiveHours": 24 } }
 ```
 
 - `maxRunning`: tasks working on their own at once; more wait queued. A message to a task is never queued.
@@ -255,7 +255,8 @@ On by default (`"subsessions": { "enabled": false }` turns them off). The owner'
 - `defaultModel`: model for a task that names none (unset follows `model`). Haiku is refused.
 - `mirror`: how the main conversation follows what you and a task say to each other. `"turn"` (default): after you write to a task directly, the main conversation takes a short silent turn to read the exchange, so it can act on it (for example tell another task); what a task says on its own (you already read it) waits for the main conversation's next turn, and there is no silent turn while 80% or more of the 5-hour usage window is used. `"note"`: it reads the exchange only on its next turn. Either way it is shown each exchange once and sends nothing by itself. A silent turn costs a little (it reuses the conversation's prompt cache); switch to `"note"` if that adds up.
 - `maxActiveHours`: a task that has been working on its own this many hours (active time, counted since your last message to it) pauses and tells you; your next message to it gives it another stretch. `0`: no cap.
-- `todos`: each task gets a todo in the main conversation's list, kept up to date with what it waits on, and closed when the task is cancelled or fails.
+
+A task is its own card: the web UI's Tasks rail and `/s` show where it stands, and nothing is added to your todo list. A task whose report needs you to do something (review and merge a PR, make a choice) says so when it finishes: it shows as **Needs you**, with what it asks, and is not archived until you have done it. Tell Tomo it is done (`task_done`), or send `/s s3 done`. A report that needs nothing from you just finishes. (An older config's `subsessions.todos` is ignored.)
 
 A task runs unattended, so it gets fewer tools than the main conversation: no external MCP servers (neither `mcpServers` nor any a plugin or a settings file brings) and no claude.ai connectors (Gmail, Calendar, Drive…), only Tomo's own tools plus the built-in ones. Its own turns also pause (and you are told once) while 80% or more of the 5-hour usage window is used, as last recorded in `~/.tomo/data/usage/limits.ndjson`; if that can't be read, they run. A message from you to the task always goes through.
 
@@ -263,9 +264,9 @@ You can also talk to a task yourself, from your own DM (Telegram or iMessage):
 
 - `/s` lists your tasks; `/s s3` shows one.
 - `/s s3 <message>` sends it a message (it wakes a task that is waiting for you). Replying to one of its `[s3 · …]` messages does the same.
-- `/s s3 stop` cancels it, `/s s3 start` starts a queued one now even past `maxRunning`, `/s s3 model <opus|sonnet|fable>` changes its model from its next turn.
+- `/s s3 stop` cancels it, `/s s3 start` starts a queued one now even past `maxRunning`, `/s s3 model <opus|sonnet|fable>` changes its model from its next turn, `/s s3 done` says you have done what its report asked of you.
 
-Only an exact `stop`, `start` or `model <name>` is a command; `/s s3 stop the deploy` is a message.
+Only an exact `stop`, `start`, `done` or `model <name>` is a command; `/s s3 stop the deploy` is a message.
 
 State lives in `~/.tomo/data/subsessions.json` (fsynced, with a `.bak`). If it cannot be read at start, sub-sessions stay off until it is repaired and nothing is unlinked or cancelled.
 

@@ -189,6 +189,15 @@ export interface SubsessionRecord {
   /** Goal, progress, next step and side effects (task_checkpoint). */
   checkpoint?: string;
   report?: string;
+  /**
+   * What the owner has to do with the report (task_finish `owner_action`:
+   * review and merge a PR, make a choice), one line. A finished task with
+   * one is the owner's ("Needs you") until they do it: `/s <id> done` or the
+   * owning session's task_done clears it, and so does the next task_finish
+   * (which sets it again or not). Meaningful only while the task is
+   * finished: read it through `needsOwner`.
+   */
+  ownerAction?: string;
   /** Counts the task's reports (a finished task can be woken and finish again); its report note is named by it. */
   reportSeq?: number;
   /**
@@ -233,8 +242,6 @@ export interface SubsessionRecord {
   conversationSeq: number;
   /** The newest `seq` the owning session has seen (mirror), advanced only by a turn that completed. */
   mirrorSeenSeq: number;
-  /** The todo (src/todos) that tracks this task on the owner's list, if one was made. */
-  todoId?: string;
   /**
    * Inputs with seq up to this went out in a turn that did not complete (cut
    * short by a restart, failed, or its result could not be saved): the task
@@ -306,6 +313,18 @@ export function isTimestamp(at: unknown): at is number {
 export function currentStep(record: Pick<SubsessionRecord, "plan" | "status">): string | undefined {
   if (!OPEN_STATUSES.has(record.status)) return undefined;
   return record.plan?.find((s) => s.status === "in_progress")?.text;
+}
+
+/** task_finish's `owner_action`: one line. */
+export const OWNER_ACTION_MAX = 300;
+
+/**
+ * What a finished task still asks of the owner (its report's `owner_action`),
+ * or undefined when it asks nothing or the task is not finished. A task that
+ * returns one is the owner's: shown as "Needs you" and never archived.
+ */
+export function needsOwner(record: Pick<SubsessionRecord, "status" | "ownerAction">): string | undefined {
+  return record.status === "finished" && record.ownerAction ? record.ownerAction : undefined;
 }
 
 /** One line, trimmed, at most `max` characters (by code point, so a pair is never split). */

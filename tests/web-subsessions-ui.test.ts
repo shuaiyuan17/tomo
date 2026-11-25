@@ -33,6 +33,10 @@ describe("sub-sessions in the Tasks rail", () => {
     expect(subsessionState(task({ status: "waiting", waitingOn: "owner" }))).toBe("waitingOwner");
     expect(subsessionState(task({ status: "waiting", waitingOn: "external" }))).toBe("waiting");
     expect(subsessionState(task({ status: "finished" }))).toBe("finished");
+    expect(subsessionState(task({ status: "finished", ownerAction: "Merge PR #3" }))).toBe("needsYou");
+    expect(subsessionStateLabel(task({ status: "finished", ownerAction: "Merge PR #3" }))).toBe("Needs you");
+    expect(isOpenSubsession(task({ status: "finished", ownerAction: "Merge PR #3" }))).toBe(true);
+    expect(isOpenSubsession(task({ status: "finished" }))).toBe(false);
     expect(subsessionStateLabel(task({ status: "waiting", waitingOn: "owner" }))).toBe("Waiting for you");
     expect(subsessionStateLabel(task({ working: true }))).toBe("Working");
   });

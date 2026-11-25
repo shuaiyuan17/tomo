@@ -96,6 +96,12 @@ export interface WebSubsession {
   status: WebSubsessionStatus;
   /** Set exactly when status is `waiting`. */
   waitingOn?: "owner" | "external";
+  /**
+   * Finished, and its report asks the owner to do this (review and merge a
+   * PR, make a choice): the rail shows it as "Needs you" and keeps it in view
+   * until they have done it. Set only while finished.
+   */
+  ownerAction?: string;
   /** What it is doing now: the plan step it marked in progress (task_plan). */
   step?: string;
   /** A turn is running on it right now. */

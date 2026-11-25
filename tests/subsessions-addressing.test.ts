@@ -24,6 +24,8 @@ describe("parseTaskAddress", () => {
     expect(parseTaskAddress("/s s3 stop")).toEqual({ kind: "stop", id: "s3" });
     expect(parseTaskAddress("/s s3   STOP  ")).toEqual({ kind: "stop", id: "s3" });
     expect(parseTaskAddress("/s s3 start")).toEqual({ kind: "start", id: "s3" });
+    expect(parseTaskAddress("/s s3 Done ")).toEqual({ kind: "done", id: "s3" });
+    expect(parseTaskAddress("/s s3 done with the review?")).toEqual({ kind: "message", id: "s3", body: "done with the review?" });
     expect(parseTaskAddress("/s s3 model sonnet")).toEqual({ kind: "model", id: "s3", model: "sonnet" });
     expect(parseTaskAddress("/s s3 stop the deploy and roll back")).toEqual({ kind: "message", id: "s3", body: "stop the deploy and roll back" });
     expect(parseTaskAddress("/s s3 model sonnet please")).toEqual({ kind: "message", id: "s3", body: "model sonnet please" });
@@ -572,6 +574,26 @@ describe("/s commands", () => {
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).toContain("Now: halfway");
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s7" })).toBe("There's no sub-session s7.");
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "usage" })).toContain("/s s3 stop");
+  });
+
+  it("/s done clears what a finished task's report asked of the owner, and says when there is nothing", async () => {
+    const { formatTaskDetail, formatTaskLine } = await import("../src/mcp/subsession-tools.js");
+    const h = harness((prompt, key) => {
+      if (prompt.includes("subsession-start")) h.service.finish(key, "PR #9 is open.", "Review and merge PR #9");
+      return { ok: true };
+    });
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).toBe("s1 · Fix CI — finished, needs you");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).toContain("Needs you: Review and merge PR #9 (/s s1 done once you have)");
+    expect(formatTaskLine(h.service.get("s1")!)).toContain("[finished, needs the owner]");
+    expect(formatTaskDetail(h.service.get("s1")!)).toContain("The owner has to: Review and merge PR #9");
+    expect(await taskCommandReply(t, h.service, "telegram:-100", { kind: "done", id: "s1" })).toBe("There's no sub-session s1.");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "done", id: "s1" })).toBe("Marked done: s1 · Fix CI.");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).toBe("s1 · Fix CI — finished");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "done", id: "s1" })).toContain("s1 asks nothing of you (it's finished)");
+    h.service.stop();
   });
 
   it("an ended task is on no step, though its last plan said one was in progress", async () => {

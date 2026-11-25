@@ -10,7 +10,7 @@ import { Text } from "./markdown.js";
 import { ModelBadge } from "./model-badge.js";
 import { differentDay, messageDateTime, messageTime } from "./message-meta.js";
 import { createCompositionGuard } from "./compose-keys.js";
-import { canRetrySend, folded, planStepLook, showableTime, updateText, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, isWorkingState, withListBackground, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
+import { canRetrySend, folded, planStepLook, showableTime, updateText, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, isWorkingState, asksOwner, ownerAsk, withListBackground, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
 import { i18n, useTranslation } from "./i18n/index.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
@@ -90,8 +90,8 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
     <div className="mb-2.5 px-2.5">
       <h2 id="subsession-heading" className="m-0 text-[15px] leading-snug font-semibold [overflow-wrap:anywhere]"><IdPill id={id} className="mr-1.5 align-[1.5px]" />{shown.title}<ModelBadge model={shown.model} className="align-[1.5px]" /></h2>
       <p className="m-0 mt-0.5 tracking-[0.02em] text-[10px] text-muted-foreground [overflow-wrap:anywhere]" data-testid="subsession-state">
-        {isWorkingState(state) ? <span className="shimmer">{subsessionStateLabel(shown)}</span> : <span className={cn(state === "waitingOwner" && "font-medium text-foreground/80")}>{subsessionStateLabel(shown)}</span>}
-        {shown.waitingReason && state === "waitingOwner" ? <> · {shown.waitingReason}</> : null}</p>
+        {isWorkingState(state) ? <span className="shimmer">{subsessionStateLabel(shown)}</span> : <span className={cn(asksOwner(state) && "font-medium text-foreground/80")}>{subsessionStateLabel(shown)}</span>}
+        {asksOwner(state) && ownerAsk(shown) ? <> · {ownerAsk(shown)}</> : null}</p>
       {detail && (detail.plan?.length || detail.doneSteps?.length || detail.updates?.some((u) => updateText(u))) ? <div className="mt-2 flex max-h-[38vh] flex-col gap-2.5 overflow-y-auto pr-1 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]">
         <Doing plan={detail.plan} done={detail.doneSteps} running={isWorkingState(state)} />
         <Updates updates={detail.updates} />

@@ -25,8 +25,6 @@ import { resolveModelName } from "./models.js";
 import type { SubsessionRecord } from "./agent/subsessions/types.js";
 import type { WebSubsessionAccess } from "./channels/web.js";
 import { buildSubsessionPrompt } from "./agent/subsessions/prompt.js";
-import { createTodoLink } from "./agent/subsessions/todo-link.js";
-import { TodoStore } from "./todos/store.js";
 import { CRON_STORE_PATH } from "./cron/store.js";
 import { createTaskCronLink } from "./agent/subsessions/cron-link.js";
 import { EFFORT_LEVELS, type EffortLevel } from "./config.js";
@@ -570,7 +568,6 @@ export class Agent {
       registryTaskKeys: () => this.sessions.listActiveEntries().map((e) => e.channelKey).filter(isTaskSessionKey),
       isStopping: () => this.stopping,
       sessionQuotaPercent: () => readSessionWindowPercent(join(usageDataDir(config.tomoHome), "limits.ndjson")),
-      ...(config.subsessions.todos ? { todos: createTodoLink(new TodoStore()) } : {}),
       mirrorWake: (parentKey) => this.mirrorWake(parentKey),
     });
   }

@@ -367,8 +367,6 @@ export interface SubsessionConfig {
    * cap. Default 24.
    */
   maxActiveHours: number;
-  /** Track each task as a todo on the owner's list. Default on. */
-  todos: boolean;
 }
 
 export const DEFAULT_SUBSESSIONS: SubsessionConfig = {
@@ -380,7 +378,6 @@ export const DEFAULT_SUBSESSIONS: SubsessionConfig = {
   defaultModel: null,
   mirror: "turn",
   maxActiveHours: 24,
-  todos: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -641,7 +638,6 @@ function parseSubsessionConfig(raw: unknown): SubsessionConfig {
       entry.defaultModel ?? null, DEFAULT_SUBSESSIONS.defaultModel),
     mirror: validated("subsessions.mirror", z.enum(["turn", "note"]), entry.mirror, DEFAULT_SUBSESSIONS.mirror),
     maxActiveHours: validated("subsessions.maxActiveHours", z.number().finite().min(0), entry.maxActiveHours, DEFAULT_SUBSESSIONS.maxActiveHours),
-    todos: validated("subsessions.todos", boolLike, entry.todos, DEFAULT_SUBSESSIONS.todos),
   };
 }
 

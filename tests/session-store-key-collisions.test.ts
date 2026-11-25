@@ -165,7 +165,6 @@ describe("transcriptFileStem", () => {
     const writer = newStore();
     for (const [key, stem] of pinned) {
       expect(transcriptFileStem(key), key).toBe(stem);
-      expect(transcriptFileStem(key), key).toBe(transcriptFileStem(key));
       writer.append(key, msg(`hello from ${key}`));
       expect(existsSync(join(testDir, `${stem}.jsonl`)), key).toBe(true);
     }

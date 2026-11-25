@@ -268,7 +268,7 @@ describe("the stop budget", () => {
     // budget is 23-33s. A 10s deadline reported failure on a HEALTHY stop and
     // advised `kill -9`, destroying the in-flight turn's inbound record.
     expect(DAEMON_STOP_TIMEOUT_MS).toBeGreaterThanOrEqual(33_000);
-    // …and no longer than that: `tomo stop` waits this long before it reports.
+    // The budget itself is 60 s: `tomo stop` waits this long before it reports.
     expect(DAEMON_STOP_TIMEOUT_MS).toBe(60_000);
   });
 });

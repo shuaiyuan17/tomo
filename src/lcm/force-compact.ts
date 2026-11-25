@@ -275,22 +275,31 @@ export function selectOldestStretch(events: Ev[], opts: { freshTail: number; max
   let conv = 0;
   const convIdx = new Map<number, number>();
   for (let i = 0; i < events.length; i++) if (isConv(events[i])) convIdx.set(i, conv++);
-  const first = chosen[0];
-  const last = chosen[chosen.length - 1];
   // The rewrite absorbs every block with the same tag, and everything between
   // it and the range. A same-day block BEFORE the stretch only spans non-raw
-  // events (the stretch starts at the oldest raw one); one AFTER it would pull
-  // in events the summary call never saw — then the block gets a tag of its own.
+  // events (the stretch starts at the oldest raw one). One AFTER it would pull
+  // in raw events the summary call never saw: the stretch is extended through
+  // them instead (past the input cap if need be — a summary call that cannot
+  // take it fails, and the archive fallback keeps the block's text), and
+  // refused when that would reach into the fresh tail.
   const sameDay = events.map((e, i) => (e.isCompactSummary && e.blockTag === blockTag ? i : -1)).filter((i) => i >= 0);
-  const tag = sameDay.some((i) => i > last)
-    ? `forced ${day} ${localStamp(events[first].timestamp).slice(11)}`
-    : blockTag;
-  const existing = tag === blockTag ? events.find((e) => e.isCompactSummary && e.blockTag === blockTag) : undefined;
-  const existingBlock = existing ? textOfContent(existing.message?.content, "\n").replace(/^\[[^\]\n]*\]\s*/, "").trim() : undefined;
+  const laterBlock = sameDay.filter((i) => i > chosen[chosen.length - 1]).pop();
+  if (laterBlock !== undefined) {
+    if (laterBlock >= tailStart) return null;
+    for (let i = chosen[chosen.length - 1] + 1; i < laterBlock; i++) {
+      if (isConv(events[i]) && !events[i].isCompactSummary) chosen.push(i);
+    }
+    wholeDay = false;
+  }
+  const first = chosen[0];
+  const last = chosen[chosen.length - 1];
+  const existingBlock = sameDay
+    .map((i) => textOfContent(events[i].message?.content, "\n").replace(/^\[[^\]\n]*\]\s*/, "").trim())
+    .filter(Boolean).join("\n\n") || undefined;
   const lines = chosen.map((i) => renderEventForSummary(events[i])).filter(Boolean);
   if (existingBlock) lines.unshift(`[earlier summary of ${day}, to be merged into the new block]\n${existingBlock}`);
   return {
-    blockTag: tag,
+    blockTag,
     fromConv: convIdx.get(first)!,
     toConv: convIdx.get(last)!,
     firstUuid: events[first].uuid,

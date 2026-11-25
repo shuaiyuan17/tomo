@@ -205,14 +205,17 @@ describe("selectOldestStretch", () => {
     expect(s2.text).toContain("Morning: decided X.");
   });
 
-  it("gives the block a tag of its own when a same-day block sits AFTER the stretch (its expansion would remove unseen events)", () => {
+  it("extends the stretch through a same-day block that sits AFTER it (the rewrite would remove what lies between)", () => {
     const b = build({ chars: 4000 });
     const events = fileEvents(b.sessionId);
     const lastOf22 = events.findIndex((e) => e.uuid === b.uuidsByDay.get(22)!.at(-1));
     events.splice(lastOf22 + 1, 0, { type: "user", uuid: "late", isCompactSummary: true, blockTag: "daily 2026-11-22", timestamp: DAY(22, 23, 0), message: { role: "user", content: "[daily 2026-11-22]\n\nevening" } });
     const s = selectOldestStretch(events, { freshTail: 4, maxInputTokens: 3_000 })!;
-    expect(s.blockTag).toMatch(/^forced 2026-11-22 /);
-    expect(s.existingBlock).toBeUndefined();
+    expect(s.blockTag).toBe("daily 2026-11-22");
+    // Every raw event the expansion removes was in the summary input.
+    expect(s.lastUuid).toBe(b.uuidsByDay.get(22)!.at(-1));
+    expect(s.text).toContain(`day 22 #${5}`);
+    expect(s.existingBlock).toBe("evening");
   });
 
   it("starts after the last SDK compact boundary (nothing before it is on the chain)", () => {

@@ -282,13 +282,16 @@ export class TaskBoard {
     const ids = [...targets.keys()].sort();
     const picked = new Map<string, WebTask[]>(ids.map((id) => [id, []]));
     let room = MAX_BOARD_TASKS;
-    // Activity first: running, then recently ended; watchers (ambient) only
-    // get what is left, so they never take a running task's place.
+    // Activity first: running (an ended task whose work runs on included),
+    // then recently ended; watchers (ambient) only get what is left, so they
+    // never take a running task's place.
+    const settled = new Map(ids.map((id) => [id, settledTimes(this.sessions.get(id)!)]));
     for (const [ambient, ended] of [[false, false], [false, true], [true, false], [true, true]] as const) {
       const queues = ids.map((id) => {
+        const at = settled.get(id)!;
         const tasks = [...this.sessions.get(id)!.values()]
-          .filter((task) => (task.endedAt !== undefined) === ended && task.ambient === ambient);
-        return { id, tasks: ended ? tasks.sort((a, b) => b.endedAt! - a.endedAt!) : tasks.sort((a, b) => a.startedAt - b.startedAt) };
+          .filter((task) => (at.get(task.taskId) !== undefined) === ended && task.ambient === ambient);
+        return { id, tasks: ended ? tasks.sort((a, b) => at.get(b.taskId)! - at.get(a.taskId)!) : tasks.sort((a, b) => a.startedAt - b.startedAt) };
       });
       for (let round = 0; room > 0 && queues.some((q) => q.tasks.length > round); round++) {
         for (const queue of queues) {

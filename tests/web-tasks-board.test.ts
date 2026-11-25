@@ -54,7 +54,7 @@ describe("TaskBoard", () => {
     b.apply("s1", [task("p", { startedAt: 1_000 }), child]);
     b.apply("s1", [child]); // the subagent's own turn ended
     vi.advanceTimersByTime(TASK_RETENTION_MS * 4);
-    expect(b.snapshot().map((t) => `${t.taskId}:${t.state}`)).toEqual(["c:running", "p:ended"]);
+    expect(b.snapshot().map((t) => `${t.taskId}:${t.state}`).sort()).toEqual(["c:running", "p:ended"]);
     b.apply("s1", []); // the command ends
     vi.advanceTimersByTime(TASK_RETENTION_MS - 1);
     expect(b.snapshot().map((t) => t.taskId).sort()).toEqual(["c", "p"]);
@@ -74,6 +74,28 @@ describe("TaskBoard", () => {
       vi.advanceTimersByTime(10);
       b.apply("s1", [child, task(`x${i}`)]);
       b.apply("s1", [child]);
+    }
+    expect(b.snapshot().map((t) => t.taskId)).toContain("p");
+    b.dispose();
+  });
+
+  it("the board-wide cap ranks an ended task whose work still runs with the running ones", () => {
+    vi.useFakeTimers({ now: 10_000 });
+    const { b } = board();
+    const child = task("c", { taskType: "local_bash", parentTaskId: "p", startedAt: 2_000 });
+    b.apply("a", [task("p", { startedAt: 1_000 }), child]);
+    b.apply("a", [child]);
+    // Its own session and others fill the board with tasks that ended later.
+    for (let i = 0; i < MAX_SESSION_TASKS; i++) {
+      vi.advanceTimersByTime(1);
+      b.apply("a", [child, task(`x${i}`)]);
+      b.apply("a", [child]);
+    }
+    for (let n = 0; n * MAX_SESSION_TASKS < MAX_BOARD_TASKS + MAX_SESSION_TASKS; n++) {
+      vi.advanceTimersByTime(10);
+      const list = Array.from({ length: MAX_SESSION_TASKS }, (_, i) => task(`y${n}_${i}`));
+      b.apply(`busy${n}`, list);
+      b.apply(`busy${n}`, []);
     }
     expect(b.snapshot().map((t) => t.taskId)).toContain("p");
     b.dispose();

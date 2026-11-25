@@ -15,6 +15,7 @@ import {
   installAgentTestHooks,
   makeMsg,
   mockSdk,
+  ownerIdentity,
   resetConfig,
   useRealAdmission,
 } from "./helpers/agent-harness.js";
@@ -204,7 +205,7 @@ describe("allowlist enforcement", () => {
   it("allows the owner's DM", async () => {
     resetConfig({
       channelAllowlists: { telegram: ["-100555"] },
-      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("alex", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -213,7 +214,7 @@ describe("allowlist enforcement", () => {
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hello" }));
     await drainQueue(agent);
 
-    expect(tg.delivered.length).toBeGreaterThanOrEqual(1);
+    expect(tg.delivered.map((m) => m.chatId)).toEqual(["12345"]);
 
     await agent.stop();
   });
@@ -225,7 +226,7 @@ describe("allowlist enforcement", () => {
   it("registers an admission predicate backed by the router", async () => {
     resetConfig({
       channelAllowlists: { telegram: ["-100555", "999"] },
-      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("alex", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -244,7 +245,7 @@ describe("allowlist enforcement", () => {
     useRealAdmission();
     resetConfig({
       channelAllowlists: {},
-      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("alex", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -295,16 +296,14 @@ describe("group chat handling", () => {
     }));
     await drainQueue(agent);
 
-    // Should have at least the user reply (may also have context injection response)
-    const replies = tg.delivered.filter(m => m.chatId === "-100123");
-    expect(replies.length).toBeGreaterThanOrEqual(1);
+    expect(tg.delivered.map((m) => [m.chatId, m.text])).toEqual([["-100123", "Group reply!"]]);
 
     await agent.stop();
   });
 
   it("uses channel:chatId session key for groups even with identity", async () => {
     resetConfig({
-      identities: [{ name: "alice", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("alice", { telegram: "12345" })],
       // No explicit allowlist — identity alone should NOT enable allowlist enforcement
     });
     const agent = new Agent();
@@ -313,12 +312,11 @@ describe("group chat handling", () => {
 
     mockSdk.responseFn = () => "reply";
 
-    // DM → uses dm:alice session
+    // DM → the owner's dm:alice session
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "DM" }));
     await drainQueue(agent);
 
-    const dmReplies = tg.delivered.filter(m => m.chatId === "12345");
-    expect(dmReplies.length).toBeGreaterThanOrEqual(1);
+    expect(tg.delivered.map((m) => m.chatId)).toEqual(["12345"]);
 
     tg.clearDelivered();
 
@@ -332,56 +330,32 @@ describe("group chat handling", () => {
     }));
     await drainQueue(agent);
 
-    // The group should get a reply (streamed or via error-retry direct send)
-    const groupDelivered = tg.delivered.filter(m => m.chatId === "-100999");
-    expect(groupDelivered.length).toBeGreaterThanOrEqual(1);
+    expect(tg.delivered.map((m) => m.chatId)).toEqual(["-100999"]);
+    // Group → its own telegram:-100999 session, NOT dm:alice.
+    expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toEqual(["dm:alice", "telegram:-100999"]);
 
     await agent.stop();
   });
 
-  it("activates group via secret phrase", async () => {
-    writeFileSync(join(agentEnv.tmpDir, "config.json"), JSON.stringify({
-      channels: { telegram: { token: "test", allowlist: ["12345"] } },
-    }));
-
-    resetConfig({
-      channelAllowlists: { telegram: ["12345"] },
-      groupSecret: "tomo-secret-123",
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    await tg.simulateMessage(makeMsg({
-      chatId: "-100group",
-      text: "tomo-secret-123",
-      isGroup: true,
-      isMentioned: false,
-      senderName: "Alice",
-    }));
-    await drainQueue(agent);
-
-    const activation = tg.sent.find(m => m.text?.includes("activated"));
-    expect(activation).toBeDefined();
-    expect(activation!.chatId).toBe("-100group");
-
-    await agent.stop();
-  });
-
-  it("creates the group allowlist when the secret arrives on a channel with none, and the owner DM still gets through", async () => {
-    // Groups on a channel with no allowlist are closed, so the secret is the
-    // way in: it must persist the group. That no longer locks anyone out —
-    // the owner's DM is admitted by its identity binding, not the allowlist.
+  // Groups on a channel with no allowlist are closed, so the secret is the
+  // way in: it must persist the group, next to whatever the allowlist held.
+  // That never locks anyone out: the owner's DM is admitted by its identity
+  // binding, not the allowlist. (agent-admission runs the same for an
+  // iMessage group GUID.)
+  it.each([
+    ["an existing allowlist", ["-100555"], ["-100555", "-100group"]],
+    ["no allowlist", undefined, ["-100group"]],
+  ])("activates a group by the secret phrase on a channel with %s, persisting it, and the owner DM still gets through", async (_label, before, after) => {
     useRealAdmission();
     const configPath = join(agentEnv.tmpDir, "config.json");
     writeFileSync(configPath, JSON.stringify({
-      channels: { telegram: { token: "test" } },
+      channels: { telegram: { token: "test", ...(before ? { allowlist: before } : {}) } },
     }));
 
     resetConfig({
-      channelAllowlists: {},
+      channelAllowlists: before ? { telegram: before } : {},
       groupSecret: "tomo-secret-123",
-      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("alex", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -402,9 +376,9 @@ describe("group chat handling", () => {
     }));
     await drainQueue(agent);
 
-    expect(tg.sent.find(m => m.text?.includes("activated"))?.chatId).toBe("-100group");
+    expect(tg.sent.map((m) => [m.chatId, m.text])).toEqual([["-100group", "Tomo activated in this group."]]);
     const cfg = JSON.parse(readFileSync(configPath, "utf-8"));
-    expect(cfg.channels.telegram.allowlist).toEqual(["-100group"]);
+    expect(cfg.channels.telegram.allowlist).toEqual(after);
     expect(tg.admissionPredicate?.("-100group")).toBe(true);
 
     // The owner's DM still gets through; a stranger still does not.
@@ -494,11 +468,10 @@ describe("identity multi-channel routing", () => {
     await im.simulateMessage(makeMsg({ chatId: "+15551234567", text: "From iMessage" }));
     await drainQueue(agent);
 
-    expect(tg.delivered.length).toBeGreaterThanOrEqual(1);
-    expect(tg.delivered[0].chatId).toBe("12345");
-
-    expect(im.delivered.length).toBeGreaterThanOrEqual(1);
-    expect(im.delivered[0].chatId).toBe("+15551234567");
+    expect(tg.delivered.map((m) => [m.chatId, m.text])).toEqual([["12345", "reply-1"]]);
+    expect(im.delivered.map((m) => [m.chatId, m.text])).toEqual([["+15551234567", "reply-2"]]);
+    // Both channels' messages ran in the one owner session.
+    expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toEqual(["dm:shuai", "dm:shuai"]);
 
     await agent.stop();
   });
@@ -520,8 +493,7 @@ describe("identity multi-channel routing", () => {
     await im.simulateMessage(makeMsg({ chatId: "+15551234567", text: "Hello" }));
     await drainQueue(agent);
 
-    expect(im.delivered.length).toBeGreaterThanOrEqual(1);
-    expect(im.delivered[0].chatId).toBe("+15551234567");
+    expect(im.delivered.map((m) => m.chatId)).toEqual(["+15551234567"]);
     expect(tg.delivered).toHaveLength(0);
 
     await agent.stop();

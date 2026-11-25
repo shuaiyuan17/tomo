@@ -117,6 +117,17 @@ afterEach(() => {
   home = "";
 });
 
+/** Make `channel.send` delete the picture it is about to send (only `path`,
+ *  when given): the file vanishes between the pipeline's check and the
+ *  channel's, which is the channel's own definite pre-check failure. */
+function vanishOnSend(channel: TelegramChannelType, path?: string): void {
+  const original = channel.send.bind(channel);
+  vi.spyOn(channel, "send").mockImplementation(async (message) => {
+    if (message.photo && (path === undefined || message.photo === path)) rmSync(message.photo, { force: true });
+    return original(message);
+  });
+}
+
 function pipeline(): DeliveryPipelineType {
   return new DeliveryPipeline({ queuePendingErrorNote: () => {} });
 }
@@ -132,17 +143,20 @@ async function failing(promise: Promise<void>): Promise<unknown> {
 }
 
 describe("a caption survives an attachment send that fails before dispatch", () => {
-  it("delivers the text when Telegram's photo send fails on the file", async () => {
-    const { channel, recorded } = makeTelegram("enoent");
-    const sender = pipeline().createBlockSender(channel, "12345");
+  // Both are DEFINITE: the file is gone (grammY's InputFile ENOENTs), or the
+  // Bot API answered no. The caption goes out as text, takes the reply target
+  // the photo could not, and the failure is still surfaced — the picture
+  // really did not ship — but as a PARTIAL one, so the transcript can say
+  // which half.
+  it.each(["enoent", "refused"] as const)("delivers the text, threaded, when Telegram's photo send fails definitely (%s)", async (failure) => {
+    const { channel, recorded } = makeTelegram(failure);
+    const sender = pipeline().createBlockSender(channel, "12345", { replyTo: "77" });
     const block = `Here's the chart\nMEDIA:${mediaPath}`;
 
-    // The failure is still surfaced — the picture really did not ship — but
-    // as a PARTIAL one, so the transcript can say which half.
     const err = await failing(sender.deliver(block));
     expect(err).toBeInstanceOf(PartialDeliveryError);
 
-    expect(recorded.messages.map((m) => m.text)).toEqual(["Here's the chart"]);
+    expect(recorded.messages).toEqual([{ text: "Here's the chart", replyToId: 77 }]);
     expect(failedDeliveryEntry(block, err)).toBe(`Here's the chart\n${DELIVERY_FAILED_MARKER}MEDIA:${mediaPath}`);
   });
 
@@ -150,26 +164,13 @@ describe("a caption survives an attachment send that fails before dispatch", () 
     const { channel, recorded } = makeTelegram("none");
     // The channel's own pre-check is the definite failure here: the sendPhoto
     // fake would have succeeded, and must never be reached.
-    const original = channel.send.bind(channel);
-    vi.spyOn(channel, "send").mockImplementation(async (message) => {
-      if (message.photo) rmSync(message.photo, { force: true });
-      return original(message);
-    });
+    vanishOnSend(channel);
     const sender = pipeline().createBlockSender(channel, "12345");
 
     const err = await failing(sender.deliver(`Here's the chart\nMEDIA:${mediaPath}`));
     expect(err).toBeInstanceOf(PartialDeliveryError);
     expect(recorded.photos).toEqual([]);
     expect(recorded.messages.map((m) => m.text)).toEqual(["Here's the chart"]);
-  });
-
-  it("hands the reply target to the caption the failed photo could not take", async () => {
-    const { channel, recorded } = makeTelegram("enoent");
-    const sender = pipeline().createBlockSender(channel, "12345", { replyTo: "77" });
-
-    await failing(sender.deliver(`Here's the chart\nMEDIA:${mediaPath}`));
-
-    expect(recorded.messages).toEqual([{ text: "Here's the chart", replyToId: 77 }]);
   });
 
   it("still ships a sticker that follows the failed photo in the same block", async () => {
@@ -190,12 +191,8 @@ describe("a caption survives an attachment send that fails before dispatch", () 
     const other = join(home, "other.png");
     writeFileSync(other, "also not a png");
     const { channel, recorded } = makeTelegram("none");
-    const original = channel.send.bind(channel);
     // Only the FIRST picture is gone.
-    vi.spyOn(channel, "send").mockImplementation(async (message) => {
-      if (message.photo === mediaPath) rmSync(message.photo, { force: true });
-      return original(message);
-    });
+    vanishOnSend(channel, mediaPath);
     const sender = pipeline().createBlockSender(channel, "12345");
     const block = `Here's the chart\nMEDIA:${mediaPath}\nMEDIA:${other}`;
 
@@ -208,17 +205,6 @@ describe("a caption survives an attachment send that fails before dispatch", () 
     expect(failedDeliveryEntry(block, err)).toBe(
       `Here's the chart\n${DELIVERY_FAILED_MARKER}MEDIA:${mediaPath}\nMEDIA:${other}`,
     );
-  });
-
-  it("treats a Bot API refusal as definite too — the caption goes out as text", async () => {
-    const { channel, recorded } = makeTelegram("refused");
-    const sender = pipeline().createBlockSender(channel, "12345", { replyTo: "77" });
-    const block = `Here's the chart\nMEDIA:${mediaPath}`;
-
-    const err = await failing(sender.deliver(block));
-
-    expect(recorded.messages).toEqual([{ text: "Here's the chart", replyToId: 77 }]);
-    expect(failedDeliveryEntry(block, err)).toBe(`Here's the chart\n${DELIVERY_FAILED_MARKER}MEDIA:${mediaPath}`);
   });
 
   it("records a failed sticker as failed and nothing else", async () => {
@@ -276,11 +262,7 @@ describe("a caption survives an attachment send that fails before dispatch", () 
     const spaced = join(home, "a b.png");
     writeFileSync(spaced, "not really a png");
     const { channel, recorded } = makeTelegram("none");
-    const original = channel.send.bind(channel);
-    vi.spyOn(channel, "send").mockImplementation(async (message) => {
-      if (message.photo) rmSync(message.photo, { force: true });
-      return original(message);
-    });
+    vanishOnSend(channel);
     const sender = pipeline().createBlockSender(channel, "12345");
     const block = `STICKER:sticker-abc\nMEDIA:"${spaced}"\nHere's the chart`;
 
@@ -323,6 +305,9 @@ describe("an AMBIGUOUS attachment failure never re-sends the caption", () => {
     );
   });
 
+});
+
+describe("failedDeliveryEntry", () => {
   it("marks the whole block when the failure is not a partial one", () => {
     const block = "plain text";
     expect(failedDeliveryEntry(block, new Error("channel down"))).toBe(`${DELIVERY_FAILED_MARKER}plain text`);

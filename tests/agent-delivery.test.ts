@@ -17,10 +17,14 @@ import {
   makeMsg,
   mockConfig,
   mockSdk,
+  ownerIdentity,
   queryState,
   resetConfig,
+  seedSession,
   waitFor,
+  type Delivery,
 } from "./helpers/agent-harness.js";
+import type { MockResponse } from "./helpers/agent-mocks.js";
 
 installAgentTestHooks();
 
@@ -29,277 +33,205 @@ installAgentTestHooks();
 // Delivery is non-streaming but not end-of-turn: each content block ships as
 // ONE channel message the moment the SDK closes it, newlines and all. Nothing
 // pattern-matches the model's words — block TYPE decides what ships.
+//
+// The unit-level twins of these shapes live in tests/turn-runner.test.ts and
+// tests/per-block-delivery.test.ts (the DeliveryPipeline / LiveSession seam);
+// this file is the one Agent-level table, through both ingress paths a turn
+// can take: an owner message, and handleCronMessage (cron jobs, background
+// sends, delegate notifications), which runs on the SAME per-block path.
 
-describe("outbound delivery", () => {
-  it("iMessage ships a single-block response as one message", async () => {
-    const agent = new Agent();
-    const im = new MockChannel("imessage");
-    agent.addChannel(im);
+type Ingress = "user" | "cron";
 
-    mockSdk.responseFn = () => "single block reply";
+const IM_DM = { channel: "imessage", chatId: "iMessage;-;+15551112222" } as const;
+const IM_GROUP = { channel: "imessage", chatId: "iMessage;+;group123", isGroup: true } as const;
+const TG_DM = { channel: "telegram", chatId: "12345" } as const;
 
-    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "hi" }));
+interface Where {
+  channel: "imessage" | "telegram";
+  chatId: string;
+  isGroup?: boolean;
+}
+
+/**
+ * Run one turn answering `response` and return what reached the channel.
+ * `user`: the turn is the owner's message. `cron`: a seeded session gets a
+ * handleCronMessage turn, which must report success.
+ */
+async function deliver(response: MockResponse, where: Where = TG_DM, ingress: Ingress = "user"): Promise<Delivery[]> {
+  const agent = new Agent();
+  const channel = new MockChannel(where.channel);
+  agent.addChannel(channel);
+  if (ingress === "cron") await seedSession(agent, channel, where.chatId);
+  mockSdk.responseFn = () => response;
+  if (ingress === "user") {
+    await channel.simulateMessage(makeMsg({ chatId: where.chatId, text: "go", ...(where.isGroup ? { isGroup: true, senderName: "Alice" } : {}) }));
     await drainQueue(agent);
+  } else {
+    await expect(agent.handleCronMessage("System: background task done", `${where.channel}:${where.chatId}`)).resolves.toBe(true);
+  }
+  await agent.stop();
+  return channel.delivered;
+}
 
-    // One block → one delivery, no merging or duplication
-    expect(im.delivered).toHaveLength(1);
-    expect(im.delivered[0].text).toBe("single block reply");
+const READ_A = { type: "tool_use" as const, name: "Read", input: { file_path: "/tmp/a" } };
+const READ_B = { type: "tool_use" as const, name: "Read", input: { file_path: "/tmp/b" } };
 
-    await agent.stop();
+describe("what a turn ships, block by block", () => {
+  it.each<{ name: string; response: MockResponse; expected: string[]; where?: Where; ingress?: Ingress }>([
+    // --- one block, one message ---
+    { name: "a single block ships as one message", where: IM_DM, response: "single block reply", expected: ["single block reply"] },
+    { name: "each block of a multi-block turn is its own iMessage", where: IM_DM, response: ["first block", "second block", "third block"], expected: ["first block", "second block", "third block"] },
+    // Mid-turn there is nothing to merge WITH: when "alpha" completes, "beta"
+    // has not been written yet. One completed block is one message.
+    { name: "adjacent text blocks are never merged (Telegram)", response: ["alpha", "beta", "gamma"], expected: ["alpha", "beta", "gamma"] },
+    { name: "a three-line reply stays one iMessage, newlines kept", where: IM_DM, response: "line A\nline B\nline C", expected: ["line A\nline B\nline C"] },
+    { name: "interior blank lines are kept, the block's outer whitespace trimmed", response: "  first burst\n\nsecond burst  ", expected: ["first burst\n\nsecond burst"] },
+    { name: "a multi-line cron reply ships as one message", ingress: "cron", response: "  first brief  \nsecond detail\n\n  third brief  ", expected: ["first brief  \nsecond detail\n\n  third brief"] },
+    { name: "a line-formatted list stays together in an iMessage group", where: IM_GROUP, response: "List 🦀\n· Running shoes ×3\n· Winter coat ×1\n\nPickup: Saturday, in store.", expected: ["List 🦀\n· Running shoes ×3\n· Winter coat ×1\n\nPickup: Saturday, in store."] },
+    // #291 P1: no word of the model's is treated as a control token.
+    { name: "a one-word `count` reply ships verbatim (#291)", where: IM_DM, response: "count", expected: ["count"] },
+    { name: "a text block that opens with Thinking: ships verbatim (#291)", where: IM_DM, response: "Thinking: I suggest two steps. First back up. Then migrate.", expected: ["Thinking: I suggest two steps. First back up. Then migrate."] },
+    { name: "whitespace-only blocks are dropped, the others ship", where: IM_DM, response: ["   ", "real content", ""], expected: ["real content"] },
+    // Filtering the JOINED response would truncate at the marker and lose B.
+    { name: "a scaffold leak cuts only the leaking block", where: IM_DM, response: ["A", "<system-reminder>internal note</system-reminder>", "B"], expected: ["A", "B"] },
+
+    // --- NO_REPLY is enforced per block (owner decision 2026-07-08) ---
+    { name: "NO_REPLY as the whole response ships nothing", where: IM_DM, response: "NO_REPLY", expected: [] },
+    { name: "NO_REPLY as the whole cron response ships nothing (#222: no regression)", ingress: "cron", response: "NO_REPLY", expected: [] },
+    { name: "a mid-turn bare NO_REPLY block drops, the blocks around it ship", where: IM_DM, response: ["before", "NO_REPLY", "after"], expected: ["before", "after"] },
+    // The middle block is housekeeping narration marked not-for-the-channel:
+    // neither the narration nor the token ships, the blocks around it do.
+    { name: "a mid-turn block whose trailing line is NO_REPLY drops, narration and all", where: IM_DM, response: ["A", "housekeeping\nNO_REPLY", "B"], expected: ["A", "B"] },
+    { name: "a cron turn whose narration block ends in NO_REPLY ships nothing", ingress: "cron", response: [READ_A, "housekeeping narration not meant for the channel\nNO_REPLY"], expected: [] },
+    // Under end-of-turn delivery a trailing token suppressed the earlier
+    // narration too. Mid-turn it cannot: the narration was its OWN completed
+    // block and was already sent when the model wrote the token. No
+    // end-of-turn rule can recall it; a turn that must stay silent whatever
+    // the model writes says so up front with suppressDelivery
+    // (tests/agent-cron.test.ts, "suppressDelivery silences every block").
+    { name: "a trailing bare NO_REPLY suppresses only itself", where: IM_DM, response: ["did the housekeeping", "NO_REPLY"], expected: ["did the housekeeping"] },
+    { name: "a later NO_REPLY cannot unsend an earlier cron narration block", ingress: "cron", response: ["housekeeping narration not meant for the channel", READ_A, READ_B, "NO_REPLY"], expected: ["housekeeping narration not meant for the channel"] },
+    // #222: only the bare token on a block's trailing line silences.
+    { name: "#222: cron prose that merely mentions NO_REPLY inline is delivered", ingress: "cron", response: "The literal token is NO_REPLY.", expected: ["The literal token is NO_REPLY."] },
+    { name: "#222: repeated NO_REPLY blocks with no visible text stay silent", ingress: "cron", response: ["NO_REPLY", "NO_REPLY"], expected: [] },
+    { name: "#222: a cron turn whose only text is NO_REPLY after tool calls stays silent", ingress: "cron", response: [READ_A, READ_B, "NO_REPLY"], expected: [] },
+  ])("$name", async ({ response, expected, where, ingress }) => {
+    const delivered = await deliver(response, where, ingress);
+    expect(delivered.map((d) => d.text)).toEqual(expected);
+    // Every message reached the chat the turn belongs to.
+    for (const d of delivered) expect(d.chatId).toBe((where ?? TG_DM).chatId);
   });
+});
 
-  it("ships each block of a multi-block turn as its own iMessage", async () => {
-    const agent = new Agent();
-    const im = new MockChannel("imessage");
-    agent.addChannel(im);
+describe("attachments ship where the model put them", () => {
+  // `IMG` stands for a real file written into the per-test tmp dir.
+  const IMG = "<img>";
+  const at = (text: string, photo?: string, sticker?: string): Delivery => ({ chatId: "12345", text, photo, sticker });
 
-    // Three text blocks in a single turn (text → tool → text → tool → text).
-    // Each ships as its own message as it completes, so the owner is answered
-    // during the turn instead of after it.
-    mockSdk.responseFn = () => ["first block", "second block", "third block"];
-
-    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
-    await drainQueue(agent);
-
-    expect(im.delivered.map((d) => d.text)).toEqual(["first block", "second block", "third block"]);
-
-    await agent.stop();
-  });
-
-  it("ships each block of a multi-block turn as its own Telegram message", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => ["alpha", "beta", "gamma"];
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
-    await drainQueue(agent);
-
-    expect(tg.delivered.map((d) => d.text)).toEqual(["alpha", "beta", "gamma"]);
-
-    await agent.stop();
-  });
-
-  it("keeps a three-line reply in one iMessage with its newlines", async () => {
-    const agent = new Agent();
-    const im = new MockChannel("imessage");
-    agent.addChannel(im);
-
-    mockSdk.responseFn = () => "line A\nline B\nline C";
-
-    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
-    await drainQueue(agent);
-
-    expect(im.delivered).toHaveLength(1);
-    expect(im.delivered[0].text).toBe("line A\nline B\nline C");
-
-    await agent.stop();
-  });
-
-  it("delivers interior blank lines verbatim instead of splitting on them", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => "  first burst\n\nsecond burst  ";
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
-    await drainQueue(agent);
-
-    expect(tg.delivered).toHaveLength(1);
-    expect(tg.delivered[0].text).toBe("first burst\n\nsecond burst");
-
-    await agent.stop();
-  });
-
-  it("delivers a one-word `count` reply verbatim (#291 P1)", async () => {
-    const agent = new Agent();
-    const im = new MockChannel("imessage");
-    agent.addChannel(im);
-
-    mockSdk.responseFn = () => "count";
-
-    await im.simulateMessage(makeMsg({
-      chatId: "iMessage;-;+15551112222",
-      text: "translate Zählung to English, one word",
-    }));
-    await drainQueue(agent);
-
-    expect(im.delivered).toHaveLength(1);
-    expect(im.delivered[0].text).toBe("count");
-
-    await agent.stop();
-  });
-
-  it("delivers a text block that opens with Thinking: verbatim (#291 P1)", async () => {
-    const agent = new Agent();
-    const im = new MockChannel("imessage");
-    agent.addChannel(im);
-
-    const reply = "Thinking: I suggest two steps. First back up. Then migrate.";
-    mockSdk.responseFn = () => reply;
-
-    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "How?" }));
-    await drainQueue(agent);
-
-    expect(im.delivered).toHaveLength(1);
-    expect(im.delivered[0].text).toBe(reply);
-
-    await agent.stop();
-  });
-
-  it("keeps line-formatted lists together in iMessage groups", async () => {
-    const agent = new Agent();
-    const im = new MockChannel("imessage");
-    agent.addChannel(im);
-
-    mockSdk.responseFn = () => "List 🦀\n· Running shoes ×3\n· Winter coat ×1\n\nPickup: Saturday, in store.";
-
-    await im.simulateMessage(makeMsg({
-      chatId: "iMessage;+;group123",
-      text: "go",
-      isGroup: true,
-      senderName: "Alice",
-    }));
-    await drainQueue(agent);
-
-    expect(im.delivered.map((d) => d.text)).toEqual([
-      "List 🦀\n· Running shoes ×3\n· Winter coat ×1\n\nPickup: Saturday, in store.",
-    ]);
-
-    await agent.stop();
-  });
-
-  it("keeps MEDIA captions attached instead of newline-splitting them away from the photo", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-    const imagePath = join(agentEnv.tmpDir, "captioned-photo.png");
+  it.each<{ name: string; response: (img: string) => MockResponse; expected: Delivery[]; ingress?: Ingress }>([
+    { name: "a MEDIA caption stays attached instead of being newline-split from the photo", response: (img) => `caption line 1\ncaption line 2 MEDIA:"${img}"`, expected: [at("caption line 1\ncaption line 2", IMG)] },
+    { name: "a cron MEDIA caption stays attached too", ingress: "cron", response: (img) => `caption line 1\ncaption line 2 MEDIA:"${img}"`, expected: [at("caption line 1\ncaption line 2", IMG)] },
+    { name: "an attachment block ships in place: A, photo, B", response: (img) => ["A", `MEDIA:${img}`, "B"], expected: [at("A"), at("", IMG), at("B")] },
+    { name: "a caption stays with the media of its OWN block", response: (img) => ["A", `here it is MEDIA:${img}`, "B"], expected: [at("A"), at("here it is", IMG), at("B")] },
+    // A block marked not-for-the-channel ships NOTHING — text, media and
+    // stickers alike (owner decision 2026-07-08).
+    { name: "a mid-turn NO_REPLY block drops its ATTACHMENTS too, not just its text", response: (img) => ["A", `MEDIA:${img}\nNO_REPLY`, "B"], expected: [at("A"), at("B")] },
+    { name: "a STICKER tag ships as a sticker send, the tag kept out of the text", response: () => "here you go STICKER:CAACAgQAAxkBAAE123", expected: [at("here you go"), at("", undefined, "CAACAgQAAxkBAAE123")] },
+  ])("$name", async ({ response, expected, ingress }) => {
+    const imagePath = join(agentEnv.tmpDir, "photo.png");
     writeFileSync(imagePath, "fake image");
-
-    mockSdk.responseFn = () => `caption line 1\ncaption line 2 MEDIA:"${imagePath}"`;
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "send photo" }));
-    await drainQueue(agent);
-
-    expect(tg.delivered).toEqual([
-      { chatId: "12345", text: "caption line 1\ncaption line 2", photo: imagePath, sticker: undefined },
-    ]);
-    expect(tg.delivered.map((d) => d.text).join("\n")).not.toContain("MEDIA:");
-
-    await agent.stop();
+    const delivered = await deliver(response(imagePath), TG_DM, ingress);
+    expect(delivered).toEqual(expected.map((d) => ({ ...d, photo: d.photo === IMG ? imagePath : d.photo })));
+    expect(delivered.map((d) => d.text).join("\n")).not.toMatch(/MEDIA:|STICKER:/);
   });
+});
 
+describe("thinking blocks", () => {
   // NOTE on the fixture: "the user probably wants X" is a synthetic block SHAPE —
   // a thinking block that still carries text. Under real `display: "omitted"`
   // actual reasoning arrives EMPTY (signature only) and is dropped; the only
   // non-empty thinking blocks observed in practice were misplaced replies. This
   // test does not assert that reasoning should ever be delivered.
+  //
   // The whole mechanism is the block-TYPE gate in renderBlock: the same turn,
-  // the same two blocks, only the flag differs. The flag decides the MARKER,
-  // not whether non-empty thinking is delivered — with the flag off the SDK
-  // runs `display: "omitted"`, under which a thinking block that still has
-  // text in it has only ever been a misplaced message, so it ships as one,
-  // plain. Delete the marker and the showThinking:true row fails; ship it
-  // unconditionally and the showThinking:false row fails. Each block is its
-  // own message, so the earlier block arrives BEFORE the answer rather than
-  // glued to it.
+  // the same two blocks, only the flag differs. With the flag ON the thinking
+  // block ships as its own message, marked 💭, BEFORE the answer rather than
+  // glued to it. With the flag OFF it is DROPPED (shipBlock logs the drop and
+  // its length): under `omitted` its text is a summary of what the model
+  // wrote, not the words, and a summary delivered as a reply puts words in the
+  // model's mouth. Delete the marker and the showThinking:true row fails; ship
+  // non-empty thinking unconditionally and the showThinking:false row fails.
   it.each([
     { showThinking: false, expected: ["public answer"] },
     { showThinking: true, expected: ["💭 the user probably wants X", "public answer"] },
   ])("renders a thinking + text turn by block type (showThinking=$showThinking)", async ({ showThinking, expected }) => {
     resetConfig({ showThinking });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => [
+    const delivered = await deliver([
       { type: "thinking", thinking: "the user probably wants X" },
       "public answer",
-    ];
+    ]);
 
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
-    await drainQueue(agent);
-
-    expect(tg.delivered.map((d) => d.text)).toEqual(expected);
-    // Spelled out both ways so the assertion cannot pass by coincidence: with
-    // the flag on the thinking block arrives, marked; with it off the block
-    // arrives nowhere — under `omitted` its text is a summary, not a reply.
-    const all = tg.delivered.map((d) => d.text).join("\n");
+    expect(delivered.map((d) => d.text)).toEqual(expected);
+    // Spelled out both ways so the assertion cannot pass by coincidence.
+    const all = delivered.map((d) => d.text).join("\n");
     expect(all.includes("the user probably wants X")).toBe(showThinking);
     expect(all.includes("💭 ")).toBe(showThinking);
-
-    await agent.stop();
   });
+});
 
-  it("suppresses NO_REPLY when it is the entire response", async () => {
+describe("typing on a passive group turn that answers NO_REPLY", () => {
+  it("shows no iMessage group typing for a quick passive turn", async () => {
     const agent = new Agent();
     const im = new MockChannel("imessage");
     agent.addChannel(im);
 
     mockSdk.responseFn = () => "NO_REPLY";
 
-    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "noise" }));
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;+;group123", text: "side chatter", isGroup: true }));
     await drainQueue(agent);
 
     expect(im.delivered).toHaveLength(0);
+    expect(im.typingStarts).toEqual([]);
+    expect(im.typingStops).toEqual([]);
 
     await agent.stop();
   });
 
-  it("drops a mid-turn bare NO_REPLY block but keeps the blocks around it", async () => {
+  it("delays iMessage typing and clears it when a slow passive turn answers NO_REPLY", async () => {
+    vi.useFakeTimers();
+    resetConfig({ imessagePassiveTypingStartDelayMs: 100 });
+
     const agent = new Agent();
     const im = new MockChannel("imessage");
     agent.addChannel(im);
 
-    mockSdk.responseFn = () => ["before", "NO_REPLY", "after"];
+    mockSdk.responseFn = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return "NO_REPLY";
+    };
 
-    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
-    await drainQueue(agent);
+    await im.simulateMessage(makeMsg({ chatId: "iMessage;+;group123", text: "side chatter", isGroup: true }));
+    const drained = drainQueue(agent);
 
-    expect(im.delivered.map((d) => d.text)).toEqual(["before", "after"]);
+    await vi.advanceTimersByTimeAsync(99);
+    expect(im.typingStarts).toEqual([]);
 
-    await agent.stop();
-  });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(im.typingStarts).toEqual(["iMessage;+;group123"]);
 
-  it("suppresses only itself when the LAST block is a bare NO_REPLY", async () => {
-    const agent = new Agent();
-    const im = new MockChannel("imessage");
-    agent.addChannel(im);
+    await vi.advanceTimersByTimeAsync(50);
+    await drained;
 
-    // Under end-of-turn delivery this trailing token suppressed the earlier
-    // narration too. Mid-turn it cannot: "did the housekeeping" was already
-    // sent when the model wrote the token. The token still ships nothing
-    // itself, which is the part that was ever load-bearing.
-    mockSdk.responseFn = () => ["did the housekeeping", "NO_REPLY"];
-
-    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
-    await drainQueue(agent);
-
-    expect(im.delivered.map((d) => d.text)).toEqual(["did the housekeeping"]);
+    expect(im.delivered).toHaveLength(0);
+    expect(im.typingStops).toEqual([
+      { chatId: "iMessage;+;group123", options: { clear: true } },
+    ]);
 
     await agent.stop();
   });
+});
 
-  it("drops empty blocks but ships the non-empty ones", async () => {
-    const agent = new Agent();
-    const im = new MockChannel("imessage");
-    agent.addChannel(im);
-
-    // Whitespace-only blocks (e.g. a tool-only assistant event with no text)
-    // should not surface as empty iMessages.
-    mockSdk.responseFn = () => ["   ", "real content", ""];
-
-    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
-    await drainQueue(agent);
-
-    expect(im.delivered).toHaveLength(1);
-    expect(im.delivered[0].text).toBe("real content");
-
-    await agent.stop();
-  });
-
+describe("delivery failures and shutdown", () => {
   it("regression: a failing channel send does not re-run the turn", async () => {
     // Delivery happens after the turn resolves, outside the SDK event loop,
     // so a channel failure must surface as an error message — never as a
@@ -338,9 +270,7 @@ describe("outbound delivery", () => {
   });
 
   it("preserves the sdk session link when stopping during an in-flight turn", async () => {
-    resetConfig({
-      identities: [{ name: "Shuai", channels: { imessage: "+15551112222" }, replyPolicy: "last-active" }],
-    });
+    resetConfig({ identities: [ownerIdentity("Shuai", { imessage: "+15551112222" })] });
     const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
     store.setSdkSessionId("dm:shuai", "old-session-id");
     store.setReplyTarget("dm:shuai", { channelName: "imessage", chatId: "+15551112222" });
@@ -361,154 +291,8 @@ describe("outbound delivery", () => {
     await agent.stop();
     release?.();
 
-    const after = new SessionStore(
-      mockConfig.sessionsDir,
-      20,
-      mockConfig.sdkSessionsDir,
-    ).getEntry("dm:shuai");
+    const after = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).getEntry("dm:shuai");
     expect(after?.sdkSessionId).toBe("old-session-id");
     expect(after?.unlinkedAt).toBeNull();
-  });
-
-  // ---------------------------------------------------------------------
-  // Per-block semantics. Joining first and filtering after changes what
-  // ships: the streaming predecessor applied the bare-NO_REPLY rule and the
-  // scaffold filter to each block on its own, and placed attachments where
-  // the model put them. Non-streaming delivery has to match that.
-  // ---------------------------------------------------------------------
-
-  it("drops a mid-turn block whose trailing line is NO_REPLY, narration and all", async () => {
-    const agent = new Agent();
-    const im = new MockChannel("imessage");
-    agent.addChannel(im);
-
-    // The middle block is housekeeping narration the agent marked
-    // not-for-the-channel. Neither the narration nor the token may ship, and
-    // the blocks around it must survive.
-    mockSdk.responseFn = () => ["A", "housekeeping\nNO_REPLY", "B"];
-
-    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
-    await drainQueue(agent);
-
-    expect(im.delivered.map((d) => d.text)).toEqual(["A", "B"]);
-    const all = im.delivered.map((d) => d.text).join("\n");
-    expect(all).not.toContain("housekeeping");
-    expect(all).not.toContain("NO_REPLY");
-
-    await agent.stop();
-  });
-
-  it("drops the ATTACHMENTS of a mid-turn NO_REPLY block, not just its text", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-    const imagePath = join(agentEnv.tmpDir, "no-reply-block.png");
-    writeFileSync(imagePath, "fake image");
-
-    // A block marked not-for-the-channel ships NOTHING — text, media and
-    // stickers alike (owner decision 2026-07-08).
-    mockSdk.responseFn = () => ["A", `MEDIA:${imagePath}\nNO_REPLY`, "B"];
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
-    await drainQueue(agent);
-
-    expect(tg.delivered.some((d) => d.photo)).toBe(false);
-    expect(tg.delivered.map((d) => d.text)).toEqual(["A", "B"]);
-
-    await agent.stop();
-  });
-
-  it("cuts only the leaking block when scaffold leaks mid-turn", async () => {
-    const agent = new Agent();
-    const im = new MockChannel("imessage");
-    agent.addChannel(im);
-
-    // Filtering the JOINED response would truncate at the marker and lose B.
-    mockSdk.responseFn = () => ["A", "<system-reminder>internal note</system-reminder>", "B"];
-
-    await im.simulateMessage(makeMsg({ chatId: "iMessage;-;+15551112222", text: "go" }));
-    await drainQueue(agent);
-
-    expect(im.delivered.map((d) => d.text)).toEqual(["A", "B"]);
-    expect(im.delivered.map((d) => d.text).join("\n")).not.toContain("system-reminder");
-
-    await agent.stop();
-  });
-
-  it("delivers an attachment block in place: A, photo, B", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-    const imagePath = join(agentEnv.tmpDir, "in-order.png");
-    writeFileSync(imagePath, "fake image");
-
-    mockSdk.responseFn = () => ["A", `MEDIA:${imagePath}`, "B"];
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
-    await drainQueue(agent);
-
-    expect(tg.delivered).toEqual([
-      { chatId: "12345", text: "A", photo: undefined, sticker: undefined },
-      { chatId: "12345", text: "", photo: imagePath, sticker: undefined },
-      { chatId: "12345", text: "B", photo: undefined, sticker: undefined },
-    ]);
-
-    await agent.stop();
-  });
-
-  it("never merges adjacent text-only blocks", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    // Mid-turn there is nothing to merge WITH: when A completes, B has not
-    // been written yet. One completed block is one message.
-    mockSdk.responseFn = () => ["A", "B"];
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
-    await drainQueue(agent);
-
-    expect(tg.delivered.map((d) => d.text)).toEqual(["A", "B"]);
-
-    await agent.stop();
-  });
-
-  it("keeps a caption with the media of its OWN block", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-    const imagePath = join(agentEnv.tmpDir, "own-block-caption.png");
-    writeFileSync(imagePath, "fake image");
-
-    mockSdk.responseFn = () => ["A", `here it is MEDIA:${imagePath}`, "B"];
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "go" }));
-    await drainQueue(agent);
-
-    expect(tg.delivered).toEqual([
-      { chatId: "12345", text: "A", photo: undefined, sticker: undefined },
-      { chatId: "12345", text: "here it is", photo: imagePath, sticker: undefined },
-      { chatId: "12345", text: "B", photo: undefined, sticker: undefined },
-    ]);
-
-    await agent.stop();
-  });
-
-  it("ships STICKER tags as sticker sends without leaking the tag into text", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => "here you go STICKER:CAACAgQAAxkBAAE123";
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "send sticker" }));
-    await drainQueue(agent);
-
-    expect(tg.delivered).toEqual([
-      { chatId: "12345", text: "here you go", photo: undefined, sticker: undefined },
-      { chatId: "12345", text: "", photo: undefined, sticker: "CAACAgQAAxkBAAE123" },
-    ]);
-
-    await agent.stop();
   });
 });

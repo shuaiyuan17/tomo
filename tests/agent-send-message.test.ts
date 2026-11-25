@@ -376,22 +376,6 @@ describe("send_message direct mode", () => {
     await agent.stop();
   });
 
-  it("caps pending notes at 15 per session, keeping the most recent", async () => {
-    const agent = new Agent();
-    const internals = agent as unknown as {
-      queuePendingNote(key: string, note: string): void;
-    };
-
-    for (let i = 0; i < 20; i++) internals.queuePendingNote("telegram:-987", `note-${i}`);
-
-    const notes = peekPendingNotes(agent, "telegram:-987");
-    expect(notes).toHaveLength(15);
-    expect(notes[0]).toBe("note-5");
-    expect(notes.at(-1)).toBe("note-19");
-
-    await agent.stop();
-  });
-
   it("restores pending direct-send context after a restart and drains it once", async () => {
     const firstAgent = new Agent();
     const tg = new MockChannel("telegram");

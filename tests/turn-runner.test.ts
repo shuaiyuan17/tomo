@@ -14,6 +14,8 @@ import {
 } from "../src/agent/turn-runner.js";
 import type { PromptContextTicket } from "../src/agent/live-session-manager.js";
 import { SteerDeclinedError } from "../src/agent/sdk-result.js";
+import { watchBus } from "../src/watch/bus.js";
+import type { WatchEvent } from "../src/watch/protocol.js";
 
 vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -46,7 +48,9 @@ interface Harness {
   typingStops: Array<StopTypingOptions | undefined>;
 }
 
-function makeHarness(respond: (req: RunWithRetryRequest) => Promise<string>): Harness {
+/** A TurnRunner over a FakeChannel that records everything it is handed.
+ *  `overrides` replace (or add) deps, e.g. the note-settling callbacks. */
+function makeHarness(respond: (req: RunWithRetryRequest) => Promise<string>, overrides: Partial<TurnRunnerDeps> = {}): Harness {
   const channel = new FakeChannel();
   const prompts: RunWithRetryRequest[] = [];
   const transcript: Harness["transcript"] = [];
@@ -73,6 +77,7 @@ function makeHarness(respond: (req: RunWithRetryRequest) => Promise<string>): Ha
         errorNotes.push({ sessionKey, visibleError });
       },
     }),
+    ...overrides,
   };
 
   return { runner: new TurnRunner(deps), channel, prompts, transcript, errorNotes, typingStarts, typingStops };
@@ -81,6 +86,7 @@ function makeHarness(respond: (req: RunWithRetryRequest) => Promise<string>): Ha
 function replySpec(h: Harness, overrides: Partial<TurnSpec> = {}): TurnSpec {
   return {
     key: "telegram:123",
+    source: "user",
     prompt: "hello",
     stampChannelName: "telegram",
     typing: { channel: h.channel, chatId: "123", passiveListen: false },
@@ -100,6 +106,7 @@ function replySpec(h: Harness, overrides: Partial<TurnSpec> = {}): TurnSpec {
 function sendSpec(h: Harness, overrides: Partial<TurnSpec> = {}): TurnSpec {
   return {
     key: "telegram:123",
+    source: "cron",
     prompt: "cron task",
     stampChannelName: "telegram",
     typing: { channel: h.channel, chatId: "123", passiveListen: false },
@@ -250,13 +257,6 @@ describe("originForSource", () => {
   });
 });
 
-describe("silent matchers", () => {
-  it("the default matcher only accepts the bare token", () => {
-    expect(isSilentReply("NO_REPLY")).toBe(true);
-    expect(isSilentReply("did the thing. NO_REPLY")).toBe(false);
-  });
-});
-
 describe("TurnRunner prompt assembly", () => {
   it("drains pending notes and stamps the timestamp for stamped specs", async () => {
     const h = makeHarness(async () => "ok");
@@ -310,19 +310,13 @@ describe("TurnRunner reply turns", () => {
     expect(empty.channel.sent).toHaveLength(0);
     expect(empty.transcript.map((t) => t.content)).toEqual(["NO_REPLY"]);
 
+    // A chosen NO_REPLY is silent too, but still recorded in the transcript.
     const chosen = makeHarness(async () => "NO_REPLY");
     const notEmpty = vi.fn();
     await chosen.runner.runTurn(replySpec(chosen, { onEmpty: notEmpty }));
     expect(notEmpty).not.toHaveBeenCalled();
     expect(chosen.channel.sent).toHaveLength(0);
-  });
-
-  it("still appends a silent reply to the transcript but sends nothing", async () => {
-    const h = makeHarness(async () => "NO_REPLY");
-    await h.runner.runTurn(replySpec(h));
-
-    expect(h.transcript).toHaveLength(1);
-    expect(h.channel.sent).toHaveLength(0);
+    expect(chosen.transcript.map((t) => t.content)).toEqual(["NO_REPLY"]);
   });
 
   it("uses the spec's silentMatcher for reply delivery", async () => {
@@ -408,26 +402,12 @@ describe("TurnRunner send turns", () => {
     ]);
   });
 
-  it("suppresses the whole turn when narration ends with a trailing NO_REPLY line", async () => {
-    const h = makeHarness(async () => "archived the logs, nothing urgent\nNO_REPLY");
-    const result = await h.runner.runTurn(sendSpec(h));
-
-    expect(result).toBe(true);
-    expect(h.channel.sent).toHaveLength(0);
-    expect(h.transcript).toHaveLength(0);
-  });
-
-  it("suppresses the whole turn on repeated trailing NO_REPLY blocks", async () => {
-    const h = makeHarness(async () => "cron says hi\nNO_REPLY\nNO_REPLY");
-    const result = await h.runner.runTurn(sendSpec(h));
-
-    expect(result).toBe(true);
-    expect(h.channel.sent).toHaveLength(0);
-    expect(h.transcript).toHaveLength(0);
-  });
-
-  it("keeps repeated trailing NO_REPLY-only send turns silent", async () => {
-    const h = makeHarness(async () => "NO_REPLY\nNO_REPLY");
+  it.each([
+    { name: "narration that ends with a trailing NO_REPLY line", response: "archived the logs, nothing urgent\nNO_REPLY" },
+    { name: "narration followed by repeated trailing NO_REPLY lines", response: "cron says hi\nNO_REPLY\nNO_REPLY" },
+    { name: "repeated NO_REPLY lines and nothing else", response: "NO_REPLY\nNO_REPLY" },
+  ])("suppresses the whole send turn on $name", async ({ response }) => {
+    const h = makeHarness(async () => response);
     const result = await h.runner.runTurn(sendSpec(h));
 
     expect(result).toBe(true);
@@ -458,8 +438,11 @@ describe("TurnRunner send turns", () => {
     expect(h.transcript).toHaveLength(0);
   });
 
-  it("keeps agent-error responses out of the chat when response policy is note-only", async () => {
-    const h = makeHarness(async () => "API Error: 529 overloaded");
+  it.each([
+    { name: "an agent-error response", respond: async () => "API Error: 529 overloaded", note: "[error] cron failed: API Error: 529 overloaded" },
+    { name: "a thrown error", respond: async (): Promise<string> => { throw new Error("boom"); }, note: "[error] cron failed: boom" },
+  ])("keeps $name out of the chat under a note-only policy, queued for the next turn", async ({ respond, note }) => {
+    const h = makeHarness(respond);
     const result = await h.runner.runTurn(sendSpec(h, {
       errors: {
         visibleError: "cron",
@@ -470,23 +453,7 @@ describe("TurnRunner send turns", () => {
     }));
 
     expect(result).toBe(false);
-    expect(h.errorNotes).toHaveLength(1);
-    expect(h.channel.sent).toHaveLength(0);
-  });
-
-  it("queues thrown errors without delivery when thrown policy is note-only", async () => {
-    const h = makeHarness(async () => { throw new Error("boom"); });
-    const result = await h.runner.runTurn(sendSpec(h, {
-      errors: {
-        visibleError: "cron",
-        response: "note-only",
-        thrown: "note-only",
-        thrownLogMessage: "Cron message handling failed",
-      },
-    }));
-
-    expect(result).toBe(false);
-    expect(h.errorNotes).toEqual([{ sessionKey: "telegram:123", visibleError: "[error] cron failed: boom" }]);
+    expect(h.errorNotes).toEqual([{ sessionKey: "telegram:123", visibleError: note }]);
     expect(h.channel.sent).toHaveLength(0);
     expect(h.typingStops).toEqual([{ clear: true }]);
   });
@@ -504,6 +471,7 @@ describe("TurnRunner deferred-send turns (continuity)", () => {
   function continuitySpec(h: Harness, resolveTarget: () => { channel: Channel; chatId: string } | undefined): TurnSpec {
     return {
       key: "dm:shuai",
+      source: "continuity",
       prompt: "System: Free time.",
       delivery: { kind: "deferred-send", resolveTarget },
       silentMatcher: isSilentReply,
@@ -569,21 +537,13 @@ describe("undelivered reply at turn end", () => {
   // that the turn ended on a thinking block no text followed, ask for ONE
   // restate turn on the same target — and never from a restate turn itself.
   function rig(flag: boolean) {
-    const h = makeHarness(async () => "NO_REPLY");
     const restates: Array<{ key: string; chatId: string | undefined }> = [];
     let reads = 0;
-    const runner = new TurnRunner({
-      drainPendingNotes: () => "",
-      runWithRetry: (req) => { h.prompts.push(req); return Promise.resolve("NO_REPLY"); },
-      appendAssistantTranscript: () => {},
-      queuePendingErrorNote: () => {},
-      startTurnTyping: () => () => {},
-      isPrivateMemoryBarred: () => false,
-      delivery: new DeliveryPipeline({ queuePendingErrorNote: () => {} }),
+    const h = makeHarness(async () => "NO_REPLY", {
       undeliveredReplyAtTurnEnd: () => { reads++; return flag; },
       requestRestate: (key, target) => { restates.push({ key, chatId: target?.chatId }); },
     });
-    return { h, runner, restates, reads: () => reads };
+    return { h, runner: h.runner, restates, reads: () => reads };
   }
 
   it("requests one restate turn, to the turn's own target, when the flag reads true", async () => {
@@ -631,14 +591,14 @@ describe("per-block trailing NO_REPLY in TurnRunner.onBlock", () => {
 
 describe("TurnRunner: pending notes are consumed only by a prompt the model took", () => {
   function notesHarness(respond: (req: RunWithRetryRequest) => Promise<string>) {
-    const h = makeHarness(respond);
     const settled: string[] = [];
     const restored: string[] = [];
-    const deps = (h.runner as unknown as { deps: TurnRunnerDeps }).deps;
-    deps.settlePendingNotes = (_key, drained) => { settled.push(drained); };
-    deps.restorePendingNotes = (_key, drained) => { restored.push(drained); };
     const interrupted: string[] = [];
-    deps.restoreInterruptedPendingNotes = (_key, drained) => { interrupted.push(drained); };
+    const h = makeHarness(respond, {
+      settlePendingNotes: (_key, drained) => { settled.push(drained); },
+      restorePendingNotes: (_key, drained) => { restored.push(drained); },
+      restoreInterruptedPendingNotes: (_key, drained) => { interrupted.push(drained); },
+    });
     return { h, settled, restored, interrupted };
   }
 
@@ -666,12 +626,12 @@ describe("TurnRunner: pending notes are consumed only by a prompt the model took
 
 describe("TurnRunner: notes taken by a turn that did not finish", () => {
   function harness(respond: (req: RunWithRetryRequest) => Promise<string>) {
-    const h = makeHarness(respond);
     const calls: string[] = [];
-    const deps = (h.runner as unknown as { deps: TurnRunnerDeps }).deps;
-    deps.settlePendingNotes = () => { calls.push("settle"); };
-    deps.restorePendingNotes = () => { calls.push("restore"); };
-    deps.restoreInterruptedPendingNotes = () => { calls.push("interrupted"); };
+    const h = makeHarness(respond, {
+      settlePendingNotes: () => { calls.push("settle"); },
+      restorePendingNotes: () => { calls.push("restore"); },
+      restoreInterruptedPendingNotes: () => { calls.push("interrupted"); },
+    });
     return { h, calls };
   }
 
@@ -711,13 +671,14 @@ describe("TurnRunner: notes taken by a turn that did not finish", () => {
 });
 
 describe("TurnRunner: the memory change note", () => {
-  function contextHarness(respond: (req: RunWithRetryRequest) => Promise<string>) {
-    const h = makeHarness(respond);
+  function contextHarness(respond: (req: RunWithRetryRequest) => Promise<string>, overrides: Partial<TurnRunnerDeps> = {}) {
     const ticket = { prefix: "[memory]\n\n" } as unknown as PromptContextTicket;
     const settled: boolean[] = [];
-    const deps = (h.runner as unknown as { deps: TurnRunnerDeps }).deps;
-    deps.takePromptContextNote = () => ticket;
-    deps.settlePromptContextNote = (t, told) => { expect(t).toBe(ticket); settled.push(told); };
+    const h = makeHarness(respond, {
+      takePromptContextNote: () => ticket,
+      settlePromptContextNote: (t, told) => { expect(t).toBe(ticket); settled.push(told); },
+      ...overrides,
+    });
     return { h, ticket, settled };
   }
 
@@ -730,13 +691,12 @@ describe("TurnRunner: the memory change note", () => {
   });
 
   it("is rolled back when the owner stopped the turn, though its pending notes settle", async () => {
+    const notesSettled: string[] = [];
     const { h, settled } = contextHarness(async (req) => {
       req.onPromptHandedOff?.();
       req.replyContext!.stopped = true;
       return "NO_REPLY";
-    });
-    const notesSettled: string[] = [];
-    (h.runner as unknown as { deps: TurnRunnerDeps }).deps.settlePendingNotes = (_k, d) => { notesSettled.push(d); };
+    }, { settlePendingNotes: (_k, d) => { notesSettled.push(d); } });
     await h.runner.runTurn(replySpec(h));
     expect(notesSettled).toEqual(["[note]\n\n"]);
     expect(settled).toEqual([false]);
@@ -754,5 +714,152 @@ describe("TurnRunner: the memory change note", () => {
     const declined = contextHarness(async () => { throw new SteerDeclinedError(); });
     await expect(declined.h.runner.runTurn(replySpec(declined.h))).rejects.toBeInstanceOf(SteerDeclinedError);
     expect(declined.settled).toEqual([false]);
+  });
+});
+
+describe("TurnRunner: a steer the session declined", () => {
+  // SteerDeclinedError means the steer never became a turn: the caller hands
+  // the message back to the session queue. Everything drained for it must go
+  // back too — a pending note lost here is a message the model never sees.
+  it("puts the drained notes back, settles nothing, publishes a requeue and rethrows", async () => {
+    const restored: string[] = [];
+    const settled: string[] = [];
+    const outcomes: boolean[] = [];
+    const h = makeHarness(async () => { throw new SteerDeclinedError(); }, {
+      restorePendingNotes: (_key, drained) => { restored.push(drained); },
+      settlePendingNotes: (_key, drained) => { settled.push(drained); },
+      restoreInterruptedPendingNotes: () => { throw new Error("a declined steer was not interrupted"); },
+      recordTurnOutcome: (_key, ok) => { outcomes.push(ok); },
+    });
+    const events: WatchEvent[] = [];
+    const unsubscribe = watchBus.subscribe((e) => { if (e.type.startsWith("turn.")) events.push(e); });
+    try {
+      await expect(h.runner.runTurn(replySpec(h, {
+        requestId: "req-1",
+        delivery: { kind: "reply", channel: h.channel, chatId: "123", steer: true },
+      }))).rejects.toBeInstanceOf(SteerDeclinedError);
+    } finally {
+      unsubscribe();
+    }
+
+    expect(restored).toEqual(["[note]\n\n"]);
+    expect(settled).toEqual([]);
+    // Not a turn: no outcome recorded, no turn.end, nothing sent.
+    expect(outcomes).toEqual([]);
+    expect(events.map((e) => e.type)).toEqual(["turn.start", "turn.requeue"]);
+    expect(h.channel.sent).toEqual([]);
+    expect(h.typingStops).toEqual([{ clear: true }]);
+  });
+});
+
+describe("TurnRunner: every turn's outcome", () => {
+  // recordTurnOutcome feeds Agent.lastGoodTurnAt, which the owner error notice
+  // reads ("last good turn at …"): only a turn that ran cleanly may move it.
+  it.each([
+    { name: "a delivered reply", respond: async () => "the reply", ok: true },
+    { name: "a chosen NO_REPLY", respond: async () => "NO_REPLY", ok: true },
+    { name: "an agent-error response", respond: async () => "API Error: 529 overloaded", ok: false },
+    { name: "a thrown error", respond: async (): Promise<string> => { throw new Error("boom"); }, ok: false },
+  ])("records $name once, as runTurn reports it", async ({ respond, ok }) => {
+    const outcomes: Array<[string, boolean]> = [];
+    const h = makeHarness(respond, { recordTurnOutcome: (key, turnOk) => { outcomes.push([key, turnOk]); } });
+    await expect(h.runner.runTurn(replySpec(h))).resolves.toBe(ok);
+    expect(outcomes).toEqual([["telegram:123", ok]]);
+  });
+});
+
+describe("TurnRunner: turn events on the watch bus", () => {
+  async function turnEvents(respond: (req: RunWithRetryRequest) => Promise<string>, overrides: Partial<TurnSpec> = {}): Promise<WatchEvent[]> {
+    const h = makeHarness(respond);
+    const events: WatchEvent[] = [];
+    const unsubscribe = watchBus.subscribe((e) => { if (e.type.startsWith("turn.") && "sessionKey" in e && e.sessionKey === "telegram:123") events.push(e); });
+    try {
+      await h.runner.runTurn(replySpec(h, overrides));
+    } finally {
+      unsubscribe();
+    }
+    return events;
+  }
+  /** A web request steered into the session: the only kind that reports its hand-off. */
+  const steered = (): Partial<TurnSpec> => ({
+    requestId: "req-7",
+    delivery: { kind: "reply", channel: new FakeChannel(), chatId: "123", steer: true },
+  });
+
+  it("brackets a clean turn with turn.start and turn.end{ok}, no uncertain flag", async () => {
+    const events = await turnEvents(async () => "ok");
+    expect(events.map((e) => e.type)).toEqual(["turn.start", "turn.end"]);
+    expect(events[0]).toMatchObject({ sessionKey: "telegram:123", source: "user" });
+    expect(events[1]).toMatchObject({ sessionKey: "telegram:123", source: "user", ok: true, durationMs: expect.any(Number) });
+    expect(events[1]).not.toHaveProperty("uncertain");
+  });
+
+  it("marks a turn that failed after its input was handed to the SDK as uncertain", async () => {
+    // The web UI and the metrics read the flag: such a turn may or may not
+    // have run, so it is never retried and is shown as "outcome unknown".
+    const events = await turnEvents(async (req) => { req.onHandedOff?.(); throw new Error("stream died"); }, steered());
+    expect(events.map((e) => e.type)).toEqual(["turn.start", "turn.handoff", "turn.end"]);
+    expect(events.at(-1)).toMatchObject({ requestId: "req-7", ok: false, uncertain: true });
+  });
+
+  it("does not mark a failed turn uncertain when nothing was handed off", async () => {
+    const events = await turnEvents(async () => { throw new Error("session build failed"); }, steered());
+    expect(events.at(-1)).toMatchObject({ type: "turn.end", requestId: "req-7", ok: false });
+    expect(events.at(-1)).not.toHaveProperty("uncertain");
+  });
+
+  it("marks a handed-off turn that shutdown cut short as uncertain, though it ended ok", async () => {
+    const events = await turnEvents(async (req) => {
+      req.onHandedOff?.();
+      req.onShutdownInterrupted?.();
+      return "NO_REPLY";
+    }, steered());
+    expect(events.at(-1)).toMatchObject({ type: "turn.end", ok: true, uncertain: true });
+  });
+});
+
+describe("TurnRunner: bare specs", () => {
+  // An SDK slash command (a sub-session's `/compact <instructions>`) only
+  // works when it leads the message: nothing may be put in front of it.
+  it("sends the prompt exactly as given: no notes drained, no memory note taken, no stamp", async () => {
+    const drained = vi.fn(() => "[note]\n\n");
+    const takeNote = vi.fn();
+    const h = makeHarness(async () => "NO_REPLY", { drainPendingNotes: drained, takePromptContextNote: takeNote });
+    await h.runner.runTurn(sendSpec(h, { prompt: "/compact keep the decisions", bare: true }));
+
+    expect(h.prompts.map((p) => p.prompt)).toEqual(["/compact keep the decisions"]);
+    expect(drained).not.toHaveBeenCalled();
+    expect(takeNote).not.toHaveBeenCalled();
+  });
+});
+
+describe("TurnRunner: an error the policy kept out of the chat", () => {
+  const ownerNotice = { noticeKey: "cron:job-1", label: "Morning digest", turnKind: "scheduled job" } as unknown as NonNullable<TurnSpec["errors"]["ownerNotice"]>;
+  const noteOnly = (notice = ownerNotice): TurnSpec["errors"] => ({
+    visibleError: "cron", response: "note-only", thrown: "note-only", thrownLogMessage: "Cron message handling failed", ownerNotice: notice,
+  });
+
+  it("is reported to the owner notifier with its detail", async () => {
+    const reports: unknown[][] = [];
+    const h = makeHarness(async () => { throw new Error("boom"); }, { reportSuppressedError: (...args) => { reports.push(args); } });
+    await expect(h.runner.runTurn(sendSpec(h, { errors: noteOnly() }))).resolves.toBe(false);
+
+    expect(h.channel.sent).toEqual([]);
+    expect(reports).toEqual([["telegram:123", ownerNotice, "boom"]]);
+  });
+
+  it("a notifier that throws does not break the turn's own error handling", async () => {
+    const h = makeHarness(async () => { throw new Error("boom"); }, { reportSuppressedError: () => { throw new Error("notifier down"); } });
+    await expect(h.runner.runTurn(sendSpec(h, { errors: noteOnly() }))).resolves.toBe(false);
+    expect(h.errorNotes).toEqual([{ sessionKey: "telegram:123", visibleError: "[error] cron failed: boom" }]);
+    expect(h.typingStops).toEqual([{ clear: true }]);
+  });
+
+  it("a visibly delivered error is not reported", async () => {
+    const reports: unknown[][] = [];
+    const h = makeHarness(async () => { throw new Error("boom"); }, { reportSuppressedError: (...args) => { reports.push(args); } });
+    await h.runner.runTurn(sendSpec(h, { errors: { ...noteOnly(), thrown: "deliver" } }));
+    expect(h.channel.sent.map((m) => m.text)).toEqual(["[error] cron failed: boom"]);
+    expect(reports).toEqual([]);
   });
 });

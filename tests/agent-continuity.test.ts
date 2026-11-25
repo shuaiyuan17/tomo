@@ -15,7 +15,9 @@ import {
   installAgentTestHooks,
   makeMsg,
   mockSdk,
+  ownerIdentity,
   resetConfig,
+  seedSession,
 } from "./helpers/agent-harness.js";
 
 installAgentTestHooks();
@@ -49,53 +51,30 @@ describe("continuity delivery", () => {
     .filter((p) => p.text.includes("Free time."))
     .map((p) => p.sessionKey);
 
-  it("runs on the first DM session and delivers none of the turn's own text", async () => {
-    resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => "Good morning!";
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
-    mockSdk.promptsBySession = [];
-
-    await agent.handleContinuity("System: Free time.");
-
-    // Routed to the owner's DM session...
-    expect(continuitySessions()).toEqual(["dm:shuai"]);
-    // ...and "Good morning!" — an unbidden greeting, the exact shape option A
-    // exists to stop — never left the machine.
-    expect(tg.sent).toHaveLength(0);
-
-    await agent.stop();
-  });
-
-  it("suppresses rich output too — multi-line text and MEDIA attachments alike", async () => {
-    resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-    });
+  // "Good morning!" is an unbidden greeting, the exact shape option A exists
+  // to stop. Formatting and attachments are not a loophole: suppression is
+  // decided by the turn's delivery policy, before anything inspects the
+  // content. And a NO_REPLY heartbeat stays silent, as it always has.
+  it.each([
+    ["plain text", () => "Good morning!"],
+    ["multi-line text with a MEDIA attachment", (imagePath: string) => `first thought\nsecond detail MEDIA:"${imagePath}"`],
+    ["a NO_REPLY answer", () => "NO_REPLY"],
+  ])("runs on the first DM session and delivers none of the turn's own text: %s", async (_label, response) => {
+    resetConfig({ identities: [ownerIdentity("shuai", { telegram: "12345" })] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     const imagePath = join(agentEnv.tmpDir, "continuity-captioned-photo.png");
     writeFileSync(imagePath, "fake image");
 
-    mockSdk.responseFn = () => "seeded";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
-
-    // Formatting and attachments are not a loophole: suppression is decided by
-    // the turn's delivery policy, before anything inspects the content.
-    mockSdk.responseFn = () => `first thought\nsecond detail MEDIA:"${imagePath}"`;
+    await seedSession(agent, tg);
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = () => response(imagePath);
 
     await agent.handleContinuity("System: Free time.");
 
+    // Routed to the owner's DM session, and nothing left the machine.
+    expect(continuitySessions()).toEqual(["dm:shuai"]);
     expect(tg.sent).toHaveLength(0);
 
     await agent.stop();
@@ -161,7 +140,7 @@ describe("continuity delivery", () => {
    */
   it("records what a heartbeat sends via send_message, and nothing it merely wrote (#203)", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -192,24 +171,4 @@ describe("continuity delivery", () => {
     await agent.stop();
   });
 
-  it("stays silent on a NO_REPLY heartbeat, as it always has", async () => {
-    resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => "NO_REPLY";
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
-
-    await agent.handleContinuity("System: Free time.");
-
-    expect(tg.sent).toHaveLength(0);
-
-    await agent.stop();
-  });
 });

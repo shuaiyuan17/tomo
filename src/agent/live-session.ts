@@ -788,7 +788,7 @@ export class LiveSession {
       log.warn(
         { session: this.sessionKey, chars },
         chars > 0
-          ? "Unowned SDK turn opened with a thinking block (showThinking off); routing it as text"
+          ? "Unowned SDK turn opened with a thinking block (showThinking off); dropping it, not delivered"
           : "Unowned SDK turn opened with an empty thinking block (showThinking off); nothing to route",
       );
     }

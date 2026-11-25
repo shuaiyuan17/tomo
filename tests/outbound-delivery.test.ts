@@ -316,15 +316,6 @@ describe("block-ordered attachment delivery", () => {
       expect(channel.sent).toEqual([{ chatId: "chat1", text: "B", replyTo: "msg-42" }]);
     });
 
-    it("threads the photo of a MEDIA: block whose caption is empty", async () => {
-      const { channel, deliverBlocks } = makePipeline();
-
-      await deliverBlocks([`MEDIA:${photoPath}`, "B"], { replyTo: "msg-42" });
-
-      expect(channel.sent[0]).toEqual({ chatId: "chat1", photo: photoPath, text: "", replyTo: "msg-42" });
-      expect(channel.sent[1].replyTo).toBeUndefined();
-    });
-
     it("skips a leading NO_REPLY block without spending the target", async () => {
       const { channel, deliverBlocks } = makePipeline();
 

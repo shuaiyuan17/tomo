@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
@@ -7,7 +7,7 @@ vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/agent-mocks.js")).sdkModuleMock());
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
-import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockConfig, mockSdk, resetConfig, useRealAdmission } from "./helpers/agent-harness.js";
+import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockConfig, mockSdk, ownerIdentity, resetConfig, useRealAdmission } from "./helpers/agent-harness.js";
 import { agentEnv } from "./helpers/agent-mocks.js";
 import { createTomoInternalMcpServer } from "../src/mcp/internal-server.js";
 import { PERMISSION_NOT_SANDBOXED } from "../src/mcp/permission-tools.js";
@@ -29,13 +29,20 @@ afterAll(() => rmSync(EXTERNAL, { recursive: true, force: true }));
 type ToolResult = { content: Array<{ text: string }>; isError?: boolean };
 type ToolHandle = { name: string; handler: (args: Record<string, unknown>) => Promise<ToolResult> };
 
+// Every Agent a test builds is stopped after it, like the rest of the area.
+const started: Array<InstanceType<typeof Agent>> = [];
+afterEach(async () => {
+  for (const agent of started.splice(0)) await agent.stop();
+});
+
 function setup() {
   useRealAdmission();
   resetConfig({
     channelAllowlists: { imessage: [GROUP_CHAT] },
-    identities: [{ name: "alex", channels: { imessage: OWNER }, replyPolicy: "last-active" }],
+    identities: [ownerIdentity("alex", { imessage: OWNER })],
   });
   const agent = new Agent();
+  started.push(agent);
   const im = new MockChannel("imessage");
   agent.addChannel(im);
   const tools = (sessionKey: string) => (createTomoInternalMcpServer(agent, sessionKey) as unknown as { tools: ToolHandle[] }).tools;
@@ -51,6 +58,7 @@ describe("request_permission through the Agent", () => {
   it("is offered on group and owner sessions, and refuses on the owner's own turn", async () => {
     const { tools, call } = setup();
     expect(tools(GROUP_KEY).map((t) => t.name)).toContain("request_permission");
+    expect(tools(OWNER_KEY).map((t) => t.name)).toContain("request_permission");
     const own = await call(OWNER_KEY, { path: EXTERNAL, access: "read", reason: "x" });
     expect(own).toMatchObject({ isError: true });
     expect(own.content[0].text).toBe(PERMISSION_NOT_SANDBOXED);

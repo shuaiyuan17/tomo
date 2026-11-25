@@ -70,6 +70,8 @@ export class ForceCompactor {
   private gaveUpNoticeAt = new Map<string, number>();
   /** Last real window seen per key: a "Prompt is too long" result may carry none. */
   private windows = new Map<string, number>();
+  /** A finished run whose result is told only once the session's next turn shows it: reached the API, or still refused. */
+  private pendingVerify = new Map<string, { notice: OwnerText; session: string; before: number; after: number }>();
   private readonly now: () => number;
   private readonly shutdown = new AbortController();
 
@@ -113,6 +115,7 @@ export class ForceCompactor {
    */
   maybeStart(key: string, reading: QueryResult | null, reason: ForceCompactReason): boolean {
     if (!ForceCompactor.enabled() || this.shutdown.signal.aborted) return false;
+    this.verify(key, reading, reason);
     const real = reading && !reading.contextEstimated && reading.contextMax > 0 ? reading : null;
     if (real) this.windows.set(key, real.contextMax);
     if (this.inFlight.has(key)) return true;
@@ -210,7 +213,33 @@ export class ForceCompactor {
       ];
       notice = joinText(parts, " ");
     }
-    await this.deps.notifyOwner(notice).catch((err) => log.warn({ err, key }, "Could not tell the owner about a forced compaction"));
+    if (failure || !report) {
+      log.error({ key, result: "failed", before: args.beforePct, failure }, "Forced compaction result");
+      await this.deps.notifyOwner(notice).catch((err) => log.warn({ err, key }, "Could not tell the owner about a forced compaction"));
+      return;
+    }
+    // "ok" from the rewrite is not recovery (11/25: the CLI still refused
+    // locally). The verdict waits for the session's next turn.
+    this.pendingVerify.set(key, { notice, session, before: args.beforePct, after: Math.round((report.afterTokens / report.contextMax) * 100) });
+  }
+
+  /**
+   * The turn after a forced compaction decides its result: it reached the API
+   * (tokens in) and was not refused → recovered; refused for size again, or no
+   * API call at all → still-over. One owner notice and one log line either way.
+   */
+  private verify(key: string, reading: QueryResult | null, reason: ForceCompactReason): void {
+    const pending = this.pendingVerify.get(key);
+    if (!pending || this.inFlight.has(key)) return;
+    const reachedApi = !!reading && reading.inputTokens + reading.cacheReadTokens + reading.cacheCreationTokens > 0;
+    // A turn with no tokens in never reached the API: the CLI refused it locally.
+    if (reason === "threshold" && reading === null) return;
+    this.pendingVerify.delete(key);
+    const recovered = reason === "threshold" && reachedApi;
+    const t = ownerT("notices");
+    log[recovered ? "info" : "error"]({ key, result: recovered ? "recovered" : "still-over", before: pending.before, after: pending.after }, "Forced compaction result");
+    const text = recovered ? pending.notice : t("forceCompact.stillOver", { session: pending.session, before: pending.before, after: pending.after });
+    void this.deps.notifyOwner(text).catch((err) => log.warn({ err, key }, "Could not tell the owner about a forced compaction"));
   }
 
   private giveUp(key: string, count: number, now: number): void {

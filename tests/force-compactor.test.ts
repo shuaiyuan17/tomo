@@ -109,8 +109,7 @@ describe("ForceCompactor triggers", () => {
     deps.notifyOwner.mockClear();
     expect(fc.maybeStart("dm:owner", reading(990), "threshold")).toBe(false);
     expect(fc.maybeStart("dm:owner", reading(990), "threshold")).toBe(false);
-    expect(deps.notifyOwner).toHaveBeenCalledTimes(1);
-    expect(String(deps.notifyOwner.mock.calls[0][0])).toMatch(/3 times/);
+    expect(deps.notifyOwner.mock.calls.filter((c) => /3 times/.test(String(c[0])))).toHaveLength(1);
     now += 61 * 60_000;
     expect(fc.maybeStart("dm:owner", reading(990), "threshold")).toBe(true);
   });
@@ -122,7 +121,10 @@ describe("ForceCompactor run", () => {
     const fc = new ForceCompactor(deps);
     fc.maybeStart("telegram:-100", reading(970), "threshold");
     await fc.running("telegram:-100");
-    expect(events).toEqual(["hold", "quiesce", "mark", "compact", "note", "interrupted-note", "release", "owner"]);
+    expect(events).toEqual(["hold", "quiesce", "mark", "compact", "note", "interrupted-note", "release"]);
+    // The result is told only once the next turn shows it reached the API.
+    fc.maybeStart("telegram:-100", reading(300), "threshold");
+    expect(events.at(-1)).toBe("owner");
     expect(deps.reportInterrupted).toHaveBeenCalledWith("telegram:-100", [agent]);
     const note = deps.queueNote.mock.calls[0][1];
     expect(note).toContain('<tomo-event type="force-compacted"');
@@ -164,7 +166,7 @@ describe("ForceCompactor run", () => {
     fc.maybeStart("dm:owner", reading(990), "threshold");
     await fc.running("dm:owner");
     expect(none.deps.queueNote).not.toHaveBeenCalled();
-    expect(String(none.deps.notifyOwner.mock.calls[0][0])).toMatch(/could not compact it itself. Nothing was changed/);
+    expect(String(none.deps.notifyOwner.mock.calls[0][0])).toMatch(/could not compact it itself.*Nothing was changed/);
 
     const part = makeDeps({ compact: vi.fn(async () => okReport({ ok: false, usageCapped: 0, errors: ["archive rewrite: refused"] })) });
     const fc2 = new ForceCompactor(part.deps);
@@ -196,6 +198,30 @@ describe("ForceCompactor run", () => {
     expect(seen?.aborted).toBe(true);
     expect(fc.running("dm:owner")).toBeUndefined();
     expect(fc.maybeStart("telegram:-1", reading(990), "threshold")).toBe(false);
+  });
+
+  it("judges the result by the next turn: recovered when it reached the API, still-over when refused again", async () => {
+    const { log } = await import("../src/logger.js");
+    const a = makeDeps();
+    const fc = new ForceCompactor(a.deps);
+    fc.maybeStart("dm:owner", reading(990), "threshold");
+    await fc.running("dm:owner");
+    expect(a.deps.notifyOwner).not.toHaveBeenCalled();
+    // A locally refused turn: no tokens, then the prompt-too-long call.
+    fc.maybeStart("dm:owner", reading(990, 1000, false, 0), "threshold");
+    await vi.waitFor(() => expect(a.deps.notifyOwner).toHaveBeenCalledTimes(1));
+    expect(String(a.deps.notifyOwner.mock.calls[0][0])).toMatch(/still refused/);
+    expect(log.error).toHaveBeenCalledWith(expect.objectContaining({ result: "still-over" }), "Forced compaction result");
+
+    const b = makeDeps();
+    const fc2 = new ForceCompactor(b.deps);
+    fc2.maybeStart("dm:owner", reading(990), "threshold");
+    await fc2.running("dm:owner");
+    fc2.maybeStart("dm:owner", reading(300), "threshold");
+    expect(String(b.deps.notifyOwner.mock.calls[0][0])).toMatch(/now about 40%/);
+    expect(log.info).toHaveBeenCalledWith(expect.objectContaining({ result: "recovered" }), "Forced compaction result");
+    fc2.maybeStart("dm:owner", reading(300), "threshold");
+    expect(b.deps.notifyOwner).toHaveBeenCalledTimes(1);
   });
 
   it("tells the session about an archive fallback and a still-high result", () => {

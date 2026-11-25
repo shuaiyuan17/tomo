@@ -131,8 +131,13 @@ export function readUpload(dir: string, uploadId: string, now = Date.now()): { b
  */
 export function peekUpload(dir: string, uploadId: string, now = Date.now()): { kind: "image"; bytes: Buffer; type: string } | { kind: "file"; size: number } | { kind: "claimed" } | undefined {
   if (!UPLOAD_ID.test(uploadId)) return undefined;
-  // Claimed by a message being filed right now: not gone yet — it comes back if that send fails.
-  try { if (readdirSync(dir).some((name) => name.startsWith(`${uploadId}.`) && name.includes(".claim-"))) return { kind: "claimed" }; } catch { return undefined; }
+  // A claim is a rename (staged ⇄ claimed), done by the daemon at any moment:
+  // staged, else claimed, else staged once more (a claim released meanwhile).
+  // Only when it is neither, twice, is it gone.
+  const claimed = () => { try { return readdirSync(dir).some((name) => name.startsWith(`${uploadId}.`) && name.includes(".claim-")); } catch { return false; } };
+  return stagedUpload(dir, uploadId, now) ?? (claimed() ? { kind: "claimed" } : stagedUpload(dir, uploadId, now));
+}
+function stagedUpload(dir: string, uploadId: string, now: number): { kind: "image"; bytes: Buffer; type: string } | { kind: "file"; size: number } | undefined {
   const image = readUpload(dir, uploadId, now);
   if (image) return { kind: "image", ...image };
   let fd: number;

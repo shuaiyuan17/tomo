@@ -137,7 +137,8 @@ export interface WebSubsessionDoneStep { at: number; text: string; result?: stri
 export type WebSubsessionMilestone = "started" | "waitingOwner" | "finished" | "reopened" | "cancelled" | "failed";
 /** One entry of "Decisions and updates": a line the task recorded (task_update), or a milestone of its lifecycle. */
 export type WebSubsessionUpdate =
-  | { at: number; kind: "update"; text: string }
+  /** `plan`: the reason the task gave for changing its plan. */
+  | { at: number; kind: "update"; text: string; plan?: true }
   | { at: number; kind: "milestone"; milestone: WebSubsessionMilestone };
 export interface WebSubsessionDetail extends WebSubsession {
   brief: string;

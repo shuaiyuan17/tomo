@@ -33,7 +33,7 @@ export const tasks = {
     you: "You", tag: { ask: "Question", notify: "Update" }, report: "Report",
     doing: { heading: "What it's doing", inProgress: "In progress", pending: "Not started", done: "Done", earlier: "Show {{count}} earlier", fewer: "Show fewer" },
     updates: {
-      heading: "Decisions and updates", more: "Show all ({{count}})", fewer: "Show fewer",
+      planChanged: "Plan changed: {{reason}}", heading: "Decisions and updates", more: "Show all ({{count}})", fewer: "Show fewer",
       milestone: { started: "Started", waitingOwner: "Waiting for you", finished: "Finished", reopened: "Reopened", cancelled: "Cancelled", failed: "Failed" },
     },
     files_one: "{{count}} file", files_other: "{{count}} files",

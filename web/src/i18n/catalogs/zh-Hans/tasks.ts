@@ -35,7 +35,7 @@ export const tasks = {
     you: "你", tag: { ask: "提问", notify: "通知" }, report: "报告",
     doing: { heading: "正在做", inProgress: "进行中", pending: "未开始", done: "已完成", earlier: "显示更早的 {{count}} 项", fewer: "收起" },
     updates: {
-      heading: "决定与进展", more: "全部显示（{{count}}）", fewer: "收起",
+      planChanged: "计划调整：{{reason}}", heading: "决定与进展", more: "全部显示（{{count}}）", fewer: "收起",
       milestone: { started: "开始", waitingOwner: "等你回复", finished: "完成", reopened: "重新打开", cancelled: "已取消", failed: "失败" },
     },
     files_other: "{{count}} 个文件",

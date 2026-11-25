@@ -1997,12 +1997,35 @@ describe("progress, plan and updates", () => {
     const plan = h.store.get(t.id)!.plan!;
     expect(plan).toHaveLength(PLAN_MAX_STEPS);
     expect(Array.from(plan[0].text)).toHaveLength(PLAN_STEP_MAX);
-    h.service.setPlan(t.sessionKey, [], [{ step: "a", result: "ok" }]);
+    expect(h.service.setPlan(t.sessionKey, [], [{ step: "a", result: "ok" }], "replanned").ok).toBe(true);
     h.service.setPlan(t.sessionKey, [], [{ step: "a", result: "ok" }]);
     expect(h.store.get(t.id)!.doneSteps).toEqual([{ at: expect.any(Number), text: "a", result: "ok" }]);
     expect(h.store.get(t.id)!.plan).toBeUndefined();
     for (let i = 0; i < DONE_STEPS_KEEP + 2; i++) h.service.setPlan(t.sessionKey, [], [{ step: `d${i}` }]);
     expect(h.store.get(t.id)!.doneSteps).toHaveLength(DONE_STEPS_KEEP);
+  });
+
+  it("asks for a reason to drop, reword or reorder a step still ahead, and files it as an update", () => {
+    const h = idle();
+    const t = spawn(h);
+    expect(h.service.setPlan(t.sessionKey, [{ step: "A", status: "in_progress" }, { step: "B" }, { step: "C" }]).ok).toBe(true);
+    // Free: a status move, a step done, steps added at the end.
+    expect(h.service.setPlan(t.sessionKey, [{ step: "B", status: "in_progress" }, { step: "C" }, { step: "D" }], [{ step: "A" }]).ok).toBe(true);
+    // Dropping C, rewording C, reordering: refused without a reason, nothing written.
+    for (const steps of [[{ step: "B" }, { step: "D" }], [{ step: "B" }, { step: "C, faster" }, { step: "D" }], [{ step: "C" }, { step: "B" }, { step: "D" }]]) {
+      expect(h.service.setPlan(t.sessionKey, steps)).toEqual({ ok: false, error: "reason_required" });
+    }
+    // Inserting before a kept step is a reorder too; done in the same call never needs one.
+    expect(h.service.setPlan(t.sessionKey, [{ step: "X" }, { step: "B" }, { step: "C" }, { step: "D" }]).ok).toBe(false);
+    expect(h.store.get(t.id)!.plan?.map((s) => s.text)).toEqual(["B", "C", "D"]);
+    expect(h.store.get(t.id)!.updates).toBeUndefined();
+    expect(h.service.setPlan(t.sessionKey, [{ step: "D", status: "in_progress" }], [{ step: "B" }], "C turned out to be unnecessary").ok).toBe(true);
+    expect(h.store.get(t.id)!.updates).toEqual([{ at: expect.any(Number), kind: "plan", text: "C turned out to be unnecessary" }]);
+    // A reason with no change to the plan files nothing.
+    h.service.setPlan(t.sessionKey, [{ step: "D", status: "in_progress" }], [], "again");
+    expect(h.store.get(t.id)!.updates).toHaveLength(1);
+    // Clearing the plan at the end, with every step done, needs none.
+    expect(h.service.setPlan(t.sessionKey, [], [{ step: "D" }]).ok).toBe(true);
   });
 
   it("a changed plan or an update counts as progress; the same plan again does not", async () => {
@@ -2040,12 +2063,12 @@ describe("progress, plan and updates", () => {
     expect(old.plan).toBeUndefined();
     expect(old.doneSteps).toBeUndefined();
     expect(old.updates).toBeUndefined();
-    table.tasks[0].updates = [{ at: 1, text: "ok" }, { at: "1", text: "bad time" }, { at: 2 }, null, { at: 3, text: "line\nmore" }, { at: 5, text: " " }];
+    table.tasks[0].updates = [{ at: 0.5, text: "why", kind: "plan" }, { at: 0.7, text: "odd kind", kind: "nope" }, { at: 1, text: "ok" }, { at: "1", text: "bad time" }, { at: 2 }, null, { at: 3, text: "line\nmore" }, { at: 5, text: " " }];
     table.tasks[0].doneSteps = [{ at: 4, text: "done", result: 7 }, { at: 6, text: "also", result: "fine" }, "nope"];
     table.tasks[0].plan = [{ text: "a", status: "in_progress" }, { text: "b", status: "weird" }, { text: 3 }, "c"];
     writeFileSync(path, JSON.stringify(table));
     const loaded = new SubsessionStore(path).get(t.id)!;
-    expect(loaded.updates).toEqual([{ at: 1, text: "ok" }, { at: 3, text: "line" }]);
+    expect(loaded.updates).toEqual([{ at: 0.5, text: "why", kind: "plan" }, { at: 0.7, text: "odd kind" }, { at: 1, text: "ok" }, { at: 3, text: "line" }]);
     expect(loaded.doneSteps).toEqual([{ at: 4, text: "done" }, { at: 6, text: "also", result: "fine" }]);
     expect(loaded.plan).toEqual([{ text: "a", status: "in_progress" }, { text: "b", status: "pending" }]);
   });

@@ -55,7 +55,7 @@ export function formatTaskDetail(r: SubsessionRecord, now = Date.now(), backgrou
   const updates = (r.updates ?? []).slice(-5);
   if (updates.length > 0) {
     lines.push("Decisions and updates (newest last):");
-    for (const e of updates) lines.push(`- ${new Date(e.at).toISOString()}: ${e.text}`);
+    for (const e of updates) lines.push(`- ${new Date(e.at).toISOString()}: ${e.kind === "plan" ? `Plan changed: ${e.text}` : e.text}`);
   }
   if (r.checkpoint) lines.push("Checkpoint:", r.checkpoint);
   for (const e of r.earlierReports ?? []) lines.push(`Earlier report #${e.seq} (replaced by a later one before it was read):`, e.text);
@@ -132,7 +132,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_plan",
-      "Set the steps still ahead, in order, replacing the plan before (an empty list clears it). Mark the one you are on in_progress (at most one). Move each step you just finished into `done`, with a one-line result. Silent: the owner sees the plan and the finished steps when they look. Set it when you start, and keep it current.",
+      "Set the steps still ahead, in order, replacing the plan before (an empty list clears it). Mark the one you are on in_progress (at most one). Move each step you just finished into `done`, with a one-line result. Silent: the owner sees the plan and the finished steps when they look. Set it when you start, and keep it current. Keep each step's words the same from call to call and add new steps at the end; to drop, reword or reorder a step still ahead, give `reason` (one line), which the owner sees under Decisions and updates.",
       {
         steps: z.array(z.object({
           step: z.string().min(1).max(PLAN_STEP_MAX).describe("One short line: what this step gets done."),
@@ -142,12 +142,17 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
           step: z.string().min(1).max(PLAN_STEP_MAX).describe("The step, as it stood in the plan."),
           result: z.string().max(STEP_RESULT_MAX).optional().describe("One line: what came of it."),
         })).max(PLAN_MAX_STEPS).optional().describe("Steps finished since the last task_plan call."),
+        reason: z.string().max(300).optional().describe("Required when this drops, rewords or reorders a step still ahead: one line on why the plan changed."),
       },
-      async ({ steps, done }) => {
+      async ({ steps, done, reason }) => {
         const r = service("task_plan");
         if (!r.ok) return r.error;
         if (steps.filter((s) => s.status === "in_progress").length > 1) return fail("task_plan", "at most one step can be in_progress.");
-        return r.s.setPlan(deps.key, steps, done ?? []) ? ok("Plan saved.") : fail("task_plan", "no task record for this session.");
+        const outcome = r.s.setPlan(deps.key, steps, done ?? [], reason);
+        if (outcome.ok) return ok("Plan saved.");
+        return fail("task_plan", outcome.error === "reason_required"
+          ? "this drops, rewords or reorders a step still ahead. Give `reason` (one line on why the plan changed), or keep those steps as they were and add new ones at the end. Nothing was saved."
+          : "no task record for this session.");
       },
       { alwaysLoad: true, searchHint: "task plan steps checklist todo" },
     ),

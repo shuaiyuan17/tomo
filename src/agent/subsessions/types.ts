@@ -104,10 +104,15 @@ export interface SubsessionDoneStep {
   result?: string;
 }
 
-/** A decision or a change the owner should know about (task_update): scope, approach, blocked or unblocked. */
+/**
+ * A decision or a change the owner should know about (task_update): scope,
+ * approach, blocked or unblocked. `kind: "plan"`: the reason task_plan gave
+ * for dropping, rewording or reordering steps.
+ */
 export interface SubsessionUpdate {
   at: number;
   text: string;
+  kind?: "plan";
 }
 
 /** A step still ahead in a task's plan (task_plan). Done steps leave the plan for the history. */

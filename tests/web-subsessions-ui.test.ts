@@ -48,6 +48,7 @@ describe("sub-sessions in the Tasks rail", () => {
 
   it("words an update: the task's own line, or the milestone's name", () => {
     expect(updateText({ at: 1, kind: "update", text: "Chose B" })).toBe("Chose B");
+    expect(updateText({ at: 1, kind: "update", text: "C was not needed", plan: true })).toBe("Plan changed: C was not needed");
     expect(updateText({ at: 1, kind: "milestone", milestone: "waitingOwner" })).toBe("Waiting for you");
     expect(updateText({ at: 1, kind: "milestone", milestone: "started" })).toBe("Started");
     // A milestone this page does not know (a newer daemon) shows nothing rather than a raw key.

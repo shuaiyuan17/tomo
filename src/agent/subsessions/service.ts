@@ -693,7 +693,8 @@ export class SubsessionService {
     let changed = false;
     const at = this.now();
     const updated = this.store.update(record.id, (r) => {
-      if (r.updates?.at(-1)?.text === value) return;
+      const last = r.updates?.at(-1);
+      if (last && !last.kind && last.text === value) return;
       (r.updates ??= []).push({ at, text: value });
       changed = true;
     });
@@ -705,10 +706,17 @@ export class SubsessionService {
    * task_plan: replace the steps still ahead (empty clears the plan) and file
    * the ones just done, each with its one-line result. A change to either
    * counts as progress for the no-progress pause.
+   *
+   * Marking steps done, moving the status and adding steps at the end are
+   * free. Dropping, rewording or reordering a step still ahead needs a
+   * `reason`, filed as a plan-change update, so the owner sees why the
+   * checklist moved (refused with `reason_required` without one, and nothing
+   * is written). A reason given with any other change to the plan is filed
+   * the same way.
    */
-  setPlan(key: string, steps: ReadonlyArray<{ step: string; status?: "pending" | "in_progress" }>, done: ReadonlyArray<{ step: string; result?: string }> = []): SubsessionRecord | undefined {
+  setPlan(key: string, steps: ReadonlyArray<{ step: string; status?: "pending" | "in_progress" }>, done: ReadonlyArray<{ step: string; result?: string }> = [], reason?: string): PlanOutcome {
     const record = this.store.byKey(key);
-    if (!record) return undefined;
+    if (!record) return { ok: false, error: "no_record" };
     const next: SubsessionPlanStep[] = steps.flatMap((s): SubsessionPlanStep[] => {
       const text = oneLine(s.step, PLAN_STEP_MAX);
       return text ? [{ text, status: s.status === "in_progress" ? "in_progress" : "pending" }] : [];
@@ -718,10 +726,15 @@ export class SubsessionService {
       const result = d.result ? oneLine(d.result, STEP_RESULT_MAX) : "";
       return text ? [{ text, ...(result ? { result } : {}) }] : [];
     });
+    const why = reason ? oneLine(reason, PROGRESS_TEXT_MAX) : "";
     let changed = false;
+    let refused = false;
     const at = this.now();
+    // Checked inside the lock, against the plan on disk.
     const updated = this.store.update(record.id, (r) => {
-      if (JSON.stringify(r.plan ?? []) !== JSON.stringify(next)) {
+      const planChanged = JSON.stringify(r.plan ?? []) !== JSON.stringify(next);
+      if (planChanged && !why && planNeedsReason(r.plan ?? [], next, finished.map((f) => f.text))) { refused = true; return; }
+      if (planChanged) {
         changed = true;
         if (next.length > 0) r.plan = next;
         else delete r.plan;
@@ -733,9 +746,12 @@ export class SubsessionService {
         (r.doneSteps ??= []).push({ at, ...step });
         changed = true;
       }
+      if (planChanged && why) (r.updates ??= []).push({ at, kind: "plan", text: why });
     });
-    if (updated && changed) this.progressChanged.add(record.id);
-    return updated;
+    if (!updated) return { ok: false, error: "no_record" };
+    if (refused) return { ok: false, error: "reason_required" };
+    if (changed) this.progressChanged.add(record.id);
+    return { ok: true, record: updated };
   }
 
   checkpoint(key: string, summary: string): SubsessionRecord | undefined {
@@ -2240,4 +2256,21 @@ export function taskPrefix(record: Pick<SubsessionRecord, "id" | "title">): stri
 
 function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+/** What task_plan did: saved, or refused because the change needs a reason (or the task has no record). */
+export type PlanOutcome = { ok: true; record: SubsessionRecord } | { ok: false; error: "no_record" | "reason_required" };
+
+/**
+ * Whether replacing `before` with `after` drops, rewords or reorders a step
+ * still ahead. A step leaving the plan as one of `done` is not dropped, a
+ * status change is not a rewording, and new steps are free only after every
+ * step that stayed.
+ */
+export function planNeedsReason(before: readonly SubsessionPlanStep[], after: readonly SubsessionPlanStep[], done: readonly string[]): boolean {
+  const finished = new Set(done);
+  const kept = before.map((s) => s.text).filter((text) => !finished.has(text));
+  // The steps that stayed must open the new plan, in their order; anything after them is an addition.
+  if (after.length < kept.length) return true;
+  return kept.some((text, i) => after[i].text !== text);
 }

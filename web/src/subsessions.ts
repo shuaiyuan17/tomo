@@ -23,7 +23,7 @@ const MILESTONE_LABELS = {
 
 /** An update's words: the line the task recorded, or the milestone's name (an unknown one shows nothing). */
 export function updateText(entry: WebSubsessionUpdate): string {
-  if (entry.kind !== "milestone") return entry.text;
+  if (entry.kind !== "milestone") return entry.plan ? i18n.t("tasks:subsession.updates.planChanged", { reason: entry.text }) : entry.text;
   // A daemon newer than this page may send a milestone it does not know.
   return Object.hasOwn(MILESTONE_LABELS, entry.milestone) ? i18n.t(MILESTONE_LABELS[entry.milestone]) : "";
 }

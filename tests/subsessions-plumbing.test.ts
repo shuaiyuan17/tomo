@@ -225,8 +225,14 @@ describe("sub-session tools", () => {
     const detail = (await call(self as never, "task_status", {})).content[0].text;
     expect(detail).toContain("[in progress] Write tests");
     expect(detail).toContain("Read the code — found it");
+    // Dropping a step still ahead without a reason is refused, with a way out.
+    const dropped = await call(self as never, "task_plan", { steps: [] });
+    expect(dropped.isError).toBe(true);
+    expect(dropped.content[0].text).toMatch(/reason/);
+    expect((await call(self as never, "task_plan", { steps: [{ step: "Write docs" }], reason: "Tests already exist" })).isError).toBeUndefined();
+    expect((await call(self as never, "task_status", {})).content[0].text).toContain("Plan changed: Tests already exist");
     // An empty list clears the plan.
-    await call(self as never, "task_plan", { steps: [], done: [{ step: "Write tests" }] });
+    await call(self as never, "task_plan", { steps: [], done: [{ step: "Write docs" }] });
     expect(svc.get("s1")?.plan).toBeUndefined();
     expect(svc.get("s1")?.doneSteps).toHaveLength(2);
   });

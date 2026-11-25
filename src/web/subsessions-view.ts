@@ -89,7 +89,7 @@ const MILESTONES: Partial<Record<SubsessionEvent, WebSubsessionMilestone>> = {
  * start counts only while the log still has the spawn before it.
  */
 export function subsessionUpdates(record: SubsessionRecord): WebSubsessionUpdate[] {
-  const out: WebSubsessionUpdate[] = (record.updates ?? []).map((u) => ({ at: u.at, kind: "update" as const, text: clip(u.text, PROGRESS_LIMIT).text }));
+  const out: WebSubsessionUpdate[] = (record.updates ?? []).map((u) => ({ at: u.at, kind: "update" as const, text: clip(u.text, PROGRESS_LIMIT).text, ...(u.kind === "plan" ? { plan: true as const } : {}) }));
   record.transitions.forEach((t, i) => {
     const event = t.event as SubsessionEvent;
     const milestone = event === "start" ? (i > 0 && record.transitions[i - 1].from === null ? "started" : undefined)

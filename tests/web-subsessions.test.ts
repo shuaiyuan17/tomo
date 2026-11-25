@@ -101,12 +101,13 @@ describe("a sub-session's plan, done steps and updates", () => {
   ];
 
   it("lists the task's updates and its milestones, newest first, without the queued/active churn", () => {
-    const r = record("s1", { transitions, updates: [{ at: NOW - 35, text: "Chose approach B" }, { at: NOW, text: "Shipped" }] });
+    const r = record("s1", { transitions, updates: [{ at: NOW - 35, text: "Chose approach B" }, { at: NOW - 15, kind: "plan", text: "Dropped step C" }, { at: NOW, text: "Shipped" }] });
     expect(subsessionUpdates(r)).toEqual([
       // At the same instant the milestone reads as the later of the two.
       { at: NOW, kind: "milestone", milestone: "finished" },
       { at: NOW, kind: "update", text: "Shipped" },
       { at: NOW - 10, kind: "milestone", milestone: "waitingOwner" },
+      { at: NOW - 15, kind: "update", text: "Dropped step C", plan: true },
       { at: NOW - 35, kind: "update", text: "Chose approach B" },
       { at: NOW - 40, kind: "milestone", milestone: "started" },
     ]);

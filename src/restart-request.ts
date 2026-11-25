@@ -405,9 +405,14 @@ export function consumeRestartRequestFromToolResult(
   // A marker that surfaces this late is not an acknowledgement of anything the
   // owner is still waiting on — drop the request rather than restart on it.
   if (isExpired(request, now)) {
-    // Gone before we could drop it: claimed elsewhere, which is the news.
-    if (removeFile(path)) onDiscard?.({ path, reason: "expired", request });
-    else onDiscard?.({ path, reason: "missing", requestId: id });
+    try {
+      unlinkSync(path);
+      onDiscard?.({ path, reason: "expired", request });
+    } catch (err) {
+      // Gone before we could drop it: claimed elsewhere, which is the news.
+      // Any other failure leaves the file for the startup sweep, as before.
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") onDiscard?.({ path, reason: "missing", requestId: id });
+    }
     return null;
   }
   try {

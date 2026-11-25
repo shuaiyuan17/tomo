@@ -405,7 +405,11 @@ describe("sub-sessions through the Agent", () => {
       leaveInInbox({ ...makeMsg({ id: "r6", chatId: "12345", senderId: "12345", text: "blue", replyToId: "provider-12" }), taskSendsInFlight: ["s1"] }, "dm:alex");
       const agent = await staleBoot();
       expect(transcript("dm:alex")).toContain(INBOX_STALE_NOT_PROCESSED);
-      expect(peekPendingNotes(agent, "dm:alex").some((n) => n.includes("/s s1 <message>"))).toBe(true);
+      const warning = peekPendingNotes(agent, "dm:alex").find((n) => n.includes("/s s1 <message>"));
+      // Quotes the reply itself (no "next message" follows a stale one), and is pinned.
+      expect(warning).toContain("blue");
+      expect(warning).toContain('type="inbox"');
+      expect(warning).not.toContain("next message");
       expect(pendingInbox()).toEqual([]);
       await agent.stop();
     });

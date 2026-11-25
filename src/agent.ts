@@ -137,6 +137,9 @@ const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
  */
 const TASK_SEND_SETTLE_MS = 30_000;
 
+/** How much of a stale unmatched reply its warning note quotes. */
+const STALE_REPLY_EXCERPT = 2000;
+
 export class Agent {
   private channels: Channel[] = [];
   /** Null unless `credentialBroker.enabled`. Read by the internal MCP server. */
@@ -1251,7 +1254,7 @@ export class Agent {
    * sending (their send settled with no id we could record, or never
    * settled): the owner's session is told the owner may be answering one.
    */
-  private warnUnmatchedReply(scope: string, ref: string, taskIds: string[]): boolean {
+  private warnUnmatchedReply(scope: string, ref: string, taskIds: string[], stale?: string): boolean {
     if (!this.subsessions || taskIds.length === 0) return true;
     // Named by id alone when the task table cannot be read (or the task is gone).
     const names = taskIds.map((id) => {
@@ -1261,6 +1264,15 @@ export class Agent {
     }).join(", ");
     const resend = taskIds.map((id) => `/s ${id} <message>`).join(" or ");
     log.warn({ ref, tasks: taskIds }, "Owner reply matched no task while a task send was in flight; it stays with the owner's session");
+    if (stale !== undefined) {
+      // Too old to replay: no "next message" follows, so the note quotes the
+      // reply, and is pinned (an inbox note): the record closes once it is
+      // written, and the cap must not drop the only word of it.
+      const quoted = stale.length > STALE_REPLY_EXCERPT ? `${stale.slice(0, STALE_REPLY_EXCERPT)}…` : stale;
+      return this.queuePendingNote(scope, markOwnerAudience(formatTomoEvent("inbox",
+        `Before Tomo restarted the owner replied to a message Tomo could not match, and it was too old to answer after the restart. Sub-session ${names} was sending a message to the owner at the time, so the owner may have been answering it; the task never got it. Tell the owner, and ask them to send it again as ${resend} if it was meant for the task. Their reply:\n\n${quoted}`,
+        { name: "stale-unmatched-reply" })));
+    }
     return this.queuePendingNote(scope, markOwnerAudience(formatTomoEvent("subsession-activity",
       `The owner's next message replies to a message Tomo could not match. Sub-session ${names} was sending a message to the owner at the time, so the owner may be answering it. If so, tell them it reached you instead, and ask them to send it again as ${resend}: only then does it reach the task as their own words.`)));
   }
@@ -3581,7 +3593,7 @@ export class Agent {
         const ref = message.replyToId ?? message.reactedToId;
         const scope = this.router.ownerSessionKey();
         if (!owner && scope && key === scope && ref && message.taskSendsInFlight?.length
-          && !this.warnUnmatchedReply(scope, ref, message.taskSendsInFlight)) {
+          && !this.warnUnmatchedReply(scope, ref, message.taskSendsInFlight, message.text)) {
           log.error({ inboxId: rec.id }, "Could not persist the note for a stale unmatched reply; the inbox record is kept for the next start");
           continue;
         }

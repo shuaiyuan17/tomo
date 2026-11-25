@@ -397,6 +397,35 @@ describe("PendingNotesQueue while the stored notes cannot be read", () => {
     queue.queueNote("k", "plain");
     expect(store.texts("k")).toEqual(["plain", "plain"]);
   });
+
+  it("a note queued again under an id a turn already carried to its end is not delivered twice", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", "report", "r1");
+    queue.settle("k", queue.drain("k"));
+    expect(store.texts("k")).toEqual([]);
+    // A retry of the same note (its first write was reported failed, say).
+    expect(queue.queueNote("k", "report", "r1")).toBe(true);
+    expect(queue.peekNotes("k")).toEqual([]);
+    expect(store.texts("k")).toEqual([]);
+    // Another session's note under the same id is its own.
+    queue.queueNote("other", "report", "r1");
+    expect(store.texts("other")).toEqual(["report"]);
+  });
+
+  it("persistLoaded writes every loaded session again, queued and in flight (a fresh file after one was moved aside)", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("a", "queued", "q1");
+    queue.queueNote("b", "carried", "c1");
+    const prefix = queue.drain("b");
+    store.rows.clear(); // the file was moved aside: the fresh one is empty
+    queue.persistLoaded();
+    expect(store.texts("a")).toEqual(["queued"]);
+    expect(store.texts("b")).toEqual([`${INTERRUPTED_NOTE_MARKER}\ncarried`]);
+    queue.settle("b", prefix);
+    expect(store.texts("b")).toEqual([]);
+  });
 });
 
 describe("PendingNotesQueue holdOwnerAudience", () => {

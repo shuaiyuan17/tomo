@@ -8,6 +8,9 @@ export interface DurablePendingNotesStore {
   setPendingNotes(key: string, notes: PendingNote[]): void;
 }
 
+/** What `queueNote` gives a note queued without an id. */
+const RANDOM_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 /** Cap on queued pending notes per session. */
 const MAX_PENDING_NOTES = 15;
 const MAX_PENDING_ERROR_NOTES = 3;
@@ -109,6 +112,10 @@ export class PendingNotesQueue {
    *  be read nor moved aside, see SessionStore.loadPendingNotes): held in
    *  memory only, never written, until a read succeeds (see `retryLoad`). */
   private unloaded = new Set<string>();
+  /** Ids of notes a turn carried to its end this process, other than random
+   *  ones: a retry under the same stable id is that same note, already
+   *  delivered (see `queueNote`). */
+  private settledIds = new Map<string, Set<string>>();
 
   constructor(private store: DurablePendingNotesStore) {}
 
@@ -194,6 +201,8 @@ export class PendingNotesQueue {
    * one, every call is a new note, even with the same text.
    */
   queueNote(sessionKey: string, note: string, id?: string): boolean {
+    // Delivered already: a turn carried it to its end. Nothing to write.
+    if (id !== undefined && this.settledIds.get(sessionKey)?.has(id)) return true;
     const arr = this.queued(sessionKey);
     const known = id !== undefined
       && (arr.some((n) => n.id === id) || (this.inflight.get(sessionKey) ?? []).some((b) => b.notes.some((n) => n.id === id)));
@@ -268,7 +277,27 @@ export class PendingNotesQueue {
     // copy of one of its notes (same id) is recognised as delivered.
     this.retryLoad(sessionKey);
     const batch = this.takeInFlight(sessionKey, prefix);
-    if (batch && batch.notes.length > 0) this.persist(sessionKey);
+    if (!batch || batch.notes.length === 0) return;
+    const stable = batch.notes.filter((n) => !RANDOM_ID.test(n.id));
+    if (stable.length > 0) {
+      const ids = this.settledIds.get(sessionKey) ?? new Set<string>();
+      for (const n of stable) ids.add(n.id);
+      this.settledIds.set(sessionKey, ids);
+    }
+    this.persist(sessionKey);
+  }
+
+  /**
+   * Write every session loaded this process again: after the file was moved
+   * aside (see SessionStore.loadPendingNotes), the fresh one holds only what
+   * has been written since, and these sessions' notes, queued and in flight,
+   * would otherwise be in memory only until each one happens to be written.
+   */
+  persistLoaded(): void {
+    for (const key of this.notes.keys()) {
+      if (this.unloaded.has(key)) continue;
+      this.persist(key);
+    }
   }
 
   /**

@@ -862,6 +862,40 @@ describe("SubsessionService start: restart recovery and reconcile", () => {
     expect(h.notes.get("dm:owner")).toHaveLength(1);
   });
 
+  it("writes a finished task's report note again from the record after the notes file was lost, and wakes once", async () => {
+    const h = harness();
+    const a = seed(h, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
+    const b = seed(h, "finished", (s, i) => s.update(i, (r) => {
+      r.reportDelivered = true;
+      r.earlierReports = [{ seq: 1, text: "EARLIER", noted: true }];
+      r.reportSeq = 2;
+    }));
+    h.service.start();
+    expect(h.wakes).toEqual([]);
+    h.service.pendingNotesLost();
+    await flush();
+    const notes = h.notes.get("dm:owner") ?? [];
+    expect(notes.filter((n) => n.includes(`name="${a}#1"`))).toHaveLength(1);
+    expect(notes.filter((n) => n.includes(`name="${b}#2"`))).toHaveLength(1);
+    expect(notes.filter((n) => n.includes(`name="${b}#1"`) && n.includes("EARLIER"))).toHaveLength(1);
+    expect(notes.every((n) => n.includes("may already have been told"))).toBe(true);
+    expect(h.wakes).toEqual(["dm:owner"]);
+    expect(h.store.get(a)?.reportDelivered).toBe(true);
+    expect(h.store.get(b)?.earlierReports?.[0].noted).toBe(true);
+  });
+
+  it("archives nothing in the sweep that finds the notes file lost", () => {
+    const h = harness();
+    const id = seed(h, "finished", (s, i) => s.update(i, (r) => {
+      r.reportDelivered = true;
+      r.endedAt = Date.now() - FINISHED_KEEP_MS - 60_000;
+    }));
+    // The read in the sweep's own pending-note check finds the file unreadable.
+    h.service.pendingNotesLost();
+    h.service.start();
+    expect(h.store.get(id)?.status).toBe("finished");
+  });
+
   it("does not wake for a delivered report the owning session already read", () => {
     const h = harness();
     seed(h, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
@@ -2038,6 +2072,26 @@ describe("SubsessionService: a failed task hands back what it never answered", (
     // The owning session's note says the same.
     expect((h.notes.get("dm:owner") ?? []).at(-1)).toContain("use the staging database, not prod");
     expect(h.store.get(t.id)?.handedBack).toBe(true);
+  });
+
+  it("hands the unanswered messages back again after the notes file was lost", async () => {
+    const h = harness();
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.onTurn = () => new Promise(() => {});
+    h.sdk.delete(t.sessionKey);
+    expect(h.service.relay(t.id, "use the staging database").ok).toBe(true);
+    await flush();
+    expect(h.store.get(t.id)?.handedBack).toBe(true);
+    h.notes.clear();
+    h.wakes.length = 0;
+    h.service.pendingNotesLost();
+    await flush();
+    const notes = h.notes.get("dm:owner") ?? [];
+    expect(notes.filter((n) => n.includes("subsession-handback") && n.includes("use the staging database"))).toHaveLength(1);
+    expect(h.store.get(t.id)?.handedBack).toBe(true);
+    expect(h.wakes).toEqual(["dm:owner"]);
   });
 
   it("hands every unanswered message back in full, in a pinned note; the record is forgotten only once that note is written", async () => {

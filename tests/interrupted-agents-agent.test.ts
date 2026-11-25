@@ -165,6 +165,49 @@ describe("interrupted subagents across a restart", () => {
     await second.agent.stop();
   });
 
+  it("telling the owner the file was moved aside is tried again when it could not be sent", async () => {
+    const first = await boot();
+    await haveSession(first.channel, "710");
+    crash(first.agent);
+
+    writeFileSync(join(mockConfig.sessionsDir, "_pending_notes.json"), "{not json");
+    const ownerNotice = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValueOnce(false).mockResolvedValue(true);
+    const second = await boot();
+    await waitFor(() => expect(ownerNotice).toHaveBeenCalledTimes(1));
+    const internals = second.agent as unknown as { pendingNotesQuarantineTimer?: ReturnType<typeof setTimeout>; tellPendingNotesQuarantined(): void };
+    await waitFor(() => expect(internals.pendingNotesQuarantineTimer).toBeDefined());
+    // The retry timer fires.
+    clearTimeout(internals.pendingNotesQuarantineTimer);
+    internals.pendingNotesQuarantineTimer = undefined;
+    internals.tellPendingNotesQuarantined();
+    await waitFor(() => expect(ownerNotice).toHaveBeenCalledTimes(2));
+    const aside = readdirSync(mockConfig.sessionsDir).find((f) => f.startsWith("_pending_notes.json.corrupt-"));
+    expect(String(ownerNotice.mock.calls[1][0])).toContain(aside);
+    await second.agent.stop();
+  });
+
+  it("a note about the same subagent left by an earlier process does not stand in for this restart's", async () => {
+    const first = await boot();
+    await haveSession(first.channel, "711");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:711", tasks: [task("again711")] });
+    crash(first.agent);
+
+    // A note from the restart before, never read: same subagent, same set of ids.
+    const { createHash } = await import("node:crypto");
+    const oldId = `interrupted-agents:${createHash("sha256").update("again711").digest("hex").slice(0, 16)}`;
+    writeFileSync(join(mockConfig.sessionsDir, "_pending_notes.json"), JSON.stringify({
+      version: 2, notes: { "imessage:711": [{ id: oldId, text: '<tomo-event type="interrupted-agents">old notice about again711</tomo-event>' }] },
+    }));
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = () => new Promise(() => {}); // the check turn holds, so the notes stay queued
+    const second = await boot();
+    await waitFor(() => expect(JSON.parse(readFileSync(ledgerPath(), "utf8")).interrupted).toEqual([]));
+    const texts = (second.agent as unknown as { sessions: { getPendingNotes(k: string): { id: string; text: string }[] } }).sessions.getPendingNotes("imessage:711");
+    expect(texts.some((n) => n.text.includes("old notice"))).toBe(true);
+    expect(texts.filter((n) => n.id.startsWith("interrupted-agents:") && n.id !== oldId)).toHaveLength(1);
+    crash(second.agent);
+  });
+
   it("with the pending notes unreadable and unmovable at start, the check waits, then tells the session once they read", async () => {
     const first = await boot();
     await haveSession(first.channel, "708");

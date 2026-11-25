@@ -85,7 +85,7 @@ import { readSessionWindowPercent } from "./usage/limits-log.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, join } from "node:path";
 import { readFileSync } from "node:fs";
 import { withConfigLockSync } from "./config-file.js";
@@ -138,6 +138,12 @@ const REWIND_SHUTDOWN_TIMEOUT_MS = 3_000;
 const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
 /** How often the interrupted-subagents startup check is retried for sessions whose pending notes could not be read. */
 const INTERRUPTED_AGENTS_RETRY_MS = 60_000;
+/** How soon the owner is told again that the notes file was moved aside, when telling them failed. */
+const PENDING_NOTES_QUARANTINE_NOTICE_RETRY_MS = 60_000;
+/** This process: an interrupted-agents note is about the restart before it.
+ *  A task id can be interrupted again by a later restart (a resumed agent
+ *  keeps its id), and that is a new note, not the old one still queued. */
+const BOOT_ID = randomUUID().slice(0, 8);
 
 /**
  * How long a reply that matches no task waits for task sends still in flight
@@ -253,6 +259,7 @@ export class Agent {
   private channelsUp = false;
   /** Re-runs the interrupted-subagents startup check for sessions whose pending notes could not be read. */
   private interruptedAgentsRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  private pendingNotesQuarantineTimer: ReturnType<typeof setTimeout> | undefined;
   /** The most recent sweep — awaited (bounded) by stop() so none is abandoned mid-write. */
   private mcpSweepInFlight: Promise<void> | undefined;
 
@@ -275,7 +282,19 @@ export class Agent {
       getChannel: (name) => this.getChannel(name),
     });
     this.pendingNotesQueue = new PendingNotesQueue(this.sessions);
-    this.sessions.onPendingNotesQuarantined = (aside) => this.notePendingNotesQuarantined(aside);
+    this.sessions.onPendingNotesQuarantined = (aside) => {
+      this.notePendingNotesQuarantined(aside);
+      // Called from inside a read of the notes: the fresh file gets what is
+      // in memory, and the sub-session notes it lost, once that read is over.
+      this.subsessions?.pendingNotesLost();
+      queueMicrotask(() => {
+        try {
+          this.pendingNotesQueue.persistLoaded();
+        } catch (err) {
+          log.error({ err }, "Could not write the loaded pending notes to the fresh file");
+        }
+      });
+    };
     if (config.inbox) {
       try {
         this.inbox = new DurableInbox({ path: join(config.tomoHome, "data", "inbox.jsonl") });
@@ -3361,6 +3380,10 @@ export class Agent {
       clearInterval(this.mcpTokenRefreshTimer);
       this.mcpTokenRefreshTimer = undefined;
     }
+    if (this.pendingNotesQuarantineTimer) {
+      clearTimeout(this.pendingNotesQuarantineTimer);
+      this.pendingNotesQuarantineTimer = undefined;
+    }
     if (this.interruptedAgentsRetryTimer) {
       clearTimeout(this.interruptedAgentsRetryTimer);
       this.interruptedAgentsRetryTimer = undefined;
@@ -3651,13 +3674,25 @@ export class Agent {
   }
 
   private tellPendingNotesQuarantined(): void {
-    if (this.pendingNotesQuarantined.length === 0 || this.stopping) return;
-    const files = this.pendingNotesQuarantined.map((p) => basename(p));
+    if (this.pendingNotesQuarantined.length === 0 || this.stopping || this.pendingNotesQuarantineTimer) return;
+    const asides = this.pendingNotesQuarantined;
     this.pendingNotesQuarantined = [];
+    const files = asides.map((p) => basename(p));
     const text = ownerT("notices")("pendingNotesQuarantined", { files: files.join(", "), count: files.length });
+    // Not sent: kept (with any moved aside meanwhile) and tried again.
+    const failed = (err?: unknown): void => {
+      log.warn({ err, files }, "Could not tell the owner the pending notes file was moved aside; trying again");
+      this.pendingNotesQuarantined = [...asides, ...this.pendingNotesQuarantined];
+      if (this.stopping || this.pendingNotesQuarantineTimer) return;
+      this.pendingNotesQuarantineTimer = setTimeout(() => {
+        this.pendingNotesQuarantineTimer = undefined;
+        this.tellPendingNotesQuarantined();
+      }, PENDING_NOTES_QUARANTINE_NOTICE_RETRY_MS);
+      this.pendingNotesQuarantineTimer.unref();
+    };
     void this.notifyOwner(text)
-      .then((sent) => { if (!sent) log.warn({ files }, "Could not tell the owner the pending notes file was moved aside"); })
-      .catch((err) => log.warn({ err, files }, "Could not tell the owner the pending notes file was moved aside"));
+      .then((sent) => { if (!sent) failed(); })
+      .catch((err) => failed(err));
   }
 
   private hasInterruptedAgentsNote(key: string): boolean {
@@ -3669,9 +3704,9 @@ export class Agent {
     const autoResume = config.interruptedAgentsAutoResume
       ? { failed: new Set(records.filter((r) => isResumable(r) && ledger.resumeCount(key, r.taskId) >= MAX_AUTO_RESUMES).map((r) => r.taskId)) }
       : undefined;
-    // One id per set of interrupted agents: a retry after a failed write
-    // writes the note held in memory again, never a second copy of it.
-    const id = `interrupted-agents:${createHash("sha256").update(records.map((r) => r.taskId).sort().join("\n")).digest("hex").slice(0, 16)}`;
+    // One id per set of interrupted agents and process: a retry after a
+    // failed write writes the note held in memory again, never a second copy.
+    const id = `interrupted-agents:${BOOT_ID}:${createHash("sha256").update(records.map((r) => r.taskId).sort().join("\n")).digest("hex").slice(0, 16)}`;
     if (!this.queuePendingNote(key, formatTomoEvent("interrupted-agents", formatInterruptedAgentsNotice(records, undefined, autoResume)), id)) {
       log.error({ sessionKey: key }, "Could not persist the interrupted-subagents note; tried again (and kept for the next start)");
       return false;
@@ -3867,6 +3902,9 @@ export class Agent {
       // persisted leaves the record started: the next start tells the session
       // again (a repeated note, never a lost message).
       const chunks = interruptedNoteChunks(recs);
+      // Stable ids: a start after one part failed to write writes the
+      // others again, and the parts already queued are not added twice.
+      const idBase = `inbox-interrupted:${createHash("sha256").update(recs.map((r) => r.id).join("\n")).digest("hex").slice(0, 16)}`;
       let persisted = true;
       chunks.forEach((chunk, i) => {
         const part = chunks.length > 1
@@ -3877,7 +3915,7 @@ export class Agent {
           : `Tomo restarted while a turn was handling ${recs.length === 1 ? "a message" : `${recs.length} messages`} received from ${oldest}${part}. `
             + "Your reply may be missing or incomplete; check the conversation before assuming it was answered, "
             + "and answer now if it was not.\n";
-        const ok = this.queuePendingNote(key, formatTomoEvent("inbox", lead + chunk, { name: "interrupted" }));
+        const ok = this.queuePendingNote(key, formatTomoEvent("inbox", lead + chunk, { name: "interrupted" }), `${idBase}:${i}`);
         persisted &&= ok;
       });
       if (persisted) {

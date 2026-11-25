@@ -809,7 +809,18 @@ export class SessionStore {
   setPendingNotes(key: string, notes: PendingNote[]): void {
     const data = this.loadPendingNotes();
     if (notes.length > 0) {
-      data[key] = notes.map((n) => ({ id: n.id, text: n.text }));
+      // Ids are unique per list, or the next read would refuse the whole
+      // file: a repeat (a bug upstream) is written as a note of its own.
+      const seen = new Set<string>();
+      data[key] = notes.map((n) => {
+        let id = n.id;
+        if (seen.has(id) || id === "") {
+          log.warn({ key, id }, "Pending note with a repeated id; stored under a new one");
+          id = randomUUID();
+        }
+        seen.add(id);
+        return { id, text: n.text };
+      });
     } else {
       delete data[key];
     }
@@ -1683,16 +1694,20 @@ export class SessionStore {
    * inbox replay note, a task report) are the only remaining copy of what
    * they carry. So:
    *  - missing → `{}` (nothing queued);
-   *  - anything else that does not read in full (a read error, bytes that are
-   *    not UTF-8 or not JSON, the wrong shape, one bad row) → the file is
+   *  - a read error (EIO, EMFILE, EACCES, …) → `PendingNotesReadError`, and
+   *    the file is left alone: it may read fine a moment later, and a write
+   *    refuses with the same error until it does (the queue holds new notes
+   *    in memory meanwhile). The one exception is a directory at the path
+   *    (EISDIR), which never heals, and is moved aside like bad bytes;
+   *  - bytes that do not read in full (not UTF-8, not JSON, the wrong shape,
+   *    one bad row) → the file is
    *    MOVED, as it is, to `_pending_notes.json.corrupt-<ts>`: renamed, never
    *    copied, decoded or judged, so every byte is kept. Then this answers
    *    `{}` (a fresh start) and `onPendingNotesQuarantined` is told the name.
    *    Nothing of it is written back: the queue still holds in memory what it
    *    had loaded, and writes that again.
    *  - the move itself failed (or the store is read-only) →
-   *    `PendingNotesReadError`, and the file is left alone; a write refuses
-   *    with the same error until it reads or moves.
+   *    `PendingNotesReadError`, as for a read error.
    */
   private loadPendingNotes(): Record<string, PendingNote[]> {
     const path = this.pendingNotesPath;
@@ -1701,7 +1716,8 @@ export class SessionStore {
       raw = readFileSync(path);
     } catch (err) {
       if (isEnoent(err)) return {};
-      return this.quarantinePendingNotes(err);
+      if ((err as NodeJS.ErrnoException).code === "EISDIR") return this.quarantinePendingNotes(err);
+      throw new PendingNotesReadError(path, err);
     }
     try {
       return parsePendingNotesFile(raw);

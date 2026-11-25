@@ -1,5 +1,5 @@
 import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import type { SessionMessage } from "../src/sessions/types.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -243,7 +243,37 @@ describe("SessionStore", () => {
     expect(readFileSync(join(TEST_DIR, asidesIn(TEST_DIR)[0]), "utf-8")).toBe(raw);
   });
 
-  it("a read error moves the file aside as well", () => {
+  it("a read error that may pass (here ELOOP) throws and leaves the file where it is, to read once it does", () => {
+    const file = join(TEST_DIR, "_pending_notes.json");
+    const other = join(TEST_DIR, "loop-other");
+    symlinkSync(other, file);
+    symlinkSync(file, other); // a symlink loop: readFileSync fails with ELOOP
+    const store = makeSessionStore(TEST_DIR);
+    let heard = 0;
+    store.onPendingNotesQuarantined = () => { heard++; };
+
+    expect(() => store.getPendingNotes("dm:alice")).toThrow(PendingNotesReadError);
+    expect(() => store.setPendingNotes("dm:alice", notesOf("new"))).toThrow(PendingNotesReadError);
+    expect(asidesIn(TEST_DIR)).toEqual([]);
+    expect(heard).toBe(0);
+
+    // The error passes: the file reads, nothing was lost.
+    rmSync(file);
+    rmSync(other);
+    writeFileSync(file, JSON.stringify({ version: 2, notes: { "dm:alice": [{ id: "a", text: "kept" }] } }));
+    expect(textsOf(store.getPendingNotes("dm:alice"))).toEqual(["kept"]);
+  });
+
+  it("writes a repeated id as a note of its own, so the file still reads", () => {
+    const store = makeSessionStore(TEST_DIR);
+    store.setPendingNotes("dm:alice", [{ id: "same", text: "one" }, { id: "same", text: "two" }]);
+    const back = makeSessionStore(TEST_DIR).getPendingNotes("dm:alice");
+    expect(textsOf(back)).toEqual(["one", "two"]);
+    expect(new Set(back.map((n) => n.id)).size).toBe(2);
+    expect(asidesIn(TEST_DIR)).toEqual([]);
+  });
+
+  it("a directory at the path (EISDIR, which never passes) is moved aside", () => {
     const file = join(TEST_DIR, "_pending_notes.json");
     mkdirSync(file); // readFileSync fails with EISDIR, not ENOENT
     writeFileSync(join(file, "inside"), "kept");

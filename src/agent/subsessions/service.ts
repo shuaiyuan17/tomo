@@ -333,6 +333,9 @@ export class SubsessionService {
   private readonly ownerStarted = new Set<string>();
   /** Outward effects (notices, wakes) recovery produced before start(): sent once the channels are up. */
   private live = false;
+  /** The pending-notes file was moved aside and the notes it held are not
+   *  sent again yet (see pendingNotesLost): nothing is cleaned up meanwhile. */
+  private notesLost = false;
   private deferred: Array<() => void> = [];
   /**
    * The table as read at start: the primary read cleanly ("ok"), or none yet
@@ -1334,6 +1337,9 @@ export class SubsessionService {
       // unread: the note holds only the start of the report, and points to
       // task_status for the rest.
       if (this.reportNotePending(task) || this.earlierReportPending(task)) continue;
+      // The check above may just have found the notes file unreadable and
+      // moved it aside: "no note pending" means nothing until they are sent again.
+      if (this.notesLost) break;
       if (task.status === "finished" && task.reportDelivered && task.pendingInput.length === 0
         && now - (task.endedAt ?? task.lastActivityAt) > FINISHED_KEEP_MS) {
         const outcome = this.transition(task.id, "archive", { reason: "finished more than 7 days ago" });
@@ -2042,11 +2048,11 @@ export class SubsessionService {
    * queued or in flight for the same task is not added twice (a restart
    * redelivery can meet the normal one).
    */
-  private deliverReport(record: SubsessionRecord): void {
+  private deliverReport(record: SubsessionRecord, opts: { lost?: boolean } = {}): void {
     // An earlier report kept unread whose own note was never written (it
     // failed, and died with the process) gets that note first: until it is
     // on disk, nothing else holds its text once the record goes.
-    if (!this.deliverEarlierReports(record)) {
+    if (!this.deliverEarlierReports(record, opts)) {
       this.retryReport(record.id);
       return;
     }
@@ -2070,6 +2076,7 @@ export class SubsessionService {
         `Sub-session ${record.id} ("${record.title}") finished. Its report #${record.reportSeq ?? 1}${report.length > REPORT_NOTE_EXCERPT ? " (start; read the whole report with task_status)" : ""}:`,
         excerpt,
         ...(earlier.length > 0 ? [`Its earlier report${earlier.length === 1 ? "" : "s"} ${earlier.join(", ")} ${earlier.length === 1 ? "is" : "are"} kept too: task_status shows ${earlier.length === 1 ? "it" : "them"}.`] : []),
+        ...(opts.lost ? [LOST_NOTE_LINE] : []),
       ].join("\n"), { name: reportNoteName(record) });
       if (!this.deps.queuePendingNote(record.parentKey, note, reportNoteId(reportNoteName(record)))) {
         this.unpersistedReports.add(record.id);
@@ -2081,13 +2088,75 @@ export class SubsessionService {
     this.clearReportRetry(record.id);
     // Wake first, then mark. The wake itself is in memory; what makes it
     // durable is the note: every start wakes the owning session again for a
-    // delivered report whose note is still unread (see reconcile).
-    this.wakeForReport(record);
+    // delivered report whose note is still unread (see reconcile). A note
+    // written again after the notes file was lost gets one wake per session
+    // (resendLostNotes).
+    if (!opts.lost) this.wakeForReport(record);
     this.safely(() => this.store.update(record.id, (r) => { r.reportDelivered = true; }), "mark report delivered");
   }
 
+  /**
+   * The pending-notes file could not be read and was moved aside (see
+   * SessionStore.loadPendingNotes): every report and handback note it may
+   * have held is gone. Each one is written again from the records, which
+   * keep the text: the report of every finished task (and its earlier
+   * reports), and the handback of every failed one. Some were already read,
+   * so each says it may have been told already, and each owning session is
+   * woken once. Ids are the usual ones, so a note this process already
+   * carried to its end, or that is queued, is not added again.
+   *
+   * Called from inside a read of the notes, so the work runs on a microtask;
+   * the sweep stops at once and cleans up nothing until it has.
+   */
+  pendingNotesLost(): void {
+    if (this.notesLost) return;
+    this.notesLost = true;
+    queueMicrotask(() => {
+      try {
+        this.resendLostNotes();
+      } catch (err) {
+        log.error({ err }, "Could not write the sub-session notes again after the pending notes file was moved aside");
+      } finally {
+        this.notesLost = false;
+      }
+    });
+  }
+
+  private resendLostNotes(): void {
+    if (!this.recovered || this.broken) return;
+    const woken = new Set<string>();
+    for (const task of this.store.list()) {
+      if (task.status === "finished" && (task.reportDelivered || (task.earlierReports ?? []).some((e) => e.noted))) {
+        this.safely(() => this.store.update(task.id, (r) => {
+          r.reportDelivered = false;
+          for (const e of r.earlierReports ?? []) delete e.noted;
+        }), "unmark lost report");
+        const record = this.safeGet(task.id);
+        if (record) this.deliverReport(record, { lost: true });
+        woken.add(task.parentKey);
+      } else if ((task.earlierReports ?? []).some((e) => e.noted)) {
+        // Reopened since: only its earlier, kept reports have notes.
+        this.safely(() => this.store.update(task.id, (r) => { for (const e of r.earlierReports ?? []) delete e.noted; }), "unmark lost report");
+        const record = this.safeGet(task.id);
+        if (record) this.deliverEarlierReports(record, { lost: true });
+        woken.add(task.parentKey);
+      }
+      if (task.status === "failed" && task.handedBack && task.pendingInput.some(isOwnerInput)) {
+        this.safely(() => this.store.update(task.id, (r) => { r.handedBack = false; }), "unmark lost handback");
+        const record = this.safeGet(task.id);
+        if (record) this.handBack(record, { lost: true });
+        woken.add(task.parentKey);
+      }
+    }
+    for (const parentKey of woken) {
+      this.outward(() => this.deps.wakeScope(parentKey, formatTomoEvent("subsession-report",
+        "Tomo's pending notes file could not be read and was set aside, so the sub-session notes above were written again from the task records. Some may already have been told to the owner: check the conversation, and tell the owner only what they have not heard.",
+        { name: "resent" })));
+    }
+  }
+
   /** Writes the note of every kept earlier report that has none on disk. False when one could not be written. */
-  private deliverEarlierReports(record: SubsessionRecord): boolean {
+  private deliverEarlierReports(record: SubsessionRecord, opts: { lost?: boolean } = {}): boolean {
     const missing = (record.earlierReports ?? []).filter((e) => !e.noted);
     if (missing.length === 0) return true;
     for (const e of missing) {
@@ -2098,6 +2167,7 @@ export class SubsessionService {
         : this.deps.queuePendingNote(record.parentKey, formatTomoEvent("subsession-report", [
           `Sub-session ${record.id} ("${record.title}") finished earlier. Its report #${e.seq}, replaced by a later one before it was read:`,
           e.text.length > REPORT_NOTE_EXCERPT ? `${e.text.slice(0, REPORT_NOTE_EXCERPT - 1)}… (read the whole report with task_status)` : e.text,
+          ...(opts.lost ? [LOST_NOTE_LINE] : []),
         ].join("\n"), { name }), reportNoteId(name));
       if (!ok) return false;
     }
@@ -2191,11 +2261,12 @@ export class SubsessionService {
    * note: the one copy that outlives the record. Marked on the record once the
    * note is on disk; until then the sweep keeps the record and tries again.
    */
-  private handBack(record: SubsessionRecord): boolean {
+  private handBack(record: SubsessionRecord, opts: { lost?: boolean } = {}): boolean {
     const unanswered = record.pendingInput.filter(isOwnerInput);
     const note = formatTomoEvent("subsession-handback", [
       `Sub-session ${record.id} ("${record.title}") failed before it answered ${unanswered.length === 1 ? "this message" : `these ${unanswered.length} messages`} passed on for the owner. Here in full; decide with the owner whether ${unanswered.length === 1 ? "it still needs" : "they still need"} doing:`,
       ...unanswered.map((i, n) => `${n + 1}. ${(i.words ?? i.text).trim()}`),
+      ...(opts.lost ? [LOST_NOTE_LINE] : []),
     ].join("\n\n"), { name: record.id });
     if (!this.deps.queuePendingNote(record.parentKey, note, `subsession-handback:${record.id}`)) {
       log.warn({ id: record.id }, "Could not write a failed sub-session's handback note; the record is kept and it is tried again");
@@ -2325,6 +2396,9 @@ function reportNoteName(record: SubsessionRecord): string {
 }
 
 /** The pending-note id of report `name` (`s3#2`): one note per report, however often it is delivered. */
+/** Added to a note written again after the notes file was lost. */
+const LOST_NOTE_LINE = "(Written again from the task record: the pending notes file was lost. It may already have been told to the owner.)";
+
 function reportNoteId(name: string): string {
   return `subsession-report:${name}`;
 }

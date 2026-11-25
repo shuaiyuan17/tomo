@@ -82,6 +82,8 @@ export const FORCE_COMPACT_IDLE_WAIT_MS = 5 * 60_000;
 export interface ForceCompactHold {
   key: string;
   release: () => void;
+  /** Set when the closed session's CLI outlived the wait: the hold is kept until it exits. */
+  untilExit?: Promise<void>;
 }
 
 /** How often the idle reaper looks (capped by the timeout itself). */
@@ -779,9 +781,15 @@ export class LiveSessionManager {
     // the pre-compaction file (createLiveSession re-checks the generation).
     this.generations.set(key, (this.generations.get(key) ?? 0) + 1);
     let released = false;
+    const handle: ForceCompactHold = { key, release: () => {} };
     const release = () => {
       if (released) return;
       released = true;
+      // A CLI child that outlived the close wait keeps the key held until it is gone.
+      if (handle.untilExit) void handle.untilExit.then(releaseNow);
+      else releaseNow();
+    };
+    const releaseNow = () => {
       if (this.sessionHolds.get(key) === hold) {
         this.sessionHolds.delete(key);
         this.holdReleases.delete(key);
@@ -789,8 +797,10 @@ export class LiveSessionManager {
       this.compactReservations.finish(key, reservation.reservationId);
       releaseHold();
     };
-    this.holdReleases.set(key, release);
-    return { key, release };
+    handle.release = release;
+    // Shutdown releases at once: the process is exiting, the child with it.
+    this.holdReleases.set(key, releaseNow);
+    return handle;
   }
 
   /**
@@ -834,6 +844,7 @@ export class LiveSessionManager {
         // A CLI that is still alive can append after the rewrite's drain
         // (orphaned parents, a fresh uncapped usage anchor): fail closed.
         log.warn({ key }, "Forced compaction: the closed session's CLI did not exit in time; not rewriting its file");
+        hold.untilExit = session.whenClosed();
         return null;
       }
     }

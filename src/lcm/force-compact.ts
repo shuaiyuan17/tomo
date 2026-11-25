@@ -9,7 +9,7 @@ import { compactSessionChecked, type ChainCheckOptions } from "./chain-check.js"
 import { checkAndClearCompactTrigger } from "./compact.js";
 import { globalFreshTailStartIdx, localDateTag } from "./blocks.js";
 import { pruneTools } from "./prune-tools.js";
-import { computeContextStats, estimateTokens } from "./stats.js";
+import { computeContextStatsFromEvents, estimateTokens } from "./stats.js";
 import { capStaleUsageInFile } from "./stale-usage.js";
 
 /**
@@ -324,7 +324,15 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
     };
   }
   const safeTokens = Math.floor(window * (o.safePct ?? FORCE_COMPACT_SAFE_PCT) / 100);
-  const fileEstimate = () => computeContextStats(o.sdkSessionId, o.sdkSessionsDir)?.totalTokens ?? 0;
+  // The active chain only: nothing before the last SDK compact boundary is loaded.
+  const fileEstimate = () => {
+    const events = loadEvents(o.sdkSessionId, o.sdkSessionsDir);
+    let start = 0;
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (events[i].type === "system" && events[i].subtype === "compact_boundary") { start = i + 1; break; }
+    }
+    return computeContextStatsFromEvents(events.slice(start)).totalTokens;
+  };
   const est0 = fileEstimate();
   const overhead = o.contextUsed && o.contextUsed > 0
     ? Math.min(Math.max(0, o.contextUsed - est0), Math.floor(window * 0.5))
@@ -343,7 +351,11 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
     errors: [],
   };
   const archivePath = join(o.sessionsDir, `_archive_${o.sdkSessionId}.jsonl`);
-  const chainOpts: ChainCheckOptions = { workspaceDir: o.workspaceDir, ...(o.loadChain ? { loadChain: o.loadChain } : {}) };
+  const chainOpts: ChainCheckOptions = {
+    workspaceDir: o.workspaceDir,
+    ...(o.signal ? { signal: o.signal } : {}),
+    ...(o.loadChain ? { loadChain: o.loadChain } : {}),
+  };
 
   const aborted = () => {
     if (!o.signal?.aborted) return false;
@@ -401,6 +413,7 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
       report.errors.push(`summary rewrite ${stretch.from}–${stretch.to}: ${res.error ?? "failed"}`);
     }
     // ④ Fallback: archive the stretch with a one-line placeholder.
+    if (aborted()) break;
     const res = await compactSessionChecked({ ...range, summary: forceArchivePlaceholder(stretch) }, chainOpts);
     if (res.success) {
       report.archived.push(step);
@@ -421,7 +434,9 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
     const capped = capStaleUsageInFile({ sdkSessionId: o.sdkSessionId, sdkSessionsDir: o.sdkSessionsDir, ceiling: after });
     if (capped.success) {
       report.usageCapped = capped.capped;
-      report.ok = true;
+      // A run that changed nothing did not recover anything.
+      report.ok = !!report.pruned || report.summarized.length > 0 || report.archived.length > 0 || capped.capped > 0;
+      if (!report.ok) report.errors.push("nothing could be compacted");
     } else report.errors.push(`usage cap: ${capped.error ?? "failed"}`);
   }
 

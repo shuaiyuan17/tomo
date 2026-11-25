@@ -307,6 +307,22 @@ describe("forceCompactSession", () => {
     expect(readFileSync(getSdkSessionPath(c.sessionId, sdkSessionsDir), "utf8")).toBe(original);
   });
 
+  it("estimates the active chain only (nothing before an SDK compact boundary), and calls a run that changed nothing a failure", async () => {
+    const b = build({ perDay: 2 });
+    const path = getSdkSessionPath(b.sessionId, sdkSessionsDir);
+    const events = fileEvents(b.sessionId);
+    // Everything so far sits before a boundary; after it, one small exchange.
+    const boundary = { type: "system", subtype: "compact_boundary", uuid: randomUUID(), parentUuid: null, timestamp: DAY(25, 9, 0), sessionId: b.sessionId };
+    const u = { ...events[0], uuid: randomUUID(), parentUuid: boundary.uuid, timestamp: DAY(25, 9, 1), message: { role: "user", content: "hi" } };
+    writeFileSync(path, [...events, boundary, u].map((e) => JSON.stringify(e)).join("\n") + "\n");
+    const summarize = vi.fn(async () => "never");
+    const r = await forceCompactSession({ ...common(), sdkSessionId: b.sessionId, contextMax: 100_000, summarize });
+    expect(r.afterTokens).toBeLessThan(25_000); // default overhead + the active chain, not the whole file
+    expect(summarize).not.toHaveBeenCalled();
+    expect(r.ok).toBe(false);
+    expect(r.errors).toContain("nothing could be compacted");
+  });
+
   it("writes the placeholder line the brief asks for", () => {
     expect(forceArchivePlaceholder({ events: 12, from: "2026-11-22 09:00", to: "2026-11-22 18:00" }))
       .toBe("[force-archived 12 events from 2026-11-22 09:00 to 2026-11-22 18:00; use `tomo lcm search` to recall]");

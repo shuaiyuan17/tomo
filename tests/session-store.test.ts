@@ -193,6 +193,17 @@ describe("SessionStore", () => {
     expect(entry?.stats.totalInputTokens).toBe(20);
   });
 
+  it("keeps the last real window when an estimated reading does not know one (contextMax 0)", () => {
+    const store = makeSessionStore(TEST_DIR);
+    store.setSdkSessionId("telegram:1", "session-1");
+    const turn = { costUsd: 0, inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 10, contextMax: 1_000_000 };
+    store.updateStats("telegram:1", turn);
+    store.updateStats("telegram:1", { ...turn, contextUsed: 15, contextMax: 0, contextEstimated: true });
+    expect(store.getEntry("telegram:1")?.stats).toMatchObject({ contextMax: 1_000_000, contextUsed: 15, contextEstimated: true });
+    store.updateStats("telegram:1", { ...turn, contextMax: 200_000 });
+    expect(store.getEntry("telegram:1")?.stats.contextMax).toBe(200_000);
+  });
+
   describe("usage baseline", () => {
     const turn = {
       costUsd: 0.1, inputTokens: 10, outputTokens: 5,

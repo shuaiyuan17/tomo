@@ -962,7 +962,10 @@ export class SessionStore {
       entry.stats.totalCacheReadTokens += update.cacheReadTokens;
       entry.stats.totalCacheCreationTokens += update.cacheCreationTokens;
       entry.stats.contextUsed = update.contextUsed;
-      entry.stats.contextMax = update.contextMax;
+      // An estimated reading carries the window as "0 = never seen one": keep
+      // the last real window rather than forget it (a forced compaction right
+      // after a restart needs it, see agent/force-compactor.ts).
+      if (update.contextMax > 0 || !update.contextEstimated) entry.stats.contextMax = update.contextMax;
       entry.stats.contextEstimated = update.contextEstimated ?? false;
       if (update.contextBreakdown) {
         entry.stats.contextBreakdown = update.contextBreakdown;

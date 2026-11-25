@@ -2181,18 +2181,30 @@ describe("LiveSessionManager forced compaction", () => {
   it("rewrites nothing while the closed session's CLI has not exited (bounded wait, then null)", async () => {
     const manager = new LiveSessionManager(makeDeps());
     await manager.runWithRetry({ key: "dm:owner", prompt: "first" });
-    mockState.closeGate = new Promise<void>(() => {});
+    let exit!: () => void;
+    mockState.closeGate = new Promise<void>((r) => { exit = r; });
     vi.useFakeTimers();
+    let hold!: NonNullable<ReturnType<typeof manager.holdForForceCompact>>;
     try {
-      const hold = manager.holdForForceCompact("dm:owner")!;
+      hold = manager.holdForForceCompact("dm:owner")!;
       const result = manager.quiesceForForceCompact(hold, () => true);
       await vi.advanceTimersByTimeAsync(IDLE_REAP_CLOSE_WAIT_MS + 10);
       expect(await result).toBeNull();
       expect(mockState.instances[0].closed).toBe(true);
-      hold.release();
     } finally {
       vi.useRealTimers();
     }
+    // Released, but the key stays held until that CLI is really gone.
+    hold.release();
+    const sent: string[] = [];
+    mockState.sendImpl = async (prompt) => { sent.push(prompt); return "ok"; };
+    const next = manager.runWithRetry({ key: "dm:owner", prompt: "after" });
+    await flushMicrotasks(20);
+    expect(sent).toEqual([]);
+    expect(manager.holdForForceCompact("dm:owner")).toBeNull();
+    exit();
+    await next;
+    expect(sent).toEqual(["after"]);
   });
 
   it("aborts with the session untouched when beforeClose refuses", async () => {

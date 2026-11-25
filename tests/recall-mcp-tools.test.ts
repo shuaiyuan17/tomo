@@ -2,7 +2,7 @@ import { afterAll, describe, it, expect, beforeEach, afterEach } from "vitest";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { SessionStore } from "../src/sessions/store.js";
+import { SessionStore, transcriptFileStem } from "../src/sessions/store.js";
 import { RECALL_FOREIGN_AUDIENCE_REFUSAL, buildRecallTools, formatRecallResults } from "../src/mcp/recall-tools.js";
 import type { SessionMessage } from "../src/sessions/types.js";
 
@@ -131,31 +131,21 @@ describe("recall_conversation MCP tool", () => {
     expect(result.content[0].text).toContain("later than");
   });
 
-  it("skips transcript records without string content instead of throwing", async () => {
+  it.each([
+    ["searching", { query: "good", limit: 20 }],
+    ["browsing without a query", { limit: 20 }],
+  ])("skips transcript records without string content instead of throwing, when %s", async (_label, args) => {
     seedMessage(store, { content: "good record", timestamp: 1000 });
     // Simulate a corrupt/legacy line written directly to the transcript file.
+    // The file name comes from the store's own mapping: a hand-built
+    // "dm_alice.jsonl" only matched because dm:alice keeps its legacy stem.
     appendFileSync(
-      join(TEST_DIR, "dm_alice.jsonl"),
+      join(TEST_DIR, `${transcriptFileStem(SESSION_KEY)}.jsonl`),
       JSON.stringify({ role: "user", channel: "telegram", timestamp: 2000 }) + "\n",
     );
     const freshStore = new SessionStore(TEST_DIR, 20, join(TEST_DIR, "sdk-sessions"));
 
-    const result = await makeTool(freshStore).handler({ query: "good", limit: 20 }, {});
-
-    expect(result.isError).toBeFalsy();
-    expect(result.content[0].text).toContain("good record");
-  });
-
-  it("skips transcript records without string content when browsing without a query", async () => {
-    seedMessage(store, { content: "good record", timestamp: 1000 });
-    // Simulate a corrupt/legacy line written directly to the transcript file.
-    appendFileSync(
-      join(TEST_DIR, "dm_alice.jsonl"),
-      JSON.stringify({ role: "user", channel: "telegram", timestamp: 2000 }) + "\n",
-    );
-    const freshStore = new SessionStore(TEST_DIR, 20, join(TEST_DIR, "sdk-sessions"));
-
-    const result = await makeTool(freshStore).handler({ limit: 20 }, {});
+    const result = await makeTool(freshStore).handler(args, {});
 
     expect(result.isError).toBeFalsy();
     expect(result.content[0].text).toContain("good record");

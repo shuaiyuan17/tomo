@@ -1,4 +1,4 @@
-import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach, vi, type MockInstance } from "vitest";
 import {
   annotateSenderName,
   autoBindHandle,
@@ -666,7 +666,7 @@ describe("loadPeople strict", () => {
  */
 describe("loadPeople — malformed person file warnings", () => {
   const root = join(TEST_DIR, "warn-once");
-  let warn: ReturnType<typeof vi.spyOn<typeof log, "warn">>;
+  let warn: MockInstance<typeof log.warn>;
   beforeEach(() => { warn = vi.spyOn(log, "warn").mockImplementation(() => {}); });
   afterEach(() => vi.restoreAllMocks());
 

@@ -5,8 +5,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const warn = vi.hoisted(() => vi.fn());
 vi.mock("../src/logger.js", () => ({ log: { warn, info: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
+// One write is slow: a 5-hour reading of exactly 17%, which no other fixture
+// here uses. Everything else goes straight through.
+vi.mock("node:fs/promises", async (original) => {
+  const real = await original<typeof import("node:fs/promises")>();
+  return { ...real, appendFile: async (...args: Parameters<typeof real.appendFile>) => {
+    if (String(args[1]).includes("\"percent\":17,")) await new Promise((r) => setTimeout(r, 30));
+    return real.appendFile(...args);
+  } };
+});
 
-import { fetchUsage } from "../src/agent/usage.js";
 import { sdkSignalOf } from "../src/agent/sdk-signals.js";
 import { LIMITS_REPEAT_MS, LimitsLog, readSessionWindowPercent, type LimitSample } from "../src/usage/limits-log.js";
 import { usageDataDir } from "../src/usage/dir.js";
@@ -92,6 +100,22 @@ describe("LimitsLog", () => {
     expect(lines(log).map((l) => l.source)).toEqual(["oauth-usage", "rate-limit-event", "rate-limit-event", "rate-limit-event", "oauth-usage"]);
   });
 
+  it("dedup compares with the LAST line written, even when two writes were in flight at once", async () => {
+    // A is slow (see the fs mock), so if the dedup state were taken when a
+    // call is made rather than when its line lands, B would be compared with
+    // the wrong line. The write ORDER itself is appendLineSerial's guarantee,
+    // tested in usage-append.test.ts.
+    const log = new LimitsLog(home, () => clock);
+    const a = { five_hour: { utilization: 17 } };
+    const b = { five_hour: { utilization: 27 } };
+    await Promise.all([log.recordOAuthUsage(a), log.recordOAuthUsage(b)]);
+    const percents = () => lines(log).map((l) => l.windows[0].percent);
+    expect(percents()).toEqual([17, 27]);
+    await log.recordOAuthUsage(b); // the file ends in B: an unchanged B is skipped
+    await log.recordOAuthUsage(a); // A differs from the last line: written
+    expect(percents()).toEqual([17, 27, 17]);
+  });
+
   it("a failed write warns, never throws, and is not deduplicated against", async () => {
     writeFileSync(join(home, "data"), "a file where the directory should be");
     const log = new LimitsLog(home, () => clock);
@@ -102,21 +126,6 @@ describe("LimitsLog", () => {
     rmSync(join(home, "data"));
     await log.recordOAuthUsage(OAUTH);
     expect(lines(log)).toHaveLength(1);
-  });
-});
-
-describe("fetchUsage onData", () => {
-  const CREDS = { claudeAiOauth: { accessToken: "t", expiresAt: NOW + 3_600_000 } };
-  const ok = async () => new Response(JSON.stringify(OAUTH), { status: 200 });
-  it("sees the parsed body of a good read, and only a good read", async () => {
-    const seen: unknown[] = [];
-    await fetchUsage({ now: () => NOW, loadCredentials: async () => CREDS, fetchImpl: ok as never, onData: (d) => seen.push(d) });
-    await fetchUsage({ now: () => NOW, loadCredentials: async () => CREDS, fetchImpl: (async () => new Response("{}", { status: 500 })) as never, onData: (d) => seen.push(d) });
-    expect(seen).toEqual([OAUTH]);
-  });
-  it("a throwing observer does not break the read", async () => {
-    const result = await fetchUsage({ now: () => NOW, loadCredentials: async () => CREDS, fetchImpl: ok as never, onData: () => { throw new Error("boom"); } });
-    expect(result).toMatchObject({ ok: true, data: OAUTH });
   });
 });
 

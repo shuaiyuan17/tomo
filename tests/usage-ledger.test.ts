@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -28,6 +28,24 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 const { log } = await import("../src/logger.js");
+
+/**
+ * Run `fn` while the month file cannot be appended to, for every uid: the file
+ * is moved aside and a DIRECTORY stands at its path (EISDIR). A mode change
+ * would not do it under root, which writes through 0o400. The file comes back
+ * untouched afterwards.
+ */
+async function withUnwritableMonthFile(file: string, fn: () => Promise<void>): Promise<void> {
+  const aside = `${file}.aside`;
+  renameSync(file, aside);
+  mkdirSync(file);
+  try {
+    await fn();
+  } finally {
+    rmSync(file, { recursive: true, force: true });
+    renameSync(aside, file);
+  }
+}
 
 const row = (ts: number, extra: Partial<UsageLedgerRow> = {}): UsageLedgerRow => ({
   v: 1, ts, sessionKey: "dm:owner", source: "owner", costUsd: 0.1,
@@ -106,13 +124,10 @@ describe("UsageLedger", () => {
     expect(readFileSync(file, "utf-8").trim().split("\n")).toHaveLength(1);
 
     // A new failure streak warns again.
-    chmodSync(file, 0o400);
-    try {
+    await withUnwritableMonthFile(file, async () => {
       await ledger.append(row(ts));
       expect(log.warn).toHaveBeenCalledTimes(2);
-    } finally {
-      chmodSync(file, 0o600);
-    }
+    });
   });
 });
 
@@ -175,12 +190,9 @@ describe("UsageLedger.lastSnapshot — the ledger is where a resume finds its ba
     const landed: number[] = [];
     await ledger.append(row(ts, { sdkSessionId: "sid-1", snapshot: snap(1) }), () => landed.push(1));
     const file = join(dir, ledgerFileName(ts));
-    chmodSync(file, 0o400);
-    try {
+    await withUnwritableMonthFile(file, async () => {
       await ledger.append(row(ts, { sdkSessionId: "sid-1", snapshot: snap(2) }), () => landed.push(2));
-    } finally {
-      chmodSync(file, 0o600);
-    }
+    });
     expect(landed).toEqual([1]);
     expect(ledger.lastSnapshot("dm:owner", "sid-1")).toEqual(snap(1));
     expect(new UsageLedger(dir).lastSnapshot("dm:owner", "sid-1")).toEqual(snap(1));

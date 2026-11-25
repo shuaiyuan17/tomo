@@ -2,7 +2,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } fro
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import {
   DEFAULT_RETENTION_DAYS, MAX_RETENTION_DAYS, copyIfExists, isBackupName, isCopyableEntry, resolveRetentionDays,
   workspaceBackupFilter,
@@ -15,7 +15,7 @@ import {
  */
 
 describe("resolveRetentionDays", () => {
-  let warn: ReturnType<typeof vi.spyOn<Console, "warn">>;
+  let warn: MockInstance<typeof console.warn>;
   beforeEach(() => { warn = vi.spyOn(console, "warn").mockImplementation(() => {}); });
   afterEach(() => vi.restoreAllMocks());
 

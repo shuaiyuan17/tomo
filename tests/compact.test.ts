@@ -302,7 +302,13 @@ describe("compactSession", () => {
     expect(stagingLeftovers()).toEqual([]);
   });
 
-  it("aborts cleanly when the first range anchor is stale", () => {
+  // Either anchor going stale aborts with the file and the archive untouched,
+  // and so does the last one when it is the only anchor given (the first is
+  // optional; the last is checked on its own).
+  it.each<[string, (events: Array<{ uuid: string }>) => { expectedFirstUuid?: string; expectedLastUuid: string }]>([
+    ["the first range anchor is stale", (events) => ({ expectedFirstUuid: randomUUID(), expectedLastUuid: events[3].uuid })],
+    ["the last range anchor is stale, and is the only anchor provided", () => ({ expectedLastUuid: randomUUID() })],
+  ])("aborts cleanly when %s", (_label, anchors) => {
     const events: any[] = [];
     let parent: string | null = null;
     for (let i = 0; i < 5; i++) {
@@ -322,39 +328,7 @@ describe("compactSession", () => {
       sdkSessionsDir,
       fromIdx: 1,
       toIdx: 3,
-      expectedFirstUuid: randomUUID(),
-      expectedLastUuid: events[3].uuid,
-      summary: "should not be applied",
-      transcriptPath: archivePath,
-    });
-
-    expect(result.success).toBe(false);
-    expect(result.error).toBe("Range anchors moved (file rewritten since range resolution); re-resolve the range and retry");
-    expect(readFileSync(path, "utf-8")).toBe(initialContent);
-    expect(existsSync(archivePath)).toBe(false);
-  });
-
-  it("verifies the last range anchor when it is the only anchor provided", () => {
-    const events: any[] = [];
-    let parent: string | null = null;
-    for (let i = 0; i < 5; i++) {
-      const ts = `2026-04-30T0${i}:00:00.000Z`;
-      const e = i % 2 === 0
-        ? mkUserEvent(parent, ts, `msg ${i}`)
-        : mkAssistantEvent(parent, ts, `reply ${i}`);
-      events.push(e);
-      parent = e.uuid;
-    }
-    mkdirSync(dirname(path), { recursive: true });
-    const initialContent = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
-    writeFileSync(path, initialContent);
-
-    const result = compactSession({
-      sdkSessionId: sessionId,
-      sdkSessionsDir,
-      fromIdx: 1,
-      toIdx: 3,
-      expectedLastUuid: randomUUID(),
+      ...anchors(events),
       summary: "should not be applied",
       transcriptPath: archivePath,
     });

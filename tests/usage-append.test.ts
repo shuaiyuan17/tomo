@@ -1,8 +1,18 @@
-import { afterEach, beforeEach, expect, it } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { appendLineSerial } from "../src/usage/append.js";
+
+// A line carrying the word "slow" takes 30 ms to write, so an unserialized
+// second append would land before it. No other line here carries it.
+vi.mock("node:fs/promises", async (original) => {
+  const real = await original<typeof import("node:fs/promises")>();
+  return { ...real, appendFile: async (...args: Parameters<typeof real.appendFile>) => {
+    if (String(args[1]).includes("slow")) await new Promise((r) => setTimeout(r, 30));
+    return real.appendFile(...args);
+  } };
+});
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "tomo-append-")); });
@@ -40,4 +50,19 @@ it("tightens an existing file wider than fileMode before writing into it; withou
   writeFileSync(other, "x\n", { mode: 0o644 });
   await appendLineSerial(other, () => "y");
   expect(statSync(other).mode & 0o777).toBe(0o644);
+});
+
+it("serializes appends to one file: lines land in call order, even when the first is slow", async () => {
+  // limits.ndjson and the month ledgers are written from callers that do not
+  // await each other (a turn's result and a /usage read). The second line is
+  // also computed only once the first has landed, which is what lets a caller
+  // dedup against the last line written.
+  const path = join(dir, "limits.ndjson");
+  const computedAfter: string[] = [];
+  await Promise.all([
+    appendLineSerial(path, () => "A slow"),
+    appendLineSerial(path, () => { computedAfter.push(readFileSync(path, "utf8")); return "B"; }),
+  ]);
+  expect(readFileSync(path, "utf8")).toBe("A slow\nB\n");
+  expect(computedAfter).toEqual(["A slow\n"]);
 });

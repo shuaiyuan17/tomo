@@ -17,6 +17,8 @@ import {
   taskSessionKey,
 } from "./sessions/keys.js";
 import { SubsessionService, type OwnerMessageResult, type TaskTurnOutcome } from "./agent/subsessions/service.js";
+import { dropLegacyTaskTodos } from "./agent/subsessions/legacy-todos.js";
+import { TodoStore } from "./todos/store.js";
 import { parseTaskAddress, type TaskAddress } from "./agent/subsessions/address.js";
 import { taskCommandReply } from "./agent/subsessions/commands.js";
 import { SubsessionStore } from "./agent/subsessions/store.js";
@@ -3191,6 +3193,8 @@ export class Agent {
       // input can reach a task recovery has not looked at yet. It schedules
       // nothing: dispatch opens with start() below, after the inbox replay.
       this.subsessions?.recoverAtStartup();
+      // The todos the old per-task todo link made would never close now (the task record is the card).
+      if (this.subsessions?.available()) dropLegacyTaskTodos(new TodoStore(), this.subsessions.list());
     } catch (err) {
       log.error({ err }, "Sub-session recovery failed");
     }

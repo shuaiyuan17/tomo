@@ -35,6 +35,7 @@ export const subsessions = {
     alreadyStopped: "{{id}} 已经停了。",
     started: "已开始 {{id}} · {{title}}。",
     done: "已标记完成：{{id}} · {{title}}。",
+    stopNeedsOwner: "{{id}} 已经做完了，在等你处理报告里的事。发 /s {{id}} done 就能清掉。",
     nothingToDo: "{{id}} 没有要你做的事（现在是{{status}}）。想给它发消息，别只写 done：/s {{id}} …",
     held: "等 Tomo 能读到 session 列表，{{id}} 马上开始（现在开始会丢掉它之前的上下文）。",
     notQueued: "{{id}} 没在排队（现在是{{status}}）。要叫醒它，给它发句话：/s {{id}} …",

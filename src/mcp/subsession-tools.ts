@@ -176,7 +176,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
       "The task is done. The report goes to the main session, which tells the owner and decides what to remember. Put the result first, then what changed (links, PRs, files), then anything worth remembering. If the result needs the owner to do something (review and merge a PR, make a choice, sign off), say what in `owner_action`: the task then shows as \"Needs you\" until they have done it. Leave it out when the report is only for their information. Scheduled check-backs of this task are removed. Refused while a message you have not read yet is waiting: it comes in your next turn; handle it, then finish.",
       {
         report: z.string().min(1).max(20000),
-        owner_action: z.string().max(2000).optional().describe(`One line: what the owner has to do with the result, if anything (cut at ${OWNER_ACTION_MAX} characters). Omit when nothing.`),
+        owner_action: z.string().optional().describe(`One line: what the owner has to do with the result, if anything (cut at ${OWNER_ACTION_MAX} characters). Omit when nothing.`),
       },
       async ({ report, owner_action }) => {
         const r = service("task_finish");

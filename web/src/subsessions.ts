@@ -77,13 +77,15 @@ export function subsessionStateLabel(task: ShownTask): string {
 
 /**
  * An opened task as shown: what the list says now wins over the last detail
- * read (it is the newer of the two). `background` is left out of a view, not
- * set false, once the work ends, so it comes from the list alone.
+ * read (it is the newer of the two). `background` and `ownerAction` are left
+ * out of a view, not set empty, once they no longer hold, so they come from
+ * the list alone.
  */
-export function withListBackground<D extends Partial<WebSubsession>>(detail: D | undefined, summary: WebSubsession): Omit<D, "background"> & WebSubsession {
+export function withListBackground<D extends Partial<WebSubsession>>(detail: D | undefined, summary: WebSubsession): Omit<D, "background" | "ownerAction"> & WebSubsession {
   const rest: Partial<WebSubsession> = { ...(detail ?? {}) };
   delete rest.background;
-  return { ...rest, ...summary } as Omit<D, "background"> & WebSubsession;
+  delete rest.ownerAction;
+  return { ...rest, ...summary } as Omit<D, "background" | "ownerAction"> & WebSubsession;
 }
 
 /**

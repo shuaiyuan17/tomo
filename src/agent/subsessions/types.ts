@@ -193,9 +193,10 @@ export interface SubsessionRecord {
    * What the owner has to do with the report (task_finish `owner_action`:
    * review and merge a PR, make a choice), one line. A finished task with
    * one is the owner's ("Needs you") until they do it: `/s <id> done` or the
-   * owning session's task_done clears it, and so does the next task_finish
-   * (which sets it again or not). Meaningful only while the task is
-   * finished: read it through `needsOwner`.
+   * owning session's task_done clears it (that report's ask only), and the
+   * next task_finish sets it afresh or not. A reopen leaves it (the ask
+   * stands until a new report says otherwise) but hides it: meaningful only
+   * while the task is finished, read through `needsOwner`.
    */
   ownerAction?: string;
   /** Counts the task's reports (a finished task can be woken and finish again); its report note is named by it. */

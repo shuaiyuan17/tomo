@@ -464,13 +464,18 @@ export class SubsessionService {
     if (!this.available()) return { ok: false, reason: "unreadable" };
     const record = this.store.get(id);
     if (!record || record.parentKey !== scope) return { ok: false, reason: "unknown" };
-    const action = needsOwner(record);
-    if (!action) return { ok: false, reason: "nothing" };
-    // Under the lock: a task_finish that landed meanwhile set its own action, which this does not clear.
+    if (!needsOwner(record)) return { ok: false, reason: "nothing" };
+    // Under the lock, and only the ask of the report the owner saw: a
+    // task_finish that landed meanwhile is a new report (a new reportSeq)
+    // whose ask they have not answered, even when its words are the same.
+    const seq = record.reportSeq;
+    let cleared = false;
     const updated = this.store.update(id, (r) => {
-      if (r.status === "finished" && r.ownerAction === action) delete r.ownerAction;
+      if (r.status !== "finished" || r.reportSeq !== seq || !r.ownerAction) return;
+      delete r.ownerAction;
+      cleared = true;
     });
-    if (!updated || needsOwner(updated) === action) return { ok: false, reason: "nothing" };
+    if (!updated || !cleared) return { ok: false, reason: "nothing" };
     log.info({ id }, "Sub-session marked done by the owner");
     return { ok: true, record: updated };
   }
@@ -857,7 +862,7 @@ export class SubsessionService {
   reopen(key: string): TransitionOutcome {
     const record = this.store.byKey(key);
     if (!record) return { ok: false, from: null };
-    const outcome = this.store.transition(record.id, "reopen", { patch: (r) => { r.turnsWithoutProgress = 0; delete r.ownerAction; } });
+    const outcome = this.store.transition(record.id, "reopen", { patch: (r) => { r.turnsWithoutProgress = 0; } });
     // The turn that reopened it is running now; its end decides what follows.
     return outcome;
   }
@@ -2015,7 +2020,7 @@ export class SubsessionService {
         excerpt,
         ...(earlier.length > 0 ? [`Its earlier report${earlier.length === 1 ? "" : "s"} ${earlier.join(", ")} ${earlier.length === 1 ? "is" : "are"} kept too: task_status shows ${earlier.length === 1 ? "it" : "them"}.`] : []),
         needsOwner(record)
-          ? `It needs the owner to: ${needsOwner(record)}. Tell them. The task shows as "Needs you" until they do it: once they say it is done (or no longer needed), call task_done("${record.id}").`
+          ? `It needs the owner to: ${needsOwner(record)!.replace(/[.。]+$/, "")}. Tell them. The task shows as "Needs you" until they do it: once they say it is done (or no longer needed), call task_done("${record.id}").`
           : "It needs nothing from the owner.",
       ].join("\n"), { name: reportNoteName(record) });
       if (!this.deps.queuePendingNote(record.parentKey, note)) {

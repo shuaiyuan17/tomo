@@ -20,8 +20,10 @@ export async function taskCommandReply(
   if (!service.available()) return t("cmd.unavailable");
   if (address.kind === "usage") return t("cmd.usage");
   if (address.kind === "list") {
+    // What waits on the owner comes first, however old: past LIST_MAX it would only be counted.
+    const asks = (r: SubsessionRecord) => (needsOwner(r) || (r.status === "waiting" && r.waitingOn === "owner") ? 1 : 0);
     const tasks = service.list(scope).filter((r) => r.status !== "archived")
-      .sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+      .sort((a, b) => asks(b) - asks(a) || b.lastActivityAt - a.lastActivityAt);
     if (tasks.length === 0) return t("cmd.empty");
     const lines = tasks.slice(0, LIST_MAX).map((r) => taskLine(t, r, service.backgroundRunning(r)));
     if (tasks.length > LIST_MAX) lines.push(t("cmd.more", { count: tasks.length - LIST_MAX }));
@@ -37,6 +39,8 @@ export async function taskCommandReply(
     case "stop": {
       if (record.status === "cancelled") return t("cmd.alreadyStopped", { id: record.id });
       if (TERMINAL_STATUSES.has(record.status)) return t("cmd.ended", { id: record.id, status: statusWord(t, record) });
+      // Finished and waiting on the owner: "stop" would cancel a task whose work is done; done is what clears it.
+      if (needsOwner(record)) return t("cmd.stopNeedsOwner", { id: record.id });
       const outcome = await service.cancel(record.id, "stopped by the owner (/s stop)");
       return outcome.ok ? t("cmd.stopped", { id: record.id, title: record.title }) : t("cmd.ended", { id: record.id, status: statusWord(t, record) });
     }

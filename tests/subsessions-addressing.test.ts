@@ -589,6 +589,8 @@ describe("/s commands", () => {
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).toContain("Needs you: Review and merge PR #9 (/s s1 done once you have)");
     expect(formatTaskLine(h.service.get("s1")!)).toContain("[finished, needs the owner]");
     expect(formatTaskDetail(h.service.get("s1")!)).toContain("The owner has to: Review and merge PR #9");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "stop", id: "s1" })).toContain("/s s1 done clears it");
+    expect(h.service.get("s1")?.status).toBe("finished");
     expect(await taskCommandReply(t, h.service, "telegram:-100", { kind: "done", id: "s1" })).toBe("There's no sub-session s1.");
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "done", id: "s1" })).toBe("Marked done: s1 · Fix CI.");
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).toBe("s1 · Fix CI — finished");

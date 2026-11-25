@@ -400,7 +400,7 @@ describe("a task is its own card", () => {
     h.service.stop();
   });
 
-  it("each finish says afresh what it asks: a later report without one clears it, reopening clears it", async () => {
+  it("each finish says afresh what it asks: a later report without one clears it; a reopen hides it until the next report", async () => {
     const h = harness();
     const task = await finished(h, "Merge PR #12");
     // Woken while finished: it reopens to report again (what the prompt tells it to do).
@@ -413,10 +413,28 @@ describe("a task is its own card", () => {
     h.service.ownerMessage("dm:owner", task.id, "one more fix");
     await flush();
     expect(needsOwner(h.service.get(task.id)!)).toBe("Merge PR #13");
-    h.onTurn = (_prompt, key) => { h.service.reopen(key); return { ok: true }; };
+    h.onTurn = (_prompt, key) => { h.service.reopen(key); return new Promise(() => {}); };
     h.service.ownerMessage("dm:owner", task.id, "actually keep going");
     await flush();
-    expect(h.service.get(task.id)?.ownerAction).toBeUndefined();
+    // Working again: not "Needs you", and no done to give; the ask stands until a new report says otherwise.
+    expect(h.service.get(task.id)).toMatchObject({ status: "active", ownerAction: "Merge PR #13" });
+    expect(needsOwner(h.service.get(task.id)!)).toBeUndefined();
+    expect(h.service.markDone("dm:owner", task.id)).toEqual({ ok: false, reason: "nothing" });
+    h.service.stop();
+  });
+
+  it("done clears only the ask of the report the owner saw, never a newer report's with the same words", async () => {
+    const h = harness();
+    const task = await finished(h, "Review and merge the PR");
+    // Between the owner's read and the write, a new report lands with the same words (a second PR).
+    const seen = h.store.get(task.id)!;
+    h.store.transition(task.id, "reopen");
+    h.store.transition(task.id, "finish", { patch: (r) => { r.reportSeq = (r.reportSeq ?? 1) + 1; r.ownerAction = "Review and merge the PR"; } });
+    const get = h.store.get.bind(h.store);
+    h.store.get = (id: string) => (id === task.id ? seen : get(id));
+    expect(h.service.markDone("dm:owner", task.id)).toEqual({ ok: false, reason: "nothing" });
+    h.store.get = get;
+    expect(needsOwner(h.store.get(task.id)!)).toBe("Review and merge the PR");
     h.service.stop();
   });
 

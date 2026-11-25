@@ -8,7 +8,7 @@ import { api, ApiError } from "./api.js";
 import { Text } from "./markdown.js";
 import { messageDateTime, messageTime } from "./message-meta.js";
 import { createCompositionGuard } from "./compose-keys.js";
-import { isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
+import { isOpenSubsession, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
 import { i18n, useTranslation } from "./i18n/index.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
@@ -38,7 +38,8 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
   const { t } = useTranslation("tasks");
   const [detail, setDetail] = useState<WebSubsessionDetail>();
   const [status, setStatus] = useState<Status>("loading");
-  const [pending, setPending] = useState<PendingSubsessionMessage[]>([]);
+  const pending = usePending(summary.id);
+  const setPending = (update: (old: PendingSubsessionMessage[]) => PendingSubsessionMessage[]) => updatePending(summary.id, update);
   const [reload, setReload] = useState(0);
   const id = summary.id;
   useEffect(() => {
@@ -50,7 +51,8 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
   // What the list says now wins over the last detail read (it is the newer of the two).
   const shown = { ...(detail ?? {}), ...summary };
   const state = subsessionState(shown);
-  const writable = !!send && shown.writable && status !== "gone";
+  // Not before the conversation has been read: a message must have somewhere to show.
+  const writable = !!send && shown.writable && status !== "gone" && !!detail;
 
   const deliver = (message: PendingSubsessionMessage) => {
     if (!send) return;
@@ -63,7 +65,7 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
       setPending((old) => old.map((m) => m.requestId === message.requestId ? { ...m, state: "failed", error: errorKey(error) } : m));
     });
   };
-  const rows = detail ? subsessionChatRows(detail, pending) : [];
+  const rows = subsessionChatRows(detail, pending);
   // Sent ones the conversation now has are done with.
   useEffect(() => {
     if (detail) setPending((old) => old.some((m) => m.state === "sent" && m.revision !== undefined && detail.revision >= m.revision)
@@ -105,10 +107,10 @@ function Chat({ rows, status, id, onRetry }: { rows: SubsessionChatRow[]; status
   }, [last, rows.length]);
   return <div ref={scroll} onScroll={(e) => { const el = e.currentTarget; pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48; }}
     className="min-h-0 flex-1 overflow-y-auto px-2.5 pb-2 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]" tabIndex={0} aria-label={t("subsession.conversation", { id })}>
-    {status !== "ready" ? <p className="m-0 px-1.5 text-[13px] text-muted-foreground" role="status">{status === "loading" ? t("note.loading") : status === "gone" ? t("subsession.gone") : t("note.error")}</p>
-      : <ol className="m-0 flex list-none flex-col gap-3 p-0">
+    {status !== "ready" && <p className="m-0 px-1.5 text-[13px] text-muted-foreground" role="status">{status === "loading" ? t("note.loading") : status === "gone" ? t("subsession.gone") : t("note.error")}</p>}
+    {(status === "ready" || rows.length > 0) && <ol className="m-0 flex list-none flex-col gap-3 p-0">
         {rows.map((row) => <li key={row.key} className="min-w-0">{rowView(row, id, onRetry)}</li>)}
-        {rows.length === 1 && <li className="px-0.5 text-[11.5px] text-muted-foreground">{t("subsession.nothingYet", { id })}</li>}
+        {status === "ready" && rows.length === 1 && <li className="px-0.5 text-[11.5px] text-muted-foreground">{t("subsession.nothingYet", { id })}</li>}
       </ol>}
   </div>;
 }

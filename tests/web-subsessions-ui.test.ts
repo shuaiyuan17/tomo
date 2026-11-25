@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { activeSubsessions, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel } from "../web/src/subsessions.js";
+import { activeSubsessions, pendingFor, updatePending, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel } from "../web/src/subsessions.js";
 import type { WebSubsession, WebSubsessionDetail } from "../src/web/protocol.js";
 
 const task = (extra: Partial<WebSubsession> = {}): WebSubsession => ({ id: "s1", title: "T", status: "active", working: false,
@@ -41,5 +41,19 @@ describe("sub-sessions in the Tasks rail", () => {
     expect(subsessionChatRows(detail({ revision: 3 }), [sent]).some((r) => r.kind === "pending")).toBe(false);
     const failed = { requestId: "r2", text: "go", state: "failed" as const, error: "network" };
     expect(subsessionChatRows(detail({ revision: 9 }), [failed]).at(-1)).toMatchObject({ kind: "pending", message: { state: "failed" } });
+  });
+
+  it("keeps messages on their way outside the chat view, so leaving the chat loses none", () => {
+    updatePending("s7", (old) => [...old, { requestId: "r1", text: "go", state: "failed", error: "network" }]);
+    // A later view of the same task finds it, with the request id a retry reuses.
+    expect(pendingFor("s7")).toEqual([{ requestId: "r1", text: "go", state: "failed", error: "network" }]);
+    expect(pendingFor("s8")).toEqual([]);
+    updatePending("s7", () => []);
+    expect(pendingFor("s7")).toEqual([]);
+  });
+
+  it("shows what is on its way even before (or without) a read of the conversation", () => {
+    const rows = subsessionChatRows(undefined, [{ requestId: "r1", text: "go", state: "failed", error: "network" }, { requestId: "r2", text: "x", state: "sent", revision: 1 }]);
+    expect(rows.map((r) => r.key)).toEqual(["pr1"]);
   });
 });

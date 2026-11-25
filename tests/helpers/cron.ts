@@ -38,6 +38,24 @@ export function tick(scheduler: CronScheduler): Promise<void> {
 }
 
 /**
+ * One poll that must SETTLE within `ms`. For a test whose point is that the
+ * scan was gated: a scan that ran anyway dispatches a hanging turn, and a
+ * plain `await tick()` would then sit until vitest's 5s timeout instead of
+ * failing with a message that says what happened.
+ */
+export async function tickSettles(scheduler: CronScheduler, ms = 1_000): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`tick did not settle within ${ms}ms: the due-scan ran and dispatched a turn`)), ms);
+  });
+  try {
+    await Promise.race([tick(scheduler), late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
  * An agent whose cron turns never settle — stands in for a daemon killed
  * mid-turn. Records every cron message it was handed and every owner DM.
  */

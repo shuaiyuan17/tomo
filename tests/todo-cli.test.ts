@@ -10,7 +10,8 @@ import { runCommand } from "./helpers/commander-run.js";
 // day, at most `--max` items otherwise, and a non-zero exit (not an empty
 // list) when the store cannot be read.
 //
-// The command runs in-process (see runCommand); two real spawns at the end
+// The command runs in-process (see runCommand). One test at the end, "through
+// the real CLI", spawns `tomo todo due` twice (a quiet day, a corrupt store) to
 // keep the CLI wiring and the "nothing else on stdout" contract honest.
 
 const scratch: string[] = [];

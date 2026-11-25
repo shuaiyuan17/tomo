@@ -5,7 +5,7 @@ import { log } from "../src/logger.js";
 import { parseTomoEvent } from "../src/tomo-event.js";
 import { watchBus } from "../src/watch/bus.js";
 import type { Agent } from "../src/agent.js";
-import { cronBodies as bodies, editJobs, hangingAgent, makeJobsDue as makeDue, tick, waitFor } from "./helpers/cron.js";
+import { cronBodies as bodies, editJobs, hangingAgent, makeJobsDue as makeDue, tick, tickSettles, waitFor } from "./helpers/cron.js";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -37,6 +37,10 @@ function retryDelayPasses(): void {
 describe("CronScheduler", () => {
   beforeEach(() => {
     mkdirSync(TEST_DIR, { recursive: true });
+    // The logger mock is module-wide. Several tests assert on what was (or
+    // was NOT) logged, so each starts from zero calls rather than from
+    // whatever the tests before it left behind.
+    vi.clearAllMocks();
   });
 
   afterEach(() => {
@@ -341,7 +345,10 @@ describe("CronScheduler", () => {
     const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
     process.on("unhandledRejection", onUnhandled);
     try {
-      new CronStore(TEST_PATH).add({ name: "rec", schedule: { kind: "every", everyMs: 60_000 }, message: "x", sessionKey: "dm:alice" });
+      // Hourly, so moving the clock past the retry delay below makes nothing
+      // due or stale: a stale skip also re-arms the report (it resets the
+      // retry clock), and would hide whether the delay itself did.
+      new CronStore(TEST_PATH).add({ name: "rec", schedule: { kind: "every", everyMs: 3_600_000 }, message: "x", sessionKey: "dm:alice" });
       const next = hangingAgent();
       const scheduler = new CronScheduler(next.agent, new CronStore(TEST_PATH));
       // Nothing reportToOwner does itself throws past its own catches, so the
@@ -355,11 +362,14 @@ describe("CronScheduler", () => {
       ));
       await new Promise((r) => setImmediate(r));
       expect(unhandled).toEqual([]);
-      // The in-flight guard was released: once the retry delay has passed, a
-      // later tick tries again.
+      // The in-flight guard was released, and the retry delay still holds: a
+      // tick before it has passed does not report, one after it does.
+      await tick(scheduler);
+      expect(report).toHaveBeenCalledTimes(1);
       retryDelayPasses();
       await tick(scheduler);
       expect(report).toHaveBeenCalledTimes(2);
+      expect(next.calls).toHaveLength(0); // nothing came due along the way
     } finally {
       process.off("unhandledRejection", onUnhandled);
     }
@@ -642,13 +652,14 @@ describe("CronScheduler", () => {
     const second = hangingAgent();
     const schedulerB = new CronScheduler(second.agent, storeB);
 
-    // Awaited: a gated tick returns before the scan. A scan that ran anyway
-    // would dispatch the hanging turn, and this await would never settle.
-    await tick(schedulerB);
+    // A gated tick returns before the scan. A scan that ran anyway would
+    // dispatch the hanging turn and never settle; tickSettles turns that
+    // into a failure that says so, instead of a 5s test timeout.
+    await tickSettles(schedulerB);
     expect(second.calls).toHaveLength(0);
 
     // Recovery succeeds on the next tick; the interrupted run is settled, not re-fired.
-    await tick(schedulerB);
+    await tickSettles(schedulerB);
     expect(recover).toHaveBeenCalledTimes(2);
     expect(second.calls).toHaveLength(0);
     expect(new CronStore(TEST_PATH).list()[0].lastStatus).toBe("interrupted");

@@ -101,13 +101,18 @@ function nextDaemon() {
   return { agent: agent as never, notices, turns };
 }
 
-/** Start a fresh scheduler on the same file, let its first tick and owner report land, stop it. */
+/**
+ * A fresh scheduler on the same file: its first tick (what `start()` runs),
+ * awaited, and the owner report that tick kicked off. That report is not part
+ * of the tick's promise, but its only await is this agent's already-resolved
+ * `notifyOwner` (the store is synchronous), so it has settled once the
+ * microtask queue drains, which one macrotask turn guarantees. No sleep,
+ * and a "no notice" answer is a real answer rather than "not yet".
+ */
 async function restartWith(path: string) {
   const next = nextDaemon();
-  const scheduler = new CronScheduler(next.agent, new CronStore(path));
-  scheduler.start();
-  await new Promise((r) => setTimeout(r, 30));
-  scheduler.stop();
+  await tick(new CronScheduler(next.agent, new CronStore(path)));
+  await new Promise((r) => setImmediate(r));
   return next;
 }
 

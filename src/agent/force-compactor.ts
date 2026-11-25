@@ -178,7 +178,7 @@ export class ForceCompactor {
       // Still inside the hold: the notes are on disk before any turn can run.
       // (A resume turn queued here waits for the hold like any other turn.)
       try {
-        if (report && !failure) this.deps.queueNote(key, formatTomoEvent("force-compacted", sessionNote(args, report, interrupted)));
+        if (report && changedAnything(report)) this.deps.queueNote(key, formatTomoEvent("force-compacted", sessionNote(args, report, interrupted, failure)));
       } catch (err) {
         log.warn({ err, key }, "Could not queue the forced-compaction note");
       }
@@ -195,8 +195,10 @@ export class ForceCompactor {
     const session = this.sessionName(key);
     let notice: OwnerText;
     if (failure || !report) {
-      log.error({ key, failure }, "Forced compaction did not compact anything");
-      notice = t("forceCompact.failed", { session, before: args.beforePct });
+      log.error({ key, failure }, "Forced compaction did not complete");
+      notice = report && changedAnything(report)
+        ? t("forceCompact.partial", { session, before: args.beforePct, after: Math.round((report.afterTokens / report.contextMax) * 100) })
+        : t("forceCompact.failed", { session, before: args.beforePct });
     } else {
       const after = Math.round((report.afterTokens / report.contextMax) * 100);
       const parts = [
@@ -229,11 +231,16 @@ export class ForceCompactor {
   }
 }
 
+function changedAnything(r: ForceCompactReport): boolean {
+  return !!r.pruned || r.summarized.length > 0 || r.archived.length > 0 || r.usageCapped > 0;
+}
+
 /** The `force-compacted` note the session reads on its next turn (for the model: English). Exported for tests. */
 export function sessionNote(
   args: { reason: ForceCompactReason; beforePct: number },
   report: ForceCompactReport,
   interrupted: readonly RunningTaskRecord[],
+  failure: string | null = null,
 ): string {
   const after = Math.round((report.afterTokens / report.contextMax) * 100);
   const why = args.reason === "prompt-too-long"
@@ -251,6 +258,7 @@ export function sessionNote(
   if (interrupted.length > 0) {
     lines.push(`It had to close the session for that, which stopped ${interrupted.length} background task(s); they are listed in the interrupted-agents note and resumable ones will be resumed.`);
   }
+  if (failure) lines.push(`It could not finish (${failure}); the rest of the history is as it was.`);
   if (!report.reachedSafe) lines.push("Context is still high: keep this turn short and run `tomo lcm daily` / prune when you can.");
   return lines.join("\n");
 }

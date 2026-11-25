@@ -7,6 +7,7 @@ export const notices = {
     doneStillHigh: "🗜️ {{session}}的上下文满了（{{before}}%）。Tomo 自己压缩了一轮，但仍约 {{after}}%，下一轮可能还要再压。",
     archived: "有一部分历史没能总结，改为归档（仍可搜索）。",
     agents_other: "为此停了 {{count}} 个后台任务，之后会续上。",
+    partial: "⚠️ {{session}}的上下文满了（{{before}}%）。Tomo 自己压缩了一部分（现在约 {{after}}%），但没能做完，详情见日志。",
     failed: "⚠️ {{session}}的上下文满了（{{before}}%），Tomo 没能自己压缩它。什么都没改，详情见日志。",
     gaveUp: "⚠️ {{session}}的上下文一直在涨满：过去一小时 Tomo 已经强制压缩了 {{count}} 次，暂时不再尝试。请看一下。",
     sessionDm: "你的对话",

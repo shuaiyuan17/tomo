@@ -4,6 +4,7 @@ import { getSdkSessionPath } from "../sessions/index.js";
 import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord } from "../jsonl.js";
 import { log } from "../logger.js";
 import { errorMessage } from "../error-text.js";
+import { computeContextStatsFromEvents } from "./stats.js";
 import {
   drainOldInodeAfterRename,
   readSinceOffsetFromFd,
@@ -94,12 +95,12 @@ export function cliAnchorUsage(events: readonly unknown[]): number | undefined {
  * records were changed. Pure over the entries (raw unparseable lines are
  * skipped untouched).
  */
-export function capStaleUsage(entries: SdkEntry[], ceiling: number, now: Date = new Date()): number {
-  const cap = Math.max(2, Math.floor(ceiling));
+export function capStaleUsage(entries: SdkEntry[], ceiling: number | ((index: number) => number), now: Date = new Date()): number {
   let changed = 0;
   for (let i = 0; i < entries.length; i++) {
     const e = entries[i];
     if (isRawJsonlLine(e)) continue;
+    const cap = Math.max(2, Math.floor(typeof ceiling === "number" ? ceiling : ceiling(i)));
     if (e.type !== "assistant" || !e.message || typeof e.message !== "object") continue;
     const usage = (e.message as { usage?: unknown }).usage;
     if (usage === null || typeof usage !== "object") continue;
@@ -142,7 +143,26 @@ export interface CapUsageResult {
  * that was on disk. Leaves no compact trigger: the caller has already closed
  * the live session. Nothing is written when nothing needs capping.
  */
-export function capStaleUsageInFile(args: { sdkSessionId: string; sdkSessionsDir: string; ceiling: number }): CapUsageResult {
+/**
+ * Per record: `overhead` plus the estimated content of the active chain up to
+ * and including it — what the context really held when that reply was
+ * written. The CLI adds its own estimate of everything AFTER its anchor, so a
+ * ceiling for the whole conversation would count that tail twice.
+ */
+export function ceilingsThrough(entries: SdkEntry[], overhead: number): (index: number) => number {
+  const through: number[] = [];
+  let sum = 0;
+  for (const e of entries) {
+    if (!isRawJsonlLine(e)) {
+      if (e.type === "system" && (e as { subtype?: string }).subtype === "compact_boundary") sum = 0;
+      else if (e.type === "user" || e.type === "assistant") sum += computeContextStatsFromEvents([e as never]).totalTokens;
+    }
+    through.push(sum);
+  }
+  return (i) => overhead + (through[i] ?? sum);
+}
+
+export function capStaleUsageInFile(args: { sdkSessionId: string; sdkSessionsDir: string; overhead: number }): CapUsageResult {
   const path = getSdkSessionPath(args.sdkSessionId, args.sdkSessionsDir);
   if (!existsSync(path)) return { success: false, capped: 0, error: "Session file not found" };
   const fd = openSync(path, "r");
@@ -170,11 +190,11 @@ export function capStaleUsageInFile(args: { sdkSessionId: string; sdkSessionsDir
     }
     if (partial) return { success: false, capped: 0, error: "Partial SDK write in flight; retry" };
     const all = [...events, ...late];
-    const capped = capStaleUsage(all, args.ceiling);
+    const capped = capStaleUsage(all, ceilingsThrough(all, args.overhead));
     if (capped === 0) return { success: true, capped: 0 };
     writeFileAtomicSync(path, all.map(serializeJsonlRecord).join("\n") + "\n");
     drainOldInodeAfterRename({ sourceFd: fd, startOffset: cursor, path, removedUuids: new Set(), summaryUuid: "", seenLateUuids });
-    log.info({ sessionId: args.sdkSessionId, capped, ceiling: args.ceiling }, "Capped stale usage readings after a forced compaction");
+    log.info({ sessionId: args.sdkSessionId, capped, overhead: args.overhead }, "Capped stale usage readings after a forced compaction");
     return { success: true, capped };
   } catch (err) {
     return { success: false, capped: 0, error: errorMessage(err) };

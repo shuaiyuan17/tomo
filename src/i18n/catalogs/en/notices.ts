@@ -10,6 +10,7 @@ export const notices = {
     archived: "Part of the history could not be summarized and was archived instead (still searchable).",
     agents_one: "1 background task was stopped for it and will be resumed.",
     agents_other: "{{count}} background tasks were stopped for it and will be resumed.",
+    partial: "⚠️ The context of {{session}} was full ({{before}}%). Tomo compacted part of it itself (now about {{after}}%) but could not finish; details are in the log.",
     failed: "⚠️ The context of {{session}} is full ({{before}}%) and Tomo could not compact it itself. Nothing was changed; details are in the log.",
     gaveUp: "⚠️ The context of {{session}} keeps filling up: Tomo has already force-compacted it {{count}} times in the last hour and stops trying for now. Please have a look.",
     sessionDm: "your conversation",

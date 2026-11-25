@@ -2207,6 +2207,20 @@ describe("LiveSessionManager forced compaction", () => {
     expect(sent).toEqual(["after"]);
   });
 
+  it("records the background work BEFORE interrupting a turn that would not end (interrupting empties the task set)", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.runWithRetry({ key: "dm:owner", prompt: "first" });
+    const first = mockState.instances[0];
+    first.busy = true;
+    const hold = manager.holdForForceCompact("dm:owner")!;
+    const seen: Array<boolean> = [];
+    const sid = await manager.quiesceForForceCompact(hold, () => { seen.push(first.interruptedWith === null && !first.closed); return true; }, 5);
+    expect(seen).toEqual([true]);
+    expect(first.interruptedWith).not.toBeNull();
+    expect(sid).toBe("sdk-1");
+    hold.release();
+  });
+
   it("aborts with the session untouched when beforeClose refuses", async () => {
     const manager = new LiveSessionManager(makeDeps());
     await manager.runWithRetry({ key: "dm:owner", prompt: "first" });

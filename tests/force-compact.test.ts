@@ -139,11 +139,26 @@ describe("stale usage cap (the CLI's local window check)", () => {
     const b = build({ usage: 977_000 });
     const before = await chain(b.sessionId);
     expect(cliAnchorUsage(fileEvents(b.sessionId))).toBe(977_203);
-    const r = capStaleUsageInFile({ sdkSessionId: b.sessionId, sdkSessionsDir, ceiling: 20_000 });
+    const r = capStaleUsageInFile({ sdkSessionId: b.sessionId, sdkSessionsDir, overhead: 2_000 });
     expect(r).toEqual({ success: true, capped: 1 });
-    expect(cliAnchorUsage(fileEvents(b.sessionId))).toBeLessThanOrEqual(20_000);
+    expect(cliAnchorUsage(fileEvents(b.sessionId))).toBe(2_000 + estimate(b.sessionId));
     expect(await chain(b.sessionId)).toEqual(before);
-    expect(capStaleUsageInFile({ sdkSessionId: b.sessionId, sdkSessionsDir, ceiling: 20_000 })).toEqual({ success: true, capped: 0 });
+    expect(capStaleUsageInFile({ sdkSessionId: b.sessionId, sdkSessionsDir, overhead: 2_000 })).toEqual({ success: true, capped: 0 });
+  });
+
+  it("caps the anchor at what the context held THROUGH it: the CLI adds the tail after it itself", () => {
+    const b = build({ usage: 977_000 });
+    const path = getSdkSessionPath(b.sessionId, sdkSessionsDir);
+    const events = fileEvents(b.sessionId);
+    const tail = { ...events.find((e) => e.type === "user"), uuid: randomUUID(), parentUuid: events.at(-1).uuid, timestamp: DAY(24, 23, 0), message: { role: "user", content: "x".repeat(40_000) } };
+    writeFileSync(path, [...events, tail].map((e) => JSON.stringify(e)).join("\n") + "\n");
+    capStaleUsageInFile({ sdkSessionId: b.sessionId, sdkSessionsDir, overhead: 2_000 });
+    const after = fileEvents(b.sessionId);
+    const anchor = cliAnchorUsage(after)!;
+    const tailTokens = estimateTokens("x".repeat(40_000));
+    expect(anchor).toBe(2_000 + estimate(b.sessionId) - tailTokens);
+    // What the CLI checks — anchor + its estimate of what follows — is the whole conversation once, not the tail twice.
+    expect(anchor + tailTokens).toBe(2_000 + estimate(b.sessionId));
   });
 });
 

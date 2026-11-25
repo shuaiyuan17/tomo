@@ -431,7 +431,7 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
   report.afterTokens = after;
   report.reachedSafe = after <= safeTokens;
   if (!stopped && !aborted()) {
-    const capped = capStaleUsageInFile({ sdkSessionId: o.sdkSessionId, sdkSessionsDir: o.sdkSessionsDir, ceiling: after });
+    const capped = capStaleUsageInFile({ sdkSessionId: o.sdkSessionId, sdkSessionsDir: o.sdkSessionsDir, overhead });
     if (capped.success) {
       report.usageCapped = capped.capped;
       // A run that changed nothing did not recover anything.

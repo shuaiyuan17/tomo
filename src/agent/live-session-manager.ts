@@ -827,11 +827,14 @@ export class LiveSessionManager {
     const closing = this.closingWait(key);
     if (closing) await closing;
     const session = this.liveSessions.get(key);
-    if (session?.isAlive() && session.isBusy() && !await withTimeout(session.waitForIdle(), idleTimeoutMs)) {
+    const stillBusy = !!session?.isAlive() && session.isBusy() && !await withTimeout(session.waitForIdle(), idleTimeoutMs);
+    // Recorded while the session (and so its task set) is still intact:
+    // interrupting or closing it empties the set the ledger mirrors.
+    if (!beforeClose()) return null;
+    if (stillBusy && session?.isAlive()) {
       log.warn({ key, idleTimeoutMs }, "Forced compaction: the running turn did not end in time; interrupting it");
       session.interrupt(new TurnInterruptedError());
     }
-    if (!beforeClose()) return null;
     const sdkSessionId = session?.getSessionId() ?? this.deps.getSdkSessionId(key) ?? null;
     if (session) {
       this.promptStale.delete(session);

@@ -158,13 +158,20 @@ describe("ForceCompactor run", () => {
     expect(fc.running("dm:owner")).toBeUndefined();
   });
 
-  it("reports a run that did not complete (a refused rewrite, a failed usage cap) as a failure, not a success", async () => {
-    const { deps } = makeDeps({ compact: vi.fn(async () => okReport({ ok: false, errors: ["archive rewrite: refused"] })) });
-    const fc = new ForceCompactor(deps);
+  it("reports a run that did not complete as a failure — and what it did change, if anything", async () => {
+    const none = makeDeps({ compact: vi.fn(async () => okReport({ ok: false, pruned: null, summarized: [], usageCapped: 0, errors: ["archive rewrite: refused"] })) });
+    const fc = new ForceCompactor(none.deps);
     fc.maybeStart("dm:owner", reading(990), "threshold");
     await fc.running("dm:owner");
-    expect(deps.queueNote).not.toHaveBeenCalled();
-    expect(String(deps.notifyOwner.mock.calls[0][0])).toMatch(/could not compact/);
+    expect(none.deps.queueNote).not.toHaveBeenCalled();
+    expect(String(none.deps.notifyOwner.mock.calls[0][0])).toMatch(/could not compact it itself. Nothing was changed/);
+
+    const part = makeDeps({ compact: vi.fn(async () => okReport({ ok: false, usageCapped: 0, errors: ["archive rewrite: refused"] })) });
+    const fc2 = new ForceCompactor(part.deps);
+    fc2.maybeStart("dm:owner", reading(990), "threshold");
+    await fc2.running("dm:owner");
+    expect(part.deps.queueNote.mock.calls[0][1]).toContain("could not finish");
+    expect(String(part.deps.notifyOwner.mock.calls[0][0])).toMatch(/compacted part of it.*could not finish/);
   });
 
   it("recovers a refusal right after a restart with the window the registry recorded", async () => {

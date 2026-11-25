@@ -325,6 +325,13 @@ export class LiveSession {
   private alive = true;
   lastResult: QueryResult | null = null;
   /**
+   * The SDK compacted this session (`compact_boundary`) after `lastResult`'s
+   * context reading was taken, so that reading overstates what is in context
+   * now. Cleared when the next turn's result replaces it. Read by the spawn
+   * gate (spawn-gate.ts), which treats such a reading as unknown.
+   */
+  compactedSinceLastResult = false;
+  /**
    * The last context window the SDK actually reported, carried across turns so
    * a transient `getContextUsage()` failure reports the real window rather
    * than a guess. 0 until the first successful reading.
@@ -1088,6 +1095,7 @@ export class LiveSession {
     }
 
     if (event.type === "system" && (event as { subtype?: string }).subtype === "compact_boundary") {
+      this.compactedSinceLastResult = true;
       const compact = event as { compact_metadata?: { pre_tokens?: number; post_tokens?: number } };
       log.info(
         { pre: compact.compact_metadata?.pre_tokens, post: compact.compact_metadata?.post_tokens },
@@ -1145,6 +1153,7 @@ export class LiveSession {
     }
 
     // Store result stats, get context usage, then resolve
+    this.compactedSinceLastResult = false;
     this.lastResult = {
       costUsd: turnCost,
       inputTokens: input,

@@ -27,7 +27,7 @@ import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERR
 import { SteerDeclinedError } from "./sdk-result.js";
 import { spawnDenial } from "./spawn-gate.js";
 import type { GroupSandboxConfig } from "./group-fs-policy.js";
-import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
+import { makeTurnBudget, sdkOptions, usesLcmCompact, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
 import { flattenSystemPrompt } from "../workspace/system-prompt-blocks.js";
 import { classifyPromptContextChange, type PromptContextLines } from "../workspace/prompt-context-diff.js";
@@ -594,6 +594,18 @@ export class LiveSessionManager {
     return operation;
   }
 
+  /**
+   * The spawn gate's context reading: the nudger's (`lastResult`), unless the
+   * SDK compacted the session since it was taken — a pre-compact number would
+   * keep the gate shut on context that is gone, so that counts as unknown
+   * until the next turn ends with a fresh reading.
+   */
+  spawnGateReading(key: string): QueryResult | null {
+    const session = this.liveSessions.get(key);
+    if (!session || session.compactedSinceLastResult) return null;
+    return session.lastResult;
+  }
+
   /** Last turn result for a session still in the map (context-nudge default). */
   lastResult(key: string): QueryResult | null {
     return this.liveSessions.get(key)?.lastResult ?? null;
@@ -987,7 +999,7 @@ export class LiveSessionManager {
       backgroundLaunchDenial: () => this.compactReservations.launchDenial(key),
       // The nudger's reading (lastResult), against the threshold read per call
       // so a config reload applies at once. Late-bound like the flag above.
-      spawnDenial: () => spawnDenial(this.lastResult(key), config.lcm.blockSpawnAtPct),
+      spawnDenial: () => spawnDenial(this.spawnGateReading(key), config.lcm.blockSpawnAtPct, usesLcmCompact(key)),
       ...(this.deps.resumeGate ? { resumeGate: (taskId: string) => this.deps.resumeGate!(key, taskId) } : {}),
     }, turnBudget, externalMcpServers);
 

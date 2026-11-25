@@ -24,6 +24,13 @@ describe("spawnDenial (the decision)", () => {
     expect(spawnDenial(at(79), 80)).toBeNull();
   });
 
+  it("a session lcm does not compact gets a refusal that does not point at lcm", () => {
+    const msg = spawnDenial(at(85), 80, false)!;
+    expect(msg).toContain("85%");
+    expect(msg).toContain("until this session is compacted");
+    expect(msg).not.toContain("lcm");
+  });
+
   it("0 and 100 turn it off", () => {
     expect(spawnDenial(at(99), 0)).toBeNull();
     expect(spawnDenial(at(99), 100)).toBeNull();

@@ -159,6 +159,7 @@ vi.mock("../src/agent/live-session.js", () => {
 
 vi.mock("../src/agent/sdk-options.js", () => ({
   makeTurnBudget: () => ({}),
+  usesLcmCompact: (key: string) => !key.startsWith("task:"),
   sdkOptions: (_server: unknown, _resume: unknown, _model: unknown, ctx: {
     sessionKey: string;
     onPromptContext?: (c: { memory: string[]; people: string[] }) => void;
@@ -606,6 +607,13 @@ describe("LiveSessionManager session lifecycle", () => {
     // Usage back under the threshold: open again, no latch.
     session.lastResult = { contextUsed: 790, contextMax: 1000 };
     expect(ctx.spawnDenial!()).toBeNull();
+    // An SDK compact since the reading was taken: the old number is stale, so
+    // unknown — no block — until the next turn's reading replaces it.
+    session.lastResult = { contextUsed: 950, contextMax: 1000 };
+    (session as unknown as { compactedSinceLastResult: boolean }).compactedSinceLastResult = true;
+    expect(ctx.spawnDenial!()).toBeNull();
+    (session as unknown as { compactedSinceLastResult: boolean }).compactedSinceLastResult = false;
+    session.lastResult = { contextUsed: 790, contextMax: 1000 };
     // The threshold is read per call (a config reload applies at once).
     const lcm = (mockConfig as unknown as { lcm: { blockSpawnAtPct: number } }).lcm;
     lcm.blockSpawnAtPct = 75;

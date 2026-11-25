@@ -10,6 +10,12 @@
  * background agents above the threshold lets the running ones drain, and the
  * compact through.
  *
+ * Every session type is gated, by the owner's choice: one rule, "no new
+ * background agents past 80%". On a session the harness does not compact with
+ * lcm (an SDK-compacted group, a sub-session) the refusal says so instead of
+ * pointing at lcm, and an SDK compact lifts the gate at once (the reading it
+ * made stale counts as unknown — LiveSession.compactedSinceLastResult).
+ *
  * What it does NOT touch: SendMessage (resuming / talking to an agent that
  * already exists), a foreground Agent call (`run_in_background: false`, which
  * ends inside the turn and never holds a compact off), every other tool
@@ -64,8 +70,11 @@ export function spawnGateEnabled(pct: number): boolean {
  * i18n: text for the model is not translated); the model relays it in the
  * conversation's language.
  */
-export function spawnGateMessage(pct: number): string {
-  return `Context is at ${pct}%: compact first (lcm compact / daily rollup), then start new background agents. ` +
+export function spawnGateMessage(pct: number, lcmManaged = true): string {
+  const first = lcmManaged
+    ? "compact first (lcm compact / daily rollup), then start new background agents"
+    : "no new background agents until this session is compacted";
+  return `Context is at ${pct}%: ${first}. ` +
     "Agents already running are unaffected; SendMessage to them, and a foreground agent (run_in_background: false), still work.";
 }
 
@@ -73,10 +82,10 @@ export function spawnGateMessage(pct: number): string {
  * Why a new background subagent must be refused right now, or null. Unknown
  * usage (no reading yet, no window, an estimated reading) never blocks.
  */
-export function spawnDenial(reading: ContextReading | null | undefined, blockAtPct: number): string | null {
+export function spawnDenial(reading: ContextReading | null | undefined, blockAtPct: number, lcmManaged = true): string | null {
   if (!spawnGateEnabled(blockAtPct)) return null;
   if (!reading || !(reading.contextMax > 0) || reading.contextEstimated) return null;
   const usedFrac = reading.contextUsed / reading.contextMax;
   if (usedFrac < blockAtPct / 100) return null;
-  return spawnGateMessage(Math.round(usedFrac * 100));
+  return spawnGateMessage(Math.round(usedFrac * 100), lcmManaged);
 }

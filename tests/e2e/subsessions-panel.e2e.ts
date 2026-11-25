@@ -34,8 +34,14 @@ beforeEach(async () => {
   mockSdk.responseFn = () => new Promise(() => {});
   await channel.start();
   browser = await chromium.launch(); page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-  await page.goto(`http://127.0.0.1:${supervisor.status().port}/?t=${readFileSync(resolve(mockConfig.tomoHome, "web-token"), "utf8").trim()}`);
-  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  // The page reads the list once it connects. Wait for that read to be answered: still in flight, the
+  // daemon can answer it after a test's spawn (the `subsessions` event that follows is debounced 250 ms,
+  // so this stale answer lands first), and a page.route the test installs meanwhile never sees it.
+  const firstList = page.waitForResponse((response) => new URL(response.url()).pathname === "/api/v1/subsessions", { timeout: 10_000 });
+  await Promise.all([firstList, (async () => {
+    await page.goto(`http://127.0.0.1:${supervisor.status().port}/?t=${readFileSync(resolve(mockConfig.tomoHome, "web-token"), "utf8").trim()}`);
+    await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  })()]);
 });
 afterEach(async () => { await browser?.close(); await agent.stop(); });
 

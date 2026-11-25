@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -12,6 +12,23 @@ import {
   sweepStaleRestartRequests,
   takePendingRestartRequest,
 } from "../src/restart-request.js";
+
+// Pass-through, except when a test arms `claimAfterRead`: then the file is
+// removed right after it is read, as if another process claimed it between
+// this module's read and its unlink.
+const race = vi.hoisted(() => ({ claimAfterRead: null as string | null }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const readFileSync = ((...args: Parameters<typeof actual.readFileSync>) => {
+    const out = actual.readFileSync(...args);
+    if (race.claimAfterRead !== null && args[0] === race.claimAfterRead) {
+      race.claimAfterRead = null;
+      actual.unlinkSync(args[0]);
+    }
+    return out;
+  }) as typeof actual.readFileSync;
+  return { ...actual, readFileSync, default: { ...actual, readFileSync } };
+});
 
 const DAEMON = 4242;
 let requestDir: string;
@@ -181,6 +198,58 @@ describe("end-of-turn restart fallback", () => {
       consumeRestartRequestFromToolResult(result, "dm:shuai", requestDir, expired, (d) => discards.push(d.reason)),
     ).toBeNull();
     expect(discards).toEqual(["expired"]);
+  });
+
+  it("reports a marker whose request file another process already claimed", () => {
+    const discards: unknown[] = [];
+    const request = createRestartRequest({ sessionKey: "dm:shuai", daemonPid: DAEMON, reason: "x" }, requestDir);
+    const result = formatRestartRequestResult(request);
+    // Someone else sharing the directory takes it first (a test run against the
+    // live home did exactly this to the daemon's own request).
+    expect(takePendingRestartRequest("dm:shuai", requestDir)).toEqual(request);
+
+    expect(
+      consumeRestartRequestFromToolResult(result, "dm:shuai", requestDir, undefined, (d) => discards.push(d)),
+    ).toBeNull();
+    expect(discards).toEqual([
+      { reason: "missing", requestId: request.id, path: join(requestDir, `${request.id}.json`) },
+    ]);
+  });
+
+  it("reports a request claimed by another process between the read and the unlink", () => {
+    const discards: unknown[] = [];
+    const request = createRestartRequest({ sessionKey: "dm:shuai", daemonPid: DAEMON, reason: "x" }, requestDir);
+    const path = join(requestDir, `${request.id}.json`);
+    race.claimAfterRead = path;
+
+    expect(
+      consumeRestartRequestFromToolResult(formatRestartRequestResult(request), "dm:shuai", requestDir, undefined, (d) => discards.push(d)),
+    ).toBeNull();
+    expect(race.claimAfterRead).toBeNull(); // the race really ran
+    expect(discards).toEqual([{ reason: "missing", requestId: request.id, path }]);
+  });
+
+  it("reports an expired request claimed elsewhere before it could be dropped as missing", () => {
+    const discards: string[] = [];
+    const request = createRestartRequest({ sessionKey: "dm:shuai", daemonPid: DAEMON, reason: "x" }, requestDir);
+    race.claimAfterRead = join(requestDir, `${request.id}.json`);
+    const expired = Date.parse(request.requestedAt) + RESTART_REQUEST_TTL_MS;
+
+    expect(
+      consumeRestartRequestFromToolResult(formatRestartRequestResult(request), "dm:shuai", requestDir, expired, (d) => discards.push(d.reason)),
+    ).toBeNull();
+    expect(race.claimAfterRead).toBeNull();
+    expect(discards).toEqual(["missing"]);
+  });
+
+  it("does not call a malformed marker file missing", () => {
+    const discards: string[] = [];
+    const id = "11111111-2222-4333-8444-555555555555";
+    writeFileSync(join(requestDir, `${id}.json`), "{not json", "utf-8");
+    expect(
+      consumeRestartRequestFromToolResult(`TOMO_RESTART_REQUEST:${id}`, "dm:shuai", requestDir, undefined, (d) => discards.push(d.reason)),
+    ).toBeNull();
+    expect(discards).toEqual([]);
   });
 
   it("reports what the startup sweep threw away", () => {

@@ -60,8 +60,9 @@ interface SdkEvent extends TranscriptEvent {
 function loadEvents(sdkSessionId: string, sdkSessionsDir: string): SdkEvent[] {
   const path = getSdkSessionPath(sdkSessionId, sdkSessionsDir);
   if (!existsSync(path)) return [];
-  // `null` or an array is valid JSON and comes back as a value in read-only mode.
-  return readJsonlFileSync<SdkEvent>(path).filter((e) => e !== null && typeof e === "object" && !Array.isArray(e));
+  // Lines that are valid JSON but not an object (`null`, an array) are skipped
+  // by the reader itself (`isJsonlRecord`).
+  return readJsonlFileSync<SdkEvent>(path);
 }
 
 /** ISO week tag for a Date (YYYY-Www). Matches Python's isocalendar. */

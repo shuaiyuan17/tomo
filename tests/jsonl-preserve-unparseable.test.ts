@@ -77,8 +77,9 @@ describe("parseJsonl", () => {
     const records = parseJsonl(scalars, { preserveUnparseable: true });
     expect(records.map(isRawJsonlLine)).toEqual([true, true, true, false]);
     expect(records.map(serializeJsonlRecord).join("\n") + "\n").toBe(scalars);
-    // Read-only mode is unchanged: it still hands `null` out, as before.
-    expect(parseJsonl(scalars)).toEqual([null, 42, "hello", { real: true }]);
+    // Read-only mode skips them like any malformed line: no reader can use a
+    // record that is not an object.
+    expect(parseJsonl(scalars)).toEqual([{ real: true }]);
   });
 
   it("carries an array line — valid JSON, but not a record either", () => {
@@ -86,7 +87,7 @@ describe("parseJsonl", () => {
     const records = parseJsonl(text, { preserveUnparseable: true });
     expect(isRawJsonlLine(records[1])).toBe(true);
     expect(serializeJsonlRecord(records[1])).toBe("[1,2,3]");
-    expect(parseJsonl(text)).toEqual([{ a: 1 }, [1, 2, 3], { b: 2 }]);   // read-only: still a value
+    expect(parseJsonl(text)).toEqual([{ a: 1 }, { b: 2 }]);   // read-only: skipped
   });
 
   it("preserves when the flag is a non-literal boolean that happens to be true", () => {
@@ -195,7 +196,10 @@ describe("compactSession preserves unparseable lines", () => {
     expect(parseJsonl(readFileSync(path, "utf-8"))).toHaveLength(after.length - 1);
   });
 
-  it("survives and preserves a bare `null` line mid-file", () => {
+  it.each([
+    ["preserves it", false],
+    ["drops it with --drop-unparseable", true],
+  ])("survives a bare `null` line mid-file and %s", (_title, dropUnparseable) => {
     const events = [
       mkUserEvent(null, "2026-04-01T00:00:00.000Z", "one"),
       mkAssistantEvent(null, "2026-04-01T00:00:01.000Z", "two"),
@@ -215,10 +219,14 @@ describe("compactSession preserves unparseable lines", () => {
       expectedLastUuid: events[2].uuid,
       summary: "compacted",
       transcriptPath: archivePath,
+      dropUnparseable,
     });
 
     expect(result.success).toBe(true);
-    expect(readFileSync(path, "utf-8").trimEnd().split("\n")).toContain("null");
+    const after = readFileSync(path, "utf-8").trimEnd().split("\n");
+    expect(after.includes("null")).toBe(!dropUnparseable);
+    // The conversation indices are counted the same way in both modes.
+    expect(after.some((l) => l.includes(events[0].uuid))).toBe(true);
   });
 
   it("drops the torn line only when --drop-unparseable is asked for", () => {

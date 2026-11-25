@@ -2,7 +2,7 @@
 
 ## What is Tomo
 
-Tomo is a personal AI assistant that lives in messaging apps (Telegram, iMessage). It runs as a long-running Node.js daemon on the user's machine, powered by the Claude Agent SDK. The optional local web channel shares the owner's DM session; group conversations are read-only in the browser. `tomo watch` also provides runtime observability.
+Tomo is a personal AI assistant that lives in messaging apps (Telegram, iMessage). It runs as a long-running Node.js daemon on the user's machine, powered by the Claude Agent SDK. The optional local web channel shares the owner's DM session; group conversations are read-only in the browser, and the owner's own sub-sessions (`task:` keys) can be written from the Tasks rail. `tomo watch` also provides runtime observability.
 
 Published to npm as `tomo-ai`. Installed globally via `npm install -g tomo-ai`.
 

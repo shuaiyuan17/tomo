@@ -1,6 +1,6 @@
 import { lazy, useEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronRight, TerminalIcon, X } from "lucide-react";
-import type { WebSession, WebTask } from "../../src/web/protocol.js";
+import type { WebSession, WebSubsession, WebTask } from "../../src/web/protocol.js";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { cn } from "@/lib/utils";
@@ -13,21 +13,32 @@ import { ModelBadge } from "./model-badge.js";
 import { type TaskRow, type TreeGuide, buildTaskView, elapsed, formatElapsed, lastStep, stateLabel, taskKind, treeGuides } from "./tasks.js";
 import { i18n, useTranslation } from "./i18n/index.js";
 import { toolIcon } from "./tool-calls.js";
+import { isOpenSubsession, subsessionState, subsessionStateLabel } from "./subsessions.js";
+import { IdPill, SubsessionView, type SubsessionSend } from "./subsession-view.js";
 
 /** A task's transcript view: its own chunk, fetched when a task is opened. */
 const SubagentView = lazy(() => import("./subagent-view.js").then((m) => ({ default: m.SubagentView })));
 
+/** The owner's sub-sessions as the rail shows them: the list, its revision (an open chat re-reads on it), and how to write to one. */
+export interface RailSubsessions { tasks: WebSubsession[]; revision: number; send?: SubsessionSend }
+
 /**
  * Shows what is running. The list itself offers nothing to act on; an opened task of the owner
- * conversation can be stopped or moved to the background (`control`, see TaskControls).
+ * conversation can be stopped or moved to the background (`control`, see TaskControls). The
+ * owner's sub-sessions come first, in their own group; one opens as a chat in the rail.
  */
-export function TasksPanel({ tasks, sessions, onClose, footer, control }: { tasks: WebTask[]; sessions: WebSession[]; onClose?: () => void; footer?: ReactNode; control?: TaskControl }) {
+export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessions }: { tasks: WebTask[]; sessions: WebSession[]; onClose?: () => void; footer?: ReactNode; control?: TaskControl; subsessions?: RailSubsessions }) {
   const { t } = useTranslation("tasks");
   const [showAmbient, setShowAmbient] = useState(false);
   /** Open "N shell commands done" rows, per session and parent. */
   const [openFolds, setOpenFolds] = useState<Record<string, boolean>>({});
   const [opened, setOpened] = useState<{ sessionId: string; taskId: string }>();
   const [cameBack, setCameBack] = useState(false);
+  const [openedSub, setOpenedSub] = useState<string>();
+  // As for a task: a sub-session that leaves the list (archived) keeps its last copy while open.
+  const lastSub = useRef<WebSubsession | undefined>(undefined);
+  const openSub = openedSub !== undefined ? subsessions?.tasks.find((task) => task.id === openedSub) ?? (lastSub.current?.id === openedSub ? lastSub.current : undefined) : undefined;
+  lastSub.current = openSub;
   // The board drops a task a minute after it ends; an open view keeps the
   // last copy it saw (as ended) rather than vanishing under the reader.
   const lastOpened = useRef<WebTask | undefined>(undefined);
@@ -47,6 +58,10 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control }: { task
   const close = onClose && <Button data-tasks-close variant="ghost" size="icon" aria-label={t("close")} title={t("closeTitle")} onClick={onClose}
     className="size-8 rounded-lg max-[600px]:size-10 hover:bg-foreground/[0.07] active:bg-foreground/[0.11] [&_svg:not([class*='size-'])]:size-5"><X strokeWidth={1.75} /></Button>;
   // Task list ↔ task view slide: in from the right when opening, from the left when going back.
+  if (openSub && subsessions) return <div className="relative flex min-h-0 flex-1 flex-col">
+    <div className="absolute top-0 right-1">{close}</div>
+    <SubsessionView key={openSub.id} summary={openSub} revision={subsessions.revision} send={subsessions.send} onBack={() => { setCameBack(true); setOpenedSub(undefined); }} />
+  </div>;
   if (openTask) return <div className="motion-from-right relative flex min-h-0 flex-1 flex-col">
     <div className="absolute top-0 right-1">{close}</div>
     <ChunkBoundary what={t("view")} className="min-h-0 flex-1"><SubagentView key={`${openTask.sessionId}/${openTask.taskId}`} task={openTask} control={control} onBack={() => { setCameBack(true); setOpened(undefined); }} /></ChunkBoundary>
@@ -60,7 +75,11 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control }: { task
       <Checkbox checked={showAmbient} onCheckedChange={(value) => setShowAmbient(value === true)} className="size-3.5 rounded-[4px]" />
       {view.hiddenAmbient ? t("watchersCount", { count: view.hiddenAmbient }) : t("watchers")}</label>}
     <div className="min-h-0 flex-1 overflow-y-auto pr-2.5 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] focus-visible:outline-offset-0" tabIndex={0} aria-label={t("list")}>
-      {view.groups.length === 0 ? <p className="m-0 px-2.5 text-[13px] text-muted-foreground">{t("empty")}</p>
+      {subsessions && subsessions.tasks.length > 0 && <div className="mb-4" data-testid="subsessions">
+        <p className="mt-1 mb-1 px-2.5 tracking-[0.02em] text-[11px] text-muted-foreground">{t("subsession.group")}</p>
+        <ul className="m-0 list-none space-y-0.5 p-0">{subsessions.tasks.map((task) => <SubsessionCard key={task.id} task={task} onOpen={() => setOpenedSub(task.id)} />)}</ul>
+      </div>}
+      {view.groups.length === 0 ? (subsessions?.tasks.length ? null : <p className="m-0 px-2.5 text-[13px] text-muted-foreground">{t("empty")}</p>)
         : view.groups.map((group) => <div className="[&+&]:mt-4" key={group.sessionId}>
           <p className="mt-1 mb-1 px-2.5 tracking-[0.02em] text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{group.title}{group.kind === "group" ? <span>{t("groupTag")}</span> : null}</p>
           <GroupRows sessionId={group.sessionId} rows={group.rows} now={now} openFolds={openFolds} setOpenFolds={setOpenFolds}
@@ -123,6 +142,24 @@ function TaskCard({ task, depth, guide, now, onOpen, motion }: { task: WebTask; 
       </p>
     </button>
     {guide && <TreeLines depth={depth} guide={guide} elbowY={18} />}
+  </li>;
+}
+
+/** A sub-session: its id, title, state and the line it last reported. Opens as a chat. */
+function SubsessionCard({ task, onOpen }: { task: WebSubsession; onOpen: () => void }) {
+  const { t } = useTranslation("tasks");
+  const state = subsessionState(task);
+  const open = isOpenSubsession(task);
+  return <li data-subsession-row={task.id}>
+    <button type="button" onClick={onOpen} title={t("subsession.openTitle", { id: task.id })}
+      className="block w-full cursor-pointer rounded-xl px-2.5 py-2 text-left transition-[background-color,opacity] duration-200 hover:bg-foreground/[0.06] focus-visible:outline-offset-0">
+      <span className={cn("block text-[13px] leading-normal font-medium [overflow-wrap:anywhere]", !open && "text-muted-foreground")}>
+        <IdPill id={task.id} className="mr-1.5 align-[1px]" />{task.title}</span>
+      <p className="mt-0.5 mb-0 line-clamp-2 text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]">
+        {state === "working" ? <span className="shimmer">{subsessionStateLabel(task)}</span>
+          : <span className={cn(state === "waitingOwner" && "font-medium text-foreground/80")}>{subsessionStateLabel(task)}</span>}
+        {task.progress && open && <> · {task.progress}</>}</p>
+    </button>
   </li>;
 }
 

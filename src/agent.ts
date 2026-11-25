@@ -20,6 +20,8 @@ import { SubsessionService, type OwnerMessageResult, type TaskTurnOutcome } from
 import { parseTaskAddress, type TaskAddress } from "./agent/subsessions/address.js";
 import { taskCommandReply } from "./agent/subsessions/commands.js";
 import { SubsessionStore } from "./agent/subsessions/store.js";
+import { subsessionDetail, subsessionList, subsessionView } from "./web/subsessions-view.js";
+import type { WebSubsessionAccess } from "./channels/web.js";
 import { buildSubsessionPrompt } from "./agent/subsessions/prompt.js";
 import { createTodoLink } from "./agent/subsessions/todo-link.js";
 import { TodoStore } from "./todos/store.js";
@@ -517,7 +519,9 @@ export class Agent {
   private createSubsessionService(): SubsessionService {
     const cron = createTaskCronLink(CRON_STORE_PATH);
     return new SubsessionService({
-      store: new SubsessionStore(join(config.tomoHome, "data", "subsessions.json")),
+      store: new SubsessionStore(join(config.tomoHome, "data", "subsessions.json"), {
+        onChange: () => { for (const listener of this.subsessionListeners) listener(); },
+      }),
       config: () => config.subsessions,
       runTaskTurn: (key, prompt, opts) => this.runTaskTurn(key, prompt, opts),
       sendToScope: async (parentKey, text, taskKey, noteFrom, harnessPrefix) => {
@@ -1934,6 +1938,52 @@ export class Agent {
   requestOwnerCompact(sessionKey: string, onSettled?: (outcome: "done" | "unverified" | "failed") => void): "queued" | "already_requested" | "no_owner" {
     if (!config.owner) return "no_owner";
     return this.contextNudger.requestCompact(sessionKey, onSettled);
+  }
+
+  /** Listeners told after every write of the sub-session table (the web Tasks rail). */
+  private readonly subsessionListeners = new Set<() => void>();
+  /** Be told whenever the sub-session table changes; returns the unsubscribe. */
+  onSubsessionsChanged(listener: () => void): () => void {
+    this.subsessionListeners.add(listener);
+    return () => { this.subsessionListeners.delete(listener); };
+  }
+
+  /**
+   * The owner's sub-sessions as the web UI reaches them: listed and read for
+   * the owner's own scope only, and written exactly as `/s <id> <text>` from
+   * the owner's DM writes (SubsessionService.ownerMessage). Undefined while
+   * sub-sessions are off. Nothing here can reach a task of another scope, a
+   * group, or the owner's DM session itself.
+   */
+  webSubsessions(): WebSubsessionAccess | undefined {
+    const service = this.subsessions;
+    if (!service) return undefined;
+    const working = (key: string) => this.liveSessionManager.hasTurnInFlight(key);
+    return {
+      list: () => {
+        const scope = this.router.ownerSessionKey();
+        if (!scope || !service.available()) return { available: false, tasks: [] };
+        try { return { available: true, tasks: subsessionList(service.list(scope), scope, Date.now(), working) }; }
+        catch { return { available: false, tasks: [] }; }
+      },
+      get: (id) => {
+        const scope = this.router.ownerSessionKey();
+        // null: the table cannot be read right now (try again), not "no such task".
+        if (!scope || !service.available()) return null;
+        let record;
+        try { record = service.get(id); } catch { return null; }
+        return record ? subsessionDetail(record, scope, Date.now(), working(record.sessionKey)) : undefined;
+      },
+      message: (id, text, requestId) => {
+        const scope = this.router.ownerSessionKey();
+        if (!scope) return { ok: false, reason: "unknown" };
+        const result = service.ownerMessage(scope, id, text, { messageId: `web:${requestId}` });
+        if (!result.ok) return { ok: false, reason: result.reason };
+        if (!result.duplicate) log.info({ channel: "web", task: result.record.id, status: result.record.status }, "Owner message handed to a sub-session");
+        const task = subsessionView(result.record, scope, Date.now(), working(result.record.sessionKey));
+        return task ? { ok: true, duplicate: result.duplicate, task } : { ok: false, reason: "unknown" };
+      },
+    };
   }
 
   /** The web Study's view of a session key's model. Never creates a session. */

@@ -76,12 +76,15 @@ export class SubsessionStore {
   private readonly now: () => number;
   /** Tests: an illegal transition throws instead of being logged and refused. */
   private readonly strict: boolean;
+  /** Called after every successful write (the web UI's live sub-session list); never throws into a write. */
+  private readonly onChange: (() => void) | undefined;
 
-  constructor(readonly path: string, opts: { now?: () => number; strictTransitions?: boolean } = {}) {
+  constructor(readonly path: string, opts: { now?: () => number; strictTransitions?: boolean; onChange?: () => void } = {}) {
     this.lockPath = `${path}.lock`;
     this.backupPath = `${path}.bak`;
     this.now = opts.now ?? Date.now;
     this.strict = opts.strictTransitions ?? false;
+    this.onChange = opts.onChange;
   }
 
   /** How the last read went. `null` before the first read. */
@@ -334,6 +337,8 @@ export class SubsessionStore {
       // The primary is good; the next successful write refreshes the backup.
       log.warn({ err, path: this.backupPath }, "Could not refresh the sub-session table backup");
     }
+    // Inside the lock, so a listener must only schedule work, never read back synchronously.
+    try { this.onChange?.(); } catch (err) { log.warn({ err }, "Sub-session change listener failed"); }
   }
 }
 

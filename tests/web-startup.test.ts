@@ -24,6 +24,8 @@ vi.mock("../src/logger.js", () => ({ log: { info: (message: string) => fixture.m
 vi.mock("../src/process-handlers.js", () => ({ installBootstrapErrorHandlers: () => {}, installProcessErrorHandlers: () => {}, raiseFatal: (err: unknown) => { throw err; } }));
 vi.mock("../src/agent.js", () => ({ Agent: class {
   prepareOwner() {}
+  webSubsessions() { return undefined; }
+  onSubsessionsChanged() { return () => {}; }
   addChannel(channel: Channel) { fixture.registered.push(channel); channel.onMessage(async () => true); }
   async start() { for (const channel of fixture.registered) await channel.start(); }
 } }));

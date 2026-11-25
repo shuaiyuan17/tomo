@@ -9,7 +9,7 @@ import { markDefiniteFailure } from "./types.js";
 import { watchBus, type WatchBus } from "../watch/bus.js";
 import type { WatchEvent, WatchTask } from "../watch/protocol.js";
 import type { SdkSignal } from "../agent/sdk-signals.js";
-import { isGroupSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
+import { isGroupSessionKey, isTaskSessionKey, legacySessionKeysForBinding } from "../sessions/keys.js";
 import { webSessionId } from "../web/owner.js";
 import { WebEvents } from "../web/events.js";
 import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
@@ -23,6 +23,7 @@ import { FALLBACK_MIME, formatFileMarker, sanitizeAttachmentFilename, saveInboun
 import type { ImageAttachment } from "./types.js";
 import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request-journal.js";
 import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
+import type { SubsessionMessageInput, WebSubsession, WebSubsessionDetail, WebSubsessionList, WebSubsessionMessageResult } from "../web/protocol.js";
 import type { WebCredentialRequest, WebCredentialResult, WebCredentialSubmit, WebHome, WebModelChangeResult, WebModelView, WebPermissionDecision, WebPermissionRequest, WebPermissionResult, WebPermissionRevokeResult } from "../web/protocol.js";
 import { modelLabel } from "../models.js";
 import { formatReactionMarker, formatReplyContextMarker } from "./text-utils.js";
@@ -63,6 +64,26 @@ export interface WebPermissionAccess {
   /** Take back an Always allow by grant id: "unknown" (no such grant), or whether config.json was written. */
   revoke(grantId: string): "revoked" | "unknown" | "unwritable";
 }
+
+/**
+ * The owner's sub-sessions as the browser reaches them (Agent.webSubsessions):
+ * the owner's own scope only. `message` is the owner writing to one, exactly
+ * as `/s <id> <text>` from their DM does.
+ */
+export interface WebSubsessionAccess {
+  list(): WebSubsessionList;
+  /** undefined: no such task the owner may see; null: the task table cannot be read right now. */
+  get(id: string): WebSubsessionDetail | undefined | null;
+  message(id: string, text: string, requestId: string):
+    | { ok: true; duplicate: boolean; task: WebSubsession }
+    | { ok: false; reason: "unknown" | "ended" | "full" | "unreadable" };
+}
+/** HTTP status of each refused sub-session message; the code names the reason. */
+const SUBSESSION_REFUSAL: Record<"unknown" | "ended" | "full" | "unreadable", [number, string]> = {
+  unknown: [404, "subsession_not_found"], ended: [409, "subsession_ended"], full: [429, "subsession_inbox_full"], unreadable: [503, "subsessions_unavailable"],
+};
+/** Sub-session changes come in bursts (one turn writes the table several times): the browser hears of them at most this often. */
+export const SUBSESSION_EVENT_MS = 250;
 
 /** The daemon side of Tomo's home (src/home/service.ts) as the browser reaches it. */
 export interface WebHomeAccess {
@@ -153,6 +174,8 @@ export class WebChannel implements Channel {
   private readonly homeAccess: WebHomeAccess | undefined;
   private readonly credentials: WebCredentialAccess | undefined;
   private readonly permissions: WebPermissionAccess | undefined;
+  private readonly subsessionAccess: WebSubsessionAccess | undefined;
+  private subsessionTimer: ReturnType<typeof setTimeout> | undefined;
   /** Live and recently ended subagents/background tasks, per visible session. */
   readonly tasks: TaskBoard;
 
@@ -204,11 +227,14 @@ export class WebChannel implements Channel {
       credentials?: WebCredentialAccess;
       /** The permission broker's cards; absent: 409 on an answer. */
       permissions?: WebPermissionAccess;
+      /** The owner's sub-sessions (Tasks rail, and writing to one); absent: sub-sessions are off. */
+      subsessions?: WebSubsessionAccess;
       /** Where Tomo's reactions on web messages are kept (JSON); absent: in memory only. */
       reactionsPath?: string } = {}) {
     this.homeAccess = options.home;
     this.credentials = options.credentials;
     this.permissions = options.permissions;
+    this.subsessionAccess = options.subsessions;
     this.models = options.models;
     this.sessionKeys = options.sessionKeys;
     this.usageReader = options.usage;
@@ -670,6 +696,48 @@ export class WebChannel implements Channel {
     return { key, owner: false };
   }
 
+  /** The owner's sub-sessions for the Tasks rail. */
+  subsessionList(): WebSubsessionList {
+    if (!this.subsessionAccess || !this.ownerId) return { available: false, tasks: [] };
+    return this.subsessionAccess.list();
+  }
+
+  /** One of the owner's sub-sessions, opened: its brief, conversation and report. */
+  subsession(id: string): WebSubsessionDetail {
+    if (!this.subsessionAccess) throw new WebError(503, "subsessions_unavailable");
+    if (!this.ownerId) throw new WebError(409, "owner_setup_required");
+    const detail = this.subsessionAccess.get(id);
+    if (detail === null) throw new WebError(503, "subsessions_unavailable");
+    if (!detail) throw new WebError(404, "subsession_not_found");
+    return detail;
+  }
+
+  /**
+   * The owner writes to one of their sub-sessions: the one write the browser
+   * has on a session other than the owner's DM, and only on a `task:` key the
+   * owner's DM owns (Agent.webSubsessions). Groups stay read-only. No receipt
+   * or journal: the task table records it durably (and drops a repeat of the
+   * same request id) before this returns.
+   */
+  messageSubsession(id: string, input: SubsessionMessageInput): WebSubsessionMessageResult {
+    if (this.closed || this.tornDown) throw new WebError(503, "ingress_closed");
+    if (!this.subsessionAccess) throw new WebError(503, "subsessions_unavailable");
+    if (!this.ownerId || !this.owner) throw new WebError(409, "owner_setup_required");
+    const result = this.subsessionAccess.message(id, input.text, input.requestId);
+    if (!result.ok) { const [status, code] = SUBSESSION_REFUSAL[result.reason]; throw new WebError(status, code); }
+    return { status: result.duplicate ? "duplicate" : "delivered", task: result.task };
+  }
+
+  /** The sub-session table changed: tell the browser (coalesced, SUBSESSION_EVENT_MS). */
+  publishSubsessionsChanged(): void {
+    if (this.tornDown || this.subsessionTimer) return;
+    this.subsessionTimer = setTimeout(() => {
+      this.subsessionTimer = undefined;
+      if (!this.tornDown) this.publishQuietly({ type: "subsessions" });
+    }, SUBSESSION_EVENT_MS);
+    this.subsessionTimer.unref?.();
+  }
+
   /** Tomo's home for the Home page: always a valid scene (the last good one, or the starter). */
   home(): WebHome {
     if (!this.homeAccess || this.tornDown) throw new WebError(503, "home_unavailable");
@@ -823,6 +891,8 @@ export class WebChannel implements Channel {
     for (const lookup of this.modelLookups.values()) clearTimeout(lookup.timer);
     this.modelLookups.clear();
     clearInterval(this.ownerKeyTimer);
+    clearTimeout(this.subsessionTimer);
+    this.subsessionTimer = undefined;
     try { await this.lifecycle?.stop(); } catch { /* Optional process cleanup cannot prevent daemon shutdown. */ }
   }
   async stop(): Promise<void> { this.closeIngestion(); await this.quiesce(); await this.teardown(); }
@@ -992,6 +1062,11 @@ export class WebChannel implements Channel {
     if (event.type === "cron.fired" || event.type === "cron.done") { this.events.publish({ type: "cron" }); return; }
     if (event.type === "sdk") { this.observeSignal(event.sessionKey, event.signal); return; }
     if (!("sessionKey" in event) || !event.sessionKey) return;
+    // A sub-session's turn starting or ending changes only its "working" mark in the rail.
+    if (isTaskSessionKey(event.sessionKey)) {
+      if (event.type === "turn.start" || event.type === "turn.end") this.publishSubsessionsChanged();
+      return;
+    }
     const sessionId = this.sessionId(event.sessionKey);
     if (!sessionId) return;
     if (event.type === "turn.join") {

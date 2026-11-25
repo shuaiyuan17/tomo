@@ -1,3 +1,4 @@
+import type { SubsessionMessageInput, WebSubsessionMessageResult } from "../../src/web/protocol.js";
 import type { EventEnvelope, MessageInput, WebBootstrap, WebCompactResult, WebCredentialResult, WebCredentialSubmit, WebEvent, WebPermissionDecision, WebPermissionResult, WebRequest, TaskAction, WebSnapshot, WebStopResult, WebTaskActionResult } from "../../src/web/protocol.js";
 
 export class ApiError extends Error {
@@ -74,6 +75,11 @@ export function stopTurn(bootstrap: WebBootstrap, refresh: () => Promise<WebBoot
 /** Stop one running task of the owner conversation, or move a foreground one to the background. */
 export function taskAction(sessionId: string, taskId: string, action: TaskAction, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebTaskActionResult> {
   return mutate<WebTaskActionResult>(`/sessions/${sessionId}/tasks/${encodeURIComponent(taskId)}/${action}`, "POST", {}, bootstrap, refresh);
+}
+
+/** The owner writes to one of their sub-sessions (the same as `/s <id> <text>`). Same CSRF/epoch rules as sending a message. */
+export function messageSubsession(id: string, input: SubsessionMessageInput, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebSubsessionMessageResult> {
+  return mutate<WebSubsessionMessageResult>(`/subsessions/${encodeURIComponent(id)}/messages`, "POST", input, bootstrap, refresh);
 }
 
 /** Ask Tomo to compact the owner's session. Same CSRF/epoch rules as sending a message. */

@@ -83,6 +83,66 @@ export interface HistoryMessage extends SessionMessage { id: string }
 export interface HistoryPage { messages: HistoryMessage[]; nextCursor: string | null; revision?: string }
 export type WebTaskState = "running" | "completed" | "failed" | "stopped" | "ended";
 /** A subagent / background task for the read-only "working now" panel. */
+/**
+ * The owner's sub-sessions (long tasks on `task:<id>` keys, src/agent/subsessions)
+ * as the Tasks rail lists them. Archived ones are never shown; ended ones only
+ * for SUBSESSION_ENDED_VISIBLE_MS (src/web/subsessions-view.ts).
+ */
+export type WebSubsessionStatus = "queued" | "active" | "waiting" | "finished" | "cancelled" | "failed";
+export interface WebSubsession {
+  /** `s1`, `s2`, … */
+  id: string;
+  title: string;
+  status: WebSubsessionStatus;
+  /** Set exactly when status is `waiting`. */
+  waitingOn?: "owner" | "external";
+  /** The task's one-line status (task_progress). */
+  progress?: string;
+  /** A turn is running on it right now. */
+  working: boolean;
+  createdAt: number;
+  lastActivityAt: number;
+  endedAt?: number;
+  /** Active time so far, the current stretch included. */
+  activeMs: number;
+  /** Changes whenever its conversation does: an open chat re-reads on a new value. */
+  revision: number;
+  /** The owner may write to it (not cancelled or failed). */
+  writable: boolean;
+}
+/** One line of the owner ↔ task conversation (what the owner wrote, and what the task said back through its tools). */
+export interface WebSubsessionEntry {
+  seq: number;
+  at: number;
+  from: "owner" | "task";
+  /** owner: "message"; task: the tool that said it, or "fallback". */
+  kind: "message" | "notify" | "reply" | "ask" | "fallback";
+  text: string;
+  /** Files sent with it (count only). */
+  files?: number;
+}
+export interface WebSubsessionDetail extends WebSubsession {
+  brief: string;
+  /** The brief was cut for the browser. */
+  briefTruncated?: boolean;
+  /** The owner's own words, quoted at spawn. */
+  quote?: string[];
+  waitingReason?: string;
+  model?: string;
+  conversation: WebSubsessionEntry[];
+  report?: string;
+  reportTruncated?: boolean;
+}
+/** `available: false`: sub-sessions are off, or their table cannot be read right now. */
+export interface WebSubsessionList { available: boolean; tasks: WebSubsession[] }
+/** The owner's message to one of their sub-sessions (the same as `/s <id> <text>` in their DM). */
+export const subsessionMessageSchema = z.object({ requestId: z.uuid(), text: z.string().trim().min(1).max(16_000) }).strict();
+export type SubsessionMessageInput = z.infer<typeof subsessionMessageSchema>;
+/** `duplicate`: this request id had already been delivered (a retry); nothing was added. */
+export interface WebSubsessionMessageResult { status: "delivered" | "duplicate"; task: WebSubsession }
+/** A sub-session id as the routes accept it. */
+export const SUBSESSION_ID = /^s[1-9]\d{0,8}$/;
+
 export interface WebTask {
   sessionId: string;
   taskId: string;
@@ -372,6 +432,8 @@ export type WebEvent =
   | { type: "invalidate"; sessionId?: string }
   /** The cron schedule may have changed (a job fired or finished). No payload: the page re-reads /cron. */
   | { type: "cron" }
+  /** The owner's sub-sessions changed (status, progress, a message either way). No payload: the page re-reads /subsessions. */
+  | { type: "subsessions" }
   | { type: "tool"; sessionId: string; tool: string; state: "started" | "completed" | "failed" }
   | { type: "typing"; sessionId: string; active: boolean }
   /** The latest compact request changed state. */
@@ -567,6 +629,12 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("credential-submit"), epoch: z.uuid(), id: z.uuid(), input: credentialSubmitSchema }).strict(),
   /** The permission card's answer, for the permission broker. */
   z.object({ method: z.literal("permission-decide"), epoch: z.uuid(), id: z.uuid(), decision: permissionDecisionSchema.shape.decision }).strict(),
+  /** The owner's sub-sessions, for the Tasks rail. */
+  z.object({ method: z.literal("subsessions") }).strict(),
+  /** One of the owner's sub-sessions, with its conversation. */
+  z.object({ method: z.literal("subsession"), id: z.string().regex(SUBSESSION_ID) }).strict(),
+  /** The owner writes to one of their sub-sessions (task: keys only; groups stay read-only). */
+  z.object({ method: z.literal("subsession-message"), epoch: z.uuid(), id: z.string().regex(SUBSESSION_ID), input: subsessionMessageSchema }).strict(),
   /** Revoke a group's Always allow, for the permission broker. */
   z.object({ method: z.literal("permission-revoke"), epoch: z.uuid(), grantId: permissionRevokeSchema.shape.grantId }).strict(),
 ]);

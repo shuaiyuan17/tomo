@@ -11,7 +11,7 @@ import { CompressedAssets, IMMUTABLE_CACHE, localizeIndexHtml, pickEncoding } fr
 import { WebAccess } from "./access.js";
 import { webConfigSchema } from "./config.js";
 import { credentialSubmitSchema, permissionDecisionSchema, permissionRevokeSchema, cronChangeSchema, HOME_SNAPSHOT_MAX_BYTES, homeSnapshotSchema, MAX_BODY_BYTES, MAX_BUFFER_BYTES, mcpReconnectSchema, messageInputSchema, modelChangeSchema, WebError,
-  type EventEnvelope, type Rpc, type TaskAction, type WebCompaction, type WebHome, type WebMcpLive, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage } from "./protocol.js";
+  type EventEnvelope, type Rpc, type TaskAction, type WebCompaction, type WebHome, type WebMcpLive, type WebRequest, type WebSync, type WebTaskAccess, type WebUsage, SUBSESSION_ID, subsessionMessageSchema } from "./protocol.js";
 import { homeSceneSchema } from "../home/scene.js";
 import { decodeSnapshotPng } from "../home/snapshot.js";
 
@@ -51,6 +51,8 @@ export interface HttpDependencies {
 /** Idle socket timeout; every RPC deadline (e.g. USAGE_RPC_TIMEOUT_MS) stays under it. */
 export const SOCKET_TIMEOUT_MS = 30_000;
 
+const SUBSESSION_PATH = new RegExp(`^/api/v1/subsessions/(${SUBSESSION_ID.source.slice(1, -1)})$`);
+const SUBSESSION_MESSAGE_PATH = new RegExp(`^/api/v1/subsessions/(${SUBSESSION_ID.source.slice(1, -1)})/messages$`);
 const TASK_ACTION_PATH = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/tasks\/([A-Za-z0-9_-]{1,64})\/(stop|background)$/;
 
 export async function startWebHttp(port: number, deps: HttpDependencies) {
@@ -234,6 +236,9 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           json(res, 200, home);
           return;
         }
+        if (url.pathname === "/api/v1/subsessions") { json(res, 200, await deps.rpc({ method: "subsessions" })); return; }
+        const subsession = SUBSESSION_PATH.exec(url.pathname);
+        if (subsession) { json(res, 200, await deps.rpc({ method: "subsession", id: subsession[1] })); return; }
         const homeAsset = /^\/api\/v1\/home\/assets\/([^/]+)$/.exec(url.pathname);
         if (homeAsset) {
           const file = deps.data.homeAsset(homeAsset[1]);
@@ -368,6 +373,20 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
         const epoch = req.headers["x-tomo-epoch"];
         if (typeof epoch !== "string" || !/^[a-f0-9-]{36}$/.test(epoch)) throw new WebError(409, "epoch_required");
         json(res, 200, await deps.rpc({ method: "task-action", epoch, sessionId, taskId, action: action as TaskAction }));
+        return;
+      } else if (req.method === "POST" && SUBSESSION_MESSAGE_PATH.test(url.pathname)) {
+        // The owner writes to one of their sub-sessions. Same gate as a message
+        // (CSRF, the owner, the daemon epoch); the daemon accepts only a task
+        // the owner's DM owns. Every other non-DM session stays read-only.
+        csrf.verify(req, session!);
+        const parsed = subsessionMessageSchema.safeParse(await body(req));
+        if (!parsed.success) throw new WebError(400, "invalid_message");
+        const { ownerId } = deps.data.catalog();
+        if (!ownerId) throw new WebError(409, "owner_setup_required");
+        const epoch = req.headers["x-tomo-epoch"];
+        if (typeof epoch !== "string" || !/^[a-f0-9-]{36}$/.test(epoch)) throw new WebError(409, "epoch_required");
+        const id = SUBSESSION_MESSAGE_PATH.exec(url.pathname)![1];
+        json(res, 200, await deps.rpc({ method: "subsession-message", epoch, id, input: parsed.data }));
         return;
       } else if (req.method === "POST" && url.pathname === "/api/v1/uploads") {
         // An image or file for the owner's next message: the same gate as

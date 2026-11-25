@@ -31,6 +31,19 @@ export function isRawJsonlLine(value: unknown): value is RawJsonlLine {
  * loses its blank lines (JSONL has no semantics for them and the SDK never
  * writes them). Every line that carries content survives.
  */
+/**
+ * True for a value a JSONL reader may hand out as a record: a plain object,
+ * not `null`, a bare number or string, or an array. Every line in the files
+ * Tomo reads is an object; one that parses to anything else is corrupt (a
+ * hand edit, a half-written line that happens to be valid JSON), and handing
+ * it to a consumer that reads `record.role` or `evt.type` throws on the
+ * message path. Read-only consumers skip such lines exactly like unparseable
+ * ones; `preserveUnparseable` rewriters carry them verbatim.
+ */
+export function isJsonlRecord(value: unknown): value is object {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 export function serializeJsonlRecord(value: unknown): string {
   return isRawJsonlLine(value) ? value[RAW_JSONL_LINE] : JSON.stringify(value);
 }
@@ -89,12 +102,13 @@ export function parseJsonl<T = unknown>(
       if (opts?.preserveUnparseable) records.push({ [RAW_JSONL_LINE]: line });
       continue;
     }
-    if (opts?.preserveUnparseable && (parsed === null || typeof parsed !== "object" || Array.isArray(parsed))) {
+    if (!isJsonlRecord(parsed)) {
       // A line that is valid JSON but not an object — `null`, a bare number, a
-      // quoted string, an array — is not a record any rewriting caller can
-      // reason about, and `null` in particular makes every `evt.type` read
-      // throw. Carry it verbatim rather than handing it out as a `T`.
-      records.push({ [RAW_JSONL_LINE]: line });
+      // quoted string, an array — is not a record any caller can reason about,
+      // and `null` in particular makes every `evt.type` read throw. Readers
+      // skip it like a malformed line; rewriters carry it verbatim rather than
+      // handing it out as a `T`.
+      if (opts?.preserveUnparseable) records.push({ [RAW_JSONL_LINE]: line });
       continue;
     }
     records.push(parsed as T);
@@ -189,8 +203,8 @@ export function reportRawJsonlLines(
 /**
  * Yield JSONL records newest-first, reading the file backwards in fixed-size
  * chunks so consumers can early-exit without paying for the whole file.
- * Malformed lines are skipped (same tolerance as parseJsonl). A missing file
- * yields nothing.
+ * Malformed lines, and lines that are not a JSON object, are skipped (same
+ * tolerance as parseJsonl). A missing file yields nothing.
  *
  * The carry between chunks is kept as bytes, not text: a UTF-8 code point can
  * straddle a chunk boundary, and decoding it half-read would corrupt it.
@@ -232,11 +246,8 @@ export function* iterateJsonlBackwardsSync<T = unknown>(
       for (let i = lines.length - 1; i >= 0; i--) {
         const trimmed = lines[i].trim();
         if (!trimmed) continue;
-        try {
-          yield JSON.parse(trimmed) as T;
-        } catch {
-          // Skip malformed lines
-        }
+        const record = parseJsonlRecord<T>(trimmed);
+        if (record !== undefined) yield record;
       }
     }
   } finally {
@@ -255,7 +266,18 @@ export function readJsonlTailSync<T = unknown>(path: string, maxRecords: number)
   return records.reverse();
 }
 
-/** Read the first parseable record of a JSONL file, or undefined. */
+/** One line as a record, or undefined when it is malformed or not an object. */
+function parseJsonlRecord<T>(line: string): T | undefined {
+  try {
+    const parsed: unknown = JSON.parse(line);
+    return isJsonlRecord(parsed) ? parsed as T : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Read the first record (a line that parses to a JSON object) of a JSONL
+ *  file, or undefined. */
 export function readFirstJsonlRecordSync<T = unknown>(path: string): T | undefined {
   let fd: number;
   try {
@@ -281,23 +303,13 @@ export function readFirstJsonlRecordSync<T = unknown>(path: string): T | undefin
         const line = pending.subarray(start, nl).toString("utf-8").trim();
         start = nl + 1;
         if (!line) continue;
-        try {
-          return JSON.parse(line) as T;
-        } catch {
-          // Skip malformed lines
-        }
+        const record = parseJsonlRecord<T>(line);
+        if (record !== undefined) return record;
       }
       pending = pending.subarray(start);
     }
     const last = pending.toString("utf-8").trim();
-    if (last) {
-      try {
-        return JSON.parse(last) as T;
-      } catch {
-        // Skip malformed trailing line
-      }
-    }
-    return undefined;
+    return last ? parseJsonlRecord<T>(last) : undefined;
   } finally {
     closeSync(fd);
   }

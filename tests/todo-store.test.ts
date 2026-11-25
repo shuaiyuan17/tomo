@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -7,6 +7,22 @@ const ROOT = mkdtempSync(join(tmpdir(), "tomo-test-todo-store-"));
 afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 
 vi.mock("../src/config.js", () => ({ config: { tomoHome: ROOT }, TOMO_HOME: ROOT }));
+
+// An injected read failure, root-safe (chmod refuses nothing as root): while
+// `eaccesPath` is set, reading exactly that file throws EACCES.
+const fsFault = vi.hoisted(() => ({ eaccesPath: null as string | null }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    readFileSync: ((p: Parameters<typeof actual.readFileSync>[0], opts?: unknown) => {
+      if (fsFault.eaccesPath !== null && String(p) === fsFault.eaccesPath) {
+        throw Object.assign(new Error(`EACCES: permission denied, open '${String(p)}'`), { code: "EACCES" });
+      }
+      return (actual.readFileSync as (a: unknown, b: unknown) => unknown)(p, opts);
+    }) as typeof actual.readFileSync,
+  };
+});
 
 const { TodoStore, TodoRuleError, TodoStoreReadError, parseReviewWhen, todosDir } = await import("../src/todos/store.js");
 const { DEFAULT_TODOS } = await import("../src/todos/limits.js");
@@ -194,6 +210,48 @@ describe("session scope", () => {
   });
 });
 
+describe("relink (the sub-session link's harness-only write)", () => {
+  const file = () => join(dir, "todos.json");
+
+  it("writes nothing when the item already waits on the same party with the same next step", () => {
+    const item = add({ waiting_on: "owner", next: "Answer the question" });
+    const before = readFileSync(file(), "utf-8");
+    const mtime = statSync(file()).mtimeMs;
+    expect(store.relink(item.id, "owner", "Answer the question", NOW + DAY)).toEqual(item);
+    expect(readFileSync(file(), "utf-8")).toBe(before);
+    expect(statSync(file()).mtimeMs).toBe(mtime);
+  });
+
+  it("moves the review date only when waiting_on changes", () => {
+    const item = add({ waiting_on: "me" });
+    const sameParty = store.relink(item.id, "me", "A new next step", NOW + DAY)!;
+    expect(sameParty).toMatchObject({ next: "A new next step", waiting_on: "me", review_at: item.review_at });
+    expect(sameParty.updated_at).toBe(new Date(NOW + DAY).toISOString());
+
+    const moved = store.relink(item.id, "owner", "Wait for the owner", NOW + 2 * DAY)!;
+    expect(moved.waiting_on).toBe("owner");
+    expect(Date.parse(moved.review_at)).toBe(NOW + 2 * DAY + DEFAULT_TODOS.reviewDaysWaiting * DAY);
+    expect(store.list()).toEqual([moved]);
+  });
+
+  it("answers undefined for an item that is not open, and writes nothing", () => {
+    const item = add();
+    store.resolve(item.id, { action: "done", by: "owner" }, NOW);
+    const before = readFileSync(file(), "utf-8");
+    expect(store.relink(item.id, "owner", "Too late")).toBeUndefined();
+    expect(store.relink("t-99", "owner", "Never existed")).toBeUndefined();
+    expect(readFileSync(file(), "utf-8")).toBe(before);
+  });
+
+  it("holds the next step to the same rules as an add", () => {
+    const item = add();
+    expectRule(() => store.relink(item.id, "me", "y".repeat(DEFAULT_TODOS.nextMaxChars + 1)), /next is 201 characters/);
+    expectRule(() => store.relink(item.id, "me", "  "), /next is required/);
+    expectRule(() => store.relink(item.id, "someone" as never, "x"), /waiting_on must be one of/);
+    expect(store.list()).toEqual([item]);
+  });
+});
+
 describe("an unreadable store is an error, never an empty list", () => {
   const corruptions: Array<[string, string]> = [
     ["not JSON", "{ nope"],
@@ -218,15 +276,35 @@ describe("an unreadable store is an error, never an empty list", () => {
     });
   }
 
-  it.skipIf(process.getuid?.() === 0)("an unreadable file (EACCES) is an error too", () => {
+  it("an unreadable file (any error but ENOENT, here EISDIR) is an error too, and nothing is written", () => {
+    // A directory at the file's path, not chmod 000: the suite runs as root in
+    // CI containers, where chmod refuses nothing. Any read error other than
+    // ENOENT must refuse the same way EACCES would.
     add();
-    chmodSync(join(dir, "todos.json"), 0o000);
+    const file = join(dir, "todos.json");
+    const content = readFileSync(file, "utf-8");
+    rmSync(file);
+    mkdirSync(file);
+    expect(() => store.list()).toThrow(TodoStoreReadError);
+    expect(() => add()).toThrow(TodoStoreReadError);
+    expect(readdirSync(file)).toEqual([]);
+    rmSync(file, { recursive: true });
+    writeFileSync(file, content);
+    expect(store.list()).toHaveLength(1);
+  });
+
+  it("an unreadable file (EACCES, injected) is an error too, and nothing is written", () => {
+    add();
+    const file = join(dir, "todos.json");
+    const content = readFileSync(file, "utf-8");
+    fsFault.eaccesPath = file;
     try {
       expect(() => store.list()).toThrow(TodoStoreReadError);
       expect(() => add()).toThrow(TodoStoreReadError);
     } finally {
-      chmodSync(join(dir, "todos.json"), 0o600);
+      fsFault.eaccesPath = null;
     }
+    expect(readFileSync(file, "utf-8")).toBe(content);
     expect(store.list()).toHaveLength(1);
   });
 });

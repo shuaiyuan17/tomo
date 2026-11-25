@@ -472,8 +472,9 @@ export class CronScheduler {
         // process will not repeat it) and keep trying. Residual ambiguity: if
         // the daemon restarts while in this state the run token is still
         // unacknowledged, so recovery treats the run as interrupted — a
-        // one-shot is disabled rather than re-fired, a recurring job gets one
-        // [resumed] fire. Both are the safe reading of "we do not know".
+        // one-shot is parked rather than re-fired, a recurring job is recorded
+        // interrupted and waits for its next slot. Both are the safe reading
+        // of "we do not know".
         log.error({ err, jobId, runId: pending.runId }, "Cron job could not be parked after a failed outcome write");
       }
     }

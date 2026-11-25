@@ -407,6 +407,16 @@ describe("synthetic rejection and exception in a real process", () => {
     expect(code).toBe(0);
   });
 
+  it("a startup rejection nobody awaits is SURVIVED by the handlers — the half-started daemon", { timeout: 60_000 }, async () => {
+    // This is what `cli.ts`'s sync parse() + an async start action produce
+    // if the command does not catch: the failure is logged as a stray
+    // rejection and the process lives on.
+    const { code, stdout } = await runChild("startup-swallowed");
+    expect(stdout).toContain(`marker=${UNHANDLED_REJECTION_MARKER}`);
+    expect(stdout).toContain("ALIVE");
+    expect(code).toBe(0);
+  });
+
   it("the start command routes its failure through raiseFatal: exit 1, origin=startup", { timeout: 60_000 }, async () => {
     const { code, stdout, stderr } = await runChild("startup-fatal");
     expect(code).toBe(1);
@@ -423,5 +433,4 @@ describe("synthetic rejection and exception in a real process", () => {
     expect(stderr).toContain(UNCAUGHT_EXCEPTION_MARKER);
     expect(stderr).toContain("synthetic uncaught exception");
   });
-
 });

@@ -135,8 +135,9 @@ describe("performStop against real child processes", () => {
     wait: (p, t) => waitForExit(p, t, 50),
     // Not DAEMON_STOP_TIMEOUT_MS: the wedged-daemon case would then take 60s.
     // The budget's VALUE is asserted above; this is about process semantics,
-    // so it only has to sit well above the cooperative child's 200 ms.
-    timeoutMs: 600,
+    // so it only has to sit well above the cooperative child's 200 ms, with
+    // room for a loaded CI host.
+    timeoutMs: 1_500,
   });
 
   function child(script: string): Promise<ChildProcess> {
@@ -152,7 +153,7 @@ describe("performStop against real child processes", () => {
 
   it("waits for a slow but cooperative daemon and reports success", async () => {
     // Exits ~200ms after SIGTERM, like a daemon finishing agent.stop(): slow,
-    // but under the 600 ms budget.
+    // but under the 1.5 s budget.
     const c = await child(
       `process.on("SIGTERM", () => setTimeout(() => process.exit(0), 200));`
       + `setInterval(() => {}, 1000); console.log("ready");`,

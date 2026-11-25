@@ -1237,18 +1237,24 @@ describe("LiveSession error results", () => {
     expect(session.isAlive()).toBe(true);
   });
 
-  // Every other error_* subtype is a failed turn; the budget one names its
-  // limit. (The max-turns test above shows the session stays reusable.)
+  // Every other error_* subtype is a failed turn too (the budget one names
+  // its limit), and the session takes the next message as usual.
   it.each([
     ["error_max_budget_usd", "I hit the spending limit for this turn before finishing."],
     ["error_during_execution", /stopped early/],
     ["error_max_structured_output_retries", /stopped early/],
-  ])("rejects a %s result as a failed turn", async (subtype, message) => {
+  ])("rejects a %s result as a failed turn, and the session stays usable", async (subtype, message) => {
     const { session, harness } = makeSession();
     const p = session.send("go");
     await waitFor(() => harness.inputs.length === 1);
     harness.pushEvent(errorResult(subtype));
     await expect(p).rejects.toThrow(message);
+
+    const again = session.send("again");
+    await waitFor(() => harness.inputs.length === 2);
+    harness.pushEvent(assistantEvent("fine now"));
+    harness.pushEvent(resultEvent());
+    await expect(again).resolves.toBe("fine now");
   });
 
   it("rejects a success result flagged is_error with the API error text, even after earlier blocks", async () => {

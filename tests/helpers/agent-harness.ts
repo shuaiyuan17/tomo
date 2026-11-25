@@ -189,6 +189,8 @@ export function resetConfig(overrides: Partial<typeof mockConfig> = {}) {
     sessionModelOverrides: {},
     // Fresh per reset: an "Always allow" writes into the live object.
     groupSandbox: { groups: {} },
+    // Fresh per reset too, so a test that mutates it in place cannot leak.
+    credentialBroker: { enabled: false },
     effort: null,
     sessionEffortOverrides: {},
     groupSecret: null,
@@ -232,6 +234,11 @@ export async function seedSession(agent: AgentType, channel: MockChannel, chatId
 /** The legacy-shaped owner binding most suites write into `identities`. */
 export function ownerIdentity(name: string, channels: Record<string, string>) {
   return { name, channels, replyPolicy: "last-active" };
+}
+
+/** How many SDK `query()` calls (live sessions built) there have been. */
+export function queryCallCount(): number {
+  return (sdkMockModule.query as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
 }
 
 /** The `options` the most recent SDK `query()` call was built with. */

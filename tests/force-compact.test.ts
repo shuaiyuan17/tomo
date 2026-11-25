@@ -205,6 +205,16 @@ describe("selectOldestStretch", () => {
     expect(s2.text).toContain("Morning: decided X.");
   });
 
+  it("gives the block a tag of its own when a same-day block sits AFTER the stretch (its expansion would remove unseen events)", () => {
+    const b = build({ chars: 4000 });
+    const events = fileEvents(b.sessionId);
+    const lastOf22 = events.findIndex((e) => e.uuid === b.uuidsByDay.get(22)!.at(-1));
+    events.splice(lastOf22 + 1, 0, { type: "user", uuid: "late", isCompactSummary: true, blockTag: "daily 2026-11-22", timestamp: DAY(22, 23, 0), message: { role: "user", content: "[daily 2026-11-22]\n\nevening" } });
+    const s = selectOldestStretch(events, { freshTail: 4, maxInputTokens: 3_000 })!;
+    expect(s.blockTag).toMatch(/^forced 2026-11-22 /);
+    expect(s.existingBlock).toBeUndefined();
+  });
+
   it("starts after the last SDK compact boundary (nothing before it is on the chain)", () => {
     const b = build({ perDay: 2 });
     const events = fileEvents(b.sessionId);

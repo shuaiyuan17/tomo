@@ -3685,9 +3685,12 @@ export class Agent {
    * the next start), and a background turn brings it to the model now. A
    * sub-session's note waits for its own next turn.
    */
-  private reportForceInterrupted(key: string, records: RunningTaskRecord[]): void {
+  private reportForceInterrupted(key: string, current: RunningTaskRecord[]): void {
     const ledger = this.runningAgents;
     if (!ledger) return;
+    // Everything still owed for the key (an earlier note that could not be
+    // stored included): the acknowledgement below drops all of it.
+    const records = ledger.pendingBySession().get(key) ?? current;
     const autoResume = config.interruptedAgentsAutoResume
       ? { failed: new Set(records.filter((r) => isResumable(r) && ledger.resumeCount(key, r.taskId) >= MAX_AUTO_RESUMES).map((r) => r.taskId)) }
       : undefined;

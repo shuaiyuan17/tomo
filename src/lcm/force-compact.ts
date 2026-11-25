@@ -277,12 +277,20 @@ export function selectOldestStretch(events: Ev[], opts: { freshTail: number; max
   for (let i = 0; i < events.length; i++) if (isConv(events[i])) convIdx.set(i, conv++);
   const first = chosen[0];
   const last = chosen[chosen.length - 1];
-  const existing = events.find((e) => e.isCompactSummary && e.blockTag === blockTag);
+  // The rewrite absorbs every block with the same tag, and everything between
+  // it and the range. A same-day block BEFORE the stretch only spans non-raw
+  // events (the stretch starts at the oldest raw one); one AFTER it would pull
+  // in events the summary call never saw — then the block gets a tag of its own.
+  const sameDay = events.map((e, i) => (e.isCompactSummary && e.blockTag === blockTag ? i : -1)).filter((i) => i >= 0);
+  const tag = sameDay.some((i) => i > last)
+    ? `forced ${day} ${localStamp(events[first].timestamp).slice(11)}`
+    : blockTag;
+  const existing = tag === blockTag ? events.find((e) => e.isCompactSummary && e.blockTag === blockTag) : undefined;
   const existingBlock = existing ? textOfContent(existing.message?.content, "\n").replace(/^\[[^\]\n]*\]\s*/, "").trim() : undefined;
   const lines = chosen.map((i) => renderEventForSummary(events[i])).filter(Boolean);
   if (existingBlock) lines.unshift(`[earlier summary of ${day}, to be merged into the new block]\n${existingBlock}`);
   return {
-    blockTag,
+    blockTag: tag,
     fromConv: convIdx.get(first)!,
     toConv: convIdx.get(last)!,
     firstUuid: events[first].uuid,

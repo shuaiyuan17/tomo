@@ -3659,8 +3659,12 @@ export class Agent {
    */
   private scheduleInterruptedAgentsRetry(keys: Set<string>): void {
     if (this.interruptedAgentsRetryTimer) clearTimeout(this.interruptedAgentsRetryTimer);
+    // stop() may already have run (it can land while start() awaits the
+    // channels): never arm a timer after shutdown.
+    if (this.stopping) return;
     this.interruptedAgentsRetryTimer = setTimeout(() => {
       this.interruptedAgentsRetryTimer = undefined;
+      if (this.stopping) return;
       try {
         this.retryInterruptedAgentsNotes(keys);
       } catch (err) {

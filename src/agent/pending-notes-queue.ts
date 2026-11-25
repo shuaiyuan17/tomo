@@ -258,6 +258,9 @@ export class PendingNotesQueue {
    */
   settle(sessionKey: string, prefix: string): void {
     if (!prefix) return;
+    // Reload first, while this batch still counts as in flight, so a stored
+    // copy of one of its notes is recognised as delivered (see retryLoad).
+    this.retryLoad(sessionKey);
     const batch = this.takeInFlight(sessionKey, prefix);
     if (batch && batch.notes.length > 0) this.persist(sessionKey);
   }
@@ -290,6 +293,7 @@ export class PendingNotesQueue {
    */
   private putBack(sessionKey: string, drainedPrefix: string, interrupted: boolean): void {
     if (!drainedPrefix) return;
+    this.retryLoad(sessionKey); // as in settle: before the batch leaves the in-flight list
     const batch = this.takeInFlight(sessionKey, drainedPrefix);
     if (!batch) {
       // Already settled or put back (or never drained here): nothing to return.

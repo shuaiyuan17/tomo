@@ -324,11 +324,24 @@ describe("PendingNotesQueue while the stored notes cannot be read", () => {
     queue.queueNote("k", "report s1#1");
     const prefix = queue.drain("k");
     store.failReads = false;
-    expect(queue.persistNow("k")).toBe(true);
+    // The first touch once the store reads again is the settle itself.
     queue.settle("k", prefix);
 
     expect(store.getPendingNotes("k")).toEqual([]);
     expect(queue.drain("k")).toBe("");
+  });
+
+  it("the same holds when the batch is put back: one copy, not two", () => {
+    const store = new UnreadableStore();
+    store.notes.set("k", ["report s1#1"]);
+    const queue = new PendingNotesQueue(store);
+
+    queue.queueNote("k", "report s1#1");
+    const prefix = queue.drain("k");
+    store.failReads = false;
+    queue.restoreInterrupted("k", prefix);
+
+    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nreport s1#1`]);
   });
 });
 

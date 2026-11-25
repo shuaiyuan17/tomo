@@ -1,13 +1,16 @@
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import {
   appendToTomoEventBody,
   formatTomoEvent,
   parseTomoEvent,
   stripLeadingTomoEvents,
   isHarnessEventText,
+  isOwnerAudienceNote,
   isoTimestampWithOffset,
+  markOwnerAudience,
   type TomoEventType,
 } from "../src/tomo-event.js";
+import { INTERRUPTED_NOTE_MARKER } from "../src/agent/pending-notes-queue.js";
 
 describe("formatTomoEvent", () => {
   it("produces the envelope with type and ts", () => {
@@ -27,6 +30,8 @@ describe("formatTomoEvent", () => {
     const m = /ts="([^"]+)"/.exec(out);
     expect(m).not.toBeNull();
     expect(m![1]).toMatch(/^2026-07-04T09:05:02[+-]\d{2}:\d{2}$/);
+    // The stamp names the same instant, whatever the host zone.
+    expect(new Date(m![1]).getTime()).toBe(ts.getTime());
   });
 
   it("escapes XML-special characters in the name attribute", () => {
@@ -37,40 +42,52 @@ describe("formatTomoEvent", () => {
 });
 
 describe("isoTimestampWithOffset", () => {
+  // `process.env.TZ` is read per call by V8's date code, so a test can move
+  // the host zone. A UTC container would otherwise print `+00:00` for every
+  // case and hide a wrong sign or a dropped half hour.
+  afterEach(() => vi.unstubAllEnvs());
+
   it("formats with a colon-separated UTC offset", () => {
     expect(isoTimestampWithOffset(new Date(2026, 0, 15, 23, 59, 59)))
       .toMatch(/^2026-01-15T23:59:59[+-]\d{2}:\d{2}$/);
   });
+
+  it.each([
+    // zone, instant, expected local stamp
+    ["UTC", "2026-01-15T12:00:00Z", "2026-01-15T12:00:00+00:00"],
+    ["Asia/Kolkata", "2026-01-15T12:00:00Z", "2026-01-15T17:30:00+05:30"],
+    ["America/St_Johns", "2026-01-15T12:00:00Z", "2026-01-15T08:30:00-03:30"],
+    // Daylight saving: the same zone half a year later.
+    ["America/St_Johns", "2026-07-15T12:00:00Z", "2026-07-15T09:30:00-02:30"],
+    // The local date can differ from the UTC date.
+    ["Pacific/Auckland", "2026-01-15T12:00:00Z", "2026-01-16T01:00:00+13:00"],
+  ])("in %s renders %s as %s, naming the same instant", (zone, instant, expected) => {
+    vi.stubEnv("TZ", zone);
+    const out = isoTimestampWithOffset(new Date(instant));
+    expect(out).toBe(expected);
+    expect(new Date(out).getTime()).toBe(new Date(instant).getTime());
+  });
 });
 
-describe("parseTomoEvent — round trip per producer type", () => {
-  const cases: Array<{ type: TomoEventType; body: string; name?: string }> = [
-    { type: "heartbeat", body: "It is Fri, Jul 4, 09:00 PDT. Read CONTINUITY.md.\n\nscript output line 1\nline 2" },
-    { type: "restart", body: "Restarted. Reason: config change via /restart" },
-    { type: "cron", body: 'Scheduled task "daily-backup" triggered. Run the backup.', name: "daily-backup" },
-    { type: "lcm-rollup", body: "An LCM rollup is due. The completed period `daily 2026-07-03` has 42 raw events ready to consolidate.", name: "daily 2026-07-03" },
-    { type: "context-nudge", body: "Context usage is at 72% (144000/200000 tokens). Run `tomo lcm prune-tools`.", name: "prune" },
-    { type: "summon", body: 'Alice summoned you into the group chat "Dinner" (telegram:-987).', name: "telegram:-987" },
-    { type: "summon-reminder", body: 'Summoned-group message. To reply in the group, call send_message with mode "direct".' },
-    { type: "summon-expired", body: 'Your summon into the group "Dinner" expired after inactivity.', name: "telegram:-987" },
-    { type: "dismiss", body: 'You have been dismissed from the group "Dinner".', name: "telegram:-987" },
-    { type: "audience", body: "Audience switched — the previous message was from the private DM.", name: "switch" },
-    { type: "errors", body: "Recent Tomo errors before this turn (newest last, capped):\n- [error] boom" },
-    { type: "direct-send", body: 'You sent the following message to this conversation earlier as a direct send: "hi"' },
-    { type: "delegate", body: "From your other conversation, you were asked to: follow up with Alice." },
-  ];
-
-  for (const c of cases) {
-    it(`round-trips a ${c.type} event`, () => {
-      const formatted = formatTomoEvent(c.type, c.body, c.name !== undefined ? { name: c.name } : {});
-      const parsed = parseTomoEvent(formatted);
-      expect(parsed).not.toBeNull();
-      expect(parsed!.type).toBe(c.type);
-      expect(parsed!.body).toBe(c.body);
-      expect(parsed!.name).toBe(c.name);
-      expect(parsed!.ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/);
-    });
-  }
+describe("parseTomoEvent — round trip", () => {
+  // parseTomoEvent reads `type` as an attribute like any other, so one row
+  // per producer type would run identical code. What varies the parse is the
+  // SHAPE: a multi-line body, a name or none, quoting characters in the body.
+  it.each<{ label: string; type: TomoEventType; body: string; name?: string }>([
+    { label: "a multi-line body, no name", type: "heartbeat", body: "It is Fri, Jul 4, 09:00 PDT. Read CONTINUITY.md.\n\nscript output line 1\nline 2" },
+    { label: "a one-line body, no name", type: "restart", body: "Restarted. Reason: config change via /restart" },
+    { label: "a name and double quotes in the body", type: "cron", body: 'Scheduled task "daily-backup" triggered. Run the backup.', name: "daily-backup" },
+    { label: "a name with a space and backticks in the body", type: "lcm-rollup", body: "An LCM rollup is due. The completed period `daily 2026-07-03` has 42 raw events ready to consolidate.", name: "daily 2026-07-03" },
+    { label: "a body of list lines", type: "errors", body: "Recent Tomo errors before this turn (newest last, capped):\n- [error] boom" },
+  ])("round-trips $label", (c) => {
+    const formatted = formatTomoEvent(c.type, c.body, c.name !== undefined ? { name: c.name } : {});
+    const parsed = parseTomoEvent(formatted);
+    expect(parsed).not.toBeNull();
+    expect(parsed!.type).toBe(c.type);
+    expect(parsed!.body).toBe(c.body);
+    expect(parsed!.name).toBe(c.name);
+    expect(parsed!.ts).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/);
+  });
 
   it("returns null for legacy and plain text", () => {
     expect(parseTomoEvent("System: It is Fri. Free time.")).toBeNull();
@@ -246,5 +263,44 @@ describe("appendToTomoEventBody", () => {
     expect(appendToTomoEventBody(composed, NOTE)).toBe(composed);
     const plain = `Scheduled task fired. ${NOTE}`;
     expect(appendToTomoEventBody(plain, NOTE)).toBe(plain);
+  });
+});
+
+/**
+ * The owner-only mark keeps a private note (a message the owner wrote to a
+ * sub-session, a task's words) out of a turn a summoned group is steering.
+ */
+describe("markOwnerAudience / isOwnerAudienceNote", () => {
+  const note = formatTomoEvent("subsession-activity", "s3 said: done", { name: "s3" });
+
+  it("marks an envelope note, and the mark survives a round trip", () => {
+    const marked = markOwnerAudience(note);
+    expect(isOwnerAudienceNote(note)).toBe(false);
+    expect(isOwnerAudienceNote(marked)).toBe(true);
+    expect(marked).toMatch(/^<tomo-event type="subsession-activity" name="s3" ts="[^"]+" audience="owner">\n/);
+    expect(parseTomoEvent(marked)).toMatchObject({ type: "subsession-activity", name: "s3", body: "s3 said: done" });
+  });
+
+  it("is idempotent on a note that is already marked", () => {
+    const marked = markOwnerAudience(note);
+    expect(markOwnerAudience(marked)).toBe(marked);
+  });
+
+  it("returns text that does not start with an envelope unchanged, and never reads it as marked", () => {
+    for (const text of ["plain words", "System: legacy note", `lead-in\n${note}`]) {
+      expect(markOwnerAudience(text)).toBe(text);
+      expect(isOwnerAudienceNote(text)).toBe(false);
+    }
+  });
+
+  it("still sees the mark behind an interrupted-note prefix", () => {
+    // The pending-notes queue prepends this marker to a note whose turn did
+    // not finish; a marked note must stay held back after that.
+    expect(isOwnerAudienceNote(`${INTERRUPTED_NOTE_MARKER}\n${markOwnerAudience(note)}`)).toBe(true);
+  });
+
+  it("does not take the words audience=\"owner\" in a body for the mark", () => {
+    const quoting = formatTomoEvent("subsession-activity", 'the task wrote audience="owner" in its reply');
+    expect(isOwnerAudienceNote(quoting)).toBe(false);
   });
 });

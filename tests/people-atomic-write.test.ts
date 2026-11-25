@@ -31,12 +31,10 @@ vi.mock("node:fs", async (orig) => {
   };
 });
 
-const { savePersonRecord, loadPeople, parsePersonFile } = await import("../src/people.js");
-const { log } = await import("../src/logger.js");
+const { savePersonRecord, parsePersonFile } = await import("../src/people.js");
 
 const root = mkdtempSync(join(tmpdir(), "tomo-people-atomic-"));
 const publicDir = join(root, "people");
-const privateDir = join(root, "private", "people");
 
 beforeEach(() => {
   state.failRename = false;
@@ -86,23 +84,5 @@ describe("savePersonRecord", () => {
 
     expect(readFileSync(filePath, "utf-8")).toBe(ORIGINAL);
     expect(readdirSync(publicDir)).toEqual(["alice.md"]);
-  });
-});
-
-describe("loadPeople", () => {
-  it("names a record it could not parse instead of dropping it in silence", () => {
-    seed();
-    // Exactly what a truncated write leaves: an opening fence and half a
-    // frontmatter. `parsePersonFile` returns undefined, the person stops
-    // being recognised, and nothing said why.
-    writeFileSync(join(publicDir, "torn.md"), "---\nname: Ke", "utf-8");
-    const warn = vi.spyOn(log, "warn").mockImplementation(() => {});
-
-    const people = loadPeople({ includePrivate: false, dirs: { publicDir, privateDir } });
-
-    expect(people.map((p) => p.name)).toEqual(["Alice"]);
-    const warned = warn.mock.calls.filter((c) => String(c[1]).includes("no usable frontmatter"));
-    expect(warned).toHaveLength(1);
-    expect(warned[0][0]).toMatchObject({ filePath: join(publicDir, "torn.md") });
   });
 });

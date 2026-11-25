@@ -1,29 +1,24 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
 import { join } from "node:path";
-import { tmpdir } from "node:os";
+import { configLoader } from "./helpers/config-loader.js";
+
+// Every load gets a scratch HOME and a cleared ambient env (see the helper),
+// so these tests never read the developer's real ~/.tomo/config.json.
+const { load, home: currentHome } = configLoader("tomo-config-");
 
 async function loadContinuityIntervalMs(value: string): Promise<number> {
-  vi.resetModules();
-  vi.stubEnv("TOMO_CONTINUITY_INTERVAL_MINUTES", value);
-  const { config } = await import("../src/config.js");
-  return config.continuityIntervalMs;
+  return (await load(undefined, { TOMO_CONTINUITY_INTERVAL_MINUTES: value })).config.continuityIntervalMs;
 }
 
 async function loadLiveSessionTimeoutMs(value: string): Promise<number> {
-  vi.resetModules();
-  vi.stubEnv("TOMO_LIVE_SESSION_TIMEOUT_MS", value);
-  const { config } = await import("../src/config.js");
-  return config.liveSessionTimeoutMs;
+  return (await load(undefined, { TOMO_LIVE_SESSION_TIMEOUT_MS: value })).config.liveSessionTimeoutMs;
 }
 
 async function loadWorkspacePaths(workspaceDir: string): Promise<{
   workspaceDir: string;
   sdkSessionsDir: string;
 }> {
-  vi.resetModules();
-  vi.stubEnv("TOMO_WORKSPACE", workspaceDir);
-  const { config } = await import("../src/config.js");
+  const { config } = await load(undefined, { TOMO_WORKSPACE: workspaceDir });
   return {
     workspaceDir: config.workspaceDir,
     sdkSessionsDir: config.sdkSessionsDir,
@@ -31,17 +26,12 @@ async function loadWorkspacePaths(workspaceDir: string): Promise<{
 }
 
 describe("config", () => {
-  afterEach(() => {
-    vi.unstubAllEnvs();
-    vi.resetModules();
-  });
-
   it("falls back to defaults on non-numeric numeric env vars and reports them", async () => {
-    vi.resetModules();
-    vi.stubEnv("HISTORY_LIMIT", "abc");
-    vi.stubEnv("TOMO_MAX_TURNS", "not-a-number");
-    vi.stubEnv("IMESSAGE_INBOUND_SETTLE_MS", "");
-    const { config, configIssues, assertConfigValid } = await import("../src/config.js");
+    const { config, configIssues, assertConfigValid } = await load(undefined, {
+      HISTORY_LIMIT: "abc",
+      TOMO_MAX_TURNS: "not-a-number",
+      IMESSAGE_INBOUND_SETTLE_MS: "",
+    });
     expect(config.historyLimit).toBe(20);
     expect(config.maxTurns).toBe(50);
     expect(config.imessageInboundSettleMs).toBe(1500);
@@ -55,10 +45,7 @@ describe("config", () => {
   });
 
   it("parses valid numeric env vars", async () => {
-    vi.resetModules();
-    vi.stubEnv("HISTORY_LIMIT", "5");
-    vi.stubEnv("TOMO_MAX_TURNS", "75");
-    const { config } = await import("../src/config.js");
+    const { config } = await load(undefined, { HISTORY_LIMIT: "5", TOMO_MAX_TURNS: "75" });
     expect(config.historyLimit).toBe(5);
     expect(config.maxTurns).toBe(75);
   });
@@ -100,10 +87,7 @@ describe("config", () => {
   // would print a full-width bracket in a path the agent is being invited to
   // open, which is a worse failure than refusing to start.
   async function loadWorkspaceIssues(workspaceDir: string): Promise<string[]> {
-    vi.resetModules();
-    vi.stubEnv("TOMO_WORKSPACE", workspaceDir);
-    const { configIssues } = await import("../src/config.js");
-    return [...configIssues];
+    return [...(await load(undefined, { TOMO_WORKSPACE: workspaceDir })).configIssues];
   }
 
   it("rejects a TOMO_WORKSPACE containing a newline or other control character", async () => {
@@ -111,9 +95,7 @@ describe("config", () => {
     expect(issues.join("\n")).toContain("workspaceDir (TOMO_WORKSPACE)");
     expect(issues.join("\n")).toContain("control characters");
 
-    vi.resetModules();
-    vi.stubEnv("TOMO_WORKSPACE", "/tmp/work\nspace");
-    const { assertConfigValid } = await import("../src/config.js");
+    const { assertConfigValid } = await load(undefined, { TOMO_WORKSPACE: "/tmp/work\nspace" });
     expect(() => assertConfigValid()).toThrow(/TOMO_WORKSPACE/);
   });
 
@@ -129,26 +111,8 @@ describe("config", () => {
 });
 
 describe("config file validation", () => {
-  let home = "";
-
-  async function loadWithConfigFile(content: string): Promise<typeof import("../src/config.js")> {
-    home = join(tmpdir(), `tomo-config-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
-    mkdirSync(join(home, ".tomo"), { recursive: true });
-    writeFileSync(join(home, ".tomo", "config.json"), content);
-    vi.resetModules();
-    vi.stubEnv("HOME", home);
-    return import("../src/config.js");
-  }
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-    vi.resetModules();
-    if (home) rmSync(home, { recursive: true, force: true });
-    home = "";
-  });
-
   it("parses a valid config file with no issues", async () => {
-    const { config, configIssues, assertConfigValid } = await loadWithConfigFile(JSON.stringify({
+    const { config, configIssues, assertConfigValid } = await load({
       model: "claude-sonnet-5",
       maxTurns: 75,
       steering: "false",
@@ -158,7 +122,7 @@ describe("config file validation", () => {
       identities: [{ name: "Alice", channels: { telegram: "12345" } }],
       lcm: { nudgeAtPct: 85 },
       groupSecret: "open-sesame",
-    }));
+    });
 
     expect(configIssues).toEqual([]);
     expect(() => assertConfigValid()).not.toThrow();
@@ -171,6 +135,7 @@ describe("config file validation", () => {
     // A single legacy identity is read as the owner.
     expect(config.owner).toEqual({ name: "Alice", telegram: ["12345"], imessage: [] });
     expect(config.ownerSource).toBe("identity");
+    expect(config.ownerNotices).toEqual([]);
     expect(config.lcm).toMatchObject({ nudgeAtPct: 85, nudgeResetPct: 60 });
     expect(config.groupSecret).toBe("open-sesame");
   });
@@ -178,53 +143,52 @@ describe("config file validation", () => {
   // saveInboundFiles gates the path-only any-MIME store. It is a NEW key, so
   // it must not quietly re-enable storage for an install that already said no.
   it("defaults saveInboundFiles to saveInboundImages when unspecified", async () => {
-    const on = await loadWithConfigFile(JSON.stringify({}));
+    const on = await load({});
     expect(on.config.saveInboundImages).toBe(true);
     expect(on.config.saveInboundFiles).toBe(true);
 
-    const off = await loadWithConfigFile(JSON.stringify({ saveInboundImages: false }));
+    const off = await load({ saveInboundImages: false });
     expect(off.config.saveInboundImages).toBe(false);
     expect(off.config.saveInboundFiles).toBe(false);
   });
 
   it("notifies the owner of suppressed errors by default, and can be turned off", async () => {
-    const on = await loadWithConfigFile(JSON.stringify({}));
+    const on = await load({});
     expect(on.config.notifyOwnerOnSuppressedErrors).toBe(true);
     expect(on.configIssues).toEqual([]);
 
-    const off = await loadWithConfigFile(JSON.stringify({ notifyOwnerOnSuppressedErrors: false }));
+    const off = await load({ notifyOwnerOnSuppressedErrors: false });
     expect(off.config.notifyOwnerOnSuppressedErrors).toBe(false);
     expect(off.configIssues).toEqual([]);
   });
 
   it("lets saveInboundFiles be set independently of saveInboundImages", async () => {
-    const { config } = await loadWithConfigFile(JSON.stringify({
+    const { config } = await load({
       saveInboundImages: false,
       saveInboundFiles: true,
-    }));
+    });
     expect(config.saveInboundImages).toBe(false);
     expect(config.saveInboundFiles).toBe(true);
   });
 
   it("accepts maxTurns 0 as no limit and still rejects a negative one", async () => {
-    const zero = await loadWithConfigFile(JSON.stringify({ maxTurns: 0 }));
+    const zero = await load({ maxTurns: 0 });
     expect(zero.configIssues).toEqual([]);
     expect(zero.config.maxTurns).toBe(0);
 
-    vi.resetModules();
-    const negative = await loadWithConfigFile(JSON.stringify({ maxTurns: -5 }));
+    const negative = await load({ maxTurns: -5 });
     expect(negative.config.maxTurns).toBe(50);
     expect(negative.configIssues.join("\n")).toContain("maxTurns");
   });
 
   it("reports invalid values, falls back to defaults, and refuses startup", async () => {
-    const { config, configIssues, assertConfigValid } = await loadWithConfigFile(JSON.stringify({
+    const { config, configIssues, assertConfigValid } = await load({
       maxTurns: "plenty",
       groupSecret: 42,
       saveInboundImages: "sometimes",
       lcm: { nudgeAtPct: 500 },
       sessionModelOverrides: { "dm:alice": 7 },
-    }));
+    });
 
     expect(config.maxTurns).toBe(50);
     expect(config.groupSecret).toBeNull();
@@ -246,11 +210,11 @@ describe("config file validation", () => {
   // must keep loading verbatim; an install that never set the key must end up
   // with iMessage OFF rather than silently spawning an imsg child.
   it("keeps loading an existing imsg provider and its allowlist", async () => {
-    const { config, configIssues, assertConfigValid, imessageConfigured } = await loadWithConfigFile(JSON.stringify({
+    const { config, configIssues, assertConfigValid, imessageConfigured } = await load({
       channels: {
         imessage: { provider: "imsg", cliPath: "/opt/homebrew/bin/imsg", allowlist: ["+15551234567"] },
       },
-    }));
+    });
 
     expect(configIssues).toEqual([]);
     expect(() => assertConfigValid()).not.toThrow();
@@ -261,9 +225,9 @@ describe("config file validation", () => {
   });
 
   it("treats an absent provider as iMessage off, with no issue raised", async () => {
-    const { config, configIssues, imessageConfigured } = await loadWithConfigFile(JSON.stringify({
+    const { config, configIssues, imessageConfigured } = await load({
       channels: { imessage: { allowlist: ["+15551234567"] } },
-    }));
+    });
 
     expect(configIssues).toEqual([]);
     expect(config.imessageProvider).toBeNull();
@@ -271,11 +235,11 @@ describe("config file validation", () => {
   });
 
   it("reports a config still pinned to the removed bluebubbles provider", async () => {
-    const { config, configIssues, assertConfigValid } = await loadWithConfigFile(JSON.stringify({
+    const { config, configIssues, assertConfigValid } = await load({
       channels: {
         imessage: { provider: "bluebubbles", url: "http://localhost:1234", allowlist: ["+15551234567"] },
       },
-    }));
+    });
 
     expect(config.imessageProvider).toBeNull();
     // One targeted issue — the rest of the iMessage entry must survive, or the
@@ -289,61 +253,44 @@ describe("config file validation", () => {
 
   it("derives the lcm reset threshold when only nudgeAtPct is customized", async () => {
     // nudgeAtPct below the stock reset (60): reset derives to nudgeAtPct - 10.
-    const low = await loadWithConfigFile(JSON.stringify({ lcm: { nudgeAtPct: 50 } }));
+    const low = await load({ lcm: { nudgeAtPct: 50 } });
     expect(low.configIssues).toEqual([]);
     expect(low.config.lcm).toMatchObject({ nudgeAtPct: 50, nudgeResetPct: 40 });
 
     // nudgeAtPct above the stock reset: the stock reset still applies.
-    rmSync(home, { recursive: true, force: true });
-    const high = await loadWithConfigFile(JSON.stringify({ lcm: { nudgeAtPct: 85 } }));
+    const high = await load({ lcm: { nudgeAtPct: 85 } });
     expect(high.configIssues).toEqual([]);
     expect(high.config.lcm).toMatchObject({ nudgeAtPct: 85, nudgeResetPct: 60 });
   });
 
   it("rejects an explicitly conflicting lcm reset threshold", async () => {
-    const { config, configIssues } = await loadWithConfigFile(JSON.stringify({
+    const { config, configIssues } = await load({
       lcm: { nudgeAtPct: 50, nudgeResetPct: 60 },
-    }));
+    });
 
     expect(config.lcm).toMatchObject({ nudgeAtPct: 70, nudgeResetPct: 60 });
     expect(configIssues.join("\n")).toContain("nudgeResetPct must be below nudgeAtPct");
   });
 
   it("drops only the invalid identity entries and reports each one", async () => {
-    const { config, configIssues } = await loadWithConfigFile(JSON.stringify({
+    const { config, configIssues } = await load({
       identities: [
         { name: "Alice", channels: { telegram: 12345 } },
         { channels: { telegram: "222" } },
         { name: "", channels: { telegram: "333" } },
       ],
-    }));
+    });
 
     expect(config.owner).toEqual({ name: "Alice", telegram: ["12345"], imessage: [] });
     expect(configIssues.join("\n")).toContain("identities[1]");
     expect(configIssues.join("\n")).toContain("identities[2]");
   });
 
-  it("reads the legacy single-identity shape as the owner with no issues (same dm: key)", async () => {
-    const { config, configIssues } = await loadWithConfigFile(JSON.stringify({
-      channels: {
-        telegram: { token: "t", allowlist: ["123456789"] },
-        imessage: { provider: "imsg", allowlist: ["+15555550123", "any;+;chat0000000001"] },
-      },
-      identities: [{ name: "Alex", channels: { telegram: "123456789", imessage: "+15555550123" }, replyPolicy: "last-active" }],
-      sessionModelOverrides: { "dm:alex": "claude-opus-5[1m]" },
-    }));
-    expect(configIssues).toEqual([]);
-    expect(config.owner).toEqual({ name: "Alex", telegram: ["123456789"], imessage: ["+15555550123"] });
-    expect(config.ownerSource).toBe("identity");
-    expect(config.ownerNotices).toEqual([]);
-    expect(config.sessionModelOverrides).toEqual({ "dm:alex": "claude-opus-5[1m]" });
-  });
-
   it("parses an `owner` block, normalizing handles; `identities` alongside it is ignored", async () => {
-    const { config, configIssues } = await loadWithConfigFile(JSON.stringify({
+    const { config, configIssues } = await load({
       owner: { name: "alex", displayName: "Alex", telegram: [123456789], imessage: ["+1 (555) 555-0123"] },
       identities: [{ name: "Sam", channels: { telegram: "222" } }],
-    }));
+    });
     expect(configIssues).toEqual([]);
     expect(config.owner).toEqual({ name: "alex", displayName: "Alex", telegram: ["123456789"], imessage: ["+15555550123"] });
     expect(config.ownerSource).toBe("owner");
@@ -351,16 +298,16 @@ describe("config file validation", () => {
   });
 
   it("an invalid `owner` block blocks startup instead of silently falling back", async () => {
-    const { configIssues, assertConfigValid } = await loadWithConfigFile(JSON.stringify({
+    const { configIssues, assertConfigValid } = await load({
       owner: { name: "   " },
       identities: [{ name: "Sam", channels: { telegram: "222" } }],
-    }));
+    });
     expect(configIssues.join("\n")).toContain("owner");
     expect(() => assertConfigValid()).toThrow();
   });
 
   it("reports malformed JSON instead of silently ignoring the file", async () => {
-    const { config, configIssues, assertConfigValid } = await loadWithConfigFile("{ this is not json");
+    const { config, configIssues, assertConfigValid } = await load("{ this is not json");
 
     expect(config.maxTurns).toBe(50);
     expect(configIssues.join("\n")).toContain("not valid JSON");
@@ -368,40 +315,21 @@ describe("config file validation", () => {
   });
 
   it("rejects a config file whose root is not an object", async () => {
-    const { configIssues } = await loadWithConfigFile(JSON.stringify(["not", "an", "object"]));
+    const { configIssues } = await load(["not", "an", "object"]);
 
     expect(configIssues.join("\n")).toContain("must contain a JSON object");
   });
 });
 
 describe("agentProfiles", () => {
-  let home = "";
-
-  async function loadWithConfigFile(content: unknown): Promise<typeof import("../src/config.js")> {
-    home = join(tmpdir(), `tomo-profiles-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
-    mkdirSync(join(home, ".tomo"), { recursive: true });
-    writeFileSync(join(home, ".tomo", "config.json"), JSON.stringify(content));
-    vi.resetModules();
-    vi.stubEnv("HOME", home);
-    return import("../src/config.js");
-  }
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-    vi.resetModules();
-    if (home) rmSync(home, { recursive: true, force: true });
-    home = "";
-  });
-
   it("defaults to an empty map when the key is absent", async () => {
-    const { config, configIssues } = await loadWithConfigFile({ model: "claude-sonnet-5" });
+    const { config, configIssues } = await load({ model: "claude-sonnet-5" });
     expect(config.agentProfiles).toEqual({});
     expect(configIssues).toEqual([]);
   });
 
   it("expands ~ and $VAR at load and strips $TMPDIR's trailing slash", async () => {
-    vi.stubEnv("TOMO_TEST_DD", "/var/tmp/dd/");
-    const { config, configIssues } = await loadWithConfigFile({
+    const { config, configIssues } = await load({
       agentProfiles: {
         "ios-reviewer": {
           writeRoots: ["~/Library/Caches", "$TOMO_TEST_DD", "/tmp"],
@@ -410,12 +338,12 @@ describe("agentProfiles", () => {
           bash: "readonly",
         },
       },
-    });
+    }, { TOMO_TEST_DD: "/var/tmp/dd/" });
     expect(configIssues).toEqual([]);
     expect(config.agentProfiles["ios-reviewer"]).toEqual({
-      writeRoots: [join(home, "Library", "Caches"), "/var/tmp/dd", "/tmp"],
+      writeRoots: [join(currentHome(), "Library", "Caches"), "/var/tmp/dd", "/tmp"],
       denyPaths: ["/Applications"],
-      denyReadPaths: [join(home, ".ssh")],
+      denyReadPaths: [join(currentHome(), ".ssh")],
       bash: "readonly",
     });
   });
@@ -423,7 +351,7 @@ describe("agentProfiles", () => {
   it("defaults bash to the NARROW mode when the field is omitted", async () => {
     // Registering a profile is an act of narrowing; the omitted field must not
     // hand back the shell the entry exists to take away.
-    const { config } = await loadWithConfigFile({
+    const { config } = await load({
       agentProfiles: { scribe: { writeRoots: ["/tmp"] } },
     });
     expect(config.agentProfiles.scribe)
@@ -434,7 +362,7 @@ describe("agentProfiles", () => {
     // $TMPDIR is absent under a bare `launchctl load`. The right answer to
     // "this machine has no TMPDIR" is a slightly narrower agent, not a daemon
     // that refuses to start.
-    const { config, configIssues, assertConfigValid } = await loadWithConfigFile({
+    const { config, configIssues, assertConfigValid } = await load({
       agentProfiles: { "ios-reviewer": { writeRoots: ["$TMPDIR_NOT_SET", "relative/path", "/tmp"], bash: "readonly" } },
     });
     expect(config.agentProfiles["ios-reviewer"].writeRoots).toEqual(["/tmp"]);
@@ -443,7 +371,7 @@ describe("agentProfiles", () => {
   });
 
   it("a bad denyPath or denyReadPath is FATAL — it would widen the profile", async () => {
-    const { config, configIssues, assertConfigValid } = await loadWithConfigFile({
+    const { config, configIssues, assertConfigValid } = await load({
       agentProfiles: {
         "ios-reviewer": {
           writeRoots: ["/tmp"],
@@ -463,7 +391,7 @@ describe("agentProfiles", () => {
   it("drops only the bad agent type, not the whole map", async () => {
     // Falling the map back to {} would silently unscope every correctly
     // configured agent beside the broken one.
-    const { config, configIssues } = await loadWithConfigFile({
+    const { config, configIssues } = await load({
       agentProfiles: {
         "ios-reviewer": { writeRoots: ["/tmp"], bash: "readonly" },
         "ios-implementer": { writeRoots: ["/tmp"], bash: "sudo-everything" },
@@ -474,7 +402,7 @@ describe("agentProfiles", () => {
   });
 
   it("reports an EMPTY profile, whose meaning is the opposite of a missing one", async () => {
-    const { configIssues } = await loadWithConfigFile({ agentProfiles: { scribe: {} } });
+    const { configIssues } = await load({ agentProfiles: { scribe: {} } });
     expect(configIssues.join("\n")).toContain("agentProfiles.scribe");
     expect(configIssues.join("\n")).toContain("neither write nor run commands");
   });
@@ -482,7 +410,7 @@ describe("agentProfiles", () => {
   it("rejects a profile under the reserved untyped-subagent key", async () => {
     // The guard substitutes "(unknown)" for a subagent that reports no
     // agent_type, so a profile under that key would quietly govern all of them.
-    const { config, configIssues } = await loadWithConfigFile({
+    const { config, configIssues } = await load({
       agentProfiles: { "(unknown)": { writeRoots: ["/tmp"], bash: "full" } },
     });
     expect(config.agentProfiles).toEqual({});
@@ -491,32 +419,14 @@ describe("agentProfiles", () => {
 });
 
 describe("groupSandbox", () => {
-  let home = "";
-
-  async function loadWithConfigFile(content: unknown): Promise<typeof import("../src/config.js")> {
-    home = join(tmpdir(), `tomo-gsbx-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
-    mkdirSync(join(home, ".tomo"), { recursive: true });
-    writeFileSync(join(home, ".tomo", "config.json"), JSON.stringify(content));
-    vi.resetModules();
-    vi.stubEnv("HOME", home);
-    return import("../src/config.js");
-  }
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-    vi.resetModules();
-    if (home) rmSync(home, { recursive: true, force: true });
-    home = "";
-  });
-
   it("defaults to no groups", async () => {
-    const { config, configIssues } = await loadWithConfigFile({ model: "claude-sonnet-5" });
+    const { config, configIssues } = await load({ model: "claude-sonnet-5" });
     expect(config.groupSandbox).toEqual({ groups: {} });
     expect(configIssues).toEqual([]);
   });
 
   it("parses per-group extras with defaults filled in", async () => {
-    const { config, configIssues } = await loadWithConfigFile({
+    const { config, configIssues } = await load({
       groupSandbox: { groups: { "group:test-1": { extraRead: ["/path/to/project"] } } },
     });
     expect(configIssues).toEqual([]);
@@ -525,14 +435,14 @@ describe("groupSandbox", () => {
 
   it("rejects a relative, traversing or whole-home extra and falls back to no groups", async () => {
     for (const bad of ["relative/dir", "/a/../b", "~", "/"]) {
-      const { config, configIssues } = await loadWithConfigFile({ groupSandbox: { groups: { "group:test-1": { extraWrite: [bad] } } } });
+      const { config, configIssues } = await load({ groupSandbox: { groups: { "group:test-1": { extraWrite: [bad] } } } });
       expect(config.groupSandbox, bad).toEqual({ groups: {} });
       expect(configIssues.join("\n"), bad).toContain("groupSandbox");
     }
   });
 
   it("leaves a legacy groupShellAllowlist in place, read as unsandboxed by the guard", async () => {
-    const { config } = await loadWithConfigFile({ groupShellAllowlist: ["group:test-1"] });
+    const { config } = await load({ groupShellAllowlist: ["group:test-1"] });
     expect(config.groupShellAllowlist).toEqual(["group:test-1"]);
     const { effectiveGroupSandbox } = await import("../src/agent/group-fs-policy.js");
     expect(effectiveGroupSandbox(config.groupSandbox, config.groupShellAllowlist).groups["group:test-1"])

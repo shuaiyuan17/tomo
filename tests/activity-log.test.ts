@@ -82,6 +82,17 @@ describe("ActivityLog", () => {
     expect(JSON.stringify(line)).not.toContain("diary");
   });
 
+  it("adds no summaryChars for a task that has no summary yet", () => {
+    activityLog = new ActivityLog({ path, bus, includeMessageText: false });
+    activityLog.start();
+    bus.publish({ type: "tasks", sessionKey: "dm:me", tasks: [{ taskId: "a", taskType: "local_agent", description: "secret plans",
+      ambient: false, background: true, startedAt: 1 }] });
+    const task = (readLines(path)[0] as { tasks: Array<Record<string, unknown>> }).tasks[0];
+    expect(task).toMatchObject({ taskId: "a", descriptionChars: 12 });
+    expect(task).not.toHaveProperty("summaryChars");
+    expect(task).not.toHaveProperty("summary");
+  });
+
   it("rotates once the live file passes maxBytes and prunes old rotations", () => {
     activityLog = new ActivityLog({ path, bus, maxBytes: 300, maxRotatedFiles: 2 });
     activityLog.start();
@@ -162,12 +173,33 @@ describe("ActivityLog", () => {
     }
   });
 
-  it("survives an unwritable path without throwing into the bus", () => {
-    activityLog = new ActivityLog({ path: join(dir, "missing-dir", "activity.ndjson"), bus });
+  it("warns once per streak of failed writes, and writes again once the path works", async () => {
+    // WatchBus.publish already shields the bus from a throwing subscriber, so
+    // "does not throw" would prove nothing here. What the log owns is the
+    // writeBroken latch: one warning for a streak of failures, reset by the
+    // first write that lands.
+    const { log } = await import("../src/logger.js");
+    const warn = vi.mocked(log.warn);
+    warn.mockClear();
+    const missingDir = join(dir, "missing-dir");
+    const brokenPath = join(missingDir, "activity.ndjson");
+    activityLog = new ActivityLog({ path: brokenPath, bus });
     activityLog.start();
-    expect(() => {
-      bus.publish({ type: "heartbeat" });
-      bus.publish({ type: "heartbeat" });
-    }).not.toThrow();
+
+    bus.publish({ type: "heartbeat" });
+    bus.publish({ type: "heartbeat" });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][1]).toContain("Activity log write failed");
+
+    mkdirSync(missingDir);
+    bus.publish({ type: "issue", level: "warn", msg: "landed" });
+    expect(readLines(brokenPath)).toEqual([expect.objectContaining({ msg: "landed" })]);
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    // A new failure after a good write is a new fact: it warns again.
+    rmSync(missingDir, { recursive: true, force: true });
+    bus.publish({ type: "heartbeat" });
+    bus.publish({ type: "heartbeat" });
+    expect(warn).toHaveBeenCalledTimes(2);
   });
 });

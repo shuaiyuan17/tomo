@@ -55,45 +55,28 @@ describe("OwnerRouter", () => {
       expect(router.isAllowed("imessage", "any;+;chat0123456789")).toBe(true);
     });
 
-    it("iMessage with no allowlist: only the bound owner handle is admitted, in any GUID form", () => {
+    // A DM is admitted only from one of the owner's handles on that channel.
+    // The matching itself (GUID forms, formatting drift, case) is
+    // isOwnerHandle's, pinned in owner.test.ts; these rows prove the router
+    // delegates to it on both channels and ignores an empty allowlist.
+    it.each<[string, LegacyIdentity["channels"], Record<string, string[]>, string, string, boolean]>([
       // The fresh-setup hole: `tomo config` → Enable iMessage wrote no
       // allowlist, and an open channel let ANY sender in with owner-grade tools.
-      const router = routerOf(
-        [{ name: "alice", channels: { telegram: "111", imessage: "+15555550123" }, replyPolicy: "last-active" }],
-        sessions,
-        {},
-      );
-      expect(router.isAllowed("imessage", "any;-;+15559999999")).toBe(false);
-      expect(router.isAllowed("imessage", "iMessage;-;+15555550123")).toBe(true);
-      expect(router.isAllowed("imessage", "SMS;-;+15555550123")).toBe(true);
-      expect(router.isAllowed("imessage", "any;-;+15555550123")).toBe(true);
-    });
-
-    it("iMessage identity bound to Telegram only: an unknown iMessage DM is refused", () => {
-      const router = routerOf(
-        [{ name: "alice", channels: { telegram: "111" }, replyPolicy: "last-active" }],
-        sessions,
-        {},
-      );
-      expect(router.isAllowed("imessage", "any;-;+15559999999")).toBe(false);
-      expect(router.isAllowed("telegram", "111")).toBe(true);
-      expect(router.isAllowed("telegram", "222")).toBe(false);
-    });
-
-    it("matches a bound handle despite formatting drift", () => {
-      const router = routerOf(
-        [{ name: "alice", channels: { imessage: "+1 (555) 555-0123" }, replyPolicy: "last-active" }],
-        sessions,
-        {},
-      );
-      expect(router.isAllowed("imessage", "iMessage;-;+15555550123")).toBe(true);
-      const byEmail = routerOf(
-        [{ name: "alice", channels: { imessage: "Alice@Example.COM" }, replyPolicy: "last-active" }],
-        sessions,
-        {},
-      );
-      expect(byEmail.isAllowed("imessage", "any;-;alice@example.com")).toBe(true);
-      expect(byEmail.isAllowed("imessage", "any;-;bob@example.com")).toBe(false);
+      ["an unknown iMessage sender, no allowlist", { telegram: "111", imessage: "+15555550123" }, {}, "imessage", "any;-;+15559999999", false],
+      ["the owner's iMessage handle under iMessage;-;", { telegram: "111", imessage: "+15555550123" }, {}, "imessage", "iMessage;-;+15555550123", true],
+      ["the owner's iMessage handle under SMS;-;", { telegram: "111", imessage: "+15555550123" }, {}, "imessage", "SMS;-;+15555550123", true],
+      ["the owner's iMessage handle under any;-;", { telegram: "111", imessage: "+15555550123" }, {}, "imessage", "any;-;+15555550123", true],
+      ["an iMessage DM when the owner is bound to Telegram only", { telegram: "111" }, {}, "imessage", "any;-;+15559999999", false],
+      ["the owner's Telegram id", { telegram: "111" }, {}, "telegram", "111", true],
+      ["the owner's Telegram id, with an empty allowlist", { telegram: "111" }, { telegram: [] }, "telegram", "111", true],
+      ["another Telegram id", { telegram: "111" }, {}, "telegram", "222", false],
+      ["another Telegram id, with an empty allowlist", { telegram: "111" }, { telegram: [] }, "telegram", "222", false],
+      ["a bound handle despite formatting drift", { imessage: "+1 (555) 555-0123" }, {}, "imessage", "iMessage;-;+15555550123", true],
+      ["a bound email in another case", { imessage: "Alice@Example.COM" }, {}, "imessage", "any;-;alice@example.com", true],
+      ["another email", { imessage: "Alice@Example.COM" }, {}, "imessage", "any;-;bob@example.com", false],
+    ])("DM admission: %s", (_label, channels, allowlists, channel, chatId, allowed) => {
+      const router = routerOf([{ name: "alice", channels, replyPolicy: "last-active" }], sessions, allowlists);
+      expect(router.isAllowed(channel, chatId)).toBe(allowed);
     });
 
     it("allowlists govern groups only: DM entries in them are ignored (no guest DMs)", () => {
@@ -103,16 +86,6 @@ describe("OwnerRouter", () => {
       expect(router.isAllowed("telegram", "123")).toBe(false);
       expect(router.isAllowed("telegram", "-100456")).toBe(true);
       expect(router.isAllowed("telegram", "-100789")).toBe(false);
-    });
-
-    it("allows identity-bound chatIds automatically", () => {
-      const router = routerOf(
-        [{ name: "alice", channels: { telegram: "111" }, replyPolicy: "last-active" }],
-        sessions,
-        { telegram: [] },
-      );
-      expect(router.isAllowed("telegram", "111")).toBe(true);
-      expect(router.isAllowed("telegram", "222")).toBe(false);
     });
 
     it("matches iMessage group identifiers under any service prefix; DM handles in the allowlist are ignored", () => {
@@ -128,6 +101,20 @@ describe("OwnerRouter", () => {
     it("refuses DMs on a channel it knows nothing about (no allowlist is not open)", () => {
       const router = routerOf([], sessions, { telegram: ["123"] });
       expect(router.isAllowed("discord", "anyone")).toBe(false);
+    });
+
+    // The web channel's rule. WebChannel and Agent.enqueueMessage refuse a
+    // non-"owner" chat before this is asked, so the router's own check has to
+    // be tested directly.
+    it("web: admits only the owner pseudo-chat", () => {
+      const router = routerOf([{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }], sessions, {});
+      expect(router.isAllowed("web", "owner")).toBe(true);
+      expect(router.isAllowed("web", "someone-else")).toBe(false);
+      expect(router.isAllowed("web", "12345")).toBe(false);
+    });
+
+    it("web: admits nothing when there is no owner", () => {
+      expect(routerOf([], sessions, {}).isAllowed("web", "owner")).toBe(false);
     });
   });
 

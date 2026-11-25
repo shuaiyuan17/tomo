@@ -98,6 +98,10 @@ describe("threeWayMerge", () => {
     ["allowlist: both additions kept", { allowlist: ["x"] }, { allowlist: ["x", "a"] }, { allowlist: ["x", "b"] }, { allowlist: ["x", "b", "a"] }],
     ["allowlist: my removal applied, their addition kept", { allowlist: ["x", "y"] }, { allowlist: ["x"] }, { allowlist: ["x", "y", "b"] }, { allowlist: ["x", "b"] }],
     ["owner handles merge as sets", { owner: { imessage: ["+1"] } }, { owner: { imessage: ["+1", "+2"] } }, { owner: { imessage: ["+1", "+3"] } }, { owner: { imessage: ["+1", "+3", "+2"] } }],
+    ["their deletion of a key I left alone survives", { a: 1 }, { a: 1 }, {}, {}],
+    // A set-key array holding anything but strings is not an id set: it falls
+    // back to atomic, and my edit wins.
+    ["a set key with non-string entries stays atomic", { allowlist: [1] }, { allowlist: [1, 2] }, { allowlist: [1, 3] }, { allowlist: [1, 2] }],
   ])("%s", (_name, base, mine, theirs, expected) => {
     expect(threeWayMerge(base, mine, theirs)).toEqual(expected);
   });

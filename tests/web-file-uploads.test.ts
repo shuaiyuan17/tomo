@@ -320,9 +320,9 @@ describe("POST /uploads with files on: the same gate as images", () => {
     cookie = saved;
     // Without the API header (an <img> or a navigation from another site): refused.
     expect((await call(`/api/v1/uploads/${image}`, { headers: { "x-tomo-request": "" } })).status).toBeGreaterThanOrEqual(400);
-    for (const bad of ["../uploads", `${image}.png`, image.toUpperCase()]) expect((await call(`/api/v1/uploads/${encodeURIComponent(bad)}`)).status).toBe(404);
+    for (const bad of ["0".repeat(32), "../uploads", `${image}.png`, image.toUpperCase()]) expect((await call(`/api/v1/uploads/${encodeURIComponent(bad)}`)).status).toBe(404);
     // An id with no file and no record of going: not taken for gone (it may be mid-claim) — the page keeps it, with Retry.
-    const unknown = await call(`/api/v1/uploads/${"0".repeat(32)}`);
+    const unknown = await call(`/api/v1/uploads/${Date.now().toString(16).padStart(12, "0")}${"0".repeat(20)}`);
     expect(unknown.status).toBe(409);
     expect(JSON.parse(unknown.text).error).toBe("upload_unsettled");
     // Claimed by a message being filed: not gone yet (409), back if that send fails, gone (404) once it is recorded.
@@ -369,11 +369,17 @@ describe("peekUpload: gone only on the record of it", () => {
     const old = stageUpload(dir, PNG).uploadId;
     sweepUploads(dir, Date.now() + 2 * 60 * 60 * 1000);
     expect(peekUpload(dir, old, Date.now())).toBeUndefined();
-    // The record of going outlives any tray (a day on, still definite); only after GONE_TTL_MS is it swept.
+    // A day on, the record swept: still definite, by the id's own date.
     sweepUploads(dir, Date.now() + 24 * 60 * 60 * 1000);
-    expect(peekUpload(dir, old, Date.now())).toBeUndefined();
+    expect(peekUpload(dir, old, Date.now() + 24 * 60 * 60 * 1000)).toBeUndefined();
+    // Any age, record swept or not: the id dates itself, so the answer stays definite.
     sweepUploads(dir, Date.now() + GONE_TTL_MS + 60 * 60 * 1000);
-    expect(peekUpload(dir, old, Date.now())).toEqual({ kind: "unsettled" });
+    expect(peekUpload(dir, old, Date.now() + 30 * 24 * 60 * 60 * 1000)).toBeUndefined();
+    // An id from before this scheme (all random) claims an impossible time: gone, not unsettled.
+    expect(peekUpload(dir, "f".repeat(32))).toBeUndefined();
+    // An id staged within the TTL with no file and no record: unsettled (mid-claim), kept by the page.
+    const fresh = `${Date.now().toString(16).padStart(12, "0")}${"0".repeat(20)}`;
+    expect(peekUpload(dir, fresh)).toEqual({ kind: "unsettled" });
   });
 });
 

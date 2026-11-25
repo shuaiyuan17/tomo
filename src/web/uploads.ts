@@ -52,12 +52,21 @@ export class UploadError extends Error {
  * staged or claimed file is removed, and never by a claim or its release —
  * so "gone" is one file's existence, not an inference from two lookups that
  * a claim landing and releasing in between can fool (see peekUpload).
- * Tombstones are kept GONE_TTL_MS (a week: empty files, at most a few
- * hundred), far longer than any tab keeps a tray, so a kept upload's answer
- * is definite; past that it is "unsettled", which the page keeps as failed
- * (Retry / ×) rather than guessing.
+ * Tombstones are kept GONE_TTL_MS, past the TTL: after that the id's own
+ * date answers (newUploadId), so a kept upload's answer is always definite.
  */
-export const GONE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const GONE_TTL_MS = 2 * UPLOAD_TTL_MS;
+/**
+ * An upload id: when it was staged (48-bit ms, 12 hex) then 80 random bits —
+ * still unguessable, and it dates itself, so an id of any age has a definite
+ * answer: one staged longer ago than the TTL (or claiming a time it cannot
+ * have, as ids from before this scheme do) is gone, record or no record.
+ */
+function newUploadId(now: number): string {
+  return Math.max(0, Math.floor(now)).toString(16).padStart(12, "0").slice(-12) + randomBytes(10).toString("hex");
+}
+function stagedAt(uploadId: string): number { return Number.parseInt(uploadId.slice(0, 12), 16); }
+const outlived = (uploadId: string, now: number) => { const at = stagedAt(uploadId); return !(at <= now + 60_000 && now - at <= UPLOAD_TTL_MS); };
 const goneDir = (dir: string) => join(dirname(dir), `${basename(dir)}.gone`);
 function markGone(dir: string, uploadId: string): void {
   if (!UPLOAD_ID.test(uploadId)) return;
@@ -119,7 +128,7 @@ export function stageUpload(dir: string, bytes: Buffer, now = Date.now(), allowF
   if (bytes.length > (type ? MAX_UPLOAD_BYTES : MAX_UPLOAD_FILE_BYTES)) throw new UploadError("too_large");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   if (sweepUploads(dir, now) >= MAX_STAGED_UPLOADS) throw new UploadError("upload_limit");
-  const uploadId = randomBytes(16).toString("hex");
+  const uploadId = newUploadId(now);
   writeFileSync(join(dir, `${uploadId}.${type ? EXT[type] : FILE_EXT}`), bytes, { flag: "wx", mode: 0o600 });
   return type ? { uploadId, type, size: bytes.length, kind: "image" } : { uploadId, type: "application/octet-stream", size: bytes.length, kind: "file" };
 }
@@ -164,7 +173,7 @@ export function peekUpload(dir: string, uploadId: string, now = Date.now()): { k
   if (!UPLOAD_ID.test(uploadId)) return undefined;
   // Gone only on the record of it (markGone): a claim is a rename that can land
   // and release between any two lookups here, any number of times.
-  if (isGone(dir, uploadId)) return undefined;
+  if (isGone(dir, uploadId) || outlived(uploadId, now)) return undefined;
   const staged = stagedUpload(dir, uploadId, now);
   if (staged) return staged;
   // Still there but past its TTL: expired, so gone (a claim refuses it too), swept or not.

@@ -345,41 +345,8 @@ describe("sub-sessions through the Agent", () => {
     });
   });
 
-  it("records a /s message too old to replay in the owner's own conversation, not the task's", async () => {
-    // The last run took the owner's message to s1 into the inbox and died
-    // before handing it over; it is past the replay window now.
-    const inbox = new DurableInbox({ path: join(mockConfig.tomoHome, "data", "inbox.jsonl") });
-    inbox.accept("telegram", makeMsg({ id: "late", chatId: "12345", senderId: "12345", text: "use plan B" }),
-      { sessionKey: "task:s1", replyTarget: { channelName: "telegram", chatId: "12345" } });
-    inbox.close();
-    resetConfig({
-      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-      subsessions: { ...mockConfig.subsessions, enabled: true },
-      inbox: true,
-      inboxReplayMaxAgeMinutes: 0,
-      tomoHome: mockConfig.tomoHome,
-    });
-    const agent = new Agent();
-    agent.addChannel(new MockChannel("telegram"));
-    await agent.start();
-    const transcript = (key: string) => {
-      const file = join(mockConfig.sessionsDir, `${key.replace(/[^a-zA-Z0-9_-]/g, "_")}.jsonl`);
-      return existsSync(file) ? readFileSync(file, "utf8") : "";
-    };
-    const mine = transcript("dm:alex");
-    expect(mine).toContain("use plan B");
-    expect(mine).toContain("sub-session s1");
-    expect(mine).toContain(INBOX_STALE_NOT_PROCESSED);
-    expect(transcript("task:s1")).not.toContain("use plan B");
-    // And the owner's session is told, so the owner hears it never arrived.
-    const told = peekPendingNotes(agent, "dm:alex").find((n) => n.includes("stale-task-message"));
-    expect(told).toContain("use plan B");
-    expect(told).toContain("/s s1");
-    await agent.stop();
-  });
-
-  describe("a /s message too old to replay", () => {
-    const staleBoot = async () => {
+  describe("a message to a task past the replay window", () => {
+    const staleBoot = async (channelName = "telegram") => {
       resetConfig({
         identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
         subsessions: { ...mockConfig.subsessions, enabled: true },
@@ -388,30 +355,98 @@ describe("sub-sessions through the Agent", () => {
         tomoHome: mockConfig.tomoHome,
       });
       const agent = new Agent();
-      agent.addChannel(new MockChannel("telegram"));
+      agent.addChannel(new MockChannel(channelName));
       await agent.start();
       return agent;
     };
-    const leaveInInbox = () => {
-      const inbox = new DurableInbox({ path: join(mockConfig.tomoHome, "data", "inbox.jsonl") });
-      inbox.accept("telegram", makeMsg({ id: "late", chatId: "12345", senderId: "12345", text: "use plan B" }),
-        { sessionKey: "task:s1", replyTarget: { channelName: "telegram", chatId: "12345" } });
+    const inboxPath = () => join(mockConfig.tomoHome, "data", "inbox.jsonl");
+    const leaveInInbox = (message = makeMsg({ id: "late", chatId: "12345", senderId: "12345", text: "use plan B" }), sessionKey = "task:s1") => {
+      const inbox = new DurableInbox({ path: inboxPath() });
+      inbox.accept("telegram", message, { sessionKey, replyTarget: { channelName: "telegram", chatId: "12345" }, ...(sessionKey === "dm:alex" ? { identityName: "alex" } : {}) });
       inbox.close();
     };
-    const pendingInbox = () => new DurableInbox({ path: join(mockConfig.tomoHome, "data", "inbox.jsonl"), readOnly: true }).pending();
-
-    it("says nothing when the task already has it (only the inbox's done-write was lost)", async () => {
+    const pendingInbox = () => new DurableInbox({ path: inboxPath(), readOnly: true }).pending();
+    const transcript = (key: string) => {
+      const file = join(mockConfig.sessionsDir, `${key.replace(/[^a-zA-Z0-9_-]/g, "_")}.jsonl`);
+      return existsSync(file) ? readFileSync(file, "utf8") : "";
+    };
+    const waitingTask = () => {
       const store = new SubsessionStore(join(mockConfig.tomoHome, "data", "subsessions.json"));
       const t = store.create({ parentKey: "dm:alex", title: "Fix it", brief: "b" });
-      store.update(t.id, (r) => { r.ownerMessageIds.push("telegram:late"); });
+      store.transition(t.id, "start");
+      store.transition(t.id, "ask", { reason: "asked", patch: (r) => { r.heldThrough = 0; } });
+      return { store, t };
+    };
+
+    it("still reaches the task: it waits in the task's own queue, not answered late in a chat", async () => {
+      waitingTask();
+      mockSdk.responseFn = () => new Promise(() => {});
       leaveInInbox();
       const agent = await staleBoot();
+      await waitFor(() => expect(taskPrompts("task:s1").map((p) => p.text).join("\n")).toContain("use plan B"));
+      expect(transcript("dm:alex")).not.toContain(INBOX_STALE_NOT_PROCESSED);
+      expect(pendingInbox()).toEqual([]);
+      await agent.stop();
+    });
+
+    it("a reply caught in the send race that matches the task now reaches it too", async () => {
+      const { store, t } = waitingTask();
+      store.update(t.id, (r) => { r.replyMap.push({ channel: "telegram", messageId: "provider-11", at: Date.now() }); });
+      mockSdk.responseFn = () => new Promise(() => {});
+      leaveInInbox({ ...makeMsg({ id: "r5", chatId: "12345", senderId: "12345", text: "blue", replyToId: "provider-11" }), taskSendsInFlight: [t.id] }, "dm:alex");
+      const agent = await staleBoot();
+      await waitFor(() => expect(taskPrompts("task:s1").map((p) => p.text).join("\n")).toContain("blue"));
+      await agent.stop();
+    });
+
+    it("an unmatched reply caught in the send race is recorded, and the owner's session warned", async () => {
+      waitingTask();
+      mockSdk.responseFn = () => new Promise(() => {});
+      leaveInInbox({ ...makeMsg({ id: "r6", chatId: "12345", senderId: "12345", text: "blue", replyToId: "provider-12" }), taskSendsInFlight: ["s1"] }, "dm:alex");
+      const agent = await staleBoot();
+      expect(transcript("dm:alex")).toContain(INBOX_STALE_NOT_PROCESSED);
+      expect(peekPendingNotes(agent, "dm:alex").some((n) => n.includes("/s s1 <message>"))).toBe(true);
+      expect(pendingInbox()).toEqual([]);
+      await agent.stop();
+    });
+
+    it("says nothing when the task already has it (only the inbox's done-write was lost)", async () => {
+      const { store, t } = waitingTask();
+      store.update(t.id, (r) => { r.ownerMessageIds.push("telegram:late"); });
+      leaveInInbox();
+      const agent = await staleBoot("imessage"); // its channel is gone: the stale path
       expect(peekPendingNotes(agent, "dm:alex").some((n) => n.includes("stale-task-message"))).toBe(false);
       expect(pendingInbox()).toEqual([]);
       await agent.stop();
     });
 
+    it("its channel gone: recorded in the owner's conversation, and the owner's session told", async () => {
+      waitingTask();
+      leaveInInbox();
+      const agent = await staleBoot("imessage");
+      const mine = transcript("dm:alex");
+      expect(mine).toContain("use plan B");
+      expect(mine).toContain(INBOX_STALE_NOT_PROCESSED);
+      expect(transcript("task:s1")).not.toContain("use plan B");
+      const told = peekPendingNotes(agent, "dm:alex").find((n) => n.includes("stale-task-message"));
+      expect(told).toContain("never got it");
+      expect(told).toContain("use plan B");
+      expect(pendingInbox()).toEqual([]);
+      await agent.stop();
+    });
+
+    it("does not claim the task never got it when its record came from a backup", async () => {
+      const { store, t } = waitingTask();
+      store.update(t.id, (r) => { r.restored = true; });
+      leaveInInbox();
+      const agent = await staleBoot("imessage");
+      const told = peekPendingNotes(agent, "dm:alex").find((n) => n.includes("stale-task-message"));
+      expect(told).toContain("may never have got it");
+      await agent.stop();
+    });
+
     it("keeps the inbox record when the note to the owner's session cannot be written", async () => {
+      waitingTask();
       leaveInInbox();
       const proto = Agent.prototype as unknown as { queuePendingNote(key: string, note: string): boolean };
       const real = proto.queuePendingNote;
@@ -419,7 +454,7 @@ describe("sub-sessions through the Agent", () => {
         return note.includes("stale-task-message") ? false : real.call(this, key, note);
       });
       try {
-        const agent = await staleBoot();
+        const agent = await staleBoot("imessage");
         expect(pendingInbox().map((r) => r.message.id)).toEqual(["late"]);
         await agent.stop();
       } finally {

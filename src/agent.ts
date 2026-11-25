@@ -1251,8 +1251,8 @@ export class Agent {
    * sending (their send settled with no id we could record, or never
    * settled): the owner's session is told the owner may be answering one.
    */
-  private warnUnmatchedReply(scope: string, ref: string, taskIds: string[]): void {
-    if (!this.subsessions || taskIds.length === 0) return;
+  private warnUnmatchedReply(scope: string, ref: string, taskIds: string[]): boolean {
+    if (!this.subsessions || taskIds.length === 0) return true;
     // Named by id alone when the task table cannot be read (or the task is gone).
     const names = taskIds.map((id) => {
       let title: string | undefined;
@@ -1261,7 +1261,7 @@ export class Agent {
     }).join(", ");
     const resend = taskIds.map((id) => `/s ${id} <message>`).join(" or ");
     log.warn({ ref, tasks: taskIds }, "Owner reply matched no task while a task send was in flight; it stays with the owner's session");
-    this.queuePendingNote(scope, markOwnerAudience(formatTomoEvent("subsession-activity",
+    return this.queuePendingNote(scope, markOwnerAudience(formatTomoEvent("subsession-activity",
       `The owner's next message replies to a message Tomo could not match. Sub-session ${names} was sending a message to the owner at the time, so the owner may be answering it. If so, tell them it reached you instead, and ask them to send it again as ${resend}: only then does it reach the task as their own words.`)));
   }
 
@@ -1270,7 +1270,23 @@ export class Agent {
     if (!this.subsessions?.available()) return undefined;
     try {
       const record = this.subsessions.get(id);
-      return record ? record.ownerMessageIds.includes(messageId) : false;
+      if (record?.ownerMessageIds.includes(messageId)) return true;
+      // Read from an older backup: an id it lacks may still have been handed over.
+      if (record?.restored) return undefined;
+      return record ? false : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The task an inbox record is for: its own key, or an owner reply that matches a task's message now. */
+  private replayTaskKey(channelName: string, message: IncomingMessage, resolution: SessionResolution): string | undefined {
+    if (isTaskSessionKey(resolution.sessionKey)) return resolution.sessionKey;
+    const scope = this.router.ownerSessionKey();
+    const ref = message.replyToId ?? message.reactedToId;
+    if (!this.subsessions?.available() || !scope || !ref || resolution.sessionKey !== scope || message.isGroup) return undefined;
+    try {
+      return this.subsessions.taskForReply(scope, channelName, ref)?.sessionKey;
     } catch {
       return undefined;
     }
@@ -1281,8 +1297,8 @@ export class Agent {
     const scope = this.router.ownerSessionKey();
     const ref = message.replyToId ?? message.reactedToId;
     if (!this.subsessions || !scope || !ref || resolution.sessionKey !== scope || message.isGroup) return resolution;
-    const task = this.subsessions.available() ? this.subsessions.taskForReply(scope, channelName, ref) : undefined;
-    if (task) return { ...resolution, sessionKey: task.sessionKey };
+    const taskKey = this.replayTaskKey(channelName, message, resolution);
+    if (taskKey) return { ...resolution, sessionKey: taskKey };
     // Sent while a task's send was in flight, and the restart came before it matched.
     this.warnUnmatchedReply(scope, ref, message.taskSendsInFlight ?? []);
     return resolution;
@@ -3549,13 +3565,26 @@ export class Agent {
         continue;
       }
       const channel = this.getChannel(rec.channel);
-      if (!channel || maxAgeMs <= 0 || now - rec.receivedAt > maxAgeMs) {
+      // A message to a sub-session is not answered late in a chat: it waits
+      // in the task's own queue like any other input, so the replay window
+      // does not apply (ownerMessageIds dedups one handed over before).
+      const forTask = channel !== undefined && this.replayTaskKey(rec.channel, restoreMessage({ ...rec.message, images: undefined, documents: undefined }), rec.resolution) !== undefined;
+      if (!forTask && (!channel || maxAgeMs <= 0 || now - rec.receivedAt > maxAgeMs)) {
         let message = restoreMessage({ ...rec.message, images: undefined, documents: undefined });
         let recordAt = key;
-        // A message the owner sent a sub-session is recorded in the owner's
-        // own conversation, where they can see it was not processed: a task
-        // key's transcript is one nobody reads.
+        // A message the owner sent a sub-session whose channel is gone now is
+        // recorded in the owner's own conversation, where they can see it was
+        // not processed: a task key's transcript is one nobody reads.
         const owner = isTaskSessionKey(key) ? this.router.ownerSessionKey() : undefined;
+        // An owner reply sent while a task was sending, still unmatched: the
+        // owner's session is told it may have been meant for that task.
+        const ref = message.replyToId ?? message.reactedToId;
+        const scope = this.router.ownerSessionKey();
+        if (!owner && scope && key === scope && ref && message.taskSendsInFlight?.length
+          && !this.warnUnmatchedReply(scope, ref, message.taskSendsInFlight)) {
+          log.error({ inboxId: rec.id }, "Could not persist the note for a stale unmatched reply; the inbox record is kept for the next start");
+          continue;
+        }
         if (owner) {
           const id = taskIdFromSessionKey(key) ?? key;
           // Handed over before the crash (only the inbox's done-write was

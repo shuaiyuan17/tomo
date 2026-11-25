@@ -11,6 +11,7 @@ import {
   DM_GUID,
   inboundMessage,
   settle,
+  waitFor,
 } from "./helpers/fake-imsg.js";
 
 // ImsgChannel tests, split by concern (fakes in tests/helpers/fake-imsg.ts).
@@ -137,10 +138,13 @@ describe("imsg capability gate diagnosis", () => {
   });
 
   it("logs the edit gate's reads (selectors probed FALSE on macOS 26) before throwing", async () => {
+    // Ground truth for macOS 26.5: editMessageItem and editMessage both
+    // probed unavailable — calling message.edit blindly is what #227 was.
     const warnSpy = vi.spyOn(log, "warn");
-    const { channel } = makeChannel({ caps: CAPS_FULL }); // editMessageItem/editMessage: false
+    const { channel, requests } = makeChannel({ caps: CAPS_FULL }); // editMessageItem/editMessage: false
     await channel.start();
     await expect(channel.editMessage(DM_GUID, "guid-1", "fixed")).rejects.toThrow(/unsupported on this macOS/i);
+    expect(requests().map((r) => r.method)).not.toContain("message.edit");
 
     const diag = diagnosisOf(warnSpy, "message edit refused by capability gate");
     expect(diag.checked).toMatchObject({
@@ -157,41 +161,18 @@ describe("imsg capability gate diagnosis", () => {
 // --- Edit gating (Codex LOW #5) -------------------------------------------------
 
 describe("imsg edit gating requires the full capability set", () => {
-  const editParams = ["any;-;+15551234567", "mine-1", "fixed text"] as const;
-
-  it("refuses when the bridge is down even if a selector is set", async () => {
-    const caps: ImsgCapabilities = { ...CAPS_FULL, advancedFeatures: false, selectors: { editMessageItem: true } };
+  // The allowed case (bridge + message.edit + a live selector) is
+  // "edits via message.edit when a selector probe confirms support" in
+  // imsg-actions.test.ts; the all-selectors-false case is the gate-diagnosis
+  // test above.
+  it.each<[string, ImsgCapabilities]>([
+    ["the bridge is down even if a selector is set", { ...CAPS_FULL, advancedFeatures: false, selectors: { editMessageItem: true } }],
+    ["imsg does not advertise message.edit", { ...CAPS_FULL, rpcMethods: new Set(["send", "watch.subscribe"]), selectors: { editMessageItem: true } }],
+  ])("refuses when %s", async (_, caps) => {
     const { channel, requests } = makeChannel({ caps });
     await channel.start();
-    await expect(channel.editMessage(...editParams)).rejects.toThrow(/unsupported on this macOS/i);
+    await expect(channel.editMessage(DM_GUID, "mine-1", "fixed text")).rejects.toThrow(/unsupported on this macOS/i);
     expect(requests().map((r) => r.method)).not.toContain("message.edit");
-    await channel.stop();
-  });
-
-  it("refuses when imsg does not advertise message.edit", async () => {
-    const caps: ImsgCapabilities = {
-      ...CAPS_FULL,
-      rpcMethods: new Set(["send", "watch.subscribe"]),
-      selectors: { editMessageItem: true },
-    };
-    const { channel, requests } = makeChannel({ caps });
-    await channel.start();
-    await expect(channel.editMessage(...editParams)).rejects.toThrow(/unsupported on this macOS/i);
-    expect(requests().map((r) => r.method)).not.toContain("message.edit");
-    await channel.stop();
-  });
-
-  it("allows edit only with bridge + message.edit + a live selector", async () => {
-    const caps: ImsgCapabilities = {
-      ...CAPS_FULL,
-      advancedFeatures: true,
-      rpcMethods: new Set([...CAPS_FULL.rpcMethods, "message.edit"]),
-      selectors: { editMessageItem: true },
-    };
-    const { channel, requests } = makeChannel({ caps });
-    await channel.start();
-    await channel.editMessage(...editParams);
-    expect(requests().find((r) => r.method === "message.edit")).toBeDefined();
     await channel.stop();
   });
 });
@@ -350,13 +331,13 @@ describe("imsg capability re-probe (#258)", () => {
     // gate kicks a background re-probe.
     bridgeUp = true;
     children[0].notifyMessage(inboundMessage({ id: 100, guid: "reprobe-1" }));
-    await vi.waitFor(() => expect(probe.mock.calls.length).toBeGreaterThanOrEqual(2));
+    await waitFor(() => expect(probe.mock.calls.length).toBeGreaterThanOrEqual(2));
     await settle();
     expect(requests().some((r) => r.method === "read")).toBe(false);
 
     // The refreshed snapshot serves the following message: read goes out.
     children[0].notifyMessage(inboundMessage({ id: 101, guid: "reprobe-2" }));
-    await vi.waitFor(() => expect(requests().some((r) => r.method === "read")).toBe(true));
+    await waitFor(() => expect(requests().some((r) => r.method === "read")).toBe(true));
     await channel.stop();
   });
 

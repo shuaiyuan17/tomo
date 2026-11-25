@@ -13,6 +13,10 @@ import {
   GROUP_GUID,
   inboundMessage,
   settle,
+  waitFor,
+  withTempDir,
+  HEIC_BYTES,
+  PNG_BYTES,
 } from "./helpers/fake-imsg.js";
 
 // ImsgChannel tests, split by concern (fakes in tests/helpers/fake-imsg.ts).
@@ -249,20 +253,6 @@ describe("imsg echo and replay dedupe", () => {
     await channel.stop();
   });
 
-  it("drops a replayed GUID within one process", async () => {
-    const { channel, children } = makeChannel();
-    await channel.start();
-    const handler = vi.fn(async () => true);
-    channel.onMessage(handler);
-
-    children[0].notifyMessage(inboundMessage({ guid: "dup-1" }));
-    children[0].notifyMessage(inboundMessage({ guid: "dup-1" }));
-    await settle();
-
-    expect(handler).toHaveBeenCalledTimes(1);
-    await channel.stop();
-  });
-
   it("drops a replayed GUID across channel restarts via the persistent store", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-dedupe-"));
     const dedupeStorePath = join(dir, "seen.json");
@@ -289,26 +279,6 @@ describe("imsg echo and replay dedupe", () => {
     }
   });
 
-  it("resumes the watch from the persisted rowid cursor", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-cursor-"));
-    const cursorStorePath = join(dir, "cursor.json");
-    try {
-      const first = makeChannel({ config: { cursorStorePath } });
-      await first.channel.start();
-      first.channel.onMessage(vi.fn(async () => true));
-      first.children[0].notifyMessage(inboundMessage({ id: 4242, guid: "cursor-1" }));
-      await settle();
-      await first.channel.stop();
-
-      const second = makeChannel({ config: { cursorStorePath } });
-      await second.channel.start();
-      const subscribe = second.requests().find((r) => r.method === "watch.subscribe");
-      expect(subscribe?.params.since_rowid).toBe(4242);
-      await second.channel.stop();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
 });
 
 // --- Inbound tapbacks ---------------------------------------------------------
@@ -330,7 +300,7 @@ describe("imsg inbound tapbacks", () => {
       is_reaction_add: true,
       reacted_to_guid: "orig-1",
     }));
-    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(handler).toHaveBeenCalledTimes(2));
 
     // Reaction rows dispatch synchronously while regular rows await
     // attachment loading, so select by id rather than call order.
@@ -373,7 +343,7 @@ describe("imsg recent-message cache addressing", () => {
       guid: "g-group", text: "group message", chat_guid: GROUP_GUID, is_group: true,
     }));
     // Rows process through a FIFO chain, so wait for the second to land.
-    await vi.waitFor(() => expect(channel.recentMessages(GROUP_GUID)).toHaveLength(1));
+    await waitFor(() => expect(channel.recentMessages(GROUP_GUID)).toHaveLength(1));
 
     expect(channel.recentMessages("+1 (555) 123-4567").map((m) => m.id)).toEqual(["g-dm"]);
     expect(channel.recentMessages("+15551234567").map((m) => m.id)).toEqual(["g-dm"]);
@@ -385,30 +355,6 @@ describe("imsg recent-message cache addressing", () => {
 
 // --- Session-key passthrough (Codex adjudication: no normalization) --------------
 
-describe("imsg session-key passthrough", () => {
-  it("emits chat_guid verbatim so keys match the on-disk any-format sessions", async () => {
-    const { channel, children } = makeChannel();
-    await channel.start();
-    const handler = vi.fn(async () => true);
-    channel.onMessage(handler);
-
-    // DMs on macOS 26 are stored as any;-;+E164; groups as any;+;<hex>.
-    // These map to ~/.tomo/data/sessions/imessage_any_-__<E164>.jsonl and
-    // imessage_any___<hex>.jsonl — passthrough (no normalization) is what
-    // keeps existing session keys valid; rewriting the GUID orphans them.
-    children[0].notifyMessage(inboundMessage({ guid: "dm-1", text: "hi", chat_guid: "any;-;+15551234567" }));
-    children[0].notifyMessage(inboundMessage({ guid: "grp-1", text: "yo", chat_guid: "any;+;a70f2f5b3ea847759d38c0b8e3cba57d", is_group: true }));
-    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(2));
-
-    const byId = Object.fromEntries(handler.mock.calls.map((c) => [c[0].id, c[0]]));
-    expect(byId["dm-1"].chatId).toBe("any;-;+15551234567");
-    expect(byId["dm-1"].isGroup).toBe(false);
-    expect(byId["grp-1"].chatId).toBe("any;+;a70f2f5b3ea847759d38c0b8e3cba57d");
-    expect(byId["grp-1"].isGroup).toBe(true);
-    await channel.stop();
-  });
-});
-
 // --- Satellite (iMessageLite) detection via chat.db service lookup ---------------
 
 describe("imsg satellite detection", () => {
@@ -417,38 +363,27 @@ describe("imsg satellite detection", () => {
     return { lookup: { serviceForGuid: spy, close: () => {} }, spy };
   };
 
-  it("prefixes the satellite marker when message.service is iMessageLite", async () => {
-    const { lookup } = makeLookup({ "sat-1": "iMessageLite" });
+  it.each([
+    ["prefixes the satellite marker when message.service is iMessageLite", "iMessageLite", `${SATELLITE_MARKER} we are off-grid`],
+    ["does not tag standard iMessage rows", "iMessage", "we are off-grid"],
+  ])("%s", async (_, service, expected) => {
+    const { lookup } = makeLookup({ "row-1": service });
     const { channel, children } = makeChannel({ config: { serviceLookup: lookup } });
     await channel.start();
     const handler = vi.fn(async () => true);
     channel.onMessage(handler);
 
-    children[0].notifyMessage(inboundMessage({ guid: "sat-1", text: "we are off-grid" }));
-    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    children[0].notifyMessage(inboundMessage({ guid: "row-1", text: "we are off-grid" }));
+    await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
 
-    expect(handler.mock.calls[0][0].text).toBe(`${SATELLITE_MARKER} we are off-grid`);
-    await channel.stop();
-  });
-
-  it("does not tag standard iMessage rows", async () => {
-    const { lookup } = makeLookup({ "plain-1": "iMessage" });
-    const { channel, children } = makeChannel({ config: { serviceLookup: lookup } });
-    await channel.start();
-    const handler = vi.fn(async () => true);
-    channel.onMessage(handler);
-
-    children[0].notifyMessage(inboundMessage({ guid: "plain-1", text: "normal message" }));
-    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
-
-    expect(handler.mock.calls[0][0].text).toBe("normal message");
+    expect(handler.mock.calls[0][0].text).toBe(expected);
     await channel.stop();
   });
 
   it("skips the sqlite lookup entirely for attachment-only rows (no text)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-sat-"));
     const imgPath = join(dir, "photo.png");
-    writeFileSync(imgPath, Buffer.from("89504e470d0a1a0a", "hex"));
+    writeFileSync(imgPath, PNG_BYTES);
     try {
       const { lookup, spy } = makeLookup({});
       const { channel, children } = makeChannel({ config: { serviceLookup: lookup } });
@@ -461,7 +396,7 @@ describe("imsg satellite detection", () => {
         text: "",
         attachments: [{ mime_type: "image/png", original_path: imgPath, total_bytes: 8, missing: false }],
       }));
-      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
 
       expect(spy).not.toHaveBeenCalled();
       await channel.stop();
@@ -484,13 +419,13 @@ describe("imsg at-least-once persist ordering", () => {
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({ id: 900, guid: "ok-1", text: "delivered" }));
-      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
       // A replay of the same GUID is now dropped (recorded after dispatch).
       children[0].notifyMessage(inboundMessage({ id: 900, guid: "ok-1", text: "delivered" }));
       await settle();
       expect(handler).toHaveBeenCalledTimes(1);
 
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(existsSync(cursorStorePath)).toBe(true);
         expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(900);
       });
@@ -512,7 +447,7 @@ describe("imsg at-least-once persist ordering", () => {
       children[0].notifyMessage(inboundMessage({ id: 400, guid: "good-1", text: "ok" }));
       children[0].notifyMessage(inboundMessage({ id: 500, guid: "throws-1", text: "will throw" }));
       // Cursor commits to 400 (the last successful row) and never advances to 500.
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(existsSync(cursorStorePath)).toBe(true);
         expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(400);
       });
@@ -550,7 +485,7 @@ describe("imsg at-least-once persist ordering", () => {
       children[0].notifyMessage(inboundMessage({ id: 500, guid: "throws-1", text: "will throw" }));
       // A later row queued behind the failure — it must not commit past 500.
       children[0].notifyMessage(inboundMessage({ id: 600, guid: "later-1", text: "after the gap" }));
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(400);
       });
       await settle();
@@ -579,7 +514,7 @@ describe("imsg at-least-once persist ordering", () => {
       // the child stays up, and a later good row still commits.
       children[0].notifyMessage(inboundMessage({ id: undefined, guid: "no-rowid", text: "will throw" }));
       children[0].notifyMessage(inboundMessage({ id: 700, guid: "good-after-norowid", text: "ok" }));
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(existsSync(cursorStorePath)).toBe(true);
         expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(700);
       });
@@ -632,7 +567,7 @@ describe("imsg at-least-once persist ordering", () => {
       children[0].notifyMessage(inboundMessage({ id: 500, guid: "cmd-1", text: "/model sonnet" }));
       // A later real row queued behind the failing command.
       children[0].notifyMessage(inboundMessage({ id: 600, guid: "later-1", text: "after cmd" }));
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(400);
       });
       await settle();
@@ -669,7 +604,7 @@ describe("imsg at-least-once persist ordering", () => {
 
       // Old generation: row 500 arrives and hangs mid-dispatch.
       watchChildren()[0].notifyMessage(inboundMessage({ id: 500, guid: "row-500", text: "row 500" }));
-      await vi.waitFor(() => expect(gateReject).not.toBeNull());
+      await waitFor(() => expect(gateReject).not.toBeNull());
 
       // The child restarts (generation bump). The new child replays 500 + 600
       // successfully, advancing the committed cursor to 600.
@@ -679,7 +614,7 @@ describe("imsg at-least-once persist ordering", () => {
       expect(watchChildren()).toHaveLength(2);
       watchChildren()[1].notifyMessage(inboundMessage({ id: 500, guid: "row-500", text: "row 500" }));
       watchChildren()[1].notifyMessage(inboundMessage({ id: 600, guid: "row-600", text: "row 600" }));
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(600);
       });
 
@@ -695,7 +630,7 @@ describe("imsg at-least-once persist ordering", () => {
 
       // The cursor keeps advancing — not wedged.
       watchChildren()[1].notifyMessage(inboundMessage({ id: 700, guid: "row-700", text: "row 700" }));
-      await vi.waitFor(() => {
+      await waitFor(() => {
         expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(700);
       });
       await channel.stop();
@@ -711,12 +646,13 @@ describe("imsg at-least-once persist ordering", () => {
     const fifoPath = join(dir, "blocking.png");
     execFileSync("mkfifo", [fifoPath]);
     const normalPath = join(dir, "replay.png");
-    const pngBytes = Buffer.from("89504e470d0a1a0a", "hex");
-    writeFileSync(normalPath, pngBytes);
+    writeFileSync(normalPath, PNG_BYTES);
     const cursorStorePath = join(dir, "cursor.json");
     try {
       const { channel, children } = makeChannel({ config: { cursorStorePath, restartDelaysMs: [10] } });
       await channel.start();
+      const rpc = (channel as unknown as { rpc: { isStaleGeneration(generation: number, rowId: number): boolean } }).rpc;
+      const staleCheck = vi.spyOn(rpc, "isStaleGeneration");
       const seen: string[] = [];
       channel.onMessage(async (m) => { seen.push(m.id); return true; });
 
@@ -733,23 +669,29 @@ describe("imsg at-least-once persist ordering", () => {
       // The child restarts; the replacement generation replays 500 (with a
       // NORMAL file) + 600 and delivers them exactly once, in order.
       children[0].emit("exit", 1, null);
-      await vi.waitFor(() => expect(children).toHaveLength(2));
+      await waitFor(() => expect(children).toHaveLength(2));
       children[1].notifyMessage(inboundMessage({
         id: 500, guid: "row-500", text: "with photo",
         attachments: [{ mime_type: "image/png", original_path: normalPath, total_bytes: 8, missing: false }],
       }));
       children[1].notifyMessage(inboundMessage({ id: 600, guid: "row-600", text: "next" }));
-      await vi.waitFor(() => expect(seen).toEqual(["row-500", "row-600"]));
-      await vi.waitFor(() => {
+      await waitFor(() => expect(seen).toEqual(["row-500", "row-600"]));
+      await waitFor(() => {
         expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(600);
       });
 
       // Unblock the OLD row's FIFO read → it resumes SUCCESSFULLY, but its
       // generation is now stale, so it must abandon before dispatching.
       const fd = openSync(fifoPath, "w");
-      writeSync(fd, pngBytes);
+      writeSync(fd, PNG_BYTES);
       closeSync(fd);
-      await new Promise((r) => setTimeout(r, 80));
+      // Wait until the old row has actually resumed and hit a staleness gate
+      // (rather than sleeping and hoping it got that far).
+      await waitFor(() => {
+        const abandoned = staleCheck.mock.calls.some(([, rowId], i) => rowId === 500 && staleCheck.mock.results[i]?.value === true);
+        expect(abandoned).toBe(true);
+      });
+      await settle();
 
       // No duplicate, no out-of-order re-delivery; cursor still at 600.
       expect(seen).toEqual(["row-500", "row-600"]);
@@ -780,13 +722,13 @@ describe("imsg watch FIFO serialization", () => {
 
     children[0].notifyMessage(inboundMessage({ id: 1, guid: "first", text: "one" }));
     children[0].notifyMessage(inboundMessage({ id: 2, guid: "second", text: "two" }));
-    await vi.waitFor(() => expect(order).toContain("start:first"));
+    await waitFor(() => expect(order).toContain("start:first"));
 
     // The second row must not have started while the first is blocked.
     expect(order).toEqual(["start:first"]);
 
     releaseFirst();
-    await vi.waitFor(() => expect(order).toContain("end:second"));
+    await waitFor(() => expect(order).toContain("end:second"));
     expect(order).toEqual(["start:first", "end:first", "start:second", "end:second"]);
     await channel.stop();
   });
@@ -808,7 +750,7 @@ describe("imsg shutdown quiesces rows that are mid-parse", () => {
     const cursorStorePath = join(dir, "cursor.json");
     const heicPath = join(dir, "photo.heic");
     // Minimal HEIC: ftyp box with the `heic` major brand.
-    writeFileSync(heicPath, Buffer.from("000000246674797068656963000000006d696631", "hex"));
+    writeFileSync(heicPath, HEIC_BYTES);
 
     try {
       // The HEIC converter is the parked point: a real await inside
@@ -838,7 +780,7 @@ describe("imsg shutdown quiesces rows that are mid-parse", () => {
         text: "",
         attachments: [{ filename: "photo.heic", mime_type: "image/heic", original_path: heicPath, missing: false }],
       }));
-      await vi.waitFor(() => expect(conversionStarted).toBe(true));
+      await waitFor(() => expect(conversionStarted).toBe(true));
 
       // SIGTERM lands here. Ingestion closes synchronously; the parked row is
       // NOT abandoned and the child is NOT killed.
@@ -881,7 +823,7 @@ describe("imsg shutdown quiesces rows that are mid-parse", () => {
       channel.onMessage(handler);
 
       children[0].notifyMessage(inboundMessage({ id: 900, guid: "refused-1", text: "refused" }));
-      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
       await settle();
 
       // Cursor never committed: the next process resubscribes from before this
@@ -892,8 +834,8 @@ describe("imsg shutdown quiesces rows that are mid-parse", () => {
       // a "duplicate" of a message that was never actually handled.
       refuse = false;
       children[0].notifyMessage(inboundMessage({ id: 900, guid: "refused-1", text: "refused" }));
-      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(2));
-      await vi.waitFor(() => {
+      await waitFor(() => expect(handler).toHaveBeenCalledTimes(2));
+      await waitFor(() => {
         expect(JSON.parse(readFileSync(cursorStorePath, "utf-8")).lastRowId).toBe(900);
       });
 
@@ -931,7 +873,7 @@ describe("imsg admission before spending anything on a chat", () => {
   it("does not load attachments or send a read receipt for a chat the agent will refuse, but still dispatches", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-adm-"));
     const imgPath = join(dir, "photo.png");
-    writeFileSync(imgPath, Buffer.from("89504e470d0a1a0a", "hex"));
+    writeFileSync(imgPath, PNG_BYTES);
     try {
       const { channel, children, requests } = makeChannel({ caps: CAPS_FULL });
       await channel.start();
@@ -945,7 +887,7 @@ describe("imsg admission before spending anything on a chat", () => {
         text: "hi, look at this",
         attachments: [{ filename: "photo.png", mime_type: "image/png", original_path: imgPath, missing: false }],
       }));
-      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
 
       const msg = handler.mock.calls[0][0] as { images?: unknown[]; text: string };
       expect(asked).toEqual([DM_GUID]);
@@ -961,7 +903,7 @@ describe("imsg admission before spending anything on a chat", () => {
   it("loads attachments and marks read for an admitted chat", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-adm-"));
     const imgPath = join(dir, "photo.png");
-    writeFileSync(imgPath, Buffer.from("89504e470d0a1a0a", "hex"));
+    writeFileSync(imgPath, PNG_BYTES);
     try {
       const { channel, children, requests } = makeChannel({ caps: CAPS_FULL });
       await channel.start();
@@ -974,7 +916,7 @@ describe("imsg admission before spending anything on a chat", () => {
         text: "",
         attachments: [{ filename: "photo.png", mime_type: "image/png", original_path: imgPath, missing: false }],
       }));
-      await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
       const msg = handler.mock.calls[0][0] as { images?: unknown[] };
       expect(msg.images).toHaveLength(1);
       expect(requests().find((r) => r.method === "read")?.params).toEqual({ chat_guid: DM_GUID });
@@ -985,28 +927,29 @@ describe("imsg admission before spending anything on a chat", () => {
   });
 
   it("fails closed when the admission predicate throws", async () => {
-    const { channel, children, requests } = makeChannel({ caps: CAPS_FULL });
-    await channel.start();
-    const handler = vi.fn(async () => true);
-    channel.onMessage(handler);
-    channel.onAdmission(() => { throw new Error("boom"); });
+    // The row still reaches the agent, whose own admission decides; but the
+    // channel spends nothing on it: no attachment is read, no receipt goes out.
+    await withTempDir("tomo-imsg-adm-", async (dir) => {
+      const imgPath = join(dir, "photo.png");
+      writeFileSync(imgPath, PNG_BYTES);
+      const { channel, children, requests } = makeChannel({ caps: CAPS_FULL });
+      await channel.start();
+      const handler = vi.fn(async () => true);
+      channel.onMessage(handler);
+      channel.onAdmission(() => { throw new Error("boom"); });
 
-    children[0].notifyMessage(inboundMessage({ guid: "x-1" }));
-    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
-    expect(requests().map((r) => r.method)).not.toContain("read");
-    await channel.stop();
-  });
-
-  it("normalizes the sender id with the shared handle normalizer", async () => {
-    const { channel, children } = makeChannel({ caps: CAPS_FULL });
-    await channel.start();
-    const handler = vi.fn(async () => true);
-    channel.onMessage(handler);
-
-    children[0].notifyMessage(inboundMessage({ guid: "fmt-1", sender: "+1 (555) 123-4567" }));
-    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
-    expect((handler.mock.calls[0][0] as { senderId?: string }).senderId).toBe("+15551234567");
-    await channel.stop();
+      children[0].notifyMessage(inboundMessage({
+        guid: "x-1",
+        text: "hi, look at this",
+        attachments: [{ filename: "photo.png", mime_type: "image/png", original_path: imgPath, missing: false }],
+      }));
+      await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+      const msg = handler.mock.calls[0][0] as { images?: unknown[]; text: string };
+      expect(msg.images).toBeUndefined();
+      expect(msg.text).toBe("hi, look at this");
+      expect(requests().map((r) => r.method)).not.toContain("read");
+      await channel.stop();
+    });
   });
 });
 
@@ -1032,7 +975,7 @@ describe("what the credential broker needs from an inbound row", () => {
     const handler = vi.fn(async () => true);
     channel.onMessage(handler);
     children[0].notifyMessage(inboundMessage({ id: 101, guid: "react-1", is_reaction: true, reaction_type: "like", is_reaction_add: true, reacted_to_guid: "target-guid" }));
-    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
     const message = handler.mock.calls[0][0] as IncomingMessage;
     expect(message.rawText).toBeUndefined();
     expect(message.reactedToId).toBe("target-guid");

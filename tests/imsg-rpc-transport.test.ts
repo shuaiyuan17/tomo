@@ -1,8 +1,6 @@
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { ImsgChannel, type ImsgCapabilities, type ImsgChannelConfig } from "../src/channels/imessage-imsg.js";
+import type { ImsgCapabilities, ImsgChannelConfig } from "../src/channels/imessage-imsg.js";
 import { isNothingSent, partsSent, type ChannelFaultNotice } from "../src/channels/types.js";
-import { NULL_SERVICE_LOOKUP } from "../src/channels/imsg-satellite.js";
-import { NULL_ATTACHMENT_LOOKUP } from "../src/channels/imsg-attachment-lookup.js";
 import { log } from "../src/logger.js";
 import {
   type RpcRequest,
@@ -14,6 +12,10 @@ import {
   DM_GUID,
   inboundMessage,
   settle,
+  defaultResponder,
+  leavingPending,
+  sentTexts,
+  waitFor,
 } from "./helpers/fake-imsg.js";
 
 // ImsgChannel tests, split by concern (fakes in tests/helpers/fake-imsg.ts).
@@ -324,7 +326,6 @@ describe("imsg rpc child lifecycle", () => {
     await settle();
     expect(children).toHaveLength(3);
     expect(children[2].stdin.lines.map((l) => (JSON.parse(l) as RpcRequest).params.text)).toEqual(["next"]);
-    void subCount;
     await channel.stop();
   });
 
@@ -350,7 +351,7 @@ describe("imsg rpc child lifecycle", () => {
 
     // The current child still delivers normally.
     child1.notifyMessage(inboundMessage({ id: 1_000, guid: "live-1", text: "from live child" }));
-    await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(handler).toHaveBeenCalledTimes(1));
     expect(handler.mock.calls[0][0].id).toBe("live-1");
     await channel.stop();
   });
@@ -541,12 +542,11 @@ describe("imsg rpc restart on -32004 Mutation lane blocked", () => {
   });
 
   it("fails a request held during the restart as not sent when the channel stops first", async () => {
-    let held: { id: number; child: FakeChild } | null = null;
     const { channel, children, mutationChildren } = makeChannel({
       responder: (req, child) => {
         if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
         if (req.method === "send" && children.indexOf(child) === 1) {
-          if (req.params.text === "slow") { held = { id: req.id, child }; return; }
+          if (req.params.text === "slow") return; // never answered: stop() rejects it
           return child.respondError(req.id, -32004, "Mutation lane blocked");
         }
         child.respond(req.id, { ok: true });
@@ -562,7 +562,6 @@ describe("imsg rpc restart on -32004 Mutation lane blocked", () => {
     await settle(20);
 
     await channel.stop(); // kills the old mutation child: "slow" is rejected, the restart finds the channel gone
-    void held;
     await slow;
     const queuedErr = await queued;
     expect(queuedErr?.message).toMatch(/not sent/);
@@ -573,30 +572,18 @@ describe("imsg rpc restart on -32004 Mutation lane blocked", () => {
   });
 
   it("reports a send as not sent when the new mutation child fails to start", async () => {
-    const children: FakeChild[] = [];
-    const spawnFn = vi.fn(() => {
-      const child = new FakeChild();
-      const index = children.length;
-      children.push(child);
-      child.stdin.onLine = (req) => {
-        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
-        if (index === 1 && req.method === "send") return child.respondError(req.id, -32004, "Mutation lane blocked");
-        child.respond(req.id, { ok: true });
-      };
-      if (index >= 2) {
+    const { channel, children } = makeChannel({
+      responder: (req, child) => {
+        if (children.indexOf(child) === 1 && req.method === "send") return child.respondError(req.id, -32004, "Mutation lane blocked");
+        defaultResponder(req, child);
+      },
+      onSpawn: (child, index) => {
+        if (index < 2) return;
         // ENOENT-style spawn failure (the binary went away): no pid, 'error'
         // before anything is answered.
         child.stdin.onLine = null;
         queueMicrotask(() => child.emit("error", Object.assign(new Error("spawn imsg ENOENT"), { code: "ENOENT" })));
-      }
-      return child;
-    });
-    const channel = new ImsgChannel({
-      cliPath: "imsg",
-      spawnFn: spawnFn as never,
-      probeCapabilities: async () => CAPS_FULL,
-      serviceLookup: NULL_SERVICE_LOOKUP,
-      attachmentLookup: NULL_ATTACHMENT_LOOKUP,
+      },
     });
     await channel.start();
 
@@ -702,29 +689,25 @@ describe("imsg stdin backpressure", () => {
     });
     await channel.start();
     const child = mutationChildOf(channel);
-    const sentTexts = () => child.stdin.lines
-      .map((l) => JSON.parse(l) as RpcRequest)
-      .filter((r) => r.method === "send")
-      .map((r) => r.params.text);
 
     // The first send's write returns false (full pipe); its chain link then
     // waits for 'drain' before the next write is allowed through.
     child.stdin.backpressureWrites = 1;
     const p1 = channel.send({ chatId: DM_GUID, text: "first" });
     await settle();
-    expect(sentTexts()).toEqual(["first"]);
+    expect(sentTexts(child)).toEqual(["first"]);
 
     // The second send is queued behind the un-drained first write — its bytes
     // must not hit stdin yet.
     const p2 = channel.send({ chatId: DM_GUID, text: "second" });
     await settle();
-    expect(sentTexts()).toEqual(["first"]);
+    expect(sentTexts(child)).toEqual(["first"]);
     expect(child.stdin.listenerCount("drain")).toBeGreaterThan(0);
 
     // Drain releases the backlog; the held write now goes out, in order.
     child.stdin.emit("drain");
     await settle();
-    expect(sentTexts()).toEqual(["first", "second"]);
+    expect(sentTexts(child)).toEqual(["first", "second"]);
 
     // Answer the held sends so both calls resolve.
     for (const { id } of heldSends.splice(0)) child.respond(id, { ok: true });
@@ -733,12 +716,9 @@ describe("imsg stdin backpressure", () => {
   });
 
   it("fails a request cleanly once the pending queue is saturated", async () => {
-    // Answer only watch.subscribe, so every send stays pending forever.
-    const { channel } = makeChannel({
-      responder: (req, child) => {
-        if (req.method === "watch.subscribe") child.respond(req.id, { subscription: 1 });
-      },
-    });
+    // Every send stays pending forever. watch.unsubscribe is still answered:
+    // left unanswered, stop() waited out its 3 s request timeout.
+    const { channel } = makeChannel({ responder: leavingPending("send") });
     await channel.start();
 
     const rpc = (channel as unknown as { rpc: { request(method: string, params: Record<string, unknown>): Promise<unknown> } }).rpc;
@@ -753,18 +733,9 @@ describe("imsg stdin backpressure", () => {
     vi.useFakeTimers();
     // Sends stay unanswered: a response to the first send would settle its
     // parked link and release the queued second write before the timeout.
-    const { channel } = makeChannel({
-      responder: (req, child) => {
-        if (req.method === "send") return;
-        child.respond(req.id, req.method === "watch.subscribe" ? { subscription: 1 } : { ok: true });
-      },
-    });
+    const { channel } = makeChannel({ responder: leavingPending("send") });
     await channel.start();
     const child = mutationChildOf(channel);
-    const sentTexts = () => child.stdin.lines
-      .map((l) => JSON.parse(l) as RpcRequest)
-      .filter((r) => r.method === "send")
-      .map((r) => r.params.text);
 
     const rpc = (channel as unknown as { rpc: {
       request(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
@@ -777,7 +748,7 @@ describe("imsg stdin backpressure", () => {
     void (request("send", { chat_guid: DM_GUID, text: "first" }, 60_000) as Promise<unknown>).catch(() => {});
     const p2 = (request("send", { chat_guid: DM_GUID, text: "second" }, 1_000) as Promise<unknown>).catch((e: Error) => e);
     await settle();
-    expect(sentTexts()).toEqual(["first"]); // second not written — still queued
+    expect(sentTexts(child)).toEqual(["first"]); // second not written — still queued
 
     // The queued second request times out before drain releases it.
     await vi.advanceTimersByTimeAsync(1_000);
@@ -788,7 +759,7 @@ describe("imsg stdin backpressure", () => {
     // so no late/duplicate "second" send hits stdin.
     child.stdin.emit("drain");
     await settle();
-    expect(sentTexts()).toEqual(["first"]);
+    expect(sentTexts(child)).toEqual(["first"]);
     await channel.stop();
   });
 
@@ -796,18 +767,9 @@ describe("imsg stdin backpressure", () => {
     vi.useFakeTimers();
     // Answer only watch.subscribe/unsubscribe; sends stay pending so responses
     // can't resolve the parked link out from under the test.
-    const { channel } = makeChannel({
-      responder: (req, child) => {
-        if (req.method === "send") return;
-        child.respond(req.id, req.method === "watch.subscribe" ? { subscription: 1 } : { ok: true });
-      },
-    });
+    const { channel } = makeChannel({ responder: leavingPending("send") });
     await channel.start();
     const child = mutationChildOf(channel);
-    const sentTexts = () => child.stdin.lines
-      .map((l) => JSON.parse(l) as RpcRequest)
-      .filter((r) => r.method === "send")
-      .map((r) => r.params.text);
     const rpc = (channel as unknown as { rpc: {
       request(method: string, params: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
     } }).rpc;
@@ -819,14 +781,14 @@ describe("imsg stdin backpressure", () => {
     const p1 = (request("send", { chat_guid: DM_GUID, text: "first" }, 1_000) as Promise<unknown>).catch((e: Error) => e);
     const p2 = (request("send", { chat_guid: DM_GUID, text: "second" }, 60_000) as Promise<unknown>).catch(() => {});
     await settle();
-    expect(sentTexts()).toEqual(["first"]); // second queued behind the parked first
+    expect(sentTexts(child)).toEqual(["first"]); // second queued behind the parked first
 
     // First request times out → its parked write link settles → the chain
     // proceeds and the second write goes out (never wedged).
     await vi.advanceTimersByTimeAsync(1_000);
     expect((await p1 as Error).message).toMatch(/timed out/);
     await settle();
-    expect(sentTexts()).toEqual(["first", "second"]);
+    expect(sentTexts(child)).toEqual(["first", "second"]);
     void p2;
     await channel.stop();
   });
@@ -838,16 +800,12 @@ describe("imsg stdin backpressure", () => {
     const { channel } = makeChannel();
     await channel.start();
     const child = mutationChildOf(channel);
-    const sentTexts = () => child.stdin.lines
-      .map((l) => JSON.parse(l) as RpcRequest)
-      .filter((r) => r.method === "send")
-      .map((r) => r.params.text);
 
     child.stdin.backpressureWrites = 1; // first send parks on a full pipe
     const p1 = channel.send({ chatId: DM_GUID, text: "first" });
     const p2 = channel.send({ chatId: DM_GUID, text: "second" });
     await settle(12);
-    expect(sentTexts()).toEqual(["first", "second"]);
+    expect(sentTexts(child)).toEqual(["first", "second"]);
     await Promise.all([p1, p2]);
     await channel.stop();
   });
@@ -884,7 +842,6 @@ describe("imsg stdin backpressure", () => {
     await settle();
     expect(children).toHaveLength(3);
     expect(children[2].stdin.lines.map((l) => (JSON.parse(l) as RpcRequest).params.text)).toEqual(["next"]);
-    void subCount;
     await channel.stop();
   });
 });

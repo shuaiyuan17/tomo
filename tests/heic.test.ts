@@ -90,8 +90,34 @@ describe("HEIC extension detection", () => {
 });
 
 describe("HEIC magic-byte sniffing", () => {
-  it("detects a HEIF ftyp box by major or compatible brand", () => {
+  /** An ftyp box: declared size, major brand, minor version 0, compatible brands. */
+  const ftyp = (size: number, major: string, ...compatible: string[]) => {
+    const box = Buffer.alloc(16 + 4 * compatible.length);
+    box.writeUInt32BE(size, 0);
+    box.write(`ftyp${major}`, 4, "ascii");
+    compatible.forEach((brand, i) => box.write(brand, 16 + 4 * i, "ascii"));
+    return box;
+  };
+
+  it("detects a HEIF ftyp box by its major brand", () => {
     expect(sniffHeic(HEIC_HEADER)).toBe(true);
+  });
+
+  it("detects a HEIF ftyp box by a compatible brand when the major brand is not HEIF", () => {
+    expect(sniffHeic(ftyp(24, "mp42", "isom", "mif1"))).toBe(true);
+    expect(sniffHeic(ftyp(24, "MP42", "isom", "MIF1"))).toBe(true); // brands compare case-insensitively
+  });
+
+  it("ignores a compatible brand past the declared box size", () => {
+    // The box ends after "isom"; the "mif1" behind it belongs to the next box.
+    expect(sniffHeic(ftyp(20, "mp42", "isom", "mif1"))).toBe(false);
+  });
+
+  it("reads only the bytes there are when the box is truncated", () => {
+    // Declared 32 bytes, only 22 present: "mif1" is cut in half, so no match
+    // (and no read past the buffer).
+    expect(sniffHeic(ftyp(32, "mp42", "isom", "mif1").subarray(0, 22))).toBe(false);
+    expect(sniffHeic(ftyp(32, "mp42", "isom", "mif1"))).toBe(true);
   });
 
   it("does not misfire on JPEG, PNG, or MP4 headers", () => {
@@ -162,44 +188,27 @@ describe("convertHeicImage temp-file cleanup", () => {
     await vi.waitFor(() => expect(existsSync(capturedOut)).toBe(false));
   });
 
-  it("returns the output path on a successful (code 0) conversion", async () => {
+  it.each([
+    ["returns the output path on a successful (code 0) conversion", "/tmp/input.heic", "jpeg", "ffd8ffe0", /\.jpg$/],
+    ["targets PNG (format arg and .png output) when asked — the alpha-preserving path", "/tmp/sticker.heic", "png", "89504e47", /\.png$/],
+  ] as const)("%s", async (_, input, format, bytes, extension) => {
     let capturedOut = "";
     let capturedArgs: string[] = [];
     spawnMock.mockImplementation((_cmd: string, args: string[]) => {
       capturedArgs = args;
       capturedOut = outPathFromArgs(args);
-      writeFileSync(capturedOut, Buffer.from("ffd8ffe0", "hex"));
+      writeFileSync(capturedOut, Buffer.from(bytes, "hex"));
       const child = new FakeChild();
       queueMicrotask(() => child.emit("exit", 0));
       return child;
     });
 
-    const result = await convertHeicImage("/tmp/input.heic", "jpeg");
+    const result = await convertHeicImage(input, format);
 
     expect(result).toBe(capturedOut);
-    expect(capturedArgs.slice(0, 3)).toEqual(["-s", "format", "jpeg"]);
-    expect(capturedOut).toMatch(/\.jpg$/);
+    expect(capturedArgs.slice(0, 3)).toEqual(["-s", "format", format]);
+    expect(capturedOut).toMatch(extension);
     expect(existsSync(capturedOut)).toBe(true);
-    unlinkSync(capturedOut);
-  });
-
-  it("targets PNG (format arg and .png output) when asked — the alpha-preserving path", async () => {
-    let capturedOut = "";
-    let capturedArgs: string[] = [];
-    spawnMock.mockImplementation((_cmd: string, args: string[]) => {
-      capturedArgs = args;
-      capturedOut = outPathFromArgs(args);
-      writeFileSync(capturedOut, Buffer.from("89504e47", "hex"));
-      const child = new FakeChild();
-      queueMicrotask(() => child.emit("exit", 0));
-      return child;
-    });
-
-    const result = await convertHeicImage("/tmp/sticker.heic", "png");
-
-    expect(result).toBe(capturedOut);
-    expect(capturedArgs.slice(0, 3)).toEqual(["-s", "format", "png"]);
-    expect(capturedOut).toMatch(/\.png$/);
     unlinkSync(capturedOut);
   });
 });
@@ -369,8 +378,7 @@ describe("convertHeicImage against a real un-SIGTERM-able child", () => {
 
     // …but the escalation still runs (2s grace) even though the promise is
     // long settled.
-    await new Promise((r) => setTimeout(r, 3_000));
-    expect(alive(pid)).toBe(false);
+    await vi.waitFor(() => expect(alive(pid)).toBe(false), { timeout: 5_000, interval: 50 });
   }, 20_000);
 });
 

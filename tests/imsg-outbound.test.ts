@@ -2,10 +2,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it, expect, vi } from "vitest";
-import type { ImsgCapabilities } from "../src/channels/imessage-imsg.js";
 import { AttachmentUnreadableError } from "../src/channels/types.js";
 import { log } from "../src/logger.js";
-import { DeliveryPipeline } from "../src/agent/delivery-pipeline.js";
+import { DeliveryPipeline, PartialDeliveryError, failedDeliveryEntry } from "../src/agent/delivery-pipeline.js";
+import { DELIVERY_FAILED_MARKER } from "../src/agent/block-transcript.js";
 import {
   type RpcRequest,
   CAPS_FULL,
@@ -13,9 +13,10 @@ import {
   CAPS_RICHLINK,
   CAPS_STICKER,
   CAPS_ATTACHMENT,
+  CAPS_ALL,
+  defaultResponder,
   makeChannel,
   DM_GUID,
-  GROUP_GUID,
   inboundMessage,
   settle,
 } from "./helpers/fake-imsg.js";
@@ -50,66 +51,24 @@ describe("imsg outbound send", () => {
     await channel.stop();
   });
 
-  it("threads only the first chunk via send.rich when the bridge is up", async () => {
+  it.each([
+    ["the reply target", { replyTo: "guid-target" }, { reply_to: "guid-target" }],
+    ["the expressive-send effect", { effect: "confetti" }, { effect: "confetti" }],
+  ] as const)("sends %s via send.rich on the first chunk only", async (_, field, param) => {
     const { channel, requests } = makeChannel({ caps: CAPS_FULL });
     await channel.start();
 
     const longText = `${"x".repeat(3990)} ${"y".repeat(100)}`;
-    await channel.send({ chatId: DM_GUID, text: longText, replyTo: "guid-target" });
+    await channel.send({ chatId: DM_GUID, text: longText, ...field });
 
     const all = requests().filter((r) => r.method === "send" || r.method === "send.rich");
     expect(all[0].method).toBe("send.rich");
-    expect(all[0].params).toMatchObject({ chat_guid: DM_GUID, reply_to: "guid-target", part_index: 0 });
+    expect(all[0].params).toMatchObject({ chat_guid: DM_GUID, part_index: 0, ...param });
     for (const rest of all.slice(1)) {
       expect(rest.method).toBe("send");
-      expect(rest.params).not.toHaveProperty("reply_to");
+      for (const key of Object.keys(param)) expect(rest.params).not.toHaveProperty(key);
     }
-    await channel.stop();
-  });
-
-  it("falls back to a plain send when send.rich fails (bridge hiccup)", async () => {
-    const { channel, requests } = makeChannel({
-      responder: (req, child) => {
-        if (req.method === "watch.subscribe") return child.respond(req.id, { subscription: 1 });
-        if (req.method === "send.rich") return child.respondError(req.id, -32603, "Internal error", "bridge not running");
-        child.respond(req.id, { ok: true });
-      },
-    });
-    await channel.start();
-
-    await channel.send({ chatId: DM_GUID, text: "threaded!", replyTo: "guid-target" });
-
-    const methods = requests().map((r) => r.method);
-    expect(methods).toContain("send.rich");
-    expect(methods).toContain("send");
-    await channel.stop();
-  });
-
-  it("does not use send.rich without the bridge", async () => {
-    const { channel, requests } = makeChannel({ caps: CAPS_BASIC });
-    await channel.start();
-
-    await channel.send({ chatId: DM_GUID, text: "plain", replyTo: "guid-target" });
-
-    expect(requests().map((r) => r.method)).not.toContain("send.rich");
-    await channel.stop();
-  });
-
-  it("sends the expressive-send effect via send.rich on the first chunk only", async () => {
-    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
-    await channel.start();
-
-    const longText = `${"x".repeat(3990)} ${"y".repeat(100)}`;
-    await channel.send({ chatId: DM_GUID, text: longText, effect: "confetti" });
-
-    const all = requests().filter((r) => r.method === "send" || r.method === "send.rich");
-    expect(all[0].method).toBe("send.rich");
-    expect(all[0].params).toMatchObject({ chat_guid: DM_GUID, effect: "confetti", part_index: 0 });
-    for (const rest of all.slice(1)) {
-      expect(rest.method).toBe("send");
-      expect(rest.params).not.toHaveProperty("effect");
-    }
-    expect(all.map((s) => s.params.text).join(" ")).toBe(longText);
+    expect(all.map((r) => r.params.text).join(" ")).toBe(longText);
     await channel.stop();
   });
 
@@ -366,6 +325,9 @@ describe("imsg sticker sends", () => {
       expect(all[0].method).toBe("send.sticker");
       // Standalone sticker: exactly the chat target and the file — no
       // attach_to/part_index (attaching to a message is deliberately unwired).
+      // Verified against imsg v0.13.4 RPCServer+StickerHandlers.swift:
+      // supported params are chat_id|chat_identifier|chat_guid, file,
+      // attach_to, part_index.
       expect(all[0].params).toEqual({ chat_guid: DM_GUID, file: stickerPath });
       await channel.stop();
     });
@@ -619,6 +581,9 @@ describe("imsg threaded photo and sticker sends", () => {
       const all = requests().filter((r) => r.method === "send" || r.method === "send.attachment");
       expect(all).toHaveLength(1);
       expect(all[0].method).toBe("send.attachment");
+      // Verified against the installed imsg 0.14.1 RPC: `send.attachment`
+      // rejects unknown params by name ("unknown send.attachment param: ..."),
+      // and accepts reply_to — the only outbound RPC that threads a file.
       expect(all[0].params).toEqual({ chat_guid: DM_GUID, file: photoPath, reply_to: "guid-target" });
       // Target honoured, so the caller must NOT reoffer it to the next block.
       expect(result?.threaded).not.toBe(false);
@@ -680,18 +645,24 @@ describe("imsg threaded photo and sticker sends", () => {
     });
   });
 
-  it("throws a definite pre-flight error when the attachment file is missing, so nothing shipped spends the target", async () => {
+  it.each([
+    ["", "no caption"],
+    ["Here's the chart", "a caption"],
+  ])("throws a definite pre-flight error when the attachment file is missing, so nothing shipped spends the target (text %j: %s)", async (text) => {
     const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
     await channel.start();
 
     // Thrown, not swallowed: a `{ threaded: false }` return read as "shipped,
     // unthreaded" to the delivery pipeline, which then recorded the block as
-    // delivered. The pipeline owns the caption fallback on this error.
+    // delivered — and a caption handed over with the picture was lost. The
+    // pipeline owns the caption fallback on this error, so the channel sends
+    // neither the caption nor the picture: a channel-side send would be
+    // invisible to it.
     await expect(
-      channel.send({ chatId: DM_GUID, photo: "/nonexistent/pic.png", text: "", replyTo: "guid-target" }),
+      channel.send({ chatId: DM_GUID, photo: "/nonexistent/pic.png", text, replyTo: "guid-target" }),
     ).rejects.toBeInstanceOf(AttachmentUnreadableError);
 
-    expect(requests().filter((r) => r.method === "send" || r.method === "send.attachment")).toHaveLength(0);
+    expect(requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method))).toHaveLength(0);
     await channel.stop();
   });
 
@@ -1004,7 +975,7 @@ describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () 
 
   it("threads B after an unthreadable sticker", async () => {
     await withPhoto(async (stickerPath) => {
-      const { channel, requests } = makeChannel({ caps: { ...CAPS_STICKER, rpcMethods: new Set([...CAPS_STICKER.rpcMethods, "send.attachment"]), selectors: { ...CAPS_STICKER.selectors, sendAttachment: true } } });
+      const { channel, requests } = makeChannel({ caps: CAPS_ALL });
       await channel.start();
 
       await deliverBlocks(channel, DM_GUID, [`STICKER:${stickerPath}`, "B"], { replyTo: "guid-target" });
@@ -1035,95 +1006,86 @@ describe("imsg + delivery pipeline: a threaded turn always lands somewhere", () 
       await channel.stop();
     });
   });
+
+  // A missing attachment file must not swallow its caption: the channel throws
+  // AttachmentUnreadableError (above) and the pipeline delivers the caption as
+  // text and records only the picture as failed.
+  it("delivers the caption as text, threads it, and records only the picture as failed", async () => {
+    await withPhoto(async (mediaPath) => {
+      const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
+      await channel.start();
+      // The window the fix is about: the file exists at the pipeline's check
+      // and is gone by the time the channel looks.
+      const send = channel.send.bind(channel);
+      vi.spyOn(channel, "send").mockImplementation(async (message) => {
+        if (message.photo) rmSync(message.photo, { force: true });
+        return send(message);
+      });
+      const sender = pipeline.createBlockSender(channel, DM_GUID, { replyTo: "reply-target-guid" });
+      const block = `Here's the chart\nMEDIA:${mediaPath}`;
+
+      const err = await sender.deliver(block).then(() => null, (e: unknown) => e);
+      expect(err).toBeInstanceOf(PartialDeliveryError);
+
+      // The caption is the turn's last chance at the reply target.
+      const rich = requests().find((r) => r.method === "send.rich");
+      expect(rich?.params).toMatchObject({ text: "Here's the chart", reply_to: "reply-target-guid" });
+      expect(requests().filter((r) => r.method === "send.rich" || r.method === "send")).toHaveLength(1);
+      expect(requests().some((r) => r.method === "send.attachment")).toBe(false);
+      expect(failedDeliveryEntry(block, err)).toBe(`Here's the chart\n${DELIVERY_FAILED_MARKER}MEDIA:${mediaPath}`);
+      await channel.stop();
+    });
+  });
+
+  it("records the picture as delivered when only its separate caption send was refused", async () => {
+    // imsg ships a captioned picture as two RPCs. If the attachment resolves
+    // and the caption is refused, the channel reports the picture shipped
+    // (PartialSendError) and the pipeline must not un-deliver it. The refusal
+    // is definite, so the caption is retried as text — refused again here —
+    // and it alone is recorded as failed.
+    await withPhoto(async (mediaPath) => {
+      const { channel, requests } = makeChannel({
+        caps: CAPS_ATTACHMENT,
+        responder: (req, child) => {
+          // Refuse every TEXT send (a definite RPC refusal); accept the file.
+          if (typeof req.params.text === "string" && !req.params.file) return child.respondError(req.id, -32000, "refused");
+          defaultResponder(req, child);
+        },
+      });
+      await channel.start();
+      const sender = pipeline.createBlockSender(channel, DM_GUID);
+      const block = `Here's the chart\nMEDIA:${mediaPath}`;
+
+      const err = await sender.deliver(block).then(() => null, (e: unknown) => e);
+      expect(err).toBeInstanceOf(PartialDeliveryError);
+
+      expect(requests().filter((r) => r.method === "send" && r.params.file === mediaPath)).toHaveLength(1);
+      expect(failedDeliveryEntry(block, err)).toBe(`${DELIVERY_FAILED_MARKER}Here's the chart\nMEDIA:${mediaPath}`);
+      await channel.stop();
+    });
+  });
 });
 
 // --- RPC param-name contract (guards against field-name drift vs the imsg CLI) ---
 // Unit-test mocks don't know imsg's real field names, so a rename (e.g. the
 // tapback `reaction`→`kind` dogfood bug) can pass tests while silently
-// misbehaving on-device. These assert the EXACT param key set of every outbound
-// RPC against the verified v0.12.3 imsg handler contract, so drift fails loudly.
+// misbehaving on-device. Every outbound RPC's EXACT params are asserted with
+// `toEqual` where its behaviour is tested, against the verified v0.12.3 imsg
+// handler contract: plain send ("reports the drop when the bridge is down"),
+// send with a file and send.attachment (threaded photo describe), send.sticker
+// (sticker sends), and tapback / message.unsend / message.edit / group.rename /
+// read (imsg-actions.test.ts). The three below have no such home, so their key
+// sets are pinned here.
 
 describe("imsg outbound RPC param-name contract", () => {
-  const editSelectorCaps: ImsgCapabilities = {
-    ...CAPS_FULL,
-    rpcMethods: new Set([...CAPS_FULL.rpcMethods, "message.edit"]),
-    selectors: { ...CAPS_FULL.selectors, editMessageItem: true },
-  };
   const keysOf = (requests: () => RpcRequest[], method: string) =>
     Object.keys(requests().find((r) => r.method === method)?.params ?? {}).sort();
-
-  it("send (plain text) → chat_guid, text", async () => {
-    const { channel, requests } = makeChannel();
-    await channel.start();
-    await channel.send({ chatId: DM_GUID, text: "hi" });
-    expect(keysOf(requests, "send")).toEqual(["chat_guid", "text"]);
-    await channel.stop();
-  });
-
-  it("send (attachment) → chat_guid, file", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-contract-"));
-    const photoPath = join(dir, "pic.png");
-    writeFileSync(photoPath, "x");
-    try {
-      const { channel, requests } = makeChannel();
-      await channel.start();
-      await channel.send({ chatId: DM_GUID, photo: photoPath });
-      expect(keysOf(requests, "send")).toEqual(["chat_guid", "file"]);
-      await channel.stop();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("send.sticker → chat_guid, file", async () => {
-    // Verified against imsg v0.13.4 RPCServer+StickerHandlers.swift:
-    // supported params are chat_id|chat_identifier|chat_guid, file, attach_to,
-    // part_index; we send exactly chat_guid + file (standalone sticker).
-    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-contract-"));
-    const stickerPath = join(dir, "sticker.png");
-    writeFileSync(stickerPath, "x");
-    try {
-      const { channel, requests } = makeChannel({ caps: CAPS_STICKER });
-      await channel.start();
-      await channel.send({ chatId: DM_GUID, text: "", sticker: stickerPath });
-      expect(keysOf(requests, "send.sticker")).toEqual(["chat_guid", "file"]);
-      await channel.stop();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("send.attachment (threaded attachment) → chat_guid, file, reply_to", async () => {
-    // Verified against the installed imsg 0.14.1 RPC: `send.attachment`
-    // rejects unknown params by name ("unknown send.attachment param: ..."),
-    // and accepts reply_to — the only outbound RPC that threads a file.
-    const dir = mkdtempSync(join(tmpdir(), "tomo-imsg-contract-"));
-    const photoPath = join(dir, "pic.png");
-    writeFileSync(photoPath, "x");
-    try {
-      const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
-      await channel.start();
-      await channel.send({ chatId: DM_GUID, photo: photoPath, replyTo: "guid-target" });
-      expect(keysOf(requests, "send.attachment")).toEqual(["chat_guid", "file", "reply_to"]);
-      await channel.stop();
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
 
   it("send.rich (threaded reply) → chat_guid, part_index, reply_to, text", async () => {
     const { channel, requests } = makeChannel({ caps: CAPS_FULL });
     await channel.start();
     await channel.send({ chatId: DM_GUID, text: "hi", replyTo: "guid-target" });
     expect(keysOf(requests, "send.rich")).toEqual(["chat_guid", "part_index", "reply_to", "text"]);
-    await channel.stop();
-  });
-
-  it("tapback → chat_guid, kind, message_guid, part_index, remove", async () => {
-    const { channel, requests } = makeChannel();
-    await channel.start();
-    await channel.reactToMessage(DM_GUID, "m-1", "love");
-    expect(keysOf(requests, "tapback")).toEqual(["chat_guid", "kind", "message_guid", "part_index", "remove"]);
     await channel.stop();
   });
 
@@ -1137,43 +1099,9 @@ describe("imsg outbound RPC param-name contract", () => {
     await channel.stop();
   });
 
-  it("read → chat_guid", async () => {
-    const { channel, children, requests } = makeChannel({ caps: CAPS_FULL });
-    await channel.start();
-    channel.onMessage(vi.fn(async () => true));
-    children[0].notifyMessage(inboundMessage());
-    await vi.waitFor(() => expect(requests().some((r) => r.method === "read")).toBe(true));
-    expect(keysOf(requests, "read")).toEqual(["chat_guid"]);
-    await channel.stop();
-  });
-
-  it("message.unsend → chat_guid, message_guid, part_index", async () => {
-    const { channel, requests } = makeChannel();
-    await channel.start();
-    await channel.unsendMessage(DM_GUID, "m-1");
-    expect(keysOf(requests, "message.unsend")).toEqual(["chat_guid", "message_guid", "part_index"]);
-    await channel.stop();
-  });
-
-  it("message.edit → backwards_compatibility_message, chat_guid, message_guid, part_index, text", async () => {
-    const { channel, requests } = makeChannel({ caps: editSelectorCaps });
-    await channel.start();
-    await channel.editMessage(DM_GUID, "m-1", "fixed");
-    expect(keysOf(requests, "message.edit")).toEqual([
-      "backwards_compatibility_message", "chat_guid", "message_guid", "part_index", "text",
-    ]);
-    await channel.stop();
-  });
-
-  it("group.rename → chat_guid, name", async () => {
-    const { channel, requests } = makeChannel();
-    await channel.start();
-    await channel.setChatTitle(GROUP_GUID, "New Title");
-    expect(keysOf(requests, "group.rename")).toEqual(["chat_guid", "name"]);
-    await channel.stop();
-  });
-
-  it("watch.subscribe → attachments, convert_attachments, include_reactions (+ since_rowid when resuming)", async () => {
+  it("watch.subscribe → attachments, convert_attachments, include_reactions", async () => {
+    // A resumed watch adds since_rowid: "does NOT advance the cursor when
+    // dispatch throws, so the row replays" (imsg-inbound.test.ts).
     const { channel, requests } = makeChannel();
     await channel.start();
     expect(keysOf(requests, "watch.subscribe")).toEqual(["attachments", "convert_attachments", "include_reactions"]);

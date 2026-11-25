@@ -73,18 +73,6 @@ describe("imsg tapback, unsend, and edit", () => {
     await channel.stop();
   });
 
-  it("refuses edit with a clean error when the macOS edit selectors are gone", async () => {
-    // Ground truth for macOS 26.5: editMessageItem and editMessage both
-    // probed unavailable — calling message.edit blindly is what #227 was.
-    const { channel, requests } = makeChannel({ caps: CAPS_FULL });
-    await channel.start();
-
-    await expect(channel.editMessage(DM_GUID, "mine-1", "fixed text"))
-      .rejects.toThrow(/editing is unsupported on this macOS/i);
-    expect(requests().map((r) => r.method)).not.toContain("message.edit");
-    await channel.stop();
-  });
-
   it("edits via message.edit when a selector probe confirms support", async () => {
     const caps: ImsgCapabilities = {
       ...CAPS_FULL,

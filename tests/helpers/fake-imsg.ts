@@ -3,7 +3,10 @@
 // capability fixtures the channel probes, and a `makeChannel` that wires them
 // into an ImsgChannel with chat.db lookups stubbed out.
 import { EventEmitter } from "node:events";
-import { vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { onTestFailed, vi } from "vitest";
 import { ImsgChannel, type ImsgCapabilities, type ImsgChannelConfig } from "../../src/channels/imessage-imsg.js";
 import { NULL_SERVICE_LOOKUP } from "../../src/channels/imsg-satellite.js";
 import { NULL_ATTACHMENT_LOOKUP } from "../../src/channels/imsg-attachment-lookup.js";
@@ -114,10 +117,20 @@ export const CAPS_ATTACHMENT: ImsgCapabilities = {
   selectors: { ...CAPS_FULL.selectors, sendAttachment: true },
 };
 
+/** Both the sticker and the attachment surfaces. */
+export const CAPS_ALL: ImsgCapabilities = {
+  ...CAPS_FULL,
+  rpcMethods: new Set([...CAPS_STICKER.rpcMethods, ...CAPS_ATTACHMENT.rpcMethods]),
+  selectors: { ...CAPS_STICKER.selectors, ...CAPS_ATTACHMENT.selectors },
+};
+
 export function makeChannel(options: {
   caps?: ImsgCapabilities;
   responder?: Responder;
   config?: Partial<ImsgChannelConfig>;
+  /** Called with each child as it is spawned (0 = the first), after its
+   *  responder is wired — e.g. to make a later spawn fail. */
+  onSpawn?: (child: FakeChild, index: number) => void;
 } = {}) {
   const children: FakeChild[] = [];
   const responder = options.responder ?? defaultResponder;
@@ -125,6 +138,7 @@ export function makeChannel(options: {
     const child = new FakeChild();
     child.stdin.onLine = (req) => responder(req, child);
     children.push(child);
+    options.onSpawn?.(child, children.length - 1);
     return child;
   });
   const channel = new ImsgChannel({
@@ -136,6 +150,19 @@ export function makeChannel(options: {
     serviceLookup: NULL_SERVICE_LOOKUP,
     attachmentLookup: NULL_ATTACHMENT_LOOKUP,
     ...options.config,
+  });
+  // A test that fails mid-way never reaches its own `await channel.stop()`,
+  // which would leave the channel's timers and fake children running into the
+  // next test. Stop it for a failed test only: a passing test stops (or
+  // deliberately does not start) its channel itself.
+  let stopped = false;
+  const stop = channel.stop.bind(channel);
+  channel.stop = async () => {
+    stopped = true;
+    await stop();
+  };
+  onTestFailed(async () => {
+    if (!stopped) await stop().catch(() => {});
   });
   return {
     channel,
@@ -180,3 +207,66 @@ export const inboundMessage = (overrides: Record<string, unknown> = {}): Record<
 export async function settle(times = 6): Promise<void> {
   for (let i = 0; i < times; i++) await Promise.resolve();
 }
+
+/** `defaultResponder`, except the named methods are never answered: those
+ *  requests stay pending. Everything else (watch.subscribe, watch.unsubscribe
+ *  on stop, ...) is answered, so stop() does not wait out a request timeout. */
+export function leavingPending(...methods: string[]): Responder {
+  return (req, child) => {
+    if (!methods.includes(req.method)) defaultResponder(req, child);
+  };
+}
+
+/** The `text` param of every `send` a child was asked for, in order. */
+export function sentTexts(child: FakeChild): unknown[] {
+  return child.stdin.lines
+    .map((l) => JSON.parse(l) as RpcRequest)
+    .filter((r) => r.method === "send")
+    .map((r) => r.params.text);
+}
+
+/** vi.waitFor polling every 5 ms instead of its default 50 ms: the channel
+ *  usually settles within a few microtask turns, and 50 ms per wait added up
+ *  to seconds across these files. */
+export function waitFor<T>(fn: () => T | Promise<T>, options: { timeout?: number } = {}): Promise<T> {
+  return vi.waitFor(fn, { interval: 5, ...options });
+}
+
+/** Fake setTimeout/setInterval/Date but keep setImmediate real, so real fs IO
+ *  can complete while the channel's clocks are under the test's control. */
+export const useFakeClock = () =>
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+
+/** Spin real IO turns (setImmediate) `rounds` times. */
+export async function flushIo(rounds = 200): Promise<void> {
+  for (let i = 0; i < rounds; i++) await new Promise<void>((r) => setImmediate(r));
+}
+
+/** Spin real IO turns until `cond` holds, and throw if it never does. Bounded
+ *  by REAL time (performance.now is not faked), not by a turn count: how many
+ *  loop turns a stat/readFile/write takes depends on the machine and on
+ *  coverage instrumentation, which is exactly what made fixed counts flaky on
+ *  CI. It throws rather than returning at the bound, so a test waiting for
+ *  something that never happens fails instead of carrying on as if it had. */
+export async function ioUntil(cond: () => boolean, maxMs = 10_000): Promise<void> {
+  const start = performance.now();
+  while (!cond()) {
+    if (performance.now() - start >= maxMs) throw new Error(`ioUntil: condition still false after ${maxMs} ms`);
+    await new Promise<void>((r) => setImmediate(r));
+  }
+}
+
+/** Run `fn` with a fresh temp directory, removed afterwards whatever happens. */
+export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T> | T): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  try {
+    return await fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Magic bytes of the image formats the inbound path sniffs. The HEIC one is a
+ *  bare `ftyp` box with major brand `heic` and compatible brand `mif1`. */
+export const HEIC_BYTES = Buffer.from("000000246674797068656963000000006d696631", "hex");
+export const PNG_BYTES = Buffer.from("89504e470d0a1a0a", "hex");

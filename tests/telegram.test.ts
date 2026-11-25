@@ -1085,9 +1085,9 @@ describe("TelegramChannel.startTyping", () => {
     return { channel, calls };
   }
 
-  // The loop itself (no overlap, giving up after maxErrors, the TTL) is
-  // tests/typing-loop.test.ts; Telegram only passes it its constants
-  // (interval 6s, 10 errors, 2-minute cap), which these pin.
+  // The loop's own rules are tests/typing-loop.test.ts. These pin the
+  // constants Telegram passes it (interval 6s, 10 errors, 2-minute cap), and
+  // that startTyping uses the loop at all (the no-overlap test below).
   it("sends typing immediately and every 6s until stopped", async () => {
     const { channel, calls } = makeChannel(async () => true);
     const stop = channel.startTyping("42");
@@ -1097,6 +1097,25 @@ describe("TelegramChannel.startTyping", () => {
     expect(stop()).toBeUndefined();
     await vi.advanceTimersByTimeAsync(60_000);
     expect(calls).toHaveLength(3);
+  });
+
+  // Revert-catcher: before the shared typing loop, a sendChatAction slower
+  // than the 6s interval was re-sent on every tick while still in flight.
+  it("does not overlap a sendChatAction slower than the interval", async () => {
+    let release: () => void = () => {};
+    const { channel, calls } = makeChannel(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve(true);
+        }),
+    );
+    const stop = channel.startTyping("42");
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(calls).toHaveLength(1);
+    release();
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(calls).toHaveLength(2);
+    stop();
   });
 
   it("gives up after 10 consecutive errors", async () => {

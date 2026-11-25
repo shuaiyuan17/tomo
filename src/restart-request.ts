@@ -410,7 +410,9 @@ export function consumeRestartRequestFromToolResult(
   }
   try {
     unlinkSync(path);
-  } catch {
+  } catch (err) {
+    // Claimed by someone else between our read and our unlink: as missing.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") onDiscard?.({ path, reason: "missing", requestId: id });
     return null;
   }
   return request;

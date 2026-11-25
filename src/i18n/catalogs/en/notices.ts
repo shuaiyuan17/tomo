@@ -44,6 +44,7 @@ export const notices = {
       cronJob: "Cron job \"{{name}}\"", heartbeat: "A heartbeat turn", restart: "A restart notice turn",
       interruptedAgents: "An interrupted-subagents notice turn",
       subsessionReport: "A sub-session report turn",
+      subsessionMirror: "A turn that watched a sub-session conversation",
     },
     label: {
       group: "group \"{{title}}\" ({{key}})", groupUntitled: "group {{key}}",

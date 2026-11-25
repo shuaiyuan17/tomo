@@ -218,7 +218,8 @@ export interface WebCostSession {
   /** The web session id when the browser can open it (owner DM, groups). */
   id?: string;
   label: string;
-  kind: "dm" | "group" | "other";
+  /** task: a sub-session (`task:<id>`), labelled `s3 · title`. */
+  kind: "dm" | "group" | "other" | "task";
   costUsd: number;
   turns: number;
   byCategory: WebCostSplit;

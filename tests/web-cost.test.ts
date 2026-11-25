@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { startWebHttp } from "../src/web/http.js";
 import { WebData } from "../src/web/data.js";
 import { SessionStore } from "../src/sessions/store.js";
+import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { webSessionId } from "../src/web/owner.js";
 import { usageDataDir } from "../src/usage/dir.js";
 import type { WebCost } from "../src/web/protocol.js";
@@ -98,6 +99,21 @@ describe("GET /api/v1/cost", () => {
     expect(body.topTurns[0]).toMatchObject({ trigger: "plan my trip", tools: 3, durationMs: 4000, session: { label: "owner (DM)" } });
     expect(body.limits).toEqual({ sampledAt: "2026-11-15T01:00:00.000Z", source: "oauth-usage",
       windows: [{ window: "seven_day", label: "Weekly", group: "weekly", percent: 61, resetsAt: "2026-11-17T00:00:00.000Z", status: "normal" }] });
+  });
+
+  it("names a sub-session's turns by its id and title, and by id alone when the task table is unreadable", async () => {
+    writeFileSync(join(usage, "2026-11.ndjson"), [
+      row("2026-11-14T10:00:00+09:00", 4, { sessionKey: "task:s3", source: "system" }),
+      row("2026-11-14T11:00:00+09:00", 1, { sessionKey: "task:s9", source: "system" }),
+    ].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    mkdirSync(join(root, "data"), { recursive: true });
+    writeFileSync(join(root, "data", "subsessions.json"), "{ not json");
+    const labels = async () => (JSON.parse((await call("/api/v1/cost?from=2026-11-14&to=2026-11-15")).text) as WebCost).sessions.map((s) => [s.label, s.kind]);
+    expect(await labels()).toEqual([["s3", "task"], ["s9", "task"]]);
+    rmSync(join(root, "data", "subsessions.json"));
+    const tasks = new SubsessionStore(join(root, "data", "subsessions.json"));
+    for (const title of ["One", "Two", "Fix CI"]) tasks.create({ parentKey: "dm:owner", title, brief: "b", model: "opus" });
+    expect(await labels()).toEqual([["s3 · Fix CI", "task"], ["s9", "task"]]);
   });
 
   it("defaults to the last 30 days and refuses a bad range", async () => {

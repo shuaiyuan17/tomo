@@ -48,6 +48,7 @@ export const cost = {
     note_other: "{{turns}} turns. Background is heartbeats and turns that pick up finished subagents.",
     overcounted: " Includes over-counted days.",
     scheduled: "Scheduled jobs", scheduledLabel: "Cost by scheduled job", last_one: "last {{count}} day", last_other: "last {{count}} days",
+    tasks: "Sub-sessions", tasksLabel: "Cost by sub-session", turns_one: "{{count}} turn", turns_other: "{{count}} turns",
     runs_one: "{{count}} run", runs_other: "{{count}} runs", runsEach_one: "{{count}} run · {{each}} each", runsEach_other: "{{count}} runs · {{each}} each",
   },
 } as const;

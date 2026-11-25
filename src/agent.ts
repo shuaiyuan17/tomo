@@ -21,6 +21,8 @@ import { parseTaskAddress, type TaskAddress } from "./agent/subsessions/address.
 import { taskCommandReply } from "./agent/subsessions/commands.js";
 import { SubsessionStore } from "./agent/subsessions/store.js";
 import { buildSubsessionPrompt } from "./agent/subsessions/prompt.js";
+import { createTodoLink } from "./agent/subsessions/todo-link.js";
+import { TodoStore } from "./todos/store.js";
 import { CRON_STORE_PATH } from "./cron/store.js";
 import { createTaskCronLink } from "./agent/subsessions/cron-link.js";
 import { EFFORT_LEVELS, type EffortLevel } from "./config.js";
@@ -63,7 +65,7 @@ import { RewindError } from "./agent/session-rewind.js";
 import { SessionQueue } from "./agent/session-queue.js";
 import { PendingNotesQueue } from "./agent/pending-notes-queue.js";
 import { DeliveryPipeline, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./agent/delivery-pipeline.js";
-import { TurnRunner, type OwnerNoticeTarget, type RunWithRetryRequest, type ShutdownTurnEnd } from "./agent/turn-runner.js";
+import { TurnRunner, type MirrorTicket, type OwnerNoticeTarget, type RunWithRetryRequest, type ShutdownTurnEnd } from "./agent/turn-runner.js";
 import { OwnerErrorNotifier } from "./agent/owner-error-notice.js";
 import { formatGroupTag } from "./agent/inbound-markers.js";
 import { CredentialBroker } from "./credentials/broker.js";
@@ -188,6 +190,10 @@ export class Agent {
   private readonly restarts: RestartCoordinator;
   /** Sub-sessions (long tasks in their own `task:` sessions); undefined while `subsessions.enabled` is off. */
   readonly subsessions: SubsessionService | undefined;
+  /** Sessions with a sub-session mirror note in flight: one at a time (see takeMirrorNote). */
+  private readonly mirrorInFlight = new Set<string>();
+  /** Sessions with a mirror wake turn queued: later rounds ride on it. */
+  private readonly mirrorWakeQueued = new Set<string>();
   private readonly ownerNotices: OwnerNotices;
   private readonly mcpAuthPrompts: McpAuthPrompts;
   private pendingNotesQueue: PendingNotesQueue;
@@ -300,6 +306,14 @@ export class Agent {
       settlePromptContextNote: (ticket, told) => {
         if (told) this.liveSessionManager.settlePromptContextNote(ticket);
         else this.liveSessionManager.restorePromptContextNote(ticket);
+      },
+      // What the owner and this session's sub-sessions said to each other,
+      // read from the task table each time (so never replayed stale after a
+      // restart) and marked seen only by a turn that completed.
+      takeMirrorNote: (sessionKey) => this.takeMirrorNote(sessionKey),
+      settleMirrorNote: (ticket, told) => {
+        this.mirrorInFlight.delete(ticket.key);
+        if (told) this.subsessions?.markMirrorSeen(ticket.upTo);
       },
       // Persisted (sessions' pending-notes file): a reply the owner never got
       // must still be known to the next turn if the daemon restarts first.
@@ -507,9 +521,8 @@ export class Agent {
       config: () => config.subsessions,
       runTaskTurn: (key, prompt, opts) => this.runTaskTurn(key, prompt, opts),
       sendToScope: async (parentKey, text, taskKey, noteFrom, harnessPrefix) => {
-        // A task owned by the owner's DM speaks for the owner alone: the note
-        // of its send never drains into a summoned group's turn there.
-        const result = await this.proactive.sendToSession(parentKey, text, taskKey, { noteFrom, harnessPrefix, ownerOnlyNote: isDmSessionKey(parentKey) });
+        // No direct-send note: the owning session sees what its tasks say through the mirror.
+        const result = await this.proactive.sendToSession(parentKey, text, taskKey, { noteFrom, harnessPrefix, skipNote: true });
         return result.ok
           ? { ok: true, ...(result.channel ? { channel: result.channel } : {}), ...(result.messageIds ? { messageIds: result.messageIds } : {}) }
           : { ok: false, error: result.error };
@@ -550,6 +563,47 @@ export class Agent {
       registryTaskKeys: () => this.sessions.listActiveEntries().map((e) => e.channelKey).filter(isTaskSessionKey),
       isStopping: () => this.stopping,
       sessionQuotaPercent: () => readSessionWindowPercent(join(usageDataDir(config.tomoHome), "limits.ndjson")),
+      ...(config.subsessions.todos ? { todos: createTodoLink(new TodoStore()) } : {}),
+      mirrorWake: (parentKey) => this.mirrorWake(parentKey),
+    });
+  }
+
+  /**
+   * The sub-session mirror note for a turn on `key`: only a turn of the
+   * session's own audience (a summoned group's turn on the owner's session
+   * gets none), and one at a time per session, so two overlapping turns never
+   * both claim the same lines.
+   */
+  private takeMirrorNote(key: string): MirrorTicket | undefined {
+    if (!this.subsessions || this.mirrorInFlight.has(key) || !this.isOwnAudienceTurn(key)) return undefined;
+    const note = this.subsessions.mirrorNote(key);
+    if (!note) return undefined;
+    this.mirrorInFlight.add(key);
+    return { key, prefix: `${note.text}\n\n`, upTo: note.upTo };
+  }
+
+  /**
+   * mirror "turn": a silent turn on the owning session so it sees a round of
+   * a task's conversation with the owner. One queued at a time; when it runs
+   * it carries everything unseen by then (rounds merge), and it does not run
+   * at all if another turn has already shown it.
+   */
+  private mirrorWake(parentKey: string): void {
+    if (this.mirrorWakeQueued.has(parentKey)) return;
+    this.mirrorWakeQueued.add(parentKey);
+    const prompt = appendToTomoEventBody(formatTomoEvent("subsession-activity",
+      "A sub-session conversation is shown above. Take it in; nothing you write here is sent. If nothing needs doing, end with NO_REPLY.",
+      { name: "check" }), CONTINUITY_DELIVERY_NOTE);
+    this.enqueueForSession(parentKey, async () => {
+      this.mirrorWakeQueued.delete(parentKey);
+      // Only for words the owner wrote (another turn may have shown them meanwhile).
+      if (this.stopping || !this.subsessions?.hasUnseenOwnerWords(parentKey)) return;
+      // Asked again here: the quota window can fill while the wake waits.
+      if (!this.subsessions.mirrorTurnAllowed()) return;
+      await this.processContinuity(prompt, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionMirror"), "background");
+    }).catch((err) => {
+      this.mirrorWakeQueued.delete(parentKey);
+      log.error({ err, sessionKey: parentKey }, "Sub-session mirror turn failed in queue");
     });
   }
 
@@ -1351,12 +1405,9 @@ export class Agent {
     if (result.ok) {
       this.inbox?.markDone(inboxId ? [inboxId] : []);
       if (!result.duplicate) {
+        // The owning session learns of it through the mirror (the task's
+        // conversation log), with what the task said back.
         log.info({ channel: channel.name, task: result.record.id, status: result.record.status }, "Owner message handed to a sub-session");
-        if (scope) {
-          this.queuePendingNote(scope, markOwnerAudience(formatTomoEvent("subsession-activity",
-            `The owner wrote to sub-session ${result.record.id} ("${result.record.title}") directly: "${message.text}"`,
-            { name: result.record.id })));
-        }
         if (result.record.status === "queued") {
           void channel.send({ chatId: message.chatId, text: ownerT("subsessions")("cmd.queuedMessage", { id: result.record.id }) })
             .catch((err) => log.warn({ err }, "Could not acknowledge a message to a queued sub-session"));
@@ -1840,6 +1891,7 @@ export class Agent {
         if (settled) return;
         settled = true;
         if (!(err instanceof TurnInterruptedError)) log.error({ err, key }, "Sub-session background turn failed");
+        this.subsessions?.onBackgroundTurnFailed(key);
       },
     };
   }
@@ -2471,7 +2523,7 @@ export class Agent {
 
   async handleCronMessage(message: string, sessionKey: string, options: CronTurnOptions = {}): Promise<boolean> {
     // A sub-session's check-back is a lifecycle event, not a turn of its own:
-    // the service wakes the task through its scheduler (slots, quota).
+    // the service wakes the task through its scheduler (slots).
     if (isTaskSessionKey(sessionKey)) return this.subsessions?.onCronFire(sessionKey, message) ?? false;
     return this.enqueueForSession(sessionKey, () => this.processCronMessage(message, sessionKey, options))
       .catch((err) => {

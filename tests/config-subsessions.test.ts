@@ -28,7 +28,7 @@ describe("subsessions config", () => {
     const { config, DEFAULT_SUBSESSIONS } = await loadConfigWith({});
     expect(config.subsessions).toEqual(DEFAULT_SUBSESSIONS);
     expect(config.subsessions.enabled).toBe(true);
-    expect(DEFAULT_SUBSESSIONS).toEqual({ enabled: true, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null, maxActiveHours: 24 });
+    expect(DEFAULT_SUBSESSIONS).toEqual({ enabled: true, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null, mirror: "turn", maxActiveHours: 24, todos: true });
   });
 
   it("can be turned off, and takes a wall-clock cap (0 = none)", async () => {
@@ -44,6 +44,15 @@ describe("subsessions config", () => {
     const { config, configIssues } = await loadConfigWith({ subsessions: { enabled: true, maxRunning: 0, defaultModel: "sonnet" } });
     expect(config.subsessions).toMatchObject({ enabled: true, maxRunning: 2, defaultModel: "sonnet" });
     expect(configIssues.join("\n")).toContain("subsessions.maxRunning");
+  });
+
+  it("takes the Phase 2 keys and refuses a bad mirror mode", async () => {
+    const { config, configIssues } = await loadConfigWith({ subsessions: { mirror: "lots", maxActiveHours: 0, todos: false } });
+    expect(config.subsessions).toMatchObject({ mirror: "turn", maxActiveHours: 0, todos: false });
+    expect(configIssues.join("\n")).toContain("subsessions.mirror");
+    const bad = await loadConfigWith({ subsessions: { mirror: "always" } });
+    expect(bad.config.subsessions.mirror).toBe("turn");
+    expect(bad.configIssues.join("\n")).toContain("subsessions.mirror");
   });
 
   it("keeps sub-sessions off LCM compaction (the harness sends /compact)", async () => {

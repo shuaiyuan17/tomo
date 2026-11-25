@@ -49,6 +49,7 @@ export const cost = {
     note_other: "共 {{turns}} 轮。后台指心跳，以及接手已完成 subagent 的对话。",
     overcounted: "包含多算的天数。",
     scheduled: "定时任务", scheduledLabel: "按定时任务的费用", last_other: "最近 {{count}} 天",
+    tasks: "子会话", tasksLabel: "按子会话的费用", turns_other: "{{count}} 轮",
     runs_other: "{{count}} 次运行", runsEach_other: "{{count}} 次运行 · 每次 {{each}}",
   },
 } satisfies Translation<typeof en>;

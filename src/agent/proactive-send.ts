@@ -15,7 +15,7 @@ import { DELIVERY_FAILED_MARKER } from "./block-transcript.js";
 import type { DeliverySegment } from "./delivery-pipeline.js";
 import { detectFabricatedMarkers, markFabricatedText, recordFabricatedMarkers } from "./inbound-markers.js";
 import { normalizeSendTarget } from "./send-target.js";
-import { formatTomoEvent, markOwnerAudience } from "../tomo-event.js";
+import { formatTomoEvent } from "../tomo-event.js";
 
 /**
  * `channel` and `messageIds` (direct mode): where the text went and the
@@ -87,12 +87,12 @@ export class ProactiveSendService {
    * A pending note is queued so the recipient's next Claude turn has context.
    */
   /**
+   * `options.skipNote`: no note for the target session (a sub-session's own
+   * words reach its owning session through the mirror instead).
    * `options.noteFrom` names the sender in the note the target session gets
    * ("Your sub-session s3 (...)"), in place of "Tomo from another session".
-   * `options.ownerOnlyNote` marks that note for the owner's own turns: a
-   * summoned group's turn on the same session never drains it.
    */
-  async sendToSession(target: string, rawText: string, callerSessionKey?: string, options?: { replyTo?: string; effect?: string; noteFrom?: string; harnessPrefix?: string; ownerOnlyNote?: boolean }): Promise<SendResult> {
+  async sendToSession(target: string, rawText: string, callerSessionKey?: string, options?: { replyTo?: string; effect?: string; noteFrom?: string; harnessPrefix?: string; skipNote?: boolean }): Promise<SendResult> {
     const text = rawText;
     const resolved = this.resolveSendTarget(target);
     if (!resolved) {
@@ -317,7 +317,7 @@ export class ProactiveSendService {
         : options?.noteFrom
           ? `${options.noteFrom} sent the following message to this conversation earlier: "${deliveredText}"`
           : `Tomo from another session sent the following message to this conversation earlier: "${deliveredText}"`);
-    this.deps.queuePendingNote(sessionKey, options?.ownerOnlyNote ? markOwnerAudience(sendNote) : sendNote);
+    if (!options?.skipNote) this.deps.queuePendingNote(sessionKey, sendNote);
 
     log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length, effect, fabricatedMarkers: fabricated.length || undefined }, "Message sent (direct)");
     const note = [fabricatedNote, effectNote, attachmentNote].filter((n): n is string => n !== undefined).join(" ");

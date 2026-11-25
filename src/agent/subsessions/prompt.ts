@@ -1,5 +1,5 @@
 import { formatTomoEvent } from "../../tomo-event.js";
-import type { SubsessionRecord } from "./types.js";
+import type { SubsessionConversationEntry, SubsessionRecord } from "./types.js";
 
 /**
  * A sub-session's system prompt. Not buildSystemPrompt(): no SOUL, AGENT or
@@ -161,4 +161,42 @@ function recordReminder(record: SubsessionRecord): string {
 
 function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+/** One mirrored line is cut at this length (task_status shows what the task sent in full). */
+export const MIRROR_ENTRY_MAX = 1500;
+
+/**
+ * The owning session's view of what the owner and its tasks said to each
+ * other (config `subsessions.mirror`). The same text serves both modes: the
+ * prefix of a silent "turn" wake, or of the session's next turn ("note").
+ * Attachment paths stay out (a MEDIA: line becomes "[attachment]"; the
+ * owner's files are only counted).
+ */
+export function formatMirrorNote(tasks: Array<{ record: SubsessionRecord; entries: SubsessionConversationEntry[] }>): string {
+  const lines = [
+    "The owner talked with your sub-sessions directly; this is a record of that conversation, for you to know about. The owner has already seen it, so don't repeat it back, and don't answer it on the task's behalf.",
+    "If it affects other work (another task, a decision you made), tell the task with task_message, or raise it the next time the owner talks to you.",
+  ];
+  for (const { record, entries } of tasks) {
+    lines.push("", `${record.id} · "${record.title}" (now ${statusPhrase(record)}):`);
+    for (const entry of entries) {
+      const who = entry.from === "owner" ? "owner" : `${record.id} (${entry.kind === "fallback" ? "its own text, sent for it" : entry.kind})`;
+      const files = entry.files ? ` [${entry.files} file${entry.files === 1 ? "" : "s"} attached]` : "";
+      lines.push(`- ${who}: ${mirrorText(entry.text)}${files}`);
+    }
+  }
+  return formatTomoEvent("subsession-activity", lines.join("\n"), { name: "mirror" });
+}
+
+function mirrorText(text: string): string {
+  const clean = text.replace(/MEDIA:\S+/g, "[attachment]").trim();
+  const cut = clean.length <= MIRROR_ENTRY_MAX ? clean : `${clean.slice(0, MIRROR_ENTRY_MAX - 1)}… (cut)`;
+  // Continuation lines indented under their bullet.
+  return cut.replace(/\n/g, "\n  ");
+}
+
+function statusPhrase(record: SubsessionRecord): string {
+  if (record.status === "waiting") return record.waitingOn === "owner" ? "waiting for the owner" : "waiting on something external";
+  return record.status === "active" ? "working" : record.status;
 }

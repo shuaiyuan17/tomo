@@ -142,6 +142,34 @@ export function captureSend(list: readonly Attachment[]): { keys: string[]; ids:
     refiled: done.flatMap((item) => (item.filed ? [item.filed.path] : [])) };
 }
 
+/**
+ * What a tab keeps of its tray across a reload (sessionStorage): the
+ * finished uploads, by id, with the name, type and size the message needs.
+ * iPad Safari reloads a backgrounded tab freely; without this the tray came
+ * back empty while its uploads sat staged on the server, and the next
+ * message went without them.
+ */
+export interface KeptUpload { uploadId: string; kind: "image" | "file"; name: string; type: string; size: number }
+export function keptUploads(list: readonly Attachment[]): KeptUpload[] {
+  return list.flatMap((item) => item.status === "done" && item.uploadId && !item.filed
+    ? [{ uploadId: item.uploadId, kind: item.kind ?? "image", name: item.file.name, type: item.file.type, size: item.file.size }] : []);
+}
+export function parseKeptUploads(raw: string | null): KeptUpload[] {
+  if (!raw) return [];
+  try {
+    const value = JSON.parse(raw) as unknown;
+    if (!Array.isArray(value)) return [];
+    return value.filter((item): item is KeptUpload => !!item && typeof item === "object"
+      && typeof item.uploadId === "string" && /^[a-f0-9]{32}$/.test(item.uploadId) && (item.kind === "image" || item.kind === "file")
+      && typeof item.name === "string" && item.name.length <= 1024 && typeof item.type === "string" && item.type.length <= 255
+      && typeof item.size === "number" && Number.isFinite(item.size) && item.size >= 0).slice(0, MAX_ATTACHMENTS);
+  } catch { return []; }
+}
+/** A kept upload back in the tray, finished: `preview` is its thumbnail (an object URL), "" for a file. */
+export function restoredAttachment(key: string, kept: KeptUpload, preview: string, size = kept.size): Attachment {
+  return { key, file: { name: kept.name, type: kept.type, size } as File, preview, kind: kept.kind, status: "done", progress: 1, uploadId: kept.uploadId };
+}
+
 /** One atomic tray change: `dropKeys` leave, `added` come in (order kept). Returns what was dropped, for its cleanup. */
 export function replaceItems(current: readonly Attachment[], dropKeys: readonly string[], added: readonly Attachment[]): { next: Attachment[]; dropped: Attachment[] } {
   const drop = new Set(dropKeys);

@@ -41,6 +41,8 @@ export const chat = {
   image: { alt: "Image", gone: "Image (no longer available)", open: "Open image", openSticker: "Open sticker", sticker: "Sticker", close: "Close image" },
   file: {
     label: "File {{name}}", labelSize: "File {{name}}, {{size}}",
+    download: "Download {{name}}", preview: "Preview {{name}}", previewTitle: "Preview", closePreview: "Close preview",
+    loading: "Loading…", failed: "Could not load this file",
     documents_one: "Document", documents_other: "{{count}} documents", files_one: "File", files_other: "{{count}} files",
   },
   reply: { reacting: "Reacting to", replying: "Replying to" },

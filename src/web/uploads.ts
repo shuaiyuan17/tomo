@@ -123,6 +123,24 @@ export function readUpload(dir: string, uploadId: string, now = Date.now()): { b
   return undefined;
 }
 
+/**
+ * Web process: a staged upload the page still holds after a reload (its tray
+ * is kept in sessionStorage): an image's bytes, for the thumbnail, or a
+ * file's size. Undefined when the id is malformed, unknown, claimed,
+ * expired, or (an image) no longer one by its bytes — the page then drops it.
+ */
+export function peekUpload(dir: string, uploadId: string, now = Date.now()): { kind: "image"; bytes: Buffer; type: string } | { kind: "file"; size: number } | undefined {
+  if (!UPLOAD_ID.test(uploadId)) return undefined;
+  const image = readUpload(dir, uploadId, now);
+  if (image) return { kind: "image", ...image };
+  let fd: number;
+  try { fd = openSync(join(dir, `${uploadId}.${FILE_EXT}`), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); } catch { return undefined; }
+  try {
+    const stat = fstatSync(fd);
+    return stat.isFile() && stat.size <= MAX_UPLOAD_FILE_BYTES && now - stat.mtimeMs <= UPLOAD_TTL_MS ? { kind: "file", size: stat.size } : undefined;
+  } finally { closeSync(fd); }
+}
+
 /** Daemon: remove staged uploads once their message is recorded. */
 export function removeUploads(dir: string, uploadIds: readonly string[]): void {
   for (const id of uploadIds) discardUpload(dir, id);

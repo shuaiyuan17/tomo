@@ -391,6 +391,16 @@ export interface Channel {
   onCommand(handler: CommandHandler): void;
 
   /**
+   * Web only: file an attachment (`MEDIA:` path) that the session `sessionKey`
+   * delivered on ANOTHER channel, under `ref` (the `mediaRef` its transcript
+   * record carries), so the web history shows it instead of "no longer
+   * available". Best effort, never throws; ignores sessions the web does not
+   * mirror. The path has already passed that delivery's own private-memory
+   * and group checks; the store asks the private-memory question again.
+   */
+  mirrorMedia?(sessionKey: string, ref: string, path: string): void;
+
+  /**
    * Register the predicate a channel may consult before spending real
    * resources (a remote download, a conversion, a write to disk) on an inbound
    * message. Optional on both sides: the Agent registers one for every channel

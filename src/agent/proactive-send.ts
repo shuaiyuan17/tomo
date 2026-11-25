@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import type { Channel, IncomingMessage, MessageReaction, RecentChatMessage, SendResult as ChannelSendResult } from "../channels/types.js";
 import { IMESSAGE_SEND_EFFECTS } from "../channels/types.js";
@@ -50,7 +51,9 @@ export interface ProactiveSendDeps {
   dmReplyTarget(sessionKey: string): ReplyTarget | undefined;
   /** Router.sessionReplyTarget: dm keys as above; raw keys (groups included) persisted, else parsed. */
   sessionReplyTarget(sessionKey: string): ReplyTarget | undefined;
-  appendAssistantTranscript(sessionKey: string, content: string, channelName: string): void;
+  appendAssistantTranscript(sessionKey: string, content: string, channelName: string, correlation?: { mediaRef?: string }): void;
+  /** File a delivered attachment for the web view under `ref` (Channel.mirrorMedia, via the agent). */
+  mirrorMedia?(sessionKey: string, ref: string, path: string): void;
   setChatTitle(sessionKey: string, title: string): void;
   listActiveEntries(): SessionEntry[];
   queuePendingNote(sessionKey: string, note: string): void;
@@ -167,6 +170,14 @@ export class ProactiveSendService {
       if (result && result.messageIds) messageIds.push(...result.messageIds);
     };
     const { cleanText, mediaPaths, stickerIds } = extractAttachments(text);
+    // What a non-web send delivered is filed for the web view under this ref,
+    // which the transcript record carries (see Channel.mirrorMedia).
+    const mediaRef = randomUUID();
+    let mirrored = false;
+    const mirror = (path: string) => {
+      if (replyTarget.channelName === "web" || !this.deps.mirrorMedia) return;
+      try { this.deps.mirrorMedia(sessionKey, mediaRef, path); mirrored = true; } catch { /* best effort */ }
+    };
 
     // PRIVATE ATTACHMENTS FOLLOW THE CALLER'S AUDIENCE. The PreToolUse guard
     // stops a barred turn's send_message; this is the same rule at the outlet,
@@ -230,6 +241,7 @@ export class ProactiveSendService {
         try {
           keepIds(await channel.send({ chatId: replyTarget.chatId, photo: path, text: "" }));
           segment.delivered = true;
+          mirror(path);
         } catch (err) {
           log.warn({ err, sessionKey, path }, "Direct send: attachment failed after the text was delivered");
         }
@@ -240,6 +252,7 @@ export class ProactiveSendService {
         try {
           await channel.send({ chatId: replyTarget.chatId, sticker: stickerId, text: "" });
           segment.delivered = true;
+          if (/^[/~]/.test(stickerId)) mirror(stickerId);
         } catch (err) {
           log.warn({ err, sessionKey, sticker: stickerId }, "Direct send: sticker failed after the text was delivered");
         }
@@ -303,6 +316,7 @@ export class ProactiveSendService {
         sessionKey,
         fromSummoner ? `[via dm:${summoned} (summoned)] ${transcriptText}` : `[proactive] ${transcriptText}`,
         replyTarget.channelName,
+        ...(mirrored ? [{ mediaRef }] : []),
       );
     } catch (err) {
       // The channel send already succeeded. Reporting a tool failure here

@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { WebBootstrap } from "./api.js";
-import { ApiError, discardUpload, uploadImage } from "./api.js";
+import { ApiError, discardUpload, readStagedUpload, uploadImage } from "./api.js";
 import type { WebFiledFile } from "../../src/web/protocol.js";
-import { addFiles, filedAttachment, isAttachableImage, replaceItems, takeSent, updateAttachment, type Attachment } from "./uploads.js";
+import { addFiles, filedAttachment, MAX_ATTACHMENTS, isAttachableImage, keptUploads, parseKeptUploads, replaceItems, restoredAttachment, takeSent, updateAttachment, type Attachment } from "./uploads.js";
 import { deferred, type Message } from "./i18n/message.js";
 
 const failure = (error: unknown) => {
@@ -33,9 +33,18 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
    * see the other. React state is only its rendered copy.
    */
   const list = useRef<Attachment[]>([]);
+  /** Where this tab keeps its finished uploads across a reload (see KeptUpload). */
+  const storageKey = targetId ? `tomo-tray:${targetId}` : undefined;
+  const kept = useRef(storageKey);
+  kept.current = storageKey;
   const commit = useCallback((change: (current: readonly Attachment[]) => Attachment[]) => {
     list.current = change(list.current);
     setItems(list.current);
+    if (kept.current) {
+      const keep = keptUploads(list.current);
+      try { if (keep.length) sessionStorage.setItem(kept.current, JSON.stringify(keep)); else sessionStorage.removeItem(kept.current); }
+      catch { /* Storage can be unavailable: the tray just does not survive a reload. */ }
+    }
   }, []);
   const aborts = useRef(new Map<string, AbortController>());
   const counter = useRef(0);
@@ -118,6 +127,35 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
     if (!kept.length) setNote([]);
     return taken;
   }, [commit]);
+
+  /**
+   * After a reload: the uploads this tab had finished come back into the
+   * tray — each one the server still holds (unsent, unexpired), with its
+   * thumbnail read back from there. One it no longer has is dropped.
+   */
+  const restored = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (!storageKey || restored.current === storageKey) return;
+    restored.current = storageKey;
+    let wanted: ReturnType<typeof parseKeptUploads>;
+    try { wanted = parseKeptUploads(sessionStorage.getItem(storageKey)); } catch { return; }
+    if (!wanted.length) return;
+    void Promise.all(wanted.map(async (item) => {
+      try {
+        const found = await readStagedUpload(item.uploadId);
+        if (!found) return null;
+        return found.kind === "image" ? restoredAttachment("", item, URL.createObjectURL(found.blob), found.blob.size)
+          : restoredAttachment("", { ...item, kind: "file" }, "", found.size);
+      } catch { return null; }
+    })).then((back) => {
+      const items = back.filter((item): item is Attachment => !!item);
+      // Another conversation by now (or a full tray): what did not go back stays staged until it expires.
+      const fits = kept.current === storageKey ? items.filter((item) => !list.current.some((entry) => entry.uploadId === item.uploadId))
+        .slice(0, Math.max(0, MAX_ATTACHMENTS - list.current.length)) : [];
+      for (const item of items) if (!fits.includes(item) && item.preview) URL.revokeObjectURL(item.preview);
+      if (fits.length) commit((old) => [...fits.map((item) => ({ ...item, key: `a${++counter.current}` })), ...old]);
+    });
+  }, [storageKey, commit]);
 
   useEffect(() => () => { for (const controller of aborts.current.values()) controller.abort(); }, []);
   return { items, note, add, replaceAll, remove, retry, take };

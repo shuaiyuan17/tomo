@@ -18,7 +18,10 @@ export type MessagePart =
   /** `files`: each file's name and size, where the marker gives them (shown as a card each). */
   | { kind: "attachment"; label: string; names: string[]; files?: Array<{ name: string; size?: string }> }
   /** Pictures the agent sent, by outgoing-store id; null: no longer available. */
-  | { kind: "sent"; ids: (string | null)[] };
+  | { kind: "sent"; ids: (string | null)[] }
+  /** Files (not pictures) the agent sent, by outgoing-store id: a download card each. */
+  | { kind: "sentFiles"; files: SentFile[] };
+export interface SentFile { id: string; name: string; size: number }
 
 /** Thumbnails shown per message; the rest are counted as "+N more". */
 export const MAX_IMAGES = 20;
@@ -66,16 +69,19 @@ export function splitAttachments(content: string): MessagePart[] {
 
 /**
  * The server rewrites each picture the agent sent (`MEDIA:<path>`,
- * `STICKER:<path>`) to `MEDIA:web:<id>` — or `MEDIA:web:gone` when it was
- * never filed (an older message, another channel's turn). Consecutive ones
- * form one row of thumbnails; the text between is parsed as usual.
+ * `STICKER:<path>`) to `MEDIA:web:<id>`, any other file to
+ * `MEDIA:web:file:<id>:<bytes>:<name>` — or `MEDIA:web:gone` when it was
+ * never filed (an older message). Consecutive pictures form one row of
+ * thumbnails, consecutive files one row of cards; the text between is parsed
+ * as usual. (Every MEDIA: tag of a message is rewritten, so the model cannot
+ * write a token of its own.)
  */
-export const SENT_TOKEN = /MEDIA:web:([a-f0-9]{32}|gone)\b/g;
+export const SENT_TOKEN = /MEDIA:web:(?:([a-f0-9]{32})|gone|file:([a-f0-9]{32}):(\d{1,12}):([A-Za-z0-9._-]{1,120}))(?![A-Za-z0-9_-])/g;
 export function splitMessage(content: string): MessagePart[] {
   const parts: MessagePart[] = [];
-  let run: (string | null)[] | null = null;
+  let run: MessagePart & { kind: "sent" | "sentFiles" } | null = null;
   let last = 0;
-  const flush = () => { if (run) parts.push({ kind: "sent", ids: run }); run = null; };
+  const flush = () => { if (run) parts.push(run); run = null; };
   const text = (chunk: string) => {
     if (!chunk.trim()) return;
     flush();
@@ -83,11 +89,24 @@ export function splitMessage(content: string): MessagePart[] {
   };
   for (const match of content.matchAll(SENT_TOKEN)) {
     text(content.slice(last, match.index));
-    (run ??= []).push(match[1] === "gone" ? null : match[1]);
     last = match.index! + match[0].length;
+    if (match[2]) {
+      if (run?.kind !== "sentFiles") { flush(); run = { kind: "sentFiles", files: [] }; }
+      run.files.push({ id: match[2], size: Number(match[3]), name: match[4] });
+    } else {
+      if (run?.kind !== "sent") { flush(); run = { kind: "sent", ids: [] }; }
+      run.ids.push(match[1] ?? null);
+    }
   }
   if (!parts.length && !run) return splitAttachments(content);
   text(content.slice(last));
   flush();
   return parts;
+}
+
+/** Shown in place when the file's text is small enough: by its name (the store keeps no type). */
+export const PREVIEW_LIMIT = 512 * 1024;
+const TEXT_NAME = /\.(?:md|markdown|txt|text|log|csv|tsv|json|jsonl|ya?ml|toml|ini|xml|html?|css|s?js|mjs|cjs|tsx?|jsx|py|rb|go|rs|swift|kt|java|c|h|cc|cpp|hpp|m|sh|zsh|bash|sql|diff|patch|env\.example|conf)$/i;
+export function isPreviewable(file: { name: string; size: number }): boolean {
+  return file.size <= PREVIEW_LIMIT && TEXT_NAME.test(file.name);
 }

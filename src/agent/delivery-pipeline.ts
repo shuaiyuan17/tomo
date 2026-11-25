@@ -209,6 +209,13 @@ export interface DeliverOptions {
    * ship only what it may read. Absent, the private-memory check alone.
    */
   attachmentBarred?: (path: string) => boolean;
+  /**
+   * Called for each `MEDIA:` path (and path `STICKER:`) once its send has
+   * RESOLVED — the reader has it. The web view files it from here, so a
+   * picture the owner's conversation sent on iMessage also shows on the web
+   * (Channel.mirrorMedia). Must not throw; a throw is logged and ignored.
+   */
+  onMediaShipped?: (path: string) => void;
 }
 
 /**
@@ -373,6 +380,9 @@ export class DeliveryPipeline {
         // the hot path for the overwhelming majority of blocks that carry no
         // media at all.
         const barred = (media.length > 0 || stickers.length > 0) && (options.blockPrivateMedia?.() ?? false);
+        const shipped = (path: string) => {
+          try { options.onMediaShipped?.(path); } catch (err) { log.warn({ err, chatId }, "Could not file a delivered attachment for the web view"); }
+        };
         /** Some piece was refused by policy: reported in the receipt. */
         let withheld = false;
         for (const { path, segment } of media) {
@@ -396,6 +406,7 @@ export class DeliveryPipeline {
             // channel's own open are different instants, and a file that
             // vanishes in between takes the whole send down.
             segment.delivered = true;
+            shipped(path);
             if (carriesCaption) {
               captionSegment!.delivered = true;
               captionState = "sent";
@@ -407,7 +418,7 @@ export class DeliveryPipeline {
             // definite/ambiguous character.
             const partial = raw instanceof PartialSendError ? raw : null;
             const err = partial ? partial.failure : raw;
-            if (partial?.shipped.photo) segment.delivered = true;
+            if (partial?.shipped.photo) { segment.delivered = true; shipped(path); }
             // Definite is not enough to free the caption: a captioned picture
             // whose caption went out as several text parts may have had a
             // LATER part refused (definite) after earlier parts landed.
@@ -457,6 +468,7 @@ export class DeliveryPipeline {
           try {
             await send({ chatId, text: "", sticker: id, ...offerReplyTo() });
             segment.delivered = true;
+            if (/^[/~]/.test(id)) shipped(id);
           } catch (err) {
             noteFailure(err, provablyUndelivered(err));
             log.warn({ err, sticker: id, chatId }, "Sticker send failed; delivering the rest of the block");

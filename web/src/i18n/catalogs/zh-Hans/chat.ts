@@ -43,6 +43,8 @@ export const chat = {
   image: { alt: "图片", gone: "图片（已失效）", open: "打开图片", openSticker: "打开贴纸", sticker: "贴纸", close: "关闭图片" },
   file: {
     label: "文件 {{name}}", labelSize: "文件 {{name}}，{{size}}",
+    download: "下载 {{name}}", preview: "预览 {{name}}", previewTitle: "预览", closePreview: "关闭预览",
+    loading: "加载中…", failed: "无法读取这个文件",
     documents_other: "{{count}} 个文档", files_other: "{{count}} 个文件",
   },
   reply: { reacting: "回应", replying: "回复" },

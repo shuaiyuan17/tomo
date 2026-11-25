@@ -326,6 +326,7 @@ export class Agent {
         formatTomoEvent("errors", note, { name: "delivery" }),
       ),
       runWithRetry: (req) => this.runWithRetry(req),
+      mirrorMedia: (sessionKey, ref, path) => this.mirrorMediaToWeb(sessionKey, ref, path),
       appendAssistantTranscript: (sessionKey, content, channelName, correlation) => {
         this.sessions.append(sessionKey, {
           role: "assistant",
@@ -482,14 +483,16 @@ export class Agent {
       getSummonedIdentity: (channelName, chatId) => this.router.getSummonedIdentity(channelName, chatId),
       dmReplyTarget: (sessionKey) => this.router.dmReplyTarget(sessionKey),
       sessionReplyTarget: (sessionKey) => this.router.sessionReplyTarget(sessionKey),
-      appendAssistantTranscript: (sessionKey, content, channelName) => {
+      appendAssistantTranscript: (sessionKey, content, channelName, correlation) => {
         this.sessions.append(sessionKey, {
           role: "assistant",
+          ...correlation,
           content,
           channel: channelName,
           timestamp: Date.now(),
         });
       },
+      mirrorMedia: (sessionKey, ref, path) => this.mirrorMediaToWeb(sessionKey, ref, path),
       setChatTitle: (sessionKey, title) => this.sessions.setChatTitle(sessionKey, title),
       listActiveEntries: () => this.sessions.listActiveEntries(),
       queuePendingNote: (sessionKey, note) => this.queuePendingNote(sessionKey, note),
@@ -792,6 +795,11 @@ export class Agent {
   }
 
   /** Look up a channel by name */
+  /** An attachment delivered on another channel, filed for the web view (Channel.mirrorMedia); best effort. */
+  private mirrorMediaToWeb(sessionKey: string, ref: string, path: string): void {
+    try { this.getChannel("web")?.mirrorMedia?.(sessionKey, ref, path); } catch (err) { log.debug({ err }, "Attachment not mirrored to the web view"); }
+  }
+
   private getChannel(name: string): Channel | undefined {
     return this.channels.find((ch) => ch.name === name);
   }

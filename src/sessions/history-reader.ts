@@ -66,7 +66,8 @@ export async function readHistoryPage(
             || !Number.isFinite(m.timestamp) || typeof m.channel !== "string") continue;
           const id = createHash("sha256").update(`${basename(file)}:${ordinal}:${line}`).digest("base64url");
           const record: PositionedRecord = { id, order, role: m.role, content: m.content, timestamp: m.timestamp,
-            channel: m.channel, ...(m.requestId ? { requestId: m.requestId } : {}), ...(m.turnId ? { turnId: m.turnId } : {}) };
+            channel: m.channel, ...(m.requestId ? { requestId: m.requestId } : {}), ...(m.turnId ? { turnId: m.turnId } : {}),
+            ...(typeof m.mediaRef === "string" && m.mediaRef.length <= 64 ? { mediaRef: m.mediaRef } : {}) };
           if (before && compare(position(record), before) >= 0) continue;
           let low = 0; let high = tail.length;
           while (low < high) {

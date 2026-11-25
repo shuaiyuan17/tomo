@@ -304,6 +304,81 @@ describe("POST /uploads with files on: the same gate as images", () => {
     expect(JSON.parse(big.text).error).toBe("too_large");
     expect(readdirSync(dir)).toHaveLength(1);
   });
+  it("GET /uploads/<id> gives a reloaded page back what it staged (an image's bytes, a file's size) — owner session only, never a claimed or unknown one", async () => {
+    const image = JSON.parse((await upload(PNG)).text).uploadId as string;
+    const file = JSON.parse((await upload(MD)).text).uploadId as string;
+    const got = await call(`/api/v1/uploads/${image}`);
+    expect(got.status).toBe(200);
+    expect(got.headers["content-type"]).toBe("image/png");
+    expect(got.headers["x-content-type-options"]).toBe("nosniff");
+    const info = await call(`/api/v1/uploads/${file}`);
+    expect(info.status).toBe(200);
+    expect(JSON.parse(info.text)).toEqual({ kind: "file", size: MD.length });
+    // Not the access cookie: refused like any API read.
+    const saved = cookie; cookie = "";
+    expect((await call(`/api/v1/uploads/${image}`)).status).toBe(401);
+    cookie = saved;
+    // Without the API header (an <img> or a navigation from another site): refused.
+    expect((await call(`/api/v1/uploads/${image}`, { headers: { "x-tomo-request": "" } })).status).toBeGreaterThanOrEqual(400);
+    for (const bad of ["0".repeat(32), "../uploads", `${image}.png`, image.toUpperCase()]) expect((await call(`/api/v1/uploads/${encodeURIComponent(bad)}`)).status).toBe(404);
+    // Claimed by a message (sent): gone for the page too.
+    const claim = claimUploads(dir, [image], "req-1")!;
+    expect((await call(`/api/v1/uploads/${image}`)).status).toBe(404);
+    claim.release();
+    expect((await call(`/api/v1/uploads/${image}`)).status).toBe(200);
+  });
+});
+
+describe("GET /sessions/<id>/outgoing/<id>: a file the agent sent is only ever a download", () => {
+  let service: Awaited<ReturnType<typeof startWebHttp>>;
+  let cookie = "";
+  const accessToken = "tomo_web_" + "c".repeat(64);
+  const call = (path: string, headers: Record<string, string> = {}) =>
+    new Promise<{ status: number; body: Buffer; headers: HttpIncoming["headers"] }>((resolve, reject) => {
+      const req = request({ host: "127.0.0.1", port: service.port, path, method: "GET",
+        headers: { "sec-fetch-site": "same-origin", "sec-fetch-dest": "empty", ...(cookie ? { cookie } : {}), ...headers } }, (res) => {
+        const parts: Buffer[] = []; res.on("data", (part: Buffer) => parts.push(part));
+        res.on("end", () => resolve({ status: res.statusCode!, body: Buffer.concat(parts), headers: res.headers }));
+      });
+      req.on("error", reject);
+      req.end();
+    });
+  it("served as application/octet-stream with Content-Disposition: attachment and a sandbox CSP; a picture is still an image; same gate as the rest", async () => {
+    const sessionsDir = join(root, "sessions"), sdkSessionsDir = join(root, "sdk"), assetsDir = join(root, "assets"), workspace = join(root, "workspace");
+    mkdirSync(assetsDir, { recursive: true }); writeFileSync(join(assetsDir, "index.html"), "<!doctype html>");
+    const { SessionStore } = await import("../src/sessions/store.js");
+    new SessionStore(sessionsDir, 20, sdkSessionsDir).setSdkSessionId("dm:owner", "sdk-1");
+    const { OutgoingMediaStore, outgoingImagesDir } = await import("../src/web/outgoing-media.js");
+    const store = new OutgoingMediaStore(outgoingImagesDir(workspace));
+    writeFileSync(join(root, "page.html"), "<script>alert(1)</script>");
+    const html = store.file("dm:owner", ["r"], join(root, "page.html"));
+    writeFileSync(join(root, "pic.png"), PNG);
+    const pic = store.file("dm:owner", ["r"], join(root, "pic.png"));
+    service = await startWebHttp(0, { accessToken, assetsDir, data: new WebData({ sessionsDir, sdkSessionsDir, workspaceDir: workspace, owner: { name: "owner", telegram: ["test-owner"], imessage: [] } }),
+      subscribe: () => () => {}, rpc: async () => ({ snapshot: { requests: [], blocks: [] }, replay: null }) });
+    const boot = await new Promise<HttpIncoming>((resolve) => request({ host: "127.0.0.1", port: service.port, path: `/api/v1/bootstrap?t=${accessToken}`, headers: { "x-tomo-request": "1", "sec-fetch-site": "same-origin" } }, resolve).end());
+    boot.resume();
+    cookie = boot.headers["set-cookie"]![0].split(";")[0];
+    const sid = webSessionId("dm:owner");
+    const got = await call(`/api/v1/sessions/${sid}/outgoing/${html.id}`);
+    expect(got.status).toBe(200);
+    expect(got.headers["content-type"]).toBe("application/octet-stream");
+    expect(got.headers["content-disposition"]).toBe('attachment; filename="page.html"');
+    expect(got.headers["content-security-policy"]).toContain("sandbox");
+    expect(got.headers["x-content-type-options"]).toBe("nosniff");
+    expect(got.body.toString()).toBe("<script>alert(1)</script>");
+    const image = await call(`/api/v1/sessions/${sid}/outgoing/${pic.id}`, { "sec-fetch-dest": "image" });
+    expect(image.headers["content-type"]).toBe("image/png");
+    expect(image.headers["content-disposition"]).toBeUndefined();
+    // A navigation (another site, or a top-level open) is refused; so is no cookie, another session, a bent id.
+    expect((await call(`/api/v1/sessions/${sid}/outgoing/${html.id}`, { "sec-fetch-dest": "document" })).status).toBe(403);
+    expect((await call(`/api/v1/sessions/${sid}/outgoing/${html.id}`, { "sec-fetch-site": "cross-site" })).status).toBe(403);
+    expect((await call(`/api/v1/sessions/${webSessionId("telegram:-1")}/outgoing/${html.id}`)).status).toBe(404);
+    expect((await call(`/api/v1/sessions/${sid}/outgoing/..%2Findex`)).status).toBeGreaterThanOrEqual(400);
+    cookie = "";
+    expect((await call(`/api/v1/sessions/${sid}/outgoing/${html.id}`)).status).toBe(401);
+    await service.close();
+  });
 });
 
 describe("the page's side", () => {

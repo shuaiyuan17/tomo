@@ -5,14 +5,7 @@ import { join } from "node:path";
 
 // Stub the logger so the intentionally-failing "bad baseDir" test doesn't
 // flush a real ERROR line to stderr. Same pattern as imageStore.test.ts.
-vi.mock("../src/logger.js", () => ({
-  log: {
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  },
-}));
+vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
 const {
   buildDocumentPath,
@@ -70,7 +63,7 @@ describe("formatDocumentMarker", () => {
     expect(formatDocumentMarker(0, [])).toBe("");
   });
 
-  it("singular vs plural", () => {
+  it("singular vs plural, without paths when none were saved", () => {
     expect(formatDocumentMarker(1, [])).toBe("[Sent a document]");
     expect(formatDocumentMarker(3, [])).toBe("[Sent 3 documents]");
   });
@@ -82,10 +75,6 @@ describe("formatDocumentMarker", () => {
     expect(formatDocumentMarker(2, ["/tmp/a.pdf", "/tmp/b.pdf"])).toBe(
       "[Sent 2 documents, saved to: /tmp/a.pdf, /tmp/b.pdf]",
     );
-  });
-
-  it("falls back to no-paths form when intended > saved", () => {
-    expect(formatDocumentMarker(2, [])).toBe("[Sent 2 documents]");
   });
 });
 
@@ -223,24 +212,24 @@ describe("readBodyWithCap", () => {
   });
 
   it("returns null and stops reading when cap is exceeded mid-stream", async () => {
-    let secondChunkRead = false;
+    // An endless body, produced on demand: only a reader that stops and
+    // cancels the source ever returns.
+    let pulls = 0;
+    let cancelled = false;
     const stream = new ReadableStream<Uint8Array>({
-      start(controller) {
-        controller.enqueue(new Uint8Array(10));
-        // Schedule a second chunk; if cap-cancellation works, this enqueue
-        // happens but the reader is already cancelled.
-        controller.enqueue(new Uint8Array(20));
-        secondChunkRead = true;
-        controller.close();
+      pull(controller) {
+        pulls++;
+        controller.enqueue(new Uint8Array(4));
       },
-    });
-    const res = new Response(stream);
-    const buf = await readBodyWithCap(res, 5);
+      cancel() {
+        cancelled = true;
+      },
+    }, { highWaterMark: 0 });
+    const buf = await readBodyWithCap(new Response(stream), 10);
     expect(buf).toBeNull();
-    // The second-chunk enqueue does happen at start time; what we really
-    // assert is the cap-hit returns null without throwing or buffering past
-    // the cap. The flag just confirms the start callback ran.
-    expect(secondChunkRead).toBe(true);
+    expect(cancelled).toBe(true);
+    // 4 + 4 + 4 crosses 10 on the third chunk; nothing is read after that.
+    expect(pulls).toBe(3);
   });
 
   it("falls back to arrayBuffer + post-check when body is missing", async () => {

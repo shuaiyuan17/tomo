@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { spawn, spawnSync } from "node:child_process";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import {
   isRecordedProcessLive, readLivePidFileRecord, stopRecordedDaemon, waitForExit, DAEMON_STOP_TIMEOUT_MS,
 } from "../src/cli/pidfile.js";
 import { getRunningPid } from "../src/cli/status-info.js";
+import { deadPid } from "./helpers/lock-fixtures.js";
 
 let dir: string;
 let pidFile: string;
@@ -21,20 +22,6 @@ beforeEach(() => {
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
-
-/**
- * A pid that is guaranteed dead: spawn a process that exits immediately.
- * Checked, not `.pid!`: under a loaded full-suite run a spawn can fail
- * (EAGAIN), and an `undefined` pid slips past `isPidAlive` (false) only to
- * fail a later `toEqual` as an inexplicable flake.
- */
-function deadPid(): number {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const res = spawnSync(process.execPath, ["-e", ""]);
-    if (!res.error && typeof res.pid === "number" && res.pid > 0) return res.pid;
-  }
-  throw new Error("could not spawn a throwaway process to obtain a dead pid");
-}
 
 describe("acquirePidFile", () => {
   it("creates the pid file and records our pid on the first line", () => {
@@ -149,13 +136,14 @@ describe("the takeover lock", () => {
     noLockLeft();
   });
 
-  it("never steals from a live owner, however old the lock: refuses and names the lock", { timeout: 15_000 }, () => {
+  it("never steals from a live owner, however old the lock: refuses and names the lock", () => {
     // Old AND the owner is alive and still the recorded process — a slow
     // holder, not an abandoned one. Stealing here is what reopens the race.
+    // The wait is shortened from the 5 s default; the refusal is the same.
     plantLock(process.pid, processIdentity(process.pid), 60_000);
     const started = Date.now();
-    expect(acquirePidFile(pidFile, 4242)).toEqual({ ok: false, holder: null });
-    expect(Date.now() - started).toBeGreaterThanOrEqual(4_900);
+    expect(acquirePidFile(pidFile, 4242, { lockWaitMs: 300 })).toEqual({ ok: false, holder: null });
+    expect(Date.now() - started).toBeGreaterThanOrEqual(290);
     expect(existsSync(join(lock(), "owner.planted"))).toBe(true);
     expect(existsSync(pidFile)).toBe(false);
   });
@@ -200,23 +188,38 @@ describe("liveness: EPERM is alive, not dead", () => {
   // Three copies of this predicate used to disagree about EPERM, so a daemon
   // owned by another uid read as dead: `tomo stop` sent no signal and reported
   // success, and getRunningPid deleted a LIVE daemon's pid file.
-  const root = process.getuid?.() === 0;
+  //
+  // pid 1 stands for a process owned by another user. For a normal user
+  // kill(1, 0) raises EPERM; for root (the CI container) it succeeds, which
+  // would let these pass without the EPERM branch running at all. So the
+  // signal-0 probe of pid 1 is made to answer EPERM on every machine.
+  const realKill = process.kill.bind(process);
+  beforeEach(() => {
+    vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
+      if (pid === 1 && (signal === 0 || signal === undefined)) {
+        throw Object.assign(new Error("kill EPERM"), { code: "EPERM", errno: -1, syscall: "kill" });
+      }
+      return realKill(pid, signal);
+    }) as typeof process.kill);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
 
-  it.skipIf(root)("treats a process we may not signal (pid 1) as alive", () => {
-    // pid 1 is launchd, owned by root: kill(1, 0) raises EPERM for us.
+  it("treats a process we may not signal (pid 1) as alive", () => {
     let code: string | undefined;
     try { process.kill(1, 0); } catch (err) { code = (err as NodeJS.ErrnoException).code; }
     expect(code).toBe("EPERM");         // the precondition this test needs
     expect(isPidAlive(1)).toBe(true);   // ...and we call it alive
   });
 
-  it.skipIf(root)("does not reap the pid file of a daemon owned by another user", () => {
+  it("does not reap the pid file of a daemon owned by another user", () => {
     writeFileSync(pidFile, "1\n");
     expect(getRunningPid(pidFile)).toBe(1);
     expect(existsSync(pidFile)).toBe(true);
   });
 
-  it.skipIf(root)("refuses to start against a cross-uid holder", () => {
+  it("refuses to start against a cross-uid holder", () => {
     writeFileSync(pidFile, "1\n");
     expect(acquirePidFile(pidFile, 4242)).toEqual({ ok: false, holder: 1 });
   });
@@ -265,6 +268,7 @@ describe("the stop budget", () => {
     // budget is 23-33s. A 10s deadline reported failure on a HEALTHY stop and
     // advised `kill -9`, destroying the in-flight turn's inbound record.
     expect(DAEMON_STOP_TIMEOUT_MS).toBeGreaterThanOrEqual(33_000);
+    // The budget itself is 60 s: `tomo stop` waits this long before it reports.
     expect(DAEMON_STOP_TIMEOUT_MS).toBe(60_000);
   });
 });
@@ -284,8 +288,12 @@ describe("releasePidFile", () => {
     expect(readFileSync(pidFile, "utf-8")).toBe("999");
   });
 
-  it("is a no-op when the file is gone", () => {
+  it("is a no-op when the directory exists but the file is gone", () => {
+    // Unlike a missing directory, this one goes through the lock: the lock is
+    // taken and released, and nothing is left behind.
+    expect(existsSync(pidFile)).toBe(false);
     expect(() => releasePidFile(pidFile, 4242)).not.toThrow();
+    expect(readdirSync(dir)).toEqual([]);
   });
 });
 
@@ -406,32 +414,5 @@ describe("stopRecordedDaemon", () => {
       .rejects.toThrow(`kill -9 ${pid}`);
     expect(isPidAlive(pid)).toBe(true);
     expect(existsSync(pidFile)).toBe(true);
-  });
-});
-
-describe("LaunchAgent respawn throttle", () => {
-  it("pairs KeepAlive with a ThrottleInterval", async () => {
-    // KeepAlive + launchd's 10s default means a deterministically-failing
-    // start (pid file held by a recycled pid, uncaught exception on a bad
-    // config, metrics port already bound) relaunches six times a minute
-    // forever. The throttle bounds the loop without slowing real recovery.
-    const { buildPlist } = await import("../src/cli/service.js");
-    const plist = buildPlist();
-    expect(plist).toContain("<key>KeepAlive</key>");
-    expect(plist).toMatch(/<key>ThrottleInterval<\/key>\s*<integer>30<\/integer>/);
-  });
-
-  it("gives the daemon its full bounded shutdown before launchd SIGKILLs it", async () => {
-    // launchd's default ExitTimeOut is 20s. Tomo's graceful shutdown is
-    // bounded at ~33s, so without this key every `launchctl bootout`, every
-    // restart through launchd, and every logout SIGKILLed the daemon
-    // mid-flush — after the registry save had started and before the
-    // transcript was written.
-    const { buildPlist, LAUNCH_AGENT_EXIT_TIMEOUT_SEC } = await import("../src/cli/service.js");
-    expect(LAUNCH_AGENT_EXIT_TIMEOUT_SEC).toBe(Math.ceil(DAEMON_STOP_TIMEOUT_MS / 1000));
-    expect(LAUNCH_AGENT_EXIT_TIMEOUT_SEC).toBeGreaterThanOrEqual(33);
-    expect(buildPlist()).toMatch(
-      new RegExp(`<key>ExitTimeOut</key>\\s*<integer>${LAUNCH_AGENT_EXIT_TIMEOUT_SEC}</integer>`),
-    );
   });
 });

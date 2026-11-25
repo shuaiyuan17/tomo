@@ -26,20 +26,12 @@ import { dirname, join } from "node:path";
 //    deny the read.
 // ---------------------------------------------------------------------------
 
-/** Paths `existsSync` should pretend are absent — how the fail-closed tests
- *  simulate a host without `sandbox-exec` without needing one. Consulted by the
- *  `node:fs` mock below, which is otherwise the real module. */
-const MISSING = new Set<string>();
-
-vi.mock("node:fs", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("node:fs")>();
-  return {
-    ...actual,
-    default: actual,
-    existsSync: (p: Parameters<typeof actual.existsSync>[0]) =>
-      MISSING.has(String(p)) ? false : actual.existsSync(p),
-  };
-});
+// `existsSync` answers from `sandboxPresence` first (tests/helpers/sandbox-exec.ts):
+// how the fail-closed tests simulate a host without `sandbox-exec` without
+// needing one, and a host WITH it (Linux CI) so they reach the branch their
+// title names. Otherwise the real module.
+vi.mock("node:fs", async (importOriginal) =>
+  (await import("./helpers/sandbox-exec.js")).fsWithSandboxPresence(await importOriginal()));
 
 /** Where the DELETED file-based implementation would have written its profile:
  *  `<config.tomoHome>/data/bash-sandbox.sb`. `bash-sandbox.ts` no longer imports
@@ -61,9 +53,11 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 const { log } = await import("../src/logger.js");
+const { sandboxPresence, sandboxRunsHere } = await import("./helpers/sandbox-exec.js");
 const {
   ENV_ALLOWLIST_PREFIX,
   SANDBOX_EXEC_PATH,
+  SANDBOX_SHELL_FLAGS,
   SANDBOX_SHELL_PATH,
   foreignPreToolUseHookSource,
   resetBashSandboxForTests,
@@ -110,7 +104,7 @@ afterAll(() => {
 });
 
 beforeEach(() => {
-  MISSING.clear();
+  sandboxPresence.reset();
   resetBashSandboxForTests();
   vi.clearAllMocks();
 });
@@ -183,14 +177,16 @@ describe("wrapWithSandbox — the exact command the Bash tool will run", () => {
  *  ENOENT` — the round-trip cases were the CI failure), and a test that only
  *  runs on the maintainer's laptop is a test that stops running.
  *
- *  `/bin/zsh -lc --` AS WELL when it exists, which on macOS — the only platform
- *  the sandbox itself runs on — is always. That case exercises the exact shell
- *  and exact flags production uses, so the portable case never becomes the only
- *  evidence on the machine that matters. */
+ *  `/bin/zsh` AS WELL when it exists, which on macOS — the only platform the
+ *  sandbox itself runs on — is always, with the flags `wrapWithSandbox` puts
+ *  there (`SANDBOX_SHELL_FLAGS` and `--`, read from the module rather than
+ *  retyped, so a change of flags is a change of what this tests). That case
+ *  exercises the exact shell and exact flags production uses, so the portable
+ *  case never becomes the only evidence on the machine that matters. */
 const ROUNDTRIP_SHELLS: Array<[string, string[]]> = [
   ["/bin/sh", ["-c", "--"]],
   ...(existsSync(SANDBOX_SHELL_PATH)
-    ? [[SANDBOX_SHELL_PATH, ["-lc", "--"]] as [string, string[]]]
+    ? [[SANDBOX_SHELL_PATH, [...SANDBOX_SHELL_FLAGS, "--"]] as [string, string[]]]
     : []),
 ];
 
@@ -359,13 +355,21 @@ describe("resolvedDenyDir", () => {
 // ---------------------------------------------------------------------------
 
 describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", () => {
+  // Pretend both binaries are there, so each test below reaches the check its
+  // title names on every host; the two "absent" tests take one away again.
+  // Without this, on Linux every case returned null at the first presence
+  // check and passed whatever the resolver or the hook scan did.
+  beforeEach(() => {
+    sandboxPresence.pretend(SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH);
+  });
+
   it("returns null when sandbox-exec is absent", () => {
-    MISSING.add(SANDBOX_EXEC_PATH);
+    sandboxPresence.missing.add(SANDBOX_EXEC_PATH);
     expect(sandboxedBashCommand("ls", policyFor(scratchDir("tomo-sbx-nosbx-")))).toBeNull();
   });
 
   it("returns null when the shell is absent", () => {
-    MISSING.add(SANDBOX_SHELL_PATH);
+    sandboxPresence.missing.add(SANDBOX_SHELL_PATH);
     expect(sandboxedBashCommand("ls", policyFor(scratchDir("tomo-sbx-nosh-")))).toBeNull();
   });
 
@@ -375,17 +379,11 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
     const root = scratchDir("tomo-sbx-unresolvable-");
     symlinkSync(join(root, "nowhere"), join(root, "private"));
     expect(sandboxedBashCommand("ls", policyFor(join(root, "private")))).toBeNull();
-    expect(vi.mocked(log.warn)).toHaveBeenCalled();
-    // WHICH reason is logged depends on the host: off macOS the `sandbox-exec`
-    // preflight refuses first and never reaches the resolver, which is why the
-    // assertion below is gated rather than unconditional (it was the other half
-    // of the Linux CI failure). The `null` above is the invariant, and it holds
-    // on every platform — every path out of here is fail-closed.
-    if (sandboxRuns) {
-      expect(vi.mocked(log.warn).mock.calls[0][0]).toMatchObject({
-        reason: expect.stringContaining("cannot resolve the real path"),
-      });
-    }
+    // The presence check is passed (see the beforeEach), so it is the resolver
+    // that refused, on every host.
+    expect(vi.mocked(log.warn).mock.calls[0][0]).toMatchObject({
+      reason: expect.stringContaining("cannot resolve the real path"),
+    });
   });
 
   it("returns null when a data dir (read+write deny) cannot be resolved", () => {
@@ -393,6 +391,9 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
     const dangling = join(dir, "data");
     symlinkSync(join(dir, "nowhere"), dangling);
     expect(sandboxedBashCommand("echo hi", policyFor(join(dir, "private"), [], [dangling]))).toBeNull();
+    expect(vi.mocked(log.warn).mock.calls[0][0]).toMatchObject({
+      reason: expect.stringContaining(`cannot resolve the real path of ${dangling}`),
+    });
   });
 
   it("returns null when the home (write-only deny) cannot be resolved", () => {
@@ -400,12 +401,9 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
     const root = scratchDir("tomo-sbx-home-unresolvable-");
     symlinkSync(join(root, "nowhere"), join(root, "home"));
     expect(sandboxedBashCommand("ls", policyFor(scratchDir("tomo-sbx-home-priv-"), [join(root, "home")]))).toBeNull();
-    expect(vi.mocked(log.warn)).toHaveBeenCalled();
-    if (sandboxRuns) {
-      expect(vi.mocked(log.warn).mock.calls[0][0]).toMatchObject({
-        reason: expect.stringContaining("writes under it cannot be denied"),
-      });
-    }
+    expect(vi.mocked(log.warn).mock.calls[0][0]).toMatchObject({
+      reason: expect.stringContaining("writes under it cannot be denied"),
+    });
     // And a `..` spelling of it is refused like the private dir's.
     expect(sandboxedBashCommand("ls", policyFor(scratchDir("tomo-sbx-home-priv2-"), [`${root}/x/../home`]))).toBeNull();
   });
@@ -420,14 +418,17 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
     writeFileSync(settings, JSON.stringify({
       hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "true" }] }] },
     }));
-    expect(sandboxedBashCommand("ls", policyFor(scratchDir("tomo-sbx-foreign-priv-")), {
-      settingsFiles: [settings],
+    const scan = { settingsFiles: [settings], pluginDirs: [] };
+    expect(sandboxedBashCommand("ls", policyFor(scratchDir("tomo-sbx-foreign-priv-")), scan)).toBeNull();
+    // And it is the hook that refused: the same call without it wraps.
+    expect(sandboxedBashCommand("ls", policyFor(scratchDir("tomo-sbx-foreign-priv2-")), {
+      settingsFiles: [],
       pluginDirs: [],
-    })).toBeNull();
+    })).toContain(SANDBOX_EXEC_PATH);
   });
 
   it("logs the fallback exactly once, however many commands are refused", () => {
-    MISSING.add(SANDBOX_EXEC_PATH);
+    sandboxPresence.missing.add(SANDBOX_EXEC_PATH);
     const dir = scratchDir("tomo-sbx-warnonce-");
     for (let i = 0; i < 4; i++) expect(sandboxedBashCommand("ls", policyFor(dir))).toBeNull();
     expect(vi.mocked(log.warn).mock.calls).toHaveLength(1);
@@ -435,7 +436,6 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
   });
 
   it("wraps when the sandbox is available, with the profile inline", () => {
-    if (!existsSync(SANDBOX_EXEC_PATH) || !existsSync(SANDBOX_SHELL_PATH)) return;
     const dir = scratchDir("tomo-sbx-ok-");
     const home = resolvedDenyDir("/ws/home")!;
     const policy = policyFor(dir, [home]);
@@ -450,7 +450,6 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
   });
 
   it("puts the whole policy in the command, and nothing on disk", () => {
-    if (!existsSync(SANDBOX_EXEC_PATH) || !existsSync(SANDBOX_SHELL_PATH)) return;
     const dir = scratchDir("tomo-sbx-nofile-");
     const wrapped = sandboxedBashCommand("echo hi", policyFor(dir))!;
     // Every deny clause travels in the argv, so there is no second place the
@@ -459,8 +458,6 @@ describe("sandboxedBashCommand — fail closed, never to an unsandboxed shell", 
       expect(wrapped).toContain(clause);
     }
     expect(wrapped).not.toContain(".sb");
-    // The file version logged once on write; nothing is written now.
-    expect(vi.mocked(log.info)).not.toHaveBeenCalled();
     expect(readdirSync(dir)).toEqual([]);
   });
 });
@@ -568,9 +565,7 @@ describe("foreignPreToolUseHookSource", () => {
 // The kernel
 // ---------------------------------------------------------------------------
 
-const sandboxRuns = process.platform === "darwin"
-  && existsSync(SANDBOX_EXEC_PATH)
-  && existsSync(SANDBOX_SHELL_PATH);
+const sandboxRuns = sandboxRunsHere(SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH);
 
 describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
   /** A workspace-shaped tree: one private file, one public sibling. */
@@ -675,9 +670,8 @@ describe.runIf(sandboxRuns)("under a real sandbox-exec", () => {
     expect(runSandboxed(`ls ${priv}`, priv).out).toMatch(/Operation not permitted/);
   });
 
-  it("denies a path ASSEMBLED inside an interpreter, which no text filter sees", () => {
+  it.skipIf(!existsSync("/usr/bin/python3"))("denies a path ASSEMBLED inside an interpreter, which no text filter sees (needs /usr/bin/python3)", () => {
     const { priv, dir } = workspace();
-    if (!existsSync("/usr/bin/python3")) return;
     const a = `${join(dir, "memory")}/pri`;
     const r = runSandboxed(`python3 -c "print(open('${a}' + 'vate/note.txt').read())"`, priv);
     expect(r.code).not.toBe(0);

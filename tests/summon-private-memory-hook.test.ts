@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
 vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
@@ -28,6 +28,22 @@ import {
 import { MEMORY_DIR, PRIVATE_MEMORY_DIR } from "../src/workspace/index.js";
 import { MIXED_AUDIENCE_KEY } from "../src/agent/audience.js";
 import type { Agent as AgentType } from "../src/agent.js";
+
+/** Agents a test started and has not stopped yet. A failed assertion skips the
+ *  test's own `stopAgent`, and a running Agent's timers would then reach into
+ *  the next test; `afterEach` stops whatever is left. */
+const running = new Set<AgentType>();
+function track(agent: AgentType): AgentType {
+  running.add(agent);
+  return agent;
+}
+async function stopAgent(agent: AgentType): Promise<void> {
+  running.delete(agent);
+  await agent.stop();
+}
+afterEach(async () => {
+  for (const agent of [...running]) await stopAgent(agent);
+});
 
 installAgentTestHooks();
 
@@ -163,9 +179,9 @@ async function openOwnerSession(tg: MockChannel, agent: AgentType): Promise<void
 }
 
 describe("private memory during a summoned-group turn", () => {
-  it("denies Read, Bash and Glob into memory/private/ while a group is summoned", async () => {
+  it("denies Read and Glob into memory/private/, and sandboxes Bash, while a group is summoned", async () => {
     resetConfig({ identities: [OWNER] });
-    const agent = new Agent();
+    const agent = track(new Agent());
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     await openOwnerSession(tg, agent);
@@ -194,12 +210,12 @@ describe("private memory during a summoned-group turn", () => {
     expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toContain(OWNER_DM);
     expectDeniedAsSummoned(unwrap(probed));
 
-    await agent.stop();
+    await stopAgent(agent);
   });
 
   it("leaves the owner's own DM turn untouched on the same session", async () => {
     resetConfig({ identities: [OWNER] });
-    const agent = new Agent();
+    const agent = track(new Agent());
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     await openOwnerSession(tg, agent);
@@ -223,12 +239,12 @@ describe("private memory during a summoned-group turn", () => {
     expect(own.glob).toEqual({});
     expect(own.publicRead).toEqual({});
 
-    await agent.stop();
+    await stopAgent(agent);
   });
 
   it("still denies a real group session, with the group wording (unchanged)", async () => {
     resetConfig({ identities: [OWNER], passiveGroups: { telegram: [GROUP_CHAT_ID] } });
-    const agent = new Agent();
+    const agent = track(new Agent());
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
@@ -253,7 +269,7 @@ describe("private memory during a summoned-group turn", () => {
     expect(probed.bash?.hookSpecificOutput?.updatedInput)
       .toEqual({ command: `SANDBOXED:${PRIVATE_CALLS.bash.tool_input.command}` });
 
-    await agent.stop();
+    await stopAgent(agent);
   });
 
   it("fails closed when an owner DM steer lands inside a summoned-group turn", async () => {
@@ -266,7 +282,7 @@ describe("private memory during a summoned-group turn", () => {
     // guard opened mid-turn. Overlapping turns now union their audiences, and
     // two distinct audiences fail closed.
     resetConfig({ identities: [OWNER], steering: true });
-    const agent = new Agent();
+    const agent = track(new Agent());
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     await openOwnerSession(tg, agent);
@@ -314,7 +330,7 @@ describe("private memory during a summoned-group turn", () => {
     expect(agent.isOwnAudienceTurn(OWNER_DM)).toBe(true);
     expect(await guardHookFor(OWNER_DM)(PRIVATE_CALLS.read)).toEqual({});
 
-    await agent.stop();
+    await stopAgent(agent);
   });
 });
 
@@ -329,7 +345,7 @@ describe("groupShellAllowlist during a summoned-group turn", () => {
   /** Summon the group, run one group-steered turn, and probe the guard inside it. */
   async function probeSummonedTurn(groupShellAllowlist: string[]): Promise<Probe> {
     resetConfig({ identities: [OWNER], groupShellAllowlist });
-    const agent = new Agent();
+    const agent = track(new Agent());
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     await openOwnerSession(tg, agent);
@@ -350,7 +366,7 @@ describe("groupShellAllowlist during a summoned-group turn", () => {
     await drainQueue(agent);
 
     expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toContain(OWNER_DM);
-    await agent.stop();
+    await stopAgent(agent);
     return unwrap(probed);
   }
 
@@ -372,7 +388,7 @@ describe("groupShellAllowlist during a summoned-group turn", () => {
 
   it("stays sandboxed when an owner DM steer mixes into an allowlisted group's turn", async () => {
     resetConfig({ identities: [OWNER], steering: true, groupShellAllowlist: [GROUP_SESSION] });
-    const agent = new Agent();
+    const agent = track(new Agent());
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     await openOwnerSession(tg, agent);
@@ -411,6 +427,6 @@ describe("groupShellAllowlist during a summoned-group turn", () => {
     release();
     await Promise.all([groupTurn, steer]);
     await drainQueue(agent);
-    await agent.stop();
+    await stopAgent(agent);
   });
 });

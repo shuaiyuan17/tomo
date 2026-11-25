@@ -47,6 +47,22 @@ import { createTomoInternalMcpServer, TOMO_INTERNAL_MCP_NAME } from "../src/mcp/
 import { SEND_MESSAGE_TOOL } from "../src/agent/permissions.js";
 import type { Agent as AgentType } from "../src/agent.js";
 
+/** Agents a test started and has not stopped yet. A failed assertion skips the
+ *  test's own `stopAgent`, and a running Agent's timers would then reach into
+ *  the next test; `afterEach` stops whatever is left. */
+const running = new Set<AgentType>();
+function track(agent: AgentType): AgentType {
+  running.add(agent);
+  return agent;
+}
+async function stopAgent(agent: AgentType): Promise<void> {
+  running.delete(agent);
+  await agent.stop();
+}
+afterEach(async () => {
+  for (const agent of [...running]) await stopAgent(agent);
+});
+
 installAgentTestHooks();
 
 // ---------------------------------------------------------------------------
@@ -114,13 +130,9 @@ describe("private tools during a summoned-group turn", () => {
     seedPeople();
   });
 
-  afterEach(() => {
-    rmSync(HOME, { recursive: true, force: true });
-  });
-
   it("hides private people records and refuses recall while a group is summoned", async () => {
     resetConfig({ identities: [OWNER] });
-    const agent = new Agent();
+    const agent = track(new Agent());
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     const tools = internalTools(agent, OWNER_DM);
@@ -171,12 +183,12 @@ describe("private tools during a summoned-group turn", () => {
 
     expect(privateWrite!.isError).toBe(true);
 
-    await agent.stop();
+    await stopAgent(agent);
   });
 
   it("leaves an ordinary DM turn on the same session untouched", async () => {
     resetConfig({ identities: [OWNER] });
-    const agent = new Agent();
+    const agent = track(new Agent());
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     const tools = internalTools(agent, OWNER_DM);
@@ -185,8 +197,9 @@ describe("private tools during a summoned-group turn", () => {
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: `remember the ${PRIVATE_PHRASE} recipe` }));
     await drainQueue(agent);
 
-    // Summon and dismiss around the turn: the window is what closes the
-    // tools, not the existence of a summon in this session's past.
+    // The group stays summoned, but the next turn is the owner's own: what
+    // closes the tools is a summoned group's turn, not a summon existing on
+    // this session.
     summon(agent, GROUP_CHAT_ID, "shuai");
 
     let people: ToolResult | undefined;
@@ -204,7 +217,7 @@ describe("private tools during a summoned-group turn", () => {
     expect(recall!.isError).toBeFalsy();
     expect(recall!.content[0].text).toContain(PRIVATE_PHRASE);
 
-    await agent.stop();
+    await stopAgent(agent);
   });
 
   it("fails closed when one turn coalesces DM and summoned-group messages", async () => {
@@ -219,7 +232,7 @@ describe("private tools during a summoned-group turn", () => {
       steering: false,
       passiveGroups: { telegram: [GROUP_CHAT_ID] },
     });
-    const agent = new Agent();
+    const agent = track(new Agent());
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     const tools = internalTools(agent, OWNER_DM);
@@ -267,7 +280,7 @@ describe("private tools during a summoned-group turn", () => {
     expect(recall!.isError).toBe(true);
     expect(recall!.content[0].text).toContain("recall is unavailable");
 
-    await agent.stop();
+    await stopAgent(agent);
   });
 
   it("stays closed when an owner DM steers into an in-flight summoned-group turn", async () => {
@@ -277,7 +290,7 @@ describe("private tools during a summoned-group turn", () => {
     // group's turn is still running. The group turn's audience must survive
     // that — a per-key single-slot record does not.
     resetConfig({ identities: [OWNER], steering: true });
-    const agent = new Agent();
+    const agent = track(new Agent());
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     const tools = internalTools(agent, OWNER_DM);
@@ -329,12 +342,12 @@ describe("private tools during a summoned-group turn", () => {
     expect(names(people!)).toEqual(["Kevin Wang"]);
     expect(recall!.isError).toBe(true);
 
-    await agent.stop();
+    await stopAgent(agent);
   });
 
   it("tells the model, in the summon reminder, that private context is off limits", async () => {
     resetConfig({ identities: [OWNER] });
-    const agent = new Agent();
+    const agent = track(new Agent());
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
@@ -357,11 +370,12 @@ describe("private tools during a summoned-group turn", () => {
     // Stated as a norm: naming the blocked tools would tell a refused model
     // where else to look, and the enforcement is not total (see the residuals
     // in CHANGELOG.md — the system prompt already carries private people
-    // names, and Read/Grep over memory/private are not guarded here).
+    // names; Read/Grep over memory/private are refused by the PreToolUse hook,
+    // which summon-private-memory-hook.test.ts covers).
     expect(prompt).not.toContain("list_people");
     expect(prompt).not.toContain("recall_conversation");
 
-    await agent.stop();
+    await stopAgent(agent);
   });
 });
 

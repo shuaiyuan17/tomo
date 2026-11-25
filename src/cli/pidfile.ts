@@ -268,11 +268,11 @@ function abandonedLockOwner(lockDir: string): string | null {
  * nothing here ever removes or moves the directory at the path, only its own
  * owner entry, and the transition to "held" is a single atomic rename.
  *
- * Returns `undefined` if the lock could not be taken within `LOCK_WAIT_MS`,
+ * Returns `undefined` if the lock could not be taken within `waitMs`,
  * or if the pid file's directory does not exist (then there is no pid file to
  * guard, and a reader must not create `~/.tomo` as a side effect).
  */
-function withPidFileLock<T>(pidFile: string, fn: () => T): T | undefined {
+function withPidFileLock<T>(pidFile: string, waitMs: number, fn: () => T): T | undefined {
   const lockDir = lockDirFor(pidFile);
   const token = randomUUID();
   const prepared = `${lockDir}.${process.pid}.${token}`;
@@ -285,7 +285,7 @@ function withPidFileLock<T>(pidFile: string, fn: () => T): T | undefined {
     if (isEnoent(err)) return undefined;
     throw err;
   }
-  const deadline = Date.now() + LOCK_WAIT_MS;
+  const deadline = Date.now() + waitMs;
   let held = false;
   try {
     for (;;) {
@@ -363,8 +363,14 @@ export type PidFileAcquisition =
  * outside this module.
  *
  * Call this as the FIRST action of daemon startup, before any `await`.
+ * `opts.lockWaitMs` (default `LOCK_WAIT_MS`) exists so tests that hold the
+ * lock on purpose need not wait the full budget.
  */
-export function acquirePidFile(pidFile: string = PID_FILE, pid: number = process.pid): PidFileAcquisition {
+export function acquirePidFile(
+  pidFile: string = PID_FILE,
+  pid: number = process.pid,
+  opts: { lockWaitMs?: number } = {},
+): PidFileAcquisition {
   mkdirSync(dirname(pidFile), { recursive: true });
   sweepAbandonedStaging(pidFile);
 
@@ -372,7 +378,7 @@ export function acquirePidFile(pidFile: string = PID_FILE, pid: number = process
   writeFileSync(staging, `${pid}\n${processIdentity(pid) ?? ""}\n`);
 
   try {
-    const outcome = withPidFileLock(pidFile, (): PidFileAcquisition => {
+    const outcome = withPidFileLock(pidFile, opts.lockWaitMs ?? LOCK_WAIT_MS, (): PidFileAcquisition => {
       let tookOverStale: number | null = null;
       for (let attempt = 0; attempt < 5; attempt++) {
         if (publishClaim(staging, pidFile)) return { ok: true, tookOverStale };
@@ -487,7 +493,7 @@ function sweepAbandonedStaging(pidFile: string): void {
  */
 export function releasePidFile(pidFile: string = PID_FILE, pid: number = process.pid): void {
   try {
-    withPidFileLock(pidFile, () => {
+    withPidFileLock(pidFile, LOCK_WAIT_MS, () => {
       if (readPidFileRecord(pidFile)?.pid !== pid) return;
       unlinkSync(pidFile);
     });
@@ -506,7 +512,7 @@ export function releasePidFile(pidFile: string = PID_FILE, pid: number = process
  * a reader must never delete what it could not examine exclusively.
  */
 export function readLivePidFileRecord(pidFile: string = PID_FILE): PidFileRecord | null {
-  const result = withPidFileLock(pidFile, (): PidFileRecord | null => {
+  const result = withPidFileLock(pidFile, LOCK_WAIT_MS, (): PidFileRecord | null => {
     const record = readPidFileRecord(pidFile);
     if (record !== null && isRecordedProcessLive(record)) return record;
     try { unlinkSync(pidFile); } catch { /* already gone */ }

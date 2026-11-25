@@ -1,11 +1,33 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Root-safe read and quarantine failures (chmod stops neither for root): a
+// test names the path whose readFileSync throws EACCES, or whose
+// appendFileSync throws ENOSPC.
+const fail = vi.hoisted(() => ({ read: null as string | null, append: null as RegExp | null }));
+vi.mock("node:fs", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...orig,
+    readFileSync: ((...args: Parameters<typeof orig.readFileSync>) => {
+      if (fail.read !== null && args[0] === fail.read) {
+        throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
+      }
+      return orig.readFileSync(...args);
+    }) as typeof orig.readFileSync,
+    appendFileSync: ((...args: Parameters<typeof orig.appendFileSync>) => {
+      if (fail.append !== null && fail.append.test(String(args[0]))) {
+        throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+      }
+      return orig.appendFileSync(...args);
+    }) as typeof orig.appendFileSync,
+  };
+});
+
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-vi.mock("../src/logger.js", () => ({
-  log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
-}));
+vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
 import {
   ATTACHMENT_NOT_RESTORED,
@@ -27,6 +49,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  fail.read = null;
+  fail.append = null;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -43,6 +67,13 @@ const resolution: SessionResolution = {
 /** A fresh instance over the same file — what the next daemon start sees. */
 function reopen(opts: Partial<ConstructorParameters<typeof DurableInbox>[0]> = {}): DurableInbox {
   return new DurableInbox({ path, fsync: false, ...opts });
+}
+
+/** Accept `id` on iMessage, failing the test unless it was accepted; returns the record id. */
+function acceptOk(inbox: DurableInbox, id: string, channel = "imessage"): string {
+  const res = inbox.accept(channel, msg(id), resolution);
+  if (res.status !== "accepted") throw new Error(`expected ${id} to be accepted, got ${res.status}`);
+  return res.id;
 }
 
 describe("DurableInbox: crash and replay", () => {
@@ -64,19 +95,16 @@ describe("DurableInbox: crash and replay", () => {
 
   it("a consumed message is not pending again", () => {
     const first = reopen();
-    const res = first.accept("imessage", msg("a"), resolution);
-    if (res.status !== "accepted") throw new Error("expected accepted");
-    first.markStarted([res.id]);
-    first.markDone([res.id]);
+    const id = acceptOk(first, "a");
+    first.markStarted([id]);
+    first.markDone([id]);
 
     expect(reopen().pending()).toEqual([]);
   });
 
   it("a message whose turn started is reported as started, never as received", () => {
     const first = reopen();
-    const res = first.accept("telegram", msg("7"), resolution);
-    if (res.status !== "accepted") throw new Error("expected accepted");
-    first.markStarted([res.id]);
+    first.markStarted([acceptOk(first, "7", "telegram")]);
 
     const next = reopen();
     const [rec] = next.pending();
@@ -125,9 +153,7 @@ describe("DurableInbox: dedup on (channel, chat, message id)", () => {
 
   it("remembers consumed ids across a restart (a channel redelivering an un-acked row)", () => {
     const first = reopen();
-    const res = first.accept("imessage", msg("a"), resolution);
-    if (res.status !== "accepted") throw new Error("expected accepted");
-    first.markDone([res.id]);
+    first.markDone([acceptOk(first, "a")]);
 
     expect(reopen().accept("imessage", msg("a"), resolution).status).toBe("duplicate");
   });
@@ -152,20 +178,36 @@ describe("DurableInbox: dedup on (channel, chat, message id)", () => {
   it("forgets consumed ids after the retention window", () => {
     let t = 1_000;
     const first = reopen({ now: () => t, dedupRetentionMs: 500 });
-    const res = first.accept("imessage", msg("a"), resolution);
-    if (res.status !== "accepted") throw new Error("expected accepted");
-    first.markDone([res.id]);
+    first.markDone([acceptOk(first, "a")]);
 
     t = 2_000;
     expect(reopen({ now: () => t, dedupRetentionMs: 500 }).accept("imessage", msg("a"), resolution).status).toBe("accepted");
   });
 
+  it("keeps a consumed id through the last instant of the retention window", () => {
+    let t = 1_000;
+    const first = reopen({ now: () => t, dedupRetentionMs: 500 });
+    first.markDone([acceptOk(first, "a")]);
+
+    // Exactly `retention` old: still remembered.
+    t = 1_500;
+    expect(reopen({ now: () => t, dedupRetentionMs: 500 }).accept("imessage", msg("a"), resolution).status).toBe("duplicate");
+    // One millisecond past it: forgotten.
+    t = 1_501;
+    expect(reopen({ now: () => t, dedupRetentionMs: 500 }).accept("imessage", msg("a"), resolution).status).toBe("accepted");
+  });
+
+  it("keeps every id when exactly at the cap", () => {
+    const first = reopen({ maxSeen: 3 });
+    for (const id of ["a", "b", "c"]) first.markDone([acceptOk(first, id)]);
+    const next = reopen({ maxSeen: 3 });
+    for (const id of ["a", "b", "c"]) expect(next.has(DurableInbox.idFor("imessage", "+15550001", id)), id).toBe(true);
+  });
+
   it("caps remembered ids, keeping the newest", () => {
     const first = reopen({ maxSeen: 2 });
     for (const id of ["a", "b", "c"]) {
-      const res = first.accept("imessage", msg(id), resolution);
-      if (res.status !== "accepted") throw new Error("expected accepted");
-      first.markDone([res.id]);
+      first.markDone([acceptOk(first, id)]);
     }
     const next = reopen({ maxSeen: 2 });
     expect(next.has(DurableInbox.idFor("imessage", "+15550001", "a"))).toBe(false);
@@ -300,16 +342,26 @@ describe("DurableInbox: short writes", () => {
   });
 
   it("a compaction temp file of the wrong length is discarded and the log kept", () => {
-    const inbox = reopen({ compactEvery: 1 });
-    inbox.accept("imessage", msg("c1"), resolution);
-    inbox.accept("imessage", msg("c2"), resolution);
+    const first = reopen();
+    acceptOk(first, "c1");
+    acceptOk(first, "c2");
+    first.close();
     const before = readFileSync(path, "utf8");
-    // Every write from here on (the compaction's temp file) comes out half as long as reported.
-    const lyingInbox = inbox as unknown as { write: WriteFn };
-    lyingInbox.write = (fd, buf, off, len) => { realWrite(fd, buf, off, Math.floor(len / 2)); return len; };
-    (inbox as unknown as { compact(): boolean }).compact();
+    // The start-up compaction is the one write that carries several records;
+    // it comes out half as long as reported. Single-record appends are honest.
+    let shortWrites = 0;
+    const shortCompaction: WriteFn = (fd, buf, off, len) => {
+      const text = Buffer.from(buf).subarray(off, off + len).toString("utf8");
+      if ((text.match(/"op":/g) ?? []).length < 2) return realWrite(fd, buf, off, len);
+      shortWrites++;
+      realWrite(fd, buf, off, Math.floor(len / 2));
+      return len;
+    };
+    const next = reopen({ writeSync: shortCompaction });
+    expect(shortWrites).toBe(1);
     expect(readFileSync(path, "utf8")).toBe(before);
     expect(readdirSync(join(dir, "data")).filter((f) => f.endsWith(".tmp"))).toEqual([]);
+    expect(next.pending().map((r) => r.message.id)).toEqual(["c1", "c2"]);
     expect(reopen().pending().map((r) => r.message.id)).toEqual(["c1", "c2"]);
   });
 });
@@ -349,6 +401,51 @@ describe("DurableInbox: a start that cannot be written", () => {
     inbox.markDone([other]); // its compaction rewrites the log from memory
     expect(reopen().pending()).toEqual([expect.objectContaining({ id, status: "started" })]);
     expect(inbox.get(id)?.unreplayable).toBeUndefined();
+  });
+});
+
+describe("DurableInbox: an unreadable log is not an empty one", () => {
+  it("keeps appending but never compacts a log it could not read", () => {
+    const first = reopen();
+    acceptOk(first, "old");
+    first.close();
+    const before = readFileSync(path, "utf8");
+
+    // EACCES/EIO on the read: the bytes are fine, just out of reach.
+    fail.read = path;
+    const blind = reopen({ compactEvery: 1 });
+    fail.read = null;
+    // Replay and dedup are off for this run...
+    expect(blind.pending()).toEqual([]);
+    // ...appends still land, after what was there...
+    blind.markDone([acceptOk(blind, "new")]); // a markDone past compactEvery would compact
+    const after = readFileSync(path, "utf8");
+    expect(after.startsWith(before)).toBe(true);
+    expect(after.length).toBeGreaterThan(before.length);
+
+    // ...so the next start that can read it still has the old record.
+    expect(reopen().pending().map((r) => r.message.id)).toEqual(["old"]);
+  });
+
+  it("disables compaction when unreadable lines cannot be set aside", () => {
+    const first = reopen();
+    acceptOk(first, "a");
+    first.close();
+    appendFileSync(path, "{\"op\":\"recv\",\"v\":1,\"rec\":{\"id\":");
+    const before = readFileSync(path, "utf8");
+
+    // The `.corrupt-` copy cannot be written: rewriting the log now would
+    // drop the torn line with nothing left to show for it.
+    fail.append = /inbox\.jsonl\.corrupt-/;
+    const next = reopen({ compactEvery: 1 });
+    fail.append = null;
+    expect(next.pending().map((r) => r.message.id)).toEqual(["a"]);
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(readdirSync(join(dir, "data")).some((f) => f.includes(".corrupt-"))).toBe(false);
+
+    // Appends still work, and still do not compact.
+    next.markDone([acceptOk(next, "b")]);
+    expect(readFileSync(path, "utf8").startsWith(before)).toBe(true);
   });
 });
 

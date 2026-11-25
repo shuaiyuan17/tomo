@@ -9,7 +9,63 @@ import {
   parseRawSessionKey,
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
+  dmIdentityFromSessionKey,
+  extractImessageIdentifier,
+  isCanonicalDmSessionKey,
+  isDmSessionKey,
+  isWellFormedTaskId,
 } from "../src/sessions/keys.js";
+
+// The small predicates every routing and authority decision leans on. Each was
+// only reached through its callers before; a change of shape here would show
+// up as a routing bug three modules away.
+describe("key predicates", () => {
+  it("isDmSessionKey is a prefix test, nothing more", () => {
+    expect(isDmSessionKey("dm:shuai")).toBe(true);
+    expect(isDmSessionKey("dm:shuai yuan")).toBe(true); // a legacy identity key
+    expect(isDmSessionKey("telegram:12345")).toBe(false);
+    expect(isDmSessionKey("task:s1")).toBe(false);
+    expect(isDmSessionKey("DM:shuai")).toBe(false);
+  });
+
+  it("isCanonicalDmSessionKey grants only the narrow slug form", () => {
+    expect(isCanonicalDmSessionKey("dm:shuai")).toBe(true);
+    expect(isCanonicalDmSessionKey("dm:a_b-1")).toBe(true);
+    // Folded and trimmed before the test, as the identity derivation is.
+    expect(isCanonicalDmSessionKey(" DM:Shuai ")).toBe(true);
+    for (const bad of ["dm:", "dm:shuai yuan", "dm:a:b", "dm:a.b", "telegram:12345", "task:s1"]) {
+      expect(isCanonicalDmSessionKey(bad), bad).toBe(false);
+    }
+  });
+
+  it("dmIdentityFromSessionKey returns the identity part of a dm key only", () => {
+    expect(dmIdentityFromSessionKey("dm:shuai")).toBe("shuai");
+    expect(dmIdentityFromSessionKey("dm:shuai yuan")).toBe("shuai yuan");
+    expect(dmIdentityFromSessionKey("telegram:12345")).toBeUndefined();
+    expect(dmIdentityFromSessionKey("task:s1")).toBeUndefined();
+  });
+
+  it("isWellFormedTaskId accepts the store's s1, s2, ... and nothing else", () => {
+    for (const ok of ["s1", "s9", "s10", "s123"]) expect(isWellFormedTaskId(ok), ok).toBe(true);
+    for (const bad of ["", "s", "s0", "s01", "S1", "t1", "s1 ", "s-1", "s1a", "1"]) {
+      expect(isWellFormedTaskId(bad), JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  it("parseRawSessionKey gives no chat for a task key", () => {
+    expect(parseRawSessionKey("task:s1")).toBeUndefined();
+    expect(replyTargetFromRawSessionKey("task:s1")).toBeUndefined();
+  });
+
+  it("extractImessageIdentifier takes everything after the second semicolon", () => {
+    expect(extractImessageIdentifier("any;-;+15551234567")).toBe("+15551234567");
+    expect(extractImessageIdentifier("iMessage;+;chat123")).toBe("chat123");
+    // A handle that itself carries a semicolon is kept whole.
+    expect(extractImessageIdentifier("any;-;a;b")).toBe("a;b");
+    expect(extractImessageIdentifier("+15551234567")).toBeNull();
+    expect(extractImessageIdentifier("any;-")).toBeNull();
+  });
+});
 
 describe("session key helpers", () => {
   it("parses raw channel session keys", () => {

@@ -7,16 +7,31 @@ import { join } from "node:path";
 // flush a real ERROR line to stderr — pino is async and the line lands at
 // unpredictable times relative to vitest's summary, making test output
 // look intermittently broken.
-vi.mock("../src/logger.js", () => ({
-  log: {
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  },
+vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
+
+// `sips` is macOS-only, so the orientation fix is driven through a stand-in:
+// a test sets `sips.run` to decide what the child does. Anything else that
+// shells out goes to the real execFile.
+type ExecCallback = (err: Error | null, stdout?: string, stderr?: string) => void;
+const sips = vi.hoisted(() => ({
+  calls: [] as string[][],
+  run: null as null | ((args: string[], done: ExecCallback) => void),
 }));
+vi.mock("node:child_process", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("node:child_process")>();
+  return {
+    ...orig,
+    execFile: ((cmd: string, args: string[], opts: unknown, cb: ExecCallback) => {
+      if (cmd !== "sips" || !sips.run) return (orig.execFile as unknown as (...a: unknown[]) => unknown)(cmd, args, opts, cb);
+      sips.calls.push(args);
+      sips.run(args, cb);
+      return undefined;
+    }) as unknown as typeof orig.execFile,
+  };
+});
 
 const { buildImagePath, findExifOrientation, formatImageMarker, formatStickerMarker, mimeToExt, normalizeJpegBuffer, saveInboundImage } = await import("../src/channels/imageStore.js");
+const { SIPS_TIMEOUT_MS } = await import("../src/channels/heic.js");
 
 /**
  * Build a minimal JPEG buffer that contains just enough structure for the EXIF
@@ -257,9 +272,63 @@ describe("normalizeJpegBuffer", () => {
     expect(out).toBe(buf);
   });
 
-  // The end-to-end "orientation 6 → rotated + patched to 1" path requires sips
-  // and a real JPEG; it's covered manually on real iPhone photos and indirectly
-  // through the saveInboundImage integration test on Mac CI.
+  // The pixel rotation itself is sips's and is checked by hand on real iPhone
+  // photos; what Tomo owns is which sips call it makes, the EXIF patch after
+  // it, and the fallback when sips fails. saveInboundImage does not normalize.
+  describe("the sips path", () => {
+    beforeEach(() => {
+      sips.calls = [];
+      // "Rotates" by leaving the temp file as it is: the bytes that come back
+      // still carry the old orientation, which Tomo must then patch to 1.
+      sips.run = (_args, done) => done(null, "", "");
+    });
+    afterEach(() => {
+      sips.run = null;
+      vi.useRealTimers();
+    });
+
+    it("rotates an orientation-6 photo with `sips -r 90` and patches the tag to 1", async () => {
+      const buf = buildJpegWithOrientation(6);
+      const out = await normalizeJpegBuffer(buf, "image/jpeg");
+      expect(sips.calls).toHaveLength(1);
+      expect(sips.calls[0].slice(0, 2)).toEqual(["-r", "90"]);
+      expect(sips.calls[0][2]).toMatch(/tomo-norm-.*\.jpg$/);
+      expect(out).not.toBe(buf);
+      expect(findExifOrientation(out)?.orientation).toBe(1);
+      // The caller's buffer is left alone.
+      expect(findExifOrientation(buf)?.orientation).toBe(6);
+    });
+
+    it("patches a little-endian tag too", async () => {
+      const out = await normalizeJpegBuffer(buildJpegWithOrientation(8, "LE"), "image/jpeg");
+      expect(sips.calls[0].slice(0, 2)).toEqual(["-r", "270"]);
+      expect(findExifOrientation(out)).toMatchObject({ orientation: 1, endian: "LE" });
+    });
+
+    it("returns the original buffer when sips fails", async () => {
+      sips.run = (_args, done) => done(new Error("sips: unsupported file"));
+      const buf = buildJpegWithOrientation(3);
+      expect(await normalizeJpegBuffer(buf, "image/jpeg")).toBe(buf);
+    });
+
+    it("returns the original buffer when sips never exits", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      let called!: () => void;
+      const started = new Promise<void>((r) => { called = r; });
+      sips.run = () => called(); // never calls back
+      const buf = buildJpegWithOrientation(6);
+      const result = normalizeJpegBuffer(buf, "image/jpeg");
+      await started;
+      await vi.advanceTimersByTimeAsync(SIPS_TIMEOUT_MS + 5_000);
+      expect(await result).toBe(buf);
+    });
+
+    it("leaves an orientation outside 1-8 alone, without calling sips", async () => {
+      const buf = buildJpegWithOrientation(9);
+      expect(await normalizeJpegBuffer(buf, "image/jpeg")).toBe(buf);
+      expect(sips.calls).toEqual([]);
+    });
+  });
 });
 
 describe("formatStickerMarker", () => {
@@ -314,11 +383,8 @@ describe("unconverted-attachment note on the inline markers", () => {
     );
   });
 
-  it("leaves the existing marker shapes untouched (no third argument)", () => {
-    expect(formatStickerMarker(2, ["/abs/a.png", "/abs/b.png"])).toBe(
-      "[Sent 2 stickers, saved to: /abs/a.png, /abs/b.png; resend with STICKER:<saved path>]",
-    );
-  });
+  // Without the third argument the shapes are unchanged: "pluralizes multiple
+  // stickers" in formatStickerMarker above.
 });
 
 describe("still-downloading clause on the inline markers", () => {

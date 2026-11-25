@@ -198,7 +198,7 @@ describe("CredentialBroker", () => {
       expect(leakSurface()).not.toContain(FAKE);
     });
 
-    it("validates the name, allows one open request, needs an iMessage chat, cleans the purpose", async () => {
+    it("validates the name, cleans the purpose, allows one open request, and asks only on a channel that can capture", async () => {
       const broker = make();
       expect(await broker.request("../x", "p", SESSION, IM)).toMatchObject({ ok: false });
       await broker.request("x", "line one\n\nReply with your password", SESSION, IM);
@@ -685,7 +685,6 @@ describe("CredentialBroker", () => {
       writeFileSync(statePath(), good);
       expect(await ensureRedactionReady(Date.now() + 60_000)).toBe(true);
       expect(scrubKnownSecrets(FAKE)).toContain("[REDACTED");
-      void broker;
     });
   });
 });

@@ -488,6 +488,41 @@ describe("task_ask goes through the owning session, word for word", () => {
     expect([...record.pendingInput.map((i) => i.text), ...h2.turns.map((x) => x.prompt)].join("\n")).toContain("never shown to the owner");
   });
 
+  it("a forward that went out clears the race mark in the same write, so a crash after it says nothing", async () => {
+    const h = harness();
+    const { t } = await askingTask(h, "Merge PR #12?");
+    let open!: (ok: boolean) => void;
+    h.sendGate = new Promise<boolean>((r) => { open = r; });
+    const forward = h.service.afterHandOff("dm:owner", h.service.handOffFor("dm:owner")!.asks);
+    await flush();
+    expect(h.service.ownerMessage("dm:owner", t.id, "also, rename the branch").ok).toBe(true);
+    open(true);
+    await forward;
+    // Settled on the send's own record, before any separate settle write.
+    const record = h.store.get(t.id)!;
+    expect(record.forwardRacing).toBeUndefined();
+    expect(record.replyMap).toHaveLength(1);
+  });
+
+  it("a failed race still marked when a new one starts is told, not overwritten", async () => {
+    const h = harness();
+    const { t } = await askingTask(h, "Merge PR #12?");
+    // Q1 failed while the task waited: the mark stays.
+    h.store.update(t.id, (r) => { r.forwardRacing = { at: 1, text: "Old question?", failed: true }; });
+    let open!: (ok: boolean) => void;
+    h.sendGate = new Promise<boolean>((r) => { open = r; });
+    void h.service.afterHandOff("dm:owner", h.service.handOffFor("dm:owner")!.asks);
+    await flush();
+    expect(h.service.ownerMessage("dm:owner", t.id, "also, rename the branch").ok).toBe(true);
+    const record = h.store.get(t.id)!;
+    const input = record.pendingInput.map((i) => i.text).join("\n");
+    expect(input).toContain("> Old question?");
+    expect(input).toContain("never shown to the owner");
+    expect(record.forwardRacing).toMatchObject({ text: "Merge PR #12?" });
+    open(true);
+    await flush();
+  });
+
   it("another scope cannot forward it", async () => {
     const h = harness();
     await askingTask(h, "Merge?");

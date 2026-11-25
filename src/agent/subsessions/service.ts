@@ -873,7 +873,11 @@ export class SubsessionService {
     const done = (async (): Promise<{ ok: true } | { ok: false; error: string }> => {
       const result = await this.sendAndRecord(record, "ask", ask.text, {
         spoke: false,
-        patch: (r, sentAt) => { if (r.pendingAsk?.at === ask.at) r.pendingAsk.forwardedAt = sentAt; },
+        patch: (r, sentAt) => {
+          if (r.pendingAsk?.at === ask.at) r.pendingAsk.forwardedAt = sentAt;
+          // A wake raced this send: it went out, recorded in the same write.
+          if (r.forwardRacing?.at === ask.at && !r.forwardRacing.failed) delete r.forwardRacing;
+        },
       });
       if (!result.ok) return { ok: false, error: result.error ?? "the question did not go out." };
       this.forwardedAsks.add(askKey(record.id, ask.at));
@@ -1924,6 +1928,10 @@ export class SubsessionService {
         const inFlight = ask ? this.forwarding.get(r.id) : undefined;
         racing = ask && inFlight?.at === ask.at ? { done: inFlight.done, text: ask.text, at: ask.at } : undefined;
         let note: string | undefined;
+        // An earlier question marked as never shown is told now, before any
+        // new mark could take its place.
+        const earlier = r.forwardRacing?.failed ? notShownNote(r.forwardRacing.text) : undefined;
+        if (earlier) delete r.forwardRacing;
         if (racing) {
           // Written before the owner could have seen the question, whatever
           // the send does: said now, in this turn's own input. Whether the
@@ -1936,11 +1944,9 @@ export class SubsessionService {
           note = formatTomoEvent("subsession-redelivery",
             `Your question had not been forwarded to the owner when this message came, so this message is most likely not an answer to it:\n${quoteBlock(ask.text)}\nAsk again with task_ask if you still need it.`,
             { name: "question-not-shown" });
-        } else if (r.forwardRacing?.failed) {
-          note = notShownNote(r.forwardRacing.text);
-          delete r.forwardRacing;
         }
-        appendInput(r, note ? `${prompt}\n\n${note}` : prompt, { from: "owner", words });
+        const notes = [earlier, note].filter((x): x is string => x !== undefined);
+        appendInput(r, notes.length > 0 ? `${prompt}\n\n${notes.join("\n")}` : prompt, { from: "owner", words });
         // The owner's word: the wall-clock cap counts from here again.
         r.activeAtOwnerInputMs = activeTotalMs(r, now);
         extra?.(r);

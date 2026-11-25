@@ -378,6 +378,56 @@ describe("sub-sessions through the Agent", () => {
     await agent.stop();
   });
 
+  describe("a /s message too old to replay", () => {
+    const staleBoot = async () => {
+      resetConfig({
+        identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+        subsessions: { ...mockConfig.subsessions, enabled: true },
+        inbox: true,
+        inboxReplayMaxAgeMinutes: 0,
+        tomoHome: mockConfig.tomoHome,
+      });
+      const agent = new Agent();
+      agent.addChannel(new MockChannel("telegram"));
+      await agent.start();
+      return agent;
+    };
+    const leaveInInbox = () => {
+      const inbox = new DurableInbox({ path: join(mockConfig.tomoHome, "data", "inbox.jsonl") });
+      inbox.accept("telegram", makeMsg({ id: "late", chatId: "12345", senderId: "12345", text: "use plan B" }),
+        { sessionKey: "task:s1", replyTarget: { channelName: "telegram", chatId: "12345" } });
+      inbox.close();
+    };
+    const pendingInbox = () => new DurableInbox({ path: join(mockConfig.tomoHome, "data", "inbox.jsonl"), readOnly: true }).pending();
+
+    it("says nothing when the task already has it (only the inbox's done-write was lost)", async () => {
+      const store = new SubsessionStore(join(mockConfig.tomoHome, "data", "subsessions.json"));
+      const t = store.create({ parentKey: "dm:alex", title: "Fix it", brief: "b" });
+      store.update(t.id, (r) => { r.ownerMessageIds.push("telegram:late"); });
+      leaveInInbox();
+      const agent = await staleBoot();
+      expect(peekPendingNotes(agent, "dm:alex").some((n) => n.includes("stale-task-message"))).toBe(false);
+      expect(pendingInbox()).toEqual([]);
+      await agent.stop();
+    });
+
+    it("keeps the inbox record when the note to the owner's session cannot be written", async () => {
+      leaveInInbox();
+      const proto = Agent.prototype as unknown as { queuePendingNote(key: string, note: string): boolean };
+      const real = proto.queuePendingNote;
+      const spy = vi.spyOn(proto, "queuePendingNote").mockImplementation(function (this: unknown, key: string, note: string) {
+        return note.includes("stale-task-message") ? false : real.call(this, key, note);
+      });
+      try {
+        const agent = await staleBoot();
+        expect(pendingInbox().map((r) => r.message.id)).toEqual(["late"]);
+        await agent.stop();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+  });
+
   it("recovers sub-sessions before any channel ingests, and runs no task turn until start() opens dispatch", async () => {
     resetConfig({
       identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],

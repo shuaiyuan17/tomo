@@ -1265,6 +1265,17 @@ export class Agent {
       `The owner's next message replies to a message Tomo could not match. Sub-session ${names} was sending a message to the owner at the time, so the owner may be answering it. If so, tell them it reached you instead, and ask them to send it again as ${resend}: only then does it reach the task as their own words.`)));
   }
 
+  /** Did this owner message reach the task? Undefined when the table can't tell. */
+  private taskHasOwnerMessage(id: string, messageId: string): boolean | undefined {
+    if (!this.subsessions?.available()) return undefined;
+    try {
+      const record = this.subsessions.get(id);
+      return record ? record.ownerMessageIds.includes(messageId) : false;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** A replayed owner reply addressed by reference: match it to a task again (its ids may be known now). */
   private replayResolution(channelName: string, message: IncomingMessage, resolution: SessionResolution): SessionResolution {
     const scope = this.router.ownerSessionKey();
@@ -1305,7 +1316,7 @@ export class Agent {
       .map((a) => a.savedPath).filter((p): p is string => typeof p === "string");
     const result: OwnerMessageResult = this.subsessions && scope && id
       ? this.subsessions.ownerMessage(scope, id, message.text, {
-        messageId: `${channel.name}:${message.id}${message.inboxKey ? `:${message.inboxKey}` : ""}`,
+        messageId: taskMessageId(channel.name, message),
         files,
       })
       : { ok: false, reason: "unknown" };
@@ -3546,14 +3557,27 @@ export class Agent {
         // key's transcript is one nobody reads.
         const owner = isTaskSessionKey(key) ? this.router.ownerSessionKey() : undefined;
         if (owner) {
-          recordAt = owner;
           const id = taskIdFromSessionKey(key) ?? key;
+          // Handed over before the crash (only the inbox's done-write was
+          // lost): the task has it, nothing to tell.
+          const delivered = this.taskHasOwnerMessage(id, taskMessageId(rec.channel, message));
+          if (delivered === true) {
+            this.inbox.markDone([rec.id]);
+            continue;
+          }
+          recordAt = owner;
           const typed = message.text;
           message = { ...message, text: `[The owner sent this to sub-session ${id}; it was too old to deliver after the restart.]\n${message.text}` };
-          // And the owner's session is told, so the owner hears it was never delivered.
-          this.queuePendingNote(owner, markOwnerAudience(formatTomoEvent("inbox",
-            `Before Tomo restarted the owner sent this to sub-session ${id}, and it was too old to deliver after the restart, so the task never got it. Tell the owner, and ask whether to send it again (/s ${id} <message>):\n\n${typed}`,
+          // And the owner's session is told, so the owner hears it may never
+          // have arrived. Only once that note is on disk is the record closed;
+          // otherwise the next start tries again.
+          const told = this.queuePendingNote(owner, markOwnerAudience(formatTomoEvent("inbox",
+            `Before Tomo restarted the owner sent this to sub-session ${id}, and it was too old to deliver after the restart, so the task ${delivered === false ? "never got it" : "may never have got it (its task list could not be read to check)"}. Tell the owner, and ask whether to send it again (/s ${id} <message>):\n\n${typed}`,
             { name: "stale-task-message" })));
+          if (!told) {
+            log.error({ task: id, inboxId: rec.id }, "Could not persist the note for a stale message to a sub-session; the inbox record is kept for the next start");
+            continue;
+          }
         }
         stale.set(recordAt, [...(stale.get(recordAt) ?? []), { channel: channel ?? { name: rec.channel }, message, inboxId: rec.id }]);
         continue;
@@ -3612,6 +3636,11 @@ export class Agent {
       this.dispatchInbound(channel, restoreMessage(rec.message), rec.resolution, rec.id);
     }
   }
+}
+
+/** The dedup id an owner message to a sub-session is recorded under (`ownerMessageIds`). */
+function taskMessageId(channelName: string, message: Pick<IncomingMessage, "id" | "inboxKey">): string {
+  return `${channelName}:${message.id}${message.inboxKey ? `:${message.inboxKey}` : ""}`;
 }
 
 /**

@@ -3644,10 +3644,19 @@ export class Agent {
         // owner's session is told it may have been meant for that task.
         const ref = message.replyToId ?? message.reactedToId;
         const scope = this.router.ownerSessionKey();
-        if (!owner && scope && key === scope && ref && message.taskSendsInFlight?.length
-          && !this.warnUnmatchedReply(scope, ref, message.taskSendsInFlight, message.text)) {
-          log.error({ inboxId: rec.id }, "Could not persist the note for a stale unmatched reply; the inbox record is kept for the next start");
-          continue;
+        if (!owner && scope && key === scope && ref && message.taskSendsInFlight?.length) {
+          // Matched once its sends settled and handed to that task before the
+          // crash (only the inbox's done-write was lost): the task has it, and
+          // asking the owner to send it again would run it twice.
+          const messageId = taskMessageId(rec.channel, message);
+          if (message.taskSendsInFlight.some((id) => this.taskHasOwnerMessage(id, messageId) === true)) {
+            this.inbox.markDone([rec.id]);
+            continue;
+          }
+          if (!this.warnUnmatchedReply(scope, ref, message.taskSendsInFlight, message.text)) {
+            log.error({ inboxId: rec.id }, "Could not persist the note for a stale unmatched reply; the inbox record is kept for the next start");
+            continue;
+          }
         }
         if (owner) {
           const id = taskIdFromSessionKey(key) ?? key;

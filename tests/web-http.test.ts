@@ -121,9 +121,10 @@ describe("the write gate", () => {
     }
     expect(handoff).not.toHaveBeenCalled();
   });
-  it("DELETE uploads/<id> does not check the epoch (today's behaviour: CSRF is its only write check)", async () => {
-    // Every other write needs the epoch; whether discarding a staged upload
-    // should too is an open question, so this pins what the route does now.
+  it("DELETE uploads/<id> does not check the epoch, by design: CSRF is its only write check", async () => {
+    // Every other write needs the epoch. A discard only removes the browser's
+    // own staged file, and refusing it after a daemon restart would leave the
+    // file until the TTL sweep, so skipping the epoch here is intended.
     const response = await call(`/api/v1/uploads/${"0".repeat(32)}`, { method: "DELETE", body: "{}", headers: { ...mutationHeaders(), "x-tomo-epoch": undefined } });
     expect([response.status, response.text]).toEqual([200, "{}"]);
   });

@@ -261,6 +261,11 @@ describe("sub-session tools", () => {
     // A blank step is refused, not read as clearing the plan.
     expect((await call(self as never, "task_plan", { steps: [{ step: "  " }], reason: "x" })).isError).toBe(true);
     expect(svc.get("s1")?.plan).toHaveLength(1);
+    // Two steps alike are refused, saying how to tell them apart.
+    const twice = await call(self as never, "task_plan", { steps: [{ step: "Write tests" }, { step: "Write tests" }], reason: "x" });
+    expect(twice.isError).toBe(true);
+    expect(JSON.stringify(twice.content)).toContain("its own words");
+    expect(svc.get("s1")?.plan).toHaveLength(1);
     // A step longer than the limit is cut, not refused.
     expect((await call(self as never, "task_plan", { steps: [{ step: "Write tests", status: "in_progress" }, { step: "😀".repeat(200) }] })).isError).toBeUndefined();
     expect(Array.from(svc.get("s1")!.plan![1].text)).toHaveLength(120);

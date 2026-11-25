@@ -570,14 +570,23 @@ function parseUpdates(raw: unknown[]): SubsessionUpdate[] {
   }).slice(-UPDATES_KEEP);
 }
 
-/** Well-formed steps only, each one line within PLAN_STEP_MAX, the first PLAN_MAX_STEPS. */
+/**
+ * Well-formed steps only, each one line within PLAN_STEP_MAX, the first
+ * PLAN_MAX_STEPS, no two alike (task_plan refuses them): a second copy is
+ * dropped, and the first takes its in_progress if it had it.
+ */
 function parsePlan(raw: unknown[]): SubsessionPlanStep[] {
-  return raw.flatMap((e): SubsessionPlanStep[] => {
-    if (!e || typeof e !== "object") return [];
+  const byText = new Map<string, SubsessionPlanStep>();
+  for (const e of raw) {
+    if (!e || typeof e !== "object") continue;
     const { text, status } = e as { text?: unknown; status?: unknown };
     const line = typeof text === "string" ? oneLine(text, PLAN_STEP_MAX) : "";
-    return line ? [{ text: line, status: status === "in_progress" ? "in_progress" : "pending" }] : [];
-  }).slice(0, PLAN_MAX_STEPS);
+    if (!line) continue;
+    const step = byText.get(line) ?? { text: line, status: "pending" as const };
+    if (status === "in_progress") step.status = "in_progress";
+    byText.set(line, step);
+  }
+  return [...byText.values()].slice(0, PLAN_MAX_STEPS);
 }
 
 /** The capped logs. pendingInput is NOT one of them: accepted input is never dropped. */

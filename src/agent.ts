@@ -13,8 +13,12 @@ import {
   privateReplyTargetFromSessionKey,
   replyTargetFromRawSessionKey,
   isTaskSessionKey,
+  taskIdFromSessionKey,
+  taskSessionKey,
 } from "./sessions/keys.js";
-import { SubsessionService, type TaskTurnOutcome } from "./agent/subsessions/service.js";
+import { SubsessionService, type OwnerMessageResult, type TaskTurnOutcome } from "./agent/subsessions/service.js";
+import { parseTaskAddress, type TaskAddress } from "./agent/subsessions/address.js";
+import { taskCommandReply } from "./agent/subsessions/commands.js";
 import { SubsessionStore } from "./agent/subsessions/store.js";
 import { buildSubsessionPrompt } from "./agent/subsessions/prompt.js";
 import { CRON_STORE_PATH } from "./cron/store.js";
@@ -125,6 +129,13 @@ const REWIND_SHUTDOWN_TIMEOUT_MS = 3_000;
  * than a "first N keys" counter because it needs no hook on the message path.
  */
 const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
+
+/**
+ * How long a reply that matches no task waits for task sends still in flight
+ * (see enqueueMessage). The wait runs after the inbox has the message, so a
+ * crash during it loses nothing: the replay matches the reply again.
+ */
+const TASK_SEND_SETTLE_MS = 30_000;
 
 export class Agent {
   private channels: Channel[] = [];
@@ -492,9 +503,13 @@ export class Agent {
       store: new SubsessionStore(join(config.tomoHome, "data", "subsessions.json")),
       config: () => config.subsessions,
       runTaskTurn: (key, prompt, opts) => this.runTaskTurn(key, prompt, opts),
-      sendToScope: async (parentKey, text, taskKey, noteFrom) => {
-        const result = await this.proactive.sendToSession(parentKey, text, taskKey, { noteFrom, ownerOnlyNote: isDmSessionKey(parentKey) });
-        return result.ok ? { ok: true } : { ok: false, error: result.error };
+      sendToScope: async (parentKey, text, taskKey, noteFrom, harnessPrefix) => {
+        // A task owned by the owner's DM speaks for the owner alone: the note
+        // of its send never drains into a summoned group's turn there.
+        const result = await this.proactive.sendToSession(parentKey, text, taskKey, { noteFrom, harnessPrefix, ownerOnlyNote: isDmSessionKey(parentKey) });
+        return result.ok
+          ? { ok: true, ...(result.channel ? { channel: result.channel } : {}), ...(result.messageIds ? { messageIds: result.messageIds } : {}) }
+          : { ok: false, error: result.error };
       },
       noticeToScope: async (parentKey, text) => {
         if (parentKey === this.router.ownerSessionKey()) {
@@ -522,6 +537,8 @@ export class Agent {
       cronJobCount: (key) => cron.count(key),
       removeCronJobs: (key) => cron.removeAll(key),
       stopSession: (key, timeoutMs) => this.stopTaskSession(key, timeoutMs),
+      hasTurnInFlight: (key) => this.liveSessionManager.hasTurnInFlight(key),
+      closeSession: (key) => this.liveSessionManager.closeLiveSession(key),
       registryReadable: () => this.sessions.registryReadable(),
       hasSdkSession: (key) => this.sessions.getSdkSessionId(key) !== undefined,
       hasLiveSession: (key) => this.liveSessionManager.hasLiveSession(key),
@@ -560,13 +577,15 @@ export class Agent {
 
   /**
    * One silent turn on a task key, queued on that key. Nothing it writes
-   * reaches a chat (a task speaks through task_notify); errors are kept to a
-   * pending note on the task itself, and the service decides what follows.
+   * reaches a chat (a task speaks through its task_* tools); errors are kept
+   * to a pending note on the task itself, and the service decides what
+   * follows. The text it ended with comes back for the service's fallback.
    */
   private runTaskTurn(key: string, prompt: string, opts: { bare: boolean }): Promise<TaskTurnOutcome> {
     return this.enqueueForSession(key, async () => {
       let stopped = false;
       let shutdown = false;
+      let response: string | undefined;
       const ok = await this.turnRunner.runTurn({
         key,
         source: "continuity",
@@ -576,8 +595,9 @@ export class Agent {
         delivery: {
           kind: "deferred-send",
           suppressDelivery: true,
-          suppressedLog: "Sub-session output kept out of chat (a task speaks through task_notify)",
+          suppressedLog: "Sub-session output kept out of chat (a task speaks through its task_* tools)",
           resolveTarget: () => undefined,
+          onSuppressedResponse: (text) => { response = text; },
         },
         silentMatcher: isSilentReply,
         transcript: "on-delivery",
@@ -591,7 +611,7 @@ export class Agent {
         onShutdown: () => { shutdown = true; },
         onStopped: () => { stopped = true; },
       });
-      return { ok: ok && !stopped && !shutdown, stopped, shutdown };
+      return { ok: ok && !stopped && !shutdown, stopped, shutdown, ...(response !== undefined ? { response } : {}) };
     }).catch((err): TaskTurnOutcome => {
       log.error({ err, sessionKey: key }, "Sub-session turn failed in queue");
       return { ok: false, shutdown: this.stopping };
@@ -1052,12 +1072,29 @@ export class Agent {
       return true;
     }
 
+    // A sub-session addressed by the owner (`/s …`, or a reply to one of its
+    // messages): their own DM only, after every gate above and before the
+    // inbox. A command is answered here and consumed, like a broker's
+    // message; a message keeps its path below (inbox, dedup, replay) with
+    // the task's key. Not from the web UI yet: a web request is bound to a
+    // reply this route would never give.
+    let taskKey: string | undefined;
+    let unmatchedReply = false;
+    if (this.subsessions && !isGroup && channel.name !== "web" && this.router.isOwnerSender(channel.name, message.senderId)) {
+      const routed = await this.routeOwnerToTask(channel, message);
+      if (routed === "consumed") return true;
+      if (routed === "unmatched-reply") unmatchedReply = true;
+      else if (routed) ({ message, taskKey } = routed);
+    }
+
     // Resolve ONCE, at receipt — this decides both which queue the message
     // waits in and which session eventually processes it. Re-resolving at
     // processing time would let a /summon or /dismiss that lands while the
     // message waits (in-flight turn, iMessage settle window) re-route it.
-    const resolution = this.router.resolve(channel.name, message.chatId, isGroup);
+    // (Resolved for a task message too: it moves the owner's reply target.)
+    let resolution = this.router.resolve(channel.name, message.chatId, isGroup);
     if (channel.name === "web") resolution.replyTarget = { channelName: "web", chatId: message.id };
+    if (taskKey) resolution = { ...resolution, sessionKey: taskKey };
 
     // DURABLE CUSTODY. Persist before the `true` below reaches the channel:
     // that answer is what makes imsg commit its cursor, and Telegram has
@@ -1096,6 +1133,12 @@ export class Agent {
       }
     }
 
+    // A reply that matched no task while a task's send was still in flight:
+    // the owner may be answering that very message, whose ids are not known
+    // yet. Wait for the sends to settle — AFTER custody, so a crash here
+    // loses nothing (the replay matches the reply again) — then look again.
+    if (unmatchedReply) resolution = await this.settleUnmatchedReply(channel.name, message, resolution);
+
     const accepted = this.dispatchInbound(channel, message, resolution, inboxId);
     // Refused only past the shutdown drain. A durably persisted message is
     // still ours — the next start replays it — so custody stands.
@@ -1113,6 +1156,10 @@ export class Agent {
     resolution: SessionResolution,
     inboxId: string | undefined,
   ): boolean {
+    // A message to a sub-session never runs a turn here: it is handed to the
+    // task (its pendingInput, on disk) — also on a replay, which re-checks
+    // that the task is still there.
+    if (isTaskSessionKey(resolution.sessionKey)) return this.deliverToTask(channel, message, resolution, inboxId);
     const isGroup = message.isGroup ?? false;
     const sessionKey = resolution.sessionKey;
     const isPassiveGroup = isGroup && this.isPassiveListenGroup(channel.name, message.chatId);
@@ -1141,6 +1188,130 @@ export class Agent {
     }
 
     return this.batcher.enqueue(resolution.sessionKey, channel, message, canCoalesce, resolution, inboxId);
+  }
+
+  /**
+   * Is this owner DM addressed to a sub-session? `"consumed"`: a `/s`
+   * command, answered here. A message: the task's key and the message with
+   * the `/s <id>` prefix taken off. A reply or tapback on one of a task's
+   * messages routes to that task as it is.
+   */
+  private async routeOwnerToTask(channel: Channel, message: IncomingMessage): Promise<"consumed" | "unmatched-reply" | { taskKey: string; message: IncomingMessage } | undefined> {
+    const service = this.subsessions;
+    const scope = this.router.ownerSessionKey();
+    if (!service || !scope) return undefined;
+    const typed = message.rawText ?? message.text;
+    const address = typed ? parseTaskAddress(typed) : undefined;
+    if (address && address.kind !== "message") {
+      await this.answerTaskCommand(channel, message.chatId, scope, address);
+      return "consumed";
+    }
+    if (address) {
+      // Channels put markers in front of what was typed (`[replying to …]`,
+      // an attachment's path): keep them, replace only the typed part.
+      const text = message.text.endsWith(typed) ? `${message.text.slice(0, message.text.length - typed.length)}${address.body}` : address.body;
+      return { taskKey: taskSessionKey(address.id), message: { ...message, text, rawText: address.body } };
+    }
+    const ref = message.replyToId ?? message.reactedToId;
+    const task = ref ? service.taskForReply(scope, channel.name, ref) : undefined;
+    if (task) return { taskKey: task.sessionKey, message };
+    // The owner can see (and answer) a task's message before its send
+    // resolves with the ids that map replies to it. Decided after custody.
+    return ref && service.sendsInFlight(scope) ? "unmatched-reply" : undefined;
+  }
+
+  /**
+   * An owner reply that matched no task while task sends were in flight
+   * (already in the inbox): wait for those sends, then match it again. Still
+   * unmatched with a send pending, it stays with the owner's session, which
+   * is told the owner may be answering that task: only the owner's own words
+   * reach a task as theirs, so it asks them to send it again with /s.
+   */
+  private async settleUnmatchedReply(channelName: string, message: IncomingMessage, resolution: SessionResolution): Promise<SessionResolution> {
+    const service = this.subsessions;
+    const scope = this.router.ownerSessionKey();
+    const ref = message.replyToId ?? message.reactedToId;
+    if (!service || !scope || !ref) return resolution;
+    await service.whenSendsSettle(scope, TASK_SEND_SETTLE_MS);
+    const task = service.taskForReply(scope, channelName, ref);
+    if (task) return { ...resolution, sessionKey: task.sessionKey };
+    const sending = service.sendingTasks(scope);
+    if (sending.length > 0) {
+      const names = sending.map((t) => `${t.id} ("${t.title}")`).join(", ");
+      const resend = sending.map((t) => `/s ${t.id} <message>`).join(" or ");
+      log.warn({ ref, tasks: sending.map((t) => t.id) }, "Owner reply matched no task while a task send was still in flight; it stays with the owner's session");
+      this.queuePendingNote(scope, markOwnerAudience(formatTomoEvent("subsession-activity",
+        `The owner's next message replies to a message Tomo could not match. Sub-session ${names} was still sending a message to the owner at the time, so the owner may be answering it. If so, tell them it reached you instead, and ask them to send it again as ${resend}: only then does it reach the task as their own words.`)));
+    }
+    return resolution;
+  }
+
+  /** A replayed owner reply addressed by reference: match it to a task again (its ids may be known now). */
+  private replayResolution(channelName: string, message: IncomingMessage, resolution: SessionResolution): SessionResolution {
+    const scope = this.router.ownerSessionKey();
+    const ref = message.replyToId ?? message.reactedToId;
+    if (!this.subsessions?.available() || !scope || !ref || resolution.sessionKey !== scope || message.isGroup) return resolution;
+    const task = this.subsessions.taskForReply(scope, channelName, ref);
+    return task ? { ...resolution, sessionKey: task.sessionKey } : resolution;
+  }
+
+  /** `/s`, `/s <id>`, `/s <id> stop|start|model <name>`: answered in the chat it came from. */
+  private async answerTaskCommand(channel: Channel, chatId: string, scope: string, address: Exclude<TaskAddress, { kind: "message" }>): Promise<void> {
+    const t = ownerT("subsessions");
+    const service = this.subsessions!;
+    let text: OwnerText;
+    try {
+      text = await taskCommandReply(t, service, scope, address);
+    } catch (err) {
+      log.warn({ err, command: address.kind }, "Sub-session command failed");
+      text = t("cmd.unavailable");
+    }
+    log.info({ channel: channel.name, command: address.kind, ...("id" in address ? { id: address.id } : {}) }, "Sub-session command (/s)");
+    await channel.send({ chatId, text }).catch((err) => log.warn({ err }, "Could not answer a /s command"));
+  }
+
+  /**
+   * Hand the owner's message to its task. On success the inbox record is
+   * done (the task's table holds it now). A task that is gone or ended — or
+   * a table that cannot be read — sends the message on to the owner's own
+   * session instead, with a line saying where it was meant to go.
+   */
+  private deliverToTask(channel: Channel, message: IncomingMessage, resolution: SessionResolution, inboxId: string | undefined): boolean {
+    const id = taskIdFromSessionKey(resolution.sessionKey);
+    const scope = this.router.ownerSessionKey();
+    const files = [...(message.images ?? []), ...(message.documents ?? [])]
+      .map((a) => a.savedPath).filter((p): p is string => typeof p === "string");
+    const result: OwnerMessageResult = this.subsessions && scope && id
+      ? this.subsessions.ownerMessage(scope, id, message.text, {
+        messageId: `${channel.name}:${message.id}${message.inboxKey ? `:${message.inboxKey}` : ""}`,
+        files,
+      })
+      : { ok: false, reason: "unknown" };
+    if (result.ok) {
+      this.inbox?.markDone(inboxId ? [inboxId] : []);
+      if (!result.duplicate) {
+        log.info({ channel: channel.name, task: result.record.id, status: result.record.status }, "Owner message handed to a sub-session");
+        if (scope) {
+          this.queuePendingNote(scope, markOwnerAudience(formatTomoEvent("subsession-activity",
+            `The owner wrote to sub-session ${result.record.id} ("${result.record.title}") directly: "${message.text}"`,
+            { name: result.record.id })));
+        }
+        if (result.record.status === "queued") {
+          void channel.send({ chatId: message.chatId, text: ownerT("subsessions")("cmd.queuedMessage", { id: result.record.id }) })
+            .catch((err) => log.warn({ err }, "Could not acknowledge a message to a queued sub-session"));
+        }
+      }
+      return true;
+    }
+    const where = id ?? resolution.sessionKey;
+    const why = result.reason === "ended" ? "has ended"
+      : result.reason === "unknown" ? "does not exist"
+        : result.reason === "full" ? "already has too many messages waiting"
+          : "could not be reached (its task list is unreadable)";
+    log.info({ task: where, reason: result.reason }, "Message for a sub-session goes to the owner's session instead");
+    const owner = this.router.resolve(channel.name, message.chatId, false);
+    const note = `[The owner sent this to sub-session ${where}, which ${why}; it reached you instead.]`;
+    return this.dispatchInbound(channel, { ...message, text: `${note}\n${message.text}` }, owner, inboxId);
   }
 
   private async handlePastedMcpCallback(channel: Channel, message: IncomingMessage): Promise<boolean> {
@@ -3389,6 +3560,7 @@ export class Agent {
     if (stale.size > 0) this.recordInboundItems(stale, INBOX_STALE_NOT_PROCESSED);
 
     const perSession = new Map<string, number>();
+    for (const item of replay) item.rec = { ...item.rec, resolution: this.replayResolution(item.rec.channel, restoreMessage(item.rec.message), item.rec.resolution) };
     for (const { rec } of replay) perSession.set(rec.resolution.sessionKey, (perSession.get(rec.resolution.sessionKey) ?? 0) + 1);
     for (const [key, count] of perSession) {
       this.queuePendingNote(key, formatTomoEvent(

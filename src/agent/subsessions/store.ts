@@ -6,6 +6,8 @@ import { log } from "../../logger.js";
 import { taskSessionKey } from "../../sessions/keys.js";
 import { IllegalTransitionError, nextStatus, type SubsessionEvent } from "./state-machine.js";
 import {
+  OWNER_MESSAGE_IDS_KEEP,
+  REPLY_MAP_KEEP,
   SENT_KEEP,
   SUBSESSION_STATUSES,
   TRANSITION_LOG_KEEP,
@@ -136,6 +138,8 @@ export class SubsessionStore {
         compactPending: false,
         postCompactReminder: false,
         pendingInput: [],
+        replyMap: [],
+        ownerMessageIds: [],
         nextInputSeq: 1,
         seenThrough: 0,
         sent: [],
@@ -412,6 +416,11 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
     nextInputSeq: Math.max(lastSeq + 1, Math.floor(num("nextInputSeq", 1))),
     seenThrough: Math.max(0, Math.floor(num("seenThrough", 0))),
     ...(typeof r.heldThrough === "number" && Number.isFinite(r.heldThrough) ? { heldThrough: Math.max(0, Math.floor(r.heldThrough)) } : { heldThrough: undefined }),
+    replyMap: Array.isArray(r.replyMap)
+      ? r.replyMap.filter((m): m is SubsessionRecord["replyMap"][number] => typeof m === "object" && m !== null
+        && typeof (m as Record<string, unknown>).channel === "string" && typeof (m as Record<string, unknown>).messageId === "string")
+      : [],
+    ownerMessageIds: Array.isArray(r.ownerMessageIds) ? r.ownerMessageIds.filter((p): p is string => typeof p === "string") : [],
     ...(r.restored === true ? { restored: true } : {}),
     ...(typeof r.activeAtOwnerInputMs === "number" && Number.isFinite(r.activeAtOwnerInputMs) ? { activeAtOwnerInputMs: r.activeAtOwnerInputMs } : { activeAtOwnerInputMs: undefined }),
     ...(Array.isArray(r.earlierReports)
@@ -454,6 +463,8 @@ function parseInputs(raw: unknown): SubsessionInput[] {
 function trimLists(record: SubsessionRecord): void {
   if (record.sent.length > SENT_KEEP) record.sent = record.sent.slice(-SENT_KEEP);
   if (record.transitions.length > TRANSITION_LOG_KEEP) record.transitions = record.transitions.slice(-TRANSITION_LOG_KEEP);
+  if (record.replyMap.length > REPLY_MAP_KEEP) record.replyMap = record.replyMap.slice(-REPLY_MAP_KEEP);
+  if (record.ownerMessageIds.length > OWNER_MESSAGE_IDS_KEEP) record.ownerMessageIds = record.ownerMessageIds.slice(-OWNER_MESSAGE_IDS_KEEP);
 }
 
 function clone<T>(value: T): T {

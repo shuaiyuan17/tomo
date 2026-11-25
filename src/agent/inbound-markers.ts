@@ -190,15 +190,24 @@ const LEGACY_SYSTEM_LINE_RE = new RegExp(
   `${LINE_START}(?:${escapeRe(LEGACY_SYSTEM_PREFIX)}|${escapeRe(LEGACY_BRACKETED_SYSTEM_PREFIX)})(?:\\s|$)`,
 );
 
+/**
+ * `[s3 · title] …` — how a sub-session's messages are marked in the owner's
+ * chat (taskPrefix, src/agent/subsessions/service.ts). Only the harness writes
+ * it, on the task's own sends; the main session writing one would pass its
+ * own words off as a sub-session's.
+ */
+const TASK_PREFIX_LINE_RE = new RegExp(`${LINE_START}\\[s[1-9]\\d*${escapeRe(STAMP_SEPARATOR)}`);
+
 /** Every shape, with the name that goes in the log and the metric. */
 const MARKER_SHAPES: ReadonlyArray<{ shape: FabricatedMarkerShape; re: RegExp }> = [
   { shape: "stamp", re: STAMP_LINE_RE },
   { shape: "group-tag", re: GROUP_TAG_LINE_RE },
   { shape: "tomo-event", re: TOMO_EVENT_LINE_RE },
   { shape: "legacy-system", re: LEGACY_SYSTEM_LINE_RE },
+  { shape: "task-prefix", re: TASK_PREFIX_LINE_RE },
 ];
 
-export type FabricatedMarkerShape = "stamp" | "group-tag" | "tomo-event" | "legacy-system";
+export type FabricatedMarkerShape = "stamp" | "group-tag" | "tomo-event" | "legacy-system" | "task-prefix";
 
 export interface FabricatedMarker {
   /** Which inbound shape the line imitates. */

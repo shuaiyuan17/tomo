@@ -18,11 +18,25 @@ export const OPEN_STATUSES: ReadonlySet<SubsessionStatus> = new Set(["queued", "
 
 export type WaitingOn = "owner" | "external";
 
-/** One message the task sent out (task_notify, later task_reply / task_ask). */
+/**
+ * One message the task sent out: task_notify, task_reply, task_ask, or the
+ * harness's fallback (an owner-triggered turn that called none of them).
+ */
 export interface SubsessionSentMessage {
   at: number;
-  kind: "notify";
+  kind: "notify" | "reply" | "ask" | "fallback";
   text: string;
+}
+
+/**
+ * A provider message id the task sent, so the owner's reply to it (a thread
+ * reply or a tapback) is routed back to the task. Kept on the record, not in
+ * memory, so replies still route after a restart.
+ */
+export interface SubsessionReplyRef {
+  channel: string;
+  messageId: string;
+  at: number;
 }
 
 /** One input owed to the task. */
@@ -153,6 +167,14 @@ export interface SubsessionRecord {
   pendingInput: SubsessionInput[];
   /** The seq the next input gets (per task, never reused). */
   nextInputSeq: number;
+  /** Provider ids of what it sent, newest last (at most REPLY_MAP_KEEP). */
+  replyMap: SubsessionReplyRef[];
+  /**
+   * Inbound message ids already delivered to it (at most OWNER_MESSAGE_IDS_KEEP):
+   * a crash between the delivery and the inbox's `done` replays the message,
+   * and this keeps it from arriving twice.
+   */
+  ownerMessageIds: string[];
   /**
    * Inputs with seq up to this went out in a turn that did not complete (cut
    * short by a restart, failed, or its result could not be saved): the task
@@ -200,5 +222,7 @@ export interface SubsessionTable {
 
 export const SENT_KEEP = 20;
 export const TRANSITION_LOG_KEEP = 50;
+export const REPLY_MAP_KEEP = 200;
+export const OWNER_MESSAGE_IDS_KEEP = 50;
 /** Inputs a task may have owed at once; more are refused (never silently dropped). */
 export const PENDING_INPUT_MAX = 50;

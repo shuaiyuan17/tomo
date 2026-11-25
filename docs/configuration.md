@@ -256,6 +256,14 @@ On by default (`"subsessions": { "enabled": false }` turns them off). The owner'
 
 A task runs unattended, so it gets fewer tools than the main conversation: no external MCP servers (neither `mcpServers` nor any a plugin or a settings file brings) and no claude.ai connectors (Gmail, Calendar, Drive…), only Tomo's own tools plus the built-in ones. Its own turns also pause (and you are told once) while 80% or more of the 5-hour usage window is used, as last recorded in `~/.tomo/data/usage/limits.ndjson`; if that can't be read, they run. A message from you to the task always goes through.
 
+You can also talk to a task yourself, from your own DM (Telegram or iMessage):
+
+- `/s` lists your tasks; `/s s3` shows one.
+- `/s s3 <message>` sends it a message (it wakes a task that is waiting for you). Replying to one of its `[s3 · …]` messages does the same.
+- `/s s3 stop` cancels it, `/s s3 start` starts a queued one now even past `maxRunning`, `/s s3 model <opus|sonnet|fable>` changes its model from its next turn.
+
+Only an exact `stop`, `start` or `model <name>` is a command; `/s s3 stop the deploy` is a message.
+
 State lives in `~/.tomo/data/subsessions.json` (fsynced, with a `.bak`). If it cannot be read at start, sub-sessions stay off until it is repaired and nothing is unlinked or cancelled.
 
 ## Context management (LCM)

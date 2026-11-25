@@ -384,7 +384,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
  * A sub-session's server: a whitelist, not the main set minus a few. It
  * reports through its task_* tools, schedules check-backs on its own key,
  * reads the people roster. No send_message (it speaks
- * only to its owning scope, through task_notify), no memory or people writes,
+ * only to its owning scope, through task_reply, task_notify and task_ask), no memory or people writes,
  * no todos, no home, no credentials.
  */
 function createSubsessionMcpServer(agent: Agent, taskKey: string): McpSdkServerConfigWithInstance {

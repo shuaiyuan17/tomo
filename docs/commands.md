@@ -43,6 +43,7 @@ These are answered by Tomo itself, without a model call. Replies follow config `
 | `/login` | Refresh Claude login from the owner's private DM (`/login cancel` aborts a pending login) |
 | `/mcp` | Show external MCP health; `/mcp login <server>` starts per-server OAuth (owner DM only) |
 | `/status` | Show session info (model, channel, message count) |
+| `/s` | Sub-sessions (when `subsessions` is on; owner's Telegram or iMessage DM): `/s` lists them, `/s s3` shows one, `/s s3 <message>` talks to it, `/s s3 stop` / `start` / `model <name>` |
 | `/tasks` | List this chat's running tasks and the last 5 finished today (`/tasks all`: all of today). `/task` works too |
 | `/todo` | List this chat's open todos; `/todo add <text>`, `/todo done <id>`, `/todo drop <id> [reason]`, `/todo all` |
 | `/cost` | Show current-session cost for 1d / 7d / 1mo |
@@ -66,6 +67,10 @@ It does not undo tools, file changes, messages already sent, or persistent memor
 `/tasks` (or `/task`, any case; `/tasks@yourbot` in Telegram groups) gives the same list as the web UI's Tasks panel (subagents, background shells, monitors, workflows; watchers left out), one plain-text line each — every running task, then the five that ended most recently today (✗ marks a failure). `/tasks all` lists every task that ended today.
 
 Your DM shows your own session's tasks. A group shows only that group's own tasks, never your DM's or another group's — except in a summoned group, where you (the owner) get your own session's list, since the summoned turns run there: it goes to your private DM, and the group sees only "Sent to your DM." It reads the web UI's task board, so it needs the web UI enabled (`web.enabled`, on by default); history starts when Tomo starts. In the web chat itself, `/tasks` is ordinary text (the panel is right there).
+
+### `/s`
+
+With sub-sessions on (`subsessions.enabled`, see [configuration](configuration.md#sub-sessions)), `/s` in your own Telegram or iMessage DM lists your sub-sessions and `/s s3` shows one. `/s s3 <message>` sends that task a message; replying to one of its `[s3 · …]` messages does the same. `/s s3 stop` cancels it, `/s s3 start` starts a queued one now even past `maxRunning`, and `/s s3 model <opus|sonnet|fable>` changes its model from its next turn. Only an exact `stop`, `start` or `model <name>` is a command, so `/s s3 stop the deploy` is a message to the task. Commands answer without a model call. A message to a task that has ended or doesn't exist reaches your main conversation instead, with a note. In groups and the web chat, `/s` is ordinary text.
 
 ### `/todo`
 

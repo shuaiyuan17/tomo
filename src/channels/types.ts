@@ -271,6 +271,13 @@ export interface SendResult {
    * `replyTo` was requested, or when threading is not a concept here.
    */
   threaded?: boolean;
+  /**
+   * Provider ids of the messages this send put on the wire (every chunk of a
+   * long text, the photo of a captioned one), where the provider returned
+   * them. Absent when it returned none; a sub-session records them so the
+   * owner's reply to one routes back to it.
+   */
+  messageIds?: string[];
 }
 
 export type MessageReaction = "love" | "like" | "dislike" | "laugh" | "emphasize" | "question";

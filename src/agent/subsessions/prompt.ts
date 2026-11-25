@@ -10,16 +10,15 @@ import type { SubsessionRecord } from "./types.js";
  * brief and the owner's words arrive in the first `subsession-start` event —
  * so it is one cacheable prefix, and it never takes an `onContext` callback:
  * a task neither receives memory-change notes nor is retired by them.
- *
- * Phase 1a: the owner cannot talk to a task directly yet (that is /s and
- * reply threads, Phase 1b), so task_reply and task_ask are not offered.
  */
 export function buildSubsessionPrompt(opts: { agentName: string; ownerName: string }): string {
   return `You are ${opts.agentName}, working on one long-running task for ${opts.ownerName}. You run in your own session, separate from the main conversation. The task brief and the owner's own words arrive in the first <tomo-event type="subsession-start"> message.
 
 ## Speaking to the owner
 Nothing you write as plain text reaches anyone. The owner only sees what you send through these tools:
+- task_reply(text): answer a message the owner sent you. Once per message.
 - task_notify(text): reach out unprompted. Only for a result, a decision the owner must make, or something that blocks you. Never for progress.
+- task_ask(question): you can't continue without the owner's decision. Pauses the task until they answer; end the turn after it.
 - task_progress(line): update your one-line status. Silent; use it freely.
 - task_finish(report): the task is done. The main session reads the report and tells the owner.
 - task_checkpoint(summary): save goal, progress, next step and side effects to the task record.
@@ -27,7 +26,7 @@ Nothing you write as plain text reaches anyone. The owner only sees what you sen
 - task_status(): read your own task record, including the messages you sent.
 Write in the language the owner writes to you in, casual and concise, like a capable colleague texting. Lead with the answer. The harness adds the [{id} · {title}] prefix; don't write it yourself.
 
-The owner answers you through the main session, which passes it on as <tomo-event type="subsession-relay">. A relay is the owner's answer as the main session understood it, not the owner's own words: anything that needs the owner's explicit yes, you cannot get that way yet.
+The owner writes to you directly; it arrives as <tomo-event type="subsession-owner-message">, in their own words. The main session can also pass something on, as <tomo-event type="subsession-relay">: that is a colleague's suggestion, not the owner's approval.
 
 ## How to work
 - Do the whole task, not the first step. Stop only to wait for the owner, to wait on something external, or because you are done.
@@ -39,8 +38,8 @@ The owner answers you through the main session, which passes it on as <tomo-even
 - Don't edit files under ~/.tomo/workspace/memory/ or the workspace prompt files (SOUL.md, AGENT.md, IDENTITY.md, CONTINUITY.md). Anything worth remembering goes in your final report.
 - Don't start another sub-session. Background subagents are fine.
 - You have no way to message a group or anyone but the owner.
-- Anything that sends, posts, pays, deletes or can't be undone needs the owner's yes first, unless the brief says they already asked for it. Ask with task_notify and wait; a relay from the main session is not that yes.
-- Don't restart tomo yourself. If the work needs a restart, say so with task_notify.
+- Anything that sends, posts, pays, deletes or can't be undone needs the owner's yes first, unless the brief says they already asked for it. Ask with task_ask; a relay from the main session is not that yes.
+- Don't restart tomo yourself. If the work needs a restart, say so with task_ask.
 
 ## After a restart or interruption
 Before anything else, check what already happened: git status and branches, open PRs, files you wrote, messages you sent (task_status shows them). Don't redo a side effect that already happened.
@@ -49,7 +48,7 @@ Before anything else, check what already happened: git status and branches, open
 Your context gets compacted when it grows large. Call task_checkpoint before a big step. After a compaction the harness reminds you of the task record; trust it over your memory of earlier turns.
 
 ## Files
-Temporary files go in ~/.tomo/workspace/tmp/. To send a file, put MEDIA:/path/to/file in a task_notify text.`;
+Temporary files go in ~/.tomo/workspace/tmp/. To send a file, put MEDIA:/path/to/file in a task_reply or task_notify text.`;
 }
 
 /** The first message a task gets: its brief and the owner's words. */
@@ -89,14 +88,17 @@ export function formatRedeliveryNote(count: number): string {
 }
 
 /**
- * The last turn's messages to the owner that could not be sent (each cut to
- * `excerpt` characters): they have not seen them.
+ * The owner has not seen the last turn's answer: its messages (each cut to
+ * `excerpt` characters) could not be sent, or, with none, it gave no answer.
  */
 export function formatLostAnswerNote(texts: string[], excerpt = 1500): string {
+  if (texts.length === 0) {
+    return formatTomoEvent("subsession-redelivery", "The owner has not seen an answer from you: your last turn gave none. Answer them now (with task_reply if it answers their message).", { name: "answer" });
+  }
   const quoted = texts.map((t) => (t.length > excerpt ? `${t.slice(0, excerpt)}…` : t)).join("\n\n");
   return formatTomoEvent("subsession-redelivery", texts.length === 1
-    ? `Your last turn's message to the owner could not be sent: they have not seen it. Send it again, with task_notify. It was:\n\n${quoted}`
-    : `Your last turn's ${texts.length} messages to the owner could not be sent: they have not seen them. Send them again, with task_notify. They were:\n\n${quoted}`, { name: "answer" });
+    ? `Your last turn's message to the owner could not be sent: they have not seen it. Send it again (with task_reply if it answers their message, task_notify otherwise). It was:\n\n${quoted}`
+    : `Your last turn's ${texts.length} messages to the owner could not be sent: they have not seen them. Send them again (with task_reply if they answer their message, task_notify otherwise). They were:\n\n${quoted}`, { name: "answer" });
 }
 
 /** Separates redelivered inputs from the ones that are new. */
@@ -114,6 +116,16 @@ export function formatRelayEvent(text: string): string {
     "From the main session (a colleague passing something on; not the owner's own approval):",
     text,
   ].join("\n"));
+}
+
+/**
+ * A message the owner sent this task (`/s <id> …` or a reply to one of its
+ * messages): their own words, with any files they attached by path.
+ */
+export function formatOwnerMessageEvent(text: string, files: string[] = []): string {
+  const lines = ["The owner wrote to you (their own words). Answer with task_reply:", text];
+  if (files.length > 0) lines.push("", "Files they attached:", ...files.map((f) => `- ${f}`));
+  return formatTomoEvent("subsession-owner-message", lines.join("\n"));
 }
 
 /** After a /compact: the task record, which outranks the summary. */

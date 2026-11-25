@@ -6,6 +6,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/a
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
 import { join } from "node:path";
+import type { OutgoingMessage, SendResult } from "../src/channels/types.js";
 import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockConfig, mockSdk, resetConfig, waitFor } from "./helpers/agent-harness.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { formatTomoEvent } from "../src/tomo-event.js";
@@ -17,14 +18,22 @@ installAgentTestHooks();
 // task: key, silently; its scope (parentKey) decides its privacy.
 // ---------------------------------------------------------------------------
 
-async function boot(enabled = true): Promise<{ agent: Agent; channel: MockChannel }> {
+/** A channel that answers each send with provider ids, as Telegram and iMessage do. */
+class IdChannel extends MockChannel {
+  private next = 500;
+  override async send(msg: OutgoingMessage): Promise<SendResult> {
+    await super.send(msg);
+    return { messageIds: [String(this.next++)] };
+  }
+}
+
+async function boot(enabled = true, channel: MockChannel = new MockChannel("telegram")): Promise<{ agent: Agent; channel: MockChannel }> {
   resetConfig({
     identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
     subsessions: { ...mockConfig.subsessions, enabled },
     tomoHome: mockConfig.tomoHome,
   });
   const agent = new Agent();
-  const channel = new MockChannel("telegram");
   agent.addChannel(channel);
   await agent.start();
   return { agent, channel };
@@ -82,6 +91,38 @@ describe("sub-sessions through the Agent", () => {
     await agent.stop();
   });
 
+  it("keeps the text a task sent to the owner out of a summoned group's turn on the owner's session", async () => {
+    const channel = new IdChannel("telegram");
+    const { agent } = await boot(true, channel);
+    (agent as unknown as { router: { summonGroup(ch: string, chatId: string, identity: string): void } })
+      .router.summonGroup("telegram", "-100271", "alex");
+    let release!: () => void;
+    const gate = new Promise<string>((r) => { release = () => r("NO_REPLY"); });
+    mockSdk.responseFn = () => gate;
+    const spawned = agent.subsessions!.spawn("dm:alex", { title: "Deploy", brief: "b" });
+    if (!spawned.ok) throw new Error(spawned.error);
+    await waitFor(() => expect(taskPrompts("task:s1")).toHaveLength(1));
+    // The real task-send path: the channel send, then the direct-send note on dm:alex.
+    expect(await agent.subsessions!.notify("task:s1", "the private deploy plan")).toMatchObject({ ok: true });
+    expect(channel.delivered.some((d) => d.text.includes("the private deploy plan"))).toBe(true);
+
+    mockSdk.responseFn = () => "NO_REPLY";
+    release();
+    await expect(agent.handleCronMessage("Scheduled group task", "telegram:-100271", { waitForHandoff: true })).resolves.toBe(true);
+    const groupTurn = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex");
+    expect(groupTurn).toHaveLength(1);
+    expect(groupTurn[0].text).toContain("Scheduled group task");
+    expect(groupTurn[0].text).not.toContain("the private deploy plan");
+
+    // The owner's own next turn gets it.
+    await channel.simulateMessage(makeMsg({ chatId: "12345", text: "how is it going?" }));
+    await drainQueue(agent);
+    const ownerTurn = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex").at(-1);
+    expect(ownerTurn?.text).toContain("how is it going?");
+    expect(ownerTurn?.text).toContain("the private deploy plan");
+    await agent.stop();
+  });
+
   it("routes a cron fire on a task key to the task, not to a chat", async () => {
     const { agent, channel } = await boot();
     mockSdk.responseFn = () => new Promise(() => {});
@@ -93,6 +134,116 @@ describe("sub-sessions through the Agent", () => {
     expect(channel.delivered).toHaveLength(0);
     expect(await agent.handleCronMessage("check CI", "task:s42")).toBe(false);
     await agent.stop();
+  });
+
+  describe("the owner addressing a task (/s, reply threads)", () => {
+    const owner = (text: string, extra: Record<string, unknown> = {}) => makeMsg({ chatId: "12345", senderId: "12345", text, rawText: text, ...extra });
+    const ownerPrompts = () => mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex");
+
+    it("answers /s itself: no turn on the owner's session", async () => {
+      const { agent, channel } = await boot();
+      await channel.simulateMessage(owner("/s"));
+      expect(channel.delivered.at(-1)?.text).toBe("No sub-sessions.");
+      await channel.simulateMessage(owner("/s s1 stop"));
+      expect(channel.delivered.at(-1)?.text).toBe("There's no sub-session s1.");
+      await drainQueue(agent);
+      expect(ownerPrompts()).toHaveLength(0);
+      await agent.stop();
+    });
+
+    it("hands /s <id> <words> to the task, without the prefix and without an owner turn", async () => {
+      const { agent, channel } = await boot();
+      mockSdk.responseFn = (text) => (text.includes("subsession-") ? new Promise(() => {}) : "owner reply");
+      agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
+      await channel.simulateMessage(owner("/s s1 stop the deploy and roll back"));
+      await waitFor(() => expect(agent.subsessions!.get("s1")!.pendingInput.length).toBeGreaterThan(0));
+      expect(agent.subsessions!.get("s1")?.status).toBe("active");
+      const input = agent.subsessions!.get("s1")!.pendingInput.map((i) => i.text).join("\n");
+      expect(input).toContain('type="subsession-owner-message"');
+      expect(input).toContain("stop the deploy and roll back");
+      expect(input).not.toContain("/s s1");
+      expect(ownerPrompts()).toHaveLength(0);
+      await agent.stop();
+    });
+
+    it("a message for a task that is gone reaches the owner's session, saying so", async () => {
+      const { agent, channel } = await boot();
+      mockSdk.responseFn = () => "ok";
+      await channel.simulateMessage(owner("/s s4 are you done?"));
+      await waitFor(() => expect(ownerPrompts().length).toBeGreaterThan(0));
+      expect(ownerPrompts()[0].text).toContain("sent this to sub-session s4, which does not exist");
+      expect(ownerPrompts()[0].text).toContain("are you done?");
+      await agent.stop();
+    });
+
+    it("routes a reply to one of the task's messages back to the task", async () => {
+      const { agent, channel } = await boot(true, new IdChannel("telegram"));
+      mockSdk.responseFn = (text) => (text.includes("subsession-") ? new Promise(() => {}) : "owner reply");
+      // A message from the owner first, so the owner's reply target is known.
+      await channel.simulateMessage(owner("hi"));
+      await drainQueue(agent);
+      const before = ownerPrompts().length;
+      agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
+      expect((await agent.subsessions!.notify("task:s1", "Which branch?")).ok).toBe(true);
+      const asked = channel.sent.find((m) => m.text.startsWith("[s1 · Fix it] Which branch?"));
+      expect(asked).toBeDefined();
+      const id = agent.subsessions!.get("s1")!.replyMap.at(-1)!.messageId;
+      await channel.simulateMessage(owner("main", { replyToId: id }));
+      await waitFor(() => expect(agent.subsessions!.get("s1")!.pendingInput.map((i) => i.text).join("\n")).toContain("main"));
+      expect(ownerPrompts()).toHaveLength(before);
+      await agent.stop();
+    });
+
+    it("matches a reply sent while the task's message is still sending, once the inbox has it", async () => {
+      resetConfig({
+        identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+        subsessions: { ...mockConfig.subsessions, enabled: true },
+        inbox: true,
+        tomoHome: mockConfig.tomoHome,
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      class GateChannel extends IdChannel {
+        override async send(msg: OutgoingMessage): Promise<SendResult> {
+          const result = await super.send(msg);
+          // The provider already shows the task's message; its ids come back late.
+          if (msg.text.startsWith("[s1 ")) await gate;
+          return result;
+        }
+      }
+      const channel = new GateChannel("telegram");
+      const agent = new Agent();
+      agent.addChannel(channel);
+      await agent.start();
+      mockSdk.responseFn = (text) => (text.includes("subsession-") ? new Promise(() => {}) : "owner reply");
+      await channel.simulateMessage(owner("hi"));
+      await drainQueue(agent);
+      const before = ownerPrompts().length;
+      agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
+      const notifying = agent.subsessions!.notify("task:s1", "Which branch?");
+      await waitFor(() => expect(channel.sent.some((m) => m.text.startsWith("[s1 · Fix it] Which branch?"))).toBe(true));
+      const inbox = (agent as unknown as { inbox: { pending(): Array<{ message: { id: string } }> } }).inbox;
+      // The id the provider will report for that message (IdChannel counts up).
+      const id = String(500 + channel.sent.findIndex((m) => m.text.startsWith("[s1 · Fix it] Which branch?")));
+      const replying = channel.simulateMessage(owner("main", { id: "r1", replyToId: id }));
+      // Custody first: the reply is in the inbox while it waits for the send.
+      await waitFor(() => expect(inbox.pending().some((r) => r.message.id === "r1")).toBe(true));
+      release();
+      expect((await notifying).ok).toBe(true);
+      expect(await replying).toBe(true);
+      await waitFor(() => expect(agent.subsessions!.get("s1")!.pendingInput.map((i) => i.text).join("\n")).toContain("main"));
+      expect(ownerPrompts()).toHaveLength(before);
+      await agent.stop();
+    });
+
+    it("leaves /s alone when sub-sessions are off", async () => {
+      const { agent, channel } = await boot(false);
+      mockSdk.responseFn = () => "ok";
+      await channel.simulateMessage(owner("/s s1 hi"));
+      await waitFor(() => expect(ownerPrompts().length).toBeGreaterThan(0));
+      expect(ownerPrompts()[0].text).toContain("/s s1 hi");
+      await agent.stop();
+    });
   });
 
   it("recovers sub-sessions before any channel ingests, and runs no task turn until start() opens dispatch", async () => {

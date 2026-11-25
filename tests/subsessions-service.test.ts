@@ -367,6 +367,10 @@ describe("SubsessionService", () => {
     expect(record).toMatchObject({ status: "finished", failStreak: 0, heldThrough: 1 });
     expect(record.pendingInput.map((i) => i.text).join()).toContain("one more thing");
     expect(h.notices.at(-1)?.text).toContain("Couldn't answer the message it was sent");
+    // The durable copy: the owning session gets what the task was sent, as a note.
+    const handed = h.notes.get("dm:owner")?.filter((n) => n.includes('type="subsession-unanswered"') && n.includes("one more thing"));
+    expect(handed).toHaveLength(1);
+    expect(h.wakes).toContain("dm:owner"); // and the owning session is woken to deal with it
     h.onTurn = () => ({ ok: false, stopped: true });
     h.service.relay(t.id, "and another");
     await flush();

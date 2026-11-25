@@ -8,7 +8,7 @@ import { api, ApiError } from "./api.js";
 import { Text } from "./markdown.js";
 import { messageDateTime, messageTime } from "./message-meta.js";
 import { createCompositionGuard } from "./compose-keys.js";
-import { canRetrySend, isOpenSubsession, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, isWorkingState, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
+import { canRetrySend, isOpenSubsession, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, isWorkingState, withListBackground, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
 import { i18n, useTranslation } from "./i18n/index.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
@@ -56,7 +56,8 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
     return () => { controller.abort(); clearTimeout(timer); };
   }, [id, revision, reload]);
   // What the list says now wins over the last detail read (it is the newer of the two).
-  const shown = { ...(detail ?? {}), ...summary };
+  // `background` is dropped, not set false, when it ends: take it from the list alone.
+  const shown = withListBackground(detail, summary);
   const state = subsessionState(shown);
   // Not before the conversation has been read: a message must have somewhere to show.
   const writable = !!send && shown.writable && status !== "gone" && !!detail;

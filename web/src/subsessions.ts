@@ -35,6 +35,27 @@ export function subsessionStateLabel(task: ShownTask): string {
   return i18n.t(STATE_LABELS[subsessionState(task)]);
 }
 
+/**
+ * An opened task as shown: what the list says now wins over the last detail
+ * read (it is the newer of the two). `background` is left out of a view, not
+ * set false, once the work ends, so it comes from the list alone.
+ */
+export function withListBackground<D extends Partial<WebSubsession>>(detail: D | undefined, summary: WebSubsession): Omit<D, "background"> & WebSubsession {
+  const rest: Partial<WebSubsession> = { ...(detail ?? {}) };
+  delete rest.background;
+  return { ...rest, ...summary } as Omit<D, "background"> & WebSubsession;
+}
+
+/**
+ * While a task is shown as working in the background, the list is read again
+ * this often: that work ending (or its report window lapsing) changes no task
+ * record, so no `subsessions` event says so.
+ */
+export const SUBSESSIONS_BACKGROUND_REFRESH_MS = 15_000;
+export function subsessionsRefreshMs(list: WebSubsessionList): number | undefined {
+  return list.available && list.tasks.some((task) => task.background === true) ? SUBSESSIONS_BACKGROUND_REFRESH_MS : undefined;
+}
+
 /** Open tasks are alive; ended ones are shown dimmed, as ended subagents are. */
 export function isOpenSubsession(task: Pick<WebSubsession, "status">): boolean {
   return task.status === "queued" || task.status === "active" || task.status === "waiting";
@@ -124,6 +145,8 @@ export function useSubsessions(revision: number): WebSubsessionList {
       // The table could not be read (or recovery is not done): keep what was shown, and look again.
       if (!next.available) { setList((old) => old.available ? old : next); again(); return; }
       setList(next);
+      const refresh = subsessionsRefreshMs(next);
+      if (refresh !== undefined && !controller.signal.aborted) timer = setTimeout(() => setRetry((n) => n + 1), refresh);
     }, again);
     return () => { controller.abort(); clearTimeout(timer); };
   }, [revision, retry]);

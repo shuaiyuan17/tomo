@@ -129,6 +129,16 @@ describe("buildSdkEnv: gateway and API-key routing", () => {
       config: { litellm: gateway("chatgpt-subscription") },
       expected: { ANTHROPIC_BASE_URL: undefined, ANTHROPIC_API_KEY: undefined },
     },
+    {
+      // The daemon's own ANTHROPIC_API_KEY (auth resolves it as source
+      // "environment") must survive the bypass: the session goes to Anthropic
+      // direct, so it needs that key, not the gateway's.
+      name: "a chatgpt-subscription gateway is bypassed and the inherited Anthropic key kept, for a Claude model",
+      parentEnv: { ANTHROPIC_BASE_URL: "http://localhost:4000", ANTHROPIC_API_KEY: "sk-anthropic-parent" },
+      model: "claude-sonnet-5[1m]",
+      config: { auth: apiKeyAuth("sk-anthropic-parent", "environment"), litellm: gateway("chatgpt-subscription") },
+      expected: { ANTHROPIC_BASE_URL: undefined, ANTHROPIC_API_KEY: "sk-anthropic-parent" },
+    },
   ])("$name", ({ parentEnv, config, model, sessionKey, expected }) => {
     for (const [name, value] of Object.entries(parentEnv ?? {})) vi.stubEnv(name, value);
     resetConfig(config as Parameters<typeof resetConfig>[0]);

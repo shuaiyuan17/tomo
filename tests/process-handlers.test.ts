@@ -400,9 +400,17 @@ describe("synthetic rejection and exception in a real process", () => {
     expect(stdout).not.toContain("ALIVE");
   });
 
-  it("survives a synthetic unhandled rejection WITH the handlers", { timeout: 60_000 }, async () => {
-    const { code, stdout } = await runChild("rejection");
+  // The object row is Node's real path for a non-Error reason: it must not
+  // kill the process either, and the log line must carry the object's
+  // contents, not "[object Object]".
+  it.each([
+    { name: "an Error", mode: "rejection", detail: "synthetic unhandled rejection" },
+    { name: "a plain object", mode: "rejection-object", detail: "ECONNRESET" },
+  ])("survives a synthetic unhandled rejection of $name WITH the handlers", { timeout: 60_000 }, async ({ mode, detail }) => {
+    const { code, stdout } = await runChild(mode);
     expect(stdout).toContain(`marker=${UNHANDLED_REJECTION_MARKER}`);
+    expect(stdout).toContain(detail);
+    expect(stdout).not.toContain("[object Object]");
     expect(stdout).toContain("ALIVE");   // the daemon is still serving
     expect(code).toBe(0);
   });

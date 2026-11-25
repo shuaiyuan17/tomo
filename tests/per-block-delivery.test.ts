@@ -1514,8 +1514,14 @@ describe("a block that fabricates an inbound marker is MARKED, not truncated", (
 
     await r.run([assistant([textBlock(body)]), result()]);
 
-    expect(events.filter((e) => e.type === "fabricated-marker").map((e) => e.shape))
-      .toEqual(["stamp", "legacy-system"]);
+    // Each event and its warning name the session LiveSession is running,
+    // not one the recorder was handed somewhere else.
+    expect(events.filter((e) => e.type === "fabricated-marker").map((e) => [e.shape, e.sessionKey]))
+      .toEqual([["stamp", "test:session"], ["legacy-system", "test:session"]]);
+    const warns = vi.mocked(log.warn).mock.calls.filter(
+      ([, msg]) => typeof msg === "string" && msg.includes("Fabricated inbound marker"),
+    );
+    expect(warns.map(([fields]) => (fields as Record<string, unknown>).session)).toEqual(["test:session", "test:session"]);
   });
 
   it("marks each offending block independently and leaves clean blocks alone", async () => {

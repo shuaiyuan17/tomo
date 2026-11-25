@@ -1,7 +1,7 @@
 import { joinText, type OwnerT, type OwnerText } from "../../i18n/index.js";
 import type { TaskAddress } from "./address.js";
 import type { SubsessionService } from "./service.js";
-import { currentStep, needsOwner, TERMINAL_STATUSES, type SubsessionRecord } from "./types.js";
+import { currentStep, needsOwner, reportNumber, TERMINAL_STATUSES, type SubsessionRecord } from "./types.js";
 
 /** The newest tasks `/s` lists; older ones are counted. */
 const LIST_MAX = 12;
@@ -40,7 +40,7 @@ export async function taskCommandReply(
       if (record.status === "cancelled") return t("cmd.alreadyStopped", { id: record.id });
       if (TERMINAL_STATUSES.has(record.status)) return t("cmd.ended", { id: record.id, status: statusWord(t, record) });
       // Finished and waiting on the owner: "stop" would cancel a task whose work is done; done is what clears it.
-      if (needsOwner(record)) return t("cmd.stopNeedsOwner", { id: record.id });
+      if (needsOwner(record)) return t("cmd.stopNeedsOwner", { id: record.id, report: reportNumber(record) });
       const outcome = await service.cancel(record.id, "stopped by the owner (/s stop)");
       return outcome.ok ? t("cmd.stopped", { id: record.id, title: record.title }) : t("cmd.ended", { id: record.id, status: statusWord(t, record) });
     }
@@ -52,11 +52,13 @@ export async function taskCommandReply(
       return t("cmd.notQueued", { id: record.id, status: statusWord(t, service.get(record.id) ?? record) });
     }
     case "done": {
-      const result = service.markDone(scope, record.id);
+      // The report number the owner was shown (the hints name it): one that
+      // landed since is not theirs to clear. Bare "done" answers the latest.
+      const result = service.markDone(scope, record.id, address.report);
       if (result.ok) return t("cmd.done", { id: record.id, title: record.title });
       if (result.reason === "unknown") return t("cmd.unknown", { id: record.id });
       if (result.reason === "unreadable") return t("cmd.unavailable");
-      if (result.reason === "newer") return t("cmd.newerReport", { id: record.id, action: needsOwner(result.record) ?? "" });
+      if (result.reason === "newer") return t("cmd.newerReport", { id: record.id, action: needsOwner(result.record) ?? "", report: reportNumber(result.record) });
       return t("cmd.nothingToDo", { id: record.id, status: statusWord(t, service.get(record.id) ?? record) });
     }
     case "model": {
@@ -97,7 +99,7 @@ function taskDetail(t: OwnerT<"subsessions">, r: SubsessionRecord, background: b
     lines.push(background ? t("cmd.detailFallback", { reason: r.waitingReason }) : t("cmd.detailWaiting", { reason: r.waitingReason }));
   }
   const action = needsOwner(r);
-  if (action) lines.push(t("cmd.detailNeedsOwner", { action, id: r.id }));
+  if (action) lines.push(t("cmd.detailNeedsOwner", { action, id: r.id, report: reportNumber(r) }));
   const step = currentStep(r);
   if (step) lines.push(t("cmd.detailStep", { step }));
   if (r.model) lines.push(t("cmd.detailModel", { model: r.model }));

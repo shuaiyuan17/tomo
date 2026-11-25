@@ -1,4 +1,4 @@
-import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -557,6 +557,73 @@ describe("a task is its own card", () => {
     expect(todos.list().map((i) => i.id)).not.toContain(item.id);
     h.service.start();
     expect(h.service.markDone("dm:owner", task.id, 1).ok).toBe(true);
+    h.service.stop();
+  });
+
+  it("migrates a table and todo list in the shape a live install left them", () => {
+    // Files as an install running the old todo link wrote them (field for
+    // field: todoId and progress on the records, the todo list's own keys).
+    const DAY = 24 * 60 * 60 * 1000;
+    const now = 1_795_624_200_000;
+    const iso = (ms: number) => new Date(ms).toISOString();
+    const at = (daysAgo: number) => now - daysAgo * DAY;
+    const record = (id: string, title: string, status: string, endedDaysAgo: number | undefined, extra: Record<string, unknown> = {}) => ({
+      id, sessionKey: `task:${id}`, parentKey: "dm:owner", title, brief: "b", quote: ["开个子会话吧"], status,
+      createdAt: at((endedDaysAgo ?? 0) + 0.1), lastActivityAt: at(endedDaysAgo ?? 0), activeMs: 1_000, resumeNeeded: false, startDelivered: true,
+      interruptStreak: 0, failStreak: 0, turnsWithoutProgress: 0, restartRequested: false, reportDelivered: status === "finished" || status === "archived",
+      compactPending: false, postCompactReminder: false, pendingInput: [], replyMap: [], ownerMessageIds: [], conversation: [], conversationSeq: 0,
+      mirrorSeenSeq: 0, nextInputSeq: 2, seenThrough: 0, sent: [], transitions: [{ at: at((endedDaysAgo ?? 0) + 0.1), from: null, to: "queued", event: "spawn" }],
+      todoId: `t-${id.slice(1)}`, progress: "跑 codex 第 1 轮",
+      ...(endedDaysAgo !== undefined ? { endedAt: at(endedDaysAgo) } : {}),
+      ...(status === "finished" || status === "archived" ? { reportSeq: 2, report: "PR 已开" } : {}),
+      ...extra,
+    });
+    writeFileSync(join(dir, "t.json"), JSON.stringify({ version: 1, nextId: 8, tasks: [
+      record("s1", "旧任务：报告还没看", "finished", 1),
+      record("s2", "旧任务：做完四十天了，报告也没看", "finished", 40),
+      record("s3", "旧任务：已经手动关过 todo", "finished", 1),
+      record("s4", "进行中的任务", "active", undefined, { activeSince: at(0.01), activeSeenAt: at(0.01) }),
+      record("s5", "被 owner 推迟过", "finished", 1),
+      record("s6", "已取消", "cancelled", 0.5),
+      record("s7", "归档很久了", "archived", 40),
+    ] }));
+    const todo = (n: number, title: string, next: string, waiting: string, extra: Record<string, unknown> = {}) => ({
+      id: `t-${n}`, title, next, waiting_on: waiting, review_at: iso(now + 7 * DAY), ref: `task:s${n}`, session: "dm:owner",
+      created_at: iso(at(2)), updated_at: iso(at(1)), source: "self", snoozes: 0, ...extra,
+    });
+    mkdirSync(join(dir, "todos"), { recursive: true });
+    writeFileSync(join(dir, "todos", "todos.json"), JSON.stringify({ version: 1, next_id: 10, items: [
+      todo(1, "旧任务：报告还没看 (s1)", "Read s1's result, then close this", "owner"),
+      todo(2, "旧任务：做完四十天了，报告也没看 (s2)", "Read s2's result, then close this", "owner"),
+      todo(4, "进行中的任务 (s4)", "s4 is working on it (/s s4)", "external"),
+      todo(5, "被 owner 推迟过 (s5)", "Read s5's result, then close this", "owner", { snoozes: 1, snooze_reason: "after the trip" }),
+      todo(7, "归档很久了 (s7)", "Read s7's result, then close this", "owner"),
+      { id: "t-9", title: "Owner's own", next: "do it", waiting_on: "me", review_at: iso(now), session: "dm:owner", created_at: iso(at(1)), updated_at: iso(at(1)), source: "owner", snoozes: 0 },
+    ] }));
+    const todos = new TodoStore(join(dir, "todos"), DEFAULT_TODOS);
+    const h = harness({}, { clock: now });
+    h.service.recoverAtStartup((records, keepAsk) => dropLegacyTaskTodos(todos, records, keepAsk).complete);
+    h.service.start();
+    const open = todos.list().map((i) => i.id);
+    // Unread results become the task's Needs you, however old (never archived or forgotten while they ask); their todos go.
+    expect(needsOwner(h.store.get("s1")!)).toBe("Read s1's result");
+    expect(h.store.get("s2")).toMatchObject({ status: "finished", ownerAction: "Read s2's result" });
+    expect(open).not.toContain("t-1");
+    expect(open).not.toContain("t-2");
+    // A task whose todo was already closed asks nothing; an active task's line is the card now.
+    expect(needsOwner(h.store.get("s3")!)).toBeUndefined();
+    expect(open).not.toContain("t-4");
+    // The owner snoozed it: theirs, kept, and nothing added to the card.
+    expect(open).toContain("t-5");
+    expect(h.store.get("s5")?.ownerAction).toBeUndefined();
+    // An archived task's unread result stays the owner's todo, as before; and so does the owner's own item.
+    expect(open).toEqual(expect.arrayContaining(["t-7", "t-9"]));
+    // The old fields are gone from what is written back.
+    const onDisk = JSON.parse(readFileSync(join(dir, "t.json"), "utf8")) as { tasks: Record<string, unknown>[] };
+    expect(onDisk.tasks.find((r) => r.id === "s1")).not.toHaveProperty("todoId");
+    // The answer the owner gives is to the report the task shows.
+    expect(h.service.markDone("dm:owner", "s2", 1)).toMatchObject({ ok: false, reason: "newer" });
+    expect(h.service.markDone("dm:owner", "s2", 2).ok).toBe(true);
     h.service.stop();
   });
 });

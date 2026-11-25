@@ -4,8 +4,9 @@
  * - `/s` lists the owner's sub-sessions.
  * - `/s <id>` shows one.
  * - `/s <id> stop` cancels it; `/s <id> start` starts a queued one past the
- *   slot cap; `/s <id> model <alias>` changes its model; `/s <id> done` says
- *   the owner did what its report asked of them.
+ *   slot cap; `/s <id> model <alias>` changes its model; `/s <id> done [n]`
+ *   says the owner did what its report asked of them (`n`, the report
+ *   number `/s <id>` showed them: a newer report's ask is not cleared by it).
  * - `/s <id> <anything else>` is a message to it.
  *
  * Only an EXACT match of what follows the id is a command (any case,
@@ -24,7 +25,8 @@ export type TaskAddress =
   | { kind: "show"; id: string }
   | { kind: "stop"; id: string }
   | { kind: "start"; id: string }
-  | { kind: "done"; id: string }
+  /** `report`: the report number the owner answered, when they gave one. */
+  | { kind: "done"; id: string; report?: number }
   | { kind: "model"; id: string; model: string }
   | { kind: "message"; id: string; body: string };
 
@@ -49,7 +51,8 @@ export function parseTaskAddress(text: string, botUsername?: string): TaskAddres
   if (!tail) return { kind: "show", id };
   if (/^stop$/i.test(tail)) return { kind: "stop", id };
   if (/^start$/i.test(tail)) return { kind: "start", id };
-  if (/^done$/i.test(tail)) return { kind: "done", id };
+  const done = /^done(?:\s+(\d{1,9}))?$/i.exec(tail);
+  if (done) return done[1] !== undefined && Number(done[1]) > 0 ? { kind: "done", id, report: Number(done[1]) } : { kind: "done", id };
   const model = /^model\s+(\S+)$/i.exec(tail);
   if (model) return { kind: "model", id, model: model[1] };
   return { kind: "message", id, body: tail };

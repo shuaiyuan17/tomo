@@ -462,7 +462,7 @@ export class SubsessionService {
    * that asked; a task of another scope is unknown here. `report` is the
    * report seq the owner answered (task_done carries the one its note
    * named): a newer report's ask is never cleared by an answer to an older
-   * one (reason "newer", with the record). Without it (`/s <id> done`, where
+   * one (reason "newer", with the record). Without it (a bare `/s <id> done`, where
    * the owner answers what the task shows now) the report read here counts.
    * Not a transition: the task stays finished, and archives like any other.
    */

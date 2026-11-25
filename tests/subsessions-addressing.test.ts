@@ -7,7 +7,7 @@ import { looksLikeTaskAddress, parseTaskAddress } from "../src/agent/subsessions
 import { taskCommandReply } from "../src/agent/subsessions/commands.js";
 import { MAX_INTERRUPT_STREAK, SETTLE_RETRY_MS, SubsessionService, type ScopeSendResult, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
-import { PENDING_INPUT_MAX, appendInput } from "../src/agent/subsessions/types.js";
+import { PENDING_INPUT_MAX, appendInput, needsOwner } from "../src/agent/subsessions/types.js";
 import { ownerT } from "../src/i18n/index.js";
 import { detectFabricatedMarkers } from "../src/agent/inbound-markers.js";
 
@@ -25,6 +25,10 @@ describe("parseTaskAddress", () => {
     expect(parseTaskAddress("/s s3   STOP  ")).toEqual({ kind: "stop", id: "s3" });
     expect(parseTaskAddress("/s s3 start")).toEqual({ kind: "start", id: "s3" });
     expect(parseTaskAddress("/s s3 Done ")).toEqual({ kind: "done", id: "s3" });
+    expect(parseTaskAddress("/s s3 done 2")).toEqual({ kind: "done", id: "s3", report: 2 });
+    expect(parseTaskAddress("/s s3 DONE  12 ")).toEqual({ kind: "done", id: "s3", report: 12 });
+    expect(parseTaskAddress("/s s3 done 0")).toEqual({ kind: "done", id: "s3" });
+    expect(parseTaskAddress("/s s3 done 2 and 3")).toEqual({ kind: "message", id: "s3", body: "done 2 and 3" });
     expect(parseTaskAddress("/s s3 done with the review?")).toEqual({ kind: "message", id: "s3", body: "done with the review?" });
     expect(parseTaskAddress("/s s3 model sonnet")).toEqual({ kind: "model", id: "s3", model: "sonnet" });
     expect(parseTaskAddress("/s s3 stop the deploy and roll back")).toEqual({ kind: "message", id: "s3", body: "stop the deploy and roll back" });
@@ -586,15 +590,39 @@ describe("/s commands", () => {
     spawn(h);
     await flush();
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).toBe("s1 · Fix CI — finished, needs you");
-    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).toContain("Needs you: Review and merge PR #9 (/s s1 done once you have)");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).toContain("Needs you: Review and merge PR #9 (/s s1 done 1 once you have)");
     expect(formatTaskLine(h.service.get("s1")!)).toContain("[finished, needs the owner]");
     expect(formatTaskDetail(h.service.get("s1")!)).toContain("The owner has to: Review and merge PR #9");
-    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "stop", id: "s1" })).toContain("/s s1 done clears it");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "stop", id: "s1" })).toContain("/s s1 done 1 clears it");
     expect(h.service.get("s1")?.status).toBe("finished");
     expect(await taskCommandReply(t, h.service, "telegram:-100", { kind: "done", id: "s1" })).toBe("There's no sub-session s1.");
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "done", id: "s1" })).toBe("Marked done: s1 · Fix CI.");
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).toBe("s1 · Fix CI — finished");
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "done", id: "s1" })).toContain("s1 asks nothing of you (it's finished)");
+    h.service.stop();
+  });
+
+  it("/s done <n> clears only the report the owner was shown: a report that landed since still needs them", async () => {
+    const h = harness((prompt, key) => {
+      if (prompt.includes("subsession-start")) h.service.finish(key, "PR #9 is open.", "Review and merge PR #9");
+      return { ok: true };
+    });
+    h.service.start();
+    spawn(h);
+    await flush();
+    // The owner reads report 1's hint; before they answer, the task is woken and sends report 2.
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).toContain("(/s s1 done 1 once you have)");
+    const store = depsOf(h).store;
+    store.transition("s1", "reopen");
+    store.transition("s1", "finish", { patch: (r) => { r.reportSeq = 2; r.ownerAction = "Review and merge PR #10"; } });
+    const stale = await taskCommandReply(t, h.service, "dm:owner", parseTaskAddress("/s s1 done 1") as { kind: "done"; id: string; report?: number });
+    expect(stale).toBe("s1 has just sent a new report, and it asks: Review and merge PR #10. That one still needs you; send /s s1 done 2 once it's handled.");
+    expect(needsOwner(h.service.get("s1")!)).toBe("Review and merge PR #10");
+    // A number past the latest report answers nothing.
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "done", id: "s1", report: 3 })).toContain("s1 asks nothing of you");
+    expect(needsOwner(h.service.get("s1")!)).toBe("Review and merge PR #10");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "done", id: "s1", report: 2 })).toBe("Marked done: s1 · Fix CI.");
+    expect(needsOwner(h.service.get("s1")!)).toBeUndefined();
     h.service.stop();
   });
 

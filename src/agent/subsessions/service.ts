@@ -724,16 +724,24 @@ export class SubsessionService {
     const updated = this.store.update(record.id, (r) => {
       const planChanged = JSON.stringify(r.plan ?? []) !== JSON.stringify(next);
       if (planChanged && !why && planNeedsReason(r.plan ?? [], next, [...finishedTexts])) { refused = true; return; }
+      const ahead = new Set((r.plan ?? []).map((s) => s.text));
       if (planChanged) {
         changed = true;
         if (next.length > 0) r.plan = next;
         else delete r.plan;
       }
       for (const step of finished) {
-        // A step already filed done (a retried call, or the whole done list sent
-        // again) is not filed twice; a new result for it is.
-        if (r.doneSteps?.some((d) => d.text === step.text && (step.result === undefined || d.result === step.result))) continue;
+        // A step that was still ahead is filed done, even one done before
+        // (it was added again). One that was not (a retried call, the whole
+        // done list sent again) is not filed twice: a new result for it
+        // replaces the one it had.
+        const filed = ahead.has(step.text) ? undefined : [...(r.doneSteps ?? [])].reverse().find((d) => d.text === step.text);
+        if (filed) {
+          if (step.result !== undefined && filed.result !== step.result) { filed.result = step.result; changed = true; }
+          continue;
+        }
         (r.doneSteps ??= []).push({ at, ...step });
+        ahead.delete(step.text);
         changed = true;
       }
       if (planChanged && why) (r.updates ??= []).push({ at, kind: "plan", text: why });

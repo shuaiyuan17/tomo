@@ -44,7 +44,7 @@ export interface SubsessionLive { background?: boolean; model?: string }
 export function subsessionView(record: SubsessionRecord, scope: string, now: number, working: boolean, live: SubsessionLive = {}): WebSubsession | undefined {
   if (record.parentKey !== scope || record.status === "archived") return undefined;
   const status = record.status as WebSubsessionStatus;
-  const step = OPEN.has(status) ? currentStep(record) : undefined;
+  const step = currentStep(record);
   return {
     id: record.id,
     title: clip(record.title, TITLE_LIMIT).text,
@@ -94,9 +94,12 @@ export function subsessionUpdates(record: SubsessionRecord): WebSubsessionUpdate
   // A second task_ask while it is still waiting for the owner (from a
   // background report's turn) is not a new milestone.
   let waitingOwner = false;
-  record.transitions.forEach((t, i) => {
+  // The log is read as the table holds it: an entry not shaped like a transition is skipped, never thrown on.
+  const log = (Array.isArray(record.transitions) ? record.transitions : []).filter((t) => !!t && typeof t === "object"
+    && typeof t.at === "number" && Number.isFinite(t.at) && typeof t.event === "string" && typeof t.to === "string");
+  log.forEach((t, i) => {
     const event = t.event as SubsessionEvent;
-    const milestone = event === "start" ? (i > 0 && record.transitions[i - 1].from === null ? "started" : undefined)
+    const milestone = event === "start" ? (i > 0 && log[i - 1].from === null ? "started" : undefined)
       : t.to === "cancelled" || t.to === "failed" ? t.to : MILESTONES[event];
     if (milestone && !(milestone === "waitingOwner" && waitingOwner)) out.push({ at: t.at, kind: "milestone", milestone });
     waitingOwner = milestone === "waitingOwner" || (waitingOwner && t.to === "waiting");

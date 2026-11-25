@@ -295,12 +295,13 @@ export const PLAN_STEP_MAX = 120;
 /** A finished step's one-line result. */
 export const STEP_RESULT_MAX = 200;
 
-/** One line, trimmed, at most `max` characters (by code point, so a pair is never split). */
-/** The plan step the task is on (its "Now"), if it marked one in progress. */
-export function currentStep(record: Pick<SubsessionRecord, "plan">): string | undefined {
+/** The plan step an open task is on (its "Now"), if it marked one in progress. An ended task is on none. */
+export function currentStep(record: Pick<SubsessionRecord, "plan" | "status">): string | undefined {
+  if (!OPEN_STATUSES.has(record.status)) return undefined;
   return record.plan?.find((s) => s.status === "in_progress")?.text;
 }
 
+/** One line, trimmed, at most `max` characters (by code point, so a pair is never split). */
 export function oneLine(text: string, max: number): string {
   return Array.from(text.trim().split("\n")[0].trim()).slice(0, max).join("");
 }

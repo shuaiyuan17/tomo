@@ -2,7 +2,7 @@ import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { EFFORT_LEVELS } from "../config.js";
 import type { SubsessionService } from "../agent/subsessions/service.js";
-import { currentStep, oneLine, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, STEP_RESULT_MAX, type SubsessionRecord } from "../agent/subsessions/types.js";
+import { currentStep, DONE_STEPS_KEEP, oneLine, OPEN_STATUSES, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, STEP_RESULT_MAX, type SubsessionRecord } from "../agent/subsessions/types.js";
 
 /** The task_* tools a sub-session reports through (its own session only). */
 export const SUBSESSION_SELF_TOOL_NAMES = ["task_reply", "task_notify", "task_ask", "task_plan", "task_update", "task_checkpoint", "task_finish", "task_reopen", "task_status"] as const;
@@ -43,7 +43,7 @@ export function formatTaskDetail(r: SubsessionRecord, now = Date.now(), backgrou
     `Created ${ago(r.createdAt, now)}, last activity ${ago(r.lastActivityAt, now)}`,
   ];
   if (r.model) lines.push(`Model: ${r.model}`);
-  if (r.plan?.length) {
+  if (r.plan?.length && OPEN_STATUSES.has(r.status)) {
     lines.push("Plan (steps still ahead):");
     for (const step of r.plan) lines.push(`- [${step.status === "in_progress" ? "in progress" : "not started"}] ${step.text}`);
   }
@@ -130,7 +130,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
         done: z.array(z.object({
           step: z.string().min(1).max(2000).describe("The step, as it stood in the plan."),
           result: z.string().max(2000).optional().describe(`One line: what came of it (cut at ${STEP_RESULT_MAX} characters).`),
-        })).max(PLAN_MAX_STEPS).optional().describe("Steps finished since the last task_plan call."),
+        })).max(DONE_STEPS_KEEP).optional().describe("Steps finished since the last task_plan call."),
         reason: z.string().max(2000).optional().describe("Required when this drops, rewords or reorders a step still ahead: one line on why the plan changed."),
       },
       async ({ steps, done, reason }) => {

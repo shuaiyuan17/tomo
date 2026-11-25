@@ -116,6 +116,11 @@ describe("a sub-session's plan, done steps and updates", () => {
     expect(subsessionUpdates(record("s1", { transitions: [{ at: NOW, from: "active", to: "failed", event: "fail" }] }))).toEqual([{ at: NOW, kind: "milestone", milestone: "failed" }]);
   });
 
+  it("skips a transition entry that is not shaped like one, instead of failing the detail", () => {
+    const log = [null, { at: "x", from: "active", to: "finished", event: "finish" }, { at: NOW, from: "active", to: "failed", event: "fail" }] as unknown as SubsessionRecord["transitions"];
+    expect(subsessionUpdates(record("s1", { transitions: log }))).toEqual([{ at: NOW, kind: "milestone", milestone: "failed" }]);
+  });
+
   it("does not repeat 'waiting for you' for a second ask while still waiting, but does after an answer", () => {
     const asks = (log: SubsessionRecord["transitions"]) => subsessionUpdates(record("s1", { transitions: log })).filter((e) => e.kind === "milestone" && e.milestone === "waitingOwner").length;
     expect(asks([

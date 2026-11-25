@@ -1975,6 +1975,28 @@ describe("progress, plan and updates", () => {
     expect(r.doneSteps?.map((d) => d.text)).toEqual(["A", "B", "C"]);
     expect(r.plan).toBeUndefined();
     expect(r.updates).toBeUndefined();
+    // Sent again with another result: that result replaces the one it had.
+    h.service.setPlan(t.sessionKey, [], [{ step: "A", result: "better" }]);
+    expect(h.store.get(t.id)?.doneSteps?.map((d) => [d.text, d.result])).toEqual([["A", "better"], ["B", undefined], ["C", undefined]]);
+  });
+
+  it("files a step done again when it was added back to the plan and finished again", () => {
+    const h = idle();
+    const t = spawn(h);
+    h.service.setPlan(t.sessionKey, [{ step: "Wait for CI", status: "in_progress" }]);
+    h.service.setPlan(t.sessionKey, [], [{ step: "Wait for CI" }]);
+    h.service.setPlan(t.sessionKey, [{ step: "Wait for CI", status: "in_progress" }]);
+    h.service.setPlan(t.sessionKey, [], [{ step: "Wait for CI" }]);
+    expect(h.store.get(t.id)?.doneSteps?.map((d) => d.text)).toEqual(["Wait for CI", "Wait for CI"]);
+  });
+
+  it("a refused plan files none of its done steps either", () => {
+    const h = idle();
+    const t = spawn(h);
+    h.service.setPlan(t.sessionKey, [{ step: "A", status: "in_progress" }, { step: "B" }]);
+    expect(h.service.setPlan(t.sessionKey, [{ step: "C" }], [{ step: "A" }])).toEqual({ ok: false, error: "reason_required" });
+    expect(h.store.get(t.id)?.doneSteps).toBeUndefined();
+    expect(h.store.get(t.id)?.plan?.map((s) => s.text)).toEqual(["A", "B"]);
   });
 
   it("keeps each decision or change with its time, a repeat once, blanks never, newest UPDATES_KEEP", () => {

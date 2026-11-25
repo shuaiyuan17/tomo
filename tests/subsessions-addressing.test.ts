@@ -574,6 +574,19 @@ describe("/s commands", () => {
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "usage" })).toContain("/s s3 stop");
   });
 
+  it("an ended task is on no step, though its last plan said one was in progress", async () => {
+    const { formatTaskDetail, formatTaskLine } = await import("../src/mcp/subsession-tools.js");
+    const h = harness(() => new Promise(() => {}), 0);
+    spawn(h);
+    h.service.setPlan("task:s1", [{ step: "Write tests", status: "in_progress" }]);
+    await h.service.cancel("s1", "test");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).not.toContain("Write tests");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).not.toContain("Now:");
+    const record = h.service.get("s1")!;
+    expect(formatTaskLine(record)).not.toContain("Write tests");
+    expect(formatTaskDetail(record)).not.toContain("Plan (steps still ahead)");
+  });
+
   it("shows a task waiting on its check-back as working while its own background work runs, without changing its status", async () => {
     const { formatTaskDetail, formatTaskLine } = await import("../src/mcp/subsession-tools.js");
     const h = harness(() => ({ ok: true }), 1);

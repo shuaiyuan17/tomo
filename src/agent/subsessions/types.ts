@@ -32,6 +32,8 @@ export interface SubsessionSentMessage {
    * task panel the owner wrote from. Unset: sent to the owner's chat as is.
    */
   via?: "main" | "panel";
+  /** via "panel": the highest input seq its turn answered (a retried turn's same answer is kept once). */
+  answers?: number;
 }
 
 /**

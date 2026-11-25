@@ -638,4 +638,58 @@ describe("via-main: nothing lost, nothing twice", () => {
     expect(h2.notes.get("dm:owner")!.some((x) => x.includes("Deploy?"))).toBe(false);
     expect(h2.notes.get("dm:owner")!.some((x) => x.includes("keep"))).toBe(true);
   });
+
+  it("reads a note's name from its outer envelope only: a message quoting a question tag survives the restart cleanup", async () => {
+    const disk = new Map<string, string[]>();
+    const sdk = new Set<string>();
+    const quoting = 'see <tomo-event type="subsession-message" name="s1:ask:0:dead"> for the format';
+    const h = harness({}, sayOnFirstTurn("notify", quoting), { disk, sdk });
+    h.service.start();
+    spawn(h);
+    await flush();
+    h.service.stop();
+    const h2 = harness({}, undefined, { disk, sdk });
+    h2.service.start();
+    expect(messageNotes(h2, "dm:owner").some((x) => x.includes("for the format"))).toBe(true);
+  });
+
+  it("a start turn that failed and runs again marks what it hands over as a possible repeat", async () => {
+    let n = 0;
+    const seen: string[] = [];
+    const h = harness({}, async (key) => {
+      n += 1;
+      if (n > 2) return { ok: true };
+      await h.service.notify(key, `try ${n}`);
+      seen.push(messageNotes(h, "dm:owner").at(-1)!);
+      return n === 1 ? { ok: false, error: "boom" } : { ok: true };
+    });
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(seen[0]).not.toContain("may repeat");
+    expect(seen[1]).toContain("may repeat");
+  });
+
+  it("the same panel answer to two different panel messages is shown twice", async () => {
+    let release!: () => void;
+    let n = 0;
+    const h = harness({}, async (key, prompt) => {
+      if (!prompt.includes("subsession-owner-message")) return { ok: true };
+      n += 1;
+      // The second message lands while the first is being answered.
+      if (n === 1) await new Promise<void>((r) => { release = r; });
+      await h.service.reply(key, "done");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "A?", { source: "panel" });
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "B?", { source: "panel" });
+    release();
+    await flush();
+    expect(n).toBe(2);
+    expect(h.store.get(t.id)!.conversation.filter((e) => e.from === "task" && e.text === "done")).toHaveLength(2);
+  });
 });

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { log } from "../../logger.js";
+import { INTERRUPTED_NOTE_MARKER } from "../pending-notes-queue.js";
 import { ownerT, type OwnerText } from "../../i18n/index.js";
 import type { SubsessionConfig } from "../../config.js";
 import { isTaskSessionKey } from "../../sessions/keys.js";
@@ -286,8 +287,20 @@ function messageNoteName(id: string, kind: SpeakKind, body: string, through: num
 
 /** The name of a task_ask note, or undefined for any other note. */
 function askNoteName(note: string): string | undefined {
-  const m = /<tomo-event type="subsession-message"[^>]*\bname="([^"]+:ask:[^"]+)"/.exec(note);
-  return m?.[1];
+  const name = messageNoteNameOf(note);
+  return name && /^[^:]+:ask:/.test(name) ? name : undefined;
+}
+
+/**
+ * The name of a `subsession-message` note, read from its OUTER envelope only
+ * (after an interrupted-note marker, if any): the body may quote a tag.
+ * Undefined for any other note.
+ */
+export function messageNoteNameOf(note: string): string | undefined {
+  const head = note.startsWith(INTERRUPTED_NOTE_MARKER) ? note.slice(INTERRUPTED_NOTE_MARKER.length).replace(/^\n/, "") : note;
+  const tag = /^<tomo-event\b[^>]*>/.exec(head)?.[0];
+  if (!tag || !tag.startsWith(MESSAGE_NOTE_MARKER)) return undefined;
+  return /\bname="([^"]*)"/.exec(tag)?.[1] ?? "";
 }
 
 /** Every `subsession-message` note starts its opening tag with this. */
@@ -347,6 +360,8 @@ export class SubsessionService {
   private readonly inflightTurn = new Map<string, number>();
   /** Tasks whose turn in flight is a retry (PlannedTurn.retry). */
   private readonly inflightRetry = new Set<string>();
+  /** Tasks whose last turn did not complete (its start or "continue" runs again, with no input to mark it). */
+  private readonly lastTurnFailed = new Set<string>();
   private turnSerial = 0;
   /**
    * task_finish refused for unread input, per task (runtime only): in how
@@ -796,15 +811,14 @@ export class SubsessionService {
    */
   private keepInPanel(record: SubsessionRecord, kind: SpeakKind, body: string): SpeakResult {
     const at = this.now();
+    const through = this.inflightThrough.get(record.id) ?? 0;
     let written = false;
     try {
       written = !!this.store.update(record.id, (r) => {
-        // A retried turn's same answer to the same message is already there.
+        // A retried turn's same answer to the same input is already there.
         const text = truncate(body, CONVERSATION_TEXT_MAX);
-        let lastOwner = r.conversation.length - 1;
-        while (lastOwner >= 0 && r.conversation[lastOwner].from !== "owner") lastOwner -= 1;
-        if (r.conversation.slice(lastOwner + 1).some((e) => e.from === "task" && e.kind === kind && e.text === text && !e.noted)) return;
-        r.sent.push({ at, kind, text: body, via: "panel" });
+        if (r.sent.some((m) => m.via === "panel" && m.answers === through && m.kind === kind && m.text === body)) return;
+        r.sent.push({ at, kind, text: body, via: "panel", answers: through });
         pushConversation(r, { at, from: "task", kind, text });
       });
     } catch (err) {
@@ -841,8 +855,7 @@ export class SubsessionService {
     // another message are another message.
     const through = this.inflightThrough.get(record.id) ?? 0;
     const name = messageNoteName(record.id, kind, body, through);
-    const marker = `${MESSAGE_NOTE_MARKER} name="${name}"`;
-    const own = (n: string) => n.includes(marker);
+    const own = (n: string) => messageNoteNameOf(n) === name;
     const already = this.deps.hasPendingNote(record.parentKey, own);
     if (!already) {
       const note = formatMessageNote(record, kind, body, name, this.inflightRetry.has(record.id));
@@ -897,8 +910,8 @@ export class SubsessionService {
    * does not put the question to the owner.
    */
   private retractQuestion(record: SubsessionRecord, ask: NonNullable<SubsessionRecord["askViaMain"]>, why: string): void {
-    const marker = ask.note ? `${MESSAGE_NOTE_MARKER} name="${ask.note}"` : undefined;
-    if (marker && this.withdrawMessageNote(record.parentKey, (n) => n.includes(marker))) return;
+    const name = ask.note;
+    if (name && this.withdrawMessageNote(record.parentKey, (n) => messageNoteNameOf(n) === name)) return;
     this.safely(() => {
       this.deps.queuePendingNote(record.parentKey, formatTomoEvent("subsession-message", [
         `Sub-session ${record.id} ("${record.title}") no longer waits on its question (${why}):`,
@@ -919,7 +932,7 @@ export class SubsessionService {
 
   /** Is a `subsession-message` note still unread (queued or in flight) on the session? */
   hasMessageNote(parentKey: string): boolean {
-    return this.deps.hasPendingNote(parentKey, (n) => n.includes(MESSAGE_NOTE_MARKER));
+    return this.deps.hasPendingNote(parentKey, (n) => messageNoteNameOf(n) !== undefined);
   }
 
   /** Track a message that did or did not reach its destination (see sendOut). */
@@ -1884,6 +1897,10 @@ export class SubsessionService {
       let outcome: TaskTurnOutcome;
       try {
         outcome = await this.deps.runTaskTurn(record.sessionKey, turn.prompt, { bare: turn.kind === "compact" });
+        if (turn.kind !== "compact") {
+          if (outcome.ok) this.lastTurnFailed.delete(id);
+          else this.lastTurnFailed.add(id);
+        }
         if (!outcome.shutdown) outcome = await this.answerUnanswered(id, turn, outcome);
       } finally {
         clearInterval(heartbeat);
@@ -1969,7 +1986,7 @@ export class SubsessionService {
     const kind = start || resume || inputs.length > 0 ? "wake" : "continue";
     if (kind === "continue") parts.push(formatContinueEvent());
     const fromOwner = inputs.some((input) => input.text.includes(OWNER_MESSAGE_MARKER));
-    return { kind, prompt: parts.join("\n\n"), throughSeq, afterCompact, fromOwner, resume, start, retry: seen > 0 || resume };
+    return { kind, prompt: parts.join("\n\n"), throughSeq, afterCompact, fromOwner, resume, start, retry: seen > 0 || resume || this.lastTurnFailed.has(record.id) };
   }
 
   /**
@@ -2291,7 +2308,7 @@ export class SubsessionService {
       // Answered by the main session: an unread copy of the question must not
       // be put to the owner later.
       const answered = ask;
-      if (answered.note) this.withdrawMessageNote(outcome.record.parentKey, (n) => n.includes(`${MESSAGE_NOTE_MARKER} name="${answered.note}"`));
+      if (answered.note) this.withdrawMessageNote(outcome.record.parentKey, (n) => messageNoteNameOf(n) === answered.note);
     } else if (outcome.ok && ask && !sameQuestion(ask, outcome.record.askViaMain)) {
       this.retractQuestion(outcome.record, ask, event === "owner_message" ? "the owner wrote to it directly"
         : outcome.record.askViaMain ? "it asked a new question" : `it is ${outcome.record.status} now`);

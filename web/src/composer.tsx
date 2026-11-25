@@ -1,4 +1,5 @@
 import { useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type FormEvent, type Ref } from "react";
+import { COMPOSER_FIELD, COMPOSER_FORM, COMPOSER_SEND } from "./composer-frame.js";
 import { ArrowUp, Plus, Reply, Sparkles, Square, X } from "lucide-react";
 import type { WebReaction, WebRequest, WebSession } from "../../src/web/protocol.js";
 import { Badge } from "@/components/ui/badge";
@@ -341,7 +342,7 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
         <span className="block truncate text-[12.5px] leading-snug text-foreground/80">{replyingTo.text || i18n.t("chat:reaction.earlier")}</span></div>
       <Button type="button" variant="ghost" size="icon" aria-label={i18n.t("chat:composer.cancelReply")} title={i18n.t("chat:composer.cancelReplyTitle")} onClick={() => { setReplyingTo(null); input.current?.focus(); }}
         className="size-7 shrink-0 rounded-full text-muted-foreground hover:text-foreground"><X className="size-3.5" strokeWidth={2} /></Button></div>}
-    <form onSubmit={(e) => void send(e)} className="composer flex items-end gap-1 rounded-[20px] border bg-card p-2.5 shadow-xs transition-[border-color,box-shadow] focus-within:border-muted-foreground/50 focus-within:shadow-md">
+    <form onSubmit={(e) => void send(e)} className={cn("composer", COMPOSER_FORM)}>
       <input ref={fileInput} type="file" {...(filesOn ? {} : { accept: IMAGE_ACCEPT })} multiple hidden
         onChange={(e) => { attachments.add(Array.from(e.target.files ?? [])); e.target.value = ""; input.current?.focus(); }} />
       <Button type="button" variant="ghost" size="icon" aria-label={filesOn ? i18n.t("chat:composer.attachFiles") : i18n.t("chat:composer.attachImages")}
@@ -349,7 +350,7 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
         onClick={() => fileInput.current?.click()} className="size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground [&_svg:not([class*='size-'])]:size-[20px]"><Plus strokeWidth={2} /></Button>
       <label className="sr-only" htmlFor="message">{i18n.t("chat:composer.label", { agent })}</label>
       <Textarea ref={input} id="message" placeholder={session?.kind === "group" ? i18n.t("chat:composer.groupPlaceholder") : i18n.t("chat:composer.placeholder")} value={draft} maxLength={16_000} rows={1} disabled={!writable}
-        className="max-h-60 min-h-10 flex-1 resize-none rounded-none border-0 bg-transparent! py-[7px] pr-3 pl-1.5 text-[15px] leading-relaxed shadow-none placeholder:text-muted-foreground focus-visible:ring-0 disabled:opacity-80 md:text-[15px]"
+        className={cn(COMPOSER_FIELD, "max-h-60 pr-3 text-[15px] disabled:opacity-80 md:text-[15px]")}
         onChange={(e) => { setDraft(e.target.value);
           // Cleared: the resend ends, and so does any restore it still had running.
           if (resending && !resendAfterDraftChange(resending, e.target.value)) endResend(); }} onPaste={(e) => {
@@ -366,7 +367,7 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
         className="size-9 shrink-0 rounded-full bg-foreground text-background transition-[background-color,transform] hover:bg-foreground/85 active:scale-[0.94] disabled:opacity-60 [&_svg:not([class*='size-'])]:size-3.5">
         <Square fill="currentColor" strokeWidth={0} /></Button> :
       <Button type="submit" size="icon" aria-label={i18n.t("chat:composer.send")} aria-busy={sending}
-        className="size-9 shrink-0 rounded-full transition-[background-color,transform] hover:bg-primary/85 active:scale-[0.94] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100 [&_svg:not([class*='size-'])]:size-[18px]"
+        className={cn(COMPOSER_SEND, "[&_svg:not([class*='size-'])]:size-[18px]")}
         title={restoring ? i18n.t("chat:composer.restoring") : undefined} disabled={!canSend}><ArrowUp strokeWidth={2.2} /></Button>}
     </form>
     {uncertain && !sending && <div className="mt-2 flex flex-wrap gap-2"><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => void checkOutcome()}>{i18n.t("chat:composer.check")}</Button><Button variant="outline" size="sm" className="rounded-lg text-xs" onClick={() => { remember(null); setFeedback(deferred.t("chat:composer.keptNote")); }}>{i18n.t("chat:composer.keep")}</Button></div>}

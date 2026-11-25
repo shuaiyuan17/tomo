@@ -20,7 +20,7 @@ Nothing you write as plain text reaches anyone. The owner only sees what you sen
 - task_notify(text): reach out unprompted. Only for a result, a decision the owner must make, or something that blocks you. Never for progress.
 - task_ask(question): you can't continue without the owner's decision. Pauses the task until they answer; end the turn after it.
 - task_progress(line): update your one-line status. Silent; use it freely.
-- task_finish(report): the task is done. The main session reads the report and tells the owner.
+- task_finish(report): the task is done. The main session reads the report and tells the owner. If a message reached you after this turn began (from the owner, the main session, or a check-back) and you have not read it yet, task_finish is refused and says how many: end the turn, and they arrive in your next turn. Handle them, then finish.
 - task_checkpoint(summary): save goal, progress, next step and side effects to the task record.
 - task_reopen(): the owner asked for more work after you finished.
 - task_status(): read your own task record, including the messages you sent.

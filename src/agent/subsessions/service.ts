@@ -19,11 +19,14 @@ import {
   formatMirrorNote,
   formatStartEvent,
 } from "./prompt.js";
-import { OPEN_STATUSES, PENDING_INPUT_MAX, TERMINAL_STATUSES, activeTotalMs, appendInput, lastInputSeq, type SubsessionConversationEntry, type SubsessionInput, type SubsessionRecord } from "./types.js";
+import { OPEN_STATUSES, PENDING_INPUT_MAX, TERMINAL_STATUSES, activeTotalMs, appendInput, lastInputSeq, type SubsessionConversationEntry, type SubsessionInput, type SubsessionRecord, type SubsessionStatus } from "./types.js";
 
 const OWNER_MESSAGE_MARKER = '<tomo-event type="subsession-owner-message"';
 
 /** How a task turn ended, as the agent's turn runner saw it. */
+/** task_finish's outcome: `unread` when it was refused for input the task has not read. */
+export type FinishOutcome = TransitionOutcome | { ok: false; from: SubsessionStatus | null; record?: SubsessionRecord; refused?: string; unread: number };
+
 export interface TaskTurnOutcome {
   /** Ran to its normal result. */
   ok: boolean;
@@ -177,6 +180,12 @@ export const EXTERNAL_WAIT_CHECK_MS = 5 * 60_000;
 export const MAX_INTERRUPT_STREAK = 3;
 export const MAX_TURNS_WITHOUT_PROGRESS = 3;
 export const MAX_FAIL_STREAK = 2;
+/**
+ * Turns in a row whose task_finish was refused for unread input, the unread
+ * count never going down, after which the next turn's task_finish goes
+ * through anyway (the unread input is quoted in its report, and stays owed).
+ */
+export const MAX_FINISH_REFUSALS = 3;
 const REPORT_NOTE_EXCERPT = 600;
 /** The fallback send of an unanswered owner message is cut at this length. */
 const FALLBACK_MAX = 3500;
@@ -195,6 +204,8 @@ const UNANSWERED_MAX = 5;
 /** How much of an undelivered message the next turn is shown. */
 const LOST_ANSWER_EXCERPT = 1500;
 const ACTIVITY_NOTE_EXCERPT = 1500;
+/** Per unread input a forced task_finish quotes in its report. */
+const UNREAD_AT_FINISH_EXCERPT = 1500;
 /** What an owner message keeps in the conversation log. */
 const CONVERSATION_TEXT_MAX = 4000;
 /** While a task's turn runs, how often its `activeSeenAt` is refreshed. */
@@ -254,6 +265,15 @@ export class SubsessionService {
   private readonly reportAttempts = new Map<string, number>();
   /** The highest input seq the turn in flight carries, per task (runtime only). */
   private readonly inflightThrough = new Map<string, number>();
+  /** Which turn is in flight, per task: a serial, so two turns that carry the same seq still differ. */
+  private readonly inflightTurn = new Map<string, number>();
+  private turnSerial = 0;
+  /**
+   * task_finish refused for unread input, per task (runtime only): in how
+   * many turns in a row, the last refused turn, and how much was unread then.
+   * A turn that ends with no refusal clears it.
+   */
+  private readonly finishRefusals = new Map<string, { turns: number; turn: number; unread: number }>();
   /** Reports whose note write failed: the note may sit in memory only. */
   private readonly unpersistedReports = new Set<string>();
   private cronRecheckTimer?: NodeJS.Timeout;
@@ -684,10 +704,33 @@ export class SubsessionService {
     return this.store.update(record.id, (r) => { r.checkpoint = summary.trim().slice(0, 8000); });
   }
 
-  finish(key: string, report: string): TransitionOutcome {
+  /**
+   * task_finish. Refused while input is pending that the turn in flight does
+   * not carry (it arrived after the turn started, so the task has never seen
+   * it): finishing would leave it unread. The task stays as it is, and that
+   * input is its next turn. Judged under the lock, like task_ask. After
+   * MAX_FINISH_REFUSALS refused turns in a row whose unread count did not
+   * go down (a turn with less unread does not count), the next turn finishes anyway: the unread input is quoted in the report
+   * and stays pending, answered like any input to a finished task.
+   * Outside a turn of its own (no task calls a tool there) nothing is refused.
+   */
+  finish(key: string, report: string): FinishOutcome {
     const record = this.store.byKey(key);
     if (!record) return { ok: false, from: null };
-    const outcome = this.transition(record.id, "finish", {
+    const id = record.id;
+    const turn = this.inflightTurn.get(id);
+    const through = this.inflightThrough.get(id) ?? 0;
+    let unread: SubsessionInput[] = [];
+    let forced = false;
+    const outcome = this.transition(id, "finish", {
+      guard: (r) => {
+        if (turn === undefined) return undefined;
+        unread = r.pendingInput.filter((i) => i.seq > through);
+        if (unread.length === 0) return undefined;
+        const prev = this.finishRefusals.get(id);
+        forced = prev !== undefined && prev.turn !== turn && prev.turns >= MAX_FINISH_REFUSALS;
+        return forced ? undefined : `${unread.length} unread input${unread.length === 1 ? "" : "s"} this turn does not carry`;
+      },
       // A live ending: the status no longer comes from a backup.
       patch: (r) => {
         const previous = r.reportSeq ?? (r.report !== undefined ? 1 : 0);
@@ -702,12 +745,25 @@ export class SubsessionService {
         }
         r.earlierReports = kept.length > 0 ? kept : undefined;
         r.reportSeq = previous + 1;
-        r.report = report.trim();
+        r.report = forced ? `${report.trim()}\n\n${formatUnreadAtFinish(unread)}` : report.trim();
         r.reportDelivered = false;
         delete r.restored;
       },
     });
-    if (!outcome.ok) return outcome;
+    if (!outcome.ok) {
+      if (!outcome.refused || turn === undefined || unread.length === 0) return outcome;
+      const prev = this.finishRefusals.get(id);
+      // A retry in the same turn changes nothing: the turn counts once, with what its first refusal saw.
+      // A turn with less unread than the last refused one does not count
+      // (it is getting through it), but does not start over either: drops
+      // in a row are bounded by the count, so the streak still ends.
+      const turns = !prev ? 1 : prev.turn === turn || unread.length < prev.unread ? prev.turns : prev.turns + 1;
+      if (prev?.turn !== turn) this.finishRefusals.set(id, { turns, turn, unread: unread.length });
+      log.info({ id, unread: unread.length, turns }, "Sub-session task_finish refused: input it has not read is pending");
+      return { ...outcome, unread: unread.length };
+    }
+    this.finishRefusals.delete(id);
+    if (forced) log.warn({ id, unread: unread.length }, "Sub-session finished with input it has not read, after refusals in a row; the input stays pending");
     this.continueOwed.delete(record.id);
     this.spoke.add(record.id);
     this.safely(() => this.deps.removeCronJobs(key), "remove cron jobs");
@@ -1453,6 +1509,8 @@ export class SubsessionService {
       }), "active heartbeat"), ACTIVE_HEARTBEAT_MS);
       heartbeat.unref?.();
       this.inflightThrough.set(id, turn.throughSeq);
+      const serial = ++this.turnSerial;
+      this.inflightTurn.set(id, serial);
       let outcome: TaskTurnOutcome;
       try {
         outcome = await this.deps.runTaskTurn(record.sessionKey, turn.prompt, { bare: turn.kind === "compact" });
@@ -1460,6 +1518,9 @@ export class SubsessionService {
       } finally {
         clearInterval(heartbeat);
         this.inflightThrough.delete(id);
+        this.inflightTurn.delete(id);
+        // Refused turns count only in a row: a turn with no refusal ends the streak.
+        if (this.finishRefusals.get(id)?.turn !== serial) this.finishRefusals.delete(id);
       }
       if (!this.afterTurn(id, turn, outcome)) return;
     }
@@ -2132,6 +2193,14 @@ export class SubsessionService {
   private safely(fn: () => void, what: string): void {
     try { fn(); } catch (err) { log.error({ err }, "Sub-session %s failed", what); }
   }
+}
+
+/** The unread input a forced task_finish quotes in its report. */
+function formatUnreadAtFinish(unread: SubsessionInput[]): string {
+  return [
+    `[Tomo: this task finished with ${unread.length} input${unread.length === 1 ? "" : "s"} it never read (task_finish was refused ${MAX_FINISH_REFUSALS} turns in a row and more kept arriving). They stay with the task, which still gets them as a finished task:]`,
+    ...unread.map((i, n) => `${n + 1}. ${truncate((i.words ?? i.text).trim(), UNREAD_AT_FINISH_EXCERPT)}`),
+  ].join("\n");
 }
 
 function pushConversation(record: SubsessionRecord, entry: Omit<SubsessionConversationEntry, "seq">): void {

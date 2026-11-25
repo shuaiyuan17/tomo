@@ -2,9 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import pino from "pino";
 import {
-  LOG_REDACT_PATHS,
   isSecretFieldName,
   redactLogRecord,
   redactSecretValue,
@@ -347,7 +345,9 @@ describe("scrubSecretValues", () => {
     const digits = "9".repeat(32_000);
     const started = Date.now();
     expect(scrubSecretValues(digits)).toBe(digits);
-    expect(Date.now() - started).toBeLessThan(20);
+    // ~6ms when linear, ~910ms when quadratic: 200ms catches the regression
+    // with room for a loaded CI runner.
+    expect(Date.now() - started).toBeLessThan(200);
   });
 
   // grammY reports failures by echoing the request URL, where the token is
@@ -433,48 +433,14 @@ describe("configIssues secret redaction", () => {
   });
 });
 
-/** pino/file runs in a worker thread, so the write is not synchronous. */
-async function readWhenReady(file: string, marker: string): Promise<string> {
-  const deadline = Date.now() + 5000;
-  let contents = "";
-  while (Date.now() < deadline) {
-    try {
-      contents = readFileSync(file, "utf-8");
-    } catch { /* not created yet */ }
-    if (contents.includes(marker)) break;
-    await new Promise((resolve) => setTimeout(resolve, 25));
-  }
-  return contents;
-}
+/** Under vitest `TOMO_LOG_INLINE` is set (vitest.config.ts), so logger.ts
+ *  writes the file with a synchronous `pino.destination`: no worker thread,
+ *  and the line is on disk when the call returns. */
+const readLog = (file: string) => readFileSync(file, "utf-8");
 
 describe("logger redaction", () => {
-  it("censors secret fields at every depth the daemon logs at", () => {
-    const written: string[] = [];
-    // Same three layers logger.ts wires up: the short paths ladder, the deep
-    // pass, and the error serializer.
-    const log = pino(
-      {
-        level: "debug",
-        redact: { paths: LOG_REDACT_PATHS },
-        formatters: { log: (record) => redactLogRecord(record) },
-      },
-      { write: (chunk: string) => void written.push(chunk) } as unknown as pino.DestinationStream,
-    );
-
-    log.info({ token: TOKEN }, "top level");
-    log.info({ channel: { name: "telegram", token: TOKEN } }, "nested");
-    log.info({ config: { litellm: { apiKey: "sk-secret" } } }, "twice nested");
-    log.info({ key: "dm:alice", sessionKey: "dm:alice" }, "identifiers");
-
-    const out = written.join("");
-    expect(out).not.toContain(TOKEN);
-    expect(out).not.toContain("sk-secret");
-    expect(out.match(/\[Redacted\]/g)).toHaveLength(3);
-    // Not everything named "key" is a credential.
-    expect(out).toContain('"key":"dm:alice"');
-    expect(out).toContain('"sessionKey":"dm:alice"');
-  });
-
+  // Through the real logger.ts, not a copy of its setup: the path ladder,
+  // the deep pass and the error serializer as the daemon wires them.
   // A ladder of literal redact.paths can always be out-nested. These are the
   // shapes that actually occur and that the ladder alone did not reach.
   it("censors credentials deeper than the path ladder, including inside errors", async () => {
@@ -506,8 +472,16 @@ describe("logger redaction", () => {
       const webToken = "tomo_web_" + "a".repeat(64);
       log.info(`Web UI: http://127.0.0.1:9465/?t=${webToken}`);
       log.info({ tool: "Read" }, webToken);
+      // 6. The short path ladder's own case.
+      log.error({ channel: { name: "telegram", token: TOKEN } }, "redaction probe");
+      // 7. Not everything named "key" is a credential.
+      log.info({ key: "dm:alice", sessionKey: "dm:alice" }, "identifiers");
 
-      const contents = await readWhenReady(file, "grammy shaped");
+      const contents = readLog(file);
+      expect(contents).toContain("redaction probe");
+      expect(contents).toContain("[Redacted]");
+      expect(contents).toContain('"key":"dm:alice"');
+      expect(contents).toContain('"sessionKey":"dm:alice"');
       expect(contents).not.toContain(webToken);
       expect(contents).toContain("deep config");
       expect(contents).toContain("axios shaped");
@@ -516,27 +490,6 @@ describe("logger redaction", () => {
       // The stack still survives redaction — the err serializer is wrapped,
       // not replaced.
       expect(contents).toContain("\"stack\"");
-    } finally {
-      vi.unstubAllEnvs();
-      vi.resetModules();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("wires those paths into the real logger", async () => {
-    const dir = join(tmpdir(), `tomo-logger-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`);
-    const file = join(dir, "tomo.log");
-    vi.resetModules();
-    vi.stubEnv("TOMO_LOG_FILE", file);
-    try {
-      const { log } = await import("../src/logger.js");
-      log.error({ channel: { name: "telegram", token: TOKEN } }, "redaction probe");
-
-      const contents = await readWhenReady(file, "redaction probe");
-
-      expect(contents).toContain("redaction probe");
-      expect(contents).toContain("[Redacted]");
-      expect(contents).not.toContain(TOKEN);
     } finally {
       vi.unstubAllEnvs();
       vi.resetModules();

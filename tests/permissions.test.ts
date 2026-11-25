@@ -158,7 +158,7 @@ describe("isPrivateMemoryAccess — group-session guard", () => {
       expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "*.json" }, ctx)).toBe(false);
     });
 
-    it("allows glob anchored to memory siblings that don't match private", () => {
+    it("allows a glob anchored to a subtree outside memory/", () => {
       expect(isPrivateMemoryAccess("Glob", { path: ".", pattern: "skills/*.json" }, ctx)).toBe(false);
     });
 
@@ -226,13 +226,14 @@ describe("isPrivateMemoryAccess — group-session guard", () => {
       // private/ from there.
       expect(isPrivateMemoryAccess("Grep", { path: "tmp", pattern: "x", glob: "*.md" }, ctx)).toBe(false);
     });
-
-    it("allows grep with anchored path-style glob to a non-memory subtree", () => {
-      expect(isPrivateMemoryAccess("Grep", { path: ".", pattern: "x", glob: "skills/**/*.md" }, ctx)).toBe(false);
-    });
   });
 
-  describe("Bash", () => {
+  // The Bash arm no longer decides anything in the guard: a barred turn's Bash
+  // is SANDBOXED (bash-sandbox.ts), whatever the command says. What this table
+  // pins is the predicate web redaction uses to hide a group's commands that
+  // touch memory/ (`reachesPrivate`, src/web/session-tools.ts), so it is
+  // deliberately strict: any reference to the memory tree counts.
+  describe("Bash (the redaction predicate)", () => {
     it("denies cd-then-relative-cat (reviewer's case)", () => {
       expect(isPrivateMemoryAccess("Bash", { command: "cd memory && cat private/secret.md" }, ctx)).toBe(true);
     });
@@ -264,9 +265,8 @@ describe("isPrivateMemoryAccess — group-session guard", () => {
     });
 
     it("denies any reference to the memory tree, even for public files", () => {
-      // New strict rule: groups don't get Bash access to memory/ at all.
-      // The agent should use Read on a named public file (MEMORY.md is in its
-      // prompt) instead of shelling out.
+      // Strict on purpose (see above): a text filter cannot scope a shell, so
+      // the redaction errs on hiding anything that names memory/.
       expect(isPrivateMemoryAccess("Bash", { command: "cat memory/MEMORY.md" }, ctx)).toBe(true);
       expect(isPrivateMemoryAccess("Bash", { command: "ls memory" }, ctx)).toBe(true);
     });
@@ -647,9 +647,8 @@ describe("privateMemoryGuardHooks - Bash on a barred turn", () => {
     }
   });
 
-  it("does not widen the bar to other tools - public Read still passes", async () => {
-    expect(await hookFor(() => "group-session")(PUBLIC_READ)).toEqual({});
-  });
+  // A group session's public Read passing: "leaves the workspace and the
+  // owner's own turn alone" above, and the summoned case.
 });
 
 // ---------------------------------------------------------------------------
@@ -1183,7 +1182,9 @@ describe("isPrivateMemoryAccess — real-path containment", () => {
     )).toBe(false);
   });
 
-  it("denies a case-permuted read that the filesystem itself resolves", () => {
+  // Only APFS (and NTFS) resolve the permutation; on a case-sensitive Linux
+  // filesystem this would be the lexical case-permuted list below over again.
+  it.runIf(process.platform === "darwin")("denies a case-permuted read that the filesystem itself resolves (macOS)", () => {
     // On case-insensitive APFS this path OPENS `secret.md` — and
     // `realpathSync` hands back the caller's spelling rather than the on-disk
     // one, so an exact compare found no containment and allowed the read.

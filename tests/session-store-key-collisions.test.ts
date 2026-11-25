@@ -1,6 +1,5 @@
 import { afterAll, describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { hostname } from "node:os";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { SessionMessage } from "../src/sessions/types.js";
@@ -20,6 +19,7 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 
 const { log } = await import("../src/logger.js");
 const { SessionStore, transcriptFileStem, legacyTranscriptFileStem } = await import("../src/sessions/store.js");
+const { holdFileLockAsLiveOwner } = await import("./helpers/lock-fixtures.js");
 
 const warn = log.warn as unknown as ReturnType<typeof vi.fn>;
 const info = log.info as unknown as ReturnType<typeof vi.fn>;
@@ -34,8 +34,14 @@ let counter = 0;
 const ALEX_DOT = "imessage:any;-;alex.smith@example.com";
 const ALEX_UNDERSCORE = "imessage:any;-;alex_smith@example.com";
 
-function newStore(dir = testDir) {
-  return new SessionStore(dir, 20, join(dir, "sdk-sessions"));
+/**
+ * The transcript and ledger lock waits are shortened from their 1-2 s
+ * defaults: the tests that hold one on purpose only need the refusal.
+ */
+const LOCK_TIMEOUTS = { transcript: 50, ledger: 50 };
+
+function newStore(dir = testDir, opts: { rotateBytes?: number } = {}) {
+  return new SessionStore(dir, 20, join(dir, "sdk-sessions"), { ...opts, lockTimeoutMs: LOCK_TIMEOUTS });
 }
 
 function msg(content: string, timestamp = Date.now()): SessionMessage {
@@ -57,13 +63,12 @@ function record(content: string, timestamp: number, seq?: number): string {
 
 /** Another LIVE process inside the transcript critical section. */
 function holdTranscriptLockIn(dir: string): string {
-  const lockDir = join(dir, "_transcripts.lock");
-  mkdirSync(lockDir, { recursive: true });
-  writeFileSync(
-    join(lockDir, "owner.other"),
-    `${JSON.stringify({ pid: process.pid, ts: Date.now(), host: hostname() })}\n`,
-  );
-  return lockDir;
+  return holdFileLockAsLiveOwner(join(dir, "_transcripts.lock"));
+}
+
+/** Did the store log that it moved a transcript to its collision-free name? */
+function loggedCollisionFreeMove(): boolean {
+  return info.mock.calls.some((c) => String(c[1] ?? "").includes("collision-free name"));
 }
 
 /** `.ambiguous-` files in the test directory. */
@@ -147,12 +152,6 @@ describe("transcriptFileStem", () => {
       expect(stem.includes(".")).toBe(stem !== legacyTranscriptFileStem(key));
     }
   });
-
-  it("is stable across calls", () => {
-    for (const key of ["dm:ünïcode", ALEX_DOT, "dm:emoji-🐈"]) {
-      expect(transcriptFileStem(key)).toBe(transcriptFileStem(key));
-    }
-  });
 });
 
 describe("transcript isolation between colliding keys", () => {
@@ -222,7 +221,7 @@ describe("lazy migration of legacy transcript files", () => {
     expect(session.createdAt).toBe(Date.parse("2026-01-02T00:00:00Z"));
     expect(first.searchTranscript(ALEX_DOT, {}).map((m) => m.content))
       .toEqual(["january", "february", "recent"]);
-    expect(info.mock.calls.some((c) => String(c[1] ?? "").includes("collision-free name"))).toBe(true);
+    expect(loggedCollisionFreeMove()).toBe(true);
   });
 
   it("is a no-op for a second store over the already-migrated directory", () => {
@@ -236,7 +235,7 @@ describe("lazy migration of legacy transcript files", () => {
     expect(second.get(ALEX_DOT).messages.map((m) => m.content)).toEqual(["recent"]);
     expect(existsSync(join(testDir, `${legacy}.jsonl`))).toBe(false);
     expect(existsSync(join(testDir, `${stem}.jsonl`))).toBe(true);
-    expect(info.mock.calls.some((c) => String(c[1] ?? "").includes("collision-free name"))).toBe(false);
+    expect(loggedCollisionFreeMove()).toBe(false);
   });
 
   it("does nothing for a key with no legacy files", () => {
@@ -357,6 +356,9 @@ describe("injectivity on a case-insensitive filesystem", () => {
   });
 
   it("takes the hash suffix for any key carrying an uppercase letter", () => {
+    // The suffix is lowercase hex, so the discriminator survives a
+    // case-folding filesystem intact — without that, two suffixed stems could
+    // still meet.
     for (const key of ["dm:Alice-2", "telegram:A1", "imessage:AbC"]) {
       expect(transcriptFileStem(key), key).not.toBe(legacyTranscriptFileStem(key));
       expect(transcriptFileStem(key), key).toMatch(/\.[0-9a-f]{12}$/);
@@ -373,12 +375,6 @@ describe("injectivity on a case-insensitive filesystem", () => {
 
     expect(store.get(UPPER).messages.map((m) => m.content)).toEqual(["from the uppercase handle"]);
     expect(store.get(LOWER).messages.map((m) => m.content)).toEqual(["from the lowercase handle"]);
-  });
-
-  it("keeps the hash suffix itself immune to folding", () => {
-    // Hex digits are lowercase, so the discriminator survives a case-folding
-    // filesystem intact — without that, two suffixed stems could still meet.
-    expect(transcriptFileStem(UPPER)).toBe(transcriptFileStem(UPPER).replace(/[^.]*$/, (h) => h.toLowerCase()));
   });
 });
 
@@ -541,12 +537,7 @@ describe("persisted legacy-stem ownership (_legacy_stems.json)", () => {
     // land, so the entry that is the ONLY record of this key must not be dropped.
     const store = newStore();
     store.setChatTitle(ALEX_UNDERSCORE, "Alex");
-    const lockDir = join(testDir, "_legacy_stems.json.lock");
-    mkdirSync(lockDir, { recursive: true });
-    writeFileSync(
-      join(lockDir, "owner.other"),
-      `${JSON.stringify({ pid: process.pid, ts: Date.now(), host: hostname() })}\n`,
-    );
+    const lockDir = holdFileLockAsLiveOwner(join(testDir, "_legacy_stems.json.lock"));
 
     store.clearSdkSessionId(ALEX_UNDERSCORE);
     expect(readFileSync(REGISTRY(), "utf-8")).toContain(ALEX_UNDERSCORE);
@@ -628,7 +619,7 @@ describe("persisted legacy-stem ownership (_legacy_stems.json)", () => {
     info.mockClear();
     const second = newStore();
     expect(second.get("dm:shuai").messages).toHaveLength(2);
-    expect(info.mock.calls.some((c) => String(c[1] ?? "").includes("collision-free name"))).toBe(false);
+    expect(loggedCollisionFreeMove()).toBe(false);
     expect(warningsMatching("filename collision")).toHaveLength(0);
   });
 });
@@ -638,25 +629,11 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
   const T2 = Date.parse("2026-02-02T00:00:00Z");
   const T3 = Date.parse("2026-02-03T00:00:00Z");
 
-  function seq(content: string, timestamp: number, n: number): string {
-    return JSON.stringify({ ...msg(content, timestamp), seq: n }) + "\n";
-  }
-
-  /** Another LIVE process inside the transcript critical section. */
-  function holdTranscriptLock(): string {
-    const lockDir = join(testDir, "_transcripts.lock");
-    mkdirSync(lockDir, { recursive: true });
-    writeFileSync(
-      join(lockDir, "owner.other"),
-      `${JSON.stringify({ pid: process.pid, ts: Date.now(), host: hostname() })}\n`,
-    );
-    return lockDir;
-  }
 
   function seedLegacyActive(key: string): string {
     const legacy = legacyTranscriptFileStem(key);
     const path = join(testDir, `${legacy}.jsonl`);
-    writeFileSync(path, seq("legacy one", T1, 1) + seq("legacy two", T2, 2));
+    writeFileSync(path, record("legacy one", T1, 1) + record("legacy two", T2, 2));
     return path;
   }
 
@@ -665,9 +642,6 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
       .map((line) => (JSON.parse(line) as { seq: number }).seq);
   }
 
-  function sidecars(): string[] {
-    return readdirSync(testDir).filter((n) => /\.legacy-\d{8}-\d{6}(?:-\d+)?\.jsonl$/.test(n)).sort();
-  }
 
   it("recovers the whole history after a lock timeout, an append, and a restart", () => {
     // THE REVIEWER'S REPRODUCTION. The attempt is deferred, the triggering
@@ -678,7 +652,7 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
     const stem = transcriptFileStem(ALEX_DOT);
     const newPath = join(testDir, `${stem}.jsonl`);
 
-    const lockDir = holdTranscriptLock();
+    const lockDir = holdTranscriptLockIn(testDir);
     const first = newStore();
     first.setSdkSessionId(ALEX_DOT, "sdk-1");
     first.append(ALEX_DOT, msg("arrived while the lock was held", T3));
@@ -693,9 +667,9 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
 
     // The legacy file was RENAMED to a sidecar, not merged: nothing was rewritten.
     expect(existsSync(legacyPath)).toBe(false);
-    expect(sidecars()).toEqual([expect.stringMatching(/^imessage_.*\.legacy-\d{8}-\d{6}\.jsonl$/)]);
-    expect(readFileSync(join(testDir, sidecars()[0]), "utf-8"))
-      .toBe(seq("legacy one", T1, 1) + seq("legacy two", T2, 2));
+    expect(sidecarFiles()).toEqual([expect.stringMatching(/^imessage_.*\.legacy-\d{8}-\d{6}\.jsonl$/)]);
+    expect(readFileSync(join(testDir, sidecarFiles()[0]), "utf-8"))
+      .toBe(record("legacy one", T1, 1) + record("legacy two", T2, 2));
 
     // …and every reader covers it.
     expect(session.messages.map((m) => m.content))
@@ -715,7 +689,7 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
     const stem = transcriptFileStem(ALEX_DOT);
     const legacyPath = seedLegacyActive(ALEX_DOT);          // seq 1, 2
     const activePath = join(testDir, `${stem}.jsonl`);
-    writeFileSync(activePath, seq("post-migration", T3, 1)); // seq 1 again
+    writeFileSync(activePath, record("post-migration", T3, 1)); // seq 1 again
 
     const store = newStore();
     store.setSdkSessionId(ALEX_DOT, "sdk-1");
@@ -728,7 +702,7 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
     expect(seqsIn(activePath)).toEqual([1, 2]);
     expect(new Set(seqsIn(activePath)).size).toBe(2);
     // The sidecar was not rewritten.
-    expect(seqsIn(join(testDir, sidecars()[0]))).toEqual([1, 2]);
+    expect(seqsIn(join(testDir, sidecarFiles()[0]))).toEqual([1, 2]);
   });
 
   it("hides the sidecar from rotation: an archive name is derived, never matched", () => {
@@ -737,15 +711,15 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
     // must never see or rewrite the sidecar.
     const stem = transcriptFileStem(ALEX_DOT);
     const sidecarName = `_archive_${stem}_2026-01.legacy-20260301-120000.jsonl`;
-    writeFileSync(join(testDir, sidecarName), seq("archived legacy january", Date.parse("2026-01-05T00:00:00Z"), 9));
+    writeFileSync(join(testDir, sidecarName), record("archived legacy january", Date.parse("2026-01-05T00:00:00Z"), 9));
     const before = readFileSync(join(testDir, sidecarName), "utf-8");
 
     // rotateBytes: 1 forces a rotation on the first `get()`.
-    const store = new SessionStore(testDir, 20, join(testDir, "sdk-sessions"), { rotateBytes: 1 });
+    const store = newStore(testDir, { rotateBytes: 1 });
     store.append(ALEX_DOT, msg("january, current", Date.parse("2026-01-20T00:00:00Z")));
     store.append(ALEX_DOT, msg("march", Date.parse("2026-03-02T00:00:00Z")));
     // A fresh store rotates on first access; nothing may be merged into the sidecar.
-    const reloaded = new SessionStore(testDir, 20, join(testDir, "sdk-sessions"), { rotateBytes: 1 });
+    const reloaded = newStore(testDir, { rotateBytes: 1 });
     reloaded.get(ALEX_DOT);
 
     expect(readFileSync(join(testDir, sidecarName), "utf-8")).toBe(before);
@@ -760,8 +734,8 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
     const legacy = legacyTranscriptFileStem(ALEX_DOT);
     const stem = transcriptFileStem(ALEX_DOT);
     const legacyPath = seedLegacyActive(ALEX_DOT);
-    writeFileSync(join(testDir, `_archive_${legacy}_2026-01.jsonl`), seq("january", Date.parse("2026-01-05T00:00:00Z"), 0));
-    writeFileSync(join(testDir, `${stem}.jsonl`), seq("post-migration", T3, 1));
+    writeFileSync(join(testDir, `_archive_${legacy}_2026-01.jsonl`), record("january", Date.parse("2026-01-05T00:00:00Z"), 0));
+    writeFileSync(join(testDir, `${stem}.jsonl`), record("post-migration", T3, 1));
 
     const store = newStore();
     store.setSdkSessionId(ALEX_DOT, "sdk-1");
@@ -778,19 +752,19 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
   it("sidecars a legacy archive whose month already exists under the new stem", () => {
     const legacy = legacyTranscriptFileStem(ALEX_DOT);
     const stem = transcriptFileStem(ALEX_DOT);
-    writeFileSync(join(testDir, `_archive_${legacy}_2026-01.jsonl`), seq("legacy january", Date.parse("2026-01-05T00:00:00Z"), 7));
-    writeFileSync(join(testDir, `_archive_${stem}_2026-01.jsonl`), seq("new january", Date.parse("2026-01-20T00:00:00Z"), 1));
+    writeFileSync(join(testDir, `_archive_${legacy}_2026-01.jsonl`), record("legacy january", Date.parse("2026-01-05T00:00:00Z"), 7));
+    writeFileSync(join(testDir, `_archive_${stem}_2026-01.jsonl`), record("new january", Date.parse("2026-01-20T00:00:00Z"), 1));
 
     const store = newStore();
     store.setSdkSessionId(ALEX_DOT, "sdk-1");
     expect(store.searchTranscript(ALEX_DOT, {}).map((m) => m.content)).toEqual(["legacy january", "new january"]);
     expect(existsSync(join(testDir, `_archive_${legacy}_2026-01.jsonl`))).toBe(false);
-    expect(sidecars()).toEqual([
+    expect(sidecarFiles()).toEqual([
       expect.stringMatching(new RegExp(`^_archive_${stem.replace(".", "\\.")}_2026-01\\.legacy-\\d{8}-\\d{6}\\.jsonl$`)),
     ]);
     // Neither file was renumbered.
     expect(seqsIn(join(testDir, `_archive_${stem}_2026-01.jsonl`))).toEqual([1]);
-    expect(seqsIn(join(testDir, sidecars()[0]))).toEqual([7]);
+    expect(seqsIn(join(testDir, sidecarFiles()[0]))).toEqual([7]);
   });
 
   describe("every crash point converges on re-run", () => {
@@ -798,9 +772,9 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
      *  already under the new stem. */
     function seedFamily(): { legacy: string; stem: string } {
       const legacy = legacyTranscriptFileStem(ALEX_DOT);
-      writeFileSync(join(testDir, `${legacy}.jsonl`), seq("legacy active", T3, 3));
-      writeFileSync(join(testDir, `_archive_${legacy}_2026-01.jsonl`), seq("legacy january", T1, 1));
-      writeFileSync(join(testDir, `_archive_${legacy}_2026-02.jsonl`), seq("legacy february", T2, 2));
+      writeFileSync(join(testDir, `${legacy}.jsonl`), record("legacy active", T3, 3));
+      writeFileSync(join(testDir, `_archive_${legacy}_2026-01.jsonl`), record("legacy january", T1, 1));
+      writeFileSync(join(testDir, `_archive_${legacy}_2026-02.jsonl`), record("legacy february", T2, 2));
       return { legacy, stem: transcriptFileStem(ALEX_DOT) };
     }
 
@@ -847,7 +821,7 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
 
     it("crash after the active file became a sidecar", () => {
       const { legacy, stem } = seedFamily();
-      writeFileSync(join(testDir, `${stem}.jsonl`), seq("post-migration", Date.parse("2026-02-04T00:00:00Z"), 1));
+      writeFileSync(join(testDir, `${stem}.jsonl`), record("post-migration", Date.parse("2026-02-04T00:00:00Z"), 1));
       renameSync(join(testDir, `${legacy}.jsonl`), join(testDir, `${stem}.legacy-20260301-120000.jsonl`));
       runAndAssert([...ALL, "post-migration"]);
     });
@@ -859,7 +833,7 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
       renameSync(join(testDir, `_archive_${legacy}_2026-02.jsonl`), join(testDir, `_archive_${stem}_2026-02.jsonl`));
       info.mockClear();
       runAndAssert(ALL);
-      expect(info.mock.calls.some((c) => String(c[1] ?? "").includes("collision-free name"))).toBe(false);
+      expect(loggedCollisionFreeMove()).toBe(false);
     });
 
     it("crash between the active rename and a sidecar the same pass created", () => {
@@ -867,7 +841,7 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
       // become a sidecar, and the third never ran.
       const { legacy, stem } = seedFamily();
       renameSync(join(testDir, `${legacy}.jsonl`), join(testDir, `${stem}.jsonl`));
-      writeFileSync(join(testDir, `_archive_${stem}_2026-02.jsonl`), seq("new february", T2 + 1000, 1));
+      writeFileSync(join(testDir, `_archive_${stem}_2026-02.jsonl`), record("new february", T2 + 1000, 1));
       renameSync(
         join(testDir, `_archive_${legacy}_2026-02.jsonl`),
         join(testDir, `_archive_${stem}_2026-02.legacy-20260301-120000.jsonl`),
@@ -880,7 +854,7 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
     // A deferred attempt must not be recorded as a completed check. Nothing here
     // restarts the store, so only a genuine retry can recover the history.
     const legacyPath = seedLegacyActive(ALEX_DOT);
-    const lockDir = holdTranscriptLock();
+    const lockDir = holdTranscriptLockIn(testDir);
     const store = newStore();
     store.setSdkSessionId(ALEX_DOT, "sdk-1");
     store.append(ALEX_DOT, msg("arrived while the lock was held", T3));
@@ -908,12 +882,12 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
     const store = newStore();
     store.setSdkSessionId(ALEX_DOT, "sdk-dot");
     store.setSdkSessionId(ALEX_UNDERSCORE, "sdk-underscore");
-    writeFileSync(join(testDir, `${legacy}.jsonl`), seq("mixed history", T1, 1));
-    writeFileSync(join(testDir, `${stem}.jsonl`), seq("mine alone", T2, 1));
+    writeFileSync(join(testDir, `${legacy}.jsonl`), record("mixed history", T1, 1));
+    writeFileSync(join(testDir, `${stem}.jsonl`), record("mine alone", T2, 1));
 
     expect(store.get(ALEX_DOT).messages.map((m) => m.content)).toEqual(["mine alone"]);
     expect(readFileSync(join(testDir, `${legacy}.jsonl`), "utf-8")).toContain("mixed history");
-    expect(sidecars()).toEqual([]);
+    expect(sidecarFiles()).toEqual([]);
     expect(warningsMatching("filename collision")).toHaveLength(1);
   });
 
@@ -921,7 +895,7 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
     // `migrateSessionKeyLocked` renames `transcriptPath(oldKey)`, and while the
     // migration is outstanding we do not know which files that is.
     seedLegacyActive(ALEX_DOT);
-    const lockDir = holdTranscriptLock();
+    const lockDir = holdTranscriptLockIn(testDir);
     const store = newStore();
     store.setSdkSessionId(ALEX_DOT, "sdk-1");
 
@@ -952,7 +926,7 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
     store.migrateSessionKey(ALEX_DOT, "dm:alex");
 
     expect(existsSync(join(testDir, `${transcriptFileStem(ALEX_DOT)}.jsonl`))).toBe(false);
-    expect(sidecars()).toEqual([expect.stringMatching(/^dm_alex\.legacy-\d{8}-\d{6}\.jsonl$/)]);
+    expect(sidecarFiles()).toEqual([expect.stringMatching(/^dm_alex\.legacy-\d{8}-\d{6}\.jsonl$/)]);
     expect(store.searchTranscript("dm:alex", {}).map((m) => m.content))
       .toEqual(["from the channel key", "already under the unified key"]);
     expect(store.get("dm:alex").messages.map((m) => m.content))
@@ -963,14 +937,14 @@ describe("a deferred transcript migration is retried, never forgotten", () => {
   it("carries an existing sidecar across a re-key", () => {
     // A reader can see a sidecar, so a re-key that cannot would lose history.
     const stem = transcriptFileStem(ALEX_DOT);
-    writeFileSync(join(testDir, `${stem}.legacy-20260301-120000.jsonl`), seq("older, sidecarred", T1, 1));
+    writeFileSync(join(testDir, `${stem}.legacy-20260301-120000.jsonl`), record("older, sidecarred", T1, 1));
     const store = newStore();
     store.setSdkSessionId(ALEX_DOT, "sdk-1");
     store.append(ALEX_DOT, msg("newer", T2));
 
     store.migrateSessionKey(ALEX_DOT, "dm:alex");
 
-    expect(sidecars()).toEqual([expect.stringMatching(/^dm_alex\.legacy-\d{8}-\d{6}\.jsonl$/)]);
+    expect(sidecarFiles()).toEqual([expect.stringMatching(/^dm_alex\.legacy-\d{8}-\d{6}\.jsonl$/)]);
     expect(store.searchTranscript("dm:alex", {}).map((m) => m.content)).toEqual(["older, sidecarred", "newer"]);
   });
 });

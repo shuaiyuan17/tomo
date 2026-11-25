@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { hostname, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -50,6 +50,7 @@ vi.mock("../src/fs-utils.js", async (importOriginal) => {
 
 const { SessionStore } = await import("../src/sessions/store.js");
 const { CronStore } = await import("../src/cron/store.js");
+const { holdFileLockAsLiveOwner } = await import("./helpers/lock-fixtures.js");
 
 let dir: string;
 
@@ -72,8 +73,24 @@ function registryOnDisk(): { sessions: { channelKey: string; sdkSessionId: strin
   return JSON.parse(readFileSync(REGISTRY(), "utf-8"));
 }
 
+/**
+ * The registry lock wait is shortened from its 2 s default: the tests that
+ * hold it on purpose only need to see the refusal, not wait it out.
+ */
 function newSessionStore() {
-  return new SessionStore(dir, 20, join(dir, "sdk"));
+  return new SessionStore(dir, 20, join(dir, "sdk"), { lockTimeoutMs: { registry: 100 } });
+}
+
+/** Another (live) process inside its own registry read-modify-write. Returns its release. */
+function holdRegistryLockAsAnotherProcess(): () => void {
+  const lockDir = holdFileLockAsLiveOwner(`${REGISTRY()}.lock`);
+  return () => rmSync(lockDir, { recursive: true, force: true });
+}
+
+/** A beforeWrite hook that fails the next REGISTRY publish with ENOSPC, letting other files through. */
+function failRegistryWrite(path: string): void {
+  if (path !== REGISTRY()) { hook.beforeWrite = failRegistryWrite; return; } // re-arm past other files
+  throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
 }
 
 // ---------------------------------------------------------------------------
@@ -131,17 +148,11 @@ describe("registry writes under the advisory lock", () => {
     expect(entry.chatTitle).toBe("Ops");          // ...and ours landed on top of it
   });
 
-  // Two 2s lock waits (see REGISTRY_LOCK_OPTIONS) plus setup.
-  it("refuses a link change it cannot serialise, and skips bookkeeping quietly", { timeout: 20_000 }, () => {
+  it("refuses a link change it cannot serialise, and skips bookkeeping quietly", () => {
     const store = newSessionStore();
     store.setSdkSessionId("telegram:1", "sess-aaaa");
 
-    // Another (live) process is inside its own read-modify-write.
-    mkdirSync(`${REGISTRY()}.lock`, { recursive: true });
-    writeFileSync(
-      join(`${REGISTRY()}.lock`, "owner.other"),
-      `${JSON.stringify({ pid: process.pid, ts: Date.now(), host: hostname() })}\n`,
-    );
+    const release = holdRegistryLockAsAnotherProcess();
     const before = readFileSync(REGISTRY(), "utf-8");
     try {
       // Link changes are loud: a link invented from an unserialised read
@@ -152,33 +163,20 @@ describe("registry writes under the advisory lock", () => {
       expect(() => store.setChatTitle("telegram:1", "Ops")).not.toThrow();
       expect(readFileSync(REGISTRY(), "utf-8")).toBe(before);
     } finally {
-      rmSync(`${REGISTRY()}.lock`, { recursive: true, force: true });
+      release();
     }
 
     // Once the holder is gone, everything works again.
     store.setChatTitle("telegram:1", "Ops");
     expect(registryOnDisk().sessions[0].chatTitle).toBe("Ops");
   });
-});
-
-describe("registry hot path: no lock when nothing changes", () => {
-  function holdLockAsAnotherProcess(): () => void {
-    mkdirSync(`${REGISTRY()}.lock`, { recursive: true });
-    writeFileSync(
-      join(`${REGISTRY()}.lock`, "owner.other"),
-      `${JSON.stringify({ pid: process.pid, ts: Date.now(), host: hostname() })}\n`,
-    );
-    return () => rmSync(`${REGISTRY()}.lock`, { recursive: true, force: true });
-  }
 
   it("does not let a later bookkeeping save publish a link change whose own save failed", () => {
     const store = newSessionStore();
     store.setSdkSessionId("telegram:-1", "sess-aaaa");
     store.setChatTitle("telegram:-1", "Old title");
 
-    hook.beforeWrite = () => {
-      throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
-    };
+    hook.beforeWrite = failRegistryWrite;
     expect(() => store.clearSdkSessionId("telegram:-1")).toThrow(/ENOSPC/);
 
     // The unlink reported failure: it is not in memory, and an unrelated
@@ -192,7 +190,9 @@ describe("registry hot path: no lock when nothing changes", () => {
     expect(active).toHaveLength(1);
     expect(active[0]!.sdkSessionId).toBe("sess-aaaa");
   });
+});
 
+describe("registry hot path: no lock when nothing changes", () => {
   it("answers an unchanged reply target, title and participant without waiting for the lock", () => {
     const store = newSessionStore();
     store.setSdkSessionId("telegram:-1", "sess-aaaa");
@@ -200,7 +200,7 @@ describe("registry hot path: no lock when nothing changes", () => {
     store.setChatTitle("telegram:-1", "Ops");
     store.addParticipant("telegram:-1", "Ada", "u1");
 
-    const release = holdLockAsAnotherProcess();
+    const release = holdRegistryLockAsAnotherProcess();
     try {
       const started = Date.now();
       for (let i = 0; i < 20; i++) {
@@ -208,7 +208,8 @@ describe("registry hot path: no lock when nothing changes", () => {
         store.setChatTitle("telegram:-1", "Ops");
         store.addParticipant("telegram:-1", "Ada", "u1");
       }
-      // One lock wait is 2s; sixty of them would be two minutes.
+      // Sixty lock waits, even at this store's shortened 100 ms, would be six
+      // seconds; at the 2 s default, two minutes.
       expect(Date.now() - started).toBeLessThan(1_000);
     } finally {
       release();
@@ -257,10 +258,6 @@ describe("registry hot path: no lock when nothing changes", () => {
     store.setSdkSessionId("telegram:old", "sess-aaaa");
     store.setReplyTarget("telegram:old", { channelName: "telegram", chatId: "-1" });
 
-    const failRegistryWrite = (path: string): void => {
-      if (path !== REGISTRY()) { hook.beforeWrite = failRegistryWrite; return; } // re-arm past other files
-      throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
-    };
     hook.beforeWrite = failRegistryWrite;
     expect(() => store.migrateSessionKey("telegram:old", "telegram:new")).toThrow(/ENOSPC/);
 
@@ -270,7 +267,6 @@ describe("registry hot path: no lock when nothing changes", () => {
     };
     const moved = onDisk.sessions.find((e) => e.channelKey === "telegram:new" && e.unlinkedAt === null);
     expect(moved?.replyTarget?.chatId).toBe("-1");
-    hook.beforeWrite = null;
   });
 
   it("sees another process's atomic write even at the same size and mtime", () => {

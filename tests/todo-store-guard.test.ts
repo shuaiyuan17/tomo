@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 // A real tree: ~/.tomo/{data/todos,workspace}, a store file, and a symlink
@@ -38,6 +38,7 @@ vi.mock("../src/logger.js", () => ({ log: { info: vi.fn(), warn: vi.fn(), error:
 const { isTodoStoreWrite, todoGuardDecision, todoStoreGuardHooks, TODO_STORE_WRITE_DENIAL } = await import("../src/agent/todo-store-guard.js");
 const { privateMemoryGuardHooks } = await import("../src/agent/private-memory-guard.js");
 const { SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH } = await import("../src/agent/bash-sandbox.js");
+const { sandboxRunsHere } = await import("./helpers/sandbox-exec.js");
 
 afterAll(() => rmSync(tree.home, { recursive: true, force: true }));
 
@@ -166,7 +167,7 @@ describe("a group session cannot read the store", () => {
     ]) expect((await groupHook(call)).hookSpecificOutput?.permissionDecision, JSON.stringify(call)).toBe("deny");
   });
 
-  const sandboxRuns = process.platform === "darwin" && existsSync(SANDBOX_EXEC_PATH) && existsSync(SANDBOX_SHELL_PATH);
+  const sandboxRuns = sandboxRunsHere(SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH);
   it.runIf(sandboxRuns)("runs Bash in a kernel sandbox that cannot open the store", async () => {
     for (const command of [`cat ${STORE}`, "cat innocent/todos.json", `ls ${tree.todos}`]) {
       const result = await groupHook({ tool_name: "Bash", tool_input: { command } });

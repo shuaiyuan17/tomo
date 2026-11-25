@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,7 +7,6 @@ import { randomUUID } from "node:crypto";
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
 import { log } from "../src/logger.js";
-import { WebSupervisor } from "../src/web/supervisor.js";
 import { WebChannel } from "../src/channels/web.js";
 import { WebRequestJournal } from "../src/web/request-journal.js";
 import { WatchBus } from "../src/watch/bus.js";
@@ -16,6 +15,8 @@ import { captureChannelFor } from "../src/credentials/capture.js";
 import { BrokerStateFile, MemoryBackend } from "../src/credentials/store.js";
 import { clearSecretValuesForTests } from "../src/credentials/redactor.js";
 import type { WebBootstrap } from "../src/web/protocol.js";
+import { startWebProcess, type WebProcess } from "./helpers/web-process.js";
+import type { Headers } from "./helpers/web-http.js";
 
 // END TO END through the real web process: the broker opens a card over SSE,
 // the browser answers on POST /credentials/<id> (exact Origin, cookie, CSRF,
@@ -29,54 +30,26 @@ const WEB = { channelName: "web", chatId: "owner" };
 
 let root: string;
 let web: WebChannel;
-let supervisor: WebSupervisor;
+let child: WebProcess;
 let broker: CredentialBroker;
 let backend: MemoryBackend;
 let now: number;
 let notes: string[];
 let diagnostics: string[];
 let bodies: string[];
-let base: string;
-let boot: WebBootstrap;
-let cookie: string;
 let sse: { text: () => string; stop: () => void };
+let run = 0;
 
-const headers = (extra: Record<string, string | undefined> = {}) => Object.fromEntries(Object.entries({
-  "x-tomo-request": "1", "sec-fetch-site": "same-origin", cookie, origin: base,
-  "content-type": "application/json", "x-tomo-csrf": boot.csrfToken, "x-tomo-epoch": boot.epoch, ...extra,
-}).filter((entry): entry is [string, string] => entry[1] !== undefined));
-
-async function post(path: string, body: unknown, extra: Record<string, string | undefined> = {}): Promise<{ status: number; body: string }> {
-  const response = await fetch(`${base}${path}`, { method: "POST", headers: headers(extra), body: typeof body === "string" ? body : JSON.stringify(body) });
-  const text = await response.text();
-  bodies.push(text);
-  return { status: response.status, body: text };
+async function post(path: string, body: unknown, extra: Headers = {}): Promise<{ status: number; body: string }> {
+  const response = await child.post(path, body, extra);
+  bodies.push(response.body);
+  return response;
 }
-const answer = (id: string, body: unknown, extra: Record<string, string | undefined> = {}) => post(`/api/v1/credentials/${id}`, body, extra);
-
+const answer = (id: string, body: unknown, extra: Headers = {}) => post(`/api/v1/credentials/${id}`, body, extra);
 async function bootstrap(): Promise<WebBootstrap> {
-  const token = readFileSync(join(root, "web-token"), "utf8").trim();
-  const response = await fetch(`${base}/api/v1/bootstrap?t=${token}`, { headers: { "x-tomo-request": "1", "sec-fetch-site": "same-origin" } });
-  expect(response.status).toBe(200);
-  cookie = response.headers.get("set-cookie")!.split(";")[0];
-  const text = await response.text();
-  bodies.push(text);
-  return JSON.parse(text) as WebBootstrap;
-}
-
-function openEvents(): { text: () => string; stop: () => void } {
-  const controller = new AbortController();
-  let buffer = "";
-  void fetch(`${base}/api/v1/events`, { headers: headers(), signal: controller.signal }).then(async (response) => {
-    const reader = response.body!.getReader();
-    const decoder = new TextDecoder();
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) return;
-      buffer += decoder.decode(value);
-    }
-  }).catch(() => {});
-  return { text: () => buffer, stop: () => controller.abort() };
+  const boot = await child.bootstrap();
+  bodies.push(JSON.stringify(boot));
+  return boot;
 }
 
 /** Every `credential-request` event the stream carried, in order. */
@@ -92,42 +65,47 @@ function everything(): string {
   return JSON.stringify([sse.text(), bodies, files, diagnostics, notes, logged, web.events.after(`${web.events.epoch}:0`)]);
 }
 
-beforeEach(async () => {
-  vi.clearAllMocks();
+// One web process for the file (a child takes about half a second to start);
+// the broker, its state file, the stream and every record of what was seen are per test.
+beforeAll(async () => {
   root = mkdtempSync(join(tmpdir(), "tomo-web-credentials-"));
-  backend = new MemoryBackend();
-  now = Date.now();
-  notes = []; diagnostics = []; bodies = [];
+  diagnostics = [];
   web = new WebChannel(owner, new WatchBus(), {
     journal: new WebRequestJournal(join(root, "data", "web", "requests.jsonl")),
     credentials: { current: () => broker.formRequest("web"), submit: (id, input) => broker.fulfill(id, input) },
   });
   web.onMessage(async () => true);
+  child = await startWebProcess(web, { tomoHome: root, owner, sessionsDir: join(root, "sessions"), sdkSessionsDir: join(root, "sdk"),
+    diagnostic: (message) => diagnostics.push(message) });
+}, 20_000);
+afterAll(async () => {
+  await child?.stop();
+  await web?.stop();
+  rmSync(root, { recursive: true, force: true });
+});
+
+beforeEach(async () => {
+  vi.clearAllMocks();
+  backend = new MemoryBackend();
+  now = Date.now();
+  notes = []; bodies = [];
   broker = new CredentialBroker({
     backend,
-    stateFile: new BrokerStateFile(join(root, "data", "credentials", "state.json")),
+    stateFile: new BrokerStateFile(join(root, "data", "credentials", `state-${++run}.json`)),
     isOwnerSender: () => true,
     captureChannel: (origin) => captureChannelFor(origin.channelName === "web" ? web : undefined, origin.chatId),
     notifySession: (_key, body) => notes.push(body),
     now: () => now,
   });
-  supervisor = new WebSupervisor(web, { tomoHome: root, owner, sessionsDir: join(root, "sessions"), sdkSessionsDir: join(root, "sdk"), port: 0,
-    diagnostic: (message) => diagnostics.push(message) });
-  web.attach(supervisor);
-  await web.start();
-  base = `http://127.0.0.1:${supervisor.status().port}`;
-  boot = await bootstrap();
-  sse = openEvents();
+  await bootstrap();
+  sse = child.openEvents();
   await expect.poll(() => sse.text()).toContain("event: snapshot");
 });
 
-afterEach(async () => {
+afterEach(() => {
   sse?.stop();
   broker?.shutdown();
-  await supervisor?.stop();
-  await web?.stop();
   clearSecretValuesForTests();
-  rmSync(root, { recursive: true, force: true });
 });
 
 describe("the web UI's credential card, end to end", () => {
@@ -140,7 +118,7 @@ describe("the web UI's credential card, end to end", () => {
     const card = cardEvents()[0]!;
     expect(card).toMatchObject({ name: "github" });
     // A reload still shows it.
-    boot = await bootstrap();
+    const boot = await bootstrap();
     expect(boot.credentialRequest).toEqual({ id: card.id, name: "github", purpose: "push to my repo", expiresAt: now + CREDENTIAL_REQUEST_TIMEOUT_MS });
 
     const stored = await answer(card.id, { value: FAKE });
@@ -153,18 +131,23 @@ describe("the web UI's credential card, end to end", () => {
     expect(existsSync(join(root, "data", "web", "requests.jsonl"))).toBe(true);
     expect(readFileSync(join(root, "data", "web", "requests.jsonl"), "utf8")).toContain("please set up github");
     expect(everything()).not.toContain(FAKE);
-  }, 20_000);
+  });
 
-  it("needs the exact origin, the cookie, CSRF and the current epoch, and echoes nothing back", async () => {
+  it("echoes nothing back from a refused answer, whichever check refused it", async () => {
+    // Which request each check refuses is web-http.test.ts's write-gate table; this
+    // is the real web process, and what matters here is that FAKE comes back nowhere.
     await broker.request("x", "p", "dm:owner", WEB);
     await expect.poll(() => cardEvents().length).toBe(1);
     const { id } = cardEvents()[0]!;
-    expect((await answer(id, { value: FAKE }, { "x-tomo-csrf": "nope" })).status).toBe(403);
-    const stale = await answer(id, { value: FAKE }, { "x-tomo-epoch": randomUUID() });
-    expect(stale).toEqual({ status: 409, body: JSON.stringify({ error: "epoch_changed" }) });
-    expect((await answer(id, { value: FAKE }, { "x-tomo-epoch": undefined })).status).toBe(409);
-    expect((await answer(id, { value: FAKE }, { origin: "http://evil.test" })).status).toBe(403);
-    expect((await answer(id, { value: FAKE }, { cookie: undefined })).status).toBe(401);
+    for (const [extra, status, error] of [
+      [{ "x-tomo-csrf": "nope" }, 403, "invalid_csrf"],
+      [{ "x-tomo-epoch": randomUUID() }, 409, "epoch_changed"],
+      [{ "x-tomo-epoch": undefined }, 409, "epoch_changed"],
+      [{ origin: "http://evil.test" }, 403, "invalid_origin"],
+      [{ cookie: undefined }, 401, "authentication_required"],
+    ] as const) {
+      expect(await answer(id, { value: FAKE }, extra), JSON.stringify(extra)).toEqual({ status, body: JSON.stringify({ error }) });
+    }
     // Refused in the web process, before the daemon, with a fixed code.
     expect(await answer(id, { value: FAKE, extra: 1 })).toEqual({ status: 400, body: JSON.stringify({ error: "invalid_credential" }) });
     expect(await answer(id, { value: "" })).toEqual({ status: 400, body: JSON.stringify({ error: "invalid_credential" }) });
@@ -174,7 +157,7 @@ describe("the web UI's credential card, end to end", () => {
     // Still open after all of that.
     expect((await bootstrap()).credentialRequest?.id).toBe(id);
     expect(everything()).not.toContain(FAKE);
-  }, 20_000);
+  });
 
   it("answers a wrong id with 409, an expired request with 410, and a bad value with 400 (still open)", async () => {
     await broker.request("x", "p", "dm:owner", WEB);
@@ -182,7 +165,7 @@ describe("the web UI's credential card, end to end", () => {
     const { id } = cardEvents()[0]!;
     expect(await answer(randomUUID(), { value: FAKE })).toEqual({ status: 409, body: JSON.stringify({ error: "credential_unknown" }) });
     expect(await answer(id, { value: "abc" })).toEqual({ status: 400, body: JSON.stringify({ error: "invalid_value" }) });
-    boot = await bootstrap();
+    const boot = await bootstrap();
     expect(boot.credentialRequest?.id).toBe(id);
     now += CREDENTIAL_REQUEST_TIMEOUT_MS + 1;
     expect(await answer(id, { value: FAKE })).toEqual({ status: 410, body: JSON.stringify({ error: "credential_expired" }) });
@@ -190,7 +173,7 @@ describe("the web UI's credential card, end to end", () => {
     expect(notes.at(-1)).toContain("timed out");
     expect(backend.items.size).toBe(0);
     expect(everything()).not.toContain(FAKE);
-  }, 20_000);
+  });
 
   it("refuses: the card's cancel ends the request, and the session is told", async () => {
     await broker.request("x", "p", "dm:owner", WEB);
@@ -199,5 +182,5 @@ describe("the web UI's credential card, end to end", () => {
     expect(await answer(id, { cancel: true })).toEqual({ status: 200, body: JSON.stringify({ status: "cancelled" }) });
     expect(notes.at(-1)).toContain("refused");
     expect(await answer(id, { value: FAKE })).toMatchObject({ status: 409 });
-  }, 20_000);
+  });
 });

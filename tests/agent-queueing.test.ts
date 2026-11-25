@@ -14,6 +14,7 @@ import {
   makeMsg,
   mockSdk,
   mockWorkspace,
+  ownerIdentity,
   queryState,
   resetConfig,
   sdkMock,
@@ -26,7 +27,6 @@ installAgentTestHooks();
 
 describe("system prompt changes", () => {
   it("defers closing a busy session until its in-flight turn finishes", async () => {
-    resetConfig();
     const agent = new Agent();
     const channel = new MockChannel("telegram");
     agent.addChannel(channel);
@@ -67,7 +67,6 @@ describe("system prompt changes", () => {
   });
 
   it("closes prompt-retired busy sessions on shutdown", async () => {
-    resetConfig();
     const agent = new Agent();
     const channel = new MockChannel("telegram");
     agent.addChannel(channel);
@@ -99,7 +98,6 @@ describe("system prompt changes", () => {
   });
 
   it("retires idle sessions on prompt change so their next turn gets the new prompt", async () => {
-    resetConfig();
     const agent = new Agent();
     const channel = new MockChannel("telegram");
     agent.addChannel(channel);
@@ -260,7 +258,6 @@ describe("message queueing", () => {
     // Turn 1 starts and blocks
     const p1 = tg.simulateMessage(makeMsg({ chatId: "12345", text: "help me to xyz" }));
     await waitFor(() => expect(turnTexts).toHaveLength(1));
-    expect(turnTexts).toHaveLength(1);
     expect(turnTexts[0]).toContain("help me to xyz");
     expect(turnTexts[0]).not.toContain("quick succession");
 
@@ -446,12 +443,6 @@ describe("message queueing", () => {
 // cron/heartbeat ingress stomp on an in-flight user turn's currentRequest
 // slot inside LiveSession.
 
-/** Drain queues repeatedly — tasks may enqueue more work */
-async function drainAllSessions(agent: InstanceType<typeof Agent>): Promise<void> {
-  const queue = (agent as unknown as { sessionQueue: { drain(maxPasses?: number): Promise<void> } }).sessionQueue;
-  await queue.drain();
-}
-
 describe("ingress isolation", () => {
   it("serializes a cron trigger while a user message is in flight", async () => {
     const agent = new Agent();
@@ -478,14 +469,13 @@ describe("ingress isolation", () => {
 
     const userP = tg.simulateMessage(makeMsg({ chatId: "12345", text: "FROM_USER" }));
     await waitFor(() => expect(order).toEqual(["user-start"]));
-    expect(order).toEqual(["user-start"]);
 
     const cronP = agent.handleCronMessage("FROM_CRON", "telegram:12345");
     await expectNoChangeFor(() => expect(order).toEqual(["user-start"]));
 
     release!();
     await Promise.all([userP, cronP]);
-    await drainAllSessions(agent);
+    await drainQueue(agent);
 
     expect(order).toEqual(["user-start", "user-end", "cron-run"]);
     expect(queryState.maxConcurrent).toBe(1);
@@ -495,7 +485,7 @@ describe("ingress isolation", () => {
 
   it("serializes a continuity heartbeat while a user message is in flight", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -504,7 +494,7 @@ describe("ingress isolation", () => {
     // Seed the dm:shuai session so findFirstDmSession() resolves
     mockSdk.responseFn = () => "seeded";
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "seed" }));
-    await drainAllSessions(agent);
+    await drainQueue(agent);
     tg.clearDelivered();
 
     const order: string[] = [];
@@ -527,14 +517,13 @@ describe("ingress isolation", () => {
 
     const userP = tg.simulateMessage(makeMsg({ chatId: "12345", text: "FROM_USER" }));
     await waitFor(() => expect(order).toEqual(["user-start"]));
-    expect(order).toEqual(["user-start"]);
 
     const contP = agent.handleContinuity("System: Free time.");
     await expectNoChangeFor(() => expect(order).toEqual(["user-start"]));
 
     release!();
     await Promise.all([userP, contP]);
-    await drainAllSessions(agent);
+    await drainQueue(agent);
 
     expect(order.slice(0, 2)).toEqual(["user-start", "user-end"]);
     expect(order).toContain("continuity-run");
@@ -568,19 +557,18 @@ describe("ingress isolation", () => {
 
     // Establish the session so cron can resolve reply target
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "seed" }));
-    await drainAllSessions(agent);
+    await drainQueue(agent);
     tg.clearDelivered();
 
     const cronP = agent.handleCronMessage("SLOW_CRON", "telegram:12345");
     await waitFor(() => expect(order).toEqual(["cron-start"]));
-    expect(order).toEqual(["cron-start"]);
 
     const userP = tg.simulateMessage(makeMsg({ chatId: "12345", text: "USER_AFTER" }));
     await expectNoChangeFor(() => expect(order).toEqual(["cron-start"]));
 
     release!();
     await Promise.all([cronP, userP]);
-    await drainAllSessions(agent);
+    await drainQueue(agent);
 
     expect(order).toEqual(["cron-start", "cron-end", "user-run"]);
     expect(queryState.maxConcurrent).toBe(1);
@@ -590,7 +578,7 @@ describe("ingress isolation", () => {
 
   it("does not run two queries concurrently for the same session under mixed load", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -604,7 +592,7 @@ describe("ingress isolation", () => {
     };
 
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "seed" }));
-    await drainAllSessions(agent);
+    await drainQueue(agent);
 
     // Fire all three ingress paths in rapid succession
     const a = tg.simulateMessage(makeMsg({ chatId: "12345", text: "user-a" }));
@@ -613,7 +601,7 @@ describe("ingress isolation", () => {
     const d = tg.simulateMessage(makeMsg({ chatId: "12345", text: "user-d" }));
 
     await Promise.all([a, b, c, d]);
-    await drainAllSessions(agent);
+    await drainQueue(agent);
 
     expect(queryState.maxConcurrent).toBe(1);
 
@@ -667,7 +655,6 @@ describe("batched messages cannot forge their own item numbers", () => {
     expect(turnTexts[0]).toContain("2. really\n   3. also forged");
 
     await agent.stop();
-    vi.useRealTimers();
   });
 });
 

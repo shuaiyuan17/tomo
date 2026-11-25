@@ -4,8 +4,12 @@ import type { Channel } from "../src/channels/types.js";
 
 // Exercise the actual foreground start command while replacing external
 // transports/schedulers. Every runtime path belongs to this disposable root.
-const fixture = vi.hoisted(() => ({ root: `/tmp/tomo-web-startup-${process.pid}-${Math.random().toString(36).slice(2)}`,
-  enabled: true, constructionFails: false, registered: [] as Channel[], messages: [] as string[] }));
+const fixture = await vi.hoisted(async () => {
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  return { root: join(tmpdir(), `tomo-web-startup-${process.pid}-${Math.random().toString(36).slice(2)}`),
+    enabled: true, constructionFails: false, registered: [] as Channel[], messages: [] as string[] };
+});
 const assertChannels = vi.hoisted(() => vi.fn());
 vi.mock("../src/runtime-paths.js", () => ({ defaultRuntimePaths: {
   tomoHome: fixture.root, pidFile: `${fixture.root}/tomo.pid`, watchSocketPath: `${fixture.root}/watch.sock`,

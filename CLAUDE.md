@@ -250,7 +250,7 @@ Custom context management that operates on the SDK's JSONL session files directl
 
 Any code path that rewrites a JSONL file it just read must call `parseJsonl(text, { preserveUnparseable: true })` and write records back with `serializeJsonlRecord` — the default tolerance drops malformed lines, which is fine for a reader and permanent data loss for a rewriter. Opting in widens the element type to `(T | RawJsonlLine)` (see the exported `SdkEntry`), so the compiler forces you to narrow with `isRawJsonlLine` before touching any field. Call `reportRawJsonlLines` after parsing so preserved corruption is visible in the logs. Read-only consumers keep the default.
 
-The harness emits context nudges at `lcm.nudgeAtPct` usage (default 70%, `src/config.ts`), escalating prune → daily rollup → full compact at 80% (decision logic in `src/agent/context-nudge.ts`).
+The harness emits context nudges at `lcm.nudgeAtPct` usage (default 70%, `src/config.ts`), escalating prune → daily rollup → full compact at 80% (decision logic in `src/agent/context-nudge.ts`). A compact reloads the session, so the rollup gate defers it while any background task runs (`src/agent/compact-reservations.ts`); to keep a stream of new subagents from deferring it forever, at `lcm.blockSpawnAtPct` (default 80) the PreToolUse background-launch hook refuses a NEW background Agent/Task launch (`src/agent/spawn-gate.ts`). It reads the nudger's own number (the live session's `lastResult`, an estimated reading counts as unknown) live per call, so it lifts once usage drops; SendMessage, foreground subagents, `task_spawn` and the lcm commands are never gated.
 
 ### Localization (i18n)
 

@@ -7,7 +7,7 @@ vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/agent-mocks.js")).sdkModuleMock());
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
-import { Agent, MockChannel, agentEnv, installAgentTestHooks, mockSdk, resetConfig, sdkMock } from "./helpers/agent-harness.js";
+import { Agent, MockChannel, installAgentTestHooks, mockSdk, resetConfig, sdkMock } from "./helpers/agent-harness.js";
 import { TodoStore, todosDir } from "../src/todos/store.js";
 import { parseTodoArgs, todoUsage } from "../src/agent/todo-command.js";
 import { CHAT_COMMAND_NAMES } from "../src/channels/chat-commands.js";
@@ -161,7 +161,6 @@ describe("/todo chat command", () => {
     await tg.simulateCommand("todo", OWNER_ID, "Shuai", "add x", OWNER_ID);
     for (const sent of tg.sent) expect(sent.text).toMatch(/^Todos are unavailable: todo store could not be read/);
     expect(readFileSync(join(todosDir(), "todos.json"), "utf-8")).toBe("{ broken");
-    expect(agentEnv.tmpDir).toBeTruthy();
     await agent.stop();
   });
 });

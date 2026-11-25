@@ -177,6 +177,22 @@ export function uploadImage(file: Blob, targetId: string, bootstrap: WebBootstra
   });
 }
 
+/**
+ * A staged upload this tab still holds after a reload (see use-attachments):
+ * an image's bytes for its thumbnail, or a file's size. Undefined when it is
+ * no longer there (sent, discarded, expired); throws on any other failure.
+ */
+export async function readStagedUpload(uploadId: string): Promise<{ kind: "image"; blob: Blob } | { kind: "file"; size: number } | undefined> {
+  const response = await fetch(`/api/v1/uploads/${uploadId}`, { credentials: "same-origin", headers: { "x-tomo-request": "1" } });
+  if (response.status === 404) return undefined;
+  if (!response.ok) throw new ApiError(response.status, "unavailable");
+  if ((response.headers.get("content-type") ?? "").startsWith("application/json")) {
+    const value = await response.json() as { kind?: string; size?: unknown };
+    return value.kind === "file" && typeof value.size === "number" ? { kind: "file", size: value.size } : undefined;
+  }
+  return { kind: "image", blob: await response.blob() };
+}
+
 /** Drop an upload the owner removed before sending (best effort: unsent uploads also expire). */
 export function discardUpload(uploadId: string, bootstrap: WebBootstrap): void {
   void api(`/uploads/${uploadId}`, { method: "DELETE", headers: { "content-type": "application/json", "x-tomo-csrf": bootstrap.csrfToken, "x-tomo-epoch": bootstrap.epoch }, body: "{}" }).catch(() => {});

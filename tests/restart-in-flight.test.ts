@@ -149,18 +149,10 @@ describe("a restart already in flight drains the requests it supersedes", () => 
   });
 });
 
+// The sweep itself (a foreign daemon's request is removed) is
+// restart-request.test.ts "sweeps a previous daemon's request for a session
+// that is not even ours to restart"; this is the Agent-level other half.
 describe("a previous daemon's requests never reach a turn end", () => {
-  it("sweeps a foreign daemon's request for a session this daemon would not even restart", () => {
-    // The cross-restart leak: filed by a daemon that is gone, it would be
-    // claimed at some later turn end and restart with a stale foreign reason.
-    // The startup sweep is what removes it — asserted here in the shape the
-    // Agent depends on, since the Agent has no other guard against it.
-    createRestartRequest({ sessionKey: "telegram:123", daemonPid: DAEMON + 1, reason: "stale" }, REQUEST_DIR);
-
-    expect(sweepStaleRestartRequests(REQUEST_DIR, Date.now(), undefined, DAEMON)).toBe(1);
-    expect(pending()).toEqual([]);
-  });
-
   it("leaves this daemon's own pending request for the turn end to claim", () => {
     file("dm:shuai", "mine");
 

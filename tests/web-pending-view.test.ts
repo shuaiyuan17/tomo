@@ -46,6 +46,11 @@ describe("pending owner bubbles (#381)", () => {
     expect(pendingLabel(request("i", { state: "interrupted" }))).toMatch(/Interrupted by a restart/);
     expect(pendingLabel(request("u", { state: "unknown" }))).toMatch(/may have run/);
   });
+
+  it("a pending reaction is a pending message (it has no text)", () => {
+    const pending: WebRequest = { requestId: "p", state: "queued", sessionId: "s", text: "", reply: { text: "x", reaction: "like" } };
+    expect(pendingUserMessages([pending], { messages: [], nextCursor: null }, "s")).toHaveLength(1);
+  });
 });
 
 describe("request list bounds", () => {

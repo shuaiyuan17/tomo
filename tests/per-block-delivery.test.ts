@@ -527,8 +527,10 @@ describe("NO_REPLY is enforced per block", () => {
 });
 
 /**
- * A `thinking` block that HAS TEXT IN IT, with showThinking off, is a
- * misplaced message — and is delivered as one.
+ * A `thinking` block that HAS TEXT IN IT, with showThinking off, is DROPPED
+ * (with a warn giving its length), never delivered: `shipBlock` drops it
+ * before the NO_REPLY rule, a suppressed turn's policy or the marker guard
+ * ever look at it (src/agent/live-session.ts).
  *
  * WHY, EMPIRICALLY. showThinking off starts the SDK with thinking
  * `display: "omitted"`, which strips the reasoning and leaves a
@@ -541,12 +543,18 @@ describe("NO_REPLY is enforced per block", () => {
  * waiting for and never received. None was reasoning that leaked past
  * `omitted`.
  *
- * The rule that follows is still TYPE + LENGTH ONLY, never content. Nothing
- * below reads the prose to judge whether it is "really" a reply — that is the
- * inspection #292 exists to prevent. Empty (or whitespace-only) thinking is
- * dropped exactly as before; non-empty thinking with the flag off renders
- * exactly like a `text` block, with NO 💭 marker, because it is not being
- * shown as reasoning: it IS the message.
+ * HISTORY. Between 2026-08-28 and 2026-09-09 such a block was rendered like
+ * a `text` block. It is dropped again because under `omitted` the text that
+ * arrives is a summary of the block, not the block: delivered as a reply it is
+ * words the model did not write. What is left of that episode is the
+ * PostToolBatch nudge (`takeUndeliveredReply`, below), so a reply the model
+ * put in a thinking block is said again as text.
+ *
+ * The rule is TYPE + LENGTH ONLY, never content. Nothing below reads the
+ * prose to judge whether it is "really" a reply — that is the inspection #292
+ * exists to prevent. Empty (or whitespace-only) thinking is dropped silently;
+ * non-empty thinking is dropped with a warn. With the flag ON a thinking
+ * block ships as its own 💭-marked message.
  */
 describe("thinking blocks", () => {
   it("remembers a dropped reply until a text block ships, for the PostToolBatch nudge", async () => {
@@ -636,39 +644,38 @@ describe("thinking blocks", () => {
     expect(log.warn).not.toHaveBeenCalled();
   });
 
-  it("drops a non-empty thinking block whose trailing line is bare NO_REPLY", async () => {
+  // The drop runs before every other per-block rule. Each row is a block that
+  // some later rule would also have handled (a trailing NO_REPLY, a turn that
+  // may not speak, a fabricated inbound marker); it must still be the drop,
+  // with its warn, that decides.
+  it.each([
+    { label: "whose trailing line is bare NO_REPLY", thinking: "housekeeping done\nNO_REPLY", suppress: false },
+    { label: "on a suppressed turn", thinking: "checking the morning routine…", suppress: true },
+    { label: "that fabricates an inbound marker", thinking: `${formatInboundStamp("imessage")} what about tomorrow?`, suppress: false },
+  ])("drops a non-empty thinking block $label before any other rule sees it", async ({ thinking, suppress }) => {
     const r = rig({ showThinking: false });
 
-    // The per-block rules apply to it exactly as they apply to a text block —
-    // rendering it as text means ALL of the text path, not just the send.
-    await r.run([
-      assistant([thinkingBlock("housekeeping done\nNO_REPLY")]),
-      assistant([textBlock("B")]),
-      result(),
-    ]);
-
-    expect(r.channel.sent.map((m) => m.text)).toEqual(["B"]);
-  });
-
-  it("ships nothing from a non-empty thinking block on a suppressed turn", async () => {
-    const r = rig({ showThinking: false });
-
-    // suppressDelivery is a policy about the TURN; rendering a thinking block
-    // as text changes what a block would say, not whether this turn may speak.
     await r.run(
-      [assistant([thinkingBlock("checking the morning routine…")]), result()],
-      {
-        delivery: {
-          kind: "deferred-send",
-          suppressDelivery: true,
-          resolveTarget: () => ({ channel: r.channel, chatId: "chat1" }),
-        },
-        transcript: "on-delivery",
-      },
+      [assistant([thinkingBlock(thinking)]), result()],
+      suppress
+        ? {
+          delivery: {
+            kind: "deferred-send",
+            suppressDelivery: true,
+            resolveTarget: () => ({ channel: r.channel, chatId: "chat1" }),
+          },
+          transcript: "on-delivery",
+        }
+        : undefined,
     );
 
     expect(r.channel.sent).toEqual([]);
-    expect(r.transcript).toEqual([]);
+    // The suppressed turn's on-delivery transcript records nothing either.
+    if (suppress) expect(r.transcript).toEqual([]);
+    expect(log.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ chars: thinking.length }),
+      expect.stringContaining("non-empty thinking block dropped"),
+    );
   });
 
   it("ships a thinking block as its own marked message before the text that follows", async () => {
@@ -779,9 +786,11 @@ describe("the reply target is spent by the first block that ships", () => {
  * instead of taking a forensics pass. Then, once a day of transcript showed
  * that a NON-EMPTY thinking block under `display: "omitted"` is always a
  * misplaced message and never leaked reasoning (173 empty vs 21 non-empty, all
- * 21 messages), DELIVERY: such a block is now rendered exactly like a `text`
- * block. See the "thinking blocks" describe above. The rule is still decided
- * from the block's type and length alone — its prose is never inspected.
+ * 21 messages), DELIVERY: such a block was rendered like a `text` block, until
+ * 2026-09-09, when it went back to being dropped (what arrives under
+ * `omitted` is a summary, not the block). See the "thinking blocks" describe
+ * above. The rule is decided from the block's type and length alone — its
+ * prose is never inspected.
  *
  * THE TESTS BELOW ARE A GUARD, NOT AN EXPLANATION. They pin that a turn's
  * blocks belong to that turn alone — cross-turn contamination was the leading
@@ -791,6 +800,10 @@ describe("the reply target is spent by the first block that ships", () => {
  * consume). Keeping them costs little and forecloses a real failure mode; they
  * are simply not the account of what went wrong that day.
  */
+/** A short window in which a send that wrongly claimed the session would have
+ *  been dispatched. Absence can only be shown by waiting; this names the wait. */
+const quietWindow = () => new Promise<void>((r) => setTimeout(r, 5));
+
 describe("a turn's blocks belong to that turn alone", () => {
   it("a NO_REPLY turn queued mid-flight cannot capture or suppress the earlier turn's blocks", async () => {
     const session = new LiveSession({} as never, "dm:owner", undefined, undefined, {});
@@ -803,17 +816,16 @@ describe("a turn's blocks belong to that turn alone", () => {
       const turnA = session.send("A?", undefined, undefined, async (b) => { toA.push(b); });
       while (harness.inputs.length === 0) await new Promise((r) => setTimeout(r, 1));
       harness.enqueue([assistant([textBlock("A1")]), assistant([toolUseBlock("codex", "t1")])]);
-      await new Promise((r) => setTimeout(r, 5));
 
       // A1 is already on the owner's phone — DURING the turn, with the tool
       // still outstanding. #292 would still have it buffered here.
-      expect(toA).toEqual(["A1"]);
+      await vi.waitFor(() => expect(toA).toEqual(["A1"]));
 
       // The heartbeat turn is dispatched now, while A is still in flight. It
       // must not be able to touch A: send() waits for genuine idleness, so B
       // does not become the session's current request until A has resolved.
       const turnB = session.send("heartbeat", undefined, undefined, async (b) => { toB.push(b); });
-      await new Promise((r) => setTimeout(r, 5));
+      await quietWindow();
       expect(harness.inputs).toHaveLength(1); // B has NOT been dispatched
 
       // The tool returns, A finishes.
@@ -851,27 +863,25 @@ describe("a turn's blocks belong to that turn alone", () => {
       // text at all — just a root tool_use. This is the common shape: the model
       // reads a file or calls an MCP tool before it says anything.
       harness.enqueue([assistant([toolUseBlock("Bash", "t1")])]);
-      await new Promise((r) => setTimeout(r, 5));
 
       // The turn is in flight, and the session says so. Claiming only on
       // text/thinking left isBusy() false right here, which is the whole bug.
-      expect(session.isBusy()).toBe(true);
+      await vi.waitFor(() => expect(session.isBusy()).toBe(true));
 
       // A heartbeat/cron/user send arrives mid-tool. It must QUEUE, not claim:
       // claiming would take currentRequest and clear `parts` out from under the
       // unowned turn, and the unowned turn's later text would then ship through
       // B's sink — to B's target, in B's turn.
       const turnB = session.send("heartbeat", undefined, undefined, async (b) => { toB.push(b); });
-      await new Promise((r) => setTimeout(r, 5));
+      await quietWindow();
       expect(harness.inputs).toHaveLength(0); // B has NOT been dispatched
 
       // The tool returns and the unowned turn finally speaks.
       harness.enqueue([toolResult("t1"), assistant([textBlock("autonomous answer")]), result()]);
-      await new Promise((r) => setTimeout(r, 5));
 
       // Delivered to the session's DEFAULT target, through the unowned turn's
       // own sink — not into B's.
-      expect(unowned).toEqual(["autonomous answer"]);
+      await vi.waitFor(() => expect(unowned).toEqual(["autonomous answer"]));
       expect(toB).toEqual([]);
 
       // Only now does B run, and it gets its own reply and nothing else.
@@ -895,7 +905,7 @@ describe("a turn's blocks belong to that turn alone", () => {
       // second silently replacing the first's request and clearing its parts.
       const first = session.send("first");
       const second = session.send("second");
-      await new Promise((r) => setTimeout(r, 5));
+      await quietWindow();
 
       expect(harness.inputs).toEqual(["first"]);
 
@@ -910,7 +920,7 @@ describe("a turn's blocks belong to that turn alone", () => {
     }
   });
 
-  it("delivers, and warns about, an unowned turn that opens with a non-empty thinking block", async () => {
+  it("drops, and warns about, an unowned turn that opens with a non-empty thinking block", async () => {
     const unowned: string[] = [];
     const session = new LiveSession(
       {} as never,
@@ -929,15 +939,14 @@ describe("a turn's blocks belong to that turn alone", () => {
       // the text that arrives is a summary of the block rather than the block
       // (see the live-session header). Nothing reaches the default target.
       harness.enqueue([assistant([thinkingBlock("x".repeat(700))]), assistant([toolUseBlock("Bash", "t1")])]);
-      await new Promise((r) => setTimeout(r, 5));
 
-      expect(unowned).toEqual([]);
       // The claim-time warn from #293 stays: this shape is worth seeing in the
       // log whatever we now do with it.
-      expect(log.warn).toHaveBeenCalledWith(
+      await vi.waitFor(() => expect(log.warn).toHaveBeenCalledWith(
         expect.objectContaining({ session: "dm:owner", chars: 700 }),
         expect.stringContaining("thinking block"),
-      );
+      ));
+      expect(unowned).toEqual([]);
     } finally {
       session.close();
     }
@@ -959,11 +968,10 @@ describe("a turn's blocks belong to that turn alone", () => {
     try {
       // No send() in flight: this turn was initiated by the SDK itself.
       harness.enqueue([assistant([textBlock("orphan narration")]), result()]);
-      await new Promise((r) => setTimeout(r, 10));
 
       // Delivered, not dropped. Losing it silently is the failure mode the
       // 2026-08-28 repro is suspected of.
-      expect(unowned).toEqual(["orphan narration"]);
+      await vi.waitFor(() => expect(unowned).toEqual(["orphan narration"]));
     } finally {
       session.close();
     }
@@ -975,14 +983,13 @@ describe("a turn's blocks belong to that turn alone", () => {
 
     try {
       harness.enqueue([assistant([textBlock("orphan narration")]), result()]);
-      await new Promise((r) => setTimeout(r, 10));
 
       // A block the model wrote reached nobody. That is never an info-level
       // event, however routine the cause.
-      expect(log.error).toHaveBeenCalledWith(
+      await vi.waitFor(() => expect(log.error).toHaveBeenCalledWith(
         expect.objectContaining({ session: "dm:owner" }),
         expect.stringContaining("DROPPING the content block"),
-      );
+      ));
     } finally {
       session.close();
     }
@@ -1322,35 +1329,24 @@ describe("continuity-shaped turns ship nothing of their own (option A)", () => {
     transcript: "on-delivery",
   });
 
-  it("drops the narration block of a text -> tool -> NO_REPLY heartbeat", async () => {
+  // Under the old contract a heartbeat's narration was already gone by the
+  // time the NO_REPLY meant to silence it was written; now it never ships.
+  // And suppression is not a judgement about the content, it is a property of
+  // the turn: a heartbeat with real news must route it through send_message.
+  it.each([
+    ["the narration block of a text -> tool -> NO_REPLY heartbeat", [
+      assistant([textBlock("Checking in on the morning routine…")]),
+      assistant([toolUseBlock("Bash", "t1")]),
+      toolResult("t1"),
+      assistant([textBlock("NO_REPLY")]),
+    ]],
+    ["even a heartbeat that says something genuinely useful", [
+      assistant([textBlock("Your flight check-in opens in an hour.")]),
+    ]],
+  ])("drops %s", async (_label, events) => {
     const r = rig();
 
-    await r.run(
-      [
-        assistant([textBlock("Checking in on the morning routine…")]),
-        assistant([toolUseBlock("Bash", "t1")]),
-        toolResult("t1"),
-        assistant([textBlock("NO_REPLY")]),
-        result(),
-      ],
-      continuityDelivery(r),
-    );
-
-    // Under the old contract the narration was already gone by the time the
-    // NO_REPLY that was meant to silence it was written. Now it never ships.
-    expect(r.channel.sent).toEqual([]);
-    expect(r.transcript).toEqual([]);
-  });
-
-  it("drops even a heartbeat that says something genuinely useful", async () => {
-    const r = rig();
-
-    // Suppression is not a judgement about the content — it is a property of
-    // the turn. A heartbeat with real news must route it through send_message.
-    await r.run(
-      [assistant([textBlock("Your flight check-in opens in an hour.")]), result()],
-      continuityDelivery(r),
-    );
+    await r.run([...events, result()], continuityDelivery(r));
 
     expect(r.channel.sent).toEqual([]);
     expect(r.transcript).toEqual([]);
@@ -1507,29 +1503,6 @@ describe("a block that fabricates an inbound marker is MARKED, not truncated", (
     expect(r.transcript).toEqual([body]);
   });
 
-  it("logs a warning naming the session and the offending line, truncated, in DETECTION terms", async () => {
-    const r = rig();
-    const stamp = formatInboundStamp("telegram");
-
-    await r.run([assistant([textBlock(`ok\n${stamp} ${"y".repeat(400)}`)]), result()]);
-
-    const warns = vi.mocked(log.warn).mock.calls.filter(
-      ([, msg]) => typeof msg === "string" && msg.includes("Fabricated inbound marker"),
-    );
-    expect(warns).toHaveLength(1);
-    // The guard fires on the model's output, which is strictly earlier than
-    // "the owner received it" — a block can still be dropped for want of a
-    // sink, refused as silent/error text, or thrown away by a suppressed turn.
-    // The line must not claim a delivery it cannot know about.
-    expect(warns[0]![1]).toContain("detected");
-    expect(warns[0]![1]).not.toContain("delivered");
-    const fields = warns[0]![0] as Record<string, unknown>;
-    expect(fields.session).toBe("test:session");
-    expect(fields.shape).toBe("stamp");
-    expect(String(fields.marker).startsWith(stamp)).toBe(true);
-    expect(String(fields.marker).endsWith("\u2026")).toBe(true);
-  });
-
   it("counts one bus event per offending line, so the stats surface can total them", async () => {
     const r = rig();
     const body = [
@@ -1541,8 +1514,14 @@ describe("a block that fabricates an inbound marker is MARKED, not truncated", (
 
     await r.run([assistant([textBlock(body)]), result()]);
 
-    expect(events.filter((e) => e.type === "fabricated-marker").map((e) => e.shape))
-      .toEqual(["stamp", "legacy-system"]);
+    // Each event and its warning name the session LiveSession is running,
+    // not one the recorder was handed somewhere else.
+    expect(events.filter((e) => e.type === "fabricated-marker").map((e) => [e.shape, e.sessionKey]))
+      .toEqual([["stamp", "test:session"], ["legacy-system", "test:session"]]);
+    const warns = vi.mocked(log.warn).mock.calls.filter(
+      ([, msg]) => typeof msg === "string" && msg.includes("Fabricated inbound marker"),
+    );
+    expect(warns.map(([fields]) => (fields as Record<string, unknown>).session)).toEqual(["test:session", "test:session"]);
   });
 
   it("marks each offending block independently and leaves clean blocks alone", async () => {
@@ -1563,29 +1542,4 @@ describe("a block that fabricates an inbound marker is MARKED, not truncated", (
     expect(events.filter((e) => e.type === "fabricated-marker")).toHaveLength(1);
   });
 
-  it("leaves an ordinary reply completely untouched — no advisory, no warning, no count", async () => {
-    const r = rig();
-
-    await r.run([assistant([textBlock("Dinner at 7 works. See you then!")]), result()]);
-
-    expect(r.channel.sent.map((m) => m.text)).toEqual(["Dinner at 7 works. See you then!"]);
-    expect(events.filter((e) => e.type === "fabricated-marker")).toEqual([]);
-    expect(log.warn).not.toHaveBeenCalled();
-  });
-
-  it("never reaches the guard for a thinking block with showThinking off — the block is dropped first", async () => {
-    const r = rig({ showThinking: false });
-    const body = `${formatInboundStamp("imessage")} what about tomorrow?`;
-
-    await r.run([assistant([thinkingBlock(body)]), result()]);
-
-    // Nothing ships, marked or otherwise: a non-empty thinking block under
-    // `omitted` is dropped before delivery, so the marker guard has no outlet
-    // to protect here. The drop is the warn.
-    expect(r.channel.sent).toEqual([]);
-    expect(log.warn).toHaveBeenCalledWith(
-      expect.objectContaining({ chars: body.length }),
-      expect.stringContaining("non-empty thinking block dropped"),
-    );
-  });
 });

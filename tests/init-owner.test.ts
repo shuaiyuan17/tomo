@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -11,42 +11,10 @@ import {
   mergeInitConfig,
   precreateOwnerSessionUnlessAdoptable,
   runChannelSetup,
-  type InitPromptPort,
 } from "../src/cli/init-setup.js";
 import { SessionStore } from "../src/sessions/store.js";
 import { resolveOwner } from "../src/owner.js";
-
-const CANCEL = Symbol("cancel");
-
-function scripted(answers: {
-  multiselect?: Array<string[] | symbol>;
-  password?: Array<string | symbol>;
-  text?: Array<string | symbol>;
-  confirm?: Array<boolean | symbol>;
-}) {
-  const logs: string[] = [];
-  const q = {
-    multiselect: [...(answers.multiselect ?? [])],
-    password: [...(answers.password ?? [])],
-    text: [...(answers.text ?? [])],
-    confirm: [...(answers.confirm ?? [])],
-  };
-  const next = <T>(kind: keyof typeof q, message: string): T => {
-    if (q[kind].length === 0) throw new Error(`unexpected ${kind}: ${message}`);
-    return q[kind].shift() as T;
-  };
-  const port: InitPromptPort = {
-    multiselect: async ({ message }) => next("multiselect", message),
-    password: async ({ message }) => next("password", message),
-    text: async ({ message }) => next("text", message),
-    confirm: async ({ message }) => next("confirm", message),
-    select: async () => { throw new Error("unexpected select"); },
-    isCancel: (v: unknown): v is symbol => v === CANCEL,
-    note: (m) => { logs.push(`note: ${m}`); },
-    log: { info: (m) => { logs.push(`info: ${m}`); }, warn: (m) => { logs.push(`warn: ${m}`); }, success: (m) => { logs.push(`success: ${m}`); } },
-  };
-  return { port, logs, q };
-}
+import { CANCEL, scriptedPrompts as scripted } from "./helpers/scripted-prompts.js";
 
 const TOKEN = "123456:ABC-test-token";
 
@@ -141,34 +109,26 @@ describe("checkClaudeRuntime (no separately installed `claude` needed)", () => {
 });
 
 describe("precreateOwnerSessionUnlessAdoptable", () => {
-  function dirs() {
+  let d: { dir: string; sessions: string; sdk: string };
+  beforeEach(() => {
     const dir = mkdtempSync(join(tmpdir(), "tomo-init-owner-"));
-    return { dir, sessions: join(dir, "sessions"), sdk: join(dir, "sdk") };
-  }
+    d = { dir, sessions: join(dir, "sessions"), sdk: join(dir, "sdk") };
+  });
+  afterEach(() => rmSync(d.dir, { recursive: true, force: true }));
   const owner = { name: "alex", telegram: ["123456789"], imessage: [] as string[] };
 
   it("creates the owner's dm: entry once, with no SDK session yet", () => {
-    const d = dirs();
-    try {
-      expect(precreateOwnerSessionUnlessAdoptable(owner, d.sessions, d.sdk)).toBe("created");
-      expect(precreateOwnerSessionUnlessAdoptable(owner, d.sessions, d.sdk)).toBe("exists");
-      const store = new SessionStore(d.sessions, 20, d.sdk);
-      expect(store.listAllSessions().map((e) => [e.channelKey, e.sdkSessionId])).toEqual([["dm:alex", ""]]);
-    } finally {
-      rmSync(d.dir, { recursive: true, force: true });
-    }
+    expect(precreateOwnerSessionUnlessAdoptable(owner, d.sessions, d.sdk)).toBe("created");
+    expect(precreateOwnerSessionUnlessAdoptable(owner, d.sessions, d.sdk)).toBe("exists");
+    const store = new SessionStore(d.sessions, 20, d.sdk);
+    expect(store.listAllSessions().map((e) => [e.channelKey, e.sdkSessionId])).toEqual([["dm:alex", ""]]);
   });
 
   it("does NOT pre-create when the owner has a legacy per-channel session with history (it would block the adoption)", () => {
-    const d = dirs();
-    try {
-      const store = new SessionStore(d.sessions, 20, d.sdk);
-      store.setSdkSessionId("telegram:123456789", "sdk-legacy");
-      expect(precreateOwnerSessionUnlessAdoptable(owner, d.sessions, d.sdk)).toBe("deferred-to-adoption");
-      expect(new SessionStore(d.sessions, 20, d.sdk).getEntry("dm:alex")).toBeUndefined();
-    } finally {
-      rmSync(d.dir, { recursive: true, force: true });
-    }
+    const store = new SessionStore(d.sessions, 20, d.sdk);
+    store.setSdkSessionId("telegram:123456789", "sdk-legacy");
+    expect(precreateOwnerSessionUnlessAdoptable(owner, d.sessions, d.sdk)).toBe("deferred-to-adoption");
+    expect(new SessionStore(d.sessions, 20, d.sdk).getEntry("dm:alex")).toBeUndefined();
   });
 });
 
@@ -230,7 +190,9 @@ describe("tomo init --force merges onto the existing config", () => {
     const { config: fresh } = buildInitConfig({ userName: "Alex", channels: ["telegram"], telegramToken: TOKEN, telegramUserId: "1", model: "m" });
     expect(mergeInitConfig(undefined, fresh, ["telegram"]).config).toEqual(fresh);
   });
+});
 
+describe("decideOwnerName", () => {
   it("keeps the existing owner name unless the user explicitly picks the new one", async () => {
     const pick = (answer: string | symbol) => ({
       ...scripted({}).port,
@@ -243,7 +205,9 @@ describe("tomo init --force merges onto the existing config", () => {
     expect(await decideOwnerName(scripted({}).port, "Alex", "alex")).toBe("Alex");
     expect(await decideOwnerName(scripted({}).port, undefined, "sam")).toBe("sam");
   });
+});
 
+describe("API key from the environment", () => {
   it("offers to save an API key that is only in the environment (launchd won't see it)", () => {
     const apiKeyRuntime = { kind: "ok", version: "v", auth: "api-key" } as const;
     expect(envApiKeyNeedingSave(apiKeyRuntime, { ANTHROPIC_API_KEY: " sk-env " }, undefined)).toBe("sk-env");

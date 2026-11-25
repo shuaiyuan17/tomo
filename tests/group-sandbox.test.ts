@@ -39,6 +39,11 @@ const fx = await vi.hoisted(async () => {
   };
 });
 
+// `existsSync` answers from `sandboxPresence` first, so the tests that only read
+// the profile TEXT (never run it) can pretend sandbox-exec is installed and run
+// on Linux too (tests/helpers/sandbox-exec.ts). Otherwise the real module.
+vi.mock("node:fs", async (importOriginal) =>
+  (await import("./helpers/sandbox-exec.js")).fsWithSandboxPresence(await importOriginal()));
 vi.mock("../src/config.js", () => ({
   config: { workspaceDir: fx.ws, tomoHome: fx.tomoHome, sessionsDir: join(fx.tomoHome, "data", "sessions") },
 }));
@@ -55,6 +60,7 @@ vi.mock("../src/logger.js", () => ({
 const { groupPathPolicy, groupPathDenial, effectiveGroupSandbox, isValidExtraPath, reachesTomoHome } = await import("../src/agent/group-fs-policy.js");
 const { sandboxedBashCommand, sandboxProfileText, SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH, SANDBOX_MACH_DENY, resolvedDenyDir, shellSingleQuote } = await import("../src/agent/bash-sandbox.js");
 const { privateMemoryGuardHooks, attachmentBarredFor } = await import("../src/agent/private-memory-guard.js");
+const { loadedSettingsFiles } = await import("../src/agent/setting-sources.js");
 const { DeliveryPipeline } = await import("../src/agent/delivery-pipeline.js");
 
 const CONFIG = join(fx.tomoHome, "config.json");
@@ -181,7 +187,8 @@ describe("file-tool allows compare exactly; denies fold case", () => {
 // The kernel
 // ---------------------------------------------------------------------------
 
-const sandboxRuns = process.platform === "darwin" && existsSync(SANDBOX_EXEC_PATH) && existsSync(SANDBOX_SHELL_PATH);
+const { sandboxPresence, sandboxRunsHere } = await import("./helpers/sandbox-exec.js");
+const sandboxRuns = sandboxRunsHere(SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH);
 
 function runWrapped(wrapped: string): { code: number; out: string } {
   // HOME is the fixture's, so git and zsh look for their start-up files where
@@ -488,6 +495,65 @@ describe("an unsandboxed group behaves as before", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// A foreign PreToolUse hook, judged through the guard
+//
+// The CLI keeps the LAST `updatedInput` any PreToolUse hook returns, and hooks
+// from the workspace's settings and from plugins reach it through the CLI's own
+// merge. A hook that echoes `tool_input` back would restore the unsandboxed
+// command, so the guard withholds the shell when any is present. bash-sandbox's
+// own tests pass the scan in by hand; these check the guard builds it from the
+// files the query really loads (`loadedSettingsFiles`) and from `pluginDirs`.
+// Presence is pretended so this runs on Linux too; nothing here executes.
+// ---------------------------------------------------------------------------
+
+describe("a foreign PreToolUse hook, judged through the guard", () => {
+  const SETTINGS = join(fx.ws, ".claude", "settings.json");
+  const foreignHook = JSON.stringify({
+    hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "cat" }] }] },
+  });
+  const guardWith = (pluginDirs: readonly string[]): Hook =>
+    (privateMemoryGuardHooks(GROUP, () => "group-session", () => pluginDirs, () => ({ groups: {} })) as unknown as
+      { PreToolUse: Array<{ hooks: Hook[] }> }).PreToolUse[0].hooks[0];
+  const bash = (h: Hook) => h({ tool_name: "Bash", tool_input: { command: "ls" } });
+
+  beforeAll(() => sandboxPresence.pretend(SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH));
+  afterAll(() => {
+    sandboxPresence.reset();
+    rmSync(join(fx.ws, ".claude"), { recursive: true, force: true });
+  });
+
+  it("scans exactly the settings file the query loads", () => {
+    expect(loadedSettingsFiles(fx.ws)).toEqual([SETTINGS]);
+  });
+
+  it("withholds the shell when the workspace settings carry one, and wraps once it is gone", async () => {
+    // Control first: with no hook, the same call is rewritten.
+    expect((await bash(guardWith([]))).hookSpecificOutput?.updatedInput?.command).toContain(SANDBOX_EXEC_PATH);
+
+    write(SETTINGS, foreignHook);
+    // A guard built BEFORE the file appeared still sees it: the scan runs per call.
+    const r = await bash(guardWith([]));
+    expect(denied(r)).toBe(true);
+    expect(r.hookSpecificOutput?.updatedInput).toBeUndefined();
+
+    rmSync(SETTINGS);
+    expect(denied(await bash(guardWith([])))).toBe(false);
+  });
+
+  it("withholds the shell when a mounted plugin ships hooks", async () => {
+    const plugin = join(fx.root, "plugin-with-hooks");
+    mkdirSync(join(plugin, "hooks"), { recursive: true });
+    const plain = join(fx.root, "plugin-without-hooks");
+    mkdirSync(plain, { recursive: true });
+
+    expect(denied(await bash(guardWith([plain])))).toBe(false);
+    const r = await bash(guardWith([plain, plugin]));
+    expect(denied(r)).toBe(true);
+    expect(r.hookSpecificOutput?.updatedInput).toBeUndefined();
+  });
+});
+
 describe.runIf(sandboxRuns)("group Bash through the guard, executed", () => {
   async function exec(command: string, entry?: { extraRead?: string[] }) {
     const r = await hook(entry)({ tool_name: "Bash", tool_input: { command } });
@@ -701,7 +767,18 @@ describe("a protected entry in Tomo's home that is a symlink", () => {
     });
     expect(p.unresolvable).toContain("web-token");
     expect(groupPathDenial("Read", { file_path: join(dangling, "workspace", "a.md") }, join(dangling, "workspace"), p)).toMatch(/cannot be established/);
-    expect(sandboxedBashCommand("ls", p)).toBeNull();
+    // Past the presence check on every host, so it is the policy's own
+    // `unresolvable` that withholds the shell, not a missing sandbox-exec.
+    sandboxPresence.pretend(SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH);
+    try {
+      expect(sandboxedBashCommand("ls", p)).toBeNull();
+      expect(sandboxedBashCommand("ls", groupPathPolicy({
+        workspaceDir: fx.ws, privateDir: join(fx.ws, "memory", "private"), homeSceneDir: join(fx.ws, "home"),
+        tomoHome: fx.tomoHome, dataDirs: [], userHome: fx.userHome,
+      }))).not.toBeNull(); // control: a resolvable policy wraps
+    } finally {
+      sandboxPresence.reset();
+    }
   });
 });
 

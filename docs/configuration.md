@@ -65,6 +65,7 @@ Security-related settings (`groupSandbox`, `credentialBroker`, `agentProfiles`) 
   "lcm": {
     "nudgeAtPct": 70,
     "nudgeResetPct": 60,
+    "blockSpawnAtPct": 80,
     "groupCompactStyle": "lcm"
   },
   "todos": { "maxOpen": 30, "maxSnoozes": 3 },
@@ -274,7 +275,7 @@ State lives in `~/.tomo/data/subsessions.json` (fsynced, with a `.bak`). If it c
 
 Instead of lossy auto-compaction, long conversations are rolled up into hierarchical summary blocks (daily → weekly → monthly → yearly), so old context degrades gracefully rather than disappearing. Anything compacted out stays searchable with the `recall_conversation` tool.
 
-The `lcm` block controls the housekeeping nudges: at `nudgeAtPct` context usage (default 70%) Tomo is prompted to prune bulky tool results or run a rollup, re-arming once usage drops below `nudgeResetPct`; `groupCompactStyle` chooses hierarchical rollups (`"lcm"`, default) or SDK auto-compact (`"sdk"`) for group chats. `tomo lcm` has the manual tools ([commands.md](commands.md#cli)).
+The `lcm` block controls the housekeeping nudges: at `nudgeAtPct` context usage (default 70%) Tomo is prompted to prune bulky tool results or run a rollup, re-arming once usage drops below `nudgeResetPct`; at `blockSpawnAtPct` (default 80, never below `nudgeAtPct`; `0` or `100` turns it off) a session may not start a new background subagent until it is compacted — a compact waits for running background tasks, so a stream of new ones would hold it off indefinitely. Running agents, `SendMessage` to them and foreground subagents are unaffected, and the block lifts as soon as usage is back under the threshold; `groupCompactStyle` chooses hierarchical rollups (`"lcm"`, default) or SDK auto-compact (`"sdk"`) for group chats. `tomo lcm` has the manual tools ([commands.md](commands.md#cli)).
 
 ## Logging and observability
 

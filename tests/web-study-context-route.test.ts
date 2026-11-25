@@ -27,19 +27,17 @@ const study = (props: { session?: WebSession }) => renderToStaticMarkup(createEl
   mutator: { refresh: async () => { throw new Error("unused"); }, live: true }, ...props }));
 
 describe("the Study's Context tab", () => {
+  // What the page draws (share, tone, segments, the rows) is web-context-view.test.ts's;
+  // here only that the Study reads this conversation and draws that page.
   it("reads the selected conversation's context and draws the window meter, not a flat list of SDK rows", () => {
     requested.length = 0;
     const html = study({ session });
     expect(requested).toEqual([`/sessions/${session.id}/context`]);
     expect(html).toContain("Context window · Owner conversation");
-    expect(html).toContain(">64%<");
-    expect(html).toMatch(/role="meter"[^>]*data-tone="calm"/);
-    expect([...html.matchAll(/data-segment="(\w+)"/g)].map((m) => m[1])).toEqual(["conversation", "fixed", "reserved"]);
+    expect(html).toMatch(/role="meter"/);
     // The old page listed these as if they filled the window.
     expect(html).not.toContain("Free space");
-    expect(html).not.toContain("(deferred)");
     expect(html).toContain("Rolled-up history");
-    expect(html).toContain("184");
   });
 
   it("asks for a conversation when none is selected", () => {

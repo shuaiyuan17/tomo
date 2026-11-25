@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { WebSupervisor } from "../src/web/supervisor.js";
 import { WebChannel } from "../src/channels/web.js";
 import type { WebBootstrap } from "../src/web/protocol.js";
+import { startWebProcess } from "./helpers/web-process.js";
 
 let root: string;
 let channel: WebChannel;
@@ -120,7 +121,7 @@ it("never gives up: keeps retrying with capped backoff past the old three-failur
 
 it("forgets consecutive failures only after the child has stayed healthy", async () => {
   supervisor = new WebSupervisor(channel, options(),
-    { childPath: flakyChild(2), startupMs: 2_000, heartbeatMs: 1_000, baseBackoffMs: 20, maxBackoffMs: 80, healthyResetMs: 2_000 });
+    { childPath: flakyChild(2), startupMs: 2_000, heartbeatMs: 1_000, baseBackoffMs: 20, maxBackoffMs: 80, healthyResetMs: 500 });
   await supervisor.start();
   await expect.poll(() => supervisor.status().state, { timeout: 8_000 }).toBe("running");
   expect(supervisor.status().restarts).toBe(2);
@@ -149,14 +150,14 @@ it("reaps a process whose event loop hangs after it reports ready", async () => 
 
 it("a start() during backoff cancels the pending restart instead of racing it", async () => {
   supervisor = new WebSupervisor(channel, options(),
-    { childPath: flakyChild(1), startupMs: 2_000, heartbeatMs: 1_000, baseBackoffMs: 1_500, maxBackoffMs: 1_500 });
+    { childPath: flakyChild(1), startupMs: 2_000, heartbeatMs: 1_000, baseBackoffMs: 500, maxBackoffMs: 500 });
   await supervisor.start();
   await expect.poll(() => supervisor.status().state, { timeout: 3_000 }).toBe("backoff");
   await supervisor.start();
   await expect.poll(() => supervisor.status().state, { timeout: 3_000 }).toBe("running");
   const pid = supervisor.status().pid;
-  // Past the moment the cancelled restart would have fired.
-  await new Promise((resolve) => setTimeout(resolve, 1_800));
+  // Past the moment the cancelled restart would have fired (500 ms after the failure).
+  await new Promise((resolve) => setTimeout(resolve, 700));
   expect(supervisor.status().pid).toBe(pid);
   expect(Number(readFileSync(join(root, "starts"), "utf8"))).toBe(2);
 }, 10_000);
@@ -164,21 +165,12 @@ it("a start() during backoff cancels the pending restart instead of racing it", 
 it("an MCP reconnect while the owner's turn runs is a 409, never a reconnect under the turn", async () => {
   let outcome: "busy" | "reconnected" = "busy";
   const asked: string[] = [];
-  supervisor = new WebSupervisor(channel, { ...options(), mcpReconnect: async (server) => { asked.push(server); return outcome; } });
-  channel.attach(supervisor); await channel.start();
-  const base = `http://127.0.0.1:${supervisor.status().port}`;
-  const response = await fetch(`${base}/api/v1/bootstrap?t=${readFileSync(join(root, "web-token"), "utf8").trim()}`, { headers });
-  const bootstrap = await response.json() as WebBootstrap;
-  const cookie = response.headers.get("set-cookie")!.split(";")[0];
-  const post = () => fetch(`${base}/api/v1/mcp/reconnect`, { method: "POST",
-    headers: { ...headers, cookie, origin: base, "content-type": "application/json", "x-tomo-csrf": bootstrap.csrfToken, "x-tomo-epoch": bootstrap.epoch },
-    body: JSON.stringify({ server: "docs" }) });
-  const busy = await post();
-  expect(busy.status).toBe(409);
-  expect(await busy.json()).toEqual({ error: "session_busy" });
+  const child = await startWebProcess(channel, { ...options(), mcpReconnect: async (server) => { asked.push(server); return outcome; } });
+  supervisor = child.supervisor;
+  await child.bootstrap();
+  const post = () => child.post("/api/v1/mcp/reconnect", { server: "docs" });
+  expect(await post()).toEqual({ status: 409, body: JSON.stringify({ error: "session_busy" }) });
   outcome = "reconnected";
-  const ok = await post();
-  expect(ok.status).toBe(200);
-  expect(await ok.json()).toEqual({ outcome: "reconnected" });
+  expect(await post()).toEqual({ status: 200, body: JSON.stringify({ outcome: "reconnected" }) });
   expect(asked).toEqual(["docs", "docs"]);
 }, 12_000);

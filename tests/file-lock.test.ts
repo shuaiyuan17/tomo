@@ -1,9 +1,27 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
-import { hostname, tmpdir } from "node:os";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+
+// Lets a test make the reclaim's unlink of an abandoned owner entry fail with
+// a code that will not fix itself (EACCES on the lock directory), without
+// chmod, which root ignores.
+const failUnlink = vi.hoisted(() => ({ code: null as string | null }));
+vi.mock("node:fs", async (importOriginal) => {
+  const orig = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...orig,
+    unlinkSync: ((path: Parameters<typeof orig.unlinkSync>[0]) => {
+      if (failUnlink.code !== null && String(path).endsWith("owner.planted")) {
+        throw Object.assign(new Error(failUnlink.code), { code: failUnlink.code });
+      }
+      return orig.unlinkSync(path);
+    }) as typeof orig.unlinkSync,
+  };
+});
+
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileLockTimeoutError, isFileLockHeldSync, isPidAlive, withFileLockSync } from "../src/file-lock.js";
+import { deadPid, plantFileLock, type PlantedOwner } from "./helpers/lock-fixtures.js";
 
 let dir: string;
 let lockPath: string;
@@ -14,30 +32,19 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  failUnlink.code = null;
   rmSync(dir, { recursive: true, force: true });
 });
 
-/** A pid that is guaranteed dead: spawn a process that exits immediately. */
-function deadPid(): number {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const res = spawnSync(process.execPath, ["-e", ""]);
-    if (!res.error && typeof res.pid === "number" && res.pid > 0) return res.pid;
-  }
-  throw new Error("could not spawn a throwaway process to obtain a dead pid");
+/** Another process's lock at `lockPath` (see plantFileLock). */
+function plantLock(owner: PlantedOwner): void {
+  plantFileLock(lockPath, owner);
 }
 
-/**
- * Plant a lock exactly as another process would leave one: a directory holding
- * a single `owner.<token>` record. Same-process re-entry is deliberately free
- * (see withFileLockSync), so this is the only honest way to play a contender.
- */
-function plantLock(owner: { pid: number; ts?: number; host?: string } | null): void {
-  mkdirSync(lockPath, { recursive: true });
-  if (owner === null) return;
-  writeFileSync(
-    join(lockPath, "owner.planted"),
-    `${JSON.stringify({ pid: owner.pid, ts: owner.ts ?? Date.now(), host: owner.host ?? hostname() })}\n`,
-  );
+/** Backdate the lock DIRECTORY, which is the age a lock with no readable owner record is judged by. */
+function ageLockDir(ageMs: number): void {
+  const when = new Date(Date.now() - ageMs);
+  utimesSync(lockPath, when, when);
 }
 
 /** Everything left in the lock's directory — a leaked temp dir shows up here. */
@@ -64,27 +71,22 @@ describe("withFileLockSync", () => {
     expect(existsSync(join(dir, "a", "b"))).toBe(true);
   });
 
-  it("excludes another process holding the lock, and gives up loudly", () => {
+  it("excludes another process holding the lock, and gives up loudly, naming the holder", () => {
     plantLock({ pid: process.pid }); // a live owner: this very process
     let ran = false;
-    expect(() => withFileLockSync(lockPath, () => { ran = true; }, { timeoutMs: 60, pollMs: 5 }))
-      .toThrow(FileLockTimeoutError);
+    let thrown: unknown;
+    try {
+      withFileLockSync(lockPath, () => { ran = true; }, { timeoutMs: 60, pollMs: 5 });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(FileLockTimeoutError);
+    expect((thrown as FileLockTimeoutError).holderPid).toBe(process.pid);
+    expect((thrown as FileLockTimeoutError).path).toBe(lockPath);
     expect(ran).toBe(false);
     // The holder's lock is untouched, and no half-prepared directory is left.
     expect(readdirSync(lockPath)).toEqual(["owner.planted"]);
     expect(residue()).toEqual(["store.json.lock"]);
-  });
-
-  it("names the holder in the timeout it throws", () => {
-    plantLock({ pid: process.pid });
-    try {
-      withFileLockSync(lockPath, () => undefined, { timeoutMs: 30, pollMs: 5 });
-      expect.unreachable("should have timed out");
-    } catch (err) {
-      expect(err).toBeInstanceOf(FileLockTimeoutError);
-      expect((err as FileLockTimeoutError).holderPid).toBe(process.pid);
-      expect((err as FileLockTimeoutError).path).toBe(lockPath);
-    }
   });
 
   it("reclaims a lock whose owner is dead, however fresh it looks", () => {
@@ -108,11 +110,58 @@ describe("withFileLockSync", () => {
     expect(ran).toBe(true);
   });
 
-  it("reclaims a lock left ownerless past staleMs (a crash between mkdir and write)", () => {
-    plantLock(null);
+  it("takes over an empty lock directory at once (a crash between mkdir and write)", () => {
+    // Not a reclaim at all: `rename` onto an EMPTY directory replaces it, so
+    // the default staleMs never comes into it.
+    mkdirSync(lockPath);
     let ran = false;
-    withFileLockSync(lockPath, () => { ran = true; }, { staleMs: 0, timeoutMs: 500, pollMs: 5 });
+    withFileLockSync(lockPath, () => { ran = true; }, { timeoutMs: 500, pollMs: 5 });
     expect(ran).toBe(true);
+  });
+
+  it("does not trust a dead-looking pid from another host: waits until the lock is stale", () => {
+    // A pid from another machine means nothing here, however dead it looks.
+    const dead = deadPid();
+    plantLock({ pid: dead, host: "elsewhere.invalid" });
+    expect(() => withFileLockSync(lockPath, () => "ran", { staleMs: 30_000, timeoutMs: 60, pollMs: 5 }))
+      .toThrow(FileLockTimeoutError);
+    expect(readdirSync(lockPath)).toEqual(["owner.planted"]);
+
+    plantLock({ pid: dead, host: "elsewhere.invalid", ts: Date.now() - 60_000 });
+    expect(withFileLockSync(lockPath, () => "ran", { staleMs: 30_000, timeoutMs: 500, pollMs: 5 })).toBe("ran");
+  });
+
+  it("never reclaims a lock with two owner entries, however old: it times out", () => {
+    // Garbage this module did not write is not its to adjudicate.
+    const old = Date.now() - 60_000;
+    plantFileLock(lockPath, { pid: deadPid(), ts: old }, "owner.one");
+    plantFileLock(lockPath, { pid: deadPid(), ts: old }, "owner.two");
+    ageLockDir(60_000);
+    expect(() => withFileLockSync(lockPath, () => "ran", { staleMs: 10, timeoutMs: 60, pollMs: 5 }))
+      .toThrow(FileLockTimeoutError);
+    expect(readdirSync(lockPath).sort()).toEqual(["owner.one", "owner.two"]);
+  });
+
+  it("judges an unreadable owner record by the lock directory's age", () => {
+    mkdirSync(lockPath);
+    writeFileSync(join(lockPath, "owner.planted"), "{ not json");
+    // Fresh: nothing proves the owner gone, so it is waited on.
+    expect(() => withFileLockSync(lockPath, () => "ran", { staleMs: 30_000, timeoutMs: 60, pollMs: 5 }))
+      .toThrow(FileLockTimeoutError);
+    // Old: reclaimed.
+    ageLockDir(60_000);
+    expect(withFileLockSync(lockPath, () => "ran", { staleMs: 30_000, timeoutMs: 500, pollMs: 5 })).toBe("ran");
+  });
+
+  it("falls through to the deadline when an abandoned owner cannot be unlinked", () => {
+    // EACCES on the lock directory is not going to fix itself: no spinning on
+    // the reclaim, a plain timeout, and the lock left as found.
+    plantLock({ pid: deadPid() });
+    failUnlink.code = "EACCES";
+    expect(() => withFileLockSync(lockPath, () => "ran", { timeoutMs: 60, pollMs: 5 }))
+      .toThrow(FileLockTimeoutError);
+    expect(readdirSync(lockPath)).toEqual(["owner.planted"]);
+    expect(residue()).toEqual(["store.json.lock"]);
   });
 
   it("releases the lock when the body throws, and propagates the error", () => {
@@ -153,10 +202,8 @@ describe("withFileLockSync", () => {
 describe("neverReclaimLiveOwner (opt-in)", () => {
   const old = () => Date.now() - 60_000;
 
-  it("by default a live owner past staleMs still loses the lock (behaviour unchanged)", () => {
-    plantLock({ pid: process.pid, ts: old() });
-    expect(withFileLockSync(lockPath, () => "ran", { staleMs: 10, timeoutMs: 200 })).toBe("ran");
-  });
+  // Without the option, a live owner past staleMs loses the lock: "reclaims a
+  // lock older than staleMs even when its pid is alive" above.
 
   it("with it set, a live holder past staleMs is waited on, not robbed", () => {
     plantLock({ pid: process.pid, ts: old() });
@@ -168,8 +215,7 @@ describe("neverReclaimLiveOwner (opt-in)", () => {
   });
 
   it("still reclaims a dead owner at once, and a foreign host's by age", () => {
-    const dead = spawnSync(process.execPath, ["-e", ""]).pid!;
-    plantLock({ pid: dead });
+    plantLock({ pid: deadPid() });
     expect(withFileLockSync(lockPath, () => "ran", { timeoutMs: 200, neverReclaimLiveOwner: true })).toBe("ran");
     plantLock({ pid: process.pid, ts: old(), host: "elsewhere.invalid" });
     expect(withFileLockSync(lockPath, () => "ran", { staleMs: 10, timeoutMs: 200, neverReclaimLiveOwner: true })).toBe("ran");

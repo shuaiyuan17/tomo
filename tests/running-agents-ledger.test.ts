@@ -76,13 +76,25 @@ describe("running-agents ledger", () => {
     expect(pending.get("dm:owner")).toMatchObject([{ taskId: "b1", kind: "command" }]);
   });
 
-  it("subscribes to the watch bus tasks events", () => {
+  it("subscribes to the watch bus tasks events, `ended` included", () => {
     const bus = new WatchBus();
-    const ledger = open();
+    const ledger = new RunningAgentsLedger({ path, now: () => clock, warn: vi.fn(), autoResume: true });
     const off = ledger.attach(bus);
     bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [agent("a1")] });
-    off();
     expect(onDisk().running.map((r) => r.taskId)).toEqual(["a1"]);
+
+    // The CLI died (an empty snapshot): a1 now counts a resume…
+    bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [] });
+    ledger.gateResume("dm:owner", "a1");
+    expect(ledger.resumeCount("dm:owner", "a1")).toBe(1);
+    // …until the bus reports it completed in `ended`, which clears the count.
+    bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [agent("a1")] });
+    bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [], ended: [{ taskId: "a1", status: "completed" }] });
+    expect(ledger.resumeCount("dm:owner", "a1")).toBe(0);
+
+    off();
+    bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [agent("a9")] });
+    expect(onDisk().running.map((r) => r.taskId)).toEqual([]);
   });
 
   it("throttles progress-only writes", () => {
@@ -112,18 +124,6 @@ describe("running-agents ledger", () => {
     expect(open(w2).pendingBySession().size).toBe(0);
   });
 
-  it("formats the notice with id, type, runtime, and what cannot be resumed", () => {
-    const body = formatInterruptedAgentsNotice([
-      { sessionKey: "k", taskId: "a1", kind: "agent", taskType: "local_agent", subagentType: "general-purpose", description: "fix bug", startedAt: 0, lastActivityAt: 12 * 60_000 },
-      { sessionKey: "k", taskId: "e1", kind: "agent", taskType: "local_agent", subagentType: "Explore", description: "look", startedAt: 0, lastActivityAt: 0 },
-      { sessionKey: "k", taskId: "b1", kind: "command", taskType: "local_bash", description: "npm test", startedAt: 0, lastActivityAt: 0 },
-    ], "UTC");
-    expect(body).toContain('- a1 "fix bug" (general-purpose, ran 12m, last activity 01/01 00:12 UTC)');
-    expect(body).toMatch(/e1 "look" \(Explore.*cannot be resumed/);
-    expect(body).toMatch(/b1 "npm test" \(background command.*rerun/);
-    expect(body).toContain("SendMessage to its id");
-  });
-
   describe("auto-resume", () => {
     const openOn = (warn = vi.fn()) => new RunningAgentsLedger({ path, now: () => clock, warn, autoResume: true });
     /** The agent was running when the daemon died: the next process gates it. */
@@ -136,8 +136,14 @@ describe("running-agents ledger", () => {
       { sessionKey: "k", taskId: "b1", kind: "command", taskType: "local_bash", description: "npm test", startedAt: 0, lastActivityAt: 0 },
     ];
 
-    it("off: the notice reads exactly as on main", () => {
-      const body = formatInterruptedAgentsNotice(recs, "UTC");
+    it("off: the notice gives id, type, runtime and what cannot be resumed, and resumes nothing", () => {
+      const body = formatInterruptedAgentsNotice(
+        [{ ...recs[0], lastActivityAt: 12 * 60_000 }, ...recs.slice(1)],
+        "UTC",
+      );
+      expect(body).toContain('- a1 "fix bug" (general-purpose, ran 12m, last activity 01/01 00:12 UTC)');
+      expect(body).toMatch(/e1 "look" \(Explore.*cannot be resumed/);
+      expect(body).toMatch(/b1 "npm test" \(background command.*rerun/);
       expect(body.split("\n").at(-1)).toBe(
         "Nothing has been resumed. To continue a resumable subagent, SendMessage to its id (names do not survive a restart; use the id) and it picks up from its saved transcript. "
         + "Explore/Plan subagents and background commands cannot be resumed; rerun them if still needed. "

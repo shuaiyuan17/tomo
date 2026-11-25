@@ -59,6 +59,22 @@ describe("jsonl backward reading", () => {
     expect(seen).toEqual([2, 1, 0]);
   });
 
+  it("skips lines that are valid JSON but not an object, in every reader", () => {
+    // `null`, a bare number or string, and an array all parse, but none is a
+    // record: a consumer reading `.role` or `.seq` on `null` throws.
+    const file = join(TEST_DIR, "scalars.jsonl");
+    writeFileSync(file, ["null", "42", JSON.stringify({ i: 0 }), '"x"', "[1,2]", JSON.stringify({ i: 1 }), "null"].join("\n") + "\n");
+
+    expect([...iterateJsonlBackwardsSync<{ i: number }>(file, 8)].map((r) => r.i)).toEqual([1, 0]);
+    expect(readJsonlTailSync<{ i: number }>(file, 5).map((r) => r.i)).toEqual([0, 1]);
+    expect(readFirstJsonlRecordSync<{ i: number }>(file)).toEqual({ i: 0 });
+
+    const onlyScalars = join(TEST_DIR, "only-scalars.jsonl");
+    writeFileSync(onlyScalars, "null\n[]\n7");   // no trailing newline: the last line goes through the tail path
+    expect(readFirstJsonlRecordSync(onlyScalars)).toBeUndefined();
+    expect([...iterateJsonlBackwardsSync(onlyScalars)]).toEqual([]);
+  });
+
   it("yields nothing for a missing or empty file", () => {
     expect([...iterateJsonlBackwardsSync(join(TEST_DIR, "nope.jsonl"))]).toEqual([]);
     const empty = join(TEST_DIR, "empty.jsonl");

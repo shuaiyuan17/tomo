@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExecFileException, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -7,6 +7,7 @@ import { join } from "node:path";
 import {
   buildUsageReport,
   CLAUDE_REFRESH_ARGS,
+  fetchUsage,
   formatCountdown,
   formatReset,
   formatUsageReport,
@@ -36,10 +37,21 @@ describe("formatCountdown", () => {
 });
 
 describe("formatReset", () => {
-  it("returns a countdown and a local clock string", () => {
-    const { countdown, clock } = formatReset("2026-07-28T02:59:59+00:00", NOW);
-    expect(countdown).toBe("4h 23m");
-    expect(clock).toMatch(/\d/); // local-zone dependent, just assert it rendered
+  // The clock is rendered in the host's zone, so pin one: the old assertion
+  // (`/\d/`) passed for any string with a digit in it, including a wrong day.
+  // Node re-reads process.env.TZ when it changes, so a stub is enough.
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it.each([
+    // 02:59:59Z on the 28th is 19:59 on the 27th in Los Angeles: same day as
+    // NOW (15:36 there), so the time alone.
+    ["same local day: the time alone", "2026-07-28T02:59:59+00:00", "4h 23m", "7:59 PM"],
+    // 09:00Z on the 28th is 02:00 on the 28th there: a different local day,
+    // so the date is added.
+    ["next local day: date and time", "2026-07-28T09:00:00Z", "10h 24m", "Jul 28, 2:00 AM"],
+  ])("%s", (_label, resetsAt, countdown, clock) => {
+    vi.stubEnv("TZ", "America/Los_Angeles");
+    expect(formatReset(resetsAt, NOW, "en")).toEqual({ countdown, clock });
   });
 
   it("handles unparseable timestamps", () => {
@@ -464,7 +476,14 @@ describe("buildUsageReport", () => {
       expect(await runClaudeRefresh(join(tmpdir(), "definitely-not-a-claude-binary-xyz"))).toBe("failed_to_start");
     });
 
+    // The two kill-path tests below drive the deadline and the kill grace with
+    // fake timers (only setTimeout: the fake child's own exit is on a real
+    // setImmediate, as a real child's 'exit' would be on a later tick). They
+    // used to poll a real clock every 5 ms and sleep a real 80 ms.
+    afterEach(() => { vi.useRealTimers(); });
+
     it("resolves at the deadline even if the child ignores SIGTERM, then SIGKILLs it", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       // A fake child makes this deterministic: no process start-up race with
       // the deadline. It ignores SIGTERM and only exits on SIGKILL.
       const signals: string[] = [];
@@ -480,19 +499,22 @@ describe("buildUsageReport", () => {
         return child;
       }) as unknown as typeof spawn;
 
-      const outcome = await runClaudeRefresh("/fake/claude", { timeoutMs: 20, killGraceMs: 20, spawnImpl: fakeSpawn });
-      expect(outcome).toBe("timed_out");
+      const pending = runClaudeRefresh("/fake/claude", { timeoutMs: 20, killGraceMs: 20, spawnImpl: fakeSpawn });
+      await vi.advanceTimersByTimeAsync(19);
+      expect(signals).toEqual([]);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await pending).toBe("timed_out");
       // Resolved at the deadline: SIGTERM sent, SIGKILL not yet (still in grace).
       expect(signals).toEqual(["SIGTERM"]);
       expect(spawnedWith[0]).toBe("/fake/claude");
       expect(spawnedWith[1]).toEqual([...CLAUDE_REFRESH_ARGS]);
 
-      const until = Date.now() + 2_000;
-      while (!signals.includes("SIGKILL") && Date.now() < until) await new Promise((r) => setTimeout(r, 5));
+      await vi.advanceTimersByTimeAsync(20);
       expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
     });
 
     it("does not escalate to SIGKILL when the child exits after SIGTERM", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
       const signals: string[] = [];
       const fakeSpawn = (() => {
         const child = new EventEmitter() as EventEmitter & { kill: (sig: string) => boolean };
@@ -504,53 +526,44 @@ describe("buildUsageReport", () => {
         return child;
       }) as unknown as typeof spawn;
 
-      expect(await runClaudeRefresh("/fake/claude", { timeoutMs: 20, killGraceMs: 20, spawnImpl: fakeSpawn })).toBe("timed_out");
-      await new Promise((r) => setTimeout(r, 80));
+      const pending = runClaudeRefresh("/fake/claude", { timeoutMs: 20, killGraceMs: 20, spawnImpl: fakeSpawn });
+      await vi.advanceTimersByTimeAsync(20);
+      expect(await pending).toBe("timed_out");
+      // Let the child's exit (a real setImmediate) land, then run well past
+      // the grace: the exit cleared the kill timer, so nothing is left to fire.
+      await new Promise((r) => setImmediate(r));
+      expect(vi.getTimerCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(1_000);
       expect(signals).toEqual(["SIGTERM"]);
     });
   });
 
-  it("returns a FIXED network-error message that never echoes the raw error", async () => {
-    // The thrown message must not leak into the surfaced text (a future fetch
-    // wrapper could put the bearer token in an error). Assert exact string.
-    const report = await buildUsageReport({
-      now: () => NOW,
-      loadCredentials: async () => CREDS,
-      fetchImpl: (async () => { throw new Error("Authorization: Bearer sk-secret-leak"); }) as unknown as typeof fetch,
-    });
-    expect(report).toBe("Claude usage unavailable: network error.");
+  // Every way the fetch can fail maps to one FIXED message. The thrown text
+  // must never leak into it (a future fetch wrapper could put the bearer
+  // token in an error), so each row asserts the exact string, or a fragment
+  // where the message carries a status code.
+  const asFetch = (impl: (...args: unknown[]) => Promise<unknown>) => impl as unknown as typeof fetch;
+  it.each<[string, () => Promise<unknown>, string]>([
+    ["a network error, without echoing it",
+      async () => { throw new Error("Authorization: Bearer sk-secret-leak"); },
+      "Claude usage unavailable: network error."],
+    ["a request timeout (AbortSignal.timeout)",
+      async () => { throw new DOMException("The operation timed out.", "TimeoutError"); },
+      "Claude usage unavailable: usage request timed out."],
+    ["a timeout during the body read",
+      async () => ({ status: 200, ok: true, json: async () => { throw new DOMException("aborted", "AbortError"); } }),
+      "Claude usage unavailable: usage request timed out."],
+  ])("maps %s to a fixed message", async (_label, impl, expected) => {
+    const report = await buildUsageReport({ now: () => NOW, loadCredentials: async () => CREDS, fetchImpl: asFetch(impl) });
+    expect(report).toBe(expected);
     expect(report).not.toContain("sk-secret-leak");
-  });
-
-  it("maps a request timeout (AbortSignal.timeout) to a fixed timeout message", async () => {
-    const report = await buildUsageReport({
-      now: () => NOW,
-      loadCredentials: async () => CREDS,
-      fetchImpl: (async () => {
-        throw new DOMException("The operation timed out.", "TimeoutError");
-      }) as unknown as typeof fetch,
-    });
-    expect(report).toBe("Claude usage unavailable: usage request timed out.");
-  });
-
-  it("maps a timeout during the body read to the timeout message", async () => {
-    const report = await buildUsageReport({
-      now: () => NOW,
-      loadCredentials: async () => CREDS,
-      fetchImpl: (async () => ({
-        status: 200,
-        ok: true,
-        json: async () => { throw new DOMException("aborted", "AbortError"); },
-      })) as unknown as typeof fetch,
-    });
-    expect(report).toBe("Claude usage unavailable: usage request timed out.");
   });
 
   it("maps a non-200 to an HTTP status message", async () => {
     const report = await buildUsageReport({
       now: () => NOW,
       loadCredentials: async () => CREDS,
-      fetchImpl: (async () => new Response("", { status: 500 })) as unknown as typeof fetch,
+      fetchImpl: asFetch(async () => new Response("", { status: 500 })),
     });
     expect(report).toContain("HTTP 500");
   });
@@ -580,30 +593,24 @@ describe("buildUsageReport", () => {
     const report = await buildUsageReport({
       now: () => NOW,
       loadCredentials: async () => CREDS,
-      fetchImpl: (async () => new Response("null", { status: 200, headers: { "Content-Type": "application/json" } })) as unknown as typeof fetch,
+      fetchImpl: asFetch(async () => new Response("null", { status: 200, headers: { "Content-Type": "application/json" } })),
     });
     expect(report).toContain("📊 Claude usage");
   });
 
-  it("degrades to an actionable message when credentials are literally null", async () => {
+  // Credentials that parse to something that is not an object must not be
+  // dereferenced (JSON.parse("null") is typeof "object"; `.claudeAiOauth`
+  // would throw), and must not reach the network.
+  it.each([["null", null], ["a primitive", 42]])("degrades to an actionable message when credentials are %s", async (_label, creds) => {
     let fetched = false;
     const report = await buildUsageReport({
       now: () => NOW,
-      // JSON.parse("null") is typeof "object"; accessing .claudeAiOauth would throw.
-      loadCredentials: (async () => null) as unknown as () => Promise<Record<string, never>>,
-      fetchImpl: (async () => { fetched = true; return okResponse({}); }) as unknown as typeof fetch,
+      loadCredentials: (async () => creds) as unknown as () => Promise<Record<string, never>>,
+      fetchImpl: asFetch(async () => { fetched = true; return okResponse({}); }),
     });
     expect(fetched).toBe(false);
     expect(report).toContain("malformed");
     expect(report).toContain("Re-login to Claude Code");
-  });
-
-  it("degrades when credentials parse to a primitive", async () => {
-    const report = await buildUsageReport({
-      now: () => NOW,
-      loadCredentials: (async () => 42) as unknown as () => Promise<Record<string, never>>,
-    });
-    expect(report).toContain("malformed");
   });
 
   it("collapses an arbitrary credential-loader error to a fixed message (no leak)", async () => {
@@ -639,30 +646,38 @@ describe("buildUsageReport", () => {
   });
 });
 
+describe("fetchUsage onData", () => {
+  // The hook the limits log (src/usage/limits-log.ts) records /usage reads
+  // through: it sees the parsed body of a good read only, and cannot break it.
+  const BODY = { five_hour: { utilization: 36 } };
+  const ok = async () => okResponse(BODY);
+  it("sees the parsed body of a good read, and only a good read", async () => {
+    const seen: unknown[] = [];
+    await fetchUsage({ now: () => NOW, loadCredentials: async () => CREDS, fetchImpl: ok as never, onData: (d) => seen.push(d) });
+    await fetchUsage({ now: () => NOW, loadCredentials: async () => CREDS, fetchImpl: (async () => new Response("{}", { status: 500 })) as never, onData: (d) => seen.push(d) });
+    expect(seen).toEqual([BODY]);
+  });
+  it("a throwing observer does not break the read", async () => {
+    const result = await fetchUsage({ now: () => NOW, loadCredentials: async () => CREDS, fetchImpl: ok as never, onData: () => { throw new Error("boom"); } });
+    expect(result).toMatchObject({ ok: true, data: BODY });
+  });
+});
+
 describe("keychainErrorMessage", () => {
   const mk = (over: Partial<ExecFileException>): ExecFileException => over as ExecFileException;
 
-  it("maps an execFile timeout (killed=true + signal) to a timeout message", () => {
-    expect(keychainErrorMessage(mk({ killed: true, signal: "SIGTERM" }), "")).toContain("timed out");
-  });
-
-  it("does NOT treat an external SIGTERM (killed=false) as a timeout", () => {
-    // Node only sets killed=true when IT killed the child via the timeout; an
-    // externally-terminated child has killed:false and must fall through.
-    const msg = keychainErrorMessage(mk({ killed: false, signal: "SIGTERM" }), "");
-    expect(msg).not.toContain("timed out");
-    expect(msg).toContain("could not read");
-  });
-
-  it("maps exit code 44 (item not found) to a login prompt", () => {
-    expect(keychainErrorMessage(mk({ code: 44 as unknown as string }), "")).toContain("Log in with Claude Code");
-  });
-
-  it("maps a locked/denied Keychain to an unlock message", () => {
-    expect(keychainErrorMessage(mk({ code: "1" }), "SecKeychain: interaction is not allowed")).toContain("locked");
-  });
-
-  it("falls back to a generic read failure otherwise", () => {
-    expect(keychainErrorMessage(mk({ code: "1" }), "unexpected")).toContain("could not read");
+  // Node only sets killed=true when IT killed the child via the timeout; an
+  // externally-terminated child has killed:false and must fall through to the
+  // generic read failure, not be called a timeout.
+  it.each<[string, Partial<ExecFileException>, string, string, string?]>([
+    ["an execFile timeout (killed=true + signal)", { killed: true, signal: "SIGTERM" }, "", "timed out"],
+    ["an external SIGTERM (killed=false)", { killed: false, signal: "SIGTERM" }, "", "could not read", "timed out"],
+    ["exit code 44 (item not found)", { code: 44 as unknown as string }, "", "Log in with Claude Code"],
+    ["a locked/denied Keychain", { code: "1" }, "SecKeychain: interaction is not allowed", "locked"],
+    ["anything else", { code: "1" }, "unexpected", "could not read"],
+  ])("maps %s", (_label, err, stderr, contains, notContains) => {
+    const msg = keychainErrorMessage(mk(err), stderr);
+    expect(msg).toContain(contains);
+    if (notContains) expect(msg).not.toContain(notContains);
   });
 });

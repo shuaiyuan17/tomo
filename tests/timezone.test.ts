@@ -5,7 +5,6 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { canonicalTimeZone, formatZonedClock, isValidTimeZone, validTimeZone } from "../src/timezone.js";
-import { log } from "../src/logger.js";
 
 // ---------------------------------------------------------------------------
 // The time zone gate every people-registry surface goes through. Two things
@@ -100,53 +99,51 @@ describe("formatZonedClock", () => {
   });
 });
 
-// The memo of already-warned values is module state, so this runs last: it
-// fills the memo to its ceiling and everything above would otherwise see a
-// registry that has already used up its warning budget.
+// The memo of already-warned values is module state. Each test here takes a
+// fresh copy of the module (empty memo, notice not yet announced) and of the
+// mocked logger, so neither depends on where it runs nor on what the describes
+// above have already warned about.
 describe("warn-once memo under a flood of bad values", () => {
-  const warnCount = () => vi.mocked(log.warn).mock.calls.length;
+  async function freshTimeZoneModule() {
+    vi.resetModules();
+    const fresh = await import("../src/timezone.js");
+    const { log: freshLog } = await import("../src/logger.js");
+    return { validTimeZone: fresh.validTimeZone, warnCount: () => vi.mocked(freshLog.warn).mock.calls.length, freshLog };
+  }
 
-  it("warns a bounded number of times and never re-warns a value it has seen", () => {
+  it("warns a bounded number of times and never re-warns a value it has seen", async () => {
+    const { validTimeZone: validate, warnCount } = await freshTimeZoneModule();
     // Comfortably past the cap: the old implementation cleared the whole memo
     // here, so the SECOND pass warned all over again — a log storm on every
     // render, which is exactly what "log once" was supposed to prevent.
     const values = Array.from({ length: 260 }, (_, i) => `Not/AZone${i}`);
 
-    const before = warnCount();
-    for (const v of values) expect(validTimeZone(v)).toBeUndefined();
-    const afterFirstPass = warnCount() - before;
-    expect(afterFirstPass).toBeGreaterThan(0);
-    // Bounded by the cap plus the single suppression notice.
-    expect(afterFirstPass).toBeLessThanOrEqual(201);
+    for (const v of values) expect(validate(v)).toBeUndefined();
+    const afterFirstPass = warnCount();
+    // Exactly the cap plus the single suppression notice: the memo starts empty.
+    expect(afterFirstPass).toBe(201);
 
-    const beforeSecondPass = warnCount();
-    for (const v of values) expect(validTimeZone(v)).toBeUndefined();
-    expect(warnCount() - beforeSecondPass).toBe(0);
+    for (const v of values) expect(validate(v)).toBeUndefined();
+    expect(warnCount()).toBe(afterFirstPass);
 
     // And a third pass, to be explicit that this does not decay over time.
-    for (const v of values) validTimeZone(v);
-    expect(warnCount() - beforeSecondPass).toBe(0);
+    for (const v of values) validate(v);
+    expect(warnCount()).toBe(afterFirstPass);
   });
 
   it("says once that further warnings are suppressed", async () => {
-    // Self-contained: a fresh copy of the module (empty memo, notice not yet
-    // announced) and of the mocked logger, so this neither depends on the test
-    // above having filled the memo nor on mock calls surviving between tests
-    // (vitest clears mocks before each test).
-    vi.resetModules();
-    const fresh = await import("../src/timezone.js");
-    const { log: freshLog } = await import("../src/logger.js");
+    const { validTimeZone: validate, freshLog } = await freshTimeZoneModule();
     const notices = () => vi.mocked(freshLog.warn).mock.calls.filter(
       ([, message]) => typeof message === "string" && message.includes("further invalid timezone warnings are suppressed"),
     );
 
     const values = Array.from({ length: 260 }, (_, i) => `Not/AFreshZone${i}`);
-    for (const v of values) fresh.validTimeZone(v);
+    for (const v of values) validate(v);
     expect(notices()).toHaveLength(1);
 
     // Further passes past the ceiling must not repeat the notice.
-    for (const v of values) fresh.validTimeZone(v);
-    for (const v of values) fresh.validTimeZone(`${v}-again`);
+    for (const v of values) validate(v);
+    for (const v of values) validate(`${v}-again`);
     expect(notices()).toHaveLength(1);
   });
 });

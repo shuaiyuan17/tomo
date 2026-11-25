@@ -109,7 +109,6 @@ describe("TaskBoard", () => {
     b.apply("a", [task("p", { startedAt: 1_000 }), child, ...others]);
     b.apply("a", [child, ...others]);
     const shown = b.snapshot().map((t) => t.taskId);
-    console.log(JSON.stringify(b.snapshot().filter((t) => !t.taskId.startsWith("r")))); expect(!shown.includes("p") || shown.includes("c")).toBe(true);
     expect(shown).not.toContain("p");
     b.dispose();
   });
@@ -303,12 +302,12 @@ describe("TaskBoard", () => {
   });
 
   it("routes slots to browser sessions and never leaks the slot name", () => {
-    const { b, published } = board();
-    const board2 = new TaskBoard((id, tasks) => published.push([id, tasks]), { router: () => (slot) => (slot === "dm:secret-key" ? "owner-id" : undefined) });
-    board2.apply("dm:secret-key", [task("a")]);
-    board2.apply("dm:other", [task("b")]);
-    expect(board2.snapshot().map((t) => [t.sessionId, t.taskId])).toEqual([["owner-id", "a"]]);
+    const published: unknown[] = [];
+    const routed = new TaskBoard((id, tasks) => published.push([id, tasks]), { router: () => (slot) => (slot === "dm:secret-key" ? "owner-id" : undefined) });
+    routed.apply("dm:secret-key", [task("a")]);
+    routed.apply("dm:other", [task("b")]);
+    expect(routed.snapshot().map((t) => [t.sessionId, t.taskId])).toEqual([["owner-id", "a"]]);
     expect(JSON.stringify(published)).not.toContain("secret-key");
-    b.dispose(); board2.dispose();
+    routed.dispose();
   });
 });

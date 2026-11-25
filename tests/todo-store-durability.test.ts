@@ -119,6 +119,8 @@ describe("closing an item survives a crash between its two writes", () => {
     expect(() => store.resolve("t-1", { action: "done", by: "self" }, Date.now(), (i) => i.session === "telegram:-100777")).toThrow(/No open todo t-1/);
   });
 
+  // Also the torn-LAST-line read: resolving t-2 reads done.ndjson while the
+  // torn line is still its last.
   it("starts a new line after a torn one, so the next record still parses", () => {
     const store = new TodoStore(dir);
     store.add(input("a"));
@@ -153,13 +155,5 @@ describe("closing an item survives a crash between its two writes", () => {
     expect(again.action).toBe("drop");
     expect(again.item).toMatchObject({ id: "t-1", title: "a" });
     expect(doneLines()).toHaveLength(2);
-  });
-
-  it("skips a torn last line in done.ndjson", () => {
-    const store = new TodoStore(dir);
-    store.add(input("a"));
-    store.resolve("t-1", { action: "done", by: "self" });
-    writeFileSync(join(dir, "done.ndjson"), `${readFileSync(join(dir, "done.ndjson"), "utf-8")}{"id":"t-`);
-    expect(new TodoStore(dir).list()).toEqual([]);
   });
 });

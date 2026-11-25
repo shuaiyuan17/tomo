@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, chmodSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it, expect } from "vitest";
@@ -16,16 +16,16 @@ const makeHome = (...components: string[]): string => {
   let current = home;
   for (const c of components) {
     current = join(current, c);
-    mkdirSync(current, { mode: 0o755 });
+    mkdirSync(current);
+    // mkdir's mode is masked by the umask; set it outright so the mode the
+    // diagnosis reports does not depend on the machine running the test.
+    chmodSync(current, 0o755);
   }
   return home;
 };
 
 afterEach(() => {
-  if (home) {
-    // Restore write bits so cleanup can recurse.
-    rmSync(home, { recursive: true, force: true });
-  }
+  if (home) rmSync(home, { recursive: true, force: true });
 });
 
 describe("isStickerStagingRefusal", () => {
@@ -70,6 +70,17 @@ describe("stickerStagingDiagnosis", () => {
     symlinkSync(join(h, "Library", "real-messages"), join(h, "Library", "Messages"));
     const diag = stickerStagingDiagnosis(h);
     expect(diag.verdict).toContain(`${join(h, "Library", "Messages")} is a symbolic link`);
+  });
+
+  // Only root can hand a directory to another uid, so this runs only as root
+  // (CI containers); on a developer machine it is skipped.
+  it.skipIf(process.getuid?.() !== 0)("names a component owned by another user and the chown remedy", () => {
+    const h = makeHome("Library", "Messages", "Attachments");
+    const messages = join(h, "Library", "Messages");
+    chownSync(messages, 4242, 4242);
+    const diag = stickerStagingDiagnosis(h);
+    expect(diag.verdict).toContain(`${messages} is owned by uid 4242, not the current user (0)`);
+    expect(diag.verdict).toContain(`chown 0 '${messages}'`);
   });
 
   it("names a non-directory component", () => {

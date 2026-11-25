@@ -1,9 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { request, type IncomingMessage } from "node:http";
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { startWebHttp } from "../src/web/http.js";
 import { WebData } from "../src/web/data.js";
 import { SessionStore } from "../src/sessions/store.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
@@ -11,26 +9,15 @@ import { webSessionId } from "../src/web/owner.js";
 import { usageDataDir } from "../src/usage/dir.js";
 import type { WebCost } from "../src/web/protocol.js";
 import type { UsageLedgerRow } from "../src/usage/ledger.js";
+import { startWebService, type WebService } from "./helpers/web-http.js";
 
 let root: string;
 let usage: string;
-let service: Awaited<ReturnType<typeof startWebHttp>>;
-let cookie: string;
+let web: WebService;
+let data: WebData;
 let now: number;
-const accessToken = "tomo_web_" + "b".repeat(64);
-const baseHeaders = { "x-tomo-request": "1", "sec-fetch-site": "same-origin" };
 const owner = { name: "owner", telegram: ["test-owner"], imessage: [] as string[] };
-
-function call(path: string, headers: Record<string, string | undefined> = {}) {
-  return new Promise<{ status: number; text: string; headers: IncomingMessage["headers"] }>((resolve, reject) => {
-    const req = request({ host: "127.0.0.1", port: service.port, path, method: "GET",
-      headers: Object.fromEntries(Object.entries({ ...baseHeaders, cookie, ...headers }).filter(([, v]) => v !== undefined)) as Record<string, string> }, (res) => {
-      let text = ""; res.setEncoding("utf8"); res.on("data", (part) => { text += part; });
-      res.on("end", () => resolve({ status: res.statusCode!, text, headers: res.headers }));
-    });
-    req.on("error", reject); req.end();
-  });
-}
+const call = (path: string) => web.get(path);
 
 const row = (ts: string | number, costUsd: number, extra: Partial<UsageLedgerRow> = {}): UsageLedgerRow => ({
   v: 1, ts: typeof ts === "string" ? Date.parse(ts) : ts, sessionKey: "dm:owner", source: "owner", costUsd,
@@ -38,7 +25,7 @@ const row = (ts: string | number, costUsd: number, extra: Partial<UsageLedgerRow
 });
 
 beforeEach(async () => {
-  cookie = ""; now = Date.parse("2026-11-15T12:00:00-08:00");
+  now = Date.parse("2026-11-15T12:00:00-08:00");
   root = mkdtempSync(join(tmpdir(), "tomo-web-cost-"));
   usage = usageDataDir(root);
   mkdirSync(usage, { recursive: true });
@@ -52,30 +39,13 @@ beforeEach(async () => {
   const store = new SessionStore(sessionsDir, 20, sdkSessionsDir);
   store.touchSession("dm:owner");
   store.touchSession("telegram:-1"); store.setChatTitle("telegram:-1", "Test group");
-  service = await startWebHttp(0, { accessToken, now: () => now, assetsDir,
-    data: new WebData({ sessionsDir, sdkSessionsDir, owner, tomoHome: root, workspaceDir }),
-    subscribe: () => () => {}, rpc: async () => ({ snapshot: {}, replay: null }) });
-  const boot = await call(`/api/v1/bootstrap?t=${accessToken}`);
-  expect(boot.status).toBe(200);
-  cookie = boot.headers["set-cookie"]![0].split(";")[0];
+  web = await startWebService({ now: () => now, assetsDir,
+    data: data = new WebData({ sessionsDir, sdkSessionsDir, owner, tomoHome: root, workspaceDir }),
+    rpc: async () => ({ snapshot: {}, replay: null }) });
 });
-afterEach(async () => { await service?.close(); rmSync(root, { recursive: true, force: true }); });
+afterEach(async () => { await web?.close(); rmSync(root, { recursive: true, force: true }); });
 
 describe("GET /api/v1/cost", () => {
-  it("is owner-only: no cookie, a forged cookie or a missing request header are refused", async () => {
-    writeFileSync(join(usage, "2026-11.ndjson"), JSON.stringify(row("2026-11-14T10:00:00+09:00", 5, { trigger: "private words" })) + "\n");
-    for (const headers of [{ cookie: undefined }, { cookie: `tomo_web=${"0".repeat(64)}.${now + 1000}.${"0".repeat(64)}` }]) {
-      const res = await call("/api/v1/cost", headers);
-      expect(res.status).toBe(401);
-      expect(res.text).not.toContain("private words");
-    }
-    // Without the same-origin request header the API refuses before reading anything.
-    const bare = await call("/api/v1/cost", { "x-tomo-request": undefined });
-    expect(bare.status).toBeGreaterThanOrEqual(400);
-    expect(bare.text).not.toContain("private words");
-    expect((await call("/api/v1/cost")).status).toBe(200);
-  });
-
   it("answers in the owner's zone with sessions named as the browser knows them, plus the quota bar", async () => {
     writeFileSync(join(usage, "2026-11.ndjson"), [
       // 23:30 on Nov 13 in Los Angeles is Nov 14 in Tokyo.
@@ -124,9 +94,37 @@ describe("GET /api/v1/cost", () => {
       expect([query, res.status, res.text]).toEqual([query, 400, '{"error":"invalid_range"}']);
     }
   });
+
+  it("keeps one reader across requests, and a row appended to the current month is in the next answer", async () => {
+    // The per-file cache itself is unit-tested ("LedgerReader cache" in usage-cost-report.test.ts);
+    // here: the route holds one reader (a new one per request would read every file again) and it stays fresh.
+    writeFileSync(join(usage, "2026-11.ndjson"), [row("2026-11-14T10:00:00+09:00", 1), row("2026-11-14T11:00:00+09:00", 2)].map((r) => JSON.stringify(r)).join("\n") + "\n");
+    const turns = async () => (JSON.parse((await call("/api/v1/cost?from=2026-11-14&to=2026-11-15")).text) as WebCost).totals.turns;
+    const reader = () => (data as unknown as { ledger?: object }).ledger;
+    expect(reader()).toBeUndefined();
+    expect(await turns()).toBe(2);
+    const first = reader();
+    expect(first).toBeDefined();
+    appendFileSync(join(usage, "2026-11.ndjson"), JSON.stringify(row("2026-11-15T09:00:00+09:00", 3)) + "\n");
+    expect(await turns()).toBe(3);
+    expect(reader()).toBe(first);
+  });
+
+  it("refuses a request without the same-origin header, or with a forged cookie, before reading anything", async () => {
+    // No cookie at all: the 401 list in web-http.test.ts.
+    writeFileSync(join(usage, "2026-11.ndjson"), JSON.stringify(row("2026-11-14T10:00:00+09:00", 5, { trigger: "private words" })) + "\n");
+    const bare = await web.get("/api/v1/cost", { "x-tomo-request": undefined });
+    expect([bare.status, bare.text]).toEqual([403, '{"error":"same_origin_required"}']);
+    const forged = await web.get("/api/v1/cost", { cookie: `tomo_web=${"0".repeat(64)}.${now + 1000}.${"0".repeat(64)}` });
+    expect([forged.status, forged.text]).toEqual([401, '{"error":"authentication_required"}']);
+    expect((data as unknown as { ledger?: object }).ledger).toBeUndefined();
+    expect((await call("/api/v1/cost")).status).toBe(200);
+  });
 });
 
-describe("GET /api/v1/cost performance", () => {
+// A wall-clock budget: meaningful on a quiet machine, flaky on a loaded test
+// worker, and about a second of setup. Run it on purpose: TOMO_PERF=1 npx vitest run tests/web-cost.test.ts
+describe.skipIf(!process.env.TOMO_PERF)("GET /api/v1/cost performance", () => {
   it("answers a year of ledger (~36k rows, live-row shape) in under 200 ms", async () => {
     // A year to Nov 15, 100 turns a day, rows shaped like live ones: per-model split and snapshot.
     const models = (n: number) => ({

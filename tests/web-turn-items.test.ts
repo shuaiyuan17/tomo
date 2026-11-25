@@ -130,16 +130,27 @@ describe("main chat: todos and sources cross the same server-side gate as output
     expect(result.output).toBe("Todos have been modified successfully.");
   });
 
-  it("a withheld output loses its links too", () => {
-    const items: SubagentItem[] = [
+  // A private output is withheld whole: nothing it carried (links, an image count) is left beside the notice,
+  // and a result without its call carries none either.
+  const png = { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgoAAAA=" } };
+  it.each<[string, string, () => SubagentItem[]]>([
+    ["links", "sources", () => [
       { kind: "tool", id: "1:0", toolUseId: "s1", name: "WebSearch", summary: "", input: "{}", inputTruncated: false, privateOutput: true },
       { kind: "result", id: "2:0", toolUseId: "s1", output: "x", truncated: false, isError: false, sources: [{ url: "https://a.test" }] },
       { kind: "result", id: "3:0", toolUseId: "unknown", output: "y", truncated: false, isError: false, sources: [{ url: "https://b.test" }] },
-    ];
-    const [, withheld, unpaired] = pairOutputs(items);
-    expect(withheld).toMatchObject({ output: PRIVATE_HIDDEN });
-    expect(withheld).not.toHaveProperty("sources");
-    expect(unpaired).not.toHaveProperty("sources");
+    ]],
+    ["image count", "images", () => [
+      // A Read of a private path is marked by the reader itself.
+      ...toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "p1", name: "Read", input: { file_path: "/w/memory/private/a.png" } }]), 0),
+      ...toolItemsFromLine(line("user", [{ type: "tool_result", tool_use_id: "p1", content: [png] }]), 100),
+      ...toolItemsFromLine(line("user", [{ type: "tool_result", tool_use_id: "zz", content: [png] }]), 200),
+    ]],
+  ])("a withheld output loses its %s too", (_what, key, items) => {
+    const [, withheld, unpaired] = pairOutputs(items());
+    expect(withheld).toMatchObject({ kind: "result", output: PRIVATE_HIDDEN });
+    expect(withheld).not.toHaveProperty(key);
+    expect(unpaired).toMatchObject({ kind: "result" });
+    expect(unpaired).not.toHaveProperty(key);
   });
 
   it("toolItemsFromLine keeps todos (they are calls), never text", () => {

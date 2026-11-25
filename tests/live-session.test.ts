@@ -1133,31 +1133,23 @@ describe("LiveSession per-block filtering", () => {
     return p;
   };
 
-  it("drops a mid-turn block whose trailing line is NO_REPLY, keeping the rest", async () => {
-    await expect(multiBlockTurn(["A", "housekeeping\nNO_REPLY", "B"])).resolves.toBe("A\nB");
-  });
-
-  it("drops a mid-turn NO_REPLY block that also carried an attachment tag", async () => {
-    await expect(multiBlockTurn(["A", "MEDIA:/tmp/x.png\nNO_REPLY", "B"])).resolves.toBe("A\nB");
-  });
-
-  it("keeps a trailing NO_REPLY so the delivery layer suppresses the turn", async () => {
-    // The token stays on the END of the response; stripTrailingNoReply then
-    // silences the whole turn, narration included (owner decision 2026-07-08).
-    await expect(multiBlockTurn(["did the housekeeping", "NO_REPLY"]))
-      .resolves.toBe("did the housekeeping\nNO_REPLY");
-  });
-
-  it("cuts only the block that leaked scaffold", async () => {
-    await expect(
-      multiBlockTurn(["A", "leaked\n_end_of_dialog_\nUser: hi", "B"]),
-    ).resolves.toBe("A\nleaked\nB");
+  // A trailing NO_REPLY stays on the END of the response; stripTrailingNoReply
+  // then silences the whole turn, narration included (owner decision
+  // 2026-07-08). Only a mid-turn NO_REPLY block is dropped here.
+  it.each([
+    ["drops a mid-turn block whose trailing line is NO_REPLY, keeping the rest", ["A", "housekeeping\nNO_REPLY", "B"], "A\nB"],
+    ["drops a mid-turn NO_REPLY block that also carried an attachment tag", ["A", "MEDIA:/tmp/x.png\nNO_REPLY", "B"], "A\nB"],
+    ["keeps a trailing NO_REPLY so the delivery layer suppresses the turn", ["did the housekeeping", "NO_REPLY"], "did the housekeeping\nNO_REPLY"],
+    ["cuts only the block that leaked scaffold", ["A", "leaked\n_end_of_dialog_\nUser: hi", "B"], "A\nleaked\nB"],
+  ])("%s", async (_title, blocks, joined) => {
+    await expect(multiBlockTurn(blocks)).resolves.toBe(joined);
   });
 
   it("warns once when any block leaked scaffold", async () => {
     vi.mocked(log.warn).mockClear();
-    await multiBlockTurn(["A", "<system-reminder>note</system-reminder>", "B"]);
-    expect(vi.mocked(log.warn).mock.calls.some(([, msg]) => msg === "model scaffold leak filtered")).toBe(true);
+    await multiBlockTurn(["A", "<system-reminder>note</system-reminder>", "B", "<system-reminder>again</system-reminder>"]);
+    // Two blocks leaked; the turn still warns exactly once.
+    expect(vi.mocked(log.warn).mock.calls.filter(([, msg]) => msg === "model scaffold leak filtered")).toHaveLength(1);
   });
 });
 
@@ -1245,25 +1237,24 @@ describe("LiveSession error results", () => {
     expect(session.isAlive()).toBe(true);
   });
 
-  it("names the budget limit for error_max_budget_usd", async () => {
+  // Every other error_* subtype is a failed turn too (the budget one names
+  // its limit), and the session takes the next message as usual.
+  it.each([
+    ["error_max_budget_usd", "I hit the spending limit for this turn before finishing."],
+    ["error_during_execution", /stopped early/],
+    ["error_max_structured_output_retries", /stopped early/],
+  ])("rejects a %s result as a failed turn, and the session stays usable", async (subtype, message) => {
     const { session, harness } = makeSession();
-    const p = session.send("expensive");
+    const p = session.send("go");
     await waitFor(() => harness.inputs.length === 1);
-    harness.pushEvent(errorResult("error_max_budget_usd"));
-    await expect(p).rejects.toThrow("I hit the spending limit for this turn before finishing.");
-  });
+    harness.pushEvent(errorResult(subtype));
+    await expect(p).rejects.toThrow(message);
 
-  it("treats error_during_execution (and any other error_* subtype) as a failed turn", async () => {
-    const { session, harness } = makeSession();
-    const p = session.send("crash");
-    await waitFor(() => harness.inputs.length === 1);
-    harness.pushEvent(errorResult("error_during_execution"));
-    await expect(p).rejects.toThrow(/stopped early/);
-
-    const p2 = session.send("again");
+    const again = session.send("again");
     await waitFor(() => harness.inputs.length === 2);
-    harness.pushEvent(errorResult("error_max_structured_output_retries"));
-    await expect(p2).rejects.toThrow(/stopped early/);
+    harness.pushEvent(assistantEvent("fine now"));
+    harness.pushEvent(resultEvent());
+    await expect(again).resolves.toBe("fine now");
   });
 
   it("rejects a success result flagged is_error with the API error text, even after earlier blocks", async () => {
@@ -2091,5 +2082,26 @@ describe("LiveSession system/informational", () => {
       "SDK informational",
     );
     expect(log.warn).not.toHaveBeenCalledWith(expect.anything(), "SDK informational warning");
+  });
+});
+
+describe("LiveSession compactedSinceLastResult (spawn gate)", () => {
+  it("an SDK compact_boundary marks the last reading stale; the next turn's result clears it", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("hi");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent(assistantEvent("one"));
+    harness.pushEvent(resultEvent());
+    await expect(p1).resolves.toBe("one");
+    expect(session.compactedSinceLastResult).toBe(false);
+
+    const p2 = session.send("again");
+    await waitFor(() => harness.inputs.length === 2);
+    harness.pushEvent({ type: "system", subtype: "compact_boundary", uuid: "u-cb", session_id: "s1", compact_metadata: { trigger: "auto", pre_tokens: 900, post_tokens: 100 } });
+    await waitFor(() => session.compactedSinceLastResult);
+    harness.pushEvent(assistantEvent("two"));
+    harness.pushEvent(resultEvent());
+    await expect(p2).resolves.toBe("two");
+    expect(session.compactedSinceLastResult).toBe(false);
   });
 });

@@ -5,11 +5,11 @@ import { tmpdir } from "node:os";
 import { request, type IncomingMessage } from "node:http";
 import { consoleStateFromSession, macScreenSource, MAX_FRAME_BYTES, parseShot, ScreenLoop, type ConsoleState, type ScreenFrame, type ScreenShot, type ScreenSource } from "../src/web/screen.js";
 import { chmodSync } from "node:fs";
-import { startWebHttp } from "../src/web/http.js";
 import { WebData } from "../src/web/data.js";
 import { WebChannel } from "../src/channels/web.js";
 import { SessionStore } from "../src/sessions/store.js";
 import type { WebBootstrap } from "../src/web/protocol.js";
+import { API_HEADERS, channelRpc, startWebService, type WebService } from "./helpers/web-http.js";
 import { clampGeometry, defaultGeometry, MAX_WIDTH, MIN_WIDTH, parseScreenEvent, readGeometry, readScreen, streamWanted, updatedAgo, windowHeight, writeGeometry } from "../web/src/screen-stream.js";
 
 /** `capture` counts real pictures taken; `shoot` is the source's one call (lock check, then picture if unlocked). */
@@ -169,14 +169,12 @@ describe("lock state (fail closed)", () => {
 
 describe("screen over HTTP", () => {
   let root: string;
-  let service: Awaited<ReturnType<typeof startWebHttp>>;
+  let web: WebService;
   let channel: WebChannel;
-  let cookie = "";
   let boot: WebBootstrap;
   let source: ReturnType<typeof fakeSource>;
   let loop: ScreenLoop;
-  const token = "tomo_web_" + "e".repeat(64);
-  const headers = () => ({ "x-tomo-request": "1", "sec-fetch-site": "same-origin", cookie });
+  const headers = () => ({ ...API_HEADERS, cookie: web.cookie });
 
   async function start(withScreen = true) {
     root = realpathSync(mkdtempSync(join(tmpdir(), "tomo-web-screen-")));
@@ -186,19 +184,17 @@ describe("screen over HTTP", () => {
     new SessionStore(sessionsDir, 20, sdkSessionsDir).touchSession("dm:owner");
     channel = new WebChannel(owner); channel.onMessage(async () => true);
     source = fakeSource(); loop = new ScreenLoop(source);
-    service = await startWebHttp(0, { accessToken: token, assetsDir: root, data: new WebData({ sessionsDir, sdkSessionsDir, owner }),
+    web = await startWebService({ assetsDir: root, data: new WebData({ sessionsDir, sdkSessionsDir, owner }),
       ...(withScreen ? { screen: loop } : {}),
-      subscribe: (fn) => channel.events.subscribe(fn), rpc: async () => ({ snapshot: channel.snapshot(), replay: null }) });
-    const response = await fetch(`http://127.0.0.1:${service.port}/api/v1/bootstrap?t=${token}`, { headers: { "x-tomo-request": "1", "sec-fetch-site": "same-origin" } });
-    cookie = response.headers.getSetCookie()[0].split(";")[0];
-    boot = await response.json() as WebBootstrap;
+      subscribe: (fn) => channel.events.subscribe(fn), rpc: channelRpc(channel) });
+    boot = web.boot;
   }
-  afterEach(async () => { await service?.close(); await channel?.stop(); rmSync(root, { recursive: true, force: true }); cookie = ""; });
+  afterEach(async () => { await web?.close(); await channel?.stop(); rmSync(root, { recursive: true, force: true }); });
 
   /** Open the stream, collect the first `count` SSE blocks, then close it. */
   function stream(path: string, extra: Record<string, string> = {}, count = 1) {
     return new Promise<{ status: number; headers: IncomingMessage["headers"]; blocks: string[]; close: () => void }>((resolve, reject) => {
-      const req = request({ host: "127.0.0.1", port: service.port, path, headers: { ...headers(), ...extra } }, (res) => {
+      const req = request({ host: "127.0.0.1", port: web.port, path, headers: { ...headers(), ...extra } }, (res) => {
         const blocks: string[] = []; let buffer = "";
         const close = () => { req.destroy(); };
         if (res.statusCode !== 200) { let text = ""; res.on("data", (c) => { text += c; }); res.on("end", () => resolve({ status: res.statusCode!, headers: res.headers, blocks: [text], close })); return; }
@@ -235,20 +231,16 @@ describe("screen over HTTP", () => {
     expect(Buffer.from(frame.jpeg!, "base64").subarray(0, 3)).toEqual(Buffer.from([0xff, 0xd8, 0xff]));
     expect(loop.viewerCount).toBe(1);
     opened.close();
-    await vi.waitFor(() => expect(loop.viewerCount).toBe(0));
-    const after = source.capture.mock.calls.length;
-    await new Promise((resolve) => setTimeout(resolve, 1_200));
-    expect(source.capture.mock.calls.length).toBe(after);
+    // A loop that is not running takes no more pictures ("ScreenLoop … stops when the last one leaves").
+    await vi.waitFor(() => expect([loop.viewerCount, loop.running]).toEqual([0, false]));
   });
 
   it("two browsers share one capture loop", async () => {
     await start();
     const a = await stream(`/api/v1/screen?fps=1&epoch=${boot.epoch}`);
     const b = await stream(`/api/v1/screen?fps=1&epoch=${boot.epoch}`);
+    // One loop, two viewers; how often it captures for them is ScreenLoop's "shares one loop between viewers".
     expect(loop.viewerCount).toBe(2);
-    await new Promise((resolve) => setTimeout(resolve, 1_100));
-    // Two viewers at 1 fps for ~1 s: about two captures, not four.
-    expect(source.capture.mock.calls.length).toBeLessThanOrEqual(3);
     a.close(); b.close();
     await vi.waitFor(() => expect(loop.running).toBe(false));
   });
@@ -275,6 +267,7 @@ describe("browser helpers", () => {
 });
 
 describe("floating window", () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
   const desktop = { width: 1440, height: 900 };
   it("opens bottom right, about 480 px wide, clear of the composer and inside the viewport", () => {
     const g = defaultGeometry(desktop);
@@ -313,22 +306,19 @@ describe("floating window", () => {
   });
   it("closing the window (aborting) ends the read and the request", async () => {
     let aborted = false;
-    const original = globalThis.fetch;
-    globalThis.fetch = (async (_url: string, init: RequestInit) => {
+    vi.stubGlobal("fetch", async (_url: string, init: RequestInit) => {
       const body = new ReadableStream<Uint8Array>({ start(controller) {
         controller.enqueue(new TextEncoder().encode('event: frame\ndata: {"status":"live","capturedAt":1,"jpeg":"/9j/"}\n\n'));
         init.signal!.addEventListener("abort", () => { aborted = true; controller.error(new DOMException("aborted", "AbortError")); });
       } });
       return new Response(body, { status: 200 });
-    }) as typeof fetch;
-    try {
-      const controller = new AbortController();
-      const frames: unknown[] = [];
-      const done = readScreen(1, "e", controller.signal, (frame) => { frames.push(frame); controller.abort(); });
-      await expect(done).rejects.toThrow();
-      expect(frames).toHaveLength(1);
-      expect(aborted).toBe(true);
-    } finally { globalThis.fetch = original; }
+    });
+    const controller = new AbortController();
+    const frames: unknown[] = [];
+    const done = readScreen(1, "e", controller.signal, (frame) => { frames.push(frame); controller.abort(); });
+    await expect(done).rejects.toThrow();
+    expect(frames).toHaveLength(1);
+    expect(aborted).toBe(true);
   });
 });
 

@@ -175,6 +175,7 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
     return () => observer.disconnect();
   }, []);
 
+  // (After a reload, kept uploads come back as tray items still "uploading": canSendWith waits for them.)
   const canSend = writable && canSendWith(draft, attachments.items) && !sending && !restoring && !uncertain && live;
 
   const send = async (event: FormEvent) => {

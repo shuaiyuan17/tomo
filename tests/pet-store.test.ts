@@ -18,7 +18,8 @@ async function runPetTool(name: string, args: Record<string, unknown> = {}) {
   return tool.handler(args as never, {});
 }
 
-describe("PetStore", () => {
+/** A fresh pet directory and a frozen clock for every test in the describe. */
+function freshPetAtNewYear() {
   beforeEach(() => {
     mkdirSync(TEST_DIR, { recursive: true });
     vi.useFakeTimers();
@@ -29,6 +30,10 @@ describe("PetStore", () => {
     vi.useRealTimers();
     rmSync(TEST_DIR, { recursive: true, force: true });
   });
+}
+
+describe("PetStore", () => {
+  freshPetAtNewYear();
 
   it("starts pets as eggs and hatches after one day without stat decay", () => {
     const store = new PetStore(TEST_PATH);
@@ -46,44 +51,29 @@ describe("PetStore", () => {
     expect(pet.diary[0]).toContain("hatched into a baby");
   });
 
-  it("uses slow age and affection gates for later stages", () => {
+  // Each later stage is gated on age AND affection; a care mistake raises the
+  // teen -> adult affection bar. One row per side of each gate, so a failure
+  // names the gate that moved.
+  it.each([
+    // [from,    age days, affection, care mistakes, expected]
+    ["baby", 7, 19, 0, "baby"],
+    ["baby", 7, 20, 0, "child"],
+    ["teen", 30, 149, 0, "teen"],
+    ["teen", 30, 150, 0, "adult"],
+    ["teen", 30, 150, 1, "teen"],
+    ["teen", 30, 155, 1, "adult"],
+    ["adult", 180, 599, 0, "adult"],
+    ["adult", 180, 600, 0, "elder"],
+  ] as const)("a %s aged %i days with affection %i and %i care mistakes is a %s", (from, ageDays, affection, careMistakes, expected) => {
     const store = new PetStore(TEST_PATH);
     const pet = store.create("Mochi", "star");
-
-    vi.setSystemTime(new Date("2026-01-08T00:00:00Z"));
-    pet.stage = "baby";
-    pet.born_at = new Date(Date.now() - 7 * DAY_MS).toISOString();
-    pet.affection = 19;
-    expect(store.checkEvolution(pet).stage).toBe("baby");
-
-    pet.affection = 20;
-    expect(store.checkEvolution(pet).stage).toBe("child");
-
-    pet.stage = "teen";
-    pet.born_at = new Date(Date.now() - 30 * DAY_MS).toISOString();
-    pet.affection = 149;
-    pet.care_mistakes = 0;
-    expect(store.checkEvolution(pet).stage).toBe("teen");
-
-    pet.affection = 150;
-    expect(store.checkEvolution(pet).stage).toBe("adult");
-
-    pet.stage = "teen";
-    pet.affection = 150;
-    pet.care_mistakes = 1;
-    expect(store.checkEvolution(pet).stage).toBe("teen");
-
-    pet.affection = 155;
-    expect(store.checkEvolution(pet).stage).toBe("adult");
-
-    pet.stage = "adult";
-    pet.born_at = new Date(Date.now() - 180 * DAY_MS).toISOString();
-    pet.affection = 599;
-    pet.care_mistakes = 0;
-    expect(store.checkEvolution(pet).stage).toBe("adult");
-
-    pet.affection = 600;
-    expect(store.checkEvolution(pet).stage).toBe("elder");
+    Object.assign(pet, {
+      stage: from,
+      born_at: new Date(Date.now() - ageDays * DAY_MS).toISOString(),
+      affection,
+      care_mistakes: careMistakes,
+    });
+    expect(store.checkEvolution(pet).stage).toBe(expected);
   });
 
   it("puts a zero-health pet into recovery and blocks evolution", () => {
@@ -188,6 +178,12 @@ describe("PetStore", () => {
     expect(pet.care_mistakes).toBe(2);
     expect(pet.last_care_mistake_at).toBe(new Date(t0 + 7 * HOUR_MS).toISOString());
   });
+});
+
+// The tool on top of the store: feeding is what the agent calls, and its
+// affection rule lives in pet-tools.ts, not in PetStore.
+describe("pet_feed", () => {
+  freshPetAtNewYear();
 
   it("does not grant feed affection when full or recovering", async () => {
     const store = new PetStore(TEST_PATH);

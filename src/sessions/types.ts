@@ -3,6 +3,8 @@ export interface SessionMessage {
   requestId?: string;
   /** Canonical reply shared by web messages that joined the same SDK turn. */
   turnId?: string;
+  /** A non-web reply's attachments, filed for the web view under this id (Channel.mirrorMedia). */
+  mediaRef?: string;
   role: "user" | "assistant" | "tool_summary";
   content: string;
   channel: string;

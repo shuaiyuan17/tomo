@@ -3,8 +3,9 @@ import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { AdmissionPredicate, Channel, IncomingMessage, MessageReaction, OutgoingMessage, MessageHandler, CommandHandler, StopTypingOptions } from "../../src/channels/types.js";
-import { agentEnv, mockConfig, mockWorkspace, queryState, resetMockSdk } from "./agent-mocks.js";
+import { agentEnv, mockConfig, mockSdk, mockWorkspace, queryState, resetMockSdk } from "./agent-mocks.js";
 import { OwnerRouter } from "../../src/router.js";
+import * as sdkMockModule from "@anthropic-ai/claude-agent-sdk";
 
 // ---------------------------------------------------------------------------
 // Shared Agent test harness: MockChannel, message/config helpers, and the
@@ -188,6 +189,8 @@ export function resetConfig(overrides: Partial<typeof mockConfig> = {}) {
     sessionModelOverrides: {},
     // Fresh per reset: an "Always allow" writes into the live object.
     groupSandbox: { groups: {} },
+    // Fresh per reset too, so a test that mutates it in place cannot leak.
+    credentialBroker: { enabled: false },
     effort: null,
     sessionEffortOverrides: {},
     groupSecret: null,
@@ -214,6 +217,36 @@ export function makeMsg(overrides: Partial<IncomingMessage> = {}): IncomingMessa
 export async function drainQueue(agent: AgentType): Promise<void> {
   const queue = (agent as unknown as { sessionQueue: { drain(): Promise<void> } }).sessionQueue;
   await queue.drain();
+}
+
+/** Run one plain owner turn on `chatId` so the session and its reply target
+ *  exist (what a cron or background turn delivers to), then forget what that
+ *  turn delivered. The test's own `responseFn` is put back afterwards. */
+export async function seedSession(agent: AgentType, channel: MockChannel, chatId = "12345"): Promise<void> {
+  const responseFn = mockSdk.responseFn;
+  mockSdk.responseFn = () => "seeded";
+  await channel.simulateMessage(makeMsg({ chatId, text: "Hi" }));
+  await drainQueue(agent);
+  channel.clearDelivered();
+  mockSdk.responseFn = responseFn;
+}
+
+/** The legacy-shaped owner binding most suites write into `identities`. */
+export function ownerIdentity(name: string, channels: Record<string, string>) {
+  return { name, channels, replyPolicy: "last-active" };
+}
+
+/** How many SDK `query()` calls (live sessions built) there have been. */
+export function queryCallCount(): number {
+  return (sdkMockModule.query as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
+}
+
+/** The `options` the most recent SDK `query()` call was built with. */
+export function lastQueryOptions(): Record<string, unknown> & { env?: Record<string, string | undefined> } {
+  const calls = (sdkMockModule.query as unknown as { mock: { calls: Array<[{ options?: Record<string, unknown> }]> } }).mock.calls;
+  const options = calls.at(-1)?.[0]?.options;
+  if (!options) throw new Error("no SDK query() has been made yet");
+  return options;
 }
 
 export function peekPendingNotes(agent: AgentType, sessionKey: string): string[] {

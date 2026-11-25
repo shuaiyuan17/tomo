@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { startWebHttp } from "../src/web/http.js";
 import { WebData } from "../src/web/data.js";
-import { localizeIndexHtml } from "../src/web/static-assets.js";
 
 /**
  * config `locale` reaches the page before any script runs (on `<html>`), so
@@ -60,12 +59,6 @@ describe("the first paint's language", () => {
     expect(plain).not.toContain("data-tomo-locale");
     expect(await initialLanguage(plain, "zh-CN")).toBe("zh-Hans");
     expect(await initialLanguage(plain, "en-GB")).toBe("en");
-  });
-
-  it("leaves the page as built for an unset or malformed locale", () => {
-    const html = Buffer.from('<html lang="en"><body></body></html>');
-    expect(localizeIndexHtml(html, undefined)).toBe(html);
-    expect(localizeIndexHtml(html, '"><script>')).toBe(html);
   });
 });
 

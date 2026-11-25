@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { chromium, expect as browserExpect, type Browser, type Page } from "@playwright/test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 vi.mock("../../src/config.js", async () => (await import("../helpers/agent-mocks.js")).configModuleMock());
@@ -624,6 +624,122 @@ it("a picture the agent sends (MEDIA:<path>) shows as a thumbnail by id, never a
   await browserExpect(page.locator("main")).not.toContainText("MEDIA:");
   expect(await page.content()).not.toContain("gap.png");
   expect(await page.content()).not.toContain("long-gone");
+});
+
+it("a non-image file the agent sends (MEDIA:<path>.md) is a card with name and size: Download hands over its bytes, Preview shows its text; kept on reload", async () => {
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(resolve(tmpdir(), "tomo-e2e-file-"));
+  const file = resolve(dir, "pr636-review.md");
+  const text = "# Review\n\n- P2: timestamps <b>unchecked</b>\n";
+  writeFileSync(file, text);
+  mockSdk.responseFn = () => `The review:\nMEDIA:${file}`;
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("send me the review");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  const reply = page.locator("article.message.assistant").filter({ hasText: "The review:" });
+  const card = reply.getByRole("group", { name: `File pr636-review.md, ${Buffer.byteLength(text)} B` });
+  await browserExpect(card).toBeVisible();
+  const [download] = await Promise.all([page.waitForEvent("download"), card.getByRole("button", { name: "Download pr636-review.md" }).click()]);
+  expect(download.suggestedFilename()).toBe("pr636-review.md");
+  expect(readFileSync((await download.path())!, "utf8")).toBe(text);
+  await card.getByRole("button", { name: "Preview pr636-review.md" }).click();
+  const preview = page.getByRole("dialog", { name: "Preview pr636-review.md" });
+  // Plain text, never markup.
+  await browserExpect(preview.locator("pre")).toHaveText(text.trimEnd());
+  await browserExpect(preview.locator("b")).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await browserExpect(preview).toHaveCount(0);
+  // Recorded and reloaded: the same card, from the store (the source can go); never the path.
+  rmSync(dir, { recursive: true, force: true });
+  await page.reload();
+  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "The review:" }).getByRole("group", { name: /^File pr636-review\.md/ })).toBeVisible();
+  await browserExpect(page.locator("main")).not.toContainText("MEDIA:");
+  expect(await page.content()).not.toContain(dir);
+});
+
+it("a picture the owner's conversation sent on another channel (a Telegram reply) shows on the web too, not as \"no longer available\"", async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(resolve(tmpdir(), "tomo-e2e-mirror-"));
+  const file = resolve(dir, "after.png");
+  writeFileSync(file, solidPng(4, 4));
+  mockSdk.responseFn = () => `Before and after:\nMEDIA:${file}`;
+  await provider.simulateMessage(makeMsg({ chatId: "test-owner", senderName: "Owner", text: "Show me the UI change" }));
+  await drainQueue(agent);
+  expect(provider.delivered.some((message) => message.photo === file)).toBe(true);
+  await page.reload();
+  const image = page.locator("article.message.assistant").filter({ hasText: "Before and after:" }).getByRole("img", { name: "Image" });
+  await browserExpect.poll(() => image.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth).catch(() => 0)).toBe(4);
+  await browserExpect(page.getByText("Image (no longer available)")).toHaveCount(0);
+  expect(await page.content()).not.toContain(dir);
+});
+
+it("the tray survives a reload: finished uploads come back (thumbnail and all) and ride the next message to the model", async () => {
+  mockSdk.responseFn = () => "Got both screenshots.";
+  await page.locator("input[type=file]").setInputFiles([
+    { name: "normal.png", mimeType: "image/png", buffer: solidPng(3, 3) },
+    { name: "typing.png", mimeType: "image/png", buffer: solidPng(3, 3) }]);
+  const tray = page.getByRole("list", { name: "Attachments" });
+  await browserExpect(tray.getByRole("listitem", { name: /attached$/ })).toHaveCount(2);
+  // iPad Safari reloads a backgrounded tab: the tray used to come back empty while the uploads sat staged.
+  await page.reload();
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await browserExpect(tray.getByRole("listitem", { name: "normal.png, attached" })).toBeVisible();
+  await browserExpect(tray.getByRole("listitem", { name: "typing.png, attached" })).toBeVisible();
+  await browserExpect.poll(() => tray.locator("img").first().evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth).catch(() => 0)).toBe(3);
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("截图有收到吗？");
+  await page.getByRole("button", { name: "Send", exact: true }).click();
+  await browserExpect(page.locator(".message.assistant .markdown").last()).toHaveText("Got both screenshots.");
+  const blocks = mockSdk.userContents.at(-1) as Array<{ type: string }>;
+  expect(blocks.filter((block) => block.type === "image")).toHaveLength(2);
+  expect(readdirSync(uploadsDir(mockConfig.tomoHome))).toEqual([]);
+  // Sent: nothing comes back on the next reload.
+  await page.reload();
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await browserExpect(tray).toHaveCount(0);
+});
+
+it("after a reload, Send waits for the tray to come back; a read that errs (or a send still filing it) shows as failed with Retry, never silently dropped", async () => {
+  await page.locator("input[type=file]").setInputFiles([{ name: "slow.png", mimeType: "image/png", buffer: solidPng(2, 2) }]);
+  const tray = page.getByRole("list", { name: "Attachments" });
+  await browserExpect(tray.getByRole("listitem", { name: "slow.png, attached" })).toBeVisible();
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let mode: "fail" | "hold" = "fail";
+  await page.route(/\/api\/v1\/uploads\/[a-f0-9]{32}$/, async (route) => {
+    if (mode === "fail") { await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ error: "upload_claimed" }) }); return; }
+    await held; await route.continue();
+  });
+  const send = page.getByRole("button", { name: "Send", exact: true });
+  // The read errs: the item stays, failed, and Send stays off with text typed.
+  await page.reload();
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await browserExpect(tray.getByRole("listitem", { name: "slow.png, upload failed" })).toBeVisible();
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("with the picture");
+  await browserExpect(send).toBeDisabled();
+  // Kept across another reload too; this time the read is slow: shown as uploading, Send still off.
+  mode = "hold";
+  await page.reload();
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await browserExpect(tray.getByRole("listitem", { name: /^slow\.png, uploading/ })).toBeVisible();
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("with the picture");
+  await browserExpect(send).toBeDisabled();
+  release();
+  await browserExpect(tray.getByRole("listitem", { name: "slow.png, attached" })).toBeVisible();
+  await browserExpect(send).toBeEnabled();
+});
+
+it("a kept upload the server no longer has (sent elsewhere, expired) is dropped on reload, not offered", async () => {
+  await page.locator("input[type=file]").setInputFiles([{ name: "gone.png", mimeType: "image/png", buffer: solidPng(2, 2) }]);
+  const tray = page.getByRole("list", { name: "Attachments" });
+  await browserExpect(tray.getByRole("listitem", { name: "gone.png, attached" })).toBeVisible();
+  // Gone for good (as when it expires or another send took it): the server records it, and the page drops it.
+  const { discardUpload } = await import("../../src/web/uploads.js");
+  for (const name of readdirSync(uploadsDir(mockConfig.tomoHome))) discardUpload(uploadsDir(mockConfig.tomoHome), name.split(".")[0]);
+  await page.reload();
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await page.waitForTimeout(300);
+  await browserExpect(tray).toHaveCount(0);
 });
 
 it("calls the agent by its IDENTITY.md name (re-read on edit); the product keeps its own name", async () => {

@@ -3,7 +3,6 @@ import { appendFileSync, mkdtempSync, rmSync, statSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PRIVATE_HIDDEN, readSessionTools, SessionToolsError, transcriptToken, UNPAIRED_HIDDEN } from "../src/web/session-tools.js";
-import { redactText, redactToolInput } from "../src/web/redact-command.js";
 import { SessionStore } from "../src/sessions/store.js";
 import { WebData } from "../src/web/data.js";
 import { webSessionId } from "../src/web/owner.js";
@@ -74,25 +73,6 @@ describe("readSessionTools", () => {
     for (const secret of ["abc123", "sekret-value", "zzz", "sk-ant-abcdefghijkl", "diary.md", "notes.md"]) expect(shown).not.toContain(secret);
     expect(tool.kind === "tool" && tool.summary).not.toContain("abc123");
     expect(shown).toContain("<private>");
-  });
-});
-
-describe("redaction helpers", () => {
-  it("redactText keeps ordinary output (a=b stays) but masks credentials", () => {
-    expect(redactText("x=1 and y=2")).toBe("x=1 and y=2");
-    expect(redactText("ghp_abcdefghijklmnop")).not.toContain("ghp_abcdefghijklmnop");
-  });
-  it("redactToolInput masks secret-named fields whole, at any depth, whatever the value looks like", () => {
-    expect(redactToolInput({ password: "hunter2" })).toEqual({ password: "•••" });
-    expect(redactToolInput({ headers: { Authorization: "x" } })).toEqual({ headers: { Authorization: "•••" } });
-    expect(redactToolInput({ api_key: "opaque" })).toEqual({ api_key: "•••" });
-    expect(redactToolInput({ config: { list: [{ "Private-Key": { n: 1 } }, { ACCESS_KEY: 42 }] }, Cookie: "a=b", sessionToken: "s", path: "/a" }))
-      .toEqual({ config: { list: [{ "Private-Key": "•••" }, { ACCESS_KEY: "•••" }] }, Cookie: "•••", sessionToken: "•••", path: "/a" });
-    expect(JSON.stringify(redactToolInput({ a: { b: { c: { d: { e: { f: { g: { h: { i: { j: "deep" } } } } } } } } } }))).not.toContain("deep");
-  });
-  it("redactToolInput masks `command` as a shell line, at any depth, keeping the keys", () => {
-    const out = redactToolInput({ command: "export SECRET=v1 && run", nested: { list: ["/m/memory/private/a"] }, n: 3 });
-    expect(out).toEqual({ command: "export SECRET=••• && run", nested: { list: ["<private>"] }, n: 3 });
   });
 });
 

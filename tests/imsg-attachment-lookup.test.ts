@@ -2,12 +2,33 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { log } from "../src/logger.js";
-import { ChatDbAttachmentLookup, expandChatDbPath } from "../src/channels/imsg-attachment-lookup.js";
+import { ChatDbAttachmentLookup, expandChatDbPath, isTransientSqliteError } from "../src/channels/imsg-attachment-lookup.js";
 
 describe("expandChatDbPath", () => {
   it("expands chat.db's ~/ form and leaves absolute paths alone", () => {
     expect(expandChatDbPath("~/Library/Messages/Attachments/a/b.heic")).toBe(join(homedir(), "Library/Messages/Attachments/a/b.heic"));
     expect(expandChatDbPath("/abs/b.heic")).toBe("/abs/b.heic");
+  });
+});
+
+describe("isTransientSqliteError", () => {
+  const sqliteError = (errcode: number, message = "x") => Object.assign(new Error(message), { code: "ERR_SQLITE_ERROR", errcode });
+
+  it.each<[string, unknown, boolean]>([
+    ["SQLITE_BUSY (5)", sqliteError(5), true],
+    ["SQLITE_LOCKED (6)", sqliteError(6), true],
+    // Extended result codes carry the primary code in the low byte.
+    ["SQLITE_BUSY_RECOVERY (261 = 5 | 1<<8)", sqliteError(261), true],
+    ["SQLITE_BUSY_SNAPSHOT (517 = 5 | 2<<8)", sqliteError(517), true],
+    ["SQLITE_CANTOPEN (14)", sqliteError(14, "unable to open database file"), false],
+    ["a busy message without an errcode", new Error("database is busy"), true],
+    ["a locked message without an errcode", new Error("Database is LOCKED"), true],
+    ["an SQLITE_BUSY name in the message", new Error("step failed: SQLITE_BUSY"), true],
+    ["an unrelated error", new Error("no such table: attachment"), false],
+    ["a non-error", "database is locked?", false],
+    ["null", null, false],
+  ])("%s → %s", (_, err, transient) => {
+    expect(isTransientSqliteError(err)).toBe(transient);
   });
 });
 
@@ -39,6 +60,25 @@ describe("ChatDbAttachmentLookup", () => {
     expect(sqlite.all).toHaveBeenCalledWith("msg-guid");
     lookup.close();
     expect(sqlite.close).toHaveBeenCalled();
+  });
+
+  it("reads a bigint transfer_state as a number, and anything else as null", () => {
+    // node:sqlite hands back INTEGER columns as bigint when readBigInts is on.
+    const sqlite = fakeSqlite([
+      { filename: "/abs/a.png", transfer_name: "a.png", mime_type: "image/png", transfer_state: 5n },
+      { filename: "/abs/b.png", transfer_name: "b.png", mime_type: "image/png", transfer_state: "5" },
+    ]);
+    const lookup = new ChatDbAttachmentLookup("/db/chat.db", () => sqlite.module);
+    expect(lookup.attachmentsForMessage("g").map((r) => r.transferState)).toEqual([5, null]);
+    lookup.close();
+  });
+
+  it("closes the database it opened when prepare() throws", () => {
+    const sqlite = fakeSqlite([]);
+    sqlite.prepare.mockImplementation(() => { throw new Error("no such table: attachment"); });
+    const lookup = new ChatDbAttachmentLookup("/db/chat.db", () => sqlite.module);
+    expect(lookup.attachmentsForMessage("g")).toEqual([]);
+    expect(sqlite.close).toHaveBeenCalledTimes(1);
   });
 
   it("degrades to no rows when chat.db cannot be opened or queried", () => {

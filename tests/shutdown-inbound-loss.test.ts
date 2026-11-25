@@ -11,6 +11,7 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 import {
   Agent,
   MockChannel,
+  expectNoChangeFor,
   installAgentTestHooks,
   makeMsg,
   mockConfig,
@@ -153,11 +154,12 @@ describe("shutdown waits for in-flight parses before draining (#294 round 6)", (
 
     let stopped = false;
     const stopping = agent.stop().then(() => { stopped = true; });
-    await new Promise((r) => setTimeout(r, 30));
 
     // Shutdown is held open by quiesce, and the channel is NOT torn down yet.
-    expect(stopped).toBe(false);
-    expect(channel.tornDown).toBe(false);
+    await expectNoChangeFor(() => {
+      expect(stopped).toBe(false);
+      expect(channel.tornDown).toBe(false);
+    }, 30);
 
     parked.release();
     await stopping;
@@ -194,8 +196,7 @@ describe("shutdown waits for in-flight parses before draining (#294 round 6)", (
     // drain overlaps with a channel that must still be able to send.
     const parked = channel.beginSlowMessage(makeMsg({ chatId: "560", text: "parked mid-parse" }));
     const stopping = agent.stop();
-    await new Promise((r) => setTimeout(r, 30));
-    expect(channel.tornDown).toBe(false);
+    await expectNoChangeFor(() => expect(channel.tornDown).toBe(false), 30);
 
     // The turn finishes mid-shutdown and its block goes out over a channel
     // that is still alive. Under the old order (#294) the channel was fully

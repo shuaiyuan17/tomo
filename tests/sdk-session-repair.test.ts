@@ -196,4 +196,46 @@ describe("repairSdkSessionFile", () => {
     const [event] = readFileSync(path, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
     expect(event.message.content[0].content).toEqual([{ type: "text", text: "result" }]);
   });
+
+  // The fail-closed branch of a rewriter: an unparseable line stops the whole
+  // repair before anything is written. The file stays byte-identical, with no
+  // backup beside it, even though an earlier line WAS repairable.
+  it("refuses a file with an unparseable line: error returned, file untouched, no backup", () => {
+    const path = tempSessionPath();
+    const original = JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "" }] } })
+      + "\n{ not json\n";
+    writeFileSync(path, original);
+
+    const result = repairSdkSessionFile(path);
+
+    expect(result.repaired).toBe(false);
+    expect(result.error).toMatch(/^Could not parse SDK session JSONL line 2: /);
+    expect(readFileSync(path, "utf-8")).toBe(original);
+    expect(existsSync(`${path}.repair.bak`)).toBe(false);
+  });
+
+  it("leaves a file with nothing to repair alone: not rewritten, no backup", () => {
+    const path = tempSessionPath();
+    // Spacing JSON.stringify would not write: a rewrite would show.
+    const original = '{ "type": "assistant", "message": { "role": "assistant", "content": [{ "type": "text", "text": "pong" }] } }\n\n';
+    writeFileSync(path, original);
+
+    const result = repairSdkSessionFile(path);
+
+    expect(result).toMatchObject({ repaired: false, changedEvents: 0, changedBlocks: 0 });
+    expect(result.error).toBeUndefined();
+    expect(readFileSync(path, "utf-8")).toBe(original);
+    expect(existsSync(`${path}.repair.bak`)).toBe(false);
+  });
+
+  it("returns an unrepaired result for a missing or blank file", () => {
+    const missing = tempSessionPath();
+    expect(repairSdkSessionFile(missing)).toMatchObject({ repaired: false, changedBlocks: 0 });
+    expect(existsSync(missing)).toBe(false);
+
+    const blank = tempSessionPath();
+    writeFileSync(blank, "  \n");
+    expect(repairSdkSessionFile(blank)).toMatchObject({ repaired: false, changedBlocks: 0 });
+    expect(readFileSync(blank, "utf-8")).toBe("  \n");
+  });
 });

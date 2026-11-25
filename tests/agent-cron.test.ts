@@ -24,7 +24,9 @@ import {
   installAgentTestHooks,
   makeMsg,
   mockSdk,
+  ownerIdentity,
   resetConfig,
+  seedSession,
   waitFor,
 } from "./helpers/agent-harness.js";
 import { log } from "../src/logger.js";
@@ -39,10 +41,7 @@ describe("cron message delivery", () => {
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
-    mockSdk.responseFn = () => "seeded";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
+    await seedSession(agent, tg);
 
     mockSdk.responseFn = () => "All done!";
     await expect(agent.handleCronMessage("Task", "telegram:12345")).resolves.toBe(true);
@@ -63,10 +62,7 @@ describe("cron message delivery", () => {
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
-    mockSdk.responseFn = () => "seeded";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
+    await seedSession(agent, tg);
 
     mockSdk.responseFn = () => "got as far as this";
     mockSdk.nextResult = { subtype: "error_max_turns", is_error: true, errors: ["too many turns"] };
@@ -121,107 +117,30 @@ describe("cron message delivery", () => {
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
+    await seedSession(agent, tg);
     mockSdk.responseFn = () => "Time to stretch!";
-
-    // Establish session first
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
 
     await agent.handleCronMessage("Stretch reminder", "telegram:12345");
 
-    // Cron uses channel.send(), not streaming
-    expect(tg.sent.length).toBeGreaterThanOrEqual(1);
-    expect(tg.sent[0].chatId).toBe("12345");
-    expect(tg.sent[0].text).toBe("Time to stretch!");
-
-    await agent.stop();
-  });
-
-  it("delivers a multi-line cron response as one message", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => "seeded";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
-
-    mockSdk.responseFn = () => "  first brief  \nsecond detail\n\n  third brief  ";
-
-    await agent.handleCronMessage("Morning briefing", "telegram:12345");
-
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("first brief  \nsecond detail\n\n  third brief");
-
-    await agent.stop();
-  });
-
-  it("keeps cron MEDIA captions attached instead of newline-splitting them away from the photo", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-    const imagePath = join(agentEnv.tmpDir, "cron-captioned-photo.png");
-    writeFileSync(imagePath, "fake image");
-
-    mockSdk.responseFn = () => "seeded";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
-
-    mockSdk.responseFn = () => `caption line 1\ncaption line 2 MEDIA:"${imagePath}"`;
-
-    await agent.handleCronMessage("Morning briefing", "telegram:12345");
-
-    expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0]).toMatchObject({
-      chatId: "12345",
-      text: "caption line 1\ncaption line 2",
-      photo: imagePath,
-    });
+    expect(tg.sent[0]).toMatchObject({ chatId: "12345", text: "Time to stretch!" });
 
     await agent.stop();
   });
 
   it("delivers cron response to dm: session via identity", async () => {
-    resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-    });
+    resetConfig({ identities: [ownerIdentity("shuai", { telegram: "12345" })] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
+    await seedSession(agent, tg);
     mockSdk.responseFn = () => "Daily briefing";
-
-    // Establish session
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
 
     await agent.handleCronMessage("Morning briefing", "dm:shuai");
 
-    expect(tg.sent.length).toBeGreaterThanOrEqual(1);
-    expect(tg.sent[0].chatId).toBe("12345");
-
-    await agent.stop();
-  });
-
-  it("suppresses NO_REPLY in cron", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => "NO_REPLY";
-
-    // Establish session
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
-
-    await agent.handleCronMessage("Check something", "telegram:12345");
-
-    expect(tg.sent).toHaveLength(0);
+    expect(tg.sent).toHaveLength(1);
+    expect(tg.sent[0]).toMatchObject({ chatId: "12345", text: "Daily briefing" });
 
     await agent.stop();
   });
@@ -287,28 +206,6 @@ describe("cron message delivery", () => {
     expect(prompts[1]).toContain("Recent Tomo errors before this turn");
     expect(prompts[1]).toContain("[error] You've hit your session limit");
     expect(tg.delivered.map((d) => d.text)).toEqual(["recovered"]);
-
-    await agent.stop();
-  });
-
-  it("caps pending error notes before injecting them into a prompt", async () => {
-    const agent = new Agent();
-    const internals = agent as unknown as {
-      queuePendingErrorNote: (sessionKey: string, visibleError: string) => void;
-      drainPendingNotes: (sessionKey: string) => string;
-    };
-
-    for (let i = 0; i < 10; i++) {
-      internals.queuePendingErrorNote("telegram:12345", `[error] err-${i} ${"x".repeat(450)}`);
-    }
-
-    const drained = internals.drainPendingNotes("telegram:12345");
-    const bulletCount = drained.match(/\n- /g)?.length ?? 0;
-
-    expect(bulletCount).toBeLessThanOrEqual(3);
-    expect(drained.length).toBeLessThan(1500);
-    expect(drained).not.toContain("err-0");
-    expect(drained).toContain("err-9");
 
     await agent.stop();
   });
@@ -382,11 +279,7 @@ describe("cron message delivery", () => {
   });
 
   it("waitForHandoff resolves only after the summoned session's turn actually runs", async () => {
-    resetConfig({
-      identities: [
-        { name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" },
-      ],
-    });
+    resetConfig({ identities: [ownerIdentity("shuai", { telegram: "12345" })] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -427,11 +320,7 @@ describe("cron message delivery", () => {
   });
 
   it("runs group background work on the summoned dm session without reviving the group session", async () => {
-    resetConfig({
-      identities: [
-        { name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" },
-      ],
-    });
+    resetConfig({ identities: [ownerIdentity("shuai", { telegram: "12345" })] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -459,11 +348,7 @@ describe("cron message delivery", () => {
 
 describe("background task notification delivery", () => {
   it("routes task-notification-triggered output to the session reply target", async () => {
-    resetConfig({
-      identities: [
-        { name: "shuai", channels: { telegram: "12345", imessage: "+15551234567" }, replyPolicy: "last-active" },
-      ],
-    });
+    resetConfig({ identities: [ownerIdentity("shuai", { telegram: "12345", imessage: "+15551234567" })] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     const im = new MockChannel("imessage");
@@ -491,10 +376,7 @@ describe("background task notification delivery", () => {
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
-    mockSdk.responseFn = () => "seeded";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
+    await seedSession(agent, tg);
 
     expect(mockSdk.queryControllers).toHaveLength(1);
     mockSdk.queryControllers[0].pushTaskNotificationTurn("NO_REPLY");
@@ -509,79 +391,17 @@ describe("background task notification delivery", () => {
   // A "background task/agent" notifying another session (e.g. via the
   // delegate send_message tool, or a scheduled cron job) runs through
   // handleCronMessage -> TurnRunner, on the SAME per-block delivery path as
-  // an owner reply: each completed block ships as it completes.
-  //
-  // NO_REPLY is therefore enforced per block (owner decision 2026-07-08, kept
-  // exactly, at block scope): a block whose trailing line is the bare token
-  // ships nothing at all, narration and attachments together. The #222
-  // protection is unchanged — inline mentions of NO_REPLY do not silence.
-  it("sends nothing for a send-turn whose narration block ends in NO_REPLY", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => "seeded";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
-
-    // The token is inside the narration block, so the block ships nothing —
-    // text and attachments together. This is the invariant that survives
-    // mid-turn delivery intact.
-    mockSdk.responseFn = () => [
-      { type: "tool_use", name: "Read", input: { file_path: "/tmp/a" } },
-      "housekeeping narration not meant for the channel\nNO_REPLY",
-    ];
-    await expect(agent.handleCronMessage("System: background task done", "telegram:12345")).resolves.toBe(true);
-
-    expect(tg.delivered).toHaveLength(0);
-    expect(tg.sent).toHaveLength(0);
-
-    await agent.stop();
-  });
-
-  /**
-   * The honest cost of mid-turn delivery, asserted rather than discovered.
-   *
-   * The reported repro shape is text -> tool_use -> tool_use -> NO_REPLY. The
-   * narration is its OWN completed block, so it reaches the channel before the
-   * model ever writes the token — no end-of-turn rule can recall it, and
-   * holding only the LAST block back would not have saved it either. A turn
-   * that must stay silent whatever the model writes has to say so up front
-   * with suppressDelivery (next test), which does not depend on the model.
-   */
-  it("cannot unsend an earlier narration block when a later block is NO_REPLY", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => "seeded";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
-
-    mockSdk.responseFn = () => [
-      "housekeeping narration not meant for the channel",
-      { type: "tool_use", name: "Read", input: { file_path: "/tmp/a" } },
-      { type: "tool_use", name: "Read", input: { file_path: "/tmp/b" } },
-      "NO_REPLY",
-    ];
-    await expect(agent.handleCronMessage("System: background task done", "telegram:12345")).resolves.toBe(true);
-
-    expect(tg.delivered.map((d) => d.text)).toEqual(["housekeeping narration not meant for the channel"]);
-
-    await agent.stop();
-  });
-
+  // an owner reply: each completed block ships as it completes. What each
+  // response shape ships (per-block NO_REPLY, #222, a narration block that a
+  // later NO_REPLY cannot unsend) is the table in tests/agent-delivery.test.ts,
+  // run through both ingress paths. A turn that must stay silent whatever the
+  // model writes says so up front:
   it("suppressDelivery silences every block of a send-turn, mid-turn included", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
 
-    mockSdk.responseFn = () => "seeded";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
+    await seedSession(agent, tg);
 
     mockSdk.responseFn = () => [
       "narration the channel must never see",
@@ -599,85 +419,6 @@ describe("background task notification delivery", () => {
     await agent.stop();
   });
 
-  it("#222: delivers send-turn prose that merely mentions NO_REPLY inline", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => "seeded";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
-
-    mockSdk.responseFn = () => "The literal token is NO_REPLY.";
-    await expect(agent.handleCronMessage("System: background task done", "telegram:12345")).resolves.toBe(true);
-
-    expect(tg.delivered).toHaveLength(1);
-    expect(tg.delivered[0]).toMatchObject({ chatId: "12345", text: "The literal token is NO_REPLY." });
-
-    await agent.stop();
-  });
-
-  it("#222: repeated trailing NO_REPLY blocks with no visible text stay silent", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => "seeded";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
-
-    mockSdk.responseFn = () => ["NO_REPLY", "NO_REPLY"];
-    await expect(agent.handleCronMessage("System: housekeeping task", "telegram:12345")).resolves.toBe(true);
-
-    expect(tg.delivered).toHaveLength(0);
-    expect(tg.sent).toHaveLength(0);
-
-    await agent.stop();
-  });
-
-  it("#222: a send-turn whose ONLY content is NO_REPLY (even after tool calls) stays silent", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => "seeded";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
-
-    mockSdk.responseFn = () => [
-      { type: "tool_use", name: "Read", input: { file_path: "/tmp/a" } },
-      { type: "tool_use", name: "Read", input: { file_path: "/tmp/b" } },
-      "NO_REPLY",
-    ];
-    await expect(agent.handleCronMessage("System: housekeeping task", "telegram:12345")).resolves.toBe(true);
-
-    expect(tg.delivered).toHaveLength(0);
-    expect(tg.sent).toHaveLength(0);
-
-    await agent.stop();
-  });
-
-  it("#222: a bare NO_REPLY send-turn (no tool calls) still stays silent (no regression)", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    mockSdk.responseFn = () => "seeded";
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-    tg.clearDelivered();
-
-    mockSdk.responseFn = () => "NO_REPLY";
-    await expect(agent.handleCronMessage("System: housekeeping task", "telegram:12345")).resolves.toBe(true);
-
-    expect(tg.delivered).toHaveLength(0);
-    expect(tg.sent).toHaveLength(0);
-
-    await agent.stop();
-  });
 });
 
 
@@ -985,23 +726,6 @@ describe("compact nudges", () => {
     await agent.stop();
   });
 
-  it("falls through to daily below the compact threshold when nothing is prunable", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-    seedDailyRollupSourceEvents();
-
-    mockSdk.contextUsage = { totalTokens: 144_000, maxTokens: 200_000 };
-    await tg.simulateMessage(makeMsg({ text: "Hi" }));
-    await drainQueue(agent);
-
-    await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
-    expect(nudgePrompts()[0]).toContain("tomo lcm daily");
-    expect(nudgePrompts()[0]).not.toContain("prune-tools");
-
-    await agent.stop();
-  });
-
   it("fires the daily rollup below the compact threshold, escalates once, and re-arms below reset", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -1012,8 +736,10 @@ describe("compact nudges", () => {
     mockSdk.contextUsage = { totalTokens: 144_000, maxTokens: 200_000 };
     await tg.simulateMessage(makeMsg({ text: "Hi" }));
     await drainQueue(agent);
+    // Nothing in the transcript is prunable, so the nudge falls through to daily.
     await waitFor(() => expect(nudgePrompts()).toHaveLength(1));
     expect(nudgePrompts()[0]).toContain("tomo lcm daily");
+    expect(nudgePrompts()[0]).not.toContain("prune-tools");
 
     // Crossing 80% escalates to a compact nudge even though daily fired.
     mockSdk.contextUsage = { totalTokens: 170_000, maxTokens: 200_000 };
@@ -1124,23 +850,6 @@ describe("silent cron turns tell the model their reply text is dropped", () => {
     return { agent, prompts };
   }
 
-  it("adds the delivery note to a suppressed lcm-rollup turn", async () => {
-    const { agent, prompts } = await seededAgent();
-
-    const rollup = formatTomoEvent(
-      "lcm-rollup",
-      "An LCM rollup is due. The completed period `daily 2026-08-28` has 5 raw events ready to consolidate.",
-      { name: "daily 2026-08-28" },
-    );
-    await agent.handleCronMessage(rollup, "telegram:12345", { showTyping: false, suppressDelivery: true });
-
-    expect(prompts).toHaveLength(1);
-    expect(prompts[0]).toContain("An LCM rollup is due");
-    expect(prompts[0]).toContain(CONTINUITY_DELIVERY_NOTE);
-
-    await agent.stop();
-  });
-
   it("adds it to any other suppressed cron-triggered turn", async () => {
     const { agent, prompts } = await seededAgent();
 
@@ -1160,7 +869,7 @@ describe("silent cron turns tell the model their reply text is dropped", () => {
    * would consume a warm-tail slot meant for something the owner actually
    * said — and the sentence would sit in the SDK JSONL as user-authored text.
    */
-  it("writes the sentence into the event body, so LCM still sees a harness event", async () => {
+  it("adds the note to a suppressed lcm-rollup turn, inside the event body, so LCM still sees a harness event", async () => {
     const { agent, prompts } = await seededAgent();
 
     const rollup = formatTomoEvent(
@@ -1170,7 +879,9 @@ describe("silent cron turns tell the model their reply text is dropped", () => {
     );
     await agent.handleCronMessage(rollup, "telegram:12345", { showTyping: false, suppressDelivery: true });
 
+    expect(prompts).toHaveLength(1);
     const prompt = prompts[0];
+    expect(prompt).toContain("An LCM rollup is due");
     expect(prompt).toContain(CONTINUITY_DELIVERY_NOTE);
     // The sentence is the last line of the BODY; the envelope still closes the
     // message, and the envelope's own attributes are untouched.

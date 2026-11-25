@@ -204,5 +204,6 @@ export const LiveReply = memo(function LiveReply({ block, agent, sessionId }: { 
   const { t } = useTranslation("chat");
   return <article className="message assistant motion-enter mx-auto mb-7 max-w-[740px]">
     <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{agent}</span><span>{t("message.inProgress")}</span></div>
-    <div className="markdown reading"><MessageBody body={[block.text, ...(block.images ?? []).map((id) => `MEDIA:web:${id}`)].filter(Boolean).join("\n")} sessionId={sessionId} thinking="block" /></div></article>;
+    <div className="markdown reading"><MessageBody body={[block.text, ...(block.images ?? []).map((id) => `MEDIA:web:${id}`),
+      ...(block.files ?? []).map((file) => `MEDIA:web:file:${file.id}:${file.size}:${file.name}`)].filter(Boolean).join("\n")} sessionId={sessionId} thinking="block" /></div></article>;
 });

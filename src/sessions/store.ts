@@ -321,12 +321,25 @@ export class SessionStore {
    * that would be written back for it, and nothing is written back for it.
    */
   private sidecarMessages = new WeakSet<SessionMessage>();
+  private readonly registryLockOptions: FileLockOptions;
+  private readonly transcriptLockOptions: FileLockOptions;
+  private readonly ledgerLockOptions: FileLockOptions;
 
   constructor(
     dir: string,
     historyLimit: number,
     sdkSessionsDir: string,
-    opts?: { tailMessages?: number; rotateBytes?: number; readOnly?: boolean },
+    opts?: {
+      tailMessages?: number;
+      rotateBytes?: number;
+      readOnly?: boolean;
+      /**
+       * How long to wait for each cross-process lock before giving up. The
+       * defaults are the constants above; tests that hold a lock on purpose
+       * shorten them so a refusal does not cost seconds of wall time.
+       */
+      lockTimeoutMs?: { registry?: number; transcript?: number; ledger?: number };
+    },
   ) {
     if (!sdkSessionsDir) {
       throw new Error("SessionStore requires an explicit SDK sessions directory");
@@ -336,6 +349,10 @@ export class SessionStore {
     this.sdkSessionsDir = sdkSessionsDir;
     this.tailLimit = opts?.tailMessages ?? Math.max(TRANSCRIPT_TAIL_MIN, historyLimit * 10);
     this.rotateBytes = opts?.rotateBytes ?? TRANSCRIPT_ROTATE_BYTES;
+    const timeouts = opts?.lockTimeoutMs;
+    this.registryLockOptions = timeouts?.registry === undefined ? REGISTRY_LOCK_OPTIONS : { timeoutMs: timeouts.registry };
+    this.transcriptLockOptions = timeouts?.transcript === undefined ? TRANSCRIPT_LOCK_OPTIONS : { timeoutMs: timeouts.transcript };
+    this.ledgerLockOptions = timeouts?.ledger === undefined ? LEGACY_STEM_LEDGER_LOCK_OPTIONS : { timeoutMs: timeouts.ledger };
     if (!this.readOnly) mkdirSync(dir, { recursive: true });
     this.loadRegistry();
     if (!this.readOnly) {
@@ -1586,7 +1603,7 @@ export class SessionStore {
         entered = true;
         this.registryLockErrorLogged = false;
         return body();
-      }, REGISTRY_LOCK_OPTIONS);
+      }, this.registryLockOptions);
     } catch (err) {
       // Anything `fn` itself threw keeps its existing meaning.
       if (entered) throw err;
@@ -1795,7 +1812,7 @@ export class SessionStore {
           + "only record of the owners they held",
         );
         return true;
-      }, LEGACY_STEM_LEDGER_LOCK_OPTIONS);
+      }, this.ledgerLockOptions);
     } catch (err) {
       log.warn(
         { err, file: this.legacyStemLedgerPath },
@@ -1834,7 +1851,7 @@ export class SessionStore {
         if (!existsSync(this.legacyStemLedgerPath)) return;
         this.legacyStemLedgerUnparseable = true;
         this.quarantineLegacyStemLedger();
-      }, LEGACY_STEM_LEDGER_LOCK_OPTIONS);
+      }, this.ledgerLockOptions);
     } catch (err) {
       log.warn(
         { err, file: this.legacyStemLedgerPath },
@@ -2042,7 +2059,7 @@ export class SessionStore {
           writeJsonAtomicSync(this.legacyStemLedgerPath, { version: 1, stems } satisfies LegacyStemLedgerFile);
         }
         return true;
-      }, LEGACY_STEM_LEDGER_LOCK_OPTIONS);
+      }, this.ledgerLockOptions);
     } catch (err) {
       log.warn(
         { err, file: this.legacyStemLedgerPath, keys: [...keys] },
@@ -2091,7 +2108,7 @@ export class SessionStore {
         writeJsonAtomicSync(this.legacyStemLedgerPath, { version: 1, stems } satisfies LegacyStemLedgerFile);
         log.debug({ stems: dropped }, "Pruned legacy transcript stem ledger rows with nothing left on disk");
         return dropped;
-      }, LEGACY_STEM_LEDGER_LOCK_OPTIONS);
+      }, this.ledgerLockOptions);
     } catch (err) {
       log.warn({ err, file: this.legacyStemLedgerPath }, "Could not prune the legacy transcript stem ledger");
       return [];
@@ -2301,7 +2318,7 @@ export class SessionStore {
           "Session registry recovered from its backup; stats and titles since the last link change may be stale",
         );
         return true;
-      }, REGISTRY_LOCK_OPTIONS);
+      }, this.registryLockOptions);
     } catch (err) {
       log.error({ err, file, backup: bak, reason }, "Could not recover the session registry from its backup");
       return false;
@@ -2347,7 +2364,7 @@ export class SessionStore {
         if (this.registryLoadError !== null || !this.registry.some((e) => e.sdkSessionId)) return;
         if (this.registryBackupHoldsLinks()) { this.registryBackupStale = false; return; }
         this.writeRegistryBackup("seed");
-      }, REGISTRY_LOCK_OPTIONS);
+      }, this.registryLockOptions);
     } catch (err) {
       // Runs from the constructor: never let it stop the store starting.
       log.debug({ err }, "Skipped seeding the session registry backup");
@@ -2501,7 +2518,7 @@ export class SessionStore {
         written = true;
         writeJsonAtomicSync(this.registryPath, data, { fsync: true });
         ownStat = this.statRegistry();
-      }, REGISTRY_LOCK_OPTIONS);
+      }, this.registryLockOptions);
     } catch (err) {
       // Past the lock: the write itself failed, and that is the caller's news.
       if (written) throw err;
@@ -2923,7 +2940,7 @@ export class SessionStore {
       outcome = withFileLockSync(
         this.transcriptLockPath,
         () => this.carryLegacyTranscriptFamily(key, legacy, stem),
-        TRANSCRIPT_LOCK_OPTIONS,
+        this.transcriptLockOptions,
       );
     } catch (err) {
       if (!(err instanceof FileLockTimeoutError)) throw err;
@@ -3052,7 +3069,7 @@ export class SessionStore {
           if (active) return moved;
         }
         return moved;
-      }, TRANSCRIPT_LOCK_OPTIONS);
+      }, this.transcriptLockOptions);
     } catch (err) {
       if (!(err instanceof FileLockTimeoutError)) throw err;
       this.warnOnce(this.transcriptLockWarned, stem, () => log.warn(

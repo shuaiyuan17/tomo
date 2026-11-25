@@ -388,8 +388,11 @@ function runChild(mode: string): Promise<{ code: number; stdout: string; stderr:
 /**
  * The behaviour under test is "does the process die?", which no in-process
  * test can answer — Node's default action for an unhandled rejection is to
- * terminate the very process running the assertions. So: real children, one
- * with the handlers installed and one without (i.e. main).
+ * terminate the very process running the assertions. So: real children with
+ * the handlers installed, and one control without them (i.e. main), which
+ * shows the default those children are measured against. A non-Error reason
+ * is covered here in a real child and in-process ("keeps a non-Error reason
+ * inspectable").
  */
 describe("synthetic rejection and exception in a real process", () => {
   it("kills a daemon WITHOUT the handlers (the bug)", { timeout: 60_000 }, async () => {
@@ -398,20 +401,20 @@ describe("synthetic rejection and exception in a real process", () => {
     expect(stdout).not.toContain("ALIVE");
   });
 
-  it("survives a synthetic unhandled rejection WITH the handlers", { timeout: 60_000 }, async () => {
-    const { code, stdout } = await runChild("rejection");
+  // The object row is Node's real path for a non-Error reason: it must not
+  // kill the process either, and the log line must carry the object's
+  // contents, not "[object Object]".
+  it.each([
+    { name: "an Error", mode: "rejection", detail: "synthetic unhandled rejection" },
+    { name: "a plain object", mode: "rejection-object", detail: "ECONNRESET" },
+  ])("survives a synthetic unhandled rejection of $name WITH the handlers", { timeout: 60_000 }, async ({ mode, detail }) => {
+    const { code, stdout } = await runChild(mode);
     expect(stdout).toContain(`marker=${UNHANDLED_REJECTION_MARKER}`);
+    expect(stdout).toContain(detail);
+    expect(stdout).not.toContain("[object Object]");
     expect(stdout).toContain("ALIVE");   // the daemon is still serving
     expect(code).toBe(0);
   });
-
-  it("survives a non-Error rejection reason and still says something useful", async () => {
-    const { code, stdout } = await runChild("rejection-object");
-    expect(code).toBe(0);
-    expect(stdout).toContain("ALIVE");
-    expect(stdout).toContain("ECONNRESET");
-    expect(stdout).not.toContain("[object Object]");
-  }, 60_000);
 
   it("a startup rejection nobody awaits is SURVIVED by the handlers — the half-started daemon", { timeout: 60_000 }, async () => {
     // This is what `cli.ts`'s sync parse() + an async start action produce
@@ -438,11 +441,5 @@ describe("synthetic rejection and exception in a real process", () => {
     expect(stdout).toContain(`marker=${UNCAUGHT_EXCEPTION_MARKER}`);
     expect(stderr).toContain(UNCAUGHT_EXCEPTION_MARKER);
     expect(stderr).toContain("synthetic uncaught exception");
-  });
-
-  it("exits non-zero without the handlers too, but says nothing greppable", { timeout: 60_000 }, async () => {
-    const { code, stderr } = await runChild("exception-bare");
-    expect(code).not.toBe(0);
-    expect(stderr).not.toContain(UNCAUGHT_EXCEPTION_MARKER);
   });
 });

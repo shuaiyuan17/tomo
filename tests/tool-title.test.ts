@@ -22,3 +22,64 @@ describe("toolTitle (what a reader sees on a folded tool row)", () => {
     expect(toolTitleIsProse("Read", { file_path: "/a", description: "x" })).toBe(false);
   });
 });
+
+describe("summarizeToolInput", () => {
+  it("returns tool name when no input", () => {
+    expect(summarizeToolInput("Read")).toBe("Read");
+    expect(summarizeToolInput("Bash")).toBe("Bash");
+  });
+
+  it("formats Read with file_path", () => {
+    expect(summarizeToolInput("Read", { file_path: "/src/index.ts" })).toBe("Read /src/index.ts");
+  });
+
+  it("formats Write with file_path", () => {
+    expect(summarizeToolInput("Write", { file_path: "/tmp/output.json" })).toBe("Write /tmp/output.json");
+  });
+
+  it("formats Edit with file_path", () => {
+    expect(summarizeToolInput("Edit", { file_path: "/src/config.ts" })).toBe("Edit /src/config.ts");
+  });
+
+  it("formats Bash with truncated command", () => {
+    const longCommand = "npm run build && npm test && echo done " + "x".repeat(1000);
+    const result = summarizeToolInput("Bash", { command: longCommand });
+    expect(result.startsWith("Bash: npm run build")).toBe(true);
+    expect(result.length).toBe(506); // "Bash: " (6) + 500
+  });
+
+  it("formats Glob with pattern", () => {
+    expect(summarizeToolInput("Glob", { pattern: "**/*.ts" })).toBe("Glob **/*.ts");
+  });
+
+  it("formats Grep with quoted pattern", () => {
+    expect(summarizeToolInput("Grep", { pattern: "TODO" })).toBe('Grep "TODO"');
+  });
+
+  it("formats WebSearch with query", () => {
+    expect(summarizeToolInput("WebSearch", { query: "vitest mocking" })).toBe("WebSearch: vitest mocking");
+  });
+
+  it("formats WebFetch with url", () => {
+    expect(summarizeToolInput("WebFetch", { url: "https://example.com" })).toBe("WebFetch: https://example.com");
+  });
+
+  it("formats unknown tools with JSON truncation", () => {
+    const input = { key: "a".repeat(1000) };
+    const result = summarizeToolInput("CustomTool", input);
+    expect(result.startsWith('CustomTool: {"key":"aaa')).toBe(true);
+    expect(result.length).toBe(512); // "CustomTool: " (12) + 500
+  });
+
+  it("scrubs secret values before they reach the log line", () => {
+    const result = summarizeToolInput("Bash", { command: "curl -H 'Authorization: Bearer abcdef123456' https://x" });
+    expect(result.startsWith("Bash: curl")).toBe(true);
+    expect(result).not.toContain("abcdef123456");
+  });
+
+  it("formats Agent/Task with subagent type and description", () => {
+    expect(summarizeToolInput("Agent", { subagent_type: "Explore", description: "find callers" }))
+      .toBe("Agent → Explore: find callers");
+    expect(summarizeToolInput("Task", {})).toBe("Agent → ?: ");
+  });
+});

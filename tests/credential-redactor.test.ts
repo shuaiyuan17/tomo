@@ -10,7 +10,7 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 import { clearSecretValuesForTests, markRedactionReady, registerSecretValue, scrubDeep, scrubKnownSecrets } from "../src/credentials/redactor.js";
 import { CredentialStoreError, isStorableValue, KeychainBackend } from "../src/credentials/store.js";
 import { keychainReadCommand } from "../src/credentials/names.js";
-import { buildHooksOption, credentialRedactionHooks } from "../src/agent/sdk-options.js";
+import { buildHooksOption } from "../src/agent/sdk-options.js";
 
 const FAKE = "fake-redactor-credential-7c21";
 const REDACTED = "[REDACTED secret://x]";
@@ -57,13 +57,8 @@ describe("redactor", () => {
     });
   });
 
-  it("the PostToolUse hook returns nothing for clean output and a rewrite for dirty output", async () => {
-    const hook = credentialRedactionHooks().PostToolUse[0].hooks[0];
-    expect(await hook({ tool_response: { stdout: "clean" } })).toEqual({});
-    expect(await hook({ tool_response: { stdout: FAKE } })).toEqual({
-      hookSpecificOutput: { hookEventName: "PostToolUse", updatedToolOutput: { stdout: REDACTED } },
-    });
-  });
+  // The hook's clean/dirty pair: "leaves the normal path unchanged" in
+  // credential-redaction-hook.test.ts, and end to end in credential-broker.
 
   // The global redactor, as the session installs it: no matcher, so it covers
   // Bash, where the agent reads a value with $(security … -w) and a careless

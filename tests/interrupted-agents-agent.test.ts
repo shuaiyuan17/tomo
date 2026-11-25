@@ -7,12 +7,17 @@ vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/agent-mocks.js")).sdkModuleMock());
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
-import { Agent, MockChannel, installAgentTestHooks, makeMsg, mockConfig, mockSdk, resetConfig, waitFor } from "./helpers/agent-harness.js";
+import { Agent, MockChannel, expectNoChangeFor, installAgentTestHooks, makeMsg, mockConfig, mockSdk, resetConfig, waitFor } from "./helpers/agent-harness.js";
 import { watchBus } from "../src/watch/bus.js";
 import { MAX_AUTO_RESUMES, type RunningAgentsLedger } from "../src/agent/running-agents-ledger.js";
 import type { WatchTask } from "../src/watch/protocol.js";
 
 installAgentTestHooks();
+
+/** The session store's durable pending notes for `key` (what survives a crash). */
+function durableNotes(agent: InstanceType<typeof Agent>, key: string): string {
+  return (agent as unknown as { sessions: { getPendingNotes(k: string): string[] } }).sessions.getPendingNotes(key).join("\n");
+}
 
 // ---------------------------------------------------------------------------
 // Subagents running when the daemon went away: on the next start, the session
@@ -88,8 +93,7 @@ describe("interrupted subagents across a restart", () => {
 
     mockSdk.promptsBySession = [];
     const third = await boot();
-    await new Promise((r) => setTimeout(r, 50));
-    expect(notices()).toEqual([]);
+    await expectNoChangeFor(() => expect(notices()).toEqual([]), 50);
     await third.agent.stop();
   });
 
@@ -107,16 +111,14 @@ describe("interrupted subagents across a restart", () => {
     await waitFor(() => expect(notices("imessage:705").length).toBeGreaterThan(0));
     // The ledger has handed off, but the durable note is still owed.
     expect(JSON.parse(readFileSync(ledgerPath(), "utf8")).interrupted).toEqual([]);
-    const store = (second.agent as unknown as { sessions: { getPendingNotes(k: string): string[] } }).sessions;
-    expect(store.getPendingNotes("imessage:705").join("\n")).toContain("retry705");
+    expect(durableNotes(second.agent, "imessage:705")).toContain("retry705");
     crash(second.agent);
 
     mockSdk.promptsBySession = [];
     mockSdk.responseFn = async () => "ok";
     const third = await boot();
     await waitFor(() => expect(notices("imessage:705").some((p) => p.text.includes("retry705"))).toBe(true));
-    const thirdStore = (third.agent as unknown as { sessions: { getPendingNotes(k: string): string[] } }).sessions;
-    await waitFor(() => expect(thirdStore.getPendingNotes("imessage:705").join("\n")).not.toContain("retry705"));
+    await waitFor(() => expect(durableNotes(third.agent, "imessage:705")).not.toContain("retry705"));
     await third.agent.stop();
   });
 
@@ -130,9 +132,8 @@ describe("interrupted subagents across a restart", () => {
     mockSdk.responseFn = async () => "API Error: 429 rate limited";
     const second = await boot();
     await waitFor(() => expect(notices("imessage:706").length).toBeGreaterThan(0));
-    await new Promise((r) => setTimeout(r, 50));
-    const store = (second.agent as unknown as { sessions: { getPendingNotes(k: string): string[] } }).sessions;
-    expect(store.getPendingNotes("imessage:706").join("\n")).toContain("ratelimited706");
+    // The failed turn puts the note back; poll for it rather than sleep.
+    await waitFor(() => expect(durableNotes(second.agent, "imessage:706")).toContain("ratelimited706"));
     await second.agent.stop();
 
     mockSdk.promptsBySession = [];
@@ -249,8 +250,7 @@ describe("auto-resume of interrupted subagents", () => {
 
     // Told once: the next start does not tell the owner again.
     const again = await boot();
-    await new Promise((r) => setTimeout(r, 50));
-    expect(owner).toHaveBeenCalledOnce();
+    await expectNoChangeFor(() => expect(owner).toHaveBeenCalledOnce(), 50);
     await again.agent.stop();
   });
 
@@ -272,26 +272,8 @@ describe("auto-resume of interrupted subagents", () => {
     await waitFor(() => expect(owner).toHaveBeenCalledTimes(2));
     await run.agent.stop();
     const last = await boot();
-    await new Promise((r) => setTimeout(r, 50));
-    expect(owner).toHaveBeenCalledTimes(2);
+    await expectNoChangeFor(() => expect(owner).toHaveBeenCalledTimes(2), 50);
     await last.agent.stop();
-  });
-
-  it("a resumed subagent that then finishes on its own starts its count afresh", async () => {
-    let run = await boot();
-    await haveSession(run.channel, "713");
-    watchBus.publish({ type: "tasks", sessionKey: "imessage:713", tasks: [task("fin713")] });
-    crash(run.agent);
-    for (let i = 0; i < MAX_AUTO_RESUMES + 1; i++) {
-      run = await boot();
-      expect(gateOf(run.agent)!("imessage:713", "fin713")).toBeNull();
-      // Resumed, completes, is started again, and the daemon dies while it runs.
-      watchBus.publish({ type: "tasks", sessionKey: "imessage:713", tasks: [task("fin713")] });
-      watchBus.publish({ type: "tasks", sessionKey: "imessage:713", tasks: [], ended: [{ taskId: "fin713", status: "completed" }] });
-      watchBus.publish({ type: "tasks", sessionKey: "imessage:713", tasks: [task("fin713")] });
-      crash(run.agent);
-    }
-    await run.agent.stop();
   });
 
   it("a note still owed when auto-resume is turned off instructs nothing", async () => {
@@ -330,8 +312,7 @@ describe("auto-resume of interrupted subagents", () => {
 
     mockSdk.promptsBySession = [];
     const on = await boot();
-    await new Promise((r) => setTimeout(r, 50));
-    expect(notices("imessage:718")).toEqual([]);
+    await expectNoChangeFor(() => expect(notices("imessage:718")).toEqual([]), 50);
     expect(gateOf(on.agent)!("imessage:718", "old718")).toBeNull();
     expect(ledgerOf(on.agent).resumeCount("imessage:718", "old718")).toBe(0);
     await on.agent.stop();

@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 
@@ -38,6 +38,11 @@ live.config.workspaceDir = fx.ws;
 live.config.tomoHome = fx.tomoHome;
 live.config.sessionsDir = join(fx.tomoHome, "data", "sessions");
 
+// `existsSync` answers from `sandboxPresence` first, so the tests that only read
+// the profile TEXT (never run it) can pretend sandbox-exec is installed and run
+// on Linux too (tests/helpers/sandbox-exec.ts). Otherwise the real module.
+vi.mock("node:fs", async (importOriginal) =>
+  (await import("./helpers/sandbox-exec.js")).fsWithSandboxPresence(await importOriginal()));
 vi.mock("../src/config.js", () => ({ config: live.config }));
 vi.mock("../src/workspace/index.js", () => ({
   MEMORY_DIR: join(fx.ws, "memory"),
@@ -55,8 +60,12 @@ const { effectiveGroupSandbox } = await import("../src/agent/group-fs-policy.js"
 const { TurnAudienceRegistry } = await import("../src/agent/audience.js");
 const { SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH, shellSingleQuote } = await import("../src/agent/bash-sandbox.js");
 type Broker = InstanceType<typeof PermissionBroker>;
-/** Profile TEXT exists only where Bash is really rewritten (macOS with sandbox-exec); elsewhere the guard withholds the shell. */
-const sandboxRuns = process.platform === "darwin" && existsSync(SANDBOX_EXEC_PATH) && existsSync(SANDBOX_SHELL_PATH);
+const { sandboxPresence, sandboxRunsHere } = await import("./helpers/sandbox-exec.js");
+/** Only tests that EXECUTE the wrapped command gate on this. A test that reads
+ *  the profile TEXT calls `pretendSandbox()` instead: without sandbox-exec the
+ *  guard withholds the shell and there is no text to read. */
+const sandboxRuns = sandboxRunsHere(SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH);
+const pretendSandbox = () => sandboxPresence.pretend(SANDBOX_EXEC_PATH, SANDBOX_SHELL_PATH);
 type Outcome = "allowed_once" | "allowed_always" | "denied" | "timed_out";
 
 const GROUP = "telegram:-100777";
@@ -179,7 +188,10 @@ function resetConfig() {
   rmSync(BACKUP, { force: true });
 }
 
-beforeEach(() => resetConfig());
+beforeEach(() => {
+  resetConfig();
+  sandboxPresence.reset();
+});
 afterEach(() => vi.useRealTimers());
 
 // ---------------------------------------------------------------------------
@@ -266,7 +278,8 @@ describe("who an Allow once reaches", () => {
     h.turns.end(GROUP, answer);
   });
 
-  it.runIf(sandboxRuns)("…and the Bash profile text has no trace of it (macOS)", async () => {
+  it("…and the Bash profile text has no trace of it", async () => {
+    pretendSandbox();
     const h = harness();
     const { id } = await ask(h, fx.external, "write");
     h.broker.decide(id, "once", "web");
@@ -284,10 +297,9 @@ describe("who an Allow once reaches", () => {
     const { id } = await ask(h);
     h.broker.decide(id, "always", "web");
     expect(sandboxFor(h.broker, GROUP, { once: false }).groups[GROUP].extraRead).toContain(fx.external);
-    if (sandboxRuns) {
-      const bg = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true", run_in_background: true }, agent_id: "agent-1" });
-      expect(bg.hookSpecificOutput?.updatedInput?.command).toContain(`(subpath "${fx.external}")`);
-    }
+    pretendSandbox();
+    const bg = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true", run_in_background: true }, agent_id: "agent-1" });
+    expect(bg.hookSpecificOutput?.updatedInput?.command).toContain(`(subpath "${fx.external}")`);
   });
 });
 
@@ -396,10 +408,9 @@ describe("the three answers", () => {
     expect(readFileSync(BACKUP, "utf8")).toBe(before);
     expect(live.config.groupSandbox.groups[GROUP].extraWrite).toEqual([fx.external]);
     expect(sandboxFor(h.broker, GROUP, { once: false }).groups[GROUP].extraWrite).toEqual([fx.external]);
-    if (sandboxRuns) {
-      const r = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true" } });
-      expect(r.hookSpecificOutput?.updatedInput?.command).toContain(`(allow file-read* file-write* (subpath "${fx.external}"))`);
-    }
+    pretendSandbox();
+    const r = await guard(h.broker)({ tool_name: "Bash", tool_input: { command: "true" } });
+    expect(r.hookSpecificOutput?.updatedInput?.command).toContain(`(allow file-read* file-write* (subpath "${fx.external}"))`);
     expect(await readAllowed(h.broker)).toBe(true);
     expect(h.notes.at(-1)?.outcome).toBe("allowed_always");
   });

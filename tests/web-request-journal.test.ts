@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebChannel } from "../src/channels/web.js";
@@ -128,25 +128,26 @@ describe("interrupted requests awaiting the owner", () => {
   it("refuses new messages with a named reason once the backlog is full, and accepts again after dismissing", async () => {
     const ids = await crashWith(32);
     const second = run();
-    const more: string[] = [];
-    for (let i = 0; i < 32; i++) { const requestId = randomUUID(); more.push(requestId); await second.channel.receive({ requestId, text: `again ${i}` }); }
+    for (let i = 0; i < 32; i++) await second.channel.receive({ requestId: randomUUID(), text: `again ${i}` });
     const third = run();
     expect(third.channel.interruptedAwaiting()).toHaveLength(64);
     await expect(third.channel.receive({ requestId: randomUUID(), text: "new" })).rejects.toMatchObject({ status: 503, code: "interrupted_backlog" });
     expect(third.handler).not.toHaveBeenCalled();
     third.channel.resolveInterrupted(ids[0], "dismissed");
     await expect(third.channel.receive({ requestId: randomUUID(), text: "new" })).resolves.toMatchObject({ state: "queued" });
-    expect(more).toHaveLength(32);
   });
 });
 
 describe("unreadable journal", () => {
   it("refuses custody (503 journal_unavailable) when the journal cannot be read, and never writes it", async () => {
     const dirAsFile = join(root, "is-a-directory");
-    const { mkdirSync } = await import("node:fs"); mkdirSync(dirAsFile);
+    mkdirSync(dirAsFile);
     const { channel, handler } = run(undefined, new WebRequestJournal(dirAsFile));
     await expect(channel.receive({ requestId: randomUUID(), text: "hello" })).rejects.toMatchObject({ status: 503, code: "journal_unavailable" });
     expect(handler).not.toHaveBeenCalled();
+    // Nothing written in its place or beside it (no temp file, no compaction).
+    expect(readdirSync(dirAsFile)).toEqual([]);
+    expect(readdirSync(root)).toEqual(["is-a-directory"]);
   });
 
   it("a corrupt record before the last line: refuse, and leave the file byte-for-byte as it was", async () => {
@@ -155,7 +156,7 @@ describe("unreadable journal", () => {
     await first.channel.receive({ requestId: randomUUID(), text: "two" });
     const lines = readFileSync(path, "utf8").split("\n");
     lines.splice(1, 0, "{not json");
-    const { writeFileSync } = await import("node:fs"); writeFileSync(path, lines.join("\n"));
+    writeFileSync(path, lines.join("\n"));
     const before = readFileSync(path);
     const journal = new WebRequestJournal(path, { compactEvery: 1 });
     const next = run(undefined, journal);

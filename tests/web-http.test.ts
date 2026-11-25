@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { request } from "node:http";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, statSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -13,35 +12,24 @@ import { checkRequest, CsrfTokens } from "../src/web/security.js";
 import type { WebBootstrap } from "../src/web/protocol.js";
 import { sendMessage } from "../web/src/api.js";
 import type { IncomingMessage } from "node:http";
-import { brotliDecompressSync, gunzipSync } from "node:zlib";
-import { CompressedAssets, pickEncoding } from "../src/web/static-assets.js";
+import { startWebService, WEB_TEST_TOKEN, type Headers, type WebService } from "./helpers/web-http.js";
 
 let root: string;
-let service: Awaited<ReturnType<typeof startWebHttp>>;
+let web: WebService;
 let channel: WebChannel;
 let handoff: ReturnType<typeof vi.fn>;
-let cookie: string;
+/** Every write RPC that reached the daemon (one carrying the page's epoch): a refused write must send none. The cron and upload routes write without an RPC, so for them only the response guards the refusal. */
+let writeRpcs: string[];
 let bootstrap: WebBootstrap;
-const baseHeaders = { "x-tomo-request": "1", "sec-fetch-site": "same-origin" };
-const accessToken = "tomo_web_" + "a".repeat(64);
+const accessToken = WEB_TEST_TOKEN;
 const externalOrigin = "https://test-node.test-tailnet.ts.net";
 let now: number;
 
-async function call(path: string, options: { method?: string; headers?: Record<string, string | undefined>; body?: string } = {}) {
-  return new Promise<{ status: number; text: string; headers: IncomingMessage["headers"] }>((resolve, reject) => {
-    const req = request({ host: "127.0.0.1", port: service.port, path, method: options.method ?? "GET",
-      headers: Object.fromEntries(Object.entries({ ...baseHeaders, cookie, ...options.headers }).filter(([, value]) => value !== undefined)) }, (res) => {
-      let text = ""; res.setEncoding("utf8"); res.on("data", (part) => { text += part; });
-      res.on("end", () => resolve({ status: res.statusCode!, text, headers: res.headers }));
-    });
-    req.on("error", reject); req.end(options.body);
-  });
-}
-function mutationHeaders() { return { origin: `http://127.0.0.1:${service.port}`, cookie,
-  "content-type": "application/json", "x-tomo-csrf": bootstrap.csrfToken, "x-tomo-epoch": bootstrap.epoch }; }
+const call = (path: string, options?: { method?: string; headers?: Headers; body?: string }) => web.call(path, options);
+const mutationHeaders = (): Headers => web.mutationHeaders();
 
 beforeEach(async () => {
-  cookie = ""; now = Date.now();
+  now = Date.now(); writeRpcs = [];
   root = mkdtempSync(join(tmpdir(), "tomo-web-http-"));
   const sessionsDir = join(root, "sessions"); const sdkSessionsDir = join(root, "sdk");
   const assetsDir = join(root, "assets"); mkdirSync(join(assetsDir, "assets"), { recursive: true });
@@ -54,8 +42,11 @@ beforeEach(async () => {
   store.append("telegram:-1", { role: "user", content: "Group history", timestamp: Date.now(), channel: "telegram" });
   store.touchSession("dm:peer");
   channel = new WebChannel(owner); handoff = vi.fn(async () => true); channel.onMessage(handoff);
-  service = await startWebHttp(0, { accessToken, externalOrigin, now: () => now, assetsDir, data: new WebData({ sessionsDir, sdkSessionsDir, owner }),
+  web = await startWebService({ accessToken, externalOrigin, now: () => now, assetsDir, uploadsDir: join(root, "uploads"),
+    data: new WebData({ sessionsDir, sdkSessionsDir, owner, cronStorePath: join(root, "jobs.json") }),
     subscribe: (fn) => channel.events.subscribe(fn), rpc: async (input) => {
+      if ("epoch" in input) writeRpcs.push(input.method);
+      if (input.method === "epoch") return channel.events.epoch;
       if (input.method === "message") return channel.receive(input.input);
       if (input.method === "request") return channel.request(input.requestId);
       if (input.method === "dismiss") return channel.resolveInterrupted(input.requestId, "dismissed");
@@ -69,12 +60,81 @@ beforeEach(async () => {
       if (input.method === "subsession-message") return channel.messageSubsession(input.id, input.input);
       return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };
     } });
-  const response = await call(`/api/v1/bootstrap?t=${accessToken}`);
-  expect(response.status).toBe(200);
-  bootstrap = JSON.parse(response.text);
-  cookie = response.headers["set-cookie"]![0].split(";")[0];
+  bootstrap = web.boot;
 });
-afterEach(async () => { vi.unstubAllGlobals(); await service?.close(); await channel?.stop(); rmSync(root, { recursive: true, force: true }); });
+afterEach(async () => { vi.unstubAllGlobals(); await web?.close(); await channel?.stop(); rmSync(root, { recursive: true, force: true }); });
+
+/**
+ * Every write route, with what its own gate compares the epoch to: "daemon"
+ * asks the daemon for its epoch (a stale one is refused here), "format" only
+ * checks that one was sent (the daemon compares it when the RPC lands),
+ * "none" checks nothing. Each route repeats its gate inline in http.ts, so
+ * each is listed: one forgotten check fails its own row.
+ */
+interface MutationRoute { name: string; method: string; path: () => string; body?: () => string; contentType?: string; epoch: "daemon" | "format" | "none" }
+const message = () => JSON.stringify({ requestId: randomUUID(), text: "hi" });
+const MUTATION_ROUTES: MutationRoute[] = [
+  { name: "PATCH cron", method: "PATCH", path: () => "/api/v1/cron/job-1", epoch: "daemon" },
+  { name: "DELETE cron", method: "DELETE", path: () => "/api/v1/cron/job-1", epoch: "daemon" },
+  { name: "POST models", method: "POST", path: () => "/api/v1/models", epoch: "daemon" },
+  { name: "POST mcp/reconnect", method: "POST", path: () => "/api/v1/mcp/reconnect", epoch: "daemon" },
+  { name: "POST home/snapshot", method: "POST", path: () => "/api/v1/home/snapshot", epoch: "daemon" },
+  { name: "POST credentials/<id>", method: "POST", path: () => `/api/v1/credentials/${randomUUID()}`, epoch: "daemon" },
+  { name: "POST permissions/revoke", method: "POST", path: () => "/api/v1/permissions/revoke", epoch: "daemon" },
+  { name: "POST permissions/<id>", method: "POST", path: () => `/api/v1/permissions/${randomUUID()}`, epoch: "daemon" },
+  { name: "POST uploads", method: "POST", path: () => `/api/v1/uploads?targetId=${bootstrap.ownerId}`, body: () => "x", contentType: "application/octet-stream", epoch: "daemon" },
+  { name: "POST compact-request", method: "POST", path: () => "/api/v1/compact-request", epoch: "format" },
+  { name: "POST stop", method: "POST", path: () => "/api/v1/stop", epoch: "format" },
+  { name: "POST task stop", method: "POST", path: () => `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/stop`, epoch: "format" },
+  { name: "POST sub-session message", method: "POST", path: () => "/api/v1/subsessions/s1/messages", body: message, epoch: "format" },
+  { name: "POST messages", method: "POST", path: () => "/api/v1/messages", body: message, epoch: "format" },
+  { name: "POST messages/<id>/dismiss", method: "POST", path: () => `/api/v1/messages/${randomUUID()}/dismiss`, epoch: "format" },
+  { name: "DELETE uploads/<id>", method: "DELETE", path: () => `/api/v1/uploads/${"0".repeat(32)}`, epoch: "none" },
+];
+
+describe("the write gate", () => {
+  const send = (route: MutationRoute, headers: Headers) => call(route.path(), { method: route.method, body: route.body?.() ?? "{}",
+    headers: { ...mutationHeaders(), "content-type": route.contentType ?? "application/json", ...headers } });
+  const refusals: Array<[string, Headers, number, string]> = [
+    ["no cookie", { cookie: undefined }, 401, "authentication_required"],
+    ["no Origin", { origin: undefined }, 403, "origin_required"],
+    ["a foreign Origin", { origin: "https://evil.example" }, 403, "invalid_origin"],
+    ["a wrong CSRF token", { "x-tomo-csrf": "wrong" }, 403, "invalid_csrf"],
+    ["a non-ASCII CSRF token of the right length", { "x-tomo-csrf": "é".repeat(43) }, 403, "invalid_csrf"],
+    ["a body that is not the route's type", { "content-type": "text/plain" }, 415, ""],
+  ];
+  it.each(MUTATION_ROUTES)("$name refuses a request missing any part of the gate", async (route) => {
+    for (const [name, headers, status, error] of refusals) {
+      const response = await send(route, headers);
+      expect(response.status, name).toBe(status);
+      if (error) expect(response.json().error, name).toBe(error);
+      expect(writeRpcs, name).toEqual([]);
+    }
+    expect(handoff).not.toHaveBeenCalled();
+  });
+  it.each(MUTATION_ROUTES.filter((route) => route.epoch === "daemon"))("$name refuses a missing epoch, and one that is not the daemon's", async (route) => {
+    for (const epoch of [undefined, randomUUID()]) {
+      const response = await send(route, { "x-tomo-epoch": epoch });
+      expect([response.status, response.json().error], String(epoch)).toEqual([409, "epoch_changed"]);
+      expect(writeRpcs, String(epoch)).toEqual([]);
+    }
+  });
+  it.each(MUTATION_ROUTES.filter((route) => route.epoch === "format"))("$name refuses a missing or malformed epoch", async (route) => {
+    for (const epoch of [undefined, "not-an-epoch"]) {
+      const response = await send(route, { "x-tomo-epoch": epoch });
+      expect([response.status, response.json().error], String(epoch)).toEqual([409, "epoch_required"]);
+      expect(writeRpcs, String(epoch)).toEqual([]);
+    }
+    expect(handoff).not.toHaveBeenCalled();
+  });
+  it("DELETE uploads/<id> does not check the epoch, by design: CSRF is its only write check", async () => {
+    // Every other write needs the epoch. A discard only removes the browser's
+    // own staged file, and refusing it after a daemon restart would leave the
+    // file until the TTL sweep, so skipping the epoch here is intended.
+    const response = await call(`/api/v1/uploads/${"0".repeat(32)}`, { method: "DELETE", body: "{}", headers: { ...mutationHeaders(), "x-tomo-epoch": undefined } });
+    expect([response.status, response.text]).toEqual([200, "{}"]);
+  });
+});
 
 describe("local HTTP boundary", () => {
   it("refuses to listen with an external origin and no access token", async () => {
@@ -86,17 +146,7 @@ describe("local HTTP boundary", () => {
     const cursor = channel.events.cursor();
     channel.events.publish({ type: "block", sessionId: bootstrap.ownerId!, requestId: randomUUID(), id: "old-block", text: "already settled" });
     channel.events.publish({ type: "tool", sessionId: bootstrap.ownerId!, tool: "Read", state: "completed" });
-    const controller = new AbortController();
-    const response = await fetch(`http://127.0.0.1:${service.port}/api/v1/events?cursor=${cursor}`, { headers: { ...baseHeaders, cookie }, signal: controller.signal });
-    const reader = response.body!.getReader(); let text = "";
-    const timeout = setTimeout(() => controller.abort(), 500);
-    try {
-      while (!text.includes('"tool":"Read"')) {
-        const part = await reader.read().catch(() => ({ done: true, value: undefined }));
-        if (part.done) break;
-        text += new TextDecoder().decode(part.value);
-      }
-    } finally { clearTimeout(timeout); controller.abort(); await reader.cancel().catch(() => {}); }
+    const text = await web.readSse(`/api/v1/events?cursor=${cursor}`, (read) => read.includes('"tool":"Read"'));
     expect(text).toContain('"tool":"Read"');
     expect(text).toContain("event: snapshot");
     expect(text.indexOf("event: snapshot")).toBeLessThan(text.indexOf("event: update"));
@@ -115,23 +165,12 @@ describe("local HTTP boundary", () => {
     watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task("current")] });
     const fresh = JSON.parse((await call("/api/v1/bootstrap")).text) as WebBootstrap;
     expect(fresh.tasks.map((t) => [t.taskId, t.state])).toEqual([["current", "running"], ["old", "ended"]]);
-    const controller = new AbortController();
-    const response = await fetch(`http://127.0.0.1:${service.port}/api/v1/events?cursor=${cursor}`, { headers: { ...baseHeaders, cookie }, signal: controller.signal });
-    const reader = response.body!.getReader(); let text = "";
-    const timeout = setTimeout(() => controller.abort(), 500);
-    try {
-      while (!text.includes("event: snapshot")) {
-        const part = await reader.read().catch(() => ({ done: true, value: undefined }));
-        if (part.done) break;
-        text += new TextDecoder().decode(part.value);
-      }
-      watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task("current"), task("next")] });
-      while (!text.includes('"taskId":"next"')) {
-        const part = await reader.read().catch(() => ({ done: true, value: undefined }));
-        if (part.done) break;
-        text += new TextDecoder().decode(part.value);
-      }
-    } finally { clearTimeout(timeout); controller.abort(); await reader.cancel().catch(() => {}); }
+    let published = false;
+    const text = await web.readSse(`/api/v1/events?cursor=${cursor}`, (read) => {
+      // Once the snapshot is in, a live update follows it on the same stream.
+      if (!published && read.includes("event: snapshot")) { published = true; watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task("current"), task("next")] }); }
+      return read.includes('"taskId":"next"');
+    });
     const snapshot = text.split("\n\n").find((frame) => frame.includes("event: snapshot"))!;
     expect(snapshot).toContain('"taskId":"current"');
     // The replayed range held a task list; only the snapshot and live updates carry tasks.
@@ -195,12 +234,10 @@ describe("local HTTP boundary", () => {
     expect(res.status).toBe(200);
     expect(JSON.parse(res.text)).toMatchObject({ state: "timeout", windows: [] });
   });
-  it("compact requests need CSRF and the epoch, reach the owner's compact, and are refused while tasks run", async () => {
+  it("compact requests reach the owner's compact, and are refused while tasks run", async () => {
     const compact = vi.fn((_key: string, _settled: (outcome: "done" | "unverified" | "failed") => void) => "queued" as const);
     (channel as unknown as { compact: typeof compact }).compact = compact;
-    const post = (headers: Record<string, string | undefined>) => call("/api/v1/compact-request", { method: "POST", headers, body: "{}" });
-    expect((await post({ ...mutationHeaders(), "x-tomo-csrf": "wrong" })).status).toBe(403);
-    expect((await post({ ...mutationHeaders(), "x-tomo-epoch": undefined })).status).toBe(409);
+    const post = (headers: Headers) => call("/api/v1/compact-request", { method: "POST", headers, body: "{}" });
     const ok = await post(mutationHeaders());
     expect(ok.status).toBe(202);
     expect(JSON.parse(ok.text)).toMatchObject({ status: "queued", requestId: expect.any(String) });
@@ -212,7 +249,7 @@ describe("local HTTP boundary", () => {
     expect(JSON.parse(busy.text)).toEqual({ error: "tasks_running" });
     expect(compact).toHaveBeenCalledTimes(1);
   });
-  it("the owner writes to a sub-session through its own route, with CSRF and the epoch; groups stay read-only", async () => {
+  it("the owner writes to a sub-session through its own route; groups stay read-only", async () => {
     const task = { id: "s1", title: "T", status: "waiting" as const, waitingOn: "owner" as const, working: false, createdAt: 1, lastActivityAt: 1, activeMs: 0, revision: 1, writable: true };
     const message = vi.fn((_id: string, _text: string, _requestId: string) => ({ ok: true as const, duplicate: false, task }));
     const get = vi.fn((id: string) => id === "s1" ? { ...task, brief: "b", conversation: [] } : undefined);
@@ -221,11 +258,8 @@ describe("local HTTP boundary", () => {
     expect(JSON.parse((await call("/api/v1/subsessions/s1")).text)).toMatchObject({ id: "s1", brief: "b" });
     expect((await call("/api/v1/subsessions/s2")).status).toBe(404);
     for (const bad of ["dm:owner", "task:s1", "s0", "..%2Fs1"]) expect((await call(`/api/v1/subsessions/${bad}`)).status).toBe(404);
-    const post = (path: string, body: unknown, headers: Record<string, string | undefined> = mutationHeaders()) =>
-      call(`/api/v1/subsessions/${path}/messages`, { method: "POST", headers, body: JSON.stringify(body) });
+    const post = (path: string, body: unknown) => web.send("POST", `/api/v1/subsessions/${path}/messages`, body);
     const requestId = randomUUID();
-    expect((await post("s1", { requestId, text: "hi" }, { ...mutationHeaders(), "x-tomo-csrf": "wrong" })).status).toBe(403);
-    expect((await post("s1", { requestId, text: "hi" }, { ...mutationHeaders(), "x-tomo-epoch": undefined })).status).toBe(409);
     expect((await post("s1", { requestId, text: "  " })).status).toBe(400);
     expect((await post("task:s1", { requestId, text: "hi" })).status).toBe(404);
     expect(message).not.toHaveBeenCalled();
@@ -239,13 +273,10 @@ describe("local HTTP boundary", () => {
     const refused = await call("/api/v1/messages", { method: "POST", headers: mutationHeaders(), body: JSON.stringify({ requestId: randomUUID(), targetId: group.id, text: "hi" }) });
     expect(refused.status).toBe(403);
   });
-  it("stop needs CSRF and the epoch, and reaches the owner conversation's running turn", async () => {
+  it("stop reaches the owner conversation's running turn", async () => {
     const stop = vi.fn(async (_key: string) => true);
     (channel as unknown as { stopTurn: typeof stop }).stopTurn = stop;
-    const post = (headers: Record<string, string | undefined>) => call("/api/v1/stop", { method: "POST", headers, body: "{}" });
-    expect((await post({ ...mutationHeaders(), "x-tomo-csrf": "wrong" })).status).toBe(403);
-    expect((await post({ ...mutationHeaders(), "x-tomo-epoch": undefined })).status).toBe(409);
-    expect(stop).not.toHaveBeenCalled();
+    const post = (headers: Headers) => call("/api/v1/stop", { method: "POST", headers, body: "{}" });
     const ok = await post(mutationHeaders());
     expect(ok.status).toBe(200);
     expect(JSON.parse(ok.text)).toEqual({ stopped: true });
@@ -253,18 +284,15 @@ describe("local HTTP boundary", () => {
     stop.mockResolvedValueOnce(false);
     expect(JSON.parse((await post(mutationHeaders())).text)).toEqual({ stopped: false });
   });
-  it("a task action needs CSRF, the epoch and the owner conversation, and reaches the task by its id", async () => {
+  it("a task action needs the owner conversation, and reaches the task by its id", async () => {
     const stop = vi.fn(async (_key: string, _taskId: string) => true);
     const background = vi.fn(async (_key: string, _toolUseId: string) => true);
     const { watchBus } = await import("../src/watch/bus.js");
     (channel as unknown as { taskControl: unknown }).taskControl = { stop, background };
     watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
       { taskId: "a1", taskType: "local_agent", description: "x", ambient: false, background: false, toolUseId: "toolu_1", startedAt: 1 }] });
-    const post = (path: string, headers: Record<string, string | undefined> = mutationHeaders()) =>
-      call(`/api/v1/sessions/${path}`, { method: "POST", headers, body: "{}" });
+    const post = (path: string) => web.send("POST", `/api/v1/sessions/${path}`, {});
     const own = `${bootstrap.ownerId}/tasks/a1`;
-    expect((await post(`${own}/stop`, { ...mutationHeaders(), "x-tomo-csrf": "wrong" })).status).toBe(403);
-    expect((await post(`${own}/stop`, { ...mutationHeaders(), "x-tomo-epoch": undefined })).status).toBe(409);
     const group = bootstrap.sessions.find((s) => s.id !== bootstrap.ownerId)!;
     const refused = await post(`${group.id}/tasks/a1/stop`);
     expect(refused.status).toBe(403); expect(JSON.parse(refused.text)).toEqual({ error: "owner_dm_only" });
@@ -279,7 +307,8 @@ describe("local HTTP boundary", () => {
   });
   it("gates every private API including SSE, while keeping static assets public", async () => {
     for (const path of ["/api/v1/bootstrap", "/api/v1/sessions", `/api/v1/sessions/${bootstrap.ownerId}/messages`, `/api/v1/messages/${randomUUID()}`, "/api/v1/events",
-      `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/transcript`, `/api/v1/sessions/${bootstrap.ownerId}/tasks/b1/output`, "/api/v1/usage"]) {
+      `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/transcript`, `/api/v1/sessions/${bootstrap.ownerId}/tasks/b1/output`, "/api/v1/usage", "/api/v1/cost",
+      `/api/v1/uploads/${"a".repeat(32)}`]) {
       const result = await call(path, { headers: { cookie: undefined } });
       expect(result.status).toBe(401); expect(result.text).toBe('{"error":"authentication_required"}');
     }
@@ -305,7 +334,7 @@ describe("local HTTP boundary", () => {
     const session = JSON.parse(login.text) as WebBootstrap;
     const headers = { ...mutationHeaders(), host, origin: externalOrigin, cookie: login.headers["set-cookie"]![0].split(";")[0], "x-tomo-csrf": session.csrfToken };
     expect((await call("/api/v1/messages", { method: "POST", headers, body: JSON.stringify({ requestId: randomUUID(), text: "from Serve" }) })).status).toBe(202);
-    for (const extra of [{ host: `${host}.evil.example` }, { origin: `${externalOrigin}.evil.example` }, { origin: `http://127.0.0.1:${service.port}` }]) {
+    for (const extra of [{ host: `${host}.evil.example` }, { origin: `${externalOrigin}.evil.example` }, { origin: web.base }]) {
       expect((await call("/api/v1/bootstrap", { headers: { ...headers, ...extra } })).status).toBe(403);
     }
   });
@@ -317,7 +346,7 @@ describe("local HTTP boundary", () => {
     now += 12 * 60 * 60_000 + 1;
     const statuses: number[] = [];
     vi.stubGlobal("fetch", async (path: string, init: RequestInit) => {
-      const result = await call(path, { method: init.method, headers: { origin: `http://127.0.0.1:${service.port}`, ...init.headers as Record<string, string> }, body: init.body as string });
+      const result = await call(path, { method: init.method, headers: { origin: web.base, ...init.headers as Record<string, string> }, body: init.body as string });
       statuses.push(result.status);
       return new Response(result.text, { status: result.status });
     });
@@ -360,25 +389,14 @@ describe("local HTTP boundary", () => {
       expect(api.text).not.toContain("csrfToken");
     }
   });
-  it("requires Origin, JSON, and a matching cookie-bound CSRF token before mutation", async () => {
-    for (const headers of [{ origin: undefined }, { cookie: undefined }, { "x-tomo-csrf": "wrong" },
-      { "x-tomo-csrf": "é".repeat(43) }, { "content-type": "text/plain" }]) {
-      const response = await call("/api/v1/messages", { method: "POST", headers: { ...mutationHeaders(), ...headers },
-        body: JSON.stringify({ requestId: randomUUID(), text: "blocked" }) });
-      expect([401, 403, 415]).toContain(response.status);
-    }
-    expect(handoff).not.toHaveBeenCalled();
-    const accepted = await call("/api/v1/messages", { method: "POST", headers: mutationHeaders(),
-      body: JSON.stringify({ requestId: randomUUID(), text: "accepted" }) });
+  it("accepts a message behind the full gate, whose CSRF token is not the cookie", async () => {
+    // The refusals of each missing part are rows of "the write gate" above.
+    const accepted = await web.send("POST", "/api/v1/messages", { requestId: randomUUID(), text: "accepted" });
     expect(accepted.status).toBe(202); expect(handoff).toHaveBeenCalledOnce();
-    expect(bootstrap.csrfToken).not.toBe(cookie);
+    expect(bootstrap.csrfToken).not.toBe(web.cookie);
   });
-  it("routes dismiss only as a CSRF- and epoch-guarded mutation", async () => {
+  it("dismisses only an interrupted request awaiting the owner", async () => {
     const requestId = randomUUID();
-    const blocked = await call(`/api/v1/messages/${requestId}/dismiss`, { method: "POST", headers: { ...mutationHeaders(), "x-tomo-csrf": "wrong" }, body: "{}" });
-    expect(blocked.status).toBe(403);
-    const noEpoch = await call(`/api/v1/messages/${requestId}/dismiss`, { method: "POST", headers: { ...mutationHeaders(), "x-tomo-epoch": undefined }, body: "{}" });
-    expect(noEpoch.status).toBe(409);
     // Only an interrupted request awaiting the owner can be dismissed.
     const notInterrupted = await call(`/api/v1/messages/${requestId}/dismiss`, { method: "POST", headers: mutationHeaders(), body: "{}" });
     expect(notInterrupted.status).toBe(404);
@@ -417,81 +435,16 @@ describe("local HTTP boundary", () => {
     }
     expect((await call("/api/v1/messages", { method: "OPTIONS", headers: { origin: "https://evil.example" } })).status).toBe(403);
   });
-  it("caches hashed assets for a year and compresses text once per version; index.html and icons stay no-store", async () => {
-    const raw = (path: string, encoding?: string) => new Promise<{ headers: IncomingMessage["headers"]; body: Buffer }>((resolve, reject) => {
-      const req = request({ host: "127.0.0.1", port: service.port, path, headers: { ...(encoding ? { "accept-encoding": encoding } : {}) } }, (res) => {
-        const parts: Buffer[] = []; res.on("data", (part: Buffer) => parts.push(part));
-        res.on("end", () => resolve({ headers: res.headers, body: Buffer.concat(parts) }));
-      });
-      req.on("error", reject); req.end();
-    });
-    const source = `export const text = ${JSON.stringify("tomo ".repeat(2_000))};`;
-    writeFileSync(join(root, "assets", "assets", "big-abc123.js"), source);
-    const br = await raw("/assets/big-abc123.js", "gzip, deflate, br");
-    expect(br.headers["content-encoding"]).toBe("br");
-    expect(br.headers["cache-control"]).toBe("public, max-age=31536000, immutable");
-    expect(br.headers.vary).toBe("accept-encoding");
-    expect(Number(br.headers["content-length"])).toBe(br.body.length);
-    expect(br.body.length).toBeLessThan(source.length / 10);
-    expect(brotliDecompressSync(br.body).toString()).toBe(source);
-    const gz = await raw("/assets/big-abc123.js", "gzip");
-    expect(gz.headers["content-encoding"]).toBe("gzip");
-    expect(gunzipSync(gz.body).toString()).toBe(source);
-    const plain = await raw("/assets/big-abc123.js");
-    expect(plain.headers["content-encoding"]).toBeUndefined();
-    expect(plain.body.toString()).toBe(source);
-    // The security headers still go out with a cached asset.
-    expect(plain.headers["content-security-policy"]).toContain("script-src 'self'");
-    // A rebuilt file under the same name is not served from the stale compressed copy.
-    writeFileSync(join(root, "assets", "assets", "big-abc123.js"), source + "\n// rebuilt");
-    expect(brotliDecompressSync((await raw("/assets/big-abc123.js", "br")).body).toString()).toBe(source + "\n// rebuilt");
-    // Tiny files and already-compressed formats go out as they are.
-    expect((await raw("/assets/app-test.js", "br")).headers["content-encoding"]).toBeUndefined();
-    for (const path of ["/", "/favicon.svg", "/manifest.webmanifest"]) {
-      expect((await raw(path, "br")).headers["cache-control"]).toBe("no-store");
-    }
-  });
-  it("warms the bundle's brotli copies at startup, regular files only", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "tomo-web-warm-")); mkdirSync(join(dir, "assets"));
-    const source = "x".repeat(4_000);
-    writeFileSync(join(dir, "assets", "app-1.js"), source); writeFileSync(join(dir, "index.html"), source);
-    writeFileSync(join(dir, "elsewhere.js"), source); symlinkSync(join(dir, "elsewhere.js"), join(dir, "assets", "link-1.js"));
-    const cache = new CompressedAssets();
-    await cache.warm(dir);
-    const version = (path: string) => { const stat = statSync(join(dir, path)); return `${stat.size}:${stat.mtimeMs}`; };
-    // Already compressed: the bytes passed now are not what is returned.
-    for (const path of ["assets/app-1.js", "index.html"]) {
-      expect(brotliDecompressSync(await cache.get(path, version(path), "br", Buffer.from("other"))).toString()).toBe(source);
-    }
-    expect(brotliDecompressSync(await cache.get("assets/link-1.js", version("assets/link-1.js"), "br", Buffer.from("other"))).toString()).toBe("other");
-    await cache.warm(join(dir, "missing"));
-    rmSync(dir, { recursive: true, force: true });
-  });
-  it("negotiates brotli, then gzip, honouring q=0", () => {
-    expect(pickEncoding("gzip, deflate, br, zstd")).toBe("br");
-    expect(pickEncoding("gzip;q=1.0, br;q=0")).toBe("gzip");
-    expect(pickEncoding("GZIP")).toBe("gzip");
-    expect(pickEncoding("br ;q=1")).toBe("br");
-    expect(pickEncoding("gzip, br ;q=0")).toBe("gzip");
-    expect(pickEncoding("*")).toBe("br");
-    expect(pickEncoding("*;q=0, gzip")).toBe("gzip");
-    expect(pickEncoding("identity")).toBeUndefined();
-    expect(pickEncoding("br;q=0, gzip;q=0")).toBeUndefined();
-    expect(pickEncoding(undefined)).toBeUndefined();
-    expect(pickEncoding("")).toBeUndefined();
-  });
   it("sends an SSE snapshot and live completed blocks without a browser read acknowledgment", async () => {
     const requestId = randomUUID();
     await channel.receive({ requestId, text: "stream" });
-    const controller = new AbortController();
-    const response = await fetch(`http://127.0.0.1:${service.port}/api/v1/events`, { headers: { ...baseHeaders, cookie }, signal: controller.signal });
-    const reader = response.body!.getReader();
-    let text = new TextDecoder().decode((await reader.read()).value);
+    let sent = false;
+    const text = await web.readSse("/api/v1/events", (read) => {
+      if (!sent && read.includes("event: snapshot")) { sent = true; void channel.send({ chatId: requestId, text: "completed block" }); }
+      return read.includes("completed block");
+    });
     expect(text).toContain("event: snapshot");
-    await channel.send({ chatId: requestId, text: "completed block" });
-    while (!text.includes("completed block")) text += new TextDecoder().decode((await reader.read()).value);
     expect(text).toContain('"type":"block"');
-    controller.abort(); await reader.cancel().catch(() => {});
     expect(channel.snapshot().blocks[0].text).toBe("completed block");
   });
 });

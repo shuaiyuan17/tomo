@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
@@ -10,16 +10,20 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 import {
   Agent,
   MockChannel,
+  agentEnv,
   installAgentTestHooks,
   makeMsg,
   mockConfig,
   mockSdk,
   peekPendingNotes,
+  expectNoChangeFor,
   resetConfig,
+  useRealAdmission,
   waitFor,
 } from "./helpers/agent-harness.js";
 import { DurableInbox, INBOX_STALE_NOT_PROCESSED, type WriteFn } from "../src/agent/durable-inbox.js";
 import { InboxPersistError } from "../src/agent.js";
+import { transcriptFileStem } from "../src/sessions/store.js";
 import { writeSync } from "node:fs";
 
 installAgentTestHooks();
@@ -33,7 +37,7 @@ installAgentTestHooks();
 const NOT_PROCESSED = "[not processed — shutting down]";
 
 function transcript(sessionKey: string): string {
-  const file = join(mockConfig.sessionsDir, `${sessionKey.replace(/[^a-zA-Z0-9_-]/g, "_")}.jsonl`);
+  const file = join(mockConfig.sessionsDir, `${transcriptFileStem(sessionKey)}.jsonl`);
   return existsSync(file) ? readFileSync(file, "utf8") : "";
 }
 
@@ -115,8 +119,7 @@ describe("durable inbox: crash and replay", () => {
     // imsg never committed its cursor for this row, so it comes again.
     expect(await second.channel.simulateMessage(makeMsg({ id: "dup", chatId: "557", text: "only once please" }))).toBe(true);
     await waitFor(() => expect(second.channel.delivered).toHaveLength(1));
-    await new Promise((r) => setTimeout(r, 30));
-    expect(second.channel.delivered).toHaveLength(1);
+    await expectNoChangeFor(() => expect(second.channel.delivered).toHaveLength(1), 30);
     expect(mockSdk.promptsBySession.filter((p) => p.text.includes("only once please"))).toHaveLength(1);
     await second.agent.stop();
   });
@@ -233,16 +236,24 @@ describe("durable inbox: graceful shutdown", () => {
 });
 
 describe("durable inbox: what never reaches disk", () => {
-  it("does not persist the group secret", async () => {
-    resetConfig({ inbox: true, groupSecret: "open-sesame" });
+  it("does not persist the group secret, while the messages it admits are persisted", async () => {
+    // Real admission: the secret is what activates the group, so the
+    // follow-up is admitted only if the secret was handled.
+    useRealAdmission();
+    writeFileSync(join(agentEnv.tmpDir, "config.json"), JSON.stringify({ channels: { imessage: {} } }));
+    resetConfig({ inbox: true, groupSecret: "open-sesame", channelAllowlists: {} });
     const agent = new Agent();
     const imessage = new MockChannel("imessage");
     agent.addChannel(imessage);
     await agent.start();
     mockSdk.responseFn = async () => "ok";
     await imessage.simulateMessage(makeMsg({ id: "s1", chatId: "chat;+;group", isGroup: true, text: "open-sesame" }));
-    await new Promise((r) => setTimeout(r, 20));
-    const onDisk = existsSync(inboxPath()) ? readFileSync(inboxPath(), "utf8") : "";
+    await waitFor(() => expect(imessage.sent.some((m) => m.text?.includes("activated"))).toBe(true));
+    await imessage.simulateMessage(makeMsg({ id: "s2", chatId: "chat;+;group", isGroup: true, text: "now we are in" }));
+
+    // Written before custody was handed back, so it is on disk already.
+    const onDisk = readFileSync(inboxPath(), "utf8");
+    expect(onDisk).toContain("now we are in");
     expect(onDisk).not.toContain("open-sesame");
     await agent.stop();
   });
@@ -299,10 +310,11 @@ describe("durable inbox: a write that fails at ingress", () => {
     // skips the cursor advance and recoverFromGap replays the row.
     await expect(channel.simulateMessage(makeMsg({ id: "w1", chatId: "570", text: "did you get this" })))
       .rejects.toBeInstanceOf(InboxPersistError);
-    await new Promise((r) => setTimeout(r, 30));
     // Not dispatched in memory either: the redelivery is the only copy.
-    expect(mockSdk.promptsBySession.some((p) => p.text.includes("did you get this"))).toBe(false);
-    expect(channel.delivered).toEqual([]);
+    await expectNoChangeFor(() => {
+      expect(mockSdk.promptsBySession.some((p) => p.text.includes("did you get this"))).toBe(false);
+      expect(channel.delivered).toEqual([]);
+    }, 30);
 
     healthy = true;
     expect(await channel.simulateMessage(makeMsg({ id: "w1", chatId: "570", text: "did you get this" }))).toBe(true);
@@ -344,8 +356,7 @@ describe("durable inbox: a start mark that cannot be written", () => {
     crash(first.agent);
 
     const second = await boot();
-    await new Promise((r) => setTimeout(r, 30));
-    expect(mockSdk.promptsBySession.filter((p) => p.text.includes("transfer the money"))).toHaveLength(1);
+    await expectNoChangeFor(() => expect(mockSdk.promptsBySession.filter((p) => p.text.includes("transfer the money"))).toHaveLength(1), 30);
     expect(peekPendingNotes(second.agent, "imessage:572").join("\n")).toContain("transfer the money");
     await second.agent.stop();
   });
@@ -388,8 +399,7 @@ describe("durable inbox: steered into another turn", () => {
     releaseHost!();
     // The host's result has resolved the steer as merged; its task is still open.
     await waitFor(() => expect(live()).toBe(false));
-    await new Promise((r) => setTimeout(r, 30));
-    expect(openInbox().pending().map((r) => r.message.id)).toEqual(["st1"]);
+    await expectNoChangeFor(() => expect(openInbox().pending().map((r) => r.message.id)).toEqual(["st1"]), 30);
     crash(agent);
 
     const second = await boot();
@@ -534,10 +544,11 @@ describe("durable inbox: a turn that ends before the model sees it", () => {
     internals.mcpOAuthManager.buildServersWithAuth = async () => { throw new Error("session build failed"); };
     await second.channel.simulateMessage(makeMsg({ id: "nb2", chatId: "590", text: "second ask" }));
     await waitFor(() => expect(second.channel.delivered.length).toBeGreaterThan(0));
-    await new Promise((r) => setTimeout(r, 30));
     // Never reached the model: neither the message nor the note is consumed.
-    expect(openInbox().pending().map((r) => [r.message.id, r.status])).toEqual([["nb2", "received"]]);
-    expect(peekPendingNotes(second.agent, "imessage:590").join("\n")).toContain("first ask");
+    await expectNoChangeFor(() => {
+      expect(openInbox().pending().map((r) => [r.message.id, r.status])).toEqual([["nb2", "received"]]);
+      expect(peekPendingNotes(second.agent, "imessage:590").join("\n")).toContain("first ask");
+    }, 30);
     crash(second.agent);
 
     const third = await boot();
@@ -555,8 +566,7 @@ describe("durable inbox: deliberate pauses do not consume", () => {
     const first = await boot();
     (first.agent as unknown as { commands: { restoringConfig: boolean } }).commands.restoringConfig = true;
     await first.channel.simulateMessage(makeMsg({ id: "rs1", chatId: "591", text: "during restore" }));
-    await new Promise((r) => setTimeout(r, 30));
-    expect(openInbox().pending().map((r) => [r.message.id, r.status])).toEqual([["rs1", "received"]]);
+    await expectNoChangeFor(() => expect(openInbox().pending().map((r) => [r.message.id, r.status])).toEqual([["rs1", "received"]]), 30);
     crash(first.agent);
 
     const second = await boot();
@@ -593,8 +603,7 @@ describe("durable inbox: an interrupted note whose turn ends on an API error", (
     mockSdk.responseFn = async () => "API Error: 429 rate limited";
     await second.channel.simulateMessage(makeMsg({ id: "ae2", chatId: "594", text: "anyone?" }));
     await waitFor(() => expect(mockSdk.promptsBySession.some((p) => p.text.includes("lost request") && p.text.includes("anyone?"))).toBe(true));
-    await new Promise((r) => setTimeout(r, 30));
-    expect(peekPendingNotes(second.agent, "imessage:594").join("\n")).toContain("lost request");
+    await expectNoChangeFor(() => expect(peekPendingNotes(second.agent, "imessage:594").join("\n")).toContain("lost request"), 30);
 
     mockSdk.promptsBySession = [];
     mockSdk.responseFn = async () => "answered now";

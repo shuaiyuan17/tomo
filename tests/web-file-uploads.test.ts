@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { request, type IncomingMessage as HttpIncoming } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claimUploads, MAX_UPLOAD_FILE_BYTES, stageUpload } from "../src/web/uploads.js";
+import { claimUploads, discardUpload, GONE_TTL_MS, MAX_UPLOAD_FILE_BYTES, peekUpload, stageUpload, sweepUploads } from "../src/web/uploads.js";
 import { WebChannel } from "../src/channels/web.js";
 import { WatchBus } from "../src/watch/bus.js";
 import { messageInputSchema, type WebBootstrap } from "../src/web/protocol.js";
@@ -303,6 +303,138 @@ describe("POST /uploads with files on: the same gate as images", () => {
     expect(big.status).toBe(413);
     expect(JSON.parse(big.text).error).toBe("too_large");
     expect(readdirSync(dir)).toHaveLength(1);
+  });
+  it("GET /uploads/<id> gives a reloaded page back what it staged (an image's bytes, a file's size) — owner session only, never a claimed or unknown one", async () => {
+    const image = JSON.parse((await upload(PNG)).text).uploadId as string;
+    const file = JSON.parse((await upload(MD)).text).uploadId as string;
+    const got = await call(`/api/v1/uploads/${image}`);
+    expect(got.status).toBe(200);
+    expect(got.headers["content-type"]).toBe("image/png");
+    expect(got.headers["x-content-type-options"]).toBe("nosniff");
+    const info = await call(`/api/v1/uploads/${file}`);
+    expect(info.status).toBe(200);
+    expect(JSON.parse(info.text)).toEqual({ kind: "file", size: MD.length });
+    // Not the access cookie: refused like any API read.
+    const saved = cookie; cookie = "";
+    expect((await call(`/api/v1/uploads/${image}`)).status).toBe(401);
+    cookie = saved;
+    // Without the API header (an <img> or a navigation from another site): refused.
+    expect((await call(`/api/v1/uploads/${image}`, { headers: { "x-tomo-request": "" } })).status).toBeGreaterThanOrEqual(400);
+    for (const bad of ["0".repeat(32), "../uploads", `${image}.png`, image.toUpperCase()]) expect((await call(`/api/v1/uploads/${encodeURIComponent(bad)}`)).status).toBe(404);
+    // An id with no file and no record of going: not taken for gone (it may be mid-claim) — the page keeps it, with Retry.
+    const unknown = await call(`/api/v1/uploads/${Date.now().toString(16).padStart(12, "0")}${"0".repeat(20)}`);
+    expect(unknown.status).toBe(409);
+    expect(JSON.parse(unknown.text).error).toBe("upload_unsettled");
+    // Claimed by a message being filed: not gone yet (409), back if that send fails, gone (404) once it is recorded.
+    const claim = claimUploads(dir, [image], "req-1")!;
+    const busy = await call(`/api/v1/uploads/${image}`);
+    expect(busy.status).toBe(409);
+    expect(JSON.parse(busy.text).error).toBe("upload_claimed");
+    claim.release();
+    expect((await call(`/api/v1/uploads/${image}`)).status).toBe(200);
+    claimUploads(dir, [image], "req-2")!.finalize();
+    expect((await call(`/api/v1/uploads/${image}`)).status).toBe(404);
+    // Discarded by the owner (× on the thumbnail): gone too. The staging directory itself holds only uploads.
+    const other = JSON.parse((await upload(PNG)).text).uploadId as string;
+    discardUpload(dir, other);
+    expect((await call(`/api/v1/uploads/${other}`)).status).toBe(404);
+    expect(readdirSync(dir).every((name) => /^[a-f0-9]{32}\.[a-z]+$/.test(name))).toBe(true);
+  });
+});
+
+describe("peekUpload: gone only on the record of it", () => {
+  it("claim, release and claim again — at any point the status is staged, claimed or unsettled, never gone; gone after the send is recorded", () => {
+    const { uploadId } = stageUpload(dir, PNG);
+    const seen = new Set<string>();
+    const look = () => seen.add(peekUpload(dir, uploadId)?.kind ?? "gone");
+    look();
+    for (let round = 0; round < 3; round++) {
+      const claim = claimUploads(dir, [uploadId], `req-${round}`)!;
+      look();
+      // Mid-rename as a lookup sees it: neither staged nor claimed (the file moved away and back).
+      const [claimed] = readdirSync(dir).filter((name) => name.includes(".claim-"));
+      renameSync(join(dir, claimed), join(root, "aside"));
+      look();
+      renameSync(join(root, "aside"), join(dir, claimed));
+      claim.release();
+      look();
+    }
+    expect([...seen].sort()).toEqual(["claimed", "image", "unsettled"]);
+    claimUploads(dir, [uploadId], "req-final")!.finalize();
+    expect(peekUpload(dir, uploadId)).toBeUndefined();
+    // Expired but not yet swept (sweeping runs on the next upload): gone, not unsettled.
+    const stale = stageUpload(dir, PNG).uploadId;
+    expect(peekUpload(dir, stale, Date.now() + 2 * 60 * 60 * 1000)).toBeUndefined();
+    // Expired: swept, and recorded gone.
+    const old = stageUpload(dir, PNG).uploadId;
+    sweepUploads(dir, Date.now() + 2 * 60 * 60 * 1000);
+    expect(peekUpload(dir, old, Date.now())).toBeUndefined();
+    // A day on, the record swept: still definite, by the id's own date.
+    sweepUploads(dir, Date.now() + 24 * 60 * 60 * 1000);
+    expect(peekUpload(dir, old, Date.now() + 24 * 60 * 60 * 1000)).toBeUndefined();
+    // Any age, record swept or not: the id dates itself, so the answer stays definite.
+    sweepUploads(dir, Date.now() + GONE_TTL_MS + 60 * 60 * 1000);
+    expect(peekUpload(dir, old, Date.now() + 30 * 24 * 60 * 60 * 1000)).toBeUndefined();
+    // A server clock moved back after staging: the id looks future-dated, but the file is there — it is found, not gone.
+    const ahead = stageUpload(dir, PNG, Date.now() + 3 * 60 * 60 * 1000).uploadId;
+    expect(peekUpload(dir, ahead)?.kind).toBe("image");
+    // Dated ahead of this clock with no file: no answer (the clock may have moved back mid-claim) — unsettled, not gone.
+    expect(peekUpload(dir, "f".repeat(32))).toEqual({ kind: "unsettled" });
+    // An id staged within the TTL with no file and no record: unsettled (mid-claim), kept by the page.
+    const fresh = `${Date.now().toString(16).padStart(12, "0")}${"0".repeat(20)}`;
+    expect(peekUpload(dir, fresh)).toEqual({ kind: "unsettled" });
+  });
+});
+
+describe("GET /sessions/<id>/outgoing/<id>: a file the agent sent is only ever a download", () => {
+  let service: Awaited<ReturnType<typeof startWebHttp>>;
+  let cookie = "";
+  const accessToken = "tomo_web_" + "c".repeat(64);
+  const call = (path: string, headers: Record<string, string> = {}) =>
+    new Promise<{ status: number; body: Buffer; headers: HttpIncoming["headers"] }>((resolve, reject) => {
+      const req = request({ host: "127.0.0.1", port: service.port, path, method: "GET",
+        headers: { "sec-fetch-site": "same-origin", "sec-fetch-dest": "empty", ...(cookie ? { cookie } : {}), ...headers } }, (res) => {
+        const parts: Buffer[] = []; res.on("data", (part: Buffer) => parts.push(part));
+        res.on("end", () => resolve({ status: res.statusCode!, body: Buffer.concat(parts), headers: res.headers }));
+      });
+      req.on("error", reject);
+      req.end();
+    });
+  it("served as application/octet-stream with Content-Disposition: attachment and a sandbox CSP; a picture is still an image; same gate as the rest", async () => {
+    const sessionsDir = join(root, "sessions"), sdkSessionsDir = join(root, "sdk"), assetsDir = join(root, "assets"), workspace = join(root, "workspace");
+    mkdirSync(assetsDir, { recursive: true }); writeFileSync(join(assetsDir, "index.html"), "<!doctype html>");
+    const { SessionStore } = await import("../src/sessions/store.js");
+    new SessionStore(sessionsDir, 20, sdkSessionsDir).setSdkSessionId("dm:owner", "sdk-1");
+    const { OutgoingMediaStore, outgoingImagesDir } = await import("../src/web/outgoing-media.js");
+    const store = new OutgoingMediaStore(outgoingImagesDir(workspace));
+    writeFileSync(join(root, "page.html"), "<script>alert(1)</script>");
+    const html = store.file("dm:owner", ["r"], join(root, "page.html"));
+    writeFileSync(join(root, "pic.png"), PNG);
+    const pic = store.file("dm:owner", ["r"], join(root, "pic.png"));
+    service = await startWebHttp(0, { accessToken, assetsDir, data: new WebData({ sessionsDir, sdkSessionsDir, workspaceDir: workspace, owner: { name: "owner", telegram: ["test-owner"], imessage: [] } }),
+      subscribe: () => () => {}, rpc: async () => ({ snapshot: { requests: [], blocks: [] }, replay: null }) });
+    const boot = await new Promise<HttpIncoming>((resolve) => request({ host: "127.0.0.1", port: service.port, path: `/api/v1/bootstrap?t=${accessToken}`, headers: { "x-tomo-request": "1", "sec-fetch-site": "same-origin" } }, resolve).end());
+    boot.resume();
+    cookie = boot.headers["set-cookie"]![0].split(";")[0];
+    const sid = webSessionId("dm:owner");
+    const got = await call(`/api/v1/sessions/${sid}/outgoing/${html.id}`);
+    expect(got.status).toBe(200);
+    expect(got.headers["content-type"]).toBe("application/octet-stream");
+    expect(got.headers["content-disposition"]).toBe('attachment; filename="page.html"');
+    expect(got.headers["content-security-policy"]).toContain("sandbox");
+    expect(got.headers["x-content-type-options"]).toBe("nosniff");
+    expect(got.body.toString()).toBe("<script>alert(1)</script>");
+    const image = await call(`/api/v1/sessions/${sid}/outgoing/${pic.id}`, { "sec-fetch-dest": "image" });
+    expect(image.headers["content-type"]).toBe("image/png");
+    expect(image.headers["content-disposition"]).toBeUndefined();
+    // A navigation (another site, or a top-level open) is refused; so is no cookie, another session, a bent id.
+    expect((await call(`/api/v1/sessions/${sid}/outgoing/${html.id}`, { "sec-fetch-dest": "document" })).status).toBe(403);
+    expect((await call(`/api/v1/sessions/${sid}/outgoing/${html.id}`, { "sec-fetch-site": "cross-site" })).status).toBe(403);
+    expect((await call(`/api/v1/sessions/${webSessionId("telegram:-1")}/outgoing/${html.id}`)).status).toBe(404);
+    expect((await call(`/api/v1/sessions/${sid}/outgoing/..%2Findex`)).status).toBeGreaterThanOrEqual(400);
+    cookie = "";
+    expect((await call(`/api/v1/sessions/${sid}/outgoing/${html.id}`)).status).toBe(401);
+    await service.close();
   });
 });
 

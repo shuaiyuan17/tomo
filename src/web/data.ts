@@ -411,8 +411,8 @@ export class WebData {
     return file;
   }
 
-  /** A picture the agent sent in a session the catalog shows, by its store id. */
-  outgoingFile(id: string, mediaId: string): { type: string; bytes: Buffer } {
+  /** A picture or file the agent sent in a session the catalog shows, by its store id. */
+  outgoingFile(id: string, mediaId: string): { type: string; bytes: Buffer; name?: string } {
     const key = this.catalog().keys.get(id);
     const file = key && this.outgoing.read(key, mediaId);
     if (!file) throw new WebError(404, "media_not_found");
@@ -461,7 +461,7 @@ export class WebData {
       // A picture the agent sent: its MEDIA:/STICKER: tag becomes the id it
       // was filed under at delivery, or "gone" — the path never goes out.
       page.messages = page.messages.map((message) => message.role !== "assistant" ? message
-        : { ...message, content: this.outgoing.rewrite(key, [message.requestId, message.turnId], message.content).content });
+        : (({ mediaRef, ...shown }) => ({ ...shown, content: this.outgoing.rewrite(key, [shown.requestId, shown.turnId, mediaRef], shown.content).content }))(message));
       for (const message of page.messages) {
         if (message.role !== "user" || !INBOUND_CHANNELS.has(message.channel)) continue;
         // A browser upload is filed as web_owner (channels/web.ts), and only a

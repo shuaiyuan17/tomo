@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -7,6 +7,22 @@ const ROOT = mkdtempSync(join(tmpdir(), "tomo-test-todo-store-"));
 afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 
 vi.mock("../src/config.js", () => ({ config: { tomoHome: ROOT }, TOMO_HOME: ROOT }));
+
+// An injected read failure, root-safe (chmod refuses nothing as root): while
+// `eaccesPath` is set, reading exactly that file throws EACCES.
+const fsFault = vi.hoisted(() => ({ eaccesPath: null as string | null }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  return {
+    ...actual,
+    readFileSync: ((p: Parameters<typeof actual.readFileSync>[0], opts?: unknown) => {
+      if (fsFault.eaccesPath !== null && String(p) === fsFault.eaccesPath) {
+        throw Object.assign(new Error(`EACCES: permission denied, open '${String(p)}'`), { code: "EACCES" });
+      }
+      return (actual.readFileSync as (a: unknown, b: unknown) => unknown)(p, opts);
+    }) as typeof actual.readFileSync,
+  };
+});
 
 const { TodoStore, TodoRuleError, TodoStoreReadError, parseReviewWhen, todosDir } = await import("../src/todos/store.js");
 const { DEFAULT_TODOS } = await import("../src/todos/limits.js");
@@ -218,15 +234,35 @@ describe("an unreadable store is an error, never an empty list", () => {
     });
   }
 
-  it.skipIf(process.getuid?.() === 0)("an unreadable file (EACCES) is an error too", () => {
+  it("an unreadable file (any error but ENOENT, here EISDIR) is an error too, and nothing is written", () => {
+    // A directory at the file's path, not chmod 000: the suite runs as root in
+    // CI containers, where chmod refuses nothing. Any read error other than
+    // ENOENT must refuse the same way EACCES would.
     add();
-    chmodSync(join(dir, "todos.json"), 0o000);
+    const file = join(dir, "todos.json");
+    const content = readFileSync(file, "utf-8");
+    rmSync(file);
+    mkdirSync(file);
+    expect(() => store.list()).toThrow(TodoStoreReadError);
+    expect(() => add()).toThrow(TodoStoreReadError);
+    expect(readdirSync(file)).toEqual([]);
+    rmSync(file, { recursive: true });
+    writeFileSync(file, content);
+    expect(store.list()).toHaveLength(1);
+  });
+
+  it("an unreadable file (EACCES, injected) is an error too, and nothing is written", () => {
+    add();
+    const file = join(dir, "todos.json");
+    const content = readFileSync(file, "utf-8");
+    fsFault.eaccesPath = file;
     try {
       expect(() => store.list()).toThrow(TodoStoreReadError);
       expect(() => add()).toThrow(TodoStoreReadError);
     } finally {
-      chmodSync(join(dir, "todos.json"), 0o600);
+      fsFault.eaccesPath = null;
     }
+    expect(readFileSync(file, "utf-8")).toBe(content);
     expect(store.list()).toHaveLength(1);
   });
 });

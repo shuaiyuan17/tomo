@@ -9,25 +9,15 @@ import { describeResultFailure } from "../src/agent/live-session.js";
 describe("SdkResultError.isResumeMissing", () => {
   const missing = { subtype: "error_during_execution", errors: ["No conversation found with session ID: x"] };
 
-  it("is true for a zero-turn missing-conversation result", () => {
-    expect(describeResultFailure({ ...missing, num_turns: 0 })?.isResumeMissing).toBe(true);
-  });
-
-  it("is false when any turn ran", () => {
-    expect(describeResultFailure({ ...missing, num_turns: 2 })?.isResumeMissing).toBe(false);
-  });
-
-  it("is false when num_turns is unknown", () => {
-    expect(describeResultFailure(missing)?.isResumeMissing).toBe(false);
-  });
-
-  it("is false when another error is mixed in", () => {
-    expect(
-      describeResultFailure({ ...missing, errors: [...missing.errors, "Session is closed"], num_turns: 0 })?.isResumeMissing,
-    ).toBe(false);
-  });
-
-  it("is false for other subtypes", () => {
-    expect(describeResultFailure({ subtype: "error_max_turns", errors: missing.errors, num_turns: 0 })?.isResumeMissing).toBe(false);
+  // Only a zero-turn result whose ONLY error is the missing conversation is
+  // safe to re-run as a fresh session.
+  it.each([
+    ["is true for a zero-turn missing-conversation result", { ...missing, num_turns: 0 }, true],
+    ["is false when any turn ran", { ...missing, num_turns: 2 }, false],
+    ["is false when num_turns is unknown", missing, false],
+    ["is false when another error is mixed in", { ...missing, errors: [...missing.errors, "Session is closed"], num_turns: 0 }, false],
+    ["is false for other subtypes", { subtype: "error_max_turns", errors: missing.errors, num_turns: 0 }, false],
+  ])("%s", (_label, result, expected) => {
+    expect(describeResultFailure(result)?.isResumeMissing).toBe(expected);
   });
 });

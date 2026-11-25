@@ -215,7 +215,7 @@ export class TaskBoard {
     const list = [...next.values()];
     // An ended task whose work runs on counts as live here, so the cap never drops it before that work.
     const settled = settledTimes(next);
-    const live = list.filter((task) => settled.get(task.taskId) === undefined).sort(runningFirst);
+    const live = list.filter((task) => settled.get(task.taskId) === undefined).sort(capOrder(next));
     const done = list.filter((task) => settled.get(task.taskId) !== undefined)
       .sort((a, b) => settled.get(b.taskId)! - settled.get(a.taskId)!);
     const kept = [...live, ...done].slice(0, MAX_SESSION_TASKS);
@@ -291,7 +291,7 @@ export class TaskBoard {
         const at = settled.get(id)!;
         const tasks = [...this.sessions.get(id)!.values()]
           .filter((task) => (at.get(task.taskId) !== undefined) === ended && task.ambient === ambient);
-        return { id, tasks: ended ? tasks.sort((a, b) => at.get(b.taskId)! - at.get(a.taskId)!) : tasks.sort(runningFirst) };
+        return { id, tasks: ended ? tasks.sort((a, b) => at.get(b.taskId)! - at.get(a.taskId)!) : tasks.sort(capOrder(this.sessions.get(id)!)) };
       });
       for (let round = 0; room > 0 && queues.some((q) => q.tasks.length > round); round++) {
         for (const queue of queues) {
@@ -334,15 +334,31 @@ export class TaskBoard {
 
 /**
  * Unsettled tasks in the order a cap keeps them: those running first (oldest
- * first), then ended ones whose work runs on, newest first. A parent is only
- * kept once every running task of its session is, and (a task starting after
- * the one that started it) once every ended task between it and that work,
- * so the rail can always trace it to its running work.
+ * first), then ended ones whose work runs on, deepest in the task tree first
+ * (ties: newest first). A parent is only kept once every running task of its
+ * session is, and once every ended task between it and that work, so the
+ * rail can always trace it to its running work. Parent cycles are cut.
  */
-function runningFirst(a: WebTask, b: WebTask): number {
-  const ended = Number(a.endedAt !== undefined) - Number(b.endedAt !== undefined);
-  if (ended !== 0) return ended;
-  return a.endedAt === undefined ? a.startedAt - b.startedAt : b.startedAt - a.startedAt;
+function capOrder(tasks: ReadonlyMap<string, WebTask>): (a: WebTask, b: WebTask) => number {
+  const depths = new Map<string, number>();
+  const depth = (task: WebTask): number => {
+    const known = depths.get(task.taskId);
+    if (known !== undefined) return known;
+    let n = 0;
+    const seen = new Set([task.taskId]);
+    for (let parent = task.parentTaskId; parent && !seen.has(parent) && tasks.has(parent); parent = tasks.get(parent)!.parentTaskId) {
+      seen.add(parent);
+      n += 1;
+    }
+    depths.set(task.taskId, n);
+    return n;
+  };
+  return (a, b) => {
+    const ended = Number(a.endedAt !== undefined) - Number(b.endedAt !== undefined);
+    if (ended !== 0) return ended;
+    if (a.endedAt === undefined) return a.startedAt - b.startedAt;
+    return depth(b) - depth(a) || b.startedAt - a.startedAt;
+  };
 }
 
 /**

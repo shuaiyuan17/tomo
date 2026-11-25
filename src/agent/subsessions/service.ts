@@ -1194,6 +1194,18 @@ export class SubsessionService {
     const queued = tasks.filter((t) => t.status === "queued")
       .sort((a, b) => Number(b.resumeNeeded) - Number(a.resumeNeeded) || a.createdAt - b.createdAt);
     const max = this.deps.config().maxRunning;
+    // A queued task holding a message the owner wrote to it never waits for
+    // a slot. Read from the table, so a start that failed, or that a restart
+    // cut off, is made here the next time the scheduler runs.
+    for (const task of queued) {
+      if (!task.pendingInput.some((p) => p.text.includes(OWNER_MESSAGE_MARKER))) continue;
+      try {
+        if (this.startTask(task.id, "the owner wrote to it")) active += 1;
+      } catch (err) {
+        log.error({ err, id: task.id }, "Could not start a queued sub-session for the owner's message; trying again shortly");
+        this.armRegistryRecheck();
+      }
+    }
     for (const task of queued) {
       if (active >= max) break;
       if (this.startQueued(task.id, "a slot is free", false)) active += 1;
@@ -1327,9 +1339,9 @@ export class SubsessionService {
       } catch (err) {
         // The message is on the task already: it must not be reported as
         // undelivered (the caller would hand it to the owning session too).
-        // The start is owed, and made again at the next recheck.
+        // The scheduler starts it from the table at the next recheck (and
+        // after a restart), past the slot cap.
         log.error({ err, id }, "Could not start a queued sub-session for the owner's message; trying again shortly");
-        this.startsOwed.set(id, "the owner wrote to it");
         this.armRegistryRecheck();
       }
       return { ...outcome, record: this.safeGet(id) ?? outcome.record };

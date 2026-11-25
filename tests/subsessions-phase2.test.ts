@@ -12,7 +12,7 @@ import {
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { ACTIVE_HEARTBEAT_MS, REGISTRY_RECHECK_MS } from "../src/agent/subsessions/service.js";
 import { createTodoLink } from "../src/agent/subsessions/todo-link.js";
-import { formatMirrorNote, MIRROR_ENTRY_MAX } from "../src/agent/subsessions/prompt.js";
+import { formatMirrorNote, formatOwnerMessageEvent, MIRROR_ENTRY_MAX } from "../src/agent/subsessions/prompt.js";
 import { TodoStore } from "../src/todos/store.js";
 import { DEFAULT_TODOS } from "../src/todos/limits.js";
 import { appendInput, type SubsessionRecord } from "../src/agent/subsessions/types.js";
@@ -123,13 +123,17 @@ describe("an owner message whose start cannot be written", () => {
       expect(h.service.get(task.id)?.status).toBe("queued");
       const store = h.store as unknown as { transition: (id: string, event: string, ...rest: unknown[]) => unknown };
       const real = store.transition.bind(h.store);
-      let fail = true;
+      // Fails at once, and again at the first recheck.
+      let fails = 2;
       store.transition = (id, event, ...rest) => {
-        if (event === "start" && fail) { fail = false; throw new Error("disk full"); }
+        if (event === "start" && fails > 0) { fails -= 1; throw new Error("disk full"); }
         return real(id, event, ...rest);
       };
       expect(h.service.ownerMessage("dm:owner", task.id, "do it now")).toMatchObject({ ok: true });
       expect(h.service.get(task.id)?.pendingInput.some((i) => i.text.includes("do it now"))).toBe(true);
+      vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
+      await flush();
+      expect(h.service.get(task.id)?.status).toBe("queued");
       vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
       await flush();
       expect(h.service.get(task.id)?.status).toBe("active");
@@ -138,6 +142,25 @@ describe("an owner message whose start cannot be written", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("an owner message to a queued task, across a restart", () => {
+  it("is started past the slot cap when dispatch opens, from what the table holds", async () => {
+    const seed = harness({ maxRunning: 0 });
+    seed.service.start();
+    const task = spawn(seed);
+    await flush();
+    // The message landed; the process died before the start.
+    seed.store.update(task.id, (r) => { appendInput(r, formatOwnerMessageEvent("do it now"), { from: "owner", words: "do it now" }); });
+    seed.service.stop();
+    const h = harness({ maxRunning: 0 });
+    h.onTurn = () => new Promise(() => {});
+    h.service.start();
+    await flush();
+    expect(h.service.get(task.id)?.status).toBe("active");
+    expect(h.prompts.some((p) => p.includes("do it now"))).toBe(true);
+    h.service.stop();
   });
 });
 

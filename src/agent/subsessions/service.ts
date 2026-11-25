@@ -708,9 +708,9 @@ export class SubsessionService {
    * task_finish. Refused while input is pending that the turn in flight does
    * not carry (it arrived after the turn started, so the task has never seen
    * it): finishing would leave it unread. The task stays as it is, and that
-   * input is its next turn. Judged under the lock, like task_ask. Past
+   * input is its next turn. Judged under the lock, like task_ask. After
    * MAX_FINISH_REFUSALS refused turns in a row with the unread count never
-   * going down, it finishes anyway: the unread input is quoted in the report
+   * going down (a drop starts the count over), the next turn finishes anyway: the unread input is quoted in the report
    * and stays pending, answered like any input to a finished task.
    * Outside a turn of its own (no task calls a tool there) nothing is refused.
    */
@@ -728,7 +728,7 @@ export class SubsessionService {
         unread = r.pendingInput.filter((i) => i.seq > through);
         if (unread.length === 0) return undefined;
         const prev = this.finishRefusals.get(id);
-        forced = prev !== undefined && prev.turn !== turn && prev.turns >= MAX_FINISH_REFUSALS && unread.length >= prev.unread;
+        forced = prev !== undefined && prev.turn !== turn && prev.turns >= MAX_FINISH_REFUSALS;
         return forced ? undefined : `${unread.length} unread input${unread.length === 1 ? "" : "s"} this turn does not carry`;
       },
       // A live ending: the status no longer comes from a backup.

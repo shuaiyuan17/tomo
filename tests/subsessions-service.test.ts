@@ -1984,6 +1984,20 @@ describe("SubsessionService: task_finish never leaves input unread", () => {
     await flush();
     expect(results.map((r) => r.ok)).toEqual([false, false, false, false, false, true]);
   });
+
+  it("once three refused turns in a row are done, the next finish goes through even if less is unread", async () => {
+    const results: Array<{ ok: boolean }> = [];
+    const arrivals = [2, 2, 2, 1, 0];
+    const h = harness({}, working((turn, hh) => {
+      const k = hh.turns.length - 1;
+      for (let i = 0; i < (arrivals[k] ?? 0); i++) hh.service.relay("s1", `r${k}.${i}`);
+      results.push(hh.service.finish(turn.key, "done") as { ok: boolean });
+    }));
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(results.slice(0, 4).map((r) => r.ok)).toEqual([false, false, false, true]);
+  });
 });
 
 describe("SubsessionService: a failed task hands back what it never answered", () => {

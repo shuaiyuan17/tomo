@@ -17,7 +17,7 @@ const reading = (used: number, max = 1000, estimated = false, inputTokens = 500)
 const okReport = (over: Partial<ForceCompactReport> = {}): ForceCompactReport => ({
   beforeTokens: 960, afterTokens: 400, contextMax: 1000, pruned: { entries: 3, chars: 9000 },
   summarized: [{ from: "2026-11-22 09:00", to: "2026-11-22 18:00", events: 40, blockTag: "daily 2026-11-22" }],
-  archived: [], usageCapped: 1, reachedSafe: true, errors: [], ...over,
+  archived: [], usageCapped: 1, reachedSafe: true, ok: true, errors: [], ...over,
 });
 
 const agent: RunningTaskRecord = { sessionKey: "telegram:-100", taskId: "a1", kind: "agent", taskType: "local_agent", subagentType: "general-purpose", description: "research", startedAt: 1, lastActivityAt: 2 };
@@ -51,7 +51,7 @@ describe("ForceCompactor triggers", () => {
     expect(deps.hold).not.toHaveBeenCalled();
     expect(fc.maybeStart("dm:owner", reading(950), "threshold")).toBe(true);
     await fc.running("dm:owner");
-    expect(deps.compact).toHaveBeenCalledWith({ key: "dm:owner", sdkSessionId: "sdk-1", contextUsed: 950, contextMax: 1000 });
+    expect(deps.compact).toHaveBeenCalledWith(expect.objectContaining({ key: "dm:owner", sdkSessionId: "sdk-1", contextUsed: 950, contextMax: 1000 }));
   });
 
   it("starts on \"Prompt is too long\" at any reading, with the window seen earlier", async () => {
@@ -68,7 +68,7 @@ describe("ForceCompactor triggers", () => {
     const fc = new ForceCompactor(deps);
     expect(fc.maybeStart("dm:owner", reading(995, 1000, false, 0), "threshold")).toBe(true);
     await fc.running("dm:owner");
-    expect(deps.compact).toHaveBeenCalledWith({ key: "dm:owner", sdkSessionId: "sdk-1", contextUsed: undefined, contextMax: 1000 });
+    expect(deps.compact).toHaveBeenCalledWith(expect.objectContaining({ key: "dm:owner", sdkSessionId: "sdk-1", contextUsed: undefined, contextMax: 1000 }));
   });
 
   it.each([0, 100])("is off at forceCompactAtPct=%s, for both triggers", (pct) => {
@@ -156,6 +156,39 @@ describe("ForceCompactor run", () => {
     expect(release).toHaveBeenCalledTimes(1);
     expect(String(deps.notifyOwner.mock.calls[0][0])).toMatch(/could not compact/);
     expect(fc.running("dm:owner")).toBeUndefined();
+  });
+
+  it("reports a run that did not complete (a refused rewrite, a failed usage cap) as a failure, not a success", async () => {
+    const { deps } = makeDeps({ compact: vi.fn(async () => okReport({ ok: false, errors: ["archive rewrite: refused"] })) });
+    const fc = new ForceCompactor(deps);
+    fc.maybeStart("dm:owner", reading(990), "threshold");
+    await fc.running("dm:owner");
+    expect(deps.queueNote).not.toHaveBeenCalled();
+    expect(String(deps.notifyOwner.mock.calls[0][0])).toMatch(/could not compact/);
+  });
+
+  it("recovers a refusal right after a restart with the window the registry recorded", async () => {
+    const { deps } = makeDeps({ persistedWindow: () => 1_000_000 });
+    const fc = new ForceCompactor(deps);
+    expect(fc.maybeStart("dm:owner", null, "prompt-too-long")).toBe(true);
+    await fc.running("dm:owner");
+    expect(deps.compact).toHaveBeenCalledWith(expect.objectContaining({ contextMax: 1_000_000 }));
+    const none = makeDeps();
+    expect(new ForceCompactor(none.deps).maybeStart("dm:owner", null, "prompt-too-long")).toBe(false);
+  });
+
+  it("stop() aborts a running compaction, waits for it, and starts no new one", async () => {
+    let seen: AbortSignal | undefined;
+    const { deps } = makeDeps({
+      compact: vi.fn(({ signal }) => { seen = signal; return new Promise<ForceCompactReport>((r) => signal.addEventListener("abort", () => r(okReport({ ok: false, errors: ["aborted (shutdown)"] })))); }),
+    });
+    const fc = new ForceCompactor(deps);
+    fc.maybeStart("dm:owner", reading(990), "threshold");
+    await vi.waitFor(() => expect(deps.compact).toHaveBeenCalled());
+    await fc.stop();
+    expect(seen?.aborted).toBe(true);
+    expect(fc.running("dm:owner")).toBeUndefined();
+    expect(fc.maybeStart("telegram:-1", reading(990), "threshold")).toBe(false);
   });
 
   it("tells the session about an archive fallback and a still-high result", () => {

@@ -34,6 +34,8 @@ export interface ForceSummarizerOptions {
   /** Model alias or id (config lcm.forceCompactModel). */
   model: string;
   timeoutMs?: number;
+  /** Shutdown: aborts the call. */
+  signal?: AbortSignal;
 }
 
 /** Build the summary function `forceCompactSession` is given. Throws on any failure (the caller falls back to archiving). */
@@ -42,6 +44,8 @@ export function sdkForceSummarizer(opts: ForceSummarizerOptions): (stretch: Stre
     const model = resolveModelName(opts.model) ?? opts.model;
     const abortController = new AbortController();
     const timer = setTimeout(() => abortController.abort(), opts.timeoutMs ?? FORCE_SUMMARY_TIMEOUT_MS);
+    const onAbort = () => abortController.abort();
+    opts.signal?.addEventListener("abort", onAbort, { once: true });
     const prompt = [
       `Conversation stretch to summarize: ${stretch.from} → ${stretch.to} (${stretch.events} events, ${stretch.label}).`,
       "",
@@ -96,6 +100,7 @@ export function sdkForceSummarizer(opts: ForceSummarizerOptions): (stretch: Stre
       throw err;
     } finally {
       clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", onAbort);
     }
   };
 }

@@ -219,8 +219,9 @@ describe("forceCompactSession", () => {
     expect(r.pruned?.entries).toBeGreaterThan(0);
     expect(r.reachedSafe).toBe(true);
     expect(r.summarized).toEqual([]);
-    // ⑤ also after a prune-only run: the stale reading is capped.
-    expect(cliAnchorUsage(fileEvents(b.sessionId))).toBeLessThanOrEqual(Math.floor(w.contextMax * 0.7));
+    // ⑤ also after a prune-only run: the stale reading is capped, at the estimate of what is left.
+    expect(cliAnchorUsage(fileEvents(b.sessionId))).toBe(r.afterTokens);
+    expect(r.afterTokens).toBeLessThanOrEqual(Math.floor(w.contextMax * 0.7));
     expect(existsSync(getCompactTriggerPath(b.sessionId, sdkSessionsDir))).toBe(false);
   });
 
@@ -270,7 +271,7 @@ describe("forceCompactSession", () => {
   });
 
   it("fails closed when the chain check refuses: no block, nothing archived", async () => {
-    const b = build();
+    const b = build({ usage: 977_000 });
     const w = windowAt(b.sessionId, 96);
     const original = readFileSync(getSdkSessionPath(b.sessionId, sdkSessionsDir), "utf8");
     const r = await forceCompactSession({
@@ -281,7 +282,29 @@ describe("forceCompactSession", () => {
     expect(r.summarized).toEqual([]);
     expect(r.archived).toEqual([]);
     expect(r.errors.join("\n")).toMatch(/archive rewrite/);
+    // Not even the usage cap: that would only hide a session still too big from the CLI's check.
+    expect(r.usageCapped).toBe(0);
+    expect(r.ok).toBe(false);
     expect(readFileSync(getSdkSessionPath(b.sessionId, sdkSessionsDir), "utf8")).toBe(original);
+  });
+
+  it("caps at the honest estimate of what is left, and does nothing once shutdown has begun", async () => {
+    const b = build({ usage: 977_000 });
+    const w = windowAt(b.sessionId, 96);
+    const r = await forceCompactSession({ ...common(), sdkSessionId: b.sessionId, ...w, summarize: async () => "Summary: the owner asked; Tomo answered; nothing open.", maxRounds: 1, safePct: 10 });
+    expect(r.ok).toBe(true);
+    expect(r.reachedSafe).toBe(false);
+    expect(cliAnchorUsage(fileEvents(b.sessionId))).toBe(r.afterTokens);
+
+    const c = build({ usage: 977_000 });
+    const original = readFileSync(getSdkSessionPath(c.sessionId, sdkSessionsDir), "utf8");
+    const ac = new AbortController();
+    ac.abort();
+    const summarize = vi.fn(async () => "never");
+    const r2 = await forceCompactSession({ ...common(), sdkSessionId: c.sessionId, ...windowAt(c.sessionId, 96), summarize, signal: ac.signal });
+    expect(summarize).not.toHaveBeenCalled();
+    expect(r2.ok).toBe(false);
+    expect(readFileSync(getSdkSessionPath(c.sessionId, sdkSessionsDir), "utf8")).toBe(original);
   });
 
   it("writes the placeholder line the brief asks for", () => {

@@ -801,7 +801,8 @@ export class LiveSessionManager {
    * session untouched), then close it — which stops its background agents
    * and commands — and wait (bounded) for its CLI child to exit, so nothing
    * appends to the file the compaction is about to rewrite. Returns the SDK
-   * session id to compact, or null when aborted. A key with no live session
+   * session id to compact, or null when aborted (also when the closed CLI did
+   * not exit in time: nothing is rewritten under a live writer). A key with no live session
    * goes straight to `beforeClose`.
    */
   async quiesceForForceCompact(
@@ -830,7 +831,10 @@ export class LiveSessionManager {
       this.mcpHealth.sessionClosed(key);
       if (session.isAlive()) session.close();
       if (!await withTimeout(session.whenClosed(), IDLE_REAP_CLOSE_WAIT_MS)) {
-        log.warn({ key }, "Forced compaction: the closed session's CLI did not exit in time; continuing (late appends are spliced)");
+        // A CLI that is still alive can append after the rewrite's drain
+        // (orphaned parents, a fresh uncapped usage anchor): fail closed.
+        log.warn({ key }, "Forced compaction: the closed session's CLI did not exit in time; not rewriting its file");
+        return null;
       }
     }
     return sdkSessionId;

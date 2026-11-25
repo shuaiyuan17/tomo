@@ -487,7 +487,7 @@ export class Agent {
       quiesce: (hold, beforeClose) => this.liveSessionManager.quiesceForForceCompact(hold, beforeClose),
       markInterrupted: (key) => this.runningAgents ? this.runningAgents.markSessionInterrupted(key) : [],
       sessionClosed: (key) => this.runningAgents?.sessionClosed(key),
-      compact: ({ sdkSessionId, contextUsed, contextMax }) => forceCompactSession({
+      compact: ({ sdkSessionId, contextUsed, contextMax, signal }) => forceCompactSession({
         sdkSessionId,
         sdkSessionsDir: config.sdkSessionsDir,
         sessionsDir: config.sessionsDir,
@@ -495,8 +495,10 @@ export class Agent {
         contextUsed,
         contextMax,
         freshTail: config.lcm.dailyFreshTail,
-        summarize: sdkForceSummarizer({ model: config.lcm.forceCompactModel }),
+        summarize: sdkForceSummarizer({ model: config.lcm.forceCompactModel, signal }),
+        signal,
       }),
+      persistedWindow: (key) => this.sessions.getEntry(key)?.stats?.contextMax,
       queueNote: (key, note) => this.queuePendingNote(key, note),
       notifyOwner: (text) => this.notifyOwner(text),
       groupTitle: (key) => this.sessions.getEntry(key)?.chatTitle,
@@ -3366,6 +3368,9 @@ export class Agent {
     // Before any session is closed: closing empties its task set, and what is
     // still running now was interrupted, not finished.
     this.runningAgents?.freeze();
+    // Before the live sessions (and the holds and rewrite slots they own) go:
+    // a forced compaction must not publish a rewrite after its slot is released.
+    await this.forceCompactor.stop();
     this.detachRunningAgents?.();
     this.detachRunningAgents = undefined;
     this.credentialBroker?.shutdown();

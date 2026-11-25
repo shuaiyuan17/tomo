@@ -50,7 +50,9 @@ export interface ForceCompactorDeps {
   markInterrupted(key: string): RunningTaskRecord[] | null;
   /** The session `markInterrupted` was called for is closed. */
   sessionClosed(key: string): void;
-  compact(args: { key: string; sdkSessionId: string; contextUsed?: number; contextMax: number }): Promise<ForceCompactReport>;
+  compact(args: { key: string; sdkSessionId: string; contextUsed?: number; contextMax: number; signal: AbortSignal }): Promise<ForceCompactReport>;
+  /** The window last recorded for the key in the session registry (stats), for a refusal right after a restart. */
+  persistedWindow?(key: string): number | undefined;
   queueNote(key: string, note: string): boolean;
   notifyOwner(text: OwnerText): Promise<boolean>;
   /** A group's title, for the owner notice. */
@@ -69,6 +71,7 @@ export class ForceCompactor {
   /** Last real window seen per key: a "Prompt is too long" result may carry none. */
   private windows = new Map<string, number>();
   private readonly now: () => number;
+  private readonly shutdown = new AbortController();
 
   constructor(private readonly deps: ForceCompactorDeps) {
     this.now = deps.now ?? Date.now;
@@ -78,6 +81,24 @@ export class ForceCompactor {
   static enabled(): boolean {
     const pct = config.lcm.forceCompactAtPct;
     return pct > 0 && pct < 100;
+  }
+
+  /**
+   * Shutdown, BEFORE the live sessions (and with them the holds and the
+   * rewrite slots) are released: no new run starts, a running one stops
+   * before its next rewrite (its summary call is aborted), and this waits for
+   * it, bounded — so no rewrite is published after its slot is gone.
+   */
+  async stop(timeoutMs = 20_000): Promise<void> {
+    this.shutdown.abort();
+    const runs = [...this.inFlight.values()];
+    if (runs.length === 0) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      Promise.allSettled(runs),
+      new Promise<void>((resolve) => { timer = setTimeout(() => { log.warn({ runs: runs.length }, "Forced compaction still running at shutdown"); resolve(); }, timeoutMs); }),
+    ]);
+    clearTimeout(timer);
   }
 
   /** A run in progress for the key (tests, shutdown). */
@@ -91,13 +112,13 @@ export class ForceCompactor {
    * Synchronous up to the hold, so no other turn can slip in between.
    */
   maybeStart(key: string, reading: QueryResult | null, reason: ForceCompactReason): boolean {
-    if (!ForceCompactor.enabled()) return false;
+    if (!ForceCompactor.enabled() || this.shutdown.signal.aborted) return false;
     const real = reading && !reading.contextEstimated && reading.contextMax > 0 ? reading : null;
     if (real) this.windows.set(key, real.contextMax);
     if (this.inFlight.has(key)) return true;
     const pct = real ? (real.contextUsed / real.contextMax) * 100 : undefined;
     if (reason === "threshold" && (pct === undefined || pct < config.lcm.forceCompactAtPct)) return false;
-    const contextMax = real?.contextMax ?? this.windows.get(key);
+    const contextMax = real?.contextMax ?? this.windows.get(key) ?? (this.deps.persistedWindow?.(key) || undefined);
     if (!contextMax) {
       log.warn({ key, reason }, "Forced compaction skipped: no context window known for this session yet");
       return false;
@@ -147,10 +168,8 @@ export class ForceCompactor {
       if (!sdkSessionId) {
         failure = "no session to compact, or its background work could not be recorded";
       } else {
-        report = await this.deps.compact({ key, sdkSessionId, contextUsed: args.contextUsed, contextMax: args.contextMax });
-        if (report.summarized.length === 0 && report.archived.length === 0 && !report.pruned && report.usageCapped === 0) {
-          failure = report.errors.join("; ") || "nothing could be compacted";
-        }
+        report = await this.deps.compact({ key, sdkSessionId, contextUsed: args.contextUsed, contextMax: args.contextMax, signal: this.shutdown.signal });
+        if (!report.ok) failure = report.errors.join("; ") || "the compaction did not complete";
       }
     } catch (err) {
       failure = errorMessage(err);

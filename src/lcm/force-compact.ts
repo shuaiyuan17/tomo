@@ -92,6 +92,8 @@ interface Stretch extends StretchForSummary {
 }
 
 export interface ForceCompactOptions {
+  /** Shutdown: no rewrite starts once this is aborted (the summary call is cut short too). */
+  signal?: AbortSignal;
   sdkSessionId: string;
   sdkSessionsDir: string;
   /** Tomo's sessions dir: the archive (`_archive_<id>.jsonl`) lives there. */
@@ -129,6 +131,12 @@ export interface ForceCompactReport {
   usageCapped: number;
   /** The estimate ended at or under the safe line. */
   reachedSafe: boolean;
+  /**
+   * The run left the session usable: no rewrite was refused and the stale
+   * usage readings were capped. False means a failure the owner must hear of,
+   * whatever else was done.
+   */
+  ok: boolean;
   /** Anything that failed along the way (a refused rewrite stops the run). */
   errors: string[];
 }
@@ -312,7 +320,7 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
   if (!existsSync(getSdkSessionPath(o.sdkSessionId, o.sdkSessionsDir))) {
     return {
       beforeTokens: o.contextUsed ?? 0, afterTokens: o.contextUsed ?? 0, contextMax: window, pruned: null,
-      summarized: [], archived: [], usageCapped: 0, reachedSafe: false, errors: ["session file not found"],
+      summarized: [], archived: [], usageCapped: 0, reachedSafe: false, ok: false, errors: ["session file not found"],
     };
   }
   const safeTokens = Math.floor(window * (o.safePct ?? FORCE_COMPACT_SAFE_PCT) / 100);
@@ -331,13 +339,20 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
     archived: [],
     usageCapped: 0,
     reachedSafe: false,
+    ok: false,
     errors: [],
   };
   const archivePath = join(o.sessionsDir, `_archive_${o.sdkSessionId}.jsonl`);
   const chainOpts: ChainCheckOptions = { workspaceDir: o.workspaceDir, ...(o.loadChain ? { loadChain: o.loadChain } : {}) };
 
+  const aborted = () => {
+    if (!o.signal?.aborted) return false;
+    if (!report.errors.includes("aborted (shutdown)")) report.errors.push("aborted (shutdown)");
+    return true;
+  };
+
   // ② Prune: mechanical, no model.
-  try {
+  if (!aborted()) try {
     const pr = pruneTools({ sdkSessionId: o.sdkSessionId, sdkSessionsDir: o.sdkSessionsDir, archivePath });
     if (pr.success) {
       if (pr.pruned.length > 0) report.pruned = { entries: pr.pruned.length, chars: pr.totalCharsRemoved };
@@ -348,7 +363,7 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
 
   // ③ / ④ Summarize (or archive) the oldest stretch until under the safe line.
   let stopped = false;
-  for (let round = 0; round < (o.maxRounds ?? FORCE_COMPACT_MAX_ROUNDS) && !stopped && estimate() > safeTokens; round++) {
+  for (let round = 0; round < (o.maxRounds ?? FORCE_COMPACT_MAX_ROUNDS) && !stopped && !aborted() && estimate() > safeTokens; round++) {
     const events = loadEvents(o.sdkSessionId, o.sdkSessionsDir);
     const maxInputTokens = o.maxInputTokens ?? FORCE_COMPACT_MAX_INPUT_TOKENS;
     const stretch = selectOldestStretch(events, { freshTail: o.freshTail, maxInputTokens })
@@ -375,6 +390,7 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
     }
     const rejection = summary === null ? "summary call failed" : summaryRejection(summary);
     if (summary !== null && rejection) report.errors.push(`summary ${stretch.from}–${stretch.to}: ${rejection}`);
+    if (aborted()) break;
     if (!rejection) {
       const text = `(Forced compaction: written by a separate summary model from the original messages, ${stretch.from} → ${stretch.to}.)\n\n${summary!.trim()}`;
       const res = await compactSessionChecked({ ...range, summary: text }, chainOpts);
@@ -395,12 +411,19 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
   }
 
   // ⑤ Stale usage: the CLI must not read the pre-compaction reply's usage.
+  // Capped at the honest estimate of what is left (never below it), and not
+  // at all after a refused rewrite or a shutdown: that would only hide a
+  // session that is still too big from the CLI's check.
   const after = estimate();
   report.afterTokens = after;
   report.reachedSafe = after <= safeTokens;
-  const capped = capStaleUsageInFile({ sdkSessionId: o.sdkSessionId, sdkSessionsDir: o.sdkSessionsDir, ceiling: Math.min(after, safeTokens) });
-  if (capped.success) report.usageCapped = capped.capped;
-  else report.errors.push(`usage cap: ${capped.error ?? "failed"}`);
+  if (!stopped && !aborted()) {
+    const capped = capStaleUsageInFile({ sdkSessionId: o.sdkSessionId, sdkSessionsDir: o.sdkSessionsDir, ceiling: after });
+    if (capped.success) {
+      report.usageCapped = capped.capped;
+      report.ok = true;
+    } else report.errors.push(`usage cap: ${capped.error ?? "failed"}`);
+  }
 
   // The live session is already closed and resumes from disk: a trigger left
   // by the rewrites above would only close the NEXT session after its first turn.

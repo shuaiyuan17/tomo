@@ -31,6 +31,11 @@ export const tasks = {
     state: { working: "Working", background: "Working (background)", active: "Active", queued: "Queued", waitingOwner: "Waiting for you", waiting: "Waiting", finished: "Done", cancelled: "Cancelled", failed: "Failed" },
     conversation: "Conversation with {{id}}", nothingYet: "Nothing said yet. Write to {{id}} below.",
     you: "You", tag: { ask: "Question", notify: "Update" }, report: "Report",
+    doing: { heading: "What it's doing", inProgress: "In progress", pending: "Not started", done: "Done", earlier: "Show {{count}} earlier", fewer: "Show fewer" },
+    updates: {
+      planChanged: "Plan changed: {{reason}}", heading: "Decisions and updates", more: "Show all ({{count}})", fewer: "Show fewer",
+      milestone: { started: "Started", waitingOwner: "Waiting for you", finished: "Finished", reopened: "Reopened", cancelled: "Cancelled", failed: "Failed" },
+    },
     files_one: "{{count}} file", files_other: "{{count}} files",
     label: "Message to {{id}}", placeholder: "Message {{id}}…", send: "Send to {{id}}",
     sending: "Sending…", sent: "Sent", retry: "Try again",

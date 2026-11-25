@@ -8,7 +8,7 @@ import { api, ApiError } from "./api.js";
 import { Text } from "./markdown.js";
 import { messageDateTime, messageTime } from "./message-meta.js";
 import { createCompositionGuard } from "./compose-keys.js";
-import { isOpenSubsession, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
+import { isOpenSubsession, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
 import { i18n, useTranslation } from "./i18n/index.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
@@ -44,9 +44,16 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
   const id = summary.id;
   useEffect(() => {
     const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
     void api<WebSubsessionDetail>(`/subsessions/${encodeURIComponent(id)}`, { signal: controller.signal }).then((value) => { setDetail(value); setStatus("ready"); },
-      (error: unknown) => { if (controller.signal.aborted) return; setStatus(error instanceof ApiError && error.status === 404 ? "gone" : "error"); });
-    return () => controller.abort();
+      (error: unknown) => {
+        if (controller.signal.aborted) return;
+        // Only a 404 means the task is gone; anything else (the table unreadable for a moment, the network) is read again.
+        if (error instanceof ApiError && error.status === 404) { setStatus("gone"); return; }
+        setStatus("error");
+        timer = setTimeout(() => setReload((n) => n + 1), SUBSESSIONS_RETRY_MS);
+      });
+    return () => { controller.abort(); clearTimeout(timer); };
   }, [id, revision, reload]);
   // What the list says now wins over the last detail read (it is the newer of the two).
   const shown = { ...(detail ?? {}), ...summary };

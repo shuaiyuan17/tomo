@@ -1968,9 +1968,10 @@ export class Agent {
       },
       get: (id) => {
         const scope = this.router.ownerSessionKey();
-        if (!scope || !service.available()) return undefined;
+        // null: the table cannot be read right now (try again), not "no such task".
+        if (!scope || !service.available()) return null;
         let record;
-        try { record = service.get(id); } catch { return undefined; }
+        try { record = service.get(id); } catch { return null; }
         return record ? subsessionDetail(record, scope, Date.now(), working(record.sessionKey)) : undefined;
       },
       message: (id, text, requestId) => {

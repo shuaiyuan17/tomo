@@ -92,3 +92,21 @@ it("an ended task reads, but cannot be written to", async () => {
   await browserExpect(rail().getByTestId("subsession-input")).toBeDisabled();
   await browserExpect(rail()).toContainText("This task has ended");
 });
+
+it("a failed read of the list or of a chat is tried again, and a table that is briefly unreadable is not taken for a task that is gone", async () => {
+  let listFails = 1, detailFails = 1;
+  await page.route("**/api/v1/subsessions", (route) => listFails-- > 0
+    ? route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ available: false, tasks: [] }) }) : route.fallback());
+  await page.route("**/api/v1/subsessions/s1", (route) => detailFails-- > 0
+    ? route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "subsessions_unavailable" }) }) : route.fallback());
+  agent.subsessions!.spawn("dm:owner", { title: "Retry me", brief: "b" });
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  const row = rail().locator('[data-subsession-row="s1"]');
+  await browserExpect(row).toBeVisible({ timeout: 10_000 });
+  await row.getByRole("button").click();
+  const input = rail().getByTestId("subsession-input");
+  await browserExpect(rail()).not.toContainText("no longer available");
+  await browserExpect(input).toBeEnabled({ timeout: 10_000 });
+  expect(listFails).toBeLessThan(0);
+  expect(detailFails).toBeLessThan(0);
+});

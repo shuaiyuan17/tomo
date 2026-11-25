@@ -99,9 +99,12 @@ export function useSubsessions(revision: number): WebSubsessionList {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     // A failed read keeps the last list and is tried again, so a blip never leaves the rail stale.
-    void api<WebSubsessionList>("/subsessions", { signal: controller.signal }).then(setList, () => {
-      if (!controller.signal.aborted) timer = setTimeout(() => setRetry((n) => n + 1), SUBSESSIONS_RETRY_MS);
-    });
+    const again = () => { if (!controller.signal.aborted) timer = setTimeout(() => setRetry((n) => n + 1), SUBSESSIONS_RETRY_MS); };
+    void api<WebSubsessionList>("/subsessions", { signal: controller.signal }).then((next) => {
+      // The table could not be read (or recovery is not done): keep what was shown, and look again.
+      if (!next.available) { setList((old) => old.available ? old : next); again(); return; }
+      setList(next);
+    }, again);
     return () => { controller.abort(); clearTimeout(timer); };
   }, [revision, retry]);
   return list;

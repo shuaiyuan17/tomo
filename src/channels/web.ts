@@ -72,7 +72,8 @@ export interface WebPermissionAccess {
  */
 export interface WebSubsessionAccess {
   list(): WebSubsessionList;
-  get(id: string): WebSubsessionDetail | undefined;
+  /** undefined: no such task the owner may see; null: the task table cannot be read right now. */
+  get(id: string): WebSubsessionDetail | undefined | null;
   message(id: string, text: string, requestId: string):
     | { ok: true; duplicate: boolean; task: WebSubsession }
     | { ok: false; reason: "unknown" | "ended" | "full" | "unreadable" };
@@ -706,6 +707,7 @@ export class WebChannel implements Channel {
     if (!this.subsessionAccess) throw new WebError(503, "subsessions_unavailable");
     if (!this.ownerId) throw new WebError(409, "owner_setup_required");
     const detail = this.subsessionAccess.get(id);
+    if (detail === null) throw new WebError(503, "subsessions_unavailable");
     if (!detail) throw new WebError(404, "subsession_not_found");
     return detail;
   }

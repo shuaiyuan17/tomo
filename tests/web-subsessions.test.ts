@@ -125,6 +125,8 @@ describe("WebChannel: the owner's sub-sessions", () => {
     expect(() => setup({}, null).channel.messageSubsession("s1", { requestId: randomUUID(), text: "x" })).toThrow(expect.objectContaining({ status: 409, code: "owner_setup_required" }));
     expect(setup().channel.subsessionList()).toEqual({ available: false, tasks: [] });
     expect(() => setup({ get: () => undefined }).channel.subsession("s9")).toThrow(expect.objectContaining({ status: 404, code: "subsession_not_found" }));
+    // A table that cannot be read right now is not "gone": the chat reads again.
+    expect(() => setup({ get: () => null }).channel.subsession("s1")).toThrow(expect.objectContaining({ status: 503, code: "subsessions_unavailable" }));
   });
 
   it("tells the browser of a burst of table changes once", async () => {

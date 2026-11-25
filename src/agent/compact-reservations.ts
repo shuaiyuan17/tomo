@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { log } from "../logger.js";
+import { agentRunsInBackground, launchesBackgroundSubagent } from "./spawn-gate.js";
 
 /**
  * Per-session "a compact is pending" reservations — the daemon half of the
@@ -201,11 +202,13 @@ const ALWAYS_BACKGROUND_TOOLS: ReadonlySet<string> = new Set(["Monitor"]);
 
 /**
  * Would this tool call start a background task? Any tool asked to run in the
- * background (Agent/Task subagents, Bash, …) plus tools that only ever run that
- * way.
+ * background (Bash, …), a subagent launch unless it asks for the foreground
+ * (the SDK's Agent tool runs in the background by default — see
+ * spawn-gate.ts), plus tools that only ever run that way.
  */
 export function startsBackgroundTask(toolName: string, toolInput: unknown): boolean {
   if (ALWAYS_BACKGROUND_TOOLS.has(toolName)) return true;
+  if (toolName === "Agent" || toolName === "Task") return agentRunsInBackground(toolInput);
   if (toolInput === null || typeof toolInput !== "object") return false;
   return (toolInput as { run_in_background?: unknown }).run_in_background === true;
 }
@@ -213,8 +216,18 @@ export function startsBackgroundTask(toolName: string, toolInput: unknown): bool
 /**
  * PreToolUse hook: while a compact is pending on the session, deny every call
  * that would start a background task. `denial` is read per call.
+ *
+ * `spawnDenial` (the high-context spawn gate, spawn-gate.ts) is asked first,
+ * for new background subagents only. It lives in this same hook on purpose: a
+ * launch it refuses must not reach `denial`, whose "allowed" answer starts the
+ * launch settle window — that would make the very compact the refusal asks
+ * for bounce off `reserve` ("recent-launch") for the next half minute.
  */
-export function backgroundLaunchGuardHooks(sessionKey: string | undefined, denial: () => string | null) {
+export function backgroundLaunchGuardHooks(
+  sessionKey: string | undefined,
+  denial: () => string | null,
+  spawnDenial?: () => string | null,
+) {
   return {
     PreToolUse: [{
       // A guard: a callback that throws denies the call instead of letting
@@ -222,17 +235,28 @@ export function backgroundLaunchGuardHooks(sessionKey: string | undefined, denia
       onFailure: "block" as const,
       hooks: [async (input: { tool_name: string; tool_input: unknown }) => {
         if (!startsBackgroundTask(input.tool_name, input.tool_input)) return {};
+        const spawnReason = spawnDenial && launchesBackgroundSubagent(input.tool_name, input.tool_input)
+          ? spawnDenial()
+          : null;
+        if (spawnReason) {
+          log.info({ key: sessionKey, tool: input.tool_name }, "Denied a new background subagent: context over lcm.blockSpawnAtPct");
+          return deny(spawnReason);
+        }
         const reason = denial();
         if (!reason) return {};
         log.info({ key: sessionKey, tool: input.tool_name }, "Denied a background launch while a compact is pending");
-        return {
-          hookSpecificOutput: {
-            hookEventName: "PreToolUse" as const,
-            permissionDecision: "deny" as const,
-            permissionDecisionReason: reason,
-          },
-        };
+        return deny(reason);
       }],
     }],
+  };
+}
+
+function deny(reason: string) {
+  return {
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse" as const,
+      permissionDecision: "deny" as const,
+      permissionDecisionReason: reason,
+    },
   };
 }

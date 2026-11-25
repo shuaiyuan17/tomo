@@ -2084,3 +2084,24 @@ describe("LiveSession system/informational", () => {
     expect(log.warn).not.toHaveBeenCalledWith(expect.anything(), "SDK informational warning");
   });
 });
+
+describe("LiveSession compactedSinceLastResult (spawn gate)", () => {
+  it("an SDK compact_boundary marks the last reading stale; the next turn's result clears it", async () => {
+    const { session, harness } = makeSession();
+    const p1 = session.send("hi");
+    await waitFor(() => harness.inputs.length === 1);
+    harness.pushEvent(assistantEvent("one"));
+    harness.pushEvent(resultEvent());
+    await expect(p1).resolves.toBe("one");
+    expect(session.compactedSinceLastResult).toBe(false);
+
+    const p2 = session.send("again");
+    await waitFor(() => harness.inputs.length === 2);
+    harness.pushEvent({ type: "system", subtype: "compact_boundary", uuid: "u-cb", session_id: "s1", compact_metadata: { trigger: "auto", pre_tokens: 900, post_tokens: 100 } });
+    await waitFor(() => session.compactedSinceLastResult);
+    harness.pushEvent(assistantEvent("two"));
+    harness.pushEvent(resultEvent());
+    await expect(p2).resolves.toBe("two");
+    expect(session.compactedSinceLastResult).toBe(false);
+  });
+});

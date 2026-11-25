@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
-import { CRON_RECHECK_MS, ENDED_KEEP_MS, FINISHED_KEEP_MS, MAX_INTERRUPT_STREAK, REGISTRY_RECHECK_MS, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
+import { CRON_RECHECK_MS, ENDED_KEEP_MS, EXTERNAL_WAIT_CHECK_MS, FINISHED_KEEP_MS, MAX_INTERRUPT_STREAK, REGISTRY_RECHECK_MS, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { PENDING_INPUT_MAX, appendInput } from "../src/agent/subsessions/types.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 
@@ -643,6 +643,81 @@ describe("SubsessionService: inputs are never lost", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  describe("a check-back that goes away while Tomo runs", () => {
+    const timers = ["setTimeout", "clearTimeout", "setInterval", "clearInterval"] as const;
+    /** First turn schedules a check-back and waits on it; any later turn finishes. */
+    const parkThenFinish = () => {
+      let calls = 0;
+      return working((turn, hh) => {
+        calls += 1;
+        if (calls === 1) hh.cron.set(turn.key, 1);
+        else hh.service.finish(turn.key, "ok");
+      });
+    };
+
+    it("wakes a task whose job was disabled or removed mid-run, within the check interval", async () => {
+      vi.useFakeTimers({ toFake: [...timers] });
+      try {
+        const h = harness({}, parkThenFinish());
+        h.service.start();
+        const t = spawn(h);
+        await flush();
+        expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "external" });
+        // The one-shot was disabled (an interrupt, retries used up) or removed by hand.
+        h.cron.set(t.sessionKey, 0);
+        vi.advanceTimersByTime(EXTERNAL_WAIT_CHECK_MS - 1);
+        await flush();
+        expect(h.turns).toHaveLength(1);
+        vi.advanceTimersByTime(1);
+        await flush();
+        expect(h.turns).toHaveLength(2);
+        expect(h.turns[1].prompt).toContain("check-back is missing");
+        expect(h.store.get(t.id)?.status).toBe("finished");
+        h.service.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("leaves a task alone while its job is still there", async () => {
+      vi.useFakeTimers({ toFake: [...timers] });
+      try {
+        const h = harness({}, parkThenFinish());
+        h.service.start();
+        const t = spawn(h);
+        await flush();
+        vi.advanceTimersByTime(3 * EXTERNAL_WAIT_CHECK_MS);
+        await flush();
+        expect(h.turns).toHaveLength(1);
+        expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "external", pendingInput: [] });
+        h.service.stop();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("stops looking once the service stops", async () => {
+      vi.useFakeTimers({ toFake: [...timers] });
+      try {
+        const h = harness({}, parkThenFinish());
+        h.service.start();
+        const t = spawn(h);
+        await flush();
+        expect(vi.getTimerCount()).toBeGreaterThan(0);
+        h.service.stop();
+        // Every interval and timeout the service armed is gone, not just skipped.
+        expect(vi.getTimerCount()).toBe(0);
+        h.cron.set(t.sessionKey, 0);
+        vi.advanceTimersByTime(2 * EXTERNAL_WAIT_CHECK_MS);
+        await flush();
+        expect(h.turns).toHaveLength(1);
+        expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "external" });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   it("withdraws the task's restart claim when the restart was not launched", () => {

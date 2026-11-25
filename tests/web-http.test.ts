@@ -18,6 +18,8 @@ let root: string;
 let web: WebService;
 let channel: WebChannel;
 let handoff: ReturnType<typeof vi.fn>;
+/** Every write RPC that reached the daemon (one carrying the page's epoch): a refused write must send none. */
+let writeRpcs: string[];
 let bootstrap: WebBootstrap;
 const accessToken = WEB_TEST_TOKEN;
 const externalOrigin = "https://test-node.test-tailnet.ts.net";
@@ -27,7 +29,7 @@ const call = (path: string, options?: { method?: string; headers?: Headers; body
 const mutationHeaders = (): Headers => web.mutationHeaders();
 
 beforeEach(async () => {
-  now = Date.now();
+  now = Date.now(); writeRpcs = [];
   root = mkdtempSync(join(tmpdir(), "tomo-web-http-"));
   const sessionsDir = join(root, "sessions"); const sdkSessionsDir = join(root, "sdk");
   const assetsDir = join(root, "assets"); mkdirSync(join(assetsDir, "assets"), { recursive: true });
@@ -43,6 +45,7 @@ beforeEach(async () => {
   web = await startWebService({ accessToken, externalOrigin, now: () => now, assetsDir, uploadsDir: join(root, "uploads"),
     data: new WebData({ sessionsDir, sdkSessionsDir, owner, cronStorePath: join(root, "jobs.json") }),
     subscribe: (fn) => channel.events.subscribe(fn), rpc: async (input) => {
+      if ("epoch" in input) writeRpcs.push(input.method);
       if (input.method === "epoch") return channel.events.epoch;
       if (input.method === "message") return channel.receive(input.input);
       if (input.method === "request") return channel.request(input.requestId);
@@ -105,6 +108,7 @@ describe("the write gate", () => {
       const response = await send(route, headers);
       expect(response.status, name).toBe(status);
       if (error) expect(response.json().error, name).toBe(error);
+      expect(writeRpcs, name).toEqual([]);
     }
     expect(handoff).not.toHaveBeenCalled();
   });
@@ -112,12 +116,14 @@ describe("the write gate", () => {
     for (const epoch of [undefined, randomUUID()]) {
       const response = await send(route, { "x-tomo-epoch": epoch });
       expect([response.status, response.json().error], String(epoch)).toEqual([409, "epoch_changed"]);
+      expect(writeRpcs, String(epoch)).toEqual([]);
     }
   });
   it.each(MUTATION_ROUTES.filter((route) => route.epoch === "format"))("$name refuses a missing or malformed epoch", async (route) => {
     for (const epoch of [undefined, "not-an-epoch"]) {
       const response = await send(route, { "x-tomo-epoch": epoch });
       expect([response.status, response.json().error], String(epoch)).toEqual([409, "epoch_required"]);
+      expect(writeRpcs, String(epoch)).toEqual([]);
     }
     expect(handoff).not.toHaveBeenCalled();
   });

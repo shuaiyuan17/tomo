@@ -16,8 +16,6 @@ export interface BackupRun {
   logs: string[];
   errors: string[];
   exitCodes: number[];
-  /** Anything other than the exit sentinel that escaped the command. */
-  threw: Error | null;
   /** What `confirm()` wrote, so a test can see the question was asked. */
   prompts: string;
 }
@@ -40,8 +38,10 @@ const EXIT_SENTINEL = "__exit__";
  * matters: `Readable.from` pulls lazily, so the generator body does not run
  * until readline actually reads — i.e. after the prompt is pending.
  *
- * stdin, the prompt stream and the console/exit spies are all put back before
- * this returns.
+ * A `process.exit` call ends the run (its code lands in `exitCodes`); anything
+ * else the command throws is rethrown, so a crash can never pass for a clean
+ * run. stdin, the prompt stream and the console/exit spies are all put back
+ * before this returns or throws.
  */
 export async function runBackupCommand(
   command: Command,
@@ -68,15 +68,14 @@ export async function runBackupCommand(
     }) as never),
   ];
 
-  let threw: Error | null = null;
   try {
     await command.parseAsync(argv, { from: "user" });
   } catch (err) {
-    if ((err as Error).message !== EXIT_SENTINEL) threw = err as Error;
+    if ((err as Error).message !== EXIT_SENTINEL) throw err;
   } finally {
     for (const spy of spies) spy.mockRestore();
     setPromptOutput(originalPrompt);
     Object.defineProperty(process, "stdin", { value: originalStdin, configurable: true });
   }
-  return { logs, errors, exitCodes, threw, prompts: sink.text() };
+  return { logs, errors, exitCodes, prompts: sink.text() };
 }

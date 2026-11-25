@@ -406,7 +406,8 @@ describe("tomo backup restore — a leg fails to copy", () => {
     // already deleted the live data by the time this throws.
     paths.failCopyWhenSrcEndsWith = join(VALID, "data");
 
-    const { errors, exitCodes, threw } = await runRestore(VALID);
+    // runRestore rejects if anything but process.exit escapes the command.
+    const { errors, exitCodes } = await runRestore(VALID);
 
     // THE DATA FIRST — this is the whole point. On the old code the live
     // `data/` tree has been deleted by now and is in no backup.
@@ -420,8 +421,8 @@ describe("tomo backup restore — a leg fails to copy", () => {
     expect(readFileSync(join(paths.tomoHome, "workspace", "SOUL.md"), "utf-8")).toBe("live soul");
     expect(leftovers(paths.tomoHome)).toEqual([]);
 
-    // And the failure is reported rather than thrown out of the command.
-    expect(threw).toBeNull();
+    // And the failure is reported rather than thrown out of the command (the
+    // await above would have rejected).
     expect(errors.join("\n")).toContain("Restore failed");
     expect(errors.join("\n")).toContain("ENOSPC");
     expect(exitCodes).toContain(1);

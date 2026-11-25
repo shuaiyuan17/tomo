@@ -70,15 +70,23 @@ describe("isoTimestampWithOffset", () => {
 });
 
 describe("parseTomoEvent — round trip", () => {
-  // parseTomoEvent reads `type` as an attribute like any other, so one row
-  // per producer type would run identical code. What varies the parse is the
-  // SHAPE: a multi-line body, a name or none, quoting characters in the body.
+  // parseTomoEvent reads `type` as an attribute like any other; what varies
+  // the parse is the SHAPE (a multi-line body, a name or none, quoting
+  // characters in the body). The per-producer rows after the shape rows are
+  // cheap and pin each type's exact string, name and body through the trip.
   it.each<{ label: string; type: TomoEventType; body: string; name?: string }>([
     { label: "a multi-line body, no name", type: "heartbeat", body: "It is Fri, Jul 4, 09:00 PDT. Read CONTINUITY.md.\n\nscript output line 1\nline 2" },
     { label: "a one-line body, no name", type: "restart", body: "Restarted. Reason: config change via /restart" },
     { label: "a name and double quotes in the body", type: "cron", body: 'Scheduled task "daily-backup" triggered. Run the backup.', name: "daily-backup" },
     { label: "a name with a space and backticks in the body", type: "lcm-rollup", body: "An LCM rollup is due. The completed period `daily 2026-07-03` has 42 raw events ready to consolidate.", name: "daily 2026-07-03" },
     { label: "a body of list lines", type: "errors", body: "Recent Tomo errors before this turn (newest last, capped):\n- [error] boom" },
+    { label: "a context-nudge event", type: "context-nudge", body: "Context usage is at 72% (144000/200000 tokens). Run `tomo lcm prune-tools`.", name: "prune" },
+    { label: "a summon event", type: "summon", body: 'Alice summoned you into the group chat "Dinner" (telegram:-987).', name: "telegram:-987" },
+    { label: "a summon-reminder event", type: "summon-reminder", body: 'Summoned-group message. To reply in the group, call send_message with mode "direct".' },
+    { label: "a summon-expired event", type: "summon-expired", body: 'Your summon into the group "Dinner" expired after inactivity.', name: "telegram:-987" },
+    { label: "a dismiss event", type: "dismiss", body: 'You have been dismissed from the group "Dinner".', name: "telegram:-987" },
+    { label: "an audience event", type: "audience", body: "Audience switched — the previous message was from the private DM.", name: "switch" },
+    { label: "a direct-send event", type: "direct-send", body: 'You sent the following message to this conversation earlier as a direct send: "hi"' },
   ])("round-trips $label", (c) => {
     const formatted = formatTomoEvent(c.type, c.body, c.name !== undefined ? { name: c.name } : {});
     const parsed = parseTomoEvent(formatted);

@@ -1,4 +1,5 @@
 import { EventEmitter } from "node:events";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
@@ -205,6 +206,22 @@ describe("resolveClaudeExecutable", () => {
       "linux", "x64", () => false);
     expect(seen).toEqual(["@anthropic-ai/claude-agent-sdk-linux-x64/package.json"]);
     expect(path).toBe("/nm/pkg/claude");
+  });
+
+  it("defaults to the host's platform and arch, and names the binary claude.exe on Windows", () => {
+    // Platform and arch left to their defaults; libc pinned to glibc so a musl
+    // runner does not try the -musl package first.
+    const seen: string[] = [];
+    const path = resolveClaudeExecutable({}, (id) => { seen.push(id); return "/nm/pkg/package.json"; }, () => true,
+      undefined, undefined, () => false);
+    expect(seen).toEqual([`@anthropic-ai/claude-agent-sdk-${process.platform}-${process.arch}/package.json`]);
+    expect(path).toBe(join("/nm/pkg", process.platform === "win32" ? "claude.exe" : "claude"));
+
+    const winSeen: string[] = [];
+    const winPath = resolveClaudeExecutable({}, (id) => { winSeen.push(id); return "/nm/pkg/package.json"; }, () => true,
+      "win32", "x64", () => false);
+    expect(winSeen).toEqual(["@anthropic-ai/claude-agent-sdk-win32-x64/package.json"]);
+    expect(winPath).toBe(join("/nm/pkg", "claude.exe"));
   });
 
   it("falls back to claude on PATH when the bundled binary is missing", () => {

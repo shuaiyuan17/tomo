@@ -548,7 +548,7 @@ export class SubsessionService {
   }
 
   // ---------------------------------------------------------------------
-  // Task side (task_reply / task_notify / task_ask / task_progress / task_checkpoint / task_finish / task_reopen)
+  // Task side (task_reply / task_notify / task_ask / task_plan / task_update / task_checkpoint / task_finish / task_reopen)
   // ---------------------------------------------------------------------
 
   async notify(key: string, text: string): Promise<{ ok: boolean; error?: string }> {
@@ -668,18 +668,6 @@ export class SubsessionService {
     return result;
   }
 
-  progress(key: string, line: string): SubsessionRecord | undefined {
-    const record = this.store.byKey(key);
-    if (!record) return undefined;
-    const value = oneLine(line, PROGRESS_TEXT_MAX);
-    let changed = false;
-    // Compared inside the lock, against the line on disk. Only the current
-    // line is kept: per-step chatter is what the plan and the updates are not.
-    const updated = this.store.update(record.id, (r) => { changed = value !== r.progress; r.progress = value; });
-    if (updated && changed) this.progressChanged.add(record.id);
-    return updated;
-  }
-
   /**
    * task_update: a decision or change the owner should know about (scope,
    * approach, blocked or unblocked), kept with its time. The same line twice
@@ -717,15 +705,17 @@ export class SubsessionService {
   setPlan(key: string, steps: ReadonlyArray<{ step: string; status?: "pending" | "in_progress" }>, done: ReadonlyArray<{ step: string; result?: string }> = [], reason?: string): PlanOutcome {
     const record = this.store.byKey(key);
     if (!record) return { ok: false, error: "no_record" };
-    const next: SubsessionPlanStep[] = steps.flatMap((s): SubsessionPlanStep[] => {
-      const text = oneLine(s.step, PLAN_STEP_MAX);
-      return text ? [{ text, status: s.status === "in_progress" ? "in_progress" : "pending" }] : [];
-    }).slice(0, PLAN_MAX_STEPS);
     const finished = done.flatMap((d) => {
       const text = oneLine(d.step, PLAN_STEP_MAX);
       const result = d.result ? oneLine(d.result, STEP_RESULT_MAX) : "";
       return text ? [{ text, ...(result ? { result } : {}) }] : [];
     });
+    const finishedTexts = new Set(finished.map((f) => f.text));
+    // A step sent as done and still in `steps` is done: it is not also shown ahead.
+    const next: SubsessionPlanStep[] = steps.flatMap((s): SubsessionPlanStep[] => {
+      const text = oneLine(s.step, PLAN_STEP_MAX);
+      return text && !finishedTexts.has(text) ? [{ text, status: s.status === "in_progress" ? "in_progress" : "pending" }] : [];
+    }).slice(0, PLAN_MAX_STEPS);
     const why = reason ? oneLine(reason, PROGRESS_TEXT_MAX) : "";
     let changed = false;
     let refused = false;
@@ -733,16 +723,16 @@ export class SubsessionService {
     // Checked inside the lock, against the plan on disk.
     const updated = this.store.update(record.id, (r) => {
       const planChanged = JSON.stringify(r.plan ?? []) !== JSON.stringify(next);
-      if (planChanged && !why && planNeedsReason(r.plan ?? [], next, finished.map((f) => f.text))) { refused = true; return; }
+      if (planChanged && !why && planNeedsReason(r.plan ?? [], next, [...finishedTexts])) { refused = true; return; }
       if (planChanged) {
         changed = true;
         if (next.length > 0) r.plan = next;
         else delete r.plan;
       }
       for (const step of finished) {
-        const last = r.doneSteps?.at(-1);
-        // The same step reported done twice in a row (a retried call) is one entry.
-        if (last && last.text === step.text && last.result === step.result) continue;
+        // A step already filed done (a retried call, or the whole done list sent
+        // again) is not filed twice; a new result for it is.
+        if (r.doneSteps?.some((d) => d.text === step.text && (step.result === undefined || d.result === step.result))) continue;
         (r.doneSteps ??= []).push({ at, ...step });
         changed = true;
       }

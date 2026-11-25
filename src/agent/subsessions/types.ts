@@ -180,8 +180,6 @@ export interface SubsessionRecord {
   turnsWithoutProgress: number;
   /** The task itself asked for the daemon restart (RestartCoordinator). */
   restartRequested: boolean;
-  /** One-line status (task_progress): the live "Now" line. Only the current one is kept. */
-  progress?: string;
   /** The steps still ahead, in order, as task_plan last set them (at most PLAN_MAX_STEPS). Unset: no plan. */
   plan?: SubsessionPlanStep[];
   /** Plan steps marked done, oldest first, at most DONE_STEPS_KEEP. Unset on records written before plans existed. */
@@ -298,6 +296,11 @@ export const PLAN_STEP_MAX = 120;
 export const STEP_RESULT_MAX = 200;
 
 /** One line, trimmed, at most `max` characters (by code point, so a pair is never split). */
+/** The plan step the task is on (its "Now"), if it marked one in progress. */
+export function currentStep(record: Pick<SubsessionRecord, "plan">): string | undefined {
+  return record.plan?.find((s) => s.status === "in_progress")?.text;
+}
+
 export function oneLine(text: string, max: number): string {
   return Array.from(text.trim().split("\n")[0].trim()).slice(0, max).join("");
 }

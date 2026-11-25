@@ -1,4 +1,4 @@
-import { activeTotalMs, type SubsessionRecord } from "../agent/subsessions/types.js";
+import { activeTotalMs, currentStep, type SubsessionRecord } from "../agent/subsessions/types.js";
 import type { SubsessionEvent } from "../agent/subsessions/state-machine.js";
 import type { WebSubsession, WebSubsessionDetail, WebSubsessionMilestone, WebSubsessionStatus, WebSubsessionUpdate } from "./protocol.js";
 
@@ -13,7 +13,7 @@ export const SUBSESSION_ENDED_VISIBLE_MS = 72 * 60 * 60 * 1000;
 /** Every open task is listed (their number is bounded by `subsessions.maxOpen`); ended ones fill up to this many rows. */
 export const MAX_RAIL_SUBSESSIONS = 24;
 const TITLE_LIMIT = 120;
-const PROGRESS_LIMIT = 300;
+const LINE_LIMIT = 300;
 export const BRIEF_LIMIT = 8_000;
 export const REPORT_LIMIT = 20_000;
 const QUOTE_LIMIT = 2_000;
@@ -44,12 +44,13 @@ export interface SubsessionLive { background?: boolean; model?: string }
 export function subsessionView(record: SubsessionRecord, scope: string, now: number, working: boolean, live: SubsessionLive = {}): WebSubsession | undefined {
   if (record.parentKey !== scope || record.status === "archived") return undefined;
   const status = record.status as WebSubsessionStatus;
+  const step = OPEN.has(status) ? currentStep(record) : undefined;
   return {
     id: record.id,
     title: clip(record.title, TITLE_LIMIT).text,
     status,
     ...(status === "waiting" && record.waitingOn ? { waitingOn: record.waitingOn } : {}),
-    ...(record.progress ? { progress: clip(record.progress, PROGRESS_LIMIT).text } : {}),
+    ...(step ? { step: clip(step, STEP_LIMIT).text } : {}),
     // Only an open task has a turn worth showing as running.
     working: working && OPEN.has(status),
     ...(live.background && status === "waiting" && record.waitingOn === "external" ? { background: true as const } : {}),
@@ -89,12 +90,16 @@ const MILESTONES: Partial<Record<SubsessionEvent, WebSubsessionMilestone>> = {
  * start counts only while the log still has the spawn before it.
  */
 export function subsessionUpdates(record: SubsessionRecord): WebSubsessionUpdate[] {
-  const out: WebSubsessionUpdate[] = (record.updates ?? []).map((u) => ({ at: u.at, kind: "update" as const, text: clip(u.text, PROGRESS_LIMIT).text, ...(u.kind === "plan" ? { plan: true as const } : {}) }));
+  const out: WebSubsessionUpdate[] = (record.updates ?? []).map((u) => ({ at: u.at, kind: "update" as const, text: clip(u.text, LINE_LIMIT).text, ...(u.kind === "plan" ? { plan: true as const } : {}) }));
+  // A second task_ask while it is still waiting for the owner (from a
+  // background report's turn) is not a new milestone.
+  let waitingOwner = false;
   record.transitions.forEach((t, i) => {
     const event = t.event as SubsessionEvent;
     const milestone = event === "start" ? (i > 0 && record.transitions[i - 1].from === null ? "started" : undefined)
       : t.to === "cancelled" || t.to === "failed" ? t.to : MILESTONES[event];
-    if (milestone) out.push({ at: t.at, kind: "milestone", milestone });
+    if (milestone && !(milestone === "waitingOwner" && waitingOwner)) out.push({ at: t.at, kind: "milestone", milestone });
+    waitingOwner = milestone === "waitingOwner" || (waitingOwner && t.to === "waiting");
   });
   // Stable: at the same instant, a milestone reads as the later one (a finish lands after the task's last update).
   return out.map((e, i) => ({ e, i })).sort((a, b) => b.e.at - a.e.at || b.i - a.i).slice(0, UPDATES_LIMIT).map(({ e }) => e);
@@ -115,7 +120,7 @@ export function subsessionDetail(record: SubsessionRecord, scope: string, now: n
     brief: brief.text,
     ...(brief.cut ? { briefTruncated: true } : {}),
     ...(record.quote?.length ? { quote: record.quote.map((line) => clip(line, QUOTE_LIMIT).text) } : {}),
-    ...(record.waitingReason ? { waitingReason: clip(record.waitingReason, PROGRESS_LIMIT).text } : {}),
+    ...(record.waitingReason ? { waitingReason: clip(record.waitingReason, LINE_LIMIT).text } : {}),
     conversation: record.conversation.map((entry) => ({
       seq: entry.seq, at: entry.at, from: entry.from, kind: entry.kind, text: clip(entry.text, ENTRY_LIMIT).text,
       ...(entry.files ? { files: entry.files } : {}),

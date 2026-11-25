@@ -116,6 +116,26 @@ describe("a sub-session's plan, done steps and updates", () => {
     expect(subsessionUpdates(record("s1", { transitions: [{ at: NOW, from: "active", to: "failed", event: "fail" }] }))).toEqual([{ at: NOW, kind: "milestone", milestone: "failed" }]);
   });
 
+  it("does not repeat 'waiting for you' for a second ask while still waiting, but does after an answer", () => {
+    const asks = (log: SubsessionRecord["transitions"]) => subsessionUpdates(record("s1", { transitions: log })).filter((e) => e.kind === "milestone" && e.milestone === "waitingOwner").length;
+    expect(asks([
+      { at: NOW - 3, from: "active", to: "waiting", event: "ask" },
+      { at: NOW - 2, from: "waiting", to: "waiting", event: "ask" },
+    ])).toBe(1);
+    expect(asks([
+      { at: NOW - 3, from: "active", to: "waiting", event: "ask" },
+      { at: NOW - 2, from: "waiting", to: "active", event: "owner_message" },
+      { at: NOW - 1, from: "active", to: "waiting", event: "ask" },
+    ])).toBe(2);
+  });
+
+  it("shows the plan step in progress as what an open task is doing now", () => {
+    const plan = [{ text: "Write tests", status: "in_progress" as const }, { text: "Open the PR", status: "pending" as const }];
+    expect(subsessionView(record("s1", { plan }), "dm:owner", NOW, false)?.step).toBe("Write tests");
+    expect(subsessionView(record("s1", { plan: [{ text: "Later", status: "pending" }] }), "dm:owner", NOW, false)).not.toHaveProperty("step");
+    expect(subsessionView(record("s1", { plan, status: "finished", endedAt: NOW }), "dm:owner", NOW, false)).not.toHaveProperty("step");
+  });
+
   it("caps the updates it sends, keeps done steps in order, and shows the plan only while the task is open", () => {
     const updates = Array.from({ length: 30 }, (_, i) => ({ at: NOW - 1000 + i, text: `u${i}` }));
     const many = Array.from({ length: 30 }, (_, i) => ({ at: NOW - 2000 + i, from: "active" as const, to: "finished" as const, event: "finish" }));
@@ -145,9 +165,9 @@ describe("the task table tells its listener about every write", () => {
     const store = new SubsessionStore(join(dir, "t.json"), { onChange });
     const created = store.create({ parentKey: "dm:owner", title: "T", brief: "b" });
     expect(onChange).toHaveBeenCalledTimes(1);
-    store.update(created.id, (r) => { r.progress = "halfway"; });
+    store.update(created.id, (r) => { r.plan = [{ text: "halfway", status: "in_progress" }]; });
     expect(onChange).toHaveBeenCalledTimes(2);
-    expect(store.get(created.id)?.progress).toBe("halfway");
+    expect(store.get(created.id)?.plan?.[0].text).toBe("halfway");
     store.list();
     expect(onChange).toHaveBeenCalledTimes(2);
   });

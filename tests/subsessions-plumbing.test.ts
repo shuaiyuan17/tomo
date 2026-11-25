@@ -15,10 +15,10 @@ import { normalizeSendTarget } from "../src/agent/send-target.js";
 import { isStorableSessionKey } from "../src/cron/scope.js";
 import { isMemoryWrite, subsessionMemoryGuardHooks } from "../src/agent/subsessions/memory-guard.js";
 import { PendingNotesQueue } from "../src/agent/pending-notes-queue.js";
-import { buildSubsessionPrompt } from "../src/agent/subsessions/prompt.js";
+import { buildSubsessionPrompt, formatPostCompactReminder } from "../src/agent/subsessions/prompt.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { SubsessionService } from "../src/agent/subsessions/service.js";
-import { buildTaskOwnerTools, buildTaskSelfTools, SUBSESSION_TASK_TOOL_NAMES } from "../src/mcp/subsession-tools.js";
+import { buildTaskOwnerTools, buildTaskSelfTools, SUBSESSION_SELF_TOOL_NAMES, SUBSESSION_TASK_TOOL_NAMES } from "../src/mcp/subsession-tools.js";
 import { DEFAULT_SUBSESSIONS } from "../src/config.js";
 import { formatTomoEvent, isOwnerAudienceNote, markOwnerAudience } from "../src/tomo-event.js";
 
@@ -129,7 +129,10 @@ describe("sub-session prompt", () => {
     const prompt = buildSubsessionPrompt({ agentName: "Tomo", ownerName: "Shuai" });
     for (const name of ["task_reply", "task_notify", "task_ask", "task_finish"]) expect(prompt).toContain(name);
     expect(prompt).not.toMatch(/MEMORY\.md index|memory_write/);
+    expect(prompt).toContain("task_plan");
+    expect(prompt).not.toContain("task_progress");
   });
+
 });
 
 describe("sub-session tools", () => {
@@ -203,9 +206,27 @@ describe("sub-session tools", () => {
     if (!created.ok) throw new Error(created.error);
     const self = buildTaskSelfTools({ service: () => svc, key: created.record.sessionKey });
     const other = buildTaskSelfTools({ service: () => svc, key: "task:s9" });
-    expect((await call(self as never, "task_progress", { line: "halfway" })).isError).toBeUndefined();
-    expect(svc.get("s1")?.progress).toBe("halfway");
-    expect((await call(other as never, "task_progress", { line: "x" })).isError).toBe(true);
+    expect((await call(self as never, "task_update", { line: "halfway" })).isError).toBeUndefined();
+    expect(svc.get("s1")?.updates?.map((u) => u.text)).toEqual(["halfway"]);
+    expect((await call(other as never, "task_update", { line: "x" })).isError).toBe(true);
+  });
+
+  it("has no task_progress: what the task is doing now is its plan step in progress", () => {
+    const svc = service();
+    const names = buildTaskSelfTools({ service: () => svc, key: "task:s1" }).map((t) => t.name);
+    expect(names).not.toContain("task_progress");
+    expect(SUBSESSION_SELF_TOOL_NAMES as readonly string[]).not.toContain("task_progress");
+  });
+
+  it("reminds the task after a compact of its plan, the steps it already filed done, and its updates", () => {
+    const svc = service();
+    const created = svc.spawn("dm:owner", { title: "Mine", brief: "b" });
+    if (!created.ok) throw new Error(created.error);
+    const record = { ...created.record, plan: [{ text: "Write tests", status: "in_progress" as const }], doneSteps: [{ at: 1, text: "Read the code", result: "found it" }], updates: [{ at: 2, text: "Chose B" }] };
+    const reminder = formatPostCompactReminder(record);
+    expect(reminder).toContain("[in progress] Write tests");
+    expect(reminder).toContain("Read the code: found it");
+    expect(reminder).toContain("Chose B");
   });
 
   it("task_plan sets the steps ahead, files finished ones with their results, and allows one step in progress", async () => {
@@ -222,6 +243,13 @@ describe("sub-session tools", () => {
     const refused = await call(self as never, "task_plan", { steps: [{ step: "a", status: "in_progress" }, { step: "b", status: "in_progress" }] });
     expect(refused.isError).toBe(true);
     expect(svc.get("s1")?.plan).toHaveLength(1);
+    // A blank step is refused, not read as clearing the plan.
+    expect((await call(self as never, "task_plan", { steps: [{ step: "  " }], reason: "x" })).isError).toBe(true);
+    expect(svc.get("s1")?.plan).toHaveLength(1);
+    // A step longer than the limit is cut, not refused.
+    expect((await call(self as never, "task_plan", { steps: [{ step: "Write tests", status: "in_progress" }, { step: "😀".repeat(200) }] })).isError).toBeUndefined();
+    expect(Array.from(svc.get("s1")!.plan![1].text)).toHaveLength(120);
+    await call(self as never, "task_plan", { steps: [{ step: "Write tests", status: "in_progress" }], reason: "dropped the emoji step" });
     const detail = (await call(self as never, "task_status", {})).content[0].text;
     expect(detail).toContain("[in progress] Write tests");
     expect(detail).toContain("Read the code — found it");
@@ -237,14 +265,16 @@ describe("sub-session tools", () => {
     expect(svc.get("s1")?.doneSteps).toHaveLength(2);
   });
 
-  it("task_update keeps a decision apart from the progress line", async () => {
+  it("task_update records a decision, and refuses a blank one", async () => {
     const svc = service();
     const created = svc.spawn("dm:owner", { title: "Mine", brief: "b" });
     if (!created.ok) throw new Error(created.error);
     const self = buildTaskSelfTools({ service: () => svc, key: created.record.sessionKey });
     expect((await call(self as never, "task_update", { line: "Scope: also add a plan checklist" })).isError).toBeUndefined();
     expect(svc.get("s1")?.updates).toEqual([{ at: expect.any(Number), text: "Scope: also add a plan checklist" }]);
-    expect(svc.get("s1")?.progress).toBeUndefined();
+    const blank = await call(self as never, "task_update", { line: "   " });
+    expect(blank.isError).toBe(true);
+    expect(svc.get("s1")?.updates).toHaveLength(1);
     expect((await call(self as never, "task_status", {})).content[0].text).toContain("Decisions and updates (newest last):");
     const other = buildTaskSelfTools({ service: () => svc, key: "task:s9" });
     expect((await call(other as never, "task_update", { line: "x" })).isError).toBe(true);

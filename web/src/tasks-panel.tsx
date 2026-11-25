@@ -148,7 +148,7 @@ function TaskCard({ task, depth, guide, now, onOpen, motion, childrenRunning, se
   </li>;
 }
 
-/** A sub-session: its id, title, state and the line it last reported. Opens as a chat. */
+/** A sub-session: its id, title, state and the plan step it is on. Opens as a chat. */
 function SubsessionCard({ task, onOpen }: { task: WebSubsession; onOpen: () => void }) {
   const { t } = useTranslation("tasks");
   const state = subsessionState(task);
@@ -161,7 +161,7 @@ function SubsessionCard({ task, onOpen }: { task: WebSubsession; onOpen: () => v
       <p className="mt-0.5 mb-0 line-clamp-2 text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]">
         {isWorkingState(state) ? <span className="shimmer">{subsessionStateLabel(task)}</span>
           : <span className={cn(state === "waitingOwner" && "font-medium text-foreground/80")}>{subsessionStateLabel(task)}</span>}
-        {task.progress && open && <> · {task.progress}</>}</p>
+        {task.step && open && <> · {task.step}</>}</p>
     </button>
   </li>;
 }

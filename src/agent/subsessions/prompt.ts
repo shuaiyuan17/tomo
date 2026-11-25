@@ -19,8 +19,7 @@ Nothing you write as plain text reaches anyone. The owner only sees what you sen
 - task_reply(text): answer a message the owner sent you. Once per message.
 - task_notify(text): reach out unprompted. Only for a result, a decision the owner must make, or something that blocks you. Never for progress.
 - task_ask(question): you can't continue without the owner's decision. Pauses the task until they answer; end the turn after it.
-- task_progress(line): update your one-line "Now" status. Silent; use it freely.
-- task_plan(steps, done): set the steps still ahead (the one you are on in_progress) and move finished ones into done with a one-line result. Silent; the owner sees it as a checklist.
+- task_plan(steps, done): set the steps still ahead (the one you are on in_progress) and move finished ones into done with a one-line result. Silent; the owner sees it as a checklist, and the step in progress as what you are doing now.
 - task_update(line): record a decision or change that should shape the owner's judgment: scope changed, approach chosen, blocked or unblocked, a finding that changes the plan. Silent; the owner sees these as "Decisions and updates". Not for routine progress.
 - task_finish(report): the task is done. The main session reads the report and tells the owner.
 - task_checkpoint(summary): save goal, progress, next step and side effects to the task record.
@@ -33,7 +32,7 @@ The owner writes to you directly; it arrives as <tomo-event type="subsession-own
 ## How to work
 - Do the whole task, not the first step. Stop only to wait for the owner, to wait on something external, or because you are done.
 - At the start, set a short plan with task_plan (a few steps, each one line, in the owner's language). Keep it current: when a step is done, call task_plan again with it in done and the next one in_progress. Keep each step's words the same and add new steps at the end; dropping, rewording or reordering a step needs a reason, which the owner sees.
-- After each meaningful step, call task_progress. When you decide something or something changes, call task_update once with it; routine steps don't belong there.
+- When you decide something or something changes, call task_update once with it; routine steps don't belong there (the plan shows them).
 - Waiting on something external (CI, a reply): schedule a cron check-back on your own session (schedule_create), then end the turn. Don't poll or sleep.
 - A turn that ends without task_finish and without a check-back scheduled is followed by a "continue" turn. Three turns in a row with no tool call and no progress pause the task and ask the owner.
 
@@ -66,7 +65,7 @@ export function formatStartEvent(record: SubsessionRecord): string {
     lines.push("", "The owner's own words, quoted verbatim from the main conversation:");
     for (const q of record.quote) lines.push(`> ${q.replace(/\n/g, "\n> ")}`);
   }
-  lines.push("", "Start working. Set your plan with task_plan, call task_progress as you go, and task_finish when done.");
+  lines.push("", "Start working. Set your plan with task_plan, keep it current as you go, and task_finish when done.");
   return formatTomoEvent("subsession-start", lines.join("\n"), { name: record.id });
 }
 
@@ -152,10 +151,14 @@ export function compactInstructions(record: SubsessionRecord): string {
 
 function recordReminder(record: SubsessionRecord): string {
   const lines = [`Task: ${record.title}`, `Status: ${record.status}`];
-  if (record.progress) lines.push(`Progress: ${record.progress}`);
   if (record.plan?.length) {
     lines.push("Plan (steps still ahead):");
     for (const step of record.plan) lines.push(`- [${step.status === "in_progress" ? "in progress" : "not started"}] ${step.text}`);
+  }
+  const doneSteps = (record.doneSteps ?? []).slice(-5);
+  if (doneSteps.length > 0) {
+    lines.push("Steps you already filed as done (newest last; do not file them again):");
+    for (const d of doneSteps) lines.push(`- ${d.text}${d.result ? `: ${d.result}` : ""}`);
   }
   const updates = (record.updates ?? []).slice(-5);
   if (updates.length > 0) {

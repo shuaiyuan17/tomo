@@ -566,10 +566,10 @@ describe("/s commands", () => {
     const h = harness(() => new Promise(() => {}), 0);
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).toBe("No sub-sessions.");
     spawn(h);
-    h.service.progress("task:s1", "halfway");
+    h.service.setPlan("task:s1", [{ step: "halfway", status: "in_progress" }]);
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).toBe("s1 · Fix CI — queued · halfway");
     expect(await taskCommandReply(t, h.service, "telegram:-100", { kind: "list" })).toBe("No sub-sessions.");
-    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).toContain("Progress: halfway");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).toContain("Now: halfway");
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s7" })).toBe("There's no sub-session s7.");
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "usage" })).toContain("/s s3 stop");
   });

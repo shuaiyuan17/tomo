@@ -345,7 +345,7 @@ describe("active time (the maxActiveHours cap counts it)", () => {
       turns += 1;
       h.clock += 48 * 60 * 60 * 1000;
       if (turns === 3) h.service.finish(key, "done");
-      else h.service.progress(key, `step ${turns}`);
+      else h.service.postUpdate(key, `step ${turns}`);
       return { ok: true };
     };
     h.service.start();

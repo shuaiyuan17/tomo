@@ -96,8 +96,8 @@ export interface WebSubsession {
   status: WebSubsessionStatus;
   /** Set exactly when status is `waiting`. */
   waitingOn?: "owner" | "external";
-  /** The task's one-line status (task_progress). */
-  progress?: string;
+  /** What it is doing now: the plan step it marked in progress (task_plan). */
+  step?: string;
   /** A turn is running on it right now. */
   working: boolean;
   /**

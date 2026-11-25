@@ -412,8 +412,11 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
   const createdAt = num("createdAt", 0);
   const pendingInput = parseInputs(r.pendingInput);
   const lastSeq = pendingInput.at(-1)?.seq ?? 0;
+  // `progress` (the old task_progress line) is no longer kept: a record written before is read without it.
+  const kept = { ...r };
+  delete kept.progress;
   return {
-    ...(r as unknown as SubsessionRecord),
+    ...(kept as unknown as SubsessionRecord),
     id,
     sessionKey: str("sessionKey"),
     parentKey: str("parentKey"),

@@ -9,7 +9,7 @@ import { Text } from "./markdown.js";
 import { ModelBadge } from "./model-badge.js";
 import { differentDay, messageDateTime, messageTime } from "./message-meta.js";
 import { createCompositionGuard } from "./compose-keys.js";
-import { canRetrySend, folded, isOpenSubsession, updateText, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, isWorkingState, withListBackground, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
+import { canRetrySend, folded, updateText, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, isWorkingState, withListBackground, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
 import { i18n, useTranslation } from "./i18n/index.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
@@ -91,8 +91,7 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
       <p className="m-0 mt-0.5 tracking-[0.02em] text-[10px] text-muted-foreground [overflow-wrap:anywhere]" data-testid="subsession-state">
         {isWorkingState(state) ? <span className="shimmer">{subsessionStateLabel(shown)}</span> : <span className={cn(state === "waitingOwner" && "font-medium text-foreground/80")}>{subsessionStateLabel(shown)}</span>}
         {shown.waitingReason && state === "waitingOwner" ? <> · {shown.waitingReason}</> : null}</p>
-      {shown.progress && isOpenSubsession(shown) && <p className="m-0 mt-1.5 text-[12px] leading-snug text-muted-foreground [overflow-wrap:anywhere]"><span className="font-medium text-foreground/80">{t("now")}</span> {shown.progress}</p>}
-      {detail && (detail.plan?.length || detail.doneSteps?.length || detail.updates?.length) ? <div className="mt-2 flex max-h-[38vh] flex-col gap-2.5 overflow-y-auto pr-1 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]">
+      {detail && (detail.plan?.length || detail.doneSteps?.length || detail.updates?.some((u) => updateText(u))) ? <div className="mt-2 flex max-h-[38vh] flex-col gap-2.5 overflow-y-auto pr-1 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]">
         <Doing plan={detail.plan} done={detail.doneSteps} />
         <Updates updates={detail.updates} />
       </div> : null}

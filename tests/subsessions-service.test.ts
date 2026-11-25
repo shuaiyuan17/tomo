@@ -1963,15 +1963,18 @@ describe("progress, plan and updates", () => {
   /** Started, with a first turn that never ends: the record only moves when the test says. */
   const idle = () => { const h = harness({}, () => new Promise(() => {})); h.service.start(); return h; };
 
-  it("keeps only the current progress line, one line within its limit", () => {
+  it("files a done step once, even when the whole done list is sent again, and never shows it ahead too", () => {
     const h = idle();
     const t = spawn(h);
-    h.service.progress(t.sessionKey, "reading the code");
-    h.service.progress(t.sessionKey, "writing tests\nsecond line");
+    h.service.setPlan(t.sessionKey, [{ step: "A", status: "in_progress" }, { step: "B" }, { step: "C" }]);
+    h.service.setPlan(t.sessionKey, [{ step: "B", status: "in_progress" }, { step: "C" }], [{ step: "A", result: "ok" }]);
+    h.service.setPlan(t.sessionKey, [{ step: "C", status: "in_progress" }], [{ step: "A", result: "ok" }, { step: "B" }]);
+    // Sent as done while still listed ahead: it is done.
+    h.service.setPlan(t.sessionKey, [{ step: "C", status: "in_progress" }], [{ step: "A" }, { step: "B" }, { step: "C" }]);
     const r = h.store.get(t.id)!;
-    expect(r.progress).toBe("writing tests");
+    expect(r.doneSteps?.map((d) => d.text)).toEqual(["A", "B", "C"]);
+    expect(r.plan).toBeUndefined();
     expect(r.updates).toBeUndefined();
-    expect(r.doneSteps).toBeUndefined();
   });
 
   it("keeps each decision or change with its time, a repeat once, blanks never, newest UPDATES_KEEP", () => {
@@ -2047,7 +2050,8 @@ describe("progress, plan and updates", () => {
     same.service.start();
     const u = spawn(same);
     await flush();
-    // The first turn set it (progress); the next three changed nothing.
+    // The first turn set it (progress); the next three changed nothing. Called
+    // here directly: through the tool, any tool call counts, as it always did.
     expect(same.turns).toHaveLength(4);
     expect(same.store.get(u.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
   });
@@ -2055,11 +2059,12 @@ describe("progress, plan and updates", () => {
   it("loads a record written before plans and updates existed, and drops malformed entries", () => {
     const h = idle();
     const t = spawn(h);
-    h.service.progress(t.sessionKey, "x");
     const table = JSON.parse(readFileSync(path, "utf8"));
+    // The old task_progress line: read without it.
+    table.tasks[0].progress = "x";
     writeFileSync(path, JSON.stringify(table));
     const old = new SubsessionStore(path).get(t.id)!;
-    expect(old.progress).toBe("x");
+    expect(old).not.toHaveProperty("progress");
     expect(old.plan).toBeUndefined();
     expect(old.doneSteps).toBeUndefined();
     expect(old.updates).toBeUndefined();

@@ -733,8 +733,9 @@ it("a kept upload the server no longer has (sent elsewhere, expired) is dropped 
   await page.locator("input[type=file]").setInputFiles([{ name: "gone.png", mimeType: "image/png", buffer: solidPng(2, 2) }]);
   const tray = page.getByRole("list", { name: "Attachments" });
   await browserExpect(tray.getByRole("listitem", { name: "gone.png, attached" })).toBeVisible();
-  const { rmSync } = await import("node:fs");
-  for (const name of readdirSync(uploadsDir(mockConfig.tomoHome))) rmSync(resolve(uploadsDir(mockConfig.tomoHome), name));
+  // Gone for good (as when it expires or another send took it): the server records it, and the page drops it.
+  const { discardUpload } = await import("../../src/web/uploads.js");
+  for (const name of readdirSync(uploadsDir(mockConfig.tomoHome))) discardUpload(uploadsDir(mockConfig.tomoHome), name.split(".")[0]);
   await page.reload();
   await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
   await page.waitForTimeout(300);

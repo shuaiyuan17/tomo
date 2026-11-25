@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { request, type IncomingMessage as HttpIncoming } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claimUploads, MAX_UPLOAD_FILE_BYTES, stageUpload } from "../src/web/uploads.js";
+import { claimUploads, discardUpload, MAX_UPLOAD_FILE_BYTES, peekUpload, stageUpload, sweepUploads } from "../src/web/uploads.js";
 import { WebChannel } from "../src/channels/web.js";
 import { WatchBus } from "../src/watch/bus.js";
 import { messageInputSchema, type WebBootstrap } from "../src/web/protocol.js";
@@ -320,7 +320,11 @@ describe("POST /uploads with files on: the same gate as images", () => {
     cookie = saved;
     // Without the API header (an <img> or a navigation from another site): refused.
     expect((await call(`/api/v1/uploads/${image}`, { headers: { "x-tomo-request": "" } })).status).toBeGreaterThanOrEqual(400);
-    for (const bad of ["0".repeat(32), "../uploads", `${image}.png`, image.toUpperCase()]) expect((await call(`/api/v1/uploads/${encodeURIComponent(bad)}`)).status).toBe(404);
+    for (const bad of ["../uploads", `${image}.png`, image.toUpperCase()]) expect((await call(`/api/v1/uploads/${encodeURIComponent(bad)}`)).status).toBe(404);
+    // An id with no file and no record of going: not taken for gone (it may be mid-claim) — the page keeps it, with Retry.
+    const unknown = await call(`/api/v1/uploads/${"0".repeat(32)}`);
+    expect(unknown.status).toBe(409);
+    expect(JSON.parse(unknown.text).error).toBe("upload_unsettled");
     // Claimed by a message being filed: not gone yet (409), back if that send fails, gone (404) once it is recorded.
     const claim = claimUploads(dir, [image], "req-1")!;
     const busy = await call(`/api/v1/uploads/${image}`);
@@ -330,6 +334,38 @@ describe("POST /uploads with files on: the same gate as images", () => {
     expect((await call(`/api/v1/uploads/${image}`)).status).toBe(200);
     claimUploads(dir, [image], "req-2")!.finalize();
     expect((await call(`/api/v1/uploads/${image}`)).status).toBe(404);
+    // Discarded by the owner (× on the thumbnail): gone too. The staging directory itself holds only uploads.
+    const other = JSON.parse((await upload(PNG)).text).uploadId as string;
+    discardUpload(dir, other);
+    expect((await call(`/api/v1/uploads/${other}`)).status).toBe(404);
+    expect(readdirSync(dir).every((name) => /^[a-f0-9]{32}\.[a-z]+$/.test(name))).toBe(true);
+  });
+});
+
+describe("peekUpload: gone only on the record of it", () => {
+  it("claim, release and claim again — at any point the status is staged, claimed or unsettled, never gone; gone after the send is recorded", () => {
+    const { uploadId } = stageUpload(dir, PNG);
+    const seen = new Set<string>();
+    const look = () => seen.add(peekUpload(dir, uploadId)?.kind ?? "gone");
+    look();
+    for (let round = 0; round < 3; round++) {
+      const claim = claimUploads(dir, [uploadId], `req-${round}`)!;
+      look();
+      // Mid-rename as a lookup sees it: neither staged nor claimed (the file moved away and back).
+      const [claimed] = readdirSync(dir).filter((name) => name.includes(".claim-"));
+      renameSync(join(dir, claimed), join(root, "aside"));
+      look();
+      renameSync(join(root, "aside"), join(dir, claimed));
+      claim.release();
+      look();
+    }
+    expect([...seen].sort()).toEqual(["claimed", "image", "unsettled"]);
+    claimUploads(dir, [uploadId], "req-final")!.finalize();
+    expect(peekUpload(dir, uploadId)).toBeUndefined();
+    // Expired: swept, and recorded gone.
+    const old = stageUpload(dir, PNG).uploadId;
+    sweepUploads(dir, Date.now() + 2 * 60 * 60 * 1000);
+    expect(peekUpload(dir, old, Date.now())).toBeUndefined();
   });
 });
 

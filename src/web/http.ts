@@ -229,7 +229,7 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           if (!deps.data.catalog().ownerId) throw new WebError(409, "owner_setup_required");
           const upload = deps.uploadsDir ? peekUpload(deps.uploadsDir, staged[1]) : undefined;
           if (!upload) throw new WebError(404, "upload_missing");
-          if (upload.kind === "claimed") throw new WebError(409, "upload_claimed");
+          if (upload.kind === "claimed" || upload.kind === "unsettled") throw new WebError(409, `upload_${upload.kind}`);
           if (upload.kind === "file") { json(res, 200, { kind: "file", size: upload.size }); return; }
           res.writeHead(200, { "content-type": upload.type, "content-length": upload.bytes.length, "cache-control": "no-store", "x-content-type-options": "nosniff" });
           res.end(upload.bytes);

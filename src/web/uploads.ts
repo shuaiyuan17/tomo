@@ -1,6 +1,6 @@
 import { closeSync, constants, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { convertHeicImage, heicHasAlpha } from "../channels/heic.js";
@@ -45,15 +45,39 @@ export class UploadError extends Error {
   constructor(readonly code: "not_image" | "too_large" | "upload_limit" | "upload_missing") { super(code); }
 }
 
-/** Remove staged uploads older than the TTL. Returns how many remain. */
+/**
+ * Where an upload that is GONE for good is recorded (`<id>`, empty): sent
+ * (its message recorded), discarded, or expired. A sibling of the staging
+ * directory, so the staged set stays exactly the uploads. Written BEFORE the
+ * staged or claimed file is removed, and never by a claim or its release —
+ * so "gone" is one file's existence, not an inference from two lookups that
+ * a claim landing and releasing in between can fool (see peekUpload).
+ * Tombstones expire with the same TTL.
+ */
+const goneDir = (dir: string) => join(dirname(dir), `${basename(dir)}.gone`);
+function markGone(dir: string, uploadId: string): void {
+  if (!UPLOAD_ID.test(uploadId)) return;
+  try { mkdirSync(goneDir(dir), { recursive: true, mode: 0o700 }); writeFileSync(join(goneDir(dir), uploadId), "", { mode: 0o600 }); } catch { /* best effort: the page then keeps it as failed, never drops it */ }
+}
+function isGone(dir: string, uploadId: string): boolean {
+  try { return statSync(join(goneDir(dir), uploadId)).isFile(); } catch { return false; }
+}
+
+/** Remove staged uploads older than the TTL (recorded as gone), and expired tombstones. Returns how many uploads remain. */
 export function sweepUploads(dir: string, now = Date.now()): number {
+  // Old tombstones first: the ones this sweep writes are new.
+  try {
+    for (const name of readdirSync(goneDir(dir))) {
+      try { if (now - statSync(join(goneDir(dir), name)).mtimeMs > UPLOAD_TTL_MS) unlinkSync(join(goneDir(dir), name)); } catch { /* raced */ }
+    }
+  } catch { /* none yet */ }
   let names: string[];
   try { names = readdirSync(dir); } catch { return 0; }
   let left = 0;
   for (const name of names) {
     const path = join(dir, name);
     try {
-      if (now - statSync(path).mtimeMs > UPLOAD_TTL_MS) unlinkSync(path);
+      if (now - statSync(path).mtimeMs > UPLOAD_TTL_MS) { markGone(dir, name.split(".")[0]); unlinkSync(path); }
       else left++;
     } catch { /* gone already */ }
   }
@@ -99,6 +123,7 @@ export function stageUpload(dir: string, bytes: Buffer, now = Date.now(), allowF
 /** Web process: drop a staged upload the owner removed (× on its thumbnail). */
 export function discardUpload(dir: string, uploadId: string): void {
   if (!UPLOAD_ID.test(uploadId)) return;
+  markGone(dir, uploadId);
   for (const ext of STAGED_EXTS) { try { unlinkSync(join(dir, `${uploadId}.${ext}`)); } catch { /* not this one */ } }
 }
 
@@ -126,16 +151,22 @@ export function readUpload(dir: string, uploadId: string, now = Date.now()): { b
 /**
  * Web process: a staged upload the page still holds after a reload (its tray
  * is kept in sessionStorage): an image's bytes, for the thumbnail, or a
- * file's size; "claimed" while a message that names it is being filed.
- * Undefined when the id is malformed, unknown, expired, or (an image) no longer one by its bytes — the page then drops it.
+ * file's size; "claimed" while a message that names it is being filed;
+ * "unsettled" when it cannot tell (see markGone). Undefined — gone — only
+ * when the id is malformed or recorded gone (sent, discarded, expired) —
+ * the page then drops it.
  */
-export function peekUpload(dir: string, uploadId: string, now = Date.now()): { kind: "image"; bytes: Buffer; type: string } | { kind: "file"; size: number } | { kind: "claimed" } | undefined {
+export function peekUpload(dir: string, uploadId: string, now = Date.now()): { kind: "image"; bytes: Buffer; type: string } | { kind: "file"; size: number } | { kind: "claimed" } | { kind: "unsettled" } | undefined {
   if (!UPLOAD_ID.test(uploadId)) return undefined;
-  // A claim is a rename (staged ⇄ claimed), done by the daemon at any moment:
-  // staged, else claimed, else staged once more (a claim released meanwhile).
-  // Only when it is neither, twice, is it gone.
-  const claimed = () => { try { return readdirSync(dir).some((name) => name.startsWith(`${uploadId}.`) && name.includes(".claim-")); } catch { return false; } };
-  return stagedUpload(dir, uploadId, now) ?? (claimed() ? { kind: "claimed" } : stagedUpload(dir, uploadId, now));
+  // Gone only on the record of it (markGone): a claim is a rename that can land
+  // and release between any two lookups here, any number of times.
+  if (isGone(dir, uploadId)) return undefined;
+  const staged = stagedUpload(dir, uploadId, now);
+  if (staged) return staged;
+  try { if (readdirSync(dir).some((name) => name.startsWith(`${uploadId}.`) && name.includes(".claim-"))) return { kind: "claimed" }; } catch { /* no directory */ }
+  // Neither staged nor claimed, yet not recorded gone: mid-claim, or a record
+  // since expired. Not an answer either way: the page keeps it, with Retry.
+  return { kind: "unsettled" };
 }
 function stagedUpload(dir: string, uploadId: string, now: number): { kind: "image"; bytes: Buffer; type: string } | { kind: "file"; size: number } | undefined {
   const image = readUpload(dir, uploadId, now);
@@ -179,7 +210,7 @@ export function recoverClaims(dir: string, recorded: (requestId: string) => bool
     if (!match) continue;
     const path = join(dir, name);
     try {
-      if (recorded(match[2])) unlinkSync(path);
+      if (recorded(match[2])) { markGone(dir, match[1].split(".")[0]); unlinkSync(path); }
       else { renameSync(path, join(dir, match[1])); restored++; }
     } catch { /* raced */ }
   }
@@ -221,5 +252,5 @@ export function claimUploads(dir: string, uploadIds: readonly string[], tag: str
     } catch { release(); return undefined; }
     finally { if (fd !== undefined) closeSync(fd); }
   }
-  return { files, release, finalize: () => { for (const c of claimed.splice(0)) { try { unlinkSync(c.to); } catch { /* gone */ } } } };
+  return { files, release, finalize: () => { for (const c of claimed.splice(0)) { markGone(dir, c.id); try { unlinkSync(c.to); } catch { /* gone */ } } } };
 }

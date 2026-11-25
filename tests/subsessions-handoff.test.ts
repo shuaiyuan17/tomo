@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_SUBSESSIONS } from "../src/config.js";
-import { ASK_FORWARD_GRACE_MS, SubsessionService, type ScopeSendResult, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
+import { ASK_FORWARD_GRACE_MS, MAX_PENDING_NOTICES, SubsessionService, type ScopeSendResult, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { buildTaskOwnerTools, buildTaskSelfTools } from "../src/mcp/subsession-tools.js";
 
@@ -24,6 +24,7 @@ interface Harness {
   wakes: string[];
   onTurn: (turn: Turn, h: Harness) => TaskTurnOutcome | Promise<TaskTurnOutcome>;
   noteWriteFails: number;
+  noteThrows: number;
   sendFails: number;
   nextId: number;
   now: number;
@@ -52,6 +53,7 @@ function harness(opts: { handOff?: boolean; store?: SubsessionStore } = {}): Har
     wakes: [],
     onTurn: () => new Promise<TaskTurnOutcome>(() => {}),
     noteWriteFails: 0,
+    noteThrows: 0,
     sendFails: 0,
     nextId: 100,
     now: 1_000_000,
@@ -73,7 +75,8 @@ function harness(opts: { handOff?: boolean; store?: SubsessionStore } = {}): Har
     noticeToScope: async () => {},
     noticeOwner: async () => {},
     queuePendingNote: (key, note) => {
-      if (h.noteWriteFails > 0) { h.noteWriteFails -= 1; return false; }
+      if (h.noteThrows > 0) { h.noteThrows -= 1; throw new Error("disk full"); }
+      if (h.noteWriteFails > 0) { h.noteWriteFails -= 1; h.notes.set(key, [...(h.notes.get(key) ?? []), note]); return false; }
       h.notes.set(key, [...(h.notes.get(key) ?? []), note]);
       return true;
     },
@@ -120,11 +123,13 @@ describe("task_notify goes to the owning session", () => {
     h.service.start();
     const t = spawn(h);
     await flush();
-    expect(await h.service.notify(t.sessionKey, "  CI is green, PR #12 ready.  ")).toEqual({ ok: true });
+    expect(await h.service.notify(t.sessionKey, "  CI is green, PR #12 ready.  ")).toEqual({ ok: true, via: "main" });
     expect(h.sent).toEqual([]);
     const note = h.notes.get("dm:owner")!.find((n) => n.includes('<tomo-event type="subsession-notice"'));
     expect(note).toContain("CI is green, PR #12 ready.");
     expect(note).toContain('Sub-session s1 ("Fix it")');
+    // The note carries its own instructions: a turn that takes it may not be the hand-off turn.
+    expect(note).toContain("Nothing reaches them unless you send it.");
     expect(h.handOffs).toEqual(["dm:owner"]);
     const handOff = h.service.handOffFor("dm:owner")!;
     expect(handOff.prompt).toContain('<tomo-event type="subsession-handoff"');
@@ -135,14 +140,24 @@ describe("task_notify goes to the owning session", () => {
     expect(h.store.get(t.id)!.conversation).toEqual([]);
   });
 
-  it("refuses when the note cannot be written, and the turn keeps what it carried", async () => {
+  it("a note held in memory whose write failed still counts as handed over (no duplicate on retry)", async () => {
+    const h = harness();
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.noteWriteFails = 1;
+    expect(await h.service.notify(t.sessionKey, "the status")).toEqual({ ok: true, via: "main" });
+    expect(h.handOffs).toEqual(["dm:owner"]);
+  });
+
+  it("refuses when the note cannot be queued at all, and the turn keeps what it carried", async () => {
     const h = harness();
     let n = 0;
     h.onTurn = async (turn, hh) => {
       n += 1;
       if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
       if (n === 2) {
-        hh.noteWriteFails = 1;
+        hh.noteThrows = 1;
         expect((await hh.service.notify(turn.key, "the status")).ok).toBe(false);
         hh.service.noteToolUse(turn.key);
         return { ok: true };
@@ -160,6 +175,39 @@ describe("task_notify goes to the owning session", () => {
     expect(h.turns[2].prompt).toContain("what is the status?");
     expect(h.turns[2].prompt).toContain('name="answer"');
     expect(h.store.get(t.id)).toMatchObject({ status: "finished", pendingInput: [] });
+  });
+
+  it("in a turn that answers the owner's message, it goes straight to the owner like task_reply", async () => {
+    const h = harness();
+    let n = 0;
+    let result: Awaited<ReturnType<SubsessionService["notify"]>> | undefined;
+    h.onTurn = async (turn, hh) => {
+      n += 1;
+      if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
+      result = await hh.service.notify(turn.key, "It is at step 3.");
+      hh.service.noteToolUse(turn.key);
+      hh.store.transition("s1", "stuck");
+      return { ok: true };
+    };
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.service.ownerMessage("dm:owner", t.id, "how far along?").ok).toBe(true);
+    await flush();
+    expect(result).toEqual({ ok: true, via: "direct" });
+    expect(h.sent).toEqual([{ parentKey: "dm:owner", text: "[s1 · Fix it] It is at step 3." }]);
+    expect(h.notes.get("dm:owner")?.some((x) => x.includes("subsession-notice")) ?? false).toBe(false);
+  });
+
+  it("refuses past the cap of unread notices from one task", async () => {
+    const h = harness();
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    for (let i = 0; i < MAX_PENDING_NOTICES; i++) expect((await h.service.notify(t.sessionKey, `n${i}`)).ok).toBe(true);
+    const over = await h.service.notify(t.sessionKey, "one more");
+    expect(over.ok).toBe(false);
+    expect(over.error).toContain("not read");
   });
 
   it("goes to a group-owned task's own scope", async () => {
@@ -238,6 +286,33 @@ describe("task_ask goes through the owning session, word for word", () => {
     expect(after.status).toBe("active");
     expect(after.pendingAsk).toBeUndefined();
     expect(after.pendingInput.map((i) => i.text).join("\n")).toContain('<tomo-event type="subsession-owner-message"');
+  });
+
+  it("an owner message that ends the wait before the question went out tells the task its question was never forwarded", async () => {
+    const h = harness();
+    const { t } = await askingTask(h, "Merge PR #12?");
+    expect(h.service.ownerMessage("dm:owner", t.id, "also, rename the branch").ok).toBe(true);
+    const after = h.store.get(t.id)!;
+    expect(after.pendingAsk).toBeUndefined();
+    const input = after.pendingInput.map((i) => i.text).join("\n");
+    expect(input).toContain("had not been forwarded to the owner");
+    expect(input).toContain("> Merge PR #12?");
+  });
+
+  it("a forward whose record write failed after the send is not sent again", async () => {
+    const h = harness();
+    await askingTask(h, "Merge PR #12?");
+    const update = h.store.update.bind(h.store);
+    let fail = 1;
+    h.store.update = ((...args: Parameters<SubsessionStore["update"]>) => {
+      if (fail > 0) { fail -= 1; throw new Error("disk full"); }
+      return update(...args);
+    }) as SubsessionStore["update"];
+    const asks = h.service.handOffFor("dm:owner")!.asks;
+    await h.service.afterHandOff("dm:owner", asks);
+    await h.service.afterHandOff("dm:owner", asks);
+    expect(h.sent).toHaveLength(1);
+    expect(h.service.handOffFor("dm:owner")).toBeUndefined();
   });
 
   it("another scope cannot forward it", async () => {

@@ -169,7 +169,10 @@ function recordReminder(record: SubsessionRecord): string {
   const sent = record.sent.slice(-5);
   if (sent.length > 0) {
     lines.push("Messages you sent the owner (newest last):");
-    for (const m of sent) lines.push(`- ${new Date(m.at).toISOString()}: ${truncate(m.text, 300)}`);
+    for (const m of sent) lines.push(`- ${new Date(m.at).toISOString()}${m.via === "main" ? " (handed to the main session)" : ""}: ${truncate(m.text, 300)}`);
+  }
+  if (record.pendingAsk) {
+    lines.push(`Your question waiting for the owner (${record.pendingAsk.forwardedAt !== undefined ? "forwarded to them" : "not forwarded yet"}):`, truncate(record.pendingAsk.text, 600));
   }
   return lines.join("\n");
 }

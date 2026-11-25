@@ -246,9 +246,11 @@ export class SubsessionStore {
         log.info({ id, event, from, to: target.status, waitingOn: record.waitingOn, reason: opts.reason }, "Sub-session transition");
       }
       record.lastActivityAt = now;
+      // The patch still sees a question the transition ends (a wake tells the
+      // task its question was never forwarded).
+      opts.patch?.(record);
       // A question stands only while the task waits for the owner's answer.
       if (record.status !== "waiting" || record.waitingOn !== "owner") delete record.pendingAsk;
-      opts.patch?.(record);
       if (record.status !== (target === "same" ? from : target.status)) {
         throw new Error(`Sub-session ${id}: a transition patch may not change the status`);
       }

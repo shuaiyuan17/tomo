@@ -222,6 +222,10 @@ export const QUOTA_PAUSE_PERCENT = 80;
  */
 export const ASK_FORWARD_GRACE_MS = 5 * 60_000;
 const NOTICE_MARKER = '<tomo-event type="subsession-notice"';
+/** At most this many of one task's notices wait unread in its owning session's notes; more are refused. */
+export const MAX_PENDING_NOTICES = 5;
+const noticeMarker = (id: string): string => `${NOTICE_MARKER} name="${id}@`;
+const askKey = (id: string, at: number): string => `${id}@${at}`;
 /** How much of each unanswered message a failure notice quotes. */
 const UNANSWERED_EXCERPT = 300;
 const UNANSWERED_MAX = 5;
@@ -285,6 +289,13 @@ export class SubsessionService {
   /** Which task each send in flight belongs to (see `sendingTasks`). */
   private readonly sendOwners = new Map<Promise<unknown>, string>();
   /** A question being forwarded, per task (by its ask time): a second forward joins it, never sends twice. */
+  /**
+   * Questions this process forwarded (`id@at`), so a record write that failed
+   * after the send went out cannot send them a second time.
+   */
+  private readonly forwardedAsks = new Set<string>();
+  /** Tasks whose running turn carries the owner's words: a notify there answers them, so it goes out directly. */
+  private readonly ownerTurns = new Set<string>();
   private readonly forwarding = new Map<string, { at: number; done: Promise<{ ok: true; already?: boolean } | { ok: false; error: string }> }>();
   private sweepTimer?: NodeJS.Timeout;
   private readonly reportTimers = new Map<string, NodeJS.Timeout>();
@@ -599,34 +610,54 @@ export class SubsessionService {
 
   /**
    * task_notify: hand a message to the owning session, which decides whether
-   * and when the owner hears it (it may fold it into other news, or hold it).
-   * The note is durable (pending notes) before this returns ok; a hand-off
-   * turn wakes the owning session for it. A note that could not be written is
-   * refused, and counts as an undelivered message of this turn, like a failed
-   * send.
+   * and when the owner hears it (it may fold it into other news, or keep it
+   * for the next time they talk). The note is pinned in the owning session's
+   * pending notes and a hand-off turn wakes it. A note held in memory whose
+   * write failed still counts as handed over (the next write of that
+   * session's notes saves it); only a note that could not be queued at all,
+   * or one past MAX_PENDING_NOTICES unread, is refused, and counts as an
+   * undelivered message of this turn, like a failed send. In a turn that
+   * carries the owner's words, a notify answers them, so it goes straight to
+   * the owner's chat like task_reply.
    */
-  async notify(key: string, text: string): Promise<{ ok: boolean; error?: string }> {
+  async notify(key: string, text: string): Promise<{ ok: boolean; error?: string; via?: "main" | "direct" }> {
     const record = this.store.byKey(key);
     if (!record) return { ok: false, error: "No task record for this session." };
     if (TERMINAL_STATUSES.has(record.status)) return { ok: false, error: `This task is ${record.status}; nothing more is sent.` };
     const body = text.trim();
     if (!body) return { ok: false, error: "text is empty" };
+    if (this.ownerTurns.has(record.id)) {
+      const sent = await this.speak(key, "notify", body);
+      return sent.ok ? { ...sent, via: "direct" } : sent;
+    }
+    let waiting = 0;
+    const full = this.deps.hasPendingNote(record.parentKey, (n) => n.includes(noticeMarker(record.id)) && ++waiting >= MAX_PENDING_NOTICES);
+    if (full) {
+      this.markDelivery(record.id, body, false);
+      return { ok: false, error: `the main session already has ${MAX_PENDING_NOTICES} of your notices it has not read. Wait for it, or put this in task_finish.` };
+    }
     const at = this.now();
-    const note = formatTomoEvent("subsession-notice",
-      `Sub-session ${record.id} ("${record.title}") has this for the owner (its words, not yet sent to them):\n${body}`,
-      { name: `${record.id}@${at}` });
-    let queued = false;
+    const note = formatTomoEvent("subsession-notice", [
+      `Sub-session ${record.id} ("${record.title}") handed you this for the owner. These are its words; nothing has been sent to them:`,
+      quoteBlock(body),
+      "Decide now: tell the owner with send_message, in your own words (merged with other news when that reads better), or keep it for the next time you talk with them. A result they are waiting for, a blocker, or a decision only they can make should reach them now. Nothing reaches them unless you send it. This note is not shown to you again (task_status keeps it).",
+    ].join("\n"), { name: `${record.id}@${at}` });
     try {
-      queued = this.deps.queuePendingNote(record.parentKey, note);
+      if (!this.deps.queuePendingNote(record.parentKey, note)) {
+        // Held in memory for this process; the next write of the owning
+        // session's notes saves it.
+        log.warn({ id: record.id }, "A sub-session notice is held in memory only: its note could not be saved yet");
+      }
     } catch (err) {
       log.error({ err, id: record.id }, "Could not hand a sub-session notice to its owning session");
+      this.markDelivery(record.id, body, false);
+      return { ok: false, error: "the main session could not be given the message. Try again." };
     }
-    this.markDelivery(record.id, body, queued);
-    if (!queued) return { ok: false, error: "the main session could not be given the message (its note was not saved). Try again." };
+    this.markDelivery(record.id, body, true);
     this.spoke.add(record.id);
     this.safely(() => this.store.update(record.id, (r) => { r.sent.push({ at, kind: "notify", text: body, via: "main" }); }), "record a handed-off notice");
     this.handOff(record.parentKey);
-    return { ok: true };
+    return { ok: true, via: "main" };
   }
 
   /** task_reply: answer the owner's message. Straight to the owner's chat. */
@@ -647,6 +678,11 @@ export class SubsessionService {
    * before.
    */
   async ask(key: string, question: string): Promise<{ ok: boolean; error?: string; via?: "main" | "direct" }> {
+    const first = this.store.byKey(key);
+    if (!first) return { ok: false, error: "No task record for this session." };
+    // A forward of the earlier question in flight settles first, so it is
+    // not sent again folded into this one.
+    await this.forwarding.get(first.id)?.done.catch(() => undefined);
     const record = this.store.byKey(key);
     if (!record) return { ok: false, error: "No task record for this session." };
     if (record.status !== "active" && record.status !== "waiting") {
@@ -661,7 +697,7 @@ export class SubsessionService {
         ? "input is pending that this turn does not carry" : undefined),
       patch: (r) => {
         // A question asked again before the first one went out keeps both.
-        const earlier = r.pendingAsk && r.pendingAsk.forwardedAt === undefined ? r.pendingAsk.text : undefined;
+        const earlier = r.pendingAsk && this.unforwarded(r) ? r.pendingAsk.text : undefined;
         r.pendingAsk = { at, text: earlier ? `${earlier}\n\n${body}` : body };
       },
     });
@@ -691,7 +727,7 @@ export class SubsessionService {
     if (record.status !== "waiting" || record.waitingOn !== "owner" || !ask) {
       return { ok: false, error: `${record.id} has no question waiting for the owner.` };
     }
-    if (ask.forwardedAt !== undefined) return { ok: true, already: true };
+    if (!this.unforwarded(record)) return { ok: true, already: true };
     const inFlight = this.forwarding.get(record.id);
     if (inFlight?.at === ask.at) return inFlight.done;
     const done = (async (): Promise<{ ok: true } | { ok: false; error: string }> => {
@@ -699,7 +735,9 @@ export class SubsessionService {
         spoke: false,
         patch: (r, sentAt) => { if (r.pendingAsk?.at === ask.at) r.pendingAsk.forwardedAt = sentAt; },
       });
-      return result.ok ? { ok: true } : { ok: false, error: result.error ?? "the question did not go out." };
+      if (!result.ok) return { ok: false, error: result.error ?? "the question did not go out." };
+      this.forwardedAsks.add(askKey(record.id, ask.at));
+      return { ok: true };
     })();
     this.forwarding.set(record.id, { at: ask.at, done });
     try {
@@ -707,6 +745,16 @@ export class SubsessionService {
     } finally {
       if (this.forwarding.get(record.id)?.done === done) this.forwarding.delete(record.id);
     }
+  }
+
+  /** A question stands on the task and has not gone out (by the record, or by this process's memory of a send). */
+  private unforwarded(r: SubsessionRecord): boolean {
+    return r.pendingAsk !== undefined && r.pendingAsk.forwardedAt === undefined && !this.forwardedAsks.has(askKey(r.id, r.pendingAsk.at));
+  }
+
+  /** A task waiting for the owner on a question not yet forwarded. */
+  private asking(r: SubsessionRecord): boolean {
+    return r.status === "waiting" && r.waitingOn === "owner" && this.unforwarded(r);
   }
 
   /**
@@ -722,14 +770,14 @@ export class SubsessionService {
     } catch {
       return undefined;
     }
-    const asking = tasks.filter((t) => t.status === "waiting" && t.waitingOn === "owner" && t.pendingAsk && t.pendingAsk.forwardedAt === undefined);
+    const asking = tasks.filter((t) => this.asking(t));
     const notices = this.deps.hasPendingNote(scope, (n) => n.includes(NOTICE_MARKER));
     if (asking.length === 0 && !notices) return undefined;
     const canForward = isDmSessionKey(scope);
     const lines = ["Your sub-sessions handed you something for the owner. Nothing they hand you reaches the owner unless it is sent."];
     if (notices) {
       lines.push("",
-        "Their notices are in the notes above (subsession-notice). For each, decide: tell the owner now with send_message, in your own words and merged with other news when that reads better; or hold it if it can wait and they would rather not be interrupted (it is kept in task_status). A result they are waiting for, a blocker, or a decision only they can make should reach them now.");
+        "Their notices are in the notes above (subsession-notice). For each, decide: tell the owner now with send_message, in your own words and merged with other news when that reads better; or keep it for the next time you talk with them if it can wait. A note is not shown to you again (task_status keeps it). A result they are waiting for, a blocker, or a decision only they can make should reach them now.");
     }
     if (asking.length > 0) {
       lines.push("",
@@ -749,7 +797,7 @@ export class SubsessionService {
   async afterHandOff(scope: string, asks: HandOff["asks"]): Promise<void> {
     for (const a of asks) {
       const record = this.safeGet(a.id);
-      if (!record || record.parentKey !== scope || record.pendingAsk?.at !== a.at || record.pendingAsk.forwardedAt !== undefined) continue;
+      if (!record || record.parentKey !== scope || record.pendingAsk?.at !== a.at || !this.unforwarded(record)) continue;
       const result = await this.forwardQuestion(a.id, scope).catch((err: unknown) => ({ ok: false as const, error: err instanceof Error ? err.message : String(err) }));
       if (!result.ok) log.warn({ id: a.id, error: result.error }, "Could not forward a sub-session question after its hand-off turn; retried later");
     }
@@ -763,9 +811,7 @@ export class SubsessionService {
   private forwardOverdueQuestions(): void {
     const now = this.now();
     for (const task of this.store.list()) {
-      const ask = task.pendingAsk;
-      if (task.status !== "waiting" || task.waitingOn !== "owner" || !ask || ask.forwardedAt !== undefined) continue;
-      if (now - ask.at < ASK_FORWARD_GRACE_MS) continue;
+      if (!this.asking(task) || now - task.pendingAsk!.at < ASK_FORWARD_GRACE_MS) continue;
       void this.forwardQuestion(task.id).then((r) => {
         if (!r.ok) log.warn({ id: task.id, error: r.error }, "Could not forward an overdue sub-session question; retried later");
       }, (err: unknown) => log.warn({ err, id: task.id }, "Could not forward an overdue sub-session question; retried later"));
@@ -780,12 +826,17 @@ export class SubsessionService {
   private handOffAfterRestart(): void {
     const scopes = new Set<string>();
     for (const task of this.store.list()) {
-      if (task.status === "waiting" && task.waitingOn === "owner" && task.pendingAsk && task.pendingAsk.forwardedAt === undefined) scopes.add(task.parentKey);
+      if (this.asking(task)) scopes.add(task.parentKey);
       else if (this.deps.hasPendingNote(task.parentKey, (n) => n.includes(NOTICE_MARKER))) scopes.add(task.parentKey);
     }
     for (const scope of scopes) {
-      if (this.deps.handOffWake) this.handOff(scope);
-      else void this.afterHandOff(scope, this.handOffFor(scope)?.asks ?? []);
+      if (this.deps.handOffWake) {
+        this.handOff(scope);
+        continue;
+      }
+      const asks = this.handOffFor(scope)?.asks ?? [];
+      if (asks.length > 0) void this.afterHandOff(scope, asks);
+      if (this.deps.hasPendingNote(scope, (n) => n.includes(NOTICE_MARKER))) this.handOff(scope);
     }
   }
 
@@ -794,12 +845,12 @@ export class SubsessionService {
     this.outward(() => {
       if (this.deps.handOffWake) this.deps.handOffWake(scope);
       else this.deps.wakeScope(scope, formatTomoEvent("subsession-notice",
-        "A sub-session handed you a notice for the owner; it is in a note above. Decide whether to tell the owner now with send_message, or hold it. If nothing needs sending, end with NO_REPLY.",
+        "A sub-session handed you a notice for the owner; it is in a note above. Decide whether to tell the owner now with send_message, or keep it for the next time you talk with them. If nothing needs sending, end with NO_REPLY.",
         { name: "check" }));
     });
   }
 
-  private speak(key: string, kind: "reply" | "ask" | "fallback", text: string): Promise<{ ok: boolean; error?: string }> {
+  private speak(key: string, kind: "reply" | "notify" | "ask" | "fallback", text: string): Promise<{ ok: boolean; error?: string }> {
     const record = this.store.byKey(key);
     if (!record) return Promise.resolve({ ok: false, error: "No task record for this session." });
     if (TERMINAL_STATUSES.has(record.status)) return Promise.resolve({ ok: false, error: `This task is ${record.status}; nothing more is sent.` });
@@ -814,7 +865,7 @@ export class SubsessionService {
    * part of the task's turn (sendOut's undelivered bookkeeping); `patch`:
    * more to write with the record of a send that went out.
    */
-  private async sendAndRecord(record: SubsessionRecord, kind: "reply" | "ask" | "fallback", body: string,
+  private async sendAndRecord(record: SubsessionRecord, kind: "reply" | "notify" | "ask" | "fallback", body: string,
     opts: { spoke: boolean; track?: boolean; patch?: (r: SubsessionRecord, at: number) => void }): Promise<{ ok: boolean; error?: string }> {
     const prefix = taskPrefix(record);
     const work = (async () => {
@@ -1715,7 +1766,13 @@ export class SubsessionService {
       reason: event === "relay" ? "a message from the main session" : "a message from the owner",
       guard: inputQueueFull,
       patch: (r) => {
-        appendInput(r, prompt, { from: "owner", words });
+        // A question the task asked that never reached the owner (its
+        // forward had not gone out yet) ends with this wake: the task is
+        // told, so it does not take this message for the answer.
+        const lost = r.pendingAsk && this.unforwarded(r) ? r.pendingAsk.text : undefined;
+        appendInput(r, lost ? `${prompt}\n\n${formatTomoEvent("subsession-redelivery",
+          `Your question had not been forwarded to the owner when this message came, so this message is most likely not an answer to it:\n${quoteBlock(lost)}\nAsk again with task_ask if you still need it.`,
+          { name: "question-not-shown" })}` : prompt, { from: "owner", words });
         // The owner's word: the wall-clock cap counts from here again.
         r.activeAtOwnerInputMs = activeTotalMs(r, now);
         extra?.(r);
@@ -1797,6 +1854,7 @@ export class SubsessionService {
       }), "active heartbeat"), ACTIVE_HEARTBEAT_MS);
       heartbeat.unref?.();
       this.inflightThrough.set(id, turn.throughSeq);
+      if (turn.fromOwner) this.ownerTurns.add(id);
       const serial = ++this.turnSerial;
       this.inflightTurn.set(id, serial);
       let outcome: TaskTurnOutcome;
@@ -1806,6 +1864,7 @@ export class SubsessionService {
       } finally {
         clearInterval(heartbeat);
         this.inflightThrough.delete(id);
+        this.ownerTurns.delete(id);
         this.inflightTurn.delete(id);
         // Refused turns count only in a row: a turn with no refusal ends the streak.
         if (this.finishRefusals.get(id)?.turn !== serial) this.finishRefusals.delete(id);

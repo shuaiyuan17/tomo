@@ -115,13 +115,16 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_notify",
-      "Tell the owner something unprompted: a result, or something that blocks you; never progress (that is task_plan), and not a question (that is task_ask). It goes to the main session, which decides whether and when the owner hears it, may put it in its own words, and may fold it into other news. A MEDIA:/path line is passed along; the main session decides whether to send the file.",
+      "Tell the owner something unprompted: a result, or something that blocks you; never progress (that is task_plan), and not a question (that is task_ask). It goes to the main session, which decides whether and when the owner hears it, may put it in its own words, and may fold it into other news (in a turn that answers the owner's message it goes straight to them, like task_reply). A MEDIA:/path line is passed along; the main session decides whether to send the file.",
       { text: z.string().min(1).max(4000).describe("The message, in the owner's language, casual and concise. Lead with the point.") },
       async ({ text }) => {
         const r = service("task_notify");
         if (!r.ok) return r.error;
         const result = await r.s.notify(deps.key, text);
-        return result.ok ? ok("Handed to the main session, which tells the owner when it should.") : fail("task_notify", result.error ?? "the message was not handed over.");
+        if (!result.ok) return fail("task_notify", result.error ?? "the message was not handed over.");
+        return ok(result.via === "direct"
+          ? "Sent to the owner (this turn answers their message, so it went straight to them)."
+          : "Handed to the main session, which tells the owner when it should.");
       },
       { alwaysLoad: true, searchHint: "task notify owner message result decision blocked" },
     ),

@@ -241,7 +241,7 @@ Set `"interruptedAgents": false` (or `{ "enabled": false }`) or `TOMO_INTERRUPTE
 
 ## Sub-sessions
 
-On by default (`"subsessions": { "enabled": false }` turns them off). The owner's own conversation gets `task_spawn`, `task_status`, `task_cancel` and `task_message`: Tomo can hand a long task (a PR to write and see through review, a long investigation) to a separate session that works in the background, survives restarts, and reports back. Each runs under the key `task:<id>` (`s1`, `s2`, …); its messages reach you with a `[s1 · title]` prefix, and its report comes back to the main conversation, which tells you the result and decides what to remember. Sub-sessions don't write memory.
+On by default (`"subsessions": { "enabled": false }` turns them off). The owner's own conversation gets `task_spawn`, `task_status`, `task_cancel`, `task_message` and `task_forward_question`: Tomo can hand a long task (a PR to write and see through review, a long investigation) to a separate session that works in the background, survives restarts, and reports back. Each runs under the key `task:<id>` (`s1`, `s2`, …); its answers to your messages reach you with a `[s1 · title]` prefix. Its other news and its questions go to the main conversation first, which decides whether and when to tell you; a question is passed to you word for word (with the prefix, so replying to it reaches the task). Its report comes back to the main conversation too, which tells you the result and decides what to remember. Sub-sessions don't write memory.
 
 ```json
 { "subsessions": { "enabled": true, "maxRunning": 2, "maxOpen": 5, "maxTurns": 200, "maxContextTokens": 500000, "defaultModel": null,

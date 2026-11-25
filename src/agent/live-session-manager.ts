@@ -828,6 +828,18 @@ export class LiveSessionManager {
     if (closing) await closing;
     const session = this.liveSessions.get(key);
     const stillBusy = !!session?.isAlive() && session.isBusy() && !await withTimeout(session.waitForIdle(), idleTimeoutMs);
+    // The compacted file must be the one the next session resumes: an SDK id
+    // the registry has not stored yet is stored now, or nothing is rewritten.
+    const liveId = session?.getSessionId();
+    if (liveId && (this.unpersistedLinks.has(key) || this.deps.getSdkSessionId(key) !== liveId)) {
+      try {
+        this.deps.setSdkSessionId(key, liveId);
+        this.unpersistedLinks.delete(key);
+      } catch (err) {
+        log.error({ err, key }, "Forced compaction: the session's SDK id is not stored in the registry; not compacting");
+        return null;
+      }
+    }
     // Recorded while the session (and so its task set) is still intact:
     // interrupting or closing it empties the set the ledger mirrors.
     if (!beforeClose()) return null;

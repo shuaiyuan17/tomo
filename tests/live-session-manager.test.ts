@@ -2222,6 +2222,18 @@ describe("LiveSessionManager forced compaction", () => {
     hold.release();
   });
 
+  it("does not compact a session whose SDK id the registry has not stored (the next session could not resume it)", async () => {
+    const setSdkSessionId = vi.fn(() => { throw new Error("registry unreadable"); });
+    const manager = new LiveSessionManager(makeDeps({ setSdkSessionId }));
+    await manager.runWithRetry({ key: "dm:owner", prompt: "first" });
+    const hold = manager.holdForForceCompact("dm:owner")!;
+    const beforeClose = vi.fn(() => true);
+    expect(await manager.quiesceForForceCompact(hold, beforeClose)).toBeNull();
+    expect(beforeClose).not.toHaveBeenCalled();
+    expect(mockState.instances[0].closed).toBe(false);
+    hold.release();
+  });
+
   it("aborts with the session untouched when beforeClose refuses", async () => {
     const manager = new LiveSessionManager(makeDeps());
     await manager.runWithRetry({ key: "dm:owner", prompt: "first" });

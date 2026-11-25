@@ -918,6 +918,24 @@ export class SessionStore {
     });
   }
 
+  /**
+   * Charge a model call made FOR this session outside its SDK session (a
+   * forced compaction's summary call) to its totals. The context reading, the
+   * query count and the usage baseline are left alone: none of them is about
+   * that call.
+   */
+  addOutsideUsage(key: string, u: { costUsd: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }): void {
+    this.mutateRegistry("addOutsideUsage", "bookkeeping", () => {
+      const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+      if (!entry?.stats) return;
+      entry.stats.totalCostUsd += u.costUsd;
+      entry.stats.totalInputTokens += u.inputTokens;
+      entry.stats.totalOutputTokens += u.outputTokens;
+      entry.stats.totalCacheReadTokens += u.cacheReadTokens;
+      entry.stats.totalCacheCreationTokens += u.cacheCreationTokens;
+    });
+  }
+
   /** Update session stats after a query */
   updateStats(key: string, update: {
     costUsd: number;

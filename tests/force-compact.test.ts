@@ -233,6 +233,18 @@ describe("selectOldestStretch", () => {
     expect(s?.lastUuid).not.toBe(call.uuid);
   });
 
+  it("skips an uncuttable oldest run (call | block | result) and takes the next safe one", () => {
+    const b = build({ chars: 4000 });
+    const all = fileEvents(b.sessionId);
+    const resultAt = all.findIndex((e) => JSON.stringify(e.message?.content ?? "").includes("tool_result"));
+    const events = all.slice(resultAt - 1);
+    events.splice(1, 0, { type: "user", uuid: "blk", isCompactSummary: true, blockTag: "weekly 2026-W47", timestamp: DAY(22, 9, 2), message: { role: "user", content: "[weekly]" } });
+    const s = selectOldestStretch(events, { freshTail: 4, maxInputTokens: 150_000 })!;
+    expect(s).not.toBeNull();
+    const firstAt = events.findIndex((e) => e.uuid === s.firstUuid);
+    expect(firstAt).toBeGreaterThan(2);
+  });
+
   it("starts on a turn boundary, never on a leftover tool result", () => {
     const b = build();
     const events = fileEvents(b.sessionId);

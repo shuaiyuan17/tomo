@@ -202,12 +202,26 @@ export function selectOldestStretch(events: Ev[], opts: { freshTail: number; max
     if (events[i].type === "system" && events[i].subtype === "compact_boundary") { boundary = i + 1; break; }
   }
   const tailStart = globalFreshTailStartIdx(events.slice(boundary) as never, opts.freshTail) + boundary;
+  // A run that cannot be cut safely (a tool call whose result sits behind a
+  // block) is skipped: the next safe run after it is tried instead, so one
+  // such spot cannot hold off every later stretch.
+  for (let from = boundary; from < tailStart;) {
+    const r = selectRunFrom(events, boundary, from, tailStart, opts.maxInputTokens);
+    if (r === null) return null;
+    if ("skipTo" in r) { from = r.skipTo; continue; }
+    return r;
+  }
+  return null;
+}
+
+function selectRunFrom(events: Ev[], boundary: number, from: number, tailStart: number, maxInputTokens: number): Stretch | { skipTo: number } | null {
+  const opts = { maxInputTokens };
   const isConv = (e: Ev) => e.type === "user" || e.type === "assistant";
   // The run starts at the oldest raw event that opens a turn (never a tool
   // result, never the middle of one assistant message); a summary block in
   // front of it is never part of it.
   let start = -1;
-  for (let i = boundary; i < tailStart; i++) {
+  for (let i = from; i < tailStart; i++) {
     const e = events[i];
     if (!isConv(e) || e.isCompactSummary || isToolResultTurn(e)) continue;
     let prev: Ev | undefined;
@@ -270,11 +284,12 @@ export function selectOldestStretch(events: Ev[], opts: { freshTail: number; max
     for (let guard = 0; badCut(end) && guard < 10_000; guard++) {
       let next = -1;
       for (let i = end + 1; i < tailStart; i++) if (isConv(events[i])) { next = i; break; }
-      if (next < 0 || events[next].isCompactSummary) return null;
+      if (next < 0) return null;
+      if (events[next].isCompactSummary) return { skipTo: next + 1 };
       chosen.push(next);
       end = next;
     }
-    if (badCut(end)) return null;
+    if (badCut(end)) return { skipTo: end + 1 };
     wholeDay = false;
   } else if (chosen.length < included.length) {
     wholeDay = false;

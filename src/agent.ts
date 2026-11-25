@@ -500,13 +500,19 @@ export class Agent {
           signal,
           // A separate CLI, outside LiveSession's recorder: its cost lands in
           // the usage ledger under the session it compacted.
-          onUsage: (u) => void this.usageLedger.append({
+          onUsage: (u) => {
+            this.sessions.addOutsideUsage(key, {
+              costUsd: u.costUsd, inputTokens: u.tokens.input, outputTokens: u.tokens.output,
+              cacheReadTokens: u.tokens.cacheRead, cacheCreationTokens: u.tokens.cacheCreated,
+            });
+            void this.usageLedger.append({
             v: USAGE_LEDGER_VERSION, ts: Date.now(), sessionKey: key, source: "background", trigger: "force-compact",
             ...(u.subtype !== "success" ? { subtype: u.subtype } : {}),
             costUsd: u.costUsd, tokens: u.tokens,
             ...(u.durationMs !== undefined ? { durationMs: u.durationMs } : {}),
             ...(u.numTurns !== undefined ? { numTurns: u.numTurns } : {}),
-          }),
+            });
+          },
         }),
         signal,
       }),

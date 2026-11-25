@@ -512,16 +512,16 @@ describe("via-main: nothing lost, nothing twice", () => {
     expect(h.store.get(t.id)!.sent.at(-1)).toMatchObject({ kind: "reply", via: "main" });
   });
 
-  it("a retried turn's same answer is not handed over again, even after the main session read the first", async () => {
+  it("a retried turn hands over again only what the main session already read, marked as a possible repeat", async () => {
     let tries = 0;
-    let handed = 0;
+    const seen: string[][] = [];
     const h = harness({}, async (key, prompt) => {
       if (!prompt.includes("subsession-owner-message")) return { ok: true };
       tries += 1;
       await h.service.reply(key, "Yes");
-      // The main session reads the note; then this turn fails, and runs again.
-      handed += messageNotes(h, "dm:owner").filter((x) => x.includes("Yes")).length;
-      h.notes.set("dm:owner", []);
+      seen.push(messageNotes(h, "dm:owner").filter((x) => x.includes("Yes")));
+      // The first time, the main session reads the note; then the turn fails and runs again.
+      if (tries === 1) h.notes.set("dm:owner", []);
       return tries === 1 ? { ok: false, error: "boom" } : { ok: true };
     });
     h.service.start();
@@ -530,8 +530,44 @@ describe("via-main: nothing lost, nothing twice", () => {
     h.service.ownerMessage("dm:owner", t.id, "ship it?");
     await flush();
     expect(tries).toBe(2);
-    expect(handed).toBe(1);
-    expect(h.store.get(t.id)!.sent.filter((m) => m.kind === "reply")).toHaveLength(1);
+    expect(seen[0]).toHaveLength(1);
+    expect(seen[0][0]).not.toContain("may repeat");
+    expect(seen[1]).toHaveLength(1);
+    expect(seen[1][0]).toContain("may repeat something it already handed you");
+  });
+
+  it("a retried turn's answer while the first note is still unread adds no second note", async () => {
+    let tries = 0;
+    const h = harness({}, async (key, prompt) => {
+      if (!prompt.includes("subsession-owner-message")) return { ok: true };
+      tries += 1;
+      await h.service.reply(key, "Yes");
+      return tries === 1 ? { ok: false, error: "boom" } : { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "ship it?");
+    await flush();
+    expect(tries).toBe(2);
+    expect(messageNotes(h, "dm:owner").filter((x) => x.includes("Yes"))).toHaveLength(1);
+  });
+
+  it("a retried turn's same panel answer is shown once", async () => {
+    let tries = 0;
+    const h = harness({}, async (key, prompt) => {
+      if (!prompt.includes("subsession-owner-message")) return { ok: true };
+      tries += 1;
+      await h.service.reply(key, "panel yes");
+      return tries === 1 ? { ok: false, error: "boom" } : { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "ok?", { source: "panel" });
+    await flush();
+    expect(tries).toBe(2);
+    expect(h.store.get(t.id)!.conversation.filter((e) => e.text === "panel yes")).toHaveLength(1);
   });
 
   it("the same words answering two different messages are two notes", async () => {

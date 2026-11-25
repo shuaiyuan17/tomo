@@ -248,6 +248,12 @@ interface PlannedTurn {
   /** Carries a message from the owner: an answer is owed (fallback send). */
   fromOwner: boolean;
   resume: boolean;
+  /**
+   * Runs again what an earlier turn may have done (inputs that may have been
+   * seen, or a resume after a cut-short turn): what it hands the main
+   * session may repeat what that turn handed over.
+   */
+  retry?: boolean;
   start: boolean;
 }
 
@@ -292,7 +298,7 @@ export const MESSAGE_NOTE_MARKER = '<tomo-event type="subsession-message"';
  * the owning session: labeled with the task, quoting the words in full,
  * with what is expected of the session.
  */
-function formatMessageNote(record: SubsessionRecord, kind: SpeakKind, body: string, name: string): string {
+function formatMessageNote(record: SubsessionRecord, kind: SpeakKind, body: string, name: string, retry = false): string {
   const who = `Sub-session ${record.id} ("${record.title}")`;
   const head = kind === "ask"
     ? `${who} asks the owner (task_ask) and waits for their answer:`
@@ -302,7 +308,13 @@ function formatMessageNote(record: SubsessionRecord, kind: SpeakKind, body: stri
   const tail = kind === "ask"
     ? `Put this question to the owner (keep its options; send_message, and its MEDIA: lines if any). Answer it for them only if they already did. When they answer, pass their answer on with task_message ${record.id}: that ends the wait. task_status ${record.id} shows the question while it waits.`
     : `Decide whether, when and how the owner hears it (send_message, in your own words or as is; its MEDIA: lines if a file should go with it). Nothing else delivers it.`;
-  return formatTomoEvent("subsession-message", [head, body, "", tail].join("\n"), { name });
+  // The harness never hands the same words over twice while a note is
+  // unread; past that, the session that tells the owner is where a repeat
+  // from a retried turn is caught.
+  const repeat = retry
+    ? ["", "Its previous turn did not complete and this one runs again: this may repeat something it already handed you. Don't tell the owner the same thing twice."]
+    : [];
+  return formatTomoEvent("subsession-message", [head, body, "", tail, ...repeat].join("\n"), { name });
 }
 
 /**
@@ -333,6 +345,8 @@ export class SubsessionService {
   private readonly inflightThrough = new Map<string, number>();
   /** Which turn is in flight, per task: a serial, so two turns that carry the same seq still differ. */
   private readonly inflightTurn = new Map<string, number>();
+  /** Tasks whose turn in flight is a retry (PlannedTurn.retry). */
+  private readonly inflightRetry = new Set<string>();
   private turnSerial = 0;
   /**
    * task_finish refused for unread input, per task (runtime only): in how
@@ -785,8 +799,13 @@ export class SubsessionService {
     let written = false;
     try {
       written = !!this.store.update(record.id, (r) => {
+        // A retried turn's same answer to the same message is already there.
+        const text = truncate(body, CONVERSATION_TEXT_MAX);
+        let lastOwner = r.conversation.length - 1;
+        while (lastOwner >= 0 && r.conversation[lastOwner].from !== "owner") lastOwner -= 1;
+        if (r.conversation.slice(lastOwner + 1).some((e) => e.from === "task" && e.kind === kind && e.text === text && !e.noted)) return;
         r.sent.push({ at, kind, text: body, via: "panel" });
-        pushConversation(r, { at, from: "task", kind, text: truncate(body, CONVERSATION_TEXT_MAX) });
+        pushConversation(r, { at, from: "task", kind, text });
       });
     } catch (err) {
       log.error({ err, id: record.id }, "Could not record a sub-session's answer in the web panel");
@@ -819,17 +838,14 @@ export class SubsessionService {
   private handToMain(record: SubsessionRecord, kind: SpeakKind, body: string, commit?: (name: string, at: number) => boolean): SpeakResult {
     const at = this.now();
     // The inputs the turn answers name it too: the same words answering
-    // another message are another message; a retry of this turn (its inputs
-    // kept) is the same one, also once the first note was read (`sent` keeps
-    // the name on disk).
+    // another message are another message.
     const through = this.inflightThrough.get(record.id) ?? 0;
     const name = messageNoteName(record.id, kind, body, through);
     const marker = `${MESSAGE_NOTE_MARKER} name="${name}"`;
     const own = (n: string) => n.includes(marker);
-    const handed = through > 0 && (this.safeGet(record.id) ?? record).sent.some((m) => m.key === name);
-    const already = handed || this.deps.hasPendingNote(record.parentKey, own);
+    const already = this.deps.hasPendingNote(record.parentKey, own);
     if (!already) {
-      const note = formatMessageNote(record, kind, body, name);
+      const note = formatMessageNote(record, kind, body, name, this.inflightRetry.has(record.id));
       let saved = false;
       try {
         saved = this.deps.queuePendingNote(record.parentKey, note);
@@ -859,7 +875,7 @@ export class SubsessionService {
       // The note is the durable copy; the record's log is for task_status and
       // the panel (marked so the mirror does not show it twice).
       this.safely(() => this.store.update(record.id, (r) => {
-        r.sent.push({ at, kind, text: body, via: "main", key: name });
+        r.sent.push({ at, kind, text: body, via: "main" });
         pushConversation(r, { at, from: "task", kind, text: truncate(body, CONVERSATION_TEXT_MAX), noted: true });
       }), "record a message handed to the main session");
     }
@@ -1862,6 +1878,7 @@ export class SubsessionService {
       }), "active heartbeat"), ACTIVE_HEARTBEAT_MS);
       heartbeat.unref?.();
       this.inflightThrough.set(id, turn.throughSeq);
+      if (turn.retry) this.inflightRetry.add(id);
       const serial = ++this.turnSerial;
       this.inflightTurn.set(id, serial);
       let outcome: TaskTurnOutcome;
@@ -1871,6 +1888,7 @@ export class SubsessionService {
       } finally {
         clearInterval(heartbeat);
         this.inflightThrough.delete(id);
+        this.inflightRetry.delete(id);
         this.inflightTurn.delete(id);
         // Refused turns count only in a row: a turn with no refusal ends the streak.
         if (this.finishRefusals.get(id)?.turn !== serial) this.finishRefusals.delete(id);
@@ -1951,7 +1969,7 @@ export class SubsessionService {
     const kind = start || resume || inputs.length > 0 ? "wake" : "continue";
     if (kind === "continue") parts.push(formatContinueEvent());
     const fromOwner = inputs.some((input) => input.text.includes(OWNER_MESSAGE_MARKER));
-    return { kind, prompt: parts.join("\n\n"), throughSeq, afterCompact, fromOwner, resume, start };
+    return { kind, prompt: parts.join("\n\n"), throughSeq, afterCompact, fromOwner, resume, start, retry: seen > 0 || resume };
   }
 
   /**

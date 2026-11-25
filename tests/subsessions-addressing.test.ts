@@ -439,6 +439,8 @@ describe("owner messages are never stranded or lost", () => {
     const handed = notes.filter((x) => x.note.includes('type="subsession-unanswered"'));
     expect(handed).toHaveLength(1);
     expect(handed[0].note).toContain("one more thing");
+    // The owner's words, not the event they were delivered in.
+    expect(handed[0].note).not.toContain("subsession-owner-message");
     expect(wakes).toEqual(["dm:owner"]);
     // Held on the task, never deleted: the owner's next message brings it back.
     const held = h.service.get("s1")!;

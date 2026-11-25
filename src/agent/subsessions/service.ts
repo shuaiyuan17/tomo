@@ -1414,7 +1414,7 @@ export class SubsessionService {
             r.failStreak = 0;
             // What this turn carried, and nothing newer: input that arrived
             // during it was never part of the failing answer and gets a turn.
-            held = r.pendingInput.filter((i) => i.seq <= turn.throughSeq).map((i) => i.text);
+            held = r.pendingInput.filter((i) => i.seq <= turn.throughSeq).map((i) => (i.words ?? i.text).trim());
             r.heldThrough = Math.max(r.heldThrough ?? 0, turn.throughSeq);
           }
         }

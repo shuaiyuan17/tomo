@@ -121,7 +121,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_plan",
-      "Set the steps still ahead, in order, replacing the plan before (an empty list clears it). Mark the one you are on in_progress (at most one). Move each step you just finished into `done`, with a one-line result. Silent: the owner sees the plan and the finished steps when they look. Set it when you start, and keep it current. Keep each step's words the same from call to call and add new steps at the end; to drop, reword or reorder a step still ahead, give `reason` (one line), which the owner sees under Decisions and updates.",
+      "Set the steps still ahead, in order, replacing the plan before (an empty list clears it). Mark the one you are on in_progress (at most one). Move each step you just finished into `done`, with a one-line result (a step in `done` is not also kept ahead; to do it again, add it in a later call, in new words). Silent: the owner sees the plan and the finished steps when they look. Set it when you start, and keep it current. Give each step its own words (no two alike), keep them the same from call to call and add new steps at the end; to drop, reword or reorder a step still ahead, give `reason` (one line), which the owner sees under Decisions and updates.",
       {
         steps: z.array(z.object({
           step: z.string().min(1).max(2000).describe(`One short line: what this step gets done (cut at ${PLAN_STEP_MAX} characters).`),
@@ -140,6 +140,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
         if (steps.some((s) => !oneLine(s.step, PLAN_STEP_MAX)) || (done ?? []).some((d) => !oneLine(d.step, PLAN_STEP_MAX))) return fail("task_plan", "a step is blank. Nothing was saved.");
         const outcome = r.s.setPlan(deps.key, steps, done ?? [], reason);
         if (outcome.ok) return ok("Plan saved.");
+        if (outcome.error === "duplicate_step") return fail("task_plan", "two steps read the same. Give each step its own words (for example \"Run the tests again\" for the second). Nothing was saved.");
         return fail("task_plan", outcome.error === "reason_required"
           ? "this drops, rewords or reorders a step still ahead. Give `reason` (one line on why the plan changed), or keep those steps as they were and add new ones at the end. Nothing was saved."
           : "no task record for this session.");

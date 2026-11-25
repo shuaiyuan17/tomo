@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
-import { CRON_RECHECK_MS, ENDED_KEEP_MS, EXTERNAL_WAIT_CHECK_MS, FINISHED_KEEP_MS, MAX_FINISH_REFUSALS, MAX_INTERRUPT_STREAK, planAfterDone, planNeedsReason, REGISTRY_RECHECK_MS, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
+import { CRON_RECHECK_MS, ENDED_KEEP_MS, EXTERNAL_WAIT_CHECK_MS, FINISHED_KEEP_MS, MAX_FINISH_REFUSALS, MAX_INTERRUPT_STREAK, REGISTRY_RECHECK_MS, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { PENDING_INPUT_MAX, DONE_STEPS_KEEP, PLAN_MAX_STEPS, PLAN_STEP_MAX, UPDATES_KEEP, appendInput } from "../src/agent/subsessions/types.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 
@@ -2137,38 +2137,42 @@ describe("progress, plan and updates", () => {
     expect(writes).toBe(1);
   });
 
-  it("checking off a step keeps another step with the same text", () => {
+  it("refuses two steps that read the same, so a done step is never ambiguous", () => {
     const h = idle();
     const t = spawn(h);
-    const plan = () => h.store.get(t.id)!.plan?.map((s) => `${s.text}:${s.status}`);
-    const filed = () => h.store.get(t.id)!.doneSteps?.map((d) => d.text);
-    h.service.setPlan(t.sessionKey, [{ step: "run tests", status: "in_progress" }, { step: "build" }, { step: "run tests" }]);
-    // Done, and left out of steps.
-    expect(h.service.setPlan(t.sessionKey, [{ step: "build", status: "in_progress" }, { step: "run tests" }], [{ step: "run tests" }]).ok).toBe(true);
-    expect(plan()).toEqual(["build:in_progress", "run tests:pending"]);
-    expect(filed()).toEqual(["run tests"]);
-    // Done, and sent again in steps too: only that copy goes.
-    h.service.setPlan(t.sessionKey, [{ step: "run tests", status: "in_progress" }, { step: "build" }, { step: "run tests" }], [], "do the tests twice");
-    expect(h.service.setPlan(t.sessionKey, [{ step: "run tests", status: "in_progress" }, { step: "build" }, { step: "run tests" }], [{ step: "run tests" }]).ok).toBe(true);
-    expect(plan()).toEqual(["build:pending", "run tests:pending"]);
-    expect(filed()).toEqual(["run tests", "run tests"]);
-    // Both copies done in one call: both filed, none left.
-    expect(h.service.setPlan(t.sessionKey, [{ step: "run tests" }, { step: "build" }, { step: "run tests" }], [], "again").ok).toBe(true);
-    expect(h.service.setPlan(t.sessionKey, [{ step: "build" }], [{ step: "run tests" }, { step: "run tests" }]).ok).toBe(true);
-    expect(plan()).toEqual(["build:pending"]);
-    expect(filed()).toEqual(["run tests", "run tests", "run tests", "run tests"]);
+    const before = readFileSync(path, "utf8");
+    // Alike once trimmed and cut to one line, too.
+    for (const steps of [[{ step: "run tests" }, { step: "build" }, { step: "run tests" }], [{ step: "run tests" }, { step: " run tests\nnow" }]]) {
+      expect(h.service.setPlan(t.sessionKey, steps)).toEqual({ ok: false, error: "duplicate_step" });
+    }
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(h.store.get(t.id)!.plan).toBeUndefined();
+    // Steps that differ only past the length a step is cut at are alike too.
+    expect(h.service.setPlan(t.sessionKey, [{ step: `${"x".repeat(PLAN_STEP_MAX)}1` }, { step: `${"x".repeat(PLAN_STEP_MAX)}2` }])).toEqual({ ok: false, error: "duplicate_step" });
+    // Its own words for the second: saved, and finishing the first leaves the second.
+    h.service.setPlan(t.sessionKey, [{ step: "run tests", status: "in_progress" }, { step: "build" }, { step: "run tests again" }]);
+    const call = () => h.service.setPlan(t.sessionKey, [{ step: "build", status: "in_progress" }, { step: "run tests again" }], [{ step: "run tests" }]);
+    expect(call().ok).toBe(true);
+    // The same call again (a retry) changes nothing: the other step stays, nothing is filed twice.
+    expect(call().ok).toBe(true);
+    expect(h.store.get(t.id)!.plan?.map((s) => s.text)).toEqual(["build", "run tests again"]);
+    expect(h.store.get(t.id)!.doneSteps?.map((d) => d.text)).toEqual(["run tests"]);
+    // The same step twice in one done list is filed once.
+    expect(h.service.setPlan(t.sessionKey, [{ step: "run tests again" }], [{ step: "build" }, { step: "build" }]).ok).toBe(true);
+    expect(h.store.get(t.id)!.doneSteps?.map((d) => d.text)).toEqual(["run tests", "build"]);
   });
 
-  it("drops the copy of a done step in the same place it was in the plan", () => {
-    const pending = (text: string) => ({ text, status: "pending" as const });
-    // The copy in progress is the later one; the plan sent again without statuses.
-    const before = [pending("A"), pending("X"), { text: "A", status: "in_progress" as const }];
-    expect(planAfterDone(before, [pending("A"), pending("X"), pending("A")], ["A"])).toEqual([pending("A"), pending("X")]);
-    expect(planNeedsReason(before, [pending("A"), pending("X")], ["A"])).toBe(false);
-    // Left out of what was sent: nothing else goes.
-    expect(planAfterDone(before, [pending("A"), pending("X")], ["A"])).toEqual([pending("A"), pending("X")]);
-    // The same call again cannot be told from a second copy done: it takes that one too.
-    expect(planAfterDone([pending("X"), pending("A")], [pending("X"), pending("A")], ["A"])).toEqual([pending("X")]);
+  it("reads a stored plan with two steps alike as one", () => {
+    const h = idle();
+    const t = spawn(h);
+    const table = JSON.parse(readFileSync(path, "utf8"));
+    table.tasks[0].plan = [{ text: "a", status: "in_progress" }, { text: "b" }, { text: "a" }];
+    writeFileSync(path, JSON.stringify(table));
+    expect(new SubsessionStore(path).get(t.id)!.plan).toEqual([{ text: "a", status: "in_progress" }, { text: "b", status: "pending" }]);
+    // The step in progress is kept in progress, whichever copy held it.
+    table.tasks[0].plan = [{ text: "a" }, { text: "b" }, { text: "a", status: "in_progress" }];
+    writeFileSync(path, JSON.stringify(table));
+    expect(new SubsessionStore(path).get(t.id)!.plan).toEqual([{ text: "a", status: "in_progress" }, { text: "b", status: "pending" }]);
   });
 
   it("a refused plan files none of its done steps either", () => {

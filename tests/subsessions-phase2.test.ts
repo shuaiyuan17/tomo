@@ -202,6 +202,21 @@ describe("active time (the maxActiveHours cap counts it)", () => {
     h.service.stop();
   });
 
+  it("an owner's word after the last heartbeat gives no time back after a crash", () => {
+    const seed = harness();
+    const t = seed.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    seed.store.transition(t.id, "start");
+    // Last seen working 10 minutes in; the owner wrote at 12 minutes, then the crash.
+    seed.store.update(t.id, (r) => { r.startDelivered = true; r.activeSeenAt = seed.clock + 10 * 60 * 1000; r.activeAtOwnerInputMs = 12 * 60 * 1000; });
+    const h = harness({ maxRunning: 0 });
+    h.clock = seed.clock + 10 * 60 * 60 * 1000;
+    h.service.start();
+    const after = h.store.get(t.id)!;
+    expect(after.activeMs).toBe(10 * 60 * 1000);
+    expect(after.activeAtOwnerInputMs).toBe(10 * 60 * 1000);
+    h.service.stop();
+  });
+
   it("is off at 0", async () => {
     const h = harness({ maxActiveHours: 0 });
     let turns = 0;
@@ -258,6 +273,30 @@ describe("the todo link", () => {
     expect(off.service.get(other.id)?.todoId).toBeUndefined();
     expect(off.todoCalls).toEqual([]);
     off.service.stop();
+  });
+
+  it("a restart fixes the todo of a task that ended just before the crash", () => {
+    const seed = harness();
+    const t = seed.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    seed.store.update(t.id, (r) => { r.todoId = "t-1"; });
+    seed.store.transition(t.id, "cancel", { reason: "stopped" }); // the todo update never happened
+    const h = harness();
+    h.service.start();
+    expect(h.todoCalls).toContain(`close t-1 sub-session ${t.id} cancelled`);
+    h.service.stop();
+  });
+
+  it("a todo made just before a crash, its id never on the record, is adopted instead of made twice", () => {
+    const todos = new TodoStore(join(dir, "todos"), DEFAULT_TODOS);
+    const link = createTodoLink(todos);
+    const seed = harness({}, { todos: link });
+    const t = seed.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    const made = link.open(seed.store.get(t.id)!)!; // ...and the crash before the record got it
+    const h = harness({ maxRunning: 0 }, { todos: link });
+    h.service.start();
+    expect(h.store.get(t.id)?.todoId).toBe(made);
+    expect(todos.list().filter((i) => i.ref === t.sessionKey)).toHaveLength(1);
+    h.service.stop();
   });
 
   it("writes real todos through the store, and a todo the owner closed is left alone", async () => {
@@ -373,6 +412,23 @@ describe("the mirror", () => {
     expect(h.wakes).toEqual([]);
     // Still shown, with the session's next turn.
     expect(h.service.mirrorNote("dm:owner")?.text).toContain("On it.");
+    h.service.stop();
+  });
+
+  it("a message the task sent but could not record still reaches the owning session, as a note", async () => {
+    const notes: string[] = [];
+    const h = harness();
+    (h.service as unknown as { deps: { queuePendingNote(k: string, n: string): boolean } }).deps.queuePendingNote = (_k, n) => { notes.push(n); return true; };
+    h.onTurn = () => new Promise(() => {});
+    h.service.start();
+    const task = spawn(h);
+    await flush();
+    const store = h.store as unknown as { update: (...a: unknown[]) => unknown };
+    const real = store.update.bind(h.store);
+    store.update = () => { throw new Error("disk full"); };
+    expect((await h.service.notify(task.sessionKey, "Build is green.")).ok).toBe(true);
+    store.update = real;
+    expect(notes.some((n) => n.includes("Build is green."))).toBe(true);
     h.service.stop();
   });
 

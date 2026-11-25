@@ -22,6 +22,9 @@ export function createTodoLink(store: TodoStore): SubsessionTodoLink {
   return {
     open(record: SubsessionRecord): string | undefined {
       try {
+        // One made already (a crash came before its id reached the task record): that one.
+        const existing = store.list().find((item) => item.ref === record.sessionKey);
+        if (existing) return existing.id;
         const limits = store.limits;
         const item = store.add({
           title: clip(`${record.title} (${record.id})`, limits.titleMaxChars),
@@ -47,6 +50,8 @@ export function createTodoLink(store: TodoStore): SubsessionTodoLink {
     },
     close(todoId: string, reason: string): void {
       try {
+        // Already closed (by the owner, or a close before a restart): nothing to write.
+        if (!store.list().some((item) => item.id === todoId)) return;
         store.resolve(todoId, { action: "drop", reason: clip(reason, 200), by: "self" });
       } catch (err) {
         if (err instanceof TodoRuleError && err.rule.kind === "not_found") return;

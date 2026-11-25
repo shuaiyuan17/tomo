@@ -384,12 +384,7 @@ export class SubsessionService {
     }
     const record = this.store.create({ parentKey, ...input, ...(input.model ? { model: input.model.trim() } : {}) });
     this.deps.ensureRegistryEntry(record.sessionKey);
-    if (cfg.todos && this.deps.todos) {
-      this.safely(() => {
-        const todoId = this.deps.todos!.open(record);
-        if (todoId) this.store.update(record.id, (r) => { r.todoId = todoId; });
-      }, "open the task's todo");
-    }
+    if (cfg.todos && this.deps.todos) this.adoptTodo(record);
     this.schedule();
     return { ok: true, record: this.store.get(record.id) ?? record };
   }
@@ -575,13 +570,22 @@ export class SubsessionService {
       if (result.ok) {
         if (kind !== "fallback") this.spoke.add(record.id);
         const at = this.now();
-        this.safely(() => this.store.update(record.id, (r) => {
-          r.sent.push({ at, kind, text: body });
-          pushConversation(r, { at, from: "task", kind, text: truncate(body, CONVERSATION_TEXT_MAX) });
-          if (result.channel) {
-            for (const messageId of result.messageIds ?? []) r.replyMap.push({ channel: result.channel, messageId, at });
-          }
-        }), "record a sent message");
+        try {
+          this.store.update(record.id, (r) => {
+            r.sent.push({ at, kind, text: body });
+            pushConversation(r, { at, from: "task", kind, text: truncate(body, CONVERSATION_TEXT_MAX) });
+            if (result.channel) {
+              for (const messageId of result.messageIds ?? []) r.replyMap.push({ channel: result.channel, messageId, at });
+            }
+          });
+        } catch (err) {
+          // Out, but not in the conversation the mirror reads: the owning
+          // session gets it as a note instead, so it still sees what was said.
+          log.error({ err, id: record.id }, "Could not record a sub-session's sent message; the owning session gets it as a note");
+          this.deps.queuePendingNote(record.parentKey, formatTomoEvent("subsession-activity",
+            `Sub-session ${record.id} ("${record.title}") said to the owner (${kind}): ${truncate(body, ACTIVITY_NOTE_EXCERPT)}`,
+            { name: record.id }));
+        }
       }
       return result;
     })();
@@ -844,8 +848,17 @@ export class SubsessionService {
     }
     // The todos follow the table: a crash between a recovery write and its
     // todo update (here, or in the process that died) leaves no stale line.
+    // Ended tasks too: a crash right after `finished`, `cancelled` or
+    // `failed` was written left their line saying it is still working. And a
+    // task whose todo was made but whose record never got the id adopts it.
     this.safely(() => {
-      for (const task of this.store.list()) if (OPEN_STATUSES.has(task.status)) this.syncTodo(task);
+      const todos = this.deps.config().todos && this.deps.todos !== undefined;
+      for (const task of this.store.list()) {
+        const open = OPEN_STATUSES.has(task.status);
+        if (task.status === "archived" || (!open && !todos)) continue;
+        if (!task.todoId && open && todos) this.adoptTodo(task);
+        this.syncTodo(this.store.get(task.id) ?? task);
+      }
     }, "todo resync");
     this.safely(() => this.reconcile(startState), "reconcile");
     this.safely(() => this.sweep(), "sweep");
@@ -943,6 +956,9 @@ export class SubsessionService {
         r.activeMs += seen - r.activeSince;
         r.activeSince = now;
         r.activeSeenAt = now;
+        // The owner's last word may have come after the last heartbeat: its
+        // mark can't be past what was banked, or the cap would get that time back.
+        if (r.activeAtOwnerInputMs !== undefined) r.activeAtOwnerInputMs = Math.min(r.activeAtOwnerInputMs, r.activeMs);
       });
     }
   }
@@ -1718,12 +1734,22 @@ export class SubsessionService {
     if (this.deps.config().mirror !== "turn" || !this.deps.mirrorWake) return;
     const record = this.safeGet(id);
     if (!record || !record.conversation.some((e) => e.seq > record.mirrorSeenSeq && e.kind !== "notify")) return;
+    if (!this.mirrorTurnAllowed()) return;
+    this.safely(() => this.deps.mirrorWake!(record.parentKey), "mirror wake");
+  }
+
+  /**
+   * May a mirror turn run now? Not while the 5-hour window is at the quota
+   * pause. Asked when the wake is queued AND when it runs (the window can
+   * fill while it waits behind the session's other turns).
+   */
+  mirrorTurnAllowed(): boolean {
     const percent = this.quotaPercent();
     if (percent !== undefined && percent >= QUOTA_PAUSE_PERCENT) {
-      log.debug({ id, percent }, "Quota window nearly used; the mirror waits for the owning session's next turn");
-      return;
+      log.debug({ percent }, "Quota window nearly used; the mirror waits for the owning session's next turn");
+      return false;
     }
-    this.safely(() => this.deps.mirrorWake!(record.parentKey), "mirror wake");
+    return true;
   }
 
   // ---------------------------------------------------------------------
@@ -1735,6 +1761,14 @@ export class SubsessionService {
     const outcome = this.store.transition(id, event, opts);
     if (outcome.ok && outcome.changed) this.syncTodo(outcome.record);
     return outcome;
+  }
+
+  /** Open (or find, by its ref) the task's todo and link it on the record. */
+  private adoptTodo(record: SubsessionRecord): void {
+    this.safely(() => {
+      const todoId = this.deps.todos!.open(record);
+      if (todoId) this.store.update(record.id, (r) => { r.todoId = todoId; });
+    }, "open the task's todo");
   }
 
   private syncTodo(record: SubsessionRecord): void {

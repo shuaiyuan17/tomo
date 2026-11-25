@@ -354,6 +354,26 @@ describe("sub-sessions through the Agent", () => {
       await agent.stop();
     });
 
+    it("a queued mirror turn that comes up once the quota window is at the pause does not run", async () => {
+      const { agent, channel } = await boot(true, new IdChannel("telegram"));
+      mockSdk.responseFn = (text) => (text.includes("subsession-start") ? new Promise(() => {}) : "ok");
+      await channel.simulateMessage(owner("hi"));
+      await drainQueue(agent);
+      agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
+      expect((await agent.subsessions!.reply("task:s1", "Using main.")).ok).toBe(true);
+      expect(agent.subsessions!.hasUnseenMirror("dm:alex")).toBe(true);
+      const before = ownerPrompts().length;
+      // Allowed when queued, past the pause by the time it runs.
+      let allowed = true;
+      vi.spyOn(agent.subsessions!, "mirrorTurnAllowed").mockImplementation(() => allowed);
+      (agent as unknown as { mirrorWake(k: string): void }).mirrorWake("dm:alex");
+      allowed = false;
+      await new Promise((r) => setTimeout(r, 100));
+      expect(ownerPrompts()).toHaveLength(before);
+      expect(agent.subsessions!.hasUnseenMirror("dm:alex")).toBe(true);
+      await agent.stop();
+    });
+
     it("leaves /s alone when sub-sessions are off", async () => {
       const { agent, channel } = await boot(false);
       mockSdk.responseFn = () => "ok";

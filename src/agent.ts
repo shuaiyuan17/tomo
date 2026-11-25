@@ -597,6 +597,8 @@ export class Agent {
     this.enqueueForSession(parentKey, async () => {
       this.mirrorWakeQueued.delete(parentKey);
       if (this.stopping || !this.subsessions?.hasUnseenMirror(parentKey)) return;
+      // Asked again here: the quota window can fill while the wake waits.
+      if (!this.subsessions.mirrorTurnAllowed()) return;
       await this.processContinuity(prompt, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionMirror"), "background");
     }).catch((err) => {
       this.mirrorWakeQueued.delete(parentKey);

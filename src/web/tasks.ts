@@ -248,8 +248,10 @@ export class TaskBoard {
   publish(): void {
     const now = this.now();
     for (const [sessionId, tasks] of [...this.sessions]) {
+      const settled = settledTimes(tasks);
       for (const [id, task] of tasks) {
-        if (task.endedAt !== undefined && task.state !== "running" && now - task.endedAt >= this.retainMs) tasks.delete(id);
+        const at = settled.get(id);
+        if (at !== undefined && task.state !== "running" && now - at >= this.retainMs) tasks.delete(id);
       }
       if (!tasks.size) this.sessions.delete(sessionId);
     }
@@ -316,10 +318,43 @@ export class TaskBoard {
     this.timer = undefined;
     let next = Infinity;
     for (const tasks of this.sessions.values()) {
-      for (const task of tasks.values()) if (task.endedAt !== undefined) next = Math.min(next, task.endedAt + this.retainMs);
+      for (const at of settledTimes(tasks).values()) if (at !== undefined) next = Math.min(next, at + this.retainMs);
     }
     if (next === Infinity) return;
     this.timer = setTimeout(() => { this.timer = undefined; this.publish(); }, Math.max(0, next - this.now()));
     this.timer.unref?.();
   }
+}
+
+/**
+ * When each of a session's tasks settled: its own end, or the last end of the
+ * work it started (its listed descendants), whichever is later; undefined
+ * while it or any of that work still runs. An ended subagent whose background
+ * command runs on stays listed (the rail shows it working) and leaves the
+ * retention window after the last of it ends. Parent cycles are cut.
+ */
+export function settledTimes(tasks: ReadonlyMap<string, WebTask>): Map<string, number | undefined> {
+  const children = new Map<string, WebTask[]>();
+  for (const task of tasks.values()) {
+    const parent = task.parentTaskId;
+    if (parent && parent !== task.taskId && tasks.has(parent)) children.set(parent, [...(children.get(parent) ?? []), task]);
+  }
+  const result = new Map<string, number | undefined>();
+  const visiting = new Set<string>();
+  const settle = (task: WebTask): number | undefined => {
+    if (result.has(task.taskId)) return result.get(task.taskId);
+    if (task.endedAt === undefined || visiting.has(task.taskId)) return task.endedAt;
+    visiting.add(task.taskId);
+    let at: number | undefined = task.endedAt;
+    for (const child of children.get(task.taskId) ?? []) {
+      const sub = settle(child);
+      if (sub === undefined) { at = undefined; break; }
+      at = Math.max(at, sub);
+    }
+    visiting.delete(task.taskId);
+    result.set(task.taskId, at);
+    return at;
+  };
+  for (const task of tasks.values()) settle(task);
+  return result;
 }

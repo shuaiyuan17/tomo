@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MAX_BOARD_TASKS, MAX_SESSION_TASKS, SNAPSHOT_DESCRIPTION_LIMIT, SNAPSHOT_SUMMARY_LIMIT, TASK_RETENTION_MS, TaskBoard } from "../src/web/tasks.js";
+import { MAX_BOARD_TASKS, MAX_SESSION_TASKS, SNAPSHOT_DESCRIPTION_LIMIT, SNAPSHOT_SUMMARY_LIMIT, TASK_RETENTION_MS, TaskBoard, settledTimes } from "../src/web/tasks.js";
 import type { WatchTask } from "../src/watch/protocol.js";
 import type { WebTask } from "../src/web/protocol.js";
 
@@ -45,6 +45,31 @@ describe("TaskBoard", () => {
     expect(b.snapshot()).toEqual([]);
     expect(published.at(-1)).toEqual(["s1", []]);
     b.dispose();
+  });
+
+  it("keeps an ended subagent while a command it started runs, and lets both go a retention window after the last ends", () => {
+    vi.useFakeTimers({ now: 10_000 });
+    const { b } = board();
+    const child = task("c", { taskType: "local_bash", parentTaskId: "p", startedAt: 2_000 });
+    b.apply("s1", [task("p", { startedAt: 1_000 }), child]);
+    b.apply("s1", [child]); // the subagent's own turn ended
+    vi.advanceTimersByTime(TASK_RETENTION_MS * 4);
+    expect(b.snapshot().map((t) => `${t.taskId}:${t.state}`)).toEqual(["c:running", "p:ended"]);
+    b.apply("s1", []); // the command ends
+    vi.advanceTimersByTime(TASK_RETENTION_MS - 1);
+    expect(b.snapshot().map((t) => t.taskId).sort()).toEqual(["c", "p"]);
+    vi.advanceTimersByTime(1);
+    expect(b.snapshot()).toEqual([]);
+    b.dispose();
+  });
+
+  it("settles a task at its own end or its descendants' last, never while one runs", () => {
+    const t = (id: string, extra: Partial<WebTask> = {}): WebTask => ({ sessionId: "s", taskId: id, taskType: "local_agent", description: id, ambient: false, startedAt: 0, state: "completed", endedAt: 5, ...extra });
+    const map = (...list: WebTask[]) => new Map(list.map((x) => [x.taskId, x]));
+    expect(settledTimes(map(t("p"), t("c", { parentTaskId: "p", endedAt: 9 })))).toEqual(new Map([["p", 9], ["c", 9]]));
+    expect(settledTimes(map(t("p"), t("c", { parentTaskId: "p", state: "running", endedAt: undefined }))).get("p")).toBeUndefined();
+    // A parent cycle is cut, not followed forever.
+    expect(settledTimes(map(t("a", { parentTaskId: "b" }), t("b", { parentTaskId: "a" }))).get("a")).toBe(5);
   });
 
   it("applies the reported end status whichever arrives first", () => {

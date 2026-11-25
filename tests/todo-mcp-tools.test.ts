@@ -80,6 +80,25 @@ describe("todo MCP tools", () => {
     expect((await tools(OWNER).resolve({ id: "t-2", action: "done", evidence: "booked" })).content[0].text).toMatch(/^Done: t-2 group trip/);
   });
 
+  it("todo_list filters by due and mine, earliest review first, and says when a filter is empty", async () => {
+    const store = new TodoStore(dir);
+    const longAgo = Date.now() - 60 * 86_400_000;
+    const base = { next: "x", session: OWNER, source: "self" as const };
+    // Added the same instant, "mine" comes up for review first: the default
+    // review is sooner for what waits on me than for what waits on the owner.
+    store.add({ ...base, title: "overdue owner", waiting_on: "owner" }, longAgo);
+    store.add({ ...base, title: "overdue mine", waiting_on: "me" }, longAgo);
+    store.add({ ...base, title: "fresh mine", waiting_on: "me" });
+    const t = tools(OWNER);
+    const lines = async (filter: string) => (await t.list(filter)).content[0].text.split("\n");
+
+    expect(await lines("due")).toEqual([expect.stringContaining("overdue mine"), expect.stringContaining("overdue owner")]);
+    expect(await lines("mine")).toEqual([expect.stringContaining("overdue mine"), expect.stringContaining("fresh mine")]);
+    // A group sees none of the owner's, so its filters come back empty, by name.
+    expect((await tools(GROUP).list("due")).content[0].text).toBe("No due todos.");
+    expect((await tools(GROUP).list("mine")).content[0].text).toBe("No mine todos.");
+  });
+
   it("todo_resolve snoozes, hands off and reports the cap", async () => {
     const t = tools(OWNER);
     await t.add({ title: "a", next: "b", waiting_on: "me" });

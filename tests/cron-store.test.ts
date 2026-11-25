@@ -4,25 +4,39 @@ import {
   CronStoreReadError,
   InvalidScheduleError,
   isInterrupted,
+  MAX_INTERRUPT_NOTICE_RUNS,
   mergeWithDisk,
   ONE_SHOT_MAX_RETRIES,
   ONE_SHOT_RETRY_DELAY_MS,
 } from "../src/cron/store.js";
-import {
-  ONE_SHOT_STALE_AFTER_MS,
-  MAX_EVERY_MS,
-  MIN_EVERY_MS,
-  parseScheduleString,
-  parseCreatableSchedule,
-  parseStaleAfter,
-  staleWindowMs,
-  unschedulableReason,
-} from "../src/cron/schedule.js";
-import { POLL_INTERVAL_MS } from "../src/cron/scheduler.js";
+import { MAX_EVERY_MS, MIN_EVERY_MS, parseScheduleString, unschedulableReason } from "../src/cron/schedule.js";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { cronAddRefusal, readCronJobsSafely } from "../src/cli/cron-errors.js";
+import { readCronJobsSafely } from "../src/cli/cron-errors.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+/**
+ * A one-shot hook that fires inside the store's atomic write — after the
+ * merge it computed from its read of the file, before the rename that
+ * publishes it. That is the window an optimistic save has to defend: another
+ * process publishing here would otherwise be silently overwritten.
+ */
+const hook = vi.hoisted(() => ({ beforeWrite: null as null | (() => void) }));
+
+// Passes straight through while no hook is armed, so every other test here
+// writes exactly as production does.
+vi.mock("../src/fs-utils.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/fs-utils.js")>();
+  return {
+    ...actual,
+    writeJsonAtomicSync: (path: string, value: unknown, opts?: { beforeRename?: () => void }) => {
+      const fire = hook.beforeWrite;
+      hook.beforeWrite = null; // one-shot: the competing writer must not recurse
+      fire?.();
+      return actual.writeJsonAtomicSync(path, value, opts);
+    },
+  };
+});
 
 type CronJobLike = Record<string, unknown> & { id: string };
 
@@ -260,7 +274,7 @@ describe("CronStore", () => {
     expect(next).toBeLessThanOrEqual(Date.now() + 60_000);
   });
 
-  it("disables one-shot jobs after run", () => {
+  it("deletes a one-shot job after a successful run", () => {
     const store = new CronStore(TEST_PATH);
     const job = store.add({
       name: "once",
@@ -348,59 +362,29 @@ describe("CronStore", () => {
     expect(updated.nextRunAt).toBeGreaterThan(Date.now());
   });
 
-  it("defaults deleteAfterRun=true for 'at' schedules when not specified", () => {
+  // A one-shot is deleted once it ran, a recurring job kept; an explicit value
+  // wins either way (a cron pattern meant to fire once, an `at` job kept as a
+  // record).
+  it.each([
+    ["at", undefined, true],
+    ["cron", undefined, false],
+    ["every", undefined, false],
+    ["at", false, false],
+    ["cron", true, true],
+  ] as const)("deleteAfterRun for a %s schedule given %s is %s", (kind, explicit, expected) => {
     const store = new CronStore(TEST_PATH);
+    const schedule = kind === "at" ? { kind, at: new Date(Date.now() + 60_000).toISOString() }
+      : kind === "cron" ? { kind, expr: "0 9 * * *" }
+      : { kind, everyMs: 60_000 };
     const job = store.add({
-      name: "at-default",
-      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
-      message: "tomorrow",
+      name: `${kind}-${explicit}`,
+      schedule,
+      message: "x",
       sessionKey: "dm:alice",
-      // deleteAfterRun intentionally omitted
+      ...(explicit === undefined ? {} : { deleteAfterRun: explicit }),
     });
-    expect(job.deleteAfterRun).toBe(true);
-  });
-
-  it("defaults deleteAfterRun=false for recurring schedules when not specified", () => {
-    const store = new CronStore(TEST_PATH);
-    const cronJob = store.add({
-      name: "daily",
-      schedule: { kind: "cron", expr: "0 9 * * *" },
-      message: "morning",
-      sessionKey: "dm:alice",
-    });
-    expect(cronJob.deleteAfterRun).toBe(false);
-
-    const everyJob = store.add({
-      name: "tick",
-      schedule: { kind: "every", everyMs: 60_000 },
-      message: "tick",
-      sessionKey: "dm:alice",
-    });
-    expect(everyJob.deleteAfterRun).toBe(false);
-  });
-
-  it("respects explicit deleteAfterRun override on 'at' schedules", () => {
-    const store = new CronStore(TEST_PATH);
-    const job = store.add({
-      name: "at-keep",
-      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
-      message: "keep me",
-      sessionKey: "dm:alice",
-      deleteAfterRun: false,
-    });
-    expect(job.deleteAfterRun).toBe(false);
-  });
-
-  it("respects explicit deleteAfterRun=true on recurring schedules", () => {
-    const store = new CronStore(TEST_PATH);
-    const job = store.add({
-      name: "fire-once-then-die",
-      schedule: { kind: "cron", expr: "0 19 1 5 *" },
-      message: "may 1 only this year",
-      sessionKey: "dm:alice",
-      deleteAfterRun: true,
-    });
-    expect(job.deleteAfterRun).toBe(true);
+    expect(job.deleteAfterRun).toBe(expected);
+    expect(new CronStore(TEST_PATH).get(job.id)!.deleteAfterRun).toBe(expected);
   });
 
   it("add() does not resurrect jobs removed by another process", () => {
@@ -572,13 +556,6 @@ describe("CronStore", () => {
   });
 });
 
-/** Make every job's last dispatch look `agoMs` old (an outage before restart). */
-function ageStart(agoMs: number): void {
-  const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
-  for (const job of raw.jobs) job.lastStartedAt = Date.now() - agoMs;
-  writeFileSync(TEST_PATH, JSON.stringify(raw));
-}
-
 describe("CronStore interrupted-run recovery", () => {
   beforeEach(() => {
     mkdirSync(TEST_DIR, { recursive: true });
@@ -700,6 +677,43 @@ describe("CronStore interrupted-run recovery", () => {
     expect(left.runs).toEqual(notice.runs.slice(1));
     new CronStore(TEST_PATH).markRecurringInterruptNoticesSent([{ id: job.id, notice: left }]);
     expect(new CronStore(TEST_PATH).unreportedInterruptedRecurring()).toHaveLength(0);
+  });
+
+  it("keeps at most MAX_INTERRUPT_NOTICE_RUNS run details but an exact count, and an acknowledgement keeps the two consistent", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = addRecurring(store);
+    const crash = () => {
+      new CronStore(TEST_PATH).markStarted(job.id);
+      new CronStore(TEST_PATH).recoverInterrupted();
+    };
+    const notice = () => new CronStore(TEST_PATH).get(job.id)!.interruptNotice!;
+
+    for (let i = 0; i < 5; i++) crash();
+    // The report went out for the first five; seven more crashes land while it is in flight.
+    const reported = structuredClone(notice());
+    expect(reported).toMatchObject({ seq: 5, count: 5 });
+    for (let i = 0; i < 7; i++) crash();
+    const full = notice();
+    expect(full.count).toBe(12);
+    expect(full.runs).toHaveLength(MAX_INTERRUPT_NOTICE_RUNS);
+
+    // Clearing what was reported leaves exactly the seven newer runs, even
+    // though some of the reported ones had already been sliced away.
+    new CronStore(TEST_PATH).markRecurringInterruptNoticesSent([{ id: job.id, notice: reported }]);
+    const left = notice();
+    expect(left.count).toBe(7);
+    expect(left.runs).toEqual(full.runs.slice(-7));
+
+    // A report that was itself capped ("12 times, 10 shown"), acknowledged
+    // after one more crash, leaves just that one.
+    for (let i = 0; i < 5; i++) crash();
+    const capped = structuredClone(notice());
+    expect(capped.count).toBe(12);
+    expect(capped.runs).toHaveLength(MAX_INTERRUPT_NOTICE_RUNS);
+    crash();
+    const newest = notice().runs.at(-1);
+    new CronStore(TEST_PATH).markRecurringInterruptNoticesSent([{ id: job.id, notice: capped }]);
+    expect(notice()).toMatchObject({ count: 1, runs: [newest] });
   });
 
   it("after a long downtime, an `every` job advances from its OWN slot by whole periods, not from recovery time", () => {
@@ -1012,8 +1026,9 @@ describe("CronStore clock independence and unacked outcomes", () => {
       message: "remind me",
       sessionKey: "dm:alice",
     });
+    // Interrupted (a crash), then parked by recovery: every interrupted
+    // one-shot is, however fresh.
     store.markStarted(job.id);
-    ageStart(ONE_SHOT_STALE_AFTER_MS + 60_000);
     new CronStore(TEST_PATH).recoverInterrupted();
     expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(false);
 
@@ -1032,12 +1047,16 @@ describe("CronStore clock independence and unacked outcomes", () => {
 describe("CronStore concurrent writers", () => {
   beforeEach(() => {
     mkdirSync(TEST_DIR, { recursive: true });
+    hook.beforeWrite = null;
   });
 
   afterEach(() => {
     rmSync(TEST_DIR, { recursive: true, force: true });
     vi.restoreAllMocks();
+    hook.beforeWrite = null;
   });
+
+  const revision = (): number => JSON.parse(readFileSync(TEST_PATH, "utf-8")).revision;
 
   function addRecurring(store: CronStore) {
     return store.add({
@@ -1062,7 +1081,7 @@ describe("CronStore concurrent writers", () => {
     });
   }
 
-  it("a CLI write does not erase a dispatch record the daemon made mid-write", () => {
+  it("a CLI write does not erase a dispatch record the daemon made between its read and its merge", () => {
     const daemon = new CronStore(TEST_PATH);
     const job = addRecurring(daemon);
 
@@ -1080,6 +1099,48 @@ describe("CronStore concurrent writers", () => {
     expect(merged.lastRunId).toBe(runId);    // ...without reverting the daemon's
     expect(merged.lastStartedAt).toBeGreaterThan(0);
     expect(isInterrupted(merged)).toBe(true);
+  });
+
+  it("a CLI write re-merges when the daemon publishes between its merge and its rename", () => {
+    const daemon = new CronStore(TEST_PATH);
+    const job = addRecurring(daemon);
+    const cli = new CronStore(TEST_PATH);
+
+    // The CLI has read the file and merged. The daemon dispatches a run —
+    // publishing lastRunId — in the instant before the CLI's rename. Without
+    // the last-moment revision check the CLI's rename erases the dispatch
+    // token, and the next daemon start re-fires a job that was already
+    // running.
+    let runId: string | undefined;
+    hook.beforeWrite = () => { runId = daemon.markStarted(job.id); };
+    cli.setEnabled(job.id, false);
+
+    const after = new CronStore(TEST_PATH).list()[0];
+    expect(after.enabled).toBe(false);        // the CLI's own edit still lands
+    expect(after.lastRunId).toBe(runId);      // ...and the token survived
+    expect(isInterrupted(after)).toBe(true);
+    expect(revision()).toBe(3);               // add, markStarted, setEnabled
+  });
+
+  it("gives up rather than publishing a merge it could not verify", () => {
+    const daemon = new CronStore(TEST_PATH);
+    const job = addRecurring(daemon);
+    const cli = new CronStore(TEST_PATH);
+
+    // A writer that loses the race on every attempt: the save must report a
+    // failure (the scheduler retries the outcome write) instead of silently
+    // clobbering.
+    const rearm = () => {
+      hook.beforeWrite = () => {
+        daemon.markStarted(job.id);
+        rearm();
+      };
+    };
+    rearm();
+
+    expect(() => cli.setEnabled(job.id, false)).toThrow(/changed during write/);
+    hook.beforeWrite = null;
+    expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(true);
   });
 
   it("a dispatch record does not revert a session rename made mid-write", () => {
@@ -1116,11 +1177,61 @@ describe("CronStore concurrent writers", () => {
     expect(names).toEqual(["late", "recurring"]);
   });
 
+  it("bumps a monotonic revision on every write", () => {
+    const store = new CronStore(TEST_PATH);
+    const job = addRecurring(store);
+    expect(revision()).toBe(1);
+    store.markStarted(job.id);
+    expect(revision()).toBe(2);
+    store.markRun(job.id, "ok");
+    expect(revision()).toBe(3);
+  });
+
+  // The ownership check has to run against the state the delete applies to.
+  // remove() reloads from disk, so a job written by another process after the
+  // caller's snapshot was taken used to skip the check and be deleted.
+  it("remove applies its ownership guard to the reloaded store, not a stale snapshot", () => {
+    const store = new CronStore(TEST_PATH);
+    const otherProcess = new CronStore(TEST_PATH);
+    const job = otherProcess.add({
+      name: "written-after-the-snapshot",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "private",
+      sessionKey: "dm:alice",
+    });
+
+    // Not in `store`'s snapshot at all — this is the window.
+    expect(store.get(job.id)).toBeUndefined();
+    expect(store.remove(job.id, (j) => j.sessionKey === "telegram:-1001234567")).toBe("refused");
+    expect(new CronStore(TEST_PATH).get(job.id)).toBeTruthy();
+  });
+
+  // Same window as remove(): setEnabled reloads, so a snapshot check misses
+  // anything another process wrote in between. enabling is the one
+  // operation that makes a DORMANT job run again, so it is the worst place to
+  // skip an ownership check.
+  it("setEnabled applies its ownership guard to the reloaded store, not a stale snapshot", () => {
+    const store = new CronStore(TEST_PATH);
+    const otherProcess = new CronStore(TEST_PATH);
+    const job = otherProcess.add({
+      name: "written-after-the-snapshot",
+      schedule: { kind: "every", everyMs: 60_000 },
+      message: "private",
+      sessionKey: "dm:alice",
+    });
+    otherProcess.setEnabled(job.id, false);
+
+    expect(store.get(job.id)).toBeUndefined();
+    expect(store.setEnabled(job.id, true, (j) => j.sessionKey === "telegram:-1001234567")).toBe("refused");
+    expect(new CronStore(TEST_PATH).get(job.id)?.enabled).toBe(false);
+  });
+
   it("mergeWithDisk treats clearing a field as an edit, not as an absence", () => {
     // `interruptedAt = null` (marker consumed) against a baseline that had no
     // such key at all. Reading undefined and null as the same value would let
-    // a concurrent writer's stale non-null value survive, and the [resumed]
-    // marker would be delivered twice.
+    // a concurrent writer's stale non-null value survive, and an interruption
+    // already acted on would come back. (This once meant a second [resumed]
+    // fire; no such marker exists any more, the rule still holds.)
     const base = {
       id: "a", name: "a", enabled: true, message: "m", sessionKey: "dm:alice",
       deleteAfterRun: false, createdAt: 1, nextRunAt: 10, lastRunAt: null,
@@ -1308,214 +1419,43 @@ describe("readCronJobsSafely", () => {
   });
 });
 
-describe("parseScheduleString", () => {
-  it("parses relative time", () => {
-    const s = parseScheduleString("in 20m");
-    expect(s.kind).toBe("at");
-    if (s.kind === "at") {
-      const ts = new Date(s.at).getTime();
-      expect(ts).toBeGreaterThan(Date.now());
-      expect(ts).toBeLessThan(Date.now() + 25 * 60_000);
-    }
+describe("CronStore stale-run skips", () => {
+  beforeEach(() => {
+    mkdirSync(TEST_DIR, { recursive: true });
   });
 
-  it("parses interval", () => {
-    const s = parseScheduleString("every 2h");
-    expect(s).toEqual({ kind: "every", everyMs: 7_200_000 });
-  });
-
-  it("parses cron expression", () => {
-    const s = parseScheduleString("0 9 * * *");
-    expect(s.kind).toBe("cron");
-    if (s.kind === "cron") {
-      expect(s.expr).toBe("0 9 * * *");
-      expect(s.tz).toBeTruthy();
-    }
-  });
-
-  it("parses ISO date", () => {
-    const s = parseScheduleString("2026-12-25T00:00:00Z");
-    expect(s.kind).toBe("at");
-  });
-});
-
-/** February 30th: a well-formed pattern croner accepts and never matches. */
-const NEVER_CRON = "0 0 30 2 *";
-
-describe("unschedulableReason", () => {
-  const now = Date.parse("2026-05-01T12:00:00Z");
-
-  it("passes a schedule that still has a future run", () => {
-    expect(unschedulableReason({ kind: "every", everyMs: 60_000 }, now)).toBeNull();
-    expect(unschedulableReason(parseScheduleString("0 9 * * *"), now)).toBeNull();
-    expect(unschedulableReason({ kind: "at", at: "2026-05-01T13:00:00Z" }, now)).toBeNull();
-  });
-
-  it("names the past one-shot — the shape the model produces off a stale clock", () => {
-    expect(unschedulableReason({ kind: "at", at: "2026-04-30T09:00:00Z" }, now))
-      .toMatch(/is in the past$/);
-  });
-
-  it("names an `at` string that is not a date at all", () => {
-    // `parseAtSchedule` returns NaN, which is neither > now nor a real time —
-    // a different failure from "already happened" and worth saying so.
-    expect(unschedulableReason({ kind: "at", at: "next tuesday-ish" }, now))
-      .toMatch(/not a date\/time that can be parsed/);
-  });
-
-  it("refuses a zero interval — the schedule that is due again the moment it runs", () => {
-    expect(unschedulableReason({ kind: "every", everyMs: 0 }, now))
-      .toBe(`an interval of 0ms is below the ${MIN_EVERY_MS / 1000}s minimum`);
-    // The user-facing route into the same value.
-    expect(unschedulableReason(parseScheduleString("every 0s"), now)).not.toBeNull();
-  });
-
-  it("refuses an interval below the scheduler's poll and accepts exactly the minimum", () => {
-    expect(unschedulableReason({ kind: "every", everyMs: MIN_EVERY_MS - 1 }, now))
-      .toMatch(/below the 30s minimum$/);
-    expect(unschedulableReason({ kind: "every", everyMs: MIN_EVERY_MS }, now)).toBeNull();
-  });
-
-  it("refuses an interval so large it stops being a safe integer", () => {
-    // `every 99999999999999d` — Number gets an answer, the clock never does.
-    const huge = parseScheduleString("every 99999999999999d");
-    expect(huge).toEqual({ kind: "every", everyMs: 99999999999999 * 86_400_000 });
-    expect(unschedulableReason(huge, now)).toBe("its interval is not a whole number of milliseconds");
-    expect(unschedulableReason({ kind: "every", everyMs: MAX_EVERY_MS + 1 }, now))
-      .toMatch(/above the 366-day maximum$/);
-    expect(unschedulableReason({ kind: "every", everyMs: MAX_EVERY_MS }, now)).toBeNull();
-  });
-
-  it("keeps the floor pinned to the scheduler's poll interval", () => {
-    // A job cannot fire more often than the scan that dispatches it; if one
-    // of these moves, the other has to be looked at.
-    expect(MIN_EVERY_MS).toBe(POLL_INTERVAL_MS);
-  });
-
-  it("names a recurring pattern with no occurrence left", () => {
-    // The case a try/catch around computeNextRun cannot see: croner accepts
-    // the pattern and simply returns null forever.
-    expect(unschedulableReason(parseScheduleString(NEVER_CRON), now))
-      .toBe("it has no future occurrence");
-  });
-});
-
-describe("`tomo cron add` refusal", () => {
-  it("refuses a time that has already passed, in one line", () => {
-    const past = new Date(Date.now() - 86_400_000).toISOString();
-    const parsed = parseCreatableSchedule(past);
-    expect(parsed.kind).toBe("unschedulable");
-    expect(cronAddRefusal(past, parsed as Exclude<typeof parsed, { kind: "ok" }>))
-      .toMatch(/^Cannot schedule ".*": .* is in the past, so the job could never fire\.$/);
-  });
-
-  it("refuses a recurring pattern that can never come round again", () => {
-    const parsed = parseCreatableSchedule(NEVER_CRON);
-    expect(parsed.kind).toBe("unschedulable");
-    expect(cronAddRefusal(NEVER_CRON, parsed as Exclude<typeof parsed, { kind: "ok" }>))
-      .toBe(`Cannot schedule "${NEVER_CRON}": it has no future occurrence, so the job could never fire.`);
-  });
-
-  it("turns croner's throw into one line instead of a stack trace", () => {
-    // `parseScheduleString` funnels anything it does not recognise into
-    // `kind: "cron"`, so a typo reaches croner — which throws only when the
-    // expression is evaluated. The CLI used to print that stack at whoever
-    // typed the command.
-    const garbage = "whenever i feel like it";
-    const parsed = parseCreatableSchedule(garbage);
-    expect(parsed.kind).toBe("unparseable");
-    const line = cronAddRefusal(garbage, parsed as Exclude<typeof parsed, { kind: "ok" }>);
-    expect(line.split("\n")).toHaveLength(1);
-    expect(line).toMatch(/^Cannot schedule "whenever i feel like it": not a schedule expression — /);
-    expect(line).not.toMatch(/\bat Object\b|\bat Module\b/); // no stack frames
-  });
-
-  it("accepts a live schedule and hands back the parsed value", () => {
-    const parsed = parseCreatableSchedule("every 2h");
-    expect(parsed).toEqual({ kind: "ok", schedule: { kind: "every", everyMs: 7_200_000 } });
-  });
-});
-
-describe("staleness window", () => {
-  it("parses --stale-after values", () => {
-    expect(parseStaleAfter("0")).toBe(0);
-    expect(parseStaleAfter("30m")).toBe(30 * 60_000);
-    expect(parseStaleAfter("6h")).toBe(6 * 3_600_000);
-    expect(parseStaleAfter("2 days")).toBe(2 * 86_400_000);
-    expect(parseStaleAfter("soon")).toBeNull();
-    expect(parseStaleAfter("-5m")).toBeNull();
-  });
-
-  it("scales the default with the period, and honours a per-job value", () => {
-    const HOUR = 3_600_000;
-    const every = (everyMs: number, staleAfterMs?: number) =>
-      ({ schedule: { kind: "every" as const, everyMs }, deleteAfterRun: false, ...(staleAfterMs !== undefined ? { staleAfterMs } : {}) });
-    const cron = (expr: string) => ({ schedule: { kind: "cron" as const, expr, tz: "UTC" }, deleteAfterRun: false });
-    const from = Date.UTC(2026, 10, 7, 12);
-    // Sub-daily: half the period, floored at 5 minutes.
-    expect(staleWindowMs(every(HOUR), from)).toBe(30 * 60_000);
-    expect(staleWindowMs(every(60_000), from)).toBe(5 * 60_000);
-    // Daily: half the period = 12h (the cap).
-    expect(staleWindowMs(every(24 * HOUR), from)).toBe(12 * HOUR);
-    expect(staleWindowMs(cron("0 3 * * *"), Date.UTC(2026, 10, 7, 3))).toBe(12 * HOUR);
-    // The period is measured FROM the missed slot: a weekday cron missed on a
-    // Thursday is daily, one missed on a Friday waits 72h for Monday.
-    expect(staleWindowMs(cron("0 9 * * 1-5"), Date.UTC(2026, 10, 12, 9))).toBe(12 * HOUR);
-    expect(staleWindowMs(cron("0 9 * * 1-5"), Date.UTC(2026, 10, 13, 9))).toBe(0);
-    // Longer than a day: always catch up.
-    expect(staleWindowMs(every(14 * 24 * HOUR), from)).toBe(0);
-    expect(staleWindowMs(cron("0 9 * * 1"), Date.UTC(2026, 10, 9, 9))).toBe(0);
-    expect(staleWindowMs(cron("0 9 1 * *"), Date.UTC(2026, 10, 1, 9))).toBe(0);
-    expect(staleWindowMs(cron("0 9 1 1,4,7,10 *"), Date.UTC(2026, 9, 1, 9))).toBe(0);
-    expect(staleWindowMs(cron("0 9 1 12 *"), Date.UTC(2026, 11, 1, 9))).toBe(0);
-    // No slot given: judged from the next occurrence.
-    expect(staleWindowMs(cron("0 9 1 * *"))).toBe(0);
-    // One-shots: a fixed retry window.
-    expect(staleWindowMs({ schedule: { kind: "at", at: "2026-11-07T10:00" }, deleteAfterRun: true }, from)).toBe(ONE_SHOT_STALE_AFTER_MS);
-    // Explicit values win; a damaged one falls back to the default.
-    expect(staleWindowMs(every(24 * HOUR, 0), from)).toBe(0);
-    expect(staleWindowMs(every(24 * HOUR, 600_000), from)).toBe(600_000);
-    expect(staleWindowMs(every(HOUR, -1), from)).toBe(30 * 60_000);
+  afterEach(() => {
+    rmSync(TEST_DIR, { recursive: true, force: true });
   });
 
   it("skip notices aggregate, and an acknowledgement clears only what was sent", () => {
-    mkdirSync(TEST_DIR, { recursive: true });
-    try {
-      const store = new CronStore(TEST_PATH);
-      store.add({ name: "j", schedule: { kind: "every", everyMs: 3_600_000 }, message: "x", sessionKey: "dm:alice" });
-      const stale = () => {
-        const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
-        raw.jobs[0].nextRunAt = Date.now() - 5 * 3_600_000;
-        writeFileSync(TEST_PATH, JSON.stringify(raw));
-        new CronStore(TEST_PATH).skipStaleRuns();
-      };
-      stale();
-      const sent = new CronStore(TEST_PATH).unreportedSkips().map((j) => ({ id: j.id, notice: { ...j.skipNotice! } }));
-      stale(); // skipped again while that report was in flight
-      expect(new CronStore(TEST_PATH).list()[0].skipNotice).toMatchObject({ seq: 2, count: 2 });
-      new CronStore(TEST_PATH).markSkipNoticesSent(sent);
-      expect(new CronStore(TEST_PATH).list()[0].skipNotice).toMatchObject({ seq: 2, count: 1 });
-      new CronStore(TEST_PATH).markSkipNoticesSent(new CronStore(TEST_PATH).unreportedSkips().map((j) => ({ id: j.id, notice: j.skipNotice! })));
-      expect(new CronStore(TEST_PATH).list()[0].skipNotice ?? null).toBeNull();
-    } finally {
-      rmSync(TEST_DIR, { recursive: true, force: true });
-    }
+    const store = new CronStore(TEST_PATH);
+    store.add({ name: "j", schedule: { kind: "every", everyMs: 3_600_000 }, message: "x", sessionKey: "dm:alice" });
+    const stale = () => {
+      const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+      raw.jobs[0].nextRunAt = Date.now() - 5 * 3_600_000;
+      writeFileSync(TEST_PATH, JSON.stringify(raw));
+      new CronStore(TEST_PATH).skipStaleRuns();
+    };
+    stale();
+    const sent = new CronStore(TEST_PATH).unreportedSkips().map((j) => ({ id: j.id, notice: { ...j.skipNotice! } }));
+    stale(); // skipped again while that report was in flight
+    expect(new CronStore(TEST_PATH).list()[0].skipNotice).toMatchObject({ seq: 2, count: 2 });
+    new CronStore(TEST_PATH).markSkipNoticesSent(sent);
+    expect(new CronStore(TEST_PATH).list()[0].skipNotice).toMatchObject({ seq: 2, count: 1 });
+    new CronStore(TEST_PATH).markSkipNoticesSent(new CronStore(TEST_PATH).unreportedSkips().map((j) => ({ id: j.id, notice: j.skipNotice! })));
+    expect(new CronStore(TEST_PATH).list()[0].skipNotice ?? null).toBeNull();
   });
 
   it("setStaleAfter sets, clears and guards a job's window", () => {
-    mkdirSync(TEST_DIR, { recursive: true });
-    try {
-      const store = new CronStore(TEST_PATH);
-      const job = store.add({ name: "j", schedule: { kind: "every", everyMs: 3_600_000 }, message: "x", sessionKey: "dm:alice" });
-      expect(new CronStore(TEST_PATH).setStaleAfter(job.id, 0)?.staleAfterMs).toBe(0);
-      expect(new CronStore(TEST_PATH).list()[0].staleAfterMs).toBe(0);
-      expect(new CronStore(TEST_PATH).setStaleAfter(job.id, null, () => false)).toBe("refused");
-      expect(new CronStore(TEST_PATH).setStaleAfter(job.id, null)?.staleAfterMs).toBeUndefined();
-      expect("staleAfterMs" in new CronStore(TEST_PATH).list()[0]).toBe(false);
-      expect(new CronStore(TEST_PATH).setStaleAfter("nope", 0)).toBeUndefined();
-      expect(() => new CronStore(TEST_PATH).setStaleAfter(job.id, -5)).toThrow(RangeError);
-    } finally {
-      rmSync(TEST_DIR, { recursive: true, force: true });
-    }
+    const store = new CronStore(TEST_PATH);
+    const job = store.add({ name: "j", schedule: { kind: "every", everyMs: 3_600_000 }, message: "x", sessionKey: "dm:alice" });
+    expect(new CronStore(TEST_PATH).setStaleAfter(job.id, 0)?.staleAfterMs).toBe(0);
+    expect(new CronStore(TEST_PATH).list()[0].staleAfterMs).toBe(0);
+    expect(new CronStore(TEST_PATH).setStaleAfter(job.id, null, () => false)).toBe("refused");
+    expect(new CronStore(TEST_PATH).setStaleAfter(job.id, null)?.staleAfterMs).toBeUndefined();
+    expect("staleAfterMs" in new CronStore(TEST_PATH).list()[0]).toBe(false);
+    expect(new CronStore(TEST_PATH).setStaleAfter("nope", 0)).toBeUndefined();
+    expect(() => new CronStore(TEST_PATH).setStaleAfter(job.id, -5)).toThrow(RangeError);
   });
 });

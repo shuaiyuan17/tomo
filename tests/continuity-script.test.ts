@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ContinuityRunner } from "../src/continuity.js";
 import { runContinuityScript, type ContinuityScriptConfig } from "../src/continuity-script.js";
 import { CONTINUITY_DELIVERY_NOTE } from "../src/continuity-defaults.js";
+import { log } from "../src/logger.js";
 
 let tmpDir: string;
 
@@ -23,6 +24,31 @@ function scriptConfig(path: string, overrides: Partial<ContinuityScriptConfig> =
     maxOutputChars: 2_000,
     ...overrides,
   };
+}
+
+/**
+ * Is `pid` still a running process? `kill(pid, 0)` alone is not enough: it
+ * succeeds on a zombie, and a zombie is exactly what a killed grandchild
+ * becomes when it is reparented to a PID 1 that never reaps (some container
+ * inits do not). A zombie is dead for this purpose — it holds no pipe and
+ * runs nothing — so on Linux the process state in `/proc/<pid>/stat` decides.
+ * macOS has no `/proc`; launchd reaps orphans there, so `kill(0)` is the
+ * whole answer.
+ */
+function isRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  let stat: string;
+  try {
+    stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch {
+    return true;
+  }
+  // `pid (comm) S ...`: comm may contain spaces or parens, so read after the LAST ")".
+  return stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) !== "Z";
 }
 
 function writeScript(name: string, content: string, executable = true): string {
@@ -94,10 +120,28 @@ describe("runContinuityScript", () => {
     expect(result).toContain("status: timed out after 500ms");
     const grandchild = Number(readFileSync(pidFile, "utf-8").trim());
     expect(Number.isInteger(grandchild)).toBe(true);
-    // SIGKILL to the group is asynchronous; give the kernel a moment.
-    await new Promise((r) => setTimeout(r, 200));
-    expect(() => process.kill(grandchild, 0)).toThrow();
+    // The signal to the group lands asynchronously; poll rather than sleep.
+    // (The helper must not be vacuous: this very process is running.)
+    expect(isRunning(process.pid)).toBe(true);
+    await vi.waitFor(() => expect(isRunning(grandchild)).toBe(false), { timeout: 2_000 });
   }, 15_000);
+
+  // A misconfigured `continuity.script` must not break the heartbeat: each
+  // preflight failure comes back as an ordinary result block for the prompt,
+  // never a throw out of fire().
+  it.each([
+    // `path` is a function: tmpDir exists only once beforeEach has run.
+    ["an empty path", () => "   ", "status: failed (empty script path)"],
+    ["a missing file", () => join(tmpDir, "nope.sh"), "status: failed (ENOENT"],
+    ["a directory", () => tmpDir, "status: failed (path is not a file)"],
+  ])("reports %s as a failed result instead of throwing", async (_label, path, status) => {
+    const scriptPath = path();
+    const result = await runContinuityScript(scriptConfig(scriptPath));
+
+    expect(result).toMatch(/^Continuity script result:\n/);
+    expect(result).toContain(`path: ${scriptPath.trim() || "(empty)"}\n`);
+    expect(result).toContain(status);
+  });
 
   it("bounds captured output", async () => {
     const path = writeScript("long.sh", "#!/bin/sh\nprintf abcdef\n");
@@ -110,17 +154,28 @@ describe("runContinuityScript", () => {
   });
 });
 
+type RunnerAgent = ConstructorParameters<typeof ContinuityRunner>[0];
+
+function agentStub(handleContinuity: (prompt: string) => Promise<void>): RunnerAgent {
+  return { handleContinuity } as unknown as RunnerAgent;
+}
+
+/** One heartbeat, awaited — the same private method the interval and the trigger call. */
+function fire(runner: ContinuityRunner): Promise<void> {
+  return (runner as unknown as { fire(): Promise<void> }).fire();
+}
+
 describe("ContinuityRunner", () => {
   it("appends the script result to the normal heartbeat prompt", async () => {
     const path = writeScript("runner.sh", "#!/bin/sh\necho runner-output\n");
     const handleContinuity = vi.fn().mockResolvedValue(undefined);
     const runner = new ContinuityRunner(
-      { handleContinuity } as unknown as ConstructorParameters<typeof ContinuityRunner>[0],
+      agentStub(handleContinuity),
       null,
       scriptConfig(path),
     );
 
-    await (runner as unknown as { fire(): Promise<void> }).fire();
+    await fire(runner);
 
     expect(handleContinuity).toHaveBeenCalledTimes(1);
     const prompt = handleContinuity.mock.calls[0][0] as string;
@@ -141,11 +196,11 @@ describe("ContinuityRunner", () => {
   it("tells the model in the heartbeat event that its reply text is not delivered", async () => {
     const handleContinuity = vi.fn().mockResolvedValue(undefined);
     const runner = new ContinuityRunner(
-      { handleContinuity } as unknown as ConstructorParameters<typeof ContinuityRunner>[0],
+      agentStub(handleContinuity),
       null,
     );
 
-    await (runner as unknown as { fire(): Promise<void> }).fire();
+    await fire(runner);
 
     const prompt = handleContinuity.mock.calls[0][0] as string;
     expect(prompt).toContain(CONTINUITY_DELIVERY_NOTE);
@@ -156,7 +211,7 @@ describe("ContinuityRunner", () => {
     vi.useFakeTimers();
     const handleContinuity = vi.fn().mockResolvedValue(undefined);
     const runner = new ContinuityRunner(
-      { handleContinuity } as unknown as ConstructorParameters<typeof ContinuityRunner>[0],
+      agentStub(handleContinuity),
       null,
       null,
       { triggerDir: tmpDir, intervalMs: 25 },
@@ -181,7 +236,7 @@ describe("ContinuityRunner", () => {
     const path = writeScript("manual.sh", "#!/bin/sh\necho manual-output\n");
     const handleContinuity = vi.fn().mockResolvedValue(undefined);
     const runner = new ContinuityRunner(
-      { handleContinuity } as unknown as ConstructorParameters<typeof ContinuityRunner>[0],
+      agentStub(handleContinuity),
       null,
       scriptConfig(path),
       { triggerDir },
@@ -205,6 +260,72 @@ describe("ContinuityRunner", () => {
     } finally {
       if (triggerInterval) clearInterval(triggerInterval);
       runner.stop();
+    }
+  });
+
+  it("adds the weather line when a city is configured, and leaves it out when the lookup fails", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("☀️ +12°C 40% ↗10km/h\n", { status: 200 }))
+      .mockResolvedValueOnce(new Response("unknown location", { status: 404 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const handleContinuity = vi.fn().mockResolvedValue(undefined);
+    const runner = new ContinuityRunner(agentStub(handleContinuity), "São Paulo");
+
+    try {
+      await fire(runner);
+      await fire(runner);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(String(fetchMock.mock.calls[0][0])).toContain(`/${encodeURIComponent("São Paulo")}?`);
+    expect(handleContinuity.mock.calls[0][0]).toContain("Weather outside: ☀️ +12°C 40% ↗10km/h.");
+    // A failed lookup is no weather, not an error, and the heartbeat still runs.
+    expect(handleContinuity).toHaveBeenCalledTimes(2);
+    expect(handleContinuity.mock.calls[1][0]).not.toContain("Weather outside");
+  });
+
+  it("logs a failed heartbeat turn instead of rejecting", async () => {
+    // fire() is not awaited by the interval or the trigger watcher, so a
+    // rejection escaping it would be an unhandled rejection in the daemon.
+    const errorSpy = vi.spyOn(log, "error").mockImplementation(() => undefined);
+    const handleContinuity = vi.fn().mockRejectedValue(new Error("turn blew up"));
+    const runner = new ContinuityRunner(agentStub(handleContinuity), null);
+
+    try {
+      await expect(fire(runner)).resolves.toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ err: expect.objectContaining({ message: "turn blew up" }) }),
+        "Continuity heartbeat failed",
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("reports the next scheduled heartbeat only while running", async () => {
+    vi.useFakeTimers();
+    const runner = new ContinuityRunner(
+      agentStub(vi.fn().mockResolvedValue(undefined)),
+      null,
+      null,
+      { triggerDir: tmpDir, intervalMs: 1_000 },
+    );
+
+    try {
+      expect(runner.nextFireAt()).toBeNull();
+      runner.start();
+      const startedAt = Date.now();
+      expect(runner.nextFireAt()).toBe(startedAt + 1_000);
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(runner.nextFireAt()).toBe(startedAt + 2_000);
+
+      runner.stop();
+      expect(runner.nextFireAt()).toBeNull();
+    } finally {
+      runner.stop();
+      vi.useRealTimers();
     }
   });
 });

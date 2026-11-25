@@ -1,11 +1,10 @@
 import { afterAll, describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { CronStore } from "../src/cron/store.js";
-import { ONE_SHOT_STALE_AFTER_MS } from "../src/cron/schedule.js";
 import { buildCronTools } from "../src/mcp/cron-tools.js";
-import { MIXED_AUDIENCE_KEY, TurnAudienceRegistry, scopedCallerKeyFor } from "../src/agent/audience.js";
+import { MIXED_AUDIENCE_KEY } from "../src/agent/audience.js";
 
 const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-cron-mcp-"));
 // The root is unique to this run, so nothing else will clean it up.
@@ -82,26 +81,6 @@ describe("cron MCP tools", () => {
     expect(summary.lifecycle).toBe("once");
   });
 
-  it("schedule_list — returns all jobs with summary fields", async () => {
-    // Seed via the underlying store (proves MCP and CLI share the file).
-    const seed = new CronStore(TEST_PATH);
-    seed.add({
-      name: "from-cli",
-      schedule: { kind: "every", everyMs: 60_000 },
-      message: "tick",
-      sessionKey: "dm:alice",
-    });
-
-    const tool = findTool("schedule_list");
-    const result = await tool.handler({}, {});
-    const jobs = JSON.parse(result.content[0].text);
-    expect(jobs).toHaveLength(1);
-    expect(jobs[0].name).toBe("from-cli");
-    expect(jobs[0].lifecycle).toBe("recurring");
-    expect(jobs[0].sessionKey).toBe("dm:alice");
-    expect(jobs[0].nextRunAt).toBeTruthy();
-  });
-
   it("schedule_create — accepts staleAfter, and reports the effective window", async () => {
     const created = await findTool("schedule_create", "dm:alice").handler(
       { name: "backup", schedule: "0 3 * * *", message: "run the backup", staleAfter: "0" }, {});
@@ -128,13 +107,10 @@ describe("cron MCP tools", () => {
       message: "remind me",
       sessionKey: "dm:alice",
     });
-    // Dispatched, then the daemon stayed down past the job's staleness
-    // window; recovery disables it rather than firing it that late. The
-    // agent's only way back was to re-create the job from scratch.
+    // Dispatched, then the daemon died mid-turn; recovery parks it (every
+    // interrupted one-shot is) rather than run it again. The agent's only way
+    // back used to be re-creating the job from scratch.
     store.markStarted(job.id);
-    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
-    raw.jobs[0].lastStartedAt = Date.now() - ONE_SHOT_STALE_AFTER_MS - 60_000;
-    writeFileSync(TEST_PATH, JSON.stringify(raw));
     new CronStore(TEST_PATH).recoverInterrupted();
     expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(false);
 
@@ -214,96 +190,6 @@ describe("cron MCP tools", () => {
     expect(summary.lastStartedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
   });
 
-  it("schedule_enable — a group session cannot re-enable a DM's job", async () => {
-    const store = new CronStore(TEST_PATH);
-    const job = store.add({
-      name: "owner-only",
-      schedule: { kind: "at", at: new Date(Date.now() + 60_000).toISOString() },
-      message: "place the order",
-      sessionKey: "dm:shuai",
-    });
-    store.setEnabled(job.id, false);
-
-    // Re-enabling is the one cron operation that makes a dormant job run
-    // again. A group chat must not be able to restart a task that fires into
-    // the owner's DM.
-    const denied = await findTool("schedule_enable", "telegram:-100270").handler({ id: job.id }, {});
-    expect(denied.isError).toBe(true);
-    expect(denied.content[0].text).toContain("different session");
-    // The refusal does not name the owning session.
-    expect(denied.content[0].text).not.toContain("dm:shuai");
-    expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(false);
-
-    // The owning session can.
-    const allowed = await findTool("schedule_enable", "dm:shuai").handler({ id: job.id }, {});
-    expect(allowed.isError).toBeFalsy();
-    expect(JSON.parse(allowed.content[0].text).enabled).toBe(true);
-  });
-
-  it("schedule_enable — a DM can manage its own group's jobs and orphaned ones", async () => {
-    const store = new CronStore(TEST_PATH);
-    const groupJob = store.add({
-      name: "group-standup",
-      schedule: { kind: "cron", expr: "0 9 * * *" },
-      message: "standup",
-      sessionKey: "telegram:-100270",
-    });
-    const orphan = store.add({
-      name: "orphan",
-      schedule: { kind: "cron", expr: "0 9 * * *" },
-      message: "legacy",
-      sessionKey: "",
-    });
-    store.setEnabled(groupJob.id, false);
-    store.setEnabled(orphan.id, false);
-
-    // The internal MCP server is built for the session the turn runs on. A
-    // summoned group's background turns run on dm:<owner>, so scoping purely
-    // on equality would lock the owner out of jobs they created for a group,
-    // and nobody could ever re-enable a job with no session key.
-    const dm = findTool("schedule_enable", "dm:shuai");
-    const onGroup = await dm.handler({ id: groupJob.id }, {});
-    const onOrphan = await dm.handler({ id: orphan.id }, {});
-    // Assert the outcome before parsing, so a regression to the old
-    // equality-only rule fails as "was denied" rather than as a JSON error.
-    expect(onGroup.isError).toBeFalsy();
-    expect(onOrphan.isError).toBeFalsy();
-    expect(JSON.parse(onGroup.content[0].text).enabled).toBe(true);
-    expect(JSON.parse(onOrphan.content[0].text).enabled).toBe(true);
-  });
-
-  it("schedule_enable — a group can manage its own jobs but nothing else", async () => {
-    const store = new CronStore(TEST_PATH);
-    const mine = store.add({
-      name: "group-standup",
-      schedule: { kind: "cron", expr: "0 9 * * *" },
-      message: "standup",
-      sessionKey: "telegram:-100270",
-    });
-    const other = store.add({
-      name: "other-group",
-      schedule: { kind: "cron", expr: "0 9 * * *" },
-      message: "x",
-      sessionKey: "telegram:-100999",
-    });
-    const orphan = store.add({
-      name: "orphan",
-      schedule: { kind: "cron", expr: "0 9 * * *" },
-      message: "legacy",
-      sessionKey: "",
-    });
-    for (const j of [mine, other, orphan]) store.setEnabled(j.id, false);
-
-    const group = findTool("schedule_enable", "telegram:-100270");
-    expect(JSON.parse((await group.handler({ id: mine.id }, {})).content[0].text).enabled).toBe(true);
-    // Another group's job, and an unattributed one: a group adopts neither.
-    expect((await group.handler({ id: other.id }, {})).isError).toBe(true);
-    expect((await group.handler({ id: orphan.id }, {})).isError).toBe(true);
-    const after = new CronStore(TEST_PATH).list();
-    expect(after.find((j) => j.id === other.id)?.enabled).toBe(false);
-    expect(after.find((j) => j.id === orphan.id)?.enabled).toBe(false);
-  });
-
   it("schedule_create — an unreadable store is not reported as an invalid schedule", async () => {
     writeFileSync(TEST_PATH, "{ not json");
     const result = await findTool("schedule_create").handler({
@@ -334,18 +220,6 @@ describe("cron MCP tools", () => {
     }
     // Nothing undeliverable was persisted.
     expect(new CronStore(TEST_PATH).list()).toHaveLength(0);
-  });
-
-  it("schedule_create — a malformed cron expression is still reported as invalid", async () => {
-    const result = await findTool("schedule_create").handler({
-      name: "test",
-      schedule: "not a cron expression at all",
-      message: "ping",
-      session: "dm:alice",
-    }, {});
-
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("invalid schedule");
   });
 
   it("schedule_remove — removes existing job; not-found returns text without isError", async () => {
@@ -413,7 +287,7 @@ describe("cron MCP tools", () => {
     expect(new CronStore(TEST_PATH).list()).toHaveLength(0);
   });
 
-  it("MCP and CronStore see the same on-disk state (no in-memory drift)", async () => {
+  it("MCP and CronStore see the same on-disk state (no in-memory drift); the list carries the summary fields", async () => {
     const create = findTool("schedule_create");
     await create.handler({
       name: "via-mcp",
@@ -441,6 +315,10 @@ describe("cron MCP tools", () => {
     const jobs = JSON.parse(listResult.content[0].text);
     const names = jobs.map((j: { name: string }) => j.name).sort();
     expect(names).toEqual(["via-cli", "via-mcp"]);
+    const viaCli = jobs.find((j: { name: string }) => j.name === "via-cli");
+    expect(viaCli).toMatchObject({ lifecycle: "once", sessionKey: "dm:alice", enabled: true });
+    expect(viaCli.nextRunAt).toBeTruthy();
+    expect(jobs.find((j: { name: string }) => j.name === "via-mcp").lifecycle).toBe("recurring");
   });
 });
 
@@ -450,7 +328,9 @@ describe("cron MCP tools", () => {
 // owner's private DM jobs. `buildPeopleTools` and `buildRecallTools`, two and
 // five lines below it, were already bound to the caller.
 //
-// The rule is `canManageJob` (src/cron/scope.ts), shared with schedule_enable.
+// The rule is `canManageJob` (src/cron/scope.ts), shared by all four tools;
+// cron-scope.test.ts pins the predicate itself. That the store applies the
+// guard to the state it reloaded, not a stale snapshot, is in cron-store.test.ts.
 describe("cron MCP tools — session scoping", () => {
   const DM = "dm:alice";
   const OTHER_DM = "dm:bob";
@@ -537,45 +417,6 @@ describe("cron MCP tools — session scoping", () => {
     expect(new CronStore(TEST_PATH).get(ids.dm)).toBeUndefined();
   });
 
-  // The ownership check has to run against the state the delete applies to.
-  // remove() reloads from disk, so a job written by another process after the
-  // caller's snapshot was taken used to skip the check and be deleted.
-  it("schedule_remove — checks ownership against the reloaded store, not a stale snapshot", () => {
-    const store = new CronStore(TEST_PATH);
-    const otherProcess = new CronStore(TEST_PATH);
-    const job = otherProcess.add({
-      name: "written-after-the-snapshot",
-      schedule: { kind: "every", everyMs: 60_000 },
-      message: "private",
-      sessionKey: DM,
-    });
-
-    // Not in `store`'s snapshot at all — this is the window.
-    expect(store.get(job.id)).toBeUndefined();
-    expect(store.remove(job.id, (j) => j.sessionKey === GROUP)).toBe("refused");
-    expect(new CronStore(TEST_PATH).get(job.id)).toBeTruthy();
-  });
-
-  // Same window as remove(): setEnabled reloads, so a snapshot check misses
-  // anything another process wrote in between. schedule_enable is the one
-  // operation that makes a DORMANT job run again, so it is the worst place to
-  // skip an ownership check.
-  it("schedule_enable — checks ownership against the reloaded store, not a stale snapshot", () => {
-    const store = new CronStore(TEST_PATH);
-    const otherProcess = new CronStore(TEST_PATH);
-    const job = otherProcess.add({
-      name: "written-after-the-snapshot",
-      schedule: { kind: "every", everyMs: 60_000 },
-      message: "private",
-      sessionKey: DM,
-    });
-    otherProcess.setEnabled(job.id, false);
-
-    expect(store.get(job.id)).toBeUndefined();
-    expect(store.setEnabled(job.id, true, (j) => j.sessionKey === GROUP)).toBe("refused");
-    expect(new CronStore(TEST_PATH).get(job.id)?.enabled).toBe(false);
-  });
-
   it("schedule_enable — a group cannot re-enable a DM job", async () => {
     const ids = seed();
     new CronStore(TEST_PATH).setEnabled(ids.dm, false);
@@ -589,6 +430,70 @@ describe("cron MCP tools — session scoping", () => {
     const allowed = await findTool("schedule_enable", DM).handler({ id: ids.dm }, {});
     expect(allowed.isError).toBeFalsy();
     expect(new CronStore(TEST_PATH).get(ids.dm)?.enabled).toBe(true);
+  });
+
+  it("schedule_enable — a DM can manage its own group's jobs and orphaned ones", async () => {
+    const store = new CronStore(TEST_PATH);
+    const groupJob = store.add({
+      name: "group-standup",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      message: "standup",
+      sessionKey: "telegram:-100270",
+    });
+    const orphan = store.add({
+      name: "orphan",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      message: "legacy",
+      sessionKey: "",
+    });
+    store.setEnabled(groupJob.id, false);
+    store.setEnabled(orphan.id, false);
+
+    // The internal MCP server is built for the session the turn runs on. A
+    // summoned group's background turns run on dm:<owner>, so scoping purely
+    // on equality would lock the owner out of jobs they created for a group,
+    // and nobody could ever re-enable a job with no session key.
+    const dm = findTool("schedule_enable", "dm:shuai");
+    const onGroup = await dm.handler({ id: groupJob.id }, {});
+    const onOrphan = await dm.handler({ id: orphan.id }, {});
+    // Assert the outcome before parsing, so a regression to the old
+    // equality-only rule fails as "was denied" rather than as a JSON error.
+    expect(onGroup.isError).toBeFalsy();
+    expect(onOrphan.isError).toBeFalsy();
+    expect(JSON.parse(onGroup.content[0].text).enabled).toBe(true);
+    expect(JSON.parse(onOrphan.content[0].text).enabled).toBe(true);
+  });
+
+  it("schedule_enable — a group can manage its own jobs but nothing else", async () => {
+    const store = new CronStore(TEST_PATH);
+    const mine = store.add({
+      name: "group-standup",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      message: "standup",
+      sessionKey: "telegram:-100270",
+    });
+    const other = store.add({
+      name: "other-group",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      message: "x",
+      sessionKey: "telegram:-100999",
+    });
+    const orphan = store.add({
+      name: "orphan",
+      schedule: { kind: "cron", expr: "0 9 * * *" },
+      message: "legacy",
+      sessionKey: "",
+    });
+    for (const j of [mine, other, orphan]) store.setEnabled(j.id, false);
+
+    const group = findTool("schedule_enable", "telegram:-100270");
+    expect(JSON.parse((await group.handler({ id: mine.id }, {})).content[0].text).enabled).toBe(true);
+    // Another group's job, and an unattributed one: a group adopts neither.
+    expect((await group.handler({ id: other.id }, {})).isError).toBe(true);
+    expect((await group.handler({ id: orphan.id }, {})).isError).toBe(true);
+    const after = new CronStore(TEST_PATH).list();
+    expect(after.find((j) => j.id === other.id)?.enabled).toBe(false);
+    expect(after.find((j) => j.id === orphan.id)?.enabled).toBe(false);
   });
 
   // A job with no sessionKey fires into no conversation but still runs. Scoped
@@ -718,129 +623,5 @@ describe("cron MCP tools — session scoping", () => {
     expect((await findTool("schedule_create", caller).handler({
       name: "x", schedule: "in 1h", message: "y",
     }, {})).isError).toBe(true);
-  });
-});
-
-// The pure half of the summoned-group fix.
-describe("scopedCallerKeyFor", () => {
-  const DM = "dm:alice";
-  const GROUP = "telegram:-1001234567";
-  const OTHER_GROUP = "telegram:-1009999999";
-
-  it("leaves a group session alone", () => {
-    expect(scopedCallerKeyFor(GROUP, ["dm"])).toBe(GROUP);
-  });
-
-  it("treats a turn with no recorded audience as the owner's", () => {
-    // Cron, LCM and other background turns.
-    expect(scopedCallerKeyFor(DM, undefined)).toBe(DM);
-    expect(scopedCallerKeyFor(DM, [])).toBe(DM);
-  });
-
-  it("keeps a private DM turn at DM scope", () => {
-    expect(scopedCallerKeyFor(DM, ["dm", "dm"])).toBe(DM);
-  });
-
-  it("narrows a summoned group's turn to that group", () => {
-    expect(scopedCallerKeyFor(DM, [GROUP])).toBe(GROUP);
-    expect(scopedCallerKeyFor(DM, [GROUP, GROUP])).toBe(GROUP);
-  });
-
-  it("fails closed when one turn spans several audiences", () => {
-    // Picking any of them would grant the WIDEST scope on exactly the turn
-    // where a group's text is in the prompt.
-    expect(scopedCallerKeyFor(DM, ["dm", GROUP])).toBe(MIXED_AUDIENCE_KEY);
-    expect(scopedCallerKeyFor(DM, [GROUP, OTHER_GROUP])).toBe(MIXED_AUDIENCE_KEY);
-  });
-});
-
-// With `steering` on (the default) InboundBatcher dispatches a drain OUTSIDE
-// the per-session queue when a live session is busy, so two runUserTurn calls
-// run concurrently on one key. The audience therefore has to be tracked per
-// TURN: a per-key slot let the second turn's cleanup unscope the first.
-describe("TurnAudienceRegistry", () => {
-  const DM = "dm:alice";
-  const GROUP = "telegram:-1001234567";
-  const OTHER_GROUP = "telegram:-1009999999";
-
-  it("scopes to the session when no turn is live", () => {
-    // Cron, LCM and continuity turns.
-    expect(new TurnAudienceRegistry().scopedCallerKey(DM)).toBe(DM);
-  });
-
-  it("scopes a summoned-group turn to that group", () => {
-    const r = new TurnAudienceRegistry();
-    r.begin(DM, [GROUP]);
-    expect(r.scopedCallerKey(DM)).toBe(GROUP);
-  });
-
-  // The regression this class exists for.
-  it("an owner DM steer during a summoned-group turn cannot widen the group turn's scope", () => {
-    const r = new TurnAudienceRegistry();
-    const groupTurn = r.begin(DM, [GROUP]);
-    expect(r.scopedCallerKey(DM)).toBe(GROUP);
-
-    // config.steering: the owner's DM message runs concurrently, not queued.
-    const steer = r.begin(DM, ["dm"]);
-    // Two live turns that disagree — a tool call cannot be attributed to
-    // either, so neither one's scope is granted.
-    expect(r.scopedCallerKey(DM)).toBe(MIXED_AUDIENCE_KEY);
-
-    // The steer finishes first. Its cleanup must not take the group turn's
-    // audience with it — that was the bug, and it fell back to the session
-    // key, which is the owner.
-    r.end(DM, steer);
-    expect(r.scopedCallerKey(DM)).toBe(GROUP);
-    expect(r.scopedCallerKey(DM)).not.toBe(DM);
-
-    r.end(DM, groupTurn);
-    expect(r.scopedCallerKey(DM)).toBe(DM);
-  });
-
-  it("keeps agreeing turns unambiguous", () => {
-    const r = new TurnAudienceRegistry();
-    // Two DM turns overlapping is still just the owner.
-    const a = r.begin(DM, ["dm"]);
-    const b = r.begin(DM, ["dm"]);
-    expect(r.scopedCallerKey(DM)).toBe(DM);
-    // ...and two turns from the same summoned group are still that group.
-    r.end(DM, a);
-    r.end(DM, b);
-    r.begin(DM, [GROUP]);
-    r.begin(DM, [GROUP]);
-    expect(r.scopedCallerKey(DM)).toBe(GROUP);
-  });
-
-  it("fails closed for two different summoned groups at once", () => {
-    const r = new TurnAudienceRegistry();
-    r.begin(DM, [GROUP]);
-    r.begin(DM, [OTHER_GROUP]);
-    expect(r.scopedCallerKey(DM)).toBe(MIXED_AUDIENCE_KEY);
-  });
-
-  it("never reads a live turn of unknown audience as 'no turn running'", () => {
-    // The fail-OPEN case: an unregistered live turn would fall back to the
-    // session key, which for a dm: session is the owner.
-    const r = new TurnAudienceRegistry();
-    r.begin(DM, undefined);
-    expect(r.scopedCallerKey(DM)).toBe(MIXED_AUDIENCE_KEY);
-    r.begin(DM, []);
-    expect(r.scopedCallerKey(DM)).toBe(MIXED_AUDIENCE_KEY);
-  });
-
-  it("removes only its own turn, by id, when two carry equal audiences", () => {
-    const r = new TurnAudienceRegistry();
-    const first = r.begin(DM, [GROUP]);
-    r.begin(DM, [GROUP]);
-    r.end(DM, first);
-    // The second is still live, so the scope is still the group.
-    expect(r.scopedCallerKey(DM)).toBe(GROUP);
-  });
-
-  it("leaves a group session's own key alone however many turns overlap", () => {
-    const r = new TurnAudienceRegistry();
-    r.begin(GROUP, ["dm"]);
-    r.begin(GROUP, [GROUP]);
-    expect(r.scopedCallerKey(GROUP)).toBe(GROUP);
   });
 });

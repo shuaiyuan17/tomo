@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { log } from "../../logger.js";
 import { ownerT, type OwnerText } from "../../i18n/index.js";
 import type { SubsessionConfig } from "../../config.js";
@@ -119,7 +120,7 @@ export interface SubsessionServiceDeps {
    * Take back a note just queued whose write failed (the sender is told it
    * was not handed over, so it must not reach a turn from memory).
    */
-  withdrawPendingNote?(key: string, note: string): void;
+  withdrawPendingNote?(key: string, match: (note: string) => boolean): boolean;
   hasPendingNote(key: string, predicate: (note: string) => boolean): boolean;
   /**
    * Write the session's pending notes (queued and in flight) to disk again.
@@ -262,6 +263,19 @@ export interface SpeakResult {
   error?: string;
   via?: "direct" | "main" | "panel";
   waiting?: boolean;
+  /** task_ask: not handed over after all (input is pending that the turn has not read). */
+  withdrawn?: boolean;
+}
+
+/** Is the question standing after a transition the same one (same note) as before it? */
+function sameQuestion(before: NonNullable<SubsessionRecord["askViaMain"]>, after: SubsessionRecord["askViaMain"]): boolean {
+  if (!after) return false;
+  return before.note !== undefined || after.note !== undefined ? before.note === after.note : before.at === after.at;
+}
+
+/** A message note's name: the task, the tool, and a digest of the words. */
+function messageNoteName(id: string, kind: SpeakKind, body: string): string {
+  return `${id}:${kind}:${createHash("sha256").update(body).digest("hex").slice(0, 16)}`;
 }
 
 /** Every `subsession-message` note starts its opening tag with this. */
@@ -314,8 +328,6 @@ export class SubsessionService {
   /** Which turn is in flight, per task: a serial, so two turns that carry the same seq still differ. */
   private readonly inflightTurn = new Map<string, number>();
   private turnSerial = 0;
-  /** Names `subsession-message` notes apart within one millisecond. */
-  private messageSerial = 0;
   /**
    * task_finish refused for unread input, per task (runtime only): in how
    * many turns in a row, the last refused turn, and how much was unread then.
@@ -641,27 +653,53 @@ export class SubsessionService {
     if (record.status !== "active" && record.status !== "waiting") {
       return { ok: false, error: `task_ask needs an active task; this one is ${record.status}. Use task_reply to answer the owner, or task_reopen first.` };
     }
-    const sent = await this.speak(key, "ask", question);
-    if (!sent.ok) return sent;
-    const viaMain = sent.via === "main";
     // Input this turn does not carry — the owner's answer that arrived while
     // the question was being sent, or anything that was already waiting
     // before the ask — is pending, and its kick() found this turn running.
     // Waiting now would strand it (nothing autonomous wakes waiting(owner)),
     // so the guard, judged under the lock, keeps the task as it is and that
     // input is its next turn.
-    const asked = this.now();
-    const outcome = this.transition(record.id, "ask", {
-      reason: `asked the owner${viaMain ? " (through the main session)" : ""}: ${truncate(question.trim(), 200)}`,
-      guard: (r) => (r.pendingInput.some((i) => i.seq > (this.inflightThrough.get(r.id) ?? 0))
-        ? "input is pending that this turn does not carry" : undefined),
-      // The main session's task_message with the answer is marked as that answer.
-      ...(viaMain ? { patch: (r: SubsessionRecord) => { r.askViaMain = { at: asked, text: question.trim() }; } } : {}),
-    });
+    const guard = (r: SubsessionRecord) => (r.pendingInput.some((i) => i.seq > (this.inflightThrough.get(r.id) ?? 0))
+      ? "input is pending that this turn does not carry" : undefined);
+    if (this.deps.config().ownerMessages !== "direct") return this.askViaMain(record, question.trim(), guard);
+    const sent = await this.speak(key, "ask", question);
+    if (!sent.ok) return sent;
+    const outcome = this.transition(record.id, "ask", { reason: `asked the owner: ${truncate(question.trim(), 200)}`, guard });
     if (!outcome.ok) return { ...sent, waiting: false };
     this.continueOwed.delete(record.id);
     this.schedule();
     return { ...sent, waiting: true };
+  }
+
+  /**
+   * ownerMessages "via-main": the question's note and the wait on it go
+   * together, with no await between them. The note is written first (a task
+   * never waits on a question nobody holds); the wait then stores it
+   * (`askViaMain`, with the note's name). When the guard refuses the wait
+   * (input is pending), the note is taken back before anything reads it: the
+   * task reads that input first and asks again if it still needs to.
+   */
+  private askViaMain(record: SubsessionRecord, question: string, guard: (r: SubsessionRecord) => string | undefined): SpeakResult {
+    if (TERMINAL_STATUSES.has(record.status)) return { ok: false, error: `This task is ${record.status}; nothing more is sent.` };
+    if (!question) return { ok: false, error: "text is empty" };
+    let waiting = false;
+    const result = this.handToMain(record, "ask", question, (name, at) => {
+      const outcome = this.transition(record.id, "ask", {
+        reason: `asked the owner (through the main session): ${truncate(question, 200)}`,
+        guard,
+        // The main session's task_message with the answer is marked as that answer.
+        patch: (r) => { r.askViaMain = { at, text: question, note: name }; },
+      });
+      waiting = outcome.ok;
+      return outcome.ok;
+    });
+    if (!result.ok) return result;
+    if (!waiting) {
+      return { ok: true, via: "main", waiting: false, withdrawn: true };
+    }
+    this.continueOwed.delete(record.id);
+    this.schedule();
+    return { ...result, waiting: true };
   }
 
   private async speak(key: string, kind: SpeakKind, text: string): Promise<SpeakResult> {
@@ -672,7 +710,8 @@ export class SubsessionService {
     if (!body) return { ok: false, error: "text is empty" };
     if (this.deps.config().ownerMessages !== "direct") {
       // An answer to the owner's message from the web task panel stays there.
-      const via = (kind === "reply" || kind === "fallback") && this.answersPanel(record) ? "panel" : "main";
+      // Not one with a file: the panel shows text only, so the main session sends it.
+      const via = (kind === "reply" || kind === "fallback") && !/^\s*MEDIA:/m.test(body) && this.answersPanel(record) ? "panel" : "main";
       return via === "panel" ? this.keepInPanel(record, kind, body) : this.handToMain(record, kind, body);
     }
     const prefix = taskPrefix(record);
@@ -762,31 +801,84 @@ export class SubsessionService {
    * memory), and the task is told to try again. The owning scope is the
    * record's parentKey: a group-owned task's words go to that group's
    * session, never to the owner's DM.
+   *
+   * The note is named by its words: the same words handed over again while
+   * the first note is still unread (a retry after a failed or cut-short
+   * turn, or after an error the task was shown) add nothing.
+   *
+   * `commit` (task_ask's wait) runs right after the note is saved, with no
+   * await between; when it declines, the note is taken back and nothing is
+   * recorded.
    */
-  private handToMain(record: SubsessionRecord, kind: SpeakKind, body: string): SpeakResult {
+  private handToMain(record: SubsessionRecord, kind: SpeakKind, body: string, commit?: (name: string, at: number) => boolean): SpeakResult {
     const at = this.now();
-    const note = formatMessageNote(record, kind, body, `${record.id}:${at}-${++this.messageSerial}`);
-    let saved = false;
-    try {
-      saved = this.deps.queuePendingNote(record.parentKey, note);
-    } catch (err) {
-      log.error({ err, id: record.id }, "Could not queue a sub-session's message note");
+    const name = messageNoteName(record.id, kind, body);
+    const marker = `${MESSAGE_NOTE_MARKER} name="${name}"`;
+    const own = (n: string) => n.includes(marker);
+    const already = this.deps.hasPendingNote(record.parentKey, own);
+    if (!already) {
+      const note = formatMessageNote(record, kind, body, name);
+      let saved = false;
+      try {
+        saved = this.deps.queuePendingNote(record.parentKey, note);
+      } catch (err) {
+        log.error({ err, id: record.id }, "Could not queue a sub-session's message note");
+      }
+      if (!saved) {
+        this.withdrawMessageNote(record.parentKey, own);
+        this.markDelivery(record.id, body, false);
+        return { ok: false, error: "it could not be handed to the main session (saving it failed); try again." };
+      }
     }
-    if (!saved) {
-      this.safely(() => this.deps.withdrawPendingNote?.(record.parentKey, note), "withdraw unsaved message note");
-      this.markDelivery(record.id, body, false);
-      return { ok: false, error: "it could not be handed to the main session (saving it failed); try again." };
+    if (commit) {
+      let committed = false;
+      try {
+        committed = commit(name, at);
+      } finally {
+        // A wait that was refused or threw: the question does not stand
+        // (a note an earlier, identical ask still holds is left alone).
+        if (!committed && !already) this.withdrawMessageNote(record.parentKey, own);
+      }
+      if (!committed) return { ok: true, via: "main", withdrawn: true };
     }
     this.markDelivery(record.id, body, true);
     if (kind !== "fallback") this.spoke.add(record.id);
-    // The note is the durable copy; the record's log is for task_status and
-    // the panel (marked so the mirror does not show it twice).
-    this.safely(() => this.store.update(record.id, (r) => {
-      r.sent.push({ at, kind, text: body, via: "main" });
-      pushConversation(r, { at, from: "task", kind, text: truncate(body, CONVERSATION_TEXT_MAX), noted: true });
-    }), "record a message handed to the main session");
+    if (!already) {
+      // The note is the durable copy; the record's log is for task_status and
+      // the panel (marked so the mirror does not show it twice).
+      this.safely(() => this.store.update(record.id, (r) => {
+        r.sent.push({ at, kind, text: body, via: "main" });
+        pushConversation(r, { at, from: "task", kind, text: truncate(body, CONVERSATION_TEXT_MAX), noted: true });
+      }), "record a message handed to the main session");
+    }
     this.wakeForMessages(record.parentKey);
     return { ok: true, via: "main" };
+  }
+
+  private withdrawMessageNote(parentKey: string, match: (note: string) => boolean): boolean {
+    let found = false;
+    this.safely(() => { found = this.deps.withdrawPendingNote?.(parentKey, match) ?? false; }, "withdraw a task message note");
+    return found;
+  }
+
+  /**
+   * A task stopped waiting on a question it handed to the main session, by
+   * anything but the answer (the owner wrote to it directly, it was
+   * cancelled or failed): the question no longer stands. Its note is taken
+   * back if no turn has read it yet; otherwise the session is told, so it
+   * does not put the question to the owner.
+   */
+  private retractQuestion(record: SubsessionRecord, ask: NonNullable<SubsessionRecord["askViaMain"]>, why: string): void {
+    const marker = ask.note ? `${MESSAGE_NOTE_MARKER} name="${ask.note}"` : undefined;
+    if (marker && this.withdrawMessageNote(record.parentKey, (n) => n.includes(marker))) return;
+    this.safely(() => {
+      this.deps.queuePendingNote(record.parentKey, formatTomoEvent("subsession-message", [
+        `Sub-session ${record.id} ("${record.title}") no longer waits on its question (${why}):`,
+        truncate(ask.text, REPORT_NOTE_EXCERPT),
+        "",
+        "Don't put it to the owner now. If you already did and they answer, you may still pass it on with task_message, as information.",
+      ].join("\n"), { name: `${record.id}:retract-${ask.at}` }));
+    }, "tell the owning session a question no longer stands");
   }
 
   /** A silent turn on the owning session for its unread `subsession-message` notes. */
@@ -2146,8 +2238,20 @@ export class SubsessionService {
 
   /** Every status change: the store's compare-and-set, then the task's todo follows. */
   private transition(id: string, event: SubsessionEvent, opts: TransitionOptions = {}): TransitionOutcome {
-    const outcome = this.store.transition(id, event, opts);
+    // A question handed to the main session, which this transition may end.
+    let ask: SubsessionRecord["askViaMain"];
+    const userPatch = opts.patch;
+    const outcome = this.store.transition(id, event, {
+      ...opts,
+      patch: (r) => { ask = r.askViaMain; userPatch?.(r); },
+    });
     if (outcome.ok && outcome.changed) this.syncTodo(outcome.record);
+    // Ended by anything but the relay that answers it, or replaced by a new
+    // question: it no longer stands.
+    if (outcome.ok && ask && event !== "relay" && !sameQuestion(ask, outcome.record.askViaMain)) {
+      this.retractQuestion(outcome.record, ask, event === "owner_message" ? "the owner wrote to it directly"
+        : outcome.record.askViaMain ? "it asked a new question" : `it is ${outcome.record.status} now`);
+    }
     return outcome;
   }
 

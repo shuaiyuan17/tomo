@@ -153,13 +153,15 @@ export class PendingNotesQueue {
   }
 
   /**
-   * Take back a note still queued (not drained), e.g. one whose write just
-   * failed and whose sender is told it was not handed over: it must not
-   * reach a turn from memory after that. True when it was found queued.
+   * Take back the newest queued (not drained) note that matches, e.g. one
+   * whose write just failed and whose sender is told it was not handed over:
+   * it must not reach a turn from memory after that. True when one was
+   * found queued; one already drained into a turn is not touched.
    */
-  withdrawNote(sessionKey: string, note: string): boolean {
+  withdrawNote(sessionKey: string, match: (note: string) => boolean): boolean {
     const arr = this.queued(sessionKey);
-    const idx = arr.lastIndexOf(note);
+    let idx = arr.length - 1;
+    while (idx >= 0 && !match(arr[idx])) idx -= 1;
     if (idx < 0) return false;
     arr.splice(idx, 1);
     // Best effort: the disk never had it if its own write failed.

@@ -281,7 +281,7 @@ export interface SubsessionRecord {
    * passes it on, and its task_message with the owner's answer ends the
    * wait. The store drops it on any transition out of waiting(owner).
    */
-  askViaMain?: { at: number; text: string };
+  askViaMain?: { at: number; text: string; /** Its note's name (to take it back). */ note?: string };
   /** The newest status changes, oldest first. */
   transitions: SubsessionTransition[];
 }

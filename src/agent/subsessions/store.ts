@@ -484,11 +484,11 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
 }
 
 /** A well-formed question handed to the main session, kept only on a task waiting for the owner. */
-function parseAskViaMain(value: unknown, status: SubsessionStatus, waitingOn: unknown): { askViaMain?: { at: number; text: string } } {
+function parseAskViaMain(value: unknown, status: SubsessionStatus, waitingOn: unknown): { askViaMain?: SubsessionRecord["askViaMain"] } {
   if (status !== "waiting" || waitingOn !== "owner" || !value || typeof value !== "object") return { askViaMain: undefined };
   const v = value as Record<string, unknown>;
   if (!isTimestamp(v.at) || typeof v.text !== "string" || !v.text.trim()) return { askViaMain: undefined };
-  return { askViaMain: { at: v.at, text: v.text } };
+  return { askViaMain: { at: v.at, text: v.text, ...(typeof v.note === "string" && v.note ? { note: v.note } : {}) } };
 }
 
 /**

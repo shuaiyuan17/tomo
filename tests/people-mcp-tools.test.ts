@@ -36,27 +36,23 @@ describe("people MCP tools", () => {
     rmSync(TEST_DIR, { recursive: true, force: true });
   });
 
-  it("list_people returns records, excluding private ones for group callers", async () => {
-    writePerson(dirs.publicDir, "kevin.md", `---\nname: Kevin Wang\naliases: kw\n---\nnotes here\n`);
-    writePerson(dirs.privateDir, "secret.md", `---\nname: Secret Friend\n---\n`);
-
-    const dmList = getTool(buildPeopleTools({ includePrivate: true, dirs }), "list_people");
-    const dmResult = await dmList.handler({}, {});
-    const dmNames = (JSON.parse(dmResult.content[0].text) as Array<{ name: string }>).map((p) => p.name);
-    expect(dmNames.sort()).toEqual(["Kevin Wang", "Secret Friend"]);
-
-    const groupList = getTool(buildPeopleTools({ includePrivate: false, dirs }), "list_people");
-    const groupResult = await groupList.handler({}, {});
-    const groupNames = (JSON.parse(groupResult.content[0].text) as Array<{ name: string }>).map((p) => p.name);
-    expect(groupNames).toEqual(["Kevin Wang"]);
-  });
-
   // One MCP server is built per live session, but a dm: session's audience
   // changes turn to turn while a group is summoned into it — so the flag is a
-  // getter, resolved per call.
+  // getter, resolved per call. A plain boolean (a group session's own server)
+  // is the same switch fixed for the server's life; both forms are run here.
   it("resolves includePrivate per call, so a summoned-group turn sees no private records", async () => {
     writePerson(dirs.publicDir, "kevin.md", `---\nname: Kevin Wang\n---\n`);
     writePerson(dirs.privateDir, "secret.md", `---\nname: Secret Friend\n---\n`);
+
+    const names = async (tool: SdkTool) =>
+      (JSON.parse((await tool.handler({}, {})).content[0].text) as Array<{ name: string }>).map((p) => p.name).sort();
+    expect(await names(getTool(buildPeopleTools({ includePrivate: true, dirs }), "list_people")))
+      .toEqual(["Kevin Wang", "Secret Friend"]);
+    const groupTools = buildPeopleTools({ includePrivate: false, dirs });
+    expect(await names(getTool(groupTools, "list_people"))).toEqual(["Kevin Wang"]);
+    const groupRefused = await getTool(groupTools, "upsert_person").handler({ name: "X", replace_aliases: false, private: true }, {});
+    expect(groupRefused.isError).toBe(true);
+    expect(groupRefused.content[0].text).toContain("DM session");
 
     let ownTurn = true;
     const tools = buildPeopleTools({ includePrivate: () => ownTurn, dirs });
@@ -107,16 +103,6 @@ describe("people MCP tools", () => {
     );
     expect(updated.content[0].text).toContain("Updated person record");
     expect(updated.content[0].text).toContain("KDub");
-  });
-
-  it("upsert_person rejects the private flag for group callers", async () => {
-    const upsert = getTool(buildPeopleTools({ includePrivate: false, dirs }), "upsert_person");
-    const result = await upsert.handler(
-      { name: "X", replace_aliases: false, private: true },
-      {},
-    );
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("DM session");
   });
 
   it("upsert_person writes, canonicalizes and clears a timezone, and list_people shows it", async () => {

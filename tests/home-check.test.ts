@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { checkHomeScene, checkHomeSceneText, MAX_LISTED } from "../src/home/check.js";
-import { MAX_OBJECTS, MAX_SCENE_BYTES, type HomeScene } from "../src/home/scene.js";
+import { CONDITION, CONDITIONS, MAX_OBJECTS, MAX_SCENE_BYTES, type HomeScene } from "../src/home/scene.js";
 import { STARTER_SCENE } from "../src/home/starter.js";
 
 /** A small fixed room (not the starter, which is being redesigned elsewhere). */
@@ -17,7 +17,8 @@ function room(): HomeScene {
     characters: { tomo: { kind: "me", spot: "chair" }, visitors: { kind: "guest", spots: ["seat"] } },
   };
 }
-const check = (change: (s: any) => void, assets?: string[]) => {
+type Change = (s: any) => void;
+const check = (change: Change, assets?: string[]) => {
   const s: any = structuredClone(room());
   change(s);
   return checkHomeScene(s, assets ? { assets: new Set(assets) } : {});
@@ -30,22 +31,62 @@ const one = (change: (s: any) => void, assets?: string[]) => {
 };
 
 describe("home scene check", () => {
-  it("a good room passes with no problems or warnings; the starter passes", () => {
+  it("a good room passes with no problems or warnings", () => {
     expect(checkHomeScene(room())).toMatchObject({ ok: true, problems: [], warnings: [] });
-    expect(checkHomeScene(STARTER_SCENE).ok).toBe(true);
   });
 
-  it("schema problems name the place, by id, and say how to fix it", () => {
-    expect(one((s) => { s.objects[1].color = "red"; })).toContain('objects[1] "screen".color: "red" should be a colour written as # and six hex digits');
-    expect(one((s) => { s.objects[0].colr = "#ffffff"; })).toContain('objects[0] "desk": "colr" is not part of the scene format (did you mean "color"?)');
-    expect(one((s) => { s.objects[1].reactions[0].do = "explode"; })).toMatch(/reactions\[0\]\.do: "explode" is not a reaction; use one of show, hide/);
-    expect(one((s) => { s.objects[1].reactions[0].when = "busy"; })).toMatch(/when: "busy" should be a condition/);
-    expect(one((s) => { s.objects.push({ picture: "../memory/private/x.png" }); })).toMatch(/objects\[2\]\.picture: .* is not a picture name/);
-    expect(one((s) => { delete s.room.floor; })).toContain("room.floor is missing; add it.");
-    expect(one((s) => { s.objects[0].at = [0, 0]; })).toContain('objects[0] "desk".at must be exactly three numbers [x, y, z]; it has 2.');
-    expect(one((s) => { s.room.size = [30, 3, 6]; })).toContain("room.size[0]: 30 is too large; the most is 20.");
-    expect(one((s) => { s.kinds["Big Chair"] = { parts: [{ shape: "box" }] }; })).toContain('the name "Big Chair" should be lowercase');
-    expect(one((s) => { s.objects.push({ window: "open" }); })).toContain("window can only be true");
+  // checkHomeScene runs the schema first, so this also covers the starter
+  // being a valid scene (home-scene.test.ts used to check that separately).
+  it("the starter room passes with no problems and no warnings: it is the example Tomo learns from", () => {
+    const result = checkHomeScene(STARTER_SCENE);
+    expect(result.problems).toEqual([]);
+    expect(result.warnings).toEqual([]);
+  });
+
+  it("accepts every listed condition, its negation, and a pet mood; nothing else", () => {
+    for (const condition of CONDITIONS) { expect(CONDITION.test(condition)).toBe(true); expect(CONDITION.test(`not:${condition}`)).toBe(true); }
+    expect(CONDITION.test("pet:sleeping")).toBe(true);
+    for (const bad of ["busy", "tool:rm", "not:not:idle", "working ", "pet:", "by:anyone"]) expect(CONDITION.test(bad)).toBe(false);
+  });
+
+  it.each<[string, Change, string | RegExp]>([
+    ["a bad colour", (s) => { s.objects[1].color = "red"; }, 'objects[1] "screen".color: "red" should be a colour written as # and six hex digits'],
+    ["a misspelt key", (s) => { s.objects[0].colr = "#ffffff"; }, 'objects[0] "desk": "colr" is not part of the scene format (did you mean "color"?)'],
+    ["a reaction off the list", (s) => { s.objects[1].reactions[0].do = "explode"; }, /reactions\[0\]\.do: "explode" is not a reaction; use one of show, hide/],
+    ["a condition off the list", (s) => { s.objects[1].reactions[0].when = "busy"; }, /when: "busy" should be a condition/],
+    ["a picture path", (s) => { s.objects.push({ picture: "../memory/private/x.png" }); }, /objects\[2\]\.picture: .* is not a picture name/],
+    ["a missing field", (s) => { delete s.room.floor; }, "room.floor is missing; add it."],
+    ["a short position", (s) => { s.objects[0].at = [0, 0]; }, 'objects[0] "desk".at must be exactly three numbers [x, y, z]; it has 2.'],
+    ["a room too large", (s) => { s.room.size = [30, 3, 6]; }, "room.size[0]: 30 is too large; the most is 20."],
+    ["a kind name with capitals", (s) => { s.kinds["Big Chair"] = { parts: [{ shape: "box" }] }; }, 'the name "Big Chair" should be lowercase'],
+    ["a window that is not true", (s) => { s.objects.push({ window: "open" }); }, "window can only be true"],
+  ])("schema problems name the place, by id, and say how to fix it: %s", (_label, change, expected) => {
+    const problems = one(change);
+    if (typeof expected === "string") expect(problems).toContain(expected);
+    else expect(problems).toMatch(expected);
+  });
+
+  // Anything that is not data in the format is refused: nothing in a scene
+  // runs, so an unknown key or a value off a list is never passed through.
+  it.each<[string, Change]>([
+    ["a top-level script key", (s) => { s.script = "alert(1)"; }],
+    ["an event handler on an object", (s) => { s.objects[0].onclick = "x"; }],
+    ["a scale far past the limit", (s) => { s.objects.push({ kind: "me", scale: 50 }); }],
+    ["a format version it does not know", (s) => { s.version = 2; }],
+    ["a weather condition off the list", (s) => { s.objects[1].reactions[0].when = "weather:meteors"; }],
+    ["a room size far past the limit", (s) => { s.room.size = [200, 3, 6]; }],
+  ])("refuses %s", (_label, change) => {
+    expect(check(change).ok).toBe(false);
+  });
+
+  it.each<[string, Change]>([
+    ["a pet with mood rules", (s) => { s.spots.nest = { at: [2, 0, 2] }; s.characters.pet = { kind: "guest", spot: "seat", rules: [{ when: "pet:sleeping", spot: "nest" }] }; }],
+    ["a scaled kind", (s) => { s.objects.push({ kind: "me", scale: 1.5, at: [1, 0, 1] }); }],
+    ["a window", (s) => { s.objects.push({ window: true, size: [1.8, 1.3, 0.05], at: [-1, 1.4, -2.98] }); }],
+    ["a weather condition", (s) => { s.objects[1].reactions[0].when = "weather:rain"; }],
+    ["a flat picture", (s) => { s.objects.push({ picture: "art.png", size: [1, 1, 0.05] }); }],
+  ])("accepts %s", (_label, change) => {
+    expect(check(change)).toMatchObject({ ok: true, problems: [] });
   });
 
   it("refuses text that is not JSON without quoting it", () => {
@@ -58,17 +99,23 @@ describe("home scene check", () => {
     expect(checkHomeSceneText(JSON.stringify(room()), {}, "draft.json").ok).toBe(true);
   });
 
-  it("unknown kind, on and spot references", () => {
-    expect(one((s) => { s.objects.push({ kind: "chiar" }); })).toContain('objects[2]: kind "chiar" is not defined; add it under kinds or use one of me, guest.');
-    expect(one((s) => { s.objects[1].on = "dsk"; })).toContain('on "dsk" names no top-level object (did you mean "desk"?)');
-    expect(one((s) => { s.characters.tomo.spot = "sofa"; })).toContain('characters.tomo.spot: spot "sofa" is not defined');
-    expect(one((s) => { s.characters.tomo.rules = [{ when: "working", spot: "bed" }]; })).toContain("characters.tomo.rules[0].spot");
-    expect(one((s) => { s.characters.visitors.kind = "ghost"; })).toContain('characters.visitors.kind: kind "ghost" is not defined');
-    expect(one((s) => { s.characters.visitors.kinds = { explore: "scout" }; })).toContain("characters.visitors.kinds.explore");
-    expect(one((s) => { s.characters.visitors.overflow = "hall"; })).toContain("characters.visitors.overflow");
-    expect(one((s) => { s.characters.pet = { kind: "cat", spot: "seat" }; })).toContain('characters.pet.kind: kind "cat"');
-    expect(one((s) => { s.characters.pet = { kind: "guest", spot: "seat", rules: [{ when: "pet:sleeping", spot: "nets" }] }; }))
-      .toContain('characters.pet.rules[0].spot: spot "nets" is not defined');
+  it.each<[string, Change, string]>([
+    ["an unknown kind", (s) => { s.objects.push({ kind: "chiar" }); }, 'objects[2]: kind "chiar" is not defined; add it under kinds or use one of me, guest.'],
+    ["an unknown on", (s) => { s.objects[1].on = "dsk"; }, 'on "dsk" names no top-level object (did you mean "desk"?)'],
+    ["tomo's unknown spot", (s) => { s.characters.tomo.spot = "sofa"; }, 'characters.tomo.spot: spot "sofa" is not defined'],
+    ["tomo's rule to an unknown spot", (s) => { s.characters.tomo.rules = [{ when: "working", spot: "bed" }]; }, "characters.tomo.rules[0].spot"],
+    ["the visitors' unknown kind", (s) => { s.characters.visitors.kind = "ghost"; }, 'characters.visitors.kind: kind "ghost" is not defined'],
+    ["a visitor mode's unknown kind", (s) => { s.characters.visitors.kinds = { explore: "scout" }; }, "characters.visitors.kinds.explore"],
+    ["the visitors' unknown overflow", (s) => { s.characters.visitors.overflow = "hall"; }, "characters.visitors.overflow"],
+    ["the pet's unknown kind", (s) => { s.characters.pet = { kind: "cat", spot: "seat" }; }, 'characters.pet.kind: kind "cat"'],
+    ["the pet's rule to an unknown spot",
+      (s) => { s.characters.pet = { kind: "guest", spot: "seat", rules: [{ when: "pet:sleeping", spot: "nets" }] }; },
+      'characters.pet.rules[0].spot: spot "nets" is not defined'],
+  ])("unknown kind, on and spot references: %s", (_label, change, expected) => {
+    expect(one(change)).toContain(expected);
+  });
+
+  it("a pet rule to a known spot passes", () => {
     expect(check((s) => { s.characters.pet = { kind: "guest", spot: "seat", rules: [{ when: "pet:sleeping", spot: "chair" }] }; }).ok).toBe(true);
   });
 

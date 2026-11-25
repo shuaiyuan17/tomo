@@ -1,5 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach, afterAll, vi } from "vitest";
-import { execFileSync } from "node:child_process";
+import { describe, it, expect, beforeAll, beforeEach, afterEach, afterAll, vi } from "vitest";
+import { execFile } from "node:child_process";
 import {
   mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync,
 } from "node:fs";
@@ -31,15 +31,9 @@ vi.stubEnv("HOME", TEST_HOME);
 afterAll(() => rmSync(TEST_HOME, { recursive: true, force: true }));
 vi.resetModules();
 
-const shared = await import("../src/cli/config/shared.js");
-const { CONFIG_PATH, CONFIG_BACKUP_PATH, loadConfig, saveConfig } = shared;
-// Absent on main; the tests that need it skip themselves rather than crash.
-const backupConfigIfParseableSync = (shared as {
-  backupConfigIfParseableSync?: (p: string, b: string) => boolean;
-}).backupConfigIfParseableSync;
-// `ConfigReadError` does not exist on unchanged main; `toThrow(undefined)`
-// then degrades to "throws anything", which is the honest assertion there.
-const ConfigReadError = (shared as { ConfigReadError?: new (...a: never[]) => Error }).ConfigReadError;
+const {
+  CONFIG_PATH, CONFIG_BACKUP_PATH, ConfigReadError, backupConfigIfParseableSync, loadConfig, saveConfig,
+} = await import("../src/cli/config/shared.js");
 
 for (const [name, value] of Object.entries({ CONFIG_PATH, CONFIG_BACKUP_PATH })) {
   if (!value.startsWith(TEST_HOME + "/")) {
@@ -147,11 +141,15 @@ describe("saveConfig", () => {
   });
 });
 
-/** Run the real CLI against a throwaway $HOME and report what it printed. */
-function runConfigCli(files: { config?: string; backup?: string }): {
-  status: number; output: string; home: string; configAfter?: string; backupAfter?: string;
-} {
-  const home = mkdtempSync(join(tmpdir(), "tomo-config-cli-home-"));
+/**
+ * Run the real CLI against a throwaway $HOME and report what it printed.
+ *
+ * Asynchronous on purpose: each run is a `node --import tsx` start (1–3 s, far
+ * more under a loaded runner), and the three runs below go in parallel.
+ */
+async function runConfigCli(home: string, files: { config?: string; backup?: string }): Promise<{
+  status: number; output: string; configAfter?: string; backupAfter?: string;
+}> {
   const tomoHome = join(home, ".tomo");
   mkdirSync(tomoHome, { recursive: true });
   const cfg = join(tomoHome, "config.json");
@@ -159,10 +157,8 @@ function runConfigCli(files: { config?: string; backup?: string }): {
   if (files.config !== undefined) writeFileSync(cfg, files.config);
   if (files.backup !== undefined) writeFileSync(bak, files.backup);
 
-  let status = 0;
-  let output: string;
-  try {
-    output = execFileSync(
+  const { status, output } = await new Promise<{ status: number; output: string }>((resolve) => {
+    const child = execFile(
       process.execPath,
       ["--import", "tsx", join(REPO_ROOT, "src", "cli.ts"), "config"],
       {
@@ -174,81 +170,82 @@ function runConfigCli(files: { config?: string; backup?: string }): {
           SESSIONS_DIR: join(home, "sessions"),
         },
         encoding: "utf-8",
-        stdio: ["ignore", "pipe", "pipe"],
         timeout: 60_000,
       },
+      (err, stdout, stderr) => {
+        const code = (err as { code?: number | string } | null)?.code;
+        resolve({ status: err ? (typeof code === "number" ? code : -1) : 0, output: `${stdout}${stderr}` });
+      },
     );
-  } catch (err) {
-    const e = err as { status?: number; stdout?: string; stderr?: string };
-    status = e.status ?? -1;
-    output = `${e.stdout ?? ""}${e.stderr ?? ""}`;
-  }
+    // No input, like a closed terminal: the menu's first prompt sees EOF.
+    child.stdin?.end();
+  });
   return {
     status,
     output,
-    home,
     configAfter: existsSync(cfg) ? readFileSync(cfg, "utf-8") : undefined,
     backupAfter: existsSync(bak) ? readFileSync(bak, "utf-8") : undefined,
   };
 }
 
-describe("`tomo config` against a corrupt config", () => {
-  const homes: string[] = [];
-  afterEach(() => {
-    for (const h of homes.splice(0)) rmSync(h, { recursive: true, force: true });
-  });
+// Each `it` reads one of three CLI runs made once, in parallel, up front: the
+// spawns are the whole cost of this block, and two inputs (a corrupt config
+// with and without a .bak) serve two assertions each.
+describe("`tomo config` against a corrupt config", { timeout: 60_000 }, () => {
+  const good = JSON.stringify(GOOD_CONFIG, null, 2);
+  const root = mkdtempSync(join(tmpdir(), "tomo-config-cli-home-"));
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+  let corruptWithBak: Awaited<ReturnType<typeof runConfigCli>>;
+  let corruptOnly: Awaited<ReturnType<typeof runConfigCli>>;
+  let parses: Awaited<ReturnType<typeof runConfigCli>>;
+
+  beforeAll(async () => {
+    [corruptWithBak, corruptOnly, parses] = await Promise.all([
+      runConfigCli(join(root, "corrupt-with-bak"), { config: CORRUPT, backup: good }),
+      runConfigCli(join(root, "corrupt-only"), { config: CORRUPT }),
+      runConfigCli(join(root, "parses"), { config: good }),
+    ]);
+  }, 120_000);
 
   it("exits non-zero and touches neither the config nor its backup", () => {
-    const good = JSON.stringify(GOOD_CONFIG, null, 2);
-    const r = runConfigCli({ config: CORRUPT, backup: good });
-    homes.push(r.home);
-
-    expect(r.status).not.toBe(0);
-    expect(r.output).toContain("could not be read");
-    expect(r.configAfter).toBe(CORRUPT);
-    expect(r.backupAfter).toBe(good);
+    expect(corruptWithBak.status).not.toBe(0);
+    expect(corruptWithBak.output).toContain("could not be read");
+    expect(corruptWithBak.configAfter).toBe(CORRUPT);
+    expect(corruptWithBak.backupAfter).toBe(good);
   });
 
   it("keeps the command alive and offers only the submenus that read no config", () => {
-    const r = runConfigCli({ config: CORRUPT });
-    homes.push(r.home);
-
     // Withdrawn: every one of these is loadConfig() -> mutate -> saveConfig().
     for (const label of [
       "Anthropic authentication", "Model", "LiteLLM gateway",
       "Channels", "Owner", "Group chats", "Sessions",
     ]) {
-      expect(r.output).not.toContain(label);
+      expect(corruptOnly.output).not.toContain(label);
     }
     // Still offered: these read no config at all. The command reached the
     // menu at all, which is the point — a parse error does not end it.
-    expect(r.output).toContain("Scheduled tasks");
-    expect(r.output).toContain("Cost analysis");
-    if (process.platform === "darwin") expect(r.output).toContain("Autostart");
-    expect(r.output).toContain("Exit");
-    expect(r.status).not.toBe(0);
+    expect(corruptOnly.output).toContain("Scheduled tasks");
+    expect(corruptOnly.output).toContain("Cost analysis");
+    if (process.platform === "darwin") expect(corruptOnly.output).toContain("Autostart");
+    expect(corruptOnly.output).toContain("Exit");
+    expect(corruptOnly.status).not.toBe(0);
+    // Nothing was written in its place either.
+    expect(corruptOnly.configAfter).toBe(CORRUPT);
+    expect(corruptOnly.backupAfter).toBeUndefined();
   });
 
   it("offers the full menu and exits 0 when the config parses", () => {
-    const r = runConfigCli({ config: JSON.stringify(GOOD_CONFIG, null, 2) });
-    homes.push(r.home);
-
-    expect(r.output).toContain("Anthropic authentication");
-    expect(r.output).toContain("Owner");
-    expect(r.output).not.toContain("Identities");
-    expect(r.output).toContain("Scheduled tasks");
-    expect(r.status).toBe(0);
+    expect(parses.output).toContain("Anthropic authentication");
+    expect(parses.output).toContain("Owner");
+    expect(parses.output).not.toContain("Identities");
+    expect(parses.output).toContain("Scheduled tasks");
+    expect(parses.status).toBe(0);
   });
 
   it("names the backup to restore only when there is one", () => {
-    const withBak = runConfigCli({ config: CORRUPT, backup: JSON.stringify(GOOD_CONFIG) });
-    homes.push(withBak.home);
-    expect(withBak.output).toContain("config.json.bak");
-    expect(withBak.output).not.toContain("no backup to restore");
-
-    const withoutBak = runConfigCli({ config: CORRUPT });
-    homes.push(withoutBak.home);
-    expect(withoutBak.output).toContain("no backup to restore");
+    expect(corruptWithBak.output).toContain("config.json.bak");
+    expect(corruptWithBak.output).not.toContain("no backup to restore");
+    expect(corruptOnly.output).toContain("no backup to restore");
   });
 });
 
@@ -259,7 +256,7 @@ describe("backupConfigIfParseableSync", () => {
   it("rotates a config that parses", () => {
     const good = JSON.stringify(GOOD_CONFIG, null, 2);
     writeFileSync(CONFIG_PATH, good);
-    expect(backupConfigIfParseableSync!(CONFIG_PATH, CONFIG_BACKUP_PATH)).toBe(true);
+    expect(backupConfigIfParseableSync(CONFIG_PATH, CONFIG_BACKUP_PATH)).toBe(true);
     expect(readFileSync(CONFIG_BACKUP_PATH, "utf-8")).toBe(good);
   });
 
@@ -268,12 +265,12 @@ describe("backupConfigIfParseableSync", () => {
     writeFileSync(CONFIG_BACKUP_PATH, good);
     writeFileSync(CONFIG_PATH, CORRUPT);
 
-    expect(backupConfigIfParseableSync!(CONFIG_PATH, CONFIG_BACKUP_PATH)).toBe(false);
+    expect(backupConfigIfParseableSync(CONFIG_PATH, CONFIG_BACKUP_PATH)).toBe(false);
     expect(readFileSync(CONFIG_BACKUP_PATH, "utf-8")).toBe(good);
   });
 
   it("does nothing when there is no config yet", () => {
-    expect(backupConfigIfParseableSync!(CONFIG_PATH, CONFIG_BACKUP_PATH)).toBe(false);
+    expect(backupConfigIfParseableSync(CONFIG_PATH, CONFIG_BACKUP_PATH)).toBe(false);
     expect(existsSync(CONFIG_BACKUP_PATH)).toBe(false);
   });
 });

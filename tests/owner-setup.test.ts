@@ -14,32 +14,7 @@ import {
   type PromptPort,
 } from "../src/cli/config/owner-setup.js";
 import { isGroupAllowlistEntry } from "../src/cli/config/channels.js";
-
-const CANCEL = Symbol("cancel");
-
-/** A scripted PromptPort: answers are consumed in order, per prompt kind. */
-function scripted(answers: { text?: Array<string | symbol>; confirm?: Array<boolean | symbol>; select?: Array<string | symbol> }) {
-  const asked: string[] = [];
-  const logs: string[] = [];
-  const queue = { text: [...(answers.text ?? [])], confirm: [...(answers.confirm ?? [])], select: [...(answers.select ?? [])] };
-  const next = <T>(kind: keyof typeof queue, message: string): T => {
-    asked.push(`${kind}: ${message}`);
-    if (queue[kind].length === 0) throw new Error(`unexpected ${kind} prompt: ${message}`);
-    return queue[kind].shift() as T;
-  };
-  const port: PromptPort = {
-    text: async ({ message }) => next("text", message),
-    confirm: async ({ message }) => next("confirm", message),
-    select: async ({ message }) => next("select", message),
-    isCancel: (v: unknown): v is symbol => v === CANCEL,
-    log: {
-      info: (m) => { logs.push(`info: ${m}`); },
-      warn: (m) => { logs.push(`warn: ${m}`); },
-      success: (m) => { logs.push(`success: ${m}`); },
-    },
-  };
-  return { port, asked, logs, remaining: queue };
-}
+import { CANCEL, scriptedPrompts as scripted } from "./helpers/scripted-prompts.js";
 
 describe("checkImessageOwnerHandle (validation table)", () => {
   it.each([

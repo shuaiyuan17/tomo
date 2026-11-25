@@ -1,14 +1,19 @@
 import { describe, it, expect, vi, afterAll, beforeEach, afterEach } from "vitest";
-import { Readable } from "node:stream";
 import { join } from "node:path";
 import type { RestoreLeg } from "../src/cli/backup-restore.js";
+import { runBackupCommand, type BackupRun } from "./helpers/backup-cli.js";
 
 /**
- * Staged restore (issue #312, finding 4).
+ * `tomo backup restore`: the argument guard, the staged restore (issue #312,
+ * finding 4), and the checks that a backup cannot be swapped or redirected
+ * between validation and copy.
  *
  * Two layers: unit tests of `restoreLegsStaged`, which owns the staging and
- * the rollback, and an end-to-end run of the real `tomo backup restore` action
- * with a copy that fails part-way — the ENOSPC case the finding describes.
+ * the rollback, and end-to-end runs of the real `tomo backup restore` action —
+ * with a copy that fails part-way (the ENOSPC case the finding describes),
+ * with hostile arguments, and with a backup that changes under the prompt.
+ * The injectable `node:fs` below is inert unless a test arms it, so the
+ * end-to-end cases that need no failure run against the real filesystem.
  *
  * HERMETIC UNDER ANY VERSION OF THE CODE. `HOME` is redirected to a temp
  * directory in a hoisted block, i.e. before any module of the system under
@@ -30,6 +35,8 @@ const paths = vi.hoisted(() => {
     backups: `${home}/Backups/tomo`,
     tomoHome: `${home}/.tomo`,
     unit: `${home}/unit`,
+    /** Somewhere outside the backups root for a hostile link to point at. */
+    outside: `${home}/outside`,
     // Set by a test to make the copy of a particular leg fail.
     failCopyWhenSrcEndsWith: null as string | null,
     /** Fail the rename that parks this leg's live tree aside. */
@@ -118,7 +125,7 @@ function errno(code: string, message: string): NodeJS.ErrnoException {
   return err;
 }
 
-const { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } =
+const { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } =
   await import("node:fs");
 const actualCopy = (from: string, to: string): void => cpSync(from, to, { recursive: true, dereference: false });
 const { backupCommand, setPromptOutput } = await import("../src/cli/backup.js");
@@ -385,47 +392,9 @@ function cliFixture(): void {
   writeFileSync(join(paths.tomoHome, "config.json"), '{"from":"live"}');
 }
 
-interface RunResult { logs: string[]; errors: string[]; exitCodes: number[]; threw: Error | null; prompts: string }
-
-/** Collects what `confirm()` writes, so the prompt does not land in the
- *  middle of `npm test`'s own output. */
-function promptSink(): { stream: NodeJS.WritableStream; text: () => string } {
-  let text = "";
-  const stream = { write: (chunk: string | Uint8Array) => { text += String(chunk); return true; } };
-  return { stream: stream as unknown as NodeJS.WritableStream, text: () => text };
-}
-
-let restoreStdin: (() => void) | undefined;
-afterEach(() => { restoreStdin?.(); restoreStdin = undefined; });
-
-async function runRestore(arg: string, answer: string[] = ["y\n"]): Promise<RunResult> {
-  const original = process.stdin;
-  const fake = Readable.from(answer) as unknown as NodeJS.ReadStream;
-  Object.defineProperty(process, "stdin", { value: fake, configurable: true });
-  const sink = promptSink();
-  const originalPrompt = setPromptOutput(sink.stream);
-  restoreStdin = () => {
-    Object.defineProperty(process, "stdin", { value: original, configurable: true });
-    setPromptOutput(originalPrompt);
-  };
-
-  const logs: string[] = [];
-  const errors: string[] = [];
-  const exitCodes: number[] = [];
-  vi.spyOn(console, "log").mockImplementation((...a) => { logs.push(a.join(" ")); });
-  vi.spyOn(console, "error").mockImplementation((...a) => { errors.push(a.join(" ")); });
-  vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
-    exitCodes.push(code ?? 0);
-    throw new Error("__exit__");
-  }) as never);
-
-  let threw: Error | null = null;
-  try {
-    await backupCommand.parseAsync(["restore", arg], { from: "user" });
-  } catch (err) {
-    if ((err as Error).message !== "__exit__") threw = err as Error;
-  }
-  return { logs, errors, exitCodes, threw, prompts: sink.text() };
+/** Run the real `restore` action; `answer` is stdin for its confirmation prompt. */
+function runRestore(arg: string, answer: Iterable<string> | AsyncIterable<string> = ["y\n"]): Promise<BackupRun> {
+  return runBackupCommand(backupCommand, setPromptOutput, ["restore", arg], answer);
 }
 
 describe("tomo backup restore — a leg fails to copy", () => {
@@ -437,7 +406,8 @@ describe("tomo backup restore — a leg fails to copy", () => {
     // already deleted the live data by the time this throws.
     paths.failCopyWhenSrcEndsWith = join(VALID, "data");
 
-    const { errors, exitCodes, threw } = await runRestore(VALID);
+    // runRestore rejects if anything but process.exit escapes the command.
+    const { errors, exitCodes } = await runRestore(VALID);
 
     // THE DATA FIRST — this is the whole point. On the old code the live
     // `data/` tree has been deleted by now and is in no backup.
@@ -451,8 +421,8 @@ describe("tomo backup restore — a leg fails to copy", () => {
     expect(readFileSync(join(paths.tomoHome, "workspace", "SOUL.md"), "utf-8")).toBe("live soul");
     expect(leftovers(paths.tomoHome)).toEqual([]);
 
-    // And the failure is reported rather than thrown out of the command.
-    expect(threw).toBeNull();
+    // And the failure is reported rather than thrown out of the command (the
+    // await above would have rejected).
     expect(errors.join("\n")).toContain("Restore failed");
     expect(errors.join("\n")).toContain("ENOSPC");
     expect(exitCodes).toContain(1);
@@ -830,5 +800,194 @@ describe("tomo backup restore — rollback and leftovers, end to end", () => {
     // ...and the staged legs really are in place, which is why it is incomplete
     // rather than failed.
     expect(readFileSync(join(paths.tomoHome, "data", "restored.txt"), "utf-8")).toBe("from backup");
+  });
+});
+
+// --------------------------------------------------------------------------
+// The argument guard, and a backup that changes under the prompt
+// --------------------------------------------------------------------------
+
+/** A file only present in the backup, so a real restore is observable. */
+const restoredMarker = join(paths.tomoHome, "data", "restored.txt");
+
+/**
+ * Where `../../<VALID>` lands from the backups root: two levels up is the fake
+ * home, which is outside the root but inside our own temp tree.
+ */
+const traversalTarget = join(paths.home, VALID);
+
+/** The hostile entries the guard has to refuse, on top of cliFixture(). */
+function guardFixture(): void {
+  cliFixture();
+
+  // Somewhere outside the backups root for a link to point at.
+  mkdirSync(join(paths.outside, "data"), { recursive: true });
+  writeFileSync(join(paths.outside, "data", "loot.txt"), "attacker payload");
+
+  // A correctly-named SYMLINK to a directory outside the root. Shape check
+  // passes, existsSync passes (it follows the link), and restore would then
+  // read from there while deleting the live destinations.
+  symlinkSync(paths.outside, join(paths.backups, "2026-08-30_0200"), "dir");
+  // A correctly-named regular file, which is not restorable either.
+  writeFileSync(join(paths.backups, "2026-08-30_0300"), "not a directory");
+
+  // DECOYS so the rejection tests discriminate. Without these, `../../../X`
+  // and `/etc` are refused merely because nothing is there — the test would
+  // pass without the validation it claims to exercise. With them, only
+  // shape/containment can do the rejecting.
+  mkdirSync(join(traversalTarget, "data"), { recursive: true });
+  writeFileSync(join(traversalTarget, "data", "loot.txt"), "attacker payload");
+  mkdirSync(join(paths.backups, "etc", "data"), { recursive: true });
+  writeFileSync(join(paths.backups, "etc", "data", "loot.txt"), "attacker payload");
+}
+
+/** The line restore prints once it has accepted the argument. */
+const ACCEPTED = "Restore from:";
+
+/** Nothing of the live install was deleted, and nothing hostile copied in. */
+function expectLiveUntouched(): void {
+  expect(existsSync(liveMarker)).toBe(true);
+  expect(existsSync(join(paths.tomoHome, "data", "loot.txt"))).toBe(false);
+  expect(readFileSync(join(paths.tomoHome, "config.json"), "utf-8")).toContain("live");
+}
+
+describe("tomo backup restore — argument guard", () => {
+  beforeEach(guardFixture);
+
+  it.each([
+    ["traversal, instead of resolving it against the backups root", "../../..", null],
+    // The decoy at `traversalTarget` exists and holds a `data/` leg, so this
+    // is rejected by containment rather than by nothing being there.
+    ["a traversal that still ends in a valid-looking name", `../../${VALID}`, join(traversalTarget, "data")],
+    // `join(BACKUPS_DIR, "/etc")` is `<backups>/etc`, which the decoy makes
+    // real — so only the shape check can reject this.
+    ["an absolute path", "/etc", join(paths.backups, "etc", "data")],
+    // The shape check and existsSync both pass — the link is named exactly
+    // like a backup and resolves to a real directory. Only lstat + realpath
+    // catch it.
+    ["a correctly-named symlink pointing outside the backups root", "2026-08-30_0200", null],
+    ["a correctly-named entry that is not a directory", "2026-08-30_0300", null],
+    // Regression guard, not a discriminator: non-existence rejects this on
+    // every version. Kept so the plain missing-backup path stays covered.
+    ["a well-formed name that does not exist", "2020-01-01_0000", null],
+  ])("rejects %s", async (_label, arg, decoy) => {
+    if (decoy) expect(existsSync(decoy)).toBe(true);
+    const { logs, errors, exitCodes } = await runRestore(arg);
+    expect(logs.join("\n")).not.toContain(ACCEPTED);
+    expect(errors.join("\n")).toContain("Not a restorable backup");
+    expect(exitCodes).toContain(1);
+    expectLiveUntouched();
+  });
+
+  it("still accepts a genuine backup directory", async () => {
+    // Declines at the prompt, so nothing is restored — reaching the prompt is
+    // the assertion.
+    const { logs, exitCodes } = await runRestore(VALID, ["n\n"]);
+    expect(logs.join("\n")).toContain(ACCEPTED);
+    expect(exitCodes).not.toContain(1);
+    expect(existsSync(restoredMarker)).toBe(false);
+  });
+});
+
+// The positive control for this block (nothing swapped, every leg restored)
+// is "still restores every leg when nothing fails" above.
+describe("tomo backup restore — swapped between validation and copy", () => {
+  beforeEach(guardFixture);
+
+  it("aborts, touching nothing live, when the validated directory becomes a symlink while the prompt is pending", async () => {
+    const { errors, exitCodes } = await runRestore(VALID, (async function* () {
+      // The prompt is up and the command is parked on it. This is the window
+      // the string-based check could not see: the name still resolves, but no
+      // longer to what was validated.
+      rmSync(validDir, { recursive: true, force: true });
+      symlinkSync(paths.outside, validDir, "dir");
+      yield "y\n";
+    })());
+
+    expect(errors.join("\n")).toContain("changed while waiting for confirmation");
+    expect(exitCodes).toContain(1);
+    // The rmSync that would have deleted the live data never ran, and nothing
+    // from the attacker's tree was copied in.
+    expectLiveUntouched();
+  });
+
+  /**
+   * Replace the validated directory with a DIFFERENT ordinary directory at the
+   * same pathname. Both resolutions return the identical canonical string, so
+   * only filesystem identity separates them.
+   *
+   * Order matters: the replacement is created while the original still
+   * exists (renamed aside), so the filesystem cannot hand it the inode it just
+   * freed. ext4 reuses freed inodes eagerly, and an rm-then-mkdir swap on
+   * Linux CI produced a "new" directory with the OLD dev+ino — indistinguishable
+   * from no swap at all, which is precisely what the guard keys on.
+   */
+  it("aborts, touching nothing live, when the directory is replaced by another directory at the same path", async () => {
+    const before = statSync(validDir);
+
+    const { errors, exitCodes } = await runRestore(VALID, (async function* () {
+      const aside = `${validDir}.aside`;
+      renameSync(validDir, aside);
+      mkdirSync(join(validDir, "data"), { recursive: true });
+      writeFileSync(join(validDir, "data", "loot.txt"), "attacker payload");
+      rmSync(aside, { recursive: true, force: true });
+      yield "y\n";
+    })());
+
+    // Guard the guard: the swap is built so the replacement cannot reuse the
+    // inode. If it ever did, there would be nothing to detect and the test
+    // would pass for the wrong reason.
+    const after = statSync(validDir);
+    expect([after.dev, after.ino]).not.toEqual([before.dev, before.ino]);
+
+    expect(errors.join("\n")).toContain("changed while waiting for confirmation");
+    expect(exitCodes).toContain(1);
+    expectLiveUntouched();
+  });
+});
+
+describe("tomo backup restore — a leg of the backup is a symlink or the wrong kind", () => {
+  beforeEach(guardFixture);
+
+  it("refuses a backup whose data/ leg redirects outside the tree, before acting on any leg", async () => {
+    // dev+ino identifies the backup DIRECTORY; its children are not covered by
+    // it, and this needs no race at all — the link can predate the command.
+    // `existsSync` follows it, so the leg would be read from the link target
+    // while the matching rmSync still deleted the live one.
+    rmSync(join(validDir, "data"), { recursive: true, force: true });
+    symlinkSync(join(paths.outside, "data"), join(validDir, "data"), "dir");
+
+    const { errors, exitCodes } = await runRestore(VALID, ["y\n"]);
+
+    expect(errors.join("\n")).toContain("symlink at data");
+    expect(exitCodes).toContain(1);
+    // Refused before ANY leg was acted on, so config.json is untouched too.
+    expectLiveUntouched();
+  });
+
+  it("refuses a backup whose workspace/ leg is a regular file", async () => {
+    // No redirection needed: `existsSync` is true for a file, the live
+    // workspace would be deleted, and the file copied into its place.
+    rmSync(join(validDir, "workspace"), { recursive: true, force: true });
+    writeFileSync(join(validDir, "workspace"), "not a directory");
+
+    const { errors, exitCodes } = await runRestore(VALID, ["y\n"]);
+
+    expect(errors.join("\n")).toContain("non-directory at workspace");
+    expect(exitCodes).toContain(1);
+    // Refused before ANY leg was acted on: config.json comes first and is intact.
+    expectLiveUntouched();
+    expect(statSync(join(paths.tomoHome, "workspace")).isDirectory()).toBe(true);
+  });
+
+  it("refuses a backup whose config.json leg is a directory", async () => {
+    rmSync(join(validDir, "config.json"), { force: true });
+    mkdirSync(join(validDir, "config.json"));
+
+    const { errors, exitCodes } = await runRestore(VALID, ["y\n"]);
+
+    expect(errors.join("\n")).toContain("non-file at config.json");
+    expect(exitCodes).toContain(1);
+    expectLiveUntouched();
   });
 });

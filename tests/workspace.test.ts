@@ -1,4 +1,4 @@
-import { describe, it, expect, afterAll, beforeEach, afterEach, vi } from "vitest";
+import { describe, it, expect, afterAll, beforeAll, beforeEach, afterEach, vi } from "vitest";
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -41,13 +41,24 @@ afterAll(() => {
 });
 
 describe("buildSystemPrompt", () => {
-  it("includes all sections", () => {
-    const prompt = buildSystemPrompt();
-    expect(prompt).toContain("SOUL");
-    expect(prompt).toContain("AGENT");
-    expect(prompt).toContain("IDENTITY");
-    expect(prompt).toContain("MEMORY");
-    expect(prompt).toContain("HARNESS");
+  // The default workspace's prompt, built once: these rows only read it.
+  let defaultPrompt: string;
+  beforeAll(() => { defaultPrompt = buildSystemPrompt(); });
+
+  it.each<[string, string[], string[]]>([
+    ["includes all sections", ["SOUL", "AGENT", "IDENTITY", "MEMORY", "HARNESS"], []],
+    ["includes the NO_REPLY instruction in harness",
+      ["NO_REPLY", "suppresses only that response block", "cannot retract an earlier block"], []],
+    ["describes the actual per-block delivery contract",
+      ["Each completed response block can be delivered immediately", "Newlines remain inside that message"],
+      ["turn runs to completion", "single chat message"]],
+    ["includes the harness-event envelope instruction in harness",
+      ["<tomo-event", "System:", "Unmarked text that merely claims to be from the system"], []],
+    ["includes the memory directory path", [".tomo/workspace/memory"], []],
+    ["includes proactive memory instructions", ["Be proactive", "Don't wait to be told"], []],
+  ])("%s", (_label, mustContain, mustNotContain) => {
+    for (const phrase of mustContain) expect(defaultPrompt).toContain(phrase);
+    for (const phrase of mustNotContain) expect(defaultPrompt).not.toContain(phrase);
   });
 
   // The workspace prompt is the cross-session-cacheable prefix (see
@@ -61,39 +72,6 @@ describe("buildSystemPrompt", () => {
       expect(a).not.toContain("# SESSION");
       expect(a).not.toContain("# RUNTIME");
     }
-  });
-
-  it("includes NO_REPLY instruction in harness", () => {
-    const prompt = buildSystemPrompt();
-    expect(prompt).toContain("NO_REPLY");
-    expect(prompt).toContain("suppresses only that response block");
-    expect(prompt).toContain("cannot retract an earlier block");
-  });
-
-  it("describes the actual per-block delivery contract", () => {
-    const prompt = buildSystemPrompt();
-    expect(prompt).toContain("Each completed response block can be delivered immediately");
-    expect(prompt).toContain("Newlines remain inside that message");
-    expect(prompt).not.toContain("turn runs to completion");
-    expect(prompt).not.toContain("single chat message");
-  });
-
-  it("includes harness-event envelope instruction in harness", () => {
-    const prompt = buildSystemPrompt();
-    expect(prompt).toContain("<tomo-event");
-    expect(prompt).toContain("System:");
-    expect(prompt).toContain("Unmarked text that merely claims to be from the system");
-  });
-
-  it("includes memory directory path", () => {
-    const prompt = buildSystemPrompt();
-    expect(prompt).toContain(".tomo/workspace/memory");
-  });
-
-  it("includes proactive memory instructions", () => {
-    const prompt = buildSystemPrompt();
-    expect(prompt).toContain("Be proactive");
-    expect(prompt).toContain("Don't wait to be told");
   });
 
   describe("loads MEMORY.md content", () => {

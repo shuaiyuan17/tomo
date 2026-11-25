@@ -258,10 +258,11 @@ describe("rollup nudge cooldown persistence", () => {
     expect(fresh.nudges).toHaveLength(1);
   });
 
-  it("treats valid JSON of the wrong shape as corrupt too, not as a healthy empty store", async () => {
-    // Another version, or a `nudged` that is not a record: reading either as
-    // empty would silently re-nudge and then overwrite the file as version 1.
-    for (const wrong of ['{"version":2,"entries":{}}', '{"version":1,"nudged":[]}', '[]']) {
+  // Another version, or a `nudged` that is not a record: reading either as
+  // empty would silently re-nudge and then overwrite the file as version 1.
+  it.each(['{"version":2,"entries":{}}', '{"version":1,"nudged":[]}', "[]"])(
+    "treats valid JSON of the wrong shape (%s) as corrupt too, not as a healthy empty store",
+    async (wrong) => {
       writeFileSync(FILE, wrong);
       resetNudgeCooldownStores();
       vi.mocked(log.warn).mockClear();
@@ -270,8 +271,8 @@ describe("rollup nudge cooldown persistence", () => {
       await checkAll(runner);
       expect(nudges).toHaveLength(1);
       expect(onDisk()[KEY]).toBe(T0715);
-    }
-  });
+    },
+  );
 
   it("ignores and drops future-dated entries — a backward clock correction can't suppress for years", async () => {
     // Written by a clock that was days fast; the clock has since been fixed.

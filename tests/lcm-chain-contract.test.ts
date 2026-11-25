@@ -390,22 +390,24 @@ describe("LCM rewrite, checked by the SDK's own loader before it is published", 
     expectUntouched(f, path);
   });
 
-  it("fails closed when the loader throws, before or after staging", async () => {
-    for (const failingCall of [1, 2]) {
-      const f = buildFixture();
-      const path = writeFixture(f);
-      let calls = 0;
-      const result = await compactSessionChecked(request(f), {
-        workspaceDir: workspace,
-        loadChain: async (sid, dir) => {
-          if (++calls === failingCall) throw new Error("loader exploded");
-          return getSessionMessages(sid, { dir });
-        },
-      });
-      expect(result.success).toBe(false);
-      expect(result.error).toMatch(/loader exploded/);
-      expectUntouched(f, path);
-    }
+  // The first load reads the live session, the second the staged rewrite.
+  it.each([
+    ["before staging (the live session's read)", 1],
+    ["after staging (the staged rewrite's read)", 2],
+  ])("fails closed when the loader throws %s", async (_label, failingCall) => {
+    const f = buildFixture();
+    const path = writeFixture(f);
+    let calls = 0;
+    const result = await compactSessionChecked(request(f), {
+      workspaceDir: workspace,
+      loadChain: async (sid, dir) => {
+        if (++calls === failingCall) throw new Error("loader exploded");
+        return getSessionMessages(sid, { dir });
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/loader exploded/);
+    expectUntouched(f, path);
   });
 
   it("fails closed when the staged rewrite loads as nothing", async () => {
@@ -436,10 +438,10 @@ describe("LCM rewrite, checked by the SDK's own loader before it is published", 
     expect(readFileSync(path, "utf8")).not.toContain(sourceUuid);
   });
 
-  for (const [label, opts] of [
+  it.each([
     ["", { queuedCommandInDay1: true }],
     [" (an isMeta queued_command with the same source_uuid in the tail does not mask it)", { queuedCommandInDay1: true, metaCopyInTail: true }],
-  ] as const) it(`a removed queued_command that stays on the chain is refused${label}`, async () => {
+  ] as const)("a removed queued_command that stays on the chain is refused%s", async (_label, opts) => {
     const f = buildFixture(undefined, undefined, opts);
     const path = writeFixture(f);
     if ("metaCopyInTail" in opts) {

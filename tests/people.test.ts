@@ -1,4 +1,4 @@
-import { afterAll, describe, it, expect, beforeEach, afterEach } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach, vi, type MockInstance } from "vitest";
 import {
   annotateSenderName,
   autoBindHandle,
@@ -19,7 +19,8 @@ import {
   type PersonRecord,
 } from "../src/people.js";
 import { normalizeImessageHandle } from "../src/sessions/keys.js";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { log } from "../src/logger.js";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -446,14 +447,13 @@ describe("people store", () => {
     });
 
     it("refuses anything that is not a region identifier instead of storing it", () => {
-      // Every one of these is accepted by Intl and every one of them behaves
-      // like a stored offset — the failure the feature exists to avoid.
-      for (const bad of ["Not/AZone", "+09:00", "EST", "EST5EDT", "Etc/GMT+8", "Etc/UTC", "UTC"]) {
-        expect(
-          () => upsertPerson({ name: "Alice Example", timezone: bad }, { includePrivate: true, dirs }),
-          `${bad} should be refused`,
-        ).toThrow(/not a valid IANA time zone/);
-      }
+      // "+09:00" is accepted by Intl and behaves like a stored offset — the
+      // failure the feature exists to avoid. One value is enough here: it
+      // proves the store routes through canonicalTimeZone, whose rejection
+      // table (Etc/, legacy aliases, offsets) lives in timezone.test.ts.
+      expect(
+        () => upsertPerson({ name: "Alice Example", timezone: "+09:00" }, { includePrivate: true, dirs }),
+      ).toThrow(/not a valid IANA time zone/);
     });
 
     it("leaves the rest of the record untouched when the timezone is rejected", () => {
@@ -636,20 +636,109 @@ describe("iMessage handles: one normal form shared with sessions/keys", () => {
 describe("loadPeople strict", () => {
   const root = join(TEST_DIR, "strict");
   const strictDirs: PeopleDirs = { publicDir: join(root, "pub", "people"), privateDir: join(root, "priv", "people") };
-  afterEach(() => {
-    if (existsSync(join(root, "pub"))) chmodSync(join(root, "pub"), 0o755);
-    rmSync(root, { recursive: true, force: true });
-  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
 
   it("a missing directory is an empty roster, strict or not", () => {
     expect(loadPeople({ includePrivate: true, dirs: strictDirs, strict: true })).toEqual([]);
   });
 
-  it("an inaccessible parent (existsSync says false) throws instead of reading as nobody", () => {
-    if (process.getuid?.() === 0) return; // root reads through chmod 000
-    writePerson(strictDirs.publicDir, "kevin.md", KEVIN);
-    chmodSync(join(root, "pub"), 0o000);
-    expect(() => loadPeople({ includePrivate: false, dirs: strictDirs, strict: true })).toThrow();
+  it("an unreachable parent (existsSync says false) throws instead of reading as nobody", () => {
+    // A symlink that points at itself: every lookup through it is ELOOP, for
+    // every uid. That is the same symptom as a parent the user cannot search
+    // (EACCES; chmod 000 would not show it under root, which reads through
+    // the mode): existsSync() answers false, yet it is not "no directory".
+    mkdirSync(root, { recursive: true });
+    symlinkSync(join(root, "pub"), join(root, "pub"));
+    expect(existsSync(strictDirs.publicDir)).toBe(false);
+    expect(() => loadPeople({ includePrivate: false, dirs: strictDirs, strict: true })).toThrow(/ELOOP/);
     expect(loadPeople({ includePrivate: false, dirs: strictDirs })).toEqual([]);
+  });
+});
+
+/**
+ * A broken person file is worth one log line, not one per message.
+ *
+ * `loadPeople` runs on the inbound path — several times per message before the
+ * request-scoped snapshot, once per message after it — and every one of those
+ * loads re-read the same malformed record and re-warned about it. A single
+ * hand-edited or half-written file therefore produced a warning per message,
+ * indefinitely, and buried the log it was written to be visible in.
+ */
+describe("loadPeople — malformed person file warnings", () => {
+  const root = join(TEST_DIR, "warn-once");
+  let warn: MockInstance<typeof log.warn>;
+  beforeEach(() => { warn = vi.spyOn(log, "warn").mockImplementation(() => {}); });
+  afterEach(() => vi.restoreAllMocks());
+
+  const GOOD = "---\nname: Kevin Wang\n---\n\nNotes.\n";
+
+  /** Fresh directories per test — the memo is keyed by path and lives for the
+   *  process, so two tests sharing a filename would be testing each other. */
+  function dirsFor(id: string): PeopleDirs {
+    const publicDir = join(root, id, "people");
+    mkdirSync(publicDir, { recursive: true });
+    return { publicDir, privateDir: join(root, id, "private", "people") };
+  }
+
+  function warningsMatching(needle: string): unknown[][] {
+    return warn.mock.calls.filter((call) => String(call[1] ?? "").includes(needle));
+  }
+
+  it("warns once per process, not once per load", () => {
+    const dirs = dirsFor("repeat");
+    writeFileSync(join(dirs.publicDir, "torn.md"), "no frontmatter here\n", "utf-8");
+
+    for (let i = 0; i < 5; i++) loadPeople({ includePrivate: false, dirs });
+
+    expect(warningsMatching("no usable frontmatter")).toHaveLength(1);
+  });
+
+  it("names a torn record and still loads the records around it on every load", () => {
+    const dirs = dirsFor("around");
+    // Exactly what a truncated write leaves: an opening fence and half a
+    // frontmatter. `parsePersonFile` returns undefined, and without the
+    // warning the person would stop being recognised with nothing saying why.
+    writeFileSync(join(dirs.publicDir, "torn.md"), "---\nname: Ke", "utf-8");
+    writeFileSync(join(dirs.publicDir, "kevin.md"), GOOD, "utf-8");
+
+    expect(loadPeople({ includePrivate: false, dirs }).map((p) => p.name)).toEqual(["Kevin Wang"]);
+    expect(loadPeople({ includePrivate: false, dirs })).toHaveLength(1);
+    const warned = warningsMatching("no usable frontmatter");
+    expect(warned).toHaveLength(1);
+    expect(warned[0][0]).toMatchObject({ filePath: join(dirs.publicDir, "torn.md") });
+  });
+
+  it("warns again after the file is repaired and broken a second time", () => {
+    const dirs = dirsFor("repaired");
+    const path = join(dirs.publicDir, "kevin.md");
+
+    writeFileSync(path, "torn\n", "utf-8");
+    loadPeople({ includePrivate: false, dirs });
+    loadPeople({ includePrivate: false, dirs });
+    expect(warningsMatching("no usable frontmatter")).toHaveLength(1);
+
+    // Repaired: the memo for this path is cleared by a load that parses it.
+    writeFileSync(path, GOOD, "utf-8");
+    expect(loadPeople({ includePrivate: false, dirs })).toHaveLength(1);
+
+    // Broken again — a new fact, said again rather than swallowed for the life
+    // of the daemon.
+    writeFileSync(path, "torn again\n", "utf-8");
+    loadPeople({ includePrivate: false, dirs });
+    loadPeople({ includePrivate: false, dirs });
+    expect(warningsMatching("no usable frontmatter")).toHaveLength(2);
+  });
+
+  it("warns once per file, so two broken records are both named", () => {
+    const dirs = dirsFor("two");
+    writeFileSync(join(dirs.publicDir, "a.md"), "torn\n", "utf-8");
+    writeFileSync(join(dirs.publicDir, "b.md"), "torn\n", "utf-8");
+
+    loadPeople({ includePrivate: false, dirs });
+    loadPeople({ includePrivate: false, dirs });
+
+    const paths = warningsMatching("no usable frontmatter")
+      .map((call) => (call as [{ filePath: string }, string])[0].filePath);
+    expect(paths.sort()).toEqual([join(dirs.publicDir, "a.md"), join(dirs.publicDir, "b.md")]);
   });
 });

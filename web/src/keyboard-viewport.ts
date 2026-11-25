@@ -8,10 +8,14 @@
  * app to the visual viewport (`--app-height`) puts the composer above the
  * keyboard on its own, and any scroll Safari did anyway is put back, so the
  * top bar stays where it is and only the chat above the composer gives way.
- * Safari can also pan the visual viewport inside the layout viewport with the
- * document unscrolled; the shell follows that pan (`--vv-top`, a transform),
- * which also makes it the containing block of the fixed layers (the Tasks
- * overlay, the Home chat panel, scrims), so they end at the keyboard too.
+ *
+ * While the keyboard is up (or Safari has panned the visual viewport inside
+ * the layout viewport with the document unscrolled) the shell carries a
+ * transform (`--app-shift`): it follows the pan, and it becomes the containing
+ * block of the fixed layers inside it (the Tasks overlay, the Home chat panel,
+ * scrims, the Screen window), so they end at the keyboard too. Only then: a
+ * transformed ancestor would otherwise clip fixed layers under an overflow
+ * (the image lightbox is portalled to <body> for that reason as well).
  *
  * Nothing here touches focus. While an IME is composing (Chinese, Japanese)
  * the scroll reset waits for `compositionend`, so the candidate window is not
@@ -24,10 +28,12 @@ export interface KeyboardViewportDeps {
   win: { scrollX: number; scrollY: number; scrollTo(x: number, y: number): void };
   frame: (callback: () => void) => number;
   cancelFrame: (handle: number) => void;
+  /** The layout viewport's height, which the keyboard does not change. */
+  layoutHeight: () => number;
 }
 
 export const APP_HEIGHT_VAR = "--app-height";
-export const VIEWPORT_TOP_VAR = "--vv-top";
+export const APP_SHIFT_VAR = "--app-shift";
 
 export function trackKeyboardViewport(deps: Partial<KeyboardViewportDeps> = {}): () => void {
   const viewport = deps.viewport === undefined ? (typeof window === "undefined" ? undefined : window.visualViewport) : deps.viewport;
@@ -37,9 +43,10 @@ export function trackKeyboardViewport(deps: Partial<KeyboardViewportDeps> = {}):
   const win = deps.win ?? window;
   const frame = deps.frame ?? ((callback) => requestAnimationFrame(callback));
   const cancelFrame = deps.cancelFrame ?? ((handle) => cancelAnimationFrame(handle));
+  const layoutHeight = deps.layoutHeight ?? (() => document.documentElement.clientHeight);
 
   let composing = false;
-  const clear = () => { root.style.removeProperty(APP_HEIGHT_VAR); root.style.removeProperty(VIEWPORT_TOP_VAR); };
+  const clear = () => { root.style.removeProperty(APP_HEIGHT_VAR); root.style.removeProperty(APP_SHIFT_VAR); };
   let pending: number | undefined;
   const settle = () => {
     pending = undefined;
@@ -51,8 +58,9 @@ export function trackKeyboardViewport(deps: Partial<KeyboardViewportDeps> = {}):
     // Whatever pan is left (Safari's own, or a scroll kept during composition)
     // the shell follows, so the top bar stays at the top of what is visible.
     const top = Math.max(0, Math.round(viewport.offsetTop + win.scrollY));
-    if (top) root.style.setProperty(VIEWPORT_TOP_VAR, `${top}px`);
-    else root.style.removeProperty(VIEWPORT_TOP_VAR);
+    const covered = layoutHeight() - viewport.height > 1;
+    if (top || covered) root.style.setProperty(APP_SHIFT_VAR, `translate(0, ${top}px)`);
+    else root.style.removeProperty(APP_SHIFT_VAR);
   };
   const schedule = () => { if (pending === undefined) pending = frame(settle); };
   const start = () => { composing = true; };

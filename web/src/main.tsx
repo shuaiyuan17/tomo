@@ -143,7 +143,7 @@ export function App() {
     else setStudy(target === "conversation" ? null : study ?? "todos");
   };
   const skipTarget = study ? "study" : home ? "home" : "conversation";
-  return <AgentNameContext.Provider value={agent}><div data-app-shell className="flex h-[var(--app-height,100dvh)] [transform:translateY(var(--vv-top,0px))] flex-col">
+  return <AgentNameContext.Provider value={agent}><div data-app-shell className="flex h-[var(--app-height,100dvh)] [transform:var(--app-shift,none)] flex-col">
     <a className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-card focus:p-3" href={`#${skipTarget}`} onClick={(e) => { e.preventDefault(); document.getElementById(skipTarget)?.focus(); }}>{study ? t("skip.to", { target: studyLabel(study) }) : home ? t("skip.home") : t("skip.conversation")}</a>
     <AppHeader headerRef={header} view={view} connection={web.connection}
       phoneTitle={home ? t("nav.home") : !study && session?.kind === "group" ? session.title : undefined}

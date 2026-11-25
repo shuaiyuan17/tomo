@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { APP_HEIGHT_VAR, VIEWPORT_TOP_VAR, trackKeyboardViewport } from "../web/src/keyboard-viewport.js";
+import { APP_HEIGHT_VAR, APP_SHIFT_VAR, trackKeyboardViewport } from "../web/src/keyboard-viewport.js";
 
 function fakePage(height = 834) {
   const viewport = Object.assign(new EventTarget(), { height, offsetTop: 0, scale: 1 });
@@ -11,13 +11,15 @@ function fakePage(height = 834) {
   const frames: Array<() => void> = [];
   const flush = () => { while (frames.length) frames.shift()!(); };
   const stop = trackKeyboardViewport({ viewport: viewport as never, doc: doc as never, root: root as never, win,
-    frame: (cb) => frames.push(cb), cancelFrame: () => { frames.length = 0; } });
+    frame: (cb) => frames.push(cb), cancelFrame: () => { frames.length = 0; }, layoutHeight: () => height });
   return { viewport, doc, vars, win, scrolls, flush, stop };
 }
 
 it("sizes the app to the visible area and puts back the scroll Safari does for the keyboard", () => {
   const page = fakePage();
   expect(page.vars.get(APP_HEIGHT_VAR)).toBe("834px");
+  // No keyboard: no transform on the shell (it would clip fixed layers under an overflow).
+  expect(page.vars.has(APP_SHIFT_VAR)).toBe(false);
   // Keyboard up: the visual viewport shrinks and Safari scrolls the document.
   page.viewport.height = 434.4;
   page.win.scrollY = 400;
@@ -27,12 +29,14 @@ it("sizes the app to the visible area and puts back the scroll Safari does for t
   expect(page.vars.get(APP_HEIGHT_VAR)).toBe("434px");
   expect(page.win.scrollY).toBe(0);
   expect(page.scrolls).toEqual([[0, 0]]);
-  expect(page.vars.has(VIEWPORT_TOP_VAR)).toBe(false);
+  // The shell becomes the fixed layers' containing block, so they end at the keyboard.
+  expect(page.vars.get(APP_SHIFT_VAR)).toBe("translate(0, 0px)");
   // Keyboard down.
   page.viewport.height = 834;
   page.viewport.dispatchEvent(new Event("resize"));
   page.flush();
   expect(page.vars.get(APP_HEIGHT_VAR)).toBe("834px");
+  expect(page.vars.has(APP_SHIFT_VAR)).toBe(false);
 });
 
 it("leaves the scroll alone while an IME is composing, and settles on compositionend", () => {
@@ -45,11 +49,11 @@ it("leaves the scroll alone while an IME is composing, and settles on compositio
   expect(page.vars.get(APP_HEIGHT_VAR)).toBe("380px");
   expect(page.scrolls).toEqual([]);
   // The shell follows the kept scroll meanwhile, so the top bar stays in view.
-  expect(page.vars.get(VIEWPORT_TOP_VAR)).toBe("120px");
+  expect(page.vars.get(APP_SHIFT_VAR)).toBe("translate(0, 120px)");
   page.doc.dispatchEvent(new Event("compositionend"));
   page.flush();
   expect(page.scrolls).toEqual([[0, 0]]);
-  expect(page.vars.has(VIEWPORT_TOP_VAR)).toBe(false);
+  expect(page.vars.get(APP_SHIFT_VAR)).toBe("translate(0, 0px)");
 });
 
 it("follows a pan of the visual viewport that left the document unscrolled", () => {
@@ -59,12 +63,12 @@ it("follows a pan of the visual viewport that left the document unscrolled", () 
   page.viewport.dispatchEvent(new Event("scroll"));
   page.flush();
   expect(page.scrolls).toEqual([]);
-  expect(page.vars.get(VIEWPORT_TOP_VAR)).toBe("300px");
+  expect(page.vars.get(APP_SHIFT_VAR)).toBe("translate(0, 300px)");
   page.viewport.offsetTop = 0;
   page.viewport.height = 834;
   page.viewport.dispatchEvent(new Event("resize"));
   page.flush();
-  expect(page.vars.has(VIEWPORT_TOP_VAR)).toBe(false);
+  expect(page.vars.has(APP_SHIFT_VAR)).toBe(false);
 });
 
 it("does nothing to a pinch-zoomed page, and cleans up when stopped", () => {
@@ -78,7 +82,7 @@ it("does nothing to a pinch-zoomed page, and cleans up when stopped", () => {
   page.viewport.dispatchEvent(new Event("scroll"));
   page.flush();
   expect(page.vars.has(APP_HEIGHT_VAR)).toBe(false);
-  expect(page.vars.has(VIEWPORT_TOP_VAR)).toBe(false);
+  expect(page.vars.has(APP_SHIFT_VAR)).toBe(false);
   expect(page.scrolls).toEqual([]);
   page.viewport.scale = 1;
   page.stop();

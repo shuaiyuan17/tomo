@@ -119,7 +119,7 @@ export function ScreenWindow({ bootstrap, refresh, live, compact, onClose }: {
     onKeyDown={(event) => { if (event.key === "Escape" && !document.fullscreenElement) { event.stopPropagation(); onClose(); } }}
     style={compact ? undefined : { left: geometry.x, top: geometry.y, width: geometry.width, height: windowHeight(geometry.width) }}
     className={cn("fixed z-40 flex flex-col overflow-hidden border bg-card shadow-2xl outline-none",
-      compact ? "inset-x-0 bottom-0 max-h-[70dvh] rounded-t-2xl border-b-0 pb-[env(safe-area-inset-bottom)] animate-in slide-in-from-bottom-4" : "rounded-2xl")}>
+      compact ? "inset-x-0 bottom-0 max-h-[calc(var(--app-height,100dvh)*0.7)] rounded-t-2xl border-b-0 pb-[env(safe-area-inset-bottom)] animate-in slide-in-from-bottom-4" : "rounded-2xl")}>
     <div onPointerDown={track("move")} style={compact ? undefined : { height: TITLE_BAR }}
       className={cn("flex shrink-0 items-center gap-2 border-b px-3 select-none", compact ? "h-12" : "cursor-grab active:cursor-grabbing")}>
       <i className={cn("size-1.5 shrink-0 rounded-full border border-muted-foreground", streaming && frame?.status === "live" && "border-primary bg-primary")} />
@@ -139,7 +139,7 @@ export function ScreenWindow({ bootstrap, refresh, live, compact, onClose }: {
       className="relative flex min-h-0 flex-1 items-center justify-center bg-black/[0.04] dark:bg-black/30 [&:fullscreen]:bg-black">
       {image ? <img src={image.src} alt={i18n.t("screen:alt")} draggable={false}
         title={i18n.t("screen:permissionHint")}
-        className={cn("block max-h-full max-w-full object-contain", compact && "max-h-[calc(70dvh-48px)]", (stale || paused) && "opacity-50 grayscale")} />
+        className={cn("block max-h-full max-w-full object-contain", compact && "max-h-[calc(var(--app-height,100dvh)*0.7-48px)]", (stale || paused) && "opacity-50 grayscale")} />
         : <p className="m-0 px-6 py-10 text-center text-[13px] text-muted-foreground">{frame && frame.status !== "live" ? i18n.t(NOTICE[frame.status]) : paused ? i18n.t("screen:pausedNote") : errorText || i18n.t("screen:waiting")}</p>}
       {image && (stale || paused) && <span className="absolute top-2 left-2 max-w-[calc(100%-1rem)] rounded-lg bg-card/90 px-2 py-1 text-[11px] text-foreground shadow-sm">
         {i18n.t("screen:lastPicture", { state: stale ? i18n.t(NOTICE[frame!.status as Exclude<WebScreenFrame["status"], "live">]) : i18n.t("screen:status.paused"), age: pictureAge(image.capturedAt, now) })}</span>}

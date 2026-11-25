@@ -1970,10 +1970,10 @@ describe("SubsessionService: task_finish never leaves input unread", () => {
     expect(results.map((r) => r.ok)).toEqual([false, false, false, false, false, false, true]);
   });
 
-  it("a refusal streak starts over when the unread count goes down", async () => {
+  it("a refused turn with less unread than the last does not count, and alternating cannot refuse forever", async () => {
     const results: Array<{ ok: boolean }> = [];
-    // Unread per turn: 2, 2, 1 (down: streak back to 1), 1, 1, then forced.
-    const arrivals = [2, 2, 1, 1, 1, 1, 0];
+    // Unread per turn: 2, 1, 2, 1, 2 — counted 1, (not), 2, (not), 3; then forced.
+    const arrivals = [2, 1, 2, 1, 2, 1, 0];
     const h = harness({}, working((turn, hh) => {
       const k = hh.turns.length - 1;
       for (let i = 0; i < arrivals[k]; i++) hh.service.relay("s1", `r${k}.${i}`);
@@ -1983,6 +1983,24 @@ describe("SubsessionService: task_finish never leaves input unread", () => {
     spawn(h);
     await flush();
     expect(results.map((r) => r.ok)).toEqual([false, false, false, false, false, true]);
+  });
+
+  it("a retry in the same turn that sees more unread does not reset the streak next turn", async () => {
+    const results: Array<{ ok: boolean }> = [];
+    // Each turn: refused with 1 unread, one more lands, retried (2 unread).
+    const h = harness({}, working((turn, hh) => {
+      const k = hh.turns.length;
+      if (k > 4) return;
+      hh.service.relay("s1", `a${k}`);
+      results.push(hh.service.finish(turn.key, "done") as { ok: boolean });
+      if (k === 4) return;
+      hh.service.relay("s1", `b${k}`);
+      results.push(hh.service.finish(turn.key, "done") as { ok: boolean });
+    }));
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(results.map((r) => r.ok)).toEqual([false, false, false, false, false, false, true]);
   });
 
   it("once three refused turns in a row are done, the next finish goes through even if less is unread", async () => {

@@ -709,8 +709,8 @@ export class SubsessionService {
    * not carry (it arrived after the turn started, so the task has never seen
    * it): finishing would leave it unread. The task stays as it is, and that
    * input is its next turn. Judged under the lock, like task_ask. After
-   * MAX_FINISH_REFUSALS refused turns in a row with the unread count never
-   * going down (a drop starts the count over), the next turn finishes anyway: the unread input is quoted in the report
+   * MAX_FINISH_REFUSALS refused turns in a row whose unread count did not
+   * go down (a turn with less unread does not count), the next turn finishes anyway: the unread input is quoted in the report
    * and stays pending, answered like any input to a finished task.
    * Outside a turn of its own (no task calls a tool there) nothing is refused.
    */
@@ -753,8 +753,12 @@ export class SubsessionService {
     if (!outcome.ok) {
       if (!outcome.refused || turn === undefined || unread.length === 0) return outcome;
       const prev = this.finishRefusals.get(id);
-      const turns = !prev ? 1 : prev.turn === turn ? prev.turns : unread.length < prev.unread ? 1 : prev.turns + 1;
-      this.finishRefusals.set(id, { turns, turn, unread: unread.length });
+      // A retry in the same turn changes nothing: the turn counts once, with what its first refusal saw.
+      // A turn with less unread than the last refused one does not count
+      // (it is getting through it), but does not start over either: drops
+      // in a row are bounded by the count, so the streak still ends.
+      const turns = !prev ? 1 : prev.turn === turn || unread.length < prev.unread ? prev.turns : prev.turns + 1;
+      if (prev?.turn !== turn) this.finishRefusals.set(id, { turns, turn, unread: unread.length });
       log.info({ id, unread: unread.length, turns }, "Sub-session task_finish refused: input it has not read is pending");
       return { ...outcome, unread: unread.length };
     }

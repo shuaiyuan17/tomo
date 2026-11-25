@@ -14,8 +14,9 @@
  * transform (`--app-shift`): it follows the pan, and it becomes the containing
  * block of the fixed layers inside it (the Tasks overlay, the Home chat panel,
  * scrims, the Screen window), so they end at the keyboard too. Only then: a
- * transformed ancestor would otherwise clip fixed layers under an overflow
- * (the image lightbox is portalled to <body> for that reason as well).
+ * transformed ancestor clips fixed layers under an overflow, such as the
+ * image lightbox in the chat; opening it moves focus off the field, which
+ * puts the keyboard, and so the transform, away.
  *
  * Nothing here touches focus. While an IME is composing (Chinese, Japanese)
  * the scroll reset waits for `compositionend`, so the candidate window is not

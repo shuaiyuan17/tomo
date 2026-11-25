@@ -10,7 +10,7 @@ import { WebData } from "../src/web/data.js";
 import { WebChannel } from "../src/channels/web.js";
 import { SessionStore } from "../src/sessions/store.js";
 import type { WebBootstrap } from "../src/web/protocol.js";
-import { clampGeometry, defaultGeometry, MAX_WIDTH, MIN_WIDTH, parseScreenEvent, readGeometry, readScreen, streamWanted, updatedAgo, windowHeight, writeGeometry } from "../web/src/screen-stream.js";
+import { clampGeometry, defaultGeometry, keptAboveKeyboard, MAX_WIDTH, MIN_WIDTH, parseScreenEvent, readGeometry, readScreen, streamWanted, updatedAgo, windowHeight, writeGeometry } from "../web/src/screen-stream.js";
 
 /** `capture` counts real pictures taken; `shoot` is the source's one call (lock check, then picture if unlocked). */
 function fakeSource(state: ConsoleState = "unlocked") {
@@ -330,4 +330,8 @@ describe("floating window", () => {
       expect(aborted).toBe(true);
     } finally { globalThis.fetch = original; }
   });
+});
+
+it("keeps the floating Screen window above the iOS keyboard without moving its stored place", () => {
+  expect(keptAboveKeyboard(600, 260)).toBe("max(0px, min(600px, calc(var(--app-height, 100dvh) - 260px)))");
 });

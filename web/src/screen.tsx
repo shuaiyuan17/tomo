@@ -5,7 +5,7 @@ import { ApiError, type WebBootstrap } from "./api.js";
 import { Button } from "@/components/ui/button";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { cn } from "@/lib/utils";
-import { clampGeometry, pictureAge, readGeometry, readScreen, SCREEN_RATES, streamWanted, TITLE_BAR, updatedAgo, windowHeight, writeGeometry,
+import { clampGeometry, keptAboveKeyboard, pictureAge, readGeometry, readScreen, SCREEN_RATES, streamWanted, TITLE_BAR, updatedAgo, windowHeight, writeGeometry,
   type ScreenGeometry, type ScreenRate } from "./screen-stream.js";
 import { i18n } from "./i18n/index.js";
 
@@ -117,7 +117,7 @@ export function ScreenWindow({ bootstrap, refresh, live, compact, onClose }: {
   const iconButton = "size-7 rounded-lg text-muted-foreground hover:bg-foreground/[0.07] hover:text-foreground [&_svg:not([class*='size-'])]:size-4";
   return <div ref={root} id="screen-window" role="dialog" aria-label={i18n.t("screen:label")} tabIndex={-1}
     onKeyDown={(event) => { if (event.key === "Escape" && !document.fullscreenElement) { event.stopPropagation(); onClose(); } }}
-    style={compact ? undefined : { left: geometry.x, top: geometry.y, width: geometry.width, height: windowHeight(geometry.width) }}
+    style={compact ? undefined : { left: geometry.x, top: keptAboveKeyboard(geometry.y, windowHeight(geometry.width)), width: geometry.width, height: windowHeight(geometry.width) }}
     className={cn("fixed z-40 flex flex-col overflow-hidden border bg-card shadow-2xl outline-none",
       compact ? "inset-x-0 bottom-0 max-h-[calc(var(--app-height,100dvh)*0.7)] rounded-t-2xl border-b-0 pb-[env(safe-area-inset-bottom)] animate-in slide-in-from-bottom-4" : "rounded-2xl")}>
     <div onPointerDown={track("move")} style={compact ? undefined : { height: TITLE_BAR }}

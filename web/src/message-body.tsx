@@ -1,5 +1,4 @@
 import { memo, useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { FileIcon, ImageIcon, X } from "lucide-react";
 import { Text } from "./markdown.js";
 import { splitMessage } from "./attachments.js";
@@ -98,13 +97,12 @@ function Lightbox({ src, onClose }: { src: string; onClose: () => void }) {
     document.addEventListener("keydown", onKey);
     return () => { document.removeEventListener("keydown", onKey); previous?.focus(); };
   }, [onClose]);
-  // On <body>: inside the chat, a transformed or masked ancestor would clip it (keyboard-viewport.ts).
-  return createPortal(<div role="dialog" aria-modal="true" aria-label={i18n.t("chat:image.alt")} onClick={onClose}
+  return <div role="dialog" aria-modal="true" aria-label={i18n.t("chat:image.alt")} onClick={onClose}
     className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6 animate-in fade-in-0">
     <button ref={close} type="button" aria-label={i18n.t("chat:image.close")} onClick={onClose}
       className="absolute top-4 right-4 grid size-10 place-items-center rounded-xl bg-black/40 text-white hover:bg-black/60"><X className="size-5" /></button>
     <img src={src} alt={i18n.t("chat:image.alt")} onClick={(e) => e.stopPropagation()} className="max-h-[90vh] max-w-[92vw] rounded-lg object-contain shadow-2xl" />
-  </div>, document.body);
+  </div>;
 }
 
 /** The message a reply quotes: one or two muted lines; clickable when the original is in view. */

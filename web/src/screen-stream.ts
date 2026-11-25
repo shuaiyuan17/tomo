@@ -88,6 +88,15 @@ const COMPOSER_CLEARANCE = 168;
 
 export function windowHeight(width: number): number { return Math.round(width * 10 / 16) + TITLE_BAR; }
 
+/**
+ * The window's CSS `top`: where it was put, but never lower than fits above
+ * the iOS keyboard (`--app-height`, keyboard-viewport.ts), nor above the top.
+ * The stored geometry is left as it was, so it comes back when the keyboard goes.
+ */
+export function keptAboveKeyboard(top: number, height: number): string {
+  return `max(0px, min(${top}px, calc(var(--app-height, 100dvh) - ${height}px)))`;
+}
+
 /** Width / position pulled back inside the viewport (and the size limits). */
 export function clampGeometry(geometry: ScreenGeometry, viewport: Viewport): ScreenGeometry {
   const maxWidth = Math.max(MIN_WIDTH, Math.min(MAX_WIDTH, viewport.width - 2 * MARGIN, (viewport.height - 2 * MARGIN - TITLE_BAR) * 16 / 10));

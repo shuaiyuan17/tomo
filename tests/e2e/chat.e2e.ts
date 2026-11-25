@@ -519,8 +519,11 @@ it("renders channel images as thumbnails (never the path), keeps line breaks, an
   await browserExpect(page.getByRole("dialog", { name: "Image" })).toBeVisible();
   // The overlay covers the window: no row or scroller contains it (paint/layout containment would).
   expect(await page.getByRole("dialog", { name: "Image" }).evaluate((el) => { const r = el.getBoundingClientRect(); return [r.width === innerWidth, r.height === innerHeight]; })).toEqual([true, true]);
-  // It lives on <body>: the app shell is transformed while the iOS keyboard is up (keyboard-viewport.ts), which would clip it under the scroller.
-  expect(await page.getByRole("dialog", { name: "Image" }).evaluate((el) => el.parentElement === document.body)).toBe(true);
+  // No ancestor carries a transform either (the shell only does while the iOS keyboard is up, keyboard-viewport.ts).
+  expect(await page.getByRole("dialog", { name: "Image" }).evaluate((el) => {
+    for (let a = el.parentElement; a; a = a.parentElement) if (getComputedStyle(a).transform !== "none") return a.tagName;
+    return null;
+  })).toBeNull();
   // Nor is it clipped by an ancestor's mask or clip-path (a mask on the scroller once hid its backdrop and Close button).
   expect(await page.getByRole("dialog", { name: "Image" }).evaluate((el) => {
     const clipped: string[] = [];

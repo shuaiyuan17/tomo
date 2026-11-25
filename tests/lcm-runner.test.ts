@@ -125,7 +125,7 @@ describe("which period a tick nudges", () => {
     }
   });
 
-  it("the next tick, past the cooldown, picks the next one", async () => {
+  it("the next tick skips the armed period and picks the next one", async () => {
     fixture.due = [
       { level: "daily", period: "2026-08-26", childCount: 5 },
       { level: "daily", period: "2026-08-27", childCount: 5 },

@@ -286,6 +286,29 @@ describe("config file validation", () => {
     expect(configIssues.join("\n")).toContain("identities[2]");
   });
 
+  // The legacy shape through the REAL parse: owner.test.ts calls resolveOwner
+  // directly and owner-migration-golden mocks config.js, so this is the one
+  // place a file with a replyPolicy, an iMessage group GUID in the allowlist
+  // and a valid model override for the owner's key goes through config.ts.
+  it("reads the legacy single-identity shape as the owner with no issues (same dm: key)", async () => {
+    const { config, configIssues } = await load({
+      channels: {
+        telegram: { token: "t", allowlist: ["123456789"] },
+        imessage: { provider: "imsg", allowlist: ["+15555550123", "any;+;chat0000000001"] },
+      },
+      identities: [{ name: "Alex", channels: { telegram: "123456789", imessage: "+15555550123" }, replyPolicy: "last-active" }],
+      sessionModelOverrides: { "dm:alex": "claude-opus-5[1m]" },
+    });
+    expect(configIssues).toEqual([]);
+    // replyPolicy is accepted and ignored: it is not carried onto the owner.
+    expect(config.owner).toEqual({ name: "Alex", telegram: ["123456789"], imessage: ["+15555550123"] });
+    expect(config.ownerSource).toBe("identity");
+    expect(config.ownerNotices).toEqual([]);
+    // The group GUID is kept: allowlists govern groups.
+    expect(config.channelAllowlists?.imessage).toContain("any;+;chat0000000001");
+    expect(config.sessionModelOverrides).toEqual({ "dm:alex": "claude-opus-5[1m]" });
+  });
+
   it("parses an `owner` block, normalizing handles; `identities` alongside it is ignored", async () => {
     const { config, configIssues } = await load({
       owner: { name: "alex", displayName: "Alex", telegram: [123456789], imessage: ["+1 (555) 555-0123"] },

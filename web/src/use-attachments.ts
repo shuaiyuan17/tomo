@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { WebBootstrap } from "./api.js";
 import { ApiError, discardUpload, readStagedUpload, uploadImage } from "./api.js";
 import type { WebFiledFile } from "../../src/web/protocol.js";
-import { addFiles, filedAttachment, MAX_ATTACHMENTS, type KeptUpload, isAttachableImage, keptUploads, parseKeptUploads, replaceItems, restoredAttachment, restoringAttachment, takeSent, updateAttachment, type Attachment } from "./uploads.js";
+import { addFiles, filedAttachment, MAX_ATTACHMENTS, type KeptUpload, isAttachableImage, keptUploads, parseKeptUploads, replaceItems, keptExpired, restoredAttachment, restoringAttachment, takeSent, updateAttachment, type Attachment } from "./uploads.js";
 import { deferred, type Message } from "./i18n/message.js";
 
 const failure = (error: unknown) => {
@@ -77,7 +77,7 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
         // The server decides what it is by its bytes: a file the browser called an image may come back a plain file.
         const kind = value.kind ?? "image";
         if (kind === "file" && item.preview) URL.revokeObjectURL(item.preview);
-        commit((old) => updateAttachment(old, item.key, { status: "done", progress: 1, uploadId: value.uploadId, kind, ...(kind === "file" ? { preview: "" } : {}) }));
+        commit((old) => updateAttachment(old, item.key, { status: "done", progress: 1, uploadId: value.uploadId, uploadedAt: Date.now(), kind, ...(kind === "file" ? { preview: "" } : {}) }));
       }, (error) => {
         if (controller.signal.aborted) return;
         commit((old) => updateAttachment(old, item.key, { status: "failed", error: failure(error) }));
@@ -155,9 +155,10 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
     restored.current = storageKey;
     let wanted: KeptUpload[];
     try { wanted = parseKeptUploads(sessionStorage.getItem(storageKey)); } catch { return; }
-    const fresh = wanted.filter((item) => !list.current.some((entry) => entry.uploadId === item.uploadId))
+    // Older than the server keeps any upload: gone, whatever a lookup would say (its record of going expires too).
+    const fresh = wanted.filter((item) => !keptExpired(item) && !list.current.some((entry) => entry.uploadId === item.uploadId))
       .slice(0, Math.max(0, MAX_ATTACHMENTS - list.current.length)).map((item) => restoringAttachment(`a${++counter.current}`, item));
-    if (!fresh.length) return;
+    if (!fresh.length) { if (wanted.length) commit((old) => [...old]); return; }
     commit((old) => [...fresh, ...old]);
     for (const item of fresh) void readBack(item.key, item.restore!);
   }, [storageKey, commit, readBack]);

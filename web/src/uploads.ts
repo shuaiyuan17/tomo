@@ -34,6 +34,8 @@ export interface Attachment {
   filed?: WebFiledFile;
   /** Kept across a reload and being read back from the server (see KeptUpload): never uploaded again; Retry reads it again. */
   restore?: KeptUpload;
+  /** When the upload finished (this tab's clock): its age decides when it is gone (UPLOAD_TTL_MS). */
+  uploadedAt?: number;
 }
 
 /** Whether a picked/dropped/pasted file may be attached (by its declared type; the server checks the bytes). */
@@ -151,11 +153,14 @@ export function captureSend(list: readonly Attachment[]): { keys: string[]; ids:
  * back empty while its uploads sat staged on the server, and the next
  * message went without them.
  */
-export interface KeptUpload { uploadId: string; kind: "image" | "file"; name: string; type: string; size: number }
+export interface KeptUpload { uploadId: string; kind: "image" | "file"; name: string; type: string; size: number; /** When it finished uploading (this tab's clock). */ at: number }
+/** The server's UPLOAD_TTL_MS (src/web/uploads.ts): an upload older than this is gone without asking. */
+export const UPLOAD_TTL_MS = 60 * 60 * 1000;
+export const keptExpired = (kept: KeptUpload, now = Date.now()) => now - kept.at > UPLOAD_TTL_MS;
 export function keptUploads(list: readonly Attachment[]): KeptUpload[] {
   // One still being read back stays kept whatever its state: until the server says it is gone, it is not.
   return list.flatMap((item) => item.restore ? [item.restore] : item.status === "done" && item.uploadId && !item.filed
-    ? [{ uploadId: item.uploadId, kind: item.kind ?? "image", name: item.file.name, type: item.file.type, size: item.file.size }] : []);
+    ? [{ uploadId: item.uploadId, kind: item.kind ?? "image", name: item.file.name, type: item.file.type, size: item.file.size, at: item.uploadedAt ?? Date.now() }] : []);
 }
 /** A kept upload in the tray while it is read back: counted, shown as uploading, and blocking Send like one. */
 export function restoringAttachment(key: string, kept: KeptUpload): Attachment {
@@ -169,12 +174,13 @@ export function parseKeptUploads(raw: string | null): KeptUpload[] {
     return value.filter((item): item is KeptUpload => !!item && typeof item === "object"
       && typeof item.uploadId === "string" && /^[a-f0-9]{32}$/.test(item.uploadId) && (item.kind === "image" || item.kind === "file")
       && typeof item.name === "string" && item.name.length <= 1024 && typeof item.type === "string" && item.type.length <= 255
-      && typeof item.size === "number" && Number.isFinite(item.size) && item.size >= 0).slice(0, MAX_ATTACHMENTS);
+      && typeof item.size === "number" && Number.isFinite(item.size) && item.size >= 0
+      && typeof item.at === "number" && Number.isFinite(item.at)).slice(0, MAX_ATTACHMENTS);
   } catch { return []; }
 }
 /** A kept upload back in the tray, finished: `preview` is its thumbnail (an object URL), "" for a file. */
 export function restoredAttachment(key: string, kept: KeptUpload, preview: string, size = kept.size): Attachment {
-  return { key, file: { name: kept.name, type: kept.type, size } as File, preview, kind: kept.kind, status: "done", progress: 1, uploadId: kept.uploadId };
+  return { key, file: { name: kept.name, type: kept.type, size } as File, preview, kind: kept.kind, status: "done", progress: 1, uploadId: kept.uploadId, uploadedAt: kept.at };
 }
 
 /** One atomic tray change: `dropKeys` leave, `added` come in (order kept). Returns what was dropped, for its cleanup. */

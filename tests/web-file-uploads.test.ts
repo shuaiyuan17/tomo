@@ -362,10 +362,29 @@ describe("peekUpload: gone only on the record of it", () => {
     expect([...seen].sort()).toEqual(["claimed", "image", "unsettled"]);
     claimUploads(dir, [uploadId], "req-final")!.finalize();
     expect(peekUpload(dir, uploadId)).toBeUndefined();
+    // Expired but not yet swept (sweeping runs on the next upload): gone, not unsettled.
+    const stale = stageUpload(dir, PNG).uploadId;
+    expect(peekUpload(dir, stale, Date.now() + 2 * 60 * 60 * 1000)).toBeUndefined();
     // Expired: swept, and recorded gone.
     const old = stageUpload(dir, PNG).uploadId;
     sweepUploads(dir, Date.now() + 2 * 60 * 60 * 1000);
     expect(peekUpload(dir, old, Date.now())).toBeUndefined();
+  });
+});
+
+describe("the tray kept across a reload (page side)", () => {
+  it("each kept upload carries when it finished; one older than the server's TTL is gone without asking", async () => {
+    const { keptExpired, keptUploads, parseKeptUploads, UPLOAD_TTL_MS: PAGE_TTL } = await import("../web/src/uploads.js");
+    const { UPLOAD_TTL_MS } = await import("../src/web/uploads.js");
+    expect(PAGE_TTL).toBe(UPLOAD_TTL_MS);
+    const item = { key: "a1", file: { name: "a.png", type: "image/png", size: 3 } as File, preview: "", kind: "image" as const, status: "done" as const, progress: 1, uploadId: "a".repeat(32), uploadedAt: 1000 };
+    const kept = keptUploads([item]);
+    expect(kept).toEqual([{ uploadId: "a".repeat(32), kind: "image", name: "a.png", type: "image/png", size: 3, at: 1000 }]);
+    expect(parseKeptUploads(JSON.stringify(kept))).toEqual(kept);
+    // A record without its time is not trusted.
+    expect(parseKeptUploads(JSON.stringify([{ ...kept[0], at: undefined }]))).toEqual([]);
+    expect(keptExpired(kept[0], 1000 + UPLOAD_TTL_MS)).toBe(false);
+    expect(keptExpired(kept[0], 1001 + UPLOAD_TTL_MS)).toBe(true);
   });
 });
 

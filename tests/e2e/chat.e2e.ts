@@ -742,6 +742,23 @@ it("a kept upload the server no longer has (sent elsewhere, expired) is dropped 
   await browserExpect(tray).toHaveCount(0);
 });
 
+it("a kept upload older than the server keeps any is dropped on reload without asking, whatever the server would say", async () => {
+  await page.locator("input[type=file]").setInputFiles([{ name: "old.png", mimeType: "image/png", buffer: solidPng(2, 2) }]);
+  const tray = page.getByRole("list", { name: "Attachments" });
+  await browserExpect(tray.getByRole("listitem", { name: "old.png, attached" })).toBeVisible();
+  let asked = 0;
+  await page.route(/\/api\/v1\/uploads\/[a-f0-9]{32}$/, async (route) => { asked++; await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ error: "upload_unsettled" }) }); });
+  // Two hours on: past the TTL.
+  await page.evaluate(() => { for (const key of Object.keys(sessionStorage)) if (key.startsWith("tomo-tray:")) {
+    sessionStorage.setItem(key, JSON.stringify(JSON.parse(sessionStorage.getItem(key)!).map((kept: { at: number }) => ({ ...kept, at: kept.at - 2 * 60 * 60 * 1000 })))); } });
+  await page.reload();
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await page.waitForTimeout(500);
+  await browserExpect(tray).toHaveCount(0);
+  expect(asked).toBe(0);
+  expect(await page.evaluate(() => Object.keys(sessionStorage).filter((key) => key.startsWith("tomo-tray:")))).toEqual([]);
+});
+
 it("calls the agent by its IDENTITY.md name (re-read on edit); the product keeps its own name", async () => {
   mkdirSync(mockConfig.workspaceDir, { recursive: true });
   writeFileSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), "# IDENTITY.md - Who Am I?\n\n- **Name:** Claw\n- **Vibe:** direct\n");

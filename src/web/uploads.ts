@@ -163,6 +163,8 @@ export function peekUpload(dir: string, uploadId: string, now = Date.now()): { k
   if (isGone(dir, uploadId)) return undefined;
   const staged = stagedUpload(dir, uploadId, now);
   if (staged) return staged;
+  // Still there but past its TTL: expired, so gone (a claim refuses it too), swept or not.
+  for (const ext of STAGED_EXTS) { try { if (now - statSync(join(dir, `${uploadId}.${ext}`)).mtimeMs > UPLOAD_TTL_MS) return undefined; } catch { /* not this one */ } }
   try { if (readdirSync(dir).some((name) => name.startsWith(`${uploadId}.`) && name.includes(".claim-"))) return { kind: "claimed" }; } catch { /* no directory */ }
   // Neither staged nor claimed, yet not recorded gone: mid-claim, or a record
   // since expired. Not an answer either way: the page keeps it, with Retry.

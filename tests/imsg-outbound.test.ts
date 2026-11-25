@@ -646,9 +646,10 @@ describe("imsg threaded photo and sticker sends", () => {
   });
 
   it.each([
-    ["", "no caption"],
-    ["Here's the chart", "a caption"],
-  ])("throws a definite pre-flight error when the attachment file is missing, so nothing shipped spends the target (text %j: %s)", async (text) => {
+    ["", "guid-target", "no caption, threaded"],
+    ["Here's the chart", "guid-target", "a caption, threaded"],
+    ["", undefined, "no caption, unthreaded"],
+  ])("throws a definite pre-flight error when the attachment file is missing, so nothing shipped spends the target (text %j, replyTo %j: %s)", async (text, replyTo) => {
     const { channel, requests } = makeChannel({ caps: CAPS_ATTACHMENT });
     await channel.start();
 
@@ -659,7 +660,7 @@ describe("imsg threaded photo and sticker sends", () => {
     // neither the caption nor the picture: a channel-side send would be
     // invisible to it.
     await expect(
-      channel.send({ chatId: DM_GUID, photo: "/nonexistent/pic.png", text, replyTo: "guid-target" }),
+      channel.send({ chatId: DM_GUID, photo: "/nonexistent/pic.png", text, replyTo }),
     ).rejects.toBeInstanceOf(AttachmentUnreadableError);
 
     expect(requests().filter((r) => ["send", "send.rich", "send.attachment"].includes(r.method))).toHaveLength(0);

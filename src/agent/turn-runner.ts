@@ -135,6 +135,12 @@ export interface DeferredSendTurnDelivery {
   suppressDelivery?: boolean;
   /** log.info message when suppressed output is dropped. */
   suppressedLog?: string;
+  /**
+   * The text a suppressed turn ended with (not called for a silent reply or
+   * an error response). A sub-session sends it when the owner's message got
+   * no answer through its tools.
+   */
+  onSuppressedResponse?(response: string): void;
 }
 
 export type TurnDelivery = ReplyTurnDelivery | SendTurnDelivery | DeferredSendTurnDelivery;
@@ -753,6 +759,7 @@ export class TurnRunner {
 
     if (isSuppressed(delivery)) {
       if (delivery.suppressedLog) log.info({ sessionKey: spec.key }, delivery.suppressedLog);
+      if (delivery.kind === "deferred-send" && !silent) delivery.onSuppressedResponse?.(deliverText);
       await stopTyping({ clear: true });
       return true;
     }

@@ -1,5 +1,5 @@
 import { existsSync } from "node:fs";
-import type { Channel, IncomingMessage, MessageReaction, RecentChatMessage } from "../channels/types.js";
+import type { Channel, IncomingMessage, MessageReaction, RecentChatMessage, SendResult as ChannelSendResult } from "../channels/types.js";
 import { IMESSAGE_SEND_EFFECTS } from "../channels/types.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
@@ -17,7 +17,11 @@ import { detectFabricatedMarkers, markFabricatedText, recordFabricatedMarkers } 
 import { normalizeSendTarget } from "./send-target.js";
 import { formatTomoEvent, markOwnerAudience } from "../tomo-event.js";
 
-export type SendResult = { ok: true; note?: string } | { ok: false; error: string };
+/**
+ * `channel` and `messageIds` (direct mode): where the text went and the
+ * provider ids it went out as, when the channel returned any.
+ */
+export type SendResult = { ok: true; note?: string; channel?: string; messageIds?: string[] } | { ok: false; error: string };
 
 export interface SessionCatalog {
   /** The one person Tomo works for; pass `name` (or "owner") to send_message. */
@@ -88,7 +92,7 @@ export class ProactiveSendService {
    * `options.ownerOnlyNote` marks that note for the owner's own turns: a
    * summoned group's turn on the same session never drains it.
    */
-  async sendToSession(target: string, rawText: string, callerSessionKey?: string, options?: { replyTo?: string; effect?: string; noteFrom?: string; ownerOnlyNote?: boolean }): Promise<SendResult> {
+  async sendToSession(target: string, rawText: string, callerSessionKey?: string, options?: { replyTo?: string; effect?: string; noteFrom?: string; harnessPrefix?: string; ownerOnlyNote?: boolean }): Promise<SendResult> {
     const text = rawText;
     const resolved = this.resolveSendTarget(target);
     if (!resolved) {
@@ -111,7 +115,10 @@ export class ProactiveSendService {
     // tool result says what happened so the caller learns. Counted here, at
     // detection, with the TARGET session as attribution — that is the
     // conversation the fabricated line would have misled.
-    const fabricated = detectFabricatedMarkers(text);
+    // A sub-session's send opens with the harness's own `[s3 · title]`
+    // prefix, which is the one place that shape is genuine: scan past it.
+    const harnessPrefix = options?.harnessPrefix;
+    const fabricated = detectFabricatedMarkers(harnessPrefix && text.startsWith(harnessPrefix) ? text.slice(harnessPrefix.length) : text);
     recordFabricatedMarkers(sessionKey, fabricated);
     const guard = (wire: string): string => (fabricated.length > 0 ? markFabricatedText(wire) : wire);
     const fabricatedNote = fabricated.length > 0
@@ -154,6 +161,11 @@ export class ProactiveSendService {
 
     /** Per-piece outcome in model order, set only when something failed. */
     let segments: DeliverySegment[] | undefined;
+    /** Provider ids of what went out (a sub-session's replies route back by them). */
+    const messageIds: string[] = [];
+    const keepIds = (result: ChannelSendResult | void): void => {
+      if (result && result.messageIds) messageIds.push(...result.messageIds);
+    };
     const { cleanText, mediaPaths, stickerIds } = extractAttachments(text);
 
     // PRIVATE ATTACHMENTS FOLLOW THE CALLER'S AUDIENCE. The PreToolUse guard
@@ -189,8 +201,8 @@ export class ProactiveSendService {
       // rides the text send — it modifies delivery of text, not attachments.
       let textDelivered = false;
       if (cleanText) {
-        await channel.send({ chatId: replyTarget.chatId, text: guard(cleanText), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) })
-          .catch(logDirectSendFailure);
+        keepIds(await channel.send({ chatId: replyTarget.chatId, text: guard(cleanText), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) })
+          .catch(logDirectSendFailure));
         textDelivered = true;
       } else if (effect) {
         effectNote = `Note: effect "${effect}" was ignored — an effect needs message text to ride on, and this send had only attachments.`;
@@ -216,7 +228,7 @@ export class ProactiveSendService {
         attachments.push({ label: path, segment });
         if (missing.has(path)) continue;
         try {
-          await channel.send({ chatId: replyTarget.chatId, photo: path, text: "" });
+          keepIds(await channel.send({ chatId: replyTarget.chatId, photo: path, text: "" }));
           segment.delivered = true;
         } catch (err) {
           log.warn({ err, sessionKey, path }, "Direct send: attachment failed after the text was delivered");
@@ -262,8 +274,8 @@ export class ProactiveSendService {
     } else {
       // No attachments: verbatim text (direct-mode contract), behind the
       // advisory only when the guard fired.
-      await channel.send({ chatId: replyTarget.chatId, text: guard(text), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) })
-        .catch(logDirectSendFailure);
+      keepIds(await channel.send({ chatId: replyTarget.chatId, text: guard(text), ...(replyToId ? { replyTo: replyToId } : {}), ...(effect ? { effect } : {}) })
+        .catch(logDirectSendFailure));
     }
 
     // What the transcript records, and what the pending note describes. On a
@@ -309,7 +321,7 @@ export class ProactiveSendService {
 
     log.info({ sessionKey, channel: replyTarget.channelName, chars: text.length, effect, fabricatedMarkers: fabricated.length || undefined }, "Message sent (direct)");
     const note = [fabricatedNote, effectNote, attachmentNote].filter((n): n is string => n !== undefined).join(" ");
-    return { ok: true, ...(note ? { note } : {}) };
+    return { ok: true, ...(note ? { note } : {}), ...(messageIds.length > 0 ? { channel: replyTarget.channelName, messageIds } : {}) };
   }
 
   /**

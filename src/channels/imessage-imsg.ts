@@ -289,6 +289,8 @@ export class ImsgChannel implements Channel {
     // continuation chunk — lands on the plain `send` below, which has no
     // reply_to param at all. Track the one success rather than assume it.
     let threaded = false;
+    /** Provider GUIDs of the parts that went out, where imsg returned one. */
+    const ids: string[] = [];
     const chunks = splitText(text, TEXT_CHUNK_LIMIT);
     // Parts of THIS text already on the phone, so a failure can say whether
     // anything went out (markNothingSent) or how much (markPartsSent).
@@ -316,6 +318,7 @@ export class ImsgChannel implements Channel {
             });
             sentParts++;
             this.recordOwnSend(chatId, result, chunk);
+            pushGuid(ids, result);
             if (message.replyTo) threaded = true;
             continue;
           } catch (err) {
@@ -342,7 +345,8 @@ export class ImsgChannel implements Channel {
           // (no text/reply_to/effect), which is why this branch is mutually
           // exclusive with the rich-text branch above.
           if (this.richLinksSupported()) {
-            if (await this.trySendRichLink(chatId, chunk.trim())) { sentParts++; continue; }
+            const guid = await this.trySendRichLink(chatId, chunk.trim());
+            if (guid !== false) { sentParts++; if (guid) ids.push(guid); continue; }
           } else {
             // Snapshot lacks the rich-link selectors. Unlike a missing edit
             // selector (an OS limit), this state heals: a Messages relaunch
@@ -365,6 +369,7 @@ export class ImsgChannel implements Channel {
         });
         sentParts++;
         this.recordOwnSend(chatId, result, chunk);
+        pushGuid(ids, result);
       }
     } catch (err) {
       // Only an RPC error RESPONSE proves the failing call sent nothing; with
@@ -377,7 +382,9 @@ export class ImsgChannel implements Channel {
     // with it: the AppleScript `send` has no reply_to. Returning nothing here
     // would read as "delivered as asked" and the pipeline would retire a
     // target that never reached a bubble, stranding the rest of the turn.
-    return message.replyTo && !threaded ? { threaded: false } : undefined;
+    const unthreaded = message.replyTo && !threaded;
+    if (!unthreaded && ids.length === 0) return undefined;
+    return { ...(unthreaded ? { threaded: false } : {}), ...(ids.length > 0 ? { messageIds: ids } : {}) };
   }
 
   /**
@@ -401,11 +408,12 @@ export class ImsgChannel implements Channel {
    * of the same URL. An ambiguous failure (timeout, child death) propagates:
    * the message may already be out, and a fallback would double-send it.
    */
-  private async trySendRichLink(chatId: string, url: string): Promise<boolean> {
+  /** The GUID it was sent as ("" when imsg returned none), or false when refused. */
+  private async trySendRichLink(chatId: string, url: string): Promise<string | false> {
     try {
       const result = await this.rpc.request("send.rich", { chat_guid: chatId, url });
       this.recordOwnSend(chatId, result, url);
-      return true;
+      return typeof result.guid === "string" ? result.guid : "";
     } catch (err) {
       if (!(err instanceof ImsgRpcResponseError)) throw err;
       log.warn({ err, chatId }, "imsg rich link send refused; falling back to plain text send");
@@ -1247,4 +1255,9 @@ export class ImsgChannel implements Channel {
   private normalizeAddress(addr: string): string {
     return normalizeImessageHandle(addr);
   }
+}
+
+/** Keep the GUID an imsg send returned, when it returned one. */
+function pushGuid(ids: string[], result: Record<string, unknown>): void {
+  if (typeof result.guid === "string" && result.guid) ids.push(result.guid);
 }

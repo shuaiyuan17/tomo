@@ -1,7 +1,7 @@
 import { API_CONSTANTS, Bot, GrammyError, type Context } from "grammy";
 import { existsSync } from "node:fs";
 import type { LanguageCode, MessageReactionUpdated, ReactionType, ReactionTypeEmoji } from "grammy/types";
-import type { AdmissionPredicate, Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, MessageReaction, RecentChatMessage } from "./types.js";
+import type { AdmissionPredicate, Channel, IncomingMessage, OutgoingMessage, MessageHandler, CommandHandler, ImageAttachment, DocumentAttachment, MessageReaction, RecentChatMessage, SendResult } from "./types.js";
 import { AttachmentUnreadableError, PartialSendError, markDefiniteFailure, markNothingSent, markPartsSent } from "./types.js";
 import { formatImageMarker } from "./imageStore.js";
 import { formatDocumentMarker, isSupportedDocumentMime } from "./documentStore.js";
@@ -15,6 +15,7 @@ import { log } from "../logger.js";
 import { scrubSecretValues } from "../redact.js";
 import { formatReactionMarker, splitText } from "./text-utils.js";
 import { formatMimeToken, sanitizeAttachmentFilename } from "./fileStore.js";
+import { looksLikeTaskAddress } from "../agent/subsessions/address.js";
 import { CHAT_COMMANDS, CHAT_COMMAND_NAMES, LOCALIZED_CHAT_COMMAND_MENUS, parseTasksCommand, TASKS_COMMAND } from "./chat-commands.js";
 import { startTypingLoop } from "./typing-loop.js";
 import { errorMessage } from "../error-text.js";
@@ -203,7 +204,10 @@ export class TelegramChannel implements Channel {
         for (const handler of this.commandHandlers) await handler(TASKS_COMMAND, chatId, senderName, tasks.args, senderId);
         return;
       }
-      if (ctx.message.text.startsWith("/")) return;
+      // `/s …` addresses a sub-session: it reaches the agent as a message
+      // (only the agent knows whether the sender is the owner). Not a
+      // bot.command, whose matching also looks at photo captions.
+      if (ctx.message.text.startsWith("/") && !looksLikeTaskAddress(ctx.message.text)) return;
 
 
       this.dispatch({
@@ -212,7 +216,6 @@ export class TelegramChannel implements Channel {
         // What was typed, for the credential broker (Telegram puts no marker in `text`).
         rawText: ctx.message.text,
         attachmentCount: 0,
-        ...(ctx.message.reply_to_message ? { replyToId: String(ctx.message.reply_to_message.message_id) } : {}),
       });
     }));
 
@@ -383,7 +386,7 @@ export class TelegramChannel implements Channel {
    * The fields every ordinary message update shares, whatever it carries:
    * who sent it, where, when, and whether it summons Tomo.
    */
-  private baseInbound(ctx: Context): Pick<IncomingMessage, "id" | "chatId" | "senderName" | "senderId" | "timestamp" | "isGroup" | "isMentioned" | "chatTitle"> {
+  private baseInbound(ctx: Context): Pick<IncomingMessage, "id" | "chatId" | "senderName" | "senderId" | "timestamp" | "isGroup" | "isMentioned" | "chatTitle" | "replyToId"> {
     const chat = ctx.chat!;
     const message = ctx.message!;
     const isGroup = isGroupChatType(chat.type);
@@ -396,6 +399,9 @@ export class TelegramChannel implements Channel {
       isGroup,
       isMentioned: this.checkMentioned(ctx),
       chatTitle: isGroup && "title" in chat ? chat.title : undefined,
+      // On every kind of message, so a photo or file sent as a reply to a
+      // sub-session's message reaches that task like a text reply does.
+      ...(message.reply_to_message ? { replyToId: String(message.reply_to_message.message_id) } : {}),
     };
   }
 
@@ -664,12 +670,13 @@ export class TelegramChannel implements Channel {
     return () => void loop.stop();
   }
 
-  async send(message: OutgoingMessage): Promise<void> {
+  async send(message: OutgoingMessage): Promise<SendResult | void> {
     // How many provider calls of THIS send landed, so a failure can say
     // whether anything is already on the phone (see markNothingSent).
-    const progress = { sent: 0, total: 1 };
+    const progress = { sent: 0, total: 1, ids: [] as string[] };
     try {
       await this.sendUnmarked(message, progress);
+      return progress.ids.length > 0 ? { messageIds: progress.ids } : undefined;
     } catch (err) {
       if (!(err instanceof PartialSendError)) {
         if (progress.sent === 0 && (err instanceof GrammyError || err instanceof AttachmentUnreadableError)) {
@@ -689,7 +696,7 @@ export class TelegramChannel implements Channel {
     }
   }
 
-  private async sendUnmarked(message: OutgoingMessage, progress: { sent: number; total: number }): Promise<void> {
+  private async sendUnmarked(message: OutgoingMessage, progress: { sent: number; total: number; ids: string[] }): Promise<void> {
     // `allow_sending_without_reply` makes the thread a PREFERENCE, not a
     // precondition. Without it the Bot API answers 400
     // "message to be replied not found" when the target is gone — the user
@@ -721,6 +728,7 @@ export class TelegramChannel implements Channel {
         caption: fitsCaption ? caption : undefined,
       });
       progress.sent++;
+      progress.ids.push(String(sent.message_id));
       if (fitsCaption && caption) {
         // A captioned photo is the visible form of a text reply (the delivery
         // pipeline ships assistant text as the first photo's caption) — it
@@ -729,7 +737,8 @@ export class TelegramChannel implements Channel {
       }
       if (!fitsCaption) {
         try {
-          await this.send({ chatId: message.chatId, text: message.text });
+          const rest = await this.send({ chatId: message.chatId, text: message.text });
+          if (rest?.messageIds) progress.ids.push(...rest.messageIds);
         } catch (err) {
           // The picture is on the phone; only the text is in doubt.
           throw new PartialSendError(err, { photo: true });
@@ -739,8 +748,9 @@ export class TelegramChannel implements Channel {
     }
 
     if (message.sticker) {
-      await this.bot.api.sendSticker(message.chatId, message.sticker, replyParams);
+      const sent = await this.bot.api.sendSticker(message.chatId, message.sticker, replyParams);
       progress.sent++;
+      progress.ids.push(String(sent.message_id));
       return;
     }
 
@@ -769,6 +779,7 @@ export class TelegramChannel implements Channel {
         sent = await this.bot.api.sendMessage(message.chatId, chunk, params);
       }
       progress.sent++;
+      progress.ids.push(String(sent.message_id));
       this.recordOwnMessage(message.chatId, sent.message_id, chunk);
     }
   }

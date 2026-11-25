@@ -1079,6 +1079,61 @@ describe("/tasks command", () => {
   });
 });
 
+describe("/s sub-session address", () => {
+  it("passes /s through as a message (the agent parses it), while other slash text stays filtered", async () => {
+    const channel = new TelegramChannel("123456:TEST-TOKEN");
+    const bot = (channel as unknown as {
+      bot: { botInfo: unknown; handleUpdate: (u: unknown) => Promise<void> };
+    }).bot;
+    bot.botInfo = {
+      id: 123456, is_bot: true, first_name: "Tomo", username: "tomobot",
+      can_join_groups: true, can_read_all_group_messages: false,
+      supports_inline_queries: false, can_connect_to_business_account: false,
+      has_main_web_app: false,
+    };
+    const messages: IncomingMessage[] = [];
+    channel.onMessage(async (msg) => { messages.push(msg); return true; });
+    let id = 1;
+    for (const text of ["/s", "/s s3 check the logs", "/S@tomobot s3 stop", "/start", "/sx s3"]) {
+      const command = /^\/\S+/.exec(text)?.[0] ?? "";
+      await bot.handleUpdate({
+        update_id: id,
+        message: {
+          message_id: id++, date: 1_700_000_000, chat: { id: 42, type: "private" },
+          from: { id: 7, is_bot: false, first_name: "Alice" }, text,
+          entities: [{ type: "bot_command", offset: 0, length: command.length }],
+        },
+      });
+    }
+    expect(messages.map((m) => m.rawText ?? m.text)).toEqual(["/s", "/s s3 check the logs", "/S@tomobot s3 stop"]);
+  });
+});
+
+describe("reply references on attachments", () => {
+  it("a document sent as a reply carries the replied-to message id, like a text reply", async () => {
+    const channel = new TelegramChannel("123456:TEST-TOKEN");
+    const bot = (channel as unknown as {
+      bot: { botInfo: unknown; handleUpdate: (u: unknown) => Promise<void> };
+    }).bot;
+    bot.botInfo = {
+      id: 123456, is_bot: true, first_name: "Tomo", username: "tomobot",
+      can_join_groups: true, can_read_all_group_messages: false,
+      supports_inline_queries: false, can_connect_to_business_account: false,
+      has_main_web_app: false,
+    };
+    const messages: IncomingMessage[] = [];
+    channel.onMessage(async (msg) => { messages.push(msg); return true; });
+    const replied = { message_id: 3, date: 1_699_999_000, chat: { id: 42, type: "private" }, from: { id: 123456, is_bot: true, first_name: "Tomo" }, text: "[s3 · Fix CI] Send me the log?" };
+    await bot.handleUpdate({ update_id: 1, message: {
+      message_id: 5, date: 1_700_000_000, chat: { id: 42, type: "private" }, from: { id: 7, is_bot: false, first_name: "Alice" },
+      document: { file_id: "f", file_unique_id: "u", file_name: "log.zip", mime_type: "application/zip" }, reply_to_message: replied } });
+    await bot.handleUpdate({ update_id: 2, message: {
+      message_id: 6, date: 1_700_000_001, chat: { id: 42, type: "private" }, from: { id: 7, is_bot: false, first_name: "Alice" },
+      document: { file_id: "g", file_unique_id: "v", file_name: "other.zip", mime_type: "application/zip" } } });
+    expect(messages.map((m) => m.replyToId)).toEqual(["3", undefined]);
+  });
+});
+
 describe("TelegramChannel inbound reactions", () => {
   function setup() {
     const channel = new TelegramChannel("123456:TEST-TOKEN");

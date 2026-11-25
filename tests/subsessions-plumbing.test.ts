@@ -20,7 +20,7 @@ import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { SubsessionService } from "../src/agent/subsessions/service.js";
 import { buildTaskOwnerTools, buildTaskSelfTools, SUBSESSION_TASK_TOOL_NAMES } from "../src/mcp/subsession-tools.js";
 import { DEFAULT_SUBSESSIONS } from "../src/config.js";
-import { formatTomoEvent } from "../src/tomo-event.js";
+import { formatTomoEvent, isOwnerAudienceNote, markOwnerAudience } from "../src/tomo-event.js";
 
 describe("task: session keys", () => {
   it("are their own kind: not a DM, not a group, not a raw channel key", () => {
@@ -98,13 +98,36 @@ describe("pending notes: sub-session reports", () => {
     expect(q.hasNote("dm:owner", (n) => n.includes("marker-a"))).toBe(true);
     expect(q.hasNote("dm:owner", (n) => n.includes("marker-b"))).toBe(false);
   });
+
+  it("a note marked for the owner is held back from a turn that is not the owner's own", () => {
+    const store = memoryStore();
+    const q = new PendingNotesQueue(store as never);
+    const report = markOwnerAudience(formatTomoEvent("subsession-report", "private task text", { name: "s1" }));
+    const plain = formatTomoEvent("note", "anyone may see this");
+    q.queueNote("dm:owner", report);
+    q.queueNote("dm:owner", plain);
+    const groupPrefix = q.drain("dm:owner", { holdOwnerAudience: true });
+    expect(groupPrefix).toContain("anyone may see this");
+    expect(groupPrefix).not.toContain("private task text");
+    // Still queued (and on disk) for the owner's own next turn.
+    expect(store.getPendingNotes("dm:owner").some((n) => n.includes("private task text"))).toBe(true);
+    q.settle("dm:owner", groupPrefix);
+    expect(q.drain("dm:owner")).toContain("private task text");
+  });
+
+  it("the owner mark survives the report's pinning and the interrupted prefix", () => {
+    const report = markOwnerAudience(formatTomoEvent("subsession-report", "r", { name: "s1" }));
+    expect(report.startsWith('<tomo-event type="subsession-report" name="s1"')).toBe(true);
+    expect(isOwnerAudienceNote(report)).toBe(true);
+    expect(markOwnerAudience(report)).toBe(report);
+    expect(isOwnerAudienceNote(formatTomoEvent("note", 'body says audience="owner"'))).toBe(false);
+  });
 });
 
 describe("sub-session prompt", () => {
-  it("carries no memory instructions and no task_reply/task_ask in Phase 1a", () => {
+  it("offers the owner-facing tools and carries no memory instructions", () => {
     const prompt = buildSubsessionPrompt({ agentName: "Tomo", ownerName: "Shuai" });
-    expect(prompt).toContain("task_notify");
-    expect(prompt).not.toMatch(/task_reply|task_ask/);
+    for (const name of ["task_reply", "task_notify", "task_ask", "task_finish"]) expect(prompt).toContain(name);
     expect(prompt).not.toMatch(/MEMORY\.md index|memory_write/);
   });
 });

@@ -367,6 +367,10 @@ describe("SubsessionService", () => {
     expect(record).toMatchObject({ status: "finished", failStreak: 0, heldThrough: 1 });
     expect(record.pendingInput.map((i) => i.text).join()).toContain("one more thing");
     expect(h.notices.at(-1)?.text).toContain("Couldn't answer the message it was sent");
+    // The durable copy: the owning session gets what the task was sent, as a note.
+    const handed = h.notes.get("dm:owner")?.filter((n) => n.includes('type="subsession-unanswered"') && n.includes("one more thing"));
+    expect(handed).toHaveLength(1);
+    expect(h.wakes).toContain("dm:owner"); // and the owning session is woken to deal with it
     h.onTurn = () => ({ ok: false, stopped: true });
     h.service.relay(t.id, "and another");
     await flush();
@@ -1395,6 +1399,41 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("an owner's start the registry held still passes the quota gate once it can be read", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness({ maxRunning: 0 }, working((turn, hh) => hh.service.finish(turn.key, "ok")));
+      const t = h.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+      h.service.start();
+      h.quota = 95;
+      h.registryReadable = false;
+      expect(h.service.startTask(t.id, "the owner started it")).toBe(false);
+      expect(h.service.isHeld(t.id)).toBe(true);
+      h.registryReadable = true;
+      vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
+      await flush();
+      // Not paused at the gate: the owner asked for this start.
+      expect(h.turns).toHaveLength(1);
+      expect(h.store.get(t.id)?.status).toBe("finished");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("an owner's start keeps its gate pass through a /compact that runs first", async () => {
+    const h = harness({ maxRunning: 0 }, working((turn, hh) => { if (!turn.bare) hh.service.finish(turn.key, "ok"); }));
+    const t = h.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    h.store.update(t.id, (r) => { r.compactPending = true; });
+    h.service.start();
+    h.quota = 95;
+    expect(h.service.startTask(t.id, "the owner started it")).toBe(true);
+    await flush();
+    // The compact, then its first real turn: not paused at the gate in between.
+    expect(h.turns.some((x) => x.prompt.startsWith("/compact"))).toBe(true);
+    expect(h.turns.some((x) => x.prompt.includes("subsession-start"))).toBe(true);
+    expect(h.store.get(t.id)?.status).toBe("finished");
   });
 
   it("makes an owner's start that the registry held past the slot cap once it can be read", async () => {

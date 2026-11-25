@@ -54,9 +54,11 @@ export type TomoEventType =
   | "subsession-resume"   // a restart cut a sub-session's work short (name = task id)
   | "subsession-continue" // auto-continue turn of an active sub-session
   | "subsession-relay"    // the owning session passing something to a sub-session
+  | "subsession-owner-message" // the owner writing to a sub-session (/s or a reply to it)
   | "subsession-record"   // the task record, injected after a /compact (name = task id)
   | "subsession-redelivery" // marks sub-session inputs sent again after a cut-short turn (at-least-once delivery)
   | "subsession-report"   // a sub-session finished; told to its owning session (name = task id#report seq, e.g. s3#1)
+  | "subsession-unanswered" // a finished sub-session gave up on what it was sent; the messages, to its owning session (name = task id)
   | "subsession-activity" // something a sub-session said to the owner, told to its owning session (name = task id)
   | "subsession-handback" // a failed sub-session's unanswered messages from the owner, in full (name = task id)
   | "note";            // bare harness aside with no producer of its own

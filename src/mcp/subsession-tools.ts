@@ -5,7 +5,7 @@ import type { SubsessionService } from "../agent/subsessions/service.js";
 import type { SubsessionRecord } from "../agent/subsessions/types.js";
 
 /** The task_* tools a sub-session reports through (its own session only). */
-export const SUBSESSION_SELF_TOOL_NAMES = ["task_notify", "task_progress", "task_checkpoint", "task_finish", "task_reopen", "task_status"] as const;
+export const SUBSESSION_SELF_TOOL_NAMES = ["task_reply", "task_notify", "task_ask", "task_progress", "task_checkpoint", "task_finish", "task_reopen", "task_status"] as const;
 /** The owning session's tools (the owner's DM only, for now). */
 export const SUBSESSION_OWNER_TOOL_NAMES = ["task_spawn", "task_status", "task_cancel", "task_message"] as const;
 /** Every task tool name, once: for the SDK's allowedTools. */
@@ -66,6 +66,30 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     return s ? { ok: true, s } : { ok: false, error: fail(name, "sub-sessions are not available right now.") };
   };
   return [
+    tool(
+      "task_reply",
+      "Answer a message the owner sent you (<tomo-event type=\"subsession-owner-message\">). Once per message. The harness adds the [id · title] prefix. A MEDIA:/path line attaches a file.",
+      { text: z.string().min(1).max(4000).describe("The answer, in the owner's language, casual and concise. Lead with the answer.") },
+      async ({ text }) => {
+        const r = service("task_reply");
+        if (!r.ok) return r.error;
+        const result = await r.s.reply(deps.key, text);
+        return result.ok ? ok("Sent.") : fail("task_reply", result.error ?? "the message did not go out.");
+      },
+      { alwaysLoad: true, searchHint: "task reply answer owner message" },
+    ),
+    tool(
+      "task_ask",
+      "Ask the owner something only they can decide, and pause the task until they answer: a yes for something that sends, posts, pays, deletes or can't be undone, or a choice the brief leaves open. Ask one question, with the options. End the turn after it; their answer arrives as a message from them.",
+      { question: z.string().min(1).max(4000).describe("The question, in the owner's language, with the options and what each sets off.") },
+      async ({ question }) => {
+        const r = service("task_ask");
+        if (!r.ok) return r.error;
+        const result = await r.s.ask(deps.key, question);
+        return result.ok ? ok("Asked. The task now waits for the owner; end this turn.") : fail("task_ask", result.error ?? "the question did not go out.");
+      },
+      { alwaysLoad: true, searchHint: "task ask owner question decision approval" },
+    ),
     tool(
       "task_notify",
       "Send the owner a message from this task. Only for a result, a decision they must make, or something that blocks you; never for progress (use task_progress). The harness adds the [id · title] prefix. A MEDIA:/path line attaches a file.",

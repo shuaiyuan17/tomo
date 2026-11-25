@@ -332,6 +332,9 @@ export class SessionStore {
    * that would be written back for it, and nothing is written back for it.
    */
   private sidecarMessages = new WeakSet<SessionMessage>();
+  /** The unreadable `_pending_notes.json` bytes last kept in a `.corrupt-`
+   *  sibling, so a write-back that keeps failing does not copy them again. */
+  private pendingNotesKeptRaw: string | null = null;
   private readonly registryLockOptions: FileLockOptions;
   private readonly transcriptLockOptions: FileLockOptions;
   private readonly ledgerLockOptions: FileLockOptions;
@@ -1724,9 +1727,12 @@ export class SessionStore {
       return;
     }
     let aside: string | null = null;
-    if (raw.trim() !== "") {
+    // Already kept these exact bytes (the write-back below failed last time):
+    // one copy is enough.
+    if (raw.trim() !== "" && raw !== this.pendingNotesKeptRaw) {
       try {
         aside = this.keepCorruptPendingNotes(raw);
+        this.pendingNotesKeptRaw = raw;
       } catch (err) {
         throw new PendingNotesReadError(path, err);
       }

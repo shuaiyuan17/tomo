@@ -140,8 +140,20 @@ export class PendingNotesQueue {
     }
     this.unloaded.delete(sessionKey);
     const arr = this.notes.get(sessionKey);
-    if (arr) arr.unshift(...stored);
-    else this.notes.set(sessionKey, stored);
+    if (!arr) {
+      this.notes.set(sessionKey, stored);
+      return true;
+    }
+    // A note queued again while the row was unreadable (a caller that found
+    // no copy and wrote one) is already among the stored ones: once is enough.
+    const remaining = [...stored];
+    const fresh = arr.filter((note) => {
+      const i = remaining.indexOf(note);
+      if (i < 0) return true;
+      remaining.splice(i, 1);
+      return false;
+    });
+    arr.splice(0, arr.length, ...stored, ...fresh);
     return true;
   }
 
@@ -295,14 +307,23 @@ export class PendingNotesQueue {
     if (!this.persist(sessionKey)) log.warn({ sessionKey }, "Could not persist restored pending notes");
   }
 
-  /** Is a note matching `predicate` queued or in flight for the session? */
-  hasNote(sessionKey: string, predicate: (note: string) => boolean): boolean {
+  /**
+   * Is a note matching `predicate` queued or in flight for the session?
+   * While the session's stored notes cannot be read the answer is unknown:
+   * `whenUnreadable` is returned unless one is found in memory. A caller
+   * about to throw something away passes true; one about to write a copy
+   * passes false (the write is refused until the row reads, and a copy
+   * already stored is not kept twice).
+   */
+  hasNote(sessionKey: string, predicate: (note: string) => boolean, whenUnreadable = false): boolean {
     if (this.queued(sessionKey).some(predicate)) return true;
-    return (this.inflight.get(sessionKey) ?? []).some((b) => b.notes.some(predicate));
+    if ((this.inflight.get(sessionKey) ?? []).some((b) => b.notes.some(predicate))) return true;
+    return this.unloaded.has(sessionKey) ? whenUnreadable : false;
   }
 
-  /** Test/support helper for observing queued durable notes without draining. */
+  /** Queued durable notes, without draining. Only the ones in memory while
+   *  the session's stored notes cannot be read. */
   peekNotes(sessionKey: string): string[] {
-    return [...(this.notes.get(sessionKey) ?? this.store.getPendingNotes(sessionKey))];
+    return [...this.queued(sessionKey)];
   }
 }

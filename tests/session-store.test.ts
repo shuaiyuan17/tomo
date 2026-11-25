@@ -151,6 +151,26 @@ describe("SessionStore", () => {
     expect(readFileSync(join(TEST_DIR, asides[0]), "utf-8")).toBe(raw);
   });
 
+  it("an empty pending notes file is removed without keeping a copy", () => {
+    const file = join(TEST_DIR, "_pending_notes.json");
+    writeFileSync(file, "");
+    const store = makeSessionStore(TEST_DIR);
+
+    expect(store.getPendingNotes("dm:alice")).toEqual([]);
+    expect(existsSync(file)).toBe(false);
+    expect(readdirSync(TEST_DIR).filter((f) => f.startsWith("_pending_notes.json.corrupt-"))).toEqual([]);
+  });
+
+  it("a read-only store leaves an unparseable pending notes file exactly as it is", () => {
+    const file = join(TEST_DIR, "_pending_notes.json");
+    writeFileSync(file, "{not json");
+    const store = makeSessionStore(TEST_DIR, { readOnly: true });
+
+    expect(store.getPendingNotes("dm:alice")).toEqual([]);
+    expect(readFileSync(file, "utf-8")).toBe("{not json");
+    expect(readdirSync(TEST_DIR).filter((f) => f.startsWith("_pending_notes.json.corrupt-"))).toEqual([]);
+  });
+
   it("a pending notes file that cannot be read throws, and a write leaves it untouched", () => {
     const file = join(TEST_DIR, "_pending_notes.json");
     mkdirSync(file); // readFileSync fails with EISDIR, not ENOENT
@@ -368,6 +388,18 @@ describe("SessionStore", () => {
 
     expect(store.getPendingNotes("telegram:111")).toEqual([]);
     expect(store.getPendingNotes("dm:alice")).toEqual(["queued before migration"]);
+  });
+
+  it("a migration with an unreadable pending notes file still re-keys the session and leaves the file alone", () => {
+    const store = makeSessionStore(TEST_DIR);
+    store.setSdkSessionId("telegram:111", "session-old");
+    const file = join(TEST_DIR, "_pending_notes.json");
+    mkdirSync(file); // EISDIR on read
+
+    store.migrateSessionKey("telegram:111", "dm:alice");
+
+    expect(store.getSdkSessionId("dm:alice")).toBe("session-old");
+    expect(statSync(file).isDirectory()).toBe(true);
   });
 
   it("remembers the raw key a unified session was migrated from, across chained migrations", () => {

@@ -279,6 +279,44 @@ describe("PendingNotesQueue when the durable store fails", () => {
   });
 });
 
+describe("PendingNotesQueue while the stored notes cannot be read", () => {
+  class UnreadableStore extends MemoryPendingNotesStore {
+    failReads = true;
+    override getPendingNotes(key: string): string[] {
+      if (this.failReads) throw new Error("EIO: read");
+      return super.getPendingNotes(key);
+    }
+  }
+
+  it("hasNote answers the caller's whenUnreadable, unless the note is in memory", () => {
+    const store = new UnreadableStore();
+    store.notes.set("k", ["report s1#1"]);
+    const queue = new PendingNotesQueue(store);
+    const isReport = (n: string) => n.includes("s1#1");
+
+    expect(queue.hasNote("k", isReport)).toBe(false);
+    expect(queue.hasNote("k", isReport, true)).toBe(true);
+    queue.queueNote("k", "other");
+    expect(queue.hasNote("k", (n) => n === "other", false)).toBe(true);
+
+    store.failReads = false;
+    expect(queue.hasNote("k", isReport, false)).toBe(true);
+    expect(queue.hasNote("k", (n) => n === "missing", true)).toBe(false);
+  });
+
+  it("peekNotes does not throw, and a note queued again meanwhile is kept once after the reload", () => {
+    const store = new UnreadableStore();
+    store.notes.set("k", ["report s1#1"]);
+    const queue = new PendingNotesQueue(store);
+
+    expect(queue.peekNotes("k")).toEqual([]);
+    expect(queue.queueNote("k", "report s1#1")).toBe(false);
+    store.failReads = false;
+    expect(queue.persistNow("k")).toBe(true);
+    expect(store.getPendingNotes("k")).toEqual(["report s1#1"]);
+  });
+});
+
 describe("PendingNotesQueue holdOwnerAudience", () => {
   // A summoned group's turn on the owner's dm: session must not read a note
   // meant for the owner alone: it stays queued for the owner's next turn.

@@ -115,7 +115,8 @@ export interface SubsessionServiceDeps {
   /** A harness notice about a task, to the owning scope's chat. */
   noticeToScope(parentKey: string, text: OwnerText): Promise<void>;
   queuePendingNote(key: string, note: string): boolean;
-  hasPendingNote(key: string, predicate: (note: string) => boolean): boolean;
+  /** `whenUnreadable` is the answer while the session's stored notes cannot be read. */
+  hasPendingNote(key: string, predicate: (note: string) => boolean, whenUnreadable?: boolean): boolean;
   /**
    * Write the session's pending notes (queued and in flight) to disk again.
    * A note whose first write failed is still held in memory, so finding it
@@ -1964,7 +1965,7 @@ export class SubsessionService {
       this.retryReport(record.id);
       return;
     }
-    let present = this.reportNotePending(record);
+    let present = this.reportNotePending(record, false);
     if (present && this.unpersistedReports.has(record.id)) {
       // The note found is our own, held in memory after its write failed: it
       // is not durable until a write succeeds.
@@ -2006,7 +2007,7 @@ export class SubsessionService {
     if (missing.length === 0) return true;
     for (const e of missing) {
       const name = `${record.id}#${e.seq}`;
-      const ok = this.notePending(record.parentKey, name)
+      const ok = this.notePending(record.parentKey, name, false)
         // Found in memory: held after a failed write, so written again.
         ? this.deps.persistPendingNotes?.(record.parentKey) ?? false
         : this.deps.queuePendingNote(record.parentKey, formatTomoEvent("subsession-report", [
@@ -2028,8 +2029,8 @@ export class SubsessionService {
   }
 
   /** This report's own note (by report seq): an unread earlier report of the same task is another note. */
-  private reportNotePending(record: SubsessionRecord): boolean {
-    return this.notePending(record.parentKey, reportNoteName(record));
+  private reportNotePending(record: SubsessionRecord, whenUnreadable = true): boolean {
+    return this.notePending(record.parentKey, reportNoteName(record), whenUnreadable);
   }
 
   /** An earlier report a later finish kept (see finish) is still unread. */
@@ -2038,9 +2039,12 @@ export class SubsessionService {
     return (record.earlierReports ?? []).some((e) => !e.noted || this.notePending(record.parentKey, `${record.id}#${e.seq}`));
   }
 
-  private notePending(parentKey: string, name: string): boolean {
+  /** While the notes cannot be read, the note may be unread on disk: by
+   *  default that counts as pending (nothing is cleaned up over it). The
+   *  delivery paths pass false, so they write a copy and retry until it lands. */
+  private notePending(parentKey: string, name: string, whenUnreadable = true): boolean {
     const marker = `<tomo-event type="subsession-report" name="${name}"`;
-    return this.deps.hasPendingNote(parentKey, (n) => n.includes(marker));
+    return this.deps.hasPendingNote(parentKey, (n) => n.includes(marker), whenUnreadable);
   }
 
   private wakeForReport(record: SubsessionRecord): void {

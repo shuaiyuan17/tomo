@@ -548,7 +548,7 @@ export class Agent {
       // A task owned by the owner's DM speaks for the owner alone: its notes
       // never drain into a summoned group's turn on that session.
       queuePendingNote: (key, note) => this.queuePendingNote(key, isDmSessionKey(key) ? markOwnerAudience(note) : note),
-      hasPendingNote: (key, predicate) => this.pendingNotesQueue.hasNote(key, predicate),
+      hasPendingNote: (key, predicate, whenUnreadable) => this.pendingNotesQueue.hasNote(key, predicate, whenUnreadable),
       persistPendingNotes: (key) => this.pendingNotesQueue.persistNow(key),
       wakeScope: (parentKey, prompt) => {
         const body = appendToTomoEventBody(prompt, CONTINUITY_DELIVERY_NOTE);

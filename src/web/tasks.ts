@@ -333,13 +333,16 @@ export class TaskBoard {
 }
 
 /**
- * Unsettled tasks in the order a cap keeps them: those running first, then
- * ended ones whose work runs on, each by start. A parent is only kept once
- * every running task of its session is, so its running work is always there
- * for the rail to read it as working.
+ * Unsettled tasks in the order a cap keeps them: those running first (oldest
+ * first), then ended ones whose work runs on, newest first. A parent is only
+ * kept once every running task of its session is, and (a task starting after
+ * the one that started it) once every ended task between it and that work,
+ * so the rail can always trace it to its running work.
  */
 function runningFirst(a: WebTask, b: WebTask): number {
-  return Number(a.endedAt !== undefined) - Number(b.endedAt !== undefined) || a.startedAt - b.startedAt;
+  const ended = Number(a.endedAt !== undefined) - Number(b.endedAt !== undefined);
+  if (ended !== 0) return ended;
+  return a.endedAt === undefined ? a.startedAt - b.startedAt : b.startedAt - a.startedAt;
 }
 
 /**

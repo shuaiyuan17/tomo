@@ -32,6 +32,8 @@ export interface SubsessionSentMessage {
    * task panel the owner wrote from. Unset: sent to the owner's chat as is.
    */
   via?: "main" | "panel";
+  /** via "main": the note's name (a retry of the same turn's words is not handed over twice). */
+  key?: string;
 }
 
 /**

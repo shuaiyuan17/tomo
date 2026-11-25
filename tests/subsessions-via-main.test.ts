@@ -511,4 +511,95 @@ describe("via-main: nothing lost, nothing twice", () => {
     expect(messageNotes(h, "dm:owner")[0]).toContain("MEDIA:/tmp/report.pdf");
     expect(h.store.get(t.id)!.sent.at(-1)).toMatchObject({ kind: "reply", via: "main" });
   });
+
+  it("a retried turn's same answer is not handed over again, even after the main session read the first", async () => {
+    let tries = 0;
+    let handed = 0;
+    const h = harness({}, async (key, prompt) => {
+      if (!prompt.includes("subsession-owner-message")) return { ok: true };
+      tries += 1;
+      await h.service.reply(key, "Yes");
+      // The main session reads the note; then this turn fails, and runs again.
+      handed += messageNotes(h, "dm:owner").filter((x) => x.includes("Yes")).length;
+      h.notes.set("dm:owner", []);
+      return tries === 1 ? { ok: false, error: "boom" } : { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "ship it?");
+    await flush();
+    expect(tries).toBe(2);
+    expect(handed).toBe(1);
+    expect(h.store.get(t.id)!.sent.filter((m) => m.kind === "reply")).toHaveLength(1);
+  });
+
+  it("the same words answering two different messages are two notes", async () => {
+    const h = harness({}, async (key, prompt) => {
+      if (prompt.includes("subsession-owner-message")) await h.service.reply(key, "Yes");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "first?");
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "second?");
+    await flush();
+    expect(messageNotes(h, "dm:owner").filter((x) => x.includes("Yes"))).toHaveLength(2);
+  });
+
+  it("an answer relayed before the question's note was read takes the note back", async () => {
+    let n = 0;
+    const h = harness({}, async (key) => {
+      n += 1;
+      if (n === 1) await h.service.ask(key, "Deploy?");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(messageNotes(h, "dm:owner")).toHaveLength(1);
+    h.service.relay(t.id, "yes (the owner said so earlier)");
+    await flush();
+    expect(messageNotes(h, "dm:owner").filter((x) => x.includes("Deploy?"))).toEqual([]);
+  });
+
+  it("a called-off question wakes the main session for it", async () => {
+    let n = 0;
+    const h = harness({}, async (key) => {
+      n += 1;
+      if (n === 1) await h.service.ask(key, "Deploy?");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.notes.set("dm:owner", []);
+    h.messageWakes = [];
+    await h.service.cancel(t.id, "test");
+    expect(h.messageWakes).toEqual(["dm:owner"]);
+  });
+
+  it("at start, takes back a question note left on disk whose task no longer waits on it", async () => {
+    const disk = new Map<string, string[]>();
+    const sdk = new Set<string>();
+    const h = harness({}, async (key, _p, hh) => {
+      await hh.service.ask(key, "Deploy?");
+      return { ok: true };
+    }, { disk, sdk });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    const askNote = messageNotes(h, "dm:owner")[0];
+    expect(askNote).toContain("Deploy?");
+    h.service.stop();
+    // The wait ended (here: the record moved on) but the note stayed on disk, as after a failed withdrawal.
+    h.store.transition(t.id, "relay", { patch: (r) => { r.pendingInput = []; } });
+    disk.set("dm:owner", [askNote, '<tomo-event type="subsession-message" name="s1:notify:0:abc" ts="x">keep</tomo-event>']);
+    const h2 = harness({}, undefined, { disk, sdk });
+    h2.service.start();
+    expect(h2.notes.get("dm:owner")!.some((x) => x.includes("Deploy?"))).toBe(false);
+    expect(h2.notes.get("dm:owner")!.some((x) => x.includes("keep"))).toBe(true);
+  });
 });

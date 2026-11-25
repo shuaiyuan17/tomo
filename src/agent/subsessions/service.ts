@@ -273,9 +273,15 @@ function sameQuestion(before: NonNullable<SubsessionRecord["askViaMain"]>, after
   return before.note !== undefined || after.note !== undefined ? before.note === after.note : before.at === after.at;
 }
 
-/** A message note's name: the task, the tool, and a digest of the words. */
-function messageNoteName(id: string, kind: SpeakKind, body: string): string {
-  return `${id}:${kind}:${createHash("sha256").update(body).digest("hex").slice(0, 16)}`;
+/** A message note's name: the task, the tool, the highest input seq its turn answers, and a digest of the words. */
+function messageNoteName(id: string, kind: SpeakKind, body: string, through: number): string {
+  return `${id}:${kind}:${through}:${createHash("sha256").update(body).digest("hex").slice(0, 16)}`;
+}
+
+/** The name of a task_ask note, or undefined for any other note. */
+function askNoteName(note: string): string | undefined {
+  const m = /<tomo-event type="subsession-message"[^>]*\bname="([^"]+:ask:[^"]+)"/.exec(note);
+  return m?.[1];
 }
 
 /** Every `subsession-message` note starts its opening tag with this. */
@@ -812,10 +818,16 @@ export class SubsessionService {
    */
   private handToMain(record: SubsessionRecord, kind: SpeakKind, body: string, commit?: (name: string, at: number) => boolean): SpeakResult {
     const at = this.now();
-    const name = messageNoteName(record.id, kind, body);
+    // The inputs the turn answers name it too: the same words answering
+    // another message are another message; a retry of this turn (its inputs
+    // kept) is the same one, also once the first note was read (`sent` keeps
+    // the name on disk).
+    const through = this.inflightThrough.get(record.id) ?? 0;
+    const name = messageNoteName(record.id, kind, body, through);
     const marker = `${MESSAGE_NOTE_MARKER} name="${name}"`;
     const own = (n: string) => n.includes(marker);
-    const already = this.deps.hasPendingNote(record.parentKey, own);
+    const handed = through > 0 && (this.safeGet(record.id) ?? record).sent.some((m) => m.key === name);
+    const already = handed || this.deps.hasPendingNote(record.parentKey, own);
     if (!already) {
       const note = formatMessageNote(record, kind, body, name);
       let saved = false;
@@ -847,7 +859,7 @@ export class SubsessionService {
       // The note is the durable copy; the record's log is for task_status and
       // the panel (marked so the mirror does not show it twice).
       this.safely(() => this.store.update(record.id, (r) => {
-        r.sent.push({ at, kind, text: body, via: "main" });
+        r.sent.push({ at, kind, text: body, via: "main", key: name });
         pushConversation(r, { at, from: "task", kind, text: truncate(body, CONVERSATION_TEXT_MAX), noted: true });
       }), "record a message handed to the main session");
     }
@@ -878,6 +890,8 @@ export class SubsessionService {
         "",
         "Don't put it to the owner now. If you already did and they answer, you may still pass it on with task_message, as information.",
       ].join("\n"), { name: `${record.id}:retract-${ask.at}` }));
+      // Soon, not with whatever turn comes next: the session may be about to ask.
+      this.wakeForMessages(record.parentKey);
     }, "tell the owning session a question no longer stands");
   }
 
@@ -1495,7 +1509,14 @@ export class SubsessionService {
     // Messages a task handed to its owning session whose note is still
     // unread: the wake queued for them lived in memory; the note is on disk,
     // so the wake is owed again.
+    // A question's note stands only while its task waits on it: one left on
+    // disk by a withdrawal that could not be written (the wait ended, or
+    // never began) is taken back now.
+    const standing = new Set(this.store.list().map((t) => t.askViaMain?.note).filter((n): n is string => !!n));
     for (const parentKey of new Set(this.store.list().map((t) => t.parentKey))) {
+      this.safely(() => {
+        while (this.withdrawMessageNote(parentKey, (n) => { const ask = askNoteName(n); return ask !== undefined && !standing.has(ask); })) { /* next */ }
+      }, "take back stale question notes");
       this.safely(() => { if (this.hasMessageNote(parentKey)) this.wakeForMessages(parentKey); }, "wake for unread task messages");
     }
     for (const task of this.store.list()) {
@@ -2248,7 +2269,12 @@ export class SubsessionService {
     if (outcome.ok && outcome.changed) this.syncTodo(outcome.record);
     // Ended by anything but the relay that answers it, or replaced by a new
     // question: it no longer stands.
-    if (outcome.ok && ask && event !== "relay" && !sameQuestion(ask, outcome.record.askViaMain)) {
+    if (outcome.ok && ask && event === "relay" && !outcome.record.askViaMain) {
+      // Answered by the main session: an unread copy of the question must not
+      // be put to the owner later.
+      const answered = ask;
+      if (answered.note) this.withdrawMessageNote(outcome.record.parentKey, (n) => n.includes(`${MESSAGE_NOTE_MARKER} name="${answered.note}"`));
+    } else if (outcome.ok && ask && !sameQuestion(ask, outcome.record.askViaMain)) {
       this.retractQuestion(outcome.record, ask, event === "owner_message" ? "the owner wrote to it directly"
         : outcome.record.askViaMain ? "it asked a new question" : `it is ${outcome.record.status} now`);
     }

@@ -26,6 +26,7 @@ export const subsessions = {
     line: "{{id}} · {{title}} — {{status}}",
     lineProgress: "{{id}} · {{title}} — {{status}} · {{progress}}",
     detailWaiting: "Waiting: {{reason}}",
+    detailFallback: "When that is done: {{reason}}",
     detailProgress: "Progress: {{progress}}",
     detailModel: "Model: {{model}}",
     detailHint: "/s {{id}} <message> to talk to it, /s {{id}} stop to end it.",
@@ -46,6 +47,7 @@ export const subsessions = {
   status: {
     queued: "queued",
     active: "working",
+    background: "working (a background task is running)",
     waitingOwner: "waiting for you",
     waitingExternal: "waiting on something external",
     finished: "finished",

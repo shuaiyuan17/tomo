@@ -23,7 +23,7 @@ export async function taskCommandReply(
     const tasks = service.list(scope).filter((r) => r.status !== "archived")
       .sort((a, b) => b.lastActivityAt - a.lastActivityAt);
     if (tasks.length === 0) return t("cmd.empty");
-    const lines = tasks.slice(0, LIST_MAX).map((r) => taskLine(t, r));
+    const lines = tasks.slice(0, LIST_MAX).map((r) => taskLine(t, r, service.backgroundRunning(r)));
     if (tasks.length > LIST_MAX) lines.push(t("cmd.more", { count: tasks.length - LIST_MAX }));
     return joinText(lines);
   }
@@ -33,7 +33,7 @@ export async function taskCommandReply(
 
   switch (address.kind) {
     case "show":
-      return taskDetail(t, record);
+      return taskDetail(t, record, service.backgroundRunning(record));
     case "stop": {
       if (record.status === "cancelled") return t("cmd.alreadyStopped", { id: record.id });
       if (TERMINAL_STATUSES.has(record.status)) return t("cmd.ended", { id: record.id, status: statusWord(t, record) });
@@ -58,7 +58,9 @@ export async function taskCommandReply(
   }
 }
 
-function statusWord(t: OwnerT<"subsessions">, r: SubsessionRecord): OwnerText {
+/** `background`: waiting(external) with its own background work still running (SubsessionService.backgroundRunning). */
+function statusWord(t: OwnerT<"subsessions">, r: SubsessionRecord, background = false): OwnerText {
+  if (background) return t("status.background");
   switch (r.status) {
     case "queued": return t("status.queued");
     case "active": return t("status.active");
@@ -70,14 +72,17 @@ function statusWord(t: OwnerT<"subsessions">, r: SubsessionRecord): OwnerText {
   }
 }
 
-function taskLine(t: OwnerT<"subsessions">, r: SubsessionRecord): OwnerText {
-  const values = { id: r.id, title: r.title, status: statusWord(t, r) };
+function taskLine(t: OwnerT<"subsessions">, r: SubsessionRecord, background: boolean): OwnerText {
+  const values = { id: r.id, title: r.title, status: statusWord(t, r, background) };
   return r.progress ? t("cmd.lineProgress", { ...values, progress: r.progress }) : t("cmd.line", values);
 }
 
-function taskDetail(t: OwnerT<"subsessions">, r: SubsessionRecord): OwnerText {
-  const lines: OwnerText[] = [t("cmd.line", { id: r.id, title: r.title, status: statusWord(t, r) })];
-  if (r.status === "waiting" && r.waitingReason) lines.push(t("cmd.detailWaiting", { reason: r.waitingReason }));
+function taskDetail(t: OwnerT<"subsessions">, r: SubsessionRecord, background: boolean): OwnerText {
+  const lines: OwnerText[] = [t("cmd.line", { id: r.id, title: r.title, status: statusWord(t, r, background) })];
+  // Working in the background: what it waits on besides is only its fallback.
+  if (r.status === "waiting" && r.waitingReason) {
+    lines.push(background ? t("cmd.detailFallback", { reason: r.waitingReason }) : t("cmd.detailWaiting", { reason: r.waitingReason }));
+  }
   if (r.progress) lines.push(t("cmd.detailProgress", { progress: r.progress }));
   if (r.model) lines.push(t("cmd.detailModel", { model: r.model }));
   lines.push(t("cmd.detailHint", { id: r.id }));

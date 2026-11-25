@@ -59,6 +59,18 @@ describe("the rail's view of sub-sessions", () => {
     expect(view("waiting")).toMatchObject({ status: "waiting", waitingOn: "external" });
   });
 
+  it("marks a task waiting on something external as working in the background only while its background work runs", () => {
+    const waiting = record("s1", { status: "waiting", waitingOn: "external" });
+    expect(subsessionView(waiting, "dm:owner", NOW, false, true)).toMatchObject({ status: "waiting", waitingOn: "external", background: true });
+    expect(subsessionView(waiting, "dm:owner", NOW, false, false)).not.toHaveProperty("background");
+    // Never for a task waiting on the owner, nor one that is not waiting.
+    expect(subsessionView(record("s2", { status: "waiting", waitingOn: "owner" }), "dm:owner", NOW, false, true)).not.toHaveProperty("background");
+    expect(subsessionView(record("s3", { status: "active" }), "dm:owner", NOW, false, true)).not.toHaveProperty("background");
+    const list = subsessionList([waiting, record("s4", { status: "waiting", waitingOn: "external", createdAt: NOW + 1 })], "dm:owner", NOW, () => false, (r) => r.id === "s1");
+    expect(list.map((v) => [v.id, v.background ?? false])).toEqual([["s1", true], ["s4", false]]);
+    expect(subsessionDetail(waiting, "dm:owner", NOW, false, true)?.background).toBe(true);
+  });
+
   it("carries the conversation, brief and report, clipped to fit the IPC frame", () => {
     const detail = subsessionDetail(record("s1", {
       brief: "b".repeat(BRIEF_LIMIT + 10), quote: ["what the owner said"], report: "Done.", conversationSeq: 2,

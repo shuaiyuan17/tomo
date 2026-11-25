@@ -13,7 +13,7 @@ import { ModelBadge } from "./model-badge.js";
 import { type TaskRow, type TreeGuide, buildTaskView, elapsed, formatElapsed, lastStep, stateLabel, taskKind, treeGuides } from "./tasks.js";
 import { i18n, useTranslation } from "./i18n/index.js";
 import { toolIcon } from "./tool-calls.js";
-import { isOpenSubsession, subsessionState, subsessionStateLabel } from "./subsessions.js";
+import { isOpenSubsession, subsessionState, subsessionStateLabel, isWorkingState } from "./subsessions.js";
 import { IdPill, SubsessionView, type SubsessionSend } from "./subsession-view.js";
 
 /** A task's transcript view: its own chunk, fetched when a task is opened. */
@@ -156,7 +156,7 @@ function SubsessionCard({ task, onOpen }: { task: WebSubsession; onOpen: () => v
       <span className={cn("block text-[13px] leading-normal font-medium [overflow-wrap:anywhere]", !open && "text-muted-foreground")}>
         <IdPill id={task.id} className="mr-1.5 align-[1px]" />{task.title}</span>
       <p className="mt-0.5 mb-0 line-clamp-2 text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]">
-        {state === "working" ? <span className="shimmer">{subsessionStateLabel(task)}</span>
+        {isWorkingState(state) ? <span className="shimmer">{subsessionStateLabel(task)}</span>
           : <span className={cn(state === "waitingOwner" && "font-medium text-foreground/80")}>{subsessionStateLabel(task)}</span>}
         {task.progress && open && <> · {task.progress}</>}</p>
     </button>

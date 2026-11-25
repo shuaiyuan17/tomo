@@ -9,19 +9,29 @@ import { i18n } from "./i18n/index.js";
 /** Sub-sessions in the Tasks rail: render logic, kept pure so it is testable. */
 
 const STATE_LABELS = {
-  working: "tasks:subsession.state.working", active: "tasks:subsession.state.active", queued: "tasks:subsession.state.queued",
+  working: "tasks:subsession.state.working", background: "tasks:subsession.state.background", active: "tasks:subsession.state.active", queued: "tasks:subsession.state.queued",
   waitingOwner: "tasks:subsession.state.waitingOwner", waiting: "tasks:subsession.state.waiting",
   finished: "tasks:subsession.state.finished", cancelled: "tasks:subsession.state.cancelled", failed: "tasks:subsession.state.failed",
 } as const;
 
 const WAITING = { owner: "waitingOwner", other: "waiting" } as const;
-/** Which state a task is shown in: a running turn reads "Working", a task waiting on the owner says so. */
-export function subsessionState(task: Pick<WebSubsession, "status" | "working" | "waitingOn">): keyof typeof STATE_LABELS {
+/**
+ * Which state a task is shown in: a running turn reads "Working", a task
+ * waiting on the owner says so, and one waiting on something external while
+ * its own background work still runs reads as working in the background.
+ */
+type ShownTask = Pick<WebSubsession, "status" | "working" | "waitingOn" | "background">;
+export function subsessionState(task: ShownTask): keyof typeof STATE_LABELS {
   if (task.status === "active") return task.working ? "working" : "active";
+  if (task.status === "waiting" && task.waitingOn === "external" && task.background) return "background";
   if (task.status === "waiting") return WAITING[task.waitingOn === "owner" ? "owner" : "other"];
   return task.status;
 }
-export function subsessionStateLabel(task: Pick<WebSubsession, "status" | "working" | "waitingOn">): string {
+/** Shown with the working shimmer: a turn running now, or its background work. */
+export function isWorkingState(state: ReturnType<typeof subsessionState>): boolean {
+  return state === "working" || state === "background";
+}
+export function subsessionStateLabel(task: ShownTask): string {
   return i18n.t(STATE_LABELS[subsessionState(task)]);
 }
 
@@ -30,9 +40,9 @@ export function isOpenSubsession(task: Pick<WebSubsession, "status">): boolean {
   return task.status === "queued" || task.status === "active" || task.status === "waiting";
 }
 
-/** Sub-sessions that count as activity on the Tasks button: those running now. */
+/** Sub-sessions that count as activity on the Tasks button: those running now, in a turn or in the background. */
 export function activeSubsessions(tasks: readonly WebSubsession[]): number {
-  return tasks.filter((task) => task.status === "active").length;
+  return tasks.filter((task) => task.status === "active" || (task.status === "waiting" && task.background === true)).length;
 }
 
 /** One message waiting for its POST: shown at the end of the chat until the task's conversation has it. */

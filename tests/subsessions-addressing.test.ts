@@ -81,6 +81,10 @@ interface H {
   registryUnreadable?: boolean;
   /** The 5-hour window's share used, as the quota gate reads it. */
   quota?: number;
+  /** Enabled cron jobs on every task key (a check-back makes a quiet turn end in waiting(external)). */
+  cronJobs?: number;
+  /** Task keys whose live session still has background work. */
+  background?: Set<string>;
 }
 
 /** Note writes fail (the note is held in memory only), from construction on. */
@@ -107,9 +111,10 @@ function harness(onTurn: H["onTurn"] = () => ({ ok: true }), maxRunning = DEFAUL
     hasPendingNote: () => false,
     wakeScope: () => {},
     contextUsage: () => undefined,
-    cronJobCount: () => 0,
+    cronJobCount: () => h.cronJobs ?? 0,
     removeCronJobs: () => {},
     stopSession: async () => {},
+    hasBackgroundWork: (key) => h.background?.has(key) === true,
     registryReadable: () => h.registryUnreadable !== true,
     hasSdkSession: () => true,
     ensureRegistryEntry: () => {},
@@ -567,6 +572,48 @@ describe("/s commands", () => {
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).toContain("Progress: halfway");
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s7" })).toBe("There's no sub-session s7.");
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "usage" })).toContain("/s s3 stop");
+  });
+
+  it("shows a task waiting on its check-back as working while its own background work runs, without changing its status", async () => {
+    const { formatTaskDetail, formatTaskLine } = await import("../src/mcp/subsession-tools.js");
+    const h = harness(() => ({ ok: true }), 1);
+    h.cronJobs = 1;
+    h.background = new Set(["task:s1"]);
+    h.service.start();
+    spawn(h);
+    await flush();
+    const record = h.service.get("s1")!;
+    // The lifecycle is untouched: still waiting(external), so it holds no slot.
+    expect(record).toMatchObject({ status: "waiting", waitingOn: "external" });
+    expect(h.service.backgroundRunning(record)).toBe(true);
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).toBe("s1 · Fix CI — working (a background task is running)");
+    const shown = String(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" }));
+    expect(shown).toContain("When that is done: waiting for its scheduled check-back");
+    expect(shown).not.toContain("Waiting:");
+    expect(formatTaskLine(record, Date.now(), h.service.backgroundRunning(record))).toContain("[working (background task running)]");
+    expect(formatTaskDetail(record, Date.now(), true)).toContain("Status: working (background task running) — when that is done: waiting for its scheduled check-back");
+    const zh = ownerT("subsessions", "zh-Hans");
+    expect(await taskCommandReply(zh, h.service, "dm:owner", { kind: "list" })).toContain("在干活（后台任务运行中）");
+    // The one slot is free for the next task.
+    spawn(h);
+    await flush();
+    expect(h.service.get("s2")?.status).not.toBe("queued");
+
+    // Its background work done: purely waiting on the check-back again.
+    h.background.clear();
+    expect(h.service.backgroundRunning(record)).toBe(false);
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).toContain("s1 · Fix CI — waiting on something external");
+    expect(formatTaskDetail(record)).toContain("Status: waiting (external) — waiting for its scheduled check-back");
+  });
+
+  it("never shows a task waiting on the owner as working, whatever runs in the background", async () => {
+    const h = harness();
+    h.background = new Set(["task:s1"]);
+    await askAndWait(h);
+    const record = h.service.get("s1")!;
+    expect(record).toMatchObject({ status: "waiting", waitingOn: "owner" });
+    expect(h.service.backgroundRunning(record)).toBe(false);
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).toContain("waiting for you");
   });
 
   it("start runs a queued task past the slot cap", async () => {

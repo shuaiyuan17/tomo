@@ -57,6 +57,24 @@ describe("the web's access to sub-sessions", () => {
     await agent.stop();
   });
 
+  it("marks a task waiting on something external as working in the background while its session's background work runs", async () => {
+    const agent = await boot();
+    agent.subsessions!.spawn("dm:alex", { title: "Mine", brief: "b" });
+    await waitFor(() => expect(agent.subsessions!.get("s1")?.status).toBe("active"));
+    // As a turn that ended with a check-back scheduled leaves it.
+    const moved = (agent.subsessions as unknown as { transition: (id: string, e: string, o: object) => { ok: boolean } })
+      .transition("s1", "wait_external", { reason: "waiting for its scheduled check-back", expectFrom: ["active"] });
+    expect(moved.ok).toBe(true);
+    const background = vi.spyOn(agent, "hasBackgroundWork").mockImplementation((key) => key === "task:s1");
+    const web = agent.webSubsessions()!;
+    expect(web.list().tasks[0]).toMatchObject({ id: "s1", status: "waiting", waitingOn: "external", background: true });
+    expect(web.get("s1")).toMatchObject({ background: true });
+    expect(agent.subsessions!.backgroundRunning(agent.subsessions!.get("s1")!)).toBe(true);
+    background.mockReturnValue(false);
+    expect(web.list().tasks[0]).not.toHaveProperty("background");
+    await agent.stop();
+  });
+
   it("refuses a task that has ended", async () => {
     const agent = await boot();
     // Turns end at once here, so the cancel does not wait for one to stop.

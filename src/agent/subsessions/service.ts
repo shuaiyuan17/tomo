@@ -101,6 +101,12 @@ export interface SubsessionServiceDeps {
   sendToScope(parentKey: string, text: string, taskKey: string, noteFrom: string, harnessPrefix: string): Promise<ScopeSendResult>;
   /** Is a turn in flight on the key right now? */
   hasTurnInFlight?(key: string): boolean;
+  /**
+   * Does the key's live session still have its own background work (a
+   * background command or subagent running, or one that finished and whose
+   * report turn is still due)? Display only: it never changes the lifecycle.
+   */
+  hasBackgroundWork?(key: string): boolean;
   /** Close the key's live session (idle), so its next turn is built afresh. */
   closeSession?(key: string): void;
   /** A harness notice about a task, to the owning scope's chat. */
@@ -325,6 +331,22 @@ export class SubsessionService {
    * fires, background reports) checks this, so nothing reaches a task before
    * recovery is done with it.
    */
+  /**
+   * Is the task waiting(external) while its own background work still runs?
+   * It then wakes by itself when that work reports back, so /s, task_status
+   * and the web rail show it as working (in the background), not as waiting.
+   * Display only: the status stays waiting(external), and slots, quota and
+   * the caps read the status as before.
+   */
+  backgroundRunning(record: Pick<SubsessionRecord, "status" | "waitingOn" | "sessionKey">): boolean {
+    if (record.status !== "waiting" || record.waitingOn !== "external") return false;
+    try {
+      return this.deps.hasBackgroundWork?.(record.sessionKey) === true;
+    } catch {
+      return false;
+    }
+  }
+
   available(): boolean {
     return this.deps.config().enabled && !this.broken && this.recovered;
   }

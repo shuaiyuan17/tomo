@@ -558,6 +558,7 @@ export class Agent {
       removeCronJobs: (key) => cron.removeAll(key),
       stopSession: (key, timeoutMs) => this.stopTaskSession(key, timeoutMs),
       hasTurnInFlight: (key) => this.liveSessionManager.hasTurnInFlight(key),
+      hasBackgroundWork: (key) => this.hasBackgroundWork(key),
       closeSession: (key) => this.liveSessionManager.closeLiveSession(key),
       registryReadable: () => this.sessions.registryReadable(),
       hasSdkSession: (key) => this.sessions.getSdkSessionId(key) !== undefined,
@@ -1963,7 +1964,7 @@ export class Agent {
       list: () => {
         const scope = this.router.ownerSessionKey();
         if (!scope || !service.available()) return { available: false, tasks: [] };
-        try { return { available: true, tasks: subsessionList(service.list(scope), scope, Date.now(), working) }; }
+        try { return { available: true, tasks: subsessionList(service.list(scope), scope, Date.now(), working, (r) => service.backgroundRunning(r)) }; }
         catch { return { available: false, tasks: [] }; }
       },
       get: (id) => {
@@ -1972,7 +1973,7 @@ export class Agent {
         if (!scope || !service.available()) return null;
         let record;
         try { record = service.get(id); } catch { return null; }
-        return record ? subsessionDetail(record, scope, Date.now(), working(record.sessionKey)) : undefined;
+        return record ? subsessionDetail(record, scope, Date.now(), working(record.sessionKey), service.backgroundRunning(record)) : undefined;
       },
       message: (id, text, requestId) => {
         const scope = this.router.ownerSessionKey();

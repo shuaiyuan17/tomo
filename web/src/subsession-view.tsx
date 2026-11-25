@@ -8,7 +8,7 @@ import { api, ApiError } from "./api.js";
 import { Text } from "./markdown.js";
 import { messageDateTime, messageTime } from "./message-meta.js";
 import { createCompositionGuard } from "./compose-keys.js";
-import { canRetrySend, isOpenSubsession, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
+import { canRetrySend, isOpenSubsession, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, isWorkingState, withListBackground, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
 import { i18n, useTranslation } from "./i18n/index.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
@@ -56,7 +56,8 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
     return () => { controller.abort(); clearTimeout(timer); };
   }, [id, revision, reload]);
   // What the list says now wins over the last detail read (it is the newer of the two).
-  const shown = { ...(detail ?? {}), ...summary };
+  // `background` is dropped, not set false, when it ends: take it from the list alone.
+  const shown = withListBackground(detail, summary);
   const state = subsessionState(shown);
   // Not before the conversation has been read: a message must have somewhere to show.
   const writable = !!send && shown.writable && status !== "gone" && !!detail;
@@ -87,7 +88,7 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
     <div className="mb-2.5 px-2.5">
       <h2 id="subsession-heading" className="m-0 text-[15px] leading-snug font-semibold [overflow-wrap:anywhere]"><IdPill id={id} className="mr-1.5 align-[1.5px]" />{shown.title}</h2>
       <p className="m-0 mt-0.5 tracking-[0.02em] text-[10px] text-muted-foreground [overflow-wrap:anywhere]" data-testid="subsession-state">
-        {state === "working" ? <span className="shimmer">{subsessionStateLabel(shown)}</span> : <span className={cn(state === "waitingOwner" && "font-medium text-foreground/80")}>{subsessionStateLabel(shown)}</span>}
+        {isWorkingState(state) ? <span className="shimmer">{subsessionStateLabel(shown)}</span> : <span className={cn(state === "waitingOwner" && "font-medium text-foreground/80")}>{subsessionStateLabel(shown)}</span>}
         {shown.waitingReason && state === "waitingOwner" ? <> · {shown.waitingReason}</> : null}</p>
       {shown.progress && isOpenSubsession(shown) && <p className="m-0 mt-1.5 text-[12px] leading-snug text-muted-foreground [overflow-wrap:anywhere]"><span className="font-medium text-foreground/80">{t("now")}</span> {shown.progress}</p>}
     </div>

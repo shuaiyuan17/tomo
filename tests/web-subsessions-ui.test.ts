@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { activeSubsessions, canRetrySend, pendingFor, updatePending, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel } from "../web/src/subsessions.js";
+import { activeSubsessions, canRetrySend, pendingFor, updatePending, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel, isWorkingState, subsessionsRefreshMs, SUBSESSIONS_BACKGROUND_REFRESH_MS, withListBackground } from "../web/src/subsessions.js";
 import type { WebSubsession, WebSubsessionDetail } from "../src/web/protocol.js";
 
 const task = (extra: Partial<WebSubsession> = {}): WebSubsession => ({ id: "s1", title: "T", status: "active", working: false,
@@ -15,6 +15,35 @@ describe("sub-sessions in the Tasks rail", () => {
     expect(subsessionState(task({ status: "finished" }))).toBe("finished");
     expect(subsessionStateLabel(task({ status: "waiting", waitingOn: "owner" }))).toBe("Waiting for you");
     expect(subsessionStateLabel(task({ working: true }))).toBe("Working");
+  });
+
+  it("shows a task whose background work still runs as working, not waiting", () => {
+    const bg = task({ status: "waiting", waitingOn: "external", background: true });
+    expect(subsessionState(bg)).toBe("background");
+    expect(isWorkingState(subsessionState(bg))).toBe(true);
+    expect(subsessionStateLabel(bg)).toBe("Working (background)");
+    expect(isWorkingState(subsessionState(task({ status: "waiting", waitingOn: "external" })))).toBe(false);
+    // Waiting on the owner is never hidden behind background work.
+    expect(subsessionState(task({ status: "waiting", waitingOn: "owner", background: true }))).toBe("waitingOwner");
+    expect(activeSubsessions([bg, task({ id: "s2", status: "waiting", waitingOn: "external" })])).toBe(1);
+  });
+
+  it("re-reads the list while a task waits on something external, since its background work changes no record", () => {
+    const bg = task({ status: "waiting", waitingOn: "external", background: true });
+    expect(subsessionsRefreshMs({ available: true, tasks: [task(), bg] })).toBe(SUBSESSIONS_BACKGROUND_REFRESH_MS);
+    // Waiting on something external without it: background work may start (a report turn), so it is read again too.
+    expect(subsessionsRefreshMs({ available: true, tasks: [task(), task({ id: "s2", status: "waiting", waitingOn: "external" })] })).toBe(SUBSESSIONS_BACKGROUND_REFRESH_MS);
+    expect(subsessionsRefreshMs({ available: true, tasks: [task(), task({ id: "s2", status: "waiting", waitingOn: "owner" }), task({ id: "s3", status: "finished" })] })).toBeUndefined();
+    expect(subsessionsRefreshMs({ available: false, tasks: [] })).toBeUndefined();
+  });
+
+  it("takes background from the list alone when an opened task is shown", () => {
+    const summary = task({ status: "waiting", waitingOn: "external" });
+    const shown = withListBackground(detail({ status: "waiting", waitingOn: "external", background: true }), summary);
+    expect(shown).not.toHaveProperty("background");
+    expect(subsessionState(shown)).toBe("waiting");
+    expect(withListBackground(detail(), { ...summary, background: true }).background).toBe(true);
+    expect(withListBackground(undefined, summary)).toEqual(summary);
   });
 
   it("counts only running tasks on the Tasks button", () => {

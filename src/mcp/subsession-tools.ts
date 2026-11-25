@@ -21,21 +21,24 @@ function ago(ms: number, now: number): string {
   return h < 48 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
 }
 
-function statusLabel(r: SubsessionRecord): string {
+/** `background`: waiting(external) with its own background work still running (SubsessionService.backgroundRunning). */
+function statusLabel(r: SubsessionRecord, background: boolean): string {
+  if (background) return "working (background task running)";
   return r.status === "waiting" ? `waiting (${r.waitingOn ?? "owner"})` : r.status;
 }
 
 /** One line per task, for the owning session's list. */
-export function formatTaskLine(r: SubsessionRecord, now = Date.now()): string {
+export function formatTaskLine(r: SubsessionRecord, now = Date.now(), background = false): string {
   const progress = r.progress ? ` · ${r.progress}` : "";
-  return `${r.id} [${statusLabel(r)}] ${r.title}${progress} (active ${ago(r.lastActivityAt, now)})`;
+  return `${r.id} [${statusLabel(r, background)}] ${r.title}${progress} (active ${ago(r.lastActivityAt, now)})`;
 }
 
 /** The whole record, as the task or its owning session reads it. */
-export function formatTaskDetail(r: SubsessionRecord, now = Date.now()): string {
+export function formatTaskDetail(r: SubsessionRecord, now = Date.now(), background = false): string {
+  const reason = r.waitingReason ? (background ? ` — when that is done: ${r.waitingReason}` : ` — ${r.waitingReason}`) : "";
   const lines = [
     `${r.id}: ${r.title}`,
-    `Status: ${statusLabel(r)}${r.waitingReason ? ` — ${r.waitingReason}` : ""}`,
+    `Status: ${statusLabel(r, background)}${reason}`,
     `Created ${ago(r.createdAt, now)}, last activity ${ago(r.lastActivityAt, now)}`,
   ];
   if (r.model) lines.push(`Model: ${r.model}`);
@@ -156,7 +159,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
         const r = service("task_status");
         if (!r.ok) return r.error;
         const record = r.s.byKey(deps.key);
-        return record ? ok(formatTaskDetail(record)) : fail("task_status", "no task record for this session.");
+        return record ? ok(formatTaskDetail(record, Date.now(), r.s.backgroundRunning(record))) : fail("task_status", "no task record for this session.");
       },
       { alwaysLoad: true, searchHint: "task status record" },
     ),
@@ -219,10 +222,10 @@ export function buildTaskOwnerTools(deps: { service: () => SubsessionService | u
         if (!c.ok) return c.error;
         if (id) {
           const record = own(c.s, c.scope, id);
-          return record ? ok(formatTaskDetail(record)) : fail("task_status", `no task ${id} in this conversation.`);
+          return record ? ok(formatTaskDetail(record, Date.now(), c.s.backgroundRunning(record))) : fail("task_status", `no task ${id} in this conversation.`);
         }
         const tasks = c.s.list(c.scope);
-        return ok(tasks.length === 0 ? "No sub-sessions." : tasks.map((t) => formatTaskLine(t)).join("\n"));
+        return ok(tasks.length === 0 ? "No sub-sessions." : tasks.map((t) => formatTaskLine(t, Date.now(), c.s.backgroundRunning(t))).join("\n"));
       },
       { alwaysLoad: true, searchHint: "sub-session task status list progress report" },
     ),

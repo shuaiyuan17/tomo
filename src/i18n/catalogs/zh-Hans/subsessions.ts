@@ -24,6 +24,7 @@ export const subsessions = {
     line: "{{id}} · {{title}} — {{status}}",
     lineProgress: "{{id}} · {{title}} — {{status}} · {{progress}}",
     detailWaiting: "在等：{{reason}}",
+    detailFallback: "跑完之后：{{reason}}",
     detailProgress: "进度：{{progress}}",
     detailModel: "模型：{{model}}",
     detailHint: "/s {{id}} <话> 跟它说，/s {{id}} stop 结束它。",
@@ -44,6 +45,7 @@ export const subsessions = {
   status: {
     queued: "排队中",
     active: "在干活",
+    background: "在干活（后台任务运行中）",
     waitingOwner: "在等你",
     waitingExternal: "在等外部结果",
     finished: "已完成",

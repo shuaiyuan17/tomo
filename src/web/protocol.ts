@@ -100,6 +100,12 @@ export interface WebSubsession {
   progress?: string;
   /** A turn is running on it right now. */
   working: boolean;
+  /**
+   * Set (true) while it is waiting on something external but its own
+   * background work (a command, a subagent) is still running: it wakes by
+   * itself when that reports back, so the rail shows it as working.
+   */
+  background?: true;
   createdAt: number;
   lastActivityAt: number;
   endedAt?: number;

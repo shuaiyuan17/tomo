@@ -391,7 +391,8 @@ function runChild(mode: string): Promise<{ code: number; stdout: string; stderr:
  * terminate the very process running the assertions. So: real children with
  * the handlers installed, and one control without them (i.e. main), which
  * shows the default those children are measured against. A non-Error reason
- * is covered in-process ("keeps a non-Error reason inspectable").
+ * is covered here in a real child and in-process ("keeps a non-Error reason
+ * inspectable").
  */
 describe("synthetic rejection and exception in a real process", () => {
   it("kills a daemon WITHOUT the handlers (the bug)", { timeout: 60_000 }, async () => {

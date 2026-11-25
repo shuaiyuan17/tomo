@@ -53,7 +53,7 @@ const { mockState } = vi.hoisted(() => ({
       errors: Record<string, string>;
     } | null>),
     compactTriggered: false,
-    sessionContexts: [] as Array<{ sessionKey: string; backgroundLaunchDenial?: () => string | null }>,
+    sessionContexts: [] as Array<{ sessionKey: string; backgroundLaunchDenial?: () => string | null; spawnDenial?: () => string | null }>,
     /** What the (mocked) prompt build hands the session as its snapshot. */
     buildContext: null as null | ((key: string) => { memory: string[]; people: string[] }),
     onInterrupt: null as null | ((err: Error, session: FakeSession) => void),
@@ -176,7 +176,7 @@ vi.mock("../src/config.js", async () => {
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
   return {
-    config: { sdkSessionsDir: mkdtempSync(join(tmpdir(), "tomo-lsm-sdk-")), liveSessionTimeoutMs: 1000, liveSessionIdleTimeoutMs: 60 * 60 * 1000 },
+    config: { sdkSessionsDir: mkdtempSync(join(tmpdir(), "tomo-lsm-sdk-")), liveSessionTimeoutMs: 1000, liveSessionIdleTimeoutMs: 60 * 60 * 1000, lcm: { blockSpawnAtPct: 80 } },
   };
 });
 
@@ -591,6 +591,29 @@ describe("LiveSessionManager session lifecycle", () => {
     if (r.ok) manager.finishCompact("telegram:1", r.reservationId);
     expect(manager.isCompactPending("telegram:1")).toBe(false);
     expect(ctx.backgroundLaunchDenial!()).toBeNull();
+  });
+
+  it("the spawn gate reads the live session's last turn result (the nudger's reading), per call", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.getOrCreateLiveSession("telegram:1");
+    const ctx = mockState.sessionContexts.find((c) => c.sessionKey === "telegram:1")!;
+    expect(ctx.spawnDenial).toBeTypeOf("function");
+    // No reading yet (a fresh or just-reloaded session): open.
+    expect(ctx.spawnDenial!()).toBeNull();
+    const session = mockState.instances[0] as unknown as { lastResult: unknown };
+    session.lastResult = { contextUsed: 870, contextMax: 1000 };
+    expect(ctx.spawnDenial!()).toContain("Context is at 87%");
+    // Usage back under the threshold: open again, no latch.
+    session.lastResult = { contextUsed: 790, contextMax: 1000 };
+    expect(ctx.spawnDenial!()).toBeNull();
+    // The threshold is read per call (a config reload applies at once).
+    const lcm = (mockConfig as unknown as { lcm: { blockSpawnAtPct: number } }).lcm;
+    lcm.blockSpawnAtPct = 75;
+    try {
+      expect(ctx.spawnDenial!()).toContain("79%");
+    } finally {
+      lcm.blockSpawnAtPct = 80;
+    }
   });
 
   it("a move to the background in flight refuses a reservation that arrives meanwhile", async () => {

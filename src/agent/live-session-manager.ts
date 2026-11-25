@@ -25,6 +25,7 @@ import type { UsageLedgerRow } from "../usage/ledger.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, TurnInterruptedError, type McpAuthRefreshOutcome, type QueryResult, type ReplyContext, type TurnRequest } from "./live-session.js";
 import { SteerDeclinedError } from "./sdk-result.js";
+import { spawnDenial } from "./spawn-gate.js";
 import type { GroupSandboxConfig } from "./group-fs-policy.js";
 import { makeTurnBudget, sdkOptions, type SessionContext } from "./sdk-options.js";
 import type { RunWithRetryRequest } from "./turn-runner.js";
@@ -984,6 +985,9 @@ export class LiveSessionManager {
       // owns the flag exists. Until it does, nothing was dropped.
       undeliveredReply: () => session?.takeUndeliveredReply() ?? false,
       backgroundLaunchDenial: () => this.compactReservations.launchDenial(key),
+      // The nudger's reading (lastResult), against the threshold read per call
+      // so a config reload applies at once. Late-bound like the flag above.
+      spawnDenial: () => spawnDenial(this.lastResult(key), config.lcm.blockSpawnAtPct),
       ...(this.deps.resumeGate ? { resumeGate: (taskId: string) => this.deps.resumeGate!(key, taskId) } : {}),
     }, turnBudget, externalMcpServers);
 

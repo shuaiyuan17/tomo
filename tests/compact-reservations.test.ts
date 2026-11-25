@@ -130,7 +130,10 @@ describe("background launch guard hook", () => {
     expect(startsBackgroundTask("Task", { prompt: "x", run_in_background: true })).toBe(true);
     expect(startsBackgroundTask("Bash", { command: "sleep 9", run_in_background: true })).toBe(true);
     expect(startsBackgroundTask("Monitor", {})).toBe(true);
-    expect(startsBackgroundTask("Agent", { prompt: "x" })).toBe(false);
+    // The SDK's Agent tool runs in the background unless told otherwise.
+    expect(startsBackgroundTask("Agent", { prompt: "x" })).toBe(true);
+    expect(startsBackgroundTask("Agent", { prompt: "x", run_in_background: false })).toBe(false);
+    expect(startsBackgroundTask("Agent", { prompt: "x", run_in_background: false, isolation: "remote" })).toBe(true);
     expect(startsBackgroundTask("Bash", { command: "ls" })).toBe(false);
     expect(startsBackgroundTask("Read", null)).toBe(false);
   });
@@ -143,7 +146,10 @@ describe("background launch guard hook", () => {
     expect(await hook({ tool_name: "Agent", tool_input: { prompt: "x", run_in_background: true } })).toEqual({
       hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "a rollup is pending" },
     });
-    expect(await hook({ tool_name: "Agent", tool_input: { prompt: "x" } })).toEqual({});
+    expect(await hook({ tool_name: "Agent", tool_input: { prompt: "x" } })).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "deny" },
+    });
+    expect(await hook({ tool_name: "Agent", tool_input: { prompt: "x", run_in_background: false } })).toEqual({});
     reason = null;
     expect(await hook({ tool_name: "Agent", tool_input: { prompt: "x", run_in_background: true } })).toEqual({});
   });

@@ -946,10 +946,11 @@ export class TurnRunner {
       if (suppressed) {
         // A silent turn's text goes nowhere, and neither do the pictures and
         // files it names — the model was told to use send_message, but one
-        // that wrote MEDIA: here believes it showed them. Say so, once per
-        // block, so the next turn does not claim a delivery that never was.
+        // that wrote MEDIA: here believes it showed them (a heartbeat, a
+        // sub-session report, a silent cron run). Say so, once per block, so
+        // the next turn does not claim a delivery that never was.
         // (A task speaks through its task_* tools: not noted.)
-        if (spec.source === "continuity" && !isTaskSessionKey(spec.key)) {
+        if (!isTaskSessionKey(spec.key)) {
           const { mediaPaths, stickerIds } = extractAttachments(block);
           const named = [...mediaPaths, ...stickerIds.filter((id) => /^[/~]/.test(id))];
           if (named.length) this.queueDeliveryNote(spec.key, suppressedAttachmentsNote(named));

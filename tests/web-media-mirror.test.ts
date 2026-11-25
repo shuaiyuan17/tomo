@@ -111,6 +111,10 @@ describe("a reply delivered on another channel is filed for the web view", () =>
     expect(h.notes[0].note).toContain("[not delivered]");
     expect(h.notes[0].note).toContain(picture);
     expect(h.notes[0].note).toContain("send_message");
+    // A silent cron run is the same: noted.
+    const cron = runner(channel);
+    await cron.runner.runTurn(spec(channel, { source: "cron", delivery: { kind: "deferred-send", suppressDelivery: true, resolveTarget: () => ({ channel, chatId: "c1" }) } }));
+    expect(cron.notes).toHaveLength(1);
     // A task's own turn speaks through task_* tools: no note there.
     const task = runner(channel);
     await task.runner.runTurn(spec(channel, { key: "task:s1", source: "continuity", delivery: { kind: "deferred-send", suppressDelivery: true, resolveTarget: () => undefined } }));

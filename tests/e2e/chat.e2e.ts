@@ -699,32 +699,34 @@ it("the tray survives a reload: finished uploads come back (thumbnail and all) a
   await browserExpect(tray).toHaveCount(0);
 });
 
-it("Send waits for the tray to come back after a reload; a read that errs keeps the upload for the next reload", async () => {
+it("after a reload, Send waits for the tray to come back; a read that errs (or a send still filing it) shows as failed with Retry, never silently dropped", async () => {
   await page.locator("input[type=file]").setInputFiles([{ name: "slow.png", mimeType: "image/png", buffer: solidPng(2, 2) }]);
   const tray = page.getByRole("list", { name: "Attachments" });
   await browserExpect(tray.getByRole("listitem", { name: "slow.png, attached" })).toBeVisible();
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
-  let failing = true;
+  let mode: "fail" | "hold" = "fail";
   await page.route(/\/api\/v1\/uploads\/[a-f0-9]{32}$/, async (route) => {
-    if (failing) { await route.fulfill({ status: 503, body: "{}" }); return; }
+    if (mode === "fail") { await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ error: "upload_claimed" }) }); return; }
     await held; await route.continue();
   });
-  // Every read errs: nothing is shown, but the upload stays kept.
+  const send = page.getByRole("button", { name: "Send", exact: true });
+  // The read errs: the item stays, failed, and Send stays off with text typed.
   await page.reload();
   await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
-  await page.waitForTimeout(3_000);
-  await browserExpect(tray).toHaveCount(0);
-  expect(await page.evaluate(() => Object.keys(sessionStorage).filter((key) => key.startsWith("tomo-tray:")).map((key) => sessionStorage.getItem(key)).join(""))).toContain("slow.png");
-  // Next reload, the read is slow: Send stays off until it is back.
-  failing = false;
-  await page.reload();
-  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await browserExpect(tray.getByRole("listitem", { name: "slow.png, upload failed" })).toBeVisible();
   await page.getByRole("textbox", { name: "Message Tomo" }).fill("with the picture");
-  await browserExpect(page.getByRole("button", { name: "Send", exact: true })).toBeDisabled();
+  await browserExpect(send).toBeDisabled();
+  // Kept across another reload too; this time the read is slow: shown as uploading, Send still off.
+  mode = "hold";
+  await page.reload();
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await browserExpect(tray.getByRole("listitem", { name: /^slow\.png, uploading/ })).toBeVisible();
+  await page.getByRole("textbox", { name: "Message Tomo" }).fill("with the picture");
+  await browserExpect(send).toBeDisabled();
   release();
   await browserExpect(tray.getByRole("listitem", { name: "slow.png, attached" })).toBeVisible();
-  await browserExpect(page.getByRole("button", { name: "Send", exact: true })).toBeEnabled();
+  await browserExpect(send).toBeEnabled();
 });
 
 it("a kept upload the server no longer has (sent elsewhere, expired) is dropped on reload, not offered", async () => {

@@ -126,11 +126,13 @@ export function readUpload(dir: string, uploadId: string, now = Date.now()): { b
 /**
  * Web process: a staged upload the page still holds after a reload (its tray
  * is kept in sessionStorage): an image's bytes, for the thumbnail, or a
- * file's size. Undefined when the id is malformed, unknown, claimed,
- * expired, or (an image) no longer one by its bytes — the page then drops it.
+ * file's size; "claimed" while a message that names it is being filed.
+ * Undefined when the id is malformed, unknown, expired, or (an image) no longer one by its bytes — the page then drops it.
  */
-export function peekUpload(dir: string, uploadId: string, now = Date.now()): { kind: "image"; bytes: Buffer; type: string } | { kind: "file"; size: number } | undefined {
+export function peekUpload(dir: string, uploadId: string, now = Date.now()): { kind: "image"; bytes: Buffer; type: string } | { kind: "file"; size: number } | { kind: "claimed" } | undefined {
   if (!UPLOAD_ID.test(uploadId)) return undefined;
+  // Claimed by a message being filed right now: not gone yet — it comes back if that send fails.
+  try { if (readdirSync(dir).some((name) => name.startsWith(`${uploadId}.`) && name.includes(".claim-"))) return { kind: "claimed" }; } catch { return undefined; }
   const image = readUpload(dir, uploadId, now);
   if (image) return { kind: "image", ...image };
   let fd: number;

@@ -32,6 +32,8 @@ export interface Attachment {
   error?: Message;
   /** Resending an interrupted message: a file it already filed, attached again from where it is (no upload). */
   filed?: WebFiledFile;
+  /** Kept across a reload and being read back from the server (see KeptUpload): never uploaded again; Retry reads it again. */
+  restore?: KeptUpload;
 }
 
 /** Whether a picked/dropped/pasted file may be attached (by its declared type; the server checks the bytes). */
@@ -151,8 +153,13 @@ export function captureSend(list: readonly Attachment[]): { keys: string[]; ids:
  */
 export interface KeptUpload { uploadId: string; kind: "image" | "file"; name: string; type: string; size: number }
 export function keptUploads(list: readonly Attachment[]): KeptUpload[] {
-  return list.flatMap((item) => item.status === "done" && item.uploadId && !item.filed
+  // One still being read back stays kept whatever its state: until the server says it is gone, it is not.
+  return list.flatMap((item) => item.restore ? [item.restore] : item.status === "done" && item.uploadId && !item.filed
     ? [{ uploadId: item.uploadId, kind: item.kind ?? "image", name: item.file.name, type: item.file.type, size: item.file.size }] : []);
+}
+/** A kept upload in the tray while it is read back: counted, shown as uploading, and blocking Send like one. */
+export function restoringAttachment(key: string, kept: KeptUpload): Attachment {
+  return { key, file: { name: kept.name, type: kept.type, size: kept.size } as File, preview: "", kind: kept.kind, status: "uploading", progress: 0, uploadId: kept.uploadId, restore: kept };
 }
 export function parseKeptUploads(raw: string | null): KeptUpload[] {
   if (!raw) return [];

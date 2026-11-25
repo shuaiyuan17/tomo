@@ -321,11 +321,15 @@ describe("POST /uploads with files on: the same gate as images", () => {
     // Without the API header (an <img> or a navigation from another site): refused.
     expect((await call(`/api/v1/uploads/${image}`, { headers: { "x-tomo-request": "" } })).status).toBeGreaterThanOrEqual(400);
     for (const bad of ["0".repeat(32), "../uploads", `${image}.png`, image.toUpperCase()]) expect((await call(`/api/v1/uploads/${encodeURIComponent(bad)}`)).status).toBe(404);
-    // Claimed by a message (sent): gone for the page too.
+    // Claimed by a message being filed: not gone yet (409), back if that send fails, gone (404) once it is recorded.
     const claim = claimUploads(dir, [image], "req-1")!;
-    expect((await call(`/api/v1/uploads/${image}`)).status).toBe(404);
+    const busy = await call(`/api/v1/uploads/${image}`);
+    expect(busy.status).toBe(409);
+    expect(JSON.parse(busy.text).error).toBe("upload_claimed");
     claim.release();
     expect((await call(`/api/v1/uploads/${image}`)).status).toBe(200);
+    claimUploads(dir, [image], "req-2")!.finalize();
+    expect((await call(`/api/v1/uploads/${image}`)).status).toBe(404);
   });
 });
 

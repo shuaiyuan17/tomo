@@ -47,13 +47,13 @@ export function withListBackground<D extends Partial<WebSubsession>>(detail: D |
 }
 
 /**
- * While a task is shown as working in the background, the list is read again
- * this often: that work ending (or its report window lapsing) changes no task
- * record, so no `subsessions` event says so.
+ * While a task waits on something external, the list is read again this
+ * often: its background work starting or ending (or a report window lapsing)
+ * changes no task record, so no `subsessions` event says so.
  */
 export const SUBSESSIONS_BACKGROUND_REFRESH_MS = 15_000;
 export function subsessionsRefreshMs(list: WebSubsessionList): number | undefined {
-  return list.available && list.tasks.some((task) => task.background === true) ? SUBSESSIONS_BACKGROUND_REFRESH_MS : undefined;
+  return list.available && list.tasks.some((task) => task.status === "waiting" && task.waitingOn === "external") ? SUBSESSIONS_BACKGROUND_REFRESH_MS : undefined;
 }
 
 /** Open tasks are alive; ended ones are shown dimmed, as ended subagents are. */

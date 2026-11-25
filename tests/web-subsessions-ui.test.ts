@@ -28,10 +28,12 @@ describe("sub-sessions in the Tasks rail", () => {
     expect(activeSubsessions([bg, task({ id: "s2", status: "waiting", waitingOn: "external" })])).toBe(1);
   });
 
-  it("re-reads the list while a task works in the background, since that work ending changes no record", () => {
+  it("re-reads the list while a task waits on something external, since its background work changes no record", () => {
     const bg = task({ status: "waiting", waitingOn: "external", background: true });
     expect(subsessionsRefreshMs({ available: true, tasks: [task(), bg] })).toBe(SUBSESSIONS_BACKGROUND_REFRESH_MS);
-    expect(subsessionsRefreshMs({ available: true, tasks: [task(), task({ id: "s2", status: "waiting", waitingOn: "external" })] })).toBeUndefined();
+    // Waiting on something external without it: background work may start (a report turn), so it is read again too.
+    expect(subsessionsRefreshMs({ available: true, tasks: [task(), task({ id: "s2", status: "waiting", waitingOn: "external" })] })).toBe(SUBSESSIONS_BACKGROUND_REFRESH_MS);
+    expect(subsessionsRefreshMs({ available: true, tasks: [task(), task({ id: "s2", status: "waiting", waitingOn: "owner" }), task({ id: "s3", status: "finished" })] })).toBeUndefined();
     expect(subsessionsRefreshMs({ available: false, tasks: [] })).toBeUndefined();
   });
 

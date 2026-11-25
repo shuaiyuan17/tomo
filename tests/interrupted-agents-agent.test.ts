@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
@@ -11,12 +11,13 @@ import { Agent, MockChannel, expectNoChangeFor, installAgentTestHooks, makeMsg, 
 import { watchBus } from "../src/watch/bus.js";
 import { MAX_AUTO_RESUMES, type RunningAgentsLedger } from "../src/agent/running-agents-ledger.js";
 import type { WatchTask } from "../src/watch/protocol.js";
+import { SessionStore } from "../src/sessions/store.js";
 
 installAgentTestHooks();
 
 /** The session store's durable pending notes for `key` (what survives a crash). */
 function durableNotes(agent: InstanceType<typeof Agent>, key: string): string {
-  return (agent as unknown as { sessions: { getPendingNotes(k: string): string[] } }).sessions.getPendingNotes(key).join("\n");
+  return (agent as unknown as { sessions: { getPendingNotes(k: string): { text: string }[] } }).sessions.getPendingNotes(key).map((n) => n.text).join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -143,26 +144,94 @@ describe("interrupted subagents across a restart", () => {
     await third.agent.stop();
   });
 
-  it("with the pending notes unreadable at start, the check waits, then tells the session once they read", async () => {
+  it("a pending notes file that will not read at start is moved aside, the owner told once, and the session still told", async () => {
     const first = await boot();
     await haveSession(first.channel, "707");
     watchBus.publish({ type: "tasks", sessionKey: "imessage:707", tasks: [task("unreadable707")] });
     crash(first.agent);
 
     const notesFile = join(mockConfig.sessionsDir, "_pending_notes.json");
-    mkdirSync(notesFile); // reads fail with EISDIR
+    writeFileSync(notesFile, Buffer.from([0xa0]));
+    const ownerNotice = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(true);
     mockSdk.promptsBySession = [];
     mockSdk.responseFn = async () => "ok";
     const second = await boot();
-    await expectNoChangeFor(() => expect(notices("imessage:707")).toEqual([]), 50);
-    // Not acknowledged: nothing could be written for it.
-    expect(JSON.parse(readFileSync(ledgerPath(), "utf8")).interrupted.map((r: { taskId: string }) => r.taskId)).toEqual(["unreadable707"]);
+    await waitFor(() => expect(notices("imessage:707").some((p) => p.text.includes("unreadable707"))).toBe(true));
+    const asides = readdirSync(mockConfig.sessionsDir).filter((f) => f.startsWith("_pending_notes.json.corrupt-"));
+    expect(asides).toHaveLength(1);
+    expect(readFileSync(join(mockConfig.sessionsDir, asides[0])).equals(Buffer.from([0xa0]))).toBe(true);
+    await waitFor(() => expect(ownerNotice).toHaveBeenCalledTimes(1));
+    expect(String(ownerNotice.mock.calls[0][0])).toContain(asides[0]);
+    await second.agent.stop();
+  });
 
+  it("with the pending notes unreadable and unmovable at start, the check waits, then tells the session once they read", async () => {
+    const first = await boot();
+    await haveSession(first.channel, "708");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:708", tasks: [task("unreadable708")] });
+    crash(first.agent);
+
+    const notesFile = join(mockConfig.sessionsDir, "_pending_notes.json");
+    mkdirSync(notesFile); // reads fail with EISDIR
+    const proto = SessionStore.prototype as unknown as { moveWithoutClobber(from: string, to: string): string };
+    const realMove = proto.moveWithoutClobber;
+    const move = vi.spyOn(proto, "moveWithoutClobber").mockImplementation(function (this: unknown, from: string, to: string) {
+      if (from.endsWith("_pending_notes.json")) throw Object.assign(new Error("EACCES"), { code: "EACCES" });
+      return realMove.call(this, from, to);
+    });
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = async () => "ok";
+    const second = await boot();
+    await expectNoChangeFor(() => expect(notices("imessage:708")).toEqual([]), 50);
+    // Not acknowledged: nothing could be written for it.
+    expect(JSON.parse(readFileSync(ledgerPath(), "utf8")).interrupted.map((r: { taskId: string }) => r.taskId)).toEqual(["unreadable708"]);
+
+    move.mockRestore();
     rmSync(notesFile, { recursive: true });
     (second.agent as unknown as { retryInterruptedAgentsNotes(keys: Set<string>): void })
-      .retryInterruptedAgentsNotes(new Set(["imessage:707"]));
-    await waitFor(() => expect(notices("imessage:707").some((p) => p.text.includes("unreadable707"))).toBe(true));
+      .retryInterruptedAgentsNotes(new Set(["imessage:708"]));
+    await waitFor(() => expect(notices("imessage:708").some((p) => p.text.includes("unreadable708"))).toBe(true));
     expect(JSON.parse(readFileSync(ledgerPath(), "utf8")).interrupted).toEqual([]);
+    await second.agent.stop();
+  });
+
+  it("a notice whose write fails is retried until it is on disk, then the session is told once", async () => {
+    const first = await boot();
+    await haveSession(first.channel, "709");
+    watchBus.publish({ type: "tasks", sessionKey: "imessage:709", tasks: [task("diskfull709")] });
+    crash(first.agent);
+
+    const write = vi.spyOn(SessionStore.prototype, "setPendingNotes").mockImplementation(() => {
+      throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+    });
+    mockSdk.promptsBySession = [];
+    mockSdk.responseFn = async () => "ok";
+    const second = await boot();
+    const agent = second.agent as unknown as {
+      retryInterruptedAgentsNotes(keys: Set<string>): void;
+      interruptedAgentsRetryTimer: ReturnType<typeof setTimeout> | undefined;
+    };
+    // The write failed at start: a retry is armed and the ledger still holds the record.
+    expect(agent.interruptedAgentsRetryTimer).toBeDefined();
+    expect(JSON.parse(readFileSync(ledgerPath(), "utf8")).interrupted.map((r: { taskId: string }) => r.taskId)).toEqual(["diskfull709"]);
+
+    // The retry's write fails too: still armed, never dropped.
+    clearTimeout(agent.interruptedAgentsRetryTimer);
+    agent.interruptedAgentsRetryTimer = undefined;
+    agent.retryInterruptedAgentsNotes(new Set(["imessage:709"]));
+    expect(agent.interruptedAgentsRetryTimer).toBeDefined();
+    expect(JSON.parse(readFileSync(ledgerPath(), "utf8")).interrupted.map((r: { taskId: string }) => r.taskId)).toEqual(["diskfull709"]);
+
+    write.mockRestore();
+    clearTimeout(agent.interruptedAgentsRetryTimer);
+    agent.interruptedAgentsRetryTimer = undefined;
+    agent.retryInterruptedAgentsNotes(new Set(["imessage:709"]));
+    await waitFor(() => expect(notices("imessage:709").some((p) => p.text.includes("diskfull709"))).toBe(true));
+    expect(JSON.parse(readFileSync(ledgerPath(), "utf8")).interrupted).toEqual([]);
+    expect(agent.interruptedAgentsRetryTimer).toBeUndefined();
+    // One note, however many times it was tried.
+    const told = notices("imessage:709").find((p) => p.text.includes("diskfull709"))!;
+    expect(told.text.split("job diskfull709").length - 1).toBe(1);
     await second.agent.stop();
   });
 

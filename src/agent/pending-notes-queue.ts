@@ -1,9 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { log } from "../logger.js";
+import type { PendingNote } from "../sessions/store.js";
 import { formatTomoEvent, isOwnerAudienceNote } from "../tomo-event.js";
 
 export interface DurablePendingNotesStore {
-  getPendingNotes(key: string): string[];
-  setPendingNotes(key: string, notes: string[]): void;
+  getPendingNotes(key: string): PendingNote[];
+  setPendingNotes(key: string, notes: PendingNote[]): void;
 }
 
 /** Cap on queued pending notes per session. */
@@ -44,6 +46,7 @@ function capErrorNotes(notes: ErrorNote[]): ErrorNote[] {
  * once the note is on disk.
  */
 function isPinnedNote(note: string): boolean {
+  // Pinned or not is read off the text; identity is the id (see PendingNote).
   // `includes`, not `startsWith`: an interrupted note carries the marker first.
   return note.includes('<tomo-event type="inbox"')
     || note.includes('<tomo-event type="interrupted-agents"')
@@ -53,10 +56,10 @@ function isPinnedNote(note: string): boolean {
 }
 
 /** Drop oldest unpinned notes until `arr` fits the cap (pinned ones always stay). */
-function capNotes(arr: string[]): number {
+function capNotes(arr: PendingNote[]): number {
   let dropped = 0;
   for (let i = 0; i < arr.length && arr.length > MAX_PENDING_NOTES;) {
-    if (isPinnedNote(arr[i])) { i++; continue; }
+    if (isPinnedNote(arr[i].text)) { i++; continue; }
     arr.splice(i, 1);
     dropped++;
   }
@@ -70,14 +73,15 @@ function capNotes(arr: string[]): number {
 export const INTERRUPTED_NOTE_MARKER =
   "[The previous attempt to handle the note below was interrupted (Tomo restarted, or the turn was cut short) — you may already have partly answered it. Check the conversation and do not repeat what was already said.]";
 
-function markInterrupted(note: string): string {
-  return note.startsWith(INTERRUPTED_NOTE_MARKER) ? note : `${INTERRUPTED_NOTE_MARKER}\n${note}`;
+/** The same note (same id), marked as possibly partly answered. */
+function markInterrupted(note: PendingNote): PendingNote {
+  return note.text.startsWith(INTERRUPTED_NOTE_MARKER) ? note : { id: note.id, text: `${INTERRUPTED_NOTE_MARKER}\n${note.text}` };
 }
 
 interface InFlightBatch {
   prefix: string;
   /** Durable notes in this prefix, in order. Persisted while in flight. */
-  notes: string[];
+  notes: PendingNote[];
   /** Error notes rendered into this prefix. Memory-only, like the queue they came from. */
   errors: ErrorNote[];
 }
@@ -97,17 +101,18 @@ interface InFlightBatch {
  */
 export class PendingNotesQueue {
   /** Queued, not yet drained. Absent: not loaded from the store this process. */
-  private notes = new Map<string, string[]>();
+  private notes = new Map<string, PendingNote[]>();
   private inflight = new Map<string, InFlightBatch[]>();
   private errorNotes = new Map<string, ErrorNote[]>();
   private errorSeq = 0;
-  /** Sessions whose stored notes could not be read: held in memory only,
-   *  never written, until a read succeeds (see `retryLoad`). */
+  /** Sessions whose stored notes could not be read (the file could neither
+   *  be read nor moved aside, see SessionStore.loadPendingNotes): held in
+   *  memory only, never written, until a read succeeds (see `retryLoad`). */
   private unloaded = new Set<string>();
 
   constructor(private store: DurablePendingNotesStore) {}
 
-  private queued(sessionKey: string): string[] {
+  private queued(sessionKey: string): PendingNote[] {
     let arr = this.notes.get(sessionKey);
     if (!arr) {
       try {
@@ -132,7 +137,7 @@ export class PendingNotesQueue {
    */
   private retryLoad(sessionKey: string): boolean {
     if (!this.unloaded.has(sessionKey)) return true;
-    let stored: string[];
+    let stored: PendingNote[];
     try {
       stored = this.store.getPendingNotes(sessionKey);
     } catch {
@@ -144,21 +149,12 @@ export class PendingNotesQueue {
       this.notes.set(sessionKey, stored);
       return true;
     }
-    // A note queued again while the row was unreadable (a caller that found
-    // no copy and wrote one) is already among the stored ones: once is enough.
-    // If that copy is already in flight, the stored one is dropped instead,
-    // or settling the turn would leave it queued and deliver it twice.
-    const take = (from: string[], note: string): boolean => {
-      const i = from.findIndex((s) => s === note || s === markInterrupted(note));
-      if (i < 0) return false;
-      from.splice(i, 1);
-      return true;
-    };
-    const kept = [...stored];
-    for (const batch of this.inflight.get(sessionKey) ?? []) for (const note of batch.notes) take(kept, note);
-    const unmatched = [...kept];
-    const fresh = arr.filter((note) => !take(unmatched, note));
-    arr.splice(0, arr.length, ...kept, ...fresh);
+    // Matched by id only, never by text: a stored note whose id is already
+    // here (queued again under its stable id, or in flight — settling would
+    // then remove it undelivered if it were queued too) is that same note.
+    // Two notes that merely read the same are two notes.
+    const here = new Set([...arr, ...(this.inflight.get(sessionKey) ?? []).flatMap((b) => b.notes)].map((n) => n.id));
+    arr.unshift(...stored.filter((n) => !here.has(n.id)));
     return true;
   }
 
@@ -188,11 +184,21 @@ export class PendingNotesQueue {
     return this.persist(sessionKey);
   }
 
-  /** Queue a note for the session's next turn. Returns false when it could
-   *  not be persisted (it is still held in memory for this process). */
-  queueNote(sessionKey: string, note: string): boolean {
+  /**
+   * Queue a note for the session's next turn. Returns false when it could
+   * not be persisted (it is still held in memory for this process).
+   *
+   * `id` names the event the note is about, where it has a stable identity
+   * (a task's report): a note with that id already queued or in flight (or
+   * stored, found once the stored notes read) is not added again. Without
+   * one, every call is a new note, even with the same text.
+   */
+  queueNote(sessionKey: string, note: string, id?: string): boolean {
     const arr = this.queued(sessionKey);
-    arr.push(note);
+    const known = id !== undefined
+      && (arr.some((n) => n.id === id) || (this.inflight.get(sessionKey) ?? []).some((b) => b.notes.some((n) => n.id === id)));
+    if (known) return this.persist(sessionKey);
+    arr.push({ id: id ?? randomUUID(), text: note });
     const dropped = capNotes(arr);
     if (dropped > 0) log.debug({ sessionKey, dropped }, "Pending notes capped at limit; dropped oldest");
     return this.persist(sessionKey);
@@ -213,12 +219,12 @@ export class PendingNotesQueue {
     const notes = this.queued(sessionKey);
     // A turn that is not the owner's own (a summoned group on the owner's
     // session) gets no owner-only note: those stay queued for the next one.
-    const held = opts.holdOwnerAudience ? notes.filter(isOwnerAudienceNote) : [];
-    const drained = held.length > 0 ? notes.filter((n) => !isOwnerAudienceNote(n)) : [...notes];
+    const held = opts.holdOwnerAudience ? notes.filter((n) => isOwnerAudienceNote(n.text)) : [];
+    const drained = held.length > 0 ? notes.filter((n) => !isOwnerAudienceNote(n.text)) : [...notes];
     this.notes.set(sessionKey, held);
 
     const errorNotes = this.errorNotes.get(sessionKey) ?? [];
-    const parts = [...drained];
+    const parts = drained.map((n) => n.text);
     if (errorNotes.length > 0) {
       this.errorNotes.delete(sessionKey);
       parts.push(formatTomoEvent("errors", [
@@ -258,8 +264,8 @@ export class PendingNotesQueue {
    */
   settle(sessionKey: string, prefix: string): void {
     if (!prefix) return;
-    // Reload first, while this batch still counts as in flight, so a stored
-    // copy of one of its notes is recognised as delivered (see retryLoad).
+    // Reload first, while this batch still counts as in flight, so the stored
+    // copy of one of its notes (same id) is recognised as delivered.
     this.retryLoad(sessionKey);
     const batch = this.takeInFlight(sessionKey, prefix);
     if (batch && batch.notes.length > 0) this.persist(sessionKey);
@@ -321,12 +327,12 @@ export class PendingNotesQueue {
    * While the session's stored notes cannot be read the answer is unknown:
    * `whenUnreadable` is returned unless one is found in memory. A caller
    * about to throw something away passes true; one about to write a copy
-   * passes false (the write is refused until the row reads, and a copy
-   * already stored is not kept twice).
+   * passes false, and queues the copy under the event's stable id (see
+   * `queueNote`), so a copy already stored is not kept twice once it reads.
    */
   hasNote(sessionKey: string, predicate: (note: string) => boolean, whenUnreadable = false): boolean {
-    if (this.queued(sessionKey).some(predicate)) return true;
-    if ((this.inflight.get(sessionKey) ?? []).some((b) => b.notes.some(predicate))) return true;
+    if (this.queued(sessionKey).some((n) => predicate(n.text))) return true;
+    if ((this.inflight.get(sessionKey) ?? []).some((b) => b.notes.some((n) => predicate(n.text)))) return true;
     return this.unloaded.has(sessionKey) ? whenUnreadable : false;
   }
 
@@ -340,6 +346,6 @@ export class PendingNotesQueue {
   /** Queued durable notes, without draining. Only the ones in memory while
    *  the session's stored notes cannot be read. */
   peekNotes(sessionKey: string): string[] {
-    return [...this.queued(sessionKey)];
+    return this.queued(sessionKey).map((n) => n.text);
   }
 }

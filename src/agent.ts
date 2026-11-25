@@ -85,7 +85,8 @@ import { readSessionWindowPercent } from "./usage/limits-log.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
-import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { basename, join } from "node:path";
 import { readFileSync } from "node:fs";
 import { withConfigLockSync } from "./config-file.js";
 import { writeJsonAtomicSync } from "./fs-utils.js";
@@ -246,6 +247,10 @@ export class Agent {
   /** Re-logs the full migration status once, after the first keys have been
    *  touched (see `start`). Unref'd, and cleared by `stop`. */
   private migrationStatusTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Where unreadable pending-notes files were moved this process, not yet told to the owner. */
+  private pendingNotesQuarantined: string[] = [];
+  /** The channels have started: an owner notice can be sent. */
+  private channelsUp = false;
   /** Re-runs the interrupted-subagents startup check for sessions whose pending notes could not be read. */
   private interruptedAgentsRetryTimer: ReturnType<typeof setTimeout> | undefined;
   /** The most recent sweep — awaited (bounded) by stop() so none is abandoned mid-write. */
@@ -270,6 +275,7 @@ export class Agent {
       getChannel: (name) => this.getChannel(name),
     });
     this.pendingNotesQueue = new PendingNotesQueue(this.sessions);
+    this.sessions.onPendingNotesQuarantined = (aside) => this.notePendingNotesQuarantined(aside);
     if (config.inbox) {
       try {
         this.inbox = new DurableInbox({ path: join(config.tomoHome, "data", "inbox.jsonl") });
@@ -551,7 +557,7 @@ export class Agent {
       noticeOwner: async (text) => { await this.notifyOwner(text); },
       // A task owned by the owner's DM speaks for the owner alone: its notes
       // never drain into a summoned group's turn on that session.
-      queuePendingNote: (key, note) => this.queuePendingNote(key, isDmSessionKey(key) ? markOwnerAudience(note) : note),
+      queuePendingNote: (key, note, id) => this.queuePendingNote(key, isDmSessionKey(key) ? markOwnerAudience(note) : note, id),
       hasPendingNote: (key, predicate, whenUnreadable) => this.pendingNotesQueue.hasNote(key, predicate, whenUnreadable),
       persistPendingNotes: (key) => this.pendingNotesQueue.persistNow(key),
       wakeScope: (parentKey, prompt) => {
@@ -3005,8 +3011,8 @@ export class Agent {
     this.proactive.recordLatestInboundMessage(sessionKey, channel, message);
   }
 
-  private queuePendingNote(sessionKey: string, note: string): boolean {
-    return this.pendingNotesQueue.queueNote(sessionKey, note);
+  private queuePendingNote(sessionKey: string, note: string, id?: string): boolean {
+    return this.pendingNotesQueue.queueNote(sessionKey, note, id);
   }
 
   private queuePendingErrorNote(sessionKey: string, visibleError: string): void {
@@ -3210,6 +3216,9 @@ export class Agent {
       log.error({ err }, "Sub-session recovery failed");
     }
     await Promise.all(this.channels.map((ch) => ch.start()));
+    this.channelsUp = true;
+    // A pending-notes file moved aside while starting (recovery reads it) is told now.
+    this.tellPendingNotesQuarantined();
     try {
       this.replayInbox(recovered);
     } catch (err) {
@@ -3612,25 +3621,43 @@ export class Agent {
     // A session whose stored notes cannot be read is settled later, once
     // they read (`retryInterruptedAgentsNotes`): until then neither "a note
     // is owed" nor "none is" is known, and a new note could not be written.
-    const unreadable = new Set([...known].filter((key) => !this.pendingNotesQueue.storedReadable(key)));
+    const retry = new Set([...known].filter((key) => !this.pendingNotesQueue.storedReadable(key)));
     // A note an earlier start handed off but no turn finished with is still
     // owed: give it its turn again now, not only at the next message.
-    const owed = new Set([...known].filter((key) => !unreadable.has(key) && this.hasInterruptedAgentsNote(key)));
+    const owed = new Set([...known].filter((key) => !retry.has(key) && this.hasInterruptedAgentsNote(key)));
     for (const [key, records] of ledger.pendingBySession()) {
       if (!known.has(key)) {
         log.warn({ sessionKey: key, count: records.length }, "Interrupted subagents belong to an unknown session; dropping the notice");
         ledger.acknowledge(key);
         continue;
       }
-      if (unreadable.has(key)) continue;
+      if (retry.has(key)) continue;
+      // Not written: tried again until it is (the ledger keeps the records).
       if (this.queueInterruptedAgentsNote(ledger, key, records)) owed.add(key);
+      else retry.add(key);
     }
     this.sendOwedResumeFailures(ledger);
     for (const key of owed) this.wakeForInterruptedAgents(key);
-    if (unreadable.size > 0) {
-      log.warn({ sessions: [...unreadable] }, "Pending notes unreadable; the interrupted-subagents check for these sessions waits until they read");
-      this.scheduleInterruptedAgentsRetry(unreadable);
+    if (retry.size > 0) {
+      log.warn({ sessions: [...retry] }, "Interrupted-subagents notes not written yet (pending notes unreadable or the write failed); tried again");
+      this.scheduleInterruptedAgentsRetry(retry);
     }
+  }
+
+  /** The pending-notes file could not be read and was moved aside (see SessionStore.loadPendingNotes): the owner is told, once the channels are up. */
+  private notePendingNotesQuarantined(aside: string): void {
+    this.pendingNotesQuarantined.push(aside);
+    if (this.channelsUp) this.tellPendingNotesQuarantined();
+  }
+
+  private tellPendingNotesQuarantined(): void {
+    if (this.pendingNotesQuarantined.length === 0 || this.stopping) return;
+    const files = this.pendingNotesQuarantined.map((p) => basename(p));
+    this.pendingNotesQuarantined = [];
+    const text = ownerT("notices")("pendingNotesQuarantined", { files: files.join(", "), count: files.length });
+    void this.notifyOwner(text)
+      .then((sent) => { if (!sent) log.warn({ files }, "Could not tell the owner the pending notes file was moved aside"); })
+      .catch((err) => log.warn({ err, files }, "Could not tell the owner the pending notes file was moved aside"));
   }
 
   private hasInterruptedAgentsNote(key: string): boolean {
@@ -3642,8 +3669,11 @@ export class Agent {
     const autoResume = config.interruptedAgentsAutoResume
       ? { failed: new Set(records.filter((r) => isResumable(r) && ledger.resumeCount(key, r.taskId) >= MAX_AUTO_RESUMES).map((r) => r.taskId)) }
       : undefined;
-    if (!this.queuePendingNote(key, formatTomoEvent("interrupted-agents", formatInterruptedAgentsNotice(records, undefined, autoResume)))) {
-      log.error({ sessionKey: key }, "Could not persist the interrupted-subagents note; kept for the next start");
+    // One id per set of interrupted agents: a retry after a failed write
+    // writes the note held in memory again, never a second copy of it.
+    const id = `interrupted-agents:${createHash("sha256").update(records.map((r) => r.taskId).sort().join("\n")).digest("hex").slice(0, 16)}`;
+    if (!this.queuePendingNote(key, formatTomoEvent("interrupted-agents", formatInterruptedAgentsNotice(records, undefined, autoResume)), id)) {
+      log.error({ sessionKey: key }, "Could not persist the interrupted-subagents note; tried again (and kept for the next start)");
       return false;
     }
     ledger.acknowledge(key);
@@ -3685,7 +3715,11 @@ export class Agent {
         continue;
       }
       const records = pending.get(key);
-      if (records && !this.queueInterruptedAgentsNote(ledger, key, records)) continue;
+      // A key leaves the retry set only once its note is on disk.
+      if (records && !this.queueInterruptedAgentsNote(ledger, key, records)) {
+        still.add(key);
+        continue;
+      }
       if (this.hasInterruptedAgentsNote(key)) this.wakeForInterruptedAgents(key);
     }
     if (still.size > 0) this.scheduleInterruptedAgentsRetry(still);

@@ -114,7 +114,8 @@ export interface SubsessionServiceDeps {
   closeSession?(key: string): void;
   /** A harness notice about a task, to the owning scope's chat. */
   noticeToScope(parentKey: string, text: OwnerText): Promise<void>;
-  queuePendingNote(key: string, note: string): boolean;
+  /** `id`: the event's stable identity, so a second copy of it is not queued (see PendingNotesQueue.queueNote). */
+  queuePendingNote(key: string, note: string, id?: string): boolean;
   /** `whenUnreadable` is the answer while the session's stored notes cannot be read. */
   hasPendingNote(key: string, predicate: (note: string) => boolean, whenUnreadable?: boolean): boolean;
   /**
@@ -2070,7 +2071,7 @@ export class SubsessionService {
         excerpt,
         ...(earlier.length > 0 ? [`Its earlier report${earlier.length === 1 ? "" : "s"} ${earlier.join(", ")} ${earlier.length === 1 ? "is" : "are"} kept too: task_status shows ${earlier.length === 1 ? "it" : "them"}.`] : []),
       ].join("\n"), { name: reportNoteName(record) });
-      if (!this.deps.queuePendingNote(record.parentKey, note)) {
+      if (!this.deps.queuePendingNote(record.parentKey, note, reportNoteId(reportNoteName(record)))) {
         this.unpersistedReports.add(record.id);
         this.retryReport(record.id);
         return;
@@ -2097,7 +2098,7 @@ export class SubsessionService {
         : this.deps.queuePendingNote(record.parentKey, formatTomoEvent("subsession-report", [
           `Sub-session ${record.id} ("${record.title}") finished earlier. Its report #${e.seq}, replaced by a later one before it was read:`,
           e.text.length > REPORT_NOTE_EXCERPT ? `${e.text.slice(0, REPORT_NOTE_EXCERPT - 1)}… (read the whole report with task_status)` : e.text,
-        ].join("\n"), { name }));
+        ].join("\n"), { name }), reportNoteId(name));
       if (!ok) return false;
     }
     const seqs = new Set(missing.map((e) => e.seq));
@@ -2196,7 +2197,7 @@ export class SubsessionService {
       `Sub-session ${record.id} ("${record.title}") failed before it answered ${unanswered.length === 1 ? "this message" : `these ${unanswered.length} messages`} passed on for the owner. Here in full; decide with the owner whether ${unanswered.length === 1 ? "it still needs" : "they still need"} doing:`,
       ...unanswered.map((i, n) => `${n + 1}. ${(i.words ?? i.text).trim()}`),
     ].join("\n\n"), { name: record.id });
-    if (!this.deps.queuePendingNote(record.parentKey, note)) {
+    if (!this.deps.queuePendingNote(record.parentKey, note, `subsession-handback:${record.id}`)) {
       log.warn({ id: record.id }, "Could not write a failed sub-session's handback note; the record is kept and it is tried again");
       return false;
     }
@@ -2321,6 +2322,11 @@ function hasPendingInput(record: SubsessionRecord): string | undefined {
 /** A report note's name: the task id and which of its reports (`s3#2`). */
 function reportNoteName(record: SubsessionRecord): string {
   return `${record.id}#${record.reportSeq ?? 1}`;
+}
+
+/** The pending-note id of report `name` (`s3#2`): one note per report, however often it is delivered. */
+function reportNoteId(name: string): string {
+  return `subsession-report:${name}`;
 }
 
 /** `s12` → 12 (0 for anything else). */

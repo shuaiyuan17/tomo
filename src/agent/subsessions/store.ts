@@ -468,11 +468,19 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
     sent: Array.isArray(r.sent) ? r.sent as SubsessionRecord["sent"] : [],
     ...parsePendingAsk(r.pendingAsk, status, r.waitingOn),
     ...parseUnsavedNotices(r.unsavedNotices),
+    ...parseForwardRacing(r.forwardRacing),
     transitions: Array.isArray(r.transitions) ? r.transitions as SubsessionRecord["transitions"] : [],
   };
 }
 
 /** A well-formed pending question, kept only on a task waiting for the owner. */
+function parseForwardRacing(value: unknown): { forwardRacing?: { at: number; text: string; failed?: true } } {
+  if (!value || typeof value !== "object") return { forwardRacing: undefined };
+  const v = value as Record<string, unknown>;
+  if (typeof v.at !== "number" || !Number.isFinite(v.at) || typeof v.text !== "string" || !v.text.trim()) return { forwardRacing: undefined };
+  return { forwardRacing: { at: v.at, text: v.text, ...(v.failed === true ? { failed: true as const } : {}) } };
+}
+
 function parseUnsavedNotices(value: unknown): { unsavedNotices?: Array<{ at: number; text: string }> } {
   if (!Array.isArray(value)) return { unsavedNotices: undefined };
   const kept = value.filter((v): v is { at: number; text: string } => !!v && typeof v === "object"

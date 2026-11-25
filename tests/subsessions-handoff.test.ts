@@ -172,6 +172,46 @@ describe("task_notify goes to the owning session", () => {
     }
   });
 
+  it("two notices in the same millisecond are kept apart", async () => {
+    const h = harness();
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.noteWriteFails = 2;
+    h.persistFails = 10;
+    expect((await h.service.notify(t.sessionKey, "first")).ok).toBe(true);
+    expect((await h.service.notify(t.sessionKey, "second")).ok).toBe(true);
+    const held = h.store.get(t.id)!.unsavedNotices!;
+    expect(held.map((n) => n.text)).toEqual(["first", "second"]);
+    expect(new Set(held.map((n) => n.at)).size).toBe(2);
+    h.service.stop();
+  });
+
+  it("a sent message whose record failed is written by the retry timer, once", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness();
+      h.service.start();
+      const t = spawn(h);
+      await flush();
+      const update = h.store.update.bind(h.store);
+      let fail = 1;
+      h.store.update = ((...args: Parameters<SubsessionStore["update"]>) => {
+        if (fail > 0) { fail -= 1; throw new Error("disk full"); }
+        return update(...args);
+      }) as SubsessionStore["update"];
+      expect((await h.service.reply(t.sessionKey, "Merged.")).ok).toBe(true);
+      expect(h.store.get(t.id)!.sent.some((m) => m.text === "Merged.")).toBe(false);
+      vi.advanceTimersByTime(CUSTODY_RETRY_MS);
+      vi.advanceTimersByTime(CUSTODY_RETRY_MS);
+      expect(h.store.get(t.id)!.sent.filter((m) => m.text === "Merged.")).toHaveLength(1);
+      expect(h.store.get(t.id)!.replyMap).toHaveLength(1);
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a held notice whose note died with the process is queued again after a restart", async () => {
     const h = harness();
     h.service.start();
@@ -366,7 +406,7 @@ describe("task_ask goes through the owning session, word for word", () => {
     expect(record.pendingAsk?.forwardedAt).toBeDefined();
   });
 
-  it("a wake while the question is being forwarded tells the task once the send settles: it reached the owner", async () => {
+  it("a wake while the question is being forwarded says so at once; a send that goes out adds nothing", async () => {
     const h = harness();
     const { t } = await askingTask(h, "Merge PR #12?");
     let open!: (ok: boolean) => void;
@@ -374,19 +414,23 @@ describe("task_ask goes through the owning session, word for word", () => {
     const forward = h.service.afterHandOff("dm:owner", h.service.handOffFor("dm:owner")!.asks);
     await flush();
     expect(h.service.ownerMessage("dm:owner", t.id, "also, rename the branch").ok).toBe(true);
-    // Not guessed while the send is pending.
-    expect(h.store.get(t.id)!.pendingInput.map((i) => i.text).join("\n")).not.toContain("question");
+    // Said in the wake's own input, while the send is pending.
+    const before = h.store.get(t.id)!;
+    expect(before.pendingInput.map((i) => i.text).join("\n")).toContain("still being sent to the owner");
+    expect(before.forwardRacing).toMatchObject({ text: "Merge PR #12?" });
+    const count = before.pendingInput.length;
     open(true);
     await forward;
     await flush();
-    const input = h.store.get(t.id)!.pendingInput.map((i) => i.text).join("\n");
-    expect(input).toContain("reached the owner after all");
-    expect(input).not.toContain("not shown");
+    const after = h.store.get(t.id)!;
+    expect(after.forwardRacing).toBeUndefined();
+    expect(after.pendingInput.length).toBeLessThanOrEqual(count);
+    expect(after.pendingInput.map((i) => i.text).join("\n")).not.toContain("never shown");
     // Their reply to it still comes back to the task.
     expect(h.service.taskForReply("dm:owner", "telegram", String(h.nextId - 1))?.id).toBe("s1");
   });
 
-  it("a wake while the question is being forwarded tells the task once the send settles: it failed", async () => {
+  it("a wake while the question is being forwarded tells the task once the send failed", async () => {
     const h = harness();
     const { t } = await askingTask(h, "Merge PR #12?");
     let open!: (ok: boolean) => void;
@@ -397,9 +441,51 @@ describe("task_ask goes through the owning session, word for word", () => {
     open(false);
     await forward;
     await flush();
-    const input = h.store.get(t.id)!.pendingInput.map((i) => i.text).join("\n");
-    expect(input).toContain("was not shown to the owner");
+    const record = h.store.get(t.id)!;
+    expect([...record.pendingInput.map((i) => i.text), ...h.turns.map((x) => x.prompt)].join("\n")).toContain("never shown to the owner");
+    expect(record.forwardRacing).toBeUndefined();
     expect(h.sent).toEqual([]);
+  });
+
+  it("a failed race on a task that is waiting again is told with its next wake", async () => {
+    const h = harness();
+    const { t } = await askingTask(h, "Merge PR #12?");
+    let open!: (ok: boolean) => void;
+    h.sendGate = new Promise<boolean>((r) => { open = r; });
+    const forward = h.service.afterHandOff("dm:owner", h.service.handOffFor("dm:owner")!.asks);
+    await flush();
+    expect(h.service.ownerMessage("dm:owner", t.id, "also, rename the branch").ok).toBe(true);
+    // The task answers and waits again before the send settles.
+    h.store.update(t.id, (r) => { r.pendingInput = []; });
+    h.store.transition(t.id, "stuck");
+    open(false);
+    await forward;
+    await flush();
+    const waiting = h.store.get(t.id)!;
+    expect(waiting.pendingInput).toEqual([]);
+    expect(waiting.forwardRacing).toMatchObject({ failed: true });
+    expect(h.service.ownerMessage("dm:owner", t.id, "any news?").ok).toBe(true);
+    const woke = h.store.get(t.id)!;
+    expect(woke.forwardRacing).toBeUndefined();
+    expect(woke.pendingInput.map((i) => i.text).join("\n")).toContain("never shown to the owner");
+  });
+
+  it("a race cut short by a crash counts as not shown in the next process", async () => {
+    const h = harness();
+    const { t } = await askingTask(h, "Merge PR #12?");
+    h.sendGate = new Promise<boolean>(() => {});
+    void h.service.afterHandOff("dm:owner", h.service.handOffFor("dm:owner")!.asks);
+    await flush();
+    expect(h.service.ownerMessage("dm:owner", t.id, "also, rename the branch").ok).toBe(true);
+    expect(h.store.get(t.id)!.forwardRacing).toBeDefined();
+    // The process dies with the send pending.
+    const h2 = harness({ store: new SubsessionStore(path, { strictTransitions: true }) });
+    h2.service.recoverAtStartup();
+    h2.service.start();
+    await flush();
+    const record = h2.store.get(t.id)!;
+    expect(record.forwardRacing).toBeUndefined();
+    expect([...record.pendingInput.map((i) => i.text), ...h2.turns.map((x) => x.prompt)].join("\n")).toContain("never shown to the owner");
   });
 
   it("another scope cannot forward it", async () => {

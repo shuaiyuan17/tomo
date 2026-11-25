@@ -3426,6 +3426,8 @@ export class Agent {
         // transcript. Channels are still alive here, so a block produced
         // during this drain still reaches the user.
         await this.liveSessionManager.stop();
+        // Task sends that went out during the drain but could not be recorded.
+        this.subsessions?.flushUnrecorded();
       } finally {
         await this.boundedShutdownStep(
           "channel teardown",

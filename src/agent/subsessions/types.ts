@@ -288,6 +288,13 @@ export interface SubsessionRecord {
    * after a restart, one whose note is gone is queued again.
    */
   unsavedNotices?: Array<{ at: number; text: string }>;
+  /**
+   * A question whose forward was still being sent when a message ended the
+   * wait. Cleared when the send goes out; when it fails (or the process
+   * died before it settled) `failed` is set, and the task is told with its
+   * next input that the owner never saw it.
+   */
+  forwardRacing?: { at: number; text: string; failed?: true };
   /** The newest status changes, oldest first. */
   transitions: SubsessionTransition[];
 }

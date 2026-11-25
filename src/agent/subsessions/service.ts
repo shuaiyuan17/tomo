@@ -237,6 +237,9 @@ function noticeNote(record: Pick<SubsessionRecord, "id" | "title">, at: number, 
     "Decide now: tell the owner with send_message, in your own words (merged with other news when that reads better), or keep it for the next time you talk with them. A result they are waiting for, a blocker, or a decision only they can make should reach them now. Nothing reaches them unless you send it. This note is not shown to you again (task_status keeps it).",
   ].join("\n"), { name: `${record.id}@${at}` });
 }
+const notShownNote = (question: string): string => formatTomoEvent("subsession-redelivery",
+  `Your question was never shown to the owner (its send failed, or Tomo stopped before it went out), so no message since then answers it:\n${quoteBlock(question)}\nAsk again with task_ask if you still need it.`,
+  { name: "question-not-shown" });
 const noticeNamed = (id: string, at: number) => (n: string): boolean => n.includes(`${NOTICE_MARKER} name="${id}@${at}"`);
 /** How much of each unanswered message a failure notice quotes. */
 const UNANSWERED_EXCERPT = 300;
@@ -315,6 +318,7 @@ export class SubsessionService {
    */
   private readonly unrecorded = new Map<string, Array<{ write: (r: SubsessionRecord) => void; replyIds: Array<{ channel: string; messageId: string }> }>>();
   private custodyTimer?: ReturnType<typeof setTimeout>;
+  private readonly lastNoticeAt = new Map<string, number>();
   /** Tasks whose running turn carries the owner's words: a notify there answers them, so it goes out directly. */
   private readonly ownerTurns = new Set<string>();
   private readonly forwarding = new Map<string, { at: number; done: Promise<{ ok: true; already?: boolean } | { ok: false; error: string }> }>();
@@ -659,7 +663,9 @@ export class SubsessionService {
       this.markDelivery(record.id, body, false);
       return { ok: false, error: `the main session already has ${MAX_PENDING_NOTICES} of your notices it has not read. Wait for it, or put this in task_finish.` };
     }
-    const at = this.now();
+    // One notice, one time: the note's name and the record's entry are keyed by it.
+    const at = Math.max(this.now(), (this.lastNoticeAt.get(record.id) ?? 0) + 1, ...(record.unsavedNotices ?? []).map((n) => n.at + 1));
+    this.lastNoticeAt.set(record.id, at);
     // Custody first: the record holds the notice until its note is on disk,
     // so a process that dies before the notes are written loses nothing.
     try {
@@ -694,10 +700,15 @@ export class SubsessionService {
   }
 
   private releaseNotice(id: string, at: number): void {
-    this.safely(() => this.store.update(id, (r) => {
-      const left = (r.unsavedNotices ?? []).filter((n) => n.at !== at);
-      r.unsavedNotices = left.length > 0 ? left : undefined;
-    }), "release a saved notice");
+    try {
+      this.store.update(id, (r) => {
+        const left = (r.unsavedNotices ?? []).filter((n) => n.at !== at);
+        r.unsavedNotices = left.length > 0 ? left : undefined;
+      });
+    } catch (err) {
+      log.warn({ err, id }, "Could not release a saved sub-session notice; tried again");
+      this.armCustodyRetry();
+    }
   }
 
   /**
@@ -708,20 +719,32 @@ export class SubsessionService {
    * sends went out without being written are written.
    */
   private secureCustody(): void {
-    let again = false;
-    for (const [id, writes] of [...this.unrecorded]) {
-      try {
-        const done = this.store.update(id, (r) => { for (const w of writes) w.write(r); });
-        this.unrecorded.delete(id);
-        if (!done) log.warn({ id }, "A sub-session's sent message could not be recorded: the task is gone");
-      } catch (err) {
-        log.warn({ err, id }, "Still could not record a sub-session's sent message; trying again");
-        again = true;
-      }
-    }
+    let again = !this.flushUnrecorded();
     let tasks: SubsessionRecord[] = [];
     try {
-      tasks = this.store.list().filter((t) => t.unsavedNotices?.length);
+      const all = this.store.list();
+      // A race mark with no send in flight in this process (it died before the
+      // send settled, or the record of its end failed): never confirmed, so
+      // not shown.
+      for (const t of all) {
+        const race = t.forwardRacing;
+        if (!race) continue;
+        if (!race.failed && this.forwarding.get(t.id)?.at === race.at) continue;
+        if (!race.failed && this.forwardedAsks.has(askKey(t.id, race.at))) {
+          this.safely(() => this.store.update(t.id, (r) => { if (r.forwardRacing?.at === race.at) delete r.forwardRacing; }), "clear a settled forward race");
+          continue;
+        }
+        if (!race.failed) {
+          try {
+            this.store.update(t.id, (r) => { if (r.forwardRacing?.at === race.at) r.forwardRacing.failed = true; });
+          } catch {
+            again = true;
+            continue;
+          }
+        }
+        this.tellNotShown(t.id);
+      }
+      tasks = all.filter((t) => t.unsavedNotices?.length);
     } catch {
       again = true;
     }
@@ -747,8 +770,28 @@ export class SubsessionService {
     if (again) this.armCustodyRetry();
   }
 
+  /**
+   * Write the sends that went out but were not recorded (best effort: they
+   * live in memory, so a process that dies first loses them). Writes only
+   * records, arms nothing: also the last try once turns have drained at
+   * shutdown. True when nothing is left.
+   */
+  flushUnrecorded(): boolean {
+    for (const [id, writes] of [...this.unrecorded]) {
+      try {
+        const done = this.store.update(id, (r) => { for (const w of writes) w.write(r); });
+        this.unrecorded.delete(id);
+        if (!done) log.warn({ id }, "A sub-session's sent message could not be recorded: the task is gone");
+      } catch (err) {
+        log.warn({ err, id }, "Still could not record a sub-session's sent message");
+      }
+    }
+    return this.unrecorded.size === 0;
+  }
+
   private armCustodyRetry(): void {
-    if (this.custodyTimer) return;
+    // Not before dispatch opens (start() runs a pass) and never after stop().
+    if (this.custodyTimer || !this.open) return;
     this.custodyTimer = setTimeout(() => {
       this.custodyTimer = undefined;
       if (this.deps.isStopping()) return;
@@ -974,6 +1017,8 @@ export class SubsessionService {
         const at = this.now();
         const replyIds = result.channel ? (result.messageIds ?? []).map((messageId) => ({ channel: result.channel!, messageId })) : [];
         const write = (r: SubsessionRecord): void => {
+          // A retry of a write that did land is not applied twice.
+          if (r.sent.some((m) => m.at === at && m.text === body && m.kind === kind)) return;
           r.sent.push({ at, kind, text: body });
           pushConversation(r, { at, from: "task", kind, text: truncate(body, CONVERSATION_TEXT_MAX) });
           for (const m of replyIds) r.replyMap.push({ ...m, at });
@@ -1464,8 +1509,7 @@ export class SubsessionService {
     this.externalWaitTimer = undefined;
     if (this.custodyTimer) clearTimeout(this.custodyTimer);
     this.custodyTimer = undefined;
-    // A last try at what is only in memory.
-    if (this.unrecorded.size > 0) this.safely(() => this.secureCustody(), "record sent messages before stopping");
+    this.flushUnrecorded();
     for (const timer of this.reportTimers.values()) clearTimeout(timer);
     this.reportTimers.clear();
     this.reportAttempts.clear();
@@ -1866,7 +1910,7 @@ export class SubsessionService {
     extra?: (record: SubsessionRecord) => void,
   ): TransitionOutcome {
     const now = this.now();
-    let racing: { done: Promise<{ ok: true; already?: boolean } | { ok: false; error: string }>; text: string } | undefined;
+    let racing: { done: Promise<{ ok: true; already?: boolean } | { ok: false; error: string }>; text: string; at: number } | undefined;
     const outcome = this.transition(id, event, {
       reason: event === "relay" ? "a message from the main session" : "a message from the owner",
       guard: inputQueueFull,
@@ -1878,11 +1922,25 @@ export class SubsessionService {
         // once it settles (racing), not guessed now.
         const ask = r.pendingAsk && this.unforwarded(r) ? r.pendingAsk : undefined;
         const inFlight = ask ? this.forwarding.get(r.id) : undefined;
-        if (ask && inFlight?.at === ask.at) racing = { done: inFlight.done, text: ask.text };
-        const lost = ask && !racing ? ask.text : undefined;
-        appendInput(r, lost ? `${prompt}\n\n${formatTomoEvent("subsession-redelivery",
-          `Your question had not been forwarded to the owner when this message came, so this message is most likely not an answer to it:\n${quoteBlock(lost)}\nAsk again with task_ask if you still need it.`,
-          { name: "question-not-shown" })}` : prompt, { from: "owner", words });
+        racing = ask && inFlight?.at === ask.at ? { done: inFlight.done, text: ask.text, at: ask.at } : undefined;
+        let note: string | undefined;
+        if (racing) {
+          // Written before the owner could have seen the question, whatever
+          // the send does: said now, in this turn's own input. Whether the
+          // question then went out is settled on the record (forwardRacing).
+          note = formatTomoEvent("subsession-redelivery",
+            `Your question was still being sent to the owner when this message came, so this message was written before they saw it and is most likely not an answer to it:\n${quoteBlock(racing.text)}\nIf the question reaches them, their answer to it comes to you as their words. If it does not, you will be told.`,
+            { name: "question-in-flight" });
+          r.forwardRacing = { at: racing.at, text: racing.text };
+        } else if (ask) {
+          note = formatTomoEvent("subsession-redelivery",
+            `Your question had not been forwarded to the owner when this message came, so this message is most likely not an answer to it:\n${quoteBlock(ask.text)}\nAsk again with task_ask if you still need it.`,
+            { name: "question-not-shown" });
+        } else if (r.forwardRacing?.failed) {
+          note = notShownNote(r.forwardRacing.text);
+          delete r.forwardRacing;
+        }
+        appendInput(r, note ? `${prompt}\n\n${note}` : prompt, { from: "owner", words });
         // The owner's word: the wall-clock cap counts from here again.
         r.activeAtOwnerInputMs = activeTotalMs(r, now);
         extra?.(r);
@@ -1890,9 +1948,9 @@ export class SubsessionService {
     });
     if (!outcome.ok) return outcome;
     if (racing) {
-      const { done, text } = racing;
+      const { done, at } = racing;
       void done.catch((err: unknown) => ({ ok: false as const, error: err instanceof Error ? err.message : String(err) }))
-        .then((result) => this.tellForwardOutcome(id, text, result.ok));
+        .then((result) => this.settleForwardRace(id, at, result.ok));
     }
     if (outcome.record.status !== "queued") {
       this.kick(id);
@@ -1918,25 +1976,52 @@ export class SubsessionService {
   }
 
   /**
-   * A message woke the task while its question was being forwarded: once the
-   * send settles, the task learns whether the owner got the question (their
-   * answer then comes to it as their words) or not (ask again if needed).
+   * A message woke the task while its question was being forwarded (the task
+   * was told so in that input). The send settled: out, and the mark goes
+   * (the owner's answer comes back through the reply map); failed, and the
+   * mark says so, and the task is told with its next input.
    */
-  private tellForwardOutcome(id: string, question: string, reached: boolean): void {
-    const note = reached
-      ? `Your question reached the owner after all (it was being sent when the message before this came). If they answer it, the answer comes to you as their words; do not ask it again:\n${quoteBlock(question)}`
-      : `Your question was not shown to the owner (its send failed while a message came), so the message before this is not an answer to it:\n${quoteBlock(question)}\nAsk again with task_ask if you still need it.`;
-    let record: SubsessionRecord | undefined;
+  private settleForwardRace(id: string, at: number, reached: boolean): void {
     try {
-      record = this.store.update(id, (r) => {
-        if (TERMINAL_STATUSES.has(r.status)) return;
-        appendInput(r, formatTomoEvent("subsession-redelivery", note, { name: reached ? "question-forwarded" : "question-not-shown" }));
+      this.store.update(id, (r) => {
+        if (r.forwardRacing?.at !== at) return;
+        if (reached) delete r.forwardRacing;
+        else r.forwardRacing.failed = true;
       });
     } catch (err) {
-      log.error({ err, id }, "Could not tell a sub-session how its question's forward ended");
+      log.error({ err, id }, "Could not record how a sub-session question's forward ended; settled again later");
+      this.armCustodyRetry();
       return;
     }
-    if (record && !TERMINAL_STATUSES.has(record.status) && record.status !== "queued") this.kick(id);
+    if (!reached) this.tellNotShown(id);
+  }
+
+  /**
+   * A question marked as not shown goes to the task with input of its own
+   * only while a turn is coming anyway (active or queued) and the input list
+   * has room; otherwise it rides on the task's next wake (deliverInput).
+   */
+  private tellNotShown(id: string): void {
+    let told = false;
+    try {
+      this.store.update(id, (r) => {
+        if (!r.forwardRacing?.failed) return;
+        if (r.status !== "active" && r.status !== "queued") return;
+        if (r.pendingInput.length >= PENDING_INPUT_MAX) return;
+        appendInput(r, notShownNote(r.forwardRacing.text));
+        delete r.forwardRacing;
+        told = true;
+      });
+    } catch (err) {
+      log.error({ err, id }, "Could not tell a sub-session its question was never shown; told later");
+      this.armCustodyRetry();
+      return;
+    }
+    if (told) {
+      const record = this.safeGet(id);
+      if (record?.status === "active") this.kick(id);
+      else if (record?.status === "queued") this.schedule();
+    }
   }
 
   /** Run the task's driver unless one is running. */

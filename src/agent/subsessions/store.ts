@@ -252,6 +252,10 @@ export class SubsessionStore {
       }
       record.lastActivityAt = now;
       opts.patch?.(record);
+      // A question handed to the main session stands only while the task
+      // waits for the owner's answer (the patch still sees it: a relay that
+      // ends the wait is marked as that answer).
+      if (record.status !== "waiting" || record.waitingOn !== "owner") delete record.askViaMain;
       if (record.status !== (target === "same" ? from : target.status)) {
         throw new Error(`Sub-session ${id}: a transition patch may not change the status`);
       }
@@ -469,6 +473,7 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
     ...(Array.isArray(r.doneSteps) ? { doneSteps: parseDoneSteps(r.doneSteps) } : { doneSteps: undefined }),
     ...(Array.isArray(r.updates) ? { updates: parseUpdates(r.updates) } : { updates: undefined }),
     sent: Array.isArray(r.sent) ? r.sent as SubsessionRecord["sent"] : [],
+    ...parseAskViaMain(r.askViaMain, status, r.waitingOn),
     // An entry not shaped like a transition (or with a time no Date can show) is dropped.
     transitions: Array.isArray(r.transitions)
       ? (r.transitions as unknown[]).filter((t): t is SubsessionRecord["transitions"][number] => !!t && typeof t === "object"
@@ -476,6 +481,14 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
         && typeof (t as Record<string, unknown>).to === "string")
       : [],
   };
+}
+
+/** A well-formed question handed to the main session, kept only on a task waiting for the owner. */
+function parseAskViaMain(value: unknown, status: SubsessionStatus, waitingOn: unknown): { askViaMain?: SubsessionRecord["askViaMain"] } {
+  if (status !== "waiting" || waitingOn !== "owner" || !value || typeof value !== "object") return { askViaMain: undefined };
+  const v = value as Record<string, unknown>;
+  if (!isTimestamp(v.at) || typeof v.text !== "string" || !v.text.trim()) return { askViaMain: undefined };
+  return { askViaMain: { at: v.at, text: v.text, ...(typeof v.note === "string" && v.note ? { note: v.note } : {}) } };
 }
 
 /**
@@ -489,13 +502,15 @@ function parseInputs(raw: unknown): SubsessionInput[] {
   for (const entry of raw) {
     let seq: number | undefined;
     let text: string | undefined;
-    let owner: { from: "owner"; words: string } | undefined;
+    let owner: { from: "owner"; words: string; source?: "panel" } | undefined;
     if (typeof entry === "string") text = entry;
     else if (entry && typeof entry === "object") {
       const e = entry as Record<string, unknown>;
       if (typeof e.text === "string") text = e.text;
       if (typeof e.seq === "number" && Number.isInteger(e.seq) && e.seq > last) seq = e.seq;
-      if (e.from === "owner") owner = { from: "owner", words: typeof e.words === "string" ? e.words : (text ?? "") };
+      if (e.from === "owner") {
+        owner = { from: "owner", words: typeof e.words === "string" ? e.words : (text ?? ""), ...(e.source === "panel" ? { source: "panel" as const } : {}) };
+      }
     }
     if (text === undefined) continue;
     last = seq ?? last + 1;

@@ -111,7 +111,14 @@ describe("subsessions", () => {
     const { config, DEFAULT_SUBSESSIONS } = await load({});
     expect(config.subsessions).toEqual(DEFAULT_SUBSESSIONS);
     expect(config.subsessions.enabled).toBe(true);
-    expect(DEFAULT_SUBSESSIONS).toEqual({ enabled: true, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null, mirror: "turn", maxActiveHours: 24, todos: true });
+    expect(DEFAULT_SUBSESSIONS).toEqual({ enabled: true, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null, mirror: "turn", ownerMessages: "via-main", maxActiveHours: 24, todos: true });
+  });
+
+  it("sends a task's messages through the main session unless ownerMessages is direct", async () => {
+    expect((await load({ subsessions: { ownerMessages: "direct" } })).config.subsessions.ownerMessages).toBe("direct");
+    const bad = await load({ subsessions: { ownerMessages: "phone" } });
+    expect(bad.config.subsessions.ownerMessages).toBe("via-main");
+    expect(bad.configIssues.join("\n")).toContain("subsessions.ownerMessages");
   });
 
   it("can be turned off, and takes a wall-clock cap (0 = none)", async () => {

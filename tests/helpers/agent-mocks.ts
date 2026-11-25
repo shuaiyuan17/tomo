@@ -427,7 +427,7 @@ export const mockConfig = {
   }>,
   /** Sub-sessions on, as by default (src/config.ts DEFAULT_SUBSESSIONS), so
    *  every agent test runs with them; tests/subsessions-agent.test.ts also turns them off. */
-  subsessions: { enabled: true, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null as string | null, mirror: "turn" as "turn" | "note", maxActiveHours: 24, todos: true },
+  subsessions: { enabled: true, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null as string | null, mirror: "turn" as "turn" | "note", ownerMessages: "via-main" as "via-main" | "direct", maxActiveHours: 24, todos: true },
   lcm: {
     nudgeAtPct: 70,
     nudgeResetPct: 60,

@@ -244,11 +244,11 @@ Set `"interruptedAgents": false` (or `{ "enabled": false }`) or `TOMO_INTERRUPTE
 
 ## Sub-sessions
 
-On by default (`"subsessions": { "enabled": false }` turns them off). The owner's own conversation gets `task_spawn`, `task_status`, `task_cancel` and `task_message`: Tomo can hand a long task (a PR to write and see through review, a long investigation) to a separate session that works in the background, survives restarts, and reports back. Each runs under the key `task:<id>` (`s1`, `s2`, …); its messages reach you with a `[s1 · title]` prefix, and its report comes back to the main conversation, which tells you the result and decides what to remember. Sub-sessions don't write memory.
+On by default (`"subsessions": { "enabled": false }` turns them off). The owner's own conversation gets `task_spawn`, `task_status`, `task_cancel` and `task_message`: Tomo can hand a long task (a PR to write and see through review, a long investigation) to a separate session that works in the background, survives restarts, and reports back. Each runs under the key `task:<id>` (`s1`, `s2`, …). What it has to say to you (answers, news, questions) goes to the main conversation first, which decides whether, when and how to tell you (see `ownerMessages`), and its report comes back to the main conversation too, which tells you the result and decides what to remember. Sub-sessions don't write memory.
 
 ```json
 { "subsessions": { "enabled": true, "maxRunning": 2, "maxOpen": 5, "maxTurns": 200, "maxContextTokens": 500000, "defaultModel": null,
-  "mirror": "turn", "maxActiveHours": 24, "todos": true } }
+  "mirror": "turn", "ownerMessages": "via-main", "maxActiveHours": 24, "todos": true } }
 ```
 
 - `maxRunning`: tasks working on their own at once; more wait queued. A message to a task is never queued.
@@ -257,6 +257,7 @@ On by default (`"subsessions": { "enabled": false }` turns them off). The owner'
 - `maxContextTokens`: between turns, a task over this is compacted with `/compact`.
 - `defaultModel`: model for a task that names none (unset follows `model`). Haiku is refused.
 - `mirror`: how the main conversation follows what you and a task say to each other. `"turn"` (default): after you write to a task directly, the main conversation takes a short silent turn to read the exchange, so it can act on it (for example tell another task); what a task says on its own (you already read it) waits for the main conversation's next turn, and there is no silent turn while 80% or more of the 5-hour usage window is used. `"note"`: it reads the exchange only on its next turn. Either way it is shown each exchange once and sends nothing by itself. A silent turn costs a little (it reuses the conversation's prompt cache); switch to `"note"` if that adds up.
+- `ownerMessages`: where a task's `task_reply`, `task_notify` and `task_ask` go. `"via-main"` (default): to the conversation that started the task (the main conversation, or the group that started it: a group's task never reaches your DM), as a note plus a short silent turn there, which passes it on to you, holds it, or folds it into other news. A question is put to you by the main conversation, and your answer goes back to the task with `task_message`, which ends its wait. When you write to a task in the web Tasks panel, its answer stays in that panel (the main conversation still sees the exchange, as `mirror` says). A note is kept on disk until a turn has read it, also across a restart. `"direct"`: each one goes straight to your chat with the `[s1 · title]` prefix, and replying to it reaches the task, as before.
 - `maxActiveHours`: a task that has been working on its own this many hours (active time, counted since your last message to it) pauses and tells you; your next message to it gives it another stretch. `0`: no cap.
 - `todos`: each task gets a todo in the main conversation's list, kept up to date with what it waits on, and closed when the task is cancelled or fails.
 

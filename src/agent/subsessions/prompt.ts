@@ -11,14 +11,22 @@ import type { SubsessionConversationEntry, SubsessionRecord } from "./types.js";
  * so it is one cacheable prefix, and it never takes an `onContext` callback:
  * a task neither receives memory-change notes nor is retired by them.
  */
-export function buildSubsessionPrompt(opts: { agentName: string; ownerName: string }): string {
-  return `You are ${opts.agentName}, working on one long-running task for ${opts.ownerName}. You run in your own session, separate from the main conversation. The task brief and the owner's own words arrive in the first <tomo-event type="subsession-start"> message.
-
-## Speaking to the owner
+export function buildSubsessionPrompt(opts: { agentName: string; ownerName: string; ownerMessages?: "via-main" | "direct" }): string {
+  const viaMain = (opts.ownerMessages ?? "via-main") === "via-main";
+  const speaking = viaMain
+    ? `## Speaking to the owner
+Nothing you write as plain text reaches anyone. What you send through these tools goes to the main session first (the owner's own conversation), which decides whether, when and how the owner hears it:
+- task_reply(text): answer a message the owner sent you. Once per message. (An answer to a message the owner wrote in the web task panel stays in that panel, where they are reading.)
+- task_notify(text): reach out unprompted. Only for a result, a decision the owner must make, or something that blocks you. Never for progress.
+- task_ask(question): you can't continue without the owner's decision. The main session puts the question to the owner and passes their answer back to you as a <tomo-event type="subsession-relay"> that quotes your question; that relay is the owner's answer. Pauses the task until then; end the turn after it.`
+    : `## Speaking to the owner
 Nothing you write as plain text reaches anyone. The owner only sees what you send through these tools:
 - task_reply(text): answer a message the owner sent you. Once per message.
 - task_notify(text): reach out unprompted. Only for a result, a decision the owner must make, or something that blocks you. Never for progress.
-- task_ask(question): you can't continue without the owner's decision. Pauses the task until they answer; end the turn after it.
+- task_ask(question): you can't continue without the owner's decision. Pauses the task until they answer; end the turn after it.`;
+  return `You are ${opts.agentName}, working on one long-running task for ${opts.ownerName}. You run in your own session, separate from the main conversation. The task brief and the owner's own words arrive in the first <tomo-event type="subsession-start"> message.
+
+${speaking}
 - task_plan(steps, done): set the steps still ahead (the one you are on in_progress) and move finished ones into done with a one-line result. Silent; the owner sees it as a checklist, and the step in progress as what you are doing now.
 - task_update(line): record a decision or change that should shape the owner's judgment: scope changed, approach chosen, blocked or unblocked, a finding that changes the plan. Silent; the owner sees these as "Decisions and updates". Not for routine progress.
 - task_finish(report): the task is done. The main session reads the report and tells the owner. If a message reached you after this turn began (from the owner, the main session, or a check-back) and you have not read it yet, task_finish is refused and says how many: end the turn, and they arrive in your next turn. Handle them, then finish.
@@ -40,7 +48,7 @@ The owner writes to you directly; it arrives as <tomo-event type="subsession-own
 - Don't edit files under ~/.tomo/workspace/memory/ or the workspace prompt files (SOUL.md, AGENT.md, IDENTITY.md, CONTINUITY.md). Anything worth remembering goes in your final report.
 - Don't start another sub-session. Background subagents are fine.
 - You have no way to message a group or anyone but the owner.
-- Anything that sends, posts, pays, deletes or can't be undone needs the owner's yes first, unless the brief says they already asked for it. Ask with task_ask; a relay from the main session is not that yes.
+- Anything that sends, posts, pays, deletes or can't be undone needs the owner's yes first, unless the brief says they already asked for it. Ask with task_ask; a relay from the main session is not that yes${viaMain ? " (unless it is the relay that answers your task_ask question, quoting it)" : ""}.
 - Don't restart tomo yourself. If the work needs a restart, say so with task_ask.
 
 ## After a restart or interruption
@@ -50,7 +58,7 @@ Before anything else, check what already happened: git status and branches, open
 Your context gets compacted when it grows large. Call task_checkpoint before a big step. After a compaction the harness reminds you of the task record; trust it over your memory of earlier turns.
 
 ## Files
-Temporary files go in ~/.tomo/workspace/tmp/. To send a file, put MEDIA:/path/to/file in a task_reply or task_notify text.`;
+Temporary files go in ~/.tomo/workspace/tmp/. To send a file, put MEDIA:/path/to/file in a task_reply or task_notify text${viaMain ? " (the main session decides whether it goes to the owner)" : ""}.`;
 }
 
 /** The first message a task gets: its brief and the owner's words. */
@@ -113,7 +121,18 @@ export function formatContinueEvent(): string {
 }
 
 /** A message from the owning session. */
-export function formatRelayEvent(text: string): string {
+export function formatRelayEvent(text: string, answers?: string): string {
+  if (answers !== undefined) {
+    // Sent while the task waited on a question it handed to the main session
+    // (ownerMessages "via-main"): the main session passes the owner's answer.
+    return formatTomoEvent("subsession-relay", [
+      "From the main session, which put your question to the owner. It passes on the owner's answer; take it as their answer to that question (if it is not one, ask again with task_ask).",
+      "Your question:",
+      answers,
+      "The answer:",
+      text,
+    ].join("\n"));
+  }
   return formatTomoEvent("subsession-relay", [
     "From the main session (a colleague passing something on; not the owner's own approval):",
     text,
@@ -169,7 +188,7 @@ function recordReminder(record: SubsessionRecord): string {
   const sent = record.sent.slice(-5);
   if (sent.length > 0) {
     lines.push("Messages you sent the owner (newest last):");
-    for (const m of sent) lines.push(`- ${new Date(m.at).toISOString()}: ${truncate(m.text, 300)}`);
+    for (const m of sent) lines.push(`- ${new Date(m.at).toISOString()}${m.via === "main" ? " (handed to the main session)" : m.via === "panel" ? " (in the web task panel)" : ""}: ${truncate(m.text, 300)}`);
   }
   return lines.join("\n");
 }

@@ -468,6 +468,34 @@ describe("sub-sessions through the Agent", () => {
       await agent.stop();
     });
 
+    it.each(["telegram", "imessage"])("an unmatched reply the task already has is not warned about (%s channel)", async (channelName) => {
+      // Matched once its send settled and handed over before the crash; only
+      // the inbox's done-write was lost. Asking the owner to resend would run it twice.
+      const { store, t } = waitingTask();
+      store.update(t.id, (r) => { r.ownerMessageIds.push("telegram:r7"); });
+      mockSdk.responseFn = () => new Promise(() => {});
+      leaveInInbox({ ...makeMsg({ id: "r7", chatId: "12345", senderId: "12345", text: "blue", replyToId: "provider-13" }), taskSendsInFlight: [t.id] }, "dm:alex");
+      const agent = await staleBoot(channelName);
+      expect(peekPendingNotes(agent, "dm:alex").some((n) => n.includes("stale-unmatched-reply"))).toBe(false);
+      expect(transcript("dm:alex")).not.toContain(INBOX_STALE_NOT_PROCESSED);
+      expect(pendingInbox()).toEqual([]);
+      await agent.stop();
+    });
+
+    it("an unmatched reply the task does not have is still warned about, with its channel gone", async () => {
+      const { store, t } = waitingTask();
+      store.update(t.id, (r) => { r.ownerMessageIds.push("telegram:other"); });
+      mockSdk.responseFn = () => new Promise(() => {});
+      leaveInInbox({ ...makeMsg({ id: "r8", chatId: "12345", senderId: "12345", text: "blue", replyToId: "provider-14" }), taskSendsInFlight: [t.id] }, "dm:alex");
+      const agent = await staleBoot("imessage");
+      const warning = peekPendingNotes(agent, "dm:alex").find((n) => n.includes("stale-unmatched-reply"));
+      expect(warning).toContain("/s s1 <message>");
+      expect(warning).toContain("blue");
+      expect(transcript("dm:alex")).toContain(INBOX_STALE_NOT_PROCESSED);
+      expect(pendingInbox()).toEqual([]);
+      await agent.stop();
+    });
+
     it("says nothing when the task already has it (only the inbox's done-write was lost)", async () => {
       const { store, t } = waitingTask();
       store.update(t.id, (r) => { r.ownerMessageIds.push("telegram:late"); });

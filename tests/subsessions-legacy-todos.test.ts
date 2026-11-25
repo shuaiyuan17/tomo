@@ -64,6 +64,17 @@ describe("the todos sub-sessions used to keep", () => {
     expect(open).toContain(unnamed);
   });
 
+  it("drops only the item the record names, not a lookalike beside it", () => {
+    const { tasks, todos } = setup();
+    const s1 = tasks.create({ parentKey: "dm:owner", title: "Twins", brief: "b" });
+    const named = linkTodo(todos, s1, `${s1.id} is working on it (/s ${s1.id})`, "external");
+    const twin = linkTodo(todos, s1, `${s1.id} is working on it (/s ${s1.id})`, "external");
+    expect(dropLegacyTaskTodos(todos, [{ ...s1, legacyTodoId: named }], () => true)).toEqual({ dropped: 1, complete: true });
+    const open = todos.list().map((i) => i.id);
+    expect(open).not.toContain(named);
+    expect(open).toContain(twin);
+  });
+
   it("reads an old record's todoId as the link's item", () => {
     const path = join(dir, "old.json");
     writeFileSync(path, JSON.stringify({ version: 1, nextId: 2, tasks: [{ id: "s1", sessionKey: "task:s1", parentKey: "dm:owner", title: "T", brief: "b", status: "finished", createdAt: 1, lastActivityAt: 1, pendingInput: [], todoId: "t-44", progress: "p" }] }));

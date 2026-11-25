@@ -57,9 +57,10 @@ export function dropLegacyTaskTodos(
     const stale = store.list().flatMap((item) => {
       const task = item.ref ? byKey.get(item.ref) : undefined;
       return task && item.session === task.parentKey && item.source === "self"
-        // The record names the link's item (`legacyTodoId`); one it never
-        // recorded (a crash before the id reached it) is known by its title.
-        && (task.legacyTodoId === item.id || wrote(item.title, `${task.title} (${task.id})`, titleMaxChars))
+        // The record names the link's item (`legacyTodoId`): that one only.
+        // One it never recorded (a crash before the id reached it) is known
+        // by its title.
+        && (task.legacyTodoId !== undefined ? task.legacyTodoId === item.id : wrote(item.title, `${task.title} (${task.id})`, titleMaxChars))
         && asLinkLeftIt(item, task) ? [{ item, task }] : [];
     });
     let dropped = 0;

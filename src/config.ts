@@ -387,8 +387,6 @@ export interface SubsessionConfig {
    * cap. Default 24.
    */
   maxActiveHours: number;
-  /** Track each task as a todo on the owner's list. Default on. */
-  todos: boolean;
 }
 
 export const DEFAULT_SUBSESSIONS: SubsessionConfig = {
@@ -401,7 +399,6 @@ export const DEFAULT_SUBSESSIONS: SubsessionConfig = {
   mirror: "turn",
   ownerMessages: "via-main",
   maxActiveHours: 24,
-  todos: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -686,7 +683,6 @@ function parseSubsessionConfig(raw: unknown): SubsessionConfig {
     mirror: validated("subsessions.mirror", z.enum(["turn", "note"]), entry.mirror, DEFAULT_SUBSESSIONS.mirror),
     ownerMessages: validated("subsessions.ownerMessages", z.enum(["via-main", "direct"]), entry.ownerMessages, DEFAULT_SUBSESSIONS.ownerMessages),
     maxActiveHours: validated("subsessions.maxActiveHours", z.number().finite().min(0), entry.maxActiveHours, DEFAULT_SUBSESSIONS.maxActiveHours),
-    todos: validated("subsessions.todos", boolLike, entry.todos, DEFAULT_SUBSESSIONS.todos),
   };
 }
 

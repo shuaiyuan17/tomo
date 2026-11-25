@@ -205,8 +205,31 @@ export interface SubsessionRecord {
   /** Goal, progress, next step and side effects (task_checkpoint). */
   checkpoint?: string;
   report?: string;
-  /** Counts the task's reports (a finished task can be woken and finish again); its report note is named by it. */
+  /**
+   * What the owner has to do with the report (task_finish `owner_action`:
+   * review and merge a PR, make a choice), one line. A finished task with
+   * one is the owner's ("Needs you") until they do it: `/s <id> done` or the
+   * owning session's task_done clears it (that report's ask only), and the
+   * next task_finish sets it afresh or not. A reopen leaves it (the ask
+   * stands until a new report says otherwise) but hides it: meaningful only
+   * while the task is finished, read through `needsOwner`.
+   */
+  ownerAction?: string;
+  /** Counts the task's reports (a finished task can be woken and finish again); its report note is named by it. Read through `reportNumber`. */
   reportSeq?: number;
+  /**
+   * Set once a start moved the old todo link's "Read sN's result" onto this
+   * record as its `ownerAction`: never moved again (an ask the owner has
+   * since cleared stays cleared, even while that todo could not be dropped).
+   */
+  legacyAskMoved?: true;
+  /**
+   * The id of the todo the old todo link kept for this task (a record written
+   * before had it as `todoId`). Read only by the startup pass that drops those
+   * todos (`legacy-todos.ts`): it names the link's own item whatever title
+   * limit was in force when it was written.
+   */
+  legacyTodoId?: string;
   /**
    * Earlier reports a later task_finish replaced while they were still
    * unread (their note still waiting, or never written), oldest first, at
@@ -249,8 +272,6 @@ export interface SubsessionRecord {
   conversationSeq: number;
   /** The newest `seq` the owning session has seen (mirror), advanced only by a turn that completed. */
   mirrorSeenSeq: number;
-  /** The todo (src/todos) that tracks this task on the owner's list, if one was made. */
-  todoId?: string;
   /**
    * Inputs with seq up to this went out in a turn that did not complete (cut
    * short by a restart, failed, or its result could not be saved): the task
@@ -329,6 +350,23 @@ export function isTimestamp(at: unknown): at is number {
 export function currentStep(record: Pick<SubsessionRecord, "plan" | "status">): string | undefined {
   if (!OPEN_STATUSES.has(record.status)) return undefined;
   return record.plan?.find((s) => s.status === "in_progress")?.text;
+}
+
+/** task_finish's `owner_action`: one line. */
+export const OWNER_ACTION_MAX = 300;
+
+/**
+ * What a finished task still asks of the owner (its report's `owner_action`),
+ * or undefined when it asks nothing or the task is not finished. A task that
+ * returns one is the owner's: shown as "Needs you" and never archived.
+ */
+/** The number of the task's latest report: `reportSeq`, or 1 for a record written before reports were counted. */
+export function reportNumber(record: Pick<SubsessionRecord, "reportSeq">): number {
+  return record.reportSeq ?? 1;
+}
+
+export function needsOwner(record: Pick<SubsessionRecord, "status" | "ownerAction">): string | undefined {
+  return record.status === "finished" && record.ownerAction ? record.ownerAction : undefined;
 }
 
 /** One line, trimmed, at most `max` characters (by code point, so a pair is never split). */

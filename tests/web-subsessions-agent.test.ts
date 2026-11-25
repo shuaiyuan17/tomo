@@ -62,8 +62,8 @@ describe("the web's access to sub-sessions", () => {
     agent.subsessions!.spawn("dm:alex", { title: "Mine", brief: "b" });
     await waitFor(() => expect(agent.subsessions!.get("s1")?.status).toBe("active"));
     // As a turn that ended with a check-back scheduled leaves it.
-    const moved = (agent.subsessions as unknown as { transition: (id: string, e: string, o: object) => { ok: boolean } })
-      .transition("s1", "wait_external", { reason: "waiting for its scheduled check-back", expectFrom: ["active"] });
+    const moved = (agent.subsessions as unknown as { store: { transition: (id: string, e: string, o: object) => { ok: boolean } } })
+      .store.transition("s1", "wait_external", { reason: "waiting for its scheduled check-back", expectFrom: ["active"] });
     expect(moved.ok).toBe(true);
     const background = vi.spyOn(agent, "hasBackgroundWork").mockImplementation((key) => key === "task:s1");
     const web = agent.webSubsessions()!;

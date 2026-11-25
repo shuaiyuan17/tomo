@@ -424,11 +424,18 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
   const createdAt = num("createdAt", 0);
   const pendingInput = parseInputs(r.pendingInput);
   const lastSeq = pendingInput.at(-1)?.seq ?? 0;
-  // `progress` (the old task_progress line) is no longer kept: a record written before is read without it.
+  // `progress` (the old task_progress line) is no longer kept: a record
+  // written before is read without it. `todoId` (the todo sub-sessions once
+  // kept on the owner's list) is read as `legacyTodoId`, for the startup
+  // pass that drops those todos.
   const kept = { ...r };
   delete kept.progress;
+  delete kept.todoId;
+  const legacyTodoId = typeof r.todoId === "string" && r.todoId ? r.todoId : typeof r.legacyTodoId === "string" && r.legacyTodoId ? r.legacyTodoId : undefined;
+  delete kept.legacyTodoId;
   return {
     ...(kept as unknown as SubsessionRecord),
+    ...(legacyTodoId ? { legacyTodoId } : {}),
     id,
     sessionKey: str("sessionKey"),
     parentKey: str("parentKey"),
@@ -469,6 +476,7 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
         !!e && typeof e === "object" && typeof (e as { seq?: unknown }).seq === "number" && typeof (e as { text?: unknown }).text === "string") }
       : { earlierReports: undefined }),
     ...(r.handedBack === true ? { handedBack: true } : { handedBack: undefined }),
+    ...(typeof r.ownerAction === "string" && r.ownerAction.trim() ? { ownerAction: r.ownerAction } : { ownerAction: undefined }),
     ...(Array.isArray(r.plan) ? { plan: parsePlan(r.plan) } : { plan: undefined }),
     ...(Array.isArray(r.doneSteps) ? { doneSteps: parseDoneSteps(r.doneSteps) } : { doneSteps: undefined }),
     ...(Array.isArray(r.updates) ? { updates: parseUpdates(r.updates) } : { updates: undefined }),

@@ -99,8 +99,8 @@ it("shows a task's own model, and a task waiting on a check-back with background
   const row = rail().locator('[data-subsession-row="s1"]');
   await browserExpect(row).toContainText("Fable 5.1");
   // As a turn that ends with a check-back scheduled and a background command still running leaves it.
-  const moved = (agent.subsessions as unknown as { transition: (id: string, e: string, o: object) => { ok: boolean } })
-    .transition("s1", "wait_external", { reason: "waiting for its scheduled check-back", expectFrom: ["active"] });
+  const moved = (agent.subsessions as unknown as { store: { transition: (id: string, e: string, o: object) => { ok: boolean } } })
+    .store.transition("s1", "wait_external", { reason: "waiting for its scheduled check-back", expectFrom: ["active"] });
   expect(moved.ok).toBe(true);
   vi.spyOn(agent, "hasBackgroundWork").mockImplementation((key) => key === "task:s1");
   channel.publishSubsessionsChanged();

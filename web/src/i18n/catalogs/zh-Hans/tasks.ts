@@ -30,7 +30,7 @@ export const tasks = {
   command: { heading: "命令", truncated: "\n…（已截断）" },
   subsession: {
     group: "子会话", openTitle: "打开 {{id}}，和它对话",
-    state: { working: "工作中", background: "工作中（后台运行）", active: "进行中", queued: "排队中", waitingOwner: "等你回复", waiting: "等待中", finished: "已完成", cancelled: "已取消", failed: "失败" },
+    state: { working: "工作中", background: "工作中（后台运行）", active: "进行中", queued: "排队中", waitingOwner: "等你回复", needsYou: "等你处理", waiting: "等待中", finished: "已完成", cancelled: "已取消", failed: "失败" },
     conversation: "和 {{id}} 的对话", nothingYet: "还没有对话。可以在下面给 {{id}} 留言。",
     you: "你", tag: { ask: "提问", notify: "通知" }, report: "报告",
     doing: { heading: "正在做", inProgress: "进行中", pending: "未开始", done: "已完成", earlier: "显示更早的 {{count}} 项", fewer: "收起" },

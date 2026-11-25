@@ -20,6 +20,8 @@ import {
   taskSessionKey,
 } from "./sessions/keys.js";
 import { SubsessionService, type OwnerMessageResult, type TaskTurnOutcome } from "./agent/subsessions/service.js";
+import { dropLegacyTaskTodos } from "./agent/subsessions/legacy-todos.js";
+import { TodoStore } from "./todos/store.js";
 import { parseTaskAddress, type TaskAddress } from "./agent/subsessions/address.js";
 import { taskCommandReply } from "./agent/subsessions/commands.js";
 import { SubsessionStore } from "./agent/subsessions/store.js";
@@ -28,8 +30,6 @@ import { resolveModelName } from "./models.js";
 import type { SubsessionRecord } from "./agent/subsessions/types.js";
 import type { WebSubsessionAccess } from "./channels/web.js";
 import { buildSubsessionPrompt } from "./agent/subsessions/prompt.js";
-import { createTodoLink } from "./agent/subsessions/todo-link.js";
-import { TodoStore } from "./todos/store.js";
 import { CRON_STORE_PATH } from "./cron/store.js";
 import { createTaskCronLink } from "./agent/subsessions/cron-link.js";
 import { EFFORT_LEVELS, type EffortLevel } from "./config.js";
@@ -628,7 +628,6 @@ export class Agent {
       registryTaskKeys: () => this.sessions.listActiveEntries().map((e) => e.channelKey).filter(isTaskSessionKey),
       isStopping: () => this.stopping,
       sessionQuotaPercent: () => readSessionWindowPercent(join(usageDataDir(config.tomoHome), "limits.ndjson")),
-      ...(config.subsessions.todos ? { todos: createTodoLink(new TodoStore()) } : {}),
       mirrorWake: (parentKey) => this.mirrorWake(parentKey),
       messageWake: (parentKey) => this.messageWake(parentKey),
     });
@@ -3316,7 +3315,10 @@ export class Agent {
       // Sub-session restart recovery runs BEFORE any channel ingests, so no
       // input can reach a task recovery has not looked at yet. It schedules
       // nothing: dispatch opens with start() below, after the inbox replay.
-      this.subsessions?.recoverAtStartup();
+      // The todos the old per-task todo link made would never close now (the
+      // task record is the card). Dropped from the table as read, before the
+      // sweep forgets a task whose todo is still open.
+      this.subsessions?.recoverAtStartup((records, keepAsk) => dropLegacyTaskTodos(new TodoStore(), records, keepAsk).complete);
     } catch (err) {
       log.error({ err }, "Sub-session recovery failed");
     }

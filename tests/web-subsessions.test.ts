@@ -32,6 +32,21 @@ describe("the rail's view of sub-sessions", () => {
     expect(subsessionDetail(tasks[2], "dm:owner", NOW, false)).toBeUndefined();
   });
 
+  it("keeps a finished task that needs the owner with the open ones, however long ago it finished", () => {
+    const old = NOW - SUBSESSION_ENDED_VISIBLE_MS - H;
+    const tasks = [
+      record("s1", { status: "finished", endedAt: old, createdAt: NOW - 9 * H, ownerAction: "Merge PR #3" }),
+      record("s2", { status: "finished", endedAt: old }),
+      record("s3", { status: "queued" }),
+      // Set but no longer finished (reopened): not the owner's.
+      record("s4", { status: "active", ownerAction: "stale", createdAt: NOW - H }),
+    ];
+    const list = subsessionList(tasks, "dm:owner", NOW, () => false);
+    expect(list.map((t) => t.id)).toEqual(["s1", "s3", "s4"]);
+    expect(list[0]).toMatchObject({ status: "finished", ownerAction: "Merge PR #3" });
+    expect(list[2]).not.toHaveProperty("ownerAction");
+  });
+
   it("lists open tasks oldest first, then recently ended ones newest first, and drops old ended ones", () => {
     const tasks = [
       record("s1", { status: "finished", endedAt: NOW - 2 * H }),

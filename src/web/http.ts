@@ -1,5 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { convertUpload, discardUpload, MAX_UPLOAD_BYTES, MAX_UPLOAD_FILE_BYTES, stageUpload, UploadError } from "./uploads.js";
+import { convertUpload, discardUpload, MAX_UPLOAD_BYTES, MAX_UPLOAD_FILE_BYTES, peekUpload, stageUpload, UploadError } from "./uploads.js";
 import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { resolve, sep } from "node:path";
@@ -222,10 +222,26 @@ export async function startWebHttp(port: number, deps: HttpDependencies) {
           res.end(file.bytes);
           return;
         }
+        // A staged upload, for a page restoring its tray after a reload: an
+        // ordinary API read (cookie + x-tomo-request), owner-only like uploading.
+        const staged = /^\/api\/v1\/uploads\/([a-f0-9]{32})$/.exec(url.pathname);
+        if (staged) {
+          if (!deps.data.catalog().ownerId) throw new WebError(409, "owner_setup_required");
+          const upload = deps.uploadsDir ? peekUpload(deps.uploadsDir, staged[1]) : undefined;
+          if (!upload) throw new WebError(404, "upload_missing");
+          if (upload.kind === "claimed" || upload.kind === "unsettled") throw new WebError(409, `upload_${upload.kind}`);
+          if (upload.kind === "file") { json(res, 200, { kind: "file", size: upload.size }); return; }
+          res.writeHead(200, { "content-type": upload.type, "content-length": upload.bytes.length, "cache-control": "no-store", "x-content-type-options": "nosniff" });
+          res.end(upload.bytes);
+          return;
+        }
         const sent = /^\/api\/v1\/sessions\/([A-Za-z0-9_-]{43})\/outgoing\/([a-f0-9]{32})$/.exec(url.pathname);
         if (sent) {
           const file = deps.data.outgoingFile(sent[1], sent[2]);
-          res.writeHead(200, { "content-type": file.type, "content-length": file.bytes.length, "cache-control": "no-store", "x-content-type-options": "nosniff" });
+          // A file (not a picture) is only ever a download: opaque bytes, never
+          // rendered, and sandboxed should a browser open it anyway.
+          res.writeHead(200, { "content-type": file.type, "content-length": file.bytes.length, "cache-control": "no-store", "x-content-type-options": "nosniff",
+            ...(file.name !== undefined ? { "content-disposition": `attachment; filename="${file.name}"`, "content-security-policy": "sandbox; default-src 'none'" } : {}) });
           res.end(file.bytes);
           return;
         }

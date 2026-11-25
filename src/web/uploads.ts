@@ -1,6 +1,6 @@
 import { closeSync, constants, fstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { convertHeicImage, heicHasAlpha } from "../channels/heic.js";
@@ -45,15 +45,53 @@ export class UploadError extends Error {
   constructor(readonly code: "not_image" | "too_large" | "upload_limit" | "upload_missing") { super(code); }
 }
 
-/** Remove staged uploads older than the TTL. Returns how many remain. */
+/**
+ * Where an upload that is GONE for good is recorded (`<id>`, empty): sent
+ * (its message recorded), discarded, or expired. A sibling of the staging
+ * directory, so the staged set stays exactly the uploads. Written BEFORE the
+ * staged or claimed file is removed, and never by a claim or its release —
+ * so "gone" is one file's existence, not an inference from two lookups that
+ * a claim landing and releasing in between can fool (see peekUpload).
+ * Tombstones are kept GONE_TTL_MS, past the TTL: after that the id's own
+ * date answers (newUploadId), so a kept upload's answer is always definite.
+ */
+export const GONE_TTL_MS = 2 * UPLOAD_TTL_MS;
+/**
+ * An upload id: when it was staged (48-bit ms, 12 hex) then 80 random bits —
+ * still unguessable, and it dates itself, so an id of any age has a definite
+ * answer: one staged longer ago than the TTL is gone, record or no record.
+ * (The kept tray that asks is new with this scheme: no older id is ever asked about.)
+ */
+function newUploadId(now: number): string {
+  return Math.max(0, Math.floor(now)).toString(16).padStart(12, "0").slice(-12) + randomBytes(10).toString("hex");
+}
+function stagedAt(uploadId: string): number { return Number.parseInt(uploadId.slice(0, 12), 16); }
+// Only the past settles it: a date ahead of this clock (the clock moved back) is no answer.
+const outlived = (uploadId: string, now: number) => now - stagedAt(uploadId) > UPLOAD_TTL_MS;
+const goneDir = (dir: string) => join(dirname(dir), `${basename(dir)}.gone`);
+function markGone(dir: string, uploadId: string): void {
+  if (!UPLOAD_ID.test(uploadId)) return;
+  try { mkdirSync(goneDir(dir), { recursive: true, mode: 0o700 }); writeFileSync(join(goneDir(dir), uploadId), "", { mode: 0o600 }); } catch { /* best effort: the page then keeps it as failed, never drops it */ }
+}
+function isGone(dir: string, uploadId: string): boolean {
+  try { return statSync(join(goneDir(dir), uploadId)).isFile(); } catch { return false; }
+}
+
+/** Remove staged uploads older than the TTL (recorded as gone), and expired tombstones. Returns how many uploads remain. */
 export function sweepUploads(dir: string, now = Date.now()): number {
+  // Old tombstones first: the ones this sweep writes are new.
+  try {
+    for (const name of readdirSync(goneDir(dir))) {
+      try { if (now - statSync(join(goneDir(dir), name)).mtimeMs > GONE_TTL_MS) unlinkSync(join(goneDir(dir), name)); } catch { /* raced */ }
+    }
+  } catch { /* none yet */ }
   let names: string[];
   try { names = readdirSync(dir); } catch { return 0; }
   let left = 0;
   for (const name of names) {
     const path = join(dir, name);
     try {
-      if (now - statSync(path).mtimeMs > UPLOAD_TTL_MS) unlinkSync(path);
+      if (now - statSync(path).mtimeMs > UPLOAD_TTL_MS) { markGone(dir, name.split(".")[0]); unlinkSync(path); }
       else left++;
     } catch { /* gone already */ }
   }
@@ -91,7 +129,7 @@ export function stageUpload(dir: string, bytes: Buffer, now = Date.now(), allowF
   if (bytes.length > (type ? MAX_UPLOAD_BYTES : MAX_UPLOAD_FILE_BYTES)) throw new UploadError("too_large");
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   if (sweepUploads(dir, now) >= MAX_STAGED_UPLOADS) throw new UploadError("upload_limit");
-  const uploadId = randomBytes(16).toString("hex");
+  const uploadId = newUploadId(now);
   writeFileSync(join(dir, `${uploadId}.${type ? EXT[type] : FILE_EXT}`), bytes, { flag: "wx", mode: 0o600 });
   return type ? { uploadId, type, size: bytes.length, kind: "image" } : { uploadId, type: "application/octet-stream", size: bytes.length, kind: "file" };
 }
@@ -99,6 +137,7 @@ export function stageUpload(dir: string, bytes: Buffer, now = Date.now(), allowF
 /** Web process: drop a staged upload the owner removed (× on its thumbnail). */
 export function discardUpload(dir: string, uploadId: string): void {
   if (!UPLOAD_ID.test(uploadId)) return;
+  markGone(dir, uploadId);
   for (const ext of STAGED_EXTS) { try { unlinkSync(join(dir, `${uploadId}.${ext}`)); } catch { /* not this one */ } }
 }
 
@@ -121,6 +160,41 @@ export function readUpload(dir: string, uploadId: string, now = Date.now()): { b
     } finally { closeSync(fd); }
   }
   return undefined;
+}
+
+/**
+ * Web process: a staged upload the page still holds after a reload (its tray
+ * is kept in sessionStorage): an image's bytes, for the thumbnail, or a
+ * file's size; "claimed" while a message that names it is being filed;
+ * "unsettled" when it cannot tell (see markGone). Undefined — gone — only
+ * when the id is malformed or recorded gone (sent, discarded, expired) —
+ * the page then drops it.
+ */
+export function peekUpload(dir: string, uploadId: string, now = Date.now()): { kind: "image"; bytes: Buffer; type: string } | { kind: "file"; size: number } | { kind: "claimed" } | { kind: "unsettled" } | undefined {
+  if (!UPLOAD_ID.test(uploadId)) return undefined;
+  // Gone only on the record of it (markGone): a claim is a rename that can land
+  // and release between any two lookups here, any number of times.
+  if (isGone(dir, uploadId)) return undefined;
+  const staged = stagedUpload(dir, uploadId, now);
+  if (staged) return staged;
+  // Still there but past its TTL: expired, so gone (a claim refuses it too), swept or not.
+  for (const ext of STAGED_EXTS) { try { if (now - statSync(join(dir, `${uploadId}.${ext}`)).mtimeMs > UPLOAD_TTL_MS) return undefined; } catch { /* not this one */ } }
+  try { if (readdirSync(dir).some((name) => name.startsWith(`${uploadId}.`) && name.includes(".claim-"))) return { kind: "claimed" }; } catch { /* no directory */ }
+  // No file either way: the id's own date settles it (checked last, so a clock moved back cannot hide a live upload).
+  if (outlived(uploadId, now)) return undefined;
+  // Dated within the TTL, neither staged nor claimed, not recorded gone: caught
+  // mid-claim. Not an answer either way: the page keeps it, with Retry.
+  return { kind: "unsettled" };
+}
+function stagedUpload(dir: string, uploadId: string, now: number): { kind: "image"; bytes: Buffer; type: string } | { kind: "file"; size: number } | undefined {
+  const image = readUpload(dir, uploadId, now);
+  if (image) return { kind: "image", ...image };
+  let fd: number;
+  try { fd = openSync(join(dir, `${uploadId}.${FILE_EXT}`), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); } catch { return undefined; }
+  try {
+    const stat = fstatSync(fd);
+    return stat.isFile() && stat.size <= MAX_UPLOAD_FILE_BYTES && now - stat.mtimeMs <= UPLOAD_TTL_MS ? { kind: "file", size: stat.size } : undefined;
+  } finally { closeSync(fd); }
 }
 
 /** Daemon: remove staged uploads once their message is recorded. */
@@ -154,7 +228,7 @@ export function recoverClaims(dir: string, recorded: (requestId: string) => bool
     if (!match) continue;
     const path = join(dir, name);
     try {
-      if (recorded(match[2])) unlinkSync(path);
+      if (recorded(match[2])) { markGone(dir, match[1].split(".")[0]); unlinkSync(path); }
       else { renameSync(path, join(dir, match[1])); restored++; }
     } catch { /* raced */ }
   }
@@ -196,5 +270,5 @@ export function claimUploads(dir: string, uploadIds: readonly string[], tag: str
     } catch { release(); return undefined; }
     finally { if (fd !== undefined) closeSync(fd); }
   }
-  return { files, release, finalize: () => { for (const c of claimed.splice(0)) { try { unlinkSync(c.to); } catch { /* gone */ } } } };
+  return { files, release, finalize: () => { for (const c of claimed.splice(0)) { markGone(dir, c.id); try { unlinkSync(c.to); } catch { /* gone */ } } } };
 }

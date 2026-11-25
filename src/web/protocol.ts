@@ -432,9 +432,11 @@ export interface WebPermissionResult { status: "allowed_once" | "allowed_always"
 /** Take back a group's Always allow (POST /permissions/revoke), by its grant id. The Permissions page (PR-3) builds on it. */
 export const permissionRevokeSchema = z.object({ grantId: z.string().regex(/^G-[A-HJ-NP-Z2-9]{6}$/) }).strict();
 export interface WebPermissionRevokeResult { status: "revoked" }
+/** A file (not a picture) the agent sent, filed in the outgoing media store: shown as a card, fetched as a download. */
+export interface WebSentFile { id: string; name: string; size: number }
 export type WebEvent =
-  /** `images`: ids of pictures this block sent, filed in the outgoing media store (see outgoing-media.ts). */
-  | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string; images?: string[] }
+  /** `images` / `files`: what this block sent, filed in the outgoing media store (see outgoing-media.ts). */
+  | { type: "block"; sessionId: string; requestId: string; turnId?: string; id: string; text: string; images?: string[]; files?: WebSentFile[] }
   | { type: "request"; request: WebRequest }
   | { type: "invalidate"; sessionId?: string }
   /** The cron schedule may have changed (a job fired or finished). No payload: the page re-reads /cron. */

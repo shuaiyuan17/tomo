@@ -7,11 +7,11 @@ import { shortErrorMessage } from "../error-text.js";
 import { watchBus } from "../watch/bus.js";
 import type { TurnSource } from "../watch/protocol.js";
 import { triggerSnippet, type UsageAttribution, type UsageSource } from "../usage/ledger.js";
-import { isGroupSessionKey } from "../sessions/keys.js";
+import { isGroupSessionKey, isTaskSessionKey } from "../sessions/keys.js";
 import type { SDKMessageOrigin } from "@anthropic-ai/claude-agent-sdk";
 import { EMPTY_REPLY, STEER_MERGED, TurnInterruptedError } from "./live-session.js";
 import { SteerDeclinedError } from "./sdk-result.js";
-import { endsWithTrailingNoReply, stripTrailingNoReply } from "./text-utils.js";
+import { endsWithTrailingNoReply, extractAttachments, stripTrailingNoReply } from "./text-utils.js";
 import { type BlockSender, DeliveryPipeline, PartialDeliveryError, isAgentErrorResponse, deliveredEntry, failedDeliveryEntry } from "./delivery-pipeline.js";
 import { isNothingSent, partsSent } from "../channels/types.js";
 import { createOrderedBlockTranscript, DELIVERY_FAILED_MARKER, SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
@@ -197,6 +197,13 @@ function excerptOf(text: string, max = 160): string {
  * - UNKNOWN: a timeout, a dead bridge, an abandoned send — it may or may not
  *   have arrived.
  */
+/** The note for attachments named in a turn whose output is never delivered (a heartbeat, a sub-session report). */
+export function suppressedAttachmentsNote(paths: readonly string[]): string {
+  const shown = paths.slice(0, 5).map((path) => excerptOf(path, 120)).join(", ") + (paths.length > 5 ? `, and ${paths.length - 5} more` : "");
+  return `[not delivered] A background turn's reply named ${paths.length === 1 ? "an attachment" : `${paths.length} attachments`} (${shown}), `
+    + `but that turn's text is never delivered, so nobody received ${paths.length === 1 ? "it" : "them"}. To show ${paths.length === 1 ? "it" : "them"}, send with send_message.`;
+}
+
 export function undeliveredBlockNote(channelName: string | undefined, block: string, err: unknown): string {
   const where = channelName ? ` to ${channelName}` : "";
   const why = err === undefined ? "the send timed out and was abandoned" : shortErrorMessage(err);
@@ -389,7 +396,9 @@ export interface TurnRunnerDeps {
   settleMirrorNote?(ticket: MirrorTicket, told: boolean): void;
   runWithRetry(req: RunWithRetryRequest): Promise<string>;
   /** Append an assistant response to the session transcript. */
-  appendAssistantTranscript(sessionKey: string, content: string, channelName: string, correlation?: { requestId?: string; turnId: string }): void;
+  appendAssistantTranscript(sessionKey: string, content: string, channelName: string, correlation?: { requestId?: string; turnId?: string; mediaRef?: string }): void;
+  /** File an attachment this session delivered on a non-web channel for the web view, under `ref` (Channel.mirrorMedia). */
+  mirrorMedia?(sessionKey: string, ref: string, path: string): void;
   queuePendingErrorNote(sessionKey: string, visibleError: string): void;
   /** Typing indicator with per-channel start delay (Agent.startTurnTyping). */
   startTurnTyping(channel: Channel, chatId: string, passiveListen?: boolean): StopTyping;
@@ -589,6 +598,10 @@ export class TurnRunner {
     if (spec.joined) return; // The original turn writes the shared reply once.
     if (spec.requestId || spec.replyContext?.webJoined) this.deps.appendAssistantTranscript(spec.key, content, channel,
       { requestId: spec.requestId, turnId: spec.replyContext!.turnId });
+    // A non-web turn's attachments were filed for the web view under its turn
+    // id (mirrorMedia): the record names it, so the history can find them.
+    // Not a turnId: that would make the web group this turn's blocks as one reply.
+    else if (spec.replyContext && /MEDIA:|STICKER:/i.test(content)) this.deps.appendAssistantTranscript(spec.key, content, channel, { mediaRef: spec.replyContext.turnId });
     else this.deps.appendAssistantTranscript(spec.key, content, channel);
   }
 
@@ -930,7 +943,20 @@ export class TurnRunner {
     // prefixed with an advisory. Only `sender.deliver` sees the difference —
     // classification, silence policy and the transcript stay verbatim.
     const onBlock = async (block: string, outgoing: string = block): Promise<void> => {
-      if (suppressed) return;
+      if (suppressed) {
+        // A silent turn's text goes nowhere, and neither do the pictures and
+        // files it names — the model was told to use send_message, but one
+        // that wrote MEDIA: here believes it showed them (a heartbeat, a
+        // sub-session report, a silent cron run). Say so, once per block, so
+        // the next turn does not claim a delivery that never was.
+        // (A task speaks through its task_* tools: not noted.)
+        if (!isTaskSessionKey(spec.key)) {
+          const { mediaPaths, stickerIds } = extractAttachments(block);
+          const named = [...mediaPaths, ...stickerIds.filter((id) => /^[/~]/.test(id))];
+          if (named.length) this.queueDeliveryNote(spec.key, suppressedAttachmentsNote(named));
+        }
+        return;
+      }
       // Classified on the model's literal words, then handled once, after the
       // turn, by the spec's error policy — never shipped as if it were a reply.
       if (isAgentErrorResponse(block)) return;
@@ -942,6 +968,8 @@ export class TurnRunner {
         const target = this.resolveSendTarget(delivery);
         if (!target) return;
         channelName = target.channel.name;
+        const mirror = target.channel.name !== "web" ? this.deps.mirrorMedia?.bind(this.deps) : undefined;
+        const mediaRef = spec.replyContext?.turnId;
         sender = this.deps.delivery.createBlockSender(
           target.channel,
           target.chatId,
@@ -949,6 +977,8 @@ export class TurnRunner {
             ...(reply?.replyToMessageId ? { replyTo: reply.replyToMessageId } : {}),
             blockPrivateMedia: () => this.deps.isPrivateMemoryBarred(spec.key),
             ...(this.deps.isAttachmentBarred ? { attachmentBarred: (p: string) => this.deps.isAttachmentBarred!(spec.key, p) } : {}),
+            // The web outlet files its own; another channel's delivery is mirrored for the web view.
+            ...(mirror && mediaRef ? { onMediaShipped: (p: string) => mirror(spec.key, mediaRef, p) } : {}),
           },
         );
       }

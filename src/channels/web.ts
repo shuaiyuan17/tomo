@@ -15,7 +15,7 @@ import { WebEvents } from "../web/events.js";
 import { MAX_SNAPSHOT_TASK_BYTES, TaskBoard } from "../web/tasks.js";
 import { redactCommand } from "../web/redact-command.js";
 import { selectOwnerSessionKey } from "../web/data.js";
-import { OutgoingMediaError, type OutgoingMediaStore } from "../web/outgoing-media.js";
+import { OUTGOING_FILE_TYPE, OutgoingMediaError, type OutgoingMediaStore } from "../web/outgoing-media.js";
 import { claimUploads, recoverClaims } from "../web/uploads.js";
 import { buildImageAttachment } from "./attachments.js";
 import { formatImageMarker } from "./imageStore.js";
@@ -27,7 +27,7 @@ import type { SubsessionMessageInput, WebSubsession, WebSubsessionDetail, WebSub
 import type { WebCredentialRequest, WebCredentialResult, WebCredentialSubmit, WebHome, WebModelChangeResult, WebModelView, WebPermissionDecision, WebPermissionRequest, WebPermissionResult, WebPermissionRevokeResult } from "../web/protocol.js";
 import { modelLabel } from "../models.js";
 import { formatReactionMarker, formatReplyContextMarker } from "./text-utils.js";
-import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WEB_REACTIONS, WEB_REQUEST_QUOTE_LIMIT, WebError, type WebReaction, type WebReply, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type TaskAction, type WebStopResult, type WebTaskActionResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess, type WebFiledFile } from "../web/protocol.js";
+import { MAX_BUFFER_BYTES, messageInputSchema, WEB_CHAT_ID, WEB_REACTIONS, WEB_REQUEST_QUOTE_LIMIT, WebError, type WebReaction, type WebReply, type MessageInput, type TaskOutput, type WebCompaction, type WebCompactResult, type WebCompactState, type WebEvent, type WebRateLimit, type TaskAction, type WebStopResult, type WebTaskActionResult, type WebTurnStatus, type WebUsage, type WebRequest, type WebTaskAccess, type WebFiledFile, type WebSentFile } from "../web/protocol.js";
 
 /** A running tool's progress reaches the browser at most this often; the page counts in between. */
 export const TOOL_PROGRESS_EVERY_MS = 10_000;
@@ -794,25 +794,28 @@ export class WebChannel implements Channel {
     if (this.tornDown || !this.ownerId || !receipt || receipt.settled || !["queued", "running", "failed"].includes(receipt.request.state)) {
       throw markDefiniteFailure(new Error("Web outlet unavailable"));
     }
-    // A picture (MEDIA:<path>, or a path STICKER:) is copied into the
+    // A picture or file (MEDIA:<path>, or a path STICKER:) is copied into the
     // outgoing store and shown by id; the path never reaches the browser.
     // A Telegram sticker file_id has nothing to show here: only its caption goes.
     const picture = message.photo ?? (message.sticker && /^[/~]/.test(message.sticker) ? message.sticker : undefined);
     let images: string[] | undefined;
+    let files: WebSentFile[] | undefined;
     if (picture) {
       const sessionKey = this.ownerKey();
       if (!this.outgoing || !sessionKey) throw markDefiniteFailure(new Error("Web attachments are not supported"));
       try {
-        images = [this.outgoing.file(sessionKey, [requestId, receipt.request.responseTurnId ?? ""], picture).id];
+        const filed = this.outgoing.file(sessionKey, [requestId, receipt.request.responseTurnId ?? ""], picture);
+        if (filed.type === OUTGOING_FILE_TYPE) files = [{ id: filed.id, name: filed.name ?? "file", size: filed.size ?? 0 }];
+        else images = [filed.id];
       } catch (err) {
-        // Not shown (private, not an image, too large, gone): the picture is
-        // definitely undelivered; the pipeline still sends its caption as text.
+        // Not shown (private, too large, gone): the attachment is definitely
+        // undelivered; the pipeline still sends its caption as text.
         throw markDefiniteFailure(err instanceof OutgoingMediaError ? new Error(`Web attachment refused: ${err.code}`) : err);
       }
     }
-    if (!message.text && !images) return;
+    if (!message.text && !images && !files) return;
     const block: Extract<WebEvent, { type: "block" }> = { type: "block", sessionId: this.ownerId,
-      requestId, turnId: receipt.request.responseTurnId, id: `${requestId}:${this.blocks.length}`, text: message.text, ...(images ? { images } : {}) };
+      requestId, turnId: receipt.request.responseTurnId, id: `${requestId}:${this.blocks.length}`, text: message.text, ...(images ? { images } : {}), ...(files ? { files } : {}) };
     const bytes = Buffer.byteLength(JSON.stringify(block));
     // The rest of the snapshot frame is reserved for receipts and the task
     // panel, whose worst case is fixed, so the snapshot never truncates it.
@@ -826,6 +829,18 @@ export class WebChannel implements Channel {
     }
     this.blocks.push(block);
     this.blockBytes += bytes;
+  }
+
+  /**
+   * A picture or file the owner's conversation delivered on another channel
+   * (iMessage, Telegram, a send_message): filed so the web history shows it
+   * too. Only the owner's DM — the conversation the web is the owner's
+   * window onto; a group's stays "no longer available" as before.
+   */
+  mirrorMedia(sessionKey: string, ref: string, path: string): void {
+    if (this.tornDown || !this.outgoing || !ref || sessionKey !== this.ownerKey()) return;
+    try { this.outgoing.file(sessionKey, [ref], path); }
+    catch (err) { log.debug({ err: err instanceof OutgoingMediaError ? err.code : err }, "Attachment not mirrored to the web view"); }
   }
 
   /**

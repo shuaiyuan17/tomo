@@ -213,10 +213,13 @@ export class TaskBoard {
   private store(sessionId: string, next: Map<string, WebTask>): void {
     // Per session, live tasks first, then the most recently ended.
     const list = [...next.values()];
-    const live = list.filter((task) => task.endedAt === undefined);
-    const done = list.filter((task) => task.endedAt !== undefined).sort((a, b) => b.endedAt! - a.endedAt!);
+    // An ended task whose work runs on counts as live here, so the cap never drops it before that work.
+    const settled = settledTimes(next);
+    const live = list.filter((task) => settled.get(task.taskId) === undefined).sort(runningFirst);
+    const done = list.filter((task) => settled.get(task.taskId) !== undefined)
+      .sort((a, b) => settled.get(b.taskId)! - settled.get(a.taskId)!);
     const kept = [...live, ...done].slice(0, MAX_SESSION_TASKS);
-    this.remember(sessionId, done);
+    this.remember(sessionId, list.filter((task) => task.endedAt !== undefined));
     if (kept.length) this.sessions.set(sessionId, new Map(kept.map((task) => [task.taskId, task])));
     else this.sessions.delete(sessionId);
     this.publish();
@@ -248,8 +251,10 @@ export class TaskBoard {
   publish(): void {
     const now = this.now();
     for (const [sessionId, tasks] of [...this.sessions]) {
+      const settled = settledTimes(tasks);
       for (const [id, task] of tasks) {
-        if (task.endedAt !== undefined && task.state !== "running" && now - task.endedAt >= this.retainMs) tasks.delete(id);
+        const at = settled.get(id);
+        if (at !== undefined && task.state !== "running" && now - at >= this.retainMs) tasks.delete(id);
       }
       if (!tasks.size) this.sessions.delete(sessionId);
     }
@@ -277,13 +282,16 @@ export class TaskBoard {
     const ids = [...targets.keys()].sort();
     const picked = new Map<string, WebTask[]>(ids.map((id) => [id, []]));
     let room = MAX_BOARD_TASKS;
-    // Activity first: running, then recently ended; watchers (ambient) only
-    // get what is left, so they never take a running task's place.
+    // Activity first: running (an ended task whose work runs on included),
+    // then recently ended; watchers (ambient) only get what is left, so they
+    // never take a running task's place.
+    const settled = new Map(ids.map((id) => [id, settledTimes(this.sessions.get(id)!)]));
     for (const [ambient, ended] of [[false, false], [false, true], [true, false], [true, true]] as const) {
       const queues = ids.map((id) => {
+        const at = settled.get(id)!;
         const tasks = [...this.sessions.get(id)!.values()]
-          .filter((task) => (task.endedAt !== undefined) === ended && task.ambient === ambient);
-        return { id, tasks: ended ? tasks.sort((a, b) => b.endedAt! - a.endedAt!) : tasks.sort((a, b) => a.startedAt - b.startedAt) };
+          .filter((task) => (at.get(task.taskId) !== undefined) === ended && task.ambient === ambient);
+        return { id, tasks: ended ? tasks.sort((a, b) => at.get(b.taskId)! - at.get(a.taskId)!) : tasks.sort(runningFirst) };
       });
       for (let round = 0; room > 0 && queues.some((q) => q.tasks.length > round); round++) {
         for (const queue of queues) {
@@ -316,10 +324,59 @@ export class TaskBoard {
     this.timer = undefined;
     let next = Infinity;
     for (const tasks of this.sessions.values()) {
-      for (const task of tasks.values()) if (task.endedAt !== undefined) next = Math.min(next, task.endedAt + this.retainMs);
+      for (const at of settledTimes(tasks).values()) if (at !== undefined) next = Math.min(next, at + this.retainMs);
     }
     if (next === Infinity) return;
     this.timer = setTimeout(() => { this.timer = undefined; this.publish(); }, Math.max(0, next - this.now()));
     this.timer.unref?.();
   }
+}
+
+/**
+ * Unsettled tasks in the order a cap keeps them: those running first (oldest
+ * first), then ended ones whose work runs on, newest first. A parent is only
+ * kept once every running task of its session is, and (a task starting after
+ * the one that started it) once every ended task between it and that work,
+ * so the rail can always trace it to its running work.
+ */
+function runningFirst(a: WebTask, b: WebTask): number {
+  const ended = Number(a.endedAt !== undefined) - Number(b.endedAt !== undefined);
+  if (ended !== 0) return ended;
+  return a.endedAt === undefined ? a.startedAt - b.startedAt : b.startedAt - a.startedAt;
+}
+
+/**
+ * When each of a session's tasks settled: its own end, or the last end of the
+ * work it started (its listed descendants), whichever is later; undefined
+ * while it or any of that work still runs. An ended subagent whose background
+ * command runs on stays listed (the rail shows it working) and leaves the
+ * retention window after the last of it ends. Ambient descendants (watchers)
+ * are not counted, as the rail does not count them (web/src/tasks.ts).
+ * Parent cycles are cut.
+ */
+export function settledTimes(tasks: ReadonlyMap<string, WebTask>): Map<string, number | undefined> {
+  const children = new Map<string, WebTask[]>();
+  for (const task of tasks.values()) {
+    const parent = task.parentTaskId;
+    // Watchers (ambient) do not hold their parent: the rail does not show them as its work by default.
+    if (parent && parent !== task.taskId && tasks.has(parent) && !task.ambient) children.set(parent, [...(children.get(parent) ?? []), task]);
+  }
+  const result = new Map<string, number | undefined>();
+  const visiting = new Set<string>();
+  const settle = (task: WebTask): number | undefined => {
+    if (result.has(task.taskId)) return result.get(task.taskId);
+    if (task.endedAt === undefined || visiting.has(task.taskId)) return task.endedAt;
+    visiting.add(task.taskId);
+    let at: number | undefined = task.endedAt;
+    for (const child of children.get(task.taskId) ?? []) {
+      const sub = settle(child);
+      if (sub === undefined) { at = undefined; break; }
+      at = Math.max(at, sub);
+    }
+    visiting.delete(task.taskId);
+    result.set(task.taskId, at);
+    return at;
+  };
+  for (const task of tasks.values()) settle(task);
+  return result;
 }

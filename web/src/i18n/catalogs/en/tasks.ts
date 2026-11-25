@@ -4,7 +4,7 @@ export const tasks = {
   watchers: "Show watchers", watchersCount_one: "Show watchers ({{count}})", watchersCount_other: "Show watchers ({{count}})",
   empty: "Nothing running in the background.", groupTag: " · group",
   shellTitle: "{{label}}\n\n{{command}}\n\nOpen to see the full command", untitled: "Untitled task",
-  backgroundTitle: "Keeps running after Tomo has replied", backgroundTag: "background · ", working: "Working",
+  backgroundTitle: "Keeps running after Tomo has replied", backgroundTag: "background · ", working: "Working", childrenRunning: "what it started is still running",
   foldedShells_one: "{{count}} shell command done", foldedShells_other: "{{count}} shell commands done",
   lastStep_one: "{{tool}} · {{count}} tool use", lastStep_other: "{{tool}} · {{count}} tool uses",
   type: { local_agent: "subagent", local_bash: "shell", local_workflow: "workflow", monitor: "monitor", mcp_task: "MCP task", remote_agent: "remote agent", task: "task" },

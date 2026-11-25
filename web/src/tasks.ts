@@ -13,7 +13,15 @@ import { formatLocale, i18n } from "./i18n/index.js";
  */
 export interface TaskRow { task: WebTask; depth: number; folded?: WebTask[];
   /** Stable key of a folded row: its parent's id (listed or not), or "root". */
-  foldKey?: string }
+  foldKey?: string;
+  /**
+   * Set on a task that itself ended while work it started (a background
+   * command, a subagent: any listed descendant) still runs: the row reads as
+   * working until the last of it ends.
+   */
+  childrenRunning?: true;
+  /** A task that ended before work it started: when the last of that ended (its row's time runs until then). */
+  settledAt?: number }
 export interface TaskGroup { sessionId: string; title: string; kind: "dm" | "group"; rows: TaskRow[] }
 export interface TaskView { groups: TaskGroup[]; running: number; hiddenAmbient: number }
 
@@ -58,6 +66,12 @@ export function elapsed(task: WebTask, now: number): number {
   return (task.endedAt ?? now) - task.startedAt;
 }
 
+/** A row's time: until now while it or work it started runs, else until the last of it ended. */
+export function rowElapsed(row: Pick<TaskRow, "task" | "childrenRunning" | "settledAt">, now: number): number {
+  if (row.childrenRunning) return now - row.task.startedAt;
+  return (row.settledAt ?? row.task.endedAt ?? now) - row.task.startedAt;
+}
+
 /** What a running task is doing now, when progress reported anything. */
 export function lastStep(task: WebTask): string | undefined {
   if (task.summary) return task.summary;
@@ -97,12 +111,42 @@ function tree(list: WebTask[]): TaskRow[] {
     if (parent && parent !== task.taskId && ids.has(parent)) children.set(parent, [...(children.get(parent) ?? []), task]);
     else roots.push(task);
   }
+  // A task that ended while what it started still runs: running (any
+  // descendant), and when the last of them ended. Guarded against parent cycles.
+  const settled = new Map<string, { running: boolean; end?: number }>();
+  const settle = (task: WebTask, seen: Set<string>): { running: boolean; end?: number } => {
+    const known = settled.get(task.taskId);
+    if (known) return known;
+    if (seen.has(task.taskId)) return { running: false };
+    seen.add(task.taskId);
+    let running = false;
+    let end = task.endedAt;
+    const later = (at: number | undefined) => { if (at !== undefined && (end === undefined || at > end)) end = at; };
+    for (const child of children.get(task.taskId) ?? []) {
+      // A watcher (ambient) is not work it waits on, shown or not (src/web/tasks.ts settledTimes).
+      if (child.ambient) continue;
+      if (child.state === "running") { running = true; continue; }
+      const sub = settle(child, seen);
+      if (sub.running) running = true;
+      later(child.endedAt);
+      later(sub.end);
+    }
+    const result = { running, ...(end !== undefined ? { end } : {}) };
+    settled.set(task.taskId, result);
+    return result;
+  };
   const rows: TaskRow[] = [];
   const placed = new Set<string>();
   const visit = (task: WebTask, depth: number) => {
     if (placed.has(task.taskId)) return;
     placed.add(task.taskId);
-    rows.push({ task, depth: Math.min(depth, MAX_TASK_DEPTH) });
+    const row: TaskRow = { task, depth: Math.min(depth, MAX_TASK_DEPTH) };
+    if (task.state !== "running" && children.has(task.taskId)) {
+      const after = settle(task, new Set());
+      if (after.running) row.childrenRunning = true;
+      else if (after.end !== undefined && after.end !== task.endedAt) row.settledAt = after.end;
+    }
+    rows.push(row);
     visitAll(children.get(task.taskId) ?? [], depth + 1, task.taskId);
   };
   // Finished shell commands under one parent fold into a single row after

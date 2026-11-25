@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MAX_BOARD_TASKS, MAX_SESSION_TASKS, SNAPSHOT_DESCRIPTION_LIMIT, SNAPSHOT_SUMMARY_LIMIT, TASK_RETENTION_MS, TaskBoard } from "../src/web/tasks.js";
+import { MAX_BOARD_TASKS, MAX_SESSION_TASKS, SNAPSHOT_DESCRIPTION_LIMIT, SNAPSHOT_SUMMARY_LIMIT, TASK_RETENTION_MS, TaskBoard, settledTimes } from "../src/web/tasks.js";
 import type { WatchTask } from "../src/watch/protocol.js";
 import type { WebTask } from "../src/web/protocol.js";
 
@@ -45,6 +45,97 @@ describe("TaskBoard", () => {
     expect(b.snapshot()).toEqual([]);
     expect(published.at(-1)).toEqual(["s1", []]);
     b.dispose();
+  });
+
+  it("keeps an ended subagent while a command it started runs, and lets both go a retention window after the last ends", () => {
+    vi.useFakeTimers({ now: 10_000 });
+    const { b } = board();
+    const child = task("c", { taskType: "local_bash", parentTaskId: "p", startedAt: 2_000 });
+    b.apply("s1", [task("p", { startedAt: 1_000 }), child]);
+    b.apply("s1", [child]); // the subagent's own turn ended
+    vi.advanceTimersByTime(TASK_RETENTION_MS * 4);
+    expect(b.snapshot().map((t) => `${t.taskId}:${t.state}`).sort()).toEqual(["c:running", "p:ended"]);
+    b.apply("s1", []); // the command ends
+    vi.advanceTimersByTime(TASK_RETENTION_MS - 1);
+    expect(b.snapshot().map((t) => t.taskId).sort()).toEqual(["c", "p"]);
+    vi.advanceTimersByTime(1);
+    expect(b.snapshot()).toEqual([]);
+    b.dispose();
+  });
+
+  it("the per-session cap never drops an ended task whose work still runs", () => {
+    vi.useFakeTimers({ now: 10_000 });
+    const { b } = board();
+    const child = task("c", { taskType: "local_bash", parentTaskId: "p", startedAt: 2_000 });
+    b.apply("s1", [task("p", { startedAt: 1_000 }), child]);
+    b.apply("s1", [child]);
+    // Many more tasks end after it.
+    for (let i = 0; i < MAX_SESSION_TASKS + 5; i++) {
+      vi.advanceTimersByTime(10);
+      b.apply("s1", [child, task(`x${i}`)]);
+      b.apply("s1", [child]);
+    }
+    expect(b.snapshot().map((t) => t.taskId)).toContain("p");
+    b.dispose();
+  });
+
+  it("the board-wide cap ranks an ended task whose work still runs with the running ones", () => {
+    vi.useFakeTimers({ now: 10_000 });
+    const { b } = board();
+    const child = task("c", { taskType: "local_bash", parentTaskId: "p", startedAt: 2_000 });
+    b.apply("a", [task("p", { startedAt: 1_000 }), child]);
+    b.apply("a", [child]);
+    // Its own session and others fill the board with tasks that ended later.
+    for (let i = 0; i < MAX_SESSION_TASKS; i++) {
+      vi.advanceTimersByTime(1);
+      b.apply("a", [child, task(`x${i}`)]);
+      b.apply("a", [child]);
+    }
+    for (let n = 0; n * MAX_SESSION_TASKS < MAX_BOARD_TASKS + MAX_SESSION_TASKS; n++) {
+      vi.advanceTimersByTime(10);
+      const list = Array.from({ length: MAX_SESSION_TASKS }, (_, i) => task(`y${n}_${i}`));
+      b.apply(`busy${n}`, list);
+      b.apply(`busy${n}`, []);
+    }
+    expect(b.snapshot().map((t) => t.taskId)).toContain("p");
+    b.dispose();
+  });
+
+  it("past the cap, running tasks are kept before an ended parent, so a kept parent always has its running work", () => {
+    vi.useFakeTimers({ now: 10_000 });
+    const { b } = board();
+    const child = task("c", { taskType: "local_bash", parentTaskId: "p", startedAt: 9_000 });
+    const others = Array.from({ length: MAX_SESSION_TASKS }, (_, i) => task(`r${i}`, { startedAt: 5_000 + i }));
+    b.apply("a", [task("p", { startedAt: 1_000 }), child, ...others]);
+    b.apply("a", [child, ...others]);
+    const shown = b.snapshot().map((t) => t.taskId);
+    expect(!shown.includes("p") || shown.includes("c")).toBe(true);
+    expect(shown).not.toContain("p");
+    b.dispose();
+  });
+
+  it("past the cap, keeps the ended tasks between a parent and its running work before the parent", () => {
+    vi.useFakeTimers({ now: 10_000 });
+    const { b } = board();
+    const grandchild = task("g", { taskType: "local_bash", parentTaskId: "m", startedAt: 3_000 });
+    const others = Array.from({ length: MAX_SESSION_TASKS - 2 }, (_, i) => task(`r${i}`, { startedAt: 5_000 + i }));
+    b.apply("a", [task("p", { startedAt: 1_000 }), task("m", { parentTaskId: "p", startedAt: 2_000 }), grandchild, ...others]);
+    b.apply("a", [grandchild, ...others]); // p and m end; g runs on. One slot is left for them.
+    const shown = b.snapshot().map((t) => t.taskId);
+    expect(shown).toContain("m");
+    expect(shown).not.toContain("p");
+    b.dispose();
+  });
+
+  it("settles a task at its own end or its descendants' last, never while one runs", () => {
+    const t = (id: string, extra: Partial<WebTask> = {}): WebTask => ({ sessionId: "s", taskId: id, taskType: "local_agent", description: id, ambient: false, startedAt: 0, state: "completed", endedAt: 5, ...extra });
+    const map = (...list: WebTask[]) => new Map(list.map((x) => [x.taskId, x]));
+    expect(settledTimes(map(t("p"), t("c", { parentTaskId: "p", endedAt: 9 })))).toEqual(new Map([["p", 9], ["c", 9]]));
+    expect(settledTimes(map(t("p"), t("c", { parentTaskId: "p", state: "running", endedAt: undefined }))).get("p")).toBeUndefined();
+    // A watcher does not hold its parent.
+    expect(settledTimes(map(t("p"), t("w", { parentTaskId: "p", ambient: true, state: "running", endedAt: undefined }))).get("p")).toBe(5);
+    // A parent cycle is cut, not followed forever.
+    expect(settledTimes(map(t("a", { parentTaskId: "b" }), t("b", { parentTaskId: "a" }))).get("a")).toBe(5);
   });
 
   it("applies the reported end status whichever arrives first", () => {

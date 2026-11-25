@@ -28,8 +28,15 @@ function clip(text: string, limit: number): { text: string; cut: boolean } {
 }
 
 /** The browser's view of one record, or undefined when it is not one the owner may see (another scope, archived). */
-/** `background`: SubsessionService.backgroundRunning for the record (only a waiting(external) task carries it). */
-export function subsessionView(record: SubsessionRecord, scope: string, now: number, working: boolean, background = false): WebSubsession | undefined {
+/**
+ * What the daemon knows of a task beyond its record. `background`:
+ * SubsessionService.backgroundRunning (only a waiting(external) task carries
+ * it). `model`: the model id its turns run on, resolved (the record's, else
+ * the configured default).
+ */
+export interface SubsessionLive { background?: boolean; model?: string }
+
+export function subsessionView(record: SubsessionRecord, scope: string, now: number, working: boolean, live: SubsessionLive = {}): WebSubsession | undefined {
   if (record.parentKey !== scope || record.status === "archived") return undefined;
   const status = record.status as WebSubsessionStatus;
   return {
@@ -40,7 +47,8 @@ export function subsessionView(record: SubsessionRecord, scope: string, now: num
     ...(record.progress ? { progress: clip(record.progress, PROGRESS_LIMIT).text } : {}),
     // Only an open task has a turn worth showing as running.
     working: working && OPEN.has(status),
-    ...(background && status === "waiting" && record.waitingOn === "external" ? { background: true as const } : {}),
+    ...(live.background && status === "waiting" && record.waitingOn === "external" ? { background: true as const } : {}),
+    ...(live.model ? { model: live.model } : {}),
     createdAt: record.createdAt,
     lastActivityAt: record.lastActivityAt,
     ...(record.endedAt !== undefined ? { endedAt: record.endedAt } : {}),
@@ -56,8 +64,8 @@ export function subsessionView(record: SubsessionRecord, scope: string, now: num
  * newest first, while the list stays within MAX_RAIL_SUBSESSIONS. An open
  * task is never left out: one may be waiting for the owner.
  */
-export function subsessionList(records: readonly SubsessionRecord[], scope: string, now: number, working: (key: string) => boolean, background: (record: SubsessionRecord) => boolean = () => false): WebSubsession[] {
-  const views = records.flatMap((r) => { const v = subsessionView(r, scope, now, working(r.sessionKey), background(r)); return v ? [v] : []; });
+export function subsessionList(records: readonly SubsessionRecord[], scope: string, now: number, working: (key: string) => boolean, live: (record: SubsessionRecord) => SubsessionLive = () => ({})): WebSubsession[] {
+  const views = records.flatMap((r) => { const v = subsessionView(r, scope, now, working(r.sessionKey), live(r)); return v ? [v] : []; });
   const open = views.filter((v) => OPEN.has(v.status)).sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
   const ended = views.filter((v) => !OPEN.has(v.status) && now - (v.endedAt ?? v.lastActivityAt) < SUBSESSION_ENDED_VISIBLE_MS)
     .sort((a, b) => (b.endedAt ?? b.lastActivityAt) - (a.endedAt ?? a.lastActivityAt));
@@ -65,8 +73,8 @@ export function subsessionList(records: readonly SubsessionRecord[], scope: stri
 }
 
 /** One task, opened: what the list shows plus its brief, the conversation and the report. */
-export function subsessionDetail(record: SubsessionRecord, scope: string, now: number, working: boolean, background = false): WebSubsessionDetail | undefined {
-  const view = subsessionView(record, scope, now, working, background);
+export function subsessionDetail(record: SubsessionRecord, scope: string, now: number, working: boolean, live: SubsessionLive = {}): WebSubsessionDetail | undefined {
+  const view = subsessionView(record, scope, now, working, live);
   if (!view) return undefined;
   const brief = clip(record.brief, BRIEF_LIMIT);
   const report = record.report !== undefined ? clip(record.report, REPORT_LIMIT) : undefined;
@@ -76,7 +84,6 @@ export function subsessionDetail(record: SubsessionRecord, scope: string, now: n
     ...(brief.cut ? { briefTruncated: true } : {}),
     ...(record.quote?.length ? { quote: record.quote.map((line) => clip(line, QUOTE_LIMIT).text) } : {}),
     ...(record.waitingReason ? { waitingReason: clip(record.waitingReason, PROGRESS_LIMIT).text } : {}),
-    ...(record.model ? { model: record.model } : {}),
     conversation: record.conversation.map((entry) => ({
       seq: entry.seq, at: entry.at, from: entry.from, kind: entry.kind, text: clip(entry.text, ENTRY_LIMIT).text,
       ...(entry.files ? { files: entry.files } : {}),

@@ -54,12 +54,15 @@ it("lists the owner's sub-sessions in their own group and opens one as a chat in
   await browserExpect(row).toContainText("s1");
   await browserExpect(row).toContainText("Draft the release notes");
   await browserExpect(row).toContainText("Working");
+  // The model its turns run on, as subagent rows show theirs: here the configured default.
+  await browserExpect(row).toContainText("Sonnet 5");
   await browserExpect(rail()).not.toContainText("A group's task");
   await page.screenshot({ path: "test-results/subsessions-list.png" });
 
   await row.getByRole("button").click();
   const chat = rail().locator('[data-subsession="s1"]');
   await browserExpect(chat.getByRole("heading")).toContainText("Draft the release notes");
+  await browserExpect(chat.getByRole("heading")).toContainText("Sonnet 5");
   await browserExpect(chat.getByLabel("Brief")).toContainText("start the 1.9 notes");
   // The DM stays on screen and usable beside it.
   await browserExpect(page.locator("#message")).toBeVisible();
@@ -79,6 +82,24 @@ it("lists the owner's sub-sessions in their own group and opens one as a chat in
 
   await chat.getByRole("button", { name: "Back to tasks" }).click();
   await browserExpect(rail().getByTestId("subsessions")).toBeVisible();
+});
+
+it("shows a task's own model, and a task waiting on a check-back with background work still running as working", async () => {
+  expect(agent.subsessions!.spawn("dm:owner", { title: "Long build", brief: "b", model: "fable" }).ok).toBe(true);
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  const row = rail().locator('[data-subsession-row="s1"]');
+  await browserExpect(row).toContainText("Fable 5.1");
+  // As a turn that ends with a check-back scheduled and a background command still running leaves it.
+  const moved = (agent.subsessions as unknown as { transition: (id: string, e: string, o: object) => { ok: boolean } })
+    .transition("s1", "wait_external", { reason: "waiting for its scheduled check-back", expectFrom: ["active"] });
+  expect(moved.ok).toBe(true);
+  vi.spyOn(agent, "hasBackgroundWork").mockImplementation((key) => key === "task:s1");
+  channel.publishSubsessionsChanged();
+  await browserExpect(row).toContainText("Working (background)");
+  await page.screenshot({ path: "test-results/subsessions-background.png" });
+  await row.getByRole("button").click();
+  await browserExpect(rail().getByTestId("subsession-state")).toContainText("Working (background)");
+  await browserExpect(rail().locator('[data-subsession="s1"]').getByRole("heading")).toContainText("Fable 5.1");
 });
 
 it("an ended task reads, but cannot be written to", async () => {

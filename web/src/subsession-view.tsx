@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { api, ApiError } from "./api.js";
 import { Text } from "./markdown.js";
+import { ModelBadge } from "./model-badge.js";
 import { messageDateTime, messageTime } from "./message-meta.js";
 import { createCompositionGuard } from "./compose-keys.js";
 import { canRetrySend, isOpenSubsession, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, isWorkingState, withListBackground, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
@@ -86,7 +87,7 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
         <ArrowLeft className="size-4" strokeWidth={1.75} />{t("heading")}</Button>
     </div>
     <div className="mb-2.5 px-2.5">
-      <h2 id="subsession-heading" className="m-0 text-[15px] leading-snug font-semibold [overflow-wrap:anywhere]"><IdPill id={id} className="mr-1.5 align-[1.5px]" />{shown.title}</h2>
+      <h2 id="subsession-heading" className="m-0 text-[15px] leading-snug font-semibold [overflow-wrap:anywhere]"><IdPill id={id} className="mr-1.5 align-[1.5px]" />{shown.title}<ModelBadge model={shown.model} className="align-[1.5px]" /></h2>
       <p className="m-0 mt-0.5 tracking-[0.02em] text-[10px] text-muted-foreground [overflow-wrap:anywhere]" data-testid="subsession-state">
         {isWorkingState(state) ? <span className="shimmer">{subsessionStateLabel(shown)}</span> : <span className={cn(state === "waitingOwner" && "font-medium text-foreground/80")}>{subsessionStateLabel(shown)}</span>}
         {shown.waitingReason && state === "waitingOwner" ? <> · {shown.waitingReason}</> : null}</p>

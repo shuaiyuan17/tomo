@@ -106,6 +106,8 @@ export interface WebSubsession {
    * itself when that reports back, so the rail shows it as working.
    */
   background?: true;
+  /** The model id its turns run on (its own, else the configured default), resolved: e.g. claude-sonnet-5-5[1m]. */
+  model?: string;
   createdAt: number;
   lastActivityAt: number;
   endedAt?: number;
@@ -134,7 +136,6 @@ export interface WebSubsessionDetail extends WebSubsession {
   /** The owner's own words, quoted at spawn. */
   quote?: string[];
   waitingReason?: string;
-  model?: string;
   conversation: WebSubsessionEntry[];
   report?: string;
   reportTruncated?: boolean;

@@ -61,14 +61,16 @@ describe("the rail's view of sub-sessions", () => {
 
   it("marks a task waiting on something external as working in the background only while its background work runs", () => {
     const waiting = record("s1", { status: "waiting", waitingOn: "external" });
-    expect(subsessionView(waiting, "dm:owner", NOW, false, true)).toMatchObject({ status: "waiting", waitingOn: "external", background: true });
-    expect(subsessionView(waiting, "dm:owner", NOW, false, false)).not.toHaveProperty("background");
+    expect(subsessionView(waiting, "dm:owner", NOW, false, { background: true })).toMatchObject({ status: "waiting", waitingOn: "external", background: true });
+    expect(subsessionView(waiting, "dm:owner", NOW, false, {})).not.toHaveProperty("background");
     // Never for a task waiting on the owner, nor one that is not waiting.
-    expect(subsessionView(record("s2", { status: "waiting", waitingOn: "owner" }), "dm:owner", NOW, false, true)).not.toHaveProperty("background");
-    expect(subsessionView(record("s3", { status: "active" }), "dm:owner", NOW, false, true)).not.toHaveProperty("background");
-    const list = subsessionList([waiting, record("s4", { status: "waiting", waitingOn: "external", createdAt: NOW + 1 })], "dm:owner", NOW, () => false, (r) => r.id === "s1");
+    expect(subsessionView(record("s2", { status: "waiting", waitingOn: "owner" }), "dm:owner", NOW, false, { background: true })).not.toHaveProperty("background");
+    expect(subsessionView(record("s3", { status: "active" }), "dm:owner", NOW, false, { background: true })).not.toHaveProperty("background");
+    const list = subsessionList([waiting, record("s4", { status: "waiting", waitingOn: "external", createdAt: NOW + 1 })], "dm:owner", NOW, () => false, (r) => ({ background: r.id === "s1" }));
     expect(list.map((v) => [v.id, v.background ?? false])).toEqual([["s1", true], ["s4", false]]);
-    expect(subsessionDetail(waiting, "dm:owner", NOW, false, true)?.background).toBe(true);
+    expect(subsessionDetail(waiting, "dm:owner", NOW, false, { background: true })?.background).toBe(true);
+    expect(subsessionView(waiting, "dm:owner", NOW, false, { model: "claude-sonnet-5-5[1m]" })?.model).toBe("claude-sonnet-5-5[1m]");
+    expect(subsessionView(waiting, "dm:owner", NOW, false)).not.toHaveProperty("model");
   });
 
   it("carries the conversation, brief and report, clipped to fit the IPC frame", () => {

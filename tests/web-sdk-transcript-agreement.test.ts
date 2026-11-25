@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { SessionMessage } from "@anthropic-ai/claude-agent-sdk";
@@ -131,7 +131,10 @@ function ourFacts(items: SubagentItem[]): Fact[] {
 }
 
 beforeAll(async () => {
-  home = mkdtempSync(join(tmpdir(), "tomo-sdk-agreement-"));
+  // Resolved: the SDK keys the project directory on the workspace's REAL path,
+  // and on macOS the temp dir is behind a symlink (/var -> /private/var), so an
+  // unresolved one put the fixture where the SDK never looks.
+  home = realpathSync.native(mkdtempSync(join(tmpdir(), "tomo-sdk-agreement-")));
   workspace = join(home, "workspace");
   mkdirSync(workspace);
   // The SDK resolves `dir` (a project working directory) under CLAUDE_CONFIG_DIR/projects;

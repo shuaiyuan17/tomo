@@ -2,8 +2,8 @@ import { fileURLToPath } from "node:url";
 import { configDefaults, defineConfig } from "vitest/config";
 
 /**
- * Deliberately minimal: everything but `env`, one `exclude` entry and the
- * web UI's `@` alias is vitest's default.
+ * Deliberately minimal: everything but `env`, the HOME-isolating setup file,
+ * one `exclude` entry and the web UI's `@` alias is vitest's default.
  */
 export default defineConfig({
   // The web UI's shadcn imports (`@/components/...`), as in web/vite.config.ts,
@@ -14,6 +14,9 @@ export default defineConfig({
     // <agent>/`) and carries a full copy of tests/. Left behind, it makes vitest
     // run every suite twice.
     exclude: [...configDefaults.exclude, ".claude/worktrees/**"],
+    // A temp HOME per test file, so no test can reach the developer's real
+    // ~/.tomo — see the file for why.
+    setupFiles: ["./tests/setup/isolate-home.ts"],
     env: {
       // Tell src/logger.ts to log through an in-process destination instead of
       // building a pino transport. A transport is a worker thread plus a

@@ -183,6 +183,32 @@ describe("end-of-turn restart fallback", () => {
     expect(discards).toEqual(["expired"]);
   });
 
+  it("reports a marker whose request file another process already claimed", () => {
+    const discards: unknown[] = [];
+    const request = createRestartRequest({ sessionKey: "dm:shuai", daemonPid: DAEMON, reason: "x" }, requestDir);
+    const result = formatRestartRequestResult(request);
+    // Someone else sharing the directory takes it first (a test run against the
+    // live home did exactly this to the daemon's own request).
+    expect(takePendingRestartRequest("dm:shuai", requestDir)).toEqual(request);
+
+    expect(
+      consumeRestartRequestFromToolResult(result, "dm:shuai", requestDir, undefined, (d) => discards.push(d)),
+    ).toBeNull();
+    expect(discards).toEqual([
+      { reason: "missing", requestId: request.id, path: join(requestDir, `${request.id}.json`) },
+    ]);
+  });
+
+  it("does not call a malformed marker file missing", () => {
+    const discards: string[] = [];
+    const id = "11111111-2222-4333-8444-555555555555";
+    writeFileSync(join(requestDir, `${id}.json`), "{not json", "utf-8");
+    expect(
+      consumeRestartRequestFromToolResult(`TOMO_RESTART_REQUEST:${id}`, "dm:shuai", requestDir, undefined, (d) => discards.push(d.reason)),
+    ).toBeNull();
+    expect(discards).toEqual([]);
+  });
+
   it("reports what the startup sweep threw away", () => {
     const discards: string[] = [];
     const stale = createRestartRequest({ sessionKey: "dm:shuai", daemonPid: DAEMON, reason: "stale" }, requestDir);

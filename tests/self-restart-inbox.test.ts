@@ -10,6 +10,9 @@ const TEST_HOME = mkdtempSync(join(tmpdir(), "tomo-self-restart-"));
 const REQUEST_DIR = join(TEST_HOME, ".tomo", "data", "restart-requests");
 vi.stubEnv("HOME", TEST_HOME);
 vi.stubEnv("TOMO_WORKSPACE", join(TEST_HOME, ".tomo", "workspace"));
+// The launch is what these tests are about, and `spawn` is mocked below; the
+// test setup turns the real helper off for everyone else.
+vi.stubEnv("TOMO_RESTART_HELPER", undefined);
 vi.resetModules();
 
 const hoisted = vi.hoisted(() => ({ spawnCalls: [] as string[][], helperFails: false }));

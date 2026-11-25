@@ -36,7 +36,14 @@ export type RestartRequestDiscardDetail =
   /** A restart for this session is already in flight. */
   | { reason: "superseded"; request: RestartRequest }
   /** The daemon is going down on purpose; a restart would resurrect it. */
-  | { reason: "shutting-down"; request: RestartRequest };
+  | { reason: "shutting-down"; request: RestartRequest }
+  /**
+   * A Bash result carried a valid marker, but its request file was already
+   * gone: something else claimed it (another process sharing the request
+   * directory), so the restart the CLI promised will not come from here.
+   * Nothing was removed; reported so that is never silent.
+   */
+  | { reason: "missing"; requestId: string };
 
 export type RestartRequestDiscard = RestartRequestDiscardDetail & { path: string };
 
@@ -59,9 +66,19 @@ function isExpired(request: RestartRequest, now: number): boolean {
 
 /** Read and validate one request file. Anything unreadable/malformed is null. */
 function readRequest(path: string): RestartRequest | null {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch {
+    return null;
+  }
+  return parseRequest(raw);
+}
+
+function parseRequest(raw: string): RestartRequest | null {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(path, "utf-8"));
+    parsed = JSON.parse(raw);
   } catch {
     return null;
   }
@@ -302,6 +319,19 @@ export function formatRestartRequestResult(request: RestartRequest): string {
   ].join("\n");
 }
 
+/**
+ * Env switch that stops the daemon from launching the restart helper:
+ * `TOMO_RESTART_HELPER=off`. Set by the test setup (tests/setup/isolate-home.ts),
+ * where `process.argv[1]` is the test runner, not the tomo CLI, and a claimed
+ * request would otherwise start a real detached `<runner> restart` process.
+ * A test that exercises the launch mocks `spawn` and unsets it.
+ */
+export const RESTART_HELPER_ENV = "TOMO_RESTART_HELPER";
+
+export function restartHelperDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env[RESTART_HELPER_ENV]?.trim().toLowerCase() === "off";
+}
+
 export function restartWorkerInvocation(
   request: RestartRequest,
   cliPath: string,
@@ -359,7 +389,17 @@ export function consumeRestartRequestFromToolResult(
   if (!REQUEST_ID_RE.test(id)) return null;
 
   const path = requestPath(id, requestDir);
-  const request = readRequest(path);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (err) {
+    // The marker is proof the CLI filed this request and told the owner a
+    // restart is coming. A file that is gone by now was claimed by someone
+    // else — say so, or the promised restart vanishes without a trace.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") onDiscard?.({ path, reason: "missing", requestId: id });
+    return null;
+  }
+  const request = parseRequest(raw);
   if (!request) return null;
   if (request.id !== id || request.sessionKey !== sessionKey) return null;
   // A marker that surfaces this late is not an acknowledgement of anything the

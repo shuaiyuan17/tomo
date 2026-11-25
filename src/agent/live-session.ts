@@ -327,8 +327,10 @@ export class LiveSession {
   /**
    * The SDK compacted this session (`compact_boundary`) after `lastResult`'s
    * context reading was taken, so that reading overstates what is in context
-   * now. Cleared when the next turn's result replaces it. Read by the spawn
-   * gate (spawn-gate.ts), which treats such a reading as unknown.
+   * now. Set by the PostCompact hook (ordered before any later tool call's
+   * hook) and, as a backstop, by the stream event. Cleared when the next
+   * turn's result replaces the reading. Read by the spawn gate
+   * (spawn-gate.ts), which treats such a reading as unknown.
    */
   compactedSinceLastResult = false;
   /**

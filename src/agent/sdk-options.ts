@@ -1,5 +1,6 @@
 import type { ElicitationRequest, ElicitationResult, McpSdkServerConfigWithInstance, McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
 import { backgroundLaunchGuardHooks } from "./compact-reservations.js";
+import { compactedHooks } from "./spawn-gate.js";
 import { resumeGateHooks } from "./running-agents-ledger.js";
 import { config } from "../config.js";
 import { log } from "../logger.js";
@@ -126,6 +127,8 @@ export interface SessionContext {
    * at or over lcm.blockSpawnAtPct), or null. See spawn-gate.ts.
    */
   spawnDenial?: () => string | null;
+  /** The SDK compacted the session (PostCompact hook): the spawn gate's reading is stale. */
+  onCompacted?: () => void;
   /**
    * Per SendMessage: null to allow, or why a resume of an interrupted subagent
    * is refused (running-agents-ledger.ts, RESUME CAP). Undefined ⇒ the hook is
@@ -352,6 +355,7 @@ export function sdkOptions(
       undeliveredReply: sessionContext?.undeliveredReply,
       backgroundLaunchDenial: sessionContext?.backgroundLaunchDenial,
       spawnDenial: sessionContext?.spawnDenial,
+      onCompacted: sessionContext?.onCompacted,
       resumeGate: sessionContext?.resumeGate,
       // Resolved at spawn (above) and handed to the guard as a getter, so the
       // barred-turn Bash arm can spot a plugin that ships PreToolUse hooks
@@ -535,6 +539,8 @@ export function buildHooksOption(args: {
   backgroundLaunchDenial?: () => string | null;
   /** Per-call reason to deny a new background subagent (high context), or null. */
   spawnDenial?: () => string | null;
+  /** Called from a PostCompact hook (spawn-gate.ts compactedHooks). */
+  onCompacted?: () => void;
   /** Per-SendMessage reason to deny a resume (the resume cap), or null. */
   resumeGate?: (taskId: string) => string | null;
   /** A sub-session: memory and the workspace prompt files are read-only to it. */
@@ -557,6 +563,9 @@ export function buildHooksOption(args: {
   // Deny-only, like the todo guard below.
   if (args.backgroundLaunchDenial || args.spawnDenial) {
     mergeHooks(hooks, backgroundLaunchGuardHooks(args.sessionKey, args.backgroundLaunchDenial ?? (() => null), args.spawnDenial));
+  }
+  if (args.onCompacted) {
+    mergeHooks(hooks, compactedHooks(args.onCompacted));
   }
   // Deny-only, like the todo guard below.
   if (args.resumeGate) {

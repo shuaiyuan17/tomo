@@ -1000,6 +1000,7 @@ export class LiveSessionManager {
       // The nudger's reading (lastResult), against the threshold read per call
       // so a config reload applies at once. Late-bound like the flag above.
       spawnDenial: () => spawnDenial(this.spawnGateReading(key), config.lcm.blockSpawnAtPct, usesLcmCompact(key)),
+      onCompacted: () => { if (session) session.compactedSinceLastResult = true; },
       ...(this.deps.resumeGate ? { resumeGate: (taskId: string) => this.deps.resumeGate!(key, taskId) } : {}),
     }, turnBudget, externalMcpServers);
 

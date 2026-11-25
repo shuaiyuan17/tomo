@@ -4,7 +4,7 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { spawnDenial, launchesBackgroundSubagent, spawnGateEnabled } = await import("../src/agent/spawn-gate.js");
+const { spawnDenial, launchesBackgroundSubagent, spawnGateEnabled, compactedHooks } = await import("../src/agent/spawn-gate.js");
 const { backgroundLaunchGuardHooks, CompactReservations } = await import("../src/agent/compact-reservations.js");
 const { buildHooksOption } = await import("../src/agent/sdk-options.js");
 
@@ -105,5 +105,17 @@ describe("spawn gate hook", () => {
     expect(pre.length).toBeGreaterThan(0);
     const outs = await Promise.all(pre.flatMap((m) => m.hooks).map((h) => h({ tool_name: "Agent", tool_input: { prompt: "x" } })));
     expect(outs.some((o) => (o.hookSpecificOutput as { permissionDecision?: string } | undefined)?.permissionDecision === "deny")).toBe(true);
+  });
+});
+
+describe("PostCompact hook", () => {
+  it("reports an SDK compact, and is installed through the SDK options", async () => {
+    const onCompacted = vi.fn();
+    const out = await compactedHooks(onCompacted).PostCompact[0].hooks[0]();
+    expect(out).toEqual({});
+    expect(onCompacted).toHaveBeenCalledTimes(1);
+    const hooks = (buildHooksOption({ maxTurns: 0, onCompacted }) as { hooks?: { PostCompact?: { hooks: (() => Promise<unknown>)[] }[] } }).hooks;
+    await hooks!.PostCompact![0].hooks[0]();
+    expect(onCompacted).toHaveBeenCalledTimes(2);
   });
 });

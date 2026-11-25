@@ -53,7 +53,7 @@ const { mockState } = vi.hoisted(() => ({
       errors: Record<string, string>;
     } | null>),
     compactTriggered: false,
-    sessionContexts: [] as Array<{ sessionKey: string; backgroundLaunchDenial?: () => string | null; spawnDenial?: () => string | null }>,
+    sessionContexts: [] as Array<{ sessionKey: string; backgroundLaunchDenial?: () => string | null; spawnDenial?: () => string | null; onCompacted?: () => void }>,
     /** What the (mocked) prompt build hands the session as its snapshot. */
     buildContext: null as null | ((key: string) => { memory: string[]; people: string[] }),
     onInterrupt: null as null | ((err: Error, session: FakeSession) => void),
@@ -610,7 +610,8 @@ describe("LiveSessionManager session lifecycle", () => {
     // An SDK compact since the reading was taken: the old number is stale, so
     // unknown — no block — until the next turn's reading replaces it.
     session.lastResult = { contextUsed: 950, contextMax: 1000 };
-    (session as unknown as { compactedSinceLastResult: boolean }).compactedSinceLastResult = true;
+    expect(ctx.spawnDenial!()).toContain("95%");
+    ctx.onCompacted!(); // the PostCompact hook
     expect(ctx.spawnDenial!()).toBeNull();
     (session as unknown as { compactedSinceLastResult: boolean }).compactedSinceLastResult = false;
     session.lastResult = { contextUsed: 790, contextMax: 1000 };

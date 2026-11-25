@@ -89,3 +89,21 @@ export function spawnDenial(reading: ContextReading | null | undefined, blockAtP
   if (usedFrac < blockAtPct / 100) return null;
   return spawnGateMessage(Math.round(usedFrac * 100), lcmManaged);
 }
+
+/**
+ * PostCompact hook: the SDK just compacted this session, so the gate's last
+ * reading is stale. A hook, not only the `compact_boundary` stream event: the
+ * CLI awaits its hooks before it goes on, so this lands before any later
+ * tool call's PreToolUse decision — while the stream event can still sit
+ * queued behind block delivery when that tool call's hook runs.
+ */
+export function compactedHooks(onCompacted: () => void) {
+  return {
+    PostCompact: [{
+      hooks: [async () => {
+        onCompacted();
+        return {};
+      }],
+    }],
+  };
+}

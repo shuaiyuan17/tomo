@@ -48,7 +48,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, opts: { registry?: Set<str
   h.store = new SubsessionStore(join(dir, "t.json"), { strictTransitions: true, now: () => h.clock });
   h.service = new SubsessionService({
     store: h.store,
-    config: () => ({ ...DEFAULT_SUBSESSIONS, enabled: true, ...cfg }),
+    config: () => ({ ...DEFAULT_SUBSESSIONS, ownerMessages: "direct" as const, enabled: true, ...cfg }),
     runTaskTurn: async (key, prompt) => {
       h.prompts.push(prompt);
       await new Promise((r) => setImmediate(r));

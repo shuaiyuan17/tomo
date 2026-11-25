@@ -11,6 +11,17 @@ export const SUBSESSION_OWNER_TOOL_NAMES = ["task_spawn", "task_status", "task_c
 /** Every task tool name, once: for the SDK's allowedTools. */
 export const SUBSESSION_TASK_TOOL_NAMES = [...new Set([...SUBSESSION_SELF_TOOL_NAMES, ...SUBSESSION_OWNER_TOOL_NAMES])];
 
+function viaLabel(via: "main" | "panel" | undefined): string {
+  return via === "main" ? " (handed to the main session)" : via === "panel" ? " (in the web task panel)" : "";
+}
+
+/** What a task_reply / task_notify that went through is told. */
+function sentText(via: "direct" | "main" | "panel" | undefined): string {
+  if (via === "main") return "Handed to the main session, which passes it on to the owner.";
+  if (via === "panel") return "Shown in the web task panel, where the owner wrote to you.";
+  return "Sent.";
+}
+
 const ok = (text: string) => ({ content: [{ type: "text" as const, text }] });
 const fail = (name: string, text: string) => ({ content: [{ type: "text" as const, text: `${name} failed: ${text}` }], isError: true });
 
@@ -62,9 +73,10 @@ export function formatTaskDetail(r: SubsessionRecord, now = Date.now(), backgrou
   if (r.checkpoint) lines.push("Checkpoint:", r.checkpoint);
   for (const e of r.earlierReports ?? []) lines.push(`Earlier report #${e.seq} (replaced by a later one before it was read):`, e.text);
   if (r.report) lines.push(r.reportSeq ? `Report #${r.reportSeq}:` : "Report:", r.report);
+  if (r.askViaMain) lines.push("Question waiting for the owner's answer (pass it on with task_message):", r.askViaMain.text);
   if (r.sent.length > 0) {
-    lines.push("Messages sent to the owner (newest last):");
-    for (const m of r.sent.slice(-5)) lines.push(`- ${new Date(m.at).toISOString()}: ${m.text}`);
+    lines.push("Messages to the owner (newest last):");
+    for (const m of r.sent.slice(-5)) lines.push(`- ${new Date(m.at).toISOString()}${viaLabel(m.via)}: ${m.text}`);
   }
   const recent = r.transitions.slice(-5);
   if (recent.length > 0) {
@@ -79,7 +91,11 @@ export function formatTaskDetail(r: SubsessionRecord, now = Date.now(), backgrou
  * its own record, and speaks only to its owning scope (resolved from the
  * record's parentKey by the service, never chosen by the model).
  */
-export function buildTaskSelfTools(deps: { service: () => SubsessionService | undefined; key: string }) {
+export function buildTaskSelfTools(deps: { service: () => SubsessionService | undefined; key: string; ownerMessages?: "via-main" | "direct" }) {
+  const viaMain = (deps.ownerMessages ?? "via-main") === "via-main";
+  const goes = viaMain
+    ? " It goes to the main session (the owner's own conversation), which decides whether, when and how the owner hears it."
+    : " The harness adds the [id · title] prefix.";
   const service = (name: string): { ok: true; s: SubsessionService } | { ok: false; error: ReturnType<typeof fail> } => {
     const s = deps.service();
     return s ? { ok: true, s } : { ok: false, error: fail(name, "sub-sessions are not available right now.") };
@@ -87,37 +103,41 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
   return [
     tool(
       "task_reply",
-      "Answer a message the owner sent you (<tomo-event type=\"subsession-owner-message\">). Once per message. The harness adds the [id · title] prefix. A MEDIA:/path line attaches a file.",
+      `Answer a message the owner sent you (<tomo-event type="subsession-owner-message">). Once per message.${viaMain ? " It goes to the main session, which passes it on; an answer to a message the owner wrote in the web task panel stays in that panel." : " The harness adds the [id · title] prefix."} A MEDIA:/path line attaches a file.`,
       { text: z.string().min(1).max(4000).describe("The answer, in the owner's language, casual and concise. Lead with the answer.") },
       async ({ text }) => {
         const r = service("task_reply");
         if (!r.ok) return r.error;
         const result = await r.s.reply(deps.key, text);
-        return result.ok ? ok("Sent.") : fail("task_reply", result.error ?? "the message did not go out.");
+        return result.ok ? ok(sentText(result.via)) : fail("task_reply", result.error ?? "the message did not go out.");
       },
       { alwaysLoad: true, searchHint: "task reply answer owner message" },
     ),
     tool(
       "task_ask",
-      "Ask the owner something only they can decide, and pause the task until they answer: a yes for something that sends, posts, pays, deletes or can't be undone, or a choice the brief leaves open. Ask one question, with the options. End the turn after it; their answer arrives as a message from them.",
+      `Ask the owner something only they can decide, and pause the task until they answer: a yes for something that sends, posts, pays, deletes or can't be undone, or a choice the brief leaves open. Ask one question, with the options. End the turn after it; ${viaMain ? "the main session puts it to the owner, and their answer comes back as a subsession-relay that quotes your question." : "their answer arrives as a message from them."}`,
       { question: z.string().min(1).max(4000).describe("The question, in the owner's language, with the options and what each sets off.") },
       async ({ question }) => {
         const r = service("task_ask");
         if (!r.ok) return r.error;
         const result = await r.s.ask(deps.key, question);
-        return result.ok ? ok("Asked. The task now waits for the owner; end this turn.") : fail("task_ask", result.error ?? "the question did not go out.");
+        if (!result.ok) return fail("task_ask", result.error ?? "the question did not go out.");
+        const asked = result.via === "main" ? "Handed to the main session, which puts it to the owner." : "Asked.";
+        return ok(result.waiting === false
+          ? `${asked} A message is already waiting for you, so the task does not pause: end this turn and read it.`
+          : `${asked} The task now waits for the owner; end this turn.`);
       },
       { alwaysLoad: true, searchHint: "task ask owner question decision approval" },
     ),
     tool(
       "task_notify",
-      "Send the owner a message from this task. Only for a result, a decision they must make, or something that blocks you; never for progress (that is task_plan). The harness adds the [id · title] prefix. A MEDIA:/path line attaches a file.",
+      `Send the owner a message from this task. Only for a result, a decision they must make, or something that blocks you; never for progress (that is task_plan).${goes} A MEDIA:/path line attaches a file.`,
       { text: z.string().min(1).max(4000).describe("The message, in the owner's language, casual and concise. Lead with the point.") },
       async ({ text }) => {
         const r = service("task_notify");
         if (!r.ok) return r.error;
         const result = await r.s.notify(deps.key, text);
-        return result.ok ? ok("Sent.") : fail("task_notify", result.error ?? "the message did not go out.");
+        return result.ok ? ok(sentText(result.via)) : fail("task_notify", result.error ?? "the message did not go out.");
       },
       { alwaysLoad: true, searchHint: "task notify owner message result decision blocked" },
     ),
@@ -299,7 +319,7 @@ export function buildTaskOwnerTools(deps: { service: () => SubsessionService | u
     ),
     tool(
       "task_message",
-      "Pass something to a sub-session: the owner's answer to its question, a change of plan. It arrives as a relay from you, not as the owner's own words, so it never counts as the owner's yes to something risky. A queued task gets it with its first turn.",
+      "Pass something to a sub-session: the owner's answer to its question, a change of plan. While a task waits on a question it handed you (a subsession-message from task_ask), what you pass is taken as the owner's answer to it and ends the wait: pass only what the owner actually said. Otherwise it arrives as a relay from you, not as the owner's own words, so it never counts as the owner's yes to something risky. A queued task gets it with its first turn.",
       { id: z.string().min(1), text: z.string().min(1).max(8000) },
       async ({ id, text }) => {
         const c = context("task_message");

@@ -374,6 +374,14 @@ export interface SubsessionConfig {
    *  silent turn after each round) or `note` (with its next turn). Default turn. */
   mirror: "turn" | "note";
   /**
+   * Where a task's task_reply / task_notify / task_ask go. `via-main`
+   * (default): to the owning session as a note, which decides whether and
+   * how the owner hears it (an answer to a message the owner wrote in the
+   * web task panel stays in that panel). `direct`: straight to the owner's
+   * chat with the `[id · title]` prefix.
+   */
+  ownerMessages: "via-main" | "direct";
+  /**
    * Hours a task may spend active (running turns) on its own before it is
    * paused for the owner, counted since the owner's last word to it. 0 = no
    * cap. Default 24.
@@ -389,6 +397,7 @@ export const DEFAULT_SUBSESSIONS: SubsessionConfig = {
   maxContextTokens: 500_000,
   defaultModel: null,
   mirror: "turn",
+  ownerMessages: "via-main",
   maxActiveHours: 24,
 };
 
@@ -672,6 +681,7 @@ function parseSubsessionConfig(raw: unknown): SubsessionConfig {
     defaultModel: validated("subsessions.defaultModel", z.string().trim().min(1, "expected a model name").nullable(),
       entry.defaultModel ?? null, DEFAULT_SUBSESSIONS.defaultModel),
     mirror: validated("subsessions.mirror", z.enum(["turn", "note"]), entry.mirror, DEFAULT_SUBSESSIONS.mirror),
+    ownerMessages: validated("subsessions.ownerMessages", z.enum(["via-main", "direct"]), entry.ownerMessages, DEFAULT_SUBSESSIONS.ownerMessages),
     maxActiveHours: validated("subsessions.maxActiveHours", z.number().finite().min(0), entry.maxActiveHours, DEFAULT_SUBSESSIONS.maxActiveHours),
   };
 }

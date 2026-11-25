@@ -271,6 +271,7 @@ export class SubsessionService {
   /**
    * task_finish refused for unread input, per task (runtime only): in how
    * many turns in a row, the last refused turn, and how much was unread then.
+   * A turn that ends with no refusal clears it.
    */
   private readonly finishRefusals = new Map<string, { turns: number; turn: number; unread: number }>();
   /** Reports whose note write failed: the note may sit in memory only. */
@@ -1504,7 +1505,8 @@ export class SubsessionService {
       }), "active heartbeat"), ACTIVE_HEARTBEAT_MS);
       heartbeat.unref?.();
       this.inflightThrough.set(id, turn.throughSeq);
-      this.inflightTurn.set(id, ++this.turnSerial);
+      const serial = ++this.turnSerial;
+      this.inflightTurn.set(id, serial);
       let outcome: TaskTurnOutcome;
       try {
         outcome = await this.deps.runTaskTurn(record.sessionKey, turn.prompt, { bare: turn.kind === "compact" });
@@ -1513,6 +1515,8 @@ export class SubsessionService {
         clearInterval(heartbeat);
         this.inflightThrough.delete(id);
         this.inflightTurn.delete(id);
+        // Refused turns count only in a row: a turn with no refusal ends the streak.
+        if (this.finishRefusals.get(id)?.turn !== serial) this.finishRefusals.delete(id);
       }
       if (!this.afterTurn(id, turn, outcome)) return;
     }

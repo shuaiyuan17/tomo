@@ -1954,6 +1954,22 @@ describe("SubsessionService: task_finish never leaves input unread", () => {
     expect(rec.status).toBe("finished");
   });
 
+  it("refused turns count only in a row: a turn without a refusal starts the streak over", async () => {
+    const results: Array<{ ok: boolean }> = [];
+    // Turns 1-3 refused, turn 4 handles its input without finishing, then
+    // turns 5-7 are refused again: only the eighth may be forced through.
+    const h = harness({}, working((turn, hh) => {
+      const k = hh.turns.length;
+      if (k === 4) return;
+      if (k <= 8) hh.service.relay("s1", `r${k}`);
+      results.push(hh.service.finish(turn.key, "done") as { ok: boolean });
+    }));
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(results.map((r) => r.ok)).toEqual([false, false, false, false, false, false, true]);
+  });
+
   it("a refusal streak starts over when the unread count goes down", async () => {
     const results: Array<{ ok: boolean }> = [];
     // Unread per turn: 2, 2, 1 (down: streak back to 1), 1, 1, then forced.

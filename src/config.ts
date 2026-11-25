@@ -71,6 +71,14 @@ export interface LcmConfig {
    *  is refused, so running ones can drain and a deferred compact can run.
    *  0 or 100 turns it off. When set, must be >= nudgeAtPct. Default 80. */
   blockSpawnAtPct: number;
+  /** Context-usage % at or above which the HARNESS compacts the session itself
+   *  after a turn (stops its background work, prunes, summarizes the oldest
+   *  stretch with a separate model call): `lcm/force-compact.ts`. A turn that
+   *  ends on "Prompt is too long" triggers it at any usage. 0 or 100 turns
+   *  both off. When set, must be >= blockSpawnAtPct. Default 95. */
+  forceCompactAtPct: number;
+  /** Model for the forced compaction's summary call. Default "sonnet". */
+  forceCompactModel: string;
 }
 
 export interface MetricsConfig {
@@ -576,6 +584,8 @@ const DEFAULT_LCM: LcmConfig = {
   dailyFreshTail: 32,
   globalFreshTail: false,
   blockSpawnAtPct: 80,
+  forceCompactAtPct: 95,
+  forceCompactModel: "sonnet",
 };
 
 /** An extra directory for a group: absolute or `~`-rooted, no `..` segment,
@@ -611,6 +621,8 @@ const lcmSchema = z.object({
   dailyFreshTail: z.coerce.number().int().min(0, "expected a non-negative integer").default(DEFAULT_LCM.dailyFreshTail),
   globalFreshTail: boolLike.default(DEFAULT_LCM.globalFreshTail),
   blockSpawnAtPct: z.coerce.number().min(0).max(100, "expected a percentage in [0, 100]").optional(),
+  forceCompactAtPct: z.coerce.number().min(0).max(100, "expected a percentage in [0, 100]").optional(),
+  forceCompactModel: z.string().min(1, "expected a model alias or id").default(DEFAULT_LCM.forceCompactModel),
 }).transform((lcm, ctx) => {
   // An omitted reset derives from the (possibly custom) nudge threshold: the
   // stock 60 when that sits below it, else 10 points under the threshold.
@@ -630,7 +642,15 @@ const lcmSchema = z.object({
     ctx.addIssue({ code: "custom", path: ["blockSpawnAtPct"], message: "blockSpawnAtPct must be at least nudgeAtPct (or 0/100 to turn it off)" });
     return z.NEVER;
   }
-  return { ...lcm, nudgeResetPct, blockSpawnAtPct };
+  // Forced compaction is the last line: it never fires below the point where
+  // new background launches are already refused. 0 and 100 mean off.
+  const gate = blockSpawnAtPct > 0 && blockSpawnAtPct < 100 ? blockSpawnAtPct : lcm.nudgeAtPct;
+  const forceCompactAtPct = lcm.forceCompactAtPct ?? Math.max(DEFAULT_LCM.forceCompactAtPct, gate);
+  if (forceCompactAtPct > 0 && forceCompactAtPct < 100 && forceCompactAtPct < gate) {
+    ctx.addIssue({ code: "custom", path: ["forceCompactAtPct"], message: "forceCompactAtPct must be at least blockSpawnAtPct (or 0/100 to turn it off)" });
+    return z.NEVER;
+  }
+  return { ...lcm, nudgeResetPct, blockSpawnAtPct, forceCompactAtPct };
 });
 
 const DEFAULT_METRICS: MetricsConfig = {

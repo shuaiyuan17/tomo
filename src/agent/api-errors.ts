@@ -45,3 +45,15 @@ export function classifyTurnError(text: string): TurnErrorClass {
   if (/^You['’]ve hit (?:your )?(?:session )?limit\b/i.test(trimmed)) return "usage-limit";
   return "other";
 }
+
+/**
+ * A turn refused because the conversation no longer fits the window: the
+ * CLI's own "Prompt is too long" (also what it says when it refuses locally,
+ * with no API call, and its `· …` variants), or the API's context-length
+ * errors as the CLI relays them. What triggers a forced compaction.
+ */
+export function isContextOverflowError(text: string): boolean {
+  const t = text.trim();
+  return /^Prompt is too long\b/i.test(t)
+    || /^API Error:.*\b(prompt is too long|input is too long for requested model|context[_ ]length|exceeds? (the )?(model'?s? )?context (window|limit))/i.test(t);
+}

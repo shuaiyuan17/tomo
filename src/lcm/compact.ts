@@ -77,6 +77,16 @@ export interface CompactRequest {
   expectedFirstUuid?: string;
   expectedLastUuid?: string;
   /**
+   * The range by record uuid instead (forced compaction, which works on the
+   * active parentUuid chain, where positions among ALL records mean nothing).
+   * When both are set, `fromIdx`/`toIdx` are ignored: the range is the file
+   * span from the record `fromUuid` through `toUuid`, both user/assistant
+   * records, the first not after the second. Either one missing refuses the
+   * rewrite (the file changed since the range was chosen).
+   */
+  fromUuid?: string;
+  toUuid?: string;
+  /**
    * @internal Test hook: mutate the rewritten event list before it is checked
    * or published, to simulate a bug in the rewrite (e.g. a missed re-point).
    */
@@ -293,16 +303,36 @@ function prepareRewrite(req: CompactRequest, sourceFd: number): PreparedRewrite 
     }
   }
 
-  if (req.fromIdx < 0 || req.toIdx >= convIndices.length || req.fromIdx > req.toIdx) {
-    return {
-      success: false, eventsRemoved: 0, eventsAfter: allEvents.length,
-      error: `Invalid range: ${req.fromIdx}-${req.toIdx} (${convIndices.length} conversation events)`,
-    };
+  let removeStartGlobal: number;
+  let removeEndGlobal: number;
+  if (req.fromUuid && req.toUuid) {
+    const at = (uuid: string) => convIndices.find((i) => {
+      const e = allEvents[i];
+      return !isRawJsonlLine(e) && e.uuid === uuid;
+    });
+    const a = at(req.fromUuid);
+    const b = at(req.toUuid);
+    if (a === undefined || b === undefined || a > b) {
+      return {
+        success: false, eventsRemoved: 0, eventsAfter: allEvents.length,
+        error: a === undefined || b === undefined
+          ? "Range anchors moved (file rewritten since range resolution); re-resolve the range and retry"
+          : `Invalid range: ${req.fromUuid} is after ${req.toUuid}`,
+      };
+    }
+    removeStartGlobal = a;
+    removeEndGlobal = b;
+  } else {
+    if (req.fromIdx < 0 || req.toIdx >= convIndices.length || req.fromIdx > req.toIdx) {
+      return {
+        success: false, eventsRemoved: 0, eventsAfter: allEvents.length,
+        error: `Invalid range: ${req.fromIdx}-${req.toIdx} (${convIndices.length} conversation events)`,
+      };
+    }
+    // Map fromIdx/toIdx (conversation-relative) to allEvents indices
+    removeStartGlobal = convIndices[req.fromIdx];
+    removeEndGlobal = convIndices[req.toIdx];
   }
-
-  // Map fromIdx/toIdx (conversation-relative) to allEvents indices
-  let removeStartGlobal = convIndices[req.fromIdx];
-  let removeEndGlobal = convIndices[req.toIdx];
 
   // convIndices only ever holds real events, so these two are never carriers;
   // the guard is what tells the compiler that, and is a genuine abort if the

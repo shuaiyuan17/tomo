@@ -45,6 +45,8 @@ export interface ChainCheckOptions {
    * (`getSessionMessages`'s `dir`): Tomo's workspace.
    */
   workspaceDir: string;
+  /** Once aborted, the rewrite is refused at its publication gate (shutdown). */
+  signal?: AbortSignal;
   /** @internal Test seam: the loader to check with. Defaults to the SDK's. */
   loadChain?: (sessionId: string, dir: string) => Promise<SessionMessage[]>;
 }
@@ -141,7 +143,9 @@ export async function compactSessionChecked(req: CompactRequest, opts: ChainChec
 
   return compactSessionGated(req, async (staged) => {
     const startedAt = performance.now();
+    if (opts.signal?.aborted) return "Aborted (shutdown); the session file is unchanged.";
     const outcome = await checkStaged(req, opts.workspaceDir, loadChain, before, staged);
+    if (opts.signal?.aborted) return "Aborted (shutdown); the session file is unchanged.";
     const checkMs = Math.round(performance.now() - startedAt);
     if (outcome.ok) {
       log.info({ sessionId: req.sdkSessionId, checkMs, tail: outcome.tailExpected }, "Rewrite chain check passed");

@@ -266,6 +266,35 @@ describe("compactSession", () => {
     expect(out[2].parentUuid).toBe(out[1].uuid);
   });
 
+  it("takes the range by uuid (fromUuid/toUuid), ignoring indices, and refuses when an anchor is gone", () => {
+    const events: any[] = [];
+    let parent: string | null = null;
+    for (let i = 0; i < 5; i++) {
+      const ts = `2026-04-30T0${i}:00:00.000Z`;
+      const e = i % 2 === 0 ? mkUserEvent(parent, ts, `msg ${i}`) : mkAssistantEvent(parent, ts, `reply ${i}`);
+      events.push(e);
+      parent = e.uuid;
+    }
+    mkdirSync(dirname(path), { recursive: true });
+    const original = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    writeFileSync(path, original);
+    const base = { sdkSessionId: sessionId, sdkSessionsDir, fromIdx: -1, toIdx: -1, summary: "by uuid", transcriptPath: archivePath };
+
+    const missing = compactSession({ ...base, fromUuid: events[1].uuid, toUuid: "gone" });
+    expect(missing.success).toBe(false);
+    expect(missing.error).toMatch(/anchors moved/);
+    const reversed = compactSession({ ...base, fromUuid: events[3].uuid, toUuid: events[1].uuid });
+    expect(reversed.success).toBe(false);
+    expect(readFileSync(path, "utf-8")).toBe(original);
+
+    const ok = compactSession({ ...base, fromUuid: events[1].uuid, toUuid: events[3].uuid });
+    expect(ok.success).toBe(true);
+    const out = readFileSync(path, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(out.map((e) => e.uuid)).toEqual([events[0].uuid, out[1].uuid, events[4].uuid]);
+    expect(out[1].isCompactSummary).toBe(true);
+    expect(out[2].parentUuid).toBe(out[1].uuid);
+  });
+
   it.each(["", "   \n\t "])("refuses a blank summary and leaves the session untouched (%j)", (blank) => {
     // Regression: `--summary "$(cat /tmp/x)"` after a reboot cleared /tmp
     // passed "" through, and the period was replaced by an empty block with

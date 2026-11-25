@@ -35,6 +35,7 @@ export type TomoEventType =
   | "cron"             // scheduled task trigger (name = job name)
   | "lcm-rollup"       // LCM rollup-due nudge (name = "<level> <period>")
   | "context-nudge"    // context-usage housekeeping nudge (name = prune|daily|compact)
+  | "force-compacted"  // the harness compacted a full session itself (what it did, for the model)
   | "summon"           // summoned into a group chat
   | "summon-reminder"  // per-turn reply-routing reminder on summoned-group messages
   | "summon-expired"   // summon lapsed from group inactivity

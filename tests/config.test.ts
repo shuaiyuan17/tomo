@@ -264,35 +264,31 @@ describe("config file validation", () => {
   });
 
   it("lcm.blockSpawnAtPct: defaults to 80, follows a higher nudgeAtPct, 0/100 turn it off", async () => {
-    const stock = await loadWithConfigFile(JSON.stringify({}));
+    const stock = await load({});
     expect(stock.configIssues).toEqual([]);
     expect(stock.config.lcm.blockSpawnAtPct).toBe(80);
 
-    rmSync(home, { recursive: true, force: true });
-    const high = await loadWithConfigFile(JSON.stringify({ lcm: { nudgeAtPct: 85 } }));
+    const high = await load({ lcm: { nudgeAtPct: 85 } });
     expect(high.configIssues).toEqual([]);
     expect(high.config.lcm.blockSpawnAtPct).toBe(85);
 
     for (const off of [0, 100]) {
-      rmSync(home, { recursive: true, force: true });
-      const r = await loadWithConfigFile(JSON.stringify({ lcm: { nudgeAtPct: 70, blockSpawnAtPct: off } }));
+      const r = await load({ lcm: { nudgeAtPct: 70, blockSpawnAtPct: off } });
       expect(r.configIssues).toEqual([]);
       expect(r.config.lcm.blockSpawnAtPct).toBe(off);
     }
 
-    rmSync(home, { recursive: true, force: true });
-    const ok = await loadWithConfigFile(JSON.stringify({ lcm: { nudgeAtPct: 70, blockSpawnAtPct: 70 } }));
+    const ok = await load({ lcm: { nudgeAtPct: 70, blockSpawnAtPct: 70 } });
     expect(ok.configIssues).toEqual([]);
     expect(ok.config.lcm.blockSpawnAtPct).toBe(70);
   });
 
   it("rejects lcm.blockSpawnAtPct below nudgeAtPct, or out of range", async () => {
-    const below = await loadWithConfigFile(JSON.stringify({ lcm: { nudgeAtPct: 70, blockSpawnAtPct: 60 } }));
+    const below = await load({ lcm: { nudgeAtPct: 70, blockSpawnAtPct: 60 } });
     expect(below.configIssues.join("\n")).toContain("blockSpawnAtPct must be at least nudgeAtPct");
     expect(below.config.lcm.blockSpawnAtPct).toBe(80);
 
-    rmSync(home, { recursive: true, force: true });
-    const over = await loadWithConfigFile(JSON.stringify({ lcm: { blockSpawnAtPct: 120 } }));
+    const over = await load({ lcm: { blockSpawnAtPct: 120 } });
     expect(over.configIssues.join("\n")).toContain("blockSpawnAtPct");
   });
 

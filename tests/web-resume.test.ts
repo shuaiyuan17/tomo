@@ -1,8 +1,7 @@
-import { afterEach, expect, it, vi } from "vitest";
-import { stream } from "../web/src/api.js";
+import { expect, it } from "vitest";
 import { onResume } from "../web/src/resume.js";
 
-afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); });
+/** The page reconnects its stream when it comes back (web/src/resume.ts); the stream itself is web-api.test.ts. */
 
 function fakePage() {
   const doc = new EventTarget() as EventTarget & { hidden: boolean };
@@ -25,14 +24,4 @@ it("onResume: fires on hidden → visible with how long it was away, and on a bf
   stop();
   page.hide(true); page.hide(false); page.pageshow(true);
   expect(seen).toHaveLength(2);
-});
-
-it("stream: gives up a connection that goes quiet (no heartbeat) instead of waiting forever", async () => {
-  vi.useFakeTimers();
-  const body = new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(": heartbeat\n\n")); } });
-  vi.stubGlobal("fetch", vi.fn(async () => new Response(body)));
-  const done = stream("c", new AbortController().signal, { snapshot: () => {}, update: () => {}, cursor: () => {} }, 1_000);
-  const outcome = expect(done).rejects.toThrow("Stream went quiet");
-  await vi.advanceTimersByTimeAsync(1_500);
-  await outcome;
 });

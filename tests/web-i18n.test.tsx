@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { WebBootstrap, WebPermissionRequest } from "../src/web/protocol.js";
 import { formatLocaleFor, i18n, pickLocale, setLocaleChoice, storedLocale } from "../web/src/i18n/index.js";
 import { formatCompact, formatDate, formatRelative } from "../web/src/i18n/format.js";
@@ -119,21 +122,23 @@ describe("copy kept in state follows a language switch", () => {
     expect(modelErrorText("turn_in_flight", "Tomo")).toContain("Tomo 正在回复中");
   });
 
-  it("no component puts translated text into state", async () => {
-    const { readdirSync, readFileSync, statSync } = await import("node:fs");
-    const { join } = await import("node:path");
+  it("no component puts translated text into state", () => {
     const offenders: string[] = [];
+    let scanned = 0;
     const walk = (dir: string) => { for (const name of readdirSync(dir)) {
       const path = join(dir, name);
       if (statSync(path).isDirectory()) { if (name !== "i18n") walk(path); continue; }
       if (!/\.tsx?$/.test(name)) continue;
+      scanned++;
       readFileSync(path, "utf8").split("\n").forEach((line, i) => {
         // A state setter fed translated words: `setX(t(...))`, `setX(i18n.t(...))`, `setX(someError(code))`.
         // (reactFailure / sendFailure return a Message, not words.)
         if (/\bset[A-Z]\w*\(\s*(i18n\.t|t|say|(?!reactFailure|sendFailure)[a-z]\w*(Error|Failure|Text|Label|Notice))\(/.test(line)) offenders.push(`${path}:${i + 1}`);
       });
     } };
-    walk("web/src");
+    // From this file, not the working directory: run from elsewhere, "web/src" found nothing and passed.
+    walk(fileURLToPath(new URL("../web/src", import.meta.url)));
+    expect(scanned).toBeGreaterThan(50);
     expect(offenders).toEqual([]);
   });
 });

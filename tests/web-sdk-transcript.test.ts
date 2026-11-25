@@ -3,11 +3,10 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describeUnreadable, parseEntry, reportUnreadable, setUnreadableReporter, type UnreadableReport } from "../src/web/sdk-transcript.js";
-import { itemsFromLine, readSubagentPage } from "../src/web/subagent-reader.js";
-import { pairOutputs, PRIVATE_HIDDEN, readSessionTools, toolItemsFromLine } from "../src/web/session-tools.js";
+import { readSubagentPage } from "../src/web/subagent-reader.js";
+import { readSessionTools, toolItemsFromLine } from "../src/web/session-tools.js";
 
 const line = (type: string, content: unknown) => JSON.stringify({ type, timestamp: "2026-11-15T10:00:00.000Z", message: { role: type, content } });
-const png = { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgoAAAA=" } };
 
 let root: string;
 let reports: UnreadableReport[];
@@ -36,41 +35,11 @@ describe("parseEntry", () => {
   });
 });
 
-describe("thinking and images in a subagent transcript", () => {
-  it("non-empty thinking is an item, clipped like text; empty or redacted thinking is nothing", () => {
-    const items = itemsFromLine(line("assistant", [{ type: "thinking", thinking: "Check the pager first.", signature: "s" },
-      { type: "thinking", thinking: "  ", signature: "s" }, { type: "redacted_thinking", data: "opaque" }, { type: "text", text: "On it." }]), 10);
-    expect(items).toEqual([
-      { kind: "thinking", id: "10:0", text: "Check the pager first.", truncated: false, ts: Date.parse("2026-11-15T10:00:00.000Z") },
-      { kind: "text", id: "10:3", text: "On it.", truncated: false, ts: Date.parse("2026-11-15T10:00:00.000Z") },
-    ]);
-    const [long] = itemsFromLine(line("assistant", [{ type: "thinking", thinking: "t".repeat(9_000) }]), 20);
-    expect(long).toMatchObject({ kind: "thinking", truncated: true });
-  });
-
-  it("an image in a tool result is counted, never written as text or carried", () => {
-    const [result] = itemsFromLine(line("user", [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "saved" }, png, png] }]), 30);
-    expect(result).toMatchObject({ kind: "result", output: "saved", images: 2 });
-    expect(JSON.stringify(result)).not.toContain("[image]");
-    expect(JSON.stringify(result)).not.toContain("iVBORw0KGgo");
-    const [only] = itemsFromLine(line("user", [{ type: "tool_result", tool_use_id: "t2", content: [png] }]), 40);
-    expect(only).toMatchObject({ output: "", images: 1 });
-    // Other non-text parts keep their [type] label.
-    const [doc] = itemsFromLine(line("user", [{ type: "tool_result", tool_use_id: "t3", content: [{ type: "document", source: {} }] }]), 50);
-    expect(doc).toMatchObject({ output: "[document]" });
-    expect(doc).not.toHaveProperty("images");
-  });
-
-  it("the main chat never gets thinking, and a withheld output loses its image count too", () => {
+describe("thinking in the main chat", () => {
+  // In a subagent transcript: web-subagent-reader.test.ts. A withheld output's image count: web-turn-items.test.ts.
+  it("the main chat never gets thinking", () => {
     const thinking = line("assistant", [{ type: "thinking", thinking: "x" }, { type: "tool_use", id: "t1", name: "Read", input: { file_path: "/a" } }]);
     expect(toolItemsFromLine(thinking, 0).map((i) => i.kind)).toEqual(["tool"]);
-    const items = [...toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "p1", name: "Read", input: { file_path: "/w/memory/private/a.png" } }]), 0),
-      ...toolItemsFromLine(line("user", [{ type: "tool_result", tool_use_id: "p1", content: [png] }]), 100)];
-    const [, result] = pairOutputs(items);
-    expect(result).toMatchObject({ kind: "result", output: PRIVATE_HIDDEN });
-    expect(result).not.toHaveProperty("images");
-    const [unpaired] = pairOutputs(toolItemsFromLine(line("user", [{ type: "tool_result", tool_use_id: "zz", content: [png] }]), 0));
-    expect(unpaired).not.toHaveProperty("images");
   });
 });
 

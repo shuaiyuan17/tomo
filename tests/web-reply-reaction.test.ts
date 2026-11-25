@@ -3,31 +3,15 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MAX_WEB_REACTIONS, WebChannel } from "../src/channels/web.js";
+import { MAX_WEB_REACTIONS } from "../src/channels/web.js";
 import { formatReactionMarker } from "../src/channels/text-utils.js";
-import { WatchBus } from "../src/watch/bus.js";
 import { WebRequestJournal } from "../src/web/request-journal.js";
-import { messageInputSchema, type WebEvent } from "../src/web/protocol.js";
-import type { OwnerConfig } from "../src/owner.js";
+import { useWebChannels } from "./helpers/web-channel.js";
 
-const owner: OwnerConfig = { name: "owner", telegram: ["test-owner"], imessage: [] };
-const channels: WebChannel[] = [];
+const setup = useWebChannels();
 const dirs: string[] = [];
 function tempDir() { const dir = mkdtempSync(join(tmpdir(), "tomo-web-reply-")); dirs.push(dir); return dir; }
-function setup(options: ConstructorParameters<typeof WebChannel>[2] = {}) {
-  const bus = new WatchBus();
-  const channel = new WebChannel(owner, bus, options);
-  channels.push(channel);
-  const handler = vi.fn(async () => true);
-  channel.onMessage(handler);
-  const events: WebEvent[] = [];
-  channel.events.subscribe(({ event }) => events.push(event));
-  return { channel, handler, bus, events };
-}
-afterEach(async () => {
-  for (const channel of channels.splice(0)) await channel.stop();
-  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
-});
+afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 const textOf = (handler: ReturnType<typeof vi.fn>) => (handler.mock.calls.at(-1)![0] as { text: string }).text;
 
 describe("formatReactionMarker (shared by iMessage tapbacks and web reactions)", () => {
@@ -41,15 +25,7 @@ describe("formatReactionMarker (shared by iMessage tapbacks and web reactions)",
 });
 
 describe("web message input with a reply", () => {
-  it("a reaction carries no content of its own; a reply needs some", () => {
-    const requestId = randomUUID();
-    expect(messageInputSchema.safeParse({ requestId, text: "", reply: { text: "hi", reaction: "love" } }).success).toBe(true);
-    expect(messageInputSchema.safeParse({ requestId, text: "and", reply: { text: "hi", reaction: "love" } }).success).toBe(false);
-    expect(messageInputSchema.safeParse({ requestId, text: "", reply: { text: "hi" } }).success).toBe(false);
-    expect(messageInputSchema.safeParse({ requestId, text: "ok", reply: { text: "hi" } }).success).toBe(true);
-    expect(messageInputSchema.safeParse({ requestId, text: "", reply: { text: "hi", reaction: "wow" } }).success).toBe(false);
-  });
-
+  // What the schema accepts: web-protocol.test.ts.
   it("hands the agent the iMessage reply marker in front of the text, and keeps the quote on the request", async () => {
     const { channel, handler } = setup();
     const request = await channel.receive({ requestId: randomUUID(), text: "[sure]", reply: { text: "Want to\ngrab lunch?" } });

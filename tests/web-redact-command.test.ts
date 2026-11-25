@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MASK, redactCommand } from "../src/web/redact-command.js";
+import { MASK, redactCommand, redactText, redactToolInput } from "../src/web/redact-command.js";
 
 describe("redactCommand", () => {
   it.each([
@@ -40,5 +40,24 @@ describe("redactCommand", () => {
     const shown = t.list()[0].description;
     expect(shown.length).toBeLessThanOrEqual(TASK_TEXT_LIMIT + 1);
     expect(shown).not.toContain("ZZZZ");
+  });
+});
+
+describe("redaction helpers", () => {
+  it("redactText keeps ordinary output (a=b stays) but masks credentials", () => {
+    expect(redactText("x=1 and y=2")).toBe("x=1 and y=2");
+    expect(redactText("ghp_abcdefghijklmnop")).not.toContain("ghp_abcdefghijklmnop");
+  });
+  it("redactToolInput masks secret-named fields whole, at any depth, whatever the value looks like", () => {
+    expect(redactToolInput({ password: "hunter2" })).toEqual({ password: "•••" });
+    expect(redactToolInput({ headers: { Authorization: "x" } })).toEqual({ headers: { Authorization: "•••" } });
+    expect(redactToolInput({ api_key: "opaque" })).toEqual({ api_key: "•••" });
+    expect(redactToolInput({ config: { list: [{ "Private-Key": { n: 1 } }, { ACCESS_KEY: 42 }] }, Cookie: "a=b", sessionToken: "s", path: "/a" }))
+      .toEqual({ config: { list: [{ "Private-Key": "•••" }, { ACCESS_KEY: "•••" }] }, Cookie: "•••", sessionToken: "•••", path: "/a" });
+    expect(JSON.stringify(redactToolInput({ a: { b: { c: { d: { e: { f: { g: { h: { i: { j: "deep" } } } } } } } } } }))).not.toContain("deep");
+  });
+  it("redactToolInput masks `command` as a shell line, at any depth, keeping the keys", () => {
+    const out = redactToolInput({ command: "export SECRET=v1 && run", nested: { list: ["/m/memory/private/a"] }, n: 3 });
+    expect(out).toEqual({ command: "export SECRET=••• && run", nested: { list: ["<private>"] }, n: 3 });
   });
 });

@@ -3,6 +3,8 @@ import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileS
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BRIEF_LIMIT, IO_LIMIT, itemsFromLine, readSubagentBrief, readSubagentModel, MAX_LINE_BYTES, MAX_LINE_ITEMS, MAX_PAGE_ITEMS, PAGE_BYTES, readSubagentPage, SubagentReadError } from "../src/web/subagent-reader.js";
+import { toolItemsFromLine } from "../src/web/session-tools.js";
+import { groupRows, viewRows } from "../web/src/subagent.js";
 
 let root: string;
 let dir: string;
@@ -33,6 +35,62 @@ describe("subagent transcript items", () => {
     const [scrubbed] = itemsFromLine(text(`token ${secret}`), 30);
     expect(JSON.stringify(scrubbed)).not.toContain(secret);
     expect(itemsFromLine("not json", 0)).toEqual([]);
+  });
+});
+
+describe("thinking and images in a subagent transcript", () => {
+  const entry = (type: string, content: unknown) => JSON.stringify({ type, timestamp: "2026-11-15T10:00:00.000Z", message: { role: type, content } });
+  const png = { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgoAAAA=" } };
+  it("non-empty thinking is an item, clipped like text; empty or redacted thinking is nothing", () => {
+    const items = itemsFromLine(entry("assistant", [{ type: "thinking", thinking: "Check the pager first.", signature: "s" },
+      { type: "thinking", thinking: "  ", signature: "s" }, { type: "redacted_thinking", data: "opaque" }, { type: "text", text: "On it." }]), 10);
+    expect(items).toEqual([
+      { kind: "thinking", id: "10:0", text: "Check the pager first.", truncated: false, ts: Date.parse("2026-11-15T10:00:00.000Z") },
+      { kind: "text", id: "10:3", text: "On it.", truncated: false, ts: Date.parse("2026-11-15T10:00:00.000Z") },
+    ]);
+    const [long] = itemsFromLine(entry("assistant", [{ type: "thinking", thinking: "t".repeat(9_000) }]), 20);
+    expect(long).toMatchObject({ kind: "thinking", truncated: true });
+  });
+
+  it("an image in a tool result is counted, never written as text or carried", () => {
+    const [result] = itemsFromLine(entry("user", [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "saved" }, png, png] }]), 30);
+    expect(result).toMatchObject({ kind: "result", output: "saved", images: 2 });
+    expect(JSON.stringify(result)).not.toContain("[image]");
+    expect(JSON.stringify(result)).not.toContain("iVBORw0KGgo");
+    const [only] = itemsFromLine(entry("user", [{ type: "tool_result", tool_use_id: "t2", content: [png] }]), 40);
+    expect(only).toMatchObject({ output: "", images: 1 });
+    // Other non-text parts keep their [type] label.
+    const [doc] = itemsFromLine(entry("user", [{ type: "tool_result", tool_use_id: "t3", content: [{ type: "document", source: {} }] }]), 50);
+    expect(doc).toMatchObject({ output: "[document]" });
+    expect(doc).not.toHaveProperty("images");
+  });
+});
+
+describe("messages sent while the subagent is busy (queued_command)", () => {
+  // Shapes as the SDK (2.1.325) writes them, ids and text replaced.
+  const toolResult = JSON.stringify({ parentUuid: "p1", isSidechain: true, agentId: "a1", type: "user", timestamp: "2026-11-15T01:15:25.584Z",
+    message: { role: "user", content: [{ tool_use_id: "toolu_1", type: "tool_result", content: "Tests 13 passed", is_error: false }] }, uuid: "u1" });
+  const queued = JSON.stringify({ parentUuid: "u1", isSidechain: true, agentId: "a1", type: "attachment", uuid: "u2", timestamp: "2026-11-15T01:15:25.588Z",
+    attachment: { type: "queued_command", prompt: "One more bug: do it as its own PR.", source_uuid: "s1", origin: { kind: "coordinator" }, isMeta: true, reminderId: "r1" },
+    rendered: [{ content: "<system-reminder id=\"r1\">\nThe coordinator sent a message while you were working:\nOne more bug…</system-reminder>" }], renderedRole: "system" });
+  const blob = JSON.stringify({ type: "api-request-blob", sessionId: "s", agentId: "a1", hash: "h",
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "Tests 13 passed" }, { type: "text", text: "One more bug: do it as its own PR." }] } });
+  const otherAttachment = JSON.stringify({ type: "attachment", attachment: { type: "edited_text_file", filename: "/x" }, timestamp: "2026-11-15T01:15:26.000Z" });
+  it("a queued_command attachment is a message to the subagent, with its prompt and time", () => {
+    expect(itemsFromLine(queued, 500)).toEqual([{ kind: "message", id: "500:queued", text: "One more bug: do it as its own PR.", truncated: false, ts: Date.parse("2026-11-15T01:15:25.588Z") }]);
+  });
+  it("the api-request-blob copy and other attachments show nothing (no duplicate message or result)", () => {
+    expect(itemsFromLine(blob, 900)).toEqual([]);
+    expect(itemsFromLine(otherAttachment, 950)).toEqual([]);
+  });
+  it("in order: the result, then the message — which splits the run of calls like any message", () => {
+    const tool = JSON.stringify({ type: "assistant", timestamp: "2026-11-15T01:15:20.000Z", message: { content: [{ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "npm test" } }] } });
+    const items = [tool, toolResult, queued, blob].flatMap((line, i) => itemsFromLine(line, i * 100 + 1));
+    expect(groupRows(viewRows(items)).map((b) => b.kind)).toEqual(["tool", "message"]);
+  });
+  it("the main chat's inline calls never pick these up (its own history has the messages)", () => {
+    expect(toolItemsFromLine(queued, 10)).toEqual([]);
+    expect(toolItemsFromLine(blob, 20)).toEqual([]);
   });
 });
 

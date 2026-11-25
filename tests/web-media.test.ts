@@ -6,10 +6,11 @@ import { SessionStore } from "../src/sessions/store.js";
 import { imagePaths, imageSessionKeys, MAX_MESSAGE_IMAGES, sniffImageType, WebData } from "../src/web/data.js";
 import { buildImagePath } from "../src/channels/imageStore.js";
 import { webSessionId } from "../src/web/owner.js";
+import { ONE_PIXEL_PNG } from "./helpers/png.js";
 
 let root: string, workspaceDir: string, images: string, data: WebData, store: SessionStore, ownerId: string;
 const owner = { name: "owner", telegram: ["test-owner"], imessage: ["+15550001111"] };
-const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+const PNG = ONE_PIXEL_PNG;
 /** A filename exactly as the image store names it for a channel's meta.sessionKey. */
 const name = (sessionKey: string, guid = "abcd-1234-ef") =>
   buildImagePath("/unused", "image/png", { sessionKey, guid, timestamp: new Date(2026, 10, 14, 12, 35, 33) } as never).filename;

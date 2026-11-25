@@ -1,9 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
-import { WatchBus } from "../src/watch/bus.js";
-import { WebChannel } from "../src/channels/web.js";
-import type { WebCronJob, WebEvent } from "../src/web/protocol.js";
+import type { WebCronJob } from "../src/web/protocol.js";
+import { useWebChannels } from "./helpers/web-channel.js";
 import { formatUntil, SCHEDULED_LIMIT, upcomingJobs } from "../web/src/scheduled.js";
 import { cronJobHash, focusFromHash, viewFromHash } from "../web/src/study-data.js";
 
@@ -41,7 +40,14 @@ describe("relative time", () => {
   });
 });
 
-describe("jumping to a job", () => {
+describe("Study hash routes and jumping to a job", () => {
+  it("routes #study/<page> and falls back to Todos", () => {
+    expect(viewFromHash("#study/memory")).toBe("memory");
+    expect(viewFromHash("#study")).toBe("todos");
+    expect(viewFromHash("#study/nope")).toBe("todos");
+    expect(viewFromHash("")).toBeNull();
+    expect(viewFromHash("#conversation")).toBeNull();
+  });
   it("links a row to its job in the Study's Cron tab", () => {
     expect(cronJobHash("abc-123")).toBe("#study/cron/abc-123");
     expect(viewFromHash("#study/cron/abc-123")).toBe("cron");
@@ -69,15 +75,12 @@ describe("jumping to a job", () => {
 });
 
 describe("cron change events", () => {
+  const webChannel = useWebChannels();
   it("tells the page to re-read /cron when a job fires or finishes, with no payload", () => {
-    const bus = new WatchBus();
-    const channel = new WebChannel({ name: "owner", telegram: ["1"], imessage: [] }, bus);
-    const events: WebEvent[] = [];
-    channel.events.subscribe(({ event }) => events.push(event));
+    const { bus, events } = webChannel();
     bus.publish({ type: "cron.fired", jobId: "j", name: "Secret job name" });
     bus.publish({ type: "cron.done", jobId: "j", name: "Secret job name", ok: true });
     expect(events).toEqual([{ type: "cron" }, { type: "cron" }]);
-    void channel.stop();
   });
 });
 

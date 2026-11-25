@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import type { HistoryMessage, SessionTools, SubagentItem, WebRequest } from "../src/web/protocol.js";
 import { blockKey, interleave, jumpLabel, jumpVisible, mergeTools, messageKey, NO_TOOLS, pendingKey, unseenKeys } from "../web/src/inline-tools.js";
 import { chatRows, openingAnchors, rowId } from "../web/src/chat-rows.js";
-import { groupLabel, pendingTool } from "../web/src/subagent.js";
 
 const msg = (id: string, role: "user" | "assistant", timestamp: number, extra: Partial<HistoryMessage> = {}): HistoryMessage =>
   ({ id, role, content: id, channel: "web", timestamp, ...extra });
@@ -27,15 +26,11 @@ describe("interleave: tool calls between the chat's messages", () => {
     const items = [...call("r1", "Read", 200), ...call("r2", "Read", 250), ...call("b1", "Bash", 400), ...call("b2", "Bash", 500)];
     expect(shape(interleave(messages, items))).toEqual(["u1", "group:calls:r1", "a1", "group:calls:b1", "a2", "|"]);
   });
-  it("calls after the last message are the running turn's; its summary names the running call", () => {
+  it("calls after the last message are the running turn's (how its group is labelled: web-subagent.test.ts)", () => {
     const items = [...call("r1", "Read", 200), ...call("b1", "Bash", 300, false)];
     const out = interleave([msg("u1", "user", 100)], items);
     expect(shape(out)).toEqual(["u1", "|", "group:calls:r1"]);
-    const group = out.trailing[0];
-    if (group.kind !== "group") throw new Error("expected a group");
-    const pending = pendingTool(group.tools)!;
-    expect(groupLabel(group.tools, true)).toEqual({ lead: "", running: `${pending.summary || pending.name}…` });
-    expect(groupLabel(group.tools)).toEqual({ lead: "Read a file, ran a command" });
+    expect(out.trailing[0]).toMatchObject({ kind: "group", tools: [{ toolUseId: "r1" }, { toolUseId: "b1" }] });
   });
   it("drops calls before the oldest loaded message (older history not loaded) and calls without a time", () => {
     const items = [...call("old", "Read", 50), { kind: "tool", id: "1:0", toolUseId: "nots", name: "X", summary: "", input: "{}", inputTruncated: false } as SubagentItem,

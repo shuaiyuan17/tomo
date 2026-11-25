@@ -1,38 +1,42 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
-import { MODEL_RETRY_DELAYS_MS, OWNER_KEY_CHECK_MS, WebChannel } from "../src/channels/web.js";
-import { WatchBus } from "../src/watch/bus.js";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { MODEL_RETRY_DELAYS_MS, OWNER_KEY_CHECK_MS } from "../src/channels/web.js";
 import { WebEvents } from "../src/web/events.js";
-import { parseWebConfig } from "../src/web/config.js";
+import { ownerSessionKeyReader, selectOwnerSessionKey } from "../src/web/data.js";
+import { SessionStore } from "../src/sessions/store.js";
 import { webSessionId } from "../src/web/owner.js";
-import { MAX_BOARD_TASKS, MAX_SNAPSHOT_TASK_BYTES, SNAPSHOT_SUMMARY_LIMIT, TASK_RETENTION_MS } from "../src/web/tasks.js";
+import { MAX_BOARD_TASKS, MAX_SESSION_TASKS, MAX_SNAPSHOT_TASK_BYTES, SNAPSHOT_SUMMARY_LIMIT, TASK_RETENTION_MS } from "../src/web/tasks.js";
 import type { OwnerConfig } from "../src/owner.js";
-import { MAX_BUFFER_BYTES, type WebEvent } from "../src/web/protocol.js";
+import { MAX_BUFFER_BYTES } from "../src/web/protocol.js";
+import { TEST_OWNER, useWebChannels } from "./helpers/web-channel.js";
 
-const owner: OwnerConfig = { name: "owner", telegram: ["test-owner"], imessage: [] };
-const channels: WebChannel[] = [];
+const owner = TEST_OWNER;
+const webChannel = useWebChannels();
 function setup(configured: OwnerConfig | null = owner, ownerKey?: () => string | undefined,
   taskOutput?: (key: string, id: string) => Promise<{ output: string; size: number } | undefined>,
   taskModel?: (key: string, id: string) => Promise<string | undefined>, now?: () => number) {
-  const bus = new WatchBus();
-  const channel = new WebChannel(configured ?? undefined, bus, { ownerKey, taskOutput, taskModel, now });
-  channels.push(channel);
-  const handler = vi.fn(async () => true);
-  channel.onMessage(handler);
-  const events: WebEvent[] = [];
-  channel.events.subscribe(({ event }) => events.push(event));
-  return { channel, handler, bus, events };
+  return webChannel({ ownerKey, taskOutput, taskModel, now }, configured);
 }
-afterEach(async () => { for (const channel of channels.splice(0)) await channel.stop(); });
+/** A session registry in a temp dir, removed after the test, and the owner-key reader over it. */
+const registries: string[] = [];
+afterEach(() => { for (const root of registries.splice(0)) rmSync(root, { recursive: true, force: true }); });
+function tempRegistry() {
+  const root = mkdtempSync(join(tmpdir(), "tomo-web-owner-key-")); registries.push(root);
+  const sessionsDir = join(root, "sessions"), sdkSessionsDir = join(root, "sdk");
+  return { sessionsDir, store: new SessionStore(sessionsDir, 20, sdkSessionsDir), read: ownerSessionKeyReader({ owner, sessionsDir, sdkSessionsDir }) };
+}
 
-describe("web configuration and owner", () => {
-  it("defaults to loopback port 9465 and degrades invalid optional config without reflecting values", () => {
-    expect(parseWebConfig(undefined)).toEqual({ enabled: true, port: 9465 });
-    expect(parseWebConfig({ enabled: false, port: 9876 })).toEqual({ enabled: false, port: 9876 });
-    const diagnostic = vi.fn();
-    expect(parseWebConfig({ port: "secret-value" }, diagnostic).enabled).toBe(false);
-    expect(JSON.stringify(diagnostic.mock.calls)).not.toContain("secret-value");
-    expect(diagnostic).toHaveBeenCalledOnce();
+describe("the owner", () => {
+  it("selectOwnerSessionKey: canonical first, then a single legacy key, none when ambiguous", () => {
+    const two: OwnerConfig = { name: "owner", telegram: ["test-owner"], imessage: ["owner@example.com"] };
+    expect(selectOwnerSessionKey(undefined, ["dm:owner"])).toBeUndefined();
+    expect(selectOwnerSessionKey(two, ["dm:owner", "telegram:test-owner"])).toBe("dm:owner");
+    expect(selectOwnerSessionKey(two, ["telegram:test-owner", "telegram:-5"])).toBe("telegram:test-owner");
+    expect(selectOwnerSessionKey(two, ["telegram:test-owner", "imessage:owner@example.com"])).toBeUndefined();
+    expect(selectOwnerSessionKey(two, [])).toBe("dm:owner");
   });
   it("the web conversation id is derived from the owner's dm: key", () => {
     const { channel } = setup();
@@ -196,40 +200,24 @@ describe("web task panel feed", () => {
     } finally { vi.useRealTimers(); }
   });
   it("with the real registry reader, a legacy DM's tasks stop the moment the canonical key appears", async () => {
-    const { mkdtempSync, rmSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    const { SessionStore } = await import("../src/sessions/store.js");
-    const { ownerSessionKeyReader } = await import("../src/web/data.js");
-    const root = mkdtempSync(join(tmpdir(), "tomo-web-owner-key-"));
-    try {
-      const sessionsDir = join(root, "sessions"), sdkSessionsDir = join(root, "sdk");
-      const store = new SessionStore(sessionsDir, 20, sdkSessionsDir);
-      store.setSdkSessionId("telegram:test-owner", "sdk-legacy");
-      const { channel, bus, events } = setup(owner, ownerSessionKeyReader({ owner, sessionsDir, sdkSessionsDir }));
-      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l", "legacy work")] });
-      expect(channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["l"]);
-      // The registry gains the canonical key; the very next legacy event is refused — no cache window.
-      store.setSdkSessionId("dm:owner", "sdk-owner");
-      const before = events.length;
-      bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l", "legacy work"), live("m", "legacy secret")] });
-      expect(JSON.stringify(events.slice(before))).not.toContain("legacy secret");
-      expect(channel.snapshot().tasks).toEqual([]);
-    } finally { rmSync(root, { recursive: true, force: true }); }
+    const { store, read } = tempRegistry();
+    store.setSdkSessionId("telegram:test-owner", "sdk-legacy");
+    const { channel, bus, events } = setup(owner, read);
+    bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l", "legacy work")] });
+    expect(channel.snapshot().tasks.map((t) => t.taskId)).toEqual(["l"]);
+    // The registry gains the canonical key; the very next legacy event is refused — no cache window.
+    store.setSdkSessionId("dm:owner", "sdk-owner");
+    const before = events.length;
+    bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l", "legacy work"), live("m", "legacy secret")] });
+    expect(JSON.stringify(events.slice(before))).not.toContain("legacy secret");
+    expect(channel.snapshot().tasks).toEqual([]);
   });
-  it("after the registry switches, sends triggered by other sessions, capacity or the timer never carry the old owner tasks", async () => {
-    const { mkdtempSync, rmSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    const { SessionStore } = await import("../src/sessions/store.js");
-    const { ownerSessionKeyReader } = await import("../src/web/data.js");
-    const root = mkdtempSync(join(tmpdir(), "tomo-web-gate-"));
+  it("after the registry switches, sends triggered by other sessions, capacity or the timer never carry the old owner tasks", () => {
+    const { store, read } = tempRegistry();
     vi.useFakeTimers({ now: 0, toFake: ["setTimeout", "setInterval", "clearTimeout", "clearInterval", "Date"] });
     try {
-      const sessionsDir = join(root, "sessions"), sdkSessionsDir = join(root, "sdk");
-      const store = new SessionStore(sessionsDir, 20, sdkSessionsDir);
       store.setSdkSessionId("telegram:test-owner", "sdk-legacy");
-      const { channel, bus, events } = setup(owner, ownerSessionKeyReader({ owner, sessionsDir, sdkSessionsDir }));
+      const { channel, bus, events } = setup(owner, read);
       bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l1", "legacy secret"), live("l2", "legacy secret")] });
       bus.publish({ type: "tasks", sessionKey: "telegram:test-owner", tasks: [live("l2", "legacy secret")] }); // l1 ended, retained
       store.setSdkSessionId("dm:owner", "sdk-owner"); // the catalog now hides the legacy session
@@ -242,7 +230,7 @@ describe("web task panel feed", () => {
       expect(sent).not.toContain("legacy secret");
       expect(events.slice(from).some((e) => e.type === "tasks" && e.sessionId === channel.ownerId && e.tasks.length === 0)).toBe(true);
       expect(JSON.stringify(channel.snapshot())).not.toContain("legacy secret");
-    } finally { vi.useRealTimers(); rmSync(root, { recursive: true, force: true }); }
+    } finally { vi.useRealTimers(); }
   });
   it("stops re-checking the owner rule once no DM task is on the board, and starts again with the next one", () => {
     vi.useFakeTimers({ now: 0 });
@@ -265,19 +253,11 @@ describe("web task panel feed", () => {
       expect(reads).toBeGreaterThan(rearmed);
     } finally { vi.useRealTimers(); }
   });
-  it("the real registry reader parses the registry only when the file changed", async () => {
-    const { mkdtempSync, rmSync } = await import("node:fs");
-    const { tmpdir } = await import("node:os");
-    const { join } = await import("node:path");
-    const { SessionStore } = await import("../src/sessions/store.js");
-    const { ownerSessionKeyReader } = await import("../src/web/data.js");
-    const root = mkdtempSync(join(tmpdir(), "tomo-web-owner-cache-"));
+  it("the real registry reader parses the registry only when the file changed", () => {
+    const { sessionsDir, store, read } = tempRegistry();
     const parse = vi.spyOn(SessionStore, "readSnapshot");
     try {
-      const sessionsDir = join(root, "sessions"), sdkSessionsDir = join(root, "sdk");
-      const store = new SessionStore(sessionsDir, 20, sdkSessionsDir);
       store.setSdkSessionId("telegram:test-owner", "sdk-legacy");
-      const read = ownerSessionKeyReader({ owner, sessionsDir, sdkSessionsDir });
       parse.mockClear();
       for (let i = 0; i < 5; i++) expect(read()).toBe("telegram:test-owner");
       expect(parse).toHaveBeenCalledTimes(1);
@@ -289,7 +269,7 @@ describe("web task panel feed", () => {
       rmSync(SessionStore.registryFile(sessionsDir));
       read(); read(); // no file: nothing to key a cache on, read each time
       expect(parse).toHaveBeenCalledTimes(4);
-    } finally { parse.mockRestore(); rmSync(root, { recursive: true, force: true }); }
+    } finally { parse.mockRestore(); }
   });
   it("keeps recording a hidden DM's events, so it is correct when it becomes visible again", () => {
     vi.useFakeTimers({ now: 0 });
@@ -416,28 +396,28 @@ describe("web task panel feed", () => {
     vi.useFakeTimers({ now: 0 });
     try {
       const lookups: string[] = [];
-      const { bus } = setup(owner, undefined, undefined, async (_key, id) => { lookups.push(id); return undefined; }, () => Date.now());
+      const { channel, bus } = setup(owner, undefined, undefined, async (_key, id) => { lookups.push(id); return undefined; }, () => Date.now());
       bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a1")] });
       await vi.advanceTimersByTimeAsync(MODEL_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0) + 5_000);
       expect(lookups).toEqual(["a1", "a1", "a1", "a1"]);
-      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a2")] }); // a1 ended
-      await vi.advanceTimersByTimeAsync(0);
-      await vi.advanceTimersByTimeAsync(TASK_RETENTION_MS + 1); // a1 leaves the panel
-      const before = lookups.filter((id) => id === "a2").length;
-      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [] }); // a2 ends; its pending retry stays only while held
-      await vi.advanceTimersByTimeAsync(TASK_RETENTION_MS + 15_000);
-      expect(lookups.filter((id) => id === "a2").length).toBeLessThanOrEqual(4);
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [live("a2")] });
+      await vi.advanceTimersByTimeAsync(MODEL_RETRY_DELAYS_MS[0]); // a2: the first try and the first retry
+      expect(lookups.filter((id) => id === "a2")).toHaveLength(2);
+      // a2 ends while its next retry is pending, and a full panel of running
+      // shells pushes it off (the cap keeps running work before ended work).
+      // Every retry delay together is shorter than TASK_RETENTION_MS, so only
+      // leaving the panel can drop a retry before it fires.
+      const shells = Array.from({ length: MAX_SESSION_TASKS }, (_, i) => ({ ...live(`b${i}`), taskType: "local_bash" }));
+      bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: shells });
+      expect(channel.snapshot().tasks.map((t) => t.taskId)).not.toContain("a2");
+      await vi.advanceTimersByTimeAsync(MODEL_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0) + 5_000);
+      expect(lookups.filter((id) => id === "a2")).toHaveLength(2);
       expect(lookups.filter((id) => id === "a1")).toHaveLength(4);
-      expect(before).toBeGreaterThan(0);
     } finally { vi.useRealTimers(); }
   });
   it("redacts shell commands before any send, and serves the full command (redacted) from the live session", async () => {
-    const bus = new WatchBus();
     const commands = new Map([["toolu_1", "cd /repo && GITHUB_TOKEN=s3cr3t gh pr list --limit 5 && echo " + "x".repeat(400)]]);
-    const channel = new WebChannel(owner, bus, { toolCommand: (_key, id) => commands.get(id) });
-    channels.push(channel);
-    const events: WebEvent[] = [];
-    channel.events.subscribe(({ event }) => events.push(event));
+    const { channel, bus, events } = webChannel({ toolCommand: (_key, id) => commands.get(id) });
     bus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [
       { ...live("b1", "GITHUB_TOKEN=s3cr3t gh pr list"), taskType: "local_bash", toolUseId: "toolu_1" },
       { ...live("b2", "API_KEY=zzz npm test"), taskType: "local_bash" },
@@ -473,7 +453,7 @@ describe("web task panel feed", () => {
   });
 });
 
-it("replays bounded events and reports gaps or another epoch", () => {
+describe("WebEvents (src/web/events.ts)", () => it("replays bounded events and reports gaps or another epoch", () => {
   const events = new WebEvents();
   events.publish({ type: "invalidate" });
   const cursor = events.cursor();
@@ -484,17 +464,7 @@ it("replays bounded events and reports gaps or another epoch", () => {
   expect(events.after(cursor)).toBeNull();
   expect(events.after("previous-epoch:1")).toBeNull();
   expect(events.after(events.cursor())).toEqual([]);
-});
-
-it("selectOwnerSessionKey: canonical first, then a single legacy key, none when ambiguous", async () => {
-  const { selectOwnerSessionKey } = await import("../src/web/data.js");
-  const two: OwnerConfig = { name: "owner", telegram: ["test-owner"], imessage: ["owner@example.com"] };
-  expect(selectOwnerSessionKey(undefined, ["dm:owner"])).toBeUndefined();
-  expect(selectOwnerSessionKey(two, ["dm:owner", "telegram:test-owner"])).toBe("dm:owner");
-  expect(selectOwnerSessionKey(two, ["telegram:test-owner", "telegram:-5"])).toBe("telegram:test-owner");
-  expect(selectOwnerSessionKey(two, ["telegram:test-owner", "imessage:owner@example.com"])).toBeUndefined();
-  expect(selectOwnerSessionKey(two, [])).toBe("dm:owner");
-});
+}));
 
 it("shares a serialized snapshot budget between queued text and completed blocks", async () => {
   // 16,000 control characters serialize to 96 kB each: the text budget, not

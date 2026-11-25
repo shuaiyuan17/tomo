@@ -14,6 +14,7 @@ import {
   PLAN_STEP_MAX,
   PROGRESS_TEXT_MAX,
   STEP_RESULT_MAX,
+  isTimestamp,
   oneLine,
   REPLY_MAP_KEEP,
   SENT_KEEP,
@@ -173,12 +174,16 @@ export class SubsessionStore {
    * Change fields other than the lifecycle. `fn` must not touch `status`,
    * `waitingOn` or the transition log: those change only through
    * {@link transition}. Returns the updated record, or undefined when there is
-   * no such task.
+   * no such task. A call that changes nothing writes nothing (and so fires no
+   * onChange), unless the table it read needs writing back anyway (it came
+   * from the backup).
    */
   update(id: string, fn: (record: SubsessionRecord) => void): SubsessionRecord | undefined {
+    let changed = true;
     return this.mutate((table) => {
       const record = table.tasks.find((t) => t.id === id);
-      if (!record) return undefined;
+      if (!record) { changed = false; return undefined; }
+      const before = JSON.stringify(record);
       const { status, waitingOn } = record;
       const logLength = record.transitions.length;
       fn(record);
@@ -186,8 +191,9 @@ export class SubsessionStore {
         throw new Error(`Sub-session ${id}: update() may not change the lifecycle; use transition()`);
       }
       trimLists(record);
+      changed = JSON.stringify(record) !== before;
       return clone(record);
-    });
+    }, () => changed);
   }
 
   /**
@@ -275,10 +281,12 @@ export class SubsessionStore {
     this.mutate((table) => { table.tasks = table.tasks.filter((t) => !drop.has(t.id)); });
   }
 
-  private mutate<T>(fn: (table: SubsessionTable) => T): T {
+  /** `changed`, when given, may skip the write: only for a table read cleanly from the primary. */
+  private mutate<T>(fn: (table: SubsessionTable) => T, changed?: () => boolean): T {
     return withFileLockSync(this.lockPath, () => {
       const table = clone(this.readLocked());
       const result = fn(table);
+      if (changed && !changed() && this.lastState === "ok") return result;
       this.writeLocked(table);
       return result;
     });
@@ -469,7 +477,12 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
     ...parsePendingAsk(r.pendingAsk, status, r.waitingOn),
     ...parseUnsavedNotices(r.unsavedNotices),
     ...parseForwardRacing(r.forwardRacing),
-    transitions: Array.isArray(r.transitions) ? r.transitions as SubsessionRecord["transitions"] : [],
+    // An entry not shaped like a transition (or with a time no Date can show) is dropped.
+    transitions: Array.isArray(r.transitions)
+      ? (r.transitions as unknown[]).filter((t): t is SubsessionRecord["transitions"][number] => !!t && typeof t === "object"
+        && isTimestamp((t as Record<string, unknown>).at) && typeof (t as Record<string, unknown>).event === "string"
+        && typeof (t as Record<string, unknown>).to === "string")
+      : [],
   };
 }
 
@@ -477,14 +490,14 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
 function parseForwardRacing(value: unknown): { forwardRacing?: { at: number; text: string; failed?: true } } {
   if (!value || typeof value !== "object") return { forwardRacing: undefined };
   const v = value as Record<string, unknown>;
-  if (typeof v.at !== "number" || !Number.isFinite(v.at) || typeof v.text !== "string" || !v.text.trim()) return { forwardRacing: undefined };
+  if (!isTimestamp(v.at) || typeof v.text !== "string" || !v.text.trim()) return { forwardRacing: undefined };
   return { forwardRacing: { at: v.at, text: v.text, ...(v.failed === true ? { failed: true as const } : {}) } };
 }
 
 function parseUnsavedNotices(value: unknown): { unsavedNotices?: Array<{ at: number; text: string }> } {
   if (!Array.isArray(value)) return { unsavedNotices: undefined };
   const kept = value.filter((v): v is { at: number; text: string } => !!v && typeof v === "object"
-    && typeof (v as { at?: unknown }).at === "number" && Number.isFinite((v as { at: number }).at)
+    && isTimestamp((v as { at?: unknown }).at)
     && typeof (v as { text?: unknown }).text === "string" && (v as { text: string }).text.trim() !== "")
     .map((v) => ({ at: v.at, text: v.text }));
   return { unsavedNotices: kept.length > 0 ? kept : undefined };
@@ -534,7 +547,7 @@ function timedLine(e: unknown, max: number): { at: number; text: string; rest: R
   if (!e || typeof e !== "object") return undefined;
   const rest = e as Record<string, unknown>;
   const { at, text } = rest;
-  if (typeof at !== "number" || !Number.isFinite(at) || typeof text !== "string") return undefined;
+  if (!isTimestamp(at) || typeof text !== "string") return undefined;
   const line = oneLine(text, max);
   return line ? { at, text: line, rest } : undefined;
 }

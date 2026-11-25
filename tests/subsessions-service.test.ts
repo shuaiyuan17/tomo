@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
-import { CRON_RECHECK_MS, ENDED_KEEP_MS, EXTERNAL_WAIT_CHECK_MS, FINISHED_KEEP_MS, MAX_FINISH_REFUSALS, MAX_INTERRUPT_STREAK, REGISTRY_RECHECK_MS, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
+import { CRON_RECHECK_MS, ENDED_KEEP_MS, EXTERNAL_WAIT_CHECK_MS, FINISHED_KEEP_MS, MAX_FINISH_REFUSALS, MAX_INTERRUPT_STREAK, planAfterDone, planNeedsReason, REGISTRY_RECHECK_MS, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { PENDING_INPUT_MAX, DONE_STEPS_KEEP, PLAN_MAX_STEPS, PLAN_STEP_MAX, UPDATES_KEEP, appendInput } from "../src/agent/subsessions/types.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 
@@ -2123,6 +2123,58 @@ describe("progress, plan and updates", () => {
     expect(h.store.get(t.id)?.doneSteps?.map((d) => d.text)).toEqual(["Wait for CI", "Wait for CI"]);
   });
 
+  it("a refused or unchanged plan writes nothing to the table", () => {
+    let writes = 0;
+    const h = idle();
+    const t = spawn(h);
+    h.service.setPlan(t.sessionKey, [{ step: "A", status: "in_progress" }, { step: "B" }]);
+    const store = new SubsessionStore(path, { onChange: () => { writes += 1; } });
+    const before = readFileSync(path, "utf8");
+    store.update(t.id, () => {});
+    store.update(t.id, (r) => { r.plan = [{ text: "A", status: "in_progress" }, { text: "B", status: "pending" }]; });
+    expect(writes).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(h.service.setPlan(t.sessionKey, [{ step: "C" }])).toEqual({ ok: false, error: "reason_required" });
+    expect(h.service.setPlan(t.sessionKey, [{ step: "A", status: "in_progress" }, { step: "B" }]).ok).toBe(true);
+    expect(readFileSync(path, "utf8")).toBe(before);
+    store.update(t.id, (r) => { r.plan = [{ text: "A", status: "in_progress" }]; });
+    expect(writes).toBe(1);
+  });
+
+  it("checking off a step keeps another step with the same text", () => {
+    const h = idle();
+    const t = spawn(h);
+    const plan = () => h.store.get(t.id)!.plan?.map((s) => `${s.text}:${s.status}`);
+    const filed = () => h.store.get(t.id)!.doneSteps?.map((d) => d.text);
+    h.service.setPlan(t.sessionKey, [{ step: "run tests", status: "in_progress" }, { step: "build" }, { step: "run tests" }]);
+    // Done, and left out of steps.
+    expect(h.service.setPlan(t.sessionKey, [{ step: "build", status: "in_progress" }, { step: "run tests" }], [{ step: "run tests" }]).ok).toBe(true);
+    expect(plan()).toEqual(["build:in_progress", "run tests:pending"]);
+    expect(filed()).toEqual(["run tests"]);
+    // Done, and sent again in steps too: only that copy goes.
+    h.service.setPlan(t.sessionKey, [{ step: "run tests", status: "in_progress" }, { step: "build" }, { step: "run tests" }], [], "do the tests twice");
+    expect(h.service.setPlan(t.sessionKey, [{ step: "run tests", status: "in_progress" }, { step: "build" }, { step: "run tests" }], [{ step: "run tests" }]).ok).toBe(true);
+    expect(plan()).toEqual(["build:pending", "run tests:pending"]);
+    expect(filed()).toEqual(["run tests", "run tests"]);
+    // Both copies done in one call: both filed, none left.
+    expect(h.service.setPlan(t.sessionKey, [{ step: "run tests" }, { step: "build" }, { step: "run tests" }], [], "again").ok).toBe(true);
+    expect(h.service.setPlan(t.sessionKey, [{ step: "build" }], [{ step: "run tests" }, { step: "run tests" }]).ok).toBe(true);
+    expect(plan()).toEqual(["build:pending"]);
+    expect(filed()).toEqual(["run tests", "run tests", "run tests", "run tests"]);
+  });
+
+  it("drops the copy of a done step in the same place it was in the plan", () => {
+    const pending = (text: string) => ({ text, status: "pending" as const });
+    // The copy in progress is the later one; the plan sent again without statuses.
+    const before = [pending("A"), pending("X"), { text: "A", status: "in_progress" as const }];
+    expect(planAfterDone(before, [pending("A"), pending("X"), pending("A")], ["A"])).toEqual([pending("A"), pending("X")]);
+    expect(planNeedsReason(before, [pending("A"), pending("X")], ["A"])).toBe(false);
+    // Left out of what was sent: nothing else goes.
+    expect(planAfterDone(before, [pending("A"), pending("X")], ["A"])).toEqual([pending("A"), pending("X")]);
+    // The same call again cannot be told from a second copy done: it takes that one too.
+    expect(planAfterDone([pending("X"), pending("A")], [pending("X"), pending("A")], ["A"])).toEqual([pending("X")]);
+  });
+
   it("a refused plan files none of its done steps either", () => {
     const h = idle();
     const t = spawn(h);
@@ -2186,7 +2238,7 @@ describe("progress, plan and updates", () => {
     expect(h.service.setPlan(t.sessionKey, [], [{ step: "D" }]).ok).toBe(true);
   });
 
-  it("a changed plan or an update counts as progress; the same plan again does not", async () => {
+  it("a changed plan or an update counts as progress; the same plan again does not on its own", async () => {
     let n = 0;
     const h = harness({}, (turn, hh) => {
       n += 1;
@@ -2201,14 +2253,32 @@ describe("progress, plan and updates", () => {
     expect(h.store.get(t.id)?.status).toBe("finished");
     expect(h.store.get(t.id)?.updates?.map((u) => u.text)).toEqual(["decided 2", "decided 4", "decided 6"]);
 
+    // Called here directly, with no tool call: the first turn set it
+    // (progress); the next three changed nothing.
     const same = harness({}, (turn, hh) => { hh.service.setPlan(turn.key, [{ step: "stuck" }]); return { ok: true }; });
     same.service.start();
     const u = spawn(same);
     await flush();
-    // The first turn set it (progress); the next three changed nothing. Called
-    // here directly: through the tool, any tool call counts, as it always did.
     expect(same.turns).toHaveLength(4);
     expect(same.store.get(u.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+
+    // Through the tool, the call itself counts as using a tool, as any tool
+    // call does: a task_plan or task_update that changed nothing never trips
+    // the pause.
+    let calls = 0;
+    const other = harness({}, (turn, hh) => {
+      calls += 1;
+      hh.service.setPlan(turn.key, [{ step: "stuck" }]);
+      hh.service.postUpdate(turn.key, "same line");
+      hh.service.noteToolUse(turn.key);
+      if (calls > 5) hh.service.finish(turn.key, "ok");
+      return { ok: true };
+    });
+    other.service.start();
+    const v = spawn(other);
+    await flush();
+    expect(other.turns.length).toBeGreaterThan(4);
+    expect(other.store.get(v.id)?.status).toBe("finished");
   });
 
   it("loads a record written before plans and updates existed, and drops malformed entries", () => {
@@ -2223,13 +2293,16 @@ describe("progress, plan and updates", () => {
     expect(old.plan).toBeUndefined();
     expect(old.doneSteps).toBeUndefined();
     expect(old.updates).toBeUndefined();
-    table.tasks[0].updates = [{ at: 0.5, text: "why", kind: "plan" }, { at: 0.7, text: "odd kind", kind: "nope" }, { at: 1, text: "ok" }, { at: "1", text: "bad time" }, { at: 2 }, null, { at: 3, text: "line\nmore" }, { at: 5, text: " " }];
-    table.tasks[0].doneSteps = [{ at: 4, text: "done", result: 7 }, { at: 6, text: "also", result: "fine" }, "nope"];
+    const events = table.tasks[0].transitions.map((x: { event: string }) => x.event);
+    table.tasks[0].transitions.push(null, { at: 1e20, from: "queued", to: "active", event: "start" }, { at: 9, to: 3, event: "start" });
+    table.tasks[0].updates = [{ at: 1e20, text: "far future" }, { at: -1, text: "before the epoch" }, { at: 0.5, text: "why", kind: "plan" }, { at: 0.7, text: "odd kind", kind: "nope" }, { at: 1, text: "ok" }, { at: "1", text: "bad time" }, { at: 2 }, null, { at: 3, text: "line\nmore" }, { at: 5, text: " " }];
+    table.tasks[0].doneSteps = [{ at: Number.MAX_VALUE, text: "huge" }, { at: 4, text: "done", result: 7 }, { at: 6, text: "also", result: "fine" }, "nope"];
     table.tasks[0].plan = [{ text: "a", status: "in_progress" }, { text: "b", status: "weird" }, { text: 3 }, "c"];
     writeFileSync(path, JSON.stringify(table));
     const loaded = new SubsessionStore(path).get(t.id)!;
     expect(loaded.updates).toEqual([{ at: 0.5, text: "why", kind: "plan" }, { at: 0.7, text: "odd kind" }, { at: 1, text: "ok" }, { at: 3, text: "line" }]);
     expect(loaded.doneSteps).toEqual([{ at: 4, text: "done" }, { at: 6, text: "also", result: "fine" }]);
     expect(loaded.plan).toEqual([{ text: "a", status: "in_progress" }, { text: "b", status: "pending" }]);
+    expect(loaded.transitions.map((x) => x.event)).toEqual(events);
   });
 });

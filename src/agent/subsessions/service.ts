@@ -1139,21 +1139,22 @@ export class SubsessionService {
       const result = d.result ? oneLine(d.result, STEP_RESULT_MAX) : "";
       return text ? [{ text, ...(result ? { result } : {}) }] : [];
     });
-    const finishedTexts = new Set(finished.map((f) => f.text));
-    // A step sent as done and still in `steps` is done: it is not also shown ahead.
-    const next: SubsessionPlanStep[] = steps.flatMap((s): SubsessionPlanStep[] => {
+    const doneTexts = finished.map((f) => f.text);
+    const sent: SubsessionPlanStep[] = steps.flatMap((s): SubsessionPlanStep[] => {
       const text = oneLine(s.step, PLAN_STEP_MAX);
-      return text && !finishedTexts.has(text) ? [{ text, status: s.status === "in_progress" ? "in_progress" : "pending" }] : [];
-    }).slice(0, PLAN_MAX_STEPS);
+      return text ? [{ text, status: s.status === "in_progress" ? "in_progress" : "pending" }] : [];
+    });
     const why = reason ? oneLine(reason, PROGRESS_TEXT_MAX) : "";
     let changed = false;
     let refused = false;
     const at = this.now();
     // Checked inside the lock, against the plan on disk.
     const updated = this.store.update(record.id, (r) => {
+      const next = planAfterDone(r.plan ?? [], sent, doneTexts).slice(0, PLAN_MAX_STEPS);
       const planChanged = JSON.stringify(r.plan ?? []) !== JSON.stringify(next);
-      if (planChanged && !why && planNeedsReason(r.plan ?? [], next, [...finishedTexts])) { refused = true; return; }
-      const ahead = new Set((r.plan ?? []).map((s) => s.text));
+      if (planChanged && !why && planNeedsReason(r.plan ?? [], next, doneTexts)) { refused = true; return; }
+      // How many copies of each text were ahead: two steps may read the same.
+      const ahead = countTexts(r.plan ?? []);
       if (planChanged) {
         changed = true;
         if (next.length > 0) r.plan = next;
@@ -1164,13 +1165,13 @@ export class SubsessionService {
         // (it was added again). One that was not (a retried call, the whole
         // done list sent again) is not filed twice: a new result for it
         // replaces the one it had.
-        const filed = ahead.has(step.text) ? undefined : [...(r.doneSteps ?? [])].reverse().find((d) => d.text === step.text);
+        const filed = (ahead.get(step.text) ?? 0) > 0 ? undefined : [...(r.doneSteps ?? [])].reverse().find((d) => d.text === step.text);
         if (filed) {
           if (step.result !== undefined && filed.result !== step.result) { filed.result = step.result; changed = true; }
           continue;
         }
         (r.doneSteps ??= []).push({ at, ...step });
-        ahead.delete(step.text);
+        ahead.set(step.text, (ahead.get(step.text) ?? 0) - 1);
         changed = true;
       }
       if (planChanged && why) (r.updates ??= []).push({ at, kind: "plan", text: why });
@@ -1268,7 +1269,11 @@ export class SubsessionService {
   // Agent hooks
   // ---------------------------------------------------------------------
 
-  /** A tool call finished on a task session. */
+  /**
+   * A tool call finished on a task session. Every tool call counts as the
+   * task doing something, task_plan and task_update included (even one that
+   * changed nothing): the no-progress pause is for turns that call no tool.
+   */
   noteToolUse(key: string): void {
     const record = this.safeByKey(key);
     if (!record) return;
@@ -2833,6 +2838,57 @@ function truncate(text: string, max: number): string {
 /** What task_plan did: saved, or refused because the change needs a reason (or the task has no record). */
 export type PlanOutcome = { ok: true; record: SubsessionRecord } | { ok: false; error: "no_record" | "reason_required" };
 
+function countTexts(steps: readonly SubsessionPlanStep[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const s of steps) counts.set(s.text, (counts.get(s.text) ?? 0) + 1);
+  return counts;
+}
+
+/**
+ * The steps with ONE copy taken out per name in `done`: the copy in
+ * progress if there is one, else the first. Two steps may read the same
+ * ("run the tests" early and again at the end); finishing one leaves the
+ * other. `limit` caps how many copies of a text go; `prefer` names, per
+ * text, which copies (by their place among that text's copies) to take
+ * first. Also returns the places of the copies it took, the same way.
+ */
+function takeOut(steps: readonly SubsessionPlanStep[], done: readonly string[], limit?: Map<string, number>, prefer?: Map<string, number[]>): { kept: SubsessionPlanStep[]; took: Map<string, number[]> } {
+  const gone = new Set<number>();
+  const took = new Map<string, number[]>();
+  for (const text of done) {
+    const already = took.get(text) ?? [];
+    if (limit && already.length >= (limit.get(text) ?? 0)) continue;
+    const copies = steps.flatMap((s, i) => (s.text === text ? [i] : []));
+    const free = copies.map((at, nth) => ({ at, nth })).filter((c) => !gone.has(c.at));
+    const wanted = prefer?.get(text)?.find((nth) => !already.includes(nth));
+    const pick = free.find((c) => c.nth === wanted) ?? free.find((c) => steps[c.at].status === "in_progress") ?? free[0];
+    if (!pick) continue;
+    gone.add(pick.at);
+    took.set(text, [...already, pick.nth]);
+  }
+  return { kept: steps.filter((_, i) => !gone.has(i)), took };
+}
+
+/**
+ * The plan a task_plan call leaves: the steps it sent, less any it also
+ * marked done. A done step is dropped from what was sent only as often as
+ * it was sent again on top of the copies that stay ahead (the plan before,
+ * less what is done), so another step with the same text is kept. Where it
+ * was sent again, the copy dropped is the one in the same place as the copy
+ * finished in the plan before.
+ *
+ * One call cannot be told from its own retry: with two copies ahead,
+ * `steps: [build, run tests]` + `done: [run tests]` finishes the first;
+ * sent again, it reads as "the second is done too, sent again by mistake".
+ */
+export function planAfterDone(before: readonly SubsessionPlanStep[], sent: readonly SubsessionPlanStep[], done: readonly string[]): SubsessionPlanStep[] {
+  const { kept, took } = takeOut(before, done);
+  const staying = countTexts(kept);
+  const extra = new Map<string, number>();
+  for (const [text, n] of countTexts(sent)) extra.set(text, Math.max(0, n - (staying.get(text) ?? 0)));
+  return takeOut(sent, done, extra, took).kept;
+}
+
 /**
  * Whether replacing `before` with `after` drops, rewords or reorders a step
  * still ahead. A step leaving the plan as one of `done` is not dropped, a
@@ -2840,8 +2896,7 @@ export type PlanOutcome = { ok: true; record: SubsessionRecord } | { ok: false; 
  * step that stayed.
  */
 export function planNeedsReason(before: readonly SubsessionPlanStep[], after: readonly SubsessionPlanStep[], done: readonly string[]): boolean {
-  const finished = new Set(done);
-  const kept = before.map((s) => s.text).filter((text) => !finished.has(text));
+  const kept = takeOut(before, done).kept.map((s) => s.text);
   // The steps that stayed must open the new plan, in their order; anything after them is an addition.
   if (after.length < kept.length) return true;
   return kept.some((text, i) => after[i].text !== text);

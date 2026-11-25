@@ -198,6 +198,8 @@ export class Agent {
   private readonly mirrorInFlight = new Set<string>();
   /** Sessions with a mirror wake turn queued: later rounds ride on it. */
   private readonly mirrorWakeQueued = new Set<string>();
+  /** Sessions with a task-message wake turn queued (subsessions.ownerMessages "via-main"). */
+  private readonly messageWakeQueued = new Set<string>();
   private readonly ownerNotices: OwnerNotices;
   private readonly mcpAuthPrompts: McpAuthPrompts;
   private pendingNotesQueue: PendingNotesQueue;
@@ -548,6 +550,7 @@ export class Agent {
       // A task owned by the owner's DM speaks for the owner alone: its notes
       // never drain into a summoned group's turn on that session.
       queuePendingNote: (key, note) => this.queuePendingNote(key, isDmSessionKey(key) ? markOwnerAudience(note) : note),
+      withdrawPendingNote: (key, note) => { this.pendingNotesQueue.withdrawNote(key, isDmSessionKey(key) ? markOwnerAudience(note) : note); },
       hasPendingNote: (key, predicate) => this.pendingNotesQueue.hasNote(key, predicate),
       persistPendingNotes: (key) => this.pendingNotesQueue.persistNow(key),
       wakeScope: (parentKey, prompt) => {
@@ -575,6 +578,7 @@ export class Agent {
       sessionQuotaPercent: () => readSessionWindowPercent(join(usageDataDir(config.tomoHome), "limits.ndjson")),
       ...(config.subsessions.todos ? { todos: createTodoLink(new TodoStore()) } : {}),
       mirrorWake: (parentKey) => this.mirrorWake(parentKey),
+      messageWake: (parentKey) => this.messageWake(parentKey),
     });
   }
 
@@ -617,6 +621,31 @@ export class Agent {
     });
   }
 
+  /**
+   * A silent turn on the owning session for the messages its tasks handed it
+   * (`subsession-message` notes: task_reply / task_notify / task_ask with
+   * ownerMessages "via-main"). The notes ride in as the turn's pending-notes
+   * prefix; the turn decides whether and how the owner hears them. One
+   * queued at a time per session, and it does not run when another turn has
+   * already read them all. Unlike the mirror wake, not held back at the quota
+   * pause: these are messages for the owner, not a look-along.
+   */
+  private messageWake(parentKey: string): void {
+    if (this.messageWakeQueued.has(parentKey)) return;
+    this.messageWakeQueued.add(parentKey);
+    const prompt = appendToTomoEventBody(formatTomoEvent("subsession-message",
+      "A sub-session handed you something for the owner; it is in a note above. Pass it on as that note says (send_message), hold it for a better moment, or fold it into other news. A question waits for the owner's answer: put it to them, and pass their answer back with task_message. If nothing needs doing, end with NO_REPLY.",
+      { name: "check" }), CONTINUITY_DELIVERY_NOTE);
+    this.enqueueForSession(parentKey, async () => {
+      this.messageWakeQueued.delete(parentKey);
+      if (this.stopping || !this.subsessions?.hasMessageNote(parentKey)) return;
+      await this.processContinuity(prompt, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionMessage"), "background");
+    }).catch((err) => {
+      this.messageWakeQueued.delete(parentKey);
+      log.error({ err, sessionKey: parentKey }, "Sub-session message turn failed in queue");
+    });
+  }
+
   /** A sub-session's prompt and limits; undefined for every other key (see LiveSessionManager). */
   private subsessionContext(key: string): SessionContext["subsession"] {
     if (!isTaskSessionKey(key)) return undefined;
@@ -625,6 +654,7 @@ export class Agent {
       staticPrompt: buildSubsessionPrompt({
         agentName: config.agentName ?? "Tomo",
         ownerName: config.owner?.displayName ?? config.owner?.name ?? "the owner",
+        ownerMessages: config.subsessions.ownerMessages,
       }),
       groupScope: this.taskScopeIsGroup(key),
       maxTurns: config.subsessions.maxTurns,
@@ -1993,7 +2023,8 @@ export class Agent {
       message: (id, text, requestId) => {
         const scope = this.router.ownerSessionKey();
         if (!scope) return { ok: false, reason: "unknown" };
-        const result = service.ownerMessage(scope, id, text, { messageId: `web:${requestId}` });
+        // From the panel: the task's answer stays in the panel (ownerMessages "via-main").
+        const result = service.ownerMessage(scope, id, text, { messageId: `web:${requestId}`, source: "panel" });
         if (!result.ok) return { ok: false, reason: result.reason };
         if (!result.duplicate) log.info({ channel: "web", task: result.record.id, status: result.record.status }, "Owner message handed to a sub-session");
         const task = subsessionView(result.record, scope, Date.now(), working(result.record.sessionKey), live(result.record));

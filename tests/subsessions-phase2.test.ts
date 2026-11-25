@@ -54,7 +54,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, opts: { todos?: Subsession
   };
   h.service = new SubsessionService({
     store: h.store,
-    config: () => ({ ...DEFAULT_SUBSESSIONS, enabled: true, ...cfg }),
+    config: () => ({ ...DEFAULT_SUBSESSIONS, ownerMessages: "direct" as const, enabled: true, ...cfg }),
     runTaskTurn: async (key, prompt) => {
       h.prompts.push(prompt);
       await new Promise((r) => setImmediate(r));

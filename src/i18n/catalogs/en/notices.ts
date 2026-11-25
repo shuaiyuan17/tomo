@@ -45,6 +45,7 @@ export const notices = {
       interruptedAgents: "An interrupted-subagents notice turn",
       subsessionReport: "A sub-session report turn",
       subsessionMirror: "A turn that watched a sub-session conversation",
+      subsessionMessage: "A turn that passed on what a sub-session handed over",
     },
     label: {
       group: "group \"{{title}}\" ({{key}})", groupUntitled: "group {{key}}",

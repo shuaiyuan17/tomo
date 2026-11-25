@@ -74,7 +74,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
     unlinked: [] as string[],
     stopped: [] as string[],
     context: new Map<string, { used: number; estimated: boolean }>(),
-    cfg: { ...DEFAULT_SUBSESSIONS, enabled: true, ...cfg },
+    cfg: { ...DEFAULT_SUBSESSIONS, ownerMessages: "direct", enabled: true, ...cfg },
     onTurn,
     cronUnknown: false,
     noteWriteFails: 0,

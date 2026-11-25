@@ -95,7 +95,7 @@ function harness(onTurn: H["onTurn"] = () => ({ ok: true }), maxRunning = DEFAUL
   const h: H = { prompts: [], sent: [], nextIds: [], inFlight: false, closed: [], notes: [], onTurn } as unknown as H;
   h.service = new SubsessionService({
     store: new SubsessionStore(join(dir, "t.json"), { strictTransitions: true }),
-    config: () => ({ ...DEFAULT_SUBSESSIONS, enabled: true, maxRunning }),
+    config: () => ({ ...DEFAULT_SUBSESSIONS, ownerMessages: "direct" as const, enabled: true, maxRunning }),
     runTaskTurn: async (key, prompt) => {
       h.prompts.push(prompt);
       await new Promise((r) => setImmediate(r));

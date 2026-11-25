@@ -394,7 +394,7 @@ function createSubsessionMcpServer(agent: Agent, taskKey: string): McpSdkServerC
     name: TOMO_INTERNAL_MCP_NAME,
     version: "0.1.0",
     tools: [
-      ...buildTaskSelfTools({ service: () => agent.subsessions, key: taskKey }),
+      ...buildTaskSelfTools({ service: () => agent.subsessions, key: taskKey, ownerMessages: config.subsessions.ownerMessages }),
       // Bound to the task key: a task schedules check-backs on itself only.
       ...buildCronTools(undefined, taskKey),
       // No recall: a task's turns are not recorded in a Tomo transcript (its

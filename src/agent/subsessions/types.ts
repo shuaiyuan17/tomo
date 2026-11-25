@@ -26,6 +26,12 @@ export interface SubsessionSentMessage {
   at: number;
   kind: "notify" | "reply" | "ask" | "fallback";
   text: string;
+  /**
+   * "main": handed to the owning session as a note, which decides whether
+   * and how the owner hears it. "panel": an answer that stayed in the web
+   * task panel the owner wrote from. Unset: sent to the owner's chat as is.
+   */
+  via?: "main" | "panel";
 }
 
 /**
@@ -55,6 +61,11 @@ export interface SubsessionConversationEntry {
   text: string;
   /** Files the owner sent with it (count only: their paths stay out of the mirror). */
   files?: number;
+  /**
+   * The task's words were handed to the owning session as a note: the
+   * mirror does not show them again.
+   */
+  noted?: true;
 }
 
 /** One input owed to the task. */
@@ -70,11 +81,14 @@ export interface SubsessionInput {
   from?: "owner";
   /** For an owner input: what was said, without the event wrapper (quoted back if it is never answered). */
   words?: string;
+  /** "panel": the owner wrote it in the web task panel (an answer to it stays there). */
+  source?: "panel";
 }
 
 /** Append an input: the only way one is added. */
-export function appendInput(record: SubsessionRecord, text: string, origin?: { from: "owner"; words: string }): void {
-  record.pendingInput.push({ seq: record.nextInputSeq, text, ...(origin ? { from: origin.from, words: origin.words } : {}) });
+export function appendInput(record: SubsessionRecord, text: string, origin?: { from: "owner"; words: string; source?: "panel" }): void {
+  record.pendingInput.push({ seq: record.nextInputSeq, text,
+    ...(origin ? { from: origin.from, words: origin.words, ...(origin.source ? { source: origin.source } : {}) } : {}) });
   record.nextInputSeq += 1;
 }
 
@@ -261,6 +275,13 @@ export interface SubsessionRecord {
   restored?: boolean;
   /** Recent messages the task sent out, newest last (at most SENT_KEEP). */
   sent: SubsessionSentMessage[];
+  /**
+   * The question a task_ask handed to the owning session (ownerMessages
+   * "via-main"), kept while the task waits for the owner: the main session
+   * passes it on, and its task_message with the owner's answer ends the
+   * wait. The store drops it on any transition out of waiting(owner).
+   */
+  askViaMain?: { at: number; text: string };
   /** The newest status changes, oldest first. */
   transitions: SubsessionTransition[];
 }

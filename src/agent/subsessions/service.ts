@@ -115,6 +115,11 @@ export interface SubsessionServiceDeps {
   /** A harness notice about a task, to the owning scope's chat. */
   noticeToScope(parentKey: string, text: OwnerText): Promise<void>;
   queuePendingNote(key: string, note: string): boolean;
+  /**
+   * Take back a note just queued whose write failed (the sender is told it
+   * was not handed over, so it must not reach a turn from memory).
+   */
+  withdrawPendingNote?(key: string, note: string): void;
   hasPendingNote(key: string, predicate: (note: string) => boolean): boolean;
   /**
    * Write the session's pending notes (queued and in flight) to disk again.
@@ -162,6 +167,12 @@ export interface SubsessionServiceDeps {
    * unseen conversation as its prefix. Merged while one is already queued.
    */
   mirrorWake?(parentKey: string): void;
+  /**
+   * ownerMessages "via-main": a silent turn on the owning session for the
+   * `subsession-message` notes its tasks handed it. Merged while one is
+   * queued; it runs only if such a note is still unread when it starts.
+   */
+  messageWake?(parentKey: string): void;
 }
 
 export const STOP_TIMEOUT_MS = 30_000;
@@ -239,6 +250,41 @@ interface PlannedTurn {
   start: boolean;
 }
 
+type SpeakKind = "notify" | "reply" | "ask" | "fallback";
+
+/**
+ * How a task's words went: `direct` to the owner's chat, `main` as a note to
+ * the owning session, `panel` kept in the web task panel. `waiting`
+ * (task_ask): the task now waits for the owner.
+ */
+export interface SpeakResult {
+  ok: boolean;
+  error?: string;
+  via?: "direct" | "main" | "panel";
+  waiting?: boolean;
+}
+
+/** Every `subsession-message` note starts its opening tag with this. */
+export const MESSAGE_NOTE_MARKER = '<tomo-event type="subsession-message"';
+
+/**
+ * A task's task_reply / task_notify / task_ask (or the fallback answer) for
+ * the owning session: labeled with the task, quoting the words in full,
+ * with what is expected of the session.
+ */
+function formatMessageNote(record: SubsessionRecord, kind: SpeakKind, body: string, name: string): string {
+  const who = `Sub-session ${record.id} ("${record.title}")`;
+  const head = kind === "ask"
+    ? `${who} asks the owner (task_ask) and waits for their answer:`
+    : kind === "notify"
+      ? `${who} has news for the owner (task_notify):`
+      : `${who} answers the owner's message to it (${kind === "fallback" ? "its turn's text, no task_reply" : "task_reply"}):`;
+  const tail = kind === "ask"
+    ? `Put this question to the owner (keep its options; send_message, and its MEDIA: lines if any). Answer it for them only if they already did. When they answer, pass their answer on with task_message ${record.id}: that ends the wait. task_status ${record.id} shows the question while it waits.`
+    : `Decide whether, when and how the owner hears it (send_message, in your own words or as is; its MEDIA: lines if a file should go with it). Nothing else delivers it.`;
+  return formatTomoEvent("subsession-message", [head, body, "", tail].join("\n"), { name });
+}
+
 /**
  * The sub-session state machine at work: spawn, the scheduler, the per-task
  * driver that runs turns and decides what follows each one, the task's own
@@ -268,6 +314,8 @@ export class SubsessionService {
   /** Which turn is in flight, per task: a serial, so two turns that carry the same seq still differ. */
   private readonly inflightTurn = new Map<string, number>();
   private turnSerial = 0;
+  /** Names `subsession-message` notes apart within one millisecond. */
+  private messageSerial = 0;
   /**
    * task_finish refused for unread input, per task (runtime only): in how
    * many turns in a row, the last refused turn, and how much was unread then.
@@ -475,7 +523,9 @@ export class SubsessionService {
   /** The owning session passes something on. */
   relay(id: string, text: string): TransitionOutcome {
     if (!this.available()) return { ok: false, from: null };
-    return this.deliverInput(id, "relay", formatRelayEvent(text), text);
+    // A task waiting on a question it handed to the main session: this relay
+    // is the owner's answer, passed on (and it ends the wait).
+    return this.deliverInput(id, "relay", (r) => formatRelayEvent(text, r.askViaMain?.text), text);
   }
 
   /**
@@ -484,7 +534,7 @@ export class SubsessionService {
    * another scope is unknown here. `messageId` dedups a replayed delivery.
    * The message is on disk (the task's pendingInput) when this returns ok.
    */
-  ownerMessage(scope: string, id: string, text: string, opts: { messageId?: string; files?: string[] } = {}): OwnerMessageResult {
+  ownerMessage(scope: string, id: string, text: string, opts: { messageId?: string; files?: string[]; source?: "panel" } = {}): OwnerMessageResult {
     // Not before restart recovery is done (the caller checks available() too).
     if (!this.available()) return { ok: false, reason: "unreadable" };
     let record: SubsessionRecord | undefined;
@@ -498,7 +548,7 @@ export class SubsessionService {
     if (opts.messageId && record.ownerMessageIds.includes(opts.messageId)) return { ok: true, record, duplicate: true };
     let outcome: TransitionOutcome;
     try {
-      outcome = this.deliverInput(id, "owner_message", formatOwnerMessageEvent(text, opts.files), ownerWords(text, opts.files), (r) => {
+      outcome = this.deliverInput(id, "owner_message", formatOwnerMessageEvent(text, opts.files), ownerWords(text, opts.files), opts.source, (r) => {
         if (opts.messageId) r.ownerMessageIds.push(opts.messageId);
         pushConversation(r, { at: this.now(), from: "owner", kind: "message", text: truncate(text.trim(), CONVERSATION_TEXT_MAX),
           ...(opts.files && opts.files.length > 0 ? { files: opts.files.length } : {}) });
@@ -571,12 +621,12 @@ export class SubsessionService {
   // Task side (task_reply / task_notify / task_ask / task_plan / task_update / task_checkpoint / task_finish / task_reopen)
   // ---------------------------------------------------------------------
 
-  async notify(key: string, text: string): Promise<{ ok: boolean; error?: string }> {
+  async notify(key: string, text: string): Promise<SpeakResult> {
     return this.speak(key, "notify", text);
   }
 
   /** task_reply: answer the owner's message. */
-  async reply(key: string, text: string): Promise<{ ok: boolean; error?: string }> {
+  async reply(key: string, text: string): Promise<SpeakResult> {
     return this.speak(key, "reply", text);
   }
 
@@ -585,7 +635,7 @@ export class SubsessionService {
    * task waits for the owner (nothing autonomous wakes it). A send that
    * failed leaves the status as it was, so the task can try again.
    */
-  async ask(key: string, question: string): Promise<{ ok: boolean; error?: string }> {
+  async ask(key: string, question: string): Promise<SpeakResult> {
     const record = this.store.byKey(key);
     if (!record) return { ok: false, error: "No task record for this session." };
     if (record.status !== "active" && record.status !== "waiting") {
@@ -593,29 +643,38 @@ export class SubsessionService {
     }
     const sent = await this.speak(key, "ask", question);
     if (!sent.ok) return sent;
+    const viaMain = sent.via === "main";
     // Input this turn does not carry — the owner's answer that arrived while
     // the question was being sent, or anything that was already waiting
     // before the ask — is pending, and its kick() found this turn running.
     // Waiting now would strand it (nothing autonomous wakes waiting(owner)),
     // so the guard, judged under the lock, keeps the task as it is and that
     // input is its next turn.
+    const asked = this.now();
     const outcome = this.transition(record.id, "ask", {
-      reason: `asked the owner: ${truncate(question.trim(), 200)}`,
+      reason: `asked the owner${viaMain ? " (through the main session)" : ""}: ${truncate(question.trim(), 200)}`,
       guard: (r) => (r.pendingInput.some((i) => i.seq > (this.inflightThrough.get(r.id) ?? 0))
         ? "input is pending that this turn does not carry" : undefined),
+      // The main session's task_message with the answer is marked as that answer.
+      ...(viaMain ? { patch: (r: SubsessionRecord) => { r.askViaMain = { at: asked, text: question.trim() }; } } : {}),
     });
-    if (!outcome.ok) return { ok: true };
+    if (!outcome.ok) return { ...sent, waiting: false };
     this.continueOwed.delete(record.id);
     this.schedule();
-    return { ok: true };
+    return { ...sent, waiting: true };
   }
 
-  private async speak(key: string, kind: "notify" | "reply" | "ask" | "fallback", text: string): Promise<{ ok: boolean; error?: string }> {
+  private async speak(key: string, kind: SpeakKind, text: string): Promise<SpeakResult> {
     const record = this.store.byKey(key);
     if (!record) return { ok: false, error: "No task record for this session." };
     if (TERMINAL_STATUSES.has(record.status)) return { ok: false, error: `This task is ${record.status}; nothing more is sent.` };
     const body = text.trim();
     if (!body) return { ok: false, error: "text is empty" };
+    if (this.deps.config().ownerMessages !== "direct") {
+      // An answer to the owner's message from the web task panel stays there.
+      const via = (kind === "reply" || kind === "fallback") && this.answersPanel(record) ? "panel" : "main";
+      return via === "panel" ? this.keepInPanel(record, kind, body) : this.handToMain(record, kind, body);
+    }
     const prefix = taskPrefix(record);
     const work = (async () => {
       const result = await this.sendOut(record, `${prefix} ${body}`, prefix);
@@ -648,11 +707,109 @@ export class SubsessionService {
     this.inFlightSends.set(record.parentKey, sends);
     try {
       const result = await work;
-      return { ok: result.ok, ...(result.error ? { error: result.error } : {}) };
+      return { ok: result.ok, ...(result.error ? { error: result.error } : {}), ...(result.ok ? { via: "direct" as const } : {}) };
     } finally {
       sends.delete(work);
       this.sendOwners.delete(work);
       if (sends.size === 0) this.inFlightSends.delete(record.parentKey);
+    }
+  }
+
+  /**
+   * Is the newest owner input of the turn in flight a message the owner
+   * wrote in the web task panel? Then the task's answer stays in the panel.
+   */
+  private answersPanel(record: SubsessionRecord): boolean {
+    const through = this.inflightThrough.get(record.id);
+    if (through === undefined) return false;
+    let current: SubsessionRecord | undefined;
+    try { current = this.store.get(record.id); } catch { current = record; }
+    const owner = (current ?? record).pendingInput.filter((i) => i.seq <= through && i.from === "owner");
+    return owner.at(-1)?.source === "panel";
+  }
+
+  /**
+   * ownerMessages "via-main", an answer to a panel message: no send. It is
+   * recorded in the conversation, which the panel shows, and which the
+   * owning session sees through the mirror like any exchange the owner had
+   * with the task. A record that cannot be written leaves the answer
+   * undelivered (the owner's message stays owed).
+   */
+  private keepInPanel(record: SubsessionRecord, kind: SpeakKind, body: string): SpeakResult {
+    const at = this.now();
+    let written = false;
+    try {
+      written = !!this.store.update(record.id, (r) => {
+        r.sent.push({ at, kind, text: body, via: "panel" });
+        pushConversation(r, { at, from: "task", kind, text: truncate(body, CONVERSATION_TEXT_MAX) });
+      });
+    } catch (err) {
+      log.error({ err, id: record.id }, "Could not record a sub-session's answer in the web panel");
+    }
+    this.markDelivery(record.id, body, written);
+    if (!written) return { ok: false, error: "the answer could not be saved for the web panel; try again." };
+    if (kind !== "fallback") this.spoke.add(record.id);
+    // The round's end wakes the owning session to see it (mirrorAfterRound), as for any panel message.
+    return { ok: true, via: "panel" };
+  }
+
+  /**
+   * ownerMessages "via-main": the task's words go to the owning session as
+   * a PINNED `subsession-message` note (never dropped by the note cap, read
+   * by its next turn whatever wakes it), plus a merged silent wake there.
+   * The task is told they were handed over only once the note is on disk; a
+   * note whose write failed is taken back (not left to reach a turn from
+   * memory), and the task is told to try again. The owning scope is the
+   * record's parentKey: a group-owned task's words go to that group's
+   * session, never to the owner's DM.
+   */
+  private handToMain(record: SubsessionRecord, kind: SpeakKind, body: string): SpeakResult {
+    const at = this.now();
+    const note = formatMessageNote(record, kind, body, `${record.id}:${at}-${++this.messageSerial}`);
+    let saved = false;
+    try {
+      saved = this.deps.queuePendingNote(record.parentKey, note);
+    } catch (err) {
+      log.error({ err, id: record.id }, "Could not queue a sub-session's message note");
+    }
+    if (!saved) {
+      this.safely(() => this.deps.withdrawPendingNote?.(record.parentKey, note), "withdraw unsaved message note");
+      this.markDelivery(record.id, body, false);
+      return { ok: false, error: "it could not be handed to the main session (saving it failed); try again." };
+    }
+    this.markDelivery(record.id, body, true);
+    if (kind !== "fallback") this.spoke.add(record.id);
+    // The note is the durable copy; the record's log is for task_status and
+    // the panel (marked so the mirror does not show it twice).
+    this.safely(() => this.store.update(record.id, (r) => {
+      r.sent.push({ at, kind, text: body, via: "main" });
+      pushConversation(r, { at, from: "task", kind, text: truncate(body, CONVERSATION_TEXT_MAX), noted: true });
+    }), "record a message handed to the main session");
+    this.wakeForMessages(record.parentKey);
+    return { ok: true, via: "main" };
+  }
+
+  /** A silent turn on the owning session for its unread `subsession-message` notes. */
+  private wakeForMessages(parentKey: string): void {
+    if (!this.deps.messageWake) return;
+    this.outward(() => this.deps.messageWake!(parentKey));
+  }
+
+  /** Is a `subsession-message` note still unread (queued or in flight) on the session? */
+  hasMessageNote(parentKey: string): boolean {
+    return this.deps.hasPendingNote(parentKey, (n) => n.includes(MESSAGE_NOTE_MARKER));
+  }
+
+  /** Track a message that did or did not reach its destination (see sendOut). */
+  private markDelivery(id: string, words: string, delivered: boolean): void {
+    const failed = this.undelivered.get(id);
+    if (delivered) {
+      failed?.delete(words);
+      if (failed?.size === 0) this.undelivered.delete(id);
+    } else if (failed) {
+      failed.add(words);
+    } else {
+      this.undelivered.set(id, new Set([words]));
     }
   }
 
@@ -676,15 +833,7 @@ export class SubsessionService {
     // copies the quote back must not send the prefix twice.
     const prefix = `${taskPrefix(record)} `;
     const words = text.startsWith(prefix) ? text.slice(prefix.length) : text;
-    const failed = this.undelivered.get(record.id);
-    if (result.ok) {
-      failed?.delete(words);
-      if (failed?.size === 0) this.undelivered.delete(record.id);
-    } else if (failed) {
-      failed.add(words);
-    } else {
-      this.undelivered.set(record.id, new Set([words]));
-    }
+    this.markDelivery(record.id, words, result.ok);
     return result;
   }
 
@@ -1251,6 +1400,12 @@ export class SubsessionService {
         if (!table.untrusted) this.store.markUntrusted(startState === "recovered" ? "recovered" : "lost");
       }
     }
+    // Messages a task handed to its owning session whose note is still
+    // unread: the wake queued for them lived in memory; the note is on disk,
+    // so the wake is owed again.
+    for (const parentKey of new Set(this.store.list().map((t) => t.parentKey))) {
+      this.safely(() => { if (this.hasMessageNote(parentKey)) this.wakeForMessages(parentKey); }, "wake for unread task messages");
+    }
     for (const task of this.store.list()) {
       if ((TERMINAL_STATUSES.has(task.status) || task.status === "finished") && this.mayCleanUp(task)) {
         // Unknown (cron unreadable) is tried too; removing throws then, and is logged.
@@ -1502,8 +1657,9 @@ export class SubsessionService {
   private deliverInput(
     id: string,
     event: Extract<SubsessionEvent, "relay" | "owner_message">,
-    prompt: string,
+    prompt: string | ((record: SubsessionRecord) => string),
     words: string,
+    source?: "panel",
     extra?: (record: SubsessionRecord) => void,
   ): TransitionOutcome {
     const now = this.now();
@@ -1511,7 +1667,7 @@ export class SubsessionService {
       reason: event === "relay" ? "a message from the main session" : "a message from the owner",
       guard: inputQueueFull,
       patch: (r) => {
-        appendInput(r, prompt, { from: "owner", words });
+        appendInput(r, typeof prompt === "string" ? prompt : prompt(r), { from: "owner", words, ...(source ? { source } : {}) });
         // The owner's word: the wall-clock cap counts from here again.
         r.activeAtOwnerInputMs = activeTotalMs(r, now);
         extra?.(r);
@@ -1919,7 +2075,8 @@ export class SubsessionService {
     const shown: Array<{ record: SubsessionRecord; entries: SubsessionConversationEntry[] }> = [];
     const upTo: Record<string, number> = {};
     for (const record of tasks) {
-      const entries = record.conversation.filter((e) => e.seq > record.mirrorSeenSeq);
+      // What the task handed to the session as a note it has read there.
+      const entries = record.conversation.filter((e) => e.seq > record.mirrorSeenSeq && !e.noted);
       if (entries.length === 0) continue;
       shown.push({ record, entries });
       upTo[record.id] = entries.at(-1)!.seq;
@@ -1940,7 +2097,7 @@ export class SubsessionService {
   /** Does the scope have conversation it has not seen? */
   hasUnseenMirror(scope: string): boolean {
     try {
-      return this.store.list().some((t) => t.parentKey === scope && t.conversation.some((e) => e.seq > t.mirrorSeenSeq));
+      return this.store.list().some((t) => t.parentKey === scope && t.conversation.some((e) => e.seq > t.mirrorSeenSeq && !e.noted));
     } catch {
       return false;
     }

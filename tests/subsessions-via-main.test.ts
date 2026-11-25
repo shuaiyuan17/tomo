@@ -835,4 +835,31 @@ describe("via-main: nothing lost, nothing twice", () => {
     h3.service.start();
     expect(h3.store.get(t.id)).toBeUndefined();
   });
+
+  it("a retry that answers the earlier and the newer message alike hands the newer answer over too", async () => {
+    let n = 0;
+    let release!: () => void;
+    const h = harness({}, async (key, prompt) => {
+      if (!prompt.includes("subsession-owner-message")) return { ok: true };
+      n += 1;
+      if (n === 1) {
+        await h.service.reply(key, "Yes");
+        await new Promise<void>((r) => { release = r; });
+        return { ok: false, error: "boom" };
+      }
+      await h.service.reply(key, "Yes");
+      await h.service.reply(key, "Yes");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "A?");
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "B?");
+    release();
+    await flush();
+    expect(n).toBe(2);
+    expect(messageNotes(h, "dm:owner").filter((x) => x.includes("Yes"))).toHaveLength(2);
+  });
 });

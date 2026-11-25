@@ -368,6 +368,8 @@ export class SubsessionService {
   private readonly inflightRetry = new Set<string>();
   /** Tasks whose last turn did not complete (its start or "continue" runs again, with no input to mark it). */
   private readonly lastTurnFailed = new Set<string>();
+  /** Per task, the message notes the turn in flight already wrote or matched (see handToMain). */
+  private readonly notesUsed = new Map<string, Set<string>>();
   /** Per task, the panel answers the turn in flight has already matched as repeats (by their time). */
   private readonly panelRepeatsUsed = new Map<string, Set<number>>();
   private turnSerial = 0;
@@ -884,14 +886,23 @@ export class SubsessionService {
     const current = this.safeGet(record.id) ?? record;
     const first = current.pendingInput.at(0)?.seq ?? Infinity;
     const seenThrough = Math.max(current.seenThrough, this.unsavedSeen.get(record.id) ?? 0);
+    // Each unread note stands for one message per turn: the same words said
+    // twice in a turn (two messages answered alike) are two.
+    const used = this.notesUsed.get(record.id) ?? new Set<string>();
+    if (this.inflightTurn.has(record.id)) this.notesUsed.set(record.id, used);
+    const exact = (n: string) => messageNoteNameOf(n) === name;
+    let matched: string | undefined;
     const own = (n: string) => {
       const other = messageNoteNameOf(n);
-      if (other === name) return true;
-      const parsed = other ? parseMessageNoteName(other) : undefined;
-      return !!parsed && parsed.id === record.id && parsed.kind === kind && parsed.digest === name.slice(name.lastIndexOf(":") + 1)
-        && parsed.through >= first && parsed.through <= seenThrough;
+      if (!other || used.has(other)) return false;
+      const parsed = other === name ? undefined : parseMessageNoteName(other);
+      const same = other === name || (!!parsed && parsed.id === record.id && parsed.kind === kind && parsed.digest === name.slice(name.lastIndexOf(":") + 1)
+        && parsed.through >= first && parsed.through <= seenThrough);
+      if (same) matched = other;
+      return same;
     };
     const already = this.deps.hasPendingNote(record.parentKey, own);
+    used.add(matched ?? name);
     if (!already) {
       const note = formatMessageNote(record, kind, body, name, this.inflightRetry.has(record.id));
       let saved = false;
@@ -901,7 +912,8 @@ export class SubsessionService {
         log.error({ err, id: record.id }, "Could not queue a sub-session's message note");
       }
       if (!saved) {
-        this.withdrawMessageNote(record.parentKey, own);
+        used.delete(name);
+        this.withdrawMessageNote(record.parentKey, exact);
         this.markDelivery(record.id, body, false);
         return { ok: false, error: "it could not be handed to the main session (saving it failed); try again." };
       }
@@ -913,7 +925,7 @@ export class SubsessionService {
       } finally {
         // A wait that was refused or threw: the question does not stand
         // (a note an earlier, identical ask still holds is left alone).
-        if (!committed && !already) this.withdrawMessageNote(record.parentKey, own);
+        if (!committed && !already) this.withdrawMessageNote(record.parentKey, exact);
       }
       if (!committed) return { ok: true, via: "main", withdrawn: true };
     }
@@ -1945,6 +1957,7 @@ export class SubsessionService {
         this.inflightThrough.delete(id);
         this.inflightRetry.delete(id);
         this.panelRepeatsUsed.delete(id);
+        this.notesUsed.delete(id);
         this.inflightTurn.delete(id);
         // Refused turns count only in a row: a turn with no refusal ends the streak.
         if (this.finishRefusals.get(id)?.turn !== serial) this.finishRefusals.delete(id);

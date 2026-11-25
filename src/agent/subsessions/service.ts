@@ -362,6 +362,8 @@ export class SubsessionService {
   private readonly inflightRetry = new Set<string>();
   /** Tasks whose last turn did not complete (its start or "continue" runs again, with no input to mark it). */
   private readonly lastTurnFailed = new Set<string>();
+  /** Per task, the panel answers the turn in flight has already matched as repeats (by their time). */
+  private readonly panelRepeatsUsed = new Map<string, Set<number>>();
   private turnSerial = 0;
   /**
    * task_finish refused for unread input, per task (runtime only): in how
@@ -815,9 +817,21 @@ export class SubsessionService {
     let written = false;
     try {
       written = !!this.store.update(record.id, (r) => {
-        // A retried turn's same answer to the same input is already there.
+        // A retried turn's same answer is already there: one an earlier
+        // attempt wrote while carrying inputs this turn carries again (they
+        // are the ones that may have been seen), each used up once per turn,
+        // so the same words answering a newer message still show.
         const text = truncate(body, CONVERSATION_TEXT_MAX);
-        if (r.sent.some((m) => m.via === "panel" && m.answers === through && m.kind === kind && m.text === body)) return;
+        const first = r.pendingInput.at(0)?.seq ?? Infinity;
+        const seenThrough = Math.max(r.seenThrough, this.unsavedSeen.get(r.id) ?? 0);
+        const used = this.panelRepeatsUsed.get(r.id) ?? new Set<number>();
+        const repeat = r.sent.find((m) => m.via === "panel" && m.kind === kind && m.text === body && m.answers !== undefined
+          && m.answers >= first && m.answers <= seenThrough && !used.has(m.at));
+        if (repeat) {
+          used.add(repeat.at);
+          this.panelRepeatsUsed.set(r.id, used);
+          return;
+        }
         r.sent.push({ at, kind, text: body, via: "panel", answers: through });
         pushConversation(r, { at, from: "task", kind, text });
       });
@@ -1906,6 +1920,7 @@ export class SubsessionService {
         clearInterval(heartbeat);
         this.inflightThrough.delete(id);
         this.inflightRetry.delete(id);
+        this.panelRepeatsUsed.delete(id);
         this.inflightTurn.delete(id);
         // Refused turns count only in a row: a turn with no refusal ends the streak.
         if (this.finishRefusals.get(id)?.turn !== serial) this.finishRefusals.delete(id);
@@ -2073,6 +2088,8 @@ export class SubsessionService {
       // keeps failing does not spin the task. A "continue" owed is still owed.
       log.error({ err, id }, "Could not record a sub-session turn's result; its inputs stay and go out again");
       if (turn.throughSeq > 0) this.unsavedSeen.set(id, Math.max(this.unsavedSeen.get(id) ?? 0, turn.throughSeq));
+      // Run again with nothing to mark it (a start, a continue): still a retry.
+      this.lastTurnFailed.add(id);
       if (lost) this.answerLost.set(id, failedTexts);
       this.retryAfterSettleFailure(id);
       return false;

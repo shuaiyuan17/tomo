@@ -1,9 +1,9 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
-import { MESSAGE_NOTE_MARKER, SubsessionService, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
+import { MESSAGE_NOTE_MARKER, SETTLE_RETRY_MS, SubsessionService, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { buildSubsessionPrompt } from "../src/agent/subsessions/prompt.js";
 
@@ -678,6 +678,72 @@ describe("via-main: nothing lost, nothing twice", () => {
       n += 1;
       // The second message lands while the first is being answered.
       if (n === 1) await new Promise<void>((r) => { release = r; });
+      await h.service.reply(key, "done");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "A?", { source: "panel" });
+    await flush();
+    h.service.ownerMessage("dm:owner", t.id, "B?", { source: "panel" });
+    release();
+    await flush();
+    expect(n).toBe(2);
+    expect(h.store.get(t.id)!.conversation.filter((e) => e.from === "task" && e.text === "done")).toHaveLength(2);
+  });
+
+  it("a start whose result could not be written runs again, and what it hands over is marked as a possible repeat", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const settle = async () => { for (let i = 0; i < 300; i++) await new Promise((r) => setImmediate(r)); };
+    try {
+      let n = 0;
+      let failNext = false;
+      const seen: string[] = [];
+      const h = harness({}, async (key) => {
+        n += 1;
+        if (n > 2) return { ok: true };
+        await h.service.notify(key, "PR opened");
+        seen.push(messageNotes(h, "dm:owner").at(-1)!);
+        h.notes.set("dm:owner", []);
+        // The next write is this turn's result: it fails.
+        if (n === 1) failNext = true;
+        return { ok: true };
+      });
+      const realUpdate = h.store.update.bind(h.store);
+      h.store.update = ((...args: Parameters<typeof realUpdate>) => {
+        if (failNext) { failNext = false; throw new Error("disk full"); }
+        return realUpdate(...args);
+      }) as typeof realUpdate;
+      h.service.start();
+      spawn(h);
+      await settle();
+      expect(seen).toHaveLength(1);
+      vi.advanceTimersByTime(SETTLE_RETRY_MS);
+      await settle();
+      expect(seen).toHaveLength(2);
+      expect(seen[0]).not.toContain("may repeat");
+      expect(seen[1]).toContain("may repeat");
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a retry carrying a newer panel message too shows the repeated answer once and the new answer", async () => {
+    let n = 0;
+    let release!: () => void;
+    const h = harness({}, async (key, prompt) => {
+      if (!prompt.includes("subsession-owner-message")) return { ok: true };
+      n += 1;
+      if (n === 1) {
+        await h.service.reply(key, "done");
+        // B lands while A's turn runs; then A's turn fails.
+        await new Promise<void>((r) => { release = r; });
+        return { ok: false, error: "boom" };
+      }
+      // The retry carries A and B, and answers both the same way.
+      await h.service.reply(key, "done");
       await h.service.reply(key, "done");
       return { ok: true };
     });

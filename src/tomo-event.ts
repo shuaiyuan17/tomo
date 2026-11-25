@@ -60,6 +60,8 @@ export type TomoEventType =
   | "subsession-report"   // a sub-session finished; told to its owning session (name = task id#report seq, e.g. s3#1)
   | "subsession-unanswered" // a finished sub-session gave up on what it was sent; the messages, to its owning session (name = task id)
   | "subsession-activity" // something a sub-session said to the owner, told to its owning session (name = task id)
+  | "subsession-notice"  // a sub-session's task_notify, handed to its owning session to pass on or hold (name = task id@ms)
+  | "subsession-handoff" // the silent turn that wakes the owning session for its tasks' notices and questions (name = check)
   | "subsession-handback" // a failed sub-session's unanswered messages from the owner, in full (name = task id)
   | "note";            // bare harness aside with no producer of its own
                        //   (appendToTomoEventBody's fallback wrapper)

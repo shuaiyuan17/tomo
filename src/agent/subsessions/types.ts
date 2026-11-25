@@ -26,6 +26,25 @@ export interface SubsessionSentMessage {
   at: number;
   kind: "notify" | "reply" | "ask" | "fallback";
   text: string;
+  /**
+   * "main": handed to the owning session, which decides whether and when the
+   * owner hears it (task_notify). Unset: sent to the owner's chat as is.
+   */
+  via?: "main";
+}
+
+/**
+ * A task_ask question waiting to reach the owner. The task is in
+ * waiting(owner) while it exists (the store drops it on any transition that
+ * leaves that state). The owning session forwards it word for word
+ * (task_forward_question); if it does not, the harness does.
+ */
+export interface SubsessionPendingAsk {
+  /** When the task asked; also names this question (a later ask replaces it). */
+  at: number;
+  text: string;
+  /** Set once the question went out to the owner's chat. */
+  forwardedAt?: number;
 }
 
 /**
@@ -261,6 +280,8 @@ export interface SubsessionRecord {
   restored?: boolean;
   /** Recent messages the task sent out, newest last (at most SENT_KEEP). */
   sent: SubsessionSentMessage[];
+  /** The question the task is waiting on the owner for, while it waits (see SubsessionPendingAsk). */
+  pendingAsk?: SubsessionPendingAsk;
   /** The newest status changes, oldest first. */
   transitions: SubsessionTransition[];
 }

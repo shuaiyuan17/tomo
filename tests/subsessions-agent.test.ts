@@ -105,7 +105,7 @@ describe("sub-sessions through the Agent", () => {
     if (!spawned.ok) throw new Error(spawned.error);
     await waitFor(() => expect(taskPrompts("task:s1")).toHaveLength(1));
     // The real task-send path: the channel send, then the direct-send note on dm:alex.
-    expect(await agent.subsessions!.notify("task:s1", "the private deploy plan")).toMatchObject({ ok: true });
+    expect(await agent.subsessions!.reply("task:s1", "the private deploy plan")).toMatchObject({ ok: true });
     expect(channel.delivered.some((d) => d.text.includes("the private deploy plan"))).toBe(true);
 
     mockSdk.responseFn = () => "NO_REPLY";
@@ -185,13 +185,52 @@ describe("sub-sessions through the Agent", () => {
       await drainQueue(agent);
       const before = ownerPrompts().length;
       agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
-      expect((await agent.subsessions!.notify("task:s1", "Which branch?")).ok).toBe(true);
+      expect((await agent.subsessions!.reply("task:s1", "Which branch?")).ok).toBe(true);
       const asked = channel.sent.find((m) => m.text.startsWith("[s1 · Fix it] Which branch?"));
       expect(asked).toBeDefined();
       const id = agent.subsessions!.get("s1")!.replyMap.at(-1)!.messageId;
       await channel.simulateMessage(owner("main", { replyToId: id }));
       await waitFor(() => expect(agent.subsessions!.get("s1")!.pendingInput.map((i) => i.text).join("\n")).toContain("main"));
       expect(ownerPrompts()).toHaveLength(before);
+      await agent.stop();
+    });
+
+    it("task_ask goes through a hand-off turn on the owner's session; the question reaches the chat word for word and the reply routes back", async () => {
+      const { agent, channel } = await boot(true, new IdChannel("telegram"));
+      mockSdk.responseFn = (text) => (text.includes("subsession-start") ? new Promise(() => {}) : "NO_REPLY");
+      await channel.simulateMessage(owner("hi"));
+      await drainQueue(agent);
+      agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
+      await waitFor(() => expect(taskPrompts("task:s1")).toHaveLength(1));
+      expect(await agent.subsessions!.ask("task:s1", "Which branch?\n- main\n- dev")).toEqual({ ok: true, via: "main" });
+      // The owner's session sees the question first, quoted as the task's words.
+      await waitFor(() => expect(ownerPrompts().some((p) => p.text.includes('<tomo-event type="subsession-handoff"'))).toBe(true));
+      const turn = ownerPrompts().find((p) => p.text.includes("subsession-handoff"))!.text;
+      expect(turn).toContain("> Which branch?\n> - main\n> - dev");
+      // That turn forwarded nothing (NO_REPLY): the harness forwards it, verbatim, once.
+      await waitFor(() => expect(channel.sent.filter((m) => m.text.startsWith("[s1 · Fix it]"))).toHaveLength(1));
+      expect(channel.sent.find((m) => m.text.startsWith("[s1 · Fix it]"))!.text).toBe("[s1 · Fix it] Which branch?\n- main\n- dev");
+      const id = agent.subsessions!.get("s1")!.replyMap.at(-1)!.messageId;
+      const before = ownerPrompts().length;
+      await channel.simulateMessage(owner("dev", { replyToId: id }));
+      await waitFor(() => expect(agent.subsessions!.get("s1")!.pendingInput.map((i) => i.text).join("\n")).toContain("dev"));
+      expect(ownerPrompts()).toHaveLength(before);
+      await agent.stop();
+    });
+
+    it("task_notify reaches the owner's session as a note on a hand-off turn, not the owner's chat", async () => {
+      const { agent, channel } = await boot(true, new IdChannel("telegram"));
+      mockSdk.responseFn = (text) => (text.includes("subsession-start") ? new Promise(() => {}) : "NO_REPLY");
+      await channel.simulateMessage(owner("hi"));
+      await drainQueue(agent);
+      agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
+      await waitFor(() => expect(taskPrompts("task:s1")).toHaveLength(1));
+      expect((await agent.subsessions!.notify("task:s1", "CI is green.")).ok).toBe(true);
+      await waitFor(() => expect(ownerPrompts().some((p) => p.text.includes("subsession-handoff"))).toBe(true));
+      const turn = ownerPrompts().find((p) => p.text.includes("subsession-handoff"))!.text;
+      expect(turn).toContain('<tomo-event type="subsession-notice"');
+      expect(turn).toContain("CI is green.");
+      expect(channel.sent.some((m) => m.text.includes("CI is green."))).toBe(false);
       await agent.stop();
     });
 
@@ -221,7 +260,7 @@ describe("sub-sessions through the Agent", () => {
       await drainQueue(agent);
       const before = ownerPrompts().length;
       agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
-      const notifying = agent.subsessions!.notify("task:s1", "Which branch?");
+      const notifying = agent.subsessions!.reply("task:s1", "Which branch?");
       await waitFor(() => expect(channel.sent.some((m) => m.text.startsWith("[s1 · Fix it] Which branch?"))).toBe(true));
       const inbox = (agent as unknown as { inbox: { pending(): Array<{ message: { id: string } }> } }).inbox;
       // The id the provider will report for that message (IdChannel counts up).
@@ -265,7 +304,7 @@ describe("sub-sessions through the Agent", () => {
         return "owner reply";
       };
       agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
-      const notifying = agent.subsessions!.notify("task:s1", "Which branch?");
+      const notifying = agent.subsessions!.reply("task:s1", "Which branch?");
       await waitFor(() => expect(channel.sent.some((m) => m.text.startsWith("[s1 · Fix it] Which branch?"))).toBe(true));
       const replying = channel.simulateMessage(owner("main", { id: "r2", replyToId: "provider-7" }));
       await new Promise((r) => setTimeout(r, 20));
@@ -340,12 +379,12 @@ describe("sub-sessions through the Agent", () => {
       await channel.simulateMessage(owner("hi"));
       await drainQueue(agent);
       agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
-      expect((await agent.subsessions!.notify("task:s1", "Which branch?")).ok).toBe(true);
+      expect((await agent.subsessions!.reply("task:s1", "Which branch?")).ok).toBe(true);
       await channel.simulateMessage(owner("what's new?"));
       await waitFor(() => expect(ownerPrompts().at(-1)?.text).toContain("what's new?"));
       const seen = ownerPrompts().at(-1)!.text;
       expect(seen).toContain('<tomo-event type="subsession-activity" name="mirror"');
-      expect(seen).toContain("- s1 (notify): Which branch?");
+      expect(seen).toContain("- s1 (reply): Which branch?");
       expect(seen).not.toContain('type="direct-send"');
       await waitFor(() => expect(agent.subsessions!.hasUnseenMirror("dm:alex")).toBe(false));
       await channel.simulateMessage(owner("and now?"));

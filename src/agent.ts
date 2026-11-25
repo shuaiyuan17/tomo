@@ -198,6 +198,7 @@ export class Agent {
   private readonly mirrorInFlight = new Set<string>();
   /** Sessions with a mirror wake turn queued: later rounds ride on it. */
   private readonly mirrorWakeQueued = new Set<string>();
+  private readonly handOffWakeQueued = new Set<string>();
   private readonly ownerNotices: OwnerNotices;
   private readonly mcpAuthPrompts: McpAuthPrompts;
   private pendingNotesQueue: PendingNotesQueue;
@@ -572,6 +573,7 @@ export class Agent {
       sessionQuotaPercent: () => readSessionWindowPercent(join(usageDataDir(config.tomoHome), "limits.ndjson")),
       ...(config.subsessions.todos ? { todos: createTodoLink(new TodoStore()) } : {}),
       mirrorWake: (parentKey) => this.mirrorWake(parentKey),
+      handOffWake: (parentKey) => this.handOffWake(parentKey),
     });
   }
 
@@ -611,6 +613,36 @@ export class Agent {
     }).catch((err) => {
       this.mirrorWakeQueued.delete(parentKey);
       log.error({ err, sessionKey: parentKey }, "Sub-session mirror turn failed in queue");
+    });
+  }
+
+  /**
+   * A silent turn on the owning session for what its tasks handed it
+   * (task_notify notices, task_ask questions). One queued at a time; the
+   * prompt is built when the turn starts, so it carries everything handed
+   * over by then, and nothing runs when another turn already took it all.
+   * Questions the turn did not forward are forwarded once it is over,
+   * whatever its outcome: a task waiting for the owner never waits on a
+   * question nobody saw.
+   */
+  private handOffWake(parentKey: string): void {
+    if (this.handOffWakeQueued.has(parentKey)) return;
+    this.handOffWakeQueued.add(parentKey);
+    this.enqueueForSession(parentKey, async () => {
+      this.handOffWakeQueued.delete(parentKey);
+      const service = this.subsessions;
+      if (this.stopping || !service) return;
+      const handOff = service.handOffFor(parentKey);
+      if (!handOff) return;
+      try {
+        await this.processContinuity(appendToTomoEventBody(handOff.prompt, CONTINUITY_DELIVERY_NOTE), parentKey, undefined,
+          ownerT("notices")("suppressed.turn.subsessionHandOff"), "background");
+      } finally {
+        if (!this.stopping) await service.afterHandOff(parentKey, handOff.asks);
+      }
+    }).catch((err) => {
+      this.handOffWakeQueued.delete(parentKey);
+      log.error({ err, sessionKey: parentKey }, "Sub-session hand-off turn failed in queue");
     });
   }
 

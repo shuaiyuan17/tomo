@@ -485,7 +485,7 @@ describe("owner messages are never stranded or lost", () => {
     spawn(h);
     await flush();
     depsOf(h).sendToScope = () => new Promise(() => {});
-    void h.service.notify("task:s1", "never lands");
+    void h.service.reply("task:s1", "never lands");
     await flush();
     expect(h.service.sendingTasks("dm:owner").map((t) => t.id)).toEqual(["s1"]);
     expect(h.service.sendingTasks("telegram:-100")).toEqual([]);
@@ -521,7 +521,7 @@ describe("owner messages are never stranded or lost", () => {
     const deps = depsOf(h);
     const send = deps.sendToScope;
     deps.sendToScope = async (...a) => { await gate; h.nextIds = ["555"]; return send(...a); };
-    const notified = h.service.notify("task:s1", "CI is green");
+    const notified = h.service.reply("task:s1", "CI is green");
     await flush();
     expect(h.service.sendsInFlight("dm:owner")).toBe(true);
     expect(h.service.taskForReply("dm:owner", "telegram", "555")).toBeUndefined();
@@ -539,7 +539,7 @@ describe("owner messages are never stranded or lost", () => {
     spawn(h);
     await flush();
     depsOf(h).sendToScope = () => new Promise(() => {});
-    void h.service.notify("task:s1", "never lands");
+    void h.service.reply("task:s1", "never lands");
     await flush();
     const t0 = Date.now();
     await h.service.whenSendsSettle("dm:owner", 20);

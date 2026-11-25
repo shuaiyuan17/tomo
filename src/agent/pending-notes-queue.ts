@@ -41,13 +41,15 @@ function capErrorNotes(notes: ErrorNote[]): ErrorNote[] {
  * losing it to the cap would lose the message. Same for an
  * `interrupted-agents` note: its ledger entry is already gone. And a
  * `subsession-report` note: the task record says the report was delivered
- * once the note is on disk.
+ * once the note is on disk. And a `subsession-notice` note: the task was told
+ * its message was handed over once the note is on disk.
  */
 function isPinnedNote(note: string): boolean {
   // `includes`, not `startsWith`: an interrupted note carries the marker first.
   return note.includes('<tomo-event type="inbox"')
     || note.includes('<tomo-event type="interrupted-agents"')
     || note.includes('<tomo-event type="subsession-report"')
+    || note.includes('<tomo-event type="subsession-notice"')
     // A failed task's unanswered messages: the record is forgotten once this is on disk.
     || note.includes('<tomo-event type="subsession-handback"');
 }

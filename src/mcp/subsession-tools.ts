@@ -7,7 +7,7 @@ import { currentStep, DONE_STEPS_KEEP, oneLine, OPEN_STATUSES, PLAN_MAX_STEPS, P
 /** The task_* tools a sub-session reports through (its own session only). */
 export const SUBSESSION_SELF_TOOL_NAMES = ["task_reply", "task_notify", "task_ask", "task_plan", "task_update", "task_checkpoint", "task_finish", "task_reopen", "task_status"] as const;
 /** The owning session's tools (the owner's DM only, for now). */
-export const SUBSESSION_OWNER_TOOL_NAMES = ["task_spawn", "task_status", "task_cancel", "task_message"] as const;
+export const SUBSESSION_OWNER_TOOL_NAMES = ["task_spawn", "task_status", "task_cancel", "task_message", "task_forward_question"] as const;
 /** Every task tool name, once: for the SDK's allowedTools. */
 export const SUBSESSION_TASK_TOOL_NAMES = [...new Set([...SUBSESSION_SELF_TOOL_NAMES, ...SUBSESSION_OWNER_TOOL_NAMES])];
 
@@ -60,9 +60,12 @@ export function formatTaskDetail(r: SubsessionRecord, now = Date.now(), backgrou
   if (r.checkpoint) lines.push("Checkpoint:", r.checkpoint);
   for (const e of r.earlierReports ?? []) lines.push(`Earlier report #${e.seq} (replaced by a later one before it was read):`, e.text);
   if (r.report) lines.push(r.reportSeq ? `Report #${r.reportSeq}:` : "Report:", r.report);
+  if (r.pendingAsk) {
+    lines.push(r.pendingAsk.forwardedAt === undefined ? "Question for the owner (not forwarded yet):" : "Question for the owner (forwarded):", r.pendingAsk.text);
+  }
   if (r.sent.length > 0) {
-    lines.push("Messages sent to the owner (newest last):");
-    for (const m of r.sent.slice(-5)) lines.push(`- ${new Date(m.at).toISOString()}: ${m.text}`);
+    lines.push("Messages to the owner (newest last):");
+    for (const m of r.sent.slice(-5)) lines.push(`- ${new Date(m.at).toISOString()}${m.via === "main" ? " (handed to the main session)" : ""}: ${m.text}`);
   }
   const recent = r.transitions.slice(-5);
   if (recent.length > 0) {
@@ -85,7 +88,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
   return [
     tool(
       "task_reply",
-      "Answer a message the owner sent you (<tomo-event type=\"subsession-owner-message\">). Once per message. The harness adds the [id · title] prefix. A MEDIA:/path line attaches a file.",
+      "Answer a message the owner sent you (<tomo-event type=\"subsession-owner-message\">). Once per message. Goes straight to the owner's chat. The harness adds the [id · title] prefix. A MEDIA:/path line attaches a file.",
       { text: z.string().min(1).max(4000).describe("The answer, in the owner's language, casual and concise. Lead with the answer.") },
       async ({ text }) => {
         const r = service("task_reply");
@@ -97,25 +100,28 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_ask",
-      "Ask the owner something only they can decide, and pause the task until they answer: a yes for something that sends, posts, pays, deletes or can't be undone, or a choice the brief leaves open. Ask one question, with the options. End the turn after it; their answer arrives as a message from them.",
+      "Ask the owner something only they can decide, and pause the task until they answer: a yes for something that sends, posts, pays, deletes or can't be undone, or a choice the brief leaves open. Ask one question, with the options. The main session passes it to the owner word for word (it may add a line of context, never reword it). End the turn after it; their answer arrives as a message from them.",
       { question: z.string().min(1).max(4000).describe("The question, in the owner's language, with the options and what each sets off.") },
       async ({ question }) => {
         const r = service("task_ask");
         if (!r.ok) return r.error;
         const result = await r.s.ask(deps.key, question);
-        return result.ok ? ok("Asked. The task now waits for the owner; end this turn.") : fail("task_ask", result.error ?? "the question did not go out.");
+        if (!result.ok) return fail("task_ask", result.error ?? "the question did not go out.");
+        return ok(result.via === "direct"
+          ? "Sent to the owner. A message is waiting for you, so the task does not pause: end this turn and read it."
+          : "Asked: the main session passes your question to the owner word for word. The task now waits for the owner; end this turn.");
       },
       { alwaysLoad: true, searchHint: "task ask owner question decision approval" },
     ),
     tool(
       "task_notify",
-      "Send the owner a message from this task. Only for a result, a decision they must make, or something that blocks you; never for progress (that is task_plan). The harness adds the [id · title] prefix. A MEDIA:/path line attaches a file.",
+      "Tell the owner something unprompted: a result, or something that blocks you; never progress (that is task_plan), and not a question (that is task_ask). It goes to the main session, which decides whether and when the owner hears it, may put it in its own words, and may fold it into other news. A MEDIA:/path line is passed along; the main session decides whether to send the file.",
       { text: z.string().min(1).max(4000).describe("The message, in the owner's language, casual and concise. Lead with the point.") },
       async ({ text }) => {
         const r = service("task_notify");
         if (!r.ok) return r.error;
         const result = await r.s.notify(deps.key, text);
-        return result.ok ? ok("Sent.") : fail("task_notify", result.error ?? "the message did not go out.");
+        return result.ok ? ok("Handed to the main session, which tells the owner when it should.") : fail("task_notify", result.error ?? "the message was not handed over.");
       },
       { alwaysLoad: true, searchHint: "task notify owner message result decision blocked" },
     ),
@@ -306,6 +312,21 @@ export function buildTaskOwnerTools(deps: { service: () => SubsessionService | u
         return ok(outcome.record.status === "queued" ? `${record.id} is queued; it gets the message with its first turn.` : `Passed to ${record.id}.`);
       },
       { searchHint: "sub-session message relay answer task" },
+    ),
+    tool(
+      "task_forward_question",
+      "Send a sub-session's waiting question (from a subsession-handoff) to the owner, word for word with its [id · title] prefix. The owner's reply to that message goes straight back to the task as their own words. Send any line of context of your own first, with send_message. Never reword the question, and never answer it for the owner.",
+      { id: z.string().min(1) },
+      async ({ id }) => {
+        const c = context("task_forward_question");
+        if (!c.ok) return c.error;
+        const record = own(c.s, c.scope, id);
+        if (!record) return fail("task_forward_question", `no task ${id} in this conversation.`);
+        const outcome = await c.s.forwardQuestion(record.id, c.scope);
+        if (!outcome.ok) return fail("task_forward_question", outcome.error);
+        return ok(outcome.already ? `${record.id}'s question was already forwarded.` : `Forwarded ${record.id}'s question to the owner.`);
+      },
+      { alwaysLoad: true, searchHint: "sub-session forward question ask owner" },
     ),
   ];
 }

@@ -40,6 +40,7 @@ export const notices = {
       interruptedAgents: "一个中断 subagent 通知回合",
       subsessionReport: "一个子会话汇报回合",
       subsessionMirror: "一个旁观子会话对话的回合",
+      subsessionHandOff: "一个转达子会话消息的回合",
     },
     label: {
       group: "群“{{title}}”（{{key}}）", groupUntitled: "群 {{key}}",

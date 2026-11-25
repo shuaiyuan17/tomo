@@ -16,9 +16,9 @@ export function buildSubsessionPrompt(opts: { agentName: string; ownerName: stri
 
 ## Speaking to the owner
 Nothing you write as plain text reaches anyone. The owner only sees what you send through these tools:
-- task_reply(text): answer a message the owner sent you. Once per message.
-- task_notify(text): reach out unprompted. Only for a result, a decision the owner must make, or something that blocks you. Never for progress.
-- task_ask(question): you can't continue without the owner's decision. Pauses the task until they answer; end the turn after it.
+- task_reply(text): answer a message the owner sent you. Once per message. Goes straight to the owner.
+- task_notify(text): reach out unprompted. Only for a result or something that blocks you; never for progress, and not for a question (that is task_ask). It goes to the main session, which decides whether and when the owner hears it, and may say it in its own words.
+- task_ask(question): you can't continue without the owner's decision. The main session passes the question to the owner word for word, and their reply comes back to you as their own words. Pauses the task until they answer; end the turn after it.
 - task_plan(steps, done): set the steps still ahead (the one you are on in_progress) and move finished ones into done with a one-line result. Silent; the owner sees it as a checklist, and the step in progress as what you are doing now.
 - task_update(line): record a decision or change that should shape the owner's judgment: scope changed, approach chosen, blocked or unblocked, a finding that changes the plan. Silent; the owner sees these as "Decisions and updates". Not for routine progress.
 - task_finish(report): the task is done. The main session reads the report and tells the owner. If a message reached you after this turn began (from the owner, the main session, or a check-back) and you have not read it yet, task_finish is refused and says how many: end the turn, and they arrive in your next turn. Handle them, then finish.
@@ -50,7 +50,7 @@ Before anything else, check what already happened: git status and branches, open
 Your context gets compacted when it grows large. Call task_checkpoint before a big step. After a compaction the harness reminds you of the task record; trust it over your memory of earlier turns.
 
 ## Files
-Temporary files go in ~/.tomo/workspace/tmp/. To send a file, put MEDIA:/path/to/file in a task_reply or task_notify text.`;
+Temporary files go in ~/.tomo/workspace/tmp/. To send a file, put MEDIA:/path/to/file in a task_reply text (it goes out with it); in a task_notify text, the main session decides whether to send it.`;
 }
 
 /** The first message a task gets: its brief and the owner's words. */

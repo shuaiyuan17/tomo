@@ -20,6 +20,7 @@ import {
   SUBSESSION_STATUSES,
   TRANSITION_LOG_KEEP,
   type SubsessionInput,
+  type SubsessionPendingAsk,
   type SubsessionPlanStep,
   type SubsessionDoneStep,
   type SubsessionUpdate,
@@ -245,6 +246,8 @@ export class SubsessionStore {
         log.info({ id, event, from, to: target.status, waitingOn: record.waitingOn, reason: opts.reason }, "Sub-session transition");
       }
       record.lastActivityAt = now;
+      // A question stands only while the task waits for the owner's answer.
+      if (record.status !== "waiting" || record.waitingOn !== "owner") delete record.pendingAsk;
       opts.patch?.(record);
       if (record.status !== (target === "same" ? from : target.status)) {
         throw new Error(`Sub-session ${id}: a transition patch may not change the status`);
@@ -461,7 +464,22 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
     ...(Array.isArray(r.doneSteps) ? { doneSteps: parseDoneSteps(r.doneSteps) } : { doneSteps: undefined }),
     ...(Array.isArray(r.updates) ? { updates: parseUpdates(r.updates) } : { updates: undefined }),
     sent: Array.isArray(r.sent) ? r.sent as SubsessionRecord["sent"] : [],
+    ...parsePendingAsk(r.pendingAsk, status, r.waitingOn),
     transitions: Array.isArray(r.transitions) ? r.transitions as SubsessionRecord["transitions"] : [],
+  };
+}
+
+/** A well-formed pending question, kept only on a task waiting for the owner. */
+function parsePendingAsk(value: unknown, status: SubsessionStatus, waitingOn: unknown): { pendingAsk?: SubsessionPendingAsk } {
+  if (status !== "waiting" || waitingOn !== "owner" || !value || typeof value !== "object") return { pendingAsk: undefined };
+  const v = value as Record<string, unknown>;
+  if (typeof v.at !== "number" || !Number.isFinite(v.at) || typeof v.text !== "string" || !v.text.trim()) return { pendingAsk: undefined };
+  return {
+    pendingAsk: {
+      at: v.at,
+      text: v.text,
+      ...(typeof v.forwardedAt === "number" && Number.isFinite(v.forwardedAt) ? { forwardedAt: v.forwardedAt } : {}),
+    },
   };
 }
 

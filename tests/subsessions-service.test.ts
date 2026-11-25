@@ -406,7 +406,7 @@ describe("SubsessionService", () => {
       n += 1;
       if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
       // Answer the relay; the send may fail.
-      await hh.service.notify(turn.key, `answer ${n}`);
+      await hh.service.reply(turn.key, `answer ${n}`);
       if (n >= 3) hh.service.finish(turn.key, "done");
       return { ok: true };
     });
@@ -449,8 +449,12 @@ describe("SubsessionService", () => {
     const t = spawn(h, "group thing", "telegram:-100123");
     await flush();
     expect(h.notices.map((n) => n.to)).toEqual(["telegram:-100123"]);
+    await h.service.reply(t.sessionKey, "the answer");
+    expect(h.sent).toEqual([{ parentKey: "telegram:-100123", text: "[s1 · group thing] the answer" }]);
+    // A notice is handed to that scope, never to the owner's DM.
     await h.service.notify(t.sessionKey, "need a decision");
-    expect(h.sent).toEqual([{ parentKey: "telegram:-100123", text: "[s1 · group thing] need a decision" }]);
+    expect(h.notes.get("telegram:-100123")?.some((n) => n.includes('type="subsession-notice"') && n.includes("need a decision"))).toBe(true);
+    expect(h.notes.has("dm:owner")).toBe(false);
     expect(h.service.list("dm:owner")).toEqual([]);
     expect(h.service.parentKeyOf(t.sessionKey)).toBe("telegram:-100123");
   });
@@ -1285,7 +1289,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     const h = harness({}, async (turn, hh) => {
       n += 1;
       if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
-      const sent = await hh.service.notify(turn.key, `answer ${n}`);
+      const sent = await hh.service.reply(turn.key, `answer ${n}`);
       if (n === 2) expect(sent.ok).toBe(false);
       if (n >= 3) hh.service.finish(turn.key, "done");
       return { ok: true };
@@ -1309,14 +1313,14 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
       if (n === 1) {
         // No input carried: a failed send here is no lost answer.
         hh.sendFails = 1;
-        await hh.service.notify(turn.key, "progress");
+        await hh.service.reply(turn.key, "progress");
         hh.service.noteToolUse(turn.key);
         hh.store.transition("s1", "stuck");
         return { ok: true };
       }
       hh.sendFails = 1;
-      await hh.service.notify(turn.key, "status: halfway");
-      await hh.service.notify(turn.key, "status: halfway");
+      await hh.service.reply(turn.key, "status: halfway");
+      await hh.service.reply(turn.key, "status: halfway");
       hh.service.finish(turn.key, "done");
       return { ok: true };
     });
@@ -1337,12 +1341,12 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
       if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
       if (n === 2) {
         hh.sendFails = 1;
-        expect((await hh.service.notify(turn.key, "the answer to your question")).ok).toBe(false);
-        expect((await hh.service.notify(turn.key, "unrelated: tests are running")).ok).toBe(true);
+        expect((await hh.service.reply(turn.key, "the answer to your question")).ok).toBe(false);
+        expect((await hh.service.reply(turn.key, "unrelated: tests are running")).ok).toBe(true);
         hh.service.noteToolUse(turn.key);
         return { ok: true };
       }
-      await hh.service.notify(turn.key, "the answer to your question");
+      await hh.service.reply(turn.key, "the answer to your question");
       hh.service.finish(turn.key, "done");
       return { ok: true };
     });
@@ -1372,7 +1376,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
       n += 1;
       if (n === 2) hh.service.relay("s1", "newer question");
       if (n <= 2) return { ok: false };
-      void hh.service.notify(turn.key, "both answered");
+      void hh.service.reply(turn.key, "both answered");
       return { ok: true };
     };
     h.service.start();
@@ -1444,7 +1448,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
   it("holds a finished task's turn while the registry is unreadable without spinning, and answers once it can be read", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
-      const h = harness({}, (turn, hh) => { void hh.service.notify(turn.key, "answer"); return { ok: true }; });
+      const h = harness({}, (turn, hh) => { void hh.service.reply(turn.key, "answer"); return { ok: true }; });
       const id = seed(h, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
       h.service.start();
       let asked = 0;

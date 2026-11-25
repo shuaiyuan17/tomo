@@ -243,7 +243,7 @@ export class SubsessionService {
   /** Which task each send in flight belongs to (see `sendingTasks`). */
   private readonly sendOwners = new Map<Promise<unknown>, string>();
   private sweepTimer?: NodeJS.Timeout;
-  /** Set while the startup hook's work is incomplete: no record is forgotten, so a later start can still match against it. */
+  /** Set while the startup hook's work is incomplete: no record is archived or forgotten, so a later start can still match against it as it is. */
   private keepEndedRecords = false;
   private readonly reportTimers = new Map<string, NodeJS.Timeout>();
   private readonly reportAttempts = new Map<string, number>();
@@ -462,8 +462,9 @@ export class SubsessionService {
    * that asked; a task of another scope is unknown here. `report` is the
    * report seq the owner answered (task_done carries the one its note
    * named): a newer report's ask is never cleared by an answer to an older
-   * one (reason "newer", with the record). Without it (a bare `/s <id> done`, where
-   * the owner answers what the task shows now) the report read here counts.
+   * one (reason "newer", with the record). Without it (a bare `/s <id> done`)
+   * it is report 1: what the owner saw when they typed it is not known, so
+   * once a task has sent a second report the number has to be given.
    * Not a transition: the task stays finished, and archives like any other.
    */
   markDone(scope: string, id: string, report?: number): { ok: true; record: SubsessionRecord } | { ok: false; reason: "unknown" | "nothing" | "unreadable" } | { ok: false; reason: "newer"; record: SubsessionRecord } {
@@ -474,7 +475,7 @@ export class SubsessionService {
     // Under the lock, and only the ask of the report the owner answered: a
     // task_finish that landed since is a new report (a new reportSeq) whose
     // ask they have not answered, even when its words are the same.
-    const seq = report ?? reportNumber(record);
+    const seq = report ?? 1;
     // A number past the latest report answers nothing the task asked.
     if (seq > reportNumber(record)) return { ok: false, reason: "nothing" };
     if (reportNumber(record) !== seq) return { ok: false, reason: "newer", record };
@@ -1023,8 +1024,8 @@ export class SubsessionService {
    * left as it is when the record already has one; once per record, so an
    * ask the owner cleared never comes back). Only records the table can be
    * trusted with are handed over (not one read from the backup). It answers whether its
-   * work is complete: until it is (false, or a throw), the sweep forgets no
-   * record in this process, so the next start can still match against them.
+   * work is complete: until it is (false, or a throw), the sweep archives or
+   * forgets no record in this process, so the next start can still match against them.
    * Called only when the table could be read.
    */
   recoverAtStartup(onTableRead?: (records: readonly SubsessionRecord[], keepAsk: (id: string, action: string) => boolean) => boolean): void {
@@ -1372,6 +1373,10 @@ export class SubsessionService {
     const forget: string[] = [];
     for (const task of this.store.list()) {
       if (!this.mayCleanUp(task)) continue;
+      // While the startup hook's work is incomplete, nothing is archived or
+      // forgotten: the next start matches its old todos against the tasks
+      // as they are now (an archived task's would no longer become its card).
+      if (this.keepEndedRecords) continue;
       // A finished task still owing an answer (pending, or held for the
       // owner's next message) stays finished: archived, it could never be
       // woken to give it, and its input would go with the record.
@@ -1386,7 +1391,7 @@ export class SubsessionService {
         && now - (task.endedAt ?? task.lastActivityAt) > FINISHED_KEEP_MS) {
         const outcome = this.store.transition(task.id, "archive", { reason: "finished more than 7 days ago" });
         if (outcome.ok) this.safely(() => this.deps.unlinkRegistryEntry(task.sessionKey), "unlink archived");
-      } else if (!this.keepEndedRecords && TERMINAL_STATUSES.has(task.status) && now - (task.endedAt ?? task.lastActivityAt) > ENDED_KEEP_MS) {
+      } else if (TERMINAL_STATUSES.has(task.status) && now - (task.endedAt ?? task.lastActivityAt) > ENDED_KEEP_MS) {
         // A failed task's unanswered owner input goes only once it is handed
         // back in full; a handback that could not be written is tried again here.
         if (task.status === "failed" && !task.handedBack && task.pendingInput.some(isOwnerInput) && !this.handBack(task)) continue;

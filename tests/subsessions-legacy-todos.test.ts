@@ -41,11 +41,25 @@ describe("the todos sub-sessions used to keep", () => {
     const owners = todos.add({ title: `Fix CI (${s1.id})`, next: `${s1.id} is working on it (/s ${s1.id})`, waiting_on: "external", ref: s1.sessionKey, session: "dm:owner", source: "owner" }).id;
     const unknown = todos.add({ title: "Old (s9)", next: "s9 is working on it (/s s9)", waiting_on: "external", ref: "task:s9", session: "dm:owner", source: "self" }).id;
 
-    expect(dropLegacyTaskTodos(todos, tasks.list(), () => true)).toEqual({ dropped: 3, complete: true });
+    const waiting = tasks.list().map((r) => (r.id === s3.id ? { ...r, status: "waiting" as const, waitingOn: "owner" as const, waitingReason: "which branch?" } : r));
+    expect(dropLegacyTaskTodos(todos, waiting, () => true)).toEqual({ dropped: 3, complete: true });
     const open = todos.list().map((i) => i.id);
     for (const id of [old1, old2, old3]) expect(open).not.toContain(id);
     expect(open).toEqual(expect.arrayContaining([group, mine, owners, unknown]));
-    expect(dropLegacyTaskTodos(todos, tasks.list(), () => true)).toEqual({ dropped: 0, complete: true });
+    expect(dropLegacyTaskTodos(todos, waiting, () => true)).toEqual({ dropped: 0, complete: true });
+  });
+
+  it("matches a title or step the link clipped at another limit than today's", () => {
+    const { tasks, todos } = setup();
+    const s1 = tasks.create({ parentKey: "dm:owner", title: "A long title that an older, shorter limit clipped", brief: "b" });
+    // Written under a 20-character title limit; the list's limit is larger now.
+    const clipped = todos.add({ title: "A long title that a…", next: `${s1.id} is working on it (/s ${s1.id})`, waiting_on: "external", ref: s1.sessionKey, session: "dm:owner", source: "self" }).id;
+    // Not a clip of the link's title: another prefix.
+    const other = todos.add({ title: "A long story…", next: `${s1.id} is working on it (/s ${s1.id})`, waiting_on: "external", ref: s1.sessionKey, session: "dm:owner", source: "self" }).id;
+    expect(dropLegacyTaskTodos(todos, tasks.list(), () => true)).toEqual({ dropped: 1, complete: true });
+    const open = todos.list().map((i) => i.id);
+    expect(open).not.toContain(clipped);
+    expect(open).toContain(other);
   });
 
   it("leaves one the owner snoozed or handed off: it is theirs now", () => {
@@ -59,8 +73,12 @@ describe("the todos sub-sessions used to keep", () => {
     todos.resolve(handed, { action: "handoff", next: "Ask Dev about the flaky test", by: "owner" });
     const moved = linkTodo(todos, s3, `${s3.id} is working on it (/s ${s3.id})`, "external");
     todos.resolve(moved, { action: "handoff", by: "owner" });
+    // Handed to the owner with a step that only starts like the link's "Answer sN: …".
+    const s4 = tasks.create({ parentKey: "dm:owner", title: "Answered", brief: "b" });
+    const answered = linkTodo(todos, s4, `${s4.id} is working on it (/s ${s4.id})`, "external");
+    todos.resolve(answered, { action: "handoff", next: `Answer ${s4.id}: ask Dev first`, by: "owner" });
     expect(dropLegacyTaskTodos(todos, tasks.list(), () => true)).toEqual({ dropped: 0, complete: true });
-    expect(todos.list().map((i) => i.id)).toEqual(expect.arrayContaining([snoozed, handed, moved]));
+    expect(todos.list().map((i) => i.id)).toEqual(expect.arrayContaining([snoozed, handed, moved, answered]));
   });
 
   it("moves a finished task's unread result onto the task before its todo goes, and keeps the todo when it cannot", () => {
@@ -76,15 +94,25 @@ describe("the todos sub-sessions used to keep", () => {
     expect(todos.list().map((i) => i.id)).not.toContain(read);
   });
 
+  it("moves a finished task's result whatever step its todo still shows (a crash before the link said Read)", () => {
+    const { tasks, todos } = setup();
+    const s1 = tasks.create({ parentKey: "dm:owner", title: "Crashed", brief: "b" });
+    const working = linkTodo(todos, s1, `${s1.id} is working on it (/s ${s1.id})`, "external");
+    const asks: string[] = [];
+    expect(dropLegacyTaskTodos(todos, [{ ...s1, status: "finished" }], (id, action) => { asks.push(`${id}: ${action}`); return true; })).toEqual({ dropped: 1, complete: true });
+    expect(asks).toEqual([`${s1.id}: Read ${s1.id}'s result`]);
+    expect(todos.list().map((i) => i.id)).not.toContain(working);
+  });
+
   it("keeps an archived task's unread result as the owner's todo, and drops a stale one of a task woken since", () => {
     const { tasks, todos } = setup();
     const s1 = tasks.create({ parentKey: "dm:owner", title: "Archived", brief: "b" });
     const s2 = tasks.create({ parentKey: "dm:owner", title: "Woken", brief: "b" });
-    const s3 = tasks.create({ parentKey: "dm:owner", title: "Asked, then finished", brief: "b" });
+    const s3 = tasks.create({ parentKey: "dm:owner", title: "Cancelled", brief: "b" });
     const archived = linkTodo(todos, s1, `Read ${s1.id}'s result, then close this`, "owner");
     const woken = linkTodo(todos, s2, `Read ${s2.id}'s result, then close this`, "owner");
-    const asked = linkTodo(todos, s3, `Answer ${s3.id}: which branch?`, "owner");
-    const records: SubsessionRecord[] = [{ ...s1, status: "archived" }, { ...s2, status: "active" }, { ...s3, status: "finished" }];
+    const asked = linkTodo(todos, s3, `${s3.id} is waiting for its check-back`, "external");
+    const records: SubsessionRecord[] = [{ ...s1, status: "archived" }, { ...s2, status: "active" }, { ...s3, status: "cancelled" }];
     const asks: string[] = [];
     expect(dropLegacyTaskTodos(todos, records, (id) => { asks.push(id); return true; })).toEqual({ dropped: 2, complete: true });
     const open = todos.list().map((i) => i.id);

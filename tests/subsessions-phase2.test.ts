@@ -504,6 +504,22 @@ describe("a task is its own card", () => {
     throwing.service.stop();
   });
 
+  it("archives nothing either while the startup hook's work is incomplete: the next start still finds the task finished", async () => {
+    const seed = harness();
+    const task = await finished(seed, undefined);
+    seed.service.stop();
+    const later = 1_000_000 + FINISHED_KEEP_MS + 60_000;
+    const failing = harness({}, { clock: later });
+    failing.service.recoverAtStartup(() => false);
+    expect(failing.service.get(task.id)?.status).toBe("finished");
+    failing.service.stop();
+    // Once the hook completes, the sweep archives as usual.
+    const done = harness({}, { clock: later });
+    done.service.recoverAtStartup(() => true);
+    expect(done.service.get(task.id)?.status).toBe("archived");
+    done.service.stop();
+  });
+
   it("moves an old todo's unread result onto a finished task: Needs you, and its own ask is never overwritten", async () => {
     const seed = harness();
     const plain = await finished(seed, undefined);

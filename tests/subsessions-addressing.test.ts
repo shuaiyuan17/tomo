@@ -616,7 +616,10 @@ describe("/s commands", () => {
     store.transition("s1", "reopen");
     store.transition("s1", "finish", { patch: (r) => { r.reportSeq = 2; r.ownerAction = "Review and merge PR #10"; } });
     const stale = await taskCommandReply(t, h.service, "dm:owner", parseTaskAddress("/s s1 done 1") as { kind: "done"; id: string; report?: number });
-    expect(stale).toBe("s1 has just sent a new report, and it asks: Review and merge PR #10. That one still needs you; send /s s1 done 2 once it's handled.");
+    expect(stale).toBe("s1 has a newer report (report 2), and it asks: Review and merge PR #10. That one still needs you; send /s s1 done 2 once it's handled.");
+    expect(needsOwner(h.service.get("s1")!)).toBe("Review and merge PR #10");
+    // A bare done is report 1: what the owner saw is not known once there is a second.
+    expect(await taskCommandReply(t, h.service, "dm:owner", parseTaskAddress("/s s1 done") as { kind: "done"; id: string })).toContain("send /s s1 done 2");
     expect(needsOwner(h.service.get("s1")!)).toBe("Review and merge PR #10");
     // A number past the latest report answers nothing.
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "done", id: "s1", report: 3 })).toContain("s1 asks nothing of you");

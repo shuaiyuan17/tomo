@@ -36,7 +36,7 @@ export const subsessions = {
     started: "已开始 {{id}} · {{title}}。",
     done: "已标记完成：{{id}} · {{title}}。",
     stopNeedsOwner: "{{id}} 已经做完了，在等你处理报告里的事。发 /s {{id}} done {{report}} 就能清掉。",
-    newerReport: "{{id}} 刚交了新的报告，要你：{{action}}。这一条还在等你，处理完发 /s {{id}} done {{report}}。",
+    newerReport: "{{id}} 有一份更新的报告（第 {{report}} 份），要你：{{action}}。这一条还在等你，处理完发 /s {{id}} done {{report}}。",
     nothingToDo: "{{id}} 没有要你做的事（现在是{{status}}）。想给它发消息，别只写 done：/s {{id}} …",
     held: "等 Tomo 能读到 session 列表，{{id}} 马上开始（现在开始会丢掉它之前的上下文）。",
     notQueued: "{{id}} 没在排队（现在是{{status}}）。要叫醒它，给它发句话：/s {{id}} …",

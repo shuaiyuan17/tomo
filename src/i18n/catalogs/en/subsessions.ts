@@ -38,7 +38,7 @@ export const subsessions = {
     started: "Started {{id}} · {{title}}.",
     done: "Marked done: {{id}} · {{title}}.",
     stopNeedsOwner: "{{id}} has finished; it's waiting for you to do what its report asks. /s {{id}} done {{report}} clears it.",
-    newerReport: "{{id}} has just sent a new report, and it asks: {{action}}. That one still needs you; send /s {{id}} done {{report}} once it's handled.",
+    newerReport: "{{id}} has a newer report (report {{report}}), and it asks: {{action}}. That one still needs you; send /s {{id}} done {{report}} once it's handled.",
     nothingToDo: "{{id}} asks nothing of you (it's {{status}}). To send it a message, write more than the word done: /s {{id}} …",
     held: "{{id}} will start as soon as Tomo can read its session list again (right now it would start without its history).",
     notQueued: "{{id}} isn't waiting for a slot (it's {{status}}). To wake it, send it a message: /s {{id}} …",

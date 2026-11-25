@@ -53,7 +53,7 @@ export async function taskCommandReply(
     }
     case "done": {
       // The report number the owner was shown (the hints name it): one that
-      // landed since is not theirs to clear. Bare "done" answers the latest.
+      // landed since is not theirs to clear. Bare "done" answers report 1.
       const result = service.markDone(scope, record.id, address.report);
       if (result.ok) return t("cmd.done", { id: record.id, title: record.title });
       if (result.reason === "unknown") return t("cmd.unknown", { id: record.id });

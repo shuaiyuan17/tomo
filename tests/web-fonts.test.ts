@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { RecordedMessage } from "../web/src/conversation-rows.js";
+import type { HistoryMessage } from "../src/web/protocol.js";
 
 const css = readFileSync(resolve(import.meta.dirname, "../web/src/styles.css"), "utf8");
 const varValue = (name: string) => new RegExp(`${name}:\\s*([^;]+);`).exec(css)?.[1] ?? "";
@@ -34,8 +38,17 @@ describe("web fonts", () => {
   });
 
   it("Tomo's replies use the serif reading style; user messages do not", () => {
-    const main = readFileSync(resolve(import.meta.dirname, "../web/src/conversation-rows.tsx"), "utf8");
-    expect(main).toContain('message.role === "assistant" && "reading"');
+    const noop = () => {};
+    const actions = { startReply: noop, react: noop, resend: noop, dismiss: noop, confirmDismiss: noop, showMessage: noop };
+    const row = (role: "user" | "assistant") => {
+      const message: HistoryMessage = { id: role, role, content: "hello", channel: "web", timestamp: 0 };
+      const html = renderToStaticMarkup(createElement(RecordedMessage, { message, parsed: { body: "hello" }, reactions: [], afterTapback: false, enter: false,
+        flash: false, confirming: false, receipts: false, agent: "Tomo", group: false, writable: true, live: false, sessionId: "s", actions }));
+      return /<div class="([^"]*\bmarkdown\b[^"]*)"/.exec(html)?.[1].split(/\s+/) ?? [];
+    };
+    expect(row("assistant")).toContain("reading");
+    expect(row("user")).toContain("markdown");
+    expect(row("user")).not.toContain("reading");
     expect(css).toMatch(/\.reading\s*{[^}]*font-serif/);
   });
 });

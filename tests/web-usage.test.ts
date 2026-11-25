@@ -1,9 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { fetchUsage, usageWindows, type UsageResult } from "../src/agent/usage.js";
 import { USAGE_DEADLINE_MS, USAGE_FAILURE_TTL_MS, USAGE_REFRESH_MIN_MS, USAGE_TIMEOUT_RETRY_MS, USAGE_TTL_MS, UsageCache } from "../src/web/usage.js";
 import { USAGE_RPC_TIMEOUT_MS } from "../src/web/protocol.js";
 import { SOCKET_TIMEOUT_MS } from "../src/web/http.js";
-import { vi } from "vitest";
 import { formatSpan, isWarn, localizeUsage, nextUsageDelay, planName, RequestGate, USAGE_MARGIN_MS, USAGE_MIN_GAP_MS, USAGE_RETRY_MS, resetLabel, splitWindows, updatedLabel, usageNotice, windowTitle } from "../web/src/usage.js";
 import type { WebUsage, WebUsageWindow } from "../src/web/protocol.js";
 
@@ -24,13 +23,10 @@ describe("fetchUsage (the reader /usage uses) classifies failures", () => {
     ["http_error", { fetchImpl: async () => json({}, 500) }],
     ["unauthorized", { fetchImpl: async () => json({}, 403) }],
     ["bad_response", { fetchImpl: async () => new Response("not json", { status: 200 }) }],
+    ["timeout", { fetchImpl: async () => { const e = new Error("t"); e.name = "TimeoutError"; throw e; } }],
   ])("%s", async (reason, deps) => {
     const result = await run(deps as never);
     expect(result).toMatchObject({ ok: false, reason });
-  });
-  it("timeout", async () => {
-    const result = await run({ fetchImpl: async () => { const e = new Error("t"); e.name = "TimeoutError"; throw e; } });
-    expect(result).toMatchObject({ ok: false, reason: "timeout" });
   });
 });
 

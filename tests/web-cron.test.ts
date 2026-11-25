@@ -1,27 +1,63 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { randomUUID } from "node:crypto";
 import { CronStore } from "../src/cron/store.js";
-import { WebCron } from "../src/web/inspection.js";
-import { startWebHttp } from "../src/web/http.js";
+import { MAX_CRON_STORE_BYTES, WebCron } from "../src/web/inspection.js";
 import { WebData } from "../src/web/data.js";
 import { WebChannel } from "../src/channels/web.js";
 import { SessionStore } from "../src/sessions/store.js";
-import type { WebBootstrap, WebCronJob } from "../src/web/protocol.js";
+import type { WebCronJob } from "../src/web/protocol.js";
+import { channelRpc, startWebService, type WebService } from "./helpers/web-http.js";
 
+/** The Study's Cron tab: WebCron (src/web/inspection.ts) reads and changes the store, and the PATCH / DELETE routes reach it. */
 let root: string;
 let path: string;
 let store: CronStore;
 let web: WebCron;
 beforeEach(() => {
-  root = realpathSync(mkdtempSync(join(tmpdir(), "tomo-web-study-actions-")));
+  root = realpathSync(mkdtempSync(join(tmpdir(), "tomo-web-cron-")));
   path = join(root, "cron", "jobs.json");
   store = new CronStore(path);
   web = new WebCron(path);
 });
 afterEach(() => { rmSync(root, { recursive: true, force: true }); });
+
+describe("WebCron.list", () => {
+  it("lists a job's intent and run state", async () => {
+    const path = join(root, "data", "cron", "jobs.json");
+    const store = new CronStore(path);
+    const job = store.add({ name: "Example task", schedule: { kind: "every", everyMs: 60_000 }, message: "Review the test note", sessionKey: "dm:owner" });
+    expect((await new WebCron(path).list()).jobs).toEqual([expect.objectContaining({ id: job.id, name: "Example task", message: "Review the test note",
+      sessionKey: "dm:owner", scheduleLabel: "every 1m", enabled: true, lastStatus: null })]);
+  });
+  it("reports an unreadable store as unavailable, not as no jobs", async () => {
+    const path = join(root, "jobs.json");
+    writeFileSync(path, "{not json");
+    await expect(new WebCron(path).list()).rejects.toMatchObject({ status: 503, code: "cron_unavailable" });
+    writeFileSync(path, JSON.stringify({ jobs: [null] }));
+    await expect(new WebCron(path).list()).rejects.toMatchObject({ code: "cron_unavailable" });
+  });
+  it("reads a missing store as no jobs, and has no path of its own", async () => {
+    expect(await new WebCron(join(root, "absent.json")).list()).toEqual({ jobs: [] });
+    await expect(new WebCron(undefined).list()).rejects.toMatchObject({ code: "cron_unavailable" });
+  });
+  it("refuses a FIFO, a symlink and a directory without blocking", async () => {
+    const fifo = join(root, "fifo.json");
+    execFileSync("mkfifo", [fifo]);
+    await expect(new WebCron(fifo).list()).rejects.toMatchObject({ code: "cron_unavailable" });
+    const real = join(root, "real.json"); writeFileSync(real, JSON.stringify({ version: 1, revision: 1, jobs: [] }));
+    symlinkSync(real, join(root, "link.json"));
+    await expect(new WebCron(join(root, "link.json")).list()).rejects.toMatchObject({ code: "cron_unavailable" });
+    await expect(new WebCron(root).list()).rejects.toMatchObject({ code: "cron_unavailable" });
+  });
+  it("refuses a store over the size bound with an explicit error", async () => {
+    const path = join(root, "big.json");
+    writeFileSync(path, JSON.stringify({ version: 1, revision: 1, jobs: [], pad: "x".repeat(MAX_CRON_STORE_BYTES) }));
+    await expect(new WebCron(path).list()).rejects.toMatchObject({ status: 413, code: "cron_store_too_large" });
+  });
+});
 
 describe("WebCron.change", () => {
   it("pauses, resumes and deletes a job it was shown, through the store", async () => {
@@ -70,49 +106,30 @@ describe("WebCron.change", () => {
 });
 
 describe("cron mutations over HTTP", () => {
-  let service: Awaited<ReturnType<typeof startWebHttp>>;
+  let service: WebService;
   let channel: WebChannel;
-  let cookie = "";
-  let boot: WebBootstrap;
-  let base: string;
   let jobId: string;
-  const token = "tomo_web_" + "d".repeat(64);
-  const job = async (): Promise<WebCronJob> => (await (await get("/cron")).json() as { jobs: WebCronJob[] }).jobs[0];
-  const get = (p: string) => fetch(base + "/api/v1" + p, { headers: { "x-tomo-request": "1", "sec-fetch-site": "same-origin", cookie } });
-  const send = async (method: string, p: string, body: unknown, headers: Record<string, string> = {}) => {
-    const response = await fetch(base + "/api/v1" + p, { method, body: JSON.stringify(body), headers: { "x-tomo-request": "1", "sec-fetch-site": "same-origin", cookie,
-      origin: base, "content-type": "application/json", "x-tomo-csrf": boot.csrfToken, "x-tomo-epoch": boot.epoch, ...headers } });
-    return { status: response.status, value: await response.json() as Record<string, unknown> };
+  const job = async (): Promise<WebCronJob> => (await service.get("/api/v1/cron")).json<{ jobs: WebCronJob[] }>().jobs[0];
+  const send = async (method: string, p: string, body: unknown) => {
+    const response = await service.send(method, "/api/v1" + p, body);
+    return { status: response.status, value: response.json() };
   };
   beforeEach(async () => {
-    cookie = "";
     writeFileSync(join(root, "index.html"), "<!doctype html>");
     jobId = store.add({ name: "Morning briefing", schedule: { kind: "every", everyMs: 3_600_000 }, message: "Summarise", sessionKey: "dm:owner" }).id;
     const owner = { name: "owner", telegram: ["test-owner"], imessage: [] as string[] };
     const sessionsDir = join(root, "sessions"); const sdkSessionsDir = join(root, "sdk");
     new SessionStore(sessionsDir, 20, sdkSessionsDir).touchSession("dm:owner");
     channel = new WebChannel(owner); channel.onMessage(async () => true);
-    service = await startWebHttp(0, { accessToken: token, assetsDir: root,
-      data: new WebData({ cronStorePath: path, sessionsDir, sdkSessionsDir, owner }),
-      subscribe: (fn) => channel.events.subscribe(fn), rpc: async (rpc) => {
-        if (rpc.method === "snapshot") return { snapshot: channel.snapshot(), replay: null };
-        if (rpc.method === "epoch") return channel.events.epoch;
-        throw new Error("unexpected rpc");
-      } });
-    base = `http://127.0.0.1:${service.port}`;
-    const response = await fetch(`${base}/api/v1/bootstrap?t=${token}`, { headers: { "x-tomo-request": "1", "sec-fetch-site": "same-origin" } });
-    cookie = response.headers.getSetCookie()[0].split(";")[0];
-    boot = await response.json() as WebBootstrap;
+    service = await startWebService({ assetsDir: root, data: new WebData({ cronStorePath: path, sessionsDir, sdkSessionsDir, owner }),
+      subscribe: (fn) => channel.events.subscribe(fn), rpc: channelRpc(channel) });
   });
   afterEach(async () => { await service?.close(); await channel?.stop(); });
 
-  it("requires origin, CSRF, JSON, the current epoch and an explicit confirmation", async () => {
+  it("requires an explicit confirmation, and enabled on a PATCH only", async () => {
+    // Origin, cookie, CSRF, JSON and the epoch are rows of web-http.test.ts's write-gate table.
     const { revision } = await job();
     const body = { revision, confirm: true, enabled: false };
-    expect((await send("PATCH", `/cron/${jobId}`, body, { origin: "http://127.0.0.1:1" })).status).toBe(403);
-    expect((await send("PATCH", `/cron/${jobId}`, body, { "x-tomo-csrf": "bad" })).value).toEqual({ error: "invalid_csrf" });
-    expect((await send("PATCH", `/cron/${jobId}`, body, { "content-type": "text/plain" })).status).toBe(415);
-    expect((await send("PATCH", `/cron/${jobId}`, body, { "x-tomo-epoch": randomUUID() })).value).toEqual({ error: "epoch_changed" });
     expect((await send("PATCH", `/cron/${jobId}`, { revision, enabled: false })).status).toBe(400);
     expect((await send("PATCH", `/cron/${jobId}`, { revision, confirm: true })).status).toBe(400);
     expect((await send("DELETE", `/cron/${jobId}`, body)).status).toBe(400);
@@ -125,28 +142,6 @@ describe("cron mutations over HTTP", () => {
     expect((await job()).enabled).toBe(false);
     expect((await send("DELETE", `/cron/${jobId}`, { revision: reviewed, confirm: true })).value).toEqual({ error: "cron_changed" });
     expect((await send("DELETE", `/cron/${jobId}`, { revision: (await job()).revision, confirm: true })).status).toBe(200);
-    expect((await (await get("/cron")).json() as { jobs: unknown[] }).jobs).toEqual([]);
-  });
-});
-
-describe("Study write helper", async () => {
-  const { mutate, ApiError } = await import("../web/src/api.js");
-  it("retries only a definite CSRF rejection, once, under the same epoch", async () => {
-    const calls: Array<{ method?: string; csrf: string }> = [];
-    const original = globalThis.fetch;
-    globalThis.fetch = (async (_url: string, init: RequestInit) => {
-      const headers = init.headers as Record<string, string>;
-      calls.push({ method: init.method, csrf: headers["x-tomo-csrf"] });
-      return calls.length === 1 ? new Response(JSON.stringify({ error: "invalid_csrf" }), { status: 403 })
-        : new Response(JSON.stringify({ ok: true }), { status: 200 });
-    }) as typeof fetch;
-    try {
-      const boot = { epoch: "e1", csrfToken: "old" } as WebBootstrap;
-      expect(await mutate("/cron/x", "DELETE", {}, boot, async () => ({ ...boot, csrfToken: "new" }))).toEqual({ ok: true });
-      expect(calls).toEqual([{ method: "DELETE", csrf: "old" }, { method: "DELETE", csrf: "new" }]);
-      calls.length = 0;
-      await expect(mutate("/cron/x", "DELETE", {}, boot, async () => ({ ...boot, epoch: "e2", csrfToken: "new" }))).rejects.toEqual(new ApiError(409, "epoch_changed"));
-      expect(calls).toHaveLength(1);
-    } finally { globalThis.fetch = original; }
+    expect((await service.get("/api/v1/cron")).json<{ jobs: unknown[] }>().jobs).toEqual([]);
   });
 });

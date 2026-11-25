@@ -6,7 +6,6 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { WebAccess } from "../src/web/access.js";
 import { loadWebToken, writeWebAccessLinks } from "../src/web/token-store.js";
 import { scrubSecretValues } from "../src/redact.js";
-import { parseWebConfig } from "../src/web/config.js";
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
@@ -81,11 +80,4 @@ describe("persistent token", () => {
     expect(scrubSecretValues(`Web UI: ${link}`)).toBe(`Web UI: ${origin}/?t=***`);
     expect(scrubSecretValues(token)).toBe("***");
   });
-});
-
-it("accepts only an exact HTTPS Serve origin in optional configuration", () => {
-  expect(parseWebConfig({ externalOrigin: "https://test-node.test-tailnet.ts.net" }).enabled).toBe(true);
-  for (const externalOrigin of ["http://test-node.test-tailnet.ts.net", "https://*.ts.net", "https://example.com", "https://test-node.test-tailnet.ts.net/", "https://test-node.test-tailnet.ts.net/path", "https://user@test-node.test-tailnet.ts.net"]) {
-    expect(parseWebConfig({ externalOrigin }).enabled).toBe(false);
-  }
 });

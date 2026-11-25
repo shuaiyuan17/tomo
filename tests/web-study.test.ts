@@ -1,114 +1,30 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, linkSync, rmSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { MemoryReader } from "../src/workspace/memory-reader.js";
-import { CronStore } from "../src/cron/store.js";
-import { MAX_CRON_STORE_BYTES, WebCron, readSessionContext } from "../src/web/inspection.js";
-import { execFileSync } from "node:child_process";
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { parseResolutions, TodoStore } from "../src/todos/store.js";
-import { DEFAULT_TODOS } from "../src/todos/limits.js";
-import { readWebTodos } from "../src/web/todos-view.js";
-import { configFields, mcpServers, WebConfigReader } from "../src/web/config-view.js";
+import { readSessionContext } from "../src/web/inspection.js";
 import { computeContextStats } from "../src/lcm/stats.js";
 import { readSummaryBlocks } from "../src/lcm/summary-reader.js";
-import { McpLiveStatus } from "../src/mcp/live-status.js";
-import { startWebHttp } from "../src/web/http.js";
 import { WebData } from "../src/web/data.js";
 import { WebChannel } from "../src/channels/web.js";
 import { SessionStore } from "../src/sessions/store.js";
 import { watchBus } from "../src/watch/bus.js";
 import type { SessionEntry } from "../src/sessions/types.js";
 import type { WebBootstrap } from "../src/web/protocol.js";
+import { channelRpc, startWebService, type Headers, type WebService } from "./helpers/web-http.js";
+import { DAY, NOW, seedTodos } from "./helpers/web-todos-fixture.js";
 
+/**
+ * The Study's server side: a session's context (src/web/inspection.ts) and
+ * every Study route over HTTP. Each tab's reader has its own file:
+ * web-memory-reader, web-config-view, web-todos-view, web-cron.
+ */
 let root: string;
-let memory: MemoryReader;
 beforeEach(() => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "tomo-web-study-")));
   mkdirSync(join(root, "memory", "topics"), { recursive: true });
-  memory = new MemoryReader(root);
 });
 afterEach(() => { rmSync(root, { recursive: true, force: true }); });
-
-describe("memory reader", () => {
-  it("lists an index, topic subdirectories and markdown files, and searches literally", async () => {
-    writeFileSync(join(root, "memory", "MEMORY.md"), "# Index\n[Topic](topics/topic.md)");
-    writeFileSync(join(root, "memory", "TODO-work.md"), "- [x] Done\n- [ ] Next [literal]");
-    writeFileSync(join(root, "memory", "topics", "topic.md"), "A topic [literal]");
-    writeFileSync(join(root, "memory", "topics", "TODO-nested.md"), "- [ ] Nested");
-    expect((await memory.tree()).entries.map((e) => e.path)).toEqual(["MEMORY.md", "TODO-work.md", "topics", "topics/TODO-nested.md", "topics/topic.md"]);
-    expect((await memory.search("[literal]")).results).toHaveLength(2);
-    expect((await memory.file("MEMORY.md")).content).toContain("# Index");
-  });
-
-  it.each(["../outside.md", "/outside.md", "topics/../../outside.md", "topics\\outside.md", "topics/./topic.md", "note.txt"])("rejects an unsafe path %s", async (path) => {
-    await expect(memory.file(path)).rejects.toMatchObject({ code: "invalid_path" });
-  });
-
-  it("rejects file, directory and root symlinks, plus hard links", async () => {
-    writeFileSync(join(root, "outside.md"), "outside content");
-    symlinkSync(join(root, "outside.md"), join(root, "memory", "alias.md"));
-    symlinkSync(root, join(root, "memory", "escape"));
-    linkSync(join(root, "outside.md"), join(root, "memory", "hard.md"));
-    await expect(memory.file("alias.md")).rejects.toThrow();
-    await expect(memory.file("escape/outside.md")).rejects.toThrow();
-    await expect(memory.file("hard.md")).rejects.toThrow();
-    expect(JSON.stringify(await memory.search("outside content"))).not.toContain("outside content");
-    rmSync(join(root, "memory"), { recursive: true }); symlinkSync(root, join(root, "memory"));
-    await expect(memory.tree()).rejects.toThrow();
-  });
-
-  it("bounds reads and tells missing memory apart from an empty result", async () => {
-    writeFileSync(join(root, "memory", "large.md"), "x".repeat(256 * 1024 + 1));
-    await expect(memory.file("large.md")).rejects.toMatchObject({ code: "limit" });
-    await expect(memory.file("missing.md")).rejects.toMatchObject({ code: "not_found" });
-    rmSync(join(root, "memory"), { recursive: true });
-    expect(await memory.tree()).toMatchObject({ missing: true });
-  });
-
-  describe("memory/private/ is never served", () => {
-    beforeEach(() => {
-      mkdirSync(join(root, "memory", "private", "people"), { recursive: true });
-      writeFileSync(join(root, "memory", "private", "note.md"), "PRIVATE-NEEDLE owner-only note");
-      writeFileSync(join(root, "memory", "private", "TODO.md"), "- [ ] PRIVATE-NEEDLE task");
-      writeFileSync(join(root, "memory", "private", "people", "friend.md"), "PRIVATE-NEEDLE person");
-      writeFileSync(join(root, "memory", "MEMORY.md"), "# Index\n- [Public](topics/topic.md)\n- [Secret](private/note.md) PRIVATE-NEEDLE\n- [Also](./private/people/friend.md)");
-      writeFileSync(join(root, "memory", "topics", "topic.md"), "public topic");
-    });
-
-    it("is absent from the tree and search", async () => {
-      const tree = await memory.tree();
-      expect(tree.entries.map((e) => e.path)).toEqual(["MEMORY.md", "topics", "topics/topic.md"]);
-      const found = await memory.search("PRIVATE-NEEDLE");
-      expect(found.results).toEqual([]);
-      expect(found.unreadable).toBe(0);
-    });
-
-    it.each(["private/note.md", "PRIVATE/note.md", "Private/people/friend.md", "private/TODO.md"])("reads %s as not found", async (path) => {
-      await expect(memory.file(path)).rejects.toMatchObject({ code: "not_found" });
-    });
-
-    it("withholds index lines that link into private/", async () => {
-      const index = await memory.file("MEMORY.md");
-      expect(index.content).toBe("# Index\n- [Public](topics/topic.md)");
-      expect(index.hiddenLines).toBe(2);
-    });
-
-    it("does not follow a public-looking symlink into private/", async () => {
-      symlinkSync(join(root, "memory", "private"), join(root, "memory", "notes"));
-      expect((await memory.tree()).entries.map((e) => e.path)).not.toContain("notes");
-      await expect(memory.file("notes/note.md")).rejects.toThrow();
-    });
-
-    it("uses the agent's own private-memory fence, not a copy", async () => {
-      // A case-insensitive volume would open memory/PRIVATE/ as private/; the
-      // shared fence folds case, so the reader refuses it before opening.
-      expect(memory.isPrivate("PRIVATE/x.md")).toBe(true);
-      expect(memory.isPrivate("privateer.md")).toBe(false);
-    });
-  });
-});
 
 describe("context", () => {
   it("uses the CLI token estimator and summary-block parser, keeping reported usage separate", async () => {
@@ -146,280 +62,20 @@ describe("context", () => {
   });
 });
 
-describe("cron list", () => {
-  it("lists a job's intent and run state", async () => {
-    const path = join(root, "data", "cron", "jobs.json");
-    const store = new CronStore(path);
-    const job = store.add({ name: "Example task", schedule: { kind: "every", everyMs: 60_000 }, message: "Review the test note", sessionKey: "dm:owner" });
-    expect((await new WebCron(path).list()).jobs).toEqual([expect.objectContaining({ id: job.id, name: "Example task", message: "Review the test note",
-      sessionKey: "dm:owner", scheduleLabel: "every 1m", enabled: true, lastStatus: null })]);
-  });
-  it("reports an unreadable store as unavailable, not as no jobs", async () => {
-    const path = join(root, "jobs.json");
-    writeFileSync(path, "{not json");
-    await expect(new WebCron(path).list()).rejects.toMatchObject({ status: 503, code: "cron_unavailable" });
-    writeFileSync(path, JSON.stringify({ jobs: [null] }));
-    await expect(new WebCron(path).list()).rejects.toMatchObject({ code: "cron_unavailable" });
-  });
-  it("reads a missing store as no jobs, and has no path of its own", async () => {
-    expect(await new WebCron(join(root, "absent.json")).list()).toEqual({ jobs: [] });
-    await expect(new WebCron(undefined).list()).rejects.toMatchObject({ code: "cron_unavailable" });
-  });
-  it("refuses a FIFO, a symlink and a directory without blocking", async () => {
-    const fifo = join(root, "fifo.json");
-    execFileSync("mkfifo", [fifo]);
-    await expect(new WebCron(fifo).list()).rejects.toMatchObject({ code: "cron_unavailable" });
-    const real = join(root, "real.json"); writeFileSync(real, JSON.stringify({ version: 1, revision: 1, jobs: [] }));
-    symlinkSync(real, join(root, "link.json"));
-    await expect(new WebCron(join(root, "link.json")).list()).rejects.toMatchObject({ code: "cron_unavailable" });
-    await expect(new WebCron(root).list()).rejects.toMatchObject({ code: "cron_unavailable" });
-  });
-  it("refuses a store over the size bound with an explicit error", async () => {
-    const path = join(root, "big.json");
-    writeFileSync(path, JSON.stringify({ version: 1, revision: 1, jobs: [], pad: "x".repeat(MAX_CRON_STORE_BYTES) }));
-    await expect(new WebCron(path).list()).rejects.toMatchObject({ status: 413, code: "cron_store_too_large" });
-  });
-});
-
-describe("config view", () => {
-  const secrets = ["123456:AAH-telegram-bot-token-value", "sk-ant-synthetic-api-key-0001", "synthetic-group-secret", "env-secret-value-0001",
-    "header-secret-value-0001", "https://user:pw-synthetic@example.test/v1", "litellm-key-value-0001"];
-  const file = {
-    model: "claude-opus-5-5",
-    channels: { telegram: { token: secrets[0], allowlist: ["12345"] } },
-    auth: { apiKey: secrets[1] },
-    groupSecret: secrets[2],
-    litellm: { baseUrl: secrets[5], apiKey: secrets[6] },
-    mcpServers: {
-      search: { type: "stdio", command: "npx", args: ["--token", "x"], env: { SEARCH_KEY: secrets[3] }, timeout: 30, enabled: true },
-      remote: { type: "http", url: "https://mcp.example.test/mcp", headers: { Authorization: secrets[4] }, enabled: false },
-    },
-    web: { enabled: true, port: 9465 },
-  };
-
-  it("shows ordinary values and masks every credential", () => {
-    const { fields } = configFields(file);
-    const text = JSON.stringify(fields);
-    for (const secret of secrets) expect(text).not.toContain(secret);
-    const at = (path: string) => fields.find((f) => f.path.join(".") === path);
-    expect(at("model")).toMatchObject({ secret: false, value: "claude-opus-5-5" });
-    expect(at("web.port")).toMatchObject({ secret: false, value: 9465 });
-    expect(at("channels.telegram.allowlist")).toMatchObject({ secret: false, value: ["12345"] });
-    expect(at("channels.telegram.token")).toEqual({ path: ["channels", "telegram", "token"], secret: true, set: true, length: secrets[0].length });
-    expect(at("groupSecret")).toMatchObject({ secret: true, set: true });
-    expect(at("litellm.baseUrl")).toMatchObject({ secret: true });
-    // Every MCP value except the safe list is opaque, whatever its key is called.
-    expect(at("mcpServers.search.command")).toMatchObject({ secret: true });
-    expect(at("mcpServers.search.args")).toMatchObject({ secret: true });
-    expect(at("mcpServers.search.timeout")).toMatchObject({ secret: false, value: 30 });
-    expect(at("mcpServers.remote.url")).toMatchObject({ secret: true });
-  });
-
-  it("shows strings only on allowlisted paths; any other string is masked with a length hint", () => {
-    const value = "plain-looking-value";
-    const config = {
-      model: "claude-opus-5-5", timezone: "America/Los_Angeles", steering: true, maxTurns: 40,
-      provider: { key: value }, aws: { accesskey: value, signingkey: value, region: "us-west-2" },
-      someNewFeature: { label: value, enabled: true, limit: 3 }, notes: value,
-      identities: [{ name: "owner", replyPolicy: "last-active", channels: { telegram: "12345" } }],
-      sessionModelOverrides: { "dm:owner": "claude-fable-5-2" },
-      channels: { imessage: { provider: "imsg", inboundSettleMs: 1500, allowlist: ["+15550001"] } },
-    };
-    const { fields } = configFields(config);
-    const at = (path: string) => fields.find((f) => f.path.join(".") === path)!;
-    // Unknown fields (including ones added in the future) are masked by default.
-    expect(at("provider.key")).toEqual({ path: ["provider", "key"], secret: true, set: true, length: value.length });
-    expect(at("aws.accesskey")).toMatchObject({ secret: true, length: value.length });
-    expect(at("aws.signingkey")).toMatchObject({ secret: true });
-    expect(at("aws.region")).toMatchObject({ secret: true });
-    expect(at("someNewFeature.label")).toMatchObject({ secret: true });
-    expect(at("notes")).toMatchObject({ secret: true });
-    expect(JSON.stringify(fields)).not.toContain(value);
-    // Allowlisted strings, numbers and booleans are shown as they are.
-    for (const [path, shown] of Object.entries({ model: "claude-opus-5-5", timezone: "America/Los_Angeles", steering: true, maxTurns: 40,
-      "someNewFeature.enabled": true, "someNewFeature.limit": 3, "identities.0.name": "owner", "identities.0.replyPolicy": "last-active",
-      "identities.0.channels.telegram": "12345", "sessionModelOverrides.dm:owner": "claude-fable-5-2", "channels.imessage.provider": "imsg",
-      "channels.imessage.inboundSettleMs": 1500 })) {
-      expect(at(path), path).toMatchObject({ secret: false, value: shown });
-    }
-    expect(at("channels.imessage.allowlist")).toMatchObject({ secret: false, value: ["+15550001"] });
-  });
-  it("shows a wildcard path's value only when it passes that path's value check", () => {
-    const { fields } = configFields({
-      sessionModelOverrides: { accesskey: "plain-looking-secret", "dm:owner": "claude-opus-5-5", "telegram:-100": "x".repeat(65) },
-      identities: [{ name: "owner", channels: { telegram: "12345", imessage: "owner@example.com", Weird_Key: "12345", slack: "xoxb-not-an-id" } }],
-      channels: { telegram: { provider: "plain-looking-secret", allowlist: ["-100200", "not an id"] }, Telegram: { provider: "imsg" } },
-      plugins: ["./plugins/local", { name: "@scope/plugin", path: "plain looking secret?" }],
-    });
-    const at = (path: string) => fields.find((f) => f.path.join(".") === path)!;
-    expect(at("sessionModelOverrides.accesskey")).toMatchObject({ secret: true, length: "plain-looking-secret".length });
-    expect(at("sessionModelOverrides.dm:owner")).toMatchObject({ secret: false, value: "claude-opus-5-5" });
-    expect(at("sessionModelOverrides.telegram:-100")).toMatchObject({ secret: true });
-    expect(at("identities.0.channels.telegram")).toMatchObject({ secret: false, value: "12345" });
-    expect(at("identities.0.channels.imessage")).toMatchObject({ secret: false, value: "owner@example.com" });
-    expect(at("identities.0.channels.slack")).toMatchObject({ secret: true });
-    expect(at("channels.telegram.provider")).toMatchObject({ secret: true });
-    expect(at("channels.Telegram.provider")).toMatchObject({ secret: true });
-    expect(at("channels.telegram.allowlist")).toMatchObject({ secret: true });
-    expect(at("plugins.0")).toMatchObject({ secret: false, value: "./plugins/local" });
-    expect(at("plugins.1.name")).toMatchObject({ secret: false, value: "@scope/plugin" });
-    expect(at("plugins.1.path")).toMatchObject({ secret: true });
-    expect(JSON.stringify(fields)).not.toContain("plain-looking-secret");
-    expect(JSON.stringify(fields)).not.toContain("xoxb-not-an-id");
-  });
-  it("never echoes a key that looks like a credential", () => {
-    const { fields } = configFields({ sessionModelOverrides: { "sk-ant-api03-synthetic000000000000000000": "claude-opus-5-5" } });
-    expect(JSON.stringify(fields)).not.toContain("sk-ant-api03");
-  });
-  it("shows legacy iMessage session keys and effort levels in per-session overrides", () => {
-    const key = "imessage:any;+;chat0000000001";
-    const { fields } = configFields({ effort: "high", sessionModelOverrides: { [key]: "claude-opus-5-5" }, sessionEffortOverrides: { [key]: "low", "dm:owner": "turbo-ish" } });
-    const at = (path: string) => fields.find((f) => f.path.join(".") === path);
-    expect(at("effort")).toMatchObject({ secret: false, value: "high" });
-    expect(at(`sessionModelOverrides.${key}`)).toMatchObject({ secret: false, value: "claude-opus-5-5" });
-    expect(at(`sessionEffortOverrides.${key}`)).toMatchObject({ secret: false, value: "low" });
-    expect(at("sessionEffortOverrides.dm:owner")).toMatchObject({ secret: true });
-  });
-  it("masks an allowlisted string that looks like a credential, and numbers under a credential name", () => {
-    const { fields } = configFields({ model: "sk-ant-api03-synthetic-0000000000000000", auth: { pin: 1234 }, tokenTtl: 5 });
-    expect(fields.map((f) => [f.path.join("."), f.secret])).toEqual([["model", true], ["auth.pin", true], ["tokenTtl", true]]);
-  });
-
-  it("lists saved MCP servers, including disabled ones, without their values", () => {
-    const servers = mcpServers(file);
-    expect(servers).toEqual([
-      { name: "search", enabled: true, type: "stdio", oauth: false, timeout: 30, alwaysLoad: false, configured: ["args", "command", "env"] },
-      { name: "remote", enabled: false, type: "http", oauth: false, timeout: null, alwaysLoad: false, configured: ["headers", "url"] },
-    ]);
-    for (const secret of secrets) expect(JSON.stringify(servers)).not.toContain(secret);
-  });
-
-  it("reports a missing file as missing and an invalid one without echoing it", async () => {
-    expect(await new WebConfigReader(root).view()).toMatchObject({ missing: true, fields: [] });
-    writeFileSync(join(root, "config.json"), `{"token": "${secrets[0]}",`);
-    await expect(new WebConfigReader(root).view()).rejects.toMatchObject({ code: "config_invalid" });
-  });
-});
-
-describe("MCP live status", () => {
-  it("passes through only SDK-reported state, and times out to unknown", async () => {
-    const ok = new McpLiveStatus({ mcpServerStatus: async () => [{ name: "search", status: "connected", serverInfo: { name: "x" }, error: "secret" }, { name: "bad name!", status: "connected" }] });
-    expect(await ok.read()).toEqual([{ name: "search", status: "connected" }]);
-    const hung = new McpLiveStatus({ mcpServerStatus: () => new Promise(() => {}) });
-    expect(await hung.read(10)).toBeNull();
-    expect(await new McpLiveStatus({}).read()).toBeNull();
-  });
-});
-
-const DAY = 86_400_000;
-/** The fixture's clock: every add and resolve is stamped relative to it, so the response is exact. */
-const NOW = Date.UTC(2026, 10, 18, 12);
-/** Three visible open items (one per waiting_on, one of a group), one of another DM, two closed. */
-function seedTodos(dir: string): void {
-  const store = new TodoStore(dir, DEFAULT_TODOS);
-  const add = (daysAgo: number, input: Record<string, unknown>) => store.add({ session: "dm:owner", source: "self", ...input } as Parameters<TodoStore["add"]>[0], NOW - daysAgo * DAY);
-  const first = add(20, { title: "Fix the flaky test", next: "Reproduce it", waiting_on: "me", review_in: "3d" });
-  const second = add(15, { title: "Compare two barrels", next: "Read reviews", waiting_on: "me", review_in: "3d" });
-  add(9, { title: "Review the release", next: "Read the diff", waiting_on: "owner", review_in: "7d", ref: "https://example.com/pull/41" });
-  const plumber = add(5, { title: "Call the plumber", next: "Phone before noon", waiting_on: "me", review_in: "2d", source: "owner" });
-  add(1, { title: "Pick the next book", next: "Post the poll", waiting_on: "external", review_in: "7d", session: "telegram:-2" });
-  add(1, { title: "OTHER-DM-NEEDLE", next: "OTHER-DM-NEEDLE step", waiting_on: "me", review_in: "3d", session: "dm:someone-else" });
-  store.resolve(first.id, { action: "done", by: "self", evidence: "https://example.com/pull/37" }, NOW - 8 * DAY);
-  store.resolve(second.id, { action: "drop", by: "owner", reason: "No longer needed." }, NOW - 3 * DAY);
-  store.resolve(plumber.id, { action: "snooze", by: "self", until: "3d", reason: "Line was busy." }, NOW - DAY);
-}
-
-describe("web todos view", () => {
-  const view = (dir: string, ownerKey?: string, doneTailBytes?: number) => readWebTodos({ dir, ownerKey, groupTitle: () => "A group", doneTailBytes });
-  it("shows nothing when no owner is configured, rather than everything", async () => {
-    const dir = join(root, "data", "todos");
-    seedTodos(dir);
-    expect(await view(dir)).toMatchObject({ items: [], recent: [], moreResolved: false, openTotal: 4, limits: { maxOpen: DEFAULT_TODOS.maxOpen, maxSnoozes: DEFAULT_TODOS.maxSnoozes } });
-    expect((await view(dir, "dm:owner")).items.map((i) => i.id)).toEqual(["t-3", "t-4", "t-5"]);
-    // A group key is not an owner: it would see only its own item.
-    expect((await view(dir, "telegram:-2")).items.map((i) => i.id)).toEqual(["t-5"]);
-  });
-  it("caps the done log at the newest entries and skips lines that are not whole records", async () => {
-    const dir = join(root, "data", "todos");
-    const store = new TodoStore(dir, { ...DEFAULT_TODOS, maxOpen: 100 });
-    for (let i = 0; i < 25; i++) {
-      const item = store.add({ title: `Item ${i}`, next: "Do it", waiting_on: "me", session: "dm:owner", source: "self" }, NOW - 30 * DAY);
-      store.resolve(item.id, { action: "done", by: "self" }, NOW - (25 - i) * DAY);
-    }
-    writeFileSync(join(dir, "done.ndjson"), readFileSync(join(dir, "done.ndjson"), "utf8")
-      + JSON.stringify({ id: "t-90", session: "dm:owner", title: "HALF-RECORD" }) + "\n" + '{"id":"t-91","session":"dm:ow');
-    const value = await view(dir, "dm:owner");
-    expect(value.moreResolved).toBe(true);
-    expect(value.recent).toHaveLength(20);
-    expect(value.recent[0]).toMatchObject({ id: "t-25", title: "Item 24", resolvedAt: NOW - DAY });
-    expect(JSON.stringify(value)).not.toContain("HALF-RECORD");
-    expect(parseResolutions(readFileSync(join(dir, "done.ndjson"), "utf8")).map((r) => r.id).slice(0, 2)).toEqual(["t-1", "t-2"]);
-  });
-
-  it("an incomplete line does not hide a later whole record of the same id", async () => {
-    const dir = join(root, "data", "todos");
-    seedTodos(dir);
-    const log = readFileSync(join(dir, "done.ndjson"), "utf8");
-    const good = log.split("\n").find((line) => line.includes('"id":"t-1"'))!;
-    // Parseable, has the two fields the store's own dedupe looks at, but is not a resolution.
-    const bad = JSON.stringify({ id: "t-1", session: "dm:owner" });
-    writeFileSync(join(dir, "done.ndjson"), `${bad}\n${log}`);
-    expect(parseResolutions(`${bad}\n${good}\n`)).toEqual([JSON.parse(good)]);
-    // Checked before deduping, so the first WHOLE record of an id wins, not the first line.
-    expect(parseResolutions(`${bad}\n${good}\n${good.replace('"done"', '"drop"')}\n`).map((r) => r.resolution)).toEqual(["done"]);
-    expect((await view(dir, "dm:owner")).recent.map((r) => [r.id, r.resolution])).toEqual([["t-2", "drop"], ["t-1", "done"]]);
-    // The store's own read path is unchanged: the same open items as before.
-    expect(new TodoStore(dir, DEFAULT_TODOS).list().map((i) => i.id)).toEqual(["t-3", "t-4", "t-5", "t-6"]);
-  });
-
-  it("reads only the end of the done log, however long it has grown", async () => {
-    const dir = join(root, "data", "todos");
-    seedTodos(dir);
-    const record = (n: number) => JSON.stringify({ id: `t-${n}`, title: `Old ${n}`, next: "x", waiting_on: "me", review_at: new Date(NOW).toISOString(), session: "dm:owner",
-      created_at: new Date(NOW).toISOString(), updated_at: new Date(NOW).toISOString(), source: "self", snoozes: 0,
-      resolution: "done", resolved_at: new Date(NOW - 400 * DAY + n * 60_000).toISOString(), resolved_by: "self" });
-    const lines = Array.from({ length: 3000 }, (_, i) => record(1000 + i));
-    writeFileSync(join(dir, "done.ndjson"), lines.join("\n") + "\n");
-    const tail = lines.slice(-30).join("\n").length + 10; // the last 30 records and a fragment of the one before
-    const value = await view(dir, "dm:owner", tail);
-    expect(value.moreResolved).toBe(true);
-    expect(value.recent.map((r) => r.id)).toEqual(Array.from({ length: 20 }, (_, i) => `t-${3999 - i}`));
-    // Bounded for real: a tail that holds five records yields five, not twenty dug out of the rest.
-    const five = await view(dir, "dm:owner", lines.slice(-5).join("\n").length + 10);
-    expect(five.recent.map((r) => r.id)).toEqual(["t-3999", "t-3998", "t-3997", "t-3996", "t-3995"]);
-    expect(five.moreResolved).toBe(true);
-    // The default bound holds too: 3000 records are well over it, and the answer is the same.
-    expect(statSync(join(dir, "done.ndjson")).size).toBeGreaterThan(256 * 1024);
-    expect((await view(dir, "dm:owner")).recent.map((r) => r.id)).toEqual(value.recent.map((r) => r.id));
-    // An interrupted close (logged, still in todos.json) reads as closed.
-    const open = JSON.parse(readFileSync(join(dir, "todos.json"), "utf8")) as { items: Array<Record<string, unknown>> };
-    writeFileSync(join(dir, "done.ndjson"), lines.join("\n") + "\n" + JSON.stringify({ ...open.items[0], resolution: "done", resolved_at: new Date(NOW).toISOString(), resolved_by: "self" }) + "\n");
-    const healed = await view(dir, "dm:owner");
-    expect(healed.items.map((i) => i.id)).toEqual(["t-4", "t-5"]);
-    expect(healed.openTotal).toBe(3);
-    expect(healed.recent[0]).toMatchObject({ id: "t-3", resolution: "done" });
-  });
-});
-
 describe("Study HTTP", () => {
-  let service: Awaited<ReturnType<typeof startWebHttp>>;
+  let web: WebService;
   let channel: WebChannel;
-  let cookie = "";
   let boot: WebBootstrap;
-  let base: string;
-  const token = "tomo_web_" + "c".repeat(64);
   let reconnects: string[] = [];
-  const reconnect = async (body: unknown, headers: Record<string, string> = {}) => {
-    const response = await fetch(base + "/api/v1/mcp/reconnect", { method: "POST", body: JSON.stringify(body), headers: { "x-tomo-request": "1", "sec-fetch-site": "same-origin", cookie,
-      origin: base, "content-type": "application/json", "x-tomo-csrf": boot.csrfToken, "x-tomo-epoch": boot.epoch, ...headers } });
-    return { status: response.status, value: await response.json() as Record<string, unknown> };
+  const reconnect = async (body: unknown, headers: Headers = {}) => {
+    const response = await web.send("POST", "/api/v1/mcp/reconnect", body, headers);
+    return { status: response.status, value: response.json() };
   };
-  const call = async (path: string, headers: Record<string, string> = {}) => {
-    const response = await fetch(base + "/api/v1" + path, { headers: { "x-tomo-request": "1", "sec-fetch-site": "same-origin", cookie, ...headers } });
-    return { status: response.status, value: await response.json() as Record<string, unknown>, text: "" };
+  const call = async (path: string, headers: Headers = {}) => {
+    const response = await web.get("/api/v1" + path, headers);
+    return { status: response.status, value: response.json() };
   };
   beforeEach(async () => {
-    cookie = "";
     reconnects = [];
     writeFileSync(join(root, "memory", "TODO.md"), "- [ ] LEGACY-MARKDOWN task");
     seedTodos(join(root, "data", "todos"));
@@ -434,21 +90,14 @@ describe("Study HTTP", () => {
     sessions.touchSession("dm:owner"); sessions.touchSession("telegram:-2"); sessions.setChatTitle("telegram:-2", "Book club");
     channel = new WebChannel(owner); channel.onMessage(async () => true);
     const data = new WebData({ workspaceDir: root, tomoHome: root, cronStorePath: join(root, "jobs.json"), sessionsDir, sdkSessionsDir, owner, todoLimits: { maxOpen: 12, maxSnoozes: 2 } });
-    service = await startWebHttp(0, { accessToken: token, assetsDir: root, data,
-      subscribe: (fn) => channel.events.subscribe(fn), rpc: async (rpc) => {
-        if (rpc.method === "snapshot") return { snapshot: channel.snapshot(), replay: null };
-        if (rpc.method === "mcp-status") return { sessions: [{ sessionId: boot.ownerId, connections: [{ name: "search", status: "connected" }] }], oauth: [{ name: "search", oauth: "login-required" }] };
-        if (rpc.method === "context-events") return channel.contextEvents(rpc.sessionId);
-        if (rpc.method === "epoch") return channel.events.epoch;
-        if (rpc.method === "mcp-reconnect") { reconnects.push(rpc.server); return { outcome: "reconnected" }; }
-        throw new Error("unexpected rpc");
-      } });
-    base = `http://127.0.0.1:${service.port}`;
-    const response = await fetch(`${base}/api/v1/bootstrap?t=${token}`, { headers: { "x-tomo-request": "1", "sec-fetch-site": "same-origin" } });
-    cookie = response.headers.getSetCookie()[0].split(";")[0];
-    boot = await response.json() as WebBootstrap;
+    web = await startWebService({ assetsDir: root, data, subscribe: (fn) => channel.events.subscribe(fn), rpc: channelRpc(channel, {
+      "mcp-status": () => ({ sessions: [{ sessionId: boot.ownerId, connections: [{ name: "search", status: "connected" }] }], oauth: [{ name: "search", oauth: "login-required" }] }),
+      "context-events": (rpc: { sessionId: string }) => channel.contextEvents(rpc.sessionId),
+      "mcp-reconnect": (rpc: { server: string }) => { reconnects.push(rpc.server); return { outcome: "reconnected" }; },
+    }) });
+    boot = web.boot;
   });
-  afterEach(async () => { await service?.close(); await channel?.stop(); });
+  afterEach(async () => { await web?.close(); await channel?.stop(); });
 
   it("requires authentication on every Study read", async () => {
     for (const path of ["/todos", "/memory/tree", "/memory/file?path=TODO.md", "/memory/search?q=test", "/cron", "/config", "/mcp", `/sessions/${boot.ownerId}/context`]) {
@@ -554,16 +203,5 @@ describe("Study HTTP", () => {
     const context = await call(`/sessions/${boot.ownerId}/context`);
     expect(context.value).toMatchObject({ used: null, analysisStatus: "unavailable", recentCompactions: [{ timestamp: 1000, preTokens: 150000, postTokens: 30000 }] });
     expect((await call(`/sessions/${"x".repeat(43)}/context`)).status).toBe(404);
-  });
-});
-
-describe("Study page helpers", async () => {
-  const { viewFromHash } = await import("../web/src/study-data.js");
-  it("routes #study/<page> and falls back to Todos", () => {
-    expect(viewFromHash("#study/memory")).toBe("memory");
-    expect(viewFromHash("#study")).toBe("todos");
-    expect(viewFromHash("#study/nope")).toBe("todos");
-    expect(viewFromHash("")).toBeNull();
-    expect(viewFromHash("#conversation")).toBeNull();
   });
 });

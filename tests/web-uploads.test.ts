@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { claimUploads, recoverClaims, discardUpload, MAX_STAGED_UPLOADS, MAX_UPLOAD_BYTES, stageUpload, sweepUploads, readUpload, removeUploads, UPLOAD_TTL_MS, UploadError } from "../src/web/uploads.js";
 import { WebChannel } from "../src/channels/web.js";
 import { WatchBus } from "../src/watch/bus.js";
-import { messageInputSchema, type WebEvent } from "../src/web/protocol.js";
 import { isImageFiledFor } from "../src/channels/imageStore.js";
 import { imageSessionKeys, imagePaths, WEB_IMAGE_KEY } from "../src/web/data.js";
 import { neutralizeMarker } from "../src/channels/web.js";
@@ -14,8 +13,9 @@ import { captureSend, takeSent, addFiles, attachmentLabel, canSendWith, dragHasF
 import type { IncomingMessage } from "../src/channels/types.js";
 import { WebRequestJournal } from "../src/web/request-journal.js";
 import { dismissAfterAcceptedSend, pendingUserMessages, resendAfterDraftChange } from "../web/src/pending.js";
+import { ONE_PIXEL_PNG } from "./helpers/png.js";
 
-const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
+const PNG = ONE_PIXEL_PNG;
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0, 0xff, 0xd9]);
 let root: string;
 let dir: string;
@@ -65,8 +65,6 @@ describe("a message with images (web channel)", () => {
     const channel = new WebChannel({ name: "owner", telegram: ["test-owner"], imessage: [] }, new WatchBus(), { uploads: { dir, workspaceDir: workspace }, journal });
     const handled: IncomingMessage[] = [];
     channel.onMessage(vi.fn(async (message: IncomingMessage) => { handled.push(message); return true; }));
-    const events: WebEvent[] = [];
-    channel.events.subscribe(({ event }) => events.push(event));
     return { channel, handled, workspace };
   };
   it("files them in incoming-images like the other channels, with the same marker, and hands them to the model", async () => {
@@ -211,13 +209,6 @@ describe("a message with images (web channel)", () => {
     claimUploads(dir, [a], "recorded-1"); claimUploads(dir, [b], "lost-2");
     expect(recoverClaims(dir, (id) => id === "recorded-1")).toBe(1);
     expect(readdirSync(dir).sort()).toEqual([`${b}.png`]);
-  });
-  it("the schema: at most 6 images, ids only, and text or an image", () => {
-    const base = { requestId: randomUUID() };
-    expect(messageInputSchema.safeParse({ ...base, text: "" }).success).toBe(false);
-    expect(messageInputSchema.safeParse({ ...base, text: "", images: ["a".repeat(32)] }).success).toBe(true);
-    expect(messageInputSchema.safeParse({ ...base, text: "x", images: Array(7).fill("a".repeat(32)) }).success).toBe(false);
-    expect(messageInputSchema.safeParse({ ...base, text: "x", images: ["../etc/passwd"] }).success).toBe(false);
   });
 });
 

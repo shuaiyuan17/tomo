@@ -1,20 +1,11 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { TOOL_PROGRESS_EVERY_MS, WebChannel } from "../src/channels/web.js";
-import { WatchBus } from "../src/watch/bus.js";
-import type { OwnerConfig } from "../src/owner.js";
-import type { WebEvent } from "../src/web/protocol.js";
+import { describe, expect, it } from "vitest";
+import { TOOL_PROGRESS_EVERY_MS } from "../src/channels/web.js";
+import { useWebChannels, type WebChannelOptions } from "./helpers/web-channel.js";
 import type { SdkSignal } from "../src/agent/sdk-signals.js";
 
-const owner: OwnerConfig = { name: "owner", telegram: ["test-owner"], imessage: [] };
-const channels: WebChannel[] = [];
-afterEach(async () => { for (const channel of channels.splice(0)) await channel.stop(); });
-
-function setup(options: ConstructorParameters<typeof WebChannel>[2] = {}) {
-  const bus = new WatchBus();
-  const channel = new WebChannel(owner, bus, options);
-  channels.push(channel);
-  const events: WebEvent[] = [];
-  channel.events.subscribe(({ event }) => events.push(event));
+const webChannel = useWebChannels();
+function setup(options: WebChannelOptions = {}) {
+  const { channel, bus, events } = webChannel(options);
   const signal = (value: SdkSignal, sessionKey: string | null = "dm:owner") => bus.publish({ type: "sdk", ...(sessionKey ? { sessionKey } : {}), signal: value });
   return { channel, bus, events, signal, id: channel.ownerId! };
 }

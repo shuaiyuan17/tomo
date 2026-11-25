@@ -111,17 +111,16 @@ describe("sub-sessions through the Agent", () => {
     mockSdk.responseFn = () => "NO_REPLY";
     release();
     await expect(agent.handleCronMessage("Scheduled group task", "telegram:-100271", { waitForHandoff: true })).resolves.toBe(true);
-    const groupTurn = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex");
+    const groupTurn = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex" && p.text.includes("Scheduled group task"));
     expect(groupTurn).toHaveLength(1);
-    expect(groupTurn[0].text).toContain("Scheduled group task");
     expect(groupTurn[0].text).not.toContain("the private deploy plan");
 
-    // The owner's own next turn gets it.
+    // The owner's own turns get it.
     await channel.simulateMessage(makeMsg({ chatId: "12345", text: "how is it going?" }));
     await drainQueue(agent);
-    const ownerTurn = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex").at(-1);
-    expect(ownerTurn?.text).toContain("how is it going?");
-    expect(ownerTurn?.text).toContain("the private deploy plan");
+    const ownerTurns = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex" && !p.text.includes("Scheduled group task"));
+    expect(ownerTurns.some((p) => p.text.includes("how is it going?"))).toBe(true);
+    expect(ownerTurns.some((p) => p.text.includes("the private deploy plan"))).toBe(true);
     await agent.stop();
   });
 
@@ -335,6 +334,26 @@ describe("sub-sessions through the Agent", () => {
       await agent.stop();
     });
 
+    it("shows the owner's session what a task said through the mirror, once, and not as a direct-send note", async () => {
+      const { agent, channel } = await boot(true, new IdChannel("telegram"));
+      mockSdk.responseFn = (text) => (text.includes("subsession-") && !text.includes('name="mirror"') ? new Promise(() => {}) : "ok");
+      await channel.simulateMessage(owner("hi"));
+      await drainQueue(agent);
+      agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
+      expect((await agent.subsessions!.notify("task:s1", "Which branch?")).ok).toBe(true);
+      await channel.simulateMessage(owner("what's new?"));
+      await waitFor(() => expect(ownerPrompts().at(-1)?.text).toContain("what's new?"));
+      const seen = ownerPrompts().at(-1)!.text;
+      expect(seen).toContain('<tomo-event type="subsession-activity" name="mirror"');
+      expect(seen).toContain("- s1 (notify): Which branch?");
+      expect(seen).not.toContain('type="direct-send"');
+      await waitFor(() => expect(agent.subsessions!.hasUnseenMirror("dm:alex")).toBe(false));
+      await channel.simulateMessage(owner("and now?"));
+      await waitFor(() => expect(ownerPrompts().at(-1)?.text).toContain("and now?"));
+      expect(ownerPrompts().at(-1)!.text).not.toContain('name="mirror"');
+      await agent.stop();
+    });
+
     it("leaves /s alone when sub-sessions are off", async () => {
       const { agent, channel } = await boot(false);
       mockSdk.responseFn = () => "ok";
@@ -543,11 +562,13 @@ describe("sub-sessions through the Agent", () => {
     const groupTurn = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex").map((p) => p.text).join("\n");
     expect(groupTurn).toContain("Scheduled group task");
     expect(groupTurn).not.toContain("SECRET-WORDS");
+    // No direct-send note at all here: the owner's own turns see what a task
+    // said through the mirror, which is own-audience only.
     mockSdk.promptsBySession = [];
     await channel.simulateMessage(makeMsg({ chatId: "12345", text: "anything new?" }));
     await drainQueue(agent);
     const ownerTurn = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex").map((p) => p.text).join("\n");
-    expect(ownerTurn).toContain("SECRET-WORDS");
+    expect(ownerTurn).not.toContain("SECRET-WORDS");
     await agent.stop();
   });
 });

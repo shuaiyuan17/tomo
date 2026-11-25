@@ -7,6 +7,7 @@ import { taskSessionKey } from "../../sessions/keys.js";
 import { IllegalTransitionError, nextStatus, type SubsessionEvent } from "./state-machine.js";
 import {
   OWNER_MESSAGE_IDS_KEEP,
+  CONVERSATION_KEEP,
   REPLY_MAP_KEEP,
   SENT_KEEP,
   SUBSESSION_STATUSES,
@@ -140,6 +141,9 @@ export class SubsessionStore {
         pendingInput: [],
         replyMap: [],
         ownerMessageIds: [],
+        conversation: [],
+        conversationSeq: 0,
+        mirrorSeenSeq: 0,
         nextInputSeq: 1,
         seenThrough: 0,
         sent: [],
@@ -207,6 +211,7 @@ export class SubsessionStore {
         if (from === "active" && record.activeSince !== undefined) {
           record.activeMs += Math.max(0, now - record.activeSince);
           delete record.activeSince;
+          delete record.activeSeenAt;
         }
         record.status = target.status;
         if (target.status === "waiting") {
@@ -217,7 +222,7 @@ export class SubsessionStore {
           delete record.waitingOn;
           delete record.waitingReason;
         }
-        if (target.status === "active") record.activeSince = now;
+        if (target.status === "active") { record.activeSince = now; record.activeSeenAt = now; }
         if (target.status === "finished" || target.status === "cancelled" || target.status === "failed" || target.status === "archived") {
           record.endedAt = now;
         } else {
@@ -421,6 +426,12 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
         && typeof (m as Record<string, unknown>).channel === "string" && typeof (m as Record<string, unknown>).messageId === "string")
       : [],
     ownerMessageIds: Array.isArray(r.ownerMessageIds) ? r.ownerMessageIds.filter((p): p is string => typeof p === "string") : [],
+    conversation: Array.isArray(r.conversation)
+      ? r.conversation.filter((e): e is SubsessionRecord["conversation"][number] => typeof e === "object" && e !== null
+        && typeof (e as Record<string, unknown>).seq === "number" && typeof (e as Record<string, unknown>).text === "string")
+      : [],
+    conversationSeq: num("conversationSeq", 0),
+    mirrorSeenSeq: num("mirrorSeenSeq", 0),
     ...(r.restored === true ? { restored: true } : {}),
     ...(typeof r.activeAtOwnerInputMs === "number" && Number.isFinite(r.activeAtOwnerInputMs) ? { activeAtOwnerInputMs: r.activeAtOwnerInputMs } : { activeAtOwnerInputMs: undefined }),
     ...(Array.isArray(r.earlierReports)
@@ -464,6 +475,7 @@ function trimLists(record: SubsessionRecord): void {
   if (record.sent.length > SENT_KEEP) record.sent = record.sent.slice(-SENT_KEEP);
   if (record.transitions.length > TRANSITION_LOG_KEEP) record.transitions = record.transitions.slice(-TRANSITION_LOG_KEEP);
   if (record.replyMap.length > REPLY_MAP_KEEP) record.replyMap = record.replyMap.slice(-REPLY_MAP_KEEP);
+  if (record.conversation.length > CONVERSATION_KEEP) record.conversation = record.conversation.slice(-CONVERSATION_KEEP);
   if (record.ownerMessageIds.length > OWNER_MESSAGE_IDS_KEEP) record.ownerMessageIds = record.ownerMessageIds.slice(-OWNER_MESSAGE_IDS_KEEP);
 }
 

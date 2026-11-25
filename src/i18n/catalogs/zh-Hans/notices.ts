@@ -39,6 +39,7 @@ export const notices = {
       cronJob: "cron 任务“{{name}}”", heartbeat: "一个心跳回合", restart: "一个重启通知回合",
       interruptedAgents: "一个中断 subagent 通知回合",
       subsessionReport: "一个子会话汇报回合",
+      subsessionMirror: "一个旁观子会话对话的回合",
     },
     label: {
       group: "群“{{title}}”（{{key}}）", groupUntitled: "群 {{key}}",

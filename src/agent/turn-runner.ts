@@ -20,6 +20,15 @@ import type { OwnerText } from "../i18n/index.js";
 import { formatVisibleError, isSafeguardError, type VisibleErrorKind } from "./api-errors.js";
 import { sleep } from "../sleep.js";
 
+/** A sub-session mirror note in flight (Agent: SubsessionService.mirrorNote). */
+export interface MirrorTicket {
+  readonly key: string;
+  /** What goes ahead of the notes: the note and a blank line. */
+  readonly prefix: string;
+  /** Task id → newest conversation seq the note shows. */
+  readonly upTo: Readonly<Record<string, number>>;
+}
+
 /** Request shape for the host's runWithRetry (LiveSession send/steer + retry). */
 export interface RunWithRetryRequest {
   /** The memory-change note at the head of `prompt`, if any: dropped from the
@@ -372,6 +381,12 @@ export interface TurnRunnerDeps {
   /** The turn that carried the note ended: `told` when it ran to its normal
    *  result, else the session goes back to its earlier snapshot. */
   settlePromptContextNote?(ticket: PromptContextTicket, told: boolean): void;
+  /** The owning session's view of its sub-sessions' conversations with the
+   *  owner (never durable: read from the task table each time), put after the
+   *  memory note and ahead of the notes. */
+  takeMirrorNote?(sessionKey: string): MirrorTicket | undefined;
+  /** `told` exactly as for the memory note: the turn ran to its normal result. */
+  settleMirrorNote?(ticket: MirrorTicket, told: boolean): void;
   runWithRetry(req: RunWithRetryRequest): Promise<string>;
   /** Append an assistant response to the session transcript. */
   appendAssistantTranscript(sessionKey: string, content: string, channelName: string, correlation?: { requestId?: string; turnId: string }): void;
@@ -493,10 +508,13 @@ export class TurnRunner {
     let declined = false;
     let notes = "";
     let contextNote: PromptContextTicket | undefined;
+    let mirrorNote: MirrorTicket | undefined;
     try {
       notes = spec.bare ? "" : this.deps.drainPendingNotes(spec.key);
       contextNote = spec.bare ? undefined : this.deps.takePromptContextNote?.(spec.key);
-      const prompt = spec.bare ? spec.prompt : (contextNote?.prefix ?? "") + notes
+      mirrorNote = spec.bare ? undefined : this.deps.takeMirrorNote?.(spec.key);
+      // The memory note stays FIRST: a replaced session strips it by prefix.
+      const prompt = spec.bare ? spec.prompt : (contextNote?.prefix ?? "") + (mirrorNote?.prefix ?? "") + notes
         + (spec.stampChannelName !== undefined
           ? injectTimestamp(spec.prompt, spec.stampChannelName, spec.stampSenderTimeZone)
           : spec.prompt);
@@ -511,6 +529,7 @@ export class TurnRunner {
         // Nothing reached the model: the notes drained for it go back.
         if (notes) this.deps.restorePendingNotes?.(spec.key, notes);
         if (contextNote) this.deps.settlePromptContextNote?.(contextNote, false);
+        if (mirrorNote) this.deps.settleMirrorNote?.(mirrorNote, false);
         await stopTyping({ clear: true });
         if (spec.requestId) watchBus.publish({ type: "turn.requeue", sessionKey: spec.key, requestId: spec.requestId });
         throw err;
@@ -538,11 +557,10 @@ export class TurnRunner {
         // Unlike the notes above, a STOPPED turn does not count as told: Stop
         // says this turn needs no further answer, not that the model took in
         // the memory change it carried. Rolled back, it is told again.
-        if (contextNote) {
-          this.deps.settlePromptContextNote?.(contextNote,
-            spec.promptTaken === true && spec.completed === true && !spec.shutdownInterrupted
-              && !spec.replyContext?.stopped);
-        }
+        const told = spec.promptTaken === true && spec.completed === true && !spec.shutdownInterrupted
+          && !spec.replyContext?.stopped;
+        if (contextNote) this.deps.settlePromptContextNote?.(contextNote, told);
+        if (mirrorNote) this.deps.settleMirrorNote?.(mirrorNote, told);
         this.deps.recordTurnOutcome?.(spec.key, ok);
         watchBus.publish({
           type: "turn.end",

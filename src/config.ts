@@ -358,12 +358,17 @@ export interface SubsessionConfig {
   maxContextTokens: number;
   /** Model for a task that names none; unset follows `model`. */
   defaultModel: string | null;
+  /** How the owning session sees the owner ↔ task conversation: `turn` (a
+   *  silent turn after each round) or `note` (with its next turn). Default turn. */
+  mirror: "turn" | "note";
   /**
    * Hours a task may spend active (running turns) on its own before it is
    * paused for the owner, counted since the owner's last word to it. 0 = no
    * cap. Default 24.
    */
   maxActiveHours: number;
+  /** Track each task as a todo on the owner's list. Default on. */
+  todos: boolean;
 }
 
 export const DEFAULT_SUBSESSIONS: SubsessionConfig = {
@@ -373,7 +378,9 @@ export const DEFAULT_SUBSESSIONS: SubsessionConfig = {
   maxTurns: 200,
   maxContextTokens: 500_000,
   defaultModel: null,
+  mirror: "turn",
   maxActiveHours: 24,
+  todos: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -632,7 +639,9 @@ function parseSubsessionConfig(raw: unknown): SubsessionConfig {
     maxContextTokens: validated("subsessions.maxContextTokens", positiveInt, entry.maxContextTokens, DEFAULT_SUBSESSIONS.maxContextTokens),
     defaultModel: validated("subsessions.defaultModel", z.string().trim().min(1, "expected a model name").nullable(),
       entry.defaultModel ?? null, DEFAULT_SUBSESSIONS.defaultModel),
+    mirror: validated("subsessions.mirror", z.enum(["turn", "note"]), entry.mirror, DEFAULT_SUBSESSIONS.mirror),
     maxActiveHours: validated("subsessions.maxActiveHours", z.number().finite().min(0), entry.maxActiveHours, DEFAULT_SUBSESSIONS.maxActiveHours),
+    todos: validated("subsessions.todos", boolLike, entry.todos, DEFAULT_SUBSESSIONS.todos),
   };
 }
 

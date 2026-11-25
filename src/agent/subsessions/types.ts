@@ -39,6 +39,24 @@ export interface SubsessionReplyRef {
   at: number;
 }
 
+/**
+ * One line of the conversation between the owner and the task, as the owning
+ * session sees it mirrored (service.ts, "mirror"): what the owner wrote to
+ * the task, and what the task said back through its tools. Turns the task
+ * ran on its own without speaking add nothing.
+ */
+export interface SubsessionConversationEntry {
+  /** Per task, increasing; compared with `mirrorSeenSeq`. */
+  seq: number;
+  at: number;
+  from: "owner" | "task";
+  /** owner: "message"; task: the tool that said it, or "fallback". */
+  kind: "message" | "notify" | "reply" | "ask" | "fallback";
+  text: string;
+  /** Files the owner sent with it (count only: their paths stay out of the mirror). */
+  files?: number;
+}
+
 /** One input owed to the task. */
 export interface SubsessionInput {
   seq: number;
@@ -111,6 +129,12 @@ export interface SubsessionRecord {
   /** Set while active: when the current active stretch began. */
   activeSince?: number;
   /**
+   * Set while active: the last time this process saw the task's work going
+   * (a turn starting or ending, and a heartbeat while one runs). A restart
+   * banks active time only up to here, never the downtime after it.
+   */
+  activeSeenAt?: number;
+  /**
    * `activeTotalMs` when the owner last said something to the task (unset:
    * never). The wall-clock cap (`subsessions.maxActiveHours`) counts the
    * active time since then: the owner's word buys it another full stretch.
@@ -175,6 +199,14 @@ export interface SubsessionRecord {
    * and this keeps it from arriving twice.
    */
   ownerMessageIds: string[];
+  /** The owner ↔ task conversation, newest last (at most CONVERSATION_KEEP). */
+  conversation: SubsessionConversationEntry[];
+  /** The last `seq` given out in `conversation`. */
+  conversationSeq: number;
+  /** The newest `seq` the owning session has seen (mirror), advanced only by a turn that completed. */
+  mirrorSeenSeq: number;
+  /** The todo (src/todos) that tracks this task on the owner's list, if one was made. */
+  todoId?: string;
   /**
    * Inputs with seq up to this went out in a turn that did not complete (cut
    * short by a restart, failed, or its result could not be saved): the task
@@ -224,5 +256,6 @@ export const SENT_KEEP = 20;
 export const TRANSITION_LOG_KEEP = 50;
 export const REPLY_MAP_KEEP = 200;
 export const OWNER_MESSAGE_IDS_KEEP = 50;
+export const CONVERSATION_KEEP = 40;
 /** Inputs a task may have owed at once; more are refused (never silently dropped). */
 export const PENDING_INPUT_MAX = 50;

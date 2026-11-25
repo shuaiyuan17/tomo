@@ -1,10 +1,11 @@
-import { constants, statSync } from "node:fs";
+import { constants, readFileSync, statSync } from "node:fs";
 import { open, realpath, type FileHandle } from "node:fs/promises";
 import { basename, extname, join, sep } from "node:path";
 import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
 import { SessionStore } from "../sessions/store.js";
 import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js";
-import { isGroupSessionKey, legacySessionKeysForBinding, normalizeImessageHandle, parseRawSessionKey } from "../sessions/keys.js";
+import { isGroupSessionKey, legacySessionKeysForBinding, normalizeImessageHandle, parseRawSessionKey, taskIdFromSessionKey } from "../sessions/keys.js";
+import { parseTable } from "../agent/subsessions/store.js";
 import { webSessionId } from "./owner.js";
 import { isImageFiledFor } from "../channels/imageStore.js";
 import { sniffImageType } from "./image-type.js";
@@ -247,12 +248,29 @@ export class WebData {
     const entries = new Map(SessionStore.readSnapshot(this.options.sessionsDir, this.options.sdkSessionsDir).map((e) => [e.channelKey, e]));
     const owner = this.options.owner;
     const labels = new Map<string, SessionLabel>();
+    let taskTitles: Map<string, string> | undefined;
+    const taskTitle = (id: string): string | undefined => {
+      // Read once per report, read-only, and best-effort: a cost page must not
+      // fail because the task table is missing or mid-write.
+      if (!taskTitles) {
+        taskTitles = new Map();
+        try {
+          const table = parseTable(JSON.parse(readFileSync(join(this.options.tomoHome!, "data", "subsessions.json"), "utf8")));
+          for (const task of table.tasks) taskTitles.set(task.id, task.title);
+        } catch { /* no titles */ }
+      }
+      return taskTitles.get(id);
+    };
     const describeSession = (key: string): SessionLabel => {
       let label = labels.get(key);
       if (label) return label;
       const id = idByKey.get(key);
       const group = isGroupSessionKey(key);
-      if (id && id === catalog.ownerId) label = { id, label: owner ? `${owner.displayName ?? owner.name} (DM)` : "Owner conversation", kind: "dm" };
+      const taskId = taskIdFromSessionKey(key);
+      if (taskId) {
+        const title = taskTitle(taskId);
+        label = { label: title ? `${taskId} · ${title}` : taskId, kind: "task" };
+      } else if (id && id === catalog.ownerId) label = { id, label: owner ? `${owner.displayName ?? owner.name} (DM)` : "Owner conversation", kind: "dm" };
       else if (group) label = { ...(id ? { id } : {}), label: entries.get(key)?.chatTitle || "Group conversation", kind: "group" };
       else label = { label: entries.get(key)?.chatTitle || "Other conversation", kind: "other" };
       labels.set(key, label);

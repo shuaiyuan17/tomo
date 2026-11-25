@@ -10,7 +10,7 @@ import { isShellTask, shellLabel } from "./shell.js";
 import { ShellPill } from "./shell-pill.js";
 import { ChunkBoundary } from "./chunk-boundary.js";
 import { ModelBadge } from "./model-badge.js";
-import { type TaskRow, type TreeGuide, buildTaskView, elapsed, formatElapsed, lastStep, stateLabel, taskKind, treeGuides } from "./tasks.js";
+import { type TaskRow, type TreeGuide, buildTaskView, formatElapsed, lastStep, rowElapsed, stateLabel, taskKind, treeGuides } from "./tasks.js";
 import { i18n, useTranslation } from "./i18n/index.js";
 import { toolIcon } from "./tool-calls.js";
 import { isOpenSubsession, subsessionState, subsessionStateLabel, isWorkingState } from "./subsessions.js";
@@ -119,11 +119,13 @@ function kindIcon(taskType: string): { Icon: ReturnType<typeof toolIcon>; kind: 
   return undefined;
 }
 
-function TaskCard({ task, depth, guide, now, onOpen, motion }: { task: WebTask; depth: number; guide?: TreeGuide; now: number; onOpen: () => void; motion?: string }) {
+function TaskCard({ task, depth, guide, now, onOpen, motion, childrenRunning, settledAt }: { task: WebTask; depth: number; guide?: TreeGuide; now: number; onOpen: () => void; motion?: string;
+  childrenRunning?: boolean; settledAt?: number }) {
   const { t } = useTranslation("tasks");
   const step = lastStep(task);
-  const time = formatElapsed(elapsed(task, now));
-  const running = task.state === "running";
+  // A task that ended while work it started still runs reads as working, its time running until the last of that ends.
+  const time = formatElapsed(rowElapsed({ task, ...(childrenRunning ? { childrenRunning: true as const } : {}), ...(settledAt !== undefined ? { settledAt } : {}) }, now));
+  const running = task.state === "running" || !!childrenRunning;
   const shell = isShellTask(task.taskType);
   const icon = shell ? undefined : kindIcon(task.taskType);
   return <li ref={motion?.includes("motion-exit") ? measureExit : undefined} style={{ marginLeft: depth * INDENT }} className={cn("relative", motion)}>
@@ -138,7 +140,8 @@ function TaskCard({ task, depth, guide, now, onOpen, motion }: { task: WebTask; 
           {task.background && <span data-testid="task-background" title={t("backgroundTitle")}>{t("backgroundTag")}</span>}{time}</span>}
       </div>
       <p className="mt-0.5 mb-0 text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]">
-        {running ? <><span className="shimmer">{t("working")}</span>{step && <> · {step}</>}</> : <>{stateLabel(task.state)} · {time}</>}
+        {childrenRunning && task.state !== "running" ? <><span className="shimmer">{t("working")}</span> · <span data-testid="task-children-running">{t("childrenRunning")}</span></>
+          : running ? <><span className="shimmer">{t("working")}</span>{step && <> · {step}</>}</> : <>{stateLabel(task.state)} · {time}</>}
       </p>
     </button>
     {guide && <TreeLines depth={depth} guide={guide} elbowY={18} />}
@@ -154,7 +157,7 @@ function SubsessionCard({ task, onOpen }: { task: WebSubsession; onOpen: () => v
     <button type="button" onClick={onOpen} title={t("subsession.openTitle", { id: task.id })}
       className="block w-full cursor-pointer rounded-xl px-2.5 py-2 text-left transition-[background-color,opacity] duration-200 hover:bg-foreground/[0.06] focus-visible:outline-offset-0">
       <span className={cn("block text-[13px] leading-normal font-medium [overflow-wrap:anywhere]", !open && "text-muted-foreground")}>
-        <IdPill id={task.id} className="mr-1.5 align-[1px]" />{task.title}</span>
+        <IdPill id={task.id} className="mr-1.5 align-[1px]" />{task.title}<ModelBadge model={task.model} /></span>
       <p className="mt-0.5 mb-0 line-clamp-2 text-xs leading-normal text-muted-foreground [overflow-wrap:anywhere]">
         {isWorkingState(state) ? <span className="shimmer">{subsessionStateLabel(task)}</span>
           : <span className={cn(state === "waitingOwner" && "font-medium text-foreground/80")}>{subsessionStateLabel(task)}</span>}
@@ -176,7 +179,8 @@ function FoldedShells({ count, depth, guide, open, onToggle, motion }:
 }
 
 /** A row as laid out on screen: a task card, or a fold of finished commands. */
-interface Line { key: string; depth: number; motion?: string; task?: WebTask; fold?: { count: number; open: boolean; id: string } }
+interface Line { key: string; depth: number; motion?: string; task?: WebTask; fold?: { count: number; open: boolean; id: string };
+  childrenRunning?: boolean; settledAt?: number }
 
 const rowKey = (row: TaskRow) => (row.folded ? `folded:${row.foldKey}` : row.task.taskId);
 
@@ -190,7 +194,7 @@ function GroupRows({ sessionId, rows, now, openFolds, setOpenFolds, onOpen }: {
   // included, one level in) and work out which lines pass each one.
   const lines = shown.flatMap(({ item: row, exiting }): Line[] => {
     const motion = exiting ? "motion-exit pointer-events-none" : appeared.has(rowKey(row)) ? "motion-drop" : undefined;
-    if (!row.folded) return [{ key: rowKey(row), depth: row.depth, task: row.task, motion }];
+    if (!row.folded) return [{ key: rowKey(row), depth: row.depth, task: row.task, motion, childrenRunning: row.childrenRunning, settledAt: row.settledAt }];
     const foldId = `${sessionId}/${row.foldKey}`;
     const open = !!openFolds[foldId];
     return [{ key: rowKey(row), depth: row.depth, fold: { count: row.folded.length, open, id: foldId }, motion },
@@ -200,5 +204,5 @@ function GroupRows({ sessionId, rows, now, openFolds, setOpenFolds, onOpen }: {
   return <ul className="m-0 list-none space-y-0.5 p-0">{lines.map((line, i) => line.fold
     ? <FoldedShells key={line.key} motion={line.motion} count={line.fold.count} depth={line.depth} guide={guides[i]} open={line.fold.open}
         onToggle={() => { const id = line.fold!.id; setOpenFolds((old) => ({ ...old, [id]: !old[id] })); }} />
-    : <TaskCard key={line.key} motion={line.motion} task={line.task!} depth={line.depth} guide={guides[i]} now={now} onOpen={() => onOpen(line.task!)} />)}</ul>;
+    : <TaskCard key={line.key} motion={line.motion} task={line.task!} depth={line.depth} guide={guides[i]} now={now} childrenRunning={line.childrenRunning} settledAt={line.settledAt} onOpen={() => onOpen(line.task!)} />)}</ul>;
 }

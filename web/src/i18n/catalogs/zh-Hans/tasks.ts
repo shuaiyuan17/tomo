@@ -6,7 +6,7 @@ export const tasks = {
   watchers: "显示监视任务", watchersCount_other: "显示监视任务（{{count}}）",
   empty: "后台没有在运行的任务。", groupTag: " · 群",
   shellTitle: "{{label}}\n\n{{command}}\n\n打开查看完整命令", untitled: "未命名任务",
-  backgroundTitle: "Tomo 回复后仍会继续运行", backgroundTag: "后台 · ", working: "运行中",
+  backgroundTitle: "Tomo 回复后仍会继续运行", backgroundTag: "后台 · ", working: "运行中", childrenRunning: "它启动的任务还在跑",
   foldedShells_other: "{{count}} 条 shell 命令已完成",
   lastStep_other: "{{tool}} · 调用了 {{count}} 次工具",
   type: { local_agent: "subagent", local_bash: "shell", local_workflow: "工作流", monitor: "监视", mcp_task: "MCP 任务", remote_agent: "远程 agent", task: "任务" },

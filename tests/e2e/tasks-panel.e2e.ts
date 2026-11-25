@@ -84,6 +84,21 @@ it("marks subagents with the trace's robot and shell tasks with its terminal; ch
   await page.screenshot({ path: "test-results/tasks-tree.png" });
 });
 
+it("a subagent that ended while a command it started still runs reads as working, not Done", async () => {
+  const parentTask = task("p1", "local_agent", "UI demo subagent", { background: false, startedAt: Date.now() - 240_000 });
+  const child = task("c1", "local_bash", "Sleep 60 seconds in background", { parentTaskId: "p1", startedAt: Date.now() - 60_000 });
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [parentTask, child] });
+  // The subagent's own turn ends; the command it started runs on.
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [child], ended: [{ taskId: "p1", status: "completed" }] });
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  const parent = row(/UI demo subagent/);
+  await browserExpect(parent.getByTestId("task-children-running")).toBeVisible();
+  await browserExpect(parent).toContainText("Working");
+  await browserExpect(parent).not.toContainText("Done");
+  await browserExpect(parent).toContainText("4m");
+  await parent.screenshot({ path: "test-results/tasks-children-running.png" });
+});
+
 it("rows that left do not linger as invisible gaps when the rail re-renders mid-exit", async () => {
   const kids = (status?: string) => ["k1", "k2"].map((id) => task(id, "local_bash", `git status ${id}`, { parentTaskId: "p1", ...(status ? { status, endedAt: Date.now() } : {}) }));
   watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [task("p1", "local_agent", "Ship the attachments"), ...kids()] });

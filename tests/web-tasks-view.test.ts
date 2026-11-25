@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTaskView, modelLabel, runningCount, elapsed, formatElapsed, lastStep, MAX_TASK_DEPTH, replaceSessionTasks, taskKind, treeGuides } from "../web/src/tasks.js";
+import { buildTaskView, modelLabel, runningCount, elapsed, rowElapsed, formatElapsed, lastStep, MAX_TASK_DEPTH, replaceSessionTasks, taskKind, treeGuides } from "../web/src/tasks.js";
 import type { WebSession, WebTask } from "../src/web/protocol.js";
 
 const session = (id: string, title: string, kind: "dm" | "group"): WebSession =>
@@ -45,6 +45,35 @@ describe("task panel view", () => {
     expect(view.running).toBe(1);
     expect(elapsed(task("b", { startedAt: 1_000, endedAt: 31_000 }), 99_000)).toBe(30_000);
     expect(elapsed(task("a", { startedAt: 1_000 }), 4_500)).toBe(3_500);
+  });
+
+  it("a task that ended while what it started still runs reads as working, its time running until the last of that ends", () => {
+    const view = buildTaskView([
+      task("agent", { state: "completed", startedAt: 0, endedAt: 6_000 }),
+      task("sleep", { taskType: "local_bash", parentTaskId: "agent", startedAt: 2_000 }),
+      task("done", { state: "completed", startedAt: 0, endedAt: 1_000 }),
+    ], sessions, false);
+    const row = (id: string) => view.groups[0].rows.find((r) => r.task.taskId === id)!;
+    expect(row("agent").childrenRunning).toBe(true);
+    expect(rowElapsed(row("agent"), 240_000)).toBe(240_000);
+    expect(row("done").childrenRunning).toBeUndefined();
+    expect(rowElapsed(row("done"), 240_000)).toBe(1_000);
+    // A grandchild counts too; once all of it ended, the time stops at the last end.
+    const deep = buildTaskView([
+      task("agent", { state: "completed", startedAt: 0, endedAt: 6_000 }),
+      task("sub", { state: "completed", parentTaskId: "agent", startedAt: 1_000, endedAt: 7_000 }),
+      task("sleep", { taskType: "local_bash", parentTaskId: "sub", startedAt: 2_000 }),
+    ], sessions, false).groups[0].rows;
+    expect(deep.find((r) => r.task.taskId === "agent")?.childrenRunning).toBe(true);
+    const ended = buildTaskView([
+      task("agent", { state: "completed", startedAt: 0, endedAt: 6_000 }),
+      task("sleep", { taskType: "local_bash", state: "completed", parentTaskId: "agent", startedAt: 2_000, endedAt: 245_000 }),
+    ], sessions, false).groups[0].rows[0];
+    expect(ended.childrenRunning).toBeUndefined();
+    expect(ended.settledAt).toBe(245_000);
+    expect(rowElapsed(ended, 300_000)).toBe(245_000);
+    // A parent cycle does not loop.
+    expect(() => buildTaskView([task("a", { state: "completed", endedAt: 1, parentTaskId: "b" }), task("b", { state: "completed", endedAt: 1, parentTaskId: "a" })], sessions, false)).not.toThrow();
   });
 
   it("formats elapsed time, kind and last step", () => {

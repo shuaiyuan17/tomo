@@ -20,7 +20,9 @@ import { SubsessionService, type OwnerMessageResult, type TaskTurnOutcome } from
 import { parseTaskAddress, type TaskAddress } from "./agent/subsessions/address.js";
 import { taskCommandReply } from "./agent/subsessions/commands.js";
 import { SubsessionStore } from "./agent/subsessions/store.js";
-import { subsessionDetail, subsessionList, subsessionView } from "./web/subsessions-view.js";
+import { subsessionDetail, subsessionList, subsessionView, type SubsessionLive } from "./web/subsessions-view.js";
+import { resolveModelName } from "./models.js";
+import type { SubsessionRecord } from "./agent/subsessions/types.js";
 import type { WebSubsessionAccess } from "./channels/web.js";
 import { buildSubsessionPrompt } from "./agent/subsessions/prompt.js";
 import { createTodoLink } from "./agent/subsessions/todo-link.js";
@@ -1960,11 +1962,16 @@ export class Agent {
     const service = this.subsessions;
     if (!service) return undefined;
     const working = (key: string) => this.liveSessionManager.hasTurnInFlight(key);
+    // The model as its turns resolve it (sdk-options): the record's, else subsessions.defaultModel, else `model`.
+    const live = (record: SubsessionRecord): SubsessionLive => {
+      const chosen = service.modelFor(record.sessionKey) ?? config.model;
+      return { background: service.backgroundRunning(record), model: resolveModelName(chosen) ?? chosen };
+    };
     return {
       list: () => {
         const scope = this.router.ownerSessionKey();
         if (!scope || !service.available()) return { available: false, tasks: [] };
-        try { return { available: true, tasks: subsessionList(service.list(scope), scope, Date.now(), working, (r) => service.backgroundRunning(r)) }; }
+        try { return { available: true, tasks: subsessionList(service.list(scope), scope, Date.now(), working, live) }; }
         catch { return { available: false, tasks: [] }; }
       },
       get: (id) => {
@@ -1973,7 +1980,7 @@ export class Agent {
         if (!scope || !service.available()) return null;
         let record;
         try { record = service.get(id); } catch { return null; }
-        return record ? subsessionDetail(record, scope, Date.now(), working(record.sessionKey), service.backgroundRunning(record)) : undefined;
+        return record ? subsessionDetail(record, scope, Date.now(), working(record.sessionKey), live(record)) : undefined;
       },
       message: (id, text, requestId) => {
         const scope = this.router.ownerSessionKey();
@@ -1981,7 +1988,7 @@ export class Agent {
         const result = service.ownerMessage(scope, id, text, { messageId: `web:${requestId}` });
         if (!result.ok) return { ok: false, reason: result.reason };
         if (!result.duplicate) log.info({ channel: "web", task: result.record.id, status: result.record.status }, "Owner message handed to a sub-session");
-        const task = subsessionView(result.record, scope, Date.now(), working(result.record.sessionKey));
+        const task = subsessionView(result.record, scope, Date.now(), working(result.record.sessionKey), live(result.record));
         return task ? { ok: true, duplicate: result.duplicate, task } : { ok: false, reason: "unknown" };
       },
     };

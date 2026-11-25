@@ -64,6 +64,9 @@ beforeEach(async () => {
       if (input.method === "task-action") return channel.taskAction(input.sessionId, input.taskId, input.action);
       if (input.method === "task") return channel.task(input.sessionId, input.taskId, input.output);
       if (input.method === "usage") return channel.usage(input.refresh);
+      if (input.method === "subsessions") return channel.subsessionList();
+      if (input.method === "subsession") return channel.subsession(input.id);
+      if (input.method === "subsession-message") return channel.messageSubsession(input.id, input.input);
       return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };
     } });
   const response = await call(`/api/v1/bootstrap?t=${accessToken}`);
@@ -208,6 +211,33 @@ describe("local HTTP boundary", () => {
     expect(busy.status).toBe(409);
     expect(JSON.parse(busy.text)).toEqual({ error: "tasks_running" });
     expect(compact).toHaveBeenCalledTimes(1);
+  });
+  it("the owner writes to a sub-session through its own route, with CSRF and the epoch; groups stay read-only", async () => {
+    const task = { id: "s1", title: "T", status: "waiting" as const, waitingOn: "owner" as const, working: false, createdAt: 1, lastActivityAt: 1, activeMs: 0, revision: 1, writable: true };
+    const message = vi.fn((_id: string, _text: string, _requestId: string) => ({ ok: true as const, duplicate: false, task }));
+    const get = vi.fn((id: string) => id === "s1" ? { ...task, brief: "b", conversation: [] } : undefined);
+    (channel as unknown as { subsessionAccess: unknown }).subsessionAccess = { list: () => ({ available: true, tasks: [task] }), get, message };
+    expect(JSON.parse((await call("/api/v1/subsessions")).text)).toEqual({ available: true, tasks: [task] });
+    expect(JSON.parse((await call("/api/v1/subsessions/s1")).text)).toMatchObject({ id: "s1", brief: "b" });
+    expect((await call("/api/v1/subsessions/s2")).status).toBe(404);
+    for (const bad of ["dm:owner", "task:s1", "s0", "..%2Fs1"]) expect((await call(`/api/v1/subsessions/${bad}`)).status).toBe(404);
+    const post = (path: string, body: unknown, headers: Record<string, string | undefined> = mutationHeaders()) =>
+      call(`/api/v1/subsessions/${path}/messages`, { method: "POST", headers, body: JSON.stringify(body) });
+    const requestId = randomUUID();
+    expect((await post("s1", { requestId, text: "hi" }, { ...mutationHeaders(), "x-tomo-csrf": "wrong" })).status).toBe(403);
+    expect((await post("s1", { requestId, text: "hi" }, { ...mutationHeaders(), "x-tomo-epoch": undefined })).status).toBe(409);
+    expect((await post("s1", { requestId, text: "  " })).status).toBe(400);
+    expect((await post("task:s1", { requestId, text: "hi" })).status).toBe(404);
+    expect(message).not.toHaveBeenCalled();
+    const ok = await post("s1", { requestId, text: "use plan B" });
+    expect(ok.status).toBe(200);
+    expect(JSON.parse(ok.text)).toEqual({ status: "delivered", task });
+    expect(message).toHaveBeenCalledWith("s1", "use plan B", requestId);
+    // Nothing went through the DM's ingress, and a group is still not writable through /messages.
+    expect(handoff).not.toHaveBeenCalled();
+    const group = bootstrap.sessions.find((s) => s.id !== bootstrap.ownerId)!;
+    const refused = await call("/api/v1/messages", { method: "POST", headers: mutationHeaders(), body: JSON.stringify({ requestId: randomUUID(), targetId: group.id, text: "hi" }) });
+    expect(refused.status).toBe(403);
   });
   it("stop needs CSRF and the epoch, and reaches the owner conversation's running turn", async () => {
     const stop = vi.fn(async (_key: string) => true);

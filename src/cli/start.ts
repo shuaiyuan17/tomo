@@ -254,6 +254,7 @@ async function startForeground(): Promise<void> {
         models: { view: (key) => agent.webModelView(key), switch: (key, model, from) => agent.switchModelFromWeb(key, model, from) },
         sessionKeys: sessionKeysReader({ owner: config.owner, sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir }),
         home: { view: () => home.web(), snapshot: (input) => home.deliverSnapshot(input) },
+        subsessions: agent.webSubsessions(),
         // A sandboxed group's request_permission: Allow once / Always allow / Deny.
         permissions: {
           current: () => agent.permissionBroker.views(),
@@ -278,6 +279,7 @@ async function startForeground(): Promise<void> {
       home.attachWeb({ publish: (event) => web.events.publish(event), available: () => supervisor.status().state === "running",
         mayShowTask: (key) => web.mayShowTask(key) });
       agent.addChannel(web);
+      agent.onSubsessionsChanged(() => web.publishSubsessionsChanged());
       // /tasks in chat reads the same board the Tasks panel shows.
       agent.setTaskSource(web.tasks);
       web.markRecorded(agent.recordedWebRequests(web.interruptedAwaiting(), WEB_CHAT_ID));

@@ -26,4 +26,19 @@ export const tasks = {
   brief: { heading: "Brief", less: "Show less", more: "Show more", truncated: "{{text}}\n\n… (truncated)" },
   note: { loading: "Opening…", missing: "Nothing recorded for this task yet.", gone: "This task has left the panel, so nothing more can be loaded.", error: "This task can't be shown right now." },
   command: { heading: "Command", truncated: "\n… (truncated)" },
+  subsession: {
+    group: "Sub-sessions", openTitle: "Open {{id}} to talk to it",
+    state: { working: "Working", active: "Active", queued: "Queued", waitingOwner: "Waiting for you", waiting: "Waiting", finished: "Done", cancelled: "Cancelled", failed: "Failed" },
+    conversation: "Conversation with {{id}}", nothingYet: "Nothing said yet. Write to {{id}} below.",
+    you: "You", tag: { ask: "Question", notify: "Update" }, report: "Report",
+    files_one: "{{count}} file", files_other: "{{count}} files",
+    label: "Message to {{id}}", placeholder: "Message {{id}}…", send: "Send to {{id}}",
+    sending: "Sending…", sent: "Sent", retry: "Try again",
+    ended: "This task has ended. It can't be written to any more.", gone: "This task is no longer available.",
+    error: {
+      ended: "Not sent: the task has ended.", full: "Not sent: too many messages are already waiting for it.",
+      gone: "Not sent: the task is gone.", unavailable: "Not sent: sub-sessions can't be reached right now.",
+      network: "Not confirmed. It may not have arrived.",
+    },
+  },
 } as const;

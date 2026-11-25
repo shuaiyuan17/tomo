@@ -28,4 +28,19 @@ export const tasks = {
   brief: { heading: "任务说明", less: "收起", more: "展开", truncated: "{{text}}\n\n…（已截断）" },
   note: { loading: "打开中…", missing: "这个任务还没有记录。", gone: "这个任务已经离开面板，无法再加载更多。", error: "这个任务暂时无法显示。" },
   command: { heading: "命令", truncated: "\n…（已截断）" },
+  subsession: {
+    group: "子会话", openTitle: "打开 {{id}}，和它对话",
+    state: { working: "工作中", active: "进行中", queued: "排队中", waitingOwner: "等你回复", waiting: "等待中", finished: "已完成", cancelled: "已取消", failed: "失败" },
+    conversation: "和 {{id}} 的对话", nothingYet: "还没有对话。可以在下面给 {{id}} 留言。",
+    you: "你", tag: { ask: "提问", notify: "通知" }, report: "报告",
+    files_other: "{{count}} 个文件",
+    label: "发给 {{id}} 的消息", placeholder: "给 {{id}} 发消息…", send: "发给 {{id}}",
+    sending: "发送中…", sent: "已发送", retry: "重试",
+    ended: "这个任务已经结束，不能再发消息。", gone: "这个任务已经不在了。",
+    error: {
+      ended: "没发出：任务已经结束。", full: "没发出：等它处理的消息太多了。",
+      gone: "没发出：任务已经不在了。", unavailable: "没发出：现在连不上子会话。",
+      network: "没收到确认，可能没送达。",
+    },
+  },
 } satisfies Translation<typeof en>;

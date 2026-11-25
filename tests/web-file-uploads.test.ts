@@ -375,6 +375,9 @@ describe("peekUpload: gone only on the record of it", () => {
     // Any age, record swept or not: the id dates itself, so the answer stays definite.
     sweepUploads(dir, Date.now() + GONE_TTL_MS + 60 * 60 * 1000);
     expect(peekUpload(dir, old, Date.now() + 30 * 24 * 60 * 60 * 1000)).toBeUndefined();
+    // A server clock moved back after staging: the id looks future-dated, but the file is there — it is found, not gone.
+    const ahead = stageUpload(dir, PNG, Date.now() + 3 * 60 * 60 * 1000).uploadId;
+    expect(peekUpload(dir, ahead)?.kind).toBe("image");
     // An id from before this scheme (all random) claims an impossible time: gone, not unsettled.
     expect(peekUpload(dir, "f".repeat(32))).toBeUndefined();
     // An id staged within the TTL with no file and no record: unsettled (mid-claim), kept by the page.

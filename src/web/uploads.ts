@@ -173,14 +173,16 @@ export function peekUpload(dir: string, uploadId: string, now = Date.now()): { k
   if (!UPLOAD_ID.test(uploadId)) return undefined;
   // Gone only on the record of it (markGone): a claim is a rename that can land
   // and release between any two lookups here, any number of times.
-  if (isGone(dir, uploadId) || outlived(uploadId, now)) return undefined;
+  if (isGone(dir, uploadId)) return undefined;
   const staged = stagedUpload(dir, uploadId, now);
   if (staged) return staged;
   // Still there but past its TTL: expired, so gone (a claim refuses it too), swept or not.
   for (const ext of STAGED_EXTS) { try { if (now - statSync(join(dir, `${uploadId}.${ext}`)).mtimeMs > UPLOAD_TTL_MS) return undefined; } catch { /* not this one */ } }
   try { if (readdirSync(dir).some((name) => name.startsWith(`${uploadId}.`) && name.includes(".claim-"))) return { kind: "claimed" }; } catch { /* no directory */ }
-  // Neither staged nor claimed, yet not recorded gone: mid-claim, or a record
-  // since expired. Not an answer either way: the page keeps it, with Retry.
+  // No file either way: the id's own date settles it (checked last, so a clock moved back cannot hide a live upload).
+  if (outlived(uploadId, now)) return undefined;
+  // Dated within the TTL, neither staged nor claimed, not recorded gone: caught
+  // mid-claim. Not an answer either way: the page keeps it, with Retry.
   return { kind: "unsettled" };
 }
 function stagedUpload(dir: string, uploadId: string, now: number): { kind: "image"; bytes: Buffer; type: string } | { kind: "file"; size: number } | undefined {

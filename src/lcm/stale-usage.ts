@@ -151,7 +151,9 @@ export interface CapUsageResult {
  * context, and counting them would keep a stale reading above the limit. The
  * CLI adds its own estimate of everything AFTER its anchor, so a ceiling for
  * the whole conversation would count that tail twice. A record without a
- * uuid counts only itself.
+ * uuid counts only itself. A record whose ancestry does not resolve to a
+ * root or a boundary (a missing parent, a cycle) gets no ceiling (Infinity):
+ * it is left uncapped rather than capped at a partial sum.
  */
 export function ceilingsThrough(entries: SdkEntry[], overhead: number): (index: number) => number {
   type Rec = { uuid?: string; parentUuid?: string | null; type?: string; subtype?: string };
@@ -171,12 +173,17 @@ export function ceilingsThrough(entries: SdkEntry[], overhead: number): (index: 
       if (e.type === "system" && e.subtype === "compact_boundary") break;
       if (e.uuid && memo.has(e.uuid)) { base = memo.get(e.uuid)!; break; }
       if (e.uuid) {
-        if (onPath.has(e.uuid)) break; // a cycle: count what was walked
+        // A cycle: what the CLI loads here is unknown, so no ceiling at all.
+        if (onPath.has(e.uuid)) { base = Infinity; break; }
         onPath.add(e.uuid);
       }
       path.push(e);
-      if (!e.uuid) break;
-      e = e.parentUuid ? byUuid.get(e.parentUuid) : undefined;
+      if (!e.uuid || !e.parentUuid) break; // a root
+      const parent = byUuid.get(e.parentUuid);
+      // A parent that is not in the file: the SDK may stitch something else
+      // in its place, so a partial sum would be a ceiling too LOW to be safe.
+      if (!parent) { base = Infinity; break; }
+      e = parent;
     }
     let sum = base;
     for (let k = path.length - 1; k >= 0; k--) {

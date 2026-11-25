@@ -193,6 +193,16 @@ function isToolResultTurn(e: Ev | undefined): boolean {
  * none of that. Exported for tests.
  */
 export function activeChain(events: readonly Ev[]): Ev[] {
+  return resolveActiveChain(events).chain;
+}
+
+/**
+ * The same, and whether the walk ended where a chain may end: at a root
+ * (no parentUuid) or an SDK compact boundary. A missing parent or a cycle
+ * means the parent walk does not tell what the SDK will load (it may stitch
+ * by timestamp), and nothing computed on a partial chain can be trusted.
+ */
+export function resolveActiveChain(events: readonly Ev[]): { chain: Ev[]; complete: boolean } {
   const byUuid = new Map<string, Ev>();
   for (const e of events) if (e.uuid) byUuid.set(e.uuid, e);
   let leaf: Ev | undefined;
@@ -202,12 +212,18 @@ export function activeChain(events: readonly Ev[]): Ev[] {
   }
   const chain: Ev[] = [];
   const seen = new Set<string>();
-  for (let e = leaf; e?.uuid && !seen.has(e.uuid); e = e.parentUuid ? byUuid.get(e.parentUuid as string) : undefined) {
+  let complete = true;
+  for (let e = leaf; e;) {
+    if (!e.uuid || seen.has(e.uuid)) { complete = !e.uuid; break; }
     seen.add(e.uuid);
     if (e.type === "system" && e.subtype === "compact_boundary") break;
     chain.push(e);
+    if (!e.parentUuid) break;
+    const parent = byUuid.get(e.parentUuid as string);
+    if (!parent) { complete = false; break; }
+    e = parent;
   }
-  return chain.reverse();
+  return { chain: chain.reverse(), complete };
 }
 
 const isConvRecord = (e: Ev) => e.type === "user" || e.type === "assistant";
@@ -403,6 +419,17 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
     return {
       beforeTokens: o.contextUsed ?? 0, afterTokens: o.contextUsed ?? 0, contextMax: window, pruned: null,
       summarized: [], archived: [], usageCapped: 0, reachedSafe: false, ok: false, errors: ["session file not found"],
+    };
+  }
+  // Fail closed on a broken chain: the estimate, the selection and the usage
+  // ceilings would all be computed on a partial conversation, and a too-low
+  // estimate would cap a stale reading under what the CLI really loads.
+  if (!resolveActiveChain(loadEvents(o.sdkSessionId, o.sdkSessionsDir)).complete) {
+    log.warn({ sessionId: o.sdkSessionId }, "Forced compaction refused: the active chain does not resolve (missing parent or cycle)");
+    return {
+      beforeTokens: o.contextUsed ?? 0, afterTokens: o.contextUsed ?? 0, contextMax: window, pruned: null,
+      summarized: [], archived: [], usageCapped: 0, reachedSafe: false, ok: false,
+      errors: ["active chain broken (a missing parent or a cycle): not compacted"],
     };
   }
   const safeTokens = Math.floor(window * (o.safePct ?? FORCE_COMPACT_SAFE_PCT) / 100);

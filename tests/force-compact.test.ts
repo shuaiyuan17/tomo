@@ -167,6 +167,19 @@ describe("stale usage cap (the CLI's local window check)", () => {
     // What the CLI checks — anchor + its estimate of what follows — is the whole conversation once, not the tail twice.
     expect(anchor + tailTokens).toBe(2_000 + estimate(b.sessionId));
   });
+
+  it("leaves a reading uncapped when its ancestry does not resolve (a missing parent): a partial sum would cap it too low", () => {
+    const b = build({ usage: 977_000 });
+    const path = getSdkSessionPath(b.sessionId, sdkSessionsDir);
+    const events = fileEvents(b.sessionId);
+    // Day 24 loses its link to day 23: the walk from the stale reading stops short of a root.
+    const firstOf24 = events.find((e) => e.uuid === b.uuidsByDay.get(24)![0]);
+    firstOf24.parentUuid = randomUUID();
+    writeFileSync(path, events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    const r = capStaleUsageInFile({ sdkSessionId: b.sessionId, sdkSessionsDir, overhead: 2_000 });
+    expect(r.success).toBe(true);
+    expect(cliAnchorUsage(fileEvents(b.sessionId))).toBe(977_000 + 3 + 200);
+  });
 });
 
 describe("selectOldestStretch", () => {
@@ -467,6 +480,22 @@ describe("forceCompactSession", () => {
     expect(r.afterTokens).toBeLessThanOrEqual(Math.floor(w.contextMax * 0.4));
     expect(cliAnchorUsage(file)).toBe(r.afterTokens);
     expect(r.usageCapped).toBeGreaterThan(0);
+  });
+
+  it("fails closed on a broken active chain (a missing parent): no rewrite, no cap, a failure", async () => {
+    const b = build({ usage: 977_000 });
+    const w = windowAt(b.sessionId, 96);
+    const path = getSdkSessionPath(b.sessionId, sdkSessionsDir);
+    const events = fileEvents(b.sessionId);
+    events.find((e) => e.uuid === b.uuidsByDay.get(24)![0]).parentUuid = randomUUID();
+    const original = events.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    writeFileSync(path, original);
+    const summarize = vi.fn(async () => "A perfectly good summary of the day, long enough to pass.");
+    const r = await forceCompactSession({ ...common(), sdkSessionId: b.sessionId, ...w, summarize });
+    expect(summarize).not.toHaveBeenCalled();
+    expect(r.ok).toBe(false);
+    expect(r.errors.join("\n")).toMatch(/active chain broken/);
+    expect(readFileSync(path, "utf8")).toBe(original);
   });
 
   it("writes the placeholder line the brief asks for", () => {

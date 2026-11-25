@@ -1401,6 +1401,27 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     }
   });
 
+  it("an owner's start the registry held still passes the quota gate once it can be read", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness({ maxRunning: 0 }, working((turn, hh) => hh.service.finish(turn.key, "ok")));
+      const t = h.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+      h.service.start();
+      h.quota = 95;
+      h.registryReadable = false;
+      expect(h.service.startTask(t.id, "the owner started it")).toBe(false);
+      expect(h.service.isHeld(t.id)).toBe(true);
+      h.registryReadable = true;
+      vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
+      await flush();
+      // Not paused at the gate: the owner asked for this start.
+      expect(h.turns).toHaveLength(1);
+      expect(h.store.get(t.id)?.status).toBe("finished");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("makes an owner's start that the registry held past the slot cap once it can be read", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {

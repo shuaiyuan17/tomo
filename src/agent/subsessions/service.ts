@@ -1181,7 +1181,8 @@ export class SubsessionService {
       // Every held task is asked again (mayRun holds it afresh if it must).
       this.registryHeld.clear();
       const owed = [...this.startsOwed];
-      for (const [id, reason] of owed) this.safely(() => { this.startQueued(id, reason, true); }, "owed start");
+      // Every owed start is the owner's (/s start): it keeps its pass past the gate.
+      for (const [id, reason] of owed) this.safely(() => { this.startTask(id, reason); }, "owed start");
       this.schedule();
       this.safely(() => {
         for (const task of this.store.list()) {

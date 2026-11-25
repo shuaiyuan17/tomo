@@ -10,6 +10,8 @@ import type { OutgoingMessage, SendResult } from "../src/channels/types.js";
 import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockConfig, mockSdk, resetConfig, waitFor } from "./helpers/agent-harness.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { formatTomoEvent } from "../src/tomo-event.js";
+import { DurableInbox, INBOX_STALE_NOT_PROCESSED } from "../src/agent/durable-inbox.js";
+import { existsSync, readFileSync } from "node:fs";
 
 installAgentTestHooks();
 
@@ -236,6 +238,78 @@ describe("sub-sessions through the Agent", () => {
       await agent.stop();
     });
 
+    it("tells the owner's session when a reply sent during a task's send still matches nothing once the send settles", async () => {
+      resetConfig({
+        identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+        subsessions: { ...mockConfig.subsessions, enabled: true },
+        inbox: true,
+        tomoHome: mockConfig.tomoHome,
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      // The task's send settles with no provider id: nothing to match a reply on.
+      class NoIdGateChannel extends MockChannel {
+        override async send(msg: OutgoingMessage): Promise<SendResult> {
+          const result = await super.send(msg);
+          if (msg.text.startsWith("[s1 ")) await gate;
+          return result;
+        }
+      }
+      const channel = new NoIdGateChannel("telegram");
+      const agent = new Agent();
+      agent.addChannel(channel);
+      await agent.start();
+      const ownerTexts: string[] = [];
+      mockSdk.responseFn = (text) => {
+        if (text.includes("subsession-start")) return new Promise(() => {});
+        ownerTexts.push(text);
+        return "owner reply";
+      };
+      agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
+      const notifying = agent.subsessions!.notify("task:s1", "Which branch?");
+      await waitFor(() => expect(channel.sent.some((m) => m.text.startsWith("[s1 · Fix it] Which branch?"))).toBe(true));
+      const replying = channel.simulateMessage(owner("main", { id: "r2", replyToId: "provider-7" }));
+      await new Promise((r) => setTimeout(r, 20));
+      release();
+      await notifying;
+      expect(await replying).toBe(true);
+      await waitFor(() => expect(ownerTexts.some((t) => t.includes("main"))).toBe(true));
+      const turn = ownerTexts.find((t) => t.includes("main"))!;
+      expect(turn).toContain("may be answering it");
+      expect(turn).toContain("/s s1 <message>");
+      await agent.stop();
+    });
+
+    it("still warns after a restart that came before a reply sent during a task's send was matched", async () => {
+      resetConfig({
+        identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+        subsessions: { ...mockConfig.subsessions, enabled: true },
+        inbox: true,
+        tomoHome: mockConfig.tomoHome,
+      });
+      const store = new SubsessionStore(join(mockConfig.tomoHome, "data", "subsessions.json"));
+      const t = store.create({ parentKey: "dm:alex", title: "Fix it", brief: "b" });
+      store.transition(t.id, "start");
+      store.transition(t.id, "ask", { reason: "asked" });
+      // In the inbox when the last run died: an owner reply, unmatched, sent while s1 was sending.
+      const inbox = new DurableInbox({ path: join(mockConfig.tomoHome, "data", "inbox.jsonl") });
+      inbox.accept("telegram", { ...owner("main", { id: "r3", replyToId: "provider-8" }), taskSendsInFlight: [t.id] },
+        { sessionKey: "dm:alex", replyTarget: { channelName: "telegram", chatId: "12345" }, identityName: "alex" });
+      inbox.close();
+      const ownerTexts: string[] = [];
+      mockSdk.responseFn = (text) => {
+        if (text.includes("subsession-start") || text.includes("subsession-resume")) return new Promise(() => {});
+        ownerTexts.push(text);
+        return "ok";
+      };
+      const agent = new Agent();
+      agent.addChannel(new MockChannel("telegram"));
+      await agent.start();
+      await waitFor(() => expect(ownerTexts.some((x) => x.includes("main"))).toBe(true));
+      expect(ownerTexts.find((x) => x.includes("main"))).toContain("may be answering it");
+      await agent.stop();
+    });
+
     it("leaves /s alone when sub-sessions are off", async () => {
       const { agent, channel } = await boot(false);
       mockSdk.responseFn = () => "ok";
@@ -244,6 +318,35 @@ describe("sub-sessions through the Agent", () => {
       expect(ownerPrompts()[0].text).toContain("/s s1 hi");
       await agent.stop();
     });
+  });
+
+  it("records a /s message too old to replay in the owner's own conversation, not the task's", async () => {
+    // The last run took the owner's message to s1 into the inbox and died
+    // before handing it over; it is past the replay window now.
+    const inbox = new DurableInbox({ path: join(mockConfig.tomoHome, "data", "inbox.jsonl") });
+    inbox.accept("telegram", makeMsg({ id: "late", chatId: "12345", senderId: "12345", text: "use plan B" }),
+      { sessionKey: "task:s1", replyTarget: { channelName: "telegram", chatId: "12345" } });
+    inbox.close();
+    resetConfig({
+      identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      subsessions: { ...mockConfig.subsessions, enabled: true },
+      inbox: true,
+      inboxReplayMaxAgeMinutes: 0,
+      tomoHome: mockConfig.tomoHome,
+    });
+    const agent = new Agent();
+    agent.addChannel(new MockChannel("telegram"));
+    await agent.start();
+    const transcript = (key: string) => {
+      const file = join(mockConfig.sessionsDir, `${key.replace(/[^a-zA-Z0-9_-]/g, "_")}.jsonl`);
+      return existsSync(file) ? readFileSync(file, "utf8") : "";
+    };
+    const mine = transcript("dm:alex");
+    expect(mine).toContain("use plan B");
+    expect(mine).toContain("sub-session s1");
+    expect(mine).toContain(INBOX_STALE_NOT_PROCESSED);
+    expect(transcript("task:s1")).not.toContain("use plan B");
+    await agent.stop();
   });
 
   it("recovers sub-sessions before any channel ingests, and runs no task turn until start() opens dispatch", async () => {

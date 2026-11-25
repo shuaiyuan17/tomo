@@ -93,6 +93,12 @@ export interface IncomingMessage {
    * `react_to_message` without `match` still reaches the last real message.
    */
   isReaction?: boolean;
+  /**
+   * Harness-set, never by a channel: an owner reply that matched no
+   * sub-session while these tasks (ids) were still sending to the owner.
+   * Kept with the message in the durable inbox, so a replay still knows.
+   */
+  taskSendsInFlight?: string[];
 }
 
 export interface OutgoingMessage {

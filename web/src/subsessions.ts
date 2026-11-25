@@ -64,6 +64,16 @@ export function usePending(id: string): PendingSubsessionMessage[] {
   return pendingFor(id);
 }
 
+/**
+ * May a failed send be tried again? Not to a task that ended or is gone; any
+ * other failure may pass (the table or the task's inbox recovers, or the
+ * network never delivered it). A retry reuses the request id, which the task
+ * drops if it already has it.
+ */
+export function canRetrySend(error: string | undefined): boolean {
+  return error !== "subsession_ended" && error !== "subsession_not_found";
+}
+
 /** A row of the chat, in order: the brief, then every line of the conversation, then the report. */
 export type SubsessionChatRow =
   | { kind: "brief"; key: string; brief: string; quote?: string[]; truncated: boolean }

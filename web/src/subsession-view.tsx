@@ -8,7 +8,7 @@ import { api, ApiError } from "./api.js";
 import { Text } from "./markdown.js";
 import { messageDateTime, messageTime } from "./message-meta.js";
 import { createCompositionGuard } from "./compose-keys.js";
-import { isOpenSubsession, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
+import { canRetrySend, isOpenSubsession, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
 import { i18n, useTranslation } from "./i18n/index.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
@@ -22,7 +22,7 @@ const ERRORS = {
   subsession_not_found: "tasks:subsession.error.gone", subsessions_unavailable: "tasks:subsession.error.unavailable",
   network: "tasks:subsession.error.network",
 } as const;
-/** A refusal is final (the text goes back to the box); anything else may not have arrived, so it is retried with the same id. */
+/** Which message a failed send shows, by the refusal's code; anything unknown counts as the network. */
 const errorKey = (error: unknown): keyof typeof ERRORS =>
   error instanceof ApiError && error.code in ERRORS ? error.code as keyof typeof ERRORS : "network";
 
@@ -154,8 +154,9 @@ function TaskMessage({ id, text, at, tag }: { id: string; text: string; at: numb
 function PendingBubble({ message, onRetry }: { message: PendingSubsessionMessage; onRetry: () => void }) {
   const { t } = useTranslation("tasks");
   const failed = message.state === "failed";
-  // A refusal is final; anything else (the network) may not have arrived and is sent again with the same id, which the task drops if it has it.
-  const retry = failed && message.error === "network";
+  // An ended or missing task is final. Anything else may pass (the table or the task's inbox recovers, the network may
+  // not have delivered it): it is sent again with the same id, which the task drops if it already has it.
+  const retry = failed && canRetrySend(message.error);
   return <div data-from="owner" data-pending={message.state} className="flex flex-col items-end">
     <div className={cn(bubble, "opacity-70")}><Text breaks>{message.text}</Text></div>
     <p role="status" className="m-0 mt-1 text-right text-[10.5px] text-muted-foreground">

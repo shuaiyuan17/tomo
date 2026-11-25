@@ -42,7 +42,11 @@ describe("the rail's view of sub-sessions", () => {
     ];
     expect(subsessionList(tasks, "dm:owner", NOW, () => false).map((t) => t.id)).toEqual(["s3", "s2", "s4", "s1"]);
     const many = Array.from({ length: MAX_RAIL_SUBSESSIONS + 5 }, (_, i) => record(`s${i + 1}`, { createdAt: NOW - i }));
-    expect(subsessionList(many, "dm:owner", NOW, () => false)).toHaveLength(MAX_RAIL_SUBSESSIONS);
+    // Every open task is listed however many there are; ended ones only fill what is left.
+    expect(subsessionList(many, "dm:owner", NOW, () => false)).toHaveLength(MAX_RAIL_SUBSESSIONS + 5);
+    const ended = Array.from({ length: MAX_RAIL_SUBSESSIONS }, (_, i) => record(`e${i}`, { status: "finished", endedAt: NOW - i - 1 }));
+    expect(subsessionList([record("s1"), record("s2"), ...ended], "dm:owner", NOW, () => false).map((t) => t.id).slice(0, 3)).toEqual(["s1", "s2", "e0"]);
+    expect(subsessionList([record("s1"), record("s2"), ...ended], "dm:owner", NOW, () => false)).toHaveLength(MAX_RAIL_SUBSESSIONS);
   });
 
   it("marks writable exactly the statuses the owner may still write to, and working only while open", () => {

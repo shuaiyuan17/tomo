@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { activeSubsessions, pendingFor, updatePending, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel } from "../web/src/subsessions.js";
+import { activeSubsessions, canRetrySend, pendingFor, updatePending, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel } from "../web/src/subsessions.js";
 import type { WebSubsession, WebSubsessionDetail } from "../src/web/protocol.js";
 
 const task = (extra: Partial<WebSubsession> = {}): WebSubsession => ({ id: "s1", title: "T", status: "active", working: false,
@@ -55,5 +55,10 @@ describe("sub-sessions in the Tasks rail", () => {
   it("shows what is on its way even before (or without) a read of the conversation", () => {
     const rows = subsessionChatRows(undefined, [{ requestId: "r1", text: "go", state: "failed", error: "network" }, { requestId: "r2", text: "x", state: "sent", revision: 1 }]);
     expect(rows.map((r) => r.key)).toEqual(["pr1"]);
+  });
+
+  it("offers a retry for any failed send except to a task that ended or is gone", () => {
+    for (const error of ["network", "subsessions_unavailable", "subsession_inbox_full", undefined]) expect(canRetrySend(error)).toBe(true);
+    for (const error of ["subsession_ended", "subsession_not_found"]) expect(canRetrySend(error)).toBe(false);
   });
 });

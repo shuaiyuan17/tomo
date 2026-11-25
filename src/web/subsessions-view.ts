@@ -9,7 +9,7 @@ import type { WebSubsession, WebSubsessionDetail, WebSubsessionStatus } from "./
 
 /** An ended task (finished, cancelled, failed) stays in the rail this long. It can still be opened by id until it is archived. */
 export const SUBSESSION_ENDED_VISIBLE_MS = 72 * 60 * 60 * 1000;
-/** At most this many in the rail: every open task first, then the most recently ended. */
+/** Every open task is listed (their number is bounded by `subsessions.maxOpen`); ended ones fill up to this many rows. */
 export const MAX_RAIL_SUBSESSIONS = 24;
 const TITLE_LIMIT = 120;
 const PROGRESS_LIMIT = 300;
@@ -51,14 +51,15 @@ export function subsessionView(record: SubsessionRecord, scope: string, now: num
 /**
  * The rail's list: the scope's tasks, open ones first (oldest first, as they
  * were started), then those that ended within SUBSESSION_ENDED_VISIBLE_MS,
- * newest first; capped at MAX_RAIL_SUBSESSIONS.
+ * newest first, while the list stays within MAX_RAIL_SUBSESSIONS. An open
+ * task is never left out: one may be waiting for the owner.
  */
 export function subsessionList(records: readonly SubsessionRecord[], scope: string, now: number, working: (key: string) => boolean): WebSubsession[] {
   const views = records.flatMap((r) => { const v = subsessionView(r, scope, now, working(r.sessionKey)); return v ? [v] : []; });
   const open = views.filter((v) => OPEN.has(v.status)).sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
   const ended = views.filter((v) => !OPEN.has(v.status) && now - (v.endedAt ?? v.lastActivityAt) < SUBSESSION_ENDED_VISIBLE_MS)
     .sort((a, b) => (b.endedAt ?? b.lastActivityAt) - (a.endedAt ?? a.lastActivityAt));
-  return [...open, ...ended].slice(0, MAX_RAIL_SUBSESSIONS);
+  return [...open, ...ended.slice(0, Math.max(0, MAX_RAIL_SUBSESSIONS - open.length))];
 }
 
 /** One task, opened: what the list shows plus its brief, the conversation and the report. */

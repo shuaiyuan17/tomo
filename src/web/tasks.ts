@@ -215,7 +215,7 @@ export class TaskBoard {
     const list = [...next.values()];
     // An ended task whose work runs on counts as live here, so the cap never drops it before that work.
     const settled = settledTimes(next);
-    const live = list.filter((task) => settled.get(task.taskId) === undefined);
+    const live = list.filter((task) => settled.get(task.taskId) === undefined).sort(runningFirst);
     const done = list.filter((task) => settled.get(task.taskId) !== undefined)
       .sort((a, b) => settled.get(b.taskId)! - settled.get(a.taskId)!);
     const kept = [...live, ...done].slice(0, MAX_SESSION_TASKS);
@@ -291,7 +291,7 @@ export class TaskBoard {
         const at = settled.get(id)!;
         const tasks = [...this.sessions.get(id)!.values()]
           .filter((task) => (at.get(task.taskId) !== undefined) === ended && task.ambient === ambient);
-        return { id, tasks: ended ? tasks.sort((a, b) => at.get(b.taskId)! - at.get(a.taskId)!) : tasks.sort((a, b) => a.startedAt - b.startedAt) };
+        return { id, tasks: ended ? tasks.sort((a, b) => at.get(b.taskId)! - at.get(a.taskId)!) : tasks.sort(runningFirst) };
       });
       for (let round = 0; room > 0 && queues.some((q) => q.tasks.length > round); round++) {
         for (const queue of queues) {
@@ -330,6 +330,16 @@ export class TaskBoard {
     this.timer = setTimeout(() => { this.timer = undefined; this.publish(); }, Math.max(0, next - this.now()));
     this.timer.unref?.();
   }
+}
+
+/**
+ * Unsettled tasks in the order a cap keeps them: those running first, then
+ * ended ones whose work runs on, each by start. A parent is only kept once
+ * every running task of its session is, so its running work is always there
+ * for the rail to read it as working.
+ */
+function runningFirst(a: WebTask, b: WebTask): number {
+  return Number(a.endedAt !== undefined) - Number(b.endedAt !== undefined) || a.startedAt - b.startedAt;
 }
 
 /**

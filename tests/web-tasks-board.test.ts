@@ -101,6 +101,19 @@ describe("TaskBoard", () => {
     b.dispose();
   });
 
+  it("past the cap, running tasks are kept before an ended parent, so a kept parent always has its running work", () => {
+    vi.useFakeTimers({ now: 10_000 });
+    const { b } = board();
+    const child = task("c", { taskType: "local_bash", parentTaskId: "p", startedAt: 9_000 });
+    const others = Array.from({ length: MAX_SESSION_TASKS }, (_, i) => task(`r${i}`, { startedAt: 5_000 + i }));
+    b.apply("a", [task("p", { startedAt: 1_000 }), child, ...others]);
+    b.apply("a", [child, ...others]);
+    const shown = b.snapshot().map((t) => t.taskId);
+    expect(!shown.includes("p") || shown.includes("c")).toBe(true);
+    expect(shown).not.toContain("p");
+    b.dispose();
+  });
+
   it("settles a task at its own end or its descendants' last, never while one runs", () => {
     const t = (id: string, extra: Partial<WebTask> = {}): WebTask => ({ sessionId: "s", taskId: id, taskType: "local_agent", description: id, ambient: false, startedAt: 0, state: "completed", endedAt: 5, ...extra });
     const map = (...list: WebTask[]) => new Map(list.map((x) => [x.taskId, x]));

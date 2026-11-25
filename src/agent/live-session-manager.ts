@@ -33,6 +33,7 @@ import { flattenSystemPrompt } from "../workspace/system-prompt-blocks.js";
 import { classifyPromptContextChange, type PromptContextLines } from "../workspace/prompt-context-diff.js";
 import { formatTomoEvent } from "../tomo-event.js";
 import { errorMessage } from "../error-text.js";
+import { isContextOverflowError } from "./api-errors.js";
 
 /**
  * How long a prompt-stale session may wait for its background tasks before it
@@ -74,6 +75,16 @@ function sameServerConfig(a: McpServerConfig | undefined, b: McpServerConfig): b
 
 /** Upper bound on how long /rewind waits for a stopped session to wind down. */
 export const REWIND_SUSPEND_TIMEOUT_MS = 10_000;
+/** How long a forced compaction lets a turn already running on the session finish before interrupting it. */
+export const FORCE_COMPACT_IDLE_WAIT_MS = 5 * 60_000;
+
+/** A key held for a forced compaction (`holdForForceCompact`). `release` MUST be called (finally). */
+export interface ForceCompactHold {
+  key: string;
+  release: () => void;
+  /** Set when the closed session's CLI outlived the wait: the hold is kept until it exits. */
+  untilExit?: Promise<void>;
+}
 
 /** How often the idle reaper looks (capped by the timeout itself). */
 export const IDLE_REAP_SWEEP_MS = 60_000;
@@ -229,6 +240,13 @@ export interface LiveSessionManagerDeps {
   handleTurnComplete?(key: string): void;
   /** Post-turn context-pressure check (Agent.maybeNudgeCompact). */
   maybeNudgeCompact(key: string, ctx: QueryResult | null): void;
+  /**
+   * After a turn: is the context full enough (or did the turn end on "Prompt
+   * is too long") for the harness to compact the session itself
+   * (agent/force-compactor.ts)? True when a forced compaction was started —
+   * then the nudge ladder is skipped for this turn. Absent: never.
+   */
+  onContextOverflow?(key: string, reading: QueryResult | null, reason: "threshold" | "prompt-too-long" | "turn-failed"): boolean;
   /**
    * A mounted external MCP server rejected a tool call for authorization
    * reasons: refresh its OAuth token (non-interactively) so the refreshed
@@ -741,6 +759,111 @@ export class LiveSessionManager {
       release();
       throw err;
     }
+  }
+
+  /**
+   * FORCED COMPACTION, step 0 (agent/force-compactor.ts): take the key away
+   * from every turn, synchronously. Reserves the session's one rewrite slot
+   * (`reserveForced`: refused while another compact holds it) and holds the
+   * key like a /rewind does: from here no live session is handed out or
+   * built for it, so a queued message, a steered drain, a cron or heartbeat
+   * waits and then runs on the compacted session. Null when refused (another
+   * rewrite or a rewind holds the key, or shutdown began).
+   */
+  holdForForceCompact(key: string): ForceCompactHold | null {
+    if (this.stopping || this.sessionHolds.has(key)) return null;
+    const reservation = this.compactReservations.reserveForced(key);
+    if (!reservation.ok) return null;
+    let releaseHold!: () => void;
+    const hold = new Promise<void>((resolve) => { releaseHold = resolve; });
+    this.sessionHolds.set(key, hold);
+    // A session build already under way must not publish a session resuming
+    // the pre-compaction file (createLiveSession re-checks the generation).
+    this.generations.set(key, (this.generations.get(key) ?? 0) + 1);
+    let released = false;
+    const handle: ForceCompactHold = { key, release: () => {} };
+    const release = () => {
+      if (released) return;
+      released = true;
+      // A CLI child that outlived the close wait keeps the key held until it is gone.
+      if (handle.untilExit) void handle.untilExit.then(releaseNow);
+      else releaseNow();
+    };
+    const releaseNow = () => {
+      if (this.sessionHolds.get(key) === hold) {
+        this.sessionHolds.delete(key);
+        this.holdReleases.delete(key);
+      }
+      this.compactReservations.finish(key, reservation.reservationId);
+      releaseHold();
+    };
+    handle.release = release;
+    // Shutdown releases at once: the process is exiting, the child with it.
+    this.holdReleases.set(key, releaseNow);
+    return handle;
+  }
+
+  /**
+   * FORCED COMPACTION, step 1: with the key held, let the live session
+   * finish what it is doing (a steered turn already promoted, bounded by
+   * `idleTimeoutMs`, then interrupted), call `beforeClose` (the compactor
+   * records the background work as interrupted there; false aborts with the
+   * session untouched), then close it — which stops its background agents
+   * and commands — and wait (bounded) for its CLI child to exit, so nothing
+   * appends to the file the compaction is about to rewrite. Returns the SDK
+   * session id to compact, or null when aborted (also when the closed CLI did
+   * not exit in time: nothing is rewritten under a live writer). A key with no live session
+   * goes straight to `beforeClose`.
+   */
+  async quiesceForForceCompact(
+    hold: ForceCompactHold,
+    beforeClose: () => boolean,
+    idleTimeoutMs = FORCE_COMPACT_IDLE_WAIT_MS,
+  ): Promise<string | null> {
+    const { key } = hold;
+    if (this.sessionHolds.get(key) === undefined) return null;
+    const creating = this.liveSessionCreates.get(key);
+    if (creating) await withTimeout(creating, REWIND_SUSPEND_TIMEOUT_MS);
+    const closing = this.closingWait(key);
+    if (closing) await closing;
+    const session = this.liveSessions.get(key);
+    const stillBusy = !!session?.isAlive() && session.isBusy() && !await withTimeout(session.waitForIdle(), idleTimeoutMs);
+    // The compacted file must be the one the next session resumes: an SDK id
+    // the registry has not stored yet is stored now, or nothing is rewritten.
+    const liveId = session?.getSessionId();
+    if (liveId && (this.unpersistedLinks.has(key) || this.deps.getSdkSessionId(key) !== liveId)) {
+      try {
+        this.deps.setSdkSessionId(key, liveId);
+        this.unpersistedLinks.delete(key);
+      } catch (err) {
+        log.error({ err, key }, "Forced compaction: the session's SDK id is not stored in the registry; not compacting");
+        return null;
+      }
+    }
+    // Recorded while the session (and so its task set) is still intact:
+    // interrupting or closing it empties the set the ledger mirrors.
+    if (!beforeClose()) return null;
+    if (stillBusy && session?.isAlive()) {
+      log.warn({ key, idleTimeoutMs }, "Forced compaction: the running turn did not end in time; interrupting it");
+      session.interrupt(new TurnInterruptedError());
+    }
+    const sdkSessionId = session?.getSessionId() ?? this.deps.getSdkSessionId(key) ?? null;
+    if (session) {
+      this.promptStale.delete(session);
+      this.liveSessions.delete(key);
+      this.externalMcpServersBySession.delete(key);
+      this.mcpServerConfigsBySession.delete(key);
+      this.mcpHealth.sessionClosed(key);
+      if (session.isAlive()) session.close();
+      if (!await withTimeout(session.whenClosed(), IDLE_REAP_CLOSE_WAIT_MS)) {
+        // A CLI that is still alive can append after the rewrite's drain
+        // (orphaned parents, a fresh uncapped usage anchor): fail closed.
+        log.warn({ key }, "Forced compaction: the closed session's CLI did not exit in time; not rewriting its file");
+        hold.untilExit = session.whenClosed();
+        return null;
+      }
+    }
+    return sdkSessionId;
   }
 
   /**
@@ -1528,7 +1651,13 @@ export class LiveSessionManager {
     } catch (err) {
       // A failed resume ran nothing and is about to be retried: recording it
       // would count one turn twice and persist nothing useful.
-      if (err instanceof SdkResultError && !err.isResumeMissing) this.recordTurnCompletion(key, session);
+      if (err instanceof SdkResultError && !err.isResumeMissing) {
+        // The CLI refused the turn for size (often locally, with no API call):
+        // the session cannot run another one, at any usage reading. Any other
+        // error result is told as such: neither may pass for a normal end.
+        const overflow = isContextOverflowError(err.message) || err.errors.some(isContextOverflowError);
+        this.recordTurnCompletion(key, session, overflow ? "prompt-too-long" : "turn-failed");
+      }
       throw err;
     }
     if (steer && response === STEER_MERGED) return response;
@@ -1536,7 +1665,7 @@ export class LiveSessionManager {
     return response;
   }
 
-  private recordTurnCompletion(key: string, session: LiveSession): void {
+  private recordTurnCompletion(key: string, session: LiveSession, outcome: "threshold" | "prompt-too-long" | "turn-failed" = "threshold"): void {
     // Capture session ID if new — or if an earlier capture could not be
     // persisted. The registry may refuse a link change while its file is
     // unreadable (SessionRegistryReadError); by the time we are here the model
@@ -1604,6 +1733,10 @@ export class LiveSessionManager {
       // provides a fresh reading for both escalation and reset.
       return;
     }
+
+    // Past lcm.forceCompactAtPct the harness compacts the session itself;
+    // the nudge would only ask a model that has no room left.
+    if (this.deps.onContextOverflow?.(key, session.lastResult, outcome)) return;
 
     // Fire-and-forget context-pressure check — don't block the current
     // reply on the nudge. Pass this turn's result explicitly.

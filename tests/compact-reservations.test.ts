@@ -26,6 +26,20 @@ describe("CompactReservations", () => {
     vi.useRealTimers();
   });
 
+  it("reserveForced ignores background work but never shares the session's rewrite slot", () => {
+    const forced = r.reserveForced("k");
+    expect(forced.ok).toBe(true);
+    expect(r.reserve("k", "sid", IDLE)).toMatchObject({ ok: false, reason: "already-pending" });
+    expect(r.reserveForced("k")).toMatchObject({ ok: false, reason: "already-pending" });
+    expect(r.launchDenial("k")).not.toBeNull();
+    if (forced.ok) r.finish("k", forced.reservationId);
+    expect(r.isPending("k")).toBe(false);
+
+    const normal = r.reserve("k", "sid", IDLE);
+    expect(normal.ok).toBe(true);
+    expect(r.reserveForced("k")).toMatchObject({ ok: false, reason: "already-pending" });
+  });
+
   it("refuses with background tasks, and in the report window", () => {
     expect(r.reserve("k", "sid", { ...IDLE, activeBackgroundTasks: 1 }))
       .toMatchObject({ ok: false, reason: "background-tasks" });

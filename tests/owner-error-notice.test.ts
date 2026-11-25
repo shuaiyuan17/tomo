@@ -3,7 +3,7 @@ import type { Channel, OutgoingMessage } from "../src/channels/types.js";
 import { DeliveryPipeline } from "../src/agent/delivery-pipeline.js";
 import { isSilentReply } from "../src/agent/text-utils.js";
 import { SdkResultError, TurnInterruptedError } from "../src/agent/live-session.js";
-import { classifyTurnError } from "../src/agent/api-errors.js";
+import { classifyTurnError, isContextOverflowError } from "../src/agent/api-errors.js";
 import {
   OWNER_NOTICE_WINDOW_MS,
   OwnerErrorNotifier,
@@ -18,6 +18,20 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 const SAFEGUARD = "API Error: Example Model's safeguards flagged this message (https://example.invalid). Details follow.\n\nRequest ID: req_1";
+
+describe("isContextOverflowError", () => {
+  it("matches the CLI's own refusal (local or relayed) and the API's context-length errors, nothing else", () => {
+    for (const t of [
+      "Prompt is too long",
+      "Prompt is too long · the request is ~1012000 tokens (limit 1000000) and this conversation's own content is most of it.",
+      "API Error: 400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"prompt is too long: 1012345 tokens > 1000000 maximum\"}}",
+      "API Error: 400 input length exceeds the context window",
+    ]) expect(isContextOverflowError(t), t).toBe(true);
+    for (const t of ["API Error: 529 Overloaded", "The prompt is too long to read, said the owner", "Failed to authenticate"]) {
+      expect(isContextOverflowError(t), t).toBe(false);
+    }
+  });
+});
 
 describe("classifyTurnError", () => {
   it("recognises the classes it gives recovery hints for", () => {

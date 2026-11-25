@@ -292,6 +292,29 @@ describe("config file validation", () => {
     expect(over.configIssues.join("\n")).toContain("blockSpawnAtPct");
   });
 
+  it("lcm.forceCompactAtPct: defaults to 95 (model sonnet), never below the spawn gate, 0/100 turn it off", async () => {
+    const stock = await load({});
+    expect(stock.configIssues).toEqual([]);
+    expect(stock.config.lcm).toMatchObject({ forceCompactAtPct: 95, forceCompactModel: "sonnet" });
+
+    const high = await load({ lcm: { nudgeAtPct: 96 } });
+    expect(high.configIssues).toEqual([]);
+    expect(high.config.lcm.forceCompactAtPct).toBe(96);
+
+    for (const off of [0, 100]) {
+      const r = await load({ lcm: { forceCompactAtPct: off } });
+      expect(r.configIssues).toEqual([]);
+      expect(r.config.lcm.forceCompactAtPct).toBe(off);
+    }
+
+    const below = await load({ lcm: { blockSpawnAtPct: 85, forceCompactAtPct: 80 } });
+    expect(below.configIssues.join("\n")).toContain("forceCompactAtPct must be at least blockSpawnAtPct");
+
+    const model = await load({ lcm: { forceCompactModel: "haiku", forceCompactAtPct: 90 } });
+    expect(model.configIssues).toEqual([]);
+    expect(model.config.lcm).toMatchObject({ forceCompactAtPct: 90, forceCompactModel: "haiku" });
+  });
+
   it("rejects an explicitly conflicting lcm reset threshold", async () => {
     const { config, configIssues } = await load({
       lcm: { nudgeAtPct: 50, nudgeResetPct: 60 },

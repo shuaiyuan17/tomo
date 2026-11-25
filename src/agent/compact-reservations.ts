@@ -112,6 +112,25 @@ export class CompactReservations {
   }
 
   /**
+   * A forced compaction (agent/force-compactor.ts) marks the session the same
+   * way, but skips every background check: it stops the background work
+   * itself before rewriting, which is its whole point. The one rule it keeps
+   * is the one about rewrites: never two at once on a session — refused while
+   * any other compact (a `tomo lcm` run, an `lcm_rollup`, a reload still
+   * pending) holds a reservation, and while it holds its own, every other
+   * `reserve` is refused `already-pending`. No safety timer: the compactor
+   * releases it with `finish` in a finally.
+   */
+  reserveForced(key: string): ReserveResult {
+    if (this.current(key)) {
+      return { ok: false, reason: "already-pending", state: { activeBackgroundTasks: 0, awaitingTaskReport: false, backgroundingInFlight: 0 } };
+    }
+    const id = randomUUID();
+    this.byKey.set(key, { id, sdkSessionId: null, phase: "rewriting", timer: null });
+    return { ok: true, reservationId: id };
+  }
+
+  /**
    * The rewriter is done (succeeded, failed, or never started). With a
    * trigger on disk the mark is held until the reload; without one nothing
    * will reload and launches are safe again.

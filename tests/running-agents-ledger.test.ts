@@ -303,3 +303,45 @@ describe("running-agents ledger", () => {
   });
 });
 
+
+describe("running-agents ledger: a forced compaction closing a session", () => {
+  const openAuto = () => new RunningAgentsLedger({ path, now: () => clock, warn: vi.fn(), autoResume: true });
+
+  it("records the session's running work as interrupted (on disk) before the close, and the close does not undo it", () => {
+    const ledger = openAuto();
+    ledger.observe("dm:owner", [agent("a1"), agent("b1", { taskType: "local_bash" })]);
+    ledger.observe("telegram:-1", [agent("g1")]);
+    const moved = ledger.markSessionInterrupted("dm:owner")!;
+    expect(moved.map((r) => r.taskId)).toEqual(["a1", "b1"]);
+    expect(onDisk()).toMatchObject({ running: [{ taskId: "g1" }], interrupted: [{ taskId: "a1" }, { taskId: "b1" }] });
+    // A late progress event before the session is gone must not put them back under `running`.
+    ledger.observe("dm:owner", [agent("a1", { toolUses: 3 })]);
+    expect(onDisk().running.map((r) => r.taskId)).toEqual(["g1"]);
+    ledger.observe("dm:owner", []);
+    ledger.sessionClosed("dm:owner");
+    expect(ledger.pendingBySession().get("dm:owner")?.map((r) => r.taskId)).toEqual(["a1", "b1"]);
+    // Resumable through the same SendMessage gate as after a restart (counted), commands not.
+    expect(ledger.gateResume("dm:owner", "a1")).toBeNull();
+    expect(ledger.resumeCount("dm:owner", "a1")).toBe(1);
+    // Resumed with the same id after the close: tracked again.
+    ledger.observe("dm:owner", [agent("a1")]);
+    expect(onDisk().running.map((r) => r.taskId).sort()).toEqual(["a1", "g1"]);
+  });
+
+  it("returns null and changes nothing when the record cannot be written", () => {
+    const ledger = openAuto();
+    ledger.observe("dm:owner", [agent("a1")]);
+    rmSync(join(dir, "data"), { recursive: true, force: true });
+    writeFileSync(join(dir, "data"), "not a dir");
+    expect(ledger.markSessionInterrupted("dm:owner")).toBeNull();
+    expect(ledger.pendingBySession().size).toBe(0);
+  });
+
+  it("words the notice for the compaction, not a restart", () => {
+    const rec = { sessionKey: "dm:owner", taskId: "a1", kind: "agent" as const, taskType: "local_agent", subagentType: "general-purpose", description: "x", startedAt: 0, lastActivityAt: 60_000 };
+    const text = formatInterruptedAgentsNotice([rec], "UTC", { failed: new Set() }, "force-compact");
+    expect(text).toContain("force-compacted");
+    expect(text).not.toContain("restarted or crashed");
+    expect(text).toContain("The check after the compaction says which to resume");
+  });
+});

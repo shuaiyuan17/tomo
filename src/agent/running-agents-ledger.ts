@@ -121,6 +121,8 @@ export class RunningAgentsLedger {
   private interrupted: RunningTaskRecord[] = [];
   private resumes = new Map<string, ResumeCount>();
   private frozen = false;
+  /** Per session: tasks `markSessionInterrupted` already recorded, ignored until `sessionClosed`. */
+  private cutOff = new Map<string, Set<string>>();
   /** Last progress seen per task (not persisted): only real progress moves `lastActivityAt`. */
   private progress = new Map<string, string>();
   private lastWriteAt = 0;
@@ -184,6 +186,50 @@ export class RunningAgentsLedger {
     this.persist();
   }
 
+  /**
+   * The harness is about to close this session on purpose (a forced
+   * compaction): what it is running now is cut off exactly as by a restart.
+   * Its running entries move to `interrupted` — the same record a restart
+   * leaves, told to the session and resumed through the same notice and
+   * SendMessage gate — and, with `autoResume`, each resumable one gets a
+   * resume entry. Written before the caller closes anything; returns the
+   * records moved, or null when the write failed (the caller must not close
+   * the session then: the agents would be lost without a record).
+   */
+  markSessionInterrupted(sessionKey: string): RunningTaskRecord[] | null {
+    if (this.frozen) return [];
+    const live = this.running.get(sessionKey);
+    if (!live || live.size === 0) return [];
+    const moved = [...live.values()];
+    const prevInterrupted = this.interrupted;
+    const prevResumes = new Map(this.resumes);
+    const known = new Set(this.interrupted.map((r) => idOf(r.sessionKey, r.taskId)));
+    this.interrupted = [...this.interrupted, ...moved.filter((r) => !known.has(idOf(r.sessionKey, r.taskId)))];
+    if (this.opts.autoResume) {
+      for (const rec of moved) {
+        if (!isResumable(rec)) continue;
+        const id = idOf(sessionKey, rec.taskId);
+        if (!this.resumes.has(id)) this.resumes.set(id, { sessionKey, taskId: rec.taskId, count: 0 });
+      }
+    }
+    this.running.delete(sessionKey);
+    if (!this.persist()) {
+      this.interrupted = prevInterrupted;
+      this.resumes = prevResumes;
+      this.running.set(sessionKey, live);
+      return null;
+    }
+    for (const rec of moved) this.progress.delete(idOf(sessionKey, rec.taskId));
+    // Until the session is gone, a late `tasks` event must not put them back under `running`.
+    this.cutOff.set(sessionKey, new Set(moved.map((r) => r.taskId)));
+    return moved;
+  }
+
+  /** The session `markSessionInterrupted` cut off has closed: its tasks are tracked normally again (a resume reuses the id). */
+  sessionClosed(sessionKey: string): void {
+    this.cutOff.delete(sessionKey);
+  }
+
   /** Shutdown has begun: what is running now stays recorded as interrupted. */
   freeze(): void { this.frozen = true; }
 
@@ -197,6 +243,8 @@ export class RunningAgentsLedger {
   /** A session's full live task set after a change (REPLACE semantics); `ended`: runs that ended with it. */
   observe(sessionKey: string, tasks: readonly WatchTask[], ended: readonly { taskId: string; status: string }[] = []): void {
     if (this.frozen) return;
+    const cut = this.cutOff.get(sessionKey);
+    if (cut) tasks = tasks.filter((t) => !cut.has(t.taskId));
     const now = this.now();
     const old = this.running.get(sessionKey) ?? new Map<string, RunningTaskRecord>();
     const next = new Map<string, RunningTaskRecord>();
@@ -378,7 +426,13 @@ export function formatInterruptedAgentsNotice(
   records: readonly RunningTaskRecord[],
   timeZone?: string,
   autoResume?: { failed: ReadonlySet<string> },
+  /** What cut them off: a restart (default), or a forced compaction that closed the session. */
+  cause: "restart" | "force-compact" = "restart",
 ): string {
+  const lead = cause === "force-compact"
+    ? "This conversation's context was full, so the harness force-compacted it; that closed the session, and these were still running in it and were cut off:"
+    : "When Tomo last restarted or crashed, these were still running in this conversation and were cut off:";
+  const check = cause === "force-compact" ? "The check after the compaction" : "The startup check";
   const lines = records.map((rec) => {
     const ran = minutes(rec.lastActivityAt - rec.startedAt);
     const last = formatZonedClock(new Date(rec.lastActivityAt), timeZone);
@@ -398,15 +452,15 @@ export function formatInterruptedAgentsNotice(
   });
   if (autoResume) {
     return [
-      "When Tomo last restarted or crashed, these were still running in this conversation and were cut off:",
+      lead,
       ...lines,
-      "The startup check says which to resume (SendMessage to the id; names do not survive a restart). "
+      `${check} says which to resume (SendMessage to the id; names do not survive a restart). `
         + "Resume none that has already been resumed or has finished since, and none marked otherwise. "
         + "Explore/Plan subagents and background commands cannot be resumed; rerun them if still needed.",
     ].join("\n");
   }
   return [
-    "When Tomo last restarted or crashed, these were still running in this conversation and were cut off:",
+    lead,
     ...lines,
     "Nothing has been resumed. To continue a resumable subagent, SendMessage to its id (names do not survive a restart; use the id) and it picks up from its saved transcript. "
       + "Explore/Plan subagents and background commands cannot be resumed; rerun them if still needed. "

@@ -918,6 +918,25 @@ export class SessionStore {
     });
   }
 
+  /**
+   * Charge a model call made FOR this session outside its SDK session (a
+   * forced compaction's summary call) to its totals. The context reading, the
+   * query count and the usage baseline are left alone: none of them is about
+   * that call.
+   */
+  addOutsideUsage(key: string, u: { costUsd: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }): void {
+    this.mutateRegistry("addOutsideUsage", "bookkeeping", () => {
+      const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
+      if (!entry?.stats) return;
+      entry.stats.totalCostUsd += u.costUsd;
+      entry.stats.totalInputTokens += u.inputTokens;
+      entry.stats.totalOutputTokens += u.outputTokens;
+      entry.stats.totalCacheReadTokens += u.cacheReadTokens;
+      entry.stats.totalCacheCreationTokens += u.cacheCreationTokens;
+      this.saveRegistryBestEffort("addOutsideUsage");
+    });
+  }
+
   /** Update session stats after a query */
   updateStats(key: string, update: {
     costUsd: number;
@@ -962,7 +981,10 @@ export class SessionStore {
       entry.stats.totalCacheReadTokens += update.cacheReadTokens;
       entry.stats.totalCacheCreationTokens += update.cacheCreationTokens;
       entry.stats.contextUsed = update.contextUsed;
-      entry.stats.contextMax = update.contextMax;
+      // An estimated reading carries the window as "0 = never seen one": keep
+      // the last real window rather than forget it (a forced compaction right
+      // after a restart needs it, see agent/force-compactor.ts).
+      if (update.contextMax > 0 || !update.contextEstimated) entry.stats.contextMax = update.contextMax;
       entry.stats.contextEstimated = update.contextEstimated ?? false;
       if (update.contextBreakdown) {
         entry.stats.contextBreakdown = update.contextBreakdown;

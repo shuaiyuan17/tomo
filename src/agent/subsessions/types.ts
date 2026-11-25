@@ -208,6 +208,13 @@ export interface SubsessionRecord {
    */
   legacyAskMoved?: true;
   /**
+   * The id of the todo the old todo link kept for this task (a record written
+   * before had it as `todoId`). Read only by the startup pass that drops those
+   * todos (`legacy-todos.ts`): it names the link's own item whatever title
+   * limit was in force when it was written.
+   */
+  legacyTodoId?: string;
+  /**
    * Earlier reports a later task_finish replaced while they were still
    * unread (their note still waiting, or never written), oldest first, at
    * kept until read. task_status shows them; they go with the record.

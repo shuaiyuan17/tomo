@@ -12,10 +12,12 @@ import type { SubsessionRecord } from "./types.js";
  *
  * An item is the link's own only when it carries the task's key as `ref`,
  * sits in the task's owning scope, came from the harness (`source:
- * "self"`), has the title the link gave it (or that title clipped, at any
- * limit), and is still as the link left it: never snoozed, and a
- * `waiting_on` / `next` pair the link wrote ("Answer sN: <reason>" only with
- * the task's own waiting reason). One the owner snoozed or handed off (a new next step, or a move to
+ * "self"`), is the item the record names (`legacyTodoId`, else the title
+ * the link gave it), and is still as the link left it: never snoozed, and a
+ * `waiting_on` / `next` pair the link wrote, word for word ("Answer sN:
+ * <reason>" only while the task waits with that reason). Anything that only
+ * looks like the link's (an owner's edit, or words clipped under limits since
+ * changed) is left alone: the owner still sees it on their list. One the owner snoozed or handed off (a new next step, or a move to
  * them) is theirs now and is left alone.
  *
  * A finished task's item (normally "Read s3's result, then close this") is
@@ -37,22 +39,28 @@ export function dropLegacyTaskTodos(
   keepAsk: (id: string, action: string) => boolean,
 ): { dropped: number; complete: boolean } {
   try {
+    const { titleMaxChars, nextMaxChars } = store.limits;
     const byKey = new Map(records.map((r) => [r.sessionKey, r]));
-    // The link's words, or those words clipped (at whatever limit was set
-    // when it wrote them: the limits may have changed since).
-    const wrote = (stored: string, text: string) => {
+    // The link's words exactly: whole, or clipped at today's limit. Anything
+    // else (an owner's edit, or words clipped under a limit since changed) is
+    // left on the list, where the owner still sees it: when unsure, keep.
+    const wrote = (stored: string, text: string, max: number) => {
       const full = text.replace(/[\r\n]+/g, " ").trim();
-      return stored === full || (stored.endsWith("…") && stored.length > 1 && full.startsWith(stored.slice(0, -1)));
+      const chars = [...full];
+      return stored === full || (chars.length > max && stored === `${chars.slice(0, max - 1).join("")}…`);
     };
     // The next steps the link wrote, with the waiting_on it wrote them with.
     const asLinkLeftIt = (item: TodoItem, r: SubsessionRecord) => item.snoozes === 0 && (item.waiting_on === "external"
-      ? wrote(item.next, `${r.id} is working on it (/s ${r.id})`) || wrote(item.next, `${r.id} is waiting for its check-back`)
-      : item.waiting_on === "owner" && (wrote(item.next, `Read ${r.id}'s result, then close this`)
-        || wrote(item.next, `Answer ${r.id}: ${r.waitingReason ?? "it is waiting for you"}`)));
+      ? wrote(item.next, `${r.id} is working on it (/s ${r.id})`, nextMaxChars) || wrote(item.next, `${r.id} is waiting for its check-back`, nextMaxChars)
+      : item.waiting_on === "owner" && (wrote(item.next, `Read ${r.id}'s result, then close this`, nextMaxChars)
+        || (r.status === "waiting" && wrote(item.next, `Answer ${r.id}: ${r.waitingReason ?? "it is waiting for you"}`, nextMaxChars))));
     const stale = store.list().flatMap((item) => {
       const task = item.ref ? byKey.get(item.ref) : undefined;
       return task && item.session === task.parentKey && item.source === "self"
-        && wrote(item.title, `${task.title} (${task.id})`) && asLinkLeftIt(item, task) ? [{ item, task }] : [];
+        // The record names the link's item (`legacyTodoId`); one it never
+        // recorded (a crash before the id reached it) is known by its title.
+        && (task.legacyTodoId === item.id || wrote(item.title, `${task.title} (${task.id})`, titleMaxChars))
+        && asLinkLeftIt(item, task) ? [{ item, task }] : [];
     });
     let dropped = 0;
     let complete = true;

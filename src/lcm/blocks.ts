@@ -77,7 +77,7 @@ export function isoWeekTag(d: Date): string {
 }
 
 /** Local-tz YYYY-MM-DD for a Date. */
-function localDateTag(d: Date): string {
+export function localDateTag(d: Date): string {
   const yyyy = d.getFullYear();
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");

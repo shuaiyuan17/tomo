@@ -2119,3 +2119,100 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(deps.maybeNudgeCompact).not.toHaveBeenCalled();
   });
 });
+
+describe("LiveSessionManager forced compaction", () => {
+  it("asks onContextOverflow after every turn and skips the nudge when a forced compaction started", async () => {
+    const onContextOverflow = vi.fn(() => true);
+    const deps = makeDeps({ onContextOverflow });
+    const manager = new LiveSessionManager(deps);
+    mockState.sendImpl = async (_p, session) => { session.lastResult = { contextUsed: 96, contextMax: 100 }; return "ok"; };
+    await manager.runWithRetry({ key: "telegram:-1", prompt: "hi" });
+    expect(onContextOverflow).toHaveBeenCalledWith("telegram:-1", { contextUsed: 96, contextMax: 100 }, "threshold");
+    expect(deps.maybeNudgeCompact).not.toHaveBeenCalled();
+
+    onContextOverflow.mockReturnValue(false);
+    await manager.runWithRetry({ key: "telegram:-1", prompt: "again" });
+    expect(deps.maybeNudgeCompact).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports a turn the CLI refused with \"Prompt is too long\" as prompt-too-long", async () => {
+    const onContextOverflow = vi.fn(() => false);
+    const manager = new LiveSessionManager(makeDeps({ onContextOverflow }));
+    mockState.sendImpl = async () => { throw new SdkResultError("Prompt is too long", "success"); };
+    await expect(manager.runWithRetry({ key: "dm:owner", prompt: "hi" })).rejects.toThrow("Prompt is too long");
+    expect(onContextOverflow).toHaveBeenCalledWith("dm:owner", null, "prompt-too-long");
+
+    onContextOverflow.mockClear();
+    mockState.sendImpl = async () => { throw new SdkResultError("API Error: 500 overloaded", "success"); };
+    await expect(manager.runWithRetry({ key: "dm:owner", prompt: "hi" })).rejects.toThrow("overloaded");
+    expect(onContextOverflow).not.toHaveBeenCalledWith("dm:owner", expect.anything(), "prompt-too-long");
+  });
+
+  it("holds the key: a turn waits, the live session is closed after beforeClose, and the turn runs on a new session after release", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.runWithRetry({ key: "dm:owner", prompt: "first" });
+    const first = mockState.instances[0];
+    first.background = true;
+
+    const hold = manager.holdForForceCompact("dm:owner")!;
+    expect(hold).not.toBeNull();
+    const sent: string[] = [];
+    mockState.sendImpl = async (prompt) => { sent.push(prompt); return "ok"; };
+    const queued = manager.runWithRetry({ key: "dm:owner", prompt: "queued" });
+    await flushMicrotasks(20);
+    expect(sent).toEqual([]);
+
+    const order: string[] = [];
+    const beforeClose = vi.fn(() => { order.push(first.closed ? "closed" : "open"); return true; });
+    const sid = await manager.quiesceForForceCompact(hold, beforeClose);
+    expect(sid).toBe("sdk-1");
+    // The background work was recorded while the session (and its tasks) still ran, then it was closed.
+    expect(order).toEqual(["open"]);
+    expect(first.closed).toBe(true);
+    await flushMicrotasks(20);
+    expect(sent).toEqual([]);
+
+    hold.release();
+    await queued;
+    expect(sent).toEqual(["queued"]);
+    expect(mockState.instances.length).toBe(2);
+  });
+
+  it("aborts with the session untouched when beforeClose refuses", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.runWithRetry({ key: "dm:owner", prompt: "first" });
+    const hold = manager.holdForForceCompact("dm:owner")!;
+    expect(await manager.quiesceForForceCompact(hold, () => false)).toBeNull();
+    expect(mockState.instances[0].closed).toBe(false);
+    hold.release();
+  });
+
+  it("never runs two rewrites of a session at once: forced and normal reservations exclude each other", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.runWithRetry({ key: "dm:owner", prompt: "first" });
+    // A `tomo lcm` rewrite in flight blocks a forced compaction…
+    const normal = manager.reserveCompact("dm:owner", "sdk-1");
+    expect(normal.ok).toBe(true);
+    expect(manager.holdForForceCompact("dm:owner")).toBeNull();
+    if (normal.ok) manager.finishCompact("dm:owner", normal.reservationId);
+
+    // …and a forced one blocks every other rewrite (and a second forced one) until released.
+    const hold = manager.holdForForceCompact("dm:owner")!;
+    expect(hold).not.toBeNull();
+    expect(manager.holdForForceCompact("dm:owner")).toBeNull();
+    const refused = manager.reserveCompact("dm:owner", "sdk-1");
+    expect(refused).toMatchObject({ ok: false, reason: "already-pending" });
+    hold.release();
+    expect(manager.reserveCompact("dm:owner", "sdk-1").ok).toBe(true);
+  });
+
+  it("is not blocked by background work (that is what it stops)", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.runWithRetry({ key: "dm:owner", prompt: "first" });
+    mockState.instances[0].background = true;
+    expect(manager.reserveCompact("dm:owner", "sdk-1")).toMatchObject({ ok: false, reason: "background-tasks" });
+    const hold = manager.holdForForceCompact("dm:owner");
+    expect(hold).not.toBeNull();
+    hold!.release();
+  });
+});

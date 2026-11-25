@@ -1,6 +1,9 @@
 import { formatDateTime, ownerT, type OwnerText } from "./i18n/index.js";
 import type { Channel, ChannelFaultNotice, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions } from "./channels/types.js";
 import type { CompactReservation } from "./lcm/background-gate.js";
+import { forceCompactSession } from "./lcm/force-compact.js";
+import { sdkForceSummarizer } from "./lcm/force-summarizer.js";
+import { ForceCompactor } from "./agent/force-compactor.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildIdentityPrompt, promptContextSnapshot } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
@@ -209,6 +212,8 @@ export class Agent {
   private inbox: DurableInbox | undefined;
   /** Subagents/background commands running per session, mirrored to disk (see running-agents-ledger.ts). */
   private runningAgents: RunningAgentsLedger | undefined;
+  /** The harness compacting a full session itself (lcm.forceCompactAtPct / "Prompt is too long"). */
+  private forceCompactor!: ForceCompactor;
   private detachRunningAgents: (() => void) | undefined;
   /** Throttle for reportInboxFault's owner DM. */
   private lastInboxFaultNoticeAt = 0;
@@ -468,6 +473,7 @@ export class Agent {
         this.handleTurnComplete(key);
       },
       maybeNudgeCompact: (key, ctx) => this.maybeNudgeCompact(key, ctx),
+      onContextOverflow: (key, reading, reason) => this.forceCompactor.maybeStart(key, reading, reason),
       refreshExternalMcpToken: (serverName) => this.mcpOAuthManager
         .refreshServerToken(serverName, config.mcpServers ?? {})
         .catch((err) => {
@@ -475,6 +481,26 @@ export class Agent {
           return "failed" as const;
         }),
       notifyOwner: (text) => this.notifyOwner(text),
+    });
+    this.forceCompactor = new ForceCompactor({
+      hold: (key) => this.liveSessionManager.holdForForceCompact(key),
+      quiesce: (hold, beforeClose) => this.liveSessionManager.quiesceForForceCompact(hold, beforeClose),
+      markInterrupted: (key) => this.runningAgents ? this.runningAgents.markSessionInterrupted(key) : [],
+      sessionClosed: (key) => this.runningAgents?.sessionClosed(key),
+      compact: ({ sdkSessionId, contextUsed, contextMax }) => forceCompactSession({
+        sdkSessionId,
+        sdkSessionsDir: config.sdkSessionsDir,
+        sessionsDir: config.sessionsDir,
+        workspaceDir: config.workspaceDir,
+        contextUsed,
+        contextMax,
+        freshTail: config.lcm.dailyFreshTail,
+        summarize: sdkForceSummarizer({ model: config.lcm.forceCompactModel }),
+      }),
+      queueNote: (key, note) => this.queuePendingNote(key, note),
+      notifyOwner: (text) => this.notifyOwner(text),
+      groupTitle: (key) => this.sessions.getEntry(key)?.chatTitle,
+      reportInterrupted: (key, records) => this.reportForceInterrupted(key, records),
     });
     this.proactive = new ProactiveSendService({
       getChannel: (name) => this.getChannel(name),
@@ -3643,6 +3669,45 @@ export class Agent {
       this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, ownerT("notices")("suppressed.turn.interruptedAgents"), "restart"))
         .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"));
     }
+  }
+
+  /**
+   * A forced compaction closed `key`'s session and with it these background
+   * tasks (agent/force-compactor.ts): told and resumed exactly like work a
+   * restart cut off (notifyInterruptedAgents) — the ledger already holds them
+   * as interrupted, the note goes to the durable pending-notes store before
+   * the ledger entry is dropped (a note that cannot be stored leaves it for
+   * the next start), and a background turn brings it to the model now. A
+   * sub-session's note waits for its own next turn.
+   */
+  private reportForceInterrupted(key: string, records: RunningTaskRecord[]): void {
+    const ledger = this.runningAgents;
+    if (!ledger) return;
+    const autoResume = config.interruptedAgentsAutoResume
+      ? { failed: new Set(records.filter((r) => isResumable(r) && ledger.resumeCount(key, r.taskId) >= MAX_AUTO_RESUMES).map((r) => r.taskId)) }
+      : undefined;
+    if (!this.queuePendingNote(key, formatTomoEvent("interrupted-agents", formatInterruptedAgentsNotice(records, undefined, autoResume, "force-compact")))) {
+      log.error({ sessionKey: key }, "Could not persist the note about work a forced compaction interrupted; kept for the next start");
+      return;
+    }
+    ledger.acknowledge(key);
+    log.info({ sessionKey: key, ids: records.map((r) => r.taskId) }, "Reporting background work a forced compaction interrupted");
+    if (isTaskSessionKey(key)) return;
+    const prompt = formatTomoEvent(
+      "interrupted-agents",
+      config.interruptedAgentsAutoResume
+        ? "Check after a forced compaction: the note above lists the background work it cut off. For each resumable subagent use SendMessage to resume it right away, "
+          + "unless the owner has explicitly said not to, or it has already been resumed or has finished since: "
+          + "tell it it was interrupted when the session was compacted, have it first check how far it got and which side effects "
+          + "(commits, pushes, messages sent, files changed) already happened, then continue without redoing them. "
+          + "Skip any the note marks otherwise; Explore/Plan subagents and background commands cannot be resumed (rerun them if still needed). "
+          + CONTINUITY_DELIVERY_NOTE
+        : "Check after a forced compaction: the note above lists the background work it cut off; decide whether each is still worth continuing. "
+          + CONTINUITY_DELIVERY_NOTE,
+      { name: "check" },
+    );
+    this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, ownerT("notices")("suppressed.turn.interruptedAgents"), "background"))
+      .catch((err) => log.error({ err, sessionKey: key }, "Forced-compaction resume turn failed in queue"));
   }
 
   /** Tell the owner (no model turn) which subagents failed past their resume limit; unsent ones are tried again next start. */

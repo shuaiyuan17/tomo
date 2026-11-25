@@ -48,6 +48,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, opts: { todos?: Subsession
   h.store = new SubsessionStore(join(dir, "t.json"), { strictTransitions: true, now: () => h.clock });
   const recording: SubsessionTodoLink = {
     open: (r) => { h.todoCalls.push(`open ${r.id}`); return "t-1"; },
+    find: () => undefined,
     set: (id, on, next) => { h.todoCalls.push(`set ${id} ${on} ${next}`); },
     close: (id, reason) => { h.todoCalls.push(`close ${id} ${reason}`); },
   };
@@ -299,6 +300,36 @@ describe("the todo link", () => {
     h.service.stop();
   });
 
+  it("never adopts a todo another scope wrote with the task's ref", () => {
+    const todos = new TodoStore(join(dir, "todos"), DEFAULT_TODOS);
+    const link = createTodoLink(todos);
+    const seed = harness({}, { todos: link });
+    const t = seed.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    const foreign = todos.add({ title: "group thing", next: "x", waiting_on: "external", ref: t.sessionKey, session: "telegram:-100", source: "self" });
+    const h = harness({ maxRunning: 0 }, { todos: link });
+    h.service.start();
+    const mine = h.store.get(t.id)?.todoId;
+    expect(mine).toBeDefined();
+    expect(mine).not.toBe(foreign.id);
+    expect(todos.list().find((i) => i.id === mine)).toMatchObject({ session: "dm:owner" });
+    h.service.stop();
+  });
+
+  it("an ended task whose todo id never reached the record finds it and closes it, and makes none", () => {
+    const todos = new TodoStore(join(dir, "todos"), DEFAULT_TODOS);
+    const link = createTodoLink(todos);
+    const seed = harness({}, { todos: link });
+    const t = seed.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    link.open(seed.store.get(t.id)!);
+    seed.store.transition(t.id, "cancel", { reason: "stopped" });
+    const other = seed.store.create({ parentKey: "dm:owner", title: "u", brief: "b" });
+    seed.store.transition(other.id, "cancel", { reason: "stopped" }); // never had one
+    const h = harness({ maxRunning: 0 }, { todos: link });
+    h.service.start();
+    expect(todos.list()).toEqual([]);
+    h.service.stop();
+  });
+
   it("writes real todos through the store, and a todo the owner closed is left alone", async () => {
     const todos = new TodoStore(join(dir, "todos"), DEFAULT_TODOS);
     const link = createTodoLink(todos);
@@ -339,7 +370,7 @@ describe("the mirror", () => {
     const h = harness();
     const task = await talk(h);
     expect(task.conversation.map((e) => `${e.from}:${e.kind}`)).toEqual(["task:ask", "owner:message", "task:reply"]);
-    expect(h.wakes.length).toBeGreaterThanOrEqual(2);
+    expect(h.wakes.length).toBeGreaterThanOrEqual(1);
     expect(new Set(h.wakes)).toEqual(new Set(["dm:owner"]));
 
     const note = h.service.mirrorNote("dm:owner")!;
@@ -358,6 +389,23 @@ describe("the mirror", () => {
     h.service.stop();
   });
 
+  it("asks for no silent turn for what the task said on its own, only once the owner wrote to it", async () => {
+    const h = harness();
+    h.onTurn = async (prompt, key) => {
+      if (prompt.includes("subsession-start")) await h.service.ask(key, "Which branch?");
+      else if (prompt.includes("subsession-owner-message")) await h.service.reply(key, "On it.");
+      return { ok: true };
+    };
+    h.service.start();
+    const task = spawn(h);
+    await flush();
+    expect(h.wakes).toEqual([]);
+    h.service.ownerMessage("dm:owner", task.id, "use main");
+    await flush();
+    expect(h.wakes.length).toBeGreaterThanOrEqual(1);
+    h.service.stop();
+  });
+
   it("in note mode, never wakes the owning session", async () => {
     const h = harness({ mirror: "note" });
     await talk(h);
@@ -366,7 +414,7 @@ describe("the mirror", () => {
     h.service.stop();
   });
 
-  it("wakes the owning session after a background turn that spoke to the owner, even one that leaves the task waiting", async () => {
+  it("a background turn wakes the owning session only when words the owner wrote to the task are unseen", async () => {
     const h = harness();
     h.onTurn = async (prompt, key) => {
       if (prompt.includes("subsession-start")) await h.service.ask(key, "Which branch?");
@@ -375,23 +423,26 @@ describe("the mirror", () => {
     h.service.start();
     const task = spawn(h);
     await flush();
+    // The task's own question: the owner has read it; no silent turn for it.
+    expect(h.wakes).toEqual([]);
     h.service.markMirrorSeen(h.service.mirrorNote("dm:owner")!.upTo);
-    const before = h.wakes.length;
     // A background subagent's report: the task speaks in a turn no driver ran.
-    // A plain notify the owner already read waits for the next turn, as a note.
     await h.service.notify(task.sessionKey, "The build finished.");
     h.service.onBackgroundReport(task.sessionKey);
-    expect(h.wakes.length).toBe(before);
-    expect(h.service.hasUnseenMirror("dm:owner")).toBe(true);
-    // A reply to the owner is an exchange: that one wakes it.
     await h.service.reply(task.sessionKey, "Use main, then.");
     h.service.onBackgroundReport(task.sessionKey);
-    expect(h.wakes.length).toBe(before + 1);
+    expect(h.wakes).toEqual([]);
+    expect(h.service.hasUnseenMirror("dm:owner")).toBe(true);
+    // Something the owner wrote to it, still unseen: that wakes it, even with the task waiting.
+    h.store.update(task.id, (r) => {
+      const seq = (r.conversation.at(-1)?.seq ?? 0) + 1;
+      r.conversation.push({ seq, at: h.clock, from: "owner", kind: "message", text: "use main" });
+    });
+    h.service.onBackgroundReport(task.sessionKey);
+    expect(h.wakes).toEqual(["dm:owner"]);
     expect(h.service.get(task.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
-
-    await h.service.reply(task.sessionKey, "And then it failed.");
     h.service.onBackgroundTurnFailed(task.sessionKey);
-    expect(h.wakes.length).toBe(before + 2);
+    expect(h.wakes).toEqual(["dm:owner", "dm:owner"]);
     h.service.stop();
   });
 

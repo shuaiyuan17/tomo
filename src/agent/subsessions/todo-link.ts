@@ -19,11 +19,26 @@ export function createTodoLink(store: TodoStore): SubsessionTodoLink {
     const chars = [...text.replace(/[\r\n]+/g, " ").trim()];
     return chars.length <= max ? chars.join("") : `${chars.slice(0, max - 1).join("")}…`;
   };
+  /**
+   * The task's own todo: made by the harness for this task key, in the
+   * owning scope. A ref alone is not enough, since any conversation can
+   * write one, and a group's item must never carry a private task's words.
+   */
+  const ownTodo = (record: SubsessionRecord) => store.list().find((item) =>
+    item.ref === record.sessionKey && item.session === record.parentKey && item.source === "self");
   return {
+    find(record: SubsessionRecord): string | undefined {
+      try {
+        return ownTodo(record)?.id;
+      } catch (err) {
+        log.warn({ err, id: record.id }, "Could not read the todo list to find a sub-session's todo");
+        return undefined;
+      }
+    },
     open(record: SubsessionRecord): string | undefined {
       try {
         // One made already (a crash came before its id reached the task record): that one.
-        const existing = store.list().find((item) => item.ref === record.sessionKey);
+        const existing = ownTodo(record);
         if (existing) return existing.id;
         const limits = store.limits;
         const item = store.add({

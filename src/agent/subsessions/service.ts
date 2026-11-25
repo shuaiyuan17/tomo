@@ -67,8 +67,10 @@ export type OwnerMessageResult =
  * nothing when it already does, or the item is gone).
  */
 export interface SubsessionTodoLink {
-  /** Add the todo for a new task; its id, or undefined when none was made. */
+  /** Add the todo for a new task (or find the one already made); its id, or undefined when none was made. */
   open(record: SubsessionRecord): string | undefined;
+  /** The task's todo if one was made, without making one. */
+  find(record: SubsessionRecord): string | undefined;
   /** Who the item waits on now, and its next step. */
   set(todoId: string, waitingOn: "owner" | "external", next: string): void;
   /** The task ended without a result: drop the item. */
@@ -856,7 +858,8 @@ export class SubsessionService {
       for (const task of this.store.list()) {
         const open = OPEN_STATUSES.has(task.status);
         if (task.status === "archived" || (!open && !todos)) continue;
-        if (!task.todoId && open && todos) this.adoptTodo(task);
+        // An ended task only finds its todo (to close or update it), never gets a new one.
+        if (!task.todoId && todos) this.adoptTodo(task, open);
         this.syncTodo(this.store.get(task.id) ?? task);
       }
     }, "todo resync");
@@ -1724,16 +1727,16 @@ export class SubsessionService {
 
   /**
    * A round ended (a task turn, or its fallback send): in "turn" mode, wake
-   * the owning session to see it. Only for an exchange with the owner (their
-   * message, or the task's reply, question or fallback answer): a plain
-   * task_notify the owner already read waits, as a note, for the session's
-   * next turn. Nor while the 5-hour window is at the quota pause: a silent
+   * the owning session to see it. Only when the owner wrote to the task
+   * directly (words the owning session has no other way to learn): what the
+   * task itself said, the owner has already read, and it waits, as the
+   * mirror note, for the session's next turn. Nor while the 5-hour window is at the quota pause: a silent
    * turn on the main conversation is exactly what that headroom is kept for.
    */
   private mirrorAfterRound(id: string): void {
     if (this.deps.config().mirror !== "turn" || !this.deps.mirrorWake) return;
     const record = this.safeGet(id);
-    if (!record || !record.conversation.some((e) => e.seq > record.mirrorSeenSeq && e.kind !== "notify")) return;
+    if (!record || !record.conversation.some((e) => e.seq > record.mirrorSeenSeq && e.from === "owner")) return;
     if (!this.mirrorTurnAllowed()) return;
     this.safely(() => this.deps.mirrorWake!(record.parentKey), "mirror wake");
   }
@@ -1763,10 +1766,10 @@ export class SubsessionService {
     return outcome;
   }
 
-  /** Open (or find, by its ref) the task's todo and link it on the record. */
-  private adoptTodo(record: SubsessionRecord): void {
+  /** Open (or only find, `create` false) the task's todo and link it on the record. */
+  private adoptTodo(record: SubsessionRecord, create = true): void {
     this.safely(() => {
-      const todoId = this.deps.todos!.open(record);
+      const todoId = create ? this.deps.todos!.open(record) : this.deps.todos!.find(record);
       if (todoId) this.store.update(record.id, (r) => { r.todoId = todoId; });
     }, "open the task's todo");
   }

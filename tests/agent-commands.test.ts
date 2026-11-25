@@ -7,6 +7,18 @@ vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js"
 vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/agent-mocks.js")).sdkModuleMock());
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
+// The config lock, as in production, except that a contended one gives up
+// after 100 ms instead of withFileLockSync's 5 s default: the /restore test
+// below holds it from "another process" and would otherwise wait it out.
+vi.mock("../src/config-file.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/config-file.js")>();
+  const { withFileLockSync } = await import("../src/file-lock.js");
+  return {
+    ...actual,
+    withConfigLockSync: <T>(configPath: string, fn: () => T): T =>
+      withFileLockSync(actual.configLockPath(configPath), fn, { timeoutMs: 100 }),
+  };
+});
 
 import {
   Agent,
@@ -17,35 +29,45 @@ import {
   installAgentTestHooks,
   makeMsg,
   mockConfig,
+  lastQueryOptions,
   mockSdk,
+  ownerIdentity,
   resetConfig,
-  sdkMock,
 } from "./helpers/agent-harness.js";
 import { PetStore } from "../src/mcp/pet-store.js";
 
 
 installAgentTestHooks();
 
+const CHATGPT_GATEWAY = { mode: "chatgpt-subscription" as const, baseUrl: "http://localhost:4000", apiKey: "sk-litellm-test" };
+
+/** config.json as the daemon left it on disk. */
+function readConfigFile(): { model?: string; sessionModelOverrides?: Record<string, string> } {
+  return JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as { model?: string; sessionModelOverrides?: Record<string, string> };
+}
+
+/** Swap the agent's Claude login flow for spies: no real `claude` process. */
+function withFakeLogin<T extends Record<string, ReturnType<typeof vi.fn>>>(agent: InstanceType<typeof Agent>, overrides: T = {} as T) {
+  const fakeLogin = { start: vi.fn(), complete: vi.fn(), cancel: vi.fn(), stop: vi.fn(), ...overrides };
+  (agent as unknown as { commands: { claudeLogin: typeof fakeLogin } }).commands.claudeLogin = fakeLogin;
+  return fakeLogin;
+}
+
 // ===== Commands =====
 
 describe("chat commands", () => {
   it("/login runs a two-step owner-DM flow and schedules restart after verification", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
-    const fakeLogin = {
+    const fakeLogin = withFakeLogin(agent, {
       start: vi.fn(async () => ({ url: "https://claude.com/login?state=test", reused: false })),
       complete: vi.fn(async () => ({ verified: true })),
       cancel: vi.fn(() => false),
-      stop: vi.fn(),
-    };
-    const internals = agent as unknown as {
-      commands: { claudeLogin: typeof fakeLogin };
-    };
-    internals.commands.claudeLogin = fakeLogin;
+    });
 
     await tg.simulateCommand("login", "12345", "Shuai", undefined, "12345");
 
@@ -64,29 +86,20 @@ describe("chat commands", () => {
 
   it("/login distinguishes a saved login from a failed verification probe and still restarts", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
-    const fakeLogin = {
-      start: vi.fn(),
+    withFakeLogin(agent, {
       complete: vi.fn(async () => ({
         verified: false,
         verificationError: "Claude login verification failed: network unavailable",
       })),
       cancel: vi.fn(() => false),
-      stop: vi.fn(),
-    };
+    });
     const scheduleRestart = vi.fn();
-    const internals = agent as unknown as {
-      commands: {
-        claudeLogin: typeof fakeLogin;
-        scheduleRestart: typeof scheduleRestart;
-      };
-    };
-    internals.commands.claudeLogin = fakeLogin;
-    internals.commands.scheduleRestart = scheduleRestart;
+    (agent as unknown as { commands: { scheduleRestart: typeof scheduleRestart } }).commands.scheduleRestart = scheduleRestart;
 
     await tg.simulateCommand("login", "12345", "Shuai", "secret-code#test", "12345");
 
@@ -101,22 +114,13 @@ describe("chat commands", () => {
 
   it("/login rejects groups without starting auth or creating a session", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
-    const fakeLogin = {
-      start: vi.fn(),
-      complete: vi.fn(),
-      cancel: vi.fn(),
-      stop: vi.fn(),
-    };
-    const internals = agent as unknown as {
-      commands: { claudeLogin: typeof fakeLogin };
-      sessions: InstanceType<typeof SessionStore>;
-    };
-    internals.commands.claudeLogin = fakeLogin;
+    const fakeLogin = withFakeLogin(agent);
+    const internals = agent as unknown as { sessions: InstanceType<typeof SessionStore> };
 
     await tg.simulateCommand("login", "-100123", "Shuai", undefined, "12345");
 
@@ -127,28 +131,33 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
-  it("/login rejects a private sender who is not a configured owner", async () => {
+  // Owner-only commands refuse anyone else, in a DM or an allowlisted group,
+  // and leave config, the model overrides and the login flow untouched.
+  // (Group-only refusals — "use this in a private DM" — are tested per command above.)
+  it.each([
+    { cmd: "login", chatId: "99999", allowlist: undefined },
+    { cmd: "usage", chatId: "12345", allowlist: ["12345"] },
+    { cmd: "restore", chatId: "-100777", allowlist: ["12345", "-100777"] },
+    { cmd: "model", chatId: "-100777", allowlist: ["12345", "-100777"], args: "opus-1m" },
+  ])("/$cmd refuses a sender who is not the configured owner ($chatId)", async ({ cmd, chatId, allowlist, args }) => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
+      ...(allowlist ? { channelAllowlists: { telegram: allowlist } } : {}),
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
-    const fakeLogin = {
-      start: vi.fn(),
-      complete: vi.fn(),
-      cancel: vi.fn(),
-      stop: vi.fn(),
-    };
-    const internals = agent as unknown as {
-      commands: { claudeLogin: typeof fakeLogin };
-    };
-    internals.commands.claudeLogin = fakeLogin;
+    const login = withFakeLogin(agent);
+    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
+    writeFileSync(agentEnv.configBackupPath, JSON.stringify({ model: "claude-sonnet-4-6" }, null, 2) + "\n");
 
-    await tg.simulateCommand("login", "99999", "Other", undefined, "99999");
+    await tg.simulateCommand(cmd, chatId, "Other", args, "99999");
 
-    expect(fakeLogin.start).not.toHaveBeenCalled();
+    expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toContain("Only the owner");
+    expect(login.start).not.toHaveBeenCalled();
+    expect(readConfigFile()).toEqual({ model: "claude-haiku-4-5" });
+    expect(mockConfig.sessionModelOverrides).toEqual({});
 
     await agent.stop();
   });
@@ -158,16 +167,7 @@ describe("chat commands", () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
-    const fakeLogin = {
-      start: vi.fn(),
-      complete: vi.fn(),
-      cancel: vi.fn(),
-      stop: vi.fn(),
-    };
-    const internals = agent as unknown as {
-      commands: { claudeLogin: typeof fakeLogin };
-    };
-    internals.commands.claudeLogin = fakeLogin;
+    const fakeLogin = withFakeLogin(agent);
 
     await tg.simulateCommand("login", "12345", "Shuai", undefined, "12345");
 
@@ -180,7 +180,7 @@ describe("chat commands", () => {
 
   it("/mcp lists live external-server status and starts one explicit login", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -225,7 +225,7 @@ describe("chat commands", () => {
 
   it("/mcp is owner-DM-only and does not create a group session when refused", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
       channelAllowlists: { telegram: ["12345", "-100123"] },
     });
     const agent = new Agent();
@@ -249,7 +249,7 @@ describe("chat commands", () => {
 
   it("/mcp reports the live session's real connection state, not whether a server is mounted", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
       mcpServers: {
         docs: { server: { type: "http", url: "https://docs.example/mcp" } },
       },
@@ -285,7 +285,7 @@ describe("chat commands", () => {
 
   it("/mcp says when the SDK does not report connection state", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
       mcpServers: { docs: { server: { type: "http", url: "https://docs.example/mcp" } } },
     });
     const agent = new Agent();
@@ -305,7 +305,7 @@ describe("chat commands", () => {
 
   it("consumes a matching pasted MCP callback in the owner DM before it reaches model context", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -345,7 +345,7 @@ describe("chat commands", () => {
 
   it("passes an ordinary URL with a code query parameter through as normal DM content", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -365,7 +365,7 @@ describe("chat commands", () => {
 
   it("never treats a group-pasted localhost callback as OAuth completion", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
       channelAllowlists: { telegram: ["12345", "-100123"] },
     });
     const agent = new Agent();
@@ -392,37 +392,26 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
-  it("/new resets the session", async () => {
+  it("/new resets the session: the SDK link is dropped and the next turn starts fresh", async () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
+    const sessions = (agent as unknown as { sessions: InstanceType<typeof SessionStore> }).sessions;
 
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
     await drainQueue(agent);
+    expect(sessions.getSdkSessionId("telegram:12345")).toBe("mock-sdk-session-123");
     tg.clearDelivered();
 
     await tg.simulateCommand("new", "12345", "TestUser");
 
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toContain("New session");
+    expect(sessions.getSdkSessionId("telegram:12345")).toBeUndefined();
 
-    await agent.stop();
-  });
-
-  it("/status shows session info", async () => {
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
+    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi again" }));
     await drainQueue(agent);
-    tg.clearDelivered();
-
-    await tg.simulateCommand("status", "12345", "TestUser");
-
-    expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toContain("Session:");
-    expect(tg.sent[0].text).toContain("Model:");
+    expect(lastQueryOptions().resume).toBeUndefined();
 
     await agent.stop();
   });
@@ -439,6 +428,7 @@ describe("chat commands", () => {
     await tg.simulateCommand("status", "12345", "TestUser");
     expect(tg.sent[0].text).toBe("🆕 New session started.");
     expect(tg.sent[1].text).toMatch(/^📋 Status\n\nSession: /);
+    expect(tg.sent[1].text).toContain("Model:");
 
     resetConfig({ locale: "zh-Hans" });
     await tg.simulateCommand("new", "12345", "TestUser");
@@ -487,7 +477,7 @@ describe("chat commands", () => {
 
   it("/usage refuses in a group chat (owner DM only)", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
       channelAllowlists: { telegram: ["12345", "-100777"] },
     });
     const agent = new Agent();
@@ -498,23 +488,6 @@ describe("chat commands", () => {
 
     expect(tg.sent).toHaveLength(1);
     expect(tg.sent[0].text).toContain("private DM");
-
-    await agent.stop();
-  });
-
-  it("/usage refuses an allowlisted sender who is not a configured owner", async () => {
-    resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-      channelAllowlists: { telegram: ["12345"] },
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    await tg.simulateCommand("usage", "12345", "Other", undefined, "99999");
-
-    expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toContain("Only the owner");
 
     await agent.stop();
   });
@@ -578,180 +551,9 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
-  it("passes LiteLLM gateway env to the Claude Agent SDK child", async () => {
-    resetConfig({
-      auth: {
-        method: "api-key",
-        apiKey: "sk-anthropic-direct",
-        apiKeySource: "config",
-        error: null,
-      },
-      litellm: {
-        mode: "anthropic-compatible",
-        baseUrl: "http://localhost:4000",
-        apiKey: "sk-litellm-test",
-      },
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-
-    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
-    const lastCall = calls[calls.length - 1]?.[0] as {
-      options?: { env?: Record<string, string | undefined> };
-    };
-    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
-    expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-litellm-test");
-
-    await agent.stop();
-  });
-
-  it("does not forward a parent Anthropic API key to a gateway without its own key", async () => {
-    const oldApiKey = process.env.ANTHROPIC_API_KEY;
-    process.env.ANTHROPIC_API_KEY = "sk-anthropic-parent";
-    let agent: InstanceType<typeof Agent> | null = null;
-    try {
-      resetConfig({
-        auth: {
-          method: "api-key",
-          apiKey: "sk-anthropic-parent",
-          apiKeySource: "environment",
-          error: null,
-        },
-        litellm: {
-          mode: "anthropic-compatible",
-          baseUrl: "http://localhost:4000",
-          apiKey: "",
-        },
-      });
-      agent = new Agent();
-      const tg = new MockChannel("telegram");
-      agent.addChannel(tg);
-
-      await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-      await drainQueue(agent);
-
-      const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
-      const lastCall = calls[calls.length - 1]?.[0] as {
-        options?: { env?: Record<string, string | undefined> };
-      };
-      expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
-      expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBeUndefined();
-    } finally {
-      if (oldApiKey === undefined) {
-        delete process.env.ANTHROPIC_API_KEY;
-      } else {
-        process.env.ANTHROPIC_API_KEY = oldApiKey;
-      }
-      await agent?.stop();
-    }
-  });
-
-  it("passes a configured Anthropic API key to direct Claude sessions", async () => {
-    resetConfig({
-      auth: {
-        method: "api-key",
-        apiKey: "sk-anthropic-test",
-        apiKeySource: "config",
-        error: null,
-      },
-      lcm: {
-        ...mockConfig.lcm,
-        groupCompactStyle: "sdk",
-      },
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    await tg.simulateMessage(makeMsg({
-      chatId: "-100123",
-      text: "Hi",
-      isGroup: true,
-      isMentioned: true,
-    }));
-    await drainQueue(agent);
-
-    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
-    const lastCall = calls[calls.length - 1]?.[0] as {
-      options?: { env?: Record<string, string | undefined> };
-    };
-    expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-anthropic-test");
-    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
-
-    await agent.stop();
-  });
-
-  it("routes a chatgpt-subscription gateway when the model is a LiteLLM model", async () => {
-    resetConfig({
-      model: "chatgpt/gpt-5.5",
-      litellm: {
-        mode: "chatgpt-subscription",
-        baseUrl: "http://localhost:4000",
-        apiKey: "sk-litellm-test",
-      },
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-
-    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
-    const lastCall = calls[calls.length - 1]?.[0] as {
-      options?: { env?: Record<string, string | undefined> };
-    };
-    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
-    expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-litellm-test");
-
-    await agent.stop();
-  });
-
-  it("bypasses a chatgpt-subscription gateway for a Claude-model session", async () => {
-    const oldBaseUrl = process.env.ANTHROPIC_BASE_URL;
-    process.env.ANTHROPIC_BASE_URL = "http://localhost:4000";
-    let agent: InstanceType<typeof Agent> | null = null;
-    try {
-      resetConfig({
-        // Gateway only serves chatgpt/*, but this session resolves to a Claude model
-        // (default config.model) — it must hit Anthropic directly, not the proxy.
-        model: "claude-sonnet-5[1m]",
-        litellm: {
-          mode: "chatgpt-subscription",
-          baseUrl: "http://localhost:4000",
-          apiKey: "sk-litellm-test",
-        },
-      });
-      agent = new Agent();
-      const tg = new MockChannel("telegram");
-      agent.addChannel(tg);
-
-      await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-      await drainQueue(agent);
-
-      const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
-      const lastCall = calls[calls.length - 1]?.[0] as {
-        options?: { env?: Record<string, string | undefined> };
-      };
-      expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
-      expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe(process.env.ANTHROPIC_API_KEY);
-    } finally {
-      if (oldBaseUrl === undefined) {
-        delete process.env.ANTHROPIC_BASE_URL;
-      } else {
-        process.env.ANTHROPIC_BASE_URL = oldBaseUrl;
-      }
-      await agent?.stop();
-    }
-  });
-
   it("routes back through the ChatGPT gateway after switching from a Claude model", async () => {
     resetConfig({
-      identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("owner", { telegram: "12345" })],
       model: "chatgpt/gpt-5.5",
       litellm: {
         mode: "chatgpt-subscription",
@@ -770,66 +572,18 @@ describe("chat commands", () => {
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Claude turn" }));
     await drainQueue(agent);
 
-    let calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
-    let lastCall = calls[calls.length - 1]?.[0] as {
-      options?: { env?: Record<string, string | undefined>; model?: string };
-    };
-    expect(lastCall.options?.model).toBe("claude-opus-5-5[1m]");
-    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBeUndefined();
+    expect(lastQueryOptions().model).toBe("claude-opus-5-5[1m]");
+    expect(lastQueryOptions().env?.ANTHROPIC_BASE_URL).toBeUndefined();
 
     await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5", "12345");
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Back to ChatGPT" }));
     await drainQueue(agent);
 
-    calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
-    lastCall = calls[calls.length - 1]?.[0] as {
-      options?: { env?: Record<string, string | undefined>; model?: string; resume?: string };
-    };
-    expect(lastCall.options?.model).toBe("chatgpt/gpt-5.5");
-    expect(lastCall.options?.resume).toBe("mock-sdk-session-123");
-    expect(lastCall.options?.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
-    expect(lastCall.options?.env?.ANTHROPIC_API_KEY).toBe("sk-litellm-test");
-
-    await agent.stop();
-  });
-
-  it("surfaces the resolved Claude model in the system prompt", async () => {
-    resetConfig({ model: "sonnet" });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-
-    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
-    const lastCall = calls[calls.length - 1]?.[0] as { options?: { systemPrompt?: string[] } };
-    expect(lastCall.options?.systemPrompt?.join("\n\n")).toContain("# RUNTIME");
-    // alias "sonnet" must be resolved to its concrete id, not echoed raw
-    expect(lastCall.options?.systemPrompt?.join("\n\n")).toContain("claude-sonnet-5");
-
-    await agent.stop();
-  });
-
-  it("surfaces a LiteLLM gateway model in the system prompt", async () => {
-    resetConfig({
-      model: "chatgpt/gpt-5.5",
-      litellm: {
-        mode: "chatgpt-subscription",
-        baseUrl: "http://localhost:4000",
-        apiKey: "sk-litellm-test",
-      },
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
-    await drainQueue(agent);
-
-    const calls = (sdkMock.query as unknown as { mock: { calls: Array<[Record<string, unknown>]> } }).mock.calls;
-    const lastCall = calls[calls.length - 1]?.[0] as { options?: { systemPrompt?: string[] } };
-    expect(lastCall.options?.systemPrompt?.join("\n\n")).toContain("chatgpt/gpt-5.5");
+    const back = lastQueryOptions();
+    expect(back.model).toBe("chatgpt/gpt-5.5");
+    expect(back.resume).toBe("mock-sdk-session-123");
+    expect(back.env?.ANTHROPIC_BASE_URL).toBe("http://localhost:4000");
+    expect(back.env?.ANTHROPIC_API_KEY).toBe("sk-litellm-test");
 
     await agent.stop();
   });
@@ -858,7 +612,7 @@ describe("chat commands", () => {
   });
 
   it("/model persists a session override to config", async () => {
-    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    resetConfig({ identities: [ownerIdentity("owner", { telegram: "12345" })] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -882,7 +636,7 @@ describe("chat commands", () => {
   });
 
   it("/model keeps the active SDK session so provider switches preserve continuity", async () => {
-    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    resetConfig({ identities: [ownerIdentity("owner", { telegram: "12345" })] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -900,142 +654,48 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
-  it("/model accepts known full model IDs", async () => {
-    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+  it.each([
+    { name: "a known full model id", arg: "claude-opus-4-8[1m]" },
+    { name: "a future direct model id", arg: "claude-sonnet-5-1" },
+    { name: "a LiteLLM provider/model name when a gateway is configured", arg: "chatgpt/gpt-5.5", litellm: CHATGPT_GATEWAY },
+  ])("/model accepts $name", async ({ arg, litellm }) => {
+    resetConfig({ identities: [ownerIdentity("owner", { telegram: "12345" })], ...(litellm ? { litellm } : {}) });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "claude-opus-4-8[1m]", "12345");
+    await tg.simulateCommand("model", "12345", "TestUser", arg, "12345");
 
-    expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("🔄 Switched to claude-opus-4-8[1m]");
-
-    const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
-      sessionModelOverrides?: Record<string, string>;
-    };
-    expect(cfg.sessionModelOverrides?.["dm:owner"]).toBe("claude-opus-4-8[1m]");
+    expect(tg.sent.map((m) => m.text)).toEqual([`🔄 Switched to ${arg}`]);
+    expect(readConfigFile().sessionModelOverrides?.["dm:owner"]).toBe(arg);
 
     await agent.stop();
   });
 
-  it("/model accepts future direct model IDs", async () => {
-    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+  it.each([
+    { name: "a non-chatgpt provider model in ChatGPT subscription mode", arg: "openrouter/openai/gpt-4o-mini", litellm: CHATGPT_GATEWAY, reply: "only routes chatgpt/* models" },
+    { name: "a LiteLLM provider/model name without a gateway", arg: "chatgpt/gpt-5.5", reply: "needs a LiteLLM gateway" },
+    { name: "an invalid model name", arg: "not a model", reply: "Unknown model" },
+  ])("/model rejects $name and does not write config", async ({ arg, litellm, reply }) => {
+    resetConfig({ identities: [ownerIdentity("owner", { telegram: "12345" })], ...(litellm ? { litellm } : {}) });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
 
-    await tg.simulateCommand("model", "12345", "TestUser", "claude-sonnet-5-1", "12345");
+    await tg.simulateCommand("model", "12345", "TestUser", arg, "12345");
 
     expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("🔄 Switched to claude-sonnet-5-1");
-
-    const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
-      sessionModelOverrides?: Record<string, string>;
-    };
-    expect(cfg.sessionModelOverrides?.["dm:owner"]).toBe("claude-sonnet-5-1");
-
-    await agent.stop();
-  });
-
-  it("/model accepts LiteLLM provider/model names when a gateway is configured", async () => {
-    resetConfig({
-      identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-      litellm: {
-        mode: "chatgpt-subscription",
-        baseUrl: "http://localhost:4000",
-        apiKey: "sk-litellm-test",
-      },
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
-
-    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5", "12345");
-
-    expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toBe("🔄 Switched to chatgpt/gpt-5.5");
-
-    const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
-      sessionModelOverrides?: Record<string, string>;
-    };
-    expect(cfg.sessionModelOverrides?.["dm:owner"]).toBe("chatgpt/gpt-5.5");
-
-    await agent.stop();
-  });
-
-  it("/model rejects non-chatgpt provider models in ChatGPT subscription mode", async () => {
-    resetConfig({
-      identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-      litellm: {
-        mode: "chatgpt-subscription",
-        baseUrl: "http://localhost:4000",
-        apiKey: "sk-litellm-test",
-      },
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
-
-    await tg.simulateCommand("model", "12345", "TestUser", "openrouter/openai/gpt-4o-mini", "12345");
-
-    expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toContain("only routes chatgpt/* models");
-
-    const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
-      sessionModelOverrides?: Record<string, string>;
-    };
-    expect(cfg.sessionModelOverrides).toBeUndefined();
-
-    await agent.stop();
-  });
-
-  it("/model rejects LiteLLM provider/model names without a gateway and does not write config", async () => {
-    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
-
-    await tg.simulateCommand("model", "12345", "TestUser", "chatgpt/gpt-5.5", "12345");
-
-    expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toContain("needs a LiteLLM gateway");
-
-    const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
-      sessionModelOverrides?: Record<string, string>;
-    };
-    expect(cfg.sessionModelOverrides).toBeUndefined();
-
-    await agent.stop();
-  });
-
-  it("/model rejects invalid model names without writing config", async () => {
-    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
-
-    await tg.simulateCommand("model", "12345", "TestUser", "not a model", "12345");
-
-    expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toContain("Unknown model");
-
-    const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
-      sessionModelOverrides?: Record<string, string>;
-    };
-    expect(cfg.sessionModelOverrides).toBeUndefined();
+    expect(tg.sent[0].text).toContain(reply);
+    expect(readConfigFile().sessionModelOverrides).toBeUndefined();
+    expect(mockConfig.sessionModelOverrides["dm:owner"]).toBeUndefined();
 
     await agent.stop();
   });
 
   it("/restore does not replace config.json while another writer holds the config lock", async () => {
-    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    resetConfig({ identities: [ownerIdentity("owner", { telegram: "12345" })] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -1049,12 +709,12 @@ describe("chat commands", () => {
     await tg.simulateCommand("restore", "12345", "TestUser", undefined, "12345");
 
     expect(tg.sent[0].text).toContain("restore failed");
-    expect(JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8"))).toEqual({ model: "current" });
+    expect(readConfigFile()).toEqual({ model: "current" });
     await agent.stop();
-  }, 15_000);
+  });
 
   it("/restore restores config.json from config.json.bak", async () => {
-    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    resetConfig({ identities: [ownerIdentity("owner", { telegram: "12345" })] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -1075,7 +735,7 @@ describe("chat commands", () => {
   });
 
   it("/restore locks out follow-up commands during restart", async () => {
-    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    resetConfig({ identities: [ownerIdentity("owner", { telegram: "12345" })] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -1096,7 +756,7 @@ describe("chat commands", () => {
   });
 
   it("drops normal messages during restore restart", async () => {
-    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    resetConfig({ identities: [ownerIdentity("owner", { telegram: "12345" })] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -1144,7 +804,7 @@ describe("chat commands", () => {
   it("still serves commands from the owner's DM when an allowlist is configured", async () => {
     resetConfig({
       channelAllowlists: { telegram: ["12345"] },
-      identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("owner", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -1158,75 +818,8 @@ describe("chat commands", () => {
     await agent.stop();
   });
 
-  it("/restore refuses an allowlisted sender who is not a configured owner", async () => {
-    resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-      channelAllowlists: { telegram: ["12345", "-100777"] },
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
-    writeFileSync(agentEnv.configBackupPath, JSON.stringify({ model: "claude-sonnet-4-6" }, null, 2) + "\n");
-
-    await tg.simulateCommand("restore", "-100777", "GroupMember", undefined, "99999");
-
-    expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toContain("Only the owner");
-    const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as { model?: string };
-    expect(cfg.model).toBe("claude-haiku-4-5");
-
-    await agent.stop();
-  });
-
-  it("/restore works for a configured owner", async () => {
-    resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "bad-model" }, null, 2) + "\n");
-    writeFileSync(agentEnv.configBackupPath, JSON.stringify({ model: "claude-sonnet-4-6" }, null, 2) + "\n");
-
-    await tg.simulateCommand("restore", "12345", "Shuai", undefined, "12345");
-
-    expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toContain("Restored config.json");
-    const restored = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as { model?: string };
-    expect(restored.model).toBe("claude-sonnet-4-6");
-
-    await agent.stop();
-  });
-
-  it("/model refuses a sender who is not a configured owner", async () => {
-    resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-      channelAllowlists: { telegram: ["12345", "-100777"] },
-    });
-    const agent = new Agent();
-    const tg = new MockChannel("telegram");
-    agent.addChannel(tg);
-
-    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-haiku-4-5" }, null, 2) + "\n");
-
-    await tg.simulateCommand("model", "-100777", "GroupMember", "opus-1m", "99999");
-
-    expect(tg.sent).toHaveLength(1);
-    expect(tg.sent[0].text).toContain("Only the owner");
-    const cfg = JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")) as {
-      sessionModelOverrides?: Record<string, string>;
-    };
-    expect(cfg.sessionModelOverrides).toBeUndefined();
-    expect(mockConfig.sessionModelOverrides["telegram:-100777"]).toBeUndefined();
-
-    await agent.stop();
-  });
-
   it("/model reports an error instead of crashing when config.json is malformed", async () => {
-    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    resetConfig({ identities: [ownerIdentity("owner", { telegram: "12345" })] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -1246,7 +839,7 @@ describe("chat commands", () => {
   });
 
   it("/restore reports when no config backup exists", async () => {
-    resetConfig({ identities: [{ name: "owner", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    resetConfig({ identities: [ownerIdentity("owner", { telegram: "12345" })] });
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
@@ -1337,7 +930,7 @@ describe("/pause and /resume", () => {
 
   it("any group member can pause and resume, even with identities configured", async () => {
     resetConfig({
-      identities: [{ name: "shuai", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
+      identities: [ownerIdentity("shuai", { telegram: "12345" })],
     });
     const agent = new Agent();
     const tg = new MockChannel("telegram");

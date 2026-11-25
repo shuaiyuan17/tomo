@@ -5,7 +5,7 @@ vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/agent-mocks.js")).sdkModuleMock());
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
-import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockSdk, resetConfig } from "./helpers/agent-harness.js";
+import { Agent, MockChannel, drainQueue, expectNoChangeFor, installAgentTestHooks, makeMsg, mockSdk, resetConfig } from "./helpers/agent-harness.js";
 import { log } from "../src/logger.js";
 import { McpHealthMonitor } from "../src/agent/mcp-health.js";
 import { mergeMcpStatus } from "../src/mcp/status-merge.js";
@@ -209,21 +209,19 @@ describe("MCP reconnect in a live session", () => {
     mockSdk.mcpStatus = [{ name: "tomo-internal", status: "connected" }, { name: "docs", status: "failed" }];
     mockSdk.queryControllers[0].pushEvent({ type: "system", subtype: "init", mcp_servers: [{ name: "docs", status: "failed" }] });
     await agent.readMcpStatuses();
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(mockSdk.mcpReconnects).toEqual([]);
+    await expectNoChangeFor(() => expect(mockSdk.mcpReconnects).toEqual([]));
 
-    const promptsWhenReconnected: string[][] = [];
-    mockSdk.onMcpReconnect = async () => {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      promptsWhenReconnected.push(mockSdk.promptsBySession.map((p) => p.text));
-    };
+    // A gate, not a delay: the reconnect holds until the test releases it.
+    let releaseReconnect!: () => void;
+    mockSdk.onMcpReconnect = () => new Promise<void>((resolve) => { releaseReconnect = resolve; });
+    const sawAgain = () => mockSdk.promptsBySession.some((p) => p.text.includes("again"));
     await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: "again" }));
+    await vi.waitFor(() => expect(mockSdk.mcpReconnects).toEqual(["docs"]));
+    // Serialized: while the reconnect runs, the turn's prompt has not reached the SDK.
+    await expectNoChangeFor(() => expect(sawAgain()).toBe(false));
+    releaseReconnect();
     await drainQueue(agent);
-    expect(mockSdk.mcpReconnects).toEqual(["docs"]);
-    // Serialized: the reconnect finished before the turn's prompt reached the SDK.
-    expect(promptsWhenReconnected).toHaveLength(1);
-    expect(promptsWhenReconnected[0].some((text) => text.includes("again"))).toBe(false);
-    expect(mockSdk.promptsBySession.some((p) => p.text.includes("again"))).toBe(true);
+    expect(sawAgain()).toBe(true);
     await agent.stop();
   });
 
@@ -252,8 +250,7 @@ describe("MCP reconnect in a live session", () => {
     const manual = agent.reconnectOwnerMcpServer("docs");
     await vi.waitFor(() => expect(mockSdk.mcpReconnects).toEqual(["docs"]));
     await tg.simulateMessage(makeMsg({ chatId: "12345", senderId: "12345", text: "during" }));
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(mockSdk.promptsBySession.some((p) => p.text.includes("during"))).toBe(false);
+    await expectNoChangeFor(() => expect(mockSdk.promptsBySession.some((p) => p.text.includes("during"))).toBe(false), 50);
     releaseReconnect();
     expect(await manual).toBe("reconnected");
     await drainQueue(agent);

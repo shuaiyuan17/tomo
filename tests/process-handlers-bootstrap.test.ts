@@ -13,9 +13,12 @@ describe("installBootstrapErrorHandlers", () => {
     vi.doMock("../src/logger.js", () => { throw new Error("logger.ts was loaded before the bootstrap handlers"); });
     try {
       const mod = await import("../src/process-handlers.js");
+      // Counted against what was there before: vitest has listeners of its own.
+      const before = process.listenerCount("uncaughtException");
       const uninstall = mod.installBootstrapErrorHandlers();
-      expect(process.listenerCount("uncaughtException")).toBeGreaterThanOrEqual(1);
+      expect(process.listenerCount("uncaughtException")).toBe(before + 1);
       uninstall();
+      expect(process.listenerCount("uncaughtException")).toBe(before);
     } finally {
       vi.doUnmock("../src/logger.js");
       vi.resetModules();

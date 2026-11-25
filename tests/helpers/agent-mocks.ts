@@ -28,8 +28,6 @@ export type MockThinkingBlock = {
   type: "thinking";
   thinking: string;
   signature?: string;
-  /** Test hook: simulate a thinking block whose stream delta is text-shaped. */
-  streamAsTextDelta?: boolean;
 };
 export type MockToolUseBlock = {
   type: "tool_use";
@@ -60,7 +58,6 @@ export const mockSdk = {
    *  event per element (each becomes its own block, stitched into the same turn
    *  — the SDK only fires `result` once at the end). */
   responseFn: (() => "mock response") as (text: string) => MockResponse | Promise<MockResponse>,
-  emitStreamDeltas: true,
   userContents: [] as Array<Array<{ type: string; text?: string }>>,
   /** When true, the mock pulls one extra pending user message mid-turn and
    *  echoes it back as a `user` event before the turn's result — simulating the
@@ -106,7 +103,6 @@ export const mockSdk = {
 
 export function resetMockSdk(): void {
   mockSdk.responseFn = () => "mock response";
-  mockSdk.emitStreamDeltas = true;
   mockSdk.userContents = [];
   mockSdk.steerEcho = false;
   mockSdk.steerEchoCount = 1;
@@ -146,10 +142,10 @@ function enqueueAssistantTurnEvents(
   wakeConsumer: () => void,
   stamp?: string[],
 ): void {
-  // For each block, emit stream events + an assistant event. This mirrors how
-  // the real SDK reports multi-block turns: text deltas arrive, then an
-  // `assistant` event consolidates the just-completed block(s). Only one
-  // `result` fires at the end of the whole turn.
+  // For each block, emit one `assistant` event. Tomo runs the SDK with
+  // `includePartialMessages` off, so no `stream_event` deltas reach it: each
+  // completed block arrives whole. Only one `result` fires at the end of the
+  // whole turn.
   for (const block of blocks) {
     const rawBlock: MockTextBlock | MockThinkingBlock | MockToolUseBlock =
       typeof block === "string" ? { type: "text", text: block } : block;
@@ -157,36 +153,6 @@ function enqueueAssistantTurnEvents(
       ? { type: rawBlock.type, thinking: rawBlock.thinking, signature: rawBlock.signature }
       : rawBlock;
 
-    // Tool-use blocks carry no text/thinking deltas to stream — the SDK
-    // reports them via partial_json input deltas we don't need to simulate
-    // here; the block just arrives whole in its `assistant` event, same as
-    // the real tool_use content our code only inspects post-hoc.
-    if (mockSdk.emitStreamDeltas && rawBlock.type !== "tool_use") {
-      eventQueue.push({
-        type: "stream_event",
-        event: {
-          type: "content_block_start",
-          index: 0,
-          content_block: assistantBlock,
-        },
-      });
-      eventQueue.push({
-        type: "stream_event",
-        event: {
-          type: "content_block_delta",
-          index: 0,
-          delta: rawBlock.type === "text"
-            ? { type: "text_delta", text: rawBlock.text }
-            : rawBlock.streamAsTextDelta
-              ? { type: "text_delta", text: rawBlock.thinking }
-              : { type: "thinking_delta", thinking: rawBlock.thinking },
-        },
-      });
-      eventQueue.push({
-        type: "stream_event",
-        event: { type: "content_block_stop", index: 0 },
-      });
-    }
     eventQueue.push({
       type: "assistant",
       message: { content: [assistantBlock] },
@@ -447,6 +413,10 @@ export const mockConfig = {
   interruptedAgents: false,
   interruptedAgentsAutoResume: true,
   notifyOwnerOnSuppressedErrors: true,
+  /** config `showThinking`: off, as by default. Listed so resetConfig puts it back. */
+  showThinking: false,
+  /** config `credentialBroker`: off, as by default (tests/agent-credentials.test.ts turns it on). */
+  credentialBroker: { enabled: false },
   liveSessionTimeoutMs: 10 * 60 * 1000,
   liveSessionIdleTimeoutMs: 0,
   litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { formatTomoEvent } from "../src/tomo-event.js";
 
@@ -18,8 +18,26 @@ import {
   mockSdk,
   waitFor,
 } from "./helpers/agent-harness.js";
+import { mockConfig } from "./helpers/agent-mocks.js";
+import { readLedgerStarted } from "../src/usage/ledger.js";
 
 installAgentTestHooks();
+
+/** SDK `modelUsage` for one model, scaled by n ($0.25 per step). */
+function models(n: number) {
+  return {
+    "claude-opus": { inputTokens: 10 * n, outputTokens: 5 * n, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, webSearchRequests: 0, costUSD: 0.25 * n },
+  };
+}
+
+/** The Agent privates these tests reach: the ledger's write chain, the live session map, the registry. */
+function internals(agent: Agent) {
+  return agent as unknown as {
+    usageLedger: { idle(): Promise<void> };
+    liveSessionManager: { closeLiveSession(k: string): void };
+    sessions: { getEntry(k: string): { stats: { totalCostUsd: number } } };
+  };
+}
 
 function ledgerRows(): Array<Record<string, unknown>> {
   const dir = join(agentEnv.tmpDir, "data", "usage");
@@ -74,9 +92,6 @@ describe("usage ledger and the resume baseline", () => {
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     const key = "telegram:12345";
-    const models = (n: number) => ({
-      "claude-opus": { inputTokens: 10 * n, outputTokens: 5 * n, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, webSearchRequests: 0, costUSD: 0.25 * n },
-    });
 
     // 1. An owner turn: the SDK's running total is $1.00.
     mockSdk.responseFn = () => "hello";
@@ -91,7 +106,7 @@ describe("usage ledger and the resume baseline", () => {
 
     // 3. The live session is rebuilt (compact reload, model switch, restart)
     //    and resumes the same SDK session, whose totals carry everything.
-    (agent as unknown as { liveSessionManager: { closeLiveSession(k: string): void } }).liveSessionManager.closeLiveSession(key);
+    internals(agent).liveSessionManager.closeLiveSession(key);
     mockSdk.responseFn = () => "again";
     mockSdk.nextResult = { total_cost_usd: 1.75, modelUsage: models(7) };
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "and now?" }));
@@ -112,32 +127,33 @@ describe("usage ledger and the resume baseline", () => {
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     const key = "telegram:12345";
-    const models = (n: number) => ({
-      "claude-opus": { inputTokens: 10 * n, outputTokens: 5 * n, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, webSearchRequests: 0, costUSD: 0.25 * n },
-    });
 
     mockSdk.responseFn = () => "one";
     mockSdk.nextResult = { total_cost_usd: 1.0, modelUsage: models(4) };
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "one" }));
     await drainQueue(agent);
-    // Fully settled (including the ledger's own chmod) before the file is locked.
-    await (agent as unknown as { usageLedger: { idle(): Promise<void> } }).usageLedger.idle();
+    // Fully settled (including the ledger's own chmod) before the file is swapped out.
+    await internals(agent).usageLedger.idle();
     expect(ledgerRows()).toHaveLength(1);
 
-    // The ledger cannot be appended to for the second turn.
+    // The ledger cannot be appended to for the second turn: the month's file
+    // is moved aside and a DIRECTORY sits at its path, so the append fails
+    // with EISDIR. (Not chmod: root writes through a read-only mode.)
     const file = join(agentEnv.tmpDir, "data", "usage", readdirSync(join(agentEnv.tmpDir, "data", "usage")).find((f) => f.endsWith(".ndjson"))!);
-    chmodSync(file, 0o400);
+    renameSync(file, `${file}.aside`);
+    mkdirSync(file);
     mockSdk.responseFn = () => "two";
     mockSdk.nextResult = { total_cost_usd: 1.5, modelUsage: models(6) };
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "two" }));
     await drainQueue(agent);
-    await (agent as unknown as { usageLedger: { idle(): Promise<void> } }).usageLedger.idle();
-    chmodSync(file, 0o600);
+    await internals(agent).usageLedger.idle();
+    rmSync(file, { recursive: true });
+    renameSync(`${file}.aside`, file);
     expect(ledgerRows()).toHaveLength(1);
 
     // Rebuild and resume. The registry's copy saw turn two ($1.50); the
     // ledger's last row did not ($1.00), and the ledger wins.
-    (agent as unknown as { liveSessionManager: { closeLiveSession(k: string): void } }).liveSessionManager.closeLiveSession(key);
+    internals(agent).liveSessionManager.closeLiveSession(key);
     mockSdk.responseFn = () => "three";
     mockSdk.nextResult = { total_cost_usd: 1.75, modelUsage: models(7) };
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "three" }));
@@ -158,7 +174,7 @@ describe("usage ledger and the resume baseline", () => {
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     const key = "telegram:12345";
-    const ledger = (agent as unknown as { usageLedger: { idle(): Promise<void> } }).usageLedger;
+    const ledger = internals(agent).usageLedger;
 
     for (const [text, total] of [["one", 1.0], ["two", 1.5]] as const) {
       mockSdk.responseFn = () => text;
@@ -168,11 +184,11 @@ describe("usage ledger and the resume baseline", () => {
       await ledger.idle();
     }
     // Session stats saw both turns; the ledger has nothing.
-    expect((agent as unknown as { sessions: { getEntry(k: string): { stats: { totalCostUsd: number } } } }).sessions.getEntry(key).stats.totalCostUsd).toBeCloseTo(1.5);
+    expect(internals(agent).sessions.getEntry(key).stats.totalCostUsd).toBeCloseTo(1.5);
 
     // The disk recovers, the session is rebuilt and resumes.
     rmSync(join(agentEnv.tmpDir, "data", "usage"));
-    (agent as unknown as { liveSessionManager: { closeLiveSession(k: string): void } }).liveSessionManager.closeLiveSession(key);
+    internals(agent).liveSessionManager.closeLiveSession(key);
     mockSdk.responseFn = () => "three";
     mockSdk.nextResult = { total_cost_usd: 1.75 };
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "three" }));
@@ -185,9 +201,6 @@ describe("usage ledger and the resume baseline", () => {
   });
 
   it("the registry copy follows landed rows, for a resume the ledger cannot answer", async () => {
-    const models = (n: number) => ({
-      "claude-opus": { inputTokens: 10 * n, outputTokens: 5 * n, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, webSearchRequests: 0, costUSD: 0.25 * n },
-    });
     const first = new Agent();
     const tg1 = new MockChannel("telegram");
     first.addChannel(tg1);
@@ -212,5 +225,22 @@ describe("usage ledger and the resume baseline", () => {
     await drainQueue(second);
     await second.stop();
     expect(ledgerRows().map((r) => r.costUsd)).toEqual([0.25]);
+  });
+});
+
+describe("ledger start marker", () => {
+  it("starting the daemon records when the usage ledger started, once", async () => {
+    const dir = join(mockConfig.tomoHome, "data", "usage");
+    expect(readLedgerStarted(dir)).toBeUndefined();
+    const before = Date.now();
+    const agent = new Agent();
+    await agent.start();
+    const first = readLedgerStarted(dir);
+    expect(first).toBeGreaterThanOrEqual(before);
+    await agent.stop();
+    const again = new Agent();
+    await again.start();
+    expect(readLedgerStarted(dir)).toBe(first);
+    await again.stop();
   });
 });

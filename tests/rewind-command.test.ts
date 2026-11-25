@@ -6,7 +6,7 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 const prepare = vi.hoisted(() => vi.fn());
 const discard = vi.hoisted(() => vi.fn());
 vi.mock("../src/agent/session-rewind.js", async (importOriginal) => ({ ...await importOriginal<typeof import("../src/agent/session-rewind.js")>(), prepareSessionRewind: prepare }));
-import { Agent, MockChannel, SessionStore, installAgentTestHooks, resetConfig, mockSdk, drainQueue, makeMsg } from "./helpers/agent-harness.js";
+import { Agent, MockChannel, SessionStore, expectNoChangeFor, installAgentTestHooks, resetConfig, mockSdk, drainQueue, makeMsg } from "./helpers/agent-harness.js";
 
 installAgentTestHooks();
 beforeEach(() => {
@@ -205,17 +205,19 @@ describe("/rewind", () => {
       await vi.waitFor(() => expect(manager.liveSessionCreates.size).toBe(1));
       expect(manager.isBusy("dm:example")).toBe(false);
       const pending = command(channel);
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      // The command waits on the session being built, preparing nothing.
+      await expectNoChangeFor(() => expect(prepare).not.toHaveBeenCalled());
       finishBuild();
       await pending;
       expect(prepare).not.toHaveBeenCalled();
       expect(channel.sent).toHaveLength(1);
       expect(channel.sent[0].text).toContain("Stopped the turn that was still running");
       await drainQueue(agent);
-      await new Promise((resolve) => setTimeout(resolve, 20));
       // The first turn never reached the model, and nothing else was sent.
-      expect(mockSdk.promptsBySession).toHaveLength(0);
-      expect(channel.sent).toHaveLength(1);
+      await expectNoChangeFor(() => {
+        expect(mockSdk.promptsBySession).toHaveLength(0);
+        expect(channel.sent).toHaveLength(1);
+      });
     } finally { finishBuild(); manager.deps.buildExternalMcpServers = build; await agent.stop(); }
   });
 
@@ -271,8 +273,7 @@ describe("/rewind", () => {
     expect(holds().size).toBe(1);
     let stopped = false;
     const stopping = agent.stop().then(() => { stopped = true; });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(stopped).toBe(false);
+    await expectNoChangeFor(() => expect(stopped).toBe(false), 50);
     unstall();
     await stopping;
     await pending;

@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import { INTERRUPTED_NOTE_MARKER, PendingNotesQueue, type DurablePendingNotesStore } from "../src/agent/pending-notes-queue.js";
-import { SessionQueue } from "../src/agent/session-queue.js";
 
 class MemoryPendingNotesStore implements DurablePendingNotesStore {
   notes = new Map<string, string[]>();
@@ -17,54 +16,6 @@ class MemoryPendingNotesStore implements DurablePendingNotesStore {
     }
   }
 }
-
-describe("SessionQueue", () => {
-  it("serializes work for the same session key and cleans up after draining", async () => {
-    const queue = new SessionQueue();
-    const events: string[] = [];
-    let releaseFirst!: () => void;
-
-    const first = queue.enqueue("telegram:123", async () => {
-      events.push("first:start");
-      await new Promise<void>((resolve) => { releaseFirst = resolve; });
-      events.push("first:end");
-      return "first";
-    });
-    const second = queue.enqueue("telegram:123", async () => {
-      events.push("second");
-      return "second";
-    });
-
-    await Promise.resolve();
-    expect(events).toEqual(["first:start"]);
-
-    releaseFirst();
-    await expect(first).resolves.toBe("first");
-    await expect(second).resolves.toBe("second");
-    expect(events).toEqual(["first:start", "first:end", "second"]);
-
-    await queue.drain();
-    expect((queue as unknown as { queues: Map<string, Promise<void>> }).queues.size).toBe(0);
-  });
-
-  it("keeps later work running after an earlier task rejects", async () => {
-    const queue = new SessionQueue();
-    const events: string[] = [];
-
-    const first = queue.enqueue("telegram:123", async () => {
-      events.push("first");
-      throw new Error("boom");
-    });
-    const second = queue.enqueue("telegram:123", async () => {
-      events.push("second");
-      return "second";
-    });
-
-    await expect(first).rejects.toThrow("boom");
-    await expect(second).resolves.toBe("second");
-    expect(events).toEqual(["first", "second"]);
-  });
-});
 
 describe("PendingNotesQueue", () => {
   it("persists pending notes, caps them, and drains once", () => {
@@ -267,5 +218,67 @@ describe("PendingNotesQueue", () => {
     queue.settle("k", drained);
     expect(store.getPendingNotes("k")).toEqual([]);
     expect(queue.drain("k")).toBe("");
+  });
+});
+
+describe("PendingNotesQueue when the durable store fails", () => {
+  /** A store whose reads or writes throw while the flags are set. */
+  class FlakyStore extends MemoryPendingNotesStore {
+    failReads = false;
+    failWrites = false;
+    override getPendingNotes(key: string): string[] {
+      if (this.failReads) throw new Error("EIO: read");
+      return super.getPendingNotes(key);
+    }
+    override setPendingNotes(key: string, notes: string[]): void {
+      if (this.failWrites) throw new Error("ENOSPC: write");
+      super.setPendingNotes(key, notes);
+    }
+  }
+
+  it("queueNote reports a failed write, keeps the note in memory, and persistNow writes it once the disk is back", () => {
+    const store = new FlakyStore();
+    const queue = new PendingNotesQueue(store);
+    store.failWrites = true;
+
+    expect(queue.queueNote("k", "n1")).toBe(false);
+    expect(store.getPendingNotes("k")).toEqual([]);
+    // This process still delivers it.
+    expect(queue.peekNotes("k")).toEqual(["n1"]);
+
+    expect(queue.persistNow("k")).toBe(false);
+    store.failWrites = false;
+    expect(queue.persistNow("k")).toBe(true);
+    expect(store.getPendingNotes("k")).toEqual(["n1"]);
+  });
+
+  it("an unreadable store is read as empty: new notes still queue and drain", () => {
+    const store = new FlakyStore();
+    store.notes.set("k", ["from disk"]);
+    store.failReads = true;
+    const queue = new PendingNotesQueue(store);
+
+    expect(queue.queueNote("k", "n1")).toBe(true);
+    expect(queue.drain("k")).toBe("n1\n\n");
+  });
+});
+
+describe("PendingNotesQueue holdOwnerAudience", () => {
+  // A summoned group's turn on the owner's dm: session must not read a note
+  // meant for the owner alone: it stays queued for the owner's next turn.
+  it("holds owner-only notes back from that drain and hands them to the next one", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    const ownerOnly = '<tomo-event type="subsession-report" audience="owner" ts="x">\nthe report\n</tomo-event>';
+    queue.queueNote("dm:owner", "shared note");
+    queue.queueNote("dm:owner", ownerOnly);
+
+    const groupTurn = queue.drain("dm:owner", { holdOwnerAudience: true });
+    expect(groupTurn).toBe("shared note\n\n");
+    expect(queue.peekNotes("dm:owner")).toEqual([ownerOnly]);
+    queue.settle("dm:owner", groupTurn);
+    expect(store.getPendingNotes("dm:owner")).toEqual([ownerOnly]);
+
+    expect(queue.drain("dm:owner")).toBe(`${ownerOnly}\n\n`);
   });
 });

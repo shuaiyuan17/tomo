@@ -134,8 +134,9 @@ describe("performStop against real child processes", () => {
     kill: (p, s) => { process.kill(p, s); },
     wait: (p, t) => waitForExit(p, t, 50),
     // Not DAEMON_STOP_TIMEOUT_MS: the wedged-daemon case would then take 60s.
-    // The budget's VALUE is asserted above; this is about process semantics.
-    timeoutMs: 3_000,
+    // The budget's VALUE is asserted above; this is about process semantics,
+    // so it only has to sit well above the cooperative child's 200 ms.
+    timeoutMs: 600,
   });
 
   function child(script: string): Promise<ChildProcess> {
@@ -150,9 +151,10 @@ describe("performStop against real child processes", () => {
   });
 
   it("waits for a slow but cooperative daemon and reports success", async () => {
-    // Exits ~700ms after SIGTERM, like a daemon finishing agent.stop().
+    // Exits ~200ms after SIGTERM, like a daemon finishing agent.stop(): slow,
+    // but under the 600 ms budget.
     const c = await child(
-      `process.on("SIGTERM", () => setTimeout(() => process.exit(0), 700));`
+      `process.on("SIGTERM", () => setTimeout(() => process.exit(0), 200));`
       + `setInterval(() => {}, 1000); console.log("ready");`,
     );
     const out = await performStopWith(realDeps(c.pid!));

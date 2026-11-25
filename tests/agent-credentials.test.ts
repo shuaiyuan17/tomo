@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -13,7 +13,7 @@ vi.mock("../src/credentials/store.js", async (original) => {
 });
 
 import { log } from "../src/logger.js";
-import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockConfig, mockSdk, resetConfig, useRealAdmission } from "./helpers/agent-harness.js";
+import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockConfig, mockSdk, ownerIdentity, resetConfig, useRealAdmission } from "./helpers/agent-harness.js";
 import { createTomoInternalMcpServer } from "../src/mcp/internal-server.js";
 import { CREDENTIAL_SCOPE_REFUSAL } from "../src/mcp/credential-tools.js";
 import { clearSecretValuesForTests } from "../src/credentials/redactor.js";
@@ -48,14 +48,22 @@ class DeletingChannel extends MockChannel {
 
 type Registry = { begin(k: string, a: string[], o?: Array<{ channelName: string; chatId: string }>): number; end(k: string, id: number): void };
 
+// Every Agent a test builds is stopped after it (which also shuts its broker
+// down), like the rest of the area.
+const started: Array<InstanceType<typeof Agent>> = [];
+afterEach(async () => {
+  for (const agent of started.splice(0)) await agent.stop();
+});
+
 function setup(enabled = true) {
   useRealAdmission();
   resetConfig({
     channelAllowlists: { imessage: ["any;+;group1"] },
-    identities: [{ name: "alex", channels: { imessage: OWNER, telegram: TG_OWNER }, replyPolicy: "last-active" }],
+    identities: [ownerIdentity("alex", { imessage: OWNER, telegram: TG_OWNER })],
+    credentialBroker: { enabled },
   });
-  (mockConfig as unknown as { credentialBroker: { enabled: boolean } }).credentialBroker = { enabled };
   const agent = new Agent();
+  started.push(agent);
   const im = new MockChannel("imessage");
   const tg = new DeletingChannel("telegram");
   agent.addChannel(im);
@@ -80,6 +88,16 @@ function onDisk(dir: string): string {
 
 function logged(): string {
   return JSON.stringify(Object.values(log).flatMap((fn) => (fn as ReturnType<typeof vi.fn>).mock.calls));
+}
+
+/** The captured value reached no prompt, no file under Tomo's home (the
+ *  sessions dir, transcripts and journals included), no log line and nothing
+ *  `sent` holds (the channels' outgoing messages, the web's events). */
+function expectSecretNowhere(sent: unknown): void {
+  expect(mockSdk.promptsBySession.map((p) => p.text).join("\n")).not.toContain(FAKE);
+  expect(onDisk(mockConfig.tomoHome)).not.toContain(FAKE);
+  expect(logged()).not.toContain(FAKE);
+  expect(JSON.stringify(sent)).not.toContain(FAKE);
 }
 
 describe("credential broker through the Agent", () => {
@@ -118,11 +136,7 @@ describe("credential broker through the Agent", () => {
     const prompts = mockSdk.promptsBySession.map((p) => p.text).join("\n");
     expect(prompts).toContain('type="credential"');
     expect(prompts).toContain("secret://github");
-    expect(prompts).not.toContain(FAKE);
-    expect(onDisk(mockConfig.tomoHome)).not.toContain(FAKE);
-    expect(logged()).not.toContain(FAKE);
-    expect(JSON.stringify(im.sent)).not.toContain(FAKE);
-    agent.credentialBroker?.shutdown();
+    expectSecretNowhere(im.sent);
   });
 
   it("an ordinary message still flows after the request is answered", async () => {
@@ -137,21 +151,17 @@ describe("credential broker through the Agent", () => {
   });
 
   describe("refused off the owner's own turn", () => {
-    const every: Array<[string, Record<string, unknown>]> = [
-      ["request_credential", { name: "x", purpose: "p" }],
-    ];
-
-    it.each(every)("%s, in a group session", async (name, args) => {
+    it("request_credential, in a group session", async () => {
       const { call, im } = setup();
-      const result = await call(GROUP_KEY, name, args);
+      const result = await call(GROUP_KEY, "request_credential", { name: "x", purpose: "p" });
       expect(result).toMatchObject({ isError: true, content: [{ text: CREDENTIAL_SCOPE_REFUSAL }] });
       expect(im.sent).toEqual([]);
     });
 
-    it.each(every)("%s, on a summoned group's turn on the owner's dm: key", async (name, args) => {
+    it("request_credential, on a summoned group's turn on the owner's dm: key", async () => {
       const { registry, call, im } = setup();
       registry.begin(OWNER_KEY, [GROUP_KEY], [{ channelName: "imessage", chatId: "any;+;group1" }]);
-      const result = await call(OWNER_KEY, name, args);
+      const result = await call(OWNER_KEY, "request_credential", { name: "x", purpose: "p" });
       expect(result).toMatchObject({ isError: true, content: [{ text: CREDENTIAL_SCOPE_REFUSAL }] });
       expect(im.sent).toEqual([]);
     });
@@ -173,7 +183,6 @@ describe("credential broker through the Agent", () => {
     await drainQueue(agent);
     const backend = (agent.credentialBroker as unknown as { deps: { backend: MemoryBackend } }).deps.backend;
     expect(backend.items.size).toBe(0);
-    agent.credentialBroker?.shutdown();
   });
 
   it("refuses a turn nobody is typing in: no live turn (cron, heartbeat), and a batch across two chats", async () => {
@@ -213,11 +222,7 @@ describe("credential broker through the Agent", () => {
     expect(backend.items.get("github")).toBe(FAKE);
     const prompts = mockSdk.promptsBySession.map((p) => p.text).join("\n");
     expect(prompts).toContain("secret://github");
-    expect(prompts).not.toContain(FAKE);
-    expect(onDisk(mockConfig.tomoHome)).not.toContain(FAKE);
-    expect(logged()).not.toContain(FAKE);
-    expect(JSON.stringify([tg.sent, im.sent])).not.toContain(FAKE);
-    agent.credentialBroker?.shutdown();
+    expectSecretNowhere([tg.sent, im.sent]);
   });
 
   it("passes the owner's ordinary Telegram messages through once the request is over", async () => {
@@ -277,13 +282,8 @@ describe("credential broker through the Agent", () => {
 
     const prompts = mockSdk.promptsBySession.map((p) => p.text).join("\n");
     expect(prompts).toContain("secret://github");
-    expect(prompts).not.toContain(FAKE);
     expect(onDisk(mockConfig.tomoHome)).toContain("still chatting");
-    expect(onDisk(mockConfig.tomoHome)).not.toContain(FAKE);
-    expect(onDisk(mockConfig.sessionsDir)).not.toContain(FAKE);
-    expect(JSON.stringify(events)).not.toContain(FAKE);
-    expect(logged()).not.toContain(FAKE);
-    agent.credentialBroker?.shutdown();
+    expectSecretNowhere([events, im.sent, tg.sent]);
     await web.stop();
   });
 
@@ -297,9 +297,7 @@ describe("credential broker through the Agent", () => {
     expect(await im.simulateMessage(makeMsg({ chatId: OWNER_CHAT, senderId: OWNER, text: FAKE, rawText: FAKE, attachmentCount: 0 }))).toBe(true);
     await drainQueue(agent);
     expect(mockSdk.promptsBySession).toEqual([]);
-    expect(logged()).not.toContain(FAKE);
-    expect(onDisk(mockConfig.sessionsDir)).not.toContain(FAKE);
-    expect(JSON.stringify(im.sent)).not.toContain(FAKE);
+    expectSecretNowhere(im.sent);
     const before = im.sent.length;
     ownTurn();
     expect((await call(OWNER_KEY, "request_credential", { name: "x", purpose: "p" })).isError).toBe(true);

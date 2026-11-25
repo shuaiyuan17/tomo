@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // ---------------------------------------------------------------------------
 // Module mocks — a controllable LiveSession double so the manager's lifecycle
@@ -25,6 +25,17 @@ interface FakeSession {
   } | null>;
   send(prompt: string, images?: unknown, documents?: unknown, onBlock?: (b: string) => void | Promise<void>): Promise<string>;
   steer(prompt: string, images?: unknown, documents?: unknown, onBlock?: (b: string) => void | Promise<void>): Promise<string>;
+  // Knobs and records the tests set or read directly.
+  background: boolean;
+  ambient: boolean;
+  bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }>;
+  awaitingReport: boolean;
+  awaitingReportAgeMs: number;
+  turnWaits: Array<{ timeoutMs: number; resolve: (started: boolean) => void }>;
+  backgroundMoves: Array<(moved: boolean) => void>;
+  lastActivity: number;
+  lastActivityAt(): number;
+  interruptedWith: Error | null;
 }
 
 const { mockState } = vi.hoisted(() => ({
@@ -158,9 +169,16 @@ vi.mock("../src/agent/sdk-options.js", () => ({
   },
 }));
 
-vi.mock("../src/config.js", () => ({
-  config: { sdkSessionsDir: "/tmp/sdk-sessions", liveSessionTimeoutMs: 1000, liveSessionIdleTimeoutMs: 60 * 60 * 1000 },
-}));
+// A private SDK sessions dir per run (a shared /tmp/sdk-sessions collided
+// across parallel runs and leaked compact triggers between them).
+vi.mock("../src/config.js", async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  return {
+    config: { sdkSessionsDir: mkdtempSync(join(tmpdir(), "tomo-lsm-sdk-")), liveSessionTimeoutMs: 1000, liveSessionIdleTimeoutMs: 60 * 60 * 1000 },
+  };
+});
 
 vi.mock("../src/sessions/repair.js", () => ({
   repairSdkSessionForResume: vi.fn(() => ({})),
@@ -174,7 +192,11 @@ vi.mock("../src/logger.js", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-const { config: mockConfig } = await import("../src/config.js") as unknown as { config: { liveSessionIdleTimeoutMs: number } };
+const { config: mockConfig } = await import("../src/config.js") as unknown as { config: { liveSessionIdleTimeoutMs: number; sdkSessionsDir: string } };
+afterAll(async () => {
+  const { rmSync } = await import("node:fs");
+  rmSync(mockConfig.sdkSessionsDir, { recursive: true, force: true });
+});
 const { LiveSessionManager, IDLE_REAP_SWEEP_MS, IDLE_REAP_CLOSE_WAIT_MS, SDK_CLI_KILL_MS, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED, PROMPT_RETIRE_BACKGROUND_WAIT_MS, PROMPT_RETIRE_REPORT_WAIT_MS } = await import("../src/agent/live-session-manager.js");
 const { log } = await import("../src/logger.js");
 const { SdkResultError } = await import("../src/agent/live-session.js");
@@ -205,8 +227,14 @@ function makeDeps(overrides: Partial<Deps> = {}): Deps {
   };
 }
 
-async function flushMicrotasks(): Promise<void> {
-  for (let i = 0; i < 5; i++) await Promise.resolve();
+/** The mock behind a session the manager handed out (every one is a FakeSession here). */
+function fake(session: unknown): FakeSession {
+  return session as FakeSession;
+}
+
+/** Let `ticks` rounds of already-queued promise callbacks run (no timers). */
+async function flushMicrotasks(ticks = 5): Promise<void> {
+  for (let i = 0; i < ticks; i++) await Promise.resolve();
 }
 
 beforeEach(() => {
@@ -269,35 +297,36 @@ describe("LiveSessionManager session lifecycle", () => {
     const first = mockState.instances[0];
 
     prompt = "v2";
-    const second = await manager.getOrCreateLiveSession("telegram:2");
+    const second = fake(await manager.getOrCreateLiveSession("telegram:2"));
 
     expect(first.closed).toBe(true);
     expect(second).not.toBe(first);
     // telegram:1 gets a fresh session with the new prompt on next use
-    const replacement = await manager.getOrCreateLiveSession("telegram:1");
+    const replacement = fake(await manager.getOrCreateLiveSession("telegram:1"));
     expect(replacement).not.toBe(first);
   });
 
-  it("still retires live sessions when SOUL/AGENT/IDENTITY or the harness rules change", async () => {
+  // The same key asks again after the identity prompt changed: the check runs
+  // on reuse too, not only when another key builds a session.
+  it("still retires a live session when SOUL/AGENT/IDENTITY or the harness rules change, even when its key would just reuse it", async () => {
     let identity = "identity-v1";
     const manager = new LiveSessionManager(makeDeps({
       buildIdentityPrompt: () => identity,
       promptContextSnapshot: () => ({ memory: [], people: [] }),
     }));
-    const first = await manager.getOrCreateLiveSession("dm:owner");
+    const first = fake(await manager.getOrCreateLiveSession("dm:owner"));
     identity = "identity-v2";
-    const second = await manager.getOrCreateLiveSession("dm:owner");
+    const second = fake(await manager.getOrCreateLiveSession("dm:owner"));
     expect(first.closed).toBe(true);
     expect(second).not.toBe(first);
   });
-
 
   it("does not read the cache-boundary marker as a prompt change", async () => {
     const BOUNDARY = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
     let prompt: string | string[] = "v1";
     const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
 
-    const first = await manager.getOrCreateLiveSession("telegram:1");
+    const first = fake(await manager.getOrCreateLiveSession("telegram:1"));
 
     // Same workspace content, now handed over as blocks around the marker.
     prompt = ["v1", BOUNDARY];
@@ -306,20 +335,7 @@ describe("LiveSessionManager session lifecycle", () => {
 
     // A real content change still retires it.
     prompt = ["v2", BOUNDARY];
-    const second = await manager.getOrCreateLiveSession("telegram:1");
-    expect(first.isAlive()).toBe(false);
-    expect(second).not.toBe(first);
-  });
-
-  it("notices a prompt change even when the session would just be reused", async () => {
-    let prompt = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
-
-    const first = await manager.getOrCreateLiveSession("telegram:1");
-
-    prompt = "v2";
-    const second = await manager.getOrCreateLiveSession("telegram:1");
-
+    const second = fake(await manager.getOrCreateLiveSession("telegram:1"));
     expect(first.isAlive()).toBe(false);
     expect(second).not.toBe(first);
   });
@@ -347,7 +363,7 @@ describe("LiveSessionManager session lifecycle", () => {
     busySession.releaseIdle();
     await flushMicrotasks();
     expect(busySession.closed).toBe(true);
-    const replacement = await manager.getOrCreateLiveSession("telegram:1");
+    const replacement = fake(await manager.getOrCreateLiveSession("telegram:1"));
     expect(replacement).not.toBe(busySession);
     expect(replacement.isAlive()).toBe(true);
   });
@@ -359,7 +375,7 @@ describe("LiveSessionManager session lifecycle", () => {
     await manager.getOrCreateLiveSession("telegram:1");
     prompt = "v2";
     // Old session was idle → retired at this boundary; rebuilt with v2.
-    const fresh = await manager.getOrCreateLiveSession("telegram:1");
+    const fresh = fake(await manager.getOrCreateLiveSession("telegram:1"));
 
     // Subsequent traffic with an unchanged prompt never touches it.
     await manager.getOrCreateLiveSession("telegram:2");
@@ -367,34 +383,12 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(await manager.getOrCreateLiveSession("telegram:1")).toBe(fresh);
   });
 
-  it("defers closing a busy retired session until it goes idle", async () => {
-    let prompt = "v1";
-    const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
-
-    await manager.getOrCreateLiveSession("telegram:1");
-    const busySession = mockState.instances[0];
-    busySession.busy = true;
-
-    prompt = "v2";
-    await manager.getOrCreateLiveSession("telegram:2");
-
-    expect(busySession.closed).toBe(false);
-
-    busySession.busy = false;
-    busySession.releaseIdle();
-    await flushMicrotasks();
-    expect(busySession.closed).toBe(true);
-  });
-
   it("waits for background tasks before retiring an idle prompt-stale session", async () => {
     let prompt = "v1";
     const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
 
     await manager.getOrCreateLiveSession("telegram:1");
-    const session = mockState.instances[0] as FakeSession & {
-      background: boolean;
-      bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }>;
-    };
+    const session = mockState.instances[0];
     // Turn over, but a background subagent it launched is still running.
     session.background = true;
 
@@ -432,10 +426,7 @@ describe("LiveSessionManager session lifecycle", () => {
     let prompt = "v1";
     const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
     await manager.getOrCreateLiveSession("telegram:1");
-    const session = mockState.instances[0] as FakeSession & {
-      awaitingReport: boolean;
-      turnWaits: Array<{ timeoutMs: number; resolve: (started: boolean) => void }>;
-    };
+    const session = mockState.instances[0];
     // Drained while a turn was running (result folded into it): no follow-up comes.
     session.awaitingReport = true;
     prompt = "v2";
@@ -451,10 +442,7 @@ describe("LiveSessionManager session lifecycle", () => {
     let prompt = "v1";
     const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
     await manager.getOrCreateLiveSession("telegram:1");
-    const session = mockState.instances[0] as FakeSession & {
-      background: boolean;
-      bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }>;
-    };
+    const session = mockState.instances[0];
     session.background = true;
     prompt = "v2";
     await manager.getOrCreateLiveSession("telegram:2");
@@ -479,10 +467,7 @@ describe("LiveSessionManager session lifecycle", () => {
       let prompt = "v1";
       const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
       await manager.getOrCreateLiveSession("telegram:1");
-      const session = mockState.instances[0] as FakeSession & {
-        background: boolean;
-        bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }>;
-      };
+      const session = mockState.instances[0];
       session.busy = true;
       prompt = "v2";
       await manager.getOrCreateLiveSession("telegram:2");
@@ -507,10 +492,7 @@ describe("LiveSessionManager session lifecycle", () => {
     const manager = new LiveSessionManager(makeDeps({ buildIdentityPrompt: () => prompt }));
 
     await manager.getOrCreateLiveSession("telegram:1");
-    const session = mockState.instances[0] as FakeSession & {
-      background: boolean;
-      bgWaits: Array<{ timeoutMs: number; resolve: (drained: boolean) => void }>;
-    };
+    const session = mockState.instances[0];
     session.background = true;
 
     prompt = "v2";
@@ -532,7 +514,7 @@ describe("LiveSessionManager session lifecycle", () => {
     const busySession = mockState.instances[0];
     busySession.busy = true;
     prompt = "v2";
-    const current = await manager.getOrCreateLiveSession("telegram:2");
+    const current = fake(await manager.getOrCreateLiveSession("telegram:2"));
 
     await manager.stop();
 
@@ -560,7 +542,7 @@ describe("LiveSessionManager session lifecycle", () => {
     const manager = new LiveSessionManager(makeDeps());
     expect(manager.backgroundState("telegram:1")).toEqual({ activeBackgroundTasks: 0, awaitingTaskReport: false, backgroundingInFlight: 0 });
     await manager.getOrCreateLiveSession("telegram:1");
-    const s = mockState.instances[0] as unknown as { background: boolean; awaitingReport: boolean };
+    const s = mockState.instances[0];
     s.background = true;
     expect(manager.backgroundState("telegram:1")).toEqual({ activeBackgroundTasks: 2, awaitingTaskReport: false, backgroundingInFlight: 0 });
     s.background = false;
@@ -583,7 +565,7 @@ describe("LiveSessionManager session lifecycle", () => {
   it("refuses a compact while background work runs or its report is due", async () => {
     const manager = new LiveSessionManager(makeDeps());
     await manager.getOrCreateLiveSession("telegram:1");
-    const s = mockState.instances[0] as unknown as { background: boolean; awaitingReport: boolean };
+    const s = mockState.instances[0];
     s.background = true;
     expect(manager.reserveCompact("telegram:1", "sdk-1")).toMatchObject({ ok: false, reason: "background-tasks" });
     s.background = false;
@@ -604,7 +586,7 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(ctx.backgroundLaunchDenial!()).toContain("rollup/compact is pending");
     expect(await manager.backgroundTask("telegram:1", "toolu_1")).toBe(false);
 
-    // No trigger on disk (/tmp/sdk-sessions): the rewrite did not happen, so
+    // No trigger on disk (the suite's sdkSessionsDir): the rewrite did not happen, so
     // finishing releases the mark at once.
     if (r.ok) manager.finishCompact("telegram:1", r.reservationId);
     expect(manager.isCompactPending("telegram:1")).toBe(false);
@@ -614,7 +596,7 @@ describe("LiveSessionManager session lifecycle", () => {
   it("a move to the background in flight refuses a reservation that arrives meanwhile", async () => {
     const manager = new LiveSessionManager(makeDeps());
     await manager.getOrCreateLiveSession("telegram:1");
-    const s = mockState.instances[0] as unknown as { backgroundMoves: Array<(moved: boolean) => void> };
+    const s = mockState.instances[0];
     const moving = manager.backgroundTask("telegram:1", "toolu_1");
     await flushMicrotasks();
     expect(s.backgroundMoves).toHaveLength(1);
@@ -630,14 +612,14 @@ describe("LiveSessionManager session lifecycle", () => {
     vi.useFakeTimers();
     const { mkdirSync, writeFileSync, rmSync } = await import("node:fs");
     const sid = `sdk-${Math.random().toString(36).slice(2)}`;
-    const trigger = `/tmp/sdk-sessions/${sid}.compact-trigger`;
+    const trigger = `${mockConfig.sdkSessionsDir}/${sid}.compact-trigger`;
     try {
       const manager = new LiveSessionManager(makeDeps());
       await manager.getOrCreateLiveSession("telegram:1");
       mockState.instances[0].sessionId = sid;
       const r = manager.reserveCompact("telegram:1", sid);
       if (!r.ok) throw new Error("expected approval");
-      mkdirSync("/tmp/sdk-sessions", { recursive: true });
+      mkdirSync(mockConfig.sdkSessionsDir, { recursive: true });
       writeFileSync(trigger, "x"); // the rewrite succeeded
       manager.finishCompact("telegram:1", r.reservationId);
       vi.advanceTimersByTime(48 * 60 * 60 * 1000);
@@ -780,7 +762,7 @@ describe("LiveSessionManager session lifecycle", () => {
     const manager = new LiveSessionManager(makeDeps({
       buildExternalMcpServers: async () => ({ docs }),
     }));
-    const original = await manager.getOrCreateLiveSession("telegram:1");
+    const original = fake(await manager.getOrCreateLiveSession("telegram:1"));
     mockState.mcpSetImpl = async () => {
       await setGate;
       return { added: ["docs"], removed: [], errors: {} };
@@ -859,7 +841,7 @@ describe("LiveSessionManager session lifecycle", () => {
       return { added: ["docs"], removed: [], errors: {} };
     };
     const manager = new LiveSessionManager(makeDeps());
-    const original = await manager.getOrCreateLiveSession("telegram:1");
+    const original = fake(await manager.getOrCreateLiveSession("telegram:1"));
 
     const mounting = manager.hotMountExternalMcpServer("docs", {
       type: "http",
@@ -869,7 +851,7 @@ describe("LiveSessionManager session lifecycle", () => {
     expect(mockState.mcpSetCalls).toHaveLength(1);
 
     manager.closeLiveSession("telegram:1");
-    const replacement = await manager.getOrCreateLiveSession("telegram:1");
+    const replacement = fake(await manager.getOrCreateLiveSession("telegram:1"));
     expect(replacement).not.toBe(original);
     releaseSet();
     await mounting;
@@ -1004,13 +986,13 @@ describe("LiveSessionManager idle reaper", () => {
   });
 
   it.each([
-    ["a turn is running", (f: FakeSession & Record<string, unknown>) => { f.busy = true; }],
-    ["background tasks are live", (f: FakeSession & Record<string, unknown>) => { f.background = true; }],
-    ["an ambient watcher is live", (f: FakeSession & Record<string, unknown>) => { f.ambient = true; }],
-    ["a task report is still due", (f: FakeSession & Record<string, unknown>) => { f.awaitingReport = true; }],
+    ["a turn is running", (f: FakeSession) => { f.busy = true; }],
+    ["background tasks are live", (f: FakeSession) => { f.background = true; }],
+    ["an ambient watcher is live", (f: FakeSession) => { f.ambient = true; }],
+    ["a task report is still due", (f: FakeSession) => { f.awaitingReport = true; }],
   ])("keeps an idle-looking session while %s, and restarts its clock", async (_label, arrange) => {
     const { manager, fake } = await idleSession();
-    arrange(fake as FakeSession & Record<string, unknown>);
+    arrange(fake);
     const later = fake.lastActivityAt() + 2 * HOUR;
     expect(manager.reapIdleSessions(later)).toEqual([]);
     expect(fake.closed).toBe(false);
@@ -1253,8 +1235,8 @@ describe("LiveSessionManager memory change notes", () => {
 
   it("tells each live session a small added line once, and keeps it", async () => {
     const { manager, set } = setup(mem("- [Travel](travel.md)"));
-    const dm = await manager.getOrCreateLiveSession("dm:owner");
-    const group = await manager.getOrCreateLiveSession("telegram:-1");
+    const dm = fake(await manager.getOrCreateLiveSession("dm:owner"));
+    const group = fake(await manager.getOrCreateLiveSession("telegram:-1"));
     expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
 
     set(mem("- [Travel](travel.md)", "- [Coffee](coffee.md)"));
@@ -1310,7 +1292,7 @@ describe("LiveSessionManager memory change notes", () => {
 
   it("a ticket from a replaced session does not touch its replacement", async () => {
     const { manager, set } = setup(mem("- a"));
-    const old = await manager.getOrCreateLiveSession("dm:owner");
+    const old = fake(await manager.getOrCreateLiveSession("dm:owner"));
     set(mem("- a", "- b"));
     const stale = manager.takePromptContextNote("dm:owner")!;
     old.closed = true;
@@ -1332,13 +1314,13 @@ describe("LiveSessionManager memory change notes", () => {
       mem("- a", ...Array.from({ length: 11 }, (_, i) => `- n${i}`))],
   ])("retires the session instead of noting %s", async (_what, before, after) => {
     const { manager, set } = setup(before);
-    const first = await manager.getOrCreateLiveSession("dm:owner");
+    const first = fake(await manager.getOrCreateLiveSession("dm:owner"));
     set(after);
     expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
     // Idle: retired at once, so the turn runs on a session built from the
     // current files.
     expect(first.closed).toBe(true);
-    const second = await manager.getOrCreateLiveSession("dm:owner");
+    const second = fake(await manager.getOrCreateLiveSession("dm:owner"));
     expect(second).not.toBe(first);
     expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
   });
@@ -1361,7 +1343,7 @@ describe("LiveSessionManager memory change notes", () => {
 
   it("notes up to the line limit", async () => {
     const { manager, set } = setup(mem("- a"));
-    const first = await manager.getOrCreateLiveSession("dm:owner");
+    const first = fake(await manager.getOrCreateLiveSession("dm:owner"));
     set(mem("- a", ...Array.from({ length: 10 }, (_, i) => `- n${i}`)));
     expect(manager.takePromptContextNote("dm:owner")?.prefix).toContain("+ - n9");
     expect(first.closed).toBe(false);
@@ -1369,7 +1351,7 @@ describe("LiveSessionManager memory change notes", () => {
 
   it("a busy session too big to note is retired once its turn ends, and gets no note meanwhile", async () => {
     const { manager, set } = setup(mem("- a"));
-    const first = await manager.getOrCreateLiveSession("dm:owner");
+    const first = fake(await manager.getOrCreateLiveSession("dm:owner"));
     first.busy = true;
     set(mem("- a", "# Heading"));
     expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
@@ -1386,7 +1368,7 @@ describe("LiveSessionManager memory change notes", () => {
 
     it("sends no note, and keeps the session when a rebuilt prompt would be the same", async () => {
       const { manager } = setup(mem("- a"), { strictRead: failing });
-      const first = await manager.getOrCreateLiveSession("dm:owner");
+      const first = fake(await manager.getOrCreateLiveSession("dm:owner"));
       expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
       expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
       expect(first.closed).toBe(false);
@@ -1394,7 +1376,7 @@ describe("LiveSessionManager memory change notes", () => {
 
     it("sends no note, and retires the session when a rebuilt prompt would differ", async () => {
       const { manager, set } = setup(mem("- a"), { strictRead: failing });
-      const first = await manager.getOrCreateLiveSession("dm:owner");
+      const first = fake(await manager.getOrCreateLiveSession("dm:owner"));
       set(mem("- a", "- b"));
       expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
       expect(first.closed).toBe(true);
@@ -1421,7 +1403,7 @@ describe("LiveSessionManager memory change notes", () => {
     it("drops it when an identity change retires the session before the turn reaches it", async () => {
       let identity = "identity-v1";
       const { manager, set } = setup(mem("- a"), { identity: () => identity });
-      const old = await manager.getOrCreateLiveSession("dm:owner");
+      const old = fake(await manager.getOrCreateLiveSession("dm:owner"));
       set(mem("- a", "- b"));
       identity = "identity-v2";
       const ticket = manager.takePromptContextNote("dm:owner")!;
@@ -1485,45 +1467,23 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(deps.maybeNudgeCompact).not.toHaveBeenCalled();
   });
 
-  it("signals turn completion when the turn ends in an SDK result error", async () => {
+  // Every way a turn can end in an error still ends a turn: a restart deferred
+  // to the end of this turn must fire. The timeout path retires the session
+  // and rethrows from `dispatchTurn`, never reaching `recordTurnCompletion`;
+  // the legacy max-turns throw is settled as an answer, not rethrown.
+  it.each([
+    ["an SDK result error", () => new SdkResultError("boom", "error_during_execution"), "throws"],
+    ["a query timeout", () => new Error("Query timed out after 10 minutes"), "throws"],
+    ["the legacy max-turns throw", () => new Error("Reached maximum number of turns"), "settles"],
+    ["an unrecoverable session error", () => new Error("something entirely unrecognised"), "throws"],
+  ] as const)("signals turn completion when the turn ends in %s", async (_label, error, outcome) => {
     const deps = makeDeps();
     const manager = new LiveSessionManager(deps);
-    mockState.sendImpl = async () => { throw new SdkResultError("boom", "error_during_execution"); };
+    mockState.sendImpl = async () => { throw error(); };
 
-    await expect(manager.runWithRetry({ key: "telegram:1", prompt: "hi" })).rejects.toThrow();
-
-    expect(deps.handleTurnComplete).toHaveBeenCalledWith("telegram:1");
-  });
-
-  it("signals turn completion on a query timeout", async () => {
-    // The timeout path retires the session and rethrows from `dispatchTurn`;
-    // it never reaches `recordTurnCompletion`. A restart deferred to the end
-    // of this turn must still fire.
-    const deps = makeDeps();
-    const manager = new LiveSessionManager(deps);
-    mockState.sendImpl = async () => { throw new Error("Query timed out after 10 minutes"); };
-
-    await expect(manager.runWithRetry({ key: "telegram:1", prompt: "hi" })).rejects.toThrow();
-
-    expect(deps.handleTurnComplete).toHaveBeenCalledWith("telegram:1");
-  });
-
-  it("signals turn completion on the legacy max-turns throw", async () => {
-    const deps = makeDeps();
-    const manager = new LiveSessionManager(deps);
-    mockState.sendImpl = async () => { throw new Error("Reached maximum number of turns"); };
-
-    await manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
-
-    expect(deps.handleTurnComplete).toHaveBeenCalledWith("telegram:1");
-  });
-
-  it("signals turn completion on an unrecoverable session error", async () => {
-    const deps = makeDeps();
-    const manager = new LiveSessionManager(deps);
-    mockState.sendImpl = async () => { throw new Error("something entirely unrecognised"); };
-
-    await expect(manager.runWithRetry({ key: "telegram:1", prompt: "hi" })).rejects.toThrow();
+    const run = manager.runWithRetry({ key: "telegram:1", prompt: "hi" });
+    if (outcome === "throws") await expect(run).rejects.toThrow();
+    else await expect(run).resolves.toBeDefined();
 
     expect(deps.handleTurnComplete).toHaveBeenCalledWith("telegram:1");
   });
@@ -1655,12 +1615,12 @@ describe("LiveSessionManager.runWithRetry", () => {
       if (calls === 1) throw new SdkResultError("x", "error_during_execution", ["No conversation found with session ID: y"], 0);
       return "recovered";
     };
-    const statsBefore = (deps.updateStats as { mock: { calls: unknown[] } }).mock.calls.length;
+    const statsBefore = vi.mocked(deps.updateStats).mock.calls.length;
 
     await manager.runWithRetry({ key: "imessage:group", prompt: "hi" });
 
     expect(deps.maybeNudgeCompact).toHaveBeenCalledTimes(1);
-    expect((deps.updateStats as { mock: { calls: unknown[] } }).mock.calls.length - statsBefore).toBeLessThanOrEqual(1);
+    expect(vi.mocked(deps.updateStats).mock.calls.length - statsBefore).toBeLessThanOrEqual(1);
   });
 
   it("does not retry other SDK error results, even ones that mention a closed session", async () => {
@@ -1712,7 +1672,7 @@ describe("LiveSessionManager.runWithRetry", () => {
       prompt: "hi",
       // The real sink (TurnRunner.makeBlockSink) marks the turn shipped as it
       // attempts each send; mirrored here.
-      onBlock: async (b) => { shipped = true; received.push(b); },
+      onBlock: async (b: string) => { shipped = true; received.push(b); },
       hasShipped: () => shipped,
     } as never).then(() => "resolved", (e: Error) => `rejected: ${e.message}`);
 
@@ -1745,7 +1705,7 @@ describe("LiveSessionManager.runWithRetry", () => {
     const response = await manager.runWithRetry({
       key: "telegram:1",
       prompt: "hi",
-      onBlock: async (b) => { received.push(b); },
+      onBlock: async (b: string) => { received.push(b); },
       hasShipped: () => received.length > 0,
     } as never);
 

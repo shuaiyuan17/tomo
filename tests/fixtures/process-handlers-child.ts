@@ -5,10 +5,8 @@
  *
  * Modes:
  *   rejection             handlers installed, then a synthetic unhandled rejection
- *   rejection-object      as above, but the reason is a plain object, not an Error
  *   rejection-bare        NO handlers (i.e. main), same synthetic rejection
  *   exception             handlers installed, then a synthetic uncaught throw
- *   exception-bare        NO handlers, same synthetic throw
  *   startup-swallowed     handlers installed, then an async "start command" whose
  *                         promise rejects with nobody awaiting it (commander's
  *                         sync parse()) — the daemon half-starts and lives on
@@ -48,13 +46,10 @@ if (mode.startsWith("startup")) {
     ? async () => { try { await startForeground(); } catch (err) { raiseFatal(err, "startup"); } }
     : startForeground;
   void action();
-} else if (mode.startsWith("exception")) {
+} else if (mode === "exception") {
   // Outside any try/catch and off the main tick — the shape a real daemon
   // crash takes (a throw inside a setInterval callback, e.g. PetScheduler).
   setTimeout(() => { throw new Error("synthetic uncaught exception"); }, 20);
-} else if (mode === "rejection-object") {
-  // Not an Error: `String(reason)` would render this "[object Object]".
-  void Promise.reject({ code: "ECONNRESET", host: "api.telegram.org" });
 } else {
   // A floating rejected promise: nobody awaits it, nobody attaches a catch.
   void Promise.reject(new Error("synthetic unhandled rejection"));

@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
-import type { WebSubsession, WebSubsessionDetail, WebSubsessionList } from "../../src/web/protocol.js";
+import type { WebSubsession, WebSubsessionDetail, WebSubsessionList, WebSubsessionMilestone, WebSubsessionUpdate } from "../../src/web/protocol.js";
 import { api } from "./api.js";
 import { i18n } from "./i18n/index.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
 // i18n-dynamic: tasks:subsession.state.*
+// i18n-dynamic: tasks:subsession.updates.milestone.*
 
 /** Sub-sessions in the Tasks rail: render logic, kept pure so it is testable. */
 
@@ -13,6 +14,19 @@ const STATE_LABELS = {
   waitingOwner: "tasks:subsession.state.waitingOwner", waiting: "tasks:subsession.state.waiting",
   finished: "tasks:subsession.state.finished", cancelled: "tasks:subsession.state.cancelled", failed: "tasks:subsession.state.failed",
 } as const;
+
+const MILESTONE_LABELS = {
+  started: "tasks:subsession.updates.milestone.started", waitingOwner: "tasks:subsession.updates.milestone.waitingOwner",
+  finished: "tasks:subsession.updates.milestone.finished", reopened: "tasks:subsession.updates.milestone.reopened",
+  cancelled: "tasks:subsession.updates.milestone.cancelled", failed: "tasks:subsession.updates.milestone.failed",
+} as const satisfies Record<WebSubsessionMilestone, string>;
+
+/** An update's words: the line the task recorded, or the milestone's name (an unknown one shows nothing). */
+export function updateText(entry: WebSubsessionUpdate): string {
+  if (entry.kind !== "milestone") return entry.text;
+  // A daemon newer than this page may send a milestone it does not know.
+  return Object.hasOwn(MILESTONE_LABELS, entry.milestone) ? i18n.t(MILESTONE_LABELS[entry.milestone]) : "";
+}
 
 const WAITING = { owner: "waitingOwner", other: "waiting" } as const;
 /**
@@ -54,6 +68,16 @@ export function withListBackground<D extends Partial<WebSubsession>>(detail: D |
 export const SUBSESSIONS_BACKGROUND_REFRESH_MS = 15_000;
 export function subsessionsRefreshMs(list: WebSubsessionList): number | undefined {
   return list.available && list.tasks.some((task) => task.status === "waiting" && task.waitingOn === "external") ? SUBSESSIONS_BACKGROUND_REFRESH_MS : undefined;
+}
+
+/**
+ * How much of a list shows before "show more": the newest `keep` (from the
+ * end for the done steps, oldest first; from the start for updates, newest
+ * first). `hidden`: how many the fold keeps back.
+ */
+export function folded<T>(items: readonly T[], keep: number, open: boolean, from: "start" | "end"): { shown: readonly T[]; hidden: number } {
+  if (open || items.length <= keep) return { shown: items, hidden: 0 };
+  return { shown: from === "end" ? items.slice(-keep) : items.slice(0, keep), hidden: items.length - keep };
 }
 
 /** Open tasks are alive; ended ones are shown dimmed, as ended subagents are. */

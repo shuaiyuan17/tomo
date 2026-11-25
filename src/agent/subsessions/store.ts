@@ -8,11 +8,21 @@ import { IllegalTransitionError, nextStatus, type SubsessionEvent } from "./stat
 import {
   OWNER_MESSAGE_IDS_KEEP,
   CONVERSATION_KEEP,
+  DONE_STEPS_KEEP,
+  UPDATES_KEEP,
+  PLAN_MAX_STEPS,
+  PLAN_STEP_MAX,
+  PROGRESS_TEXT_MAX,
+  STEP_RESULT_MAX,
+  oneLine,
   REPLY_MAP_KEEP,
   SENT_KEEP,
   SUBSESSION_STATUSES,
   TRANSITION_LOG_KEEP,
   type SubsessionInput,
+  type SubsessionPlanStep,
+  type SubsessionDoneStep,
+  type SubsessionUpdate,
   type SubsessionRecord,
   type SubsessionStatus,
   type SubsessionTable,
@@ -444,6 +454,9 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
         !!e && typeof e === "object" && typeof (e as { seq?: unknown }).seq === "number" && typeof (e as { text?: unknown }).text === "string") }
       : { earlierReports: undefined }),
     ...(r.handedBack === true ? { handedBack: true } : { handedBack: undefined }),
+    ...(Array.isArray(r.plan) ? { plan: parsePlan(r.plan) } : { plan: undefined }),
+    ...(Array.isArray(r.doneSteps) ? { doneSteps: parseDoneSteps(r.doneSteps) } : { doneSteps: undefined }),
+    ...(Array.isArray(r.updates) ? { updates: parseUpdates(r.updates) } : { updates: undefined }),
     sent: Array.isArray(r.sent) ? r.sent as SubsessionRecord["sent"] : [],
     transitions: Array.isArray(r.transitions) ? r.transitions as SubsessionRecord["transitions"] : [],
   };
@@ -475,12 +488,53 @@ function parseInputs(raw: unknown): SubsessionInput[] {
   return out;
 }
 
+/** A timed one-line entry, or nothing when it is malformed (no finite time, no text) or blank. */
+function timedLine(e: unknown, max: number): { at: number; text: string; rest: Record<string, unknown> } | undefined {
+  if (!e || typeof e !== "object") return undefined;
+  const rest = e as Record<string, unknown>;
+  const { at, text } = rest;
+  if (typeof at !== "number" || !Number.isFinite(at) || typeof text !== "string") return undefined;
+  const line = oneLine(text, max);
+  return line ? { at, text: line, rest } : undefined;
+}
+
+/** Well-formed steps only, each within its limits, the newest DONE_STEPS_KEEP. */
+function parseDoneSteps(raw: unknown[]): SubsessionDoneStep[] {
+  return raw.flatMap((e): SubsessionDoneStep[] => {
+    const entry = timedLine(e, PLAN_STEP_MAX);
+    if (!entry) return [];
+    const result = typeof entry.rest.result === "string" ? oneLine(entry.rest.result, STEP_RESULT_MAX) : "";
+    return [{ at: entry.at, text: entry.text, ...(result ? { result } : {}) }];
+  }).slice(-DONE_STEPS_KEEP);
+}
+
+/** Well-formed updates only, each one line within PROGRESS_TEXT_MAX, the newest UPDATES_KEEP. */
+function parseUpdates(raw: unknown[]): SubsessionUpdate[] {
+  return raw.flatMap((e): SubsessionUpdate[] => {
+    const entry = timedLine(e, PROGRESS_TEXT_MAX);
+    return entry ? [{ at: entry.at, text: entry.text }] : [];
+  }).slice(-UPDATES_KEEP);
+}
+
+/** Well-formed steps only, each one line within PLAN_STEP_MAX, the first PLAN_MAX_STEPS. */
+function parsePlan(raw: unknown[]): SubsessionPlanStep[] {
+  return raw.flatMap((e): SubsessionPlanStep[] => {
+    if (!e || typeof e !== "object") return [];
+    const { text, status } = e as { text?: unknown; status?: unknown };
+    const line = typeof text === "string" ? oneLine(text, PLAN_STEP_MAX) : "";
+    return line ? [{ text: line, status: status === "in_progress" ? "in_progress" : "pending" }] : [];
+  }).slice(0, PLAN_MAX_STEPS);
+}
+
 /** The capped logs. pendingInput is NOT one of them: accepted input is never dropped. */
 function trimLists(record: SubsessionRecord): void {
   if (record.sent.length > SENT_KEEP) record.sent = record.sent.slice(-SENT_KEEP);
   if (record.transitions.length > TRANSITION_LOG_KEEP) record.transitions = record.transitions.slice(-TRANSITION_LOG_KEEP);
   if (record.replyMap.length > REPLY_MAP_KEEP) record.replyMap = record.replyMap.slice(-REPLY_MAP_KEEP);
   if (record.conversation.length > CONVERSATION_KEEP) record.conversation = record.conversation.slice(-CONVERSATION_KEEP);
+  if (record.plan && record.plan.length > PLAN_MAX_STEPS) record.plan = record.plan.slice(0, PLAN_MAX_STEPS);
+  if (record.doneSteps && record.doneSteps.length > DONE_STEPS_KEEP) record.doneSteps = record.doneSteps.slice(-DONE_STEPS_KEEP);
+  if (record.updates && record.updates.length > UPDATES_KEEP) record.updates = record.updates.slice(-UPDATES_KEEP);
   if (record.ownerMessageIds.length > OWNER_MESSAGE_IDS_KEEP) record.ownerMessageIds = record.ownerMessageIds.slice(-OWNER_MESSAGE_IDS_KEEP);
 }
 

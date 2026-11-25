@@ -2,10 +2,10 @@ import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { EFFORT_LEVELS } from "../config.js";
 import type { SubsessionService } from "../agent/subsessions/service.js";
-import type { SubsessionRecord } from "../agent/subsessions/types.js";
+import { PLAN_MAX_STEPS, PLAN_STEP_MAX, STEP_RESULT_MAX, type SubsessionRecord } from "../agent/subsessions/types.js";
 
 /** The task_* tools a sub-session reports through (its own session only). */
-export const SUBSESSION_SELF_TOOL_NAMES = ["task_reply", "task_notify", "task_ask", "task_progress", "task_checkpoint", "task_finish", "task_reopen", "task_status"] as const;
+export const SUBSESSION_SELF_TOOL_NAMES = ["task_reply", "task_notify", "task_ask", "task_progress", "task_plan", "task_update", "task_checkpoint", "task_finish", "task_reopen", "task_status"] as const;
 /** The owning session's tools (the owner's DM only, for now). */
 export const SUBSESSION_OWNER_TOOL_NAMES = ["task_spawn", "task_status", "task_cancel", "task_message"] as const;
 /** Every task tool name, once: for the SDK's allowedTools. */
@@ -43,6 +43,20 @@ export function formatTaskDetail(r: SubsessionRecord, now = Date.now(), backgrou
   ];
   if (r.model) lines.push(`Model: ${r.model}`);
   if (r.progress) lines.push(`Progress: ${r.progress}`);
+  if (r.plan?.length) {
+    lines.push("Plan (steps still ahead):");
+    for (const step of r.plan) lines.push(`- [${step.status === "in_progress" ? "in progress" : "not started"}] ${step.text}`);
+  }
+  const doneSteps = (r.doneSteps ?? []).slice(-5);
+  if (doneSteps.length > 0) {
+    lines.push("Steps done (newest last):");
+    for (const e of doneSteps) lines.push(`- ${new Date(e.at).toISOString()}: ${e.text}${e.result ? ` — ${e.result}` : ""}`);
+  }
+  const updates = (r.updates ?? []).slice(-5);
+  if (updates.length > 0) {
+    lines.push("Decisions and updates (newest last):");
+    for (const e of updates) lines.push(`- ${new Date(e.at).toISOString()}: ${e.text}`);
+  }
   if (r.checkpoint) lines.push("Checkpoint:", r.checkpoint);
   for (const e of r.earlierReports ?? []) lines.push(`Earlier report #${e.seq} (replaced by a later one before it was read):`, e.text);
   if (r.report) lines.push(r.reportSeq ? `Report #${r.reportSeq}:` : "Report:", r.report);
@@ -107,7 +121,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_progress",
-      "Update this task's one-line status. Silent: the owner sees it only when they look. Call it after each meaningful step.",
+      "Update this task's one-line \"Now\" status (only the current line is kept). Silent: the owner sees it only when they look. Call it after each meaningful step.",
       { line: z.string().min(1).max(300).describe("One line: where the task stands now.") },
       async ({ line }) => {
         const r = service("task_progress");
@@ -115,6 +129,38 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
         return r.s.progress(deps.key, line) ? ok("Progress saved.") : fail("task_progress", "no task record for this session.");
       },
       { alwaysLoad: true, searchHint: "task progress status line" },
+    ),
+    tool(
+      "task_plan",
+      "Set the steps still ahead, in order, replacing the plan before (an empty list clears it). Mark the one you are on in_progress (at most one). Move each step you just finished into `done`, with a one-line result. Silent: the owner sees the plan and the finished steps when they look. Set it when you start, and keep it current.",
+      {
+        steps: z.array(z.object({
+          step: z.string().min(1).max(PLAN_STEP_MAX).describe("One short line: what this step gets done."),
+          status: z.enum(["pending", "in_progress"]).optional().describe("in_progress for the step you are on; default pending."),
+        })).max(PLAN_MAX_STEPS).describe("The steps still ahead, in order. Not the finished ones."),
+        done: z.array(z.object({
+          step: z.string().min(1).max(PLAN_STEP_MAX).describe("The step, as it stood in the plan."),
+          result: z.string().max(STEP_RESULT_MAX).optional().describe("One line: what came of it."),
+        })).max(PLAN_MAX_STEPS).optional().describe("Steps finished since the last task_plan call."),
+      },
+      async ({ steps, done }) => {
+        const r = service("task_plan");
+        if (!r.ok) return r.error;
+        if (steps.filter((s) => s.status === "in_progress").length > 1) return fail("task_plan", "at most one step can be in_progress.");
+        return r.s.setPlan(deps.key, steps, done ?? []) ? ok("Plan saved.") : fail("task_plan", "no task record for this session.");
+      },
+      { alwaysLoad: true, searchHint: "task plan steps checklist todo" },
+    ),
+    tool(
+      "task_update",
+      "Record a decision or a change the owner should know about: the scope changed, an approach was chosen (and why, briefly), you are blocked or unblocked, a finding that changes the plan. Kept with its time and shown to the owner as \"Decisions and updates\". Silent (not a message). Not for routine progress: that is task_progress and task_plan.",
+      { line: z.string().min(1).max(300).describe("One line: what was decided or what changed.") },
+      async ({ line }) => {
+        const r = service("task_update");
+        if (!r.ok) return r.error;
+        return r.s.postUpdate(deps.key, line) ? ok("Update saved.") : fail("task_update", "no task record for this session.");
+      },
+      { alwaysLoad: true, searchHint: "task update decision change blocked scope" },
     ),
     tool(
       "task_checkpoint",
@@ -153,7 +199,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_status",
-      "Read this task's record: status, progress, checkpoint, and the messages it sent the owner.",
+      "Read this task's record: status, progress, plan, steps done, decisions and updates, checkpoint, and the messages it sent the owner.",
       {},
       async () => {
         const r = service("task_status");

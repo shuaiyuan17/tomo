@@ -207,4 +207,40 @@ describe("sub-session tools", () => {
     expect(svc.get("s1")?.progress).toBe("halfway");
     expect((await call(other as never, "task_progress", { line: "x" })).isError).toBe(true);
   });
+
+  it("task_plan sets the steps ahead, files finished ones with their results, and allows one step in progress", async () => {
+    const svc = service();
+    const created = svc.spawn("dm:owner", { title: "Mine", brief: "b" });
+    if (!created.ok) throw new Error(created.error);
+    const self = buildTaskSelfTools({ service: () => svc, key: created.record.sessionKey });
+    const steps = [{ step: "Read the code", status: "in_progress" }, { step: "Write tests" }];
+    expect((await call(self as never, "task_plan", { steps })).isError).toBeUndefined();
+    expect(svc.get("s1")?.plan).toEqual([{ text: "Read the code", status: "in_progress" }, { text: "Write tests", status: "pending" }]);
+    expect((await call(self as never, "task_plan", { steps: [{ step: "Write tests", status: "in_progress" }], done: [{ step: "Read the code", result: "found it" }] })).isError).toBeUndefined();
+    expect(svc.get("s1")?.plan).toEqual([{ text: "Write tests", status: "in_progress" }]);
+    expect(svc.get("s1")?.doneSteps).toEqual([{ at: expect.any(Number), text: "Read the code", result: "found it" }]);
+    const refused = await call(self as never, "task_plan", { steps: [{ step: "a", status: "in_progress" }, { step: "b", status: "in_progress" }] });
+    expect(refused.isError).toBe(true);
+    expect(svc.get("s1")?.plan).toHaveLength(1);
+    const detail = (await call(self as never, "task_status", {})).content[0].text;
+    expect(detail).toContain("[in progress] Write tests");
+    expect(detail).toContain("Read the code — found it");
+    // An empty list clears the plan.
+    await call(self as never, "task_plan", { steps: [], done: [{ step: "Write tests" }] });
+    expect(svc.get("s1")?.plan).toBeUndefined();
+    expect(svc.get("s1")?.doneSteps).toHaveLength(2);
+  });
+
+  it("task_update keeps a decision apart from the progress line", async () => {
+    const svc = service();
+    const created = svc.spawn("dm:owner", { title: "Mine", brief: "b" });
+    if (!created.ok) throw new Error(created.error);
+    const self = buildTaskSelfTools({ service: () => svc, key: created.record.sessionKey });
+    expect((await call(self as never, "task_update", { line: "Scope: also add a plan checklist" })).isError).toBeUndefined();
+    expect(svc.get("s1")?.updates).toEqual([{ at: expect.any(Number), text: "Scope: also add a plan checklist" }]);
+    expect(svc.get("s1")?.progress).toBeUndefined();
+    expect((await call(self as never, "task_status", {})).content[0].text).toContain("Decisions and updates (newest last):");
+    const other = buildTaskSelfTools({ service: () => svc, key: "task:s9" });
+    expect((await call(other as never, "task_update", { line: "x" })).isError).toBe(true);
+  });
 });

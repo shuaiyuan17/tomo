@@ -19,7 +19,7 @@ import {
   formatMirrorNote,
   formatStartEvent,
 } from "./prompt.js";
-import { OPEN_STATUSES, PENDING_INPUT_MAX, TERMINAL_STATUSES, activeTotalMs, appendInput, lastInputSeq, type SubsessionConversationEntry, type SubsessionInput, type SubsessionRecord } from "./types.js";
+import { OPEN_STATUSES, PENDING_INPUT_MAX, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, STEP_RESULT_MAX, TERMINAL_STATUSES, oneLine, type SubsessionPlanStep, activeTotalMs, appendInput, lastInputSeq, type SubsessionConversationEntry, type SubsessionInput, type SubsessionRecord } from "./types.js";
 
 const OWNER_MESSAGE_MARKER = '<tomo-event type="subsession-owner-message"';
 
@@ -671,9 +671,70 @@ export class SubsessionService {
   progress(key: string, line: string): SubsessionRecord | undefined {
     const record = this.store.byKey(key);
     if (!record) return undefined;
-    const value = line.trim().split("\n")[0].slice(0, 300);
-    const updated = this.store.update(record.id, (r) => { r.progress = value; });
-    if (updated && value !== record.progress) this.progressChanged.add(record.id);
+    const value = oneLine(line, PROGRESS_TEXT_MAX);
+    let changed = false;
+    // Compared inside the lock, against the line on disk. Only the current
+    // line is kept: per-step chatter is what the plan and the updates are not.
+    const updated = this.store.update(record.id, (r) => { changed = value !== r.progress; r.progress = value; });
+    if (updated && changed) this.progressChanged.add(record.id);
+    return updated;
+  }
+
+  /**
+   * task_update: a decision or change the owner should know about (scope,
+   * approach, blocked or unblocked), kept with its time. The same line twice
+   * in a row is kept once. Counts as progress.
+   */
+  postUpdate(key: string, line: string): SubsessionRecord | undefined {
+    const record = this.store.byKey(key);
+    if (!record) return undefined;
+    const value = oneLine(line, PROGRESS_TEXT_MAX);
+    if (!value) return record;
+    let changed = false;
+    const at = this.now();
+    const updated = this.store.update(record.id, (r) => {
+      if (r.updates?.at(-1)?.text === value) return;
+      (r.updates ??= []).push({ at, text: value });
+      changed = true;
+    });
+    if (updated && changed) this.progressChanged.add(record.id);
+    return updated;
+  }
+
+  /**
+   * task_plan: replace the steps still ahead (empty clears the plan) and file
+   * the ones just done, each with its one-line result. A change to either
+   * counts as progress for the no-progress pause.
+   */
+  setPlan(key: string, steps: ReadonlyArray<{ step: string; status?: "pending" | "in_progress" }>, done: ReadonlyArray<{ step: string; result?: string }> = []): SubsessionRecord | undefined {
+    const record = this.store.byKey(key);
+    if (!record) return undefined;
+    const next: SubsessionPlanStep[] = steps.flatMap((s): SubsessionPlanStep[] => {
+      const text = oneLine(s.step, PLAN_STEP_MAX);
+      return text ? [{ text, status: s.status === "in_progress" ? "in_progress" : "pending" }] : [];
+    }).slice(0, PLAN_MAX_STEPS);
+    const finished = done.flatMap((d) => {
+      const text = oneLine(d.step, PLAN_STEP_MAX);
+      const result = d.result ? oneLine(d.result, STEP_RESULT_MAX) : "";
+      return text ? [{ text, ...(result ? { result } : {}) }] : [];
+    });
+    let changed = false;
+    const at = this.now();
+    const updated = this.store.update(record.id, (r) => {
+      if (JSON.stringify(r.plan ?? []) !== JSON.stringify(next)) {
+        changed = true;
+        if (next.length > 0) r.plan = next;
+        else delete r.plan;
+      }
+      for (const step of finished) {
+        const last = r.doneSteps?.at(-1);
+        // The same step reported done twice in a row (a retried call) is one entry.
+        if (last && last.text === step.text && last.result === step.result) continue;
+        (r.doneSteps ??= []).push({ at, ...step });
+        changed = true;
+      }
+    });
+    if (updated && changed) this.progressChanged.add(record.id);
     return updated;
   }
 

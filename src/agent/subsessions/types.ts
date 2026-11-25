@@ -97,6 +97,25 @@ export interface SubsessionTransition {
   reason?: string;
 }
 
+/** A plan step the task marked done (task_plan), with the one-line result it gave. */
+export interface SubsessionDoneStep {
+  at: number;
+  text: string;
+  result?: string;
+}
+
+/** A decision or a change the owner should know about (task_update): scope, approach, blocked or unblocked. */
+export interface SubsessionUpdate {
+  at: number;
+  text: string;
+}
+
+/** A step still ahead in a task's plan (task_plan). Done steps leave the plan for the history. */
+export interface SubsessionPlanStep {
+  text: string;
+  status: "pending" | "in_progress";
+}
+
 export interface SubsessionRecord {
   /** Short id, unique across every owning scope: `s1`, `s2`, … */
   id: string;
@@ -156,8 +175,14 @@ export interface SubsessionRecord {
   turnsWithoutProgress: number;
   /** The task itself asked for the daemon restart (RestartCoordinator). */
   restartRequested: boolean;
-  /** One-line status (task_progress). */
+  /** One-line status (task_progress): the live "Now" line. Only the current one is kept. */
   progress?: string;
+  /** The steps still ahead, in order, as task_plan last set them (at most PLAN_MAX_STEPS). Unset: no plan. */
+  plan?: SubsessionPlanStep[];
+  /** Plan steps marked done, oldest first, at most DONE_STEPS_KEEP. Unset on records written before plans existed. */
+  doneSteps?: SubsessionDoneStep[];
+  /** Decisions and changes (task_update), oldest first, at most UPDATES_KEEP. */
+  updates?: SubsessionUpdate[];
   /** Goal, progress, next step and side effects (task_checkpoint). */
   checkpoint?: string;
   report?: string;
@@ -257,5 +282,19 @@ export const TRANSITION_LOG_KEEP = 50;
 export const REPLY_MAP_KEEP = 200;
 export const OWNER_MESSAGE_IDS_KEEP = 50;
 export const CONVERSATION_KEEP = 40;
+export const DONE_STEPS_KEEP = 20;
+export const UPDATES_KEEP = 20;
+/** A progress or update line is one line of at most this many characters. */
+export const PROGRESS_TEXT_MAX = 300;
+/** A plan holds at most this many steps, each one line of at most PLAN_STEP_MAX characters. */
+export const PLAN_MAX_STEPS = 8;
+export const PLAN_STEP_MAX = 120;
+/** A finished step's one-line result. */
+export const STEP_RESULT_MAX = 200;
+
+/** One line, trimmed, at most `max` characters (by code point, so a pair is never split). */
+export function oneLine(text: string, max: number): string {
+  return Array.from(text.trim().split("\n")[0].trim()).slice(0, max).join("");
+}
 /** Inputs a task may have owed at once; more are refused (never silently dropped). */
 export const PENDING_INPUT_MAX = 50;

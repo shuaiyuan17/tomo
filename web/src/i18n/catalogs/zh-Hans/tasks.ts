@@ -33,6 +33,11 @@ export const tasks = {
     state: { working: "工作中", background: "工作中（后台运行）", active: "进行中", queued: "排队中", waitingOwner: "等你回复", waiting: "等待中", finished: "已完成", cancelled: "已取消", failed: "失败" },
     conversation: "和 {{id}} 的对话", nothingYet: "还没有对话。可以在下面给 {{id}} 留言。",
     you: "你", tag: { ask: "提问", notify: "通知" }, report: "报告",
+    doing: { heading: "正在做", inProgress: "进行中", pending: "未开始", done: "已完成", earlier: "显示更早的 {{count}} 项", fewer: "收起" },
+    updates: {
+      heading: "决定与进展", more: "全部显示（{{count}}）", fewer: "收起",
+      milestone: { started: "开始", waitingOwner: "等你回复", finished: "完成", reopened: "重新打开", cancelled: "已取消", failed: "失败" },
+    },
     files_other: "{{count}} 个文件",
     label: "发给 {{id}} 的消息", placeholder: "给 {{id}} 发消息…", send: "发给 {{id}}",
     sending: "发送中…", sent: "已发送", retry: "重试",

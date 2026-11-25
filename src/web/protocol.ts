@@ -129,6 +129,16 @@ export interface WebSubsessionEntry {
   /** Files sent with it (count only). */
   files?: number;
 }
+/** A step still ahead in a task's plan (task_plan). */
+export interface WebSubsessionPlanStep { text: string; status: "pending" | "in_progress" }
+/** A plan step the task marked done, with its one-line result. */
+export interface WebSubsessionDoneStep { at: number; text: string; result?: string }
+/** A lifecycle milestone shown among a task's updates (drawn from its status changes). */
+export type WebSubsessionMilestone = "started" | "waitingOwner" | "finished" | "reopened" | "cancelled" | "failed";
+/** One entry of "Decisions and updates": a line the task recorded (task_update), or a milestone of its lifecycle. */
+export type WebSubsessionUpdate =
+  | { at: number; kind: "update"; text: string }
+  | { at: number; kind: "milestone"; milestone: WebSubsessionMilestone };
 export interface WebSubsessionDetail extends WebSubsession {
   brief: string;
   /** The brief was cut for the browser. */
@@ -137,6 +147,12 @@ export interface WebSubsessionDetail extends WebSubsession {
   quote?: string[];
   waitingReason?: string;
   conversation: WebSubsessionEntry[];
+  /** The steps still ahead, in order (an open task with a plan only). */
+  plan?: WebSubsessionPlanStep[];
+  /** Plan steps done, oldest first (the checklist's ticked lines). Absent when none. */
+  doneSteps?: WebSubsessionDoneStep[];
+  /** Decisions and updates, newest first, with the lifecycle's milestones among them. Absent when none. */
+  updates?: WebSubsessionUpdate[];
   report?: string;
   reportTruncated?: boolean;
 }

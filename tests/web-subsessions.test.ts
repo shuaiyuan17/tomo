@@ -9,7 +9,7 @@ import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import type { SubsessionRecord } from "../src/agent/subsessions/types.js";
 import type { OwnerConfig } from "../src/owner.js";
 import { rpcSchema, type WebEvent, type WebSubsession } from "../src/web/protocol.js";
-import { BRIEF_LIMIT, ENTRY_LIMIT, MAX_RAIL_SUBSESSIONS, SUBSESSION_ENDED_VISIBLE_MS, subsessionDetail, subsessionList, subsessionView } from "../src/web/subsessions-view.js";
+import { BRIEF_LIMIT, ENTRY_LIMIT, MAX_RAIL_SUBSESSIONS, SUBSESSION_ENDED_VISIBLE_MS, UPDATES_LIMIT, subsessionDetail, subsessionUpdates, subsessionList, subsessionView } from "../src/web/subsessions-view.js";
 
 const NOW = 1_800_000_000_000;
 const H = 3_600_000;
@@ -85,6 +85,53 @@ describe("the rail's view of sub-sessions", () => {
     expect(detail.revision).toBe(2);
     expect(detail.conversation[0]).toEqual({ seq: 1, at: NOW, from: "owner", kind: "message", text: "hi", files: 2 });
     expect(Array.from(detail.conversation[1].text)).toHaveLength(ENTRY_LIMIT + 1);
+  });
+});
+
+describe("a sub-session's plan, done steps and updates", () => {
+  const transitions: SubsessionRecord["transitions"] = [
+    { at: NOW - 50, from: null, to: "queued", event: "spawn" },
+    { at: NOW - 40, from: "queued", to: "active", event: "start" },
+    { at: NOW - 30, from: "active", to: "waiting", event: "wait_external" },
+    { at: NOW - 25, from: "waiting", to: "queued", event: "cron_wake" },
+    { at: NOW - 24, from: "queued", to: "active", event: "start" },
+    { at: NOW - 10, from: "active", to: "waiting", event: "ask" },
+    { at: NOW - 5, from: "waiting", to: "active", event: "owner_message" },
+    { at: NOW, from: "active", to: "finished", event: "finish" },
+  ];
+
+  it("lists the task's updates and its milestones, newest first, without the queued/active churn", () => {
+    const r = record("s1", { transitions, updates: [{ at: NOW - 35, text: "Chose approach B" }, { at: NOW, text: "Shipped" }] });
+    expect(subsessionUpdates(r)).toEqual([
+      // At the same instant the milestone reads as the later of the two.
+      { at: NOW, kind: "milestone", milestone: "finished" },
+      { at: NOW, kind: "update", text: "Shipped" },
+      { at: NOW - 10, kind: "milestone", milestone: "waitingOwner" },
+      { at: NOW - 35, kind: "update", text: "Chose approach B" },
+      { at: NOW - 40, kind: "milestone", milestone: "started" },
+    ]);
+    // Once the spawn has left the capped log, no start reads as the first one.
+    expect(subsessionUpdates(record("s1", { transitions: transitions.slice(1) })).some((e) => e.kind === "milestone" && e.milestone === "started")).toBe(false);
+    expect(subsessionUpdates(record("s1", { transitions: [{ at: NOW, from: "active", to: "failed", event: "fail" }] }))).toEqual([{ at: NOW, kind: "milestone", milestone: "failed" }]);
+  });
+
+  it("caps the updates it sends, keeps done steps in order, and shows the plan only while the task is open", () => {
+    const updates = Array.from({ length: 30 }, (_, i) => ({ at: NOW - 1000 + i, text: `u${i}` }));
+    const many = Array.from({ length: 30 }, (_, i) => ({ at: NOW - 2000 + i, from: "active" as const, to: "finished" as const, event: "finish" }));
+    expect(subsessionUpdates(record("s1", { updates, transitions: many }))).toHaveLength(UPDATES_LIMIT);
+    const plan = [{ text: "Write tests", status: "in_progress" as const }, { text: "Open the PR", status: "pending" as const }];
+    const doneSteps = [{ at: NOW - 20, text: "Read the code", result: "found it" }, { at: NOW - 10, text: "Fix it" }];
+    const open = subsessionDetail(record("s1", { plan, doneSteps }), "dm:owner", NOW, false)!;
+    expect(open.plan).toEqual(plan);
+    expect(open.doneSteps).toEqual(doneSteps);
+    const ended = subsessionDetail(record("s1", { plan, doneSteps, status: "finished", endedAt: NOW }), "dm:owner", NOW, false)!;
+    expect(ended).not.toHaveProperty("plan");
+    expect(ended.doneSteps).toEqual(doneSteps);
+    // Nothing to show, nothing sent; and the list rows never carry any of it.
+    const bare = subsessionDetail(record("s1"), "dm:owner", NOW, false)!;
+    for (const key of ["plan", "doneSteps", "updates"]) expect(bare).not.toHaveProperty(key);
+    const row = subsessionView(record("s1", { plan, doneSteps, updates }), "dm:owner", NOW, false)!;
+    for (const key of ["plan", "doneSteps", "updates"]) expect(row).not.toHaveProperty(key);
   });
 });
 

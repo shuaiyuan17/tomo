@@ -49,7 +49,13 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
   const readBack = useCallback(async (key: string, item: KeptUpload) => {
     let found: Awaited<ReturnType<typeof readStagedUpload>>;
     try { found = await readStagedUpload(item.uploadId); }
-    catch { commit((old) => updateAttachment(old, key, { status: "failed", error: deferred.t("chat:attach.failed") })); return; }
+    catch {
+      // No clear answer. Past its TTL by this tab's clock: gone (its record of going may have expired too).
+      // Within it: kept, failed, with Retry.
+      if (keptExpired(item)) commit((old) => old.filter((entry) => entry.key !== key));
+      else commit((old) => updateAttachment(old, key, { status: "failed", error: deferred.t("chat:attach.failed") }));
+      return;
+    }
     if (!list.current.some((entry) => entry.key === key)) return;
     if (!found) { commit((old) => old.filter((entry) => entry.key !== key)); return; }
     const preview = found.kind === "image" ? URL.createObjectURL(found.blob) : "";
@@ -155,10 +161,11 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
     restored.current = storageKey;
     let wanted: KeptUpload[];
     try { wanted = parseKeptUploads(sessionStorage.getItem(storageKey)); } catch { return; }
-    // Older than the server keeps any upload: gone, whatever a lookup would say (its record of going expires too).
-    const fresh = wanted.filter((item) => !keptExpired(item) && !list.current.some((entry) => entry.uploadId === item.uploadId))
+    // Every one is asked about, even one that looks expired by this tab's clock (which can be wrong):
+    // only an unclear answer for an apparently expired one drops it (readBack).
+    const fresh = wanted.filter((item) => !list.current.some((entry) => entry.uploadId === item.uploadId))
       .slice(0, Math.max(0, MAX_ATTACHMENTS - list.current.length)).map((item) => restoringAttachment(`a${++counter.current}`, item));
-    if (!fresh.length) { if (wanted.length) commit((old) => [...old]); return; }
+    if (!fresh.length) return;
     commit((old) => [...fresh, ...old]);
     for (const item of fresh) void readBack(item.key, item.restore!);
   }, [storageKey, commit, readBack]);

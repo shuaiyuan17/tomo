@@ -742,7 +742,7 @@ it("a kept upload the server no longer has (sent elsewhere, expired) is dropped 
   await browserExpect(tray).toHaveCount(0);
 });
 
-it("a kept upload older than the server keeps any is dropped on reload without asking, whatever the server would say", async () => {
+it("a kept upload that looks older than the server keeps any: dropped on an unclear answer, kept if the server still has it (the device clock can be wrong)", async () => {
   await page.locator("input[type=file]").setInputFiles([{ name: "old.png", mimeType: "image/png", buffer: solidPng(2, 2) }]);
   const tray = page.getByRole("list", { name: "Attachments" });
   await browserExpect(tray.getByRole("listitem", { name: "old.png, attached" })).toBeVisible();
@@ -755,8 +755,17 @@ it("a kept upload older than the server keeps any is dropped on reload without a
   await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
   await page.waitForTimeout(500);
   await browserExpect(tray).toHaveCount(0);
-  expect(asked).toBe(0);
+  expect(asked).toBeGreaterThan(0);
   expect(await page.evaluate(() => Object.keys(sessionStorage).filter((key) => key.startsWith("tomo-tray:")))).toEqual([]);
+  // Same age, but the server still holds it (the clock was off): it comes back.
+  await page.unroute(/\/api\/v1\/uploads\/[a-f0-9]{32}$/);
+  await page.locator("input[type=file]").setInputFiles([{ name: "skewed.png", mimeType: "image/png", buffer: solidPng(2, 2) }]);
+  await browserExpect(tray.getByRole("listitem", { name: "skewed.png, attached" })).toBeVisible();
+  await page.evaluate(() => { for (const key of Object.keys(sessionStorage)) if (key.startsWith("tomo-tray:")) {
+    sessionStorage.setItem(key, JSON.stringify(JSON.parse(sessionStorage.getItem(key)!).map((kept: { at: number }) => ({ ...kept, at: kept.at - 2 * 60 * 60 * 1000 })))); } });
+  await page.reload();
+  await browserExpect(page.getByText("Connected", { exact: true })).toBeVisible();
+  await browserExpect(tray.getByRole("listitem", { name: "skewed.png, attached" })).toBeVisible();
 });
 
 it("calls the agent by its IDENTITY.md name (re-read on edit); the product keeps its own name", async () => {

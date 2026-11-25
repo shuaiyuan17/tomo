@@ -45,6 +45,21 @@ export function subsessionState(task: ShownTask): keyof typeof STATE_LABELS {
 export function isWorkingState(state: ReturnType<typeof subsessionState>): boolean {
   return state === "working" || state === "background";
 }
+/**
+ * How a plan step is drawn: the step in progress moves (shimmer, accent)
+ * only while the task is actually working; waiting for the owner or on
+ * something external, it is held still ("paused").
+ */
+export function planStepLook(status: "pending" | "in_progress", running: boolean): "running" | "paused" | "pending" {
+  if (status !== "in_progress") return "pending";
+  return running ? "running" : "paused";
+}
+
+/** A time a Date can show (a stored 1e20 is not one: it would throw in toISOString). */
+export function showableTime(at: number): boolean {
+  return Number.isFinite(new Date(at).getTime());
+}
+
 export function subsessionStateLabel(task: ShownTask): string {
   return i18n.t(STATE_LABELS[subsessionState(task)]);
 }

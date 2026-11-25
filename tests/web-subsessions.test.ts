@@ -121,6 +121,18 @@ describe("a sub-session's plan, done steps and updates", () => {
     expect(subsessionUpdates(record("s1", { transitions: log }))).toEqual([{ at: NOW, kind: "milestone", milestone: "failed" }]);
   });
 
+  it("drops a time no Date can hold (1e20) instead of breaking the task view", () => {
+    const far = 1e20;
+    const detail = subsessionDetail(record("s1", {
+      transitions: [{ at: far, from: "active", to: "failed", event: "fail" }],
+      updates: [{ at: far, text: "far" }, { at: NOW, text: "ok" }],
+      doneSteps: [{ at: far, text: "far step" }, { at: NOW, text: "step" }],
+    }), "dm:owner", NOW, false)!;
+    expect(detail.updates?.map((e) => (e.kind === "update" ? e.text : e.milestone))).toEqual(["ok"]);
+    expect(detail.doneSteps?.map((d) => d.text)).toEqual(["step"]);
+    for (const at of [...(detail.updates ?? []), ...(detail.doneSteps ?? [])].map((e) => e.at)) expect(() => new Date(at).toISOString()).not.toThrow();
+  });
+
   it("does not repeat 'waiting for you' for a second ask while still waiting, but does after an answer", () => {
     const asks = (log: SubsessionRecord["transitions"]) => subsessionUpdates(record("s1", { transitions: log })).filter((e) => e.kind === "milestone" && e.milestone === "waitingOwner").length;
     expect(asks([

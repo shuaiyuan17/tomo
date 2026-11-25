@@ -860,7 +860,13 @@ export class SubsessionService {
   // ---------------------------------------------------------------------
 
   /** A tool call finished on a task session. */
-  noteToolUse(key: string): void {
+  /**
+   * A tool call counts as progress, except task_plan and task_update: they
+   * count only when they changed something (progressChanged), so a refused
+   * or unchanged plan does not hold off the no-progress pause.
+   */
+  noteToolUse(key: string, toolName: string): void {
+    if (/(^|__)task_(plan|update)$/.test(toolName)) return;
     const record = this.safeByKey(key);
     if (!record) return;
     this.toolCalls.set(record.id, (this.toolCalls.get(record.id) ?? 0) + 1);

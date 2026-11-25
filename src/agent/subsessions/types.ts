@@ -295,6 +295,13 @@ export const PLAN_STEP_MAX = 120;
 /** A finished step's one-line result. */
 export const STEP_RESULT_MAX = 200;
 
+/** The latest time a JS Date can hold (ms since the epoch). */
+const MAX_DATE_MS = 8.64e15;
+/** A time a record may hold: finite ms since the epoch that a Date can show. Anything else (a hand edit, 1e20) is dropped, not drawn. */
+export function isTimestamp(at: unknown): at is number {
+  return typeof at === "number" && Number.isFinite(at) && at >= 0 && at <= MAX_DATE_MS;
+}
+
 /** The plan step an open task is on (its "Now"), if it marked one in progress. An ended task is on none. */
 export function currentStep(record: Pick<SubsessionRecord, "plan" | "status">): string | undefined {
   if (!OPEN_STATUSES.has(record.status)) return undefined;

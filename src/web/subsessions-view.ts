@@ -1,4 +1,4 @@
-import { activeTotalMs, currentStep, type SubsessionRecord } from "../agent/subsessions/types.js";
+import { activeTotalMs, currentStep, isTimestamp, type SubsessionRecord } from "../agent/subsessions/types.js";
 import type { SubsessionEvent } from "../agent/subsessions/state-machine.js";
 import type { WebSubsession, WebSubsessionDetail, WebSubsessionMilestone, WebSubsessionStatus, WebSubsessionUpdate } from "./protocol.js";
 
@@ -90,13 +90,13 @@ const MILESTONES: Partial<Record<SubsessionEvent, WebSubsessionMilestone>> = {
  * start counts only while the log still has the spawn before it.
  */
 export function subsessionUpdates(record: SubsessionRecord): WebSubsessionUpdate[] {
-  const out: WebSubsessionUpdate[] = (record.updates ?? []).map((u) => ({ at: u.at, kind: "update" as const, text: clip(u.text, LINE_LIMIT).text, ...(u.kind === "plan" ? { plan: true as const } : {}) }));
+  const out: WebSubsessionUpdate[] = (record.updates ?? []).filter((u) => isTimestamp(u.at)).map((u) => ({ at: u.at, kind: "update" as const, text: clip(u.text, LINE_LIMIT).text, ...(u.kind === "plan" ? { plan: true as const } : {}) }));
   // A second task_ask while it is still waiting for the owner (from a
   // background report's turn) is not a new milestone.
   let waitingOwner = false;
   // The log is read as the table holds it: an entry not shaped like a transition is skipped, never thrown on.
   const log = (Array.isArray(record.transitions) ? record.transitions : []).filter((t) => !!t && typeof t === "object"
-    && typeof t.at === "number" && Number.isFinite(t.at) && typeof t.event === "string" && typeof t.to === "string");
+    && isTimestamp(t.at) && typeof t.event === "string" && typeof t.to === "string");
   log.forEach((t, i) => {
     const event = t.event as SubsessionEvent;
     const milestone = event === "start" ? (i > 0 && log[i - 1].from === null ? "started" : undefined)
@@ -115,7 +115,7 @@ export function subsessionDetail(record: SubsessionRecord, scope: string, now: n
   const brief = clip(record.brief, BRIEF_LIMIT);
   const report = record.report !== undefined ? clip(record.report, REPORT_LIMIT) : undefined;
   const updates = subsessionUpdates(record);
-  const doneSteps = (record.doneSteps ?? []).map((d) => ({ at: d.at, text: clip(d.text, STEP_LIMIT).text, ...(d.result ? { result: clip(d.result, RESULT_LIMIT).text } : {}) }));
+  const doneSteps = (record.doneSteps ?? []).filter((d) => isTimestamp(d.at)).map((d) => ({ at: d.at, text: clip(d.text, STEP_LIMIT).text, ...(d.result ? { result: clip(d.result, RESULT_LIMIT).text } : {}) }));
   // The steps ahead mean something only while the task can still take them.
   const plan = OPEN.has(view.status) && record.plan?.length ? record.plan.map((step) => ({ text: clip(step.text, STEP_LIMIT).text, status: step.status })) : undefined;
   return {

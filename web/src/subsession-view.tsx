@@ -10,7 +10,7 @@ import { Text } from "./markdown.js";
 import { ModelBadge } from "./model-badge.js";
 import { differentDay, messageDateTime, messageTime } from "./message-meta.js";
 import { createCompositionGuard } from "./compose-keys.js";
-import { canRetrySend, folded, updateText, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, isWorkingState, withListBackground, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
+import { canRetrySend, folded, planStepLook, showableTime, updateText, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, isWorkingState, withListBackground, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
 import { i18n, useTranslation } from "./i18n/index.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
@@ -93,7 +93,7 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
         {isWorkingState(state) ? <span className="shimmer">{subsessionStateLabel(shown)}</span> : <span className={cn(state === "waitingOwner" && "font-medium text-foreground/80")}>{subsessionStateLabel(shown)}</span>}
         {shown.waitingReason && state === "waitingOwner" ? <> · {shown.waitingReason}</> : null}</p>
       {detail && (detail.plan?.length || detail.doneSteps?.length || detail.updates?.some((u) => updateText(u))) ? <div className="mt-2 flex max-h-[38vh] flex-col gap-2.5 overflow-y-auto pr-1 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]">
-        <Doing plan={detail.plan} done={detail.doneSteps} />
+        <Doing plan={detail.plan} done={detail.doneSteps} running={isWorkingState(state)} />
         <Updates updates={detail.updates} />
       </div> : null}
     </div>
@@ -111,6 +111,7 @@ const foldButton = "rounded px-0 text-[11px] text-muted-foreground transition-co
 
 /** Older than today: the date says when, as the time alone would not. */
 function When({ at }: { at: number }) {
+  if (!showableTime(at)) return null;
   return <time dateTime={new Date(at).toISOString()} title={messageDateTime(at)} className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
     {differentDay(at, Date.now()) ? messageDateTime(at) : messageTime(at)}</time>;
 }
@@ -120,7 +121,7 @@ function When({ at }: { at: number }) {
  * result, the newest few unless asked for more), then the one it is on and
  * those still ahead.
  */
-function Doing({ plan, done }: { plan?: WebSubsessionPlanStep[]; done?: WebSubsessionDoneStep[] }) {
+function Doing({ plan, done, running }: { plan?: WebSubsessionPlanStep[]; done?: WebSubsessionDoneStep[]; running: boolean }) {
   const { t } = useTranslation("tasks");
   const [open, setOpen] = useState(false);
   if (!plan?.length && !done?.length) return null;
@@ -136,13 +137,13 @@ function Doing({ plan, done }: { plan?: WebSubsessionPlanStep[]; done?: WebSubse
         <span className="min-w-0 flex-1 text-foreground/80 [overflow-wrap:anywhere]">{step.text}{step.result ? <span className="text-muted-foreground"> · {step.result}</span> : null}</span>
         <When at={step.at} />
       </li>)}
-      {(plan ?? []).map((step, i) => <li key={`p${i}`} data-step={step.status} className="flex items-start gap-1.5 text-[12px] leading-snug">
-        {step.status === "in_progress" ? <CircleDot aria-hidden="true" className="mt-[2px] size-3 shrink-0 text-primary" />
-          : <Circle aria-hidden="true" className="mt-[2px] size-3 shrink-0 text-muted-foreground/60" />}
-        <span className="sr-only">{step.status === "in_progress" ? t("subsession.doing.inProgress") : t("subsession.doing.pending")}: </span>
-        <span className={cn("min-w-0 [overflow-wrap:anywhere]", step.status === "in_progress" ? "font-medium text-foreground/90" : "text-muted-foreground")}>
-          {step.status === "in_progress" ? <span className="shimmer">{step.text}</span> : step.text}</span>
-      </li>)}
+      {(plan ?? []).map((step, i) => { const look = planStepLook(step.status, running); return <li key={`p${i}`} data-step={step.status} data-look={look} className="flex items-start gap-1.5 text-[12px] leading-snug">
+        {look === "pending" ? <Circle aria-hidden="true" className="mt-[2px] size-3 shrink-0 text-muted-foreground/60" />
+          : <CircleDot aria-hidden="true" className={cn("mt-[2px] size-3 shrink-0", look === "running" ? "text-primary" : "text-muted-foreground")} />}
+        <span className="sr-only">{look === "pending" ? t("subsession.doing.pending") : t("subsession.doing.inProgress")}: </span>
+        <span className={cn("min-w-0 [overflow-wrap:anywhere]", look === "pending" ? "text-muted-foreground" : look === "running" ? "font-medium text-foreground/90" : "font-medium text-foreground/70")}>
+          {look === "running" ? <span className="shimmer">{step.text}</span> : step.text}</span>
+      </li>; })}
     </ol>
   </section>;
 }
@@ -202,7 +203,7 @@ function rowView(row: SubsessionChatRow, id: string, onRetry: (message: PendingS
 
 const meta = "mb-1 flex items-baseline gap-1.5 tracking-[0.02em] text-[10.5px] text-muted-foreground";
 const bubble = "markdown ml-auto w-fit max-w-[92%] rounded-2xl rounded-tr-md bg-secondary px-3 py-2 text-[13px]! leading-relaxed!";
-const Time = ({ at }: { at: number }) => <time dateTime={new Date(at).toISOString()} title={messageDateTime(at)} className="tabular-nums">{messageTime(at)}</time>;
+const Time = ({ at }: { at: number }) => !showableTime(at) ? null : <time dateTime={new Date(at).toISOString()} title={messageDateTime(at)} className="tabular-nums">{messageTime(at)}</time>;
 
 function OwnerBubble({ text, at, files }: { text: string; at: number; files?: number }) {
   const { t } = useTranslation("tasks");

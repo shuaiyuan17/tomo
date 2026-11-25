@@ -133,7 +133,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
 /** A turn that makes progress (a tool call) and then does `then`. */
 function working(then?: (turn: Turn, h: Harness) => void): TurnHandler {
   return (turn, h) => {
-    h.service.noteToolUse(turn.key);
+    h.service.noteToolUse(turn.key, "Bash");
     then?.(turn, h);
     return { ok: true };
   };
@@ -166,7 +166,7 @@ describe("SubsessionService", () => {
     const gate = new Promise<void>((r) => { release = r; });
     const h = harness({ maxRunning: 1 }, async (turn, hh) => {
       if (turn.key === "task:s1") await gate;
-      hh.service.noteToolUse(turn.key);
+      hh.service.noteToolUse(turn.key, "Bash");
       hh.service.finish(turn.key, "ok");
       return { ok: true };
     });
@@ -262,7 +262,7 @@ describe("SubsessionService", () => {
     let n = 0;
     const h = harness({ maxRunning: 1 }, (turn, hh) => {
       n += 1;
-      if (n > 3) { hh.service.noteToolUse(turn.key); hh.service.finish(turn.key, "ok"); }
+      if (n > 3) { hh.service.noteToolUse(turn.key, "Bash"); hh.service.finish(turn.key, "ok"); }
       return { ok: true };
     });
     h.service.start();
@@ -291,7 +291,7 @@ describe("SubsessionService", () => {
     const h = harness({ maxContextTokens: 1000 }, (turn, hh) => {
       n += 1;
       if (turn.bare) { hh.context.set(turn.key, { used: 100, estimated: false }); return { ok: true }; }
-      hh.service.noteToolUse(turn.key);
+      hh.service.noteToolUse(turn.key, "Bash");
       if (n === 1) hh.context.set(turn.key, { used: 5000, estimated: false });
       else hh.service.finish(turn.key, "done");
       return { ok: true };
@@ -404,7 +404,7 @@ describe("SubsessionService", () => {
     let n = 0;
     const h = harness({}, async (turn, hh) => {
       n += 1;
-      if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
+      if (n === 1) { hh.service.noteToolUse(turn.key, "Bash"); hh.store.transition("s1", "stuck"); return { ok: true }; }
       // Answer the relay; the send may fail.
       await hh.service.notify(turn.key, `answer ${n}`);
       if (n >= 3) hh.service.finish(turn.key, "done");
@@ -1284,7 +1284,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     let n = 0;
     const h = harness({}, async (turn, hh) => {
       n += 1;
-      if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
+      if (n === 1) { hh.service.noteToolUse(turn.key, "Bash"); hh.store.transition("s1", "stuck"); return { ok: true }; }
       const sent = await hh.service.notify(turn.key, `answer ${n}`);
       if (n === 2) expect(sent.ok).toBe(false);
       if (n >= 3) hh.service.finish(turn.key, "done");
@@ -1310,7 +1310,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
         // No input carried: a failed send here is no lost answer.
         hh.sendFails = 1;
         await hh.service.notify(turn.key, "progress");
-        hh.service.noteToolUse(turn.key);
+        hh.service.noteToolUse(turn.key, "Bash");
         hh.store.transition("s1", "stuck");
         return { ok: true };
       }
@@ -1334,12 +1334,12 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     let n = 0;
     const h = harness({}, async (turn, hh) => {
       n += 1;
-      if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
+      if (n === 1) { hh.service.noteToolUse(turn.key, "Bash"); hh.store.transition("s1", "stuck"); return { ok: true }; }
       if (n === 2) {
         hh.sendFails = 1;
         expect((await hh.service.notify(turn.key, "the answer to your question")).ok).toBe(false);
         expect((await hh.service.notify(turn.key, "unrelated: tests are running")).ok).toBe(true);
-        hh.service.noteToolUse(turn.key);
+        hh.service.noteToolUse(turn.key, "Bash");
         return { ok: true };
       }
       await hh.service.notify(turn.key, "the answer to your question");
@@ -2119,6 +2119,24 @@ describe("progress, plan and updates", () => {
     expect(h.store.get(t.id)?.doneSteps?.map((d) => d.text)).toEqual(["Wait for CI", "Wait for CI"]);
   });
 
+  it("a refused or unchanged plan writes nothing to the table", () => {
+    let writes = 0;
+    const h = idle();
+    const t = spawn(h);
+    h.service.setPlan(t.sessionKey, [{ step: "A", status: "in_progress" }, { step: "B" }]);
+    const store = new SubsessionStore(path, { onChange: () => { writes += 1; } });
+    const before = readFileSync(path, "utf8");
+    store.update(t.id, () => {});
+    store.update(t.id, (r) => { r.plan = [{ text: "A", status: "in_progress" }, { text: "B", status: "pending" }]; });
+    expect(writes).toBe(0);
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(h.service.setPlan(t.sessionKey, [{ step: "C" }])).toEqual({ ok: false, error: "reason_required" });
+    expect(h.service.setPlan(t.sessionKey, [{ step: "A", status: "in_progress" }, { step: "B" }]).ok).toBe(true);
+    expect(readFileSync(path, "utf8")).toBe(before);
+    store.update(t.id, (r) => { r.plan = [{ text: "A", status: "in_progress" }]; });
+    expect(writes).toBe(1);
+  });
+
   it("a refused plan files none of its done steps either", () => {
     const h = idle();
     const t = spawn(h);
@@ -2197,14 +2215,29 @@ describe("progress, plan and updates", () => {
     expect(h.store.get(t.id)?.status).toBe("finished");
     expect(h.store.get(t.id)?.updates?.map((u) => u.text)).toEqual(["decided 2", "decided 4", "decided 6"]);
 
-    const same = harness({}, (turn, hh) => { hh.service.setPlan(turn.key, [{ step: "stuck" }]); return { ok: true }; });
+    // The tool call itself does not count either: only what task_plan changed does.
+    const same = harness({}, (turn, hh) => { hh.service.setPlan(turn.key, [{ step: "stuck" }]); hh.service.noteToolUse(turn.key, "mcp__tomo-internal__task_plan"); return { ok: true }; });
     same.service.start();
     const u = spawn(same);
     await flush();
-    // The first turn set it (progress); the next three changed nothing. Called
-    // here directly: through the tool, any tool call counts, as it always did.
+    // The first turn set it (progress); the next three changed nothing.
     expect(same.turns).toHaveLength(4);
     expect(same.store.get(u.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+
+    // Any other tool call still counts, task_status included.
+    let calls = 0;
+    const other = harness({}, (turn, hh) => {
+      calls += 1;
+      hh.service.setPlan(turn.key, [{ step: "stuck" }]);
+      hh.service.noteToolUse(turn.key, "mcp__tomo-internal__task_status");
+      if (calls > 5) hh.service.finish(turn.key, "ok");
+      return { ok: true };
+    });
+    other.service.start();
+    const v = spawn(other);
+    await flush();
+    expect(other.turns.length).toBeGreaterThan(4);
+    expect(other.store.get(v.id)?.status).toBe("finished");
   });
 
   it("loads a record written before plans and updates existed, and drops malformed entries", () => {
@@ -2219,13 +2252,16 @@ describe("progress, plan and updates", () => {
     expect(old.plan).toBeUndefined();
     expect(old.doneSteps).toBeUndefined();
     expect(old.updates).toBeUndefined();
-    table.tasks[0].updates = [{ at: 0.5, text: "why", kind: "plan" }, { at: 0.7, text: "odd kind", kind: "nope" }, { at: 1, text: "ok" }, { at: "1", text: "bad time" }, { at: 2 }, null, { at: 3, text: "line\nmore" }, { at: 5, text: " " }];
-    table.tasks[0].doneSteps = [{ at: 4, text: "done", result: 7 }, { at: 6, text: "also", result: "fine" }, "nope"];
+    const events = table.tasks[0].transitions.map((x: { event: string }) => x.event);
+    table.tasks[0].transitions.push(null, { at: 1e20, from: "queued", to: "active", event: "start" }, { at: 9, to: 3, event: "start" });
+    table.tasks[0].updates = [{ at: 1e20, text: "far future" }, { at: -1, text: "before the epoch" }, { at: 0.5, text: "why", kind: "plan" }, { at: 0.7, text: "odd kind", kind: "nope" }, { at: 1, text: "ok" }, { at: "1", text: "bad time" }, { at: 2 }, null, { at: 3, text: "line\nmore" }, { at: 5, text: " " }];
+    table.tasks[0].doneSteps = [{ at: Number.MAX_VALUE, text: "huge" }, { at: 4, text: "done", result: 7 }, { at: 6, text: "also", result: "fine" }, "nope"];
     table.tasks[0].plan = [{ text: "a", status: "in_progress" }, { text: "b", status: "weird" }, { text: 3 }, "c"];
     writeFileSync(path, JSON.stringify(table));
     const loaded = new SubsessionStore(path).get(t.id)!;
     expect(loaded.updates).toEqual([{ at: 0.5, text: "why", kind: "plan" }, { at: 0.7, text: "odd kind" }, { at: 1, text: "ok" }, { at: 3, text: "line" }]);
     expect(loaded.doneSteps).toEqual([{ at: 4, text: "done" }, { at: 6, text: "also", result: "fine" }]);
     expect(loaded.plan).toEqual([{ text: "a", status: "in_progress" }, { text: "b", status: "pending" }]);
+    expect(loaded.transitions.map((x) => x.event)).toEqual(events);
   });
 });

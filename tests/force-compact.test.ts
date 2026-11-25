@@ -200,13 +200,13 @@ describe("selectOldestStretch", () => {
     const b = build({ perDay: 2 });
     const events = fileEvents(b.sessionId);
     const firstOf23 = events.findIndex((e) => e.uuid === b.uuidsByDay.get(23)![0]);
-    events.splice(firstOf23, 0, { type: "user", uuid: "blk", isCompactSummary: true, blockTag: "weekly 2026-W47", timestamp: DAY(23, 0, 0), message: { role: "user", content: "[weekly]" } });
+    insertOnChain(events, firstOf23, { type: "user", uuid: "blk", isCompactSummary: true, blockTag: "weekly 2026-W47", timestamp: DAY(23, 0, 0), message: { role: "user", content: "[weekly]" } });
     const s = selectOldestStretch(events, { freshTail: 1, maxInputTokens: 150_000 })!;
     expect(s.blockTag).toBe("daily 2026-11-22");
     expect(s.text).not.toContain("[weekly]");
 
     const own = fileEvents(b.sessionId);
-    own.unshift({ type: "user", uuid: "own", isCompactSummary: true, blockTag: "daily 2026-11-22", timestamp: DAY(22, 8, 0), message: { role: "user", content: "[daily 2026-11-22 — 9 events summarized]\n\nMorning: decided X." } });
+    insertOnChain(own, 0, { type: "user", uuid: "own", isCompactSummary: true, blockTag: "daily 2026-11-22", timestamp: DAY(22, 8, 0), message: { role: "user", content: "[daily 2026-11-22 — 9 events summarized]\n\nMorning: decided X." } });
     const s2 = selectOldestStretch(own, { freshTail: 1, maxInputTokens: 150_000 })!;
     expect(s2.existingBlock).toBe("Morning: decided X.");
     expect(s2.text).toContain("Morning: decided X.");
@@ -221,7 +221,7 @@ describe("selectOldestStretch", () => {
       { type: "user", uuid: "wk", isCompactSummary: true, blockTag: "weekly 2026-W47", timestamp: DAY(22, 12, 0), message: { role: "user", content: "[weekly]\n\nWEEKLY-TEXT" } },
       { type: "user", uuid: "late", isCompactSummary: true, blockTag: "daily 2026-11-22", timestamp: DAY(22, 12, 1), message: { role: "user", content: "[daily]\n\nevening" } });
     const s = selectOldestStretch(events, { freshTail: 4, maxInputTokens: 150_000 })!;
-    const range = events.filter((e) => e.type === "user" || e.type === "assistant").slice(s.fromConv, s.toConv + 1);
+    const range = events.slice(events.findIndex((e) => e.uuid === s.firstUuid), events.findIndex((e) => e.uuid === s.lastUuid) + 1);
     expect(range.some((e) => e.isCompactSummary)).toBe(false);
     expect(s.lastUuid).toBe(day22[5]);
     // The day's own block sits after the run: the day's tag would make the rewrite absorb it (and the weekly between).
@@ -285,7 +285,9 @@ describe("selectOldestStretch", () => {
     const b = build({ perDay: 2 });
     const events = fileEvents(b.sessionId);
     const at = events.findIndex((e) => e.uuid === b.uuidsByDay.get(23)![0]);
-    events.splice(at, 0, { type: "system", subtype: "compact_boundary", uuid: "bnd", timestamp: DAY(23, 0, 0) });
+    // As the SDK writes one: the boundary starts a new chain, the next record hangs off it.
+    events.splice(at, 0, { type: "system", subtype: "compact_boundary", uuid: "bnd", parentUuid: null, timestamp: DAY(23, 0, 0) });
+    events[at + 1].parentUuid = "bnd";
     expect(selectOldestStretch(events, { freshTail: 1, maxInputTokens: 150_000 })!.blockTag).toBe("daily 2026-11-23");
   });
 
@@ -412,6 +414,59 @@ describe("forceCompactSession", () => {
     expect(summarize).not.toHaveBeenCalled();
     expect(r.ok).toBe(false);
     expect(r.errors).toContain("nothing could be compacted");
+  });
+
+  it("works on the active chain end to end: abandoned branches (a large one before the run, one inside a later day) shift no range and inflate no ceiling", async () => {
+    const b = build({ usage: 977_000 });
+    // The window is sized on the active conversation only: the branches below must not count.
+    const w = windowAt(b.sessionId, 96);
+    const events = fileEvents(b.sessionId);
+    const env = { isSidechain: false, userType: "external", entrypoint: "sdk-ts", cwd: workspace, sessionId: b.sessionId, version: "2.1.330", gitBranch: "main" };
+    // An earlier day already rolled up: its block heads the chain.
+    const head = { ...env, type: "user", uuid: randomUUID(), isCompactSummary: true, blockTag: "daily 2026-11-21", timestamp: DAY(21, 9, 0), message: { role: "user", content: "[daily 2026-11-21 — 4 events summarized]\n\nNov 21: nothing open." } };
+    insertOnChain(events, 0, head);
+    // A large abandoned branch off that block (a rewind): ~100K tokens and a huge reading of its own, in the file before day 22.
+    const bigU = { ...env, type: "user", uuid: randomUUID(), parentUuid: head.uuid, timestamp: DAY(22, 8, 0), message: { role: "user", content: "ABANDONED-BIG question" } };
+    const bigA = {
+      ...env, type: "assistant", uuid: randomUUID(), parentUuid: bigU.uuid, timestamp: DAY(22, 8, 1),
+      message: { model: "claude-opus-5-5", id: "msg_big", type: "message", role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: `ABANDONED-BIG ${"x".repeat(400_000)}` }], usage: { input_tokens: 5, cache_read_input_tokens: 950_000, output_tokens: 100 } },
+    };
+    events.splice(1, 0, bigU, bigA);
+    // A small one in the middle of day 23, off one of its records.
+    const day23 = b.uuidsByDay.get(23)!;
+    const midAt = events.findIndex((e) => e.uuid === day23[3]);
+    const midU = { ...env, type: "user", uuid: randomUUID(), parentUuid: day23[3], timestamp: DAY(23, 9, 4), message: { role: "user", content: "ABANDONED-MID question" } };
+    const midA = { ...env, type: "assistant", uuid: randomUUID(), parentUuid: midU.uuid, timestamp: DAY(23, 9, 4), message: { model: "claude-opus-5-5", id: "msg_mid", type: "message", role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: "ABANDONED-MID answer" }], usage: { input_tokens: 5, output_tokens: 10 } } };
+    events.splice(midAt + 1, 0, midU, midA);
+    writeFileSync(getSdkSessionPath(b.sessionId, sdkSessionsDir), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    const before = await chain(b.sessionId);
+    expect(before).not.toContain(bigU.uuid);
+    expect(before).not.toContain(midU.uuid);
+
+    const seen: StretchForSummary[] = [];
+    const r = await forceCompactSession({
+      ...common(), sdkSessionId: b.sessionId, ...w, safePct: 40,
+      summarize: async (st) => { seen.push(st); return `Summary of ${st.from}–${st.to}: the owner asked questions; Tomo answered.`; },
+    });
+    // Both rewrites published (by uuid: positions among all records would have been shifted by the branch).
+    expect(r.errors).toEqual([]);
+    expect(r.archived).toEqual([]);
+    expect(r.summarized.map((x) => x.blockTag)).toEqual(["daily 2026-11-22", "daily 2026-11-23"]);
+    expect(r.ok).toBe(true);
+    for (const st of seen) expect(st.text).not.toMatch(/ABANDONED/);
+
+    const after = await chain(b.sessionId);
+    const file = fileEvents(b.sessionId);
+    const blocks = ["daily 2026-11-21", "daily 2026-11-22", "daily 2026-11-23"].map((t) => file.find((e) => e.isCompactSummary && e.blockTag === t)?.uuid);
+    expect(after).toEqual([...blocks, ...before.filter((u) => b.uuidsByDay.get(24)!.includes(u))]);
+    // The mid-day branch sat inside day 23's span: archived with it, not summarized.
+    expect(file.some((e) => e.uuid === midU.uuid)).toBe(false);
+    // The large branch was before every run: left as it was.
+    expect(file.find((e) => e.uuid === bigA.uuid)).toBeDefined();
+    // The CLI's anchor is capped at the active chain's estimate, not at one inflated by the big branch.
+    expect(r.afterTokens).toBeLessThanOrEqual(Math.floor(w.contextMax * 0.4));
+    expect(cliAnchorUsage(file)).toBe(r.afterTokens);
+    expect(r.usageCapped).toBeGreaterThan(0);
   });
 
   it("writes the placeholder line the brief asks for", () => {

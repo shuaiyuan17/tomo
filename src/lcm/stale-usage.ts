@@ -144,22 +144,52 @@ export interface CapUsageResult {
  * the live session. Nothing is written when nothing needs capping.
  */
 /**
- * Per record: `overhead` plus the estimated content of the active chain up to
- * and including it — what the context really held when that reply was
- * written. The CLI adds its own estimate of everything AFTER its anchor, so a
- * ceiling for the whole conversation would count that tail twice.
+ * Per record: `overhead` plus the estimated content of the record and its
+ * ANCESTORS (parentUuid walked back, cut at an SDK compact boundary) — what
+ * the context really held when that reply was written. Never a sum in file
+ * order: records of an abandoned branch are no part of any other record's
+ * context, and counting them would keep a stale reading above the limit. The
+ * CLI adds its own estimate of everything AFTER its anchor, so a ceiling for
+ * the whole conversation would count that tail twice. A record without a
+ * uuid counts only itself.
  */
 export function ceilingsThrough(entries: SdkEntry[], overhead: number): (index: number) => number {
-  const through: number[] = [];
-  let sum = 0;
-  for (const e of entries) {
-    if (!isRawJsonlLine(e)) {
-      if (e.type === "system" && (e as { subtype?: string }).subtype === "compact_boundary") sum = 0;
-      else if (e.type === "user" || e.type === "assistant") sum += computeContextStatsFromEvents([e as never]).totalTokens;
+  type Rec = { uuid?: string; parentUuid?: string | null; type?: string; subtype?: string };
+  const byUuid = new Map<string, Rec>();
+  for (const e of entries) if (!isRawJsonlLine(e) && e.uuid) byUuid.set(e.uuid, e as Rec);
+  const own = (e: Rec): number => {
+    if (e.type === "user" || e.type === "assistant") return computeContextStatsFromEvents([e as never]).totalTokens;
+    return 0;
+  };
+  const memo = new Map<string, number>();
+  const through = (start: Rec): number => {
+    // Iterative: a chain can be thousands of records long.
+    const path: Rec[] = [];
+    const onPath = new Set<string>();
+    let base = 0;
+    for (let e: Rec | undefined = start; e;) {
+      if (e.type === "system" && e.subtype === "compact_boundary") break;
+      if (e.uuid && memo.has(e.uuid)) { base = memo.get(e.uuid)!; break; }
+      if (e.uuid) {
+        if (onPath.has(e.uuid)) break; // a cycle: count what was walked
+        onPath.add(e.uuid);
+      }
+      path.push(e);
+      if (!e.uuid) break;
+      e = e.parentUuid ? byUuid.get(e.parentUuid) : undefined;
     }
-    through.push(sum);
-  }
-  return (i) => overhead + (through[i] ?? sum);
+    let sum = base;
+    for (let k = path.length - 1; k >= 0; k--) {
+      sum += own(path[k]);
+      if (path[k].uuid) memo.set(path[k].uuid!, sum);
+    }
+    return sum;
+  };
+  return (i) => {
+    const e = entries[i];
+    if (!e || isRawJsonlLine(e)) return overhead;
+    return overhead + through(e as Rec);
+  };
 }
 
 export function capStaleUsageInFile(args: { sdkSessionId: string; sdkSessionsDir: string; overhead: number }): CapUsageResult {

@@ -84,10 +84,9 @@ export interface StretchForSummary {
 interface Stretch extends StretchForSummary {
   /** Undefined: written untagged (a same-day block elsewhere would be absorbed by the day's tag). */
   blockTag?: string;
-  fromConv: number;
-  toConv: number;
-  firstUuid?: string;
-  lastUuid?: string;
+  /** The run's first and last record: the rewrite range, by uuid. */
+  firstUuid: string;
+  lastUuid: string;
   /** The text of an existing block with the same tag, absorbed by the rewrite. */
   existingBlock?: string;
 }
@@ -185,46 +184,59 @@ function isToolResultTurn(e: Ev | undefined): boolean {
 }
 
 /**
- * The uuids on the active chain: parentUuid walked back from the newest
- * conversation record. Records off it (an abandoned branch) are never what a
- * compaction is aimed at, and do not count toward the estimate. Exported for tests.
+ * The active chain: parentUuid walked back from the newest conversation
+ * record (not a sidechain one), cut at the newest SDK compact boundary on it,
+ * returned oldest first. This is the conversation the CLI loads, and the ONE
+ * coordinate system a forced compaction works in: selection, the summary
+ * input, the estimate and the rewrite range (by uuid) all come from it.
+ * Records off it (an abandoned branch after a rewind or an edit) take part in
+ * none of that. Exported for tests.
  */
-export function activeChainUuids(events: readonly Ev[]): Set<string> {
+export function activeChain(events: readonly Ev[]): Ev[] {
   const byUuid = new Map<string, Ev>();
   for (const e of events) if (e.uuid) byUuid.set(e.uuid, e);
   let leaf: Ev | undefined;
   for (let i = events.length - 1; i >= 0; i--) {
-    if ((events[i].type === "user" || events[i].type === "assistant") && events[i].uuid) { leaf = events[i]; break; }
+    const e = events[i];
+    if ((e.type === "user" || e.type === "assistant") && e.uuid && e.isSidechain !== true) { leaf = e; break; }
   }
-  const on = new Set<string>();
-  for (let e = leaf; e?.uuid && !on.has(e.uuid); e = e.parentUuid ? byUuid.get(e.parentUuid as string) : undefined) on.add(e.uuid);
-  return on;
+  const chain: Ev[] = [];
+  const seen = new Set<string>();
+  for (let e = leaf; e?.uuid && !seen.has(e.uuid); e = e.parentUuid ? byUuid.get(e.parentUuid as string) : undefined) {
+    seen.add(e.uuid);
+    if (e.type === "system" && e.subtype === "compact_boundary") break;
+    chain.push(e);
+  }
+  return chain.reverse();
 }
 
+const isConvRecord = (e: Ev) => e.type === "user" || e.type === "assistant";
+
 /**
- * The oldest raw stretch to compact, or null. Exported for tests.
+ * The oldest raw stretch of the active chain to compact, or null. Exported for tests.
  *
- * Starts at the oldest raw (non-summary) user/assistant event after the last
- * SDK compact boundary; runs over that one local day, stops before the fresh
- * tail, before any summary block that is not that day's own, and before the
- * rendered text passes `maxInputTokens` (at least one event is always taken).
- * The end is then moved so the retained side does not begin with a tool
- * result whose call was removed, or in the middle of one assistant message
- * (records sharing a message id): back first, forward if backing off empties
- * the range.
+ * A run is contiguous raw (non-summary) conversation records of the chain:
+ * it starts at the oldest record that opens a turn (never a tool result,
+ * never the second record of one split assistant message), covers that one
+ * local day, and stops before the fresh tail, before any summary block, and
+ * before the rendered text passes `maxInputTokens` (at least one record is
+ * always taken). Its end is moved so the kept side does not begin with a
+ * tool result whose call was removed, or in the middle of one assistant
+ * message: back first, forward if backing off empties it. A run that cannot
+ * be cut safely is skipped for the next one.
+ *
+ * The rewrite removes the FILE span from the run's first record to its last.
+ * Records of an abandoned branch that sit inside that span go to the archive
+ * with it (they are not summarized: not the conversation); a run whose span
+ * holds a chain record outside the run is never returned.
  */
 export function selectOldestStretch(events: Ev[], opts: { freshTail: number; maxInputTokens: number }): Stretch | null {
-  let boundary = 0;
-  for (let i = events.length - 1; i >= 0; i--) {
-    if (events[i].type === "system" && events[i].subtype === "compact_boundary") { boundary = i + 1; break; }
-  }
-  const tailStart = globalFreshTailStartIdx(events.slice(boundary) as never, opts.freshTail) + boundary;
-  // A run that cannot be cut safely (a tool call whose result sits behind a
-  // block) is skipped: the next safe run after it is tried instead, so one
-  // such spot cannot hold off every later stretch.
-  const onChain = activeChainUuids(events);
-  for (let from = boundary; from < tailStart;) {
-    const r = selectRunFrom(events, boundary, from, tailStart, opts.maxInputTokens, onChain);
+  const chain = activeChain(events);
+  const tailStart = globalFreshTailStartIdx(chain as never, opts.freshTail);
+  const filePos = new Map<Ev, number>();
+  events.forEach((e, i) => filePos.set(e, i));
+  for (let from = 0; from < tailStart;) {
+    const r = selectRunFrom(events, chain, filePos, from, tailStart, opts.maxInputTokens);
     if (r === null) return null;
     if ("skipTo" in r) { from = r.skipTo; continue; }
     return r;
@@ -233,28 +245,23 @@ export function selectOldestStretch(events: Ev[], opts: { freshTail: number; max
 }
 
 function selectRunFrom(
-  events: Ev[], boundary: number, from: number, tailStart: number, maxInputTokens: number, onChain: ReadonlySet<string>,
+  events: Ev[], chain: Ev[], filePos: ReadonlyMap<Ev, number>, from: number, tailStart: number, maxInputTokens: number,
 ): Stretch | { skipTo: number } | null {
-  const opts = { maxInputTokens };
-  // Off the active chain = not part of the conversation: neither a start nor summary input.
-  const isConv = (e: Ev) => (e.type === "user" || e.type === "assistant") && (!e.uuid || onChain.has(e.uuid));
-  // The run starts at the oldest raw event that opens a turn (never a tool
-  // result, never the middle of one assistant message); a summary block in
-  // front of it is never part of it.
+  const isRaw = (e: Ev) => isConvRecord(e) && !e.isCompactSummary;
   let start = -1;
   for (let i = from; i < tailStart; i++) {
-    const e = events[i];
-    if (!isConv(e) || e.isCompactSummary || isToolResultTurn(e)) continue;
+    const e = chain[i];
+    if (!isRaw(e) || isToolResultTurn(e)) continue;
     let prev: Ev | undefined;
-    // The previous RAW event: a block between the two records of one split
+    // The previous RAW record: a block between the two records of one split
     // assistant message does not make the second one a turn start.
-    for (let j = i - 1; j >= boundary; j--) if (isConv(events[j]) && !events[j].isCompactSummary) { prev = events[j]; break; }
+    for (let j = i - 1; j >= 0; j--) if (isRaw(chain[j])) { prev = chain[j]; break; }
     if (e.type === "assistant" && prev?.type === "assistant" && !!e.message?.id && prev.message?.id === e.message.id) continue;
     start = i;
     break;
   }
   if (start < 0) return null;
-  const day = events[start].timestamp ? localDateTag(new Date(events[start].timestamp!)) : undefined;
+  const day = chain[start].timestamp ? localDateTag(new Date(chain[start].timestamp!)) : undefined;
   if (!day) return null;
   const blockTag = `daily ${day}`;
 
@@ -262,38 +269,38 @@ function selectRunFrom(
   let tokens = 0;
   let wholeDay = true;
   for (let i = start; i < tailStart; i++) {
-    const e = events[i];
-    if (!isConv(e)) continue;
-    if (e.isCompactSummary) { wholeDay = false; break; } // a run of raw events only: stop at any block
+    const e = chain[i];
+    if (!isConvRecord(e)) continue;
+    if (e.isCompactSummary) { wholeDay = false; break; } // a run of raw records only: stop at any block
     if (e.timestamp && localDateTag(new Date(e.timestamp)) !== day) break;
     const t = estimateTokens(renderEventForSummary(e));
-    if (included.length > 0 && tokens + t > opts.maxInputTokens) { wholeDay = false; break; }
+    if (included.length > 0 && tokens + t > maxInputTokens) { wholeDay = false; break; }
     included.push(i);
     tokens += t;
   }
   if (included.length === 0) return null;
   if (included[included.length - 1] < tailStart - 1) {
-    // Did the day end, or did something cut it short? A later event of the same day still ahead means a partial day.
-    for (let i = included[included.length - 1] + 1; i < events.length; i++) {
-      const e = events[i];
-      if (!isConv(e) || e.isCompactSummary) continue;
+    // Did the day end, or did something cut it short? A later record of the same day still ahead means a partial day.
+    for (let i = included[included.length - 1] + 1; i < chain.length; i++) {
+      const e = chain[i];
+      if (!isRaw(e)) continue;
       if (e.timestamp && localDateTag(new Date(e.timestamp)) === day) wholeDay = false;
       break;
     }
-  } else if (tailStart < events.length) {
+  } else if (tailStart < chain.length) {
     wholeDay = false;
   }
 
-  // The next RAW event: a summary block in between does not pair anything,
+  // The next RAW record: a summary block in between does not pair anything,
   // so a tool result behind it is still orphaned by removing its call.
-  const nextConv = (after: number): Ev | undefined => {
-    for (let i = after + 1; i < events.length; i++) if (isConv(events[i]) && !events[i].isCompactSummary) return events[i];
+  const nextRaw = (after: number): Ev | undefined => {
+    for (let i = after + 1; i < chain.length; i++) if (isRaw(chain[i])) return chain[i];
     return undefined;
   };
   const badCut = (endIdx: number): boolean => {
-    const next = nextConv(endIdx);
+    const next = nextRaw(endIdx);
     if (isToolResultTurn(next)) return true;
-    const id = events[endIdx].message?.id;
+    const id = chain[endIdx].message?.id;
     return !!next && next.type === "assistant" && !!id && next.message?.id === id;
   };
   let endPos = included.length - 1;
@@ -306,9 +313,9 @@ function selectRunFrom(
     let end = chosen[chosen.length - 1];
     for (let guard = 0; badCut(end) && guard < 10_000; guard++) {
       let next = -1;
-      for (let i = end + 1; i < tailStart; i++) if (isConv(events[i])) { next = i; break; }
+      for (let i = end + 1; i < tailStart; i++) if (isConvRecord(chain[i])) { next = i; break; }
       if (next < 0) return null;
-      if (events[next].isCompactSummary) return { skipTo: next + 1 };
+      if (chain[next].isCompactSummary) return { skipTo: next + 1 };
       chosen.push(next);
       end = next;
     }
@@ -318,24 +325,37 @@ function selectRunFrom(
     wholeDay = false;
   }
 
-  let conv = 0;
-  const convIdx = new Map<number, number>();
-  for (let i = 0; i < events.length; i++) if (isConv(events[i])) convIdx.set(i, conv++);
+  const first = chain[chosen[0]];
+  const last = chain[chosen[chosen.length - 1]];
+  const firstPos = filePos.get(first)!;
+  const lastPos = filePos.get(last)!;
+  // The rewrite removes the file span firstPos..lastPos. Every chain record
+  // in it must be one of the run's (chain order follows file order in every
+  // file the CLI or the rewriter writes; this is the check that it does).
+  const chosenSet = new Set(chosen.map((i) => chain[i]));
+  const onChain = new Set(chain);
+  for (let p = firstPos; p <= lastPos; p++) {
+    const e = events[p];
+    if (onChain.has(e) && isConvRecord(e) && !chosenSet.has(e)) return { skipTo: chosen[chosen.length - 1] + 1 };
+  }
+  if (chosen.some((i, k) => k > 0 && filePos.get(chain[i])! < filePos.get(chain[chosen[k - 1]])!)) {
+    return { skipTo: chosen[chosen.length - 1] + 1 };
+  }
+
   // No extension, ever: the range is exactly the raw run the summary call
-  // reads. But the rewrite ABSORBS every block carrying the tag it is given
-  // (and everything between it and the range). So the day's tag is used only
-  // when each same-day block sits directly in front of the run, with nothing
-  // but other such blocks (and non-conversation records) in between — then
-  // its text is merged into the input. Anywhere else, the block is written
+  // reads. But the rewrite ABSORBS every block in the FILE carrying the tag it
+  // is given (and the whole file span between it and the range). So the
+  // day's tag is used only when every same-tag block is on the chain and sits
+  // directly in front of the run in the file, with no conversation record but
+  // other such blocks in between — then its text is merged into the input.
+  // Anywhere else (one on an abandoned branch included) the block is written
   // untagged, and nothing outside the range can be absorbed.
-  const first = chosen[0];
-  const last = chosen[chosen.length - 1];
   const sameDay = events.map((e, i) => (e.isCompactSummary && e.blockTag === blockTag ? i : -1)).filter((i) => i >= 0);
   const adjacent = sameDay.every((b) => {
-    if (b > first) return false;
-    for (let i = b + 1; i < first; i++) {
+    if (b > firstPos || !onChain.has(events[b])) return false;
+    for (let i = b + 1; i < firstPos; i++) {
       const e = events[i];
-      if (isConv(e) && !(e.isCompactSummary && e.blockTag === blockTag)) return false;
+      if (isConvRecord(e) && !(e.isCompactSummary && e.blockTag === blockTag)) return false;
     }
     return true;
   });
@@ -343,16 +363,14 @@ function selectRunFrom(
   const existingBlock = (tag ? sameDay : [])
     .map((i) => textOfContent(events[i].message?.content, "\n").replace(/^\[[^\]\n]*\]\s*/, "").trim())
     .filter(Boolean).join("\n\n") || undefined;
-  const lines = chosen.map((i) => renderEventForSummary(events[i])).filter(Boolean);
+  const lines = chosen.map((i) => renderEventForSummary(chain[i])).filter(Boolean);
   if (existingBlock) lines.unshift(`[earlier summary of ${day}, to be merged into the new block]\n${existingBlock}`);
   return {
     blockTag: tag,
-    fromConv: convIdx.get(first)!,
-    toConv: convIdx.get(last)!,
-    firstUuid: events[first].uuid,
-    lastUuid: events[last].uuid,
-    from: localStamp(events[first].timestamp),
-    to: localStamp(events[last].timestamp),
+    firstUuid: first.uuid!,
+    lastUuid: last.uuid!,
+    from: localStamp(first.timestamp),
+    to: localStamp(last.timestamp),
     events: chosen.length,
     label: wholeDay ? `whole day ${day}` : `part of ${day}`,
     text: lines.join("\n\n"),
@@ -388,16 +406,8 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
     };
   }
   const safeTokens = Math.floor(window * (o.safePct ?? FORCE_COMPACT_SAFE_PCT) / 100);
-  // The active chain only: nothing before the last SDK compact boundary is loaded.
-  const fileEstimate = () => {
-    const events = loadEvents(o.sdkSessionId, o.sdkSessionsDir);
-    let start = 0;
-    for (let i = events.length - 1; i >= 0; i--) {
-      if (events[i].type === "system" && events[i].subtype === "compact_boundary") { start = i + 1; break; }
-    }
-    const onChain = activeChainUuids(events);
-    return computeContextStatsFromEvents(events.slice(start).filter((e) => !e.uuid || onChain.has(e.uuid))).totalTokens;
-  };
+  // The active chain only (from the last SDK compact boundary on): abandoned branches are not the conversation.
+  const fileEstimate = () => computeContextStatsFromEvents(activeChain(loadEvents(o.sdkSessionId, o.sdkSessionsDir))).totalTokens;
   const est0 = fileEstimate();
   const overhead = o.contextUsed && o.contextUsed > 0
     ? Math.min(Math.max(0, o.contextUsed - est0), Math.floor(window * 0.5))
@@ -450,10 +460,12 @@ export async function forceCompactSession(o: ForceCompactOptions): Promise<Force
     const range = {
       sdkSessionId: o.sdkSessionId,
       sdkSessionsDir: o.sdkSessionsDir,
-      fromIdx: stretch.fromConv,
-      toIdx: stretch.toConv,
-      expectedFirstUuid: stretch.firstUuid,
-      expectedLastUuid: stretch.lastUuid,
+      // By uuid: the stretch was chosen on the active chain, and positions
+      // among all records (abandoned branches included) would not match.
+      fromIdx: -1,
+      toIdx: -1,
+      fromUuid: stretch.firstUuid,
+      toUuid: stretch.lastUuid,
       transcriptPath: archivePath,
       blockTag: stretch.blockTag,
       dropUnparseable: false,

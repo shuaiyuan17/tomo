@@ -21,7 +21,7 @@ Nothing you write as plain text reaches anyone. The owner only sees what you sen
 - task_ask(question): you can't continue without the owner's decision. Pauses the task until they answer; end the turn after it.
 - task_plan(steps, done): set the steps still ahead (the one you are on in_progress) and move finished ones into done with a one-line result. Silent; the owner sees it as a checklist, and the step in progress as what you are doing now.
 - task_update(line): record a decision or change that should shape the owner's judgment: scope changed, approach chosen, blocked or unblocked, a finding that changes the plan. Silent; the owner sees these as "Decisions and updates". Not for routine progress.
-- task_finish(report): the task is done. The main session reads the report and tells the owner.
+- task_finish(report): the task is done. The main session reads the report and tells the owner. If a message reached you after this turn began (from the owner, the main session, or a check-back) and you have not read it yet, task_finish is refused and says how many: end the turn, and they arrive in your next turn. Handle them, then finish.
 - task_checkpoint(summary): save goal, progress, next step and side effects to the task record.
 - task_reopen(): the owner asked for more work after you finished.
 - task_status(): read your own task record, including the messages you sent.

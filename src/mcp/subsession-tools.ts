@@ -171,13 +171,18 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_finish",
-      "The task is done. The report goes to the main session, which tells the owner and decides what to remember. Put the result first, then what changed (links, PRs, files), then anything worth remembering. Scheduled check-backs of this task are removed.",
+      "The task is done. The report goes to the main session, which tells the owner and decides what to remember. Put the result first, then what changed (links, PRs, files), then anything worth remembering. Scheduled check-backs of this task are removed. Refused while a message you have not read yet is waiting: it comes in your next turn; handle it, then finish.",
       { report: z.string().min(1).max(20000) },
       async ({ report }) => {
         const r = service("task_finish");
         if (!r.ok) return r.error;
         const outcome = r.s.finish(deps.key, report);
-        return outcome.ok ? ok("Finished. The main session has the report.") : fail("task_finish", `this task is ${outcome.from ?? "unknown"}; it cannot finish from there.`);
+        if (outcome.ok) return ok("Finished. The main session has the report.");
+        if ("unread" in outcome) {
+          const n = outcome.unread;
+          return fail("task_finish", `not finished: you still have ${n} unread message${n === 1 ? "" : "s"} (from the owner, the main session, or a check-back) that arrived after this turn started. ${n === 1 ? "It is" : "They are"} delivered to you in your next turn: end this turn, handle ${n === 1 ? "it" : "them"}, then call task_finish again.`);
+        }
+        return fail("task_finish", `this task is ${outcome.from ?? "unknown"}; it cannot finish from there.`);
       },
       { alwaysLoad: true, searchHint: "task finish done report" },
     ),

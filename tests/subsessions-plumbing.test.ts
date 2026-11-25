@@ -133,6 +133,10 @@ describe("sub-session prompt", () => {
     expect(prompt).not.toContain("task_progress");
   });
 
+  it("says task_finish is refused while a message the task has not read is waiting", () => {
+    const prompt = buildSubsessionPrompt({ agentName: "Tomo", ownerName: "Shuai" });
+    expect(prompt).toMatch(/task_finish is refused[^\n]*next turn/);
+  });
 });
 
 describe("sub-session tools", () => {
@@ -198,6 +202,17 @@ describe("sub-session tools", () => {
     const svc = service();
     const tools = buildTaskOwnerTools({ service: () => svc, scope: () => undefined });
     expect((await call(tools, "task_spawn", { title: "x", brief: "y" })).isError).toBe(true);
+  });
+
+  it("task_finish refused for unread input says how many and that they come next turn", async () => {
+    const fake = { finish: () => ({ ok: false, from: "active", refused: "x", unread: 2 }) } as unknown as SubsessionService;
+    const self = buildTaskSelfTools({ service: () => fake, key: "task:s1" });
+    const out = await call(self as never, "task_finish", { report: "done" });
+    expect(out.isError).toBe(true);
+    expect(out.content[0].text).toMatch(/still have 2 unread messages[^]*next turn[^]*task_finish again/);
+    const illegal = { finish: () => ({ ok: false, from: "cancelled" }) } as unknown as SubsessionService;
+    const other = await call(buildTaskSelfTools({ service: () => illegal, key: "task:s1" }) as never, "task_finish", { report: "done" });
+    expect(other.content[0].text).toContain("this task is cancelled");
   });
 
   it("a task's own tools are bound to its key", async () => {

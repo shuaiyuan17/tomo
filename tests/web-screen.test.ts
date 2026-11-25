@@ -331,3 +331,4 @@ describe("floating window", () => {
     } finally { globalThis.fetch = original; }
   });
 });
+

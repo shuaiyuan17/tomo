@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
-import { CRON_RECHECK_MS, ENDED_KEEP_MS, EXTERNAL_WAIT_CHECK_MS, FINISHED_KEEP_MS, MAX_INTERRUPT_STREAK, REGISTRY_RECHECK_MS, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
+import { CRON_RECHECK_MS, ENDED_KEEP_MS, EXTERNAL_WAIT_CHECK_MS, FINISHED_KEEP_MS, MAX_FINISH_REFUSALS, MAX_INTERRUPT_STREAK, REGISTRY_RECHECK_MS, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { PENDING_INPUT_MAX, DONE_STEPS_KEEP, PLAN_MAX_STEPS, PLAN_STEP_MAX, UPDATES_KEEP, appendInput } from "../src/agent/subsessions/types.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 
@@ -1886,6 +1886,135 @@ describe("SubsessionService: a later task_finish keeps an unread report", () => 
     h2.notes = h.notes;
     h2.service.recoverAtStartup();
     expect(h2.store.get(t.id)?.status).toBe("finished");
+  });
+});
+
+describe("SubsessionService: task_finish never leaves input unread", () => {
+  it("refuses while input arrived during the turn; the task stays active and gets it next turn", async () => {
+    const results: unknown[] = [];
+    const h = harness({}, working((turn, hh) => {
+      if (hh.turns.length === 1) hh.service.relay("s1", "also do the docs");
+      results.push(hh.service.finish(turn.key, `report ${hh.turns.length}`));
+    }));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(results[0]).toMatchObject({ ok: false, unread: 1 });
+    // The refused turn's report never went out; the relay was its next turn.
+    expect(h.turns).toHaveLength(2);
+    expect(h.turns[1].prompt).toContain("also do the docs");
+    expect(results[1]).toMatchObject({ ok: true });
+    const done = h.store.get(t.id)!;
+    expect(done).toMatchObject({ status: "finished", report: "report 2", reportSeq: 1, pendingInput: [] });
+    expect(done.transitions.filter((x) => x.event === "finish")).toHaveLength(1);
+  });
+
+  it("the input the turn carries does not block it, nor does a finish outside a turn", async () => {
+    const h = harness({}, working((turn, hh) => {
+      if (turn.prompt.includes("finish up")) hh.service.finish(turn.key, "ok");
+      else hh.cron.set(turn.key, 1);
+    }));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.service.relay(t.id, "finish up");
+    await flush();
+    expect(h.store.get(t.id)).toMatchObject({ status: "finished", pendingInput: [] });
+    expect(h.turns).toHaveLength(2);
+    // No turn in flight (no task calls a tool there): nothing to refuse for.
+    const h2 = harness({}, () => new Promise(() => {}));
+    h2.service.recoverAtStartup();
+    const t2 = spawn(h2);
+    h2.store.transition(t2.id, "start");
+    h2.store.update(t2.id, (r) => { appendInput(r, "x"); });
+    expect(h2.service.finish(t2.sessionKey, "ok").ok).toBe(true);
+  });
+
+  it("retrying in the same turn stays refused; after MAX_FINISH_REFUSALS turns with unread input not going down it finishes and quotes it", async () => {
+    const results: Array<{ ok: boolean; unread?: number }> = [];
+    let n = 0;
+    const h = harness({}, working((turn, hh) => {
+      n += 1;
+      if (n > 4) return;
+      // More keeps arriving every turn, as fast as it is read.
+      hh.service.relay("s1", `relay ${n}`);
+      for (let i = 0; i < 3; i++) results.push(hh.service.finish(turn.key, `report ${n}`) as { ok: boolean; unread?: number });
+    }));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(MAX_FINISH_REFUSALS).toBe(3);
+    // Three turns refused (every retry in them too), the fourth goes through.
+    expect(results.slice(0, 9).every((r) => !r.ok && r.unread === 1)).toBe(true);
+    expect(results[9]).toMatchObject({ ok: true });
+    const rec = h.store.get(t.id)!;
+    expect(rec.report).toMatch(/^report 4\n\n\[Tomo: this task finished with 1 input it never read[^]*1\. relay 4/);
+    // Not dropped: a finished task still answers it (the turn after the finish).
+    expect(h.turns[4].prompt).toContain("relay 4");
+    expect(rec.status).toBe("finished");
+  });
+
+  it("refused turns count only in a row: a turn without a refusal starts the streak over", async () => {
+    const results: Array<{ ok: boolean }> = [];
+    // Turns 1-3 refused, turn 4 handles its input without finishing, then
+    // turns 5-7 are refused again: only the eighth may be forced through.
+    const h = harness({}, working((turn, hh) => {
+      const k = hh.turns.length;
+      if (k === 4) return;
+      if (k <= 8) hh.service.relay("s1", `r${k}`);
+      results.push(hh.service.finish(turn.key, "done") as { ok: boolean });
+    }));
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(results.map((r) => r.ok)).toEqual([false, false, false, false, false, false, true]);
+  });
+
+  it("a refused turn with less unread than the last does not count, and alternating cannot refuse forever", async () => {
+    const results: Array<{ ok: boolean }> = [];
+    // Unread per turn: 2, 1, 2, 1, 2 — counted 1, (not), 2, (not), 3; then forced.
+    const arrivals = [2, 1, 2, 1, 2, 1, 0];
+    const h = harness({}, working((turn, hh) => {
+      const k = hh.turns.length - 1;
+      for (let i = 0; i < arrivals[k]; i++) hh.service.relay("s1", `r${k}.${i}`);
+      results.push(hh.service.finish(turn.key, "done") as { ok: boolean });
+    }));
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(results.map((r) => r.ok)).toEqual([false, false, false, false, false, true]);
+  });
+
+  it("a retry in the same turn that sees more unread does not reset the streak next turn", async () => {
+    const results: Array<{ ok: boolean }> = [];
+    // Each turn: refused with 1 unread, one more lands, retried (2 unread).
+    const h = harness({}, working((turn, hh) => {
+      const k = hh.turns.length;
+      if (k > 4) return;
+      hh.service.relay("s1", `a${k}`);
+      results.push(hh.service.finish(turn.key, "done") as { ok: boolean });
+      if (k === 4) return;
+      hh.service.relay("s1", `b${k}`);
+      results.push(hh.service.finish(turn.key, "done") as { ok: boolean });
+    }));
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(results.map((r) => r.ok)).toEqual([false, false, false, false, false, false, true]);
+  });
+
+  it("once three refused turns in a row are done, the next finish goes through even if less is unread", async () => {
+    const results: Array<{ ok: boolean }> = [];
+    const arrivals = [2, 2, 2, 1, 0];
+    const h = harness({}, working((turn, hh) => {
+      const k = hh.turns.length - 1;
+      for (let i = 0; i < (arrivals[k] ?? 0); i++) hh.service.relay("s1", `r${k}.${i}`);
+      results.push(hh.service.finish(turn.key, "done") as { ok: boolean });
+    }));
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(results.slice(0, 4).map((r) => r.ok)).toEqual([false, false, false, true]);
   });
 });
 

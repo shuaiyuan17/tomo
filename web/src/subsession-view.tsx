@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
+import { COMPOSER_FIELD, COMPOSER_FORM, COMPOSER_SEND } from "./composer-frame.js";
 import { ArrowLeft, ArrowUp, Check, Circle, CircleDot, Paperclip } from "lucide-react";
 import type { WebSubsession, WebSubsessionDetail, WebSubsessionDoneStep, WebSubsessionPlanStep, WebSubsessionUpdate } from "../../src/web/protocol.js";
 import { cn } from "@/lib/utils";
@@ -273,15 +274,15 @@ function SubsessionComposer({ id, writable, ended, onSend }: { id: string; writa
   };
   return <div className="px-2.5 pt-1">
     {ended && <p role="status" className="m-0 mb-1.5 text-[11px] text-muted-foreground">{t("subsession.ended")}</p>}
-    <form onSubmit={submit} className="flex items-end gap-1 rounded-[16px] border bg-card p-1.5 shadow-xs transition-[border-color,box-shadow] focus-within:border-muted-foreground/50 focus-within:shadow-md">
+    <form onSubmit={submit} className={COMPOSER_FORM}>
       <label className="sr-only" htmlFor={`subsession-message-${id}`}>{t("subsession.label", { id })}</label>
       <Textarea ref={input} id={`subsession-message-${id}`} data-testid="subsession-input" value={draft} maxLength={16_000} rows={1} disabled={!writable}
         placeholder={t("subsession.placeholder", { id })}
-        className="max-h-40 min-h-8 flex-1 resize-none rounded-none border-0 bg-transparent! py-[5px] pr-2 pl-1.5 text-[13.5px] leading-relaxed shadow-none placeholder:text-muted-foreground focus-visible:ring-0 disabled:opacity-70 md:text-[13.5px]"
+        className={cn(COMPOSER_FIELD, "max-h-40 pr-2 text-[13.5px] disabled:opacity-70 md:text-[13.5px]")}
         onChange={(e) => setDraft(e.target.value)} onCompositionStart={() => ime.current.start()} onCompositionEnd={() => ime.current.end()}
         onKeyDown={(e) => { if (ime.current.shouldSubmit({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
       <Button type="submit" size="icon" aria-label={t("subsession.send", { id })} disabled={!canSend}
-        className="size-8 shrink-0 rounded-full transition-[background-color,transform] hover:bg-primary/85 active:scale-[0.94] disabled:bg-muted disabled:text-muted-foreground disabled:opacity-100 [&_svg:not([class*='size-'])]:size-4"><ArrowUp strokeWidth={2.2} /></Button>
+        className={cn(COMPOSER_SEND, "[&_svg:not([class*='size-'])]:size-4")}><ArrowUp strokeWidth={2.2} /></Button>
     </form>
   </div>;
 }

@@ -460,7 +460,7 @@ async function conversationSteps(page: Page, vp: Viewport, theme: Theme): Promis
   await s("conversation", "full", async (snap) => {
     await page.evaluate(() => {
       const el = document.querySelector<HTMLElement>("[aria-label='Conversation history']")!;
-      const shell = document.querySelector<HTMLElement>(".h-dvh");
+      const shell = document.querySelector<HTMLElement>("[data-app-shell]");
       if (shell) shell.style.height = "auto";
       el.style.overflow = "visible"; el.style.flex = "none";
     });

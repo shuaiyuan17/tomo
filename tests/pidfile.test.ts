@@ -285,6 +285,14 @@ describe("releasePidFile", () => {
     releasePidFile(pidFile, 4242);
     expect(readFileSync(pidFile, "utf-8")).toBe("999");
   });
+
+  it("is a no-op when the directory exists but the file is gone", () => {
+    // Unlike a missing directory, this one goes through the lock: the lock is
+    // taken and released, and nothing is left behind.
+    expect(existsSync(pidFile)).toBe(false);
+    expect(() => releasePidFile(pidFile, 4242)).not.toThrow();
+    expect(readdirSync(dir)).toEqual([]);
+  });
 });
 
 const FIXTURE = fileURLToPath(new URL("./fixtures/pidfile-race.ts", import.meta.url));

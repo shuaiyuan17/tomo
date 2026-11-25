@@ -649,5 +649,8 @@ describe("expired-session cleanup at construction", () => {
     // key adopt a shared legacy transcript, so the registry is left alone.
     expect(readFileSync(REGISTRY, "utf-8")).toBe(before);
     expect(existsSync(LEDGER)).toBe(false);
+    // The SDK file goes first, before the ledger write that failed: TTL'd data,
+    // not history, and the entry left behind names a file that is gone.
+    expect(existsSync(SDK_FILE)).toBe(false);
   });
 });

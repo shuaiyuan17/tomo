@@ -77,8 +77,8 @@ function registryOnDisk(): { sessions: { channelKey: string; sdkSessionId: strin
  * The registry lock wait is shortened from its 2 s default: the tests that
  * hold it on purpose only need to see the refusal, not wait it out.
  */
-function newSessionStore() {
-  return new SessionStore(dir, 20, join(dir, "sdk"), { lockTimeoutMs: { registry: 100 } });
+function newSessionStore(registryLockMs = 100) {
+  return new SessionStore(dir, 20, join(dir, "sdk"), { lockTimeoutMs: { registry: registryLockMs } });
 }
 
 /** Another (live) process inside its own registry read-modify-write. Returns its release. */
@@ -194,7 +194,10 @@ describe("registry writes under the advisory lock", () => {
 
 describe("registry hot path: no lock when nothing changes", () => {
   it("answers an unchanged reply target, title and participant without waiting for the lock", () => {
-    const store = newSessionStore();
+    // A lock wait longer than the per-call budget below, so even ONE call that
+    // slips onto the lock path fails, and fails at that call (not after
+    // sixty waits).
+    const store = newSessionStore(1_000);
     store.setSdkSessionId("telegram:-1", "sess-aaaa");
     store.setReplyTarget("telegram:-1", { channelName: "telegram", chatId: "-1" });
     store.setChatTitle("telegram:-1", "Ops");
@@ -202,15 +205,18 @@ describe("registry hot path: no lock when nothing changes", () => {
 
     const release = holdRegistryLockAsAnotherProcess();
     try {
-      const started = Date.now();
+      const calls: Array<[string, () => void]> = [
+        ["setReplyTarget", () => store.setReplyTarget("telegram:-1", { channelName: "telegram", chatId: "-1" })],
+        ["setChatTitle", () => store.setChatTitle("telegram:-1", "Ops")],
+        ["addParticipant", () => store.addParticipant("telegram:-1", "Ada", "u1")],
+      ];
       for (let i = 0; i < 20; i++) {
-        store.setReplyTarget("telegram:-1", { channelName: "telegram", chatId: "-1" });
-        store.setChatTitle("telegram:-1", "Ops");
-        store.addParticipant("telegram:-1", "Ada", "u1");
+        for (const [name, call] of calls) {
+          const started = Date.now();
+          call();
+          expect(Date.now() - started, `${name} #${i}`).toBeLessThan(500);
+        }
       }
-      // Sixty lock waits, even at this store's shortened 100 ms, would be six
-      // seconds; at the 2 s default, two minutes.
-      expect(Date.now() - started).toBeLessThan(1_000);
     } finally {
       release();
     }

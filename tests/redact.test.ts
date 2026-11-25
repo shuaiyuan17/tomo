@@ -472,14 +472,19 @@ describe("logger redaction", () => {
       const webToken = "tomo_web_" + "a".repeat(64);
       log.info(`Web UI: http://127.0.0.1:9465/?t=${webToken}`);
       log.info({ tool: "Read" }, webToken);
-      // 6. The short path ladder's own case.
+      // 6. The short path ladder's own cases: top level, nested, twice nested.
+      log.info({ token: TOKEN }, "top level");
       log.error({ channel: { name: "telegram", token: TOKEN } }, "redaction probe");
+      log.info({ config: { litellm: { apiKey: "sk-secret" } } }, "twice nested");
       // 7. Not everything named "key" is a credential.
       log.info({ key: "dm:alice", sessionKey: "dm:alice" }, "identifiers");
 
       const contents = readLog(file);
-      expect(contents).toContain("redaction probe");
-      expect(contents).toContain("[Redacted]");
+      // Each ladder line censors exactly its one field, and nothing else.
+      const ladder = contents.split("\n").filter((line) => /"msg":"(top level|redaction probe|twice nested)"/.test(line));
+      expect(ladder).toHaveLength(3);
+      expect(ladder.join("\n").match(/\[Redacted\]/g)).toHaveLength(3);
+      expect(contents).not.toContain("sk-secret");
       expect(contents).toContain('"key":"dm:alice"');
       expect(contents).toContain('"sessionKey":"dm:alice"');
       expect(contents).not.toContain(webToken);

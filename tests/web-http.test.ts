@@ -300,7 +300,8 @@ describe("local HTTP boundary", () => {
   });
   it("gates every private API including SSE, while keeping static assets public", async () => {
     for (const path of ["/api/v1/bootstrap", "/api/v1/sessions", `/api/v1/sessions/${bootstrap.ownerId}/messages`, `/api/v1/messages/${randomUUID()}`, "/api/v1/events",
-      `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/transcript`, `/api/v1/sessions/${bootstrap.ownerId}/tasks/b1/output`, "/api/v1/usage", "/api/v1/cost"]) {
+      `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/transcript`, `/api/v1/sessions/${bootstrap.ownerId}/tasks/b1/output`, "/api/v1/usage", "/api/v1/cost",
+      `/api/v1/uploads/${"a".repeat(32)}`]) {
       const result = await call(path, { headers: { cookie: undefined } });
       expect(result.status).toBe(401); expect(result.text).toBe('{"error":"authentication_required"}');
     }

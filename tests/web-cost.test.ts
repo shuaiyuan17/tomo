@@ -14,6 +14,7 @@ import { startWebService, type WebService } from "./helpers/web-http.js";
 let root: string;
 let usage: string;
 let web: WebService;
+let data: WebData;
 let now: number;
 const owner = { name: "owner", telegram: ["test-owner"], imessage: [] as string[] };
 const call = (path: string) => web.get(path);
@@ -39,7 +40,7 @@ beforeEach(async () => {
   store.touchSession("dm:owner");
   store.touchSession("telegram:-1"); store.setChatTitle("telegram:-1", "Test group");
   web = await startWebService({ now: () => now, assetsDir,
-    data: new WebData({ sessionsDir, sdkSessionsDir, owner, tomoHome: root, workspaceDir }),
+    data: data = new WebData({ sessionsDir, sdkSessionsDir, owner, tomoHome: root, workspaceDir }),
     rpc: async () => ({ snapshot: {}, replay: null }) });
 });
 afterEach(async () => { await web?.close(); rmSync(root, { recursive: true, force: true }); });
@@ -94,14 +95,30 @@ describe("GET /api/v1/cost", () => {
     }
   });
 
-  it("keeps its reader between requests: a row appended to the current month is in the next answer", async () => {
+  it("keeps one reader across requests, and a row appended to the current month is in the next answer", async () => {
     // The per-file cache itself is unit-tested ("LedgerReader cache" in usage-cost-report.test.ts);
-    // this is the web route holding one reader across requests.
+    // here: the route holds one reader (a new one per request would read every file again) and it stays fresh.
     writeFileSync(join(usage, "2026-11.ndjson"), [row("2026-11-14T10:00:00+09:00", 1), row("2026-11-14T11:00:00+09:00", 2)].map((r) => JSON.stringify(r)).join("\n") + "\n");
     const turns = async () => (JSON.parse((await call("/api/v1/cost?from=2026-11-14&to=2026-11-15")).text) as WebCost).totals.turns;
+    const reader = () => (data as unknown as { ledger?: object }).ledger;
+    expect(reader()).toBeUndefined();
     expect(await turns()).toBe(2);
+    const first = reader();
+    expect(first).toBeDefined();
     appendFileSync(join(usage, "2026-11.ndjson"), JSON.stringify(row("2026-11-15T09:00:00+09:00", 3)) + "\n");
     expect(await turns()).toBe(3);
+    expect(reader()).toBe(first);
+  });
+
+  it("refuses a request without the same-origin header, or with a forged cookie, before reading anything", async () => {
+    // No cookie at all: the 401 list in web-http.test.ts.
+    writeFileSync(join(usage, "2026-11.ndjson"), JSON.stringify(row("2026-11-14T10:00:00+09:00", 5, { trigger: "private words" })) + "\n");
+    const bare = await web.get("/api/v1/cost", { "x-tomo-request": undefined });
+    expect([bare.status, bare.text]).toEqual([403, '{"error":"same_origin_required"}']);
+    const forged = await web.get("/api/v1/cost", { cookie: `tomo_web=${"0".repeat(64)}.${now + 1000}.${"0".repeat(64)}` });
+    expect([forged.status, forged.text]).toEqual([401, '{"error":"authentication_required"}']);
+    expect((data as unknown as { ledger?: object }).ledger).toBeUndefined();
+    expect((await call("/api/v1/cost")).status).toBe(200);
   });
 });
 

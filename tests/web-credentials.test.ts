@@ -139,8 +139,14 @@ describe("the web UI's credential card, end to end", () => {
     await broker.request("x", "p", "dm:owner", WEB);
     await expect.poll(() => cardEvents().length).toBe(1);
     const { id } = cardEvents()[0]!;
-    for (const extra of [{ "x-tomo-csrf": "nope" }, { "x-tomo-epoch": randomUUID() }, { "x-tomo-epoch": undefined }, { origin: "http://evil.test" }, { cookie: undefined }]) {
-      expect((await answer(id, { value: FAKE }, extra)).status, JSON.stringify(extra)).toBeGreaterThanOrEqual(400);
+    for (const [extra, status, error] of [
+      [{ "x-tomo-csrf": "nope" }, 403, "invalid_csrf"],
+      [{ "x-tomo-epoch": randomUUID() }, 409, "epoch_changed"],
+      [{ "x-tomo-epoch": undefined }, 409, "epoch_changed"],
+      [{ origin: "http://evil.test" }, 403, "invalid_origin"],
+      [{ cookie: undefined }, 401, "authentication_required"],
+    ] as const) {
+      expect(await answer(id, { value: FAKE }, extra), JSON.stringify(extra)).toEqual({ status, body: JSON.stringify({ error }) });
     }
     // Refused in the web process, before the daemon, with a fixed code.
     expect(await answer(id, { value: FAKE, extra: 1 })).toEqual({ status: 400, body: JSON.stringify({ error: "invalid_credential" }) });

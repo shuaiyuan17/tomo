@@ -2,10 +2,10 @@ import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { EFFORT_LEVELS } from "../config.js";
 import type { SubsessionService } from "../agent/subsessions/service.js";
-import type { SubsessionRecord } from "../agent/subsessions/types.js";
+import { currentStep, DONE_STEPS_KEEP, oneLine, OPEN_STATUSES, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, STEP_RESULT_MAX, type SubsessionRecord } from "../agent/subsessions/types.js";
 
 /** The task_* tools a sub-session reports through (its own session only). */
-export const SUBSESSION_SELF_TOOL_NAMES = ["task_reply", "task_notify", "task_ask", "task_progress", "task_checkpoint", "task_finish", "task_reopen", "task_status"] as const;
+export const SUBSESSION_SELF_TOOL_NAMES = ["task_reply", "task_notify", "task_ask", "task_plan", "task_update", "task_checkpoint", "task_finish", "task_reopen", "task_status"] as const;
 /** The owning session's tools (the owner's DM only, for now). */
 export const SUBSESSION_OWNER_TOOL_NAMES = ["task_spawn", "task_status", "task_cancel", "task_message"] as const;
 /** Every task tool name, once: for the SDK's allowedTools. */
@@ -29,8 +29,9 @@ function statusLabel(r: SubsessionRecord, background: boolean): string {
 
 /** One line per task, for the owning session's list. */
 export function formatTaskLine(r: SubsessionRecord, now = Date.now(), background = false): string {
-  const progress = r.progress ? ` · ${r.progress}` : "";
-  return `${r.id} [${statusLabel(r, background)}] ${r.title}${progress} (active ${ago(r.lastActivityAt, now)})`;
+  const step = currentStep(r);
+  const onStep = step ? ` · ${step}` : "";
+  return `${r.id} [${statusLabel(r, background)}] ${r.title}${onStep} (active ${ago(r.lastActivityAt, now)})`;
 }
 
 /** The whole record, as the task or its owning session reads it. */
@@ -42,7 +43,20 @@ export function formatTaskDetail(r: SubsessionRecord, now = Date.now(), backgrou
     `Created ${ago(r.createdAt, now)}, last activity ${ago(r.lastActivityAt, now)}`,
   ];
   if (r.model) lines.push(`Model: ${r.model}`);
-  if (r.progress) lines.push(`Progress: ${r.progress}`);
+  if (r.plan?.length && OPEN_STATUSES.has(r.status)) {
+    lines.push("Plan (steps still ahead):");
+    for (const step of r.plan) lines.push(`- [${step.status === "in_progress" ? "in progress" : "not started"}] ${step.text}`);
+  }
+  const doneSteps = (r.doneSteps ?? []).slice(-5);
+  if (doneSteps.length > 0) {
+    lines.push("Steps done (newest last):");
+    for (const e of doneSteps) lines.push(`- ${new Date(e.at).toISOString()}: ${e.text}${e.result ? ` — ${e.result}` : ""}`);
+  }
+  const updates = (r.updates ?? []).slice(-5);
+  if (updates.length > 0) {
+    lines.push("Decisions and updates (newest last):");
+    for (const e of updates) lines.push(`- ${new Date(e.at).toISOString()}: ${e.kind === "plan" ? `Plan changed: ${e.text}` : e.text}`);
+  }
   if (r.checkpoint) lines.push("Checkpoint:", r.checkpoint);
   for (const e of r.earlierReports ?? []) lines.push(`Earlier report #${e.seq} (replaced by a later one before it was read):`, e.text);
   if (r.report) lines.push(r.reportSeq ? `Report #${r.reportSeq}:` : "Report:", r.report);
@@ -95,7 +109,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_notify",
-      "Send the owner a message from this task. Only for a result, a decision they must make, or something that blocks you; never for progress (use task_progress). The harness adds the [id · title] prefix. A MEDIA:/path line attaches a file.",
+      "Send the owner a message from this task. Only for a result, a decision they must make, or something that blocks you; never for progress (that is task_plan). The harness adds the [id · title] prefix. A MEDIA:/path line attaches a file.",
       { text: z.string().min(1).max(4000).describe("The message, in the owner's language, casual and concise. Lead with the point.") },
       async ({ text }) => {
         const r = service("task_notify");
@@ -106,15 +120,44 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
       { alwaysLoad: true, searchHint: "task notify owner message result decision blocked" },
     ),
     tool(
-      "task_progress",
-      "Update this task's one-line status. Silent: the owner sees it only when they look. Call it after each meaningful step.",
-      { line: z.string().min(1).max(300).describe("One line: where the task stands now.") },
-      async ({ line }) => {
-        const r = service("task_progress");
-        if (!r.ok) return r.error;
-        return r.s.progress(deps.key, line) ? ok("Progress saved.") : fail("task_progress", "no task record for this session.");
+      "task_plan",
+      "Set the steps still ahead, in order, replacing the plan before (an empty list clears it). Mark the one you are on in_progress (at most one). Move each step you just finished into `done`, with a one-line result (a step in `done` is not also kept ahead; to do it again, add it in a later call, in new words). Silent: the owner sees the plan and the finished steps when they look. Set it when you start, and keep it current. Give each step its own words (no two alike), keep them the same from call to call and add new steps at the end; to drop, reword or reorder a step still ahead, give `reason` (one line), which the owner sees under Decisions and updates.",
+      {
+        steps: z.array(z.object({
+          step: z.string().min(1).max(2000).describe(`One short line: what this step gets done (cut at ${PLAN_STEP_MAX} characters).`),
+          status: z.enum(["pending", "in_progress"]).optional().describe("in_progress for the step you are on; default pending."),
+        })).max(PLAN_MAX_STEPS).describe("The steps still ahead, in order. Not the finished ones."),
+        done: z.array(z.object({
+          step: z.string().min(1).max(2000).describe("The step, as it stood in the plan."),
+          result: z.string().max(2000).optional().describe(`One line: what came of it (cut at ${STEP_RESULT_MAX} characters).`),
+        })).max(DONE_STEPS_KEEP).optional().describe("Steps finished since the last task_plan call."),
+        reason: z.string().max(2000).optional().describe("Required when this drops, rewords or reorders a step still ahead: one line on why the plan changed."),
       },
-      { alwaysLoad: true, searchHint: "task progress status line" },
+      async ({ steps, done, reason }) => {
+        const r = service("task_plan");
+        if (!r.ok) return r.error;
+        if (steps.filter((s) => s.status === "in_progress").length > 1) return fail("task_plan", "at most one step can be in_progress.");
+        if (steps.some((s) => !oneLine(s.step, PLAN_STEP_MAX)) || (done ?? []).some((d) => !oneLine(d.step, PLAN_STEP_MAX))) return fail("task_plan", "a step is blank. Nothing was saved.");
+        const outcome = r.s.setPlan(deps.key, steps, done ?? [], reason);
+        if (outcome.ok) return ok("Plan saved.");
+        if (outcome.error === "duplicate_step") return fail("task_plan", "two steps read the same. Give each step its own words (for example \"Run the tests again\" for the second). Nothing was saved.");
+        return fail("task_plan", outcome.error === "reason_required"
+          ? "this drops, rewords or reorders a step still ahead. Give `reason` (one line on why the plan changed), or keep those steps as they were and add new ones at the end. Nothing was saved."
+          : "no task record for this session.");
+      },
+      { alwaysLoad: true, searchHint: "task plan steps checklist todo" },
+    ),
+    tool(
+      "task_update",
+      "Record a decision or a change the owner should know about: the scope changed, an approach was chosen (and why, briefly), you are blocked or unblocked, a finding that changes the plan. Kept with its time and shown to the owner as \"Decisions and updates\". Silent (not a message). Not for routine progress: that is task_plan.",
+      { line: z.string().min(1).max(2000).describe("One line: what was decided or what changed (cut at 300 characters).") },
+      async ({ line }) => {
+        const r = service("task_update");
+        if (!r.ok) return r.error;
+        if (!oneLine(line, PROGRESS_TEXT_MAX)) return fail("task_update", "the line is blank. Nothing was saved.");
+        return r.s.postUpdate(deps.key, line) ? ok("Update saved.") : fail("task_update", "no task record for this session.");
+      },
+      { alwaysLoad: true, searchHint: "task update decision change blocked scope" },
     ),
     tool(
       "task_checkpoint",
@@ -158,7 +201,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_status",
-      "Read this task's record: status, progress, checkpoint, and the messages it sent the owner.",
+      "Read this task's record: status, plan, steps done, decisions and updates, checkpoint, and the messages it sent the owner.",
       {},
       async () => {
         const r = service("task_status");

@@ -1,16 +1,16 @@
 import { useEffect, useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { COMPOSER_FIELD, COMPOSER_FORM, COMPOSER_SEND } from "./composer-frame.js";
-import { ArrowLeft, ArrowUp, Paperclip } from "lucide-react";
-import type { WebSubsession, WebSubsessionDetail } from "../../src/web/protocol.js";
+import { ArrowLeft, ArrowUp, Check, Circle, CircleDot, Paperclip } from "lucide-react";
+import type { WebSubsession, WebSubsessionDetail, WebSubsessionDoneStep, WebSubsessionPlanStep, WebSubsessionUpdate } from "../../src/web/protocol.js";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { api, ApiError } from "./api.js";
 import { Text } from "./markdown.js";
 import { ModelBadge } from "./model-badge.js";
-import { messageDateTime, messageTime } from "./message-meta.js";
+import { differentDay, messageDateTime, messageTime } from "./message-meta.js";
 import { createCompositionGuard } from "./compose-keys.js";
-import { canRetrySend, isOpenSubsession, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, isWorkingState, withListBackground, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
+import { canRetrySend, folded, planStepLook, showableTime, updateText, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, isWorkingState, withListBackground, type PendingSubsessionMessage, type SubsessionChatRow } from "./subsessions.js";
 import { i18n, useTranslation } from "./i18n/index.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
@@ -92,11 +92,80 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
       <p className="m-0 mt-0.5 tracking-[0.02em] text-[10px] text-muted-foreground [overflow-wrap:anywhere]" data-testid="subsession-state">
         {isWorkingState(state) ? <span className="shimmer">{subsessionStateLabel(shown)}</span> : <span className={cn(state === "waitingOwner" && "font-medium text-foreground/80")}>{subsessionStateLabel(shown)}</span>}
         {shown.waitingReason && state === "waitingOwner" ? <> · {shown.waitingReason}</> : null}</p>
-      {shown.progress && isOpenSubsession(shown) && <p className="m-0 mt-1.5 text-[12px] leading-snug text-muted-foreground [overflow-wrap:anywhere]"><span className="font-medium text-foreground/80">{t("now")}</span> {shown.progress}</p>}
+      {detail && (detail.plan?.length || detail.doneSteps?.length || detail.updates?.some((u) => updateText(u))) ? <div className="mt-2 flex max-h-[38vh] flex-col gap-2.5 overflow-y-auto pr-1 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]">
+        <Doing plan={detail.plan} done={detail.doneSteps} running={isWorkingState(state)} />
+        <Updates updates={detail.updates} />
+      </div> : null}
     </div>
     <Chat rows={rows} status={detail ? "ready" : status} id={id} onRetry={deliver} />
     {status === "gone" && detail && <p role="status" className="m-0 mx-2.5 mb-2 text-[11.5px] text-muted-foreground">{t("subsession.gone")}</p>}
     {send && <SubsessionComposer id={id} writable={writable} ended={!shown.writable} onSend={(text) => deliver({ requestId: crypto.randomUUID(), text, state: "sending" })} />}
+  </section>;
+}
+
+/** Done steps shown before "show earlier", and updates before "show all". */
+const DONE_SHOWN = 3;
+const UPDATES_SHOWN = 3;
+const sectionHeading = "m-0 mb-1 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase";
+const foldButton = "rounded px-0 text-[11px] text-muted-foreground transition-colors hover:text-foreground";
+
+/** Older than today: the date says when, as the time alone would not. */
+function When({ at }: { at: number }) {
+  if (!showableTime(at)) return null;
+  return <time dateTime={new Date(at).toISOString()} title={messageDateTime(at)} className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+    {differentDay(at, Date.now()) ? messageDateTime(at) : messageTime(at)}</time>;
+}
+
+/**
+ * "What it's doing": a checklist. The steps it finished (each with its
+ * result, the newest few unless asked for more), then the one it is on and
+ * those still ahead.
+ */
+function Doing({ plan, done, running }: { plan?: WebSubsessionPlanStep[]; done?: WebSubsessionDoneStep[]; running: boolean }) {
+  const { t } = useTranslation("tasks");
+  const [open, setOpen] = useState(false);
+  if (!plan?.length && !done?.length) return null;
+  const finished = folded(done ?? [], DONE_SHOWN, open, "end");
+  return <section aria-label={t("subsession.doing.heading")} data-testid="subsession-doing">
+    <p className={sectionHeading}>{t("subsession.doing.heading")}</p>
+    {finished.hidden > 0 || open && (done?.length ?? 0) > DONE_SHOWN ? <button type="button" aria-expanded={open} onClick={() => setOpen((v) => !v)} className={cn(foldButton, "mb-1")}>
+      {open ? t("subsession.doing.fewer") : t("subsession.doing.earlier", { count: finished.hidden })}</button> : null}
+    <ol className="m-0 flex list-none flex-col gap-1 p-0">
+      {finished.shown.map((step, i) => <li key={`d${i}`} data-step="done" className="flex items-start gap-1.5 text-[12px] leading-snug">
+        <Check aria-hidden="true" className="mt-[2px] size-3 shrink-0 text-foreground/70" />
+        <span className="sr-only">{t("subsession.doing.done")}: </span>
+        <span className="min-w-0 flex-1 text-foreground/80 [overflow-wrap:anywhere]">{step.text}{step.result ? <span className="text-muted-foreground"> · {step.result}</span> : null}</span>
+        <When at={step.at} />
+      </li>)}
+      {(plan ?? []).map((step, i) => { const look = planStepLook(step.status, running); return <li key={`p${i}`} data-step={step.status} data-look={look} className="flex items-start gap-1.5 text-[12px] leading-snug">
+        {look === "pending" ? <Circle aria-hidden="true" className="mt-[2px] size-3 shrink-0 text-muted-foreground/60" />
+          : <CircleDot aria-hidden="true" className={cn("mt-[2px] size-3 shrink-0", look === "running" ? "text-primary" : "text-muted-foreground")} />}
+        <span className="sr-only">{look === "pending" ? t("subsession.doing.pending") : t("subsession.doing.inProgress")}: </span>
+        <span className={cn("min-w-0 [overflow-wrap:anywhere]", look === "pending" ? "text-muted-foreground" : look === "running" ? "font-medium text-foreground/90" : "font-medium text-foreground/70")}>
+          {look === "running" ? <span className="shimmer">{step.text}</span> : step.text}</span>
+      </li>; })}
+    </ol>
+  </section>;
+}
+
+/** "Decisions and updates", newest first: what the task decided or what changed, with its milestones among them. */
+function Updates({ updates }: { updates?: WebSubsessionUpdate[] }) {
+  const { t } = useTranslation("tasks");
+  const [open, setOpen] = useState(false);
+  const lines = (updates ?? []).flatMap((entry) => { const text = updateText(entry); return text ? [{ entry, text }] : []; });
+  if (lines.length === 0) return null;
+  const view = folded(lines, UPDATES_SHOWN, open, "start");
+  return <section aria-label={t("subsession.updates.heading")} data-testid="subsession-updates">
+    <p className={sectionHeading}>{t("subsession.updates.heading")}</p>
+    <ol className="m-0 flex list-none flex-col gap-1 p-0">
+      {view.shown.map(({ entry, text }, i) => <li key={i} data-kind={entry.kind} className="flex items-start gap-1.5 text-[12px] leading-snug">
+        <span aria-hidden="true" className={cn("mx-[4px] mt-[6px] size-1 shrink-0 rounded-full", entry.kind === "milestone" ? "bg-muted-foreground/50" : "bg-primary/70")} />
+        <span className={cn("min-w-0 flex-1 [overflow-wrap:anywhere]", entry.kind === "milestone" ? "text-muted-foreground" : "text-foreground/85")}>{text}</span>
+        <When at={entry.at} />
+      </li>)}
+    </ol>
+    {view.hidden > 0 || open && lines.length > UPDATES_SHOWN ? <button type="button" aria-expanded={open} onClick={() => setOpen((v) => !v)} className={cn(foldButton, "mt-1")}>
+      {open ? t("subsession.updates.fewer") : t("subsession.updates.more", { count: lines.length })}</button> : null}
   </section>;
 }
 
@@ -134,7 +203,7 @@ function rowView(row: SubsessionChatRow, id: string, onRetry: (message: PendingS
 
 const meta = "mb-1 flex items-baseline gap-1.5 tracking-[0.02em] text-[10.5px] text-muted-foreground";
 const bubble = "markdown ml-auto w-fit max-w-[92%] rounded-2xl rounded-tr-md bg-secondary px-3 py-2 text-[13px]! leading-relaxed!";
-const Time = ({ at }: { at: number }) => <time dateTime={new Date(at).toISOString()} title={messageDateTime(at)} className="tabular-nums">{messageTime(at)}</time>;
+const Time = ({ at }: { at: number }) => !showableTime(at) ? null : <time dateTime={new Date(at).toISOString()} title={messageDateTime(at)} className="tabular-nums">{messageTime(at)}</time>;
 
 function OwnerBubble({ text, at, files }: { text: string; at: number; files?: number }) {
   const { t } = useTranslation("tasks");

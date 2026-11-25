@@ -67,6 +67,10 @@ export interface LcmConfig {
    *  cold-start with summaries only. N reuses `dailyFreshTail`. Default false
    *  (preserves the today-only behavior). */
   globalFreshTail: boolean;
+  /** Context-usage % at or above which a NEW background subagent (Agent tool)
+   *  is refused, so running ones can drain and a deferred compact can run.
+   *  0 or 100 turns it off. When set, must be >= nudgeAtPct. Default 80. */
+  blockSpawnAtPct: number;
 }
 
 export interface MetricsConfig {
@@ -574,6 +578,7 @@ const DEFAULT_LCM: LcmConfig = {
   groupCompactStyle: "lcm",
   dailyFreshTail: 32,
   globalFreshTail: false,
+  blockSpawnAtPct: 80,
 };
 
 /** An extra directory for a group: absolute or `~`-rooted, no `..` segment,
@@ -608,6 +613,7 @@ const lcmSchema = z.object({
   groupCompactStyle: z.enum(["sdk", "lcm"]).default(DEFAULT_LCM.groupCompactStyle),
   dailyFreshTail: z.coerce.number().int().min(0, "expected a non-negative integer").default(DEFAULT_LCM.dailyFreshTail),
   globalFreshTail: boolLike.default(DEFAULT_LCM.globalFreshTail),
+  blockSpawnAtPct: z.coerce.number().min(0).max(100, "expected a percentage in [0, 100]").optional(),
 }).transform((lcm, ctx) => {
   // An omitted reset derives from the (possibly custom) nudge threshold: the
   // stock 60 when that sits below it, else 10 points under the threshold.
@@ -618,7 +624,16 @@ const lcmSchema = z.object({
     ctx.addIssue({ code: "custom", path: ["nudgeResetPct"], message: "nudgeResetPct must be below nudgeAtPct" });
     return z.NEVER;
   }
-  return { ...lcm, nudgeResetPct };
+  // The spawn gate never shuts before the first nudge has had a chance to ask
+  // for housekeeping. An omitted value follows a custom nudge threshold that
+  // sits above the stock 80; an explicit one under it is a real error. 0 and
+  // 100 mean off and are always accepted.
+  const blockSpawnAtPct = lcm.blockSpawnAtPct ?? Math.max(DEFAULT_LCM.blockSpawnAtPct, lcm.nudgeAtPct);
+  if (blockSpawnAtPct > 0 && blockSpawnAtPct < 100 && blockSpawnAtPct < lcm.nudgeAtPct) {
+    ctx.addIssue({ code: "custom", path: ["blockSpawnAtPct"], message: "blockSpawnAtPct must be at least nudgeAtPct (or 0/100 to turn it off)" });
+    return z.NEVER;
+  }
+  return { ...lcm, nudgeResetPct, blockSpawnAtPct };
 });
 
 const DEFAULT_METRICS: MetricsConfig = {

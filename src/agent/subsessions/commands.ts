@@ -1,7 +1,7 @@
 import { joinText, type OwnerT, type OwnerText } from "../../i18n/index.js";
 import type { TaskAddress } from "./address.js";
 import type { SubsessionService } from "./service.js";
-import { TERMINAL_STATUSES, type SubsessionRecord } from "./types.js";
+import { currentStep, TERMINAL_STATUSES, type SubsessionRecord } from "./types.js";
 
 /** The newest tasks `/s` lists; older ones are counted. */
 const LIST_MAX = 12;
@@ -74,7 +74,8 @@ function statusWord(t: OwnerT<"subsessions">, r: SubsessionRecord, background = 
 
 function taskLine(t: OwnerT<"subsessions">, r: SubsessionRecord, background: boolean): OwnerText {
   const values = { id: r.id, title: r.title, status: statusWord(t, r, background) };
-  return r.progress ? t("cmd.lineProgress", { ...values, progress: r.progress }) : t("cmd.line", values);
+  const step = currentStep(r);
+  return step ? t("cmd.lineStep", { ...values, step }) : t("cmd.line", values);
 }
 
 function taskDetail(t: OwnerT<"subsessions">, r: SubsessionRecord, background: boolean): OwnerText {
@@ -83,7 +84,8 @@ function taskDetail(t: OwnerT<"subsessions">, r: SubsessionRecord, background: b
   if (r.status === "waiting" && r.waitingReason) {
     lines.push(background ? t("cmd.detailFallback", { reason: r.waitingReason }) : t("cmd.detailWaiting", { reason: r.waitingReason }));
   }
-  if (r.progress) lines.push(t("cmd.detailProgress", { progress: r.progress }));
+  const step = currentStep(r);
+  if (step) lines.push(t("cmd.detailStep", { step }));
   if (r.model) lines.push(t("cmd.detailModel", { model: r.model }));
   lines.push(t("cmd.detailHint", { id: r.id }));
   return joinText(lines);

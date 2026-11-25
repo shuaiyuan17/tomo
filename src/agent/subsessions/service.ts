@@ -19,7 +19,7 @@ import {
   formatMirrorNote,
   formatStartEvent,
 } from "./prompt.js";
-import { OPEN_STATUSES, PENDING_INPUT_MAX, TERMINAL_STATUSES, activeTotalMs, appendInput, lastInputSeq, type SubsessionConversationEntry, type SubsessionInput, type SubsessionRecord, type SubsessionStatus } from "./types.js";
+import { OPEN_STATUSES, PENDING_INPUT_MAX, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, STEP_RESULT_MAX, TERMINAL_STATUSES, oneLine, type SubsessionPlanStep, activeTotalMs, appendInput, lastInputSeq, type SubsessionConversationEntry, type SubsessionInput, type SubsessionRecord, type SubsessionStatus } from "./types.js";
 
 const OWNER_MESSAGE_MARKER = '<tomo-event type="subsession-owner-message"';
 
@@ -569,7 +569,7 @@ export class SubsessionService {
   }
 
   // ---------------------------------------------------------------------
-  // Task side (task_reply / task_notify / task_ask / task_progress / task_checkpoint / task_finish / task_reopen)
+  // Task side (task_reply / task_notify / task_ask / task_plan / task_update / task_checkpoint / task_finish / task_reopen)
   // ---------------------------------------------------------------------
 
   async notify(key: string, text: string): Promise<{ ok: boolean; error?: string }> {
@@ -689,13 +689,93 @@ export class SubsessionService {
     return result;
   }
 
-  progress(key: string, line: string): SubsessionRecord | undefined {
+  /**
+   * task_update: a decision or change the owner should know about (scope,
+   * approach, blocked or unblocked), kept with its time. The same line twice
+   * in a row is kept once. Counts as progress.
+   */
+  postUpdate(key: string, line: string): SubsessionRecord | undefined {
     const record = this.store.byKey(key);
     if (!record) return undefined;
-    const value = line.trim().split("\n")[0].slice(0, 300);
-    const updated = this.store.update(record.id, (r) => { r.progress = value; });
-    if (updated && value !== record.progress) this.progressChanged.add(record.id);
+    const value = oneLine(line, PROGRESS_TEXT_MAX);
+    if (!value) return record;
+    let changed = false;
+    const at = this.now();
+    const updated = this.store.update(record.id, (r) => {
+      const last = r.updates?.at(-1);
+      if (last && !last.kind && last.text === value) return;
+      (r.updates ??= []).push({ at, text: value });
+      changed = true;
+    });
+    if (updated && changed) this.progressChanged.add(record.id);
     return updated;
+  }
+
+  /**
+   * task_plan: replace the steps still ahead (empty clears the plan) and file
+   * the ones just done, each with its one-line result. A change to either
+   * counts as progress for the no-progress pause.
+   *
+   * Marking steps done, moving the status and adding steps at the end are
+   * free. Dropping, rewording or reordering a step still ahead needs a
+   * `reason`, filed as a plan-change update, so the owner sees why the
+   * checklist moved (refused with `reason_required` without one, and nothing
+   * is written). A reason given with any other change to the plan is filed
+   * the same way.
+   */
+  setPlan(key: string, steps: ReadonlyArray<{ step: string; status?: "pending" | "in_progress" }>, done: ReadonlyArray<{ step: string; result?: string }> = [], reason?: string): PlanOutcome {
+    const record = this.store.byKey(key);
+    if (!record) return { ok: false, error: "no_record" };
+    const finished = done.flatMap((d) => {
+      const text = oneLine(d.step, PLAN_STEP_MAX);
+      const result = d.result ? oneLine(d.result, STEP_RESULT_MAX) : "";
+      return text ? [{ text, ...(result ? { result } : {}) }] : [];
+    });
+    const finishedTexts = new Set(finished.map((f) => f.text));
+    const sent: SubsessionPlanStep[] = steps.flatMap((s): SubsessionPlanStep[] => {
+      const text = oneLine(s.step, PLAN_STEP_MAX);
+      return text ? [{ text, status: s.status === "in_progress" ? "in_progress" : "pending" }] : [];
+    });
+    // Every step ahead reads differently ("Run the tests again", not a second
+    // "Run the tests"): a step is known by its words, and with two alike a
+    // call that finishes one could not say which.
+    if (new Set(sent.map((step) => step.text)).size < sent.length) return { ok: false, error: "duplicate_step" };
+    // A step sent as done and still in `steps` is done: it is not also shown ahead.
+    const next = sent.filter((step) => !finishedTexts.has(step.text)).slice(0, PLAN_MAX_STEPS);
+    const why = reason ? oneLine(reason, PROGRESS_TEXT_MAX) : "";
+    let changed = false;
+    let refused = false;
+    const at = this.now();
+    // Checked inside the lock, against the plan on disk.
+    const updated = this.store.update(record.id, (r) => {
+      const planChanged = JSON.stringify(r.plan ?? []) !== JSON.stringify(next);
+      if (planChanged && !why && planNeedsReason(r.plan ?? [], next, [...finishedTexts])) { refused = true; return; }
+      const ahead = new Set((r.plan ?? []).map((step) => step.text));
+      if (planChanged) {
+        changed = true;
+        if (next.length > 0) r.plan = next;
+        else delete r.plan;
+      }
+      for (const step of finished) {
+        // A step that was still ahead is filed done, even one done before
+        // (it was added again). One that was not (a retried call, the whole
+        // done list sent again) is not filed twice: a new result for it
+        // replaces the one it had.
+        const filed = ahead.has(step.text) ? undefined : [...(r.doneSteps ?? [])].reverse().find((d) => d.text === step.text);
+        if (filed) {
+          if (step.result !== undefined && filed.result !== step.result) { filed.result = step.result; changed = true; }
+          continue;
+        }
+        (r.doneSteps ??= []).push({ at, ...step });
+        ahead.delete(step.text);
+        changed = true;
+      }
+      if (planChanged && why) (r.updates ??= []).push({ at, kind: "plan", text: why });
+    });
+    if (!updated) return { ok: false, error: "no_record" };
+    if (refused) return { ok: false, error: "reason_required" };
+    if (changed) this.progressChanged.add(record.id);
+    return { ok: true, record: updated };
   }
 
   checkpoint(key: string, summary: string): SubsessionRecord | undefined {
@@ -785,7 +865,11 @@ export class SubsessionService {
   // Agent hooks
   // ---------------------------------------------------------------------
 
-  /** A tool call finished on a task session. */
+  /**
+   * A tool call finished on a task session. Every tool call counts as the
+   * task doing something, task_plan and task_update included (even one that
+   * changed nothing): the no-progress pause is for turns that call no tool.
+   */
   noteToolUse(key: string): void {
     const record = this.safeByKey(key);
     if (!record) return;
@@ -2252,4 +2336,21 @@ export function taskPrefix(record: Pick<SubsessionRecord, "id" | "title">): stri
 
 function truncate(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}…`;
+}
+
+/** What task_plan did: saved, or refused because the change needs a reason (or the task has no record). */
+export type PlanOutcome = { ok: true; record: SubsessionRecord } | { ok: false; error: "no_record" | "reason_required" | "duplicate_step" };
+
+/**
+ * Whether replacing `before` with `after` drops, rewords or reorders a step
+ * still ahead. A step leaving the plan as one of `done` is not dropped, a
+ * status change is not a rewording, and new steps are free only after every
+ * step that stayed.
+ */
+export function planNeedsReason(before: readonly SubsessionPlanStep[], after: readonly SubsessionPlanStep[], done: readonly string[]): boolean {
+  const finished = new Set(done);
+  const kept = before.map((s) => s.text).filter((text) => !finished.has(text));
+  // The steps that stayed must open the new plan, in their order; anything after them is an addition.
+  if (after.length < kept.length) return true;
+  return kept.some((text, i) => after[i].text !== text);
 }

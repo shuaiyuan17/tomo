@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { activeSubsessions, canRetrySend, pendingFor, updatePending, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel, isWorkingState, subsessionsRefreshMs, SUBSESSIONS_BACKGROUND_REFRESH_MS, withListBackground } from "../web/src/subsessions.js";
+import { activeSubsessions, canRetrySend, folded, planStepLook, showableTime, updateText, pendingFor, updatePending, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel, isWorkingState, subsessionsRefreshMs, SUBSESSIONS_BACKGROUND_REFRESH_MS, withListBackground } from "../web/src/subsessions.js";
 import type { WebSubsession, WebSubsessionDetail } from "../src/web/protocol.js";
 
 const task = (extra: Partial<WebSubsession> = {}): WebSubsession => ({ id: "s1", title: "T", status: "active", working: false,
@@ -7,6 +7,26 @@ const task = (extra: Partial<WebSubsession> = {}): WebSubsession => ({ id: "s1",
 const detail = (extra: Partial<WebSubsessionDetail> = {}): WebSubsessionDetail => ({ ...task(), brief: "Do it.", conversation: [], ...extra });
 
 describe("sub-sessions in the Tasks rail", () => {
+  it("moves the step in progress only while the task is working, and holds it still while it waits", () => {
+    expect(planStepLook("in_progress", true)).toBe("running");
+    expect(planStepLook("in_progress", false)).toBe("paused");
+    expect(planStepLook("pending", true)).toBe("pending");
+    const waiting = (waitingOn: "owner" | "external") => isWorkingState(subsessionState({ status: "waiting", waitingOn, working: false }));
+    expect(planStepLook("in_progress", waiting("owner"))).toBe("paused");
+    expect(planStepLook("in_progress", waiting("external"))).toBe("paused");
+    expect(planStepLook("in_progress", isWorkingState(subsessionState({ status: "active", working: true })))).toBe("running");
+    // Waiting on something external while its own background work runs: that work is running, so it moves, as the header does.
+    expect(planStepLook("in_progress", isWorkingState(subsessionState({ status: "waiting", waitingOn: "external", working: false, background: true })))).toBe("running");
+    // Active between turns: no turn runs, so it holds still.
+    expect(planStepLook("in_progress", isWorkingState(subsessionState({ status: "active", working: false })))).toBe("paused");
+  });
+
+  it("shows a time only when a Date can hold it", () => {
+    expect(showableTime(Date.UTC(2026, 10, 25))).toBe(true);
+    expect(showableTime(1e20)).toBe(false);
+    expect(showableTime(Number.NaN)).toBe(false);
+  });
+
   it("says what a task is doing: working only with a turn running, and when it waits on the owner", () => {
     expect(subsessionState(task({ working: true }))).toBe("working");
     expect(subsessionState(task())).toBe("active");
@@ -44,6 +64,23 @@ describe("sub-sessions in the Tasks rail", () => {
     expect(subsessionState(shown)).toBe("waiting");
     expect(withListBackground(detail(), { ...summary, background: true }).background).toBe(true);
     expect(withListBackground(undefined, summary)).toEqual(summary);
+  });
+
+  it("words an update: the task's own line, or the milestone's name", () => {
+    expect(updateText({ at: 1, kind: "update", text: "Chose B" })).toBe("Chose B");
+    expect(updateText({ at: 1, kind: "update", text: "C was not needed", plan: true })).toBe("Plan changed: C was not needed");
+    expect(updateText({ at: 1, kind: "milestone", milestone: "waitingOwner" })).toBe("Waiting for you");
+    expect(updateText({ at: 1, kind: "milestone", milestone: "started" })).toBe("Started");
+    // A milestone this page does not know (a newer daemon) shows nothing rather than a raw key.
+    expect(updateText({ at: 1, kind: "milestone", milestone: "teleported" as never })).toBe("");
+  });
+
+  it("folds a long list to its newest few until asked", () => {
+    const items = [1, 2, 3, 4, 5];
+    expect(folded(items, 3, false, "end")).toEqual({ shown: [3, 4, 5], hidden: 2 });
+    expect(folded(items, 3, false, "start")).toEqual({ shown: [1, 2, 3], hidden: 2 });
+    expect(folded(items, 3, true, "end")).toEqual({ shown: items, hidden: 0 });
+    expect(folded([1, 2], 3, false, "end")).toEqual({ shown: [1, 2], hidden: 0 });
   });
 
   it("counts only running tasks on the Tasks button", () => {

@@ -398,11 +398,14 @@ describe("chat commands", () => {
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
     const sessions = (agent as unknown as { sessions: InstanceType<typeof SessionStore> }).sessions;
+    // The query mock's call history is not cleared between tests, so count
+    // from where this test starts.
+    const before = queryCallCount();
 
     await tg.simulateMessage(makeMsg({ chatId: "12345", text: "Hi" }));
     await drainQueue(agent);
     expect(sessions.getSdkSessionId("telegram:12345")).toBe("mock-sdk-session-123");
-    expect(queryCallCount()).toBe(1);
+    expect(queryCallCount()).toBe(before + 1);
     tg.clearDelivered();
 
     await tg.simulateCommand("new", "12345", "TestUser");
@@ -416,7 +419,7 @@ describe("chat commands", () => {
     // A second query() was built (the old session was closed), and it does
     // not resume the old conversation. Without the count, lastQueryOptions()
     // would read the FIRST call, which has no resume either.
-    expect(queryCallCount()).toBe(2);
+    expect(queryCallCount()).toBe(before + 2);
     expect(lastQueryOptions().resume).toBeUndefined();
 
     await agent.stop();

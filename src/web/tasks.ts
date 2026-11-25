@@ -216,8 +216,7 @@ export class TaskBoard {
     // An ended task whose work runs on counts as live here, so the cap never drops it before that work.
     const settled = settledTimes(next);
     const live = list.filter((task) => settled.get(task.taskId) === undefined).sort(capOrder(next));
-    const done = list.filter((task) => settled.get(task.taskId) !== undefined)
-      .sort((a, b) => settled.get(b.taskId)! - settled.get(a.taskId)!);
+    const done = list.filter((task) => settled.get(task.taskId) !== undefined).sort(settledOrder(next, settled));
     const kept = [...live, ...done].slice(0, MAX_SESSION_TASKS);
     this.remember(sessionId, list.filter((task) => task.endedAt !== undefined));
     if (kept.length) this.sessions.set(sessionId, new Map(kept.map((task) => [task.taskId, task])));
@@ -291,7 +290,7 @@ export class TaskBoard {
         const at = settled.get(id)!;
         const tasks = [...this.sessions.get(id)!.values()]
           .filter((task) => (at.get(task.taskId) !== undefined) === ended && task.ambient === ambient);
-        return { id, tasks: ended ? tasks.sort((a, b) => at.get(b.taskId)! - at.get(a.taskId)!) : tasks.sort(capOrder(this.sessions.get(id)!)) };
+        return { id, tasks: ended ? tasks.sort(settledOrder(this.sessions.get(id)!, at)) : tasks.sort(capOrder(this.sessions.get(id)!)) };
       });
       for (let round = 0; room > 0 && queues.some((q) => q.tasks.length > round); round++) {
         for (const queue of queues) {
@@ -340,8 +339,30 @@ export class TaskBoard {
  * rail can always trace it to its running work. Parent cycles are cut.
  */
 function capOrder(tasks: ReadonlyMap<string, WebTask>): (a: WebTask, b: WebTask) => number {
+  const depth = treeDepth(tasks);
+  return (a, b) => {
+    const ended = Number(a.endedAt !== undefined) - Number(b.endedAt !== undefined);
+    if (ended !== 0) return ended;
+    if (a.endedAt === undefined) return a.startedAt - b.startedAt;
+    return depth(b) - depth(a) || b.startedAt - a.startedAt;
+  };
+}
+
+/**
+ * Settled tasks in the order a cap keeps them: the most recently settled
+ * first; on a tie (a parent settles when its last descendant ends) the
+ * deeper one first, so a parent is never kept without the task that holds
+ * its later settled time.
+ */
+function settledOrder(tasks: ReadonlyMap<string, WebTask>, settled: ReadonlyMap<string, number | undefined>): (a: WebTask, b: WebTask) => number {
+  const depth = treeDepth(tasks);
+  return (a, b) => settled.get(b.taskId)! - settled.get(a.taskId)! || depth(b) - depth(a);
+}
+
+/** A task's depth in its session's task tree (listed ancestors only; parent cycles cut). */
+function treeDepth(tasks: ReadonlyMap<string, WebTask>): (task: WebTask) => number {
   const depths = new Map<string, number>();
-  const depth = (task: WebTask): number => {
+  return (task) => {
     const known = depths.get(task.taskId);
     if (known !== undefined) return known;
     let n = 0;
@@ -352,12 +373,6 @@ function capOrder(tasks: ReadonlyMap<string, WebTask>): (a: WebTask, b: WebTask)
     }
     depths.set(task.taskId, n);
     return n;
-  };
-  return (a, b) => {
-    const ended = Number(a.endedAt !== undefined) - Number(b.endedAt !== undefined);
-    if (ended !== 0) return ended;
-    if (a.endedAt === undefined) return a.startedAt - b.startedAt;
-    return depth(b) - depth(a) || b.startedAt - a.startedAt;
   };
 }
 

@@ -109,7 +109,7 @@ describe("TaskBoard", () => {
     b.apply("a", [task("p", { startedAt: 1_000 }), child, ...others]);
     b.apply("a", [child, ...others]);
     const shown = b.snapshot().map((t) => t.taskId);
-    expect(!shown.includes("p") || shown.includes("c")).toBe(true);
+    console.log(JSON.stringify(b.snapshot().filter((t) => !t.taskId.startsWith("r")))); expect(!shown.includes("p") || shown.includes("c")).toBe(true);
     expect(shown).not.toContain("p");
     b.dispose();
   });
@@ -137,6 +137,19 @@ describe("TaskBoard", () => {
     b.apply("a", [grandchild, ...others]);
     const shown = b.snapshot().map((t) => t.taskId);
     expect(shown).toContain("m");
+    expect(shown).not.toContain("p");
+    b.dispose();
+  });
+
+  it("past the cap, a parent that settled with its child is never kept without that child", () => {
+    vi.useFakeTimers({ now: 10_000 });
+    const { b } = board();
+    const others = Array.from({ length: MAX_SESSION_TASKS - 1 }, (_, i) => task(`r${i}`, { startedAt: 5_000 + i }));
+    b.apply("a", [task("p", { startedAt: 1_000 }), task("c", { parentTaskId: "p", startedAt: 2_000 }), ...others]);
+    // In one update the parent reports its end while still listed and its child leaves: both settle at the same moment.
+    b.apply("a", [task("p", { startedAt: 1_000, status: "completed" }), ...others]);
+    const shown = b.snapshot().map((t) => t.taskId);
+    expect(shown).toContain("c");
     expect(shown).not.toContain("p");
     b.dispose();
   });

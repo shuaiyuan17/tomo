@@ -133,7 +133,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
 /** A turn that makes progress (a tool call) and then does `then`. */
 function working(then?: (turn: Turn, h: Harness) => void): TurnHandler {
   return (turn, h) => {
-    h.service.noteToolUse(turn.key, "Bash");
+    h.service.noteToolUse(turn.key);
     then?.(turn, h);
     return { ok: true };
   };
@@ -166,7 +166,7 @@ describe("SubsessionService", () => {
     const gate = new Promise<void>((r) => { release = r; });
     const h = harness({ maxRunning: 1 }, async (turn, hh) => {
       if (turn.key === "task:s1") await gate;
-      hh.service.noteToolUse(turn.key, "Bash");
+      hh.service.noteToolUse(turn.key);
       hh.service.finish(turn.key, "ok");
       return { ok: true };
     });
@@ -262,7 +262,7 @@ describe("SubsessionService", () => {
     let n = 0;
     const h = harness({ maxRunning: 1 }, (turn, hh) => {
       n += 1;
-      if (n > 3) { hh.service.noteToolUse(turn.key, "Bash"); hh.service.finish(turn.key, "ok"); }
+      if (n > 3) { hh.service.noteToolUse(turn.key); hh.service.finish(turn.key, "ok"); }
       return { ok: true };
     });
     h.service.start();
@@ -291,7 +291,7 @@ describe("SubsessionService", () => {
     const h = harness({ maxContextTokens: 1000 }, (turn, hh) => {
       n += 1;
       if (turn.bare) { hh.context.set(turn.key, { used: 100, estimated: false }); return { ok: true }; }
-      hh.service.noteToolUse(turn.key, "Bash");
+      hh.service.noteToolUse(turn.key);
       if (n === 1) hh.context.set(turn.key, { used: 5000, estimated: false });
       else hh.service.finish(turn.key, "done");
       return { ok: true };
@@ -404,7 +404,7 @@ describe("SubsessionService", () => {
     let n = 0;
     const h = harness({}, async (turn, hh) => {
       n += 1;
-      if (n === 1) { hh.service.noteToolUse(turn.key, "Bash"); hh.store.transition("s1", "stuck"); return { ok: true }; }
+      if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
       // Answer the relay; the send may fail.
       await hh.service.notify(turn.key, `answer ${n}`);
       if (n >= 3) hh.service.finish(turn.key, "done");
@@ -1284,7 +1284,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     let n = 0;
     const h = harness({}, async (turn, hh) => {
       n += 1;
-      if (n === 1) { hh.service.noteToolUse(turn.key, "Bash"); hh.store.transition("s1", "stuck"); return { ok: true }; }
+      if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
       const sent = await hh.service.notify(turn.key, `answer ${n}`);
       if (n === 2) expect(sent.ok).toBe(false);
       if (n >= 3) hh.service.finish(turn.key, "done");
@@ -1310,7 +1310,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
         // No input carried: a failed send here is no lost answer.
         hh.sendFails = 1;
         await hh.service.notify(turn.key, "progress");
-        hh.service.noteToolUse(turn.key, "Bash");
+        hh.service.noteToolUse(turn.key);
         hh.store.transition("s1", "stuck");
         return { ok: true };
       }
@@ -1334,12 +1334,12 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     let n = 0;
     const h = harness({}, async (turn, hh) => {
       n += 1;
-      if (n === 1) { hh.service.noteToolUse(turn.key, "Bash"); hh.store.transition("s1", "stuck"); return { ok: true }; }
+      if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
       if (n === 2) {
         hh.sendFails = 1;
         expect((await hh.service.notify(turn.key, "the answer to your question")).ok).toBe(false);
         expect((await hh.service.notify(turn.key, "unrelated: tests are running")).ok).toBe(true);
-        hh.service.noteToolUse(turn.key, "Bash");
+        hh.service.noteToolUse(turn.key);
         return { ok: true };
       }
       await hh.service.notify(turn.key, "the answer to your question");
@@ -2137,6 +2137,44 @@ describe("progress, plan and updates", () => {
     expect(writes).toBe(1);
   });
 
+  it("refuses two steps that read the same, so a done step is never ambiguous", () => {
+    const h = idle();
+    const t = spawn(h);
+    const before = readFileSync(path, "utf8");
+    // Alike once trimmed and cut to one line, too.
+    for (const steps of [[{ step: "run tests" }, { step: "build" }, { step: "run tests" }], [{ step: "run tests" }, { step: " run tests\nnow" }]]) {
+      expect(h.service.setPlan(t.sessionKey, steps)).toEqual({ ok: false, error: "duplicate_step" });
+    }
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(h.store.get(t.id)!.plan).toBeUndefined();
+    // Steps that differ only past the length a step is cut at are alike too.
+    expect(h.service.setPlan(t.sessionKey, [{ step: `${"x".repeat(PLAN_STEP_MAX)}1` }, { step: `${"x".repeat(PLAN_STEP_MAX)}2` }])).toEqual({ ok: false, error: "duplicate_step" });
+    // Its own words for the second: saved, and finishing the first leaves the second.
+    h.service.setPlan(t.sessionKey, [{ step: "run tests", status: "in_progress" }, { step: "build" }, { step: "run tests again" }]);
+    const call = () => h.service.setPlan(t.sessionKey, [{ step: "build", status: "in_progress" }, { step: "run tests again" }], [{ step: "run tests" }]);
+    expect(call().ok).toBe(true);
+    // The same call again (a retry) changes nothing: the other step stays, nothing is filed twice.
+    expect(call().ok).toBe(true);
+    expect(h.store.get(t.id)!.plan?.map((s) => s.text)).toEqual(["build", "run tests again"]);
+    expect(h.store.get(t.id)!.doneSteps?.map((d) => d.text)).toEqual(["run tests"]);
+    // The same step twice in one done list is filed once.
+    expect(h.service.setPlan(t.sessionKey, [{ step: "run tests again" }], [{ step: "build" }, { step: "build" }]).ok).toBe(true);
+    expect(h.store.get(t.id)!.doneSteps?.map((d) => d.text)).toEqual(["run tests", "build"]);
+  });
+
+  it("reads a stored plan with two steps alike as one", () => {
+    const h = idle();
+    const t = spawn(h);
+    const table = JSON.parse(readFileSync(path, "utf8"));
+    table.tasks[0].plan = [{ text: "a", status: "in_progress" }, { text: "b" }, { text: "a" }];
+    writeFileSync(path, JSON.stringify(table));
+    expect(new SubsessionStore(path).get(t.id)!.plan).toEqual([{ text: "a", status: "in_progress" }, { text: "b", status: "pending" }]);
+    // The step in progress is kept in progress, whichever copy held it.
+    table.tasks[0].plan = [{ text: "a" }, { text: "b" }, { text: "a", status: "in_progress" }];
+    writeFileSync(path, JSON.stringify(table));
+    expect(new SubsessionStore(path).get(t.id)!.plan).toEqual([{ text: "a", status: "in_progress" }, { text: "b", status: "pending" }]);
+  });
+
   it("a refused plan files none of its done steps either", () => {
     const h = idle();
     const t = spawn(h);
@@ -2200,7 +2238,7 @@ describe("progress, plan and updates", () => {
     expect(h.service.setPlan(t.sessionKey, [], [{ step: "D" }]).ok).toBe(true);
   });
 
-  it("a changed plan or an update counts as progress; the same plan again does not", async () => {
+  it("a changed plan or an update counts as progress; the same plan again does not on its own", async () => {
     let n = 0;
     const h = harness({}, (turn, hh) => {
       n += 1;
@@ -2215,21 +2253,24 @@ describe("progress, plan and updates", () => {
     expect(h.store.get(t.id)?.status).toBe("finished");
     expect(h.store.get(t.id)?.updates?.map((u) => u.text)).toEqual(["decided 2", "decided 4", "decided 6"]);
 
-    // The tool call itself does not count either: only what task_plan changed does.
-    const same = harness({}, (turn, hh) => { hh.service.setPlan(turn.key, [{ step: "stuck" }]); hh.service.noteToolUse(turn.key, "mcp__tomo-internal__task_plan"); return { ok: true }; });
+    // Called here directly, with no tool call: the first turn set it
+    // (progress); the next three changed nothing.
+    const same = harness({}, (turn, hh) => { hh.service.setPlan(turn.key, [{ step: "stuck" }]); return { ok: true }; });
     same.service.start();
     const u = spawn(same);
     await flush();
-    // The first turn set it (progress); the next three changed nothing.
     expect(same.turns).toHaveLength(4);
     expect(same.store.get(u.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
 
-    // Any other tool call still counts, task_status included.
+    // Through the tool, the call itself counts as using a tool, as any tool
+    // call does: a task_plan or task_update that changed nothing never trips
+    // the pause.
     let calls = 0;
     const other = harness({}, (turn, hh) => {
       calls += 1;
       hh.service.setPlan(turn.key, [{ step: "stuck" }]);
-      hh.service.noteToolUse(turn.key, "mcp__tomo-internal__task_status");
+      hh.service.postUpdate(turn.key, "same line");
+      hh.service.noteToolUse(turn.key);
       if (calls > 5) hh.service.finish(turn.key, "ok");
       return { ok: true };
     });

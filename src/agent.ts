@@ -3009,7 +3009,7 @@ export class Agent {
     turn?: ReplyContext,
   ): void {
     this.restarts.handleToolResult(sessionKey, toolName, content, isError, turn);
-    if (isTaskSessionKey(sessionKey)) this.subsessions?.noteToolUse(sessionKey, toolName);
+    if (isTaskSessionKey(sessionKey)) this.subsessions?.noteToolUse(sessionKey);
   }
 
   /** End-of-turn restart fallback — see RestartCoordinator. */

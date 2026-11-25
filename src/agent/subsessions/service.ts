@@ -751,11 +751,16 @@ export class SubsessionService {
       return text ? [{ text, ...(result ? { result } : {}) }] : [];
     });
     const finishedTexts = new Set(finished.map((f) => f.text));
-    // A step sent as done and still in `steps` is done: it is not also shown ahead.
-    const next: SubsessionPlanStep[] = steps.flatMap((s): SubsessionPlanStep[] => {
+    const sent: SubsessionPlanStep[] = steps.flatMap((s): SubsessionPlanStep[] => {
       const text = oneLine(s.step, PLAN_STEP_MAX);
-      return text && !finishedTexts.has(text) ? [{ text, status: s.status === "in_progress" ? "in_progress" : "pending" }] : [];
-    }).slice(0, PLAN_MAX_STEPS);
+      return text ? [{ text, status: s.status === "in_progress" ? "in_progress" : "pending" }] : [];
+    });
+    // Every step ahead reads differently ("Run the tests again", not a second
+    // "Run the tests"): a step is known by its words, and with two alike a
+    // call that finishes one could not say which.
+    if (new Set(sent.map((step) => step.text)).size < sent.length) return { ok: false, error: "duplicate_step" };
+    // A step sent as done and still in `steps` is done: it is not also shown ahead.
+    const next = sent.filter((step) => !finishedTexts.has(step.text)).slice(0, PLAN_MAX_STEPS);
     const why = reason ? oneLine(reason, PROGRESS_TEXT_MAX) : "";
     let changed = false;
     let refused = false;
@@ -764,7 +769,7 @@ export class SubsessionService {
     const updated = this.store.update(record.id, (r) => {
       const planChanged = JSON.stringify(r.plan ?? []) !== JSON.stringify(next);
       if (planChanged && !why && planNeedsReason(r.plan ?? [], next, [...finishedTexts])) { refused = true; return; }
-      const ahead = new Set((r.plan ?? []).map((s) => s.text));
+      const ahead = new Set((r.plan ?? []).map((step) => step.text));
       if (planChanged) {
         changed = true;
         if (next.length > 0) r.plan = next;
@@ -883,14 +888,12 @@ export class SubsessionService {
   // Agent hooks
   // ---------------------------------------------------------------------
 
-  /** A tool call finished on a task session. */
   /**
-   * A tool call counts as progress, except task_plan and task_update: they
-   * count only when they changed something (progressChanged), so a refused
-   * or unchanged plan does not hold off the no-progress pause.
+   * A tool call finished on a task session. Every tool call counts as the
+   * task doing something, task_plan and task_update included (even one that
+   * changed nothing): the no-progress pause is for turns that call no tool.
    */
-  noteToolUse(key: string, toolName: string): void {
-    if (/(^|__)task_(plan|update)$/.test(toolName)) return;
+  noteToolUse(key: string): void {
     const record = this.safeByKey(key);
     if (!record) return;
     this.toolCalls.set(record.id, (this.toolCalls.get(record.id) ?? 0) + 1);
@@ -2339,7 +2342,7 @@ function truncate(text: string, max: number): string {
 }
 
 /** What task_plan did: saved, or refused because the change needs a reason (or the task has no record). */
-export type PlanOutcome = { ok: true; record: SubsessionRecord } | { ok: false; error: "no_record" | "reason_required" };
+export type PlanOutcome = { ok: true; record: SubsessionRecord } | { ok: false; error: "no_record" | "reason_required" | "duplicate_step" };
 
 /**
  * Whether replacing `before` with `after` drops, rewords or reorders a step

@@ -162,10 +162,10 @@ export class WebSupervisor implements WebLifecycle {
         execArgv: ["--max-old-space-size=256", ...(entry.endsWith(".ts") ? ["--import", "tsx"] : [])],
         // Do not give the HTTP process bot tokens, API keys, SDK hooks, or the
         // live daemon log destination through its inherited environment. HOME
-        // is passed on: it is no secret, and without it `homedir()` in the child
+        // (USERPROFILE on Windows) is passed on: it is no secret, and without it `homedir()` in the child
         // falls back to the account's home, not the one the daemon resolved its
         // paths against (a test run's temp home, for one).
-        env: { PATH: process.env.PATH, HOME: process.env.HOME, LANG: process.env.LANG, TZ: process.env.TZ, TOMO_LOG_INLINE: "1", TOMO_LOG_FILE: "" },
+        env: { PATH: process.env.PATH, HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, LANG: process.env.LANG, TZ: process.env.TZ, TOMO_LOG_INLINE: "1", TOMO_LOG_FILE: "" },
       });
     } catch {
       // fork() can throw synchronously (EAGAIN under process pressure). That

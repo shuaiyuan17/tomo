@@ -229,6 +229,19 @@ describe("end-of-turn restart fallback", () => {
     expect(discards).toEqual([{ reason: "missing", requestId: request.id, path }]);
   });
 
+  it("reports an expired request claimed elsewhere before it could be dropped as missing", () => {
+    const discards: string[] = [];
+    const request = createRestartRequest({ sessionKey: "dm:shuai", daemonPid: DAEMON, reason: "x" }, requestDir);
+    race.claimAfterRead = join(requestDir, `${request.id}.json`);
+    const expired = Date.parse(request.requestedAt) + RESTART_REQUEST_TTL_MS;
+
+    expect(
+      consumeRestartRequestFromToolResult(formatRestartRequestResult(request), "dm:shuai", requestDir, expired, (d) => discards.push(d.reason)),
+    ).toBeNull();
+    expect(race.claimAfterRead).toBeNull();
+    expect(discards).toEqual(["missing"]);
+  });
+
   it("does not call a malformed marker file missing", () => {
     const discards: string[] = [];
     const id = "11111111-2222-4333-8444-555555555555";

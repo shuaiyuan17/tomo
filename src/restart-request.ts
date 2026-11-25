@@ -405,7 +405,9 @@ export function consumeRestartRequestFromToolResult(
   // A marker that surfaces this late is not an acknowledgement of anything the
   // owner is still waiting on — drop the request rather than restart on it.
   if (isExpired(request, now)) {
-    discard(path, { reason: "expired", request }, onDiscard);
+    // Gone before we could drop it: claimed elsewhere, which is the news.
+    if (removeFile(path)) onDiscard?.({ path, reason: "expired", request });
+    else onDiscard?.({ path, reason: "missing", requestId: id });
     return null;
   }
   try {

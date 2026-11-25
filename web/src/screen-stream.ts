@@ -89,12 +89,15 @@ const COMPOSER_CLEARANCE = 168;
 export function windowHeight(width: number): number { return Math.round(width * 10 / 16) + TITLE_BAR; }
 
 /**
- * The window's CSS `top`: where it was put, but never lower than fits above
- * the iOS keyboard (`--app-height`, keyboard-viewport.ts), nor above the top.
- * The stored geometry is left as it was, so it comes back when the keyboard goes.
+ * The window's CSS `top` and `height`: where and how big it was made, but
+ * never past what is visible above the iOS keyboard (`--app-height`,
+ * keyboard-viewport.ts): it moves up first, and is cut down (the picture
+ * scales inside) only when the visible area is shorter than the window. The
+ * stored geometry is left as it was, so it comes back when the keyboard goes.
  */
-export function keptAboveKeyboard(top: number, height: number): string {
-  return `max(0px, min(${top}px, calc(var(--app-height, 100dvh) - ${height}px)))`;
+export function keptAboveKeyboard(top: number, height: number): { top: string; height: string } {
+  const visible = "var(--app-height, 100dvh)";
+  return { top: `max(0px, min(${top}px, calc(${visible} - ${height}px)))`, height: `min(${height}px, ${visible})` };
 }
 
 /** Width / position pulled back inside the viewport (and the size limits). */

@@ -210,6 +210,8 @@ describe("SessionStore", () => {
     store.updateStats("telegram:1", { costUsd: 1, inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 900, contextMax: 1000 });
     store.addOutsideUsage("telegram:1", { costUsd: 0.5, inputTokens: 150_000, outputTokens: 900, cacheReadTokens: 0, cacheCreationTokens: 0 });
     expect(store.getEntry("telegram:1")?.stats).toMatchObject({ totalCostUsd: 1.5, totalInputTokens: 150_010, totalQueries: 1, contextUsed: 900 });
+    // On disk, not only in this instance's cache.
+    expect(makeSessionStore(TEST_DIR).getEntry("telegram:1")?.stats).toMatchObject({ totalCostUsd: 1.5, totalInputTokens: 150_010 });
   });
 
   describe("usage baseline", () => {

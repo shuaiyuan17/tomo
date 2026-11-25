@@ -933,6 +933,7 @@ export class SessionStore {
       entry.stats.totalOutputTokens += u.outputTokens;
       entry.stats.totalCacheReadTokens += u.cacheReadTokens;
       entry.stats.totalCacheCreationTokens += u.cacheCreationTokens;
+      this.saveRegistryBestEffort("addOutsideUsage");
     });
   }
 

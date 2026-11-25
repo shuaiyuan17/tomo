@@ -225,7 +225,9 @@ function selectRunFrom(events: Ev[], boundary: number, from: number, tailStart: 
     const e = events[i];
     if (!isConv(e) || e.isCompactSummary || isToolResultTurn(e)) continue;
     let prev: Ev | undefined;
-    for (let j = i - 1; j >= boundary; j--) if (isConv(events[j])) { prev = events[j]; break; }
+    // The previous RAW event: a block between the two records of one split
+    // assistant message does not make the second one a turn start.
+    for (let j = i - 1; j >= boundary; j--) if (isConv(events[j]) && !events[j].isCompactSummary) { prev = events[j]; break; }
     if (e.type === "assistant" && prev?.type === "assistant" && !!e.message?.id && prev.message?.id === e.message.id) continue;
     start = i;
     break;

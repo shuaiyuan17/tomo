@@ -245,6 +245,18 @@ describe("selectOldestStretch", () => {
     expect(firstAt).toBeGreaterThan(2);
   });
 
+  it("never starts on the second record of a split assistant message, even with a block between the records", () => {
+    const b = build();
+    const events = fileEvents(b.sessionId);
+    const callAt = events.findIndex((e) => JSON.stringify(e.message?.content ?? "").includes("tool_use"));
+    const call = events[callAt];
+    const second = { ...call, uuid: randomUUID(), parentUuid: "blk", message: { ...call.message, content: [{ type: "tool_use", id: "toolu_b", name: "Bash", input: {} }] } };
+    const blk = { type: "user", uuid: "blk", isCompactSummary: true, blockTag: "weekly 2026-W47", timestamp: call.timestamp, message: { role: "user", content: "[weekly]" } };
+    const sliced = [call, blk, second, ...events.slice(callAt + 1)];
+    const s = selectOldestStretch(sliced, { freshTail: 4, maxInputTokens: 150_000 })!;
+    expect(s.firstUuid).not.toBe(second.uuid);
+  });
+
   it("starts on a turn boundary, never on a leftover tool result", () => {
     const b = build();
     const events = fileEvents(b.sessionId);

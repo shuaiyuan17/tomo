@@ -59,14 +59,15 @@ export const GONE_TTL_MS = 2 * UPLOAD_TTL_MS;
 /**
  * An upload id: when it was staged (48-bit ms, 12 hex) then 80 random bits —
  * still unguessable, and it dates itself, so an id of any age has a definite
- * answer: one staged longer ago than the TTL (or claiming a time it cannot
- * have, as ids from before this scheme do) is gone, record or no record.
+ * answer: one staged longer ago than the TTL is gone, record or no record.
+ * (The kept tray that asks is new with this scheme: no older id is ever asked about.)
  */
 function newUploadId(now: number): string {
   return Math.max(0, Math.floor(now)).toString(16).padStart(12, "0").slice(-12) + randomBytes(10).toString("hex");
 }
 function stagedAt(uploadId: string): number { return Number.parseInt(uploadId.slice(0, 12), 16); }
-const outlived = (uploadId: string, now: number) => { const at = stagedAt(uploadId); return !(at <= now + 60_000 && now - at <= UPLOAD_TTL_MS); };
+// Only the past settles it: a date ahead of this clock (the clock moved back) is no answer.
+const outlived = (uploadId: string, now: number) => now - stagedAt(uploadId) > UPLOAD_TTL_MS;
 const goneDir = (dir: string) => join(dirname(dir), `${basename(dir)}.gone`);
 function markGone(dir: string, uploadId: string): void {
   if (!UPLOAD_ID.test(uploadId)) return;

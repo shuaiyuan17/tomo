@@ -378,8 +378,8 @@ describe("peekUpload: gone only on the record of it", () => {
     // A server clock moved back after staging: the id looks future-dated, but the file is there — it is found, not gone.
     const ahead = stageUpload(dir, PNG, Date.now() + 3 * 60 * 60 * 1000).uploadId;
     expect(peekUpload(dir, ahead)?.kind).toBe("image");
-    // An id from before this scheme (all random) claims an impossible time: gone, not unsettled.
-    expect(peekUpload(dir, "f".repeat(32))).toBeUndefined();
+    // Dated ahead of this clock with no file: no answer (the clock may have moved back mid-claim) — unsettled, not gone.
+    expect(peekUpload(dir, "f".repeat(32))).toEqual({ kind: "unsettled" });
     // An id staged within the TTL with no file and no record: unsettled (mid-claim), kept by the page.
     const fresh = `${Date.now().toString(16).padStart(12, "0")}${"0".repeat(20)}`;
     expect(peekUpload(dir, fresh)).toEqual({ kind: "unsettled" });

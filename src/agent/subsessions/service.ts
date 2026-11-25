@@ -167,6 +167,13 @@ export const ENDED_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 const SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 /** A task parked while the cron store could not be read: how soon it is looked at again. */
 export const CRON_RECHECK_MS = 60_000;
+/**
+ * While Tomo runs, how often tasks waiting on their check-back are looked at:
+ * a job can go away mid-run (a one-shot disabled after an interrupt or after
+ * its retries ran out, a bad interval held disabled, a job removed by hand),
+ * and nothing else would wake the task before the next restart.
+ */
+export const EXTERNAL_WAIT_CHECK_MS = 5 * 60_000;
 export const MAX_INTERRUPT_STREAK = 3;
 export const MAX_TURNS_WITHOUT_PROGRESS = 3;
 export const MAX_FAIL_STREAK = 2;
@@ -250,6 +257,7 @@ export class SubsessionService {
   /** Reports whose note write failed: the note may sit in memory only. */
   private readonly unpersistedReports = new Set<string>();
   private cronRecheckTimer?: NodeJS.Timeout;
+  private externalWaitTimer?: NodeJS.Timeout;
   /**
    * Inputs a completed turn carried whose result could not be written: they
    * are still on the record, and the next turn in this process says they may
@@ -918,6 +926,12 @@ export class SubsessionService {
     }, "resume owed turns");
     this.sweepTimer = setInterval(() => this.safely(() => this.sweep(), "sweep"), SWEEP_INTERVAL_MS);
     this.sweepTimer.unref?.();
+    this.externalWaitTimer = setInterval(() => {
+      if (!this.open || this.deps.isStopping()) return;
+      this.safely(() => this.checkExternalWaits("while Tomo was running"), "check-back recheck");
+      this.safely(() => this.schedule(), "schedule after the check-back recheck");
+    }, EXTERNAL_WAIT_CHECK_MS);
+    this.externalWaitTimer.unref?.();
   }
 
   /** Run an outward effect now, or once start() has the channels up. */
@@ -951,6 +965,8 @@ export class SubsessionService {
     this.startsOwed.clear();
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     this.sweepTimer = undefined;
+    if (this.externalWaitTimer) clearInterval(this.externalWaitTimer);
+    this.externalWaitTimer = undefined;
     for (const timer of this.reportTimers.values()) clearTimeout(timer);
     this.reportTimers.clear();
     this.reportAttempts.clear();
@@ -1130,10 +1146,12 @@ export class SubsessionService {
 
   /**
    * A task waiting on its check-back whose job is gone (the cron store is
-   * not fsynced, or was unreadable when the task parked) would wait forever:
-   * let it run again and schedule a new one itself. A store that still
-   * cannot be read is looked at again shortly, in this process. Never
-   * schedules: the caller does, once it is safe to.
+   * not fsynced, was unreadable when the task parked, or the job was disabled
+   * or removed while Tomo ran) would wait forever: let it run again and
+   * schedule a new one itself. Runs after restart recovery and every
+   * EXTERNAL_WAIT_CHECK_MS while dispatch is open. A store that still cannot
+   * be read is looked at again shortly, in this process. Never schedules:
+   * the caller does, once it is safe to.
    */
   private checkExternalWaits(when: string): void {
     let unknown = false;
@@ -1145,7 +1163,7 @@ export class SubsessionService {
       this.transition(task.id, "cron_wake", {
         reason: `its check-back job was missing ${when}`,
         guard: inputQueueFull,
-        patch: (r) => { appendInput(r, formatTomoEvent("subsession-continue", "Your scheduled check-back is missing (lost in a restart, or never saved). Check on what you were waiting for, and schedule a new check-back if you still need to wait.")); },
+        patch: (r) => { appendInput(r, formatTomoEvent("subsession-continue", "Your scheduled check-back is missing (removed, disabled, lost in a restart, or never saved). Check on what you were waiting for, and schedule a new check-back if you still need to wait.")); },
       });
     }
     if (unknown) this.armCronRecheck();
@@ -1156,7 +1174,7 @@ export class SubsessionService {
     this.cronRecheckTimer = setTimeout(() => {
       this.cronRecheckTimer = undefined;
       this.safely(() => this.checkExternalWaits("once the cron store could be read again"), "cron recheck");
-      this.schedule();
+      this.safely(() => this.schedule(), "schedule after the cron recheck");
     }, CRON_RECHECK_MS);
     this.cronRecheckTimer.unref?.();
   }
@@ -1656,8 +1674,9 @@ export class SubsessionService {
     const jobs = this.deps.cronJobCount(record.sessionKey);
     if (jobs === undefined || jobs > 0) {
       // Unknown (the cron store cannot be read) parks it too: auto-continuing
-      // could spin on a check-back that exists. A fire, or the next start's
-      // reconcile once the store reads again, wakes it.
+      // could spin on a check-back that exists. A fire wakes it, or, once
+      // the store reads again and the job is gone, checkExternalWaits (the
+      // cron recheck, the periodic check, the next start).
       const waited = this.transition(id, "wait_external", {
         reason: jobs === undefined ? "waiting for its check-back (the cron store could not be read)" : "waiting for its scheduled check-back",
         expectFrom: ["active"],

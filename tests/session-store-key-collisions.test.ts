@@ -152,6 +152,29 @@ describe("transcriptFileStem", () => {
       expect(stem.includes(".")).toBe(stem !== legacyTranscriptFileStem(key));
     }
   });
+
+  it("is stable across calls and across stores for Unicode and emoji keys", () => {
+    // A stem that drifted between calls, or between daemon runs, would leave
+    // every existing transcript of the key unreachable. Pinned, because a
+    // changed derivation is the same loss: nothing migrates suffixed stems.
+    const pinned: Array<[string, string]> = [
+      ["dm:ünïcode", "dm__n_code.51993b8f8a99"],
+      ["dm:emoji-🐈", "dm_emoji-__.9e5aa115597d"],
+      [ALEX_DOT, "imessage_any_-_alex_smith_example_com.a47bab332bcb"],
+    ];
+    const writer = newStore();
+    for (const [key, stem] of pinned) {
+      expect(transcriptFileStem(key), key).toBe(stem);
+      expect(transcriptFileStem(key), key).toBe(transcriptFileStem(key));
+      writer.append(key, msg(`hello from ${key}`));
+      expect(existsSync(join(testDir, `${stem}.jsonl`)), key).toBe(true);
+    }
+    const reader = newStore();
+    for (const [key] of pinned) {
+      expect(reader.get(key).messages.map((m) => m.content), key).toEqual([`hello from ${key}`]);
+      expect(reader.searchTranscript(key, { query: "hello" }), key).toHaveLength(1);
+    }
+  });
 });
 
 describe("transcript isolation between colliding keys", () => {

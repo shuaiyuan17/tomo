@@ -16,10 +16,17 @@ const {
   MAX_MIME_LENGTH,
   sanitizeAttachmentFilename,
   saveInboundFile,
+  MAX_FILE_BYTES,
 } = await import("../src/channels/fileStore.js");
+const { MAX_DOCUMENT_BYTES } = await import("../src/channels/documentStore.js");
 
-// MAX_FILE_BYTES is MAX_DOCUMENT_BYTES by definition (fileStore.ts); the limit
-// a person is told is pinned by "reports an oversize file as arrived-but-unsaved".
+describe("MAX_FILE_BYTES", () => {
+  it("is the document cap, to the byte", () => {
+    // MAX_DOCUMENT_BYTES itself is pinned in documentStore.test.ts; the limit
+    // a person is told is pinned by "reports an oversize file as arrived-but-unsaved".
+    expect(MAX_FILE_BYTES).toBe(MAX_DOCUMENT_BYTES);
+  });
+});
 
 describe("sanitizeAttachmentFilename", () => {
   it("caps a long sanitised name", () => {

@@ -16,6 +16,7 @@ import {
   nextPollingBackoff,
   TELEGRAM_ALLOWED_UPDATES,
 } from "../src/channels/telegram.js";
+import { ALICE, BOT_INFO, offlineTelegram, messageUpdate, receivedBy, startOffline } from "./helpers/fake-telegram.js";
 
 // A REAL file for the photo sends: the channel refuses a path that does not
 // exist before it ever reaches grammY (a definite pre-flight failure the
@@ -26,40 +27,21 @@ writeFileSync(PIC, "not really a png");
 afterAll(() => rmSync(PIC_DIR, { recursive: true, force: true }));
 
 describe("cleanMention", () => {
-  it("strips bot mention from text", () => {
-    expect(cleanMention("@mybot hello", "mybot")).toBe("hello");
-  });
-
-  it("strips mention case-insensitively", () => {
-    expect(cleanMention("@MyBot hello", "mybot")).toBe("hello");
-  });
-
-  it("strips mention from middle of text", () => {
-    expect(cleanMention("hey @mybot what's up", "mybot")).toBe("hey  what's up");
-  });
-
-  it("returns text unchanged when no botUsername", () => {
-    expect(cleanMention("@mybot hello", undefined)).toBe("@mybot hello");
-  });
-
-  it("returns text unchanged when no mention present", () => {
-    expect(cleanMention("hello world", "mybot")).toBe("hello world");
-  });
-
-  it("strips multiple mentions", () => {
-    expect(cleanMention("@mybot hey @mybot", "mybot")).toBe("hey");
-  });
-
-  it("treats regex metacharacters in the username literally", () => {
+  it.each([
+    ["strips bot mention from text", "@mybot hello", "mybot", "hello"],
+    ["strips mention case-insensitively", "@MyBot hello", "mybot", "hello"],
+    ["strips mention from middle of text", "hey @mybot what's up", "mybot", "hey  what's up"],
+    ["returns text unchanged when no botUsername", "@mybot hello", undefined, "@mybot hello"],
+    ["returns text unchanged when no mention present", "hello world", "mybot", "hello world"],
+    ["strips multiple mentions", "@mybot hey @mybot", "mybot", "hey"],
     // Telegram usernames are [A-Za-z0-9_], but the RegExp must not break or
     // over-match if that ever changes.
-    expect(cleanMention("@my.bot hello", "my.bot")).toBe("hello");
-    expect(cleanMention("@myXbot hello", "my.bot")).toBe("@myXbot hello");
-  });
-
-  it("does not strip a longer username that starts with the bot's name", () => {
-    expect(cleanMention("@mybot_backup hello", "mybot")).toBe("@mybot_backup hello");
-    expect(cleanMention("@mybot2 hello", "mybot")).toBe("@mybot2 hello");
+    ["treats regex metacharacters in the username literally", "@my.bot hello", "my.bot", "hello"],
+    ["does not let a metacharacter match another character", "@myXbot hello", "my.bot", "@myXbot hello"],
+    ["does not strip a longer username that starts with the bot's name", "@mybot_backup hello", "mybot", "@mybot_backup hello"],
+    ["does not strip a username that extends the bot's name with a digit", "@mybot2 hello", "mybot", "@mybot2 hello"],
+  ])("%s", (_, text, username, expected) => {
+    expect(cleanMention(text, username)).toBe(expected);
   });
 });
 
@@ -70,77 +52,84 @@ describe("mentionRegex", () => {
     expect(mentionRegex("mybot", "i").test("@mybot")).toBe(true);
   });
 
-  it("does not match longer usernames sharing the bot's prefix", () => {
-    expect(mentionRegex("mybot", "i").test("hey @mybot_backup")).toBe(false);
-    expect(mentionRegex("mybot", "i").test("hey @mybot2")).toBe(false);
-  });
 });
 
 /**
  * Drive the REAL `message:*` handlers and return what the agent receives.
- * `bot.handleUpdate` needs `botInfo` (normally from `getMe`); setting it
- * directly keeps this offline. Text and sticker updates make no API calls.
+ * Text, sticker and unsupported-document updates make no API calls, so
+ * nothing but the bot's identity has to be faked, and the assertions land on
+ * what the public `onMessage` registration receives.
  */
-async function dispatchedFor(message: Record<string, unknown>): Promise<IncomingMessage> {
-  const channel = new TelegramChannel("123456:TEST-TOKEN");
-  const bot = (channel as unknown as {
-    bot: { botInfo: unknown; handleUpdate: (u: unknown) => Promise<void> };
-  }).bot;
-  bot.botInfo = {
-    id: 123456, is_bot: true, first_name: "Tomo", username: "tomobot",
-    can_join_groups: true, can_read_all_group_messages: false,
-    supports_inline_queries: false, can_connect_to_business_account: false,
-    has_main_web_app: false,
-  };
-  const received: IncomingMessage[] = [];
-  channel.onMessage(async (msg) => { received.push(msg); return true; });
-  await bot.handleUpdate({
-    update_id: 1,
-    message: {
-      message_id: 5,
-      date: 1_700_000_000,
-      chat: { id: 42, type: "private" },
-      from: { id: 7, is_bot: false, first_name: "Alice" },
-      ...message,
-    },
-  });
+async function dispatched(message: Record<string, unknown>): Promise<IncomingMessage> {
+  const { channel, bot } = offlineTelegram();
+  const received = receivedBy(channel);
+  await bot.handleUpdate(messageUpdate(message));
   expect(received).toHaveLength(1);
   return received[0];
 }
 
 describe("sender name", () => {
-  it("returns first name only", async () => {
-    const msg = await dispatchedFor({ text: "hi", from: { id: 7, is_bot: false, first_name: "John" } });
-    expect(msg.senderName).toBe("John");
+  it.each([
+    ["returns first name only", { first_name: "John" }, "John"],
+    ["combines first and last name", { first_name: "John", last_name: "Doe" }, "John Doe"],
+    ["handles empty last name", { first_name: "Alice", last_name: "" }, "Alice"],
+  ])("%s", async (_, name, expected) => {
+    const msg = await dispatched({ text: "hi", from: { id: 7, is_bot: false, ...name } });
+    expect(msg.senderName).toBe(expected);
     expect(msg.senderId).toBe("7");
-  });
-
-  it("combines first and last name", async () => {
-    const msg = await dispatchedFor({ text: "hi", from: { id: 7, is_bot: false, first_name: "John", last_name: "Doe" } });
-    expect(msg.senderName).toBe("John Doe");
-  });
-
-  it("handles empty last name", async () => {
-    const msg = await dispatchedFor({ text: "hi", from: { id: 7, is_bot: false, first_name: "Alice", last_name: "" } });
-    expect(msg.senderName).toBe("Alice");
   });
 });
 
 describe("group chat detection", () => {
   it("detects group and supergroup, with the chat title", async () => {
     for (const type of ["group", "supergroup"]) {
-      const msg = await dispatchedFor({ text: "hi", chat: { id: -100, type, title: "Crew" } });
+      const msg = await dispatched({ text: "hi", chat: { id: -100, type, title: "Crew" } });
       expect(msg.isGroup).toBe(true);
       expect(msg.chatTitle).toBe("Crew");
     }
   });
 
   it("rejects private chat and channel", async () => {
-    const dm = await dispatchedFor({ text: "hi" });
+    const dm = await dispatched({ text: "hi" });
     expect(dm.isGroup).toBe(false);
     expect(dm.chatTitle).toBeUndefined();
-    const channelPost = await dispatchedFor({ text: "hi", chat: { id: -200, type: "channel", title: "News" } });
+    const channelPost = await dispatched({ text: "hi", chat: { id: -200, type: "channel", title: "News" } });
     expect(channelPost.isGroup).toBe(false);
+  });
+});
+
+// Whether a group message mentions the bot decides whether it answers in that
+// group at all. Three ways in: a reply to one of the bot's messages, an
+// @mention in the text, or an @mention in a caption. The username is only
+// known after start() has loaded the bot's identity.
+describe("group mention detection", () => {
+  const GROUP = { id: -100, type: "supergroup", title: "Crew" };
+  const fromBot = { message_id: 3, date: 1_699_999_000, chat: GROUP, from: { id: BOT_INFO.id, is_bot: true, first_name: "Tomo" }, text: "earlier" };
+  const fromAlice = { ...fromBot, from: ALICE };
+  const unsupportedDoc = { file_id: "f", file_unique_id: "u", file_name: "a.zip", mime_type: "application/zip" };
+
+  it.each<[string, Record<string, unknown>, boolean]>([
+    ["a reply to the bot", { text: "thanks", reply_to_message: fromBot }, true],
+    ["a reply to someone else", { text: "thanks", reply_to_message: fromAlice }, false],
+    ["@bot in the text", { text: "hey @tomobot what's up" }, true],
+    ["@BOT in the text, any case", { text: "@TomoBot ping" }, true],
+    ["@bot in a caption", { caption: "@tomobot look", document: unsupportedDoc }, true],
+    ["a longer username sharing the bot's prefix", { text: "@tomobot_backup hi" }, false],
+    ["no mention at all", { text: "hello all" }, false],
+  ])("%s → isMentioned %s", async (_, message, mentioned) => {
+    const { channel, bot } = offlineTelegram();
+    await startOffline(channel, bot);
+    const received = receivedBy(channel);
+    await bot.handleUpdate(messageUpdate({ chat: GROUP, ...message }));
+    expect(received).toHaveLength(1);
+    expect(received[0].isMentioned).toBe(mentioned);
+  });
+
+  it("is never mentioned before the bot knows its own username", async () => {
+    const { channel, bot } = offlineTelegram(); // not started: no username
+    const received = receivedBy(channel);
+    await bot.handleUpdate(messageUpdate({ chat: GROUP, text: "@tomobot hi" }));
+    expect(received[0].isMentioned).toBe(false);
   });
 });
 
@@ -153,12 +142,12 @@ describe("sticker description", () => {
   });
 
   it("includes file_id and resend instruction", async () => {
-    const msg = await dispatchedFor(sticker({ type: undefined }));
+    const msg = await dispatched(sticker({ type: undefined }));
     expect(msg.text).toBe("[Sent a Telegram sticker: file_id=CAAC123; resend=STICKER:CAAC123]");
   });
 
   it("includes optional sticker metadata", async () => {
-    const msg = await dispatchedFor(sticker({
+    const msg = await dispatched(sticker({
       file_id: "CAAC456",
       emoji: "😂",
       set_name: "funny_pack",
@@ -175,11 +164,10 @@ describe("sticker description", () => {
 // separate chunked message instead.
 describe("TelegramChannel.send photo captions", () => {
   function makeChannel() {
-    const channel = new TelegramChannel("000000:test-token");
     const photos: Array<{ chatId: string; caption?: string }> = [];
     const messages: Array<{ chatId: string; text: string }> = [];
     let nextId = 100;
-    (channel as unknown as { bot: { api: unknown } }).bot.api = {
+    const { channel } = offlineTelegram({ api: {
       sendPhoto: async (chatId: string | number, _file: unknown, opts?: { caption?: string }) => {
         photos.push({ chatId: String(chatId), caption: opts?.caption });
         return { message_id: nextId++ };
@@ -188,7 +176,7 @@ describe("TelegramChannel.send photo captions", () => {
         messages.push({ chatId: String(chatId), text });
         return { message_id: nextId++ };
       },
-    };
+    } });
     return { channel, photos, messages };
   }
 
@@ -237,11 +225,10 @@ describe("TelegramChannel.send photo captions", () => {
  */
 describe("TelegramChannel.send threads photos and stickers", () => {
   function makeChannel() {
-    const channel = new TelegramChannel("000000:test-token");
     type Opts = { caption?: string; reply_parameters?: { message_id: number; allow_sending_without_reply?: boolean } };
     const calls: Array<{ kind: string; replyToId?: number; caption?: string; withoutReply?: boolean }> = [];
     let nextId = 100;
-    (channel as unknown as { bot: { api: unknown } }).bot.api = {
+    const { channel } = offlineTelegram({ api: {
       sendPhoto: async (_chatId: string | number, _file: unknown, opts?: Opts) => {
         calls.push({ kind: "photo", replyToId: opts?.reply_parameters?.message_id, caption: opts?.caption, withoutReply: opts?.reply_parameters?.allow_sending_without_reply });
         return { message_id: nextId++ };
@@ -254,7 +241,7 @@ describe("TelegramChannel.send threads photos and stickers", () => {
         calls.push({ kind: "text", replyToId: opts?.reply_parameters?.message_id, withoutReply: opts?.reply_parameters?.allow_sending_without_reply });
         return { message_id: nextId++ };
       },
-    };
+    } });
     return { channel, calls };
   }
 
@@ -302,7 +289,6 @@ describe("TelegramChannel.send threads photos and stickers", () => {
 // messages) so edit_message/unsend_message can target them later.
 describe("TelegramChannel recent messages and edit/unsend", () => {
   function makeChannel() {
-    const channel = new TelegramChannel("000000:test-token");
     const sent: Array<{ chatId: string; text: string }> = [];
     const edited: Array<{ chatId: string; messageId: number; text: string; parseMode?: string }> = [];
     const deleted: Array<{ chatId: string; messageId: number }> = [];
@@ -329,7 +315,7 @@ describe("TelegramChannel recent messages and edit/unsend", () => {
         return true;
       },
     };
-    (channel as unknown as { bot: { api: unknown } }).bot.api = api;
+    const { channel } = offlineTelegram({ api });
     return { channel, api, sent, edited, editedCaptions, deleted };
   }
 
@@ -494,19 +480,6 @@ describe("TelegramChannel recent messages and edit/unsend", () => {
     await expect(channel.unsendMessage("1", "100")).rejects.toThrow(/48 hours/);
   });
 
-  it("records sent messages so they are targetable for edit/unsend", async () => {
-    const { channel } = makeChannel();
-
-    await channel.send({ chatId: "1", text: "first message" });
-    await channel.send({ chatId: "1", text: "second message" });
-
-    const recent = channel.recentMessages("1");
-    expect(recent.map((m) => ({ text: m.text, fromMe: m.fromMe }))).toEqual([
-      { text: "second message", fromMe: true },
-      { text: "first message", fromMe: true },
-    ]);
-  });
-
   it("chunks an over-limit send instead of truncating it", async () => {
     const { channel, sent } = makeChannel();
 
@@ -566,24 +539,7 @@ describe("nextPollingBackoff", () => {
  * finish into the agent — which is what `quiesce()` waits for.
  */
 describe("TelegramChannel shutdown phases", () => {
-  interface BotInternals {
-    botInfo: unknown;
-    api: Record<string, unknown>;
-    handleUpdate: (update: unknown) => Promise<void>;
-  }
-
-  function makeChannel() {
-    const channel = new TelegramChannel("000000:test-token");
-    const bot = (channel as unknown as { bot: BotInternals }).bot;
-    // handleUpdate refuses to run before the bot knows who it is.
-    bot.botInfo = {
-      id: 1, is_bot: true, first_name: "Tomo", username: "mybot",
-      can_join_groups: true, can_read_all_group_messages: false,
-      supports_inline_queries: false, can_connect_to_business_account: false,
-      has_main_web_app: false,
-    };
-    return { channel, bot };
-  }
+  const makeChannel = () => offlineTelegram();
 
   const chat = { id: 42, type: "private" as const, first_name: "Alice" };
   const from = { id: 7, is_bot: false, first_name: "Alice" };
@@ -685,17 +641,16 @@ describe("TelegramChannel Markdown fallback", () => {
   );
 
   function makeChannel(failWith: (attempt: number) => Error | null) {
-    const channel = new TelegramChannel("000000:test-token");
     const calls: Array<{ text: string; parseMode?: string }> = [];
     let attempt = 0;
-    (channel as unknown as { bot: { api: unknown } }).bot.api = {
+    const { channel } = offlineTelegram({ api: {
       sendMessage: async (_chatId: string | number, text: string, opts?: { parse_mode?: string }) => {
         calls.push({ text, parseMode: opts?.parse_mode });
         const err = failWith(attempt++);
         if (err) throw err;
         return { message_id: 100 + attempt };
       },
-    };
+    } });
     return { channel, calls };
   }
 
@@ -745,14 +700,13 @@ describe("TelegramChannel reports whether a failed send put anything on the wire
   );
 
   function makeChannel(failOnCall: number) {
-    const channel = new TelegramChannel("000000:test-token");
     let call = 0;
-    (channel as unknown as { bot: { api: unknown } }).bot.api = {
+    const { channel } = offlineTelegram({ api: {
       sendMessage: async () => {
         if (call++ === failOnCall) throw refusal();
         return { message_id: 100 + call };
       },
-    };
+    } });
     return channel;
   }
 
@@ -771,56 +725,21 @@ describe("TelegramChannel reports whether a failed send put anything on the wire
   });
 
   it("never marks a transport failure as nothing sent", async () => {
-    const channel = new TelegramChannel("000000:test-token");
-    (channel as unknown as { bot: { api: unknown } }).bot.api = {
+    const { channel } = offlineTelegram({ api: {
       sendMessage: async () => { throw new Error("Request to 'sendMessage' timed out"); },
-    };
+    } });
     const err = await channel.send({ chatId: "1", text: "x" }).catch((e: unknown) => e);
     expect(isNothingSent(err)).toBe(false);
   });
 });
 
-/**
- * Drive the REAL `message:document` handler.
- *
- * `bot.handleUpdate` needs `botInfo`, which normally comes from `getMe`;
- * setting it directly is what keeps this offline. The unsupported-MIME branch
- * makes no API calls — it only dispatches — so nothing else has to be faked,
- * and the assertions land on what the agent actually receives via the public
- * `onMessage` registration rather than on an internal helper.
- */
-async function dispatchedTextForDocument(
-  document: Record<string, unknown>,
-  caption?: string,
-): Promise<string> {
-  const channel = new TelegramChannel("123456:TEST-TOKEN");
-  const bot = (channel as unknown as {
-    bot: { botInfo: unknown; handleUpdate: (u: unknown) => Promise<void> };
-  }).bot;
-  bot.botInfo = {
-    id: 123456, is_bot: true, first_name: "Tomo", username: "tomobot",
-    can_join_groups: true, can_read_all_group_messages: false,
-    supports_inline_queries: false, can_connect_to_business_account: false,
-    has_main_web_app: false,
-  };
-
-  const received: string[] = [];
-  channel.onMessage(async (msg) => { received.push(msg.text); return true; });
-
-  await bot.handleUpdate({
-    update_id: 1,
-    message: {
-      message_id: 5,
-      date: 1_700_000_000,
-      chat: { id: 42, type: "private" },
-      from: { id: 7, is_bot: false, first_name: "Alice" },
-      ...(caption === undefined ? {} : { caption }),
-      document: { file_id: "f", file_unique_id: "u", ...document },
-    },
+/** The text the agent receives for a document (the unsupported-MIME branch). */
+async function dispatchedTextForDocument(document: Record<string, unknown>, caption?: string): Promise<string> {
+  const msg = await dispatched({
+    ...(caption === undefined ? {} : { caption }),
+    document: { file_id: "f", file_unique_id: "u", ...document },
   });
-
-  expect(received).toHaveLength(1);
-  return received[0];
+  return msg.text;
 }
 
 describe("inbound document with an unsupported MIME type", () => {
@@ -903,12 +822,6 @@ describe("inbound document with an unsupported MIME type", () => {
  * still be activated by posting the groupSecret exactly as before.
  */
 describe("TelegramChannel attachment admission", () => {
-  interface BotInternals {
-    botInfo: unknown;
-    api: Record<string, unknown>;
-    handleUpdate: (update: unknown) => Promise<void>;
-  }
-
   const chat = { id: 42, type: "private" as const, first_name: "Alice" };
   const from = { id: 7, is_bot: false, first_name: "Alice" };
   const storeDirs: string[] = [];
@@ -931,22 +844,14 @@ describe("TelegramChannel attachment admission", () => {
   function makeChannel(admit?: (chatId: string) => boolean) {
     const storeDir = mkdtempSync(join(tmpdir(), "tomo-telegram-inbound-"));
     storeDirs.push(storeDir);
-    const channel = new TelegramChannel("123456:TEST-TOKEN", { imageStoreBaseDir: storeDir });
-    const bot = (channel as unknown as { bot: BotInternals }).bot;
-    bot.botInfo = {
-      id: 123456, is_bot: true, first_name: "Tomo", username: "tomobot",
-      can_join_groups: true, can_read_all_group_messages: false,
-      supports_inline_queries: false, can_connect_to_business_account: false,
-      has_main_web_app: false,
-    };
+    const { channel, bot } = offlineTelegram({ config: { imageStoreBaseDir: storeDir } });
     const getFileCalls: string[] = [];
     bot.api.getFile = async (fileId: string) => {
       getFileCalls.push(fileId);
       return { file_id: fileId, file_unique_id: "u", file_path: "photos/file_1.png" };
     };
     if (admit) channel.onAdmission(admit);
-    const received: IncomingMessage[] = [];
-    channel.onMessage(async (msg) => { received.push(msg); return true; });
+    const received = receivedBy(channel);
     return { channel, bot, getFileCalls, received, storeDir };
   }
 
@@ -1040,16 +945,7 @@ describe("TelegramChannel attachment admission", () => {
 
 describe("/tasks command", () => {
   async function commandsFor(text: string, chat: Record<string, unknown> = { id: 42, type: "private" }) {
-    const channel = new TelegramChannel("123456:TEST-TOKEN");
-    const bot = (channel as unknown as {
-      bot: { botInfo: unknown; handleUpdate: (u: unknown) => Promise<void> };
-    }).bot;
-    bot.botInfo = {
-      id: 123456, is_bot: true, first_name: "Tomo", username: "tomobot",
-      can_join_groups: true, can_read_all_group_messages: false,
-      supports_inline_queries: false, can_connect_to_business_account: false,
-      has_main_web_app: false,
-    };
+    const { channel, bot } = offlineTelegram();
     const commands: unknown[][] = [];
     const messages: IncomingMessage[] = [];
     channel.onCommand(async (...call) => { commands.push(call); });
@@ -1081,18 +977,8 @@ describe("/tasks command", () => {
 
 describe("/s sub-session address", () => {
   it("passes /s through as a message (the agent parses it), while other slash text stays filtered", async () => {
-    const channel = new TelegramChannel("123456:TEST-TOKEN");
-    const bot = (channel as unknown as {
-      bot: { botInfo: unknown; handleUpdate: (u: unknown) => Promise<void> };
-    }).bot;
-    bot.botInfo = {
-      id: 123456, is_bot: true, first_name: "Tomo", username: "tomobot",
-      can_join_groups: true, can_read_all_group_messages: false,
-      supports_inline_queries: false, can_connect_to_business_account: false,
-      has_main_web_app: false,
-    };
-    const messages: IncomingMessage[] = [];
-    channel.onMessage(async (msg) => { messages.push(msg); return true; });
+    const { channel, bot } = offlineTelegram();
+    const messages = receivedBy(channel);
     let id = 1;
     for (const text of ["/s", "/s s3 check the logs", "/S@tomobot s3 stop", "/start", "/sx s3"]) {
       const command = /^\/\S+/.exec(text)?.[0] ?? "";
@@ -1111,18 +997,8 @@ describe("/s sub-session address", () => {
 
 describe("reply references on attachments", () => {
   it("a document sent as a reply carries the replied-to message id, like a text reply", async () => {
-    const channel = new TelegramChannel("123456:TEST-TOKEN");
-    const bot = (channel as unknown as {
-      bot: { botInfo: unknown; handleUpdate: (u: unknown) => Promise<void> };
-    }).bot;
-    bot.botInfo = {
-      id: 123456, is_bot: true, first_name: "Tomo", username: "tomobot",
-      can_join_groups: true, can_read_all_group_messages: false,
-      supports_inline_queries: false, can_connect_to_business_account: false,
-      has_main_web_app: false,
-    };
-    const messages: IncomingMessage[] = [];
-    channel.onMessage(async (msg) => { messages.push(msg); return true; });
+    const { channel, bot } = offlineTelegram();
+    const messages = receivedBy(channel);
     const replied = { message_id: 3, date: 1_699_999_000, chat: { id: 42, type: "private" }, from: { id: 123456, is_bot: true, first_name: "Tomo" }, text: "[s3 · Fix CI] Send me the log?" };
     await bot.handleUpdate({ update_id: 1, message: {
       message_id: 5, date: 1_700_000_000, chat: { id: 42, type: "private" }, from: { id: 7, is_bot: false, first_name: "Alice" },
@@ -1136,16 +1012,8 @@ describe("reply references on attachments", () => {
 
 describe("TelegramChannel inbound reactions", () => {
   function setup() {
-    const channel = new TelegramChannel("123456:TEST-TOKEN");
-    const bot = (channel as unknown as { bot: { botInfo: unknown; handleUpdate: (u: unknown) => Promise<void> } }).bot;
-    bot.botInfo = {
-      id: 123456, is_bot: true, first_name: "Tomo", username: "tomobot",
-      can_join_groups: true, can_read_all_group_messages: false,
-      supports_inline_queries: false, can_connect_to_business_account: false,
-      has_main_web_app: false,
-    };
-    const received: IncomingMessage[] = [];
-    channel.onMessage(async (msg) => { received.push(msg); return true; });
+    const { channel, bot } = offlineTelegram();
+    const received = receivedBy(channel);
     let updateId = 1;
     const message = (messageId: number, text: string) => bot.handleUpdate({ update_id: updateId++, message: {
       message_id: messageId, date: 1_700_000_000, chat: { id: 42, type: "private" }, from: { id: 7, is_bot: false, first_name: "Alice" }, text } });
@@ -1207,17 +1075,19 @@ describe("TelegramChannel.startTyping", () => {
   });
 
   function makeChannel(sendChatAction: (chatId: string, action: string) => Promise<unknown>) {
-    const channel = new TelegramChannel("000000:test-token");
     const calls: Array<{ chatId: string; action: string }> = [];
-    (channel as unknown as { bot: { api: unknown } }).bot.api = {
+    const { channel } = offlineTelegram({ api: {
       sendChatAction: (chatId: string, action: string) => {
         calls.push({ chatId, action });
         return sendChatAction(chatId, action);
       },
-    };
+    } });
     return { channel, calls };
   }
 
+  // The loop's own rules are tests/typing-loop.test.ts. These pin the
+  // constants Telegram passes it (interval 6s, 10 errors, 2-minute cap), and
+  // that startTyping uses the loop at all (the no-overlap test below).
   it("sends typing immediately and every 6s until stopped", async () => {
     const { channel, calls } = makeChannel(async () => true);
     const stop = channel.startTyping("42");
@@ -1260,10 +1130,11 @@ describe("TelegramChannel.startTyping", () => {
   it("stops by itself after the 2-minute cap", async () => {
     const { channel, calls } = makeChannel(async () => true);
     channel.startTyping("42");
-    await vi.advanceTimersByTimeAsync(2 * 60 * 1000);
-    const atCap = calls.length;
+    await vi.advanceTimersByTimeAsync(2 * 60 * 1000 - 1);
+    // One immediately, then every 6s: 20 ticks inside the cap.
+    expect(calls).toHaveLength(20);
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(calls).toHaveLength(atCap);
+    expect(calls).toHaveLength(20);
   });
 });
 

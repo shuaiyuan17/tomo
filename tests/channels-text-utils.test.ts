@@ -9,24 +9,17 @@ import { formatReplyContextMarker, isSatelliteService, splitText } from "../src/
 // the only direct coverage of live code with it.
 
 describe("isSatelliteService", () => {
-  it("flags iMessageLite as satellite", () => {
-    expect(isSatelliteService("iMessageLite")).toBe(true);
-  });
-
-  it("is case-insensitive and matches variant spellings containing 'lite'", () => {
-    expect(isSatelliteService("imessagelite")).toBe(true);
-    expect(isSatelliteService("SMS-Lite")).toBe(true);
-  });
-
-  it("does not flag standard services", () => {
-    expect(isSatelliteService("iMessage")).toBe(false);
-    expect(isSatelliteService("SMS")).toBe(false);
-  });
-
-  it("handles missing/non-string service", () => {
-    expect(isSatelliteService(undefined)).toBe(false);
-    expect(isSatelliteService(null)).toBe(false);
-    expect(isSatelliteService(42)).toBe(false);
+  it.each<[string, unknown, boolean]>([
+    ["flags iMessageLite as satellite", "iMessageLite", true],
+    ["is case-insensitive", "imessagelite", true],
+    ["matches variant spellings containing 'lite'", "SMS-Lite", true],
+    ["does not flag standard iMessage", "iMessage", false],
+    ["does not flag standard SMS", "SMS", false],
+    ["handles a missing service", undefined, false],
+    ["handles a null service", null, false],
+    ["handles a non-string service", 42, false],
+  ])("%s", (_, service, satellite) => {
+    expect(isSatelliteService(service)).toBe(satellite);
   });
 });
 
@@ -69,7 +62,7 @@ describe("splitText", () => {
   const hasLoneSurrogate = (s: string): boolean =>
     /[\uD800-\uDFFF]/.test(s.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, ""));
 
-  it("never cuts an astral character in half on the hard-cut fallback", () => {
+  it("never cuts an astral character in half on the hard-cut fallback, loses nothing, and respects the limit", () => {
     // One ASCII char then an unbroken run of emoji: no newline and no space, so
     // every split takes the `splitAt = limit` fallback, and the odd leading
     // char puts the cut squarely between the two units of a pair.
@@ -77,19 +70,10 @@ describe("splitText", () => {
     const chunks = splitText(text, 100);
     for (const chunk of chunks) {
       expect(hasLoneSurrogate(chunk)).toBe(false);
-    }
-  });
-
-  it("loses no characters while avoiding the split", () => {
-    const text = "x" + "😀".repeat(200);
-    expect(splitText(text, 100).join("")).toBe(text);
-  });
-
-  it("still respects the limit when it backs off a unit", () => {
-    const text = "x" + "😀".repeat(200);
-    for (const chunk of splitText(text, 100)) {
+      // Backing off a unit to keep the pair whole never overruns the limit.
       expect(chunk.length).toBeLessThanOrEqual(100);
     }
+    expect(chunks.join("")).toBe(text);
   });
 
   it("emits no lone surrogate even when the limit cannot hold one character", () => {

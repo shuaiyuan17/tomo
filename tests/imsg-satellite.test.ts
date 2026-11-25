@@ -78,14 +78,45 @@ describe("ChatDbServiceLookup", () => {
     lookup.close();
   });
 
+  it("counts a cache hit as a use, so a hot entry outlives a newer cold one", () => {
+    const sqlite = mockSqlite({ "a": "iMessage", "b": "iMessage", "c": "iMessage" });
+    const lookup = new ChatDbServiceLookup("/fake/chat.db", { loadSqlite: () => sqlite.module, maxCache: 2 });
+
+    lookup.serviceForGuid("a");
+    lookup.serviceForGuid("b");
+    lookup.serviceForGuid("a"); // hit: "a" is now the most recent
+    lookup.serviceForGuid("c"); // evicts "b", not "a"
+    lookup.serviceForGuid("a"); // still cached
+    lookup.serviceForGuid("b"); // re-queried
+
+    expect(sqlite.gets).toEqual(["a", "b", "c", "b"]);
+    lookup.close();
+  });
+
   it("degrades to undefined (never throws) when the database cannot be opened", () => {
-    const lookup = new ChatDbServiceLookup("/fake/chat.db", {
-      loadSqlite: () => { throw new Error("no Full Disk Access"); },
-    });
+    const loadSqlite = vi.fn((): SqliteModule => { throw new Error("no Full Disk Access"); });
+    const lookup = new ChatDbServiceLookup("/fake/chat.db", { loadSqlite });
     expect(lookup.serviceForGuid("g-lite")).toBeUndefined();
     // Failure is sticky — it does not retry (and does not throw) on later calls.
     expect(lookup.serviceForGuid("g-im")).toBeUndefined();
+    expect(loadSqlite).toHaveBeenCalledTimes(1);
     lookup.close();
+  });
+
+  it("closes the database it just opened when prepare() throws (no leaked handle)", () => {
+    let closed = 0;
+    const module: SqliteModule = {
+      DatabaseSync: class {
+        constructor(public path: string) {}
+        prepare(): never { throw new Error("no such table: message"); }
+        close() { closed++; }
+      },
+    };
+    const lookup = new ChatDbServiceLookup("/fake/chat.db", { loadSqlite: () => module });
+    expect(lookup.serviceForGuid("g-lite")).toBeUndefined();
+    expect(closed).toBe(1);
+    lookup.close(); // nothing published, so nothing to close twice
+    expect(closed).toBe(1);
   });
 
   it("degrades to undefined when a query throws", () => {
@@ -117,6 +148,11 @@ describe("ChatDbServiceLookup", () => {
     lookup.serviceForGuid("g-lite");
     lookup.close();
     expect(sqlite.closed()).toBe(true);
+    // The cache went with it: the next lookup reopens and queries again.
+    expect(lookup.serviceForGuid("g-lite")).toBe("iMessageLite");
+    expect(sqlite.gets).toEqual(["g-lite", "g-lite"]);
+    expect(sqlite.prepareCount()).toBe(2);
+    lookup.close();
   });
 });
 

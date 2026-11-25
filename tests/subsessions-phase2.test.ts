@@ -599,10 +599,8 @@ describe("the mirror", () => {
     h.service.stop();
   });
 
-  it("a message the task sent but could not record still reaches the owning session, as a note", async () => {
-    const notes: string[] = [];
+  it("a message the task sent but could not record is written once the store works again", async () => {
     const h = harness();
-    (h.service as unknown as { deps: { queuePendingNote(k: string, n: string): boolean } }).deps.queuePendingNote = (_k, n) => { notes.push(n); return true; };
     h.onTurn = () => new Promise(() => {});
     h.service.start();
     const task = spawn(h);
@@ -610,10 +608,13 @@ describe("the mirror", () => {
     const store = h.store as unknown as { update: (...a: unknown[]) => unknown };
     const real = store.update.bind(h.store);
     store.update = () => { throw new Error("disk full"); };
-    expect((await h.service.notify(task.sessionKey, "Build is green.")).ok).toBe(true);
+    expect((await h.service.reply(task.sessionKey, "Build is green.")).ok).toBe(true);
     store.update = real;
-    expect(notes.some((n) => n.includes("Build is green."))).toBe(true);
+    expect(h.service.get(task.id)!.conversation.some((e) => e.text === "Build is green.")).toBe(false);
+    // The kept write is tried again (here: the last try on stop).
     h.service.stop();
+    expect(h.service.get(task.id)!.conversation.some((e) => e.text === "Build is green.")).toBe(true);
+    expect(h.service.get(task.id)!.sent.at(-1)).toMatchObject({ kind: "reply", text: "Build is green." });
   });
 
   it("does not mirror a turn the task ran on its own without speaking", async () => {

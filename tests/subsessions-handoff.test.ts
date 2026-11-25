@@ -1,9 +1,9 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SUBSESSIONS } from "../src/config.js";
-import { ASK_FORWARD_GRACE_MS, MAX_PENDING_NOTICES, SubsessionService, type ScopeSendResult, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
+import { ASK_FORWARD_GRACE_MS, CUSTODY_RETRY_MS, MAX_PENDING_NOTICES, SubsessionService, type ScopeSendResult, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { buildTaskOwnerTools, buildTaskSelfTools } from "../src/mcp/subsession-tools.js";
 
@@ -25,6 +25,8 @@ interface Harness {
   onTurn: (turn: Turn, h: Harness) => TaskTurnOutcome | Promise<TaskTurnOutcome>;
   noteWriteFails: number;
   noteThrows: number;
+  persistFails: number;
+  sendGate?: Promise<boolean>;
   sendFails: number;
   nextId: number;
   now: number;
@@ -42,18 +44,19 @@ async function flush(): Promise<void> {
   for (let i = 0; i < 60; i++) await new Promise((r) => setImmediate(r));
 }
 
-function harness(opts: { handOff?: boolean; store?: SubsessionStore } = {}): Harness {
+function harness(opts: { handOff?: boolean; store?: SubsessionStore; notes?: Map<string, string[]> } = {}): Harness {
   const store = opts.store ?? new SubsessionStore(path, { strictTransitions: true });
   const h = {
     store,
     turns: [],
-    notes: new Map<string, string[]>(),
+    notes: opts.notes ?? new Map<string, string[]>(),
     sent: [],
     handOffs: [],
     wakes: [],
     onTurn: () => new Promise<TaskTurnOutcome>(() => {}),
     noteWriteFails: 0,
     noteThrows: 0,
+    persistFails: 0,
     sendFails: 0,
     nextId: 100,
     now: 1_000_000,
@@ -68,6 +71,7 @@ function harness(opts: { handOff?: boolean; store?: SubsessionStore } = {}): Har
       return h.onTurn(turn, h);
     },
     sendToScope: async (parentKey, text): Promise<ScopeSendResult> => {
+      if (h.sendGate && !(await h.sendGate)) return { ok: false, error: "channel down" };
       if (h.sendFails > 0) { h.sendFails -= 1; return { ok: false, error: "channel down" }; }
       h.sent.push({ parentKey, text });
       return { ok: true, channel: "telegram", messageIds: [String(h.nextId++)] };
@@ -81,6 +85,10 @@ function harness(opts: { handOff?: boolean; store?: SubsessionStore } = {}): Har
       return true;
     },
     hasPendingNote: (key, pred) => (h.notes.get(key) ?? []).some(pred),
+    persistPendingNotes: () => {
+      if (h.persistFails > 0) { h.persistFails -= 1; return false; }
+      return true;
+    },
     wakeScope: (parentKey) => { h.wakes.push(parentKey); },
     contextUsage: () => undefined,
     cronJobCount: () => 0,
@@ -140,25 +148,59 @@ describe("task_notify goes to the owning session", () => {
     expect(h.store.get(t.id)!.conversation).toEqual([]);
   });
 
-  it("a note held in memory whose write failed still counts as handed over (no duplicate on retry)", async () => {
+  it("a notice whose note could not be written is held on the record until the note is on disk", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness();
+      h.service.start();
+      const t = spawn(h);
+      await flush();
+      h.noteWriteFails = 1;
+      h.persistFails = 1;
+      expect(await h.service.notify(t.sessionKey, "the status")).toEqual({ ok: true, via: "main" });
+      expect(h.store.get(t.id)!.unsavedNotices).toEqual([{ at: h.now, text: "the status" }]);
+      vi.advanceTimersByTime(CUSTODY_RETRY_MS);
+      // The write failed again: still held.
+      expect(h.store.get(t.id)!.unsavedNotices).toHaveLength(1);
+      vi.advanceTimersByTime(CUSTODY_RETRY_MS);
+      expect(h.store.get(t.id)!.unsavedNotices).toBeUndefined();
+      // Queued once: no duplicate.
+      expect(h.notes.get("dm:owner")!.filter((x) => x.includes("the status"))).toHaveLength(1);
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a held notice whose note died with the process is queued again after a restart", async () => {
     const h = harness();
     h.service.start();
     const t = spawn(h);
     await flush();
     h.noteWriteFails = 1;
-    expect(await h.service.notify(t.sessionKey, "the status")).toEqual({ ok: true, via: "main" });
-    expect(h.handOffs).toEqual(["dm:owner"]);
+    expect((await h.service.notify(t.sessionKey, "the status")).ok).toBe(true);
+    h.service.stop();
+    // A new process: the notes in memory are gone, the record is on disk.
+    const h2 = harness({ store: new SubsessionStore(path, { strictTransitions: true }) });
+    h2.service.recoverAtStartup();
+    h2.service.start();
+    await flush();
+    expect(h2.notes.get("dm:owner")!.filter((x) => x.includes("the status"))).toHaveLength(1);
+    expect(h2.store.get(t.id)!.unsavedNotices).toBeUndefined();
+    expect(h2.handOffs).toContain("dm:owner");
   });
 
-  it("refuses when the note cannot be queued at all, and the turn keeps what it carried", async () => {
+  it("refuses when the record cannot hold the notice, and the turn keeps what it carried", async () => {
     const h = harness();
     let n = 0;
     h.onTurn = async (turn, hh) => {
       n += 1;
       if (n === 1) { hh.service.noteToolUse(turn.key); hh.store.transition("s1", "stuck"); return { ok: true }; }
       if (n === 2) {
-        hh.noteThrows = 1;
+        const update = hh.store.update.bind(hh.store);
+        hh.store.update = (() => { hh.store.update = update; throw new Error("disk full"); }) as SubsessionStore["update"];
         expect((await hh.service.notify(turn.key, "the status")).ok).toBe(false);
+        expect(hh.notes.get("dm:owner")?.some((x) => x.includes("subsession-notice")) ?? false).toBe(false);
         hh.service.noteToolUse(turn.key);
         return { ok: true };
       }
@@ -313,6 +355,51 @@ describe("task_ask goes through the owning session, word for word", () => {
     await h.service.afterHandOff("dm:owner", asks);
     expect(h.sent).toHaveLength(1);
     expect(h.service.handOffFor("dm:owner")).toBeUndefined();
+    // The owner's reply to it routes to the task before the write is retried…
+    const messageId = String(h.nextId - 1);
+    expect(h.store.get("s1")!.replyMap).toEqual([]);
+    expect(h.service.taskForReply("dm:owner", "telegram", messageId)?.id).toBe("s1");
+    // …and the kept write lands (here: the last try on stop), forward mark and all.
+    h.service.stop();
+    const record = h.store.get("s1")!;
+    expect(record.replyMap.map((m) => m.messageId)).toEqual([messageId]);
+    expect(record.pendingAsk?.forwardedAt).toBeDefined();
+  });
+
+  it("a wake while the question is being forwarded tells the task once the send settles: it reached the owner", async () => {
+    const h = harness();
+    const { t } = await askingTask(h, "Merge PR #12?");
+    let open!: (ok: boolean) => void;
+    h.sendGate = new Promise<boolean>((r) => { open = r; });
+    const forward = h.service.afterHandOff("dm:owner", h.service.handOffFor("dm:owner")!.asks);
+    await flush();
+    expect(h.service.ownerMessage("dm:owner", t.id, "also, rename the branch").ok).toBe(true);
+    // Not guessed while the send is pending.
+    expect(h.store.get(t.id)!.pendingInput.map((i) => i.text).join("\n")).not.toContain("question");
+    open(true);
+    await forward;
+    await flush();
+    const input = h.store.get(t.id)!.pendingInput.map((i) => i.text).join("\n");
+    expect(input).toContain("reached the owner after all");
+    expect(input).not.toContain("not shown");
+    // Their reply to it still comes back to the task.
+    expect(h.service.taskForReply("dm:owner", "telegram", String(h.nextId - 1))?.id).toBe("s1");
+  });
+
+  it("a wake while the question is being forwarded tells the task once the send settles: it failed", async () => {
+    const h = harness();
+    const { t } = await askingTask(h, "Merge PR #12?");
+    let open!: (ok: boolean) => void;
+    h.sendGate = new Promise<boolean>((r) => { open = r; });
+    const forward = h.service.afterHandOff("dm:owner", h.service.handOffFor("dm:owner")!.asks);
+    await flush();
+    expect(h.service.ownerMessage("dm:owner", t.id, "also, rename the branch").ok).toBe(true);
+    open(false);
+    await forward;
+    await flush();
+    const input = h.store.get(t.id)!.pendingInput.map((i) => i.text).join("\n");
+    expect(input).toContain("was not shown to the owner");
+    expect(h.sent).toEqual([]);
   });
 
   it("another scope cannot forward it", async () => {

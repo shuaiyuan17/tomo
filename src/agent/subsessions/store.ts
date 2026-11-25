@@ -467,11 +467,21 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
     ...(Array.isArray(r.updates) ? { updates: parseUpdates(r.updates) } : { updates: undefined }),
     sent: Array.isArray(r.sent) ? r.sent as SubsessionRecord["sent"] : [],
     ...parsePendingAsk(r.pendingAsk, status, r.waitingOn),
+    ...parseUnsavedNotices(r.unsavedNotices),
     transitions: Array.isArray(r.transitions) ? r.transitions as SubsessionRecord["transitions"] : [],
   };
 }
 
 /** A well-formed pending question, kept only on a task waiting for the owner. */
+function parseUnsavedNotices(value: unknown): { unsavedNotices?: Array<{ at: number; text: string }> } {
+  if (!Array.isArray(value)) return { unsavedNotices: undefined };
+  const kept = value.filter((v): v is { at: number; text: string } => !!v && typeof v === "object"
+    && typeof (v as { at?: unknown }).at === "number" && Number.isFinite((v as { at: number }).at)
+    && typeof (v as { text?: unknown }).text === "string" && (v as { text: string }).text.trim() !== "")
+    .map((v) => ({ at: v.at, text: v.text }));
+  return { unsavedNotices: kept.length > 0 ? kept : undefined };
+}
+
 function parsePendingAsk(value: unknown, status: SubsessionStatus, waitingOn: unknown): { pendingAsk?: SubsessionPendingAsk } {
   if (status !== "waiting" || waitingOn !== "owner" || !value || typeof value !== "object") return { pendingAsk: undefined };
   const v = value as Record<string, unknown>;

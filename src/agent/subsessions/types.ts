@@ -282,6 +282,12 @@ export interface SubsessionRecord {
   sent: SubsessionSentMessage[];
   /** The question the task is waiting on the owner for, while it waits (see SubsessionPendingAsk). */
   pendingAsk?: SubsessionPendingAsk;
+  /**
+   * Notices handed to the owning session whose pending note is not on disk
+   * yet (its write failed). The record holds them until the note is saved;
+   * after a restart, one whose note is gone is queued again.
+   */
+  unsavedNotices?: Array<{ at: number; text: string }>;
   /** The newest status changes, oldest first. */
   transitions: SubsessionTransition[];
 }

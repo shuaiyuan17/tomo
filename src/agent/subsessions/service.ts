@@ -226,6 +226,18 @@ const NOTICE_MARKER = '<tomo-event type="subsession-notice"';
 export const MAX_PENDING_NOTICES = 5;
 const noticeMarker = (id: string): string => `${NOTICE_MARKER} name="${id}@`;
 const askKey = (id: string, at: number): string => `${id}@${at}`;
+/** How soon a notice note or a sent message's record that could not be written is tried again. */
+export const CUSTODY_RETRY_MS = 5_000;
+
+/** The pending note that hands one notice to the owning session (rebuilt the same from the record when it must be queued again). */
+function noticeNote(record: Pick<SubsessionRecord, "id" | "title">, at: number, body: string): string {
+  return formatTomoEvent("subsession-notice", [
+    `Sub-session ${record.id} ("${record.title}") handed you this for the owner. These are its words; nothing has been sent to them:`,
+    quoteBlock(body),
+    "Decide now: tell the owner with send_message, in your own words (merged with other news when that reads better), or keep it for the next time you talk with them. A result they are waiting for, a blocker, or a decision only they can make should reach them now. Nothing reaches them unless you send it. This note is not shown to you again (task_status keeps it).",
+  ].join("\n"), { name: `${record.id}@${at}` });
+}
+const noticeNamed = (id: string, at: number) => (n: string): boolean => n.includes(`${NOTICE_MARKER} name="${id}@${at}"`);
 /** How much of each unanswered message a failure notice quotes. */
 const UNANSWERED_EXCERPT = 300;
 const UNANSWERED_MAX = 5;
@@ -294,6 +306,15 @@ export class SubsessionService {
    * after the send went out cannot send them a second time.
    */
   private readonly forwardedAsks = new Set<string>();
+  /** Notices (`id@at`) this process put in the owning session's notes queue (in memory at least). */
+  private readonly noticesQueued = new Set<string>();
+  /**
+   * Sends that went out but whose record write failed: the write (the
+   * conversation, the reply ids, a forward's mark) is kept and tried again,
+   * and the reply ids already route the owner's replies to the task.
+   */
+  private readonly unrecorded = new Map<string, Array<{ write: (r: SubsessionRecord) => void; replyIds: Array<{ channel: string; messageId: string }> }>>();
+  private custodyTimer?: ReturnType<typeof setTimeout>;
   /** Tasks whose running turn carries the owner's words: a notify there answers them, so it goes out directly. */
   private readonly ownerTurns = new Set<string>();
   private readonly forwarding = new Map<string, { at: number; done: Promise<{ ok: true; already?: boolean } | { ok: false; error: string }> }>();
@@ -583,7 +604,8 @@ export class SubsessionService {
     } catch {
       return undefined;
     }
-    return tasks.find((t) => t.replyMap.some((m) => m.channel === channel && m.messageId === messageId));
+    const unrecorded = (id: string) => (this.unrecorded.get(id) ?? []).some((u) => u.replyIds.some((m) => m.channel === channel && m.messageId === messageId));
+    return tasks.find((t) => t.replyMap.some((m) => m.channel === channel && m.messageId === messageId) || unrecorded(t.id));
   }
 
   /**
@@ -612,11 +634,12 @@ export class SubsessionService {
    * task_notify: hand a message to the owning session, which decides whether
    * and when the owner hears it (it may fold it into other news, or keep it
    * for the next time they talk). The note is pinned in the owning session's
-   * pending notes and a hand-off turn wakes it. A note held in memory whose
-   * write failed still counts as handed over (the next write of that
-   * session's notes saves it); only a note that could not be queued at all,
-   * or one past MAX_PENDING_NOTICES unread, is refused, and counts as an
-   * undelivered message of this turn, like a failed send. In a turn that
+   * pending notes and a hand-off turn wakes it. The record holds the notice
+   * (`unsavedNotices`) BEFORE the note is queued, and lets go of it only once
+   * the note is on disk (or a turn took it), so it survives a note write
+   * that fails and a restart before the retry. Only a notice the record
+   * could not hold, or one past MAX_PENDING_NOTICES unread, is refused, and
+   * counts as an undelivered message of this turn, like a failed send. In a turn that
    * carries the owner's words, a notify answers them, so it goes straight to
    * the owner's chat like task_reply.
    */
@@ -637,27 +660,101 @@ export class SubsessionService {
       return { ok: false, error: `the main session already has ${MAX_PENDING_NOTICES} of your notices it has not read. Wait for it, or put this in task_finish.` };
     }
     const at = this.now();
-    const note = formatTomoEvent("subsession-notice", [
-      `Sub-session ${record.id} ("${record.title}") handed you this for the owner. These are its words; nothing has been sent to them:`,
-      quoteBlock(body),
-      "Decide now: tell the owner with send_message, in your own words (merged with other news when that reads better), or keep it for the next time you talk with them. A result they are waiting for, a blocker, or a decision only they can make should reach them now. Nothing reaches them unless you send it. This note is not shown to you again (task_status keeps it).",
-    ].join("\n"), { name: `${record.id}@${at}` });
+    // Custody first: the record holds the notice until its note is on disk,
+    // so a process that dies before the notes are written loses nothing.
     try {
-      if (!this.deps.queuePendingNote(record.parentKey, note)) {
-        // Held in memory for this process; the next write of the owning
-        // session's notes saves it.
-        log.warn({ id: record.id }, "A sub-session notice is held in memory only: its note could not be saved yet");
-      }
+      if (!this.store.update(record.id, (r) => { r.unsavedNotices = [...(r.unsavedNotices ?? []), { at, text: body }]; })) throw new Error("the task record is gone");
     } catch (err) {
-      log.error({ err, id: record.id }, "Could not hand a sub-session notice to its owning session");
+      log.error({ err, id: record.id }, "Could not hold a sub-session notice on its record");
       this.markDelivery(record.id, body, false);
       return { ok: false, error: "the main session could not be given the message. Try again." };
     }
+    this.queueNotice(record, at, body);
     this.markDelivery(record.id, body, true);
     this.spoke.add(record.id);
     this.safely(() => this.store.update(record.id, (r) => { r.sent.push({ at, kind: "notify", text: body, via: "main" }); }), "record a handed-off notice");
     this.handOff(record.parentKey);
     return { ok: true, via: "main" };
+  }
+
+  /** Put a held notice's note in the owning session's queue; the record lets go of it once the note is on disk. */
+  private queueNotice(record: Pick<SubsessionRecord, "id" | "title" | "parentKey">, at: number, body: string): void {
+    let saved = false;
+    try {
+      saved = this.deps.queuePendingNote(record.parentKey, noticeNote(record, at, body));
+      this.noticesQueued.add(askKey(record.id, at));
+    } catch (err) {
+      log.error({ err, id: record.id }, "Could not queue a sub-session notice's note; the record holds it and it is tried again");
+    }
+    if (saved) this.releaseNotice(record.id, at);
+    else {
+      log.warn({ id: record.id }, "A sub-session notice's note is not on disk yet; the record holds it and it is tried again");
+      this.armCustodyRetry();
+    }
+  }
+
+  private releaseNotice(id: string, at: number): void {
+    this.safely(() => this.store.update(id, (r) => {
+      const left = (r.unsavedNotices ?? []).filter((n) => n.at !== at);
+      r.unsavedNotices = left.length > 0 ? left : undefined;
+    }), "release a saved notice");
+  }
+
+  /**
+   * Each notice the record still holds: its note in memory is written again
+   * (released once it is on disk); one this process queued that is gone was
+   * taken by a turn (released); one this process never queued (its queue
+   * threw, or it is from before a restart) is queued again. Records whose
+   * sends went out without being written are written.
+   */
+  private secureCustody(): void {
+    let again = false;
+    for (const [id, writes] of [...this.unrecorded]) {
+      try {
+        const done = this.store.update(id, (r) => { for (const w of writes) w.write(r); });
+        this.unrecorded.delete(id);
+        if (!done) log.warn({ id }, "A sub-session's sent message could not be recorded: the task is gone");
+      } catch (err) {
+        log.warn({ err, id }, "Still could not record a sub-session's sent message; trying again");
+        again = true;
+      }
+    }
+    let tasks: SubsessionRecord[] = [];
+    try {
+      tasks = this.store.list().filter((t) => t.unsavedNotices?.length);
+    } catch {
+      again = true;
+    }
+    for (const task of tasks) {
+      for (const n of task.unsavedNotices ?? []) {
+        if (this.deps.hasPendingNote(task.parentKey, noticeNamed(task.id, n.at))) {
+          let ok = false;
+          try {
+            ok = this.deps.persistPendingNotes ? this.deps.persistPendingNotes(task.parentKey) : true;
+          } catch (err) {
+            log.warn({ err, id: task.id }, "Could not write a sub-session notice's note");
+          }
+          if (ok) this.releaseNotice(task.id, n.at);
+          else again = true;
+        } else if (this.noticesQueued.has(askKey(task.id, n.at))) {
+          this.releaseNotice(task.id, n.at);
+        } else {
+          this.queueNotice(task, n.at, n.text);
+          this.handOff(task.parentKey);
+        }
+      }
+    }
+    if (again) this.armCustodyRetry();
+  }
+
+  private armCustodyRetry(): void {
+    if (this.custodyTimer) return;
+    this.custodyTimer = setTimeout(() => {
+      this.custodyTimer = undefined;
+      if (this.deps.isStopping()) return;
+      this.safely(() => this.secureCustody(), "secure notices and sent records");
+    }, CUSTODY_RETRY_MS);
+    this.custodyTimer.unref?.();
   }
 
   /** task_reply: answer the owner's message. Straight to the owner's chat. */
@@ -875,22 +972,23 @@ export class SubsessionService {
       if (result.ok) {
         if (opts.spoke) this.spoke.add(record.id);
         const at = this.now();
+        const replyIds = result.channel ? (result.messageIds ?? []).map((messageId) => ({ channel: result.channel!, messageId })) : [];
+        const write = (r: SubsessionRecord): void => {
+          r.sent.push({ at, kind, text: body });
+          pushConversation(r, { at, from: "task", kind, text: truncate(body, CONVERSATION_TEXT_MAX) });
+          for (const m of replyIds) r.replyMap.push({ ...m, at });
+          opts.patch?.(r, at);
+        };
         try {
-          this.store.update(record.id, (r) => {
-            r.sent.push({ at, kind, text: body });
-            pushConversation(r, { at, from: "task", kind, text: truncate(body, CONVERSATION_TEXT_MAX) });
-            if (result.channel) {
-              for (const messageId of result.messageIds ?? []) r.replyMap.push({ channel: result.channel, messageId, at });
-            }
-            opts.patch?.(r, at);
-          });
+          this.store.update(record.id, write);
         } catch (err) {
-          // Out, but not in the conversation the mirror reads: the owning
-          // session gets it as a note instead, so it still sees what was said.
-          log.error({ err, id: record.id }, "Could not record a sub-session's sent message; the owning session gets it as a note");
-          this.deps.queuePendingNote(record.parentKey, formatTomoEvent("subsession-activity",
-            `Sub-session ${record.id} ("${record.title}") said to the owner (${kind}): ${truncate(body, ACTIVITY_NOTE_EXCERPT)}`,
-            { name: record.id }));
+          // Out, but not recorded: the write is kept and tried again (until
+          // then its reply ids still route the owner's replies to the task).
+          log.error({ err, id: record.id }, "Could not record a sub-session's sent message; trying again");
+          const kept = this.unrecorded.get(record.id) ?? [];
+          kept.push({ write, replyIds });
+          this.unrecorded.set(record.id, kept);
+          this.armCustodyRetry();
         }
       }
       return result;
@@ -1312,6 +1410,7 @@ export class SubsessionService {
     this.startsOwed.clear();
     for (const [id, reason] of owed) this.safely(() => { this.startTask(id, reason); }, "owed start");
     this.schedule();
+    this.safely(() => this.secureCustody(), "notices held on records");
     this.safely(() => this.handOffAfterRestart(), "hand-offs after a restart");
     this.safely(() => {
       for (const task of this.store.list()) {
@@ -1325,6 +1424,7 @@ export class SubsessionService {
       this.safely(() => this.checkExternalWaits("while Tomo was running"), "check-back recheck");
       this.safely(() => this.schedule(), "schedule after the check-back recheck");
       this.safely(() => this.forwardOverdueQuestions(), "forward overdue questions");
+      this.safely(() => this.secureCustody(), "notices held on records");
     }, EXTERNAL_WAIT_CHECK_MS);
     this.externalWaitTimer.unref?.();
   }
@@ -1362,6 +1462,10 @@ export class SubsessionService {
     this.sweepTimer = undefined;
     if (this.externalWaitTimer) clearInterval(this.externalWaitTimer);
     this.externalWaitTimer = undefined;
+    if (this.custodyTimer) clearTimeout(this.custodyTimer);
+    this.custodyTimer = undefined;
+    // A last try at what is only in memory.
+    if (this.unrecorded.size > 0) this.safely(() => this.secureCustody(), "record sent messages before stopping");
     for (const timer of this.reportTimers.values()) clearTimeout(timer);
     this.reportTimers.clear();
     this.reportAttempts.clear();
@@ -1762,6 +1866,7 @@ export class SubsessionService {
     extra?: (record: SubsessionRecord) => void,
   ): TransitionOutcome {
     const now = this.now();
+    let racing: { done: Promise<{ ok: true; already?: boolean } | { ok: false; error: string }>; text: string } | undefined;
     const outcome = this.transition(id, event, {
       reason: event === "relay" ? "a message from the main session" : "a message from the owner",
       guard: inputQueueFull,
@@ -1769,7 +1874,12 @@ export class SubsessionService {
         // A question the task asked that never reached the owner (its
         // forward had not gone out yet) ends with this wake: the task is
         // told, so it does not take this message for the answer.
-        const lost = r.pendingAsk && this.unforwarded(r) ? r.pendingAsk.text : undefined;
+        // A forward in flight may still land: the task is told what happened
+        // once it settles (racing), not guessed now.
+        const ask = r.pendingAsk && this.unforwarded(r) ? r.pendingAsk : undefined;
+        const inFlight = ask ? this.forwarding.get(r.id) : undefined;
+        if (ask && inFlight?.at === ask.at) racing = { done: inFlight.done, text: ask.text };
+        const lost = ask && !racing ? ask.text : undefined;
         appendInput(r, lost ? `${prompt}\n\n${formatTomoEvent("subsession-redelivery",
           `Your question had not been forwarded to the owner when this message came, so this message is most likely not an answer to it:\n${quoteBlock(lost)}\nAsk again with task_ask if you still need it.`,
           { name: "question-not-shown" })}` : prompt, { from: "owner", words });
@@ -1779,6 +1889,11 @@ export class SubsessionService {
       },
     });
     if (!outcome.ok) return outcome;
+    if (racing) {
+      const { done, text } = racing;
+      void done.catch((err: unknown) => ({ ok: false as const, error: err instanceof Error ? err.message : String(err) }))
+        .then((result) => this.tellForwardOutcome(id, text, result.ok));
+    }
     if (outcome.record.status !== "queued") {
       this.kick(id);
       return outcome;
@@ -1800,6 +1915,28 @@ export class SubsessionService {
       return { ...outcome, record: this.safeGet(id) ?? outcome.record };
     }
     return outcome;
+  }
+
+  /**
+   * A message woke the task while its question was being forwarded: once the
+   * send settles, the task learns whether the owner got the question (their
+   * answer then comes to it as their words) or not (ask again if needed).
+   */
+  private tellForwardOutcome(id: string, question: string, reached: boolean): void {
+    const note = reached
+      ? `Your question reached the owner after all (it was being sent when the message before this came). If they answer it, the answer comes to you as their words; do not ask it again:\n${quoteBlock(question)}`
+      : `Your question was not shown to the owner (its send failed while a message came), so the message before this is not an answer to it:\n${quoteBlock(question)}\nAsk again with task_ask if you still need it.`;
+    let record: SubsessionRecord | undefined;
+    try {
+      record = this.store.update(id, (r) => {
+        if (TERMINAL_STATUSES.has(r.status)) return;
+        appendInput(r, formatTomoEvent("subsession-redelivery", note, { name: reached ? "question-forwarded" : "question-not-shown" }));
+      });
+    } catch (err) {
+      log.error({ err, id }, "Could not tell a sub-session how its question's forward ended");
+      return;
+    }
+    if (record && !TERMINAL_STATUSES.has(record.status) && record.status !== "queued") this.kick(id);
   }
 
   /** Run the task's driver unless one is running. */

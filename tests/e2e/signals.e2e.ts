@@ -61,10 +61,25 @@ it("shows what the SDK reports about a running turn, stops it, and offers the ne
   await browserExpect(page.getByRole("button", { name: "Send", exact: true })).toHaveCount(0);
   const sdk = mockSdk.queryControllers.at(-1)!;
 
+  // Running with nothing to add: the line shows no words (the thinking dots say it), a screen reader
+  // still hears it, and the composer does not move when words come and go.
+  const spoken = status.locator(".sr-only");
+  const shown = () => status.evaluate((el) => [...el.childNodes].filter((node) => node.nodeType === Node.TEXT_NODE).map((node) => node.textContent).join(""));
+  const composerTop = async () => (await page.getByRole("textbox", { name: "Message Tomo" }).boundingBox())!.y;
+  await browserExpect(status).toHaveText("Tomo is working…");
+  await browserExpect(spoken).toHaveText("Tomo is working…");
+  expect(await shown()).toBe("");
+  await browserExpect(page.locator("[data-slot=thinking-dots]")).toHaveCSS("opacity", "1");
+  const top = await composerTop();
+  await page.screenshot({ path: "test-results/turn-working-desktop.png" });
+
   sdk.pushEvent({ type: "system", subtype: "api_retry", attempt: 2, max_retries: 10, retry_delay_ms: 4000, error_status: 529, error: "overloaded" });
   await browserExpect(status).toHaveText("Tomo is working… Retrying 2/10 · claude is overloaded");
+  expect(await shown()).toBe("Retrying 2/10 · claude is overloaded");
+  expect(await composerTop()).toBe(top);
   sdk.pushEvent({ type: "tool_progress", tool_use_id: "t1", tool_name: "Bash", parent_tool_use_id: null, elapsed_time_seconds: 42 });
   await browserExpect(status).toHaveText(/^Tomo is working… Bash · 4\ds$/);
+  expect(await shown()).toMatch(/^Bash · 4\ds$/);
   sdk.pushEvent({ type: "rate_limit_event", rate_limit_info: { status: "allowed_warning", rateLimitType: "five_hour", utilization: 0.91, resetsAt: Math.floor(Date.now() / 1000) + 7200 } });
   await browserExpect(page.getByText(/^5-hour limit almost reached · 91% · resets in/)).toBeVisible();
   await page.screenshot({ path: "test-results/turn-running-desktop.png" });

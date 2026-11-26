@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { WebRequest } from "../src/web/protocol.js";
-import { composerStatus, composerStatusIsProblem, elapsedLabel, rateLimitNotice, requestStamp, toolName, turnDetail, turnOutcome, TYPING_ACTIVITY, type ComposerNote, type TurnStatus } from "../web/src/composer-status.js";
+import { composerStatus, composerStatusIsProblem, composerStatusSpoken, elapsedLabel, rateLimitNotice, requestStamp, toolName, turnDetail, turnOutcome, TYPING_ACTIVITY, type ComposerNote, type TurnStatus } from "../web/src/composer-status.js";
 import { modelLabel } from "../web/src/tasks.js";
 import { deferred } from "../web/src/i18n/message.js";
 
@@ -12,7 +12,8 @@ describe("composer status: one line, one source", () => {
       composerStatus({ activity: undefined, note: { text: null, at: "" }, latest, settled: null, ...extra });
     expect(at(undefined, { note: { text: deferred.t("chat:composer.sending"), at: "" } })).toBe("Sending…");
     expect(at(req("queued"))).toBe("Queued");
-    expect(at(req("running"))).toBe("Tomo is working…");
+    // Running with nothing to add: no words (the chat shows the turn working).
+    expect(at(req("running"))).toBe("");
     expect(at(req("running"), { activity: "Bash · running" })).toBe("Bash · running");
     expect(at(req("completed"))).toBe("Completed");
     expect(at(req("completed"), { settled: "r1" })).toBe("");
@@ -38,7 +39,8 @@ describe("composer status: one line, one source", () => {
     const note: ComposerNote = { text: deferred.t("chat:request.queued"), at: requestStamp(queued) };
     const line = (latest: WebRequest, settled: string | null = null) => composerStatus({ activity: undefined, note, latest, settled });
     expect(line(queued)).toBe("Queued");
-    expect(line(req("running"))).toBe("Tomo is working…");
+    // Running: the note has lapsed, and the line has nothing of its own to say.
+    expect(line(req("running"))).toBe("");
     expect(line(req("completed"))).toBe("Completed");
     expect(line(req("completed"), "r1")).toBe("");
     // A note written before the request was accepted lapses once it is.
@@ -51,10 +53,41 @@ describe("composer status: what the SDK says about the turn", () => {
   const line = (latest: WebRequest | undefined, turn: TurnStatus | undefined, extra: Partial<Parameters<typeof composerStatus>[0]> = {}) =>
     composerStatus({ activity: undefined, note: none, latest, settled: null, turn, now: 10_000, ...extra });
 
+  it("a running turn with nothing to add shows no words: never a bare \"… is working…\"", () => {
+    const typing = { activity: TYPING_ACTIVITY };
+    expect(line(req("running"), undefined)).toBe("");
+    expect(line(undefined, undefined, typing)).toBe("");
+    expect(line(req("running"), undefined, { ...typing, agent: "Claw" })).toBe("");
+    // A tool that has only just started is not worth a word either.
+    expect(line(req("running"), { status: { kind: "tool", tool: "Bash", elapsed: 1 }, at: 10_000 })).toBe("");
+    // Typing over an earlier request's end: its "Completed" / "Stopped" / failure gives way, to nothing.
+    expect(line(req("completed"), { status: { kind: "stopped" }, at: 0 }, typing)).toBe("");
+    expect(line(req("failed"), undefined, typing)).toBe("");
+    // Waiting in line is not working: it keeps its word (no dots show for it).
+    expect(line(req("queued"), undefined)).toBe("Queued");
+  });
+
+  it("a screen reader still hears that the turn is working, exactly while the line is the running turn's", () => {
+    const spoken = (latest: WebRequest | undefined, extra: Partial<Parameters<typeof composerStatus>[0]> = {}) =>
+      composerStatusSpoken({ activity: undefined, note: none, latest, settled: null, now: 10_000, ...extra });
+    expect(spoken(req("running"))).toBe("Tomo is working…");
+    expect(spoken(undefined, { activity: TYPING_ACTIVITY, agent: "Claw" })).toBe("Claw is working…");
+    expect(spoken(req("completed"), { activity: TYPING_ACTIVITY })).toBe("Tomo is working…");
+    // With a detail shown, it is said ahead of it.
+    expect(spoken(req("running"), { turn: { status: { kind: "retry", attempt: 2, max: 10, delayMs: 4000, error: "overloaded" }, at: 9_000 } })).toBe("Tomo is working…");
+    // Any other line speaks for itself.
+    for (const state of ["queued", "completed", "failed", "refused", "unknown", "interrupted"] as const) expect(spoken(req(state))).toBe("");
+    expect(spoken(undefined)).toBe("");
+    expect(spoken(req("running"), { activity: "Bash · running" })).toBe("");
+    const running = req("running");
+    expect(spoken(running, { note: { text: deferred.t("chat:composer.checkFailed"), at: requestStamp(running), warn: true } })).toBe("");
+    expect(spoken(running, { note: { text: deferred.t("chat:composer.sending"), at: "" } })).toBe("Tomo is working…");
+  });
+
   it("a retry is named while the turn runs, and never once it is over", () => {
     const retry: TurnStatus = { status: { kind: "retry", attempt: 2, max: 10, delayMs: 4000, error: "overloaded" }, at: 9_000 };
-    expect(line(req("running"), retry)).toBe("Tomo is working… Retrying 2/10 · claude is overloaded");
-    expect(line(undefined, retry, { activity: TYPING_ACTIVITY })).toBe("Tomo is working… Retrying 2/10 · claude is overloaded");
+    expect(line(req("running"), retry)).toBe("Retrying 2/10 · claude is overloaded");
+    expect(line(undefined, retry, { activity: TYPING_ACTIVITY })).toBe("Retrying 2/10 · claude is overloaded");
     expect(line(req("completed"), retry)).toBe("Completed");
   });
 
@@ -62,7 +95,7 @@ describe("composer status: what the SDK says about the turn", () => {
     const tool = (elapsed: number): TurnStatus => ({ status: { kind: "tool", tool: "mcp__tomo-internal__recall", elapsed }, at: 4_000 });
     expect(turnDetail(tool(1), 5_000)).toBe("");
     expect(turnDetail(tool(31), 4_000)).toBe("recall · 31s");
-    expect(line(req("running"), tool(31))).toBe("Tomo is working… recall · 37s");
+    expect(line(req("running"), tool(31))).toBe("recall · 37s");
     expect(toolName("Bash")).toBe("Bash");
     expect([elapsedLabel(59.9), elapsedLabel(125), elapsedLabel(3725)]).toEqual(["59s", "2m 05s", "1h 02m"]);
   });
@@ -71,7 +104,8 @@ describe("composer status: what the SDK says about the turn", () => {
     const stopped: TurnStatus = { status: { kind: "stopped" }, at: 0 };
     expect(line(req("completed"), stopped)).toBe("Stopped");
     expect(line(req("completed"), stopped, { settled: "r1" })).toBe("");
-    expect(line(req("running"), stopped)).toBe("Tomo is working…");
+    // A running turn is not the stopped one: the old outcome is not shown over it.
+    expect(line(req("running"), stopped)).toBe("");
     expect(line(req("failed"), { status: { kind: "error", error: "authentication_failed" }, at: 0 }))
       .toBe("Claude login expired. Send /login to sign in again — not answered");
     expect(turnOutcome({ status: { kind: "error", error: "brand_new" }, at: 0 })).toBe("The model returned an error — not answered");
@@ -79,7 +113,7 @@ describe("composer status: what the SDK says about the turn", () => {
 
   it("a refusal names the models", () => {
     const fallback: TurnStatus = { status: { kind: "refusal", model: "claude-fable-5-1[1m]", fallbackModel: "claude-opus-5-5" }, at: 0 };
-    expect(line(req("running"), fallback)).toBe("Tomo is working… Fable 5.1 declined · continuing on Opus 5.5");
+    expect(line(req("running"), fallback)).toBe("Fable 5.1 declined · continuing on Opus 5.5");
     expect(line(req("completed"), fallback)).toBe("Fable 5.1 declined this; answered by Opus 5.5");
     expect(turnOutcome({ status: { kind: "refusal", model: "claude-fable-5-1" }, at: 0 })).toBe("Fable 5.1 declined this request");
     expect(modelLabel("claude-opus-5-5[1m]")).toBe("Opus 5.5");

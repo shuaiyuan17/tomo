@@ -9,7 +9,7 @@ import { cn } from "@/lib/utils";
 import { api, ApiError, dismissRequest, sendMessage, stopTurn } from "./api.js";
 import { AttachmentTray } from "./attachment-tray.js";
 import { createCompositionGuard } from "./compose-keys.js";
-import { composerStatus, composerStatusIsProblem, requestMessage, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
+import { composerStatus, composerStatusIsProblem, composerStatusSpoken, requestMessage, requestStamp, useCompletedSettle, type ComposerNote } from "./composer-status.js";
 import type { SentAttachments } from "./conversation-rows.js";
 import { CredentialCard } from "./credential-card.js";
 import { PermissionCard, PermissionGranted, type GrantedPermission } from "./permission-card.js";
@@ -378,7 +378,9 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
 /**
  * The status line above the composer. It counts a running tool's seconds
  * itself between the daemon's reports: the per-second tick re-renders this
- * line only.
+ * line only. A running turn with nothing to add shows no words (the chat
+ * shows it working); the line keeps its height, and a screen reader still
+ * hears "… is working…".
  */
 function StatusLine({ activity, note, latest, agent, turn, turnActive }: Omit<Parameters<typeof composerStatus>[0], "settled" | "now"> & { turnActive: boolean }) {
   const settle = useCompletedSettle(latest);
@@ -391,7 +393,8 @@ function StatusLine({ activity, note, latest, agent, turn, turnActive }: Omit<Pa
     return () => clearInterval(timer);
   }, [ticking]);
   const input = { activity, note, latest, settled: settle.settled, agent, turn, now };
+  const spoken = composerStatusSpoken(input);
   return <div className="flex min-h-7 items-baseline gap-3 pb-2">
-    <div className={cn("feedback min-w-0 flex-1 tracking-[0.02em] text-xs leading-normal text-muted-foreground tabular-nums transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0", composerStatusIsProblem(input) && "text-destructive")} role="status" aria-live="polite">{composerStatus(input)}</div>
+    <div className={cn("feedback min-w-0 flex-1 tracking-[0.02em] text-xs leading-normal text-muted-foreground tabular-nums transition-opacity duration-200 [overflow-wrap:anywhere]", settle.fading && "opacity-0", composerStatusIsProblem(input) && "text-destructive")} role="status" aria-live="polite">{spoken && <span className="sr-only">{spoken} </span>}{composerStatus(input)}</div>
   </div>;
 }

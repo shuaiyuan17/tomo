@@ -8,7 +8,7 @@ import { deferred, say, type Message } from "./i18n/message.js";
 export const COMPLETED_VISIBLE_MS = 2000;
 export const COMPLETED_FADE_MS = 200;
 
-/** The request states as the status line words them, naming the agent (see agent-name.ts). */
+/** The request states in words, naming the agent (see agent-name.ts). "running" is shown only as an answer to "check the outcome", and spoken to a screen reader. */
 export function requestLabels(agent = "Tomo"): Record<WebRequest["state"], string> {
   return { queued: i18n.t("chat:request.queued"), running: i18n.t("chat:request.running", { agent }), completed: i18n.t("chat:request.completed"),
     failed: i18n.t("chat:request.failed"), refused: i18n.t("chat:request.refused"),
@@ -27,7 +27,7 @@ export function requestMessage(state: WebRequest["state"], agent: string): Messa
     case "interrupted": return deferred.t("chat:request.interrupted", { agent });
   }
 }
-/** The typing indicator's activity value; the status line words it with the agent's name. */
+/** The typing indicator's activity value: a turn is running. */
 export const TYPING_ACTIVITY = "typing";
 
 /** Where the latest request stands: a note is tied to this and lapses when it moves. */
@@ -76,7 +76,7 @@ export function isTransient(status: WebTurnStatus): boolean { return status.kind
 /** A tool's progress is only worth a word once it has run this long. */
 export const TOOL_PROGRESS_SHOWN_AFTER_S = 10;
 
-/** What a running turn is doing, appended to "… is working…"; "" when there is nothing to add. */
+/** What a running turn is doing, worth a word in the status line; "" when there is nothing to say. */
 export function turnDetail(turn: TurnStatus | undefined, now: number): string {
   if (!turn) return "";
   const { status } = turn;
@@ -129,26 +129,21 @@ export function rateLimitNotice(limit: WebRateLimit | undefined, now: number): s
  * The composer's ONE status line. Live tool/typing activity first; then a
  * note the page produced, but only while the latest request is still where
  * it was when the note was written (any change of request or state retires
- * it, so a note can never hold back "Running" or "Completed"); then the
+ * it, so a note can never hold back "Queued" or "Completed"); then the
  * latest web request's state, read live from the request stream. A
  * completed request shows "Completed" until `settled` names it.
+ *
+ * A running turn shows only what it has to add (a retry, a long tool, a
+ * model that declined): that it is working at all is the chat's to show
+ * (the thinking dots, the steps, the reply), and composerStatusSpoken's to
+ * say to a screen reader.
  */
-export function composerStatus(input: {
-  activity: string | undefined;
-  note: ComposerNote;
-  latest: WebRequest | undefined;
-  settled: string | null;
-  /** The agent's name (default "Tomo"). */
-  agent?: string;
-  /** What the SDK last reported about this conversation's turn. */
-  turn?: TurnStatus;
-  now?: number;
-}): string {
+export function composerStatus(input: ComposerStatusInput): string {
   const labels = requestLabels(input.agent);
   const { latest } = input;
   const working = input.activity === TYPING_ACTIVITY || latest?.state === "running";
   const detail = working ? turnDetail(input.turn, input.now ?? Date.now()) : "";
-  if (input.activity === TYPING_ACTIVITY) return detail ? `${labels.running} ${detail}` : labels.running;
+  if (input.activity === TYPING_ACTIVITY) return detail;
   if (input.activity) return input.activity;
   if (input.note.text && input.note.at === requestStamp(latest)) return say(input.note.text);
   // How the turn went, in the SDK's own terms, outranks the bare request state
@@ -158,8 +153,33 @@ export function composerStatus(input: {
   const outcome = latest?.state === "queued" || latest?.state === "running" ? "" : turnOutcome(input.turn);
   if (outcome) return outcome;
   if (!latest) return "";
-  if (latest.state === "running" && detail) return `${labels.running} ${detail}`;
+  if (latest.state === "running") return detail;
   return labels[latest.state];
+}
+
+/**
+ * What a screen reader hears ahead of the line composerStatus shows for the
+ * same input: "… is working…" whenever that line is a running turn's (its
+ * detail, or nothing), so the turn is announced though the words are not
+ * shown; "" when the line is anything else (it speaks for itself).
+ */
+export function composerStatusSpoken(input: ComposerStatusInput): string {
+  const { latest } = input;
+  const running = input.activity === TYPING_ACTIVITY
+    || (!input.activity && !(input.note.text && input.note.at === requestStamp(latest)) && latest?.state === "running");
+  return running ? requestLabels(input.agent).running : "";
+}
+
+export interface ComposerStatusInput {
+  activity: string | undefined;
+  note: ComposerNote;
+  latest: WebRequest | undefined;
+  settled: string | null;
+  /** The agent's name (default "Tomo"). */
+  agent?: string;
+  /** What the SDK last reported about this conversation's turn. */
+  turn?: TurnStatus;
+  now?: number;
 }
 
 /** Request states the status line shows as a problem. */
@@ -171,7 +191,7 @@ const PROBLEM_STATES = new Set<WebRequest["state"]>(["failed", "refused", "unkno
  * error or an unanswered refusal, or a failed / refused / unknown /
  * interrupted request. Progress, "Stopped" and "Completed" never are.
  */
-export function composerStatusIsProblem(input: Parameters<typeof composerStatus>[0]): boolean {
+export function composerStatusIsProblem(input: ComposerStatusInput): boolean {
   const { latest } = input;
   if (input.activity) return false;
   if (input.note.text && input.note.at === requestStamp(latest)) return !!input.note.warn;

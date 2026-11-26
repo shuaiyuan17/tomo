@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { COMPOSER_FIELD, COMPOSER_FORM, COMPOSER_SEND } from "./composer-frame.js";
 import { ArrowLeft, ArrowUp, Check, ChevronDown, Circle, CircleDot, Paperclip } from "lucide-react";
 import type { WebSubsession, WebSubsessionDetail, WebSubsessionDoneStep, WebSubsessionPlanStep, WebSubsessionUpdate } from "../../src/web/protocol.js";
@@ -9,6 +9,8 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { api, ApiError } from "./api.js";
 import { Text } from "./markdown.js";
 import { ModelBadge } from "./model-badge.js";
+import { useAgentName } from "./agent-name.js";
+import { RAIL_SCROLL, useScrollbarInPadding } from "./rail-scroll.js";
 import { differentDay, messageDateTime, messageTime } from "./message-meta.js";
 import { createCompositionGuard } from "./compose-keys.js";
 import { canRetrySend, folded, planStepLook, showableTime, updateText, SUBSESSIONS_RETRY_MS, subsessionChatRows, updatePending, usePending, subsessionState, subsessionStateLabel, isWorkingState, asksOwner, ownerAsk, withListBackground, hasProgress, leadsWithChat, progressSummary, type PendingSubsessionMessage, type ProgressSummary, type SubsessionChatRow } from "./subsessions.js";
@@ -39,7 +41,7 @@ type Status = "loading" | "ready" | "gone" | "error";
  *
  * Until anything has been said, the view leads with what the task is doing
  * (its plan, decisions and updates) under the brief, at full size. Once there
- * is a message or a report, that folds into one line above the chat (the step
+ * is a message or a report, that folds into one line under the brief, above the chat (the step
  * it is on), which opens it again.
  */
 export function SubsessionView({ summary, revision, onBack, send }: { summary: WebSubsession; revision: number; onBack: () => void; send?: SubsessionSend }) {
@@ -105,11 +107,11 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
         {isWorkingState(state) ? <span className="shimmer">{subsessionStateLabel(shown)}</span> : <span className={cn(asksOwner(state) && "font-medium text-foreground/80")}>{subsessionStateLabel(shown)}</span>}
         {asksOwner(state) && ownerAsk(shown) ? <> · {ownerAsk(shown)}</> : null}</p>
     </div>
-    {progress && foldLine && <ProgressFold summary={foldLine} open={progressOpen} onOpenChange={setProgressOpen}>
-      <Doing plan={progress.plan} done={progress.doneSteps} running={running} />
-      <Updates updates={progress.updates} />
-    </ProgressFold>}
     <Chat rows={rows} status={detail ? "ready" : status} id={id} onRetry={deliver} follow={chatFirst}
+      fold={progress && foldLine ? <ProgressFold summary={foldLine} open={progressOpen} onOpenChange={setProgressOpen}>
+        <Doing plan={progress.plan} done={progress.doneSteps} running={running} />
+        <Updates updates={progress.updates} />
+      </ProgressFold> : undefined}
       overview={progress && !chatFirst ? <div data-testid="subsession-overview" className="flex flex-col gap-4 px-0.5 pt-1">
         <Doing plan={progress.plan} done={progress.doneSteps} running={running} roomy />
         <Updates updates={progress.updates} roomy />
@@ -119,7 +121,7 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
   </section>;
 }
 
-/** Done steps shown before "show earlier", and updates before "show all": folded above the chat, and with the view to themselves (`roomy`). */
+/** Done steps shown before "show earlier", and updates before "show all": folded under the brief, and with the view to themselves (`roomy`). */
 const DONE_SHOWN = 3;
 const UPDATES_SHOWN = 3;
 const DONE_SHOWN_ROOMY = 6;
@@ -141,12 +143,13 @@ function When({ at }: { at: number }) {
  */
 function Doing({ plan, done, running, roomy }: { plan?: WebSubsessionPlanStep[]; done?: WebSubsessionDoneStep[]; running: boolean; roomy?: boolean }) {
   const { t } = useTranslation("tasks");
+  const agent = useAgentName();
   const [open, setOpen] = useState(false);
   if (!plan?.length && !done?.length) return null;
   const keep = roomy ? DONE_SHOWN_ROOMY : DONE_SHOWN;
   const finished = folded(done ?? [], keep, open, "end");
-  return <section aria-label={t("subsession.doing.heading")} data-testid="subsession-doing">
-    <p className={sectionHeading}>{t("subsession.doing.heading")}</p>
+  return <section aria-label={t("subsession.doing.heading", { agent })} data-testid="subsession-doing">
+    <p className={sectionHeading}>{t("subsession.doing.heading", { agent })}</p>
     {finished.hidden > 0 || open && (done?.length ?? 0) > keep ? <button type="button" aria-expanded={open} onClick={() => setOpen((v) => !v)} className={cn(foldButton, "mb-1")}>
       {open ? t("subsession.doing.fewer") : t("subsession.doing.earlier", { count: finished.hidden })}</button> : null}
     <ol className="m-0 flex list-none flex-col gap-1 p-0">
@@ -190,20 +193,21 @@ function Updates({ updates, roomy }: { updates?: WebSubsessionUpdate[]; roomy?: 
 }
 
 /**
- * What the task is doing, folded into one line above the chat once there is
+ * What the task is doing, folded into one line under the brief once there is
  * something to read there: the step it is on (or its latest update) and how
  * far through its plan it is. Opens in place to the full checklist and the
  * decisions and updates.
  */
 export function ProgressFold({ summary, open, onOpenChange, children }: { summary: ProgressSummary; open: boolean; onOpenChange: (open: boolean) => void; children: ReactNode }) {
   const { t } = useTranslation("tasks");
+  const agent = useAgentName();
   const count = summary.total !== undefined ? t("subsession.progress.count", { done: summary.done, total: summary.total }) : undefined;
   return <Collapsible open={open} onOpenChange={onOpenChange} data-testid="subsession-progress"
-    className="mx-2.5 mb-2 overflow-hidden rounded-lg border bg-card/70">
-    <CollapsibleTrigger title={open ? t("subsession.progress.hide") : t("subsession.progress.show")}
+    className="overflow-hidden rounded-lg border bg-card/70">
+    <CollapsibleTrigger title={open ? t("subsession.progress.hide", { agent }) : t("subsession.progress.show", { agent })}
       className="group flex w-full cursor-pointer items-center gap-2 px-2.5 py-1.5 text-left transition-colors hover:bg-foreground/[0.04] focus-visible:outline-offset-0">
       <SummaryMark look={summary.look} />
-      <span className="sr-only">{t("subsession.progress.label")}</span>
+      <span className="sr-only">{t("subsession.progress.label", { agent })}</span>
       <span data-testid="subsession-progress-summary" className={cn("min-w-0 flex-1 truncate text-[12px] leading-snug",
         summary.look === "running" || summary.look === "paused" ? "font-medium text-foreground/85" : "text-foreground/75")}>
         {summary.text}</span>
@@ -233,12 +237,16 @@ export function IdPill({ id, className }: { id: string; className?: string }) {
 
 /**
  * The brief and the conversation. `overview`: what the task is doing, shown at
- * full size after the brief while nothing has been said. `follow`: keep to the
+ * full size after the brief while nothing has been said. `fold`: the same,
+ * folded into one line, between the brief and the conversation once something
+ * has been said. `follow`: keep to the
  * end as lines arrive (the chat leads); otherwise it opens at the top.
  */
-function Chat({ rows, status, id, onRetry, overview, follow }: { rows: SubsessionChatRow[]; status: Status; id: string; onRetry: (message: PendingSubsessionMessage) => void; overview?: ReactNode; follow: boolean }) {
+export function Chat({ rows, status, id, onRetry, overview, fold, follow }: { rows: SubsessionChatRow[]; status: Status; id: string; onRetry: (message: PendingSubsessionMessage) => void; overview?: ReactNode; fold?: ReactNode; follow: boolean }) {
   const { t } = useTranslation("tasks");
-  const scroll = useRef<HTMLDivElement>(null);
+  const scroll = useRef<HTMLDivElement | null>(null);
+  const gutter = useScrollbarInPadding<HTMLDivElement>();
+  const scrollRef = useCallback((el: HTMLDivElement | null) => { scroll.current = el; gutter(el); }, [gutter]);
   const pinned = useRef(true);
   const last = rows.at(-1)?.key;
   // Follows the end while the reader is there; reading further up stays put.
@@ -250,12 +258,12 @@ function Chat({ rows, status, id, onRetry, overview, follow }: { rows: Subsessio
     followed.current = follow;
     if (el && follow && pinned.current) el.scrollTop = el.scrollHeight;
   }, [last, rows.length, follow]);
-  return <div ref={scroll} onScroll={(e) => { const el = e.currentTarget; pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48; }}
-    className="min-h-0 flex-1 overflow-y-auto px-2.5 pb-2 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]" tabIndex={0} aria-label={t("subsession.conversation", { id })}>
+  return <div ref={scrollRef} onScroll={(e) => { const el = e.currentTarget; pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48; }}
+    className={cn("min-h-0 flex-1 overflow-y-auto px-2.5 pb-2", RAIL_SCROLL)} data-testid="subsession-scroll" tabIndex={0} aria-label={t("subsession.conversation", { id })}>
     {status !== "ready" && <p className="m-0 px-1.5 text-[13px] text-muted-foreground" role="status">{status === "loading" ? t("note.loading") : status === "gone" ? t("subsession.gone") : t("note.error")}</p>}
     {(status === "ready" || rows.length > 0) && <ol className="m-0 flex list-none flex-col gap-3 p-0">
-        {rows.map((row) => <li key={row.key} className="min-w-0">{rowView(row, id, onRetry)}</li>)}
-        {status === "ready" && rows.length === 1 && <li className="px-0.5 text-[11.5px] text-muted-foreground">{t("subsession.nothingYet", { id })}</li>}
+        {rows.map((row) => <Fragment key={row.key}><li className="min-w-0">{rowView(row, id, onRetry)}</li>
+          {row.kind === "brief" && fold ? <li className="min-w-0">{fold}</li> : null}</Fragment>)}
       </ol>}
     {overview && status === "ready" && <div className="motion-enter mt-4 min-w-0">{overview}</div>}
   </div>;
@@ -346,7 +354,7 @@ function SubsessionComposer({ id, writable, ended, onSend }: { id: string; writa
       <label className="sr-only" htmlFor={`subsession-message-${id}`}>{t("subsession.label", { id })}</label>
       <Textarea ref={input} id={`subsession-message-${id}`} data-testid="subsession-input" value={draft} maxLength={16_000} rows={1} disabled={!writable}
         placeholder={t("subsession.placeholder", { id })}
-        className={cn(COMPOSER_FIELD, "max-h-40 pr-2 text-[13.5px] disabled:opacity-70 md:text-[13.5px]")}
+        className={cn(COMPOSER_FIELD, "max-h-40 pr-2 py-[7px] text-[13.5px] leading-[22px] disabled:opacity-70 md:text-[13.5px]")}
         onChange={(e) => setDraft(e.target.value)} onCompositionStart={() => ime.current.start()} onCompositionEnd={() => ime.current.end()}
         onKeyDown={(e) => { if (ime.current.shouldSubmit({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
       <Button type="submit" size="icon" aria-label={t("subsession.send", { id })} disabled={!canSend}

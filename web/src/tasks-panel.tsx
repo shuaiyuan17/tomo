@@ -15,6 +15,7 @@ import { i18n, useTranslation } from "./i18n/index.js";
 import { toolIcon } from "./tool-calls.js";
 import { asksOwner, isOpenSubsession, subsessionState, subsessionStateLabel, isWorkingState } from "./subsessions.js";
 import { IdPill, SubsessionView, type SubsessionSend } from "./subsession-view.js";
+import { RAIL_SCROLL, useScrollbarInPadding } from "./rail-scroll.js";
 
 /** A task's transcript view: its own chunk, fetched when a task is opened. */
 const SubagentView = lazy(() => import("./subagent-view.js").then((m) => ({ default: m.SubagentView })));
@@ -30,6 +31,7 @@ export interface RailSubsessions { tasks: WebSubsession[]; revision: number; sen
 export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessions }: { tasks: WebTask[]; sessions: WebSession[]; onClose?: () => void; footer?: ReactNode; control?: TaskControl; subsessions?: RailSubsessions }) {
   const { t } = useTranslation("tasks");
   const [showAmbient, setShowAmbient] = useState(false);
+  const listGutter = useScrollbarInPadding<HTMLDivElement>();
   /** Open "N shell commands done" rows, per session and parent. */
   const [openFolds, setOpenFolds] = useState<Record<string, boolean>>({});
   const [opened, setOpened] = useState<{ sessionId: string; taskId: string }>();
@@ -58,8 +60,9 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessi
   const close = onClose && <Button data-tasks-close variant="ghost" size="icon" aria-label={t("close")} title={t("closeTitle")} onClick={onClose}
     className="size-8 rounded-lg max-[600px]:size-10 hover:bg-foreground/[0.07] active:bg-foreground/[0.11] [&_svg:not([class*='size-'])]:size-5"><X strokeWidth={1.75} /></Button>;
   // Task list ↔ task view slide: in from the right when opening, from the left when going back.
+  // Above the view: its slide-in leaves it a layer of its own, which would cover the button.
   if (openSub && subsessions) return <div className="relative flex min-h-0 flex-1 flex-col">
-    <div className="absolute top-0 right-1">{close}</div>
+    <div className="absolute top-0 right-1 z-10">{close}</div>
     <SubsessionView key={openSub.id} summary={openSub} revision={subsessions.revision} send={subsessions.send} onBack={() => { setCameBack(true); setOpenedSub(undefined); }} />
   </div>;
   if (openTask) return <div className="motion-from-right relative flex min-h-0 flex-1 flex-col">
@@ -74,7 +77,7 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessi
     {ambient && <label className="mb-2.5 flex cursor-pointer items-center gap-2 px-2.5 tracking-[0.02em] text-[10px] text-muted-foreground">
       <Checkbox checked={showAmbient} onCheckedChange={(value) => setShowAmbient(value === true)} className="size-3.5 rounded-[4px]" />
       {view.hiddenAmbient ? t("watchersCount", { count: view.hiddenAmbient }) : t("watchers")}</label>}
-    <div className="min-h-0 flex-1 overflow-y-auto pr-2.5 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] focus-visible:outline-offset-0" tabIndex={0} aria-label={t("list")}>
+    <div ref={listGutter} className={cn("min-h-0 flex-1 overflow-y-auto focus-visible:outline-offset-0", RAIL_SCROLL)} tabIndex={0} aria-label={t("list")}>
       {subsessions && subsessions.tasks.length > 0 && <div className="mb-4" data-testid="subsessions">
         <p className="mt-1 mb-1 px-2.5 tracking-[0.02em] text-[11px] text-muted-foreground">{t("subsession.group")}</p>
         <ul className="m-0 list-none space-y-0.5 p-0">{subsessions.tasks.map((task) => <SubsessionCard key={task.id} task={task} onOpen={() => setOpenedSub(task.id)} />)}</ul>

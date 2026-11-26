@@ -33,7 +33,9 @@ beforeEach(async () => {
   // A task's turn never ends here: it stays active, "Working".
   mockSdk.responseFn = () => new Promise(() => {});
   await channel.start();
-  browser = await chromium.launch(); page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  // Scrollbars as the owner's browser draws them (Playwright hides them by default): one that takes room must not
+  // push the rail's content off centre.
+  browser = await chromium.launch({ ignoreDefaultArgs: ["--hide-scrollbars"] }); page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   // The page reads the list once it connects. Wait for that read to be answered: still in flight, the
   // daemon can answer it after a test's spawn (the `subsessions` event that follows is debounced 250 ms,
   // so this stale answer lands first), and a page.route the test installs meanwhile never sees it.
@@ -180,3 +182,92 @@ it("leads with what the task is doing until something is said, then folds it int
   await browserExpect(chat.getByTestId("subsession-doing")).toHaveCount(0);
   await browserExpect(chat.locator('[data-from="task"]').filter({ hasText: "It races the first paint." })).toBeVisible();
 });
+
+it("keeps the rail's content centred, gap for gap, and both input bars' placeholders on the bar's middle: light and dark, desktop and phone", async () => {
+  expect(agent.subsessions!.spawn("dm:owner", { title: "Fix the flaky test", brief: "Find why signals.e2e flakes and fix it." }).ok).toBe(true);
+  expect(agent.subsessions!.setPlan("task:s1", [{ step: "Run it in a loop", status: "in_progress" }, { step: "Fix the wait" }], [{ step: "Read the test" }]).ok).toBe(true);
+  // Enough said that the chat scrolls: a scrollbar that takes room must not push the content off centre.
+  for (let i = 0; i < 12; i++) await agent.subsessions!.reply("task:s1", `Line ${i}: it races the first paint, and the wait is on a timer, not the response.`);
+
+  // A phone shows the rail as a dialog, not a complementary landmark.
+  const panel = () => page.locator("#tasks-rail");
+  /** How far `selector`'s box is from the rail's inner edges, left and right (the rail's border not counted). */
+  const gaps = (selector: string) => page.evaluate((sel) => {
+    const aside = document.getElementById("tasks-rail")!;
+    const r = aside.getBoundingClientRect(); const inner = { left: r.left + aside.clientLeft, right: r.left + aside.clientLeft + aside.clientWidth };
+    const box = document.querySelector(sel)!.getBoundingClientRect();
+    return { left: box.left - inner.left, right: inner.right - box.right };
+  }, selector);
+  /** A field's placeholder line, centre to centre with its bar: the line box sits at the top of the content box. */
+  const offCentre = (selector: string) => page.evaluate((sel) => {
+    const field = document.querySelector<HTMLTextAreaElement>(sel)!;
+    const style = getComputedStyle(field);
+    const top = field.getBoundingClientRect().top + field.clientTop + parseFloat(style.paddingTop);
+    const line = top + parseFloat(style.lineHeight) / 2;
+    const bar = field.closest("form")!.getBoundingClientRect();
+    return { empty: field.value === "", lineHeight: style.lineHeight, off: Math.abs(line - (bar.top + bar.height / 2)), bar: bar.height };
+  }, selector);
+  // Polled: the view slides in, and only once it has settled is a gap what it stays.
+  const centred = async (selector: string) => {
+    let last = { left: 0, right: 0 };
+    await browserExpect.poll(async () => { last = await gaps(selector); return Math.abs(last.left - last.right); }, { message: `${selector} centred`, timeout: 3000 }).toBeLessThanOrEqual(1);
+    expect(last.left).toBeGreaterThan(8);
+  };
+  const placeholderCentred = async (selector: string) => {
+    const m = await offCentre(selector);
+    expect(m.empty).toBe(true);
+    expect(m.lineHeight).toMatch(/px$/);
+    expect(m.off, `${selector}: ${JSON.stringify(m)}`).toBeLessThanOrEqual(1);
+    return m.bar;
+  };
+
+  for (const { name, viewport } of [{ name: "desktop", viewport: { width: 1440, height: 900 } }, { name: "phone", viewport: { width: 390, height: 844 } }]) {
+    for (const scheme of ["light", "dark"] as const) {
+      await page.setViewportSize(viewport);
+      await page.emulateMedia({ colorScheme: scheme });
+      // On a phone the rail covers the DM: close it to see the DM's bar.
+      if (name === "phone" && await panel().isVisible()) { await panel().locator("[data-tasks-close]").click(); await browserExpect(panel()).toBeHidden(); }
+      await browserExpect(page.locator("html")).toHaveClass(scheme === "dark" ? /\bdark\b/ : /^(?!.*\bdark\b)/);
+      // The DM's bar, empty, then focused: the placeholder on its middle, the bar shorter than it was (62px).
+      await browserExpect(page.locator("#message")).toBeVisible();
+      expect(await placeholderCentred("#message")).toBeLessThanOrEqual(52);
+      await page.locator("#message").focus();
+      await placeholderCentred("#message");
+      await page.locator("form.composer").screenshot({ path: `test-results/composer-main-${name}-${scheme}.png` });
+
+      if (!(await panel().isVisible())) await page.getByRole("button", { name: /^Tasks/ }).click();
+      const chat = panel().locator('[data-subsession="s1"]');
+      await browserExpect(panel().locator('[data-subsession="s1"], [data-subsession-row="s1"]').first()).toBeVisible();
+      if (!(await chat.isVisible())) await panel().locator('[data-subsession-row="s1"]').getByRole("button").click();
+      const fold = chat.getByTestId("subsession-progress");
+      await browserExpect(fold).toBeVisible();
+      await chat.getByTestId("subsession-scroll").evaluate((el) => { el.scrollTop = 0; });
+      await browserExpect.poll(() => chat.getByTestId("subsession-scroll").evaluate((el) => el.scrollHeight > el.clientHeight)).toBe(true);
+      // A scrollbar that takes room (Linux, Windows) sits in the rail's padding, not in the content.
+      const bar = await chat.getByTestId("subsession-scroll").evaluate((el) => ({ width: el.offsetWidth - el.clientWidth, margin: getComputedStyle(el).marginRight }));
+      console.log(`scrollbar ${name}/${scheme}: ${JSON.stringify(bar)}`);
+      if (bar.width > 0) expect(bar.margin).toBe(`-${bar.width}px`);
+      for (const sel of ['[data-subsession="s1"] [aria-label="Brief"]', "[data-testid=subsession-progress]", '[data-subsession="s1"] [data-from="task"]', '[data-subsession="s1"] form'])
+        await centred(sel);
+      // Opened, the checklist is centred too.
+      const trigger = fold.getByRole("button").first();
+      await trigger.click();
+      await browserExpect(fold.getByTestId("subsession-doing")).toBeVisible();
+      await centred("[data-testid=subsession-progress] [data-testid=subsession-doing]");
+      await trigger.click();
+      await browserExpect(fold.getByTestId("subsession-doing")).toHaveCount(0);
+      // The rail's own bar, empty then focused.
+      const input = chat.getByTestId("subsession-input");
+      await input.blur();
+      await placeholderCentred("[data-testid=subsession-input]");
+      await input.focus();
+      await placeholderCentred("[data-testid=subsession-input]");
+      await page.screenshot({ path: `test-results/subsessions-layout-${name}-${scheme}.png` });
+      // Back to the list: it is centred as well.
+      await chat.getByRole("button", { name: "Back to tasks" }).click();
+      await centred('[data-subsession-row="s1"]');
+      await panel().locator('[data-subsession-row="s1"]').getByRole("button").click();
+      await browserExpect(chat).toBeVisible();
+    }
+  }
+}, 120_000);

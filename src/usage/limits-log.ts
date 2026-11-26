@@ -237,6 +237,11 @@ export function readWeeklyWindowPercent(path: string, now = Date.now()): number 
   return windowPercent(readTailSamples(path), weeklyWindow, SEVEN_DAYS_MS, now);
 }
 
+/** Samples older than this do not count for the gate at all (see readQuotaGateReading). */
+export const QUOTA_GATE_SAMPLE_MAX_AGE_MS = 6 * 60 * 60_000;
+/** A usage read that has not settled by then counts as failed: the next one may start. */
+export const QUOTA_REFRESH_TIMEOUT_MS = 60_000;
+
 export type QuotaGateWindow = "five_hour" | "weekly";
 export interface QuotaGateReading { window: QuotaGateWindow; percent: number }
 
@@ -249,7 +254,13 @@ export interface QuotaGateReading { window: QuotaGateWindow; percent: number }
  * exists but cannot be read.
  */
 export function readQuotaGateReading(path: string, now = Date.now()): QuotaGateReading | undefined {
-  const samples = readTailSamples(path);
+  // Only recent samples speak: an old one may be from another login (a
+  // switch to API-key auth leaves the last subscription reading behind),
+  // and with none recent the gate holds nothing.
+  const samples = readTailSamples(path).filter((s) => {
+    const at = Date.parse(s.ts);
+    return Number.isFinite(at) && now - at < QUOTA_GATE_SAMPLE_MAX_AGE_MS;
+  });
   const session = windowPercent(samples, sessionWindow, FIVE_HOURS_MS, now);
   const weekly = windowPercent(samples, weeklyWindow, SEVEN_DAYS_MS, now);
   if (session === undefined && weekly === undefined) return undefined;
@@ -302,6 +313,7 @@ export const QUOTA_REFRESH_WAIT_MS = 15_000;
 export class QuotaGateReader {
   private inFlight: Promise<void> | undefined;
   private lastAttempt = -Infinity;
+  private staleWarned = false;
   private refresh: (() => Promise<unknown>) | undefined;
 
   constructor(private readonly opts: { path: string; refresh?: () => Promise<unknown>; now?: () => number }) {
@@ -315,7 +327,16 @@ export class QuotaGateReader {
 
   /** As readQuotaGateReading (throws when the file cannot be read). */
   read(): QuotaGateReading | undefined {
-    return readQuotaGateReading(this.opts.path, (this.opts.now ?? Date.now)());
+    const now = (this.opts.now ?? Date.now)();
+    const reading = readQuotaGateReading(this.opts.path, now);
+    // Samples there, none recent: say so once per stretch (the gate is open).
+    if (!reading && readTailSamples(this.opts.path).length > 0) {
+      if (!this.staleWarned) log.warn({ maxAgeHours: QUOTA_GATE_SAMPLE_MAX_AGE_MS / 3_600_000 }, "No recent usage reading; sub-session turns are not held for quota");
+      this.staleWarned = true;
+    } else {
+      this.staleWarned = false;
+    }
+    return reading;
   }
 
   /** A fresh usage read in the file when one is due, waited for up to `waitMs`. Never throws. */
@@ -342,9 +363,15 @@ export class QuotaGateReader {
     } catch (err) {
       pending = Promise.reject(err);
     }
-    const settled = pending
+    // A read that never settles must not hold every later one: past the timeout it counts as failed.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`no answer in ${QUOTA_REFRESH_TIMEOUT_MS / 1000}s`)), QUOTA_REFRESH_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    const settled = Promise.race([pending, timeout])
       .then(() => undefined, (err) => { log.warn({ err: errorMessage(err) }, "Could not refresh the usage reading for the sub-session quota gate"); })
-      .finally(() => { if (this.inFlight === settled) this.inFlight = undefined; });
+      .finally(() => { clearTimeout(timer); if (this.inFlight === settled) this.inFlight = undefined; });
     this.inFlight = settled;
     return settled;
   }

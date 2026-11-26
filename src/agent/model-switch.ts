@@ -5,7 +5,7 @@ import { withConfigLockSync } from "../config-file.js";
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
 import { CHATGPT_SUBSCRIPTION_DEFAULT_MODEL, CHATGPT_SUBSCRIPTION_MODE, isChatGptSubscriptionModel } from "../litellm.js";
 import { log } from "../logger.js";
-import { MODEL_ALIASES, isLiteLlmProviderModel, modelLabel, normalizeModelId, resolveModelName, sameModel } from "../models.js";
+import { MODEL_ALIASES, isLiteLlmProviderModel, canonicalModelId, modelLabel, resolveModelName, sameModel } from "../models.js";
 import type { WebModelView } from "../web/protocol.js";
 import { effectiveEffort } from "./effort.js";
 
@@ -115,10 +115,10 @@ export function modelChoices(): Array<{ id: string; label: string; aliases: stri
 
 /** What the web Study's Model page shows for a session key (no browser session id or write access: the caller adds those). */
 export function describeSessionModel(overrides: ReadonlyMap<string, string>, key: string, busy: boolean): Omit<WebModelView, "sessionId" | "writable"> {
-  // An older config's `claude-opus-5-5[1m]` is shown as the untagged id the
-  // options use, so the picker marks it current.
-  const current = normalizeModelId(currentSessionModel(overrides, key));
-  const defaultModel = normalizeModelId(config.model);
+  // A stored alias or an older config's `claude-opus-5-5[1m]` is shown as the
+  // full id the options use, so the picker marks it current.
+  const current = canonicalModelId(currentSessionModel(overrides, key));
+  const defaultModel = canonicalModelId(config.model);
   return {
     model: { id: current, label: modelLabel(current) },
     defaultModel: { id: defaultModel, label: modelLabel(defaultModel) },

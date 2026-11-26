@@ -108,6 +108,16 @@ describe("model switch from the web (agent side)", () => {
     await agent.stop();
   });
 
+  it("hands the SDK tomo's id for a stored alias, and marks it current", () => {
+    resetConfig({ ...OWNER, model: "opus-1m", sessionModelOverrides: { "dm:owner": "fable" } });
+    const server = { type: "sdk", name: "tomo-internal", instance: {} } as unknown as McpSdkServerConfigWithInstance;
+    expect(sdkOptions(server, undefined, undefined, { sessionKey: "dm:other" }).model).toBe("claude-opus-5-5");
+    expect(sdkOptions(server, undefined, "fable", { sessionKey: "dm:owner" }).model).toBe("claude-fable-5-2");
+    const view = describeSessionModel(new Map([["dm:owner", "fable"]]), "dm:owner", false);
+    expect(view.model.id).toBe("claude-fable-5-2");
+    expect(view.defaultModel.id).toBe("claude-opus-5-5");
+  });
+
   it("lists each alias target once, with its aliases", () => {
     const choices = modelChoices();
     expect(choices.map((c) => c.id)).toEqual(["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2"]);

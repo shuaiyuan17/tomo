@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MODEL, MODEL_ALIASES, PICKER_MODELS, modelLabel, normalizeModelId, resolveModelName, sameModel } from "../src/models.js";
+import { canonicalModelId, DEFAULT_MODEL, MODEL_ALIASES, PICKER_MODELS, modelLabel, normalizeModelId, resolveModelName, sameModel } from "../src/models.js";
 import {
   CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
   inferLiteLlmMode,
@@ -46,6 +46,9 @@ describe("model resolution", () => {
     expect(normalizeModelId("claude-haiku-5-5[1m]")).toBe("claude-haiku-5-5");
     expect(sameModel("claude-opus-5-5[1m]", "claude-opus-5-5")).toBe(true);
     expect(sameModel("claude-opus-5-5", "claude-sonnet-5-5")).toBe(false);
+    expect(sameModel("opus-1m", "claude-opus-5-5[1m]")).toBe(true);
+    expect(canonicalModelId("fable")).toBe("claude-fable-5-2");
+    expect(canonicalModelId("not a model")).toBe("not a model");
   });
 
   it("labels tagged and untagged ids alike, Fable 5.1 as older", () => {

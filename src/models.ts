@@ -70,9 +70,18 @@ export function normalizeModelId(model: string): string {
   return match && NATIVE_1M_MODELS.has(match[1]) ? match[1] : model;
 }
 
-/** Whether two model ids name the same model once a redundant `[1m]` tag is dropped. */
+/**
+ * The full id a stored model name stands for: a tomo alias resolved
+ * (`opus-1m` → `claude-opus-5-5`), a redundant `[1m]` dropped; anything
+ * resolveModelName refuses is returned unchanged.
+ */
+export function canonicalModelId(model: string): string {
+  return resolveModelName(model) ?? model;
+}
+
+/** Whether two stored model names (aliases or ids) name the same model. */
 export function sameModel(a: string, b: string): boolean {
-  return normalizeModelId(a) === normalizeModelId(b);
+  return canonicalModelId(a) === canonicalModelId(b);
 }
 
 const DIRECT_MODEL_RE = /^[a-z0-9][a-z0-9._:-]*(?:\[[a-z0-9_-]+\])?$/i;

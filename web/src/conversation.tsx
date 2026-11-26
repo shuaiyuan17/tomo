@@ -144,13 +144,16 @@ export function Conversation({ web, agent, session, sessionId, ownerConversation
   // message carries on the entrance its first block began (often still under way: a short reply is
   // recorded a moment after its block shows), or is simply there once that is over. One recorded
   // before any block of it was shown rises as any new message does.
+  // A turn's blocks share one key, and the FIRST block's time is the one kept: resuming from a later
+  // block's would fade the whole recorded message, earlier blocks included, a second time. So a late
+  // block still rising when the turn is recorded ends its rise there (it is simply shown).
   const streamed = useRef({ scope, shownAt: new Map<string, number>(), resumed: new Map<string, number | null>() });
   if (streamed.current.scope !== scope) streamed.current = { scope, shownAt: new Map(), resumed: new Map() };
   const liveKeys = blocks.map(blockKey).join("\n");
   useEffect(() => {
     const { shownAt } = streamed.current;
     for (const key of liveKeys ? liveKeys.split("\n") : []) if (!shownAt.has(key)) shownAt.set(key, performance.now());
-  }, [liveKeys]);
+  }, [liveKeys, scope]); // `scope`: a rewritten history starts the record afresh while a block may still be showing.
   /** A row's entrance: undefined for none, else its animation-delay in ms (0, or negative to carry one on). */
   const entrance = (row: (typeof rows)[number]): number | undefined => {
     if (!appearedRows.has(row.id)) return undefined;

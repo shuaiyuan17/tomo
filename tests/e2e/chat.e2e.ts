@@ -1553,27 +1553,55 @@ it("own bubbles fit their content (85% cap) and show ✓ sent, then ✓✓ read 
   await browserExpect.poll(async () => { const m = await measure(longOwn); return m.bubble <= m.column * 0.85 + 1 && m.bubble > m.column * 0.8; }).toBe(true);
 });
 
-it("a foldable held open (wide, touch, not tall): the sidebar stays, the header is the phone's compact bar; desktop keeps its tall one", async () => {
+it("the top bar is 45px on every screen and holds only the wordmark and where you are", async () => {
   const token = readFileSync(resolve(mockConfig.tomoHome, "web-token"), "utf8").trim();
-  const duo = await browser.newPage({ viewport: { width: 1000, height: 700 }, hasTouch: true, isMobile: true });
-  await duo.goto(`${url}/?t=${token}`);
-  await browserExpect(duo.getByRole("textbox", { name: "Message Tomo" })).toBeEnabled();
-  const header = (await duo.locator("header").boundingBox())!;
-  expect(header.height).toBeLessThanOrEqual(56);
-  await browserExpect(duo.locator("#sidebar")).toBeVisible();
-  expect((await duo.locator("#sidebar").boundingBox())!.x).toBe(0);
-  await browserExpect(duo.getByRole("button", { name: /^Menu/ })).toBeHidden();
-  // Nothing in the header is lost: the page title, Tasks, the connection.
-  await browserExpect(duo.locator("header").getByText("Conversation", { exact: true })).toBeVisible();
-  await browserExpect(duo.locator("header").getByRole("status")).toContainText("Connected");
-  // The Tasks overlay and its backdrop start right under the compact header.
-  await duo.getByRole("button", { name: /^Tasks/ }).click();
-  await browserExpect(duo.locator("#tasks-rail")).toBeVisible();
-  await duo.waitForTimeout(300);
-  // (as on a phone: it starts at 3rem and covers the header's 1px bottom border)
-  expect(Math.abs((await duo.locator("#tasks-rail").boundingBox())!.y - (header.y + header.height))).toBeLessThanOrEqual(1);
-  await duo.close();
+  /** The bar's height, and its text (spaces dropped) with the toggles' and the connection's taken out. */
+  const bar = async (p: Page) => {
+    const header = p.locator("header");
+    const box = (await header.boundingBox())!;
+    const text = await header.evaluate((el) => {
+      const copy = el.cloneNode(true) as HTMLElement;
+      copy.querySelectorAll("button, [role=status], .sr-only").forEach((n) => n.remove());
+      return (copy.textContent ?? "").replace(/\s+/g, "");
+    });
+    return { box, text };
+  };
+  // Desktop (the suite's 1440 x 900 page): the Conversation, Home and the Study.
+  let { box, text } = await bar(page);
+  expect(box.height).toBe(45);
+  expect(text).toBe("tomo.Conversation");
+  await page.evaluate(() => { window.location.hash = "home"; });
+  await browserExpect(page.getByTestId("header-title")).toHaveText("Home");
+  expect((await bar(page)).text).toBe("tomo.Home");
+  await page.evaluate(() => { window.location.hash = "study/todos"; });
+  await browserExpect(page.getByRole("tab", { name: "Todos" })).toBeVisible();
+  ({ box, text } = await bar(page));
+  expect(box.height).toBe(45);
+  expect(text).toBe("tomo.TheStudy");
+  // No title block or description over the Study's tabs: the tabs come first under the bar.
+  const tabs = (await page.getByRole("tablist", { name: "Study sections" }).boundingBox())!;
+  expect(tabs.y - (box.y + box.height)).toBeLessThan(24);
+  await page.evaluate(() => { window.location.hash = ""; });
 
-  // Desktop (the suite's 1440 x 900 page): the tall header as before.
-  expect((await page.locator("header").boundingBox())!.height).toBeGreaterThanOrEqual(72);
+  // A phone, and a foldable held open (wide, touch, not tall): the same 45px bar.
+  for (const viewport of [{ width: 390, height: 844 }, { width: 1000, height: 700 }]) {
+    const other = await browser.newPage({ viewport, hasTouch: true, isMobile: true });
+    await other.goto(`${url}/?t=${token}`);
+    await browserExpect(other.getByRole("textbox", { name: "Message Tomo" })).toBeEnabled();
+    const header = await bar(other);
+    expect(header.box.height).toBe(45);
+    expect(header.text).toBe("tomo.Conversation");
+    await browserExpect(other.locator("header").getByRole("status")).toContainText("Connected");
+    // The Tasks overlay and its backdrop start right under the bar.
+    await other.getByRole("button", { name: /^Tasks/ }).click();
+    await browserExpect(other.locator("#tasks-rail")).toBeVisible();
+    await other.waitForTimeout(300);
+    expect(Math.abs((await other.locator("#tasks-rail").boundingBox())!.y - (header.box.y + header.box.height))).toBeLessThanOrEqual(1);
+    if (viewport.width > 600) {
+      // The foldable keeps its sidebar.
+      await browserExpect(other.locator("#sidebar")).toBeVisible();
+      await browserExpect(other.getByRole("button", { name: /^Menu/ })).toBeHidden();
+    }
+    await other.close();
+  }
 });

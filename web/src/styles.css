@@ -18,14 +18,13 @@
 }
 
 @custom-variant dark (&:where(.dark, .dark *));
-/* A wide screen with little height to spare (a foldable or tablet held open,
-   iPad in landscape, a short window): the sidebar stays, but the header is
-   the phone's compact bar so the chat gets the rows. Desktop is untouched. */
-@custom-variant compact (@media (min-width: 601px) and ((pointer: coarse) or (max-height: 700px)));
 
 /* The paper palette, expressed as shadcn tokens. Light and dark keep the
    values the UI has always used. */
 :root {
+  /* The top bar: 45px on every screen, plus the status bar's inset on a phone. Layers that sit
+     under it (the drawers, the Tasks rail and the chat beside Home on narrow screens) start here. */
+  --app-header: calc(45px + env(safe-area-inset-top));
   color-scheme: light;
   --background: #f4efe6;
   --foreground: #2a2622;

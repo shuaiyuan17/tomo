@@ -119,7 +119,11 @@ function spawn(h: H, parentKey = "dm:owner") {
   return r.record;
 }
 
-const messageNotes = (h: H, key: string) => (h.notes.get(key) ?? []).filter((n) => n.includes(MESSAGE_NOTE_MARKER));
+/** A harness notice about a task handed to the main session (named `<id>:notice:…`), not the task's own words. */
+const isNoticeNote = (n: string) => n.includes(MESSAGE_NOTE_MARKER) && /name="[^"]*:notice:/.test(n);
+/** A task's own words handed over. */
+const messageNotes = (h: H, key: string) => (h.notes.get(key) ?? []).filter((n) => n.includes(MESSAGE_NOTE_MARKER) && !isNoticeNote(n));
+const noticeNotes = (h: H, key: string) => (h.notes.get(key) ?? []).filter(isNoticeNote);
 
 /** A first turn that says `what` through the given tool, then finishes nothing (waits on the owner after). */
 function sayOnFirstTurn(tool: "notify" | "reply" | "ask", text: string): OnTurn {
@@ -205,7 +209,9 @@ describe("via-main (default): a task's words go to the owning session first", ()
     expect(notes).toHaveLength(1);
     expect(notes[0]).toContain("answers the owner's message");
     expect(notes[0]).toContain("yes, it's the flaky test");
-    expect(h.messageWakes).toEqual(["dm:owner"]);
+    // One wake for the answer; any other is for a notice (the task pausing again after it).
+    expect(h.messageWakes).toHaveLength(1 + noticeNotes(h, "dm:owner").length);
+    expect(new Set(h.messageWakes)).toEqual(new Set(["dm:owner"]));
     expect(h.store.get(t.id)!.sent.at(-1)).toMatchObject({ kind: "reply", via: "main" });
     // The owner's own words are still mirrored; the task's answer is in the note.
     const mirror = h.service.mirrorNote("dm:owner")!.text;
@@ -241,7 +247,8 @@ describe("via-main (default): a task's words go to the owning session first", ()
     await flush();
     expect(h.sent).toEqual([]);
     expect(messageNotes(h, "dm:owner")).toEqual([]);
-    expect(h.messageWakes).toEqual([]);
+    // No wake for the answer; one only for a notice (the task pausing again after it).
+    expect(h.messageWakes).toHaveLength(noticeNotes(h, "dm:owner").length);
     const r = h.store.get(t.id)!;
     expect(r.sent.at(-1)).toMatchObject({ kind: "reply", via: "panel", text: "panel answer" });
     expect(r.conversation.at(-1)).toMatchObject({ from: "task", kind: "reply", text: "panel answer" });
@@ -435,7 +442,7 @@ describe("via-main: task_ask round trip", () => {
     expect(asked).toMatchObject({ ok: true, via: "main", waiting: false, withdrawn: true });
     // The question was taken back before anything read it, and not logged as sent.
     expect(messageNotes(h, "dm:owner")).toEqual([]);
-    expect((h.disk.get("dm:owner") ?? []).filter((x) => x.includes(MESSAGE_NOTE_MARKER))).toEqual([]);
+    expect((h.disk.get("dm:owner") ?? []).filter((x) => x.includes(MESSAGE_NOTE_MARKER) && !isNoticeNote(x))).toEqual([]);
     expect(h.store.get(t.id)!.sent).toEqual([]);
     // Not parked on the question: the relay got its own turn.
     expect(h.prompts.length).toBeGreaterThanOrEqual(2);
@@ -469,7 +476,7 @@ describe("via-main: nothing lost, nothing twice", () => {
     expect(replies.at(-1)).toMatchObject({ ok: true, via: "main" });
     // Exactly one copy in memory and on disk: the failed one was withdrawn.
     expect(messageNotes(h, "dm:owner")).toHaveLength(1);
-    expect(h.disk.get("dm:owner")!.filter((x) => x.includes(MESSAGE_NOTE_MARKER))).toHaveLength(1);
+    expect(h.disk.get("dm:owner")!.filter((x) => x.includes(MESSAGE_NOTE_MARKER) && !isNoticeNote(x))).toHaveLength(1);
     // The owner's message was answered by the second turn and then consumed.
     expect(h.store.get(t.id)!.pendingInput).toEqual([]);
     expect(h.store.get(t.id)!.sent.filter((m) => m.kind === "reply")).toHaveLength(1);

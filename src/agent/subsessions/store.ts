@@ -469,6 +469,7 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
     startDelivered: r.startDelivered === true,
     interruptStreak: num("interruptStreak", 0),
     failStreak: num("failStreak", 0),
+    ...parseLastFailure(r.lastFailure),
     turnsWithoutProgress: num("turnsWithoutProgress", 0),
     restartRequested: r.restartRequested === true,
     reportDelivered: r.reportDelivered === true,
@@ -510,6 +511,19 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
         && typeof (t as Record<string, unknown>).to === "string")
       : [],
   };
+}
+
+/** A well-formed last-failure cause, or none. */
+function parseLastFailure(value: unknown): { lastFailure?: SubsessionRecord["lastFailure"] } {
+  if (!value || typeof value !== "object") return { lastFailure: undefined };
+  const v = value as Record<string, unknown>;
+  if (!isTimestamp(v.at)) return { lastFailure: undefined };
+  return { lastFailure: {
+    at: v.at,
+    ...(typeof v.category === "string" && v.category ? { category: v.category } : {}),
+    ...(v.refused === true ? { refused: true } : {}),
+    ...(typeof v.detail === "string" && v.detail ? { detail: v.detail } : {}),
+  } };
 }
 
 /** A well-formed question handed to the main session, kept only on a task waiting for the owner. */

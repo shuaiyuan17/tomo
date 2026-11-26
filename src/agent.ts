@@ -20,6 +20,7 @@ import {
   taskSessionKey,
 } from "./sessions/keys.js";
 import { SubsessionService, type OwnerMessageResult, type TaskTurnOutcome } from "./agent/subsessions/service.js";
+import type { TurnFailure } from "./agent/subsessions/failure.js";
 import { dropLegacyTaskTodos } from "./agent/subsessions/legacy-todos.js";
 import { TodoStore } from "./todos/store.js";
 import { parseTaskAddress, type TaskAddress } from "./agent/subsessions/address.js";
@@ -609,6 +610,7 @@ export class Agent {
         if (target) await target.channel.send({ chatId: target.chatId, text });
       },
       noticeOwner: (text) => this.notifyOwner(text),
+      ownerKey: () => this.router.ownerSessionKey(),
       // A task owned by the owner's DM speaks for the owner alone: its notes
       // never drain into a summoned group's turn on that session.
       queuePendingNote: (key, note) => this.queuePendingNote(key, isDmSessionKey(key) ? markOwnerAudience(note) : note),
@@ -697,7 +699,7 @@ export class Agent {
     if (this.messageWakeQueued.has(parentKey)) return;
     this.messageWakeQueued.add(parentKey);
     const prompt = appendToTomoEventBody(formatTomoEvent("subsession-message",
-      "A sub-session handed you something for the owner; it is in a note above. Pass it on as that note says (send_message), hold it for a better moment, or fold it into other news. A question waits for the owner's answer: put it to them, and pass their answer back with task_message and attach_owner_message, in the turn of their answer. If nothing needs doing, end with NO_REPLY.",
+      "A sub-session (or the harness, about one) handed you something for the owner; it is in a note above. Pass it on as that note says (send_message), hold it for a better moment, or fold it into other news. A question waits for the owner's answer: put it to them, and pass their answer back with task_message and attach_owner_message, in the turn of their answer. If nothing needs doing, end with NO_REPLY.",
       { name: "check" }), CONTINUITY_DELIVERY_NOTE);
     let ran = false;
     this.enqueueForSession(parentKey, async () => {
@@ -715,6 +717,23 @@ export class Agent {
       // Retried by the turn's own finally when it ran.
       if (!ran) this.retryMessageWake(parentKey);
     });
+  }
+
+  /**
+   * At start: notes a task (or the harness, about one) handed a session and
+   * no turn read yet. The service wakes the scopes its table names, but a
+   * table that can't be read names none, so every session with one is woken
+   * here too (merged with a wake already queued; a no-op once read).
+   */
+  private wakeUnreadSubsessionNotes(): void {
+    if (!this.subsessions) return;
+    try {
+      for (const entry of this.sessions.listActiveEntries()) {
+        if (!isTaskSessionKey(entry.channelKey) && this.subsessions.hasMessageNote(entry.channelKey)) this.messageWake(entry.channelKey);
+      }
+    } catch (err) {
+      log.warn({ err }, "Could not wake sessions for unread sub-session notes");
+    }
   }
 
   /**
@@ -778,33 +797,52 @@ export class Agent {
       let stopped = false;
       let shutdown = false;
       let response: string | undefined;
-      const ok = await this.turnRunner.runTurn({
-        key,
-        source: "continuity",
-        // The task's own turn: its own bucket on the Cost page, never "Background".
-        usage: { source: "task", ...(taskIdFromSessionKey(key) ? { taskId: taskIdFromSessionKey(key) } : {}) },
-        prompt,
-        bare: opts.bare,
-        delivery: {
-          kind: "deferred-send",
-          suppressDelivery: true,
-          suppressedLog: "Sub-session output kept out of chat (a task speaks through its task_* tools)",
-          resolveTarget: () => undefined,
-          onSuppressedResponse: (text) => { response = text; },
-        },
-        silentMatcher: isSilentReply,
-        transcript: "on-delivery",
-        errors: {
-          visibleError: "continuity",
-          response: "note-only",
-          responseSuppressedLog: "Sub-session turn returned an agent error response",
-          thrown: "ignore",
-          thrownLogMessage: "Sub-session turn failed",
-        },
-        onShutdown: () => { shutdown = true; },
-        onStopped: () => { stopped = true; },
+      // Why it failed, if it does: the SDK's refusal category and typed API
+      // error for this key during the turn, and the short error text.
+      const failure: TurnFailure = {};
+      const unsubscribe = watchBus.subscribe((event) => {
+        if (event.type !== "sdk" || event.sessionKey !== key) return;
+        if (event.signal.kind === "refusal" && event.signal.category) failure.refusal = event.signal.category;
+        else if (event.signal.kind === "error" && event.signal.error !== "unknown") failure.errorKind = event.signal.error;
       });
-      return { ok: ok && !stopped && !shutdown, stopped, shutdown, ...(response !== undefined ? { response } : {}) };
+      let ok: boolean;
+      try {
+        ok = await this.turnRunner.runTurn({
+          key,
+          source: "continuity",
+          // The task's own turn: its own bucket on the Cost page, never "Background".
+          usage: { source: "task", ...(taskIdFromSessionKey(key) ? { taskId: taskIdFromSessionKey(key) } : {}) },
+          prompt,
+          bare: opts.bare,
+          delivery: {
+            kind: "deferred-send",
+            suppressDelivery: true,
+            suppressedLog: "Sub-session output kept out of chat (a task speaks through its task_* tools)",
+            resolveTarget: () => undefined,
+            onSuppressedResponse: (text) => { response = text; },
+          },
+          silentMatcher: isSilentReply,
+          transcript: "on-delivery",
+          errors: {
+            visibleError: "continuity",
+            response: "note-only",
+            responseSuppressedLog: "Sub-session turn returned an agent error response",
+            thrown: "ignore",
+            thrownLogMessage: "Sub-session turn failed",
+            onSuppressedError: (detail) => { failure.detail = detail; },
+          },
+          onShutdown: () => { shutdown = true; },
+          onStopped: () => { stopped = true; },
+        });
+      } finally {
+        unsubscribe();
+      }
+      const failed = !ok && !stopped && !shutdown;
+      return {
+        ok: ok && !stopped && !shutdown, stopped, shutdown,
+        ...(response !== undefined ? { response } : {}),
+        ...(failed && (failure.refusal || failure.errorKind || failure.detail) ? { failure } : {}),
+      };
     }).catch((err): TaskTurnOutcome => {
       log.error({ err, sessionKey: key }, "Sub-session turn failed in queue");
       return { ok: false, shutdown: this.stopping };
@@ -3382,6 +3420,7 @@ export class Agent {
     } catch (err) {
       log.error({ err }, "Sub-session start failed");
     }
+    this.wakeUnreadSubsessionNotes();
     try {
       // Requests the last run left open died with it: denied (restart), and their sessions told.
       this.permissionBroker.reconcileAfterRestart();

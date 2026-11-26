@@ -264,6 +264,11 @@ export interface TurnErrorPolicy {
    * agent/owner-error-notice.ts.
    */
   ownerNotice?: OwnerNoticeTarget;
+  /**
+   * Told the short error text of a failure this policy kept out of the chat
+   * (the same detail an owner notice would carry). Must not throw.
+   */
+  onSuppressedError?: (detail: string) => void;
 }
 
 /** The parts of an owner notice the spec builder knows (see SuppressedErrorReport). */
@@ -1159,6 +1164,11 @@ export class TurnRunner {
 
   /** Hand an error the policy kept out of the chat to the owner notifier. */
   private reportSuppressed(spec: TurnSpec, detail: string): void {
+    try {
+      spec.errors.onSuppressedError?.(detail);
+    } catch (err) {
+      log.warn({ err, sessionKey: spec.key }, "Suppressed-error hook failed");
+    }
     const target = spec.errors.ownerNotice;
     if (!target || !this.deps.reportSuppressedError) return;
     try {

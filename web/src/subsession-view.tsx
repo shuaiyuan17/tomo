@@ -198,21 +198,21 @@ function Updates({ updates, roomy }: { updates?: WebSubsessionUpdate[]; roomy?: 
 export function ProgressFold({ summary, open, onOpenChange, children }: { summary: ProgressSummary; open: boolean; onOpenChange: (open: boolean) => void; children: ReactNode }) {
   const { t } = useTranslation("tasks");
   const count = summary.total !== undefined ? t("subsession.progress.count", { done: summary.done, total: summary.total }) : undefined;
-  return <Collapsible open={open} onOpenChange={onOpenChange} data-testid="subsession-progress" data-open={open || undefined}
-    className="mx-2.5 mb-2 rounded-lg border bg-card/70 transition-colors">
+  return <Collapsible open={open} onOpenChange={onOpenChange} data-testid="subsession-progress"
+    className="mx-2.5 mb-2 overflow-hidden rounded-lg border bg-card/70">
     <CollapsibleTrigger title={open ? t("subsession.progress.hide") : t("subsession.progress.show")}
-      className="group flex w-full cursor-pointer items-center gap-2 rounded-lg px-2.5 py-1.5 text-left transition-colors hover:bg-foreground/[0.04] focus-visible:outline-offset-0">
+      className="group flex w-full cursor-pointer items-center gap-2 px-2.5 py-1.5 text-left transition-colors hover:bg-foreground/[0.04] focus-visible:outline-offset-0">
       <SummaryMark look={summary.look} />
-      <span className="sr-only">{t("subsession.doing.heading")}: </span>
+      <span className="sr-only">{t("subsession.progress.label")}</span>
       <span data-testid="subsession-progress-summary" className={cn("min-w-0 flex-1 truncate text-[12px] leading-snug",
         summary.look === "running" || summary.look === "paused" ? "font-medium text-foreground/85" : "text-foreground/75")}>
-        {summary.look === "running" ? <span className="shimmer">{summary.text}</span> : summary.text}</span>
+        {summary.text}</span>
       {summary.total !== undefined && <span title={count} className="shrink-0 text-[10.5px] tabular-nums text-muted-foreground">
         <span aria-hidden="true">{summary.done}/{summary.total}</span><span className="sr-only">{count}</span></span>}
       <ChevronDown aria-hidden="true" className={cn("size-3.5 shrink-0 text-muted-foreground transition-transform duration-200 group-hover:text-foreground", open && "rotate-180")} />
     </CollapsibleTrigger>
     <CollapsibleContent>
-      <div className="flex max-h-[42vh] flex-col gap-3 overflow-y-auto border-t px-2.5 pt-2 pb-2.5 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]">{children}</div>
+      <div className="flex max-h-[min(42vh,340px)] flex-col gap-3 overflow-y-auto border-t px-2.5 pt-2 pb-2.5 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]">{children}</div>
     </CollapsibleContent>
   </Collapsible>;
 }
@@ -242,8 +242,12 @@ function Chat({ rows, status, id, onRetry, overview, follow }: { rows: Subsessio
   const pinned = useRef(true);
   const last = rows.at(-1)?.key;
   // Follows the end while the reader is there; reading further up stays put.
+  const followed = useRef(follow);
   useLayoutEffect(() => {
     const el = scroll.current;
+    // The chat has just taken the lead: go to its end, wherever the overview was scrolled to.
+    if (follow && !followed.current) pinned.current = true;
+    followed.current = follow;
     if (el && follow && pinned.current) el.scrollTop = el.scrollHeight;
   }, [last, rows.length, follow]);
   return <div ref={scroll} onScroll={(e) => { const el = e.currentTarget; pinned.current = el.scrollHeight - el.scrollTop - el.clientHeight < 48; }}
@@ -251,9 +255,9 @@ function Chat({ rows, status, id, onRetry, overview, follow }: { rows: Subsessio
     {status !== "ready" && <p className="m-0 px-1.5 text-[13px] text-muted-foreground" role="status">{status === "loading" ? t("note.loading") : status === "gone" ? t("subsession.gone") : t("note.error")}</p>}
     {(status === "ready" || rows.length > 0) && <ol className="m-0 flex list-none flex-col gap-3 p-0">
         {rows.map((row) => <li key={row.key} className="min-w-0">{rowView(row, id, onRetry)}</li>)}
-        {overview && status === "ready" && <li className="min-w-0 motion-enter">{overview}</li>}
         {status === "ready" && rows.length === 1 && <li className="px-0.5 text-[11.5px] text-muted-foreground">{t("subsession.nothingYet", { id })}</li>}
       </ol>}
+    {overview && status === "ready" && <div className="motion-enter mt-4 min-w-0">{overview}</div>}
   </div>;
 }
 

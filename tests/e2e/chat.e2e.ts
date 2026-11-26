@@ -1593,6 +1593,9 @@ it("the top bar is 45px on every screen and holds only the wordmark and where yo
     expect(header.text).toBe("tomo.Conversation");
     await browserExpect(other.locator("header").getByRole("status")).toContainText("Connected");
     // Touch: each toggle's 44px target (the button and its ::after margin) meets the next one's without overlapping.
+    // On Home, which always has two (the conversation beside the room, and Tasks).
+    await other.evaluate(() => { window.location.hash = "home"; });
+    await browserExpect(other.getByTestId("header-title")).toHaveText("Home");
     const targets = await other.locator("header button[aria-pressed]").evaluateAll((buttons) => buttons.map((b) => {
       const r = b.getBoundingClientRect(); const after = getComputedStyle(b, "::after");
       const grow = after.position === "absolute" ? -parseFloat(after.left) : 0;
@@ -1603,6 +1606,8 @@ it("the top bar is 45px on every screen and holds only the wordmark and where yo
       expect(t.size).toBeGreaterThanOrEqual(44);
       if (i > 0) expect(t.left).toBeGreaterThanOrEqual(targets[i - 1].right - 0.5);
     }
+    await other.evaluate(() => { window.location.hash = ""; });
+    await browserExpect(other.getByTestId("header-title")).toHaveText("Conversation");
     // The Tasks overlay and its backdrop start right under the bar.
     await other.getByRole("button", { name: /^Tasks/ }).click();
     await browserExpect(other.locator("#tasks-rail")).toBeVisible();

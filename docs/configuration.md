@@ -251,7 +251,7 @@ On by default (`"subsessions": { "enabled": false }` turns them off). The owner'
   "mirror": "turn", "ownerMessages": "via-main", "maxActiveHours": 24, "quotaPauseAtPct": 85 } }
 ```
 
-- `maxRunning`: tasks working on their own at once; more wait queued. A message to a task is never queued.
+- `maxRunning`: tasks working on their own at once; more wait queued. The owner's message to a task is never queued; a note from the main session to a task waiting on something external waits for a slot like any autonomous start.
 - `maxOpen`: tasks not yet finished, cancelled or failed; `task_spawn` refuses beyond it.
 - `maxTurns`: the SDK's turn cap per task turn (`0`: none).
 - `maxContextTokens`: between turns, a task over this is compacted with `/compact`.

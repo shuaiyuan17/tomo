@@ -83,7 +83,8 @@
 :root {
   /* The shared durations: every entrance, exit and move below is one of these. */
   --motion-quick: 150ms; /* something closing */
-  --motion-enter: 180ms; /* something appearing: a bubble, a reply block, a card */
+  --motion-enter: 180ms; /* something appearing: a card, a panel, a placeholder */
+  --motion-rise: 260ms; /* a new message bubble or reply block rising in (slower, so it reads) */
   --motion-move: 200ms;  /* something travelling: list ↔ view, a task card in or out */
   --motion-grow: 240ms;  /* chart bars */
   /* A placeholder for a wait (the history skeleton, the thinking dots) holds back this long,
@@ -92,6 +93,8 @@
 }
 @theme {
   --ease-soft: cubic-bezier(0.2, 0.8, 0.2, 1);
+  /* Entrances: a gentler ease-out (cubic) than ease-soft, so the rise is visible rather than over in the first frames. */
+  --ease-enter: cubic-bezier(0.33, 1, 0.68, 1);
   --default-transition-duration: 120ms;
   --default-transition-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
@@ -213,7 +216,7 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 
 @layer components {
   /* A new bubble or block rises slightly into place. */
-  .motion-enter { animation: motion-enter var(--motion-enter) var(--ease-soft) both; }
+  .motion-enter { animation: motion-enter var(--motion-rise) var(--ease-enter) both; }
   /* A new task card drops in. */
   .motion-drop { animation: motion-drop var(--motion-move) var(--ease-soft) both; }
   /* A task card on its way out: fades and collapses so the list does not jump. */
@@ -251,7 +254,7 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 .viz .growx { transform-origin: left; animation: viz-growx var(--motion-grow) var(--ease-soft) both; }
 @keyframes viz-grow { from { transform: scaleY(0); } }
 @keyframes viz-growx { from { transform: scaleX(0); } }
-@keyframes motion-enter { from { opacity: 0; transform: translateY(6px); } }
+@keyframes motion-enter { from { opacity: 0; transform: translateY(12px); } }
 @keyframes motion-fade { from { opacity: 0; } }
 @keyframes thinking-dot { 0%, 60%, 100% { opacity: 0.35; transform: translateY(0); } 30% { opacity: 0.9; transform: translateY(-3px); } }
 @keyframes motion-drop { from { opacity: 0; transform: translateY(-4px); } }

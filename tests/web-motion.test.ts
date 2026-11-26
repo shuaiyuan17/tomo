@@ -28,7 +28,7 @@ describe("motion: an entrance plays once, to the end", () => {
   });
 
   it("a recorded reply carries on the entrance its streamed block began, or is simply there once that is over", () => {
-    expect(css).toContain(`--motion-enter: ${ENTER_MS}ms;`);
+    expect(css).toContain(`--motion-rise: ${ENTER_MS}ms;`);
     expect(resumeDelay(1_000, 1_000)).toBe(0);
     expect(resumeDelay(1_000, 1_060)).toBe(-60);
     expect(resumeDelay(1_000, 1_000 + ENTER_MS)).toBeNull();
@@ -49,8 +49,8 @@ describe("motion: the CSS contract", () => {
   });
 
   it("every motion animation takes a shared duration token (120–300 ms) on a shared curve", () => {
-    const tokens = new Map([...css.matchAll(/--motion-(quick|enter|move|grow):\s*(\d+)ms;/g)].map(([, name, ms]) => [name, Number(ms)]));
-    expect([...tokens.keys()].sort()).toEqual(["enter", "grow", "move", "quick"]);
+    const tokens = new Map([...css.matchAll(/--motion-(quick|enter|rise|move|grow):\s*(\d+)ms;/g)].map(([, name, ms]) => [name, Number(ms)]));
+    expect([...tokens.keys()].sort()).toEqual(["enter", "grow", "move", "quick", "rise"]);
     for (const ms of tokens.values()) {
       expect(ms).toBeGreaterThanOrEqual(120);
       expect(ms).toBeLessThanOrEqual(300);
@@ -64,12 +64,12 @@ describe("motion: the CSS contract", () => {
   });
 
   it("a new bubble's rise is visible: at least 240 ms, at least 10 px, on the gentler entrance curve", () => {
-    const enter = Number(/--motion-enter:\s*(\d+)ms;/.exec(css)?.[1]);
+    const enter = Number(/--motion-rise:\s*(\d+)ms;/.exec(css)?.[1]);
     expect(enter).toBeGreaterThanOrEqual(240);
     expect(ENTER_MS).toBe(enter);
     const rise = Number(/@keyframes motion-enter \{ from \{[^}]*translateY\((\d+)px\)/.exec(css)?.[1]);
     expect(rise).toBeGreaterThanOrEqual(10);
-    expect(css).toMatch(/\.motion-enter \{ animation: motion-enter var\(--motion-enter\) var\(--ease-enter\) both; \}/);
+    expect(css).toMatch(/\.motion-enter \{ animation: motion-enter var\(--motion-rise\) var\(--ease-enter\) both; \}/);
   });
 
   it("a new bubble or block only fades and rises: nothing that changes the transcript's height", () => {

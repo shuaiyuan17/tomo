@@ -83,7 +83,8 @@
 :root {
   /* The shared durations: every entrance, exit and move below is one of these. */
   --motion-quick: 150ms; /* something closing */
-  --motion-enter: 260ms; /* something appearing: a bubble, a reply block, a card */
+  --motion-enter: 180ms; /* something appearing: a card, a panel, a placeholder */
+  --motion-rise: 260ms; /* a new message bubble or reply block rising in (slower, so it reads) */
   --motion-move: 200ms;  /* something travelling: list ↔ view, a task card in or out */
   --motion-grow: 240ms;  /* chart bars */
   /* A placeholder for a wait (the history skeleton, the thinking dots) holds back this long,
@@ -215,7 +216,7 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 
 @layer components {
   /* A new bubble or block rises slightly into place. */
-  .motion-enter { animation: motion-enter var(--motion-enter) var(--ease-enter) both; }
+  .motion-enter { animation: motion-enter var(--motion-rise) var(--ease-enter) both; }
   /* A new task card drops in. */
   .motion-drop { animation: motion-drop var(--motion-move) var(--ease-soft) both; }
   /* A task card on its way out: fades and collapses so the list does not jump. */

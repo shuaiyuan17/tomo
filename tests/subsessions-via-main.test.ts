@@ -875,7 +875,12 @@ describe("via-main: nothing lost, nothing twice", () => {
     const h = harness({}, async (key, prompt, hh) => {
       hh.service.noteToolUse(key);
       if (prompt.includes("subsession-start")) await hh.service.ask(key, "Merge now?");
-      else if (prompt.includes("They said yes.")) await hh.service.reply(key, "Merging now");
+      else if (prompt.includes("They said yes.")) {
+        await hh.service.reply(key, "Merging now");
+        // Done with the work: finishing keeps the task out of "continue" turns (and the stuck pause), and the
+        // main session's next note reopens it, which is the turn whose reply this test classifies.
+        hh.service.finish(key, "merged");
+      }
       else if (prompt.includes("also bump the version")) await hh.service.reply(key, "Version bumped");
       return { ok: true };
     });

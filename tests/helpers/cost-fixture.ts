@@ -111,7 +111,11 @@ export function seedCostLedger(tomoHome: string, options: CostFixtureOptions = {
         tokens: { input: 900, output: 4_000, cacheRead: 220_000, cacheCreated: 9_000 }, durationMs: Math.round(between(6_000, 45_000)), numTurns: 3, tools: Math.round(between(0, 8)) });
     }
   }
-  if (options.tasks !== false) rows.push(...taskRows(now, Math.min(days, 10), options.seed ?? 7));
+  if (options.tasks !== false) {
+    // Inside the history only: a short ledger stays as many days long as it says.
+    const first = new Date(midnight); first.setDate(first.getDate() - (days - 1));
+    rows.push(...taskRows(now, Math.min(days, 10), options.seed ?? 7).filter((r) => r.ts >= first.getTime()));
+  }
   rows.sort((a, b) => a.ts - b.ts);
   const dir = usageDataDir(tomoHome);
   mkdirSync(dir, { recursive: true });

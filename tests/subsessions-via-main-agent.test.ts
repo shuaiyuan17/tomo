@@ -90,7 +90,7 @@ describe("via-main through the Agent", () => {
     expect(agent.subsessions!.get("s1")!.conversation.at(-1)).toMatchObject({ from: "task", kind: "reply", text: "PANEL-ANSWER" });
     expect(agent.subsessions!.get("s1")!.sent.at(-1)).toMatchObject({ kind: "reply", via: "panel" });
     await new Promise((r) => setTimeout(r, 50));
-    expect(prompts("dm:alex").some((p) => p.includes("PANEL-ANSWER") && p.includes('type="subsession-message"'))).toBe(false);
+    expect(prompts("dm:alex").some((p) => p.includes("PANEL-ANSWER") && p.includes("answers the owner's message to it"))).toBe(false);
     expect(messageNotes(agent, "dm:alex")).toEqual([]);
     expect(channel.delivered.some((d) => d.text.includes("PANEL-ANSWER"))).toBe(false);
     await agent.stop();
@@ -111,6 +111,35 @@ describe("via-main through the Agent", () => {
     expect(prompts("dm:alex").some((p) => p.includes("GROUP-ONLY"))).toBe(false);
     expect(peekPendingNotes(agent, "dm:alex").some((n) => n.includes("GROUP-ONLY"))).toBe(false);
     expect(channel.delivered.some((d) => d.text.includes("GROUP-ONLY"))).toBe(false);
+    await agent.stop();
+  });
+
+  it("a task whose turns keep failing: the main session is woken with the failure category, nothing reaches the owner's chat", async () => {
+    const { agent, channel } = await boot();
+    // The main session's turns are the wakes for the notes; every other turn is the task's, and fails.
+    mockSdk.responseFn = (text) => text.includes('type="subsession-message"') ? "NO_REPLY"
+      : 'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"bad"}}';
+    agent.subsessions!.spawn("dm:alex", { title: "Mine", brief: "b" });
+    await waitFor(() => expect(agent.subsessions!.get("s1")).toMatchObject({ status: "waiting", waitingOn: "owner" }));
+    expect(agent.subsessions!.get("s1")!.lastFailure).toMatchObject({ category: "invalid_request" });
+    await waitFor(() => expect(prompts("dm:alex").some((p) => p.includes("Paused: its last turns failed") && p.includes("Failure category: invalid_request"))).toBe(true));
+    expect(channel.delivered.some((d) => d.text.includes("Paused"))).toBe(false);
+    await agent.stop();
+  });
+
+  it("at start, a session holding an unread sub-session note is woken even when the task table names no task there", async () => {
+    const { agent } = await boot();
+    mockSdk.responseFn = () => "NO_REPLY";
+    const internals = agent as unknown as {
+      sessions: { ensureEntry(k: string): void };
+      wakeUnreadSubsessionNotes(): void;
+      subsessions: { deps: { queuePendingNote(k: string, n: string): boolean } };
+    };
+    internals.sessions.ensureEntry("telegram:-100555");
+    internals.subsessions.deps.queuePendingNote("telegram:-100555", formatTomoEvent("subsession-message", "ORPHAN-NOTICE", { name: "s7:notice:1:abcdef" }));
+    internals.wakeUnreadSubsessionNotes();
+    await waitFor(() => expect(prompts("telegram:-100555").some((p) => p.includes("ORPHAN-NOTICE"))).toBe(true));
+    expect(prompts("dm:alex").some((p) => p.includes("ORPHAN-NOTICE"))).toBe(false);
     await agent.stop();
   });
 

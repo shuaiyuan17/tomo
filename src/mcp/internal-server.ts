@@ -78,7 +78,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       tool(
         "send_message",
         [
-          "Send a chat message to another conversation (the owner's DM, a group chat, or back to the current session).",
+          "Send a chat message to another conversation (the owner's DM, a group chat, or back to the current session). An ordinary reply in this conversation is just your text, not this tool.",
           "",
           "Two modes:",
           "- `delegate` (default): describe the *intent* (e.g. \"follow up with Alice about her recent trip\"). The recipient session's Claude composes the actual message in its own voice, with full local context (participant names, recent conversation, group tone). Best for social/contextual messages. Fire-and-forget — the tool returns once dispatched, the user observes the actual sent text in the recipient channel.",

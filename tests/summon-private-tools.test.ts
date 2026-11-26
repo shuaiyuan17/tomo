@@ -365,6 +365,8 @@ describe("private tools during a summoned-group turn", () => {
 
     const prompt = mockSdk.promptsBySession.find((p) => p.sessionKey === OWNER_DM)?.text ?? "";
     expect(prompt).toContain("Summoned-group message");
+    // How to behave in the group lives here, in code, not in the user's AGENT.md copy.
+    expect(prompt).toContain("reply like a participant: short, in its tone, no headers, people by name; chatter that isn't for you needs no reply");
     expect(prompt).toContain("The owner's private context is off limits for this turn");
     expect(prompt).toContain("by any route");
     // Stated as a norm: naming the blocked tools would tell a refused model

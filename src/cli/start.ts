@@ -181,10 +181,22 @@ async function startForeground(): Promise<void> {
   // leaves every cron surface refusing (CronStoreReadError), never empty.
   {
     const { importLegacyCronJobs } = await import("../cron/store.js");
-    try {
-      importLegacyCronJobs(config.dbPath);
-    } catch (err) {
-      log.error({ err }, "Could not import the cron jobs file into the database; scheduled tasks stay off until it can be");
+    // A busy database (a CLI holding a write past the busy timeout) is
+    // transient: retry for about half a minute before the scheduler starts,
+    // since giving up here leaves every job off until the next restart.
+    const attempts = 6;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        importLegacyCronJobs(config.dbPath);
+        break;
+      } catch (err) {
+        if (attempt === attempts) {
+          log.error({ err }, "Could not import the cron jobs file into the database; scheduled tasks stay off until it can be");
+          break;
+        }
+        log.warn({ err, attempt }, "Cron jobs import failed; retrying");
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+      }
     }
   }
 

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AgentNameReader, DEFAULT_AGENT_NAME, parseIdentityName } from "../src/workspace/agent-name.js";
-import { composerStatus, requestLabels, TYPING_ACTIVITY } from "../web/src/composer-status.js";
+import { composerStatusSpoken, requestLabels, TYPING_ACTIVITY } from "../web/src/composer-status.js";
 import { agentNameOf } from "../web/src/agent-name.js";
 
 /** The Han word for "name" (U+540D U+5B57), one of the labels the parser accepts. */
@@ -62,8 +62,9 @@ describe("the UI words the agent by name", () => {
   it("status line labels and the typing indicator use the name; product wording stays", () => {
     expect(requestLabels("Claw").running).toBe("Claw is working…");
     expect(requestLabels("Claw").unknown).toContain("Claw may already have acted");
-    expect(composerStatus({ activity: TYPING_ACTIVITY, note: { text: "", at: "" }, latest: undefined, settled: null, agent: "Claw" })).toBe("Claw is working…");
-    expect(composerStatus({ activity: undefined, note: { text: "", at: "" }, latest: { requestId: "r", state: "running" }, settled: null })).toBe("Tomo is working…");
+    // The running words are spoken (to a screen reader), not shown: see composerStatusSpoken.
+    expect(composerStatusSpoken({ activity: TYPING_ACTIVITY, note: { text: "", at: "" }, latest: undefined, settled: null, agent: "Claw" })).toBe("Claw is working…");
+    expect(composerStatusSpoken({ activity: undefined, note: { text: "", at: "" }, latest: { requestId: "r", state: "running" }, settled: null })).toBe("Tomo is working…");
   });
   it("an older daemon without agentName, or a blank one, reads Tomo", () => {
     expect(agentNameOf(undefined)).toBe("Tomo");

@@ -321,6 +321,35 @@ describe("SubsessionService", () => {
     expect(h.turns.at(-1)?.prompt).toContain("any news?");
   });
 
+  it("a relay with the owner's words whose start failed is started past the slot cap by the scheduler's next run", async () => {
+    const h = harness({ maxRunning: 1 }, (turn, hh) => {
+      if (turn.key === "task:s2") return new Promise(() => {}); // s2 keeps the one slot
+      hh.service.noteToolUse(turn.key);
+      return { ok: true };
+    });
+    h.service.start();
+    const waiter = spawn(h, "waits on a check-back");
+    h.cron.set(waiter.sessionKey, 1);
+    await flush();
+    spawn(h, "busy");
+    await flush();
+    h.service.relay(waiter.id, "any news?");
+    await flush();
+    expect(h.store.get(waiter.id)?.status).toBe("queued");
+    const svc = h.service as unknown as { startTask: (id: string, why: string) => boolean; schedule: () => void };
+    const real = svc.startTask.bind(h.service);
+    const spy = vi.spyOn(svc, "startTask").mockImplementationOnce(() => { throw new Error("disk full"); });
+    expect(h.service.relay(waiter.id, "check now please", said("check now please")).ok).toBe(true);
+    await flush();
+    expect(h.store.get(waiter.id)?.status).toBe("queued");
+    spy.mockImplementation(real);
+    const turns = h.turns.length;
+    svc.schedule();
+    await flush();
+    expect(h.turns.length).toBeGreaterThan(turns);
+    expect(h.turns.at(-1)?.prompt).toContain("check now please");
+  });
+
   it("the main session's own note queues a task waiting on something external for a slot, like a check-back", async () => {
     const h = harness({ maxRunning: 1 }, (turn, hh) => {
       if (turn.key === "task:s2") return new Promise(() => {}); // s2 keeps the one slot

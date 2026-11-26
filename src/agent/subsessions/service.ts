@@ -2010,11 +2010,12 @@ export class SubsessionService {
     const queued = tasks.filter((t) => t.status === "queued")
       .sort((a, b) => Number(b.resumeNeeded) - Number(a.resumeNeeded) || a.createdAt - b.createdAt);
     const max = this.deps.config().maxRunning;
-    // A queued task holding a message the owner wrote to it never waits for
-    // a slot. Read from the table, so a start that failed, or that a restart
-    // cut off, is made here the next time the scheduler runs.
+    // A queued task holding the owner's own words (a message they wrote to
+    // it, or a relay with theirs attached) never waits for a slot. Read from
+    // the table, so a start that failed, or that a restart cut off, is made
+    // here the next time the scheduler runs.
     for (const task of queued) {
-      if (!task.pendingInput.some(isOwnerMessageInput)) continue;
+      if (!task.pendingInput.some(isOwnerInput)) continue;
       try {
         if (this.startTask(task.id, "the owner wrote to it")) active += 1;
       } catch (err) {

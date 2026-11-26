@@ -2158,11 +2158,12 @@ export class SubsessionService {
       this.kick(id);
       return outcome;
     }
-    // Queued: a relay waits for its slot and goes with the first turn (a
-    // note that woke a waiting task asks the scheduler for one now). The
-    // owner's message never waits for a slot: it starts the task, like
+    // Queued: the main session's own note waits for its slot and goes with
+    // the first turn (a note that woke a waiting task asks the scheduler for
+    // one now). The owner's words never wait for a slot, whether they came as
+    // a message or attached to a relay: they start the task, like
     // `/s <id> start`.
-    if (event !== "owner_message") {
+    if (origin.from !== "owner") {
       // The note is on the task already: a failed start must not fail its delivery.
       if (outcome.changed) this.safely(() => this.schedule(), "schedule after a note");
       return outcome;

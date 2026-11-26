@@ -295,6 +295,32 @@ describe("SubsessionService", () => {
     expect(h.store.get(t.id)).toMatchObject({ seenThrough: 0, pendingInput: [{ seq: 1 }] });
   });
 
+  it("the owner's words relayed to a task a note already queued start it past the slot cap", async () => {
+    const h = harness({ maxRunning: 1 }, (turn, hh) => {
+      if (turn.key === "task:s2") return new Promise(() => {}); // s2 keeps the one slot
+      hh.service.noteToolUse(turn.key);
+      return { ok: true };
+    });
+    h.service.start();
+    const waiter = spawn(h, "waits on a check-back");
+    h.cron.set(waiter.sessionKey, 1);
+    await flush();
+    expect(h.store.get(waiter.id)).toMatchObject({ status: "waiting", waitingOn: "external" });
+    spawn(h, "busy");
+    await flush();
+    // The main session's note queues it behind the busy slot...
+    h.service.relay(waiter.id, "any news?");
+    await flush();
+    expect(h.store.get(waiter.id)?.status).toBe("queued");
+    const turns = h.turns.length;
+    // ...but the owner's own words never wait for a slot.
+    expect(h.service.relay(waiter.id, "check now please", said("check now please")).ok).toBe(true);
+    await flush();
+    expect(h.turns.length).toBeGreaterThan(turns);
+    expect(h.turns.at(-1)?.prompt).toContain("check now please");
+    expect(h.turns.at(-1)?.prompt).toContain("any news?");
+  });
+
   it("the main session's own note queues a task waiting on something external for a slot, like a check-back", async () => {
     const h = harness({ maxRunning: 1 }, (turn, hh) => {
       if (turn.key === "task:s2") return new Promise(() => {}); // s2 keeps the one slot

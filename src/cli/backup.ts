@@ -15,6 +15,7 @@ import {
 import { createInterface } from "node:readline";
 import { config } from "../config.js";
 import { restoreWorkspaceFromBackup } from "./backup-workspace.js";
+import { acquireMaintenanceLock, maintenanceLockBusyMessage, maintenanceLockPath } from "../db/lock.js";
 import {
   acquireRestoreLock,
   RestoreLockHeldError,
@@ -505,6 +506,16 @@ backupCommand
       }
       throw err;
     }
+    // And the lock the daemon holds for its whole life (src/db/lock.ts): a
+    // daemon launchd respawns mid-restore waits for this, and then sees the
+    // restored tree. The pid check above only gives the friendlier message.
+    const maintenanceLock = acquireMaintenanceLock(maintenanceLockPath(TOMO_HOME));
+    if (!maintenanceLock) {
+      releaseRestoreLock();
+      console.error(`Cannot restore: ${maintenanceLockBusyMessage(maintenanceLockPath(TOMO_HOME))}`);
+      process.exit(1);
+      return;
+    }
 
     try {
       console.log(`Restore from: ${backup.path}`);
@@ -738,6 +749,7 @@ backupCommand
 
       console.log("\nRestore complete.");
     } finally {
+      maintenanceLock.release();
       releaseRestoreLock();
     }
   });

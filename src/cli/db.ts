@@ -7,7 +7,7 @@ import { DUMPABLE_TABLES, TOMO_DB_MIGRATIONS } from "../db/schema.js";
 import { canManageJob } from "../cron/scope.js";
 import { TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
-import { withFileLockSync } from "../file-lock.js";
+import { acquireMaintenanceLock, maintenanceLockBusyMessage, maintenanceLockPath, type MaintenanceLock } from "../db/lock.js";
 import { LEGACY_PENDING_NOTES_FILENAME, exportPendingNotesToFile } from "../sessions/pending-notes-store.js";
 import { isRecordedProcessLive, readPidFileRecord } from "./pidfile.js";
 
@@ -59,6 +59,19 @@ function canonical(path: string): string {
 function refuseWhileRunning(): void {
   const record = existsSync(defaultRuntimePaths.pidFile) ? readPidFileRecord(defaultRuntimePaths.pidFile) : null;
   if (record && isRecordedProcessLive(record)) fail("Tomo is running. Stop it first (`tomo stop`).");
+}
+
+/**
+ * Take the lock the daemon holds for its whole
+ * life (src/db/lock.ts), so a daemon launchd respawns meanwhile waits for it.
+ * Refuses, without waiting, when the daemon or another maintenance command
+ * holds it.
+ */
+function takeMaintenanceLock(): MaintenanceLock {
+  const path = maintenanceLockPath(config.tomoHome);
+  const lock = acquireMaintenanceLock(path);
+  if (!lock) fail(maintenanceLockBusyMessage(path));
+  return lock;
 }
 
 function tableNames(db: TomoDb): string[] {
@@ -120,10 +133,27 @@ dbCommand
   });
 
 /** Stores `tomo db export` can write back to their pre-SQLite file. */
-const EXPORTS: Record<string, { file: () => string; write: (db: TomoDb, out: string, mark: boolean) => number }> = {
+const EXPORTS: Record<string, {
+  file: () => string;
+  /** Write the file; with `mark` (the rollback file) record that in the database. Returns the count. */
+  write: (db: TomoDb, out: string, mark: boolean) => number;
+  noun: string;
+  /** Does a rollback export record itself in the database? */
+  marks?: boolean;
+  /** May a rollback export replace what is at the rollback path? (Default: only when nothing is there.) */
+  replaceable?: (path: string) => boolean;
+  /** What to tell the operator after a rollback export. */
+  rollbackNotes: string[];
+}> = {
   "pending-notes": {
     file: () => join(config.sessionsDir, LEGACY_PENDING_NOTES_FILENAME),
     write: (db, out, mark) => exportPendingNotesToFile(db, out, { mark }),
+    noun: "note(s)",
+    marks: true,
+    rollbackNotes: [
+      "If you start this version again instead, it imports the file (it replaces the table). Do not delete the file:",
+      "this version then takes it that an older Tomo delivered every note, and empties the table.",
+    ],
   },
 };
 
@@ -141,39 +171,44 @@ dbCommand
     // THE ROLLBACK FILE is written only by a plain export, from the live
     // database, with Tomo stopped: Tomo imports that file at its next start
     // (it replaces the table), so anything else written there would replace
-    // the live queue. Everything else is a copy to a file of your choosing.
+    // the live store. Everything else is a copy to a file of your choosing.
     if (opts.from && !opts.out) fail("--from needs --out: a copy from another database never goes to the file Tomo imports.");
     if (opts.out && canonical(opts.out) === canonical(rollbackFile)) fail(`--out may not be ${rollbackFile}; run the export without --out to write it.`);
     const rollback = !opts.out;
     const out = opts.out ?? rollbackFile;
     if (rollback) refuseWhileRunning();
-    if (existsSync(out) && !(opts.overwrite && !rollback)) {
-      fail(rollback
-        ? `${out} already exists (an export already ran, or an older Tomo wrote it). Start this Tomo once to import it, or move it away first.`
-        : `${out} already exists; pass --overwrite to replace it.`);
-    }
-    const path = opts.from ?? config.dbPath;
-    if (!existsSync(path)) fail(`No database at ${path}.`);
-    let count: number;
+    // Held from here to the end (exiting releases it too), so the checks
+    // below cannot go stale before the write: a respawned daemon waits.
+    const lock = rollback ? takeMaintenanceLock() : null;
     try {
-      withFileLockSync(`${config.dbPath}.maintenance.lock`, () => {
+      const taken = existsSync(out) && !(rollback && (target.replaceable?.(out) ?? false));
+      if (taken && !(opts.overwrite && !rollback)) {
+        fail(rollback
+          ? `${out} already exists (an export already ran, or an older Tomo wrote it). Start this Tomo once to import it, or move it away first.`
+          : `${out} already exists; pass --overwrite to replace it.`);
+      }
+      const path = opts.from ?? config.dbPath;
+      if (!existsSync(path)) fail(`No database at ${path}.`);
+      let count: number;
+      try {
         const db = openTomoDb(path, rollback ? {} : { readOnly: true, allowNewerSchema: true });
         try {
           count = target.write(db, out, rollback);
         } finally {
           db.close();
         }
-      });
-    } catch (err) {
-      fail(`Could not export from ${path}: ${(err as Error).message}`);
-    }
-    if (rollback) {
-      console.log(`Wrote ${count!} note(s) to ${out}; the database is marked exported.`);
-      console.log("To roll back: install the older Tomo and start it; it reads this file.");
-      console.log("If you start this version again instead, it imports the file (it replaces the table). Do not delete the file:");
-      console.log("this version then takes it that an older Tomo delivered every note, and empties the table.");
-    } else {
-      console.log(`Wrote ${count!} note(s) to ${out} (the database is unchanged).`);
+      } catch (err) {
+        fail(`Could not export from ${path}: ${(err as Error).message}`);
+      }
+      if (rollback) {
+        console.log(`Wrote ${count} ${target.noun} to ${out}${target.marks ? "; the database is marked exported" : ""}.`);
+        console.log("To roll back: install the older Tomo and start it; it reads this file.");
+        for (const line of target.rollbackNotes) console.log(line);
+      } else {
+        console.log(`Wrote ${count} ${target.noun} to ${out} (the database is unchanged).`);
+      }
+    } finally {
+      lock?.release();
     }
   });
 
@@ -183,11 +218,14 @@ dbCommand
   .action(() => {
     if (process.env[TOMO_SESSION_KEY_ENV]?.trim()) fail("`tomo db repair` is an operator command; run it from a terminal, not an agent's shell.");
     refuseWhileRunning();
+    const lock = takeMaintenanceLock();
     let aside: string | null;
     try {
-      aside = withFileLockSync(`${config.dbPath}.maintenance.lock`, () => repairDb(config.dbPath));
+      aside = repairDb(config.dbPath);
     } catch (err) {
       fail(`Repair failed: ${(err as Error).message}`);
+    } finally {
+      lock.release();
     }
     if (aside === null) {
       console.log(`${config.dbPath} passes its check (or does not exist); nothing to repair.`);

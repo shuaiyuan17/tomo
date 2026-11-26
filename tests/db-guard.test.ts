@@ -58,6 +58,20 @@ describe("isDbWrite", () => {
     }
   });
 
+  it("denies removing or overwriting the maintenance lock (~/.tomo/tomo.lock): a new file would let a repair run beside the daemon", () => {
+    const lock = join(tree.tomoHome, "tomo.lock");
+    for (const [tool, input] of [
+      ["Write", { file_path: lock, content: "" }],
+      ["Bash", { command: `rm ${lock}` }],
+      ["Bash", { command: "rm -f ~/.tomo/tomo.lock" }],
+      ["Bash", { command: "cd ~/.tomo && mv tomo.lock x" }],
+      ["Bash", { command: `rm ${lock}-journal` }],
+    ] as const) {
+      expect(isDbWrite(tool, input, ctx), JSON.stringify(input)).toBe(true);
+    }
+    expect(isDbWrite("Bash", { command: `ls -la ${tree.tomoHome}` }, ctx)).toBe(false);
+  });
+
   it("lets reads through", () => {
     for (const command of [
       `sqlite3 -readonly ${tree.db} 'select * from pending_notes'`,

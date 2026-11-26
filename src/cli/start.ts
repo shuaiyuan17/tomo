@@ -3,12 +3,17 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { acquirePidFile, readPidFileRecord, releasePidFile } from "./pidfile.js";
+import { acquireMaintenanceLock, maintenanceLockPath, type MaintenanceLock } from "../db/lock.js";
 import { getRunningPid } from "./status-info.js";
 import type { CronJob } from "../cron/types.js";
 import { sleep } from "../sleep.js";
 
 const TOMO_HOME = defaultRuntimePaths.tomoHome;
 const PID_FILE = defaultRuntimePaths.pidFile;
+/** How long a starting daemon waits for a maintenance command to let go of the lock. */
+const MAINTENANCE_LOCK_WAIT_MS = 5_000;
+/** Held for the daemon's whole life; see acquireMaintenanceLock. */
+let daemonMaintenanceLock: MaintenanceLock | null = null;
 
 export const startCommand = new Command("start")
   .description("Start Tomo")
@@ -56,6 +61,19 @@ async function startForeground(): Promise<void> {
   // disk would make the next `tomo start` print a stale-takeover line for a
   // daemon that never started.
   process.on("exit", () => releasePidFile(PID_FILE));
+
+  // SECOND, still before any await: the lock the maintenance commands
+  // (`tomo db repair` / `db export`, `tomo backup restore`) take. A daemon
+  // launchd respawns while one of them runs must not start under it. Held
+  // until this process exits; the kernel releases it however that happens.
+  // Kept in a module variable: a lock object nothing references could be
+  // collected, and closing its connection would let go of the lock.
+  // (`??=`: a second start in one process, as the start tests do, already holds it.)
+  daemonMaintenanceLock ??= acquireMaintenanceLock(maintenanceLockPath(TOMO_HOME), { waitMs: MAINTENANCE_LOCK_WAIT_MS });
+  if (!daemonMaintenanceLock) {
+    console.error(`A maintenance command (tomo db repair / export, tomo backup restore) is running (${maintenanceLockPath(TOMO_HOME)} is locked). Refusing to start until it finishes.`);
+    process.exit(1);
+  }
 
   // Before the config and agent imports, but AFTER the synchronous pid-file
   // claim above (an await in front of the exclusion gate would re-open the

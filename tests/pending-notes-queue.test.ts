@@ -301,4 +301,19 @@ describe("PendingNotesQueue when the stored notes cannot be read", () => {
     queue.queueNote("k", "another");
     expect(store.notes.get("k")).toEqual(["the only copy of a replayed message", "new note", "another"]);
   });
+
+  it("a turn drains them once they read, though nothing was queued meanwhile", () => {
+    const store = new MemoryPendingNotesStore();
+    store.notes.set("k", ["stored"]);
+    let readable = false;
+    const real = store.getPendingNotes.bind(store);
+    store.getPendingNotes = (key: string) => {
+      if (!readable) throw new Error("EMFILE");
+      return real(key);
+    };
+    const queue = new PendingNotesQueue(store);
+    expect(queue.drain("k")).toBe("");
+    readable = true;
+    expect(queue.drain("k")).toBe("stored\n\n");
+  });
 });

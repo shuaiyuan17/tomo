@@ -109,6 +109,7 @@ export class PendingNotesQueue {
   constructor(private store: DurablePendingNotesStore) {}
 
   private queued(sessionKey: string): string[] {
+    if (this.unloaded.has(sessionKey)) this.retryLoad(sessionKey);
     let arr = this.notes.get(sessionKey);
     if (!arr) {
       try {
@@ -123,18 +124,22 @@ export class PendingNotesQueue {
     return arr;
   }
 
+  /** Read the stored notes that could not be read before, ahead of the ones
+   *  held in memory since. Returns false while they still cannot be read. */
+  private retryLoad(sessionKey: string): boolean {
+    try {
+      this.notes.set(sessionKey, [...this.store.getPendingNotes(sessionKey), ...(this.notes.get(sessionKey) ?? [])]);
+      this.unloaded.delete(sessionKey);
+      return true;
+    } catch (err) {
+      log.warn({ err, sessionKey }, "Stored pending notes still cannot be read");
+      return false;
+    }
+  }
+
   /** Write in-flight + queued notes for this session. Returns false on failure. */
   private persist(sessionKey: string): boolean {
-    if (this.unloaded.has(sessionKey)) {
-      try {
-        // Held in memory while the stored ones could not be read: the stored ones first.
-        this.notes.set(sessionKey, [...this.store.getPendingNotes(sessionKey), ...(this.notes.get(sessionKey) ?? [])]);
-        this.unloaded.delete(sessionKey);
-      } catch (err) {
-        log.warn({ err, sessionKey }, "Pending notes not persisted: the stored ones still cannot be read");
-        return false;
-      }
-    }
+    if (this.unloaded.has(sessionKey) && !this.retryLoad(sessionKey)) return false;
     const all = [
       ...(this.inflight.get(sessionKey) ?? []).flatMap((b) => b.notes.map(markInterrupted)),
       ...(this.notes.get(sessionKey) ?? []),

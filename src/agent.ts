@@ -90,7 +90,7 @@ import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
 import { join } from "node:path";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { withConfigLockSync } from "./config-file.js";
 import { writeJsonAtomicSync } from "./fs-utils.js";
 import { CONTINUITY_DELIVERY_NOTE } from "./continuity-defaults.js";
@@ -3386,8 +3386,15 @@ export class Agent {
    */
   private tellPendingNotesQuarantined(): void {
     if (!this.pendingNotesNoticeReady || this.stopping || this.pendingNotesNoticeSending || this.pendingNotesNoticeTimer) return;
-    const asides = this.sessions.quarantinedPendingNotes();
-    if (!asides) return;
+    const marked = this.sessions.quarantinedPendingNotes();
+    if (!marked) return;
+    // A name whose move never happened (a crash between marker and move) is
+    // dropped, not announced: the file it names does not exist.
+    const asides = marked.filter((a) => existsSync(a));
+    if (asides.length < marked.length) {
+      this.sessions.clearQuarantinedPendingNotes(marked.filter((a) => !asides.includes(a)));
+      if (asides.length === 0) return;
+    }
     // A marker that will not read names no file.
     const files = asides.length > 0 ? asides : [join(config.sessionsDir, "_pending_notes.json.corrupt-*")];
     const text = ownerT("notices")("pendingNotesQuarantined", { files: files.join(", "), count: files.length });

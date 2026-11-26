@@ -68,7 +68,9 @@ describe("a pending notes file that will not read", () => {
 
   it("a notice that could not be sent keeps the marker and is tried again", async () => {
     const ownerNotice = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValueOnce(false).mockResolvedValue(true);
-    writeFileSync(marker(), JSON.stringify({ asides: ["/x/_pending_notes.json.corrupt-1"] }));
+    const aside = join(mockConfig.sessionsDir, "_pending_notes.json.corrupt-1");
+    writeFileSync(aside, "{not json");
+    writeFileSync(marker(), JSON.stringify({ asides: [aside] }));
     const agent = await boot();
     const internals = agent as unknown as Internals;
     await waitFor(() => expect(internals.pendingNotesNoticeTimer).toBeDefined());
@@ -79,6 +81,15 @@ describe("a pending notes file that will not read", () => {
     internals.tellPendingNotesQuarantined();
     await waitFor(() => expect(ownerNotice).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(existsSync(marker())).toBe(false));
+    await agent.stop();
+  });
+
+  it("a marker naming a file whose move never happened sends no notice and is cleared", async () => {
+    const ownerNotice = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(true);
+    writeFileSync(marker(), JSON.stringify({ asides: [join(mockConfig.sessionsDir, "_pending_notes.json.corrupt-7")] }));
+    const agent = await boot();
+    await waitFor(() => expect(existsSync(marker())).toBe(false));
+    expect(ownerNotice).not.toHaveBeenCalled();
     await agent.stop();
   });
 

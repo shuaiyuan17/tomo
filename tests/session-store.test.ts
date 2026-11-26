@@ -455,6 +455,24 @@ describe("SessionStore", () => {
     expect(store.getPendingNotes("dm:alice")).toEqual(["queued before migration"]);
   });
 
+  it("a re-key whose pending notes cannot be read or moved aside fails, so it is tried again", () => {
+    const store = makeSessionStore(TEST_DIR);
+    store.setSdkSessionId("telegram:111", "session-old");
+    store.append("telegram:111", { role: "user", content: "before", timestamp: Date.now() });
+    writeFileSync(join(TEST_DIR, "_pending_notes.json"), "{not json");
+    const restore = failPendingNotesMove(store);
+    try {
+      expect(() => store.migrateSessionKey("telegram:111", "dm:alice")).toThrow();
+    } finally {
+      restore();
+    }
+    const fresh = makeSessionStore(TEST_DIR);
+    expect(fresh.getEntry("telegram:111")?.sdkSessionId).toBe("session-old");
+    expect(fresh.getEntry("dm:alice")).toBeUndefined();
+    // Nothing moved: the old key's history is where it was.
+    expect(fresh.loadTranscript("telegram:111").map((m) => m.content)).toEqual(["before"]);
+  });
+
   it("remembers the raw key a unified session was migrated from, across chained migrations", () => {
     const store = makeSessionStore(TEST_DIR);
     store.setSdkSessionId("imessage:any;-;+15551234567", "session-old");

@@ -1474,6 +1474,10 @@ export class SessionStore {
       );
     }
 
+    // Read before anything moves: a pending notes file that cannot be read
+    // (nor moved aside) refuses the re-key while it can still be retried.
+    const pendingNotes = this.loadPendingNotes();
+
     // Re-keying is the registry forgetting `oldKey`: the `migratedFrom`
     // breadcrumb below is only kept for a non-DM→DM unification, so for every
     // other re-key nothing would remember that `oldKey` once owned its legacy
@@ -1534,19 +1538,14 @@ export class SessionStore {
       );
     }
 
-    try {
-      const pendingNotes = this.loadPendingNotes();
-      const oldNotes = pendingNotes[oldKey];
-      if (oldNotes) {
-        pendingNotes[newKey] = [...(pendingNotes[newKey] ?? []), ...oldNotes];
-        delete pendingNotes[oldKey];
-        writeJsonAtomicSync(this.pendingNotesPath, {
-          version: 1,
-          notes: pendingNotes,
-        } satisfies PendingNotesFile);
-      }
-    } catch (err) {
-      log.error({ err, oldKey, newKey }, "Pending notes file unreadable and could not be moved aside; the old key's notes were not moved and stay in that file");
+    const oldNotes = pendingNotes[oldKey];
+    if (oldNotes) {
+      pendingNotes[newKey] = [...(pendingNotes[newKey] ?? []), ...oldNotes];
+      delete pendingNotes[oldKey];
+      writeJsonAtomicSync(this.pendingNotesPath, {
+        version: 1,
+        notes: pendingNotes,
+      } satisfies PendingNotesFile);
     }
 
     // Clear the in-memory session cache for BOTH keys: the old one is gone, and

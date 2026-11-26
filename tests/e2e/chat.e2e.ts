@@ -1629,6 +1629,14 @@ it("the top bar is 45px on every screen and holds only the wordmark and where yo
   expect(shown.clipped).toBe(false);
   expect(shown.left).toBeGreaterThanOrEqual(0);
   expect(shown.right).toBeLessThanOrEqual(320);
+  // It sits over the page (the Study's refresh button is right there): a tap goes through it.
+  await narrow.evaluate(() => { window.location.hash = "study/todos"; });
+  const refresh = narrow.getByRole("button", { name: "Refresh" });
+  await browserExpect(refresh).toBeVisible();
+  const hit = await refresh.evaluate((el) => { const r = el.getBoundingClientRect(); return el.contains(document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)); });
+  expect(hit).toBe(true);
+  await narrow.evaluate(() => { window.location.hash = "home"; });
+  await browserExpect(narrow.getByTestId("header-title")).toHaveText("Home");
   const fits = await narrow.locator("header").evaluate((el) => ({
     overflow: el.scrollWidth - el.clientWidth,
     buttons: [...el.querySelectorAll("button")].filter((b) => b.getClientRects().length).map((b) => { const r = b.getBoundingClientRect(); return [r.left, r.right, r.width]; }),

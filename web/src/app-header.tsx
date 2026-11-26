@@ -69,9 +69,9 @@ export function AppHeader({ headerRef, title, menu, chat, tasks, screen, connect
       {screen && <ToggleButton toggle={screen} controls="screen-window" title={t("header.screen")} label={t("header.screenLabel")}><Monitor strokeWidth={1.75} /></ToggleButton>}
       <span role="status" data-connection={connection} className="ml-1.5 flex items-center gap-2 tracking-[0.02em] text-xs text-muted-foreground max-[600px]:ml-0.5">
         <i className={cn("size-1.5 shrink-0 rounded-full border border-muted-foreground", connection === "live" && "border-primary bg-primary", connection !== "live" && connection !== "locked" && "animate-pulse")} />
-        {/* A phone has no room in the bar for these words: connected, the dot says it; otherwise they hang just under the bar, whole. */}
+        {/* A phone has no room in the bar for these words: connected, the dot says it; otherwise they hang just under the bar, whole, and taps go through them to what is under. */}
         <span data-testid="connection-words" className={cn("whitespace-nowrap", connection === "live" ? "max-[600px]:sr-only"
-          : "max-[600px]:absolute max-[600px]:top-full max-[600px]:right-2.5 max-[600px]:mt-1.5 max-[600px]:rounded-full max-[600px]:border max-[600px]:bg-card max-[600px]:px-2.5 max-[600px]:py-1 max-[600px]:shadow-xs")}>{t(CONNECTION_LABELS[connection])}</span></span>
+          : "max-[600px]:pointer-events-none max-[600px]:absolute max-[600px]:top-full max-[600px]:right-2.5 max-[600px]:mt-1.5 max-[600px]:rounded-full max-[600px]:border max-[600px]:bg-card max-[600px]:px-2.5 max-[600px]:py-1 max-[600px]:shadow-xs")}>{t(CONNECTION_LABELS[connection])}</span></span>
     </div>
   </header>;
 }

@@ -374,7 +374,7 @@ export interface SubsessionConfig {
    *  silent turn after each round) or `note` (with its next turn). Default turn. */
   mirror: "turn" | "note";
   /**
-   * Where a task's task_reply / task_notify / task_ask go. `via-main`
+   * Where a task's task_reply / task_ask go. `via-main`
    * (default): to the owning session as a note, which decides whether and
    * how the owner hears it (an answer to a message the owner wrote in the
    * web task panel stays in that panel). `direct`: straight to the owner's

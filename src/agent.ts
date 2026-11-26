@@ -674,7 +674,7 @@ export class Agent {
 
   /**
    * A silent turn on the owning session for the messages its tasks handed it
-   * (`subsession-message` notes: task_reply / task_notify / task_ask with
+   * (`subsession-message` notes: task_reply / task_ask with
    * ownerMessages "via-main"). The notes ride in as the turn's pending-notes
    * prefix; the turn decides whether and how the owner hears them. One
    * queued at a time per session, and it does not run when another turn has

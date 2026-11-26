@@ -2693,7 +2693,7 @@ describe("progress, plan and updates", () => {
     store.update(t.id, (r) => { r.plan = [{ text: "A", status: "in_progress" }, { text: "B", status: "pending" }]; });
     expect(writes).toBe(0);
     expect(readFileSync(path, "utf8")).toBe(before);
-    expect(h.service.setPlan(t.sessionKey, [{ step: "C" }])).toEqual({ ok: false, error: "reason_required" });
+    expect(h.service.setPlan(t.sessionKey, [{ step: "C" }])).toEqual({ ok: false, error: "reason_required", missing: ["A", "B"] });
     expect(h.service.setPlan(t.sessionKey, [{ step: "A", status: "in_progress" }, { step: "B" }]).ok).toBe(true);
     expect(readFileSync(path, "utf8")).toBe(before);
     store.update(t.id, (r) => { r.plan = [{ text: "A", status: "in_progress" }]; });
@@ -2742,7 +2742,7 @@ describe("progress, plan and updates", () => {
     const h = idle();
     const t = spawn(h);
     h.service.setPlan(t.sessionKey, [{ step: "A", status: "in_progress" }, { step: "B" }]);
-    expect(h.service.setPlan(t.sessionKey, [{ step: "C" }], [{ step: "A" }])).toEqual({ ok: false, error: "reason_required" });
+    expect(h.service.setPlan(t.sessionKey, [{ step: "C" }], [{ step: "A" }])).toEqual({ ok: false, error: "reason_required", missing: ["B"] });
     expect(h.store.get(t.id)?.doneSteps).toBeUndefined();
     expect(h.store.get(t.id)?.plan?.map((s) => s.text)).toEqual(["A", "B"]);
   });
@@ -2785,8 +2785,13 @@ describe("progress, plan and updates", () => {
     // Free: a status move, a step done, steps added at the end.
     expect(h.service.setPlan(t.sessionKey, [{ step: "B", status: "in_progress" }, { step: "C" }, { step: "D" }], [{ step: "A" }]).ok).toBe(true);
     // Dropping C, rewording C, reordering: refused without a reason, nothing written.
-    for (const steps of [[{ step: "B" }, { step: "D" }], [{ step: "B" }, { step: "C, faster" }, { step: "D" }], [{ step: "C" }, { step: "B" }, { step: "D" }]]) {
-      expect(h.service.setPlan(t.sessionKey, steps)).toEqual({ ok: false, error: "reason_required" });
+    // The refusal names the steps that left the plan (none for a reorder).
+    for (const [steps, missing] of [
+      [[{ step: "B" }, { step: "D" }], ["C"]],
+      [[{ step: "B" }, { step: "C, faster" }, { step: "D" }], ["C"]],
+      [[{ step: "C" }, { step: "B" }, { step: "D" }], []],
+    ] as const) {
+      expect(h.service.setPlan(t.sessionKey, [...steps])).toEqual({ ok: false, error: "reason_required", missing });
     }
     // Inserting before a kept step is a reorder too; done in the same call never needs one.
     expect(h.service.setPlan(t.sessionKey, [{ step: "X" }, { step: "B" }, { step: "C" }, { step: "D" }]).ok).toBe(false);

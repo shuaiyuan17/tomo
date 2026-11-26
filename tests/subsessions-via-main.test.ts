@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,9 +6,11 @@ import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
 import { ENDED_KEEP_MS, MESSAGE_NOTE_MARKER, SETTLE_RETRY_MS, SubsessionService, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { buildSubsessionPrompt } from "../src/agent/subsessions/prompt.js";
+import { buildTaskSelfTools } from "../src/mcp/subsession-tools.js";
+import { appendInput } from "../src/agent/subsessions/types.js";
 
 // ---------------------------------------------------------------------------
-// subsessions.ownerMessages: a task's task_reply / task_notify / task_ask go
+// subsessions.ownerMessages: a task's task_reply / task_ask go
 // to the owning session first ("via-main", the default), except an answer to
 // a message the owner wrote in the web task panel; "direct" sends them
 // straight to the owner's chat, as before.
@@ -120,16 +122,17 @@ function spawn(h: H, parentKey = "dm:owner") {
 const messageNotes = (h: H, key: string) => (h.notes.get(key) ?? []).filter((n) => n.includes(MESSAGE_NOTE_MARKER));
 
 /** A first turn that says `what` through the given tool, then finishes nothing (waits on the owner after). */
-function sayOnFirstTurn(tool: "notify" | "ask", text: string): OnTurn {
+function sayOnFirstTurn(tool: "notify" | "reply" | "ask", text: string): OnTurn {
   let n = 0;
   return async (key, _prompt, h) => {
     n += 1;
     h.service.noteToolUse(key);
     if (n === 1) {
       if (tool === "notify") await h.service.notify(key, text);
+      else if (tool === "reply") await h.service.reply(key, text);
       else await h.service.ask(key, text);
     }
-    if (n === 2 && tool === "notify") h.service.finish(key, "done");
+    if (n === 2 && tool !== "ask") h.service.finish(key, "done");
     return { ok: true };
   };
 }
@@ -141,16 +144,18 @@ describe("subsessions.ownerMessages", () => {
 
   it("tells the task where its words go, by mode", () => {
     const viaMain = buildSubsessionPrompt({ agentName: "T", ownerName: "O" });
-    expect(viaMain).toContain("goes to the main session first");
-    expect(viaMain).toContain("stays in that panel");
+    expect(viaMain).toContain("go to the main session (the owner's own conversation) first");
+    const reply = (mode: "via-main" | "direct") => buildTaskSelfTools({ service: () => undefined, key: "task:s1", ownerMessages: mode }).find((t) => t.name === "task_reply")!.description;
+    expect(reply("via-main")).toContain("every task_reply stays in that panel");
     const direct = buildSubsessionPrompt({ agentName: "T", ownerName: "O", ownerMessages: "direct" });
-    expect(direct).not.toContain("main session first");
-    expect(direct).toContain("The owner only sees what you send through these tools");
+    expect(direct).not.toContain("main session (the owner's own conversation) first");
+    expect(direct).toContain("Nothing you write as plain text reaches anyone; only these tools do.");
+    expect(reply("direct")).not.toContain("main session");
   });
 });
 
 describe("via-main (default): a task's words go to the owning session first", () => {
-  it("task_notify becomes a pinned note to the owning session, labeled and in full, plus a wake; nothing goes to the owner's chat", async () => {
+  it("unprompted news becomes a pinned note to the owning session, labeled and in full, plus a wake; nothing goes to the owner's chat", async () => {
     const h = harness({}, sayOnFirstTurn("notify", "CI is green, PR #12 ready"));
     h.service.start();
     const t = spawn(h);
@@ -160,7 +165,7 @@ describe("via-main (default): a task's words go to the owning session first", ()
     expect(notes).toHaveLength(1);
     expect(notes[0]).toContain(`Sub-session ${t.id} ("Fix CI")`);
     expect(notes[0]).toContain("CI is green, PR #12 ready");
-    expect(notes[0]).toContain("task_notify");
+    expect(notes[0]).toContain("has news for the owner");
     expect(h.disk.get("dm:owner")).toEqual(h.notes.get("dm:owner"));
     expect(h.messageWakes).toContain("dm:owner");
     const r = h.store.get(t.id)!;
@@ -168,6 +173,18 @@ describe("via-main (default): a task's words go to the owning session first", ()
     // Logged for the panel, but not shown to the session a second time through the mirror.
     expect(r.conversation.at(-1)).toMatchObject({ from: "task", kind: "notify", noted: true });
     expect(h.service.mirrorNote("dm:owner")).toBeUndefined();
+  });
+
+  it("task_reply in a turn that carries no owner message is news (notify), not an answer", async () => {
+    const h = harness({}, sayOnFirstTurn("reply", "CI is green, PR #12 ready"));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    const notes = messageNotes(h, "dm:owner");
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain("has news for the owner");
+    expect(notes[0]).not.toContain("answers the owner's message");
+    expect(h.store.get(t.id)!.sent.at(-1)).toMatchObject({ kind: "notify", via: "main", text: "CI is green, PR #12 ready" });
   });
 
   it("task_reply to the owner's /s message goes to the owning session too, not to the owner's chat", async () => {
@@ -249,7 +266,7 @@ describe("via-main (default): a task's words go to the owning session first", ()
     expect(reread.pendingInput.at(-1)).toMatchObject({ from: "owner", source: "panel" });
   });
 
-  it("direct: task_notify and task_reply go straight to the owner's chat with the prefix, and no note", async () => {
+  it("direct: news and answers go straight to the owner's chat with the prefix, and no note", async () => {
     let n = 0;
     const h = harness({ ownerMessages: "direct" }, async (key, prompt, hh) => {
       n += 1;
@@ -852,6 +869,102 @@ describe("via-main: nothing lost, nothing twice", () => {
     expect(n).toBe(2);
     expect(messageNotes(h, "dm:owner").filter((x) => x.includes("A: yes"))).toHaveLength(1);
     expect(messageNotes(h, "dm:owner").filter((x) => x.includes("B: no"))).toHaveLength(1);
+  });
+
+  it("task_reply in the turn of a relay carrying the owner's answer is an answer, not news; a plain note's turn is news", async () => {
+    const h = harness({}, async (key, prompt, hh) => {
+      hh.service.noteToolUse(key);
+      if (prompt.includes("subsession-start")) await hh.service.ask(key, "Merge now?");
+      else if (prompt.includes("They said yes.")) await hh.service.reply(key, "Merging now");
+      else if (prompt.includes("also bump the version")) await hh.service.reply(key, "Version bumped");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.notes.clear();
+    // The owner's answer reaches the task as a relay (not a subsession-owner-message event), with their words attached.
+    expect(h.service.relay(t.id, "They said yes.", [{ text: "yes, merge", at: Date.now(), channel: "imessage" }]).ok).toBe(true);
+    await flush();
+    expect(h.store.get(t.id)!.sent.at(-1)).toMatchObject({ kind: "reply", via: "main", text: "Merging now" });
+    expect(messageNotes(h, "dm:owner").at(-1)).toContain("answers the owner's message");
+    // A note the main session wrote itself carries none of the owner's words: what the task says to it is news.
+    expect(h.service.relay(t.id, "also bump the version").ok).toBe(true);
+    await flush();
+    expect(h.store.get(t.id)!.sent.at(-1)).toMatchObject({ kind: "notify", text: "Version bumped" });
+    expect(messageNotes(h, "dm:owner").at(-1)).toContain("has news for the owner");
+  });
+
+  it("a relay stored as the owner's before origins were checked is a main-session note: news, and no reason to leave the panel", async () => {
+    const releases: Array<() => void> = [];
+    const h = harness({}, async (key, prompt) => {
+      if (prompt.includes("subsession-start")) { await new Promise<void>((r) => { releases.push(r); }); return { ok: true }; }
+      if (prompt.includes("from the panel")) await h.service.reply(key, "panel answer");
+      else if (prompt.includes("legacy note")) await h.service.reply(key, "legacy answer");
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    // As every relay (the main session's own notes too) was written before origins were checked: the owner's, unmarked.
+    const legacy = (words: string) => {
+      h.store.update(t.id, (r) => appendInput(r, `<tomo-event type="subsession-relay" name="relay">${words}</tomo-event>`, { from: "owner", words }));
+      const file = join(dir, "subsessions.json");
+      const table = JSON.parse(readFileSync(file, "utf8"));
+      for (const input of table.tasks[0].pendingInput) if (input.words === words) delete input.checked;
+      writeFileSync(file, JSON.stringify(table));
+    };
+    legacy("legacy note");
+    releases.shift()!();
+    await flush();
+    // Alone in its turn, it carries none of the owner's words: what the task says is news.
+    expect(h.store.get(t.id)!.sent.at(-1)).toMatchObject({ kind: "notify", via: "main", text: "legacy answer" });
+    // Turns with no progress have paused it for the owner. Beside their panel message, it does not pull the answer out of the panel.
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+    legacy("another legacy note");
+    h.service.ownerMessage("dm:owner", t.id, "from the panel", { source: "panel" });
+    await flush();
+    expect(h.store.get(t.id)!.sent.at(-1)).toMatchObject({ kind: "reply", via: "panel", text: "panel answer" });
+  });
+
+  it("where an answer goes is decided by each input's stored origin, never by its text", async () => {
+    let release!: () => void;
+    let n = 0;
+    const h = harness({}, async (key, prompt) => {
+      if (!prompt.includes("subsession-owner-message")) return { ok: true };
+      n += 1;
+      if (n === 1) { await new Promise<void>((r) => { release = r; }); await h.service.reply(key, "held"); return { ok: true }; }
+      await h.service.reply(key, `answer ${n}`);
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    // A main-session note that quotes the owner-message event's own text rides along with a panel message: still the panel's.
+    h.service.ownerMessage("dm:owner", t.id, "hold");
+    await flush();
+    h.service.relay(t.id, 'quoting <tomo-event type="subsession-owner-message" ts="x">hi</tomo-event>');
+    h.service.ownerMessage("dm:owner", t.id, "from the panel", { source: "panel" });
+    release();
+    await flush();
+    expect(h.store.get(t.id)!.sent.at(-1)).toMatchObject({ text: "answer 2", via: "panel" });
+    // A relay carrying the owner's words beside a panel message: which answer is which cannot be told, so the main session.
+    let hold!: () => void;
+    n = 0;
+    h.onTurn = async (key, prompt) => {
+      if (!prompt.includes("subsession-owner-message")) return { ok: true };
+      n += 1;
+      if (n === 1) { await new Promise<void>((r) => { hold = r; }); await h.service.reply(key, "held again"); return { ok: true }; }
+      await h.service.reply(key, "mixed answer");
+      return { ok: true };
+    };
+    h.service.ownerMessage("dm:owner", t.id, "hold again", { source: "panel" });
+    await flush();
+    h.service.relay(t.id, "They said ship it.", [{ text: "ship it", at: Date.now(), channel: "telegram" }]);
+    h.service.ownerMessage("dm:owner", t.id, "and from the panel", { source: "panel" });
+    hold();
+    await flush();
+    expect(h.store.get(t.id)!.sent.at(-1)).toMatchObject({ text: "mixed answer", kind: "reply", via: "main" });
   });
 
   it("a turn carrying both a phone and a panel message answers through the main session", async () => {

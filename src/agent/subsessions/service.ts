@@ -310,7 +310,7 @@ export function messageNoteNameOf(note: string): string | undefined {
 export const MESSAGE_NOTE_MARKER = '<tomo-event type="subsession-message"';
 
 /**
- * A task's task_reply / task_notify / task_ask (or the fallback answer) for
+ * A task's task_reply / task_ask (or the fallback answer) for
  * the owning session: labeled with the task, quoting the words in full,
  * with what is expected of the session.
  */
@@ -319,8 +319,8 @@ function formatMessageNote(record: SubsessionRecord, kind: SpeakKind, body: stri
   const head = kind === "ask"
     ? `${who} asks the owner (task_ask) and waits for their answer:`
     : kind === "notify"
-      ? `${who} has news for the owner (task_notify):`
-      : `${who} answers the owner's message to it (${kind === "fallback" ? "its turn's text, no task_reply" : "task_reply"}):`;
+      ? `${who} has news for the owner:`
+      : `${who} answers the owner's message to it${kind === "fallback" ? " (its turn's text; it sent no task_reply)" : ""}:`;
   const tail = kind === "ask"
     ? `Put this question to the owner (keep its options; send_message, and its MEDIA: lines if any); don't answer it for them, even if you think you know. When they answer, pass it on with task_message ${record.id} and attach_owner_message, in the turn of their answer, so the task gets their own words: that ends the wait. task_status ${record.id} shows the question while it waits.`
     : `Decide whether, when and how the owner hears it (send_message, in your own words or as is; its MEDIA: lines if a file should go with it). Nothing else delivers it.`;
@@ -798,16 +798,23 @@ export class SubsessionService {
   }
 
   // ---------------------------------------------------------------------
-  // Task side (task_reply / task_notify / task_ask / task_plan / task_update / task_checkpoint / task_finish / task_reopen)
+  // Task side (task_reply / task_ask / task_plan / task_update / task_checkpoint / task_finish / task_reopen)
   // ---------------------------------------------------------------------
 
+  /** A message sent as unprompted news, whatever the turn carries (no tool calls this; task_reply picks the kind). */
   async notify(key: string, text: string): Promise<SpeakResult> {
     return this.speak(key, "notify", text);
   }
 
-  /** task_reply: answer the owner's message. */
+  /**
+   * task_reply, the task's one way to speak: an answer when the turn in
+   * flight carries a message the owner wrote to it, otherwise a message it
+   * sends unprompted (notify). Which one decides only the note's heading
+   * and whether an answer to a panel message stays in the panel.
+   */
   async reply(key: string, text: string): Promise<SpeakResult> {
-    return this.speak(key, "reply", text);
+    const record = this.safeByKey(key);
+    return this.speak(key, record && this.answersOwner(record) ? "reply" : "notify", text);
   }
 
   /**
@@ -930,19 +937,36 @@ export class SubsessionService {
   }
 
   /**
-   * Is the newest owner input of the turn in flight a message the owner
-   * wrote in the web task panel? Then the task's answer stays in the panel.
+   * Did the owner write every owner input of the turn in flight in the web
+   * task panel? Then the task's answer stays in the panel.
    */
   private answersPanel(record: SubsessionRecord): boolean {
+    // Only when all of them came from the panel. Mixed with one from the
+    // phone or a relay carrying the owner's words, which answer is which
+    // cannot be told, so it goes through the main session.
+    const owner = this.ownerInputsInFlight(record);
+    return owner.length > 0 && owner.every((i) => i.source === "panel");
+  }
+
+  /**
+   * Does the turn in flight carry the owner's own words (a message to the
+   * task, or a relay with theirs attached, such as their answer to task_ask)?
+   * Then task_reply is an answer, not news.
+   */
+  private answersOwner(record: SubsessionRecord): boolean {
+    return this.ownerInputsInFlight(record).length > 0;
+  }
+
+  /** The owner's inputs the turn in flight carries. */
+  private ownerInputsInFlight(record: SubsessionRecord): SubsessionInput[] {
     const through = this.inflightThrough.get(record.id);
-    if (through === undefined) return false;
+    if (through === undefined) return [];
     let current: SubsessionRecord | undefined;
     try { current = this.store.get(record.id); } catch { current = record; }
-    // The owner's own messages the turn carries (not relays): only when all
-    // of them came from the panel. Mixed with one from the phone, which
-    // answer is which cannot be told, so it goes through the main session.
-    const owner = (current ?? record).pendingInput.filter((i) => i.seq <= through && isOwnerMessageInput(i));
-    return owner.length > 0 && owner.every((i) => i.source === "panel");
+    // From each input's stored origin only, never its text: a direct message
+    // and a relay carrying the owner's own words both count; a note the main
+    // session wrote itself, or the harness's own input, never does.
+    return (current ?? record).pendingInput.filter((i) => i.seq <= through && isOwnerInput(i));
   }
 
   /**
@@ -1205,11 +1229,17 @@ export class SubsessionService {
     const why = reason ? oneLine(reason, PROGRESS_TEXT_MAX) : "";
     let changed = false;
     let refused = false;
+    let missing: string[] = [];
     const at = this.now();
     // Checked inside the lock, against the plan on disk.
     const updated = this.store.update(record.id, (r) => {
       const planChanged = JSON.stringify(r.plan ?? []) !== JSON.stringify(next);
-      if (planChanged && !why && planNeedsReason(r.plan ?? [], next, [...finishedTexts])) { refused = true; return; }
+      if (planChanged && !why && planNeedsReason(r.plan ?? [], next, [...finishedTexts])) {
+        refused = true;
+        const kept = new Set(next.map((step) => step.text));
+        missing = (r.plan ?? []).map((step) => step.text).filter((text) => !finishedTexts.has(text) && !kept.has(text));
+        return;
+      }
       const ahead = new Set((r.plan ?? []).map((step) => step.text));
       if (planChanged) {
         changed = true;
@@ -1233,7 +1263,7 @@ export class SubsessionService {
       if (planChanged && why) (r.updates ??= []).push({ at, kind: "plan", text: why });
     });
     if (!updated) return { ok: false, error: "no_record" };
-    if (refused) return { ok: false, error: "reason_required" };
+    if (refused) return { ok: false, error: "reason_required", missing };
     if (changed) this.progressChanged.add(record.id);
     return { ok: true, record: updated };
   }
@@ -1430,7 +1460,7 @@ export class SubsessionService {
     if (!this.available()) return;
     const record = this.safeByKey(key);
     if (!record) return;
-    // What it said (task_notify, task_ask) was a round like any other: with
+    // What it said (task_reply, task_ask) was a round like any other: with
     // mirror "turn", the owning session is woken to see it. A task_ask leaves
     // the task waiting on the owner, so no driver turn would do this later.
     this.mirrorAfterRound(record.id);
@@ -2992,7 +3022,10 @@ function truncate(text: string, max: number): string {
 }
 
 /** What task_plan did: saved, or refused because the change needs a reason (or the task has no record). */
-export type PlanOutcome = { ok: true; record: SubsessionRecord } | { ok: false; error: "no_record" | "reason_required" | "duplicate_step" };
+export type PlanOutcome = { ok: true; record: SubsessionRecord }
+  | { ok: false; error: "no_record" | "duplicate_step" }
+  /** `missing`: the steps still ahead that left the plan without being filed done (empty: only the order changed). */
+  | { ok: false; error: "reason_required"; missing: string[] };
 
 /**
  * Whether replacing `before` with `after` drops, rewords or reorders a step

@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { withFileLockSync } from "../file-lock.js";
 import { dirname } from "node:path";
 import { writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
 import { log } from "../logger.js";
@@ -237,8 +238,9 @@ export function openTomoDb(path: string, opts: OpenOptions = {}): TomoDb {
   }
 
   mkdirSync(dirname(path), { recursive: true });
-  const quarantine = (err: unknown): void => {
-    const aside = quarantineDb(path, err);
+  const quarantine = (err: unknown, checked: string | null): void => {
+    const aside = quarantineDb(path, err, checked);
+    if (aside === null) return; // another process moved it first
     try {
       opts.onQuarantined?.(aside);
     } catch (listenerErr) {
@@ -251,7 +253,8 @@ export function openTomoDb(path: string, opts: OpenOptions = {}): TomoDb {
   // what is moved aside is byte for byte what was there. When the read-only
   // check cannot run at all (no -shm to read, say) the writable open checks.
   let checked = false;
-  if (existsSync(path)) {
+  const identity = fileIdentity(path);
+  if (identity !== null) {
     let ro: SqliteDatabase | null = null;
     try {
       ro = connect(path, { ...opts, readOnly: true });
@@ -261,7 +264,7 @@ export function openTomoDb(path: string, opts: OpenOptions = {}): TomoDb {
       if (isCorruptionError(err)) {
         ro?.close();
         ro = null;
-        quarantine(err);
+        quarantine(err, identity);
         checked = true;
       }
     } finally {
@@ -280,12 +283,13 @@ export function openTomoDb(path: string, opts: OpenOptions = {}): TomoDb {
       throw err;
     }
   };
+  const before = fileIdentity(path);
   try {
     return attempt(!checked);
   } catch (err) {
     if (!isCorruptionError(err)) throw err;
-    quarantine(err);
-    return attempt(false);
+    quarantine(err, before);
+    return attempt(true);
   }
 }
 
@@ -326,48 +330,80 @@ export function clearQuarantinedDbs(path: string, asides: string[]): void {
   }
 }
 
+/** Identity of the file at `path` (null: none), to tell "the file we checked" from one created since. */
+export function fileIdentity(path: string): string | null {
+  try {
+    const st = statSync(path, { bigint: true });
+    return `${st.dev}:${st.ino}`;
+  } catch (err) {
+    if (isEnoent(err)) return null;
+    throw err;
+  }
+}
+
 /**
  * Move a damaged database and its sidecars aside unchanged, as
- * `<path>.corrupt-<ts>` (+ `-wal`/`-shm`, so `sqlite3 <aside>` still sees the
- * log), with the marker naming it written first. Throws when it cannot be
- * moved: nothing may be created over it then.
+ * `<path>.corrupt-<ts>` (+ `-wal`/`-journal`/`-shm`, so `sqlite3 <aside>`
+ * still sees the log), with the marker naming it written first.
+ *
+ * ONE PROCESS AT A TIME, AND ONLY THE FILE THAT WAS CHECKED. Two processes can
+ * both find the file damaged; without the lock and the identity check the
+ * second would move aside the fresh database the first just created (and
+ * the first would go on writing to a file nobody opens again). Returns null
+ * when the file is no longer the one that failed (someone else moved it).
+ *
+ * THE LOG GOES FIRST. `-wal` (or a hot `-journal`) can hold committed data
+ * the main file does not have yet, so it is moved before the main file, and
+ * anything already moved is put back when a later step fails: either the
+ * whole family is aside, or none of it is and this throws (nothing may be
+ * created over it then). `-shm` is only an index SQLite rebuilds from the
+ * log; one that will not move is deleted. Exported for tests.
  */
-function quarantineDb(path: string, cause: unknown): string {
-  const ts = fileTimestamp();
-  for (let n = 0; n < 100; n++) {
-    const aside = n === 0 ? `${path}.corrupt-${ts}` : `${path}.corrupt-${ts}-${n}`;
-    if (dbFamily(aside).some((p) => existsSync(p))) continue;
-    const marker = dbQuarantineMarkerPath(path);
-    const before = quarantinedDbs(path);
-    writeJsonAtomicSync(marker, { asides: [...(before ?? []), aside] }, { fsync: true });
-    try {
-      renameSync(path, aside);
-    } catch (err) {
+export function quarantineDb(path: string, cause: unknown, checked: string | null): string | null {
+  return withFileLockSync(`${path}.quarantine.lock`, () => {
+    if (fileIdentity(path) !== checked) return null;
+    const ts = fileTimestamp();
+    for (let n = 0; n < 100; n++) {
+      const aside = n === 0 ? `${path}.corrupt-${ts}` : `${path}.corrupt-${ts}-${n}`;
+      if (dbFamily(aside).some((p) => existsSync(p))) continue;
+      const marker = dbQuarantineMarkerPath(path);
+      const before = quarantinedDbs(path);
+      writeJsonAtomicSync(marker, { asides: [...(before ?? []), aside] }, { fsync: true });
+      const moved: Array<[string, string]> = [];
       try {
-        if (before === undefined) unlinkSync(marker);
-        else writeJsonAtomicSync(marker, { asides: before }, { fsync: true });
-      } catch (markerErr) {
-        if (!isEnoent(markerErr)) log.warn({ err: markerErr }, "Could not restore the database quarantine marker");
-      }
-      throw new Error(`Database ${path} is damaged and could not be moved aside`, { cause: err });
-    }
-    for (const suffix of DB_SIDECAR_SUFFIXES) {
-      try {
-        renameSync(`${path}${suffix}`, `${aside}${suffix}`);
+        for (const suffix of ["-wal", "-journal", ""]) {
+          const from = `${path}${suffix}`;
+          if (!existsSync(from)) continue;
+          renameSync(from, `${aside}${suffix}`);
+          moved.push([from, `${aside}${suffix}`]);
+        }
       } catch (err) {
-        if (isEnoent(err)) continue;
-        // The main file is already aside: a stale sidecar left here would be
-        // applied to the fresh database. Remove it rather than keep it.
-        log.warn({ err, file: `${path}${suffix}` }, "Could not move a database sidecar aside; removing it");
+        for (const [from, to] of moved.reverse()) {
+          try {
+            renameSync(to, from);
+          } catch (backErr) {
+            log.error({ err: backErr, from: to, to: from }, "Could not put a database file back after a failed quarantine");
+          }
+        }
         try {
-          unlinkSync(`${path}${suffix}`);
-        } catch (unlinkErr) {
-          if (!isEnoent(unlinkErr)) throw new Error(`Could not clear ${path}${suffix} after moving the damaged database aside`, { cause: unlinkErr });
+          if (before === undefined) unlinkSync(marker);
+          else writeJsonAtomicSync(marker, { asides: before }, { fsync: true });
+        } catch (markerErr) {
+          if (!isEnoent(markerErr)) log.warn({ err: markerErr }, "Could not restore the database quarantine marker");
+        }
+        throw new Error(`Database ${path} is damaged and could not be moved aside`, { cause: err });
+      }
+      try {
+        renameSync(`${path}-shm`, `${aside}-shm`);
+      } catch (err) {
+        if (!isEnoent(err)) {
+          log.warn({ err, file: `${path}-shm` }, "Could not move the database's -shm index aside; removing it (SQLite rebuilds it)");
+          unlinkSync(`${path}-shm`);
         }
       }
+      log.error({ err: cause, file: path, aside }, "Database failed its check; moved it aside unchanged and started a fresh one");
+      return aside;
     }
-    log.error({ err: cause, file: path, aside }, "Database failed its check; moved it aside unchanged and started a fresh one");
-    return aside;
-  }
-  throw new Error(`No free name to move the damaged database ${path} aside`, { cause });
+    throw new Error(`No free name to move the damaged database ${path} aside`, { cause });
+  });
 }

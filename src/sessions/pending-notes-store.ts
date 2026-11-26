@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, renameSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { clearQuarantinedDbs, openTomoDb, quarantinedDbs, type TomoDb } from "../db/index.js";
 import { isEnoent, writeJsonAtomicSync } from "../fs-utils.js";
@@ -10,8 +10,14 @@ import type { PendingNotesFile } from "./store-support.js";
 /** The pre-SQLite file, in the sessions directory. Imported once, then renamed. */
 export const LEGACY_PENDING_NOTES_FILENAME = "_pending_notes.json";
 const LEGACY_MARKER_FILENAME = "_pending_notes.quarantined.json";
-/** `meta` row: digest of the legacy file last imported (an import that crashed before the rename is not run twice). */
-const IMPORTED_DIGEST_KEY = "legacy_pending_notes_sha256";
+/**
+ * `meta` row, present only between an import's commit and the rename of the
+ * file it imported: that file's digest. A crash in between leaves the file
+ * and this row, and the next start renames the file without importing it
+ * again. Cleared once the file is renamed, so a later file (after a rollback)
+ * is always imported, whatever its bytes.
+ */
+export const IMPORT_PENDING_KEY = "legacy_pending_notes_import_pending";
 
 export type MoveOutcome = "moved" | "taken" | "gone";
 
@@ -28,7 +34,10 @@ export type MoveOutcome = "moved" | "taken" | "gone";
  * is imported in one transaction and renamed to `.migrated-<ts>`: it is then
  * the newest truth (only a pre-SQLite Tomo writes it, e.g. after a rollback),
  * so it replaces the table rather than adding to it. Its digest is recorded in
- * the same transaction, so a crash before the rename imports nothing twice. A
+ * the same transaction until the rename lands (IMPORT_PENDING_KEY), so a crash
+ * in between imports nothing twice. `tomo db export pending-notes` MOVES the
+ * notes out (file written, then the table emptied), so an older Tomo that
+ * drains them and deletes the file leaves nothing behind to deliver again. A
  * file that will not read is moved aside unchanged as before (`.corrupt-<ts>`,
  * marker first) and the owner told. No dual writes: the file is never written
  * again; `tomo db export pending-notes` writes it for a rollback.
@@ -136,12 +145,12 @@ export class PendingNotesStore {
     }
     const digest = createHash("sha256").update(raw).digest("hex");
     const outcome = db.transaction(() => {
-      const prev = db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", IMPORTED_DIGEST_KEY);
+      const prev = db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", IMPORT_PENDING_KEY);
       if (prev?.value === digest) return null;
       const displaced = Number(db.get<{ n: number }>("SELECT count(*) AS n FROM pending_notes")?.n ?? 0);
       db.run("DELETE FROM pending_notes");
       for (const [key, list] of Object.entries(notes)) writeNotes(db, key, list);
-      db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", IMPORTED_DIGEST_KEY, digest);
+      db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", IMPORT_PENDING_KEY, digest);
       return { displaced };
     });
     if (outcome) {
@@ -162,7 +171,9 @@ export class PendingNotesStore {
         log.warn({ err, file: this.legacyPath }, "Imported the pending notes file but could not rename it; will retry next start");
         return;
       }
-      if (moved !== "taken") return;
+      if (moved === "taken") continue;
+      db.run("DELETE FROM meta WHERE key = ?", IMPORT_PENDING_KEY);
+      return;
     }
   }
 
@@ -284,14 +295,21 @@ export function parsePendingNotesFile(raw: Buffer): Record<string, string[]> {
   return notes;
 }
 
-/** Rename without overwriting (export's helper, for a file nobody else writes). */
-export function renameNoClobber(from: string, to: string): MoveOutcome {
-  if (existsSync(to)) return "taken";
-  try {
-    renameSync(from, to);
-    return "moved";
-  } catch (err) {
-    if (isEnoent(err)) return "gone";
-    throw err;
+/**
+ * Move every note out of the database into the legacy file at `out` (the
+ * rollback path): the file is written and fsynced first, then the table
+ * emptied in one transaction, so the notes are never only in neither place.
+ * Returns how many were moved.
+ */
+export function exportPendingNotesToFile(db: TomoDb, out: string, opts: { clear: boolean }): number {
+  const notes = readAllNotes(db);
+  const file: PendingNotesFile = { version: 1, notes };
+  writeJsonAtomicSync(out, file, { fsync: true });
+  if (opts.clear) {
+    db.transaction(() => {
+      db.run("DELETE FROM pending_notes");
+      db.run("DELETE FROM meta WHERE key = ?", IMPORT_PENDING_KEY);
+    });
   }
+  return Object.values(notes).reduce((n, list) => n + list.length, 0);
 }

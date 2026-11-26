@@ -1,12 +1,24 @@
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { spawn, spawnSync } from "node:child_process";
+
+// renameSync can be made to fail for one path (a sidecar that will not move).
+const fsHooks = vi.hoisted(() => ({ failRename: null as null | ((from: string) => boolean) }));
+vi.mock("node:fs", async (orig) => {
+  const actual = await orig<typeof import("node:fs")>();
+  const renameSync = (from: string, to: string) => {
+    if (fsHooks.failRename?.(String(from))) throw Object.assign(new Error(`EACCES: rename ${from}`), { code: "EACCES" });
+    return actual.renameSync(from, to);
+  };
+  return { ...actual, default: { ...actual, renameSync }, renameSync };
+});
+
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync, closeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  DB_BUSY_TIMEOUT_MS, DbSchemaTooNewError, clearQuarantinedDbs, dbQuarantineMarkerPath, isCorruptionError, openTomoDb,
-  quarantinedDbs, type Migration,
+  DB_BUSY_TIMEOUT_MS, DbSchemaTooNewError, clearQuarantinedDbs, dbQuarantineMarkerPath, fileIdentity, isCorruptionError, openTomoDb,
+  quarantineDb, quarantinedDbs, type Migration,
 } from "../src/db/index.js";
 import { TOMO_DB_MIGRATIONS } from "../src/db/schema.js";
 
@@ -207,6 +219,72 @@ describe("a damaged database", () => {
     expect(readFileSync(path, "utf8")).toBe("garbage ".repeat(512));
     expect(readdirSync(dir)).toEqual(["tomo.db"]);
   });
+
+  it("whose -wal will not move is left whole, with its log, and the open throws", () => {
+    const dir = freshDir();
+    const path = join(dir, "tomo.db");
+    writeFileSync(path, "garbage ".repeat(512));
+    writeFileSync(`${path}-wal`, "committed frames only here");
+    fsHooks.failRename = (from) => from.endsWith("tomo.db-wal");
+    try {
+      expect(() => openTomoDb(path)).toThrow(/could not be moved aside/);
+    } finally {
+      fsHooks.failRename = null;
+    }
+    expect(readFileSync(path, "utf8")).toBe("garbage ".repeat(512));
+    expect(readFileSync(`${path}-wal`, "utf8")).toBe("committed frames only here");
+    expect(readdirSync(dir).filter((f) => f.includes("corrupt"))).toEqual([]);
+    expect(quarantinedDbs(path)).toBeUndefined();
+  });
+
+  it("whose main file will not move puts the -wal it already moved back", () => {
+    const dir = freshDir();
+    const path = join(dir, "tomo.db");
+    writeFileSync(path, "garbage ".repeat(512));
+    writeFileSync(`${path}-wal`, "log");
+    fsHooks.failRename = (from) => from === path;
+    try {
+      expect(() => openTomoDb(path)).toThrow(/could not be moved aside/);
+    } finally {
+      fsHooks.failRename = null;
+    }
+    expect(readFileSync(`${path}-wal`, "utf8")).toBe("log");
+    expect(readdirSync(dir).filter((f) => f.includes("corrupt"))).toEqual([]);
+  });
+
+  it("already replaced by another process is not moved again", () => {
+    const dir = freshDir();
+    const path = join(dir, "tomo.db");
+    writeFileSync(path, "garbage ".repeat(512));
+    const checked = fileIdentity(path);
+    // Another process moved it aside and started a fresh one in between.
+    rmSync(path);
+    const other = openTomoDb(path);
+    other.run("INSERT INTO meta (key, value) VALUES ('theirs', '1')");
+    expect(quarantineDb(path, new Error("quick_check"), checked)).toBeNull();
+    expect(other.get("SELECT value FROM meta WHERE key = 'theirs'")).toEqual({ value: "1" });
+    other.close();
+    expect(readdirSync(dir).filter((f) => f.includes("corrupt"))).toEqual([]);
+  });
+
+  it("found by two processes at once is moved aside once, and both end up writing the same fresh file", async () => {
+    const dir = freshDir();
+    const path = join(dir, "tomo.db");
+    writeFileSync(path, "garbage ".repeat(4096));
+    const opener = (id: number) => `
+      import { openTomoDb } from ${JSON.stringify(DB_MODULE)};
+      const db = openTomoDb(${JSON.stringify(path)});
+      db.run("INSERT INTO meta (key, value) VALUES (?, '1')", "proc-${id}");
+      db.close();
+      console.log("done");
+    `;
+    const results = await Promise.all([0, 1, 2].map((id) => child(opener(id))));
+    for (const r of results) expect(r, r.err).toMatchObject({ code: 0, out: "done\n" });
+    expect(readdirSync(dir).filter((f) => /^tomo\.db\.corrupt-[\d-]+$/.test(f))).toHaveLength(1);
+    const db = openTomoDb(path);
+    expect(db.all("SELECT key FROM meta ORDER BY key").map((r) => r.key)).toEqual(["proc-0", "proc-1", "proc-2"]);
+    db.close();
+  }, 30_000);
 
   it("is recognised by its SQLite error code", () => {
     expect(isCorruptionError({ errcode: 26 })).toBe(true);

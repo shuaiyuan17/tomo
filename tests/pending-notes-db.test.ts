@@ -86,6 +86,17 @@ describe("importing _pending_notes.json", () => {
     expect(filesLike(dir, "_pending_notes.json.migrated-")).toHaveLength(2);
   });
 
+  it("a later file with the same bytes as an earlier import is still imported", () => {
+    const dir = freshDir();
+    writeLegacy(dir, { "dm:alice": ["same"] });
+    const store = makeSessionStore(dir);
+    expect(store.getPendingNotes("dm:alice")).toEqual(["same"]);
+    store.setPendingNotes("dm:alice", []); // delivered
+    // After a rollback an older Tomo happens to write the very same file again.
+    writeLegacy(dir, { "dm:alice": ["same"] });
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["same"]);
+  });
+
   it("an import that fails half-way leaves the table and the file as they were", () => {
     const dir = freshDir();
     makeSessionStore(dir).setPendingNotes("dm:carol", ["already here"]);

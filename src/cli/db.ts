@@ -5,18 +5,16 @@ import { config } from "../config.js";
 import { DbSchemaTooNewError, openTomoDb, quarantinedDbs, type TomoDb } from "../db/index.js";
 import { DUMPABLE_TABLES, TOMO_DB_MIGRATIONS } from "../db/schema.js";
 import { canManageJob } from "../cron/scope.js";
-import { writeJsonAtomicSync } from "../fs-utils.js";
 import { TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
-import { LEGACY_PENDING_NOTES_FILENAME, readAllNotes } from "../sessions/pending-notes-store.js";
-import type { PendingNotesFile } from "../sessions/store-support.js";
+import { LEGACY_PENDING_NOTES_FILENAME, exportPendingNotesToFile } from "../sessions/pending-notes-store.js";
 import { isRecordedProcessLive, readPidFileRecord } from "./pidfile.js";
 
 /**
  * `tomo db`: look at Tomo's database (`~/.tomo/data/tomo.db`) without
  * writing to it, and export a store back to its pre-SQLite file for a
- * rollback. Every command opens the database read-only; `export` writes only
- * the file it is asked to.
+ * rollback. `check` and `dump` open it read-only; `export` to the default file
+ * moves the store's rows out of the database (see below).
  */
 export const dbCommand = new Command("db")
   .description("Inspect Tomo's database (check, dump) and export a store to its old file format");
@@ -103,15 +101,10 @@ dbCommand
   });
 
 /** Stores `tomo db export` can write back to their pre-SQLite file. */
-const EXPORTS: Record<string, { file: () => string; write: (db: TomoDb, out: string) => number }> = {
+const EXPORTS: Record<string, { file: () => string; write: (db: TomoDb, out: string, clear: boolean) => number }> = {
   "pending-notes": {
     file: () => join(config.sessionsDir, LEGACY_PENDING_NOTES_FILENAME),
-    write: (db, out) => {
-      const notes = readAllNotes(db);
-      const file: PendingNotesFile = { version: 1, notes };
-      writeJsonAtomicSync(out, file, { fsync: true });
-      return Object.values(notes).reduce((n, list) => n + list.length, 0);
-    },
+    write: (db, out, clear) => exportPendingNotesToFile(db, out, { clear }),
   },
 };
 
@@ -133,11 +126,30 @@ dbCommand
       if (record && isRecordedProcessLive(record)) fail("Tomo is running. Stop it first (`tomo stop`), or pass --force.");
       if (existsSync(out)) fail(`${out} already exists; pass --force to overwrite it.`);
     }
+    // To the file the older Tomo reads, from the live database: the notes are
+    // MOVED (the table is emptied once the file is on disk), so an older Tomo
+    // that delivers them and deletes the file leaves nothing in the database
+    // to deliver a second time after an upgrade. Anywhere else, or from
+    // another file, it is a copy and the database is not written.
+    const move = !opts.out && !opts.from;
     const path = opts.from ?? config.dbPath;
-    const count = withDb(path, (db) => target.write(db, out), { allowNewerSchema: true });
-    console.log(`Wrote ${count} note(s) to ${out}.`);
-    if (!opts.out) {
+    if (!existsSync(path)) fail(`No database at ${path}.`);
+    let count: number;
+    try {
+      const db = openTomoDb(path, move ? {} : { readOnly: true, allowNewerSchema: true });
+      try {
+        count = target.write(db, out, move);
+      } finally {
+        db.close();
+      }
+    } catch (err) {
+      fail(`Could not export from ${path}: ${(err as Error).message}`);
+    }
+    if (move) {
+      console.log(`Moved ${count} note(s) out of the database into ${out}.`);
       console.log("To roll back: install the older Tomo and start it; it reads this file.");
-      console.log("Starting this version again imports the file once more (it replaces the table).");
+      console.log("Starting this version again imports the file back (it replaces the table).");
+    } else {
+      console.log(`Wrote ${count} note(s) to ${out} (the database is unchanged).`);
     }
   });

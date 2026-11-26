@@ -27,7 +27,7 @@ export class OwnerAdoption {
   /**
    * The one-time adoption of a legacy per-channel session into the owner's
    * `dm:` key, WITH everything that is keyed by the session: its cron jobs
-   * (`data/cron/jobs.json`) and its `sessionModelOverrides` and
+   * (the `cron_jobs` table) and its `sessionModelOverrides` and
    * `sessionEffortOverrides` entries. Moving only
    * the registry entry left the jobs on the raw key — the next run forked a
    * fresh session there — and dropped the owner's model.
@@ -54,7 +54,7 @@ export class OwnerAdoption {
   /** Move cron jobs and the model override from `from` to `to`; idempotent. */
   private finishAdoption(from: string, to: string): void {
     try {
-      const moved = new CronStore(join(config.tomoHome, "data", "cron", "jobs.json")).rewriteSessionKey(from, to);
+      const moved = new CronStore(config.dbPath).rewriteSessionKey(from, to);
       if (moved > 0) log.info({ from, to, jobs: moved }, "Moved cron jobs with the adopted session");
       this.moveModelOverride(from, to);
       rmSync(this.adoptionMarkerPath, { force: true });

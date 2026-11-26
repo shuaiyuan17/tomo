@@ -55,7 +55,7 @@ async function setup() {
   tg.delivered.length = 0;
   const dir = mkdtempSync(join(tmpdir(), "cron-interrupted-"));
   tmpDirs.push(dir);
-  const path = join(dir, "jobs.json");
+  const path = join(dir, "data", "tomo.db");
   const store = new CronStore(path);
   /**
    * Add a job that is due on the first tick. A one-shot's `at` is a minute

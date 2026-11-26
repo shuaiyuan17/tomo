@@ -31,10 +31,31 @@ export const TOMO_DB_MIGRATIONS: readonly Migration[] = [
       `);
     },
   },
+  {
+    version: 2,
+    up(db) {
+      db.exec(`
+        -- Scheduled tasks (src/cron/store.ts), one row per job, in creation order
+        -- (seq). The record is the JSON the old data/cron/jobs.json held; the
+        -- columns after it are read-only mirrors for tomo db dump and sqlite3.
+        CREATE TABLE cron_jobs (
+          seq INTEGER PRIMARY KEY,
+          id TEXT NOT NULL UNIQUE,
+          job TEXT NOT NULL CHECK (json_valid(job) AND json_extract(job, '$.id') = id),
+          name ANY GENERATED ALWAYS AS (json_extract(job, '$.name')) VIRTUAL,
+          session_key ANY GENERATED ALWAYS AS (json_extract(job, '$.sessionKey')) VIRTUAL,
+          enabled ANY GENERATED ALWAYS AS (json_extract(job, '$.enabled')) VIRTUAL,
+          next_run_at ANY GENERATED ALWAYS AS (json_extract(job, '$.nextRunAt')) VIRTUAL,
+          last_status ANY GENERATED ALWAYS AS (json_extract(job, '$.lastStatus')) VIRTUAL
+        ) STRICT;
+      `);
+    },
+  },
 ];
 
 /** Tables `tomo db dump` may print, with the column order rows are sorted by. */
 export const DUMPABLE_TABLES: Readonly<Record<string, string>> = {
   meta: "key",
   pending_notes: "session_key, position",
+  cron_jobs: "seq",
 };

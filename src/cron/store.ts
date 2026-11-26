@@ -1,17 +1,13 @@
-import { readFileSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { homedir } from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync, readdirSync, statSync, mkdirSync, existsSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import type { CronJob, CronOutcome, CronSchedule, InterruptNotice, InterruptedRun, InterruptedSkip, SkipNotice } from "./types.js";
-import { writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
+import { DbDamagedError, openTomoDb, type TomoDb } from "../db/index.js";
+import { writeFileAtomicSync, writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
 import { log } from "../logger.js";
-import { withFileLockSync } from "../file-lock.js";
+import { defaultRuntimePaths } from "../runtime-paths.js";
+import { fileTimestamp } from "../sessions/transcript-names.js";
 import { computeNextRun, everyIntervalReason, isSingleFire, missedSlots, staleWindowMs, type StaleSkip } from "./schedule.js";
-
-const DEFAULT_STORE_PATH = join(homedir(), ".tomo", "data", "cron", "jobs.json");
-/** The store file the daemon's scheduler uses. Passed explicitly to the web
- *  process, which must read the same file and never derive it itself. */
-export const CRON_STORE_PATH = DEFAULT_STORE_PATH;
 
 /** Failed one-shot ("at") jobs retry this many times before being disabled. */
 export const ONE_SHOT_MAX_RETRIES = 2;
@@ -31,63 +27,88 @@ export class InvalidScheduleError extends Error {
   }
 }
 
+/**
+ * The cron jobs, one row each in Tomo's database (`cron_jobs`, see
+ * src/db/schema.ts). Every process that schedules or edits jobs (the daemon's
+ * scheduler and schedule_* tools, `tomo cron`, `tomo config`, the web
+ * process) goes through this class.
+ *
+ * EVERY CHANGE IS ONE WRITE TRANSACTION. A mutator reads the jobs, changes
+ * them and writes back the rows it changed, all under SQLite's write lock
+ * (`BEGIN IMMEDIATE`), so no other process can write in between. That is the
+ * whole of the concurrency story: it replaces the old `jobs.json` lock, the
+ * three-way merge against a stale snapshot and the revision check before the
+ * rename (#356, a848a8f3). Reads see the last committed state.
+ *
+ * The record is kept as JSON (column `job`), with the fields worth querying
+ * mirrored as generated columns for `tomo db dump` and `sqlite3`. The domain
+ * logic below (run tokens, interruption settling, stale skips) is unchanged.
+ *
+ * THE OLD FILE (`data/cron/jobs.json`) is imported once, by the daemon at
+ * start ({@link importLegacyCronJobs}), and then replaced by a placeholder an
+ * older Tomo cannot read as a jobs file. Until a real jobs file is imported,
+ * every call here refuses ({@link CronStoreReadError}): that file is newer
+ * than the table (an older Tomo wrote it, or `tomo db export cron` did).
+ */
 export class CronStore {
-  private jobs: CronJob[] = [];
-  /**
-   * Per-job copy of `jobs` as of the last load — the merge base. The copies
-   * are SHALLOW (`{ ...job }`), which is sound only because no mutator edits
-   * a nested value in place: `schedule` is replaced wholesale, everything
-   * else is a primitive. A future mutator that reaches into a nested object
-   * would be invisible to the merge (base and ours would share the object and
-   * compare equal) and must deep-copy here instead.
-   *
-   * Every save is a
-   * three-way merge (baseline / our in-memory jobs / whatever is on disk right
-   * now), so a concurrent writer that loaded before us and saves between our
-   * load and our save cannot silently revert fields we never touched, and we
-   * cannot revert theirs. See `mergeWithDisk`.
-   *
-   * This is not a lock: two writers can still interleave their read-modify-
-   * write cycles, and the loser's *conflicting* field edit is lost (last write
-   * wins per field). It closes the common case — the daemon writing
-   * `lastStartedAt` while a `tomo cron add` / `schedule_create` in another
-   * process holds a snapshot that predates it — which would otherwise erase
-   * the only durable record that a run was dispatched.
-   */
-  private baseline = new Map<string, CronJob>();
-  /**
-   * Set when the last load failed. The instance still exists (constructing a
-   * store must not take the daemon down over a transient read error) but it
-   * holds no trustworthy state, so reads and writes refuse rather than report
-   * an empty store. Cleared by the next successful load.
-   */
-  private loadError: unknown = null;
-  /** Job ids already reported by `quarantineBadIntervals` — warn once, not per poll. */
-  private warnedBadInterval = new Set<string>();
-  private path: string;
+  readonly dbPath: string;
 
-  constructor(path = DEFAULT_STORE_PATH) {
-    this.path = path;
-    try {
-      this.load();
-    } catch {
-      // Recorded by load(); every read and write refuses until a reload succeeds.
-    }
+  constructor(dbPath = defaultRuntimePaths.dbPath) {
+    this.dbPath = dbPath;
+  }
+
+  /** The legacy jobs file this store's database replaced. */
+  get legacyPath(): string {
+    return legacyCronJobsPath(this.dbPath);
   }
 
   list(): CronJob[] {
-    this.assertLoaded();
-    return [...this.jobs];
+    return readJobs(this.open());
   }
 
   get(id: string): CronJob | undefined {
-    this.assertLoaded();
-    return this.jobs.find((j) => j.id === id);
+    const row = this.open().get<{ job: string }>("SELECT job FROM cron_jobs WHERE id = ?", id);
+    return row ? (JSON.parse(row.job) as CronJob) : undefined;
   }
 
-  /** Refuse to serve or overwrite state we could not read. */
-  private assertLoaded(): void {
-    if (this.loadError !== null) throw this.loadError;
+  /** The database, ready for this store; throws CronStoreReadError when it is not. */
+  private open(): TomoDb {
+    let db: TomoDb;
+    try {
+      db = sharedDb(this.dbPath);
+    } catch (err) {
+      throw new CronStoreReadError(this.dbPath, err, err instanceof DbDamagedError ? "the database is damaged; stop Tomo and run `tomo db repair`" : undefined);
+    }
+    assertLegacyImported(db, this.legacyPath);
+    return db;
+  }
+
+  /**
+   * Run `fn` over every job inside one write transaction and write back what
+   * it changed: rows whose record differs are updated, jobs it added are
+   * inserted, jobs it took out of the array are deleted.
+   */
+  private mutate<T>(fn: (jobs: CronJob[]) => T): T {
+    const db = this.open();
+    return db.transaction(() => {
+      // Again under the write lock: a rollback export may have committed
+      // between the check in open() and BEGIN, and a change made after its
+      // snapshot would be in neither the exported file nor, once that file is
+      // imported back, the table.
+      assertLegacyImported(db, this.legacyPath);
+      const before = new Map(db.all<{ id: string; job: string }>("SELECT id, job FROM cron_jobs").map((r) => [r.id, r.job]));
+      const jobs = readJobs(db);
+      const result = fn(jobs);
+      const kept = new Set(jobs.map((j) => j.id));
+      for (const id of before.keys()) if (!kept.has(id)) db.run("DELETE FROM cron_jobs WHERE id = ?", id);
+      for (const job of jobs) {
+        const json = JSON.stringify(job);
+        const prev = before.get(job.id);
+        if (prev === undefined) db.run("INSERT INTO cron_jobs (id, job) VALUES (?, ?)", job.id, json);
+        else if (prev !== json) db.run("UPDATE cron_jobs SET job = ? WHERE id = ?", json, job.id);
+      }
+      return result;
+    });
   }
 
   add(opts: {
@@ -100,17 +121,13 @@ export class CronStore {
   }): CronJob {
     // The one schedule check the store itself owes: an unusable `every`
     // interval is not a state this store may represent at all (unlike a past
-    // `at` time, which every fired one-shot on disk is). A caller that skipped
+    // `at` time, which every fired one-shot is). A caller that skipped
     // `parseCreatableSchedule` — an older CLI, a future surface — must not be
-    // able to write `every 0s` back in.
+    // able to write `every 0s` in.
     if (opts.schedule.kind === "every") {
       const bad = everyIntervalReason(opts.schedule.everyMs);
       if (bad !== null) throw new InvalidScheduleError(bad);
     }
-    // Reload before mutating (like markRun/remove): jobs added/removed by
-    // separate CLI processes while this instance holds a stale snapshot
-    // would otherwise be reverted by the save below.
-    this.load();
     const now = Date.now();
     const job: CronJob = {
       id: randomUUID().slice(0, 8),
@@ -129,38 +146,32 @@ export class CronStore {
       lastCompletedRunId: null,
       ...(opts.staleAfterMs !== undefined ? { staleAfterMs: opts.staleAfterMs } : {}),
     };
-    this.jobs.push(job);
-    this.save();
+    this.mutate((jobs) => jobs.push(job));
     return job;
   }
 
   /** Rewrite sessionKey on all jobs matching oldKey. Returns count changed. */
   rewriteSessionKey(oldKey: string, newKey: string): number {
-    this.load();
-    let count = 0;
-    for (const job of this.jobs) {
-      if (job.sessionKey === oldKey) {
-        job.sessionKey = newKey;
-        count++;
+    return this.mutate((jobs) => {
+      let count = 0;
+      for (const job of jobs) {
+        if (job.sessionKey === oldKey) {
+          job.sessionKey = newKey;
+          count++;
+        }
       }
-    }
-    if (count > 0) this.save();
-    return count;
+      return count;
+    });
   }
 
   /**
    * Enable or disable a job. Enabling recomputes the next run; a one-shot
    * ("at") job whose time already passed fires on the next poll, with its
    * retry budget reset — re-enabling a failed reminder is a manual retry.
-   */
-  /**
-   * Enable or disable a job.
    *
-   * `guard` runs against the job as it exists AFTER the reload, for the same
-   * reason `remove`'s does: checking ownership against a snapshot taken when
-   * the store was constructed misses anything another process wrote in
-   * between, and `load()` here replaces that snapshot anyway. Returns
-   * `"refused"` when the guard rejects, distinct from `undefined` (not found).
+   * `guard` runs against the job inside the write transaction, so ownership
+   * is checked against the state the change applies to. Returns `"refused"`
+   * when the guard rejects, distinct from `undefined` (not found).
    *
    * Returns `"unschedulable"` — leaving the job as it was — when enabling it
    * would produce the dead-job shape `enabled: true, nextRunAt: null`: a job
@@ -175,50 +186,48 @@ export class CronStore {
   setEnabled(id: string, enabled: boolean): CronJob | undefined | "unschedulable";
   setEnabled(id: string, enabled: boolean, guard: (job: CronJob) => boolean): CronJob | undefined | "refused" | "unschedulable";
   setEnabled(id: string, enabled: boolean, guard?: (job: CronJob) => boolean): CronJob | undefined | "refused" | "unschedulable" {
-    this.load();
-    const job = this.get(id);
-    if (!job) return undefined;
-    if (guard && !guard(job)) return "refused";
-    if (job.enabled === enabled) return job;
-    if (enabled) {
-      const next = computeNextRun(job.schedule, Date.now());
-      if (next === null && job.schedule.kind !== "at") return "unschedulable";
-    }
-    job.enabled = enabled;
-    if (enabled) {
-      const now = Date.now();
-      const next = computeNextRun(job.schedule, now);
-      job.nextRunAt = job.schedule.kind === "at" && next === null ? now : next;
-      if (job.schedule.kind === "at") delete job.retryCount;
-      // Whoever re-enabled it has seen it; a later interruption is news again.
-      if (job.interruptNotifiedAt != null) job.interruptNotifiedAt = null;
-      // Re-enabling adjudicates an interrupted run that recovery has ALREADY
-      // settled: whoever re-enabled it has decided the job should run again,
-      // so clear the state that would otherwise make the next daemon start
-      // settle (and for a one-shot, immediately re-disable) it a second time.
-      //
-      // "Settled" is BOTH halves: the status says interrupted AND the run
-      // token is acknowledged. The status alone is not enough — recovery
-      // stamps it on a *resumed recurring* job too, and that job then gets
-      // dispatched again with the status still set, so a disable→enable
-      // during the resumed run would acknowledge the LIVE token and the next
-      // restart would re-fire it with no [resumed] marker. Checking
-      // isInterrupted means a live run is never mistaken for a settled one.
-      // (For a genuinely settled job the ack is a no-op — recovery already
-      // acknowledged the token — and stays only to repair a hand-edited file.)
-      if (job.lastStatus === "interrupted" && !isInterrupted(job)) {
-        job.lastStatus = null;
-        job.lastCompletedRunId = job.lastRunId ?? null;
-        if (job.interruptedAt != null) job.interruptedAt = null;
-        delete job.resumeAttempts;
+    return this.mutate((jobs) => {
+      const job = jobs.find((j) => j.id === id);
+      if (!job) return undefined;
+      if (guard && !guard(job)) return "refused";
+      if (job.enabled === enabled) return job;
+      if (enabled) {
+        const next = computeNextRun(job.schedule, Date.now());
+        if (next === null && job.schedule.kind !== "at") return "unschedulable";
       }
-    } else {
-      // Clear rather than leave a stale timestamp that list/detail views
-      // would show as a "next run" that will never fire.
-      job.nextRunAt = null;
-    }
-    this.save();
-    return job;
+      job.enabled = enabled;
+      if (enabled) {
+        const now = Date.now();
+        const next = computeNextRun(job.schedule, now);
+        job.nextRunAt = job.schedule.kind === "at" && next === null ? now : next;
+        if (job.schedule.kind === "at") delete job.retryCount;
+        // Whoever re-enabled it has seen it; a later interruption is news again.
+        if (job.interruptNotifiedAt != null) job.interruptNotifiedAt = null;
+        // Re-enabling adjudicates an interrupted run that recovery has ALREADY
+        // settled: whoever re-enabled it has decided the job should run again,
+        // so clear the state that would otherwise make the next daemon start
+        // settle (and for a one-shot, immediately re-disable) it a second time.
+        //
+        // "Settled" is BOTH halves: the status says interrupted AND the run
+        // token is acknowledged. The status alone is not enough — recovery
+        // stamps it on a *resumed recurring* job too, and that job then gets
+        // dispatched again with the status still set, so a disable→enable
+        // during the resumed run would acknowledge the LIVE token and the next
+        // restart would re-fire it with no [resumed] marker. Checking
+        // isInterrupted means a live run is never mistaken for a settled one.
+        if (job.lastStatus === "interrupted" && !isInterrupted(job)) {
+          job.lastStatus = null;
+          job.lastCompletedRunId = job.lastRunId ?? null;
+          if (job.interruptedAt != null) job.interruptedAt = null;
+          delete job.resumeAttempts;
+        }
+      } else {
+        // Clear rather than leave a stale timestamp that list/detail views
+        // would show as a "next run" that will never fire.
+        job.nextRunAt = null;
+      }
+      return job;
+    });
   }
 
   /**
@@ -229,48 +238,38 @@ export class CronStore {
   setStaleAfter(id: string, ms: number | null, guard: (job: CronJob) => boolean): CronJob | undefined | "refused";
   setStaleAfter(id: string, ms: number | null, guard?: (job: CronJob) => boolean): CronJob | undefined | "refused" {
     if (ms !== null && !(Number.isSafeInteger(ms) && ms >= 0)) throw new RangeError(`invalid staleAfterMs: ${ms}`);
-    this.load();
-    const job = this.get(id);
-    if (!job) return undefined;
-    if (guard && !guard(job)) return "refused";
-    if (ms === null) delete job.staleAfterMs;
-    else job.staleAfterMs = ms;
-    this.save();
-    return job;
+    return this.mutate((jobs) => {
+      const job = jobs.find((j) => j.id === id);
+      if (!job) return undefined;
+      if (guard && !guard(job)) return "refused";
+      if (ms === null) delete job.staleAfterMs;
+      else job.staleAfterMs = ms;
+      return job;
+    });
   }
 
   /**
-   * Remove a job.
-   *
-   * `guard` is checked against the job as it exists AFTER the reload, inside
-   * the same load-modify-save. Checking ownership against a snapshot taken
-   * when the store was constructed is not enough: `load()` here replaces it,
-   * so a job written to disk by another process in between was absent from
-   * the caller's snapshot, skipped their ownership check, and was then deleted
-   * by the filter below. The guard has to run against the state the delete
-   * actually applies to.
-   *
-   * Returns `"refused"` when the guard rejects, distinct from `false`
-   * (not found) so the caller can say which happened.
+   * Remove a job. `guard` is checked against the job inside the same write
+   * transaction as the delete. Returns `"refused"` when the guard rejects,
+   * distinct from `false` (not found) so the caller can say which happened.
    */
   remove(id: string): boolean;
   remove(id: string, guard: (job: CronJob) => boolean): boolean | "refused";
   remove(id: string, guard?: (job: CronJob) => boolean): boolean | "refused" {
-    this.load();
-    const existing = this.jobs.find((j) => j.id === id);
-    if (!existing) return false;
-    if (guard && !guard(existing)) return "refused";
-    this.jobs = this.jobs.filter((j) => j.id !== id);
-    this.save();
-    return true;
+    return this.mutate((jobs) => {
+      const i = jobs.findIndex((j) => j.id === id);
+      if (i === -1) return false;
+      if (guard && !guard(jobs[i])) return "refused";
+      jobs.splice(i, 1);
+      return true;
+    });
   }
 
   /**
    * Record — durably, BEFORE the agent turn is dispatched — that a run has
    * started. `nextRunAt` only advances once a run completes (markRun), and the
    * scheduler's in-flight guard lives in memory, so without this a daemon that
-   * restarts mid-run comes back up, sees a due job on disk, and fires it a
-   * second time.
+   * restarts mid-run comes back up, sees a due job, and fires it a second time.
    *
    * The durable flag is a run *token*, not a timestamp comparison:
    * `lastRunId !== lastCompletedRunId` means "dispatched, never acknowledged".
@@ -282,32 +281,25 @@ export class CronStore {
    * concurrent CLI call between the due-scan and dispatch).
    */
   markStarted(id: string): string | undefined {
-    // Reload before mutating, like markRun/add: another process may have
-    // changed the file since this instance's last read.
-    this.load();
-    const job = this.get(id);
-    if (!job) return undefined;
-    const runId = randomUUID().slice(0, 8);
-    job.lastStartedAt = Date.now();
-    job.lastRunId = runId;
-    // This dispatch supersedes any earlier interrupted run: whatever marker
-    // recovery left is being delivered right now. Only written when there is
-    // actually a marker to clear — an unconditional `= null` would add the
-    // key to every job on every dispatch and, since clearing a field is a
-    // merge edit that beats a concurrent value, would let a routine dispatch
-    // stomp a marker another process had just set.
-    //
-    // The status goes with it: from here on the interruption is being acted
-    // on, not waiting to be. Leaving `lastStatus: "interrupted"` behind on a
-    // live run makes the job look settled to anything that reads the status
-    // (setEnabled did exactly that), and it is stale besides — this run's
-    // outcome is what markRun is about to write.
-    if (job.interruptedAt != null) {
-      job.interruptedAt = null;
-      if (job.lastStatus === "interrupted") job.lastStatus = null;
-    }
-    this.save();
-    return runId;
+    return this.mutate((jobs) => {
+      const job = jobs.find((j) => j.id === id);
+      if (!job) return undefined;
+      const runId = randomUUID().slice(0, 8);
+      job.lastStartedAt = Date.now();
+      job.lastRunId = runId;
+      // This dispatch supersedes any earlier interrupted run: whatever marker
+      // recovery left is being delivered right now. The status goes with it:
+      // from here on the interruption is being acted on, not waiting to be.
+      // Leaving `lastStatus: "interrupted"` behind on a live run makes the job
+      // look settled to anything that reads the status (setEnabled did
+      // exactly that), and it is stale besides — this run's outcome is what
+      // markRun is about to write.
+      if (job.interruptedAt != null) {
+        job.interruptedAt = null;
+        if (job.lastStatus === "interrupted") job.lastStatus = null;
+      }
+      return runId;
+    });
   }
 
   /**
@@ -325,16 +317,16 @@ export class CronStore {
     runId: string,
     prior: { lastStartedAt: number | null; interruptedAt: number | null; lastStatus: CronJob["lastStatus"] },
   ): void {
-    this.load();
-    const job = this.get(id);
-    if (!job || job.lastRunId !== runId) return;
-    job.lastCompletedRunId = runId;
-    job.lastStartedAt = prior.lastStartedAt;
-    if (prior.interruptedAt != null) {
-      job.interruptedAt = prior.interruptedAt;
-      job.lastStatus = prior.lastStatus;
-    }
-    this.save();
+    this.mutate((jobs) => {
+      const job = jobs.find((j) => j.id === id);
+      if (!job || job.lastRunId !== runId) return;
+      job.lastCompletedRunId = runId;
+      job.lastStartedAt = prior.lastStartedAt;
+      if (prior.interruptedAt != null) {
+        job.interruptedAt = prior.interruptedAt;
+        job.lastStatus = prior.lastStatus;
+      }
+    });
   }
 
   /**
@@ -345,12 +337,12 @@ export class CronStore {
    * another dispatch has since taken the token.
    */
   markInterruptedByShutdown(id: string, runId: string): void {
-    this.load();
-    const job = this.get(id);
-    if (!job || job.lastRunId !== runId) return;
-    const now = Date.now();
-    settleInterruptedRun(job, now, now);
-    this.save();
+    this.mutate((jobs) => {
+      const job = jobs.find((j) => j.id === id);
+      if (!job || job.lastRunId !== runId) return;
+      const now = Date.now();
+      settleInterruptedRun(job, now, now);
+    });
   }
 
   /**
@@ -363,15 +355,15 @@ export class CronStore {
    * cannot keep its cadence honestly anyway.
    */
   markUnacked(id: string, status: CronOutcome): void {
-    this.load();
-    const job = this.get(id);
-    if (!job) return;
-    job.lastRunAt = Date.now();
-    job.lastStatus = status;
-    job.lastCompletedRunId = job.lastRunId ?? null;
-    job.enabled = false;
-    job.nextRunAt = null;
-    this.save();
+    this.mutate((jobs) => {
+      const job = jobs.find((j) => j.id === id);
+      if (!job) return;
+      job.lastRunAt = Date.now();
+      job.lastStatus = status;
+      job.lastCompletedRunId = job.lastRunId ?? null;
+      job.enabled = false;
+      job.nextRunAt = null;
+    });
   }
 
   /**
@@ -392,79 +384,74 @@ export class CronStore {
    * retry is parked instead, a recurring job's pending resume is dropped.
    */
   recoverInterrupted(): { parked: InterruptedSkip[]; recurring: CronJob[] } {
-    this.load();
-    const now = Date.now();
-    const parked: InterruptedSkip[] = [];
-    const recurring: CronJob[] = [];
-    let changed = false;
-    for (const job of this.jobs) {
-      const legacyResume = !isInterrupted(job) && job.interruptedAt != null;
-      if (!isInterrupted(job) && !legacyResume) continue;
-      const wasEnabled = job.enabled;
-      // legacyResume: an older daemon settled the run and queued an automatic
-      // resume. Same incident, new policy: no resume. Either way the moment
-      // of the interruption is unknown here — the daemon was not alive to see
-      // it — so it is not invented.
-      settleInterruptedRun(job, now, null);
-      changed = true;
-      if (isSingleFire(job)) {
-        parked.push({ job: { ...job }, reason: wasEnabled ? "once-interrupted" : "once-disabled" });
-      } else {
-        recurring.push({ ...job });
+    return this.mutate((jobs) => {
+      const now = Date.now();
+      const parked: InterruptedSkip[] = [];
+      const recurring: CronJob[] = [];
+      for (const job of jobs) {
+        const legacyResume = !isInterrupted(job) && job.interruptedAt != null;
+        if (!isInterrupted(job) && !legacyResume) continue;
+        const wasEnabled = job.enabled;
+        // legacyResume: an older daemon settled the run and queued an automatic
+        // resume. Same incident, new policy: no resume. Either way the moment
+        // of the interruption is unknown here — the daemon was not alive to see
+        // it — so it is not invented.
+        settleInterruptedRun(job, now, null);
+        if (isSingleFire(job)) {
+          parked.push({ job: { ...job }, reason: wasEnabled ? "once-interrupted" : "once-disabled" });
+        } else {
+          recurring.push({ ...job });
+        }
       }
-    }
-    if (changed) this.save();
-    return { parked, recurring };
+      return { parked, recurring };
+    });
   }
 
   markRun(id: string, status: CronOutcome): void {
-    // Reload before mutating: jobs are added/removed by separate CLI
-    // processes (tomo cron add) while the daemon's run is in flight; saving
-    // the stale poll-time snapshot would silently delete them.
-    this.load();
-    const job = this.get(id);
-    if (!job) return;
+    this.mutate((jobs) => {
+      const i = jobs.findIndex((j) => j.id === id);
+      if (i === -1) return;
+      const job = jobs[i];
 
-    const now = Date.now();
-    job.lastRunAt = now;
-    job.lastStatus = status;
-    // Acknowledge the dispatch token — this is what makes the run "completed"
-    // for isInterrupted, independent of any clock.
-    job.lastCompletedRunId = job.lastRunId ?? null;
-    // A run that got all the way to an outcome clears the crash-loop budget:
-    // the cap exists for jobs that keep taking the daemon down mid-turn.
-    if (status !== "error") delete job.resumeAttempts;
+      const now = Date.now();
+      job.lastRunAt = now;
+      job.lastStatus = status;
+      // Acknowledge the dispatch token — this is what makes the run "completed"
+      // for isInterrupted, independent of any clock.
+      job.lastCompletedRunId = job.lastRunId ?? null;
+      // A run that got all the way to an outcome clears the crash-loop budget:
+      // the cap exists for jobs that keep taking the daemon down mid-turn.
+      if (status !== "error") delete job.resumeAttempts;
 
-    if (status !== "error" && job.deleteAfterRun) {
-      this.remove(id);
-      return;
-    }
+      if (status !== "error" && job.deleteAfterRun) {
+        jobs.splice(i, 1);
+        return;
+      }
 
-    // Compute next run for recurring jobs
-    if (job.schedule.kind === "every") {
-      // Advance from the scheduled due time, not from run completion —
-      // otherwise every run's duration (an agent turn can take minutes)
-      // accumulates as drift. If the daemon was down long enough that the
-      // next slot is already in the past, restart the cadence from now
-      // instead of burst-firing missed runs.
-      const scheduled = job.nextRunAt ?? now;
-      const next = scheduled + job.schedule.everyMs;
-      job.nextRunAt = next > now ? next : computeNextRun(job.schedule, now);
-    } else if (job.schedule.kind !== "at") {
-      job.nextRunAt = computeNextRun(job.schedule, now);
-    } else if (status === "error" && (job.retryCount ?? 0) < ONE_SHOT_MAX_RETRIES) {
-      // A one-shot job IS the deliverable (a reminder, usually) — a failed
-      // run gets a bounded number of delayed retries instead of being
-      // silently disabled. Recurring jobs need none of this: their next
-      // scheduled run is the retry.
-      job.retryCount = (job.retryCount ?? 0) + 1;
-      job.nextRunAt = now + ONE_SHOT_RETRY_DELAY_MS;
-    } else {
-      job.enabled = false;
-      job.nextRunAt = null;
-    }
-
-    this.save();
+      // Compute next run for recurring jobs
+      if (job.schedule.kind === "every") {
+        // Advance from the scheduled due time, not from run completion —
+        // otherwise every run's duration (an agent turn can take minutes)
+        // accumulates as drift. If the daemon was down long enough that the
+        // next slot is already in the past, restart the cadence from now
+        // instead of burst-firing missed runs.
+        const scheduled = job.nextRunAt ?? now;
+        const next = scheduled + job.schedule.everyMs;
+        job.nextRunAt = next > now ? next : computeNextRun(job.schedule, now);
+      } else if (job.schedule.kind !== "at") {
+        job.nextRunAt = computeNextRun(job.schedule, now);
+      } else if (status === "error" && (job.retryCount ?? 0) < ONE_SHOT_MAX_RETRIES) {
+        // A one-shot job IS the deliverable (a reminder, usually) — a failed
+        // run gets a bounded number of delayed retries instead of being
+        // silently disabled. Recurring jobs need none of this: their next
+        // scheduled run is the retry.
+        job.retryCount = (job.retryCount ?? 0) + 1;
+        job.nextRunAt = now + ONE_SHOT_RETRY_DELAY_MS;
+      } else {
+        job.enabled = false;
+        job.nextRunAt = null;
+      }
+    });
   }
 
   /**
@@ -476,34 +463,34 @@ export class CronStore {
    * nextRunAt has not advanced yet for a reason that is not lateness).
    */
   skipStaleRuns(exclude: ReadonlySet<string> = new Set(), now = Date.now()): StaleSkip[] {
-    this.load();
-    const skipped: StaleSkip[] = [];
-    for (const job of this.jobs) {
-      if (!job.enabled || job.nextRunAt === null || exclude.has(job.id) || isSingleFire(job)) continue;
-      // A resumed run (recovery left it due with the marker) is the
-      // interrupted run being finished, not a missed slot: never skip it.
-      if (job.interruptedAt != null) continue;
-      const windowMs = staleWindowMs(job, job.nextRunAt);
-      const lateByMs = now - job.nextRunAt;
-      if (windowMs === 0 || lateByMs <= windowMs) continue;
-      // `every`: keep the phase — the next slot on the job's own grid, not
-      // `now + interval` (a 09:00 daily job skipped at 16:00 stays a 09:00 job).
-      const next = job.schedule.kind === "every" && everyIntervalReason(job.schedule.everyMs) === null
-        ? job.nextRunAt + (Math.floor(lateByMs / job.schedule.everyMs) + 1) * job.schedule.everyMs
-        : computeNextRun(job.schedule, now);
-      // No future slot: leave it due rather than store the dead shape
-      // `enabled: true, nextRunAt: null` that nothing ever fires.
-      if (next === null) continue;
-      job.nextRunAt = next;
-      job.lastSkippedAt = now;
-      // Durable, so the owner still hears about it after a restart or a
-      // failed DM; cleared by markSkipNoticesSent.
-      const prior = job.skipNotice ?? null;
-      job.skipNotice = { seq: (prior?.seq ?? 0) + 1, count: (prior?.count ?? 0) + 1, lateByMs, windowMs };
-      skipped.push({ job: { ...job }, lateByMs, windowMs });
-    }
-    if (skipped.length > 0) this.save();
-    return skipped;
+    return this.mutate((jobs) => {
+      const skipped: StaleSkip[] = [];
+      for (const job of jobs) {
+        if (!job.enabled || job.nextRunAt === null || exclude.has(job.id) || isSingleFire(job)) continue;
+        // A resumed run (recovery left it due with the marker) is the
+        // interrupted run being finished, not a missed slot: never skip it.
+        if (job.interruptedAt != null) continue;
+        const windowMs = staleWindowMs(job, job.nextRunAt);
+        const lateByMs = now - job.nextRunAt;
+        if (windowMs === 0 || lateByMs <= windowMs) continue;
+        // `every`: keep the phase — the next slot on the job's own grid, not
+        // `now + interval` (a 09:00 daily job skipped at 16:00 stays a 09:00 job).
+        const next = job.schedule.kind === "every" && everyIntervalReason(job.schedule.everyMs) === null
+          ? job.nextRunAt + (Math.floor(lateByMs / job.schedule.everyMs) + 1) * job.schedule.everyMs
+          : computeNextRun(job.schedule, now);
+        // No future slot: leave it due rather than store the dead shape
+        // `enabled: true, nextRunAt: null` that nothing ever fires.
+        if (next === null) continue;
+        job.nextRunAt = next;
+        job.lastSkippedAt = now;
+        // Durable, so the owner still hears about it after a restart or a
+        // failed DM; cleared by markSkipNoticesSent.
+        const prior = job.skipNotice ?? null;
+        job.skipNotice = { seq: (prior?.seq ?? 0) + 1, count: (prior?.count ?? 0) + 1, lateByMs, windowMs };
+        skipped.push({ job: { ...job }, lateByMs, windowMs });
+      }
+      return skipped;
+    });
   }
 
   /**
@@ -512,15 +499,13 @@ export class CronStore {
    * which did so silently. The scheduler reports each once.
    */
   unreportedParkedOneShots(): CronJob[] {
-    this.load();
-    return this.jobs.filter((job) =>
+    return this.list().filter((job) =>
       !job.enabled && job.lastStatus === "interrupted" && isSingleFire(job) && job.interruptNotifiedAt == null);
   }
 
   /** Recurring jobs with an interrupted run the owner has not been told about. */
   unreportedInterruptedRecurring(): CronJob[] {
-    this.load();
-    return this.jobs.filter((job) => job.interruptNotice != null);
+    return this.list().filter((job) => job.interruptNotice != null);
   }
 
   /**
@@ -530,33 +515,30 @@ export class CronStore {
    */
   markRecurringInterruptNoticesSent(sent: ReadonlyArray<{ id: string; notice: InterruptNotice }>): void {
     if (sent.length === 0) return;
-    this.load();
-    let changed = false;
-    for (const { id, notice } of sent) {
-      const job = this.jobs.find((j) => j.id === id);
-      const current = job?.interruptNotice;
-      if (!job || current == null) continue;
-      if (current.seq <= notice.seq) {
-        job.interruptNotice = null;
-      } else {
-        // Interrupted again while the DM was in flight: drop only what was
-        // reported, keep the newer ones (they are appended after it).
-        const newer = current.seq - notice.seq;
-        job.interruptNotice = {
-          seq: current.seq,
-          count: Math.max(1, current.count - notice.count),
-          runs: current.runs.slice(-newer),
-        };
+    this.mutate((jobs) => {
+      for (const { id, notice } of sent) {
+        const job = jobs.find((j) => j.id === id);
+        const current = job?.interruptNotice;
+        if (!job || current == null) continue;
+        if (current.seq <= notice.seq) {
+          job.interruptNotice = null;
+        } else {
+          // Interrupted again while the DM was in flight: drop only what was
+          // reported, keep the newer ones (they are appended after it).
+          const newer = current.seq - notice.seq;
+          job.interruptNotice = {
+            seq: current.seq,
+            count: Math.max(1, current.count - notice.count),
+            runs: current.runs.slice(-newer),
+          };
+        }
       }
-      changed = true;
-    }
-    if (changed) this.save();
+    });
   }
 
   /** Recurring jobs with a stale skip the owner has not been told about. */
   unreportedSkips(): CronJob[] {
-    this.load();
-    return this.jobs.filter((job) => job.skipNotice != null);
+    return this.list().filter((job) => job.skipNotice != null);
   }
 
   /**
@@ -565,199 +547,383 @@ export class CronStore {
    */
   markSkipNoticesSent(sent: ReadonlyArray<{ id: string; notice: SkipNotice }>): void {
     if (sent.length === 0) return;
-    this.load();
-    let changed = false;
-    for (const { id, notice } of sent) {
-      const job = this.jobs.find((j) => j.id === id);
-      const current = job?.skipNotice;
-      if (!job || current == null) continue;
-      if (current.seq <= notice.seq) job.skipNotice = null;
-      else job.skipNotice = { ...current, count: Math.max(1, current.count - notice.count) };
-      changed = true;
-    }
-    if (changed) this.save();
+    this.mutate((jobs) => {
+      for (const { id, notice } of sent) {
+        const job = jobs.find((j) => j.id === id);
+        const current = job?.skipNotice;
+        if (!job || current == null) continue;
+        if (current.seq <= notice.seq) job.skipNotice = null;
+        else job.skipNotice = { ...current, count: Math.max(1, current.count - notice.count) };
+      }
+    });
   }
 
   /** Record that the owner was told about these parked one-shots. */
   markInterruptNotified(ids: readonly string[], now = Date.now()): void {
     if (ids.length === 0) return;
-    this.load();
-    let changed = false;
-    for (const job of this.jobs) {
-      if (!ids.includes(job.id)) continue;
-      job.interruptNotifiedAt = now;
-      changed = true;
-    }
-    if (changed) this.save();
+    this.mutate((jobs) => {
+      for (const job of jobs) if (ids.includes(job.id)) job.interruptNotifiedAt = now;
+    });
   }
 
   getDueJobs(): CronJob[] {
-    // Re-read from disk to pick up jobs added by external CLI calls
-    this.load();
     const now = Date.now();
-    return this.jobs.filter(
-      (j) => j.enabled && j.nextRunAt !== null && j.nextRunAt <= now,
-    );
-  }
-
-  private load(): void {
-    let disk: { jobs: CronJob[]; revision: number };
-    try {
-      disk = readStore(this.path);
-    } catch (err) {
-      // A reload that fails AFTER a successful one must not leave the old
-      // snapshot serviceable: `list()` would keep reporting the jobs that
-      // were there before the file went bad, and the surfaces that degrade on
-      // `CronStoreReadError` (watch snapshot, metrics scrape, `tomo status`)
-      // would see a healthy store. Record the failure so they degrade too.
-      this.loadError = err;
-      throw err;
-    }
-    this.jobs = disk.jobs;
-    this.quarantineBadIntervals();
-    this.baseline = snapshot(this.jobs);
-    this.loadError = null;
-  }
-
-  /** Advisory lock serializing the read-merge-write against other processes. */
-  private get lockPath(): string {
-    return `${this.path}.lock`;
-  }
-
-  /**
-   * Neutralise jobs whose `every` interval could never be honoured — a
-   * hand-edited jobs.json, or a job written by a version that predates the
-   * bounds. Rejecting the whole file (`readStore`) would take the daemon's
-   * entire schedule down over one bad record, and firing it would spin the
-   * scheduler, so the job is held inert in memory: disabled, with no next run.
-   *
-   * Applied AFTER the disk read and BEFORE the baseline snapshot, so the change
-   * is invisible to `mergeWithDisk` and the user's file is left as they wrote
-   * it — this refuses to run a job, it does not silently rewrite one. Editing
-   * the interval and restarting is enough to bring it back; `setEnabled` alone
-   * is not, and says why (`unschedulableReason`).
-   */
-  private quarantineBadIntervals(): void {
-    for (const job of this.jobs) {
-      if (job.schedule.kind !== "every") continue;
-      const bad = everyIntervalReason(job.schedule.everyMs);
-      if (bad === null) continue;
-      if (job.enabled || job.nextRunAt !== null) {
-        job.enabled = false;
-        job.nextRunAt = null;
-      }
-      // Once per job per process: load() runs on every 30s poll.
-      if (this.warnedBadInterval.has(job.id)) continue;
-      this.warnedBadInterval.add(job.id);
-      log.warn(
-        { jobId: job.id, name: job.name, schedule: job.schedule, reason: bad, path: this.path },
-        "Cron job has an unusable interval; holding it disabled",
-      );
-    }
-  }
-
-  /**
-   * Publish our merged view, with `jobs.json.lock` held for the whole
-   * read-merge-write.
-   *
-   * The lock is what makes this correct. The optimistic `revision` check below
-   * — re-read after the temp file is written, immediately before the rename —
-   * narrowed the race but could not close it: the check and the rename are two
-   * syscalls, so a process publishing between them was still lost. The concrete
-   * case was a `tomo cron add` passing the check while the daemon's
-   * `markStarted()` wrote a run token, and the CLI's rename erasing the only
-   * durable record that the run had been dispatched.
-   *
-   * With the lock held, no other process can be inside its own read-merge-write
-   * at all. The revision check stays as belt-and-braces (it still catches a
-   * writer that does not take the lock — a hand-edit, an older build) and the
-   * three-way merge still handles the wider window between this instance's
-   * `load()` and this save.
-   */
-  private save(): void {
-    // Never publish from a state we could not read: that is how a transient
-    // read error turns into an empty jobs file.
-    this.assertLoaded();
-    const dir = dirname(this.path);
-    mkdirSync(dir, { recursive: true });
-    withFileLockSync(this.lockPath, () => {
-      for (let attempt = 1; ; attempt++) {
-        const disk = readStore(this.path);
-        const merged = mergeWithDisk(this.baseline, this.jobs, disk.jobs);
-        try {
-          writeJsonAtomicSync(
-            this.path,
-            { version: STORE_SCHEMA_VERSION, revision: disk.revision + 1, jobs: merged },
-            {
-              beforeRename: () => {
-                if (readStore(this.path).revision !== disk.revision) {
-                  throw new StaleWriteError(this.path);
-                }
-              },
-            },
-          );
-        } catch (err) {
-          if (err instanceof StaleWriteError && attempt < SAVE_MAX_ATTEMPTS) continue;
-          throw err;
-        }
-        this.jobs = merged;
-        this.baseline = snapshot(merged);
-        return;
-      }
-    });
+    return this.list().filter((j) => j.enabled && j.nextRunAt !== null && j.nextRunAt <= now);
   }
 }
 
-/** Schema version of the on-disk file. Unrelated to `revision`. */
-const STORE_SCHEMA_VERSION = 1;
-/** Optimistic save retries before giving up and reporting a write failure. */
-const SAVE_MAX_ATTEMPTS = 5;
+function readJobs(db: TomoDb): CronJob[] {
+  return db.all<{ job: string }>("SELECT job FROM cron_jobs ORDER BY seq").map((r) => JSON.parse(r.job) as CronJob);
+}
 
-/** The file changed under an optimistic save; re-read, re-merge, retry. */
-class StaleWriteError extends Error {
-  constructor(path: string) {
-    super(`cron store changed during write: ${path}`);
-    this.name = "StaleWriteError";
+// --- Connections --------------------------------------------------------------
+
+/**
+ * One connection per database file per process, reopened when the file at the
+ * path is no longer the one it was opened on (a test that deletes its temp
+ * directory, a repaired database). Stores are created per call (every MCP
+ * handler, `tomo cron`, the web process); a connection each would leave
+ * handles for the GC to find, and run `quick_check` every time.
+ */
+const connections = new Map<string, { db: TomoDb; identity: string }>();
+
+/** Which file is at `path` (device, inode, birth time: an inode number alone can be reused), or null when none. */
+function fileIdentity(path: string): string | null {
+  try {
+    const st = statSync(path);
+    return `${st.dev}:${st.ino}:${st.birthtimeMs}`;
+  } catch (err) {
+    if (isEnoent(err)) return null;
+    throw err;
   }
+}
+
+function sharedDb(path: string): TomoDb {
+  const cached = connections.get(path);
+  if (cached && cached.identity === fileIdentity(path)) return cached.db;
+  if (cached) {
+    cached.db.close();
+    connections.delete(path);
+  }
+  const db = openTomoDb(path);
+  connections.set(path, { db, identity: fileIdentity(path) ?? "" });
+  return db;
+}
+
+/** Close the shared connections (tests that remove their database). */
+export function closeCronStoreConnections(): void {
+  for (const { db } of connections.values()) db.close();
+  connections.clear();
+}
+
+// --- The legacy jobs file -------------------------------------------------------
+
+/** `data/cron/jobs.json`, beside the database's `data/` directory. */
+export function legacyCronJobsPath(dbPath: string): string {
+  return join(dirname(dbPath), "cron", "jobs.json");
 }
 
 /**
- * The store could not be read. Distinct from "no store yet": an unreadable or
- * corrupt file must never be mistaken for an empty one — that reading would
- * let interrupted-run recovery "succeed" with nothing to recover and then let
- * the next save overwrite the real jobs with an empty list.
+ * `meta` row: the digest of the last jobs file imported. A file at the legacy
+ * path with that digest is already in the table and is never imported again:
+ * a crash between the import's commit and the placeholder leaves it there, and
+ * so does restoring a backup that copied `data/` before the daemon's first
+ * start imported it (the database snapshot was taken after), even one taken
+ * across a later rollback export. The export's own file carries `exportedAt`,
+ * so it never has the digest of a file imported before.
+ */
+export const CRON_IMPORTED_KEY = "legacy_cron_jobs_imported";
+
+/**
+ * `meta` row set by the rollback export (`tomo db export cron`), from its
+ * snapshot on: the jobs file at the legacy path continues from the table, so
+ * every store call refuses (the file is the truth now), and when this
+ * version's daemon imports it, it REPLACES the table (an older Tomo may have
+ * removed jobs since). Without it, a jobs file there did not start from the
+ * table — someone deleted the placeholder and an older Tomo began a new file,
+ * as its error message suggests — so it is MERGED in and no job in the table
+ * is lost. Cleared by that import, or by a start that finds only the
+ * placeholder (an export that never wrote its file).
+ */
+export const CRON_EXPORTED_KEY = "legacy_cron_jobs_exported";
+
+/**
+ * What the daemon leaves at `data/cron/jobs.json` once the jobs live in the
+ * database. Valid JSON with no `jobs` array: an older Tomo started without an
+ * export reads it as an unreadable store and refuses to schedule (and says
+ * so), instead of reading a missing file as a fresh install with no jobs.
+ */
+export function cronPlaceholder(dbPath: string): Record<string, string> {
+  return {
+    movedToDatabase: dbPath,
+    note: "Tomo keeps its scheduled tasks in its database now (table cron_jobs). This file is deliberately not a jobs file, "
+      + "so an older Tomo refuses to schedule instead of seeing no tasks. To go back to an older Tomo: "
+      + "`tomo stop && tomo db export cron`, then install it.",
+  };
+}
+
+type LegacyState =
+  | { kind: "absent" }
+  | { kind: "placeholder" }
+  | { kind: "jobs"; jobs: CronJob[]; digest: string; raw: string }
+  | { kind: "unreadable"; error: CronStoreReadError };
+
+function readLegacy(path: string): LegacyState {
+  let raw: Buffer;
+  try {
+    raw = readFileSync(path);
+  } catch (err) {
+    if (isEnoent(err)) return { kind: "absent" };
+    return { kind: "unreadable", error: new CronStoreReadError(path, err) };
+  }
+  try {
+    const data = JSON.parse(raw.toString("utf-8")) as Record<string, unknown> | null;
+    if (data !== null && typeof data === "object" && typeof data.movedToDatabase === "string" && !("jobs" in data)) {
+      return { kind: "placeholder" };
+    }
+  } catch {
+    /* parseCronStore below says why */
+  }
+  try {
+    const { jobs } = parseCronStore(path, raw.toString("utf-8"));
+    return { kind: "jobs", jobs, digest: digestOf(raw), raw: raw.toString("utf-8") };
+  } catch (err) {
+    return { kind: "unreadable", error: err as CronStoreReadError };
+  }
+}
+
+function digestOf(raw: Buffer | string): string {
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+function metaValue(db: TomoDb, key: string): string | undefined {
+  return db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", key)?.value;
+}
+
+/**
+ * Refuse after a rollback export, and while a real jobs file sits at the
+ * legacy path that is not in the table: it is newer than the table (written
+ * by an older Tomo, or by `tomo db export cron`), and only the daemon's start
+ * imports it. One that will not read refuses too: as before, an unreadable
+ * store is not an empty one.
+ */
+function assertLegacyImported(db: TomoDb, legacyPath: string): void {
+  if (metaValue(db, CRON_EXPORTED_KEY) !== undefined) {
+    throw new CronStoreReadError(legacyPath, null, "the jobs were exported for a rollback (`tomo db export cron`); Tomo imports that file when it starts");
+  }
+  // Not existsSync: it says "absent" for a file it cannot reach too (a
+  // directory without search permission). readLegacy tells ENOENT apart.
+  const state = readLegacy(legacyPath);
+  if (state.kind === "absent" || state.kind === "placeholder") return;
+  if (state.kind === "unreadable") throw state.error;
+  if (metaValue(db, CRON_IMPORTED_KEY) === state.digest) return;
+  throw new CronStoreReadError(legacyPath, null, "this jobs file has not been imported into the database yet; Tomo imports it when it starts");
+}
+
+export type CronImportOutcome =
+  | { kind: "none" }
+  | { kind: "imported"; jobs: number; aside: string | null }
+  | { kind: "unreadable"; error: CronStoreReadError };
+
+/**
+ * THE DAEMON'S, at start, before anything schedules: import a jobs file at the
+ * legacy path into the database, in one transaction, and replace it with the
+ * placeholder.
+ *
+ * After a rollback export (CRON_EXPORTED_KEY) the file replaces the table:
+ * the older Tomo continued from it, so it is the newest truth, deletions
+ * included. Otherwise (a first upgrade, or an older Tomo that started a new
+ * file after the placeholder was deleted) it is merged in: its jobs are
+ * added, and win over a row with the same id. Its digest is recorded in the same transaction until the rename
+ * lands, so a crash in between does not import it again later over newer
+ * rows. No dual writes: the file is never written again, apart from the
+ * placeholder; `tomo db export cron` writes it for a rollback.
+ *
+ * Jobs with an `every` interval that could never be honoured (a hand-edited
+ * file, a version predating the bounds) are imported disabled with no next
+ * run, and logged: firing one would spin the scheduler.
+ *
+ * A file that will not read is left where it is and the outcome says so;
+ * every store call then refuses with the same error until it is fixed and
+ * Tomo restarted, as an unreadable jobs file always did.
+ */
+export function importLegacyCronJobs(dbPath: string): CronImportOutcome {
+  const path = legacyCronJobsPath(dbPath);
+  const state = readLegacy(path);
+  if (state.kind === "unreadable") {
+    log.error({ err: state.error.cause ?? state.error, file: path }, "Cron jobs file could not be read; not imported, and scheduled tasks stay off until it is fixed");
+    return { kind: "unreadable", error: state.error };
+  }
+  const db = sharedDb(dbPath);
+  if (state.kind === "absent" || state.kind === "placeholder") {
+    if (state.kind === "absent") writePlaceholder(path, dbPath);
+    // A rollback export that marked the table but never wrote its file (it
+    // failed or was killed): the table is still the truth.
+    if (db.run("DELETE FROM meta WHERE key = ?", CRON_EXPORTED_KEY) > 0) {
+      log.warn({ file: path }, "A cron rollback export never wrote its file; the jobs stay in the database");
+    }
+    return { kind: "none" };
+  }
+  const imported = db.transaction(() => {
+    if (metaValue(db, CRON_IMPORTED_KEY) === state.digest) {
+      // Already in the table. Beside an export mark it is not the export
+      // (that one never has an imported digest): the export never landed in
+      // this state of things (a restored backup), and the table is the truth.
+      db.run("DELETE FROM meta WHERE key = ?", CRON_EXPORTED_KEY);
+      return null;
+    }
+    const replace = metaValue(db, CRON_EXPORTED_KEY) !== undefined;
+    const before = Number(db.get<{ n: number }>("SELECT count(*) AS n FROM cron_jobs")?.n ?? 0);
+    if (replace) db.run("DELETE FROM cron_jobs");
+    const seen = new Set<string>();
+    for (const job of state.jobs) {
+      if (seen.has(job.id)) {
+        log.warn({ jobId: job.id, name: job.name }, "Cron jobs file has two jobs with one id; importing the first");
+        continue;
+      }
+      seen.add(job.id);
+      holdBadInterval(job, path);
+      db.run("INSERT INTO cron_jobs (id, job) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET job = excluded.job", job.id, JSON.stringify(job));
+    }
+    db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", CRON_IMPORTED_KEY, state.digest);
+    db.run("DELETE FROM meta WHERE key = ?", CRON_EXPORTED_KEY);
+    return { jobs: seen.size, before, replace };
+  });
+  if (imported) {
+    log.info({ file: path, jobs: imported.jobs, replaced: imported.replace }, "Imported the cron jobs file into the database");
+    if (imported.before > 0) {
+      log.warn({ inTable: imported.before }, imported.replace
+        ? "The imported cron jobs file (an older Tomo continued from the rollback export) replaced the jobs in the database"
+        : "Merged a cron jobs file an older Tomo started into the jobs already in the database (none removed)");
+    }
+  } else {
+    log.info({ file: path }, "The cron jobs file is already in the database; replacing it with the placeholder");
+  }
+  // After the commit, and never leaving the path empty (an older Tomo reads a
+  // missing file as a fresh install): a copy aside first, then the
+  // placeholder renamed over the file. A crash in between leaves the file,
+  // whose digest now matches.
+  let aside: string | null = null;
+  try {
+    aside = keepAside(path, state.raw);
+    writePlaceholder(path, dbPath);
+  } catch (err) {
+    log.warn({ err, file: path }, "Imported the cron jobs file but could not replace it with the placeholder; will retry next start");
+  }
+  return { kind: "imported", jobs: imported?.jobs ?? state.jobs.length, aside };
+}
+
+/** Copy the imported file to `<path>.migrated-<ts>` (fsynced), unless a copy with the same content is already there. Returns its path. */
+function keepAside(path: string, raw: string): string {
+  const dir = dirname(path);
+  const prefix = `${basename(path)}.migrated-`;
+  for (const name of readdirSync(dir)) {
+    if (!name.startsWith(prefix)) continue;
+    try {
+      if (readFileSync(join(dir, name), "utf-8") === raw) return join(dir, name);
+    } catch { /* not ours to judge; pick a new name */ }
+  }
+  const ts = fileTimestamp();
+  for (let n = 0; n < 100; n++) {
+    const to = n === 0 ? `${path}.migrated-${ts}` : `${path}.migrated-${ts}-${n}`;
+    if (existsSync(to)) continue;
+    writeFileAtomicSync(to, raw, { fsync: true });
+    return to;
+  }
+  throw new Error("no free name to copy it to");
+}
+
+function writePlaceholder(path: string, dbPath: string): void {
+  mkdirSync(dirname(path), { recursive: true });
+  writeJsonAtomicSync(path, cronPlaceholder(dbPath), { fsync: true });
+}
+
+/**
+ * An `every` interval that could never be honoured is stored disabled, with
+ * no next run: firing it would spin the scheduler. `setEnabled` refuses to
+ * re-arm it (unschedulable).
+ */
+function holdBadInterval(job: CronJob, path: string): void {
+  if (job.schedule.kind !== "every") return;
+  const bad = everyIntervalReason(job.schedule.everyMs);
+  if (bad === null) return;
+  job.enabled = false;
+  job.nextRunAt = null;
+  log.warn({ jobId: job.id, name: job.name, schedule: job.schedule, reason: bad, file: path }, "Cron job has an unusable interval; imported it disabled");
+}
+
+/**
+ * `tomo db export cron`: write every job to `out` in the format of the old
+ * jobs file (`{ version: 1, revision, jobs }`), fsynced. With `mark` (the
+ * rollback, to the legacy path) the table is marked exported in the same
+ * transaction, so the next import replaces the table with the file; since a
+ * real jobs file is there again, every store call refuses until this
+ * version's daemon imports it. The jobs themselves are not changed. Returns
+ * how many jobs were written.
+ */
+export function exportCronJobsToFile(db: TomoDb, out: string, opts: { mark: boolean }): number {
+  const write = (jobs: CronJob[]): number => {
+    mkdirSync(dirname(out), { recursive: true });
+    // `exportedAt` is ignored by an older Tomo; it keeps this file's digest
+    // from ever matching a file imported before (CRON_IMPORTED_KEY).
+    writeJsonAtomicSync(out, { version: 1, revision: 1, exportedAt: new Date().toISOString(), jobs }, { fsync: true });
+    return jobs.length;
+  };
+  if (!opts.mark) return write(readJobs(db));
+  // The snapshot and the mark commit together, BEFORE the file is written:
+  // from the mark on, every store call refuses, so nothing changes the table
+  // behind the snapshot, and the file is never on disk without the mark (a
+  // file without it would be merged on import, bringing back jobs the older
+  // Tomo deleted). A mark whose file never landed is undone below, or by the
+  // next start, which finds only the placeholder.
+  const jobs = db.transaction(() => {
+    db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", CRON_EXPORTED_KEY, new Date().toISOString());
+    return readJobs(db);
+  });
+  try {
+    return write(jobs);
+  } catch (err) {
+    // Only when the file did not land: the atomic write can still fail after
+    // its rename (the chmod, the directory fsync), and a landed file without
+    // the mark would be merged on import instead of replacing the table.
+    if (legacyCronFileReplaceable(out)) {
+      try { db.run("DELETE FROM meta WHERE key = ?", CRON_EXPORTED_KEY); } catch { /* the next start undoes it */ }
+    }
+    throw err;
+  }
+}
+
+/** Is the file at `path` absent, or only the placeholder (safe for a rollback export to replace)? */
+export function legacyCronFileReplaceable(path: string): boolean {
+  const state = readLegacy(path);
+  return state.kind === "absent" || state.kind === "placeholder";
+}
+
+/**
+ * The store could not be read. Distinct from "no jobs": an unreadable or
+ * corrupt store must never be mistaken for an empty one — that reading would
+ * let interrupted-run recovery "succeed" with nothing to recover. `path` is
+ * the database, or the jobs file that is in the way.
  */
 export class CronStoreReadError extends Error {
-  /** The store file that could not be read — surfaced by CLI error output. */
   readonly path: string;
+  /** What is wrong, in a phrase the CLI can print. */
+  readonly detail: string | undefined;
 
-  constructor(path: string, cause: unknown) {
-    super(`cron store could not be read: ${path}`, { cause });
+  constructor(path: string, cause: unknown, detail?: string) {
+    super(`cron store could not be read: ${path}${detail ? ` (${detail})` : cause ? ` (${(cause as Error)?.message ?? cause})` : ""}`, { cause });
     this.name = "CronStoreReadError";
     this.path = path;
+    this.detail = detail ?? (cause ? String((cause as Error)?.message ?? cause) : undefined);
   }
-}
-
-function readStore(path: string): { jobs: CronJob[]; revision: number } {
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf-8");
-  } catch (err) {
-    // Absent is a normal state — a fresh install has no jobs file. Anything
-    // else (EACCES, EIO, a directory in the way) is a failure, not emptiness.
-    if (isEnoent(err)) return { jobs: [], revision: 0 };
-    throw new CronStoreReadError(path, err);
-  }
-  return parseCronStore(path, raw);
 }
 
 /**
- * Parse and shape-check the text of a store file, with no I/O and no side
- * effects. `readStore` and read-only viewers (the web Study, which reads the
- * file itself with bounds) share it, so both refuse the same malformed files.
+ * Parse and shape-check the text of a legacy jobs file, with no I/O and no
+ * side effects.
  */
-export function parseCronStore(path: string, raw: string): { jobs: CronJob[]; revision: number } {
-  let data: { jobs?: unknown; revision?: unknown };
+export function parseCronStore(path: string, raw: string): { jobs: CronJob[] } {
+  let data: { jobs?: unknown };
   try {
     data = JSON.parse(raw);
   } catch (err) {
@@ -774,12 +940,7 @@ export function parseCronStore(path: string, raw: string): { jobs: CronJob[]; re
   if (bad !== -1) {
     throw new CronStoreReadError(path, new Error(`jobs[${bad}] is not a job record`));
   }
-  return {
-    jobs: data.jobs as CronJob[],
-    // Files written before revisions existed start at 0 and get 1 on the next
-    // save; the counter only ever has to be monotonic within one file.
-    revision: typeof data.revision === "number" ? data.revision : 0,
-  };
+  return { jobs: data.jobs as CronJob[] };
 }
 
 const SCHEDULE_KINDS: ReadonlySet<string> = new Set(["at", "every", "cron"]);
@@ -811,73 +972,6 @@ function isJobRecord(entry: unknown): entry is CronJob {
     (j.lastRunAt === null || typeof j.lastRunAt === "number") &&
     (j.lastStatus === null || typeof j.lastStatus === "string")
   );
-}
-
-function snapshot(jobs: CronJob[]): Map<string, CronJob> {
-  return new Map(jobs.map((j) => [j.id, { ...j }]));
-}
-
-function sameValue(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  // Absence and an explicit null are different edits: clearing a field
-  // (`interruptedAt = null`, `nextRunAt = null`) is a change that must beat a
-  // concurrent non-null value, not be read as "we never touched it".
-  if (a === undefined || b === undefined) return false;
-  return JSON.stringify(a) === JSON.stringify(b);
-}
-
-/**
- * Three-way merge of one job. `base` is what we read, `ours` is what we made
- * of it, `theirs` is what is on disk now. Fields we changed win; every other
- * field keeps the on-disk value, so a writer holding a stale snapshot cannot
- * roll back a field it never looked at.
- */
-function mergeJob(base: CronJob, ours: CronJob, theirs: CronJob): CronJob {
-  const merged = { ...theirs } as Record<string, unknown>;
-  const o = ours as unknown as Record<string, unknown>;
-  const b = base as unknown as Record<string, unknown>;
-  for (const key of new Set([...Object.keys(o), ...Object.keys(b)])) {
-    if (sameValue(o[key], b[key])) continue; // untouched by us — theirs stands
-    if (o[key] === undefined) delete merged[key];
-    else merged[key] = o[key];
-  }
-  return merged as unknown as CronJob;
-}
-
-/**
- * Reconcile our view of the job list with the file. Presence is resolved
- * against the baseline so neither side resurrects a job the other deleted:
- * a job missing from our memory but present in the baseline was deleted by
- * us; one missing from disk but present in the baseline was deleted by them.
- */
-export function mergeWithDisk(
-  baseline: Map<string, CronJob>,
-  ours: CronJob[],
-  theirs: CronJob[],
-): CronJob[] {
-  const ourById = new Map(ours.map((j) => [j.id, j]));
-  const theirById = new Map(theirs.map((j) => [j.id, j]));
-  const out: CronJob[] = [];
-
-  // Disk order first: keeps unrelated concurrent additions where they were.
-  for (const t of theirs) {
-    const mine = ourById.get(t.id);
-    const base = baseline.get(t.id);
-    if (!mine) {
-      if (base) continue;   // we removed it
-      out.push(t);          // they added it
-      continue;
-    }
-    out.push(base ? mergeJob(base, mine, t) : { ...t, ...mine });
-  }
-  // Jobs we hold that are not on disk: ours if we created them, dropped if
-  // the other writer removed them.
-  for (const mine of ours) {
-    if (theirById.has(mine.id)) continue;
-    if (baseline.has(mine.id)) continue; // removed by them — respect it
-    out.push(mine);
-  }
-  return out;
 }
 
 /**

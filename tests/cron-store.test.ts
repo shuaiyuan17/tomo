@@ -1,49 +1,37 @@
-import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { afterAll, describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
   CronStore,
   CronStoreReadError,
   InvalidScheduleError,
   isInterrupted,
   MAX_INTERRUPT_NOTICE_RUNS,
-  mergeWithDisk,
+  importLegacyCronJobs,
   ONE_SHOT_MAX_RETRIES,
   ONE_SHOT_RETRY_DELAY_MS,
 } from "../src/cron/store.js";
 import { MAX_EVERY_MS, MIN_EVERY_MS, parseScheduleString, unschedulableReason } from "../src/cron/schedule.js";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readCronJobsSafely } from "../src/cli/cron-errors.js";
+import { editJobs } from "./helpers/cron.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-/**
- * A one-shot hook that fires inside the store's atomic write — after the
- * merge it computed from its read of the file, before the rename that
- * publishes it. That is the window an optimistic save has to defend: another
- * process publishing here would otherwise be silently overwritten.
- */
-const hook = vi.hoisted(() => ({ beforeWrite: null as null | (() => void) }));
-
-// Passes straight through while no hook is armed, so every other test here
-// writes exactly as production does.
-vi.mock("../src/fs-utils.js", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("../src/fs-utils.js")>();
-  return {
-    ...actual,
-    writeJsonAtomicSync: (path: string, value: unknown, opts?: { beforeRename?: () => void }) => {
-      const fire = hook.beforeWrite;
-      hook.beforeWrite = null; // one-shot: the competing writer must not recurse
-      fire?.();
-      return actual.writeJsonAtomicSync(path, value, opts);
-    },
-  };
-});
-
-type CronJobLike = Record<string, unknown> & { id: string };
 
 const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-cron-"));
 // The root is unique to this run, so nothing else will clean it up.
 afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
-const TEST_PATH = join(TEST_DIR, "jobs.json");
+const TEST_PATH = join(TEST_DIR, "data", "tomo.db");
+/** The old jobs file beside it (what an older Tomo, or `tomo db export cron`, writes). */
+const LEGACY = join(TEST_DIR, "data", "cron", "jobs.json");
+function writeLegacy(contents: string): void {
+  mkdirSync(join(TEST_DIR, "data", "cron"), { recursive: true });
+  writeFileSync(LEGACY, contents);
+}
+/** Put these raw records in the database the way an upgrade does: an old jobs file, imported. */
+function seedLegacy(file: { version?: number; jobs: unknown[] }): void {
+  writeLegacy(JSON.stringify(file));
+  importLegacyCronJobs(TEST_PATH);
+}
 
 describe("CronStore", () => {
   beforeEach(() => {
@@ -145,9 +133,9 @@ describe("CronStore", () => {
     });
 
     // Persist an overdue nextRunAt directly (getDueJobs reloads from disk)
-    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    editJobs(TEST_PATH, (jobs) => { const raw = { jobs };
     raw.jobs.find((j: { name: string }) => j.name === "overdue").nextRunAt = Date.now() - 1000;
-    writeFileSync(TEST_PATH, JSON.stringify(raw));
+    });
 
     const due = store.getDueJobs();
     expect(due).toHaveLength(1);
@@ -188,30 +176,21 @@ describe("CronStore", () => {
     })).not.toThrow();
   });
 
-  it("holds a hand-edited zero-interval job disabled instead of firing it every poll", () => {
-    const store = new CronStore(TEST_PATH);
-    const job = store.add({
-      name: "legacy",
-      schedule: { kind: "every", everyMs: 60_000 },
-      message: "tick",
-      sessionKey: "dm:alice",
-    });
-    // What an older CLI or a text editor could leave behind.
-    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
-    const onDisk = raw.jobs.find((j: CronJobLike) => j.id === job.id);
-    onDisk.schedule = { kind: "every", everyMs: 0 };
-    onDisk.nextRunAt = Date.now() - 1000;
-    writeFileSync(TEST_PATH, JSON.stringify(raw));
+  it("imports a hand-edited zero-interval job disabled instead of firing it every poll", () => {
+    // What an older CLI or a text editor could leave behind in the old file.
+    writeLegacy(JSON.stringify({ version: 1, jobs: [{
+      id: "legacy01", name: "legacy", enabled: true, schedule: { kind: "every", everyMs: 0 }, message: "tick",
+      sessionKey: "dm:alice", deleteAfterRun: false, createdAt: 1, nextRunAt: Date.now() - 1000, lastRunAt: null, lastStatus: null,
+    }] }));
+    importLegacyCronJobs(TEST_PATH);
 
     const reopened = new CronStore(TEST_PATH);
     expect(reopened.getDueJobs()).toHaveLength(0);
-    const held = reopened.get(job.id)!;
+    const held = reopened.get("legacy01")!;
     expect(held.enabled).toBe(false);
     expect(held.nextRunAt).toBeNull();
-    // Held, not rewritten: the user's file still says what they wrote.
-    const still = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
-    expect(still.jobs.find((j: CronJobLike) => j.id === job.id).enabled).toBe(true);
-    // And re-enabling it says why, instead of quietly re-arming a spin.
+    // Re-enabling it refuses, and says why, instead of quietly re-arming a spin.
+    expect(reopened.setEnabled("legacy01", true)).toBe("unschedulable");
     expect(unschedulableReason(held.schedule, Date.now())).toMatch(/below the 30s minimum$/);
   });
 
@@ -244,9 +223,9 @@ describe("CronStore", () => {
     // turn). The next slot must be scheduled-time + interval, so the delay
     // doesn't accumulate as drift run over run.
     const scheduledAt = Date.now() - 5_000;
-    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    editJobs(TEST_PATH, (jobs) => { const raw = { jobs };
     raw.jobs[0].nextRunAt = scheduledAt;
-    writeFileSync(TEST_PATH, JSON.stringify(raw));
+    });
 
     store.markRun(job.id, "ok");
     expect(store.get(job.id)!.nextRunAt).toBe(scheduledAt + 60_000);
@@ -263,9 +242,9 @@ describe("CronStore", () => {
 
     // Daemon was down for several intervals: don't burst-fire missed runs.
     const scheduledAt = Date.now() - 300_000;
-    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    editJobs(TEST_PATH, (jobs) => { const raw = { jobs };
     raw.jobs[0].nextRunAt = scheduledAt;
-    writeFileSync(TEST_PATH, JSON.stringify(raw));
+    });
 
     const before = Date.now();
     store.markRun(job.id, "ok");
@@ -609,9 +588,9 @@ describe("CronStore interrupted-run recovery", () => {
     const store = new CronStore(TEST_PATH);
     const job = addRecurring(store);
     // Due now, as it is at dispatch.
-    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    editJobs(TEST_PATH, (jobs) => { const raw = { jobs };
     raw.jobs[0].nextRunAt = Date.now() - 1_000;
-    writeFileSync(TEST_PATH, JSON.stringify(raw));
+    });
     new CronStore(TEST_PATH).markStarted(job.id);
 
     const first = new CronStore(TEST_PATH).recoverInterrupted();
@@ -722,9 +701,9 @@ describe("CronStore interrupted-run recovery", () => {
     const job = store.add({ name: "hourly", schedule: { kind: "every", everyMs: hour }, message: "x", sessionKey: "dm:alice" });
     // The interrupted run's slot was 5.5h ago (then the daemon stayed down).
     const slot = Date.now() - 5.5 * hour;
-    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    editJobs(TEST_PATH, (jobs) => { const raw = { jobs };
     raw.jobs[0].nextRunAt = slot;
-    writeFileSync(TEST_PATH, JSON.stringify(raw));
+    });
     new CronStore(TEST_PATH).markStarted(job.id);
 
     new CronStore(TEST_PATH).recoverInterrupted();
@@ -743,9 +722,9 @@ describe("CronStore interrupted-run recovery", () => {
     const hour = 3_600_000;
     const top = Math.floor(Date.now() / hour) * hour;
     const slot = top - 3 * hour; // 3 full hours ago, on the hour
-    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    editJobs(TEST_PATH, (jobs) => { const raw = { jobs };
     raw.jobs[0].nextRunAt = slot;
-    writeFileSync(TEST_PATH, JSON.stringify(raw));
+    });
     new CronStore(TEST_PATH).markStarted(job.id);
 
     new CronStore(TEST_PATH).recoverInterrupted();
@@ -848,11 +827,11 @@ describe("CronStore interrupted-run recovery", () => {
     const rec = addRecurring(store);
     // What an older daemon's recovery left: token acknowledged, marker set,
     // still enabled and due for its [resumed] fire.
-    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    editJobs(TEST_PATH, (jobs) => { const raw = { jobs };
     for (const job of raw.jobs) {
       Object.assign(job, { lastRunId: "r1", lastCompletedRunId: "r1", lastStartedAt: Date.now() - 5_000, interruptedAt: Date.now() - 5_000, lastStatus: "interrupted", nextRunAt: Date.now() - 1_000, resumeAttempts: 1 });
     }
-    writeFileSync(TEST_PATH, JSON.stringify(raw));
+    });
 
     const outcome = new CronStore(TEST_PATH).recoverInterrupted();
     expect(outcome.parked.map((s) => s.job.id)).toEqual([once.id]);
@@ -869,9 +848,9 @@ describe("CronStore interrupted-run recovery", () => {
     const job = store.add({ name: "daily", schedule: { kind: "every", everyMs: 86_400_000 }, message: "x", sessionKey: "dm:alice" });
     const now = Date.now();
     const slot = now - 14 * 3_600_000;
-    const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+    editJobs(TEST_PATH, (jobs) => { const raw = { jobs };
     raw.jobs[0].nextRunAt = slot;
-    writeFileSync(TEST_PATH, JSON.stringify(raw));
+    });
 
     const [skip] = new CronStore(TEST_PATH).skipStaleRuns(new Set(), now);
     expect(skip.job.id).toBe(job.id);
@@ -899,7 +878,7 @@ describe("CronStore interrupted-run recovery", () => {
   it("does not retro-flag jobs written before lastStartedAt existed", () => {
     // Pre-upgrade records have no lastStartedAt at all; treating them as
     // interrupted would disable every one-shot on the first upgraded start.
-    writeFileSync(TEST_PATH, JSON.stringify({
+    seedLegacy({
       version: 1,
       jobs: [{
         id: "legacy01",
@@ -914,7 +893,7 @@ describe("CronStore interrupted-run recovery", () => {
         lastRunAt: null,
         lastStatus: null,
       }],
-    }));
+    });
 
     const store = new CronStore(TEST_PATH);
     expect(isInterrupted(store.list()[0])).toBe(false);
@@ -941,7 +920,7 @@ describe("CronStore clock independence and unacked outcomes", () => {
     // lastStartedAt. A timestamp comparison calls that interrupted and
     // re-fires finished work; the run token says it completed.
     const started = Date.now();
-    writeFileSync(TEST_PATH, JSON.stringify({
+    seedLegacy({
       version: 1,
       jobs: [{
         id: "clockjmp",
@@ -959,7 +938,7 @@ describe("CronStore clock independence and unacked outcomes", () => {
         lastCompletedRunId: "run-1",
         lastStatus: "ok",
       }],
-    }));
+    });
 
     const store = new CronStore(TEST_PATH);
     expect(isInterrupted(store.list()[0])).toBe(false);
@@ -971,7 +950,7 @@ describe("CronStore clock independence and unacked outcomes", () => {
 
   it("still flags a dispatch whose token was never acknowledged, whatever the clock says", () => {
     const started = Date.now();
-    writeFileSync(TEST_PATH, JSON.stringify({
+    seedLegacy({
       version: 1,
       jobs: [{
         id: "clockjm2",
@@ -991,7 +970,7 @@ describe("CronStore clock independence and unacked outcomes", () => {
         lastCompletedRunId: "run-1",
         lastStatus: "ok",
       }],
-    }));
+    });
 
     expect(isInterrupted(new CronStore(TEST_PATH).list()[0])).toBe(true);
     expect(new CronStore(TEST_PATH).recoverInterrupted().recurring).toHaveLength(1);
@@ -1044,153 +1023,18 @@ describe("CronStore clock independence and unacked outcomes", () => {
   });
 });
 
-describe("CronStore concurrent writers", () => {
+describe("CronStore guards", () => {
   beforeEach(() => {
     mkdirSync(TEST_DIR, { recursive: true });
-    hook.beforeWrite = null;
   });
 
   afterEach(() => {
     rmSync(TEST_DIR, { recursive: true, force: true });
-    vi.restoreAllMocks();
-    hook.beforeWrite = null;
   });
 
-  const revision = (): number => JSON.parse(readFileSync(TEST_PATH, "utf-8")).revision;
-
-  function addRecurring(store: CronStore) {
-    return store.add({
-      name: "recurring",
-      schedule: { kind: "every", everyMs: 60_000 },
-      message: "x",
-      sessionKey: "dm:alice",
-    });
-  }
-
-  /**
-   * Land another process's write inside this store's load→save window. `get`
-   * is called after the reload and before the save in every mutator, which is
-   * exactly the gap a real second process can slip into.
-   */
-  function interleave(store: CronStore, other: () => void): void {
-    const realGet = store.get.bind(store);
-    vi.spyOn(store, "get").mockImplementationOnce((id: string) => {
-      const found = realGet(id);
-      other();
-      return found;
-    });
-  }
-
-  it("a CLI write does not erase a dispatch record the daemon made between its read and its merge", () => {
-    const daemon = new CronStore(TEST_PATH);
-    const job = addRecurring(daemon);
-
-    // The CLI process reloads, then the daemon dispatches a run, then the CLI
-    // saves. Its snapshot predates lastRunId — the losing write would take
-    // the only durable evidence of the in-flight run with it, and the restart
-    // that follows would re-fire the job.
-    const cli = new CronStore(TEST_PATH);
-    let runId: string | undefined;
-    interleave(cli, () => { runId = daemon.markStarted(job.id); });
-    cli.setEnabled(job.id, false);
-
-    const merged = new CronStore(TEST_PATH).list()[0];
-    expect(merged.enabled).toBe(false);      // the CLI's own edit lands
-    expect(merged.lastRunId).toBe(runId);    // ...without reverting the daemon's
-    expect(merged.lastStartedAt).toBeGreaterThan(0);
-    expect(isInterrupted(merged)).toBe(true);
-  });
-
-  it("a CLI write re-merges when the daemon publishes between its merge and its rename", () => {
-    const daemon = new CronStore(TEST_PATH);
-    const job = addRecurring(daemon);
-    const cli = new CronStore(TEST_PATH);
-
-    // The CLI has read the file and merged. The daemon dispatches a run —
-    // publishing lastRunId — in the instant before the CLI's rename. Without
-    // the last-moment revision check the CLI's rename erases the dispatch
-    // token, and the next daemon start re-fires a job that was already
-    // running.
-    let runId: string | undefined;
-    hook.beforeWrite = () => { runId = daemon.markStarted(job.id); };
-    cli.setEnabled(job.id, false);
-
-    const after = new CronStore(TEST_PATH).list()[0];
-    expect(after.enabled).toBe(false);        // the CLI's own edit still lands
-    expect(after.lastRunId).toBe(runId);      // ...and the token survived
-    expect(isInterrupted(after)).toBe(true);
-    expect(revision()).toBe(3);               // add, markStarted, setEnabled
-  });
-
-  it("gives up rather than publishing a merge it could not verify", () => {
-    const daemon = new CronStore(TEST_PATH);
-    const job = addRecurring(daemon);
-    const cli = new CronStore(TEST_PATH);
-
-    // A writer that loses the race on every attempt: the save must report a
-    // failure (the scheduler retries the outcome write) instead of silently
-    // clobbering.
-    const rearm = () => {
-      hook.beforeWrite = () => {
-        daemon.markStarted(job.id);
-        rearm();
-      };
-    };
-    rearm();
-
-    expect(() => cli.setEnabled(job.id, false)).toThrow(/changed during write/);
-    hook.beforeWrite = null;
-    expect(new CronStore(TEST_PATH).list()[0].enabled).toBe(true);
-  });
-
-  it("a dispatch record does not revert a session rename made mid-write", () => {
-    const daemon = new CronStore(TEST_PATH);
-    const job = addRecurring(daemon);
-
-    const cli = new CronStore(TEST_PATH);
-    interleave(daemon, () => { cli.rewriteSessionKey("dm:alice", "dm:bob"); });
-    const runId = daemon.markStarted(job.id);
-
-    const merged = new CronStore(TEST_PATH).list()[0];
-    expect(merged.sessionKey).toBe("dm:bob");
-    expect(merged.lastRunId).toBe(runId);
-  });
-
-  it("a job added mid-write survives, and one removed mid-write stays removed", () => {
-    const daemon = new CronStore(TEST_PATH);
-    const job = addRecurring(daemon);
-    const doomed = daemon.add({
-      name: "doomed",
-      schedule: { kind: "every", everyMs: 60_000 },
-      message: "y",
-      sessionKey: "dm:carol",
-    });
-
-    const cli = new CronStore(TEST_PATH);
-    interleave(daemon, () => {
-      cli.add({ name: "late", schedule: { kind: "every", everyMs: 60_000 }, message: "z", sessionKey: "dm:dave" });
-      cli.remove(doomed.id);
-    });
-    daemon.markStarted(job.id);
-
-    const names = new CronStore(TEST_PATH).list().map((j) => j.name).sort();
-    expect(names).toEqual(["late", "recurring"]);
-  });
-
-  it("bumps a monotonic revision on every write", () => {
-    const store = new CronStore(TEST_PATH);
-    const job = addRecurring(store);
-    expect(revision()).toBe(1);
-    store.markStarted(job.id);
-    expect(revision()).toBe(2);
-    store.markRun(job.id, "ok");
-    expect(revision()).toBe(3);
-  });
-
-  // The ownership check has to run against the state the delete applies to.
-  // remove() reloads from disk, so a job written by another process after the
-  // caller's snapshot was taken used to skip the check and be deleted.
-  it("remove applies its ownership guard to the reloaded store, not a stale snapshot", () => {
+  // The ownership check runs against the state the delete applies to: a job
+  // another process wrote after this store was created is still checked.
+  it("remove applies its ownership guard to the job another process wrote", () => {
     const store = new CronStore(TEST_PATH);
     const otherProcess = new CronStore(TEST_PATH);
     const job = otherProcess.add({
@@ -1200,17 +1044,13 @@ describe("CronStore concurrent writers", () => {
       sessionKey: "dm:alice",
     });
 
-    // Not in `store`'s snapshot at all — this is the window.
-    expect(store.get(job.id)).toBeUndefined();
     expect(store.remove(job.id, (j) => j.sessionKey === "telegram:-1001234567")).toBe("refused");
     expect(new CronStore(TEST_PATH).get(job.id)).toBeTruthy();
   });
 
-  // Same window as remove(): setEnabled reloads, so a snapshot check misses
-  // anything another process wrote in between. enabling is the one
-  // operation that makes a DORMANT job run again, so it is the worst place to
-  // skip an ownership check.
-  it("setEnabled applies its ownership guard to the reloaded store, not a stale snapshot", () => {
+  // Same for setEnabled: enabling is the one operation that makes a DORMANT
+  // job run again, so it is the worst place to skip an ownership check.
+  it("setEnabled applies its ownership guard to the job another process wrote", () => {
     const store = new CronStore(TEST_PATH);
     const otherProcess = new CronStore(TEST_PATH);
     const job = otherProcess.add({
@@ -1221,53 +1061,8 @@ describe("CronStore concurrent writers", () => {
     });
     otherProcess.setEnabled(job.id, false);
 
-    expect(store.get(job.id)).toBeUndefined();
     expect(store.setEnabled(job.id, true, (j) => j.sessionKey === "telegram:-1001234567")).toBe("refused");
     expect(new CronStore(TEST_PATH).get(job.id)?.enabled).toBe(false);
-  });
-
-  it("mergeWithDisk treats clearing a field as an edit, not as an absence", () => {
-    // `interruptedAt = null` (marker consumed) against a baseline that had no
-    // such key at all. Reading undefined and null as the same value would let
-    // a concurrent writer's stale non-null value survive, and an interruption
-    // already acted on would come back. (This once meant a second [resumed]
-    // fire; no such marker exists any more, the rule still holds.)
-    const base = {
-      id: "a", name: "a", enabled: true, message: "m", sessionKey: "dm:alice",
-      deleteAfterRun: false, createdAt: 1, nextRunAt: 10, lastRunAt: null,
-      lastStatus: null, schedule: { kind: "every", everyMs: 60_000 },
-    };
-    const merged = mergeWithDisk(
-      new Map([["a", { ...base }]]) as never,
-      [{ ...base, interruptedAt: null }] as never,
-      [{ ...base, interruptedAt: 1234 }] as never,
-    ) as unknown as CronJobLike[];
-
-    expect(merged[0].interruptedAt).toBeNull();
-  });
-
-  it("mergeWithDisk keeps each writer's own edits and both deletions", () => {
-    const base = (over: Partial<CronJobLike> = {}): CronJobLike => ({
-      id: "a", name: "a", enabled: true, message: "m", sessionKey: "dm:alice",
-      deleteAfterRun: false, createdAt: 1, nextRunAt: 10, lastRunAt: null,
-      lastStatus: null, schedule: { kind: "every", everyMs: 60_000 }, ...over,
-    });
-    const baseline = new Map([["a", base()], ["gone", base({ id: "gone" })]]);
-    const ours = [base({ enabled: false }), base({ id: "mine" })];
-    const theirs = [base({ lastRunId: "r1" }), base({ id: "gone" }), base({ id: "yours" })];
-
-    const merged = mergeWithDisk(
-      baseline as never,
-      ours as never,
-      theirs as never,
-    ) as unknown as CronJobLike[];
-    const byId = new Map(merged.map((j) => [j.id, j]));
-
-    expect(byId.get("a")?.enabled).toBe(false);   // our field edit
-    expect(byId.get("a")?.lastRunId).toBe("r1");  // their field edit
-    expect(byId.has("gone")).toBe(false);         // we deleted it
-    expect(byId.has("mine")).toBe(true);          // we added it
-    expect(byId.has("yours")).toBe(true);         // they added it
   });
 });
 
@@ -1286,7 +1081,7 @@ describe("CronStore unreadable file", () => {
 
     // A corrupt file is not an empty one. Reporting "no jobs" here is what
     // lets interrupted-run recovery believe it has nothing to do.
-    writeFileSync(TEST_PATH, "{ not json");
+    writeLegacy("{ not json");
     const store = new CronStore(TEST_PATH);
     expect(() => store.list()).toThrow(CronStoreReadError);
     expect(() => store.recoverInterrupted()).toThrow(CronStoreReadError);
@@ -1294,7 +1089,7 @@ describe("CronStore unreadable file", () => {
   });
 
   it("never overwrites a file it could not read", () => {
-    writeFileSync(TEST_PATH, "{ not json");
+    writeLegacy("{ not json");
     const store = new CronStore(TEST_PATH);
     expect(() => store.add({
       name: "x",
@@ -1304,11 +1099,11 @@ describe("CronStore unreadable file", () => {
     })).toThrow(CronStoreReadError);
     // The old behaviour (read error -> empty list) would have published an
     // empty store over the real one.
-    expect(readFileSync(TEST_PATH, "utf-8")).toBe("{ not json");
+    expect(readFileSync(LEGACY, "utf-8")).toBe("{ not json");
   });
 
   it("rejects a well-formed file with no jobs array", () => {
-    writeFileSync(TEST_PATH, JSON.stringify({ version: 1 }));
+    writeLegacy(JSON.stringify({ version: 1 }));
     expect(() => new CronStore(TEST_PATH).list()).toThrow(CronStoreReadError);
   });
 
@@ -1329,11 +1124,11 @@ describe("CronStore unreadable file", () => {
       lastRunAt: null,
       lastStatus: null,
     }]]) {
-      writeFileSync(TEST_PATH, JSON.stringify({ version: 1, jobs }));
+      writeLegacy(JSON.stringify({ version: 1, jobs }));
       const store = new CronStore(TEST_PATH);
       expect(() => store.list()).toThrow(CronStoreReadError);
       expect(() => store.getDueJobs()).toThrow(CronStoreReadError);
-      expect(readCronJobsSafely(store).unreadablePath).toBe(TEST_PATH);
+      expect(readCronJobsSafely(store).unreadablePath).toBe(LEGACY);
     }
   });
 
@@ -1345,18 +1140,17 @@ describe("CronStore unreadable file", () => {
       message: "x",
       sessionKey: "dm:alice",
     });
-    const contents = readFileSync(TEST_PATH, "utf-8");
     expect(store.list()).toHaveLength(1);
 
-    writeFileSync(TEST_PATH, "{ not json");
+    writeLegacy("{ not json");
     expect(() => store.getDueJobs()).toThrow(CronStoreReadError);
     // The pre-fix behaviour: the failed reload left the earlier snapshot in
     // place, so `list()` — and through it the watch snapshot, the metrics
     // scrape and `tomo status` — kept reporting a healthy store.
     expect(() => store.list()).toThrow(CronStoreReadError);
-    expect(readCronJobsSafely(store)).toEqual({ jobs: [], unreadablePath: TEST_PATH });
+    expect(readCronJobsSafely(store)).toEqual({ jobs: [], unreadablePath: LEGACY });
 
-    writeFileSync(TEST_PATH, contents);
+    rmSync(LEGACY);
     expect(store.getDueJobs()).toEqual([]);
     expect(store.list()).toHaveLength(1);
   });
@@ -1369,13 +1163,12 @@ describe("CronStore unreadable file", () => {
       message: "x",
       sessionKey: "dm:alice",
     });
-    const contents = readFileSync(TEST_PATH, "utf-8");
 
-    writeFileSync(TEST_PATH, "{ not json");
+    writeLegacy("{ not json");
     const store = new CronStore(TEST_PATH);
     expect(() => store.list()).toThrow(CronStoreReadError);
 
-    writeFileSync(TEST_PATH, contents);
+    rmSync(LEGACY);
     expect(store.getDueJobs()).toEqual([]);   // reload clears the error
     expect(store.list()).toHaveLength(1);
   });
@@ -1404,13 +1197,13 @@ describe("readCronJobsSafely", () => {
   });
 
   it("degrades to an empty list AND the path when the store is unreadable", () => {
-    writeFileSync(TEST_PATH, "{ not json");
+    writeLegacy("{ not json");
     const result = readCronJobsSafely(new CronStore(TEST_PATH));
     // Both halves matter: the caller keeps working (watch snapshot, metrics
     // scrape, status report) and can still say "unreadable" rather than
     // "none" — an empty list on its own would restore the original lie.
     expect(result.jobs).toEqual([]);
-    expect(result.unreadablePath).toBe(TEST_PATH);
+    expect(result.unreadablePath).toBe(LEGACY);
   });
 
   it("does not swallow errors that are not read failures", () => {
@@ -1432,9 +1225,9 @@ describe("CronStore stale-run skips", () => {
     const store = new CronStore(TEST_PATH);
     store.add({ name: "j", schedule: { kind: "every", everyMs: 3_600_000 }, message: "x", sessionKey: "dm:alice" });
     const stale = () => {
-      const raw = JSON.parse(readFileSync(TEST_PATH, "utf-8"));
+      editJobs(TEST_PATH, (jobs) => { const raw = { jobs };
       raw.jobs[0].nextRunAt = Date.now() - 5 * 3_600_000;
-      writeFileSync(TEST_PATH, JSON.stringify(raw));
+      });
       new CronStore(TEST_PATH).skipStaleRuns();
     };
     stale();

@@ -17,7 +17,7 @@ vi.mock("../src/runtime-paths.js", () => ({ defaultRuntimePaths: {
 vi.mock("../src/config.js", () => ({
   config: { get web() { return { enabled: fixture.enabled, port: 0 }; },
     owner: { name: "owner", telegram: ["test-owner"], imessage: [] },
-    tomoHome: fixture.root, workspaceDir: `${fixture.root}/workspace`, sessionsDir: `${fixture.root}/sessions`,
+    tomoHome: fixture.root, dbPath: `${fixture.root}/scheduler-db/data/tomo.db`, workspaceDir: `${fixture.root}/workspace`, sessionsDir: `${fixture.root}/sessions`,
     sdkSessionsDir: `${fixture.root}/sdk`, logsDir: `${fixture.root}/logs`, telegramToken: "synthetic-token",
     metrics: { enabled: false }, continuity: false,
   },
@@ -45,7 +45,7 @@ vi.mock("../src/web/supervisor.js", async (original) => {
   } };
 });
 vi.mock("../src/cron/scheduler.js", () => ({ CronScheduler: class { start() {} } }));
-vi.mock("../src/cron/store.js", () => ({ CronStore: class {}, CRON_STORE_PATH: `${fixture.root}/scheduler-cron/jobs.json` }));
+vi.mock("../src/cron/store.js", async (original) => ({ ...await original<typeof import("../src/cron/store.js")>(), CronStore: class {} }));
 vi.mock("../src/mcp/pet-scheduler.js", () => ({ PetScheduler: class { start() {} } }));
 vi.mock("../src/continuity.js", () => ({ ContinuityRunner: class {} }));
 vi.mock("../src/version.js", () => ({ VersionChecker: class { start() {} }, getCurrentVersion: () => "test" }));
@@ -81,11 +81,12 @@ it("automatically serves the local web UI from tomo start and retains messaging 
   const response = await fetch(message!.slice("Web UI: ".length));
   expect(response.status).toBe(200); expect(await response.text()).toContain("Tomo — Conversation");
 });
-it("hands the web process the scheduler's cron store path explicitly", async () => {
+it("imports the old jobs file at start, and hands the web process the scheduler's database path explicitly", async () => {
   // A path no homedir()-based default could produce: the web process can only
-  // read this job if the daemon passed CRON_STORE_PATH through init.
-  mkdirSync(`${fixture.root}/scheduler-cron`, { recursive: true });
-  writeFileSync(`${fixture.root}/scheduler-cron/jobs.json`, JSON.stringify({ version: 1, revision: 1, jobs: [{ id: "job-1", name: "Startup chain job",
+  // read this job if the daemon passed its database path through init. Left
+  // as an old jobs file, so the start's import has to bring it in first.
+  mkdirSync(`${fixture.root}/scheduler-db/data/cron`, { recursive: true });
+  writeFileSync(`${fixture.root}/scheduler-db/data/cron/jobs.json`, JSON.stringify({ version: 1, revision: 1, jobs: [{ id: "job-1", name: "Startup chain job",
     enabled: true, schedule: { kind: "every", everyMs: 60_000 }, message: "x", sessionKey: "dm:owner", deleteAfterRun: false,
     createdAt: 1, nextRunAt: 2, lastRunAt: null, lastStatus: null }] }));
   await startCommand.parseAsync(["--foreground"], { from: "user" });

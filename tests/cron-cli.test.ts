@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runCommand } from "./helpers/commander-run.js";
 
-// `tomo cron`: the shell's way into the same jobs.json the daemon schedules
+// `tomo cron`: the shell's way into the same cron_jobs table the daemon schedules
 // from. The command builds ONE CronStore at import, from ~/.tomo, and its
 // list()/get() serve what that store read then — right for a CLI process,
 // which lives for one command. So HOME points at a scratch directory, and
@@ -18,7 +18,8 @@ afterAll(() => {
 });
 const { CronStore, isInterrupted } = await import("../src/cron/store.js");
 
-const PATH = join(HOME, ".tomo", "data", "cron", "jobs.json");
+const PATH = join(HOME, ".tomo", "data", "tomo.db");
+const LEGACY = join(HOME, ".tomo", "data", "cron", "jobs.json");
 /** `tomo cron <args...>`, in a "fresh process": modules reset, so the store reads the file now. */
 async function cron(...args: string[]) {
   vi.resetModules();
@@ -151,12 +152,12 @@ describe("tomo cron run", () => {
     // A real dispatch record would read as an interrupted run at the next
     // daemon start, and park or report a job nobody ran.
     const job = addHourly();
-    const before = readFileSync(PATH, "utf-8");
+    const before = JSON.stringify(store().list());
     const run = await cron("run", job.id);
     expect(run.code).toBe(0);
     expect(run.out).toContain(`Would trigger: [${job.id}] hourly`);
     expect(run.out).toContain("this just previews");
-    expect(readFileSync(PATH, "utf-8")).toBe(before);
+    expect(JSON.stringify(store().list())).toBe(before);
     expect((await cron("run", "nope1234")).code).toBe(1);
   });
 });
@@ -167,10 +168,10 @@ describe("an unreadable store", () => {
     ["edit", "abc12345", "--stale-after", "0"], ["run", "abc12345"],
     ["add", "--name", "x", "--schedule", "every 1h", "--message", "x", "--session", "dm:alice"],
   ])("tomo cron %s exits 1, names the file instead of a stack trace, and writes nothing", async (...args) => {
-    writeFileSync(PATH, "{ not json");
+    writeFileSync(LEGACY, "{ not json");
     const run = await cron(...args);
     expect(run).toMatchObject({ code: 1, out: "" });
-    expect(run.err).toContain(`cron store unreadable: ${PATH}`);
-    expect(readFileSync(PATH, "utf-8")).toBe("{ not json");
+    expect(run.err).toContain(`cron store unreadable: ${LEGACY}`);
+    expect(readFileSync(LEGACY, "utf-8")).toBe("{ not json");
   });
 });

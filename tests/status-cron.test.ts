@@ -15,6 +15,7 @@ process.env.HOME = HOME;
 process.env.TOMO_HOME = join(HOME, ".tomo");
 
 const { gatherStatus, renderStatusReport } = await import("../src/cli/status.js");
+const { importLegacyCronJobs } = await import("../src/cron/store.js");
 
 afterAll(() => {
   rmSync(HOME, { recursive: true, force: true });
@@ -57,6 +58,8 @@ describe("tomo status with an unreadable cron store", () => {
         lastStatus: null,
       }],
     }));
+    // As an upgraded daemon's start does.
+    importLegacyCronJobs(join(HOME, ".tomo", "data", "tomo.db"));
 
     const report = await gatherStatus();
     expect(report.cron.unreadable).toBeUndefined();
@@ -70,7 +73,7 @@ describe("tomo status with an unreadable cron store", () => {
   });
 
   it("reports no tasks when there is no store at all", async () => {
-    rmSync(JOBS, { force: true });
+    rmSync(join(HOME, ".tomo", "data"), { recursive: true, force: true });
     const report = await gatherStatus();
     expect(report.cron.unreadable).toBeUndefined();
     expect(report.cron.total).toBe(0);

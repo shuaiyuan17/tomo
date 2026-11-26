@@ -1,15 +1,16 @@
 import { afterAll, describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { CronStore } from "../src/cron/store.js";
 import { buildCronTools } from "../src/mcp/cron-tools.js";
+import { breakStore } from "./helpers/cron.js";
 import { MIXED_AUDIENCE_KEY } from "../src/agent/audience.js";
 
 const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-cron-mcp-"));
 // The root is unique to this run, so nothing else will clean it up.
 afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
-const TEST_PATH = join(TEST_DIR, "jobs.json");
+const TEST_PATH = join(TEST_DIR, "data", "tomo.db");
 
 interface ToolHandle {
   name: string;
@@ -191,7 +192,7 @@ describe("cron MCP tools", () => {
   });
 
   it("schedule_create — an unreadable store is not reported as an invalid schedule", async () => {
-    writeFileSync(TEST_PATH, "{ not json");
+    breakStore(TEST_PATH, "{ not json");
     const result = await findTool("schedule_create").handler({
       name: "test",
       schedule: "every 1h",

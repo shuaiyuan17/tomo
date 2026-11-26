@@ -200,7 +200,7 @@ describe("model switch over HTTP", () => {
     channel = new WebChannel(owner, new WatchBus(), { models: models.access, ownerKey: () => "dm:owner", sessionKeys: () => ["dm:owner", GROUP] });
     channel.onMessage(async () => true);
     service = await startWebHttp(0, { accessToken: token, assetsDir: root,
-      data: new WebData({ cronStorePath: join(root, "jobs.json"), sessionsDir, sdkSessionsDir, owner }),
+      data: new WebData({ cronDbPath: join(root, "jobs.json"), sessionsDir, sdkSessionsDir, owner }),
       subscribe: (fn) => channel.events.subscribe(fn), rpc: async (rpc) => {
         if (rpc.method === "snapshot") return { snapshot: channel.snapshot(), replay: null };
         if (rpc.method === "epoch") return channel.events.epoch;

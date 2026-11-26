@@ -1,13 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CronStore } from "../src/cron/store.js";
 import { createTaskCronLink } from "../src/agent/subsessions/cron-link.js";
+import { breakStore } from "./helpers/cron.js";
 
 let dir = "";
 let path = "";
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "tomo-cronlink-")); path = join(dir, "jobs.json"); });
+beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "tomo-cronlink-")); path = join(dir, "data", "tomo.db"); });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 const add = (store: CronStore, sessionKey: string) =>
@@ -36,7 +37,7 @@ describe("a task's cron jobs", () => {
   it("answers unknown, not zero, when the cron store cannot be read, and refuses to remove", () => {
     const link = createTaskCronLink(path);
     add(new CronStore(path), "task:s1");
-    writeFileSync(path, "{broken");
+    breakStore(path, "{broken");
     expect(link.count("task:s1")).toBeUndefined();
     expect(() => link.removeAll("task:s1")).toThrow();
   });

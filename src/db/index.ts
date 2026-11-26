@@ -179,13 +179,39 @@ function connect(path: string, opts: OpenOptions): SqliteDatabase {
   try {
     if (!opts.readOnly) {
       // WAL is a property of the file and survives; the rest are per connection.
-      db.exec("PRAGMA journal_mode=WAL");
+      // Switching a NEW file to WAL needs an exclusive lock that SQLite does
+      // not wait for through the busy timeout, so processes opening a fresh
+      // database at the same moment (a `tomo cron add` racing the daemon's
+      // first start) would fail with "database is locked". Wait for it here.
+      enableWal(db, opts.busyTimeoutMs ?? DB_BUSY_TIMEOUT_MS);
     }
     db.exec("PRAGMA synchronous=FULL; PRAGMA fullfsync=1; PRAGMA checkpoint_fullfsync=1; PRAGMA foreign_keys=ON");
     return db;
   } catch (err) {
     db.close();
     throw err;
+  }
+}
+
+const SQLITE_BUSY = 5;
+
+function isBusyError(err: unknown): boolean {
+  const code = (err as { errcode?: unknown } | null)?.errcode;
+  return typeof code === "number" && (code & 0xff) === SQLITE_BUSY;
+}
+
+/** `PRAGMA journal_mode=WAL`, retried while another connection holds the lock it needs, for up to `timeoutMs`. */
+function enableWal(db: SqliteDatabase, timeoutMs: number): void {
+  const deadline = Date.now() + timeoutMs;
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  for (;;) {
+    try {
+      db.exec("PRAGMA journal_mode=WAL");
+      return;
+    } catch (err) {
+      if (!isBusyError(err) || Date.now() >= deadline) throw err;
+      Atomics.wait(pause, 0, 0, 10);
+    }
   }
 }
 

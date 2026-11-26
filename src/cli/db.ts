@@ -8,6 +8,7 @@ import { canManageJob } from "../cron/scope.js";
 import { TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { acquireMaintenanceLock, maintenanceLockBusyMessage, maintenanceLockPath, type MaintenanceLock } from "../db/lock.js";
+import { exportCronJobsToFile, legacyCronFileReplaceable, legacyCronJobsPath } from "../cron/store.js";
 import { LEGACY_PENDING_NOTES_FILENAME, exportPendingNotesToFile } from "../sessions/pending-notes-store.js";
 import { isRecordedProcessLive, readPidFileRecord } from "./pidfile.js";
 
@@ -120,6 +121,8 @@ dbCommand
       // rule as `tomo todo` and `tomo cron`): a group's shell must not read the owner's.
       const caller = process.env[TOMO_SESSION_KEY_ENV]?.trim() || undefined;
       if (table === "pending_notes") rows = rows.filter((r) => canManageJob({ sessionKey: String(r.session_key) }, caller));
+      // Same for cron jobs (`tomo cron list` shows a session only its own).
+      if (table === "cron_jobs") rows = rows.filter((r) => canManageJob({ sessionKey: (typeof r.session_key === "string" ? r.session_key : undefined) as string }, caller));
       if (opts.json) {
         console.log(JSON.stringify(rows, null, 2));
         return;
@@ -153,6 +156,23 @@ const EXPORTS: Record<string, {
     rollbackNotes: [
       "If you start this version again instead, it imports the file (it replaces the table). Do not delete the file:",
       "this version then takes it that an older Tomo delivered every note, and empties the table.",
+    ],
+  },
+  cron: {
+    file: () => legacyCronJobsPath(config.dbPath),
+    // While a real jobs file is there every cron call refuses, and this
+    // version's daemon imports it at its next start; the mark makes that
+    // import replace the table (the older Tomo continued from the export).
+    write: (db, out, mark) => exportCronJobsToFile(db, out, { mark }),
+    noun: "job(s)",
+    marks: true,
+    // The placeholder the daemon leaves there is not a jobs file.
+    replaceable: legacyCronFileReplaceable,
+    rollbackNotes: [
+      "Until then `tomo cron` refuses (the file is the truth now). If you start this version again instead, it imports the file",
+      "(it replaces the table), so changes the older Tomo made are kept.",
+      "Export pending notes too (`tomo db export pending-notes`). A Tomo from before the database (0.15 and older) needs nothing",
+      "more; one whose database is an older schema refuses this one: move data/tomo.db, -wal and -shm aside before starting it.",
     ],
   },
 };
@@ -232,6 +252,6 @@ dbCommand
       return;
     }
     console.log(`Copied the damaged database to ${aside} and started a fresh one.`);
-    console.log(`Its pending notes may still be readable: tomo db export pending-notes --from ${aside} --out <file>`);
+    console.log(`Its pending notes and cron jobs may still be readable: tomo db export pending-notes|cron --from ${aside} --out <file>`);
     console.log(`Last resort: sqlite3 ${aside} .recover`);
   });

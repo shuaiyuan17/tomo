@@ -3,13 +3,13 @@ import type { CreatableSchedule } from "../cron/schedule.js";
 import type { CronJob } from "../cron/types.js";
 
 /**
- * The jobs file exists but could not be read or parsed. That is now an error
- * rather than an empty store (silently reporting "no scheduled tasks" over an
- * unreadable file is how a real backlog goes unnoticed), so the CLI has to
- * say so in one line instead of dumping a stack trace at the user.
+ * The store could not be read (the database cannot be opened, or an old jobs
+ * file is in the way). That is an error rather than an empty store (silently
+ * reporting "no scheduled tasks" over an unreadable one is how a real backlog
+ * goes unnoticed), so the CLI says so in one line instead of a stack trace.
  */
 export function cronStoreErrorMessage(err: CronStoreReadError): string {
-  return `cron store unreadable: ${err.path}`;
+  return `cron store unreadable: ${err.path}${err.detail ? ` (${err.detail})` : ""}`;
 }
 
 /**
@@ -23,7 +23,7 @@ export function withCronStore<T>(fn: () => T): T {
   } catch (err) {
     if (err instanceof CronStoreReadError) {
       console.error(cronStoreErrorMessage(err));
-      console.error("Fix or remove the file and retry; the daemon recreates it empty.");
+      console.error("Nothing was changed. `tomo db check` shows the database's state; Tomo imports an old jobs file when it starts.");
       process.exit(1);
     }
     throw err;
@@ -40,7 +40,7 @@ export interface SafeCronRead {
  * Read the job list for a surface that must keep working without it — the
  * status report, the watch snapshot, the metrics scrape. Those must degrade
  * to "the cron section is unavailable" rather than failing whole: a scrape
- * that 500s or a `tomo watch` client that gets dropped because jobs.json is
+ * that 500s or a `tomo watch` client that gets dropped because the store is
  * corrupt hides every OTHER thing they were reporting.
  *
  * The caller gets the path back rather than a bare empty list precisely so it

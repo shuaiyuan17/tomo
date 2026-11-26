@@ -6,7 +6,8 @@
  *
  * The store is constructed BEFORE the barrier on purpose: every racer then
  * holds a snapshot that predates the others' writes, which is exactly the
- * read-modify-write the advisory lock has to serialise. It cannot be staged
+ * read-modify-write the lock (or, for cron, the database's write
+ * transaction) has to serialise. It cannot be staged
  * inside one process — every store API here is synchronous, so an in-process
  * "race" is always serialised by the interpreter.
  */

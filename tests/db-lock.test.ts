@@ -111,9 +111,10 @@ describe("who takes it", () => {
 
   it("tomo db repair and the rollback export refuse while the daemon holds it", { timeout: 60_000 }, async () => {
     mkdirSync(join(home, ".tomo", "data"), { recursive: true });
+    expect(tomo("cron", "list").status).toBe(0); // creates the database
     const { got } = await holder("forever");
     expect(got).toBe(true);
-    for (const args of [["db", "repair"], ["db", "export", "pending-notes"]]) {
+    for (const args of [["db", "repair"], ["db", "export", "cron"], ["db", "export", "pending-notes"]]) {
       const run = tomo(...args);
       expect(run.status, args.join(" ")).toBe(1);
       expect(run.stderr, args.join(" ")).toContain("is locked");

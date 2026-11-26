@@ -1,26 +1,37 @@
-import { readFileSync, writeFileSync } from "node:fs";
 import { vi } from "vitest";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
+import { openTomoDb } from "../../src/db/index.js";
+import { legacyCronJobsPath } from "../../src/cron/store.js";
 import type { Agent } from "../../src/agent.js";
 import type { CronScheduler } from "../../src/cron/scheduler.js";
 import { parseTomoEvent } from "../../src/tomo-event.js";
 
 /**
- * Shared fixtures for the cron tests: raw edits of `jobs.json` (as another
- * process, or a daemon that has been down a while, would leave it), the
- * scheduler's private tick, and an agent that stands in for a killed daemon.
+ * Shared fixtures for the cron tests: raw edits of the `cron_jobs` rows (as
+ * another process, or a daemon that has been down a while, would leave them),
+ * the scheduler's private tick, and an agent that stands in for a killed daemon.
  */
 
-/** A job as it sits in jobs.json — loose on purpose: tests write what they need. */
+/** A job record as it sits in a `cron_jobs` row — loose on purpose: tests write what they need. */
 export type RawJob = Record<string, unknown> & { id: string; name: string };
 
 /**
- * Edit jobs.json in place, bypassing the store — what another process, a hand
- * edit or an older version would leave on disk. `fn` mutates the parsed jobs.
+ * Edit the jobs in the database at `dbPath` directly, bypassing the store —
+ * what another process or an older version would leave. `fn` mutates the
+ * parsed records in place (jobs it adds or removes are ignored).
  */
-export function editJobs(path: string, fn: (jobs: RawJob[]) => void): void {
-  const raw = JSON.parse(readFileSync(path, "utf-8")) as { jobs: RawJob[] };
-  fn(raw.jobs);
-  writeFileSync(path, JSON.stringify(raw));
+export function editJobs(dbPath: string, fn: (jobs: RawJob[]) => void): void {
+  const db = openTomoDb(dbPath);
+  try {
+    db.transaction(() => {
+      const jobs = db.all<{ job: string }>("SELECT job FROM cron_jobs ORDER BY seq").map((r) => JSON.parse(r.job) as RawJob);
+      fn(jobs);
+      for (const job of jobs) db.run("UPDATE cron_jobs SET job = ? WHERE id = ?", JSON.stringify(job), job.id);
+    });
+  } finally {
+    db.close();
+  }
 }
 
 /** Make the named jobs (every job when no name is given) due a second ago. */
@@ -84,4 +95,20 @@ export function cronBodies(calls: string[]): string[] {
  */
 export function waitFor(assertion: () => void, timeout = 500): Promise<void> {
   return vi.waitFor(assertion, { timeout, interval: 1 });
+}
+
+/**
+ * Make the store at `dbPath` unreadable the way it can be in production: an
+ * old jobs file that will not parse, in the way of the database (every store
+ * call refuses until it is gone). `repairStore` takes it away again.
+ */
+export function breakStore(dbPath: string, contents = "{ this is not json"): string {
+  const file = legacyCronJobsPath(dbPath);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, contents);
+  return file;
+}
+
+export function repairStore(dbPath: string): void {
+  rmSync(legacyCronJobsPath(dbPath), { force: true });
 }

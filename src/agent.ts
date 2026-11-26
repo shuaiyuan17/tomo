@@ -31,7 +31,6 @@ import { resolveModelName } from "./models.js";
 import type { SubsessionRecord } from "./agent/subsessions/types.js";
 import type { WebSubsessionAccess } from "./channels/web.js";
 import { buildSubsessionPrompt } from "./agent/subsessions/prompt.js";
-import { CRON_STORE_PATH } from "./cron/store.js";
 import { createTaskCronLink } from "./agent/subsessions/cron-link.js";
 import { EFFORT_LEVELS, type EffortLevel } from "./config.js";
 import type { SessionContext } from "./agent/sdk-options.js";
@@ -596,7 +595,7 @@ export class Agent {
    * would report, notify and be fenced through its group.
    */
   private createSubsessionService(): SubsessionService {
-    const cron = createTaskCronLink(CRON_STORE_PATH);
+    const cron = createTaskCronLink(config.dbPath);
     return new SubsessionService({
       store: new SubsessionStore(join(config.tomoHome, "data", "subsessions.json"), {
         onChange: () => { for (const listener of this.subsessionListeners) listener(); },

@@ -3853,7 +3853,8 @@ export class Agent {
     const failed = (err?: unknown): void => {
       log.warn({ err, files }, "Could not tell the owner the pending notes file was moved aside; trying again");
       this.pendingNotesQuarantined = [...asides, ...this.pendingNotesQuarantined];
-      if (this.stopping || this.pendingNotesQuarantineTimer) return;
+      // No owner to tell: trying again would only log this every minute.
+      if (this.stopping || this.pendingNotesQuarantineTimer || !this.router.ownerSessionKey()) return;
       this.pendingNotesQuarantineTimer = setTimeout(() => {
         this.pendingNotesQuarantineTimer = undefined;
         this.tellPendingNotesQuarantined();

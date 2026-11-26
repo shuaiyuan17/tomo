@@ -1091,4 +1091,27 @@ describe("via-main: a lost pending notes file", () => {
     expect(notes.filter((n) => n.includes("yes, it's the flaky test") && n.includes(lostLine))).toHaveLength(1);
     expect(notes.some((n) => n.includes("OLD NEWS"))).toBe(false);
   });
+
+  it("adds no second copy of a message note still held in memory, so taking the question back leaves none", async () => {
+    const h = harness({}, async (key, prompt, hh) => {
+      if (prompt.includes("subsession-start")) {
+        await hh.service.notify(key, "build is green");
+        await hh.service.ask(key, "Merge PR #12 now?");
+      }
+      return { ok: true };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(messageNotes(h, "dm:owner")).toHaveLength(2);
+    // Only the file is moved aside: the queue still holds both notes (and writes them to the fresh file).
+    h.disk.clear();
+    h.service.pendingNotesLost();
+    await flush();
+    expect(messageNotes(h, "dm:owner")).toHaveLength(2);
+    // The owner writes to the task directly: the question is taken back, and no copy of it stays.
+    expect(h.service.ownerMessage("dm:owner", t.id, "hold off for now").ok).toBe(true);
+    await flush();
+    expect(messageNotes(h, "dm:owner").some((n) => n.includes("Merge PR #12 now?"))).toBe(false);
+  });
 });

@@ -441,6 +441,8 @@ export class SubsessionService {
    *  sent again yet (see pendingNotesLost): nothing is cleaned up meanwhile. */
   private notesLost = false;
   private lostNotesTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Failed tasks whose handback a lost-notes pass unmarked and has not written yet. */
+  private readonly lostHandbacks = new Set<string>();
   private deferred: Array<() => void> = [];
   /**
    * The table as read at start: the primary read cleanly ("ok"), or none yet
@@ -2837,14 +2839,18 @@ export class SubsessionService {
         });
         woken.add(task.parentKey);
       }
-      if (task.status === "failed" && task.handedBack && task.pendingInput.some(isOwnerInput)) {
+      if (task.status === "failed" && (task.handedBack || this.lostHandbacks.has(task.id)) && task.pendingInput.some(isOwnerInput)) {
+        // Remembered until written: a failed write leaves handedBack false, which no later pass would pick up.
+        this.lostHandbacks.add(task.id);
         step("unmark lost handback", () => {
           this.store.update(task.id, (r) => { r.handedBack = false; });
           return true;
         });
         step("rewrite lost handback", () => {
           const record = this.store.get(task.id);
-          return !record || this.handBack(record, { lost: true });
+          const done = !record || this.handBack(record, { lost: true });
+          if (done) this.lostHandbacks.delete(task.id);
+          return done;
         });
         woken.add(task.parentKey);
       }
@@ -2852,7 +2858,11 @@ export class SubsessionService {
       // waits on, and what it said since the owner last wrote to it.
       const messages = lostMessageNotes(task);
       if (messages.length > 0) {
-        for (const { id, note } of messages) step("rewrite lost task message", () => this.deps.queuePendingNote(task.parentKey, note, id));
+        for (const { id, note, same } of messages) {
+          // Still held in memory (the queue writes it to the fresh file): a second copy would outlive a withdrawal.
+          if (this.deps.hasPendingNote(task.parentKey, (n) => same(messageNoteNameOf(n)))) continue;
+          step("rewrite lost task message", () => this.deps.queuePendingNote(task.parentKey, note, id));
+        }
         woken.add(task.parentKey);
       }
     }
@@ -3162,18 +3172,25 @@ const LOST_MESSAGES_MAX = 5;
  * has answered since). Each gets its usual id, so a copy still queued is
  * not added twice.
  */
-function lostMessageNotes(record: SubsessionRecord): Array<{ id: string; note: string }> {
-  const out: Array<{ id: string; note: string }> = [];
+function lostMessageNotes(record: SubsessionRecord): Array<{ id: string; note: string; same: (name: string | undefined) => boolean }> {
+  const out: Array<{ id: string; note: string; same: (name: string | undefined) => boolean }> = [];
   const lost = (note: string) => appendToTomoEventBody(note, LOST_NOTE_LINE);
   const ask = record.askViaMain;
   if (ask?.note && !ask.direct && record.status === "waiting") {
-    out.push({ id: `subsession-message:${ask.note}`, note: lost(formatMessageNote(record, "ask", ask.text, ask.note)) });
+    const asked = ask.note;
+    out.push({ id: `subsession-message:${asked}`, note: lost(formatMessageNote(record, "ask", ask.text, asked)), same: (n) => n === asked });
   }
   const ownerLast = Math.max(0, ...record.conversation.filter((c) => c.from === "owner").map((c) => c.at));
   const said = record.sent.filter((m) => m.via === "main" && m.kind !== "ask" && m.at > ownerLast).slice(-LOST_MESSAGES_MAX);
   for (const m of said) {
     const name = messageNoteName(record.id, m.kind, m.text, 0);
-    out.push({ id: `subsession-message:${name}`, note: lost(formatMessageNote(record, m.kind, m.text, name)) });
+    const mine = parseMessageNoteName(name);
+    // The same words from the same tool, whatever inputs their turn answered.
+    const same = (n: string | undefined): boolean => {
+      const other = n === undefined ? undefined : parseMessageNoteName(n);
+      return other !== undefined && other.id === mine?.id && other.kind === mine.kind && other.digest === mine.digest;
+    };
+    out.push({ id: `subsession-message:${name}`, note: lost(formatMessageNote(record, m.kind, m.text, name)), same });
   }
   return out;
 }

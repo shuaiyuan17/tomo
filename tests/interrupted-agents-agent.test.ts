@@ -172,7 +172,8 @@ describe("interrupted subagents across a restart", () => {
 
     writeFileSync(join(mockConfig.sessionsDir, "_pending_notes.json"), "{not json");
     const ownerNotice = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValueOnce(false).mockResolvedValue(true);
-    const second = await boot();
+    // An owner to tell (with none, it is not tried again).
+    const second = await boot({ identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     await waitFor(() => expect(ownerNotice).toHaveBeenCalledTimes(1));
     const internals = second.agent as unknown as { pendingNotesQuarantineTimer?: ReturnType<typeof setTimeout>; tellPendingNotesQuarantined(): void };
     await waitFor(() => expect(internals.pendingNotesQuarantineTimer).toBeDefined());
@@ -184,6 +185,23 @@ describe("interrupted subagents across a restart", () => {
     const aside = readdirSync(mockConfig.sessionsDir).find((f) => f.startsWith("_pending_notes.json.corrupt-"));
     expect(String(ownerNotice.mock.calls[1][0])).toContain(aside);
     await second.agent.stop();
+  });
+
+  it("telling the owner the file was moved aside is not tried again when there is no owner to tell", async () => {
+    const { agent } = await boot();
+    const internals = agent as unknown as {
+      router: { ownerSessionKey(): string | undefined };
+      pendingNotesQuarantined: string[];
+      pendingNotesQuarantineTimer?: ReturnType<typeof setTimeout>;
+      tellPendingNotesQuarantined(): void;
+    };
+    vi.spyOn(internals.router, "ownerSessionKey").mockReturnValue(undefined);
+    const ownerNotice = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(false);
+    internals.pendingNotesQuarantined = ["/x/_pending_notes.json.corrupt-1"];
+    internals.tellPendingNotesQuarantined();
+    await waitFor(() => expect(ownerNotice).toHaveBeenCalledTimes(1));
+    await expectNoChangeFor(() => expect(internals.pendingNotesQuarantineTimer).toBeUndefined(), 50);
+    await agent.stop();
   });
 
   it("notes held in memory that could not be written to the fresh file are written once the disk is back", async () => {

@@ -2720,6 +2720,33 @@ describe("SubsessionService: a failed task hands back what it never answered", (
     expect(h.wakes).toEqual(["dm:owner"]);
   });
 
+  it("keeps trying a lost handback whose rewrite failed, and counts the notes lost until it is written", async () => {
+    const h = harness();
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    h.onTurn = () => new Promise(() => {});
+    h.sdk.delete(t.sessionKey);
+    expect(h.service.relay(t.id, "use the staging database", said("use the staging database")).ok).toBe(true);
+    await flush();
+    expect(h.store.get(t.id)?.handedBack).toBe(true);
+    h.notes.clear();
+    h.noteWriteFails = 1;
+    h.service.pendingNotesLost();
+    await flush();
+    const internals = h.service as unknown as { notesLost: boolean; lostNotesTimer?: ReturnType<typeof setTimeout>; flushLostNotes(): void };
+    expect(internals.notesLost).toBe(true);
+    expect(h.store.get(t.id)?.handedBack).toBeFalsy();
+    // The retry: the same task is picked up again, though its record no longer says handed back.
+    clearTimeout(internals.lostNotesTimer);
+    internals.lostNotesTimer = undefined;
+    h.notes.clear();
+    internals.flushLostNotes();
+    expect(h.store.get(t.id)?.handedBack).toBe(true);
+    expect(internals.notesLost).toBe(false);
+    expect((h.notes.get("dm:owner") ?? []).filter((n) => n.includes("subsession-handback") && n.includes("use the staging database"))).toHaveLength(1);
+  });
+
   it("hands every unanswered message back in full, in a pinned note; the record is forgotten only once that note is written", async () => {
     const h = harness();
     h.service.start();

@@ -2104,6 +2104,24 @@ describe("SubsessionService: the quota gate", () => {
     expect(h.notices[0].text).not.toContain("5-hour");
   });
 
+  it("a weekly-quota pause is lifted only by the owner's own words, not by a main-session note", async () => {
+    const h = harness({}, working());
+    h.quota = { window: "weekly", percent: 90 };
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+    // The main session passes something on without the owner's words: no turn.
+    h.service.relay(t.id, "the main session thinks you should go on");
+    await flush();
+    expect(h.turns).toHaveLength(0);
+    expect(h.store.get(t.id)?.status).toBe("waiting");
+    // The owner's own words run, past the gate.
+    expect(h.service.relay(t.id, "go anyway", said("go anyway")).ok).toBe(true);
+    await flush();
+    expect(h.turns).toHaveLength(1);
+  });
+
   it("decides on the reading taken just before the turn (freshenQuota is awaited first)", async () => {
     const h = harness({}, working());
     // The file is stale (nothing known); the fresh read finds the week at 90%.

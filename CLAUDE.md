@@ -205,7 +205,7 @@ Built by `workspace/index.ts` from layered markdown files:
 - `IDENTITY.md` — name and quirks
 - Memory system — injected from `~/.tomo/workspace/memory/`
 - Harness instructions — NO_REPLY, MEDIA: tags, formatting rules
-- Owner DM only: the home note, and with `subsessions.enabled` the `DELEGATION_NOTE` (when to work in the turn, use an Agent subagent, or `task_spawn`; task_spawn's own description says only how to use it). Groups and task sessions never get it.
+- Owner DM only: the home note, and with `subsessions.enabled` the `DELEGATION_NOTE` (when to work in the turn, use an Agent subagent, or `task_spawn`; task_spawn's own description says only how to use it). Groups and task sessions never get it; the note itself says it holds only in a turn the owner wrote privately, since a summoned group's turn runs on the DM session (the prompt is per session, the audience per turn) and task_spawn refuses it.
 
 Changes to workspace files take effect on next message (no restart needed) — the prompt is rebuilt on each new LiveSession.
 

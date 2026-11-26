@@ -255,6 +255,12 @@ describe("sub-session tools", () => {
     expect(description).toContain("`brief` must say everything it needs");
     expect(description).not.toMatch(/quick question|tell the owner first|silently/);
     expect(DELEGATION_NOTE).toMatch(/Before you call `task_spawn`, tell the owner in a line what you're starting \(and why, if they didn't ask for one\)/);
+    // Long AND briefable; a follow-up alone is no reason; connectors keep work here whatever its length.
+    expect(DELEGATION_NOTE).toMatch(/only when it is long[^.]*and you can brief it self-contained/);
+    expect(DELEGATION_NOTE).toMatch(/A likely follow-up alone is no reason/);
+    expect(DELEGATION_NOTE).toMatch(/connectors or external MCP servers stays here however long it runs/);
+    // The prompt is per session, the audience per turn: a summoned group's turn on the DM session is told here.
+    expect(DELEGATION_NOTE).toMatch(/Only in a turn the owner wrote privately: `task_spawn` refuses a turn a group steers/);
   });
 
   it("refuses a turn that may not manage sub-sessions", async () => {

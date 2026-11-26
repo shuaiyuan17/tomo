@@ -252,13 +252,14 @@ describe("PendingNotesQueue when the durable store fails", () => {
     expect(store.getPendingNotes("k")).toEqual(["n1"]);
   });
 
-  it("an unreadable store is read as empty: new notes still queue and drain", () => {
+  it("an unreadable store: new notes are held in memory (not on disk, so not written over it) and still drain", () => {
     const store = new FlakyStore();
     store.notes.set("k", ["from disk"]);
     store.failReads = true;
     const queue = new PendingNotesQueue(store);
 
-    expect(queue.queueNote("k", "n1")).toBe(true);
+    expect(queue.queueNote("k", "n1")).toBe(false);
+    expect(store.notes.get("k")).toEqual(["from disk"]);
     expect(queue.drain("k")).toBe("n1\n\n");
   });
 });
@@ -280,5 +281,39 @@ describe("PendingNotesQueue holdOwnerAudience", () => {
     expect(store.getPendingNotes("dm:owner")).toEqual([ownerOnly]);
 
     expect(queue.drain("dm:owner")).toBe(`${ownerOnly}\n\n`);
+  });
+});
+
+describe("PendingNotesQueue when the stored notes cannot be read", () => {
+  it("never writes over them: a note queued meanwhile is written after them once they read", () => {
+    const store = new MemoryPendingNotesStore();
+    store.notes.set("k", ["the only copy of a replayed message"]);
+    let readable = false;
+    const real = store.getPendingNotes.bind(store);
+    store.getPendingNotes = (key: string) => {
+      if (!readable) throw new Error("EMFILE");
+      return real(key);
+    };
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("k", "new note");
+    expect(store.notes.get("k")).toEqual(["the only copy of a replayed message"]);
+    readable = true;
+    queue.queueNote("k", "another");
+    expect(store.notes.get("k")).toEqual(["the only copy of a replayed message", "new note", "another"]);
+  });
+
+  it("a turn drains them once they read, though nothing was queued meanwhile", () => {
+    const store = new MemoryPendingNotesStore();
+    store.notes.set("k", ["stored"]);
+    let readable = false;
+    const real = store.getPendingNotes.bind(store);
+    store.getPendingNotes = (key: string) => {
+      if (!readable) throw new Error("EMFILE");
+      return real(key);
+    };
+    const queue = new PendingNotesQueue(store);
+    expect(queue.drain("k")).toBe("");
+    readable = true;
+    expect(queue.drain("k")).toBe("stored\n\n");
   });
 });

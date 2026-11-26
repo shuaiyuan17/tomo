@@ -90,7 +90,7 @@ import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
 import { join } from "node:path";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { withConfigLockSync } from "./config-file.js";
 import { writeJsonAtomicSync } from "./fs-utils.js";
 import { CONTINUITY_DELIVERY_NOTE } from "./continuity-defaults.js";
@@ -139,6 +139,9 @@ const REWIND_SHUTDOWN_TIMEOUT_MS = 3_000;
  * than a "first N keys" counter because it needs no hook on the message path.
  */
 const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
+/** How soon an owner notice about a moved-aside pending notes file that could not be sent is tried again. */
+const PENDING_NOTES_NOTICE_RETRY_MS = 60_000;
+const PENDING_NOTES_NOTICE_MAX_TRIES = 30;
 
 /**
  * How long a reply that matches no task waits for task sends still in flight
@@ -238,6 +241,11 @@ export class Agent {
    * it failed. Shutdown wins; the request is dropped, with a line saying so.
    */
   private stopping = false;
+  /** Owner notices about a moved-aside pending notes file: sent once the channels are up. */
+  private pendingNotesNoticeReady = false;
+  private pendingNotesNoticeSending = false;
+  private pendingNotesNoticeTimer: ReturnType<typeof setTimeout> | undefined;
+  private pendingNotesNoticeTries = 0;
   /** End time of each session's last successful turn this process saw — the
    *  start of the range an owner notice suggests compacting. */
   private readonly lastGoodTurnAt = new Map<string, number>();
@@ -282,6 +290,7 @@ export class Agent {
       getChannel: (name) => this.getChannel(name),
     });
     this.pendingNotesQueue = new PendingNotesQueue(this.sessions);
+    this.sessions.onPendingNotesQuarantined = () => this.tellPendingNotesQuarantined();
     if (config.inbox) {
       try {
         this.inbox = new DurableInbox({ path: join(config.tomoHome, "data", "inbox.jsonl") });
@@ -3369,6 +3378,54 @@ export class Agent {
   }
 
   /**
+   * Tell the owner which pending notes files were moved aside (their notes
+   * were not delivered; the file is kept for the owner session to read and
+   * resend what matters). The store's marker names them until the notice is
+   * sent, so a restart in between sends it then; a send that fails is tried
+   * again for a while, unless there is no owner to tell.
+   */
+  private tellPendingNotesQuarantined(): void {
+    if (!this.pendingNotesNoticeReady || this.stopping || this.pendingNotesNoticeSending || this.pendingNotesNoticeTimer) return;
+    const marked = this.sessions.quarantinedPendingNotes();
+    if (!marked) return;
+    // A name whose move never happened (a crash between marker and move) is
+    // dropped, not announced: the file it names does not exist.
+    const asides = marked.filter((a) => existsSync(a));
+    if (asides.length < marked.length) {
+      this.sessions.clearQuarantinedPendingNotes(marked.filter((a) => !asides.includes(a)));
+      if (asides.length === 0) return;
+    }
+    // A marker that will not read names no file.
+    const files = asides.length > 0 ? asides : [join(config.sessionsDir, "_pending_notes.json.corrupt-*")];
+    const text = ownerT("notices")("pendingNotesQuarantined", { files: files.join(", "), count: files.length });
+    this.pendingNotesNoticeSending = true;
+    const failed = (err?: unknown): void => {
+      log.warn({ err, files }, "Could not tell the owner the pending notes file was moved aside");
+      // No owner, or none reachable after a while: the marker keeps it for the next start.
+      if (this.stopping || !this.router.ownerSessionKey() || ++this.pendingNotesNoticeTries >= PENDING_NOTES_NOTICE_MAX_TRIES) return;
+      this.pendingNotesNoticeTimer = setTimeout(() => {
+        this.pendingNotesNoticeTimer = undefined;
+        this.tellPendingNotesQuarantined();
+      }, PENDING_NOTES_NOTICE_RETRY_MS);
+      this.pendingNotesNoticeTimer.unref();
+    };
+    void this.notifyOwner(text)
+      .then((sent) => {
+        if (!sent) return failed();
+        this.pendingNotesNoticeTries = 0;
+        this.sessions.clearQuarantinedPendingNotes(asides);
+      })
+      .catch((err) => failed(err))
+      .finally(() => {
+        this.pendingNotesNoticeSending = false;
+        // Another file moved aside while this one was being sent.
+        if (!this.pendingNotesNoticeTimer && (this.sessions.quarantinedPendingNotes() ?? []).some((a) => !asides.includes(a))) {
+          this.tellPendingNotesQuarantined();
+        }
+      });
+  }
+
+  /**
    * DM the configured OWNER (no agent query); never falls back to another
    * private chat. Resolves false when nothing was sent.
    */
@@ -3402,6 +3459,9 @@ export class Agent {
       log.error({ err }, "Sub-session recovery failed");
     }
     await Promise.all(this.channels.map((ch) => ch.start()));
+    // A file moved aside before now (this start, or a run that went away before telling the owner).
+    this.pendingNotesNoticeReady = true;
+    this.tellPendingNotesQuarantined();
     try {
       this.replayInbox(recovered);
     } catch (err) {
@@ -3551,6 +3611,10 @@ export class Agent {
     if (this.migrationStatusTimer) {
       clearTimeout(this.migrationStatusTimer);
       this.migrationStatusTimer = undefined;
+    }
+    if (this.pendingNotesNoticeTimer) {
+      clearTimeout(this.pendingNotesNoticeTimer);
+      this.pendingNotesNoticeTimer = undefined;
     }
     this.commands.stop();
 

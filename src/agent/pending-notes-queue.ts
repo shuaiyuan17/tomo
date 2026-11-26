@@ -103,10 +103,13 @@ export class PendingNotesQueue {
   private inflight = new Map<string, InFlightBatch[]>();
   private errorNotes = new Map<string, ErrorNote[]>();
   private errorSeq = 0;
+  /** Sessions whose stored notes could not be read when first needed: merged in at the next write, never written over. */
+  private unloaded = new Set<string>();
 
   constructor(private store: DurablePendingNotesStore) {}
 
   private queued(sessionKey: string): string[] {
+    if (this.unloaded.has(sessionKey)) this.retryLoad(sessionKey);
     let arr = this.notes.get(sessionKey);
     if (!arr) {
       try {
@@ -114,14 +117,29 @@ export class PendingNotesQueue {
       } catch (err) {
         log.warn({ err, sessionKey }, "Could not load durable pending notes");
         arr = [];
+        this.unloaded.add(sessionKey);
       }
       this.notes.set(sessionKey, arr);
     }
     return arr;
   }
 
+  /** Read the stored notes that could not be read before, ahead of the ones
+   *  held in memory since. Returns false while they still cannot be read. */
+  private retryLoad(sessionKey: string): boolean {
+    try {
+      this.notes.set(sessionKey, [...this.store.getPendingNotes(sessionKey), ...(this.notes.get(sessionKey) ?? [])]);
+      this.unloaded.delete(sessionKey);
+      return true;
+    } catch (err) {
+      log.warn({ err, sessionKey }, "Stored pending notes still cannot be read");
+      return false;
+    }
+  }
+
   /** Write in-flight + queued notes for this session. Returns false on failure. */
   private persist(sessionKey: string): boolean {
+    if (this.unloaded.has(sessionKey) && !this.retryLoad(sessionKey)) return false;
     const all = [
       ...(this.inflight.get(sessionKey) ?? []).flatMap((b) => b.notes.map(markInterrupted)),
       ...(this.notes.get(sessionKey) ?? []),
@@ -291,6 +309,13 @@ export class PendingNotesQueue {
 
   /** Test/support helper for observing queued durable notes without draining. */
   peekNotes(sessionKey: string): string[] {
-    return [...(this.notes.get(sessionKey) ?? this.store.getPendingNotes(sessionKey))];
+    const held = this.notes.get(sessionKey);
+    if (held) return [...held];
+    try {
+      return this.store.getPendingNotes(sessionKey);
+    } catch (err) {
+      log.warn({ err, sessionKey }, "Could not read durable pending notes");
+      return [];
+    }
   }
 }

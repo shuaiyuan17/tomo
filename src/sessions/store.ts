@@ -1474,6 +1474,10 @@ export class SessionStore {
       );
     }
 
+    // Read before anything moves: a pending notes file that cannot be read
+    // (nor moved aside) refuses the re-key while it can still be retried.
+    const pendingNotes = this.loadPendingNotes();
+
     // Re-keying is the registry forgetting `oldKey`: the `migratedFrom`
     // breadcrumb below is only kept for a non-DM→DM unification, so for every
     // other re-key nothing would remember that `oldKey` once owned its legacy
@@ -1534,7 +1538,6 @@ export class SessionStore {
       );
     }
 
-    const pendingNotes = this.loadPendingNotes();
     const oldNotes = pendingNotes[oldKey];
     if (oldNotes) {
       pendingNotes[newKey] = [...(pendingNotes[newKey] ?? []), ...oldNotes];
@@ -1684,20 +1687,111 @@ export class SessionStore {
     return join(this.dir, "_pending_notes.json");
   }
 
+  /**
+   * A file that cannot be read, decoded or parsed, or holds anything but
+   * lists of strings, is never read as empty: the next write would replace
+   * every session's notes. It is moved aside unchanged (see
+   * `quarantinePendingNotes`) and a fresh one started.
+   */
   private loadPendingNotes(): Record<string, string[]> {
-    if (!existsSync(this.pendingNotesPath)) return {};
+    let raw: Buffer;
     try {
-      const data = JSON.parse(readFileSync(this.pendingNotesPath, "utf-8")) as Partial<PendingNotesFile>;
-      if (!data.notes || typeof data.notes !== "object") return {};
-      return Object.fromEntries(
-        Object.entries(data.notes)
-          .filter((entry): entry is [string, string[]] =>
-            Array.isArray(entry[1]) && entry[1].every((note) => typeof note === "string")),
-      );
+      raw = readFileSync(this.pendingNotesPath);
     } catch (err) {
-      log.warn({ err, file: this.pendingNotesPath }, "Could not load pending notes");
+      if (isEnoent(err)) return {};
+      return this.quarantinePendingNotes(err);
+    }
+    try {
+      const data = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)) as Partial<PendingNotesFile> | null;
+      const notes = data?.notes;
+      if (!notes || typeof notes !== "object" || Array.isArray(notes)
+        || !Object.values(notes).every((v) => Array.isArray(v) && v.every((n) => typeof n === "string"))) {
+        throw new Error("not a pending notes file");
+      }
+      return notes;
+    } catch (err) {
+      return this.quarantinePendingNotes(err);
+    }
+  }
+
+  private get pendingNotesMarkerPath(): string {
+    return join(this.dir, "_pending_notes.quarantined.json");
+  }
+
+  /**
+   * The pending notes files moved aside that the owner has not been told
+   * about yet (undefined: none). Kept on disk until the notice is sent, so a
+   * restart in between still sends it. A marker that will not read counts as
+   * one naming no file.
+   */
+  quarantinedPendingNotes(): string[] | undefined {
+    let raw: string;
+    try {
+      raw = readFileSync(this.pendingNotesMarkerPath, "utf-8");
+    } catch (err) {
+      return isEnoent(err) ? undefined : [];
+    }
+    try {
+      const asides = (JSON.parse(raw) as { asides?: unknown }).asides;
+      return Array.isArray(asides) ? asides.filter((a): a is string => typeof a === "string") : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** The owner was told about `asides`: they leave the marker, which goes once empty. */
+  clearQuarantinedPendingNotes(asides: string[]): void {
+    const left = (this.quarantinedPendingNotes() ?? []).filter((a) => !asides.includes(a));
+    try {
+      if (left.length > 0) writeJsonAtomicSync(this.pendingNotesMarkerPath, { asides: left }, { fsync: true });
+      else unlinkSync(this.pendingNotesMarkerPath);
+    } catch (err) {
+      if (!isEnoent(err)) log.warn({ err }, "Could not update the pending notes quarantine marker");
+    }
+  }
+
+  /** Told after a file was moved aside (the marker already names it). */
+  onPendingNotesQuarantined?: (aside: string) => void;
+
+  /**
+   * Move the unreadable pending notes file aside, byte for byte, as
+   * `_pending_notes.json.corrupt-<ts>`, and start fresh. The marker naming it
+   * is on disk first. Throws when it cannot be moved: nothing may be written
+   * over it then.
+   */
+  private quarantinePendingNotes(cause: unknown): Record<string, string[]> {
+    const path = this.pendingNotesPath;
+    if (this.readOnly) throw new Error("Pending notes file could not be read", { cause });
+    const ts = fileTimestamp();
+    for (let n = 0; n < 100; n++) {
+      const aside = n === 0 ? `${path}.corrupt-${ts}` : `${path}.corrupt-${ts}-${n}`;
+      const before = this.quarantinedPendingNotes();
+      let outcome: "moved" | "taken" | "gone" | undefined;
+      try {
+        writeJsonAtomicSync(this.pendingNotesMarkerPath, { asides: [...(before ?? []), aside] }, { fsync: true });
+        outcome = this.moveWithoutClobber(path, aside);
+      } finally {
+        // Not moved: the marker goes back to what it was.
+        if (outcome !== "moved") {
+          try {
+            if (before === undefined) unlinkSync(this.pendingNotesMarkerPath);
+            else writeJsonAtomicSync(this.pendingNotesMarkerPath, { asides: before }, { fsync: true });
+          } catch (err) {
+            if (!isEnoent(err)) log.warn({ err }, "Could not restore the pending notes quarantine marker");
+          }
+        }
+      }
+      if (outcome === "taken") continue;
+      if (outcome === "gone") return {};
+      log.error({ err: cause, file: path, aside }, "Pending notes file could not be read; moved it aside unchanged and started a fresh one");
+      try {
+        this.onPendingNotesQuarantined?.(aside);
+      } catch (err) {
+        log.warn({ err }, "Pending notes quarantine listener failed");
+      }
       return {};
     }
+    throw new Error("No free name to move the pending notes file aside", { cause });
   }
 
   // --- Legacy stem ownership ledger (see LegacyStemLedgerFile) ---

@@ -64,3 +64,11 @@ export function chatRows(entries: readonly TimelineEntry[], pending: readonly We
 export function openingAnchors(keys: readonly string[], claimed: ReadonlySet<string>): ReadonlySet<string> {
   return new Set(keys.filter((key) => !claimed.has(key)));
 }
+
+/**
+ * A turn is running and has shown nothing of itself yet (no step, no text):
+ * the chat says so with the thinking dots, which go the moment it does.
+ */
+export function awaitingOutput(turnActive: boolean, trailingSteps: number, liveBlocks: number): boolean {
+  return turnActive && trailingSteps === 0 && liveBlocks === 0;
+}

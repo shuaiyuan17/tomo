@@ -106,7 +106,6 @@ export interface RecordedMessageProps {
   reactions: readonly ShownReaction[];
   /** The message before it is a tapback (Tomo's silence after one is the expected answer). */
   afterTapback: boolean;
-  /** Rises in (it arrived while the page was open, not sent from here). */ enter: boolean;
   /** Highlighted: its quote was just clicked. */ flash: boolean;
   /** Its interrupted request's Dismiss is being confirmed. */ confirming: boolean;
   /** The owner conversation: the owner's bubbles carry a read receipt. */ receipts: boolean;
@@ -115,14 +114,14 @@ export interface RecordedMessageProps {
 
 /** A recorded message: a tapback line, "No reply", or a message with its header, actions and reactions. */
 export const RecordedMessage = memo(function RecordedMessage(props: RecordedMessageProps) {
-  const { message, parsed, quotedId, request, reactions, afterTapback, enter, flash, confirming, receipts, agent, group, writable, live, sessionId, actions } = props;
+  const { message, parsed, quotedId, request, reactions, afterTapback, flash, confirming, receipts, agent, group, writable, live, sessionId, actions } = props;
   // Memoized: subscribe, so a language switch re-renders the row.
   useTranslation();
   const { sent, reply, body, tapback } = parsed;
   const interrupted = request && awaitingOwner(request) ? request : undefined;
   const onQuote = quotedId ? () => actions.showMessage(quotedId) : undefined;
   const articleClass = (gap: string) => cn(`message ${message.role} group/message mx-auto ${gap} max-w-[740px] rounded-2xl transition-[background-color,box-shadow] duration-700`,
-    enter && "motion-enter", flash && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]");
+    flash && "bg-primary/10 shadow-[0_0_0_8px_color-mix(in_srgb,var(--primary)_10%,transparent)]");
   const when = <><time dateTime={new Date(message.timestamp).toISOString()} title={messageDateTime(message.timestamp)} className="tabular-nums">{messageTime(message.timestamp)}</time><span>{channelLabel(message.channel)}</span></>;
   const interruptedActions = <InterruptedActions request={interrupted} agent={agent} writable={writable} confirming={confirming} actions={actions} />;
   if (tapback) return <article id={`msg-${message.id}`} className={articleClass("mb-5")}>
@@ -177,12 +176,12 @@ export function PendingMessage({ request, sent, reactions, receipts, confirming,
 }) {
   const interruptedActions = <InterruptedActions request={awaitingOwner(request) ? request : undefined} agent={agent} writable={writable} confirming={confirming} actions={actions} />;
   const quote = request.reply?.text.replace(/\s+/g, " ").trim() || null;
-  if (request.reply?.reaction) return <article className="message user tapback motion-enter mx-auto mb-5 max-w-[740px]" data-request-id={request.requestId}>
+  if (request.reply?.reaction) return <article className="message user tapback mx-auto mb-5 max-w-[740px]" data-request-id={request.requestId}>
     <TapbackLine who={i18n.t("chat:reaction.who.you")} reaction={reactionKind(request.reply.reaction)} quote={quote}
       meta={<Badge variant="outline" className={cn(metaBadge, "shrink-0")}>{pendingLabel(request)}</Badge>} />
     {interruptedActions}</article>;
   const files = sent?.files ?? (request.files ?? []).map((file): { name: string; size?: number } => ({ name: file.name, size: file.size }));
-  return <article className="message user motion-enter mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId}>
+  return <article className="message user mx-auto mb-7 max-w-[740px]" data-request-id={request.requestId}>
     <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{i18n.t("chat:reaction.who.you")}</span><span>{channelLabel("web")}</span>
       <Badge variant="outline" className={metaBadge}>{pendingLabel(request)}</Badge></div>
     {/* Another tab's send (or a reload): the images by where they were filed. */}
@@ -200,10 +199,42 @@ export function PendingMessage({ request, sent, reactions, receipts, confirming,
 }
 
 /** A block of the reply streaming in, until the transcript records the turn. */
-export const LiveReply = memo(function LiveReply({ block, agent, sessionId }: { block: WebSnapshot["blocks"][number]; agent: string; sessionId: string }) {
+export const LiveReply = memo(function LiveReply({ block, enter, agent, sessionId }: {
+  block: WebSnapshot["blocks"][number]; /** Rises in: it came while the page was open (not with a reload mid-reply). */ enter: boolean; agent: string; sessionId: string;
+}) {
   const { t } = useTranslation("chat");
-  return <article className="message assistant motion-enter mx-auto mb-7 max-w-[740px]">
+  return <article className={cn("message assistant mx-auto mb-7 max-w-[740px]", enter && "motion-enter")}>
     <div className="mb-2 flex items-baseline gap-3 tracking-[0.02em] text-[11px] text-muted-foreground"><span className="font-sans text-[13px] font-semibold text-foreground">{agent}</span><span>{t("message.inProgress")}</span></div>
     <div className="markdown reading"><MessageBody body={[block.text, ...(block.images ?? []).map((id) => `MEDIA:web:${id}`),
       ...(block.files ?? []).map((file) => `MEDIA:web:file:${file.id}:${file.size}:${file.name}`)].filter(Boolean).join("\n")} sessionId={sessionId} thinking="block" /></div></article>;
 });
+
+/**
+ * Under the last message while a turn has shown nothing yet: three dots,
+ * where the reply will start. They sit IN the gap a message leaves under
+ * itself (-24 + 20 + 4 px: no height of their own), so the transcript is
+ * exactly as tall with them as without and nothing moves when they come or
+ * go. For the eye only: the composer's status line is what says "working"
+ * to a screen reader.
+ */
+export function ThinkingDots() {
+  return <div aria-hidden="true" data-slot="thinking-dots" className="motion-wait mx-auto -mt-6 mb-1 max-w-[740px]"><div className="thinking-dots"><i /><i /><i /></div></div>;
+}
+
+/**
+ * A conversation while its first page loads: the outline of an exchange,
+ * pulsing. It holds back a moment (`motion-wait`), so a history that loads
+ * at once shows no placeholder at all.
+ */
+export function HistorySkeleton({ label }: { label: string }) {
+  const bar = "h-3 rounded-full bg-foreground/[0.07]";
+  const lines = (widths: string[]) => <div className="mb-8"><div className={cn(bar, "mb-4 w-14")} />
+    {widths.map((width, i) => <div key={i} className={cn(bar, "mb-3", width)} />)}</div>;
+  return <div role="status" data-slot="history-skeleton" className="motion-wait mx-auto w-full max-w-[740px] pt-1">
+    <span className="sr-only">{label}</span>
+    <div aria-hidden="true" className="animate-pulse">
+      {lines(["w-[92%]", "w-[84%]", "w-[58%]"])}
+      <div className="mb-8"><div className={cn(bar, "mb-4 w-10")} /><div className="h-12 w-[46%] rounded-2xl rounded-tl-md bg-foreground/[0.07]" /></div>
+      {lines(["w-[88%]", "w-[66%]"])}
+    </div></div>;
+}

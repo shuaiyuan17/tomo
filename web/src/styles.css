@@ -80,6 +80,16 @@
 
 /* Motion: one ease-out curve, short durations (120–250 ms); everything is
    switched off under prefers-reduced-motion (see the end of this file). */
+:root {
+  /* The shared durations: every entrance, exit and move below is one of these. */
+  --motion-quick: 150ms; /* something closing */
+  --motion-enter: 180ms; /* something appearing: a bubble, a reply block, a card */
+  --motion-move: 200ms;  /* something travelling: list ↔ view, a task card in or out */
+  --motion-grow: 240ms;  /* chart bars */
+  /* A placeholder for a wait (the history skeleton, the thinking dots) holds back this long,
+     so a load or a reply that comes at once never flashes one. */
+  --motion-wait: 300ms;
+}
 @theme {
   --ease-soft: cubic-bezier(0.2, 0.8, 0.2, 1);
   --default-transition-duration: 120ms;
@@ -203,18 +213,26 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
 
 @layer components {
   /* A new bubble or block rises slightly into place. */
-  .motion-enter { animation: motion-enter 180ms var(--ease-soft) both; }
+  .motion-enter { animation: motion-enter var(--motion-enter) var(--ease-soft) both; }
   /* A new task card drops in. */
-  .motion-drop { animation: motion-drop 200ms var(--ease-soft) both; }
+  .motion-drop { animation: motion-drop var(--motion-move) var(--ease-soft) both; }
   /* A task card on its way out: fades and collapses so the list does not jump. */
-  .motion-exit { animation: motion-exit 200ms var(--ease-soft) both; overflow: hidden; }
+  .motion-exit { animation: motion-exit var(--motion-move) var(--ease-soft) both; overflow: hidden; }
   /* Task list ↔ task view. */
-  .motion-from-right { animation: motion-from-right 200ms var(--ease-soft) both; }
-  .motion-from-left { animation: motion-from-left 200ms var(--ease-soft) both; }
+  .motion-from-right { animation: motion-from-right var(--motion-move) var(--ease-soft) both; }
+  .motion-from-left { animation: motion-from-left var(--motion-move) var(--ease-soft) both; }
   /* Radix Collapsible content: height follows open/close. */
   .motion-collapsible { overflow: hidden; }
-  .motion-collapsible[data-state="open"] { animation: collapsible-open 180ms var(--ease-soft); }
-  .motion-collapsible[data-state="closed"] { animation: collapsible-close 150ms var(--ease-soft); }
+  .motion-collapsible[data-state="open"] { animation: collapsible-open var(--motion-enter) var(--ease-soft); }
+  .motion-collapsible[data-state="closed"] { animation: collapsible-close var(--motion-quick) var(--ease-soft); }
+  /* A placeholder for a wait fades in, and only once the wait has lasted (--motion-wait). */
+  .motion-wait { animation: motion-fade var(--motion-enter) var(--ease-soft) var(--motion-wait) backwards; }
+  /* "Thinking": three dots rising in turn, under the last message until the turn shows something.
+     A loop, like the shimmer and the running mark; still dots under reduced motion. */
+  .thinking-dots { @apply flex h-5 items-center gap-[5px]; }
+  .thinking-dots > i { @apply block size-[6px] rounded-full bg-muted-foreground; opacity: 0.35; animation: thinking-dot 1.2s ease-in-out infinite; }
+  .thinking-dots > i:nth-child(2) { animation-delay: 160ms; }
+  .thinking-dots > i:nth-child(3) { animation-delay: 320ms; }
 }
 /* Charts (Study · Cost). Categorical hues validated (dataviz validate_palette.js, --pairs all) against the card
    surface in each mode: light #3d7ab5,#c8623a,#2f9a74 on #fbf8f1; dark #3a70b3,#b65329,#28815e on #27231f.
@@ -229,11 +247,13 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
   --seq-0:#37322c; --seq-1:#354254; --seq-2:#3e5471; --seq-3:#48668d; --seq-4:#5479a9; --seq-5:#658dc1; }
 .viz .bar { transition: filter 120ms var(--ease-soft); }
 .viz [data-col]:hover .bar, .viz [data-col]:focus-visible .bar { filter: brightness(1.12); }
-.viz .vgrow { transform-origin: bottom; animation: viz-grow 240ms var(--ease-soft) both; }
-.viz .growx { transform-origin: left; animation: viz-growx 240ms var(--ease-soft) both; }
+.viz .vgrow { transform-origin: bottom; animation: viz-grow var(--motion-grow) var(--ease-soft) both; }
+.viz .growx { transform-origin: left; animation: viz-growx var(--motion-grow) var(--ease-soft) both; }
 @keyframes viz-grow { from { transform: scaleY(0); } }
 @keyframes viz-growx { from { transform: scaleX(0); } }
 @keyframes motion-enter { from { opacity: 0; transform: translateY(6px); } }
+@keyframes motion-fade { from { opacity: 0; } }
+@keyframes thinking-dot { 0%, 60%, 100% { opacity: 0.35; transform: translateY(0); } 30% { opacity: 0.9; transform: translateY(-3px); } }
 @keyframes motion-drop { from { opacity: 0; transform: translateY(-4px); } }
 @keyframes motion-exit { from { opacity: 1; height: var(--motion-exit-from, auto); } to { opacity: 0; height: 0; padding-top: 0; padding-bottom: 0; margin-top: 0; } }
 @keyframes motion-from-right { from { opacity: 0; transform: translateX(16px); } }

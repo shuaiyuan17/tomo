@@ -12,19 +12,60 @@ export function appendedIds(known: ReadonlySet<string>, ids: readonly string[]):
   return new Set(ids.filter((id, index) => index > lastKnown && !known.has(id)));
 }
 
+/** The entrance's length: `--motion-enter` in styles.css (a test keeps the two equal). */
+export const ENTER_MS = 180;
+
 /**
- * The ids to animate in this render: appended since the list was first
- * shown for `scope` (a session, a panel). The first non-empty render, and
- * every change of scope, animates nothing.
+ * For an element that takes over from one already rising in (a streamed reply
+ * block, replaced by the recorded message): the `animation-delay` (negative)
+ * that carries the entrance on from where the first one was, or null when
+ * that entrance is over and the new element should just be there.
+ */
+export function resumeDelay(shownAt: number, now: number, duration = ENTER_MS): number | null {
+  const elapsed = Math.max(0, now - shownAt);
+  return elapsed < duration ? 0 - Math.round(elapsed) : null;
+}
+
+/** How long an id stays "appeared": longer than any entrance (see the `--motion-*` durations in styles.css). */
+export const APPEARED_HOLD_MS = 400;
+
+/** The ids that appeared less than `hold` ms before `now`. */
+export function heldIds(appearedAt: ReadonlyMap<string, number>, now: number, hold = APPEARED_HOLD_MS): string[] {
+  return [...appearedAt].filter(([, at]) => now - at < hold).map(([id]) => id);
+}
+
+/**
+ * The ids to animate: appended since the list was first shown for `scope`
+ * (a session, a panel). The first non-empty render, and every change of
+ * scope, animates nothing.
+ *
+ * An id stays in the set for APPEARED_HOLD_MS, not for one render: the
+ * entrance class must outlive the renders that follow at once (a streamed
+ * block, a status tick), or the animation is cut off as it starts. Then it
+ * leaves (one re-render), so an element shown again later (a hidden page
+ * coming back) does not play it a second time.
  */
 export function useAppeared(ids: readonly string[], scope: string, ready = true): Set<string> {
-  const known = useRef<{ scope: string; ids: Set<string> } | null>(null);
-  const fresh = !ready || !known.current || known.current.scope !== scope ? new Set<string>() : appendedIds(known.current.ids, ids);
+  const known = useRef<{ scope: string; ids: Set<string>; appearedAt: Map<string, number> } | null>(null);
+  const [, rerender] = useState(0);
+  const sameScope = ready && known.current?.scope === scope ? known.current : null;
+  const fresh = sameScope ? appendedIds(sameScope.ids, ids) : new Set<string>();
+  if (sameScope) for (const id of heldIds(sameScope.appearedAt, performance.now())) fresh.add(id);
+  const timers = useRef(new Set<ReturnType<typeof setTimeout>>());
   useEffect(() => {
     if (!ready) return;
-    if (!known.current || known.current.scope !== scope) known.current = { scope, ids: new Set(ids) };
-    else for (const id of ids) known.current.ids.add(id);
+    if (!known.current || known.current.scope !== scope) { known.current = { scope, ids: new Set(ids), appearedAt: new Map() }; return; }
+    const { ids: seen, appearedAt } = known.current;
+    const now = performance.now();
+    for (const [id, at] of appearedAt) if (now - at >= APPEARED_HOLD_MS) appearedAt.delete(id);
+    const added = appendedIds(seen, ids);
+    for (const id of ids) seen.add(id);
+    if (!added.size) return;
+    for (const id of added) appearedAt.set(id, now);
+    const timer = setTimeout(() => { timers.current.delete(timer); rerender((n) => n + 1); }, APPEARED_HOLD_MS + 20);
+    timers.current.add(timer);
   });
+  useEffect(() => { const all = timers.current; return () => { for (const timer of all) clearTimeout(timer); all.clear(); }; }, []);
   return fresh;
 }
 

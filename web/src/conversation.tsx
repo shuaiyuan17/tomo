@@ -5,13 +5,13 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { Mark } from "./app-header.js";
 import { ChatRow, ChatScroller, type ChatScrollerHandle } from "./chat-scroller.js";
-import { chatRows, rowId } from "./chat-rows.js";
+import { awaitingOutput, chatRows, rowId } from "./chat-rows.js";
 import { Composer, type ComposerHandle } from "./composer.js";
-import { DayDivider, LiveReply, parseHistory, PendingMessage, RecordedMessage, type RowActions, type SentAttachments } from "./conversation-rows.js";
+import { DayDivider, HistorySkeleton, LiveReply, parseHistory, PendingMessage, RecordedMessage, ThinkingDots, type RowActions, type SentAttachments } from "./conversation-rows.js";
 import { blockKey, interleave, messageKey, pendingKey, type ToolBlock } from "./inline-tools.js";
 import { trapTab } from "./layers.js";
 import { dayDividers } from "./message-meta.js";
-import { useAppeared } from "./motion.js";
+import { resumeDelay, useAppeared } from "./motion.js";
 import { pendingUserMessages, recordedReplyIds } from "./pending.js";
 import { collectReactions, type ShownReaction } from "./reactions.js";
 import { ToolsUnreadableNote, TurnBlock } from "./tool-calls.js";
@@ -127,12 +127,43 @@ export function Conversation({ web, agent, session, sessionId, ownerConversation
   // Who reacted to what: recorded tapbacks, this page's pending ones, and Tomo's (kept by the daemon).
   const reactions = useMemo(() => collectReactions(history.messages, pendingUserMessages(web.requests, history, sessionId), web.reactions, group),
     [history, web.requests, web.reactions, sessionId, group]);
-  // New messages rise in as they arrive (not on load). Web-sent ones were
-  // already shown as a pending bubble / streamed block, so they don't again.
-  const appeared = useAppeared(history.messages.map((m) => m.id), sessionId, historyStatus === "ready");
   // Rows of the scroller (see chat-rows.ts); the running turn's calls and reply ride in the last one.
   const rows = chatRows(timeline.entries, pendingUsers, timeline.trailing.length > 0 || blocks.length > 0);
+  // Until the running turn shows a step or a word, dots hold its place under the last message
+  // (they ride in its row and never make one: an empty conversation keeps its greeting).
+  const thinking = historyStatus !== "loading" && awaitingOutput(turnActive, timeline.trailing.length, blocks.length);
   // A day divider rides at the top of the row it introduces (rows only grow at their ends; see chat-rows.ts).
+  // New rows and new reply blocks rise in as they arrive; what the conversation opened with (a load, a
+  // reload, "Load earlier") never does. The entrance is the ROW's: a sent message keeps its row from
+  // pending bubble to recorded message, so recording it mid-rise swaps the bubble inside, not the animation.
+  const settled = historyStatus === "ready" || historyStatus === "loading-older";
+  const scope = `${sessionId}:${history.revision ?? ""}`; // A rewritten history is a fresh transcript (as for the scroller below).
+  const appearedRows = useAppeared(rows.map((row) => row.id), scope, settled);
+  const appearedBlocks = useAppeared(blocks.map((block) => block.id), scope, settled);
+  // A reply that was shown streaming in does not rise a second time when it is recorded: the recorded
+  // message carries on the entrance its first block began (often still under way: a short reply is
+  // recorded a moment after its block shows), or is simply there once that is over. One recorded
+  // before any block of it was shown rises as any new message does.
+  // A turn's blocks share one key, and the FIRST block's time is the one kept: resuming from a later
+  // block's would fade the whole recorded message, earlier blocks included, a second time. So a late
+  // block still rising when the turn is recorded ends its rise there (it is simply shown).
+  const streamed = useRef({ scope, shownAt: new Map<string, number>(), resumed: new Map<string, number | null>() });
+  if (streamed.current.scope !== scope) streamed.current = { scope, shownAt: new Map(), resumed: new Map() };
+  const liveKeys = blocks.map(blockKey).join("\n");
+  useEffect(() => {
+    const { shownAt } = streamed.current;
+    for (const key of liveKeys ? liveKeys.split("\n") : []) if (!shownAt.has(key)) shownAt.set(key, performance.now());
+  }, [liveKeys, scope]); // `scope`: a rewritten history starts the record afresh while a block may still be showing.
+  /** A row's entrance: undefined for none, else its animation-delay in ms (0, or negative to carry one on). */
+  const entrance = (row: (typeof rows)[number]): number | undefined => {
+    if (!appearedRows.has(row.id)) return undefined;
+    const shownAt = row.kind === "message" && row.message.role === "assistant" ? streamed.current.shownAt.get(row.key) : undefined;
+    if (shownAt === undefined) return 0;
+    // Decided once, when the row first renders: the delay must not move while the animation runs.
+    const { resumed } = streamed.current;
+    if (!resumed.has(row.id)) resumed.set(row.id, resumeDelay(shownAt, performance.now()));
+    return resumed.get(row.id) ?? undefined;
+  };
   const dividers = dayDividers(rows.map((row) => row.kind === "message" ? { at: row.message.timestamp } : { at: row.kind === "pending" ? row.request.timestamp : undefined, late: true }));
 
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
@@ -159,37 +190,37 @@ export function Conversation({ web, agent, session, sessionId, ownerConversation
     {web.bootstrap?.setupRequired && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert"><Trans ns="chat" i18nKey="notice.setup" components={{ code: <code /> }} /></div>}
     {web.connection === "locked" && <div className={cn(notice, "mx-auto mb-4 w-full max-w-[740px]")} role="alert"><Trans ns="chat" i18nKey="notice.locked" components={{ code: <code /> }} /></div>}
     {/* A conversation (and a rewritten history) opens afresh: at its last turn. */}
-    <ChatScroller key={`${sessionId}:${history.revision ?? ""}`} handle={scroller} busy={turnActive} lastRowId={rows.at(-1)?.id}
+    <ChatScroller key={scope} handle={scroller} busy={turnActive} lastRowId={rows.at(-1)?.id}
       keys={[...history.messages.map(messageKey), ...pendingUsers.map(pendingKey), ...blocks.map(blockKey)]} top={<>
       {history.nextCursor && <Button variant="outline" size="sm" className="mx-auto mb-6 flex rounded-full text-xs" onClick={() => void loadOlder()} disabled={historyStatus === "loading-older"}>{historyStatus === "loading-older" ? i18n.t("common:state.loading") : i18n.t("chat:history.earlier")}</Button>}
       {!tools.complete && <p className="mx-auto mb-4 max-w-[740px] text-center text-[11.5px] text-muted-foreground" role="note">{i18n.t("chat:history.olderTools")}</p>}
       {tools.unreadable && <ToolsUnreadableNote />}
       {historyStatus === "error" && <div className={cn(notice, "mx-auto mb-4 flex max-w-[740px] items-center gap-3")} role="alert">{i18n.t("chat:history.unavailable")} <Button variant="outline" size="sm" className="rounded-lg" onClick={reload}>{i18n.t("home:retry")}</Button></div>}
-      {historyStatus === "loading" && sessionId && <p className="text-center text-sm text-muted-foreground" role="status">{i18n.t("chat:history.opening")}</p>}
+      {historyStatus === "loading" && sessionId && <HistorySkeleton label={i18n.t("chat:history.opening")} />}
       {historyStatus === "ready" && history.messages.length === 0 && blocks.length === 0 && pendingUsers.length === 0 && <div className="m-auto flex h-full min-h-56 max-w-md flex-col items-center justify-center pb-12 text-center"><Mark className="mb-4 size-16 stroke-[1.3]" /><h2 className="mt-2 mb-3 font-serif text-[28px] font-normal">{i18n.t("chat:empty.heading")}</h2><p className="m-0 max-w-80 text-sm text-muted-foreground">{group ? i18n.t("chat:empty.group") : i18n.t("chat:empty.body")}</p></div>}
       {/* The first shown row's day, outside the rows: on "Load earlier" only its text changes. */}
       {dividers.first && <DayDivider label={dividers.first} />}
       </>}>
-      {rows.map((row, rowIndex) => <ChatRow key={row.id} row={row}>
-        {row.kind === "message" && <>
-          {row.tools.map((block) => toolBlock(block, false))}
-          {(() => {
+      {rows.map((row, rowIndex) => { const delay = entrance(row); return <ChatRow key={row.id} row={row}>
+        {row.kind === "message" && row.tools.map((block) => toolBlock(block, false))}
+        {/* One element from pending bubble to recorded message: the entrance plays once, through the swap. */}
+        {row.kind !== "live" && <div data-slot="message-entrance" className={delay === undefined ? undefined : "motion-enter"} style={delay ? { animationDelay: `${delay}ms` } : undefined}>
+          {row.kind === "pending" ? pending(row.request) : (() => {
             const { message } = row;
             const index = messageIndex.get(message.id)!;
             const request = message.requestId ? requestById.get(message.requestId) : undefined;
             return <RecordedMessage message={message} parsed={parsed[index].parsed} quotedId={parsed[index].quotedId} request={request}
               reactions={reactions.get(message.id) ?? NO_REACTIONS} afterTapback={!!parsed[index - 1]?.parsed.tapback}
-              enter={appeared.has(message.id) && !requestById.has(message.requestId ?? "")} flash={flashId === message.id}
+              flash={flashId === message.id}
               confirming={!!message.requestId && confirmDismiss === message.requestId} {...rowProps} />;
-          })()}
-        </>}
-        {row.kind === "pending" && pending(row.request)}
+          })()}</div>}
         {rowIndex === rows.length - 1 && <>
           {timeline.trailing.map((block) => toolBlock(block, turnActive))}
-          {blocks.map((block) => <LiveReply key={block.id} block={block} agent={agent} sessionId={sessionId} />)}
+          {blocks.map((block) => <LiveReply key={block.id} block={block} enter={appearedBlocks.has(block.id)} agent={agent} sessionId={sessionId} />)}
+          {thinking && <ThinkingDots />}
         </>}
         {/* A change of day: at the END of the earlier row, so no row ever changes at its top. */}
-        {dividers.after[rowIndex] && <DayDivider label={dividers.after[rowIndex]!} />}</ChatRow>)}
+        {dividers.after[rowIndex] && <DayDivider label={dividers.after[rowIndex]!} />}</ChatRow>; })}
     </ChatScroller>
     <Composer handle={composer} web={web} session={session} sessionId={sessionId} agent={agent} latest={latest} turnActive={turnActive}
       canAttach={canAttach} uploadsOn={uploadsOn} filesOn={filesOn} claim={(key) => scroller.current?.claim(key)} onAccepted={reload}

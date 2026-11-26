@@ -26,7 +26,7 @@ export const notices = {
     hookCallbackFailed: "⚠️ {{session}} 里有一个 Tomo 钩子执行失败，它负责的检查可能没有生效。Claude Code 的原话：{{text}}",
     settingsNotInEffect: "⚠️ Tomo 传给 Claude Code 的部分设置在 {{session}} 里没有生效。Claude Code 的原话：{{text}}",
   },
-  pendingNotesQuarantined_other: "⚠️ Tomo 读不了待处理笔记文件（sessions/_pending_notes.json），已把它原样改名（{{count}} 份：{{files}}），并新建了一个。已完成任务的报告已按任务记录重新写入；其他排着的笔记（比如要补发的消息）不会再送达。旧文件留着，可以去看。",
+  pendingNotesQuarantined_other: "⚠️ Tomo 读不了待处理笔记文件，已把它原样移到一边（{{count}} 份：{{files}}），并新建了一个。里面的笔记没有送达。可以让我读一下这个文件，把还要紧的补发。",
   imsgLaneBlocked: "⚠️ iMessage 一直拒绝发送（imsg rpc 错误 -32004，mutation lane blocked）。Tomo 在过去 {{minutes}} 分钟里已重启 imsg rpc 进程 {{restarts}} 次，现在暂停重启，在它恢复之前 iMessage 的回复可能会失败。可以先看看 `imsg status`；重启 Messages.app 或 Tomo 通常能解决。",
   mcpDown: "⚠️ MCP 服务器“{{server}}”挂了：连续 {{failures}} 次重连失败。重新连上之前，它的工具都用不了。可以试试 /mcp reconnect {{server}}（或在 web 的 MCP 页面点“重新连接”），或用 /new 开一个新的 session。",
   mcpOAuth: {

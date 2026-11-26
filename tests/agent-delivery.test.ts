@@ -262,7 +262,7 @@ describe("delivery failures and shutdown", () => {
     const fresh = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
     const key = "imessage:iMessage;-;+15551112222";
     const notes = fresh.getPendingNotes(key);
-    expect(notes.some((n) => n.text.includes("delivery failed") && n.text.includes("the reply"))).toBe(true);
+    expect(notes.some((n) => n.includes("delivery failed") && n.includes("the reply"))).toBe(true);
     const assistant = fresh.get(key).messages.filter((m) => m.role === "assistant").map((m) => m.content);
     expect(assistant).toEqual(["[delivery failed] the reply"]);
 

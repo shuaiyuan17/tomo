@@ -18,55 +18,9 @@ export function renameIfPresent(from: string, to: string): boolean {
   }
 }
 
-/** One durable prompt note. `id` is unique within its session's list and
- *  never derived from `text`: two notes that read the same are two notes. */
-export interface PendingNote {
-  id: string;
-  text: string;
-}
-
-/** `_pending_notes.json`. Version 1 (a list of strings per session) is still
- *  read; it is written as version 2 from the next write on. */
 export interface PendingNotesFile {
-  version: 2;
-  notes: Record<string, PendingNote[]>;
-}
-
-/**
- * Read `_pending_notes.json` bytes. Throws on anything that does not read in
- * full: bytes that are not UTF-8 (decoded strictly, so nothing is repaired
- * into a different note), not JSON, the wrong shape, or any row that is not
- * a list of notes. Version 1 rows (strings) get ids derived from the session
- * key and position, so reading the same file twice gives the same ids.
- */
-export function parsePendingNotesFile(raw: Buffer): Record<string, PendingNote[]> {
-  const parsed: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw));
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("pending notes: not an object");
-  const { version, notes } = parsed as { version?: unknown; notes?: unknown };
-  if (!notes || typeof notes !== "object" || Array.isArray(notes)) throw new Error("pending notes: no notes object");
-  const out: Record<string, PendingNote[]> = {};
-  for (const [key, row] of Object.entries(notes)) {
-    if (!Array.isArray(row)) throw new Error(`pending notes: row ${key} is not a list`);
-    if (version === 2) {
-      const ids = new Set<string>();
-      out[key] = row.map((note: unknown) => {
-        const { id, text } = (note ?? {}) as { id?: unknown; text?: unknown };
-        if (typeof id !== "string" || id === "" || typeof text !== "string" || ids.has(id)) {
-          throw new Error(`pending notes: bad note in row ${key}`);
-        }
-        ids.add(id);
-        return { id, text };
-      });
-    } else if (version === 1 || version === undefined) {
-      out[key] = row.map((text: unknown, i) => {
-        if (typeof text !== "string") throw new Error(`pending notes: bad note in row ${key}`);
-        return { id: `v1:${key}:${i}`, text };
-      });
-    } else {
-      throw new Error("pending notes: unknown version");
-    }
-  }
-  return out;
+  version: 1;
+  notes: Record<string, string[]>;
 }
 
 /**

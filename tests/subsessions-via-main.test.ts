@@ -63,7 +63,6 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: OnTurn = () => ({ 
   } as unknown as H;
   // A fresh process reads the notes from disk.
   for (const [k, v] of h.disk) h.notes.set(k, [...v]);
-  const noteIds = new Map<string, string>();
   // The registry and SDK sessions outlive a restart when shared.
   const sdk = shared?.sdk ?? new Set<string>();
   const registry = sdk;
@@ -79,13 +78,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: OnTurn = () => ({ 
     sendToScope: async (parentKey, text) => { h.sent.push({ parentKey, text }); return { ok: true }; },
     noticeToScope: async () => {},
     noticeOwner: async () => {},
-    queuePendingNote: (key, note, id) => {
-      // As the real queue: a note with the same id already held is written again, not added.
-      if (id !== undefined && (h.notes.get(key) ?? []).some((n) => noteIds.get(n) === id)) {
-        h.disk.set(key, [...(h.notes.get(key) ?? [])]);
-        return true;
-      }
-      if (id !== undefined) noteIds.set(note, id);
+    queuePendingNote: (key, note) => {
       h.notes.set(key, [...(h.notes.get(key) ?? []), note]);
       h.duringNoteWrite?.();
       if (h.noteWriteFails > 0) { h.noteWriteFails -= 1; return false; }
@@ -103,11 +96,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: OnTurn = () => ({ 
       return false;
     },
     hasPendingNote: (key, pred) => (h.notes.get(key) ?? []).some(pred),
-    persistPendingNotes: (key) => {
-      if (h.noteWriteFails > 0) { h.noteWriteFails -= 1; return false; }
-      h.disk.set(key, [...(h.notes.get(key) ?? [])]);
-      return true;
-    },
+    persistPendingNotes: () => true,
     wakeScope: () => {},
     messageWake: (key) => { h.messageWakes.push(key); },
     contextUsage: () => undefined,
@@ -508,8 +497,8 @@ describe("via-main: nothing lost, nothing twice", () => {
 
   it("the message note is pinned: the pending-notes cap never drops it", async () => {
     const { PendingNotesQueue } = await import("../src/agent/pending-notes-queue.js");
-    const saved = new Map<string, Array<{ id: string; text: string }>>();
-    const q = new PendingNotesQueue({ getPendingNotes: (k: string) => saved.get(k) ?? [], setPendingNotes: (k: string, n: Array<{ id: string; text: string }>) => { saved.set(k, n); } });
+    const saved = new Map<string, string[]>();
+    const q = new PendingNotesQueue({ getPendingNotes: (k: string) => saved.get(k) ?? [], setPendingNotes: (k: string, n: string[]) => { saved.set(k, n); } } as never);
     q.queueNote("dm:owner", '<tomo-event type="subsession-message" name="s1:1-1" ts="x">keep me</tomo-event>');
     for (let i = 0; i < 200; i++) q.queueNote("dm:owner", `<tomo-event type="note" name="n${i}" ts="x">filler</tomo-event>`);
     expect(q.peekNotes("dm:owner").some((n) => n.includes("keep me"))).toBe(true);
@@ -518,7 +507,7 @@ describe("via-main: nothing lost, nothing twice", () => {
     q.queueNote("dm:owner", note);
     expect(q.withdrawNote("dm:owner", (n) => n.includes('name="s1:2-2"'))).toBe(true);
     expect(q.peekNotes("dm:owner").some((n) => n.includes("withdraw me"))).toBe(false);
-    expect(saved.get("dm:owner")!.some((n) => n.text.includes("withdraw me"))).toBe(false);
+    expect(saved.get("dm:owner")!.some((n) => n.includes("withdraw me"))).toBe(false);
   });
 
   it("the same words handed over again while the first note is unread add no second note (a retried turn)", async () => {
@@ -1064,73 +1053,5 @@ describe("via-main: nothing lost, nothing twice", () => {
     await flush();
     expect(n).toBe(2);
     expect(messageNotes(h, "dm:owner").filter((x) => x.includes("Yes"))).toHaveLength(2);
-  });
-});
-
-describe("via-main: a lost pending notes file", () => {
-  const lostLine = "may already have been told";
-
-  it("writes the question a task still waits on again, under the name its wait holds", async () => {
-    const h = harness({}, sayOnFirstTurn("ask", "Merge PR #12 now?"));
-    h.service.start();
-    const t = spawn(h);
-    await flush();
-    const asked = h.store.get(t.id)!.askViaMain;
-    expect(asked?.note).toBeDefined();
-    // The file is moved aside: nothing of it is left.
-    h.notes.clear();
-    h.disk.clear();
-    expect(h.service.rebuildLostNotes()).toBe(true);
-    const notes = messageNotes(h, "dm:owner");
-    expect(notes).toHaveLength(1);
-    expect(notes[0]).toContain("Merge PR #12 now?");
-    expect(notes[0]).toContain(`name="${asked!.note}"`);
-    expect(notes[0]).toContain(lostLine);
-  });
-
-  it("writes every message no turn of the owning session read again: the same words twice are two, a read one is not", async () => {
-    const h = harness({}, async (key, prompt, hh) => {
-      if (prompt.includes("subsession-start")) {
-        await hh.service.notify(key, "tests pass");
-        await hh.service.notify(key, "tests pass");
-        await hh.service.notify(key, "READ ALREADY");
-      }
-      return { ok: true };
-    });
-    h.service.start();
-    const t = spawn(h);
-    await flush();
-    const sent = h.store.get(t.id)!.sent;
-    expect(sent.map((m) => m.text)).toEqual(["tests pass", "tests pass", "READ ALREADY"]);
-    h.service.notesRead([sent[2].noteId!]);
-    h.notes.clear();
-    h.disk.clear();
-    expect(h.service.rebuildLostNotes()).toBe(true);
-    const notes = messageNotes(h, "dm:owner");
-    expect(notes.filter((n) => n.includes("tests pass") && n.includes(lostLine))).toHaveLength(2);
-    expect(notes.some((n) => n.includes("READ ALREADY"))).toBe(false);
-  });
-
-  it("adds no second copy of a message note still held in memory, so taking the question back leaves none", async () => {
-    const h = harness({}, async (key, prompt, hh) => {
-      if (prompt.includes("subsession-start")) {
-        await hh.service.notify(key, "build is green");
-        await hh.service.ask(key, "Merge PR #12 now?");
-      }
-      return { ok: true };
-    });
-    h.service.start();
-    const t = spawn(h);
-    await flush();
-    expect(messageNotes(h, "dm:owner")).toHaveLength(2);
-    // Only the file is moved aside: the notes held in memory are written to the fresh file as they are.
-    h.disk.clear();
-    expect(h.service.rebuildLostNotes()).toBe(true);
-    expect(messageNotes(h, "dm:owner")).toHaveLength(2);
-    expect((h.disk.get("dm:owner") ?? []).filter((n) => n.includes("subsession-message"))).toHaveLength(2);
-    // The owner writes to the task directly: the question is taken back, and no copy of it stays.
-    expect(h.service.ownerMessage("dm:owner", t.id, "hold off for now").ok).toBe(true);
-    await flush();
-    expect(messageNotes(h, "dm:owner").some((n) => n.includes("Merge PR #12 now?"))).toBe(false);
   });
 });

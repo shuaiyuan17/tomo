@@ -17,10 +17,6 @@ interface Harness {
   turns: Turn[];
   cron: Map<string, number>;
   notes: Map<string, string[]>;
-  /** The id each queued note was given, in the same order as `notes`. */
-  noteIds: Map<string, Array<string | undefined>>;
-  /** A moved-aside notes file is not recovered yet (pendingNotesRecovering). */
-  recovering: boolean;
   sent: Array<{ parentKey: string; text: string }>;
   notices: Array<{ to: string; text: string }>;
   wakes: string[];
@@ -77,8 +73,6 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
     turns: [] as Turn[],
     cron: new Map<string, number>(),
     notes: new Map<string, string[]>(),
-    noteIds: new Map<string, Array<string | undefined>>(),
-    recovering: false,
     sent: [] as Array<{ parentKey: string; text: string }>,
     notices: [] as Array<{ to: string; text: string }>,
     wakes: [] as string[],
@@ -120,9 +114,8 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
       if (h.ownerNotice === "unreachable") return false;
       h.notices.push({ to: "owner", text });
     },
-    queuePendingNote: (key, note, id) => {
+    queuePendingNote: (key, note) => {
       h.notes.set(key, [...(h.notes.get(key) ?? []), note]);
-      h.noteIds.set(key, [...(h.noteIds.get(key) ?? []), id]);
       if (h.noteWriteFails > 0) { h.noteWriteFails -= 1; return false; }
       return true;
     },
@@ -131,7 +124,6 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
       return true;
     },
     hasPendingNote: (key, pred) => (h.notes.get(key) ?? []).some(pred),
-    pendingNotesRecovering: () => h.recovering,
     wakeScope: (parentKey) => { h.wakes.push(parentKey); h.wakeSawDelivered.push(h.store.list().some((t) => t.parentKey === parentKey && t.reportDelivered)); },
     contextUsage: (key) => h.context.get(key),
     cronJobCount: (key) => { h.onCronCount?.(key); return h.cronUnknown ? undefined : h.cron.get(key) ?? 0; },
@@ -1154,74 +1146,6 @@ describe("SubsessionService start: restart recovery and reconcile", () => {
     h.service.start();
     expect(h.wakes).toEqual(["dm:owner"]);
     expect(h.notes.get("dm:owner")).toHaveLength(1);
-  });
-
-  it("writes a finished task's report note again from the record after the notes file was lost, and wakes once", async () => {
-    const h = harness();
-    const a = seed(h, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
-    const b = seed(h, "finished", (s, i) => s.update(i, (r) => {
-      r.reportDelivered = true;
-      r.earlierReports = [{ seq: 1, text: "EARLIER", noted: true }];
-      r.reportSeq = 2;
-    }));
-    h.service.start();
-    expect(h.wakes).toEqual([]);
-    expect(h.service.rebuildLostNotes()).toBe(true);
-    await flush();
-    const notes = h.notes.get("dm:owner") ?? [];
-    expect(notes.filter((n) => n.includes(`name="${a}#1"`))).toHaveLength(1);
-    expect(notes.filter((n) => n.includes(`name="${b}#2"`))).toHaveLength(1);
-    expect(notes.filter((n) => n.includes(`name="${b}#1"`) && n.includes("EARLIER"))).toHaveLength(1);
-    expect(notes.every((n) => n.includes("may already have been told"))).toBe(true);
-    expect(h.wakes).toEqual(["dm:owner"]);
-    expect(h.noteIds.get("dm:owner")).toEqual(expect.arrayContaining([`subsession-report:${a}#1`, `subsession-report:${b}#2`, `subsession-report:${b}#1`]));
-    expect(h.store.get(a)?.reportDelivered).toBe(true);
-    expect(h.store.get(b)?.earlierReports?.[0].noted).toBe(true);
-  });
-
-  it("answers false while a lost note is not on disk, changing no record, and writes it on the next try", async () => {
-    const h = harness();
-    const id = seed(h, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
-    h.service.start();
-    h.noteWriteFails = 1;
-    expect(h.service.rebuildLostNotes()).toBe(false);
-    await flush();
-    expect(h.wakes).toEqual([]);
-    // Nothing on the record moved: the next try picks the same report up.
-    expect(h.store.get(id)?.reportDelivered).toBe(true);
-    expect(h.service.rebuildLostNotes()).toBe(true);
-    expect(h.noteIds.get("dm:owner")).toEqual([`subsession-report:${id}#1`, `subsession-report:${id}#1`]);
-  });
-
-  it("cleans up nothing while a moved-aside notes file is not recovered", () => {
-    const h = harness();
-    const id = seed(h, "finished", (s, i) => s.update(i, (r) => {
-      r.reportDelivered = true;
-      r.endedAt = Date.now() - FINISHED_KEEP_MS - 60_000;
-    }));
-    h.recovering = true;
-    h.service.start();
-    expect(h.store.get(id)?.status).toBe("finished");
-    h.recovering = false;
-    (h.service as unknown as { sweep(): void }).sweep();
-    expect(h.store.get(id)?.status).toBe("archived");
-  });
-
-  it("writes nothing again before recovery has read the table", () => {
-    const h = harness();
-    seed(h, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
-    expect(h.service.rebuildLostNotes()).toBe(false);
-    expect(h.notes.get("dm:owner")).toBeUndefined();
-  });
-
-  it("keeps an earlier report at a finish while a moved-aside notes file is not recovered", async () => {
-    const h = harness();
-    const id = seed(h, "active", (s, i) => s.update(i, (r) => { r.report = "FIRST"; r.reportSeq = 1; r.reportDelivered = true; }));
-    h.service.start();
-    await flush();
-    h.recovering = true;
-    h.service.finish(`task:${id}`, "SECOND");
-    expect(h.store.get(id)?.earlierReports?.map((e) => e.text)).toContain("FIRST");
   });
 
   it("does not wake for a delivered report the owning session already read", () => {
@@ -2866,30 +2790,6 @@ describe("SubsessionService: a failed task hands back what it never answered", (
     // The owning session's note says the same.
     expect((h.notes.get("dm:owner") ?? []).at(-1)).toContain("use the staging database, not prod");
     expect(h.store.get(t.id)?.handedBack).toBe(true);
-  });
-
-  it("hands the unanswered messages back again after the notes file was lost, until it is on disk", async () => {
-    const h = harness();
-    h.service.start();
-    const t = spawn(h);
-    await flush();
-    h.onTurn = () => new Promise(() => {});
-    h.sdk.delete(t.sessionKey);
-    expect(h.service.relay(t.id, "use the staging database", said("use the staging database")).ok).toBe(true);
-    await flush();
-    expect(h.store.get(t.id)?.handedBack).toBe(true);
-    h.notes.clear();
-    h.wakes.length = 0;
-    h.noteWriteFails = 1;
-    expect(h.service.rebuildLostNotes()).toBe(false);
-    expect(h.store.get(t.id)?.handedBack).toBe(true);
-    h.notes.clear();
-    expect(h.service.rebuildLostNotes()).toBe(true);
-    await flush();
-    const notes = h.notes.get("dm:owner") ?? [];
-    expect(notes.filter((n) => n.includes("subsession-handback") && n.includes("use the staging database"))).toHaveLength(1);
-    expect(h.noteIds.get("dm:owner")).toContain(`subsession-handback:${t.id}`);
-    expect(h.wakes).toEqual(["dm:owner"]);
   });
 
   it("hands every unanswered message back in full, in a pinned note; the record is forgotten only once that note is written", async () => {

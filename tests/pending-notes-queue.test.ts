@@ -1,30 +1,19 @@
 import { describe, expect, it } from "vitest";
 import { INTERRUPTED_NOTE_MARKER, PendingNotesQueue, type DurablePendingNotesStore } from "../src/agent/pending-notes-queue.js";
-import type { PendingNote } from "../src/sessions/store.js";
 
 class MemoryPendingNotesStore implements DurablePendingNotesStore {
-  rows = new Map<string, PendingNote[]>();
+  notes = new Map<string, string[]>();
 
-  getPendingNotes(key: string): PendingNote[] {
-    return (this.rows.get(key) ?? []).map((n) => ({ ...n }));
+  getPendingNotes(key: string): string[] {
+    return [...(this.notes.get(key) ?? [])];
   }
 
-  setPendingNotes(key: string, notes: PendingNote[]): void {
+  setPendingNotes(key: string, notes: string[]): void {
     if (notes.length === 0) {
-      this.rows.delete(key);
+      this.notes.delete(key);
     } else {
-      this.rows.set(key, notes.map((n) => ({ ...n })));
+      this.notes.set(key, [...notes]);
     }
-  }
-
-  /** Store these notes as they would be on disk: each its own id (or the one given). */
-  seed(key: string, texts: string[], ids?: string[]): void {
-    this.rows.set(key, texts.map((text, i) => ({ id: ids?.[i] ?? `seed-${i}`, text })));
-  }
-
-  /** The stored notes' texts, in order. */
-  texts(key: string): string[] {
-    return (this.rows.get(key) ?? []).map((n) => n.text);
   }
 }
 
@@ -39,17 +28,17 @@ describe("PendingNotesQueue", () => {
 
     expect(queue.peekNotes("telegram:-987")).toHaveLength(15);
     expect(queue.peekNotes("telegram:-987")[0]).toBe("note-5");
-    expect(store.texts("telegram:-987").at(-1)).toBe("note-19");
+    expect(store.getPendingNotes("telegram:-987").at(-1)).toBe("note-19");
 
     const drained = queue.drain("telegram:-987");
     expect(drained).toContain("note-5");
     expect(drained).toContain("note-19");
     expect(queue.drain("telegram:-987")).toBe("");
     // Still on disk while the turn that took them runs…
-    expect(store.texts("telegram:-987")).toHaveLength(15);
+    expect(store.getPendingNotes("telegram:-987")).toHaveLength(15);
     queue.settle("telegram:-987", drained);
     // …and gone once it has ended.
-    expect(store.texts("telegram:-987")).toEqual([]);
+    expect(store.getPendingNotes("telegram:-987")).toEqual([]);
   });
 
   it("keeps drained notes durable until their turn settles, alongside notes queued meanwhile", () => {
@@ -59,14 +48,14 @@ describe("PendingNotesQueue", () => {
     const drained = queue.drain("k");
     queue.queueNote("k", "during");
     // In flight it is stored already marked as possibly partly answered.
-    expect(store.texts("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nbefore`, "during"]);
+    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nbefore`, "during"]);
 
     // A crash here: the next process sees both and delivers both.
     const next = new PendingNotesQueue(store);
     expect(next.drain("k")).toContain("before");
 
     queue.settle("k", drained);
-    expect(store.texts("k")).toEqual(["during"]);
+    expect(store.getPendingNotes("k")).toEqual(["during"]);
   });
 
   it("restoreInterrupted puts a taken-but-unfinished batch back, marked", () => {
@@ -75,7 +64,7 @@ describe("PendingNotesQueue", () => {
     queue.queueNote("k", "n1");
     const drained = queue.drain("k");
     queue.restoreInterrupted("k", drained);
-    expect(store.texts("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nn1`]);
+    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nn1`]);
     const again = queue.drain("k");
     expect(again.startsWith(INTERRUPTED_NOTE_MARKER)).toBe(true);
     expect(again.split(INTERRUPTED_NOTE_MARKER)).toHaveLength(2);
@@ -87,7 +76,7 @@ describe("PendingNotesQueue", () => {
     queue.queueNote("k", "n1");
     const drained = queue.drain("k");
     queue.restore("k", drained);
-    expect(store.texts("k")).toEqual(["n1"]);
+    expect(store.getPendingNotes("k")).toEqual(["n1"]);
     expect(queue.drain("k")).toContain("n1");
   });
 
@@ -129,7 +118,7 @@ describe("PendingNotesQueue", () => {
     }
 
     // The durable store only ever holds the one real note, marked once.
-    expect(store.texts("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nn1`]);
+    expect(store.getPendingNotes("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nn1`]);
 
     const next = queue.drain("k");
     expect(next.match(/<tomo-event type="errors"/g)).toHaveLength(1);
@@ -148,7 +137,7 @@ describe("PendingNotesQueue", () => {
     expect(drained).toContain("boom");
 
     queue.restoreInterrupted("k", drained);
-    expect(store.texts("k")).toEqual([]);
+    expect(store.getPendingNotes("k")).toEqual([]);
     expect(queue.peekNotes("k")).toEqual([]);
     expect(queue.drain("k")).toContain("boom");
   });
@@ -161,7 +150,7 @@ describe("PendingNotesQueue", () => {
     queue.queueError("k", "[error] boom");
     const drained = queue.drain("k");
     queue.restoreInterrupted("k", drained);
-    const stored = store.texts("k");
+    const stored = store.getPendingNotes("k");
     expect(stored).toHaveLength(1);
     expect(stored[0]).toContain("the message");
     expect(stored[0]).not.toContain('type="errors"');
@@ -175,10 +164,10 @@ describe("PendingNotesQueue", () => {
     const drained = queue.drain("k");
     queue.queueNote("k", "c");
     queue.restore("k", drained);
-    expect(store.texts("k")).toEqual(["a", "b", "c"]);
+    expect(store.getPendingNotes("k")).toEqual(["a", "b", "c"]);
     // A second put-back of the same prefix is a no-op, not a duplicate.
     queue.restore("k", drained);
-    expect(store.texts("k")).toEqual(["a", "b", "c"]);
+    expect(store.getPendingNotes("k")).toEqual(["a", "b", "c"]);
   });
   it("keeps every restored note when the queue filled up while the batch was in flight", () => {
     const store = new MemoryPendingNotesStore();
@@ -187,7 +176,7 @@ describe("PendingNotesQueue", () => {
     const drained = queue.drain("k");
     for (let i = 0; i < 15; i++) queue.queueNote("k", `new-${i}`);
     queue.restore("k", drained);
-    const stored = store.texts("k");
+    const stored = store.getPendingNotes("k");
     for (let i = 0; i < 15; i++) expect(stored).toContain(`old-${i}`);
     expect(stored[0]).toBe("old-0");
     expect(stored.at(-1)).toBe("new-14");
@@ -212,7 +201,7 @@ describe("PendingNotesQueue", () => {
     const errors = '<tomo-event type="errors" ts="x">\nRecent Tomo errors before this turn (newest last, capped):\n- [error] old-boom\n</tomo-event>';
     const inbox = '<tomo-event type="inbox" name="interrupted" ts="x">\nthe message\n</tomo-event>';
     const legacy = `${INTERRUPTED_NOTE_MARKER}\n${inbox}\n\n${errors}`;
-    store.seed("k", [legacy]);
+    store.setPendingNotes("k", [legacy]);
     const queue = new PendingNotesQueue(store);
 
     // Turns keep failing: the stored note comes back unchanged every time.
@@ -220,14 +209,14 @@ describe("PendingNotesQueue", () => {
       const drained = queue.drain("k");
       queue.queueError("k", `[error] new-${i}`);
       queue.restoreInterrupted("k", drained);
-      expect(store.texts("k")).toEqual([legacy]);
+      expect(store.getPendingNotes("k")).toEqual([legacy]);
     }
 
     // A turn that ends normally consumes it, errors block and all.
     const drained = queue.drain("k");
     expect(drained.match(/<tomo-event type="errors"/g)).toHaveLength(2);
     queue.settle("k", drained);
-    expect(store.texts("k")).toEqual([]);
+    expect(store.getPendingNotes("k")).toEqual([]);
     expect(queue.drain("k")).toBe("");
   });
 });
@@ -237,11 +226,11 @@ describe("PendingNotesQueue when the durable store fails", () => {
   class FlakyStore extends MemoryPendingNotesStore {
     failReads = false;
     failWrites = false;
-    override getPendingNotes(key: string): PendingNote[] {
+    override getPendingNotes(key: string): string[] {
       if (this.failReads) throw new Error("EIO: read");
       return super.getPendingNotes(key);
     }
-    override setPendingNotes(key: string, notes: PendingNote[]): void {
+    override setPendingNotes(key: string, notes: string[]): void {
       if (this.failWrites) throw new Error("ENOSPC: write");
       super.setPendingNotes(key, notes);
     }
@@ -253,251 +242,24 @@ describe("PendingNotesQueue when the durable store fails", () => {
     store.failWrites = true;
 
     expect(queue.queueNote("k", "n1")).toBe(false);
-    expect(store.texts("k")).toEqual([]);
+    expect(store.getPendingNotes("k")).toEqual([]);
     // This process still delivers it.
     expect(queue.peekNotes("k")).toEqual(["n1"]);
 
     expect(queue.persistNow("k")).toBe(false);
     store.failWrites = false;
     expect(queue.persistNow("k")).toBe(true);
-    expect(store.texts("k")).toEqual(["n1"]);
+    expect(store.getPendingNotes("k")).toEqual(["n1"]);
   });
 
-  it("an unreadable store: new notes still queue and drain, but the stored row is never written over", () => {
+  it("an unreadable store is read as empty: new notes still queue and drain", () => {
     const store = new FlakyStore();
-    store.seed("k", ["from disk"]);
+    store.notes.set("k", ["from disk"]);
     store.failReads = true;
     const queue = new PendingNotesQueue(store);
 
-    // Not persisted: writing the memory-only list would replace "from disk".
-    expect(queue.queueNote("k", "n1")).toBe(false);
-    expect(store.texts("k")).toEqual(["from disk"]);
+    expect(queue.queueNote("k", "n1")).toBe(true);
     expect(queue.drain("k")).toBe("n1\n\n");
-    expect(store.texts("k")).toEqual(["from disk"]);
-  });
-
-  it("once the store reads again, the stored notes come back ahead of the ones queued meanwhile", () => {
-    const store = new FlakyStore();
-    store.seed("k", ["from disk"]);
-    store.failReads = true;
-    const queue = new PendingNotesQueue(store);
-
-    expect(queue.queueNote("k", "n1")).toBe(false);
-    store.failReads = false;
-    expect(queue.queueNote("k", "n2")).toBe(true);
-    expect(store.texts("k")).toEqual(["from disk", "n1", "n2"]);
-    expect(queue.drain("k")).toBe("from disk\n\nn1\n\nn2\n\n");
-  });
-});
-
-describe("PendingNotesQueue while the stored notes cannot be read", () => {
-  class UnreadableStore extends MemoryPendingNotesStore {
-    failReads = true;
-    override getPendingNotes(key: string): PendingNote[] {
-      if (this.failReads) throw new Error("EIO: read");
-      return super.getPendingNotes(key);
-    }
-  }
-
-  it("hasNote answers the caller's whenUnreadable, unless the note is in memory", () => {
-    const store = new UnreadableStore();
-    store.seed("k", ["report s1#1"]);
-    const queue = new PendingNotesQueue(store);
-    const isReport = (n: string) => n.includes("s1#1");
-
-    expect(queue.hasNote("k", isReport)).toBe(false);
-    expect(queue.hasNote("k", isReport, true)).toBe(true);
-    queue.queueNote("k", "other");
-    expect(queue.hasNote("k", (n) => n === "other", false)).toBe(true);
-
-    store.failReads = false;
-    expect(queue.hasNote("k", isReport, false)).toBe(true);
-    expect(queue.hasNote("k", (n) => n === "missing", true)).toBe(false);
-  });
-
-  it("peekNotes does not throw, and a note queued again under its id meanwhile is kept once after the reload", () => {
-    const store = new UnreadableStore();
-    store.seed("k", ["report s1#1"], ["report:s1#1"]);
-    const queue = new PendingNotesQueue(store);
-
-    expect(queue.peekNotes("k")).toEqual([]);
-    expect(queue.queueNote("k", "report s1#1", "report:s1#1")).toBe(false);
-    store.failReads = false;
-    expect(queue.persistNow("k")).toBe(true);
-    expect(store.texts("k")).toEqual(["report s1#1"]);
-  });
-
-  it("a stored note whose copy (same id) is already in flight is not delivered again after settle", () => {
-    const store = new UnreadableStore();
-    store.seed("k", ["report s1#1"], ["report:s1#1"]);
-    const queue = new PendingNotesQueue(store);
-
-    queue.queueNote("k", "report s1#1", "report:s1#1");
-    const prefix = queue.drain("k");
-    store.failReads = false;
-    // The first touch once the store reads again is the settle itself.
-    queue.settle("k", prefix);
-
-    expect(store.texts("k")).toEqual([]);
-    expect(queue.drain("k")).toBe("");
-  });
-
-  it("the same holds when the batch is put back: one copy, not two", () => {
-    const store = new UnreadableStore();
-    store.seed("k", ["report s1#1"], ["report:s1#1"]);
-    const queue = new PendingNotesQueue(store);
-
-    queue.queueNote("k", "report s1#1", "report:s1#1");
-    const prefix = queue.drain("k");
-    store.failReads = false;
-    queue.restoreInterrupted("k", prefix);
-
-    expect(store.texts("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nreport s1#1`]);
-  });
-
-  it("two notes that read the same are two notes: both kept after the reload, and both delivered", () => {
-    const store = new UnreadableStore();
-    store.seed("k", ["the same words"]);
-    const queue = new PendingNotesQueue(store);
-
-    // A second, separate note with the same text, queued while the row is unreadable.
-    queue.queueNote("k", "the same words");
-    store.failReads = false;
-    expect(queue.persistNow("k")).toBe(true);
-    expect(store.texts("k")).toEqual(["the same words", "the same words"]);
-    expect(queue.drain("k")).toBe("the same words\n\nthe same words\n\n");
-  });
-
-  it("a stored note that only reads like one in flight is not removed when that turn settles", () => {
-    const store = new UnreadableStore();
-    store.seed("k", ["the same words"]);
-    const queue = new PendingNotesQueue(store);
-
-    queue.queueNote("k", "the same words");
-    const prefix = queue.drain("k");
-    store.failReads = false;
-    queue.settle("k", prefix);
-
-    // The settled turn delivered its own note; the stored one is still owed.
-    expect(store.texts("k")).toEqual(["the same words"]);
-    expect(queue.drain("k")).toBe("the same words\n\n");
-  });
-
-  it("queueNote with an id already queued or in flight adds nothing; without an id every call is a note", () => {
-    const store = new MemoryPendingNotesStore();
-    const queue = new PendingNotesQueue(store);
-    queue.queueNote("k", "report", "r1");
-    expect(queue.queueNote("k", "report", "r1")).toBe(true);
-    expect(store.texts("k")).toEqual(["report"]);
-    const prefix = queue.drain("k");
-    queue.queueNote("k", "report", "r1");
-    expect(store.texts("k")).toEqual([`${INTERRUPTED_NOTE_MARKER}\nreport`]);
-    queue.settle("k", prefix);
-    queue.queueNote("k", "plain");
-    queue.queueNote("k", "plain");
-    expect(store.texts("k")).toEqual(["plain", "plain"]);
-  });
-
-  it("a note queued again under an id a turn already carried to its end is not delivered twice", () => {
-    const store = new MemoryPendingNotesStore();
-    const queue = new PendingNotesQueue(store);
-    queue.queueNote("k", "report", "r1");
-    queue.settle("k", queue.drain("k"));
-    expect(store.texts("k")).toEqual([]);
-    // A retry of the same note (its first write was reported failed, say).
-    expect(queue.queueNote("k", "report", "r1")).toBe(true);
-    expect(queue.peekNotes("k")).toEqual([]);
-    expect(store.texts("k")).toEqual([]);
-    // Another session's note under the same id is its own.
-    queue.queueNote("other", "report", "r1");
-    expect(store.texts("other")).toEqual(["report"]);
-  });
-
-  it("a note carried to its end while the file would not read is not put back when it reads again", () => {
-    const store = new MemoryPendingNotesStore();
-    store.seed("k", ["the message"], ["inbox-interrupted:h:0"]);
-    let readable = false;
-    const real = store.getPendingNotes.bind(store);
-    store.getPendingNotes = (key: string) => {
-      if (!readable) throw new Error("EIO");
-      return real(key);
-    };
-    const queue = new PendingNotesQueue(store);
-    queue.queueNote("k", "the message", "inbox-interrupted:h:0");
-    const prefix = queue.drain("k");
-    expect(prefix).toContain("the message");
-    queue.settle("k", prefix);
-    readable = true;
-    expect(queue.drain("k")).toBe("");
-  });
-
-  it("persistAll names the sessions whose write failed", () => {
-    const store = new MemoryPendingNotesStore();
-    const queue = new PendingNotesQueue(store);
-    queue.queueNote("a", "one");
-    queue.queueNote("b", "two");
-    const real = store.setPendingNotes.bind(store);
-    store.setPendingNotes = (key, notes) => {
-      if (key === "b") throw new Error("ENOSPC");
-      real(key, notes);
-    };
-    expect(queue.persistAll()).toEqual(["b"]);
-  });
-
-  it("persistAll writes every loaded session again, queued and in flight (a fresh file after one was moved aside)", () => {
-    const store = new MemoryPendingNotesStore();
-    const queue = new PendingNotesQueue(store);
-    queue.queueNote("a", "queued", "q1");
-    queue.queueNote("b", "carried", "c1");
-    const prefix = queue.drain("b");
-    store.rows.clear(); // the file was moved aside: the fresh one is empty
-    queue.persistAll();
-    expect(store.texts("a")).toEqual(["queued"]);
-    expect(store.texts("b")).toEqual([`${INTERRUPTED_NOTE_MARKER}\ncarried`]);
-    queue.settle("b", prefix);
-    expect(store.texts("b")).toEqual([]);
-  });
-
-  it("persistAll also writes a session whose stored row could not be read when it queued, once it reads", () => {
-    const store = new MemoryPendingNotesStore();
-    let readable = false;
-    const real = store.getPendingNotes.bind(store);
-    store.getPendingNotes = (key: string) => {
-      if (key === "b" && !readable) throw new Error("EIO");
-      return real(key);
-    };
-    const queue = new PendingNotesQueue(store);
-    queue.queueNote("a", "one");
-    queue.queueNote("b", "held while unreadable", "h1");
-    store.rows.clear(); // the file was moved aside
-    readable = true;
-    expect(queue.persistAll()).toEqual([]);
-    expect(store.texts("a")).toEqual(["one"]);
-    expect(store.texts("b")).toEqual(["held while unreadable"]);
-  });
-
-  it("tells the settle hook before the read notes leave the disk (a crash between leaves them read, not lost unread)", () => {
-    const store = new MemoryPendingNotesStore();
-    const onDiskAtHook: string[][] = [];
-    const queue = new PendingNotesQueue(store, (key) => onDiskAtHook.push(store.texts(key)));
-    queue.queueNote("k", "one", "id1");
-    queue.settle("k", queue.drain("k"));
-    expect(onDiskAtHook).toHaveLength(1);
-    expect(onDiskAtHook[0].join("")).toContain("one");
-    expect(store.texts("k")).toEqual([]);
-  });
-
-  it("names the ids a turn read to the settle hook", () => {
-    const store = new MemoryPendingNotesStore();
-    const read: [string, string[]][] = [];
-    const queue = new PendingNotesQueue(store, (key, ids) => read.push([key, ids]));
-    queue.queueNote("k", "one", "id1");
-    queue.queueNote("k", "two");
-    queue.settle("k", queue.drain("k"));
-    expect(read).toHaveLength(1);
-    expect(read[0][0]).toBe("k");
-    expect(read[0][1]).toContain("id1");
-    expect(read[0][1]).toHaveLength(2);
   });
 });
 
@@ -515,7 +277,7 @@ describe("PendingNotesQueue holdOwnerAudience", () => {
     expect(groupTurn).toBe("shared note\n\n");
     expect(queue.peekNotes("dm:owner")).toEqual([ownerOnly]);
     queue.settle("dm:owner", groupTurn);
-    expect(store.texts("dm:owner")).toEqual([ownerOnly]);
+    expect(store.getPendingNotes("dm:owner")).toEqual([ownerOnly]);
 
     expect(queue.drain("dm:owner")).toBe(`${ownerOnly}\n\n`);
   });

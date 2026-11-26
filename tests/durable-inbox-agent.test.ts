@@ -445,52 +445,21 @@ describe("durable inbox: the interrupted-turn note takes custody", () => {
     await interruptedFirstRun("580", "remember the milk");
     resetConfig({ inbox: true, imessageInboundSettleMs: 0, tomoHome: mockConfig.tomoHome });
     const agent = new Agent();
-    const sessions = (agent as unknown as { sessions: { setPendingNotes: (k: string, n: { id: string; text: string }[]) => void } }).sessions;
+    const sessions = (agent as unknown as { sessions: { setPendingNotes: (k: string, n: string[]) => void } }).sessions;
     const realSet = sessions.setPendingNotes.bind(sessions);
-    let refused = 0;
     sessions.setPendingNotes = (k, n) => {
-      if (n.some((x) => x.text.includes("remember the milk"))) {
-        refused++;
-        throw new Error("EIO");
-      }
+      if (n.some((x) => x.includes("remember the milk"))) throw new Error("EIO");
       realSet(k, n);
     };
     const channel = new MockChannel("imessage");
     agent.addChannel(channel);
     await agent.start();
-    // The write was really tried and refused (not a write that never happened).
-    expect(refused).toBeGreaterThan(0);
     expect(openInbox().pending().map((r) => r.message.text)).toEqual(["remember the milk"]);
     crash(agent);
 
     // The next start still has it, and tells the session.
     const third = await boot();
     expect(peekPendingNotes(third.agent, "imessage:580").join("\n")).toContain("remember the milk");
-    await third.agent.stop();
-  });
-
-  it("a note in parts whose second part could not be written is not written twice by the next start", async () => {
-    const long = `fix the gate ${"x".repeat(20_000)}`;
-    await interruptedFirstRun("582", long);
-    resetConfig({ inbox: true, imessageInboundSettleMs: 0, tomoHome: mockConfig.tomoHome });
-    const agent = new Agent();
-    const sessions = (agent as unknown as { sessions: { setPendingNotes: (k: string, n: { id: string; text: string }[]) => void } }).sessions;
-    const realSet = sessions.setPendingNotes.bind(sessions);
-    sessions.setPendingNotes = (k, n) => {
-      if (n.some((x) => x.text.includes("part 2 of 2"))) throw new Error("ENOSPC");
-      realSet(k, n);
-    };
-    const channel = new MockChannel("imessage");
-    agent.addChannel(channel);
-    await agent.start();
-    expect(openInbox().pending()).toHaveLength(1);
-    crash(agent);
-
-    const third = await boot();
-    const notes = peekPendingNotes(third.agent, "imessage:582");
-    expect(notes.filter((n) => n.includes("part 1 of 2"))).toHaveLength(1);
-    expect(notes.filter((n) => n.includes("part 2 of 2"))).toHaveLength(1);
-    expect(openInbox().pending()).toEqual([]);
     await third.agent.stop();
   });
 

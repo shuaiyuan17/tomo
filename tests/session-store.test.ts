@@ -1,26 +1,20 @@
 import { afterAll, describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { SessionMessage } from "../src/sessions/types.js";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { makeSessionStore, writeTranscript as writeTranscriptIn } from "./helpers/session-store-fixtures.js";
-import { PendingNotesReadError, type PendingNote, type SessionStore } from "../src/sessions/store.js";
-
-/** Notes with ids of their own, for the store's API. */
-const notesOf = (...texts: string[]): PendingNote[] => texts.map((text, i) => ({ id: `n${i}-${text}`, text }));
-const textsOf = (notes: PendingNote[]): string[] => notes.map((n) => n.text);
-const asidesIn = (dir: string): string[] => readdirSync(dir).filter((f) => f.startsWith("_pending_notes.json.corrupt-"));
-/** Make moving the pending notes file aside fail (as a read-only directory would); every other move is real. */
-function failPendingNotesMove(store: SessionStore): void {
-  const target = store as unknown as { moveWithoutClobber(from: string, to: string): string };
-  const real = target.moveWithoutClobber.bind(target);
-  vi.spyOn(target, "moveWithoutClobber").mockImplementation((from: string, to: string) => {
-    if (from.endsWith("_pending_notes.json")) throw Object.assign(new Error("EACCES: permission denied"), { code: "EACCES" });
-    return real(from, to);
-  });
-}
 
 const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-sessions-"));
+const asidesIn = (dir: string): string[] => readdirSync(dir).filter((f) => f.startsWith("_pending_notes.json.corrupt-"));
+const markerPath = (dir: string): string => join(dir, "_pending_notes.quarantined.json");
+
+/** Make the store's move of the pending notes file fail (an immutable file, say). */
+function failPendingNotesMove(store: unknown): () => void {
+  const proto = Object.getPrototypeOf(store) as { moveWithoutClobber(from: string, to: string): string };
+  const spy = vi.spyOn(proto, "moveWithoutClobber").mockImplementation(() => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); });
+  return () => spy.mockRestore();
+}
 // The root is unique to this run, so nothing else will clean it up.
 afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
 
@@ -121,38 +115,7 @@ describe("SessionStore", () => {
     expect(store2.getSdkSessionId("key1")).toBe("session-xyz");
   });
 
-  it("persists pending notes across instances until cleared, each with its id", () => {
-    const store1 = makeSessionStore(TEST_DIR);
-    store1.setPendingNotes("telegram:-987", [{ id: "a", text: "same" }, { id: "b", text: "same" }]);
-
-    const store2 = makeSessionStore(TEST_DIR);
-    expect(store2.getPendingNotes("telegram:-987")).toEqual([{ id: "a", text: "same" }, { id: "b", text: "same" }]);
-    expect(JSON.parse(readFileSync(join(TEST_DIR, "_pending_notes.json"), "utf-8")).version).toBe(2);
-
-    store2.setPendingNotes("telegram:-987", []);
-    const store3 = makeSessionStore(TEST_DIR);
-    expect(store3.getPendingNotes("telegram:-987")).toEqual([]);
-  });
-
-  it("reads a version 1 file (strings) with ids that stay the same, and writes it as version 2", () => {
-    const file = join(TEST_DIR, "_pending_notes.json");
-    writeFileSync(file, JSON.stringify({ version: 1, notes: { "dm:alice": ["one", "one"], "dm:bob": ["two"] } }));
-    const store = makeSessionStore(TEST_DIR);
-
-    const alice = store.getPendingNotes("dm:alice");
-    expect(textsOf(alice)).toEqual(["one", "one"]);
-    expect(new Set(alice.map((n) => n.id)).size).toBe(2);
-    expect(store.getPendingNotes("dm:alice")).toEqual(alice);
-
-    store.setPendingNotes("telegram:-987", notesOf("new"));
-    const written = JSON.parse(readFileSync(file, "utf-8"));
-    expect(written.version).toBe(2);
-    expect(store.getPendingNotes("dm:alice")).toEqual(alice);
-    expect(textsOf(store.getPendingNotes("dm:bob"))).toEqual(["two"]);
-    expect(asidesIn(TEST_DIR)).toEqual([]);
-  });
-
-  it("a pending notes file that will not parse is moved aside unchanged and a fresh one started", () => {
+  it("a pending notes file that will not parse is moved aside byte for byte, a fresh one started, and the marker names it", () => {
     const file = join(TEST_DIR, "_pending_notes.json");
     const corrupt = '{"version":1,"notes":{"dm:alice":["only copy of a replayed message"]'; // truncated
     writeFileSync(file, corrupt);
@@ -160,209 +123,95 @@ describe("SessionStore", () => {
     const told: string[] = [];
     store.onPendingNotesQuarantined = (aside) => told.push(aside);
 
-    expect(store.getPendingNotes("dm:alice")).toEqual([]);
-    expect(existsSync(file)).toBe(false);
+    // Main read it as empty, and this write replaced every session's notes.
+    store.setPendingNotes("telegram:-987", ["new"]);
+    expect(store.getPendingNotes("telegram:-987")).toEqual(["new"]);
     const asides = asidesIn(TEST_DIR);
     expect(asides).toHaveLength(1);
+    expect(readFileSync(join(TEST_DIR, asides[0]), "utf-8")).toBe(corrupt);
     expect(told).toEqual([join(TEST_DIR, asides[0])]);
-    expect(readFileSync(join(TEST_DIR, asides[0]), "utf-8")).toBe(corrupt);
-
-    store.setPendingNotes("telegram:-987", notesOf("new"));
-    expect(textsOf(store.getPendingNotes("telegram:-987"))).toEqual(["new"]);
-    // The fresh file reads: nothing more is moved, and the owner is told once.
-    expect(asidesIn(TEST_DIR)).toHaveLength(1);
-    expect(told).toHaveLength(1);
-    expect(readFileSync(join(TEST_DIR, asides[0]), "utf-8")).toBe(corrupt);
+    // A fresh process (a restart before the owner was told) still reads the marker.
+    expect(makeSessionStore(TEST_DIR).quarantinedPendingNotes()).toEqual([join(TEST_DIR, asides[0])]);
+    store.clearQuarantinedPendingNotes([join(TEST_DIR, asides[0])]);
+    expect(existsSync(markerPath(TEST_DIR))).toBe(false);
+    expect(store.quarantinedPendingNotes()).toBeUndefined();
   });
 
-  it("a recovery marker naming the moved-aside file is on disk before the move, and goes once recovery says it is done", () => {
+  it("a file that is not valid UTF-8, has a row of the wrong shape, is empty, or is a directory is moved aside too", () => {
     const file = join(TEST_DIR, "_pending_notes.json");
-    const marker = join(TEST_DIR, "_pending_notes.recovery.json");
-    writeFileSync(file, "{not json");
-    const store = makeSessionStore(TEST_DIR);
-    let markedAtMove: string[] | undefined;
-    const proto = Object.getPrototypeOf(store) as { moveWithoutClobber(from: string, to: string): string };
-    const real = proto.moveWithoutClobber;
-    const move = vi.spyOn(proto, "moveWithoutClobber").mockImplementation(function (this: unknown, from: string, to: string) {
-      if (from === file) markedAtMove = store.pendingNotesRecovery();
-      return real.call(this, from, to);
-    });
-    try {
+    const cases: Array<Buffer | "dir"> = [
+      Buffer.concat([Buffer.from('{"version":1,"notes":{"dm:alice":["caf'), Buffer.from([0xff]), Buffer.from('"]}}')]),
+      Buffer.from(JSON.stringify({ version: 1, notes: { "dm:alice": ["keep me"], "dm:bob": [42] } })),
+      Buffer.from(""),
+      "dir",
+    ];
+    for (const raw of cases) {
+      rmSync(TEST_DIR, { recursive: true, force: true });
+      mkdirSync(TEST_DIR, { recursive: true });
+      if (raw === "dir") {
+        mkdirSync(file);
+        writeFileSync(join(file, "inside"), "kept");
+      } else {
+        writeFileSync(file, raw);
+      }
+      const store = makeSessionStore(TEST_DIR);
       expect(store.getPendingNotes("dm:alice")).toEqual([]);
-    } finally {
-      move.mockRestore();
+      const asides = asidesIn(TEST_DIR);
+      expect(asides).toHaveLength(1);
+      if (raw === "dir") expect(readFileSync(join(TEST_DIR, asides[0], "inside"), "utf-8")).toBe("kept");
+      else expect(readFileSync(join(TEST_DIR, asides[0])).equals(raw)).toBe(true);
     }
-    const aside = join(TEST_DIR, asidesIn(TEST_DIR)[0]);
-    expect(markedAtMove).toEqual([aside]);
-    // A fresh process (a restart before recovery finished) still reads it.
-    expect(makeSessionStore(TEST_DIR).pendingNotesRecovery()).toEqual([aside]);
-    expect(store.clearPendingNotesRecovery([aside])).toBe(true);
-    expect(existsSync(marker)).toBe(false);
-    expect(store.pendingNotesRecovery()).toBeUndefined();
   });
 
-  it("a move that does not happen leaves no recovery marker", () => {
+  it("a file that cannot be moved aside throws, a write leaves it untouched, and no marker is left", () => {
     const file = join(TEST_DIR, "_pending_notes.json");
     writeFileSync(file, "{not json");
     const store = makeSessionStore(TEST_DIR);
-    const proto = Object.getPrototypeOf(store) as { moveWithoutClobber(from: string, to: string): string };
-    const move = vi.spyOn(proto, "moveWithoutClobber").mockImplementation(() => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); });
+    const restore = failPendingNotesMove(store);
     try {
-      expect(() => store.getPendingNotes("dm:alice")).toThrow(PendingNotesReadError);
+      expect(() => store.getPendingNotes("dm:alice")).toThrow();
+      expect(() => store.setPendingNotes("dm:alice", ["new"])).toThrow();
     } finally {
-      move.mockRestore();
+      restore();
     }
-    expect(existsSync(file)).toBe(true);
-    expect(store.pendingNotesRecovery()).toBeUndefined();
-  });
-
-  it("a recovery marker that will not read is not deleted by a move that does not happen", () => {
-    const file = join(TEST_DIR, "_pending_notes.json");
-    const marker = join(TEST_DIR, "_pending_notes.recovery.json");
-    writeFileSync(file, "{not json");
-    writeFileSync(marker, "{garbled");
-    const store = makeSessionStore(TEST_DIR);
-    const proto = Object.getPrototypeOf(store) as { moveWithoutClobber(from: string, to: string): string };
-    const move = vi.spyOn(proto, "moveWithoutClobber").mockImplementation(() => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); });
-    try {
-      expect(() => store.getPendingNotes("dm:alice")).toThrow(PendingNotesReadError);
-    } finally {
-      move.mockRestore();
-    }
-    // An earlier recovery is still owed.
-    expect(store.pendingNotesRecovery()).toEqual([]);
-  });
-
-  it("a pending notes file that is not valid UTF-8 is moved aside byte for byte, even when it would still parse", () => {
-    const file = join(TEST_DIR, "_pending_notes.json");
-    // 0xff is never valid UTF-8; a lenient decode reads it as U+FFFD inside a
-    // JSON string, which parses, and would be written back as another note.
-    const raw = Buffer.concat([
-      Buffer.from('{"version":1,"notes":{"dm:alice":["caf'),
-      Buffer.from([0xff]),
-      Buffer.from('"]}}'),
-    ]);
-    writeFileSync(file, raw);
-    const store = makeSessionStore(TEST_DIR);
-
-    expect(store.getPendingNotes("dm:alice")).toEqual([]);
-    const asides = asidesIn(TEST_DIR);
-    expect(asides).toHaveLength(1);
-    expect(readFileSync(join(TEST_DIR, asides[0])).equals(raw)).toBe(true);
-  });
-
-  it("a file that only looks blank once decoded (a lone 0xA0 byte) is moved aside, never deleted", () => {
-    const file = join(TEST_DIR, "_pending_notes.json");
-    // Not UTF-8; read as Latin-1 it is a no-break space, which trim() removes.
-    const raw = Buffer.from([0xa0]);
-    writeFileSync(file, raw);
-    const store = makeSessionStore(TEST_DIR);
-
-    expect(store.getPendingNotes("dm:alice")).toEqual([]);
-    const asides = asidesIn(TEST_DIR);
-    expect(asides).toHaveLength(1);
-    expect(readFileSync(join(TEST_DIR, asides[0])).equals(raw)).toBe(true);
-  });
-
-  it("an empty or whitespace-only pending notes file is moved aside too: no file is judged blank", () => {
-    const file = join(TEST_DIR, "_pending_notes.json");
-    writeFileSync(file, " \n");
-    const store = makeSessionStore(TEST_DIR);
-
-    expect(store.getPendingNotes("dm:alice")).toEqual([]);
-    expect(existsSync(file)).toBe(false);
-    const asides = asidesIn(TEST_DIR);
-    expect(asides).toHaveLength(1);
-    expect(readFileSync(join(TEST_DIR, asides[0]), "utf-8")).toBe(" \n");
-  });
-
-  it("one row of the wrong shape moves the whole file aside, as it is; nothing of it is written back", () => {
-    const file = join(TEST_DIR, "_pending_notes.json");
-    const raw = JSON.stringify({ version: 1, notes: { "dm:alice": ["keep me"], "dm:bob": [42] } });
-    writeFileSync(file, raw);
-    const store = makeSessionStore(TEST_DIR);
-
-    store.setPendingNotes("telegram:-987", notesOf("new"));
-
-    expect(store.getPendingNotes("dm:alice")).toEqual([]);
-    expect(textsOf(store.getPendingNotes("telegram:-987"))).toEqual(["new"]);
-    const asides = asidesIn(TEST_DIR);
-    expect(asides).toHaveLength(1);
-    expect(readFileSync(join(TEST_DIR, asides[0]), "utf-8")).toBe(raw);
-  });
-
-  it("a version 2 row with a repeated id is not read as two notes or one: the file is moved aside", () => {
-    const file = join(TEST_DIR, "_pending_notes.json");
-    const raw = JSON.stringify({ version: 2, notes: { "dm:alice": [{ id: "x", text: "a" }, { id: "x", text: "b" }] } });
-    writeFileSync(file, raw);
-    const store = makeSessionStore(TEST_DIR);
-
-    expect(store.getPendingNotes("dm:alice")).toEqual([]);
-    expect(readFileSync(join(TEST_DIR, asidesIn(TEST_DIR)[0]), "utf-8")).toBe(raw);
-  });
-
-  it("a read error that may pass (here ELOOP) throws and leaves the file where it is, to read once it does", () => {
-    const file = join(TEST_DIR, "_pending_notes.json");
-    const other = join(TEST_DIR, "loop-other");
-    symlinkSync(other, file);
-    symlinkSync(file, other); // a symlink loop: readFileSync fails with ELOOP
-    const store = makeSessionStore(TEST_DIR);
-    let heard = 0;
-    store.onPendingNotesQuarantined = () => { heard++; };
-
-    expect(() => store.getPendingNotes("dm:alice")).toThrow(PendingNotesReadError);
-    expect(() => store.setPendingNotes("dm:alice", notesOf("new"))).toThrow(PendingNotesReadError);
-    expect(asidesIn(TEST_DIR)).toEqual([]);
-    expect(heard).toBe(0);
-
-    // The error passes: the file reads, nothing was lost.
-    rmSync(file);
-    rmSync(other);
-    writeFileSync(file, JSON.stringify({ version: 2, notes: { "dm:alice": [{ id: "a", text: "kept" }] } }));
-    expect(textsOf(store.getPendingNotes("dm:alice"))).toEqual(["kept"]);
-  });
-
-  it("writes a repeated id as a note of its own, so the file still reads", () => {
-    const store = makeSessionStore(TEST_DIR);
-    store.setPendingNotes("dm:alice", [{ id: "same", text: "one" }, { id: "same", text: "two" }]);
-    const back = makeSessionStore(TEST_DIR).getPendingNotes("dm:alice");
-    expect(textsOf(back)).toEqual(["one", "two"]);
-    expect(new Set(back.map((n) => n.id)).size).toBe(2);
-    expect(asidesIn(TEST_DIR)).toEqual([]);
-  });
-
-  it("a directory at the path (EISDIR, which never passes) is moved aside", () => {
-    const file = join(TEST_DIR, "_pending_notes.json");
-    mkdirSync(file); // readFileSync fails with EISDIR, not ENOENT
-    writeFileSync(join(file, "inside"), "kept");
-    const store = makeSessionStore(TEST_DIR);
-
-    expect(store.getPendingNotes("dm:alice")).toEqual([]);
-    const asides = asidesIn(TEST_DIR);
-    expect(asides).toHaveLength(1);
-    expect(readFileSync(join(TEST_DIR, asides[0], "inside"), "utf-8")).toBe("kept");
-  });
-
-  it("a file that cannot be moved aside throws, and a write leaves it untouched", () => {
-    const file = join(TEST_DIR, "_pending_notes.json");
-    writeFileSync(file, "{not json");
-    const store = makeSessionStore(TEST_DIR);
-    failPendingNotesMove(store);
-
-    expect(() => store.getPendingNotes("dm:alice")).toThrow(PendingNotesReadError);
-    expect(() => store.setPendingNotes("dm:alice", notesOf("new"))).toThrow(PendingNotesReadError);
     expect(readFileSync(file, "utf-8")).toBe("{not json");
     expect(asidesIn(TEST_DIR)).toEqual([]);
+    expect(store.quarantinedPendingNotes()).toBeUndefined();
   });
 
-  it("a read-only store throws for an unreadable pending notes file and leaves it exactly as it is", () => {
+  it("a move that does not happen puts a marker that is already there back as it was", () => {
+    const file = join(TEST_DIR, "_pending_notes.json");
+    writeFileSync(file, "{not json");
+    writeFileSync(markerPath(TEST_DIR), JSON.stringify({ asides: ["/x/_pending_notes.json.corrupt-1"] }));
+    const store = makeSessionStore(TEST_DIR);
+    const restore = failPendingNotesMove(store);
+    try {
+      expect(() => store.getPendingNotes("dm:alice")).toThrow();
+    } finally {
+      restore();
+    }
+    expect(store.quarantinedPendingNotes()).toEqual(["/x/_pending_notes.json.corrupt-1"]);
+  });
+
+  it("a read-only store throws for an unreadable pending notes file and leaves it as it is", () => {
     const file = join(TEST_DIR, "_pending_notes.json");
     writeFileSync(file, "{not json");
     const store = makeSessionStore(TEST_DIR, { readOnly: true });
-
-    expect(() => store.getPendingNotes("dm:alice")).toThrow(PendingNotesReadError);
+    expect(() => store.getPendingNotes("dm:alice")).toThrow();
     expect(readFileSync(file, "utf-8")).toBe("{not json");
     expect(asidesIn(TEST_DIR)).toEqual([]);
+  });
+
+  it("persists pending notes across instances until cleared", () => {
+    const store1 = makeSessionStore(TEST_DIR);
+    store1.setPendingNotes("telegram:-987", ["first", "second"]);
+
+    const store2 = makeSessionStore(TEST_DIR);
+    expect(store2.getPendingNotes("telegram:-987")).toEqual(["first", "second"]);
+
+    store2.setPendingNotes("telegram:-987", []);
+    const store3 = makeSessionStore(TEST_DIR);
+    expect(store3.getPendingNotes("telegram:-987")).toEqual([]);
   });
 
   it("list APIs see external registry changes from another store instance", () => {
@@ -598,46 +447,12 @@ describe("SessionStore", () => {
   it("migrates pending notes with a unified session key", () => {
     const store = makeSessionStore(TEST_DIR);
     store.setSdkSessionId("telegram:111", "session-old");
-    store.setPendingNotes("telegram:111", notesOf("queued before migration"));
+    store.setPendingNotes("telegram:111", ["queued before migration"]);
 
     store.migrateSessionKey("telegram:111", "dm:alice");
 
     expect(store.getPendingNotes("telegram:111")).toEqual([]);
-    expect(textsOf(store.getPendingNotes("dm:alice"))).toEqual(["queued before migration"]);
-  });
-
-  it("a migration keeps two notes two when the new key already uses one of the old key's ids", () => {
-    const store = makeSessionStore(TEST_DIR);
-    store.setSdkSessionId("telegram:111", "session-old");
-    store.setPendingNotes("telegram:111", [{ id: "x", text: "old" }]);
-    store.setPendingNotes("dm:alice", [{ id: "x", text: "new" }]);
-
-    store.migrateSessionKey("telegram:111", "dm:alice");
-
-    const notes = store.getPendingNotes("dm:alice");
-    expect(textsOf(notes)).toEqual(["new", "old"]);
-    expect(new Set(notes.map((n) => n.id)).size).toBe(2);
-  });
-
-  it("a migration with an unreadable pending notes file is refused before anything moves, and succeeds once it reads", () => {
-    const store = makeSessionStore(TEST_DIR);
-    store.setSdkSessionId("telegram:111", "session-old");
-    store.setPendingNotes("telegram:111", notesOf("queued before migration"));
-    const file = join(TEST_DIR, "_pending_notes.json");
-    const saved = readFileSync(file);
-    rmSync(file);
-    mkdirSync(file); // EISDIR on read
-    failPendingNotesMove(store); // and it cannot be moved aside either
-
-    expect(() => store.migrateSessionKey("telegram:111", "dm:alice")).toThrow(/pending notes could not be read/);
-    expect(store.getSdkSessionId("telegram:111")).toBe("session-old");
-    expect(store.getSdkSessionId("dm:alice")).toBeUndefined();
-
-    rmSync(file, { recursive: true });
-    writeFileSync(file, saved);
-    store.migrateSessionKey("telegram:111", "dm:alice");
-    expect(store.getSdkSessionId("dm:alice")).toBe("session-old");
-    expect(textsOf(store.getPendingNotes("dm:alice"))).toEqual(["queued before migration"]);
+    expect(store.getPendingNotes("dm:alice")).toEqual(["queued before migration"]);
   });
 
   it("remembers the raw key a unified session was migrated from, across chained migrations", () => {

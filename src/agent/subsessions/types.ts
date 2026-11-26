@@ -34,10 +34,6 @@ export interface SubsessionSentMessage {
   via?: "main" | "panel";
   /** via "panel": the highest input seq its turn answered (a retried turn's same answer is kept once). */
   answers?: number;
-  /** via "main": its note's name and pending-note id, and whether a turn of the owning session has read it. */
-  note?: string;
-  noteId?: string;
-  read?: true;
 }
 
 /**

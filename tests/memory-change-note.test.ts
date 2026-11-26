@@ -31,7 +31,7 @@ describe("memory change note on a live session", () => {
     const agent = new Agent();
     const tg = new MockChannel("telegram");
     agent.addChannel(tg);
-    const store = (agent as unknown as { sessions: { getPendingNotes(key: string): { text: string }[] } }).sessions;
+    const store = (agent as unknown as { sessions: { getPendingNotes(key: string): string[] } }).sessions;
 
     mockWorkspace.promptContext = { memory: ["- [Travel](travel.md)"], people: [] };
     await tg.simulateMessage(makeMsg({ text: "hello" }));
@@ -44,7 +44,7 @@ describe("memory change note on a live session", () => {
     // What a crash in the middle of the next turn would replay.
     let durableDuringTurn: string[] | undefined;
     mockSdk.responseFn = () => {
-      durableDuringTurn = store.getPendingNotes(key).map((n) => n.text);
+      durableDuringTurn = store.getPendingNotes(key);
       return "ok";
     };
     mockSdk.promptsBySession = [];

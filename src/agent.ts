@@ -89,8 +89,7 @@ import { QuotaGateReader } from "./usage/limits-log.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
-import { createHash, randomUUID } from "node:crypto";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { readFileSync } from "node:fs";
 import { withConfigLockSync } from "./config-file.js";
 import { writeJsonAtomicSync } from "./fs-utils.js";
@@ -140,16 +139,8 @@ const REWIND_SHUTDOWN_TIMEOUT_MS = 3_000;
  * than a "first N keys" counter because it needs no hook on the message path.
  */
 const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
-/** How often the interrupted-subagents startup check is retried for sessions whose pending notes could not be read. */
-const INTERRUPTED_AGENTS_RETRY_MS = 60_000;
-/** How soon recovery after a moved-aside notes file is tried again, when a note could not be written. */
-const PENDING_NOTES_RECOVERY_RETRY_MS = 60_000;
-/** How soon the owner is told again that the notes file was moved aside, when telling them failed. */
-const PENDING_NOTES_QUARANTINE_NOTICE_RETRY_MS = 60_000;
-/** This process: an interrupted-agents note is about the restart before it.
- *  A task id can be interrupted again by a later restart (a resumed agent
- *  keeps its id), and that is a new note, not the old one still queued. */
-const BOOT_ID = randomUUID().slice(0, 8);
+/** How soon an owner notice about a moved-aside pending notes file that could not be sent is tried again. */
+const PENDING_NOTES_NOTICE_RETRY_MS = 60_000;
 
 /**
  * How long a reply that matches no task waits for task sends still in flight
@@ -249,6 +240,10 @@ export class Agent {
    * it failed. Shutdown wins; the request is dropped, with a line saying so.
    */
   private stopping = false;
+  /** Owner notices about a moved-aside pending notes file: sent once the channels are up. */
+  private pendingNotesNoticeReady = false;
+  private pendingNotesNoticeSending = false;
+  private pendingNotesNoticeTimer: ReturnType<typeof setTimeout> | undefined;
   /** End time of each session's last successful turn this process saw — the
    *  start of the range an owner notice suggests compacting. */
   private readonly lastGoodTurnAt = new Map<string, number>();
@@ -271,14 +266,6 @@ export class Agent {
   /** Re-logs the full migration status once, after the first keys have been
    *  touched (see `start`). Unref'd, and cleared by `stop`. */
   private migrationStatusTimer: ReturnType<typeof setTimeout> | undefined;
-  /** Where unreadable pending-notes files were moved this process, not yet told to the owner. */
-  private pendingNotesQuarantined: string[] = [];
-  /** The channels have started: an owner notice can be sent. */
-  private channelsUp = false;
-  /** Re-runs the interrupted-subagents startup check for sessions whose pending notes could not be read. */
-  private interruptedAgentsRetryTimer: ReturnType<typeof setTimeout> | undefined;
-  private pendingNotesQuarantineTimer: ReturnType<typeof setTimeout> | undefined;
-  private pendingNotesRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
   /** The most recent sweep — awaited (bounded) by stop() so none is abandoned mid-write. */
   private mcpSweepInFlight: Promise<void> | undefined;
 
@@ -300,9 +287,8 @@ export class Agent {
       findPrivateReplyTarget: () => this.findPrivateReplyTarget(),
       getChannel: (name) => this.getChannel(name),
     });
-    this.pendingNotesQueue = new PendingNotesQueue(this.sessions, (_key, ids) => this.subsessions?.notesRead(ids));
-    // Called from inside a read of the notes: recovery runs once that read is over.
-    this.sessions.onPendingNotesQuarantined = () => queueMicrotask(() => this.recoverPendingNotes());
+    this.pendingNotesQueue = new PendingNotesQueue(this.sessions);
+    this.sessions.onPendingNotesQuarantined = () => this.tellPendingNotesQuarantined();
     if (config.inbox) {
       try {
         this.inbox = new DurableInbox({ path: join(config.tomoHome, "data", "inbox.jsonl") });
@@ -634,10 +620,9 @@ export class Agent {
       ownerKey: () => this.router.ownerSessionKey(),
       // A task owned by the owner's DM speaks for the owner alone: its notes
       // never drain into a summoned group's turn on that session.
-      queuePendingNote: (key, note, id) => this.queuePendingNote(key, isDmSessionKey(key) ? markOwnerAudience(note) : note, id),
+      queuePendingNote: (key, note) => this.queuePendingNote(key, isDmSessionKey(key) ? markOwnerAudience(note) : note),
       withdrawPendingNote: (key, match) => this.pendingNotesQueue.withdrawNote(key, match),
-      hasPendingNote: (key, predicate, whenUnreadable) => this.pendingNotesQueue.hasNote(key, predicate, whenUnreadable),
-      pendingNotesRecovering: () => this.sessions.pendingNotesRecovery() !== undefined,
+      hasPendingNote: (key, predicate) => this.pendingNotesQueue.hasNote(key, predicate),
       persistPendingNotes: (key) => this.pendingNotesQueue.persistNow(key),
       wakeScope: (parentKey, prompt, taskId) => {
         const body = appendToTomoEventBody(prompt, CONTINUITY_DELIVERY_NOTE);
@@ -3216,8 +3201,8 @@ export class Agent {
     this.proactive.recordLatestInboundMessage(sessionKey, channel, message);
   }
 
-  private queuePendingNote(sessionKey: string, note: string, id?: string): boolean {
-    return this.pendingNotesQueue.queueNote(sessionKey, note, id);
+  private queuePendingNote(sessionKey: string, note: string): boolean {
+    return this.pendingNotesQueue.queueNote(sessionKey, note);
   }
 
   private queuePendingErrorNote(sessionKey: string, visibleError: string): void {
@@ -3394,6 +3379,45 @@ export class Agent {
    * DM the configured OWNER (no agent query); never falls back to another
    * private chat. Resolves false when nothing was sent.
    */
+  /**
+   * Tell the owner which pending notes files were moved aside (their notes
+   * were not delivered; the file is kept for the owner session to read and
+   * resend what matters). The store's marker names them until the notice is
+   * sent, so a restart in between sends it then; a send that fails is tried
+   * again, unless there is no owner to tell.
+   */
+  private tellPendingNotesQuarantined(): void {
+    if (!this.pendingNotesNoticeReady || this.stopping || this.pendingNotesNoticeSending || this.pendingNotesNoticeTimer) return;
+    const asides = this.sessions.quarantinedPendingNotes();
+    if (!asides) return;
+    // A marker that will not read names no file.
+    const files = asides.length > 0 ? asides : [join(config.sessionsDir, "_pending_notes.json.corrupt-*")];
+    const text = ownerT("notices")("pendingNotesQuarantined", { files: files.join(", "), count: files.length });
+    this.pendingNotesNoticeSending = true;
+    const failed = (err?: unknown): void => {
+      log.warn({ err, files }, "Could not tell the owner the pending notes file was moved aside");
+      if (this.stopping || !this.router.ownerSessionKey()) return;
+      this.pendingNotesNoticeTimer = setTimeout(() => {
+        this.pendingNotesNoticeTimer = undefined;
+        this.tellPendingNotesQuarantined();
+      }, PENDING_NOTES_NOTICE_RETRY_MS);
+      this.pendingNotesNoticeTimer.unref();
+    };
+    void this.notifyOwner(text)
+      .then((sent) => {
+        if (sent) this.sessions.clearQuarantinedPendingNotes(asides);
+        else failed();
+      })
+      .catch((err) => failed(err))
+      .finally(() => {
+        this.pendingNotesNoticeSending = false;
+        // Another file moved aside while this one was being sent.
+        if (!this.pendingNotesNoticeTimer && (this.sessions.quarantinedPendingNotes() ?? []).some((a) => !asides.includes(a))) {
+          this.tellPendingNotesQuarantined();
+        }
+      });
+  }
+
   async notifyOwner(text: OwnerText): Promise<boolean> {
     return this.ownerNotices.notifyOwner(text);
   }
@@ -3423,11 +3447,9 @@ export class Agent {
     } catch (err) {
       log.error({ err }, "Sub-session recovery failed");
     }
-    // A notes file moved aside before this start (or while starting): its notes are written again.
-    this.recoverPendingNotes();
     await Promise.all(this.channels.map((ch) => ch.start()));
-    this.channelsUp = true;
-    // A pending-notes file moved aside while starting (recovery reads it) is told now.
+    // A file moved aside before now (this start, or a run that went away before telling the owner).
+    this.pendingNotesNoticeReady = true;
     this.tellPendingNotesQuarantined();
     try {
       this.replayInbox(recovered);
@@ -3575,21 +3597,13 @@ export class Agent {
       clearInterval(this.mcpTokenRefreshTimer);
       this.mcpTokenRefreshTimer = undefined;
     }
-    if (this.pendingNotesRecoveryTimer) {
-      clearTimeout(this.pendingNotesRecoveryTimer);
-      this.pendingNotesRecoveryTimer = undefined;
-    }
-    if (this.pendingNotesQuarantineTimer) {
-      clearTimeout(this.pendingNotesQuarantineTimer);
-      this.pendingNotesQuarantineTimer = undefined;
-    }
-    if (this.interruptedAgentsRetryTimer) {
-      clearTimeout(this.interruptedAgentsRetryTimer);
-      this.interruptedAgentsRetryTimer = undefined;
-    }
     if (this.migrationStatusTimer) {
       clearTimeout(this.migrationStatusTimer);
       this.migrationStatusTimer = undefined;
+    }
+    if (this.pendingNotesNoticeTimer) {
+      clearTimeout(this.pendingNotesNoticeTimer);
+      this.pendingNotesNoticeTimer = undefined;
     }
     this.commands.stop();
 
@@ -3840,161 +3854,28 @@ export class Agent {
     const ledger = this.runningAgents;
     if (!ledger) return;
     const known = new Set(this.sessions.listActiveEntries().map((e) => e.channelKey));
-    // A session whose stored notes cannot be read is settled later, once
-    // they read (`retryInterruptedAgentsNotes`): until then neither "a note
-    // is owed" nor "none is" is known, and a new note could not be written.
-    const retry = new Set([...known].filter((key) => !this.pendingNotesQueue.storedReadable(key)));
     // A note an earlier start handed off but no turn finished with is still
     // owed: give it its turn again now, not only at the next message.
-    const owed = new Set([...known].filter((key) => !retry.has(key) && this.hasInterruptedAgentsNote(key)));
+    const owed = new Set([...known].filter((key) =>
+      this.pendingNotesQueue.peekNotes(key).some((n) => n.includes('<tomo-event type="interrupted-agents"'))));
     for (const [key, records] of ledger.pendingBySession()) {
       if (!known.has(key)) {
         log.warn({ sessionKey: key, count: records.length }, "Interrupted subagents belong to an unknown session; dropping the notice");
         ledger.acknowledge(key);
         continue;
       }
-      if (retry.has(key)) continue;
-      // Not written: tried again until it is (the ledger keeps the records).
-      if (this.queueInterruptedAgentsNote(ledger, key, records)) owed.add(key);
-      else retry.add(key);
+      const autoResume = config.interruptedAgentsAutoResume
+        ? { failed: new Set(records.filter((r) => isResumable(r) && ledger.resumeCount(key, r.taskId) >= MAX_AUTO_RESUMES).map((r) => r.taskId)) }
+        : undefined;
+      if (!this.queuePendingNote(key, formatTomoEvent("interrupted-agents", formatInterruptedAgentsNotice(records, undefined, autoResume)))) {
+        log.error({ sessionKey: key }, "Could not persist the interrupted-subagents note; kept for the next start");
+        continue;
+      }
+      ledger.acknowledge(key);
+      owed.add(key);
+      log.info({ sessionKey: key, ids: records.map((r: RunningTaskRecord) => r.taskId) }, "Reporting subagents interrupted by the last restart");
     }
     this.sendOwedResumeFailures(ledger);
-    for (const key of owed) this.wakeForInterruptedAgents(key);
-    if (retry.size > 0) {
-      log.warn({ sessions: [...retry] }, "Interrupted-subagents notes not written yet (pending notes unreadable or the write failed); tried again");
-      this.scheduleInterruptedAgentsRetry(retry);
-    }
-  }
-
-  /**
-   * The pending-notes file was moved aside (see SessionStore.loadPendingNotes),
-   * in this process or one before it: the store's recovery marker says so
-   * until this is done. Every note held in memory is written to the fresh
-   * file, and the sub-session notes it may have held are written again from
-   * the task records (each under its own id, so this can run any number of
-   * times). Once all of it is on disk the marker goes and the owner is told;
-   * until then it is tried again.
-   */
-  private recoverPendingNotes(): void {
-    if (this.stopping) return;
-    const asides = this.sessions.pendingNotesRecovery();
-    if (!asides) return;
-    let done = false;
-    try {
-      // The rebuild (which wakes the owning sessions) only once the notes held here are on disk.
-      done = this.pendingNotesQueue.persistAll().length === 0
-        && (this.subsessions ? this.subsessions.rebuildLostNotes() : true)
-        && this.sessions.clearPendingNotesRecovery(asides);
-    } catch (err) {
-      log.error({ err }, "Pending notes recovery failed");
-    }
-    if (!done) {
-      log.warn("Notes from the moved-aside pending notes file are not all written again yet; trying again");
-      if (this.pendingNotesRecoveryTimer) return;
-      this.pendingNotesRecoveryTimer = setTimeout(() => {
-        this.pendingNotesRecoveryTimer = undefined;
-        this.recoverPendingNotes();
-      }, PENDING_NOTES_RECOVERY_RETRY_MS);
-      this.pendingNotesRecoveryTimer.unref();
-      return;
-    }
-    // A marker that would not read names no file: the owner is still told.
-    this.pendingNotesQuarantined.push(...(asides.length > 0 ? asides : ["_pending_notes.json.corrupt-*"]));
-    if (this.channelsUp) this.tellPendingNotesQuarantined();
-  }
-
-  private tellPendingNotesQuarantined(): void {
-    if (this.pendingNotesQuarantined.length === 0 || this.stopping || this.pendingNotesQuarantineTimer) return;
-    const asides = this.pendingNotesQuarantined;
-    this.pendingNotesQuarantined = [];
-    const files = asides.map((p) => basename(p));
-    const text = ownerT("notices")("pendingNotesQuarantined", { files: files.join(", "), count: files.length });
-    // Not sent: kept (with any moved aside meanwhile) and tried again.
-    const failed = (err?: unknown): void => {
-      log.warn({ err, files }, "Could not tell the owner the pending notes file was moved aside; trying again");
-      this.pendingNotesQuarantined = [...asides, ...this.pendingNotesQuarantined];
-      // No owner to tell: trying again would only log this every minute.
-      if (this.stopping || this.pendingNotesQuarantineTimer || !this.router.ownerSessionKey()) return;
-      this.pendingNotesQuarantineTimer = setTimeout(() => {
-        this.pendingNotesQuarantineTimer = undefined;
-        this.tellPendingNotesQuarantined();
-      }, PENDING_NOTES_QUARANTINE_NOTICE_RETRY_MS);
-      this.pendingNotesQuarantineTimer.unref();
-    };
-    void this.notifyOwner(text)
-      .then((sent) => { if (!sent) failed(); })
-      .catch((err) => failed(err));
-  }
-
-  private hasInterruptedAgentsNote(key: string): boolean {
-    return this.pendingNotesQueue.hasNote(key, (n) => n.includes('<tomo-event type="interrupted-agents"'));
-  }
-
-  /** Queue the notice for `records` and acknowledge them. False when the note could not be persisted (kept for the next start). */
-  private queueInterruptedAgentsNote(ledger: RunningAgentsLedger, key: string, records: RunningTaskRecord[]): boolean {
-    const autoResume = config.interruptedAgentsAutoResume
-      ? { failed: new Set(records.filter((r) => isResumable(r) && ledger.resumeCount(key, r.taskId) >= MAX_AUTO_RESUMES).map((r) => r.taskId)) }
-      : undefined;
-    // One id per set of interrupted agents and process: a retry after a
-    // failed write writes the note held in memory again, never a second copy.
-    const id = `interrupted-agents:${BOOT_ID}:${createHash("sha256").update(records.map((r) => r.taskId).sort().join("\n")).digest("hex").slice(0, 16)}`;
-    if (!this.queuePendingNote(key, formatTomoEvent("interrupted-agents", formatInterruptedAgentsNotice(records, undefined, autoResume)), id)) {
-      log.error({ sessionKey: key }, "Could not persist the interrupted-subagents note; tried again (and kept for the next start)");
-      return false;
-    }
-    ledger.acknowledge(key);
-    log.info({ sessionKey: key, ids: records.map((r: RunningTaskRecord) => r.taskId) }, "Reporting subagents interrupted by the last restart");
-    return true;
-  }
-
-  /**
-   * The startup check for sessions whose stored notes could not be read:
-   * looked at again every `INTERRUPTED_AGENTS_RETRY_MS` until each reads, then
-   * settled the way `notifyInterruptedAgents` would have (queue the notice for
-   * what the ledger still holds, wake the session if a notice is owed).
-   */
-  private scheduleInterruptedAgentsRetry(keys: Set<string>): void {
-    if (this.interruptedAgentsRetryTimer) clearTimeout(this.interruptedAgentsRetryTimer);
-    // stop() may already have run (it can land while start() awaits the
-    // channels): never arm a timer after shutdown.
-    if (this.stopping) return;
-    this.interruptedAgentsRetryTimer = setTimeout(() => {
-      this.interruptedAgentsRetryTimer = undefined;
-      if (this.stopping) return;
-      try {
-        this.retryInterruptedAgentsNotes(keys);
-      } catch (err) {
-        log.error({ err }, "Interrupted-subagents retry failed");
-      }
-    }, INTERRUPTED_AGENTS_RETRY_MS);
-    this.interruptedAgentsRetryTimer.unref();
-  }
-
-  private retryInterruptedAgentsNotes(keys: Set<string>): void {
-    const ledger = this.runningAgents;
-    if (!ledger) return;
-    const pending = ledger.pendingBySession();
-    const still = new Set<string>();
-    for (const key of keys) {
-      if (!this.pendingNotesQueue.storedReadable(key)) {
-        still.add(key);
-        continue;
-      }
-      const records = pending.get(key);
-      // A key leaves the retry set only once its note is on disk.
-      if (records && !this.queueInterruptedAgentsNote(ledger, key, records)) {
-        still.add(key);
-        continue;
-      }
-      if (this.hasInterruptedAgentsNote(key)) this.wakeForInterruptedAgents(key);
-    }
-    if (still.size > 0) this.scheduleInterruptedAgentsRetry(still);
-  }
-
-  private wakeForInterruptedAgents(key: string): void {
-    // A sub-session's note waits for its own next turn (the resume after
-    // this restart): it is not woken outside its scheduler.
-    if (isTaskSessionKey(key)) return;
     const prompt = formatTomoEvent(
       "interrupted-agents",
       config.interruptedAgentsAutoResume
@@ -4008,8 +3889,13 @@ export class Agent {
           + `still worth continuing; otherwise there is nothing to do. ${CONTINUITY_DELIVERY_NOTE}`,
       { name: "check" },
     );
-    this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, ownerT("notices")("suppressed.turn.interruptedAgents"), "restart"))
-      .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"));
+    for (const key of owed) {
+      // A sub-session's note waits for its own next turn (the resume after
+      // this restart): it is not woken outside its scheduler.
+      if (isTaskSessionKey(key)) continue;
+      this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, ownerT("notices")("suppressed.turn.interruptedAgents"), "restart"))
+        .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"));
+    }
   }
 
   /**
@@ -4175,9 +4061,6 @@ export class Agent {
       // persisted leaves the record started: the next start tells the session
       // again (a repeated note, never a lost message).
       const chunks = interruptedNoteChunks(recs);
-      // Stable ids: a start after one part failed to write writes the
-      // others again, and the parts already queued are not added twice.
-      const idBase = `inbox-interrupted:${createHash("sha256").update(recs.map((r) => r.id).join("\n")).digest("hex").slice(0, 16)}`;
       let persisted = true;
       chunks.forEach((chunk, i) => {
         const part = chunks.length > 1
@@ -4188,7 +4071,7 @@ export class Agent {
           : `Tomo restarted while a turn was handling ${recs.length === 1 ? "a message" : `${recs.length} messages`} received from ${oldest}${part}. `
             + "Your reply may be missing or incomplete; check the conversation before assuming it was answered, "
             + "and answer now if it was not.\n";
-        const ok = this.queuePendingNote(key, formatTomoEvent("inbox", lead + chunk, { name: "interrupted" }), `${idBase}:${i}`);
+        const ok = this.queuePendingNote(key, formatTomoEvent("inbox", lead + chunk, { name: "interrupted" }));
         persisted &&= ok;
       });
       if (persisted) {

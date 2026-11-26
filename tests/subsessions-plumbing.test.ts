@@ -70,11 +70,8 @@ describe("sub-session memory guard", () => {
 
 describe("pending notes: sub-session reports", () => {
   const memoryStore = () => {
-    const data = new Map<string, { id: string; text: string }[]>();
-    return {
-      getPendingNotes: (k: string) => [...(data.get(k) ?? [])],
-      setPendingNotes: (k: string, n: { id: string; text: string }[]) => { data.set(k, [...n]); },
-    };
+    const data = new Map<string, string[]>();
+    return { getPendingNotes: (k: string) => [...(data.get(k) ?? [])], setPendingNotes: (k: string, n: string[]) => { data.set(k, [...n]); } };
   };
 
   it("a report note is pinned: the note cap never drops it", () => {
@@ -113,7 +110,7 @@ describe("pending notes: sub-session reports", () => {
     expect(groupPrefix).toContain("anyone may see this");
     expect(groupPrefix).not.toContain("private task text");
     // Still queued (and on disk) for the owner's own next turn.
-    expect(store.getPendingNotes("dm:owner").some((n) => n.text.includes("private task text"))).toBe(true);
+    expect(store.getPendingNotes("dm:owner").some((n) => n.includes("private task text"))).toBe(true);
     q.settle("dm:owner", groupPrefix);
     expect(q.drain("dm:owner")).toContain("private task text");
   });

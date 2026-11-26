@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { activeSubsessions, canRetrySend, folded, planStepLook, showableTime, updateText, pendingFor, updatePending, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel, isWorkingState, subsessionsRefreshMs, SUBSESSIONS_BACKGROUND_REFRESH_MS, withListBackground } from "../web/src/subsessions.js";
+import { activeSubsessions, canRetrySend, folded, hasProgress, leadsWithChat, progressSummary, planStepLook, showableTime, updateText, pendingFor, updatePending, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel, isWorkingState, subsessionsRefreshMs, SUBSESSIONS_BACKGROUND_REFRESH_MS, withListBackground } from "../web/src/subsessions.js";
 import type { WebSubsession, WebSubsessionDetail } from "../src/web/protocol.js";
 
 const task = (extra: Partial<WebSubsession> = {}): WebSubsession => ({ id: "s1", title: "T", status: "active", working: false,
@@ -107,6 +107,39 @@ describe("sub-sessions in the Tasks rail", () => {
     expect(rows.map((r) => r.kind === "entry" ? `${r.from}:${r.tag ?? "-"}` : r.kind)).toEqual(["brief", "task:notify", "owner:-", "task:ask", "task:-", "report", "pending"]);
     expect(rows[0]).toMatchObject({ quote: ["owner words"], brief: "Do it." });
     expect(rows[2]).toMatchObject({ files: 1 });
+  });
+
+  it("leads with what the task is doing until something is said, then with the chat", () => {
+    expect(leadsWithChat(subsessionChatRows(detail(), []))).toBe(false);
+    // Any line of the conversation, either way, the report, or the owner's message on its way: the chat leads.
+    expect(leadsWithChat(subsessionChatRows(detail({ conversation: [{ seq: 1, at: 1, from: "owner", kind: "message", text: "hi" }] }), []))).toBe(true);
+    expect(leadsWithChat(subsessionChatRows(detail({ conversation: [{ seq: 1, at: 1, from: "task", kind: "notify", text: "Started." }] }), []))).toBe(true);
+    expect(leadsWithChat(subsessionChatRows(detail({ report: "Done." }), []))).toBe(true);
+    expect(leadsWithChat(subsessionChatRows(detail(), [{ requestId: "r1", text: "go", state: "sending" }]))).toBe(true);
+    // A sent message the conversation already has adds nothing of its own.
+    expect(leadsWithChat(subsessionChatRows(detail({ revision: 3 }), [{ requestId: "r1", text: "go", state: "sent", revision: 3 }]))).toBe(false);
+  });
+
+  it("has something to show of what the task is doing only with a plan, a done step or a line it can word", () => {
+    expect(hasProgress({})).toBe(false);
+    expect(hasProgress({ plan: [{ text: "A", status: "pending" }] })).toBe(true);
+    expect(hasProgress({ doneSteps: [{ at: 1, text: "A" }] })).toBe(true);
+    expect(hasProgress({ updates: [{ at: 1, kind: "milestone", milestone: "started" }] })).toBe(true);
+    expect(hasProgress({ updates: [{ at: 1, kind: "milestone", milestone: "teleported" as never }] })).toBe(false);
+  });
+
+  it("folds what it is doing into one line: the step it is on, else the next, else its latest own update, else its last done step", () => {
+    const doneSteps = [{ at: 1, text: "Read the code" }, { at: 2, text: "Wrote the fix" }];
+    const updates = [{ at: 5, kind: "milestone" as const, milestone: "finished" as const }, { at: 4, kind: "update" as const, text: "Chose B" }];
+    expect(progressSummary({ doneSteps, plan: [{ text: "Test it", status: "in_progress" }, { text: "Ship", status: "pending" }] }, true))
+      .toEqual({ text: "Test it", look: "running", done: 2, total: 4 });
+    expect(progressSummary({ plan: [{ text: "Test it", status: "in_progress" }] }, false)).toMatchObject({ look: "paused", done: 0, total: 1 });
+    expect(progressSummary({ doneSteps, plan: [{ text: "Ship", status: "pending" }] }, true)).toEqual({ text: "Next: Ship", look: "pending", done: 2, total: 3 });
+    // No plan left (an ended task): its own latest line before a milestone, with no count.
+    expect(progressSummary({ doneSteps, updates }, false)).toEqual({ text: "Chose B", look: "update", done: 2 });
+    expect(progressSummary({ doneSteps, updates: [updates[0]] }, false)).toEqual({ text: "Wrote the fix", look: "done", done: 2 });
+    expect(progressSummary({ updates: [updates[0]] }, false)).toEqual({ text: "Finished", look: "update", done: 0 });
+    expect(progressSummary({}, false)).toBeUndefined();
   });
 
   it("keeps a sent message until a read of the conversation has it, so it never blinks out", () => {

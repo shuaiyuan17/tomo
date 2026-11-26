@@ -157,6 +157,43 @@ export function canRetrySend(error: string | undefined): boolean {
   return error !== "subsession_ended" && error !== "subsession_not_found";
 }
 
+/** Plan, done steps or a line of "Decisions and updates": something to show of what the task is doing. */
+export function hasProgress(detail: Pick<WebSubsessionDetail, "plan" | "doneSteps" | "updates">): boolean {
+  return !!detail.plan?.length || !!detail.doneSteps?.length || !!detail.updates?.some((u) => updateText(u));
+}
+
+/**
+ * An opened task leads with what it is doing until something has been said:
+ * a line of the conversation (the owner's or the task's), the report, or a
+ * message of the owner's on its way. From then on it leads with the chat, and
+ * what it is doing folds into one line above it.
+ */
+export function leadsWithChat(rows: readonly SubsessionChatRow[]): boolean {
+  return rows.some((row) => row.kind !== "brief");
+}
+
+/**
+ * The folded line: the step it is on, else the next one, else its latest
+ * decision or update (a line of its own before a milestone), else the last
+ * step it finished. `done` / `total`: steps ticked off and all steps, while
+ * it has a plan.
+ */
+export interface ProgressSummary { text: string; look: "running" | "paused" | "pending" | "update" | "done"; done: number; total?: number }
+export function progressSummary(detail: Pick<WebSubsessionDetail, "plan" | "doneSteps" | "updates">, running: boolean): ProgressSummary | undefined {
+  const done = detail.doneSteps?.length ?? 0;
+  const plan = detail.plan ?? [];
+  const total = plan.length ? { total: done + plan.length } : {};
+  const now = plan.find((step) => step.status === "in_progress");
+  if (now) return { text: now.text, look: planStepLook("in_progress", running), done, ...total };
+  if (plan.length) return { text: i18n.t("tasks:subsession.progress.next", { step: plan[0].text }), look: "pending", done, ...total };
+  const lines = (detail.updates ?? []).filter((u) => updateText(u));
+  const own = lines.find((u) => u.kind === "update");
+  if (own) return { text: updateText(own), look: "update", done };
+  const last = detail.doneSteps?.at(-1);
+  if (last) return { text: last.text, look: "done", done };
+  return lines[0] ? { text: updateText(lines[0]), look: "update", done } : undefined;
+}
+
 /** A row of the chat, in order: the brief, then every line of the conversation, then the report. */
 export type SubsessionChatRow =
   | { kind: "brief"; key: string; brief: string; quote?: string[]; truncated: boolean }

@@ -23,7 +23,7 @@ import { FALLBACK_MIME, formatFileMarker, sanitizeAttachmentFilename, saveInboun
 import type { ImageAttachment } from "./types.js";
 import type { JournalEntry, Resolution, WebRequestJournal } from "../web/request-journal.js";
 import type { ModelSwitchOutcome, ModelSwitchRefusal } from "../agent/model-switch.js";
-import type { SubsessionMessageInput, WebSubsession, WebSubsessionDetail, WebSubsessionList, WebSubsessionMessageResult } from "../web/protocol.js";
+import type { SubsessionDoneInput, SubsessionMessageInput, WebSubsession, WebSubsessionDetail, WebSubsessionDoneResult, WebSubsessionList, WebSubsessionMessageResult } from "../web/protocol.js";
 import type { WebCredentialRequest, WebCredentialResult, WebCredentialSubmit, WebHome, WebModelChangeResult, WebModelView, WebPermissionDecision, WebPermissionRequest, WebPermissionResult, WebPermissionRevokeResult } from "../web/protocol.js";
 import { modelLabel } from "../models.js";
 import { formatReactionMarker, formatReplyContextMarker } from "./text-utils.js";
@@ -77,10 +77,18 @@ export interface WebSubsessionAccess {
   message(id: string, text: string, requestId: string):
     | { ok: true; duplicate: boolean; task: WebSubsession }
     | { ok: false; reason: "unknown" | "ended" | "full" | "unreadable" };
+  /** The owner did what report `report` asked: exactly `/s <id> done <report>` (SubsessionService.markDone). */
+  done(id: string, report: number):
+    | { ok: true; task: WebSubsession }
+    | { ok: false; reason: "unknown" | "nothing" | "newer" | "unreadable" };
 }
 /** HTTP status of each refused sub-session message; the code names the reason. */
 const SUBSESSION_REFUSAL: Record<"unknown" | "ended" | "full" | "unreadable", [number, string]> = {
   unknown: [404, "subsession_not_found"], ended: [409, "subsession_ended"], full: [429, "subsession_inbox_full"], unreadable: [503, "subsessions_unavailable"],
+};
+/** HTTP status of each refused Done: nothing left to clear, or a newer report asks something the owner has not seen. */
+const SUBSESSION_DONE_REFUSAL: Record<"unknown" | "nothing" | "newer" | "unreadable", [number, string]> = {
+  unknown: [404, "subsession_not_found"], nothing: [409, "subsession_nothing_to_do"], newer: [409, "subsession_newer_report"], unreadable: [503, "subsessions_unavailable"],
 };
 /** Sub-session changes come in bursts (one turn writes the table several times): the browser hears of them at most this often. */
 export const SUBSESSION_EVENT_MS = 250;
@@ -726,6 +734,20 @@ export class WebChannel implements Channel {
     const result = this.subsessionAccess.message(id, input.text, input.requestId);
     if (!result.ok) { const [status, code] = SUBSESSION_REFUSAL[result.reason]; throw new WebError(status, code); }
     return { status: result.duplicate ? "duplicate" : "delivered", task: result.task };
+  }
+
+  /**
+   * The owner pressed Done on a finished task that needs them: the same as
+   * `/s <id> done <report>` from their DM. `report` is the report whose ask
+   * the page showed, so a newer report's ask is never cleared by it.
+   */
+  markSubsessionDone(id: string, input: SubsessionDoneInput): WebSubsessionDoneResult {
+    if (this.closed || this.tornDown) throw new WebError(503, "ingress_closed");
+    if (!this.subsessionAccess) throw new WebError(503, "subsessions_unavailable");
+    if (!this.ownerId || !this.owner) throw new WebError(409, "owner_setup_required");
+    const result = this.subsessionAccess.done(id, input.report);
+    if (!result.ok) { const [status, code] = SUBSESSION_DONE_REFUSAL[result.reason]; throw new WebError(status, code); }
+    return { task: result.task };
   }
 
   /** The sub-session table changed: tell the browser (coalesced, SUBSESSION_EVENT_MS). */

@@ -1,4 +1,4 @@
-import { activeTotalMs, currentStep, isTimestamp, needsOwner, type SubsessionRecord } from "../agent/subsessions/types.js";
+import { activeTotalMs, currentStep, isTimestamp, needsOwner, reportNumber, type SubsessionRecord } from "../agent/subsessions/types.js";
 import type { SubsessionEvent } from "../agent/subsessions/state-machine.js";
 import type { WebSubsession, WebSubsessionDetail, WebSubsessionMilestone, WebSubsessionStatus, WebSubsessionUpdate } from "./protocol.js";
 
@@ -51,7 +51,7 @@ export function subsessionView(record: SubsessionRecord, scope: string, now: num
     title: clip(record.title, TITLE_LIMIT).text,
     status,
     ...(status === "waiting" && record.waitingOn ? { waitingOn: record.waitingOn } : {}),
-    ...(action ? { ownerAction: clip(action, LINE_LIMIT).text } : {}),
+    ...(action ? { ownerAction: clip(action, LINE_LIMIT).text, reportSeq: reportNumber(record) } : {}),
     ...(step ? { step: clip(step, STEP_LIMIT).text } : {}),
     // Only an open task has a turn worth showing as running.
     working: working && OPEN.has(status),

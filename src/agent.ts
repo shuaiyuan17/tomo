@@ -2113,6 +2113,15 @@ export class Agent {
         const task = subsessionView(result.record, scope, Date.now(), working(result.record.sessionKey), live(result.record));
         return task ? { ok: true, duplicate: result.duplicate, task } : { ok: false, reason: "unknown" };
       },
+      done: (id, report) => {
+        const scope = this.router.ownerSessionKey();
+        if (!scope) return { ok: false, reason: "unknown" };
+        const result = service.markDone(scope, id, report);
+        if (!result.ok) return { ok: false, reason: result.reason };
+        log.info({ channel: "web", task: result.record.id, report }, "Owner marked a sub-session done");
+        const task = subsessionView(result.record, scope, Date.now(), working(result.record.sessionKey), live(result.record));
+        return task ? { ok: true, task } : { ok: false, reason: "unknown" };
+      },
     };
   }
 

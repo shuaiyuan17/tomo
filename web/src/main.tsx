@@ -1,6 +1,6 @@
 import { lazy, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { messageSubsession, taskAction } from "./api.js";
+import { markSubsessionDone, messageSubsession, taskAction } from "./api.js";
 import { activeSubsessions, useSubsessions } from "./subsessions.js";
 import { useWeb } from "./use-web.js";
 import { onResume, repaint } from "./resume.js";
@@ -86,11 +86,14 @@ export function App() {
   const subsessionList = useSubsessions(web.subsessionRevision);
   // A sub-session running now counts on the Tasks button like a running subagent.
   const running = runningCount(web.tasks) + activeSubsessions(subsessionList.tasks);
-  // The owner writes to one of their sub-sessions from its chat in the rail (same gate as a message).
+  // The owner writes to one of their sub-sessions from its chat in the rail, and marks what its report asked done (same gate as a message).
   const railSubsessions = { tasks: subsessionList.tasks, revision: web.subsessionRevision,
     ...(web.bootstrap?.ownerId ? { send: async (id: string, requestId: string, text: string) => {
       if (!web.bootstrap) throw new Error("not ready");
       return (await messageSubsession(id, { requestId, text }, web.bootstrap, web.refreshBootstrap)).task;
+    }, done: async (id: string, report: number) => {
+      if (!web.bootstrap) throw new Error("not ready");
+      return (await markSubsessionDone(id, { report }, web.bootstrap, web.refreshBootstrap)).task;
     } } : {}) };
   // Stop / move to background for an opened task of the owner conversation (same gate as a message).
   const taskControl = { ownerId: ownerId ?? undefined, act: async (task: { sessionId: string; taskId: string }, action: "stop" | "background") => {

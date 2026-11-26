@@ -14,14 +14,14 @@ import { type TaskRow, type TreeGuide, buildTaskView, formatElapsed, lastStep, r
 import { i18n, useTranslation } from "./i18n/index.js";
 import { toolIcon } from "./tool-calls.js";
 import { asksOwner, isOpenSubsession, subsessionState, subsessionStateLabel, isWorkingState } from "./subsessions.js";
-import { IdPill, SubsessionView, type SubsessionSend } from "./subsession-view.js";
+import { IdPill, SubsessionView, type SubsessionDone, type SubsessionSend } from "./subsession-view.js";
 import { RAIL_SCROLL, useScrollbarInPadding } from "./rail-scroll.js";
 
 /** A task's transcript view: its own chunk, fetched when a task is opened. */
 const SubagentView = lazy(() => import("./subagent-view.js").then((m) => ({ default: m.SubagentView })));
 
-/** The owner's sub-sessions as the rail shows them: the list, its revision (an open chat re-reads on it), and how to write to one. */
-export interface RailSubsessions { tasks: WebSubsession[]; revision: number; send?: SubsessionSend }
+/** The owner's sub-sessions as the rail shows them: the list, its revision (an open chat re-reads on it), how to write to one and to mark its report's ask done. */
+export interface RailSubsessions { tasks: WebSubsession[]; revision: number; send?: SubsessionSend; done?: SubsessionDone }
 
 /**
  * Shows what is running. The list itself offers nothing to act on; an opened task of the owner
@@ -63,7 +63,7 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessi
   // Above the view: its slide-in leaves it a layer of its own, which would cover the button.
   if (openSub && subsessions) return <div className="relative flex min-h-0 flex-1 flex-col">
     <div className="absolute top-0 right-1 z-10">{close}</div>
-    <SubsessionView key={openSub.id} summary={openSub} revision={subsessions.revision} send={subsessions.send} onBack={() => { setCameBack(true); setOpenedSub(undefined); }} />
+    <SubsessionView key={openSub.id} summary={openSub} revision={subsessions.revision} send={subsessions.send} done={subsessions.done} onBack={() => { setCameBack(true); setOpenedSub(undefined); }} />
   </div>;
   if (openTask) return <div className="motion-from-right relative flex min-h-0 flex-1 flex-col">
     <div className="absolute top-0 right-1">{close}</div>

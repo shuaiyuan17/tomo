@@ -35,7 +35,7 @@ describe("the rail's view of sub-sessions", () => {
   it("keeps a finished task that needs the owner with the open ones, however long ago it finished", () => {
     const old = NOW - SUBSESSION_ENDED_VISIBLE_MS - H;
     const tasks = [
-      record("s1", { status: "finished", endedAt: old, createdAt: NOW - 9 * H, ownerAction: "Merge PR #3" }),
+      record("s1", { status: "finished", endedAt: old, createdAt: NOW - 9 * H, ownerAction: "Merge PR #3", reportSeq: 2 }),
       record("s2", { status: "finished", endedAt: old }),
       record("s3", { status: "queued" }),
       // Set but no longer finished (reopened): not the owner's.
@@ -43,8 +43,10 @@ describe("the rail's view of sub-sessions", () => {
     ];
     const list = subsessionList(tasks, "dm:owner", NOW, () => false);
     expect(list.map((t) => t.id)).toEqual(["s1", "s3", "s4"]);
-    expect(list[0]).toMatchObject({ status: "finished", ownerAction: "Merge PR #3" });
+    // With the report the ask belongs to, which the Done button answers.
+    expect(list[0]).toMatchObject({ status: "finished", ownerAction: "Merge PR #3", reportSeq: 2 });
     expect(list[2]).not.toHaveProperty("ownerAction");
+    expect(list[2]).not.toHaveProperty("reportSeq");
   });
 
   it("lists open tasks oldest first, then recently ended ones newest first, and drops old ended ones", () => {
@@ -213,7 +215,7 @@ function setup(access?: Partial<WebSubsessionAccess>, configured: OwnerConfig | 
   const bus = new WatchBus();
   const full: WebSubsessionAccess | undefined = access ? {
     list: () => ({ available: true, tasks: [summary("s1")] }), get: () => undefined,
-    message: () => ({ ok: true, duplicate: false, task: summary("s1") }), ...access } : undefined;
+    message: () => ({ ok: true, duplicate: false, task: summary("s1") }), done: () => ({ ok: true, task: summary("s1") }), ...access } : undefined;
   const channel = new WebChannel(configured ?? undefined, bus, { ...(full ? { subsessions: full } : {}) });
   channels.push(channel);
   const handler = vi.fn(async () => true);
@@ -247,6 +249,21 @@ describe("WebChannel: the owner's sub-sessions", () => {
     expect(() => setup({ get: () => null }).channel.subsession("s1")).toThrow(expect.objectContaining({ status: 503, code: "subsessions_unavailable" }));
   });
 
+  it("Done goes through the access with the report the page showed, and names each refusal", () => {
+    const done = vi.fn(() => ({ ok: true as const, task: summary("s1") }));
+    const { channel, handler } = setup({ done });
+    expect(channel.markSubsessionDone("s1", { report: 2 })).toEqual({ task: summary("s1") });
+    expect(done).toHaveBeenCalledWith("s1", 2);
+    expect(handler).not.toHaveBeenCalled();
+    const codes: Array<[string, number, string]> = [["unknown", 404, "subsession_not_found"], ["nothing", 409, "subsession_nothing_to_do"], ["newer", 409, "subsession_newer_report"], ["unreadable", 503, "subsessions_unavailable"]];
+    for (const [reason, status, code] of codes) {
+      const { channel: refusing } = setup({ done: () => ({ ok: false, reason: reason as "unknown" }) });
+      expect(() => refusing.markSubsessionDone("s1", { report: 1 })).toThrow(expect.objectContaining({ status, code }));
+    }
+    expect(() => setup().channel.markSubsessionDone("s1", { report: 1 })).toThrow(expect.objectContaining({ status: 503, code: "subsessions_unavailable" }));
+    expect(() => setup({}, null).channel.markSubsessionDone("s1", { report: 1 })).toThrow(expect.objectContaining({ status: 409, code: "owner_setup_required" }));
+  });
+
   it("tells the browser of a burst of table changes once", async () => {
     vi.useFakeTimers();
     const { channel, events } = setup({});
@@ -276,5 +293,11 @@ describe("the RPC surface for sub-sessions", () => {
     expect(ok({ method: "subsession-message", epoch, id: "s1", input: { requestId: randomUUID(), text: "hi" } })).toBe(true);
     expect(ok({ method: "subsession-message", epoch, id: "s1", input: { requestId: randomUUID(), text: "   " } })).toBe(false);
     expect(ok({ method: "subsession-message", epoch, id: "s1", input: { requestId: randomUUID(), text: "hi", targetId: "x" } })).toBe(false);
+    // Done names a report: a whole number from 1, nothing else.
+    expect(ok({ method: "subsession-done", epoch, id: "s1", input: { report: 1 } })).toBe(true);
+    for (const report of [0, -1, 1.5, "1", undefined]) expect(ok({ method: "subsession-done", epoch, id: "s1", input: { report } })).toBe(false);
+    expect(ok({ method: "subsession-done", epoch, id: "s1", input: { report: 1, extra: true } })).toBe(false);
+    expect(ok({ method: "subsession-done", id: "s1", input: { report: 1 } })).toBe(false);
+    expect(ok({ method: "subsession-done", epoch, id: "task:s1", input: { report: 1 } })).toBe(false);
   });
 });

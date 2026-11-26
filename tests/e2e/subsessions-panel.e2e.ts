@@ -271,3 +271,25 @@ it("keeps the rail's content centred, gap for gap, and both input bars' placehol
     }
   }
 }, 120_000);
+
+it("Done on a task that needs the owner clears what its report asked, as `/s <id> done <report>` does", async () => {
+  expect(agent.subsessions!.spawn("dm:owner", { title: "Ship 1.9", brief: "b" }).ok).toBe(true);
+  // As task_finish leaves a second report that asks the owner to merge.
+  const store = (agent.subsessions as unknown as { store: {
+    transition: (id: string, e: string, o: object) => { ok: boolean };
+    update: (id: string, fn: (r: Record<string, unknown>) => void) => unknown;
+  } }).store;
+  await browserExpect.poll(() => agent.subsessions!.get("s1")?.status).toBe("active");
+  expect(store.transition("s1", "finish", { expectFrom: ["active"] }).ok).toBe(true);
+  store.update("s1", (r) => { r.ownerAction = "Merge PR #3"; r.reportSeq = 2; });
+  channel.publishSubsessionsChanged();
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  const row = rail().locator('[data-subsession-row="s1"]');
+  await browserExpect(row).toContainText("Needs you");
+  await row.getByRole("button").click();
+  await browserExpect(rail().getByTestId("subsession-state")).toContainText("Merge PR #3");
+  await rail().getByRole("button", { name: "Done", exact: true }).click();
+  await browserExpect.poll(() => agent.subsessions!.get("s1")!.ownerAction).toBeUndefined();
+  await browserExpect(rail().getByRole("button", { name: "Done", exact: true })).toHaveCount(0);
+  await browserExpect(rail().getByTestId("subsession-state")).not.toContainText("Needs you");
+});

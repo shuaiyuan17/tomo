@@ -1,4 +1,4 @@
-import type { SubsessionMessageInput, WebSubsessionMessageResult } from "../../src/web/protocol.js";
+import type { SubsessionDoneInput, SubsessionMessageInput, WebSubsessionDoneResult, WebSubsessionMessageResult } from "../../src/web/protocol.js";
 import type { EventEnvelope, MessageInput, WebBootstrap, WebCompactResult, WebCredentialResult, WebCredentialSubmit, WebEvent, WebPermissionDecision, WebPermissionResult, WebRequest, TaskAction, WebSnapshot, WebStopResult, WebTaskActionResult } from "../../src/web/protocol.js";
 
 export class ApiError extends Error {
@@ -80,6 +80,11 @@ export function taskAction(sessionId: string, taskId: string, action: TaskAction
 /** The owner writes to one of their sub-sessions (the same as `/s <id> <text>`). Same CSRF/epoch rules as sending a message. */
 export function messageSubsession(id: string, input: SubsessionMessageInput, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebSubsessionMessageResult> {
   return mutate<WebSubsessionMessageResult>(`/subsessions/${encodeURIComponent(id)}/messages`, "POST", input, bootstrap, refresh);
+}
+
+/** The owner did what a finished task's report asked (the same as `/s <id> done <report>`). Same CSRF/epoch rules. */
+export function markSubsessionDone(id: string, input: SubsessionDoneInput, bootstrap: WebBootstrap, refresh: () => Promise<WebBootstrap>): Promise<WebSubsessionDoneResult> {
+  return mutate<WebSubsessionDoneResult>(`/subsessions/${encodeURIComponent(id)}/done`, "POST", input, bootstrap, refresh);
 }
 
 /** Ask Tomo to compact the owner's session. Same CSRF/epoch rules as sending a message. */

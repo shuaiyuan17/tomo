@@ -43,6 +43,13 @@ export const tasks = {
     label: "发给 {{id}} 的消息", placeholder: "给 {{id}} 发消息…", send: "发给 {{id}}",
     sending: "发送中…", sent: "已发送", retry: "重试",
     ended: "这个任务已经结束，不能再发消息。", gone: "这个任务已经不在了。",
+    markDone: {
+      label: "完成", marking: "正在标记…", title: "报告里要你做的事已经做完",
+      error: {
+        nothing: "没什么要标记的：它已经不需要你做什么了。", newer: "有一份更新的报告，先看看它。",
+        gone: "这个任务已经不在了。", unavailable: "现在连不上子会话。", network: "没收到确认，再试一次。",
+      },
+    },
     error: {
       ended: "没发出：任务已经结束。", full: "没发出：等它处理的消息太多了。",
       gone: "没发出：任务已经不在了。", unavailable: "没发出：现在连不上子会话。",

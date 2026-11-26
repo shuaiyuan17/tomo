@@ -18,9 +18,12 @@ import { i18n, useTranslation } from "./i18n/index.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
 // i18n-dynamic: tasks:subsession.error.*
+// i18n-dynamic: tasks:subsession.markDone.error.*
 
 /** How the view sends the owner's words: resolves when the task has them, rejects with the refusal. */
 export type SubsessionSend = (id: string, requestId: string, text: string) => Promise<WebSubsession>;
+/** How the view marks a finished task's report done (by the report number it showed): resolves with the task, rejects with the refusal. */
+export type SubsessionDone = (id: string, report: number) => Promise<WebSubsession>;
 
 const ERRORS = {
   subsession_ended: "tasks:subsession.error.ended", subsession_inbox_full: "tasks:subsession.error.full",
@@ -30,6 +33,14 @@ const ERRORS = {
 /** Which message a failed send shows, by the refusal's code; anything unknown counts as the network. */
 const errorKey = (error: unknown): keyof typeof ERRORS =>
   error instanceof ApiError && error.code in ERRORS ? error.code as keyof typeof ERRORS : "network";
+
+const DONE_ERRORS = {
+  subsession_nothing_to_do: "tasks:subsession.markDone.error.nothing", subsession_newer_report: "tasks:subsession.markDone.error.newer",
+  subsession_not_found: "tasks:subsession.markDone.error.gone", subsessions_unavailable: "tasks:subsession.markDone.error.unavailable",
+  network: "tasks:subsession.markDone.error.network",
+} as const;
+const doneErrorKey = (error: unknown): keyof typeof DONE_ERRORS =>
+  error instanceof ApiError && error.code in DONE_ERRORS ? error.code as keyof typeof DONE_ERRORS : "network";
 
 type Status = "loading" | "ready" | "gone" | "error";
 
@@ -44,7 +55,7 @@ type Status = "loading" | "ready" | "gone" | "error";
  * is a message or a report, that folds into one line under the brief, above the chat (the step
  * it is on), which opens it again.
  */
-export function SubsessionView({ summary, revision, onBack, send }: { summary: WebSubsession; revision: number; onBack: () => void; send?: SubsessionSend }) {
+export function SubsessionView({ summary, revision, onBack, send, done }: { summary: WebSubsession; revision: number; onBack: () => void; send?: SubsessionSend; done?: SubsessionDone }) {
   const { t } = useTranslation("tasks");
   const [detail, setDetail] = useState<WebSubsessionDetail>();
   const [status, setStatus] = useState<Status>("loading");
@@ -65,9 +76,14 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
       });
     return () => { controller.abort(); clearTimeout(timer); };
   }, [id, revision, reload]);
+  // The task as Done returned it, while the list still shows the ask it cleared: the list can lag (coalesced),
+  // or no longer carry the task at all (an old one leaves it once it no longer needs the owner), and the rail
+  // then keeps the summary it was opened with. A list showing anything else (a newer report) wins.
+  const [marked, setMarked] = useState<{ task: WebSubsession; report: number }>();
+  const current = marked && summary.ownerAction !== undefined && summary.reportSeq === marked.report ? marked.task : summary;
   // What the list says now wins over the last detail read (it is the newer of the two).
   // `background` is dropped, not set false, when it ends: take it from the list alone.
-  const shown = withListBackground(detail, summary);
+  const shown = withListBackground(detail, current);
   const state = subsessionState(shown);
   // Not before the conversation has been read: a message must have somewhere to show.
   const writable = !!send && shown.writable && status !== "gone" && !!detail;
@@ -106,6 +122,8 @@ export function SubsessionView({ summary, revision, onBack, send }: { summary: W
       <p className="m-0 mt-0.5 tracking-[0.02em] text-[10px] text-muted-foreground [overflow-wrap:anywhere]" data-testid="subsession-state">
         {isWorkingState(state) ? <span className="shimmer">{subsessionStateLabel(shown)}</span> : <span className={cn(asksOwner(state) && "font-medium text-foreground/80")}>{subsessionStateLabel(shown)}</span>}
         {asksOwner(state) && ownerAsk(shown) ? <> · {ownerAsk(shown)}</> : null}</p>
+      {done && state === "needsYou" && shown.reportSeq !== undefined
+        ? <MarkDone key={shown.reportSeq} id={id} report={shown.reportSeq} done={done} onDone={(task, report) => { setMarked({ task, report }); setReload((n) => n + 1); }} /> : null}
     </div>
     <Chat rows={rows} status={detail ? "ready" : status} id={id} onRetry={deliver} follow={chatFirst}
       fold={progress && foldLine ? <ProgressFold summary={foldLine} open={progressOpen} onOpenChange={setProgressOpen}>
@@ -360,5 +378,26 @@ function SubsessionComposer({ id, writable, ended, onSend }: { id: string; writa
       <Button type="submit" size="icon" aria-label={t("subsession.send", { id })} disabled={!canSend}
         className={cn(COMPOSER_SEND, "[&_svg:not([class*='size-'])]:size-4")}><ArrowUp strokeWidth={2.2} /></Button>
     </form>
+  </div>;
+}
+
+/**
+ * "Done" on a task whose report asks the owner to do something: the same as
+ * `/s <id> done <report>`. It names the report it was shown with, so a newer
+ * report's ask is never cleared by it. Keyed by that report, so a new one starts fresh.
+ */
+function MarkDone({ id, report, done, onDone }: { id: string; report: number; done: SubsessionDone; onDone: (task: WebSubsession, report: number) => void }) {
+  const { t } = useTranslation("tasks");
+  const [state, setState] = useState<{ marking: boolean; error?: keyof typeof DONE_ERRORS }>({ marking: false });
+  const mark = () => {
+    setState({ marking: true });
+    void done(id, report).then((task) => { setState({ marking: false }); onDone(task, report); },
+      (error: unknown) => setState({ marking: false, error: doneErrorKey(error) }));
+  };
+  return <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1">
+    <Button type="button" variant="outline" size="sm" onClick={mark} disabled={state.marking} title={t("subsession.markDone.title")}
+      className="h-7 gap-1 rounded-lg px-2 text-[12px]"><Check className="size-3.5" aria-hidden="true" />
+      {state.marking ? t("subsession.markDone.marking") : t("subsession.markDone.label")}</Button>
+    {state.error ? <span role="status" className="text-[11px] text-muted-foreground">{i18n.t(DONE_ERRORS[state.error])}</span> : null}
   </div>;
 }

@@ -295,6 +295,123 @@ describe("SubsessionService", () => {
     expect(h.store.get(t.id)).toMatchObject({ seenThrough: 0, pendingInput: [{ seq: 1 }] });
   });
 
+  it("the owner's words relayed to a task a note already queued start it past the slot cap", async () => {
+    const h = harness({ maxRunning: 1 }, (turn, hh) => {
+      if (turn.key === "task:s2") return new Promise(() => {}); // s2 keeps the one slot
+      hh.service.noteToolUse(turn.key);
+      return { ok: true };
+    });
+    h.service.start();
+    const waiter = spawn(h, "waits on a check-back");
+    h.cron.set(waiter.sessionKey, 1);
+    await flush();
+    expect(h.store.get(waiter.id)).toMatchObject({ status: "waiting", waitingOn: "external" });
+    spawn(h, "busy");
+    await flush();
+    // The main session's note queues it behind the busy slot...
+    h.service.relay(waiter.id, "any news?");
+    await flush();
+    expect(h.store.get(waiter.id)?.status).toBe("queued");
+    const turns = h.turns.length;
+    // ...but the owner's own words never wait for a slot.
+    expect(h.service.relay(waiter.id, "check now please", said("check now please")).ok).toBe(true);
+    await flush();
+    expect(h.turns.length).toBeGreaterThan(turns);
+    expect(h.turns.at(-1)?.prompt).toContain("check now please");
+    expect(h.turns.at(-1)?.prompt).toContain("any news?");
+  });
+
+  it("a relay with the owner's words whose start failed is started past the slot cap by the scheduler's next run", async () => {
+    const h = harness({ maxRunning: 1 }, (turn, hh) => {
+      if (turn.key === "task:s2") return new Promise(() => {}); // s2 keeps the one slot
+      hh.service.noteToolUse(turn.key);
+      return { ok: true };
+    });
+    h.service.start();
+    const waiter = spawn(h, "waits on a check-back");
+    h.cron.set(waiter.sessionKey, 1);
+    await flush();
+    spawn(h, "busy");
+    await flush();
+    h.service.relay(waiter.id, "any news?");
+    await flush();
+    expect(h.store.get(waiter.id)?.status).toBe("queued");
+    const svc = h.service as unknown as { startTask: (id: string, why: string) => boolean; schedule: () => void };
+    const real = svc.startTask.bind(h.service);
+    const spy = vi.spyOn(svc, "startTask").mockImplementationOnce(() => { throw new Error("disk full"); });
+    expect(h.service.relay(waiter.id, "check now please", said("check now please")).ok).toBe(true);
+    await flush();
+    expect(h.store.get(waiter.id)?.status).toBe("queued");
+    spy.mockImplementation(real);
+    const turns = h.turns.length;
+    svc.schedule();
+    await flush();
+    expect(h.turns.length).toBeGreaterThan(turns);
+    expect(h.turns.at(-1)?.prompt).toContain("check now please");
+  });
+
+  it("the main session's own note queues a task waiting on something external for a slot, like a check-back", async () => {
+    const h = harness({ maxRunning: 1 }, (turn, hh) => {
+      if (turn.key === "task:s2") return new Promise(() => {}); // s2 keeps the one slot
+      hh.service.noteToolUse(turn.key);
+      return { ok: true };
+    });
+    h.service.start();
+    const waiter = spawn(h, "waits on a check-back");
+    h.cron.set(waiter.sessionKey, 1);
+    await flush();
+    expect(h.store.get(waiter.id)).toMatchObject({ status: "waiting", waitingOn: "external" });
+    spawn(h, "busy");
+    await flush();
+    expect(h.store.list().filter((x) => x.status === "active")).toHaveLength(1);
+    const turns = h.turns.length;
+    // Autonomous work: it waits for a slot like a cron check-back.
+    expect(h.service.relay(waiter.id, "any news?")).toMatchObject({ ok: true, changed: true });
+    await flush();
+    expect(h.store.get(waiter.id)?.status).toBe("queued");
+    expect(h.store.list().filter((x) => x.status === "active")).toHaveLength(1);
+    expect(h.turns).toHaveLength(turns);
+    // The slot frees: it runs, with the note.
+    await h.service.cancel("s2", "test");
+    await flush();
+    expect(h.turns.at(-1)?.key).toBe(waiter.sessionKey);
+    expect(h.turns.at(-1)?.prompt).toContain("any news?");
+  });
+
+  it("a driver that throws is tried again by the retry timer, never at once in a loop", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness();
+      h.service.start();
+      const t = spawn(h);
+      await flush();
+      expect(h.store.get(t.id)?.status).toBe("waiting");
+      // Its conversation is gone and the table will not take the failure:
+      // the driver throws before its turn, every time.
+      h.sdk.delete(t.sessionKey);
+      const real = h.store.transition.bind(h.store);
+      let failWrites = 0;
+      let writeFails = true;
+      h.store.transition = ((...args: Parameters<typeof real>) => {
+        if (args[1] === "fail" && writeFails && failWrites < 200) { failWrites += 1; throw new Error("disk full"); }
+        return real(...args);
+      }) as typeof real;
+      h.service.relay(t.id, "go on", said("go on"));
+      await flush();
+      expect(failWrites).toBe(1);
+      vi.advanceTimersByTime(SETTLE_RETRY_MS);
+      await flush();
+      expect(failWrites).toBe(2);
+      writeFails = false;
+      vi.advanceTimersByTime(SETTLE_RETRY_MS);
+      await flush();
+      expect(h.store.get(t.id)?.status).toBe("failed");
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a relay with the owner's words wakes a task waiting for the owner, past the slot cap; a note alone is held", async () => {
     let n = 0;
     const h = harness({ maxRunning: 1 }, (turn, hh) => {
@@ -2379,7 +2496,11 @@ describe("SubsessionService: task_finish never leaves input unread", () => {
       if (n > 4) return;
       // More keeps arriving every turn, as fast as it is read.
       hh.service.relay("s1", `relay ${n}`);
-      for (let i = 0; i < 3; i++) results.push(hh.service.finish(turn.key, `report ${n}`) as { ok: boolean; unread?: number });
+      for (let i = 0; i < 3; i++) {
+        const r = hh.service.finish(turn.key, `report ${n}`) as { ok: boolean; unread?: number };
+        results.push(r);
+        if (r.ok) break; // finished: a second finish would be illegal
+      }
     }));
     h.service.start();
     const t = spawn(h);

@@ -697,8 +697,10 @@ export class SubsessionService {
       ? { from: "owner", words: ownerMessages.map((m) => m.text).join("\n\n") }
       : { from: "main", words: text };
     // Framed as the answer to the question the main session put to the owner;
-    // a question the task sent the owner directly was not put by it.
-    return this.deliverInput(id, "relay", (r) => formatRelayEvent(text, r.askViaMain && !r.askViaMain.direct ? r.askViaMain.text : undefined, ownerMessages), origin);
+    // a question the task sent the owner directly was not put by it. A note
+    // with none of the owner's words is the session's own (autonomous) work:
+    // it queues a task waiting on something external, never past the cap.
+    return this.deliverInput(id, ownerMessages.length > 0 ? "relay" : "note", (r) => formatRelayEvent(text, r.askViaMain && !r.askViaMain.direct ? r.askViaMain.text : undefined, ownerMessages), origin);
   }
 
   /** relay() of a note alone to a task waiting for the owner: kept for the owner's wake ("answer" to a recorded question, else "paused"); undefined when the task is not waiting for the owner. */
@@ -2008,11 +2010,12 @@ export class SubsessionService {
     const queued = tasks.filter((t) => t.status === "queued")
       .sort((a, b) => Number(b.resumeNeeded) - Number(a.resumeNeeded) || a.createdAt - b.createdAt);
     const max = this.deps.config().maxRunning;
-    // A queued task holding a message the owner wrote to it never waits for
-    // a slot. Read from the table, so a start that failed, or that a restart
-    // cut off, is made here the next time the scheduler runs.
+    // A queued task holding the owner's own words (a message they wrote to
+    // it, or a relay with theirs attached) never waits for a slot. Read from
+    // the table, so a start that failed, or that a restart cut off, is made
+    // here the next time the scheduler runs.
     for (const task of queued) {
-      if (!task.pendingInput.some(isOwnerMessageInput)) continue;
+      if (!task.pendingInput.some(isOwnerInput)) continue;
       try {
         if (this.startTask(task.id, "the owner wrote to it")) active += 1;
       } catch (err) {
@@ -2132,14 +2135,14 @@ export class SubsessionService {
 
   private deliverInput(
     id: string,
-    event: Extract<SubsessionEvent, "relay" | "owner_message">,
+    event: Extract<SubsessionEvent, "relay" | "note" | "owner_message">,
     prompt: string | ((record: SubsessionRecord) => string),
     origin: InputOrigin,
     extra?: (record: SubsessionRecord) => void,
   ): TransitionOutcome {
     const now = this.now();
     const outcome = this.transition(id, event, {
-      reason: event === "relay" ? "a message from the main session" : "a message from the owner",
+      reason: event === "owner_message" ? "a message from the owner" : "a message from the main session",
       // A task waiting on the owner always takes their word, even past the
       // limit: only it wakes the task, which then works the queue down.
       guard: (r) => (origin.from === "owner" && r.status === "waiting" && r.waitingOn === "owner" ? undefined : inputQueueFull(r)),
@@ -2156,23 +2159,27 @@ export class SubsessionService {
       this.kick(id);
       return outcome;
     }
-    // Queued: a relay waits for its slot and goes with the first turn. The
-    // owner's message never waits for a slot: it starts the task, like
+    // Queued: the main session's own note waits for its slot and goes with
+    // the first turn (a note that woke a waiting task asks the scheduler for
+    // one now). The owner's words never wait for a slot, whether they came as
+    // a message or attached to a relay: they start the task, like
     // `/s <id> start`.
-    if (event === "owner_message") {
-      try {
-        this.startTask(id, "the owner wrote to it");
-      } catch (err) {
-        // The message is on the task already: it must not be reported as
-        // undelivered (the caller would hand it to the owning session too).
-        // The scheduler starts it from the table at the next recheck (and
-        // after a restart), past the slot cap.
-        log.error({ err, id }, "Could not start a queued sub-session for the owner's message; trying again shortly");
-        this.armRegistryRecheck();
-      }
-      return { ...outcome, record: this.safeGet(id) ?? outcome.record };
+    if (origin.from !== "owner") {
+      // The note is on the task already: a failed start must not fail its delivery.
+      if (outcome.changed) this.safely(() => this.schedule(), "schedule after a note");
+      return outcome;
     }
-    return outcome;
+    try {
+      this.startTask(id, "the owner wrote to it");
+    } catch (err) {
+      // The message is on the task already: it must not be reported as
+      // undelivered (the caller would hand it to the owning session too).
+      // The scheduler starts it from the table at the next recheck (and
+      // after a restart), past the slot cap.
+      log.error({ err, id }, "Could not start a queued sub-session for the owner's message; trying again shortly");
+      this.armRegistryRecheck();
+    }
+    return { ...outcome, record: this.safeGet(id) ?? outcome.record };
   }
 
   /** Run the task's driver unless one is running. */
@@ -2180,13 +2187,24 @@ export class SubsessionService {
     // Closed until start(): start() kicks every task with a turn owed.
     if (!this.open || this.driving.has(id) || this.settleTimers.has(id) || this.registryHeld.has(id) || this.deps.isStopping()) return;
     this.driving.add(id);
+    let threw = false;
     void this.drive(id)
-      .catch((err) => log.error({ err, id }, "Sub-session driver failed"))
+      .catch((err) => {
+        threw = true;
+        log.error({ err, id }, "Sub-session driver failed; trying it again later");
+      })
       .finally(() => {
         this.driving.delete(id);
-        // Input that arrived while the last turn was ending.
-        const record = this.safeGet(id);
-        if (record && record.status !== "queued" && !TERMINAL_STATUSES.has(record.status) && this.plan(record)) this.kick(id);
+        // A driver that threw leaves its turn owed. Asked again by the retry
+        // timer, never at once: a failure that persists (a table that reads
+        // but will not write) would otherwise re-run it in a loop, before
+        // anything else (a timer, I/O, any channel) gets to run.
+        if (threw) this.retryAfterSettleFailure(id);
+        else {
+          // Input that arrived while the last turn was ending.
+          const record = this.safeGet(id);
+          if (record && record.status !== "queued" && !TERMINAL_STATUSES.has(record.status) && this.plan(record)) this.kick(id);
+        }
         this.schedule();
       });
   }

@@ -9,9 +9,14 @@ import type { SubsessionStatus, WaitingOn } from "./types.js";
  * Two rules shape the table:
  * - AUTONOMOUS WORK GOES THROUGH THE SCHEDULER. A start, a cron check-back,
  *   a background report on a task waiting on something external and a
- *   resume after a restart all land in `queued`; only the scheduler
- *   (`start`) moves a task to `active`, so the slot cap and (later) the quota
- *   gate apply to every one of them in one place.
+ *   resume after a restart all land in `queued`; `start` (the scheduler) is
+ *   the only autonomous way to `active`, so the slot cap and the quota gate
+ *   apply to every one of them in one place. The other routes there take no
+ *   new slot: `owner_message` and `relay` from waiting carry the owner's
+ *   words, and `reopen` is made inside a turn the task is already running.
+ *   A finished task stays finished while it answers what it is sent; a turn
+ *   of it with none of the owner's words (a `note`) waits for a slot in the
+ *   service's driver (`waitsForSlot`), since no status change marks it.
  * - THE OWNER IS NEVER QUEUED. A message from the owner (or a relay from the
  *   owning session that carries the owner's own words) gets its turn
  *   whatever the slots say, and wakes a waiting task. A waiting(owner) task

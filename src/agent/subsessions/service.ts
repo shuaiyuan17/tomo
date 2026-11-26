@@ -2069,7 +2069,7 @@ export class SubsessionService {
       this.armRegistryRecheck();
       return;
     }
-    let active = tasks.filter((t) => t.status === "active").length;
+    let active = this.busyCount(tasks);
     const queued = tasks.filter((t) => t.status === "queued")
       .sort((a, b) => Number(b.resumeNeeded) - Number(a.resumeNeeded) || a.createdAt - b.createdAt);
     const max = this.deps.config().maxRunning;
@@ -2089,6 +2089,14 @@ export class SubsessionService {
     for (const task of queued) {
       if (active >= max) break;
       if (this.startQueued(task.id, "a slot is free", false)) active += 1;
+    }
+    // A finished task holding a note from its owning session waited for a
+    // slot in kick(); it gets one after the queued tasks.
+    for (const task of tasks) {
+      if (active >= max) break;
+      if (task.status !== "finished" || this.driving.has(task.id) || !this.plan(task)) continue;
+      this.kick(task.id);
+      if (this.driving.has(task.id)) active += 1;
     }
   }
 
@@ -2249,6 +2257,7 @@ export class SubsessionService {
   private kick(id: string): void {
     // Closed until start(): start() kicks every task with a turn owed.
     if (!this.open || this.driving.has(id) || this.settleTimers.has(id) || this.registryHeld.has(id) || this.deps.isStopping()) return;
+    if (this.waitsForSlot(id)) return;
     this.driving.add(id);
     let threw = false;
     void this.drive(id)
@@ -2272,6 +2281,37 @@ export class SubsessionService {
       });
   }
 
+  /**
+   * Tasks using a slot: every active one, and a finished one whose driver is
+   * running (it is answering something it was sent).
+   */
+  private busyCount(tasks: readonly SubsessionRecord[]): number {
+    return tasks.filter((t) => t.status === "active" || (t.status === "finished" && this.driving.has(t.id))).length;
+  }
+
+  /**
+   * A finished task's turn with none of the owner's new words in it (a note
+   * from the owning session) is autonomous work: it runs only while a slot is
+   * free, and schedule() gives it one later. kick() asks here for every
+   * path, and drive() before each further turn of a driver already running
+   * (`self`: that driver's own slot is not counted). Read from the pending
+   * input, not the planned turn: a compact planned ahead of the owner's
+   * message is still the owner's turn, and owner input held for their next
+   * message (at or below heldThrough) is not new words. Unreadable: not held
+   * here (the driver reads the table again and stops on its own).
+   */
+  private waitsForSlot(id: string, self = false): boolean {
+    try {
+      const record = this.store.get(id);
+      if (record?.status !== "finished" || !this.plan(record)) return false;
+      const held = record.heldThrough ?? 0;
+      if (record.pendingInput.some((i) => i.seq > held && isOwnerInput(i))) return false;
+      return this.busyCount(this.store.list()) - (self && this.driving.has(id) ? 1 : 0) >= this.deps.config().maxRunning;
+    } catch {
+      return false;
+    }
+  }
+
   private async drive(id: string): Promise<void> {
     for (;;) {
       if (this.deps.isStopping()) return;
@@ -2285,6 +2325,8 @@ export class SubsessionService {
       if (!record || record.status === "queued" || TERMINAL_STATUSES.has(record.status)) return;
       const turn = this.plan(record);
       if (!turn) return;
+      // A note that came in during the last turn waits for a slot like any other.
+      if (this.waitsForSlot(id, true)) return;
       if (this.mayRun(record) !== "run") return;
       // A turn the task gives itself (a continue, a check-back, its start)
       // first passes the wall-clock cap and the quota gate.

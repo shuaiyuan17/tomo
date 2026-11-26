@@ -136,13 +136,19 @@ it("on a phone: no zoom-triggering fields, a compact header, and the view follow
   await page.keyboard.press("End");
   await browserExpect.poll(gap).toBeLessThan(2);
   // A picture has no height until it loads: the reader, at the end, must stay at the end.
-  await scroller.evaluate((element) => {
-    const image = document.createElement("img");
-    image.alt = "late";
-    image.src = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="200" height="400"><rect width="200" height="400" fill="gray"/></svg>')}`;
-    [...element.querySelectorAll("article.message")].at(-1)!.appendChild(image);
+  // The picture is put into the last message by hand, so a re-render of that message (the
+  // turn settling after its text is already shown) can drop it: put it back while polling.
+  const lateImageHeight = () => scroller.evaluate((element) => {
+    let image = element.querySelector<HTMLImageElement>('img[alt="late"]');
+    if (!image) {
+      image = document.createElement("img");
+      image.alt = "late";
+      image.src = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="200" height="400"><rect width="200" height="400" fill="gray"/></svg>')}`;
+      [...element.querySelectorAll("article.message")].at(-1)!.appendChild(image);
+    }
+    return image.naturalHeight;
   });
-  await browserExpect.poll(() => scroller.evaluate((element) => (element.querySelector('img[alt="late"]') as HTMLImageElement).naturalHeight)).toBe(400);
+  await browserExpect.poll(lateImageHeight).toBe(400);
   await browserExpect.poll(gap).toBeLessThan(2);
   await scroller.evaluate((element) => element.querySelector('img[alt="late"]')!.remove());
   await page.screenshot({ path: "test-results/chat-phone.png" });

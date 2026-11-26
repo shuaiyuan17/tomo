@@ -75,22 +75,44 @@ export interface SubsessionInput {
   seq: number;
   text: string;
   /**
-   * "owner": the owner's word (a relay from the owning session, or a message
-   * from the owner). A turn carrying one is never held by the wall-clock cap
-   * or the quota gate, and a failed task hands it back to the owner.
-   * Unset: the harness's own (a check-back, a background report).
+   * "owner": the owner's own words: a message they wrote to the task, or a
+   * relay the owning session attached their messages to (copied by the
+   * harness from the turn they wrote them in, never typed by the model). A
+   * turn carrying one is never held by the wall-clock cap or the quota gate,
+   * and a failed task hands it back to the owner.
+   * "main": a relay that carries only the owning session's own note. It wakes
+   * the task like any relay, but it is not the owner's word: it passes no
+   * gate, does not restart the wall-clock cap, and is not handed back.
+   * "harness": the harness's own (a check-back, a "continue", a background
+   * report), and every input read without an origin: only an input created
+   * as the owner's is ever theirs (never guessed from its text).
    */
-  from?: "owner";
-  /** For an owner input: what was said, without the event wrapper (quoted back if it is never answered). */
+  from: "owner" | "main" | "harness";
+  /**
+   * Set on every owner input written since origins were checked. Before
+   * that, every relay was stored as `from: "owner"`, the main session's own
+   * notes included: an owner input without it is read as a main-session
+   * note (fail closed), never as the owner's word, unless it is an owner
+   * message (`OWNER_MESSAGE_MARKER`), which only the owner's `/s` or panel
+   * message ever was.
+   */
+  checked?: true;
+  /** For an owner input or a main-session note: what was said, without the event wrapper (quoted back if it is never answered). */
   words?: string;
   /** "panel": the owner wrote it in the web task panel (an answer to it stays there). */
   source?: "panel";
 }
 
-/** Append an input: the only way one is added. */
-export function appendInput(record: SubsessionRecord, text: string, origin?: { from: "owner"; words: string; source?: "panel" }): void {
+export type InputOrigin = { from: "owner"; words: string; source?: "panel" } | { from: "main"; words: string } | { from: "harness" };
+
+/** The harness's own input (a check-back, a "continue", a start, a background report). */
+export const HARNESS: InputOrigin = { from: "harness" };
+
+/** Append an input: the only way one is added. Every input says where it came from. */
+export function appendInput(record: SubsessionRecord, text: string, origin: InputOrigin): void {
   record.pendingInput.push({ seq: record.nextInputSeq, text,
-    ...(origin ? { from: origin.from, words: origin.words, ...(origin.source ? { source: origin.source } : {}) } : {}) });
+    ...(origin.from === "owner" ? { from: origin.from, checked: true as const, words: origin.words, ...(origin.source ? { source: origin.source } : {}) }
+      : origin.from === "main" ? { from: "main" as const, words: origin.words } : { from: "harness" as const }) });
   record.nextInputSeq += 1;
 }
 
@@ -292,19 +314,35 @@ export interface SubsessionRecord {
   /**
    * The record came from `.bak` (the primary table was lost or unreadable):
    * its status may be older than what happened, so no cleanup acts on it
-   * (archive, forget, unlink, cron removal). Cleared only by an ending this
-   * process saw happen (task_finish, a cancel).
+   * (archive, forget, unlink, cron removal). Cleared by an ending this
+   * process saw happen (task_finish, a cancel, any move to a terminal
+   * status), or by the owner's `/s trust`; never by time. Never set on a
+   * terminal record: cancelled, failed and archived never change again, so
+   * a backup cannot hold an older version of them.
    */
   restored?: boolean;
   /** Recent messages the task sent out, newest last (at most SENT_KEEP). */
   sent: SubsessionSentMessage[];
   /**
-   * The question a task_ask handed to the owning session (ownerMessages
-   * "via-main"), kept while the task waits for the owner: the main session
+   * The question a task_ask is waiting on, kept while the task waits for
+   * the owner. ownerMessages "via-main": handed to the owning session, which
    * passes it on, and its task_message with the owner's answer ends the
-   * wait. The store drops it on any transition out of waiting(owner).
+   * wait. "direct" (`direct`): sent to the owner's chat, which they answer
+   * with /s or a reply. Either way a note from the main session alone does
+   * not end it. The store drops it on any transition out of waiting(owner).
    */
-  askViaMain?: { at: number; text: string; /** Its note's name (to take it back). */ note?: string };
+  askViaMain?: {
+    at: number;
+    text: string;
+    /** Its note's name (to take it back). */
+    note?: string;
+    /**
+     * ownerMessages "direct": the question went straight to the owner's chat,
+     * not through the main session (no note to take back, nothing to retract
+     * there). The wait is the same: only the owner's own words end it.
+     */
+    direct?: true;
+  };
   /** The newest status changes, oldest first. */
   transitions: SubsessionTransition[];
 }
@@ -318,10 +356,16 @@ export interface SubsessionTable {
    * Set when this table may be missing tasks: it was recovered from `.bak`,
    * or it was missing while the registry held task sessions. Kept across
    * every write and restart, so no later start unlinks a registry entry the
-   * table does not know (it may be a task the lost table had). Cleared once
-   * no such entry is left and no record is still `restored`.
+   * table does not know (it may be a task the lost table had), and no record
+   * is archived or forgotten. Never cleared on its own (no time limit, no
+   * count of what is left): only the owner's `/s trust` ends it.
    */
-  untrusted?: { since: number; reason: "recovered" | "lost" };
+  untrusted?: {
+    since: number;
+    reason: "recovered" | "lost";
+    /** The owner was told (once per mark: a fresh recovery tells them again). */
+    notified?: true;
+  };
 }
 
 export const SENT_KEEP = 20;
@@ -375,3 +419,7 @@ export function oneLine(text: string, max: number): string {
 }
 /** Inputs a task may have owed at once; more are refused (never silently dropped). */
 export const PENDING_INPUT_MAX = 50;
+/** Slots input held for a task waiting on the owner never takes, kept for the owner's message that wakes it. */
+export const PENDING_INPUT_OWNER_RESERVE = 5;
+/** How an owner's `/s` or panel message starts: an envelope only the harness writes (a relay starts with its own). */
+export const OWNER_MESSAGE_MARKER = '<tomo-event type="subsession-owner-message"';

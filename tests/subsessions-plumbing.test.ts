@@ -192,6 +192,27 @@ describe("sub-session tools", () => {
     expect((await call(owner, "task_status", { id: "s1" })).content[0].text).toContain("Mine");
   });
 
+  it("task_message attaches the owner's own messages only when asked and only when the turn has some", async () => {
+    const svc = service();
+    let mine: Array<{ text: string; at: number; channel: string }> = [];
+    const owner = buildTaskOwnerTools({ service: () => svc, scope: () => "dm:owner", ownerMessages: () => mine });
+    await call(owner, "task_spawn", { title: "Mine", brief: "b" });
+    // Nothing of the owner's in this turn (a background wake): attaching is refused, nothing relayed.
+    const refused = await call(owner, "task_message", { id: "s1", text: "go", attach_owner_message: true });
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toContain("no message from the owner");
+    expect(svc.get("s1")!.pendingInput).toHaveLength(0);
+    // Without attaching: the main session's own note.
+    expect((await call(owner, "task_message", { id: "s1", text: "a note" })).isError).toBeUndefined();
+    expect(svc.get("s1")!.pendingInput.at(-1)).toMatchObject({ from: "main", words: "a note" });
+    // With the owner's message in this turn: copied in as theirs, not the model's retelling.
+    mine = [{ text: "ship it", at: 1, channel: "imessage" }];
+    const passed = await call(owner, "task_message", { id: "s1", text: "They said ship it.", attach_owner_message: true });
+    expect(passed.content[0].text).toContain("with the owner's message");
+    expect(svc.get("s1")!.pendingInput.at(-1)).toMatchObject({ from: "owner", words: "ship it" });
+    expect(svc.get("s1")!.pendingInput.at(-1)!.text).toContain("[1970-01-01T00:00:00.001Z · imessage] ship it");
+  });
+
   it("task_finish takes what the owner has to do; task_done clears it, only in the owning scope", async () => {
     const svc = service();
     const owner = buildTaskOwnerTools({ service: () => svc, scope: () => "dm:owner" });
@@ -206,6 +227,11 @@ describe("sub-session tools", () => {
     expect(svc.get("s1")).toMatchObject({ status: "finished", ownerAction: "Merge PR #4" });
     expect((await call(group, "task_done", { id: "s1", report: 1 })).isError).toBe(true);
     expect(svc.get("s1")?.ownerAction).toBe("Merge PR #4");
+    // task_cancel agrees with /s stop: a finished task waiting on the owner is not cancelled; task_done clears it.
+    const cancel = await call(owner, "task_cancel", { id: "s1" });
+    expect(cancel.isError).toBe(true);
+    expect(cancel.content[0].text).toContain(`task_done("s1", ${svc.get("s1")!.reportSeq})`);
+    expect(svc.get("s1")).toMatchObject({ status: "finished", ownerAction: "Merge PR #4" });
     const report = svc.get("s1")!.reportSeq!;
     const done = await call(owner, "task_done", { id: "s1", report });
     expect(done.isError).toBeUndefined();

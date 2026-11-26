@@ -296,21 +296,50 @@ describe("via-main: task_ask round trip", () => {
     expect(note).toContain(`task_message ${t.id}`);
     // Waiting(owner) is not woken by the harness: only the answer does it.
     expect(h.prompts).toHaveLength(1);
-    // The main session asked the owner, who said A; it passes that on.
-    const relayed = h.service.relay(t.id, "A, merge it");
+    // The main session asked the owner, who said A; it passes that on with their message attached.
+    const relayed = h.service.relay(t.id, "They chose A.", [{ text: "A, merge it", at: Date.UTC(2026, 10, 25, 9, 0), channel: "imessage" }]);
     expect(relayed.ok).toBe(true);
     await flush();
     expect(h.prompts).toHaveLength(2);
     const answer = h.prompts[1].prompt;
-    expect(answer).toContain("take it as their answer to that question");
+    expect(answer).toContain("The owner's answer is in their own words below");
     expect(answer).toContain("Merge now? A) yes B) wait for review");
-    expect(answer).toContain("A, merge it");
-    expect(answer).not.toContain("not the owner's own approval");
+    // Their words as the harness received them, with time and channel; the note is labelled as the main session's.
+    expect(answer).toContain("> [2026-11-25T09:00:00.000Z · imessage] A, merge it");
+    expect(answer).toContain("The main session's note, every line starting with \"| \":\n| They chose A.");
+    expect(answer).not.toContain("not the owner's own words or approval");
     expect(h.store.get(t.id)!.askViaMain).toBeUndefined();
     // A later relay, with no question standing, is a colleague's word again.
     h.service.relay(t.id, "also bump the version");
     await flush();
-    expect(h.prompts.at(-1)!.prompt).toContain("not the owner's own approval");
+    expect(h.prompts.at(-1)!.prompt).toContain("not the owner's own words or approval");
+  });
+
+  it("a check-back that fires after task_ask, while that turn still runs, keeps the wait across a restart", async () => {
+    const disk = new Map<string, string[]>();
+    const sdk = new Set<string>();
+    const h = harness({}, async (key, _p, hh) => {
+      if (!hh.store.get("s1")!.askViaMain) {
+        await hh.service.ask(key, "Deploy?");
+        // The wait has begun; the turn has not ended yet.
+        expect(hh.service.onCronFire(key, "<tomo-event type=\"cron\">check CI</tomo-event>")).toBe(true);
+      }
+      return { ok: true };
+    }, { disk, sdk });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    const settled = h.store.get(t.id)!;
+    expect(settled).toMatchObject({ status: "waiting", waitingOn: "owner", askViaMain: { text: "Deploy?" } });
+    expect(settled.pendingInput.map((i) => i.text).join("")).toContain("check CI");
+    expect(settled.heldThrough).toBe(settled.pendingInput.at(-1)!.seq);
+    h.service.stop();
+    // Not a turn cut short: still waiting for the owner, the question standing.
+    const h2 = harness({}, () => ({ ok: true }), { disk, sdk });
+    h2.service.start();
+    await flush();
+    expect(h2.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner", askViaMain: { text: "Deploy?" } });
+    expect(h2.prompts).toEqual([]);
   });
 
   it("keeps the standing question across a restart, and the answer after it still ends the wait as the owner's answer", async () => {
@@ -328,10 +357,48 @@ describe("via-main: task_ask round trip", () => {
     await flush();
     expect(h2.messageWakes).toEqual(["dm:owner"]);
     expect(h2.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner", askViaMain: { text: "Deploy to prod?" } });
-    h2.service.relay(t.id, "yes");
+    h2.service.relay(t.id, "yes", [{ text: "yes", at: Date.now(), channel: "telegram" }]);
     await flush();
-    expect(h2.prompts.at(-1)!.prompt).toContain("take it as their answer");
+    expect(h2.prompts.at(-1)!.prompt).toContain("The owner's answer is in their own words below");
     expect(h2.prompts.at(-1)!.prompt).toContain("Deploy to prod?");
+  });
+
+  it("a relay with no owner message attached does not end the wait: it is kept for the owner's answer", async () => {
+    const disk = new Map<string, string[]>();
+    const sdk = new Set<string>();
+    const h = harness({}, sayOnFirstTurn("ask", "Merge now?"), { disk, sdk });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)?.askViaMain?.text).toBe("Merge now?");
+    const ownerMark = h.store.get(t.id)!.activeAtOwnerInputMs;
+    const turns = h.prompts.length;
+    // The main session answers for the owner, in its own words: the task is
+    // not woken (it would only ask again, and the two could go round for good).
+    const held = h.service.relay(t.id, "Yes, merge it");
+    expect(held).toMatchObject({ ok: true, held: "answer" });
+    await flush();
+    expect(h.prompts).toHaveLength(turns);
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner", askViaMain: { text: "Merge now?" } });
+    // Its input is the main session's, not the owner's, held for their wake.
+    const record = h.store.get(t.id)!;
+    expect(record.activeAtOwnerInputMs).toBe(ownerMark);
+    expect(record.pendingInput.at(-1)).toMatchObject({ from: "main" });
+    expect(record.heldThrough).toBe(record.pendingInput.at(-1)!.seq);
+    // A restart does not take it for a turn cut short.
+    h.service.stop();
+    const h2 = harness({}, () => ({ ok: true }), { disk, sdk });
+    h2.service.start();
+    await flush();
+    expect(h2.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner", askViaMain: { text: "Merge now?" } });
+    expect(h2.prompts).toEqual([]);
+    // The owner's own answer ends the wait, with the kept note.
+    h2.service.relay(t.id, "They said yes.", [{ text: "yes", at: Date.now(), channel: "telegram" }]);
+    await flush();
+    // One turn: the kept note, then the owner's answer.
+    const prompt = h2.prompts[0].prompt;
+    expect(prompt.indexOf("| Yes, merge it")).toBeLessThan(prompt.indexOf("> ["));
+    expect(prompt).toContain("The owner's answer is in their own words below");
   });
 
   it("input that lands while the question is being handed over keeps the task from waiting on it (no stale wait)", async () => {
@@ -596,7 +663,7 @@ describe("via-main: nothing lost, nothing twice", () => {
     const t = spawn(h);
     await flush();
     expect(messageNotes(h, "dm:owner")).toHaveLength(1);
-    h.service.relay(t.id, "yes (the owner said so earlier)");
+    h.service.relay(t.id, "yes", [{ text: "yes, deploy", at: Date.now(), channel: "telegram" }]);
     await flush();
     expect(messageNotes(h, "dm:owner").filter((x) => x.includes("Deploy?"))).toEqual([]);
   });

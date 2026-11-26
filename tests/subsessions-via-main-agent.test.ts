@@ -6,7 +6,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/a
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
 import { randomUUID } from "node:crypto";
-import { Agent, MockChannel, installAgentTestHooks, mockConfig, mockSdk, peekPendingNotes, resetConfig, waitFor } from "./helpers/agent-harness.js";
+import { Agent, MockChannel, installAgentTestHooks, makeMsg, mockConfig, mockSdk, peekPendingNotes, resetConfig, waitFor } from "./helpers/agent-harness.js";
 import { formatTomoEvent } from "../src/tomo-event.js";
 import { MESSAGE_WAKE_RETRY_MS } from "../src/agent.js";
 
@@ -37,10 +37,20 @@ const messageNotes = (agent: Agent, key: string) => peekPendingNotes(agent, key)
 describe("via-main through the Agent", () => {
   it("task_ask: the main session gets the question in a silent turn, nothing reaches the owner's chat, and task_message with the answer resumes the task", async () => {
     const { agent, channel } = await boot();
+    let attached: ReturnType<Agent["turnOwnerMessages"]> = [];
+    let passed = false;
     mockSdk.responseFn = async (text) => {
       if (text.includes('type="subsession-start"')) {
         await agent.subsessions!.ask("task:s1", "Merge PR #12 now? A) yes B) wait");
         return "";
+      }
+      // The owner's answer reaches the main session: it passes it on with
+      // task_message and attach_owner_message, as the tool does.
+      if (!passed && text.includes("A, go") && !text.includes("subsession-relay")) {
+        passed = true;
+        attached = agent.turnOwnerMessages("dm:alex");
+        agent.subsessions!.relay("s1", "They picked A.", attached);
+        return "Passing that on.";
       }
       return "NO_REPLY";
     };
@@ -50,9 +60,13 @@ describe("via-main through the Agent", () => {
     expect(channel.delivered.some((d) => d.text.includes("Merge PR #12"))).toBe(false);
     // The turn read the note: it is no longer pending.
     await waitFor(() => expect(messageNotes(agent, "dm:alex")).toEqual([]));
-    // The owner said A in the main conversation; the main session passes it on (task_message).
-    expect(agent.subsessions!.relay("s1", "A, go").ok).toBe(true);
-    await waitFor(() => expect(prompts("task:s1").some((p) => p.includes("take it as their answer") && p.includes("A, go"))).toBe(true));
+    // The owner says A in the main conversation; the main session passes it on (task_message).
+    await channel.simulateMessage(makeMsg({ chatId: "12345", text: "A, go" }));
+    await waitFor(() => expect(prompts("task:s1").some((p) => p.includes("The owner's answer is in their own words below") && p.includes("· telegram] A, go"))).toBe(true));
+    // The harness copied the owner's message from that turn; the model did not retell it.
+    expect(attached).toEqual([expect.objectContaining({ text: "A, go", channel: "telegram" })]);
+    // Once that turn is over there is nothing of the owner's to attach.
+    expect(agent.turnOwnerMessages("dm:alex")).toEqual([]);
     expect(agent.subsessions!.get("s1")!.askViaMain).toBeUndefined();
     await agent.stop();
   });

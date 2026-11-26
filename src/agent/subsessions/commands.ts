@@ -19,13 +19,25 @@ export async function taskCommandReply(
 ): Promise<OwnerText> {
   if (!service.available()) return t("cmd.unavailable");
   if (address.kind === "usage") return t("cmd.usage");
+  if (address.kind === "trust") {
+    const result = service.trust();
+    if (result.ok) {
+      const done = t("cmd.trusted", { count: result.unlinked });
+      return result.failed > 0 ? joinText([done, t("cmd.trustUnlinkFailed", { count: result.failed })]) : done;
+    }
+    if (result.reason === "nothing") return t("cmd.trustNothing");
+    if (result.reason === "registry") return t("cmd.trustRegistry");
+    return t("cmd.unavailable");
+  }
   if (address.kind === "list") {
     // What waits on the owner comes first, however old: past LIST_MAX it would only be counted.
     const asks = (r: SubsessionRecord) => (needsOwner(r) || (r.status === "waiting" && r.waitingOn === "owner") ? 1 : 0);
     const tasks = service.list(scope).filter((r) => r.status !== "archived")
       .sort((a, b) => asks(b) - asks(a) || b.lastActivityAt - a.lastActivityAt);
-    if (tasks.length === 0) return t("cmd.empty");
-    const lines = tasks.slice(0, LIST_MAX).map((r) => taskLine(t, r, service.backgroundRunning(r)));
+    // Recovered from the backup and not checked yet: said first, every time.
+    const untrusted = service.untrusted() ? [t("cmd.untrusted")] : [];
+    if (tasks.length === 0) return untrusted.length > 0 ? joinText([...untrusted, t("cmd.empty")]) : t("cmd.empty");
+    const lines = [...untrusted, ...tasks.slice(0, LIST_MAX).map((r) => taskLine(t, r, service.backgroundRunning(r)))];
     if (tasks.length > LIST_MAX) lines.push(t("cmd.more", { count: tasks.length - LIST_MAX }));
     return joinText(lines);
   }

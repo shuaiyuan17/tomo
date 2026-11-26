@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { parseTable, SubsessionStore, SubsessionStoreError } from "../src/agent/subsessions/store.js";
-import { TRANSITION_LOG_KEEP, appendInput } from "../src/agent/subsessions/types.js";
+import { TRANSITION_LOG_KEEP, appendInput, HARNESS } from "../src/agent/subsessions/types.js";
 
 let dir = "";
 let path = "";
@@ -62,9 +62,9 @@ describe("SubsessionStore", () => {
   it("never drops accepted input, and a guard refuses a transition without writing", () => {
     const store = new SubsessionStore(path, { strictTransitions: true });
     const t = store.create({ parentKey: "dm:owner", title: "a", brief: "b" });
-    for (let i = 0; i < 30; i++) store.transition(t.id, "relay", { patch: (r) => { appendInput(r, `m${i}`); } });
+    for (let i = 0; i < 30; i++) store.transition(t.id, "relay", { patch: (r) => { appendInput(r, `m${i}`, HARNESS); } });
     expect(store.get(t.id)?.pendingInput).toHaveLength(30);
-    const refused = store.transition(t.id, "relay", { guard: () => "full", patch: (r) => { appendInput(r, "x"); } });
+    const refused = store.transition(t.id, "relay", { guard: () => "full", patch: (r) => { appendInput(r, "x", HARNESS); } });
     expect(refused).toMatchObject({ ok: false, refused: "full" });
     expect(store.get(t.id)?.pendingInput).toHaveLength(30);
   });

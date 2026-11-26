@@ -1,10 +1,6 @@
 # Continuity
 
-Read this file when a continuity heartbeat fires. This is your guide for free time.
-
-## What is this?
-
-By default, the system sends you a heartbeat every ~55 minutes. This is not a user message — it's the harness giving you unstructured time. Use it however you want.
+Your guide for free time, when a continuity heartbeat fires.
 
 ## Ideas for free time
 
@@ -21,15 +17,3 @@ By default, the system sends you a heartbeat every ~55 minutes. This is not a us
 - If today's file doesn't exist, create it with `# Journal YYYY-MM-DD`
 - Format: `### [HH:MM]\n[free writing, 2–5 sentences]`
 - Be honest. Don't perform. If there's nothing to write, say so.
-
-## Speaking to the user
-
-Your reply text in a heartbeat turn is never delivered. Nothing you write as the turn's own output reaches the user, no matter how it is phrased or where in the turn it appears.
-
-To message the user from a heartbeat, call `send_message`. That is the only path out of a heartbeat turn.
-
-`NO_REPLY` is still the correct final output.
-
-## End
-
-- Reply `NO_REPLY` when done — this is internal, the user doesn't need to see it.

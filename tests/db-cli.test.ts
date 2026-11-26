@@ -200,6 +200,11 @@ describe("export guards for the file Tomo imports", () => {
     store().setPendingNotes("dm:alice", ["a"]);
     expect((await run(["export", "pending-notes", "--from", dbPath])).exitCodes).toEqual([1]);
     expect((await run(["export", "pending-notes", "--out", legacyFile])).exitCodes).toEqual([1]);
+    const { symlinkSync } = await import("node:fs");
+    const alias = join(paths.home, "alias-sessions");
+    rmSync(alias, { force: true });
+    symlinkSync(sessionsDir, alias);
+    expect((await run(["export", "pending-notes", "--from", dbPath, "--out", join(alias, "_pending_notes.json")])).exitCodes).toEqual([1]);
     expect(existsSync(legacyFile)).toBe(false);
   });
 

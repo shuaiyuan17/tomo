@@ -1,6 +1,6 @@
 import { Command } from "commander";
-import { existsSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { config } from "../config.js";
 import { DbSchemaTooNewError, openTomoDb, repairDb, type TomoDb } from "../db/index.js";
 import { DUMPABLE_TABLES, TOMO_DB_MIGRATIONS } from "../db/schema.js";
@@ -39,6 +39,16 @@ function withDb<T>(path: string, fn: (db: TomoDb) => T, opts: { allowNewerSchema
     return fn(db);
   } finally {
     db.close();
+  }
+}
+
+/** `path` with its directory's symlinks resolved (the file itself need not exist). */
+function canonical(path: string): string {
+  const abs = resolve(path);
+  try {
+    return join(realpathSync(dirname(abs)), basename(abs));
+  } catch {
+    return abs;
   }
 }
 
@@ -133,7 +143,7 @@ dbCommand
     // (it replaces the table), so anything else written there would replace
     // the live queue. Everything else is a copy to a file of your choosing.
     if (opts.from && !opts.out) fail("--from needs --out: a copy from another database never goes to the file Tomo imports.");
-    if (opts.out && resolve(opts.out) === resolve(rollbackFile)) fail(`--out may not be ${rollbackFile}; run the export without --out to write it.`);
+    if (opts.out && canonical(opts.out) === canonical(rollbackFile)) fail(`--out may not be ${rollbackFile}; run the export without --out to write it.`);
     const rollback = !opts.out;
     const out = opts.out ?? rollbackFile;
     if (rollback) refuseWhileRunning();

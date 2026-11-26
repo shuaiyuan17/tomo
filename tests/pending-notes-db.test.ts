@@ -147,6 +147,20 @@ describe("outside the daemon (no maintenance)", () => {
 
 });
 
+describe("after an export", () => {
+  it("an exported file that will not read is moved aside, and the table is kept (not taken as delivered)", () => {
+    const dir = freshDir();
+    const store = makeSessionStore(dir);
+    store.setPendingNotes("dm:alice", ["still here"]);
+    const db = openTomoDb(join(dir, "tomo.db"));
+    db.run("INSERT INTO meta (key, value) VALUES ('legacy_pending_notes_exported', 'x')");
+    db.close();
+    writeFileSync(legacy(dir), "{truncated");
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["still here"]);
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["still here"]);
+  });
+});
+
 describe("one row per note", () => {
   it("a write for one session never touches another's (#649)", () => {
     const dir = freshDir();

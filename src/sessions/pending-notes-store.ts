@@ -200,6 +200,8 @@ export class PendingNotesStore {
     }
     if (outcome === "unreadable") {
       this.quarantineLegacy(this.unreadable);
+      // Moved aside by us, not consumed by an older Tomo: the table stays the truth.
+      db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
       return;
     }
     if (typeof outcome === "object") {

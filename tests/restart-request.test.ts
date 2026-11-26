@@ -16,7 +16,11 @@ import {
 // Pass-through, except when a test arms `claimAfterRead`: then the file is
 // removed right after it is read, as if another process claimed it between
 // this module's read and its unlink.
-const race = vi.hoisted(() => ({ claimAfterRead: null as string | null }));
+const race = vi.hoisted(() => ({
+  claimAfterRead: null as string | null,
+  /** Called halfway through the next writeFileSync: half the bytes are on disk. */
+  midWrite: null as (() => void) | null,
+}));
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   const readFileSync = ((...args: Parameters<typeof actual.readFileSync>) => {
@@ -27,7 +31,17 @@ vi.mock("node:fs", async (importOriginal) => {
     }
     return out;
   }) as typeof actual.readFileSync;
-  return { ...actual, readFileSync, default: { ...actual, readFileSync } };
+  const writeFileSync = ((...args: Parameters<typeof actual.writeFileSync>) => {
+    const hook = race.midWrite;
+    if (hook === null || typeof args[1] !== "string") return actual.writeFileSync(...args);
+    race.midWrite = null;
+    const [path, data, options] = args;
+    const half = Math.floor(data.length / 2);
+    actual.writeFileSync(path, data.slice(0, half), options);
+    hook();
+    actual.appendFileSync(path, data.slice(half));
+  }) as typeof actual.writeFileSync;
+  return { ...actual, readFileSync, writeFileSync, default: { ...actual, readFileSync, writeFileSync } };
 });
 
 const DAEMON = 4242;
@@ -133,6 +147,18 @@ describe("end-of-turn restart fallback", () => {
     expect(existsSync(join(requestDir, `${request.id}.json`))).toBe(false);
     // Claimed once: the restart is already in flight, a second must not queue.
     expect(takePendingRestartRequest("dm:shuai", requestDir)).toBeNull();
+  });
+
+  it("never shows another session a half-written request", () => {
+    // Another session scans the directory while this request is half on disk.
+    race.midWrite = () => {
+      expect(takePendingRestartRequest("telegram:123", requestDir)).toBeNull();
+    };
+    const mine = createRestartRequest({ sessionKey: "dm:shuai", daemonPid: DAEMON, reason: "deploy" }, requestDir);
+
+    expect(race.midWrite).toBeNull();
+    expect(readdirSync(requestDir)).toEqual([`${mine.id}.json`]);
+    expect(takePendingRestartRequest("dm:shuai", requestDir)).toEqual(mine);
   });
 
   it("leaves other sessions' requests alone", () => {

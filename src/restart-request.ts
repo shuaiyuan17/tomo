@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { defaultRuntimePaths } from "./runtime-paths.js";
 import { TOMO_SESSION_KEY_ENV } from "./restart-reason.js";
@@ -304,11 +304,23 @@ export function createRestartRequest(
       : {}),
     requestedAt: new Date().toISOString(),
   };
-  writeFileSync(requestPath(request.id, requestDir), `${JSON.stringify(request)}\n`, {
+  // Written under a name the scanners skip (it doesn't end in `.json`), then
+  // renamed into place. Other sessions claim or sweep every `.json` here and
+  // throw away one they can't parse, so a request must never be visible
+  // half-written: that read as "malformed" and deleted it.
+  const path = requestPath(request.id, requestDir);
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, `${JSON.stringify(request)}\n`, {
     encoding: "utf-8",
     flag: "wx",
     mode: 0o600,
   });
+  try {
+    renameSync(tmp, path);
+  } catch (error) {
+    try { unlinkSync(tmp); } catch { /* already gone */ }
+    throw error;
+  }
   return request;
 }
 

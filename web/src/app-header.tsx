@@ -24,7 +24,7 @@ interface Toggle { ref: Ref<HTMLButtonElement>; pressed: boolean; onToggle: () =
  * apart so those targets meet without overlapping.
  */
 const touchTarget = "max-[600px]:after:absolute max-[600px]:after:-inset-1 max-[600px]:after:content-[''] pointer-coarse:after:absolute pointer-coarse:after:-inset-1 pointer-coarse:after:content-['']";
-const toggleClass = "relative size-8 rounded-lg text-foreground max-[600px]:size-9 pointer-coarse:size-9 " + touchTarget + " hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-[18px]";
+const toggleClass = "relative size-8 shrink-0 rounded-lg text-foreground max-[600px]:size-9 pointer-coarse:size-9 " + touchTarget + " hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-[18px]";
 
 const CONNECTION_LABELS = {
   live: "connection.live", locked: "connection.locked", connecting: "connection.connecting", reconnecting: "connection.reconnecting",
@@ -54,10 +54,11 @@ export function AppHeader({ headerRef, title, menu, chat, tasks, screen, connect
       onClick={menu.onToggle}
       className={cn(touchTarget, "relative hidden size-9 shrink-0 rounded-lg text-foreground hover:bg-foreground/[0.07] aria-expanded:bg-foreground/[0.11] max-[600px]:inline-flex [&_svg:not([class*='size-'])]:size-[18px]")}><PanelLeft strokeWidth={1.75} /></Button>
     <a className="flex shrink-0 items-center gap-1.5 font-serif text-[21px] leading-none tracking-[-0.8px] text-foreground no-underline" href="/" aria-label={t("header.homeLink")}>
-      <Mark className="size-6" /><span>tomo<span className="text-primary">.</span></span></a>
+      <Mark className="size-6" /><span className="max-[360px]:sr-only">tomo<span className="text-primary">.</span></span></a>
     <span aria-hidden="true" className="h-4 w-px shrink-0 bg-border" />
     <span data-testid="header-title" className="min-w-0 truncate text-[13px] text-muted-foreground" title={title}>{title}</span>
-    <div className="ml-auto flex shrink-0 items-center gap-0.5 max-[600px]:gap-2 pointer-coarse:gap-2">
+    {/* Shrinks only by its connection words (a narrow phone, reconnecting): the toggles keep their size. */}
+    <div className="ml-auto flex min-w-0 items-center gap-0.5 max-[600px]:gap-2 pointer-coarse:gap-2">
       {chat && <ToggleButton toggle={chat} controls="conversation" title={t("nav.conversation")} label={chat.unread ? t("header.chatUnread") : t("header.chat")}>
         <MessageCircle strokeWidth={1.75} />
         {chat.unread && <span aria-hidden="true" data-testid="chat-unread" className="absolute top-1 right-1 size-2 rounded-full bg-primary ring-2 ring-background" />}
@@ -67,9 +68,9 @@ export function AppHeader({ headerRef, title, menu, chat, tasks, screen, connect
         {tasks.running > 0 && <span aria-hidden="true" className="absolute -top-0.5 -right-0.5 min-w-4 rounded-full bg-primary px-1 text-center text-[10px] leading-4 font-semibold text-primary-foreground ring-2 ring-background">{tasks.running > 99 ? "99+" : tasks.running}</span>}
       </ToggleButton>
       {screen && <ToggleButton toggle={screen} controls="screen-window" title={t("header.screen")} label={t("header.screenLabel")}><Monitor strokeWidth={1.75} /></ToggleButton>}
-      <span role="status" data-connection={connection} className="ml-1.5 flex items-center gap-2 tracking-[0.02em] text-xs text-muted-foreground max-[600px]:ml-0.5">
-        <i className={cn("size-1.5 rounded-full border border-muted-foreground", connection === "live" && "border-primary bg-primary", connection !== "live" && connection !== "locked" && "animate-pulse")} />
-        <span className={cn(connection === "live" && "max-[600px]:sr-only")}>{t(CONNECTION_LABELS[connection])}</span></span>
+      <span role="status" data-connection={connection} className="ml-1.5 flex min-w-0 items-center gap-2 tracking-[0.02em] text-xs text-muted-foreground max-[600px]:ml-0.5">
+        <i className={cn("size-1.5 shrink-0 rounded-full border border-muted-foreground", connection === "live" && "border-primary bg-primary", connection !== "live" && connection !== "locked" && "animate-pulse")} />
+        <span className={cn("truncate", connection === "live" && "max-[600px]:sr-only")} title={t(CONNECTION_LABELS[connection])}>{t(CONNECTION_LABELS[connection])}</span></span>
     </div>
   </header>;
 }

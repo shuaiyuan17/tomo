@@ -1615,4 +1615,18 @@ it("the top bar is 45px on every screen and holds only the wordmark and where yo
     }
     await other.close();
   }
+
+  // A narrow phone on Home (three toggles) while the connection is spelled out in words: nothing leaves the bar.
+  const narrow = await browser.newPage({ viewport: { width: 320, height: 640 }, hasTouch: true, isMobile: true });
+  await narrow.goto(`${url}/?t=${token}#home`);
+  await browserExpect(narrow.getByTestId("header-title")).toHaveText("Home");
+  await narrow.locator("header [role=status] span").evaluate((el) => { el.textContent = "Reconnecting…"; el.classList.remove("max-[600px]:sr-only"); });
+  const fits = await narrow.locator("header").evaluate((el) => ({
+    overflow: el.scrollWidth - el.clientWidth,
+    buttons: [...el.querySelectorAll("button")].filter((b) => b.getClientRects().length).map((b) => { const r = b.getBoundingClientRect(); return [r.left, r.right, r.width]; }),
+  }));
+  expect(fits.overflow).toBeLessThanOrEqual(0);
+  expect(fits.buttons.length).toBeGreaterThanOrEqual(3);
+  for (const [left, right, width] of fits.buttons) { expect(left).toBeGreaterThanOrEqual(0); expect(right).toBeLessThanOrEqual(320); expect(width).toBeGreaterThanOrEqual(36); }
+  await narrow.close();
 });

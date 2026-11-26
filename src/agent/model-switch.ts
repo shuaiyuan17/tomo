@@ -5,7 +5,7 @@ import { withConfigLockSync } from "../config-file.js";
 import { backupFileIfExistsSync, writeJsonAtomicSync } from "../fs-utils.js";
 import { CHATGPT_SUBSCRIPTION_DEFAULT_MODEL, CHATGPT_SUBSCRIPTION_MODE, isChatGptSubscriptionModel } from "../litellm.js";
 import { log } from "../logger.js";
-import { MODEL_ALIASES, isLiteLlmProviderModel, modelLabel, resolveModelName } from "../models.js";
+import { MODEL_ALIASES, isLiteLlmProviderModel, modelLabel, normalizeModelId, resolveModelName, sameModel } from "../models.js";
 import type { WebModelView } from "../web/protocol.js";
 import { effectiveEffort } from "./effort.js";
 
@@ -83,10 +83,10 @@ export function switchSessionModel(deps: ModelSwitchDeps, key: string, input: st
   const target = validateModelChoice(input);
   if (!target.ok) return target;
   const previous = currentSessionModel(deps.modelOverrides, key);
-  if (options.expectedCurrent !== undefined && previous !== options.expectedCurrent) {
+  if (options.expectedCurrent !== undefined && !sameModel(previous, options.expectedCurrent)) {
     return { ok: false, reason: "model_changed", model: target.model };
   }
-  if (options.unchangedIsNoop && previous === target.model) {
+  if (options.unchangedIsNoop && sameModel(previous, target.model)) {
     return { ok: true, model: target.model, previous, changed: false };
   }
   // Checked last, right before the synchronous write and close: no turn can
@@ -115,10 +115,13 @@ export function modelChoices(): Array<{ id: string; label: string; aliases: stri
 
 /** What the web Study's Model page shows for a session key (no browser session id or write access: the caller adds those). */
 export function describeSessionModel(overrides: ReadonlyMap<string, string>, key: string, busy: boolean): Omit<WebModelView, "sessionId" | "writable"> {
-  const current = currentSessionModel(overrides, key);
+  // An older config's `claude-opus-5-5[1m]` is shown as the untagged id the
+  // options use, so the picker marks it current.
+  const current = normalizeModelId(currentSessionModel(overrides, key));
+  const defaultModel = normalizeModelId(config.model);
   return {
     model: { id: current, label: modelLabel(current) },
-    defaultModel: { id: config.model, label: modelLabel(config.model) },
+    defaultModel: { id: defaultModel, label: modelLabel(defaultModel) },
     overridden: overrides.has(key),
     effort: effectiveEffort(config, key, current),
     busy,

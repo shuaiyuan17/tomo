@@ -9,7 +9,7 @@ import type { PromptContextLines } from "../workspace/prompt-context-diff.js";
 import { assembleSystemPrompt, renderRuntimeSection, renderSessionSection } from "../workspace/system-prompt-blocks.js";
 import { isDmSessionKey, isGroupSessionKey, isTaskSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
-import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
+import { isLiteLlmProviderModel, normalizeModelId, resolveModelName, modelLabel } from "../models.js";
 import { litellmRoutesModel } from "../litellm.js";
 import { effectiveGroupSandbox, type GroupSandboxConfig } from "./group-fs-policy.js";
 import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, skillsCanUseTool, todoStoreGuardHooks, type PrivateMemoryBar } from "./permissions.js";
@@ -211,7 +211,9 @@ export function sdkOptions(
   );
   const externalMcpAllowedTools = !unattended && Array.isArray(config.mcpAllowedTools) ? config.mcpAllowedTools : [];
   const shouldDisableAutoCompact = Boolean(sessionContext && usesLcmCompact(sessionContext.sessionKey));
-  const effectiveModel = model ?? config.model;
+  // A redundant `[1m]` on a natively 1M model (an older config's
+  // `claude-opus-5-5[1m]`) is dropped, so the SDK and the usage ledger see one id.
+  const effectiveModel = normalizeModelId(model ?? config.model);
 
   // Tell the agent which model is actually serving this session. A model can't
   // reliably introspect its own identity, so surface it as a fact in the prompt

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { DEFAULT_MODEL, MODEL_ALIASES, PICKER_MODELS, resolveModelName } from "../src/models.js";
+import { DEFAULT_MODEL, MODEL_ALIASES, PICKER_MODELS, modelLabel, normalizeModelId, resolveModelName, sameModel } from "../src/models.js";
 import {
   CHATGPT_SUBSCRIPTION_DEFAULT_MODEL,
   inferLiteLlmMode,
@@ -12,30 +12,54 @@ import {
 // gateway modes they can route through (src/litellm.ts).
 
 describe("model resolution", () => {
-  it("maps short names to full model IDs", () => {
-    // 5.5 family, 1M by default: [1m] ids where the SDK has a [1m] alias
-    // (sonnet/opus/fable); the bundled binary handles the tag in its model
-    // lookup. Haiku 5.5 is natively 1M and has no [1m] alias.
-    expect(MODEL_ALIASES["opus"]).toBe("claude-opus-5-5[1m]");
-    expect(MODEL_ALIASES["opus-1m"]).toBe("claude-opus-5-5[1m]");
-    expect(MODEL_ALIASES["sonnet"]).toBe("claude-sonnet-5-5[1m]");
-    expect(MODEL_ALIASES["sonnet-1m"]).toBe("claude-sonnet-5-5[1m]");
+  it("maps short names to full model IDs, with no [1m] tag", () => {
+    // All natively 1M (SDK 0.3.332 registry: native_1m), so the tag is gone.
+    expect(MODEL_ALIASES["opus"]).toBe("claude-opus-5-5");
+    expect(MODEL_ALIASES["opus-1m"]).toBe("claude-opus-5-5");
+    expect(MODEL_ALIASES["sonnet"]).toBe("claude-sonnet-5-5");
+    expect(MODEL_ALIASES["sonnet-1m"]).toBe("claude-sonnet-5-5");
     expect(MODEL_ALIASES["haiku"]).toBe("claude-haiku-5-5");
-    expect(MODEL_ALIASES["fable"]).toBe("claude-fable-5-1[1m]");
-    expect(DEFAULT_MODEL).toBe("claude-opus-5-5[1m]");
+    expect(MODEL_ALIASES["fable"]).toBe("claude-fable-5-2");
+    expect(DEFAULT_MODEL).toBe("claude-opus-5-5");
+    expect(Object.values(MODEL_ALIASES).some((id) => id.includes("["))).toBe(false);
+  });
+
+  it("resolves fable to Fable 5.2", () => {
+    expect(resolveModelName("fable")).toBe("claude-fable-5-2");
+    expect(resolveModelName("FABLE")).toBe("claude-fable-5-2");
   });
 
   it("does not have unknown model keys", () => {
     expect(Object.keys(MODEL_ALIASES)).toEqual(["opus", "opus-1m", "sonnet", "sonnet-1m", "haiku", "fable"]);
   });
 
-  it("pickers offer only the 5.5 family plus Fable 5.1, 1M by default, default first", () => {
-    expect(PICKER_MODELS.map((m) => m.id)).toEqual(["claude-opus-5-5[1m]", "claude-sonnet-5-5[1m]", "claude-haiku-5-5", "claude-fable-5-1[1m]"]);
-    expect(PICKER_MODELS.some((m) => /-4-|claude-(opus|sonnet)-5(\[|$)/.test(m.id))).toBe(false);
+  it("pickers offer only the 5.5 family plus Fable 5.2, untagged, default first", () => {
+    expect(PICKER_MODELS.map((m) => m.id)).toEqual(["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2"]);
+    expect(PICKER_MODELS.some((m) => /-4-|claude-(opus|sonnet)-5(\[|$)|\[/.test(m.id))).toBe(false);
   });
 
-  it("still accepts older explicit ids, so existing configs keep working", () => {
-    for (const id of ["claude-sonnet-5[1m]", "claude-opus-5[1m]", "claude-opus-4-8[1m]", "claude-haiku-4-5", "claude-opus-5-5[1m]"]) {
+  it("accepts a tagged id of a natively 1M model and returns it untagged", () => {
+    expect(resolveModelName("claude-opus-5-5[1m]")).toBe("claude-opus-5-5");
+    expect(resolveModelName("claude-sonnet-5-5[1m]")).toBe("claude-sonnet-5-5");
+    expect(resolveModelName("claude-fable-5-1[1m]")).toBe("claude-fable-5-1");
+    expect(resolveModelName("claude-fable-5-2[1M]")).toBe("claude-fable-5-2");
+    expect(normalizeModelId("claude-haiku-5-5[1m]")).toBe("claude-haiku-5-5");
+    expect(sameModel("claude-opus-5-5[1m]", "claude-opus-5-5")).toBe(true);
+    expect(sameModel("claude-opus-5-5", "claude-sonnet-5-5")).toBe(false);
+  });
+
+  it("labels tagged and untagged ids alike, Fable 5.1 as older", () => {
+    expect(modelLabel("claude-opus-5-5")).toBe("Opus 5.5 (default)");
+    expect(modelLabel("claude-opus-5-5[1m]")).toBe("Opus 5.5 (default)");
+    expect(modelLabel("claude-fable-5-2")).toMatch(/^Fable 5\.2/);
+    expect(modelLabel("claude-fable-5-1[1m]")).toBe("Fable 5.1 (older)");
+    expect(modelLabel("claude-sonnet-5[1m]")).toBe("Sonnet 5 1M");
+    expect(modelLabel("future-model")).toBe("future-model");
+  });
+
+  it("still accepts older explicit ids as is, so existing configs keep working", () => {
+    // A tag on a model that was not natively 1M is meaningful and kept.
+    for (const id of ["claude-sonnet-5[1m]", "claude-opus-5[1m]", "claude-opus-4-8[1m]", "claude-haiku-4-5", "claude-fable-5-1"]) {
       expect(resolveModelName(id)).toBe(id);
     }
   });

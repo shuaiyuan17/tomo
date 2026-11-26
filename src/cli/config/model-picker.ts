@@ -1,5 +1,5 @@
 import * as p from "@clack/prompts";
-import { isLiteLlmProviderModel, resolveModelName } from "../../models.js";
+import { isLiteLlmProviderModel, resolveModelName, sameModel } from "../../models.js";
 import { CHATGPT_SUBSCRIPTION_DEFAULT_MODEL } from "../../litellm.js";
 import { loadConfig, modelLabel, MODELS } from "./shared.js";
 
@@ -23,7 +23,7 @@ export async function promptForModel(message: string, current?: string): Promise
       .map(([short, full]) => ({
         value: full,
         label: `${short} — ${modelLabel(full)}`,
-        hint: full === current ? "current" : undefined,
+        hint: current !== undefined && sameModel(full, current) ? "current" : undefined,
       })),
     ...(gatewayConfigured
       ? [

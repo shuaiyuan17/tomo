@@ -12,7 +12,7 @@ import type { SessionStore } from "../sessions/index.js";
 import type { PauseStore } from "../sessions/pause-store.js";
 import { dmSessionKeyForIdentity, isGroupSessionKey } from "../sessions/keys.js";
 import { writeRestartReasonFile } from "../restart-reason.js";
-import { DEFAULT_MODEL, MODEL_ALIASES } from "../models.js";
+import { DEFAULT_MODEL, MODEL_ALIASES, sameModel } from "../models.js";
 import { errorDetail } from "../i18n/error-detail.js";
 import { formatDateTime, formatLocale, formatNumber, joinText, ownerT, raw, type OwnerT, type OwnerText } from "../i18n/index.js";
 import { switchSessionModel, type ModelSwitchRefusal } from "./model-switch.js";
@@ -206,7 +206,7 @@ export class ChatCommandHandler {
         const current = this.deps.modelOverrides.get(key) ?? config.model;
         const lines = [t("model.current", { model: current })];
         for (const [shortName, fullName] of Object.entries(MODEL_ALIASES)) {
-          lines.push(fullName === current ? t("model.aliasActive", { alias: shortName, model: fullName }) : t("model.alias", { alias: shortName, model: fullName }));
+          lines.push(sameModel(fullName, current) ? t("model.aliasActive", { alias: shortName, model: fullName }) : t("model.alias", { alias: shortName, model: fullName }));
         }
         if (config.litellm?.baseUrl) {
           lines.push(t("model.gatewayModels", { example: CHATGPT_SUBSCRIPTION_DEFAULT_MODEL }));

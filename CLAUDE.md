@@ -65,7 +65,8 @@ src/
   channels/           # Channel implementations (Telegram, iMessage via imsg, local web)
   web/                # Optional supervised HTTP/SSE process, bounded RPC, local security
   db/                 # Tomo's SQLite database (data/tomo.db) over node:sqlite: index.ts (open: WAL, FULL+fullfsync,
-                      #   busy timeout, quick_check → move a damaged file aside; BEGIN IMMEDIATE transactions),
+                      #   busy timeout, quick_check → DbDamagedError, never moved by a running process; repairDb for
+                      #   `tomo db repair` with Tomo stopped; BEGIN IMMEDIATE transactions),
                       #   schema.ts (user_version migrations, append only), sqlite.ts (the only node:sqlite loader,
                       #   swallows its ExperimentalWarning), backup.ts (VACUUM INTO snapshot for `tomo backup`)
   sessions/           # Persistence (store.ts + transcript-names/-rotation/-order.ts, store-support.ts,

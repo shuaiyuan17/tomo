@@ -117,7 +117,7 @@ describe("tomo db export pending-notes (the rollback path)", () => {
     expect(store().getPendingNotes("dm:alice")).toEqual([]);
   });
 
-  it("will not overwrite an existing file, run while Tomo is up, or run from an agent's shell", async () => {
+  it("will not overwrite an existing file (without --overwrite), run while Tomo is up, or run from an agent's shell", async () => {
     store().setPendingNotes("dm:alice", ["a1"]);
     writeFileSync(legacyFile, "keep me");
     expect((await run(["export", "pending-notes"])).exitCodes).toEqual([1]);
@@ -158,5 +158,39 @@ describe("tomo db export pending-notes (the rollback path)", () => {
     rmSync(out);
     expect((await run(["export", "pending-notes", "--out", out])).exitCodes).toEqual([]);
     expect(store().getPendingNotes("dm:alice")).toEqual(["rescued"]);
+  });
+});
+
+describe("tomo db repair", () => {
+  it("copies a damaged database aside and starts a fresh one; a sound one is left alone", async () => {
+    store().setPendingNotes("dm:alice", ["keep"]);
+    const ok = await run(["repair"]);
+    expect(ok.exitCodes).toEqual([]);
+    expect(ok.logs.join("\n")).toContain("nothing to repair");
+    expect(store().getPendingNotes("dm:alice")).toEqual(["keep"]);
+
+    for (const f of [`${dbPath}-wal`, `${dbPath}-shm`]) rmSync(f, { force: true });
+    writeFileSync(dbPath, "garbage ".repeat(600));
+    const r = await run(["repair"]);
+    expect(r.exitCodes).toEqual([]);
+    expect(r.logs.join("\n")).toMatch(/tomo\.db\.corrupt-/);
+    expect(r.logs.join("\n")).toContain("tomo db export pending-notes --from");
+    expect((await run(["check"])).exitCodes).toEqual([]);
+  });
+
+  it("refuses while Tomo is running, and from an agent's shell", async () => {
+    mkdirSync(join(paths.tomoHome, "data"), { recursive: true });
+    writeFileSync(dbPath, "garbage ".repeat(600));
+    writeFileSync(paths.pidFile, `${process.pid}\n`);
+    try {
+      const up = await run(["repair"]);
+      expect(up.exitCodes).toEqual([1]);
+      expect(up.errors.join("\n")).toContain("Tomo is running");
+    } finally {
+      rmSync(paths.pidFile, { force: true });
+    }
+    vi.stubEnv("TOMO_SESSION_KEY", "dm:alice");
+    expect((await run(["repair"])).exitCodes).toEqual([1]);
+    expect(readFileSync(dbPath, "utf8")).toBe("garbage ".repeat(600));
   });
 });

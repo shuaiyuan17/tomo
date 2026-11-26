@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, readdirSync, writeFileSync as write } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync as write } from "node:fs";
 import { join } from "node:path";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
@@ -105,17 +105,17 @@ describe("a pending notes file that will not read", () => {
 });
 
 describe("Tomo's database at start", () => {
-  it("a damaged tomo.db is moved aside at boot, before any message, and the owner told with the recovery commands", async () => {
+  it("a damaged tomo.db is found at boot, left as it is, and the owner told how to repair it", async () => {
     const ownerNotice = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(true);
     mkdirSync(join(mockConfig.tomoHome, "data"), { recursive: true });
     write(mockConfig.dbPath, "not a database ".repeat(300));
     const agent = await boot();
     await waitFor(() => expect(ownerNotice).toHaveBeenCalledTimes(1));
     const text = String(ownerNotice.mock.calls[0][0]);
-    expect(text).toMatch(/tomo\.db\.corrupt-/);
-    expect(text).toContain("tomo db export pending-notes");
-    expect(readdirSync(join(mockConfig.tomoHome, "data")).filter((f) => /^tomo\.db\.corrupt-[\d-]+$/.test(f))).toHaveLength(1);
-    await waitFor(() => expect(existsSync(`${mockConfig.dbPath}.quarantined.json`)).toBe(false));
+    expect(text).toContain(mockConfig.dbPath);
+    expect(text).toContain("tomo db repair");
+    expect(readFileSync(mockConfig.dbPath, "utf8")).toBe("not a database ".repeat(300));
+    expect(readdirSync(join(mockConfig.tomoHome, "data")).filter((f) => f.includes("corrupt"))).toEqual([]);
     await agent.stop();
   });
 

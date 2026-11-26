@@ -1,7 +1,6 @@
-import { closeSync, constants, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, rmSync, statSync, unlinkSync } from "node:fs";
-import { withFileLockSync } from "../file-lock.js";
+import { closeSync, constants, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, rmSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
-import { writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
+import { isEnoent } from "../fs-utils.js";
 import { log } from "../logger.js";
 import { fileTimestamp } from "../sessions/transcript-names.js";
 import { loadNodeSqlite, type SqliteDatabase, type SqliteStatement, type SqliteValue } from "./sqlite.js";
@@ -26,12 +25,14 @@ export type { SqliteValue } from "./sqlite.js";
  *   instead of one failing with SQLITE_BUSY.
  * - A forward-only schema migration keyed on `PRAGMA user_version`, each step
  *   in its own transaction. A database newer than this code is refused.
- * - A `quick_check` on every writable open. A database that fails it, or is
- *   not a database at all, is never repaired in place nor read as empty and
- *   written over. The daemon (the only opener with `quarantine`) copies it
- *   aside unchanged with its log as `tomo.db.corrupt-<ts>` and starts a fresh
- *   one; the marker beside it names the copy until the owner has been told.
- *   Every other opener gets a DbDamagedError and leaves it for the daemon.
+ * - A `quick_check` on every writable open, read-only first. A database that
+ *   fails it, or is not a database at all, is never repaired in place, never
+ *   read as empty and written over, and never moved by a running process: the
+ *   open throws DbDamagedError (the daemon tells the owner and keeps notes in
+ *   memory), and `tomo db repair`, with Tomo stopped, copies it aside as
+ *   `tomo.db.corrupt-<ts>` and starts a fresh one (see repairDb). Moving files
+ *   under processes that may have them open was the source of every race an
+ *   automatic quarantine had.
  *
  * This is the only module that talks to `node:sqlite`; nothing else should
  * hold a raw handle.
@@ -61,21 +62,12 @@ export function isCorruptionError(err: unknown): boolean {
 }
 
 export interface OpenOptions {
-  /** Open for reading only: no PRAGMA writes, no migration, no quarantine. */
+  /** Open for reading only: no PRAGMA writes, no migration. */
   readOnly?: boolean;
   /** Override the schema (tests). Defaults to Tomo's own migrations. */
   migrations?: readonly Migration[];
   /** Read-only opens only: do not refuse a schema newer than this code (`tomo db check`). */
   allowNewerSchema?: boolean;
-  /**
-   * Copy a damaged database aside and start a fresh one (see quarantineDb).
-   * Only the daemon sets this, when it opens the database at start: with
-   * several processes free to do it, one could move the file while another
-   * is opening or using it. Anyone else gets a DbDamagedError.
-   */
-  quarantine?: boolean;
-  /** Told after a damaged database was copied aside (the marker already names it). */
-  onQuarantined?: (aside: string) => void;
   /** Busy timeout override (tests that hold a lock on purpose). */
   busyTimeoutMs?: number;
 }
@@ -247,27 +239,14 @@ export function openTomoDb(path: string, opts: OpenOptions = {}): TomoDb {
   }
 
   mkdirSync(dirname(path), { recursive: true });
-  const damaged = (err: unknown, checked: string | null): void => {
-    // Only the process that owns maintenance (the daemon, at start) moves a
-    // damaged file; anyone else stops here and leaves it for that one.
-    if (!opts.quarantine) throw new DbDamagedError(path, err);
-    const aside = quarantineDb(path, err, checked);
-    if (aside === null) return; // another process moved it first
-    try {
-      opts.onQuarantined?.(aside);
-    } catch (listenerErr) {
-      log.warn({ err: listenerErr }, "Database quarantine listener failed");
-    }
-  };
   // CHECKED READ-ONLY FIRST. A writable connection to a damaged file is not
   // harmless: it can rewrite or drop a -wal it does not like, and closing it
   // checkpoints the log into the database. A read-only one leaves the -wal and
-  // the main file as they are, so what is copied aside is what was there. When
-  // the read-only check cannot run at all (no -shm to read, say) the writable
-  // open checks instead.
+  // the main file as they are, for `tomo db repair` to copy. When the
+  // read-only check cannot run at all (no -shm to read, say) the writable open
+  // checks instead.
   let checked = false;
-  const identity = fileIdentity(path);
-  if (identity !== null) {
+  if (existsSync(path)) {
     let ro: SqliteDatabase | null = null;
     let failure: unknown = null;
     try {
@@ -279,152 +258,109 @@ export function openTomoDb(path: string, opts: OpenOptions = {}): TomoDb {
     } finally {
       ro?.close();
     }
-    if (failure !== null) {
-      damaged(failure, identity);
-      checked = true;
-    }
+    if (failure !== null) throw new DbDamagedError(path, failure);
   }
-  const attempt = (check: boolean): TomoDb => {
-    const raw = connect(path, opts);
-    const db = new TomoDb(path, raw, false);
-    try {
-      if (check) assertSound(raw, path);
-      migrate(db, migrations);
-      return db;
-    } catch (err) {
-      db.close();
-      throw err;
-    }
-  };
-  const before = fileIdentity(path);
+  const raw = connect(path, opts);
+  const db = new TomoDb(path, raw, false);
   try {
-    return attempt(!checked);
+    if (!checked) assertSound(raw, path);
+    migrate(db, migrations);
+    return db;
   } catch (err) {
-    if (!isCorruptionError(err)) throw err;
-    damaged(err, before);
-    return attempt(true);
-  }
-}
-
-/** The database is damaged and this opener does not move it aside (see `OpenOptions.quarantine`). */
-export class DbDamagedError extends Error {
-  readonly errcode = SQLITE_CORRUPT;
-  constructor(readonly path: string, cause: unknown) {
-    super(`${path} is damaged (${(cause as Error)?.message ?? cause}); Tomo moves it aside when it next starts. \`tomo db check\` shows the damage.`, { cause });
-    this.name = "DbDamagedError";
-  }
-}
-
-// --- Quarantine -------------------------------------------------------------
-
-/** Beside the database: the copies moved aside that the owner has not been told about. */
-export function dbQuarantineMarkerPath(path: string): string {
-  return `${path}.quarantined.json`;
-}
-
-/** Moved-aside copies not yet announced (undefined: none). A marker that will not read names none. */
-export function quarantinedDbs(path: string): string[] | undefined {
-  let raw: string;
-  try {
-    raw = readFileSync(dbQuarantineMarkerPath(path), "utf-8");
-  } catch (err) {
-    return isEnoent(err) ? undefined : [];
-  }
-  try {
-    const asides = (JSON.parse(raw) as { asides?: unknown }).asides;
-    return Array.isArray(asides) ? asides.filter((a): a is string => typeof a === "string") : [];
-  } catch {
-    return [];
-  }
-}
-
-/** The owner was told about `asides`: they leave the marker, which goes once empty. */
-export function clearQuarantinedDbs(path: string, asides: string[]): void {
-  const marker = dbQuarantineMarkerPath(path);
-  const before = quarantinedDbs(path);
-  if (before === undefined) return;
-  const left = before.filter((a) => !asides.includes(a));
-  try {
-    if (left.length > 0) writeJsonAtomicSync(marker, { asides: left }, { fsync: true });
-    else unlinkSync(marker);
-  } catch (err) {
-    if (!isEnoent(err)) log.warn({ err }, "Could not update the database quarantine marker");
-  }
-}
-
-/** Identity of the file at `path` (null: none), to tell "the file we checked" from one created since. */
-export function fileIdentity(path: string): string | null {
-  try {
-    const st = statSync(path, { bigint: true });
-    return `${st.dev}:${st.ino}`;
-  } catch (err) {
-    if (isEnoent(err)) return null;
+    db.close();
+    if (isCorruptionError(err) && !(err instanceof DbDamagedError)) throw new DbDamagedError(path, err);
     throw err;
   }
 }
 
-/**
- * Copy a damaged database and its log aside, as `<path>.corrupt-<ts>`
- * (+ `-wal`/`-journal`, so `sqlite3 <aside>` still sees the log), then remove
- * the originals so a fresh database can start.
- *
- * COPY, FSYNC, MARK, THEN DELETE. A crash at any point leaves a complete copy
- * or the untouched originals, never a database separated from its committed
- * log: the copies are whole and on disk before the marker names them, and the
- * marker is on disk before any original goes. The log is deleted before the
- * main file (a -wal left beside a fresh database would be replayed into it);
- * a crash between the two leaves the damaged main file, which the next start
- * finds and copies aside again. `-shm` is only an index and is not copied.
- *
- * Under a lock, and only while the file is still the one that failed the
- * check (`checked`, its dev:ino): returns null when it is not (someone else
- * already moved it). Throws when it cannot complete; nothing may be created
- * over the originals then. Exported for tests.
- */
-export function quarantineDb(path: string, cause: unknown, checked: string | null): string | null {
-  return withFileLockSync(`${path}.quarantine.lock`, () => {
-    if (fileIdentity(path) !== checked) return null;
-    const ts = fileTimestamp();
-    for (let n = 0; n < 100; n++) {
-      const aside = n === 0 ? `${path}.corrupt-${ts}` : `${path}.corrupt-${ts}-${n}`;
-      if (dbFamily(aside).some((p) => existsSync(p))) continue;
-      const copied: string[] = [];
-      try {
-        for (const suffix of ["", "-wal", "-journal"]) {
-          if (!existsSync(`${path}${suffix}`)) continue;
-          copyFileSync(`${path}${suffix}`, `${aside}${suffix}`, constants.COPYFILE_EXCL);
-          copied.push(`${aside}${suffix}`);
-          fsyncPath(`${aside}${suffix}`);
-        }
-        fsyncPath(dirname(path));
-      } catch (err) {
-        for (const p of copied) rmSync(p, { force: true });
-        throw new Error(`Database ${path} is damaged and could not be copied aside`, { cause: err });
-      }
-      const before = quarantinedDbs(path);
-      writeJsonAtomicSync(dbQuarantineMarkerPath(path), { asides: [...(before ?? []), aside] }, { fsync: true });
-      for (const suffix of ["-wal", "-journal", "", "-shm"]) {
-        try {
-          unlinkSync(`${path}${suffix}`);
-        } catch (err) {
-          if (!isEnoent(err)) throw new Error(`Copied the damaged database ${path} aside to ${aside} but could not remove ${path}${suffix}`, { cause: err });
-        }
-      }
-      log.error({ err: cause, file: path, aside }, "Database failed its check; copied it aside unchanged and started a fresh one");
-      return aside;
-    }
-    throw new Error(`No free name to copy the damaged database ${path} aside`, { cause });
-  });
+/** The database failed its check. Nothing was changed; `tomo db repair` (Tomo stopped) copies it aside. */
+export class DbDamagedError extends Error {
+  readonly errcode = SQLITE_CORRUPT;
+  constructor(readonly path: string, cause: unknown) {
+    super(`${path} is damaged (${(cause as Error)?.message ?? cause}). Stop Tomo and run \`tomo db repair\` to copy it aside and start a fresh one; \`tomo db check\` shows the damage.`, { cause });
+    this.name = "DbDamagedError";
+  }
 }
 
-function fsyncPath(path: string): void {
-  let fd: number | null = null;
+// --- Repair -----------------------------------------------------------------
+
+/**
+ * `tomo db repair`: copy a damaged database and its log aside, as
+ * `<path>.corrupt-<ts>` (+ `-wal`/`-journal`, so `sqlite3 <aside>` still sees
+ * the log), remove the originals and start a fresh database. The caller makes
+ * sure Tomo is not running; nothing else moves these files.
+ *
+ * COPY, FSYNC, THEN DELETE. A failure (or a crash) before the deletes leaves
+ * the originals untouched, and a copy is only trusted once it and its
+ * directory are fsynced. The log is deleted before the main file (a -wal left
+ * beside a fresh database would be replayed into it); stopping between the
+ * two leaves the damaged main file, which the next repair copies again.
+ * `-shm` is only an index and is not copied.
+ *
+ * Returns null, touching nothing, when the database passes its check (or does
+ * not exist); otherwise the aside path.
+ */
+export function repairDb(path: string): string | null {
+  if (!existsSync(path)) return null;
+  let failure: unknown = null;
+  let ro: SqliteDatabase | null = null;
   try {
-    fd = openSync(path, "r");
-    fsyncSync(fd);
-  } catch {
-    /* advisory where the filesystem refuses (a directory on some systems) */
+    ro = connect(path, { readOnly: true });
+    assertSound(ro, path);
+  } catch (err) {
+    if (!isCorruptionError(err)) throw err;
+    failure = err;
   } finally {
-    if (fd !== null) closeSync(fd);
+    ro?.close();
+  }
+  if (failure === null) return null;
+  const ts = fileTimestamp();
+  for (let n = 0; n < 100; n++) {
+    const aside = n === 0 ? `${path}.corrupt-${ts}` : `${path}.corrupt-${ts}-${n}`;
+    if (dbFamily(aside).some((p) => existsSync(p))) continue;
+    const copied: string[] = [];
+    try {
+      for (const suffix of ["", "-wal", "-journal"]) {
+        if (!existsSync(`${path}${suffix}`)) continue;
+        copyFileSync(`${path}${suffix}`, `${aside}${suffix}`, constants.COPYFILE_EXCL);
+        copied.push(`${aside}${suffix}`);
+        fsyncFile(`${aside}${suffix}`);
+      }
+      fsyncDir(dirname(path));
+    } catch (err) {
+      for (const p of copied) rmSync(p, { force: true });
+      throw new Error(`Could not copy the damaged database ${path} aside; nothing was changed`, { cause: err });
+    }
+    for (const suffix of ["-wal", "-journal", "", "-shm"]) {
+      try {
+        unlinkSync(`${path}${suffix}`);
+      } catch (err) {
+        if (!isEnoent(err)) throw new Error(`Copied the damaged database to ${aside} but could not remove ${path}${suffix}; run repair again`, { cause: err });
+      }
+    }
+    fsyncDir(dirname(path));
+    log.warn({ err: failure, file: path, aside }, "Damaged database copied aside; a fresh one starts");
+    openTomoDb(path).close();
+    return aside;
+  }
+  throw new Error(`No free name to copy the damaged database ${path} aside`);
+}
+
+/** fsync a file the copy depends on: an error here aborts the repair. */
+function fsyncFile(path: string): void {
+  const fd = openSync(path, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** fsync a directory: advisory, as some filesystems refuse it. */
+function fsyncDir(path: string): void {
+  try {
+    fsyncFile(path);
+  } catch {
+    /* see above */
   }
 }

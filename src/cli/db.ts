@@ -2,7 +2,7 @@ import { Command } from "commander";
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { config } from "../config.js";
-import { DbSchemaTooNewError, openTomoDb, quarantinedDbs, type TomoDb } from "../db/index.js";
+import { DbSchemaTooNewError, openTomoDb, repairDb, type TomoDb } from "../db/index.js";
 import { DUMPABLE_TABLES, TOMO_DB_MIGRATIONS } from "../db/schema.js";
 import { canManageJob } from "../cron/scope.js";
 import { TOMO_SESSION_KEY_ENV } from "../restart-reason.js";
@@ -40,6 +40,11 @@ function withDb<T>(path: string, fn: (db: TomoDb) => T, opts: { allowNewerSchema
   }
 }
 
+function refuseWhileRunning(): void {
+  const record = existsSync(defaultRuntimePaths.pidFile) ? readPidFileRecord(defaultRuntimePaths.pidFile) : null;
+  if (record && isRecordedProcessLive(record)) fail("Tomo is running. Stop it first (`tomo stop`).");
+}
+
 function tableNames(db: TomoDb): string[] {
   return db.all<{ name: string }>("SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").map((r) => r.name);
 }
@@ -64,8 +69,6 @@ dbCommand
       console.log(`integrity_check: ${sound ? "ok" : result.slice(0, 20).join("\n  ")}`);
       return sound;
     }, { allowNewerSchema: true });
-    const asides = opts.from ? undefined : quarantinedDbs(path);
-    if (asides && asides.length > 0) console.log(`Moved aside, owner not yet told: ${asides.join(", ")}`);
     if (!ok) process.exit(1);
   });
 
@@ -113,25 +116,22 @@ dbCommand
   .description(`Write a store back to its pre-SQLite file, for a rollback (${Object.keys(EXPORTS).join(", ")})`)
   .option("--out <path>", "Write here instead of the file the older Tomo reads")
   .option("--from <path>", "Read this database file instead (e.g. a moved-aside copy)")
-  .option("--force", "Overwrite an existing file, and run while the daemon is up")
-  .action((store: string, opts: { out?: string; from?: string; force?: boolean }) => {
+  .option("--overwrite", "Overwrite an existing file")
+  .action((store: string, opts: { out?: string; from?: string; overwrite?: boolean }) => {
     const target = EXPORTS[store];
     if (!target) fail(`Unknown store "${store}". Stores: ${Object.keys(EXPORTS).join(", ")}`);
     if (process.env[TOMO_SESSION_KEY_ENV]?.trim()) fail("`tomo db export` is an operator command; run it from a terminal, not an agent's shell.");
     const out = opts.out ?? target.file();
-    if (!opts.force) {
-      // A running daemon keeps changing the table after the export, and an
-      // older Tomo started on the file would miss those changes.
-      const record = existsSync(defaultRuntimePaths.pidFile) ? readPidFileRecord(defaultRuntimePaths.pidFile) : null;
-      if (record && isRecordedProcessLive(record)) fail("Tomo is running. Stop it first (`tomo stop`), or pass --force.");
-      if (existsSync(out)) fail(`${out} already exists; pass --force to overwrite it.`);
-    }
+    // Never while Tomo runs: it holds the queue in memory and would write it
+    // back after the export, and an older Tomo started on the file would miss that.
+    const move = !opts.out && !opts.from;
+    if (move) refuseWhileRunning();
+    if (existsSync(out) && !opts.overwrite) fail(`${out} already exists; pass --overwrite to replace it.`);
     // To the file the older Tomo reads, from the live database: the notes are
     // MOVED (the table is emptied once the file is on disk), so an older Tomo
     // that delivers them and deletes the file leaves nothing in the database
     // to deliver a second time after an upgrade. Anywhere else, or from
     // another file, it is a copy and the database is not written.
-    const move = !opts.out && !opts.from;
     const path = opts.from ?? config.dbPath;
     if (!existsSync(path)) fail(`No database at ${path}.`);
     let count: number;
@@ -143,7 +143,8 @@ dbCommand
         db.close();
       }
     } catch (err) {
-      fail(`Could not export from ${path}: ${(err as Error).message}`);
+      fail(`Could not export from ${path}: ${(err as Error).message}`
+        + (move ? " If the file was written, the database was not emptied: run the export again with --overwrite before rolling back." : ""));
     }
     if (move) {
       console.log(`Moved ${count} note(s) out of the database into ${out}.`);
@@ -152,4 +153,25 @@ dbCommand
     } else {
       console.log(`Wrote ${count} note(s) to ${out} (the database is unchanged).`);
     }
+  });
+
+dbCommand
+  .command("repair")
+  .description("Copy a damaged database aside (tomo.db.corrupt-<ts>, with its -wal) and start a fresh one. Tomo must be stopped.")
+  .action(() => {
+    if (process.env[TOMO_SESSION_KEY_ENV]?.trim()) fail("`tomo db repair` is an operator command; run it from a terminal, not an agent's shell.");
+    refuseWhileRunning();
+    let aside: string | null;
+    try {
+      aside = repairDb(config.dbPath);
+    } catch (err) {
+      fail(`Repair failed: ${(err as Error).message}`);
+    }
+    if (aside === null) {
+      console.log(`${config.dbPath} passes its check (or does not exist); nothing to repair.`);
+      return;
+    }
+    console.log(`Copied the damaged database to ${aside} and started a fresh one.`);
+    console.log(`Its pending notes may still be readable: tomo db export pending-notes --from ${aside} --out <file>`);
+    console.log(`Last resort: sqlite3 ${aside} .recover`);
   });

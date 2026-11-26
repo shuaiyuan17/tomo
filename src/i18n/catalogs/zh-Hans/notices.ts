@@ -27,7 +27,7 @@ export const notices = {
     settingsNotInEffect: "⚠️ Tomo 传给 Claude Code 的部分设置在 {{session}} 里没有生效。Claude Code 的原话：{{text}}",
   },
   pendingNotesQuarantined_other: "⚠️ Tomo 读不了待处理笔记文件，已把它原样移到一边（{{count}} 份：{{files}}），并新建了一个。里面的笔记没有送达。可以让我读一下这个文件，把还要紧的补发。",
-  databaseQuarantined_other: "⚠️ Tomo 的数据库或待处理笔记读不出来（{{count}} 份），已原样移到一边（{{files}}，连同 -wal/-shm），并新建了一个。里面的笔记没有送达。`tomo db export pending-notes --from <那个文件>` 也许还能读出来；最后的办法是 `sqlite3 <那个文件> .recover`。",
+  databaseDamaged: "⚠️ Tomo 的数据库（{{file}}）没通过启动自检。Tomo 没有动它，待处理笔记暂时只存在内存里，修好之前重启就会丢。修复：`tomo stop`，然后 `tomo db repair`（把坏库原样拷到一边、新建一个，并告诉你怎么把旧笔记读出来），再 `tomo start`。",
   imsgLaneBlocked: "⚠️ iMessage 一直拒绝发送（imsg rpc 错误 -32004，mutation lane blocked）。Tomo 在过去 {{minutes}} 分钟里已重启 imsg rpc 进程 {{restarts}} 次，现在暂停重启，在它恢复之前 iMessage 的回复可能会失败。可以先看看 `imsg status`；重启 Messages.app 或 Tomo 通常能解决。",
   mcpDown: "⚠️ MCP 服务器“{{server}}”挂了：连续 {{failures}} 次重连失败。重新连上之前，它的工具都用不了。可以试试 /mcp reconnect {{server}}（或在 web 的 MCP 页面点“重新连接”），或用 /new 开一个新的 session。",
   mcpOAuth: {

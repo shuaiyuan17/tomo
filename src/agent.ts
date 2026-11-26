@@ -89,7 +89,7 @@ import { QuotaGateReader } from "./usage/limits-log.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { withConfigLockSync } from "./config-file.js";
 import { writeJsonAtomicSync } from "./fs-utils.js";
@@ -3398,11 +3398,7 @@ export class Agent {
     }
     // A marker that will not read names no file.
     const files = asides.length > 0 ? asides : [join(config.sessionsDir, "_pending_notes.json.corrupt-*")];
-    // A moved-aside database (not the old notes file) gets its own wording: it names the recovery commands.
-    const params = { files: files.join(", "), count: files.length };
-    const text = files.some((f) => !basename(f).startsWith("_pending_notes.json"))
-      ? ownerT("notices")("databaseQuarantined", params)
-      : ownerT("notices")("pendingNotesQuarantined", params);
+    const text = ownerT("notices")("pendingNotesQuarantined", { files: files.join(", "), count: files.length });
     this.pendingNotesNoticeSending = true;
     const failed = (err?: unknown): void => {
       log.warn({ err, files }, "Could not tell the owner the pending notes file was moved aside");
@@ -3428,6 +3424,19 @@ export class Agent {
           this.tellPendingNotesQuarantined();
         }
       });
+  }
+
+  /**
+   * Tell the owner, once per start, that Tomo's database failed its check:
+   * nothing was changed, notes are held in memory until it is repaired, and
+   * `tomo db repair` (with Tomo stopped) copies it aside. Every start that
+   * still finds it damaged says so again.
+   */
+  private tellDatabaseDamaged(): void {
+    const damage = this.sessions.pendingNotesDbDamage();
+    if (!damage) return;
+    const text = ownerT("notices")("databaseDamaged", { file: damage.path });
+    void this.notifyOwner(text).catch((err) => log.warn({ err }, "Could not tell the owner the database is damaged"));
   }
 
   /**
@@ -3471,6 +3480,7 @@ export class Agent {
     // A file moved aside before now (this start, or a run that went away before telling the owner).
     this.pendingNotesNoticeReady = true;
     this.tellPendingNotesQuarantined();
+    this.tellDatabaseDamaged();
     try {
       this.replayInbox(recovered);
     } catch (err) {

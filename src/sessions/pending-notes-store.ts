@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { clearQuarantinedDbs, openTomoDb, quarantinedDbs, type TomoDb } from "../db/index.js";
+import { DbDamagedError, openTomoDb, type TomoDb } from "../db/index.js";
 import { isEnoent, writeJsonAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
 import { fileTimestamp } from "./transcript-names.js";
@@ -46,17 +46,20 @@ export type MoveOutcome = "moved" | "taken" | "gone";
  * never touches notes (`tomo status`) never opens it. When it cannot be opened
  * every call throws and the queue keeps the notes in memory (its own fallback).
  *
- * MAINTENANCE IS THE DAEMON'S. Importing the old file and copying a damaged
- * database aside happen only in a store built with `maintenance` (the
- * daemon's, opened at start). Another process (a CLI re-key) that finds the
- * old file not yet imported, or a damaged database, throws and leaves both
- * for the daemon: two processes doing either at once could each act on what
- * the other is halfway through changing.
+ * THE IMPORT IS THE DAEMON'S. Only a store built with `maintenance` (the
+ * daemon's, opened at start) imports the old file. Another process (a CLI
+ * re-key) that finds it not yet imported throws and leaves it for the daemon.
+ *
+ * A DAMAGED DATABASE is left as it is (see src/db): every call throws, the
+ * queue keeps notes in memory, and `damage()` says why so the daemon can tell
+ * the owner to stop Tomo and run `tomo db repair`.
  */
 export class PendingNotesStore {
   private db: TomoDb | null = null;
   private unreadable: unknown = null;
-  /** Told after a file or database was moved aside (a marker already names it). */
+  /** The last open failed because the database is damaged (cleared by a good open). */
+  private damaged: DbDamagedError | null = null;
+  /** Told after the unreadable old notes file was moved aside (a marker already names it). */
   onQuarantined?: (aside: string) => void;
 
   constructor(
@@ -76,11 +79,14 @@ export class PendingNotesStore {
   /** The open database, imported and ready. Throws when it cannot be. */
   private ready(): TomoDb {
     if (this.db) return this.db;
-    const db = openTomoDb(this.dbPath, {
-      readOnly: this.opts.readOnly,
-      quarantine: this.opts.maintenance && !this.opts.readOnly,
-      onQuarantined: (aside) => this.tell(aside),
-    });
+    let db: TomoDb;
+    try {
+      db = openTomoDb(this.dbPath, { readOnly: this.opts.readOnly });
+    } catch (err) {
+      if (err instanceof DbDamagedError) this.damaged = err;
+      throw err;
+    }
+    this.damaged = null;
     try {
       if (this.opts.maintenance && !this.opts.readOnly) this.importLegacy(db);
       else if (!this.opts.readOnly && existsSync(this.legacyPath)) {
@@ -92,6 +98,11 @@ export class PendingNotesStore {
     }
     this.db = db;
     return db;
+  }
+
+  /** Why the database could not be opened, when it is damaged (null: it is not, or not known yet). */
+  damage(): DbDamagedError | null {
+    return this.damaged;
   }
 
   /** Is the database usable? Throws when not (a re-key checks before it moves anything). */
@@ -208,7 +219,7 @@ export class PendingNotesStore {
     const ts = fileTimestamp();
     for (let n = 0; n < 100; n++) {
       const aside = n === 0 ? `${path}.corrupt-${ts}` : `${path}.corrupt-${ts}-${n}`;
-      const before = this.legacyMarker();
+      const before = this.quarantined();
       let outcome: MoveOutcome | undefined;
       try {
         writeJsonAtomicSync(this.legacyMarkerPath, { asides: [...(before ?? []), aside] }, { fsync: true });
@@ -240,9 +251,14 @@ export class PendingNotesStore {
     }
   }
 
-  // --- Quarantine markers (the legacy file's and the database's) ---
+  // --- Quarantine marker (the unreadable legacy file's) ---
 
-  private legacyMarker(): string[] | undefined {
+  /**
+   * Old notes files moved aside because they would not read, that the owner
+   * has not been told about yet; undefined: none. A marker that will not read
+   * counts as one naming no file.
+   */
+  quarantined(): string[] | undefined {
     let raw: string;
     try {
       raw = readFileSync(this.legacyMarkerPath, "utf-8");
@@ -257,31 +273,17 @@ export class PendingNotesStore {
     }
   }
 
-  /**
-   * Files moved aside (an unreadable legacy notes file, or a damaged
-   * database) that the owner has not been told about yet; undefined: none.
-   * A marker that will not read counts as one naming no file.
-   */
-  quarantined(): string[] | undefined {
-    const legacy = this.legacyMarker();
-    const dbs = quarantinedDbs(this.dbPath);
-    if (legacy === undefined && dbs === undefined) return undefined;
-    return [...(legacy ?? []), ...(dbs ?? [])];
-  }
-
-  /** The owner was told about `asides`: they leave the markers, each of which goes once empty. */
+  /** The owner was told about `asides`: they leave the marker, which goes once empty. */
   clearQuarantined(asides: string[]): void {
-    const legacy = this.legacyMarker();
-    if (legacy !== undefined) {
-      const left = legacy.filter((a) => !asides.includes(a));
-      try {
-        if (left.length > 0) writeJsonAtomicSync(this.legacyMarkerPath, { asides: left }, { fsync: true });
-        else unlinkSync(this.legacyMarkerPath);
-      } catch (err) {
-        if (!isEnoent(err)) log.warn({ err }, "Could not update the pending notes quarantine marker");
-      }
+    const before = this.quarantined();
+    if (before === undefined) return;
+    const left = before.filter((a) => !asides.includes(a));
+    try {
+      if (left.length > 0) writeJsonAtomicSync(this.legacyMarkerPath, { asides: left }, { fsync: true });
+      else unlinkSync(this.legacyMarkerPath);
+    } catch (err) {
+      if (!isEnoent(err)) log.warn({ err }, "Could not update the pending notes quarantine marker");
     }
-    clearQuarantinedDbs(this.dbPath, asides);
   }
 }
 

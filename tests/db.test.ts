@@ -5,6 +5,7 @@ import { spawn, spawnSync } from "node:child_process";
 const fsHooks = vi.hoisted(() => ({
   failCopy: null as null | ((from: string) => boolean),
   failUnlink: null as null | ((path: string) => boolean),
+  failFsync: false,
 }));
 vi.mock("node:fs", async (orig) => {
   const actual = await orig<typeof import("node:fs")>();
@@ -16,17 +17,18 @@ vi.mock("node:fs", async (orig) => {
     if (fsHooks.failUnlink?.(String(path))) throw Object.assign(new Error(`EPERM: unlink ${path}`), { code: "EPERM" });
     return actual.unlinkSync(path);
   };
-  return { ...actual, default: { ...actual, copyFileSync, unlinkSync }, copyFileSync, unlinkSync };
+  const fsyncSync = (fd: number) => {
+    if (fsHooks.failFsync) throw Object.assign(new Error("EIO: fsync"), { code: "EIO" });
+    return actual.fsyncSync(fd);
+  };
+  return { ...actual, default: { ...actual, copyFileSync, unlinkSync, fsyncSync }, copyFileSync, unlinkSync, fsyncSync };
 });
 
 import { existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync, closeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  DB_BUSY_TIMEOUT_MS, DbDamagedError, DbSchemaTooNewError, clearQuarantinedDbs, dbQuarantineMarkerPath, fileIdentity, isCorruptionError, openTomoDb,
-  quarantineDb, quarantinedDbs, type Migration,
-} from "../src/db/index.js";
+import { DB_BUSY_TIMEOUT_MS, DbDamagedError, DbSchemaTooNewError, isCorruptionError, openTomoDb, repairDb, type Migration } from "../src/db/index.js";
 import { TOMO_DB_MIGRATIONS } from "../src/db/schema.js";
 
 vi.mock("../src/logger.js", () => ({ log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
@@ -165,32 +167,20 @@ describe("transactions", () => {
 describe("a damaged database", () => {
   const corruptAsides = (dir: string) => readdirSync(dir).filter((f) => /^tomo\.db\.corrupt-[\d-]+$/.test(f));
 
-  it("that is not a database at all is copied aside with its log, the marker names it, and a fresh one starts", () => {
+  it("is refused by every open, writable or not, and left exactly as it is, log included", () => {
     const dir = freshDir();
     const path = join(dir, "tomo.db");
     writeFileSync(path, "garbage ".repeat(512));
-    writeFileSync(`${path}-wal`, "old wal");
-    writeFileSync(`${path}-shm`, "old shm");
-    const told: string[] = [];
-    const db = openTomoDb(path, { quarantine: true, onQuarantined: (aside) => told.push(aside) });
-    expect(told).toHaveLength(1);
-    const aside = told[0];
-    expect(aside).toMatch(/tomo\.db\.corrupt-\d{8}-\d{6}$/);
-    expect(readFileSync(aside, "utf8")).toBe("garbage ".repeat(512));
-    expect(readFileSync(`${aside}-wal`, "utf8")).toBe("old wal");
-    // -shm is an index SQLite rebuilds: not copied, and the stale one is gone.
-    expect(existsSync(`${aside}-shm`)).toBe(false);
-    expect(existsSync(`${path}-shm`) && readFileSync(`${path}-shm`, "utf8") === "old shm").toBe(false);
-    expect(quarantinedDbs(path)).toEqual([aside]);
-    db.run("INSERT INTO meta (key, value) VALUES ('fresh', '1')");
-    expect(db.check()).toEqual(["ok"]);
-    db.close();
-    clearQuarantinedDbs(path, [aside]);
-    expect(existsSync(dbQuarantineMarkerPath(path))).toBe(false);
-    expect(quarantinedDbs(path)).toBeUndefined();
+    writeFileSync(`${path}-wal`, "committed frames only here");
+    expect(() => openTomoDb(path)).toThrow(DbDamagedError);
+    expect(() => openTomoDb(path)).toThrow(/tomo db repair/);
+    expect(() => openTomoDb(path, { readOnly: true })).toThrow();
+    expect(readFileSync(path, "utf8")).toBe("garbage ".repeat(512));
+    expect(readFileSync(`${path}-wal`, "utf8")).toBe("committed frames only here");
+    expect(corruptAsides(dir)).toEqual([]);
   });
 
-  it("whose pages are damaged fails quick_check and is copied aside", () => {
+  it("whose pages are damaged fails quick_check and is refused", () => {
     const dir = freshDir();
     const path = join(dir, "tomo.db");
     populated(path);
@@ -198,98 +188,101 @@ describe("a damaged database", () => {
     // Page 3 onwards (page size 4096): scribble over b-tree pages, keep the header.
     writeSync(fd, Buffer.alloc(4096 * 3, 0xa5), 0, 4096 * 3, 4096 * 2);
     closeSync(fd);
-    const told: string[] = [];
-    const db = openTomoDb(path, { quarantine: true, onQuarantined: (aside) => told.push(aside) });
-    expect(told).toHaveLength(1);
-    expect(db.get<{ n: number }>("SELECT count(*) AS n FROM pending_notes")?.n).toBe(0);
-    db.close();
+    const before = readFileSync(path);
+    expect(() => openTomoDb(path)).toThrow(DbDamagedError);
+    expect(readFileSync(path).equals(before)).toBe(true);
   });
+});
 
-  it("is left exactly where it is by an opener that does not own maintenance, and by a read-only one", () => {
+describe("repairDb (tomo db repair, Tomo stopped)", () => {
+  const corruptAsides = (dir: string) => readdirSync(dir).filter((f) => /^tomo\.db\.corrupt-[\d-]+$/.test(f));
+
+  it("copies the damaged file and its log aside unchanged and starts a fresh database", () => {
     const dir = freshDir();
     const path = join(dir, "tomo.db");
     writeFileSync(path, "garbage ".repeat(512));
     writeFileSync(`${path}-wal`, "old wal");
-    expect(() => openTomoDb(path)).toThrow(DbDamagedError);
-    expect(() => openTomoDb(path, { readOnly: true })).toThrow();
-    expect(readFileSync(path, "utf8")).toBe("garbage ".repeat(512));
-    expect(readFileSync(`${path}-wal`, "utf8")).toBe("old wal");
-    expect(corruptAsides(dir)).toEqual([]);
-    expect(quarantinedDbs(path)).toBeUndefined();
+    writeFileSync(`${path}-shm`, "old shm");
+    const aside = repairDb(path)!;
+    expect(aside).toMatch(/tomo\.db\.corrupt-\d{8}-\d{6}$/);
+    expect(readFileSync(aside, "utf8")).toBe("garbage ".repeat(512));
+    expect(readFileSync(`${aside}-wal`, "utf8")).toBe("old wal");
+    // -shm is an index SQLite rebuilds: not copied, and the stale one is gone.
+    expect(existsSync(`${aside}-shm`)).toBe(false);
+    const db = openTomoDb(path);
+    db.run("INSERT INTO meta (key, value) VALUES ('fresh', '1')");
+    // The old log was not replayed into the fresh file.
+    expect(db.check()).toEqual(["ok"]);
+    expect(db.all("SELECT key FROM meta")).toEqual([{ key: "fresh" }]);
+    db.close();
   });
 
-  it("whose log cannot be copied is left whole, with no partial copy and no marker, and the open throws", () => {
+  it("leaves a sound database alone", () => {
+    const dir = freshDir();
+    const path = join(dir, "tomo.db");
+    const db = openTomoDb(path);
+    db.run("INSERT INTO meta (key, value) VALUES ('keep', '1')");
+    db.close();
+    expect(repairDb(path)).toBeNull();
+    expect(repairDb(join(dir, "missing.db"))).toBeNull();
+    expect(corruptAsides(dir)).toEqual([]);
+    const again = openTomoDb(path);
+    expect(again.get("SELECT value FROM meta WHERE key = 'keep'")).toEqual({ value: "1" });
+    again.close();
+  });
+
+  it("whose log cannot be copied changes nothing: no partial copy, originals whole", () => {
     const dir = freshDir();
     const path = join(dir, "tomo.db");
     writeFileSync(path, "garbage ".repeat(512));
     writeFileSync(`${path}-wal`, "committed frames only here");
     fsHooks.failCopy = (from) => from.endsWith("tomo.db-wal");
     try {
-      expect(() => openTomoDb(path, { quarantine: true })).toThrow(/could not be copied aside/);
+      expect(() => repairDb(path)).toThrow(/nothing was changed/);
     } finally {
       fsHooks.failCopy = null;
     }
     expect(readFileSync(path, "utf8")).toBe("garbage ".repeat(512));
     expect(readFileSync(`${path}-wal`, "utf8")).toBe("committed frames only here");
     expect(readdirSync(dir).filter((f) => f.includes("corrupt"))).toEqual([]);
-    expect(quarantinedDbs(path)).toBeUndefined();
   });
 
-  it("stopped after its log was removed but before the main file keeps a complete copy, and the next start finishes", () => {
+  it("whose copy cannot be fsynced changes nothing", () => {
+    const dir = freshDir();
+    const path = join(dir, "tomo.db");
+    writeFileSync(path, "garbage ".repeat(512));
+    fsHooks.failFsync = true;
+    try {
+      expect(() => repairDb(path)).toThrow(/nothing was changed/);
+    } finally {
+      fsHooks.failFsync = false;
+    }
+    expect(readFileSync(path, "utf8")).toBe("garbage ".repeat(512));
+    expect(readdirSync(dir).filter((f) => f.includes("corrupt"))).toEqual([]);
+  });
+
+  it("stopped after the log was removed but before the main file keeps a complete copy, and runs again", () => {
     const dir = freshDir();
     const path = join(dir, "tomo.db");
     writeFileSync(path, "garbage ".repeat(512));
     writeFileSync(`${path}-wal`, "committed frames only here");
     fsHooks.failUnlink = (p) => p === path;
     try {
-      expect(() => openTomoDb(path, { quarantine: true })).toThrow(/could not remove/);
+      expect(() => repairDb(path)).toThrow(/run repair again/);
     } finally {
       fsHooks.failUnlink = null;
     }
-    const [first] = quarantinedDbs(path)!;
-    expect(readFileSync(first, "utf8")).toBe("garbage ".repeat(512));
-    expect(readFileSync(`${first}-wal`, "utf8")).toBe("committed frames only here");
+    const [first] = corruptAsides(dir);
+    expect(readFileSync(join(dir, first), "utf8")).toBe("garbage ".repeat(512));
+    expect(readFileSync(join(dir, `${first}-wal`), "utf8")).toBe("committed frames only here");
     // The log went first, so no -wal is left to be replayed into a fresh file.
     expect(existsSync(`${path}-wal`)).toBe(false);
-    const db = openTomoDb(path, { quarantine: true });
-    expect(quarantinedDbs(path)).toHaveLength(2);
+    expect(repairDb(path)).not.toBeNull();
+    expect(corruptAsides(dir)).toHaveLength(2);
+    const db = openTomoDb(path);
     expect(db.check()).toEqual(["ok"]);
     db.close();
   });
-
-  it("already replaced by another process is not moved again", () => {
-    const dir = freshDir();
-    const path = join(dir, "tomo.db");
-    writeFileSync(path, "garbage ".repeat(512));
-    const checked = fileIdentity(path);
-    // Another process copied it aside and started a fresh one in between.
-    rmSync(path);
-    const other = openTomoDb(path);
-    other.run("INSERT INTO meta (key, value) VALUES ('theirs', '1')");
-    expect(quarantineDb(path, new Error("quick_check"), checked)).toBeNull();
-    expect(other.get("SELECT value FROM meta WHERE key = 'theirs'")).toEqual({ value: "1" });
-    other.close();
-    expect(corruptAsides(dir)).toEqual([]);
-  });
-
-  it("found by two processes at once is copied aside once, and both end up writing the same fresh file", async () => {
-    const dir = freshDir();
-    const path = join(dir, "tomo.db");
-    writeFileSync(path, "garbage ".repeat(4096));
-    const opener = (id: number) => `
-      import { openTomoDb } from ${JSON.stringify(DB_MODULE)};
-      const db = openTomoDb(${JSON.stringify(path)}, { quarantine: true });
-      db.run("INSERT INTO meta (key, value) VALUES (?, '1')", "proc-${id}");
-      db.close();
-      console.log("done");
-    `;
-    const results = await Promise.all([0, 1, 2].map((id) => child(opener(id))));
-    for (const r of results) expect(r, r.err).toMatchObject({ code: 0, out: "done\n" });
-    expect(corruptAsides(dir)).toHaveLength(1);
-    const db = openTomoDb(path);
-    expect(db.all("SELECT key FROM meta ORDER BY key").map((r) => r.key)).toEqual(["proc-0", "proc-1", "proc-2"]);
-    db.close();
-  }, 30_000);
 
   it("is recognised by its SQLite error code", () => {
     expect(isCorruptionError({ errcode: 26 })).toBe(true);

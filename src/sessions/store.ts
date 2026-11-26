@@ -1674,6 +1674,12 @@ export class SessionStore {
     log.warn({ err, file: this.registryPath, op }, msg);
   }
 
+  /** Why the notes database could not be opened, when it is damaged (null otherwise). */
+  pendingNotesDbDamage(): { path: string; message: string } | null {
+    const damage = this.pendingNotes.damage();
+    return damage ? { path: damage.path, message: damage.message } : null;
+  }
+
   /** Open the notes database now (startup self-check). Never throws: a failure is logged, and every
    *  later note read or write retries it (the queue holds notes in memory meanwhile). */
   preparePendingNotes(): void {
@@ -1685,7 +1691,7 @@ export class SessionStore {
   }
 
   /**
-   * The pending notes files and databases moved aside that the owner has not
+   * The old pending notes files moved aside that the owner has not
    * been told about yet (undefined: none). Kept on disk until the notice is
    * sent, so a restart in between still sends it.
    */
@@ -1698,7 +1704,7 @@ export class SessionStore {
     this.pendingNotes.clearQuarantined(asides);
   }
 
-  /** Told after a notes file or the database was moved aside (a marker already names it). */
+  /** Told after an unreadable old notes file was moved aside (a marker already names it). */
   set onPendingNotesQuarantined(listener: ((aside: string) => void) | undefined) {
     this.pendingNotes.onQuarantined = listener;
   }

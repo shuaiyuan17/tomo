@@ -26,7 +26,8 @@ tomo lcm               # Context tools (stats / blocks / compact / search / prun
 tomo backup            # Back up all Tomo data (create / list / restore <date>)
 tomo db check          # integrity_check of ~/.tomo/data/tomo.db, schema version, row counts
 tomo db dump [table]   # Print a table's rows (--json); no table lists them
-tomo db export <store> # Write a store back to its pre-SQLite file for a rollback (pending-notes)
+tomo db export <store> # Move a store back to its pre-SQLite file for a rollback (pending-notes; Tomo stopped)
+tomo db repair         # Copy a damaged tomo.db aside and start a fresh one (Tomo stopped)
 tomo usage backfill    # One-off: rebuild the usage ledger's history from the activity log (--dry-run first)
 tomo migrate           # Import conversation history from other platforms (openclaw <file>)
 tomo update            # Update Tomo to the latest version and restart

@@ -360,4 +360,4 @@ If LiteLLM returns `System messages are not allowed`, use a LiteLLM build that i
     activity.ndjson           # Activity log (with metrics enabled)
 ```
 
-Back it all up with `tomo backup`. The backup takes a consistent snapshot of `tomo.db` (`VACUUM INTO`) rather than copying the live file, and a restore checks it before swapping anything in. Keep `data/` on a local disk: SQLite's WAL mode does not work on network or cloud-synced folders.
+Back it all up with `tomo backup`. The backup takes a consistent snapshot of `tomo.db` (`VACUUM INTO`) rather than copying the live file, and a restore checks it before swapping anything in. Keep `data/` on a local disk: SQLite's WAL mode does not work on network or cloud-synced folders. If `tomo.db` ever fails its startup check, Tomo leaves it untouched, keeps notes in memory and tells you; `tomo stop && tomo db repair && tomo start` copies it aside and starts a fresh one.

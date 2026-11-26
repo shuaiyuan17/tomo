@@ -145,14 +145,6 @@ describe("outside the daemon (no maintenance)", () => {
     expect(makeSessionStore(dir, { dbMaintenance: false }).getPendingNotes("dm:alice")).toEqual(["not yet imported"]);
   });
 
-  it("a store that finds the database damaged throws and moves nothing", () => {
-    const dir = freshDir();
-    writeFileSync(join(dir, "tomo.db"), "not a database ".repeat(300));
-    const cli = makeSessionStore(dir, { dbMaintenance: false });
-    expect(() => cli.getPendingNotes("dm:alice")).toThrow(/damaged/);
-    expect(readFileSync(join(dir, "tomo.db"), "utf8")).toBe("not a database ".repeat(300));
-    expect(filesLike(dir, "tomo.db.corrupt-")).toEqual([]);
-  });
 });
 
 describe("one row per note", () => {
@@ -256,19 +248,20 @@ describe("re-keying a session", () => {
 });
 
 describe("a damaged database", () => {
-  it("is moved aside at first use, the owner told, and the session starts with no notes", () => {
-    const dir = freshDir();
-    writeFileSync(join(dir, "tomo.db"), "not a database ".repeat(300));
-    const store = makeSessionStore(dir);
-    const told: string[] = [];
-    store.onPendingNotesQuarantined = (aside) => told.push(aside);
-    expect(store.getPendingNotes("dm:alice")).toEqual([]);
-    expect(told).toHaveLength(1);
-    expect(told[0]).toMatch(/tomo\.db\.corrupt-/);
-    expect(store.quarantinedPendingNotes()).toEqual(told);
-    store.setPendingNotes("dm:alice", ["after"]);
-    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["after"]);
-    store.clearQuarantinedPendingNotes(told);
-    expect(store.quarantinedPendingNotes()).toBeUndefined();
+  it("is never moved or written: every call throws, the store says why, and the queue holds notes in memory", () => {
+    for (const maintenance of [true, false]) {
+      const dir = freshDir();
+      writeFileSync(join(dir, "tomo.db"), "not a database ".repeat(300));
+      const store = makeSessionStore(dir, { dbMaintenance: maintenance });
+      expect(store.pendingNotesDbDamage()).toBeNull();
+      store.preparePendingNotes(); // the daemon's start: logs, never throws
+      expect(store.pendingNotesDbDamage()?.path).toBe(join(dir, "tomo.db"));
+      expect(() => store.getPendingNotes("dm:alice")).toThrow(/tomo db repair/);
+      const queue = new PendingNotesQueue(store);
+      expect(queue.queueNote("dm:alice", "kept in memory")).toBe(false);
+      expect(queue.peekNotes("dm:alice")).toEqual(["kept in memory"]);
+      expect(readFileSync(join(dir, "tomo.db"), "utf8")).toBe("not a database ".repeat(300));
+      expect(filesLike(dir, "tomo.db.corrupt-")).toEqual([]);
+    }
   });
 });

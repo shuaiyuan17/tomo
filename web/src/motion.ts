@@ -13,7 +13,7 @@ export function appendedIds(known: ReadonlySet<string>, ids: readonly string[]):
 }
 
 /** The entrance's length: `--motion-enter` in styles.css (a test keeps the two equal). */
-export const ENTER_MS = 180;
+export const ENTER_MS = 260;
 
 /**
  * For an element that takes over from one already rising in (a streamed reply

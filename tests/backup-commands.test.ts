@@ -49,6 +49,7 @@ vi.mock("../src/config.js", () => ({
     workspaceDir: join(paths.tomoHome, "workspace"),
     get sessionsDir() { return paths.sessionsDir; },
     sdkSessionsDir: join(paths.tomoHome, "sdk-sessions"),
+    dbPath: join(paths.tomoHome, "data", "tomo.db"),
   },
   CONFIG_PATH: join(paths.tomoHome, "config.json"),
 }));
@@ -294,5 +295,51 @@ describe("restore: refuses while the daemon runs", () => {
     expect(exitCodes).not.toContain(1);
     expect(logs.join("\n")).toContain("Restore complete.");
     expect(readFileSync(join(paths.tomoHome, "data", "restored.txt"), "utf-8")).toBe("from backup");
+  });
+});
+
+/**
+ * Tomo's database is never file-copied: a copy of a live tomo.db and its -wal
+ * can come from two moments. `create` writes one VACUUM INTO snapshot (WAL
+ * content included), and `restore` checks the database before anything moves.
+ */
+describe("the database (data/tomo.db)", () => {
+  const dbPath = () => join(paths.tomoHome, "data", "tomo.db");
+
+  it("create writes a consistent snapshot, rows still in the WAL included, and no -wal/-shm", async () => {
+    liveFixture();
+    const { openTomoDb } = await import("../src/db/index.js");
+    // Held open, like the daemon's connection: the row lives in the -wal.
+    const live = openTomoDb(dbPath());
+    live.run("INSERT INTO pending_notes (session_key, position, note) VALUES ('dm:owner', 0, 'only in the wal')");
+    expect(existsSync(`${dbPath()}-wal`)).toBe(true);
+    try {
+      const { logs, exitCodes } = await run(["create"]);
+      expect(exitCodes).toEqual([]);
+      expect(logs.join("\n")).toContain("data/tomo.db (consistent snapshot)");
+    } finally {
+      live.close();
+    }
+    const backup = join(paths.backups, readdirSync(paths.backups)[0]);
+    expect(readdirSync(join(backup, "data")).filter((f) => f.startsWith("tomo.db"))).toEqual(["tomo.db"]);
+    const copy = openTomoDb(join(backup, "data", "tomo.db"), { readOnly: true });
+    expect(copy.all("SELECT note FROM pending_notes")).toEqual([{ note: "only in the wal" }]);
+    copy.close();
+  });
+
+  it("restore refuses a backup whose database fails integrity_check, and replaces nothing", async () => {
+    liveFixture();
+    const { openTomoDb } = await import("../src/db/index.js");
+    openTomoDb(dbPath()).close();
+    expect((await run(["create"])).exitCodes).toEqual([]);
+    const name = readdirSync(paths.backups)[0];
+    writeFileSync(join(paths.backups, name, "data", "tomo.db"), "garbage ".repeat(600));
+    writeFileSync(join(paths.tomoHome, "data", "cron", "jobs.json"), '{"jobs":["live"]}');
+
+    const { errors, exitCodes } = await run(["restore", name]);
+    expect(exitCodes).toEqual([1]);
+    expect(errors.join("\n")).toMatch(/data\/: staged copy failed its check/);
+    expect(errors.join("\n")).toContain("Nothing was replaced");
+    expect(readFileSync(join(paths.tomoHome, "data", "cron", "jobs.json"), "utf-8")).toBe('{"jobs":["live"]}');
   });
 });

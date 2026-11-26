@@ -35,7 +35,7 @@ function privateFile(name: string): string {
 }
 
 function transcript(key: string): Array<{ role: string; content: string }> {
-  return new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).get(key).messages as Array<{ role: string; content: string }>;
+  return new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath }).get(key).messages as Array<{ role: string; content: string }>;
 }
 
 // ---------------------------------------------------------------------------

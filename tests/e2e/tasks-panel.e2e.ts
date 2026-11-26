@@ -27,7 +27,7 @@ let url: string;
 beforeEach(async () => {
   watchBus.reset();
   mockConfig.identities = [{ name: "owner", channels: { telegram: "test-owner" }, replyPolicy: "last-active" }];
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   store.setChatTitle("telegram:-1", "Test group");
   store.append("telegram:-1", { role: "user", content: "A shared group note.", channel: "telegram", timestamp: Date.now() });
   agent = new Agent(); channel = new WebChannel(mockConfig.owner, undefined, { compact: (key, settled) => agent.requestOwnerCompact(key, settled),

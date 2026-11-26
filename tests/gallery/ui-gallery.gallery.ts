@@ -303,7 +303,7 @@ const usage = () => ({ state: "ok", plan: "max", fetchedAt: BASE, updatedAt: BAS
 async function boot(options: { conversation: boolean }): Promise<void> {
   watchBus.reset();
   mockConfig.identities = [{ name: "owner", channels: { telegram: "test-owner" }, replyPolicy: "last-active" }];
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   const cronStorePath = seedWorkspace(store);
   if (options.conversation) seedConversation(store);
   const theAgent = agent = new Agent();

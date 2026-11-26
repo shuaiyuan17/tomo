@@ -65,6 +65,8 @@ export interface RestoreLeg {
   src: string;
   /** Live destination path. */
   dest: string;
+  /** Extra check of the staged copy (throws to abort before anything live moves). */
+  verify?: (staging: string) => void;
 }
 
 /**
@@ -407,6 +409,11 @@ export function restoreLegsStaged(legs: RestoreLeg[], io: StagedRestoreIo = {}):
       const difference = firstDifference(manifestTree(leg.src), manifestTree(staging));
       if (difference !== null) {
         throw new Error(`${leg.label}: staged copy does not match the backup (${difference})`);
+      }
+      try {
+        leg.verify?.(staging);
+      } catch (err) {
+        throw new Error(`${leg.label}: staged copy failed its check (${(err as Error).message})`, { cause: err });
       }
 
       staged.push({ leg, staging, preRestore: null });

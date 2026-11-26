@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, readdirSync, writeFileSync as write } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync as write } from "node:fs";
 import { join } from "node:path";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
@@ -100,6 +100,32 @@ describe("a pending notes file that will not read", () => {
     await waitFor(() => expect(ownerNotice).toHaveBeenCalledTimes(1));
     await expectNoChangeFor(() => expect((agent as unknown as Internals).pendingNotesNoticeTimer).toBeUndefined(), 50);
     expect(existsSync(marker())).toBe(true);
+    await agent.stop();
+  });
+});
+
+describe("Tomo's database at start", () => {
+  it("a damaged tomo.db is found at boot, left as it is, and the owner told how to repair it", async () => {
+    const ownerNotice = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(true);
+    mkdirSync(join(mockConfig.tomoHome, "data"), { recursive: true });
+    write(mockConfig.dbPath, "not a database ".repeat(300));
+    const agent = await boot();
+    await waitFor(() => expect(ownerNotice).toHaveBeenCalledTimes(1));
+    const text = String(ownerNotice.mock.calls[0][0]);
+    expect(text).toContain(mockConfig.dbPath);
+    expect(text).toContain("tomo db repair");
+    expect(readFileSync(mockConfig.dbPath, "utf8")).toBe("not a database ".repeat(300));
+    expect(readdirSync(join(mockConfig.tomoHome, "data")).filter((f) => f.includes("corrupt"))).toEqual([]);
+    await agent.stop();
+  });
+
+  it("an old _pending_notes.json is imported at boot and its notes reach the next turn", async () => {
+    vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(true);
+    writeFileSync(notesFile(), JSON.stringify({ version: 1, notes: { "imessage:700": ["carried over from the file"] } }));
+    const agent = await boot();
+    expect(existsSync(notesFile())).toBe(false);
+    expect(readdirSync(mockConfig.sessionsDir).some((f) => f.startsWith("_pending_notes.json.migrated-"))).toBe(true);
+    expect((agent as unknown as { pendingNotesQueue: { peekNotes(k: string): string[] } }).pendingNotesQueue.peekNotes("imessage:700")).toEqual(["carried over from the file"]);
     await agent.stop();
   });
 });

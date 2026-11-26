@@ -19,7 +19,7 @@ jobs:
 
     strategy:
       matrix:
-        node-version: ["22.12.0", 24, 26]
+        node-version: ["22.16.0", 24, 26]
 
     steps:
       - uses: actions/checkout@v7
@@ -38,11 +38,11 @@ jobs:
       # Coverage is uploaded from one version only, so only that one pays for
       # the instrumentation.
       - run: npm run test:coverage
-        if: matrix.node-version == '22.12.0'
+        if: matrix.node-version == '22.16.0'
       - run: npm test
-        if: matrix.node-version != '22.12.0'
+        if: matrix.node-version != '22.16.0'
       - name: Upload coverage
-        if: matrix.node-version == '22.12.0'
+        if: matrix.node-version == '22.16.0'
         uses: actions/upload-artifact@v7
         with:
           name: coverage

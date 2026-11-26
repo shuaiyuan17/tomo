@@ -272,7 +272,7 @@ export class Agent {
   private mcpSweepInFlight: Promise<void> | undefined;
 
   constructor() {
-    this.sessions = new SessionStore(config.sessionsDir, config.historyLimit, config.sdkSessionsDir);
+    this.sessions = new SessionStore(config.sessionsDir, config.historyLimit, config.sdkSessionsDir, { dbPath: config.dbPath, dbMaintenance: true });
     this.ownerAdoption = new OwnerAdoption(this.sessions, this.modelOverrides);
     this.contextNudger = new ContextNudger(
       this.sessions,
@@ -3427,6 +3427,19 @@ export class Agent {
   }
 
   /**
+   * Tell the owner, once per start, that Tomo's database failed its check:
+   * nothing was changed, notes are held in memory until it is repaired, and
+   * `tomo db repair` (with Tomo stopped) copies it aside. Every start that
+   * still finds it damaged says so again.
+   */
+  private tellDatabaseDamaged(): void {
+    const damage = this.sessions.pendingNotesDbDamage();
+    if (!damage) return;
+    const text = ownerT("notices")("databaseDamaged", { file: damage.path });
+    void this.notifyOwner(text).catch((err) => log.warn({ err }, "Could not tell the owner the database is damaged"));
+  }
+
+  /**
    * DM the configured OWNER (no agent query); never falls back to another
    * private chat. Resolves false when nothing was sent.
    */
@@ -3448,6 +3461,10 @@ export class Agent {
     // dispatched by live ingress, and replaying it too would run it twice (or
     // misread its fresh turn as interrupted).
     const recovered = this.inbox?.pending() ?? [];
+    // Open (check, migrate, import the old notes file into) the database now,
+    // not at the first note: a damaged file is found and moved aside at start,
+    // and the owner hears about it below rather than at some later turn.
+    this.sessions.preparePendingNotes();
     try {
       // Sub-session restart recovery runs BEFORE any channel ingests, so no
       // input can reach a task recovery has not looked at yet. It schedules
@@ -3463,6 +3480,7 @@ export class Agent {
     // A file moved aside before now (this start, or a run that went away before telling the owner).
     this.pendingNotesNoticeReady = true;
     this.tellPendingNotesQuarantined();
+    this.tellDatabaseDamaged();
     try {
       this.replayInbox(recovered);
     } catch (err) {

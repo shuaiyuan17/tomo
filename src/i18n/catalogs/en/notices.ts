@@ -33,6 +33,7 @@ export const notices = {
   },
   pendingNotesQuarantined_one: "⚠️ Tomo could not read its saved notes for upcoming turns, so it moved the file aside unchanged, to {{files}}, and started a fresh one. The notes in it were not delivered. Ask me to read that file and resend what still matters.",
   pendingNotesQuarantined_other: "⚠️ Tomo could not read its saved notes for upcoming turns, so it moved the file aside unchanged {{count}} times, to {{files}}, and started a fresh one. The notes in them were not delivered. Ask me to read those files and resend what still matters.",
+  databaseDamaged: "⚠️ Tomo's database ({{file}}) failed its startup check. Tomo has not changed it, and is keeping notes for upcoming turns in memory only, so they are lost if Tomo restarts before it is fixed. To fix: `tomo stop`, then `tomo db repair` (copies the damaged file aside and starts a fresh one; it prints how to read the old notes back), then `tomo start`.",
   imsgLaneBlocked: "⚠️ iMessage keeps refusing to send (imsg rpc error -32004, mutation lane blocked). Tomo restarted the imsg rpc process {{restarts}} times in the last {{minutes}} minutes and has stopped restarting it for now, so iMessage replies may fail until it clears. Check `imsg status`; restarting Messages.app or Tomo usually clears it.",
   mcpDown: "⚠️ MCP server \"{{server}}\" is down: {{failures}} reconnects in a row failed. Its tools fail until it reconnects. Try /mcp reconnect {{server}} (or Reconnect on the web MCP page), or /new for a fresh session.",
   mcpOAuth: {

@@ -29,7 +29,7 @@ let url: string;
 beforeEach(async () => {
   watchBus.reset();
   mockConfig.identities = [{ name: "owner", channels: { telegram: "test-owner" }, replyPolicy: "last-active" }];
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   store.setChatTitle("telegram:-1", "Test group");
   store.append("telegram:-1", { role: "user", content: "A shared group note.", channel: "telegram", timestamp: Date.now() });
   agent = new Agent(); channel = new WebChannel(mockConfig.owner, undefined, { compact: (key, settled) => agent.requestOwnerCompact(key, settled),
@@ -160,7 +160,7 @@ it("explains oversized requests and preserves the draft", async () => {
 });
 
 it("silently reloads the first history page after rotation invalidates a cursor", async () => {
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   const timestamp = Date.now();
   for (let i = 0; i < 110; i++) store.append("dm:owner", { role: "user", channel: "web", content: `Earlier message ${i}`, timestamp: timestamp + i });
   let firstPages = 0;
@@ -359,7 +359,7 @@ it("the composer re-fits its height when only its width changes", async () => {
 
 it("opens a task to read its subagent transcript, expands a tool call, and goes back", async () => {
   const { mkdirSync: mkdir, writeFileSync: write } = await import("node:fs");
-  new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).setSdkSessionId("dm:owner", "sdk-e2e");
+  new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath }).setSdkSessionId("dm:owner", "sdk-e2e");
   const dir = resolve(mockConfig.sdkSessionsDir, "sdk-e2e", "subagents");
   mkdir(dir, { recursive: true });
   const line = (type: string, content: unknown[]) => JSON.stringify({ type, message: { content } }) + "\n";
@@ -460,7 +460,7 @@ it("a shell task: its Output card lines up with the Command card above it", asyn
 });
 
 it("a message Tomo sent on its own carries a label, and no [proactive] marker in its text", async () => {
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   store.append("dm:owner", { role: "assistant", channel: "imessage", content: "[proactive] Restarted, you can carry on.", timestamp: Date.now() - 1_000 });
   await page.reload();
   const sent = page.locator("article.message.assistant").filter({ hasText: "Restarted" });
@@ -495,7 +495,7 @@ it("renders channel images as thumbnails (never the path), keeps line breaks, an
   const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
   const file = resolve(dir, "123533_telegram_test-owner_abcd1234.png");
   write(file, png);
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   const t = Date.now();
   store.append("dm:owner", { role: "assistant", channel: "telegram", timestamp: t, content: "Picked up the stale #383 and split it into 3 PRs, the first is merged" });
   store.append("dm:owner", { role: "user", channel: "telegram", timestamp: t + 1, content: `[Sent an image, saved to: ${file}] like this\n• one\n• two` });
@@ -605,7 +605,7 @@ it("a picture the agent sends (MEDIA:<path>) shows as a thumbnail by id, never a
   const dir = mkdtempSync(resolve(tmpdir(), "tomo-e2e-out-"));
   const file = resolve(dir, "gap.png");
   writeFileSync(file, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64"));
-  new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).append("dm:owner",
+  new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath }).append("dm:owner",
     { role: "assistant", channel: "imessage", timestamp: Date.now() - 1_000, content: "From before:\nMEDIA:/tmp/long-gone.jpg" });
   mockSdk.responseFn = () => `Here is the gap.\nMEDIA:${file}`;
   await page.reload();
@@ -745,7 +745,7 @@ it("a kept upload the server no longer has (sent elsewhere, expired) is dropped 
 it("calls the agent by its IDENTITY.md name (re-read on edit); the product keeps its own name", async () => {
   mkdirSync(mockConfig.workspaceDir, { recursive: true });
   writeFileSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), "# IDENTITY.md - Who Am I?\n\n- **Name:** Claw\n- **Vibe:** direct\n");
-  new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).append("dm:owner", { role: "assistant", channel: "web", content: "Hello there.", timestamp: Date.now() });
+  new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath }).append("dm:owner", { role: "assistant", channel: "web", content: "Hello there.", timestamp: Date.now() });
   await page.reload();
   await browserExpect(page.getByRole("textbox", { name: "Message Claw" })).toBeVisible();
   await browserExpect(page.locator("article.message.assistant").first()).toContainText("Claw");
@@ -762,7 +762,7 @@ it("calls the agent by its IDENTITY.md name (re-read on edit); the product keeps
 });
 
 it("shows a turn's tool calls inline, folded, between the messages; INPUT/OUTPUT open on demand", async () => {
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   store.setSdkSessionId("dm:owner", "sdk-inline");
   const t = Date.now() - 60_000;
   store.append("dm:owner", { role: "user", channel: "web", content: "Check the changelog please.", timestamp: t });
@@ -814,7 +814,7 @@ it("shows a turn's tool calls inline, folded, between the messages; INPUT/OUTPUT
 });
 
 it("a jump-to-latest pill: shown a screen up, counts new messages without pulling the reader down, jumps on click", async () => {
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   const t = Date.now() - 600_000;
   for (let i = 0; i < 40; i++) store.append("dm:owner", { role: i % 2 ? "assistant" : "user", channel: "web", content: `Line ${i}\n\nmore text to make it tall`, timestamp: t + i * 1_000 });
   await page.reload();
@@ -858,7 +858,7 @@ const topOf = (row: ReturnType<Page["locator"]>) => row.evaluate((el) => {
 const tall = (i: number) => `Reply ${i}.\n\n${"A paragraph of the reply, long enough to give the conversation some height on any screen.\n\n".repeat(16)}`;
 
 it("opens at the last turn; a sent message (a tall picture too) is just fully shown, no screen of blank under it, and the reply is followed while the reader stays at the end", async () => {
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   const t = Date.now() - 600_000;
   for (let i = 0; i < 30; i++) store.append("dm:owner", { role: i % 2 ? "assistant" : "user", channel: "web", content: i % 2 ? tall(i) : `Question ${i}?`, timestamp: t + i * 1_000 });
   await page.addInitScript(() => {
@@ -966,7 +966,7 @@ it("opens at the last turn; a sent message (a tall picture too) is just fully sh
 
 for (const [label, olderDay] of [["the same day", 0], ["an earlier day", 86_400_000]] as const) {
   it(`Load earlier does not move the first shown message when the earlier page ends on ${label} (day dividers never sit at a row's top)`, async () => {
-    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     const t = Date.now() - 600_000;
     // The first page shows messages 30..129; "Load earlier" brings 0..29.
     for (let i = 0; i < 130; i++) store.append("dm:owner", { role: i % 2 ? "assistant" : "user", channel: "web", content: `Message ${i}\n\nwith a second paragraph`, timestamp: t + i * 1_000 - (i < 30 ? olderDay : 0) });
@@ -987,7 +987,7 @@ for (const [label, olderDay] of [["the same day", 0], ["an earlier day", 86_400_
 }
 
 it("Load earlier keeps the reader's place, and a row growing above the view does not move it", async () => {
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   const t = Date.now() - 600_000;
   for (let i = 0; i < 130; i++) store.append("dm:owner", { role: i % 2 ? "assistant" : "user", channel: "web", content: `Message ${i}\n\nwith a second paragraph`, timestamp: t + i * 1_000 });
   await page.reload();
@@ -1019,7 +1019,7 @@ it("Load earlier keeps the reader's place, and a row growing above the view does
 });
 
 it("a reply's quote jumps to the quoted message far up and flashes it; focus stays in the conversation", async () => {
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   const t = Date.now() - 600_000;
   store.append("dm:owner", { role: "assistant", channel: "imessage", content: "The original note, far up.", timestamp: t });
   for (let i = 1; i < 40; i++) store.append("dm:owner", { role: i % 2 ? "user" : "assistant", channel: "web", content: `Line ${i}\n\nmore text to make it tall`, timestamp: t + i * 1_000 });
@@ -1353,7 +1353,7 @@ it("switching Resend from A to B (both with an image and a file, each fully rest
 });
 
 it("a thinking block in history reads as a folded, quiet Thinking row; the reply stays the reply", async () => {
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   const t = Date.now() - 60_000;
   store.append("dm:owner", { role: "user", channel: "web", content: "Which option is cheaper?", timestamp: t });
   // As renderResponseBlocks records a turn with showThinking on: blocks joined by "\n".
@@ -1385,7 +1385,7 @@ async function settledShot(name: string) {
 }
 
 it("a subagent's thinking folds, an image output is a chip, and unreadable lines are said", async () => {
-  new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).setSdkSessionId("dm:owner", "sdk-think");
+  new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath }).setSdkSessionId("dm:owner", "sdk-think");
   const dir = resolve(mockConfig.sdkSessionsDir, "sdk-think", "subagents");
   mkdirSync(dir, { recursive: true });
   const line = (type: string, content: unknown[]) => JSON.stringify({ type, message: { content } }) + "\n";
@@ -1425,7 +1425,7 @@ it("a turn's trace: the todo list open while it runs and folded after, its Sourc
   await page.context().grantPermissions(["clipboard-read", "clipboard-write"], { origin: url });
   const requests: string[] = [];
   page.on("request", (request) => requests.push(request.url()));
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   store.setSdkSessionId("dm:owner", "sdk-trace");
   const t = Date.now() - 60_000;
   store.append("dm:owner", { role: "user", channel: "web", content: "How do I start an Astro project with pnpm?", timestamp: t });

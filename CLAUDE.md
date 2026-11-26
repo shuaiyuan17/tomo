@@ -64,7 +64,13 @@ src/
   auth.ts             # Anthropic auth resolution (env key > config; subscription or API key)
   channels/           # Channel implementations (Telegram, iMessage via imsg, local web)
   web/                # Optional supervised HTTP/SSE process, bounded RPC, local security
-  sessions/           # Persistence (store.ts + transcript-names/-rotation/-order.ts, store-support.ts),
+  db/                 # Tomo's SQLite database (data/tomo.db) over node:sqlite: index.ts (open: WAL, FULL+fullfsync,
+                      #   busy timeout, quick_check → DbDamagedError, never moved by a running process; repairDb for
+                      #   `tomo db repair` with Tomo stopped; BEGIN IMMEDIATE transactions),
+                      #   schema.ts (user_version migrations, append only), sqlite.ts (the only node:sqlite loader,
+                      #   swallows its ExperimentalWarning), backup.ts (VACUUM INTO snapshot for `tomo backup`)
+  sessions/           # Persistence (store.ts + transcript-names/-rotation/-order.ts, store-support.ts,
+                      #   pending-notes-store.ts: pending notes as rows in tomo.db, one-time import of _pending_notes.json),
                       #   key helpers (keys.ts), summon-store.ts
   credentials/        # Credential broker, off by default: broker.ts (request on the turn's channel, capture, fulfill),
                       #   capture.ts (CaptureChannel: iMessage/Telegram next message, web password card),

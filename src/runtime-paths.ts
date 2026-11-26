@@ -11,6 +11,9 @@ export interface RuntimePaths {
   watchSocketPath: string;
   workspaceDir: string;
   sessionsDir: string;
+  /** Tomo's SQLite database (src/db). Always under `<tomoHome>/data`, even when
+   *  SESSIONS_DIR moves the transcripts: one file, so stores can share a transaction. */
+  dbPath: string;
   logsDir: string;
   sdkSessionsDir: string;
   /** Env overrides (`TOMO_WORKSPACE`, `SESSIONS_DIR`) that were set but blank,
@@ -81,6 +84,7 @@ export function createRuntimePaths(options: RuntimePathOptions = {}): RuntimePat
     watchSocketPath: join(tomoHome, "watch.sock"),
     workspaceDir,
     sessionsDir,
+    dbPath: join(tomoHome, "data", "tomo.db"),
     logsDir,
     sdkSessionsDir: sdkSessionsDirForWorkspace(workspaceDir, homeDir),
     ignoredEnvOverrides,

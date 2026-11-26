@@ -219,6 +219,17 @@ describe.runIf(sandboxRuns)("group Bash under a real sandbox-exec", () => {
     expect(r.out).not.toContain(marker);
   });
 
+  it("cannot read, write or remove Tomo's database or its -wal/-shm files", () => {
+    const family = ["tomo.db", "tomo.db-wal", "tomo.db-shm"].map((name) => join(fx.tomoHome, "data", name));
+    for (const file of family) write(file, `DB-SECRET ${file}\n`);
+    for (const file of family) {
+      const r = run(`cat ${q(file)}; echo x >> ${q(file)}; rm -f ${q(file)}`);
+      expect(r.out).not.toContain("DB-SECRET");
+      expect(readFileSync(file, "utf8")).toBe(`DB-SECRET ${file}\n`);
+    }
+    expect(run(`sqlite3 ${q(family[0])} 'select 1'`).code).not.toBe(0);
+  });
+
   it("cannot list secrets/ or write the config file", () => {
     expect(run(`ls ${q(join(fx.ws, "secrets"))}`).code).not.toBe(0);
     expect(run(`echo '{"x":1}' > ${q(CONFIG)}`).code).not.toBe(0);

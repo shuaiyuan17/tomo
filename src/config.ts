@@ -197,6 +197,8 @@ export interface TomoConfig {
   effort: EffortLevel | null;
   workspaceDir: string;
   sessionsDir: string;
+  /** Tomo's SQLite database, `<tomoHome>/data/tomo.db` (src/db). */
+  dbPath: string;
   /** Claude Agent SDK JSONL directory derived from workspaceDir. */
   sdkSessionsDir: string;
   historyLimit: number;
@@ -1091,6 +1093,7 @@ function buildConfig(): TomoConfig {
     effort: validated("effort", effortSchema, file.effort, null),
     workspaceDir: paths.workspaceDir,
     sessionsDir: paths.sessionsDir,
+    dbPath: paths.dbPath,
     sdkSessionsDir: paths.sdkSessionsDir,
     historyLimit: validated("HISTORY_LIMIT", positiveInt, envVar("HISTORY_LIMIT"), 20),
     logsDir: paths.logsDir,

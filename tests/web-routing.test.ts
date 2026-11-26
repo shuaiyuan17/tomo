@@ -27,7 +27,7 @@ beforeEach(() => {
   events = []; web.events.subscribe(({ event }) => events.push(event));
 });
 afterEach(async () => { await agent.stop(); });
-const store = () => new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+const store = () => new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
 const sendProvider = (text: string) => provider.simulateMessage(makeMsg({ chatId: "test-owner", senderName: "Owner", text }));
 const webBlocks = () => events.filter((event) => event.type === "block");
 /** Request states the browser was told, in order. */

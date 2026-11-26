@@ -15,6 +15,7 @@ import { effectiveGroupSandbox, type GroupSandboxConfig } from "./group-fs-polic
 import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, skillsCanUseTool, todoStoreGuardHooks, type PrivateMemoryBar } from "./permissions.js";
 import { TODO_TOOL_NAMES } from "../mcp/todo-tools.js";
 import { todosDir } from "../todos/store.js";
+import { dbGuardHooks } from "./db-guard.js";
 import type { AgentProfile, EffortLevel } from "../config.js";
 import { subsessionMemoryGuardHooks } from "./subsessions/memory-guard.js";
 import { SUBSESSION_TASK_TOOL_NAMES } from "../mcp/subsession-tools.js";
@@ -375,6 +376,7 @@ export function sdkOptions(
       scopedCallerKey: sessionContext?.scopedCallerKey,
       credentialBroker: config.credentialBroker?.enabled === true,
       todosDir: () => todosDir(),
+      dbPath: () => config.dbPath,
       subsessionMemoryGuard: subsession !== undefined,
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
@@ -539,6 +541,9 @@ export function buildHooksOption(args: {
   /** The todo store directory; when set, direct writes into it are denied on
    *  every session (todo-store-guard.ts). */
   todosDir?: () => string;
+  /** Tomo's database; when set, direct writes to it are denied on every
+   *  session (db-guard.ts). */
+  dbPath?: () => string;
   /** Per-call reason to deny a background launch (pending compact), or null. */
   backgroundLaunchDenial?: () => string | null;
   /** Per-call reason to deny a new background subagent (high context), or null. */
@@ -578,6 +583,10 @@ export function buildHooksOption(args: {
   // Deny-only, so its place before the private-memory guard costs nothing.
   if (args.todosDir) {
     mergeHooks(hooks, todoStoreGuardHooks(args.sessionKey, config.workspaceDir, args.todosDir));
+  }
+  // Deny-only, like the todo guard above.
+  if (args.dbPath) {
+    mergeHooks(hooks, dbGuardHooks(args.sessionKey, config.workspaceDir, args.dbPath));
   }
   // Deny-only, like the todo guard above.
   if (args.subsessionMemoryGuard && args.sessionKey) {

@@ -1,4 +1,4 @@
-import { createRequire } from "node:module";
+import { loadNodeSqlite } from "../db/sqlite.js";
 import { log } from "../logger.js";
 
 /**
@@ -58,14 +58,9 @@ export class ChatDbServiceLookup implements ServiceLookup {
     options: { maxCache?: number; loadSqlite?: () => SqliteModule } = {},
   ) {
     this.maxCache = options.maxCache ?? 512;
-    // node:sqlite is a built-in (Node 22+), but experimental — load it via
-    // createRequire so the ExperimentalWarning only fires when the imsg
-    // channel actually runs, not on module import elsewhere. Injectable so
-    // tests can supply a mock sqlite layer.
-    this.loadSqlite = options.loadSqlite ?? (() => {
-      const require = createRequire(import.meta.url);
-      return require("node:sqlite") as SqliteModule;
-    });
+    // Through src/db/sqlite.ts, which loads node:sqlite lazily and without
+    // its ExperimentalWarning. Injectable so tests can supply a mock sqlite layer.
+    this.loadSqlite = options.loadSqlite ?? (() => loadNodeSqlite() as unknown as SqliteModule);
   }
 
   private ensureOpen(): void {

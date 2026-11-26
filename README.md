@@ -52,7 +52,7 @@ cat ~/.tomo/web-access.log
 
 ### Requirements
 
-- **Node.js 22.16+** (Tomo keeps its runtime state in the built-in `node:sqlite`)
+- **Node.js 22.16+ or 24+** (Node 23 is not supported; Tomo keeps its runtime state in the built-in `node:sqlite`)
 - **A Claude login or an Anthropic API key.** Tomo bundles the Claude Code binary through its Agent SDK dependency, so no separate `claude` install is needed; `tomo init` offers to log in, and `/login` in your DM refreshes it later. [LiteLLM gateways](docs/configuration.md#litellm--chatgpt-subscription-models) support other backends.
 - **At least one messaging channel:**
   - **Telegram** — a bot token from [@BotFather](https://t.me/BotFather)

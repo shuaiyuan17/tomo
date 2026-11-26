@@ -44,7 +44,7 @@
     "url": "https://github.com/shuaiyuan17/tomo/issues"
   },
   "engines": {
-    "node": ">=22.16.0"
+    "node": "^22.16.0 || >=24.0.0"
   },
   "license": "MIT",
   "dependencies": {

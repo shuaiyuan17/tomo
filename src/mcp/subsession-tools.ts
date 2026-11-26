@@ -2,6 +2,7 @@ import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { EFFORT_LEVELS } from "../config.js";
 import type { SubsessionService } from "../agent/subsessions/service.js";
+import type { OwnerTurnMessage } from "../agent/audience.js";
 import { currentStep, DONE_STEPS_KEEP, needsOwner, oneLine, OPEN_STATUSES, OWNER_ACTION_MAX, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, reportNumber, STEP_RESULT_MAX, type SubsessionRecord } from "../agent/subsessions/types.js";
 
 /** The task_* tools a sub-session reports through (its own session only). */
@@ -73,7 +74,7 @@ export function formatTaskDetail(r: SubsessionRecord, now = Date.now(), backgrou
   if (r.checkpoint) lines.push("Checkpoint:", r.checkpoint);
   for (const e of r.earlierReports ?? []) lines.push(`Earlier report #${e.seq} (replaced by a later one before it was read):`, e.text);
   if (r.report) lines.push(r.reportSeq ? `Report #${r.reportSeq}:` : "Report:", r.report);
-  if (r.askViaMain) lines.push("Question waiting for the owner's answer (pass it on with task_message):", r.askViaMain.text);
+  if (r.askViaMain) lines.push(r.askViaMain.direct ? "Question waiting for the owner's answer (sent to them directly):" : "Question waiting for the owner's answer (pass it on with task_message):", r.askViaMain.text);
   if (r.sent.length > 0) {
     lines.push("Messages to the owner (newest last):");
     for (const m of r.sent.slice(-5)) lines.push(`- ${new Date(m.at).toISOString()}${viaLabel(m.via)}: ${m.text}`);
@@ -246,7 +247,12 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
  * checks the record's parentKey against it, so a scope only ever sees and
  * steers its own tasks.
  */
-export function buildTaskOwnerTools(deps: { service: () => SubsessionService | undefined; scope: () => string | undefined }) {
+export function buildTaskOwnerTools(deps: {
+  service: () => SubsessionService | undefined;
+  scope: () => string | undefined;
+  /** The owner's own messages in the turn in flight (empty unless it is theirs). */
+  ownerMessages?: () => OwnerTurnMessage[];
+}) {
   const context = (name: string): { ok: true; s: SubsessionService; scope: string } | { ok: false; error: ReturnType<typeof fail> } => {
     const s = deps.service();
     if (!s || !s.available()) return { ok: false, error: fail(name, "sub-sessions are not enabled.") };
@@ -311,6 +317,9 @@ export function buildTaskOwnerTools(deps: { service: () => SubsessionService | u
         if (!c.ok) return c.error;
         const record = own(c.s, c.scope, id);
         if (!record) return fail("task_cancel", `no task ${id} in this conversation.`);
+        // Finished and waiting on the owner (as /s stop): its work is done, and
+        // cancelling would hide the ask. task_done is what clears it.
+        if (needsOwner(record)) return fail("task_cancel", `${record.id} has finished and is waiting for the owner to: ${needsOwner(record)}. There is nothing to cancel. Once they say it is done (or no longer needed), call task_done("${record.id}", ${reportNumber(record)}).`);
         const outcome = await c.s.cancel(record.id, reason ?? "cancelled from the main session");
         if (!outcome.ok) return fail("task_cancel", `${record.id} is ${outcome.from ?? "unknown"}; there is nothing to cancel.`);
         return ok(outcome.changed ? `Cancelled ${record.id}.` : `${record.id} was already cancelled.`);
@@ -319,17 +328,28 @@ export function buildTaskOwnerTools(deps: { service: () => SubsessionService | u
     ),
     tool(
       "task_message",
-      "Pass something to a sub-session: the owner's answer to its question, a change of plan. While a task waits on a question it handed you (a subsession-message from task_ask), what you pass is taken as the owner's answer to it and ends the wait: pass only what the owner actually said. Otherwise it arrives as a relay from you, not as the owner's own words, so it never counts as the owner's yes to something risky. A queued task gets it with its first turn.",
-      { id: z.string().min(1), text: z.string().min(1).max(8000) },
-      async ({ id, text }) => {
+      "Pass something to a sub-session: the owner's answer to its question, a change of plan. Your text arrives as a note from you, never as the owner's words: it is not the owner's yes to anything, and it does not let a paused task run past its time or usage limits. When what you pass is the owner's own word (their answer to its question, their go-ahead), set attach_owner_message: the harness copies the message(s) the owner wrote in this turn into the relay, exactly as they wrote them, and only those count as the owner's. While a task waits for the owner (a question it handed you with task_ask, or a pause), only a message with the owner's message attached wakes it; a note without one is kept for it until the owner's word comes. A queued task gets it with its first turn.",
+      {
+        id: z.string().min(1),
+        text: z.string().min(1).max(8000),
+        attach_owner_message: z.boolean().optional().describe("Copy the owner's own message(s) from this turn into the relay, as their words. Only in a turn the owner wrote in."),
+      },
+      async ({ id, text, attach_owner_message }) => {
         const c = context("task_message");
         if (!c.ok) return c.error;
         const record = own(c.s, c.scope, id);
         if (!record) return fail("task_message", `no task ${id} in this conversation.`);
-        const outcome = c.s.relay(record.id, text);
+        const attached = attach_owner_message ? (deps.ownerMessages?.() ?? []) : [];
+        if (attach_owner_message && attached.length === 0) {
+          return fail("task_message", "there is no message from the owner in this turn to attach (nothing was sent). Pass it without attach_owner_message as your own note, or wait for the owner's word.");
+        }
+        const outcome = c.s.relay(record.id, text, attached);
         if (!outcome.ok && outcome.refused) return fail("task_message", `${record.id} was not given the message: ${outcome.refused}. Wait for it to catch up, or cancel it.`);
         if (!outcome.ok) return fail("task_message", `${record.id} is ${outcome.from ?? "unknown"}; it takes no more messages.`);
-        return ok(outcome.record.status === "queued" ? `${record.id} is queued; it gets the message with its first turn.` : `Passed to ${record.id}.`);
+        if (outcome.held === "answer") return ok(`${record.id} still waits for the owner's answer to its question; your note goes to it with that answer. Only the owner's own words end the wait: their message to the task, or theirs passed with attach_owner_message in the turn they answer.`);
+        if (outcome.held === "paused") return ok(`${record.id} waits for the owner (task_status says why); your note goes to it when they write to it (or you pass their message with attach_owner_message). Only the owner's own words wake it.`);
+        const withOwner = attached.length > 0 ? ` with the owner's ${attached.length === 1 ? "message" : `${attached.length} messages`}` : "";
+        return ok(outcome.record.status === "queued" ? `${record.id} is queued; it gets the message${withOwner} with its first turn.` : `Passed to ${record.id}${withOwner}.`);
       },
       { searchHint: "sub-session message relay answer task" },
     ),

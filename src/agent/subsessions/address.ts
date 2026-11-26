@@ -22,6 +22,8 @@ export type TaskAddress =
   | { kind: "list" }
   /** `/s <something>` where `<something>` is not a task id. */
   | { kind: "usage" }
+  /** `/s trust`: the owner checked a task table recovered from its backup (SubsessionService.trust). */
+  | { kind: "trust" }
   | { kind: "show"; id: string }
   | { kind: "stop"; id: string }
   | { kind: "start"; id: string }
@@ -45,6 +47,7 @@ export function parseTaskAddress(text: string, botUsername?: string): TaskAddres
   if (!rest) return { kind: "list" };
   const space = rest.search(/\s/);
   const head = space === -1 ? rest : rest.slice(0, space);
+  if (/^trust$/i.test(rest)) return { kind: "trust" };
   if (!TASK_ID.test(head)) return { kind: "usage" };
   const id = head.toLowerCase();
   const tail = space === -1 ? "" : rest.slice(space).trim();

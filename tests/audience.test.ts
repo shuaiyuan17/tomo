@@ -99,6 +99,31 @@ describe("isOwnAudienceTurn", () => {
  * `turnOrigin` decides which chat `request_credential` asks on, so every way
  * it can be unsure must answer "no chat" (undefined), never a guess.
  */
+describe("TurnAudienceRegistry.ownerMessages", () => {
+  const KEY = "dm:alex";
+  const msg = (text: string, at: number) => ({ text, at, channel: "imessage" });
+
+  it("is the owner's messages of the live turns, oldest first, and forgets a turn when it ends", () => {
+    const r = new TurnAudienceRegistry();
+    const a = r.begin(KEY, ["dm"], undefined, [msg("second", 2)]);
+    r.begin(KEY, ["dm"], undefined, [msg("first", 1)]);
+    expect(r.ownerMessages(KEY).map((m) => m.text)).toEqual(["first", "second"]);
+    r.end(KEY, a);
+    expect(r.ownerMessages(KEY).map((m) => m.text)).toEqual(["first"]);
+    expect(r.ownerMessages("dm:other")).toEqual([]);
+  });
+
+  it("is empty while a summoned group or a mixed batch steers the session (fails closed)", () => {
+    const r = new TurnAudienceRegistry();
+    r.begin(KEY, ["dm"], undefined, [msg("mine", 1)]);
+    r.begin(KEY, ["telegram:-100"]);
+    expect(r.ownerMessages(KEY)).toEqual([]);
+    const mixed = new TurnAudienceRegistry();
+    mixed.begin(KEY, ["dm", "telegram:-100"], undefined, [msg("mine", 1)]);
+    expect(mixed.ownerMessages(KEY)).toEqual([]);
+  });
+});
+
 describe("TurnAudienceRegistry.turnOrigin", () => {
   const KEY = "dm:alex";
   const dm = { channelName: "imessage", chatId: "any;-;+15555550123" };

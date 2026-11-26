@@ -60,7 +60,7 @@ import { log } from "./logger.js";
 import { shortErrorMessage } from "./error-text.js";
 import { SteerDeclinedError, TurnInterruptedError, type QueryResult, type ReplyContext, type TurnRequest } from "./agent/live-session.js";
 import { isSilentReply } from "./agent/text-utils.js";
-import { audienceOf, audienceSwitchNote, TurnAudienceRegistry, type TurnOrigin } from "./agent/audience.js";
+import { audienceOf, audienceSwitchNote, TurnAudienceRegistry, type OwnerTurnMessage, type TurnOrigin } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { formatInterruptedAgentsNotice, isResumable, MAX_AUTO_RESUMES, RunningAgentsLedger, type RunningTaskRecord } from "./agent/running-agents-ledger.js";
 import { DurableInbox, INBOX_STALE_NOT_PROCESSED, restoreMessage, type InboxRecord } from "./agent/durable-inbox.js";
@@ -598,7 +598,7 @@ export class Agent {
         const target = this.resolveDeliveryTargetForSession(parentKey, "Sub-session notice");
         if (target) await target.channel.send({ chatId: target.chatId, text });
       },
-      noticeOwner: async (text) => { await this.notifyOwner(text); },
+      noticeOwner: (text) => this.notifyOwner(text),
       // A task owned by the owner's DM speaks for the owner alone: its notes
       // never drain into a summoned group's turn on that session.
       queuePendingNote: (key, note) => this.queuePendingNote(key, isDmSessionKey(key) ? markOwnerAudience(note) : note),
@@ -685,7 +685,7 @@ export class Agent {
     if (this.messageWakeQueued.has(parentKey)) return;
     this.messageWakeQueued.add(parentKey);
     const prompt = appendToTomoEventBody(formatTomoEvent("subsession-message",
-      "A sub-session handed you something for the owner; it is in a note above. Pass it on as that note says (send_message), hold it for a better moment, or fold it into other news. A question waits for the owner's answer: put it to them, and pass their answer back with task_message. If nothing needs doing, end with NO_REPLY.",
+      "A sub-session handed you something for the owner; it is in a note above. Pass it on as that note says (send_message), hold it for a better moment, or fold it into other news. A question waits for the owner's answer: put it to them, and pass their answer back with task_message and attach_owner_message, in the turn of their answer. If nothing needs doing, end with NO_REPLY.",
       { name: "check" }), CONTINUITY_DELIVERY_NOTE);
     let ran = false;
     this.enqueueForSession(parentKey, async () => {
@@ -2164,7 +2164,7 @@ export class Agent {
     // second one's cleanup unscope the first. Removed afterwards, so a later
     // cron or background turn on the same session is the owner's again and
     // does not inherit a summoned group's narrower scope.
-    const turnId = this.turnAudiences.begin(req.key, req.audiences, req.origins);
+    const turnId = this.turnAudiences.begin(req.key, req.audiences, req.origins, req.ownerMessages);
     // Until the SDK takes the prompt, this turn has not consumed its messages.
     req.inboxHooks?.notConsumed();
     try {
@@ -2176,6 +2176,12 @@ export class Agent {
         if (!requests?.size) this.webRequestIds.delete(req.key);
       }
     }
+  }
+
+  /** The owner's own messages in the turns live on this session (empty
+   *  unless they are the owner's own): what task_message may attach. */
+  turnOwnerMessages(sessionKey: string): OwnerTurnMessage[] {
+    return this.turnAudiences.ownerMessages(sessionKey);
   }
 
   /** The session key a session-scoped MCP tool should be judged against for
@@ -2413,6 +2419,7 @@ export class Agent {
         documents: message.documents,
         audiences,
         origins: [{ channelName: channel.name, chatId: message.chatId }],
+        ...(!isGroup && isDmSessionKey(key) ? { ownerMessages: [ownerTurnMessage(channel, message)] } : {}),
         suppressErrors: isPassiveGroup,
         ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, ownerT("notices")("suppressed.turn.message"), `${channel.name}:${message.chatId}`) } : {}),
         errorLogMessage: "Error handling message",
@@ -2581,6 +2588,7 @@ export class Agent {
       documents: allDocuments.length > 0 ? allDocuments : undefined,
       audiences,
       origins: items.map((it) => ({ channelName: it.channel.name, chatId: it.message.chatId })),
+      ...(isDmSessionKey(key) ? { ownerMessages: items.filter((it) => !(it.message.isGroup ?? false)).map((it) => ownerTurnMessage(it.channel, it.message)) } : {}),
       suppressErrors: isPassiveGroup,
       ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, ownerT("notices")("suppressed.turn.message"), `${lastChannel.name}:${lastMessage.chatId}`) } : {}),
       errorLogMessage: "Error handling batched messages",
@@ -4048,4 +4056,9 @@ export class InboxPersistError extends Error {
 
 function inboxIdsOf(items: ReadonlyArray<{ inboxId?: string }>): string[] {
   return items.flatMap((item) => (item.inboxId ? [item.inboxId] : []));
+}
+
+/** An inbound owner message as task_message attaches it: what they sent, when, and where. */
+function ownerTurnMessage(channel: Pick<Channel, "name">, message: Pick<IncomingMessage, "text" | "timestamp">): OwnerTurnMessage {
+  return { text: message.text, at: message.timestamp, channel: channel.name };
 }

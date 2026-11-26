@@ -313,6 +313,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       ...(ownerSession && agent.subsessions ? buildTaskOwnerTools({
         service: () => agent.subsessions,
         scope: () => (isOwnAudience() ? callerSessionKey : undefined),
+        ownerMessages: () => agent.turnOwnerMessages(callerSessionKey),
       }) : []),
       ...buildPetTools(),
       ...buildLcmTools({

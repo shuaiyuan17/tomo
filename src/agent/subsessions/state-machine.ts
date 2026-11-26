@@ -15,7 +15,8 @@ import type { SubsessionStatus, WaitingOn } from "./types.js";
  * - THE OWNER IS NEVER QUEUED. A message from the owner (or a relay from the
  *   owning session, which is how the owner answers in Phase 1a) gets its turn
  *   whatever the slots say, and wakes a waiting task. A waiting(owner) task
- *   is woken by nothing else: a cron firing there is ignored.
+ *   is woken by nothing else: a cron firing there is kept for the owner's
+ *   wake ("same"), not a turn of its own.
  */
 export const SUBSESSION_EVENTS = [
   "start",
@@ -75,7 +76,7 @@ export function nextStatus(status: SubsessionStatus, waitingOn: WaitingOn | unde
       if (waiting) return ACTIVE;
       return status === "queued" || status === "active" || status === "finished" ? "same" : null;
     case "cron_wake":
-      if (waiting) return waitingOn === "external" ? QUEUED : null;
+      if (waiting) return waitingOn === "external" ? QUEUED : "same";
       return status === "queued" || status === "active" ? "same" : null;
     case "background_report":
       // The report turn itself already ran (the SDK starts it; it cannot be

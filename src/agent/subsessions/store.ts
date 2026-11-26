@@ -7,6 +7,7 @@ import { taskSessionKey } from "../../sessions/keys.js";
 import { IllegalTransitionError, nextStatus, type SubsessionEvent } from "./state-machine.js";
 import {
   OWNER_MESSAGE_IDS_KEEP,
+  OWNER_MESSAGE_MARKER,
   CONVERSATION_KEEP,
   DONE_STEPS_KEEP,
   UPDATES_KEEP,
@@ -19,6 +20,7 @@ import {
   REPLY_MAP_KEEP,
   SENT_KEEP,
   SUBSESSION_STATUSES,
+  TERMINAL_STATUSES,
   TRANSITION_LOG_KEEP,
   type SubsessionInput,
   type SubsessionPlanStep,
@@ -27,6 +29,7 @@ import {
   type SubsessionRecord,
   type SubsessionStatus,
   type SubsessionTable,
+  type InputOrigin,
 } from "./types.js";
 
 /**
@@ -247,6 +250,8 @@ export class SubsessionStore {
         } else {
           delete record.endedAt;
         }
+        // An ended task never changes again, so nothing a backup held about it can be newer.
+        if (TERMINAL_STATUSES.has(target.status)) delete record.restored;
         record.transitions.push({ at: now, from, to: target.status, event, ...(opts.reason ? { reason: opts.reason } : {}) });
         log.info({ id, event, from, to: target.status, waitingOn: record.waitingOn, reason: opts.reason }, "Sub-session transition");
       }
@@ -323,9 +328,11 @@ export class SubsessionStore {
 
   /** A table read from `.bak` may be missing tasks, and its records may be stale: it says so from here on, in every write. */
   private untrust(table: SubsessionTable): SubsessionTable {
-    if (!table.untrusted) table.untrusted = { since: this.now(), reason: "recovered" };
-    // Every status in it may be older than what happened since.
-    for (const task of table.tasks) task.restored = true;
+    // A fresh recovery: the owner is told again (no `notified`).
+    table.untrusted = { since: this.now(), reason: table.untrusted?.reason ?? "recovered" };
+    // Every open status in it may be older than what happened since. An
+    // ended one cannot be: cancelled, failed and archived never change.
+    for (const task of table.tasks) if (!TERMINAL_STATUSES.has(task.status)) task.restored = true;
     return table;
   }
 
@@ -334,12 +341,24 @@ export class SubsessionStore {
     this.mutate((table) => { if (!table.untrusted) table.untrusted = { since: this.now(), reason }; });
   }
 
+  /** The owner was told about the mark (see `SubsessionTable.untrusted`): called once the notice went out. */
+  markNotified(): void {
+    this.mutate((table) => { if (table.untrusted) table.untrusted.notified = true; });
+  }
+
   /**
-   * Nothing left to protect: every registry task session is one the table
-   * knows, and no record is still `restored` (refused while one is).
+   * The owner checked the recovered table and says it is right (`/s trust`):
+   * the `untrusted` mark and every `restored` mark go. The only way either
+   * ends besides a live report or cancel of that one record: nothing clears
+   * them on its own. Returns whether there was a mark to clear.
    */
-  clearUntrusted(): void {
-    this.mutate((table) => { if (!table.tasks.some((t) => t.restored)) delete table.untrusted; });
+  trust(): boolean {
+    return this.mutate((table) => {
+      const had = !!table.untrusted || table.tasks.some((t) => t.restored);
+      for (const task of table.tasks) delete task.restored;
+      delete table.untrusted;
+      return had;
+    });
   }
 
   private remember(table: SubsessionTable, state: SubsessionStoreState): SubsessionTable {
@@ -407,7 +426,7 @@ function parseUntrusted(raw: unknown): SubsessionTable["untrusted"] {
   // Present but malformed still means "do not trust": never dropped silently.
   const since = u && typeof u.since === "number" && Number.isFinite(u.since) ? u.since : 0;
   const reason = u && u.reason === "lost" ? "lost" : "recovered";
-  return { since, reason };
+  return { since, reason, ...(u && u.notified === true ? { notified: true as const } : {}) };
 }
 
 function parseRecord(raw: unknown, index: number): SubsessionRecord {
@@ -433,6 +452,7 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
   delete kept.todoId;
   const legacyTodoId = typeof r.todoId === "string" && r.todoId ? r.todoId : typeof r.legacyTodoId === "string" && r.legacyTodoId ? r.legacyTodoId : undefined;
   delete kept.legacyTodoId;
+  delete kept.restored;
   return {
     ...(kept as unknown as SubsessionRecord),
     ...(legacyTodoId ? { legacyTodoId } : {}),
@@ -469,7 +489,8 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
       : [],
     conversationSeq: num("conversationSeq", 0),
     mirrorSeenSeq: num("mirrorSeenSeq", 0),
-    ...(r.restored === true ? { restored: true } : {}),
+    // Never on an ended task (an older table could have marked one, which kept it from ever being cleaned up).
+    ...(r.restored === true && !TERMINAL_STATUSES.has(status) ? { restored: true } : {}),
     ...(typeof r.activeAtOwnerInputMs === "number" && Number.isFinite(r.activeAtOwnerInputMs) ? { activeAtOwnerInputMs: r.activeAtOwnerInputMs } : { activeAtOwnerInputMs: undefined }),
     ...(Array.isArray(r.earlierReports)
       ? { earlierReports: (r.earlierReports as unknown[]).filter((e): e is { seq: number; text: string } =>
@@ -496,7 +517,7 @@ function parseAskViaMain(value: unknown, status: SubsessionStatus, waitingOn: un
   if (status !== "waiting" || waitingOn !== "owner" || !value || typeof value !== "object") return { askViaMain: undefined };
   const v = value as Record<string, unknown>;
   if (!isTimestamp(v.at) || typeof v.text !== "string" || !v.text.trim()) return { askViaMain: undefined };
-  return { askViaMain: { at: v.at, text: v.text, ...(typeof v.note === "string" && v.note ? { note: v.note } : {}) } };
+  return { askViaMain: { at: v.at, text: v.text, ...(typeof v.note === "string" && v.note ? { note: v.note } : {}), ...(v.direct === true ? { direct: true as const } : {}) } };
 }
 
 /**
@@ -510,19 +531,26 @@ function parseInputs(raw: unknown): SubsessionInput[] {
   for (const entry of raw) {
     let seq: number | undefined;
     let text: string | undefined;
-    let owner: { from: "owner"; words: string; source?: "panel" } | undefined;
+    // No origin (written before inputs carried one, or malformed): the
+    // harness's own, never the owner's word.
+    let origin: InputOrigin = { from: "harness" };
     if (typeof entry === "string") text = entry;
     else if (entry && typeof entry === "object") {
       const e = entry as Record<string, unknown>;
       if (typeof e.text === "string") text = e.text;
       if (typeof e.seq === "number" && Number.isInteger(e.seq) && e.seq > last) seq = e.seq;
-      if (e.from === "owner") {
-        owner = { from: "owner", words: typeof e.words === "string" ? e.words : (text ?? ""), ...(e.source === "panel" ? { source: "panel" as const } : {}) };
+      if (e.from === "owner" && (e.checked === true || (text ?? "").startsWith(OWNER_MESSAGE_MARKER))) {
+        origin = { from: "owner", words: typeof e.words === "string" ? e.words : (text ?? ""), ...(e.source === "panel" ? { source: "panel" as const } : {}) };
+      } else if (e.from === "owner" || e.from === "main") {
+        // A relay stored as the owner's with no `checked` was stored before
+        // origins were checked, when every relay was stored as the owner's:
+        // the main session may have written it, so it is read as its note.
+        origin = { from: "main", words: typeof e.words === "string" ? e.words : (text ?? "") };
       }
     }
     if (text === undefined) continue;
     last = seq ?? last + 1;
-    out.push({ seq: last, text, ...(owner ?? {}) });
+    out.push({ seq: last, text, ...origin, ...(origin.from === "owner" ? { checked: true as const } : {}) });
   }
   return out;
 }

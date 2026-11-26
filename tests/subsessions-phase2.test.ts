@@ -11,7 +11,7 @@ import {
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { ACTIVE_HEARTBEAT_MS, ENDED_KEEP_MS, FINISHED_KEEP_MS, REGISTRY_RECHECK_MS } from "../src/agent/subsessions/service.js";
 import { formatMirrorNote, formatOwnerMessageEvent, MIRROR_ENTRY_MAX } from "../src/agent/subsessions/prompt.js";
-import { appendInput, needsOwner, type SubsessionRecord } from "../src/agent/subsessions/types.js";
+import { appendInput, needsOwner, type SubsessionRecord, HARNESS } from "../src/agent/subsessions/types.js";
 import { dropLegacyTaskTodos } from "../src/agent/subsessions/legacy-todos.js";
 import { TodoStore } from "../src/todos/store.js";
 import { DEFAULT_TODOS } from "../src/todos/limits.js";
@@ -233,7 +233,7 @@ describe("restart recovery from an older backup", () => {
     h0.store.update(t.id, (r) => {
       r.startDelivered = true;
       r.activeSeenAt = h0.clock;
-      appendInput(r, "the owner's message");
+      appendInput(r, "the owner's message", HARNESS);
     });
     const file = join(dir, "t.json");
     copyFileSync(file, `${file}.bak`);

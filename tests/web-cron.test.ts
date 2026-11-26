@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { CronStore } from "../src/cron/store.js";
-import { MAX_CRON_STORE_BYTES, WebCron } from "../src/web/inspection.js";
+import { WebCron } from "../src/web/inspection.js";
+import { breakStore, repairStore } from "./helpers/cron.js";
 import { WebData } from "../src/web/data.js";
 import { WebChannel } from "../src/channels/web.js";
 import { SessionStore } from "../src/sessions/store.js";
@@ -18,7 +18,7 @@ let store: CronStore;
 let web: WebCron;
 beforeEach(() => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "tomo-web-cron-")));
-  path = join(root, "cron", "jobs.json");
+  path = join(root, "data", "tomo.db");
   store = new CronStore(path);
   web = new WebCron(path);
 });
@@ -26,36 +26,25 @@ afterEach(() => { rmSync(root, { recursive: true, force: true }); });
 
 describe("WebCron.list", () => {
   it("lists a job's intent and run state", async () => {
-    const path = join(root, "data", "cron", "jobs.json");
-    const store = new CronStore(path);
     const job = store.add({ name: "Example task", schedule: { kind: "every", everyMs: 60_000 }, message: "Review the test note", sessionKey: "dm:owner" });
-    expect((await new WebCron(path).list()).jobs).toEqual([expect.objectContaining({ id: job.id, name: "Example task", message: "Review the test note",
+    expect((await web.list()).jobs).toEqual([expect.objectContaining({ id: job.id, name: "Example task", message: "Review the test note",
       sessionKey: "dm:owner", scheduleLabel: "every 1m", enabled: true, lastStatus: null })]);
   });
   it("reports an unreadable store as unavailable, not as no jobs", async () => {
-    const path = join(root, "jobs.json");
-    writeFileSync(path, "{not json");
-    await expect(new WebCron(path).list()).rejects.toMatchObject({ status: 503, code: "cron_unavailable" });
-    writeFileSync(path, JSON.stringify({ jobs: [null] }));
-    await expect(new WebCron(path).list()).rejects.toMatchObject({ code: "cron_unavailable" });
+    breakStore(path);
+    await expect(web.list()).rejects.toMatchObject({ status: 503, code: "cron_unavailable" });
+    breakStore(path, JSON.stringify({ jobs: [null] }));
+    await expect(web.list()).rejects.toMatchObject({ code: "cron_unavailable" });
   });
-  it("reads a missing store as no jobs, and has no path of its own", async () => {
-    expect(await new WebCron(join(root, "absent.json")).list()).toEqual({ jobs: [] });
+  it("reports a damaged database as unavailable", async () => {
+    const damaged = join(root, "damaged", "data", "tomo.db");
+    mkdirSync(dirname(damaged), { recursive: true });
+    writeFileSync(damaged, "not a database, but not empty either ".repeat(200));
+    await expect(new WebCron(damaged).list()).rejects.toMatchObject({ status: 503, code: "cron_unavailable" });
+  });
+  it("reads a new store as no jobs, and has no path of its own", async () => {
+    expect(await new WebCron(join(root, "absent", "data", "tomo.db")).list()).toEqual({ jobs: [] });
     await expect(new WebCron(undefined).list()).rejects.toMatchObject({ code: "cron_unavailable" });
-  });
-  it("refuses a FIFO, a symlink and a directory without blocking", async () => {
-    const fifo = join(root, "fifo.json");
-    execFileSync("mkfifo", [fifo]);
-    await expect(new WebCron(fifo).list()).rejects.toMatchObject({ code: "cron_unavailable" });
-    const real = join(root, "real.json"); writeFileSync(real, JSON.stringify({ version: 1, revision: 1, jobs: [] }));
-    symlinkSync(real, join(root, "link.json"));
-    await expect(new WebCron(join(root, "link.json")).list()).rejects.toMatchObject({ code: "cron_unavailable" });
-    await expect(new WebCron(root).list()).rejects.toMatchObject({ code: "cron_unavailable" });
-  });
-  it("refuses a store over the size bound with an explicit error", async () => {
-    const path = join(root, "big.json");
-    writeFileSync(path, JSON.stringify({ version: 1, revision: 1, jobs: [], pad: "x".repeat(MAX_CRON_STORE_BYTES) }));
-    await expect(new WebCron(path).list()).rejects.toMatchObject({ status: 413, code: "cron_store_too_large" });
   });
 });
 
@@ -92,9 +81,12 @@ describe("WebCron.change", () => {
   });
 
   it("refuses to change a store it would refuse to read", async () => {
-    store.add({ name: "x", schedule: { kind: "every", everyMs: 60_000 }, message: "x", sessionKey: "dm:owner" });
-    writeFileSync(path, JSON.stringify({ version: 1, revision: 9, jobs: [], pad: "x".repeat(4 * 1024 * 1024) }));
-    await expect(web.change("x", "0".repeat(64))).rejects.toMatchObject({ code: "cron_store_too_large" });
+    const job = store.add({ name: "x", schedule: { kind: "every", everyMs: 60_000 }, message: "x", sessionKey: "dm:owner" });
+    const revision = (await web.list()).jobs[0].revision;
+    breakStore(path);
+    await expect(web.change(job.id, revision, false)).rejects.toMatchObject({ code: "cron_unavailable" });
+    repairStore(path);
+    expect(new CronStore(path).get(job.id)?.enabled).toBe(true);
   });
 
   it("reports a missing job and an unschedulable resume distinctly", async () => {
@@ -121,7 +113,7 @@ describe("cron mutations over HTTP", () => {
     const sessionsDir = join(root, "sessions"); const sdkSessionsDir = join(root, "sdk");
     new SessionStore(sessionsDir, 20, sdkSessionsDir).touchSession("dm:owner");
     channel = new WebChannel(owner); channel.onMessage(async () => true);
-    service = await startWebService({ assetsDir: root, data: new WebData({ cronStorePath: path, sessionsDir, sdkSessionsDir, owner }),
+    service = await startWebService({ assetsDir: root, data: new WebData({ cronDbPath: path, sessionsDir, sdkSessionsDir, owner }),
       subscribe: (fn) => channel.events.subscribe(fn), rpc: channelRpc(channel) });
   });
   afterEach(async () => { await service?.close(); await channel?.stop(); });

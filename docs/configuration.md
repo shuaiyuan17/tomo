@@ -330,6 +330,7 @@ If LiteLLM returns `System messages are not allowed`, use a LiteLLM build that i
 ~/.tomo/
   config.json                 # Owner, channels, model, settings (0600)
   tomo.pid                    # PID file (when running)
+  tomo.lock                   # Held by the daemon, and by `tomo db repair|export` / `tomo backup restore`, so they never overlap
   web-token, web-access.log   # Web UI token and private access link
   workspace/
     SOUL.md                   # Personality and values
@@ -343,8 +344,8 @@ If LiteLLM returns `System messages are not allowed`, use a LiteLLM build that i
     secrets/                  # Harness-managed credentials (e.g. MCP OAuth tokens, mode 0600)
     .claude/skills/           # Agent skills
   data/
-    tomo.db                   # SQLite database (+ -wal/-shm): pending prompt notes so far. `tomo db check|dump|export`
-    cron/jobs.json            # Scheduled tasks
+    tomo.db                   # SQLite database (+ -wal/-shm): pending prompt notes, scheduled tasks (cron_jobs). `tomo db check|dump|export`
+    cron/jobs.json            # Placeholder only: the old jobs file, imported into tomo.db (renamed .migrated-<ts>)
     todos/                    # Todo store (todos.json + done.ndjson)
     sessions/                 # Transcript logs and session registry
     inbox.jsonl               # Durable inbox

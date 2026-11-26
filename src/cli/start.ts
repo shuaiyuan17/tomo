@@ -3,12 +3,17 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { acquirePidFile, readPidFileRecord, releasePidFile } from "./pidfile.js";
+import { acquireMaintenanceLock, maintenanceLockPath, type MaintenanceLock } from "../db/lock.js";
 import { getRunningPid } from "./status-info.js";
 import type { CronJob } from "../cron/types.js";
 import { sleep } from "../sleep.js";
 
 const TOMO_HOME = defaultRuntimePaths.tomoHome;
 const PID_FILE = defaultRuntimePaths.pidFile;
+/** How long a starting daemon waits for a maintenance command to let go of the lock. */
+const MAINTENANCE_LOCK_WAIT_MS = 5_000;
+/** Held for the daemon's whole life; see acquireMaintenanceLock. */
+let daemonMaintenanceLock: MaintenanceLock | null = null;
 
 export const startCommand = new Command("start")
   .description("Start Tomo")
@@ -56,6 +61,19 @@ async function startForeground(): Promise<void> {
   // disk would make the next `tomo start` print a stale-takeover line for a
   // daemon that never started.
   process.on("exit", () => releasePidFile(PID_FILE));
+
+  // SECOND, still before any await: the lock the maintenance commands
+  // (`tomo db repair` / `db export`, `tomo backup restore`) take. A daemon
+  // launchd respawns while one of them runs must not start under it. Held
+  // until this process exits; the kernel releases it however that happens.
+  // Kept in a module variable: a lock object nothing references could be
+  // collected, and closing its connection would let go of the lock.
+  // (`??=`: a second start in one process, as the start tests do, already holds it.)
+  daemonMaintenanceLock ??= acquireMaintenanceLock(maintenanceLockPath(TOMO_HOME), { waitMs: MAINTENANCE_LOCK_WAIT_MS });
+  if (!daemonMaintenanceLock) {
+    console.error(`A maintenance command (tomo db repair / export, tomo backup restore) is running (${maintenanceLockPath(TOMO_HOME)} is locked). Refusing to start until it finishes.`);
+    process.exit(1);
+  }
 
   // Before the config and agent imports, but AFTER the synchronous pid-file
   // claim above (an await in front of the exclusion gate would re-open the
@@ -156,6 +174,32 @@ async function startForeground(): Promise<void> {
     );
   });
 
+  // Before anything can read or schedule cron jobs (the agent's owner
+  // adoption and task links, the web process, the scheduler): bring an old
+  // data/cron/jobs.json into the database. Only the daemon does this; other
+  // processes refuse while such a file is waiting. A failure is logged and
+  // leaves every cron surface refusing (CronStoreReadError), never empty.
+  {
+    const { importLegacyCronJobs } = await import("../cron/store.js");
+    // A busy database (a CLI holding a write past the busy timeout) is
+    // transient: retry for about half a minute before the scheduler starts,
+    // since giving up here leaves every job off until the next restart.
+    const attempts = 6;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        importLegacyCronJobs(config.dbPath);
+        break;
+      } catch (err) {
+        if (attempt === attempts) {
+          log.error({ err }, "Could not import the cron jobs file into the database; scheduled tasks stay off until it can be");
+          break;
+        }
+        log.warn({ err, attempt }, "Cron jobs import failed; retrying");
+        await new Promise((resolve) => setTimeout(resolve, 5_000));
+      }
+    }
+  }
+
   const agent = new Agent();
   // Owner notices, legacy adoption and the pre-created owner session entry —
   // before any channel can deliver a message.
@@ -244,7 +288,6 @@ async function startForeground(): Promise<void> {
       const usageCache = new UsageCache(() => fetchUsage({ authMethod: config.auth.method,
         gatewayActive: litellmRoutesModel(config.litellm, config.model),
         onData: (data) => { void limitsLog.recordOAuthUsage(data); } }));
-      const { CRON_STORE_PATH } = await import("../cron/store.js");
       const { WebRequestJournal } = await import("../web/request-journal.js");
       const { WEB_CHAT_ID } = await import("../web/protocol.js");
       const { OutgoingMediaStore, outgoingImagesDir } = await import("../web/outgoing-media.js");
@@ -287,7 +330,7 @@ async function startForeground(): Promise<void> {
       const supervisor = new WebSupervisor(web, {
         ...config.web, owner: config.owner,
         sessionsDir: config.sessionsDir, sdkSessionsDir: config.sdkSessionsDir, tomoHome: config.tomoHome,
-        workspaceDir: config.workspaceDir, agentName: config.agentName, locale: config.locale, uploadsEnabled: config.saveInboundImages, fileUploadsEnabled: config.saveInboundFiles, cronStorePath: CRON_STORE_PATH, todoLimits: config.todos, mcpStatus: () => agent.readMcpStatuses(), mcpOAuth: () => agent.mcpOAuthStates(), mcpReconnect: (server) => agent.reconnectOwnerMcpServer(server),
+        workspaceDir: config.workspaceDir, agentName: config.agentName, locale: config.locale, uploadsEnabled: config.saveInboundImages, fileUploadsEnabled: config.saveInboundFiles, cronDbPath: config.dbPath, todoLimits: config.todos, mcpStatus: () => agent.readMcpStatuses(), mcpOAuth: () => agent.mcpOAuthStates(), mcpReconnect: (server) => agent.reconnectOwnerMcpServer(server),
         diagnostic: (message, level = "info") => log[level](message),
       });
       web.attach(supervisor);
@@ -302,12 +345,12 @@ async function startForeground(): Promise<void> {
     } catch { log.warn("Web UI unavailable; messaging channels remain active."); }
   }
 
-  const { CronStore, CRON_STORE_PATH } = await import("../cron/store.js");
+  const { CronStore } = await import("../cron/store.js");
   const { readCronJobsSafely } = await import("./cron-errors.js");
-  // The same path the web process is given above: one store, one file.
-  const cronStore = new CronStore(CRON_STORE_PATH);
+  // The same database the web process is given above.
+  const cronStore = new CronStore(config.dbPath);
   // The watch snapshot and the metrics scrape must not fail whole because
-  // jobs.json is unreadable: dropping a `tomo watch` client or 500ing a
+  // the cron store is unreadable: dropping a `tomo watch` client or 500ing a
   // scrape hides every other thing those surfaces report. Degrade the cron
   // section only, and say so in the log (the scheduler surfaces the same
   // failure properly, by refusing to scan until it can read the store).

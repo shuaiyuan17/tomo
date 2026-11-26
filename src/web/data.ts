@@ -45,7 +45,7 @@ export interface WebDataOptions {
   /** `locale` from config: the web UI's default language (null/undefined: the browser's). */
   locale?: Locale | null;
   /** The scheduler's cron store file, passed by the daemon (the web process never derives it). */
-  cronStorePath?: string;
+  cronDbPath?: string;
   /** The todo limits in force (config `todos`), passed by the daemon; absent: the defaults. */
   todoLimits?: Pick<TodoConfig, "maxOpen" | "maxSnoozes">;
 }
@@ -190,7 +190,7 @@ export class WebData {
     this.agent = new AgentNameReader({ configured: options.agentName, workspaceDir: options.workspaceDir });
     if (options.workspaceDir) this.memory = new MemoryReader(options.workspaceDir);
     if (options.tomoHome) this.config = new WebConfigReader(options.tomoHome);
-    this.cron = new WebCron(options.cronStorePath);
+    this.cron = new WebCron(options.cronDbPath);
   }
 
   private ledger?: LedgerReader;

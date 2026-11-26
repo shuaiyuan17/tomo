@@ -32,7 +32,7 @@ function describeJob(job: CronJob): string {
 export async function configCron(): Promise<void> {
   for (;;) {
     // Fresh store per pass: the daemon and `tomo cron` mutate the same
-    // jobs.json, so re-read instead of browsing a startup-time snapshot.
+    // the store, so re-read instead of browsing a startup-time snapshot.
     const store = new CronStore();
     let jobs;
     try {

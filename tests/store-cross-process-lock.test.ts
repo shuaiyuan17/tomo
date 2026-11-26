@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -67,7 +67,7 @@ afterEach(() => {
 });
 
 const REGISTRY = () => join(dir, "_sessions.json");
-const JOBS = () => join(dir, "cron", "jobs.json");
+const JOBS = () => join(dir, "data", "tomo.db");
 
 function registryOnDisk(): { sessions: { channelKey: string; sdkSessionId: string; chatTitle?: string }[] } {
   return JSON.parse(readFileSync(REGISTRY(), "utf-8"));
@@ -304,19 +304,6 @@ describe("registry hot path: no lock when nothing changes", () => {
   });
 });
 
-describe("cron writes under the advisory lock", () => {
-  it("holds jobs.json.lock across the read-merge-write", () => {
-    const store = new CronStore(JOBS());
-    let heldDuringWrite: boolean | null = null;
-    hook.beforeWrite = (path) => {
-      if (path === JOBS()) heldDuringWrite = existsSync(`${JOBS()}.lock`);
-    };
-    store.add({ name: "j", schedule: { kind: "every", everyMs: 60_000 }, message: "m", sessionKey: "dm:a" });
-    expect(heldDuringWrite).toBe(true);
-    expect(existsSync(`${JOBS()}.lock`)).toBe(false);
-  });
-});
-
 // ---------------------------------------------------------------------------
 // Across real processes. The property is cross-process by construction: every
 // store API is synchronous, so nothing inside one process can interleave with
@@ -367,16 +354,15 @@ describe("concurrent processes writing the same store", () => {
   });
 
   it("keeps every cron job added at once", { timeout: 60_000 }, async () => {
-    mkdirSync(join(dir, "cron"), { recursive: true });
     const startAt = Date.now() + 5_000;
     const results = await Promise.all(
       Array.from({ length: RACERS }, (_, i) => race("cron", JOBS(), i, startAt)),
     );
-    // Not merely "the jobs are there": a save that ran out of optimistic
-    // retries used to surface as a thrown StaleWriteError to the CLI user.
+    // Not merely "the jobs are there": every writer waited its turn for the
+    // database's write lock instead of failing (SQLITE_BUSY).
     expect(results.map((r) => r.error)).toEqual(Array(RACERS).fill(null));
 
-    const jobs = (JSON.parse(readFileSync(JOBS(), "utf-8")) as { jobs: { name: string }[] }).jobs;
+    const jobs = new CronStore(JOBS()).list();
     expect(jobs.map((j) => j.name).sort()).toEqual(
       Array.from({ length: RACERS }, (_, i) => `job-${i}`).sort(),
     );

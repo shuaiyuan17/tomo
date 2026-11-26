@@ -89,7 +89,7 @@ describe("Study HTTP", () => {
     const sessions = new SessionStore(sessionsDir, 20, sdkSessionsDir);
     sessions.touchSession("dm:owner"); sessions.touchSession("telegram:-2"); sessions.setChatTitle("telegram:-2", "Book club");
     channel = new WebChannel(owner); channel.onMessage(async () => true);
-    const data = new WebData({ workspaceDir: root, tomoHome: root, cronStorePath: join(root, "jobs.json"), sessionsDir, sdkSessionsDir, owner, todoLimits: { maxOpen: 12, maxSnoozes: 2 } });
+    const data = new WebData({ workspaceDir: root, tomoHome: root, cronDbPath: join(root, "jobs.json"), sessionsDir, sdkSessionsDir, owner, todoLimits: { maxOpen: 12, maxSnoozes: 2 } });
     web = await startWebService({ assetsDir: root, data, subscribe: (fn) => channel.events.subscribe(fn), rpc: channelRpc(channel, {
       "mcp-status": () => ({ sessions: [{ sessionId: boot.ownerId, connections: [{ name: "search", status: "connected" }] }], oauth: [{ name: "search", oauth: "login-required" }] }),
       "context-events": (rpc: { sessionId: string }) => channel.contextEvents(rpc.sessionId),

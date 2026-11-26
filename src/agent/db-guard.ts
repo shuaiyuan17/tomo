@@ -1,6 +1,7 @@
 // PreToolUse guard: Tomo's database is written by Tomo only.
-import { isAbsolute, resolve as pathResolve } from "node:path";
+import { dirname, isAbsolute, resolve as pathResolve } from "node:path";
 import { dbFamily } from "../db/index.js";
+import { maintenanceLockPath } from "../db/lock.js";
 import { log } from "../logger.js";
 import { bashTokens, pathCandidates } from "./permission-paths.js";
 import { commandSegments, expandTilde, landsIn } from "./bash-write-targets.js";
@@ -24,7 +25,10 @@ export const DB_WRITE_DENIAL =
 
 /** Would this call write the database (or open it writable with sqlite3)? Exported for tests. */
 export function isDbWrite(toolName: string, toolInput: unknown, ctx: { cwd: string; dbPath: string }): boolean {
-  const family = dbFamily(ctx.dbPath);
+  // And the maintenance lock (~/.tomo/tomo.lock, src/db/lock.ts): deleting it
+  // while the daemon holds it would let `tomo db repair` lock a new file and
+  // run beside the daemon. The database is always <tomoHome>/data/tomo.db.
+  const family = [...dbFamily(ctx.dbPath), ...dbFamily(maintenanceLockPath(dirname(dirname(ctx.dbPath))))];
   if (family.some((file) => isTodoStoreWrite(toolName, toolInput, { cwd: ctx.cwd, todosDir: file }))) return true;
   if (toolName !== "Bash" || !toolInput || typeof toolInput !== "object") return false;
   const command = (toolInput as Record<string, unknown>).command;

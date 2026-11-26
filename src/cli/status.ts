@@ -31,7 +31,7 @@ export interface StatusReport {
     failing: number;
     upcoming: Array<{ name: string; nextRunAt: number }>;
     /**
-     * Set when jobs.json exists but could not be read. The counts are then
+     * Set when the cron store could not be read. The counts are then
      * zero because nothing could be counted — which is NOT the same as a
      * store with no jobs, so it is reported separately.
      */
@@ -147,7 +147,7 @@ export function renderStatusReport(r: StatusReport, now = Date.now()): string {
   lines.push("");
   if (r.cron.unreadable) {
     lines.push(`Scheduled tasks: store unreadable (${r.cron.unreadable})`);
-    lines.push("  fix or remove the file; the daemon recreates it empty");
+    lines.push("  `tomo cron list` says why; nothing is reported as \"none\" while it cannot be read");
   } else if (r.cron.total === 0) {
     lines.push("Scheduled tasks: none");
   } else {

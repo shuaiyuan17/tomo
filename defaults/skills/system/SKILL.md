@@ -58,8 +58,7 @@ The `tomo cron list / add / remove` CLI is still here for human debugging (audit
 | `~/.tomo/workspace/AGENT.md` | Operating rules |
 | `~/.tomo/workspace/IDENTITY.md` | Identity and preferences |
 | `~/.tomo/data/sessions/` | Transcript logs and session registry |
-| `~/.tomo/data/tomo.db` | SQLite database (pending prompt notes). Read with `tomo db dump <table>` / `tomo db check`; never write it directly |
-| `~/.tomo/data/cron/jobs.json` | Scheduled tasks |
+| `~/.tomo/data/tomo.db` | SQLite database (pending prompt notes, scheduled tasks). Read with `tomo db dump <table>` / `tomo db check`; never write it directly |
 | `~/.tomo/logs/tomo.log` | Daemon logs |
 
 ## Config file

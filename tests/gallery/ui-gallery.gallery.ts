@@ -304,7 +304,7 @@ async function boot(options: { conversation: boolean }): Promise<void> {
   watchBus.reset();
   mockConfig.identities = [{ name: "owner", channels: { telegram: "test-owner" }, replyPolicy: "last-active" }];
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
-  const cronStorePath = seedWorkspace(store);
+  const cronDbPath = seedWorkspace(store);
   if (options.conversation) seedConversation(store);
   const theAgent = agent = new Agent();
   const theHome = home = new HomeService({ workspaceDir: mockConfig.workspaceDir, lastGoodPath: join(mockConfig.tomoHome, "data", "home", "last-good.json"), debounceMs: 20, pollMs: 100 });
@@ -324,7 +324,7 @@ async function boot(options: { conversation: boolean }): Promise<void> {
     uploads: { dir: uploadsDir(mockConfig.tomoHome), workspaceDir: mockConfig.workspaceDir },
     subsessions: theAgent.webSubsessions(),
   });
-  supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0, cronStorePath,
+  supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0, cronDbPath,
     // What the owner's live session reports: one failed, one waiting on sign-in, the in-process server fine.
     mcpStatus: async () => [{ key: "dm:owner", connections: [{ name: "docs", status: "failed" }, { name: "calendar", status: "needs-auth" },
       { name: "notes", status: "connected" }, { name: "tomo-internal", status: "connected" }] }],

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
@@ -348,7 +348,7 @@ describe("the owner DM exists from the start and every channel binds to it", () 
 
 describe("adoption is one-time and carries the session's cron jobs and model override", () => {
   const RAW = `telegram:${TG_ID}`;
-  const jobsPath = () => join(mockConfig.tomoHome, "data", "cron", "jobs.json");
+  const jobsPath = () => mockConfig.dbPath;
   function seedPreIdentityInstall(): void {
     // A pre-July install adopted by rule 4: owner "owner" bound to the single
     // Telegram DM allowlist entry; its history, a cron job and a model
@@ -365,7 +365,9 @@ describe("adoption is one-time and carries the session's cron jobs and model ove
     const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     store.setSdkSessionId(RAW, SDK_ID);
     store.append(RAW, { role: "user", content: "pre-identity history", timestamp: 1, channel: "telegram" });
-    mkdirSync(join(mockConfig.tomoHome, "data", "cron"), { recursive: true });
+    // An old jobs file another test left would hold every cron call until a
+    // daemon start imports it; this install's jobs are already in the database.
+    rmSync(join(mockConfig.tomoHome, "data", "cron", "jobs.json"), { force: true });
     const cron = new CronStore(jobsPath());
     cron.add({ name: "morning", schedule: { kind: "cron", expr: "0 9 * * *" }, message: "m", sessionKey: RAW });
     cron.add({ name: "group", schedule: { kind: "cron", expr: "0 9 * * *" }, message: "m", sessionKey: "telegram:-100555" });

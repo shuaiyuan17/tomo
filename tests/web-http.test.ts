@@ -43,7 +43,7 @@ beforeEach(async () => {
   store.touchSession("dm:peer");
   channel = new WebChannel(owner); handoff = vi.fn(async () => true); channel.onMessage(handoff);
   web = await startWebService({ accessToken, externalOrigin, now: () => now, assetsDir, uploadsDir: join(root, "uploads"),
-    data: new WebData({ sessionsDir, sdkSessionsDir, owner, cronStorePath: join(root, "jobs.json") }),
+    data: new WebData({ sessionsDir, sdkSessionsDir, owner, cronDbPath: join(root, "jobs.json") }),
     subscribe: (fn) => channel.events.subscribe(fn), rpc: async (input) => {
       if ("epoch" in input) writeRpcs.push(input.method);
       if (input.method === "epoch") return channel.events.epoch;

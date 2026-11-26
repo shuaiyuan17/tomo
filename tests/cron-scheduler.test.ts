@@ -5,8 +5,8 @@ import { log } from "../src/logger.js";
 import { parseTomoEvent } from "../src/tomo-event.js";
 import { watchBus } from "../src/watch/bus.js";
 import type { Agent } from "../src/agent.js";
-import { cronBodies as bodies, editJobs, hangingAgent, makeJobsDue as makeDue, tick, tickSettles, waitFor } from "./helpers/cron.js";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { breakStore, cronBodies as bodies, editJobs, hangingAgent, repairStore, makeJobsDue as makeDue, tick, tickSettles, waitFor } from "./helpers/cron.js";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -22,7 +22,7 @@ vi.mock("../src/logger.js", () => ({
 const TEST_DIR = mkdtempSync(join(tmpdir(), "tomo-test-cron-scheduler-"));
 // The root is unique to this run, so nothing else will clean it up.
 afterAll(() => rmSync(TEST_DIR, { recursive: true, force: true }));
-const TEST_PATH = join(TEST_DIR, "jobs.json");
+const TEST_PATH = join(TEST_DIR, "data", "tomo.db");
 
 /**
  * Move the clock past the owner-report retry delay. Only `Date` is faked, so
@@ -604,13 +604,12 @@ describe("CronScheduler", () => {
     const first = hangingAgent();
     void tick(new CronScheduler(first.agent, storeA));
     await waitFor(() => expect(first.calls).toHaveLength(1));
-    const goodFile = readFileSync(TEST_PATH, "utf-8");
 
     // Daemon 2 comes up while the store is unreadable. A read error must not
     // be read as "no jobs": that would let recovery report success with
     // nothing to recover, latch, and then fire the interrupted job unmarked
     // as soon as the file came back.
-    writeFileSync(TEST_PATH, "{ this is not json");
+    const broken = breakStore(TEST_PATH);
     const second = hangingAgent();
     const schedulerB = new CronScheduler(second.agent, new CronStore(TEST_PATH));
 
@@ -620,11 +619,11 @@ describe("CronScheduler", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(second.calls).toHaveLength(0);
     // ...and nothing overwrote the file we could not read.
-    expect(readFileSync(TEST_PATH, "utf-8")).toBe("{ this is not json");
+    expect(readFileSync(broken, "utf-8")).toBe("{ this is not json");
 
     // The file is readable again: recovery lands, settles the interrupted
     // run, and the job is NOT re-fired.
-    writeFileSync(TEST_PATH, goodFile);
+    repairStore(TEST_PATH);
     await tick(schedulerB);
     expect(second.calls).toHaveLength(0);
     expect(new CronStore(TEST_PATH).list()[0].lastStatus).toBe("interrupted");

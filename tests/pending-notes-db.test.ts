@@ -132,6 +132,29 @@ describe("importing _pending_notes.json", () => {
   });
 });
 
+describe("outside the daemon (no maintenance)", () => {
+  it("a store that finds the old file not yet imported refuses, and leaves the file for the daemon", () => {
+    const dir = freshDir();
+    const text = writeLegacy(dir, { "dm:alice": ["not yet imported"] });
+    const cli = makeSessionStore(dir, { dbMaintenance: false });
+    expect(() => cli.getPendingNotes("dm:alice")).toThrow(/has not been imported/);
+    expect(() => cli.setPendingNotes("dm:alice", [])).toThrow(/has not been imported/);
+    expect(readFileSync(legacy(dir), "utf8")).toBe(text);
+    // The daemon's store imports it.
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["not yet imported"]);
+    expect(makeSessionStore(dir, { dbMaintenance: false }).getPendingNotes("dm:alice")).toEqual(["not yet imported"]);
+  });
+
+  it("a store that finds the database damaged throws and moves nothing", () => {
+    const dir = freshDir();
+    writeFileSync(join(dir, "tomo.db"), "not a database ".repeat(300));
+    const cli = makeSessionStore(dir, { dbMaintenance: false });
+    expect(() => cli.getPendingNotes("dm:alice")).toThrow(/damaged/);
+    expect(readFileSync(join(dir, "tomo.db"), "utf8")).toBe("not a database ".repeat(300));
+    expect(filesLike(dir, "tomo.db.corrupt-")).toEqual([]);
+  });
+});
+
 describe("one row per note", () => {
   it("a write for one session never touches another's (#649)", () => {
     const dir = freshDir();

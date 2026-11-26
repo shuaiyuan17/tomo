@@ -45,16 +45,24 @@ export type MoveOutcome = "moved" | "taken" | "gone";
  * The database opens lazily, on the first note read or write; a store that
  * never touches notes (`tomo status`) never opens it. When it cannot be opened
  * every call throws and the queue keeps the notes in memory (its own fallback).
+ *
+ * MAINTENANCE IS THE DAEMON'S. Importing the old file and copying a damaged
+ * database aside happen only in a store built with `maintenance` (the
+ * daemon's, opened at start). Another process (a CLI re-key) that finds the
+ * old file not yet imported, or a damaged database, throws and leaves both
+ * for the daemon: two processes doing either at once could each act on what
+ * the other is halfway through changing.
  */
 export class PendingNotesStore {
   private db: TomoDb | null = null;
+  private unreadable: unknown = null;
   /** Told after a file or database was moved aside (a marker already names it). */
   onQuarantined?: (aside: string) => void;
 
   constructor(
     private readonly sessionsDir: string,
     readonly dbPath: string,
-    private readonly opts: { readOnly: boolean; move: (from: string, to: string) => MoveOutcome },
+    private readonly opts: { readOnly: boolean; maintenance: boolean; move: (from: string, to: string) => MoveOutcome },
   ) {}
 
   private get legacyPath(): string {
@@ -70,10 +78,14 @@ export class PendingNotesStore {
     if (this.db) return this.db;
     const db = openTomoDb(this.dbPath, {
       readOnly: this.opts.readOnly,
+      quarantine: this.opts.maintenance && !this.opts.readOnly,
       onQuarantined: (aside) => this.tell(aside),
     });
     try {
-      if (!this.opts.readOnly) this.importLegacy(db);
+      if (this.opts.maintenance && !this.opts.readOnly) this.importLegacy(db);
+      else if (!this.opts.readOnly && existsSync(this.legacyPath)) {
+        throw new Error(`${this.legacyPath} has not been imported into the database yet; Tomo imports it when it starts`);
+      }
     } catch (err) {
       db.close();
       throw err;
@@ -128,32 +140,40 @@ export class PendingNotesStore {
   // --- Legacy file import ---
 
   private importLegacy(db: TomoDb): void {
-    let raw: Buffer;
-    try {
-      raw = readFileSync(this.legacyPath);
-    } catch (err) {
-      if (isEnoent(err)) return;
-      this.quarantineLegacy(err);
-      return;
-    }
-    let notes: Record<string, string[]>;
-    try {
-      notes = parsePendingNotesFile(raw);
-    } catch (err) {
-      this.quarantineLegacy(err);
-      return;
-    }
-    const digest = createHash("sha256").update(raw).digest("hex");
-    const outcome = db.transaction(() => {
+    // Read inside the write transaction: what is imported is what the file
+    // held while nobody else could write the table.
+    const outcome = db.transaction((): { notes: Record<string, string[]>; displaced: number } | "none" | "unreadable" | "pending" => {
+      let raw: Buffer;
+      try {
+        raw = readFileSync(this.legacyPath);
+      } catch (err) {
+        if (isEnoent(err)) return "none";
+        this.unreadable = err;
+        return "unreadable";
+      }
+      let notes: Record<string, string[]>;
+      try {
+        notes = parsePendingNotesFile(raw);
+      } catch (err) {
+        this.unreadable = err;
+        return "unreadable";
+      }
+      const digest = createHash("sha256").update(raw).digest("hex");
       const prev = db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", IMPORT_PENDING_KEY);
-      if (prev?.value === digest) return null;
+      if (prev?.value === digest) return "pending";
       const displaced = Number(db.get<{ n: number }>("SELECT count(*) AS n FROM pending_notes")?.n ?? 0);
       db.run("DELETE FROM pending_notes");
       for (const [key, list] of Object.entries(notes)) writeNotes(db, key, list);
       db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", IMPORT_PENDING_KEY, digest);
-      return { displaced };
+      return { notes, displaced };
     });
-    if (outcome) {
+    if (outcome === "none") return;
+    if (outcome === "unreadable") {
+      this.quarantineLegacy(this.unreadable);
+      return;
+    }
+    if (typeof outcome === "object") {
+      const { notes } = outcome;
       const count = Object.values(notes).reduce((n, list) => n + list.length, 0);
       log.info({ file: this.legacyPath, sessions: Object.keys(notes).length, notes: count }, "Imported the pending notes file into the database");
       if (outcome.displaced > 0) {
@@ -296,20 +316,24 @@ export function parsePendingNotesFile(raw: Buffer): Record<string, string[]> {
 }
 
 /**
- * Move every note out of the database into the legacy file at `out` (the
- * rollback path): the file is written and fsynced first, then the table
- * emptied in one transaction, so the notes are never only in neither place.
- * Returns how many were moved.
+ * Write every note to the legacy file at `out`. With `clear` (the rollback
+ * path) they are MOVED: the read, the file write (fsynced) and the emptying
+ * of the table are one write transaction, so a note committed by a running
+ * daemon meanwhile waits for it and stays in the table, and a failed file
+ * write empties nothing. Returns how many notes were written.
  */
 export function exportPendingNotesToFile(db: TomoDb, out: string, opts: { clear: boolean }): number {
-  const notes = readAllNotes(db);
-  const file: PendingNotesFile = { version: 1, notes };
-  writeJsonAtomicSync(out, file, { fsync: true });
-  if (opts.clear) {
-    db.transaction(() => {
-      db.run("DELETE FROM pending_notes");
-      db.run("DELETE FROM meta WHERE key = ?", IMPORT_PENDING_KEY);
-    });
-  }
-  return Object.values(notes).reduce((n, list) => n + list.length, 0);
+  const write = (): number => {
+    const notes = readAllNotes(db);
+    const file: PendingNotesFile = { version: 1, notes };
+    writeJsonAtomicSync(out, file, { fsync: true });
+    return Object.values(notes).reduce((n, list) => n + list.length, 0);
+  };
+  if (!opts.clear) return write();
+  return db.transaction(() => {
+    const count = write();
+    db.run("DELETE FROM pending_notes");
+    db.run("DELETE FROM meta WHERE key = ?", IMPORT_PENDING_KEY);
+    return count;
+  });
 }

@@ -139,6 +139,16 @@ describe("tomo db export pending-notes (the rollback path)", () => {
     expect(existsSync(legacyFile)).toBe(false);
   });
 
+  it("refuses a damaged database rather than moving it aside and exporting an empty one", async () => {
+    mkdirSync(join(paths.tomoHome, "data"), { recursive: true });
+    writeFileSync(dbPath, "garbage ".repeat(600));
+    const r = await run(["export", "pending-notes"]);
+    expect(r.exitCodes).toEqual([1]);
+    expect(r.errors.join("\n")).toMatch(/damaged/);
+    expect(existsSync(legacyFile)).toBe(false);
+    expect(readFileSync(dbPath, "utf8")).toBe("garbage ".repeat(600));
+  });
+
   it("copies (never empties) a database named with --from, or into a file named with --out", async () => {
     store().setPendingNotes("dm:alice", ["rescued"]);
     const out = join(paths.home, "rescued.json");

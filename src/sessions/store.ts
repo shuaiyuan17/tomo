@@ -339,6 +339,9 @@ export class SessionStore {
       readOnly?: boolean;
       /** Tomo's database (pending notes live there). Defaults to `RuntimePaths.dbPath`. */
       dbPath?: string;
+      /** The daemon's store: imports the old pending notes file and copies a
+       *  damaged database aside (see PendingNotesStore). Off for every other process. */
+      dbMaintenance?: boolean;
       /**
        * How long to wait for each cross-process lock before giving up. The
        * defaults are the constants above; tests that hold a lock on purpose
@@ -355,6 +358,7 @@ export class SessionStore {
     this.sdkSessionsDir = sdkSessionsDir;
     this.pendingNotes = new PendingNotesStore(dir, opts?.dbPath ?? defaultRuntimePaths.dbPath, {
       readOnly: this.readOnly,
+      maintenance: opts?.dbMaintenance === true,
       move: (from, to) => this.moveWithoutClobber(from, to),
     });
     this.tailLimit = opts?.tailMessages ?? Math.max(TRANSCRIPT_TAIL_MIN, historyLimit * 10);

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { closeSync, constants, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { withFileLockSync } from "../file-lock.js";
 import { dirname } from "node:path";
 import { writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
@@ -27,10 +27,11 @@ export type { SqliteValue } from "./sqlite.js";
  * - A forward-only schema migration keyed on `PRAGMA user_version`, each step
  *   in its own transaction. A database newer than this code is refused.
  * - A `quick_check` on every writable open. A database that fails it, or is
- *   not a database at all, is moved aside unchanged (with its -wal/-shm) as
- *   `tomo.db.corrupt-<ts>` and a fresh one started; the marker beside it
- *   names the copy until the owner has been told. Never repaired in place,
- *   never read as empty and written over.
+ *   not a database at all, is never repaired in place nor read as empty and
+ *   written over. The daemon (the only opener with `quarantine`) copies it
+ *   aside unchanged with its log as `tomo.db.corrupt-<ts>` and starts a fresh
+ *   one; the marker beside it names the copy until the owner has been told.
+ *   Every other opener gets a DbDamagedError and leaves it for the daemon.
  *
  * This is the only module that talks to `node:sqlite`; nothing else should
  * hold a raw handle.
@@ -66,7 +67,14 @@ export interface OpenOptions {
   migrations?: readonly Migration[];
   /** Read-only opens only: do not refuse a schema newer than this code (`tomo db check`). */
   allowNewerSchema?: boolean;
-  /** Told after a damaged database was moved aside (the marker already names it). */
+  /**
+   * Copy a damaged database aside and start a fresh one (see quarantineDb).
+   * Only the daemon sets this, when it opens the database at start: with
+   * several processes free to do it, one could move the file while another
+   * is opening or using it. Anyone else gets a DbDamagedError.
+   */
+  quarantine?: boolean;
+  /** Told after a damaged database was copied aside (the marker already names it). */
   onQuarantined?: (aside: string) => void;
   /** Busy timeout override (tests that hold a lock on purpose). */
   busyTimeoutMs?: number;
@@ -218,9 +226,10 @@ function migrate(db: TomoDb, migrations: readonly Migration[]): void {
  * Open Tomo's database at `path`, creating it (and its directory) when
  * missing. See {@link TomoDb} for what every connection is set up with.
  *
- * A damaged file is moved aside and a fresh one started (writable opens
- * only); a read-only open, or a file that cannot be moved, throws instead —
- * nothing is ever written over a database that might still hold data.
+ * A damaged file is copied aside and a fresh one started only with
+ * `quarantine` (the daemon); any other open, or a copy that cannot complete,
+ * throws instead — nothing is ever written over a database that might still
+ * hold data.
  */
 export function openTomoDb(path: string, opts: OpenOptions = {}): TomoDb {
   const migrations = opts.migrations ?? TOMO_DB_MIGRATIONS;
@@ -238,7 +247,10 @@ export function openTomoDb(path: string, opts: OpenOptions = {}): TomoDb {
   }
 
   mkdirSync(dirname(path), { recursive: true });
-  const quarantine = (err: unknown, checked: string | null): void => {
+  const damaged = (err: unknown, checked: string | null): void => {
+    // Only the process that owns maintenance (the daemon, at start) moves a
+    // damaged file; anyone else stops here and leaves it for that one.
+    if (!opts.quarantine) throw new DbDamagedError(path, err);
     const aside = quarantineDb(path, err, checked);
     if (aside === null) return; // another process moved it first
     try {
@@ -249,26 +261,27 @@ export function openTomoDb(path: string, opts: OpenOptions = {}): TomoDb {
   };
   // CHECKED READ-ONLY FIRST. A writable connection to a damaged file is not
   // harmless: it can rewrite or drop a -wal it does not like, and closing it
-  // checkpoints the log into the database. A read-only one changes nothing, so
-  // what is moved aside is byte for byte what was there. When the read-only
-  // check cannot run at all (no -shm to read, say) the writable open checks.
+  // checkpoints the log into the database. A read-only one leaves the -wal and
+  // the main file as they are, so what is copied aside is what was there. When
+  // the read-only check cannot run at all (no -shm to read, say) the writable
+  // open checks instead.
   let checked = false;
   const identity = fileIdentity(path);
   if (identity !== null) {
     let ro: SqliteDatabase | null = null;
+    let failure: unknown = null;
     try {
       ro = connect(path, { ...opts, readOnly: true });
       assertSound(ro, path);
       checked = true;
     } catch (err) {
-      if (isCorruptionError(err)) {
-        ro?.close();
-        ro = null;
-        quarantine(err, identity);
-        checked = true;
-      }
+      if (isCorruptionError(err)) failure = err;
     } finally {
       ro?.close();
+    }
+    if (failure !== null) {
+      damaged(failure, identity);
+      checked = true;
     }
   }
   const attempt = (check: boolean): TomoDb => {
@@ -288,8 +301,17 @@ export function openTomoDb(path: string, opts: OpenOptions = {}): TomoDb {
     return attempt(!checked);
   } catch (err) {
     if (!isCorruptionError(err)) throw err;
-    quarantine(err, before);
+    damaged(err, before);
     return attempt(true);
+  }
+}
+
+/** The database is damaged and this opener does not move it aside (see `OpenOptions.quarantine`). */
+export class DbDamagedError extends Error {
+  readonly errcode = SQLITE_CORRUPT;
+  constructor(readonly path: string, cause: unknown) {
+    super(`${path} is damaged (${(cause as Error)?.message ?? cause}); Tomo moves it aside when it next starts. \`tomo db check\` shows the damage.`, { cause });
+    this.name = "DbDamagedError";
   }
 }
 
@@ -342,22 +364,22 @@ export function fileIdentity(path: string): string | null {
 }
 
 /**
- * Move a damaged database and its sidecars aside unchanged, as
- * `<path>.corrupt-<ts>` (+ `-wal`/`-journal`/`-shm`, so `sqlite3 <aside>`
- * still sees the log), with the marker naming it written first.
+ * Copy a damaged database and its log aside, as `<path>.corrupt-<ts>`
+ * (+ `-wal`/`-journal`, so `sqlite3 <aside>` still sees the log), then remove
+ * the originals so a fresh database can start.
  *
- * ONE PROCESS AT A TIME, AND ONLY THE FILE THAT WAS CHECKED. Two processes can
- * both find the file damaged; without the lock and the identity check the
- * second would move aside the fresh database the first just created (and
- * the first would go on writing to a file nobody opens again). Returns null
- * when the file is no longer the one that failed (someone else moved it).
+ * COPY, FSYNC, MARK, THEN DELETE. A crash at any point leaves a complete copy
+ * or the untouched originals, never a database separated from its committed
+ * log: the copies are whole and on disk before the marker names them, and the
+ * marker is on disk before any original goes. The log is deleted before the
+ * main file (a -wal left beside a fresh database would be replayed into it);
+ * a crash between the two leaves the damaged main file, which the next start
+ * finds and copies aside again. `-shm` is only an index and is not copied.
  *
- * THE LOG GOES FIRST. `-wal` (or a hot `-journal`) can hold committed data
- * the main file does not have yet, so it is moved before the main file, and
- * anything already moved is put back when a later step fails: either the
- * whole family is aside, or none of it is and this throws (nothing may be
- * created over it then). `-shm` is only an index SQLite rebuilds from the
- * log; one that will not move is deleted. Exported for tests.
+ * Under a lock, and only while the file is still the one that failed the
+ * check (`checked`, its dev:ino): returns null when it is not (someone else
+ * already moved it). Throws when it cannot complete; nothing may be created
+ * over the originals then. Exported for tests.
  */
 export function quarantineDb(path: string, cause: unknown, checked: string | null): string | null {
   return withFileLockSync(`${path}.quarantine.lock`, () => {
@@ -366,44 +388,43 @@ export function quarantineDb(path: string, cause: unknown, checked: string | nul
     for (let n = 0; n < 100; n++) {
       const aside = n === 0 ? `${path}.corrupt-${ts}` : `${path}.corrupt-${ts}-${n}`;
       if (dbFamily(aside).some((p) => existsSync(p))) continue;
-      const marker = dbQuarantineMarkerPath(path);
+      const copied: string[] = [];
+      try {
+        for (const suffix of ["", "-wal", "-journal"]) {
+          if (!existsSync(`${path}${suffix}`)) continue;
+          copyFileSync(`${path}${suffix}`, `${aside}${suffix}`, constants.COPYFILE_EXCL);
+          copied.push(`${aside}${suffix}`);
+          fsyncPath(`${aside}${suffix}`);
+        }
+        fsyncPath(dirname(path));
+      } catch (err) {
+        for (const p of copied) rmSync(p, { force: true });
+        throw new Error(`Database ${path} is damaged and could not be copied aside`, { cause: err });
+      }
       const before = quarantinedDbs(path);
-      writeJsonAtomicSync(marker, { asides: [...(before ?? []), aside] }, { fsync: true });
-      const moved: Array<[string, string]> = [];
-      try {
-        for (const suffix of ["-wal", "-journal", ""]) {
-          const from = `${path}${suffix}`;
-          if (!existsSync(from)) continue;
-          renameSync(from, `${aside}${suffix}`);
-          moved.push([from, `${aside}${suffix}`]);
-        }
-      } catch (err) {
-        for (const [from, to] of moved.reverse()) {
-          try {
-            renameSync(to, from);
-          } catch (backErr) {
-            log.error({ err: backErr, from: to, to: from }, "Could not put a database file back after a failed quarantine");
-          }
-        }
+      writeJsonAtomicSync(dbQuarantineMarkerPath(path), { asides: [...(before ?? []), aside] }, { fsync: true });
+      for (const suffix of ["-wal", "-journal", "", "-shm"]) {
         try {
-          if (before === undefined) unlinkSync(marker);
-          else writeJsonAtomicSync(marker, { asides: before }, { fsync: true });
-        } catch (markerErr) {
-          if (!isEnoent(markerErr)) log.warn({ err: markerErr }, "Could not restore the database quarantine marker");
-        }
-        throw new Error(`Database ${path} is damaged and could not be moved aside`, { cause: err });
-      }
-      try {
-        renameSync(`${path}-shm`, `${aside}-shm`);
-      } catch (err) {
-        if (!isEnoent(err)) {
-          log.warn({ err, file: `${path}-shm` }, "Could not move the database's -shm index aside; removing it (SQLite rebuilds it)");
-          unlinkSync(`${path}-shm`);
+          unlinkSync(`${path}${suffix}`);
+        } catch (err) {
+          if (!isEnoent(err)) throw new Error(`Copied the damaged database ${path} aside to ${aside} but could not remove ${path}${suffix}`, { cause: err });
         }
       }
-      log.error({ err: cause, file: path, aside }, "Database failed its check; moved it aside unchanged and started a fresh one");
+      log.error({ err: cause, file: path, aside }, "Database failed its check; copied it aside unchanged and started a fresh one");
       return aside;
     }
-    throw new Error(`No free name to move the damaged database ${path} aside`, { cause });
+    throw new Error(`No free name to copy the damaged database ${path} aside`, { cause });
   });
+}
+
+function fsyncPath(path: string): void {
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, "r");
+    fsyncSync(fd);
+  } catch {
+    /* advisory where the filesystem refuses (a directory on some systems) */
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
 }

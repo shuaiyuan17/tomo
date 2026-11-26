@@ -272,7 +272,7 @@ export class Agent {
   private mcpSweepInFlight: Promise<void> | undefined;
 
   constructor() {
-    this.sessions = new SessionStore(config.sessionsDir, config.historyLimit, config.sdkSessionsDir, { dbPath: config.dbPath });
+    this.sessions = new SessionStore(config.sessionsDir, config.historyLimit, config.sdkSessionsDir, { dbPath: config.dbPath, dbMaintenance: true });
     this.ownerAdoption = new OwnerAdoption(this.sessions, this.modelOverrides);
     this.contextNudger = new ContextNudger(
       this.sessions,

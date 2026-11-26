@@ -9,7 +9,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/a
 vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
 
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
-import { installAgentTestHooks, mockConfig, resetConfig } from "./helpers/agent-harness.js";
+import { installAgentTestHooks, mockConfig, mockWorkspace, resetConfig } from "./helpers/agent-harness.js";
 import { buildHooksOption, buildSdkEnv, makeTurnBudget, sdkOptions } from "../src/agent/sdk-options.js";
 import { TOMO_SESSION_KEY_ENV } from "../src/restart-reason.js";
 
@@ -181,6 +181,21 @@ describe("sdkOptions: the serving model, named in the system prompt", () => {
     resetConfig(config);
     const prompt = (sdkOptions(internalServer, undefined, undefined, { sessionKey: "dm:shuai" }).systemPrompt as unknown as string[]).join("\n\n");
     for (const text of contains) expect(prompt).toContain(text);
+  });
+});
+
+describe("sdkOptions: the delegation note follows subsessions.enabled", () => {
+  it.each([true, false])("subsessions.enabled %s reaches buildSystemPrompt; a task session builds its own prompt", (enabled) => {
+    resetConfig({ subsessions: { ...mockConfig.subsessions, enabled } });
+    mockWorkspace.lastBuildOptions = undefined;
+    sdkOptions(internalServer, undefined, undefined, { sessionKey: "dm:shuai" });
+    expect(mockWorkspace.lastBuildOptions).toMatchObject({ isGroup: false, subsessions: enabled });
+    mockWorkspace.lastBuildOptions = undefined;
+    sdkOptions(internalServer, undefined, undefined, {
+      sessionKey: "task:s1",
+      subsession: { staticPrompt: "task prompt", maxTurns: 10, groupScope: false } as never,
+    });
+    expect(mockWorkspace.lastBuildOptions).toBeUndefined();
   });
 });
 

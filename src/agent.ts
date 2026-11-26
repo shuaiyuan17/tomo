@@ -428,7 +428,7 @@ export class Agent {
         this.liveSessionManager.hotMountExternalMcpServer(serverName, server),
     });
     this.liveSessionManager = new LiveSessionManager({
-      buildIdentityPrompt: () => buildIdentityPrompt(),
+      buildIdentityPrompt: () => buildIdentityPrompt({ subsessions: config.subsessions.enabled }),
       promptContextSnapshot: (key, { strict }) => promptContextSnapshot({ isGroup: isGroupSessionKey(key), strict }),
       getSdkSessionId: (key) => this.sessions.getSdkSessionId(key),
       setSdkSessionId: (key, sessionId) => this.sessions.setSdkSessionId(key, sessionId),

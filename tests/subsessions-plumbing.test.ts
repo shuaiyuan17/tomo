@@ -21,6 +21,7 @@ import { SubsessionService } from "../src/agent/subsessions/service.js";
 import { buildTaskOwnerTools, buildTaskSelfTools, SUBSESSION_SELF_TOOL_NAMES, SUBSESSION_TASK_TOOL_NAMES } from "../src/mcp/subsession-tools.js";
 import { DEFAULT_SUBSESSIONS } from "../src/config.js";
 import { formatTomoEvent, isOwnerAudienceNote, markOwnerAudience } from "../src/tomo-event.js";
+import { buildIdentityPrompt, buildSystemPrompt, DELEGATION_NOTE } from "../src/workspace/index.js";
 
 describe("task: session keys", () => {
   it("are their own kind: not a DM, not a group, not a raw channel key", () => {
@@ -240,10 +241,26 @@ describe("sub-session tools", () => {
     expect(svc.get("s1")?.ownerAction).toBeUndefined();
   });
 
-  it("task_spawn tells the model to tell the owner before starting a task on its own", () => {
+  it("the delegation note is in the owner's DM prompt only with sub-sessions on, never a group's (a task's: sdk-options.test)", () => {
+    expect(buildSystemPrompt({ subsessions: true })).toContain(DELEGATION_NOTE);
+    expect(buildIdentityPrompt({ subsessions: true })).toContain(DELEGATION_NOTE);
+    expect(buildSystemPrompt({ subsessions: false })).not.toContain("task_spawn");
+    expect(buildSystemPrompt({ isGroup: true, subsessions: true })).not.toContain("task_spawn");
+    expect(buildIdentityPrompt({ subsessions: false })).not.toContain("task_spawn");
+  });
+
+  it("task_spawn's description says how to use it; when to use it is the owner prompt's DELEGATION_NOTE, said once", () => {
     const tools = buildTaskOwnerTools({ service: () => undefined, scope: () => "dm:owner" });
     const description = (tools.find((t) => t.name === "task_spawn") as unknown as { description: string }).description;
-    expect(description).toMatch(/on your own[^.]*must tell the owner first/);
+    expect(description).toContain("`brief` must say everything it needs");
+    expect(description).not.toMatch(/quick question|tell the owner first|silently/);
+    expect(DELEGATION_NOTE).toMatch(/Before you call `task_spawn`, tell the owner in a line what you're starting \(and why, if they didn't ask for one\)/);
+    // Long AND briefable; a follow-up alone is no reason; connectors keep work here whatever its length.
+    expect(DELEGATION_NOTE).toMatch(/only when it is long[^.]*and you can brief it self-contained/);
+    expect(DELEGATION_NOTE).toMatch(/A likely follow-up alone is no reason/);
+    expect(DELEGATION_NOTE).toMatch(/connectors or external MCP servers stays here however long it runs/);
+    // The prompt is per session, the audience per turn: a summoned group's turn on the DM session is told here.
+    expect(DELEGATION_NOTE).toMatch(/Only in a turn the owner wrote privately: `task_spawn` refuses a turn a group steers/);
   });
 
   it("refuses a turn that may not manage sub-sessions", async () => {

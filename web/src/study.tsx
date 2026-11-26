@@ -51,7 +51,7 @@ export function Study({ page, onPage, session, reload, inert, mutator, focus, cr
         {STUDY_PAGES.map((value) => <TabsTrigger key={value} value={value} title={t(INTRO[value], { agent })}
           className="-mb-px h-10 flex-none rounded-none border-0 border-b-2 border-transparent bg-transparent! px-3 text-[13px] font-medium text-muted-foreground shadow-none! hover:text-foreground data-[state=active]:border-primary data-[state=active]:text-foreground dark:data-[state=active]:border-primary">{studyLabel(value)}</TabsTrigger>)}
       </TabsList>
-      <Button variant="ghost" size="icon" className="size-8 shrink-0 rounded-lg text-muted-foreground hover:bg-foreground/[0.07] [&_svg:not([class*='size-'])]:size-4" aria-label={t("refresh")} title={t("refresh")} onClick={() => setLocal((v) => v + 1)}><RefreshCw strokeWidth={1.75} /></Button>
+      <Button variant="ghost" size="icon" className="size-8 shrink-0 rounded-lg text-muted-foreground max-[600px]:size-9 pointer-coarse:size-9 hover:bg-foreground/[0.07] [&_svg:not([class*='size-'])]:size-4" aria-label={t("refresh")} title={t("refresh")} onClick={() => setLocal((v) => v + 1)}><RefreshCw strokeWidth={1.75} /></Button>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto pt-5 pb-10 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]" role="tabpanel" aria-label={studyLabel(page)}>
         {page === "todos" && <Todos reload={key} />}

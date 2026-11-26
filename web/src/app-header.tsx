@@ -20,7 +20,8 @@ interface Toggle { ref: Ref<HTMLButtonElement>; pressed: boolean; onToggle: () =
 
 /**
  * 32px on a desktop, 36px where a finger taps (a phone, or any touch screen), inside the 45px bar;
- * there an invisible 4px margin (::after) still gives each a 44px target.
+ * there an invisible 4px margin (::after) still gives each a 44px target, and the toggles sit 8px
+ * apart so those targets meet without overlapping.
  */
 const touchTarget = "max-[600px]:after:absolute max-[600px]:after:-inset-1 max-[600px]:after:content-[''] pointer-coarse:after:absolute pointer-coarse:after:-inset-1 pointer-coarse:after:content-['']";
 const toggleClass = "relative size-8 rounded-lg text-foreground max-[600px]:size-9 pointer-coarse:size-9 " + touchTarget + " hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-[18px]";
@@ -56,7 +57,7 @@ export function AppHeader({ headerRef, title, menu, chat, tasks, screen, connect
       <Mark className="size-6" /><span>tomo<span className="text-primary">.</span></span></a>
     <span aria-hidden="true" className="h-4 w-px shrink-0 bg-border" />
     <span data-testid="header-title" className="min-w-0 truncate text-[13px] text-muted-foreground" title={title}>{title}</span>
-    <div className="ml-auto flex shrink-0 items-center gap-0.5">
+    <div className="ml-auto flex shrink-0 items-center gap-0.5 max-[600px]:gap-2 pointer-coarse:gap-2">
       {chat && <ToggleButton toggle={chat} controls="conversation" title={t("nav.conversation")} label={chat.unread ? t("header.chatUnread") : t("header.chat")}>
         <MessageCircle strokeWidth={1.75} />
         {chat.unread && <span aria-hidden="true" data-testid="chat-unread" className="absolute top-1 right-1 size-2 rounded-full bg-primary ring-2 ring-background" />}

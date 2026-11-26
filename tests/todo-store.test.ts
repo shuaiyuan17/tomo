@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -207,48 +207,6 @@ describe("session scope", () => {
     expect(titles(OWNER)).toEqual(["owner private errand", "group trip", "other group secret"]);
     // A non-canonical dm key does not get owner powers.
     expect(titles("dm:shuai yuan")).toEqual([]);
-  });
-});
-
-describe("relink (the sub-session link's harness-only write)", () => {
-  const file = () => join(dir, "todos.json");
-
-  it("writes nothing when the item already waits on the same party with the same next step", () => {
-    const item = add({ waiting_on: "owner", next: "Answer the question" });
-    const before = readFileSync(file(), "utf-8");
-    const mtime = statSync(file()).mtimeMs;
-    expect(store.relink(item.id, "owner", "Answer the question", NOW + DAY)).toEqual(item);
-    expect(readFileSync(file(), "utf-8")).toBe(before);
-    expect(statSync(file()).mtimeMs).toBe(mtime);
-  });
-
-  it("moves the review date only when waiting_on changes", () => {
-    const item = add({ waiting_on: "me" });
-    const sameParty = store.relink(item.id, "me", "A new next step", NOW + DAY)!;
-    expect(sameParty).toMatchObject({ next: "A new next step", waiting_on: "me", review_at: item.review_at });
-    expect(sameParty.updated_at).toBe(new Date(NOW + DAY).toISOString());
-
-    const moved = store.relink(item.id, "owner", "Wait for the owner", NOW + 2 * DAY)!;
-    expect(moved.waiting_on).toBe("owner");
-    expect(Date.parse(moved.review_at)).toBe(NOW + 2 * DAY + DEFAULT_TODOS.reviewDaysWaiting * DAY);
-    expect(store.list()).toEqual([moved]);
-  });
-
-  it("answers undefined for an item that is not open, and writes nothing", () => {
-    const item = add();
-    store.resolve(item.id, { action: "done", by: "owner" }, NOW);
-    const before = readFileSync(file(), "utf-8");
-    expect(store.relink(item.id, "owner", "Too late")).toBeUndefined();
-    expect(store.relink("t-99", "owner", "Never existed")).toBeUndefined();
-    expect(readFileSync(file(), "utf-8")).toBe(before);
-  });
-
-  it("holds the next step to the same rules as an add", () => {
-    const item = add();
-    expectRule(() => store.relink(item.id, "me", "y".repeat(DEFAULT_TODOS.nextMaxChars + 1)), /next is 201 characters/);
-    expectRule(() => store.relink(item.id, "me", "  "), /next is required/);
-    expectRule(() => store.relink(item.id, "someone" as never, "x"), /waiting_on must be one of/);
-    expect(store.list()).toEqual([item]);
   });
 });
 

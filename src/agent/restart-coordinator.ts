@@ -3,6 +3,7 @@ import { log } from "../logger.js";
 import {
   consumeRestartRequestFromToolResult,
   drainRestartRequests,
+  restartHelperDisabled,
   restartWorkerInvocation,
   takePendingRestartRequest,
   type RestartRequest,
@@ -135,6 +136,13 @@ export class RestartCoordinator {
   }
 
   private logRestartRequestDiscard(sessionKey: string, discarded: RestartRequestDiscard): void {
+    if (discarded.reason === "missing") {
+      log.warn(
+        { sessionKey, requestId: discarded.requestId },
+        "Restart marker seen but its request file is gone (claimed by another process?)",
+      );
+      return;
+    }
     log.warn(
       {
         sessionKey,
@@ -195,6 +203,10 @@ export class RestartCoordinator {
       } catch (err) {
         log.warn({ err, sessionKey: request.sessionKey }, "Restart claim hook failed");
       }
+    }
+    if (restartHelperDisabled()) {
+      this.reportScheduledRestartFailure(request.sessionKey, "the restart helper is disabled (TOMO_RESTART_HELPER=off)");
+      return;
     }
     const cliPath = process.argv[1];
     if (!cliPath) {

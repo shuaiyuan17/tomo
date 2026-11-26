@@ -313,6 +313,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       ...(ownerSession && agent.subsessions ? buildTaskOwnerTools({
         service: () => agent.subsessions,
         scope: () => (isOwnAudience() ? callerSessionKey : undefined),
+        ownerMessages: () => agent.turnOwnerMessages(callerSessionKey),
       }) : []),
       ...buildPetTools(),
       ...buildLcmTools({
@@ -384,7 +385,7 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
  * A sub-session's server: a whitelist, not the main set minus a few. It
  * reports through its task_* tools, schedules check-backs on its own key,
  * reads the people roster. No send_message (it speaks
- * only to its owning scope, through task_reply, task_notify and task_ask), no memory or people writes,
+ * only to its owning scope, through task_reply and task_ask), no memory or people writes,
  * no todos, no home, no credentials.
  */
 function createSubsessionMcpServer(agent: Agent, taskKey: string): McpSdkServerConfigWithInstance {
@@ -394,7 +395,7 @@ function createSubsessionMcpServer(agent: Agent, taskKey: string): McpSdkServerC
     name: TOMO_INTERNAL_MCP_NAME,
     version: "0.1.0",
     tools: [
-      ...buildTaskSelfTools({ service: () => agent.subsessions, key: taskKey }),
+      ...buildTaskSelfTools({ service: () => agent.subsessions, key: taskKey, ownerMessages: config.subsessions.ownerMessages }),
       // Bound to the task key: a task schedules check-backs on itself only.
       ...buildCronTools(undefined, taskKey),
       // No recall: a task's turns are not recorded in a Tomo transcript (its

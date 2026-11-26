@@ -111,7 +111,14 @@ describe("subsessions", () => {
     const { config, DEFAULT_SUBSESSIONS } = await load({});
     expect(config.subsessions).toEqual(DEFAULT_SUBSESSIONS);
     expect(config.subsessions.enabled).toBe(true);
-    expect(DEFAULT_SUBSESSIONS).toEqual({ enabled: true, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null, mirror: "turn", maxActiveHours: 24, todos: true });
+    expect(DEFAULT_SUBSESSIONS).toEqual({ enabled: true, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null, mirror: "turn", ownerMessages: "via-main", maxActiveHours: 24 });
+  });
+
+  it("sends a task's messages through the main session unless ownerMessages is direct", async () => {
+    expect((await load({ subsessions: { ownerMessages: "direct" } })).config.subsessions.ownerMessages).toBe("direct");
+    const bad = await load({ subsessions: { ownerMessages: "phone" } });
+    expect(bad.config.subsessions.ownerMessages).toBe("via-main");
+    expect(bad.configIssues.join("\n")).toContain("subsessions.ownerMessages");
   });
 
   it("can be turned off, and takes a wall-clock cap (0 = none)", async () => {
@@ -130,8 +137,11 @@ describe("subsessions", () => {
   });
 
   it("takes the Phase 2 keys and refuses a bad mirror mode", async () => {
+    // `todos` (sub-sessions once kept a todo each) is no longer a key: an old file that still has it loads without an issue.
     const { config, configIssues } = await load({ subsessions: { mirror: "lots", maxActiveHours: 0, todos: false } });
-    expect(config.subsessions).toMatchObject({ mirror: "turn", maxActiveHours: 0, todos: false });
+    expect(config.subsessions).toMatchObject({ mirror: "turn", maxActiveHours: 0 });
+    expect(config.subsessions).not.toHaveProperty("todos");
+    expect(configIssues.join("\n")).not.toContain("subsessions.todos");
     expect(configIssues.join("\n")).toContain("subsessions.mirror");
   });
 });

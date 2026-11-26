@@ -382,6 +382,27 @@ describe("SessionStore", () => {
     expect(entry?.stats.totalInputTokens).toBe(20);
   });
 
+  it("keeps the last real window when an estimated reading does not know one (contextMax 0)", () => {
+    const store = makeSessionStore(TEST_DIR);
+    store.setSdkSessionId("telegram:1", "session-1");
+    const turn = { costUsd: 0, inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 10, contextMax: 1_000_000 };
+    store.updateStats("telegram:1", turn);
+    store.updateStats("telegram:1", { ...turn, contextUsed: 15, contextMax: 0, contextEstimated: true });
+    expect(store.getEntry("telegram:1")?.stats).toMatchObject({ contextMax: 1_000_000, contextUsed: 15, contextEstimated: true });
+    store.updateStats("telegram:1", { ...turn, contextMax: 200_000 });
+    expect(store.getEntry("telegram:1")?.stats.contextMax).toBe(200_000);
+  });
+
+  it("charges an outside call (forced-compaction summary) to the totals without touching the context reading or query count", () => {
+    const store = makeSessionStore(TEST_DIR);
+    store.setSdkSessionId("telegram:1", "session-1");
+    store.updateStats("telegram:1", { costUsd: 1, inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 900, contextMax: 1000 });
+    store.addOutsideUsage("telegram:1", { costUsd: 0.5, inputTokens: 150_000, outputTokens: 900, cacheReadTokens: 0, cacheCreationTokens: 0 });
+    expect(store.getEntry("telegram:1")?.stats).toMatchObject({ totalCostUsd: 1.5, totalInputTokens: 150_010, totalQueries: 1, contextUsed: 900 });
+    // On disk, not only in this instance's cache.
+    expect(makeSessionStore(TEST_DIR).getEntry("telegram:1")?.stats).toMatchObject({ totalCostUsd: 1.5, totalInputTokens: 150_010 });
+  });
+
   describe("usage baseline", () => {
     const turn = {
       costUsd: 0.1, inputTokens: 10, outputTokens: 5,

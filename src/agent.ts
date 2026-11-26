@@ -1,6 +1,9 @@
 import { formatDateTime, ownerT, type OwnerText } from "./i18n/index.js";
 import type { Channel, ChannelFaultNotice, IncomingMessage, MessageReaction, StopTyping, StopTypingOptions } from "./channels/types.js";
 import type { CompactReservation } from "./lcm/background-gate.js";
+import { forceCompactSession } from "./lcm/force-compact.js";
+import { sdkForceSummarizer } from "./lcm/force-summarizer.js";
+import { ForceCompactor } from "./agent/force-compactor.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildIdentityPrompt, promptContextSnapshot } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
@@ -17,6 +20,8 @@ import {
   taskSessionKey,
 } from "./sessions/keys.js";
 import { SubsessionService, type OwnerMessageResult, type TaskTurnOutcome } from "./agent/subsessions/service.js";
+import { dropLegacyTaskTodos } from "./agent/subsessions/legacy-todos.js";
+import { TodoStore } from "./todos/store.js";
 import { parseTaskAddress, type TaskAddress } from "./agent/subsessions/address.js";
 import { taskCommandReply } from "./agent/subsessions/commands.js";
 import { SubsessionStore } from "./agent/subsessions/store.js";
@@ -25,8 +30,6 @@ import { resolveModelName } from "./models.js";
 import type { SubsessionRecord } from "./agent/subsessions/types.js";
 import type { WebSubsessionAccess } from "./channels/web.js";
 import { buildSubsessionPrompt } from "./agent/subsessions/prompt.js";
-import { createTodoLink } from "./agent/subsessions/todo-link.js";
-import { TodoStore } from "./todos/store.js";
 import { CRON_STORE_PATH } from "./cron/store.js";
 import { createTaskCronLink } from "./agent/subsessions/cron-link.js";
 import { EFFORT_LEVELS, type EffortLevel } from "./config.js";
@@ -57,7 +60,7 @@ import { log } from "./logger.js";
 import { shortErrorMessage } from "./error-text.js";
 import { SteerDeclinedError, TurnInterruptedError, type QueryResult, type ReplyContext, type TurnRequest } from "./agent/live-session.js";
 import { isSilentReply } from "./agent/text-utils.js";
-import { audienceOf, audienceSwitchNote, TurnAudienceRegistry, type TurnOrigin } from "./agent/audience.js";
+import { audienceOf, audienceSwitchNote, TurnAudienceRegistry, type OwnerTurnMessage, type TurnOrigin } from "./agent/audience.js";
 import { InboundBatcher, type InboundItem } from "./agent/inbound-batcher.js";
 import { formatInterruptedAgentsNotice, isResumable, MAX_AUTO_RESUMES, RunningAgentsLedger, type RunningTaskRecord } from "./agent/running-agents-ledger.js";
 import { DurableInbox, INBOX_STALE_NOT_PROCESSED, restoreMessage, type InboxRecord } from "./agent/durable-inbox.js";
@@ -79,7 +82,7 @@ import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/bl
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { appendToTomoEventBody, formatTomoEvent, markOwnerAudience } from "./tomo-event.js";
-import { UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
+import { USAGE_LEDGER_VERSION, UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
 import { usageDataDir } from "./usage/dir.js";
 import { readSessionWindowPercent } from "./usage/limits-log.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
@@ -138,6 +141,8 @@ const REWIND_SHUTDOWN_TIMEOUT_MS = 3_000;
 const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
 /** How often the interrupted-subagents startup check is retried for sessions whose pending notes could not be read. */
 const INTERRUPTED_AGENTS_RETRY_MS = 60_000;
+/** How soon notes held in memory are written again to the fresh notes file, when that failed. */
+const PENDING_NOTES_REWRITE_RETRY_MS = 60_000;
 /** How soon the owner is told again that the notes file was moved aside, when telling them failed. */
 const PENDING_NOTES_QUARANTINE_NOTICE_RETRY_MS = 60_000;
 /** This process: an interrupted-agents note is about the restart before it.
@@ -154,6 +159,10 @@ const TASK_SEND_SETTLE_MS = 30_000;
 
 /** How much of a stale unmatched reply its warning note quotes. */
 const STALE_REPLY_EXCERPT = 2000;
+
+/** A task-message wake whose turn left the note unread is tried again this soon, this many times. */
+export const MESSAGE_WAKE_RETRY_MS = 60_000;
+export const MESSAGE_WAKE_RETRY_MAX = 5;
 
 export class Agent {
   private channels: Channel[] = [];
@@ -207,6 +216,10 @@ export class Agent {
   private readonly mirrorInFlight = new Set<string>();
   /** Sessions with a mirror wake turn queued: later rounds ride on it. */
   private readonly mirrorWakeQueued = new Set<string>();
+  /** Sessions with a task-message wake turn queued (subsessions.ownerMessages "via-main"). */
+  private readonly messageWakeQueued = new Set<string>();
+  /** Message wakes retried in a row per session, after turns that left the note unread. */
+  private readonly messageWakeRetries = new Map<string, number>();
   private readonly ownerNotices: OwnerNotices;
   private readonly mcpAuthPrompts: McpAuthPrompts;
   private pendingNotesQueue: PendingNotesQueue;
@@ -218,6 +231,8 @@ export class Agent {
   private inbox: DurableInbox | undefined;
   /** Subagents/background commands running per session, mirrored to disk (see running-agents-ledger.ts). */
   private runningAgents: RunningAgentsLedger | undefined;
+  /** The harness compacting a full session itself (lcm.forceCompactAtPct / "Prompt is too long"). */
+  private forceCompactor!: ForceCompactor;
   private detachRunningAgents: (() => void) | undefined;
   /** Throttle for reportInboxFault's owner DM. */
   private lastInboxFaultNoticeAt = 0;
@@ -260,6 +275,9 @@ export class Agent {
   /** Re-runs the interrupted-subagents startup check for sessions whose pending notes could not be read. */
   private interruptedAgentsRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private pendingNotesQuarantineTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Sessions whose notes were held in memory when the notes file was moved aside, not yet written to the fresh one. */
+  private pendingNotesRewritesOwed = new Set<string>();
+  private pendingNotesRewriteTimer: ReturnType<typeof setTimeout> | undefined;
   /** The most recent sweep — awaited (bounded) by stop() so none is abandoned mid-write. */
   private mcpSweepInFlight: Promise<void> | undefined;
 
@@ -290,10 +308,11 @@ export class Agent {
       this.subsessions?.pendingNotesLost();
       queueMicrotask(() => {
         try {
-          this.pendingNotesQueue.persistLoaded();
+          for (const key of this.pendingNotesQueue.persistLoaded()) this.pendingNotesRewritesOwed.add(key);
         } catch (err) {
           log.error({ err }, "Could not write the loaded pending notes to the fresh file");
         }
+        this.retryPendingNotesRewrites();
         this.notePendingNotesQuarantined(aside);
       });
     };
@@ -499,6 +518,7 @@ export class Agent {
         this.handleTurnComplete(key);
       },
       maybeNudgeCompact: (key, ctx) => this.maybeNudgeCompact(key, ctx),
+      onContextOverflow: (key, reading, reason) => this.forceCompactor.maybeStart(key, reading, reason),
       refreshExternalMcpToken: (serverName) => this.mcpOAuthManager
         .refreshServerToken(serverName, config.mcpServers ?? {})
         .catch((err) => {
@@ -506,6 +526,46 @@ export class Agent {
           return "failed" as const;
         }),
       notifyOwner: (text) => this.notifyOwner(text),
+    });
+    this.forceCompactor = new ForceCompactor({
+      hold: (key) => this.liveSessionManager.holdForForceCompact(key),
+      quiesce: (hold, beforeClose) => this.liveSessionManager.quiesceForForceCompact(hold, beforeClose),
+      markInterrupted: (key) => this.runningAgents ? this.runningAgents.markSessionInterrupted(key) : [],
+      sessionClosed: (key) => this.runningAgents?.sessionClosed(key),
+      compact: ({ key, sdkSessionId, contextUsed, contextMax, signal }) => forceCompactSession({
+        sdkSessionId,
+        sdkSessionsDir: config.sdkSessionsDir,
+        sessionsDir: config.sessionsDir,
+        workspaceDir: config.workspaceDir,
+        contextUsed,
+        contextMax,
+        freshTail: config.lcm.dailyFreshTail,
+        summarize: sdkForceSummarizer({
+          model: config.lcm.forceCompactModel,
+          signal,
+          // A separate CLI, outside LiveSession's recorder: its cost lands in
+          // the usage ledger under the session it compacted.
+          onUsage: (u) => {
+            this.sessions.addOutsideUsage(key, {
+              costUsd: u.costUsd, inputTokens: u.tokens.input, outputTokens: u.tokens.output,
+              cacheReadTokens: u.tokens.cacheRead, cacheCreationTokens: u.tokens.cacheCreated,
+            });
+            void this.usageLedger.append({
+            v: USAGE_LEDGER_VERSION, ts: Date.now(), sessionKey: key, source: "background", trigger: "force-compact",
+            ...(u.subtype !== "success" ? { subtype: u.subtype } : {}),
+            costUsd: u.costUsd, tokens: u.tokens,
+            ...(u.durationMs !== undefined ? { durationMs: u.durationMs } : {}),
+            ...(u.numTurns !== undefined ? { numTurns: u.numTurns } : {}),
+            });
+          },
+        }),
+        signal,
+      }),
+      persistedWindow: (key) => this.sessions.getEntry(key)?.stats?.contextMax,
+      queueNote: (key, note) => this.queuePendingNote(key, note),
+      notifyOwner: (text) => this.notifyOwner(text),
+      groupTitle: (key) => this.sessions.getEntry(key)?.chatTitle,
+      reportInterrupted: (key, records) => this.reportForceInterrupted(key, records),
     });
     this.proactive = new ProactiveSendService({
       getChannel: (name) => this.getChannel(name),
@@ -575,10 +635,11 @@ export class Agent {
         const target = this.resolveDeliveryTargetForSession(parentKey, "Sub-session notice");
         if (target) await target.channel.send({ chatId: target.chatId, text });
       },
-      noticeOwner: async (text) => { await this.notifyOwner(text); },
+      noticeOwner: (text) => this.notifyOwner(text),
       // A task owned by the owner's DM speaks for the owner alone: its notes
       // never drain into a summoned group's turn on that session.
       queuePendingNote: (key, note, id) => this.queuePendingNote(key, isDmSessionKey(key) ? markOwnerAudience(note) : note, id),
+      withdrawPendingNote: (key, match) => this.pendingNotesQueue.withdrawNote(key, match),
       hasPendingNote: (key, predicate, whenUnreadable) => this.pendingNotesQueue.hasNote(key, predicate, whenUnreadable),
       persistPendingNotes: (key) => this.pendingNotesQueue.persistNow(key),
       wakeScope: (parentKey, prompt) => {
@@ -604,8 +665,8 @@ export class Agent {
       registryTaskKeys: () => this.sessions.listActiveEntries().map((e) => e.channelKey).filter(isTaskSessionKey),
       isStopping: () => this.stopping,
       sessionQuotaPercent: () => readSessionWindowPercent(join(usageDataDir(config.tomoHome), "limits.ndjson")),
-      ...(config.subsessions.todos ? { todos: createTodoLink(new TodoStore()) } : {}),
       mirrorWake: (parentKey) => this.mirrorWake(parentKey),
+      messageWake: (parentKey) => this.messageWake(parentKey),
     });
   }
 
@@ -648,6 +709,63 @@ export class Agent {
     });
   }
 
+  /**
+   * A silent turn on the owning session for the messages its tasks handed it
+   * (`subsession-message` notes: task_reply / task_ask with
+   * ownerMessages "via-main"). The notes ride in as the turn's pending-notes
+   * prefix; the turn decides whether and how the owner hears them. One
+   * queued at a time per session, and it does not run when another turn has
+   * already read them all. Unlike the mirror wake, not held back at the quota
+   * pause: these are messages for the owner, not a look-along.
+   */
+  private messageWake(parentKey: string): void {
+    if (this.messageWakeQueued.has(parentKey)) return;
+    this.messageWakeQueued.add(parentKey);
+    const prompt = appendToTomoEventBody(formatTomoEvent("subsession-message",
+      "A sub-session handed you something for the owner; it is in a note above. Pass it on as that note says (send_message), hold it for a better moment, or fold it into other news. A question waits for the owner's answer: put it to them, and pass their answer back with task_message and attach_owner_message, in the turn of their answer. If nothing needs doing, end with NO_REPLY.",
+      { name: "check" }), CONTINUITY_DELIVERY_NOTE);
+    let ran = false;
+    this.enqueueForSession(parentKey, async () => {
+      ran = true;
+      this.messageWakeQueued.delete(parentKey);
+      if (this.stopping || !this.subsessions?.hasMessageNote(parentKey)) return;
+      try {
+        await this.processContinuity(prompt, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionMessage"), "background");
+      } finally {
+        this.retryMessageWake(parentKey);
+      }
+    }).catch((err) => {
+      this.messageWakeQueued.delete(parentKey);
+      log.error({ err, sessionKey: parentKey }, "Sub-session message turn failed in queue");
+      // Retried by the turn's own finally when it ran.
+      if (!ran) this.retryMessageWake(parentKey);
+    });
+  }
+
+  /**
+   * After a message wake: a note it did not consume (the turn failed or was
+   * cut short, and the note went back to the queue) gets another wake in a
+   * while, a few times; past that it waits for the session's next turn or
+   * the next start. A turn that ran consumed what it read, and a note that
+   * came in during it queued its own wake, so a session that is quiet again
+   * makes no retry.
+   */
+  private retryMessageWake(parentKey: string): void {
+    if (this.stopping || this.messageWakeQueued.has(parentKey) || !this.subsessions?.hasMessageNote(parentKey)) {
+      if (!this.subsessions?.hasMessageNote(parentKey)) this.messageWakeRetries.delete(parentKey);
+      return;
+    }
+    const attempts = (this.messageWakeRetries.get(parentKey) ?? 0) + 1;
+    if (attempts > MESSAGE_WAKE_RETRY_MAX) {
+      this.messageWakeRetries.delete(parentKey);
+      log.warn({ sessionKey: parentKey }, "Sub-session message turns keep failing; the note waits for the session's next turn");
+      return;
+    }
+    this.messageWakeRetries.set(parentKey, attempts);
+    const timer = setTimeout(() => this.messageWake(parentKey), MESSAGE_WAKE_RETRY_MS);
+    timer.unref?.();
+  }
+
   /** A sub-session's prompt and limits; undefined for every other key (see LiveSessionManager). */
   private subsessionContext(key: string): SessionContext["subsession"] {
     if (!isTaskSessionKey(key)) return undefined;
@@ -656,6 +774,7 @@ export class Agent {
       staticPrompt: buildSubsessionPrompt({
         agentName: config.agentName ?? "Tomo",
         ownerName: config.owner?.displayName ?? config.owner?.name ?? "the owner",
+        ownerMessages: config.subsessions.ownerMessages,
       }),
       groupScope: this.taskScopeIsGroup(key),
       maxTurns: config.subsessions.maxTurns,
@@ -2024,11 +2143,21 @@ export class Agent {
       message: (id, text, requestId) => {
         const scope = this.router.ownerSessionKey();
         if (!scope) return { ok: false, reason: "unknown" };
-        const result = service.ownerMessage(scope, id, text, { messageId: `web:${requestId}` });
+        // From the panel: the task's answer stays in the panel (ownerMessages "via-main").
+        const result = service.ownerMessage(scope, id, text, { messageId: `web:${requestId}`, source: "panel" });
         if (!result.ok) return { ok: false, reason: result.reason };
         if (!result.duplicate) log.info({ channel: "web", task: result.record.id, status: result.record.status }, "Owner message handed to a sub-session");
         const task = subsessionView(result.record, scope, Date.now(), working(result.record.sessionKey), live(result.record));
         return task ? { ok: true, duplicate: result.duplicate, task } : { ok: false, reason: "unknown" };
+      },
+      done: (id, report) => {
+        const scope = this.router.ownerSessionKey();
+        if (!scope) return { ok: false, reason: "unknown" };
+        const result = service.markDone(scope, id, report);
+        if (!result.ok) return { ok: false, reason: result.reason };
+        log.info({ channel: "web", task: result.record.id, report }, "Owner marked a sub-session done");
+        const task = subsessionView(result.record, scope, Date.now(), working(result.record.sessionKey), live(result.record));
+        return task ? { ok: true, task } : { ok: false, reason: "unknown" };
       },
     };
   }
@@ -2072,7 +2201,7 @@ export class Agent {
     // second one's cleanup unscope the first. Removed afterwards, so a later
     // cron or background turn on the same session is the owner's again and
     // does not inherit a summoned group's narrower scope.
-    const turnId = this.turnAudiences.begin(req.key, req.audiences, req.origins);
+    const turnId = this.turnAudiences.begin(req.key, req.audiences, req.origins, req.ownerMessages);
     // Until the SDK takes the prompt, this turn has not consumed its messages.
     req.inboxHooks?.notConsumed();
     try {
@@ -2084,6 +2213,12 @@ export class Agent {
         if (!requests?.size) this.webRequestIds.delete(req.key);
       }
     }
+  }
+
+  /** The owner's own messages in the turns live on this session (empty
+   *  unless they are the owner's own): what task_message may attach. */
+  turnOwnerMessages(sessionKey: string): OwnerTurnMessage[] {
+    return this.turnAudiences.ownerMessages(sessionKey);
   }
 
   /** The session key a session-scoped MCP tool should be judged against for
@@ -2321,6 +2456,7 @@ export class Agent {
         documents: message.documents,
         audiences,
         origins: [{ channelName: channel.name, chatId: message.chatId }],
+        ...(!isGroup && isDmSessionKey(key) ? { ownerMessages: [ownerTurnMessage(channel, message)] } : {}),
         suppressErrors: isPassiveGroup,
         ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, ownerT("notices")("suppressed.turn.message"), `${channel.name}:${message.chatId}`) } : {}),
         errorLogMessage: "Error handling message",
@@ -2489,6 +2625,7 @@ export class Agent {
       documents: allDocuments.length > 0 ? allDocuments : undefined,
       audiences,
       origins: items.map((it) => ({ channelName: it.channel.name, chatId: it.message.chatId })),
+      ...(isDmSessionKey(key) ? { ownerMessages: items.filter((it) => !(it.message.isGroup ?? false)).map((it) => ownerTurnMessage(it.channel, it.message)) } : {}),
       suppressErrors: isPassiveGroup,
       ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, ownerT("notices")("suppressed.turn.message"), `${lastChannel.name}:${lastMessage.chatId}`) } : {}),
       errorLogMessage: "Error handling batched messages",
@@ -3232,7 +3369,10 @@ export class Agent {
       // Sub-session restart recovery runs BEFORE any channel ingests, so no
       // input can reach a task recovery has not looked at yet. It schedules
       // nothing: dispatch opens with start() below, after the inbox replay.
-      this.subsessions?.recoverAtStartup();
+      // The todos the old per-task todo link made would never close now (the
+      // task record is the card). Dropped from the table as read, before the
+      // sweep forgets a task whose todo is still open.
+      this.subsessions?.recoverAtStartup((records, keepAsk) => dropLegacyTaskTodos(new TodoStore(), records, keepAsk).complete);
     } catch (err) {
       log.error({ err }, "Sub-session recovery failed");
     }
@@ -3374,6 +3514,9 @@ export class Agent {
     // Before any session is closed: closing empties its task set, and what is
     // still running now was interrupted, not finished.
     this.runningAgents?.freeze();
+    // Before the live sessions (and the holds and rewrite slots they own) go:
+    // a forced compaction must not publish a rewrite after its slot is released.
+    await this.forceCompactor.stop();
     this.detachRunningAgents?.();
     this.detachRunningAgents = undefined;
     this.credentialBroker?.shutdown();
@@ -3381,6 +3524,10 @@ export class Agent {
     if (this.mcpTokenRefreshTimer) {
       clearInterval(this.mcpTokenRefreshTimer);
       this.mcpTokenRefreshTimer = undefined;
+    }
+    if (this.pendingNotesRewriteTimer) {
+      clearTimeout(this.pendingNotesRewriteTimer);
+      this.pendingNotesRewriteTimer = undefined;
     }
     if (this.pendingNotesQuarantineTimer) {
       clearTimeout(this.pendingNotesQuarantineTimer);
@@ -3669,6 +3816,27 @@ export class Agent {
     }
   }
 
+  /**
+   * After the notes file was moved aside, a session whose notes (held in
+   * memory) could not be written to the fresh file is tried again until it
+   * is: until then a restart would leave them only in the file moved aside.
+   */
+  private retryPendingNotesRewrites(): void {
+    if (this.pendingNotesRewritesOwed.size === 0 || this.stopping || this.pendingNotesRewriteTimer) return;
+    log.warn({ sessions: [...this.pendingNotesRewritesOwed] }, "Pending notes not written to the fresh file yet; trying again");
+    this.pendingNotesRewriteTimer = setTimeout(() => {
+      this.pendingNotesRewriteTimer = undefined;
+      if (this.stopping) return;
+      for (const key of [...this.pendingNotesRewritesOwed]) {
+        let ok = false;
+        try { ok = this.pendingNotesQueue.persistNow(key); } catch (err) { log.error({ err, sessionKey: key }, "Could not write pending notes"); }
+        if (ok) this.pendingNotesRewritesOwed.delete(key);
+      }
+      this.retryPendingNotesRewrites();
+    }, PENDING_NOTES_REWRITE_RETRY_MS);
+    this.pendingNotesRewriteTimer.unref();
+  }
+
   /** The pending-notes file could not be read and was moved aside (see SessionStore.loadPendingNotes): the owner is told, once the channels are up. */
   private notePendingNotesQuarantined(aside: string): void {
     this.pendingNotesQuarantined.push(aside);
@@ -3781,6 +3949,48 @@ export class Agent {
     );
     this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, ownerT("notices")("suppressed.turn.interruptedAgents"), "restart"))
       .catch((err) => log.error({ err, sessionKey: key }, "Interrupted-subagents notice failed in queue"));
+  }
+
+  /**
+   * A forced compaction closed `key`'s session and with it these background
+   * tasks (agent/force-compactor.ts): told and resumed exactly like work a
+   * restart cut off (notifyInterruptedAgents) — the ledger already holds them
+   * as interrupted, the note goes to the durable pending-notes store before
+   * the ledger entry is dropped (a note that cannot be stored leaves it for
+   * the next start), and a background turn brings it to the model now. A
+   * sub-session's note waits for its own next turn.
+   */
+  private reportForceInterrupted(key: string, current: RunningTaskRecord[]): void {
+    const ledger = this.runningAgents;
+    if (!ledger) return;
+    // Everything still owed for the key (an earlier note that could not be
+    // stored included): the acknowledgement below drops all of it.
+    const records = ledger.pendingBySession().get(key) ?? current;
+    const autoResume = config.interruptedAgentsAutoResume
+      ? { failed: new Set(records.filter((r) => isResumable(r) && ledger.resumeCount(key, r.taskId) >= MAX_AUTO_RESUMES).map((r) => r.taskId)) }
+      : undefined;
+    if (!this.queuePendingNote(key, formatTomoEvent("interrupted-agents", formatInterruptedAgentsNotice(records, undefined, autoResume, "force-compact")))) {
+      log.error({ sessionKey: key }, "Could not persist the note about work a forced compaction interrupted; kept for the next start");
+      return;
+    }
+    ledger.acknowledge(key);
+    log.info({ sessionKey: key, ids: records.map((r) => r.taskId) }, "Reporting background work a forced compaction interrupted");
+    if (isTaskSessionKey(key)) return;
+    const prompt = formatTomoEvent(
+      "interrupted-agents",
+      config.interruptedAgentsAutoResume
+        ? "Check after a forced compaction: the note above lists the background work it cut off. For each resumable subagent use SendMessage to resume it right away, "
+          + "unless the owner has explicitly said not to, or it has already been resumed or has finished since: "
+          + "tell it it was interrupted when the session was compacted, have it first check how far it got and which side effects "
+          + "(commits, pushes, messages sent, files changed) already happened, then continue without redoing them. "
+          + "Skip any the note marks otherwise; Explore/Plan subagents and background commands cannot be resumed (rerun them if still needed). "
+          + CONTINUITY_DELIVERY_NOTE
+        : "Check after a forced compaction: the note above lists the background work it cut off; decide whether each is still worth continuing. "
+          + CONTINUITY_DELIVERY_NOTE,
+      { name: "check" },
+    );
+    this.enqueueForSession(key, () => this.processContinuity(prompt, key, undefined, ownerT("notices")("suppressed.turn.interruptedAgents"), "background"))
+      .catch((err) => log.error({ err, sessionKey: key }, "Forced-compaction resume turn failed in queue"));
   }
 
   /** Tell the owner (no model turn) which subagents failed past their resume limit; unsent ones are tried again next start. */
@@ -4018,4 +4228,9 @@ export class InboxPersistError extends Error {
 
 function inboxIdsOf(items: ReadonlyArray<{ inboxId?: string }>): string[] {
   return items.flatMap((item) => (item.inboxId ? [item.inboxId] : []));
+}
+
+/** An inbound owner message as task_message attaches it: what they sent, when, and where. */
+function ownerTurnMessage(channel: Pick<Channel, "name">, message: Pick<IncomingMessage, "text" | "timestamp">): OwnerTurnMessage {
+  return { text: message.text, at: message.timestamp, channel: channel.name };
 }

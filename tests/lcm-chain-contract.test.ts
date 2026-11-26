@@ -233,6 +233,20 @@ describe("LCM rewrite, checked by the SDK's own loader before it is published", 
     expectNoLeftovers();
   });
 
+  it("refuses at the publication gate once its signal is aborted (shutdown): the file is untouched", async () => {
+    const f = buildFixture();
+    const path = writeFixture(f);
+    const ac = new AbortController();
+    const result = await compactSessionChecked(request(f), {
+      workspaceDir: workspace, signal: ac.signal,
+      loadChain: async (id, dir) => { const m = await getSessionMessages(id, { dir }); if (dir !== workspace) ac.abort(); return m; },
+    });
+    expect(result).toMatchObject({ success: false });
+    expect(result.error).toMatch(/Aborted/);
+    expect(readFileSync(path, "utf8")).toBe(f.text);
+    expect(existsSync(getCompactTriggerPath(f.sessionId, sdkSessionsDir))).toBe(false);
+  });
+
   it("the loader really loses the summary when re-pointing is skipped (what the check guards against)", async () => {
     const f = buildFixture();
     const path = writeFixture(f);

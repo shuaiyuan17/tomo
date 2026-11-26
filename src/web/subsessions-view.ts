@@ -1,4 +1,4 @@
-import { activeTotalMs, currentStep, isTimestamp, type SubsessionRecord } from "../agent/subsessions/types.js";
+import { activeTotalMs, currentStep, isTimestamp, needsOwner, reportNumber, type SubsessionRecord } from "../agent/subsessions/types.js";
 import type { SubsessionEvent } from "../agent/subsessions/state-machine.js";
 import type { WebSubsession, WebSubsessionDetail, WebSubsessionMilestone, WebSubsessionStatus, WebSubsessionUpdate } from "./protocol.js";
 
@@ -45,11 +45,13 @@ export function subsessionView(record: SubsessionRecord, scope: string, now: num
   if (record.parentKey !== scope || record.status === "archived") return undefined;
   const status = record.status as WebSubsessionStatus;
   const step = currentStep(record);
+  const action = needsOwner(record);
   return {
     id: record.id,
     title: clip(record.title, TITLE_LIMIT).text,
     status,
     ...(status === "waiting" && record.waitingOn ? { waitingOn: record.waitingOn } : {}),
+    ...(action ? { ownerAction: clip(action, LINE_LIMIT).text, reportSeq: reportNumber(record) } : {}),
     ...(step ? { step: clip(step, STEP_LIMIT).text } : {}),
     // Only an open task has a turn worth showing as running.
     working: working && OPEN.has(status),
@@ -68,12 +70,15 @@ export function subsessionView(record: SubsessionRecord, scope: string, now: num
  * The rail's list: the scope's tasks, open ones first (oldest first, as they
  * were started), then those that ended within SUBSESSION_ENDED_VISIBLE_MS,
  * newest first, while the list stays within MAX_RAIL_SUBSESSIONS. An open
- * task is never left out: one may be waiting for the owner.
+ * task is never left out: one may be waiting for the owner. Nor is a
+ * finished one whose report still needs the owner, however long ago it
+ * finished: it is listed with the open ones, until they have done it.
  */
 export function subsessionList(records: readonly SubsessionRecord[], scope: string, now: number, working: (key: string) => boolean, live: (record: SubsessionRecord) => SubsessionLive = () => ({})): WebSubsession[] {
   const views = records.flatMap((r) => { const v = subsessionView(r, scope, now, working(r.sessionKey), live(r)); return v ? [v] : []; });
-  const open = views.filter((v) => OPEN.has(v.status)).sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
-  const ended = views.filter((v) => !OPEN.has(v.status) && now - (v.endedAt ?? v.lastActivityAt) < SUBSESSION_ENDED_VISIBLE_MS)
+  const kept = (v: WebSubsession) => OPEN.has(v.status) || v.ownerAction !== undefined;
+  const open = views.filter(kept).sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));
+  const ended = views.filter((v) => !kept(v) && now - (v.endedAt ?? v.lastActivityAt) < SUBSESSION_ENDED_VISIBLE_MS)
     .sort((a, b) => (b.endedAt ?? b.lastActivityAt) - (a.endedAt ?? a.lastActivityAt));
   return [...open, ...ended.slice(0, Math.max(0, MAX_RAIL_SUBSESSIONS - open.length))];
 }

@@ -4,6 +4,20 @@
  * (group activation, summon expiry, a failed reply's error prefix).
  */
 export const notices = {
+  forceCompact: {
+    done: "🗜️ The context of {{session}} was full ({{before}}%), so Tomo compacted it itself — now about {{after}}%.",
+    doneStillHigh: "🗜️ The context of {{session}} was full ({{before}}%). Tomo compacted it itself, but it is still about {{after}}%; the next turn may need another pass.",
+    archived: "Part of the history could not be summarized and was archived instead (still searchable).",
+    agents_one: "1 background task was stopped for it and will be resumed.",
+    agents_other: "{{count}} background tasks were stopped for it and will be resumed.",
+    partial: "⚠️ The context of {{session}} was full ({{before}}%). Tomo compacted part of it itself (now about {{after}}%) but could not finish; details are in the log.",
+    stillOver: "⚠️ Tomo force-compacted {{session}} ({{before}}% → about {{after}}%), but the next turn was still refused as too long. Stuck at: the CLI's size check after the compaction. By hand: `tomo lcm prune-tools` and `tomo lcm daily` on that session, or start it fresh with /new.",
+    failed: "⚠️ The context of {{session}} is full ({{before}}%) and Tomo could not compact it itself (stuck at the prune/summary/archive rewrite). Nothing was changed; details are in the log (\"Forced compaction result\"). By hand: `tomo lcm prune-tools` and `tomo lcm daily` on that session, or /new.",
+    gaveUp: "⚠️ The context of {{session}} keeps filling up: Tomo has already force-compacted it {{count}} times in the last hour and stops trying for now. Please have a look.",
+    sessionDm: "your conversation",
+    sessionGroup: "the group “{{title}}”",
+    sessionTask: "sub-session {{id}}",
+  },
   interruptedAgents: {
     autoResumeFailed_one: "⚠️ A subagent in {{session}} was cut off by a restart again after {{max}} automatic resumes, so Tomo has stopped resuming it and counts it as failed:\n{{agents}}\nIf it is still needed, ask for it to be resumed or rerun.",
     autoResumeFailed_other: "⚠️ {{count}} subagents in {{session}} were cut off by a restart again after {{max}} automatic resumes, so Tomo has stopped resuming them and counts them as failed:\n{{agents}}\nIf they are still needed, ask for them to be resumed or rerun.",
@@ -47,6 +61,7 @@ export const notices = {
       interruptedAgents: "An interrupted-subagents notice turn",
       subsessionReport: "A sub-session report turn",
       subsessionMirror: "A turn that watched a sub-session conversation",
+      subsessionMessage: "A turn that passed on what a sub-session handed over",
     },
     label: {
       group: "group \"{{title}}\" ({{key}})", groupUntitled: "group {{key}}",

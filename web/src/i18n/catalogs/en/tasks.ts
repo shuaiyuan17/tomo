@@ -28,10 +28,11 @@ export const tasks = {
   command: { heading: "Command", truncated: "\n… (truncated)" },
   subsession: {
     group: "Sub-sessions", openTitle: "Open {{id}} to talk to it",
-    state: { working: "Working", background: "Working (background)", active: "Active", queued: "Queued", waitingOwner: "Waiting for you", waiting: "Waiting", finished: "Done", cancelled: "Cancelled", failed: "Failed" },
-    conversation: "Conversation with {{id}}", nothingYet: "Nothing said yet. Write to {{id}} below.",
+    state: { working: "Working", background: "Working (background)", active: "Active", queued: "Queued", waitingOwner: "Waiting for you", needsYou: "Needs you", waiting: "Waiting", finished: "Done", cancelled: "Cancelled", failed: "Failed" },
+    conversation: "Conversation with {{id}}",
     you: "You", tag: { ask: "Question", notify: "Update" }, report: "Report",
-    doing: { heading: "What it's doing", inProgress: "In progress", pending: "Not started", done: "Done", earlier: "Show {{count}} earlier", fewer: "Show fewer" },
+    doing: { heading: "What {{agent}}'s doing", inProgress: "In progress", pending: "Not started", done: "Done", earlier: "Show {{count}} earlier", fewer: "Show fewer" },
+    progress: { label: "What {{agent}}'s doing: ", show: "Show what {{agent}}'s doing", hide: "Hide what {{agent}}'s doing", next: "Next: {{step}}", count: "{{done}} of {{total}} steps done" },
     updates: {
       planChanged: "Plan changed: {{reason}}", heading: "Decisions and updates", more: "Show all ({{count}})", fewer: "Show fewer",
       milestone: { started: "Started", waitingOwner: "Waiting for you", finished: "Finished", reopened: "Reopened", cancelled: "Cancelled", failed: "Failed" },
@@ -40,6 +41,13 @@ export const tasks = {
     label: "Message to {{id}}", placeholder: "Message {{id}}…", send: "Send to {{id}}",
     sending: "Sending…", sent: "Sent", retry: "Try again",
     ended: "This task has ended. It can't be written to any more.", gone: "This task is no longer available.",
+    markDone: {
+      label: "Done", marking: "Marking done…", title: "You did what the report asks",
+      error: {
+        nothing: "Nothing to mark: it no longer asks you anything.", newer: "There's a newer report. Read it first.",
+        gone: "The task is gone.", unavailable: "Sub-sessions can't be reached right now.", network: "Not confirmed. Try again.",
+      },
+    },
     error: {
       ended: "Not sent: the task has ended.", full: "Not sent: too many messages are already waiting for it.",
       gone: "Not sent: the task is gone.", unavailable: "Not sent: sub-sessions can't be reached right now.",

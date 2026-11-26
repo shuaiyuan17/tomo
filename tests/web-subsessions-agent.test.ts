@@ -62,8 +62,8 @@ describe("the web's access to sub-sessions", () => {
     agent.subsessions!.spawn("dm:alex", { title: "Mine", brief: "b" });
     await waitFor(() => expect(agent.subsessions!.get("s1")?.status).toBe("active"));
     // As a turn that ended with a check-back scheduled leaves it.
-    const moved = (agent.subsessions as unknown as { transition: (id: string, e: string, o: object) => { ok: boolean } })
-      .transition("s1", "wait_external", { reason: "waiting for its scheduled check-back", expectFrom: ["active"] });
+    const moved = (agent.subsessions as unknown as { store: { transition: (id: string, e: string, o: object) => { ok: boolean } } })
+      .store.transition("s1", "wait_external", { reason: "waiting for its scheduled check-back", expectFrom: ["active"] });
     expect(moved.ok).toBe(true);
     const background = vi.spyOn(agent, "hasBackgroundWork").mockImplementation((key) => key === "task:s1");
     const web = agent.webSubsessions()!;
@@ -82,6 +82,34 @@ describe("the web's access to sub-sessions", () => {
     const web = agent.webSubsessions()!;
     expect(web.list().tasks.map((t) => [t.id, t.model])).toEqual([["s1", "claude-sonnet-5[1m]"], ["s2", "claude-fable-5-1[1m]"]]);
     expect(web.get("s2")).toMatchObject({ model: "claude-fable-5-1[1m]" });
+    await agent.stop();
+  });
+
+  it("Done clears what the report asked exactly as `/s <id> done <report>` does, and only for that report", async () => {
+    const agent = await boot();
+    agent.subsessions!.spawn("dm:alex", { title: "Mine", brief: "b" });
+    agent.subsessions!.spawn("telegram:-100", { title: "A group's", brief: "b" });
+    await waitFor(() => expect(agent.subsessions!.get("s1")?.status).toBe("active"));
+    // As task_finish leaves a second report that asks the owner to do something.
+    const store = (agent.subsessions as unknown as { store: {
+      transition: (id: string, e: string, o: object) => { ok: boolean };
+      update: (id: string, fn: (r: Record<string, unknown>) => void) => unknown;
+    } }).store;
+    expect(store.transition("s1", "finish", { expectFrom: ["active"] }).ok).toBe(true);
+    store.update("s1", (r) => { r.ownerAction = "Merge PR #3"; r.reportSeq = 2; });
+    const web = agent.webSubsessions()!;
+    expect(web.list().tasks.find((t) => t.id === "s1")).toMatchObject({ ownerAction: "Merge PR #3", reportSeq: 2 });
+    // An answer to the earlier report does not clear the newer one's ask.
+    expect(web.done("s1", 1)).toEqual({ ok: false, reason: "newer" });
+    expect(web.done("s1", 3)).toEqual({ ok: false, reason: "nothing" });
+    // Another scope's task cannot be marked from the web.
+    expect(web.done("s2", 2)).toEqual({ ok: false, reason: "unknown" });
+    const result = web.done("s1", 2);
+    expect(result).toMatchObject({ ok: true, task: { id: "s1", status: "finished" } });
+    expect(result.ok && result.task).not.toHaveProperty("ownerAction");
+    expect(agent.subsessions!.get("s1")!.ownerAction).toBeUndefined();
+    // Nothing left to clear.
+    expect(web.done("s1", 2)).toEqual({ ok: false, reason: "nothing" });
     await agent.stop();
   });
 

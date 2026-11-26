@@ -15,6 +15,7 @@ import { followStep, groupRows, INITIAL_TRANSCRIPT, isOutputTask, POLL_MS, trans
 import { stateLabel, taskKind } from "./tasks.js";
 import { i18n, useTranslation } from "./i18n/index.js";
 import { useAgentName } from "./agent-name.js";
+import { RAIL_SCROLL, useScrollbarInPadding } from "./rail-scroll.js";
 
 /** Keys this file picks at runtime, from a literal map (tests/i18n-catalogs.test.ts). */
 // i18n-dynamic: tasks:control.*
@@ -120,7 +121,9 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
   const [loadingOlder, setLoadingOlder] = useState(false);
   /** The reader's open/closed choice per tool-call group (key: first tool_use id). */
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({});
-  const scroll = useRef<HTMLDivElement>(null);
+  const scroll = useRef<HTMLDivElement | null>(null);
+  const gutter = useScrollbarInPadding<HTMLDivElement>();
+  const scrollRef = useCallback((el: HTMLDivElement | null) => { scroll.current = el; gutter(el); }, [gutter]);
   const pinned = useRef(true);
   const restore = useRef<number | null>(null);
   const fetchPage = useCallback((query: string, signal?: AbortSignal) => api<SubagentPage>(`${base}/transcript${query}`, { signal }), [base]);
@@ -187,8 +190,8 @@ function Transcript({ base, running }: { base: string; running: boolean }) {
   // The turn still running: everything after the last message sent to the subagent.
   const lastTurn = blocks.map((block) => block.kind).lastIndexOf("message");
   const gone = state.status === "gone";
-  return <div ref={scroll} tabIndex={0} aria-label={t("transcript.label")} onScroll={() => { const e = scroll.current!; pinned.current = e.scrollHeight - e.scrollTop - e.clientHeight < 40; }}
-    className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-2.5 pl-1 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]">
+  return <div ref={scrollRef} tabIndex={0} aria-label={t("transcript.label")} onScroll={() => { const e = scroll.current!; pinned.current = e.scrollHeight - e.scrollTop - e.clientHeight < 40; }}
+    className={cn("min-h-0 flex-1 space-y-1 overflow-y-auto pr-2.5 pl-1", RAIL_SCROLL)}>
     {gone && <p role="status" className="m-0 mb-2 ml-1.5 rounded-lg bg-muted/70 px-2.5 py-2 text-[12px] text-muted-foreground">{t("transcript.goneKept")}</p>}
     {!gone && state.hasEarlier && <Button variant="outline" size="sm" className="mx-auto mb-2 flex h-7 rounded-full text-[11px]" disabled={loadingOlder} onClick={() => void older()}>{loadingOlder ? t("common:state.loading") : t("transcript.earlier")}</Button>}
     {state.unreadable && <UnreadableNote className="mb-2 px-1.5" />}

@@ -161,8 +161,11 @@ export class WebSupervisor implements WebLifecycle {
         stdio: ["ignore", "ignore", "ignore", "ipc"],
         execArgv: ["--max-old-space-size=256", ...(entry.endsWith(".ts") ? ["--import", "tsx"] : [])],
         // Do not give the HTTP process bot tokens, API keys, SDK hooks, or the
-        // live daemon log destination through its inherited environment.
-        env: { PATH: process.env.PATH, LANG: process.env.LANG, TZ: process.env.TZ, TOMO_LOG_INLINE: "1", TOMO_LOG_FILE: "" },
+        // live daemon log destination through its inherited environment. HOME
+        // (USERPROFILE on Windows) is passed on: it is no secret, and without it `homedir()` in the child
+        // falls back to the account's home, not the one the daemon resolved its
+        // paths against (a test run's temp home, for one).
+        env: { PATH: process.env.PATH, HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE, LANG: process.env.LANG, TZ: process.env.TZ, TOMO_LOG_INLINE: "1", TOMO_LOG_FILE: "" },
       });
     } catch {
       // fork() can throw synchronously (EAGAIN under process pressure). That
@@ -296,6 +299,10 @@ export class WebSupervisor implements WebLifecycle {
           if (input.method === "subsession-message") {
             if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
             return this.channel.messageSubsession(input.id, input.input);
+          }
+          if (input.method === "subsession-done") {
+            if (input.epoch !== this.channel.events.epoch) throw new WebError(409, "epoch_changed");
+            return this.channel.markSubsessionDone(input.id, input.input);
           }
           if (input.method === "home") return this.channel.home();
           if (input.method === "home-snapshot") {

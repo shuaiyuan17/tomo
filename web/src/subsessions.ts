@@ -11,7 +11,7 @@ import { i18n } from "./i18n/index.js";
 
 const STATE_LABELS = {
   working: "tasks:subsession.state.working", background: "tasks:subsession.state.background", active: "tasks:subsession.state.active", queued: "tasks:subsession.state.queued",
-  waitingOwner: "tasks:subsession.state.waitingOwner", waiting: "tasks:subsession.state.waiting",
+  waitingOwner: "tasks:subsession.state.waitingOwner", needsYou: "tasks:subsession.state.needsYou", waiting: "tasks:subsession.state.waiting",
   finished: "tasks:subsession.state.finished", cancelled: "tasks:subsession.state.cancelled", failed: "tasks:subsession.state.failed",
 } as const;
 
@@ -29,13 +29,16 @@ export function updateText(entry: WebSubsessionUpdate): string {
 }
 
 const WAITING = { owner: "waitingOwner", other: "waiting" } as const;
+const NEEDS_YOU = { needsYou: "needsYou" } as const;
 /**
  * Which state a task is shown in: a running turn reads "Working", a task
- * waiting on the owner says so, and one waiting on something external while
- * its own background work still runs reads as working in the background.
+ * waiting on the owner says so, one waiting on something external while its
+ * own background work still runs reads as working in the background, and a
+ * finished one whose report asks something of the owner reads "Needs you".
  */
-type ShownTask = Pick<WebSubsession, "status" | "working" | "waitingOn" | "background">;
+type ShownTask = Pick<WebSubsession, "status" | "working" | "waitingOn" | "background" | "ownerAction">;
 export function subsessionState(task: ShownTask): keyof typeof STATE_LABELS {
+  if (task.status === "finished" && task.ownerAction) return NEEDS_YOU.needsYou;
   if (task.status === "active") return task.working ? "working" : "active";
   if (task.status === "waiting" && task.waitingOn === "external" && task.background) return "background";
   if (task.status === "waiting") return WAITING[task.waitingOn === "owner" ? "owner" : "other"];
@@ -44,6 +47,14 @@ export function subsessionState(task: ShownTask): keyof typeof STATE_LABELS {
 /** Shown with the working shimmer: a turn running now, or its background work. */
 export function isWorkingState(state: ReturnType<typeof subsessionState>): boolean {
   return state === "working" || state === "background";
+}
+/** Shown emphasised, with what it asks: the task is waiting on the owner, or its report needs them. */
+export function asksOwner(state: ReturnType<typeof subsessionState>): boolean {
+  return state === "waitingOwner" || state === "needsYou";
+}
+/** What a task that asks the owner something says it needs: its question, or what its report asks them to do. */
+export function ownerAsk(task: Pick<WebSubsession, "status" | "ownerAction"> & { waitingReason?: string }): string | undefined {
+  return task.status === "finished" ? task.ownerAction : task.status === "waiting" ? task.waitingReason : undefined;
 }
 /**
  * How a plan step is drawn: the step in progress moves (shimmer, accent)
@@ -66,13 +77,16 @@ export function subsessionStateLabel(task: ShownTask): string {
 
 /**
  * An opened task as shown: what the list says now wins over the last detail
- * read (it is the newer of the two). `background` is left out of a view, not
- * set false, once the work ends, so it comes from the list alone.
+ * read (it is the newer of the two). `background` and `ownerAction` are left
+ * out of a view, not set empty, once they no longer hold, so they come from
+ * the list alone.
  */
-export function withListBackground<D extends Partial<WebSubsession>>(detail: D | undefined, summary: WebSubsession): Omit<D, "background"> & WebSubsession {
+export function withListBackground<D extends Partial<WebSubsession>>(detail: D | undefined, summary: WebSubsession): Omit<D, "background" | "ownerAction" | "reportSeq"> & WebSubsession {
   const rest: Partial<WebSubsession> = { ...(detail ?? {}) };
   delete rest.background;
-  return { ...rest, ...summary } as Omit<D, "background"> & WebSubsession;
+  delete rest.ownerAction;
+  delete rest.reportSeq;
+  return { ...rest, ...summary } as Omit<D, "background" | "ownerAction" | "reportSeq"> & WebSubsession;
 }
 
 /**
@@ -95,9 +109,9 @@ export function folded<T>(items: readonly T[], keep: number, open: boolean, from
   return { shown: from === "end" ? items.slice(-keep) : items.slice(0, keep), hidden: items.length - keep };
 }
 
-/** Open tasks are alive; ended ones are shown dimmed, as ended subagents are. */
-export function isOpenSubsession(task: Pick<WebSubsession, "status">): boolean {
-  return task.status === "queued" || task.status === "active" || task.status === "waiting";
+/** Open tasks are alive, and so is a finished one that still needs the owner; ended ones are shown dimmed, as ended subagents are. */
+export function isOpenSubsession(task: Pick<WebSubsession, "status" | "ownerAction">): boolean {
+  return task.status === "queued" || task.status === "active" || task.status === "waiting" || (task.status === "finished" && !!task.ownerAction);
 }
 
 /** Sub-sessions that count as activity on the Tasks button: those running now, in a turn or in the background. */
@@ -142,6 +156,43 @@ export function usePending(id: string): PendingSubsessionMessage[] {
  */
 export function canRetrySend(error: string | undefined): boolean {
   return error !== "subsession_ended" && error !== "subsession_not_found";
+}
+
+/** Plan, done steps or a line of "Decisions and updates": something to show of what the task is doing. */
+export function hasProgress(detail: Pick<WebSubsessionDetail, "plan" | "doneSteps" | "updates">): boolean {
+  return !!detail.plan?.length || !!detail.doneSteps?.length || !!detail.updates?.some((u) => updateText(u));
+}
+
+/**
+ * An opened task leads with what it is doing until something has been said:
+ * a line of the conversation (the owner's or the task's), the report, or a
+ * message of the owner's on its way. From then on it leads with the chat, and
+ * what it is doing folds into one line above it.
+ */
+export function leadsWithChat(rows: readonly SubsessionChatRow[]): boolean {
+  return rows.some((row) => row.kind !== "brief");
+}
+
+/**
+ * The folded line: the step it is on, else the next one, else its latest
+ * decision or update (a line of its own before a milestone), else the last
+ * step it finished. `done` / `total`: steps ticked off and all steps, while
+ * it has a plan.
+ */
+export interface ProgressSummary { text: string; look: "running" | "paused" | "pending" | "update" | "done"; done: number; total?: number }
+export function progressSummary(detail: Pick<WebSubsessionDetail, "plan" | "doneSteps" | "updates">, running: boolean): ProgressSummary | undefined {
+  const done = detail.doneSteps?.length ?? 0;
+  const plan = detail.plan ?? [];
+  const total = plan.length ? { total: done + plan.length } : {};
+  const now = plan.find((step) => step.status === "in_progress");
+  if (now) return { text: now.text, look: planStepLook("in_progress", running), done, ...total };
+  if (plan.length) return { text: i18n.t("tasks:subsession.progress.next", { step: plan[0].text }), look: "pending", done, ...total };
+  const lines = (detail.updates ?? []).filter((u) => updateText(u));
+  const own = lines.find((u) => u.kind === "update");
+  if (own) return { text: updateText(own), look: "update", done };
+  const last = detail.doneSteps?.at(-1);
+  if (last) return { text: last.text, look: "done", done };
+  return lines[0] ? { text: updateText(lines[0]), look: "update", done } : undefined;
 }
 
 /** A row of the chat, in order: the brief, then every line of the conversation, then the report. */

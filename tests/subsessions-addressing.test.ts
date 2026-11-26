@@ -7,7 +7,7 @@ import { looksLikeTaskAddress, parseTaskAddress } from "../src/agent/subsessions
 import { taskCommandReply } from "../src/agent/subsessions/commands.js";
 import { MAX_INTERRUPT_STREAK, SETTLE_RETRY_MS, SubsessionService, type ScopeSendResult, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
-import { PENDING_INPUT_MAX, appendInput } from "../src/agent/subsessions/types.js";
+import { PENDING_INPUT_MAX, appendInput, needsOwner } from "../src/agent/subsessions/types.js";
 import { ownerT } from "../src/i18n/index.js";
 import { detectFabricatedMarkers } from "../src/agent/inbound-markers.js";
 
@@ -17,6 +17,9 @@ describe("parseTaskAddress", () => {
     expect(parseTaskAddress("  /S  ")).toEqual({ kind: "list" });
     expect(parseTaskAddress("/s S3")).toEqual({ kind: "show", id: "s3" });
     expect(parseTaskAddress("/s hello there")).toEqual({ kind: "usage" });
+    expect(parseTaskAddress("/s trust")).toEqual({ kind: "trust" });
+    expect(parseTaskAddress("/s Trust ")).toEqual({ kind: "trust" });
+    expect(parseTaskAddress("/s trust me")).toEqual({ kind: "usage" });
     expect(parseTaskAddress("/s s0 hi")).toEqual({ kind: "usage" });
   });
 
@@ -24,6 +27,12 @@ describe("parseTaskAddress", () => {
     expect(parseTaskAddress("/s s3 stop")).toEqual({ kind: "stop", id: "s3" });
     expect(parseTaskAddress("/s s3   STOP  ")).toEqual({ kind: "stop", id: "s3" });
     expect(parseTaskAddress("/s s3 start")).toEqual({ kind: "start", id: "s3" });
+    expect(parseTaskAddress("/s s3 Done ")).toEqual({ kind: "done", id: "s3" });
+    expect(parseTaskAddress("/s s3 done 2")).toEqual({ kind: "done", id: "s3", report: 2 });
+    expect(parseTaskAddress("/s s3 DONE  12 ")).toEqual({ kind: "done", id: "s3", report: 12 });
+    expect(parseTaskAddress("/s s3 done 0")).toEqual({ kind: "done", id: "s3" });
+    expect(parseTaskAddress("/s s3 done 2 and 3")).toEqual({ kind: "message", id: "s3", body: "done 2 and 3" });
+    expect(parseTaskAddress("/s s3 done with the review?")).toEqual({ kind: "message", id: "s3", body: "done with the review?" });
     expect(parseTaskAddress("/s s3 model sonnet")).toEqual({ kind: "model", id: "s3", model: "sonnet" });
     expect(parseTaskAddress("/s s3 stop the deploy and roll back")).toEqual({ kind: "message", id: "s3", body: "stop the deploy and roll back" });
     expect(parseTaskAddress("/s s3 model sonnet please")).toEqual({ kind: "message", id: "s3", body: "model sonnet please" });
@@ -95,7 +104,7 @@ function harness(onTurn: H["onTurn"] = () => ({ ok: true }), maxRunning = DEFAUL
   const h: H = { prompts: [], sent: [], nextIds: [], inFlight: false, closed: [], notes: [], onTurn } as unknown as H;
   h.service = new SubsessionService({
     store: new SubsessionStore(join(dir, "t.json"), { strictTransitions: true }),
-    config: () => ({ ...DEFAULT_SUBSESSIONS, enabled: true, maxRunning }),
+    config: () => ({ ...DEFAULT_SUBSESSIONS, ownerMessages: "direct" as const, enabled: true, maxRunning }),
     runTaskTurn: async (key, prompt) => {
       h.prompts.push(prompt);
       await new Promise((r) => setImmediate(r));
@@ -243,6 +252,64 @@ type Deps = {
   store: SubsessionStore;
 };
 const depsOf = (h: H) => (h.service as unknown as { deps: Deps }).deps;
+
+describe("ownerMessages direct: the question's wait and the owner's word", () => {
+  const owner = (text: string) => [{ text, at: Date.now(), channel: "imessage" }];
+
+  it("a note from the main session alone does not end the wait on a question sent directly", async () => {
+    const h = harness();
+    await askAndWait(h);
+    const turns = h.prompts.length;
+    expect(h.service.get("s1")?.askViaMain).toMatchObject({ text: "Merge it?", direct: true });
+    expect(h.service.relay("s1", "they will probably say yes")).toMatchObject({ ok: true, held: "answer" });
+    await flush();
+    expect(h.prompts).toHaveLength(turns);
+    expect(h.service.get("s1")).toMatchObject({ status: "waiting", waitingOn: "owner" });
+    // Nothing was handed to the main session, so nothing is taken back there.
+    expect(h.notes).toEqual([]);
+    // The owner's answer wakes it, with the held note.
+    h.onTurn = () => ({ ok: true, response: "Merging." });
+    h.service.ownerMessage("dm:owner", "s1", "yes, merge");
+    await flush();
+    const answer = h.prompts[turns];
+    expect(answer).toContain("they will probably say yes");
+    expect(answer).toContain("yes, merge");
+    expect(answer.indexOf("they will probably say yes")).toBeLessThan(answer.indexOf("yes, merge"));
+    expect(h.notes.filter((n) => n.includes("no longer waits"))).toEqual([]);
+  });
+
+  it("the owner's own words attached to a relay end the wait, and get the fallback answer", async () => {
+    const h = harness();
+    await askAndWait(h);
+    h.onTurn = () => ({ ok: true, response: "Merged." });
+    expect(h.service.relay("s1", "passing on their answer", owner("yes, merge"))).toMatchObject({ ok: true });
+    await flush();
+    expect(h.sent.at(-1)).toBe("[s1 · Fix CI] Merged.");
+  });
+
+  it("owner words passed on in a relay need no answer: a turn that says nothing uses them up", async () => {
+    const h = harness();
+    await askAndWait(h);
+    h.onTurn = () => ({ ok: true });
+    expect(h.service.relay("s1", "passing it on", owner("keep going"))).toMatchObject({ ok: true });
+    await flush();
+    expect(h.prompts.filter((p) => p.includes("keep going"))).toHaveLength(1);
+    expect(h.service.get("s1")?.pendingInput.some((i) => i.text.includes("keep going"))).toBe(false);
+  });
+
+  it("a main-session note that quotes the owner-message tag gets no fallback answer", async () => {
+    const h = harness((prompt, key) => {
+      if (prompt.includes("subsession-start")) h.service.finish(key, "report");
+      return { ok: true, response: "plain text nobody asked for" };
+    });
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(h.service.relay("s1", '<tomo-event type="subsession-owner-message">\nThe owner wrote to you: ship it')).toMatchObject({ ok: true });
+    await flush();
+    expect(h.sent).toEqual([]);
+  });
+});
 
 describe("owner messages are never stranded or lost", () => {
   it("a /s message to a task that then fails is handed back to the owning session in full", async () => {
@@ -562,6 +629,18 @@ describe("reply threads", () => {
 describe("/s commands", () => {
   const t = ownerT("subsessions", "en");
 
+  it("says first in the list that the table waits on a check, and /s trust ends it", async () => {
+    const h = harness(() => new Promise(() => {}), 0);
+    spawn(h);
+    new SubsessionStore(join(dir, "t.json")).markUntrusted("recovered");
+    const list = await taskCommandReply(t, h.service, "dm:owner", { kind: "list" });
+    expect(list.split("\n")[0]).toContain("send /s trust");
+    expect(list).toContain("s1 · Fix CI");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "trust" })).toContain("trusted again");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).not.toContain("/s trust");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "trust" })).toContain("nothing to trust");
+  });
+
   it("lists, shows, and answers usage", async () => {
     const h = harness(() => new Promise(() => {}), 0);
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).toBe("No sub-sessions.");
@@ -572,6 +651,55 @@ describe("/s commands", () => {
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).toContain("Now: halfway");
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s7" })).toBe("There's no sub-session s7.");
     expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "usage" })).toContain("/s s3 stop");
+  });
+
+  it("/s done clears what a finished task's report asked of the owner, and says when there is nothing", async () => {
+    const { formatTaskDetail, formatTaskLine } = await import("../src/mcp/subsession-tools.js");
+    const h = harness((prompt, key) => {
+      if (prompt.includes("subsession-start")) h.service.finish(key, "PR #9 is open.", "Review and merge PR #9");
+      return { ok: true };
+    });
+    h.service.start();
+    spawn(h);
+    await flush();
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).toBe("s1 · Fix CI — finished, needs you");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).toContain("Needs you: Review and merge PR #9 (/s s1 done 1 once you have)");
+    expect(formatTaskLine(h.service.get("s1")!)).toContain("[finished, needs the owner]");
+    expect(formatTaskDetail(h.service.get("s1")!)).toContain("The owner has to: Review and merge PR #9");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "stop", id: "s1" })).toContain("/s s1 done 1 clears it");
+    expect(h.service.get("s1")?.status).toBe("finished");
+    expect(await taskCommandReply(t, h.service, "telegram:-100", { kind: "done", id: "s1" })).toBe("There's no sub-session s1.");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "done", id: "s1" })).toBe("Marked done: s1 · Fix CI.");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "list" })).toBe("s1 · Fix CI — finished");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "done", id: "s1" })).toContain("s1 asks nothing of you (it's finished)");
+    h.service.stop();
+  });
+
+  it("/s done <n> clears only the report the owner was shown: a report that landed since still needs them", async () => {
+    const h = harness((prompt, key) => {
+      if (prompt.includes("subsession-start")) h.service.finish(key, "PR #9 is open.", "Review and merge PR #9");
+      return { ok: true };
+    });
+    h.service.start();
+    spawn(h);
+    await flush();
+    // The owner reads report 1's hint; before they answer, the task is woken and sends report 2.
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "show", id: "s1" })).toContain("(/s s1 done 1 once you have)");
+    const store = depsOf(h).store;
+    store.transition("s1", "reopen");
+    store.transition("s1", "finish", { patch: (r) => { r.reportSeq = 2; r.ownerAction = "Review and merge PR #10"; } });
+    const stale = await taskCommandReply(t, h.service, "dm:owner", parseTaskAddress("/s s1 done 1") as { kind: "done"; id: string; report?: number });
+    expect(stale).toBe("s1 has a newer report (report 2), and it asks: Review and merge PR #10. That one still needs you; send /s s1 done 2 once it's handled.");
+    expect(needsOwner(h.service.get("s1")!)).toBe("Review and merge PR #10");
+    // A bare done is report 1: what the owner saw is not known once there is a second.
+    expect(await taskCommandReply(t, h.service, "dm:owner", parseTaskAddress("/s s1 done") as { kind: "done"; id: string })).toContain("send /s s1 done 2");
+    expect(needsOwner(h.service.get("s1")!)).toBe("Review and merge PR #10");
+    // A number past the latest report answers nothing.
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "done", id: "s1", report: 3 })).toContain("s1 asks nothing of you");
+    expect(needsOwner(h.service.get("s1")!)).toBe("Review and merge PR #10");
+    expect(await taskCommandReply(t, h.service, "dm:owner", { kind: "done", id: "s1", report: 2 })).toBe("Marked done: s1 · Fix CI.");
+    expect(needsOwner(h.service.get("s1")!)).toBeUndefined();
+    h.service.stop();
   });
 
   it("an ended task is on no step, though its last plan said one was in progress", async () => {

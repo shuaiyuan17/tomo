@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it } from "vitest";
 import { createServer } from "node:http";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { WebSupervisor } from "../src/web/supervisor.js";
@@ -127,6 +127,24 @@ it("forgets consecutive failures only after the child has stayed healthy", async
   expect(supervisor.status().restarts).toBe(2);
   await expect.poll(() => supervisor.status().restarts, { timeout: 5_000 }).toBe(0);
 }, 12_000);
+
+it("hands the child the daemon's HOME, so its homedir() is not the account's", async () => {
+  // Under the test setup that HOME is a throwaway one; without it in the
+  // child's env, homedir() there would fall back to the real home.
+  const childPath = join(root, "home.cjs");
+  const seen = join(root, "child-home");
+  writeFileSync(childPath, `
+    require("node:fs").writeFileSync(${JSON.stringify(seen)}, require("node:os").homedir());
+    process.on("message", (m) => {
+      if (m.type === "init") process.send({ type: "ready", port: 9465, accessToken: "tomo_web_" + "a".repeat(64) });
+      if (m.type === "ping") process.send({ type: "pong" });
+    });`);
+  supervisor = new WebSupervisor(channel, options(), { childPath, startupMs: 2_000, heartbeatMs: 1_000 });
+  await supervisor.start();
+  await expect.poll(() => supervisor.status().state, { timeout: 5_000 }).toBe("running");
+  expect(readFileSync(seen, "utf8")).toBe(homedir());
+  expect(homedir()).not.toBe(userInfo().homedir);
+}, 10_000);
 
 it("times out a hung child, limits restart attempts, and shuts down promptly", async () => {
   const childPath = join(root, "hung.cjs");

@@ -431,6 +431,19 @@ describe("PendingNotesQueue while the stored notes cannot be read", () => {
     expect(queue.drain("k")).toBe("");
   });
 
+  it("persistLoaded names the sessions whose write failed", () => {
+    const store = new MemoryPendingNotesStore();
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("a", "one");
+    queue.queueNote("b", "two");
+    const real = store.setPendingNotes.bind(store);
+    store.setPendingNotes = (key, notes) => {
+      if (key === "b") throw new Error("ENOSPC");
+      real(key, notes);
+    };
+    expect(queue.persistLoaded()).toEqual(["b"]);
+  });
+
   it("persistLoaded writes every loaded session again, queued and in flight (a fresh file after one was moved aside)", () => {
     const store = new MemoryPendingNotesStore();
     const queue = new PendingNotesQueue(store);

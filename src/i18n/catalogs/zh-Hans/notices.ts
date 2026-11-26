@@ -2,6 +2,19 @@ import type { Translation } from "../../catalog.js";
 import type { notices as en } from "../en/notices.js";
 
 export const notices = {
+  forceCompact: {
+    done: "🗜️ {{session}}的上下文满了（{{before}}%），Tomo 自己把它压缩了，现在约 {{after}}%。",
+    doneStillHigh: "🗜️ {{session}}的上下文满了（{{before}}%）。Tomo 自己压缩了一轮，但仍约 {{after}}%，下一轮可能还要再压。",
+    archived: "有一部分历史没能总结，改为归档（仍可搜索）。",
+    agents_other: "为此停了 {{count}} 个后台任务，之后会续上。",
+    partial: "⚠️ {{session}}的上下文满了（{{before}}%）。Tomo 自己压缩了一部分（现在约 {{after}}%），但没能做完，详情见日志。",
+    stillOver: "⚠️ Tomo 强制压缩了{{session}}（{{before}}% → 约 {{after}}%），但下一轮仍被判太长。卡在：压缩后 CLI 的长度检查。手动办法：对该会话跑 `tomo lcm prune-tools` 和 `tomo lcm daily`，或用 /new 重开。",
+    failed: "⚠️ {{session}}的上下文满了（{{before}}%），Tomo 没能自己压缩它（卡在 prune/总结/归档改写）。什么都没改，详情见日志（\"Forced compaction result\"）。手动办法：对该会话跑 `tomo lcm prune-tools` 和 `tomo lcm daily`，或 /new。",
+    gaveUp: "⚠️ {{session}}的上下文一直在涨满：过去一小时 Tomo 已经强制压缩了 {{count}} 次，暂时不再尝试。请看一下。",
+    sessionDm: "你的对话",
+    sessionGroup: "群「{{title}}」",
+    sessionTask: "子会话 {{id}} ",
+  },
   interruptedAgents: {
     autoResumeFailed_other: "⚠️ {{session}} 里有 {{count}} 个 subagent 已自动续跑 {{max}} 次，又被重启打断，Tomo 不再续它们，记为失败：\n{{agents}}\n如果还需要，请让我续上或重跑。",
   },
@@ -41,6 +54,7 @@ export const notices = {
       interruptedAgents: "一个中断 subagent 通知回合",
       subsessionReport: "一个子会话汇报回合",
       subsessionMirror: "一个旁观子会话对话的回合",
+      subsessionMessage: "一个转达子会话消息的回合",
     },
     label: {
       group: "群“{{title}}”（{{key}}）", groupUntitled: "群 {{key}}",

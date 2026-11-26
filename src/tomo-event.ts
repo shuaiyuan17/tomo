@@ -35,6 +35,7 @@ export type TomoEventType =
   | "cron"             // scheduled task trigger (name = job name)
   | "lcm-rollup"       // LCM rollup-due nudge (name = "<level> <period>")
   | "context-nudge"    // context-usage housekeeping nudge (name = prune|daily|compact)
+  | "force-compacted"  // the harness compacted a full session itself (what it did, for the model)
   | "summon"           // summoned into a group chat
   | "summon-reminder"  // per-turn reply-routing reminder on summoned-group messages
   | "summon-expired"   // summon lapsed from group inactivity
@@ -59,6 +60,7 @@ export type TomoEventType =
   | "subsession-redelivery" // marks sub-session inputs sent again after a cut-short turn (at-least-once delivery)
   | "subsession-report"   // a sub-session finished; told to its owning session (name = task id#report seq, e.g. s3#1)
   | "subsession-unanswered" // a finished sub-session gave up on what it was sent; the messages, to its owning session (name = task id)
+  | "subsession-message"  // a sub-session's task_reply / task_ask, handed to its owning session to pass on (name = task id:ms-n)
   | "subsession-activity" // something a sub-session said to the owner, told to its owning session (name = task id)
   | "subsession-handback" // a failed sub-session's unanswered messages from the owner, in full (name = task id)
   | "note";            // bare harness aside with no producer of its own

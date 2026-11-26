@@ -19,13 +19,21 @@ export const OPEN_STATUSES: ReadonlySet<SubsessionStatus> = new Set(["queued", "
 export type WaitingOn = "owner" | "external";
 
 /**
- * One message the task sent out: task_notify, task_reply, task_ask, or the
+ * One message the task sent out: task_reply (kind reply or notify), task_ask, or the
  * harness's fallback (an owner-triggered turn that called none of them).
  */
 export interface SubsessionSentMessage {
   at: number;
   kind: "notify" | "reply" | "ask" | "fallback";
   text: string;
+  /**
+   * "main": handed to the owning session as a note, which decides whether
+   * and how the owner hears it. "panel": an answer that stayed in the web
+   * task panel the owner wrote from. Unset: sent to the owner's chat as is.
+   */
+  via?: "main" | "panel";
+  /** via "panel": the highest input seq its turn answered (a retried turn's same answer is kept once). */
+  answers?: number;
 }
 
 /**
@@ -55,6 +63,11 @@ export interface SubsessionConversationEntry {
   text: string;
   /** Files the owner sent with it (count only: their paths stay out of the mirror). */
   files?: number;
+  /**
+   * The task's words were handed to the owning session as a note: the
+   * mirror does not show them again.
+   */
+  noted?: true;
 }
 
 /** One input owed to the task. */
@@ -62,19 +75,44 @@ export interface SubsessionInput {
   seq: number;
   text: string;
   /**
-   * "owner": the owner's word (a relay from the owning session, or a message
-   * from the owner). A turn carrying one is never held by the wall-clock cap
-   * or the quota gate, and a failed task hands it back to the owner.
-   * Unset: the harness's own (a check-back, a background report).
+   * "owner": the owner's own words: a message they wrote to the task, or a
+   * relay the owning session attached their messages to (copied by the
+   * harness from the turn they wrote them in, never typed by the model). A
+   * turn carrying one is never held by the wall-clock cap or the quota gate,
+   * and a failed task hands it back to the owner.
+   * "main": a relay that carries only the owning session's own note. It wakes
+   * the task like any relay, but it is not the owner's word: it passes no
+   * gate, does not restart the wall-clock cap, and is not handed back.
+   * "harness": the harness's own (a check-back, a "continue", a background
+   * report), and every input read without an origin: only an input created
+   * as the owner's is ever theirs (never guessed from its text).
    */
-  from?: "owner";
-  /** For an owner input: what was said, without the event wrapper (quoted back if it is never answered). */
+  from: "owner" | "main" | "harness";
+  /**
+   * Set on every owner input written since origins were checked. Before
+   * that, every relay was stored as `from: "owner"`, the main session's own
+   * notes included: an owner input without it is read as a main-session
+   * note (fail closed), never as the owner's word, unless it is an owner
+   * message (`OWNER_MESSAGE_MARKER`), which only the owner's `/s` or panel
+   * message ever was.
+   */
+  checked?: true;
+  /** For an owner input or a main-session note: what was said, without the event wrapper (quoted back if it is never answered). */
   words?: string;
+  /** "panel": the owner wrote it in the web task panel (an answer to it stays there). */
+  source?: "panel";
 }
 
-/** Append an input: the only way one is added. */
-export function appendInput(record: SubsessionRecord, text: string, origin?: { from: "owner"; words: string }): void {
-  record.pendingInput.push({ seq: record.nextInputSeq, text, ...(origin ? { from: origin.from, words: origin.words } : {}) });
+export type InputOrigin = { from: "owner"; words: string; source?: "panel" } | { from: "main"; words: string } | { from: "harness" };
+
+/** The harness's own input (a check-back, a "continue", a start, a background report). */
+export const HARNESS: InputOrigin = { from: "harness" };
+
+/** Append an input: the only way one is added. Every input says where it came from. */
+export function appendInput(record: SubsessionRecord, text: string, origin: InputOrigin): void {
+  record.pendingInput.push({ seq: record.nextInputSeq, text,
+    ...(origin.from === "owner" ? { from: origin.from, checked: true as const, words: origin.words, ...(origin.source ? { source: origin.source } : {}) }
+      : origin.from === "main" ? { from: "main" as const, words: origin.words } : { from: "harness" as const }) });
   record.nextInputSeq += 1;
 }
 
@@ -189,8 +227,31 @@ export interface SubsessionRecord {
   /** Goal, progress, next step and side effects (task_checkpoint). */
   checkpoint?: string;
   report?: string;
-  /** Counts the task's reports (a finished task can be woken and finish again); its report note is named by it. */
+  /**
+   * What the owner has to do with the report (task_finish `owner_action`:
+   * review and merge a PR, make a choice), one line. A finished task with
+   * one is the owner's ("Needs you") until they do it: `/s <id> done` or the
+   * owning session's task_done clears it (that report's ask only), and the
+   * next task_finish sets it afresh or not. A reopen leaves it (the ask
+   * stands until a new report says otherwise) but hides it: meaningful only
+   * while the task is finished, read through `needsOwner`.
+   */
+  ownerAction?: string;
+  /** Counts the task's reports (a finished task can be woken and finish again); its report note is named by it. Read through `reportNumber`. */
   reportSeq?: number;
+  /**
+   * Set once a start moved the old todo link's "Read sN's result" onto this
+   * record as its `ownerAction`: never moved again (an ask the owner has
+   * since cleared stays cleared, even while that todo could not be dropped).
+   */
+  legacyAskMoved?: true;
+  /**
+   * The id of the todo the old todo link kept for this task (a record written
+   * before had it as `todoId`). Read only by the startup pass that drops those
+   * todos (`legacy-todos.ts`): it names the link's own item whatever title
+   * limit was in force when it was written.
+   */
+  legacyTodoId?: string;
   /**
    * Earlier reports a later task_finish replaced while they were still
    * unread (their note still waiting, or never written), oldest first, at
@@ -233,8 +294,6 @@ export interface SubsessionRecord {
   conversationSeq: number;
   /** The newest `seq` the owning session has seen (mirror), advanced only by a turn that completed. */
   mirrorSeenSeq: number;
-  /** The todo (src/todos) that tracks this task on the owner's list, if one was made. */
-  todoId?: string;
   /**
    * Inputs with seq up to this went out in a turn that did not complete (cut
    * short by a restart, failed, or its result could not be saved): the task
@@ -255,12 +314,35 @@ export interface SubsessionRecord {
   /**
    * The record came from `.bak` (the primary table was lost or unreadable):
    * its status may be older than what happened, so no cleanup acts on it
-   * (archive, forget, unlink, cron removal). Cleared only by an ending this
-   * process saw happen (task_finish, a cancel).
+   * (archive, forget, unlink, cron removal). Cleared by an ending this
+   * process saw happen (task_finish, a cancel, any move to a terminal
+   * status), or by the owner's `/s trust`; never by time. Never set on a
+   * terminal record: cancelled, failed and archived never change again, so
+   * a backup cannot hold an older version of them.
    */
   restored?: boolean;
   /** Recent messages the task sent out, newest last (at most SENT_KEEP). */
   sent: SubsessionSentMessage[];
+  /**
+   * The question a task_ask is waiting on, kept while the task waits for
+   * the owner. ownerMessages "via-main": handed to the owning session, which
+   * passes it on, and its task_message with the owner's answer ends the
+   * wait. "direct" (`direct`): sent to the owner's chat, which they answer
+   * with /s or a reply. Either way a note from the main session alone does
+   * not end it. The store drops it on any transition out of waiting(owner).
+   */
+  askViaMain?: {
+    at: number;
+    text: string;
+    /** Its note's name (to take it back). */
+    note?: string;
+    /**
+     * ownerMessages "direct": the question went straight to the owner's chat,
+     * not through the main session (no note to take back, nothing to retract
+     * there). The wait is the same: only the owner's own words end it.
+     */
+    direct?: true;
+  };
   /** The newest status changes, oldest first. */
   transitions: SubsessionTransition[];
 }
@@ -274,10 +356,16 @@ export interface SubsessionTable {
    * Set when this table may be missing tasks: it was recovered from `.bak`,
    * or it was missing while the registry held task sessions. Kept across
    * every write and restart, so no later start unlinks a registry entry the
-   * table does not know (it may be a task the lost table had). Cleared once
-   * no such entry is left and no record is still `restored`.
+   * table does not know (it may be a task the lost table had), and no record
+   * is archived or forgotten. Never cleared on its own (no time limit, no
+   * count of what is left): only the owner's `/s trust` ends it.
    */
-  untrusted?: { since: number; reason: "recovered" | "lost" };
+  untrusted?: {
+    since: number;
+    reason: "recovered" | "lost";
+    /** The owner was told (once per mark: a fresh recovery tells them again). */
+    notified?: true;
+  };
 }
 
 export const SENT_KEEP = 20;
@@ -308,9 +396,30 @@ export function currentStep(record: Pick<SubsessionRecord, "plan" | "status">): 
   return record.plan?.find((s) => s.status === "in_progress")?.text;
 }
 
+/** task_finish's `owner_action`: one line. */
+export const OWNER_ACTION_MAX = 300;
+
+/**
+ * What a finished task still asks of the owner (its report's `owner_action`),
+ * or undefined when it asks nothing or the task is not finished. A task that
+ * returns one is the owner's: shown as "Needs you" and never archived.
+ */
+/** The number of the task's latest report: `reportSeq`, or 1 for a record written before reports were counted. */
+export function reportNumber(record: Pick<SubsessionRecord, "reportSeq">): number {
+  return record.reportSeq ?? 1;
+}
+
+export function needsOwner(record: Pick<SubsessionRecord, "status" | "ownerAction">): string | undefined {
+  return record.status === "finished" && record.ownerAction ? record.ownerAction : undefined;
+}
+
 /** One line, trimmed, at most `max` characters (by code point, so a pair is never split). */
 export function oneLine(text: string, max: number): string {
   return Array.from(text.trim().split("\n")[0].trim()).slice(0, max).join("");
 }
 /** Inputs a task may have owed at once; more are refused (never silently dropped). */
 export const PENDING_INPUT_MAX = 50;
+/** Slots input held for a task waiting on the owner never takes, kept for the owner's message that wakes it. */
+export const PENDING_INPUT_OWNER_RESERVE = 5;
+/** How an owner's `/s` or panel message starts: an envelope only the harness writes (a relay starts with its own). */
+export const OWNER_MESSAGE_MARKER = '<tomo-event type="subsession-owner-message"';

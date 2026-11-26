@@ -130,15 +130,17 @@ describe("pending notes: sub-session reports", () => {
 describe("sub-session prompt", () => {
   it("offers the owner-facing tools and carries no memory instructions", () => {
     const prompt = buildSubsessionPrompt({ agentName: "Tomo", ownerName: "Shuai" });
-    for (const name of ["task_reply", "task_notify", "task_ask", "task_finish"]) expect(prompt).toContain(name);
+    for (const name of ["task_reply", "task_ask", "task_finish"]) expect(prompt).toContain(name);
+    // One tool speaks: an answer or unprompted news.
+    expect(prompt).not.toContain("task_notify");
     expect(prompt).not.toMatch(/MEMORY\.md index|memory_write/);
     expect(prompt).toContain("task_plan");
     expect(prompt).not.toContain("task_progress");
   });
 
-  it("says task_finish is refused while a message the task has not read is waiting", () => {
-    const prompt = buildSubsessionPrompt({ agentName: "Tomo", ownerName: "Shuai" });
-    expect(prompt).toMatch(/task_finish is refused[^\n]*next turn/);
+  it("says task_finish is refused while a message the task has not read is waiting (in the tool, where it applies)", () => {
+    const finish = buildTaskSelfTools({ service: () => undefined, key: "task:s1" }).find((t) => t.name === "task_finish")!;
+    expect(finish.description).toMatch(/Refused while a message you have not read yet is waiting[^\n]*next turn/);
   });
 });
 
@@ -193,6 +195,52 @@ describe("sub-session tools", () => {
     expect((await call(group, "task_cancel", { id: "s1" })).isError).toBe(true);
     expect((await call(group, "task_message", { id: "s1", text: "hi" })).isError).toBe(true);
     expect((await call(owner, "task_status", { id: "s1" })).content[0].text).toContain("Mine");
+  });
+
+  it("task_message attaches the owner's own messages only when asked and only when the turn has some", async () => {
+    const svc = service();
+    let mine: Array<{ text: string; at: number; channel: string }> = [];
+    const owner = buildTaskOwnerTools({ service: () => svc, scope: () => "dm:owner", ownerMessages: () => mine });
+    await call(owner, "task_spawn", { title: "Mine", brief: "b" });
+    // Nothing of the owner's in this turn (a background wake): attaching is refused, nothing relayed.
+    const refused = await call(owner, "task_message", { id: "s1", text: "go", attach_owner_message: true });
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0].text).toContain("no message from the owner");
+    expect(svc.get("s1")!.pendingInput).toHaveLength(0);
+    // Without attaching: the main session's own note.
+    expect((await call(owner, "task_message", { id: "s1", text: "a note" })).isError).toBeUndefined();
+    expect(svc.get("s1")!.pendingInput.at(-1)).toMatchObject({ from: "main", words: "a note" });
+    // With the owner's message in this turn: copied in as theirs, not the model's retelling.
+    mine = [{ text: "ship it", at: 1, channel: "imessage" }];
+    const passed = await call(owner, "task_message", { id: "s1", text: "They said ship it.", attach_owner_message: true });
+    expect(passed.content[0].text).toContain("with the owner's message");
+    expect(svc.get("s1")!.pendingInput.at(-1)).toMatchObject({ from: "owner", words: "ship it" });
+    expect(svc.get("s1")!.pendingInput.at(-1)!.text).toContain("[1970-01-01T00:00:00.001Z · imessage] ship it");
+  });
+
+  it("task_finish takes what the owner has to do; task_done clears it, only in the owning scope", async () => {
+    const svc = service();
+    const owner = buildTaskOwnerTools({ service: () => svc, scope: () => "dm:owner" });
+    const group = buildTaskOwnerTools({ service: () => svc, scope: () => "telegram:-100123" });
+    await call(owner, "task_spawn", { title: "Mine", brief: "b" });
+    expect((await call(owner, "task_done", { id: "s1", report: 1 })).content[0].text).toContain("asks nothing of the owner");
+    // As its first turn leaves it (dispatch is not open here, so nothing else starts it).
+    (svc as unknown as { store: { transition: (id: string, e: string) => unknown } }).store.transition("s1", "start");
+    const self = buildTaskSelfTools({ service: () => svc, key: "task:s1" });
+    const out = await call(self as never, "task_finish", { report: "PR #4 is open.", owner_action: "Merge PR #4" });
+    expect(out.content[0].text).toContain("needing the owner");
+    expect(svc.get("s1")).toMatchObject({ status: "finished", ownerAction: "Merge PR #4" });
+    expect((await call(group, "task_done", { id: "s1", report: 1 })).isError).toBe(true);
+    expect(svc.get("s1")?.ownerAction).toBe("Merge PR #4");
+    // task_cancel agrees with /s stop: a finished task waiting on the owner is not cancelled; task_done clears it.
+    const cancel = await call(owner, "task_cancel", { id: "s1" });
+    expect(cancel.isError).toBe(true);
+    expect(cancel.content[0].text).toContain(`task_done("s1", ${svc.get("s1")!.reportSeq})`);
+    expect(svc.get("s1")).toMatchObject({ status: "finished", ownerAction: "Merge PR #4" });
+    const report = svc.get("s1")!.reportSeq!;
+    const done = await call(owner, "task_done", { id: "s1", report });
+    expect(done.isError).toBeUndefined();
+    expect(svc.get("s1")?.ownerAction).toBeUndefined();
   });
 
   it("task_spawn tells the model to tell the owner before starting a task on its own", () => {
@@ -280,6 +328,11 @@ describe("sub-session tools", () => {
     const dropped = await call(self as never, "task_plan", { steps: [] });
     expect(dropped.isError).toBe(true);
     expect(dropped.content[0].text).toMatch(/reason/);
+    // A step filed done in other words is named, so the task can tell it slipped.
+    const paraphrased = await call(self as never, "task_plan", { steps: [], done: [{ step: "Wrote tests" }] });
+    expect(paraphrased.isError).toBe(true);
+    expect(paraphrased.content[0].text).toContain('"Write tests" is no longer in the plan and not in `done`');
+    expect(paraphrased.content[0].text).toContain("in exactly these words");
     expect((await call(self as never, "task_plan", { steps: [{ step: "Write docs" }], reason: "Tests already exist" })).isError).toBeUndefined();
     expect((await call(self as never, "task_status", {})).content[0].text).toContain("Plan changed: Tests already exist");
     // An empty list clears the plan.

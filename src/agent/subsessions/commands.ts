@@ -1,7 +1,7 @@
 import { joinText, type OwnerT, type OwnerText } from "../../i18n/index.js";
 import type { TaskAddress } from "./address.js";
 import type { SubsessionService } from "./service.js";
-import { currentStep, TERMINAL_STATUSES, type SubsessionRecord } from "./types.js";
+import { currentStep, needsOwner, reportNumber, TERMINAL_STATUSES, type SubsessionRecord } from "./types.js";
 
 /** The newest tasks `/s` lists; older ones are counted. */
 const LIST_MAX = 12;
@@ -19,11 +19,25 @@ export async function taskCommandReply(
 ): Promise<OwnerText> {
   if (!service.available()) return t("cmd.unavailable");
   if (address.kind === "usage") return t("cmd.usage");
+  if (address.kind === "trust") {
+    const result = service.trust();
+    if (result.ok) {
+      const done = t("cmd.trusted", { count: result.unlinked });
+      return result.failed > 0 ? joinText([done, t("cmd.trustUnlinkFailed", { count: result.failed })]) : done;
+    }
+    if (result.reason === "nothing") return t("cmd.trustNothing");
+    if (result.reason === "registry") return t("cmd.trustRegistry");
+    return t("cmd.unavailable");
+  }
   if (address.kind === "list") {
+    // What waits on the owner comes first, however old: past LIST_MAX it would only be counted.
+    const asks = (r: SubsessionRecord) => (needsOwner(r) || (r.status === "waiting" && r.waitingOn === "owner") ? 1 : 0);
     const tasks = service.list(scope).filter((r) => r.status !== "archived")
-      .sort((a, b) => b.lastActivityAt - a.lastActivityAt);
-    if (tasks.length === 0) return t("cmd.empty");
-    const lines = tasks.slice(0, LIST_MAX).map((r) => taskLine(t, r, service.backgroundRunning(r)));
+      .sort((a, b) => asks(b) - asks(a) || b.lastActivityAt - a.lastActivityAt);
+    // Recovered from the backup and not checked yet: said first, every time.
+    const untrusted = service.untrusted() ? [t("cmd.untrusted")] : [];
+    if (tasks.length === 0) return untrusted.length > 0 ? joinText([...untrusted, t("cmd.empty")]) : t("cmd.empty");
+    const lines = [...untrusted, ...tasks.slice(0, LIST_MAX).map((r) => taskLine(t, r, service.backgroundRunning(r)))];
     if (tasks.length > LIST_MAX) lines.push(t("cmd.more", { count: tasks.length - LIST_MAX }));
     return joinText(lines);
   }
@@ -37,6 +51,8 @@ export async function taskCommandReply(
     case "stop": {
       if (record.status === "cancelled") return t("cmd.alreadyStopped", { id: record.id });
       if (TERMINAL_STATUSES.has(record.status)) return t("cmd.ended", { id: record.id, status: statusWord(t, record) });
+      // Finished and waiting on the owner: "stop" would cancel a task whose work is done; done is what clears it.
+      if (needsOwner(record)) return t("cmd.stopNeedsOwner", { id: record.id, report: reportNumber(record) });
       const outcome = await service.cancel(record.id, "stopped by the owner (/s stop)");
       return outcome.ok ? t("cmd.stopped", { id: record.id, title: record.title }) : t("cmd.ended", { id: record.id, status: statusWord(t, record) });
     }
@@ -46,6 +62,16 @@ export async function taskCommandReply(
       // Held while the session registry can't be read: it starts, past the cap, once it can.
       if (service.isHeld(record.id)) return t("cmd.held", { id: record.id });
       return t("cmd.notQueued", { id: record.id, status: statusWord(t, service.get(record.id) ?? record) });
+    }
+    case "done": {
+      // The report number the owner was shown (the hints name it): one that
+      // landed since is not theirs to clear. Bare "done" answers report 1.
+      const result = service.markDone(scope, record.id, address.report);
+      if (result.ok) return t("cmd.done", { id: record.id, title: record.title });
+      if (result.reason === "unknown") return t("cmd.unknown", { id: record.id });
+      if (result.reason === "unreadable") return t("cmd.unavailable");
+      if (result.reason === "newer") return t("cmd.newerReport", { id: record.id, action: needsOwner(result.record) ?? "", report: reportNumber(result.record) });
+      return t("cmd.nothingToDo", { id: record.id, status: statusWord(t, service.get(record.id) ?? record) });
     }
     case "model": {
       const result = service.setModel(scope, record.id, address.model);
@@ -65,7 +91,7 @@ function statusWord(t: OwnerT<"subsessions">, r: SubsessionRecord, background = 
     case "queued": return t("status.queued");
     case "active": return t("status.active");
     case "waiting": return r.waitingOn === "external" ? t("status.waitingExternal") : t("status.waitingOwner");
-    case "finished": return t("status.finished");
+    case "finished": return needsOwner(r) ? t("status.needsOwner") : t("status.finished");
     case "cancelled": return t("status.cancelled");
     case "failed": return t("status.failed");
     case "archived": return t("status.archived");
@@ -84,6 +110,8 @@ function taskDetail(t: OwnerT<"subsessions">, r: SubsessionRecord, background: b
   if (r.status === "waiting" && r.waitingReason) {
     lines.push(background ? t("cmd.detailFallback", { reason: r.waitingReason }) : t("cmd.detailWaiting", { reason: r.waitingReason }));
   }
+  const action = needsOwner(r);
+  if (action) lines.push(t("cmd.detailNeedsOwner", { action, id: r.id, report: reportNumber(r) }));
   const step = currentStep(r);
   if (step) lines.push(t("cmd.detailStep", { step }));
   if (r.model) lines.push(t("cmd.detailModel", { model: r.model }));

@@ -142,17 +142,34 @@ export interface TurnOrigin {
   chatId: string;
 }
 
+/**
+ * A message the owner wrote, as the harness received it: what a session may
+ * attach when it passes something on (task_message), so the receiver gets the
+ * owner's own words, never the model's retelling of them.
+ */
+export interface OwnerTurnMessage {
+  text: string;
+  /** Unix ms, as the channel gave it. */
+  at: number;
+  /** The channel it came in on (imessage, telegram, web). */
+  channel: string;
+}
+
 export class TurnAudienceRegistry {
   private live = new Map<string, Map<number, string[]>>();
   /** The chats each live turn's messages came in on (inbound turns only). */
   private origins = new Map<number, TurnOrigin[]>();
+  /** The owner's own messages each live turn carries (inbound turns only). */
+  private owner = new Map<number, OwnerTurnMessage[]>();
   private nextId = 1;
 
   /** Register a turn. Returns the id to pass to `end`. `origins`: the chat of
-   *  each inbound message, for a turn the owner (or a group) is typing in. */
-  begin(sessionKey: string, audiences: readonly string[] | undefined, origins?: readonly TurnOrigin[]): number {
+   *  each inbound message, for a turn the owner (or a group) is typing in.
+   *  `ownerMessages`: the owner's own messages in it (private DM ones only). */
+  begin(sessionKey: string, audiences: readonly string[] | undefined, origins?: readonly TurnOrigin[], ownerMessages?: readonly OwnerTurnMessage[]): number {
     const id = this.nextId++;
     if (origins?.length) this.origins.set(id, origins.map((o) => ({ ...o })));
+    if (ownerMessages?.length) this.owner.set(id, ownerMessages.map((m) => ({ ...m })));
     let turns = this.live.get(sessionKey);
     if (!turns) {
       turns = new Map();
@@ -173,6 +190,7 @@ export class TurnAudienceRegistry {
 
   end(sessionKey: string, id: number): void {
     this.origins.delete(id);
+    this.owner.delete(id);
     const turns = this.live.get(sessionKey);
     if (!turns) return;
     turns.delete(id);
@@ -197,6 +215,21 @@ export class TurnAudienceRegistry {
     }
     const distinct = new Set(all.map((o) => `${o.channelName}\u0000${o.chatId}`));
     return distinct.size === 1 ? { ...all[0] } : undefined;
+  }
+
+  /**
+   * The owner's own messages in the turns live on this session, oldest first.
+   * Empty unless the session's live turns are the owner's own (the same
+   * fail-closed rule as `isOwnAudienceTurn`: never while a summoned group or
+   * a mixed batch is steering it), and when no live turn carries one (a cron
+   * job, a heartbeat, a background report: nobody wrote anything).
+   */
+  ownerMessages(sessionKey: string): OwnerTurnMessage[] {
+    const turns = this.live.get(sessionKey);
+    if (!turns || turns.size === 0 || !this.isOwnAudienceTurn(sessionKey)) return [];
+    const all: OwnerTurnMessage[] = [];
+    for (const id of turns.keys()) all.push(...(this.owner.get(id) ?? []).map((m) => ({ ...m })));
+    return all.sort((a, b) => a.at - b.at);
   }
 
   /** The ids of the turns registered live on this session right now. Ids are

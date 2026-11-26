@@ -1,6 +1,6 @@
 import { lazy, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { messageSubsession, taskAction } from "./api.js";
+import { markSubsessionDone, messageSubsession, taskAction } from "./api.js";
 import { activeSubsessions, useSubsessions } from "./subsessions.js";
 import { useWeb } from "./use-web.js";
 import { onResume, repaint } from "./resume.js";
@@ -86,11 +86,14 @@ export function App() {
   const subsessionList = useSubsessions(web.subsessionRevision);
   // A sub-session running now counts on the Tasks button like a running subagent.
   const running = runningCount(web.tasks) + activeSubsessions(subsessionList.tasks);
-  // The owner writes to one of their sub-sessions from its chat in the rail (same gate as a message).
+  // The owner writes to one of their sub-sessions from its chat in the rail, and marks what its report asked done (same gate as a message).
   const railSubsessions = { tasks: subsessionList.tasks, revision: web.subsessionRevision,
     ...(web.bootstrap?.ownerId ? { send: async (id: string, requestId: string, text: string) => {
       if (!web.bootstrap) throw new Error("not ready");
       return (await messageSubsession(id, { requestId, text }, web.bootstrap, web.refreshBootstrap)).task;
+    }, done: async (id: string, report: number) => {
+      if (!web.bootstrap) throw new Error("not ready");
+      return (await markSubsessionDone(id, { report }, web.bootstrap, web.refreshBootstrap)).task;
     } } : {}) };
   // Stop / move to background for an opened task of the owner conversation (same gate as a message).
   const taskControl = { ownerId: ownerId ?? undefined, act: async (task: { sessionId: string; taskId: string }, action: "stop" | "background") => {
@@ -171,7 +174,7 @@ export function App() {
         className={`${scrim} transition-opacity duration-[220ms] data-[state=closed]:opacity-0`} />}
       {railMotion.mounted && <aside ref={rail} id="tasks-rail" aria-label={t("header.tasks")} data-state={railMotion.shown ? "open" : "closed"} {...(modal ? { role: "dialog", "aria-modal": true } : {})}
         style={railSize.width !== null ? { width: railSize.width } : undefined}
-        className="group/rail relative flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l pt-4 pb-6 pl-3.5 max-[1024px]:fixed max-[1024px]:top-[72px] max-[1024px]:compact:top-[calc(3rem+env(safe-area-inset-top))] max-[1024px]:right-0 max-[1024px]:bottom-0 max-[1024px]:z-30 max-[1024px]:w-[min(340px,88vw)] max-[1024px]:bg-background max-[1024px]:pt-3 max-[1024px]:pl-2.5 max-[1024px]:shadow-2xl max-[1024px]:transition-transform max-[1024px]:duration-[220ms] max-[1024px]:data-[state=closed]:translate-x-full max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+        className="group/rail relative flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l px-3.5 pt-4 pb-6 max-[1024px]:fixed max-[1024px]:top-[72px] max-[1024px]:compact:top-[calc(3rem+env(safe-area-inset-top))] max-[1024px]:right-0 max-[1024px]:bottom-0 max-[1024px]:z-30 max-[1024px]:w-[min(340px,88vw)] max-[1024px]:bg-background max-[1024px]:px-3 max-[1024px]:pt-3 max-[1024px]:shadow-2xl max-[1024px]:transition-transform max-[1024px]:duration-[220ms] max-[1024px]:data-[state=closed]:translate-x-full max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:pb-[max(1.5rem,env(safe-area-inset-bottom))]">
         <div className="flex min-h-0 min-w-[246px] flex-1 flex-col transition-[opacity,transform] duration-[220ms] min-[1025px]:group-data-[state=closed]/rail:translate-x-4 min-[1025px]:group-data-[state=closed]/rail:opacity-0"><TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks} control={taskControl} subsessions={railSubsessions}
           footer={<ScheduledSection revision={web.cronRevision} onNavigate={() => { if (overlay) setTasksOpen(false); }} />} /></div>
         {railSize.separator && <div {...railSize.separator}

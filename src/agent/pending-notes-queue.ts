@@ -46,7 +46,8 @@ function capErrorNotes(notes: ErrorNote[]): ErrorNote[] {
  * losing it to the cap would lose the message. Same for an
  * `interrupted-agents` note: its ledger entry is already gone. And a
  * `subsession-report` note: the task record says the report was delivered
- * once the note is on disk.
+ * once the note is on disk. And a `subsession-message` note: the task was
+ * told its message was handed to the owning session once the note is on disk.
  */
 function isPinnedNote(note: string): boolean {
   // Pinned or not is read off the text; identity is the id (see PendingNote).
@@ -54,6 +55,7 @@ function isPinnedNote(note: string): boolean {
   return note.includes('<tomo-event type="inbox"')
     || note.includes('<tomo-event type="interrupted-agents"')
     || note.includes('<tomo-event type="subsession-report"')
+    || note.includes('<tomo-event type="subsession-message"')
     // A failed task's unanswered messages: the record is forgotten once this is on disk.
     || note.includes('<tomo-event type="subsession-handback"');
 }
@@ -215,6 +217,23 @@ export class PendingNotesQueue {
     return this.persist(sessionKey);
   }
 
+  /**
+   * Take back the newest queued (not drained) note that matches, e.g. one
+   * whose write just failed and whose sender is told it was not handed over:
+   * it must not reach a turn from memory after that. True when one was
+   * found queued; one already drained into a turn is not touched.
+   */
+  withdrawNote(sessionKey: string, match: (note: string) => boolean): boolean {
+    const arr = this.queued(sessionKey);
+    let idx = arr.length - 1;
+    while (idx >= 0 && !match(arr[idx].text)) idx -= 1;
+    if (idx < 0) return false;
+    arr.splice(idx, 1);
+    // Best effort: the disk never had it if its own write failed.
+    this.persist(sessionKey);
+    return true;
+  }
+
   queueError(sessionKey: string, visibleError: string): void {
     const normalized = visibleError.replace(/\s+/g, " ").trim();
     const clipped = truncateForPendingError(normalized, MAX_SINGLE_PENDING_ERROR_CHARS);
@@ -295,11 +314,13 @@ export class PendingNotesQueue {
    * has been written since, and these sessions' notes, queued and in flight,
    * would otherwise be in memory only until each one happens to be written.
    */
-  persistLoaded(): void {
+  persistLoaded(): string[] {
+    const failed: string[] = [];
     for (const key of this.notes.keys()) {
       if (this.unloaded.has(key)) continue;
-      this.persist(key);
+      if (!this.persist(key)) failed.push(key);
     }
+    return failed;
   }
 
   /**

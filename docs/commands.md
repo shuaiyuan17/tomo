@@ -43,7 +43,7 @@ These are answered by Tomo itself, without a model call. Replies follow config `
 | `/login` | Refresh Claude login from the owner's private DM (`/login cancel` aborts a pending login) |
 | `/mcp` | Show external MCP health; `/mcp login <server>` starts per-server OAuth (owner DM only) |
 | `/status` | Show session info (model, channel, message count) |
-| `/s` | Sub-sessions (when `subsessions` is on; owner's Telegram or iMessage DM): `/s` lists them, `/s s3` shows one, `/s s3 <message>` talks to it, `/s s3 stop` / `start` / `model <name>` |
+| `/s` | Sub-sessions (when `subsessions` is on; owner's Telegram or iMessage DM): `/s` lists them, `/s s3` shows one, `/s s3 <message>` talks to it, `/s s3 stop` / `start` / `done` / `model <name>` |
 | `/tasks` | List this chat's running tasks and the last 5 finished today (`/tasks all`: all of today). `/task` works too |
 | `/todo` | List this chat's open todos; `/todo add <text>`, `/todo done <id>`, `/todo drop <id> [reason]`, `/todo all` |
 | `/cost` | Show current-session cost for 1d / 7d / 1mo |
@@ -70,7 +70,7 @@ Your DM shows your own session's tasks. A group shows only that group's own task
 
 ### `/s`
 
-With sub-sessions on (`subsessions.enabled`, see [configuration](configuration.md#sub-sessions)), `/s` in your own Telegram or iMessage DM lists your sub-sessions and `/s s3` shows one. `/s s3 <message>` sends that task a message; replying to one of its `[s3 · …]` messages does the same. `/s s3 stop` cancels it, `/s s3 start` starts a queued one now even past `maxRunning`, and `/s s3 model <opus|sonnet|fable>` changes its model from its next turn. Only an exact `stop`, `start` or `model <name>` is a command, so `/s s3 stop the deploy` is a message to the task. Commands answer without a model call. A message to a task that has ended or doesn't exist reaches your main conversation instead, with a note. In groups and the web chat, `/s` is ordinary text.
+With sub-sessions on (`subsessions.enabled`, see [configuration](configuration.md#sub-sessions)), `/s` in your own Telegram or iMessage DM lists your sub-sessions and `/s s3` shows one. `/s s3 <message>` sends that task a message; replying to one of its `[s3 · …]` messages does the same. `/s s3 stop` cancels it, `/s s3 start` starts a queued one now even past `maxRunning`, `/s s3 done` clears a finished task's "Needs you" once you've done what its report asked (`/s s3 done 2`, as `/s s3` shows it, clears only report 2's ask, so a newer report that arrived meanwhile still needs you; a bare `done` means report 1; a task that needs you is not cancelled by `stop`; use `done`), and `/s s3 model <opus|sonnet|fable>` changes its model from its next turn. Only an exact `stop`, `start`, `done` or `model <name>` is a command, so `/s s3 stop the deploy` is a message to the task. Commands answer without a model call. A message to a task that has ended or doesn't exist reaches your main conversation instead, with a note. In groups and the web chat, `/s` is ordinary text.
 
 ### `/todo`
 

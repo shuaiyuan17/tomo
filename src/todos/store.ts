@@ -505,38 +505,6 @@ export class TodoStore {
   }
 
   /**
-   * Harness only, for the sub-session link (src/agent/subsessions/todo-link.ts):
-   * point an open item at whoever it waits on now, with its next step. Not
-   * one of the four actions and never offered to the model: a task's todo
-   * follows the task's lifecycle. The review date moves only when `waiting_on`
-   * changes. Writes nothing when nothing would change; undefined when the item
-   * is not open (the owner may have closed it).
-   */
-  relink(id: string, waitingOn: WaitingOn, next: string, now: number = Date.now()): TodoItem | undefined {
-    const limits = this.limits;
-    const step = line("next", next, limits.nextMaxChars, true);
-    if (!WAITING_ON.includes(waitingOn)) throw new TodoRuleError({ kind: "waiting_on_invalid", allowed: WAITING_ON.join(", ") });
-    const current = this.list().find((item) => item.id === id);
-    if (!current) return undefined;
-    if (current.waiting_on === waitingOn && current.next === step) return current;
-    return this.mutate((file) => {
-      const index = file.items.findIndex((item) => item.id === id);
-      if (index === -1) return undefined;
-      const found = file.items[index];
-      const moved = found.waiting_on !== waitingOn;
-      const updated: TodoItem = {
-        ...found,
-        next: step,
-        waiting_on: waitingOn,
-        ...(moved ? { review_at: new Date(now + (waitingOn === "me" ? limits.reviewDaysSelf : limits.reviewDaysWaiting) * DAY_MS).toISOString() } : {}),
-        updated_at: new Date(now).toISOString(),
-      };
-      file.items[index] = updated;
-      return updated;
-    });
-  }
-
-  /**
    * Lock, read fresh, change, publish atomically. A read error aborts before
    * anything is written. Just before the rename the file is read again and
    * compared with what this attempt read: if another writer got in (the lock

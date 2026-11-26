@@ -186,6 +186,33 @@ describe("interrupted subagents across a restart", () => {
     await second.agent.stop();
   });
 
+  it("notes held in memory that could not be written to the fresh file are written once the disk is back", async () => {
+    const { agent } = await boot();
+    const internals = agent as unknown as {
+      pendingNotesQueue: { queueNote(k: string, n: string): boolean };
+      sessions: { onPendingNotesQuarantined?: (aside: string) => void };
+      pendingNotesRewriteTimer?: ReturnType<typeof setTimeout>;
+    };
+    vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(true);
+    internals.pendingNotesQueue.queueNote("imessage:712", "keep me 712");
+    // The file was moved aside; writing to the fresh one fails for now.
+    const write = vi.spyOn(SessionStore.prototype, "setPendingNotes").mockImplementation(() => { throw new Error("ENOSPC"); });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      internals.sessions.onPendingNotesQuarantined!("/x/_pending_notes.json.corrupt-1");
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(internals.pendingNotesRewriteTimer).toBeDefined();
+      write.mockRestore();
+      vi.advanceTimersByTime(60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(durableNotes(agent, "imessage:712")).toContain("keep me 712");
+    expect(internals.pendingNotesRewriteTimer).toBeUndefined();
+    await agent.stop();
+  });
+
   it("a note about the same subagent left by an earlier process does not stand in for this restart's", async () => {
     const first = await boot();
     await haveSession(first.channel, "711");

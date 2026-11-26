@@ -11,5 +11,7 @@ export default defineConfig({ test: {
   // One viewport-and-theme pass per test; each boots the real stack and drives its own Chromium.
   testTimeout: 300_000, hookTimeout: 60_000,
   fileParallelism: false,
+  // A temp HOME per file (and for every process it starts): see tests/setup/isolate-home.ts.
+  setupFiles: ["./tests/setup/isolate-home.ts"],
   env: { TOMO_LOG_INLINE: "1", TOMO_LOG_FILE: "" },
 } });

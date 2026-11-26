@@ -3,7 +3,7 @@ import type { ReplyTarget } from "../sessions/types.js";
 import type { InboundItem } from "./inbound-batcher.js";
 import type { OwnerNoticeTarget, ShutdownTurnEnd } from "./turn-runner.js";
 import type { UsageSource } from "../usage/ledger.js";
-import type { TurnOrigin } from "./audience.js";
+import type { OwnerTurnMessage, TurnOrigin } from "./audience.js";
 
 // Request and option shapes passed between the Agent's turn entry points.
 
@@ -36,6 +36,9 @@ export interface UserTurnRequest {
   passiveListen?: boolean;
   /** Durable-inbox progress for the messages behind this turn. */
   inboxHooks?: InboxTurnHooks;
+  /** The owner's own messages in this turn (their private DM ones), for
+   *  task_message to attach. See TurnAudienceRegistry.ownerMessages. */
+  ownerMessages?: OwnerTurnMessage[];
   /** Owner DM notice for an error `suppressErrors` keeps out of the chat. */
   ownerNotice?: OwnerNoticeTarget;
   /** This turn's inbound audiences, in order (see agent/audience.ts): "dm",

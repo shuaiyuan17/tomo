@@ -4,7 +4,9 @@
  * - `/s` lists the owner's sub-sessions.
  * - `/s <id>` shows one.
  * - `/s <id> stop` cancels it; `/s <id> start` starts a queued one past the
- *   slot cap; `/s <id> model <alias>` changes its model.
+ *   slot cap; `/s <id> model <alias>` changes its model; `/s <id> done [n]`
+ *   says the owner did what its report asked of them (`n`, the report
+ *   number `/s <id>` showed them: a newer report's ask is not cleared by it).
  * - `/s <id> <anything else>` is a message to it.
  *
  * Only an EXACT match of what follows the id is a command (any case,
@@ -20,9 +22,13 @@ export type TaskAddress =
   | { kind: "list" }
   /** `/s <something>` where `<something>` is not a task id. */
   | { kind: "usage" }
+  /** `/s trust`: the owner checked a task table recovered from its backup (SubsessionService.trust). */
+  | { kind: "trust" }
   | { kind: "show"; id: string }
   | { kind: "stop"; id: string }
   | { kind: "start"; id: string }
+  /** `report`: the report number the owner answered, when they gave one. */
+  | { kind: "done"; id: string; report?: number }
   | { kind: "model"; id: string; model: string }
   | { kind: "message"; id: string; body: string };
 
@@ -41,12 +47,15 @@ export function parseTaskAddress(text: string, botUsername?: string): TaskAddres
   if (!rest) return { kind: "list" };
   const space = rest.search(/\s/);
   const head = space === -1 ? rest : rest.slice(0, space);
+  if (/^trust$/i.test(rest)) return { kind: "trust" };
   if (!TASK_ID.test(head)) return { kind: "usage" };
   const id = head.toLowerCase();
   const tail = space === -1 ? "" : rest.slice(space).trim();
   if (!tail) return { kind: "show", id };
   if (/^stop$/i.test(tail)) return { kind: "stop", id };
   if (/^start$/i.test(tail)) return { kind: "start", id };
+  const done = /^done(?:\s+(\d{1,9}))?$/i.exec(tail);
+  if (done) return done[1] !== undefined && Number(done[1]) > 0 ? { kind: "done", id, report: Number(done[1]) } : { kind: "done", id };
   const model = /^model\s+(\S+)$/i.exec(tail);
   if (model) return { kind: "model", id, model: model[1] };
   return { kind: "message", id, body: tail };

@@ -32,7 +32,7 @@ class IdChannel extends MockChannel {
 async function boot(enabled = true, channel: MockChannel = new MockChannel("telegram")): Promise<{ agent: Agent; channel: MockChannel }> {
   resetConfig({
     identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-    subsessions: { ...mockConfig.subsessions, enabled },
+    subsessions: { ...mockConfig.subsessions, ownerMessages: "direct", enabled },
     tomoHome: mockConfig.tomoHome,
   });
   const agent = new Agent();
@@ -66,7 +66,7 @@ describe("sub-sessions through the Agent", () => {
   it("gives a task session no external MCP server and no claude.ai connector", async () => {
     resetConfig({
       identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-      subsessions: { ...mockConfig.subsessions, enabled: true },
+      subsessions: { ...mockConfig.subsessions, ownerMessages: "direct", enabled: true },
       tomoHome: mockConfig.tomoHome,
       mcpServers: { linear: { server: { type: "http", url: "https://example.invalid/mcp" } } },
     } as never);
@@ -198,7 +198,7 @@ describe("sub-sessions through the Agent", () => {
     it("matches a reply sent while the task's message is still sending, once the inbox has it", async () => {
       resetConfig({
         identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-        subsessions: { ...mockConfig.subsessions, enabled: true },
+        subsessions: { ...mockConfig.subsessions, ownerMessages: "direct", enabled: true },
         inbox: true,
         tomoHome: mockConfig.tomoHome,
       });
@@ -240,7 +240,7 @@ describe("sub-sessions through the Agent", () => {
     it("tells the owner's session when a reply sent during a task's send still matches nothing once the send settles", async () => {
       resetConfig({
         identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-        subsessions: { ...mockConfig.subsessions, enabled: true },
+        subsessions: { ...mockConfig.subsessions, ownerMessages: "direct", enabled: true },
         inbox: true,
         tomoHome: mockConfig.tomoHome,
       });
@@ -282,7 +282,7 @@ describe("sub-sessions through the Agent", () => {
     it("still warns after a restart that came before a reply sent during a task's send was matched", async () => {
       resetConfig({
         identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-        subsessions: { ...mockConfig.subsessions, enabled: true },
+        subsessions: { ...mockConfig.subsessions, ownerMessages: "direct", enabled: true },
         inbox: true,
         tomoHome: mockConfig.tomoHome,
       });
@@ -312,7 +312,7 @@ describe("sub-sessions through the Agent", () => {
     it("warns by task id on replay even when the task table cannot be read", async () => {
       resetConfig({
         identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-        subsessions: { ...mockConfig.subsessions, enabled: true },
+        subsessions: { ...mockConfig.subsessions, ownerMessages: "direct", enabled: true },
         inbox: true,
         tomoHome: mockConfig.tomoHome,
       });
@@ -403,7 +403,7 @@ describe("sub-sessions through the Agent", () => {
     const staleBoot = async (channelName = "telegram") => {
       resetConfig({
         identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-        subsessions: { ...mockConfig.subsessions, enabled: true },
+        subsessions: { ...mockConfig.subsessions, ownerMessages: "direct", enabled: true },
         inbox: true,
         inboxReplayMaxAgeMinutes: 0,
         tomoHome: mockConfig.tomoHome,
@@ -552,7 +552,7 @@ describe("sub-sessions through the Agent", () => {
   it("recovers sub-sessions before any channel ingests, and runs no task turn until start() opens dispatch", async () => {
     resetConfig({
       identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }],
-      subsessions: { ...mockConfig.subsessions, enabled: true },
+      subsessions: { ...mockConfig.subsessions, ownerMessages: "direct", enabled: true },
       tomoHome: mockConfig.tomoHome,
     });
     // The last run left a task in the middle of a turn.
@@ -619,7 +619,7 @@ describe("sub-sessions through the Agent", () => {
     await channel.simulateMessage(makeMsg({ chatId: "12345", text: "hi" }));
     await drainQueue(agent);
     mockSdk.promptsBySession = [];
-    // The task tells the owner something private (task_notify's path).
+    // The task tells the owner something private (task_reply's unprompted path).
     expect((await internals.subsessions.deps.sendToScope("dm:alex", "[s1 · t] SECRET-WORDS", "task:s1", "Your sub-session s1")).ok).toBe(true);
     expect(await agent.handleCronMessage("Scheduled group task", "telegram:-100271", { waitForHandoff: true })).toBe(true);
     const groupTurn = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex").map((p) => p.text).join("\n");

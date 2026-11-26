@@ -12,6 +12,9 @@ const TEST_HOME = mkdtempSync(join(tmpdir(), "tomo-restart-inflight-"));
 const REQUEST_DIR = join(TEST_HOME, ".tomo", "data", "restart-requests");
 vi.stubEnv("HOME", TEST_HOME);
 vi.stubEnv("TOMO_WORKSPACE", join(TEST_HOME, ".tomo", "workspace"));
+// The launch is what these tests are about, and `spawn` is mocked below; the
+// test setup turns the real helper off for everyone else.
+vi.stubEnv("TOMO_RESTART_HELPER", undefined);
 vi.resetModules();
 
 const hoisted = vi.hoisted(() => ({
@@ -339,6 +342,21 @@ describe("a failed restart helper is reported once and frees the next restart", 
     expect(claims).toEqual(["claimed dm:shuai", "withdrawn dm:shuai"]);
   });
 
+  it("spawns nothing while the helper is switched off, and says why", () => {
+    // The switch the test setup sets for every other file: a claimed request
+    // there must not start a real `<runner> restart` process.
+    vi.stubEnv("TOMO_RESTART_HELPER", "off");
+    try {
+      const { notes, restart } = makeCoordinator();
+      restart("first");
+      expect(hoisted.spawnCalls).toEqual([]);
+      expect(notes).toEqual(["Scheduled Tomo restart failed: the restart helper is disabled (TOMO_RESTART_HELPER=off)"]);
+      expect(pending()).toEqual([]);
+    } finally {
+      vi.stubEnv("TOMO_RESTART_HELPER", undefined);
+    }
+  });
+
   it("reports a missing CLI entry point without spawning, and frees the next restart", () => {
     const { notes, restart } = makeCoordinator();
     const argv1 = process.argv[1];
@@ -353,5 +371,25 @@ describe("a failed restart helper is reported once and frees the next restart", 
     expect(hoisted.spawnCalls).toEqual([]);
     restart("second");
     expect(hoisted.spawnCalls).toHaveLength(1);
+  });
+});
+
+describe("a marker whose request file is gone is logged, not dropped silently", () => {
+  it("warns with the request id and session when another process claimed the file first", async () => {
+    const { log } = await import("../src/logger.js");
+    const warn = vi.mocked(log.warn);
+    warn.mockClear();
+    const coordinator = new RestartCoordinator({ isStopping: () => false, queuePendingErrorNote: () => {} });
+    const request = file("dm:shuai", "config changed");
+    // The other process: claims the request before this daemon sees the marker.
+    rmSync(join(REQUEST_DIR, `${request.id}.json`));
+
+    coordinator.handleToolResult("dm:shuai", "Bash", formatRestartRequestResult(request), false);
+
+    expect(hoisted.spawnCalls).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(
+      { sessionKey: "dm:shuai", requestId: request.id },
+      "Restart marker seen but its request file is gone (claimed by another process?)",
+    );
   });
 });

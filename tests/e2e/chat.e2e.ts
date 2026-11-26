@@ -1616,11 +1616,19 @@ it("the top bar is 45px on every screen and holds only the wordmark and where yo
     await other.close();
   }
 
-  // A narrow phone on Home (three toggles) while the connection is spelled out in words: nothing leaves the bar.
+  // A narrow phone on Home (three toggles) that cannot reach the event stream: nothing leaves the bar, and the
+  // connection state is still there in words, whole and on screen (just under the bar).
   const narrow = await browser.newPage({ viewport: { width: 320, height: 640 }, hasTouch: true, isMobile: true });
+  await narrow.route("**/api/v1/events?**", (route) => route.abort());
   await narrow.goto(`${url}/?t=${token}#home`);
   await browserExpect(narrow.getByTestId("header-title")).toHaveText("Home");
-  await narrow.locator("header [role=status] span").evaluate((el) => { el.textContent = "Reconnecting…"; el.classList.remove("max-[600px]:sr-only"); });
+  await browserExpect(narrow.locator("header [role=status]")).toHaveAttribute("data-connection", /connecting|reconnecting/);
+  const words = narrow.getByTestId("connection-words");
+  await browserExpect(words).toHaveText(/^(Connecting|Reconnecting)…$/);
+  const shown = await words.evaluate((el) => { const r = el.getBoundingClientRect(); return { left: r.left, right: r.right, clipped: el.scrollWidth > el.clientWidth + 0.5 }; });
+  expect(shown.clipped).toBe(false);
+  expect(shown.left).toBeGreaterThanOrEqual(0);
+  expect(shown.right).toBeLessThanOrEqual(320);
   const fits = await narrow.locator("header").evaluate((el) => ({
     overflow: el.scrollWidth - el.clientWidth,
     buttons: [...el.querySelectorAll("button")].filter((b) => b.getClientRects().length).map((b) => { const r = b.getBoundingClientRect(); return [r.left, r.right, r.width]; }),

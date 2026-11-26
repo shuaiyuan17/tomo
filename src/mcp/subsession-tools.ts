@@ -257,11 +257,9 @@ export function buildTaskOwnerTools(deps: {
     tool(
       "task_spawn",
       [
-        "Start a sub-session: a separate session that works on one long task in the background and reports back. For work that takes many steps or a long time (a PR to write and see through review, a long investigation), so this conversation stays free. Not for a quick question.",
+        "Start a sub-session: a separate session that works on one long task in the background and reports back.",
         "",
         "The task gets no memory and none of this conversation: `brief` must say everything it needs (goal, where things are, what done looks like, what it may do without asking). Put the owner's own words about the task in `quote`, verbatim, so the task sees what they actually asked.",
-        "",
-        "When you start a task on your own (the owner did not ask for one), you must tell the owner first, in this conversation, what you are starting and why. Never start one silently.",
         "",
         "It starts when a slot is free. It reports with task_finish; you get the report as a note and tell the owner.",
       ].join("\n"),

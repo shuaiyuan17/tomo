@@ -165,7 +165,7 @@ export function sdkOptions(
   const isGroup = subsession ? subsession.groupScope : sessionContext ? isGroupSessionKey(sessionContext.sessionKey) : false;
   const staticPrompt = subsession
     ? subsession.staticPrompt
-    : buildSystemPrompt({ isGroup, onContext: sessionContext?.onPromptContext });
+    : buildSystemPrompt({ isGroup, subsessions: config.subsessions.enabled, onContext: sessionContext?.onPromptContext });
   const maxTurns = subsession ? subsession.maxTurns : config.maxTurns;
 
   // Why `memory/private/` is closed for the turn in flight — or null when it is

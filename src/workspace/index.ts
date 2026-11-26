@@ -226,6 +226,22 @@ export const HOME_NOTE = `## Your Home
 You have a home: a small 3D room the owner can open in the web UI, which you design as data in \`~/.tomo/workspace/home/scene.json\` and which shows what you are doing. Load the \`tomo-home\` skill before changing it, and check your work with \`home_check\`.`;
 
 /**
+ * Owner DM only, and only with sub-sessions on (`subsessions.enabled`): when
+ * to do work in the turn, with a subagent, or as a sub-session. task_spawn's
+ * own description says only how to use it, so this is said once.
+ */
+export const DELEGATION_NOTE = `## Long tasks
+
+Before you start on an ask, two questions: will the owner come back to it later (feedback, a change of direction, a follow-up), and will it take long enough that they shouldn't sit waiting in the chat? A yes to either goes to a sub-session with \`task_spawn\`: a PR through review, a long investigation. A sub-session has no connectors or external MCP servers, so work that needs them stays here. Two noes, and you do it yourself in this turn, with as many lookups as a right answer needs; the number of tool calls doesn't decide it. If the first looks show it won't wrap up in a minute or two, say where things stand and hand the rest off. An Agent subagent is for a piece of this turn that can run in parallel and that the owner won't talk to again.
+
+Before handing off, look only as far as the brief needs: the task starts with nothing, so the brief carries what you've already found. Before you call \`task_spawn\`, tell the owner in a line what you're starting (and why, if they didn't ask for one), then stay free to talk.`;
+
+/** The DM-only tail of the prompt: the home note, and the delegation note when sub-sessions are on. */
+function ownerNotes(subsessions: boolean): string {
+  return subsessions ? `${HOME_NOTE}\n\n${DELEGATION_NOTE}` : HOME_NOTE;
+}
+
+/**
  * The parts of the system prompt whose change RETIRES live sessions: SOUL,
  * AGENT, IDENTITY and the harness rules. MEMORY.md and the people roster are
  * deliberately not here — they change often (the model itself saves memories
@@ -235,8 +251,8 @@ You have a home: a small 3D room the owner can open in the web UI, which you des
  * through {@link promptContextSnapshot}; its next rebuild (idle reap, compact,
  * restart) picks the new text up in the prompt itself.
  */
-export function buildIdentityPrompt(): string {
-  return [load("SOUL"), load("AGENT"), load("IDENTITY"), HARNESS_INSTRUCTIONS, HOME_NOTE]
+export function buildIdentityPrompt(opts: { subsessions?: boolean } = {}): string {
+  return [load("SOUL"), load("AGENT"), load("IDENTITY"), HARNESS_INSTRUCTIONS, ownerNotes(!!opts.subsessions)]
     .filter(Boolean).join("\n\n---\n\n");
 }
 
@@ -273,13 +289,18 @@ export function promptContextSnapshot(opts: { isGroup?: boolean; strict?: boolea
  * (see LiveSessionManager.takePromptContextNote): a second read could see
  * different files than the prompt did.
  */
-export function buildSystemPrompt(opts: { isGroup?: boolean; onContext?: (context: PromptContextSnapshot) => void } = {}): string {
+export function buildSystemPrompt(opts: {
+  isGroup?: boolean;
+  /** `subsessions.enabled`: the DM variant then carries DELEGATION_NOTE. One value per process, so it keeps the shared prefix. */
+  subsessions?: boolean;
+  onContext?: (context: PromptContextSnapshot) => void;
+} = {}): string {
   const isGroup = !!opts.isGroup;
   mkdirSync(MEMORY_DIR, { recursive: true });
   const memoryLines = memoryIndexLines(isGroup);
   const rosterLines = peopleRosterLines(isGroup);
   opts.onContext?.({ memory: (memoryLines ?? []).slice(0, MAX_MEMORY_LINES), people: rosterLines });
   const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup, memoryLines), loadPeopleSection(isGroup, rosterLines),
-    isGroup ? HARNESS_INSTRUCTIONS : `${HARNESS_INSTRUCTIONS}\n\n${HOME_NOTE}`].filter(Boolean);
+    isGroup ? HARNESS_INSTRUCTIONS : `${HARNESS_INSTRUCTIONS}\n\n${ownerNotes(!!opts.subsessions)}`].filter(Boolean);
   return sections.join("\n\n---\n\n");
 }

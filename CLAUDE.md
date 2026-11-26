@@ -205,6 +205,7 @@ Built by `workspace/index.ts` from layered markdown files:
 - `IDENTITY.md` — name and quirks
 - Memory system — injected from `~/.tomo/workspace/memory/`
 - Harness instructions — NO_REPLY, MEDIA: tags, formatting rules
+- Owner DM only: the home note, and with `subsessions.enabled` the `DELEGATION_NOTE` (when to work in the turn, use an Agent subagent, or `task_spawn`; task_spawn's own description says only how to use it). Groups and task sessions never get it.
 
 Changes to workspace files take effect on next message (no restart needed) — the prompt is rebuilt on each new LiveSession.
 

@@ -11,7 +11,8 @@
  * Static here means "identical for every session of the same audience":
  * `buildSystemPrompt({ isGroup })` has two variants (DM / group) because group
  * sessions see MEMORY and PEOPLE with private entries stripped and no home
- * note. Each variant is its own shared prefix. Nothing that names one session
+ * note (nor delegation note, which the DM variant carries when
+ * `subsessions.enabled` is on: one value per process). Each variant is its own shared prefix. Nothing that names one session
  * (session key, SDK session id, group title, participants, listen mode) or
  * that can change per session (the model) may go before the marker — one such
  * byte and every session gets a private copy of the whole prefix again.

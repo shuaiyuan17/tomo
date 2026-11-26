@@ -350,6 +350,8 @@ export const mockWorkspace = {
   /** What `promptContextSnapshot` answers: the MEMORY.md / roster lines a
    *  live session's prompt is built with. */
   promptContext: { memory: [] as string[], people: [] as string[] },
+  /** The options of the last `buildSystemPrompt` call (the mock ignores them). */
+  lastBuildOptions: undefined as { isGroup?: boolean; subsessions?: boolean } | undefined,
 };
 
 export const mockConfig = {
@@ -464,7 +466,8 @@ export function configModuleMock() {
 
 export function workspaceModuleMock() {
   return {
-    buildSystemPrompt: (opts?: { onContext?: (c: { memory: string[]; people: string[] }) => void }) => {
+    buildSystemPrompt: (opts?: { isGroup?: boolean; subsessions?: boolean; onContext?: (c: { memory: string[]; people: string[] }) => void }) => {
+      mockWorkspace.lastBuildOptions = opts;
       opts?.onContext?.(mockWorkspace.promptContext);
       return mockWorkspace.systemPrompt;
     },

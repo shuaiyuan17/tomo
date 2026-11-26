@@ -204,31 +204,58 @@ describe("interrupted subagents across a restart", () => {
     await agent.stop();
   });
 
-  it("notes held in memory that could not be written to the fresh file are written once the disk is back", async () => {
-    const { agent } = await boot();
+  it("notes held in memory that could not be written to the fresh file keep the recovery marker, and the owner is told only once they are written", async () => {
+    const { agent } = await boot({ identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
     const internals = agent as unknown as {
       pendingNotesQueue: { queueNote(k: string, n: string): boolean };
       sessions: { onPendingNotesQuarantined?: (aside: string) => void };
-      pendingNotesRewriteTimer?: ReturnType<typeof setTimeout>;
+      pendingNotesRecoveryTimer?: ReturnType<typeof setTimeout>;
+      recoverPendingNotes(): void;
     };
-    vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(true);
+    const ownerNotice = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(true);
     internals.pendingNotesQueue.queueNote("imessage:712", "keep me 712");
-    // The file was moved aside; writing to the fresh one fails for now.
+    // The file was moved aside (the store wrote the marker first); writing to the fresh one fails for now.
+    const marker = join(mockConfig.sessionsDir, "_pending_notes.recovery.json");
+    writeFileSync(marker, JSON.stringify({ asides: ["/x/_pending_notes.json.corrupt-1"] }));
     const write = vi.spyOn(SessionStore.prototype, "setPendingNotes").mockImplementation(() => { throw new Error("ENOSPC"); });
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       internals.sessions.onPendingNotesQuarantined!("/x/_pending_notes.json.corrupt-1");
       await Promise.resolve();
       await Promise.resolve();
-      expect(internals.pendingNotesRewriteTimer).toBeDefined();
-      write.mockRestore();
-      vi.advanceTimersByTime(60_000);
+      expect(internals.pendingNotesRecoveryTimer).toBeDefined();
+      expect(existsSync(marker)).toBe(true);
+      expect(ownerNotice).not.toHaveBeenCalled();
     } finally {
-      vi.useRealTimers();
+      write.mockRestore();
     }
+    // The retry timer fires.
+    clearTimeout(internals.pendingNotesRecoveryTimer);
+    internals.pendingNotesRecoveryTimer = undefined;
+    internals.recoverPendingNotes();
     expect(durableNotes(agent, "imessage:712")).toContain("keep me 712");
-    expect(internals.pendingNotesRewriteTimer).toBeUndefined();
+    expect(existsSync(marker)).toBe(false);
+    await waitFor(() => expect(ownerNotice).toHaveBeenCalledTimes(1));
+    expect(String(ownerNotice.mock.calls[0][0])).toContain("_pending_notes.json.corrupt-1");
     await agent.stop();
+  });
+
+  it("a restart after the file was moved aside and before the recovery finished does it at start, and tells the owner once", async () => {
+    const first = await boot();
+    crash(first.agent);
+    // The previous process moved the file aside, wrote the marker and went away.
+    writeFileSync(join(mockConfig.sessionsDir, "_pending_notes.json.corrupt-99"), "{not json");
+    const marker = join(mockConfig.sessionsDir, "_pending_notes.recovery.json");
+    writeFileSync(marker, JSON.stringify({ asides: [join(mockConfig.sessionsDir, "_pending_notes.json.corrupt-99")] }));
+    const ownerNotice = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(true);
+    const second = await boot({ identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    await waitFor(() => expect(ownerNotice).toHaveBeenCalledTimes(1));
+    expect(String(ownerNotice.mock.calls[0][0])).toContain("_pending_notes.json.corrupt-99");
+    expect(existsSync(marker)).toBe(false);
+    await second.agent.stop();
+    // The next start has nothing left to do.
+    const third = await boot({ identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    await expectNoChangeFor(() => expect(ownerNotice).toHaveBeenCalledTimes(1), 50);
+    await third.agent.stop();
   });
 
   it("a note about the same subagent left by an earlier process does not stand in for this restart's", async () => {

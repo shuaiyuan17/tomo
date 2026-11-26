@@ -119,7 +119,8 @@ export class PendingNotesQueue {
    *  delivered (see `queueNote`). */
   private settledIds = new Map<string, Set<string>>();
 
-  constructor(private store: DurablePendingNotesStore) {}
+  /** `onSettled`: the ids of the notes a turn carried to its end. */
+  constructor(private store: DurablePendingNotesStore, private onSettled?: (sessionKey: string, ids: string[]) => void) {}
 
   private queued(sessionKey: string): PendingNote[] {
     let arr = this.notes.get(sessionKey);
@@ -306,18 +307,24 @@ export class PendingNotesQueue {
       this.settledIds.set(sessionKey, ids);
     }
     this.persist(sessionKey);
+    try {
+      this.onSettled?.(sessionKey, batch.notes.map((n) => n.id));
+    } catch (err) {
+      log.warn({ err, sessionKey }, "Pending notes settle listener failed");
+    }
   }
 
   /**
-   * Write every session loaded this process again: after the file was moved
+   * Write every session held in memory again: after the file was moved
    * aside (see SessionStore.loadPendingNotes), the fresh one holds only what
    * has been written since, and these sessions' notes, queued and in flight,
    * would otherwise be in memory only until each one happens to be written.
+   * One whose stored notes could not be read is loaded from the fresh file
+   * first. Returns the sessions whose write failed.
    */
-  persistLoaded(): string[] {
+  persistAll(): string[] {
     const failed: string[] = [];
     for (const key of this.notes.keys()) {
-      if (this.unloaded.has(key)) continue;
       if (!this.persist(key)) failed.push(key);
     }
     return failed;

@@ -142,8 +142,8 @@ const REWIND_SHUTDOWN_TIMEOUT_MS = 3_000;
 const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
 /** How often the interrupted-subagents startup check is retried for sessions whose pending notes could not be read. */
 const INTERRUPTED_AGENTS_RETRY_MS = 60_000;
-/** How soon notes held in memory are written again to the fresh notes file, when that failed. */
-const PENDING_NOTES_REWRITE_RETRY_MS = 60_000;
+/** How soon recovery after a moved-aside notes file is tried again, when a note could not be written. */
+const PENDING_NOTES_RECOVERY_RETRY_MS = 60_000;
 /** How soon the owner is told again that the notes file was moved aside, when telling them failed. */
 const PENDING_NOTES_QUARANTINE_NOTICE_RETRY_MS = 60_000;
 /** This process: an interrupted-agents note is about the restart before it.
@@ -278,9 +278,7 @@ export class Agent {
   /** Re-runs the interrupted-subagents startup check for sessions whose pending notes could not be read. */
   private interruptedAgentsRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private pendingNotesQuarantineTimer: ReturnType<typeof setTimeout> | undefined;
-  /** Sessions whose notes were held in memory when the notes file was moved aside, not yet written to the fresh one. */
-  private pendingNotesRewritesOwed = new Set<string>();
-  private pendingNotesRewriteTimer: ReturnType<typeof setTimeout> | undefined;
+  private pendingNotesRecoveryTimer: ReturnType<typeof setTimeout> | undefined;
   /** The most recent sweep — awaited (bounded) by stop() so none is abandoned mid-write. */
   private mcpSweepInFlight: Promise<void> | undefined;
 
@@ -302,23 +300,9 @@ export class Agent {
       findPrivateReplyTarget: () => this.findPrivateReplyTarget(),
       getChannel: (name) => this.getChannel(name),
     });
-    this.pendingNotesQueue = new PendingNotesQueue(this.sessions);
-    this.sessions.onPendingNotesQuarantined = (aside) => {
-      // Called from inside a read of the notes (maybe under a store lock):
-      // only flags are set here. The sub-session service stops cleaning up
-      // at once; the fresh file gets what is in memory, the lost sub-session
-      // notes are written again, and the owner is told, once that read is over.
-      this.subsessions?.pendingNotesLost();
-      queueMicrotask(() => {
-        try {
-          for (const key of this.pendingNotesQueue.persistLoaded()) this.pendingNotesRewritesOwed.add(key);
-        } catch (err) {
-          log.error({ err }, "Could not write the loaded pending notes to the fresh file");
-        }
-        this.retryPendingNotesRewrites();
-        this.notePendingNotesQuarantined(aside);
-      });
-    };
+    this.pendingNotesQueue = new PendingNotesQueue(this.sessions, (_key, ids) => this.subsessions?.notesRead(ids));
+    // Called from inside a read of the notes: recovery runs once that read is over.
+    this.sessions.onPendingNotesQuarantined = () => queueMicrotask(() => this.recoverPendingNotes());
     if (config.inbox) {
       try {
         this.inbox = new DurableInbox({ path: join(config.tomoHome, "data", "inbox.jsonl") });
@@ -653,6 +637,7 @@ export class Agent {
       queuePendingNote: (key, note, id) => this.queuePendingNote(key, isDmSessionKey(key) ? markOwnerAudience(note) : note, id),
       withdrawPendingNote: (key, match) => this.pendingNotesQueue.withdrawNote(key, match),
       hasPendingNote: (key, predicate, whenUnreadable) => this.pendingNotesQueue.hasNote(key, predicate, whenUnreadable),
+      pendingNotesRecovering: () => this.sessions.pendingNotesRecovery() !== undefined,
       persistPendingNotes: (key) => this.pendingNotesQueue.persistNow(key),
       wakeScope: (parentKey, prompt, taskId) => {
         const body = appendToTomoEventBody(prompt, CONTINUITY_DELIVERY_NOTE);
@@ -3438,6 +3423,8 @@ export class Agent {
     } catch (err) {
       log.error({ err }, "Sub-session recovery failed");
     }
+    // A notes file moved aside before this start (or while starting): its notes are written again.
+    this.recoverPendingNotes();
     await Promise.all(this.channels.map((ch) => ch.start()));
     this.channelsUp = true;
     // A pending-notes file moved aside while starting (recovery reads it) is told now.
@@ -3588,9 +3575,9 @@ export class Agent {
       clearInterval(this.mcpTokenRefreshTimer);
       this.mcpTokenRefreshTimer = undefined;
     }
-    if (this.pendingNotesRewriteTimer) {
-      clearTimeout(this.pendingNotesRewriteTimer);
-      this.pendingNotesRewriteTimer = undefined;
+    if (this.pendingNotesRecoveryTimer) {
+      clearTimeout(this.pendingNotesRecoveryTimer);
+      this.pendingNotesRecoveryTimer = undefined;
     }
     if (this.pendingNotesQuarantineTimer) {
       clearTimeout(this.pendingNotesQuarantineTimer);
@@ -3880,29 +3867,37 @@ export class Agent {
   }
 
   /**
-   * After the notes file was moved aside, a session whose notes (held in
-   * memory) could not be written to the fresh file is tried again until it
-   * is: until then a restart would leave them only in the file moved aside.
+   * The pending-notes file was moved aside (see SessionStore.loadPendingNotes),
+   * in this process or one before it: the store's recovery marker says so
+   * until this is done. Every note held in memory is written to the fresh
+   * file, and the sub-session notes it may have held are written again from
+   * the task records (each under its own id, so this can run any number of
+   * times). Once all of it is on disk the marker goes and the owner is told;
+   * until then it is tried again.
    */
-  private retryPendingNotesRewrites(): void {
-    if (this.pendingNotesRewritesOwed.size === 0 || this.stopping || this.pendingNotesRewriteTimer) return;
-    log.warn({ sessions: [...this.pendingNotesRewritesOwed] }, "Pending notes not written to the fresh file yet; trying again");
-    this.pendingNotesRewriteTimer = setTimeout(() => {
-      this.pendingNotesRewriteTimer = undefined;
-      if (this.stopping) return;
-      for (const key of [...this.pendingNotesRewritesOwed]) {
-        let ok = false;
-        try { ok = this.pendingNotesQueue.persistNow(key); } catch (err) { log.error({ err, sessionKey: key }, "Could not write pending notes"); }
-        if (ok) this.pendingNotesRewritesOwed.delete(key);
-      }
-      this.retryPendingNotesRewrites();
-    }, PENDING_NOTES_REWRITE_RETRY_MS);
-    this.pendingNotesRewriteTimer.unref();
-  }
-
-  /** The pending-notes file could not be read and was moved aside (see SessionStore.loadPendingNotes): the owner is told, once the channels are up. */
-  private notePendingNotesQuarantined(aside: string): void {
-    this.pendingNotesQuarantined.push(aside);
+  private recoverPendingNotes(): void {
+    if (this.stopping) return;
+    const asides = this.sessions.pendingNotesRecovery();
+    if (!asides) return;
+    let done = false;
+    try {
+      const unwritten = this.pendingNotesQueue.persistAll();
+      const rebuilt = this.subsessions ? this.subsessions.rebuildLostNotes() : true;
+      done = unwritten.length === 0 && rebuilt && this.sessions.clearPendingNotesRecovery(asides);
+    } catch (err) {
+      log.error({ err }, "Pending notes recovery failed");
+    }
+    if (!done) {
+      log.warn("Notes from the moved-aside pending notes file are not all written again yet; trying again");
+      if (this.pendingNotesRecoveryTimer) return;
+      this.pendingNotesRecoveryTimer = setTimeout(() => {
+        this.pendingNotesRecoveryTimer = undefined;
+        this.recoverPendingNotes();
+      }, PENDING_NOTES_RECOVERY_RETRY_MS);
+      this.pendingNotesRecoveryTimer.unref();
+      return;
+    }
+    this.pendingNotesQuarantined.push(...asides);
     if (this.channelsUp) this.tellPendingNotesQuarantined();
   }
 

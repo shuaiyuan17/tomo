@@ -175,6 +175,47 @@ describe("SessionStore", () => {
     expect(readFileSync(join(TEST_DIR, asides[0]), "utf-8")).toBe(corrupt);
   });
 
+  it("a recovery marker naming the moved-aside file is on disk before the move, and goes once recovery says it is done", () => {
+    const file = join(TEST_DIR, "_pending_notes.json");
+    const marker = join(TEST_DIR, "_pending_notes.recovery.json");
+    writeFileSync(file, "{not json");
+    const store = makeSessionStore(TEST_DIR);
+    let markedAtMove: string[] | undefined;
+    const proto = Object.getPrototypeOf(store) as { moveWithoutClobber(from: string, to: string): string };
+    const real = proto.moveWithoutClobber;
+    const move = vi.spyOn(proto, "moveWithoutClobber").mockImplementation(function (this: unknown, from: string, to: string) {
+      if (from === file) markedAtMove = store.pendingNotesRecovery();
+      return real.call(this, from, to);
+    });
+    try {
+      expect(store.getPendingNotes("dm:alice")).toEqual([]);
+    } finally {
+      move.mockRestore();
+    }
+    const aside = join(TEST_DIR, asidesIn(TEST_DIR)[0]);
+    expect(markedAtMove).toEqual([aside]);
+    // A fresh process (a restart before recovery finished) still reads it.
+    expect(makeSessionStore(TEST_DIR).pendingNotesRecovery()).toEqual([aside]);
+    expect(store.clearPendingNotesRecovery([aside])).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+    expect(store.pendingNotesRecovery()).toBeUndefined();
+  });
+
+  it("a move that does not happen leaves no recovery marker", () => {
+    const file = join(TEST_DIR, "_pending_notes.json");
+    writeFileSync(file, "{not json");
+    const store = makeSessionStore(TEST_DIR);
+    const proto = Object.getPrototypeOf(store) as { moveWithoutClobber(from: string, to: string): string };
+    const move = vi.spyOn(proto, "moveWithoutClobber").mockImplementation(() => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); });
+    try {
+      expect(() => store.getPendingNotes("dm:alice")).toThrow(PendingNotesReadError);
+    } finally {
+      move.mockRestore();
+    }
+    expect(existsSync(file)).toBe(true);
+    expect(store.pendingNotesRecovery()).toBeUndefined();
+  });
+
   it("a pending notes file that is not valid UTF-8 is moved aside byte for byte, even when it would still parse", () => {
     const file = join(TEST_DIR, "_pending_notes.json");
     // 0xff is never valid UTF-8; a lenient decode reads it as U+FFFD inside a

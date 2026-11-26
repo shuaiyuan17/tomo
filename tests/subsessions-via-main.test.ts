@@ -63,6 +63,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: OnTurn = () => ({ 
   } as unknown as H;
   // A fresh process reads the notes from disk.
   for (const [k, v] of h.disk) h.notes.set(k, [...v]);
+  const noteIds = new Map<string, string>();
   // The registry and SDK sessions outlive a restart when shared.
   const sdk = shared?.sdk ?? new Set<string>();
   const registry = sdk;
@@ -78,7 +79,13 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: OnTurn = () => ({ 
     sendToScope: async (parentKey, text) => { h.sent.push({ parentKey, text }); return { ok: true }; },
     noticeToScope: async () => {},
     noticeOwner: async () => {},
-    queuePendingNote: (key, note) => {
+    queuePendingNote: (key, note, id) => {
+      // As the real queue: a note with the same id already held is written again, not added.
+      if (id !== undefined && (h.notes.get(key) ?? []).some((n) => noteIds.get(n) === id)) {
+        h.disk.set(key, [...(h.notes.get(key) ?? [])]);
+        return true;
+      }
+      if (id !== undefined) noteIds.set(note, id);
       h.notes.set(key, [...(h.notes.get(key) ?? []), note]);
       h.duringNoteWrite?.();
       if (h.noteWriteFails > 0) { h.noteWriteFails -= 1; return false; }
@@ -1073,8 +1080,7 @@ describe("via-main: a lost pending notes file", () => {
     // The file is moved aside: nothing of it is left.
     h.notes.clear();
     h.disk.clear();
-    h.service.pendingNotesLost();
-    await flush();
+    expect(h.service.rebuildLostNotes()).toBe(true);
     const notes = messageNotes(h, "dm:owner");
     expect(notes).toHaveLength(1);
     expect(notes[0]).toContain("Merge PR #12 now?");
@@ -1082,25 +1088,27 @@ describe("via-main: a lost pending notes file", () => {
     expect(notes[0]).toContain(lostLine);
   });
 
-  it("writes what the task handed over since the owner last wrote to it again, not what came before", async () => {
+  it("writes every message no turn of the owning session read again: the same words twice are two, a read one is not", async () => {
     const h = harness({}, async (key, prompt, hh) => {
-      if (prompt.includes("subsession-start")) await hh.service.notify(key, "OLD NEWS");
-      if (prompt.includes("subsession-owner-message")) await hh.service.reply(key, "yes, it's the flaky test");
+      if (prompt.includes("subsession-start")) {
+        await hh.service.notify(key, "tests pass");
+        await hh.service.notify(key, "tests pass");
+        await hh.service.notify(key, "READ ALREADY");
+      }
       return { ok: true };
     });
     h.service.start();
     const t = spawn(h);
     await flush();
-    await new Promise((r) => setTimeout(r, 5));
-    expect(h.service.ownerMessage("dm:owner", t.id, "is it the flaky test?").ok).toBe(true);
-    await flush();
+    const sent = h.store.get(t.id)!.sent;
+    expect(sent.map((m) => m.text)).toEqual(["tests pass", "tests pass", "READ ALREADY"]);
+    h.service.notesRead([sent[2].noteId!]);
     h.notes.clear();
     h.disk.clear();
-    h.service.pendingNotesLost();
-    await flush();
+    expect(h.service.rebuildLostNotes()).toBe(true);
     const notes = messageNotes(h, "dm:owner");
-    expect(notes.filter((n) => n.includes("yes, it's the flaky test") && n.includes(lostLine))).toHaveLength(1);
-    expect(notes.some((n) => n.includes("OLD NEWS"))).toBe(false);
+    expect(notes.filter((n) => n.includes("tests pass") && n.includes(lostLine))).toHaveLength(2);
+    expect(notes.some((n) => n.includes("READ ALREADY"))).toBe(false);
   });
 
   it("adds no second copy of a message note still held in memory, so taking the question back leaves none", async () => {
@@ -1115,10 +1123,9 @@ describe("via-main: a lost pending notes file", () => {
     const t = spawn(h);
     await flush();
     expect(messageNotes(h, "dm:owner")).toHaveLength(2);
-    // Only the file is moved aside: the queue still holds both notes, and they are written to the fresh file as they are.
+    // Only the file is moved aside: the notes held in memory are written to the fresh file as they are.
     h.disk.clear();
-    h.service.pendingNotesLost();
-    await flush();
+    expect(h.service.rebuildLostNotes()).toBe(true);
     expect(messageNotes(h, "dm:owner")).toHaveLength(2);
     expect((h.disk.get("dm:owner") ?? []).filter((n) => n.includes("subsession-message"))).toHaveLength(2);
     // The owner writes to the task directly: the question is taken back, and no copy of it stays.

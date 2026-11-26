@@ -431,7 +431,7 @@ describe("PendingNotesQueue while the stored notes cannot be read", () => {
     expect(queue.drain("k")).toBe("");
   });
 
-  it("persistLoaded names the sessions whose write failed", () => {
+  it("persistAll names the sessions whose write failed", () => {
     const store = new MemoryPendingNotesStore();
     const queue = new PendingNotesQueue(store);
     queue.queueNote("a", "one");
@@ -441,21 +441,52 @@ describe("PendingNotesQueue while the stored notes cannot be read", () => {
       if (key === "b") throw new Error("ENOSPC");
       real(key, notes);
     };
-    expect(queue.persistLoaded()).toEqual(["b"]);
+    expect(queue.persistAll()).toEqual(["b"]);
   });
 
-  it("persistLoaded writes every loaded session again, queued and in flight (a fresh file after one was moved aside)", () => {
+  it("persistAll writes every loaded session again, queued and in flight (a fresh file after one was moved aside)", () => {
     const store = new MemoryPendingNotesStore();
     const queue = new PendingNotesQueue(store);
     queue.queueNote("a", "queued", "q1");
     queue.queueNote("b", "carried", "c1");
     const prefix = queue.drain("b");
     store.rows.clear(); // the file was moved aside: the fresh one is empty
-    queue.persistLoaded();
+    queue.persistAll();
     expect(store.texts("a")).toEqual(["queued"]);
     expect(store.texts("b")).toEqual([`${INTERRUPTED_NOTE_MARKER}\ncarried`]);
     queue.settle("b", prefix);
     expect(store.texts("b")).toEqual([]);
+  });
+
+  it("persistAll also writes a session whose stored row could not be read when it queued, once it reads", () => {
+    const store = new MemoryPendingNotesStore();
+    let readable = false;
+    const real = store.getPendingNotes.bind(store);
+    store.getPendingNotes = (key: string) => {
+      if (key === "b" && !readable) throw new Error("EIO");
+      return real(key);
+    };
+    const queue = new PendingNotesQueue(store);
+    queue.queueNote("a", "one");
+    queue.queueNote("b", "held while unreadable", "h1");
+    store.rows.clear(); // the file was moved aside
+    readable = true;
+    expect(queue.persistAll()).toEqual([]);
+    expect(store.texts("a")).toEqual(["one"]);
+    expect(store.texts("b")).toEqual(["held while unreadable"]);
+  });
+
+  it("names the ids a turn read to the settle hook", () => {
+    const store = new MemoryPendingNotesStore();
+    const read: [string, string[]][] = [];
+    const queue = new PendingNotesQueue(store, (key, ids) => read.push([key, ids]));
+    queue.queueNote("k", "one", "id1");
+    queue.queueNote("k", "two");
+    queue.settle("k", queue.drain("k"));
+    expect(read).toHaveLength(1);
+    expect(read[0][0]).toBe("k");
+    expect(read[0][1]).toContain("id1");
+    expect(read[0][1]).toHaveLength(2);
   });
 });
 

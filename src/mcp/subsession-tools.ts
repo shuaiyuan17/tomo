@@ -6,7 +6,7 @@ import type { OwnerTurnMessage } from "../agent/audience.js";
 import { currentStep, DONE_STEPS_KEEP, needsOwner, oneLine, OPEN_STATUSES, OWNER_ACTION_MAX, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, reportNumber, STEP_RESULT_MAX, type SubsessionRecord } from "../agent/subsessions/types.js";
 
 /** The task_* tools a sub-session reports through (its own session only). */
-export const SUBSESSION_SELF_TOOL_NAMES = ["task_reply", "task_notify", "task_ask", "task_plan", "task_update", "task_checkpoint", "task_finish", "task_reopen", "task_status"] as const;
+export const SUBSESSION_SELF_TOOL_NAMES = ["task_reply", "task_ask", "task_plan", "task_update", "task_checkpoint", "task_finish", "task_reopen", "task_status"] as const;
 /** The owning session's tools (the owner's DM only, for now). */
 export const SUBSESSION_OWNER_TOOL_NAMES = ["task_spawn", "task_status", "task_cancel", "task_message", "task_done"] as const;
 /** Every task tool name, once: for the SDK's allowedTools. */
@@ -16,7 +16,7 @@ function viaLabel(via: "main" | "panel" | undefined): string {
   return via === "main" ? " (handed to the main session)" : via === "panel" ? " (in the web task panel)" : "";
 }
 
-/** What a task_reply / task_notify that went through is told. */
+/** What a task_reply that went through is told. */
 function sentText(via: "direct" | "main" | "panel" | undefined): string {
   if (via === "main") return "Handed to the main session, which passes it on to the owner.";
   if (via === "panel") return "Shown in the web task panel, where the owner wrote to you.";
@@ -94,9 +94,6 @@ export function formatTaskDetail(r: SubsessionRecord, now = Date.now(), backgrou
  */
 export function buildTaskSelfTools(deps: { service: () => SubsessionService | undefined; key: string; ownerMessages?: "via-main" | "direct" }) {
   const viaMain = (deps.ownerMessages ?? "via-main") === "via-main";
-  const goes = viaMain
-    ? " It goes to the main session (the owner's own conversation), which decides whether, when and how the owner hears it."
-    : " The harness adds the [id · title] prefix.";
   const service = (name: string): { ok: true; s: SubsessionService } | { ok: false; error: ReturnType<typeof fail> } => {
     const s = deps.service();
     return s ? { ok: true, s } : { ok: false, error: fail(name, "sub-sessions are not available right now.") };
@@ -104,20 +101,20 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
   return [
     tool(
       "task_reply",
-      `Answer a message the owner sent you (<tomo-event type="subsession-owner-message">). Once per message.${viaMain ? " It goes to the main session, which passes it on; an answer to a message the owner wrote in the web task panel stays in that panel." : " The harness adds the [id · title] prefix."} A MEDIA:/path line attaches a file.`,
-      { text: z.string().min(1).max(4000).describe("The answer, in the owner's language, casual and concise. Lead with the answer.") },
+      `Send the owner a message: your answer to a message they sent you (once per message), or, unprompted, a result, a decision they must make, or something that blocks you. Never for progress (that is task_plan).${viaMain ? " It goes to the main session, which decides whether, when and how the owner hears it; in a turn answering a message the owner wrote in the web task panel, every task_reply stays in that panel, where they are reading." : ""} A MEDIA:/path line attaches a file.`,
+      { text: z.string().min(1).max(4000).describe("The message. Lead with the point.") },
       async ({ text }) => {
         const r = service("task_reply");
         if (!r.ok) return r.error;
         const result = await r.s.reply(deps.key, text);
         return result.ok ? ok(sentText(result.via)) : fail("task_reply", result.error ?? "the message did not go out.");
       },
-      { alwaysLoad: true, searchHint: "task reply answer owner message" },
+      { alwaysLoad: true, searchHint: "task reply answer notify owner message result decision blocked" },
     ),
     tool(
       "task_ask",
       `Ask the owner something only they can decide, and pause the task until they answer: a yes for something that sends, posts, pays, deletes or can't be undone, or a choice the brief leaves open. Ask one question, with the options. End the turn after it; ${viaMain ? "the main session puts it to the owner, and their answer comes back as a subsession-relay that quotes your question." : "their answer arrives as a message from them."}`,
-      { question: z.string().min(1).max(4000).describe("The question, in the owner's language, with the options and what each sets off.") },
+      { question: z.string().min(1).max(4000).describe("The question, with the options and what each sets off.") },
       async ({ question }) => {
         const r = service("task_ask");
         if (!r.ok) return r.error;
@@ -131,18 +128,6 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
       { alwaysLoad: true, searchHint: "task ask owner question decision approval" },
     ),
     tool(
-      "task_notify",
-      `Send the owner a message from this task. Only for a result, a decision they must make, or something that blocks you; never for progress (that is task_plan).${goes} A MEDIA:/path line attaches a file.`,
-      { text: z.string().min(1).max(4000).describe("The message, in the owner's language, casual and concise. Lead with the point.") },
-      async ({ text }) => {
-        const r = service("task_notify");
-        if (!r.ok) return r.error;
-        const result = await r.s.notify(deps.key, text);
-        return result.ok ? ok(sentText(result.via)) : fail("task_notify", result.error ?? "the message did not go out.");
-      },
-      { alwaysLoad: true, searchHint: "task notify owner message result decision blocked" },
-    ),
-    tool(
       "task_plan",
       "Set the steps still ahead, in order, replacing the plan before (an empty list clears it). Mark the one you are on in_progress (at most one). Move each step you just finished into `done`, with a one-line result (a step in `done` is not also kept ahead; to do it again, add it in a later call, in new words). Silent: the owner sees the plan and the finished steps when they look. Set it when you start, and keep it current. Give each step its own words (no two alike), keep them the same from call to call and add new steps at the end; to drop, reword or reorder a step still ahead, give `reason` (one line), which the owner sees under Decisions and updates.",
       {
@@ -151,7 +136,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
           status: z.enum(["pending", "in_progress"]).optional().describe("in_progress for the step you are on; default pending."),
         })).max(PLAN_MAX_STEPS).describe("The steps still ahead, in order. Not the finished ones."),
         done: z.array(z.object({
-          step: z.string().min(1).max(2000).describe("The step, as it stood in the plan."),
+          step: z.string().min(1).max(2000).describe("The step, in exactly the words it had in the plan."),
           result: z.string().max(2000).optional().describe(`One line: what came of it (cut at ${STEP_RESULT_MAX} characters).`),
         })).max(DONE_STEPS_KEEP).optional().describe("Steps finished since the last task_plan call."),
         reason: z.string().max(2000).optional().describe("Required when this drops, rewords or reorders a step still ahead: one line on why the plan changed."),
@@ -164,9 +149,13 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
         const outcome = r.s.setPlan(deps.key, steps, done ?? [], reason);
         if (outcome.ok) return ok("Plan saved.");
         if (outcome.error === "duplicate_step") return fail("task_plan", "two steps read the same. Give each step its own words (for example \"Run the tests again\" for the second). Nothing was saved.");
-        return fail("task_plan", outcome.error === "reason_required"
-          ? "this drops, rewords or reorders a step still ahead. Give `reason` (one line on why the plan changed), or keep those steps as they were and add new ones at the end. Nothing was saved."
-          : "no task record for this session.");
+        if (outcome.error === "reason_required") {
+          const gone = outcome.missing.map((step) => `"${step}"`).join(", ");
+          return fail("task_plan", outcome.missing.length > 0
+            ? `${gone} ${outcome.missing.length === 1 ? "is" : "are"} no longer in the plan and not in \`done\`. If you finished ${outcome.missing.length === 1 ? "it" : "them"}, put ${outcome.missing.length === 1 ? "it" : "them"} in \`done\` in exactly these words. If you dropped or reworded ${outcome.missing.length === 1 ? "it" : "them"}, give \`reason\` (one line on why the plan changed). Nothing was saved.`
+            : "this reorders the steps still ahead. Give `reason` (one line on why), or keep their order and add new steps at the end. Nothing was saved.");
+        }
+        return fail("task_plan", "no task record for this session.");
       },
       { alwaysLoad: true, searchHint: "task plan steps checklist todo" },
     ),
@@ -184,7 +173,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_checkpoint",
-      "Save the task's goal, progress, next step and every side effect so far (commits, pushes, PRs, messages, files) to the task record. It survives compaction and restarts; call it before a big step.",
+      "Save what the plan doesn't show: every side effect so far (branch, commits, pushes, PRs, files, messages) and anything you ruled out, replacing the checkpoint before. It survives compaction and restarts. Save it before you end a turn with work left, and before a step that is hard to undo.",
       { summary: z.string().min(1).max(8000) },
       async ({ summary }) => {
         const r = service("task_checkpoint");
@@ -215,7 +204,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_reopen",
-      "Reopen this task after task_finish, when the owner asks for more work on it.",
+      "Reopen this task after task_finish, when the owner asks for more work on it, or tells you they did what your report asked (then task_finish again with a short report and no owner_action).",
       {},
       async () => {
         const r = service("task_reopen");

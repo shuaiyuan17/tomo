@@ -127,15 +127,17 @@ describe("pending notes: sub-session reports", () => {
 describe("sub-session prompt", () => {
   it("offers the owner-facing tools and carries no memory instructions", () => {
     const prompt = buildSubsessionPrompt({ agentName: "Tomo", ownerName: "Shuai" });
-    for (const name of ["task_reply", "task_notify", "task_ask", "task_finish"]) expect(prompt).toContain(name);
+    for (const name of ["task_reply", "task_ask", "task_finish"]) expect(prompt).toContain(name);
+    // One tool speaks: an answer or unprompted news.
+    expect(prompt).not.toContain("task_notify");
     expect(prompt).not.toMatch(/MEMORY\.md index|memory_write/);
     expect(prompt).toContain("task_plan");
     expect(prompt).not.toContain("task_progress");
   });
 
-  it("says task_finish is refused while a message the task has not read is waiting", () => {
-    const prompt = buildSubsessionPrompt({ agentName: "Tomo", ownerName: "Shuai" });
-    expect(prompt).toMatch(/task_finish is refused[^\n]*next turn/);
+  it("says task_finish is refused while a message the task has not read is waiting (in the tool, where it applies)", () => {
+    const finish = buildTaskSelfTools({ service: () => undefined, key: "task:s1" }).find((t) => t.name === "task_finish")!;
+    expect(finish.description).toMatch(/Refused while a message you have not read yet is waiting[^\n]*next turn/);
   });
 });
 
@@ -323,6 +325,11 @@ describe("sub-session tools", () => {
     const dropped = await call(self as never, "task_plan", { steps: [] });
     expect(dropped.isError).toBe(true);
     expect(dropped.content[0].text).toMatch(/reason/);
+    // A step filed done in other words is named, so the task can tell it slipped.
+    const paraphrased = await call(self as never, "task_plan", { steps: [], done: [{ step: "Wrote tests" }] });
+    expect(paraphrased.isError).toBe(true);
+    expect(paraphrased.content[0].text).toContain('"Write tests" is no longer in the plan and not in `done`');
+    expect(paraphrased.content[0].text).toContain("in exactly these words");
     expect((await call(self as never, "task_plan", { steps: [{ step: "Write docs" }], reason: "Tests already exist" })).isError).toBeUndefined();
     expect((await call(self as never, "task_status", {})).content[0].text).toContain("Plan changed: Tests already exist");
     // An empty list clears the plan.

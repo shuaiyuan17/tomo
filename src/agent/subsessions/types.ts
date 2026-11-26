@@ -19,7 +19,7 @@ export const OPEN_STATUSES: ReadonlySet<SubsessionStatus> = new Set(["queued", "
 export type WaitingOn = "owner" | "external";
 
 /**
- * One message the task sent out: task_notify, task_reply, task_ask, or the
+ * One message the task sent out: task_reply (kind reply or notify), task_ask, or the
  * harness's fallback (an owner-triggered turn that called none of them).
  */
 export interface SubsessionSentMessage {

@@ -619,7 +619,7 @@ describe("sub-sessions through the Agent", () => {
     await channel.simulateMessage(makeMsg({ chatId: "12345", text: "hi" }));
     await drainQueue(agent);
     mockSdk.promptsBySession = [];
-    // The task tells the owner something private (task_notify's path).
+    // The task tells the owner something private (task_reply's unprompted path).
     expect((await internals.subsessions.deps.sendToScope("dm:alex", "[s1 · t] SECRET-WORDS", "task:s1", "Your sub-session s1")).ok).toBe(true);
     expect(await agent.handleCronMessage("Scheduled group task", "telegram:-100271", { waitForHandoff: true })).toBe(true);
     const groupTurn = mockSdk.promptsBySession.filter((p) => p.sessionKey === "dm:alex").map((p) => p.text).join("\n");

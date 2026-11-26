@@ -928,7 +928,15 @@ export class SessionStore {
   addOutsideUsage(key: string, u: { costUsd: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }): void {
     this.mutateRegistry("addOutsideUsage", "bookkeeping", () => {
       const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
-      if (!entry) return;
+      if (!entry) {
+        // A NEW session's first ledger row can land before its registry entry
+        // exists (the entry is made at turn completion): held, and added with
+        // the session's first stats update.
+        const held = this.pendingUsage.get(key) ?? { costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+        for (const k of Object.keys(held) as (keyof typeof held)[]) held[k] += u[k];
+        this.pendingUsage.set(key, held);
+        return;
+      }
       // A session's first ledger row can land before its first updateStats.
       entry.stats ??= {
         totalQueries: 0, totalCostUsd: 0,
@@ -983,11 +991,14 @@ export class SessionStore {
       }
 
       entry.stats.totalQueries++;
-      entry.stats.totalCostUsd += update.costUsd;
-      entry.stats.totalInputTokens += update.inputTokens;
-      entry.stats.totalOutputTokens += update.outputTokens;
-      entry.stats.totalCacheReadTokens += update.cacheReadTokens;
-      entry.stats.totalCacheCreationTokens += update.cacheCreationTokens;
+      // Rows that landed before the entry existed (see addOutsideUsage).
+      const held = this.pendingUsage.get(key);
+      this.pendingUsage.delete(key);
+      entry.stats.totalCostUsd += update.costUsd + (held?.costUsd ?? 0);
+      entry.stats.totalInputTokens += update.inputTokens + (held?.inputTokens ?? 0);
+      entry.stats.totalOutputTokens += update.outputTokens + (held?.outputTokens ?? 0);
+      entry.stats.totalCacheReadTokens += update.cacheReadTokens + (held?.cacheReadTokens ?? 0);
+      entry.stats.totalCacheCreationTokens += update.cacheCreationTokens + (held?.cacheCreationTokens ?? 0);
       entry.stats.contextUsed = update.contextUsed;
       // An estimated reading carries the window as "0 = never seen one": keep
       // the last real window rather than forget it (a forced compaction right
@@ -1031,6 +1042,9 @@ export class SessionStore {
       this.saveRegistryBestEffort("setUsageBaseline");
     });
   }
+
+  /** Usage from landed ledger rows of a key that had no registry entry yet (see addOutsideUsage). */
+  private readonly pendingUsage = new Map<string, { costUsd: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }>();
 
   /** Snapshots from landed ledger rows whose SDK session was not linked yet (see setUsageBaseline). */
   private readonly pendingUsageBaselines = new Map<string, UsageBaseline>();

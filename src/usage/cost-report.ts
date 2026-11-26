@@ -4,6 +4,7 @@ import type {
 } from "../web/protocol.js";
 import type { CostRow, LedgerReader } from "./ledger-reader.js";
 import { addDays, daysBetween, localParts } from "./local-time.js";
+import { normalizeModelId } from "../models.js";
 
 /** Longest range one request may ask for, in days. */
 export const MAX_RANGE_DAYS = 400;
@@ -156,11 +157,15 @@ export function buildCostReport(reader: LedgerReader, options: CostReportOptions
       }
 
       if (row.models) {
-        for (const [id, m] of Object.entries(row.models)) {
+        // Older turns logged a natively 1M model with its `[1m]` tag
+        // (`claude-opus-5-5[1m]`): one row per model, a turn counted once.
+        const counted = new Set<string>();
+        for (const [rawId, m] of Object.entries(row.models)) {
+          const id = normalizeModelId(rawId);
           let model = models.get(id);
           if (!model) models.set(id, model = { model: id, costUsd: 0, turns: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheCreated: 0 } });
           model.costUsd += m.costUsd;
-          model.turns++;
+          if (!counted.has(id)) { counted.add(id); model.turns++; }
           model.tokens.input += m.input;
           model.tokens.output += m.output;
           model.tokens.cacheRead += m.cacheRead;

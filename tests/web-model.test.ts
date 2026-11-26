@@ -43,15 +43,15 @@ describe("model switch from the web (agent side)", () => {
     const before = agent.webModelView("dm:owner");
     expect(before).toMatchObject({ model: { id: mockConfig.model }, overridden: false, busy: false, gateway: { configured: false } });
     const outcome = agent.switchModelFromWeb("dm:owner", "sonnet", before.model.id);
-    expect(outcome).toEqual({ ok: true, model: "claude-sonnet-5-5[1m]", previous: mockConfig.model, changed: true });
-    expect(savedOverrides()?.["dm:owner"]).toBe("claude-sonnet-5-5[1m]");
+    expect(outcome).toEqual({ ok: true, model: "claude-sonnet-5-5", previous: mockConfig.model, changed: true });
+    expect(savedOverrides()?.["dm:owner"]).toBe("claude-sonnet-5-5");
     expect(internals.liveSessionManager.isAlive("dm:owner")).toBe(false);
     expect((agent as unknown as { sessions: SessionStore }).sessions.getSdkSessionId("dm:owner")).toBe("mock-sdk-session-123");
-    expect(agent.webModelView("dm:owner")).toMatchObject({ model: { id: "claude-sonnet-5-5[1m]", label: "Sonnet 5.5 1M (fast)" }, overridden: true });
+    expect(agent.webModelView("dm:owner")).toMatchObject({ model: { id: "claude-sonnet-5-5", label: "Sonnet 5.5 (fast)" }, overridden: true });
 
     // The chat command reads the same override.
     await tg.simulateCommand("model", "12345", "TestUser", undefined, "12345");
-    expect(tg.sent.at(-1)?.text).toContain("🧠 Current: claude-sonnet-5-5[1m]");
+    expect(tg.sent.at(-1)?.text).toContain("🧠 Current: claude-sonnet-5-5");
     await agent.stop();
   });
 
@@ -89,10 +89,39 @@ describe("model switch from the web (agent side)", () => {
     await agent.stop();
   });
 
+  it("treats an older config's [1m]-tagged id as the untagged model, without rewriting the config", async () => {
+    resetConfig({ ...OWNER, model: "claude-opus-5-5[1m]" });
+    const agent = new Agent();
+    agent.addChannel(new MockChannel("telegram"));
+    writeFileSync(agentEnv.configFilePath, JSON.stringify({ model: "claude-opus-5-5[1m]" }) + "\n");
+    const view = agent.webModelView("dm:owner");
+    expect(view.model).toEqual({ id: "claude-opus-5-5", label: "Opus 5.5 (default)" });
+    expect(view.defaultModel.id).toBe("claude-opus-5-5");
+    expect(view.options.some((o) => o.id === view.model.id)).toBe(true);
+    // The page reviewed the untagged id: choosing Opus is the model in use, nothing written.
+    expect(agent.switchModelFromWeb("dm:owner", "opus", view.model.id)).toMatchObject({ ok: true, changed: false });
+    expect(agent.switchModelFromWeb("dm:owner", "sonnet", view.model.id)).toMatchObject({ ok: true, model: "claude-sonnet-5-5", changed: true });
+    expect(JSON.parse(readFileSync(agentEnv.configFilePath, "utf-8")).model).toBe("claude-opus-5-5[1m]");
+    // The SDK is handed the untagged id.
+    const server = { type: "sdk", name: "tomo-internal", instance: {} } as unknown as McpSdkServerConfigWithInstance;
+    expect(sdkOptions(server, undefined, undefined, { sessionKey: "dm:other" }).model).toBe("claude-opus-5-5");
+    await agent.stop();
+  });
+
+  it("hands the SDK tomo's id for a stored alias, and marks it current", () => {
+    resetConfig({ ...OWNER, model: "opus-1m", sessionModelOverrides: { "dm:owner": "fable" } });
+    const server = { type: "sdk", name: "tomo-internal", instance: {} } as unknown as McpSdkServerConfigWithInstance;
+    expect(sdkOptions(server, undefined, undefined, { sessionKey: "dm:other" }).model).toBe("claude-opus-5-5");
+    expect(sdkOptions(server, undefined, "fable", { sessionKey: "dm:owner" }).model).toBe("claude-fable-5-2");
+    const view = describeSessionModel(new Map([["dm:owner", "fable"]]), "dm:owner", false);
+    expect(view.model.id).toBe("claude-fable-5-2");
+    expect(view.defaultModel.id).toBe("claude-opus-5-5");
+  });
+
   it("lists each alias target once, with its aliases", () => {
     const choices = modelChoices();
-    expect(choices.map((c) => c.id)).toEqual(["claude-opus-5-5[1m]", "claude-sonnet-5-5[1m]", "claude-haiku-5-5", "claude-fable-5-1[1m]"]);
-    expect(choices[0]).toEqual({ id: "claude-opus-5-5[1m]", label: "Opus 5.5 1M (default)", aliases: ["opus", "opus-1m"] });
+    expect(choices.map((c) => c.id)).toEqual(["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2"]);
+    expect(choices[0]).toEqual({ id: "claude-opus-5-5", label: "Opus 5.5 (default)", aliases: ["opus", "opus-1m"] });
   });
 });
 
@@ -135,7 +164,7 @@ describe("model switch from the web (channel)", () => {
     expect(() => channel.switchModel(ownerId, "busy", mockConfig.model)).toThrow(expect.objectContaining({ status: 409, code: "turn_in_flight" }));
     expect(events).toEqual([]);
     expect(channel.switchModel(ownerId, "claude-haiku-5-5", mockConfig.model)).toEqual({ status: "switched",
-      model: { id: "claude-haiku-5-5", label: "Haiku 5.5 1M (cheapest)" }, previous: { id: mockConfig.model, label: expect.any(String) } });
+      model: { id: "claude-haiku-5-5", label: "Haiku 5.5 (cheapest)" }, previous: { id: mockConfig.model, label: expect.any(String) } });
     expect(events).toEqual([{ type: "invalidate", sessionId: ownerId }]);
     expect(channel.switchModel(ownerId, "claude-haiku-5-5", "claude-haiku-5-5").status).toBe("unchanged");
     expect(events).toHaveLength(1);
@@ -218,7 +247,7 @@ describe("model switch over HTTP", () => {
 describe("Model page copy", () => {
   it("names both models in the confirm, resolves listed aliases, and words refusals", () => {
     const view = { options: modelChoices() };
-    expect(pickTarget(view, " Sonnet ")).toEqual({ id: "claude-sonnet-5-5[1m]", label: "Sonnet 5.5 1M (fast)" });
+    expect(pickTarget(view, " Sonnet ")).toEqual({ id: "claude-sonnet-5-5", label: "Sonnet 5.5 (fast)" });
     expect(pickTarget(view, "claude-opus-4-8")).toEqual({ id: "claude-opus-4-8", label: "claude-opus-4-8" });
     expect(pickTarget(view, "  ")).toBeNull();
     const copy = switchCopy({ id: "a", label: "Opus 5.5" }, { id: "b", label: "Haiku 5.5" });

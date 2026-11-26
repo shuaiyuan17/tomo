@@ -80,8 +80,8 @@ describe("the web's access to sub-sessions", () => {
     agent.subsessions!.spawn("dm:alex", { title: "Default", brief: "b" });
     agent.subsessions!.spawn("dm:alex", { title: "Own", brief: "b", model: "fable" });
     const web = agent.webSubsessions()!;
-    expect(web.list().tasks.map((t) => [t.id, t.model])).toEqual([["s1", "claude-sonnet-5[1m]"], ["s2", "claude-fable-5-1[1m]"]]);
-    expect(web.get("s2")).toMatchObject({ model: "claude-fable-5-1[1m]" });
+    expect(web.list().tasks.map((t) => [t.id, t.model])).toEqual([["s1", "claude-sonnet-5[1m]"], ["s2", "claude-fable-5-2"]]);
+    expect(web.get("s2")).toMatchObject({ model: "claude-fable-5-2" });
     await agent.stop();
   });
 

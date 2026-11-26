@@ -99,7 +99,7 @@ it("shows a task's own model, and a task waiting on a check-back with background
   expect(agent.subsessions!.spawn("dm:owner", { title: "Long build", brief: "b", model: "fable" }).ok).toBe(true);
   await page.getByRole("button", { name: /^Tasks/ }).click();
   const row = rail().locator('[data-subsession-row="s1"]');
-  await browserExpect(row).toContainText("Fable 5.1");
+  await browserExpect(row).toContainText("Fable 5.2");
   // As a turn that ends with a check-back scheduled and a background command still running leaves it.
   const moved = (agent.subsessions as unknown as { store: { transition: (id: string, e: string, o: object) => { ok: boolean } } })
     .store.transition("s1", "wait_external", { reason: "waiting for its scheduled check-back", expectFrom: ["active"] });
@@ -110,7 +110,7 @@ it("shows a task's own model, and a task waiting on a check-back with background
   await page.screenshot({ path: "test-results/subsessions-background.png" });
   await row.getByRole("button").click();
   await browserExpect(rail().getByTestId("subsession-state")).toContainText("Working (background)");
-  await browserExpect(rail().locator('[data-subsession="s1"]').getByRole("heading")).toContainText("Fable 5.1");
+  await browserExpect(rail().locator('[data-subsession="s1"]').getByRole("heading")).toContainText("Fable 5.2");
 });
 
 it("an ended task reads, but cannot be written to", async () => {

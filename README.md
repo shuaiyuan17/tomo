@@ -131,7 +131,7 @@ Every command, with details: [docs/commands.md](docs/commands.md).
 
 `tomo config` covers the common settings interactively; everything lives in `~/.tomo/config.json` and most values can be overridden by environment variables. Highlights:
 
-- `model` — default `claude-opus-5-5[1m]`; per-chat with `/model`
+- `model` — default `claude-opus-5-5`; per-chat with `/model`
 - `mcpServers`, `plugins` — [extend Tomo](docs/configuration.md#external-mcp-servers) with MCP servers and Claude Code plugins
 - `continuity` — [heartbeats](docs/configuration.md#continuity-heartbeats) for autonomous behaviour (off by default)
 - `metrics` — Prometheus exporter + activity log, with a [Grafana stack](contrib/observability/README.md)

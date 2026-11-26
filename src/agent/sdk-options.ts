@@ -9,7 +9,7 @@ import type { PromptContextLines } from "../workspace/prompt-context-diff.js";
 import { assembleSystemPrompt, renderRuntimeSection, renderSessionSection } from "../workspace/system-prompt-blocks.js";
 import { isDmSessionKey, isGroupSessionKey, isTaskSessionKey } from "../sessions/keys.js";
 import { TOMO_INTERNAL_MCP_NAME } from "../mcp/internal-server.js";
-import { isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
+import { canonicalModelId, isLiteLlmProviderModel, resolveModelName, modelLabel } from "../models.js";
 import { litellmRoutesModel } from "../litellm.js";
 import { effectiveGroupSandbox, type GroupSandboxConfig } from "./group-fs-policy.js";
 import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, skillsCanUseTool, todoStoreGuardHooks, type PrivateMemoryBar } from "./permissions.js";
@@ -211,13 +211,17 @@ export function sdkOptions(
   );
   const externalMcpAllowedTools = !unattended && Array.isArray(config.mcpAllowedTools) ? config.mcpAllowedTools : [];
   const shouldDisableAutoCompact = Boolean(sessionContext && usesLcmCompact(sessionContext.sessionKey));
-  const effectiveModel = model ?? config.model;
+  // The SDK is handed tomo's full id: a stored alias (`fable`, `opus-1m`) as
+  // tomo resolves it, not as the SDK's own alias list would, and a redundant
+  // `[1m]` (an older config's `claude-opus-5-5[1m]`) dropped, so the SDK and
+  // the usage ledger see one id.
+  const effectiveModel = canonicalModelId(model ?? config.model);
 
   // Tell the agent which model is actually serving this session. A model can't
   // reliably introspect its own identity, so surface it as a fact in the prompt
   // rather than leaving the agent to guess. Reassembled every turn, so a /model
   // switch (or a gateway re-route) is reflected on the next turn.
-  const resolvedModel = resolveModelName(effectiveModel) ?? effectiveModel;
+  const resolvedModel = effectiveModel;
   const resolvedLabel = modelLabel(resolvedModel);
   const modelDisplay = resolvedLabel === resolvedModel ? resolvedModel : `${resolvedModel} — ${resolvedLabel}`;
   dynamicSections.push(renderRuntimeSection(modelDisplay));

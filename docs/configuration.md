@@ -41,7 +41,7 @@ Security-related settings (`groupSandbox`, `credentialBroker`, `agentProfiles`) 
     },
     "imessage": { "provider": "imsg", "allowlist": ["any;+;<group-chat-guid>"] }
   },
-  "model": "claude-opus-5-5[1m]",
+  "model": "claude-opus-5-5",
   "litellm": {
     "mode": "chatgpt-subscription",
     "baseUrl": "http://localhost:4000",

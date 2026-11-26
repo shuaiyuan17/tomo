@@ -8,7 +8,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
 
 ```json
 {
-  "model": "claude-opus-5-5[1m]",
+  "model": "claude-opus-5-5",
   "city": "Seattle",
   "continuity": false,
   "continuityIntervalMinutes": 55,
@@ -36,7 +36,7 @@ Before direct edits, copy `~/.tomo/config.json` to `~/.tomo/config.json.bak`. Ch
     }
   },
   "sessionModelOverrides": {
-    "dm:alice": "claude-opus-5-5[1m]"
+    "dm:alice": "claude-opus-5-5"
   },
   "litellm": {
     "mode": "chatgpt-subscription",

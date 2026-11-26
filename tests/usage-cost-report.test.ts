@@ -74,6 +74,22 @@ describe("Cost report: day boundaries", () => {
 });
 
 describe("Cost report: breakdowns", () => {
+  it("merges a natively 1M model's [1m]-tagged id into its untagged row, counting a turn once", () => {
+    const opus = (costUsd: number) => ({ input: 1, output: 1, cacheRead: 10, cacheCreated: 0, costUsd });
+    write("2026-11.ndjson", [
+      row("2026-11-14T09:00:00-08:00", 1, { models: { "claude-opus-5-5[1m]": opus(1) } }),
+      row("2026-11-14T10:00:00-08:00", 2, { models: { "claude-opus-5-5": opus(2) } }),
+      row("2026-11-14T11:00:00-08:00", 3, { models: { "claude-opus-5-5[1m]": opus(1), "claude-opus-5-5": opus(2) } }),
+      row("2026-11-14T12:00:00-08:00", 4, { models: { "claude-sonnet-5[1m]": opus(4) } }),
+    ]);
+    const r = report({ from: "2026-11-14", to: "2026-11-14" });
+    expect(r.models.map((m) => [m.model, m.costUsd, m.turns, m.tokens.cacheRead])).toEqual([
+      ["claude-opus-5-5", 6, 3, 40],
+      // An older model whose tag did change the context keeps its own row.
+      ["claude-sonnet-5[1m]", 4, 1, 10],
+    ]);
+  });
+
   it("splits by category, session, cron job and model, and ranks the costliest turns", () => {
     write("2026-11.ndjson", [
       row("2026-11-14T09:00:00-08:00", 3, { trigger: "plan my trip", durationMs: 9000, tools: 4, numTurns: 5,

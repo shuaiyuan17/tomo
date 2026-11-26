@@ -98,7 +98,7 @@ const PREFIXES: ReadonlySet<string> = new Set(["sudo", "command", "env", "nice",
  * A writer named anywhere else — `grep 'rm' file`, a commit message — is an
  * argument, not a command.
  */
-function commandWordIndex(tokens: string[]): number {
+export function commandWordIndex(tokens: string[]): number {
   let i = 0;
   while (i < tokens.length) {
     const t = tokens[i];

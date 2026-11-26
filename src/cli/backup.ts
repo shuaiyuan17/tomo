@@ -24,6 +24,7 @@ import {
   type RestoreLeg,
 } from "./backup-restore.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
+import { isLiveDbFile, snapshotDb, verifyDbFile } from "../db/backup.js";
 import { isRecordedProcessLive, readPidFileRecord } from "./pidfile.js";
 
 const TOMO_HOME = config.tomoHome;
@@ -392,8 +393,15 @@ backupCommand
     // 3. data/
     const dataSrc = join(TOMO_HOME, "data");
     const dataDest = join(tmpDest, "data");
-    if (copyIfExists(dataSrc, dataDest)) {
+    // The database is not file-copied (a copy of a live tomo.db and its -wal
+    // can be from two different moments): it is skipped here and written as
+    // one consistent snapshot below. A failed snapshot fails the backup.
+    if (copyIfExists(dataSrc, dataDest, { filter: (src) => !isLiveDbFile(src, config.dbPath) })) {
       console.log("  [ok] data/");
+      if (isInsideDir(config.dbPath, dataSrc)) {
+        const dbDest = join(dataDest, relative(dataSrc, config.dbPath));
+        if (snapshotDb(config.dbPath, dbDest)) console.log(`  [ok] data/${relative(dataSrc, config.dbPath)} (consistent snapshot)`);
+      }
     } else {
       console.log("  [--] data/ (not found)");
     }
@@ -509,7 +517,16 @@ backupCommand
       }
       const dataSrc = join(backup.path, "data");
       if (existsSync(dataSrc)) {
-        legs.push({ label: "data/", src: dataSrc, dest: join(TOMO_HOME, "data") });
+        legs.push({
+          label: "data/",
+          src: dataSrc,
+          dest: join(TOMO_HOME, "data"),
+          // The restored database must pass integrity_check before anything live moves.
+          verify: (staging) => {
+            const db = join(staging, relative(join(TOMO_HOME, "data"), config.dbPath));
+            if (existsSync(db)) verifyDbFile(db);
+          },
+        });
       }
       // Restored to where THIS install keeps them, which is the only place
       // the daemon will look — if SESSIONS_DIR has changed since the backup

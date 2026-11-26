@@ -78,7 +78,7 @@ function useLiveShape(): void {
 /** Lay down the persisted state of the upgraded install. */
 function seedDataDir(): void {
   writeFileSync(agentEnv.configFilePath, JSON.stringify(LIVE_SHAPE_CONFIG, null, 2) + "\n");
-  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   // The stale raw owner-iMessage session first, so it sits ahead of dm:alex
   // in registry order (the order findFirstDmSession-style lookups walked).
   store.setSdkSessionId(STALE_RAW, "sdk-stale-raw");
@@ -141,7 +141,7 @@ describe("golden: upgrading a single-identity install to `owner`", () => {
     seedDataDir();
 
     expect(mockConfig.owner).toEqual({ name: "Alex", telegram: [TG_ID], imessage: [HANDLE] });
-    const router = new OwnerRouter(mockConfig.owner, new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir), mockConfig.channelAllowlists,
+    const router = new OwnerRouter(mockConfig.owner, new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath }), mockConfig.channelAllowlists,
       new SummonStore(join(mockConfig.tomoHome, "data", "summons.json"), 0));
 
     expect(router.ownerSessionKey()).toBe(OWNER_KEY);
@@ -171,7 +171,7 @@ describe("golden: upgrading a single-identity install to `owner`", () => {
     seedDataDir();
     const before = snapshot(agentEnv.tmpDir);
 
-    const sessions = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const sessions = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     const router = new OwnerRouter(mockConfig.owner, sessions, mockConfig.channelAllowlists);
     expect(router.prepareOwnerSession()).toBe(OWNER_KEY);
     expect(router.resolve("telegram", TG_ID, false).sessionKey).toBe(OWNER_KEY);
@@ -221,9 +221,10 @@ describe("golden: upgrading a single-identity install to `owner`", () => {
     // The registry only changed in lastActiveAt / replyTarget / stats: same
     // entries, same keys, same SDK session ids, nothing migrated or added.
     expect(stableRegistryView(registry())).toEqual(stableRegistryView(registryBefore));
-    // New files are only advisory lock files and the append-only usage ledger.
+    // New files are only advisory lock files, the append-only usage ledger
+    // and Tomo's database (created on first use, beside the files it replaces).
     const added = [...after.keys()].filter((path) => !before.has(path));
-    expect(added.filter((path) => !path.endsWith(".lock") && !/^data\/usage\/\d{4}-\d{2}\.ndjson$/.test(path))).toEqual([]);
+    expect(added.filter((path) => !path.endsWith(".lock") && !/^data\/usage\/\d{4}-\d{2}\.ndjson$/.test(path) && !/^data\/tomo\.db(-wal|-shm)?$/.test(path))).toEqual([]);
     // The cron store, summons, LCM latch and config are byte-identical.
     for (const path of ["data/cron/jobs.json", "data/summons.json", "data/lcm/nudge-cooldown.json", "config.json"]) {
       expect(after.get(path), path).toBe(before.get(path));
@@ -238,7 +239,7 @@ describe("golden: upgrading a single-identity install to `owner`", () => {
         { name: "Sam", channels: { telegram: "222" }, replyPolicy: "telegram" },
       ],
     });
-    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     store.setSdkSessionId("dm:sam", "sdk-sam");
     store.setReplyTarget("dm:sam", { channelName: "telegram", chatId: "222" });
     store.append("dm:sam", { role: "user", content: "sam's history", timestamp: 1, channel: "telegram" });
@@ -305,7 +306,7 @@ describe("the owner DM exists from the start and every channel binds to it", () 
   it("a raw session is never merged into an owner key that already exists (even a pre-created stub)", async () => {
     useRealAdmission();
     resetConfig({ identities: [{ name: "Alex", channels: { telegram: TG_ID }, replyPolicy: "last-active" }] });
-    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     store.setSdkSessionId(`telegram:${TG_ID}`, "sdk-legacy");
     store.ensureEntry(OWNER_KEY);
 
@@ -325,7 +326,7 @@ describe("the owner DM exists from the start and every channel binds to it", () 
   });
 
   it("the store folds a metadata-only stub under the destination key instead of creating a second active entry", () => {
-    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     store.setSdkSessionId("telegram:1", "sdk-a");
     store.ensureEntry(OWNER_KEY);
     store.setReplyTarget(OWNER_KEY, { channelName: "telegram", chatId: "1" });
@@ -336,7 +337,7 @@ describe("the owner DM exists from the start and every channel binds to it", () 
   });
 
   it("adoption refuses to re-key onto an owner key that already has a linked session", () => {
-    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     store.setSdkSessionId("telegram:1", "sdk-a");
     store.setSdkSessionId(OWNER_KEY, "sdk-b");
     expect(() => store.migrateSessionKey("telegram:1", OWNER_KEY)).toThrow(/already has a linked session/);
@@ -361,7 +362,7 @@ describe("adoption is one-time and carries the session's cron jobs and model ove
       channels: { telegram: { token: "t", allowlist: [TG_ID] } },
       sessionModelOverrides: { [RAW]: "claude-opus-5[1m]" },
     }, null, 2));
-    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     store.setSdkSessionId(RAW, SDK_ID);
     store.append(RAW, { role: "user", content: "pre-identity history", timestamp: 1, channel: "telegram" });
     mkdirSync(join(mockConfig.tomoHome, "data", "cron"), { recursive: true });
@@ -422,7 +423,7 @@ describe("adoption is one-time and carries the session's cron jobs and model ove
 
   it("an adoption interrupted after its re-key finishes the follow-ups on the next start (idempotent)", () => {
     seedPreIdentityInstall();
-    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     store.migrateSessionKey(RAW, "dm:owner");
     writeFileSync(join(mockConfig.tomoHome, "data", "owner-adoption-pending.json"), JSON.stringify({ version: 1, from: RAW, to: "dm:owner" }));
     new Agent().prepareOwner();
@@ -437,7 +438,7 @@ describe("adoption is one-time and carries the session's cron jobs and model ove
     seedPreIdentityInstall();
     const agent = new Agent();
     agent.prepareOwner();
-    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     store.clearSdkSessionId("dm:owner");           // /new
     store.setSdkSessionId(RAW, "SID-CRON-FORK");   // a session some cron run created on the raw key
 
@@ -449,14 +450,14 @@ describe("adoption is one-time and carries the session's cron jobs and model ove
     await agent.stop();
 
     expect(mockSdk.optionsBySession[0].options.resume).toBeUndefined();
-    expect(new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).getSdkSessionId(RAW)).toBe("SID-CRON-FORK");
+    expect(new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath }).getSdkSessionId(RAW)).toBe("SID-CRON-FORK");
   });
 
   it("live shape: clearing the owner's session (/new, timeout) never resumes the stale raw iMessage session", async () => {
     useRealAdmission();
     useLiveShape();
     seedDataDir();
-    new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).clearSdkSessionId(OWNER_KEY);
+    new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath }).clearSdkSessionId(OWNER_KEY);
 
     const agent = new Agent();
     agent.prepareOwner();
@@ -479,7 +480,7 @@ describe("adoption is one-time and carries the session's cron jobs and model ove
     agent.addChannel(new MockChannel("telegram"));
     // Startup adoption deferred (registry briefly unreadable, say): the
     // scheduler still dispatches the job under the raw key...
-    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     // ...and an owner DM completes the adoption before the job executes.
     store.migrateSessionKey(RAW, "dm:owner");
     mockSdk.responseFn = () => "NO_REPLY";
@@ -490,7 +491,7 @@ describe("adoption is one-time and carries the session's cron jobs and model ove
     expect(ok).toBe(true);
     expect(mockSdk.promptsBySession.map((p) => p.sessionKey)).toEqual(["dm:owner"]);
     expect(mockSdk.optionsBySession[0].options.resume).toBe(SDK_ID);
-    const after = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const after = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     expect(after.getEntry(RAW)).toBeUndefined();   // no raw session recreated
   });
 

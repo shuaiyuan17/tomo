@@ -424,3 +424,15 @@ describe("sdkOptions thinking display", () => {
     expect(sdkOptions(internalServer).thinking).toBeUndefined();
   });
 });
+
+describe("sdkOptions: Tomo's database is guarded on every session", () => {
+  type Hook = (input: { tool_name: string; tool_input: unknown }) => Promise<{ hookSpecificOutput?: { permissionDecision?: string } }>;
+  it.each(["dm:shuai", "telegram:-100123", undefined])("denies `rm tomo.db-wal` for %s", async (sessionKey) => {
+    resetConfig();
+    const opts = sdkOptions(internalServer, undefined, undefined, sessionKey ? { sessionKey } : undefined);
+    const hooks = (opts.hooks as { PreToolUse: Array<{ hooks: Hook[] }> }).PreToolUse.flatMap((m) => m.hooks);
+    const input = { tool_name: "Bash", tool_input: { command: `rm ${mockConfig.dbPath}-wal` } };
+    const decisions = await Promise.all(hooks.map((h) => h(input)));
+    expect(decisions.some((d) => d.hookSpecificOutput?.permissionDecision === "deny")).toBe(true);
+  });
+});

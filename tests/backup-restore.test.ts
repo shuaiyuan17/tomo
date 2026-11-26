@@ -62,6 +62,7 @@ vi.mock("../src/config.js", () => ({
     // a backup's `sessions/` leg goes.
     sessionsDir: join(paths.tomoHome, "data", "sessions"),
     sdkSessionsDir: join(paths.tomoHome, "sdk-sessions"),
+    dbPath: join(paths.tomoHome, "data", "tomo.db"),
   },
   CONFIG_PATH: join(paths.tomoHome, "config.json"),
 }));

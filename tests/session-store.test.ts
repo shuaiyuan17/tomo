@@ -193,13 +193,15 @@ describe("SessionStore", () => {
     expect(store.quarantinedPendingNotes()).toEqual(["/x/_pending_notes.json.corrupt-1"]);
   });
 
-  it("a read-only store throws for an unreadable pending notes file and leaves it as it is", () => {
+  it("a read-only store neither imports nor moves the old pending notes file, and creates no database", () => {
     const file = join(TEST_DIR, "_pending_notes.json");
     writeFileSync(file, "{not json");
     const store = makeSessionStore(TEST_DIR, { readOnly: true });
-    expect(() => store.getPendingNotes("dm:alice")).toThrow();
+    expect(store.getPendingNotes("dm:alice")).toEqual([]);
+    expect(() => store.setPendingNotes("dm:alice", ["x"])).toThrow("Read-only");
     expect(readFileSync(file, "utf-8")).toBe("{not json");
     expect(asidesIn(TEST_DIR)).toEqual([]);
+    expect(existsSync(join(TEST_DIR, "tomo.db"))).toBe(false);
   });
 
   it("persists pending notes across instances until cleared", () => {

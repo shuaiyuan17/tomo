@@ -103,3 +103,29 @@ describe("a pending notes file that will not read", () => {
     await agent.stop();
   });
 });
+
+describe("Tomo's database at start", () => {
+  it("a damaged tomo.db is moved aside at boot, before any message, and the owner told with the recovery commands", async () => {
+    const ownerNotice = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(true);
+    mkdirSync(join(mockConfig.tomoHome, "data"), { recursive: true });
+    write(mockConfig.dbPath, "not a database ".repeat(300));
+    const agent = await boot();
+    await waitFor(() => expect(ownerNotice).toHaveBeenCalledTimes(1));
+    const text = String(ownerNotice.mock.calls[0][0]);
+    expect(text).toMatch(/tomo\.db\.corrupt-/);
+    expect(text).toContain("tomo db export pending-notes");
+    expect(readdirSync(join(mockConfig.tomoHome, "data")).filter((f) => /^tomo\.db\.corrupt-[\d-]+$/.test(f))).toHaveLength(1);
+    await waitFor(() => expect(existsSync(`${mockConfig.dbPath}.quarantined.json`)).toBe(false));
+    await agent.stop();
+  });
+
+  it("an old _pending_notes.json is imported at boot and its notes reach the next turn", async () => {
+    vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(true);
+    writeFileSync(notesFile(), JSON.stringify({ version: 1, notes: { "imessage:700": ["carried over from the file"] } }));
+    const agent = await boot();
+    expect(existsSync(notesFile())).toBe(false);
+    expect(readdirSync(mockConfig.sessionsDir).some((f) => f.startsWith("_pending_notes.json.migrated-"))).toBe(true);
+    expect((agent as unknown as { pendingNotesQueue: { peekNotes(k: string): string[] } }).pendingNotesQueue.peekNotes("imessage:700")).toEqual(["carried over from the file"]);
+    await agent.stop();
+  });
+});

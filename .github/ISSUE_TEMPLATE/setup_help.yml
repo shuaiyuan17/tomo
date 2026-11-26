@@ -55,7 +55,7 @@ body:
     attributes:
       label: Environment
       description: OS version, `node --version`, `tomo --version`, and whether Claude Code is installed and logged in.
-      placeholder: "macOS 15.4, Node 22.12.0, tomo 0.9.0, Claude Code 2.x logged in"
+      placeholder: "macOS 15.4, Node 22.16.0, tomo 0.9.0, Claude Code 2.x logged in"
     validations:
       required: true
   - type: textarea

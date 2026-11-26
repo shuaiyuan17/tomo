@@ -367,6 +367,7 @@ export const mockConfig = {
   model: "claude-sonnet-5[1m]",
   workspaceDir: "",
   sessionsDir: "",
+  dbPath: "",
   sdkSessionsDir: "",
   historyLimit: 20,
   logsDir: "",

@@ -199,7 +199,7 @@ describe("owner-only private delivery", () => {
     // An owner with no reachable handle yet, and a legacy raw session from
     // the open-channel era: before, the notification went to that stranger.
     resetConfig({ owner: { name: "alex", telegram: [], imessage: [] } });
-    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     store.setSdkSessionId("telegram:99999", "sdk-stranger");
     const agent = new Agent();
     const tg = new MockChannel("telegram");
@@ -213,7 +213,7 @@ describe("owner-only private delivery", () => {
 
   it("private links for any session (MCP login, elicitation) resolve to the owner's DM only", async () => {
     resetConfig({ identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
-    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     store.setSdkSessionId("telegram:99999", "sdk-stranger");
     store.setSdkSessionId("dm:sam", "sdk-former-identity");
     store.setReplyTarget("dm:sam", { channelName: "telegram", chatId: "222" });

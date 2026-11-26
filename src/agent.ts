@@ -89,7 +89,7 @@ import { QuotaGateReader } from "./usage/limits-log.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { withConfigLockSync } from "./config-file.js";
 import { writeJsonAtomicSync } from "./fs-utils.js";
@@ -272,7 +272,7 @@ export class Agent {
   private mcpSweepInFlight: Promise<void> | undefined;
 
   constructor() {
-    this.sessions = new SessionStore(config.sessionsDir, config.historyLimit, config.sdkSessionsDir);
+    this.sessions = new SessionStore(config.sessionsDir, config.historyLimit, config.sdkSessionsDir, { dbPath: config.dbPath });
     this.ownerAdoption = new OwnerAdoption(this.sessions, this.modelOverrides);
     this.contextNudger = new ContextNudger(
       this.sessions,
@@ -3398,7 +3398,11 @@ export class Agent {
     }
     // A marker that will not read names no file.
     const files = asides.length > 0 ? asides : [join(config.sessionsDir, "_pending_notes.json.corrupt-*")];
-    const text = ownerT("notices")("pendingNotesQuarantined", { files: files.join(", "), count: files.length });
+    // A moved-aside database (not the old notes file) gets its own wording: it names the recovery commands.
+    const params = { files: files.join(", "), count: files.length };
+    const text = files.some((f) => !basename(f).startsWith("_pending_notes.json"))
+      ? ownerT("notices")("databaseQuarantined", params)
+      : ownerT("notices")("pendingNotesQuarantined", params);
     this.pendingNotesNoticeSending = true;
     const failed = (err?: unknown): void => {
       log.warn({ err, files }, "Could not tell the owner the pending notes file was moved aside");
@@ -3448,6 +3452,10 @@ export class Agent {
     // dispatched by live ingress, and replaying it too would run it twice (or
     // misread its fresh turn as interrupted).
     const recovered = this.inbox?.pending() ?? [];
+    // Open (check, migrate, import the old notes file into) the database now,
+    // not at the first note: a damaged file is found and moved aside at start,
+    // and the owner hears about it below rather than at some later turn.
+    this.sessions.preparePendingNotes();
     try {
       // Sub-session restart recovery runs BEFORE any channel ingests, so no
       // input can reach a task recovery has not looked at yet. It schedules

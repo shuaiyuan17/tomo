@@ -91,7 +91,7 @@ function isHighSurrogate(unit: number): boolean {
 /**
  * Grapheme segmenter for the hard-cut fallback, or null on a build without it.
  *
- * Present in every Node this project supports (>= 22.12; `Intl.Segmenter`
+ * Present in every Node this project supports (>= 22.16; `Intl.Segmenter`
  * landed in 16), so the null branch is only reached on an ICU-less build
  * (`--with-intl=none`). Constructed once — instantiating a segmenter per chunk
  * is the expensive part, segmenting a short probe is not.

@@ -101,7 +101,7 @@ body:
     attributes:
       label: Operating system and Node version
       description: OS with version, plus `node --version`.
-      placeholder: "macOS 15.4, Node 22.12.0"
+      placeholder: "macOS 15.4, Node 22.16.0"
     validations:
       required: true
   - type: input

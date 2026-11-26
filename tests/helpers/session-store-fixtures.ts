@@ -10,15 +10,15 @@ type StoreOptions = NonNullable<ConstructorParameters<typeof SessionStore>[3]>;
 
 /**
  * A store over `dir`, with the SDK sessions directory defaulted to
- * `<dir>/sdk-sessions` (the store insists on an explicit one, so that nothing
+ * `<dir>/sdk-sessions` and its database to `<dir>/tomo.db` (the store insists on an explicit one, so that nothing
  * a test does can reach the developer's real ~/.claude).
  */
 export function makeSessionStore(
   dir: string,
   opts: StoreOptions & { historyLimit?: number; sdkSessionsDir?: string } = {},
 ): SessionStore {
-  const { historyLimit = 20, sdkSessionsDir = join(dir, "sdk-sessions"), ...rest } = opts;
-  return new SessionStore(dir, historyLimit, sdkSessionsDir, rest);
+  const { historyLimit = 20, sdkSessionsDir = join(dir, "sdk-sessions"), dbPath = join(dir, "tomo.db"), ...rest } = opts;
+  return new SessionStore(dir, historyLimit, sdkSessionsDir, { dbPath, ...rest });
 }
 
 /**

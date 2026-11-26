@@ -259,7 +259,7 @@ describe("delivery failures and shutdown", () => {
     // P0-5: the failure is SURFACED — a note for the next turn, persisted so
     // it survives a restart (a fresh store reads it back from disk), and the
     // transcript does not claim the reply arrived.
-    const fresh = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const fresh = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     const key = "imessage:iMessage;-;+15551112222";
     const notes = fresh.getPendingNotes(key);
     expect(notes.some((n) => n.includes("delivery failed") && n.includes("the reply"))).toBe(true);
@@ -271,7 +271,7 @@ describe("delivery failures and shutdown", () => {
 
   it("preserves the sdk session link when stopping during an in-flight turn", async () => {
     resetConfig({ identities: [ownerIdentity("Shuai", { imessage: "+15551112222" })] });
-    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir);
+    const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
     store.setSdkSessionId("dm:shuai", "old-session-id");
     store.setReplyTarget("dm:shuai", { channelName: "imessage", chatId: "+15551112222" });
 
@@ -291,7 +291,7 @@ describe("delivery failures and shutdown", () => {
     await agent.stop();
     release?.();
 
-    const after = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir).getEntry("dm:shuai");
+    const after = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath }).getEntry("dm:shuai");
     expect(after?.sdkSessionId).toBe("old-session-id");
     expect(after?.unlinkedAt).toBeNull();
   });

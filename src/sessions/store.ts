@@ -22,10 +22,12 @@ import {
   monthOf, monthNow, isAfterMessage, acquireRotationLock, sameInode, readCompleteLinesFromFd,
   spliceAppendsSince, type RotationLock,
 } from "./transcript-rotation.js";
+import { PendingNotesStore } from "./pending-notes-store.js";
+import { defaultRuntimePaths } from "../runtime-paths.js";
 import { usableSeq, usableTimestamp, orderTimestamp, sortByRecordTime } from "./transcript-order.js";
 import {
   renameIfPresent, NO_CORRUPT_LEDGER_HOLD, stubMetadata, sameFileOnDisk, unlinkIfPresent,
-  type PendingNotesFile, type LegacyStemLedgerFile, type OwnershipProbe, type CorruptLedgerHold,
+  type LegacyStemLedgerFile, type OwnershipProbe, type CorruptLedgerHold,
   type CarryOutcome, type TranscriptReadFile,
 } from "./store-support.js";
 
@@ -181,6 +183,8 @@ export { legacyTranscriptFileStem, transcriptFileStem } from "./transcript-names
 
 export class SessionStore {
   private readonly readOnly: boolean;
+  /** Pending prompt notes, in Tomo's database (see PendingNotesStore). */
+  private readonly pendingNotes: PendingNotesStore;
   private sessions = new Map<string, Session>();
   private registry: SessionEntry[] = [];
   /**
@@ -333,6 +337,8 @@ export class SessionStore {
       tailMessages?: number;
       rotateBytes?: number;
       readOnly?: boolean;
+      /** Tomo's database (pending notes live there). Defaults to `RuntimePaths.dbPath`. */
+      dbPath?: string;
       /**
        * How long to wait for each cross-process lock before giving up. The
        * defaults are the constants above; tests that hold a lock on purpose
@@ -347,6 +353,10 @@ export class SessionStore {
     this.dir = dir;
     this.readOnly = opts?.readOnly === true;
     this.sdkSessionsDir = sdkSessionsDir;
+    this.pendingNotes = new PendingNotesStore(dir, opts?.dbPath ?? defaultRuntimePaths.dbPath, {
+      readOnly: this.readOnly,
+      move: (from, to) => this.moveWithoutClobber(from, to),
+    });
     this.tailLimit = opts?.tailMessages ?? Math.max(TRANSCRIPT_TAIL_MIN, historyLimit * 10);
     this.rotateBytes = opts?.rotateBytes ?? TRANSCRIPT_ROTATE_BYTES;
     const timeouts = opts?.lockTimeoutMs;
@@ -781,31 +791,15 @@ export class SessionStore {
   }
 
   /** Load prompt notes that must survive daemon restarts until the session's
-   *  next turn drains them. Returns a defensive copy. */
+   *  next turn drains them (see PendingNotesStore). Returns a fresh copy. */
   getPendingNotes(key: string): string[] {
-    return [...(this.loadPendingNotes()[key] ?? [])];
+    return this.pendingNotes.get(key);
   }
 
-  /** Replace the durable prompt-note queue for one session. An empty list
-   *  removes the key and deletes the sidecar when no queues remain. */
+  /** Replace the durable prompt-note queue for one session, in one
+   *  transaction. An empty list removes the session's notes. */
   setPendingNotes(key: string, notes: string[]): void {
-    const data = this.loadPendingNotes();
-    if (notes.length > 0) {
-      data[key] = [...notes];
-    } else {
-      delete data[key];
-    }
-
-    if (Object.keys(data).length === 0) {
-      if (existsSync(this.pendingNotesPath)) unlinkSync(this.pendingNotesPath);
-      return;
-    }
-
-    const file: PendingNotesFile = { version: 1, notes: data };
-    // fsynced: a queued note is something a later turn was promised (e.g. the
-    // interrupted-web-request notice, which is only recorded as given once
-    // this returns).
-    writeJsonAtomicSync(this.pendingNotesPath, file, { fsync: true });
+    this.pendingNotes.set(key, notes);
   }
 
   // --- SDK Session Registry ---
@@ -1474,9 +1468,10 @@ export class SessionStore {
       );
     }
 
-    // Read before anything moves: a pending notes file that cannot be read
-    // (nor moved aside) refuses the re-key while it can still be retried.
-    const pendingNotes = this.loadPendingNotes();
+    // Before anything moves: a notes database that cannot be opened (nor a
+    // legacy notes file read or moved aside) refuses the re-key while it can
+    // still be retried.
+    this.pendingNotes.assertReady();
 
     // Re-keying is the registry forgetting `oldKey`: the `migratedFrom`
     // breadcrumb below is only kept for a non-DM→DM unification, so for every
@@ -1538,15 +1533,7 @@ export class SessionStore {
       );
     }
 
-    const oldNotes = pendingNotes[oldKey];
-    if (oldNotes) {
-      pendingNotes[newKey] = [...(pendingNotes[newKey] ?? []), ...oldNotes];
-      delete pendingNotes[oldKey];
-      writeJsonAtomicSync(this.pendingNotesPath, {
-        version: 1,
-        notes: pendingNotes,
-      } satisfies PendingNotesFile);
-    }
+    this.pendingNotes.rekey(oldKey, newKey);
 
     // Clear the in-memory session cache for BOTH keys: the old one is gone, and
     // the new one's files just changed underneath it (it gained the old key's
@@ -1683,115 +1670,37 @@ export class SessionStore {
     log.warn({ err, file: this.registryPath, op }, msg);
   }
 
-  private get pendingNotesPath(): string {
-    return join(this.dir, "_pending_notes.json");
-  }
-
-  /**
-   * A file that cannot be read, decoded or parsed, or holds anything but
-   * lists of strings, is never read as empty: the next write would replace
-   * every session's notes. It is moved aside unchanged (see
-   * `quarantinePendingNotes`) and a fresh one started.
-   */
-  private loadPendingNotes(): Record<string, string[]> {
-    let raw: Buffer;
+  /** Open the notes database now (startup self-check). Never throws: a failure is logged, and every
+   *  later note read or write retries it (the queue holds notes in memory meanwhile). */
+  preparePendingNotes(): void {
     try {
-      raw = readFileSync(this.pendingNotesPath);
+      this.pendingNotes.assertReady();
     } catch (err) {
-      if (isEnoent(err)) return {};
-      return this.quarantinePendingNotes(err);
-    }
-    try {
-      const data = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(raw)) as Partial<PendingNotesFile> | null;
-      const notes = data?.notes;
-      if (!notes || typeof notes !== "object" || Array.isArray(notes)
-        || !Object.values(notes).every((v) => Array.isArray(v) && v.every((n) => typeof n === "string"))) {
-        throw new Error("not a pending notes file");
-      }
-      return notes;
-    } catch (err) {
-      return this.quarantinePendingNotes(err);
+      log.error({ err, db: this.pendingNotes.dbPath }, "Tomo's database could not be opened; pending notes are held in memory until it can");
     }
   }
 
-  private get pendingNotesMarkerPath(): string {
-    return join(this.dir, "_pending_notes.quarantined.json");
-  }
-
   /**
-   * The pending notes files moved aside that the owner has not been told
-   * about yet (undefined: none). Kept on disk until the notice is sent, so a
-   * restart in between still sends it. A marker that will not read counts as
-   * one naming no file.
+   * The pending notes files and databases moved aside that the owner has not
+   * been told about yet (undefined: none). Kept on disk until the notice is
+   * sent, so a restart in between still sends it.
    */
   quarantinedPendingNotes(): string[] | undefined {
-    let raw: string;
-    try {
-      raw = readFileSync(this.pendingNotesMarkerPath, "utf-8");
-    } catch (err) {
-      return isEnoent(err) ? undefined : [];
-    }
-    try {
-      const asides = (JSON.parse(raw) as { asides?: unknown }).asides;
-      return Array.isArray(asides) ? asides.filter((a): a is string => typeof a === "string") : [];
-    } catch {
-      return [];
-    }
+    return this.pendingNotes.quarantined();
   }
 
-  /** The owner was told about `asides`: they leave the marker, which goes once empty. */
+  /** The owner was told about `asides`: they leave the markers. */
   clearQuarantinedPendingNotes(asides: string[]): void {
-    const left = (this.quarantinedPendingNotes() ?? []).filter((a) => !asides.includes(a));
-    try {
-      if (left.length > 0) writeJsonAtomicSync(this.pendingNotesMarkerPath, { asides: left }, { fsync: true });
-      else unlinkSync(this.pendingNotesMarkerPath);
-    } catch (err) {
-      if (!isEnoent(err)) log.warn({ err }, "Could not update the pending notes quarantine marker");
-    }
+    this.pendingNotes.clearQuarantined(asides);
   }
 
-  /** Told after a file was moved aside (the marker already names it). */
-  onPendingNotesQuarantined?: (aside: string) => void;
+  /** Told after a notes file or the database was moved aside (a marker already names it). */
+  set onPendingNotesQuarantined(listener: ((aside: string) => void) | undefined) {
+    this.pendingNotes.onQuarantined = listener;
+  }
 
-  /**
-   * Move the unreadable pending notes file aside, byte for byte, as
-   * `_pending_notes.json.corrupt-<ts>`, and start fresh. The marker naming it
-   * is on disk first. Throws when it cannot be moved: nothing may be written
-   * over it then.
-   */
-  private quarantinePendingNotes(cause: unknown): Record<string, string[]> {
-    const path = this.pendingNotesPath;
-    if (this.readOnly) throw new Error("Pending notes file could not be read", { cause });
-    const ts = fileTimestamp();
-    for (let n = 0; n < 100; n++) {
-      const aside = n === 0 ? `${path}.corrupt-${ts}` : `${path}.corrupt-${ts}-${n}`;
-      const before = this.quarantinedPendingNotes();
-      let outcome: "moved" | "taken" | "gone" | undefined;
-      try {
-        writeJsonAtomicSync(this.pendingNotesMarkerPath, { asides: [...(before ?? []), aside] }, { fsync: true });
-        outcome = this.moveWithoutClobber(path, aside);
-      } finally {
-        // Not moved: the marker goes back to what it was.
-        if (outcome !== "moved") {
-          try {
-            if (before === undefined) unlinkSync(this.pendingNotesMarkerPath);
-            else writeJsonAtomicSync(this.pendingNotesMarkerPath, { asides: before }, { fsync: true });
-          } catch (err) {
-            if (!isEnoent(err)) log.warn({ err }, "Could not restore the pending notes quarantine marker");
-          }
-        }
-      }
-      if (outcome === "taken") continue;
-      if (outcome === "gone") return {};
-      log.error({ err: cause, file: path, aside }, "Pending notes file could not be read; moved it aside unchanged and started a fresh one");
-      try {
-        this.onPendingNotesQuarantined?.(aside);
-      } catch (err) {
-        log.warn({ err }, "Pending notes quarantine listener failed");
-      }
-      return {};
-    }
-    throw new Error("No free name to move the pending notes file aside", { cause });
+  get onPendingNotesQuarantined(): ((aside: string) => void) | undefined {
+    return this.pendingNotes.onQuarantined;
   }
 
   // --- Legacy stem ownership ledger (see LegacyStemLedgerFile) ---

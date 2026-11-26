@@ -180,6 +180,7 @@ export function resetConfig(overrides: Partial<typeof mockConfig> = {}) {
     ...DEFAULTS,
     _ownerOverride: undefined,
     sessionsDir: join(agentEnv.tmpDir, "sessions"),
+    dbPath: join(agentEnv.tmpDir, "data", "tomo.db"),
     sdkSessionsDir: join(agentEnv.tmpDir, "sdk-sessions"),
     workspaceDir: join(agentEnv.tmpDir, "workspace"),
     logsDir: join(agentEnv.tmpDir, "logs"),

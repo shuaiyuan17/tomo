@@ -1,4 +1,4 @@
-import { createRequire } from "node:module";
+import { loadNodeSqlite } from "../db/sqlite.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { log } from "../logger.js";
@@ -99,10 +99,7 @@ export class ChatDbAttachmentLookup implements AttachmentLookup {
   private failed = false;
   private closed = false;
 
-  constructor(private readonly dbPath: string, private readonly loadSqlite: () => SqliteModule = () => {
-    const require = createRequire(import.meta.url);
-    return require("node:sqlite") as SqliteModule;
-  }) {}
+  constructor(private readonly dbPath: string, private readonly loadSqlite: () => SqliteModule = () => loadNodeSqlite() as unknown as SqliteModule) {}
 
   private ensureOpen(): void {
     if (this.db || this.failed || this.closed) return;

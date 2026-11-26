@@ -378,6 +378,69 @@ describe("SubsessionService", () => {
     expect(h.turns.at(-1)?.prompt).toContain("any news?");
   });
 
+  it("the main session's own note to a finished task waits for a slot; the owner's words do not", async () => {
+    let hold = true;
+    const h = harness({ maxRunning: 1 }, (turn, hh) => {
+      if (turn.key === "task:s2" && hold) return new Promise(() => {}); // s2 keeps the one slot
+      hh.service.noteToolUse(turn.key);
+      if (hh.store.byKey(turn.key)?.status === "active") hh.service.finish(turn.key, "done");
+      return { ok: true };
+    });
+    h.service.start();
+    const done = spawn(h, "finishes");
+    await flush();
+    expect(h.store.get(done.id)?.status).toBe("finished");
+    spawn(h, "busy");
+    await flush();
+    const turns = h.turns.length;
+    // Autonomous work on a finished task: no turn past the cap, and it stays finished.
+    expect(h.service.relay(done.id, "one more thing?")).toMatchObject({ ok: true });
+    await flush();
+    expect(h.turns).toHaveLength(turns);
+    expect(h.store.get(done.id)).toMatchObject({ status: "finished", pendingInput: [expect.objectContaining({ text: expect.stringContaining("one more thing?") })] });
+    // The slot frees: it answers the note.
+    await h.service.cancel("s2", "test");
+    await flush();
+    expect(h.turns.at(-1)?.key).toBe(done.sessionKey);
+    expect(h.turns.at(-1)?.prompt).toContain("one more thing?");
+    expect(h.store.get(done.id)).toMatchObject({ status: "finished", pendingInput: [] });
+    // The owner's words to a finished task run at once, whatever the slots say.
+    hold = true;
+    spawn(h, "busy again");
+    await flush();
+    const before = h.turns.length;
+    h.service.relay(done.id, "the owner says go", said("go"));
+    await flush();
+    expect(h.turns.length).toBe(before + 1);
+    expect(h.turns.at(-1)?.key).toBe(done.sessionKey);
+  });
+
+  it("the owner's words to a finished task run past the cap even with a compact planned first; held owner input does not let a note through", async () => {
+    const h = harness({ maxRunning: 1 }, (turn, hh) => {
+      if (turn.key === "task:s2") return new Promise(() => {}); // s2 keeps the one slot
+      hh.service.noteToolUse(turn.key);
+      if (hh.store.byKey(turn.key)?.status === "active") hh.service.finish(turn.key, "done");
+      return { ok: true };
+    });
+    h.service.start();
+    const done = spawn(h, "finishes");
+    await flush();
+    spawn(h, "busy");
+    await flush();
+    // Owner input held for their next message, then a note: still autonomous work.
+    h.store.update(done.id, (r) => { appendInput(r, "old owner words", { from: "owner", words: "old owner words" }); r.heldThrough = r.pendingInput.at(-1)!.seq; });
+    const turns = h.turns.length;
+    h.service.relay(done.id, "a note");
+    await flush();
+    expect(h.turns).toHaveLength(turns);
+    // The owner writes; a compact is planned ahead of their turn: it runs now.
+    h.store.update(done.id, (r) => { r.compactPending = true; });
+    h.service.relay(done.id, "the owner says go", said("go"));
+    await flush();
+    expect(h.turns.length).toBeGreaterThan(turns);
+    expect(h.turns.slice(turns).map((t) => t.key)).toEqual(expect.arrayContaining([done.sessionKey]));
+  });
+
   it("a driver that throws is tried again by the retry timer, never at once in a loop", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {

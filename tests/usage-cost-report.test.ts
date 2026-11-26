@@ -85,7 +85,7 @@ describe("Cost report: breakdowns", () => {
       row("2026-11-14T04:00:00-08:00", 6, { source: "heartbeat" }),
     ]);
     const r = report({ from: "2026-11-14", to: "2026-11-15", top: 3 });
-    expect(r.totals.byCategory).toEqual({ you: 4, background: 6, scheduled: 2.75 });
+    expect(r.totals.byCategory).toEqual({ you: 4, background: 6, scheduled: 2.75, tasks: 0 });
     expect(r.sessions.map((s) => [s.label, s.costUsd, s.turns])).toEqual([["dm:owner", 11.75, 5], ["telegram:-1", 1, 1]]);
     expect(r.crons).toEqual([
       { jobId: "j1", name: "daily-brief", costUsd: 2.5, runs: 2 },
@@ -96,7 +96,7 @@ describe("Cost report: breakdowns", () => {
     expect(r.topTurns.map((t) => t.costUsd)).toEqual([6, 3, 2]);
     expect(r.topTurns[1]).toMatchObject({ date: "2026-11-14", category: "you", source: "owner", trigger: "plan my trip", durationMs: 9000, tools: 4, numTurns: 5,
       session: { label: "dm:owner", kind: "dm" } });
-    expect(day(r, "2026-11-14").byCategory).toEqual({ you: 4, background: 6, scheduled: 2.25 });
+    expect(day(r, "2026-11-14").byCategory).toEqual({ you: 4, background: 6, scheduled: 2.25, tasks: 0 });
   });
 
   it("skips torn and foreign lines, and says which days nothing was recorded", () => {
@@ -170,5 +170,64 @@ describe("LedgerReader cache", () => {
     // Gone.
     rmSync(join(dir, "2026-11.ndjson"));
     expect(reader.rows(["2026-11.ndjson"])[0]).toEqual([]);
+  });
+});
+
+describe("Cost report: sub-sessions (the Tasks category)", () => {
+  const RELAY = "A sub-session finished; its report is in a note above. Tell the owner the result in a few lines";
+  const describe_ = (key: string) => ({ label: key.startsWith("task:") ? `${key.slice(5)} · a title` : key, kind: key.startsWith("task:") ? "task" as const : "dm" as const });
+
+  it("reads rows written before tasks had sources of their own into Tasks, without rewriting them", () => {
+    const rows = [
+      // A task's own turn, written as "background" before this change.
+      row("2026-11-14T09:00:00-08:00", 5, { sessionKey: "task:s9", source: "background" }),
+      // The owning session's report turn for it, also "background", known by its trigger.
+      row("2026-11-14T09:05:00-08:00", 1, { source: "background", trigger: RELAY }),
+      row("2026-11-14T09:06:00-08:00", 0.5, { source: "background", trigger: "A sub-session conversation is shown above. Take it in; nothing you write here is sent." }),
+      // A real background turn stays where it was.
+      row("2026-11-14T09:10:00-08:00", 2, { source: "background", trigger: "A background task finished" }),
+      // Another source with a relay-looking trigger is not reclassified.
+      row("2026-11-14T09:20:00-08:00", 3, { source: "owner", trigger: "A sub-session finished; its report is in a note above. what now" }),
+    ];
+    write("2026-11.ndjson", rows);
+    const before = JSON.stringify(rows.map((r) => JSON.stringify(r)));
+    const r = report({ from: "2026-11-14", to: "2026-11-14", describeSession: describe_ });
+    expect(r.totals.byCategory).toEqual({ you: 3, background: 2, scheduled: 0, tasks: 6.5 });
+    expect(r.tasks.list).toEqual([{ id: "s9", label: "s9 · a title", costUsd: 5, selfCostUsd: 5, relayCostUsd: 0, turns: 1 }]);
+    // Old relay rows never named their task: counted in the category, under no task.
+    expect(r.tasks.unattributedRelayCostUsd).toBe(1.5);
+    expect(r.topTurns.find((t) => t.costUsd === 5)).toMatchObject({ source: "task", category: "tasks", taskId: "s9" });
+    // The file is untouched.
+    expect(JSON.stringify(rows.map((x) => JSON.stringify(x)))).toBe(before);
+  });
+
+  it("a task's total is its own turns plus the relay turns that name it, and everything still adds up to the ledger", () => {
+    write("2026-11.ndjson", [
+      row("2026-11-14T08:00:00-08:00", 4, { sessionKey: "task:s3", source: "task", taskId: "s3" }),
+      row("2026-11-14T08:30:00-08:00", 2, { sessionKey: "task:s3", source: "task", taskId: "s3", trigger: "force-compact" }),
+      row("2026-11-14T09:00:00-08:00", 0.75, { source: "task-relay", taskId: "s3", trigger: RELAY }),
+      row("2026-11-14T09:00:00-08:00", 7, { sessionKey: "task:s4", source: "task", taskId: "s4" }),
+      row("2026-11-14T09:30:00-08:00", 0.25, { source: "task-relay" }),
+      // A relay row whose task id is not one: under no task.
+      row("2026-11-14T09:40:00-08:00", 0.5, { source: "task-relay", taskId: "../etc" }),
+      row("2026-11-14T10:00:00-08:00", 10, { source: "owner" }),
+    ]);
+    const r = report({ from: "2026-11-14", to: "2026-11-14", describeSession: describe_ });
+    expect(r.tasks.list).toEqual([
+      { id: "s4", label: "s4 · a title", costUsd: 7, selfCostUsd: 7, relayCostUsd: 0, turns: 1 },
+      { id: "s3", label: "s3 · a title", costUsd: 6.75, selfCostUsd: 6, relayCostUsd: 0.75, turns: 2 },
+    ]);
+    expect(r.tasks).toMatchObject({ selfCostUsd: 13, relayCostUsd: 0.75, unattributedRelayCostUsd: 0.75 });
+    expect(r.totals.byCategory.tasks).toBe(r.tasks.selfCostUsd + r.tasks.relayCostUsd + r.tasks.unattributedRelayCostUsd);
+    expect(r.totals.costUsd).toBe(24.5);
+    // The relay turns stay on the owning session's row, in its Tasks part.
+    expect(r.sessions.find((s) => s.label === "dm:owner")).toMatchObject({ costUsd: 11.5, byCategory: { you: 10, background: 0, scheduled: 0, tasks: 1.5 } });
+  });
+
+  it("a row that says it is a task's own turn but is not on a task key is read as background", () => {
+    write("2026-11.ndjson", [row("2026-11-14T08:00:00-08:00", 4, { source: "task", taskId: "s3" })]);
+    const r = report({ from: "2026-11-14", to: "2026-11-14", describeSession: describe_ });
+    expect(r.totals.byCategory).toMatchObject({ background: 4, tasks: 0 });
+    expect(r.tasks.list).toEqual([]);
   });
 });

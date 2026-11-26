@@ -120,6 +120,9 @@ describe("usage ledger and the resume baseline", () => {
     expect(rows[2].models).toEqual({ "claude-opus": { input: 10, output: 5, cacheRead: 0, cacheCreated: 0, webSearch: 0, costUsd: 0.25 } });
     // Together they add up to the SDK's own total: nothing charged twice.
     expect(rows.reduce((sum, r) => sum + (r.costUsd as number), 0)).toBe(1.75);
+    // The registry's totals (tomo status, sessions) follow the landed rows: the
+    // turn the CLI started itself, which no managed turn ever reported, included.
+    expect(internals(agent).sessions.getEntry(key).stats.totalCostUsd).toBeCloseTo(1.75);
   });
 
   it("a row that failed to land is counted by the first turn after the resume, from the ledger's last snapshot", async () => {
@@ -183,8 +186,8 @@ describe("usage ledger and the resume baseline", () => {
       await drainQueue(agent);
       await ledger.idle();
     }
-    // Session stats saw both turns; the ledger has nothing.
-    expect(internals(agent).sessions.getEntry(key).stats.totalCostUsd).toBeCloseTo(1.5);
+    // The ledger has nothing, and the registry's totals follow the ledger: nothing yet either.
+    expect(internals(agent).sessions.getEntry(key).stats.totalCostUsd).toBe(0);
 
     // The disk recovers, the session is rebuilt and resumes.
     rmSync(join(agentEnv.tmpDir, "data", "usage"));
@@ -198,6 +201,8 @@ describe("usage ledger and the resume baseline", () => {
     const rows = ledgerRows();
     expect(rows.map((r) => r.costUsd)).toEqual([1.75]);
     expect(rows[0].noBaseline).toBeUndefined();
+    // The first row that lands carries it all, into the registry too.
+    expect(internals(agent).sessions.getEntry(key).stats.totalCostUsd).toBeCloseTo(1.75);
   });
 
   it("the registry copy follows landed rows, for a resume the ledger cannot answer", async () => {

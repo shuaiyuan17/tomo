@@ -82,9 +82,9 @@ import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/bl
 import { LiveSessionManager } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { appendToTomoEventBody, formatTomoEvent, markOwnerAudience } from "./tomo-event.js";
-import { USAGE_LEDGER_VERSION, UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
+import { forceSummaryLedgerRow, UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
 import { usageDataDir } from "./usage/dir.js";
-import { readSessionWindowPercent } from "./usage/limits-log.js";
+import { QuotaGateReader } from "./usage/limits-log.js";
 import { consumeRestartReasonFile } from "./restart-reason.js";
 import { watchBus } from "./watch/bus.js";
 import type { WatchSessionInfo } from "./watch/protocol.js";
@@ -195,6 +195,8 @@ export class Agent {
   // /pause state: raw group keys whose inbound messages are dropped at receipt.
   private pauses: PauseStore;
   private usageLedger: UsageLedger;
+  /** The sub-session quota gate's reading, with a usage read of its own when the samples go stale. */
+  private quotaGate: QuotaGateReader;
   private modelOverrides = new Map<string, string>();
   private readonly ownerAdoption: OwnerAdoption;
   private readonly contextNudger: ContextNudger;
@@ -377,6 +379,8 @@ export class Agent {
       this.handleSummonExpired(channelName, chatId, identity, notifyGroup);
     this.pauses = new PauseStore(join(config.tomoHome, "data", "pauses.json"));
     this.usageLedger = new UsageLedger(usageDataDir(config.tomoHome));
+    // The refresh (a real usage read) is wired by the daemon's start (setQuotaRefresh), never in tests.
+    this.quotaGate = new QuotaGateReader({ path: join(usageDataDir(config.tomoHome), "limits.ndjson") });
     this.commands = new ChatCommandHandler({
       router: this.router,
       sessions: this.sessions,
@@ -426,9 +430,14 @@ export class Agent {
         // usage-ledger rows alone (recordUsage below), never by a result
         // seen: a baseline that ran ahead of the ledger would let a resume
         // skip a turn whose row failed to land.
+        // Cost and tokens too come from the ledger (recordUsage below), one
+        // landed row at a time: a turn can hold several results (a steered
+        // message, one the CLI started itself) and only the newest is here,
+        // and a result after the turn has no turn at all. Here: the query
+        // count and the context reading.
         const { usageBaseline: _seen, ...stats } = result;
         void _seen;
-        this.sessions.updateStats(key, stats);
+        this.sessions.updateStats(key, { ...stats, costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 });
         watchBus.publish({
           type: "turn.stats",
           sessionKey: key,
@@ -445,8 +454,15 @@ export class Agent {
         let row: UsageLedgerRow | undefined;
         void this.usageLedger.appendFor(key, () => (row = build()), () => {
           onWritten();
-          // The registry copy follows the ledger, one landed row at a time.
-          if (row) this.sessions.setUsageBaseline(key, row.snapshot ?? null);
+          // The registry copy follows the ledger, one landed row at a time:
+          // the resume baseline, and the session's cost and token totals.
+          if (row) {
+            this.sessions.setUsageBaseline(key, row.snapshot ?? null);
+            this.sessions.addOutsideUsage(key, {
+              costUsd: row.costUsd, inputTokens: row.tokens.input, outputTokens: row.tokens.output,
+              cacheReadTokens: row.tokens.cacheRead, cacheCreationTokens: row.tokens.cacheCreated,
+            });
+          }
         });
       },
       getSessionMessages: (key) => this.sessions.get(key).messages,
@@ -509,17 +525,11 @@ export class Agent {
           // A separate CLI, outside LiveSession's recorder: its cost lands in
           // the usage ledger under the session it compacted.
           onUsage: (u) => {
-            this.sessions.addOutsideUsage(key, {
+            // The registry's totals follow the ledger here too: added once the row has landed.
+            void this.usageLedger.append(forceSummaryLedgerRow(key, u, Date.now()), () => this.sessions.addOutsideUsage(key, {
               costUsd: u.costUsd, inputTokens: u.tokens.input, outputTokens: u.tokens.output,
               cacheReadTokens: u.tokens.cacheRead, cacheCreationTokens: u.tokens.cacheCreated,
-            });
-            void this.usageLedger.append({
-            v: USAGE_LEDGER_VERSION, ts: Date.now(), sessionKey: key, source: "background", trigger: "force-compact",
-            ...(u.subtype !== "success" ? { subtype: u.subtype } : {}),
-            costUsd: u.costUsd, tokens: u.tokens,
-            ...(u.durationMs !== undefined ? { durationMs: u.durationMs } : {}),
-            ...(u.numTurns !== undefined ? { numTurns: u.numTurns } : {}),
-            });
+            }));
           },
         }),
         signal,
@@ -605,9 +615,9 @@ export class Agent {
       withdrawPendingNote: (key, match) => this.pendingNotesQueue.withdrawNote(key, match),
       hasPendingNote: (key, predicate) => this.pendingNotesQueue.hasNote(key, predicate),
       persistPendingNotes: (key) => this.pendingNotesQueue.persistNow(key),
-      wakeScope: (parentKey, prompt) => {
+      wakeScope: (parentKey, prompt, taskId) => {
         const body = appendToTomoEventBody(prompt, CONTINUITY_DELIVERY_NOTE);
-        this.enqueueForSession(parentKey, () => this.processContinuity(body, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionReport"), "background"))
+        this.enqueueForSession(parentKey, () => this.processContinuity(body, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionReport"), "task-relay", taskId))
           .catch((err) => log.error({ err, sessionKey: parentKey }, "Sub-session report turn failed in queue"));
       },
       contextUsage: (key) => {
@@ -627,7 +637,9 @@ export class Agent {
       unlinkRegistryEntry: (key) => this.sessions.clearSdkSessionId(key),
       registryTaskKeys: () => this.sessions.listActiveEntries().map((e) => e.channelKey).filter(isTaskSessionKey),
       isStopping: () => this.stopping,
-      sessionQuotaPercent: () => readSessionWindowPercent(join(usageDataDir(config.tomoHome), "limits.ndjson")),
+      // API-key auth has no subscription windows: any sample on disk is an earlier login's.
+      quotaReading: () => (config.auth.method === "api-key" ? undefined : this.quotaGate.read()),
+      freshenQuota: () => this.quotaGate.ensureFresh(),
       mirrorWake: (parentKey) => this.mirrorWake(parentKey),
       messageWake: (parentKey) => this.messageWake(parentKey),
     });
@@ -665,7 +677,7 @@ export class Agent {
       if (this.stopping || !this.subsessions?.hasUnseenOwnerWords(parentKey)) return;
       // Asked again here: the quota window can fill while the wake waits.
       if (!this.subsessions.mirrorTurnAllowed()) return;
-      await this.processContinuity(prompt, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionMirror"), "background");
+      await this.processContinuity(prompt, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionMirror"), "task-relay");
     }).catch((err) => {
       this.mirrorWakeQueued.delete(parentKey);
       log.error({ err, sessionKey: parentKey }, "Sub-session mirror turn failed in queue");
@@ -693,7 +705,7 @@ export class Agent {
       this.messageWakeQueued.delete(parentKey);
       if (this.stopping || !this.subsessions?.hasMessageNote(parentKey)) return;
       try {
-        await this.processContinuity(prompt, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionMessage"), "background");
+        await this.processContinuity(prompt, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionMessage"), "task-relay");
       } finally {
         this.retryMessageWake(parentKey);
       }
@@ -769,7 +781,8 @@ export class Agent {
       const ok = await this.turnRunner.runTurn({
         key,
         source: "continuity",
-        usage: { source: "background" },
+        // The task's own turn: its own bucket on the Cost page, never "Background".
+        usage: { source: "task", ...(taskIdFromSessionKey(key) ? { taskId: taskIdFromSessionKey(key) } : {}) },
         prompt,
         bare: opts.bare,
         delivery: {
@@ -2126,6 +2139,14 @@ export class Agent {
   }
 
   /** The web Study's view of a session key's model. Never creates a session. */
+  /**
+   * How the sub-session quota gate takes a fresh usage read when its samples
+   * are stale (see QuotaGateReader). Set once by the daemon's start.
+   */
+  setQuotaRefresh(refresh: () => Promise<unknown>): void {
+    this.quotaGate.setRefresh(refresh);
+  }
+
   webModelView(sessionKey: string): ReturnType<typeof describeSessionModel> {
     return describeSessionModel(this.modelOverrides, sessionKey, this.liveSessionManager.hasTurnInFlight(sessionKey));
   }
@@ -2979,13 +3000,15 @@ export class Agent {
     audiences: string[] | undefined,
     turnKind: OwnerText,
     usageSource: UsageSource,
+    /** `task-relay`: the one task the turn is for, when there is one. */
+    taskId?: string,
   ): Promise<void> {
     const turnId = audiences ? this.turnAudiences.begin(key, audiences) : undefined;
     try {
       // A summoned group's restart notice runs on the owner's dm: session;
       // its failure still belongs to (and is reported as) the group's.
       const groupKey = audiences?.find((a) => isGroupSessionKey(a));
-      await this.runContinuityTurn(prompt, key, turnKind, usageSource, groupKey);
+      await this.runContinuityTurn(prompt, key, turnKind, usageSource, groupKey, taskId);
     } finally {
       if (turnId !== undefined) this.turnAudiences.end(key, turnId);
     }
@@ -2997,11 +3020,12 @@ export class Agent {
     turnKind: OwnerText,
     usageSource: UsageSource,
     noticeGroupKey?: string,
+    taskId?: string,
   ): Promise<void> {
     await this.turnRunner.runTurn({
       key,
       source: "continuity",
-      usage: { source: usageSource },
+      usage: { source: usageSource, ...(taskId ? { taskId } : {}) },
       prompt,
       // No timestamp stamp, no typing indicator — continuity turns are
       // invisible. A heartbeat speaks only through the explicit `send_message`

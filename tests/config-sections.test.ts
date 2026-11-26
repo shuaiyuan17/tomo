@@ -111,7 +111,16 @@ describe("subsessions", () => {
     const { config, DEFAULT_SUBSESSIONS } = await load({});
     expect(config.subsessions).toEqual(DEFAULT_SUBSESSIONS);
     expect(config.subsessions.enabled).toBe(true);
-    expect(DEFAULT_SUBSESSIONS).toEqual({ enabled: true, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null, mirror: "turn", ownerMessages: "via-main", maxActiveHours: 24 });
+    expect(DEFAULT_SUBSESSIONS).toEqual({ enabled: true, maxRunning: 2, maxOpen: 5, maxTurns: 200, maxContextTokens: 500_000, defaultModel: null, mirror: "turn", ownerMessages: "via-main", maxActiveHours: 24, quotaPauseAtPct: 85 });
+  });
+
+  it("takes a quota pause threshold, 0 < pct <= 100, a bad one falling back to 85", async () => {
+    expect((await load({ subsessions: { quotaPauseAtPct: 70 } })).config.subsessions.quotaPauseAtPct).toBe(70);
+    for (const bad of [0, 101, "high"]) {
+      const out = await load({ subsessions: { quotaPauseAtPct: bad } });
+      expect(out.config.subsessions.quotaPauseAtPct).toBe(85);
+      expect(out.configIssues.join("\n")).toContain("subsessions.quotaPauseAtPct");
+    }
   });
 
   it("sends a task's messages through the main session unless ownerMessages is direct", async () => {

@@ -1,5 +1,6 @@
 import { closeSync, fstatSync, openSync, readdirSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { isWellFormedTaskId, taskIdFromSessionKey } from "../sessions/keys.js";
 import { BACKFILL_FILE, LEDGER_FILE_RE, readLedgerStarted, usageCategory, type UsageCategory, type UsageLedgerRow, type UsageSource } from "./ledger.js";
 
 /**
@@ -14,6 +15,8 @@ export interface CostRow {
   category: UsageCategory;
   jobId?: string;
   jobName?: string;
+  /** `task` / `task-relay` rows: the sub-session the turn was for. */
+  taskId?: string;
   trigger?: string;
   costUsd: number;
   durationMs?: number;
@@ -24,18 +27,50 @@ export interface CostRow {
   backfilled?: true;
 }
 
-const SOURCES = new Set<UsageSource>(["owner", "group", "cron", "system", "delegate", "heartbeat", "restart", "background"]);
+const SOURCES = new Set<UsageSource>(["owner", "group", "cron", "system", "delegate", "heartbeat", "restart", "background", "task", "task-relay"]);
+
+/**
+ * How the owning session's turns for its tasks began, before they had a
+ * source of their own (`task-relay`): the first words of each wake's prompt,
+ * as the trigger snippet keeps them (src/agent.ts mirrorWake / messageWake,
+ * subsessions/service.ts wakeForReport and the unanswered-messages wake).
+ */
+const LEGACY_RELAY_TRIGGERS = [
+  "A sub-session finished; its report is in a note above.",
+  "A sub-session conversation is shown above.",
+  "A sub-session handed you something for the owner;",
+  "A finished sub-session could not answer what it was sent;",
+];
+
+/**
+ * The source a row is read as. Rows are never rewritten: rows from before
+ * sub-sessions had sources of their own are read into them here. A row on
+ * a `task:` key is the task's own turn whatever it was written as (they were
+ * all `background`); a `background` row whose trigger is one of the relay
+ * wakes is a relay turn.
+ */
+function readSource(raw: Partial<UsageLedgerRow>, sessionKey: string): UsageSource {
+  const written = SOURCES.has(raw.source as UsageSource) ? raw.source as UsageSource : "background";
+  if (taskIdFromSessionKey(sessionKey)) return "task";
+  // Only a task's own key can hold its own turns (every `task` row is in Tasks with an id).
+  if (written === "task") return "background";
+  if (written === "background" && typeof raw.trigger === "string" && LEGACY_RELAY_TRIGGERS.some((t) => raw.trigger!.startsWith(t))) return "task-relay";
+  return written;
+}
 const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
 const optNum = (v: unknown): number | undefined => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
 const optStr = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
+const wellFormedTaskId = (v: unknown): string | undefined => (typeof v === "string" && isWellFormedTaskId(v) ? v : undefined);
 
 /** One parsed line, or undefined for a torn, corrupt or foreign one. */
 export function toCostRow(line: string): CostRow | undefined {
   let raw: Partial<UsageLedgerRow>;
   try { raw = JSON.parse(line) as Partial<UsageLedgerRow>; } catch { return undefined; }
   if (!raw || typeof raw !== "object" || typeof raw.ts !== "number" || !Number.isFinite(raw.ts) || typeof raw.sessionKey !== "string") return undefined;
-  const source = SOURCES.has(raw.source as UsageSource) ? raw.source as UsageSource : "background";
+  const source = readSource(raw, raw.sessionKey);
   const row: CostRow = { ts: raw.ts, sessionKey: raw.sessionKey, source, category: usageCategory(source), costUsd: num(raw.costUsd) };
+  const taskId = source === "task" ? taskIdFromSessionKey(raw.sessionKey) : source === "task-relay" ? wellFormedTaskId(raw.taskId) : undefined;
+  if (taskId) row.taskId = taskId;
   const jobId = optStr(raw.jobId); if (jobId) row.jobId = jobId;
   const jobName = optStr(raw.jobName); if (jobName) row.jobName = jobName;
   const trigger = optStr(raw.trigger); if (trigger) row.trigger = trigger;

@@ -919,15 +919,31 @@ export class SessionStore {
   }
 
   /**
-   * Charge a model call made FOR this session outside its SDK session (a
-   * forced compaction's summary call) to its totals. The context reading, the
-   * query count and the usage baseline are left alone: none of them is about
-   * that call.
+   * Add usage to the session's cost and token totals: every usage-ledger row
+   * of the session as it lands (agent.ts recordUsage — so the totals follow
+   * the ledger, every result counted, none twice), and a model call made FOR
+   * it outside its SDK session (a forced compaction's summary call). The
+   * context reading, the query count and the usage baseline are left alone.
    */
   addOutsideUsage(key: string, u: { costUsd: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }): void {
     this.mutateRegistry("addOutsideUsage", "bookkeeping", () => {
       const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
-      if (!entry?.stats) return;
+      if (!entry) {
+        // A NEW session's first ledger row can land before its registry entry
+        // exists (the entry is made at turn completion): held, and added with
+        // the session's first stats update.
+        const held = this.pendingUsage.get(key) ?? { costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+        for (const k of Object.keys(held) as (keyof typeof held)[]) held[k] += u[k];
+        this.pendingUsage.set(key, held);
+        return;
+      }
+      // A session's first ledger row can land before its first updateStats.
+      entry.stats ??= {
+        totalQueries: 0, totalCostUsd: 0,
+        totalInputTokens: 0, totalOutputTokens: 0,
+        totalCacheReadTokens: 0, totalCacheCreationTokens: 0,
+        contextUsed: 0, contextMax: 0,
+      };
       entry.stats.totalCostUsd += u.costUsd;
       entry.stats.totalInputTokens += u.inputTokens;
       entry.stats.totalOutputTokens += u.outputTokens;
@@ -975,11 +991,14 @@ export class SessionStore {
       }
 
       entry.stats.totalQueries++;
-      entry.stats.totalCostUsd += update.costUsd;
-      entry.stats.totalInputTokens += update.inputTokens;
-      entry.stats.totalOutputTokens += update.outputTokens;
-      entry.stats.totalCacheReadTokens += update.cacheReadTokens;
-      entry.stats.totalCacheCreationTokens += update.cacheCreationTokens;
+      // Rows that landed before the entry existed (see addOutsideUsage).
+      const held = this.pendingUsage.get(key);
+      this.pendingUsage.delete(key);
+      entry.stats.totalCostUsd += update.costUsd + (held?.costUsd ?? 0);
+      entry.stats.totalInputTokens += update.inputTokens + (held?.inputTokens ?? 0);
+      entry.stats.totalOutputTokens += update.outputTokens + (held?.outputTokens ?? 0);
+      entry.stats.totalCacheReadTokens += update.cacheReadTokens + (held?.cacheReadTokens ?? 0);
+      entry.stats.totalCacheCreationTokens += update.cacheCreationTokens + (held?.cacheCreationTokens ?? 0);
       entry.stats.contextUsed = update.contextUsed;
       // An estimated reading carries the window as "0 = never seen one": keep
       // the last real window rather than forget it (a forced compaction right
@@ -1023,6 +1042,9 @@ export class SessionStore {
       this.saveRegistryBestEffort("setUsageBaseline");
     });
   }
+
+  /** Usage from landed ledger rows of a key that had no registry entry yet (see addOutsideUsage). */
+  private readonly pendingUsage = new Map<string, { costUsd: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }>();
 
   /** Snapshots from landed ledger rows whose SDK session was not linked yet (see setUsageBaseline). */
   private readonly pendingUsageBaselines = new Map<string, UsageBaseline>();

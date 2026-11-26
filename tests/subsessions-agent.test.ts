@@ -11,7 +11,7 @@ import { Agent, MockChannel, drainQueue, installAgentTestHooks, makeMsg, mockCon
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { formatTomoEvent } from "../src/tomo-event.js";
 import { DurableInbox, INBOX_STALE_NOT_PROCESSED } from "../src/agent/durable-inbox.js";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 
 installAgentTestHooks();
 
@@ -39,6 +39,14 @@ async function boot(enabled = true, channel: MockChannel = new MockChannel("tele
   agent.addChannel(channel);
   await agent.start();
   return { agent, channel };
+}
+
+/** The usage ledger's rows, every month file. */
+function ledger(): Array<Record<string, unknown>> {
+  const dir = join(mockConfig.tomoHome, "data", "usage");
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).filter((f) => /^\d{4}-\d{2}\.ndjson$/.test(f))
+    .flatMap((f) => readFileSync(join(dir, f), "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l) as Record<string, unknown>));
 }
 
 const taskPrompts = (key: string) => mockSdk.promptsBySession.filter((p) => p.sessionKey === key);
@@ -122,6 +130,47 @@ describe("sub-sessions through the Agent", () => {
     expect(ownerTurns.some((p) => p.text.includes("how is it going?"))).toBe(true);
     expect(ownerTurns.some((p) => p.text.includes("the private deploy plan"))).toBe(true);
     await agent.stop();
+  });
+
+  it("writes a task's own turns as `task` and the owning session's report turn for it as `task-relay`, both naming the task", async () => {
+    const { agent } = await boot();
+    mockSdk.responseFn = (text) => {
+      if (text.includes("subsession-start")) {
+        agent.subsessions!.finish("task:s1", "All done.");
+        return "NO_REPLY";
+      }
+      return "NO_REPLY";
+    };
+    agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
+    await waitFor(() => expect(mockSdk.promptsBySession.some((p) => p.sessionKey === "dm:alex" && p.text.includes("A sub-session finished"))).toBe(true));
+    const ledgerIdle = () => (agent as unknown as { usageLedger: { idle(): Promise<void> } }).usageLedger.idle();
+    for (let i = 0; i < 100 && !ledger().some((r) => r.sessionKey === "dm:alex" && r.source === "task-relay"); i++) {
+      await ledgerIdle();
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    const rows = ledger();
+    expect(rows.filter((r) => r.sessionKey === "task:s1").length).toBeGreaterThan(0);
+    for (const r of rows.filter((x) => x.sessionKey === "task:s1")) expect(r).toMatchObject({ source: "task", taskId: "s1" });
+    expect(rows.find((r) => r.sessionKey === "dm:alex" && r.source === "task-relay")).toMatchObject({ taskId: "s1" });
+    await agent.stop();
+  });
+
+  it("with API-key auth the quota gate ignores a subscription reading left on disk", async () => {
+    const dir = join(mockConfig.tomoHome, "data", "usage");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "limits.ndjson"), JSON.stringify({ v: 1, ts: new Date().toISOString(), source: "oauth-usage",
+      windows: [{ window: "weekly_all", group: "weekly", scoped: false, percent: 95, resetsAt: new Date(Date.now() + 86_400_000).toISOString() }] }) + "\n");
+    const auth = mockConfig.auth.method;
+    mockConfig.auth.method = "api-key";
+    try {
+      const { agent } = await boot();
+      mockSdk.responseFn = () => new Promise(() => {});
+      agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
+      await waitFor(() => expect(taskPrompts("task:s1")).toHaveLength(1));
+      await agent.stop();
+    } finally {
+      mockConfig.auth.method = auth;
+    }
   });
 
   it("routes a cron fire on a task key to the task, not to a chat", async () => {

@@ -214,6 +214,21 @@ async function startForeground(): Promise<void> {
   const { limitsLogFor } = await import("../usage/limits-log.js");
   const { watchBus } = await import("../watch/bus.js");
   watchBus.subscribe((event) => { if (event.type === "sdk") void limitsLogFor(config.tomoHome).recordSignal(event.signal); });
+  // The sub-session quota gate takes its own usage read when nobody has opened /usage or the web card for a while.
+  {
+    const { fetchUsage } = await import("../agent/usage.js");
+    const { litellmRoutesModel } = await import("../litellm.js");
+    agent.setQuotaRefresh(async () => {
+      // Settled only once the sample is in limits.ndjson: the gate reads the file right after.
+      let written: Promise<void> | undefined;
+      await fetchUsage({
+        authMethod: config.auth.method,
+        gatewayActive: litellmRoutesModel(config.litellm, config.model),
+        onData: (data) => { written = limitsLogFor(config.tomoHome).recordOAuthUsage(data); },
+      });
+      await written;
+    });
+  }
 
   // Optional UI failures must not become a messaging startup prerequisite.
   if (config.web?.enabled) {

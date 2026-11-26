@@ -16,7 +16,7 @@ vi.mock("node:fs/promises", async (original) => {
 });
 
 import { sdkSignalOf } from "../src/agent/sdk-signals.js";
-import { LIMITS_REPEAT_MS, LimitsLog, readSessionWindowPercent, type LimitSample } from "../src/usage/limits-log.js";
+import { LIMITS_REPEAT_MS, LimitsLog, QUOTA_GATE_SAMPLE_MAX_AGE_MS, QUOTA_REFRESH_MIN_INTERVAL_MS, QUOTA_REFRESH_TIMEOUT_MS, QUOTA_SAMPLE_MAX_AGE_MS, QuotaGateReader, readQuotaGateReading, readSessionWindowPercent, readWeeklyWindowPercent, type LimitSample } from "../src/usage/limits-log.js";
 import { usageDataDir } from "../src/usage/dir.js";
 
 const NOW = Date.parse("2026-11-15T20:00:00.000Z");
@@ -159,5 +159,199 @@ describe("readSessionWindowPercent (the sub-session quota gate's reading)", () =
     // A directory where the file should be: open() fails with EISDIR, not ENOENT.
     mkdirSync(dir, { recursive: true });
     expect(() => readSessionWindowPercent(dir, NOW)).toThrow();
+  });
+});
+
+/** The account this was written for: the oauth read carries weekly windows only, no 5-hour one. */
+const WEEKLY_ONLY = {
+  limits: [
+    { kind: "weekly_all", group: "weekly", percent: 86, severity: "normal", resets_at: "2026-11-18T07:00:00Z", is_active: true },
+    { kind: "weekly_scoped", group: "weekly", percent: 97, severity: "normal", resets_at: "2026-11-18T07:00:00Z",
+      scope: { model: { id: "claude-fable", display_name: "Fable" } } },
+  ],
+};
+
+describe("readQuotaGateReading (the sub-session quota gate: the fuller of 5-hour and weekly)", () => {
+  it("with no 5-hour window, reads the weekly (all models) one, never a model-scoped one", async () => {
+    const log = new LimitsLog(home, () => clock);
+    await log.recordOAuthUsage(WEEKLY_ONLY);
+    // The old reading: no 5-hour window is 0, so a gate on it alone never fired.
+    expect(readSessionWindowPercent(log.path, NOW)).toBe(0);
+    expect(readWeeklyWindowPercent(log.path, NOW)).toBe(86);
+    expect(readQuotaGateReading(log.path, NOW)).toEqual({ window: "weekly", percent: 86 });
+  });
+
+  it("takes whichever window is fuller when both are there", async () => {
+    const log = new LimitsLog(home, () => clock);
+    await log.recordOAuthUsage({ limits: [
+      { kind: "session", group: "session", percent: 91, severity: "normal", resets_at: "2026-11-15T22:00:00Z", is_active: true },
+      WEEKLY_ONLY.limits[0],
+    ] });
+    expect(readQuotaGateReading(log.path, NOW)).toEqual({ window: "five_hour", percent: 91 });
+    clock += 60_000;
+    await log.recordOAuthUsage({ limits: [
+      { kind: "session", group: "session", percent: 12, severity: "normal", resets_at: "2026-11-15T22:00:00Z", is_active: true },
+      WEEKLY_ONLY.limits[0],
+    ] });
+    expect(readQuotaGateReading(log.path, clock)).toEqual({ window: "weekly", percent: 86 });
+  });
+
+  it("a weekly reading past its reset reads 0; within the gate's sample age it holds", async () => {
+    const log = new LimitsLog(home, () => clock);
+    await log.recordOAuthUsage(WEEKLY_ONLY);
+    expect(readQuotaGateReading(log.path, NOW + QUOTA_GATE_SAMPLE_MAX_AGE_MS - 1)).toEqual({ window: "weekly", percent: 86 });
+    // A fresh read after the reset (the old one alone would be too old to count).
+    clock = Date.parse("2026-11-18T07:00:01Z");
+    await log.recordOAuthUsage({ limits: [{ ...WEEKLY_ONLY.limits[0], resets_at: "2026-11-18T07:00:00Z" }] });
+    expect(readQuotaGateReading(log.path, clock)?.percent).toBe(0);
+  });
+
+  it("a weekly sample with no reset time reads 0 once it is a week old", async () => {
+    const log = new LimitsLog(home, () => clock);
+    await log.recordOAuthUsage({ seven_day: { utilization: 88, resets_at: null } });
+    expect(readWeeklyWindowPercent(log.path, NOW + 86_400_000)).toBe(88);
+    expect(readWeeklyWindowPercent(log.path, NOW + 7 * 86_400_000)).toBe(0);
+  });
+
+  it("a rate-limit line without a percentage does not speak for the week; the oauth read before it does", async () => {
+    const log = new LimitsLog(home, () => clock);
+    await log.recordOAuthUsage(WEEKLY_ONLY);
+    clock += 60_000;
+    await log.recordSignal({ kind: "rate_limit", status: "allowed", limit: "seven_day", resetsAt: Date.parse("2026-11-18T07:00:00Z") });
+    expect(readQuotaGateReading(log.path, clock)).toEqual({ window: "weekly", percent: 86 });
+  });
+
+  it("is undefined with no samples, and throws when the file cannot be read", () => {
+    expect(readQuotaGateReading(join(home, "nope.ndjson"), NOW)).toBeUndefined();
+    const dir = join(home, "data", "usage", "limits.ndjson");
+    mkdirSync(dir, { recursive: true });
+    expect(() => readQuotaGateReading(dir, NOW)).toThrow();
+  });
+});
+
+describe("the quota gate never reads a missing measurement as an empty window", () => {
+  it("a usage read whose weekly window has no percentage leaves the earlier reading standing", async () => {
+    const log = new LimitsLog(home, () => clock);
+    await log.recordOAuthUsage(WEEKLY_ONLY);
+    clock += 60_000;
+    await log.recordOAuthUsage({ limits: [{ ...WEEKLY_ONLY.limits[0], percent: null }] });
+    expect(readWeeklyWindowPercent(log.path, clock)).toBe(86);
+    expect(readQuotaGateReading(log.path, clock)).toEqual({ window: "weekly", percent: 86 });
+  });
+
+  it("the same for the 5-hour window", async () => {
+    const log = new LimitsLog(home, () => clock);
+    await log.recordOAuthUsage(OAUTH);
+    clock += 60_000;
+    await log.recordOAuthUsage({ limits: [{ ...OAUTH.limits[0], percent: null }] });
+    expect(readSessionWindowPercent(log.path, clock)).toBe(36);
+  });
+});
+
+describe("QuotaGateReader (a fresh usage read before the gate decides, when the last one is stale)", () => {
+  it("with no usage read in the file, takes one and waits for it; then the gate reads what it wrote", async () => {
+    const log = new LimitsLog(home, () => clock);
+    const refresh = vi.fn(async () => { await log.recordOAuthUsage(WEEKLY_ONLY); });
+    const gate = new QuotaGateReader({ path: log.path, now: () => clock, refresh });
+    expect(gate.read()).toBeUndefined();
+    await gate.ensureFresh();
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(gate.read()).toEqual({ window: "weekly", percent: 86 });
+    // Fresh now: no second read.
+    await gate.ensureFresh();
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("an old read is replaced before the decision, not after", async () => {
+    const log = new LimitsLog(home, () => clock);
+    await log.recordOAuthUsage({ limits: [{ ...WEEKLY_ONLY.limits[0], percent: 40 }] });
+    clock += QUOTA_SAMPLE_MAX_AGE_MS;
+    const gate = new QuotaGateReader({ path: log.path, now: () => clock, refresh: () => log.recordOAuthUsage(WEEKLY_ONLY) });
+    await gate.ensureFresh();
+    expect(gate.read()).toEqual({ window: "weekly", percent: 86 });
+  });
+
+  it("a read whose weekly window has no percentage is not fresh: the next one is taken once the interval is up", async () => {
+    const log = new LimitsLog(home, () => clock);
+    await log.recordOAuthUsage(WEEKLY_ONLY);
+    clock += 60_000;
+    await log.recordOAuthUsage({ limits: [{ ...WEEKLY_ONLY.limits[0], percent: null }] });
+    const refresh = vi.fn(async () => {});
+    const gate = new QuotaGateReader({ path: log.path, now: () => clock, refresh });
+    clock += QUOTA_SAMPLE_MAX_AGE_MS;
+    await gate.ensureFresh();
+    expect(refresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits at most the bound for a read that hangs, joins it rather than starting another, and throttles after", async () => {
+    const log = new LimitsLog(home, () => clock);
+    let calls = 0;
+    const gate = new QuotaGateReader({ path: log.path, now: () => clock, refresh: () => { calls++; return new Promise(() => {}); } });
+    const started = Date.now();
+    await gate.ensureFresh(30);
+    await gate.ensureFresh(30);
+    expect(calls).toBe(1);
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("a failing read is logged, never thrown, costs the wait once, and the gate still answers from the file", async () => {
+    const log = new LimitsLog(home, () => clock);
+    await log.recordOAuthUsage(WEEKLY_ONLY);
+    clock += QUOTA_SAMPLE_MAX_AGE_MS;
+    let calls = 0;
+    const gate = new QuotaGateReader({ path: log.path, now: () => clock, refresh: () => { calls++; throw new Error("no keychain"); } });
+    await gate.ensureFresh();
+    await gate.ensureFresh();
+    expect(calls).toBe(1);
+    expect(warn).toHaveBeenCalledWith(expect.anything(), "Could not refresh the usage reading for the sub-session quota gate");
+    expect(gate.read()).toEqual({ window: "weekly", percent: 86 });
+    clock += QUOTA_REFRESH_MIN_INTERVAL_MS;
+    await gate.ensureFresh();
+    expect(calls).toBe(2);
+  });
+
+  it("with no refresh set (tests, or before start wires it) it only reads the file", async () => {
+    const log = new LimitsLog(home, () => clock);
+    await log.recordOAuthUsage(WEEKLY_ONLY);
+    const gate = new QuotaGateReader({ path: log.path, now: () => clock + 60_000 });
+    await gate.ensureFresh();
+    expect(gate.read()).toEqual({ window: "weekly", percent: 86 });
+  });
+});
+
+describe("the quota gate fails open on old samples, and a hung read does not hold it", () => {
+  it("a reading older than the gate's sample age does not count (another login may have left it): no hold, one warning", async () => {
+    const log = new LimitsLog(home, () => clock);
+    await log.recordOAuthUsage({ limits: [{ ...WEEKLY_ONLY.limits[0], percent: 95 }] });
+    const gate = new QuotaGateReader({ path: log.path, now: () => clock });
+    clock += QUOTA_GATE_SAMPLE_MAX_AGE_MS - 1;
+    expect(gate.read()).toEqual({ window: "weekly", percent: 95 });
+    clock += 1;
+    warn.mockClear();
+    expect(gate.read()).toBeUndefined();
+    expect(gate.read()).toBeUndefined();
+    expect(warn.mock.calls.filter((c) => c[1] === "No recent usage reading; sub-session turns are not held for quota")).toHaveLength(1);
+  });
+
+  it("a read that never settles counts as failed after the timeout, and the next one can start", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const log = new LimitsLog(home, () => clock);
+      let calls = 0;
+      const gate = new QuotaGateReader({ path: log.path, now: () => clock, refresh: () => { calls++; return new Promise(() => {}); } });
+      const waited = gate.ensureFresh(10);
+      await vi.advanceTimersByTimeAsync(10);
+      await waited;
+      expect(calls).toBe(1);
+      await vi.advanceTimersByTimeAsync(QUOTA_REFRESH_TIMEOUT_MS);
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({ err: expect.stringContaining("no answer") }), "Could not refresh the usage reading for the sub-session quota gate");
+      clock += QUOTA_REFRESH_MIN_INTERVAL_MS;
+      const again = gate.ensureFresh(10);
+      await vi.advanceTimersByTimeAsync(10);
+      await again;
+      expect(calls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

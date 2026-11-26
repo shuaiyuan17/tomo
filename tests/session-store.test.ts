@@ -193,6 +193,17 @@ describe("SessionStore", () => {
     expect(entry?.stats.totalInputTokens).toBe(20);
   });
 
+  it("usage from a ledger row that landed before the session's entry existed is held, then added with its first stats update", () => {
+    const store = makeSessionStore(TEST_DIR);
+    store.addOutsideUsage("telegram:1", { costUsd: 0.4, inputTokens: 3, outputTokens: 2, cacheReadTokens: 1, cacheCreationTokens: 1 });
+    store.setSdkSessionId("telegram:1", "session-1");
+    store.updateStats("telegram:1", { costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 10, contextMax: 100 });
+    expect(store.getEntry("telegram:1")?.stats).toMatchObject({ totalCostUsd: 0.4, totalInputTokens: 3, totalOutputTokens: 2, totalQueries: 1 });
+    // Applied once: a second update adds nothing more.
+    store.updateStats("telegram:1", { costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 10, contextMax: 100 });
+    expect(store.getEntry("telegram:1")?.stats.totalCostUsd).toBeCloseTo(0.4);
+  });
+
   it("keeps the last real window when an estimated reading does not know one (contextMax 0)", () => {
     const store = makeSessionStore(TEST_DIR);
     store.setSdkSessionId("telegram:1", "session-1");

@@ -599,6 +599,99 @@ it("motion: new messages rise in, the rail transitions open and closed, and redu
   expect(style).toEqual(["none", "0s"]);
 });
 
+it("motion: only what is new rises in (never the history, on load or reload); dots wait for the reply, a skeleton for a slow history", async () => {
+  // Every entrance animation the page starts on a message (its row's entrance element, or a streamed block), and every one cut short.
+  await page.addInitScript(() => {
+    const w = window as unknown as { entrances: string[]; cancelled: string[] }; w.entrances = []; w.cancelled = [];
+    const record = (into: string[]) => (event: AnimationEvent) => {
+      const el = event.target as Element;
+      // (A streamed block that leaves mid-rise, replaced by the recorded message, is not a cut: the message carries it on.)
+      if (event.animationName === "motion-enter" && el.matches("[data-slot=message-entrance], article.message") && (event.type === "animationstart" || el.isConnected)) into.push(el.textContent ?? "");
+    };
+    document.addEventListener("animationstart", record(w.entrances), true);
+    document.addEventListener("animationcancel", record(w.cancelled), true);
+  });
+  const entrances = () => page.evaluate(() => (window as unknown as { entrances: string[] }).entrances);
+  const cancelled = () => page.evaluate(() => (window as unknown as { cancelled: string[] }).cancelled);
+  const input = page.getByRole("textbox", { name: "Message Tomo" });
+  const dots = page.locator("[data-slot=thinking-dots]");
+  mockSdk.responseFn = () => "An old reply.";
+  await input.fill("an old question"); await input.press("Enter");
+  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "An old reply." }).first()).toBeVisible();
+  await browserExpect(page.locator(".feedback")).toHaveText("Completed");
+
+  // Reloaded: the same two messages are history now, and nothing animates in. A slow read shows the skeleton meanwhile.
+  let release!: () => void; const held = new Promise<void>((done) => { release = done; });
+  await page.route("**/api/v1/sessions/*/messages*", async (route) => { await held; await route.continue(); });
+  await page.reload();
+  const skeleton = page.locator("[data-slot=history-skeleton]");
+  await browserExpect(skeleton).toBeVisible();
+  await browserExpect(skeleton).toHaveCSS("opacity", "1");
+  expect(await skeleton.evaluate((el) => getComputedStyle(el).animationName)).toBe("motion-fade");
+  await browserExpect(dots).toHaveCount(0);
+  release();
+  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "An old reply." })).toBeVisible();
+  await browserExpect(skeleton).toHaveCount(0);
+  await page.unroute("**/api/v1/sessions/*/messages*");
+  await page.waitForTimeout(400);
+  expect(await entrances()).toEqual([]);
+  expect(await page.locator("#conversation .motion-enter").count()).toBe(0);
+  // Another conversation and back: both open as history.
+  await page.getByRole("button", { name: /^Session/ }).click();
+  await page.getByRole("menuitemradio", { name: /Test group/ }).click();
+  await browserExpect(page.getByText("A shared group note.", { exact: true })).toBeVisible();
+  await browserExpect(page.getByRole("menuitemradio")).toHaveCount(0);
+  await page.getByRole("button", { name: /^Session/ }).click();
+  await page.getByRole("menuitemradio", { name: /Owner conversation/ }).click();
+  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "An old reply." })).toBeVisible();
+  await page.waitForTimeout(400);
+  expect(await entrances()).toEqual([]);
+
+  // A new message: its bubble rises in, dots hold the reply's place until its first word, then the reply rises in.
+  let answer!: (text: string) => void;
+  mockSdk.responseFn = () => new Promise<string>((done) => { answer = done; });
+  await input.fill("a new question"); await input.press("Enter");
+  await browserExpect(page.locator("[data-slot=message-entrance].motion-enter").filter({ hasText: "a new question" })).toBeVisible();
+  await browserExpect(dots).toBeVisible();
+  await browserExpect(dots).toHaveCSS("opacity", "1");
+  expect(await dots.locator("i").first().evaluate((el) => getComputedStyle(el).animationName)).toBe("thinking-dot");
+  // The dots sit in the gap under the bubble and take no room of their own: the transcript is as tall as without them, the view still at the end.
+  const tall = () => page.getByRole("region", { name: "Conversation history" }).evaluate((el) => el.scrollHeight);
+  const withDots = await tall();
+  await dots.evaluate((el) => { el.style.display = "none"; });
+  expect(await tall()).toBe(withDots);
+  await dots.evaluate((el) => { el.style.display = ""; });
+  expect(await page.getByRole("region", { name: "Conversation history" }).evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThanOrEqual(2);
+  await browserExpect.poll(() => typeof answer).toBe("function");
+  answer("A new reply.");
+  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "A new reply." }).first()).toBeVisible();
+  await browserExpect(dots).toHaveCount(0);
+  await browserExpect(page.locator(".feedback")).toHaveText("Completed");
+  // Each rose once and to the end: the bubble is recorded (pending → history) mid-rise, and that must not restart or cut it.
+  // (The reply's may be carried from its streamed block on to the recorded message: one rise, on two elements.)
+  await browserExpect.poll(async () => (await entrances()).filter((text) => text.includes("A new reply.")).length).toBeGreaterThanOrEqual(1);
+  const seen = await entrances();
+  expect(seen.filter((text) => text.includes("a new question"))).toHaveLength(1);
+  expect(seen.filter((text) => text.includes("an old question") || text.includes("An old reply."))).toEqual([]);
+  await page.waitForTimeout(500);
+  expect(await cancelled()).toEqual([]);
+  // The entrance class is gone once it has played, so showing the page again cannot replay it.
+  await browserExpect(page.locator("#conversation .motion-enter")).toHaveCount(0);
+
+  // Reduced motion: a new bubble is simply there, and the dots are still.
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  mockSdk.responseFn = () => new Promise<string>((done) => { answer = done; });
+  await input.fill("a calm question"); await input.press("Enter");
+  const calm = page.locator("article.message.user").filter({ hasText: "a calm question" });
+  await browserExpect(calm).toBeVisible();
+  expect(await calm.evaluate((el) => getComputedStyle(el.closest("[data-slot=message-entrance]")!).animationName)).toBe("none");
+  await browserExpect(dots).toBeVisible();
+  expect(await dots.evaluate((el) => [getComputedStyle(el).animationName, getComputedStyle(el.querySelector("i")!).animationName])).toEqual(["none", "none"]);
+  answer("A calm reply.");
+  await browserExpect(page.locator("article.message.assistant").filter({ hasText: "A calm reply." }).first()).toBeVisible();
+  expect((await entrances()).filter((text) => text.includes("calm"))).toEqual([]);
+});
+
 it("a picture the agent sends (MEDIA:<path>) shows as a thumbnail by id, never as its path; an unfiled one is a placeholder", async () => {
   const { mkdtempSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");

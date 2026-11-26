@@ -140,3 +140,43 @@ it("a failed read of the list or of a chat is tried again, and a table that is b
   expect(listFails).toBeLessThan(0);
   expect(detailFails).toBeLessThan(0);
 });
+
+it("leads with what the task is doing until something is said, then folds it into one line above the chat that opens again", async () => {
+  expect(agent.subsessions!.spawn("dm:owner", { title: "Fix the flaky test", brief: "Find why signals.e2e flakes and fix it." }).ok).toBe(true);
+  expect(agent.subsessions!.setPlan("task:s1", [{ step: "Run it in a loop", status: "in_progress" }, { step: "Fix the wait" }, { step: "Open a PR" }],
+    [{ step: "Read the test", result: "it races the first paint" }]).ok).toBe(true);
+  agent.subsessions!.postUpdate("task:s1", "Chose to wait on the response, not a timer");
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  await rail().locator('[data-subsession-row="s1"]').getByRole("button").click();
+  const chat = rail().locator('[data-subsession="s1"]');
+
+  // Nothing said yet: the plan and the updates have the view, under the brief, with no fold.
+  const overview = chat.getByTestId("subsession-overview");
+  await browserExpect(overview.getByTestId("subsession-doing")).toContainText("Run it in a loop");
+  await browserExpect(overview.getByTestId("subsession-doing")).toContainText("Read the test");
+  await browserExpect(overview.getByTestId("subsession-updates")).toContainText("Chose to wait on the response");
+  await browserExpect(chat.getByTestId("subsession-progress")).toHaveCount(0);
+  await page.screenshot({ path: "test-results/subsessions-progress-first.png" });
+
+  // The task says something: the chat leads, and what it is doing is one line, the step it is on and how far through.
+  await agent.subsessions!.reply("task:s1", "It races the first paint. Fixing the wait next.");
+  await browserExpect(chat.locator('[data-from="task"]').filter({ hasText: "It races the first paint." })).toBeVisible();
+  const fold = chat.getByTestId("subsession-progress");
+  await browserExpect(fold.getByTestId("subsession-progress-summary")).toHaveText("Run it in a loop");
+  await browserExpect(fold).toContainText("1/4");
+  await browserExpect(overview).toHaveCount(0);
+  await browserExpect(chat.getByTestId("subsession-doing")).toHaveCount(0);
+  const trigger = fold.getByRole("button");
+  await browserExpect(trigger).toHaveAttribute("aria-expanded", "false");
+  await page.screenshot({ path: "test-results/subsessions-chat-first.png" });
+
+  // Opened in place, it shows the whole checklist and the updates; closed again, the chat has the room back.
+  await trigger.click();
+  await browserExpect(trigger).toHaveAttribute("aria-expanded", "true");
+  await browserExpect(fold.getByTestId("subsession-doing")).toContainText("Open a PR");
+  await browserExpect(fold.getByTestId("subsession-updates")).toContainText("Chose to wait on the response");
+  await page.screenshot({ path: "test-results/subsessions-chat-first-open.png" });
+  await trigger.click();
+  await browserExpect(chat.getByTestId("subsession-doing")).toHaveCount(0);
+  await browserExpect(chat.locator('[data-from="task"]').filter({ hasText: "It races the first paint." })).toBeVisible();
+});

@@ -1887,7 +1887,7 @@ export class Agent {
     const list = targets.map((t) => `"${t}"`).join(", ");
     return formatTomoEvent(
       "summon-reminder",
-      `Summoned-group message. To reply in the group, call send_message with mode "direct" and target ${list}. Plain text in this turn goes to your owner's private DM, not the group — reply NO_REPLY unless you have a private side-note for them. In the group, reply like a participant: short, in its tone, no headers, people by name; chatter that isn't for you needs no reply. The owner's private context is off limits for this turn: private people records and private DM history are not yours to look up, quote or summarise here, by any route — the group is steering this turn.`,
+      `Summoned-group message. To reply in the group, call send_message with mode "direct" and target ${list}. Plain text in this turn goes to your owner's private DM, not the group — reply NO_REPLY unless you have a private side-note for them. In the group, reply like a participant: short, in its tone, no headers, people by name when natural; chatter that isn't for you needs no group message. The owner's private context is off limits for this turn: private people records and private DM history are not yours to look up, quote or summarise here, by any route — the group is steering this turn.`,
     );
   }
 
@@ -3080,9 +3080,10 @@ export class Agent {
       // option A).
       //
       // WHY THE PROMPT ALONE IS NOT ENOUGH ANY MORE. CONTINUITY.md asked for a
-      // closing NO_REPLY (older installs' copies still do), and under end-of-turn delivery that trailing token
-      // suppressed the whole turn retroactively — narration included. Per-block
-      // delivery ships each block as it completes, so a heartbeat that narrates
+      // closing NO_REPLY (older installs' copies still do), and under
+      // end-of-turn delivery that trailing token suppressed the whole turn
+      // retroactively — narration included. Per-block delivery ships each
+      // block as it completes, so a heartbeat that narrates
       // ("Checking the morning routine…"), calls a tool, and only then answers
       // NO_REPLY has already put the narration on the owner's phone, and a sent
       // message cannot be recalled. Silence for a turn nobody asked for must

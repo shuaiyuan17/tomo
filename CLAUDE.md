@@ -209,7 +209,7 @@ Built by `workspace/index.ts` from layered markdown files:
 
 Changes to workspace files take effect on next message (no restart needed) — the prompt is rebuilt on each new LiveSession.
 
-The workspace files are copied once (`tomo init`; CONTINUITY.md at start when missing) and are the owner's from then on, so a later version never reaches an existing install. Keep them to personality and personal habits; anything about how Tomo works (tools, routing, delivery, summoning, heartbeats) goes in code-side prompts, events or tool descriptions (`tests/workspace-defaults.test.ts`).
+The workspace files are copied once (`tomo init`; CONTINUITY.md at start when missing) and are the owner's from then on, so they are never updated in place (only `tomo init --force` overwrites them). Keep them to personality and personal habits; anything about how Tomo works (tools, routing, delivery, summoning, heartbeats) goes in code-side prompts, events or tool descriptions (`tests/workspace-defaults.test.ts`).
 
 ### Daemon Lifecycle
 

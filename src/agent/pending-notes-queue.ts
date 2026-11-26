@@ -103,6 +103,8 @@ export class PendingNotesQueue {
   private inflight = new Map<string, InFlightBatch[]>();
   private errorNotes = new Map<string, ErrorNote[]>();
   private errorSeq = 0;
+  /** Sessions whose stored notes could not be read when first needed: merged in at the next write, never written over. */
+  private unloaded = new Set<string>();
 
   constructor(private store: DurablePendingNotesStore) {}
 
@@ -114,6 +116,7 @@ export class PendingNotesQueue {
       } catch (err) {
         log.warn({ err, sessionKey }, "Could not load durable pending notes");
         arr = [];
+        this.unloaded.add(sessionKey);
       }
       this.notes.set(sessionKey, arr);
     }
@@ -122,6 +125,16 @@ export class PendingNotesQueue {
 
   /** Write in-flight + queued notes for this session. Returns false on failure. */
   private persist(sessionKey: string): boolean {
+    if (this.unloaded.has(sessionKey)) {
+      try {
+        // Held in memory while the stored ones could not be read: the stored ones first.
+        this.notes.set(sessionKey, [...this.store.getPendingNotes(sessionKey), ...(this.notes.get(sessionKey) ?? [])]);
+        this.unloaded.delete(sessionKey);
+      } catch (err) {
+        log.warn({ err, sessionKey }, "Pending notes not persisted: the stored ones still cannot be read");
+        return false;
+      }
+    }
     const all = [
       ...(this.inflight.get(sessionKey) ?? []).flatMap((b) => b.notes.map(markInterrupted)),
       ...(this.notes.get(sessionKey) ?? []),
@@ -291,6 +304,13 @@ export class PendingNotesQueue {
 
   /** Test/support helper for observing queued durable notes without draining. */
   peekNotes(sessionKey: string): string[] {
-    return [...(this.notes.get(sessionKey) ?? this.store.getPendingNotes(sessionKey))];
+    const held = this.notes.get(sessionKey);
+    if (held) return [...held];
+    try {
+      return this.store.getPendingNotes(sessionKey);
+    } catch (err) {
+      log.warn({ err, sessionKey }, "Could not read durable pending notes");
+      return [];
+    }
   }
 }

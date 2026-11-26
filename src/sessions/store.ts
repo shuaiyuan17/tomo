@@ -1546,7 +1546,7 @@ export class SessionStore {
         } satisfies PendingNotesFile);
       }
     } catch (err) {
-      log.warn({ err, oldKey, newKey }, "Could not move the old key's pending notes; they stay under the old key");
+      log.error({ err, oldKey, newKey }, "Pending notes file unreadable and could not be moved aside; the old key's notes were not moved and stay in that file");
     }
 
     // Clear the in-memory session cache for BOTH keys: the old one is gone, and

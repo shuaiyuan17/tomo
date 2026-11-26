@@ -141,6 +141,7 @@ const REWIND_SHUTDOWN_TIMEOUT_MS = 3_000;
 const MIGRATION_STATUS_RELOG_MS = 5 * 60_000;
 /** How soon an owner notice about a moved-aside pending notes file that could not be sent is tried again. */
 const PENDING_NOTES_NOTICE_RETRY_MS = 60_000;
+const PENDING_NOTES_NOTICE_MAX_TRIES = 30;
 
 /**
  * How long a reply that matches no task waits for task sends still in flight
@@ -244,6 +245,7 @@ export class Agent {
   private pendingNotesNoticeReady = false;
   private pendingNotesNoticeSending = false;
   private pendingNotesNoticeTimer: ReturnType<typeof setTimeout> | undefined;
+  private pendingNotesNoticeTries = 0;
   /** End time of each session's last successful turn this process saw — the
    *  start of the range an owner notice suggests compacting. */
   private readonly lastGoodTurnAt = new Map<string, number>();
@@ -3376,15 +3378,11 @@ export class Agent {
   }
 
   /**
-   * DM the configured OWNER (no agent query); never falls back to another
-   * private chat. Resolves false when nothing was sent.
-   */
-  /**
    * Tell the owner which pending notes files were moved aside (their notes
    * were not delivered; the file is kept for the owner session to read and
    * resend what matters). The store's marker names them until the notice is
    * sent, so a restart in between sends it then; a send that fails is tried
-   * again, unless there is no owner to tell.
+   * again for a while, unless there is no owner to tell.
    */
   private tellPendingNotesQuarantined(): void {
     if (!this.pendingNotesNoticeReady || this.stopping || this.pendingNotesNoticeSending || this.pendingNotesNoticeTimer) return;
@@ -3396,7 +3394,8 @@ export class Agent {
     this.pendingNotesNoticeSending = true;
     const failed = (err?: unknown): void => {
       log.warn({ err, files }, "Could not tell the owner the pending notes file was moved aside");
-      if (this.stopping || !this.router.ownerSessionKey()) return;
+      // No owner, or none reachable after a while: the marker keeps it for the next start.
+      if (this.stopping || !this.router.ownerSessionKey() || ++this.pendingNotesNoticeTries >= PENDING_NOTES_NOTICE_MAX_TRIES) return;
       this.pendingNotesNoticeTimer = setTimeout(() => {
         this.pendingNotesNoticeTimer = undefined;
         this.tellPendingNotesQuarantined();
@@ -3405,8 +3404,9 @@ export class Agent {
     };
     void this.notifyOwner(text)
       .then((sent) => {
-        if (sent) this.sessions.clearQuarantinedPendingNotes(asides);
-        else failed();
+        if (!sent) return failed();
+        this.pendingNotesNoticeTries = 0;
+        this.sessions.clearQuarantinedPendingNotes(asides);
       })
       .catch((err) => failed(err))
       .finally(() => {
@@ -3418,6 +3418,10 @@ export class Agent {
       });
   }
 
+  /**
+   * DM the configured OWNER (no agent query); never falls back to another
+   * private chat. Resolves false when nothing was sent.
+   */
   async notifyOwner(text: OwnerText): Promise<boolean> {
     return this.ownerNotices.notifyOwner(text);
   }

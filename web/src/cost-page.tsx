@@ -176,7 +176,6 @@ function PeriodCards({ resource, range, onRange }: { resource: Resource<WebCost>
   </ToggleGroup>;
   const total = value?.totals.costUsd ?? 0;
   const overcounted = !!value && value.totals.overcountedCostUsd > 0;
-  const tasks = value?.sessions.filter((s) => s.kind === "task") ?? [];
   return <div className="min-w-0 space-y-4 [grid-area:range] max-[900px]:grid max-[900px]:grid-cols-2 max-[900px]:items-start max-[900px]:gap-4 max-[900px]:space-y-0 max-[600px]:grid-cols-1">
     <Section title={t("period.who")} aside={toggle}>
       {resource.state === "error" ? <Failed resource={resource} />
@@ -189,9 +188,30 @@ function PeriodCards({ resource, range, onRange }: { resource: Resource<WebCost>
       <Ranked label={t("period.scheduledLabel")} color="var(--series-3)" rows={value.crons.slice(0, 6).map((cron) => ({ name: cron.name, value: cron.costUsd,
         note: cron.runs > 1 ? t("period.runsEach", { count: cron.runs, each: usd(cron.costUsd / cron.runs, true) }) : t("period.runs", { count: cron.runs }) }))} />
     </Section>}
-    {value && tasks.length > 0 && <Section title={t("period.tasks")} aside={t("period.last", { count: Number(range) })}>
-      <Ranked label={t("period.tasksLabel")} color="var(--series-1)" rows={tasks.slice(0, 6).map((task) => ({ name: task.label, value: task.costUsd,
-        note: t("period.turns", { count: task.turns }) }))} />
-    </Section>}
+    {value && (value.tasks.list.length > 0 || value.tasks.unattributedRelayCostUsd > 0) && <TasksCard tasks={value.tasks} range={range} />}
   </div>;
+}
+
+/** Shown before "Show more". */
+const TASKS_SHOWN = 6;
+
+/**
+ * Every sub-session in the range: its own turns plus what the main
+ * conversation spent on it (its report, what it handed over for the owner),
+ * with the category's total on top.
+ */
+function TasksCard({ tasks, range }: { tasks: WebCost["tasks"]; range: Range }) {
+  const { t } = useTranslation("cost");
+  const [all, setAll] = useState(false);
+  const relay = tasks.relayCostUsd + tasks.unattributedRelayCostUsd;
+  const list = all ? tasks.list : tasks.list.slice(0, TASKS_SHOWN);
+  const hidden = tasks.list.length - list.length;
+  return <Section title={t("period.tasks")} aside={t("period.last", { count: Number(range) })}>
+    <p className={cn(meta, "mt-0 mb-3 leading-relaxed")} data-testid="cost-tasks-total">{t("period.tasksTotal", { total: usd(tasks.selfCostUsd + relay), self: usd(tasks.selfCostUsd), relay: usd(relay) })}</p>
+    {list.length > 0 && <Ranked label={t("period.tasksLabel")} color="var(--series-4)" rows={list.map((task) => ({ name: task.label, value: task.costUsd,
+      note: task.relayCostUsd > 0 ? t("period.taskRelay", { turns: t("period.turns", { count: task.turns }), relay: usd(task.relayCostUsd, true) }) : t("period.turns", { count: task.turns }) }))} />}
+    {(hidden > 0 || all) && tasks.list.length > TASKS_SHOWN && <button type="button" className="mt-3 text-[12px] text-muted-foreground underline-offset-2 hover:underline" onClick={() => setAll(!all)}>
+      {all ? t("period.tasksLess") : t("period.tasksMore", { count: hidden })}</button>}
+    {tasks.unattributedRelayCostUsd > 0 && <p className={cn(meta, "mt-3 mb-0 leading-relaxed")}>{t("period.tasksUnattributed", { cost: usd(tasks.unattributedRelayCostUsd, true) })}</p>}
+  </Section>;
 }

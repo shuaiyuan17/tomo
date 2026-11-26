@@ -13,6 +13,7 @@ export const CATEGORIES: { readonly key: WebCostCategory; readonly label: string
   { key: "you", get label() { return i18n.t("cost:category.you"); }, get hint() { return i18n.t("cost:category.youHint"); }, color: "var(--series-1)" },
   { key: "background", get label() { return i18n.t("cost:category.background"); }, get hint() { return i18n.t("cost:category.backgroundHint"); }, color: "var(--series-2)" },
   { key: "scheduled", get label() { return i18n.t("cost:category.scheduled"); }, get hint() { return i18n.t("cost:category.scheduledHint"); }, color: "var(--series-3)" },
+  { key: "tasks", get label() { return i18n.t("cost:category.tasks"); }, get hint() { return i18n.t("cost:category.tasksHint"); }, color: "var(--series-4)" },
 ];
 export const categoryOf = (key: WebCostCategory) => CATEGORIES.find((c) => c.key === key)!;
 
@@ -124,11 +125,15 @@ export function turnTitle(turn: WebCostTurn): string {
     case "restart": return i18n.t("cost:turn.restart");
     case "delegate": return i18n.t("cost:turn.delegate");
     case "cron": return i18n.t("cost:turn.cron");
+    case "task": return i18n.t("cost:turn.task");
+    case "task-relay": return turn.taskId ? i18n.t("cost:turn.relayFor", { id: turn.taskId }) : i18n.t("cost:turn.relay");
     default: return turn.category === "scheduled" ? i18n.t("cost:turn.scheduled") : i18n.t("cost:turn.other");
   }
 }
 export function turnMeta(turn: WebCostTurn): string {
   const parts = [categoryOf(turn.category).label, turn.session.label];
+  // A relay turn runs on the owning session: say which task it was for.
+  if (turn.source === "task-relay" && turn.taskId) parts.splice(2, 0, i18n.t("cost:turn.relayFor", { id: turn.taskId }));
   const took = duration(turn.durationMs);
   if (took) parts.push(took);
   if (turn.tools !== undefined) parts.push(i18n.t("cost:turn.tools", { count: turn.tools }));

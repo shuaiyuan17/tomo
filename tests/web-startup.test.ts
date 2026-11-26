@@ -30,6 +30,7 @@ vi.mock("../src/agent.js", () => ({ Agent: class {
   prepareOwner() {}
   webSubsessions() { return undefined; }
   onSubsessionsChanged() { return () => {}; }
+  setQuotaRefresh() {}
   addChannel(channel: Channel) { fixture.registered.push(channel); channel.onMessage(async () => true); }
   async start() { for (const channel of fixture.registered) await channel.start(); }
 } }));

@@ -919,15 +919,23 @@ export class SessionStore {
   }
 
   /**
-   * Charge a model call made FOR this session outside its SDK session (a
-   * forced compaction's summary call) to its totals. The context reading, the
-   * query count and the usage baseline are left alone: none of them is about
-   * that call.
+   * Add usage to the session's cost and token totals: every usage-ledger row
+   * of the session as it lands (agent.ts recordUsage — so the totals follow
+   * the ledger, every result counted, none twice), and a model call made FOR
+   * it outside its SDK session (a forced compaction's summary call). The
+   * context reading, the query count and the usage baseline are left alone.
    */
   addOutsideUsage(key: string, u: { costUsd: number; inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }): void {
     this.mutateRegistry("addOutsideUsage", "bookkeeping", () => {
       const entry = this.registry.find((e) => e.channelKey === key && e.unlinkedAt === null);
-      if (!entry?.stats) return;
+      if (!entry) return;
+      // A session's first ledger row can land before its first updateStats.
+      entry.stats ??= {
+        totalQueries: 0, totalCostUsd: 0,
+        totalInputTokens: 0, totalOutputTokens: 0,
+        totalCacheReadTokens: 0, totalCacheCreationTokens: 0,
+        contextUsed: 0, contextMax: 0,
+      };
       entry.stats.totalCostUsd += u.costUsd;
       entry.stats.totalInputTokens += u.inputTokens;
       entry.stats.totalOutputTokens += u.outputTokens;

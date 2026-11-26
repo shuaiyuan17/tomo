@@ -202,11 +202,17 @@ function readTailSamples(path: string): LimitSample[] {
 
 const FIVE_HOURS_MS = 5 * 60 * 60_000;
 
-/** The account-wide 5-hour window of a sample, if it has one with a reading. */
+/** The account-wide 5-hour window of a sample, if it has one (with a reading or not). */
 function sessionWindow(sample: LimitSample): LimitWindowSample | undefined {
-  return sample.windows.find((w) => typeof w.percent === "number" && Number.isFinite(w.percent)
-    && (sample.source === "oauth-usage" ? w.group === "session" && !w.scoped : w.window === "five_hour"));
+  return sample.windows.find((w) => (sample.source === "oauth-usage" ? w.group === "session" && !w.scoped : w.window === "five_hour"));
 }
+
+/** The account-wide weekly window of a sample (all models), if it has one (with a reading or not). */
+function weeklyWindow(sample: LimitSample): LimitWindowSample | undefined {
+  return sample.windows.find((w) => (sample.source === "oauth-usage" ? w.group === "weekly" && !w.scoped : w.window === "seven_day"));
+}
+
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60_000;
 
 /**
  * The share of the 5-hour window used (0–100), from the newest sample that
@@ -218,15 +224,152 @@ function sessionWindow(sample: LimitSample): LimitWindowSample | undefined {
  * when the file exists but cannot be read.
  */
 export function readSessionWindowPercent(path: string, now = Date.now()): number | undefined {
-  for (const sample of readTailSamples(path)) {
-    const window = sessionWindow(sample);
+  return windowPercent(readTailSamples(path), sessionWindow, FIVE_HOURS_MS, now);
+}
+
+/**
+ * The same for the account-wide weekly window (all models): the newest
+ * sample that speaks for it, 0 once it has reset (`resetsAt` past, or the
+ * sample a week old), 0 when the newest usage read has no weekly window. Within its week the share only grows, so an older reading
+ * still holds as a floor: it is not dropped for age alone.
+ */
+export function readWeeklyWindowPercent(path: string, now = Date.now()): number | undefined {
+  return windowPercent(readTailSamples(path), weeklyWindow, SEVEN_DAYS_MS, now);
+}
+
+export type QuotaGateWindow = "five_hour" | "weekly";
+export interface QuotaGateReading { window: QuotaGateWindow; percent: number }
+
+/**
+ * What the sub-session quota gate reads: the higher of the 5-hour and the
+ * weekly window's share used (one read of the file). An account that has no
+ * 5-hour window (the oauth read carries only weekly ones) is gated on the
+ * week alone; one with both stops at whichever fills first. Undefined when
+ * neither window is known (no samples, API-key auth). Throws when the file
+ * exists but cannot be read.
+ */
+export function readQuotaGateReading(path: string, now = Date.now()): QuotaGateReading | undefined {
+  const samples = readTailSamples(path);
+  const session = windowPercent(samples, sessionWindow, FIVE_HOURS_MS, now);
+  const weekly = windowPercent(samples, weeklyWindow, SEVEN_DAYS_MS, now);
+  if (session === undefined && weekly === undefined) return undefined;
+  if (weekly !== undefined && (session === undefined || weekly > session)) return { window: "weekly", percent: weekly };
+  return { window: "five_hour", percent: session! };
+}
+
+/**
+ * When the newest COMPLETE `/api/oauth/usage` sample in the file's tail was
+ * taken (ms epoch): one whose account-wide windows (5-hour, weekly all
+ * models) all carry a reading. A read that left one out says nothing new
+ * about it, so it does not count as fresh. Undefined: none, or unreadable.
+ */
+export function newestOAuthSampleAt(path: string): number | undefined {
+  try {
+    for (const sample of readTailSamples(path)) {
+      if (sample.source !== "oauth-usage") continue;
+      const gated = sample.windows.filter((w) => !w.scoped && (w.group === "session" || w.group === "weekly"));
+      if (!gated.every((w) => typeof w.percent === "number" && Number.isFinite(w.percent))) continue;
+      const at = Date.parse(sample.ts);
+      return Number.isFinite(at) ? at : undefined;
+    }
+  } catch { /* unreadable: no sample known */ }
+  return undefined;
+}
+
+/** The gate's samples are this old before it asks for a fresh usage read. */
+export const QUOTA_SAMPLE_MAX_AGE_MS = 30 * 60_000;
+/** At most one such read this often, whether or not the last one worked. */
+export const QUOTA_REFRESH_MIN_INTERVAL_MS = 30 * 60_000;
+
+/** How long a task's own turn waits for a fresh usage read before the gate decides on what it has. */
+export const QUOTA_REFRESH_WAIT_MS = 15_000;
+
+/**
+ * The quota gate's reading, kept current. Usage reads (`/api/oauth/usage`)
+ * are otherwise only taken when the owner opens `/usage` or the web usage
+ * card, and the SDK's rate-limit events rarely carry the weekly share, so a
+ * daemon left alone would gate unattended tasks on an ever older reading.
+ *
+ * `ensureFresh` is awaited before a task's own turn is gated: when the newest
+ * complete usage read is older than QUOTA_SAMPLE_MAX_AGE_MS it takes one (or
+ * joins the one in flight) and waits for it, at most QUOTA_REFRESH_WAIT_MS;
+ * reads are throttled to one per QUOTA_REFRESH_MIN_INTERVAL_MS whether they
+ * worked or not, so a failing read (no token) costs the wait once, not every
+ * turn. Then `read` answers from the file, synchronously. When no read can be
+ * had the gate decides on the newest reading it has (a weekly share is a
+ * floor within its week), and with none at all (API-key auth) holds nothing.
+ */
+export class QuotaGateReader {
+  private inFlight: Promise<void> | undefined;
+  private lastAttempt = -Infinity;
+  private refresh: (() => Promise<unknown>) | undefined;
+
+  constructor(private readonly opts: { path: string; refresh?: () => Promise<unknown>; now?: () => number }) {
+    this.refresh = opts.refresh;
+  }
+
+  /** The usage read to take when the samples are stale; none: the gate reads the file only. */
+  setRefresh(refresh: () => Promise<unknown>): void {
+    this.refresh = refresh;
+  }
+
+  /** As readQuotaGateReading (throws when the file cannot be read). */
+  read(): QuotaGateReading | undefined {
+    return readQuotaGateReading(this.opts.path, (this.opts.now ?? Date.now)());
+  }
+
+  /** A fresh usage read in the file when one is due, waited for up to `waitMs`. Never throws. */
+  async ensureFresh(waitMs = QUOTA_REFRESH_WAIT_MS): Promise<void> {
+    const pending = this.start();
+    if (!pending) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([pending, new Promise<void>((resolve) => { timer = setTimeout(resolve, waitMs); timer.unref?.(); })]);
+    clearTimeout(timer);
+  }
+
+  /** The read in flight, a new one when due, or undefined when the samples are fresh enough or a read is throttled. */
+  private start(): Promise<void> | undefined {
+    if (this.inFlight) return this.inFlight;
+    const refresh = this.refresh;
+    const now = (this.opts.now ?? Date.now)();
+    if (!refresh || now - this.lastAttempt < QUOTA_REFRESH_MIN_INTERVAL_MS) return undefined;
+    const newest = newestOAuthSampleAt(this.opts.path);
+    if (newest !== undefined && now - newest < QUOTA_SAMPLE_MAX_AGE_MS) return undefined;
+    this.lastAttempt = now;
+    let pending: Promise<unknown>;
+    try {
+      pending = refresh();
+    } catch (err) {
+      pending = Promise.reject(err);
+    }
+    const settled = pending
+      .then(() => undefined, (err) => { log.warn({ err: errorMessage(err) }, "Could not refresh the usage reading for the sub-session quota gate"); })
+      .finally(() => { if (this.inFlight === settled) this.inFlight = undefined; });
+    this.inFlight = settled;
+    return settled;
+  }
+}
+
+function windowPercent(
+  samples: readonly LimitSample[],
+  pick: (sample: LimitSample) => LimitWindowSample | undefined,
+  spanMs: number,
+  now: number,
+): number | undefined {
+  for (const sample of samples) {
+    const window = pick(sample);
     if (!window) {
+      // A usage read lists every window in force: one it lacks is not in force.
       if (sample.source === "oauth-usage") return 0;
       continue;
     }
+    // The window is there but this sample has no reading of it: it says nothing
+    // about how full it is, so an older reading still stands.
+    if (typeof window.percent !== "number" || !Number.isFinite(window.percent)) continue;
+    // Past its reset, or older than the window is long (so it has reset since): nothing used yet.
     const resetsAt = window.resetsAt ? Date.parse(window.resetsAt) : NaN;
     const sampledAt = Date.parse(sample.ts);
-    if ((Number.isFinite(resetsAt) && resetsAt <= now) || (Number.isFinite(sampledAt) && now - sampledAt >= FIVE_HOURS_MS)) return 0;
+    if ((Number.isFinite(resetsAt) && resetsAt <= now) || (Number.isFinite(sampledAt) && now - sampledAt >= spanMs)) return 0;
     return window.percent;
   }
   return undefined;

@@ -137,3 +137,36 @@ it("looks right in both themes, on a desktop and a phone", async () => {
     }
   }
 });
+
+it("Tasks is its own category, and Sub-sessions shows every task's own turns plus the main conversation's for it", async () => {
+  await boot({});
+  for (const [name, options] of [["desktop", { viewport: { width: 1280, height: 900 } }], ["phone", { viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 }]] as const) {
+    for (const colorScheme of ["light", "dark"] as const) {
+      const page = await open({ ...options, colorScheme, reducedMotion: "reduce" });
+      const who = page.getByRole("region", { name: "Who started it" });
+      await who.getByRole("radio", { name: "30 days" }).click();
+      await browserExpect(who.getByRole("list", { name: "Cost by who started it" }).getByRole("listitem")).toHaveText([/^You/, /^Background/, /^Scheduled/, /^Tasks/]);
+      const tasks = page.getByRole("region", { name: "Sub-sessions" });
+      await browserExpect(tasks.getByTestId("cost-tasks-total")).toHaveText(/^\$[\d,.]+ in all: \$[\d,.]+ their own turns, \$[\d,.]+ the main conversation's for them$/);
+      const rows = tasks.getByRole("list", { name: "Cost by sub-session" }).getByRole("listitem");
+      await browserExpect(rows).toHaveCount(6);
+      // A task with a report turn on the main conversation says how much of its total that was.
+      await browserExpect(rows.filter({ hasText: "from the main conversation" }).first()).toBeVisible();
+      // The old-style task (written as background) is read into Tasks too.
+      await tasks.getByRole("button", { name: /^Show \d+ more$/ }).click();
+      await browserExpect(rows).toHaveCount(9);
+      // (Its relay row was "background" too, so it has no "from the main conversation" part: that is in the unattributed line.)
+      await browserExpect(rows.filter({ hasText: /^s1\d+ turns?\$/ })).toHaveCount(1);
+      await browserExpect(tasks.getByText(/were for several at once/)).toBeVisible();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      await tasks.scrollIntoViewIfNeeded();
+      await tasks.screenshot({ path: `test-results/study-cost-tasks-${name}-${colorScheme}.png` });
+      if (name === "desktop" && colorScheme === "light") {
+        const overflow = await page.evaluate(() => { const panel = document.querySelector("#study [role=tabpanel]")!; return panel.scrollHeight - panel.clientHeight; });
+        await page.setViewportSize({ width: 1280, height: 900 + overflow + 8 });
+        await page.screenshot({ path: "test-results/study-cost-tasks-page-desktop-light.png" });
+      }
+      await page.close();
+    }
+  }
+});

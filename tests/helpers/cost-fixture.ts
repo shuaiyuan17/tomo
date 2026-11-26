@@ -45,6 +45,8 @@ export interface CostFixtureOptions {
   overcountedDays?: number;
   /** A quota sample in limits.ndjson (default true). */
   limits?: boolean;
+  /** Sub-session turns over the last ten days (default true): own turns, relay turns, and old-style rows. */
+  tasks?: boolean;
   seed?: number;
 }
 
@@ -109,6 +111,7 @@ export function seedCostLedger(tomoHome: string, options: CostFixtureOptions = {
         tokens: { input: 900, output: 4_000, cacheRead: 220_000, cacheCreated: 9_000 }, durationMs: Math.round(between(6_000, 45_000)), numTurns: 3, tools: Math.round(between(0, 8)) });
     }
   }
+  if (options.tasks !== false) rows.push(...taskRows(now, Math.min(days, 10), options.seed ?? 7));
   rows.sort((a, b) => a.ts - b.ts);
   const dir = usageDataDir(tomoHome);
   mkdirSync(dir, { recursive: true });
@@ -120,5 +123,48 @@ export function seedCostLedger(tomoHome: string, options: CostFixtureOptions = {
       { window: "seven_day_opus:opus:", label: "Weekly · Opus", group: "weekly", scoped: true, percent: 72, resetsAt: new Date(now + 2.4 * DAY).toISOString(), status: "normal" },
     ] }) + "\n");
   }
+  return rows;
+}
+
+const RELAY_REPORT = "A sub-session finished; its report is in a note above. Tell the owner the result in a few lines, in your own words";
+const RELAY_MESSAGE = "A sub-session handed you something for the owner; it is in a note above. Pass it on as that note says";
+
+/**
+ * Sub-sessions over the last `span` days, on their own random stream (so the
+ * rest of the ledger is the same with or without them): each task's own
+ * turns on `task:<id>` (one with a forced-compaction summary call), the
+ * owning session's report turn for it, a merged message wake tied to no one
+ * task, and, for the oldest task, rows as they were written before tasks had
+ * sources of their own (all `background`).
+ */
+function taskRows(now: number, span: number, seed: number): UsageLedgerRow[] {
+  const random = rng(seed * 31 + 5);
+  const between = (lo: number, hi: number) => lo + random() * (hi - lo);
+  const rows: UsageLedgerRow[] = [];
+  const tokens = (cost: number) => ({ input: Math.round(cost * 900), output: Math.round(cost * 4_000), cacheRead: Math.round(cost * 220_000), cacheCreated: Math.round(cost * 9_000) });
+  const push = (ts: number, row: Omit<UsageLedgerRow, "v" | "ts" | "tokens">) => {
+    if (ts > now) return;
+    const costUsd = Math.round(row.costUsd * 10_000) / 10_000;
+    rows.push({ v: 1, ts, tokens: tokens(costUsd), ...row, costUsd });
+  };
+  const count = 9;
+  for (let n = 1; n <= count; n++) {
+    const id = `s${n}`;
+    const legacy = n === 1;
+    const start = now - Math.round(((count - n + 0.5) / count) * span * 86_400_000 * 0.9);
+    const turns = Math.round(between(1, 6));
+    let ts = start;
+    for (let i = 0; i < turns; i++) {
+      ts += Math.round(between(2, 25) * 60_000);
+      const heavy = i === 0;
+      const durationMs = Math.round(heavy ? between(400_000, 3_000_000) : between(20_000, 400_000));
+      push(ts, { sessionKey: `task:${id}`, source: legacy ? "background" : "task", ...(legacy ? {} : { taskId: id }),
+        costUsd: heavy ? between(4, 18) : between(0.1, 3), durationMs, numTurns: Math.round(durationMs / 15_000) + 1, tools: Math.round(between(3, 60)) });
+    }
+    if (n === 4) push(ts + 60_000, { sessionKey: `task:${id}`, source: "task", taskId: id, trigger: "force-compact", costUsd: between(0.3, 0.8), durationMs: 40_000, numTurns: 1 });
+    push(ts + 120_000, { sessionKey: "dm:owner", source: legacy ? "background" : "task-relay", ...(legacy ? {} : { taskId: id }), trigger: RELAY_REPORT,
+      costUsd: between(0.2, 1.2), durationMs: Math.round(between(8_000, 40_000)), numTurns: 3, tools: Math.round(between(1, 4)) });
+  }
+  push(now - Math.round(span * 0.3 * 86_400_000), { sessionKey: "dm:owner", source: "task-relay", trigger: RELAY_MESSAGE, costUsd: 0.4, durationMs: 12_000, numTurns: 2, tools: 1 });
   return rows;
 }

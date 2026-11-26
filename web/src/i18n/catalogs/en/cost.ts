@@ -4,6 +4,7 @@ export const cost = {
     you: "You", youHint: "Turns started by a message: yours, or one in a group",
     background: "Background", backgroundHint: "Heartbeats and turns that pick up finished background work",
     scheduled: "Scheduled", scheduledHint: "Cron jobs and other scheduled turns",
+    tasks: "Tasks", tasksHint: "Sub-sessions' own turns, and the turns the main conversation ran for them",
   },
   lessThan: "<{{value}}", resetsAt: "resets {{when}}",
   day: { today: "Today so far", yesterday: "Yesterday", other: "That day" },
@@ -11,6 +12,7 @@ export const cost = {
   turn: {
     heartbeat: "Heartbeat", background: "Background work finished", restart: "After a restart", delegate: "Delegated message",
     cron: "Scheduled job", scheduled: "Scheduled turn", other: "Turn",
+    task: "Sub-session turn", relay: "For sub-sessions", relayFor: "For {{id}}",
     tools_one: "{{count}} tool", tools_other: "{{count}} tools", backfilled: "from the activity log",
   },
   est: { label: "est.", title: "Estimated at API list prices by the Claude SDK. On a subscription this is not what you pay." },
@@ -44,11 +46,15 @@ export const cost = {
   period: {
     label: "Period", days_one: "{{count}} day", days_other: "{{count}} days", who: "Who started it", whoLabel: "Cost by who started it",
     noTurns_one: "No turns in the last {{count}} day.", noTurns_other: "No turns in the last {{count}} days.",
-    note_one: "{{turns}} turn. Background is heartbeats and turns that pick up finished subagents.",
-    note_other: "{{turns}} turns. Background is heartbeats and turns that pick up finished subagents.",
+    note_one: "{{turns}} turn. Background is heartbeats and turns that pick up finished subagents; Tasks is sub-sessions.",
+    note_other: "{{turns}} turns. Background is heartbeats and turns that pick up finished subagents; Tasks is sub-sessions.",
     overcounted: " Includes over-counted days.",
     scheduled: "Scheduled jobs", scheduledLabel: "Cost by scheduled job", last_one: "last {{count}} day", last_other: "last {{count}} days",
     tasks: "Sub-sessions", tasksLabel: "Cost by sub-session", turns_one: "{{count}} turn", turns_other: "{{count}} turns",
+    tasksTotal: "{{total}} in all: {{self}} their own turns, {{relay}} the main conversation's for them",
+    taskRelay: "{{turns}} · {{relay}} from the main conversation",
+    tasksUnattributed: "{{cost}} of the main conversation's turns for sub-sessions were for several at once, or are from before turns named their task; that is in the total, not under one task.",
+    tasksMore_one: "Show {{count}} more", tasksMore_other: "Show {{count}} more", tasksLess: "Show fewer",
     runs_one: "{{count}} run", runs_other: "{{count}} runs", runsEach_one: "{{count}} run · {{each}} each", runsEach_other: "{{count}} runs · {{each}} each",
   },
 } as const;

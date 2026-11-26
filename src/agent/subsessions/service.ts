@@ -5,6 +5,7 @@ import { ownerT, type OwnerText } from "../../i18n/index.js";
 import type { SubsessionConfig } from "../../config.js";
 import { isTaskSessionKey } from "../../sessions/keys.js";
 import { formatTomoEvent } from "../../tomo-event.js";
+import type { QuotaGateReading } from "../../usage/limits-log.js";
 import { MODEL_ALIASES } from "../../models.js";
 import { SubsessionStoreError, type SubsessionStore, type TransitionOptions, type TransitionOutcome } from "./store.js";
 import type { SubsessionEvent } from "./state-machine.js";
@@ -115,8 +116,11 @@ export interface SubsessionServiceDeps {
   persistPendingNotes?(key: string): boolean;
   /** A harness notice to the owner's own chat (no task to attribute it to). `false`: it could not be sent (no reachable DM). */
   noticeOwner(text: OwnerText): Promise<boolean | void>;
-  /** A silent turn on the owning session that reads the notes queued for it. */
-  wakeScope(parentKey: string, prompt: string): void;
+  /**
+   * A silent turn on the owning session that reads the notes queued for it.
+   * `taskId`: the task it is for, so the Cost page charges the turn to it.
+   */
+  wakeScope(parentKey: string, prompt: string, taskId?: string): void;
   /** The last turn's context reading on a key, if any. */
   contextUsage(key: string): { used: number; estimated: boolean } | undefined;
   /** Enabled cron jobs that deliver to `key`; undefined when the cron store cannot be read (unknown, not zero). */
@@ -140,11 +144,18 @@ export interface SubsessionServiceDeps {
   registryTaskKeys(): string[];
   isStopping(): boolean;
   /**
-   * The newest reading of the subscription's 5-hour window, 0–100; undefined
-   * when there is none (no quota samples yet, API-key auth). Throws when the
-   * samples cannot be read: the gate then lets the turn run (fail open).
+   * What the quota gate reads: the fuller of the subscription's 5-hour and
+   * weekly windows (`readQuotaGateReading`), 0–100; undefined when neither is
+   * known (no quota samples yet, API-key auth). Throws when the samples
+   * cannot be read: the gate then lets the turn run (fail open).
    */
-  sessionQuotaPercent?(): number | undefined;
+  quotaReading?(): QuotaGateReading | undefined;
+  /**
+   * Before a task's own turn is gated: take a fresh usage reading when the
+   * last one is stale, waiting a bounded time (QuotaGateReader.ensureFresh).
+   * Never rejects.
+   */
+  freshenQuota?(): Promise<void>;
   now?(): number;
   /**
    * mirror "turn": a silent turn on the owning session, which takes the
@@ -196,8 +207,8 @@ export const REPORT_RETRY_MAX = 5;
 export const SETTLE_RETRY_MS = 60_000;
 /** Turns held while the session registry cannot be read: how soon it is looked at again. */
 export const REGISTRY_RECHECK_MS = 60_000;
-/** At this share of the 5-hour window, a task's own turns pause for the owner. */
-export const QUOTA_PAUSE_PERCENT = 80;
+/** Default of `subsessions.quotaPauseAtPct`: at this share of the fuller quota window, a task's own turns pause for the owner. */
+export const QUOTA_PAUSE_PERCENT = 85;
 /** How much of each unanswered message a failure notice quotes. */
 const UNANSWERED_EXCERPT = 300;
 const UNANSWERED_MAX = 5;
@@ -2183,6 +2194,12 @@ export class SubsessionService {
   private async drive(id: string): Promise<void> {
     for (;;) {
       if (this.deps.isStopping()) return;
+      // The quota gate below decides on the newest usage reading: make it a
+      // current one first (a no-op while it is, bounded when it is not).
+      if (this.deps.freshenQuota) {
+        try { await this.deps.freshenQuota(); } catch (err) { log.warn({ err }, "Quota reading refresh failed; the gate decides on what it has"); }
+        if (this.deps.isStopping()) return;
+      }
       const record = this.safeGet(id);
       if (!record || record.status === "queued" || TERMINAL_STATUSES.has(record.status)) return;
       const turn = this.plan(record);
@@ -2513,7 +2530,7 @@ export class SubsessionService {
       { name: record.id }));
     this.outward(() => this.deps.wakeScope(record.parentKey, formatTomoEvent("subsession-unanswered",
       "A finished sub-session could not answer what it was sent; the messages are in a note above. Answer the owner yourself if you can, or tell them the task will get the messages again when they next write to it.",
-      { name: "check" })));
+      { name: "check" }), record.id));
     this.tellScope(record, ownerT("subsessions")("finishedUnanswered", { id: record.id, title: record.title }));
   }
 
@@ -2630,14 +2647,14 @@ export class SubsessionService {
   }
 
   /**
-   * May a mirror turn run now? Not while the 5-hour window is at the quota
+   * May a mirror turn run now? Not while the quota window is at the quota
    * pause. Asked when the wake is queued AND when it runs (the window can
    * fill while it waits behind the session's other turns).
    */
   mirrorTurnAllowed(): boolean {
-    const percent = this.quotaPercent();
-    if (percent !== undefined && percent >= QUOTA_PAUSE_PERCENT) {
-      log.debug({ percent }, "Quota window nearly used; the mirror waits for the owning session's next turn");
+    const reading = this.quotaAtPause();
+    if (reading) {
+      log.debug({ window: reading.window, percent: reading.percent }, "Quota window nearly used; the mirror waits for the owning session's next turn");
       return false;
     }
     return true;
@@ -2776,7 +2793,7 @@ export class SubsessionService {
   private wakeForReport(record: SubsessionRecord): void {
     this.outward(() => this.deps.wakeScope(record.parentKey, formatTomoEvent("subsession-report",
       "A sub-session finished; its report is in a note above. Tell the owner the result in a few lines, in your own words, and read the full report with task_status if they will want details. Decide what, if anything, belongs in memory.",
-      { name: "check" })));
+      { name: "check" }), record.id));
   }
 
   /** The report note could not be written: try again in-process, a few times, then on the next start. */
@@ -2853,8 +2870,8 @@ export class SubsessionService {
 
   /**
    * A turn the task gives itself (no owner input in it) is held when it has
-   * been active on its own past `maxActiveHours`, or when the 5-hour window
-   * is at QUOTA_PAUSE_PERCENT or more: it pauses for the owner (one notice),
+   * been active on its own past `maxActiveHours`, or when the 5-hour or the
+   * weekly window is at `quotaPauseAtPct` or more: it pauses for the owner (one notice),
    * whose word wakes it. "again": the pause was refused (the owner's input
    * just landed): plan the turn afresh.
    */
@@ -2872,22 +2889,37 @@ export class SubsessionService {
           ownerT("subsessions")("activeCap", { id: record.id, title: record.title, hours: capHours }), hasOwnerInput) ? "paused" : "again";
       }
     }
-    const percent = this.quotaPercent();
-    if (percent !== undefined && percent >= QUOTA_PAUSE_PERCENT) {
-      log.info({ id: record.id, percent }, "5-hour quota window nearly used; pausing a sub-session for the owner");
-      return this.pause(record, `the 5-hour quota window is at ${Math.round(percent)}%`,
-        ownerT("subsessions")("quotaHigh", { id: record.id, title: record.title, percent: Math.round(percent) }), hasOwnerInput) ? "paused" : "again";
+    const reading = this.quotaAtPause();
+    if (reading) {
+      const percent = Math.round(reading.percent);
+      const threshold = this.quotaPausePercent();
+      log.info({ id: record.id, window: reading.window, percent: reading.percent, threshold }, "Quota window nearly used; pausing a sub-session for the owner");
+      const windowName = reading.window === "weekly" ? "weekly (all models)" : "5-hour";
+      const vars = { id: record.id, title: record.title, percent };
+      const notice = reading.window === "weekly" ? ownerT("subsessions")("quotaHighWeekly", vars) : ownerT("subsessions")("quotaHigh", vars);
+      return this.pause(record, `the ${windowName} quota window is at ${percent}% (pauses at ${threshold}%, subsessions.quotaPauseAtPct)`,
+        notice, hasOwnerInput) ? "paused" : "again";
     }
     return "run";
   }
 
-  /** The 5-hour window's share used, or undefined: none known, or unreadable (fail open, logged). */
-  private quotaPercent(): number | undefined {
-    if (!this.deps.sessionQuotaPercent) return undefined;
+  private quotaPausePercent(): number {
+    return this.deps.config().quotaPauseAtPct ?? QUOTA_PAUSE_PERCENT;
+  }
+
+  /** The quota reading when it is at the pause threshold or over; undefined below it, unknown or unreadable. */
+  private quotaAtPause(): QuotaGateReading | undefined {
+    const reading = this.quotaReading();
+    return reading && reading.percent >= this.quotaPausePercent() ? reading : undefined;
+  }
+
+  /** The fuller quota window's share used, or undefined: none known, or unreadable (fail open, logged). */
+  private quotaReading(): QuotaGateReading | undefined {
+    if (!this.deps.quotaReading) return undefined;
     try {
-      const percent = this.deps.sessionQuotaPercent();
+      const reading = this.deps.quotaReading();
       this.quotaReadFailing = false;
-      return percent;
+      return reading;
     } catch (err) {
       if (!this.quotaReadFailing) log.warn({ err }, "Could not read the quota samples; sub-session turns are not held for quota");
       else log.debug({ err }, "Quota samples still unreadable");

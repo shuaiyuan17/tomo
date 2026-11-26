@@ -1508,6 +1508,7 @@ export class LiveSession {
           source: usage.source,
           ...(usage.jobId ? { jobId: usage.jobId } : {}),
           ...(usage.jobName ? { jobName: usage.jobName } : {}),
+          ...(usage.taskId ? { taskId: usage.taskId } : {}),
           ...(ctx?.requestId ? { requestId: ctx.requestId } : {}),
           ...(usage.trigger ? { trigger: usage.trigger } : {}),
           ...(result.subtype !== "success" ? { subtype: result.subtype } : {}),

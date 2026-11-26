@@ -45,7 +45,7 @@ interface Harness {
   /** Task keys whose own background work (subagents, background commands) is still running. */
   background: Set<string>;
   /** The 5-hour window's share used; "throw": the samples cannot be read. */
-  quota?: number | "throw";
+  quota?: number | "throw" | { window: "five_hour" | "weekly"; percent: number };
   /** Owner notices that do not go out: "throw" (the send failed), "unreachable" (no DM to send to). */
   ownerNotice?: "throw" | "unreachable";
 }
@@ -136,9 +136,10 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
     registryTaskKeys: () => [...h.registry],
     hasBackgroundWork: (key) => h.background.has(key),
     isStopping: () => false,
-    sessionQuotaPercent: () => {
+    quotaReading: () => {
       if (h.quota === "throw") throw new Error("limits.ndjson unreadable");
-      return h.quota;
+      if (h.quota === undefined) return undefined;
+      return typeof h.quota === "number" ? { window: "five_hour" as const, percent: h.quota } : h.quota;
     },
   });
   return h;
@@ -2075,17 +2076,66 @@ describe("SubsessionService: the wall-clock cap", () => {
 });
 
 describe("SubsessionService: the quota gate", () => {
-  it("pauses a task's own turn at 80% of the 5-hour window, and tells the owner once", async () => {
+  it("pauses a task's own turn at 85% of the 5-hour window, and tells the owner once", async () => {
     const h = harness({}, working());
-    h.quota = 80;
+    h.quota = 85;
     h.service.start();
     const t = spawn(h);
     await flush();
     // Not even its first turn runs.
     expect(h.turns).toHaveLength(0);
     expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
-    expect(h.store.get(t.id)?.waitingReason).toContain("80%");
-    expect(h.notices.map((x) => x.text)).toEqual([expect.stringContaining("80%")]);
+    expect(h.store.get(t.id)?.waitingReason).toContain("5-hour quota window is at 85%");
+    expect(h.notices.map((x) => x.text)).toEqual([expect.stringContaining("85%")]);
+    expect(h.notices[0].text).toContain("5-hour");
+  });
+
+  it("pauses on the weekly window (an account with no 5-hour one) and says which window it was", async () => {
+    const h = harness({}, working());
+    h.quota = { window: "weekly", percent: 85.4 };
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.turns).toHaveLength(0);
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+    expect(h.store.get(t.id)?.waitingReason).toContain("weekly (all models) quota window is at 85%");
+    expect(h.notices.map((x) => x.text)).toEqual([expect.stringContaining("85%")]);
+    expect(h.notices[0].text).toContain("this week's usage");
+    expect(h.notices[0].text).not.toContain("5-hour");
+  });
+
+  it("decides on the reading taken just before the turn (freshenQuota is awaited first)", async () => {
+    const h = harness({}, working());
+    // The file is stale (nothing known); the fresh read finds the week at 90%.
+    (h.service as unknown as { deps: { freshenQuota: () => Promise<void> } }).deps.freshenQuota = async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      h.quota = { window: "weekly", percent: 90 };
+    };
+    h.service.start();
+    const t = spawn(h);
+    await new Promise((r) => setTimeout(r, 30));
+    await flush();
+    expect(h.turns).toHaveLength(0);
+    expect(h.store.get(t.id)?.waitingReason).toContain("weekly (all models) quota window is at 90%");
+  });
+
+  it("runs below the threshold on either window, and the threshold is subsessions.quotaPauseAtPct", async () => {
+    const below = harness({}, working((turn, hh) => hh.service.finish(turn.key, "done")));
+    below.quota = { window: "weekly", percent: 84.9 };
+    below.service.start();
+    spawn(below);
+    await flush();
+    expect(below.turns).toHaveLength(1);
+    expect(below.store.get("s1")?.status).toBe("finished");
+    below.service.stop();
+
+    const strict = harness({ quotaPauseAtPct: 60 }, working());
+    strict.quota = { window: "weekly", percent: 60 };
+    strict.service.start();
+    const t = spawn(strict);
+    await flush();
+    expect(strict.turns).toHaveLength(0);
+    expect(strict.store.get(t.id)?.waitingReason).toContain("pauses at 60%");
   });
 
   it("lets the owner's own word through, and runs below the threshold", async () => {
@@ -2112,7 +2162,7 @@ describe("SubsessionService: the quota gate", () => {
     expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
     expect(h.notices).toHaveLength(2);
     // Quota freed: the owner's next word, and the continue after it, run.
-    h.quota = 79;
+    h.quota = 84;
     expect(h.service.relay(t.id, "now go", said("now go")).ok).toBe(true);
     await flush();
     expect(h.turns).toHaveLength(2);

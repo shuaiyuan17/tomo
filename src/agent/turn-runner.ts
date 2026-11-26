@@ -473,6 +473,7 @@ export function usageAttributionFor(spec: Pick<TurnSpec, "source" | "key" | "pro
     source: spec.usage?.source ?? defaultUsageSource(spec.source, spec.key),
     ...(spec.usage?.jobId ? { jobId: spec.usage.jobId } : {}),
     ...(spec.usage?.jobName ? { jobName: spec.usage.jobName } : {}),
+    ...(spec.usage?.taskId ? { taskId: spec.usage.taskId } : {}),
     ...(trigger ? { trigger } : {}),
   };
 }

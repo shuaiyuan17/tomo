@@ -41,6 +41,13 @@ export const tasks = {
     label: "Message to {{id}}", placeholder: "Message {{id}}…", send: "Send to {{id}}",
     sending: "Sending…", sent: "Sent", retry: "Try again",
     ended: "This task has ended. It can't be written to any more.", gone: "This task is no longer available.",
+    markDone: {
+      label: "Done", marking: "Marking done…", title: "You did what the report asks",
+      error: {
+        nothing: "Nothing to mark: it no longer asks you anything.", newer: "There's a newer report. Read it first.",
+        gone: "The task is gone.", unavailable: "Sub-sessions can't be reached right now.", network: "Not confirmed. Try again.",
+      },
+    },
     error: {
       ended: "Not sent: the task has ended.", full: "Not sent: too many messages are already waiting for it.",
       gone: "Not sent: the task is gone.", unavailable: "Not sent: sub-sessions can't be reached right now.",

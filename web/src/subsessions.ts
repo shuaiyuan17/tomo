@@ -81,11 +81,12 @@ export function subsessionStateLabel(task: ShownTask): string {
  * out of a view, not set empty, once they no longer hold, so they come from
  * the list alone.
  */
-export function withListBackground<D extends Partial<WebSubsession>>(detail: D | undefined, summary: WebSubsession): Omit<D, "background" | "ownerAction"> & WebSubsession {
+export function withListBackground<D extends Partial<WebSubsession>>(detail: D | undefined, summary: WebSubsession): Omit<D, "background" | "ownerAction" | "reportSeq"> & WebSubsession {
   const rest: Partial<WebSubsession> = { ...(detail ?? {}) };
   delete rest.background;
   delete rest.ownerAction;
-  return { ...rest, ...summary } as Omit<D, "background" | "ownerAction"> & WebSubsession;
+  delete rest.reportSeq;
+  return { ...rest, ...summary } as Omit<D, "background" | "ownerAction" | "reportSeq"> & WebSubsession;
 }
 
 /**

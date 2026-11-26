@@ -102,6 +102,8 @@ export interface WebSubsession {
    * until they have done it. Set only while finished.
    */
   ownerAction?: string;
+  /** Which of its reports `ownerAction` belongs to (1, 2, …): what the Done button answers. Set exactly with ownerAction. */
+  reportSeq?: number;
   /** What it is doing now: the plan step it marked in progress (task_plan). */
   step?: string;
   /** A turn is running on it right now. */
@@ -170,6 +172,11 @@ export const subsessionMessageSchema = z.object({ requestId: z.uuid(), text: z.s
 export type SubsessionMessageInput = z.infer<typeof subsessionMessageSchema>;
 /** `duplicate`: this request id had already been delivered (a retry); nothing was added. */
 export interface WebSubsessionMessageResult { status: "delivered" | "duplicate"; task: WebSubsession }
+
+/** The owner did what a finished task's report asked (the web Done button; the same as `/s <id> done <report>`). */
+export const subsessionDoneSchema = z.object({ report: z.number().int().min(1).max(1_000_000) }).strict();
+export type SubsessionDoneInput = z.infer<typeof subsessionDoneSchema>;
+export interface WebSubsessionDoneResult { task: WebSubsession }
 /** A sub-session id as the routes accept it. */
 export const SUBSESSION_ID = /^s[1-9]\d{0,8}$/;
 
@@ -667,6 +674,7 @@ export const rpcSchema = z.discriminatedUnion("method", [
   z.object({ method: z.literal("subsession"), id: z.string().regex(SUBSESSION_ID) }).strict(),
   /** The owner writes to one of their sub-sessions (task: keys only; groups stay read-only). */
   z.object({ method: z.literal("subsession-message"), epoch: z.uuid(), id: z.string().regex(SUBSESSION_ID), input: subsessionMessageSchema }).strict(),
+  z.object({ method: z.literal("subsession-done"), epoch: z.uuid(), id: z.string().regex(SUBSESSION_ID), input: subsessionDoneSchema }).strict(),
   /** Revoke a group's Always allow, for the permission broker. */
   z.object({ method: z.literal("permission-revoke"), epoch: z.uuid(), grantId: permissionRevokeSchema.shape.grantId }).strict(),
 ]);

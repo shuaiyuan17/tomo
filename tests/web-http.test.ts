@@ -58,6 +58,7 @@ beforeEach(async () => {
       if (input.method === "subsessions") return channel.subsessionList();
       if (input.method === "subsession") return channel.subsession(input.id);
       if (input.method === "subsession-message") return channel.messageSubsession(input.id, input.input);
+      if (input.method === "subsession-done") return channel.markSubsessionDone(input.id, input.input);
       return { snapshot: channel.snapshot(), replay: input.cursor ? channel.events.after(input.cursor) : null };
     } });
   bootstrap = web.boot;
@@ -87,6 +88,7 @@ const MUTATION_ROUTES: MutationRoute[] = [
   { name: "POST stop", method: "POST", path: () => "/api/v1/stop", epoch: "format" },
   { name: "POST task stop", method: "POST", path: () => `/api/v1/sessions/${bootstrap.ownerId}/tasks/a1/stop`, epoch: "format" },
   { name: "POST sub-session message", method: "POST", path: () => "/api/v1/subsessions/s1/messages", body: message, epoch: "format" },
+  { name: "POST sub-session done", method: "POST", path: () => "/api/v1/subsessions/s1/done", body: () => JSON.stringify({ report: 1 }), epoch: "format" },
   { name: "POST messages", method: "POST", path: () => "/api/v1/messages", body: message, epoch: "format" },
   { name: "POST messages/<id>/dismiss", method: "POST", path: () => `/api/v1/messages/${randomUUID()}/dismiss`, epoch: "format" },
   { name: "DELETE uploads/<id>", method: "DELETE", path: () => `/api/v1/uploads/${"0".repeat(32)}`, epoch: "none" },
@@ -272,6 +274,24 @@ describe("local HTTP boundary", () => {
     const group = bootstrap.sessions.find((s) => s.id !== bootstrap.ownerId)!;
     const refused = await call("/api/v1/messages", { method: "POST", headers: mutationHeaders(), body: JSON.stringify({ requestId: randomUUID(), targetId: group.id, text: "hi" }) });
     expect(refused.status).toBe(403);
+  });
+  it("the owner's Done on a sub-session names the report it answers, through its own route", async () => {
+    const task = { id: "s1", title: "T", status: "finished" as const, working: false, createdAt: 1, lastActivityAt: 1, activeMs: 0, revision: 2, writable: true };
+    const done = vi.fn((_id: string, _report: number) => ({ ok: true as const, task }));
+    (channel as unknown as { subsessionAccess: unknown }).subsessionAccess = { list: () => ({ available: true, tasks: [task] }), get: () => undefined, message: vi.fn(), done };
+    const post = (path: string, body: unknown) => web.send("POST", `/api/v1/subsessions/${path}/done`, body);
+    for (const bad of [{}, { report: 0 }, { report: "2" }, { report: 2, extra: 1 }]) expect((await post("s1", bad)).status).toBe(400);
+    expect((await post("task:s1", { report: 2 })).status).toBe(404);
+    expect(done).not.toHaveBeenCalled();
+    const ok = await post("s1", { report: 2 });
+    expect(ok.status).toBe(200);
+    expect(JSON.parse(ok.text)).toEqual({ task });
+    expect(done).toHaveBeenCalledWith("s1", 2);
+    expect(handoff).not.toHaveBeenCalled();
+    done.mockReturnValueOnce({ ok: false, reason: "newer" } as never);
+    const newer = await post("s1", { report: 1 });
+    expect(newer.status).toBe(409);
+    expect(JSON.parse(newer.text)).toEqual({ error: "subsession_newer_report" });
   });
   it("stop reaches the owner conversation's running turn", async () => {
     const stop = vi.fn(async (_key: string) => true);

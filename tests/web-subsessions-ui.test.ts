@@ -69,8 +69,9 @@ describe("sub-sessions in the Tasks rail", () => {
     expect(withListBackground(detail(), { ...summary, background: true }).background).toBe(true);
     expect(withListBackground(undefined, summary)).toEqual(summary);
     // Marked done: the list no longer says Needs you, and an older detail read does not bring it back.
-    const done = withListBackground(detail({ status: "finished", ownerAction: "Merge PR #3" }), task({ status: "finished" }));
+    const done = withListBackground(detail({ status: "finished", ownerAction: "Merge PR #3", reportSeq: 2 }), task({ status: "finished" }));
     expect(done).not.toHaveProperty("ownerAction");
+    expect(done).not.toHaveProperty("reportSeq");
     expect(subsessionState(done)).toBe("finished");
   });
 

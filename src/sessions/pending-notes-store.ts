@@ -18,6 +18,14 @@ const LEGACY_MARKER_FILENAME = "_pending_notes.quarantined.json";
  * is always imported, whatever its bytes.
  */
 export const IMPORT_PENDING_KEY = "legacy_pending_notes_import_pending";
+/**
+ * `meta` row set by `tomo db export pending-notes`: from then on the exported
+ * file is the truth. The next start imports it if it is there (a rollback
+ * that was called off, or an older Tomo that left notes), and if it is gone
+ * (an older Tomo delivered every note and deleted it) empties the table, so
+ * nothing it already delivered is delivered again.
+ */
+export const EXPORTED_KEY = "legacy_pending_notes_exported";
 
 export type MoveOutcome = "moved" | "taken" | "gone";
 
@@ -35,9 +43,10 @@ export type MoveOutcome = "moved" | "taken" | "gone";
  * the newest truth (only a pre-SQLite Tomo writes it, e.g. after a rollback),
  * so it replaces the table rather than adding to it. Its digest is recorded in
  * the same transaction until the rename lands (IMPORT_PENDING_KEY), so a crash
- * in between imports nothing twice. `tomo db export pending-notes` MOVES the
- * notes out (file written, then the table emptied), so an older Tomo that
- * drains them and deletes the file leaves nothing behind to deliver again. A
+ * in between imports nothing twice. `tomo db export pending-notes` writes the
+ * file and marks the table exported (EXPORTED_KEY): the next start takes the
+ * file as the truth, and when the file is gone (an older Tomo delivered every
+ * note and deleted it) empties the table, so nothing is delivered twice. A
  * file that will not read is moved aside unchanged as before (`.corrupt-<ts>`,
  * marker first) and the owner told. No dual writes: the file is never written
  * again; `tomo db export pending-notes` writes it for a rollback.
@@ -153,12 +162,17 @@ export class PendingNotesStore {
   private importLegacy(db: TomoDb): void {
     // Read inside the write transaction: what is imported is what the file
     // held while nobody else could write the table.
-    const outcome = db.transaction((): { notes: Record<string, string[]>; displaced: number } | "none" | "unreadable" | "pending" => {
+    const outcome = db.transaction((): { notes: Record<string, string[]>; displaced: number } | "none" | "consumed" | "unreadable" | "pending" => {
       let raw: Buffer;
       try {
         raw = readFileSync(this.legacyPath);
       } catch (err) {
-        if (isEnoent(err)) return "none";
+        if (isEnoent(err)) {
+          if (!db.get("SELECT 1 FROM meta WHERE key = ?", EXPORTED_KEY)) return "none";
+          db.run("DELETE FROM pending_notes");
+          db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
+          return "consumed";
+        }
         this.unreadable = err;
         return "unreadable";
       }
@@ -176,9 +190,14 @@ export class PendingNotesStore {
       db.run("DELETE FROM pending_notes");
       for (const [key, list] of Object.entries(notes)) writeNotes(db, key, list);
       db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", IMPORT_PENDING_KEY, digest);
+      db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
       return { notes, displaced };
     });
     if (outcome === "none") return;
+    if (outcome === "consumed") {
+      log.info("The exported pending notes file is gone (an older Tomo delivered its notes): the table was emptied");
+      return;
+    }
     if (outcome === "unreadable") {
       this.quarantineLegacy(this.unreadable);
       return;
@@ -318,24 +337,22 @@ export function parsePendingNotesFile(raw: Buffer): Record<string, string[]> {
 }
 
 /**
- * Write every note to the legacy file at `out`. With `clear` (the rollback
- * path) they are MOVED: the read, the file write (fsynced) and the emptying
- * of the table are one write transaction, so a note committed by a running
- * daemon meanwhile waits for it and stays in the table, and a failed file
- * write empties nothing. Returns how many notes were written.
+ * Write every note to the legacy file at `out`. With `mark` (the rollback
+ * path, to the file the older Tomo reads) the table is marked exported in the
+ * same write transaction, the file written and fsynced inside it: the mark
+ * commits only with the file on disk. The table itself is not changed, so an
+ * export can be repeated. Returns how many notes were written.
  */
-export function exportPendingNotesToFile(db: TomoDb, out: string, opts: { clear: boolean }): number {
+export function exportPendingNotesToFile(db: TomoDb, out: string, opts: { mark: boolean }): number {
   const write = (): number => {
     const notes = readAllNotes(db);
     const file: PendingNotesFile = { version: 1, notes };
     writeJsonAtomicSync(out, file, { fsync: true });
     return Object.values(notes).reduce((n, list) => n + list.length, 0);
   };
-  if (!opts.clear) return write();
+  if (!opts.mark) return write();
   return db.transaction(() => {
-    const count = write();
-    db.run("DELETE FROM pending_notes");
-    db.run("DELETE FROM meta WHERE key = ?", IMPORT_PENDING_KEY);
-    return count;
+    db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", EXPORTED_KEY, new Date().toISOString());
+    return write();
   });
 }

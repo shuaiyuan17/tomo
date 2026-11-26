@@ -99,9 +99,9 @@ describe("tomo db export pending-notes (the rollback path)", () => {
     expect(r.exitCodes).toEqual([]);
     expect(parsePendingNotesFile(readFileSync(legacyFile))).toEqual({ "dm:alice": ["a1", "a2"], "telegram:-9": ["g1"] });
     expect(JSON.parse(readFileSync(legacyFile, "utf8")).version).toBe(1);
-    // Moved, not copied: the database no longer holds them.
+    // A copy: the table is unchanged (marked exported), so the export can be repeated safely.
     const after = await run(["dump", "pending_notes", "--json"]);
-    expect(JSON.parse(after.logs.join("\n"))).toEqual([]);
+    expect(JSON.parse(after.logs.join("\n"))).toHaveLength(3);
 
     // An older Tomo ran on it (delivered alice's), then this version starts again.
     writeFileSync(legacyFile, JSON.stringify({ version: 1, notes: { "telegram:-9": ["g1"] } }));
@@ -192,5 +192,22 @@ describe("tomo db repair", () => {
     vi.stubEnv("TOMO_SESSION_KEY", "dm:alice");
     expect((await run(["repair"])).exitCodes).toEqual([1]);
     expect(readFileSync(dbPath, "utf8")).toBe("garbage ".repeat(600));
+  });
+});
+
+describe("export guards for the file Tomo imports", () => {
+  it("--from needs --out, and --out may not name the rollback file", async () => {
+    store().setPendingNotes("dm:alice", ["a"]);
+    expect((await run(["export", "pending-notes", "--from", dbPath])).exitCodes).toEqual([1]);
+    expect((await run(["export", "pending-notes", "--out", legacyFile])).exitCodes).toEqual([1]);
+    expect(existsSync(legacyFile)).toBe(false);
+  });
+
+  it("a second export never overwrites the rollback file", async () => {
+    store().setPendingNotes("dm:alice", ["a"]);
+    expect((await run(["export", "pending-notes"])).exitCodes).toEqual([]);
+    const first = readFileSync(legacyFile, "utf8");
+    expect((await run(["export", "pending-notes", "--overwrite"])).exitCodes).toEqual([1]);
+    expect(readFileSync(legacyFile, "utf8")).toBe(first);
   });
 });

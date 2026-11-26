@@ -18,21 +18,28 @@ export function Mark({ className }: { className?: string }) {
 /** A layer toggle in the top bar (pressed while its layer is open). */
 interface Toggle { ref: Ref<HTMLButtonElement>; pressed: boolean; onToggle: () => void }
 
-const toggleClass = "relative size-10 rounded-xl text-foreground max-[600px]:size-11 compact:size-11 hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-5";
+/**
+ * 32px on a desktop, 36px where a finger taps (a phone, or any touch screen), inside the 45px bar;
+ * there an invisible 4px margin (::after) still gives each a 44px target, and the toggles sit 8px
+ * apart so those targets meet without overlapping.
+ */
+const touchTarget = "max-[600px]:after:absolute max-[600px]:after:-inset-1 max-[600px]:after:content-[''] pointer-coarse:after:absolute pointer-coarse:after:-inset-1 pointer-coarse:after:content-['']";
+const toggleClass = "relative size-8 shrink-0 rounded-lg text-foreground max-[600px]:size-9 pointer-coarse:size-9 " + touchTarget + " hover:bg-foreground/[0.07] aria-pressed:bg-foreground/[0.11] aria-pressed:hover:bg-foreground/[0.14] [&_svg:not([class*='size-'])]:size-[18px]";
 
 const CONNECTION_LABELS = {
   live: "connection.live", locked: "connection.locked", connecting: "connection.connecting", reconnecting: "connection.reconnecting",
 } as const satisfies Record<ReturnType<typeof useWeb>["connection"], string>;
 
 /**
- * The top bar: the phone menu button, the wordmark, where you are, and the
- * layer toggles (the conversation beside Home's room, Tasks, the screen) with
- * the connection state.
+ * The top bar, 45px on every screen: the phone menu button, the wordmark, the
+ * name of where you are (one line, nothing under it), and the layer toggles
+ * (the conversation beside Home's room, Tasks, the screen) with the
+ * connection state.
  */
-export function AppHeader({ headerRef, view, phoneTitle, menu, chat, tasks, screen, connection }: {
-  headerRef: Ref<HTMLElement>; view: View;
-  /** Phones have no sidebar on screen: Home, or a group being read, is named in the bar. */
-  phoneTitle?: string;
+export function AppHeader({ headerRef, title, menu, chat, tasks, screen, connection }: {
+  headerRef: Ref<HTMLElement>;
+  /** Where you are: the page's name, or the group being read. */
+  title: string;
   menu: Toggle;
   /** Home only: the conversation beside the room, with a dot for a reply not seen yet. */
   chat?: Toggle & { unread: boolean };
@@ -42,27 +49,29 @@ export function AppHeader({ headerRef, view, phoneTitle, menu, chat, tasks, scre
   connection: ReturnType<typeof useWeb>["connection"];
 }) {
   const { t } = useTranslation();
-  return <header ref={headerRef} className="flex h-[72px] shrink-0 items-center gap-8 border-b px-8 max-[1024px]:px-6 max-[600px]:h-12 max-[600px]:gap-3 max-[600px]:px-3.5 max-[600px]:pt-[env(safe-area-inset-top)] max-[600px]:box-content compact:h-12 compact:gap-4 compact:px-5 compact:pt-[env(safe-area-inset-top)] compact:box-content">
+  return <header ref={headerRef} data-testid="app-header" className="relative z-10 flex h-(--app-header) shrink-0 items-center gap-3 border-b px-5 pt-[env(safe-area-inset-top)] max-[1024px]:px-4 max-[600px]:gap-2 max-[600px]:px-2.5">
     <Button ref={menu.ref} variant="ghost" size="icon" aria-expanded={menu.pressed} aria-controls="sidebar" title={t("header.menu")} aria-label={t("header.menuLabel")}
       onClick={menu.onToggle}
-      className="-ml-2.5 hidden size-11 shrink-0 rounded-xl text-foreground hover:bg-foreground/[0.07] aria-expanded:bg-foreground/[0.11] max-[600px]:inline-flex [&_svg:not([class*='size-'])]:size-5"><PanelLeft strokeWidth={1.75} /></Button>
-    <a className="flex shrink-0 items-center gap-2 font-serif text-[30px] tracking-[-1.5px] text-foreground no-underline max-[600px]:gap-1.5 max-[600px]:text-[22px] max-[600px]:tracking-[-1px] compact:gap-1.5 compact:text-[22px] compact:tracking-[-1px]" href="/" aria-label={t("header.homeLink")}>
-      <Mark className="size-9 max-[600px]:size-7 compact:size-7" /><span>tomo<span className="text-primary">.</span></span></a>
-    <span className="border-l pl-8 text-sm text-muted-foreground max-[800px]:hidden compact:pl-4">{view === "study" ? t("nav.study") : view === "home" ? t("nav.home") : t("nav.conversation")}</span>
-    {phoneTitle && <span className="hidden min-w-0 truncate border-l pl-3 text-[13px] text-muted-foreground max-[600px]:block" title={view === "home" ? undefined : phoneTitle}>{phoneTitle}</span>}
-    <div className="ml-auto flex items-center gap-0.5">
+      className={cn(touchTarget, "relative hidden size-9 shrink-0 rounded-lg text-foreground hover:bg-foreground/[0.07] aria-expanded:bg-foreground/[0.11] max-[600px]:inline-flex [&_svg:not([class*='size-'])]:size-[18px]")}><PanelLeft strokeWidth={1.75} /></Button>
+    <a className="flex shrink-0 items-center gap-1.5 font-serif text-[21px] leading-none tracking-[-0.8px] text-foreground no-underline" href="/" aria-label={t("header.homeLink")}>
+      <Mark className="size-6" /><span className="max-[360px]:sr-only">tomo<span className="text-primary">.</span></span></a>
+    <span aria-hidden="true" className="h-4 w-px shrink-0 bg-border" />
+    <span data-testid="header-title" className="min-w-0 truncate text-[13px] text-muted-foreground" title={title}>{title}</span>
+    <div className="ml-auto flex shrink-0 items-center gap-0.5 max-[600px]:gap-2 pointer-coarse:gap-2">
       {chat && <ToggleButton toggle={chat} controls="conversation" title={t("nav.conversation")} label={chat.unread ? t("header.chatUnread") : t("header.chat")}>
         <MessageCircle strokeWidth={1.75} />
-        {chat.unread && <span aria-hidden="true" data-testid="chat-unread" className="absolute top-1.5 right-1.5 size-2 rounded-full bg-primary ring-2 ring-background" />}
+        {chat.unread && <span aria-hidden="true" data-testid="chat-unread" className="absolute top-1 right-1 size-2 rounded-full bg-primary ring-2 ring-background" />}
       </ToggleButton>}
       <ToggleButton toggle={tasks} controls="tasks-rail" title={t("header.tasks")} label={tasks.running ? t("header.tasksRunning", { count: tasks.running }) : t("header.tasks")}>
         <ListChecks strokeWidth={1.75} />
-        {tasks.running > 0 && <span aria-hidden="true" className="absolute top-0.5 right-0.5 min-w-4 rounded-full bg-primary px-1 text-center text-[10px] leading-4 font-semibold text-primary-foreground ring-2 ring-background">{tasks.running > 99 ? "99+" : tasks.running}</span>}
+        {tasks.running > 0 && <span aria-hidden="true" className="absolute -top-0.5 -right-0.5 min-w-4 rounded-full bg-primary px-1 text-center text-[10px] leading-4 font-semibold text-primary-foreground ring-2 ring-background">{tasks.running > 99 ? "99+" : tasks.running}</span>}
       </ToggleButton>
       {screen && <ToggleButton toggle={screen} controls="screen-window" title={t("header.screen")} label={t("header.screenLabel")}><Monitor strokeWidth={1.75} /></ToggleButton>}
-      <span role="status" data-connection={connection} className="ml-1.5 flex items-center gap-2 tracking-[0.02em] text-xs text-muted-foreground max-[600px]:ml-0">
-        <i className={cn("size-1.5 rounded-full border border-muted-foreground", connection === "live" && "border-primary bg-primary", connection !== "live" && connection !== "locked" && "animate-pulse")} />
-        <span className={cn(connection === "live" && "max-[600px]:sr-only")}>{t(CONNECTION_LABELS[connection])}</span></span>
+      <span role="status" data-connection={connection} className="ml-1.5 flex items-center gap-2 tracking-[0.02em] text-xs text-muted-foreground max-[600px]:ml-0.5">
+        <i className={cn("size-1.5 shrink-0 rounded-full border border-muted-foreground", connection === "live" && "border-primary bg-primary", connection !== "live" && connection !== "locked" && "animate-pulse")} />
+        {/* A phone has no room in the bar for these words: connected, the dot says it; otherwise they hang just under the bar, whole, and taps go through them to what is under. */}
+        <span data-testid="connection-words" className={cn("whitespace-nowrap", connection === "live" ? "max-[600px]:sr-only"
+          : "max-[600px]:pointer-events-none max-[600px]:absolute max-[600px]:top-full max-[600px]:right-2.5 max-[600px]:mt-1.5 max-[600px]:rounded-full max-[600px]:border max-[600px]:bg-card max-[600px]:px-2.5 max-[600px]:py-1 max-[600px]:shadow-xs")}>{t(CONNECTION_LABELS[connection])}</span></span>
     </div>
   </header>;
 }

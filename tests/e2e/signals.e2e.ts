@@ -119,7 +119,8 @@ it("on a phone: no zoom-triggering fields, a compact header, and the view follow
   await page.screenshot({ path: "test-results/study-model-phone.png" });
   await page.evaluate(() => { window.location.hash = ""; });
   await browserExpect(input).toBeVisible();
-  expect((await page.locator("header").boundingBox())!.height).toBeLessThan(52);
+  // The top bar is 45px on a phone too (no safe-area inset in the emulator).
+  expect((await page.locator("header").boundingBox())!.height).toBe(45);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 
   let answers = 0;

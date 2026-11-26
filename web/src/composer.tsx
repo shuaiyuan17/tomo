@@ -348,7 +348,7 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
         onChange={(e) => { attachments.add(Array.from(e.target.files ?? [])); e.target.value = ""; input.current?.focus(); }} />
       <Button type="button" variant="ghost" size="icon" aria-label={filesOn ? i18n.t("chat:composer.attachFiles") : i18n.t("chat:composer.attachImages")}
         title={filesOn ? i18n.t("chat:composer.attachFilesTitle") : uploadsOn ? i18n.t("chat:composer.attachImagesTitle") : i18n.t("chat:composer.uploadsOff")} disabled={!canAttach}
-        onClick={() => fileInput.current?.click()} className="size-9 shrink-0 rounded-full text-muted-foreground hover:text-foreground [&_svg:not([class*='size-'])]:size-[20px]"><Plus strokeWidth={2} /></Button>
+        onClick={() => fileInput.current?.click()} className="size-9 shrink-0 rounded-[10px] text-muted-foreground hover:text-foreground [&_svg:not([class*='size-'])]:size-[20px]"><Plus strokeWidth={2} /></Button>
       <label className="sr-only" htmlFor="message">{i18n.t("chat:composer.label", { agent })}</label>
       <Textarea ref={input} id="message" placeholder={session?.kind === "group" ? i18n.t("chat:composer.groupPlaceholder") : i18n.t("chat:composer.placeholder")} value={draft} maxLength={16_000} rows={1} disabled={!writable}
         className={cn(COMPOSER_FIELD, "max-h-60 pr-3 text-[15px] disabled:opacity-80 md:text-[15px]")}
@@ -365,7 +365,7 @@ export function Composer({ handle, web, session, sessionId, agent, latest, turnA
           if (e.key === "Escape" && replyingTo && !e.nativeEvent.isComposing) { e.preventDefault(); e.stopPropagation(); setReplyingTo(null); return; }
           if (ime.current.shouldSubmit({ key: e.key, shiftKey: e.shiftKey, isComposing: e.nativeEvent.isComposing, keyCode: e.keyCode })) { e.preventDefault(); e.currentTarget.form?.requestSubmit(); } }} />
       {showStop ? <Button type="button" size="icon" aria-label={i18n.t("chat:composer.stopLabel", { agent })} title={i18n.t("chat:composer.stop")} aria-busy={stopping} disabled={stopping} onClick={() => void stop()}
-        className="size-9 shrink-0 rounded-full bg-foreground text-background transition-[background-color,transform] hover:bg-foreground/85 active:scale-[0.94] disabled:opacity-60 [&_svg:not([class*='size-'])]:size-3.5">
+        className="size-9 shrink-0 rounded-[10px] bg-foreground text-background transition-[background-color,transform] hover:bg-foreground/85 active:scale-[0.94] disabled:opacity-60 [&_svg:not([class*='size-'])]:size-3.5">
         <Square fill="currentColor" strokeWidth={0} /></Button> :
       <Button type="submit" size="icon" aria-label={i18n.t("chat:composer.send")} aria-busy={sending}
         className={cn(COMPOSER_SEND, "[&_svg:not([class*='size-'])]:size-[18px]")}

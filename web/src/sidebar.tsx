@@ -39,17 +39,17 @@ export function Sidebar({ sidebarRef, view, onNavigate, drawer, phone, inert, se
 }) {
   const { t } = useTranslation();
   return <aside ref={sidebarRef} id="sidebar" data-state={drawer ? "open" : "closed"} {...(drawer ? { role: "dialog", "aria-modal": true } : {})}
-    className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-6 py-8 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] max-[1024px]:w-[232px] max-[1024px]:px-5 max-[800px]:w-[204px] max-[800px]:px-4 max-[600px]:fixed max-[600px]:top-[calc(3rem+env(safe-area-inset-top))] max-[600px]:bottom-0 max-[600px]:left-0 max-[600px]:z-30 max-[600px]:w-[min(320px,86vw)] max-[600px]:bg-background max-[600px]:px-5 max-[600px]:pt-5 max-[600px]:pb-[max(1.25rem,env(safe-area-inset-bottom))] max-[600px]:shadow-2xl max-[600px]:transition-transform max-[600px]:duration-[220ms] max-[600px]:data-[state=closed]:-translate-x-full max-[600px]:data-[state=closed]:shadow-none"
+    className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-4 pt-4 pb-4 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] max-[1024px]:w-[232px] max-[1024px]:px-3.5 max-[800px]:w-[204px] max-[800px]:px-3 max-[600px]:fixed max-[600px]:top-(--app-header) max-[600px]:bottom-0 max-[600px]:left-0 max-[600px]:z-30 max-[600px]:w-[min(320px,86vw)] max-[600px]:bg-background max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-[max(1.25rem,env(safe-area-inset-bottom))] max-[600px]:shadow-2xl max-[600px]:transition-transform max-[600px]:duration-[220ms] max-[600px]:data-[state=closed]:-translate-x-full max-[600px]:data-[state=closed]:shadow-none"
     aria-label={t("sidebar.label")} inert={inert || (phone && !drawer)} aria-hidden={phone && !drawer ? true : undefined}>
-    <nav aria-label={t("sidebar.workspace")} className="mb-7 flex flex-col gap-0.5">
+    <nav aria-label={t("sidebar.workspace")} className="mb-6 flex flex-col gap-0.5">
       {NAVIGATION.map(([target, label, Icon]) =>
         <Button key={label} variant="ghost" aria-current={view === target ? "page" : undefined} onClick={() => { onNavigate(target); if (drawer) closeDrawer(false); }}
-          className="h-9 justify-start gap-2.5 rounded-xl px-3 text-[13px] font-normal text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground aria-[current=page]:bg-foreground/[0.08] aria-[current=page]:font-medium aria-[current=page]:text-foreground max-[600px]:h-10 max-[600px]:text-[14px]">
+          className="h-8 justify-start gap-2.5 rounded-lg px-2.5 text-[13px] font-normal text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground aria-[current=page]:bg-foreground/[0.08] aria-[current=page]:font-medium aria-[current=page]:text-foreground max-[600px]:h-10 max-[600px]:text-[14px]">
           <Icon strokeWidth={1.75} /><span>{t(label)}</span></Button>)}
     </nav>
-    <p className="eyebrow mb-3">{t("sidebar.conversations")}</p>
-    <div className="mb-1.5 flex items-center justify-between gap-2">
-      <span id="session-label" className="text-[13px] font-medium">{t("sidebar.session")}</span>
+    <div className="mb-2 flex items-center justify-between gap-2 px-0.5">
+      <p className="eyebrow">{t("sidebar.conversations")}</p>
+      <span id="session-label" className="sr-only">{t("sidebar.session")}</span>
       {session?.kind === "group" && <Badge variant="outline" className="rounded-md tracking-[0.02em] text-[10px] font-normal text-muted-foreground">{t("sidebar.readOnly")}</Badge>}
     </div>
     <SessionPicker sessions={sessions} ownerId={ownerId} session={session} onSelect={onSelect} drawer={drawer} closeDrawer={closeDrawer} />
@@ -57,7 +57,7 @@ export function Sidebar({ sidebarRef, view, onNavigate, drawer, phone, inert, se
     <ContextWindow session={session} web={web} />
     <PlanUsage ready={!!web.bootstrap} locked={web.connection === "locked"} live={web.rateLimit} />
     {/* Theme: pinned to the bottom of the sidebar (and of the phone drawer). */}
-    <div className="mt-auto flex items-center justify-between gap-3 border-t pt-4 max-[600px]:mt-8">
+    <div className="mt-auto flex items-center justify-between gap-3 px-0.5 pt-6 max-[600px]:mt-6">
       <span className="eyebrow">{t("theme.heading")}</span>
       <ToggleGroup type="single" aria-label={t("theme.label")} value={theme} onValueChange={(value) => { if (value) onTheme(value as Theme); }}
         className="rounded-xl bg-foreground/[0.05] p-0.5 max-[600px]:rounded-[13px]">
@@ -87,7 +87,7 @@ function SessionPicker({ sessions, ownerId, session, onSelect, drawer, closeDraw
   return <DropdownMenu modal={false}>
     <DropdownMenuTrigger asChild disabled={!sessions.length}>
       <Button ref={trigger} variant="outline" aria-labelledby="session-label session-value"
-        className="h-11 w-full min-w-0 justify-between rounded-xl bg-card px-3.5 text-[13px] font-normal shadow-xs hover:bg-accent">
+        className="h-9 w-full min-w-0 justify-between rounded-lg bg-card px-3 text-[13px] max-[600px]:h-10 font-normal shadow-xs hover:bg-accent">
         <span id="session-value" className="flex min-w-0 flex-1 items-center gap-2">
           <span className="truncate" title={session?.title}>{session ? session.kind === "group" ? t("sidebar.groupTitle", { title: session.title }) : session.title : t("sidebar.noSession")}</span>
           {session && session.id === ownerId && <span data-testid="session-main" role="img" aria-label={t("sidebar.mainSession")} title={t("sidebar.mainSession")} className="ml-auto flex shrink-0 pl-1"><Pin aria-hidden="true" className="size-3.5 text-primary" strokeWidth={2} /></span>}
@@ -122,18 +122,18 @@ function ContextWindow({ session, web }: { session?: WebSession; web: Pick<Web, 
   const { t } = useTranslation();
   const usage = session?.stats;
   const ownerId = web.bootstrap?.ownerId;
-  return <section className="mt-8 border-t pt-7" aria-labelledby="context-heading">
-    <div className="mb-3 flex items-center justify-between gap-2"><p className="eyebrow m-0" id="context-heading">{t("context.heading")}</p>
+  return <section className="mt-7 px-0.5" aria-labelledby="context-heading">
+    <div className="mb-2 flex items-center justify-between gap-2"><p className="eyebrow m-0" id="context-heading">{t("context.heading")}</p>
       <CompactButton bootstrap={web.bootstrap} refresh={web.refreshBootstrap} ownerSession={!!session && session.id === ownerId}
         running={web.tasks.filter((t) => t.sessionId === ownerId && t.state === "running" && !t.ambient).length}
         request={web.compact} /></div>
     {usage?.contextMax ? <>
-      <p className="mb-3 text-lg tabular-nums" title={usage.contextEstimated ? t("context.estimated") : t("context.reported")}>
+      <p className="mb-2 text-base tabular-nums" title={usage.contextEstimated ? t("context.estimated") : t("context.reported")}>
         {usage.contextEstimated ? "~" : ""}{formatNumber(usage.contextUsed)} <span className="text-xs text-muted-foreground">/ {formatNumber(usage.contextMax)}</span></p>
       <Progress max={usage.contextMax} value={Math.min(usage.contextUsed, usage.contextMax)} aria-label={t("context.progress")} className="h-1.5 bg-border" />
     </> : <>
-      <p className="mb-3 text-lg tabular-nums">{t("context.unavailable")}</p>
-      <p className="mt-3 text-[13px] leading-relaxed text-muted-foreground">{t("context.empty")}</p>
+      <p className="mb-2 text-base tabular-nums">{t("context.unavailable")}</p>
+      <p className="mt-2 text-[12.5px] leading-relaxed text-muted-foreground">{t("context.empty")}</p>
     </>}
   </section>;
 }

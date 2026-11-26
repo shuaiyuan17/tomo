@@ -322,6 +322,7 @@ async function boot(options: { conversation: boolean }): Promise<void> {
       } },
     outgoingMedia: new OutgoingMediaStore(outgoingImagesDir(mockConfig.workspaceDir), { isPrivate: (path) => path.includes("/memory/private/") }),
     uploads: { dir: uploadsDir(mockConfig.tomoHome), workspaceDir: mockConfig.workspaceDir },
+    subsessions: theAgent.webSubsessions(),
   });
   supervisor = new WebSupervisor(channel, { ...mockConfig, owner: mockConfig.owner, port: 0, cronStorePath,
     // What the owner's live session reports: one failed, one waiting on sign-in, the in-process server fine.
@@ -330,6 +331,7 @@ async function boot(options: { conversation: boolean }): Promise<void> {
     mcpOAuth: () => [{ name: "calendar", oauth: "login-required" }],
     mcpReconnect: async () => "reconnected" });
   channel.attach(supervisor); theAgent.addChannel(channel); theAgent.addChannel(new MockChannel("telegram"));
+  theAgent.onSubsessionsChanged(() => channel.publishSubsessionsChanged());
   theHome.attachWeb({ publish: (event) => channel.events.publish(event), available: () => supervisor.status().state === "running", mayShowTask: (key) => channel.mayShowTask(key) });
   await channel.start();
   theHome.start();
@@ -338,6 +340,12 @@ async function boot(options: { conversation: boolean }): Promise<void> {
   browser = await chromium.launch({ args: ["--use-gl=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"] });
   publishTasks();
   mockSdk.responseFn = () => "ok";
+  if (options.conversation) {
+    // One sub-session of the owner's, for the sub-session chat in the Tasks rail. The table is read but
+    // dispatch never opens (no agent.start()): the task stays queued and runs no turn into the shots.
+    theAgent.subsessions?.recoverAtStartup();
+    theAgent.subsessions?.spawn("dm:owner", { title: "Draft the release notes", brief: "Draft the 1.9 release notes from the merged PRs.", quote: ["start the 1.9 notes"] });
+  }
 }
 
 interface PageOptions { noWebgl?: boolean; signedIn?: boolean; hash?: string }
@@ -629,6 +637,14 @@ async function chromeSteps(page: Page, vp: Viewport, theme: Theme): Promise<void
   await s("tasks", "open", async (snap) => {
     await reset(page);
     await openTasks(page);
+    await snap();
+  });
+  await s("tasks", "subsession", async (snap) => {
+    await reset(page);
+    await openTasks(page);
+    await page.locator('[data-subsession-row="s1"]').filter({ visible: true }).first().getByRole("button").first().click();
+    await page.locator('[data-subsession="s1"]').filter({ visible: true }).first().waitFor();
+    await page.waitForTimeout(600);
     await snap();
   });
   await s("tasks", "subagent", async (snap) => {

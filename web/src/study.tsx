@@ -42,19 +42,18 @@ export function Study({ page, onPage, session, reload, inert, mutator, focus, cr
   const agent = useAgentName();
   const { t } = useTranslation(["study", "common"]);
   const key = reload + local;
-  return <main id="study" tabIndex={-1} inert={inert} className="mx-auto flex min-h-0 w-full max-w-[1040px] min-w-0 flex-1 flex-col px-12 pt-7 max-[1024px]:px-7 max-[800px]:px-5 max-[600px]:px-4 max-[600px]:pt-4">
-    <div className="mb-5 flex items-end justify-between gap-4">
-      <div className="min-w-0"><p className="eyebrow">{t("common:nav.study")}</p>
-        <h1 className="mt-1 mb-1 font-serif text-[30px] leading-tight font-normal tracking-[-0.5px] max-[600px]:text-[24px]">{studyLabel(page)}</h1>
-        <p className="m-0 text-[13px] text-muted-foreground">{t(INTRO[page], { agent })}</p></div>
-      <Button variant="ghost" size="icon" className="size-9 shrink-0 rounded-xl text-muted-foreground hover:bg-foreground/[0.07]" aria-label={t("refresh")} title={t("refresh")} onClick={() => setLocal((v) => v + 1)}><RefreshCw strokeWidth={1.75} /></Button>
-    </div>
+  return <main id="study" tabIndex={-1} inert={inert} className="mx-auto flex min-h-0 w-full max-w-[1040px] min-w-0 flex-1 flex-col px-10 pt-3 max-[1024px]:px-6 max-[800px]:px-5 max-[600px]:px-4 max-[600px]:pt-1">
+    {/* The top bar names the Study; the tabs name the page. No title block or description above them. */}
+    <h1 className="sr-only">{studyLabel(page)}</h1>
     <Tabs value={page} onValueChange={(value) => onPage(value as StudyPage)} className="min-h-0 flex-1 gap-0">
-      <TabsList aria-label={t("sections")} className="h-auto w-full justify-start gap-1 overflow-x-auto overflow-y-hidden overscroll-x-contain touch-pan-x rounded-none border-b bg-transparent p-0 [scrollbar-width:none] max-[800px]:pr-8 max-[800px]:[mask-image:linear-gradient(to_right,#000_calc(100%-2.5rem),transparent)]">
-        {STUDY_PAGES.map((value) => <TabsTrigger key={value} value={value}
+      <div className="flex items-center gap-2 border-b">
+      <TabsList aria-label={t("sections")} className="h-auto min-w-0 flex-1 justify-start gap-1 overflow-x-auto overflow-y-hidden overscroll-x-contain touch-pan-x rounded-none bg-transparent p-0 [scrollbar-width:none] max-[800px]:pr-8 max-[800px]:[mask-image:linear-gradient(to_right,#000_calc(100%-2.5rem),transparent)]">
+        {STUDY_PAGES.map((value) => <TabsTrigger key={value} value={value} title={t(INTRO[value], { agent })}
           className="-mb-px h-10 flex-none rounded-none border-0 border-b-2 border-transparent bg-transparent! px-3 text-[13px] font-medium text-muted-foreground shadow-none! hover:text-foreground data-[state=active]:border-primary data-[state=active]:text-foreground dark:data-[state=active]:border-primary">{studyLabel(value)}</TabsTrigger>)}
       </TabsList>
-      <div className="min-h-0 flex-1 overflow-y-auto pt-6 pb-10 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]" role="tabpanel" aria-label={studyLabel(page)}>
+      <Button variant="ghost" size="icon" className="size-8 shrink-0 rounded-lg text-muted-foreground max-[600px]:size-9 pointer-coarse:size-9 hover:bg-foreground/[0.07] [&_svg:not([class*='size-'])]:size-4" aria-label={t("refresh")} title={t("refresh")} onClick={() => setLocal((v) => v + 1)}><RefreshCw strokeWidth={1.75} /></Button>
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto pt-5 pb-10 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]" role="tabpanel" aria-label={studyLabel(page)}>
         {page === "todos" && <Todos reload={key} />}
         {page === "memory" && <Memory reload={key} />}
         {page === "context" && <Context session={session} reload={key} />}

@@ -2859,9 +2859,10 @@ export class SubsessionService {
       const messages = lostMessageNotes(task);
       if (messages.length > 0) {
         for (const { id, note, same } of messages) {
-          // Still held in memory (the queue writes it to the fresh file): a second copy would outlive a withdrawal.
-          if (this.deps.hasPendingNote(task.parentKey, (n) => same(messageNoteNameOf(n)))) continue;
-          step("rewrite lost task message", () => this.deps.queuePendingNote(task.parentKey, note, id));
+          // Still held in memory: written to the fresh file as it is, since a second copy would outlive a withdrawal.
+          step("rewrite lost task message", () => this.deps.hasPendingNote(task.parentKey, (n) => same(messageNoteNameOf(n)))
+            ? this.deps.persistPendingNotes?.(task.parentKey) ?? false
+            : this.deps.queuePendingNote(task.parentKey, note, id));
         }
         woken.add(task.parentKey);
       }

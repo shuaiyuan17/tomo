@@ -155,6 +155,24 @@ describe("sub-sessions through the Agent", () => {
     await agent.stop();
   });
 
+  it("with API-key auth the quota gate ignores a subscription reading left on disk", async () => {
+    const dir = join(mockConfig.tomoHome, "data", "usage");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "limits.ndjson"), JSON.stringify({ v: 1, ts: new Date().toISOString(), source: "oauth-usage",
+      windows: [{ window: "weekly_all", group: "weekly", scoped: false, percent: 95, resetsAt: new Date(Date.now() + 86_400_000).toISOString() }] }) + "\n");
+    const auth = mockConfig.auth.method;
+    mockConfig.auth.method = "api-key";
+    try {
+      const { agent } = await boot();
+      mockSdk.responseFn = () => new Promise(() => {});
+      agent.subsessions!.spawn("dm:alex", { title: "Fix it", brief: "b" });
+      await waitFor(() => expect(taskPrompts("task:s1")).toHaveLength(1));
+      await agent.stop();
+    } finally {
+      mockConfig.auth.method = auth;
+    }
+  });
+
   it("routes a cron fire on a task key to the task, not to a chat", async () => {
     const { agent, channel } = await boot();
     mockSdk.responseFn = () => new Promise(() => {});

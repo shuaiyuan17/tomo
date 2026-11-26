@@ -637,7 +637,8 @@ export class Agent {
       unlinkRegistryEntry: (key) => this.sessions.clearSdkSessionId(key),
       registryTaskKeys: () => this.sessions.listActiveEntries().map((e) => e.channelKey).filter(isTaskSessionKey),
       isStopping: () => this.stopping,
-      quotaReading: () => this.quotaGate.read(),
+      // API-key auth has no subscription windows: any sample on disk is an earlier login's.
+      quotaReading: () => (config.auth.method === "api-key" ? undefined : this.quotaGate.read()),
       freshenQuota: () => this.quotaGate.ensureFresh(),
       mirrorWake: (parentKey) => this.mirrorWake(parentKey),
       messageWake: (parentKey) => this.messageWake(parentKey),

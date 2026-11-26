@@ -132,7 +132,7 @@ function harness(onTurn: H["onTurn"] = () => ({ ok: true }), maxRunning = DEFAUL
     isStopping: () => false,
     hasTurnInFlight: () => h.inFlight,
     closeSession: (key) => { h.closed.push(key); },
-    sessionQuotaPercent: () => h.quota,
+    quotaReading: () => (h.quota === undefined ? undefined : { window: "five_hour" as const, percent: h.quota }),
   });
   // Restart recovery done: the entry points work; dispatch opens with start().
   h.service.recoverAtStartup();

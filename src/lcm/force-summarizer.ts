@@ -2,6 +2,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { tmpdir } from "node:os";
 import { buildSdkEnv } from "../agent/sdk-options.js";
 import { resolveModelName } from "../models.js";
+import { cumulativeModelCounters, type ModelTurnUsage, type SdkResultLike } from "../agent/sdk-result.js";
 import { errorMessage } from "../error-text.js";
 import { log } from "../logger.js";
 import type { StretchForSummary } from "./force-compact.js";
@@ -47,6 +48,8 @@ export interface ForceSummaryUsage {
   numTurns?: number;
   subtype: string;
   model: string;
+  /** The call per model, as the ledger's `models` (see summaryModels); absent when the split does not add up. */
+  models?: Record<string, ModelTurnUsage>;
 }
 
 /** Build the summary function `forceCompactSession` is given. Throws on any failure (the caller falls back to archiving). */
@@ -98,14 +101,17 @@ export function sdkForceSummarizer(opts: ForceSummarizerOptions): (stretch: Stre
       let text = "";
       for await (const msg of q) {
         if (msg.type === "result") {
-          const r = msg as unknown as { total_cost_usd?: number; usage?: Record<string, number>; duration_ms?: number; num_turns?: number; subtype: string };
+          const r = msg as unknown as SdkResultLike & { usage?: Record<string, number> };
           try {
+            const tokens = {
+              input: r.usage?.input_tokens ?? 0, output: r.usage?.output_tokens ?? 0,
+              cacheRead: r.usage?.cache_read_input_tokens ?? 0, cacheCreated: r.usage?.cache_creation_input_tokens ?? 0,
+            };
+            const costUsd = r.total_cost_usd ?? 0;
             opts.onUsage?.({
-              costUsd: r.total_cost_usd ?? 0,
-              tokens: {
-                input: r.usage?.input_tokens ?? 0, output: r.usage?.output_tokens ?? 0,
-                cacheRead: r.usage?.cache_read_input_tokens ?? 0, cacheCreated: r.usage?.cache_creation_input_tokens ?? 0,
-              },
+              costUsd,
+              tokens,
+              models: summaryModels(r, model, tokens, costUsd),
               ...(r.duration_ms !== undefined ? { durationMs: r.duration_ms } : {}),
               ...(r.num_turns !== undefined ? { numTurns: r.num_turns } : {}),
               subtype: r.subtype,
@@ -130,4 +136,27 @@ export function sdkForceSummarizer(opts: ForceSummarizerOptions): (stretch: Stre
       opts.signal?.removeEventListener("abort", onAbort);
     }
   };
+}
+
+/**
+ * The call per model for the ledger. The result's `modelUsage` when its
+ * costs add up to the call's total (a fresh CLI, so its counters are this
+ * call's own); a single model whose cost is missing gets the total; when
+ * there is no `modelUsage`, the whole call goes under the model asked for.
+ * A split that does not add up and cannot be mended is left out (undefined):
+ * the row's cost then shows as unsplit, never as missing from "By model".
+ */
+export function summaryModels(
+  result: SdkResultLike,
+  model: string,
+  tokens: { input: number; output: number; cacheRead: number; cacheCreated: number },
+  costUsd: number,
+): Record<string, ModelTurnUsage> | undefined {
+  const split = cumulativeModelCounters(result);
+  if (!split) return { [model]: { ...tokens, webSearch: 0, costUsd } };
+  const entries = Object.entries(split);
+  const sum = entries.reduce((total, [, m]) => total + m.costUsd, 0);
+  if (Math.abs(sum - costUsd) <= 1e-9 * Math.max(1, costUsd)) return split;
+  if (entries.length === 1) return { [entries[0][0]]: { ...entries[0][1], costUsd } };
+  return undefined;
 }

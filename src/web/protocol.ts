@@ -295,7 +295,8 @@ export const MCP_RECONNECT_RPC_TIMEOUT_MS = 24_000;
  * estimate at API list prices, never a bill. Dates are `YYYY-MM-DD` in
  * `timeZone` (the owner's), whose midnights are the day boundaries.
  */
-export type WebCostCategory = "you" | "background" | "scheduled";
+/** tasks: sub-sessions' own turns plus the turns their owning session ran for them. */
+export type WebCostCategory = "you" | "background" | "scheduled" | "tasks";
 export type WebCostSplit = Record<WebCostCategory, number>;
 export interface WebCostDay {
   date: string;
@@ -321,6 +322,33 @@ export interface WebCostSession {
   turns: number;
   byCategory: WebCostSplit;
 }
+/** One sub-session over the range: its own turns plus what its owning session spent on it. */
+export interface WebCostTask {
+  /** `s3`. */
+  id: string;
+  /** `s3 · title`. */
+  label: string;
+  /** selfCostUsd + relayCostUsd. */
+  costUsd: number;
+  /** The task's own turns (`task:<id>`), its compaction summary calls included. */
+  selfCostUsd: number;
+  /** Turns the owning session ran for this task alone (its report, what it was handed for the owner). */
+  relayCostUsd: number;
+  /** The task's own turns. */
+  turns: number;
+}
+export interface WebCostTasks {
+  /** Costliest first. */
+  list: WebCostTask[];
+  /** Sums over every task in the range: their own turns, and the relay turns tied to one of them. */
+  selfCostUsd: number;
+  relayCostUsd: number;
+  /**
+   * Relay turns tied to no single task: a wake that carried several tasks'
+   * news at once, or rows from before relay turns named their task.
+   */
+  unattributedRelayCostUsd: number;
+}
 export interface WebCostCron {
   /** null: scheduled turns with no job (LCM rollups, nudges, unpaired backfilled cron turns). */
   jobId: string | null;
@@ -339,8 +367,10 @@ export interface WebCostTurn {
   date: string;
   session: { id?: string; label: string; kind: WebCostSession["kind"] };
   category: WebCostCategory;
-  /** The ledger's finer source (owner, group, cron, heartbeat, …). */
+  /** The ledger's finer source (owner, group, cron, heartbeat, task, task-relay, …). */
   source: string;
+  /** task / task-relay: the sub-session the turn was for. */
+  taskId?: string;
   jobName?: string;
   costUsd: number;
   durationMs?: number;
@@ -390,6 +420,8 @@ export interface WebCost {
   days: WebCostDay[];
   hours: WebCostHour[];
   sessions: WebCostSession[];
+  /** The Tasks category, task by task. totals.byCategory.tasks = selfCostUsd + relayCostUsd + unattributedRelayCostUsd. */
+  tasks: WebCostTasks;
   crons: WebCostCron[];
   /** Per model, from rows that carry the split; `unsplitCostUsd` is the rest of the range's cost. */
   models: WebCostModel[];

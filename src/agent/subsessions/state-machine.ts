@@ -13,10 +13,13 @@ import type { SubsessionStatus, WaitingOn } from "./types.js";
  *   (`start`) moves a task to `active`, so the slot cap and (later) the quota
  *   gate apply to every one of them in one place.
  * - THE OWNER IS NEVER QUEUED. A message from the owner (or a relay from the
- *   owning session, which is how the owner answers in Phase 1a) gets its turn
+ *   owning session that carries the owner's own words) gets its turn
  *   whatever the slots say, and wakes a waiting task. A waiting(owner) task
  *   is woken by nothing else: a cron firing there is kept for the owner's
  *   wake ("same"), not a turn of its own.
+ * - The owning session's own note (`note`, no words of the owner's in it) is
+ *   autonomous work: it wakes a task waiting on something external into
+ *   `queued`, never past the slot cap.
  */
 export const SUBSESSION_EVENTS = [
   "start",
@@ -27,6 +30,7 @@ export const SUBSESSION_EVENTS = [
   "reopen",
   "owner_message",
   "relay",
+  "note",
   "cron_wake",
   "background_report",
   "restart",
@@ -74,6 +78,12 @@ export function nextStatus(status: SubsessionStatus, waitingOn: WaitingOn | unde
     case "owner_message":
     case "relay":
       if (waiting) return ACTIVE;
+      return status === "queued" || status === "active" || status === "finished" ? "same" : null;
+    case "note":
+      // A note to a waiting(owner) task is held for the owner's wake before
+      // any transition (relay() appends it held); refused here, so nothing
+      // could append it unheld and let restart recovery end that wait.
+      if (waiting) return waitingOn === "external" ? QUEUED : null;
       return status === "queued" || status === "active" || status === "finished" ? "same" : null;
     case "cron_wake":
       if (waiting) return waitingOn === "external" ? QUEUED : "same";

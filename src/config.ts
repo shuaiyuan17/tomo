@@ -387,6 +387,13 @@ export interface SubsessionConfig {
    * cap. Default 24.
    */
   maxActiveHours: number;
+  /**
+   * A task's own turns (and the mirror's silent turns) pause for the owner
+   * once the fuller of the 5-hour and weekly (all models) quota windows is at
+   * this share used, 0–100. An account with no 5-hour window is gated on the
+   * week alone. Default 85.
+   */
+  quotaPauseAtPct: number;
 }
 
 export const DEFAULT_SUBSESSIONS: SubsessionConfig = {
@@ -399,6 +406,7 @@ export const DEFAULT_SUBSESSIONS: SubsessionConfig = {
   mirror: "turn",
   ownerMessages: "via-main",
   maxActiveHours: 24,
+  quotaPauseAtPct: 85,
 };
 
 // ---------------------------------------------------------------------------
@@ -683,6 +691,7 @@ function parseSubsessionConfig(raw: unknown): SubsessionConfig {
     mirror: validated("subsessions.mirror", z.enum(["turn", "note"]), entry.mirror, DEFAULT_SUBSESSIONS.mirror),
     ownerMessages: validated("subsessions.ownerMessages", z.enum(["via-main", "direct"]), entry.ownerMessages, DEFAULT_SUBSESSIONS.ownerMessages),
     maxActiveHours: validated("subsessions.maxActiveHours", z.number().finite().min(0), entry.maxActiveHours, DEFAULT_SUBSESSIONS.maxActiveHours),
+    quotaPauseAtPct: validated("subsessions.quotaPauseAtPct", z.number().finite().gt(0).max(100), entry.quotaPauseAtPct, DEFAULT_SUBSESSIONS.quotaPauseAtPct),
   };
 }
 

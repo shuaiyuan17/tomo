@@ -8,6 +8,7 @@ export const subsessions = {
   stopped: "[{{id}} · {{title}}] 已停下。让它继续（/s {{id}} …），或者 /s {{id}} stop。",
   activeCap: "[{{id}} · {{title}}] 已暂停：它已经自己跑了 {{hours}} 小时（subsessions.maxActiveHours）。让它继续（/s {{id}} …），或者 /s {{id}} stop。",
   quotaHigh: "[{{id}} · {{title}}] 已暂停：5 小时额度已用 {{percent}}%，先停下给我们的对话留余量。想让它继续就告诉它（/s {{id}} …）。",
+  quotaHighWeekly: "[{{id}} · {{title}}] 已暂停：本周额度（全部模型）已用 {{percent}}%，先停下给我们的对话留余量。想让它继续就告诉它（/s {{id}} …）。",
   withUnanswered_other: "{{notice}}\n\n它还有 {{count}} 条消息没回（主对话里有完整内容）：\n{{list}}",
   selfRestart: "[{{id}} · {{title}}] Tomo 按这个任务自己的要求重启了，所以先暂停。准备好了让它继续（/s {{id}} …）。",
   failedInterrupted: "[{{id}} · {{title}}] 放弃了：连续 {{restarts}} 次被重启打断。还需要的话再说一次。",

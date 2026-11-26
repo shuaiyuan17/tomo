@@ -6,6 +6,7 @@ export const subsessions = {
   stopped: "[{{id}} · {{title}}] Stopped. Tell it to go on (/s {{id}} …), or /s {{id}} stop.",
   activeCap: "[{{id}} · {{title}}] Paused: it has been working on its own for {{hours}} hours (subsessions.maxActiveHours). Tell it to go on (/s {{id}} …), or /s {{id}} stop.",
   quotaHigh: "[{{id}} · {{title}}] Paused: {{percent}}% of the 5-hour usage window is used, so it stops to leave room for our conversation. Tell it to go on when you want it to continue (/s {{id}} …).",
+  quotaHighWeekly: "[{{id}} · {{title}}] Paused: {{percent}}% of this week's usage (all models) is used, so it stops to leave room for our conversation. Tell it to go on when you want it to continue (/s {{id}} …).",
   withUnanswered_one: "{{notice}}\n\nIt never answered this message (the main conversation has it in full):\n{{list}}",
   withUnanswered_other: "{{notice}}\n\nIt never answered {{count}} messages (the main conversation has them all, in full):\n{{list}}",
   selfRestart: "[{{id}} · {{title}}] Tomo restarted at this task's own request, so it is paused. Tell it to go on when you're ready (/s {{id}} …).",

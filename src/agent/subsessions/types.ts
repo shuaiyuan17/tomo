@@ -214,6 +214,11 @@ export interface SubsessionRecord {
   interruptStreak: number;
   /** Failed turns in a row. */
   failStreak: number;
+  /**
+   * The last failed turn's cause, for the notice when the failures pause or
+   * end the task. Kept until a turn completes.
+   */
+  lastFailure?: { at: number; category?: string; refused?: boolean; detail?: string };
   /** Completed turns in a row with no tool call and no progress change. */
   turnsWithoutProgress: number;
   /** The task itself asked for the daemon restart (RestartCoordinator). */

@@ -1,6 +1,6 @@
 import type {
   WebCost, WebCostCategory, WebCostCron, WebCostDay, WebCostGlance, WebCostHour, WebCostLimits, WebCostModel, WebCostPeriod,
-  WebCostSession, WebCostSplit, WebCostTurn,
+  WebCostSession, WebCostSplit, WebCostTask, WebCostTasks, WebCostTurn,
 } from "../web/protocol.js";
 import type { CostRow, LedgerReader } from "./ledger-reader.js";
 import { addDays, daysBetween, localParts } from "./local-time.js";
@@ -27,7 +27,7 @@ export interface CostReportOptions {
   limits?: WebCostLimits | null;
 }
 
-const split = (): WebCostSplit => ({ you: 0, background: 0, scheduled: 0 });
+const split = (): WebCostSplit => ({ you: 0, background: 0, scheduled: 0, tasks: 0 });
 
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
@@ -84,6 +84,13 @@ export function buildCostReport(reader: LedgerReader, options: CostReportOptions
   const sessions = new Map<string, WebCostSession & { key: string }>();
   const crons = new Map<string, WebCostCron>();
   const models = new Map<string, WebCostModel>();
+  const tasks = new Map<string, WebCostTask>();
+  let unattributedRelayCostUsd = 0;
+  const taskAcc = (id: string) => {
+    let task = tasks.get(id);
+    if (!task) tasks.set(id, task = { id, label: options.describeSession(`task:${id}`).label, costUsd: 0, selfCostUsd: 0, relayCostUsd: 0, turns: 0 });
+    return task;
+  };
   const totals = { costUsd: 0, turns: 0, byCategory: split(), overcountedCostUsd: 0 };
   let unsplitCostUsd = 0;
   const top = Math.min(Math.max(options.top ?? DEFAULT_TOP_TURNS, 0), MAX_TOP_TURNS);
@@ -121,6 +128,21 @@ export function buildCostReport(reader: LedgerReader, options: CostReportOptions
       session.costUsd += row.costUsd;
       session.turns++;
       session.byCategory[row.category] += row.costUsd;
+
+      if (row.source === "task" && row.taskId) {
+        const task = taskAcc(row.taskId);
+        task.selfCostUsd += row.costUsd;
+        task.costUsd += row.costUsd;
+        task.turns++;
+      } else if (row.source === "task-relay") {
+        if (row.taskId) {
+          const task = taskAcc(row.taskId);
+          task.relayCostUsd += row.costUsd;
+          task.costUsd += row.costUsd;
+        } else {
+          unattributedRelayCostUsd += row.costUsd;
+        }
+      }
 
       if (row.category === "scheduled") {
         const jobKey = row.source === "cron" && (row.jobId || row.jobName) ? `job:${row.jobId ?? row.jobName}` : "other";
@@ -190,6 +212,7 @@ export function buildCostReport(reader: LedgerReader, options: CostReportOptions
     days: span(from, to),
     hours,
     sessions: [...sessions.values()].sort(byCost).map(({ key: _key, ...s }) => s),
+    tasks: taskTotals([...tasks.values()].sort(byCost), unattributedRelayCostUsd),
     crons: [...crons.values()].sort(byCost),
     models: [...models.values()].sort(byCost),
     unsplitCostUsd,
@@ -200,9 +223,19 @@ export function buildCostReport(reader: LedgerReader, options: CostReportOptions
   };
 }
 
+function taskTotals(list: WebCostTask[], unattributedRelayCostUsd: number): WebCostTasks {
+  return {
+    list,
+    selfCostUsd: list.reduce((sum, t) => sum + t.selfCostUsd, 0),
+    relayCostUsd: list.reduce((sum, t) => sum + t.relayCostUsd, 0),
+    unattributedRelayCostUsd,
+  };
+}
+
 function turnOut(row: CostRow, date: string, session: SessionLabel): WebCostTurn {
   return {
     ts: row.ts, date, session, category: row.category as WebCostCategory, source: row.source,
+    ...(row.taskId ? { taskId: row.taskId } : {}),
     ...(row.jobName ? { jobName: row.jobName } : {}),
     costUsd: row.costUsd,
     ...(row.durationMs !== undefined ? { durationMs: row.durationMs } : {}),

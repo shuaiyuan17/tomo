@@ -5,6 +5,7 @@ import { ownerT, type OwnerText } from "../../i18n/index.js";
 import type { SubsessionConfig } from "../../config.js";
 import { isTaskSessionKey } from "../../sessions/keys.js";
 import { appendToTomoEventBody, formatTomoEvent } from "../../tomo-event.js";
+import type { QuotaGateReading } from "../../usage/limits-log.js";
 import { MODEL_ALIASES } from "../../models.js";
 import { SubsessionStoreError, type SubsessionStore, type TransitionOptions, type TransitionOutcome } from "./store.js";
 import type { SubsessionEvent } from "./state-machine.js";
@@ -22,6 +23,7 @@ import {
   formatStartEvent,
 } from "./prompt.js";
 import type { OwnerTurnMessage } from "../audience.js";
+import { classifyFailure, failureDetail, failureHint, type TurnFailure } from "./failure.js";
 import { OPEN_STATUSES, OWNER_ACTION_MAX, OWNER_MESSAGE_MARKER, PENDING_INPUT_MAX, PENDING_INPUT_OWNER_RESERVE, needsOwner, reportNumber, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, STEP_RESULT_MAX, TERMINAL_STATUSES, oneLine, type SubsessionPlanStep, activeTotalMs, appendInput, HARNESS, type InputOrigin, lastInputSeq, type SubsessionConversationEntry, type SubsessionInput, type SubsessionRecord, type SubsessionStatus } from "./types.js";
 
 
@@ -47,6 +49,8 @@ export interface TaskTurnOutcome {
    * possibly seen) and the next turn answers again.
    */
   answerUndelivered?: boolean;
+  /** A failed turn: what it left of why (see ./failure.ts). */
+  failure?: TurnFailure;
 }
 
 /** Where a task's outward message landed: provider ids, for reply threading. */
@@ -117,8 +121,13 @@ export interface SubsessionServiceDeps {
   persistPendingNotes?(key: string): boolean;
   /** A harness notice to the owner's own chat (no task to attribute it to). `false`: it could not be sent (no reachable DM). */
   noticeOwner(text: OwnerText): Promise<boolean | void>;
-  /** A silent turn on the owning session that reads the notes queued for it. */
-  wakeScope(parentKey: string, prompt: string): void;
+  /** The owner's own main session key (where notices about sub-sessions as a whole go, ownerMessages "via-main"). */
+  ownerKey?(): string | undefined;
+  /**
+   * A silent turn on the owning session that reads the notes queued for it.
+   * `taskId`: the task it is for, so the Cost page charges the turn to it.
+   */
+  wakeScope(parentKey: string, prompt: string, taskId?: string): void;
   /** The last turn's context reading on a key, if any. */
   contextUsage(key: string): { used: number; estimated: boolean } | undefined;
   /** Enabled cron jobs that deliver to `key`; undefined when the cron store cannot be read (unknown, not zero). */
@@ -142,11 +151,18 @@ export interface SubsessionServiceDeps {
   registryTaskKeys(): string[];
   isStopping(): boolean;
   /**
-   * The newest reading of the subscription's 5-hour window, 0–100; undefined
-   * when there is none (no quota samples yet, API-key auth). Throws when the
-   * samples cannot be read: the gate then lets the turn run (fail open).
+   * What the quota gate reads: the fuller of the subscription's 5-hour and
+   * weekly windows (`readQuotaGateReading`), 0–100; undefined when neither is
+   * known (no quota samples yet, API-key auth). Throws when the samples
+   * cannot be read: the gate then lets the turn run (fail open).
    */
-  sessionQuotaPercent?(): number | undefined;
+  quotaReading?(): QuotaGateReading | undefined;
+  /**
+   * Before a task's own turn is gated: take a fresh usage reading when the
+   * last one is stale, waiting a bounded time (QuotaGateReader.ensureFresh).
+   * Never rejects.
+   */
+  freshenQuota?(): Promise<void>;
   now?(): number;
   /**
    * mirror "turn": a silent turn on the owning session, which takes the
@@ -198,8 +214,8 @@ export const REPORT_RETRY_MAX = 5;
 export const SETTLE_RETRY_MS = 60_000;
 /** Turns held while the session registry cannot be read: how soon it is looked at again. */
 export const REGISTRY_RECHECK_MS = 60_000;
-/** At this share of the 5-hour window, a task's own turns pause for the owner. */
-export const QUOTA_PAUSE_PERCENT = 80;
+/** Default of `subsessions.quotaPauseAtPct`: at this share of the fuller quota window, a task's own turns pause for the owner. */
+export const QUOTA_PAUSE_PERCENT = 85;
 /** How much of each unanswered message a failure notice quotes. */
 const UNANSWERED_EXCERPT = 300;
 const UNANSWERED_MAX = 5;
@@ -333,6 +349,59 @@ function formatMessageNote(record: SubsessionRecord, kind: SpeakKind, body: stri
     ? ["", "Its previous turn did not complete and this one runs again: this may repeat something it already handed you. Don't tell the owner the same thing twice."]
     : [];
   return formatTomoEvent("subsession-message", [head, body, "", tail, ...repeat].join("\n"), { name });
+}
+
+/** Why the harness gives a notice, for the owning session's note. */
+interface NoticeCause {
+  /** A short machine-readable kind (no_progress, turns_failing, quota, …). */
+  kind: string;
+  reason: string;
+  /** The failed turns' cause (category, error text), when the notice is about failures. */
+  failure?: { category?: string; refused?: boolean; detail?: string };
+  /** The task has ended (failed): nothing resumes it. */
+  ended?: boolean;
+  /** The task is finished; a message to it reopens it. */
+  finished?: boolean;
+  /** More for the session, appended as is. */
+  detail?: string;
+}
+
+const NO_SESSION_CAUSE: NoticeCause = { kind: "conversation_lost", reason: "its conversation could not be found, and starting over could repeat what it already did", ended: true };
+const INPUT_FULL_CAUSE: NoticeCause = { kind: "input_full", reason: "a scheduled check-back was dropped: too many messages are already waiting for it" };
+
+/**
+ * A notice note's name: the task (or "subsessions"), the kind "notice", the
+ * occurrence, and a digest of its words. A task's notice is one event each
+ * time (two check-backs dropped are two notes): it is always queued, and
+ * `occurrence` only labels it. A notice about the list itself, said again at
+ * each start while it holds, is 0 and matched by name: the same one still
+ * unread is not handed over twice.
+ */
+function noticeNoteName(id: string | undefined, notice: string, cause: NoticeCause, occurrence: number): string {
+  return `${id ?? "subsessions"}:notice:${occurrence}:${createHash("sha256").update(`${notice}\n${JSON.stringify(cause)}`).digest("hex").slice(0, 16)}`;
+}
+
+/** A harness notice, handed to the owning session instead of the owner's chat (ownerMessages "via-main"). */
+function formatNoticeNote(notice: string, cause: NoticeCause, name: string, record?: SubsessionRecord): string {
+  const lines: string[] = [];
+  if (record) {
+    const id = record.id;
+    lines.push(`The harness has news about sub-session ${id} ("${record.title}") and hands it to you instead of the owner's chat:`, notice, "");
+    lines.push(`Why: ${cause.reason} (kind: ${cause.kind}).`);
+    if (cause.failure) {
+      const category = cause.failure.category;
+      lines.push(`Failure category: ${category ?? "unknown"}${cause.failure.detail ? ` (last error: ${cause.failure.detail})` : ""}.`, failureHint(category, cause.failure.refused === true));
+    }
+    if (cause.detail) lines.push("", cause.detail);
+    lines.push("");
+    if (cause.ended) lines.push(`It has ended; nothing resumes it. If the work is still needed, start it again with task_spawn. task_status ${id} shows what it did.`);
+    else if (cause.finished) lines.push(`task_message ${id} reopens it with what you write (the owner can also write /s ${id} …). task_status ${id} shows its record.`);
+    else lines.push(`To go on: task_message ${id} with what it should do (the owner can also write /s ${id} …). To end it: task_cancel ${id}. task_status ${id} shows its plan and steps.`);
+  } else {
+    lines.push("The harness has news about the sub-sessions and hands it to you instead of the owner's chat:", notice, "", `Why: ${cause.reason}.`, "Any /s command it names is the owner's to send.");
+  }
+  lines.push("Decide whether, when and how the owner hears it (send_message, in your own words). Nothing else tells them.");
+  return formatTomoEvent("subsession-message", lines.join("\n"), { name });
 }
 
 /**
@@ -694,8 +763,10 @@ export class SubsessionService {
       ? { from: "owner", words: ownerMessages.map((m) => m.text).join("\n\n") }
       : { from: "main", words: text };
     // Framed as the answer to the question the main session put to the owner;
-    // a question the task sent the owner directly was not put by it.
-    return this.deliverInput(id, "relay", (r) => formatRelayEvent(text, r.askViaMain && !r.askViaMain.direct ? r.askViaMain.text : undefined, ownerMessages), origin);
+    // a question the task sent the owner directly was not put by it. A note
+    // with none of the owner's words is the session's own (autonomous) work:
+    // it queues a task waiting on something external, never past the cap.
+    return this.deliverInput(id, ownerMessages.length > 0 ? "relay" : "note", (r) => formatRelayEvent(text, r.askViaMain && !r.askViaMain.direct ? r.askViaMain.text : undefined, ownerMessages), origin);
   }
 
   /** relay() of a note alone to a task waiting for the owner: kept for the owner's wake ("answer" to a recorded question, else "paused"); undefined when the task is not waiting for the owner. */
@@ -1415,7 +1486,7 @@ export class SubsessionService {
         const now = this.safeGet(record.id);
         return now ? this.deferCheckBack(now, prompt, depth + 1) : false;
       }
-      if (outcome.refused) this.tellScope(record, ownerT("subsessions")("inputFull", { id: record.id, title: record.title, max: PENDING_INPUT_MAX }));
+      if (outcome.refused) this.tellScope(record, ownerT("subsessions")("inputFull", { id: record.id, title: record.title, max: PENDING_INPUT_MAX }), INPUT_FULL_CAUSE);
       return false;
     }
     if (outcome.record.status === "queued") this.schedule();
@@ -1448,7 +1519,7 @@ export class SubsessionService {
     });
     if (!outcome.ok) {
       if (outcome.refused && outcome.refused !== "no longer waiting for the owner") {
-        this.tellScope(record, ownerT("subsessions")("inputFull", { id: record.id, title: record.title, max: PENDING_INPUT_MAX - PENDING_INPUT_OWNER_RESERVE }));
+        this.tellScope(record, ownerT("subsessions")("inputFull", { id: record.id, title: record.title, max: PENDING_INPUT_MAX - PENDING_INPUT_OWNER_RESERVE }), INPUT_FULL_CAUSE);
         return false;
       }
       // No longer waiting for the owner (the guard, or the status moved
@@ -1739,13 +1810,15 @@ export class SubsessionService {
             r.heldThrough = lastInputSeq(r);
           },
         });
-        if (outcome.ok && outcome.changed) this.tellScope(outcome.record, ownerT("subsessions")("selfRestart", { id: task.id, title: task.title }));
+        if (outcome.ok && outcome.changed) this.tellScope(outcome.record, ownerT("subsessions")("selfRestart", { id: task.id, title: task.title }),
+          { kind: "self_restart", reason: "Tomo restarted at its own request, so it is paused" });
         continue;
       }
       if (task.status === "active" || cutShortWaiting) {
         if (task.interruptStreak + 1 > MAX_INTERRUPT_STREAK) {
           const failed = this.transition(task.id, "fail", { reason: `interrupted by ${MAX_INTERRUPT_STREAK + 1} restarts in a row`, expectFrom: [task.status] });
-          if (failed.ok && failed.changed) this.reportFailure(failed.record, ownerT("subsessions")("failedInterrupted", { id: task.id, title: task.title, restarts: MAX_INTERRUPT_STREAK + 1 }));
+          if (failed.ok && failed.changed) this.reportFailure(failed.record, ownerT("subsessions")("failedInterrupted", { id: task.id, title: task.title, restarts: MAX_INTERRUPT_STREAK + 1 }),
+            { kind: "interrupted_by_restarts", reason: `restarts cut it short ${MAX_INTERRUPT_STREAK + 1} times in a row`, ended: true });
           continue;
         }
         if (cutShortWaiting) log.warn({ id: task.id, inputs: task.pendingInput.length }, "Sub-session's last turn was cut short while it waited; resuming it");
@@ -1829,7 +1902,10 @@ export class SubsessionService {
     // disk by a withdrawal that could not be written (the wait ended, or
     // never began) is taken back now.
     const standing = new Set(this.store.list().map((t) => t.askViaMain?.note).filter((n): n is string => !!n));
-    for (const parentKey of new Set(this.store.list().map((t) => t.parentKey))) {
+    // The owner's session too: a notice about sub-sessions as a whole has no task.
+    let ownerKey: string | undefined;
+    try { ownerKey = this.deps.ownerKey?.(); } catch { ownerKey = undefined; }
+    for (const parentKey of new Set([...this.store.list().map((t) => t.parentKey), ...(ownerKey ? [ownerKey] : [])])) {
       this.safely(() => {
         while (this.withdrawMessageNote(parentKey, (n) => { const ask = askNoteName(n); return ask !== undefined && !standing.has(ask); })) { /* next */ }
       }, "take back stale question notes");
@@ -1853,7 +1929,7 @@ export class SubsessionService {
           // without its conversation: it cannot resume, and starting it over
           // without that history could repeat what it did.
           const failed = this.transition(task.id, "fail", { reason: "its conversation could not be found after a restart" });
-          if (failed.ok) this.reportFailure(failed.record, ownerT("subsessions")("failedNoSession", { id: task.id, title: task.title }));
+          if (failed.ok) this.reportFailure(failed.record, ownerT("subsessions")("failedNoSession", { id: task.id, title: task.title }), NO_SESSION_CAUSE);
           continue;
         }
         // No turn of it ever completed. If its first turn was cut short, the
@@ -2017,11 +2093,12 @@ export class SubsessionService {
     const queued = tasks.filter((t) => t.status === "queued")
       .sort((a, b) => Number(b.resumeNeeded) - Number(a.resumeNeeded) || a.createdAt - b.createdAt);
     const max = this.deps.config().maxRunning;
-    // A queued task holding a message the owner wrote to it never waits for
-    // a slot. Read from the table, so a start that failed, or that a restart
-    // cut off, is made here the next time the scheduler runs.
+    // A queued task holding the owner's own words (a message they wrote to
+    // it, or a relay with theirs attached) never waits for a slot. Read from
+    // the table, so a start that failed, or that a restart cut off, is made
+    // here the next time the scheduler runs.
     for (const task of queued) {
-      if (!task.pendingInput.some(isOwnerMessageInput)) continue;
+      if (!task.pendingInput.some(isOwnerInput)) continue;
       try {
         if (this.startTask(task.id, "the owner wrote to it")) active += 1;
       } catch (err) {
@@ -2107,7 +2184,7 @@ export class SubsessionService {
     }
     if (record.startDelivered && !this.deps.hasSdkSession(record.sessionKey)) {
       const failed = this.transition(record.id, "fail", { reason: "its conversation could not be found" });
-      if (failed.ok) this.reportFailure(failed.record, ownerT("subsessions")("failedNoSession", { id: record.id, title: record.title }));
+      if (failed.ok) this.reportFailure(failed.record, ownerT("subsessions")("failedNoSession", { id: record.id, title: record.title }), NO_SESSION_CAUSE);
       return "failed";
     }
     return "run";
@@ -2141,14 +2218,14 @@ export class SubsessionService {
 
   private deliverInput(
     id: string,
-    event: Extract<SubsessionEvent, "relay" | "owner_message">,
+    event: Extract<SubsessionEvent, "relay" | "note" | "owner_message">,
     prompt: string | ((record: SubsessionRecord) => string),
     origin: InputOrigin,
     extra?: (record: SubsessionRecord) => void,
   ): TransitionOutcome {
     const now = this.now();
     const outcome = this.transition(id, event, {
-      reason: event === "relay" ? "a message from the main session" : "a message from the owner",
+      reason: event === "owner_message" ? "a message from the owner" : "a message from the main session",
       // A task waiting on the owner always takes their word, even past the
       // limit: only it wakes the task, which then works the queue down.
       guard: (r) => (origin.from === "owner" && r.status === "waiting" && r.waitingOn === "owner" ? undefined : inputQueueFull(r)),
@@ -2165,23 +2242,27 @@ export class SubsessionService {
       this.kick(id);
       return outcome;
     }
-    // Queued: a relay waits for its slot and goes with the first turn. The
-    // owner's message never waits for a slot: it starts the task, like
+    // Queued: the main session's own note waits for its slot and goes with
+    // the first turn (a note that woke a waiting task asks the scheduler for
+    // one now). The owner's words never wait for a slot, whether they came as
+    // a message or attached to a relay: they start the task, like
     // `/s <id> start`.
-    if (event === "owner_message") {
-      try {
-        this.startTask(id, "the owner wrote to it");
-      } catch (err) {
-        // The message is on the task already: it must not be reported as
-        // undelivered (the caller would hand it to the owning session too).
-        // The scheduler starts it from the table at the next recheck (and
-        // after a restart), past the slot cap.
-        log.error({ err, id }, "Could not start a queued sub-session for the owner's message; trying again shortly");
-        this.armRegistryRecheck();
-      }
-      return { ...outcome, record: this.safeGet(id) ?? outcome.record };
+    if (origin.from !== "owner") {
+      // The note is on the task already: a failed start must not fail its delivery.
+      if (outcome.changed) this.safely(() => this.schedule(), "schedule after a note");
+      return outcome;
     }
-    return outcome;
+    try {
+      this.startTask(id, "the owner wrote to it");
+    } catch (err) {
+      // The message is on the task already: it must not be reported as
+      // undelivered (the caller would hand it to the owning session too).
+      // The scheduler starts it from the table at the next recheck (and
+      // after a restart), past the slot cap.
+      log.error({ err, id }, "Could not start a queued sub-session for the owner's message; trying again shortly");
+      this.armRegistryRecheck();
+    }
+    return { ...outcome, record: this.safeGet(id) ?? outcome.record };
   }
 
   /** Run the task's driver unless one is running. */
@@ -2189,13 +2270,24 @@ export class SubsessionService {
     // Closed until start(): start() kicks every task with a turn owed.
     if (!this.open || this.driving.has(id) || this.settleTimers.has(id) || this.registryHeld.has(id) || this.deps.isStopping()) return;
     this.driving.add(id);
+    let threw = false;
     void this.drive(id)
-      .catch((err) => log.error({ err, id }, "Sub-session driver failed"))
+      .catch((err) => {
+        threw = true;
+        log.error({ err, id }, "Sub-session driver failed; trying it again later");
+      })
       .finally(() => {
         this.driving.delete(id);
-        // Input that arrived while the last turn was ending.
-        const record = this.safeGet(id);
-        if (record && record.status !== "queued" && !TERMINAL_STATUSES.has(record.status) && this.plan(record)) this.kick(id);
+        // A driver that threw leaves its turn owed. Asked again by the retry
+        // timer, never at once: a failure that persists (a table that reads
+        // but will not write) would otherwise re-run it in a loop, before
+        // anything else (a timer, I/O, any channel) gets to run.
+        if (threw) this.retryAfterSettleFailure(id);
+        else {
+          // Input that arrived while the last turn was ending.
+          const record = this.safeGet(id);
+          if (record && record.status !== "queued" && !TERMINAL_STATUSES.has(record.status) && this.plan(record)) this.kick(id);
+        }
         this.schedule();
       });
   }
@@ -2203,6 +2295,12 @@ export class SubsessionService {
   private async drive(id: string): Promise<void> {
     for (;;) {
       if (this.deps.isStopping()) return;
+      // The quota gate below decides on the newest usage reading: make it a
+      // current one first (a no-op while it is, bounded when it is not).
+      if (this.deps.freshenQuota) {
+        try { await this.deps.freshenQuota(); } catch (err) { log.warn({ err }, "Quota reading refresh failed; the gate decides on what it has"); }
+        if (this.deps.isStopping()) return;
+      }
       const record = this.safeGet(id);
       if (!record || record.status === "queued" || TERMINAL_STATUSES.has(record.status)) return;
       const turn = this.plan(record);
@@ -2398,6 +2496,7 @@ export class SubsessionService {
         }
         if (!keep) {
           r.failStreak = 0;
+          r.lastFailure = undefined;
           r.pendingInput = r.pendingInput.filter((i) => i.seq > turn.throughSeq);
           // The turn ended waiting for the owner (task_ask) and input landed
           // after the wait began (a check-back, a note): it waits for their
@@ -2406,6 +2505,13 @@ export class SubsessionService {
           if (r.status === "waiting" && r.waitingOn === "owner" && r.pendingInput.length > 0) r.heldThrough = Math.max(r.heldThrough ?? 0, lastInputSeq(r));
         } else {
           r.failStreak += 1;
+          if (!outcome.ok && !outcome.stopped) {
+            const { category, refused } = classifyFailure(outcome.failure);
+            const detail = failureDetail(outcome.failure);
+            r.lastFailure = { at: this.now(), ...(category ? { category } : {}), ...(refused ? { refused } : {}), ...(detail ? { detail } : {}) };
+          } else if (outcome.ok) {
+            r.lastFailure = { at: this.now(), category: "answer_undelivered", detail: "its answer to the owner could not be delivered" };
+          }
           // They stay first in line, marked as possibly seen: the turn may
           // have acted on part of them.
           r.seenThrough = Math.max(r.seenThrough, turn.throughSeq);
@@ -2465,11 +2571,11 @@ export class SubsessionService {
     const newInput = (why: string) => (r: SubsessionRecord) => (r.pendingInput.some((i) => i.seq > carried) ? why : undefined);
     if (keep) {
       if (stopped) {
-        this.pause(record, "stopped by the owner", ownerT("subsessions")("stopped", { id: record.id, title: record.title }),
+        this.pause(record, { kind: "stopped_by_owner", reason: "stopped by the owner" }, ownerT("subsessions")("stopped", { id: record.id, title: record.title }),
           newInput("new input arrived during the stopped turn"));
       } else if (record.failStreak >= MAX_FAIL_STREAK) {
         // A failed turn's own inputs are still pending, and stay for the wake.
-        this.pause(record, "its turns keep failing", ownerT("subsessions")("failing", { id: record.id, title: record.title }),
+        this.pause(record, { kind: "turns_failing", reason: "its turns keep failing", failure: true }, ownerT("subsessions")("failing", { id: record.id, title: record.title }),
           newInput("new input arrived during the failed turn"));
       }
       return;
@@ -2516,7 +2622,7 @@ export class SubsessionService {
       const streak = progressed ? 0 : record.turnsWithoutProgress + 1;
       this.store.update(id, (r) => { r.turnsWithoutProgress = streak; });
       if (streak >= MAX_TURNS_WITHOUT_PROGRESS) {
-        this.pause(record, `${streak} turns in a row without progress`, ownerT("subsessions")("stuck", { id: record.id, title: record.title, turns: streak }), hasPendingInput);
+        this.pause(record, { kind: "no_progress", reason: `${streak} turns in a row without progress` }, ownerT("subsessions")("stuck", { id: record.id, title: record.title, turns: streak }), hasPendingInput);
       }
     }
   }
@@ -2528,13 +2634,19 @@ export class SubsessionService {
    * and is woken, so it can tell the owner or answer them itself.
    */
   private handOverUnanswered(record: SubsessionRecord, texts: string[]): void {
+    const notice = ownerT("subsessions")("finishedUnanswered", { id: record.id, title: record.title });
+    const cause: NoticeCause = { kind: "finished_unanswered", reason: "it is finished and could not answer what it was sent (it was stopped, or its turns kept failing)", finished: true,
+      detail: `The task keeps these messages and gets them again with the owner's next message to it. Answer the owner yourself if you can, or tell them the task will get them when they next write to it. What it was sent:\n\n${texts.join("\n\n")}` };
+    // ownerMessages "via-main": one pinned note carries the notice and the
+    // messages (and its wake); the separate note below is the direct mode's.
+    if (this.viaMain() && this.noticeToMain(record.parentKey, notice, cause, record)) return;
     this.deps.queuePendingNote(record.parentKey, formatTomoEvent("subsession-unanswered",
       `Sub-session ${record.id} ("${record.title}") is finished and could not answer what it was sent (it was stopped, or its turns kept failing). The task keeps these messages and gets them again with the owner's next message to it. What it was sent:\n\n${texts.join("\n\n")}`,
       { name: record.id }));
     this.outward(() => this.deps.wakeScope(record.parentKey, formatTomoEvent("subsession-unanswered",
       "A finished sub-session could not answer what it was sent; the messages are in a note above. Answer the owner yourself if you can, or tell them the task will get the messages again when they next write to it.",
-      { name: "check" })));
-    this.tellScope(record, ownerT("subsessions")("finishedUnanswered", { id: record.id, title: record.title }));
+      { name: "check" }), record.id));
+    this.tellDirect(record, notice);
   }
 
   /** The result could not be written: no turn for this task until a timer gives it one. */
@@ -2556,10 +2668,11 @@ export class SubsessionService {
    */
   private pause(
     record: SubsessionRecord,
-    reason: string,
+    why: { kind: string; reason: string; failure?: boolean },
     notice: OwnerText,
     guard?: (r: SubsessionRecord) => string | undefined,
   ): boolean {
+    const reason = why.reason;
     const outcome = this.transition(record.id, "stuck", {
       reason,
       expectFrom: ["active"],
@@ -2570,7 +2683,10 @@ export class SubsessionService {
     });
     if (outcome.ok) {
       this.continueOwed.delete(record.id);
-      this.tellScope(outcome.record, notice);
+      this.tellScope(outcome.record, notice, {
+        kind: why.kind, reason,
+        ...(why.failure ? { failure: outcome.record.lastFailure ?? {} } : {}),
+      });
     }
     this.schedule();
     return outcome.ok;
@@ -2650,14 +2766,14 @@ export class SubsessionService {
   }
 
   /**
-   * May a mirror turn run now? Not while the 5-hour window is at the quota
+   * May a mirror turn run now? Not while the quota window is at the quota
    * pause. Asked when the wake is queued AND when it runs (the window can
    * fill while it waits behind the session's other turns).
    */
   mirrorTurnAllowed(): boolean {
-    const percent = this.quotaPercent();
-    if (percent !== undefined && percent >= QUOTA_PAUSE_PERCENT) {
-      log.debug({ percent }, "Quota window nearly used; the mirror waits for the owning session's next turn");
+    const reading = this.quotaAtPause();
+    if (reading) {
+      log.debug({ window: reading.window, percent: reading.percent }, "Quota window nearly used; the mirror waits for the owning session's next turn");
       return false;
     }
     return true;
@@ -2926,7 +3042,7 @@ export class SubsessionService {
   private wakeForReport(record: SubsessionRecord): void {
     this.outward(() => this.deps.wakeScope(record.parentKey, formatTomoEvent("subsession-report",
       "A sub-session finished; its report is in a note above. Tell the owner the result in a few lines, in your own words, and read the full report with task_status if they will want details. Decide what, if anything, belongs in memory.",
-      { name: "check" })));
+      { name: "check" }), record.id));
   }
 
   /** The report note could not be written: try again in-process, a few times, then on the next start. */
@@ -2966,14 +3082,14 @@ export class SubsessionService {
    * answered: the notice hands that back (the record, and those inputs with
    * it, is forgotten 30 days on).
    */
-  private reportFailure(record: SubsessionRecord, notice: OwnerText): void {
+  private reportFailure(record: SubsessionRecord, notice: OwnerText, cause: NoticeCause): void {
     const unanswered = record.pendingInput.filter(isOwnerInput);
     if (unanswered.length === 0) {
-      this.tellScope(record, notice);
+      this.tellScope(record, notice, cause);
       return;
     }
     const list = unanswered.slice(0, UNANSWERED_MAX).map((i) => `• ${truncate((i.words ?? i.text).trim(), UNANSWERED_EXCERPT)}`).join("\n");
-    this.tellScope(record, ownerT("subsessions")("withUnanswered", { notice, count: unanswered.length, list }));
+    this.tellScope(record, ownerT("subsessions")("withUnanswered", { notice, count: unanswered.length, list }), cause);
     this.handBack(record);
   }
 
@@ -3004,8 +3120,8 @@ export class SubsessionService {
 
   /**
    * A turn the task gives itself (no owner input in it) is held when it has
-   * been active on its own past `maxActiveHours`, or when the 5-hour window
-   * is at QUOTA_PAUSE_PERCENT or more: it pauses for the owner (one notice),
+   * been active on its own past `maxActiveHours`, or when the 5-hour or the
+   * weekly window is at `quotaPauseAtPct` or more: it pauses for the owner (one notice),
    * whose word wakes it. "again": the pause was refused (the owner's input
    * just landed): plan the turn afresh.
    */
@@ -3019,26 +3135,41 @@ export class SubsessionService {
       const ownMs = activeTotalMs(record, this.now()) - (record.activeAtOwnerInputMs ?? 0);
       if (ownMs >= capHours * 3_600_000) {
         log.info({ id: record.id, ownMs, capHours }, "Sub-session over its wall-clock cap; pausing for the owner");
-        return this.pause(record, `active ${capHours}h on its own (subsessions.maxActiveHours)`,
+        return this.pause(record, { kind: "active_hours_cap", reason: `active ${capHours}h on its own (subsessions.maxActiveHours)` },
           ownerT("subsessions")("activeCap", { id: record.id, title: record.title, hours: capHours }), hasOwnerInput) ? "paused" : "again";
       }
     }
-    const percent = this.quotaPercent();
-    if (percent !== undefined && percent >= QUOTA_PAUSE_PERCENT) {
-      log.info({ id: record.id, percent }, "5-hour quota window nearly used; pausing a sub-session for the owner");
-      return this.pause(record, `the 5-hour quota window is at ${Math.round(percent)}%`,
-        ownerT("subsessions")("quotaHigh", { id: record.id, title: record.title, percent: Math.round(percent) }), hasOwnerInput) ? "paused" : "again";
+    const reading = this.quotaAtPause();
+    if (reading) {
+      const percent = Math.round(reading.percent);
+      const threshold = this.quotaPausePercent();
+      log.info({ id: record.id, window: reading.window, percent: reading.percent, threshold }, "Quota window nearly used; pausing a sub-session for the owner");
+      const windowName = reading.window === "weekly" ? "weekly (all models)" : "5-hour";
+      const vars = { id: record.id, title: record.title, percent };
+      const notice = reading.window === "weekly" ? ownerT("subsessions")("quotaHighWeekly", vars) : ownerT("subsessions")("quotaHigh", vars);
+      return this.pause(record, { kind: "quota", reason: `the ${windowName} quota window is at ${percent}% (pauses at ${threshold}%, subsessions.quotaPauseAtPct)` },
+        notice, hasOwnerInput) ? "paused" : "again";
     }
     return "run";
   }
 
-  /** The 5-hour window's share used, or undefined: none known, or unreadable (fail open, logged). */
-  private quotaPercent(): number | undefined {
-    if (!this.deps.sessionQuotaPercent) return undefined;
+  private quotaPausePercent(): number {
+    return this.deps.config().quotaPauseAtPct ?? QUOTA_PAUSE_PERCENT;
+  }
+
+  /** The quota reading when it is at the pause threshold or over; undefined below it, unknown or unreadable. */
+  private quotaAtPause(): QuotaGateReading | undefined {
+    const reading = this.quotaReading();
+    return reading && reading.percent >= this.quotaPausePercent() ? reading : undefined;
+  }
+
+  /** The fuller quota window's share used, or undefined: none known, or unreadable (fail open, logged). */
+  private quotaReading(): QuotaGateReading | undefined {
+    if (!this.deps.quotaReading) return undefined;
     try {
-      const percent = this.deps.sessionQuotaPercent();
+      const reading = this.deps.quotaReading();
       this.quotaReadFailing = false;
-      return percent;
+      return reading;
     } catch (err) {
       if (!this.quotaReadFailing) log.warn({ err }, "Could not read the quota samples; sub-session turns are not held for quota");
       else log.debug({ err }, "Quota samples still unreadable");
@@ -3047,16 +3178,83 @@ export class SubsessionService {
     }
   }
 
-  /** A harness notice to the owner, and a note so the owning session knows it was said. */
-  private tellScope(record: SubsessionRecord, notice: OwnerText): void {
+  private noticeSeq = 0;
+
+  /** Strictly increasing within the process; a label only (a task's notice note is never matched by name). */
+  private nextNoticeOccurrence(): number {
+    this.noticeSeq = Math.max(this.noticeSeq + 1, this.now());
+    return this.noticeSeq;
+  }
+
+  private viaMain(): boolean {
+    return this.deps.config().ownerMessages !== "direct";
+  }
+
+  /**
+   * A harness notice about a task. ownerMessages "via-main": handed to the
+   * owning session (record.parentKey: a group's task to that group, never the
+   * owner's DM) as a pinned note with a wake, which decides whether and how
+   * the owner hears it; only when that note cannot be saved does it go
+   * straight to the chat, so it is never lost. "direct": to the chat, as before.
+   */
+  private tellScope(record: SubsessionRecord, notice: OwnerText, cause: NoticeCause): void {
+    if (this.viaMain() && this.noticeToMain(record.parentKey, notice, cause, record)) return;
+    this.tellDirect(record, notice);
+  }
+
+  /**
+   * The notice as a PINNED `subsession-message` note on `key` (never dropped
+   * by the note cap, kept across a restart, which wakes for it again), and a
+   * merged silent wake there. Named by the task and the notice's words: the
+   * same notice while the first is still unread adds nothing. False when it
+   * could not be saved (or nothing would wake for it): the caller sends it
+   * straight to the chat instead.
+   */
+  private noticeToMain(key: string, notice: OwnerText, cause: NoticeCause, record?: SubsessionRecord): boolean {
+    if (!this.deps.messageWake) return false;
+    const name = noticeNoteName(record?.id, notice, cause, record ? this.nextNoticeOccurrence() : 0);
+    let saved = false;
+    try {
+      // Only a notice about the list itself is ever said twice (at each start
+      // while it holds); a task's notice is one event each time, never matched.
+      saved = (!record && this.deps.hasPendingNote(key, (n) => messageNoteNameOf(n) === name))
+        || this.deps.queuePendingNote(key, formatNoticeNote(notice, cause, name, record));
+    } catch (err) {
+      log.error({ err, id: record?.id }, "Could not queue a sub-session notice for the main session; sending it to the chat");
+    }
+    if (!saved) {
+      log.warn({ id: record?.id, kind: cause.kind }, "Sub-session notice could not be handed to the main session; sending it to the chat");
+      this.withdrawMessageNote(key, (n) => messageNoteNameOf(n) === name);
+      return false;
+    }
+    this.wakeForMessages(key);
+    return true;
+  }
+
+  /** A harness notice to the owner's chat, and a note so the owning session knows it was said. */
+  private tellDirect(record: SubsessionRecord, notice: OwnerText): void {
     this.deps.queuePendingNote(record.parentKey, formatTomoEvent("subsession-activity",
       `The harness told the owner about sub-session ${record.id} ("${record.title}"): ${truncate(notice, ACTIVITY_NOTE_EXCERPT)}`,
       { name: record.id }));
     this.outward(() => { void this.deps.noticeToScope(record.parentKey, notice).catch((err) => log.warn({ err, id: record.id }, "Sub-session notice failed")); });
   }
 
-  /** `sent`: called once the notice has gone out (not when it could not be sent, or failed). */
+  /**
+   * A notice about sub-sessions as a whole (no task). ownerMessages
+   * "via-main": to the owner's main session, like a task's notice. Straight
+   * to the owner's DM when the session registry cannot be read (the main
+   * session cannot load its own conversation then either), when the owner's
+   * session is not known, in "direct" mode, or when the note cannot be saved.
+   * `sent`: called once the notice has gone out or its note is on disk (not
+   * when it could not be sent, or failed).
+   */
   private noticeOwner(text: OwnerText, sent?: () => void): void {
+    let ownerKey: string | undefined;
+    try { ownerKey = this.viaMain() && this.deps.registryReadable() ? this.deps.ownerKey?.() : undefined; } catch { ownerKey = undefined; }
+    if (ownerKey && this.noticeToMain(ownerKey, text, { kind: "subsessions", reason: "a problem with the sub-session list itself" })) {
+      sent?.();
+      return;
+    }
     this.outward(() => {
       void this.deps.noticeOwner(text).then((ok) => { if (ok !== false) sent?.(); else log.warn("Sub-session notice not sent: no reachable owner DM"); },
         (err: unknown) => log.warn({ err }, "Sub-session notice failed"));

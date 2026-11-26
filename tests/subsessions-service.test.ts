@@ -49,7 +49,7 @@ interface Harness {
   /** Task keys whose own background work (subagents, background commands) is still running. */
   background: Set<string>;
   /** The 5-hour window's share used; "throw": the samples cannot be read. */
-  quota?: number | "throw";
+  quota?: number | "throw" | { window: "five_hour" | "weekly"; percent: number };
   /** Owner notices that do not go out: "throw" (the send failed), "unreachable" (no DM to send to). */
   ownerNotice?: "throw" | "unreachable";
 }
@@ -142,9 +142,10 @@ function harness(cfg: Partial<SubsessionConfig> = {}, onTurn: TurnHandler = () =
     registryTaskKeys: () => [...h.registry],
     hasBackgroundWork: (key) => h.background.has(key),
     isStopping: () => false,
-    sessionQuotaPercent: () => {
+    quotaReading: () => {
       if (h.quota === "throw") throw new Error("limits.ndjson unreadable");
-      return h.quota;
+      if (h.quota === undefined) return undefined;
+      return typeof h.quota === "number" ? { window: "five_hour" as const, percent: h.quota } : h.quota;
     },
   });
   return h;
@@ -298,6 +299,123 @@ describe("SubsessionService", () => {
     expect(first.prompt).toContain("use the staging db");
     // Still on the record, unmarked, until that turn's result is written.
     expect(h.store.get(t.id)).toMatchObject({ seenThrough: 0, pendingInput: [{ seq: 1 }] });
+  });
+
+  it("the owner's words relayed to a task a note already queued start it past the slot cap", async () => {
+    const h = harness({ maxRunning: 1 }, (turn, hh) => {
+      if (turn.key === "task:s2") return new Promise(() => {}); // s2 keeps the one slot
+      hh.service.noteToolUse(turn.key);
+      return { ok: true };
+    });
+    h.service.start();
+    const waiter = spawn(h, "waits on a check-back");
+    h.cron.set(waiter.sessionKey, 1);
+    await flush();
+    expect(h.store.get(waiter.id)).toMatchObject({ status: "waiting", waitingOn: "external" });
+    spawn(h, "busy");
+    await flush();
+    // The main session's note queues it behind the busy slot...
+    h.service.relay(waiter.id, "any news?");
+    await flush();
+    expect(h.store.get(waiter.id)?.status).toBe("queued");
+    const turns = h.turns.length;
+    // ...but the owner's own words never wait for a slot.
+    expect(h.service.relay(waiter.id, "check now please", said("check now please")).ok).toBe(true);
+    await flush();
+    expect(h.turns.length).toBeGreaterThan(turns);
+    expect(h.turns.at(-1)?.prompt).toContain("check now please");
+    expect(h.turns.at(-1)?.prompt).toContain("any news?");
+  });
+
+  it("a relay with the owner's words whose start failed is started past the slot cap by the scheduler's next run", async () => {
+    const h = harness({ maxRunning: 1 }, (turn, hh) => {
+      if (turn.key === "task:s2") return new Promise(() => {}); // s2 keeps the one slot
+      hh.service.noteToolUse(turn.key);
+      return { ok: true };
+    });
+    h.service.start();
+    const waiter = spawn(h, "waits on a check-back");
+    h.cron.set(waiter.sessionKey, 1);
+    await flush();
+    spawn(h, "busy");
+    await flush();
+    h.service.relay(waiter.id, "any news?");
+    await flush();
+    expect(h.store.get(waiter.id)?.status).toBe("queued");
+    const svc = h.service as unknown as { startTask: (id: string, why: string) => boolean; schedule: () => void };
+    const real = svc.startTask.bind(h.service);
+    const spy = vi.spyOn(svc, "startTask").mockImplementationOnce(() => { throw new Error("disk full"); });
+    expect(h.service.relay(waiter.id, "check now please", said("check now please")).ok).toBe(true);
+    await flush();
+    expect(h.store.get(waiter.id)?.status).toBe("queued");
+    spy.mockImplementation(real);
+    const turns = h.turns.length;
+    svc.schedule();
+    await flush();
+    expect(h.turns.length).toBeGreaterThan(turns);
+    expect(h.turns.at(-1)?.prompt).toContain("check now please");
+  });
+
+  it("the main session's own note queues a task waiting on something external for a slot, like a check-back", async () => {
+    const h = harness({ maxRunning: 1 }, (turn, hh) => {
+      if (turn.key === "task:s2") return new Promise(() => {}); // s2 keeps the one slot
+      hh.service.noteToolUse(turn.key);
+      return { ok: true };
+    });
+    h.service.start();
+    const waiter = spawn(h, "waits on a check-back");
+    h.cron.set(waiter.sessionKey, 1);
+    await flush();
+    expect(h.store.get(waiter.id)).toMatchObject({ status: "waiting", waitingOn: "external" });
+    spawn(h, "busy");
+    await flush();
+    expect(h.store.list().filter((x) => x.status === "active")).toHaveLength(1);
+    const turns = h.turns.length;
+    // Autonomous work: it waits for a slot like a cron check-back.
+    expect(h.service.relay(waiter.id, "any news?")).toMatchObject({ ok: true, changed: true });
+    await flush();
+    expect(h.store.get(waiter.id)?.status).toBe("queued");
+    expect(h.store.list().filter((x) => x.status === "active")).toHaveLength(1);
+    expect(h.turns).toHaveLength(turns);
+    // The slot frees: it runs, with the note.
+    await h.service.cancel("s2", "test");
+    await flush();
+    expect(h.turns.at(-1)?.key).toBe(waiter.sessionKey);
+    expect(h.turns.at(-1)?.prompt).toContain("any news?");
+  });
+
+  it("a driver that throws is tried again by the retry timer, never at once in a loop", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness();
+      h.service.start();
+      const t = spawn(h);
+      await flush();
+      expect(h.store.get(t.id)?.status).toBe("waiting");
+      // Its conversation is gone and the table will not take the failure:
+      // the driver throws before its turn, every time.
+      h.sdk.delete(t.sessionKey);
+      const real = h.store.transition.bind(h.store);
+      let failWrites = 0;
+      let writeFails = true;
+      h.store.transition = ((...args: Parameters<typeof real>) => {
+        if (args[1] === "fail" && writeFails && failWrites < 200) { failWrites += 1; throw new Error("disk full"); }
+        return real(...args);
+      }) as typeof real;
+      h.service.relay(t.id, "go on", said("go on"));
+      await flush();
+      expect(failWrites).toBe(1);
+      vi.advanceTimersByTime(SETTLE_RETRY_MS);
+      await flush();
+      expect(failWrites).toBe(2);
+      writeFails = false;
+      vi.advanceTimersByTime(SETTLE_RETRY_MS);
+      await flush();
+      expect(h.store.get(t.id)?.status).toBe("failed");
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("a relay with the owner's words wakes a task waiting for the owner, past the slot cap; a note alone is held", async () => {
@@ -2171,17 +2289,84 @@ describe("SubsessionService: the wall-clock cap", () => {
 });
 
 describe("SubsessionService: the quota gate", () => {
-  it("pauses a task's own turn at 80% of the 5-hour window, and tells the owner once", async () => {
+  it("pauses a task's own turn at 85% of the 5-hour window, and tells the owner once", async () => {
     const h = harness({}, working());
-    h.quota = 80;
+    h.quota = 85;
     h.service.start();
     const t = spawn(h);
     await flush();
     // Not even its first turn runs.
     expect(h.turns).toHaveLength(0);
     expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
-    expect(h.store.get(t.id)?.waitingReason).toContain("80%");
-    expect(h.notices.map((x) => x.text)).toEqual([expect.stringContaining("80%")]);
+    expect(h.store.get(t.id)?.waitingReason).toContain("5-hour quota window is at 85%");
+    expect(h.notices.map((x) => x.text)).toEqual([expect.stringContaining("85%")]);
+    expect(h.notices[0].text).toContain("5-hour");
+  });
+
+  it("pauses on the weekly window (an account with no 5-hour one) and says which window it was", async () => {
+    const h = harness({}, working());
+    h.quota = { window: "weekly", percent: 85.4 };
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.turns).toHaveLength(0);
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+    expect(h.store.get(t.id)?.waitingReason).toContain("weekly (all models) quota window is at 85%");
+    expect(h.notices.map((x) => x.text)).toEqual([expect.stringContaining("85%")]);
+    expect(h.notices[0].text).toContain("this week's usage");
+    expect(h.notices[0].text).not.toContain("5-hour");
+  });
+
+  it("a weekly-quota pause is lifted only by the owner's own words, not by a main-session note", async () => {
+    const h = harness({}, working());
+    h.quota = { window: "weekly", percent: 90 };
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+    // The main session passes something on without the owner's words: no turn.
+    h.service.relay(t.id, "the main session thinks you should go on");
+    await flush();
+    expect(h.turns).toHaveLength(0);
+    expect(h.store.get(t.id)?.status).toBe("waiting");
+    // The owner's own words run, past the gate.
+    expect(h.service.relay(t.id, "go anyway", said("go anyway")).ok).toBe(true);
+    await flush();
+    expect(h.turns).toHaveLength(1);
+  });
+
+  it("decides on the reading taken just before the turn (freshenQuota is awaited first)", async () => {
+    const h = harness({}, working());
+    // The file is stale (nothing known); the fresh read finds the week at 90%.
+    (h.service as unknown as { deps: { freshenQuota: () => Promise<void> } }).deps.freshenQuota = async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      h.quota = { window: "weekly", percent: 90 };
+    };
+    h.service.start();
+    const t = spawn(h);
+    await new Promise((r) => setTimeout(r, 30));
+    await flush();
+    expect(h.turns).toHaveLength(0);
+    expect(h.store.get(t.id)?.waitingReason).toContain("weekly (all models) quota window is at 90%");
+  });
+
+  it("runs below the threshold on either window, and the threshold is subsessions.quotaPauseAtPct", async () => {
+    const below = harness({}, working((turn, hh) => hh.service.finish(turn.key, "done")));
+    below.quota = { window: "weekly", percent: 84.9 };
+    below.service.start();
+    spawn(below);
+    await flush();
+    expect(below.turns).toHaveLength(1);
+    expect(below.store.get("s1")?.status).toBe("finished");
+    below.service.stop();
+
+    const strict = harness({ quotaPauseAtPct: 60 }, working());
+    strict.quota = { window: "weekly", percent: 60 };
+    strict.service.start();
+    const t = spawn(strict);
+    await flush();
+    expect(strict.turns).toHaveLength(0);
+    expect(strict.store.get(t.id)?.waitingReason).toContain("pauses at 60%");
   });
 
   it("lets the owner's own word through, and runs below the threshold", async () => {
@@ -2208,7 +2393,7 @@ describe("SubsessionService: the quota gate", () => {
     expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
     expect(h.notices).toHaveLength(2);
     // Quota freed: the owner's next word, and the continue after it, run.
-    h.quota = 79;
+    h.quota = 84;
     expect(h.service.relay(t.id, "now go", said("now go")).ok).toBe(true);
     await flush();
     expect(h.turns).toHaveLength(2);
@@ -2407,7 +2592,11 @@ describe("SubsessionService: task_finish never leaves input unread", () => {
       if (n > 4) return;
       // More keeps arriving every turn, as fast as it is read.
       hh.service.relay("s1", `relay ${n}`);
-      for (let i = 0; i < 3; i++) results.push(hh.service.finish(turn.key, `report ${n}`) as { ok: boolean; unread?: number });
+      for (let i = 0; i < 3; i++) {
+        const r = hh.service.finish(turn.key, `report ${n}`) as { ok: boolean; unread?: number };
+        results.push(r);
+        if (r.ok) break; // finished: a second finish would be illegal
+      }
     }));
     h.service.start();
     const t = spawn(h);

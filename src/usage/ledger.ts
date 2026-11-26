@@ -5,6 +5,8 @@ import { log } from "../logger.js";
 import { scrubSecretValues } from "../redact.js";
 import { appendLineSerial } from "./append.js";
 import type { ModelTurnUsage } from "../agent/sdk-result.js";
+import type { ForceSummaryUsage } from "../lcm/force-summarizer.js";
+import { taskIdFromSessionKey } from "../sessions/keys.js";
 import type { UsageBaseline } from "../sessions/types.js";
 import { parseTomoEvent } from "../tomo-event.js";
 import { errorMessage } from "../error-text.js";
@@ -33,12 +35,18 @@ export const USAGE_LEDGER_VERSION = 1;
  *    context nudges, undelivered-reply restates;
  *  - `delegate`: `send_message(mode: "delegate")` from another session;
  *  - `heartbeat` / `restart`: continuity turns;
- *  - `background`: a turn the CLI started itself (a background task's report).
+ *  - `background`: a turn the CLI started itself (a background task's report);
+ *  - `task`: a sub-session's own turn (`task:<id>` key; `taskId` set), its
+ *    forced-compaction summary call included;
+ *  - `task-relay`: a turn the OWNING session runs for its tasks (a task's
+ *    report, what a task handed it for the owner, the mirror of an exchange).
+ *    `taskId` is set when one task caused it; a wake that carries several
+ *    tasks' news at once has none.
  */
-export type UsageSource = "owner" | "group" | "cron" | "system" | "delegate" | "heartbeat" | "restart" | "background";
+export type UsageSource = "owner" | "group" | "cron" | "system" | "delegate" | "heartbeat" | "restart" | "background" | "task" | "task-relay";
 
-/** The Cost page's three buckets ("You" / "Background" / "Scheduled"). */
-export type UsageCategory = "you" | "background" | "scheduled";
+/** The Cost page's four buckets ("You" / "Background" / "Scheduled" / "Tasks"). */
+export type UsageCategory = "you" | "background" | "scheduled" | "tasks";
 
 export function usageCategory(source: UsageSource): UsageCategory {
   switch (source) {
@@ -49,6 +57,9 @@ export function usageCategory(source: UsageSource): UsageCategory {
     case "system":
     case "delegate":
       return "scheduled";
+    case "task":
+    case "task-relay":
+      return "tasks";
     default:
       return "background";
   }
@@ -61,6 +72,8 @@ export interface UsageAttribution {
   jobName?: string;
   /** Start of the message that triggered the turn (see triggerSnippet). */
   trigger?: string;
+  /** `task` / `task-relay`: the sub-session the turn was for (`s3`). */
+  taskId?: string;
 }
 
 export interface UsageLedgerRow {
@@ -71,6 +84,8 @@ export interface UsageLedgerRow {
   source: UsageSource;
   jobId?: string;
   jobName?: string;
+  /** `task` / `task-relay`: the sub-session the turn was for (see UsageSource). */
+  taskId?: string;
   /** Web request id, when the turn answers one. */
   requestId?: string;
   trigger?: string;
@@ -124,6 +139,27 @@ export interface UsageLedgerRow {
    * down the no-baseline path.
    */
   snapshot?: UsageBaseline;
+}
+
+/**
+ * The ledger row of a forced compaction's summary call: a separate CLI,
+ * outside LiveSession's recorder, charged to the session it compacted — to a
+ * task's own turns (`task`) when that session is a sub-session — and split
+ * per model like any other row, so "By model" is not left with an unsplit
+ * remainder.
+ */
+export function forceSummaryLedgerRow(sessionKey: string, u: ForceSummaryUsage, ts: number): UsageLedgerRow {
+  const taskId = taskIdFromSessionKey(sessionKey);
+  return {
+    v: USAGE_LEDGER_VERSION, ts, sessionKey,
+    ...(taskId ? { source: "task" as const, taskId } : { source: "background" as const }),
+    trigger: "force-compact",
+    ...(u.subtype !== "success" ? { subtype: u.subtype } : {}),
+    costUsd: u.costUsd, tokens: u.tokens,
+    ...(u.durationMs !== undefined ? { durationMs: u.durationMs } : {}),
+    ...(u.numTurns !== undefined ? { numTurns: u.numTurns } : {}),
+    ...(u.models ? { models: u.models } : {}),
+  };
 }
 
 export const TRIGGER_MAX_CHARS = 80;

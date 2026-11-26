@@ -75,7 +75,7 @@ function harness(cfg: Partial<SubsessionConfig> = {}, opts: { registry?: Set<str
     isStopping: () => false,
     now: () => h.clock,
     mirrorWake: (parent) => { h.wakes.push(parent); },
-    sessionQuotaPercent: () => h.quota,
+    quotaReading: () => (h.quota === undefined ? undefined : { window: "five_hour" as const, percent: h.quota }),
   });
   return h;
 }

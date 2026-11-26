@@ -34,7 +34,7 @@ const MACHADO = {
 const sim = (h: string, kind?: keyof typeof MACHADO) => kind ? MACHADO[kind].map((row) => Math.max(0, Math.min(1, row.reduce((sum, k, i) => sum + k * lin(h)[i], 0)))) : lin(h);
 const deltaE = (a: string, b: string, kind?: keyof typeof MACHADO) => { const [p, q] = [oklab(sim(a, kind)), oklab(sim(b, kind))]; return 100 * Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]); };
 
-const SERIES = ["series-1", "series-2", "series-3"];
+const SERIES = ["series-1", "series-2", "series-3", "series-4"];
 const RAMP = ["seq-0", "seq-1", "seq-2", "seq-3", "seq-4", "seq-5"];
 
 describe("cost chart tokens", () => {
@@ -46,11 +46,11 @@ describe("cost chart tokens", () => {
   });
 
   it("light mode keeps its validated palette", () => {
-    expect(SERIES.map((k) => light[k])).toEqual(["#3d7ab5", "#c8623a", "#2f9a74"]);
+    expect(SERIES.map((k) => light[k])).toEqual(["#3d7ab5", "#c8623a", "#2f9a74", "#9e497d"]);
     expect(RAMP.map((k) => light[k])).toEqual(["#efe8d8", "#cfdcea", "#a3c0dd", "#729fcd", "#3d7ab5", "#27578a"]);
   });
 
-  it("dark series pass the dataviz checks on the card, all pairs (You / Background / Scheduled can all touch)", () => {
+  it("dark series pass the dataviz checks on the card, all pairs (You / Background / Scheduled / Tasks can all touch)", () => {
     const series = SERIES.map((k) => dark[k]);
     for (const hex of series) {
       expect(L(hex), hex).toBeGreaterThanOrEqual(0.48);
@@ -65,8 +65,19 @@ describe("cost chart tokens", () => {
     }
   });
 
+  it("light series stay apart too, Tasks included", () => {
+    const series = SERIES.map((k) => light[k]);
+    for (const hex of series) expect(contrast(hex, "#fbf8f1"), hex).toBeGreaterThanOrEqual(3);
+    for (let i = 0; i < series.length; i++) for (let j = i + 1; j < series.length; j++) {
+      const [a, b] = [series[i], series[j]];
+      expect(deltaE(a, b), `${a}/${b} normal`).toBeGreaterThanOrEqual(15);
+      expect(Math.min(deltaE(a, b, "protan"), deltaE(a, b, "deutan")), `${a}/${b} CVD`).toBeGreaterThanOrEqual(8);
+    }
+  });
+
+  // Tasks (series-4) is left out: no hue in the calm band keeps it apart from the other three (see styles.css).
   it("dark series are calmer than before: lower chroma than the old #3987e5/#d95926 (C ≥ 0.16) and below L 0.6", () => {
-    for (const key of SERIES) {
+    for (const key of SERIES.slice(0, 3)) {
       expect(C(dark[key]), key).toBeLessThanOrEqual(0.14);
       expect(L(dark[key]), key).toBeLessThan(0.6);
     }

@@ -6,6 +6,7 @@ export const cost = {
     you: "你", youHint: "由消息触发的对话：你的，或群里的",
     background: "后台", backgroundHint: "心跳，以及接手已完成后台工作的对话",
     scheduled: "定时", scheduledHint: "Cron 任务和其他定时对话",
+    tasks: "子会话", tasksHint: "子会话自己的对话，以及主对话为它们跑的对话",
   },
   lessThan: "<{{value}}", resetsAt: "{{when}}重置",
   day: { today: "今天到目前为止", yesterday: "昨天", other: "当天" },
@@ -13,6 +14,7 @@ export const cost = {
   turn: {
     heartbeat: "心跳", background: "后台工作完成", restart: "重启之后", delegate: "代发的消息",
     cron: "定时任务", scheduled: "定时对话", other: "对话",
+    task: "子会话的对话", relay: "为子会话", relayFor: "为 {{id}}",
     tools_other: "{{count}} 个工具", backfilled: "来自活动日志",
   },
   est: { label: "估", title: "由 Claude SDK 按 API 标价估算。如果你用的是订阅，这不是你实际付的钱。" },
@@ -46,10 +48,14 @@ export const cost = {
   period: {
     label: "时间段", days_other: "{{count}} 天", who: "由谁触发", whoLabel: "按触发方的费用",
     noTurns_other: "最近 {{count}} 天没有对话。",
-    note_other: "共 {{turns}} 轮。后台指心跳，以及接手已完成 subagent 的对话。",
+    note_other: "共 {{turns}} 轮。后台指心跳，以及接手已完成 subagent 的对话；子会话单独一类。",
     overcounted: "包含多算的天数。",
     scheduled: "定时任务", scheduledLabel: "按定时任务的费用", last_other: "最近 {{count}} 天",
     tasks: "子会话", tasksLabel: "按子会话的费用", turns_other: "{{count}} 轮",
+    tasksTotal: "共 {{total}}：子会话自己 {{self}}，主对话为它们 {{relay}}",
+    taskRelay: "{{turns}} · 主对话 {{relay}}",
+    tasksUnattributed: "主对话为子会话花的钱里有 {{cost}} 是同时为几个子会话的，或者来自对话还不记任务的时候；它算在总数里，不归到某一个子会话。",
+    tasksMore_other: "再显示 {{count}} 个", tasksLess: "收起",
     runs_other: "{{count}} 次运行", runsEach_other: "{{count}} 次运行 · 每次 {{each}}",
   },
 } satisfies Translation<typeof en>;

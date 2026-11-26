@@ -1759,7 +1759,7 @@ export class SessionStore {
   clearPendingNotesRecovery(asides: string[]): boolean {
     const left = (this.pendingNotesRecovery() ?? []).filter((a) => !asides.includes(a));
     try {
-      if (left.length > 0) writeJsonAtomicSync(this.pendingNotesRecoveryPath, { asides: left });
+      if (left.length > 0) writeJsonAtomicSync(this.pendingNotesRecoveryPath, { asides: left }, { fsync: true });
       else unlinkSync(this.pendingNotesRecoveryPath);
       return true;
     } catch (err) {
@@ -1821,19 +1821,30 @@ export class SessionStore {
     for (let n = 0; n < 100; n++) {
       const aside = n === 0 ? `${path}.corrupt-${ts}` : `${path}.corrupt-${ts}-${n}`;
       let outcome: "moved" | "taken" | "gone" | undefined;
+      let before: string[] | undefined;
       let marked = true;
+      // No move: the marker goes back to what it was (one that would not read stays, as an empty one).
+      const unmark = (): void => {
+        if (marked) return;
+        try {
+          if (before === undefined) this.clearPendingNotesRecovery([aside]);
+          else writeJsonAtomicSync(this.pendingNotesRecoveryPath, { asides: before }, { fsync: true });
+        } catch (err) {
+          log.warn({ err }, "Could not take a name off the pending notes recovery marker");
+        }
+      };
       try {
-        // The marker first: a restart after the move still knows its notes are owed again.
-        const before = this.pendingNotesRecovery() ?? [];
-        marked = before.includes(aside);
-        if (!marked) writeJsonAtomicSync(this.pendingNotesRecoveryPath, { asides: [...before, aside] });
+        // The marker first, on disk: a restart after the move still knows its notes are owed again.
+        before = this.pendingNotesRecovery();
+        marked = (before ?? []).includes(aside);
+        if (!marked) writeJsonAtomicSync(this.pendingNotesRecoveryPath, { asides: [...(before ?? []), aside] }, { fsync: true });
         outcome = this.moveWithoutClobber(path, aside);
       } catch (err) {
-        if (!marked) this.clearPendingNotesRecovery([aside]);
+        unmark();
         log.error({ err, cause, file: path }, "Pending notes file could not be read, and could not be moved aside; left as it is");
         throw new PendingNotesReadError(path, err);
       }
-      if (outcome !== "moved" && !marked) this.clearPendingNotesRecovery([aside]);
+      if (outcome !== "moved") unmark();
       if (outcome === "taken") continue;
       // Gone between the read and the move: nothing to keep, nothing queued.
       if (outcome === "gone") return {};

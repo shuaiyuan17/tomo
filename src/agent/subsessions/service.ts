@@ -1391,7 +1391,8 @@ export class SubsessionService {
         // While the notes file is lost (it may be the read just below that
         // finds it unreadable and moves it aside), "no note" means nothing:
         // every earlier report is kept, as if unread.
-        const noteUnread = (name: string): boolean => this.notePending(r.parentKey, name) || this.notesRecovering();
+        const recovering = this.notesRecovering();
+        const noteUnread = (name: string): boolean => recovering || this.notePending(r.parentKey, name);
         const kept = (r.earlierReports ?? []).filter((e) => e.seq !== previous && (!e.noted || noteUnread(`${r.id}#${e.seq}`)));
         if (r.report !== undefined && previous > 0 && (!r.reportDelivered || noteUnread(reportNoteName({ ...r, reportSeq: previous })))) {
           kept.push({ seq: previous, text: r.report, ...(r.reportDelivered ? { noted: true } : {}) });

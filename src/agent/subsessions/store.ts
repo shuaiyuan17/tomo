@@ -619,8 +619,8 @@ function parsePlan(raw: unknown[]): SubsessionPlanStep[] {
 /** The capped logs. pendingInput is NOT one of them: accepted input is never dropped. */
 function trimLists(record: SubsessionRecord): void {
   if (record.sent.length > SENT_KEEP) {
-    // A message whose note is still unread stays: it is what a lost notes file is rebuilt from.
-    const older = record.sent.slice(0, -SENT_KEEP).filter((m) => m.noteId !== undefined && !m.read && m.kind !== "ask");
+    // A message whose note is still unread stays (up to as many again): it is what a lost notes file is rebuilt from.
+    const older = record.sent.slice(0, -SENT_KEEP).filter((m) => m.noteId !== undefined && !m.read && m.kind !== "ask").slice(-SENT_KEEP);
     record.sent = [...older, ...record.sent.slice(-SENT_KEEP)];
   }
   if (record.transitions.length > TRANSITION_LOG_KEEP) record.transitions = record.transitions.slice(-TRANSITION_LOG_KEEP);

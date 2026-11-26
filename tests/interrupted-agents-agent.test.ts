@@ -258,6 +258,18 @@ describe("interrupted subagents across a restart", () => {
     await third.agent.stop();
   });
 
+  it("a recovery marker that will not read still ends in one notice to the owner", async () => {
+    const first = await boot();
+    crash(first.agent);
+    const marker = join(mockConfig.sessionsDir, "_pending_notes.recovery.json");
+    writeFileSync(marker, "{garbled");
+    const ownerNotice = vi.spyOn(Agent.prototype, "notifyOwner").mockResolvedValue(true);
+    const second = await boot({ identities: [{ name: "alex", channels: { telegram: "12345" }, replyPolicy: "last-active" }] });
+    await waitFor(() => expect(ownerNotice).toHaveBeenCalledTimes(1));
+    expect(existsSync(marker)).toBe(false);
+    await second.agent.stop();
+  });
+
   it("a note about the same subagent left by an earlier process does not stand in for this restart's", async () => {
     const first = await boot();
     await haveSession(first.channel, "711");

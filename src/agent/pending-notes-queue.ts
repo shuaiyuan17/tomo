@@ -306,12 +306,13 @@ export class PendingNotesQueue {
       for (const n of stable) ids.add(n.id);
       this.settledIds.set(sessionKey, ids);
     }
-    this.persist(sessionKey);
+    // Told before the notes leave the disk: a crash in between leaves them read and still stored, never gone and unread.
     try {
       this.onSettled?.(sessionKey, batch.notes.map((n) => n.id));
     } catch (err) {
       log.warn({ err, sessionKey }, "Pending notes settle listener failed");
     }
+    this.persist(sessionKey);
   }
 
   /**

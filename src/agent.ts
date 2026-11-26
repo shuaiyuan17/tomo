@@ -3881,9 +3881,10 @@ export class Agent {
     if (!asides) return;
     let done = false;
     try {
-      const unwritten = this.pendingNotesQueue.persistAll();
-      const rebuilt = this.subsessions ? this.subsessions.rebuildLostNotes() : true;
-      done = unwritten.length === 0 && rebuilt && this.sessions.clearPendingNotesRecovery(asides);
+      // The rebuild (which wakes the owning sessions) only once the notes held here are on disk.
+      done = this.pendingNotesQueue.persistAll().length === 0
+        && (this.subsessions ? this.subsessions.rebuildLostNotes() : true)
+        && this.sessions.clearPendingNotesRecovery(asides);
     } catch (err) {
       log.error({ err }, "Pending notes recovery failed");
     }
@@ -3897,7 +3898,8 @@ export class Agent {
       this.pendingNotesRecoveryTimer.unref();
       return;
     }
-    this.pendingNotesQuarantined.push(...asides);
+    // A marker that would not read names no file: the owner is still told.
+    this.pendingNotesQuarantined.push(...(asides.length > 0 ? asides : ["_pending_notes.json.corrupt-*"]));
     if (this.channelsUp) this.tellPendingNotesQuarantined();
   }
 

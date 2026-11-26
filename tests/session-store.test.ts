@@ -216,6 +216,23 @@ describe("SessionStore", () => {
     expect(store.pendingNotesRecovery()).toBeUndefined();
   });
 
+  it("a recovery marker that will not read is not deleted by a move that does not happen", () => {
+    const file = join(TEST_DIR, "_pending_notes.json");
+    const marker = join(TEST_DIR, "_pending_notes.recovery.json");
+    writeFileSync(file, "{not json");
+    writeFileSync(marker, "{garbled");
+    const store = makeSessionStore(TEST_DIR);
+    const proto = Object.getPrototypeOf(store) as { moveWithoutClobber(from: string, to: string): string };
+    const move = vi.spyOn(proto, "moveWithoutClobber").mockImplementation(() => { throw Object.assign(new Error("EACCES"), { code: "EACCES" }); });
+    try {
+      expect(() => store.getPendingNotes("dm:alice")).toThrow(PendingNotesReadError);
+    } finally {
+      move.mockRestore();
+    }
+    // An earlier recovery is still owed.
+    expect(store.pendingNotesRecovery()).toEqual([]);
+  });
+
   it("a pending notes file that is not valid UTF-8 is moved aside byte for byte, even when it would still parse", () => {
     const file = join(TEST_DIR, "_pending_notes.json");
     // 0xff is never valid UTF-8; a lenient decode reads it as U+FFFD inside a

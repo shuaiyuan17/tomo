@@ -476,6 +476,17 @@ describe("PendingNotesQueue while the stored notes cannot be read", () => {
     expect(store.texts("b")).toEqual(["held while unreadable"]);
   });
 
+  it("tells the settle hook before the read notes leave the disk (a crash between leaves them read, not lost unread)", () => {
+    const store = new MemoryPendingNotesStore();
+    const onDiskAtHook: string[][] = [];
+    const queue = new PendingNotesQueue(store, (key) => onDiskAtHook.push(store.texts(key)));
+    queue.queueNote("k", "one", "id1");
+    queue.settle("k", queue.drain("k"));
+    expect(onDiskAtHook).toHaveLength(1);
+    expect(onDiskAtHook[0].join("")).toContain("one");
+    expect(store.texts("k")).toEqual([]);
+  });
+
   it("names the ids a turn read to the settle hook", () => {
     const store = new MemoryPendingNotesStore();
     const read: [string, string[]][] = [];

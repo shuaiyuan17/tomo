@@ -425,8 +425,8 @@ export const REPLY_MAP_KEEP = 200;
 export const OWNER_MESSAGE_IDS_KEEP = 50;
 export const CONVERSATION_KEEP = 40;
 export const DONE_STEPS_KEEP = 20;
-export const UPDATES_KEEP = 20;
-/** A progress or update line is one line of at most this many characters. */
+export const UPDATES_KEEP = 40;
+/** A progress or update line is one line of at most this many characters (an update's lines are joined first). */
 export const PROGRESS_TEXT_MAX = 300;
 /** A plan holds at most this many steps, each one line of at most PLAN_STEP_MAX characters. */
 export const PLAN_MAX_STEPS = 8;
@@ -464,9 +464,20 @@ export function needsOwner(record: Pick<SubsessionRecord, "status" | "ownerActio
   return record.status === "finished" && record.ownerAction ? record.ownerAction : undefined;
 }
 
-/** One line, trimmed, at most `max` characters (by code point, so a pair is never split). */
+/** One line, trimmed, at most `max` characters (by code point, so a pair is never split; trimmed again after the cut, so it reads back the same). */
 export function oneLine(text: string, max: number): string {
-  return Array.from(text.trim().split("\n")[0].trim()).slice(0, max).join("");
+  return Array.from(text.trim().split("\n")[0].trim()).slice(0, max).join("").trimEnd();
+}
+
+/**
+ * Every line joined into one (each line break, \n, \r\n or \r, and the spaces
+ * around it become one space), trimmed, at most `max` characters by code
+ * point, trimmed again after the cut. For an
+ * update the model may write over several lines, where `oneLine` would keep
+ * only the first and drop the reason that follows it.
+ */
+export function joinedLine(text: string, max: number): string {
+  return Array.from(text.trim().replace(/\s*[\r\n]\s*/g, " ")).slice(0, max).join("").trimEnd();
 }
 /** Inputs a task may have owed at once; more are refused (never silently dropped). */
 export const PENDING_INPUT_MAX = 50;

@@ -1,4 +1,4 @@
-import { activeTotalMs, currentStep, isTimestamp, needsOwner, reportNumber, type SubsessionRecord } from "../agent/subsessions/types.js";
+import { activeTotalMs, currentStep, isTimestamp, needsOwner, reportNumber, TRANSITION_LOG_KEEP, UPDATES_KEEP, type SubsessionRecord } from "../agent/subsessions/types.js";
 import type { SubsessionEvent } from "../agent/subsessions/state-machine.js";
 import type { WebSubsession, WebSubsessionDetail, WebSubsessionMilestone, WebSubsessionStatus, WebSubsessionUpdate } from "./protocol.js";
 
@@ -19,8 +19,8 @@ export const REPORT_LIMIT = 20_000;
 const QUOTE_LIMIT = 2_000;
 const STEP_LIMIT = 120;
 const RESULT_LIMIT = 200;
-/** Update entries a detail carries at most (the record keeps 20 updates; milestones come from its 50 status changes). */
-export const UPDATES_LIMIT = 40;
+/** Update entries a detail carries at most: every update the record keeps, plus a milestone for each status change it keeps. */
+export const UPDATES_LIMIT = UPDATES_KEEP + TRANSITION_LOG_KEEP;
 /** Per conversation line. With the table's 40 lines, brief and report, a detail stays well under the 2 MiB IPC frame even fully escaped. */
 export const ENTRY_LIMIT = 4_000;
 

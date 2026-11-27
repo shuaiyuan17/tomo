@@ -6,7 +6,7 @@ import { randomUUID } from "node:crypto";
 import { SUBSESSION_EVENT_MS, WebChannel, type WebSubsessionAccess } from "../src/channels/web.js";
 import { WatchBus } from "../src/watch/bus.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
-import type { SubsessionRecord } from "../src/agent/subsessions/types.js";
+import { TRANSITION_LOG_KEEP, UPDATES_KEEP, type SubsessionRecord } from "../src/agent/subsessions/types.js";
 import type { OwnerConfig } from "../src/owner.js";
 import { rpcSchema, type WebEvent, type WebSubsession } from "../src/web/protocol.js";
 import { BRIEF_LIMIT, ENTRY_LIMIT, MAX_RAIL_SUBSESSIONS, SUBSESSION_ENDED_VISIBLE_MS, UPDATES_LIMIT, subsessionDetail, subsessionUpdates, subsessionList, subsessionView } from "../src/web/subsessions-view.js";
@@ -171,8 +171,13 @@ describe("a sub-session's plan, done steps and updates", () => {
   });
 
   it("caps the updates it sends, keeps done steps in order, and shows the plan only while the task is open", () => {
-    const updates = Array.from({ length: 30 }, (_, i) => ({ at: NOW - 1000 + i, text: `u${i}` }));
-    const many = Array.from({ length: 30 }, (_, i) => ({ at: NOW - 2000 + i, from: "active" as const, to: "finished" as const, event: "finish" }));
+    // Every update the record keeps is shown, whatever its milestones.
+    const updates = Array.from({ length: UPDATES_KEEP }, (_, i) => ({ at: NOW - 1000 + i, text: `u${i}` }));
+    const milestones = Array.from({ length: TRANSITION_LOG_KEEP }, (_, i) => ({ at: NOW - 2000 + i, from: "active" as const, to: "finished" as const, event: "finish" }));
+    const shown = subsessionUpdates(record("s1", { updates, transitions: milestones }));
+    expect(shown.filter((u) => u.kind === "update")).toHaveLength(UPDATES_KEEP);
+    expect(shown).toHaveLength(UPDATES_LIMIT);
+    const many = Array.from({ length: TRANSITION_LOG_KEEP + 10 }, (_, i) => ({ at: NOW - 2000 + i, from: "active" as const, to: "finished" as const, event: "finish" }));
     expect(subsessionUpdates(record("s1", { updates, transitions: many }))).toHaveLength(UPDATES_LIMIT);
     const plan = [{ text: "Write tests", status: "in_progress" as const }, { text: "Open the PR", status: "pending" as const }];
     const doneSteps = [{ at: NOW - 20, text: "Read the code", result: "found it" }, { at: NOW - 10, text: "Fix it" }];

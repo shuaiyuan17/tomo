@@ -20,6 +20,7 @@ import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { SubsessionService } from "../src/agent/subsessions/service.js";
 import { buildTaskOwnerTools, buildTaskSelfTools, SUBSESSION_SELF_TOOL_NAMES, SUBSESSION_TASK_TOOL_NAMES } from "../src/mcp/subsession-tools.js";
 import { DEFAULT_SUBSESSIONS } from "../src/config.js";
+import { PROGRESS_TEXT_MAX } from "../src/agent/subsessions/types.js";
 import { formatTomoEvent, isOwnerAudienceNote, markOwnerAudience } from "../src/tomo-event.js";
 import { buildIdentityPrompt, buildSystemPrompt, DELEGATION_NOTE } from "../src/workspace/index.js";
 
@@ -402,5 +403,27 @@ describe("sub-session tools", () => {
     expect((await call(self as never, "task_status", {})).content[0].text).toContain("Decisions and updates (newest last):");
     const other = buildTaskSelfTools({ service: () => svc, key: "task:s9" });
     expect((await call(other as never, "task_update", { line: "x" })).isError).toBe(true);
+  });
+
+  it("task_update keeps every line of a multi-line update, joined into one", async () => {
+    const svc = service();
+    const created = svc.spawn("dm:owner", { title: "Mine", brief: "b" });
+    if (!created.ok) throw new Error(created.error);
+    const self = buildTaskSelfTools({ service: () => svc, key: created.record.sessionKey });
+    await call(self as never, "task_update", { line: "  Using the REST API, not the CLI:\r\n  - the CLI needs a login\n\n- the API is already authed  " });
+    expect(svc.get("s1")?.updates?.at(-1)?.text).toBe("Using the REST API, not the CLI: - the CLI needs a login - the API is already authed");
+    expect((await call(self as never, "task_update", { line: "\n \n" })).isError).toBe(true);
+    await call(self as never, "task_update", { line: `${"a".repeat(PROGRESS_TEXT_MAX - 2)}\nbcd` });
+    expect(svc.get("s1")?.updates?.at(-1)?.text).toBe(`${"a".repeat(PROGRESS_TEXT_MAX - 2)} b`);
+    // A cut that lands on a joint leaves no trailing space, so the same update
+    // sent again reads as a repeat (kept once), not as a new line.
+    const atJoint = `${"c".repeat(PROGRESS_TEXT_MAX - 1)}\nd`;
+    const before = svc.get("s1")!.updates!.length;
+    await call(self as never, "task_update", { line: atJoint });
+    await call(self as never, "task_update", { line: atJoint });
+    expect(svc.get("s1")!.updates).toHaveLength(before + 1);
+    expect(svc.get("s1")?.updates?.at(-1)?.text).toBe("c".repeat(PROGRESS_TEXT_MAX - 1));
+    await call(self as never, "task_update", { line: "old mac\rline" });
+    expect(svc.get("s1")?.updates?.at(-1)?.text).toBe("old mac line");
   });
 });

@@ -28,7 +28,7 @@ The owner's own words arrive as <tomo-event type="subsession-owner-message">. Th
 ## Keeping track
 Silent; the owner sees these when they look.
 - task_plan: your checklist of steps. Keep it current.
-- task_update: a decision or a change that should shape the owner's judgment (scope, approach, blocked or unblocked). Not routine progress.
+- task_update: each choice you make, finding that changes the plan, scope change, or block, with its reason in the same line. Not for finishing a step.
 - task_checkpoint: side effects so far and anything you ruled out. Survives compaction and restarts.
 - task_status: your own record.
 - task_reopen: after you finished, the owner asks for more work, or says they did what your report asked (then task_finish again, with no owner_action).

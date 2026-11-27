@@ -3,7 +3,7 @@ import { z } from "zod";
 import { EFFORT_LEVELS } from "../config.js";
 import type { SubsessionService } from "../agent/subsessions/service.js";
 import type { OwnerTurnMessage } from "../agent/audience.js";
-import { currentStep, DONE_STEPS_KEEP, joinedLine, needsOwner, oneLine, OPEN_STATUSES, OWNER_ACTION_MAX, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, reportNumber, STEP_RESULT_MAX, type SubsessionRecord } from "../agent/subsessions/types.js";
+import { CHECKPOINT_MAX, currentStep, DONE_STEPS_KEEP, joinedLine, needsOwner, oneLine, OPEN_STATUSES, OWNER_ACTION_MAX, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, reportNumber, STEP_RESULT_MAX, type SubsessionRecord } from "../agent/subsessions/types.js";
 
 /** The task_* tools a sub-session reports through (its own session only). */
 export const SUBSESSION_SELF_TOOL_NAMES = ["task_reply", "task_ask", "task_plan", "task_update", "task_checkpoint", "task_finish", "task_reopen", "task_status"] as const;
@@ -147,7 +147,11 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
         if (steps.filter((s) => s.status === "in_progress").length > 1) return fail("task_plan", "at most one step can be in_progress.");
         if (steps.some((s) => !oneLine(s.step, PLAN_STEP_MAX)) || (done ?? []).some((d) => !oneLine(d.step, PLAN_STEP_MAX))) return fail("task_plan", "a step is blank. Nothing was saved.");
         const outcome = r.s.setPlan(deps.key, steps, done ?? [], reason);
-        if (outcome.ok) return ok("Plan saved.");
+        if (outcome.ok) {
+          // The one nudge toward task_update: steps are being finished and no decision is on record yet.
+          const noDecisions = (done ?? []).length > 0 && !(outcome.record.updates ?? []).some((u) => !u.kind);
+          return ok(noDecisions ? "Plan saved. No decisions are on record yet: if a step you just finished involved a choice (an approach, a tool, one option over another) or a finding that changed the plan, record it with task_update, with the reason." : "Plan saved.");
+        }
         if (outcome.error === "duplicate_step") return fail("task_plan", "two steps read the same. Give each step its own words (for example \"Run the tests again\" for the second). Nothing was saved.");
         if (outcome.error === "reason_required") {
           const gone = outcome.missing.map((step) => `"${step}"`).join(", ");
@@ -173,8 +177,8 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_checkpoint",
-      "Save what the plan doesn't show: every side effect so far (branch, commits, pushes, PRs, files, messages) and anything you ruled out, replacing the checkpoint before. It survives compaction and restarts. Save it before you end a turn with work left, and before a step that is hard to undo.",
-      { summary: z.string().min(1).max(8000) },
+      "Save what the plan doesn't show: every side effect so far (branch, commits, pushes, PRs, files, messages) and anything you ruled out, replacing the checkpoint before. It survives compaction and restarts, and the owner can read it in the task panel. Save it before you end a turn with work left, and before a step that is hard to undo.",
+      { summary: z.string().min(1).max(CHECKPOINT_MAX) },
       async ({ summary }) => {
         const r = service("task_checkpoint");
         if (!r.ok) return r.error;
@@ -307,7 +311,8 @@ export function buildTaskOwnerTools(deps: {
         // Finished and waiting on the owner (as /s stop): its work is done, and
         // cancelling would hide the ask. task_done is what clears it.
         if (needsOwner(record)) return fail("task_cancel", `${record.id} has finished and is waiting for the owner to: ${needsOwner(record)}. There is nothing to cancel. Once they say it is done (or no longer needed), call task_done("${record.id}", ${reportNumber(record)}).`);
-        const outcome = await c.s.cancel(record.id, reason ?? "cancelled from the main session");
+        const said = reason?.trim() ? reason.trim() : undefined;
+        const outcome = await c.s.cancel(record.id, said ?? "cancelled from the main session", !!said);
         if (!outcome.ok) return fail("task_cancel", `${record.id} is ${outcome.from ?? "unknown"}; there is nothing to cancel.`);
         return ok(outcome.changed ? `Cancelled ${record.id}.` : `${record.id} was already cancelled.`);
       },

@@ -196,6 +196,18 @@ describe("sub-session tools", () => {
     expect((await call(owner, "task_status", { id: "s1" })).content[0].text).toContain("Mine");
   });
 
+  it("task_cancel marks a reason it was given as said, and its own default as not", async () => {
+    const svc = service();
+    const owner = buildTaskOwnerTools({ service: () => svc, scope: () => "dm:owner" });
+    await call(owner, "task_spawn", { title: "One", brief: "b" });
+    await call(owner, "task_spawn", { title: "Two", brief: "b" });
+    expect((await call(owner, "task_cancel", { id: "s1", reason: "not needed any more" })).isError).toBeUndefined();
+    expect((await call(owner, "task_cancel", { id: "s2", reason: "  " })).isError).toBeUndefined();
+    expect(svc.get("s1")!.transitions.at(-1)).toMatchObject({ to: "cancelled", reason: "not needed any more", said: true });
+    expect(svc.get("s2")!.transitions.at(-1)).toMatchObject({ to: "cancelled", reason: "cancelled from the main session" });
+    expect(svc.get("s2")!.transitions.at(-1)).not.toHaveProperty("said");
+  });
+
   it("task_message attaches the owner's own messages only when asked and only when the turn has some", async () => {
     const svc = service();
     let mine: Array<{ text: string; at: number; channel: string }> = [];
@@ -403,6 +415,18 @@ describe("sub-session tools", () => {
     expect((await call(self as never, "task_status", {})).content[0].text).toContain("Decisions and updates (newest last):");
     const other = buildTaskSelfTools({ service: () => svc, key: "task:s9" });
     expect((await call(other as never, "task_update", { line: "x" })).isError).toBe(true);
+  });
+
+  it("task_plan nudges toward task_update when steps are finished and no decision is on record", async () => {
+    const svc = service();
+    const created = svc.spawn("dm:owner", { title: "Mine", brief: "b" });
+    if (!created.ok) throw new Error(created.error);
+    const self = buildTaskSelfTools({ service: () => svc, key: created.record.sessionKey });
+    const text = async (args: Record<string, unknown>) => (await call(self as never, "task_plan", args)).content[0].text;
+    expect(await text({ steps: [{ step: "A", status: "in_progress" }, { step: "B" }] })).toBe("Plan saved.");
+    expect(await text({ steps: [{ step: "B", status: "in_progress" }], done: [{ step: "A" }] })).toContain("record it with task_update");
+    await call(self as never, "task_update", { line: "Using B: A was enough" });
+    expect(await text({ steps: [], done: [{ step: "B" }] })).toBe("Plan saved.");
   });
 
   it("task_update keeps every line of a multi-line update, joined into one", async () => {

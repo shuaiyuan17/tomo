@@ -618,7 +618,7 @@ function parseDoneSteps(raw: unknown[]): SubsessionDoneStep[] {
 function parseUpdates(raw: unknown[]): SubsessionUpdate[] {
   return raw.flatMap((e): SubsessionUpdate[] => {
     const entry = timedLine(e, PROGRESS_TEXT_MAX);
-    return entry ? [{ at: entry.at, text: entry.text, ...(entry.rest.kind === "plan" ? { kind: "plan" as const } : {}) }] : [];
+    return entry ? [{ at: entry.at, text: entry.text, ...(entry.rest.kind === "plan" || entry.rest.kind === "release" ? { kind: entry.rest.kind } : {}) }] : [];
   }).slice(-UPDATES_KEEP);
 }
 

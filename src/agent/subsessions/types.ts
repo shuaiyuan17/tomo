@@ -155,6 +155,8 @@ export interface SubsessionTransition {
   to: SubsessionStatus;
   event: string;
   reason?: string;
+  /** The reason is someone's own words (the owning session's task_cancel), not fixed harness text. */
+  said?: true;
 }
 
 /** A plan step the task marked done (task_plan), with the one-line result it gave. */
@@ -167,12 +169,13 @@ export interface SubsessionDoneStep {
 /**
  * A decision or a change the owner should know about (task_update): scope,
  * approach, blocked or unblocked. `kind: "plan"`: the reason task_plan gave
- * for dropping, rewording or reordering steps.
+ * for dropping, rewording or reordering steps. `kind: "release"`: the
+ * harness's line that the owning session lifted a pause (not the task's).
  */
 export interface SubsessionUpdate {
   at: number;
   text: string;
-  kind?: "plan";
+  kind?: "plan" | "release";
 }
 
 /** A step still ahead in a task's plan (task_plan). Done steps leave the plan for the history. */
@@ -431,6 +434,8 @@ export const PROGRESS_TEXT_MAX = 300;
 /** A plan holds at most this many steps, each one line of at most PLAN_STEP_MAX characters. */
 export const PLAN_MAX_STEPS = 8;
 export const PLAN_STEP_MAX = 120;
+/** task_checkpoint's summary, kept whole up to this many characters. */
+export const CHECKPOINT_MAX = 8000;
 /** A finished step's one-line result. */
 export const STEP_RESULT_MAX = 200;
 

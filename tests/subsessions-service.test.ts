@@ -2324,7 +2324,7 @@ describe("SubsessionService: the quota gate", () => {
     // On the record: who let it go on, and it was the main session's note, never the owner's word.
     const record = h.store.get(t.id)!;
     expect(record.transitions.find((x) => x.event === "release")).toMatchObject({ from: "waiting", to: "queued", reason: expect.stringContaining("the main session lifted the pause") });
-    expect(record.updates?.map((u) => u.text)).toEqual(["Pause lifted by the main session; it goes on."]);
+    expect(record.updates?.map((u) => [u.text, u.kind])).toEqual([["Pause lifted by the main session; it goes on.", "release"]]);
     expect(record.activeAtOwnerInputMs).toBeUndefined();
     // The go-ahead was for that work: it left with the finish.
     expect(record.quotaPass).toBeUndefined();

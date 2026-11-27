@@ -132,12 +132,14 @@ describe("sortByRecordTime", () => {
     const input = Array.from({ length: 200 }, (_, i) =>
       record(`undated-${i}`, i % 3 === 0 ? {} : { timestamp: i % 3 === 1 ? 0 : Number.NaN }),
     );
-    expect(contents(sortByRecordTime(input))).toEqual(contents(input));
+    const expected = contents(input);
+    expect(contents(sortByRecordTime(input))).toEqual(expected);
   });
 
   it("keeps records with the same timestamp in input order", () => {
     const input = Array.from({ length: 200 }, (_, i) => record(`same-${i}`, { timestamp: T1 }));
-    expect(contents(sortByRecordTime(input))).toEqual(contents(input));
+    const expected = contents(input);
+    expect(contents(sortByRecordTime(input))).toEqual(expected);
   });
 
   it("breaks ties by input order while still sorting the rest", () => {

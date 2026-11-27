@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { isSecretFieldName, scrubSecretValues } from "../redact.js";
 import { WebError, type WebConfigField, type WebConfigView, type WebMcpServer } from "./protocol.js";
 import { isEnoent } from "../fs-utils.js";
+import { isRecord } from "../is-record.js";
 
 const MAX_CONFIG_BYTES = 1024 * 1024;
 const MAX_FIELDS = 500;
@@ -14,7 +15,6 @@ const MAX_DEPTH = 8;
 const SAFE_MCP_KEYS = new Set(["type", "enabled", "disabled", "timeout", "alwaysLoad"]);
 const MCP_TYPES = new Set(["stdio", "http", "sse", "streamable-http"]);
 
-function record(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }
 function scalar(value: unknown): value is string | number | boolean | null {
   return value === null || ["string", "number", "boolean"].includes(typeof value);
 }
@@ -124,7 +124,7 @@ export function configFields(value: Record<string, unknown>): { fields: WebConfi
   const visit = (current: unknown, path: string[]) => {
     if (fields.length >= MAX_FIELDS) { truncated = true; return; }
     const leafArray = Array.isArray(current) && current.every(scalar);
-    if ((record(current) || (Array.isArray(current) && !leafArray)) && path.length < MAX_DEPTH) {
+    if ((isRecord(current) || (Array.isArray(current) && !leafArray)) && path.length < MAX_DEPTH) {
       const entries = Array.isArray(current) ? current.map((item, i) => [String(i), item] as const) : Object.entries(current);
       if (!entries.length) { fields.push({ path: path.map((segment) => secretShaped(segment) ? "•••" : segment), secret: false, set: false, value: Array.isArray(current) ? [] : {} }); return; }
       for (const [key, child] of entries) visit(child, [...path, key]);
@@ -142,10 +142,10 @@ export function configFields(value: Record<string, unknown>): { fields: WebConfi
 }
 
 export function mcpServers(value: Record<string, unknown>): WebMcpServer[] {
-  const saved = value.mcpServers ?? (record(value.mcp) ? value.mcp.servers : undefined);
-  if (!record(saved)) return [];
+  const saved = value.mcpServers ?? (isRecord(value.mcp) ? value.mcp.servers : undefined);
+  if (!isRecord(saved)) return [];
   return Object.entries(saved).slice(0, 128).map(([name, server]) => {
-    const entry = record(server) ? server : {};
+    const entry = isRecord(server) ? server : {};
     const type = typeof entry.type === "string" && MCP_TYPES.has(entry.type) ? entry.type : entry.url !== undefined ? "http" : "stdio";
     return { name: name.slice(0, 128), enabled: entry.enabled !== false && entry.disabled !== true, type,
       oauth: entry.oauth !== undefined, timeout: typeof entry.timeout === "number" ? entry.timeout : null,
@@ -176,7 +176,7 @@ export class WebConfigReader {
       let value: unknown;
       // A parse error is never echoed: its message can quote the file.
       try { value = JSON.parse(bytes.toString("utf8", 0, bytesRead)); } catch { throw new WebError(503, "config_invalid"); }
-      if (!record(value)) throw new WebError(503, "config_invalid");
+      if (!isRecord(value)) throw new WebError(503, "config_invalid");
       return { value, modifiedAt: stat.mtimeMs };
     } finally { await file.close(); }
   }

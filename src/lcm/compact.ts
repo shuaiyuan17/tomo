@@ -11,6 +11,7 @@ import type { TranscriptEvent } from "../sessions/transcript-event.js";
 import { isRawJsonlLine, parseJsonl, reportRawJsonlLines, serializeJsonlRecord, type RawJsonlLine } from "../jsonl.js";
 import { errorMessage } from "../error-text.js";
 import { removedLoaderIds } from "./loader-ids.js";
+import { sleepSync } from "../sleep.js";
 
 /** Path to the compact trigger file for a given session */
 export function getCompactTriggerPath(sdkSessionId: string, sdkSessionsDir: string): string {
@@ -957,7 +958,7 @@ export function drainOldInodeAfterRename(args: {
  * restructuring the caller as async.
  */
 export function sleepMs(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  sleepSync(ms);
 }
 
 /** A staging corpse is stale once it is older than this. */

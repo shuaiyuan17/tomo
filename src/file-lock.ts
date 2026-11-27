@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { isEnoent } from "./fs-utils.js";
+import { sleepSync } from "./sleep.js";
 
 /**
  * Is `pid` a process we can see? EPERM means it exists and is simply owned by
@@ -252,8 +253,4 @@ function readOwner(file: string): LockOwner | null {
   } catch {
     return null;
   }
-}
-
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }

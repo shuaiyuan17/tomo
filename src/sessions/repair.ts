@@ -4,6 +4,7 @@ import { writeFileAtomicSync } from "../fs-utils.js";
 import type { SessionMessage } from "./types.js";
 import { getSdkSessionPath } from "./store.js";
 import { errorMessage } from "../error-text.js";
+import { isRecord } from "../is-record.js";
 
 const EMPTY_TEXT_PLACEHOLDER = "[empty text block repaired by Tomo]";
 
@@ -206,8 +207,4 @@ function chooseTranscriptReplacement(
 
 function isEmptyTextBlock(value: unknown): boolean {
   return isRecord(value) && value.type === "text" && value.text === "";
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

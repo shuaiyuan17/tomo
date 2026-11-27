@@ -8,7 +8,7 @@ import { basename, dirname, join } from "node:path";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { isPidAlive } from "../file-lock.js";
 import { isEnoent } from "../fs-utils.js";
-import { sleep } from "../sleep.js";
+import { sleep, sleepSync } from "../sleep.js";
 
 const PID_FILE = defaultRuntimePaths.pidFile;
 
@@ -198,10 +198,6 @@ const LOCK_IDENTITY_CHECK_AGE_MS = 10_000;
 /** How long a contender waits for the lock before giving up. */
 const LOCK_WAIT_MS = 5_000;
 const LOCK_POLL_MS = 5;
-
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
 
 function lockDirFor(pidFile: string): string {
   return `${pidFile}.lock`;

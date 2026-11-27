@@ -37,7 +37,7 @@ import { renderBlock, renderResponseBlocks, type ResponseBlock } from "./block-r
 import { summarizeToolInput, summarizeToolResult } from "./tool-summary.js";
 import { buildContentBlocks, isTextBlock, isThinkingBlock, isToolUseBlock } from "./content-blocks.js";
 import { isTaskSystemMessage, TaskTracker, type TaskChange, type TaskSystemMessage } from "./task-tracker.js";
-import { sdkSignalOf, type SdkSignal } from "./sdk-signals.js";
+import { sdkSignalOf, type SdkErrorKind, type SdkSignal } from "./sdk-signals.js";
 import { logInformational } from "./sdk-informational.js";
 import { ReadReceiptTracker } from "./read-receipts.js";
 
@@ -272,6 +272,14 @@ export class LiveSession {
   private currentRequest: TurnRequest | null = null;
   /** Whether the turn now in flight has produced any top-level assistant frame. */
   private turnSawAssistant = false;
+  /**
+   * The CLI's API error message, while it is the last top-level assistant
+   * frame of the turn in flight (a later frame of the model's own clears it:
+   * the turn went on). Its text is never a reply; see handleEvent.
+   */
+  private turnApiError: { kind: SdkErrorKind; text: string } | null = null;
+  /** Whether the turn in flight has a top-level frame of the model's own (text, thinking or a tool call). */
+  private turnHadModelFrame = false;
   // Steered requests confirmed merged into the in-flight turn (we saw the CLI
   // echo their message back mid-turn). Resolved with STEER_MERGED at result.
   private mergedRequests: MessageRequest[] = [];
@@ -1016,7 +1024,27 @@ export class LiveSession {
       // out from under it and receiving its text in the wrong sink.
       if (!this.currentRequest) this.claimFirstUnownedEvent(event.message.content);
 
+      // AN API ERROR MESSAGE IS NOT A REPLY. When a request fails, the CLI
+      // writes the failure as a synthetic assistant message: `error` names the
+      // kind and the text is its own error line ("Not logged in · Please run
+      // /login", "API Error: 529 …"). Shipping that text put a raw CLI error in
+      // the owner's chat as if the model had said it, and kept it in `parts`
+      // as the turn's answer. It is held here instead and becomes the turn's
+      // failure at the result (handleResult), unless the turn goes on.
+      const apiError = signal?.kind === "error" ? signal.error : undefined;
+      if (apiError) {
+        const lines: string[] = [];
+        for (const block of event.message.content) if (isTextBlock(block)) lines.push(block.text);
+        this.turnApiError = { kind: apiError, text: lines.join("\n").trim() };
+      } else {
+        this.turnApiError = null;
+        this.turnHadModelFrame = true;
+      }
+
       for (const block of event.message.content) {
+        if (apiError && (isTextBlock(block) || isThinkingBlock(block))) continue;
+        // A tool call is work whatever frame announced it: never "nothing ran".
+        if (apiError && isToolUseBlock(block)) this.turnHadModelFrame = true;
         if (isTextBlock(block)) {
           this.parts.push({ type: "text", text: block.text });
           await this.shipBlock({ type: "text", text: block.text });
@@ -1146,7 +1174,11 @@ export class LiveSession {
       this.publishSignal({ kind: "stopped" });
       if (this.currentRequest?.replyContext) this.currentRequest.replyContext.stopped = true;
     }
-    const failure = stopped ? null : describeResultFailure(result);
+    const apiError = this.turnApiError;
+    const nothingRan = !this.turnHadModelFrame && this.mergedRequests.length === 0 && this.pendingSteers.length === 0;
+    this.turnApiError = null;
+    this.turnHadModelFrame = false;
+    const failure = stopped ? null : describeResultFailure(result, apiError ? { ...apiError, nothingRan } : undefined);
     if (failure) {
       log.warn(
         { session: this.sessionKey, subtype: result.subtype, errors: result.errors, turns: result.num_turns },
@@ -1211,6 +1243,7 @@ export class LiveSession {
     this.parts = [];
     this.unownedTurnDropLogged = false;
     const req = this.currentRequest;
+    if (failure?.isAuthFailureBeforeAnyWork && this.resendAfterAuthFailure(req)) return;
     if (this.pendingSteers.length === 0) this.clearActivityTimeout();
     // A failed turn REJECTS its owner (blocks already shipped stay shipped;
     // the sink flushes their transcript slots on the rejection path) rather
@@ -1244,6 +1277,42 @@ export class LiveSession {
       this.notifyIdle();
     }
   }
+
+  /**
+   * ONE MORE TRY FOR A LOGIN REFUSED BEFORE ANY WORK.
+   *
+   * The first request of a freshly started CLI child (after a compact reload,
+   * a restart) has been seen to fail with "Not logged in" and the next one,
+   * moments later, to go through. Failing the turn there dropped the owner's
+   * message for a state that had already passed. So the same message is put
+   * on the input queue once more, and only when a second run cannot repeat
+   * anything: the failed turn made no tool call and produced nothing of the
+   * model's own (so no block of it shipped), no steered message is merged or
+   * waiting, and nobody asked to stop it. A second failure (the account
+   * really is logged out) fails the turn like any other.
+   *
+   * THE REQUEST NEVER LETS GO OF THE SESSION. It stays `currentRequest`
+   * across the resend, so the session is busy throughout: nothing else can
+   * claim it in between, and the retried turn can be steered into and stopped
+   * like the first. True when the message was resent (the caller returns
+   * without settling the request).
+   */
+  private resendAfterAuthFailure(req: TurnRequest | null): boolean {
+    const owner = req as MessageRequest | null;
+    if (!owner?.message || !this.alive || this.resentAfterAuthFailure.has(owner)) return false;
+    if (this.mergedRequests.length > 0 || this.pendingSteers.length > 0 || this.stopRequestedFor === owner) return false;
+    this.resentAfterAuthFailure.add(owner);
+    log.warn({ session: this.sessionKey }, "Login refused before the turn did anything; sending the message once more");
+    // A new client uuid: the result of the second run must name this send,
+    // not the one that already ended (attributeResult).
+    owner.message = { ...owner.message, uuid: randomUUID() };
+    if (this.turnBudget) resetTurnBudget(this.turnBudget);
+    this.pushInput(owner.message, owner.replyContext?.requestId, owner.onPromptHandedOff);
+    this.refreshActivityTimeout();
+    return true;
+  }
+  /** Requests whose message was already resent once after a refused login. */
+  private readonly resentAfterAuthFailure = new WeakSet<TurnRequest>();
 
   /**
    * Observability-only path for subagent events (parent_tool_use_id set):
@@ -1656,6 +1725,8 @@ export class LiveSession {
           this.onTurnClaimed();
           this.parts = [];
           this.turnSawAssistant = false;
+          this.turnApiError = null;
+          this.turnHadModelFrame = false;
           this.refreshActivityTimeout();
           this.pushInput(req.message, req.replyContext?.requestId, req.onPromptHandedOff);
           return;

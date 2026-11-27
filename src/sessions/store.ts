@@ -170,6 +170,17 @@ export interface RecallScanBudget {
  */
 export const RECALL_SCAN_BUDGET: Readonly<RecallScanBudget> = { maxMs: 300, maxBytes: 16 * 1024 * 1024 };
 const RECALL_CLOCK_EVERY = 64;
+/** How far into a file the scan looks for its first record before deciding
+ *  whether `toTime` rules the whole file out. */
+const RECALL_FILE_PROBE_BYTES = 64 * 1024;
+
+function safeFileSize(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
+}
 
 interface RecallCandidate {
   msg: SessionMessage;
@@ -777,8 +788,12 @@ export class SessionStore {
    * `before` only saves reading at the grain of a file: a file that starts
    * after `toTime` is passed over, but inside a file the scan still runs from
    * its newest record, and what it passes on the way to the window is charged
-   * to the budget. Rotation keeps a file to one month, far below the budget;
-   * a single file larger than the budget cannot be searched past it.
+   * to the budget. So a retry with `toTime` set to where the last scan
+   * stopped gets further only while the part of that file above `toTime`
+   * fits the budget. When it does not, the scan stops above `toTime` again
+   * and `stopped.reachedBackTo` shows it (it is not below `toTime`): the
+   * caller says that part of history is out of reach rather than suggesting
+   * another retry. Getting past that needs an offset index, which this is not.
    *
    * The window rules are `searchTranscript`'s: only a record whose time is
    * known may end the scan, and a record that cannot be placed under a bound
@@ -825,7 +840,10 @@ export class SessionStore {
       // chronological read set is in time order inside each file too, and
       // like it only a record whose time is known may decide.
       if (ordered && opts.toTime != null) {
-        const first = readFirstJsonlRecordSync<SessionMessage>(path);
+        // One bounded look, charged to the budget: a file whose first record
+        // is not within it is simply read like any other.
+        const first = readFirstJsonlRecordSync<SessionMessage>(path, RECALL_FILE_PROBE_BYTES);
+        progress.bytesRead += Math.min(RECALL_FILE_PROBE_BYTES, safeFileSize(path));
         const firstTime = first ? usableTimestamp(first) : null;
         if (firstTime != null && firstTime > opts.toTime) continue;
       }

@@ -168,11 +168,29 @@ describe("recallTranscript", () => {
     writeTranscript(dir, KEY, Array.from({ length: 1000 }, (_, i) =>
       msg(`filler ${i} ${"x".repeat(150)}`, day(8, 1) + i * 60_000)));
 
-    const result = recall({ queries: ["ramen"], toTime: day(7, 31), budget: { maxBytes: 64 * 1024 } });
+    // Room for the look at each file's first record, and nothing like the
+    // 180 KB the active file would take.
+    const result = recall({ queries: ["ramen"], toTime: day(7, 31), budget: { maxBytes: 100 * 1024 } });
 
     expect(contents(result)).toEqual(["ramen in july"]);
     expect(result.scanned).toBe(1);
     expect(result.stopped).toBeUndefined();
+  });
+
+  it("does not read far into a file to decide whether `toTime` rules it out", () => {
+    // The first record is a line longer than the look the scan allows
+    // itself. The file is then read like any other, within the budget.
+    writeFile(`_archive_${STEM}_2026-07.jsonl`, [msg("ramen in july", day(7, 3))]);
+    writeTranscript(dir, KEY, [
+      msg(`giant ${"x".repeat(600 * 1024)}`, day(8, 1)),
+      msg("ramen in august", day(8, 2)),
+    ]);
+
+    const result = recall({ queries: ["ramen"], toTime: day(7, 31), budget: { maxBytes: 128 * 1024 } });
+
+    // 64 KB for the look, then the budget runs out inside the giant line.
+    expect(contents(result)).toEqual([]);
+    expect(result.stopped).toEqual({ reason: "bytes", reachedBackTo: day(8, 2) });
   });
 
   it("reads a file whose first record is undated even when the rest is after `toTime`", () => {

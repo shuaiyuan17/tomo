@@ -99,21 +99,21 @@ function isWordChar(char: string): boolean {
 }
 
 /**
- * `text` lowercased WITHOUT changing its length, so that an index into the
- * result is an index into `text`. `toLowerCase` can lengthen a string ("İ"
- * becomes two code units), and the excerpt is cut from the original at the
- * position a token was found in the lowercased copy. A character whose
- * lowercase form has another length is kept as it is.
+ * The index in `text` of the character that index `lowerIndex` of
+ * `text.toLowerCase()` came from. The two differ when lowercasing lengthens
+ * the string ("İ" becomes two code units), and the excerpt is cut from the
+ * original at the position a token was found in the lowercased copy.
  */
-export function lowercaseInPlace(text: string): string {
-  const lower = text.toLowerCase();
-  if (lower.length === text.length) return lower;
-  let out = "";
+function indexInOriginal(text: string, lowerIndex: number): number {
+  let original = 0;
+  let lowered = 0;
   for (const char of text) {
-    const folded = char.toLowerCase();
-    out += folded.length === char.length ? folded : char;
+    const next = lowered + char.toLowerCase().length;
+    if (next > lowerIndex) break;
+    lowered = next;
+    original += char.length;
   }
-  return out;
+  return original;
 }
 
 /**
@@ -129,7 +129,7 @@ export function tokenizeRecallQuery(query: string): RecallToken[] {
     seen.add(id);
     tokens.push({ text, kind, maybeArtefact });
   };
-  for (const [segment] of lowercaseInPlace(query).matchAll(SEGMENT)) {
+  for (const [segment] of query.toLowerCase().matchAll(SEGMENT)) {
     const chars = Array.from(segment);
     if (!SPACELESS_CHAR.test(chars[0])) {
       if (chars.length >= 2) add(segment, "word", false);
@@ -234,7 +234,7 @@ export class RecallScorer<T> {
       return this.table.length - 1;
     };
     for (const raw of queries) {
-      const phrase = lowercaseInPlace(raw.trim());
+      const phrase = raw.trim().toLowerCase();
       if (phrase === "") continue;
       const tokens = tokenizeRecallQuery(phrase);
       if (tokens.length === 0) {
@@ -253,7 +253,8 @@ export class RecallScorer<T> {
   /** Count one message of the search window, and keep it if it holds any token. */
   observe(item: T, content: string): void {
     this.observed++;
-    const lower = lowercaseInPlace(content);
+    const lower = content.toLowerCase();
+    const sameLength = lower.length === content.length;
     let tokens: number[] | null = null;
     let positions: number[] | null = null;
     for (let i = 0; i < this.table.length; i++) {
@@ -262,7 +263,7 @@ export class RecallScorer<T> {
       if (at === -1) continue;
       this.holders[i]++;
       (tokens ??= []).push(i);
-      (positions ??= []).push(at);
+      (positions ??= []).push(sameLength ? at : indexInOriginal(content, at));
     }
     if (tokens === null || positions === null) return;
     let phraseMask = 0;

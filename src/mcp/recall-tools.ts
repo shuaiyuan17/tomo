@@ -139,18 +139,27 @@ const DEFAULT_WINDOW_NOTE = ` (the last ${RECALL_DEFAULT_WINDOW_DAYS} days; use 
  * lower bound, with the default window named so a miss is not read as "never
  * said".
  */
-function searchedBackTo(recall: TranscriptRecall, window: RecallWindow): { short: string; note: string } {
+function searchedBackTo(recall: TranscriptRecall, window: RecallWindow, toTime?: number): { short: string; note: string } {
   if (!recall.stopped) {
     const reach = `${formatDate(window.fromTime)}${window.defaultWindow ? DEFAULT_WINDOW_NOTE : ""}`;
     return { short: `searched back to ${reach}`, note: "" };
   }
-  if (recall.stopped.reachedBackTo === null) {
+  const reachedBackTo = recall.stopped.reachedBackTo;
+  if (reachedBackTo === null) {
     return {
       short: "the search stopped before reading the whole time range",
       note: " One search scans a bounded slice of history; narrow the time range with `before` / `after` to cover the rest.",
     };
   }
-  const reached = formatTimestamp(recall.stopped.reachedBackTo);
+  const reached = formatTimestamp(reachedBackTo);
+  if (toTime !== undefined && reachedBackTo >= toTime) {
+    // The scan ran out on its way down to `before`: a retry from here would
+    // stop in the same place, so none is suggested.
+    return {
+      short: `the search got back to ${reached} only, without getting past \`before\``,
+      note: " One search scans a bounded slice of history, newest first, and there is more than that between here and `before`: what is older cannot be reached by this search. Say so rather than concluding it was never said.",
+    };
+  }
   return {
     short: `searched back to ${reached} only`,
     note: ` One search scans a bounded slice of history, newest first, and this one stopped at ${reached}; set \`before\` to that time to search what is older.`,
@@ -162,8 +171,8 @@ function capitalize(text: string): string {
 }
 
 /** Result text for a scored search. Exported for tests. */
-export function formatRecallHits(recall: TranscriptRecall, window: RecallWindow): string {
-  const { short, note } = searchedBackTo(recall, window);
+export function formatRecallHits(recall: TranscriptRecall, window: RecallWindow, toTime?: number): string {
+  const { short, note } = searchedBackTo(recall, window, toTime);
   if (recall.hits.length === 0) {
     return `No matching messages found (${short}).${note} Try other phrasings in queries, fewer or rarer words, or a wider time range.`;
   }
@@ -298,7 +307,7 @@ export function buildRecallTools(deps: RecallToolDeps) {
         const recall = deps.recall({ queries: phrasings, fromTime: window.fromTime, toTime, limit });
         deps.onSearch?.({ matched: recall.matched, stopped: recall.stopped !== undefined });
         return {
-          content: [{ type: "text" as const, text: formatRecallHits(recall, window) }],
+          content: [{ type: "text" as const, text: formatRecallHits(recall, window, toTime) }],
         };
       },
       {

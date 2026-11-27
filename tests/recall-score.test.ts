@@ -205,6 +205,14 @@ describe("recall scoring", () => {
     expect(text.slice(hit.matchIndex, hit.matchIndex + 6)).toBe("flight");
   });
 
+  it("lowercases a message the same way whatever else is in it", () => {
+    // "ΟΣ" lowercases to "ος" (a final sigma) as a word. An unrelated
+    // character that lengthens under lowercasing must not change that.
+    const messages = [...FILLER, "İ ΟΣ"];
+
+    expect(search(messages, "ΟΣ").texts).toEqual(["İ ΟΣ"]);
+  });
+
   it("leaves out a two-character piece that straddles two words and appears nowhere", () => {
     // "搬家时间" cuts to 搬家 / 家时 / 时间. 家时 is in no message: it is an
     // artefact of the cutting, not a rare word the message failed to hold, so

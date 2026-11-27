@@ -449,4 +449,24 @@ describe("formatRecallHits", () => {
     expect(text).toContain("`before` / `after`");
     expect(text).not.toContain("searched back to");
   });
+
+  it("does not suggest a retry when the search ran out before getting past `before`", () => {
+    // A retry with the same `before` would read the same newer records and
+    // stop in the same place.
+    const before = Date.parse("2026-06-01T00:00:00Z");
+    const reachedBackTo = Date.parse("2026-07-10T00:00:00Z");
+    const text = formatRecallHits({ hits: [], matched: 0, scanned: 500, stopped: { reason: "bytes", reachedBackTo } }, window, before);
+
+    expect(text).toContain("got back to 2026-07-10T00:00:00.000Z only, without getting past `before`");
+    expect(text).toContain("cannot be reached by this search");
+    expect(text).not.toContain("set `before` to that time");
+  });
+
+  it("suggests continuing from where it stopped when that is below `before`", () => {
+    const before = Date.parse("2026-08-01T00:00:00Z");
+    const reachedBackTo = Date.parse("2026-07-10T00:00:00Z");
+    const text = formatRecallHits({ hits: [], matched: 0, scanned: 500, stopped: { reason: "time", reachedBackTo } }, window, before);
+
+    expect(text).toContain("set `before` to that time to search what is older");
+  });
 });

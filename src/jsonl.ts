@@ -298,8 +298,9 @@ function parseJsonlRecord<T>(line: string): T | undefined {
 }
 
 /** Read the first record (a line that parses to a JSON object) of a JSONL
- *  file, or undefined. */
-export function readFirstJsonlRecordSync<T = unknown>(path: string): T | undefined {
+ *  file, or undefined. With `maxBytes`, gives up (undefined) rather than read
+ *  further than that into the file looking for one. */
+export function readFirstJsonlRecordSync<T = unknown>(path: string, maxBytes = Infinity): T | undefined {
   let fd: number;
   try {
     fd = openSync(path, "r");
@@ -312,7 +313,8 @@ export function readFirstJsonlRecordSync<T = unknown>(path: string): T | undefin
     let pos = 0;
     let pending = Buffer.alloc(0);
     while (pos < size) {
-      const readSize = Math.min(chunkSize, size - pos);
+      if (pos >= maxBytes) return undefined;
+      const readSize = Math.min(chunkSize, size - pos, maxBytes - pos);
       const buf = Buffer.alloc(readSize);
       readSync(fd, buf, 0, readSize, pos);
       pos += readSize;

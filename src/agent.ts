@@ -707,7 +707,7 @@ export class Agent {
     if (this.messageWakeQueued.has(parentKey)) return;
     this.messageWakeQueued.add(parentKey);
     const prompt = appendToTomoEventBody(formatTomoEvent("subsession-message",
-      "A sub-session (or the harness, about one) handed you something for the owner; it is in a note above. Pass it on as that note says (send_message), hold it for a better moment, or fold it into other news. A question waits for the owner's answer: put it to them, and pass their answer back with task_message and attach_owner_message, in the turn of their answer. If nothing needs doing, end with NO_REPLY.",
+      "A sub-session (or the harness, about one) handed you something for the owner; it is in a note above. Pass it on as that note says (send_message), hold it for a better moment, or fold it into other news. A question waits for the owner's answer: put it to them, and pass their answer back with task_message and attach_owner_message, in the turn of their answer. A task the harness paused at a limit goes on with a task_message of your own once the owner says so (the note says which kind it is). If nothing needs doing, end with NO_REPLY.",
       { name: "check" }), CONTINUITY_DELIVERY_NOTE);
     let ran = false;
     this.enqueueForSession(parentKey, async () => {

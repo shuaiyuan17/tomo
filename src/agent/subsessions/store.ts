@@ -8,6 +8,9 @@ import { IllegalTransitionError, nextStatus, type SubsessionEvent } from "./stat
 import {
   OWNER_MESSAGE_IDS_KEEP,
   OWNER_MESSAGE_MARKER,
+  PAUSE_KINDS,
+  type PauseKind,
+  type QuotaPass,
   CONVERSATION_KEEP,
   DONE_STEPS_KEEP,
   UPDATES_KEEP,
@@ -261,6 +264,11 @@ export class SubsessionStore {
       // waits for the owner's answer (the patch still sees it: a relay that
       // ends the wait is marked as that answer).
       if (record.status !== "waiting" || record.waitingOn !== "owner") delete record.askViaMain;
+      // Why a pause was made stands only while that pause does: not once the
+      // task moved on, nor once it waits on a question instead.
+      if (record.status !== "waiting" || record.waitingOn !== "owner" || record.askViaMain) delete record.pausedBy;
+      // A quota go-ahead is for the work in hand, not for whatever a finished task is woken to do later.
+      if (record.status === "finished" || TERMINAL_STATUSES.has(record.status)) delete record.quotaPass;
       if (record.status !== (target === "same" ? from : target.status)) {
         throw new Error(`Sub-session ${id}: a transition patch may not change the status`);
       }
@@ -504,6 +512,8 @@ function parseRecord(raw: unknown, index: number): SubsessionRecord {
     ...(Array.isArray(r.updates) ? { updates: parseUpdates(r.updates) } : { updates: undefined }),
     sent: Array.isArray(r.sent) ? r.sent as SubsessionRecord["sent"] : [],
     ...parseAskViaMain(r.askViaMain, status, r.waitingOn),
+    ...parsePausedBy(r.pausedBy, status, r.waitingOn),
+    ...(status !== "finished" && !TERMINAL_STATUSES.has(status) && parseQuotaPass(r.quotaPass) ? { quotaPass: parseQuotaPass(r.quotaPass) } : { quotaPass: undefined }),
     // An entry not shaped like a transition (or with a time no Date can show) is dropped.
     transitions: Array.isArray(r.transitions)
       ? (r.transitions as unknown[]).filter((t): t is SubsessionRecord["transitions"][number] => !!t && typeof t === "object"
@@ -527,6 +537,21 @@ function parseLastFailure(value: unknown): { lastFailure?: SubsessionRecord["las
 }
 
 /** A well-formed question handed to the main session, kept only on a task waiting for the owner. */
+function parsePausedBy(value: unknown, status: SubsessionStatus, waitingOn: unknown): { pausedBy?: SubsessionRecord["pausedBy"] } {
+  if (status !== "waiting" || waitingOn !== "owner" || !value || typeof value !== "object") return { pausedBy: undefined };
+  const kind = (value as Record<string, unknown>).kind;
+  // An unknown kind is read as none: only the owner's own words end that wait (fail closed).
+  if (!(PAUSE_KINDS as readonly unknown[]).includes(kind)) return { pausedBy: undefined };
+  const resetsAt = (value as Record<string, unknown>).resetsAt;
+  return { pausedBy: { kind: kind as PauseKind, ...(kind === "quota" && isTimestamp(resetsAt) ? { resetsAt: resetsAt as number } : {}) } };
+}
+
+function parseQuotaPass(value: unknown): QuotaPass | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const v = value as Record<string, unknown>;
+  return isTimestamp(v.until) ? { until: v.until as number } : undefined;
+}
+
 function parseAskViaMain(value: unknown, status: SubsessionStatus, waitingOn: unknown): { askViaMain?: SubsessionRecord["askViaMain"] } {
   if (status !== "waiting" || waitingOn !== "owner" || !value || typeof value !== "object") return { askViaMain: undefined };
   const v = value as Record<string, unknown>;

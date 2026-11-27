@@ -80,9 +80,10 @@ export interface SubsessionInput {
    * harness from the turn they wrote them in, never typed by the model). A
    * turn carrying one is never held by the wall-clock cap or the quota gate,
    * and a failed task hands it back to the owner.
-   * "main": a relay that carries only the owning session's own note. It wakes
-   * the task like any relay, but it is not the owner's word: it passes no
-   * gate, does not restart the wall-clock cap, and is not handed back.
+   * "main": a relay that carries only the owning session's own note. It is
+   * not the owner's word: it answers no question, is not handed back, and by
+   * itself passes no gate and restarts no cap (lifting a harness pause is the
+   * `release` transition's doing, recorded as the session's own act).
    * "harness": the harness's own (a check-back, a "continue", a background
    * report), and every input read without an origin: only an input created
    * as the owner's is ever theirs (never guessed from its text).
@@ -102,6 +103,27 @@ export interface SubsessionInput {
   /** "panel": the owner wrote it in the web task panel (an answer to it stays there). */
   source?: "panel";
 }
+
+/**
+ * How long a go-ahead after a quota pause lasts (ms epoch): until the window
+ * that made the pause resets, or `QUOTA_PASS_FALLBACK_MS` from the go-ahead
+ * when its reset time is not known.
+ */
+export interface QuotaPass { until: number }
+/** A go-ahead after a quota pause whose window gave no reset time lasts this long. */
+export const QUOTA_PASS_FALLBACK_MS = 60 * 60_000;
+
+/** The kinds of pause the harness makes (`SubsessionService.pause`). */
+export const PAUSE_KINDS = ["stopped_by_owner", "turns_failing", "no_progress", "active_hours_cap", "quota"] as const;
+export type PauseKind = typeof PAUSE_KINDS[number];
+
+/**
+ * Pauses the owning session may lift with a task_message of its own (no
+ * owner message attached): the limits the harness watches for the owner.
+ * They are there so somebody knows, not to keep the owning session out,
+ * which speaks for the owner. Not a stop the owner made themselves.
+ */
+export const MAIN_RELEASABLE_PAUSES: ReadonlySet<PauseKind> = new Set<PauseKind>(["quota", "active_hours_cap", "no_progress", "turns_failing"]);
 
 export type InputOrigin = { from: "owner"; words: string; source?: "panel" } | { from: "main"; words: string } | { from: "harness" };
 
@@ -348,6 +370,30 @@ export interface SubsessionRecord {
      */
     direct?: true;
   };
+  /**
+   * Why the harness paused it (`SubsessionService.pause`), kept while it
+   * waits for the owner. A pause of a kind in `MAIN_RELEASABLE_PAUSES` is
+   * there so the owner knows, and the owning session's task_message lifts it
+   * on their behalf; any other waiting(owner) (a question, a stop the owner
+   * made, a self-restart, a wait that recorded nothing) ends only with the
+   * owner's own words. A quota pause keeps when its window resets
+   * (`resetsAt`, when the reading gave it), for the go-ahead's `quotaPass`.
+   * The store drops it on any transition out of waiting(owner), and when a
+   * question replaces the pause.
+   */
+  pausedBy?: { kind: PauseKind; resetsAt?: number };
+  /**
+   * A go-ahead after a quota pause (the owner's own word to the paused task,
+   * or the owning session lifting the pause): the quota gate does not pause
+   * this task for usage again (either window: one go-ahead, one rule)
+   * before `until`: when the window that paused it resets (as the pause read
+   * it: `pausedBy.resetsAt`), or `QUOTA_PASS_FALLBACK_MS` after the go-ahead
+   * when that is not known or already past. Without it
+   * the first turn the task gave itself after the go-ahead would pause again
+   * at once. A time, so nothing has to clear it; the store drops it when the
+   * task finishes or ends.
+   */
+  quotaPass?: QuotaPass;
   /** The newest status changes, oldest first. */
   transitions: SubsessionTransition[];
 }

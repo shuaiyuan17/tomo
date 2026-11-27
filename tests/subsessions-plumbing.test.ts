@@ -216,6 +216,40 @@ describe("sub-session tools", () => {
     expect(svc.get("s1")!.pendingInput.at(-1)!.text).toContain("[1970-01-01T00:00:00.001Z · imessage] ship it");
   });
 
+  it("task_message with no owner message attached lifts a harness pause and says so; a stop the owner made stays theirs", async () => {
+    const svc = service();
+    const owner = buildTaskOwnerTools({ service: () => svc, scope: () => "dm:owner", ownerMessages: () => [] });
+    await call(owner, "task_spawn", { title: "Mine", brief: "b" });
+    const pauseAs = (kind: "quota" | "stopped_by_owner") => {
+      const store = (svc as unknown as { store: SubsessionStore }).store;
+      if (store.get("s1")!.status === "queued") store.transition("s1", "start");
+      store.transition("s1", "stuck", { reason: kind === "quota" ? "the weekly (all models) quota window is at 85%" : "stopped by the owner", patch: (r) => { r.pausedBy = kind === "quota" ? { kind, resetsAt: Date.now() + 3_600_000 } : { kind }; } });
+    };
+    pauseAs("quota");
+    const lifted = await call(owner, "task_message", { id: "s1", text: "继续" });
+    expect(lifted.isError).toBeUndefined();
+    expect(lifted.content[0].text).toContain("Lifted s1's pause (the weekly (all models) quota window is at 85%)");
+    expect(lifted.content[0].text).toContain("the main session lifted it");
+    expect(lifted.content[0].text).toContain("not paused for usage again until the window that paused it resets");
+    expect(svc.get("s1")).toMatchObject({ quotaPass: { until: expect.any(Number) } });
+    expect(svc.get("s1")!.status).not.toBe("waiting");
+    expect(svc.get("s1")!.pendingInput.at(-1)).toMatchObject({ from: "main", words: "继续" });
+
+    pauseAs("stopped_by_owner");
+    const kept = await call(owner, "task_message", { id: "s1", text: "go on" });
+    expect(kept.isError).toBeUndefined();
+    expect(kept.content[0].text).toContain("waits for the owner's own word");
+    expect(kept.content[0].text).toContain("attach_owner_message");
+    expect(svc.get("s1")).toMatchObject({ status: "waiting", waitingOn: "owner" });
+  });
+
+  it("the task_message description no longer says a note cannot lift a pause", () => {
+    const tool = buildTaskOwnerTools({ service: () => service(), scope: () => "dm:owner" }).find((t) => t.name === "task_message")!;
+    expect(tool.description).toContain("goes on with your note alone");
+    expect(tool.description).not.toContain("does not let a paused task run");
+    expect(tool.description).toContain("answer to its question");
+  });
+
   it("task_finish takes what the owner has to do; task_done clears it, only in the owning scope", async () => {
     const svc = service();
     const owner = buildTaskOwnerTools({ service: () => svc, scope: () => "dm:owner" });

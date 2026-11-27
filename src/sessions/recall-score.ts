@@ -99,21 +99,25 @@ function isWordChar(char: string): boolean {
 }
 
 /**
- * The index in `text` of the character that index `lowerIndex` of
- * `text.toLowerCase()` came from. The two differ when lowercasing lengthens
- * the string ("İ" becomes two code units), and the excerpt is cut from the
- * original at the position a token was found in the lowercased copy.
+ * Rewrites `lowerIndexes` (positions in `text.toLowerCase()`) into the
+ * positions in `text` of the characters they came from. The two differ when
+ * lowercasing lengthens the string ("İ" becomes two code units), and the
+ * excerpt is cut from the original at the position a token was found in the
+ * lowercased copy. One walk over the text however many positions there are.
  */
-function indexInOriginal(text: string, lowerIndex: number): number {
+function mapToOriginal(text: string, lowerIndexes: number[]): void {
+  const order = lowerIndexes.map((_, i) => i).sort((a, b) => lowerIndexes[a] - lowerIndexes[b]);
+  let next = 0;
   let original = 0;
   let lowered = 0;
   for (const char of text) {
-    const next = lowered + char.toLowerCase().length;
-    if (next > lowerIndex) break;
-    lowered = next;
+    const end = lowered + char.toLowerCase().length;
+    while (next < order.length && lowerIndexes[order[next]] < end) lowerIndexes[order[next++]] = original;
+    if (next === order.length) return;
+    lowered = end;
     original += char.length;
   }
-  return original;
+  while (next < order.length) lowerIndexes[order[next++]] = original;
 }
 
 /**
@@ -254,7 +258,6 @@ export class RecallScorer<T> {
   observe(item: T, content: string): void {
     this.observed++;
     const lower = content.toLowerCase();
-    const sameLength = lower.length === content.length;
     let tokens: number[] | null = null;
     let positions: number[] | null = null;
     for (let i = 0; i < this.table.length; i++) {
@@ -263,9 +266,10 @@ export class RecallScorer<T> {
       if (at === -1) continue;
       this.holders[i]++;
       (tokens ??= []).push(i);
-      (positions ??= []).push(sameLength ? at : indexInOriginal(content, at));
+      (positions ??= []).push(at);
     }
     if (tokens === null || positions === null) return;
+    if (lower.length !== content.length) mapToOriginal(content, positions);
     let phraseMask = 0;
     for (let q = 0; q < this.queries.length; q++) {
       const query = this.queries[q];

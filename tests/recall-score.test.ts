@@ -203,6 +203,11 @@ describe("recall scoring", () => {
     const [hit] = search([...FILLER, text], "flight noon").hits;
 
     expect(text.slice(hit.matchIndex, hit.matchIndex + 6)).toBe("flight");
+
+    // The first match is the earliest of several, whichever token it is.
+    const later = `${"İ".repeat(40)} at noon the flight leaves`;
+    const [second] = search([...FILLER, later], "flight noon").hits;
+    expect(later.slice(second.matchIndex, second.matchIndex + 4)).toBe("noon");
   });
 
   it("lowercases a message the same way whatever else is in it", () => {

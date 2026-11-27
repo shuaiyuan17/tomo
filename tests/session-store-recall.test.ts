@@ -193,6 +193,24 @@ describe("recallTranscript", () => {
     expect(result.stopped).toEqual({ reason: "bytes", reachedBackTo: day(8, 2) });
   });
 
+  it("counts the files it passes over against the budget", () => {
+    // Every file here starts after `toTime` except the oldest. Each look
+    // costs the file's size (they are small); the budget covers three.
+    for (const month of ["03", "04", "05", "06", "07"]) {
+      writeFile(`_archive_${STEM}_2026-${month}.jsonl`, [msg(`ramen in month ${month} ${"x".repeat(400)}`, day(Number(month), 3))]);
+    }
+    writeTranscript(dir, KEY, [msg(`ramen in august ${"x".repeat(400)}`, day(8, 3))]);
+
+    const result = recall({ queries: ["ramen"], toTime: day(3, 31), budget: { maxBytes: 1500 } });
+
+    expect(contents(result)).toEqual([]);
+    expect(result.stopped).toEqual({ reason: "bytes", reachedBackTo: null });
+
+    const roomy = recall({ queries: ["ramen"], toTime: day(3, 31) });
+    expect(contents(roomy)).toHaveLength(1);
+    expect(roomy.stopped).toBeUndefined();
+  });
+
   it("reads a file whose first record is undated even when the rest is after `toTime`", () => {
     // Only a record whose time is known may rule a file out.
     writeTranscript(dir, KEY, [

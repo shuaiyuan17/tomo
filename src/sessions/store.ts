@@ -840,6 +840,13 @@ export class SessionStore {
       // chronological read set is in time order inside each file too, and
       // like it only a record whose time is known may decide.
       if (ordered && opts.toTime != null) {
+        // The looks are reads too: a long run of files passed over must not
+        // add up to more than the scan may spend.
+        const reason = progress.bytesRead > budget.maxBytes ? "bytes" : now() - startedAt > budget.maxMs ? "time" : null;
+        if (reason) {
+          stopped = { reason, reachedBackTo };
+          break;
+        }
         // One bounded look, charged to the budget: a file whose first record
         // is not within it is simply read like any other.
         const first = readFirstJsonlRecordSync<SessionMessage>(path, RECALL_FILE_PROBE_BYTES);

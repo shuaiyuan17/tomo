@@ -35,8 +35,8 @@ function indexBytes(lines: string[]): number {
  * the longest run of whole lines from the top that fits both limits. THE ONE
  * PLACE the cut is decided: the prompt, the snapshot handed over by
  * buildSystemPrompt and the before-turn re-read (promptContextSnapshot) all
- * call it, since a snapshot cut differently from the prompt would report
- * lines the prompt never showed as unchanged, or shown ones as added.
+ * go through it, since a snapshot cut differently from the prompt would
+ * report lines the prompt never showed as unchanged, or shown ones as added.
  */
 export function fitMemoryIndex(lines: string[]): { shown: string[]; notice?: string } {
   const maxBytes = MEMORY_HARD_KB * KB;
@@ -55,10 +55,25 @@ export function fitMemoryIndex(lines: string[]): { shown: string[]; notice?: str
   const omitted = lines.length - count;
   const lastShown = [...shown].reverse().find((line) => line.trim().length > 0);
   // By code point: a UTF-16 slice could end on half a surrogate pair.
-  const where = lastShown === undefined
+  const where = count === 0
     ? "from the top: the first line alone is over it"
-    : `after the line starting "${Array.from(lastShown).slice(0, 60).join("")}"`;
+    : lastShown === undefined
+      ? `after the first ${count} lines, all blank`
+      : `after the line starting "${Array.from(lastShown).slice(0, 60).join("")}"`;
   return { shown, notice: `(cut at the ${limit} limit: ${omitted} ${omitted === 1 ? "line" : "lines"} omitted ${where})` };
+}
+
+/**
+ * What a live session's snapshot holds for MEMORY.md: the lines its prompt
+ * shows, then the cut notice when there is one. The notice is in so that an
+ * index growing past the hard limit under a live session (or its hidden tail
+ * changing) reads as a change and the session is told; with the shown lines
+ * alone nothing would differ, and its prompt would go on presenting them as
+ * the whole index.
+ */
+function memorySnapshotLines(lines: string[] | null): string[] {
+  const { shown, notice } = fitMemoryIndex(lines ?? []);
+  return notice === undefined ? shown : [...shown, notice];
 }
 
 /** The over-soft-budget line, or undefined within budget. Measured on the whole index, not on what a cut left. */
@@ -319,7 +334,7 @@ export interface PromptContextSnapshot {
  * The MEMORY.md / roster lines a prompt built now would hold — the before-turn
  * re-read compared against a live session's snapshot (which comes from
  * buildSystemPrompt's `onContext`). Read-only: never creates the memory
- * directory. `memory` is only what the prompt shows (fitMemoryIndex).
+ * directory. `memory` is only what the prompt shows (memorySnapshotLines).
  *
  * `strict` throws when MEMORY.md, the people directory or a record cannot be
  * read (only ENOENT counts as missing), instead of returning the partial
@@ -330,13 +345,13 @@ export interface PromptContextSnapshot {
 export function promptContextSnapshot(opts: { isGroup?: boolean; strict?: boolean } = {}): PromptContextSnapshot {
   const isGroup = !!opts.isGroup;
   const strict = !!opts.strict;
-  const memory = fitMemoryIndex(memoryIndexLines(isGroup, strict) ?? []).shown;
+  const memory = memorySnapshotLines(memoryIndexLines(isGroup, strict));
   return { memory, people: peopleRosterLines(isGroup, strict) };
 }
 
 /**
  * `onContext` receives the MEMORY.md and roster lines this prompt was built
- * from — the same read, filtered for the audience and cut (fitMemoryIndex)
+ * from — the same read, filtered for the audience and cut (memorySnapshotLines)
  * exactly as the prompt shows them. A live session keeps that as its snapshot
  * (see LiveSessionManager.takePromptContextNote): a second read could see
  * different files than the prompt did.
@@ -351,7 +366,7 @@ export function buildSystemPrompt(opts: {
   mkdirSync(MEMORY_DIR, { recursive: true });
   const memoryLines = memoryIndexLines(isGroup);
   const rosterLines = peopleRosterLines(isGroup);
-  opts.onContext?.({ memory: fitMemoryIndex(memoryLines ?? []).shown, people: rosterLines });
+  opts.onContext?.({ memory: memorySnapshotLines(memoryLines), people: rosterLines });
   const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup, memoryLines), loadPeopleSection(isGroup, rosterLines),
     isGroup ? HARNESS_INSTRUCTIONS : `${HARNESS_INSTRUCTIONS}\n\n${ownerNotes(!!opts.subsessions)}`].filter(Boolean);
   return sections.join("\n\n---\n\n");

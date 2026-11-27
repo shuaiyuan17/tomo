@@ -112,8 +112,8 @@ describe("buildSystemPrompt", () => {
       writeFileSync(join(peopleDir, "alice.md"), "---\nname: Alice\n---\n");
       let built: { memory: string[]; people: string[] } | undefined;
       const prompt = buildSystemPrompt({ onContext: (c) => { built = c; } });
-      expect(built!.memory).toHaveLength(400);
-      expect(built!.memory).not.toContain("- line 401");
+      expect(built!.memory.slice(0, 400)).toEqual(lines.slice(0, 400));
+      expect(built!.memory.slice(400)).toEqual(['(cut at the 400-line limit: 1 line omitted after the line starting "- line 400")']);
       expect(prompt).toContain("- line 400");
       expect(prompt).not.toContain("- line 401");
       expect(built!.people.join("\n")).toContain("Alice");
@@ -247,9 +247,9 @@ describe("buildSystemPrompt", () => {
       const notice = '(cut at the 400-line limit: 1 line omitted after the line starting "- line 400")';
       for (const isGroup of [false, true]) {
         const { prompt, handed, reread } = build(isGroup);
-        expect(handed).toEqual(numbered(400));
+        expect(handed).toEqual([...numbered(400), notice]);
         expect(reread).toEqual(handed);
-        const body = `${handed.join("\n")}\n\n${notice}`;
+        const body = `${numbered(400).join("\n")}\n\n${notice}`;
         expect(indexBlock(prompt)).toBe(isGroup ? body
           : `⚠ MEMORY.md is 401 lines / 4.2 KB, over its 200-line / 16 KB budget. Keep here only what most conversations need; the rest belongs in topic files.\n\n${body}`);
         expect(prompt).not.toContain("- line 401");
@@ -262,9 +262,10 @@ describe("buildSystemPrompt", () => {
       write(lines);
       for (const isGroup of [false, true]) {
         const { prompt, handed, reread } = build(isGroup);
-        expect(handed).toEqual(lines.slice(0, 32));
+        const notice = `(cut at the 32 KB limit: 8 lines omitted after the line starting "${lines[31].slice(0, 60)}")`;
+        expect(handed).toEqual([...lines.slice(0, 32), notice]);
         expect(reread).toEqual(handed);
-        expect(prompt).toContain(`(cut at the 32 KB limit: 8 lines omitted after the line starting "${lines[31].slice(0, 60)}")`);
+        expect(prompt).toContain(`${lines[31]}\n\n${notice}`);
         expect(prompt).toContain(lines[31]);
         expect(prompt).not.toContain("- 33 ");
       }
@@ -283,8 +284,24 @@ describe("buildSystemPrompt", () => {
       expect(group.prompt).not.toContain("(cut at the");
       expect(group.reread).toEqual(group.handed);
       const dm = build(false);
-      expect(dm.handed).toHaveLength(400);
-      expect(dm.prompt).toContain("(cut at the 400-line limit: 1 line omitted");
+      expect(dm.handed).toHaveLength(401);
+      expect(dm.handed[400]).toContain("(cut at the 400-line limit: 1 line omitted");
+      expect(dm.prompt).toContain(dm.handed[400]);
+    });
+
+    it("a live session is told when the index grows past the hard limit, and when its hidden tail changes", () => {
+      write(numbered(400));
+      const live = build(false).handed;
+      // A 401st line is not shown, but the cut it causes is a change.
+      write(numbered(401));
+      const grown = promptContextSnapshot({ strict: true });
+      const first = classifyPromptContextChange({ memory: live, people: [] }, { memory: grown.memory, people: [] });
+      expect(first.kind === "note" && first.body).toContain('+ (cut at the 400-line limit: 1 line omitted after the line starting "- line 400")');
+      // Another line in the hidden tail changes the count in the notice.
+      write(numbered(402));
+      const second = classifyPromptContextChange({ memory: grown.memory, people: [] }, { memory: promptContextSnapshot({ strict: true }).memory, people: [] });
+      expect(second.kind === "note" && second.body).toContain("+ (cut at the 400-line limit: 2 lines omitted");
+      expect(second.kind === "note" && second.body).toContain("- (cut at the 400-line limit: 1 line omitted");
     });
 
     it("a sub-session prompt carries neither the index nor the reminder", () => {
@@ -313,6 +330,12 @@ describe("buildSystemPrompt", () => {
         const { shown, notice } = fitMemoryIndex(["z".repeat(32 * 1024 + 1), "- next"]);
         expect(shown).toEqual([]);
         expect(notice).toBe("(cut at the 32 KB limit: 2 lines omitted from the top: the first line alone is over it)");
+      });
+
+      it("a shown part that is all blank lines is described as that, not as a first line over the limit", () => {
+        const { shown, notice } = fitMemoryIndex([...Array.from({ length: 400 }, () => ""), "- public entry"]);
+        expect(shown).toHaveLength(400);
+        expect(notice).toBe("(cut at the 400-line limit: 1 line omitted after the first 400 lines, all blank)");
       });
 
       it("a line that lands exactly on 32 KB is kept", () => {

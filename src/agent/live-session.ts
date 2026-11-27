@@ -1043,6 +1043,8 @@ export class LiveSession {
 
       for (const block of event.message.content) {
         if (apiError && (isTextBlock(block) || isThinkingBlock(block))) continue;
+        // A tool call is work whatever frame announced it: never "nothing ran".
+        if (apiError && isToolUseBlock(block)) this.turnHadModelFrame = true;
         if (isTextBlock(block)) {
           this.parts.push({ type: "text", text: block.text });
           await this.shipBlock({ type: "text", text: block.text });

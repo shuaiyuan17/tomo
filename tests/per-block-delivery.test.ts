@@ -397,6 +397,7 @@ describe("CLI API error delivery", () => {
   it.each([
     ["a login refused on the turn's first frame", [], true],
     ["one refused after the model had called a tool", [assistant([toolUseBlock("Bash", "t1")]), toolResult("t1")], false],
+    ["an error frame that itself carries a tool call", [{ ...assistant([toolUseBlock("Bash", "t2")]), error: "authentication_failed" }], false],
   ])("marks only a failure before any work as safe to send again: %s", async (_label, before, safe) => {
     const r = rig();
     const turn = r.session.send("hello");

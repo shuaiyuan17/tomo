@@ -336,6 +336,88 @@ describe("CLI API error delivery", () => {
     expect(r.transcript).toEqual([reply]);
   });
 
+  /**
+   * The CLI reports an API failure as a SYNTHETIC assistant message: the
+   * `error` field names the kind and the one text block is the CLI's own
+   * error line. Not every such line starts with "API Error:" (a failed login
+   * reads "Not logged in · Please run /login"), so the text classifier let it
+   * through and the chat received it as if the model had said it.
+   */
+  const NOT_LOGGED_IN = "Not logged in · Please run /login";
+  const apiErrorMessage = (text: string, error = "authentication_failed") => ({ ...assistant([textBlock(text)]), error });
+
+  it.each([
+    ["an is_error result", true],
+    ["a result not marked as an error", false],
+  ])("never ships the text of an assistant message that carries a typed API error (%s)", async (_label, isError) => {
+    const r = rig();
+    const signals: unknown[] = [];
+    const unsubscribe = watchBus.subscribe((event: { type: string; signal?: unknown }) => {
+      if (event.type === "sdk") signals.push(event.signal);
+    });
+    let ok: boolean;
+    try {
+      ok = await r.run([
+        apiErrorMessage(NOT_LOGGED_IN),
+        { ...result(), is_error: isError, result: NOT_LOGGED_IN },
+      ]);
+    } finally {
+      unsubscribe();
+    }
+
+    // The turn failed: one error line by the turn's error policy, and the CLI's
+    // line never on its own, as a reply.
+    expect(ok).toBe(false);
+    const texts = r.channel.sent.map((message) => message.text);
+    expect(texts).not.toContain(NOT_LOGGED_IN);
+    expect(texts).toHaveLength(1);
+    expect(texts[0]).toMatch(/^\[error\] /);
+    expect(texts[0]).toContain(NOT_LOGGED_IN);
+    expect(r.transcript).not.toContain(NOT_LOGGED_IN);
+    expect(r.transcript).toEqual([texts[0]]);
+    // The web UI still hears about it.
+    expect(signals).toContainEqual({ kind: "error", error: "authentication_failed" });
+  });
+
+  it("keeps the model's earlier text and drops only the API error message's", async () => {
+    const r = rig();
+    const ok = await r.run([
+      assistant([textBlock("Earlier output")]),
+      apiErrorMessage(NOT_LOGGED_IN),
+      { ...result(), is_error: true, result: NOT_LOGGED_IN },
+    ]);
+    expect(ok).toBe(false);
+    const texts = r.channel.sent.map((message) => message.text);
+    expect(texts[0]).toBe("Earlier output");
+    expect(texts).not.toContain(NOT_LOGGED_IN);
+    expect(texts).toHaveLength(2);
+    expect(texts[1]).toContain(NOT_LOGGED_IN);
+  });
+
+  it.each([
+    ["a login refused on the turn's first frame", [], true],
+    ["one refused after the model had called a tool", [assistant([toolUseBlock("Bash", "t1")]), toolResult("t1")], false],
+  ])("marks only a failure before any work as safe to send again: %s", async (_label, before, safe) => {
+    const r = rig();
+    const turn = r.session.send("hello");
+    turn.catch(() => {});
+    while (harnessRef.current!.inputs.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+    harnessRef.current!.enqueue([...before, apiErrorMessage(NOT_LOGGED_IN), { ...result(), is_error: true, result: NOT_LOGGED_IN }]);
+    await expect(turn).rejects.toMatchObject({ message: NOT_LOGGED_IN, isAuthFailureBeforeAnyWork: safe });
+  });
+
+  it("a turn that recovers after an API error message is not failed by it", async () => {
+    const r = rig();
+    const ok = await r.run([
+      apiErrorMessage("API Error: the response exceeded the output token maximum", "max_output_tokens"),
+      assistant([textBlock("Recovered answer")]),
+      result(),
+    ]);
+    expect(ok).toBe(true);
+    expect(r.channel.sent.map((message) => message.text)).toEqual(["Recovered answer"]);
+    expect(r.transcript).toEqual(["Recovered answer"]);
+  });
+
   it.each([false, true])("delivers a safeguard error once, preserving earlier output (%s)", async (withEarlierOutput) => {
     const r = rig();
     const error = "API Error: Example Model's safeguards flagged this message.\nDetails: [example_category]\nRequest ID: req_example";

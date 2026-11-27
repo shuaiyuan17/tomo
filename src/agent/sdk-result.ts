@@ -1,6 +1,7 @@
 /** SDK result classification for one LiveSession turn: fabricated replies, result errors, token totals. */
 
 import type { ModelCounters, UsageBaseline } from "../sessions/types.js";
+import type { SdkErrorKind } from "./sdk-signals.js";
 
 /**
  * Sentinel resolution for a steered message that merged into the in-flight
@@ -160,6 +161,19 @@ export function mainLoopUsage(result: SdkResultLike): TokenTotals {
 }
 
 /**
+ * The CLI's own API error message, when it is the last thing the turn's
+ * assistant said: a synthetic assistant message whose `error` names the kind
+ * and whose text is the error line ("Not logged in · Please run /login").
+ */
+export interface TurnApiError {
+  kind: SdkErrorKind;
+  /** The error line, as the CLI wrote it. */
+  text: string;
+  /** Before it, the turn made no tool call, produced no block of the model's own, and took in no steered message. */
+  nothingRan: boolean;
+}
+
+/**
  * A turn the CLI ended on a non-success result. Thrown (rejected) from
  * send()/steer() so the failure travels the same path as any other turn
  * error and TurnRunner's `TurnErrorPolicy` decides what the chat sees —
@@ -175,9 +189,22 @@ export class SdkResultError extends Error {
     readonly errors: string[] = [],
     /** `num_turns` from the result, when the SDK reported it. 0 = nothing ran. */
     readonly numTurns?: number,
+    /** The typed API error the turn's last assistant message carried, if it ended on one. */
+    readonly apiError?: Pick<TurnApiError, "kind" | "nothingRan">,
   ) {
     super(message);
     this.name = "SdkResultError";
+  }
+
+  /**
+   * The login was refused before the model did anything: no tool call, no
+   * block of its own, no steered message folded in. Seen as a passing state
+   * on the first request of a freshly started CLI, so the same prompt is safe
+   * to send once more (LiveSessionManager): nothing of the turn exists to
+   * repeat. An account that really is logged out fails the second time too.
+   */
+  get isAuthFailureBeforeAnyWork(): boolean {
+    return this.apiError?.kind === "authentication_failed" && this.apiError.nothingRan;
   }
 
   /**
@@ -233,19 +260,26 @@ export class TurnInterruptedError extends Error {
  * `error_*`, so an unrecognised `error_*` subtype is treated as an execution
  * error rather than as success.
  */
-export function describeResultFailure(result: SdkResultLike): SdkResultError | null {
+export function describeResultFailure(result: SdkResultLike, apiError?: TurnApiError): SdkResultError | null {
   const errors = result.errors ?? [];
+  const typed = apiError ? { kind: apiError.kind, nothingRan: apiError.nothingRan } : undefined;
   switch (result.subtype) {
     case "success":
-      if (!result.is_error) return null;
-      return new SdkResultError(result.result?.trim() || "API Error: the turn ended on an API error", result.subtype, errors);
+      // A turn whose last assistant message was the CLI's API error message
+      // failed, whether or not the result says so: its only "answer" is that
+      // error text, which must not pass for a reply.
+      if (!result.is_error && !apiError) return null;
+      return new SdkResultError(
+        (result.is_error ? result.result?.trim() : "") || apiError?.text.trim() || "API Error: the turn ended on an API error",
+        result.subtype, errors, result.num_turns, typed,
+      );
     case "error_max_turns":
-      return new SdkResultError(MAX_TURNS_RESPONSE, result.subtype, errors);
+      return new SdkResultError(MAX_TURNS_RESPONSE, result.subtype, errors, undefined, typed);
     case "error_max_budget_usd":
-      return new SdkResultError(MAX_BUDGET_RESPONSE, result.subtype, errors);
+      return new SdkResultError(MAX_BUDGET_RESPONSE, result.subtype, errors, undefined, typed);
     default:
       return result.subtype.startsWith("error") || result.is_error
-        ? new SdkResultError(EXECUTION_ERROR_RESPONSE, result.subtype, errors, result.num_turns)
+        ? new SdkResultError(EXECUTION_ERROR_RESPONSE, result.subtype, errors, result.num_turns, typed)
         : null;
   }
 }

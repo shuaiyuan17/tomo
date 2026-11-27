@@ -117,6 +117,9 @@ async function withTimeout(promise: Promise<unknown>, ms: number): Promise<boole
   }
 }
 
+/** How long a login refused before any work is given to settle before the one retry. */
+const AUTH_RETRY_DELAY_MS = 1_000;
+
 function isRecoverableSessionError(errMsg: string): boolean {
   return errMsg.includes("No conversation found")
     || /session (?:is )?closed/i.test(errMsg)
@@ -240,6 +243,8 @@ export interface LiveSessionManagerDeps {
   handleTurnComplete?(key: string): void;
   /** Post-turn context-pressure check (Agent.maybeNudgeCompact). */
   maybeNudgeCompact(key: string, ctx: QueryResult | null): void;
+  /** Wait before the one retry of a login refused before any work (tests: 0). Default 1s. */
+  authRetryDelayMs?: number;
   /**
    * After a turn: is the context full enough (or did the turn end on "Prompt
    * is too long") for the harness to compact the session itself
@@ -1520,6 +1525,8 @@ export class LiveSessionManager {
       // One exception: a resume that can't find its conversation. Current SDKs
       // report it as a zero-turn error result instead of throwing, so nothing
       // ran and the reset-and-retry below must still fire (see isResumeMissing).
+      // The other: the login refused before the model did anything.
+      if (err instanceof SdkResultError && err.isAuthFailureBeforeAnyWork) return await this.retryAfterAuthFailure(req, token, err);
       if (err instanceof SdkResultError && !err.isResumeMissing) throw err;
 
       // A missing-conversation result reaches here only with every error saying
@@ -1622,6 +1629,36 @@ export class LiveSessionManager {
 
       throw err;
     }
+  }
+
+  /**
+   * ONE MORE TRY FOR A LOGIN REFUSED BEFORE ANY WORK.
+   *
+   * The first request of a freshly started CLI child (after a compact reload,
+   * a restart) has been seen to fail with "Not logged in" and the next one,
+   * moments later, to go through. Giving up there dropped the owner's message
+   * for a state that had already passed. So the same prompt is sent once more,
+   * and only when a second run cannot repeat anything: the failed turn made no
+   * tool call and produced nothing of the model's own (isAuthFailureBeforeAnyWork),
+   * nothing has shipped, it is not a steered message, and the session is not
+   * already running something else. Otherwise, and when the second try fails
+   * too (the account really is logged out), the error goes to TurnRunner's
+   * error policy like any other failed turn.
+   */
+  private async retryAfterAuthFailure(req: RunWithRetryRequest, token: { interrupted: boolean }, err: SdkResultError): Promise<string> {
+    const { key, prompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery } = req;
+    if (req.steer || this.stopping || req.hasShipped?.()) throw err;
+    await new Promise<void>((resolve) => { setTimeout(resolve, this.deps.authRetryDelayMs ?? AUTH_RETRY_DELAY_MS); });
+    if (token.interrupted) throw new TurnInterruptedError();
+    if (this.stopping || req.hasShipped?.()) throw err;
+    // The failed attempt may have retired its session (a compact reload).
+    const session = await this.getOrCreateLiveSession(key, () => token.interrupted);
+    if (token.interrupted) throw new TurnInterruptedError();
+    if (!session.isAlive() || session.isBusy()) throw err;
+    log.warn({ key, err: err.message }, "Login refused before the turn did anything; sending the prompt once more");
+    const retryPrompt = this.promptForSession(key, req.contextNote, session, prompt);
+    return await this.runTurnOnSession(key, session, false, () =>
+      session.send(retryPrompt, images, documents, onBlock, onBlockAbandoned, origin, silentDelivery, req.replyContext, req.onPromptHandedOff));
   }
 
   /**

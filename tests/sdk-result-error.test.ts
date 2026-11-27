@@ -21,3 +21,37 @@ describe("SdkResultError.isResumeMissing", () => {
     expect(describeResultFailure(result)?.isResumeMissing).toBe(expected);
   });
 });
+
+/**
+ * The CLI's API error message as the turn's last assistant frame: the turn
+ * failed even when the result is not marked `is_error`, and only a login
+ * refused before any work may be sent again.
+ */
+describe("describeResultFailure with the turn's API error message", () => {
+  const text = "Not logged in · Please run /login";
+  const auth = { kind: "authentication_failed" as const, text, nothingRan: true };
+
+  it("is a failure carrying the error line even when the result is not marked as an error", () => {
+    const failure = describeResultFailure({ subtype: "success", result: text, num_turns: 1 }, auth);
+    expect(failure?.message).toBe(text);
+    expect(failure?.isAuthFailureBeforeAnyWork).toBe(true);
+  });
+
+  it("keeps the result's own error text on an is_error result", () => {
+    const failure = describeResultFailure({ subtype: "success", is_error: true, result: "API Error: 401 nope" }, auth);
+    expect(failure?.message).toBe("API Error: 401 nope");
+    expect(failure?.isAuthFailureBeforeAnyWork).toBe(true);
+  });
+
+  it.each([
+    ["the turn had done something", { ...auth, nothingRan: false }],
+    ["the error is another kind", { ...auth, kind: "overloaded" as const }],
+  ])("is not safe to send again when %s", (_label, apiError) => {
+    expect(describeResultFailure({ subtype: "success", is_error: true, result: text }, apiError)?.isAuthFailureBeforeAnyWork).toBe(false);
+  });
+
+  it("is not safe to send again without a typed API error", () => {
+    expect(describeResultFailure({ subtype: "success", is_error: true, result: text })?.isAuthFailureBeforeAnyWork).toBe(false);
+    expect(describeResultFailure({ subtype: "success", result: "fine" })).toBeNull();
+  });
+});

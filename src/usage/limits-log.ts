@@ -243,7 +243,8 @@ export const QUOTA_GATE_SAMPLE_MAX_AGE_MS = 6 * 60 * 60_000;
 export const QUOTA_REFRESH_TIMEOUT_MS = 60_000;
 
 export type QuotaGateWindow = "five_hour" | "weekly";
-export interface QuotaGateReading { window: QuotaGateWindow; percent: number }
+/** `resetsAt` (ms epoch): when that window next resets, when its sample said so. */
+export interface QuotaGateReading { window: QuotaGateWindow; percent: number; resetsAt?: number }
 
 /**
  * What the sub-session quota gate reads: the higher of the 5-hour and the
@@ -261,11 +262,11 @@ export function readQuotaGateReading(path: string, now = Date.now()): QuotaGateR
     const at = Date.parse(s.ts);
     return Number.isFinite(at) && now - at < QUOTA_GATE_SAMPLE_MAX_AGE_MS;
   });
-  const session = windowPercent(samples, sessionWindow, FIVE_HOURS_MS, now);
-  const weekly = windowPercent(samples, weeklyWindow, SEVEN_DAYS_MS, now);
+  const session = windowReading(samples, sessionWindow, FIVE_HOURS_MS, now);
+  const weekly = windowReading(samples, weeklyWindow, SEVEN_DAYS_MS, now);
   if (session === undefined && weekly === undefined) return undefined;
-  if (weekly !== undefined && (session === undefined || weekly > session)) return { window: "weekly", percent: weekly };
-  return { window: "five_hour", percent: session! };
+  if (weekly !== undefined && (session === undefined || weekly.percent > session.percent)) return { window: "weekly", ...weekly };
+  return { window: "five_hour", ...session! };
 }
 
 /**
@@ -383,11 +384,21 @@ function windowPercent(
   spanMs: number,
   now: number,
 ): number | undefined {
+  return windowReading(samples, pick, spanMs, now)?.percent;
+}
+
+/** A window's share used and, when its sample gives one, its reset time. */
+function windowReading(
+  samples: readonly LimitSample[],
+  pick: (sample: LimitSample) => LimitWindowSample | undefined,
+  spanMs: number,
+  now: number,
+): { percent: number; resetsAt?: number } | undefined {
   for (const sample of samples) {
     const window = pick(sample);
     if (!window) {
       // A usage read lists every window in force: one it lacks is not in force.
-      if (sample.source === "oauth-usage") return 0;
+      if (sample.source === "oauth-usage") return { percent: 0 };
       continue;
     }
     // The window is there but this sample has no reading of it: it says nothing
@@ -396,8 +407,8 @@ function windowPercent(
     // Past its reset, or older than the window is long (so it has reset since): nothing used yet.
     const resetsAt = window.resetsAt ? Date.parse(window.resetsAt) : NaN;
     const sampledAt = Date.parse(sample.ts);
-    if ((Number.isFinite(resetsAt) && resetsAt <= now) || (Number.isFinite(sampledAt) && now - sampledAt >= spanMs)) return 0;
-    return window.percent;
+    if ((Number.isFinite(resetsAt) && resetsAt <= now) || (Number.isFinite(sampledAt) && now - sampledAt >= spanMs)) return { percent: 0 };
+    return { percent: window.percent, ...(Number.isFinite(resetsAt) ? { resetsAt } : {}) };
   }
   return undefined;
 }

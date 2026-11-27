@@ -26,6 +26,7 @@ const EXPECTED: Record<SubsessionEvent, Record<State, string>> = {
   owner_message:     { queued: "=", active: "=", "waiting(owner)": "active", "waiting(external)": "active", finished: "=", cancelled: "-", failed: "-", archived: "-" },
   relay:             { queued: "=", active: "=", "waiting(owner)": "active", "waiting(external)": "active", finished: "=", cancelled: "-", failed: "-", archived: "-" },
   note:              { queued: "=", active: "=", "waiting(owner)": "-", "waiting(external)": "queued", finished: "=", cancelled: "-", failed: "-", archived: "-" },
+  release:           { queued: "-", active: "-", "waiting(owner)": "queued", "waiting(external)": "-", finished: "-", cancelled: "-", failed: "-", archived: "-" },
   cron_wake:         { queued: "=", active: "=", "waiting(owner)": "=", "waiting(external)": "queued", finished: "-", cancelled: "-", failed: "-", archived: "-" },
   background_report: { queued: "=", active: "=", "waiting(owner)": "=", "waiting(external)": "queued", finished: "=", cancelled: "-", failed: "-", archived: "-" },
   restart:           { queued: "-", active: "queued", "waiting(owner)": "-", "waiting(external)": "-", finished: "-", cancelled: "-", failed: "-", archived: "-" },

@@ -19,12 +19,14 @@ import type { SubsessionStatus, WaitingOn } from "./types.js";
  *   service's driver (`waitsForSlot`), since no status change marks it.
  * - THE OWNER IS NEVER QUEUED. A message from the owner (or a relay from the
  *   owning session that carries the owner's own words) gets its turn
- *   whatever the slots say, and wakes a waiting task. A waiting(owner) task
- *   is woken by nothing else: a cron firing there is kept for the owner's
+ *   whatever the slots say, and wakes a waiting task. Nothing autonomous
+ *   wakes a waiting(owner) task: a cron firing there is kept for the owner's
  *   wake ("same"), not a turn of its own.
  * - The owning session's own note (`note`, no words of the owner's in it) is
  *   autonomous work: it wakes a task waiting on something external into
- *   `queued`, never past the slot cap.
+ *   `queued`, never past the slot cap. To a task the harness paused at one
+ *   of its limits it is a `release`: the pause ends, into `queued` too. A
+ *   question to the owner is never ended that way.
  */
 export const SUBSESSION_EVENTS = [
   "start",
@@ -36,6 +38,7 @@ export const SUBSESSION_EVENTS = [
   "owner_message",
   "relay",
   "note",
+  "release",
   "cron_wake",
   "background_report",
   "restart",
@@ -90,6 +93,11 @@ export function nextStatus(status: SubsessionStatus, waitingOn: WaitingOn | unde
       // could append it unheld and let restart recovery end that wait.
       if (waiting) return waitingOn === "external" ? QUEUED : null;
       return status === "queued" || status === "active" || status === "finished" ? "same" : null;
+    case "release":
+      // The owning session lifts a pause the harness made (the service checks
+      // which pauses it may). Its own act, not the owner's message: through
+      // the scheduler, like its note to a task waiting on something external.
+      return waiting && waitingOn === "owner" ? QUEUED : null;
     case "cron_wake":
       if (waiting) return waitingOn === "external" ? QUEUED : "same";
       return status === "queued" || status === "active" ? "same" : null;

@@ -192,6 +192,12 @@ describe("via-main (default): a task's harness notices go to the owning session,
       expect(mine).toHaveLength(1);
       expect(mine[0]).toContain(`(kind: ${k.kind})`);
       expect(mine[0]).toContain("Decide whether, when and how the owner hears it");
+      // Who may let it go on: a harness limit is lifted by the session's own
+      // task_message; a stop the owner made, or a self-restart, only by their word.
+      const lifts = ["no_progress", "turns_failing", "quota", "active_hours_cap"].includes(k.kind);
+      const ownerOnly = ["stopped_by_owner", "self_restart"].includes(k.kind);
+      expect(mine[0].includes("lifts the pause (your own note is enough, no attach_owner_message needed")).toBe(lifts);
+      expect(mine[0].includes("Only the owner's own word lets it go on")).toBe(ownerOnly);
       // On disk, so it survives a restart; and the session is woken for it.
       expect((h.disk.get("dm:owner") ?? []).filter((n) => isNotice(n) && n.includes(k.says))).toHaveLength(1);
       expect(h.messageWakes).toContain("dm:owner");

@@ -17,6 +17,7 @@ import {
   formatNewInputNote,
   formatRedeliveryNote,
   formatRelayEvent,
+  formatReleaseEvent,
   formatOwnerMessageEvent,
   formatResumeEvent,
   formatMirrorNote,
@@ -24,7 +25,7 @@ import {
 } from "./prompt.js";
 import type { OwnerTurnMessage } from "../audience.js";
 import { classifyFailure, failureDetail, failureHint, type TurnFailure } from "./failure.js";
-import { OPEN_STATUSES, OWNER_ACTION_MAX, OWNER_MESSAGE_MARKER, PENDING_INPUT_MAX, PENDING_INPUT_OWNER_RESERVE, needsOwner, reportNumber, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, STEP_RESULT_MAX, TERMINAL_STATUSES, oneLine, type SubsessionPlanStep, activeTotalMs, appendInput, HARNESS, type InputOrigin, lastInputSeq, type SubsessionConversationEntry, type SubsessionInput, type SubsessionRecord, type SubsessionStatus } from "./types.js";
+import { MAIN_RELEASABLE_PAUSES, QUOTA_PASS_FALLBACK_MS, type PauseKind, OPEN_STATUSES, OWNER_ACTION_MAX, OWNER_MESSAGE_MARKER, PENDING_INPUT_MAX, PENDING_INPUT_OWNER_RESERVE, needsOwner, reportNumber, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, STEP_RESULT_MAX, TERMINAL_STATUSES, oneLine, type SubsessionPlanStep, activeTotalMs, appendInput, HARNESS, type InputOrigin, lastInputSeq, type SubsessionConversationEntry, type SubsessionInput, type SubsessionRecord, type SubsessionStatus } from "./types.js";
 
 
 /** How a task turn ended, as the agent's turn runner saw it. */
@@ -394,6 +395,8 @@ function formatNoticeNote(notice: string, cause: NoticeCause, name: string, reco
     lines.push("");
     if (cause.ended) lines.push(`It has ended; nothing resumes it. If the work is still needed, start it again with task_spawn. task_status ${id} shows what it did.`);
     else if (cause.finished) lines.push(`task_message ${id} reopens it with what you write (the owner can also write /s ${id} …). task_status ${id} shows its record.`);
+    else if ((MAIN_RELEASABLE_PAUSES as ReadonlySet<string>).has(cause.kind)) lines.push(`It is paused so that the owner knows, not to keep you out. task_message ${id} with what it should do lifts the pause (your own note is enough, no attach_owner_message needed; it is recorded as lifted by you): do that when the owner says it should go on, in whatever words and whichever turn, or when they already told you how to handle this; otherwise tell them first.${cause.kind === "quota" ? " Once lifted, it is not paused for usage again until the window that paused it resets." : ""} The owner can also write /s ${id} …. To end it: task_cancel ${id}. task_status ${id} shows its plan and steps.`);
+    else if (cause.kind === "stopped_by_owner" || cause.kind === "self_restart") lines.push(`Only the owner's own word lets it go on: they write /s ${id} …, or tell you and you pass it with task_message ${id} and attach_owner_message in the turn of their message. A note of your own is kept for it until then. To end it: task_cancel ${id}. task_status ${id} shows its plan and steps.`);
     else lines.push(`To go on: task_message ${id} with what it should do (the owner can also write /s ${id} …). To end it: task_cancel ${id}. task_status ${id} shows its plan and steps.`);
   } else {
     lines.push("The harness has news about the sub-sessions and hands it to you instead of the owner's chat:", notice, "", `Why: ${cause.reason}.`, "Any /s command it names is the owner's to send.");
@@ -732,16 +735,21 @@ export class SubsessionService {
   }
 
   /** The owning session passes something on. */
-  relay(id: string, text: string, ownerMessages: readonly OwnerTurnMessage[] = []): TransitionOutcome & { held?: "answer" | "paused" } {
+  relay(id: string, text: string, ownerMessages: readonly OwnerTurnMessage[] = []): TransitionOutcome & { held?: "answer" | "paused"; released?: MainRelease } {
     if (!this.available()) return { ok: false, from: null };
     if (ownerMessages.length === 0) {
-      // A task waiting for the owner is woken only by the owner's own
-      // words. A note without them does not end the wait (to a question, it
-      // would only ask again, and the two sessions could go round for good;
-      // to a pause, the time or usage limit would pause it again at once): it
-      // is kept, held, and goes to the task with the owner's word. Every
-      // waiting(owner) task is held so, whether or not it recorded what it
-      // waits on (fail closed).
+      // A pause the harness made at one of its limits (usage, time on its
+      // own, no progress, failing turns) is there so the owner knows, not to
+      // keep the owning session out: it speaks for the owner, and its note
+      // lifts the pause, on the record as its doing.
+      const released = this.releaseByMain(id, text);
+      if (released) return released;
+      // Any other wait for the owner ends only with the owner's own words:
+      // a question (the session must not answer it for them: a note would
+      // only make the task ask again, and the two could go round for good),
+      // a stop the owner made, a self-restart, and a wait that recorded
+      // nothing (fail closed). The note is kept, held, and goes to the task
+      // with the owner's word.
       const held = this.holdForAnswer(id, text);
       if (held) return held;
     }
@@ -759,6 +767,42 @@ export class SubsessionService {
     // with none of the owner's words is the session's own (autonomous) work:
     // it queues a task waiting on something external, never past the cap.
     return this.deliverInput(id, ownerMessages.length > 0 ? "relay" : "note", (r) => formatRelayEvent(text, r.askViaMain && !r.askViaMain.direct ? r.askViaMain.text : undefined, ownerMessages), origin);
+  }
+
+  /**
+   * relay() of a note alone to a task the harness paused at one of its limits
+   * (`MAIN_RELEASABLE_PAUSES`): the pause ends and the note goes with the
+   * task's next turn. Through the scheduler (`release` → queued): the
+   * session's own act takes a slot like its other notes. What made the pause
+   * is not left to make it again at once: a time cap counts from here, and a
+   * usage pause leaves a `quotaPass`. Undefined when the task is not in such
+   * a pause (the caller holds the note or delivers it as usual).
+   */
+  private releaseByMain(id: string, text: string): (TransitionOutcome & { released?: MainRelease }) | undefined {
+    const before = this.store.get(id);
+    if (!before || !mainMayRelease(before)) return undefined;
+    const kind = before.pausedBy!.kind;
+    const why = before.waitingReason;
+    const now = this.now();
+    const outcome = this.transition(id, "release", {
+      reason: `the main session lifted the pause${why ? ` (${why})` : ""}`,
+      expectFrom: ["waiting"],
+      guard: (r) => (mainMayRelease(r) ? inputQueueFull(r) : NOT_RELEASABLE),
+      patch: (r) => {
+        appendInput(r, formatReleaseEvent(text, why), { from: "main", words: text });
+        if (kind === "active_hours_cap") r.activeAtOwnerInputMs = activeTotalMs(r, now);
+        grantQuotaPass(r, now);
+        // A fresh count: the note tells it how to go on, and one quiet turn
+        // must not pause it again at once.
+        if (kind === "no_progress") r.turnsWithoutProgress = 0;
+        // Where the owner looks ("Decisions and updates"): who let it go on.
+        (r.updates ??= []).push({ at: now, text: ownerT("subsessions")("releasedByMain") });
+      },
+    });
+    if (!outcome.ok) return outcome.refused === NOT_RELEASABLE ? undefined : outcome;
+    log.info({ id, kind, why }, "The main session lifted a sub-session's pause");
+    this.safely(() => this.schedule(), "schedule after a lifted pause");
+    return { ...outcome, record: this.safeGet(id) ?? outcome.record, released: { kind, ...(why ? { reason: why } : {}) } };
   }
 
   /** relay() of a note alone to a task waiting for the owner: kept for the owner's wake ("answer" to a recorded question, else "paused"); undefined when the task is not waiting for the owner. */
@@ -2077,8 +2121,10 @@ export class SubsessionService {
     // it, or a relay with theirs attached) never waits for a slot. Read from
     // the table, so a start that failed, or that a restart cut off, is made
     // here the next time the scheduler runs.
+    // (Not words of theirs a pause kept, which a release by the owning
+    // session brings back: that start is the session's, and takes a slot.)
     for (const task of queued) {
-      if (!task.pendingInput.some(isOwnerInput)) continue;
+      if (!hasNewOwnerInput(task)) continue;
       try {
         if (this.startTask(task.id, "the owner wrote to it")) active += 1;
       } catch (err) {
@@ -2221,7 +2267,11 @@ export class SubsessionService {
         appendInput(r, typeof prompt === "string" ? prompt : prompt(r), origin);
         // The owner's word: the wall-clock cap counts from here again. A note
         // the main session wrote itself is not their word.
-        if (origin.from === "owner") r.activeAtOwnerInputMs = activeTotalMs(r, now);
+        if (origin.from === "owner") {
+          r.activeAtOwnerInputMs = activeTotalMs(r, now);
+          // Their go-ahead after a usage pause holds past this one turn (see `quotaPass`).
+          grantQuotaPass(r, now);
+        }
         extra?.(r);
       },
     });
@@ -2690,7 +2740,7 @@ export class SubsessionService {
    */
   private pause(
     record: SubsessionRecord,
-    why: { kind: string; reason: string; failure?: boolean },
+    why: { kind: PauseKind; reason: string; failure?: boolean; resetsAt?: number },
     notice: OwnerText,
     guard?: (r: SubsessionRecord) => string | undefined,
   ): boolean {
@@ -2701,7 +2751,7 @@ export class SubsessionService {
       ...(guard ? { guard } : {}),
       // What it holds now waits for the owner's wake; restart recovery must
       // not take it for a turn cut short.
-      patch: (r) => { r.heldThrough = lastInputSeq(r); },
+      patch: (r) => { r.heldThrough = lastInputSeq(r); r.pausedBy = { kind: why.kind, ...(why.resetsAt !== undefined ? { resetsAt: why.resetsAt } : {}) }; },
     });
     if (outcome.ok) {
       this.continueOwed.delete(record.id);
@@ -3012,34 +3062,48 @@ export class SubsessionService {
   /**
    * A turn the task gives itself (no owner input in it) is held when it has
    * been active on its own past `maxActiveHours`, or when the 5-hour or the
-   * weekly window is at `quotaPauseAtPct` or more: it pauses for the owner (one notice),
-   * whose word wakes it. "again": the pause was refused (the owner's input
-   * just landed): plan the turn afresh.
+   * weekly window is at `quotaPauseAtPct` or more: it pauses for the owner (one notice).
+   * The owner's word wakes it, or the owning session's note (`releaseByMain`);
+   * after either, a time cap counts from there and a usage pause is not made
+   * again until the window that made it resets (`quotaPass`). "again": the
+   * pause was refused (the owner's input just landed): plan the turn afresh.
    */
   private gateOwnTurn(record: SubsessionRecord, compact: boolean): "run" | "paused" | "again" {
     // The owner started it (/s start): its first turn is theirs, and a
     // /compact before that turn does not use the pass up.
     const startedByOwner = compact ? this.ownerStarted.has(record.id) : this.ownerStarted.delete(record.id);
-    if (startedByOwner || record.status !== "active" || record.pendingInput.some(isOwnerInput)) return "run";
+    if (record.status !== "active") return "run";
+    const reading = this.quotaReading();
+    const threshold = this.quotaPausePercent();
+    // The owner's words a pause kept (a failed or stopped turn carried them)
+    // are not a new word of theirs: a release by the owning session brings
+    // them back, and must not pass the gate on them.
+    if (startedByOwner || hasNewOwnerInput(record)) return "run";
     const capHours = this.deps.config().maxActiveHours;
     if (capHours > 0) {
       const ownMs = activeTotalMs(record, this.now()) - (record.activeAtOwnerInputMs ?? 0);
       if (ownMs >= capHours * 3_600_000) {
         log.info({ id: record.id, ownMs, capHours }, "Sub-session over its wall-clock cap; pausing for the owner");
         return this.pause(record, { kind: "active_hours_cap", reason: `active ${capHours}h on its own (subsessions.maxActiveHours)` },
-          ownerT("subsessions")("activeCap", { id: record.id, title: record.title, hours: capHours }), hasOwnerInput) ? "paused" : "again";
+          ownerT("subsessions")("activeCap", { id: record.id, title: record.title, hours: capHours }), newOwnerInputPending) ? "paused" : "again";
       }
     }
-    const reading = this.quotaAtPause();
-    if (reading) {
+    if (reading && reading.percent >= threshold) {
+      // A go-ahead after a quota pause stands until the window that made the
+      // pause resets, whichever window is the fuller one now (a time, so a
+      // reset nobody was running to see ends it all the same).
+      if (record.quotaPass && this.now() < record.quotaPass.until) {
+        log.debug({ id: record.id, window: reading.window, percent: reading.percent }, "Quota window nearly used, but the task was told to go on; not pausing it again");
+        return "run";
+      }
       const percent = Math.round(reading.percent);
-      const threshold = this.quotaPausePercent();
       log.info({ id: record.id, window: reading.window, percent: reading.percent, threshold }, "Quota window nearly used; pausing a sub-session for the owner");
       const windowName = reading.window === "weekly" ? "weekly (all models)" : "5-hour";
       const vars = { id: record.id, title: record.title, percent };
       const notice = reading.window === "weekly" ? ownerT("subsessions")("quotaHighWeekly", vars) : ownerT("subsessions")("quotaHigh", vars);
-      return this.pause(record, { kind: "quota", reason: `the ${windowName} quota window is at ${percent}% (pauses at ${threshold}%, subsessions.quotaPauseAtPct)` },
-        notice, hasOwnerInput) ? "paused" : "again";
+      // Kept with the pause: a go-ahead is good until this window resets.
+      return this.pause(record, { kind: "quota", ...(reading.resetsAt !== undefined ? { resetsAt: reading.resetsAt } : {}), reason: `the ${windowName} quota window is at ${percent}% (pauses at ${threshold}%, subsessions.quotaPauseAtPct)` },
+        notice, newOwnerInputPending) ? "paused" : "again";
     }
     return "run";
   }
@@ -3198,6 +3262,27 @@ function ownerWords(text: string, files: string[] = []): string {
 }
 
 /** An input's text with its event times taken out: the same check-back fired again compares equal. */
+/** What `relay()` says of a pause the main session's note lifted. */
+export interface MainRelease { kind: PauseKind; reason?: string }
+
+/** The guard's answer when the task is no longer in a pause the main session may lift. */
+const NOT_RELEASABLE = "not in a pause the main session may lift";
+
+/** Waking a task from a quota pause: it is not paused for usage again until the window that paused it resets. Called under the lock, before the store drops `pausedBy`. */
+function grantQuotaPass(r: SubsessionRecord, now: number): void {
+  if (r.pausedBy?.kind !== "quota") return;
+  // Until the pausing window resets; an hour from this go-ahead when that
+  // is not known or already past (short rather than far into a new window,
+  // and never nothing: the task would pause again before it read the note).
+  const resetsAt = r.pausedBy.resetsAt;
+  r.quotaPass = { until: resetsAt !== undefined && resetsAt > now ? resetsAt : now + QUOTA_PASS_FALLBACK_MS };
+}
+
+/** Is the task in a pause the owning session's own note lifts? Never while it waits on a question. */
+function mainMayRelease(r: SubsessionRecord): boolean {
+  return r.status === "waiting" && r.waitingOn === "owner" && !r.askViaMain && !!r.pausedBy && MAIN_RELEASABLE_PAUSES.has(r.pausedBy.kind);
+}
+
 /**
  * Input for a task waiting on the owner, kept for their wake. Held only when
  * nothing else was owed: inputs a turn still in flight carried stay owed, so
@@ -3233,8 +3318,14 @@ function isOwnerMessageInput(input: SubsessionInput): boolean {
   return input.from === "owner" && input.text.startsWith(OWNER_MESSAGE_MARKER);
 }
 
-function hasOwnerInput(record: SubsessionRecord): string | undefined {
-  return record.pendingInput.some(isOwnerInput) ? "the owner's input is pending" : undefined;
+/** Owner input the task holds that no pause kept for a wake (above `heldThrough`): a new word of theirs. */
+function hasNewOwnerInput(record: SubsessionRecord): boolean {
+  const held = record.heldThrough ?? 0;
+  return record.pendingInput.some((i) => i.seq > held && isOwnerInput(i));
+}
+
+function newOwnerInputPending(record: SubsessionRecord): string | undefined {
+  return hasNewOwnerInput(record) ? "the owner's input is pending" : undefined;
 }
 
 function hasPendingInput(record: SubsessionRecord): string | undefined {

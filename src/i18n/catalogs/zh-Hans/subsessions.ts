@@ -2,13 +2,14 @@ import type { Translation } from "../../catalog.js";
 import type { subsessions as en } from "../en/subsessions.js";
 
 export const subsessions = {
-  stuck: "[{{id}} · {{title}}] 已暂停：连续 {{turns}} 轮没有进展。告诉它怎么继续（/s {{id}} …），或者 /s {{id}} stop。",
-  failing: "[{{id}} · {{title}}] 已暂停：最近几轮都失败了。让它继续（/s {{id}} …），或者 /s {{id}} stop。",
+  stuck: "[{{id}} · {{title}}] 已暂停：连续 {{turns}} 轮没有进展。跟我说它该怎么继续，或者直接发给它（/s {{id}} …），或者 /s {{id}} stop。",
+  failing: "[{{id}} · {{title}}] 已暂停：最近几轮都失败了。跟我说一声让它继续，或者直接发给它（/s {{id}} …），或者 /s {{id}} stop。",
   finishedUnanswered: "[{{id}} · {{title}}] 没能回复发给它的消息，它仍是已完成状态，消息留着。再给它发消息（/s {{id}} …），它会连同没回的一起再试。",
   stopped: "[{{id}} · {{title}}] 已停下。让它继续（/s {{id}} …），或者 /s {{id}} stop。",
-  activeCap: "[{{id}} · {{title}}] 已暂停：它已经自己跑了 {{hours}} 小时（subsessions.maxActiveHours）。让它继续（/s {{id}} …），或者 /s {{id}} stop。",
-  quotaHigh: "[{{id}} · {{title}}] 已暂停：5 小时额度已用 {{percent}}%，先停下给我们的对话留余量。想让它继续就告诉它（/s {{id}} …）。",
-  quotaHighWeekly: "[{{id}} · {{title}}] 已暂停：本周额度（全部模型）已用 {{percent}}%，先停下给我们的对话留余量。想让它继续就告诉它（/s {{id}} …）。",
+  activeCap: "[{{id}} · {{title}}] 已暂停：它已经自己跑了 {{hours}} 小时（subsessions.maxActiveHours）。跟我说一声让它继续，或者直接发给它（/s {{id}} …），或者 /s {{id}} stop。",
+  quotaHigh: "[{{id}} · {{title}}] 已暂停：5 小时额度已用 {{percent}}%，先停下给我们的对话留余量。想让它继续就跟我说一声，或者直接发给它（/s {{id}} …）；放行后在这个额度窗口重置之前不会再因为额度停下。",
+  releasedByMain: "主会话已放行，继续运行。",
+  quotaHighWeekly: "[{{id}} · {{title}}] 已暂停：本周额度（全部模型）已用 {{percent}}%，先停下给我们的对话留余量。想让它继续就跟我说一声，或者直接发给它（/s {{id}} …）；放行后在这个额度窗口重置之前不会再因为额度停下。",
   withUnanswered_other: "{{notice}}\n\n它还有 {{count}} 条消息没回（主对话里有完整内容）：\n{{list}}",
   selfRestart: "[{{id}} · {{title}}] Tomo 按这个任务自己的要求重启了，所以先暂停。准备好了让它继续（/s {{id}} …）。",
   failedInterrupted: "[{{id}} · {{title}}] 放弃了：连续 {{restarts}} 次被重启打断。还需要的话再说一次。",

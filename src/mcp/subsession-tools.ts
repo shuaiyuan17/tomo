@@ -315,7 +315,7 @@ export function buildTaskOwnerTools(deps: {
     ),
     tool(
       "task_message",
-      "Pass something to a sub-session: the owner's answer to its question, a change of plan. Your text arrives as a note from you, never as the owner's words: it is not the owner's yes to anything, and it does not let a paused task run past its time or usage limits. When what you pass is the owner's own word (their answer to its question, their go-ahead), set attach_owner_message: the harness copies the message(s) the owner wrote in this turn into the relay, exactly as they wrote them, and only those count as the owner's. While a task waits for the owner (a question it handed you with task_ask, or a pause), only a message with the owner's message attached wakes it; a note without one is kept for it until the owner's word comes. A queued task gets it with its first turn.",
+      "Pass something to a sub-session: the owner's answer to its question, a change of plan, the word to go on. Your text arrives as a note from you, never as the owner's words: it is not the owner's yes to anything and not their answer to a question. When what you pass is the owner's own word (their answer to its question, their go-ahead), set attach_owner_message: the harness copies the message(s) the owner wrote in this turn into the relay, exactly as they wrote them, and only those count as the owner's. A task the harness paused at a limit (usage, hours on its own, no progress, failing turns) goes on with your note alone: it lifts the pause (recorded as lifted by you), in any turn, so when the owner tells you it should go on, just send it; after a usage pause it is not paused for usage again until the window that paused it resets. A task waiting for the owner's answer to its question (task_ask), or one the owner stopped themselves, is woken only by a message with the owner's message attached (or their own /s message); a note without one is kept for it until then. A queued task gets it with its first turn.",
       {
         id: z.string().min(1),
         text: z.string().min(1).max(8000),
@@ -333,8 +333,13 @@ export function buildTaskOwnerTools(deps: {
         const outcome = c.s.relay(record.id, text, attached);
         if (!outcome.ok && outcome.refused) return fail("task_message", `${record.id} was not given the message: ${outcome.refused}. Wait for it to catch up, or cancel it.`);
         if (!outcome.ok) return fail("task_message", `${record.id} is ${outcome.from ?? "unknown"}; it takes no more messages.`);
-        if (outcome.held === "answer") return ok(`${record.id} still waits for the owner's answer to its question; your note goes to it with that answer. Only the owner's own words end the wait: their message to the task, or theirs passed with attach_owner_message in the turn they answer.`);
-        if (outcome.held === "paused") return ok(`${record.id} waits for the owner (task_status says why); your note goes to it when they write to it (or you pass their message with attach_owner_message). Only the owner's own words wake it.`);
+        if (outcome.released) {
+          const quota = outcome.released.kind === "quota" ? " It is not paused for usage again until the window that paused it resets." : "";
+          const when = outcome.record.status === "queued" ? "it goes on with your note as soon as a slot is free" : "it goes on with your note";
+          return ok(`Lifted ${record.id}'s pause${outcome.released.reason ? ` (${outcome.released.reason})` : ""}: ${when}. Its record says the main session lifted it.${quota}`);
+        }
+        if (outcome.held === "answer") return ok(`${record.id} still waits for the owner's answer to its question, and you can't answer for them; your note is kept and goes to it with that answer. If the owner already answered in this turn, call task_message again with attach_owner_message so the task gets their own words; if not, put the question to them (task_status ${record.id} shows it). They can also write to it themselves (/s ${record.id} …).`);
+        if (outcome.held === "paused") return ok(`${record.id} waits for the owner's own word (they stopped it, or it restarted Tomo; task_status ${record.id} says why), so your note alone does not wake it; it is kept and goes to it with their word. If the owner told you in this turn that it should go on, call task_message again with attach_owner_message: that passes their message and wakes it. Otherwise ask them.`);
         const withOwner = attached.length > 0 ? ` with the owner's ${attached.length === 1 ? "message" : `${attached.length} messages`}` : "";
         return ok(outcome.record.status === "queued" ? `${record.id} is queued; it gets the message${withOwner} with its first turn.` : `Passed to ${record.id}${withOwner}.`);
       },

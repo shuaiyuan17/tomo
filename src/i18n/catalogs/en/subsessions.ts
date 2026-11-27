@@ -1,12 +1,13 @@
 /** Harness notices about sub-sessions, to the chat of the scope that owns the task (src/agent/subsessions/service.ts). */
 export const subsessions = {
-  stuck: "[{{id}} · {{title}}] Paused: {{turns}} turns in a row with no progress. Tell it how to go on (/s {{id}} …), or /s {{id}} stop.",
-  failing: "[{{id}} · {{title}}] Paused: its last turns failed. Tell it to go on (/s {{id}} …), or /s {{id}} stop.",
+  stuck: "[{{id}} · {{title}}] Paused: {{turns}} turns in a row with no progress. Tell me how it should go on, or write to it yourself (/s {{id}} …), or /s {{id}} stop.",
+  failing: "[{{id}} · {{title}}] Paused: its last turns failed. Tell me it should go on, or write to it yourself (/s {{id}} …), or /s {{id}} stop.",
   finishedUnanswered: "[{{id}} · {{title}}] Couldn't answer the message it was sent; it stays finished and keeps the message. Write to it again (/s {{id}} …) and it gets another try with everything it hasn't answered.",
   stopped: "[{{id}} · {{title}}] Stopped. Tell it to go on (/s {{id}} …), or /s {{id}} stop.",
-  activeCap: "[{{id}} · {{title}}] Paused: it has been working on its own for {{hours}} hours (subsessions.maxActiveHours). Tell it to go on (/s {{id}} …), or /s {{id}} stop.",
-  quotaHigh: "[{{id}} · {{title}}] Paused: {{percent}}% of the 5-hour usage window is used, so it stops to leave room for our conversation. Tell it to go on when you want it to continue (/s {{id}} …).",
-  quotaHighWeekly: "[{{id}} · {{title}}] Paused: {{percent}}% of this week's usage (all models) is used, so it stops to leave room for our conversation. Tell it to go on when you want it to continue (/s {{id}} …).",
+  activeCap: "[{{id}} · {{title}}] Paused: it has been working on its own for {{hours}} hours (subsessions.maxActiveHours). Tell me it should go on, or write to it yourself (/s {{id}} …), or /s {{id}} stop.",
+  quotaHigh: "[{{id}} · {{title}}] Paused: {{percent}}% of the 5-hour usage window is used, so it stops to leave room for our conversation. Tell me when it should go on, or write to it yourself (/s {{id}} …); it then keeps going until that usage window resets.",
+  releasedByMain: "Pause lifted by the main session; it goes on.",
+  quotaHighWeekly: "[{{id}} · {{title}}] Paused: {{percent}}% of this week's usage (all models) is used, so it stops to leave room for our conversation. Tell me when it should go on, or write to it yourself (/s {{id}} …); it then keeps going until that usage window resets.",
   withUnanswered_one: "{{notice}}\n\nIt never answered this message (the main conversation has it in full):\n{{list}}",
   withUnanswered_other: "{{notice}}\n\nIt never answered {{count}} messages (the main conversation has them all, in full):\n{{list}}",
   selfRestart: "[{{id}} · {{title}}] Tomo restarted at this task's own request, so it is paused. Tell it to go on when you're ready (/s {{id}} …).",

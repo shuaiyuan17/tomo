@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
 import { BACKGROUND_WAIT_MAX_MS, BACKGROUND_WAIT_REASON, CRON_RECHECK_MS, ENDED_KEEP_MS, EXTERNAL_WAIT_CHECK_MS, FINISHED_KEEP_MS, MAX_FINISH_REFUSALS, MAX_INTERRUPT_STREAK, REGISTRY_RECHECK_MS, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { formatOwnerMessageEvent } from "../src/agent/subsessions/prompt.js";
-import { PENDING_INPUT_MAX, PENDING_INPUT_OWNER_RESERVE, DONE_STEPS_KEEP, PLAN_MAX_STEPS, PLAN_STEP_MAX, UPDATES_KEEP, appendInput, HARNESS } from "../src/agent/subsessions/types.js";
+import { QUOTA_PASS_FALLBACK_MS, PENDING_INPUT_MAX, PENDING_INPUT_OWNER_RESERVE, DONE_STEPS_KEEP, PLAN_MAX_STEPS, PLAN_STEP_MAX, UPDATES_KEEP, appendInput, HARNESS } from "../src/agent/subsessions/types.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 
 type Turn = { key: string; prompt: string; bare: boolean };
@@ -45,7 +45,7 @@ interface Harness {
   /** Task keys whose own background work (subagents, background commands) is still running. */
   background: Set<string>;
   /** The 5-hour window's share used; "throw": the samples cannot be read. */
-  quota?: number | "throw" | { window: "five_hour" | "weekly"; percent: number };
+  quota?: number | "throw" | { window: "five_hour" | "weekly"; percent: number; resetsAt?: number };
   /** Owner notices that do not go out: "throw" (the send failed), "unreachable" (no DM to send to). */
   ownerNotice?: "throw" | "unreachable";
 }
@@ -487,8 +487,10 @@ describe("SubsessionService", () => {
     await flush();
     expect(h.store.get(t.id)?.waitingOn).toBe("owner");
     const turns = h.turns.length;
-    // Paused with no question recorded: the main session's note alone is
-    // not the owner's word, so it does not move the task (fail closed).
+    // A wait for the owner that recorded neither a question nor why it
+    // paused (an older record): the main session's note alone is not the
+    // owner's word, so it does not move the task (fail closed).
+    h.store.update(t.id, (r) => { delete r.pausedBy; });
     expect(h.service.relay(t.id, "keep going")).toMatchObject({ ok: true, changed: false, held: "paused" });
     await flush();
     expect(h.turns).toHaveLength(turns);
@@ -511,6 +513,7 @@ describe("SubsessionService", () => {
     const t = spawn(h);
     await flush();
     expect(h.store.get(t.id)?.waitingOn).toBe("owner");
+    h.store.update(t.id, (r) => { r.pausedBy = { kind: "stopped_by_owner" }; });
     expect(h.service.relay(t.id, "the plan changed: use v2")).toMatchObject({ held: "paused" });
     expect(h.service.ownerMessage("dm:owner", t.id, "go on").ok).toBe(true);
     await flush();
@@ -2220,22 +2223,34 @@ describe("SubsessionService: the wall-clock cap", () => {
     expect(h.notices).toHaveLength(1);
     expect(h.notices[0].text).toContain("24 hours");
 
-    // The main session's own note is not the owner's word: it buys no
-    // stretch, so it does not wake the task (the cap would pause it again,
-    // with another notice); it is kept for the owner's word.
-    expect(h.service.relay(t.id, "I think it should go on")).toMatchObject({ ok: true, held: "paused" });
-    await flush();
-    expect(h.turns).toHaveLength(1);
-    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
-    expect(h.notices).toHaveLength(1);
-
     // The owner says go on (their message attached): that turn runs, and so does the continue after it.
     expect(h.service.relay(t.id, "keep going", said("keep going")).ok).toBe(true);
     await flush();
     expect(h.turns).toHaveLength(3);
     expect(h.turns[1].prompt).toContain("keep going");
-    expect(h.turns[1].prompt).toContain("I think it should go on");
     expect(h.turns[2].prompt).toContain('type="subsession-continue"');
+    expect(h.store.get(t.id)?.status).toBe("finished");
+    expect(h.notices).toHaveLength(1);
+  });
+
+  it("the main session's own note lifts the cap pause too, and buys the same stretch", async () => {
+    let n = 0;
+    const h = harness({ maxActiveHours: 24 }, working((turn, hh) => {
+      n += 1;
+      if (n === 1) hh.store.update("s1", (r) => { r.activeMs = 25 * HOUR; });
+      if (n === 3) hh.service.finish(turn.key, "done");
+    }));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.turns).toHaveLength(1);
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner", pausedBy: { kind: "active_hours_cap" } });
+    expect(h.service.relay(t.id, "the owner says go on")).toMatchObject({ ok: true, released: { kind: "active_hours_cap" } });
+    await flush();
+    // Its turn runs and so does the continue after it: the cap counts from the release.
+    expect(h.turns).toHaveLength(3);
+    expect(h.turns[1].prompt).toContain("the owner says go on");
+    expect(h.turns[1].prompt).toContain("lifted your pause");
     expect(h.store.get(t.id)?.status).toBe("finished");
     expect(h.notices).toHaveLength(1);
   });
@@ -2284,22 +2299,190 @@ describe("SubsessionService: the quota gate", () => {
     expect(h.notices[0].text).not.toContain("5-hour");
   });
 
-  it("a weekly-quota pause is lifted only by the owner's own words, not by a main-session note", async () => {
-    const h = harness({}, working());
+  it("the main session's own note lifts a quota pause (no owner message attached), and the task keeps going with the window still high", async () => {
+    let n = 0;
+    const h = harness({}, working((turn, hh) => { n += 1; if (n === 3) hh.service.finish(turn.key, "done"); }));
     h.quota = { window: "weekly", percent: 90 };
     h.service.start();
     const t = spawn(h);
     await flush();
-    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
-    // The main session passes something on without the owner's words: no turn.
-    h.service.relay(t.id, "the main session thinks you should go on");
+    expect(h.turns).toHaveLength(0);
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner", pausedBy: { kind: "quota" } });
+    // The owner told the main session "go on"; it passes that on in its own words.
+    const out = h.service.relay(t.id, "继续");
+    expect(out).toMatchObject({ ok: true, changed: true, released: { kind: "quota" } });
+    expect(out.released?.reason).toContain("weekly (all models) quota window is at 90%");
+    expect(out.held).toBeUndefined();
+    await flush();
+    // Not just one turn: the continues after it run too, with usage still over the threshold.
+    expect(h.turns).toHaveLength(3);
+    expect(h.turns[0].prompt).toContain("| 继续");
+    expect(h.turns[0].prompt).toContain("The main session lifted your pause");
+    expect(h.turns[0].prompt).toContain("not the owner's yes");
+    expect(h.store.get(t.id)?.status).toBe("finished");
+    expect(h.notices).toHaveLength(1);
+    // On the record: who let it go on, and it was the main session's note, never the owner's word.
+    const record = h.store.get(t.id)!;
+    expect(record.transitions.find((x) => x.event === "release")).toMatchObject({ from: "waiting", to: "queued", reason: expect.stringContaining("the main session lifted the pause") });
+    expect(record.updates?.map((u) => u.text)).toEqual(["Pause lifted by the main session; it goes on."]);
+    expect(record.activeAtOwnerInputMs).toBeUndefined();
+    // The go-ahead was for that work: it left with the finish.
+    expect(record.quotaPass).toBeUndefined();
+    expect(record.pausedBy).toBeUndefined();
+  });
+
+  it("a lifted quota pause holds until that window resets; when the window fills again after it, the task pauses again", async () => {
+    const h = harness({}, working());
+    let clock = Date.now();
+    (h.service as unknown as { deps: { now: () => number } }).deps.now = () => clock;
+    const resetsAt = clock + 3_600_000;
+    h.quota = { window: "five_hour", percent: 90, resetsAt };
+    h.service.start();
+    const t = spawn(h);
     await flush();
     expect(h.turns).toHaveLength(0);
-    expect(h.store.get(t.id)?.status).toBe("waiting");
-    // The owner's own words run, past the gate.
-    expect(h.service.relay(t.id, "go anyway", said("go anyway")).ok).toBe(true);
+    expect(h.store.get(t.id)?.pausedBy).toEqual({ kind: "quota", resetsAt });
+    let n = 0;
+    h.onTurn = working(() => {
+      n += 1;
+      // The window reset and filled again (nobody saw it empty: the pass is a time, not a reading).
+      if (n === 3) { clock = resetsAt + 1; h.quota = { window: "five_hour", percent: 95, resetsAt: clock + 3_600_000 }; }
+    });
+    expect(h.service.relay(t.id, "go on")).toMatchObject({ ok: true, released: { kind: "quota" } });
+    expect(h.store.get(t.id)?.quotaPass).toEqual({ until: resetsAt });
     await flush();
-    expect(h.turns).toHaveLength(1);
+    expect(h.turns).toHaveLength(3);
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner", pausedBy: { kind: "quota" } });
+    expect(h.notices).toHaveLength(2);
+  });
+
+  it("one go-ahead covers usage on either window until the pausing window resets; with no reset time known it lasts an hour", async () => {
+    const h = harness({}, working());
+    let clock = Date.now();
+    (h.service as unknown as { deps: { now: () => number } }).deps.now = () => clock;
+    h.quota = 90; // a reading with no reset time
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)?.pausedBy).toEqual({ kind: "quota" });
+    // The go-ahead comes two hours later: its hour counts from then, not from the pause.
+    clock += 2 * QUOTA_PASS_FALLBACK_MS;
+    let n = 0;
+    h.onTurn = working(() => {
+      n += 1;
+      // The week becomes the fuller window: still the same go-ahead.
+      if (n === 1) h.quota = { window: "weekly", percent: 92, resetsAt: clock + 86_400_000 };
+      if (n === 3) clock += QUOTA_PASS_FALLBACK_MS;
+    });
+    expect(h.service.relay(t.id, "go on")).toMatchObject({ ok: true, released: { kind: "quota" } });
+    await flush();
+    expect(h.turns).toHaveLength(3);
+    expect(h.store.get(t.id)?.waitingReason).toContain("weekly (all models) quota window is at 92%");
+  });
+
+  it("a lifted pause goes through the scheduler: with no slot free it waits queued, its note with it", async () => {
+    const h = harness({ maxRunning: 1 }, working());
+    h.quota = 90;
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)?.pausedBy).toMatchObject({ kind: "quota" });
+    // Another task takes the only slot (its turn started while usage read low).
+    h.onTurn = () => new Promise(() => {});
+    h.quota = 10;
+    const other = spawn(h);
+    await flush();
+    expect(h.store.get(other.id)?.status).toBe("active");
+    h.quota = 90;
+    const out = h.service.relay(t.id, "go on");
+    expect(out).toMatchObject({ ok: true, released: { kind: "quota" } });
+    expect(out.record?.status).toBe("queued");
+    expect(h.store.get(t.id)).toMatchObject({ status: "queued", quotaPass: { until: expect.any(Number) } });
+    expect(h.store.get(t.id)!.pendingInput.at(-1)).toMatchObject({ from: "main", words: "go on" });
+  });
+
+  it("words of the owner's that a pause kept do not carry a main-session release past the gate", async () => {
+    const h = harness({}, working());
+    const { id, sessionKey } = h.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    h.registry.add(sessionKey); h.sdk.add(sessionKey);
+    h.store.transition(id, "start");
+    // Its turns kept failing on a message of the owner's: paused, the message kept.
+    h.store.update(id, (r) => { r.startDelivered = true; appendInput(r, "the owner's old message", { from: "owner", words: "the owner's old message" }); });
+    h.store.transition(id, "stuck", { reason: "its turns keep failing", patch: (r) => { r.heldThrough = 1; r.pausedBy = { kind: "turns_failing" }; } });
+    h.quota = 90;
+    h.service.start();
+    await flush();
+    expect(h.turns).toHaveLength(0);
+    // The main session lifts the failing-turns pause. Usage is high, and nobody lifted that: it pauses for quota.
+    expect(h.service.relay(id, "try again")).toMatchObject({ ok: true, released: { kind: "turns_failing" } });
+    await flush();
+    expect(h.turns).toHaveLength(0);
+    expect(h.store.get(id)).toMatchObject({ status: "waiting", waitingOn: "owner", pausedBy: { kind: "quota" } });
+    // Lifted too, it runs, and the owner's old message goes with it.
+    expect(h.service.relay(id, "go on")).toMatchObject({ ok: true, released: { kind: "quota" } });
+    await flush();
+    expect(h.turns.length).toBeGreaterThan(0);
+    expect(h.turns[0].prompt).toContain("the owner's old message");
+  });
+
+  it("lifting a no-progress pause starts the count afresh", async () => {
+    const h = harness();
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner", pausedBy: { kind: "no_progress" } });
+    const before = h.turns.length;
+    expect(h.service.relay(t.id, "try the other approach")).toMatchObject({ ok: true, released: { kind: "no_progress" } });
+    await flush();
+    // Not paused again after one quiet turn: as many as it took the first time.
+    expect(h.turns.length - before).toBe(before);
+    expect(h.store.get(t.id)?.pausedBy).toEqual({ kind: "no_progress" });
+    expect(h.notices).toHaveLength(2);
+  });
+
+  it("a question to the owner is never answered by the main session's own note, quota pause or not (only pauses are lifted)", async () => {
+    const h = harness({}, working((turn, hh) => { void hh.service.ask(turn.key, "Merge now?"); }));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+    expect(h.store.get(t.id)?.askViaMain?.text).toBe("Merge now?");
+    expect(h.store.get(t.id)?.pausedBy).toBeUndefined();
+    const turns = h.turns.length;
+    h.quota = 90;
+    const out = h.service.relay(t.id, "Yes, merge it");
+    expect(out).toMatchObject({ ok: true, changed: false, held: "answer" });
+    expect(out.released).toBeUndefined();
+    await flush();
+    expect(h.turns).toHaveLength(turns);
+    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner", askViaMain: { text: "Merge now?" } });
+    // A pause mark left on a record that waits on a question lifts nothing either.
+    h.store.update(t.id, (r) => { r.pausedBy = { kind: "quota" }; });
+    expect(h.service.relay(t.id, "go on")).toMatchObject({ ok: true, held: "answer" });
+    await flush();
+    expect(h.turns).toHaveLength(turns);
+    // The owner's own words end the wait.
+    h.onTurn = working((turn, hh) => hh.service.finish(turn.key, "done"));
+    expect(h.service.relay(t.id, "They said yes", said("yes")).ok).toBe(true);
+    await flush();
+    expect(h.turns.length).toBeGreaterThan(turns);
+    expect(h.store.get(t.id)?.status).toBe("finished");
+  });
+
+  it("a stop the owner made, a self-restart and a wait that recorded nothing are not lifted by the main session's note", async () => {
+    for (const mark of [{ kind: "stopped_by_owner" as const }, undefined]) {
+      const h = harness({}, working());
+      h.quota = 90;
+      h.service.start();
+      const t = spawn(h);
+      await flush();
+      h.store.update(t.id, (r) => { if (mark) r.pausedBy = mark; else delete r.pausedBy; });
+      expect(h.service.relay(t.id, "go on")).toMatchObject({ ok: true, changed: false, held: "paused" });
+      await flush();
+      expect(h.turns).toHaveLength(0);
+      expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+      h.service.stop();
+    }
   });
 
   it("decides on the reading taken just before the turn (freshenQuota is awaited first)", async () => {
@@ -2344,27 +2527,16 @@ describe("SubsessionService: the quota gate", () => {
     const t = spawn(h);
     await flush();
     expect(h.turns).toHaveLength(0);
-    // A note the main session wrote itself does not pass the gate.
-    expect(h.service.relay(t.id, "the main session says go")).toMatchObject({ ok: true, held: "paused" });
-    await flush();
-    expect(h.turns).toHaveLength(0);
-    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
-    // Kept for the owner's word, without waking it into another pause notice.
-    expect(h.notices).toHaveLength(1);
-    // The owner's word runs (it carries the start too); the continue after it is held again.
+    // The owner's word runs (it carries the start too), and so does the
+    // continue after it: their go-ahead is not used up by one turn.
     expect(h.service.relay(t.id, "go anyway", said("go anyway")).ok).toBe(true);
     await flush();
-    expect(h.turns).toHaveLength(1);
+    expect(h.turns).toHaveLength(2);
     expect(h.turns[0].prompt).toContain("go anyway");
     expect(h.turns[0].prompt).toContain('type="subsession-start"');
-    expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
-    expect(h.notices).toHaveLength(2);
-    // Quota freed: the owner's next word, and the continue after it, run.
-    h.quota = 84;
-    expect(h.service.relay(t.id, "now go", said("now go")).ok).toBe(true);
-    await flush();
-    expect(h.turns).toHaveLength(2);
+    expect(h.turns[1].prompt).toContain('type="subsession-continue"');
     expect(h.store.get(t.id)?.status).toBe("finished");
+    expect(h.notices).toHaveLength(1);
   });
 
   it("a pause that cannot be written runs no turn and does not spin; the retry timer pauses it", async () => {
@@ -2746,6 +2918,8 @@ describe("SubsessionService: room kept for the owner's wake", () => {
     await flush();
     expect(h.store.get(id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
     expect(h.turns).toHaveLength(0);
+    // A wait only the owner ends (a note of the main session's would lift the cap pause itself).
+    h.store.update(id, (r) => { r.pausedBy = { kind: "stopped_by_owner" }; });
     return { h, id, sessionKey };
   };
 

@@ -1,3 +1,5 @@
+import { isRecord } from "./is-record.js";
+
 export const ANTHROPIC_AUTH_METHODS = ["subscription", "api-key"] as const;
 
 export type AnthropicAuthMethod = typeof ANTHROPIC_AUTH_METHODS[number];
@@ -74,8 +76,4 @@ function isAnthropicAuthMethod(value: string): value is AnthropicAuthMethod {
 function cleanString(value: unknown): string | null {
   if (typeof value !== "string") return null;
   return value.trim() || null;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

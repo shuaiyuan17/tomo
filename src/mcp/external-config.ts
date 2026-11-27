@@ -1,4 +1,5 @@
 import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
+import { isRecord } from "../is-record.js";
 
 type Env = Record<string, string | undefined>;
 
@@ -140,8 +141,4 @@ function stripUndefined<T extends Record<string, unknown>>(value: T): Partial<T>
     if (value[key] === undefined) delete value[key];
   }
   return value;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

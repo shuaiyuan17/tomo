@@ -1,4 +1,5 @@
 import { withFileLockSync } from "./file-lock.js";
+import { isRecord } from "./is-record.js";
 
 /**
  * ONE advisory lock for every config.json writer: the daemon (group
@@ -12,10 +13,6 @@ export function configLockPath(configPath: string): string {
 
 export function withConfigLockSync<T>(configPath: string, fn: () => T): T {
   return withFileLockSync(configLockPath(configPath), fn);
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function same(a: unknown, b: unknown): boolean {
@@ -62,8 +59,8 @@ function mergeStringSet(base: string[], mine: string[], theirs: string[]): strin
 export function threeWayMerge(base: unknown, mine: unknown, theirs: unknown, key?: string): unknown {
   if (same(mine, base)) return theirs;
   if (same(theirs, base)) return mine;
-  if (isPlainObject(mine) && isPlainObject(theirs)) {
-    const b = isPlainObject(base) ? base : {};
+  if (isRecord(mine) && isRecord(theirs)) {
+    const b = isRecord(base) ? base : {};
     const out: Record<string, unknown> = {};
     for (const k of new Set([...Object.keys(b), ...Object.keys(mine), ...Object.keys(theirs)])) {
       const merged = threeWayMerge(b[k], mine[k], theirs[k], k);

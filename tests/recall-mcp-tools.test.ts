@@ -469,4 +469,10 @@ describe("formatRecallHits", () => {
 
     expect(text).toContain("set `before` to that time to search what is older");
   });
+
+  it("says when long messages were searched only in part", () => {
+    const text = formatRecallHits({ hits: [], matched: 0, scanned: 10, clipped: 2 }, window);
+
+    expect(text).toContain("2 very long message(s) in that range were searched only in their first 100,000 characters.");
+  });
 });

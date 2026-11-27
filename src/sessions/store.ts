@@ -202,6 +202,9 @@ export interface TranscriptRecall {
   matched: number;
   /** Records read inside the scan. */
   scanned: number;
+  /** Records too long to score whole: only their beginning was searched
+   *  (`RECALL_MAX_SCORED_CHARS`). Absent when there were none. */
+  clipped?: number;
   /**
    * Set when the scan ran out of budget before reaching the window's lower
    * bound. `reachedBackTo` is the timestamp of the oldest record it passed, or
@@ -904,6 +907,7 @@ export class SessionStore {
       hits: hits.map((hit) => ({ msg: hit.item.msg, score: hit.score, matchIndex: hit.matchIndex })),
       matched,
       scanned,
+      ...(scorer.clippedMessages > 0 ? { clipped: scorer.clippedMessages } : {}),
       ...(stopped ? { stopped } : {}),
     };
   }

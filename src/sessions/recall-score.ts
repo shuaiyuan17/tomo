@@ -107,6 +107,22 @@ function isWordChar(char: string): boolean {
 }
 
 /**
+ * The part of an over-long message that is scored: its first
+ * `RECALL_MAX_SCORED_CHARS` characters, less a word the cut would split.
+ * Left in, the first half of "ramenshop" would read as the whole word "ramen".
+ */
+function scoredPart(content: string): string {
+  let end = RECALL_MAX_SCORED_CHARS;
+  if (isWordChar(charAt(content, end)) || (content.charCodeAt(end) >= 0xdc00 && content.charCodeAt(end) <= 0xdfff)) {
+    // A word runs across the cut. Words are short; one that is not is given
+    // up on after a bounded look rather than walked to its start.
+    const floor = end - 1000;
+    while (end > floor && isWordChar(charBefore(content, end))) end -= charBefore(content, end).length;
+  }
+  return content.slice(0, end);
+}
+
+/**
  * Rewrites `lowerIndexes` (positions in `text.toLowerCase()`) into the
  * positions in `text` of the characters they came from. The two differ when
  * lowercasing lengthens the string ("İ" becomes two code units), and the
@@ -235,6 +251,7 @@ export class RecallScorer<T> {
   private readonly holders: number[] = [];
   private readonly candidates: Candidate<T>[] = [];
   private observed = 0;
+  private clipped = 0;
 
   constructor(queries: readonly string[]) {
     const index = new Map<string, number>();
@@ -264,6 +281,12 @@ export class RecallScorer<T> {
     }
   }
 
+  /** How many observed messages were longer than `RECALL_MAX_SCORED_CHARS`
+   *  and scored on their beginning only. */
+  get clippedMessages(): number {
+    return this.clipped;
+  }
+
   /** True when no query was usable; nothing can match. */
   get isEmpty(): boolean {
     return this.queries.length === 0;
@@ -272,7 +295,10 @@ export class RecallScorer<T> {
   /** Count one message of the search window, and keep it if it holds any token. */
   observe(item: T, content: string): void {
     this.observed++;
-    if (content.length > RECALL_MAX_SCORED_CHARS) content = content.slice(0, RECALL_MAX_SCORED_CHARS);
+    if (content.length > RECALL_MAX_SCORED_CHARS) {
+      this.clipped++;
+      content = scoredPart(content);
+    }
     const lower = content.toLowerCase();
     let tokens: number[] | null = null;
     let positions: number[] | null = null;

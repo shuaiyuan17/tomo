@@ -2,6 +2,7 @@ import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import type { SessionMessage } from "../sessions/types.js";
 import type { TranscriptRecall, TranscriptRecallHit } from "../sessions/store.js";
+import { RECALL_MAX_SCORED_CHARS } from "../sessions/recall-score.js";
 import { shortErrorMessage } from "../error-text.js";
 
 /** Cap per-message excerpt length so one giant transcript entry can't blow
@@ -172,7 +173,13 @@ function capitalize(text: string): string {
 
 /** Result text for a scored search. Exported for tests. */
 export function formatRecallHits(recall: TranscriptRecall, window: RecallWindow, toTime?: number): string {
-  const { short, note } = searchedBackTo(recall, window, toTime);
+  const reach = searchedBackTo(recall, window, toTime);
+  const short = reach.short;
+  // A very long message (a pasted log or file) is searched in its beginning
+  // only. Said, so that a miss is not read as "not in there".
+  const note = recall.clipped
+    ? `${reach.note} ${recall.clipped} very long message(s) in that range were searched only in their first ${RECALL_MAX_SCORED_CHARS.toLocaleString("en-US")} characters.`
+    : reach.note;
   if (recall.hits.length === 0) {
     return `No matching messages found (${short}).${note} Try other phrasings in queries, fewer or rarer words, or a wider time range.`;
   }

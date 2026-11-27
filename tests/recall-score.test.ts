@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { RecallScorer, tokenizeRecallQuery } from "../src/sessions/recall-score.js";
+import { RECALL_MAX_SCORED_CHARS, RecallScorer, tokenizeRecallQuery } from "../src/sessions/recall-score.js";
 
 // The scoring behind `recall_conversation` (src/sessions/recall-score.ts).
 //
@@ -137,6 +137,26 @@ describe("recall scoring", () => {
 
     expect(result.texts).toEqual(["a zeppelin flew by"]);
     expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it("counts the messages it scored only in part", () => {
+    const scorer = new RecallScorer<number>(["ramen"]);
+    scorer.observe(0, "ramen");
+    scorer.observe(1, "x".repeat(RECALL_MAX_SCORED_CHARS + 1));
+
+    expect(scorer.clippedMessages).toBe(1);
+  });
+
+  it("does not take the first half of a word split by the cut for a whole word", () => {
+    // "ramen" ends exactly where the scored part does, and the message goes
+    // on with "shop": the word there is "ramenshop".
+    const lead = "x ".repeat((RECALL_MAX_SCORED_CHARS - 6) / 2);
+    const split = `${lead} ramenshop is open`;
+    expect(split.indexOf("ramen") + 5).toBe(RECALL_MAX_SCORED_CHARS);
+
+    expect(search([...FILLER, split], "ramen").texts).toEqual([]);
+    // The same word, whole, just before the cut is found.
+    expect(search([...FILLER, `${lead}ramen shop is open`], "ramen").texts).toHaveLength(1);
   });
 
   it("finds an English word that touches Chinese text", () => {

@@ -13,7 +13,75 @@ const DEFAULTS_DIR = resolve(__dirname, "../../defaults");
  *  can reason about scans rooted in or descending into this tree. */
 export const MEMORY_DIR = join(WORKSPACE_DIR, "memory");
 const MEMORY_ENTRYPOINT = join(MEMORY_DIR, "MEMORY.md");
-const MAX_MEMORY_LINES = 200;
+/**
+ * MEMORY.md's budget, each as lines or UTF-8 bytes, whichever is reached
+ * first. Over the SOFT one the whole index still goes into the prompt, and the
+ * owner's DM prompt says so (memoryBudgetReminder). Only past the HARD one is
+ * it cut, and the cut says where (fitMemoryIndex).
+ */
+export const MEMORY_SOFT_LINES = 200;
+export const MEMORY_SOFT_KB = 16;
+export const MEMORY_HARD_LINES = 400;
+export const MEMORY_HARD_KB = 32;
+const KB = 1024;
+
+/** Size of the index as the prompt holds it: its lines joined by newlines. */
+function indexBytes(lines: string[]): number {
+  return Buffer.byteLength(lines.join("\n"), "utf-8");
+}
+
+/**
+ * The part of MEMORY.md a prompt shows: all of it up to the hard limit, else
+ * the longest run of whole lines from the top that fits both limits. THE ONE
+ * PLACE the cut is decided: the prompt, the snapshot handed over by
+ * buildSystemPrompt and the before-turn re-read (promptContextSnapshot) all
+ * go through it, since a snapshot cut differently from the prompt would
+ * report lines the prompt never showed as unchanged, or shown ones as added.
+ */
+export function fitMemoryIndex(lines: string[]): { shown: string[]; notice?: string } {
+  const maxBytes = MEMORY_HARD_KB * KB;
+  let count = 0;
+  let bytes = 0;
+  let limit: string | undefined;
+  for (const line of lines) {
+    if (count === MEMORY_HARD_LINES) { limit = `${MEMORY_HARD_LINES}-line`; break; }
+    const next = bytes + Buffer.byteLength(line, "utf-8") + (count > 0 ? 1 : 0);
+    if (next > maxBytes) { limit = `${MEMORY_HARD_KB} KB`; break; }
+    bytes = next;
+    count++;
+  }
+  if (limit === undefined) return { shown: lines };
+  const shown = lines.slice(0, count);
+  const omitted = lines.length - count;
+  const lastShown = [...shown].reverse().find((line) => line.trim().length > 0);
+  // By code point: a UTF-16 slice could end on half a surrogate pair.
+  const where = count === 0
+    ? "from the top: the first line alone is over it"
+    : lastShown === undefined
+      ? `after the first ${count} lines, all blank`
+      : `after the line starting "${Array.from(lastShown).slice(0, 60).join("")}"`;
+  return { shown, notice: `(cut at the ${limit} limit: ${omitted} ${omitted === 1 ? "line" : "lines"} omitted ${where})` };
+}
+
+/**
+ * What a live session's snapshot holds for MEMORY.md: the lines its prompt
+ * shows, then the cut notice when there is one. The notice is in so that an
+ * index growing past the hard limit under a live session (or its hidden tail
+ * changing) reads as a change and the session is told; with the shown lines
+ * alone nothing would differ, and its prompt would go on presenting them as
+ * the whole index.
+ */
+function memorySnapshotLines(lines: string[] | null): string[] {
+  const { shown, notice } = fitMemoryIndex(lines ?? []);
+  return notice === undefined ? shown : [...shown, notice];
+}
+
+/** The over-soft-budget line, or undefined within budget. Measured on the whole index, not on what a cut left. */
+function memoryBudgetReminder(lines: string[]): string | undefined {
+  const bytes = indexBytes(lines);
+  if (lines.length <= MEMORY_SOFT_LINES && bytes <= MEMORY_SOFT_KB * KB) return undefined;
+  return `⚠ MEMORY.md is ${lines.length} lines / ${(bytes / KB).toFixed(1)} KB, over its ${MEMORY_SOFT_LINES}-line / ${MEMORY_SOFT_KB} KB budget. Keep here only what most conversations need; the rest belongs in topic files.`;
+}
 export { PRIVATE_MEMORY_SUBDIR };
 /** Absolute path to the private memory dir. Used by the group-session guard
  *  hook to deny tool calls referencing this location. */
@@ -50,7 +118,7 @@ Your persistent memory lives at ${MEMORY_DIR}/. Read and update it whenever dura
 
 ## Storage
 
-- **MEMORY.md** is the index loaded into every conversation. Keep it under ${MAX_MEMORY_LINES} lines.
+- **MEMORY.md** is the index loaded into every conversation. Keep it under ${MEMORY_SOFT_LINES} lines and ${MEMORY_SOFT_KB} KB.
 - Store each topic in its own Markdown file with name, description, and type frontmatter.
 - MEMORY.md contains one-line pointers: \`- [Title](file.md) — short description\`
 ${privacySection}
@@ -96,10 +164,12 @@ Don't wait to be told "remember this." Save durable personal details, preference
   let memoryContent: string;
   if (lines === null) {
     memoryContent = "(currently empty)";
-  } else if (lines.length > MAX_MEMORY_LINES) {
-    memoryContent = lines.slice(0, MAX_MEMORY_LINES).join("\n") + `\n\n(truncated — ${lines.length - MAX_MEMORY_LINES} lines omitted)`;
   } else {
-    memoryContent = lines.join("\n");
+    const { shown, notice } = fitMemoryIndex(lines);
+    // Owner DM only: a group session is not where the index gets reorganized,
+    // so there the line would be an instruction it cannot act on.
+    const reminder = isGroup ? undefined : memoryBudgetReminder(lines);
+    memoryContent = [reminder, shown.join("\n"), notice].filter((part) => part !== undefined).join("\n\n");
   }
 
   return `${instructions}\n\n## Current MEMORY.md\n\n${memoryContent}`;
@@ -264,8 +334,7 @@ export interface PromptContextSnapshot {
  * The MEMORY.md / roster lines a prompt built now would hold — the before-turn
  * re-read compared against a live session's snapshot (which comes from
  * buildSystemPrompt's `onContext`). Read-only: never creates the memory
- * directory. `memory` is only what the prompt shows (the first
- * MAX_MEMORY_LINES lines).
+ * directory. `memory` is only what the prompt shows (memorySnapshotLines).
  *
  * `strict` throws when MEMORY.md, the people directory or a record cannot be
  * read (only ENOENT counts as missing), instead of returning the partial
@@ -276,13 +345,13 @@ export interface PromptContextSnapshot {
 export function promptContextSnapshot(opts: { isGroup?: boolean; strict?: boolean } = {}): PromptContextSnapshot {
   const isGroup = !!opts.isGroup;
   const strict = !!opts.strict;
-  const memory = (memoryIndexLines(isGroup, strict) ?? []).slice(0, MAX_MEMORY_LINES);
+  const memory = memorySnapshotLines(memoryIndexLines(isGroup, strict));
   return { memory, people: peopleRosterLines(isGroup, strict) };
 }
 
 /**
  * `onContext` receives the MEMORY.md and roster lines this prompt was built
- * from — the same read, filtered for the audience and cut at MAX_MEMORY_LINES
+ * from — the same read, filtered for the audience and cut (memorySnapshotLines)
  * exactly as the prompt shows them. A live session keeps that as its snapshot
  * (see LiveSessionManager.takePromptContextNote): a second read could see
  * different files than the prompt did.
@@ -297,7 +366,7 @@ export function buildSystemPrompt(opts: {
   mkdirSync(MEMORY_DIR, { recursive: true });
   const memoryLines = memoryIndexLines(isGroup);
   const rosterLines = peopleRosterLines(isGroup);
-  opts.onContext?.({ memory: (memoryLines ?? []).slice(0, MAX_MEMORY_LINES), people: rosterLines });
+  opts.onContext?.({ memory: memorySnapshotLines(memoryLines), people: rosterLines });
   const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup, memoryLines), loadPeopleSection(isGroup, rosterLines),
     isGroup ? HARNESS_INSTRUCTIONS : `${HARNESS_INSTRUCTIONS}\n\n${ownerNotes(!!opts.subsessions)}`].filter(Boolean);
   return sections.join("\n\n---\n\n");

@@ -6,7 +6,7 @@ import { isDmSessionKey } from "./keys.js";
 import { log } from "../logger.js";
 import { textOfContent, type TranscriptEvent } from "./transcript-event.js";
 import {
-  parseJsonl, readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync,
+  parseJsonl, readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync, type JsonlReadProgress,
   isRawJsonlLine, reportRawJsonlLines, serializeJsonlRecord, type RawJsonlLine,
 } from "../jsonl.js";
 import { writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
@@ -774,6 +774,12 @@ export class SessionStore {
    * `stopped` then says how far back it got. The caller reports that rather
    * than presenting a partial scan as the whole history.
    *
+   * `before` only saves reading at the grain of a file: a file that starts
+   * after `toTime` is passed over, but inside a file the scan still runs from
+   * its newest record, and what it passes on the way to the window is charged
+   * to the budget. Rotation keeps a file to one month, far below the budget;
+   * a single file larger than the budget cannot be searched past it.
+   *
    * The window rules are `searchTranscript`'s: only a record whose time is
    * known may end the scan, and a record that cannot be placed under a bound
    * is skipped. A file that starts after `toTime` is passed over unread. With a read-only legacy sidecar in the read set the files are
@@ -794,7 +800,7 @@ export class SessionStore {
     const budget = { ...RECALL_SCAN_BUDGET, ...opts.budget };
     const now = budget.now ?? (() => performance.now());
     const startedAt = now();
-    const progress = { bytesRead: 0 };
+    const progress: JsonlReadProgress = { bytesRead: 0, maxBytes: budget.maxBytes };
     const readSet = this.transcriptReadSet(key);
     const ordered = !readSet.hasSidecars;
 
@@ -848,6 +854,12 @@ export class SessionStore {
         scorer.observe({ msg, fileIndex, position }, msg.content);
       }
       if (skipped > 0) log.debug({ file: path, skipped }, "Skipped transcript records that cannot be placed in the search window");
+      // The reader itself stopped at the byte budget, part-way through a line
+      // too long to yield or a run of lines that do not parse.
+      if (progress.cutShort) {
+        stopped = { reason: "bytes", reachedBackTo: ordered ? reachedBackTo : null };
+        break;
+      }
     }
 
     // Newest first. In a chronological read set that is the order the records

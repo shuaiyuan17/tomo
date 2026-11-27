@@ -128,6 +128,21 @@ describe("recallTranscript", () => {
     expect(contents(recall({ queries: ["ramen"], budget: { maxBytes: Infinity } }))).toContain("ramen in may");
   });
 
+  it("stops inside a line longer than the byte budget instead of reading it whole", () => {
+    // A record is only handed over once its whole line is read, so a budget
+    // tested between records could not interrupt this one.
+    writeTranscript(dir, KEY, [
+      msg("ramen before the giant", day(8, 1)),
+      msg(`giant ${"x".repeat(600 * 1024)}`, day(8, 2)),
+      msg("ramen after the giant", day(8, 3)),
+    ]);
+
+    const result = recall({ queries: ["ramen"], budget: { maxBytes: 128 * 1024 } });
+
+    expect(contents(result)).toEqual(["ramen after the giant"]);
+    expect(result.stopped).toEqual({ reason: "bytes", reachedBackTo: day(8, 3) });
+  });
+
   it("does not report a scan that reached the lower bound as cut short", () => {
     writeFile(`_archive_${STEM}_2026-05.jsonl`, [msg("ramen in may", day(5, 1))]);
     writeTranscript(dir, KEY, [msg("ramen in august", day(8, 1))]);

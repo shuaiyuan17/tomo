@@ -211,13 +211,25 @@ export function reportRawJsonlLines(
  * Splitting at newline bytes is safe — 0x0A never appears inside a multi-byte
  * UTF-8 sequence.
  *
- * `progress.bytesRead`, when given, is advanced by every chunk read, so a
- * caller with a byte budget can stop between records.
+ * `progress`, when given, is a byte budget shared across calls: `bytesRead`
+ * is advanced by every chunk read, and once it has passed `maxBytes` the
+ * generator reads no further, sets `cutShort` and returns. The test sits
+ * before each read rather than with the consumer, because a record is only
+ * yielded once its whole line is in memory: one oversized line, or a long run
+ * of lines that do not parse, would otherwise be read to the end of the file
+ * before any consumer could say stop.
  */
+export interface JsonlReadProgress {
+  bytesRead: number;
+  maxBytes: number;
+  /** Set when a read stopped at the budget with part of a file unread. */
+  cutShort?: boolean;
+}
+
 export function* iterateJsonlBackwardsSync<T = unknown>(
   path: string,
   chunkSize = 64 * 1024,
-  progress?: { bytesRead: number },
+  progress?: JsonlReadProgress,
 ): Generator<T> {
   let fd: number;
   try {
@@ -229,6 +241,10 @@ export function* iterateJsonlBackwardsSync<T = unknown>(
     let pos = fstatSync(fd).size;
     let carry = Buffer.alloc(0);
     while (pos > 0) {
+      if (progress && progress.bytesRead > progress.maxBytes) {
+        progress.cutShort = true;
+        return;
+      }
       const readSize = Math.min(chunkSize, pos);
       pos -= readSize;
       const buf = Buffer.alloc(readSize);

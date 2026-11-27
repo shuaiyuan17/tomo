@@ -186,6 +186,25 @@ describe("recall scoring", () => {
     expect(result.scoreOf("dentist appointment confirmed")).toBeCloseTo(1.5, 5);
   });
 
+  it("gives a one-word phrasing the same verbatim bonus as a longer one", () => {
+    // Otherwise, of two phrasings, the longer one's exact matches would
+    // always outrank the shorter one's.
+    const messages = [...FILLER, "ramen tonight?", "the noodle shop is closed"];
+    const result = search(messages, ["ramen", "noodle shop"]);
+
+    expect(result.scoreOf("ramen tonight?")).toBeCloseTo(1.5, 5);
+    expect(result.scoreOf("the noodle shop is closed")).toBeCloseTo(1.5, 5);
+  });
+
+  it("reports the match position in the original text when lowercasing would lengthen it", () => {
+    // "İ" lowercases to two code units; forty of them would push an index
+    // taken from a plainly lowercased copy forty places past the word.
+    const text = `${"İ".repeat(40)} the flight leaves at noon`;
+    const [hit] = search([...FILLER, text], "flight noon").hits;
+
+    expect(text.slice(hit.matchIndex, hit.matchIndex + 6)).toBe("flight");
+  });
+
   it("leaves out a two-character piece that straddles two words and appears nowhere", () => {
     // "搬家时间" cuts to 搬家 / 家时 / 时间. 家时 is in no message: it is an
     // artefact of the cutting, not a rare word the message failed to hold, so

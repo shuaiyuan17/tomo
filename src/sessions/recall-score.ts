@@ -99,6 +99,24 @@ function isWordChar(char: string): boolean {
 }
 
 /**
+ * `text` lowercased WITHOUT changing its length, so that an index into the
+ * result is an index into `text`. `toLowerCase` can lengthen a string ("İ"
+ * becomes two code units), and the excerpt is cut from the original at the
+ * position a token was found in the lowercased copy. A character whose
+ * lowercase form has another length is kept as it is.
+ */
+export function lowercaseInPlace(text: string): string {
+  const lower = text.toLowerCase();
+  if (lower.length === text.length) return lower;
+  let out = "";
+  for (const char of text) {
+    const folded = char.toLowerCase();
+    out += folded.length === char.length ? folded : char;
+  }
+  return out;
+}
+
+/**
  * Cut one query into tokens. Exported for tests; `RecallScorer` is the caller.
  * Returns an empty list for a query with nothing to cut ("的", "a", "!!").
  */
@@ -111,7 +129,7 @@ export function tokenizeRecallQuery(query: string): RecallToken[] {
     seen.add(id);
     tokens.push({ text, kind, maybeArtefact });
   };
-  for (const [segment] of query.toLowerCase().matchAll(SEGMENT)) {
+  for (const [segment] of lowercaseInPlace(query).matchAll(SEGMENT)) {
     const chars = Array.from(segment);
     if (!SPACELESS_CHAR.test(chars[0])) {
       if (chars.length >= 2) add(segment, "word", false);
@@ -153,8 +171,11 @@ function findIn(haystack: string, needle: string, wholeWords: boolean): number {
 }
 
 interface ScoredQuery {
-  /** The query lowercased and trimmed, for the verbatim bonus; null when the bonus cannot apply. */
-  phrase: string | null;
+  /** The query lowercased and trimmed, for the verbatim bonus. */
+  phrase: string;
+  /** Whether a verbatim occurrence must stand clear of other word characters
+   *  (false for a query matched as a plain substring). */
+  wholeWords: boolean;
   /** Indexes into the scorer's token table. */
   tokens: number[];
 }
@@ -213,16 +234,14 @@ export class RecallScorer<T> {
       return this.table.length - 1;
     };
     for (const raw of queries) {
-      const phrase = raw.trim().toLowerCase();
+      const phrase = lowercaseInPlace(raw.trim());
       if (phrase === "") continue;
       const tokens = tokenizeRecallQuery(phrase);
       if (tokens.length === 0) {
-        this.queries.push({ phrase: null, tokens: [intern({ text: phrase, kind: "whole", maybeArtefact: false })] });
+        this.queries.push({ phrase, wholeWords: false, tokens: [intern({ text: phrase, kind: "whole", maybeArtefact: false })] });
         continue;
       }
-      // One token IS the phrase (or nearly): the bonus would only shift every
-      // hit by the same amount.
-      this.queries.push({ phrase: tokens.length >= 2 ? phrase : null, tokens: tokens.map(intern) });
+      this.queries.push({ phrase, wholeWords: true, tokens: tokens.map(intern) });
     }
   }
 
@@ -234,7 +253,7 @@ export class RecallScorer<T> {
   /** Count one message of the search window, and keep it if it holds any token. */
   observe(item: T, content: string): void {
     this.observed++;
-    const lower = content.toLowerCase();
+    const lower = lowercaseInPlace(content);
     let tokens: number[] | null = null;
     let positions: number[] | null = null;
     for (let i = 0; i < this.table.length; i++) {
@@ -249,10 +268,9 @@ export class RecallScorer<T> {
     let phraseMask = 0;
     for (let q = 0; q < this.queries.length; q++) {
       const query = this.queries[q];
-      if (query.phrase === null) continue;
       // Verbatim implies every token is there, so the cheap test goes first.
       if (!query.tokens.every((t) => tokens.includes(t))) continue;
-      if (findIn(lower, query.phrase, true) !== -1) phraseMask |= 1 << q;
+      if (findIn(lower, query.phrase, query.wholeWords) !== -1) phraseMask |= 1 << q;
     }
     this.candidates.push({ item, tokens, positions, phraseMask });
   }

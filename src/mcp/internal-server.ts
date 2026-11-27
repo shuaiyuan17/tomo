@@ -16,6 +16,7 @@ import { isDmSessionKey, isGroupSessionKey, isTaskSessionKey } from "../sessions
 import { buildTaskOwnerTools, buildTaskSelfTools } from "./subsession-tools.js";
 import { ownerSessionKey } from "../owner.js";
 import { homeService } from "../home/service.js";
+import { watchBus } from "../watch/bus.js";
 
 export const TOMO_INTERNAL_MCP_NAME = "tomo-internal";
 
@@ -345,6 +346,12 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       // ask again in their own DM, or dismiss the summon.
       ...buildRecallTools({
         search: (opts) => agent.searchSessionTranscript(callerSessionKey, opts),
+        recall: (opts) => agent.recallSessionTranscript(callerSessionKey, opts),
+        // Counted so the share of searches that find nothing can be watched
+        // (tomo_recall_searches_total). The outcome only: never the query.
+        onSearch: ({ matched, stopped }) => watchBus.publish({
+          type: "recall", sessionKey: callerSessionKey, matched, stopped,
+        }),
         canSearch: isOwnAudience,
       }),
       // Tomo's home: the owner's DM session only (a group never gets the

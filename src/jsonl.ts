@@ -210,10 +210,14 @@ export function reportRawJsonlLines(
  * straddle a chunk boundary, and decoding it half-read would corrupt it.
  * Splitting at newline bytes is safe — 0x0A never appears inside a multi-byte
  * UTF-8 sequence.
+ *
+ * `progress.bytesRead`, when given, is advanced by every chunk read, so a
+ * caller with a byte budget can stop between records.
  */
 export function* iterateJsonlBackwardsSync<T = unknown>(
   path: string,
   chunkSize = 64 * 1024,
+  progress?: { bytesRead: number },
 ): Generator<T> {
   let fd: number;
   try {
@@ -229,6 +233,7 @@ export function* iterateJsonlBackwardsSync<T = unknown>(
       pos -= readSize;
       const buf = Buffer.alloc(readSize);
       readSync(fd, buf, 0, readSize, pos);
+      if (progress) progress.bytesRead += readSize;
       let chunk = Buffer.concat([buf, carry]);
       carry = Buffer.alloc(0);
       if (pos > 0) {

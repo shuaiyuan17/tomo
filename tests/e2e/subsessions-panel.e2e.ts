@@ -139,8 +139,11 @@ it("a failed read of the list or of a chat is tried again, and a table that is b
   const input = rail().getByTestId("subsession-input");
   await browserExpect(rail()).not.toContainText("no longer available");
   await browserExpect(input).toBeEnabled({ timeout: 10_000 });
-  expect(listFails).toBeLessThan(0);
-  expect(detailFails).toBeLessThan(0);
+  // The retry is on a timer (SUBSESSIONS_RETRY_MS for the list, and the chat's
+  // own); the input can be enabled before it fires, so wait for the second read
+  // rather than asserting it already happened.
+  await expect.poll(() => listFails, { timeout: 12_000 }).toBeLessThan(0);
+  await expect.poll(() => detailFails, { timeout: 12_000 }).toBeLessThan(0);
 });
 
 it("leads with what the task is doing until something is said, then folds it into one line above the chat that opens again", async () => {

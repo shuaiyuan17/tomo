@@ -357,7 +357,10 @@ describe("CLI API error delivery", () => {
     });
     let ok: boolean;
     try {
+      // Refused twice: the one resend (see below) fails the same way.
       ok = await r.run([
+        apiErrorMessage(NOT_LOGGED_IN),
+        { ...result(), is_error: isError, result: NOT_LOGGED_IN },
         apiErrorMessage(NOT_LOGGED_IN),
         { ...result(), is_error: isError, result: NOT_LOGGED_IN },
       ]);
@@ -394,17 +397,57 @@ describe("CLI API error delivery", () => {
     expect(texts[1]).toContain(NOT_LOGGED_IN);
   });
 
+  const refused = () => [apiErrorMessage(NOT_LOGGED_IN), { ...result(), is_error: true, result: NOT_LOGGED_IN }];
+
+  it("sends the message once more when the login was refused before the turn did anything", async () => {
+    const r = rig();
+    const busyAfterFailure: boolean[] = [];
+    const ok = await r.run([
+      ...refused(),
+      // The request never lets go of the session between the two runs.
+      effect(() => busyAfterFailure.push(r.session.isBusy())),
+      assistant([textBlock("Here is the answer")]),
+      result(),
+    ]);
+    expect(ok).toBe(true);
+    expect(busyAfterFailure).toEqual([true]);
+    const { inputs } = harnessRef.current!;
+    expect(inputs).toHaveLength(2);
+    expect(inputs[1]).toBe(inputs[0]);
+    expect(inputs[0]).toContain("hello");
+    expect(r.channel.sent.map((message) => message.text)).toEqual(["Here is the answer"]);
+    expect(r.transcript).toEqual(["Here is the answer"]);
+  });
+
+  it("resends only once: a second refusal fails the turn", async () => {
+    const r = rig();
+    expect(await r.run([...refused(), ...refused()])).toBe(false);
+    expect(harnessRef.current!.inputs).toHaveLength(2);
+    expect(r.session.isBusy()).toBe(false);
+  });
+
   it.each([
-    ["a login refused on the turn's first frame", [], true],
-    ["one refused after the model had called a tool", [assistant([toolUseBlock("Bash", "t1")]), toolResult("t1")], false],
-    ["an error frame that itself carries a tool call", [{ ...assistant([toolUseBlock("Bash", "t2")]), error: "authentication_failed" }], false],
-  ])("marks only a failure before any work as safe to send again: %s", async (_label, before, safe) => {
+    ["the model had already called a tool", [assistant([toolUseBlock("Bash", "t1")]), toolResult("t1")], "authentication_failed"],
+    ["the error frame itself carries a tool call", [{ ...assistant([toolUseBlock("Bash", "t2")]), error: "authentication_failed" }], "authentication_failed"],
+    ["the API error is another kind", [], "overloaded"],
+  ])("does not resend when %s", async (_label, before, kind) => {
+    const r = rig();
+    const ok = await r.run([...before, apiErrorMessage(NOT_LOGGED_IN, kind), { ...result(), is_error: true, result: NOT_LOGGED_IN }]);
+    expect(ok).toBe(false);
+    expect(harnessRef.current!.inputs).toHaveLength(1);
+    expect(r.channel.sent.map((message) => message.text)).toEqual([`[error] ${NOT_LOGGED_IN}`]);
+  });
+
+  it("does not resend a turn the owner asked to stop", async () => {
     const r = rig();
     const turn = r.session.send("hello");
     turn.catch(() => {});
     while (harnessRef.current!.inputs.length === 0) await new Promise((resolve) => setTimeout(resolve, 1));
-    harnessRef.current!.enqueue([...before, apiErrorMessage(NOT_LOGGED_IN), { ...result(), is_error: true, result: NOT_LOGGED_IN }]);
-    await expect(turn).rejects.toMatchObject({ message: NOT_LOGGED_IN, isAuthFailureBeforeAnyWork: safe });
+    (r.session as unknown as { q: { interrupt: () => Promise<void> } }).q.interrupt = async () => {};
+    await r.session.stop();
+    harnessRef.current!.enqueue(refused());
+    await expect(turn).resolves.toBe("NO_REPLY");
+    expect(harnessRef.current!.inputs).toEqual(["hello"]);
   });
 
   it("a turn that recovers after an API error message is not failed by it", async () => {

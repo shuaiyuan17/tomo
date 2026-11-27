@@ -199,9 +199,10 @@ export class SdkResultError extends Error {
   /**
    * The login was refused before the model did anything: no tool call, no
    * block of its own, no steered message folded in. Seen as a passing state
-   * on the first request of a freshly started CLI, so the same prompt is safe
-   * to send once more (LiveSessionManager): nothing of the turn exists to
-   * repeat. An account that really is logged out fails the second time too.
+   * on the first request of a freshly started CLI, so the same message is safe
+   * to send once more (LiveSession.resendAfterAuthFailure): nothing of the
+   * turn exists to repeat. An account that really is logged out fails the
+   * second time too.
    */
   get isAuthFailureBeforeAnyWork(): boolean {
     return this.apiError?.kind === "authentication_failed" && this.apiError.nothingRan;

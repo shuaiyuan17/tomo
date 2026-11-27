@@ -145,15 +145,9 @@ vi.mock("../src/agent/live-session.js", () => {
       }
     },
     SdkResultError: class SdkResultError extends Error {
-      constructor(
-        message: string, readonly subtype: string, readonly errors: string[] = [], readonly numTurns?: number,
-        readonly apiError?: { kind: string; nothingRan: boolean },
-      ) {
+      constructor(message: string, readonly subtype: string, readonly errors: string[] = [], readonly numTurns?: number) {
         super(message);
         this.name = "SdkResultError";
-      }
-      get isAuthFailureBeforeAnyWork(): boolean {
-        return this.apiError?.kind === "authentication_failed" && this.apiError.nothingRan;
       }
       get isResumeMissing(): boolean {
         return this.subtype === "error_during_execution" && this.numTurns === 0
@@ -1628,93 +1622,6 @@ describe("LiveSessionManager.runWithRetry", () => {
     expect(deps.clearSdkSessionId).toHaveBeenCalledWith("imessage:group");
     expect(mockState.instances).toHaveLength(2);
     expect(mockState.instances[0].closed).toBe(true);
-  });
-
-  describe("a login refused before the turn did anything", () => {
-    const NOT_LOGGED_IN = "Not logged in · Please run /login";
-    const authFailure = (nothingRan = true, kind = "authentication_failed") =>
-      new SdkResultError(NOT_LOGGED_IN, "success", [], 1, { kind, nothingRan });
-
-    it("sends the same prompt once more, on the same session", async () => {
-      const deps = makeDeps();
-      const manager = new LiveSessionManager(deps);
-      const prompts: string[] = [];
-      mockState.sendImpl = async (prompt) => {
-        prompts.push(prompt);
-        if (prompts.length === 1) throw authFailure();
-        return "answered";
-      };
-
-      await expect(manager.runWithRetry({ key: "dm:owner", prompt: "hi" })).resolves.toBe("answered");
-      expect(prompts).toEqual(["hi", "hi"]);
-      expect(mockState.instances).toHaveLength(1);
-      expect(mockState.instances[0].closed).toBe(false);
-      expect(deps.clearSdkSessionId).not.toHaveBeenCalled();
-    });
-
-    it("gives up after the one retry when the login is still refused", async () => {
-      const manager = new LiveSessionManager(makeDeps());
-      let calls = 0;
-      mockState.sendImpl = async () => { calls++; throw authFailure(); };
-
-      await expect(manager.runWithRetry({ key: "dm:owner", prompt: "hi" })).rejects.toThrow(NOT_LOGGED_IN);
-      expect(calls).toBe(2);
-    });
-
-    it.each([
-      ["the turn had already done something", () => authFailure(false), {}],
-      ["the API error is another kind", () => authFailure(true, "rate_limit"), {}],
-      ["the result carries no typed API error", () => new SdkResultError(NOT_LOGGED_IN, "success"), {}],
-      ["a block has already shipped", () => authFailure(), { hasShipped: () => true }],
-      ["the message was steered", () => authFailure(), { steer: true }],
-    ])("does not retry when %s", async (_label, error, extra) => {
-      const manager = new LiveSessionManager(makeDeps());
-      let calls = 0;
-      mockState.sendImpl = async () => { calls++; throw error(); };
-
-      await expect(manager.runWithRetry({ key: "dm:owner", prompt: "hi", ...extra })).rejects.toThrow(NOT_LOGGED_IN);
-      expect(calls).toBe(1);
-    });
-
-    it("sends the retry in the same step as the failure, leaving no idle gap for another turn", async () => {
-      const manager = new LiveSessionManager(makeDeps());
-      const order: string[] = [];
-      let calls = 0;
-      mockState.sendImpl = async () => {
-        calls++;
-        order.push(`send-${calls}`);
-        if (calls === 1) {
-          // Runs as soon as the failure has been handled, before any timer.
-          queueMicrotask(() => queueMicrotask(() => order.push("after-failure")));
-          setTimeout(() => order.push("timer"), 0);
-          throw authFailure();
-        }
-        return "answered";
-      };
-
-      await expect(manager.runWithRetry({ key: "dm:owner", prompt: "hi" })).resolves.toBe("answered");
-      await new Promise((resolve) => setTimeout(resolve, 1));
-      expect(order.indexOf("send-2")).toBeLessThan(order.indexOf("timer"));
-    });
-
-    it("does not retry once the failed session has closed", async () => {
-      const manager = new LiveSessionManager(makeDeps());
-      let calls = 0;
-      mockState.sendImpl = async (_prompt, session) => { calls++; session.closed = true; throw authFailure(); };
-
-      await expect(manager.runWithRetry({ key: "dm:owner", prompt: "hi" })).rejects.toThrow(NOT_LOGGED_IN);
-      expect(calls).toBe(1);
-      expect(mockState.instances).toHaveLength(1);
-    });
-
-    it("does not retry onto a session that is running something else", async () => {
-      const manager = new LiveSessionManager(makeDeps());
-      let calls = 0;
-      mockState.sendImpl = async (_prompt, session) => { calls++; session.busy = true; throw authFailure(); };
-
-      await expect(manager.runWithRetry({ key: "dm:owner", prompt: "hi" })).rejects.toThrow(NOT_LOGGED_IN);
-      expect(calls).toBe(1);
-    });
   });
 
   it("does not retry a missing-conversation result from a turn that ran", async () => {

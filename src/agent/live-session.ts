@@ -1243,6 +1243,7 @@ export class LiveSession {
     this.parts = [];
     this.unownedTurnDropLogged = false;
     const req = this.currentRequest;
+    if (failure?.isAuthFailureBeforeAnyWork && this.resendAfterAuthFailure(req)) return;
     if (this.pendingSteers.length === 0) this.clearActivityTimeout();
     // A failed turn REJECTS its owner (blocks already shipped stay shipped;
     // the sink flushes their transcript slots on the rejection path) rather
@@ -1276,6 +1277,42 @@ export class LiveSession {
       this.notifyIdle();
     }
   }
+
+  /**
+   * ONE MORE TRY FOR A LOGIN REFUSED BEFORE ANY WORK.
+   *
+   * The first request of a freshly started CLI child (after a compact reload,
+   * a restart) has been seen to fail with "Not logged in" and the next one,
+   * moments later, to go through. Failing the turn there dropped the owner's
+   * message for a state that had already passed. So the same message is put
+   * on the input queue once more, and only when a second run cannot repeat
+   * anything: the failed turn made no tool call and produced nothing of the
+   * model's own (so no block of it shipped), no steered message is merged or
+   * waiting, and nobody asked to stop it. A second failure (the account
+   * really is logged out) fails the turn like any other.
+   *
+   * THE REQUEST NEVER LETS GO OF THE SESSION. It stays `currentRequest`
+   * across the resend, so the session is busy throughout: nothing else can
+   * claim it in between, and the retried turn can be steered into and stopped
+   * like the first. True when the message was resent (the caller returns
+   * without settling the request).
+   */
+  private resendAfterAuthFailure(req: TurnRequest | null): boolean {
+    const owner = req as MessageRequest | null;
+    if (!owner?.message || !this.alive || this.resentAfterAuthFailure.has(owner)) return false;
+    if (this.mergedRequests.length > 0 || this.pendingSteers.length > 0 || this.stopRequestedFor === owner) return false;
+    this.resentAfterAuthFailure.add(owner);
+    log.warn({ session: this.sessionKey }, "Login refused before the turn did anything; sending the message once more");
+    // A new client uuid: the result of the second run must name this send,
+    // not the one that already ended (attributeResult).
+    owner.message = { ...owner.message, uuid: randomUUID() };
+    if (this.turnBudget) resetTurnBudget(this.turnBudget);
+    this.pushInput(owner.message, owner.replyContext?.requestId, owner.onPromptHandedOff);
+    this.refreshActivityTimeout();
+    return true;
+  }
+  /** Requests whose message was already resent once after a refused login. */
+  private readonly resentAfterAuthFailure = new WeakSet<TurnRequest>();
 
   /**
    * Observability-only path for subagent events (parent_tool_use_id set):

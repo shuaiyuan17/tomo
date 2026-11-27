@@ -121,6 +121,24 @@ describe("recall scoring", () => {
     expect(search(messages, "id").texts).toEqual(["send me your ID when you can"]);
   });
 
+  it("finds a whole-word occurrence after ones glued into longer words", () => {
+    const messages = [...FILLER, "xab ab ab", "aaaaaaaa aa", "abab"];
+
+    expect(search(messages, "ab ab").scoreOf("xab ab ab")).toBeCloseTo(1.5, 5);
+    expect(search(messages, "aa").texts).toEqual(["aaaaaaaa aa"]);
+  });
+
+  it("scores only the start of a very long message, in bounded time", () => {
+    // A megabyte of one letter: every position is an occurrence of "aa"
+    // glued into the run. The word after the scored part is not looked for.
+    const giant = `${"a".repeat(1_000_000)} zeppelin`;
+    const started = performance.now();
+    const result = search([...FILLER, giant, "a zeppelin flew by"], ["aa", "zeppelin"]);
+
+    expect(result.texts).toEqual(["a zeppelin flew by"]);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
   it("finds an English word that touches Chinese text", () => {
     const messages = [...FILLER, "那个offer的截止日期是周五"];
 

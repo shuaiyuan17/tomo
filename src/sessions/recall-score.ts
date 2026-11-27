@@ -46,6 +46,14 @@ const MAX_TOKENS_PER_QUERY = 32;
  */
 const RARITY_CEILING = 1000;
 
+/**
+ * How much of one message is scored: its first this many characters. The
+ * scan's clock is read between messages, so the work one message can cost has
+ * to be bounded on its own, and a message this long is a pasted log or file,
+ * not conversation.
+ */
+export const RECALL_MAX_SCORED_CHARS = 100_000;
+
 const SPACELESS_CHAR = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u;
 const WORD_CHAR = /[\p{L}\p{N}\p{M}]/u;
 /** One run of spaceless-script characters, or one run of other word characters. */
@@ -169,7 +177,14 @@ function findIn(haystack: string, needle: string, wholeWords: boolean): number {
     const gluedBefore = guardStart && isWordChar(charBefore(haystack, at));
     const gluedAfter = guardEnd && isWordChar(charAt(haystack, end));
     if (!gluedBefore && !gluedAfter) return at;
-    at = haystack.indexOf(needle, at + 1);
+    // An occurrence that starts inside a word is followed by more that do,
+    // one place further along each: skip to the end of that word instead of
+    // stepping through it, which is quadratic on a long run of one character.
+    let next = at + 1;
+    if (gluedBefore) {
+      while (next < haystack.length && isWordChar(charAt(haystack, next))) next++;
+    }
+    at = haystack.indexOf(needle, next);
   }
   return -1;
 }
@@ -257,6 +272,7 @@ export class RecallScorer<T> {
   /** Count one message of the search window, and keep it if it holds any token. */
   observe(item: T, content: string): void {
     this.observed++;
+    if (content.length > RECALL_MAX_SCORED_CHARS) content = content.slice(0, RECALL_MAX_SCORED_CHARS);
     const lower = content.toLowerCase();
     let tokens: number[] | null = null;
     let positions: number[] | null = null;

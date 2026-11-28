@@ -1,7 +1,7 @@
-import { createHash } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { DbDamagedError, openTomoDb, type TomoDb } from "../db/index.js";
+import { deleteMeta, digestOf, metaValue, setMeta } from "../db/legacy.js";
 import { isEnoent, writeJsonAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
 import { fileTimestamp } from "./transcript-names.js";
@@ -172,15 +172,15 @@ export class PendingNotesStore {
         raw = readFileSync(this.legacyPath);
       } catch (err) {
         if (isEnoent(err)) {
-          const mark = db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", EXPORTED_KEY);
-          if (!mark) return "none";
-          if (mark.value.startsWith(EXPORT_WRITING_PREFIX)) {
+          const mark = metaValue(db, EXPORTED_KEY);
+          if (mark === undefined) return "none";
+          if (mark.startsWith(EXPORT_WRITING_PREFIX)) {
             // The export's file never reached the legacy path: the table is still the truth.
-            db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
+            deleteMeta(db, EXPORTED_KEY);
             return "unlanded";
           }
           db.run("DELETE FROM pending_notes");
-          db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
+          deleteMeta(db, EXPORTED_KEY);
           return "consumed";
         }
         this.unreadable = err;
@@ -193,9 +193,8 @@ export class PendingNotesStore {
         this.unreadable = err;
         return "unreadable";
       }
-      const digest = createHash("sha256").update(raw).digest("hex");
-      const prev = db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", IMPORT_PENDING_KEY);
-      if (prev?.value === digest) return "pending";
+      const digest = digestOf(raw);
+      if (metaValue(db, IMPORT_PENDING_KEY) === digest) return "pending";
       const displaced = merge ? 0 : Number(db.get<{ n: number }>("SELECT count(*) AS n FROM pending_notes")?.n ?? 0);
       if (merge) {
         // The older Tomo never saw the export (it was still staged): the
@@ -205,8 +204,8 @@ export class PendingNotesStore {
         db.run("DELETE FROM pending_notes");
         for (const [key, list] of Object.entries(notes)) writeNotes(db, key, list);
       }
-      db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", IMPORT_PENDING_KEY, digest);
-      db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
+      setMeta(db, IMPORT_PENDING_KEY, digest);
+      deleteMeta(db, EXPORTED_KEY);
       return { notes, displaced };
     });
     // Committed: a staged export merged above is in the table now.
@@ -224,7 +223,7 @@ export class PendingNotesStore {
       // Moved aside by us, not consumed by an older Tomo: the table stays the
       // truth. The mark goes first: a settled one beside no file would read,
       // at the next start, as every note delivered.
-      db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
+      deleteMeta(db, EXPORTED_KEY);
       this.quarantineLegacy(this.unreadable);
       this.removeStaged();
       return;
@@ -249,7 +248,7 @@ export class PendingNotesStore {
         return;
       }
       if (moved === "taken") continue;
-      db.run("DELETE FROM meta WHERE key = ?", IMPORT_PENDING_KEY);
+      deleteMeta(db, IMPORT_PENDING_KEY);
       return;
     }
   }
@@ -266,7 +265,7 @@ export class PendingNotesStore {
    */
   private finishStagedExport(db: TomoDb): boolean {
     const staged = stagedExportPath(this.legacyPath);
-    const mark = db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", EXPORTED_KEY)?.value;
+    const mark = metaValue(db, EXPORTED_KEY);
     const settled = mark !== undefined && !mark.startsWith(EXPORT_WRITING_PREFIX);
     if (!existsSync(staged)) {
       // An export file reaches the legacy path only once its mark settles:
@@ -462,8 +461,8 @@ export function exportPendingNotesToFile(db: TomoDb, out: string, opts: { mark: 
   }
   const at = new Date().toISOString();
   const notes = db.transaction(() => {
-    const prev = db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", EXPORTED_KEY);
-    if (prev && !prev.value.startsWith(EXPORT_WRITING_PREFIX)) {
+    const prev = metaValue(db, EXPORTED_KEY);
+    if (prev !== undefined && !prev.startsWith(EXPORT_WRITING_PREFIX)) {
       throw new Error("The notes were already exported for a rollback, and that export is not settled yet. "
         + "Start this Tomo once (it imports the exported file, or, when it is gone, takes it that an older Tomo delivered every note), then export again.");
     }
@@ -499,7 +498,7 @@ export function exportPendingNotesToFile(db: TomoDb, out: string, opts: { mark: 
 function takeBack(db: TomoDb, staged: string): void {
   let undone = false;
   try {
-    db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
+    deleteMeta(db, EXPORTED_KEY);
     undone = true;
   } catch {
     try {
@@ -519,6 +518,3 @@ function fsyncDirQuietly(dir: string): void {
   } catch { /* advisory on filesystems that refuse it */ }
 }
 
-function setMeta(db: TomoDb, key: string, value: string): void {
-  db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", key, value);
-}

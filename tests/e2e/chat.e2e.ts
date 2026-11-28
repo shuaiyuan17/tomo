@@ -602,17 +602,19 @@ it("motion: new messages rise in, the rail transitions open and closed, and redu
 it("motion: only what is new rises in (never the history, on load or reload); dots wait for the reply, a skeleton for a slow history", async () => {
   // Every entrance animation the page starts on a message (its row's entrance element, or a streamed block), and every one cut short.
   await page.addInitScript(() => {
-    const w = window as unknown as { entrances: string[]; cancelled: string[] }; w.entrances = []; w.cancelled = [];
-    const record = (into: string[]) => (event: AnimationEvent) => {
+    const w = window as unknown as { entrances: Element[]; cancelled: Element[] }; w.entrances = []; w.cancelled = [];
+    // The element is kept, not its text: an entrance can start before the bubble's text is in it, so the text is
+    // read when the test asks (the entrance element is the same one from pending bubble to recorded message).
+    const record = (into: Element[]) => (event: AnimationEvent) => {
       const el = event.target as Element;
       // (A streamed block that leaves mid-rise, replaced by the recorded message, is not a cut: the message carries it on.)
-      if (event.animationName === "motion-enter" && el.matches("[data-slot=message-entrance], article.message") && (event.type === "animationstart" || el.isConnected)) into.push(el.textContent ?? "");
+      if (event.animationName === "motion-enter" && el.matches("[data-slot=message-entrance], article.message") && (event.type === "animationstart" || el.isConnected)) into.push(el);
     };
     document.addEventListener("animationstart", record(w.entrances), true);
     document.addEventListener("animationcancel", record(w.cancelled), true);
   });
-  const entrances = () => page.evaluate(() => (window as unknown as { entrances: string[] }).entrances);
-  const cancelled = () => page.evaluate(() => (window as unknown as { cancelled: string[] }).cancelled);
+  const entrances = () => page.evaluate(() => (window as unknown as { entrances: Element[] }).entrances.map((el) => el.textContent ?? ""));
+  const cancelled = () => page.evaluate(() => (window as unknown as { cancelled: Element[] }).cancelled.map((el) => el.textContent ?? ""));
   const input = page.getByRole("textbox", { name: "Message Tomo" });
   const dots = page.locator("[data-slot=thinking-dots]");
   mockSdk.responseFn = () => "An old reply.";
@@ -684,9 +686,17 @@ it("motion: only what is new rises in (never the history, on load or reload); do
   await input.fill("a calm question"); await input.press("Enter");
   const calm = page.locator("article.message.user").filter({ hasText: "a calm question" });
   await browserExpect(calm).toBeVisible();
-  expect(await calm.evaluate((el) => getComputedStyle(el.closest("[data-slot=message-entrance]")!).animationName)).toBe("none");
+  // Polled, and read from inside the page: the bubble is swapped (pending → recorded) right about now, and the
+  // element a locator resolved can be detached before evaluate runs: closest() then finds no wrapper.
+  await browserExpect.poll(() => calm.evaluate((el) => {
+    const wrapper = el.closest("[data-slot=message-entrance]");
+    return wrapper ? getComputedStyle(wrapper).animationName : "detached";
+  })).toBe("none");
   await browserExpect(dots).toBeVisible();
-  expect(await dots.evaluate((el) => [getComputedStyle(el).animationName, getComputedStyle(el.querySelector("i")!).animationName])).toEqual(["none", "none"]);
+  await browserExpect.poll(() => dots.evaluate((el) => {
+    const dot = el.querySelector("i");
+    return dot ? [getComputedStyle(el).animationName, getComputedStyle(dot).animationName] : ["detached"];
+  })).toEqual(["none", "none"]);
   answer("A calm reply.");
   await browserExpect(page.locator("article.message.assistant").filter({ hasText: "A calm reply." }).first()).toBeVisible();
   expect((await entrances()).filter((text) => text.includes("calm"))).toEqual([]);

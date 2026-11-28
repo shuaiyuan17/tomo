@@ -118,6 +118,30 @@ describe("schema migrations", () => {
   });
 });
 
+describe("snapshots", () => {
+  it("reads in a snapshot never see another connection's commit half-way", () => {
+    const path = join(freshDir(), "tomo.db");
+    const a = openTomoDb(path);
+    const b = openTomoDb(path);
+    try {
+      a.exec("CREATE TABLE t (x INTEGER)");
+      const seen = a.snapshot(() => {
+        const first = a.get<{ n: number }>("SELECT count(*) AS n FROM t")!.n;
+        b.run("INSERT INTO t (x) VALUES (1)");
+        const second = a.get<{ n: number }>("SELECT count(*) AS n FROM t")!.n;
+        return [first, second];
+      });
+      expect(seen).toEqual([0, 0]);
+      expect(a.get<{ n: number }>("SELECT count(*) AS n FROM t")!.n).toBe(1);
+      // Inside a write transaction it just runs.
+      expect(a.transaction(() => a.snapshot(() => 7))).toBe(7);
+    } finally {
+      a.close();
+      b.close();
+    }
+  });
+});
+
 describe("transactions", () => {
   it("anything thrown inside rolls every write back", () => {
     const db = openTomoDb(join(freshDir(), "tomo.db"));

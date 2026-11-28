@@ -133,6 +133,31 @@ export class TomoDb {
     }
   }
 
+  /**
+   * Run `fn`'s reads against one snapshot (a deferred read transaction), so
+   * statements in it cannot see two states of the database. Inside a write
+   * transaction it simply runs (that one is a snapshot already). Read-only
+   * connections may use it. Synchronous only.
+   */
+  snapshot<T>(fn: () => T): T {
+    if (this.inTransaction) return fn();
+    this.db.exec("BEGIN");
+    this.inTransaction = true;
+    try {
+      const result = fn();
+      if (result && typeof (result as { then?: unknown }).then === "function") {
+        throw new Error("TomoDb.snapshot callbacks must be synchronous");
+      }
+      this.db.exec("COMMIT");
+      return result;
+    } catch (err) {
+      try { this.db.exec("ROLLBACK"); } catch { /* nothing was written */ }
+      throw err;
+    } finally {
+      this.inTransaction = false;
+    }
+  }
+
   /** `PRAGMA quick_check` (or the full `integrity_check`): `["ok"]` when sound. */
   check(full = false): string[] {
     const rows = this.db.prepare(full ? "PRAGMA integrity_check" : "PRAGMA quick_check").all();

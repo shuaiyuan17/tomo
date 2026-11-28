@@ -210,6 +210,45 @@ describe("importing the old subsessions.json", () => {
     expect(third.state()).toBe("ok");
   });
 
+  it("a placeholder that cannot be written keeps sub-sessions off this start; the next start finishes the import", () => {
+    writeLegacy(legacyTable(2));
+    const real = fsUtils.writeJsonAtomicSync;
+    vi.spyOn(fsUtils, "writeJsonAtomicSync").mockImplementation((file, value, o) => {
+      if (file === path) throw new Error("EROFS");
+      return real(file, value, o);
+    });
+    const store = new SubsessionStore(path);
+    expect(() => store.list()).toThrow(/placeholder/);
+    expect(store.state()).toBe("unreadable");
+    vi.restoreAllMocks();
+    expect(JSON.parse(readFileSync(path, "utf8")).tasks).toHaveLength(2);
+    const next = new SubsessionStore(path);
+    expect(next.list()).toHaveLength(2);
+    expect(JSON.parse(readFileSync(path, "utf8")).movedToDatabase).toBeDefined();
+  });
+
+  it("a .bak left behind (a stop between the placeholder and moving it) is moved aside next start, never imported again", () => {
+    const table = legacyTable(2);
+    writeLegacy(table);
+    new SubsessionStore(path).update("s1", (r) => { r.activeMs = 77; });
+    writeLegacy(table, `${path}.bak`);
+    const store = new SubsessionStore(path);
+    expect(store.get("s1")?.activeMs).toBe(77);
+    expect(store.state()).toBe("ok");
+    expect(existsSync(`${path}.bak`)).toBe(false);
+  });
+
+  it("after a rollback export the file wins even with the bytes of the file imported before", () => {
+    const text = writeLegacy(legacyTable(2));
+    const store = new SubsessionStore(path);
+    store.create({ parentKey: "dm:owner", title: "made after the import", brief: "b" });
+    const db = openTomoDb(join(dir, "data", "tomo.db"));
+    try { exportSubsessionsToFile(db, path, { mark: true }); } finally { db.close(); }
+    // The older Tomo (or a restored copy) put back exactly the first file.
+    writeFileSync(path, text);
+    expect(new SubsessionStore(path).list().map((t) => t.id)).toEqual(["s1", "s2"]);
+  });
+
   it("a fresh install leaves the placeholder and reads as missing", () => {
     const store = new SubsessionStore(path);
     expect(store.list()).toEqual([]);

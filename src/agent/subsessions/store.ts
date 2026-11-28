@@ -1,5 +1,5 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { openTomoDb, sharedTomoDb, type TomoDb } from "../../db/index.js";
 import { deleteMeta, digestOf, isPlaceholder, keepAside, metaValue, setMeta, writePlaceholder } from "../../db/legacy.js";
 import { isEnoent, writeJsonAtomicSync } from "../../fs-utils.js";
@@ -437,10 +437,10 @@ export class SubsessionStore {
       const stored = readStored(db);
       const empty = !stored.written && stored.table.tasks.length === 0;
       if (primary.kind === "table") {
-        if (metaValue(db, SUBSESSIONS_IMPORTED_KEY) === primary.digest) {
-          deleteMeta(db, SUBSESSIONS_EXPORTED_KEY);
-          return null;
-        }
+        // After a rollback export the file is the truth, whatever its bytes
+        // (an older Tomo, or a restored copy, can write the very file imported
+        // before): the mark wins over the digest.
+        if (!exported && metaValue(db, SUBSESSIONS_IMPORTED_KEY) === primary.digest) return null;
         if (!empty && !exported) {
           throw new SubsessionStoreError(`${this.path} holds a sub-session table the database has not imported, and the database already has one. `
             + "Nothing was changed. Move the file aside to keep the database's table, or export with `tomo db export subsessions` first to go back to it.");
@@ -494,17 +494,27 @@ export class SubsessionStore {
    * (that throws before here): the files stay as they are for the owner.
    */
   private finishImport(primary: LegacyTable, backup: LegacyTable): void {
+    // The placeholder first, and it must land: until it does, an older Tomo
+    // could still read the old file (or, with that gone, nothing) as its
+    // table. Failing it keeps sub-sessions off this start; the next retries.
     try {
       if (primary.kind === "table") keepAside(this.path, primary.raw);
-      else if (primary.kind === "bad" && primary.raw) copyFileSync(this.path, `${this.path}.corrupt-${fileTimestamp()}`);
-      if (backup.kind !== "absent") {
-        if (backup.kind === "table") keepAside(this.backupPath, backup.raw);
-        else copyFileSync(this.backupPath, `${this.backupPath}.corrupt-${fileTimestamp()}`);
-        unlinkSync(this.backupPath);
-      }
+      else if (primary.kind === "bad" && primary.raw) keepCorruptCopy(this.path);
       if (primary.kind !== "placeholder") writePlaceholder(this.path, subsessionsPlaceholder(this.dbPath));
     } catch (err) {
-      log.warn({ err, file: this.path }, "Could not replace the old sub-session table file with its placeholder; will retry next start");
+      throw new SubsessionStoreError(`Imported the sub-session table, but could not leave the placeholder at ${this.path}; sub-sessions stay off until it can be written`, err);
+    }
+    // Then the .bak goes aside. Left behind, an older Tomo would recover the
+    // table from it, marked untrusted (never acting on it): not lost, so a
+    // failure here is only logged and retried next start.
+    try {
+      if (backup.kind !== "absent") {
+        if (backup.kind === "table") keepAside(this.backupPath, backup.raw);
+        else keepCorruptCopy(this.backupPath);
+        unlinkSync(this.backupPath);
+      }
+    } catch (err) {
+      log.warn({ err, file: this.backupPath }, "Could not move the old sub-session table backup aside; will retry next start");
     }
   }
 
@@ -555,7 +565,23 @@ interface StoredTable {
   rows: Map<string, string>;
 }
 
+/** Copy a file that will not read aside, byte for byte, as `<path>.corrupt-<ts>`, once per content. */
+function keepCorruptCopy(path: string): void {
+  const raw = readFileSync(path);
+  const dir = dirname(path);
+  const prefix = `${basename(path)}.corrupt-`;
+  for (const name of readdirSync(dir)) {
+    if (name.startsWith(prefix) && readFileSync(join(dir, name)).equals(raw)) return;
+  }
+  copyFileSync(path, `${path}.corrupt-${fileTimestamp()}`);
+}
+
+/** The table as stored, from one snapshot (the state row and the task rows never from two moments). */
 function readStored(db: TomoDb): StoredTable {
+  return db.snapshot(() => readStoredNow(db));
+}
+
+function readStoredNow(db: TomoDb): StoredTable {
   const state = db.get<{ next_id: number; untrusted: string | null }>("SELECT next_id, untrusted FROM subsessions_state WHERE one = 1");
   const records = db.all<{ record: string }>("SELECT record FROM subsessions ORDER BY seq").map((r) => JSON.parse(r.record) as unknown);
   const table = parseTable({

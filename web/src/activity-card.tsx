@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowRightIcon, BracesIcon, CheckIcon, FileIcon } from "lucide-react";
 import type { ToolActivity, WebSubsession } from "../../src/web/protocol.js";
 import { cn } from "@/lib/utils";
@@ -12,7 +12,7 @@ import { useActivityEnv, useSubsessionById } from "./activity-env.js";
 import { asksOwner, isOpenSubsession, isWorkingState, subsessionState, subsessionStateLabel } from "./subsessions.js";
 import { callDuration, elapsedSince, type ToolRow } from "./subagent.js";
 import { useNow } from "./use-now.js";
-import { i18n, Trans, useTranslation } from "./i18n/index.js";
+import { Trans, useTranslation } from "./i18n/index.js";
 
 /** Keys this file picks at runtime (tests/i18n-catalogs.test.ts). */
 // i18n-dynamic: activity:card.*
@@ -47,8 +47,6 @@ function Head({ k, values }: { k: string; values?: Record<string, string> }) {
   return <Trans t={t} ns="activity" i18nKey={k as never} values={values}
     components={{ id: <IdPill id={values?.id ?? ""} className="mx-0.5 align-[1px]" />, b: <b className="font-medium text-foreground" /> }} />;
 }
-/** The same sentence as plain text, for the card's accessible name. */
-const plain = (k: string, values?: Record<string, string>) => (i18n.t as unknown as (key: string, v?: object) => string)(`activity:${k}`, values).replace(/<\/?\w+>/g, "");
 
 /** Text the agent wrote (a note, a message), set off on a tinted block, clamped to `lines` with "Show all". */
 function Quote({ text, lines, plain: bare, truncated }: { text: string; lines: 2 | 3 | 6; plain?: boolean; truncated?: boolean }) {
@@ -126,14 +124,14 @@ function Card({ rows, state, head, children, footer, rawOpen, onRawOpen, compact
   const Icon = state === "running" ? RunningMark : activityIcon(row) ?? BracesIcon;
   const now = useNow(state === "running");
   const time = state === "running" ? elapsedSince(row.ts, now) : callDuration(row);
-  const label = plain(head.k, head.values);
-  return <section role="group" aria-label={label} data-activity-card={row.activity?.kind} data-state={state}
+  const headId = useId();
+  return <section role="group" aria-labelledby={headId} data-activity-card={row.activity?.kind} data-state={state}
     className={cn("group/card w-[min(560px,100%)] overflow-hidden rounded-lg border bg-card font-sans", state === "error" && "border-destructive/35",
       state === "running" && "motion-enter")}>
     <div className={cn("px-3.5", compact ? "py-2" : "pt-2.5 pb-3")}>
       <div className="flex min-w-0 items-center gap-2 text-[12px] text-muted-foreground">
         <span aria-hidden="true" className={cn("grid size-4 shrink-0 place-items-center [&_svg]:size-3.5", state === "error" && "text-destructive")}><Icon /></span>
-        <span className={cn("min-w-0 flex-1 truncate", state === "error" && "text-destructive", state === "running" && "shimmer")}><Head {...head} /></span>
+        <span id={headId} className={cn("min-w-0 flex-1 truncate", state === "error" && "text-destructive", state === "running" && "shimmer")}><Head {...head} /></span>
         {state === "running" && <span className="sr-only">{t("chat:trace.running")}</span>}
         {state === "error" && <span className="sr-only">{t("chat:trace.failed")}</span>}
         {time && <span className="shrink-0 tabular-nums">{time}</span>}

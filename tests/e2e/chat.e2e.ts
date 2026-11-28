@@ -854,7 +854,7 @@ it("calls the agent by its IDENTITY.md name (re-read on edit); the product keeps
   rmSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), { force: true });
 });
 
-it("Tomo's own tools read as sentences; a long pane's copy button without a clipboard selects all of it", async () => {
+it("Tomo's own tools read as cards with raw data; a long pane's copy button without a clipboard selects all of it", async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   store.setSdkSessionId("dm:owner", "sdk-activity");
   const t = Date.now() - 60_000;
@@ -871,13 +871,17 @@ it("Tomo's own tools read as sentences; a long pane's copy button without a clip
     line("user", t + 2_100, [{ type: "tool_result", tool_use_id: "a2", content: long }]));
   await page.reload();
   const history = page.getByLabel("Conversation history");
-  const summary = history.getByRole("button", { name: "Worked with a task, read a file" });
-  await summary.click();
-  await browserExpect(history.getByRole("button", { name: /Started s12 · Cards/ })).toBeVisible();
+  // task_spawn is a card (it splits the run, so the Read is its own line); raw data behind its {} button.
+  const card = history.getByRole("group", { name: /Started a task/ });
+  await browserExpect(card).toContainText("Cards");
+  await browserExpect(card).toContainText("Build the cards");
   expect(await history.textContent()).not.toContain("mcp__tomo-internal");
+  await card.getByRole("button", { name: "Raw data" }).click();
+  await browserExpect(card.locator("[data-slot=activity-raw]")).toContainText("mcp__tomo-internal__task_spawn");
+  await browserExpect(card.locator("[data-slot=activity-raw]")).toContainText("Started s12 (active).");
   await history.getByRole("button", { name: /Read \/repo\/long\.txt/ }).click();
   await page.evaluate(() => Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true }));
-  await history.getByRole("button", { name: "Copy Output" }).click();
+  await history.getByRole("button", { name: "Copy Output" }).last().click();
   await browserExpect.poll(() => page.evaluate(() => window.getSelection()?.toString() ?? "")).toContain("line 59 of a long file");
 });
 

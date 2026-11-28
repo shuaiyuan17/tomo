@@ -1,10 +1,18 @@
-import { readFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { defaultPeopleDirs, loadPeople, renderPeopleRoster } from "../people.js";
 import { PRIVATE_MEMORY_SUBDIR, isPrivateIndexLine } from "./private-memory.js";
-import { MEMORY_HARD_KB, MEMORY_HARD_LINES, MEMORY_SOFT_KB, MEMORY_SOFT_LINES } from "./memory-index.js";
+import {
+  collectMemoryFiles,
+  MEMORY_FILES_HEADER,
+  MEMORY_HARD_KB,
+  MEMORY_HARD_LINES,
+  MEMORY_SOFT_KB,
+  MEMORY_SOFT_LINES,
+  renderMemoryFilesList,
+} from "./memory-index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -14,6 +22,8 @@ const DEFAULTS_DIR = resolve(__dirname, "../../defaults");
  *  can reason about scans rooted in or descending into this tree. */
 export const MEMORY_DIR = join(WORKSPACE_DIR, "memory");
 const MEMORY_ENTRYPOINT = join(MEMORY_DIR, "MEMORY.md");
+/** The private core: loaded into the owner's private conversation only (the full DM variant). */
+const PRIVATE_MEMORY_ENTRYPOINT = join(MEMORY_DIR, "private", "MEMORY.md");
 /**
  * MEMORY.md's budget, each as lines or UTF-8 bytes, whichever is reached
  * first. Over the SOFT one the whole index still goes into the prompt, and the
@@ -75,10 +85,10 @@ function memorySnapshotLines(lines: string[] | null): string[] {
 }
 
 /** The over-soft-budget line, or undefined within budget. Measured on the whole index, not on what a cut left. */
-function memoryBudgetReminder(lines: string[]): string | undefined {
+function memoryBudgetReminder(lines: string[], file = "MEMORY.md"): string | undefined {
   const bytes = indexBytes(lines);
   if (lines.length <= MEMORY_SOFT_LINES && bytes <= MEMORY_SOFT_KB * KB) return undefined;
-  return `⚠ MEMORY.md is ${lines.length} lines / ${(bytes / KB).toFixed(1)} KB, over its ${MEMORY_SOFT_LINES}-line / ${MEMORY_SOFT_KB} KB budget. Keep here only what most conversations need; the rest belongs in topic files.`;
+  return `⚠ ${file} is ${lines.length} lines / ${(bytes / KB).toFixed(1)} KB, over its ${MEMORY_SOFT_LINES}-line / ${MEMORY_SOFT_KB} KB budget. Keep here only what most conversations need; the rest belongs in topic files.`;
 }
 export { PRIVATE_MEMORY_SUBDIR };
 /** Absolute path to the private memory dir. Used by the group-session guard
@@ -104,35 +114,66 @@ function load(name: string): string {
 /**
  * What the owner's DM session is told about private memory while a group chat
  * is part of the conversation (the SHARED variant, see buildSystemPrompt). It
- * replaces the DM's own private-memory section: the lines it speaks of are
- * the ones that variant leaves out.
+ * takes the place of the Layout lines about private/ and private/MEMORY.md:
+ * what it speaks of is what that variant leaves out.
  */
-export const SHARED_PRIVATE_MEMORY_NOTE = `## Private memories (not loaded)
+export const SHARED_PRIVATE_MEMORY_NOTE = `- A group chat is part of this conversation now, so private/MEMORY.md, the files under private/ and private people records are not loaded. Don't bring private memory into this conversation while the group is here. On a group member's turn you can write only in the folder that turn's reminder names.`;
 
-A group chat is part of this conversation now, so the files under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` and private people records are not loaded: MEMORY.md lines that link into \`${PRIVATE_MEMORY_SUBDIR}/\` are left out of the index below, and private people are left out of the registry. Don't bring private memory into this conversation while the group is here. On a group member's turn you can write only in the folder that turn's reminder names. What the owner tells you in private that shouldn't surface in a group still goes under \`memory/${PRIVATE_MEMORY_SUBDIR}/\`, indexed in MEMORY.md the normal way.`;
+/** The Layout lines a group session reads in place of the DM's. */
+const GROUP_LAYOUT = `- **MEMORY.md** is loaded into every conversation. Only the owner, in private, can change it.
+- What you save here goes in this chat's memory folder (Group Chat Context, below).
+- Topic files hold one subject each; read one from the Memory files list when it bears on the task.
+- People go in the people registry (\`upsert_person\`), not in memory files.
+- What was said and when stays in the conversation history (\`recall_conversation\`). Memory holds the current value.`;
 
-/** `lines`: MEMORY.md as this audience sees it (memoryIndexLines), read once
- *  by buildSystemPrompt so the prompt and its context snapshot agree.
- *  `shared`: the DM session's shared variant (never with `isGroup`). */
-function loadMemory(isGroup: boolean, lines: string[] | null, shared = false): string {
+const GROUP_PRIVATE_NOTE = `## Private memories (DM-only)
 
-  const privacySection = shared ? `\n${SHARED_PRIVATE_MEMORY_NOTE}\n` : isGroup
-    ? `\n## Private memories (DM-only)\n\nMemory files under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` are restricted to DM sessions. They are not listed in the index below, and you cannot read them from this group session — the harness will deny the tool call. Two consequences worth knowing before you reach for them: the **shell here runs sandboxed** (every Bash command is wrapped in a \`sandbox-exec\` profile that makes those files unreadable at the kernel level, so assembling the path in an interpreter fails with EPERM rather than working; if the sandbox cannot be set up the Bash tool is withheld for the turn instead), and a \`MEDIA:\` attachment pointing into \`memory/${PRIVATE_MEMORY_SUBDIR}/\` is dropped before it is sent, since attaching a file is a way of reading it out loud.\n`
-    : `\n## Private memories (DM-only)\n\nFor anything you wouldn't want surfaced in a group chat (sensitive personal details, private notes), save the memory file under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` instead of the top level. Index it in MEMORY.md the normal way — group sessions automatically see the index with \`${PRIVATE_MEMORY_SUBDIR}/\` lines stripped, and the harness blocks them from reading the files directly.\n`;
+Memory files under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` are restricted to DM sessions. They are not in the Memory files list below, and you cannot read them from this group session — the harness will deny the tool call. Two consequences worth knowing before you reach for them: the **shell here runs sandboxed** (every Bash command is wrapped in a \`sandbox-exec\` profile that makes those files unreadable at the kernel level, so assembling the path in an interpreter fails with EPERM rather than working; if the sandbox cannot be set up the Bash tool is withheld for the turn instead), and a \`MEDIA:\` attachment pointing into \`memory/${PRIVATE_MEMORY_SUBDIR}/\` is dropped before it is sent, since attaching a file is a way of reading it out loud.`;
 
-  // How a topic file gets indexed: only the owner's own conversation can
-  // change MEMORY.md (MemoryStore refuses a group turn).
-  const howToSave = isGroup
-    ? `When someone here asks you to remember something, save it in this chat's memory folder (Group Chat Context, below) before you reply; nothing from a group chat is saved later. You can't write anywhere else in memory: something every conversation needs is for the owner to ask for in private. Create a file there with memory_write (if_version "new"), with frontmatter whose \`description:\` (one line, at most 200 characters) says when to read it.`
-    : `1. Create the topic file with memory_write (if_version "new"), e.g. \`travel.md\`:
-\`\`\`markdown
----
-description: Travel preferences and booked trips; read when planning or changing a trip.
----
-# Travel
-- Aisle seats; never a red-eye.
-\`\`\`
-2. Add its pointer to MEMORY.md with memory_append: \`- [Travel](travel.md) — one-line hook\``;
+/** The DM's Layout (§15.1 of the memory design, as of stage 2b-2). `shared`: the private lines replaced by SHARED_PRIVATE_MEMORY_NOTE. */
+function dmLayout(shared: boolean): string {
+  const privateLines = shared ? SHARED_PRIVATE_MEMORY_NOTE : `- **private/** is for what must stay between you and the owner; group chats never see it. Put these there, not in the shared files: health; money (income, assets, accounts, trades, debts); home address, whereabouts and daily routine; relationships, family matters and conflicts with others; other people's personal details; work that isn't public; anything the owner said to keep to yourselves. When unsure, choose private/.
+- **private/MEMORY.md** is loaded into this private conversation only: the private things most conversations need.`;
+  return `- **Topic files** are where most things go: one subject per file, organized by topic, not by date. Each starts with frontmatter whose \`description:\` (one line) says when to read it. Only paths and descriptions are loaded (Memory files, below); read a file when its description bears on the task.
+- **MEMORY.md** is loaded into every conversation, group chats included. Keep in it only what most conversations need, or what you have gotten wrong more than once.
+${privateLines}
+- Everything else is shared: group chats can read it. When a folder gathers several files, give it a README.md: its description is what the list shows once the folder is folded.
+- \`groups/\` holds what group chats saved: their members' words.
+- \`journal/\` folders hold dated notes and \`archive/\` folders hold files no longer in use. Neither is listed below; memory_list shows them.
+- People go in the people registry (\`upsert_person\`), not in memory files.
+- What was said and when stays in the conversation history (\`recall_conversation\`). Memory holds the current value.
+
+A topic file, for example travel.md:
+
+    ---
+    description: Travel preferences and booked trips; read when planning or changing a trip.
+    ---
+    # Travel
+    - Aisle seats; never a red-eye.
+    - Tokyo trip booked: Dec 14–21, ANA.`;
+}
+
+/** A core's block: the lines the prompt shows, with the over-budget line first where it may be acted on. */
+function coreContent(lines: string[] | null, file: string, remind: boolean, absent: string): string {
+  if (lines === null) return absent;
+  const { shown, notice } = fitMemoryIndex(lines);
+  const reminder = remind ? memoryBudgetReminder(lines, file) : undefined;
+  return [reminder, shown.join("\n"), notice].filter((part) => part !== undefined).join("\n\n");
+}
+
+/**
+ * The memory section. `lines`: MEMORY.md as this audience sees it
+ * (memoryIndexLines), `privateLines`: private/MEMORY.md (the full DM variant
+ * only, else null), `files`: the memory files list (memoryFilesLines), all
+ * read once by buildSystemPrompt so the prompt and its context snapshot agree.
+ * `shared`: the DM session's shared variant (never with `isGroup`).
+ */
+function loadMemory(isGroup: boolean, lines: string[] | null, privateLines: string[] | null, files: string[], shared = false): string {
+  const layout = isGroup ? `${GROUP_LAYOUT}\n\n${GROUP_PRIVATE_NOTE}` : dmLayout(shared);
+
+  const saving = isGroup
+    ? `- When someone here asks you to remember something, save it in this chat's memory folder (Group Chat Context, below) before you reply; nothing from a group chat is saved later. You can't write anywhere else in memory: something every conversation needs is for the owner to ask for in private. A file there needs frontmatter whose \`description:\` (one line, at most 200 characters) says when to read it.`
+    : `- A new topic file needs frontmatter whose \`description:\` (one line, at most 200 characters) says when to read it. It shows up in the Memory files list by itself: MEMORY.md holds no pointers to topic files.`;
 
   const instructions = `
 # MEMORY — Your Persistent Memory
@@ -141,23 +182,18 @@ Your memory lives in ${MEMORY_DIR}/ as Markdown files. It is the durable underst
 
 Bring what you remember to the work so the owner doesn't have to repeat themselves: a preference, constraint or earlier decision can matter even when they haven't mentioned it again.
 
-## Storage
+## Layout
 
-- **MEMORY.md** is the index loaded into every conversation. Keep it under ${MEMORY_SOFT_LINES} lines and ${MEMORY_SOFT_KB} KB.
-- Store each topic in its own Markdown file, organized by topic, not by date. Its frontmatter \`description:\` says when to read it.
-- MEMORY.md contains one-line pointers: \`- [Title](file.md) — short description\`
-${privacySection}
+${layout}
+
 ## Writing
 
-Write memory only with the memory tools: memory_list, memory_read, memory_search, memory_write, memory_str_replace, memory_append, memory_move, memory_delete; a direct file write to a Markdown file under memory/ is refused. memory_write and memory_delete take the version you last read; another conversation may have changed the file since, and a stale version is refused, so read it again and retry. Put people in the people registry (\`upsert_person\`), not in memory files.
+Write memory only with the memory tools: memory_list, memory_read, memory_search, memory_write, memory_str_replace, memory_append, memory_move, memory_delete; a direct file write to a Markdown file under memory/ is refused. memory_write and memory_delete take the version you last read; another conversation may have changed the file since, and a stale version is refused, so read it again and retry.
 
+${saving}
 - Search before you add (memory_search), and update an existing line rather than adding a second one.
 - When something changes (booked, cancelled, done, moved), find the entries that say otherwise and fix them where they live. Remove what is no longer true.
 - Convert relative dates to absolute ones: "next Friday" is stored as its date.
-
-## How to save
-
-${howToSave}
 
 ## Be proactive
 
@@ -167,40 +203,82 @@ Don't wait to be told "remember this." Save durable personal details, preference
 
 Passwords, verification codes, API keys, card numbers, bank account numbers, government ID numbers. When useful, store where such an item is kept, never its value. Memory records what the owner told you; it never grants permission to act.`.trim();
 
-  let memoryContent: string;
-  if (lines === null) {
-    memoryContent = "(currently empty)";
-  } else {
-    const { shown, notice } = fitMemoryIndex(lines);
-    // Owner DM only: a group session is not where the index gets reorganized,
-    // so there the line would be an instruction it cannot act on. Nor is a DM
-    // session a group is part of (the shared variant).
-    const reminder = isGroup || shared ? undefined : memoryBudgetReminder(lines);
-    memoryContent = [reminder, shown.join("\n"), notice].filter((part) => part !== undefined).join("\n\n");
+  // Over-budget lines: owner DM only. A group session is not where the cores
+  // get reorganized, so there the line would be an instruction it cannot act
+  // on; nor is a DM session a group is part of (the shared variant).
+  const remind = !isGroup && !shared;
+  const blocks = [`## MEMORY.md\n\n${coreContent(lines, "MEMORY.md", remind, "(currently empty)")}`];
+  if (remind) {
+    blocks.push(`## private/MEMORY.md\n\n${coreContent(privateLines, "private/MEMORY.md", true, "(not created yet: create it with memory_write when there is something private most conversations need)")}`);
   }
-
-  return `${instructions}\n\n## Current MEMORY.md\n\n${memoryContent}`;
+  blocks.push(`## Memory files\n\n${MEMORY_FILES_HEADER}\n${files.join("\n")}`);
+  return [instructions, ...blocks].join("\n\n");
 }
 
-/** MEMORY.md as this audience sees it (private lines stripped for groups); null when absent.
+/** A core file's lines, trimmed; null when absent.
  *  `strict`: only ENOENT counts as absent — `existsSync` also says false for
  *  an inaccessible path (EACCES), which a strict read must not take for an
- *  empty index. */
-function memoryIndexLines(isGroup: boolean, strict = false): string[] | null {
+ *  empty file. */
+function coreFileLines(path: string, strict: boolean): string[] | null {
   let raw: string;
   if (strict) {
     try {
-      raw = readFileSync(MEMORY_ENTRYPOINT, "utf-8");
+      raw = readFileSync(path, "utf-8");
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
       throw err;
     }
   } else {
-    if (!existsSync(MEMORY_ENTRYPOINT)) return null;
-    raw = readFileSync(MEMORY_ENTRYPOINT, "utf-8");
+    if (!existsSync(path)) return null;
+    try { raw = readFileSync(path, "utf-8"); } catch { return null; }
   }
-  const lines = raw.trim().split("\n");
-  return isGroup ? lines.filter((line) => !isPrivateIndexLine(line)) : lines;
+  return raw.trim().split("\n");
+}
+
+/** MEMORY.md as this audience sees it; null when absent. For a group (and
+ *  the shared variant) lines that link into private/ are left out: an index
+ *  written in the old layout still points into private/ from MEMORY.md. */
+function memoryIndexLines(isGroup: boolean, strict = false): string[] | null {
+  const lines = coreFileLines(MEMORY_ENTRYPOINT, strict);
+  return lines && isGroup ? lines.filter((line) => !isPrivateIndexLine(line)) : lines;
+}
+
+/** private/MEMORY.md; null when absent (an install still on the old layout has none). */
+function privateIndexLines(strict = false): string[] | null {
+  return coreFileLines(PRIVATE_MEMORY_ENTRYPOINT, strict);
+}
+
+let groupLabelLookup: ((dir: string) => string | undefined) | undefined;
+
+/**
+ * How the owner's files list names a group's folder (`groups/<dir>` → the
+ * chat's title). Set once by the daemon, from the session registry; without
+ * it a group's line has no name. Read when a prompt or snapshot is built, so
+ * a renamed chat reaches a live session as a one-line note.
+ */
+export function setMemoryGroupLabels(lookup: ((dir: string) => string | undefined) | undefined): void {
+  groupLabelLookup = lookup;
+}
+
+/**
+ * The memory files list's lines for this audience (renderMemoryFilesList).
+ * `strict` throws when the scan stopped early (time or file cap): compared
+ * against a snapshot, the files it never reached would read as removed. A
+ * single file that can't be read stays in the list, marked, either way.
+ */
+function memoryFilesLines(withoutPrivate: boolean, strict = false): string[] {
+  let root: string;
+  try { root = realpathSync(MEMORY_DIR); } catch (err) {
+    if (strict && (err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    return renderMemoryFilesList([], { audience: withoutPrivate ? "shared" : "full" });
+  }
+  const { entries, truncated } = collectMemoryFiles({ memoryDir: root, excludePrivate: withoutPrivate, reportUnreadable: true });
+  if (truncated && strict) throw new Error("The memory files scan stopped early");
+  const lines = renderMemoryFilesList(entries, {
+    audience: withoutPrivate ? "shared" : "full",
+    ...(groupLabelLookup ? { groupLabel: groupLabelLookup } : {}),
+  });
+  return truncated ? [...lines, "(the scan stopped early: memory_list shows the rest)"] : lines;
 }
 
 function peopleRosterLines(isGroup: boolean, strict = false): string[] {
@@ -333,9 +411,13 @@ export function buildIdentityPrompt(opts: { subsessions?: boolean } = {}): strin
     .filter(Boolean).join("\n\n---\n\n");
 }
 
-/** What a session of this audience has in its prompt for MEMORY.md and PEOPLE. */
+/** What a session of this audience has in its prompt for the memory cores, the memory files list and PEOPLE. */
 export interface PromptContextSnapshot {
   memory: string[];
+  /** private/MEMORY.md as shown: the full DM variant only, else empty. */
+  privateMemory: string[];
+  /** The memory files list's lines. */
+  files: string[];
   people: string[];
 }
 
@@ -359,7 +441,8 @@ export function promptContextSnapshot(opts: { isGroup?: boolean; strict?: boolea
   const isGroup = !!opts.isGroup;
   const strict = !!opts.strict;
   const memory = memorySnapshotLines(memoryIndexLines(isGroup, strict));
-  return { memory, people: peopleRosterLines(isGroup, strict) };
+  const privateMemory = isGroup ? [] : memorySnapshotLines(privateIndexLines(strict));
+  return { memory, privateMemory, files: memoryFilesLines(isGroup, strict), people: peopleRosterLines(isGroup, strict) };
 }
 
 /**
@@ -374,9 +457,10 @@ export function buildSystemPrompt(opts: {
   /**
    * The owner's DM session while a group chat is part of it (a summon is
    * active, or the turn's audience is not the owner alone): the DM prompt
-   * WITHOUT what must stay private. MEMORY.md lines that link into private/
-   * and private people records are left out, exactly as for a group, and the
-   * private-memory section says so (SHARED_PRIVATE_MEMORY_NOTE). Everything
+   * WITHOUT what must stay private: private/MEMORY.md, private/ in the files
+   * list, MEMORY.md lines that link into private/ and private people records
+   * are left out, exactly as for a group, and the Layout says so
+   * (SHARED_PRIVATE_MEMORY_NOTE). Everything
    * else is the DM prompt. Ignored with `isGroup`. Which turns need it is
    * decided where they are dispatched (LiveSessionManager).
    */
@@ -390,9 +474,16 @@ export function buildSystemPrompt(opts: {
   const withoutPrivate = isGroup || shared;
   mkdirSync(MEMORY_DIR, { recursive: true });
   const memoryLines = memoryIndexLines(withoutPrivate);
+  const privateLines = withoutPrivate ? null : privateIndexLines();
+  const fileLines = memoryFilesLines(withoutPrivate);
   const rosterLines = peopleRosterLines(withoutPrivate);
-  opts.onContext?.({ memory: memorySnapshotLines(memoryLines), people: rosterLines });
-  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup, memoryLines, shared), loadPeopleSection(isGroup, rosterLines, shared),
+  opts.onContext?.({
+    memory: memorySnapshotLines(memoryLines),
+    privateMemory: withoutPrivate ? [] : memorySnapshotLines(privateLines),
+    files: fileLines,
+    people: rosterLines,
+  });
+  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup, memoryLines, privateLines, fileLines, shared), loadPeopleSection(isGroup, rosterLines, shared),
     isGroup ? HARNESS_INSTRUCTIONS : `${HARNESS_INSTRUCTIONS}\n\n${ownerNotes(!!opts.subsessions)}`].filter(Boolean);
   return sections.join("\n\n---\n\n");
 }

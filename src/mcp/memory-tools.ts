@@ -31,7 +31,7 @@ export function buildMemoryTools(deps: { store: () => MemoryStore; access: () =>
   const reads = [
     tool(
       "memory_list",
-      'List memory files with their description and version. `prefix` narrows to a folder, e.g. "private/work/".',
+      'List memory files with their description and version. `prefix` narrows to a folder, e.g. "private/work/". It also shows what the Memory files list folds, and journal/ and archive/ folders.',
       {
         prefix: z.string().optional().describe('A folder relative to memory/, e.g. "work/" or "private/journal/". Omit for every listed file.'),
       },

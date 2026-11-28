@@ -18,6 +18,10 @@
 
 export interface PromptContextLines {
   memory: string[];
+  /** private/MEMORY.md (the owner's private variant); absent counts as empty. */
+  privateMemory?: string[];
+  /** The memory files list; absent counts as empty. */
+  files?: string[];
   people: string[];
 }
 
@@ -92,25 +96,25 @@ function renderSection(title: string, lines: string[]): string | undefined {
 
 /** Whether a session built with `before` can be told about `after` as a note. */
 export function classifyPromptContextChange(before: PromptContextLines, after: PromptContextLines): PromptContextChange {
-  const memory = diffLines(before.memory, after.memory);
-  const people = diffLines(before.people, after.people);
-  const diffs = [memory, people];
+  const titles = ["MEMORY.md", "private/MEMORY.md", "Memory files", "People registry"];
+  const pick = (c: PromptContextLines) => [c.memory, c.privateMemory ?? [], c.files ?? [], c.people];
+  const b = pick(before);
+  const a = pick(after);
+  const diffs = titles.map((_, i) => diffLines(b[i], a[i]));
   const count = diffs.reduce((n, d) => n + d.added.length + d.removed.length, 0);
   if (diffs.some((d) => d.moved)) return { kind: "retire", reason: "reordered" };
   if (count === 0) return { kind: "none" };
   if (diffs.some((d) => [...d.added, ...d.removed].some((e) => isHeading(e.line)))) return { kind: "retire", reason: "heading" };
   if (count > MAX_NOTED_LINES) return { kind: "retire", reason: "too-many" };
-  const memoryLines = renderedLines(memory);
-  const peopleLines = renderedLines(people);
+  const rendered = diffs.map(renderedLines);
   // Measured as rendered: the heading path repeats on every line.
-  const chars = [...memoryLines, ...peopleLines].reduce((n, l) => n + l.length, 0);
+  const chars = rendered.flat().reduce((n, l) => n + l.length, 0);
   if (chars > MAX_NOTED_CHARS) return { kind: "retire", reason: "too-large" };
-  const sections = [renderSection("MEMORY.md", memoryLines), renderSection("People registry", peopleLines)]
-    .filter((s): s is string => s !== undefined);
+  const sections = titles.map((t, i) => renderSection(t, rendered[i])).filter((x): x is string => x !== undefined);
   return {
     kind: "note",
     body: [
-      "Your memory index or people registry changed since this conversation's system prompt was built (possibly by you). The system prompt still shows the earlier text; these lines are current.",
+      "Your memory (MEMORY.md, private/MEMORY.md, the memory files list) or people registry changed since this conversation's system prompt was built (possibly by you). The system prompt still shows the earlier text; these lines are current.",
       ...sections,
     ].join("\n\n"),
   };

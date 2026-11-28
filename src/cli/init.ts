@@ -4,6 +4,7 @@ import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as p from "@clack/prompts";
 import { printBanner } from "./banner.js";
+import { writeMemoryCores } from "./memory-skeleton.js";
 import { enableAutostart, isAutostartEnabled, isMacOS } from "./service.js";
 import { writeJsonAtomicSync } from "../fs-utils.js";
 import { backupConfigIfParseableSync, loadConfig, saveConfig } from "./config/shared.js";
@@ -255,18 +256,9 @@ export const initCommand = new Command("init")
       }
     }
 
-    // MEMORY.md with initial content
+    // The two memory cores, as skeletons (see writeMemoryCores).
     const memoryDir = join(WORKSPACE_DIR, "memory");
-    const memoryFile = join(memoryDir, "MEMORY.md");
-    if (!existsSync(memoryFile) || overwriteOwnFiles) {
-      if (personality) {
-        writeMemory(memoryDir, personality);
-        copied.push("MEMORY.md");
-      } else if (!existsSync(memoryFile)) {
-        writeFileSync(memoryFile, "");
-        copied.push("MEMORY.md");
-      }
-    }
+    copied.push(...writeMemoryCores(memoryDir, personality, overwriteOwnFiles));
 
     if (copied.length > 0) {
       s.stop(`Workspace ready (${copied.join(", ")})`);
@@ -483,42 +475,4 @@ function applyPersonality(file: string, content: string, p: Personality): string
   }
 
   return content;
-}
-
-function writeMemory(memoryDir: string, personality: Personality): void {
-  const date = new Date().toISOString().split("T")[0];
-
-  // User profile
-  writeFileSync(join(memoryDir, "user_profile.md"), [
-    "---",
-    "name: user-profile",
-    `description: Key facts about ${personality.userName}`,
-    "type: user",
-    "---",
-    "",
-    `Name: ${personality.userName}`,
-    `Preferred name to use: ${personality.userName}`,
-    `Set up ${personality.agentName} on ${date}.`,
-    "",
-  ].join("\n"));
-
-  // Work context
-  writeFileSync(join(memoryDir, "work_context.md"), [
-    "---",
-    "name: work-context",
-    `description: ${personality.userName}'s current projects and work context`,
-    "type: project",
-    "---",
-    "",
-    "(Agent will fill this in as it learns)",
-    "",
-  ].join("\n"));
-
-  // MEMORY.md index
-  const index = [
-    `- [User profile](user_profile.md) — ${personality.userName}'s basic info`,
-    `- [Work context](work_context.md) — Current projects and goals`,
-    "",
-  ].join("\n");
-  writeFileSync(join(memoryDir, "MEMORY.md"), index);
 }

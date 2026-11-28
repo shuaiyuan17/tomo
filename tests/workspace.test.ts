@@ -58,8 +58,13 @@ describe("buildSystemPrompt", () => {
     ["includes the memory directory path", [".tomo/workspace/memory"], []],
     ["includes proactive memory instructions", ["Be proactive", "Don't wait to be told"], []],
     ["says memory is written with the memory tools",
-      ["Write memory only with the memory tools", "a direct file write to a Markdown file under memory/ is refused", "memory_str_replace", "memory_append", "if_version \"new\"", "Never store", "Search before you add"],
+      ["Write memory only with the memory tools", "a direct file write to a Markdown file under memory/ is refused", "memory_str_replace", "memory_append", "Never store", "Search before you add"],
       ["## Memory types", "type frontmatter", "## When NOT to save", "Write the memory file (e.g."]],
+    // 2b-2: the list is generated, so nothing asks for a pointer in MEMORY.md.
+    ["lays memory out as two cores, topic files and a generated list",
+      ["## Layout", "**private/MEMORY.md** is loaded into this private conversation only", "health; money (income, assets, accounts, trades, debts)", "When unsure, choose private/.",
+        "Everything else is shared: group chats can read it.", "give it a README.md", "MEMORY.md holds no pointers to topic files", "## Memory files", "## private/MEMORY.md"],
+      ["Add its pointer to MEMORY.md", "One-line pointers", "## Current MEMORY.md", "Don't keep"]],
   ])("%s", (_label, mustContain, mustNotContain) => {
     for (const phrase of mustContain) expect(defaultPrompt).toContain(phrase);
     for (const phrase of mustNotContain) expect(defaultPrompt).not.toContain(phrase);
@@ -72,8 +77,11 @@ describe("buildSystemPrompt", () => {
     const group = buildSystemPrompt({ isGroup: true });
     expect(group).toContain("save it in this chat's memory folder (Group Chat Context, below) before you reply");
     expect(group).toContain("You can't write anywhere else in memory");
-    expect(group).not.toContain("Add its pointer to MEMORY.md with memory_append");
-    expect(defaultPrompt).toContain("Add its pointer to MEMORY.md with memory_append");
+    expect(group).toContain("Only the owner, in private, can change it.");
+    expect(group).toContain("They are not in the Memory files list below");
+    // The private list and the private core are the DM's.
+    expect(group).not.toContain("When unsure, choose private/.");
+    expect(group).not.toContain("## private/MEMORY.md");
   });
 
   it("is byte-identical across builds of the same variant", () => {
@@ -164,6 +172,77 @@ describe("buildSystemPrompt", () => {
     });
   });
 
+  describe("two cores and the memory files list (2b-2)", () => {
+    const memoryDir = join(TOMO_WORKSPACE, "memory");
+    afterEach(() => {
+      for (const name of ["MEMORY.md", "private", "notes", "travel.md", "groups"]) rmSync(join(memoryDir, name), { recursive: true, force: true });
+    });
+
+    it("an install still on the old layout keeps working: its index whole, no private core yet, its files listed", () => {
+      mkdirSync(join(memoryDir, "private"), { recursive: true });
+      mkdirSync(join(memoryDir, "notes"), { recursive: true });
+      writeFileSync(join(memoryDir, "MEMORY.md"), "- [Travel](travel.md) — trips\n- [Health](private/health.md) — LEGACY-PRIVATE-POINTER\n");
+      writeFileSync(join(memoryDir, "travel.md"), "---\nname: travel\ndescription: Trips.\ntype: user\n---\nx\n");
+      writeFileSync(join(memoryDir, "notes", "old.md"), "no frontmatter\n");
+      writeFileSync(join(memoryDir, "private", "health.md"), "---\ndescription: LEGACY-PRIVATE-TOPIC.\n---\nx\n");
+      const dm = buildSystemPrompt();
+      expect(dm).toContain("## MEMORY.md\n\n- [Travel](travel.md) — trips\n- [Health](private/health.md) — LEGACY-PRIVATE-POINTER");
+      expect(dm).toContain("## private/MEMORY.md\n\n(not created yet: create it with memory_write when there is something private most conversations need)");
+      expect(dm).toContain("- notes/old.md — ⚠ no description yet: add one next time you touch this file");
+      expect(dm).toContain("- private/health.md — LEGACY-PRIVATE-TOPIC.");
+      expect(dm).toContain("- travel.md — Trips.");
+      // A group still never sees the old index's private pointers, nor private files in the list.
+      for (const prompt of [buildSystemPrompt({ isGroup: true }), buildSystemPrompt({ shared: true })]) {
+        expect(prompt).not.toContain("LEGACY-PRIVATE-POINTER");
+        expect(prompt).not.toContain("LEGACY-PRIVATE-TOPIC");
+        expect(prompt).toContain("- travel.md — Trips.");
+      }
+    });
+
+    it("loads private/MEMORY.md into the owner's private prompt only, with its own budget line", () => {
+      mkdirSync(join(memoryDir, "private"), { recursive: true });
+      writeFileSync(join(memoryDir, "MEMORY.md"), "## Owner\n- shared fact\n");
+      writeFileSync(join(memoryDir, "private", "MEMORY.md"), ["## Private", ...Array.from({ length: 201 }, (_, i) => `- p${i}`)].join("\n"));
+      const dm = buildSystemPrompt();
+      expect(dm).toContain("## private/MEMORY.md\n\n⚠ private/MEMORY.md is 202 lines");
+      expect(dm).toContain("- p200");
+      for (const prompt of [buildSystemPrompt({ isGroup: true }), buildSystemPrompt({ shared: true })]) {
+        expect(prompt).toContain("- shared fact");
+        expect(prompt).not.toContain("- p200");
+      }
+    });
+
+    it("hands a session its cores and list, the same as a strict re-read, per audience", () => {
+      mkdirSync(join(memoryDir, "private"), { recursive: true });
+      mkdirSync(join(memoryDir, "groups", "telegram_-100"), { recursive: true });
+      writeFileSync(join(memoryDir, "MEMORY.md"), "## Owner\n- shared fact\n");
+      writeFileSync(join(memoryDir, "private", "MEMORY.md"), "## Private\n- private fact\n");
+      writeFileSync(join(memoryDir, "private", "health.md"), "---\ndescription: Health.\n---\nx\n");
+      writeFileSync(join(memoryDir, "groups", "telegram_-100", "n.md"), "---\ndescription: N.\n---\nx\n");
+      writeFileSync(join(memoryDir, "travel.md"), "---\ndescription: Trips.\n---\nx\n");
+      for (const isGroup of [false, true]) {
+        let handed: unknown;
+        buildSystemPrompt({ isGroup, onContext: (c) => { handed = c; } });
+        expect(handed).toEqual(promptContextSnapshot({ isGroup, strict: true }));
+      }
+      const dm = promptContextSnapshot({ strict: true });
+      expect(dm.privateMemory).toEqual(["## Private", "- private fact"]);
+      expect(dm.files).toEqual([
+        "- groups/telegram_-100/ — 1 file a group chat saved (its members' words)",
+        "- private/health.md — Health.",
+        "- travel.md — Trips.",
+      ]);
+      const group = promptContextSnapshot({ isGroup: true, strict: true });
+      expect(group.privateMemory).toEqual([]);
+      expect(group.files).toEqual(["- travel.md — Trips."]);
+      // A shared session's own build hands over the shared lines, not the private ones.
+      let shared: { privateMemory: string[]; files: string[] } | undefined;
+      buildSystemPrompt({ shared: true, onContext: (c) => { shared = c; } });
+      expect(shared!.privateMemory).toEqual([]);
+      expect(shared!.files).toEqual(["- travel.md — Trips."]);
+    });
+  });
+
   describe("MEMORY.md budget", () => {
     const memoryDir = join(TOMO_WORKSPACE, "memory");
     const memoryFile = join(memoryDir, "MEMORY.md");
@@ -171,7 +250,7 @@ describe("buildSystemPrompt", () => {
     const numbered = (n: number) => Array.from({ length: n }, (_, i) => `- line ${i + 1}`);
     const write = (lines: string[]) => writeFileSync(memoryFile, lines.join("\n") + "\n");
     /** The index as the prompt holds it: everything under the "Current MEMORY.md" heading, up to the next section. */
-    const indexBlock = (prompt: string) => prompt.split("## Current MEMORY.md\n\n")[1].split("\n\n---\n\n")[0];
+    const indexBlock = (prompt: string) => prompt.split("\n## MEMORY.md\n\n")[1].split("\n\n## ")[0];
     /** The prompt and both snapshots for one audience, built from the same file. */
     const build = (isGroup: boolean) => {
       let handed: { memory: string[] } | undefined;
@@ -184,7 +263,7 @@ describe("buildSystemPrompt", () => {
 
     it("tells the model the budget in both variants' instructions", () => {
       for (const isGroup of [false, true]) {
-        expect(buildSystemPrompt({ isGroup })).toContain("Keep it under 200 lines and 16 KB.");
+        expect(buildSystemPrompt({ isGroup })).toContain("MEMORY.md** is loaded into every conversation");
       }
     });
 
@@ -454,8 +533,18 @@ describe("buildSystemPrompt", () => {
         expect(buildSystemPrompt({ isGroup: true })).not.toContain("A group chat is part of this conversation now");
       });
 
-      it("does not name private/MEMORY.md, which does not exist yet", () => {
-        expect(buildSystemPrompt({ shared: true })).not.toContain("private/MEMORY.md");
+      it("says private/MEMORY.md is not loaded, and leaves out its block and private/ in the list", () => {
+        writeFileSync(join(memoryDir, "private", "MEMORY.md"), "## Private\n- PRIVATE-CORE-LINE\n");
+        writeFileSync(join(memoryDir, "private", "health.md"), "---\ndescription: PRIVATE-TOPIC.\n---\nx\n");
+        const prompt = buildSystemPrompt({ shared: true });
+        expect(prompt).toContain("so private/MEMORY.md, the files under private/ and private people records are not loaded");
+        expect(prompt).not.toContain("## private/MEMORY.md");
+        expect(prompt).not.toContain("PRIVATE-CORE-LINE");
+        expect(prompt).not.toContain("PRIVATE-TOPIC");
+        expect(prompt).not.toContain("When unsure, choose private/.");
+        const full = buildSystemPrompt();
+        expect(full).toContain("PRIVATE-CORE-LINE");
+        expect(full).toContain("- private/health.md — PRIVATE-TOPIC.");
       });
 
       it("is otherwise the DM prompt: the owner notes stay, the group's sections do not appear", () => {
@@ -489,7 +578,7 @@ describe("buildSystemPrompt", () => {
     it("DM prompt tells the agent to use memory/private/ for sensitive notes", () => {
       const prompt = buildSystemPrompt({ isGroup: false });
       expect(prompt).toContain("memory/private/");
-      expect(prompt).toMatch(/save the memory file under/i);
+      expect(prompt).toContain("**private/** is for what must stay between you and the owner");
     });
 
     it("group prompt tells the agent that memory/private/ is unreachable", () => {

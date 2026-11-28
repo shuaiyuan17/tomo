@@ -79,6 +79,19 @@ export const MIXED_WRITE_REFUSAL =
   "This turn's messages come from more than one chat, so nothing can be saved to memory from it. Save it on a turn from a single chat.";
 export const OTHER_GROUP_REFUSAL =
   "That folder holds what another group chat saved; it is not available on this turn.";
+/** After an owner's write that put something new where group chats can read it (§8.2 of the design). */
+export function sharedReminder(rel: string): string {
+  return isCoreMemoryPath(rel)
+    ? `${rel} is shared: group chats have it in every prompt. If what you added is private (see Layout), put it in private/MEMORY.md instead.`
+    : `${rel} is shared: group chats can read it. If this is private (see Layout), move it under private/.`;
+}
+
+/** Non-blank lines in `after` that `before` doesn't have. */
+function addsLines(before: string, after: string): boolean {
+  const had = new Set(before.split("\n").map((l) => l.trim()));
+  return after.split("\n").some((l) => l.trim() && !had.has(l.trim()));
+}
+
 export const READ_ONLY_REFUSAL =
   "Memory is read-only here. Put what should be saved in your report; the main conversation decides what to keep.";
 
@@ -309,8 +322,22 @@ export class MemoryStore {
     }
   }
 
-  private saved(rel: string, version: string, note?: string): string {
-    return `Saved ${rel} (version ${version}).${note ? ` ${note}` : ""}`;
+  private saved(rel: string, version: string, ...notes: Array<string | undefined>): string {
+    const said = notes.filter((n): n is string => !!n).map((n) => ` ${n}`).join("");
+    return `Saved ${rel} (version ${version}).${said}`;
+  }
+
+  /**
+   * The share reminder, on the two writes that decide where something lives:
+   * a new file outside private/, and new lines in MEMORY.md. Only on an
+   * owner's turn: a group's turn writes in its own folder, where that is
+   * the point. Not on every write, or it would be read past.
+   */
+  private shareNote(access: MemoryAccess, rel: string, before: string | null, after: string): string | undefined {
+    if (access.privateBarred || isPrivateMemoryPath(rel)) return undefined;
+    if (before === null) return sharedReminder(rel);
+    if (isCoreMemoryPath(rel) && addsLines(before, after)) return sharedReminder(rel);
+    return undefined;
   }
 
   // ---------------------------------------------------------------- reads
@@ -416,7 +443,7 @@ export class MemoryStore {
     if (isListedMemoryPath(r.rel) && descriptionProblem(content) !== null) throw this.missingDescription(r.rel);
     const note = this.checkSize(r.rel, cur?.text ?? null, content);
     if (cur) this.keep(r, cur);
-    return this.saved(r.rel, this.write(r, access, cur, content), note);
+    return this.saved(r.rel, this.write(r, access, cur, content), note, this.shareNote(access, r.rel, cur?.text ?? null, content));
   }
 
   strReplace(access: MemoryAccess, path: unknown, oldText: string, newText: string): string {
@@ -433,7 +460,7 @@ export class MemoryStore {
     // A replacement that shortens the file is the one that loses content worth
     // keeping; so is any rewrite of bytes that weren't valid UTF-8.
     if (Buffer.byteLength(next, "utf8") < cur.bytes.length || !cur.lossless) this.keep(r, cur);
-    return this.saved(r.rel, this.write(r, access, cur, next), note);
+    return this.saved(r.rel, this.write(r, access, cur, next), note, this.shareNote(access, r.rel, cur.text, next));
   }
 
   append(access: MemoryAccess, path: unknown, content: string, create = false): string {
@@ -451,7 +478,7 @@ export class MemoryStore {
     const note = this.checkSize(r.rel, cur?.text ?? null, next);
     // The file is rewritten from its decoded text: bytes that weren't UTF-8 would be lost.
     if (cur && !cur.lossless) this.keep(r, cur);
-    return this.saved(r.rel, this.write(r, access, cur, next), note);
+    return this.saved(r.rel, this.write(r, access, cur, next), note, this.shareNote(access, r.rel, cur?.text ?? null, next));
   }
 
   move(access: MemoryAccess, from: unknown, to: unknown): string {
@@ -491,7 +518,9 @@ export class MemoryStore {
       const reason = (err as NodeJS.ErrnoException).code ?? String(err);
       throw new MemoryToolError(`${a.rel} could not be moved (${reason}); it was left where it was.`);
     }
-    return `Moved ${a.rel} to ${b.rel} (version ${cur.version}).`;
+    // Out of private/ into a shared place: as much a new shared file as one written there.
+    const share = isPrivateMemoryPath(a.rel) ? this.shareNote(access, b.rel, null, cur.text) : undefined;
+    return `Moved ${a.rel} to ${b.rel} (version ${cur.version}).${share ? ` ${share}` : ""}`;
   }
 
   delete(access: MemoryAccess, path: unknown, ifVersion: string): string {

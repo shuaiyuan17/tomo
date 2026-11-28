@@ -224,6 +224,8 @@ export interface MemoryFileEntry {
   listed: boolean;
   /** The bytes the version was taken from, when asked for (`withContent`). */
   content?: Buffer;
+  /** It exists but could not be read just now (`reportUnreadable`): no description, no version. */
+  unreadable?: true;
 }
 
 export interface CollectOptions {
@@ -241,6 +243,8 @@ export interface CollectOptions {
   includeCores?: boolean;
   /** Keep each file's bytes on its entry. */
   withContent?: boolean;
+  /** Keep a file that exists but could not be read (an I/O error) as an entry marked `unreadable`, instead of skipping it. */
+  reportUnreadable?: boolean;
   /** Stop after this many files (default 5000). */
   maxFiles?: number;
   /** Stop after this long (default 500 ms). */
@@ -298,7 +302,10 @@ export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileE
         const read = readMemoryFile(join(opts.memoryDir, rel), opts.memoryDir, opts.excludePrivate, opts.ownGroupDir);
         if (read === null || "refused" in read) continue;
         content = read.bytes;
-      } catch { continue; }
+      } catch {
+        if (opts.reportUnreadable) entries.push({ path: rel, version: "", bytes: 0, listed, unreadable: true });
+        continue;
+      }
       const description = content.length <= maxBytes ? parseDescription(content.toString("utf8")) : undefined;
       entries.push({
         path: rel,
@@ -312,4 +319,132 @@ export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileE
   };
   walk("", 0);
   return { entries, truncated };
+}
+
+// ------------------------------------------------------------ the prompt list
+
+/** A folder holding more listable files than this (its subfolders included) is folded into one line. */
+export const LIST_FOLD_FILES = 12;
+/** The list's size, as rendered, past which it is cut (by path order) and the rest counted. */
+export const LIST_BUDGET_KB = 8;
+
+export const MEMORY_FILES_HEADER =
+  "Path and description of each topic file. Read one with memory_read when its description bears on the task; memory_list with a folder shows a folded one.";
+export const NO_TOPIC_FILES = "(no topic files yet)";
+const NO_DESCRIPTION = "⚠ no description yet: add one next time you touch this file";
+
+export interface MemoryFilesListOptions {
+  /**
+   * `full`: the owner's private conversation: everything, private/ included,
+   * each group's folder one line. `shared`: what a group chat may see (a
+   * group session, the DM session's shared variant): no private/ and no
+   * groups/ (a group's own folder is named in its session block).
+   */
+  audience: "full" | "shared";
+  /** A group folder's display name (`groups/<dir>` → the chat's title), when known. */
+  groupLabel?: (dir: string) => string | undefined;
+}
+
+/** One line of text, at most 80 characters: a title is data, not a prompt line. */
+function oneLine(text: string, max = 80): string {
+  // eslint-disable-next-line no-control-regex -- control characters are exactly what is stripped
+  const flat = text.replace(/[\u0000-\u001f\u007f\u2028\u2029"]+/g, " ").replace(/\s+/g, " ").trim();
+  const chars = Array.from(flat);
+  return chars.length <= max ? flat : `${chars.slice(0, max - 1).join("")}…`;
+}
+
+/**
+ * Where a file is folded, if its folder is: a folder right under the memory
+ * root or right under private/ (the root and private/ themselves are never
+ * folded: folded, nothing in them would be seen). A folder below those is
+ * part of its top folder's count, so a folder crosses the line once.
+ */
+function foldKey(path: string): string | undefined {
+  const parts = path.split("/");
+  const isPrivate = folded(path)[0] === PRIVATE_MEMORY_SUBDIR;
+  const depth = isPrivate ? 2 : 1;
+  return parts.length > depth ? parts.slice(0, depth).join("/") : undefined;
+}
+
+/** The `groups/<dir>` a file is in, or undefined (a file lying directly in groups/ is listed as itself). */
+function groupKeyOfPath(path: string): string | undefined {
+  const parts = path.split("/");
+  return folded(path)[0] === GROUPS_MEMORY_SUBDIR && parts.length > 2 ? parts.slice(0, 2).join("/") : undefined;
+}
+
+/**
+ * The memory files list's lines (§5.1 of the design), from the listed files
+ * of this audience in path order. Stable on purpose: sorted by path; a
+ * folder folds by its own file count, not by the list's total size, so
+ * adding a file changes a line or two, and a folder folds once.
+ *
+ * - A folder right under the root or private/ with more than LIST_FOLD_FILES
+ *   files is one line: `work/ — 42 files: <its README.md description>`.
+ * - `full`: each group's folder is one line, with the chat's name.
+ * - A file with no description says so (⚠); one that could not be read is
+ *   kept as a line saying that, rather than dropped (dropped, it would read
+ *   as deleted).
+ * - Past LIST_BUDGET_KB the list is cut in path order and the rest counted.
+ */
+export function renderMemoryFilesList(entries: readonly MemoryFileEntry[], opts: MemoryFilesListOptions): string[] {
+  const shown = entries.filter((e) => e.listed && !(opts.audience === "shared"
+    && (isPrivateMemoryPath(e.path) || folded(e.path)[0] === GROUPS_MEMORY_SUBDIR)));
+  const groupCounts = new Map<string, number>();
+  const foldCounts = new Map<string, number>();
+  for (const e of shown) {
+    const g = groupKeyOfPath(e.path);
+    if (g !== undefined) { groupCounts.set(g, (groupCounts.get(g) ?? 0) + 1); continue; }
+    const k = foldKey(e.path);
+    if (k !== undefined) foldCounts.set(k, (foldCounts.get(k) ?? 0) + 1);
+  }
+  const readme = (dir: string): string | undefined =>
+    shown.find((e) => foldPath(e.path) === foldPath(`${dir}/README.md`))?.description;
+  // Each item: its line and how many files it stands for.
+  const items: Array<{ line: string; files: number; dir: string }> = [];
+  const emitted = new Set<string>();
+  for (const e of shown) {
+    const g = groupKeyOfPath(e.path);
+    if (g !== undefined) {
+      if (emitted.has(g)) continue;
+      emitted.add(g);
+      const n = groupCounts.get(g)!;
+      const label = opts.groupLabel?.(g);
+      const what = `${n} ${n === 1 ? "file" : "files"} a group chat saved (its members' words)`;
+      items.push({ line: `- ${g}/ — ${label ? `"${oneLine(label)}": ` : ""}${what}`, files: n, dir: GROUPS_MEMORY_SUBDIR });
+      continue;
+    }
+    const k = foldKey(e.path);
+    if (k !== undefined && foldCounts.get(k)! > LIST_FOLD_FILES) {
+      if (emitted.has(k)) continue;
+      emitted.add(k);
+      const n = foldCounts.get(k)!;
+      const d = readme(k);
+      items.push({ line: `- ${k}/ — ${n} files${d ? `: ${d}` : ""}`, files: n, dir: k.split("/").slice(0, -1).join("/") });
+      continue;
+    }
+    const text = e.unreadable ? "⚠ could not be read just now" : e.description ?? NO_DESCRIPTION;
+    items.push({ line: `- ${e.path} — ${text}`, files: 1, dir: e.path.split("/").slice(0, -1).join("/") });
+  }
+  if (items.length === 0) return [NO_TOPIC_FILES];
+  // The cut leaves room for its own line.
+  const budget = LIST_BUDGET_KB * 1024 - 120;
+  let bytes = 0;
+  let count = 0;
+  for (const item of items) {
+    const next = bytes + Buffer.byteLength(item.line, "utf8") + (count > 0 ? 1 : 0);
+    if (next > budget) break;
+    bytes = next;
+    count++;
+  }
+  const lines = items.slice(0, count).map((i) => i.line);
+  if (count === items.length) return lines;
+  const rest = items.slice(count);
+  const n = rest.reduce((sum, i) => sum + i.files, 0);
+  // The folder all the unlisted ones share, if any.
+  const dirs = rest.map((i) => i.dir.split("/").filter(Boolean));
+  const common: string[] = [];
+  for (let i = 0; dirs.every((d) => d.length > i && d[i] === dirs[0][i]); i++) common.push(dirs[0][i]);
+  const where = common.length > 0 ? ` under ${common.join("/")}/` : "";
+  lines.push(`(${n} more ${n === 1 ? "file" : "files"}${where} not listed: memory_list shows them)`);
+  return lines;
 }

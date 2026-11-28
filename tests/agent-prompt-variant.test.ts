@@ -436,6 +436,7 @@ describe("a group's turn that cannot get the shared prompt in time", () => {
     const notes = peekPendingNotes(agent, OWNER).join("\n");
     expect(notes).toContain('type="summon-busy"');
     expect(notes).toContain("Book club");
+    expect(notes).toContain("The owner has been sent a notice about it.");
 
     // The session is not stuck: the next turn runs.
     await tg.simulateMessage(groupMsg("@tomo GROUP-LATER"));
@@ -559,7 +560,16 @@ describe("what a refusal does not drop", () => {
     tg.tornDown = true;
     expect(await agent.handleCronMessage("GROUP-CRON-JOB", GROUP, { waitForHandoff: true })).toBe(false);
     tg.tornDown = false;
-    expect(peekPendingNotes(agent, OWNER).filter((n) => n.includes('type="summon-busy"') && n.includes("A background turn"))).toHaveLength(2);
+    const busy = peekPendingNotes(agent, OWNER).filter((n) => n.includes('type="summon-busy"'));
+    expect(busy).toHaveLength(2);
+    // It names the work, and says whether telling the owner is still to do.
+    expect(busy[0]).toContain("a scheduled job: GROUP-CRON-JOB");
+    expect(busy[0]).toContain("The owner has been sent a notice about it.");
+    expect(busy[1]).toContain("The owner could NOT be told");
+    // The cap never drops it: the group's inbox record is closed on its strength.
+    const queue = (agent as unknown as { pendingNotesQueue: { queueNote(key: string, note: string): boolean } }).pendingNotesQueue;
+    for (let i = 0; i < 40; i++) queue.queueNote(OWNER, `<tomo-event type="audience">filler ${i}</tomo-event>`);
+    expect(peekPendingNotes(agent, OWNER).filter((n) => n.includes('type="summon-busy"'))).toHaveLength(2);
 
     // The owner's own cron job keeps the ordinary error policy.
     tg.clearDelivered();

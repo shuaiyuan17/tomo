@@ -1987,47 +1987,54 @@ export class Agent {
       this.enqueueInboundForSession(req.key, ownerItems.map((item) => ({ ...item, userRecorded: true })));
     }
     const groups = [...new Set((req.audiences ?? []).filter((a) => isGroupSessionKey(a)))];
-    const settled = await this.tellSharedPromptUnavailable(req.key, groups, groups, false);
+    const settled = await this.tellSharedPromptUnavailable(req.key, groups, groups);
     if (settled) req.inboxHooks?.refused(inboxIdsOf(ownerItems));
     else log.warn({ sessionKey: req.key, groups }, "Refused group turn: it could be neither recorded nor told; its inbox records stay open for the next start");
   }
 
   /**
-   * Put a refusal on record and tell people: a durable pending note for the
-   * session (owner-audience: its next private turn reads it, so the refusal
-   * survives a restart and a channel that is down), the busy line to
-   * `tellGroups`, and one owner notice naming `groups`. True when the note
-   * was stored, or failing that when the owner notice or every group line
-   * was delivered.
+   * Tell people of a refusal and put it on record: the busy line to
+   * `tellGroups`, one owner notice naming `groups`, then a durable pending
+   * note for the session (owner-audience and pinned: only the owner's own
+   * turns read it, the cap never drops it, and it survives a restart, a
+   * disabled inbox and a channel that is down). The note says whether the
+   * owner was reached, so a turn that reads it knows whether telling them is
+   * still to do. `what`: the work that did not run, for a background turn.
+   * True when the note was stored, or failing that when the owner notice or
+   * every group line was delivered.
    */
-  private async tellSharedPromptUnavailable(sessionKey: string, groups: string[], tellGroups: string[], background: boolean): Promise<boolean> {
+  private async tellSharedPromptUnavailable(sessionKey: string, groups: string[], tellGroups: string[], what?: string): Promise<boolean> {
     const label = groups.map((g) => this.sessions.getEntry(g)?.chatTitle ?? g).join(", ") || "a group";
-    const noted = this.queuePendingNote(sessionKey, markOwnerAudience(formatTomoEvent(
-      "summon-busy",
-      `${background ? "A background turn (a scheduled job, a delegated request or a restart notice)" : "A message"} from the group ${label} was not run: this session was busy and could not be reloaded without the owner's private context in time. Nothing reached you for it${background ? "" : "; the message itself is in the conversation history"}. The owner was sent a notice if their chat could be reached; mention it if it matters to what they ask next.`,
-    )));
     // Every group told counts; one of several does not speak for the rest.
-    let told = tellGroups.length > 0;
+    let groupsTold = tellGroups.length > 0;
     for (const groupKey of tellGroups) {
       const parsed = parseRawSessionKey(groupKey);
       const channel = parsed ? this.getChannel(parsed.channelName) : undefined;
-      if (!parsed || !channel) { told = false; continue; }
+      if (!parsed || !channel) { groupsTold = false; continue; }
       try {
         await channel.send({ chatId: parsed.chatId, text: ownerT("notices")("group.summonBusy") });
       } catch (err) {
-        told = false;
+        groupsTold = false;
         log.warn({ err, group: groupKey }, "Could not post the busy notice to the group");
       }
     }
+    let ownerTold = false;
     try {
-      const notice = background
+      const notice = what !== undefined
         ? ownerT("notices")("group.summonBusyOwnerBackground", { group: label })
         : ownerT("notices")("group.summonBusyOwner", { group: label });
-      if (await this.notifyOwner(notice)) told = true;
+      ownerTold = await this.notifyOwner(notice);
     } catch (err) {
       log.warn({ err }, "Could not tell the owner about a refused group turn");
     }
-    return noted || told;
+    const subject = what !== undefined ? `A background turn for the group ${label} (${what})` : `A message from the group ${label}`;
+    const noted = this.queuePendingNote(sessionKey, markOwnerAudience(formatTomoEvent(
+      "summon-busy",
+      `${subject} was not run: this session was busy and could not be reloaded without the owner's private context in time. Nothing reached you for it${what !== undefined ? "" : "; the message itself is in the conversation history"}. ${ownerTold
+        ? "The owner has been sent a notice about it."
+        : "The owner could NOT be told (their chat was unreachable): tell them, with send_message if this turn's own reply is not delivered to them."}`,
+    )));
+    return noted || ownerTold || groupsTold;
   }
 
   /**
@@ -2036,11 +2043,11 @@ export class Agent {
    * did not run, and a group that asked for a delegate gets the busy line.
    * Undefined for a turn no group is behind, which keeps the error policy.
    */
-  private backgroundRefusal(sessionKey: string, audiences: readonly string[] | undefined, tellGroup: boolean): (() => Promise<boolean>) | undefined {
+  private backgroundRefusal(sessionKey: string, audiences: readonly string[] | undefined, tellGroup: boolean, what: string): (() => Promise<boolean>) | undefined {
     const groups = [...new Set((audiences ?? []).filter((a) => isGroupSessionKey(a)))];
     if (groups.length === 0) return undefined;
     // False (neither recorded nor told): the turn's ordinary error policy takes over.
-    return () => this.tellSharedPromptUnavailable(sessionKey, groups, tellGroup ? groups : [], true);
+    return () => this.tellSharedPromptUnavailable(sessionKey, groups, tellGroup ? groups : [], what);
   }
 
   private audienceLabel(audience: string): string {
@@ -3066,7 +3073,8 @@ export class Agent {
     // narrows them to that group and which `scopedCallerKey` logs at debug.
     const turnId = options.audiences ? this.turnAudiences.begin(key, options.audiences) : undefined;
     if (turnId !== undefined) options.onTurnBegin?.(turnId);
-    const groupRefusal = this.backgroundRefusal(key, options.audiences, options.usageSource === "delegate");
+    const groupRefusal = this.backgroundRefusal(key, options.audiences, options.usageSource === "delegate",
+      `${options.usageSource === "delegate" ? "a delegated request" : options.jobName ? `the scheduled job "${options.jobName}"` : "a scheduled job"}: ${triggerSnippet(message) ?? "no text"}`);
     try {
       return await this.turnRunner.runTurn({
         key,
@@ -3233,7 +3241,7 @@ export class Agent {
       usage: { source: usageSource, ...(taskId ? { taskId } : {}) },
       prompt,
       // A summoned group's restart notice refused for the shared prompt.
-      ...(noticeGroupKey ? { onSharedPromptUnavailable: this.backgroundRefusal(key, [noticeGroupKey], false) } : {}),
+      ...(noticeGroupKey ? { onSharedPromptUnavailable: this.backgroundRefusal(key, [noticeGroupKey], false, `a restart notice: ${triggerSnippet(prompt) ?? "no text"}`) } : {}),
       // No timestamp stamp, no typing indicator — continuity turns are
       // invisible. A heartbeat speaks only through the explicit `send_message`
       // tool, never through its own text blocks (owner decision 2026-08-28,

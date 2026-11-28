@@ -3058,6 +3058,10 @@ export class Agent {
     }
 
     const key = sessionKey;
+    if (options.dropIf?.()) {
+      log.info({ sessionKey }, "Background turn dropped at run time (its prompt no longer fits the session)");
+      return false;
+    }
     const delivery = options.deliveryTarget
       ? this.channelDeliveryTarget(options.deliveryTarget, sessionKey, "Cron")
       : this.resolveDeliveryTargetForSession(sessionKey, "Cron");
@@ -3502,6 +3506,12 @@ export class Agent {
   /** Read-only: a shell/Monitor task's output tail (web task view). */
   readTaskOutput(sessionKey: string, taskId: string): Promise<{ output: string; size: number } | undefined> {
     return this.liveSessionManager.taskOutput(sessionKey, taskId);
+  }
+
+  /** The key's last recorded context usage (tokens), if the registry has one. */
+  contextUsageOf(sessionKey: string): { used: number; max: number } | undefined {
+    const stats = this.sessions.getEntry(sessionKey)?.stats;
+    return stats && stats.contextMax > 0 ? { used: stats.contextUsed, max: stats.contextMax } : undefined;
   }
 
   /** Does the key's live session have background work a compact reload would cut? */

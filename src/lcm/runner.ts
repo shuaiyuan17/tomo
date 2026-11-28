@@ -1,8 +1,10 @@
 import { join } from "node:path";
 import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
-import { isGroupSessionKey } from "../sessions/keys.js";
-import { BLOCK_SUMMARY_TOKEN_BUDGETS, findDuePromotions, type DuePromotion } from "./blocks.js";
+import { isGroupSessionKey, sessionKind } from "../sessions/keys.js";
+import { BLOCK_SUMMARY_TOKEN_BUDGETS, findDuePromotions, localDateTag, type DuePromotion } from "./blocks.js";
+import { collectSaidLines, coreStatusLine, SAID_CHECK_MAX_LINES, type SaidLines } from "../memory/said-check.js";
+import { defaultRuntimePaths } from "../runtime-paths.js";
 import { usesLcmCompact } from "../agent/sdk-options.js";
 import { config } from "../config.js";
 import { formatTomoEvent } from "../tomo-event.js";
@@ -43,7 +45,99 @@ function commandFor(p: DuePromotion): string {
   return `tomo lcm ${p.level} --session-id <SESSION_ID> ${flag} ${p.period} --summary "..."`;
 }
 
-export function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: string): string {
+/**
+ * The memory step a rollup nudge carries (§4.2 / §15.2 of the memory design):
+ * built by the runner for the owner's own DM session only, and only on the
+ * daily and weekly levels. Absent: no memory step (a group, a task, a
+ * monthly or yearly rollup).
+ */
+export type MemoryPass =
+  /** The session has too little room left for the step: the rollup goes first. */
+  | { skip: string }
+  | {
+      skip?: undefined;
+      /** Weekly: both cores' sizes (coreStatusLine). */
+      coreStatus?: string;
+      /** Weekly: the week's `said` lines (collectSaidLines); undefined when the scan failed. */
+      said?: SaidLines;
+      /** Weekly: why the `said` check is left out this time (too little room), instead of the list. */
+      saidSkipped?: string;
+      /** Local YYYY-MM-DD the nudge is written on: the date in "(no source found, checked …)". */
+      today: string;
+    };
+
+/** What both steps say about failure: the memory step never costs the rollup. */
+const MEMORY_STEP_FAILURE = "The rollup matters more than this step: if a memory tool keeps failing, or a turn budget notice arrives, stop here, run the rollup anyway, and say what was left undone in the memory line.";
+
+/** The daily memory pass (§15.2): save and fix what that day left, before the day is summarized. */
+export function dailyMemoryPassText(period: string): string {
+  return [
+    `Before the rollup: the memory pass for ${period}. If memory already reflects that day (an earlier attempt at this rollup did it), change nothing. Otherwise read that day's raw events once and update memory with the memory tools.`,
+    `- Save what future conversations need and wasn't saved then: preferences, decisions, commitments, plans and dates, outcomes. Put it in topic files; MEMORY.md takes only what most conversations need. Anything on the private list (Layout) goes under private/. A new line's leading date is when it was said, ${period}, not today. Mark a rule or goal \`said\` only when the owner stated it or agreed to it that day; when they agreed to your proposal, write "agreed to … (my proposal)".`,
+    "- Skip subjects under `## Don't keep`, and anything the owner asked that day to forget or not to keep; leave them out of the rollup summary too.",
+    "- Messages from a summoned group are its members' words: record anything worth keeping as `from:group`, never as `said` and never in either MEMORY.md.",
+    "- Fix lines that day contradicted or made stale (booked, cancelled, done, corrected) where they live, and follow a correction into todos. Don't change scheduled jobs here, since the owner won't see it; if one relied on an old value, add a todo to raise it with them.",
+    `Finding nothing worth keeping is a fine result. ${MEMORY_STEP_FAILURE} Then write the rollup, and end its summary with one line: \`memory: <files you changed, or none>\`, naming each correction as "X corrected to Y".`,
+  ].join("\n");
+}
+
+/** The `said` check's part of the weekly step (§6.3), or "" when there is nothing to check. */
+export function saidCheckText(said: SaidLines, today: string): string {
+  if (said.lines.length === 0) return "";
+  return [
+    "First, before you move any file (the paths below are where the lines are now), check that week's `said` lines against what the owner actually wrote. Run the searches for several lines at once where you can. For each line below, search the conversation around its date: recall_conversation with 2–4 distinctive words from the line, `after` the day before its date, `before` two days after, and `limit` 5. At most three searches a line. Also memory_search the fact, and bring any copy that disagrees into line with what you confirm.",
+    ...said.lines.map((l) => `- ${l.path}:${l.line}: ${l.text}`),
+    "- They said something else: correct the line to what they said, and keep `said` and its date.",
+    "- The line says more than they did (a one-off written as a standing rule, a \"maybe\" as a decision, a wider scope): cut it back to what they said. Keep the extra as a separate `inferred` line only if it is still useful.",
+    `- You find no source: look before you change it. If the owner only answered "ok" or "好" around then, read your own message just before that reply (recall_conversation with no query, \`before\` set to the reply's time, limit 3). When they agreed to something you proposed, the line is \`said\`: rewrite it as "agreed to <what> (my proposal)". If it came from a group, a task report, an email or a tool result, mark it \`from:<source>\`. Otherwise make it \`inferred\` and add "(no source found, checked ${today})". Don't delete it. If that line is a rule, a goal or a commitment, add a todo to ask the owner; you can't ask them in this turn.`,
+    ...(said.more > 0 ? [`${said.more} more \`said\` ${said.more === 1 ? "line" : "lines"} from that week ${said.more === 1 ? "is" : "are"} not listed; leave ${said.more === 1 ? "it" : "them"}.`] : []),
+    ...(said.truncated ? ["(The scan for these lines was incomplete: some files were not read in full, so the list may be short.)"] : []),
+  ].join("\n");
+}
+
+/** The weekly upkeep (§15.2): shrink and tidy, then check the week's `said` lines. */
+export function weeklyMemoryUpkeepText(period: string, pass: Exclude<MemoryPass, { skip: string }>): string {
+  const said = pass.said && pass.said.lines.length > 0 ? pass.said : undefined;
+  const block = said ? saidCheckText(said, pass.today) : "";
+  const notChecked = pass.saidSkipped !== undefined
+    ? `This week's \`said\` lines are not checked this time: ${pass.saidSkipped}. Leave them.`
+    : pass.said === undefined
+      ? "This week's `said` lines could not be listed this time; leave them."
+      : !said && pass.said.truncated
+        ? "The scan for this week's `said` lines was incomplete (some files were not read in full) and found none; leave them."
+        : "";
+  const summary = said
+    ? "`memory: <what you moved or removed, or none>; said check: <n> checked, <a> misquoted, <b> overstated, <c> unsourced`"
+    : "`memory: <what you moved or removed, or none>`";
+  return [
+    `Before the rollup: memory upkeep for ${period}.${pass.coreStatus ? ` ${pass.coreStatus}` : ""}`,
+    ...(block ? [block] : []),
+    ...(notChecked ? [notChecked] : []),
+    block ? "Then tidy:" : "Tidy:",
+    "- If private/MEMORY.md or MEMORY.md is over budget, or holds things most conversations don't need, move those into topic files.",
+    "- Remove lines about events that are over and no longer useful, and lines that are no longer true.",
+    "- Move topic files about finished or dropped subjects into archive/ with memory_move.",
+    "- If a shared file holds something on the private list (Layout), move it under private/.",
+    "- When loose files in one folder clearly belong together, move them into a subfolder and give it a README.md with a description.",
+    `If memory needs none of this, change nothing. ${MEMORY_STEP_FAILURE} End the weekly summary with one line: ${summary}, naming each correction as "X corrected to Y".`,
+  ].join("\n");
+}
+
+/** The levels with a memory step: daily (the pass) and weekly (the upkeep). */
+function isMemoryStepLevel(p: DuePromotion): boolean {
+  return p.level === "daily" || p.level === "weekly";
+}
+
+/** The memory step's lines for this nudge, or none. */
+function memoryStepLines(p: DuePromotion, pass: MemoryPass | undefined): string[] {
+  if (!pass || !isMemoryStepLevel(p)) return [];
+  if (pass.skip !== undefined) {
+    return [`No memory ${p.level === "daily" ? "pass" : "upkeep"} this time: ${pass.skip}. Write the rollup only, and end its summary with one line: \`memory: skipped (${pass.skip})\`.`, ""];
+  }
+  return [p.level === "daily" ? dailyMemoryPassText(p.period) : weeklyMemoryUpkeepText(p.period, pass), ""];
+}
+
+export function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: string, memoryPass?: MemoryPass): string {
   const flag = p.level === "daily" ? "--date" :
                p.level === "weekly" ? "--week" :
                p.level === "monthly" ? "--month" : "--year";
@@ -53,11 +147,21 @@ export function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: str
     BLOCK_SUMMARY_TOKEN_BUDGETS.monthly,
     BLOCK_SUMMARY_TOKEN_BUDGETS.yearly,
   );
+  // The memory step is the owner's own DM session's alone: a group's nudge
+  // (a group session, or one running on the DM session while the group is
+  // summoned, whose key is the group's) never carries it, whatever the caller passed.
+  const memoryStep = sessionKind(sessionKey) === "owner-dm" ? memoryStepLines(p, memoryPass) : [];
   const lines = [
     `An LCM rollup is due. The completed period \`${p.level} ${p.period}\` has ${p.childCount} ${childLabel} ready to consolidate.`,
     "",
     "⚠️ Before you run this: a rollup reloads the session and will interrupt any subagent that is currently working — its transcript is saved and it can be resumed, but its in-progress turn is cut. If a subagent is running right now, DEFER this rollup until it finishes; the next heartbeat re-nudges, so nothing is lost by waiting. (The command refuses with status \"deferred\" while background tasks are running; if it does, reply NO_REPLY.)",
     "",
+    // Right after the warning, before anything about the summary itself.
+    ...(isGroupSessionKey(sessionKey) ? [
+      "Group scope: this is a group session — keep the rollup focused on this group's conversation (threads, decisions, group dynamics); don't mix in personal/DM context from elsewhere.",
+      "",
+    ] : []),
+    ...memoryStep,
     ...(p.replacesExistingBlock ? [
       `IMPORTANT: \`${p.level} ${p.period}\` already has a rollup block. The command below REPLACES that block; it does not append to it.`,
       "Write a fresh summary covering the WHOLE period. Preserve the existing block's important content and integrate the newly eligible source material.",
@@ -83,14 +187,109 @@ export function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: str
     "",
     "After the rollup finishes, reply NO_REPLY so we don't send a user-facing message for this housekeeping turn.",
   ];
-  if (isGroupSessionKey(sessionKey)) {
-    lines.splice(5, 0,
-      "Group scope: this is a group session — keep the rollup focused on this group's conversation (threads, decisions, group dynamics); don't mix in personal/DM context from elsewhere.",
-      "",
-    );
-  }
   void commandFor; // keep reference for potential future use
   return formatTomoEvent("lcm-rollup", lines.join("\n"), { name: `${p.level} ${p.period}` });
+}
+
+/**
+ * Room a memory step needs below the forced-compaction line, in tokens. A
+ * rollup turn that runs out of window ends on "Prompt is too long" and the
+ * rollup is not written (the harness compacts instead), so the step is left
+ * out when the session can't afford it: the rollup is what frees room.
+ * The pass: a few searches, reads and edits. The `said` check: up to 20
+ * lines × 3 recalls (5 excerpts of ≤400 characters each) and a search.
+ */
+export const MEMORY_PASS_MIN_ROOM_TOKENS = 40_000;
+export const SAID_CHECK_MIN_ROOM_TOKENS = 150_000;
+/**
+ * Tool rounds a turn needs besides the `said` check (the rest of the step,
+ * the rollup itself, slack), and per listed line (searches run several lines
+ * at once where they can, but count two). Under a `maxTurns` limit the list
+ * is cut to fit, so the check cannot use up the rounds the rollup needs; with
+ * fewer than MEMORY_PASS_MIN_ROUNDS the step is left out.
+ */
+export const MEMORY_PASS_MIN_ROUNDS = 20;
+const SAID_CHECK_BASE_ROUNDS = 25;
+const SAID_CHECK_ROUNDS_PER_LINE = 2;
+
+/** Where the memory tools write: the workspace's memory/ (the same root as the prompt's MEMORY_DIR). */
+export function defaultMemoryDir(): string {
+  return join(defaultRuntimePaths.workspaceDir, "memory");
+}
+
+export interface MemoryPassDeps {
+  /** The memory root, resolved when a nudge is built. */
+  memoryDir: () => string;
+  /** The session's last recorded context usage, if known. */
+  contextUsage?: (sessionKey: string) => { used: number; max: number } | undefined;
+  /** The forced-compaction line, % of the window. */
+  forceCompactAtPct?: () => number;
+  /** Tool rounds a turn may use (config.maxTurns; 0 = no limit). */
+  maxTurns?: () => number;
+  now?: () => Date;
+}
+
+/**
+ * The memory step for this nudge: only on the owner's DM session and the
+ * daily and weekly levels. Never throws: whatever fails here (a scan, a
+ * read), the nudge goes out with less of the step, never without the rollup.
+ */
+export function buildMemoryPass(p: DuePromotion, sessionKey: string, deps: MemoryPassDeps): MemoryPass | undefined {
+  try {
+    return memoryPassFor(p, sessionKey, deps);
+  } catch (err) {
+    log.warn({ err, sessionKey }, "Rollup memory step failed to build; nudging without it");
+    return undefined;
+  }
+}
+
+function memoryPassFor(p: DuePromotion, sessionKey: string, deps: MemoryPassDeps): MemoryPass | undefined {
+  if (sessionKind(sessionKey) !== "owner-dm" || !isMemoryStepLevel(p)) return undefined;
+  const today = localDateTag((deps.now ?? (() => new Date()))());
+  let room: number | undefined;
+  try {
+    const usage = deps.contextUsage?.(sessionKey);
+    if (usage && usage.max > 0) {
+      // Forced compaction off (0 or 100): the line is the window itself.
+      const raw = deps.forceCompactAtPct?.() ?? 95;
+      const pct = raw > 0 && raw < 100 ? raw : 100;
+      room = Math.floor((usage.max * pct) / 100) - usage.used;
+    }
+  } catch (err) {
+    log.warn({ err, sessionKey }, "Rollup memory step: context usage unreadable; assuming room");
+  }
+  if (room !== undefined && room < MEMORY_PASS_MIN_ROOM_TOKENS) return { skip: "the context is too full" };
+  let maxTurns = 0;
+  try { maxTurns = deps.maxTurns?.() ?? 0; } catch { /* unknown: no limit assumed */ }
+  if (maxTurns > 0 && maxTurns < MEMORY_PASS_MIN_ROUNDS) return { skip: "a turn here has too few tool rounds" };
+  if (p.level === "daily") return { today };
+  let memoryDir: string;
+  try { memoryDir = deps.memoryDir(); } catch (err) {
+    log.warn({ err, sessionKey }, "Rollup memory step: memory root unresolved; nudging without the said check");
+    return { today };
+  }
+  let coreStatus: string | undefined;
+  try { coreStatus = coreStatusLine(memoryDir); } catch (err) {
+    log.warn({ err, sessionKey }, "Rollup memory step: core sizes unreadable");
+  }
+  if (room !== undefined && room < SAID_CHECK_MIN_ROOM_TOKENS) {
+    return { today, coreStatus, saidSkipped: "the context is too full" };
+  }
+  const cap = maxTurns > 0
+    ? Math.min(SAID_CHECK_MAX_LINES, Math.max(0, Math.floor((maxTurns - SAID_CHECK_BASE_ROUNDS) / SAID_CHECK_ROUNDS_PER_LINE)))
+    : SAID_CHECK_MAX_LINES;
+  if (cap === 0) return { today, coreStatus, saidSkipped: "a turn here has too few tool rounds" };
+  try {
+    return { today, coreStatus, said: collectSaidLines(memoryDir, p.period, { max: cap }) };
+  } catch (err) {
+    log.warn({ err, sessionKey, period: p.period }, "Rollup memory step: said-line scan failed; nudging without it");
+    return { today, coreStatus };
+  }
+}
+
+/** Same level and period. */
+function samePromotion(a: DuePromotion, b: DuePromotion): boolean {
+  return a.level === b.level && a.period === b.period;
 }
 
 export class RollupRunner {
@@ -107,13 +306,43 @@ export class RollupRunner {
   private lastNudged: NudgeCooldownStore;
   /** Guards against a second check starting while one is still awaiting a turn. */
   private checking = false;
+  /** What the memory step of a DM nudge reads (the memory root, the session's context usage). */
+  private memory: MemoryPassDeps;
+  /**
+   * Cooldown keys whose last nudge carried a memory step and did not
+   * complete: the next one for that period goes without the step. In memory
+   * only: after a restart the step is tried once more.
+   */
+  private memoryStepFailed = new Set<string>();
 
-  constructor(agent: Agent, cooldowns?: NudgeCooldownStore) {
+  constructor(agent: Agent, cooldowns?: NudgeCooldownStore, memory?: Partial<MemoryPassDeps>) {
     this.agent = agent;
+    this.memory = {
+      memoryDir: memory?.memoryDir ?? defaultMemoryDir,
+      contextUsage: memory?.contextUsage ?? ((key) => this.agent.contextUsageOf?.(key)),
+      forceCompactAtPct: memory?.forceCompactAtPct ?? (() => config.lcm.forceCompactAtPct),
+      maxTurns: memory?.maxTurns ?? (() => config.maxTurns),
+      ...(memory?.now ? { now: memory.now } : {}),
+    };
     // Shared per path and loaded on first construction — i.e. before start()
     // can fire the first check, and without a second runner in this process
     // holding an independent snapshot of the same file.
     this.lastNudged = cooldowns ?? nudgeCooldownStore(defaultNudgeCooldownPath());
+  }
+
+  /**
+   * Is `p` still due for the session after its nudge turn? Read from the
+   * session's file under the id the key has now (a rollup can reload the
+   * session). Unreadable: assume it landed, as before this check existed.
+   */
+  private stillDue(sessionKey: string, sdkSessionId: string, p: DuePromotion): boolean {
+    try {
+      const sid = this.agent.listActiveSessions().find(([k]) => k === sessionKey)?.[1] ?? sdkSessionId;
+      return findDuePromotions(sid, config.sdkSessionsDir).some((d) => samePromotion(d, p));
+    } catch (err) {
+      log.warn({ err, sessionKey }, "Rollup nudge: could not re-read what is due after the turn");
+      return false;
+    }
   }
 
   start(): void {
@@ -236,14 +465,46 @@ export class RollupRunner {
         // completion, the next tick sees the same period still un-nudged and
         // asks for it a second time — the duplicate lands the moment the first
         // one finishes, and rewrites the whole period again.
+        // The memory step (owner DM, daily and weekly only) is built before
+        // the cooldown is armed and cannot throw: a failed scan sends the
+        // nudge with less of the step, never no nudge.
         cooldownKey = `${sessionKey}:${next.level}:${next.period}`;
+        // A period whose last nudge with a memory step did not complete is
+        // asked again without the step: whatever the step ran into (a turn
+        // limit, an error, a window gone full), the rollup is not held
+        // behind it twice. A rollup-only retry that succeeds clears the mark.
+        const retryWithoutStep = this.memoryStepFailed.has(cooldownKey);
+        const memoryPass = retryWithoutStep
+          ? (isMemoryStepLevel(next) && sessionKind(sessionKey) === "owner-dm" ? { skip: "the last attempt at this rollup did not finish" } : undefined)
+          : buildMemoryPass(next, sessionKey, this.memory);
+        const hasStep = memoryPass !== undefined && memoryPass.skip === undefined;
         this.lastNudged.set(cooldownKey, now);
+        // The nudge waits its place in the session's queue. A group summoned
+        // in meanwhile turns the session shared; one that carries the memory
+        // step (private lines, private context to read) is dropped then,
+        // like a nudge never sent: no cooldown, asked again after the summon.
+        let droppedForSummon = false;
         const delivered = await this.agent.handleCronMessage(
-          nudgeText(next, sdkSessionId, sessionKey), sessionKey, {
+          nudgeText(next, sdkSessionId, sessionKey, memoryPass), sessionKey, {
             showTyping: false,
             suppressDelivery: true,
+            ...(hasStep ? { dropIf: () => (droppedForSummon = this.agent.hasActiveSummonInto(sessionKey)) } : {}),
           },
         );
+        // A turn that completed is not yet a rollup that landed: the model
+        // may have spent it on the memory step and replied without running
+        // the command. With the step in it, look: still due means it did not
+        // land, and the next nudge for the period (after the usual cooldown)
+        // goes without the step. A rollup refused as "deferred" reads the
+        // same way, which is right: the step's edits are already saved, and
+        // the retry only has the rollup left to do.
+        const landed = delivered && !(hasStep && this.stillDue(sessionKey, sdkSessionId, next));
+        if (landed) {
+          this.memoryStepFailed.delete(cooldownKey);
+        } else if (hasStep && !droppedForSummon) {
+          this.memoryStepFailed.add(cooldownKey);
+          if (delivered) log.warn({ sessionKey, level: next.level, period: next.period }, "Rollup nudge with the memory step completed without the rollup; the next one goes without the step");
+        }
         // handleCronMessage resolves FALSE rather than rejecting when the turn
         // never happened (no deliverable target for the session, the turn
         // ended on an error result, the per-session queue threw). Holding a 6h

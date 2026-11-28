@@ -19,6 +19,9 @@
  * DM sessions too. It used to pass `isGroupSessionKey(sessionKey)`, which is
  * exactly `false` for the owner's DM: the one session that leaked.
  */
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
@@ -29,6 +32,7 @@ const fixture = vi.hoisted(() => ({
   lcm: ((_key: string) => true) as (key: string) => boolean,
   due: [] as Array<{ level: "daily" | "weekly" | "monthly" | "yearly"; period: string; childCount: number }>,
   dueCalls: 0,
+  rollupLands: true,
 }));
 vi.mock("../src/agent/sdk-options.js", () => ({ usesLcmCompact: (key: string) => fixture.lcm(key) }));
 vi.mock("../src/lcm/blocks.js", async (importOriginal) => ({
@@ -39,9 +43,9 @@ vi.mock("../src/lcm/blocks.js", async (importOriginal) => ({
 const { RollupRunner } = await import("../src/lcm/runner.js");
 const { NudgeCooldownStore } = await import("../src/lcm/nudge-cooldown-store.js");
 
-interface Nudge { text: string; sessionKey: string; options: { suppressDelivery?: boolean } }
+interface Nudge { text: string; sessionKey: string; options: { suppressDelivery?: boolean; dropIf?: () => boolean } }
 
-function runnerFor(sessionKey: string, summoned: () => boolean = () => false): {
+function runnerFor(sessionKey: string, summoned: () => boolean = () => false, memory?: ConstructorParameters<typeof RollupRunner>[2], turnOk: () => boolean = () => true): {
   runner: InstanceType<typeof RollupRunner>;
   nudges: Nudge[];
   cooldowns: InstanceType<typeof NudgeCooldownStore>;
@@ -53,13 +57,21 @@ function runnerFor(sessionKey: string, summoned: () => boolean = () => false): {
     hasActiveSummonInto: (key: string) => key === sessionKey && summoned(),
     handleCronMessage: async (text: string, key: string, options: Nudge["options"]) => {
       nudges.push({ text, sessionKey: key, options });
+      // As the agent does: asked when the turn is about to run.
+      if (options.dropIf?.()) return false;
+      if (!turnOk()) return false;
+      // The turn ran the rollup: its period is no longer due (unless a test says the command never ran).
+      if (fixture.rollupLands) {
+        const m = /name="(\w+) ([^"]+)"/.exec(text);
+        if (m) fixture.due = fixture.due.filter((d) => !(d.level === m[1] && d.period === m[2]));
+      }
       return true;
     },
   };
   // In-memory cooldown (null path): these cases nudge the same period, and
   // a shared file would let the first one's cooldown suppress the second.
   const cooldowns = new NudgeCooldownStore(null);
-  return { runner: new RollupRunner(agent as never, cooldowns), nudges, cooldowns };
+  return { runner: new RollupRunner(agent as never, cooldowns, { memoryDir: () => "/nonexistent-memory-root", maxTurns: () => 0, ...memory }), nudges, cooldowns };
 }
 
 /** `checkAll` is private; the scheduler is the only production caller. */
@@ -74,6 +86,7 @@ beforeEach(() => {
   fixture.lcm = () => true;
   fixture.due = [{ level: "daily", period: "2026-08-27", childCount: 5 }];
   fixture.dueCalls = 0;
+  fixture.rollupLands = true;
 });
 afterEach(() => { vi.useRealTimers(); });
 
@@ -196,5 +209,157 @@ describe("the gates in front of a nudge", () => {
     const { runner, nudges } = runnerFor("dm:owner");
     await checkAll(runner);
     expect(nudges).toHaveLength(1);
+  });
+});
+
+describe("the memory step never costs the rollup (§4.2)", () => {
+  let memDir: string;
+  beforeEach(() => {
+    memDir = mkdtempSync(join(tmpdir(), "runner-memory-"));
+    writeFileSync(join(memDir, "MEMORY.md"), "## Rules\n- 2026-08-18 [said] No calls before 9.\n- 2026-08-10 [said] An older week's rule.\n");
+    fixture.due = [{ level: "weekly", period: "2026-W34", childCount: 7 }];
+  });
+  afterEach(() => { rmSync(memDir, { recursive: true, force: true }); });
+
+  it("a DM weekly nudge carries the harness's list of that week's said lines", async () => {
+    const { runner, nudges } = runnerFor("dm:owner", undefined, { memoryDir: () => memDir });
+    await checkAll(runner);
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0].text).toContain("- MEMORY.md:2: - 2026-08-18 [said] No calls before 9.");
+    expect(nudges[0].text).not.toContain("An older week's rule");
+    expect(nudges[0].text).toContain("MEMORY.md is 3 lines");
+  });
+
+  it("when the memory root can't be resolved, the nudge still goes out with the rollup command", async () => {
+    const { runner, nudges, cooldowns } = runnerFor("dm:owner", undefined, { memoryDir: () => { throw new Error("boom"); } });
+    await checkAll(runner);
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0].text).toContain("tomo lcm weekly --session-id sdk-session-1 --week 2026-W34");
+    expect(nudges[0].text).toContain("could not be listed this time");
+    expect(cooldowns.get("dm:owner:weekly:2026-W34", Date.now())).toBeDefined();
+  });
+
+  it("when the context usage can't be read, it assumes room rather than dropping the nudge", async () => {
+    const { runner, nudges } = runnerFor("dm:owner", undefined, { memoryDir: () => memDir, contextUsage: () => { throw new Error("boom"); } });
+    await checkAll(runner);
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0].text).toContain("No calls before 9.");
+  });
+
+  it("near the forced-compaction line the said check is left out, and nearer still the whole step", async () => {
+    fixture.rollupLands = false; // several runners read the same due list: only the text is under test
+    const at = (used: number) => runnerFor("dm:owner", undefined, { memoryDir: () => memDir, contextUsage: () => ({ used, max: 1_000_000 }), forceCompactAtPct: () => 95 });
+    const roomy = at(500_000);
+    await checkAll(roomy.runner);
+    expect(roomy.nudges[0].text).toContain("No calls before 9.");
+
+    const tight = at(950_000 - 100_000);
+    await checkAll(tight.runner);
+    expect(tight.nudges[0].text).toContain("memory upkeep for 2026-W34");
+    expect(tight.nudges[0].text).toContain("not checked this time: the context is too full");
+    expect(tight.nudges[0].text).not.toContain("No calls before 9.");
+
+    const full = at(950_000 - 10_000);
+    await checkAll(full.runner);
+    expect(full.nudges[0].text).toContain("`memory: skipped (the context is too full)`");
+    expect(full.nudges[0].text).not.toContain("memory upkeep for");
+    expect(full.nudges[0].text).toContain("tomo lcm weekly --session-id sdk-session-1");
+  });
+
+  it("under a tool-round limit the list is cut to leave the rollup its rounds, and a tiny limit drops the step", async () => {
+    fixture.rollupLands = false; // several runners read the same due list: only the text is under test
+    writeFileSync(join(memDir, "MEMORY.md"), Array.from({ length: 20 }, (_, i) => `- 2026-08-18 [said] Rule ${i + 1}.`).join("\n"));
+    const withTurns = (maxTurns: number) => runnerFor("dm:owner", undefined, { memoryDir: () => memDir, maxTurns: () => maxTurns });
+    const fifty = withTurns(50);
+    await checkAll(fifty.runner);
+    expect(fifty.nudges[0].text).toContain("Rule 12.");
+    expect(fifty.nudges[0].text).not.toContain("Rule 13.");
+    expect(fifty.nudges[0].text).toContain("8 more `said` lines from that week are not listed");
+    const unlimited = withTurns(0);
+    await checkAll(unlimited.runner);
+    expect(unlimited.nudges[0].text).toContain("Rule 20.");
+    const tiny = withTurns(10);
+    await checkAll(tiny.runner);
+    expect(tiny.nudges[0].text).toContain("`memory: skipped (a turn here has too few tool rounds)`");
+    expect(tiny.nudges[0].text).toContain("tomo lcm weekly --session-id sdk-session-1");
+  });
+
+  it("a nudge with the step is dropped when a group was summoned in while it waited, and asked again later with the step", async () => {
+    let summonedAtRun = false;
+    // The summon starts between the check (which saw none) and the turn.
+    const late = runnerFor("dm:owner", () => summonedAtRun, { memoryDir: () => memDir });
+    const original = late.nudges.push.bind(late.nudges);
+    late.nudges.push = (...items: Nudge[]) => { summonedAtRun = true; return original(...items); };
+    await checkAll(late.runner);
+    expect(late.nudges).toHaveLength(1);
+    // Not delivered: no cooldown, so the first tick after the summon asks again...
+    expect(late.cooldowns.get("dm:owner:weekly:2026-W34", Date.now())).toBeUndefined();
+    summonedAtRun = false;
+    late.nudges.push = original;
+    await checkAll(late.runner);
+    // ...with the step still in it: a summon is not the step's failure.
+    expect(late.nudges[1].text).toContain("No calls before 9.");
+  });
+
+  it("a nudge without the step is never dropped at run time", async () => {
+    const { runner, nudges } = runnerFor("telegram:-1001234567", undefined, { memoryDir: () => memDir });
+    await checkAll(runner);
+    expect(nudges[0].options.dropIf).toBeUndefined();
+  });
+
+  it("after a nudge with the step fails, the period is asked again without it, then with it once a rollup lands", async () => {
+    let ok = false;
+    const { runner, nudges, cooldowns } = runnerFor("dm:owner", undefined, { memoryDir: () => memDir }, () => ok);
+    await checkAll(runner);
+    expect(nudges[0].text).toContain("No calls before 9.");
+    expect(cooldowns.get("dm:owner:weekly:2026-W34", Date.now())).toBeUndefined();
+    ok = true;
+    await checkAll(runner);
+    expect(nudges[1].text).toContain("`memory: skipped (the last attempt at this rollup did not finish)`");
+    expect(nudges[1].text).not.toContain("No calls before 9.");
+    expect(nudges[1].text).toContain("tomo lcm weekly --session-id sdk-session-1 --week 2026-W34");
+    // That one landed: a later nudge for the period (a rebuild) has the step again.
+    fixture.due = [{ level: "weekly", period: "2026-W34", childCount: 7 }];
+    cooldowns.clear("dm:owner:weekly:2026-W34");
+    await checkAll(runner);
+    expect(nudges[2].text).toContain("No calls before 9.");
+  });
+
+  it("a turn that completed without the rollup landing is asked again, after the usual cooldown, without the step", async () => {
+    fixture.rollupLands = false;
+    const { runner, nudges, cooldowns } = runnerFor("dm:owner", undefined, { memoryDir: () => memDir });
+    await checkAll(runner);
+    expect(nudges[0].text).toContain("No calls before 9.");
+    // The cooldown is untouched: a completed turn holds it as before.
+    expect(cooldowns.get("dm:owner:weekly:2026-W34", Date.now())).toBeDefined();
+    cooldowns.clear("dm:owner:weekly:2026-W34");
+    fixture.rollupLands = true;
+    await checkAll(runner);
+    expect(nudges[1].text).toContain("`memory: skipped (the last attempt at this rollup did not finish)`");
+    expect(cooldowns.get("dm:owner:weekly:2026-W34", Date.now())).toBeDefined();
+  });
+
+  it("a nudge without the step keeps the old behaviour: a completed turn holds the cooldown even if still due", async () => {
+    fixture.rollupLands = false;
+    const { runner, cooldowns } = runnerFor("telegram:-1001234567", undefined, { memoryDir: () => memDir });
+    await checkAll(runner);
+    expect(cooldowns.get("telegram:-1001234567:weekly:2026-W34", Date.now())).toBeDefined();
+  });
+
+  it("with forced compaction off (0 or 100), room is measured to the window, not to zero", async () => {
+    fixture.rollupLands = false; // several runners read the same due list: only the text is under test
+    for (const pct of [0, 100]) {
+      const { runner, nudges } = runnerFor("dm:owner", undefined, { memoryDir: () => memDir, contextUsage: () => ({ used: 100_000, max: 1_000_000 }), forceCompactAtPct: () => pct });
+      await checkAll(runner);
+      expect(nudges[0].text).toContain("No calls before 9.");
+    }
+  });
+
+  it("a group session's nudge has no memory step and no said lines", async () => {
+    const { runner, nudges } = runnerFor("telegram:-1001234567", undefined, { memoryDir: () => memDir });
+    await checkAll(runner);
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0].text).not.toContain("memory upkeep");
+    expect(nudges[0].text).not.toContain("No calls before 9.");
   });
 });

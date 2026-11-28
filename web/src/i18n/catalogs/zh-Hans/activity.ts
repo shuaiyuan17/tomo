@@ -8,7 +8,7 @@ export const activity = {
     rawNote: "这是服务端给浏览器的那份：截到 4,000 字，密钥已打码。完整的在磁盘上的 transcript 里。",
     showAll: "展开全文", showLess: "收起", longer: "原文更长，看原始数据。",
     spawn: "开了一个任务", spawning: "正在开任务", spawnFailed: "任务没开成",
-    openTask: "打开任务", taskGone: "已不在任务列表里",
+    unknown: "没有记录到结果，不确定是否已经完成。", openTask: "打开任务", taskGone: "已不在任务列表里",
     note: "给 <id>{{id}}</id> 带了话", noting: "正在给 <id>{{id}}</id> 带话", noteFailed: "没能给 <id>{{id}}</id> 带话",
     noteHeld: "给 <id>{{id}}</id> 的话先留着", noteQueued: "它开始第一轮时会收到。", noteReleased: "这句话让它继续了。",
     withOwner: "附上了你的原话",

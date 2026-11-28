@@ -183,3 +183,24 @@ describe("cards in the turn", () => {
     expect(card(row(call({ kind: "task_status", id: "s1" }, { outcome: {} })))).toBe("");
   });
 });
+
+describe("no result after the turn ended", () => {
+  it("claims neither success nor failure", () => {
+    const shown = card(row(call(cancel)));
+    expect(shown).toContain('data-state="unknown"');
+    expect(shown).not.toContain("Cancelled a task");
+    expect(shown).toContain("may or may not have happened");
+    expect(shown).not.toContain("shimmer");
+    const sent = card(row(call(send)), { env: { sessions: [] } });
+    expect(sent).not.toMatch(/Sent to/);
+  });
+});
+
+describe("a send to the conversation on screen with a problem noted", () => {
+  it("keeps the full card so the note shows", () => {
+    const env: ActivityEnv = { sessions: [], ownerConversation: true };
+    const shown = card(row(call({ ...send, target: "dm:owner", targetId: undefined, toOwner: true } as ToolActivity, { outcome: { note: "chart.png could not be attached." } })), { env });
+    expect(shown).not.toContain("Sent to this conversation");
+    expect(shown).toMatch(/text-warn[^>]*>chart.png could not be attached/);
+  });
+});

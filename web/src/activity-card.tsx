@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowRightIcon, BracesIcon, CheckIcon, FileIcon } from "lucide-react";
 import type { ToolActivity, WebSubsession } from "../../src/web/protocol.js";
 import { cn } from "@/lib/utils";
@@ -26,19 +26,20 @@ import { i18n, Trans, useTranslation } from "./i18n/index.js";
  * destructive colour and says why; done without effect, it says so in warn.
  */
 
-type CardState = "running" | "done" | "error";
+/** `unknown`: no result, and the turn is over (interrupted, or the result is not in what was loaded): no claim either way. */
+type CardState = "running" | "done" | "error" | "unknown";
 
 /** Each card's head sentence, by state (catalog keys in activity:card). */
 const HEADS = {
-  spawn: { running: "card.spawning", error: "card.spawnFailed", done: "card.spawn" },
-  note: { running: "card.noting", error: "card.noteFailed", done: "card.note", held: "card.noteHeld" },
-  cancel: { running: "card.cancelling", error: "card.cancelFailed", done: "card.cancel" },
-  send: { running: "card.sendingTo", error: "card.sendFailed", done: "card.sentTo" },
-  sendYou: { running: "card.sendingYou", error: "card.sendFailed", done: "card.sentYou" },
-  delegate: { running: "card.delegating", error: "card.sendFailed", done: "card.delegate" },
-  delegateYou: { running: "card.delegating", error: "card.sendFailed", done: "card.delegateYou" },
+  spawn: { running: "card.spawning", unknown: "card.spawning", error: "card.spawnFailed", done: "card.spawn" },
+  note: { running: "card.noting", unknown: "card.noting", error: "card.noteFailed", done: "card.note", held: "card.noteHeld" },
+  cancel: { running: "card.cancelling", unknown: "card.cancelling", error: "card.cancelFailed", done: "card.cancel" },
+  send: { running: "card.sendingTo", unknown: "card.sendingTo", error: "card.sendFailed", done: "card.sentTo" },
+  sendYou: { running: "card.sendingYou", unknown: "card.sendingYou", error: "card.sendFailed", done: "card.sentYou" },
+  delegate: { running: "card.delegating", unknown: "card.delegating", error: "card.sendFailed", done: "card.delegate" },
+  delegateYou: { running: "card.delegating", unknown: "card.delegating", error: "card.sendFailed", done: "card.delegateYou" },
 } as const;
-const stateOf = (row: ToolRow, running: boolean): CardState => row.result?.isError ? "error" : !row.result && running ? "running" : "done";
+const stateOf = (row: ToolRow, running: boolean): CardState => row.result?.isError ? "error" : row.result ? "done" : running ? "running" : "unknown";
 
 /** A card's head sentence: a catalog key with `<id>` (a task id pill) and `<b>` (a name) in it. */
 function Head({ k, values }: { k: string; values?: Record<string, string> }) {
@@ -53,9 +54,21 @@ const plain = (k: string, values?: Record<string, string>) => (i18n.t as unknown
 function Quote({ text, lines }: { text: string; lines: 3 | 6 }) {
   const { t } = useTranslation("activity");
   const [open, setOpen] = useState(false);
-  const long = text.split("\n").length > lines || text.length > lines * 80;
+  // A first guess from the text; once laid out, whether the clamp actually cut it (wrapping on a narrow screen, CJK).
+  const [long, setLong] = useState(() => text.split("\n").length > lines || text.length > lines * 80);
+  const ref = useRef<HTMLParagraphElement>(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el || open) return;
+    const measure = () => setLong(el.scrollHeight > el.clientHeight + 1);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [text, open]);
   return <div className="mt-2">
-    <p data-slot="activity-quote" className={cn("m-0 rounded-[10px] bg-foreground/[0.05] px-3 py-2 text-[13px] leading-relaxed whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]",
+    <p ref={ref} data-slot="activity-quote" className={cn("m-0 rounded-[10px] bg-foreground/[0.05] px-3 py-2 text-[13px] leading-relaxed whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]",
       !open && (lines === 3 ? "line-clamp-3" : "line-clamp-6"))}>{text}</p>
     {long && <button type="button" onClick={() => setOpen((v) => !v)} aria-expanded={open}
       className="mt-1 rounded px-1 text-[11.5px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline">{open ? t("card.showLess") : t("card.showAll")}</button>}
@@ -116,6 +129,7 @@ function Card({ rows, state, head, children, footer, rawOpen, onRawOpen, compact
           <BracesIcon className="size-3.5" aria-hidden="true" /></button>
       </div>
       {children}
+      {state === "unknown" && <p className="m-0 mt-2 text-[12px] text-muted-foreground">{t("card.unknown")}</p>}
     </div>
     {footer && state === "done" && <div className="flex min-w-0 items-center gap-2 border-t px-3.5 py-2 text-[12px] text-muted-foreground">{footer}</div>}
     {rawOpen && <RawPanel rows={rows} />}
@@ -204,8 +218,8 @@ function SendCard({ row, state, raw }: CardProps & { row: ToolRow & { activity: 
   const prefix = activity.target.split(":")[0];
   const channel = !activity.toOwner && (CHANNELS as readonly string[]).includes(prefix) ? t(`card.via.${prefix as (typeof CHANNELS)[number]}`) : undefined;
   const values = { name };
-  // A direct message to the conversation on screen is its next bubble: the card only says so.
-  const here = activity.mode === "direct" && state === "done" && (activity.toOwner ? !!env.ownerConversation : !!activity.targetId && activity.targetId === env.sessionId);
+  // A direct message to the conversation on screen is its next bubble: the card only says so (unless the tool noted something went wrong).
+  const here = activity.mode === "direct" && state === "done" && !row.result?.outcome?.note && (activity.toOwner ? !!env.ownerConversation : !!activity.targetId && activity.targetId === env.sessionId);
   if (here) return <Card rows={[row]} state={state} head={{ k: "card.sentHere" }} {...raw} compact />;
   const delegate = activity.mode === "delegate";
   const k = (delegate ? (activity.toOwner ? HEADS.delegateYou : HEADS.delegate) : activity.toOwner ? HEADS.sendYou : HEADS.send)[state];

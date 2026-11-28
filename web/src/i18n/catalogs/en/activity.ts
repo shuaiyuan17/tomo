@@ -5,7 +5,7 @@ export const activity = {
     rawNote: "As the server sends it: clipped at 4,000 characters, secrets masked. The transcript on disk has the rest.",
     showAll: "Show all", showLess: "Show less", longer: "The message is longer; the raw data has more.",
     spawn: "Started a task", spawning: "Starting a task", spawnFailed: "Couldn't start the task",
-    openTask: "Open task", taskGone: "No longer in the task list",
+    unknown: "No result was recorded, so it may or may not have happened.", openTask: "Open task", taskGone: "No longer in the task list",
     note: "Passed a note to <id>{{id}}</id>", noting: "Passing a note to <id>{{id}}</id>", noteFailed: "Couldn't pass the note to <id>{{id}}</id>",
     noteHeld: "Note to <id>{{id}}</id> held", noteQueued: "It gets this with its first turn.", noteReleased: "This lifted its pause.",
     withOwner: "With your own message attached",

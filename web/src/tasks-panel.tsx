@@ -44,6 +44,8 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessi
   const [ownOpenedSub, setOwnOpenedSub] = useState<string>();
   const openedSub = onOpenSub ? openedFromOutside : ownOpenedSub;
   const setOpenedSub = onOpenSub ?? setOwnOpenedSub;
+  // A sub-session opened from outside (a card's "Open task") replaces a subagent view left open, so Back leads to the list.
+  useEffect(() => { if (openedFromOutside !== undefined) setOpened(undefined); }, [openedFromOutside]);
   /** Ended sub-sessions from before today are listed too. Not kept: the rail opens tidy again. */
   const [showEarlier, setShowEarlier] = useState(false);
   const today = useToday();

@@ -363,7 +363,15 @@ export class MemoryStore {
    */
   private provenanceNote(rel: string, before: string | null, after: string): string | undefined {
     if (!isCoreMemoryPath(rel)) return undefined;
-    const missing = addedLines(before ?? "", after).filter((l) => !l.startsWith("#") && !PROVENANCE_LINE_RE.test(l)).length;
+    // Subjects under `## Don't keep` are a few neutral words, not facts: no source is asked of them.
+    const dontKeep = new Set<string>();
+    let inDontKeep = false;
+    for (const l of after.split("\n")) {
+      const t = l.trim();
+      if (/^#{1,6}\s/.test(t)) { inDontKeep = /^##\s+don['’]t keep\s*$/i.test(t); continue; }
+      if (inDontKeep && t) dontKeep.add(t);
+    }
+    const missing = addedLines(before ?? "", after).filter((l) => !l.startsWith("#") && !dontKeep.has(l) && !PROVENANCE_LINE_RE.test(l)).length;
     return missing > 0 ? provenanceReminder(rel, missing) : undefined;
   }
 

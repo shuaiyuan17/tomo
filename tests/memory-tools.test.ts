@@ -600,6 +600,11 @@ describe("the provenance reminder (§6.1): a fact line added to a core without i
       expect(r.text, line).not.toContain("no source");
     }
     expect((await t.call("memory_str_replace", { path: "MEMORY.md", old: "- old line\n", new: "" })).text).not.toContain("no source");
+    // A subject under Don't keep, added without reading the file (the shared variant's way), is not a fact.
+    put("private/MEMORY.md", "## Don't keep\n\n## Private\n- 2026-11-01 [said] x\n");
+    const dk = await t.call("memory_str_replace", { path: "private/MEMORY.md", old: "## Don't keep\n", new: "## Don't keep\n- a medical matter\n" });
+    expect(dk.error).toBe(false);
+    expect(dk.text).not.toContain("no source");
     expect((await t.call("memory_append", { path: "travel.md", content: "- unprefixed in a topic file" })).text).not.toContain("no source");
     for (const bad of ["- 2026-11-24 [said]", "- 2026-11-24 [from:] x", "- [said] 2026-11-24 x"]) {
       const r = await t.call("memory_append", { path: "MEMORY.md", content: bad });

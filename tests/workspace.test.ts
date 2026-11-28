@@ -114,10 +114,12 @@ describe("buildSystemPrompt", () => {
     expect(shared).toContain("## Corrections");
     expect(shared).not.toContain("Be proactive");
     // No Don't keep list in this prompt: it says so, and doesn't send a group's turn to write private/MEMORY.md.
-    expect(shared).toContain("read that list with memory_read before you save anything personal");
-    expect(shared).toContain("ask the owner to repeat it in private");
-    expect(shared).toContain("On the owner's own turn, read that list with memory_read before you save anything personal, and save nothing on a subject listed there");
-    expect(shared).toContain("add its subject in a few neutral words under `## Don't keep` at the top of private/MEMORY.md");
+    expect(shared).toContain("Don't read private/MEMORY.md here (whatever you read stays in a conversation the group shares), and save nothing personal while the group is here");
+    expect(shared).not.toContain("memory_read before you save");
+    expect(shared).toContain("add its subject with memory_str_replace on the `## Don't keep` heading line alone");
+    expect(shared).toContain("without reading the file");
+    expect(shared).toContain("On a group member's turn, remove it only from the folder that turn's reminder names");
+    expect(shared).toContain("ask the owner to repeat the request in private");
     expect(shared).toContain("Either way, say that the conversation history still holds the original words, and the memory tools keep what they replace or delete for 30 days");
     // One audience rule scopes every change/fix instruction on a group member's turn.
     expect(shared).toContain("where the sections below say to change or fix a line, on such a turn that holds only inside that folder");

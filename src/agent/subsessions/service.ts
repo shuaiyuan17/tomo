@@ -2141,7 +2141,15 @@ export class SubsessionService {
     }
     for (const task of queued) {
       if (active >= max) break;
-      if (this.startQueued(task.id, "a slot is free", false)) active += 1;
+      // A start that cannot be written must not escape: schedule() runs in a
+      // driver's finally, where a throw would be an unhandled rejection and
+      // the queued task would wait for some later event. Looked at again shortly.
+      try {
+        if (this.startQueued(task.id, "a slot is free", false)) active += 1;
+      } catch (err) {
+        log.error({ err, id: task.id }, "Could not start a queued sub-session; trying again shortly");
+        this.armRegistryRecheck();
+      }
     }
     // A finished task holding a note from its owning session waited for a
     // slot in kick(); it gets one after the queued tasks.
@@ -2339,11 +2347,14 @@ export class SubsessionService {
   }
 
   /**
-   * Tasks using a slot: every active one, and a finished one whose driver is
-   * running (it is answering something it was sent).
+   * Tasks using a slot: every active one, a finished one whose driver is
+   * running (it is answering something it was sent), and a waiting one whose
+   * driver is running: a task_ask moves the task to waiting while its turn
+   * still runs, and that turn keeps the slot until it ends (it can still
+   * finish and reopen the task, which is active again with no new start).
    */
   private busyCount(tasks: readonly SubsessionRecord[]): number {
-    return tasks.filter((t) => t.status === "active" || (t.status === "finished" && this.driving.has(t.id))).length;
+    return tasks.filter((t) => t.status === "active" || ((t.status === "finished" || t.status === "waiting") && this.driving.has(t.id))).length;
   }
 
   /**
@@ -2577,11 +2588,6 @@ export class SubsessionService {
           r.failStreak = 0;
           r.lastFailure = undefined;
           r.pendingInput = r.pendingInput.filter((i) => i.seq > turn.throughSeq);
-          // The turn ended waiting for the owner (task_ask) and input landed
-          // after the wait began (a check-back, a note): it waits for their
-          // wake too. Held, so recovery does not take a completed wait for a
-          // turn cut short and requeue it without their answer.
-          if (r.status === "waiting" && r.waitingOn === "owner" && r.pendingInput.length > 0) r.heldThrough = Math.max(r.heldThrough ?? 0, lastInputSeq(r));
         } else {
           r.failStreak += 1;
           if (!outcome.ok && !outcome.stopped) {
@@ -2602,6 +2608,13 @@ export class SubsessionService {
             r.heldThrough = Math.max(r.heldThrough ?? 0, turn.throughSeq);
           }
         }
+        // The turn ended waiting for the owner (task_ask). What is still
+        // pending waits for their wake too: input that landed after the wait
+        // began (a check-back, a note), and what this turn carried when it
+        // failed or was stopped after asking. Held, so recovery does not take
+        // a wait whose turn ended for a turn cut short, and requeue the task
+        // without their answer (a restart is not the owner).
+        if (r.status === "waiting" && r.waitingOn === "owner" && (keep || r.pendingInput.length > 0)) r.heldThrough = Math.max(r.heldThrough ?? 0, lastInputSeq(r));
         const usage = this.deps.contextUsage(r.sessionKey);
         if (outcome.ok && usage && !usage.estimated && usage.used > this.deps.config().maxContextTokens && !r.compactPending) {
           log.info({ id, used: usage.used, limit: this.deps.config().maxContextTokens }, "Sub-session context over its limit; compacting before the next turn");
@@ -2943,7 +2956,40 @@ export class SubsessionService {
     // durable is the note: every start wakes the owning session again for a
     // delivered report whose note is still unread (see reconcile).
     this.wakeForReport(record);
-    this.safely(() => this.store.update(record.id, (r) => { r.reportDelivered = true; }), "mark report delivered");
+    this.markReportDelivered(record.id, record.reportSeq);
+  }
+
+  /**
+   * The report's note is on disk and its wake is sent: record that. A write
+   * that fails is tried again on its own (never the whole delivery: the note
+   * may be read by then, and a second one would tell the owner twice), up to
+   * REPORT_RETRY_MAX times; past that, the next start delivers it again.
+   * Only the report that was delivered is marked (`seq`): a task_finish that
+   * landed meanwhile is a new report, not delivered yet.
+   */
+  private markReportDelivered(id: string, seq: number | undefined): void {
+    try {
+      this.store.update(id, (r) => { if (r.reportSeq === seq) r.reportDelivered = true; });
+      this.clearReportRetry(id);
+      return;
+    } catch (err) {
+      log.error({ err, id }, "Could not mark a sub-session report delivered; trying again");
+    }
+    const attempts = (this.reportAttempts.get(id) ?? 0) + 1;
+    if (attempts > REPORT_RETRY_MAX) {
+      this.clearReportRetry(id);
+      log.error({ id, attempts }, "Could not mark a sub-session report delivered; delivered again on the next start");
+      return;
+    }
+    this.reportAttempts.set(id, attempts);
+    const old = this.reportTimers.get(id);
+    if (old) clearTimeout(old);
+    const timer = setTimeout(() => {
+      this.reportTimers.delete(id);
+      this.markReportDelivered(id, seq);
+    }, REPORT_RETRY_MS);
+    timer.unref?.();
+    this.reportTimers.set(id, timer);
   }
 
   /** Writes the note of every kept earlier report that has none on disk. False when one could not be written. */

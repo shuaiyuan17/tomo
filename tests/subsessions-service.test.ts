@@ -441,6 +441,80 @@ describe("SubsessionService", () => {
     expect(h.turns.slice(turns).map((t) => t.key)).toEqual(expect.arrayContaining([done.sessionKey]));
   });
 
+  it("a queued task whose start cannot be written when a slot frees is started at the recheck, with nothing escaping", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const rejections: unknown[] = [];
+    const onRejection = (err: unknown) => { rejections.push(err); };
+    process.on("unhandledRejection", onRejection);
+    try {
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      const h = harness({ maxRunning: 1 }, async (turn, hh) => {
+        if (turn.key === "task:s1") await gate;
+        hh.service.noteToolUse(turn.key);
+        hh.service.finish(turn.key, "ok");
+        return { ok: true };
+      });
+      h.service.start();
+      spawn(h, "one");
+      spawn(h, "two");
+      await flush();
+      expect(h.store.get("s2")?.status).toBe("queued");
+      // The slot frees when s1's driver ends; that start's write fails once.
+      const transition = h.store.transition.bind(h.store);
+      let fail = 1;
+      vi.spyOn(h.store, "transition").mockImplementation((id, event, opts) => {
+        if (event === "start" && fail > 0) { fail -= 1; throw new Error("disk full"); }
+        return transition(id, event, opts);
+      });
+      release();
+      await flush();
+      expect(fail).toBe(0);
+      expect(h.store.get("s2")?.status).toBe("queued");
+      expect(rejections).toEqual([]);
+      vi.advanceTimersByTime(REGISTRY_RECHECK_MS);
+      await flush();
+      expect(h.store.get("s2")?.status).toBe("finished");
+      h.service.stop();
+    } finally {
+      process.off("unhandledRejection", onRejection);
+      vi.useRealTimers();
+    }
+  });
+
+  it("a task that asks keeps its slot until that turn ends, so finishing and reopening in the same turn stays within maxRunning", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const activeAfterReopen: number[] = [];
+    const h = harness({ maxRunning: 1 }, async (turn, hh) => {
+      hh.service.noteToolUse(turn.key);
+      if (turn.key !== "task:s1") { hh.service.finish(turn.key, "ok"); return { ok: true }; }
+      if (hh.turns.filter((t) => t.key === "task:s1").length > 1) { hh.service.finish(turn.key, "done"); return { ok: true }; }
+      // Asks, then goes on in the same turn: finishes and reopens itself.
+      await hh.service.ask(turn.key, "which one?");
+      await gate;
+      hh.service.finish(turn.key, "done after all");
+      hh.service.reopen(turn.key);
+      activeAfterReopen.push(hh.store.list().filter((t) => t.status === "active").length);
+      return { ok: true };
+    });
+    h.service.start();
+    spawn(h, "one");
+    spawn(h, "two");
+    await flush();
+    // s1 waits for the owner, but its turn still runs: s2 has no slot yet.
+    expect(h.store.get("s1")).toMatchObject({ status: "waiting", waitingOn: "owner" });
+    expect(h.store.get("s2")?.status).toBe("queued");
+    expect(h.turns.map((t) => t.key)).toEqual(["task:s1"]);
+    release();
+    await flush();
+    expect(activeAfterReopen).toEqual([1]);
+    // Both got their turns in the end.
+    expect(h.store.get("s1")?.status).toBe("finished");
+    expect(h.store.get("s2")?.status).toBe("finished");
+    h.service.stop();
+  });
+
   it("a driver that throws is tried again by the retry timer, never at once in a loop", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
@@ -820,6 +894,40 @@ describe("SubsessionService: inputs are never lost", () => {
     }
   });
 
+  it("retries marking a report delivered when that write fails, so a restart does not deliver it again", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, "the result")));
+      // The write right after the report's wake (marking it delivered) fails once.
+      const update = h.store.update.bind(h.store);
+      let fail = 1;
+      vi.spyOn(h.store, "update").mockImplementation((id, fn) => {
+        if (h.wakes.length === 1 && fail > 0) { fail -= 1; throw new Error("disk full"); }
+        return update(id, fn);
+      });
+      h.service.start();
+      const t = spawn(h);
+      await flush();
+      expect(fail).toBe(0);
+      expect(h.store.get(t.id)).toMatchObject({ status: "finished", reportDelivered: false });
+      vi.advanceTimersByTime(REPORT_RETRY_MS);
+      expect(h.store.get(t.id)?.reportDelivered).toBe(true);
+      // The mark alone was tried again: one note, one wake.
+      expect(h.notes.get("dm:owner")?.filter((n) => n.includes('type="subsession-report"'))).toHaveLength(1);
+      expect(h.wakes).toEqual(["dm:owner"]);
+      h.service.stop();
+      // The owning session read the note; a restart has nothing to deliver again.
+      const h2 = harness();
+      h2.service.start();
+      await flush();
+      expect(h2.notes.get("dm:owner") ?? []).toEqual([]);
+      expect(h2.wakes).toEqual([]);
+      h2.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not take a note held in memory after a failed write for a durable one", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
@@ -1194,6 +1302,40 @@ describe("SubsessionService start: restart recovery and reconcile", () => {
     expect(h.turns[0].prompt).toContain('type="subsession-start"');
     expect(h.turns[0].prompt).toContain('type="subsession-resume"');
     expect(h.store.get(t.id)?.status).toBe("finished");
+  });
+
+  it("keeps a task that asked the owner waiting across a restart when that turn then failed or was stopped: a restart is not the owner", async () => {
+    for (const end of [{ ok: false, stopped: true }, { ok: false, failure: { detail: "API error" } }] as TaskTurnOutcome[]) {
+      const h = harness({}, async (turn, hh) => {
+        if (hh.turns.length > 1) { hh.service.noteToolUse(turn.key); hh.service.finish(turn.key, "ok"); return { ok: true }; }
+        await hh.service.ask(turn.key, "which one?");
+        return end;
+      });
+      h.service.start();
+      const t = spawn(h);
+      await flush();
+      expect(h.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner", startDelivered: false });
+      expect(h.turns).toHaveLength(1);
+      h.service.stop();
+      // The process restarts: the wait stands, and no turn runs.
+      const h2 = harness({}, working((turn, hh) => hh.service.finish(turn.key, "ok")));
+      h2.registry.add(t.sessionKey);
+      h2.sdk.add(t.sessionKey);
+      h2.service.start();
+      await flush();
+      expect(h2.turns).toHaveLength(0);
+      expect(h2.store.get(t.id)).toMatchObject({ status: "waiting", waitingOn: "owner" });
+      // The owner's answer wakes it, with the start it never completed.
+      expect(h2.service.ownerMessage("dm:owner", t.id, "the second one")).toMatchObject({ ok: true });
+      await flush();
+      expect(h2.turns).toHaveLength(1);
+      expect(h2.turns[0].prompt).toContain("the second one");
+      expect(h2.turns[0].prompt).toContain('type="subsession-start"');
+      expect(h2.store.get(t.id)).toMatchObject({ status: "finished", pendingInput: [] });
+      h2.service.stop();
+      rmSync(path, { force: true });
+      rmSync(`${path}.bak`, { force: true });
+    }
   });
 
   it("leaves a task that asked the owner in a completed turn waiting", async () => {

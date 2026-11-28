@@ -92,14 +92,14 @@ export function PlanUsage({ ready, locked, live }: { ready: boolean;
     <div className="mb-2 flex items-center justify-between gap-2">
       <p className="eyebrow m-0" id="usage-heading">{t("usage.heading")}{usage?.plan ? <span className="normal-case tracking-normal">{t("format.separator")}{planName(usage.plan)}</span> : null}</p>
       <Button variant="ghost" size="icon" aria-label={t("usage.refreshLabel")} title={usage ? t("usage.refreshTitle", { updated: updatedLabel(usage.updatedAt, now) }) : t("usage.refresh")} disabled={loading || !ready} onClick={() => void load(true)}
-        className="-my-1 size-7 rounded-lg text-muted-foreground max-[600px]:-my-2 max-[600px]:size-9 hover:bg-foreground/[0.07] hover:text-foreground [&_svg:not([class*='size-'])]:size-3.5">
+        className="-my-1 size-7 rounded-lg text-muted-foreground max-phone:-my-2 max-phone:size-9 hover:bg-foreground/[0.07] hover:text-foreground [&_svg:not([class*='size-'])]:size-3.5">
         <RefreshCw className={cn(spinning && "animate-spin")} onAnimationIteration={() => { if (!loading) setSpinning(false); }} strokeWidth={1.75} /></Button>
     </div>
     {liveNotice && <p className="m-0 mb-3 text-[12px] leading-relaxed font-medium text-warn" role="status">{liveNotice}</p>}
     {!usage && !failed && <p className="m-0 text-[13px] text-muted-foreground" role="status">{locked ? t("usage.locked") : t("state.loading")}</p>}
     {main.length > 0 && <div className="space-y-3">{main.map((window) => <UsageRow key={window.id} title={windowTitle(window)} window={window} now={now} />)}</div>}
     {scoped.length > 0 && <Collapsible className="group/models mt-3">
-      <CollapsibleTrigger className="flex items-center gap-1 rounded-md px-0.5 py-0.5 text-[12px] max-[600px]:-my-2 max-[600px]:py-2.5 text-muted-foreground transition-colors hover:text-foreground">
+      <CollapsibleTrigger className="flex items-center gap-1 rounded-md px-0.5 py-0.5 text-[12px] max-phone:-my-2 max-phone:py-2.5 text-muted-foreground transition-colors hover:text-foreground">
         <ChevronRight className="size-3.5 transition-transform group-data-[state=open]/models:rotate-90" />{t("usage.byModel", { count: scoped.length })}</CollapsibleTrigger>
       <CollapsibleContent className="mt-2.5 space-y-3">{scoped.map((window) => <UsageRow key={window.id} title={windowTitle(window)} window={window} now={now} compact />)}</CollapsibleContent>
     </Collapsible>}

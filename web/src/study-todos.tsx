@@ -69,7 +69,7 @@ export function Todos({ reload }: { reload: number }) {
 }
 
 function Stat({ label, children, note, className }: { label: string; children: ReactNode; note?: ReactNode; className?: string }) {
-  return <div className={cn("min-w-0 px-6 py-5 max-[600px]:px-5 max-[600px]:py-4", className)}>
+  return <div className={cn("min-w-0 px-6 py-5 max-phone:px-5 max-phone:py-4", className)}>
     <p className="eyebrow">{label}</p>
     <div className="mt-1.5">{children}</div>
     {note && <p className={cn(meta, "mt-2 mb-0")}>{note}</p>}
@@ -79,8 +79,8 @@ function Stat({ label, children, note, className }: { label: string; children: R
 function Summary({ summary, agent }: { summary: TodoSummary; agent: string }) {
   const { t } = useTranslation(["todos", "common", "study"]);
   const left = summary.max - summary.open;
-  return <section aria-label={t("summary.label")} className={cn(card, "grid grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,1fr)] max-[600px]:grid-cols-2")}>
-    <Stat label={t("summary.open")} className="border-r max-[600px]:col-span-2 max-[600px]:border-r-0 max-[600px]:border-b" note={summary.cap === "full" ? t("summary.full", { agent })
+  return <section aria-label={t("summary.label")} className={cn(card, "grid grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)_minmax(0,1fr)] max-phone:grid-cols-2")}>
+    <Stat label={t("summary.open")} className="border-r max-phone:col-span-2 max-phone:border-r-0 max-phone:border-b" note={summary.cap === "full" ? t("summary.full", { agent })
       : summary.cap === "near" ? t("summary.near", { count: left, agent }) : t("summary.left", { count: left })}>
       <p className="m-0 text-2xl tabular-nums" data-testid="todo-open">{summary.open} <span className="text-sm text-muted-foreground">/ {summary.max}</span></p>
       <Progress value={summary.percent} aria-label={t("summary.progress", { open: summary.open, max: summary.max })}
@@ -119,7 +119,7 @@ function TodoRow({ item, now, maxSnoozes }: { item: WebTodoItem; now: number; ma
   const snooze = snoozeLabel(item.snoozes, maxSnoozes);
   const review = new Date(item.reviewAt);
   return <li data-todo={item.id} data-due={due || undefined}
-    className="grid grid-cols-[40px_minmax(0,1fr)_auto] items-baseline gap-x-3 px-5 py-3.5 max-[600px]:grid-cols-[40px_minmax(0,1fr)] max-[600px]:px-4">
+    className="grid grid-cols-[40px_minmax(0,1fr)_auto] items-baseline gap-x-3 px-5 py-3.5 max-phone:grid-cols-[40px_minmax(0,1fr)] max-phone:px-4">
     <span className="font-mono text-[11px] text-muted-foreground tabular-nums">{item.id}</span>
     <div className="min-w-0">
       <p className="m-0 text-sm leading-snug font-medium [overflow-wrap:anywhere]">{item.title}</p>
@@ -132,7 +132,7 @@ function TodoRow({ item, now, maxSnoozes }: { item: WebTodoItem; now: number; ma
         {item.source === "owner" && <span>{t("addedByYou")}</span>}
       </MetaLine>
     </div>
-    <time dateTime={review.toISOString()} title={formatDate(review, { dateStyle: "medium", timeStyle: "short" })} className="max-[600px]:col-start-2 max-[600px]:mt-1.5 max-[600px]:justify-self-start">
+    <time dateTime={review.toISOString()} title={formatDate(review, { dateStyle: "medium", timeStyle: "short" })} className="max-phone:col-start-2 max-phone:mt-1.5 max-phone:justify-self-start">
       {due ? <Badge variant="outline" className="rounded-md border-warn/40 bg-warn/10 text-[11px] font-medium text-warn">{reviewLabel(item.reviewAt, now)}</Badge>
         : <span className={cn(meta, "whitespace-nowrap")}>{reviewLabel(item.reviewAt, now)}</span>}
     </time>
@@ -142,7 +142,7 @@ function TodoRow({ item, now, maxSnoozes }: { item: WebTodoItem; now: number; ma
 function Recent({ recent, more, now, agent }: { recent: WebTodoResolution[]; more: boolean; now: number; agent: string }) {
   const { t } = useTranslation(["todos", "common", "study"]);
   return <Collapsible asChild><section className={card} aria-label={t("recent.heading")}>
-    <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-2.5 rounded-xl px-5 py-3.5 text-left hover:bg-foreground/[0.04] max-[600px]:px-4">
+    <CollapsibleTrigger className="group flex w-full cursor-pointer items-center gap-2.5 rounded-xl px-5 py-3.5 text-left hover:bg-foreground/[0.04] max-phone:px-4">
       <ChevronRight className="size-3.5 shrink-0 text-muted-foreground transition-transform group-data-[state=open]:rotate-90" />
       <span className="eyebrow">{t("recent.heading")}</span>
       <span className={cn(meta, "ml-auto tabular-nums")}>{more ? t("recent.latest", { count: recent.length }) : recent.length}</span>
@@ -151,7 +151,7 @@ function Recent({ recent, more, now, agent }: { recent: WebTodoResolution[]; mor
       <ul className="m-0 list-none divide-y border-t p-0">{recent.map((item) => {
         const done = item.resolution === "done";
         const at = new Date(item.resolvedAt);
-        return <li key={item.id} data-todo={item.id} className="grid grid-cols-[40px_minmax(0,1fr)_auto] items-baseline gap-x-3 px-5 py-3 max-[600px]:grid-cols-[40px_minmax(0,1fr)] max-[600px]:px-4">
+        return <li key={item.id} data-todo={item.id} className="grid grid-cols-[40px_minmax(0,1fr)_auto] items-baseline gap-x-3 px-5 py-3 max-phone:grid-cols-[40px_minmax(0,1fr)] max-phone:px-4">
           <span className="font-mono text-[11px] text-muted-foreground tabular-nums">{item.id}</span>
           <div className="min-w-0">
             <p className={cn("m-0 text-[13px] leading-snug [overflow-wrap:anywhere]", !done && "text-muted-foreground line-through decoration-muted-foreground/50")}>{item.title}</p>
@@ -161,7 +161,7 @@ function Recent({ recent, more, now, agent }: { recent: WebTodoResolution[]; mor
               {item.group && <span>{t("inGroup", { group: item.group })}</span>}
             </MetaLine>
           </div>
-          <time dateTime={at.toISOString()} title={formatDate(at, { dateStyle: "medium", timeStyle: "short" })} className={cn(meta, "inline-flex items-center gap-1 whitespace-nowrap max-[600px]:col-start-2 max-[600px]:mt-1")}>
+          <time dateTime={at.toISOString()} title={formatDate(at, { dateStyle: "medium", timeStyle: "short" })} className={cn(meta, "inline-flex items-center gap-1 whitespace-nowrap max-phone:col-start-2 max-phone:mt-1")}>
             {done ? <Check className="size-3 translate-y-px text-primary" strokeWidth={2} aria-hidden="true" /> : <X className="size-3 translate-y-px" strokeWidth={2} aria-hidden="true" />}
             {t(done ? "recent.done" : "recent.dropped", { when: closedLabel(item.resolvedAt, now), who: item.resolvedBy === "owner" ? t("recent.you") : agent })}
           </time>

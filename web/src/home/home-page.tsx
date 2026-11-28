@@ -121,9 +121,9 @@ export function HomePage({ events, bootstrap, refresh, inert }: {
     : failure === "webgl" ? i18n.t("home:failure.webgl")
     : failure === "lost" ? i18n.t("home:failure.lost") : null;
   const working = !!status && (status.working || status.compacting);
-  return <main id="home" tabIndex={-1} inert={inert} className="flex min-h-0 min-w-0 flex-1 flex-col px-8 pt-6 pb-4 max-[1024px]:px-6 max-[800px]:px-5 max-[600px]:px-0 max-[600px]:pt-0 max-[600px]:pb-[max(0.75rem,env(safe-area-inset-bottom))]">
+  return <main id="home" tabIndex={-1} inert={inert} className="flex min-h-0 min-w-0 flex-1 flex-col px-8 pt-6 pb-4 max-overlay:px-6 max-[800px]:px-5 max-phone:px-0 max-phone:pt-0 max-phone:pb-[max(0.75rem,env(safe-area-inset-bottom))]">
     <h1 className="sr-only">{i18n.t("home:heading", { agent })}</h1>
-    <div className={cn("relative min-h-0 flex-1 overflow-hidden rounded-2xl border max-[600px]:rounded-none max-[600px]:border-x-0 max-[600px]:border-t-0", (failureText || loaded.state === "error") && "bg-muted/40")}
+    <div className={cn("relative min-h-0 flex-1 overflow-hidden rounded-2xl border max-phone:rounded-none max-phone:border-x-0 max-phone:border-t-0", (failureText || loaded.state === "error") && "bg-muted/40")}
       style={failureText || loaded.state === "error" ? undefined : { backgroundColor: backdrop }} data-testid="home-room">
       {failureText ? <div className="flex size-full flex-col items-center justify-center gap-3 p-6 text-center text-[13px] text-muted-foreground" role="note">
           <p className="m-0 max-w-80">{i18n.t("home:failure.note", { failure: failureText, agent })}</p>
@@ -135,11 +135,11 @@ export function HomePage({ events, bootstrap, refresh, inert }: {
           label={i18n.t("home:roomLabel", { agent, name: home.scene.name ?? i18n.t("home:smallRoom"), caption })} handle={handle} onFailure={setFailure} onReady={() => setDrawn(true)} />
         : <p className="sr-only" role="status">{i18n.t("home:opening")}</p>}
     </div>
-    <div className="w-full px-1 pt-3 max-[600px]:px-4">
+    <div className="w-full px-1 pt-3 max-phone:px-4">
       <p className="m-0 flex items-baseline gap-2 text-[13px] leading-relaxed text-muted-foreground" role="status" aria-live="polite">
         <i aria-hidden="true" className={cn("relative top-[-1px] size-1.5 shrink-0 rounded-full border border-muted-foreground", working && "border-primary bg-primary", status?.trouble && "border-warn bg-warn")} />
         <span className="min-w-0 flex-1" data-testid="home-caption">{caption}</span>
-        {home?.scene.name && <span className="shrink-0 text-[11px] tracking-[0.02em] max-[600px]:hidden">{home.scene.name}</span>}</p>
+        {home?.scene.name && <span className="shrink-0 text-[11px] tracking-[0.02em] max-phone:hidden">{home.scene.name}</span>}</p>
       {home?.problems?.length ? <details className="mt-1 text-[12px] text-muted-foreground">
           <summary className="cursor-pointer select-none">{i18n.t("home:problem", { agent })}</summary>
           <ul className="mt-1 mb-0 pl-5">{home.problems.slice(0, 20).map((problem, i) => <li key={i} className="[overflow-wrap:anywhere]">{problem}</li>)}</ul></details>

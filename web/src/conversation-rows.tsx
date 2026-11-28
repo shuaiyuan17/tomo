@@ -96,7 +96,7 @@ function OwnBubble({ receipts, receipt, agent, children }: { receipts: boolean; 
     {receipts && <ReadReceiptMark receipt={receipt} agent={agent} />}</div>;
 }
 
-const userBubble = "min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 max-[600px]:px-4 max-[600px]:py-3";
+const userBubble = "min-w-0 rounded-2xl rounded-tl-md bg-secondary px-5 py-3.5 max-phone:px-4 max-phone:py-3";
 
 export interface RecordedMessageProps {
   message: HistoryMessage; parsed: ParsedMessage; quotedId?: string;

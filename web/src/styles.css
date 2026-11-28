@@ -92,6 +92,14 @@
   --motion-wait: 300ms;
 }
 @theme {
+  /* The app shell's two widths, the same numbers as PHONE_QUERY and OVERLAY_QUERY in layers.ts
+     (tests/web-breakpoints.test.ts holds them together). As breakpoints, so `max-phone:` and
+     `max-overlay:` sort among the pages' own `max-[...]` thresholds by width:
+     max-phone:  below 600px, the phone layout (the sidebar is a drawer);
+     max-overlay: below 1024px, the Tasks rail and the Home conversation slide over the page;
+     min-overlay: 1024px and up, both pinned. */
+  --breakpoint-phone: 600px;
+  --breakpoint-overlay: 1024px;
   --ease-soft: cubic-bezier(0.2, 0.8, 0.2, 1);
   /* Entrances: a gentler ease-out (cubic) than ease-soft, so the rise is visible rather than over in the first frames. */
   --ease-enter: cubic-bezier(0.33, 1, 0.68, 1);

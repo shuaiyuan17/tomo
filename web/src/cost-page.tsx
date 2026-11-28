@@ -58,7 +58,7 @@ export function CostPage({ reload, focus }: { reload: number; focus: string | nu
   const recordedDays = calendarDays.filter((d) => d.recorded).length;
   return <div className="viz space-y-4">
     {quota}
-    <div className="grid grid-cols-[minmax(0,340px)_minmax(0,1fr)] grid-rows-[auto_auto_1fr] items-start gap-4 [grid-template-areas:'cal_day'_'glance_day'_'range_day'] max-[900px]:grid-cols-2 max-[900px]:grid-rows-none max-[900px]:[grid-template-areas:'cal_glance'_'day_day'_'range_range'] max-[600px]:grid-cols-1 max-[600px]:[grid-template-areas:'cal'_'glance'_'day'_'range']">
+    <div className="grid grid-cols-[minmax(0,340px)_minmax(0,1fr)] grid-rows-[auto_auto_1fr] items-start gap-4 [grid-template-areas:'cal_day'_'glance_day'_'range_day'] max-[900px]:grid-cols-2 max-[900px]:grid-rows-none max-[900px]:[grid-template-areas:'cal_glance'_'day_day'_'range_range'] max-phone:grid-cols-1 max-phone:[grid-template-areas:'cal'_'glance'_'day'_'range']">
       <Section title={t("calendar.heading")} aside={recordedDays < 14 ? t("calendar.since", { day: shortDay(localDate(value.recordedSince)) }) : t("calendar.pick")} className="[grid-area:cal]">
         <Heatmap days={calendarDays} today={value.glance.today} selected={selected!} onSelect={select} />
       </Section>
@@ -85,7 +85,7 @@ export function QuotaBar({ limits }: { limits: WebCostLimits }) {
   if (!windows.length) return null;
   const now = Date.now();
   const sampled = Date.parse(limits.sampledAt);
-  return <section aria-label={t("common:usage.heading")} className={cn(card, "flex flex-wrap items-center gap-x-8 gap-y-3 px-6 py-3.5 max-[600px]:px-4")}>
+  return <section aria-label={t("common:usage.heading")} className={cn(card, "flex flex-wrap items-center gap-x-8 gap-y-3 px-6 py-3.5 max-phone:px-4")}>
     <p className="eyebrow shrink-0 max-[1100px]:w-full" title={Number.isFinite(sampled) ? t("quota.sampled", { when: formatDate(sampled, { dateStyle: "medium", timeStyle: "medium" }) }) : undefined}>{t("common:usage.heading")}
       {Number.isFinite(sampled) && <span className="normal-case tracking-normal">{t("quota.asOf", { when: formatDate(sampled, now - sampled > 86_400_000 ? { hour: "numeric", minute: "2-digit", month: "short", day: "numeric" } : { hour: "numeric", minute: "2-digit" }) })}</span>}</p>
     <div className="grid min-w-0 flex-1 grid-cols-2 gap-x-8 gap-y-2.5 max-[1100px]:grid-cols-1">{windows.map(({ title, window }) => {
@@ -96,7 +96,7 @@ export function QuotaBar({ limits }: { limits: WebCostLimits }) {
         <span className="w-12 shrink-0 text-[13px]">{title}</span>
         <Progress max={100} value={percent} aria-label={t("common:usage.rowLabel", { title })} className={cn("h-1.5 min-w-[60px] flex-1 bg-border", warn && "[&>[data-slot=progress-indicator]]:bg-warn")} />
         <span className={cn("shrink-0 text-[13px] tabular-nums", warn ? "font-medium text-warn" : "text-muted-foreground")}>{formatNumber(Math.round(percent) / 100, { style: "percent" })}</span>
-        {reset && <span className={cn(meta, "shrink-0 max-[600px]:hidden")}>{reset}</span>}
+        {reset && <span className={cn(meta, "shrink-0 max-phone:hidden")}>{reset}</span>}
       </div>;
     })}</div>
   </section>;
@@ -106,7 +106,7 @@ function Glance({ cost, onSelect }: { cost: WebCost; onSelect: (date: string) =>
   const { thisWeek, lastWeek, last30, typicalDay, busiestDay } = cost.glance;
   const { t } = useTranslation("cost");
   const recorded30 = cost.days.filter((d) => d.date >= last30.from && d.recorded).length;
-  return <Section title={t("glance.heading")} aside={<><span className="min-[601px]:max-[900px]:hidden">{t("glance.apiEquivalent")}</span><Est /></>} className="[grid-area:glance]">
+  return <Section title={t("glance.heading")} aside={<><span className="min-phone:max-[900px]:hidden">{t("glance.apiEquivalent")}</span><Est /></>} className="[grid-area:glance]">
     <div className="grid grid-cols-2 gap-x-4 gap-y-4">
       <Stat label={t("glance.thisWeek")} value={usd(thisWeek.costUsd)} note={!thisWeek.comparable || !lastWeek.comparable ? t("glance.noComparison")
         : t("glance.weekBefore", { cost: usd(lastWeek.costUsd) })} />
@@ -123,7 +123,7 @@ function Glance({ cost, onSelect }: { cost: WebCost; onSelect: (date: string) =>
 function DayPanel({ resource, date, today, typical }: { resource: Resource<WebCost>; date: string; today: string; typical: number | undefined }) {
   const { t } = useTranslation(["cost", "common"]);
   const value = resource.state === "ready" && resource.value.from === date ? resource.value : undefined;
-  const header = (body: ReactNode) => <section key={date} aria-label={longDay(date)} className={cn(card, "motion-enter min-w-0 px-6 py-6 max-[600px]:px-4 max-[600px]:py-5")}>
+  const header = (body: ReactNode) => <section key={date} aria-label={longDay(date)} className={cn(card, "motion-enter min-w-0 px-6 py-6 max-phone:px-4 max-phone:py-5")}>
     <p className="eyebrow">{dayEyebrow(date, today)}</p>
     <h2 className="mt-1 mb-0 font-serif text-[24px] leading-tight font-normal tracking-[-0.3px]">{longDay(date)}</h2>
     {body}
@@ -140,7 +140,7 @@ function DayPanel({ resource, date, today, typical }: { resource: Resource<WebCo
   const topShare = share(top.reduce((s, t) => s + t.costUsd, 0), value.totals.costUsd);
   return header(<>
     <div className="mt-4 flex flex-wrap items-end gap-x-8 gap-y-3">
-      <p className="m-0 text-[48px] leading-none font-semibold tracking-[-0.03em] tabular-nums max-[600px]:text-[40px]" data-testid="day-cost">{usd(value.totals.costUsd)}<Est className="align-[12px]" /></p>
+      <p className="m-0 text-[48px] leading-none font-semibold tracking-[-0.03em] tabular-nums max-phone:text-[40px]" data-testid="day-cost">{usd(value.totals.costUsd)}<Est className="align-[12px]" /></p>
       <p className="m-0 max-w-[360px] pb-1 text-[13px] leading-snug text-muted-foreground">
         {note ?? <>{versusTypical(value.totals.costUsd, typical) && <span className="font-medium text-foreground">{versusTypical(value.totals.costUsd, typical)} · </span>}
           {peak !== undefined ? t("dayPanel.turnsPeak", { count: turns, hour: hourLabel(peak) }) : t("dayPanel.turns", { count: turns })}</>}</p>
@@ -176,7 +176,7 @@ function PeriodCards({ resource, range, onRange }: { resource: Resource<WebCost>
   </ToggleGroup>;
   const total = value?.totals.costUsd ?? 0;
   const overcounted = !!value && value.totals.overcountedCostUsd > 0;
-  return <div className="min-w-0 space-y-4 [grid-area:range] max-[900px]:grid max-[900px]:grid-cols-2 max-[900px]:items-start max-[900px]:gap-4 max-[900px]:space-y-0 max-[600px]:grid-cols-1">
+  return <div className="min-w-0 space-y-4 [grid-area:range] max-[900px]:grid max-[900px]:grid-cols-2 max-[900px]:items-start max-[900px]:gap-4 max-[900px]:space-y-0 max-phone:grid-cols-1">
     <Section title={t("period.who")} aside={toggle}>
       {resource.state === "error" ? <Failed resource={resource} />
         : !value ? <p className="m-0 text-sm text-muted-foreground" role="status">{t("common:state.loading")}</p>

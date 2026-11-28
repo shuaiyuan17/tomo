@@ -39,7 +39,7 @@ export function CompactButton({ bootstrap, refresh, ownerSession, running, reque
     <Popover open={open} onOpenChange={setOpen}>
       <PopoverTrigger asChild>
         <Button variant="ghost" size="icon" aria-label={button.label} title={button.label} disabled={button.state === "busy" || button.state === "requested"}
-          className={cn("-my-1 size-7 rounded-lg text-muted-foreground max-[600px]:-my-2 max-[600px]:size-9 hover:bg-foreground/[0.07] hover:text-foreground disabled:opacity-40 [&_svg:not([class*='size-'])]:size-3.5",
+          className={cn("-my-1 size-7 rounded-lg text-muted-foreground max-phone:-my-2 max-phone:size-9 hover:bg-foreground/[0.07] hover:text-foreground disabled:opacity-40 [&_svg:not([class*='size-'])]:size-3.5",
             button.state === "requested" && "disabled:opacity-100")}>
           <FoldVertical strokeWidth={1.75} className={cn(button.state === "requested" && "animate-pulse")} /></Button>
       </PopoverTrigger>

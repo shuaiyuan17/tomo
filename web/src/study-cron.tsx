@@ -38,7 +38,7 @@ export function CronJobRow({ job, actions, highlighted }: { job: WebCronJob; act
         </div>
         {actions}
       </div>
-      <dl className="mt-3 mb-0 grid grid-cols-3 gap-3 text-[13px] max-[600px]:grid-cols-1">
+      <dl className="mt-3 mb-0 grid grid-cols-3 gap-3 text-[13px] max-phone:grid-cols-1">
         <div><dt className={meta}>{t("nextRun")}</dt><dd className="m-0">{job.enabled ? formatWhen(job.nextRunAt) : "—"}</dd></div>
         <div><dt className={meta}>{t("lastRun")}</dt><dd className="m-0">{formatWhen(job.lastRunAt)}</dd></div>
         <div><dt className={meta}>{t("statusLabel")}</dt><dd className={cn("m-0", status.tone === "warn" && "text-destructive")}>{status.label}</dd></div>
@@ -118,7 +118,7 @@ function CronActions({ job, mutator, onDone }: { job: WebCronJob; mutator: Mutat
     delete: { title: t("confirm.deleteTitle", { name: job.name }), action: t("confirm.delete"), body: t("confirm.deleteBody") },
   };
   const toggle: CronAction = job.enabled ? "pause" : "resume";
-  const iconButton = "size-8 rounded-lg text-muted-foreground max-[600px]:size-10 hover:bg-foreground/[0.07] hover:text-foreground";
+  const iconButton = "size-8 rounded-lg text-muted-foreground max-phone:size-10 hover:bg-foreground/[0.07] hover:text-foreground";
   return <AlertDialog open={open !== null} onOpenChange={(value) => { if (!value && !busy) { setOpen(null); setError(null); } }}>
     <div className="flex shrink-0 items-center gap-1">
       <AlertDialogTrigger asChild><Button variant="ghost" size="icon" className={iconButton} disabled={disabled} onClick={() => setOpen(toggle)}

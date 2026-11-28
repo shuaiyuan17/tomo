@@ -72,7 +72,7 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessi
   const subs = todaysSubsessions(subsessions?.tasks ?? [], today);
   const sections = railSections(view.groups, !!subsessions?.tasks.length);
   const close = onClose && <Button data-tasks-close variant="ghost" size="icon" aria-label={t("close")} title={t("closeTitle")} onClick={onClose}
-    className="size-8 rounded-lg max-[600px]:size-10 hover:bg-foreground/[0.07] active:bg-foreground/[0.11] [&_svg:not([class*='size-'])]:size-5"><X strokeWidth={1.75} /></Button>;
+    className="size-8 rounded-lg max-phone:size-10 hover:bg-foreground/[0.07] active:bg-foreground/[0.11] [&_svg:not([class*='size-'])]:size-5"><X strokeWidth={1.75} /></Button>;
   // Task list ↔ task view slide: in from the right when opening, from the left when going back.
   // Above the view: its slide-in leaves it a layer of its own, which would cover the button.
   if (openSub && subsessions) return <div className="relative flex min-h-0 flex-1 flex-col">

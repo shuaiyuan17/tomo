@@ -47,7 +47,7 @@ export function WindowMeter({ used, max, segments, tone }: { used: number; max: 
 function Window({ value, title, parts }: { value: WebContext; title: string; parts: WindowComposition }) {
   const { t } = useTranslation(["context", "common"]);
   const recorded = <span className={cn(meta, "text-right")}>{value.recordedAt ? t("window.recorded", { when: formatWhen(value.recordedAt) }) : t("window.notRecorded")}</span>;
-  if (!value.max || value.used === null) return <section className={cn(card, "px-6 py-5 max-[600px]:px-4 max-[600px]:py-4")} aria-labelledby="ctx-window">
+  if (!value.max || value.used === null) return <section className={cn(card, "px-6 py-5 max-phone:px-4 max-phone:py-4")} aria-labelledby="ctx-window">
     <div className="flex flex-wrap items-baseline justify-between gap-2"><h2 className="eyebrow" id="ctx-window">{t("window.heading", { title })}</h2>{recorded}</div>
     <p className="mt-2 mb-0 text-sm text-muted-foreground">{t("window.unavailable")}</p>
   </section>;
@@ -55,15 +55,15 @@ function Window({ value, title, parts }: { value: WebContext; title: string; par
   const tone = fillTone(percent);
   const share = (tokens: number) => t("window.share", { percent: formatPercent(fillPercent(tokens, value.max!)) });
   const split = parts.segments.some((segment) => segment.kind === "conversation" || segment.kind === "fixed");
-  return <section className={cn(card, "px-6 py-5 max-[600px]:px-4 max-[600px]:py-4")} aria-labelledby="ctx-window">
+  return <section className={cn(card, "px-6 py-5 max-phone:px-4 max-phone:py-4")} aria-labelledby="ctx-window">
     <div className="flex flex-wrap items-baseline justify-between gap-2"><h2 className="eyebrow" id="ctx-window">{t("window.heading", { title })}</h2>{recorded}</div>
     <div className="mt-3 flex flex-wrap items-end justify-between gap-x-6 gap-y-2">
       <p className="m-0 flex items-baseline gap-3">
-        <span className="font-serif text-[52px] leading-none tracking-[-1.5px] tabular-nums max-[600px]:text-[44px]">{formatPercent(percent)}</span>
+        <span className="font-serif text-[52px] leading-none tracking-[-1.5px] tabular-nums max-phone:text-[44px]">{formatPercent(percent)}</span>
         <span className="inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-[12px] font-medium" data-tone={tone}>
           <span aria-hidden className={cn("size-1.5 rounded-full", SOLID[tone])} />{fillLabel(tone)}</span>
       </p>
-      <p className="m-0 text-right text-[13px] text-muted-foreground max-[600px]:text-left">
+      <p className="m-0 text-right text-[13px] text-muted-foreground max-phone:text-left">
         <Trans t={t} ns="context" i18nKey="window.tokens" values={{ used: formatNumber(value.used), max: formatNumber(value.max) }}
           components={{ used: <span className="text-[15px] font-medium text-foreground tabular-nums" />, max: <span className="tabular-nums" /> }} />
         <span className="block text-[12px]">{value.estimated ? t("window.estimated") : t("window.reported")}</span></p>

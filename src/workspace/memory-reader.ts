@@ -3,6 +3,7 @@ import { lstat, open, readdir, realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { landsInPrivate } from "../agent/private-memory-reach.js";
 import { isPrivateIndexLine, PRIVATE_MEMORY_SUBDIR } from "./private-memory.js";
+import { isJournalMemoryPath } from "./memory-index.js";
 import { isEnoent } from "../fs-utils.js";
 
 export class MemoryReadError extends Error {
@@ -115,6 +116,8 @@ export class MemoryReader {
     const needle = query.toLocaleLowerCase(); const deadline = Date.now() + 500; let bytes = 0; let truncated = tree.truncated; let unreadable = 0;
     for (const entry of tree.entries) {
       if (entry.kind !== "file") continue;
+      // Dated notes are not searched: a journal is free writing, the likeliest place for something private.
+      if (isJournalMemoryPath(entry.path)) continue;
       if (bytes > 4 * 1024 * 1024 || Date.now() > deadline || results.length >= 100) { truncated = true; break; }
       try {
         const file = await this.file(entry.path); bytes += Buffer.byteLength(file.content);

@@ -1,7 +1,8 @@
 import { extractAttachments } from "./text-utils.js";
 import { landsInPrivate, globReachesPrivate, grepReachesPrivate, bashTouchesMemory } from "./private-memory-reach.js";
 import { expandTilde } from "./bash-write-targets.js";
-import { dirname, isAbsolute } from "node:path";
+import { readdirSync } from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
 import { abs, foldPath, hasTraversalSegment, isInside, realResolve } from "./permission-paths.js";
 
 /*
@@ -210,4 +211,36 @@ export function isPrivateMemoryAccess(
     default:
       return false;
   }
+}
+
+/**
+ * The folders under `memory/groups/` that belong to some group other than
+ * `ownDir` (relative to memory/, `groups/<dir>`; undefined: the turn has no
+ * single group, so every one is another's). Absolute. Read per call: a group
+ * folder appears the first time that group saves something.
+ */
+export function otherGroupMemoryDirs(memoryDir: string, ownDir: string | undefined): string[] {
+  const groupsDir = join(memoryDir, "groups");
+  let names: string[];
+  try { names = readdirSync(groupsDir); } catch { return []; }
+  const own = ownDir === undefined ? undefined : foldPath(ownDir.split("/")[1] ?? "");
+  return names.filter((name) => foldPath(name) !== own).map((name) => join(groupsDir, name));
+}
+
+/**
+ * Would this file-tool call (or search, or attachment) reach another group's
+ * memory folder? Each such folder is judged exactly as private/ is (lexical,
+ * real path, `..` under memory/, a search rooted at, in or above it), so a
+ * link or a scan over groups/ does not get round it. Bash is not decided
+ * here: its sandbox closes private/ only, and what another group said is
+ * that group's words, not the owner's private matters (accepted).
+ */
+export function isOtherGroupMemoryAccess(
+  toolName: string,
+  toolInput: unknown,
+  ctx: { cwd: string; memoryDir: string; otherGroupDirs: readonly string[] },
+): boolean {
+  if (toolName === "Bash" || ctx.otherGroupDirs.length === 0) return false;
+  if (ctx.otherGroupDirs.some((dir) => isPrivateMemoryAccess(toolName, toolInput, { cwd: ctx.cwd, memoryDir: ctx.memoryDir, privateDir: dir }))) return true;
+  return SEARCH_TOOLS.has(toolName) && barredSearch(toolName, toolInput, { cwd: ctx.cwd, barredDirs: ctx.otherGroupDirs });
 }

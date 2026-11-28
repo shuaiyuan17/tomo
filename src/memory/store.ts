@@ -9,7 +9,9 @@ import {
   descriptionProblem,
   DESCRIPTION_MAX_CHARS,
   isCoreMemoryPath,
+  isInsideMemoryFolder,
   isJournalMemoryPath,
+  isOtherGroupMemoryPath,
   isListedMemoryPath,
   isPeopleMemoryPath,
   isPrivateMemoryPath,
@@ -39,6 +41,14 @@ export interface MemoryAccess {
   canWrite: boolean;
   /** MEMORY.md and private/MEMORY.md: the owner's own turns only. */
   canWriteCore: boolean;
+  /**
+   * With `privateBarred`: the one group folder the turn belongs to
+   * (`groups/<dir>`, see groupMemoryDir). A barred turn writes only inside it
+   * and, among groups/, reads only it. Undefined on a barred turn no single
+   * group can be held to (a batch spanning several chats): no group's folder
+   * is its own, and it writes nowhere. Ignored when not barred.
+   */
+  groupDir?: string;
 }
 
 export interface MemoryStoreOptions {
@@ -61,6 +71,14 @@ export const PRIVATE_BARRED_REFUSAL =
   `memory/${PRIVATE_MEMORY_SUBDIR}/ is not available on this turn: a group is part of this conversation. Ask again in the owner's own conversation.`;
 export const CORE_WRITE_REFUSAL =
   "MEMORY.md can only be changed in the owner's own conversation, not while a group is part of it.";
+/** A barred turn writing outside its group's folder. */
+export function groupWriteRefusal(groupDir: string): string {
+  return `While a group is part of the conversation, memory can only be written under ${groupDir}/. Something every conversation needs is for the owner to ask for in private.`;
+}
+export const MIXED_WRITE_REFUSAL =
+  "This turn's messages come from more than one chat, so nothing can be saved to memory from it. Save it on a turn from a single chat.";
+export const OTHER_GROUP_REFUSAL =
+  "That folder holds what another group chat saved; it is not available on this turn.";
 export const READ_ONLY_REFUSAL =
   "Memory is read-only here. Put what should be saved in your report; the main conversation decides what to keep.";
 
@@ -144,9 +162,15 @@ export class MemoryStore {
       || landsInPrivate(abs, { cwd: root, memoryDir: root, privateDir: join(root, PRIVATE_MEMORY_SUBDIR) }))) {
       throw new MemoryToolError(PRIVATE_BARRED_REFUSAL);
     }
+    if (mode === "write" && access.canWrite && access.privateBarred && access.groupDir === undefined) throw new MemoryToolError(MIXED_WRITE_REFUSAL);
+    if (access.privateBarred && isOtherGroupMemoryPath(rel, access.groupDir)) throw new MemoryToolError(OTHER_GROUP_REFUSAL);
     if (mode === "write") {
       if (!access.canWrite) throw new MemoryToolError(READ_ONLY_REFUSAL);
       if (isCoreMemoryPath(rel) && !access.canWriteCore) throw new MemoryToolError(CORE_WRITE_REFUSAL);
+      if (access.privateBarred) {
+        if (access.groupDir === undefined) throw new MemoryToolError(MIXED_WRITE_REFUSAL);
+        if (!isInsideMemoryFolder(rel, access.groupDir)) throw new MemoryToolError(groupWriteRefusal(access.groupDir));
+      }
     }
     // No symlink anywhere: each existing folder along the way, then the file.
     let dir = root;
@@ -278,6 +302,10 @@ export class MemoryStore {
     if (access.privateBarred && landsInPrivate(real, { cwd: root, memoryDir: root, privateDir: join(root, PRIVATE_MEMORY_SUBDIR) })) {
       throw new MemoryToolError(PRIVATE_BARRED_REFUSAL);
     }
+    // The real place, not the spelled one, inside the turn's own group folder.
+    if (access.privateBarred && (access.groupDir === undefined || !isInside(real, join(root, access.groupDir)))) {
+      throw new MemoryToolError(access.groupDir === undefined ? MIXED_WRITE_REFUSAL : groupWriteRefusal(access.groupDir));
+    }
   }
 
   private saved(rel: string, version: string, note?: string): string {
@@ -294,9 +322,10 @@ export class MemoryStore {
         throw new MemoryToolError(`${prefix} is not a folder inside memory/. Give it relative to memory/, e.g. "private/work/".`);
       }
       if (access.privateBarred && isPrivateMemoryPath(folder)) throw new MemoryToolError(PRIVATE_BARRED_REFUSAL);
+      if (access.privateBarred && isOtherGroupMemoryPath(folder, access.groupDir, true)) throw new MemoryToolError(OTHER_GROUP_REFUSAL);
     }
     const root = this.root();
-    const all = collectMemoryFiles({ memoryDir: root, excludePrivate: access.privateBarred, prefix: folder, includeUnlisted: true, now: this.now });
+    const all = collectMemoryFiles({ memoryDir: root, excludePrivate: access.privateBarred, ownGroupDir: access.groupDir, prefix: folder, includeUnlisted: true, now: this.now });
     // Without a folder: what the memory files list shows. With one: everything in it.
     const entries = folder ? all.entries : all.entries.filter((e) => e.listed);
     return { entries, truncated: all.truncated, unlisted: all.entries.length - entries.length };
@@ -342,6 +371,7 @@ export class MemoryStore {
     const all = collectMemoryFiles({
       memoryDir: this.root(),
       excludePrivate: access.privateBarred,
+      ownGroupDir: access.groupDir,
       includeUnlisted: true,
       includeCores: true,
       withContent: true,

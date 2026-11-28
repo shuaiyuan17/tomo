@@ -6,6 +6,7 @@ import { sdkForceSummarizer } from "./lcm/force-summarizer.js";
 import { ForceCompactor } from "./agent/force-compactor.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildIdentityPrompt, promptContextSnapshot } from "./workspace/index.js";
+import { groupMemoryDir } from "./workspace/memory-index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { TranscriptRecall } from "./sessions/store.js";
 import type { ReplyTarget, SessionMessage, UsageBaseline } from "./sessions/types.js";
@@ -1904,11 +1905,16 @@ export class Agent {
    * limits, by any route" is both the instruction we want and the honest
    * description.
    */
-  private summonReminder(targets: string[]): string {
+  private summonReminder(targets: string[], opts: { mixed?: boolean } = {}): string {
     const list = targets.map((t) => `"${t}"`).join(", ");
+    // Where this turn may save (the memory tools hold it to the same folder):
+    // a single group's own, or nowhere for a turn spanning several chats.
+    const save = targets.length === 1 && !opts.mixed
+      ? ` You can save to memory only under ${groupMemoryDir(targets[0])}/.`
+      : " This turn spans more than one chat, so nothing can be saved to memory from it.";
     return formatTomoEvent(
       "summon-reminder",
-      `Summoned-group message. To reply in the group, call send_message with mode "direct" and target ${list}. Plain text in this turn goes to your owner's private DM, not the group — reply NO_REPLY unless you have a private side-note for them. In the group, reply like a participant: short, in its tone, no headers, people by name when natural; chatter that isn't for you needs no group message. The owner's private context is off limits for this turn: private people records and private DM history are not yours to look up, quote or summarise here, by any route — the group is steering this turn.`,
+      `Summoned-group message. To reply in the group, call send_message with mode "direct" and target ${list}. Plain text in this turn goes to your owner's private DM, not the group — reply NO_REPLY unless you have a private side-note for them. In the group, reply like a participant: short, in its tone, no headers, people by name when natural; chatter that isn't for you needs no group message. The owner's private context is off limits for this turn: private people records and private DM history are not yours to look up, quote or summarise here, by any route — the group is steering this turn.${save}`,
     );
   }
 
@@ -2784,7 +2790,9 @@ export class Agent {
     const summonTargets = isDmSessionKey(key)
       ? [...new Set(items.filter((it) => it.message.isGroup).map((it) => `${it.channel.name}:${it.message.chatId}`))]
       : [];
-    const reminder = summonTargets.length > 0 ? `\n${this.summonReminder(summonTargets)}` : "";
+    const reminder = summonTargets.length > 0
+      ? `\n${this.summonReminder(summonTargets, { mixed: items.some((it) => !it.message.isGroup) })}`
+      : "";
     const audiences = items.map((it) => audienceOf(it.channel.name, it.message));
     const audienceBefore = this.lastAudiences.get(key);
     const switchNote = this.noteAudienceSwitch(key, audiences);

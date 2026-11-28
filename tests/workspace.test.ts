@@ -70,7 +70,8 @@ describe("buildSystemPrompt", () => {
   // byte-identical, and it must not carry the SDK boundary marker itself.
   it("tells a group session MEMORY.md is changed only in the owner's private conversation", () => {
     const group = buildSystemPrompt({ isGroup: true });
-    expect(group).toContain("MEMORY.md can be changed only in the owner's private conversation");
+    expect(group).toContain("save it in this chat's memory folder (Group Chat Context, below) before you reply");
+    expect(group).toContain("You can't write anywhere else in memory");
     expect(group).not.toContain("Add its pointer to MEMORY.md with memory_append");
     expect(defaultPrompt).toContain("Add its pointer to MEMORY.md with memory_append");
   });

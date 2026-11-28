@@ -5,7 +5,8 @@ import { HOME_SCENE_DIR, MEMORY_DIR, PRIVATE_MEMORY_DIR, PRIVATE_MEMORY_SUBDIR }
 import { sandboxedBashCommand } from "./bash-sandbox.js";
 import { MIXED_AUDIENCE_KEY } from "./audience.js";
 import { loadedSettingsFiles } from "./setting-sources.js";
-import { barredSearch, isHarnessDataAccess, isHomeWrite, isPrivateMemoryAccess, SEARCH_TOOLS, SEND_MESSAGE_TOOL } from "./private-memory-access.js";
+import { barredSearch, isHarnessDataAccess, isHomeWrite, isOtherGroupMemoryAccess, isPrivateMemoryAccess, otherGroupMemoryDirs, SEARCH_TOOLS, SEND_MESSAGE_TOOL } from "./private-memory-access.js";
+import { groupMemoryDir } from "../workspace/memory-index.js";
 export { barredSearch, isHarnessDataAccess, isHomeWrite, isPrivateMemoryAccess, SEARCH_TOOLS, SEND_MESSAGE_TOOL };
 import { join } from "node:path";
 import { landsInPrivate } from "./private-memory-reach.js";
@@ -90,6 +91,10 @@ export function harnessDataDenialReason(bar: PrivateMemoryBar): string {
 export function privateMemoryDenialReason(bar: PrivateMemoryBar): string {
   return bar === "group-session" ? PRIVATE_MEMORY_GROUP_DENIAL : PRIVATE_MEMORY_SUMMONED_DENIAL;
 }
+
+/** Denial text for a file-tool call into another group's memory folder on a barred turn. */
+export const OTHER_GROUP_MEMORY_DENIAL =
+  "That folder under `memory/groups/` holds what another group chat saved; it is not available on this turn. Searches over `memory/groups/` as a whole are refused for the same reason: point at this chat's own folder.";
 
 /**
  * Denial text for a write into Tomo's home on a barred turn. The home is the
@@ -300,6 +305,20 @@ export function privateMemoryGuardHooks(
                 hookEventName: "PreToolUse" as const,
                 permissionDecision: "deny" as const,
                 permissionDecisionReason: barredSearchDenialReason(reason),
+              },
+            };
+          }
+          // Other groups' memory folders, reads and writes: what one group
+          // saved is not another's to read.
+          const ownGroup = groupKeyFor(reason, sessionKey, scopedCallerKey);
+          const groupCtx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, otherGroupDirs: otherGroupMemoryDirs(MEMORY_DIR, ownGroup ? groupMemoryDir(ownGroup) : undefined) };
+          if (isOtherGroupMemoryAccess(input.tool_name, input.tool_input, groupCtx)) {
+            log.warn({ key: sessionKey, tool: input.tool_name, bar: reason }, "Blocked access to another group's memory folder");
+            return {
+              hookSpecificOutput: {
+                hookEventName: "PreToolUse" as const,
+                permissionDecision: "deny" as const,
+                permissionDecisionReason: OTHER_GROUP_MEMORY_DENIAL,
               },
             };
           }

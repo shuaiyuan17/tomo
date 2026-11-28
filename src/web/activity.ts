@@ -376,7 +376,7 @@ export function toolOutcome(name: string, output: string): ToolOutcome | undefin
       if (/^No match for /.test(text)) return count(0);
       const lines = text.split("\n");
       const hits = lines.filter((l) => /^\S.*:\d+: /.test(l));
-      return hits.length && lines.every((l) => /^\S.*:\d+: /.test(l) || /^\(stopped at /.test(l)) ? count(hits.length) : undefined;
+      return hits.length && lines.every((l) => /^\S.*:\d+: /.test(l) || /^\((?:stopped at|showing the best) /.test(l)) ? count(hits.length) : undefined;
     }
     case "list_sessions":
       return json(text) ? {} : undefined;

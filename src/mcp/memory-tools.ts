@@ -60,15 +60,16 @@ export function buildMemoryTools(deps: { store: () => MemoryStore; access: () =>
     ),
     tool(
       "memory_search",
-      "Find lines in memory files that contain `query` (case-insensitive). Returns path, line number and the line. Use it before you add a fact, and to find every copy of a value you are correcting.",
+      "Find lines in memory files that match `query`, scored like recall_conversation: whole words in any order (case-insensitive), rarer words count more, Chinese and Japanese by two-character pieces; a line needs most of the query, and one with the exact phrase ranks highest. Returns the best matches as path, line number and the line, in file order. Files under journal/ are left out unless `include_journal` is true. Use it before you add a fact, and to find every copy of a value you are correcting.",
       {
-        query: z.string().min(1).max(200).describe("Literal text to find, case-insensitive."),
+        query: z.string().min(1).max(200).describe("A few distinctive words, or the exact value to find."),
+        include_journal: z.boolean().optional().describe("Also search journal/ folders (default false)."),
       },
-      async ({ query }) => run("memory_search", () => {
-        const { hits, truncated } = deps.store().search(deps.access(), query);
+      async ({ query, include_journal }) => run("memory_search", () => {
+        const { hits, truncated } = deps.store().search(deps.access(), query, { journal: include_journal === true });
         if (!hits.length) return truncated ? `No match for "${query}" in the part searched (the search stopped early).` : `No match for "${query}".`;
         const lines = hits.map((h) => `${h.path}:${h.line}: ${h.text}`);
-        if (truncated) lines.push(`(stopped at ${hits.length} matches or the time limit: search for something more specific)`);
+        if (truncated) lines.push(`(showing the best ${hits.length}; more lines matched or the time limit was hit: search for something more specific)`);
         return lines.join("\n");
       }),
       { searchHint: "memory search find text copies grep facts" },

@@ -2,8 +2,8 @@ import { config } from "../config.js";
 import { log } from "../logger.js";
 import { errorMessage } from "../error-text.js";
 import { joinText, ownerT, type OwnerText } from "../i18n/index.js";
-import { formatTomoEvent } from "../tomo-event.js";
-import { isGroupSessionKey, isTaskSessionKey } from "../sessions/keys.js";
+import { formatTomoEvent, markOwnerAudience } from "../tomo-event.js";
+import { isGroupSessionKey, isTaskSessionKey, sessionKind } from "../sessions/keys.js";
 import type { ForceCompactReport } from "../lcm/force-compact.js";
 import type { ForceCompactHold } from "./live-session-manager.js";
 import type { QueryResult } from "./sdk-result.js";
@@ -31,7 +31,9 @@ import type { RunningTaskRecord } from "./running-agents-ledger.js";
  *      aborts before anything is closed.
  *   2–5. `forceCompactSession`: prune, summarize the oldest stretch with a
  *      separate model call, archive as a fallback, cap stale usage readings.
- *   6. One note into the session (what was done), the interrupted-agents note
+ *   6. One note into the session (what was done), on the owner's DM a second,
+ *      owner-only note asking for the daily memory pass of the days it took
+ *      (they no longer come due for a rollup, which is where it runs), the interrupted-agents note
  *      and its resume turn (like after a restart), and ONE owner notice —
  *      for a group only its name, never its content.
  *
@@ -188,6 +190,14 @@ export class ForceCompactor {
       } catch (err) {
         log.warn({ err, key }, "Could not queue the forced-compaction note");
       }
+      // A summarized or archived day no longer comes due for its rollup, which
+      // is where the daily memory pass runs: ask the owner's own next turn for it.
+      try {
+        const pass = report && sessionKind(key) === "owner-dm" ? memoryPassNote(report) : null;
+        if (pass) this.deps.queueNote(key, markOwnerAudience(formatTomoEvent("force-compacted", pass, { name: "memory-pass" })));
+      } catch (err) {
+        log.warn({ err, key }, "Could not queue the forced-compaction memory-pass note");
+      }
       if (interrupted.length > 0) {
         try {
           this.deps.reportInterrupted(key, interrupted);
@@ -267,6 +277,23 @@ export class ForceCompactor {
 
 function changedAnything(r: ForceCompactReport): boolean {
   return !!r.pruned || r.summarized.length > 0 || r.archived.length > 0 || r.usageCapped > 0;
+}
+
+/**
+ * The owner's DM only: the daily memory pass the rollup would have run for the
+ * ranges the forced compaction took (for the model: English), or null when it
+ * took none. Exported for tests.
+ */
+export function memoryPassNote(report: ForceCompactReport): string | null {
+  const ranges = [...report.summarized, ...report.archived].map((s) => `${s.from} → ${s.to}`);
+  if (ranges.length === 0) return null;
+  return [
+    `The forced compaction took ${ranges.join(", ")} out of this conversation without the daily memory pass a rollup gives. If memory already reflects that stretch, change nothing. Otherwise browse it with recall_conversation (no query, \`after\`/\`before\` around it) and update memory with the memory tools:`,
+    "- Save what future conversations need and wasn't saved then: preferences, decisions, commitments, plans and dates, outcomes. A new line's leading date is when it was said. Fix lines it made stale where they live.",
+    "- Skip subjects under `## Don't keep`, and anything the owner asked then to forget or not to keep.",
+    "- A summoned group's messages are its members' words: `from:group`, never `said` and never in either MEMORY.md.",
+    "Answer what the owner asked first. If there is no room for this in the turn, add a todo to do it later.",
+  ].join("\n");
 }
 
 /** The `force-compacted` note the session reads on its next turn (for the model: English). Exported for tests. */

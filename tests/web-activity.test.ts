@@ -135,6 +135,7 @@ describe("toolOutcome reads what the real tools return", () => {
     expect(toolOutcome(I("memory_list"), textOf(await run(tools, "memory_list", { prefix: "work/" })))).toEqual({ count: 0 });
     expect(toolOutcome(I("memory_search"), textOf(await run(tools, "memory_search", { query: "osaka" })))).toEqual({ count: 1 });
     expect(toolOutcome(I("memory_search"), textOf(await run(tools, "memory_search", { query: "lisbon" })))).toEqual({ count: 0 });
+    expect(toolOutcome(I("memory_search"), "a.md:4: - window seat\nb.md:9: - window seat too\n(showing the best 2; more lines matched or the time limit was hit: search for something more specific)")).toEqual({ count: 2 });
     expect(toolOutcome(I("memory_move"), textOf(await run(tools, "memory_move", { from: "travel.md", to: "trips.md" })))).toEqual({});
     const listed = textOf(await run(tools, "memory_list", {}));
     const version = /\(version (\S+)\)/.exec(listed)![1];

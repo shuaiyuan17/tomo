@@ -26,6 +26,7 @@ import {
 } from "../workspace/memory-index.js";
 import { isPrivateIndexLine, PRIVATE_MEMORY_SUBDIR } from "../workspace/private-memory.js";
 import { keepOldVersion, MEMORY_HISTORY_DAYS } from "./history.js";
+import { RecallScorer } from "../sessions/recall-score.js";
 
 /** A refusal the model should read: the message says what to do instead. */
 export class MemoryToolError extends Error {}
@@ -441,10 +442,17 @@ export class MemoryStore {
     return `${head}${note}\n\n${out.join("\n")}`;
   }
 
-  search(access: MemoryAccess, query: string): { hits: Array<{ path: string; line: number; text: string }>; truncated: boolean } {
-    const needle = query.trim().toLocaleLowerCase();
-    if (!needle) throw new MemoryToolError("memory_search needs a query.");
-    if (needle.length > 200) throw new MemoryToolError("The query is too long: search for a few distinctive words.");
+  /**
+   * Lines matching `query`, scored the way recall_conversation scores messages
+   * (`RecallScorer`: words in any order, rarer words weigh more, two-character
+   * pieces for Han and kana, a bonus for the exact phrase). The best
+   * `SEARCH_MAX_RESULTS` are kept and returned in file order, cores first.
+   * `journal/` folders are left out unless `opts.journal`.
+   */
+  search(access: MemoryAccess, query: string, opts: { journal?: boolean } = {}): { hits: Array<{ path: string; line: number; text: string }>; truncated: boolean } {
+    const phrase = query.trim();
+    if (!phrase) throw new MemoryToolError("memory_search needs a query.");
+    if (phrase.length > 200) throw new MemoryToolError("The query is too long: search for a few distinctive words.");
     const all = collectMemoryFiles({
       memoryDir: this.root(),
       excludePrivate: access.privateBarred,
@@ -457,24 +465,33 @@ export class MemoryStore {
       budgetMs: SEARCH_BUDGET_MS,
       now: this.now,
     });
+    const searched = opts.journal ? all.entries : all.entries.filter((e) => !isJournalMemoryPath(e.path));
     // The cores first: they are what every conversation holds.
-    const files = [...all.entries.filter((e) => isCoreMemoryPath(e.path)), ...all.entries.filter((e) => !isCoreMemoryPath(e.path))];
-    const hits: Array<{ path: string; line: number; text: string }> = [];
-    let truncated = all.truncated;
+    const files = [...searched.filter((e) => isCoreMemoryPath(e.path)), ...searched.filter((e) => !isCoreMemoryPath(e.path))];
+    const scorer = new RecallScorer<{ order: number; path: string; line: number; text: string }>([phrase]);
+    let order = 0;
     // The budget bounds the reading (collectMemoryFiles); what was read is always searched.
-    outer: for (const file of files) {
+    for (const file of files) {
       const lines = (file.content ?? Buffer.alloc(0)).toString("utf8").split("\n");
       const barredCore = access.privateBarred && isCoreMemoryPath(file.path);
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
-        const at = line.toLocaleLowerCase().indexOf(needle);
-        if (at < 0 || (barredCore && isPrivateIndexLine(line))) continue;
-        if (hits.length >= SEARCH_MAX_RESULTS) { truncated = true; break outer; }
-        const text = line.length <= 300 ? line : `${at > 80 ? "…" : ""}${line.slice(Math.max(0, at - 80), at + 220)}…`;
-        hits.push({ path: file.path, line: i + 1, text });
+        if (line.trim() === "" || (barredCore && isPrivateIndexLine(line))) continue;
+        scorer.observe({ order: order++, path: file.path, line: i + 1, text: line }, line);
       }
     }
-    return { hits, truncated };
+    // An earlier line counts as "newer", so a tie goes to the cores and the
+    // order returned is the reverse of file order; put it back.
+    const { hits, matched } = scorer.results(SEARCH_MAX_RESULTS, (a, b) => a.order - b.order);
+    const inOrder = hits.map((h) => ({ ...h.item, at: h.matchIndex })).sort((a, b) => a.order - b.order);
+    return {
+      hits: inOrder.map(({ path, line, text, at }) => ({
+        path,
+        line,
+        text: text.length <= 300 ? text : `${at > 80 ? "…" : ""}${text.slice(Math.max(0, at - 80), at + 220)}…`,
+      })),
+      truncated: all.truncated || matched > hits.length,
+    };
   }
 
   // --------------------------------------------------------------- writes

@@ -35,6 +35,13 @@ export { MEMORY_SOFT_LINES, MEMORY_SOFT_KB, MEMORY_HARD_LINES, MEMORY_HARD_KB };
 const KB = 1024;
 /** How much of each file the prompt's list reads: its frontmatter is at the top. */
 const LIST_HEAD_BYTES = 16 * 1024;
+/**
+ * The prompt list's scan time limit: far above a real tree's (about 25 ms
+ * for some 600 files, reading heads only), so a scan does not sit near it
+ * and flip between complete and cut off from one turn to the next (which
+ * would retire a live session for nothing).
+ */
+const LIST_SCAN_BUDGET_MS = 2000;
 
 /** Size of the index as the prompt holds it: its lines joined by newlines. */
 function indexBytes(lines: string[]): number {
@@ -276,7 +283,7 @@ function memoryFilesLines(withoutPrivate: boolean, strict = false): string[] {
     return renderMemoryFilesList([], { audience: withoutPrivate ? "shared" : "full" });
   }
   // Only the top of each file: the list needs the frontmatter, and a huge file must not stall the daemon.
-  const { entries, truncated, unreadableDirs } = collectMemoryFiles({ memoryDir: root, excludePrivate: withoutPrivate, reportUnreadable: true, headBytes: LIST_HEAD_BYTES });
+  const { entries, truncated, unreadableDirs } = collectMemoryFiles({ memoryDir: root, excludePrivate: withoutPrivate, reportUnreadable: true, headBytes: LIST_HEAD_BYTES, budgetMs: LIST_SCAN_BUDGET_MS });
   if (strict && (truncated || unreadableDirs.length > 0)) throw new Error("The memory files scan was incomplete");
   // A scan stopped by its time or file cap ends wherever the disk let it, a
   // different place each time: listing that part would differ from build to

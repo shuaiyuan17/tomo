@@ -6,6 +6,7 @@ import {
   collectMemoryFiles,
   LIST_BUDGET_KB,
   LIST_FOLD_FILES,
+  LIST_NOTE_MAX_BYTES,
   NO_TOPIC_FILES,
   renderMemoryFilesList,
   shortPath,
@@ -180,6 +181,12 @@ describe("the size cut", () => {
       expect(Buffer.byteLength([...lines, notice].join("\n"))).toBeLessThanOrEqual(LIST_BUDGET_KB * 1024);
     }
     expect(shortPath(`${deep}/`).length).toBeLessThanOrEqual(80);
+    // Multi-byte names: the widest path the notice may carry still fits the reserve.
+    const wide = `${"文件夹".repeat(40)}/`;
+    expect(Buffer.byteLength(`(${shortPath(wide)} could not be read just now)`)).toBeLessThanOrEqual(LIST_NOTE_MAX_BYTES);
+    const wideEntries = Array.from({ length: 80 }, (_, i) => entry(`private/${"名".repeat(20)}-${String(i).padStart(2, "0")}.md`, "说".repeat(60)));
+    const lines = renderMemoryFilesList(wideEntries, { audience: "full" });
+    expect(Buffer.byteLength([...lines, `(${shortPath(wide)} could not be read just now)`].join("\n"))).toBeLessThanOrEqual(LIST_BUDGET_KB * 1024);
   });
 
   it("an install with 600 files stays inside the budget", () => {

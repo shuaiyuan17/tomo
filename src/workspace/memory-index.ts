@@ -365,8 +365,8 @@ export interface MemoryFilesListOptions {
   groupLabel?: (dir: string) => string | undefined;
 }
 
-/** The most a line after the list (the cut, a notice) takes: its path is shortened to fit. */
-export const LIST_NOTE_MAX_BYTES = 300;
+/** The most a line after the list (the cut, a notice) takes: a shortened path (80 code points, 4 bytes each at most) and its words. */
+export const LIST_NOTE_MAX_BYTES = 80 * 4 + 120;
 
 /** A path for a notice line: at most 80 code points (4 bytes each at most), the end kept. */
 export function shortPath(path: string): string {

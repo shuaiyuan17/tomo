@@ -8,7 +8,8 @@ vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js"
 import { randomUUID } from "node:crypto";
 import { Agent, MockChannel, installAgentTestHooks, makeMsg, mockConfig, mockSdk, peekPendingNotes, resetConfig, waitFor } from "./helpers/agent-harness.js";
 import { formatTomoEvent } from "../src/tomo-event.js";
-import { MESSAGE_WAKE_RETRY_MS } from "../src/agent.js";
+import { MESSAGE_WAKE_RETRY_BASE_MS, MESSAGE_WAKE_RETRY_CAP_MS } from "../src/agent.js";
+import type { BackoffTimers } from "../src/agent/keyed-backoff.js";
 
 installAgentTestHooks();
 
@@ -33,6 +34,23 @@ async function boot(): Promise<{ agent: Agent; channel: MockChannel }> {
 
 const prompts = (key: string) => mockSdk.promptsBySession.filter((p) => p.sessionKey === key).map((p) => p.text);
 const messageNotes = (agent: Agent, key: string) => peekPendingNotes(agent, key).filter((n) => n.includes('<tomo-event type="subsession-message"'));
+
+type RetryInternals = {
+  processContinuity: (...args: unknown[]) => Promise<unknown>;
+  subsessions: { deps: { queuePendingNote(k: string, n: string): boolean; messageWake(k: string): void } };
+  messageWakeRetry: { timerApi: BackoffTimers };
+};
+const retryInternals = (agent: Agent) => agent as unknown as RetryInternals;
+
+/** The message wake's retry timers, held for the test to fire (nothing fires by itself). */
+function interceptRetryTimers(agent: Agent): Array<{ fn: () => void; ms: number; cleared: boolean }> {
+  const timers: Array<{ fn: () => void; ms: number; cleared: boolean }> = [];
+  retryInternals(agent).messageWakeRetry.timerApi = {
+    set: (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); return t; },
+    clear: (handle) => { (handle as { cleared: boolean }).cleared = true; },
+  };
+  return timers;
+}
 
 describe("via-main through the Agent", () => {
   it("task_ask: the main session gets the question in a silent turn, nothing reaches the owner's chat, and task_message with the answer resumes the task", async () => {
@@ -157,28 +175,105 @@ describe("via-main through the Agent", () => {
   it("a message wake whose turn failed is tried again, so an idle main session still reads the note", async () => {
     const { agent } = await boot();
     mockSdk.responseFn = () => "NO_REPLY";
-    const internals = agent as unknown as {
-      processContinuity: (...args: unknown[]) => Promise<unknown>;
-      subsessions: { deps: { queuePendingNote(k: string, n: string): boolean; messageWake(k: string): void } };
-    };
-    const retries: Array<() => void> = [];
-    const realSetTimeout = globalThis.setTimeout;
-    const timers = vi.spyOn(globalThis, "setTimeout").mockImplementation(((fn: () => void, ms?: number, ...rest: unknown[]) => {
-      if (ms === MESSAGE_WAKE_RETRY_MS) { retries.push(fn); return { unref() {} } as unknown as NodeJS.Timeout; }
-      return realSetTimeout(fn, ms, ...rest);
-    }) as typeof setTimeout);
+    const internals = retryInternals(agent);
+    const retries = interceptRetryTimers(agent);
     const turn = vi.spyOn(internals, "processContinuity").mockRejectedValueOnce(new Error("API down"));
     internals.subsessions.deps.queuePendingNote("dm:alex", formatTomoEvent("subsession-message", "RETRY-ME", { name: "s1:notify:x" }));
     internals.subsessions.deps.messageWake("dm:alex");
     await waitFor(() => expect(retries).toHaveLength(1));
+    expect(retries[0].ms).toBe(MESSAGE_WAKE_RETRY_BASE_MS);
     expect(prompts("dm:alex").some((p) => p.includes("RETRY-ME"))).toBe(false);
-    retries[0]();
+    retries[0].fn();
     await waitFor(() => expect(prompts("dm:alex").some((p) => p.includes("RETRY-ME"))).toBe(true));
     expect(turn).toHaveBeenCalledTimes(2);
     // Read now: no further retry.
     await waitFor(() => expect(messageNotes(agent, "dm:alex")).toEqual([]));
     expect(retries).toHaveLength(1);
-    timers.mockRestore();
     await agent.stop();
+  });
+
+  it("keeps retrying past five failed turns, doubling the delay up to the cap", async () => {
+    const { agent } = await boot();
+    mockSdk.responseFn = () => "NO_REPLY";
+    const internals = retryInternals(agent);
+    const retries = interceptRetryTimers(agent);
+    const failures = 8;
+    const turn = vi.spyOn(internals, "processContinuity");
+    for (let i = 0; i < failures; i++) turn.mockRejectedValueOnce(new Error("API down"));
+    internals.subsessions.deps.queuePendingNote("dm:alex", formatTomoEvent("subsession-message", "PERSIST", { name: "s1:notify:p" }));
+    internals.subsessions.deps.messageWake("dm:alex");
+    for (let i = 1; i < failures; i++) {
+      await waitFor(() => expect(retries).toHaveLength(i));
+      retries[i - 1].fn();
+    }
+    await waitFor(() => expect(retries).toHaveLength(failures));
+    const base = MESSAGE_WAKE_RETRY_BASE_MS;
+    const cap = MESSAGE_WAKE_RETRY_CAP_MS;
+    expect(retries.map((r) => r.ms)).toEqual([base, 2 * base, 4 * base, 8 * base, 16 * base, cap, cap, cap]);
+    // The ninth turn reads it; nothing more is scheduled.
+    retries[failures - 1].fn();
+    await waitFor(() => expect(messageNotes(agent, "dm:alex")).toEqual([]));
+    expect(turn).toHaveBeenCalledTimes(failures + 1);
+    expect(prompts("dm:alex").some((p) => p.includes("PERSIST"))).toBe(true);
+    expect(retries).toHaveLength(failures);
+    await agent.stop();
+  });
+
+  it("keeps one retry timer per session when a second wake fails while one is pending", async () => {
+    const { agent } = await boot();
+    mockSdk.responseFn = () => "NO_REPLY";
+    const internals = retryInternals(agent);
+    const retries = interceptRetryTimers(agent);
+    const turn = vi.spyOn(internals, "processContinuity").mockRejectedValueOnce(new Error("API down")).mockRejectedValueOnce(new Error("API down"));
+    internals.subsessions.deps.queuePendingNote("dm:alex", formatTomoEvent("subsession-message", "ONE", { name: "s1:notify:1" }));
+    internals.subsessions.deps.messageWake("dm:alex");
+    await waitFor(() => expect(retries).toHaveLength(1));
+    // Another note's wake fails too while the retry is pending.
+    internals.subsessions.deps.queuePendingNote("dm:alex", formatTomoEvent("subsession-message", "TWO", { name: "s1:notify:2" }));
+    internals.subsessions.deps.messageWake("dm:alex");
+    await waitFor(() => expect(turn).toHaveBeenCalledTimes(2));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(retries).toHaveLength(1);
+    retries[0].fn();
+    await waitFor(() => expect(messageNotes(agent, "dm:alex")).toEqual([]));
+    expect(retries).toHaveLength(1);
+    await agent.stop();
+  });
+
+  it("starts from the base delay again once the note has been read", async () => {
+    const { agent } = await boot();
+    mockSdk.responseFn = () => "NO_REPLY";
+    const internals = retryInternals(agent);
+    const retries = interceptRetryTimers(agent);
+    const turn = vi.spyOn(internals, "processContinuity").mockRejectedValueOnce(new Error("API down")).mockRejectedValueOnce(new Error("API down"));
+    internals.subsessions.deps.queuePendingNote("dm:alex", formatTomoEvent("subsession-message", "FIRST", { name: "s1:notify:a" }));
+    internals.subsessions.deps.messageWake("dm:alex");
+    await waitFor(() => expect(retries).toHaveLength(1));
+    retries[0].fn();
+    await waitFor(() => expect(retries).toHaveLength(2));
+    expect(retries[1].ms).toBe(2 * MESSAGE_WAKE_RETRY_BASE_MS);
+    retries[1].fn();
+    await waitFor(() => expect(messageNotes(agent, "dm:alex")).toEqual([]));
+    // A later note whose wake fails waits the base again.
+    turn.mockRejectedValueOnce(new Error("API down"));
+    internals.subsessions.deps.queuePendingNote("dm:alex", formatTomoEvent("subsession-message", "SECOND", { name: "s1:notify:b" }));
+    internals.subsessions.deps.messageWake("dm:alex");
+    await waitFor(() => expect(retries).toHaveLength(3));
+    expect(retries[2].ms).toBe(MESSAGE_WAKE_RETRY_BASE_MS);
+    await agent.stop();
+  });
+
+  it("stop() drops a pending retry timer", async () => {
+    const { agent } = await boot();
+    mockSdk.responseFn = () => "NO_REPLY";
+    const internals = retryInternals(agent);
+    const retries = interceptRetryTimers(agent);
+    vi.spyOn(internals, "processContinuity").mockRejectedValueOnce(new Error("API down"));
+    internals.subsessions.deps.queuePendingNote("dm:alex", formatTomoEvent("subsession-message", "STOPPED", { name: "s1:notify:s" }));
+    internals.subsessions.deps.messageWake("dm:alex");
+    await waitFor(() => expect(retries).toHaveLength(1));
+    expect(retries[0].cleared).toBe(false);
+    await agent.stop();
+    expect(retries[0].cleared).toBe(true);
   });
 });

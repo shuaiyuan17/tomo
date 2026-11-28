@@ -1,4 +1,5 @@
 // PreToolUse guard: Markdown under memory/ is written by the memory tools only.
+import { statSync } from "node:fs";
 import { isAbsolute, join, relative, resolve as pathResolve } from "node:path";
 import { log } from "../logger.js";
 import { abs, bashTokens, foldPath, isInside, pathCandidates, realResolve } from "./permission-paths.js";
@@ -77,7 +78,18 @@ function containsMemory(p: string, ctx: Ctx): boolean {
 }
 
 const isMarkdown = (p: string): boolean => /\.md$/i.test(p.replace(/\/+$/, ""));
-const inIncoming = (rel: string): boolean => rel.split("/")[0].startsWith("incoming-");
+/** Inside an attachment folder (`incoming-files/...`): a folder, so a root-level `incoming-x.md` note doesn't count. */
+const inIncoming = (rel: string): boolean => rel.includes("/") && rel.split("/")[0].startsWith("incoming-");
+/** Is `p` an existing folder (following links)? */
+function isDir(p: string, cwd: string): boolean {
+  try { return statSync(abs(expandTilde(p), cwd)).isDirectory(); } catch { return false; }
+}
+/** Could `p` be a folder: one that exists, or a name with no extension. */
+function maybeDir(p: string, cwd: string): boolean {
+  if (isDir(p, cwd)) return true;
+  const last = p.replace(/\/+$/, "").split("/").pop() ?? "";
+  return !last.includes(".");
+}
 
 /** A memory note this path names: a `.md` under memory/, outside the attachment folders. */
 function isMemoryNote(p: string, ctx: Ctx): string | undefined {
@@ -91,8 +103,8 @@ function isMemoryNote(p: string, ctx: Ctx): string | undefined {
 function isMemoryTree(p: string, ctx: Ctx): string | undefined {
   if (containsMemory(p, ctx)) return p;
   const rel = underMemory(p, ctx);
-  if (rel === undefined || inIncoming(rel)) return undefined;
-  return isMarkdown(p) ? p : (rel.split("/").pop()?.includes(".") ? undefined : p);
+  if (rel === undefined || inIncoming(rel) || rel.split("/")[0].startsWith("incoming-")) return undefined;
+  return isMarkdown(p) || maybeDir(p, ctx.cwd) ? p : undefined;
 }
 
 /**
@@ -121,7 +133,7 @@ function bashMemoryWrite(command: string, ctx: Ctx): string | null {
       continue;
     }
     const here = { cwd, memoryDir: ctx.memoryDir };
-    for (const t of redirectTargets(segment)) {
+    for (const t of [...redirectTargets(segment), ...quotedRedirectTargets(segment)]) {
       const hit = isMemoryNote(t, here);
       if (hit) return hit;
     }
@@ -129,7 +141,8 @@ function bashMemoryWrite(command: string, ctx: Ctx): string | null {
     const verb = at === -1 ? null : writerAt(tokens, at);
     if (!verb) continue;
     const args = tokens.slice(at + 1);
-    const operands = args.flatMap((word) => pathCandidates(word)).filter((w) => !w.startsWith("-"));
+    // A quoted operand may hold spaces the word split broke apart: judge it whole as well.
+    const operands = [...args.flatMap((word) => pathCandidates(word)), ...quotedStrings(segment)].filter((w) => !w.startsWith("-"));
     if (verb === "dd") {
       for (const of of args.filter((w) => w.startsWith("of=")).map((w) => w.slice(3))) {
         const hit = isMemoryNote(of, here);
@@ -143,7 +156,7 @@ function bashMemoryWrite(command: string, ctx: Ctx): string | null {
       const dest = t !== -1 && args[t + 1] !== undefined ? args[t + 1] : operands[operands.length - 1];
       const sources = t !== -1 ? operands.filter((o) => o !== dest) : operands.slice(0, -1);
       if (dest === undefined) continue;
-      const hit = isMemoryNote(dest, here) ?? (sources.some(isMarkdown) ? intoMemoryFolder(dest, here) : undefined);
+      const hit = isMemoryNote(dest, here) ?? (sources.some((src) => isMarkdown(src) || maybeDir(src, cwd)) ? intoMemoryFolder(dest, here) : undefined);
       if (hit) return hit;
       continue;
     }
@@ -156,7 +169,7 @@ function bashMemoryWrite(command: string, ctx: Ctx): string | null {
         if (hit) return hit;
       }
       if (dest !== undefined) {
-        const hit = isMemoryNote(dest, here) ?? (sources.some(isMarkdown) ? intoMemoryFolder(dest, here) : undefined);
+        const hit = isMemoryNote(dest, here) ?? (sources.some((src) => isMarkdown(src) || maybeDir(src, cwd)) ? intoMemoryFolder(dest, here) : undefined);
         if (hit) return hit;
       }
       continue;
@@ -167,6 +180,16 @@ function bashMemoryWrite(command: string, ctx: Ctx): string | null {
     }
   }
   return null;
+}
+
+/** Quoted strings in a segment, whole (spaces kept). */
+function quotedStrings(segment: string): string[] {
+  return [...segment.matchAll(/"([^"]+)"|'([^']+)'/g)].map((m) => m[1] ?? m[2]);
+}
+
+/** `> "a b.md"`: a quoted redirection target, which the word-based reading cuts at the space. */
+function quotedRedirectTargets(segment: string): string[] {
+  return [...segment.matchAll(/>>?\s*(?:"([^"]+)"|'([^']+)')/g)].map((m) => m[1] ?? m[2]);
 }
 
 /** A folder under memory/ (not an attachment folder) a `.md` is copied or moved into. */

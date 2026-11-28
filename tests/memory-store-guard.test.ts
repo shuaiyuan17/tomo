@@ -11,6 +11,7 @@ const tree = vi.hoisted(() => {
   mkdirSync(join(ws, "memory", "private", "journal"), { recursive: true });
   mkdirSync(join(ws, "memory", "incoming-files"), { recursive: true });
   mkdirSync(join(ws, "memory", "notes"), { recursive: true });
+  mkdirSync(join(ws, "memory", "project.v2"), { recursive: true });
   process.env.HOME = home;
   return { home, ws, mem: join(ws, "memory") };
 });
@@ -45,6 +46,7 @@ describe("memory-store guard: file tools", () => {
     ["Edit", { file_path: `${tree.mem}/Notes/X.MD` }],
     ["Write", { file_path: `${tree.mem}/people/kevin.md` }],
     ["Write", { file_path: "memory/../memory/x.md" }],
+    ["Write", { file_path: `${tree.mem}/incoming-summary.md` }],
   ])("%s %j is refused", (tool, input) => {
     expect(hits(tool, input)).toBe(true);
   });
@@ -85,6 +87,12 @@ describe("memory-store guard: Bash", () => {
     "touch memory/new.md",
     "cd memory && echo x > a.md",
     "cd ~/.tomo/workspace/memory/private && cat >> journal/d.md <<EOF\nx\nEOF",
+    'printf x > "memory/trip notes.md"',
+    "rm 'memory/trip notes.md'",
+    "cp -R /tmp/notes memory/",
+    "mv /tmp/notes memory/notes",
+    "rm -rf memory/project.v2",
+    "echo x > memory/incoming-summary.md",
   ])("refuses %j", (command) => {
     expect(bash(command)).toBe(true);
   });

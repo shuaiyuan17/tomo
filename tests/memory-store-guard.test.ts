@@ -12,6 +12,7 @@ const tree = vi.hoisted(() => {
   mkdirSync(join(ws, "memory", "incoming-files"), { recursive: true });
   mkdirSync(join(ws, "memory", "notes"), { recursive: true });
   mkdirSync(join(ws, "memory", "project.v2"), { recursive: true });
+  process.getBuiltinModule("node:fs").writeFileSync(join(home, "LICENSE"), "MIT");
   process.env.HOME = home;
   return { home, ws, mem: join(ws, "memory") };
 });
@@ -96,6 +97,9 @@ describe("memory-store guard: Bash", () => {
     'cp "/tmp/draft.md" memory/note.md',
     "rm memory/incoming-summary.md",
     "mv memory/incoming-summary.md /tmp/",
+    "rm memory/trip\\ notes.md",
+    "printf x > memory/trip\\ notes.md",
+    "rm 2>&1 memory/note.md",
   ])("refuses %j", (command) => {
     expect(bash(command)).toBe(true);
   });
@@ -113,6 +117,7 @@ describe("memory-store guard: Bash", () => {
     'cp "memory/note.md" /tmp/note.md',
     "cp /tmp/report.md memory/incoming-files/",
     "mv /tmp/report.md memory/incoming-files/",
+    `cp ${tree.home}/LICENSE memory/`,
   ])("lets %j through", (command) => {
     expect(bash(command)).toBe(false);
   });

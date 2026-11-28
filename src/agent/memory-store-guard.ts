@@ -92,7 +92,7 @@ function isDir(p: string, cwd: string): boolean {
 }
 /** Could `p` be a folder: one that exists, or a name with no extension. */
 function maybeDir(p: string, cwd: string): boolean {
-  if (isDir(p, cwd)) return true;
+  try { return statSync(abs(expandTilde(p), cwd)).isDirectory(); } catch { /* doesn't exist: judge the name */ }
   const last = p.replace(/\/+$/, "").split("/").pop() ?? "";
   return !last.includes(".");
 }
@@ -199,11 +199,14 @@ function shellWords(segment: string): string[] {
   let cur = "";
   let has = false;
   let quote: string | null = null;
+  let escaped = false;
   for (const ch of segment) {
     if (quote) {
       if (ch === quote) quote = null; else cur += ch;
       continue;
     }
+    if (escaped) { cur += ch; escaped = false; continue; }
+    if (ch === "\\") { escaped = true; continue; }
     if (ch === "'" || ch === "\"") { quote = ch; has = true; continue; }
     if (/\s/.test(ch)) { if (has || cur) words.push(cur); cur = ""; has = false; continue; }
     cur += ch;
@@ -212,16 +215,22 @@ function shellWords(segment: string): string[] {
   const out: string[] = [];
   for (let i = 0; i < words.length; i++) {
     const w = words[i];
-    if (/^\d*(>>?|<<?-?)(&\d+)?$/.test(w)) { i++; continue; }
+    if (/^\d*(>>?|<<?-?)&(\d+|-)$/.test(w)) continue; // 2>&1: complete in itself
+    if (/^\d*(>>?|<<?-?|&>>?)$/.test(w)) { i++; continue; } // its target is the next word
     if (/^\d*(>>?|<<?-?)/.test(w)) continue;
     out.push(w);
   }
   return out;
 }
 
-/** `> "a b.md"`: a quoted redirection target, which the word-based reading cuts at the space. */
+/**
+ * `> "a b.md"`, `> a\\ b.md`: a redirection target with a quoted or escaped
+ * space, which the word-based reading cuts at the space.
+ */
 function quotedRedirectTargets(segment: string): string[] {
-  return [...segment.matchAll(/>>?\s*(?:"([^"]+)"|'([^']+)')/g)].map((m) => m[1] ?? m[2]);
+  const quoted = [...segment.matchAll(/>>?\s*(?:"([^"]+)"|'([^']+)')/g)].map((m) => m[1] ?? m[2]);
+  const escaped = [...segment.matchAll(/>>?\s*((?:\\.|[^\s;|&<>"'])+)/g)].map((m) => m[1].replace(/\\(.)/g, "$1"));
+  return [...quoted, ...escaped];
 }
 
 /** A folder under memory/ (not an attachment folder) a `.md` is copied or moved into. */

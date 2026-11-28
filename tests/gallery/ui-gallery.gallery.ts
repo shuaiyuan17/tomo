@@ -33,6 +33,7 @@ import { formatReactionMarker } from "../../src/channels/text-utils.js";
 import { WebSupervisor } from "../../src/web/supervisor.js";
 import { watchBus } from "../../src/watch/bus.js";
 import { CronStore } from "../../src/cron/store.js";
+import { editJobs } from "../helpers/cron.js";
 import { TodoStore } from "../../src/todos/store.js";
 import { DEFAULT_TODOS } from "../../src/todos/limits.js";
 import { HomeService } from "../../src/home/service.js";
@@ -177,8 +178,8 @@ function seedWorkspace(store: SessionStore): string {
   todo(0.5, { title: "Pick December's book", next: "Post the poll with the three finalists", waiting_on: "me", review_in: "2d", session: "telegram:-2" });
   todo(2, { title: "Upstream fix for the calendar sync bug", next: "Watch the issue; upgrade once a release ships", waiting_on: "external", review_in: "14d", ref: "example/calendar-sync#1203" });
 
-  const cronPath = resolve(mockConfig.tomoHome, "data", "cron", "jobs.json");
-  mkdirSync(resolve(cronPath, ".."), { recursive: true });
+  // Cron lives in Tomo's database (cron_jobs) since #670.
+  const cronPath = mockConfig.dbPath;
   const cron = new CronStore(cronPath);
   cron.add({ name: "Morning brief", schedule: { kind: "cron", expr: "30 8 * * *" }, message: "Send the morning brief", sessionKey: "dm:owner" });
   cron.add({ name: "Water the seedlings — check the soil moisture in all three beds first", schedule: { kind: "every", everyMs: 3 * 3_600_000 }, message: "Remind me to water", sessionKey: "dm:owner" });
@@ -186,16 +187,15 @@ function seedWorkspace(store: SessionStore): string {
   cron.add({ name: "Book club poll", schedule: { kind: "cron", expr: "0 18 * * 5" }, message: "Post poll", sessionKey: "telegram:-2" });
   cron.add({ name: "Parked one-shot", schedule: { kind: "at", at: "1h" }, message: "Was interrupted", sessionKey: "dm:owner", deleteAfterRun: true });
   // Pin the times to BASE (the store computed them from the real clock), and park and pause two.
-  const file = JSON.parse(readFileSync(cronPath, "utf8")) as { jobs?: Record<string, unknown>[] } | Record<string, unknown>[];
-  const jobs = Array.isArray(file) ? file : file.jobs ?? [];
-  const byName = (name: string) => jobs.find((j) => j.name === name) ?? {};
-  for (const job of jobs) { if (typeof job.createdAt === "number") job.createdAt = BASE - 7 * 86_400_000; }
-  Object.assign(byName("Morning brief"), { nextRunAt: Date.UTC(2026, 10, 15, 16, 30) });
-  Object.assign(byName("Water the seedlings — check the soil moisture in all three beds first"), { nextRunAt: BASE + 3 * 3_600_000 });
-  Object.assign(byName("Dentist reminder"), { nextRunAt: BASE + 2 * 3_600_000, schedule: { kind: "at", at: new Date(BASE + 2 * 3_600_000).toISOString() } });
-  Object.assign(byName("Book club poll"), { enabled: false, nextRunAt: Date.UTC(2026, 10, 21, 2, 0) });
-  Object.assign(byName("Parked one-shot"), { enabled: false, lastStatus: "interrupted", lastRunAt: BASE - 3_600_000, interruptedAt: BASE - 3_600_000, nextRunAt: null });
-  writeFileSync(cronPath, JSON.stringify(file, null, 2));
+  editJobs(cronPath, (jobs) => {
+    const byName = (name: string) => jobs.find((j) => j.name === name) ?? {};
+    for (const job of jobs) { if (typeof job.createdAt === "number") job.createdAt = BASE - 7 * 86_400_000; }
+    Object.assign(byName("Morning brief"), { nextRunAt: Date.UTC(2026, 10, 15, 16, 30) });
+    Object.assign(byName("Water the seedlings — check the soil moisture in all three beds first"), { nextRunAt: BASE + 3 * 3_600_000 });
+    Object.assign(byName("Dentist reminder"), { nextRunAt: BASE + 2 * 3_600_000, schedule: { kind: "at", at: new Date(BASE + 2 * 3_600_000).toISOString() } });
+    Object.assign(byName("Book club poll"), { enabled: false, nextRunAt: Date.UTC(2026, 10, 21, 2, 0) });
+    Object.assign(byName("Parked one-shot"), { enabled: false, lastStatus: "interrupted", lastRunAt: BASE - 3_600_000, interruptedAt: BASE - 3_600_000, nextRunAt: null });
+  });
   // The Study's Cost tab: ten weeks of ledger and a quota sample (the server's own clock decides "today").
   seedCostLedger(mockConfig.tomoHome);
   return cronPath;

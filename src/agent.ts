@@ -9,6 +9,7 @@ import { buildIdentityPrompt, promptContextSnapshot, setMemoryGroupLabels } from
 import { groupMemoryDir } from "./workspace/memory-index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { TranscriptRecall } from "./sessions/store.js";
+import type { RecallGroupSource } from "./mcp/recall-tools.js";
 import type { ReplyTarget, SessionMessage, UsageBaseline } from "./sessions/types.js";
 import {
   isGroupSessionKey,
@@ -3392,9 +3393,55 @@ export class Agent {
    *  the caller's session key like `searchSessionTranscript`. */
   recallSessionTranscript(
     sessionKey: string,
-    opts: { queries: string[]; fromTime?: number; toTime?: number; limit?: number },
+    opts: { queries: string[]; fromTime?: number; toTime?: number; limit?: number; budget?: { maxMs: number; maxBytes: number } },
   ): TranscriptRecall {
     return this.sessions.recallTranscript(sessionKey, opts);
+  }
+
+  /**
+   * May the turn in flight on `sessionKey` search the group chats too
+   * (recall_conversation `scope: "all"`)? Only the owner's own private turn
+   * on their DM session, running on the FULL prompt.
+   *
+   * The same reading the prompt-variant dispatch makes (`promptVariantFor`),
+   * not a second one: a turn that needs the shared prompt (a summoned
+   * group's, a mixed batch, a group's delegate, cron job or restart notice,
+   * and the owner's own turns while a group is summoned in) is one a group can
+   * read, and group chat history must not be pulled into it. On top of that
+   * the live session must actually HAVE the full prompt: a session built on
+   * the shared one is one a group has been, or is about to be, reading, and a
+   * session whose variant is unknown fails closed.
+   */
+  canRecallGroupChats(sessionKey: string): boolean {
+    if (!config.owner || sessionKey !== ownerSessionKey(config.owner)) return false;
+    // Also false for a turn that is not the owner's alone: that one is
+    // `required` to be shared.
+    if (this.promptVariantFor(sessionKey).shared) return false;
+    return this.liveSessionManager.hasSharedPrompt(sessionKey) === false;
+  }
+
+  /** The group chats a `scope: "all"` recall reads: every group session the
+   *  registry knows, once each, with its latest chat title. From the session
+   *  registry (re-read only when its file changed), not the transcripts: no
+   *  transcript is listed or sized to find the groups. */
+  groupRecallSources(): RecallGroupSource[] {
+    const titles = new Map<string, string | undefined>();
+    for (const entry of this.sessions.listAllSessions()) {
+      const key = entry.channelKey;
+      if (!isGroupSessionKey(key)) continue;
+      if (!titles.has(key) || entry.chatTitle) titles.set(key, entry.chatTitle ?? titles.get(key));
+    }
+    return [...titles].map(([key, title]) => ({ key, ...(title ? { title } : {}) }));
+  }
+
+  /** Scored recall of one GROUP's transcript, for a `scope: "all"` search.
+   *  Anything that is not a group session key reads nothing. */
+  recallGroupTranscript(
+    groupKey: string,
+    opts: { queries: string[]; fromTime?: number; toTime?: number; limit?: number; budget?: { maxMs: number; maxBytes: number } },
+  ): TranscriptRecall {
+    if (!isGroupSessionKey(groupKey)) return { hits: [], matched: 0, scanned: 0 };
+    return this.sessions.recallTranscript(groupKey, opts);
   }
 
   private recordLatestInboundMessage(sessionKey: string, channel: Channel, message: IncomingMessage): void {

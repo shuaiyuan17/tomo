@@ -218,6 +218,8 @@ export interface TranscriptRecall {
    * time order).
    */
   stopped?: { reason: "time" | "bytes"; reachedBackTo: number | null };
+  /** Bytes the scan read, probes included: what it spent of `maxBytes`. */
+  bytesRead?: number;
 }
 
 /** What identifies one published version of the registry file. */
@@ -920,6 +922,7 @@ export class SessionStore {
       scanned,
       ...(scorer.clippedMessages > 0 ? { clipped: scorer.clippedMessages } : {}),
       ...(stopped ? { stopped } : {}),
+      bytesRead: progress.bytesRead,
     };
   }
 

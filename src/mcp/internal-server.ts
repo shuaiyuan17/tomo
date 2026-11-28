@@ -378,6 +378,17 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           type: "recall", sessionKey: callerSessionKey, matched, stopped,
         }),
         canSearch: isOwnAudience,
+        // scope "all" (this conversation and every group chat): the owner's
+        // DM session only, and there only on a turn that is the owner's alone
+        // and runs on the full prompt (Agent.canRecallGroupChats). One way:
+        // no session gets a way to search the owner's DM from elsewhere.
+        ...(ownerSession ? {
+          scopeAll: {
+            allowed: () => agent.canRecallGroupChats(callerSessionKey),
+            groups: () => agent.groupRecallSources(),
+            recallGroup: (key: string, opts: Parameters<Agent["recallGroupTranscript"]>[1]) => agent.recallGroupTranscript(key, opts),
+          },
+        } : {}),
       }),
       // Tomo's home: the owner's DM session only (a group never gets the
       // tool), and even there refused while a summoned group steers the turn.

@@ -2544,7 +2544,10 @@ describe("LiveSessionManager prompt variants (the dm: session's full and shared 
       sent.push({ prompt, session, steered: false });
       return "ok";
     };
-    await expect(manager.runWithRetry({ key: "dm:owner", prompt: "group 2" })).rejects.toBeInstanceOf(SharedPromptUnavailableError);
+    // The original session error, not a refusal: the first attempt may have reached the model.
+    const err = await manager.runWithRetry({ key: "dm:owner", prompt: "group 2" }).then(() => undefined, (e: unknown) => e);
+    expect(err).not.toBeInstanceOf(SharedPromptUnavailableError);
+    expect((err as Error).message).toBe("Session is closed");
     expect(builtShared()).toEqual([true, false]);
     expect(sent.map((s) => s.prompt)).toEqual(["group 1"]);
   });

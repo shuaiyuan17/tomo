@@ -1428,7 +1428,7 @@ export class Agent {
     }
     // Provider batching never steers into a live web turn (canSteerIntoSession).
     // Web must stay out of the batch path: handleBatchedMessages writes no
-    // web requestId and ignores userRecorded (see appendInboundUser).
+    // web requestId (see appendInboundUser).
     const canCoalesce = (!isGroup || isPassiveGroup) && channel.name !== "web";
 
     if (!canCoalesce) {
@@ -1994,22 +1994,24 @@ export class Agent {
 
   /**
    * The busy line to `tellGroups`, and one owner notice naming `groups`.
-   * True when at least one of them was delivered.
+   * True when the owner notice was delivered, or the line reached every one
+   * of `tellGroups`.
    */
   private async tellSharedPromptUnavailable(
     groups: string[],
     tellGroups: string[],
     background: boolean,
   ): Promise<boolean> {
-    let told = false;
+    // Every group told counts; one of several does not speak for the rest.
+    let told = tellGroups.length > 0;
     for (const groupKey of tellGroups) {
       const parsed = parseRawSessionKey(groupKey);
       const channel = parsed ? this.getChannel(parsed.channelName) : undefined;
-      if (!parsed || !channel) continue;
+      if (!parsed || !channel) { told = false; continue; }
       try {
         await channel.send({ chatId: parsed.chatId, text: ownerT("notices")("group.summonBusy") });
-        told = true;
       } catch (err) {
+        told = false;
         log.warn({ err, group: groupKey }, "Could not post the busy notice to the group");
       }
     }
@@ -2031,10 +2033,12 @@ export class Agent {
    * did not run, and a group that asked for a delegate gets the busy line.
    * Undefined for a turn no group is behind, which keeps the error policy.
    */
-  private backgroundRefusal(audiences: readonly string[] | undefined, tellGroup: boolean): (() => Promise<void>) | undefined {
+  private backgroundRefusal(audiences: readonly string[] | undefined, tellGroup: boolean): (() => Promise<boolean>) | undefined {
     const groups = [...new Set((audiences ?? []).filter((a) => isGroupSessionKey(a)))];
     if (groups.length === 0) return undefined;
-    return async () => { await this.tellSharedPromptUnavailable(groups, tellGroup ? groups : [], true); };
+    // False (nobody told): the turn's ordinary error policy takes over, which
+    // leaves a pending error note for the session.
+    return () => this.tellSharedPromptUnavailable(groups, tellGroup ? groups : [], true);
   }
 
   private audienceLabel(audience: string): string {
@@ -2720,9 +2724,8 @@ export class Agent {
       if (message.isGroup) this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle, message.senderId, people);
       this.recordLatestInboundMessage(key, channel, message);
       const transcriptText = this.formatGroupText(channel, message, key, people);
-      // No web requestId and no userRecorded check here: both only matter for
-      // web input, and web never coalesces (canCoalesce in enqueueMessage).
-      // Kept exactly as the batch path always wrote it; if web ever reaches
+      // No web requestId here: it only matters for web input, and web never
+      // coalesces (canCoalesce in enqueueMessage). If web ever reaches
       // this path, its records would lack the requestId the browser pairs on,
       // so say so loudly instead of silently writing them.
       // Diagnostic only: a logging failure must not abort the batch.

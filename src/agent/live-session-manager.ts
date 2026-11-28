@@ -1677,8 +1677,13 @@ export class LiveSessionManager {
         const retrySession = await this.getOrCreateLiveSession(key);
         // Built just now for this turn, so it has the variant the turn needs;
         // one somebody else built meanwhile may not. Never the full prompt
-        // for a group's turn.
-        if (this.lacksRequiredSharedPrompt(key, retrySession)) throw new SharedPromptUnavailableError("session replaced during a retry");
+        // for a group's turn: no retry then. The ORIGINAL error, not a
+        // refusal: the first attempt may already have reached the model, and
+        // a refusal says nothing ran (and would queue its messages again).
+        if (this.lacksRequiredSharedPrompt(key, retrySession)) {
+          log.warn({ key }, "Not retrying a group's turn: the replacement session has the full prompt");
+          throw err;
+        }
         // Safe to reuse the same sink: the guard above proved it has shipped
         // nothing, so this retry is the first and only delivery of the turn.
         // Same bookkeeping as the first attempt — a retry that ends on an SDK

@@ -369,10 +369,11 @@ export interface TurnSpec {
    * steering it, and the dm: session could not be reloaded with the shared
    * prompt in time (SharedPromptUnavailableError). When set, this answers the
    * refusal INSTEAD of the thrown-error policy (which would put an error in
-   * the owner's chat for something the group is waiting on). The turn
-   * returns false either way.
+   * the owner's chat for something the group is waiting on). Answering
+   * `false` (nobody could be told) falls back to that policy, so the refusal
+   * at least becomes a pending error note. The turn returns false either way.
    */
-  onSharedPromptUnavailable?: () => void | Promise<void>;
+  onSharedPromptUnavailable?: () => void | boolean | Promise<void | boolean>;
   /**
    * Send `prompt` exactly as given: no pending notes, no memory-change note,
    * no stamp in front of it. For an SDK slash command (a sub-session's
@@ -561,12 +562,13 @@ export class TurnRunner {
       if (err instanceof SharedPromptUnavailableError && spec.onSharedPromptUnavailable) {
         log.warn({ sessionKey: spec.key, source: spec.source, blocker: err.blocker }, "Turn refused: no session with the shared prompt in time");
         await stopTyping({ clear: true });
+        let answered = true;
         try {
-          await spec.onSharedPromptUnavailable();
+          answered = (await spec.onSharedPromptUnavailable()) !== false;
         } catch (noticeErr) {
           log.warn({ err: noticeErr, sessionKey: spec.key }, "Could not answer a turn refused for the shared prompt");
         }
-        return ok;
+        if (answered) return ok;
       }
       ok = await this.handleThrownError(spec, err, stopTyping);
       return ok;

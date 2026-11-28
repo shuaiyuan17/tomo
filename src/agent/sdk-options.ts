@@ -575,7 +575,10 @@ export function buildHooksOption(args: {
   if (args.turnBudget && args.maxTurns > 0) {
     mergeHooks(hooks, turnBudgetHooks(args.turnBudget, args.maxTurns, args.sessionKey));
   }
-  if (args.undeliveredReply) {
+  // Never on a task session: what it writes as text is not delivered to anyone
+  // by design (it speaks through its task_* tools), so "your message did not
+  // reach the user" is false there, and every block it drops would be nudged.
+  if (args.undeliveredReply && !(args.sessionKey && isTaskSessionKey(args.sessionKey))) {
     mergeHooks(hooks, undeliveredReplyHooks(args.undeliveredReply, args.sessionKey));
   }
   if (args.agentProfile) {
@@ -730,11 +733,22 @@ export function credentialRedactionHooks() {
 /**
  * What the model is told when its previous message was dropped. Reaches it
  * with the next request, after the tool batch that followed the dropped block.
+ *
+ * The words matter: this asks for a message to the user, and nothing else. It
+ * must not name where the dropped words were written, nor ask for them back
+ * word for word: a request to reproduce reasoning in the reply is what the
+ * API refuses as `reasoning_extraction`.
  */
 export const UNDELIVERED_REPLY_NOTICE =
-  "Your previous message was written in a thinking block and was NOT delivered to the user. " +
-  "If it was meant for them, say it again now as plain text, verbatim. " +
-  "If it was internal narration, do not repeat it.";
+  "Your last message did not reach the user. " +
+  "If there is something they should hear, write it now as your reply. " +
+  "If there is nothing to tell them, carry on.";
+
+/** The same, for a turn that ENDED on a dropped message (the restate turn's prompt). */
+export const UNDELIVERED_REPLY_TURN_END_NOTICE =
+  "Your last turn ended without a message reaching the user. " +
+  "If there is something they should hear, write it now as your reply. " +
+  "If there is nothing to tell them, reply NO_REPLY.";
 
 /**
  * A PostToolBatch hook that fires only when the session reports a dropped
@@ -751,7 +765,7 @@ function undeliveredReplyHooks(read: () => boolean, sessionKey?: string) {
     PostToolBatch: [{
       hooks: [async () => {
         if (!read()) return {};
-        log.info({ key: sessionKey }, "undelivered reply: nudging the model to restate as text");
+        log.info({ key: sessionKey }, "undelivered reply: telling the model its message did not reach the user");
         return {
           hookSpecificOutput: {
             hookEventName: "PostToolBatch" as const,

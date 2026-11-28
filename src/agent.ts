@@ -37,7 +37,7 @@ import type { WebSubsessionAccess } from "./channels/web.js";
 import { buildSubsessionPrompt } from "./agent/subsessions/prompt.js";
 import { createTaskCronLink } from "./agent/subsessions/cron-link.js";
 import { EFFORT_LEVELS, type EffortLevel } from "./config.js";
-import type { SessionContext } from "./agent/sdk-options.js";
+import { UNDELIVERED_REPLY_TURN_END_NOTICE, type SessionContext } from "./agent/sdk-options.js";
 import { privateMemoryBarFor } from "./agent/permissions.js";
 import { assessGroupPermission, attachmentBarredFor } from "./agent/private-memory-guard.js";
 import { effectiveGroupSandbox, type GroupSandboxConfig } from "./agent/group-fs-policy.js";
@@ -2842,11 +2842,7 @@ export class Agent {
    * narration. `restate: true` keeps the follow-up from chaining.
    */
   private restateUndeliveredReply(sessionKey: string, target: { channel: Channel; chatId: string } | undefined): void {
-    const nudge = formatTomoEvent(
-      "undelivered-reply",
-      "Your last turn ended on a message written in a thinking block; it was NOT delivered to the user. " +
-      "If it was meant for them, say it now as plain text, verbatim. If it was internal narration, reply NO_REPLY.",
-    );
+    const nudge = formatTomoEvent("undelivered-reply", UNDELIVERED_REPLY_TURN_END_NOTICE);
     this.handleCronMessage(nudge, sessionKey, {
       showTyping: false,
       restate: true,

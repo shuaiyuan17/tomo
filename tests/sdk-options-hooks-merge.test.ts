@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { UNDELIVERED_REPLY_NOTICE, buildHooksOption, makeTurnBudget, mergeHooks } from "../src/agent/sdk-options.js";
+import { UNDELIVERED_REPLY_NOTICE, UNDELIVERED_REPLY_TURN_END_NOTICE, buildHooksOption, makeTurnBudget, mergeHooks } from "../src/agent/sdk-options.js";
 
 describe("mergeHooks", () => {
   it("concatenates entries when two producers register the same event", () => {
@@ -186,6 +186,34 @@ describe("undelivered-reply nudge", () => {
     // Read-and-clear on the session side: the second batch says nothing.
     const second = await batch[1]!();
     expect(second).toEqual({});
+  });
+
+  it("is installed on a chat session's key", () => {
+    const { hooks } = buildHooksOption({ maxTurns: 50, turnBudget: makeTurnBudget(), sessionKey: "dm:alex", undeliveredReply: () => true }) as { hooks: Record<string, unknown[]> };
+    expect(postToolBatchHooks(hooks)).toHaveLength(2);
+  });
+
+  it("is never installed on a task session: its text is not delivered to anyone by design", async () => {
+    let reads = 0;
+    const { hooks } = buildHooksOption({
+      maxTurns: 50,
+      turnBudget: makeTurnBudget(),
+      sessionKey: "task:s1",
+      undeliveredReply: () => { reads++; return true; },
+    }) as { hooks: Record<string, unknown[]> };
+    const batch = postToolBatchHooks(hooks);
+    expect(batch).toHaveLength(1);
+    for (const hook of batch) expect((await hook()).hookSpecificOutput?.additionalContext ?? "").not.toContain(UNDELIVERED_REPLY_NOTICE);
+    expect(reads).toBe(0);
+  });
+
+  it("asks for a message to the user, never for the dropped words back", () => {
+    // A request to reproduce reasoning in the reply is refused by the API
+    // (reasoning_extraction): the notices name no source and ask for no copy.
+    for (const notice of [UNDELIVERED_REPLY_NOTICE, UNDELIVERED_REPLY_TURN_END_NOTICE]) {
+      expect(notice).not.toMatch(/think|reason|verbatim|repeat|restate|again|word for word|exact|narrat/i);
+      expect(notice).toContain("write it now as your reply");
+    }
   });
 });
 

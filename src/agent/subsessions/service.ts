@@ -2609,6 +2609,9 @@ export class SubsessionService {
           r.failStreak += 1;
           if (!outcome.ok && !outcome.stopped) {
             const { category, refused } = classifyFailure(outcome.failure);
+            // A refusal is not tried again on the same conversation: it
+            // would be refused again, and billed again (failure.ts REFUSED).
+            if (refused) r.failStreak = Math.max(r.failStreak, MAX_FAIL_STREAK);
             const detail = failureDetail(outcome.failure);
             r.lastFailure = { at: this.now(), ...(category ? { category } : {}), ...(refused ? { refused } : {}), ...(detail ? { detail } : {}) };
           } else if (outcome.ok) {
@@ -2684,7 +2687,8 @@ export class SubsessionService {
           newInput("new input arrived during the stopped turn"));
       } else if (record.failStreak >= MAX_FAIL_STREAK) {
         // A failed turn's own inputs are still pending, and stay for the wake.
-        this.pause(record, { kind: "turns_failing", reason: "its turns keep failing", failure: true }, ownerT("subsessions")("failing", { id: record.id, title: record.title }),
+        const reason = record.lastFailure?.refused ? "the model refused its turn, so it was not tried again" : "its turns keep failing";
+        this.pause(record, { kind: "turns_failing", reason, failure: true }, ownerT("subsessions")("failing", { id: record.id, title: record.title }),
           newInput("new input arrived during the failed turn"));
       }
       return;

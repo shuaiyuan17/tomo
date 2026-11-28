@@ -274,6 +274,33 @@ describe("the rollback export (t-67: the mark commits before the file is written
     expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["never delivered", "from the older Tomo"]);
   });
 
+  it.each([["with", true], ["without", false]])("an older Tomo's own file beside a \"writing\" mark (%s a staged file) is merged in", (_label, withStaged) => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["never delivered"]);
+    setMark(dir, `${EXPORT_WRITING_PREFIX}2026-11-28T00:00:00.000Z`);
+    if (withStaged) writeFileSync(stagedExportPath(legacy(dir)), JSON.stringify({ version: 1, notes: { "dm:alice": ["never delivered"] } }));
+    writeLegacy(dir, { "dm:alice": ["from the older Tomo"] });
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["never delivered", "from the older Tomo"]);
+    expect(metaMark(dir)).toBeUndefined();
+    expect(existsSync(stagedExportPath(legacy(dir)))).toBe(false);
+  });
+
+  it("an unreadable file beside a settled mark: the mark goes before the file is moved aside, so the table is never taken as delivered", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["keep me"]);
+    setMark(dir, "2026-11-28T00:00:00.000Z");
+    writeFileSync(legacy(dir), "{truncated");
+    const store = makeSessionStore(dir);
+    // The move aside fails (a crash at that point leaves the same state).
+    const proto = Object.getPrototypeOf(store) as { moveWithoutClobber(from: string, to: string): string };
+    vi.spyOn(proto, "moveWithoutClobber").mockImplementation(() => { throw new Error("EIO"); });
+    expect(() => store.getPendingNotes("dm:alice")).toThrow("EIO");
+    vi.restoreAllMocks();
+    expect(metaMark(dir)).toBeUndefined();
+    rmSync(legacy(dir)); // say the move did land before the crash
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["keep me"]);
+  });
+
   it("a settled mark that cannot be undone keeps the staged file, which the next start imports", () => {
     const dir = freshDir();
     makeSessionStore(dir).setPendingNotes("dm:alice", ["keep me"]);

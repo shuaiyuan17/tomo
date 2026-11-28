@@ -210,7 +210,7 @@ export class PendingNotesStore {
       return { notes, displaced };
     });
     // Committed: a staged export merged above is in the table now.
-    this.removeStaged();
+    if (typeof outcome === "object" || outcome === "pending") this.removeStaged();
     if (outcome === "none") return;
     if (outcome === "unlanded") {
       log.warn({ file: this.legacyPath }, "A pending notes rollback export never wrote its file; the notes stay in the database");
@@ -221,9 +221,12 @@ export class PendingNotesStore {
       return;
     }
     if (outcome === "unreadable") {
-      this.quarantineLegacy(this.unreadable);
-      // Moved aside by us, not consumed by an older Tomo: the table stays the truth.
+      // Moved aside by us, not consumed by an older Tomo: the table stays the
+      // truth. The mark goes first: a settled one beside no file would read,
+      // at the next start, as every note delivered.
       db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
+      this.quarantineLegacy(this.unreadable);
+      this.removeStaged();
       return;
     }
     if (typeof outcome === "object") {
@@ -263,9 +266,17 @@ export class PendingNotesStore {
    */
   private finishStagedExport(db: TomoDb): boolean {
     const staged = stagedExportPath(this.legacyPath);
-    if (!existsSync(staged)) return false;
     const mark = db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", EXPORTED_KEY)?.value;
     const settled = mark !== undefined && !mark.startsWith(EXPORT_WRITING_PREFIX);
+    if (!existsSync(staged)) {
+      // An export file reaches the legacy path only once its mark settles:
+      // a file there beside a "writing" mark is an older Tomo's own.
+      if (mark !== undefined && !settled && existsSync(this.legacyPath)) {
+        log.warn({ file: this.legacyPath }, "An older Tomo wrote its own pending notes file after a rollback export that never landed; merging it into the database");
+        return true;
+      }
+      return false;
+    }
     if (settled && !existsSync(this.legacyPath)) {
       renameSync(staged, this.legacyPath);
       log.warn({ file: this.legacyPath }, "Finished a pending notes rollback export that stopped before its file was in place");
@@ -277,7 +288,12 @@ export class PendingNotesStore {
       this.stagedToRemove = staged;
       return true;
     }
+    // Never published (the mark is "writing", or gone): its notes are the table's.
     unlinkSync(staged);
+    if (mark !== undefined && existsSync(this.legacyPath)) {
+      log.warn({ file: this.legacyPath }, "An older Tomo wrote its own pending notes file after a rollback export that never landed; merging it into the database");
+      return true;
+    }
     return false;
   }
 

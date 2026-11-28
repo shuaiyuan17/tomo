@@ -48,7 +48,23 @@ export function toolTitle(name: string, input?: Record<string, unknown>): string
   if (name === "Bash" && description) return scrubSecretValues(description);
   // A subagent is named by what it was sent to do; its type is in the row's input.
   if ((name === "Agent" || name === "Task") && description) return scrubSecretValues(`Subagent · ${description}`);
+  const mcp = mcpTitle(name, input);
+  if (mcp) return scrubSecretValues(mcp);
   return summarizeToolInput(name, input);
+}
+
+/**
+ * An MCP call, `mcp__<server>__<tool>`, as `server · tool "value"`: the
+ * server and the tool apart, then the input's first string value (80
+ * characters), which for most tools is what the call is about (a query, a
+ * title, a path). No string field, nothing after the tool's name.
+ */
+function mcpTitle(name: string, input?: Record<string, unknown>): string | undefined {
+  const m = /^mcp__(.+?)__(.+)$/.exec(name);
+  if (!m) return undefined;
+  const first = Object.values(input ?? {}).find((value): value is string => typeof value === "string" && value.trim() !== "");
+  const said = first?.replace(/\s+/g, " ").trim();
+  return `${m[1]} · ${m[2]}${said ? ` "${said.length > 80 ? `${said.slice(0, 80)}…` : said}"` : ""}`;
 }
 
 /**

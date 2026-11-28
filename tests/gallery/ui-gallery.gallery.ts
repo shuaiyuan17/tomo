@@ -225,6 +225,9 @@ function seedConversation(store: SessionStore): void {
   add("assistant", "Short answer: yes.", "web", q + 125_000);
   add("user", formatReactionMarker("like", "Short answer: yes."), "web", q + 130_000);
   add("assistant", "NO_REPLY", "web", q + 131_000);
+  // A turn of Tomo's own tools (tomo-internal): rows as sentences, cards (see ACTIVITY below).
+  add("user", "Can you have someone design the activity cards, tell the book club, and remind me tomorrow morning?", "web", q + 200_000);
+  add("assistant", "Done: s12 is on the design, the book club has the note, and there's a reminder for 8:30 tomorrow.", "web", q + 260_000);
   store.updateStats("dm:owner", { costUsd: 0.4, inputTokens: 1000, outputTokens: 400, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 128_400, contextMax: 200_000,
     // The SDK's real shape: what counts (sums to contextUsed), deferred tool schemas, the reserve and the free rest.
     contextBreakdown: [{ name: "System prompt", tokens: 9_200 }, { name: "System tools", tokens: 14_400 }, { name: "MCP tools", tokens: 3_400 },
@@ -261,6 +264,11 @@ function seedConversation(store: SessionStore): void {
   });
   body += line("assistant", q + 121_000, [{ type: "tool_use", id: "s1", name: "Read", input: { file_path: "/Users/owner/code/tomo/README.md" } }]);
   body += line("user", q + 121_100, [{ type: "tool_result", tool_use_id: "s1", content: "# Tomo" }]);
+  ACTIVITY.forEach(([name, input, out, isError], k) => {
+    body += line("assistant", q + 201_000 + k * 3000, [{ type: "tool_use", id: `i${k}`, name: `mcp__tomo-internal__${name}`, input }]);
+    body += line("user", q + 201_000 + k * 3000 + (name === "recall_conversation" ? 2400 : 200),
+      [{ type: "tool_result", tool_use_id: `i${k}`, content: out, ...(isError ? { is_error: true } : {}) }]);
+  });
   writeFileSync(resolve(mockConfig.sdkSessionsDir, "sdk-rich.jsonl"), body);
 
   const subagents = resolve(mockConfig.sdkSessionsDir, "sdk-rich", "subagents");
@@ -275,6 +283,24 @@ function seedConversation(store: SessionStore): void {
     sub("user", [{ type: "tool_result", tool_use_id: "t2", content: "src/sessions/transcript-rotation.ts:88" }]) +
     sub("assistant", [{ type: "text", text: "All rename paths go through `moveWithoutClobber`:\n\n- rotation\n- migration\n\n```ts\nmoveWithoutClobber(from, to)\n```" }]));
 }
+
+/** One turn of Tomo's own tools: what the owner asked for above, as the transcript holds it. */
+const ACTIVITY: [string, Record<string, unknown>, string, boolean?][] = [
+  ["recall_conversation", { query: "activity cards" }, "3 message(s), oldest first. Searched back to 2026-10-15.\n\n…"],
+  ["task_spawn", { title: "Web UI: activity cards for internal tool calls", model: "fable",
+    brief: "Goal: design cards for Tomo's internal tool calls in the web UI, so the chat shows what Tomo did instead of raw JSON.\n\nRead web/src/tool-calls.tsx first." },
+  "Started s12 (active). Its messages show as [s12 · Web UI: activity cards for internal tool calls]."],
+  ["task_status", { id: "s12" }, "s12: Web UI: activity cards for internal tool calls\nStatus: active\nCreated 0m ago, last activity 0m ago"],
+  ["send_message", { target: "telegram:-2", mode: "direct", message: "Reminder: Piranesi for next month. Poll for December goes out Friday." }, "OK (direct)."],
+  ["todo_add", { title: "Review the activity cards design", next: "Read s12's report", waiting_on: "owner", review_in: "2026-11-13" },
+    "todo_add failed: review_in \"2026-11-13\" is not in the future.", true],
+  ["todo_add", { title: "Review the activity cards design", next: "Read s12's report", waiting_on: "owner", review_in: "3d" },
+    "Added t-41 Review the activity cards design · next: Read s12's report · waiting on the owner · review Nov 17"],
+  ["schedule_create", { name: "Design review reminder", schedule: "2026-11-15T08:30", message: "Remind the owner to look at s12's design", once: true },
+    JSON.stringify({ id: "c7f2a91e", name: "Design review reminder", enabled: true, lifecycle: "once", nextRunAt: "2026-11-15T16:30:00.000Z" })],
+  ["pet_feed", {}, JSON.stringify({ event: "fed", hunger: 80, happiness: 72, mood: "happy", diary: "ate contentedly." })],
+  ["react_to_message", { target: "dm:owner", reaction: "love" }, "OK. Reaction sent."],
+];
 
 function publishTasks(): void {
   // Two compactions since "the daemon started" (Study · Context).
@@ -485,6 +511,14 @@ async function conversationSteps(page: Page, vp: Viewport, theme: Theme): Promis
     await reset(page);
     const group = await openToolGroup(page);
     for (const name of [/vitest/, /git log/]) await history(page).getByRole("button", { name }).first().click({ timeout: 3000 });
+    await page.waitForTimeout(300);
+    await group.evaluate((el) => el.scrollIntoView({ block: "start" }));
+    await snap();
+  });
+  await s("activity", "open", async (snap) => {
+    await reset(page);
+    const group = history(page).getByRole("button", { name: /Searched past conversations/ }).first();
+    await group.click({ timeout: 5000 });
     await page.waitForTimeout(300);
     await group.evaluate((el) => el.scrollIntoView({ block: "start" }));
     await snap();

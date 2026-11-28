@@ -214,6 +214,53 @@ export interface WebSource { url: string; title?: string }
 export type TodoStatus = "pending" | "in_progress" | "completed";
 /** One entry of the agent's todo list (TodoWrite). `activeForm`: the present-tense label shown while it is in progress. */
 export interface TodoEntry { content: string; status: TodoStatus; activeForm?: string }
+/**
+ * One of Tomo's own tools (tomo-internal) as a card or a sentence shows it: the
+ * fields it reads from the call's raw input, each clipped and scrubbed on its
+ * own (src/web/activity.ts). `kind` is the tool's name without the
+ * `mcp__tomo-internal__` prefix; a page that meets a kind it does not know
+ * shows the plain tool line.
+ */
+export type ToolActivity =
+  | { kind: "task_spawn"; title: string; brief: string; briefTruncated?: true; model?: string; quoted?: true }
+  | { kind: "task_message"; id: string; text: string; textTruncated?: true; withOwner?: true }
+  | { kind: "task_cancel" | "task_done"; id: string; reason?: string }
+  | { kind: "task_status"; id?: string }
+  /** `text`: the message without its MEDIA: lines (those are `media`, file names only); `chars`: the whole message's length. */
+  | { kind: "send_message"; target: string; mode: "direct" | "delegate"; text: string; textTruncated?: true; chars: number; media?: string[];
+    replyTo?: string; effect?: string }
+  | { kind: "react_to_message"; target: string; reaction: string; remove?: true }
+  | { kind: "edit_message" | "unsend_message"; target: string }
+  | { kind: "rename_group_chat"; target: string; title: string }
+  | { kind: "list_sessions" | "schedule_list" | "home_check" | "list_people" | "pet_status" }
+  | { kind: "todo_add"; title: string; next: string; waitingOn: "me" | "owner" | "external"; reviewIn?: string; ref?: string }
+  | { kind: "todo_resolve"; id: string; action: "done" | "drop" | "snooze" | "handoff"; until?: string; reason?: string; evidence?: string; next?: string }
+  | { kind: "todo_list"; filter: "due" | "mine" | "owner" | "all" }
+  | { kind: "schedule_create"; name: string; schedule: string; message: string; messageTruncated?: true; session?: string; once?: true }
+  | { kind: "schedule_remove"; id: string }
+  | { kind: "schedule_enable"; id: string; enabled: boolean }
+  | { kind: "request_permission"; path: string; access: "read" | "write"; reason: string }
+  | { kind: "request_credential"; name: string; purpose: string }
+  | { kind: "pet_feed"; treat?: true }
+  | { kind: "pet_play"; activity?: string }
+  | { kind: "pet_sleep"; action: "sleep" | "wake" }
+  | { kind: "pet_hatch"; name: string }
+  /** `query`: the first phrasing; `more`: how many others the call searched. */
+  | { kind: "recall_conversation"; query?: string; more?: number }
+  | { kind: "lcm_rollup"; level: "daily" | "weekly" | "monthly" | "yearly"; period?: string }
+  | { kind: "upsert_person"; name: string };
+/**
+ * What an internal tool's (successful) result says happened, read from its
+ * text (src/web/activity.ts). `id`: what it made or touched (s12, t-41, a cron
+ * job id); `status`: a task's status, a pet's mood, a rollup's status; `count`:
+ * how many a list or search found; `delivery`: what became of a task_message;
+ * `noop`: it returned normally but nothing happened (the tool's own sentence).
+ */
+export interface ToolOutcome {
+  id?: string; status?: string; count?: number; note?: string; noop?: string;
+  delivery?: "passed" | "queued" | "released" | "held";
+  lifecycle?: "once" | "recurring"; nextRunAt?: number; enabled?: boolean;
+}
 /** One entry of a subagent's transcript, as the read-only task view shows it. */
 export type SubagentItem =
   | { kind: "text"; id: string; text: string; truncated: boolean; ts?: number }
@@ -222,11 +269,15 @@ export type SubagentItem =
     sources?: WebSource[];
     /** `summary` is words the model wrote (a Bash description), not a command: shown in the text face. */
     prose?: true;
+    /** One of Tomo's own tools, read from its raw input: the page shows a card or a sentence (absent: the plain line). */
+    activity?: ToolActivity;
     /** Server-side only (session-tools.ts): the call reached memory/private, so its output is withheld. Never sent. */
     privateOutput?: boolean }
   /** `images`: image blocks in the output, counted and never served (the view shows a chip). `sources`: a WebSearch result's links. */
   | { kind: "result"; id: string; toolUseId: string; output: string; truncated: boolean; isError: boolean; images?: number; ts?: number;
-    sources?: WebSource[] }
+    sources?: WebSource[];
+    /** An internal tool's result, read (main chat only, where the call is paired on the server). `reason`: a failure without its "x failed: " prefix. */
+    outcome?: ToolOutcome; reason?: string }
   /** A TodoWrite call, parsed: the whole list as the agent wrote it (at most MAX_TODOS entries; `more` says how many were left out). */
   | { kind: "todos"; id: string; toolUseId: string; todos: TodoEntry[]; more?: number; ts?: number }
   /** A message sent to the subagent while it ran (not its first prompt, which is the brief). */

@@ -27,7 +27,8 @@ export function CodeBlock({ language, code, children }: { language?: string; cod
   </div>;
 }
 
-function CopyButton({ value, fallback }: { value: string; fallback: RefObject<HTMLPreElement | null> }) {
+/** Copies `value`; without the async clipboard it selects `fallback`'s text instead. `label`: what it copies, for its accessible name. */
+export function CopyButton({ value, fallback, label }: { value: string; fallback: RefObject<HTMLElement | null>; label?: string }) {
   const [copied, setCopied] = useState(false);
   useEffect(() => {
     if (!copied) return;
@@ -43,7 +44,7 @@ function CopyButton({ value, fallback }: { value: string; fallback: RefObject<HT
     navigator.clipboard.writeText(value).then(() => setCopied(true), select);
   };
   return <>
-    <button type="button" data-slot="code-block-copy-button" aria-label={copied ? t("actions.copied") : t("actions.copyCode")} title={copied ? t("actions.copied") : t("actions.copy")} onClick={copy}
+    <button type="button" data-slot="code-block-copy-button" aria-label={copied ? t("actions.copied") : label ?? t("actions.copyCode")} title={copied ? t("actions.copied") : t("actions.copy")} onClick={copy}
       className="grid size-6 place-items-center rounded-md bg-background/80 text-muted-foreground ring-1 ring-foreground/10 transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none">
       {copied ? <CheckIcon className="size-3.5" aria-hidden="true" /> : <CopyIcon className="size-3.5" aria-hidden="true" />}
     </button>

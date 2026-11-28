@@ -16,7 +16,7 @@ export const chat = {
       other_other: "用了 {{count}} 个工具",
     },
     error: "错误", report: "报告", output: "输出", outputTail: "输出 · 最后一部分", taskOutput: "任务输出", noOutput: "（还没有输出）",
-    input: "输入", empty: "（空）", truncated: "已截断", running: "运行中", failed: "失败",
+    input: "输入", copySection: "复制{{label}}", empty: "（空）", truncated: "已截断", running: "运行中", failed: "失败",
     images_other: "{{count}} 张图片输出，未显示",
     thinking: "思考", failedCount_other: "{{count}} 个失败",
     todos: "待办", more_other: "还有 {{count}} 项",

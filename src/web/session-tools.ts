@@ -7,6 +7,7 @@ import { isSidechainLine, mayHoldToolBlocks, reportUnreadable, SDK_SESSION_ID, s
 import { redactText, redactToolInput } from "./redact-command.js";
 import { isPrivateMemoryAccess } from "../agent/private-memory-access.js";
 import type { CallItem, SessionTools, SubagentItem } from "./protocol.js";
+import { failureReason, toolOutcome } from "./activity.js";
 
 /**
  * The tool calls of a conversation's CURRENT SDK transcript
@@ -95,28 +96,40 @@ function toolLine(text: string, offset: number, scope: PrivateScope): { items: S
 /** A call as the chat counts and keeps them: an ordinary call or a parsed TodoWrite list. */
 export function isCallItem(item: SubagentItem): item is CallItem { return item.kind === "tool" || item.kind === "todos"; }
 
+/** A call a result is paired with: did it reach memory/private, and which tool it was. */
+export interface KnownCall { private: boolean; name: string }
+const knownCall = (item: CallItem): KnownCall => ({ private: item.kind === "tool" && item.privateOutput === true, name: item.kind === "tool" ? item.name : "TodoWrite" });
+
 /**
  * Pair every result with its call, ON THE SERVER, before anything is sent:
  * the output of a call that reached memory/private is replaced whole (its
  * input stays, redacted); a result whose call is not known is hidden too.
  * `owner` (the owner's DM): nothing is withheld, every output is kept.
  * `known`: calls from outside this page (an `after` read's look-back).
+ * A result of one of Tomo's own tools whose output is shown also gets what
+ * it says happened (`outcome`) or, failed, why (`reason`): activity.ts.
  */
-export function pairOutputs(items: SubagentItem[], known: ReadonlyMap<string, boolean> = new Map(), owner = false): SubagentItem[] {
-  if (owner) return items.map((item) => { if (item.kind !== "tool") return item; const rest = { ...item }; delete rest.privateOutput; return rest; });
+export function pairOutputs(items: SubagentItem[], known: ReadonlyMap<string, KnownCall> = new Map(), owner = false): SubagentItem[] {
   const calls = new Map(known);
-  for (const item of items) if (isCallItem(item)) calls.set(item.toolUseId, item.kind === "tool" && item.privateOutput === true);
+  for (const item of items) if (isCallItem(item)) calls.set(item.toolUseId, knownCall(item));
   return items.map((item) => {
     if (item.kind === "tool") { const rest = { ...item }; delete rest.privateOutput; return rest; }
     if (item.kind !== "result") return item;
-    const reached = calls.get(item.toolUseId);
+    const call = calls.get(item.toolUseId);
+    if (owner) return call ? withOutcome(item, call.name) : item;
     // A withheld output is replaced whole: not even how many images or links it held.
     const rest = { ...item };
     delete rest.images;
     delete rest.sources;
-    if (reached === undefined) return { ...rest, output: UNPAIRED_HIDDEN, truncated: false };
-    return reached ? { ...rest, output: PRIVATE_HIDDEN, truncated: false } : item;
+    if (call === undefined) return { ...rest, output: UNPAIRED_HIDDEN, truncated: false };
+    return call.private ? { ...rest, output: PRIVATE_HIDDEN, truncated: false } : withOutcome(item, call.name);
   });
+}
+
+function withOutcome(item: Extract<SubagentItem, { kind: "result" }>, name: string): SubagentItem {
+  if (item.isError) { const reason = failureReason(name, item.output); return reason ? { ...item, reason } : item; }
+  const outcome = toolOutcome(name, item.output);
+  return outcome ? { ...item, outcome } : item;
 }
 
 const EMPTY: SessionTools = { items: [], end: 0, transcript: "", complete: true };
@@ -171,14 +184,14 @@ export async function readSessionTools(sdkSessionsDir: string, sdkSessionId: str
       // Results whose call was on an earlier page: find those calls just before `after`.
       const inPage = new Set(items.flatMap((item) => isCallItem(item) ? [item.toolUseId] : []));
       const wanted = new Set(items.flatMap((item) => item.kind === "result" && !inPage.has(item.toolUseId) ? [item.toolUseId] : []));
-      const known = new Map<string, boolean>();
+      const known = new Map<string, KnownCall>();
       let hi = query.after;
       while (wanted.size && hi > 0 && query.after - hi < PAIR_LOOKBACK_BYTES) {
         const page = await readWindow(fd, size, Math.max(0, hi - PAGE_BYTES), hi, "back");
         for (const line of page.lines) {
           for (const item of toolItemsFromLine(line.text, line.offset, scope)) {
             if (isCallItem(item) && wanted.has(item.toolUseId)) {
-              known.set(item.toolUseId, item.kind === "tool" && item.privateOutput === true); wanted.delete(item.toolUseId);
+              known.set(item.toolUseId, knownCall(item)); wanted.delete(item.toolUseId);
             }
           }
         }

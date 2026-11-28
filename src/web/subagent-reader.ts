@@ -4,6 +4,7 @@ import { sep } from "node:path";
 import { scrubSecretValues } from "../redact.js";
 import { toolTitle, toolTitleIsProse } from "../agent/tool-summary.js";
 import { redactText } from "./redact-command.js";
+import { toolActivity } from "./activity.js";
 import type { SubagentBrief, SubagentItem, SubagentPage, TodoEntry, WebSource } from "./protocol.js";
 import { fetchedPage, mayBeAssistant, metaModels, parseEntry, reportUnreadable, searchResultLinks, subagentMetaFile, subagentTranscriptFile,
   todoList, taskNotice, BACKGROUND_TASK_TOOL, SUBAGENT_MESSAGE_TOOL, type Block, type Entry, type Problem, type ResultPart, type TaskNotice, type WebLink } from "./sdk-transcript.js";
@@ -162,10 +163,13 @@ function itemsFromBlocks(entry: Extract<Entry, { kind: "message" }>, content: Bl
       const inputText = clip(JSON.stringify(input, null, 2), IO_LIMIT);
       const reaches = redact?.reachesPrivate?.(b.name, raw) === true;
       const page = reaches ? undefined : sources([fetchedPage(b.name, raw)], redact);
+      // Read from the raw input (before the clip), field by field; never for a call that reached memory/private.
+      const activity = reaches ? undefined : toolActivity(b.name, raw);
       items.push({ kind: "tool", id, toolUseId: b.id ?? id, name: b.name.slice(0, 128),
         summary: clip(toolTitle(b.name, input), 200).text, input: inputText.text, inputTruncated: inputText.truncated,
         ...(toolTitleIsProse(b.name, input) ? { prose: true as const } : {}),
-        ...(ts ? { ts } : {}), ...(page ? { sources: page } : {}), ...(reaches ? { privateOutput: true } : {}) });
+        ...(ts ? { ts } : {}), ...(page ? { sources: page } : {}), ...(reaches ? { privateOutput: true } : {}),
+        ...(activity ? { activity: redactActivity(activity, redact) } : {}) });
     } else if (entry.role === "user" && b.type === "tool_result") {
       const result = resultText(b.parts);
       const { text, truncated } = clip(result.text, IO_LIMIT);
@@ -177,6 +181,13 @@ function itemsFromBlocks(entry: Extract<Entry, { kind: "message" }>, content: Bl
   });
   if (hidden) items.push({ kind: "text", id: `${offset}:more`, text: `… ${hidden} more entries in this step are not shown.`, truncated: true });
   return items;
+}
+
+/** An activity's text fields through the caller's output redaction too (the main chat's #492 rules). */
+function redactActivity<T extends object>(activity: T, redact?: ToolRedaction): T {
+  if (!redact) return activity;
+  return Object.fromEntries(Object.entries(activity).map(([key, value]) => [key, key === "kind" ? value
+    : typeof value === "string" ? redact.output(value) : Array.isArray(value) ? value.map((v) => typeof v === "string" ? redact.output(v) : v) : value])) as T;
 }
 
 /** One todo's text, clipped and scrubbed (and redacted where the caller redacts outputs). */

@@ -82,4 +82,9 @@ describe("summarizeToolInput", () => {
       .toBe("Agent → Explore: find callers");
     expect(summarizeToolInput("Task", {})).toBe("Agent → ?: ");
   });
+  it("an MCP call is `server · tool` and its first string value, not the raw name and JSON", () => {
+    expect(toolTitle("mcp__mac-kit__mail_search", { limit: 5, query: "zagg  black\nfriday" })).toBe('mac-kit · mail_search "zagg black friday"');
+    expect(toolTitle("mcp__claude_ai_Gmail__list", { limit: 5 })).toBe("claude_ai_Gmail · list");
+    expect(toolTitle("mcp__docs__fetch", { url: "x".repeat(100) })).toBe(`docs · fetch "${"x".repeat(80)}…"`);
+  });
 });

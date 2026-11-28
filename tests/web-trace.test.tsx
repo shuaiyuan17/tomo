@@ -199,7 +199,10 @@ describe("code blocks in replies", () => {
     expect(codeBlockInfo(odd)).toEqual({ code: "echo a\n\necho b" });
     expect(codeBlockInfo(undefined)).toEqual({ code: "" });
   });
-  it("tool input/output panes have no copy button", () => {
-    expect(html(createElement(ToolSection, { label: "Input", text: "```ts\nx\n```" }))).not.toContain("Copy");
+  it("tool input/output panes have one copy button for the whole text (none when empty)", () => {
+    const shown = html(createElement(ToolSection, { label: "Input", text: "```ts\nx\n```" }));
+    expect(shown.match(/data-slot="code-block-copy-button"/g)).toHaveLength(1);
+    expect(shown).toContain('aria-label="Copy Input"');
+    expect(html(createElement(ToolSection, { label: "Output", text: "" }))).not.toContain("code-block-copy-button");
   });
 });

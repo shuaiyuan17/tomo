@@ -103,6 +103,9 @@ export class PendingNotesStore {
       } else {
         db = sharedTomoDb(this.dbPath);
         if (db === this.db) return db;
+        // The import moves the old file once its rows are in: never inside
+        // another transaction, which could still roll those rows back.
+        if (db.inWriteTransaction()) throw new Error("The pending notes store is first used inside another database transaction; it is opened on its own first");
       }
     } catch (err) {
       if (err instanceof DbDamagedError) this.damaged = err;

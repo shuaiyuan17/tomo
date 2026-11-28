@@ -186,3 +186,29 @@ describe("ordering around the commit", () => {
     expect(store.list()).toEqual([]);
   });
 });
+
+describe("first use and hooks", () => {
+  it("a pending-notes store first used inside another transaction refuses rather than import there", () => {
+    const sessions = makeSessionStore(join(dir, "sessions"), { dbPath: join(dir, "tomo.db") });
+    const db = sharedTomoDb(join(dir, "tomo.db"));
+    expect(() => db.transaction(() => sessions.getPendingNotes("dm:owner"))).toThrow(/first used inside another/);
+    expect(sessions.getPendingNotes("dm:owner")).toEqual([]);
+  });
+
+  it("a listener that writes from a commit hook leaves the newest table in the cache", () => {
+    let armed = false;
+    const store: SubsessionStore = new SubsessionStore(join(dir, "subsessions.json"), {
+      dbPath: join(dir, "tomo.db"),
+      onChange: () => { if (armed) { armed = false; store.update("s1", (r) => { r.activeMs = 3; }); } },
+    });
+    store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    const db = sharedTomoDb(join(dir, "tomo.db"));
+    armed = true;
+    db.transaction(() => {
+      store.update("s1", (r) => { r.activeMs = 1; });
+      store.update("s1", (r) => { r.activeMs = 2; });
+    });
+    expect(store.peek()?.tasks[0].activeMs).toBe(3);
+    expect(store.get("s1")?.activeMs).toBe(3);
+  });
+});

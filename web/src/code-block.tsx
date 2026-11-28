@@ -40,7 +40,7 @@ export function selectContents(node: HTMLElement | null): void {
  * `fallback`'s text, or calls it (a pane that shows only part of the text
  * first shows it all). `label`: what it copies, for its accessible name.
  */
-export function CopyButton({ value, fallback, label }: { value: string; fallback: RefObject<HTMLElement | null> | (() => void); label?: string }) {
+export function CopyButton({ value, fallback, label, text }: { value: string; fallback: RefObject<HTMLElement | null> | (() => void); label?: string; text?: string }) {
   const [copied, setCopied] = useState(false);
   useEffect(() => {
     if (!copied) return;
@@ -56,8 +56,11 @@ export function CopyButton({ value, fallback, label }: { value: string; fallback
   };
   return <>
     <button type="button" data-slot="code-block-copy-button" aria-label={copied ? t("actions.copied") : label ?? t("actions.copyCode")} title={copied ? t("actions.copied") : t("actions.copy")} onClick={copy}
-      className="grid size-6 place-items-center rounded-md bg-background/80 text-muted-foreground ring-1 ring-foreground/10 transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none">
+      className={text
+        ? "inline-flex h-6 items-center gap-1 rounded-md bg-background/80 px-2 font-sans text-[11px] text-muted-foreground ring-1 ring-foreground/10 transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+        : "grid size-6 place-items-center rounded-md bg-background/80 text-muted-foreground ring-1 ring-foreground/10 transition-colors hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"}>
       {copied ? <CheckIcon className="size-3.5" aria-hidden="true" /> : <CopyIcon className="size-3.5" aria-hidden="true" />}
+      {text && <span aria-hidden="true">{copied ? t("actions.copied") : text}</span>}
     </button>
     <span aria-live="polite" className="sr-only">{copied ? t("actions.copied") : ""}</span>
   </>;

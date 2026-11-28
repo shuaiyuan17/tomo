@@ -107,7 +107,6 @@ function Quote({ text, lines, plain: bare, truncated }: { text: string; lines: 2
 /** One call in the raw-data panel: its full name, id and time, then INPUT / OUTPUT as the server sent them. */
 function RawCall({ row }: { row: ToolRow }) {
   const { t } = useTranslation(["activity", "chat"]);
-  const idRef = useRef<HTMLSpanElement>(null);
   // Without the clipboard (not a secure context, or denied): the JSON in a selected box, to copy by hand.
   const [manual, setManual] = useState(false);
   const manualBox = useRef<HTMLTextAreaElement>(null);
@@ -118,10 +117,11 @@ function RawCall({ row }: { row: ToolRow }) {
   return <div className="space-y-2.5">
     <div className="flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
       <span className="min-w-0 truncate">{row.name}</span><span aria-hidden="true">·</span>
-      <span ref={idRef} title={row.toolUseId} className="min-w-0 max-w-[14ch] truncate">{row.toolUseId}</span>
+      <span title={row.toolUseId} className="min-w-0 max-w-[14ch] truncate select-all">{row.toolUseId}</span>
       {took && <span className="shrink-0">· {took}</span>}
-      <span className="ml-auto flex shrink-0 items-center gap-1"><CopyButton value={row.toolUseId} fallback={idRef} label={t("card.copyId", { id: row.toolUseId })} />
-        <CopyButton value={json} fallback={() => setManual(true)} label={t("card.copyJson")} /></span>
+      {/* One labelled button for the whole call (its id is in the JSON, and a click selects the id above);
+          the icon-only copy buttons stay on INPUT / OUTPUT, so the header doesn't read as two more of them. */}
+      <span className="ml-auto flex shrink-0 items-center"><CopyButton value={json} fallback={() => setManual(true)} label={t("card.copyJson")} text={t("card.copyJson")} /></span>
     </div>
     {manual && <textarea readOnly value={json} rows={6} aria-label={t("card.copyJson")} ref={manualBox}
       className="block w-full resize-y rounded-md border bg-background p-2 font-mono text-[11px] text-foreground" />}

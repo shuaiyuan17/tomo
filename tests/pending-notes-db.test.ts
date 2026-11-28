@@ -259,6 +259,42 @@ describe("the rollback export (t-67: the mark commits before the file is written
     expect(filesLike(dir, "_pending_notes.json.migrated-")).toHaveLength(1);
   });
 
+  it("an older Tomo that started while the export was still staged: its file is merged in, the staged notes kept", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["never delivered"]);
+    setMark(dir, "2026-11-28T00:00:00.000Z");
+    writeFileSync(stagedExportPath(legacy(dir)), JSON.stringify({ version: 1, notes: { "dm:alice": ["never delivered"] } }));
+    // The older Tomo saw no file, started empty and queued its own.
+    writeLegacy(dir, { "dm:alice": ["from the older Tomo"], "dm:bob": ["b1"] });
+    const store = makeSessionStore(dir);
+    expect(store.getPendingNotes("dm:alice")).toEqual(["never delivered", "from the older Tomo"]);
+    expect(store.getPendingNotes("dm:bob")).toEqual(["b1"]);
+    expect(metaMark(dir)).toBeUndefined();
+    expect(existsSync(stagedExportPath(legacy(dir)))).toBe(false);
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["never delivered", "from the older Tomo"]);
+  });
+
+  it("a settled mark that cannot be undone keeps the staged file, which the next start imports", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["keep me"]);
+    const db = openTomoDb(join(dir, "tomo.db"));
+    mkdirSync(join(legacy(dir), "x"), { recursive: true }); // the rename fails
+    const real = TomoDb.prototype.run;
+    vi.spyOn(TomoDb.prototype, "run").mockImplementation(function (this: TomoDb, sql: string, ...params) {
+      if (sql.startsWith("DELETE FROM meta") || (sql.startsWith("UPDATE meta") && String(params[0]).startsWith(EXPORT_WRITING_PREFIX))) throw new Error("SQLITE_IOERR");
+      return real.call(this, sql, ...params);
+    });
+    try {
+      expect(() => exportPendingNotesToFile(db, legacy(dir), { mark: true })).toThrow();
+    } finally {
+      db.close();
+      vi.restoreAllMocks();
+      rmSync(legacy(dir), { recursive: true });
+    }
+    expect(existsSync(stagedExportPath(legacy(dir)))).toBe(true);
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["keep me"]);
+  });
+
   it("a rename that fails takes the mark back and removes the staged file", () => {
     const dir = freshDir();
     makeSessionStore(dir).setPendingNotes("dm:alice", ["keep me"]);

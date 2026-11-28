@@ -363,15 +363,22 @@ export class MemoryStore {
    */
   private provenanceNote(rel: string, before: string | null, after: string): string | undefined {
     if (!isCoreMemoryPath(rel)) return undefined;
-    // Subjects under `## Don't keep` are a few neutral words, not facts: no source is asked of them.
-    const dontKeep = new Set<string>();
+    // Each added occurrence by where it is: a subject under `## Don't keep` is a few
+    // neutral words, not a fact, so no source is asked of it; the same words
+    // added under another heading are a fact like any other.
+    const had = new Map<string, number>();
+    for (const l of (before ?? "").split("\n")) if (l.trim()) had.set(l.trim(), (had.get(l.trim()) ?? 0) + 1);
     let inDontKeep = false;
+    let missing = 0;
     for (const l of after.split("\n")) {
       const t = l.trim();
+      if (!t) continue;
+      const n = had.get(t) ?? 0;
+      if (n > 0) { had.set(t, n - 1); if (/^#{1,6}\s/.test(t)) inDontKeep = /^##\s+don['’]t keep\s*$/i.test(t); continue; }
       if (/^#{1,6}\s/.test(t)) { inDontKeep = /^##\s+don['’]t keep\s*$/i.test(t); continue; }
-      if (inDontKeep && t) dontKeep.add(t);
+      if (t.startsWith("#") || inDontKeep || PROVENANCE_LINE_RE.test(t)) continue;
+      missing++;
     }
-    const missing = addedLines(before ?? "", after).filter((l) => !l.startsWith("#") && !dontKeep.has(l) && !PROVENANCE_LINE_RE.test(l)).length;
     return missing > 0 ? provenanceReminder(rel, missing) : undefined;
   }
 

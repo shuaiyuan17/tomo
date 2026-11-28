@@ -605,6 +605,9 @@ describe("the provenance reminder (§6.1): a fact line added to a core without i
     const dk = await t.call("memory_str_replace", { path: "private/MEMORY.md", old: "## Don't keep\n", new: "## Don't keep\n- a medical matter\n" });
     expect(dk.error).toBe(false);
     expect(dk.text).not.toContain("no source");
+    // The same words added under another heading are a fact: reminded.
+    const dup = await t.call("memory_str_replace", { path: "private/MEMORY.md", old: "## Private\n", new: "## Private\n- a medical matter\n" });
+    expect(dup.text).toContain("A new line in private/MEMORY.md has no source");
     expect((await t.call("memory_append", { path: "travel.md", content: "- unprefixed in a topic file" })).text).not.toContain("no source");
     for (const bad of ["- 2026-11-24 [said]", "- 2026-11-24 [from:] x", "- [said] 2026-11-24 x"]) {
       const r = await t.call("memory_append", { path: "MEMORY.md", content: bad });

@@ -167,8 +167,14 @@ export interface RecallScanBudget {
  * The search runs synchronously on the daemon's event loop, so this is how
  * long one `recall_conversation` call may hold up everything else. A direct
  * message transcript of about 30,000 records scans in well under it.
+ *
+ * Time is the real bound. A long-lived transcript grows by a megabyte or two a
+ * month and scans at roughly 5 ms per megabyte, so a byte cap near today's size
+ * would cut every undated search short long before the time budget mattered.
+ * `maxBytes` stays only as a backstop for a pathological disk (one far larger
+ * than the time budget could read), set well past what 300 ms can scan.
  */
-export const RECALL_SCAN_BUDGET: Readonly<RecallScanBudget> = { maxMs: 300, maxBytes: 16 * 1024 * 1024 };
+export const RECALL_SCAN_BUDGET: Readonly<RecallScanBudget> = { maxMs: 300, maxBytes: 256 * 1024 * 1024 };
 const RECALL_CLOCK_EVERY = 64;
 /** How far into a file the scan looks for its first record before deciding
  *  whether `toTime` rules the whole file out. */
@@ -818,7 +824,11 @@ export class SessionStore {
     const budget = { ...RECALL_SCAN_BUDGET, ...opts.budget };
     const now = budget.now ?? (() => performance.now());
     const startedAt = now();
-    const progress: JsonlReadProgress = { bytesRead: 0, maxBytes: budget.maxBytes };
+    const progress: JsonlReadProgress = {
+      bytesRead: 0,
+      maxBytes: budget.maxBytes,
+      outOfTime: () => now() - startedAt > budget.maxMs,
+    };
     const readSet = this.transcriptReadSet(key);
     const ordered = !readSet.hasSidecars;
 
@@ -827,6 +837,7 @@ export class SessionStore {
     // The oldest placeable record the scan has passed: how far back it got.
     let reachedBackTo: number | null = null;
     const exhausted = (): "time" | "bytes" | null => {
+      if (progress.timedOut) return "time";
       if (progress.bytesRead > budget.maxBytes) return "bytes";
       // The clock is read once per few records: a search of tens of thousands
       // of short records should not spend its budget asking the time.
@@ -885,7 +896,7 @@ export class SessionStore {
       // The reader itself stopped at the byte budget, part-way through a line
       // too long to yield or a run of lines that do not parse.
       if (progress.cutShort) {
-        stopped = { reason: "bytes", reachedBackTo: ordered ? reachedBackTo : null };
+        stopped = { reason: progress.timedOut ? "time" : "bytes", reachedBackTo: ordered ? reachedBackTo : null };
         break;
       }
     }

@@ -305,14 +305,15 @@ describe("recall_conversation scored search", () => {
     for (let i = 1; i <= 200; i++) {
       seedMessage(store, { content: `ramen visit ${i}.`, timestamp: T0 + i * MINUTE_MS });
     }
-    // The scan reads the clock once to start and then once every 64 records.
-    // This one jumps past the budget on its third reading: the newest 64
-    // records are scanned, and the scan is out of time before the 65th.
+    // The scan reads the clock once to start, once in the reader before the
+    // file's only chunk, and then once every 64 records. This one jumps past
+    // the budget on its fourth reading: the newest 64 records are scanned,
+    // and the scan is out of time before the 65th.
     let readings = 0;
     const result = await text({ query: "ramen", limit: 100 }, {
       recall: (opts) => store.recallTranscript(SESSION_KEY, {
         ...opts,
-        budget: { now: () => (++readings >= 3 ? 1000 : 0) },
+        budget: { now: () => (++readings >= 4 ? 1000 : 0) },
       }),
     });
 

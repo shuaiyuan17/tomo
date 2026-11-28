@@ -305,6 +305,8 @@ describe("sub-session tools", () => {
     // Long AND briefable; a follow-up alone is no reason; connectors keep work here whatever its length.
     expect(DELEGATION_NOTE).toMatch(/only when it is long[^.]*and you can brief it self-contained/);
     expect(DELEGATION_NOTE).toMatch(/A likely follow-up alone is no reason/);
+    // Reuse first: more work on something a task already did goes to that task.
+    expect(DELEGATION_NOTE).toMatch(/Before a new `task_spawn`, look in `task_status`[^.]*goes to that task with `task_message` \(with `attach_owner_message` when it is the owner's ask\), a finished one included/);
     expect(DELEGATION_NOTE).toMatch(/connectors or external MCP servers stays here however long it runs/);
     // The prompt is per session, the audience per turn: a summoned group's turn on the DM session is told here.
     expect(DELEGATION_NOTE).toMatch(/Only in a turn the owner wrote privately: `task_spawn` refuses a turn a group steers/);

@@ -11,7 +11,11 @@ import type { BackoffTimers } from "../src/agent/keyed-backoff.js";
 // The owning session's wakes, with every collaborator faked: a serial turn
 // queue per session, a note table, and retry timers the test fires by hand.
 // docs/subsessions-invariants.md: "a wake is eventually followed by a turn
-// that reads the note" was not checked end to end; this checks it here.
+// that reads the note" was not checked by anything. This checks the wake
+// side of it: whatever the turns do (throw, end without reading, never run),
+// another wake comes until a turn ran that read the note. That such a turn's
+// prompt carries the note is the turn runner's half, checked through the
+// real Agent in subsessions-via-main-agent.test.ts.
 // ---------------------------------------------------------------------------
 
 /** What one wake's turn does: reads the note, throws, ends without reading it, or never runs (the queue rejects). */

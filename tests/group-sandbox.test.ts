@@ -808,16 +808,31 @@ describe.runIf(sandboxRuns)("ancestors of denied paths", () => {
   });
 
   it("still writes and creates the ancestors' other children", () => {
-    const r = run(`echo fine > ${q(join(fx.ws, "memory", "foo.md"))} && mkdir -p ${q(join(fx.ws, "memory", "sub"))} && cat ${q(join(fx.ws, "memory", "foo.md"))}`);
+    const r = run(`echo fine > ${q(join(fx.ws, "foo.md"))} && mkdir -p ${q(join(fx.ws, "sub"))} && cat ${q(join(fx.ws, "foo.md"))}`);
     expect(r).toMatchObject({ code: 0 });
     expect(r.out).toContain("fine");
+  });
+});
+
+describe.runIf(sandboxRuns)("memory/ is not writable from a group shell", () => {
+  it("not by a redirection, and not by an interpreter the text filter cannot read", () => {
+    run(`echo injected >> ${q(PUBLIC)}; python3 -c "open('${PUBLIC}','a').write('injected')"; echo x > ${q(join(fx.ws, "memory", "new.md"))}`);
+    expect(readFileSync(PUBLIC, "utf8")).toBe("PUBLIC\n");
+    expect(existsSync(join(fx.ws, "memory", "new.md"))).toBe(false);
+    expect(run(`cat ${q(PUBLIC)}`).out).toContain("PUBLIC");
   });
 });
 
 describe("file tools and ancestors", () => {
   it("Write cannot target a directory above a protected path", async () => {
     expect(denied(await hook()({ tool_name: "Write", tool_input: { file_path: join(fx.ws, "memory"), content: "x" } }))).toBe(true);
-    expect(await hook()({ tool_name: "Write", tool_input: { file_path: join(fx.ws, "memory", "new.md"), content: "x" } })).toEqual({});
+    expect(await hook()({ tool_name: "Write", tool_input: { file_path: join(fx.ws, "new.md"), content: "x" } })).toEqual({});
+  });
+
+  it("Write cannot reach memory/: the memory tools write it", async () => {
+    for (const file of ["MEMORY.md", "topic.md", join("groups", "telegram_-100", "x.md"), join("incoming-files", "x.txt")]) {
+      expect(denied(await hook()({ tool_name: "Write", tool_input: { file_path: join(fx.ws, "memory", file), content: "x" } })), file).toBe(true);
+    }
   });
 });
 

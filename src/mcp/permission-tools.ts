@@ -38,7 +38,7 @@ export function buildPermissionTools({ broker, sessionKey, scope }: PermissionTo
     tool(
       "request_permission",
       [
-        "Ask the owner to let this group reach a path its sandbox does not cover. On a group turn, Bash and the file tools can read and write the workspace (except memory/private/ and secrets/) and the temp dirs, and read the system directories; anything else fails with EPERM / \"Not available on this turn\".",
+        "Ask the owner to let this group reach a path its sandbox does not cover. On a group turn, Bash and the file tools can read the workspace (except memory/private/ and secrets/), write it (except memory/, which the memory tools write, and secrets/), use the temp dirs, and read the system directories; anything else fails with EPERM / \"Not available on this turn\".",
         "",
         "Call this when a task really needs something outside that (a project checkout, a document folder), with the real path, read or write, and a one-line reason. It returns at once with {status:\"pending\", code}, or \"already_allowed\", or \"denied\" (the path is never granted to a group: Tomo's own files, secrets, private memory, keychains, ~/.ssh; or this group already has a request open). Do not wait or poll: tell the group you asked the owner and end the turn.",
         "",

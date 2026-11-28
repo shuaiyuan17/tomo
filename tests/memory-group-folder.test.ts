@@ -215,7 +215,10 @@ describe("file tools on a group's turn", () => {
     expect(await denied(h, "Read", { file_path: join(tree.mem, "shared.md") })).toBe(false);
   });
 
-  it("can't create files in a group folder that doesn't exist yet, unless it is its own", async () => {
+  // `denied` checks the other-group refusal only: the group's own folder is not
+  // refused as another group's. (A file-tool write under memory/ is refused anyway,
+  // by the group path policy: tests/group-sandbox.test.ts.)
+  it("can't create files in a group folder that doesn't exist yet, and its own is not refused as another group's", async () => {
     const h = hook(OWN_KEY, "group-session");
     expect(await denied(h, "Write", { file_path: join(tree.mem, "groups", "telegram_-100999", "new.txt"), content: "x" })).toBe(true);
     expect(await denied(h, "Write", { file_path: join(tree.mem, "groups", "stray.txt"), content: "x" })).toBe(true);

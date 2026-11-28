@@ -604,9 +604,11 @@ export function buildHooksOption(args: {
     mergeHooks(hooks, dbGuardHooks(args.sessionKey, config.workspaceDir, args.dbPath));
   }
   // Deny-only (or log-only in warn mode), like the todo guard above. Not on a
-  // sub-session: its own guard below keeps it out of all of memory/.
+  // sub-session: its own guard below keeps it out of all of memory/. On a
+  // private-memory-barred turn it denies in every mode.
   if (args.memoryStoreGuard && !args.subsessionMemoryGuard) {
-    mergeHooks(hooks, memoryStoreGuardHooks(args.sessionKey, config.workspaceDir, () => config.workspaceDir, args.memoryStoreGuard));
+    const bar = args.privateMemoryBar;
+    mergeHooks(hooks, memoryStoreGuardHooks(args.sessionKey, config.workspaceDir, () => config.workspaceDir, args.memoryStoreGuard, () => bar?.() != null));
   }
   // Deny-only, like the todo guard above.
   if (args.subsessionMemoryGuard && args.sessionKey) {

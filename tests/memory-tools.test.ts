@@ -367,18 +367,44 @@ describe("memory_read", () => {
 });
 
 describe("memory_search", () => {
-  it("is literal and case-insensitive, with path and line", async () => {
+  it("is case-insensitive, with path and line, in file order with the cores first", async () => {
     put("MEMORY.md", "# M\n- Aisle seats\n");
     put("travel.md", topic("t", "- no red-eye\n- AISLE please\n"));
     const r = await tools().call("memory_search", { query: "aisle" });
     expect(r.text.split("\n")).toEqual(["MEMORY.md:2: - Aisle seats", "travel.md:5: - AISLE please"]);
   });
 
+  it("is scored like recall: words in any order, whole words, Chinese by pieces", async () => {
+    put("trip.md", topic("t", "- seats: aisle on long flights\n- an aisleway\n- 搬家时间定在周六\n- 时间不够\n"));
+    const t = tools();
+    expect((await t.call("memory_search", { query: "flights aisle" })).text).toBe("trip.md:4: - seats: aisle on long flights");
+    expect((await t.call("memory_search", { query: "aisle" })).text).not.toContain("aisleway");
+    expect((await t.call("memory_search", { query: "搬家时间" })).text).toBe("trip.md:6: - 搬家时间定在周六");
+  });
+
+  it("keeps the best matches: the exact phrase late in a file beats earlier lines with the same words", async () => {
+    put("a.md", topic("a", [...Array.from({ length: 60 }, (_, i) => `- seat by the window ${i}`), "- window seat"].join("\n")));
+    const lines = (await tools().call("memory_search", { query: "window seat" })).text.split("\n");
+    expect(lines.filter((l) => l.startsWith("a.md:"))).toHaveLength(SEARCH_MAX_RESULTS);
+    expect(lines).toContain("a.md:64: - window seat");
+  });
+
   it(`stops at ${SEARCH_MAX_RESULTS} matches`, async () => {
     put("many.md", topic("m", Array.from({ length: 80 }, () => "- hit").join("\n")));
     const lines = (await tools().call("memory_search", { query: "hit" })).text.split("\n");
     expect(lines.filter((l) => l.startsWith("many.md:"))).toHaveLength(SEARCH_MAX_RESULTS);
-    expect(lines.at(-1)).toContain("stopped at");
+    expect(lines.at(-1)).toContain(`showing the best ${SEARCH_MAX_RESULTS}`);
+  });
+
+  it("leaves journal/ out unless asked", async () => {
+    put("journal/2026-11-27.md", "# Journal\n- needle in the journal\n");
+    put("private/journal/2026-11-27.md", "# Journal\n- needle in the private journal\n");
+    put("notes.md", topic("n", "- needle in a note\n"));
+    const t = tools();
+    expect((await t.call("memory_search", { query: "needle" })).text).toBe("notes.md:4: - needle in a note");
+    const all = (await t.call("memory_search", { query: "needle", include_journal: true })).text;
+    expect(all).toContain("journal/2026-11-27.md:2: - needle in the journal");
+    expect(all).toContain("private/journal/2026-11-27.md:2: - needle in the private journal");
   });
 
   it("does not search people or attachments", async () => {

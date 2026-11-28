@@ -11,7 +11,8 @@ import { isEnoent } from "../fs-utils.js";
  * (`./bash-sandbox.ts`) and the file-tool guard (`./private-memory-guard.ts`).
  *
  * DEFAULT DENY. A group turn may read the system directories a shell needs,
- * read and write the workspace and the temp dirs, and touch whatever its group
+ * read and write the workspace (not write memory/: the memory tools do that) and
+ * the temp dirs, and touch whatever its group
  * entry in `groupSandbox` adds. Everything else is out of reach — the owner's
  * home directory, Tomo's own config, logs and state, other checkouts.
  *
@@ -250,7 +251,10 @@ export function groupPathPolicy(input: GroupPathPolicyInput): GroupPathPolicy {
       ...links.targets,
     ],
     denyPrefixes: input.tomoHome ? TOMO_HOME_DENY_PREFIXES.map((name) => join(input.tomoHome!, name)) : [],
-    writeDenyDirs: [input.homeSceneDir, join(input.workspaceDir, ".claude")],
+    // memory/ (the private dir's parent) is written by the memory tools, which
+    // run in the harness, not in this shell. A group shell that could write it
+    // would put its words into the shared core, which goes into the owner's prompt.
+    writeDenyDirs: [dirname(input.privateDir), input.homeSceneDir, join(input.workspaceDir, ".claude")],
     ...(links.unresolvable ? { unresolvable: links.unresolvable } : {}),
   };
 }
@@ -403,7 +407,7 @@ export function groupPathDenial(
 
 /** Denial text for a file-tool call the group policy refuses. */
 export function groupPathDenialReason(detail: string): string {
-  return `Not available on this turn: ${detail}. A group turn can read and write the workspace (except memory/private/ and secrets/), read system directories, and use the temp dirs; anything else needs the owner to add it to this group's sandbox config. Do not retry with a different spelling of the path.`;
+  return `Not available on this turn: ${detail}. A group turn can read the workspace (except memory/private/ and secrets/) and write it (except memory/, which the memory tools write, and secrets/), read system directories, and use the temp dirs; anything else needs the owner to add it to this group's sandbox config. Do not retry with a different spelling of the path.`;
 }
 
 /**

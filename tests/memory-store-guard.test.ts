@@ -198,6 +198,20 @@ describe("memory-store guard: installed on every session but a sub-session", () 
     expect(await reasons(args, write)).toEqual([MEMORY_STORE_WRITE_DENIAL]);
   });
 
+  it("denies on a group's or a summoned turn whatever the mode, since the shared core goes into the owner's prompt", async () => {
+    for (const mode of ["warn", "off"] as const) {
+      let bar: "group-session" | "summoned-turn" | null = "summoned-turn";
+      const args = { maxTurns: 10, sessionKey: "dm:alex", memoryStoreGuard: () => mode, privateMemoryBar: () => bar };
+      for (const file of ["MEMORY.md", "travel.md"]) {
+        expect(await reasons(args, { tool_name: "Write", tool_input: { file_path: `${tree.mem}/${file}` } }), `${mode} ${file}`).toContain(MEMORY_STORE_WRITE_DENIAL);
+      }
+      bar = null;
+      expect(await reasons(args, write), `${mode}, the owner's own turn`).toEqual([]);
+      const group = { maxTurns: 10, sessionKey: "telegram:-100123", memoryStoreGuard: () => mode, privateMemoryBar: () => "group-session" as const };
+      expect(await reasons(group, write), `${mode}, a group session`).toContain(MEMORY_STORE_WRITE_DENIAL);
+    }
+  });
+
   it("leaves a sub-session to its own guard, which keeps it out of all of memory/", async () => {
     const denied = await reasons({ maxTurns: 10, sessionKey: "task:s1", memoryStoreGuard: () => "enforce", subsessionMemoryGuard: true }, write);
     expect(denied).toEqual([SUBSESSION_MEMORY_WRITE_DENIAL]);

@@ -4,7 +4,7 @@ const { cfg } = vi.hoisted(() => ({ cfg: { lcm: { forceCompactAtPct: 95 }, local
 vi.mock("../src/config.js", () => ({ config: cfg }));
 vi.mock("../src/logger.js", () => ({ log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
-const { ForceCompactor, FORCE_COMPACT_MAX_PER_HOUR, sessionNote } = await import("../src/agent/force-compactor.js");
+const { ForceCompactor, FORCE_COMPACT_MAX_PER_HOUR, sessionNote, memoryPassNote } = await import("../src/agent/force-compactor.js");
 import type { ForceCompactorDeps } from "../src/agent/force-compactor.js";
 import type { ForceCompactReport } from "../src/lcm/force-compact.js";
 import type { RunningTaskRecord } from "../src/agent/running-agents-ledger.js";
@@ -237,6 +237,31 @@ describe("ForceCompactor run", () => {
     expect(deps.sessionClosed).not.toHaveBeenCalled();
     exit();
     await vi.waitFor(() => expect(deps.sessionClosed).toHaveBeenCalledWith("dm:owner"));
+  });
+
+  it("asks the owner's DM, and only it, for the memory pass of the days it took, held for the owner's own turn", async () => {
+    const dm = makeDeps();
+    const fc = new ForceCompactor(dm.deps);
+    fc.maybeStart("dm:owner", reading(970), "threshold");
+    await fc.running("dm:owner");
+    expect(dm.events).toEqual(["hold", "quiesce", "mark", "compact", "note", "note", "interrupted-note", "release"]);
+    const pass = dm.deps.queueNote.mock.calls[1][1];
+    expect(pass).toMatch(/^<tomo-event type="force-compacted" name="memory-pass"[^>]* audience="owner">/);
+    expect(pass).toContain("2026-11-22 09:00 → 2026-11-22 18:00");
+    expect(pass).toContain("recall_conversation");
+
+    const group = makeDeps();
+    const fg = new ForceCompactor(group.deps);
+    fg.maybeStart("telegram:-100", reading(970), "threshold");
+    await fg.running("telegram:-100");
+    expect(group.deps.queueNote).toHaveBeenCalledTimes(1);
+
+    const pruned = makeDeps({ compact: vi.fn(async () => okReport({ summarized: [] })) });
+    const fp = new ForceCompactor(pruned.deps);
+    fp.maybeStart("dm:owner", reading(970), "threshold");
+    await fp.running("dm:owner");
+    expect(pruned.deps.queueNote).toHaveBeenCalledTimes(1);
+    expect(memoryPassNote(okReport({ summarized: [], archived: [{ from: "a", to: "b", events: 5 }] }))).toContain("took a → b out");
   });
 
   it("tells the session about an archive fallback and a still-high result", () => {

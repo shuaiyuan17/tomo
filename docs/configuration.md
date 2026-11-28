@@ -220,7 +220,7 @@ Tomo writes its memory (`~/.tomo/workspace/memory/`) with its memory tools (`mem
 - `"warn"`: allowed, and logged (`Direct write to memory`, with the session, the tool, the path and the subagent type) so you can find what still writes directly before switching to `enforce`.
 - `"off"`: not checked.
 
-Attachments under `memory/incoming-*/`, reads, and non-Markdown files are never affected. Sub-sessions keep their own, stricter guard (no writes under `memory/` at all). The shell check reads the command text, so it catches habits, not a script determined to get around it.
+Attachments under `memory/incoming-*/`, reads, and non-Markdown files are never affected. Sub-sessions keep their own, stricter guard (no writes under `memory/` at all). On a group's turn (a group session, or a summoned group's turn on your DM session) a direct write is refused whatever this says, and a group's sandboxed shell cannot write under `memory/` at all: the shared files go into your own prompt. The shell check reads the command text, so it catches habits, not a script determined to get around it.
 
 ## Continuity heartbeats
 

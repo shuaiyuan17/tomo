@@ -33,7 +33,9 @@ import { commandWordIndex } from "./todo-store-guard.js";
  *
  * `memory.storeGuard` sets the mode: `enforce` (default) denies, `warn`
  * allows and logs who wrote what (to find an install's remaining direct
- * writers before enforcing), `off` does nothing.
+ * writers before enforcing), `off` does nothing. Not on a private-memory-barred
+ * turn (a group's, or a summoned one): there it always denies, because the
+ * shared core it would write goes into the owner's own prompt.
  */
 export type MemoryStoreGuardMode = "enforce" | "warn" | "off";
 
@@ -286,13 +288,22 @@ export function memoryGuardTarget(toolName: string, toolInput: unknown, ctx: Ctx
   }
 }
 
-/** The PreToolUse hook. `mode` and `memoryDir` are read per call. */
-export function memoryStoreGuardHooks(sessionKey: string | undefined, cwd: string, workspaceDir: () => string, mode: () => MemoryStoreGuardMode) {
+/**
+ * The PreToolUse hook. `mode`, `memoryDir` and `barred` are read per call;
+ * `barred` (the turn is private-memory-barred) makes it `enforce` whatever the mode.
+ */
+export function memoryStoreGuardHooks(
+  sessionKey: string | undefined,
+  cwd: string,
+  workspaceDir: () => string,
+  mode: () => MemoryStoreGuardMode,
+  barred: () => boolean = () => false,
+) {
   return {
     PreToolUse: [{
       onFailure: "block" as const,
       hooks: [async (input: { tool_name: string; tool_input: unknown; agent_id?: string; agent_type?: string }) => {
-        const m = mode();
+        const m = barred() ? "enforce" : mode();
         if (m === "off") return {};
         const target = memoryGuardTarget(input.tool_name, input.tool_input, { cwd, memoryDir: join(workspaceDir(), "memory") });
         if (target === null) return {};

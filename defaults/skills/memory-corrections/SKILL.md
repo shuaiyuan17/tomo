@@ -23,7 +23,7 @@ In a group chat you can change only lines in that chat's own memory folder. For 
 
 ## Update the record and its consequences
 - In the same turn, change the stored line to the confirmed value (memory_str_replace, or upsert_person for a person), with today's date. If this value has been wrong before, write what it is not as well: "the 14th (not the 15th)".
-- Find other copies with memory_search, and what used the old value (todos, scheduled jobs), and fix them, within the owner's instructions. Say the changed consequences plainly.
+- Find other copies with memory_search (search the exact old value; it matches whole words, and journal/ only with include_journal), and what used the old value (todos, scheduled jobs), and fix them, within the owner's instructions. Say the changed consequences plainly.
 - Own the earlier error in one plain sentence, without debating it or blaming an older record.
 
 ## Say where a snapshot came from

@@ -293,8 +293,9 @@ function TodoLine({ row, state, alone }: { row: TodoRow; state: CardState; alone
   const resolved = activity.kind === "todo_resolve" ? RESOLVED[activity.action] : undefined;
   const Icon = state === "running" ? RunningMark : state === "unknown" ? CircleHelpIcon : add ? PlusIcon : resolved!.icon;
   const id = outcome.id ?? (activity.kind === "todo_resolve" ? activity.id : undefined);
-  // A resolve's title is the tool's printed words (title, and next step): its English field label is said in the reader's language.
-  const title = add ? activity.title : outcome.title?.replaceAll(" · next: ", ` · ${t("card.todoNextLabel")} `);
+  // A resolve's title is the tool's printed words verbatim (title, and its next step after " · next: " when that differs):
+  // English like every tool's own text here, and never re-split, since a title can hold the same marker.
+  const title = add ? activity.title : outcome.title;
   const struck = state === "done" && (activity.kind === "todo_resolve" && (activity.action === "done" || activity.action === "drop"));
   const date = outcome.review ?? (add ? activity.reviewIn : undefined);
   const small: string[] = [];

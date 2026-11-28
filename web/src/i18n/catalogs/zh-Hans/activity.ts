@@ -30,7 +30,6 @@ export const activity = {
     everySeconds_other: "每 {{count}} 秒",
     everyDays_other: "每 {{count}} 天", everyHours_other: "每 {{count}} 小时", everyMinutes_other: "每 {{count}} 分钟",
     todoWaiting: { me: "等我", owner: "等你", external: "等别人" },
-    todoNextLabel: "下一步：",
     todoNext: "下一步：{{next}}", todoReview: "{{date}} 再看", todoDue: "{{date}} 到期", todoUntil: "推到 {{date}}", todoSnoozes: "第 {{count}}/{{max}} 次推后",
     todoNotAdded: "没加上：{{reason}}", todoNotUpdated: "没更新：{{reason}}",
     scheduledOnce: "定了一个任务 · 只跑一次", scheduledRecurring: "定了一个任务 · 重复", scheduling: "正在定任务", scheduleFailed: "没能定“{{name}}”",

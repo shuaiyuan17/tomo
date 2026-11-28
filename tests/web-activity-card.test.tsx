@@ -256,10 +256,10 @@ describe("to-do cards", () => {
     expect(snoozed).toContain("until Dec 4 · snoozed 2 of 3 · waiting on CI");
     expect(snoozed).not.toContain("line-through");
   });
-  it("a resolve's printed next step is labelled in the reader's language", async () => {
+  it("a resolve's title is the tool's printed words, untouched, in either language", async () => {
     await i18n.changeLanguage("zh-Hans");
     try {
-      expect(card(row(call(done, { outcome: { id: "t-40", title: "Ship · next: merge it" } })))).toContain("Ship · 下一步： merge it");
+      expect(card(row(call(done, { outcome: { id: "t-40", title: "Plan · next: discuss" } })))).toContain("Plan · next: discuss");
     } finally { await i18n.changeLanguage("en"); }
   });
   it("calls in a row merge into one card: a failed add, the retry, and closes; the head counts them", () => {

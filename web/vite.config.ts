@@ -28,13 +28,15 @@ export default defineConfig({
     // The Study, the screen window and the task view are lazy chunks. React
     // is its own chunk: its name (hash) survives app releases, so a browser
     // keeps it in cache (hashed assets are served immutable) across upgrades.
-    // The largest chunk is the home room's three.js (~530 kB, lazy, only on
-    // #home); the chat's own chunk (with both languages' copy) is under 600 kB.
+    // i18next and three.js are their own chunks for the same reason (a stable
+    // vendor hash); the catalogs stay with the app. three.js (~550 kB) is the
+    // largest chunk, lazy, loaded only with the home room on #home; the chat's
+    // own chunk (with both languages' copy) is under 600 kB.
     chunkSizeWarningLimit: 600,
-    rollupOptions: {
-      // i18next is its own chunk for the same reason (a stable vendor hash); the catalogs stay with the app.
-      output: { advancedChunks: { groups: [{ name: "react", test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/ },
-        { name: "i18n", test: /node_modules[\\/](i18next|react-i18next|html-parse-stringify|void-elements)[\\/]/ }] } },
+    rolldownOptions: {
+      output: { codeSplitting: { groups: [{ name: "react", test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/ },
+        { name: "i18n", test: /node_modules[\\/](i18next|react-i18next|html-parse-stringify|void-elements)[\\/]/ },
+        { name: "three", test: /node_modules[\\/]three[\\/]/ }] } },
       // Radix ships "use client" for React Server Components; meaningless in a client-only bundle.
       onwarn(warning, warn) { if (warning.code !== "MODULE_LEVEL_DIRECTIVE") warn(warning); },
     },

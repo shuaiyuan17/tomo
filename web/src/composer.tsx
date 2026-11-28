@@ -94,7 +94,6 @@ export function reactFailure(err: unknown): Message {
     : deferred.t("chat:composer.reactUncertain");
 }
 
-/** A resend that could not bring all of the original's attachments back (a failed read, a full tray). */
 /** Who a reply quotes, worded when shown. */
 const selfMessage = deferred.t("chat:composerWho.self");
 const agentMessage = (agent: string) => deferred.t("chat:composerWho.agent", { agent });

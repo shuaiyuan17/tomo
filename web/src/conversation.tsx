@@ -79,6 +79,9 @@ export function Conversation({ web, agent, session, sessionId, ownerConversation
   const [flashId, setFlashId] = useState<string>();
   const messages = useRef(history.messages);
   messages.current = history.messages;
+  // The flash timers still pending, cleared if the conversation goes first.
+  const flashTimers = useRef(new Set<ReturnType<typeof setTimeout>>());
+  useEffect(() => { const timers = flashTimers.current; return () => { for (const timer of timers) clearTimeout(timer); timers.clear(); }; }, []);
   // One object for the rows' whole life: memoized rows never re-render for a new handler.
   const actions = useMemo<RowActions>(() => ({
     startReply: (message) => composer.current?.startReply(message),
@@ -90,7 +93,8 @@ export function Conversation({ web, agent, session, sessionId, ownerConversation
       const message = messages.current.find((m) => m.id === id);
       if (message) scroller.current?.scrollToRow(rowId(message));
       setFlashId(id);
-      setTimeout(() => setFlashId((current) => (current === id ? undefined : current)), 1_600);
+      const timer = setTimeout(() => { flashTimers.current.delete(timer); setFlashId((current) => (current === id ? undefined : current)); }, 1_600);
+      flashTimers.current.add(timer);
     },
   }), []);
 

@@ -1,12 +1,12 @@
-import { createHash, randomUUID } from "node:crypto";
-import { readFileSync, readdirSync, statSync, mkdirSync, existsSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { readFileSync, statSync, mkdirSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { CronJob, CronOutcome, CronSchedule, InterruptNotice, InterruptedRun, InterruptedSkip, SkipNotice } from "./types.js";
 import { DbDamagedError, openTomoDb, type TomoDb } from "../db/index.js";
-import { writeFileAtomicSync, writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
+import { deleteMeta, digestOf, isPlaceholder, keepAside, metaValue, setMeta, writePlaceholder } from "../db/legacy.js";
+import { writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
 import { log } from "../logger.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
-import { fileTimestamp } from "../sessions/transcript-names.js";
 import { computeNextRun, everyIntervalReason, isSingleFire, missedSlots, staleWindowMs, type StaleSkip } from "./schedule.js";
 
 /** Failed one-shot ("at") jobs retry this many times before being disabled. */
@@ -653,7 +653,7 @@ export const CRON_EXPORTED_KEY = "legacy_cron_jobs_exported";
  * export reads it as an unreadable store and refuses to schedule (and says
  * so), instead of reading a missing file as a fresh install with no jobs.
  */
-export function cronPlaceholder(dbPath: string): Record<string, string> {
+export function cronPlaceholder(dbPath: string): { movedToDatabase: string; note: string } {
   return {
     movedToDatabase: dbPath,
     note: "Tomo keeps its scheduled tasks in its database now (table cron_jobs). This file is deliberately not a jobs file, "
@@ -678,7 +678,7 @@ function readLegacy(path: string): LegacyState {
   }
   try {
     const data = JSON.parse(raw.toString("utf-8")) as Record<string, unknown> | null;
-    if (data !== null && typeof data === "object" && typeof data.movedToDatabase === "string" && !("jobs" in data)) {
+    if (isPlaceholder(data, ["jobs"])) {
       return { kind: "placeholder" };
     }
   } catch {
@@ -690,14 +690,6 @@ function readLegacy(path: string): LegacyState {
   } catch (err) {
     return { kind: "unreadable", error: err as CronStoreReadError };
   }
-}
-
-function digestOf(raw: Buffer | string): string {
-  return createHash("sha256").update(raw).digest("hex");
-}
-
-function metaValue(db: TomoDb, key: string): string | undefined {
-  return db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", key)?.value;
 }
 
 /**
@@ -756,10 +748,10 @@ export function importLegacyCronJobs(dbPath: string): CronImportOutcome {
   }
   const db = sharedDb(dbPath);
   if (state.kind === "absent" || state.kind === "placeholder") {
-    if (state.kind === "absent") writePlaceholder(path, dbPath);
+    if (state.kind === "absent") writePlaceholder(path, cronPlaceholder(dbPath));
     // A rollback export that marked the table but never wrote its file (it
     // failed or was killed): the table is still the truth.
-    if (db.run("DELETE FROM meta WHERE key = ?", CRON_EXPORTED_KEY) > 0) {
+    if (deleteMeta(db, CRON_EXPORTED_KEY) > 0) {
       log.warn({ file: path }, "A cron rollback export never wrote its file; the jobs stay in the database");
     }
     return { kind: "none" };
@@ -769,7 +761,7 @@ export function importLegacyCronJobs(dbPath: string): CronImportOutcome {
       // Already in the table. Beside an export mark it is not the export
       // (that one never has an imported digest): the export never landed in
       // this state of things (a restored backup), and the table is the truth.
-      db.run("DELETE FROM meta WHERE key = ?", CRON_EXPORTED_KEY);
+      deleteMeta(db, CRON_EXPORTED_KEY);
       return null;
     }
     const replace = metaValue(db, CRON_EXPORTED_KEY) !== undefined;
@@ -785,8 +777,8 @@ export function importLegacyCronJobs(dbPath: string): CronImportOutcome {
       holdBadInterval(job, path);
       db.run("INSERT INTO cron_jobs (id, job) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET job = excluded.job", job.id, JSON.stringify(job));
     }
-    db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", CRON_IMPORTED_KEY, state.digest);
-    db.run("DELETE FROM meta WHERE key = ?", CRON_EXPORTED_KEY);
+    setMeta(db, CRON_IMPORTED_KEY, state.digest);
+    deleteMeta(db, CRON_EXPORTED_KEY);
     return { jobs: seen.size, before, replace };
   });
   if (imported) {
@@ -806,36 +798,11 @@ export function importLegacyCronJobs(dbPath: string): CronImportOutcome {
   let aside: string | null = null;
   try {
     aside = keepAside(path, state.raw);
-    writePlaceholder(path, dbPath);
+    writePlaceholder(path, cronPlaceholder(dbPath));
   } catch (err) {
     log.warn({ err, file: path }, "Imported the cron jobs file but could not replace it with the placeholder; will retry next start");
   }
   return { kind: "imported", jobs: imported?.jobs ?? state.jobs.length, aside };
-}
-
-/** Copy the imported file to `<path>.migrated-<ts>` (fsynced), unless a copy with the same content is already there. Returns its path. */
-function keepAside(path: string, raw: string): string {
-  const dir = dirname(path);
-  const prefix = `${basename(path)}.migrated-`;
-  for (const name of readdirSync(dir)) {
-    if (!name.startsWith(prefix)) continue;
-    try {
-      if (readFileSync(join(dir, name), "utf-8") === raw) return join(dir, name);
-    } catch { /* not ours to judge; pick a new name */ }
-  }
-  const ts = fileTimestamp();
-  for (let n = 0; n < 100; n++) {
-    const to = n === 0 ? `${path}.migrated-${ts}` : `${path}.migrated-${ts}-${n}`;
-    if (existsSync(to)) continue;
-    writeFileAtomicSync(to, raw, { fsync: true });
-    return to;
-  }
-  throw new Error("no free name to copy it to");
-}
-
-function writePlaceholder(path: string, dbPath: string): void {
-  mkdirSync(dirname(path), { recursive: true });
-  writeJsonAtomicSync(path, cronPlaceholder(dbPath), { fsync: true });
 }
 
 /**
@@ -877,7 +844,7 @@ export function exportCronJobsToFile(db: TomoDb, out: string, opts: { mark: bool
   // Tomo deleted). A mark whose file never landed is undone below, or by the
   // next start, which finds only the placeholder.
   const jobs = db.transaction(() => {
-    db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", CRON_EXPORTED_KEY, new Date().toISOString());
+    setMeta(db, CRON_EXPORTED_KEY, new Date().toISOString());
     return readJobs(db);
   });
   try {
@@ -887,7 +854,7 @@ export function exportCronJobsToFile(db: TomoDb, out: string, opts: { mark: bool
     // its rename (the chmod, the directory fsync), and a landed file without
     // the mark would be merged on import instead of replacing the table.
     if (legacyCronFileReplaceable(out)) {
-      try { db.run("DELETE FROM meta WHERE key = ?", CRON_EXPORTED_KEY); } catch { /* the next start undoes it */ }
+      try { deleteMeta(db, CRON_EXPORTED_KEY); } catch { /* the next start undoes it */ }
     }
     throw err;
   }

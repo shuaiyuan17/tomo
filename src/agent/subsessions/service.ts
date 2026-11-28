@@ -434,8 +434,10 @@ export class SubsessionService {
   /**
    * Reports whose note is on disk and whose wake is sent, but whose
    * `reportDelivered` mark could not be written yet (task id → report seq).
-   * A task_finish that lands before the retry treats that report as delivered:
-   * kept beside the new one only while its note is unread, never noted again.
+   * A task_finish that lands before the mark is written treats that report as
+   * delivered: kept beside the new one only while its note is unread, never
+   * noted again. Kept past the last retry, for as long as this process runs:
+   * giving up on the mark does not make the note unwritten.
    */
   private readonly markOwed = new Map<string, number | undefined>();
   /** The highest input seq the turn in flight carries, per task (runtime only). */
@@ -1469,6 +1471,8 @@ export class SubsessionService {
       return { ...outcome, unread: unread.length };
     }
     this.finishRefusals.delete(id);
+    // A new report: what was owed for the one before it went into this write.
+    this.markOwed.delete(id);
     if (forced) log.warn({ id, unread: unread.length }, "Sub-session finished with input it has not read, after refusals in a row; the input stays pending");
     this.continueOwed.delete(record.id);
     this.spoke.add(record.id);
@@ -2981,6 +2985,7 @@ export class SubsessionService {
     try {
       this.store.update(id, (r) => { if (r.reportSeq === seq) r.reportDelivered = true; });
       this.clearReportRetry(id);
+      this.markOwed.delete(id);
       return;
     } catch (err) {
       log.error({ err, id }, "Could not mark a sub-session report delivered; trying again");
@@ -3082,7 +3087,6 @@ export class SubsessionService {
     if (timer) clearTimeout(timer);
     this.reportTimers.delete(id);
     this.reportAttempts.delete(id);
-    this.markOwed.delete(id);
   }
 
   /**

@@ -795,11 +795,14 @@ describe("sub-session service, model-based", () => {
     const began = performance.now();
     let ran = 0;
     let skipped = 0;
+    let failed = false;
     await fc.assert(
       fc.asyncProperty(fc.array(opArb, { minLength: 10, maxLength: 60, size: "max" }), cfgArb, async (ops, cfg) => {
         // performance.now() is not faked: this is the test's real run time.
-        if (++ran > REGRESSIONS.length && performance.now() - began > TIME_LIMIT_MS) { skipped += 1; return; }
+        // Not once a run has failed: the runs that shrink it are all made.
+        if (++ran > REGRESSIONS.length && !failed && performance.now() - began > TIME_LIMIT_MS) { skipped += 1; return; }
         const violations = await runOps(ops, cfg);
+        if (violations.length > 0) failed = true;
         expect(violations).toEqual([]);
       }),
       { seed: SEED, numRuns: RUNS, examples: REGRESSIONS, endOnFailure: false },

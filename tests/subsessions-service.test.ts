@@ -3,10 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_SUBSESSIONS, type SubsessionConfig } from "../src/config.js";
-import { BACKGROUND_WAIT_MAX_MS, BACKGROUND_WAIT_REASON, CRON_RECHECK_MS, ENDED_KEEP_MS, EXTERNAL_WAIT_CHECK_MS, FINISHED_KEEP_MS, MAX_FINISH_REFUSALS, MAX_INTERRUPT_STREAK, REGISTRY_RECHECK_MS, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
+import { BACKGROUND_WAIT_MAX_MS, BACKGROUND_WAIT_REASON, CRON_RECHECK_MS, ENDED_KEEP_MS, EXTERNAL_WAIT_CHECK_MS, FINISHED_KEEP_MS, MAX_FINISH_REFUSALS, MAX_INTERRUPT_STREAK, REGISTRY_RECHECK_MS, REPORT_RETRY_MAX, REPORT_RETRY_MS, SETTLE_RETRY_MS, SubsessionService, validateTaskModel, type TaskTurnOutcome } from "../src/agent/subsessions/service.js";
 import { formatOwnerMessageEvent } from "../src/agent/subsessions/prompt.js";
 import { QUOTA_PASS_FALLBACK_MS, PENDING_INPUT_MAX, PENDING_INPUT_OWNER_RESERVE, DONE_STEPS_KEEP, PLAN_MAX_STEPS, PLAN_STEP_MAX, UPDATES_KEEP, appendInput, HARNESS } from "../src/agent/subsessions/types.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
+import type { SubsessionRecord } from "../src/agent/subsessions/types.js";
 
 type Turn = { key: string; prompt: string; bare: boolean };
 type TurnHandler = (turn: Turn, h: Harness) => TaskTurnOutcome | Promise<TaskTurnOutcome>;
@@ -931,17 +932,23 @@ describe("SubsessionService: inputs are never lost", () => {
   it("a second task_finish while the first report's mark is still owed does not note the first report again", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
+    for (const exhausted of [false, true]) {
       let n = 0;
       const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, `report ${++n}`)));
       const update = h.store.update.bind(h.store);
-      let fail = 1;
+      // The mark fails once, or through every retry (the service gives up on it).
+      let fail = exhausted ? REPORT_RETRY_MAX + 1 : 1;
       vi.spyOn(h.store, "update").mockImplementation((id, fn) => {
-        if (h.wakes.length === 1 && fail > 0) { fail -= 1; throw new Error("disk full"); }
+        // Only the write that marks the report delivered fails.
+        const probe = { reportSeq: 1, reportDelivered: false } as SubsessionRecord;
+        try { fn(probe); } catch { /* another update, which needs a whole record */ }
+        if (probe.reportDelivered && fail > 0) { fail -= 1; throw new Error("disk full"); }
         return update(id, fn);
       });
       h.service.start();
       const t = spawn(h);
       await flush();
+      if (exhausted) vi.advanceTimersByTime(REPORT_RETRY_MS * REPORT_RETRY_MAX);
       expect(fail).toBe(0);
       expect(h.store.get(t.id)).toMatchObject({ status: "finished", reportDelivered: false, reportSeq: 1 });
       // The owning session read report 1's note; before the mark's retry, the owner writes and the task finishes again.
@@ -958,6 +965,10 @@ describe("SubsessionService: inputs are never lost", () => {
       vi.advanceTimersByTime(REPORT_RETRY_MS * 2);
       expect((h.notes.get("dm:owner") ?? []).filter((x) => x.includes('type="subsession-report"'))).toHaveLength(1);
       h.service.stop();
+      vi.restoreAllMocks();
+      rmSync(path, { force: true });
+      rmSync(`${path}.bak`, { force: true });
+    }
     } finally {
       vi.useRealTimers();
     }

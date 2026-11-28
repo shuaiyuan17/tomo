@@ -109,7 +109,8 @@ export function Conversation({ web, agent, session, sessionId, ownerConversation
   };
 
   const durable = useMemo(() => recordedReplyIds(history), [history]);
-  useEffect(() => { web.discardRecordedBlocks(durable); }, [durable, web.discardRecordedBlocks]);
+  const { discardRecordedBlocks } = web;
+  useEffect(() => { discardRecordedBlocks(durable); }, [durable, discardRecordedBlocks]);
   const blocks = web.blocks.filter((b) => b.sessionId === sessionId && !durable.has(b.turnId ?? b.requestId));
   const pendingUsers = pendingUserMessages(web.requests, history, sessionId, new Set(Object.keys(sent)));
   const latest = web.requests.filter((r) => r.sessionId === sessionId).at(-1);

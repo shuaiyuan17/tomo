@@ -44,12 +44,13 @@ export function App() {
   useEffect(() => {
     const update = configuredLocaleUpdate(web.bootstrap);
     if (update !== "keep") applyConfiguredLocale(update.locale);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- only an arrival or a new locale matters, not every bootstrap refresh
   }, [bootstrapped, web.bootstrap?.locale]);
   const agent = agentNameOf(web.bootstrap?.agentName);
   const [study, setStudy, studyFocus] = useStudyRoute();
   const home = useHomeRoute() && !study;
   const view: View = study ? "study" : home ? "home" : "conversation";
-  const sessions = web.bootstrap?.sessions ?? [];
+  const sessions = useMemo(() => web.bootstrap?.sessions ?? [], [web.bootstrap?.sessions]);
   const ownerId = web.bootstrap?.ownerId ?? null;
   const [selected, setSelected] = useState("");
   const selectedId = selected || ownerId || sessions[0]?.id || "";
@@ -121,7 +122,7 @@ export function App() {
   const lastMessage = history.history.messages.at(-1);
   const [seenMessage, setSeenMessage] = useState<string>();
   const chatInSight = (!study && !home) || chatPanel;
-  useEffect(() => { if (chatInSight || seenMessage === undefined) setSeenMessage(lastMessage?.id ?? ""); }, [chatInSight, lastMessage?.id]);
+  useEffect(() => { if (chatInSight || seenMessage === undefined) setSeenMessage(lastMessage?.id ?? ""); }, [chatInSight, lastMessage?.id, seenMessage]);
   const chatUnread = home && !chatPanel && !!lastMessage && seenMessage !== undefined && lastMessage.id !== seenMessage && lastMessage.role === "assistant";
 
   // The screen is the owner's: offered only with the owner conversation selected.
@@ -141,7 +142,7 @@ export function App() {
     if (overlayNow.current) { setTasksOpen(false); setHomeChatOpen(false); }
     if (window.scrollX || window.scrollY) window.scrollTo(0, 0);
     repaint(header.current);
-  }), []);
+  }), [setTasksOpen, setHomeChatOpen]);
   // The on-screen keyboard shrinks the app, not scrolls the page (keyboard-viewport.ts).
   useEffect(() => trackKeyboardViewport(), []);
   // The tab says where you are: a Study page or a group being read.

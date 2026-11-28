@@ -149,9 +149,9 @@ function Rollups({ value }: { value: WebContext }) {
 }
 
 function Compactions({ value }: { value: WebContext }) {
+  const { t } = useTranslation(["context", "common"]);
   const list = value.recentCompactions?.slice().reverse() ?? [];
   if (!list.length) return null;
-  const { t } = useTranslation(["context", "common"]);
   const top = Math.max(1, ...list.map((c) => c.preTokens ?? 0));
   return <Section title={t("compactions.heading")} aside={t("compactions.seen", { count: list.length })}>
     <ul className="m-0 list-none space-y-3 p-0">{list.map((c, i) => { const freed = compactionFreed(c.preTokens, c.postTokens);

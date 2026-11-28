@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, URL as NodeURL } from "node:url";
 import { afterAll } from "vitest";
 
 // A HOME of its own for every test file, set before the file's imports run.
@@ -32,7 +32,9 @@ import { afterAll } from "vitest";
 // suites share this file), so pin the cache it was installed into first —
 // read-only, and the same directory `npx playwright install` wrote.
 if (!process.env.PLAYWRIGHT_BROWSERS_PATH) process.env.PLAYWRIGHT_BROWSERS_PATH = playwrightCacheDir(homedir());
-const cacheDir = fileURLToPath(new URL("../../node_modules/.cache", import.meta.url));
+// node:url's URL, not the global: a test file on the happy-dom environment
+// replaces the global with one that refuses file: URLs.
+const cacheDir = fileURLToPath(new NodeURL("../../node_modules/.cache", import.meta.url));
 mkdirSync(cacheDir, { recursive: true });
 const testHome = realpathSync.native(mkdtempSync(join(cacheDir, "tomo-test-home-")));
 process.env.HOME = testHome;

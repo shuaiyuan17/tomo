@@ -646,7 +646,7 @@ it("motion: only what is new rises in (never the history, on load or reload); do
   await browserExpect(page.getByText("A shared group note.", { exact: true })).toBeVisible();
   await browserExpect(page.getByRole("menuitemradio")).toHaveCount(0);
   await page.getByRole("button", { name: /^Session/ }).click();
-  await page.getByRole("menuitemradio", { name: /Owner conversation/ }).click();
+  await page.getByRole("menuitemradio", { name: /^owner/ }).click();
   await browserExpect(page.locator("article.message.assistant").filter({ hasText: "An old reply." })).toBeVisible();
   await page.waitForTimeout(400);
   expect(await entrances()).toEqual([]);
@@ -874,6 +874,22 @@ it("calls the agent by its IDENTITY.md name (re-read on edit); the product keeps
   rmSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), { force: true });
 });
 
+it("the bar shows only the dot while connected, and the words when not", async () => {
+  // Connected (the page from beforeEach, 1440 wide): the words are for screen readers only.
+  const words = page.getByTestId("connection-words");
+  await browserExpect(page.locator("header [role=status]")).toHaveAttribute("data-connection", "live");
+  await browserExpect(words).toHaveText("Connected");
+  expect((await words.boundingBox())!.width).toBeLessThanOrEqual(1);
+  // Cut off from the event stream: the words show beside the dot.
+  const cut = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  await cut.route("**/api/v1/events?**", (route) => route.abort());
+  await cut.goto(`${url}/?t=${readFileSync(resolve(mockConfig.tomoHome, "web-token"), "utf8").trim()}`);
+  const cutWords = cut.getByTestId("connection-words");
+  await browserExpect(cutWords).toHaveText(/^(Connecting|Reconnecting)…$/);
+  expect((await cutWords.boundingBox())!.width).toBeGreaterThan(40);
+  await cut.close();
+});
+
 it("Tomo's own tools read as cards with raw data; a long pane's copy button without a clipboard selects all of it", async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   store.setSdkSessionId("dm:owner", "sdk-activity");
@@ -896,7 +912,25 @@ it("Tomo's own tools read as cards with raw data; a long pane's copy button with
   await browserExpect(card).toContainText("Cards");
   await browserExpect(card).toContainText("Build the cards");
   expect(await history.textContent()).not.toContain("mcp__tomo-internal");
-  await card.getByRole("button", { name: "Raw data" }).click();
+  // The {} button: out of sight until the card is hovered or the button has keyboard focus.
+  const raw = card.getByRole("button", { name: "Raw data" });
+  const opacity = () => raw.evaluate((el) => getComputedStyle(el).opacity);
+  await page.mouse.move(0, 0);
+  await browserExpect.poll(opacity).toBe("0");
+  await card.hover();
+  await browserExpect.poll(opacity).toBe("1");
+  await page.mouse.move(0, 0);
+  await browserExpect.poll(opacity).toBe("0");
+  await raw.focus();
+  await browserExpect.poll(opacity).toBe("1");
+  await raw.blur();
+  // A touch screen has no hover: there it is always shown.
+  const touch = await browser.newPage({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  await touch.goto(`${url}/?t=${readFileSync(resolve(mockConfig.tomoHome, "web-token"), "utf8").trim()}`);
+  const touchRaw = touch.getByLabel("Conversation history").getByRole("group", { name: /Started a task/ }).getByRole("button", { name: "Raw data" });
+  await browserExpect.poll(() => touchRaw.evaluate((el) => getComputedStyle(el).opacity)).toBe("1");
+  await touch.close();
+  await raw.click();
   await browserExpect(card.locator("[data-slot=activity-raw]")).toContainText("mcp__tomo-internal__task_spawn");
   await browserExpect(card.locator("[data-slot=activity-raw]")).toContainText("Started s12 (active).");
   await history.getByRole("button", { name: /Read \/repo\/long\.txt/ }).click();

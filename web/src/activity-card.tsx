@@ -165,8 +165,8 @@ function Card({ rows, state, head, children, footer, rawOpen, onRawOpen, compact
         {state === "error" && <span className="sr-only">{t("chat:trace.failed")}</span>}
         {time && <span className="shrink-0 tabular-nums">{time}</span>}
         <button type="button" aria-label={t("card.raw")} title={rawOpen ? t("card.rawHide") : t("card.raw")} aria-expanded={rawOpen} onClick={() => onRawOpen(!rawOpen)}
-          className={cn("-my-1 grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground opacity-55 transition-opacity hover:bg-foreground/[0.06] hover:text-foreground hover:opacity-100",
-            "group-hover/card:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none pointer-coarse:size-9 pointer-coarse:-my-2.5 pointer-coarse:opacity-100",
+          className={cn("-my-1 grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-foreground/[0.06] hover:text-foreground hover:opacity-100",
+            "group-hover/card:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none pointer-coarse:size-9 pointer-coarse:-my-2.5 pointer-coarse:opacity-100 [@media(hover:none)]:opacity-100",
             rawOpen && "bg-foreground/[0.06] opacity-100")}>
           <BracesIcon className="size-3.5" aria-hidden="true" /></button>
       </div>

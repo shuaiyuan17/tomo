@@ -69,8 +69,9 @@ export function AppHeader({ headerRef, title, menu, chat, tasks, screen, connect
       {screen && <ToggleButton toggle={screen} controls="screen-window" title={t("header.screen")} label={t("header.screenLabel")}><Monitor strokeWidth={1.75} /></ToggleButton>}
       <span role="status" data-connection={connection} className="ml-1.5 flex items-center gap-2 tracking-[0.02em] text-xs text-muted-foreground max-phone:ml-0.5">
         <i className={cn("size-1.5 shrink-0 rounded-full border border-muted-foreground", connection === "live" && "border-primary bg-primary", connection !== "live" && connection !== "locked" && "animate-pulse")} />
-        {/* A phone has no room in the bar for these words: connected, the dot says it; otherwise they hang just under the bar, whole, and taps go through them to what is under. */}
-        <span data-testid="connection-words" className={cn("whitespace-nowrap", connection === "live" ? "max-phone:sr-only"
+        {/* Connected, the dot says it (the words stay for screen readers). Otherwise the words show: beside the dot on a wide screen;
+            on a phone, which has no room in the bar, they hang just under it, whole, and taps go through them to what is under. */}
+        <span data-testid="connection-words" className={cn("whitespace-nowrap", connection === "live" ? "sr-only"
           : "max-phone:pointer-events-none max-phone:absolute max-phone:top-full max-phone:right-2.5 max-phone:mt-1.5 max-phone:rounded-full max-phone:border max-phone:bg-card max-phone:px-2.5 max-phone:py-1 max-phone:shadow-xs")}>{t(CONNECTION_LABELS[connection])}</span></span>
     </div>
   </header>;

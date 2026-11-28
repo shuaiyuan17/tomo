@@ -1,7 +1,7 @@
 import { constants, statSync } from "node:fs";
 import { open, realpath, type FileHandle } from "node:fs/promises";
 import { basename, extname, join, sep } from "node:path";
-import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
+import { ownerBindings, ownerDisplayName, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
 import { SessionStore } from "../sessions/store.js";
 import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js";
 import { isGroupSessionKey, legacySessionKeysForBinding, normalizeImessageHandle, parseRawSessionKey, taskIdFromSessionKey } from "../sessions/keys.js";
@@ -265,7 +265,7 @@ export class WebData {
       if (taskId) {
         const title = taskTitle(taskId);
         label = { label: title ? `${taskId} · ${title}` : taskId, kind: "task" };
-      } else if (id && id === catalog.ownerId) label = { id, label: owner ? `${owner.displayName ?? owner.name} (DM)` : "Owner conversation", kind: "dm" };
+      } else if (id && id === catalog.ownerId) label = { id, label: owner ? `${ownerDisplayName(owner)} (DM)` : "Owner conversation", kind: "dm" };
       else if (group) label = { ...(id ? { id } : {}), label: entries.get(key)?.chatTitle || "Group conversation", kind: "group" };
       else label = { label: entries.get(key)?.chatTitle || "Other conversation", kind: "other" };
       labels.set(key, label);
@@ -315,12 +315,14 @@ export class WebData {
     const ownerKey = selectOwnerSessionKey(owner, entries.map((e) => e.channelKey));
     const keys = new Map<string, string>();
     const sessions: WebCatalog["sessions"] = [];
+    // The owner's conversation goes by the owner's name (`displayName`, else `name`).
+    const ownerTitle = owner ? ownerDisplayName(owner) : "Owner conversation";
     for (const entry of entries) {
       const group = isGroupSessionKey(entry.channelKey);
       if (!group && entry.channelKey !== ownerKey) continue;
       const id = group ? webSessionId(entry.channelKey) : stableOwnerId!;
       keys.set(id, entry.channelKey);
-      sessions.push({ id, title: group ? entry.chatTitle || "Group conversation" : "Owner conversation",
+      sessions.push({ id, title: group ? entry.chatTitle || "Group conversation" : ownerTitle,
         kind: group ? "group" : "dm", writable: !group,
         lastActiveAt: entry.lastActiveAt,
         stats: { contextUsed: entry.stats?.contextUsed ?? 0, contextMax: entry.stats?.contextMax ?? 0,
@@ -329,7 +331,7 @@ export class WebData {
     if (ownerKey && !keys.has(stableOwnerId!)) {
       const id = stableOwnerId!;
       keys.set(id, ownerKey);
-      sessions.unshift({ id, title: "Owner conversation", kind: "dm", writable: true,
+      sessions.unshift({ id, title: ownerTitle, kind: "dm", writable: true,
         lastActiveAt: null, stats: { contextUsed: 0, contextMax: 0 } });
     }
     return { sessions, keys, ownerId: ownerKey ? stableOwnerId : null, setupRequired: !ownerKey };

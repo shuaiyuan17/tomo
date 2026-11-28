@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -268,6 +268,13 @@ describe("the main chat's tool items carry activity and outcome", () => {
     expect(moved.kind === "tool" && moved.activity).toBeUndefined();
     const [open] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m3", name: I("memory_str_replace"), input: { path: "work/a.md", old: "o", new: "n" } }]), 0, { workspaceDir: "/w" });
     expect(open.kind === "tool" && open.activity).toMatchObject({ kind: "memory_str_replace" });
+    // A link inside memory/ into private/: resolved on disk.
+    const ws = mkdtempSync(join(ROOT, "ws-"));
+    mkdirSync(join(ws, "memory", "private"), { recursive: true });
+    symlinkSync(join(ws, "memory", "private"), join(ws, "memory", "alias"));
+    const [linked] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m5", name: I("memory_str_replace"), input: { path: "alias/notes.md", old: "secret", new: "x" } }]), 0, { workspaceDir: ws });
+    expect(linked.kind === "tool" && linked.activity).toBeUndefined();
+    expect(linked.kind === "tool" && linked.input).not.toContain("secret");
     // The owner's own chat: private is theirs.
     const [own] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m4", name: I("memory_str_replace"), input: { path: "private/a.md", old: "o", new: "n" } }]), 0, { owner: true });
     expect(own.kind === "tool" && own.activity).toMatchObject({ kind: "memory_str_replace", path: "private/a.md" });

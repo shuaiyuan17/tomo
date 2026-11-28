@@ -421,6 +421,12 @@ describe("memory cards", () => {
     expect(() => card(row(call({ kind: "memory_delete", path: "a\ud83d" } as ToolActivity, { outcome: {} })))).not.toThrow();
     expect(() => card(row(call({ ...edit, path: "a\ud83d" } as ToolActivity, { outcome: {} })))).not.toThrow();
   });
+  it("a merged card counts a write without a result in its head", () => {
+    const items = [...call(edit, { outcome: {} }), ...call(created, { outcome: {} }), ...call(move, { outcome: {} }), ...call(del)];
+    const block = groupRows(viewRows(items)).find((b) => b.kind === "card");
+    const shown = block?.kind === "card" ? renderToStaticMarkup(createElement(ActivityCard, { rows: block.rows, running: false, rawOpen: false, onRawOpen: () => undefined })) : "";
+    expect(shown).toContain("Memory · 3 changes · 1 without a result");
+  });
   it("saved over budget: the tool's note in warn", () => {
     expect(card(row(call(edit, { outcome: { note: "MEMORY.md is now 210 lines, over its budget." } })))).toMatch(/text-warn[^>]*>MEMORY.md is now 210 lines/);
   });

@@ -493,13 +493,15 @@ function MemoryCard({ rows, running, raw }: { rows: MemoryRow[]; running: boolea
   const state = stateOfAll(rows, running);
   const failed = states.filter((s) => s === "error").length;
   const done = states.filter((s) => s === "done").length;
+  const unknown = states.filter((s) => s === "unknown").length;
   let head: { k: string; values?: Record<string, string> };
   if (state === "running" || state === "unknown") head = { k: MEMORY_HEADS.working };
   else if (state === "error") head = { k: rows.length === 1 ? MEMORY_HEADS.failed : MEMORY_HEADS.noneWent };
   else if (rows.length === 1) head = { k: memoryAction(rows[0].activity).head };
   else {
     const changes = t("card.memoryChanges", { count: done });
-    head = { k: MEMORY_HEADS.counted, values: { text: failed ? `${changes} · ${t("card.memoryFailedCount", { count: failed })}` : changes } };
+    const extra = [failed ? t("card.memoryFailedCount", { count: failed }) : "", unknown ? t("card.todoParts.unknown", { count: unknown }) : ""].filter(Boolean);
+    head = { k: MEMORY_HEADS.counted, values: { text: [changes, ...extra].join(" · ") } };
   }
   const shown = all ? rows : rows.slice(0, TODO_LINES);
   return <Card rows={rows} state={state} head={head} {...raw}>

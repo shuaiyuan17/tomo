@@ -6,6 +6,7 @@ import { PAGE_BYTES, readLine, readWindow, type ToolRedaction } from "./subagent
 import { isSidechainLine, mayHoldToolBlocks, reportUnreadable, SDK_SESSION_ID, sessionTranscriptFile, type Problem } from "./sdk-transcript.js";
 import { redactText, redactToolInput } from "./redact-command.js";
 import { isPrivateMemoryAccess } from "../agent/private-memory-access.js";
+import { landsInPrivate } from "../agent/private-memory-reach.js";
 import type { CallItem, SessionTools, SubagentItem } from "./protocol.js";
 import { failureReason, toolOutcome } from "./activity.js";
 
@@ -46,7 +47,7 @@ function redaction(scope: PrivateScope): ToolRedaction {
     : undefined;
   // No workspace known: any mention of memory/private withholds (fail closed).
   const reaches = (name: string, input: Record<string, unknown>) =>
-    memoryToolReachesPrivate(name, input) || (ctx ? isPrivateMemoryAccess(name, input, ctx) : false) || /memory[/\\]private/i.test(JSON.stringify(input));
+    memoryToolReachesPrivate(name, input, ctx) || (ctx ? isPrivateMemoryAccess(name, input, ctx) : false) || /memory[/\\]private/i.test(JSON.stringify(input));
   return {
     // A file/search tool aimed at memory/private shows its name and its
     // (redacted) path only: no old_string/new_string/content/pattern body,
@@ -79,14 +80,16 @@ const PATH_TOOLS: Record<string, readonly string[]> = {
  * case-folded (the disk may not tell case apart); the store refuses links, so
  * the spelled path is the real one.
  */
-function memoryToolReachesPrivate(name: string, input: Record<string, unknown>): boolean {
+function memoryToolReachesPrivate(name: string, input: Record<string, unknown>, ctx?: { cwd: string; memoryDir: string; privateDir: string }): boolean {
   if (!/^mcp__tomo-internal__memory_/.test(name)) return false;
   return ["path", "from", "to", "prefix"].some((key) => {
     const value = input[key];
     if (typeof value !== "string") return false;
     // Trimmed first, as the store trims a path before it resolves it.
-    const rel = posix.normalize(value.trim().replace(/\\/g, "/").replace(/^\/+/, "")).toLowerCase();
-    return rel === "private" || rel.startsWith("private/");
+    const rel = posix.normalize(value.trim().replace(/\\/g, "/").replace(/^\/+/, ""));
+    if (rel.toLowerCase() === "private" || rel.toLowerCase().startsWith("private/")) return true;
+    // A link inside memory/ that leads into private/ (the store refuses to follow it, but the call's input would still show): resolved on disk.
+    return !!ctx && landsInPrivate(join(ctx.memoryDir, rel), ctx);
   });
 }
 

@@ -1,6 +1,6 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ArrowRightIcon, BracesIcon, CheckIcon, FileIcon } from "lucide-react";
-import type { ToolActivity, WebSubsession } from "../../src/web/protocol.js";
+import { ArrowRightIcon, BracesIcon, CheckIcon, CircleCheckIcon, CircleHelpIcon, ClockIcon, FileIcon, PlusIcon, Trash2Icon, UserRoundIcon } from "lucide-react";
+import type { ToolActivity, ToolOutcome, WebSubsession } from "../../src/web/protocol.js";
 import { cn } from "@/lib/utils";
 import { ToolSection } from "@/components/ai/tool";
 import { CopyButton } from "./code-block.js";
@@ -12,7 +12,9 @@ import { useActivityEnv, useSubsessionById } from "./activity-env.js";
 import { asksOwner, isOpenSubsession, isWorkingState, subsessionState, subsessionStateLabel } from "./subsessions.js";
 import { callDuration, elapsedSince, type ToolRow } from "./subagent.js";
 import { useNow } from "./use-now.js";
-import { Trans, useTranslation } from "./i18n/index.js";
+import { formatLocale, i18n, Trans, useTranslation } from "./i18n/index.js";
+import { cronJobHash } from "./study-data.js";
+import { formatList } from "./i18n/format.js";
 
 /** Keys this file picks at runtime (tests/i18n-catalogs.test.ts). */
 // i18n-dynamic: activity:card.*
@@ -38,7 +40,34 @@ const HEADS = {
   sendYou: { running: "card.sendingYou", unknown: "card.sendingYou", error: "card.sendFailed", done: "card.sentYou" },
   delegate: { running: "card.delegating", unknown: "card.delegating", error: "card.sendFailed", done: "card.delegate" },
   delegateYou: { running: "card.delegating", unknown: "card.delegating", error: "card.sendFailed", done: "card.delegateYou" },
+  todoAdd: { running: "card.todoAdding", unknown: "card.todoAdding", error: "card.todoAddFailed", done: "card.todoAdd" },
+  todoResolve: { running: "card.todoResolving", unknown: "card.todoResolving", error: "card.todoResolveFailed", done: "card.todoDone" },
+  todos: { running: "card.todosWorking", unknown: "card.todosWorking", error: "card.todosFailed", done: "card.todos" },
+  scheduleOnce: { running: "card.scheduling", unknown: "card.scheduling", error: "card.scheduleFailed", done: "card.scheduledOnce" },
+  scheduleRecurring: { running: "card.scheduling", unknown: "card.scheduling", error: "card.scheduleFailed", done: "card.scheduledRecurring" },
+  permission: { running: "card.permissionAsking", unknown: "card.permissionAsking", error: "card.permissionFailed", done: "card.permission" },
+  credential: { running: "card.credentialAsking", unknown: "card.credentialAsking", error: "card.credentialFailed", done: "card.credential" },
 } as const;
+/** A to-do resolved, by action: its head, the icon of its line, and what it counts as in a merged card's head. */
+const RESOLVED = {
+  done: { head: "card.todoDone", icon: CircleCheckIcon, part: "closed" }, drop: { head: "card.todoDrop", icon: Trash2Icon, part: "dropped" },
+  snooze: { head: "card.todoSnooze", icon: ClockIcon, part: "snoozed" }, handoff: { head: "card.todoHandoff", icon: UserRoundIcon, part: "handed" },
+} as const;
+const PARTS = { added: "card.todoParts.added", closed: "card.todoParts.closed", dropped: "card.todoParts.dropped", snoozed: "card.todoParts.snoozed",
+  handed: "card.todoParts.handed", failed: "card.todoParts.failed", unknown: "card.todoParts.unknown" } as const;
+const LINE_STATE = { done: "card.lineState.done", error: "card.lineState.error", running: "card.lineState.running", unknown: "card.lineState.unknown" } as const;
+/** Said before a to-do line to a screen reader: what was done to it (the icon and strike-through say it on screen). */
+const LINE_ACTION = { add: "card.lineAction.add", done: "card.lineAction.done", drop: "card.lineAction.drop", snooze: "card.lineAction.snooze",
+  handoff: "card.lineAction.handoff" } as const;
+const WAITING = { me: "card.todoWaiting.me", owner: "card.todoWaiting.owner", external: "card.todoWaiting.external" } as const;
+const ACCESS = { read: "card.access.read", write: "card.access.write" } as const;
+/** A card of several calls: running while any runs, failed when all failed, unknown when none finished, else done. */
+function stateOfAll(rows: readonly ToolRow[], running: boolean): CardState {
+  const states = rows.map((row) => stateOf(row, running));
+  if (states.includes("running")) return "running";
+  if (states.every((state) => state === "error")) return "error";
+  return states.includes("done") ? "done" : states.includes("unknown") ? "unknown" : "error";
+}
 const stateOf = (row: ToolRow, running: boolean): CardState => row.result?.isError ? "error" : row.result ? "done" : running ? "running" : "unknown";
 
 /** A card's head sentence: a catalog key with `<id>` (a task id pill) and `<b>` (a name) in it. */
@@ -254,6 +283,147 @@ function SendCard({ row, state, raw }: CardProps & { row: ToolRow & { activity: 
 }
 const Chip = ({ children }: { children: ReactNode }) => <span className="inline-flex max-w-full items-center gap-1 truncate rounded-md border px-1.5 py-0.5 text-[11px] text-muted-foreground">{children}</span>;
 
+type TodoRow = ToolRow & { activity: Extract<ToolActivity, { kind: "todo_add" | "todo_resolve" }> };
+/** One to-do call as a line of the card: what it did to which to-do, and the small print under it. */
+function TodoLine({ row, state, alone }: { row: TodoRow; state: CardState; alone: boolean }) {
+  const { t } = useTranslation("activity");
+  const activity = row.activity;
+  const outcome: ToolOutcome = row.result?.outcome ?? {};
+  const add = activity.kind === "todo_add";
+  const resolved = activity.kind === "todo_resolve" ? RESOLVED[activity.action] : undefined;
+  const Icon = state === "running" ? RunningMark : state === "unknown" ? CircleHelpIcon : add ? PlusIcon : resolved!.icon;
+  const id = outcome.id ?? (activity.kind === "todo_resolve" ? activity.id : undefined);
+  // A resolve's title is the tool's printed words verbatim (title, and its next step after " · next: " when that differs):
+  // English like every tool's own text here, and never re-split, since a title can hold the same marker.
+  const title = add ? activity.title : outcome.title;
+  const struck = state === "done" && (activity.kind === "todo_resolve" && (activity.action === "done" || activity.action === "drop"));
+  const date = outcome.review ?? (add ? activity.reviewIn : undefined);
+  const small: string[] = [];
+  if (state === "done" || state === "running" || state === "unknown") {
+    if (add) {
+      small.push(t("card.todoNext", { next: activity.next }), t(WAITING[activity.waitingOn]));
+      if (date) small.push(outcome.due ? t("card.todoDue", { date }) : t("card.todoReview", { date }));
+    } else if (activity.kind === "todo_resolve") {
+      if (activity.action === "done" && activity.evidence) small.push(activity.evidence);
+      if (activity.action === "drop" && activity.reason) small.push(activity.reason);
+      if (activity.action === "snooze") {
+        const until = outcome.review ?? activity.until;
+        if (until) small.push(t("card.todoUntil", { date: until }));
+        if (outcome.snoozes && outcome.maxSnoozes) small.push(t("card.todoSnoozes", { count: outcome.snoozes, max: outcome.maxSnoozes }));
+        if (activity.reason) small.push(activity.reason);
+      }
+      if (activity.action === "handoff" && activity.next) small.push(t("card.todoNext", { next: activity.next }));
+    }
+  }
+  return <li data-todo-line={add ? "add" : activity.kind === "todo_resolve" ? activity.action : undefined} data-state={state} className="flex min-w-0 gap-2 py-0.5">
+    <span aria-hidden="true" className={cn("mt-[3px] grid size-3.5 shrink-0 place-items-center [&_svg]:size-3.5", state === "error" ? "text-destructive" : "text-muted-foreground")}><Icon /></span>
+    <div className="min-w-0 flex-1">
+      <p className={cn("m-0 text-[13px] leading-snug [overflow-wrap:anywhere]", state === "error" ? "text-destructive" : "text-foreground", state === "running" && "shimmer")}>
+        <span className="sr-only">{t("card.lineSr", { action: t(LINE_ACTION[add ? "add" : activity.kind === "todo_resolve" ? activity.action : "add"]), state: t(LINE_STATE[state]) })} </span>
+        {id && <IdPill id={id} className="mr-1.5 align-[1px]" />}
+        <span className={cn(struck && "line-through decoration-muted-foreground/50")}>{title}</span></p>
+      {state === "error" && row.result?.reason && <p className="m-0 mt-0.5 text-[12px] text-destructive [overflow-wrap:anywhere]">
+        {t(add ? "card.todoNotAdded" : "card.todoNotUpdated", { reason: row.result.reason })}</p>}
+      {small.length > 0 && <p className="m-0 mt-0.5 text-[12px] text-muted-foreground [overflow-wrap:anywhere]">{small.join(" · ")}</p>}
+      {state === "unknown" && !alone && <p className="m-0 mt-0.5 text-[12px] text-muted-foreground">{t("card.unknown")}</p>}
+    </div>
+  </li>;
+}
+
+/** Lines a to-do card shows before "N more". */
+const TODO_LINES = 3;
+/** to-do calls in a row: one card, a line each (the first three, then "N more"). */
+function TodoCard({ rows, running, raw }: { rows: TodoRow[]; running: boolean; raw: CardProps["raw"] }) {
+  const { t } = useTranslation("activity");
+  const [all, setAll] = useState(false);
+  const states = rows.map((row) => stateOf(row, running));
+  const state = stateOfAll(rows, running);
+  let head: { k: string; values?: Record<string, string> };
+  if (rows.length === 1) {
+    const activity = rows[0].activity;
+    head = activity.kind === "todo_add" ? { k: HEADS.todoAdd[state] }
+      : { k: state === "done" ? RESOLVED[activity.action].head : HEADS.todoResolve[state], values: { id: activity.id } };
+  } else if (state === "done") {
+    const counts: Partial<Record<keyof typeof PARTS, number>> = {};
+    rows.forEach((row, i) => {
+      const part = states[i] === "error" ? "failed" : states[i] === "unknown" ? "unknown" : states[i] !== "done" ? undefined
+        : row.activity.kind === "todo_add" ? "added" : RESOLVED[row.activity.action].part;
+      if (part) counts[part] = (counts[part] ?? 0) + 1;
+    });
+    const parts = (Object.keys(PARTS) as (keyof typeof PARTS)[]).flatMap((part) => counts[part] ? [t(PARTS[part], { count: counts[part] })] : []);
+    head = { k: HEADS.todos.done, values: { parts: formatList(parts) } };
+  } else head = { k: HEADS.todos[state] };
+  const shown = all ? rows : rows.slice(0, TODO_LINES);
+  return <Card rows={rows} state={state} head={head} {...raw}>
+    <ul className="m-0 mt-1.5 list-none space-y-1 p-0">{shown.map((row) => <TodoLine key={row.id} row={row} state={stateOf(row, running)} alone={rows.length === 1} />)}</ul>
+    {rows.length > TODO_LINES && <button type="button" onClick={() => setAll((v) => !v)} aria-expanded={all}
+      className="mt-1 rounded px-1 text-[11.5px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline">
+      {all ? t("card.showLess") : t("card.moreLines", { count: rows.length - TODO_LINES })}</button>}
+  </Card>;
+}
+
+const MINUTE_MS = 60_000;
+/** An interval in the largest whole unit: "every 2 hours", "every day", "every 90 minutes", "every 30 seconds". */
+function every(ms: number): string {
+  if (ms % (1440 * MINUTE_MS) === 0) return i18n.t("activity:card.everyDays", { count: ms / (1440 * MINUTE_MS) });
+  if (ms % (60 * MINUTE_MS) === 0) return i18n.t("activity:card.everyHours", { count: ms / (60 * MINUTE_MS) });
+  if (ms % MINUTE_MS === 0) return i18n.t("activity:card.everyMinutes", { count: ms / MINUTE_MS });
+  return i18n.t("activity:card.everySeconds", { count: Math.max(1, Math.round(ms / 1000)) });
+}
+/** A time the page names in the reader's own zone and language: "Nov 15, 8:30 AM". */
+const when = (at: number) => new Intl.DateTimeFormat(formatLocale(), { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(at);
+
+function ScheduleCard({ row, state, raw }: CardProps & { row: ToolRow & { activity: Extract<ToolActivity, { kind: "schedule_create" }> } }) {
+  const { t } = useTranslation("activity");
+  const env = useActivityEnv();
+  const activity = row.activity;
+  const outcome = row.result?.outcome;
+  // Once: a date (even kept after it ran), or any job deleted after its first run (`once: true`, also with a cron or an interval).
+  const once = outcome ? !!outcome.firesOnce || outcome.lifecycle === "once" : !!activity.once;
+  const head = { k: (once ? HEADS.scheduleOnce : HEADS.scheduleRecurring)[state], values: { name: activity.name } };
+  const target = activity.session ? env.sessions.find((s) => s.id === activity.sessionId)?.title || activity.session : undefined;
+  const badge = once ? (outcome?.nextRunAt ? when(outcome.nextRunAt) : undefined)
+    : outcome?.everyMs ? every(outcome.everyMs) : outcome?.cron ? `${outcome.cron}${outcome.tz ? ` (${outcome.tz})` : ""}` : activity.schedule;
+  const mono = !once && !outcome?.everyMs;
+  const footer = outcome?.id ? <>
+    <span className="font-mono text-[11.5px]">{outcome.id}</span>
+    {target && <Chip>{t("card.toSession", { name: target })}</Chip>}
+    {!once && outcome.nextRunAt && <span className="min-w-0 truncate">{t("card.nextRun", { when: when(outcome.nextRunAt) })}</span>}
+    <a href={cronJobHash(outcome.id)} className="-my-1 ml-auto flex shrink-0 items-center gap-1 rounded-md px-1.5 py-1 font-medium text-primary hover:bg-foreground/[0.05] focus-visible:ring-2 focus-visible:ring-ring/40 focus-visible:outline-none pointer-coarse:py-2">
+      {t("card.openCron")}<ArrowRightIcon className="size-3.5" aria-hidden="true" /></a>
+  </> : undefined;
+  return <Card rows={[row]} state={state} head={head} {...raw} footer={footer}>
+    <p className="m-0 mt-1.5 text-[13.5px] leading-snug font-medium text-foreground [overflow-wrap:anywhere]">{activity.name}
+      {badge && state !== "error" && <span className={cn("ml-1.5 inline-block rounded-md border px-1.5 align-[1px] text-[11px] font-normal text-muted-foreground", mono && "font-mono")}>{badge}</span>}</p>
+    {state === "error" ? <Reason row={row} /> : <Quote text={activity.message} lines={2} plain truncated={activity.messageTruncated} />}
+  </Card>;
+}
+
+function PermissionCard({ row, state, raw }: CardProps & { row: ToolRow & { activity: Extract<ToolActivity, { kind: "request_permission" }> } }) {
+  const { t } = useTranslation("activity");
+  const activity = row.activity;
+  const status = row.result?.outcome?.status;
+  const footer = status === "pending" ? <span>{t("card.permissionPending")}</span> : status === "already_allowed" ? <span>{t("card.permissionAllowed")}</span> : undefined;
+  return <Card rows={[row]} state={state} head={{ k: HEADS.permission[state] }} {...raw} footer={footer}>
+    <p className="m-0 mt-1.5 flex min-w-0 items-center gap-1.5 text-[13px] text-foreground">
+      <span className="shrink-0 rounded-md border px-1.5 text-[11px] text-muted-foreground">{t(ACCESS[activity.access])}</span>
+      <span className="min-w-0 truncate font-mono text-[12.5px]" title={activity.path}>{activity.path}</span></p>
+    {state === "error" ? <Reason row={row} /> : <Quote text={`“${activity.reason}”`} lines={3} plain />}
+  </Card>;
+}
+
+function CredentialCard({ row, state, raw }: CardProps & { row: ToolRow & { activity: Extract<ToolActivity, { kind: "request_credential" }> } }) {
+  const { t } = useTranslation("activity");
+  const activity = row.activity;
+  const channel = row.result?.outcome?.channel;
+  const named = channel && (CHANNELS as readonly string[]).includes(channel) ? t(`card.via.${channel as (typeof CHANNELS)[number]}`) : channel;
+  const footer = state === "done" ? <span>{named ? `${t("card.askedOn", { channel: named })} · ` : ""}{t("card.credentialNote")}</span> : undefined;
+  return <Card rows={[row]} state={state} head={{ k: HEADS.credential[state] }} {...raw} footer={footer}>
+    <p className="m-0 mt-1.5 font-mono text-[13px] text-foreground [overflow-wrap:anywhere]">{activity.name}</p>
+    {state === "error" ? <Reason row={row} /> : <Quote text={activity.purpose} lines={2} plain />}
+  </Card>;
+}
+
 interface CardProps { row: ToolRow; state: CardState; raw: { rawOpen: boolean; onRawOpen: (open: boolean) => void } }
 
 /** A card for `rows` (one call, or a run of the same kind), or null when they are not a card's (the caller shows lines). */
@@ -263,6 +433,13 @@ export function ActivityCard({ rows, running, rawOpen, onRawOpen }: { rows: read
   if (!activity) return null;
   const props = { state: stateOf(row, running), raw: { rawOpen, onRawOpen } };
   switch (activity.kind) {
+    case "todo_add": case "todo_resolve": {
+      const todos = rows.flatMap((r) => { const a = knownActivity(r); return a && (a.kind === "todo_add" || a.kind === "todo_resolve") ? [{ ...r, activity: a }] : []; });
+      return <TodoCard rows={todos} running={running} raw={props.raw} />;
+    }
+    case "schedule_create": return <ScheduleCard row={{ ...row, activity }} {...props} />;
+    case "request_permission": return <PermissionCard row={{ ...row, activity }} {...props} />;
+    case "request_credential": return <CredentialCard row={{ ...row, activity }} {...props} />;
     case "task_spawn": return <SpawnCard row={{ ...row, activity }} {...props} />;
     case "task_message": return <NoteCard row={{ ...row, activity }} {...props} />;
     case "task_cancel": return <CancelCard row={{ ...row, activity }} {...props} />;

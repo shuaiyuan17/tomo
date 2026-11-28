@@ -210,7 +210,25 @@ export function Sources({ sources, open, onOpenChange }: { sources: WebSource[];
 /** A page without a title: its URL without the scheme. */
 const shortUrl = (url: string) => url.replace(/^https?:\/\/(www\.)?/, "").replace(/\/$/, "");
 
-export type TurnStep = Extract<ViewBlock, { kind: "tool" | "group" | "thinking" | "todos" | "sources" | "card" }>;
+export type TurnStep = Extract<ViewBlock, { kind: "tool" | "group" | "thinking" | "todos" | "sources" | "card" | "more" }>;
+const isTurnStep = (block: ViewBlock): block is TurnStep => block.kind !== "text" && block.kind !== "message";
+
+/**
+ * A turn's blocks past its sixth card: "4 more activities", opening to them
+ * in order (cards and lines). Folded unless the reader opened it.
+ */
+function MoreActivity({ block, running, choices, onChoice }: { block: Extract<ViewBlock, { kind: "more" }>; running: boolean;
+  choices: Readonly<Record<string, boolean>>; onChoice: (key: string, open: boolean) => void }) {
+  const { t } = useTranslation("activity");
+  return <TraceCollapsible data-kind="more" open={choices[block.key] ?? false} onOpenChange={(value) => onChoice(block.key, value)} className="font-sans">
+    <TraceCollapsibleTrigger>
+      <TraceLine><TraceIcon><LayersIcon /></TraceIcon><TraceTitle>{t("card.more", { count: block.cards })}</TraceTitle></TraceLine>
+    </TraceCollapsibleTrigger>
+    <TraceCollapsibleContent className="space-y-1.5 py-1">
+      {block.blocks.filter(isTurnStep).map((inner) => <TurnBlock key={"key" in inner ? inner.key : inner.row.id} block={inner} running={running} choices={choices} onChoice={onChoice} />)}
+    </TraceCollapsibleContent>
+  </TraceCollapsible>;
+}
 
 /**
  * One step block of a turn, with its open/closed state: `choices` holds the
@@ -229,6 +247,7 @@ export function TurnBlock({ block, running, choices, onChoice }:
     // A card's raw-data panel is kept open by its call (`raw:<id>`), so paging and live updates do not close it.
     case "card": return <ActivityCard rows={block.rows} running={running} rawOpen={choices[`raw:${block.rows[0].toolUseId}`] ?? false}
       onRawOpen={(value) => onChoice(`raw:${block.rows[0].toolUseId}`, value)} />;
+    case "more": return <MoreActivity block={block} running={running} choices={choices} onChoice={onChoice} />;
   }
 }
 

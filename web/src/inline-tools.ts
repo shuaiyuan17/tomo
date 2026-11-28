@@ -34,13 +34,13 @@ export function mergeTools(state: ToolsState, page: SessionTools, kind: "full" |
 }
 
 /** A tool block in the chat, keyed so its open/closed state survives paging and live updates. */
-export type ToolBlock = Extract<ViewBlock, { kind: "tool" | "group" | "todos" | "sources" | "card" }> & { key: string };
+export type ToolBlock = Extract<ViewBlock, { kind: "tool" | "group" | "todos" | "sources" | "card" | "more" }> & { key: string };
 export type TimelineEntry = { kind: "message"; message: HistoryMessage } | { kind: "tools"; block: ToolBlock };
 
 /** A run of calls is keyed by its first call (a run only grows at its end); todos and sources carry their own key. */
 const keyed = (block: ToolBlock): ToolBlock => block.kind === "group" ? { ...block, key: `calls:${block.key}` }
   : block.kind === "tool" ? { ...block, key: `call:${block.row.toolUseId}` } : block;
-const isToolBlock = (block: ViewBlock): block is ToolBlock => block.kind === "tool" || block.kind === "group" || block.kind === "todos" || block.kind === "sources" || block.kind === "card";
+const isToolBlock = (block: ViewBlock): block is ToolBlock => block.kind === "tool" || block.kind === "group" || block.kind === "todos" || block.kind === "sources" || block.kind === "card" || block.kind === "more";
 
 /**
  * Messages in order with the tool calls made before each placed in front of

@@ -262,10 +262,12 @@ export interface ToolOutcome {
   id?: string; status?: string; count?: number; note?: string; noop?: string;
   delivery?: "passed" | "queued" | "released" | "held";
   lifecycle?: "once" | "recurring"; nextRunAt?: number; enabled?: boolean;
-  /** A to-do's line as the tool printed it: `title`, `review` (its date, as written: "Nov 17"), `due` (that date has passed), `snoozes` / `maxSnoozes`. */
+  /** A to-do's line as the tool printed it: `title` (with its next step when that differs, as printed), `review` (its date, as written: "Nov 17"), `due` (that date has passed), `snoozes` / `maxSnoozes`. */
   title?: string; review?: string; due?: true; snoozes?: number; maxSnoozes?: number;
   /** A recurring scheduled task's schedule: every `everyMs`, or the cron expression `cron` (in `tz`). */
   everyMs?: number; cron?: string; tz?: string;
+  /** Its schedule is a single date: it fires once, whatever `lifecycle` says about keeping the job. */
+  firesOnce?: true;
   /** request_credential: the channel the owner was asked on. */
   channel?: string;
 }

@@ -208,22 +208,24 @@ const TODO_ID = "t-\\d+";
 /**
  * A to-do's line as todo_add / todo_resolve print it (src/todos/format.ts, the
  * English catalog): `t-41 Title · next: … · waiting on owner · review Nov 17 · snoozed 1/3 · ref`.
- * The title is everything before the first " · " that starts a known part; a
- * line in another shape gives nothing (the card shows the input's words).
+ * `title` is everything before the last "waiting on" part, as printed: the
+ * title and, when it has a different one, its next step. A title can itself
+ * hold " · next: ", so splitting the two would sometimes name the wrong to-do;
+ * the printed words never do. A line in another shape gives nothing.
  */
-const TODO_LINE = new RegExp(`^${TODO_ID} (.+?)(?: · next: .+?)? · waiting on (?:me|owner|external) · (due|review) ([^·]+?)(?: · snoozed (\\d+)(?:/(\\d+))?)?(?: · .*)?$`);
+const TODO_LINE = new RegExp(`^${TODO_ID} (.+) · waiting on (?:me|owner|external) · (due|review) ([^·]+?)(?: · snoozed (\\d+)(?:/(\\d+))?)?(?: · .*)?$`);
 function todoLine(line: string): Partial<ToolOutcome> {
   const m = TODO_LINE.exec(line);
   if (!m) return {};
-  // A title holding a field's own marker (" · next: ", " · waiting on ") cannot be told from the field: no title, rather than a wrong one.
-  const ambiguous = line.split(" · next: ").length > 2 || line.split(" · waiting on ").length > 2;
-  return { ...(ambiguous ? {} : { title: clean(m[1], ACTIVITY_LINE_LIMIT).text }), review: clean(m[3], 40).text, ...(m[2] === "due" ? { due: true } : {}),
+  return { title: clean(m[1], ACTIVITY_LINE_LIMIT).text, review: clean(m[3], 40).text, ...(m[2] === "due" ? { due: true } : {}),
     ...(m[4] ? { snoozes: Number(m[4]) } : {}), ...(m[5] ? { maxSnoozes: Number(m[5]) } : {}) };
 }
-/** A recurring job's schedule as the page words it: an interval (`everyMs`), or a cron expression (`cron`, `tz`) shown as written. */
+/** A job's schedule as the page words it: one date (`firesOnce`), an interval (`everyMs`), or a cron expression (`cron`, `tz`) shown as written. */
 function scheduleParts(schedule: unknown): Partial<ToolOutcome> {
   if (!schedule || typeof schedule !== "object") return {};
   const s = schedule as Record<string, unknown>;
+  // A date: it fires once, whatever its lifecycle (a "recurring" one is only kept, disabled, after it ran).
+  if (s.kind === "at") return { firesOnce: true };
   if (s.kind === "every" && typeof s.everyMs === "number" && s.everyMs > 0) return { everyMs: s.everyMs };
   if (s.kind === "cron" && typeof s.expr === "string") return { cron: clean(s.expr, 80).text, ...(typeof s.tz === "string" ? { tz: clean(s.tz, 60).text } : {}) };
   return {};

@@ -67,20 +67,23 @@ describe("toolOutcome reads what the real tools return", () => {
     const tools = buildTodoTools({ store: () => new TodoStore(dir), caller: () => "dm:owner" });
     expect(toolOutcome(I("todo_list"), textOf(await run(tools, "todo_list", { filter: "all" })))).toEqual({ count: 0 });
     const added = await run(tools, "todo_add", { title: "Order seeds", next: "Call the nursery", waiting_on: "me" });
-    expect(toolOutcome(I("todo_add"), textOf(added))).toEqual({ id: "t-1", title: "Order seeds", review: expect.any(String) });
+    expect(toolOutcome(I("todo_add"), textOf(added))).toEqual({ id: "t-1", title: "Order seeds · next: Call the nursery", review: expect.any(String) });
     // A title with the separator in it is still read whole.
     const dotted = await run(tools, "todo_add", { title: "Seeds · and soil", next: "Call", waiting_on: "external", ref: "PR 9" });
-    expect(toolOutcome(I("todo_add"), textOf(dotted))).toMatchObject({ id: "t-2", title: "Seeds · and soil" });
+    expect(toolOutcome(I("todo_add"), textOf(dotted))).toMatchObject({ id: "t-2", title: "Seeds · and soil · next: Call" });
     await run(tools, "todo_resolve", { id: "t-2", action: "drop", reason: "dup" });
-    // A title with a field's marker in it is ambiguous: no title rather than a wrong one.
+    // The printed words, never a split that could name the wrong to-do.
     const marked = await run(tools, "todo_add", { title: "Plan · next: discuss", next: "Book a room", waiting_on: "me" });
-    expect(toolOutcome(I("todo_add"), textOf(marked))).not.toHaveProperty("title");
+    expect(toolOutcome(I("todo_add"), textOf(marked))).toMatchObject({ title: "Plan · next: discuss · next: Book a room" });
+    const same = await run(tools, "todo_add", { title: "Plan · next: discuss", next: "Plan · next: discuss", waiting_on: "me" });
+    expect(toolOutcome(I("todo_add"), textOf(same))).toMatchObject({ title: "Plan · next: discuss" });
+    await run(tools, "todo_resolve", { id: "t-4", action: "drop", reason: "dup" });
     await run(tools, "todo_resolve", { id: "t-3", action: "drop", reason: "dup" });
-    await run(tools, "todo_add", { title: "Fix the tap", next: "Phone the plumber", waiting_on: "owner" }); // t-4
+    await run(tools, "todo_add", { title: "Fix the tap", next: "Phone the plumber", waiting_on: "owner" }); // t-5
     expect(toolOutcome(I("todo_list"), textOf(await run(tools, "todo_list", { filter: "all" })))).toEqual({ count: 2 });
-    expect(toolOutcome(I("todo_resolve"), textOf(await run(tools, "todo_resolve", { id: "t-1", action: "done", evidence: "PR 4" })))).toMatchObject({ id: "t-1", title: "Order seeds" });
-    expect(toolOutcome(I("todo_resolve"), textOf(await run(tools, "todo_resolve", { id: "t-4", action: "snooze", until: "3d", reason: "later" }))))
-      .toMatchObject({ id: "t-4", title: "Fix the tap", snoozes: 1, maxSnoozes: expect.any(Number), review: expect.any(String) });
+    expect(toolOutcome(I("todo_resolve"), textOf(await run(tools, "todo_resolve", { id: "t-1", action: "done", evidence: "PR 4" })))).toMatchObject({ id: "t-1", title: "Order seeds · next: Call the nursery" });
+    expect(toolOutcome(I("todo_resolve"), textOf(await run(tools, "todo_resolve", { id: "t-5", action: "snooze", until: "3d", reason: "later" }))))
+      .toMatchObject({ id: "t-5", title: "Fix the tap · next: Phone the plumber", snoozes: 1, maxSnoozes: expect.any(Number), review: expect.any(String) });
     const bad = await run(tools, "todo_resolve", { id: "t-99", action: "done" });
     expect(bad.isError).toBe(true);
     expect(failureReason(I("todo_resolve"), textOf(bad))).not.toMatch(/^todo_resolve/);
@@ -96,7 +99,10 @@ describe("toolOutcome reads what the real tools return", () => {
     expect(toolOutcome(I("schedule_create"), textOf(brief))).toMatchObject({ lifecycle: "recurring", cron: "30 8 * * *" });
     const every = await run(tools, "schedule_create", { name: "Water", schedule: "every 2h", message: "Water the plants" });
     expect(toolOutcome(I("schedule_create"), textOf(every))).toMatchObject({ lifecycle: "recurring", everyMs: 7_200_000 });
-    expect(toolOutcome(I("schedule_list"), textOf(await run(tools, "schedule_list", {})))).toEqual({ count: 3 });
+    // A date kept after it ran is "recurring" by lifecycle, but fires once.
+    const kept = await run(tools, "schedule_create", { name: "Call", schedule: "in 3h", message: "Call back", once: false });
+    expect(toolOutcome(I("schedule_create"), textOf(kept))).toMatchObject({ firesOnce: true });
+    expect(toolOutcome(I("schedule_list"), textOf(await run(tools, "schedule_list", {})))).toEqual({ count: 4 });
     expect(toolOutcome(I("schedule_enable"), textOf(await run(tools, "schedule_enable", { id: outcome!.id, enabled: false })))).toMatchObject({ enabled: false });
     expect(toolOutcome(I("schedule_remove"), textOf(await run(tools, "schedule_remove", { id: outcome!.id })))).toEqual({});
     expect(toolOutcome(I("schedule_remove"), textOf(await run(tools, "schedule_remove", { id: "nope0000" })))).toEqual({ noop: "Job nope0000 not found." });

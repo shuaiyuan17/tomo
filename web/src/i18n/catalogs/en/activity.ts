@@ -1,7 +1,7 @@
 /** Tomo's own tools (tomo-internal) in the chat: one-line sentences, fold summaries and (later) activity cards. */
 export const activity = {
   card: {
-    raw: "Raw data", rawHide: "Hide raw data", copyJson: "Copy JSON", copyId: "Copy call ID: {{id}}",
+    raw: "Raw data", rawHide: "Hide raw data", copyJson: "Copy JSON",
     rawNote: "As the server sends it: clipped at 4,000 characters, secrets masked. The transcript on disk has the rest.",
     showAll: "Show all", showLess: "Show less", longer: "Longer than shown here; the raw data has more.", stickers_one: "A sticker", stickers_other: "{{count}} stickers",
     spawn: "Started a task", spawning: "Starting a task", spawnFailed: "Couldn't start the task",

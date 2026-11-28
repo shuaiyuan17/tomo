@@ -162,6 +162,15 @@ describe("the raw-data button", () => {
     expect(open).toContain("clipped at 4,000 characters");
     expect(open).toContain("Copy JSON");
   });
+  it("one labelled copy for the whole call, then one per section: no separate icon for the call id", () => {
+    const r = row(call(spawn, { outcome: { id: "s12" }, output: "Started s12 (active)." }));
+    const open = card(r, { rawOpen: true });
+    const copies = open.match(/data-slot="code-block-copy-button"/g) ?? [];
+    // Header (labelled "Copy JSON"), INPUT, OUTPUT.
+    expect(copies).toHaveLength(3);
+    expect(open).not.toContain("Copy call ID");
+    expect(open).toMatch(/<span aria-hidden="true">Copy JSON<\/span>/);
+  });
   it("its open state is kept by the call id in the chat's choices", () => {
     const r = row(call(spawn, { outcome: { id: "s12" } }));
     const block = { kind: "card" as const, key: `card:${r.toolUseId}`, rows: [r] };

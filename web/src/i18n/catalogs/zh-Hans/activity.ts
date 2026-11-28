@@ -4,7 +4,7 @@ import type { activity as en } from "../en/activity.js";
 /** Tomo 自己的工具（tomo-internal）在聊天里的样子：一句话、折叠行的统计、（之后的）活动卡片。 */
 export const activity = {
   card: {
-    raw: "原始数据", rawHide: "收起原始数据", copyJson: "复制 JSON", copyId: "复制调用 ID：{{id}}",
+    raw: "原始数据", rawHide: "收起原始数据", copyJson: "复制 JSON",
     rawNote: "这是服务端给浏览器的那份：截到 4,000 字，密钥已打码。完整的在磁盘上的 transcript 里。",
     showAll: "展开全文", showLess: "收起", longer: "原文比这里显示的更长，看原始数据。", stickers_other: "{{count}} 个贴纸",
     spawn: "开了一个任务", spawning: "正在开任务", spawnFailed: "任务没开成",

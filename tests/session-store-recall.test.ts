@@ -274,6 +274,24 @@ describe("recallTranscript over a read set with a legacy sidecar", () => {
   });
 });
 
+describe("time budget inside one file", () => {
+  it("stops on time even when the file yields no records to check the clock between", async () => {
+    const { iterateJsonlBackwardsSync } = await import("../src/jsonl.js");
+    const dir = mkdtempSync(join(tmpdir(), "recall-time-"));
+    const path = join(dir, "one-line.jsonl");
+    writeFileSync(path, "x".repeat(512 * 1024)); // one huge unparsable line, no newline
+    let calls = 0;
+    const progress = { bytesRead: 0, maxBytes: Infinity, outOfTime: () => ++calls > 2 };
+    const records = [...iterateJsonlBackwardsSync(path, 16 * 1024, progress)];
+    expect(records).toEqual([]);
+    expect(progress.timedOut).toBe(true);
+    expect(progress.cutShort).toBe(true);
+    // Stopped after a couple of chunks, not at the end of the 512 KB line.
+    expect(progress.bytesRead).toBeLessThan(64 * 1024);
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
 describe("default recall budget", () => {
   it("is bound by time, with the byte cap far past what the time budget can read", async () => {
     const { RECALL_SCAN_BUDGET } = await import("../src/sessions/store.js");

@@ -222,8 +222,17 @@ export function reportRawJsonlLines(
 export interface JsonlReadProgress {
   bytesRead: number;
   maxBytes: number;
+  /**
+   * Optional wall-clock stop, asked before each chunk like the byte budget:
+   * true means out of time. A file that yields no records (one huge line, a
+   * long run of unparsable lines) never returns to the consumer's own clock
+   * check, so the time budget has to be enforced here too.
+   */
+  outOfTime?: () => boolean;
   /** Set when a read stopped at the budget with part of a file unread. */
   cutShort?: boolean;
+  /** Set when that stop was `outOfTime`, not the byte budget. */
+  timedOut?: boolean;
 }
 
 export function* iterateJsonlBackwardsSync<T = unknown>(
@@ -243,6 +252,11 @@ export function* iterateJsonlBackwardsSync<T = unknown>(
     while (pos > 0) {
       if (progress && progress.bytesRead > progress.maxBytes) {
         progress.cutShort = true;
+        return;
+      }
+      if (progress?.outOfTime?.()) {
+        progress.cutShort = true;
+        progress.timedOut = true;
         return;
       }
       const readSize = Math.min(chunkSize, pos);

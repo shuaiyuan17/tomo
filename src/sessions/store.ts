@@ -824,7 +824,11 @@ export class SessionStore {
     const budget = { ...RECALL_SCAN_BUDGET, ...opts.budget };
     const now = budget.now ?? (() => performance.now());
     const startedAt = now();
-    const progress: JsonlReadProgress = { bytesRead: 0, maxBytes: budget.maxBytes };
+    const progress: JsonlReadProgress = {
+      bytesRead: 0,
+      maxBytes: budget.maxBytes,
+      outOfTime: () => now() - startedAt > budget.maxMs,
+    };
     const readSet = this.transcriptReadSet(key);
     const ordered = !readSet.hasSidecars;
 
@@ -833,6 +837,7 @@ export class SessionStore {
     // The oldest placeable record the scan has passed: how far back it got.
     let reachedBackTo: number | null = null;
     const exhausted = (): "time" | "bytes" | null => {
+      if (progress.timedOut) return "time";
       if (progress.bytesRead > budget.maxBytes) return "bytes";
       // The clock is read once per few records: a search of tens of thousands
       // of short records should not spend its budget asking the time.
@@ -891,7 +896,7 @@ export class SessionStore {
       // The reader itself stopped at the byte budget, part-way through a line
       // too long to yield or a run of lines that do not parse.
       if (progress.cutShort) {
-        stopped = { reason: "bytes", reachedBackTo: ordered ? reachedBackTo : null };
+        stopped = { reason: progress.timedOut ? "time" : "bytes", reachedBackTo: ordered ? reachedBackTo : null };
         break;
       }
     }

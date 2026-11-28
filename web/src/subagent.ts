@@ -2,7 +2,7 @@ import type { SubagentItem, SubagentPage, TodoEntry, ToolActivity, ToolOutcome, 
 import { safeHref } from "./links.js";
 import { i18n } from "./i18n/index.js";
 import { formatUnit, formatUnitPair } from "./i18n/format.js";
-import { activityKind, activityKindText, activityLine, isCardRow } from "./activity.js";
+import { activityKind, activityKindText, activityLine, isCardRow, MAX_TURN_CARDS, mergesWith } from "./activity.js";
 
 /** Pure state for the read-only subagent view, kept out of React so it is testable. */
 
@@ -259,12 +259,14 @@ export type ViewBlock =
   /** One of Tomo's own calls that left something behind (activity-card.tsx): never folded, it splits a run like text does. */
   | { kind: "card"; key: string; rows: ToolRow[] }
   | { kind: "todos"; key: string; row: TodosRow }
-  | { kind: "sources"; key: string; sources: WebSource[] };
+  | { kind: "sources"; key: string; sources: WebSource[] }
+  /** A turn's blocks from its seventh card on, folded under "N more activities" (`cards`: how many cards are in it). */
+  | { kind: "more"; key: string; cards: number; blocks: ViewBlock[] };
 
 export function groupRows(rows: ViewRow[]): ViewBlock[] {
   const blocks: ViewBlock[] = [];
   let run: Array<ToolRow | ThinkingRow> = [];
-  let turn: { todosAt?: number; todos: TodosRow[]; tools: ToolRow[]; afterTools: number } = { todos: [], tools: [], afterTools: 0 };
+  let turn: { todosAt?: number; todos: TodosRow[]; tools: ToolRow[]; afterTools: number; start: number } = { todos: [], tools: [], afterTools: 0, start: 0 };
   const flush = () => {
     const tools = run.filter((row): row is ToolRow => row.kind === "tool");
     if (tools.length > 1) blocks.push({ kind: "group", key: tools[0].toolUseId, tools, steps: run });
@@ -283,12 +285,21 @@ export function groupRows(rows: ViewRow[]): ViewBlock[] {
       const first = turn.tools.find((tool) => sourcesOf([tool]).length)!;
       blocks.splice(turn.afterTools, 0, { kind: "sources", key: `sources:${first.toolUseId}`, sources });
     }
-    turn = { todos: [], tools: [], afterTools: 0 };
+    // Past MAX_TURN_CARDS cards, the rest of the turn (cards and lines, in order) folds into one row.
+    const cardsAt = blocks.flatMap((block, i) => i >= turn.start && block.kind === "card" ? [i] : []);
+    if (cardsAt.length > MAX_TURN_CARDS) {
+      const from = cardsAt[MAX_TURN_CARDS];
+      const rest = blocks.splice(from);
+      blocks.push({ kind: "more", key: `more:${(rest[0] as Extract<ViewBlock, { kind: "card" }>).rows[0].toolUseId}`, cards: cardsAt.length - MAX_TURN_CARDS, blocks: rest });
+    }
+    turn = { todos: [], tools: [], afterTools: 0, start: blocks.length };
   };
   for (const row of rows) {
     if (row.kind === "tool" && isCardRow(row)) {
-      flush();
-      blocks.push({ kind: "card", key: `card:${row.toolUseId}`, rows: [row] });
+      const last = blocks.at(-1);
+      // Straight after a card of the same family (to-dos) with nothing between: one card, a line each.
+      if (!run.length && last?.kind === "card" && blocks.length > turn.start && mergesWith(last.rows.at(-1)!, row)) last.rows.push(row);
+      else { flush(); blocks.push({ kind: "card", key: `card:${row.toolUseId}`, rows: [row] }); }
       turn.tools.push(row);
     } else if (row.kind === "tool" || row.kind === "thinking") {
       run.push(row);

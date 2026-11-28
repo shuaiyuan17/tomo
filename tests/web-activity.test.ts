@@ -67,11 +67,16 @@ describe("toolOutcome reads what the real tools return", () => {
     const tools = buildTodoTools({ store: () => new TodoStore(dir), caller: () => "dm:owner" });
     expect(toolOutcome(I("todo_list"), textOf(await run(tools, "todo_list", { filter: "all" })))).toEqual({ count: 0 });
     const added = await run(tools, "todo_add", { title: "Order seeds", next: "Call the nursery", waiting_on: "me" });
-    expect(toolOutcome(I("todo_add"), textOf(added))).toEqual({ id: "t-1" });
-    await run(tools, "todo_add", { title: "Fix the tap", next: "Phone the plumber", waiting_on: "owner" });
+    expect(toolOutcome(I("todo_add"), textOf(added))).toEqual({ id: "t-1", title: "Order seeds", review: expect.any(String) });
+    // A title with the separator in it is still read whole.
+    const dotted = await run(tools, "todo_add", { title: "Seeds · and soil", next: "Call", waiting_on: "external", ref: "PR 9" });
+    expect(toolOutcome(I("todo_add"), textOf(dotted))).toMatchObject({ id: "t-2", title: "Seeds · and soil" });
+    await run(tools, "todo_resolve", { id: "t-2", action: "drop", reason: "dup" });
+    await run(tools, "todo_add", { title: "Fix the tap", next: "Phone the plumber", waiting_on: "owner" }); // t-3
     expect(toolOutcome(I("todo_list"), textOf(await run(tools, "todo_list", { filter: "all" })))).toEqual({ count: 2 });
-    expect(toolOutcome(I("todo_resolve"), textOf(await run(tools, "todo_resolve", { id: "t-1", action: "done", evidence: "PR 4" })))).toEqual({ id: "t-1" });
-    expect(toolOutcome(I("todo_resolve"), textOf(await run(tools, "todo_resolve", { id: "t-2", action: "snooze", until: "3d", reason: "later" })))).toEqual({ id: "t-2" });
+    expect(toolOutcome(I("todo_resolve"), textOf(await run(tools, "todo_resolve", { id: "t-1", action: "done", evidence: "PR 4" })))).toMatchObject({ id: "t-1", title: "Order seeds" });
+    expect(toolOutcome(I("todo_resolve"), textOf(await run(tools, "todo_resolve", { id: "t-3", action: "snooze", until: "3d", reason: "later" }))))
+      .toMatchObject({ id: "t-3", title: "Fix the tap", snoozes: 1, maxSnoozes: expect.any(Number), review: expect.any(String) });
     const bad = await run(tools, "todo_resolve", { id: "t-99", action: "done" });
     expect(bad.isError).toBe(true);
     expect(failureReason(I("todo_resolve"), textOf(bad))).not.toMatch(/^todo_resolve/);
@@ -82,12 +87,19 @@ describe("toolOutcome reads what the real tools return", () => {
     const tools = buildCronTools(path, "dm:owner");
     const created = await run(tools, "schedule_create", { name: "Dentist", schedule: "in 2h", message: "Dentist at 4", once: true });
     const outcome = toolOutcome(I("schedule_create"), textOf(created));
-    expect(outcome).toMatchObject({ id: expect.any(String), lifecycle: "once", enabled: true, nextRunAt: expect.any(Number) });
-    await run(tools, "schedule_create", { name: "Brief", schedule: "30 8 * * *", message: "Morning brief" });
+    expect(outcome).toMatchObject({ id: expect.any(String), lifecycle: "once", enabled: true, nextRunAt: expect.any(Number), scheduleLabel: expect.stringMatching(/^once at /) });
+    const brief = await run(tools, "schedule_create", { name: "Brief", schedule: "30 8 * * *", message: "Morning brief" });
+    expect(toolOutcome(I("schedule_create"), textOf(brief))).toMatchObject({ lifecycle: "recurring", scheduleLabel: expect.stringContaining("30 8 * * *") });
     expect(toolOutcome(I("schedule_list"), textOf(await run(tools, "schedule_list", {})))).toEqual({ count: 2 });
     expect(toolOutcome(I("schedule_enable"), textOf(await run(tools, "schedule_enable", { id: outcome!.id, enabled: false })))).toMatchObject({ enabled: false });
     expect(toolOutcome(I("schedule_remove"), textOf(await run(tools, "schedule_remove", { id: outcome!.id })))).toEqual({});
     expect(toolOutcome(I("schedule_remove"), textOf(await run(tools, "schedule_remove", { id: "nope0000" })))).toEqual({ noop: "Job nope0000 not found." });
+  });
+
+  it("request_credential / request_permission: the status, and where the owner was asked", () => {
+    expect(toolOutcome(I("request_credential"), JSON.stringify({ status: "pending", secret_ref: "r1", asked_on: "telegram", expires_at: 1 }, null, 2)))
+      .toEqual({ status: "pending", channel: "telegram" });
+    expect(toolOutcome(I("request_permission"), JSON.stringify({ status: "already_allowed", path: "/x" }))).toEqual({ status: "already_allowed" });
   });
 
   it("pet tools: an egg or a full pet is a no-op, a feed is its mood", async () => {
@@ -124,6 +136,7 @@ describe("toolActivity reads the raw input", () => {
     expect(activity?.kind === "task_spawn" && activity.brief.length).toBe(ACTIVITY_TEXT_LIMIT);
   });
   it("keeps a schedule's destination session (the input redaction would blank a key named `session`)", () => {
+    expect(toolActivity(I("schedule_create"), { name: "Poll", schedule: "0 18 * * 5", message: "m", session: "telegram:-2" })).toMatchObject({ sessionId: webSessionId("telegram:-2") });
     expect(toolActivity(I("schedule_create"), { name: "Poll", schedule: "0 18 * * 5", message: "Post the poll", session: "telegram:-2" }))
       .toMatchObject({ session: "telegram:-2" });
     expect(toolActivity(I("schedule_create"), { name: "Poll", schedule: "0 18 * * 5", message: "m", session: "hunter2-opaque-value" })).not.toHaveProperty("session");

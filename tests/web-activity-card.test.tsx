@@ -221,3 +221,131 @@ describe("truncation and attachments", () => {
     expect(card(r, { rawOpen: true })).toContain(`>${r.toolUseId}</span>`);
   });
 });
+
+describe("to-do cards", () => {
+  const add: ToolActivity = { kind: "todo_add", title: "Review the design", next: "Read s12's report", waitingOn: "owner", reviewIn: "3d" };
+  const done: ToolActivity = { kind: "todo_resolve", id: "t-40", action: "done", evidence: "PR 689" };
+  const snooze: ToolActivity = { kind: "todo_resolve", id: "t-39", action: "snooze", until: "1w", reason: "waiting on CI" };
+  const cardOf = (items: SubagentItem[], running = false) => {
+    const blocks = groupRows(viewRows(items));
+    const block = blocks.find((b) => b.kind === "card");
+    return block?.kind === "card" ? renderToStaticMarkup(createElement(ActivityCard, { rows: block.rows, running, rawOpen: false, onRawOpen: () => undefined })) : "";
+  };
+  it("one add: its head, the title, next step, who it waits on and when it is reviewed", () => {
+    const shown = card(row(call(add, { outcome: { id: "t-41", title: "Review the design", review: "Nov 17" } })));
+    expect(shown).toContain('data-activity-card="todo_add"');
+    expect(shown).toContain("Added a to-do");
+    expect(shown).toContain("Review the design");
+    expect(shown).toContain("t-41");
+    expect(shown).toContain("next: Read s12&#x27;s report · waiting on you · review Nov 17");
+  });
+  it("running and failed", () => {
+    expect(card(row(call(add)), { running: true })).toContain("Adding a to-do");
+    const failed = card(row(call(add, { isError: true, reason: "\"2026-11-13\" is not in the future." })));
+    expect(failed).toContain("Couldn&#x27;t add the to-do");
+    expect(failed).toContain("Not added: &quot;2026-11-13&quot; is not in the future.");
+  });
+  it("a resolve: per action head; done and dropped are struck through; a snooze says until when and which time", () => {
+    const closed = card(row(call(done, { outcome: { id: "t-40", title: "Ship part 1" } })));
+    expect(closed).toContain("Closed a to-do");
+    expect(closed).toContain("line-through");
+    expect(closed).toContain("PR 689");
+    const snoozed = card(row(call(snooze, { outcome: { id: "t-39", title: "Merge", review: "Dec 4", snoozes: 2, maxSnoozes: 3 } })));
+    expect(snoozed).toContain("Snoozed a to-do");
+    expect(snoozed).toContain("until Dec 4 · snoozed 2 of 3 · waiting on CI");
+    expect(snoozed).not.toContain("line-through");
+  });
+  it("calls in a row merge into one card: a failed add, the retry, and closes; the head counts them", () => {
+    const items = [...call(add, { isError: true, reason: "not in the future." }), ...call(add, { outcome: { id: "t-41" } }),
+      ...call(done, { outcome: { id: "t-40" } }), ...call(done, { outcome: { id: "t-38" } })];
+    const blocks = groupRows(viewRows(items));
+    expect(blocks.map((b) => b.kind)).toEqual(["card"]);
+    const shown = cardOf(items);
+    expect(shown).toContain("To-dos · added 1, closed 2, and 1 failed");
+    expect(shown).toContain("Not added: not in the future.");
+    // Four lines: three shown, then "1 more".
+    expect(shown.match(/data-todo-line=/g)).toHaveLength(3);
+    expect(shown).toContain("1 more");
+  });
+  it("a line between them keeps them apart", () => {
+    const items = [...call(add, { outcome: { id: "t-41" } }), ...call({ kind: "task_status", id: "s1" }, { outcome: {} }), ...call(done, { outcome: { id: "t-40" } })];
+    expect(groupRows(viewRows(items)).map((b) => b.kind)).toEqual(["card", "tool", "card"]);
+  });
+});
+
+describe("schedule card", () => {
+  const create: ToolActivity = { kind: "schedule_create", name: "Design review", schedule: "2026-11-15T08:30", message: "Remind the owner to look at the design", once: true };
+  it("done, once: name, its time in the reader's zone, the message, the job id and a link to it in Cron", () => {
+    const shown = card(row(call(create, { outcome: { id: "c7f2a91e", lifecycle: "once", nextRunAt: Date.parse("2026-11-15T16:30:00Z") } })));
+    expect(shown).toContain("Scheduled a task · once");
+    expect(shown).toContain("Design review");
+    expect(shown).toContain("Nov 15");
+    expect(shown).toContain("Remind the owner");
+    expect(shown).toContain('href="#study/cron/c7f2a91e"');
+    expect(shown).toContain("Open in Cron");
+  });
+  it("recurring: the schedule in words, the next run, and where it delivers", () => {
+    const env: ActivityEnv = { sessions: [{ id: "w-club", title: "Book club" } as ActivityEnv["sessions"][number]] };
+    const shown = card(row(call({ ...create, schedule: "30 8 * * *", once: undefined, session: "telegram:-2", sessionId: "w-club" } as ToolActivity,
+      { outcome: { id: "ab12", lifecycle: "recurring", scheduleLabel: "30 8 * * *", nextRunAt: Date.parse("2026-11-16T16:30:00Z") } })), { env });
+    expect(shown).toContain("Scheduled a task · recurring");
+    expect(shown).toContain("30 8 * * *");
+    expect(shown).toContain("Next: ");
+    expect(shown).toContain("To Book club");
+  });
+  it("running and failed", () => {
+    expect(card(row(call(create)), { running: true })).toContain("Scheduling a task");
+    const failed = card(row(call(create, { isError: true, reason: "invalid schedule \"x\"" })));
+    expect(failed).toContain("Couldn&#x27;t schedule “Design review”");
+    expect(failed).toContain("invalid schedule");
+    expect(failed).not.toContain("Open in Cron");
+  });
+});
+
+describe("permission and credential cards", () => {
+  const perm: ToolActivity = { kind: "request_permission", path: "~/Documents/taxes", access: "read", reason: "To find last year's return" };
+  const cred: ToolActivity = { kind: "request_credential", name: "github-token", purpose: "Open PRs" };
+  it("permission: access, path, the reason quoted; the footer says only that it was sent (never the final answer)", () => {
+    const shown = card(row(call(perm, { outcome: { status: "pending" } })));
+    expect(shown).toContain("Asked you for access");
+    expect(shown).toContain(">Read<");
+    expect(shown).toContain("~/Documents/taxes");
+    expect(shown).toContain("“To find last year&#x27;s return”");
+    expect(shown).toContain("Request sent");
+    expect(card(row(call(perm, { outcome: { status: "already_allowed" } })))).toContain("Already allowed");
+    expect(card(row(call(perm)), { running: true })).toContain("Asking you for access");
+    expect(card(row(call(perm, { isError: true, reason: "Not in a group." })))).toContain("Not in a group.");
+  });
+  it("credential: its name, purpose, where it was asked; never a value", () => {
+    const shown = card(row(call(cred, { outcome: { status: "pending", channel: "telegram" } })));
+    expect(shown).toContain("Asked you for a credential");
+    expect(shown).toContain("github-token");
+    expect(shown).toContain("Asked on Telegram");
+    expect(card(row(call(cred)), { running: true })).toContain("Asking you for a credential");
+    expect(card(row(call(cred, { isError: true, reason: "No channel to ask on." })))).toContain("No channel to ask on.");
+  });
+});
+
+describe("a turn with more than six cards", () => {
+  const sends = (n: number) => Array.from({ length: n }, (_, i) => call({ kind: "send_message", target: `telegram:-${i}`, mode: "direct", text: `m${i}`, chars: 2 }, { outcome: {} })).flat();
+  it("shows six; the rest of the turn, cards and lines in order, folds under one row", () => {
+    const items = [...sends(6), ...call({ kind: "task_status", id: "s1" }, { outcome: {} }), ...sends(3)];
+    const blocks = groupRows(viewRows(items));
+    expect(blocks.map((b) => b.kind)).toEqual(["card", "card", "card", "card", "card", "card", "tool", "more"]);
+    const more = blocks.at(-1)!;
+    expect(more.kind === "more" && more.cards).toBe(3);
+    const html = renderToStaticMarkup(createElement(TurnBlock, { block: more as Extract<typeof more, { kind: "more" }>, running: false, choices: {}, onChoice: () => undefined }));
+    expect(html).toContain("3 more activities");
+  });
+  it("six or fewer: nothing folds; a new turn (a message) starts the count again", () => {
+    expect(groupRows(viewRows(sends(6))).map((b) => b.kind)).not.toContain("more");
+    const items: SubagentItem[] = [...sends(4), { kind: "message", id: "m", text: "next", truncated: false }, ...sends(4)];
+    expect(groupRows(viewRows(items)).map((b) => b.kind)).not.toContain("more");
+  });
+  it("open, it shows the folded cards", () => {
+    const blocks = groupRows(viewRows(sends(7)));
+    const more = blocks.at(-1)!;
+    const html = renderToStaticMarkup(createElement(TurnBlock, { block: more as Extract<typeof more, { kind: "more" }>, running: false, choices: { [more.kind === "more" ? more.key : ""]: true }, onChoice: () => undefined }));
+    expect(html).toContain('data-activity-card="send_message"');
+  });
+});

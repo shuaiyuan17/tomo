@@ -297,9 +297,14 @@ const ACTIVITY: [string, Record<string, unknown>, string, boolean?][] = [
   ["todo_add", { title: "Review the activity cards design", next: "Read s2's report", waiting_on: "owner", review_in: "2026-11-13" },
     "todo_add failed: review_in \"2026-11-13\" is not in the future.", true],
   ["todo_add", { title: "Review the activity cards design", next: "Read s2's report", waiting_on: "owner", review_in: "3d" },
-    "Added t-41 Review the activity cards design · next: Read s2's report · waiting on the owner · review Nov 17"],
+    "Added t-41 Review the activity cards design · next: Read s2's report · waiting on owner · review Nov 17"],
+  ["todo_resolve", { id: "t-38", action: "done", evidence: "PR 689" }, "Done: t-38 Ship the activity sentences · waiting on me · review Nov 14"],
   ["schedule_create", { name: "Design review reminder", schedule: "2026-11-15T08:30", message: "Remind the owner to look at s2's design", once: true },
-    JSON.stringify({ id: "c7f2a91e", name: "Design review reminder", enabled: true, lifecycle: "once", nextRunAt: "2026-11-15T16:30:00.000Z" })],
+    JSON.stringify({ id: "c7f2a91e", name: "Design review reminder", enabled: true, lifecycle: "once", schedule: { kind: "at", at: "2026-11-15T16:30:00.000Z" }, nextRunAt: "2026-11-15T16:30:00.000Z" })],
+  ["request_permission", { path: "~/Documents/design-notes", access: "read", reason: "To read last month's notes on the chat layout" },
+    JSON.stringify({ status: "pending", id: "p1", code: "4821", path: "~/Documents/design-notes", expires_at: 1 })],
+  ["request_credential", { name: "figma-token", purpose: "Export the frames for the design review" },
+    JSON.stringify({ status: "pending", secret_ref: "r1", asked_on: "telegram", expires_at: 1 })],
   ["pet_feed", {}, JSON.stringify({ event: "fed", hunger: 80, happiness: 72, mood: "happy", diary: "ate contentedly." })],
   ["react_to_message", { target: "dm:owner", reaction: "love" }, "OK. Reaction sent."],
 ];
@@ -530,6 +535,13 @@ async function conversationSteps(page: Page, vp: Viewport, theme: Theme): Promis
     await reset(page);
     const card = history(page).locator("[data-activity-card=task_spawn]").first();
     await card.getByRole("button", { name: "Raw data" }).click({ timeout: 5000 });
+    await card.evaluate((el) => el.scrollIntoView({ block: "start" }));
+    await page.waitForTimeout(300);
+    await snap();
+  });
+  await s("activity", "more", async (snap) => {
+    await reset(page);
+    const card = history(page).locator("[data-activity-card=todo_add]").first();
     await card.evaluate((el) => el.scrollIntoView({ block: "start" }));
     await page.waitForTimeout(300);
     await snap();

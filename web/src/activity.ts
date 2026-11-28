@@ -48,7 +48,17 @@ const KINDS: Record<ToolActivity["kind"], { icon: LucideIcon; kind: ActivityKind
 };
 
 /** Tools shown as a card in the chat (activity-card.tsx); every other internal tool is a line. */
-const CARD_KINDS = new Set<ToolActivity["kind"]>(["task_spawn", "task_message", "task_cancel", "send_message"]);
+const CARD_KINDS = new Set<ToolActivity["kind"]>(["task_spawn", "task_message", "task_cancel", "send_message",
+  "todo_add", "todo_resolve", "schedule_create", "request_permission", "request_credential"]);
+/** Kinds whose cards in a row merge into one (3 todo_resolve calls: one card, a line each). */
+const MERGING = new Set<ToolActivity["kind"]>(["todo_add", "todo_resolve"]);
+/** The card `row` joins when it follows `previous` directly: both to-do calls. */
+export function mergesWith(previous: Pick<ToolRow, "activity" | "result">, row: Pick<ToolRow, "activity" | "result">): boolean {
+  const a = knownActivity(previous); const b = knownActivity(row);
+  return !!a && !!b && MERGING.has(a.kind) && MERGING.has(b.kind);
+}
+/** Cards a turn shows before the rest fold under "N more activities". */
+export const MAX_TURN_CARDS = 6;
 /** A row shown as a card: one of those tools, with an activity this page knows (and a result it could read, when it has one). */
 export function isCardRow(row: Pick<ToolRow, "activity" | "result">): boolean {
   const activity = knownActivity(row);

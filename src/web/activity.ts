@@ -3,6 +3,8 @@ import { redactText } from "./redact-command.js";
 import type { ToolActivity, ToolOutcome } from "./protocol.js";
 import { webSessionId } from "./owner.js";
 import { extractAttachments } from "../agent/text-utils.js";
+import { formatSchedule } from "../cron/format.js";
+import type { CronSchedule } from "../cron/types.js";
 
 /**
  * Tomo's own tools (the in-process `tomo-internal` MCP server) as the web UI
@@ -138,7 +140,8 @@ export function toolActivity(name: string, input: Record<string, unknown>): Tool
       const name = line(input.name); const schedule = line(input.schedule); const message = body(input.message);
       if (!name || !schedule || !message) return undefined;
       return { kind: tool, name, schedule, message: message.text, ...(message.truncated ? { messageTruncated: true } : {}),
-        ...optional("session", sessionKey(input.session)), ...(input.once === true ? { once: true } : {}) };
+        ...optional("session", sessionKey(input.session)), ...(sessionKey(input.session) ? { sessionId: webSessionId(sessionKey(input.session)!) } : {}),
+        ...(input.once === true ? { once: true } : {}) };
     }
     case "schedule_remove": {
       const id = line(input.id);
@@ -201,6 +204,26 @@ const jsonArray = (text: string): unknown[] | undefined => {
 };
 const TASK_ID = "s[1-9]\\d{0,8}";
 const TODO_ID = "t-\\d+";
+/**
+ * A to-do's line as todo_add / todo_resolve print it (src/todos/format.ts, the
+ * English catalog): `t-41 Title · next: … · waiting on owner · review Nov 17 · snoozed 1/3 · ref`.
+ * The title is everything before the first " · " that starts a known part; a
+ * line in another shape gives nothing (the card shows the input's words).
+ */
+const TODO_LINE = new RegExp(`^${TODO_ID} (.+?)(?: · next: .+?)? · waiting on (?:me|owner|external) · (due|review) ([^·]+?)(?: · snoozed (\\d+)(?:/(\\d+))?)?(?: · .*)?$`);
+function todoLine(line: string): Partial<ToolOutcome> {
+  const m = TODO_LINE.exec(line);
+  if (!m) return {};
+  return { title: clean(m[1], ACTIVITY_LINE_LIMIT).text, review: clean(m[3], 40).text, ...(m[2] === "due" ? { due: true } : {}),
+    ...(m[4] ? { snoozes: Number(m[4]) } : {}), ...(m[5] ? { maxSnoozes: Number(m[5]) } : {}) };
+}
+/** A job's schedule in words, when it has the shape cron keeps. */
+function scheduleLabel(schedule: unknown): string | undefined {
+  if (!schedule || typeof schedule !== "object") return undefined;
+  const s = schedule as Partial<CronSchedule> & Record<string, unknown>;
+  const ok = (s.kind === "at" && typeof s.at === "string") || (s.kind === "every" && typeof s.everyMs === "number") || (s.kind === "cron" && typeof s.expr === "string");
+  return ok ? clean(formatSchedule(s as CronSchedule), ACTIVITY_LINE_LIMIT).text : undefined;
+}
 const count = (n: number): ToolOutcome => ({ count: n });
 
 /**
@@ -240,9 +263,9 @@ export function toolOutcome(name: string, output: string): ToolOutcome | undefin
     case "react_to_message": case "edit_message": case "unsend_message": case "rename_group_chat":
       return /^OK\./.test(text) ? {} : undefined;
     case "todo_add":
-      return ((m = new RegExp(`^Added (${TODO_ID}) `).exec(text))) ? { id: m[1] } : undefined;
+      return ((m = new RegExp(`^Added (${TODO_ID}) `).exec(text))) ? { id: m[1], ...todoLine(first.slice("Added ".length)) } : undefined;
     case "todo_resolve":
-      return ((m = new RegExp(`^(?:Done|Dropped|Snoozed|Handed to the owner): (${TODO_ID}) `).exec(text))) ? { id: m[1] } : undefined;
+      return ((m = new RegExp(`^(Done|Dropped|Snoozed|Handed to the owner): (${TODO_ID}) `).exec(text))) ? { id: m[2], ...todoLine(first.slice(m[1].length + 2)) } : undefined;
     case "todo_list":
       if (/^No (?:open|due|mine|owner) todos\.$/.test(text)) return count(0);
       return text.split("\n").every((l) => new RegExp(`^${TODO_ID} `).test(l)) ? count(text.split("\n").length) : undefined;
@@ -251,7 +274,8 @@ export function toolOutcome(name: string, output: string): ToolOutcome | undefin
       const job = json(text);
       if (!job || typeof job.id !== "string") return undefined;
       const next = typeof job.nextRunAt === "string" ? Date.parse(job.nextRunAt) : NaN;
-      return { id: job.id, ...(job.lifecycle === "once" || job.lifecycle === "recurring" ? { lifecycle: job.lifecycle } : {}),
+      const label = scheduleLabel(job.schedule);
+      return { id: job.id, ...(job.lifecycle === "once" || job.lifecycle === "recurring" ? { lifecycle: job.lifecycle } : {}), ...(label ? { scheduleLabel: label } : {}),
         ...(Number.isFinite(next) ? { nextRunAt: next } : {}), ...(typeof job.enabled === "boolean" ? { enabled: job.enabled } : {}) };
     }
     case "schedule_remove":
@@ -263,8 +287,10 @@ export function toolOutcome(name: string, output: string): ToolOutcome | undefin
       return list ? count(list.length) : undefined;
     }
     case "request_permission": case "request_credential": {
-      const status = json(text)?.status;
-      return typeof status === "string" ? { status: clean(status, 40).text } : undefined;
+      const result = json(text);
+      const status = result?.status;
+      if (typeof status !== "string") return undefined;
+      return { status: clean(status, 40).text, ...(tool === "request_credential" && typeof result?.asked_on === "string" ? { channel: clean(result.asked_on, 40).text } : {}) };
     }
     case "recall_conversation":
       if (((m = /^(\d+) message\(s\), oldest first/.exec(text)))) return count(Number(m[1]));

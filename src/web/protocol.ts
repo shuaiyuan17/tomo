@@ -237,7 +237,8 @@ export type ToolActivity =
   | { kind: "todo_add"; title: string; next: string; waitingOn: "me" | "owner" | "external"; reviewIn?: string; ref?: string }
   | { kind: "todo_resolve"; id: string; action: "done" | "drop" | "snooze" | "handoff"; until?: string; reason?: string; evidence?: string; next?: string }
   | { kind: "todo_list"; filter: "due" | "mine" | "owner" | "all" }
-  | { kind: "schedule_create"; name: string; schedule: string; message: string; messageTruncated?: true; session?: string; once?: true }
+  /** `session`: where it delivers, when not here; `sessionId`: that conversation's WebSession.id. */
+  | { kind: "schedule_create"; name: string; schedule: string; message: string; messageTruncated?: true; session?: string; sessionId?: string; once?: true }
   | { kind: "schedule_remove"; id: string }
   | { kind: "schedule_enable"; id: string; enabled: boolean }
   | { kind: "request_permission"; path: string; access: "read" | "write"; reason: string }
@@ -261,6 +262,12 @@ export interface ToolOutcome {
   id?: string; status?: string; count?: number; note?: string; noop?: string;
   delivery?: "passed" | "queued" | "released" | "held";
   lifecycle?: "once" | "recurring"; nextRunAt?: number; enabled?: boolean;
+  /** A to-do's line as the tool printed it: `title`, `review` (its date, as written: "Nov 17"), `due` (that date has passed), `snoozes` / `maxSnoozes`. */
+  title?: string; review?: string; due?: true; snoozes?: number; maxSnoozes?: number;
+  /** A scheduled task's schedule in words (src/cron/format.ts, English). */
+  scheduleLabel?: string;
+  /** request_credential: the channel the owner was asked on. */
+  channel?: string;
 }
 /** One entry of a subagent's transcript, as the read-only task view shows it. */
 export type SubagentItem =

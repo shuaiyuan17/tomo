@@ -64,6 +64,7 @@ function Frame({ keys, lastRowId, busy, top, handle, children }: Parameters<type
   if (!opening.current && keys.length) opening.current = openingAnchors(keys, claimed.current);
   const joined = keys.join("\n");
   // `joined` stands in for `keys`, a fresh array every render.
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- `joined` stands in for `keys`, a fresh array every render
   const unseen = useMemo(() => atEnd ? NONE : unseenKeys(baseline.current!, keys), [atEnd, joined]);
   useEffect(() => { if (atEnd) baseline.current = new Set(keys); });
   useImperativeHandle(handle, () => ({

@@ -78,15 +78,18 @@ export function RoomView({ scene, revision, status, now, label, handle, onFailur
   }, [handle]);
 
   useEffect(() => { if (stage.current) stage.current.reducedMotion = reduced; stage.current?.invalidate(); }, [reduced, ready]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- a new onReady from the parent is no reason to rebuild the scene
   useEffect(() => { if (ready) { stage.current?.setScene(scene, revision); onReady?.(); } }, [scene, revision, ready]);
 
   // Pure evaluation; the stage only hears about it when something it shows changed.
   // The sign values are words (an idle span, the caption): worked out again when the language changes.
   const { i18n: language } = useTranslation();
   const state = useMemo<StageState>(() => ({ conditions: homeConditions(status, now), values: signValues(status, now), subagents: status.subagents, hasPet: !!status.pet, sky: skyOf(status, now) }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- language.language: signValues reads the current language through i18n
     [status, now, language.language]);
   // The sun and moon move slowly: their place is rounded so a tick does not redraw the window for nothing.
   const signature = JSON.stringify([[...state.conditions].sort(), state.values, state.subagents, state.hasPet, { ...state.sky, progress: Math.round(state.sky.progress * 200) }]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- `signature` stands in for `state`, which is new every tick
   useEffect(() => { if (ready) stage.current?.setState(state); }, [signature, ready, scene, revision]);
 
   // The room is the owner's to look round (OrbitControls, in the stage): drag

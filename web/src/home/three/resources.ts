@@ -68,6 +68,7 @@ export class Resources {
    */
   picture(name: string, use: (texture: Texture) => void): void {
     const known = this.pictures.get(name);
+    // eslint-disable-next-line react-hooks/rules-of-hooks -- a callback parameter named `use`, not React's use() hook
     if (known) { if (known.texture) use(known.texture); else known.waiting.push(use); return; }
     const entry = { texture: null as Texture | null, waiting: [use] };
     this.pictures.set(name, entry);

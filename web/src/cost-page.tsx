@@ -79,11 +79,11 @@ function CostSkeleton() {
 }
 
 /** The plan's 5-hour and 7-day quota from the newest sample in limits.ndjson; nothing without one. */
-function QuotaBar({ limits }: { limits: WebCostLimits }) {
+export function QuotaBar({ limits }: { limits: WebCostLimits }) {
+  const { t } = useTranslation(["cost", "common"]);
   const windows = quotaWindows(limits.windows);
   if (!windows.length) return null;
   const now = Date.now();
-  const { t } = useTranslation(["cost", "common"]);
   const sampled = Date.parse(limits.sampledAt);
   return <section aria-label={t("common:usage.heading")} className={cn(card, "flex flex-wrap items-center gap-x-8 gap-y-3 px-6 py-3.5 max-[600px]:px-4")}>
     <p className="eyebrow shrink-0 max-[1100px]:w-full" title={Number.isFinite(sampled) ? t("quota.sampled", { when: formatDate(sampled, { dateStyle: "medium", timeStyle: "medium" }) }) : undefined}>{t("common:usage.heading")}

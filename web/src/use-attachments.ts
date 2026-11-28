@@ -96,6 +96,7 @@ export function useAttachments(bootstrap: WebBootstrap | undefined, refresh: () 
     setNote(message);
     for (const item of added) upload(item);
     return added.map((item) => item.key);
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- `allow` is a fresh object from the caller every render; its two flags are what count
   }, [upload, commit, allow.images, allow.files]);
 
   /**

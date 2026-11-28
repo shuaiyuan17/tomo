@@ -108,9 +108,9 @@ export function SubsessionView({ summary, revision, onBack, send, done }: { summ
   const foldLine = progress && chatFirst ? progressSummary(progress, running) : undefined;
   // Sent ones the conversation now has are done with.
   useEffect(() => {
-    if (detail) setPending((old) => old.some((m) => m.state === "sent" && m.revision !== undefined && detail.revision >= m.revision)
+    if (detail) updatePending(id, (old) => old.some((m) => m.state === "sent" && m.revision !== undefined && detail.revision >= m.revision)
       ? old.filter((m) => !(m.state === "sent" && m.revision !== undefined && detail.revision >= m.revision)) : old);
-  }, [detail]);
+  }, [detail, id]);
   return <section className="motion-from-right flex min-h-0 flex-1 flex-col" aria-labelledby="subsession-heading" data-subsession={id}>
     <div className="mb-2 flex items-start gap-1.5 pr-2.5">
       <Button variant="ghost" size="sm" onClick={onBack} aria-label={t("back")}

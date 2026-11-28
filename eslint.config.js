@@ -1,6 +1,7 @@
 import eslint from "@eslint/js";
 import tseslint from "typescript-eslint";
 import i18next from "eslint-plugin-i18next";
+import reactHooks from "eslint-plugin-react-hooks";
 
 export default tseslint.config(
   eslint.configs.recommended,
@@ -12,6 +13,17 @@ export default tseslint.config(
     rules: {
       "@typescript-eslint/no-unused-vars": ["error", { argsIgnorePattern: "^_" }],
       "@typescript-eslint/no-explicit-any": "off",
+    },
+  },
+  // The two classic hook rules only. The plugin's v7 React Compiler rules
+  // (refs, set-state-in-effect, purity, ...) are left off: the web UI does not
+  // use the Compiler, and those rules mostly flag code it could not optimise.
+  {
+    files: ["web/src/**/*.{ts,tsx}"],
+    plugins: { "react-hooks": reactHooks },
+    rules: {
+      "react-hooks/rules-of-hooks": "error",
+      "react-hooks/exhaustive-deps": "warn",
     },
   },
   // The web UI's copy goes through its catalogs (web/src/i18n/). Mode "all":

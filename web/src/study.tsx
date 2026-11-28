@@ -78,7 +78,7 @@ function Memory({ reload, focus }: { reload: number; focus: string | null }) {
   const [query, setQuery] = useState("");
   const [file] = useResource<WebMemoryFile>(selected ? `/memory/file?path=${encodeURIComponent(selected)}` : null, reload);
   const [search] = useResource<WebMemorySearch>(query ? `/memory/search?q=${encodeURIComponent(query)}` : null, reload);
-  const entries = tree.state === "ready" ? tree.value.entries : [];
+  const entries = useMemo(() => tree.state === "ready" ? tree.value.entries : [], [tree]);
   useEffect(() => {
     if (!selected && entries.some((e) => e.path === "MEMORY.md")) setSelected("MEMORY.md");
   }, [entries, selected]);

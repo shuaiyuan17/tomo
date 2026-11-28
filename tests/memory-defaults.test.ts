@@ -8,9 +8,9 @@ const defaults = join(import.meta.dirname, "..", "defaults");
 const read = (rel: string) => readFileSync(join(defaults, rel), "utf8");
 
 describe("bundled defaults and the memory store guard", () => {
-  it("a new install's heartbeat keeps no journal", () => {
+  it("a new install's heartbeat keeps its journal under private/journal/, never a path the guard refuses", () => {
     const continuity = read("CONTINUITY.md");
-    expect(continuity).not.toMatch(/journal/i);
+    expect(continuity).toContain("`private/journal/YYYY-MM-DD.md`");
     expect(continuity).not.toMatch(/memory\/[^\s`]*\.md/);
   });
 
@@ -27,6 +27,7 @@ describe("bundled defaults and the memory store guard", () => {
 
 describe("stage 3 defaults", () => {
   it("a new install's heartbeat no longer checks memory: that is the rollup's memory pass", () => {
-    expect(read("CONTINUITY.md")).not.toMatch(/memory/i);
+    // The journal step names where the journal lives ("in memory"); nothing else mentions memory.
+    expect(read("CONTINUITY.md").replace("journal in memory", "")).not.toMatch(/memory/i);
   });
 });

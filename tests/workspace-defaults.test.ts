@@ -15,6 +15,7 @@ const MECHANICS = [
   /\bNO_REPLY\b|\bMEDIA:|\bSTICKER:/,
   /\/summon|\/dismiss|tomo-event/,
   /\bevery ~?\d+ minutes\b/,
+  /\bmemory_[a-z]+\b/,
 ];
 
 describe("the bundled workspace files", () => {

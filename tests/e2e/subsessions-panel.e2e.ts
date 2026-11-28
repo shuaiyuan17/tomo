@@ -124,6 +124,8 @@ it("puts the owner conversation's tasks first, then sub-sessions; an ended one f
 
   await page.getByRole("button", { name: /^Tasks/ }).click();
   await browserExpect(rail().locator('[data-subsession-row="s4"]')).toBeVisible();
+  // The last change to the table has reached the page (the `subsessions` event is debounced).
+  await browserExpect(rail().locator('[data-subsession-row="s5"]')).toContainText("Done");
   await browserExpect(rail().getByRole("button", { name: /Group work/ })).toBeVisible();
   // The rail's content slides and fades in: the shot waits for it to settle.
   await page.waitForTimeout(400);
@@ -136,19 +138,19 @@ it("puts the owner conversation's tasks first, then sub-sessions; an ended one f
   expect(subs).toBeLessThan(group);
   // Yesterday's: the one still going and the one that needs the owner stay; the cancelled and the finished one are folded away.
   const rows = () => rail().locator("[data-subsession-row]").evaluateAll((els) => els.map((el) => el.getAttribute("data-subsession-row")));
-  expect(await rows()).toEqual(["s3", "s4", "s5"]);
+  await browserExpect.poll(rows).toEqual(["s3", "s4", "s5"]);
   const earlier = rail().getByTestId("subsessions-earlier");
   await browserExpect(earlier).toHaveText("2 earlier");
   await browserExpect(earlier).toHaveAttribute("aria-expanded", "false");
   await earlier.click();
   await browserExpect(earlier).toHaveAttribute("aria-expanded", "true");
   // They open under the row that offered them, newest first.
-  expect(await rows()).toEqual(["s3", "s4", "s5", "s2", "s1"]);
+  await browserExpect.poll(rows).toEqual(["s3", "s4", "s5", "s2", "s1"]);
   expect((await earlier.boundingBox())!.y).toBeLessThan((await rail().locator('[data-subsession-row="s2"]').boundingBox())!.y);
   await page.waitForTimeout(200);
   await page.screenshot({ path: "test-results/subsessions-today-earlier.png" });
   await earlier.click();
-  expect(await rows()).toEqual(["s3", "s4", "s5"]);
+  await browserExpect.poll(rows).toEqual(["s3", "s4", "s5"]);
 });
 
 it("shows a task's own model, and a task waiting on a check-back with background work still running as working", async () => {

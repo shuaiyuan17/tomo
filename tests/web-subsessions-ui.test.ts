@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { activeSubsessions, canRetrySend, folded, hasProgress, leadsWithChat, progressSummary, planStepLook, showableTime, updateText, pendingFor, updatePending, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel, isWorkingState, subsessionsRefreshMs, SUBSESSIONS_BACKGROUND_REFRESH_MS, startOfLocalDay, todaysSubsessions, withListBackground } from "../web/src/subsessions.js";
+import { activeSubsessions, canRetrySend, folded, hasProgress, leadsWithChat, progressSummary, planStepLook, showableTime, updateText, pendingFor, updatePending, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel, isWorkingState, subsessionsRefreshMs, SUBSESSIONS_BACKGROUND_REFRESH_MS, msToNextLocalDay, startOfLocalDay, todaysSubsessions, withListBackground } from "../web/src/subsessions.js";
 import type { WebSubsession, WebSubsessionDetail } from "../src/web/protocol.js";
 
 const task = (extra: Partial<WebSubsession> = {}): WebSubsession => ({ id: "s1", title: "T", status: "active", working: false,
@@ -226,6 +226,13 @@ describe("sub-sessions in the Tasks rail", () => {
       // The daemon's clock a little ahead of the browser's, across midnight.
       expect(todaysSubsessions([ended("s1", "finished", at(28, 0, 1))], at(27, 23, 59)).earlier).toHaveLength(0);
       expect(todaysSubsessions([ended("s1", "finished", Number.NaN)], now).earlier).toHaveLength(0);
+    });
+
+    it("sets its timer for the viewer's next midnight, and never for no time at all", () => {
+      expect(msToNextLocalDay(at(27, 0), at(27, 23, 59))).toBe(60_000);
+      expect(msToNextLocalDay(at(27, 0), at(27, 0))).toBe(at(28, 0) - at(27, 0));
+      // The clock already past it (the day has not been moved on yet): soon, not at once in a loop.
+      expect(msToNextLocalDay(at(27, 0), at(28, 0, 5))).toBe(250);
     });
 
     it("has nothing to offer when there is nothing earlier", () => {

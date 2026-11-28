@@ -137,17 +137,27 @@ export function todaysSubsessions<T extends DatedTask>(tasks: readonly T[], now:
   const isEarlier = (task: T) => !isOpenSubsession(task) && lastActive(task) < today;
   return { shown: tasks.filter((task) => !isEarlier(task)), earlier: tasks.filter(isEarlier) };
 }
-/** How often the rail looks at the clock for a new day. */
+/** How often the rail looks at the clock for a new day, should the timer set for midnight be held back (a throttled tab). */
 const TODAY_CHECK_MS = 60_000;
-/** Today's first moment on the viewer's clock, moving on when the day does (a page left open overnight, a laptop woken). */
+/** How long until the day after `today` (a start of day) begins, on the viewer's clock: never less than a moment, so a timer set for it cannot spin. */
+export function msToNextLocalDay(today: number, now: number): number {
+  return Math.max(250, new Date(today).setHours(24, 0, 0, 0) - now);
+}
+/**
+ * Today's first moment on the viewer's clock, moving on when the day does: a
+ * timer set for midnight, and a look at the clock every minute and whenever
+ * the page comes back into view (a page left open overnight, a laptop woken).
+ */
 export function useToday(): number {
   const [today, setToday] = useState(() => startOfLocalDay(Date.now()));
   useEffect(() => {
     const check = () => setToday(startOfLocalDay(Date.now()));
+    // Set again for each new day: the effect runs again when `today` moves.
+    const midnight = setTimeout(check, msToNextLocalDay(today, Date.now()));
     const timer = setInterval(check, TODAY_CHECK_MS);
     document.addEventListener("visibilitychange", check);
-    return () => { clearInterval(timer); document.removeEventListener("visibilitychange", check); };
-  }, []);
+    return () => { clearTimeout(midnight); clearInterval(timer); document.removeEventListener("visibilitychange", check); };
+  }, [today]);
   return today;
 }
 

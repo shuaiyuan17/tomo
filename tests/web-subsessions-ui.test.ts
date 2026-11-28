@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { activeSubsessions, canRetrySend, folded, hasProgress, leadsWithChat, progressSummary, planStepLook, showableTime, updateText, pendingFor, updatePending, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel, isWorkingState, subsessionsRefreshMs, SUBSESSIONS_BACKGROUND_REFRESH_MS, msToNextLocalDay, startOfLocalDay, todaysSubsessions, withListBackground } from "../web/src/subsessions.js";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { activeSubsessions, canRetrySend, folded, hasProgress, leadsWithChat, progressSummary, planStepLook, showableTime, updateText, pendingFor, updatePending, isOpenSubsession, subsessionChatRows, subsessionState, subsessionStateLabel, isWorkingState, subsessionsRefreshMs, SUBSESSIONS_BACKGROUND_REFRESH_MS, msToNextLocalDay, startOfLocalDay, todaysSubsessions, watchLocalDay, withListBackground } from "../web/src/subsessions.js";
 import type { WebSubsession, WebSubsessionDetail } from "../src/web/protocol.js";
 
 const task = (extra: Partial<WebSubsession> = {}): WebSubsession => ({ id: "s1", title: "T", status: "active", working: false,
@@ -177,7 +177,7 @@ describe("sub-sessions in the Tasks rail", () => {
   });
   describe("only today's ended sub-sessions are listed until the earlier ones are asked for", () => {
     // Times are built on the machine's own clock, as the browser reads them: the test holds in any time zone.
-    const at = (day: number, hour: number, minute = 0) => new Date(2026, 10, day, hour, minute).getTime();
+    const at = (day: number, hour: number, minute = 0, second = 0) => new Date(2026, 10, day, hour, minute, second).getTime();
     const now = at(27, 15);
     const ids = (list: readonly WebSubsession[]) => list.map((t) => t.id);
     const ended = (id: string, status: "finished" | "cancelled" | "failed", when: number, extra: Partial<WebSubsession> = {}) =>
@@ -233,6 +233,65 @@ describe("sub-sessions in the Tasks rail", () => {
       expect(msToNextLocalDay(at(27, 0), at(27, 0))).toBe(at(28, 0) - at(27, 0));
       // The clock already past it (the day has not been moved on yet): soon, not at once in a loop.
       expect(msToNextLocalDay(at(27, 0), at(28, 0, 5))).toBe(250);
+    });
+
+    describe("the day moves on while the rail is open", () => {
+      afterEach(() => { vi.useRealTimers(); });
+      const watch = (start: number) => {
+        vi.useFakeTimers();
+        vi.setSystemTime(start);
+        const days: number[] = [];
+        let onVisible = () => {};
+        const page = { addEventListener: (_: string, fn: () => void) => { onVisible = fn; }, removeEventListener: () => { onVisible = () => {}; } } as unknown as Document;
+        const stop = watchLocalDay((today) => { if (days.at(-1) !== today) days.push(today); }, page);
+        return { days, stop, visible: () => onVisible() };
+      };
+
+      it("at the viewer's midnight, not up to a minute after it", () => {
+        const w = watch(at(27, 23, 59, 30));
+        expect(w.days).toEqual([at(27, 0)]);
+        vi.advanceTimersByTime(29_000);
+        expect(w.days).toEqual([at(27, 0)]);
+        vi.advanceTimersByTime(1_000);
+        expect(w.days).toEqual([at(27, 0), at(28, 0)]);
+        // And again the night after.
+        vi.advanceTimersByTime(24 * 60 * 60 * 1000);
+        expect(w.days.at(-1)).toBe(at(29, 0));
+        w.stop();
+      });
+
+      it("still at midnight after the clock was put back, or forward, in between", () => {
+        const back = watch(at(27, 23, 0, 30));
+        // An hour back: the timer set for midnight fires an hour early, finds the same day, and is set again.
+        vi.setSystemTime(at(27, 22, 0, 30));
+        vi.advanceTimersByTime(2 * 60 * 60 * 1000 - 31_000);
+        expect(back.days).toEqual([at(27, 0)]);
+        vi.advanceTimersByTime(1_000);
+        expect(back.days).toEqual([at(27, 0), at(28, 0)]);
+        back.stop();
+        vi.useRealTimers();
+
+        const forward = watch(at(27, 20, 0, 30));
+        // Two hours forward: the next look (within the minute) sets the timer for the midnight that is now nearer.
+        vi.setSystemTime(at(27, 22, 0, 30));
+        vi.advanceTimersByTime(2 * 60 * 60 * 1000 - 31_000);
+        expect(forward.days).toEqual([at(27, 0)]);
+        vi.advanceTimersByTime(1_000);
+        expect(forward.days).toEqual([at(27, 0), at(28, 0)]);
+        forward.stop();
+      });
+
+      it("as soon as the page comes back into view, and not at all once stopped", () => {
+        const w = watch(at(27, 12));
+        // A laptop asleep overnight: the clock moved, no timer ran.
+        vi.setSystemTime(at(28, 8));
+        w.visible();
+        expect(w.days).toEqual([at(27, 0), at(28, 0)]);
+        w.stop();
+        vi.advanceTimersByTime(48 * 60 * 60 * 1000);
+        expect(w.days).toEqual([at(27, 0), at(28, 0)]);
+        expect(vi.getTimerCount()).toBe(0);
+      });
     });
 
     it("has nothing to offer when there is nothing earlier", () => {

@@ -144,22 +144,31 @@ export function msToNextLocalDay(today: number, now: number): number {
   return Math.max(250, new Date(today).setHours(24, 0, 0, 0) - now);
 }
 /**
- * Today's first moment on the viewer's clock, moving on when the day does: a
- * timer set for midnight (set again each time it fires, so a clock put back
- * does not leave it unset), and a look at the clock every minute and whenever
- * the page comes back into view (a page left open overnight, a laptop woken).
+ * Tells `onDay` today's first moment on the viewer's clock whenever it looks:
+ * at midnight, on a timer; every minute; and whenever the page comes back
+ * into view (a page left open overnight, a laptop woken). Each look sets the
+ * midnight timer again from the clock as it is then, so a clock or time zone
+ * that moved, either way, does not leave it set for the wrong moment.
+ * Returns how to stop.
  */
+export function watchLocalDay(onDay: (today: number) => void, page: Pick<Document, "addEventListener" | "removeEventListener"> = document): () => void {
+  let midnight: ReturnType<typeof setTimeout> | undefined;
+  const look = () => {
+    const now = Date.now();
+    const today = startOfLocalDay(now);
+    clearTimeout(midnight);
+    midnight = setTimeout(look, msToNextLocalDay(today, now));
+    onDay(today);
+  };
+  look();
+  const timer = setInterval(look, TODAY_CHECK_MS);
+  page.addEventListener("visibilitychange", look);
+  return () => { clearTimeout(midnight); clearInterval(timer); page.removeEventListener("visibilitychange", look); };
+}
+/** Today's first moment on the viewer's clock, moving on when the day does (watchLocalDay). */
 export function useToday(): number {
   const [today, setToday] = useState(() => startOfLocalDay(Date.now()));
-  useEffect(() => {
-    const check = () => setToday(startOfLocalDay(Date.now()));
-    let midnight: ReturnType<typeof setTimeout>;
-    const arm = () => { const now = Date.now(); midnight = setTimeout(() => { check(); arm(); }, msToNextLocalDay(startOfLocalDay(now), now)); };
-    arm();
-    const timer = setInterval(check, TODAY_CHECK_MS);
-    document.addEventListener("visibilitychange", check);
-    return () => { clearTimeout(midnight); clearInterval(timer); document.removeEventListener("visibilitychange", check); };
-  }, []);
+  useEffect(() => watchLocalDay(setToday), []);
   return today;
 }
 

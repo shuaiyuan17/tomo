@@ -208,11 +208,12 @@ export function readMemoryFile(abs: string, memoryDir: string, excludePrivate: b
     if (excludePrivate && isOtherGroupMemoryPath(relative(memoryDir, real).split(sep).join("/"), ownGroupDir)) return { refused: "other-group" };
     const now = statSync(real);
     if (now.ino !== st.ino || now.dev !== st.dev) return { refused: "moved" };
-    if (headBytes !== undefined && st.size > headBytes) {
-      // The first part only (the frontmatter is at the top): bounded, whatever the file's size.
+    if (headBytes !== undefined) {
+      // The first part only (the frontmatter is at the top): one bounded read,
+      // whatever the size was at fstat (the file may be growing).
       const head = Buffer.alloc(headBytes);
       const n = readSync(fd, head, 0, headBytes, 0);
-      return { bytes: head.subarray(0, n), partial: true };
+      return n === headBytes ? { bytes: head.subarray(0, n), partial: true } : { bytes: head.subarray(0, n) };
     }
     return { bytes: readFileSync(fd) };
   } finally {
@@ -302,6 +303,8 @@ export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileE
       try { st = lstatSync(join(opts.memoryDir, rel)); } catch { continue; }
       if (st.isSymbolicLink() || skipped(rel, st.isDirectory())) continue;
       if (st.isDirectory()) {
+        // Nothing under journal/ or archive/ can be listed: without includeUnlisted, don't spend the budget there.
+        if (!opts.includeUnlisted && ["journal", "archive"].includes(foldPath(name))) continue;
         if (depth < 8) walk(rel, depth + 1);
         continue;
       }

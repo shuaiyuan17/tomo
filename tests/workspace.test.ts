@@ -1,5 +1,5 @@
 import { describe, it, expect, afterAll, beforeAll, beforeEach, afterEach, vi } from "vitest";
-import { mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -196,6 +196,24 @@ describe("buildSystemPrompt", () => {
         expect(prompt).not.toContain("LEGACY-PRIVATE-POINTER");
         expect(prompt).not.toContain("LEGACY-PRIVATE-TOPIC");
         expect(prompt).toContain("- travel.md — Trips.");
+      }
+    });
+
+    it("says a folder it can't read could not be read, in one line however many there are", () => {
+      for (const d of ["notes", "travel.md"]) rmSync(join(memoryDir, d), { recursive: true, force: true });
+      mkdirSync(join(memoryDir, "notes", "a"), { recursive: true });
+      mkdirSync(join(memoryDir, "notes", "b"), { recursive: true });
+      chmodSync(join(memoryDir, "notes", "a"), 0o000);
+      try {
+        expect(buildSystemPrompt()).toContain("(notes/a/ could not be read just now)");
+        expect(() => promptContextSnapshot({ strict: true })).toThrow();
+        chmodSync(join(memoryDir, "notes", "b"), 0o000);
+        const prompt = buildSystemPrompt();
+        expect(prompt).toContain("(2 folders could not be read just now)");
+        expect(prompt).not.toContain("notes/a/ could not");
+      } finally {
+        chmodSync(join(memoryDir, "notes", "a"), 0o755);
+        chmodSync(join(memoryDir, "notes", "b"), 0o755);
       }
     });
 

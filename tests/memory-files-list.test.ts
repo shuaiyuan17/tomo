@@ -102,6 +102,21 @@ describe("reading the tree for the list", () => {
     expect(entries).toEqual([expect.objectContaining({ path: "huge.md", description: "Huge.", version: "", bytes: 3 * 1024 * 1024 + topic("Huge.").length })]);
   });
 
+  it("doesn't spend the scan on journal/ or archive/, whose files are never listed", () => {
+    for (let i = 0; i < 10; i++) put(`archive/a${i}.md`, topic("Old."));
+    for (let i = 0; i < 10; i++) put(`journal/d${i}.md`, "x");
+    put("work.md", topic("W."));
+    const r = collectMemoryFiles({ memoryDir: mem, excludePrivate: false, maxFiles: 2 });
+    expect(r.truncated).toBe(false);
+    expect(r.entries.map((e) => e.path)).toEqual(["work.md"]);
+  });
+
+  it("a small file is read whole under the head limit", () => {
+    put("small.md", topic("Small."));
+    const { entries } = collectMemoryFiles({ memoryDir: mem, excludePrivate: false, headBytes: 16 * 1024 });
+    expect(entries[0]).toMatchObject({ path: "small.md", description: "Small.", bytes: topic("Small.").length });
+  });
+
   it("reports a folder it can't read, rather than treating it as empty", () => {
     put("work/a.md", topic("A."));
     chmodSync(join(mem, "work"), 0o000);

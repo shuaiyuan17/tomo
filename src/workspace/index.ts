@@ -282,7 +282,10 @@ function memoryFilesLines(withoutPrivate: boolean, strict = false): string[] {
     ...(groupLabelLookup ? { groupLabel: groupLabelLookup } : {}),
   });
   const notes = [
-    ...unreadableDirs.map((dir) => `(${dir ? `${dir}/` : "memory/"} could not be read just now)`),
+    // One line however many: folder names are not bounded by the list's budget.
+    ...(unreadableDirs.length === 1
+      ? [`(${unreadableDirs[0] ? `${unreadableDirs[0]}/` : "memory/"} could not be read just now)`]
+      : unreadableDirs.length > 1 ? [`(${unreadableDirs.length} folders could not be read just now)`] : []),
     ...(truncated ? ["(the scan stopped early: memory_list shows the rest)"] : []),
   ];
   return [...lines, ...notes];

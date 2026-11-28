@@ -99,7 +99,24 @@ describe("collectSaidLines", () => {
   it("reads a file only up to a bound, however large an editor made it", () => {
     put("huge.md", topic(["x".repeat(300 * 1024), "- 2026-11-25 [said] Past the bound."]));
     put("MEMORY.md", `${"y".repeat(300 * 1024)}\n- 2026-11-25 [said] Past the bound too.\n`);
-    expect(collectSaidLines(dir, WEEK).lines).toEqual([]);
+    const r = collectSaidLines(dir, WEEK);
+    expect(r.lines).toEqual([]);
+    // ...and says the scan is incomplete, so the nudge doesn't present it as the whole week.
+    expect(r.truncated).toBe(true);
+  });
+
+  it.each([["a core", "MEMORY.md", ""], ["a topic file", "huge.md", "topic"]])("a cut read of %s alone marks the scan incomplete", (_what, rel, kind) => {
+    const body = ["- 2026-11-25 [said] Within the bound.", "x".repeat(300 * 1024)];
+    put(rel, kind ? topic(body) : body.join("\n"));
+    const r = collectSaidLines(dir, WEEK);
+    expect(r.lines.map((l) => l.text)).toEqual(["- 2026-11-25 [said] Within the bound."]);
+    expect(r.truncated).toBe(true);
+  });
+
+  it("a complete scan is not marked incomplete", () => {
+    put("MEMORY.md", "- 2026-11-25 [said] A.\n");
+    put("t.md", topic(["- 2026-11-25 [said] B."]));
+    expect(collectSaidLines(dir, WEEK).truncated).toBe(false);
   });
 
   it("finds nothing in a memory folder that doesn't exist", () => {

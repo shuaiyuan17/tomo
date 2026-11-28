@@ -91,7 +91,7 @@ export function saidCheckText(said: SaidLines, today: string): string {
     "- The line says more than they did (a one-off written as a standing rule, a \"maybe\" as a decision, a wider scope): cut it back to what they said. Keep the extra as a separate `inferred` line only if it is still useful.",
     `- You find no source: look before you change it. If the owner only answered "ok" or "好" around then, read your own message just before that reply (recall_conversation with no query, \`before\` set to the reply's time, limit 3). When they agreed to something you proposed, the line is \`said\`: rewrite it as "agreed to <what> (my proposal)". If it came from a group, a task report, an email or a tool result, mark it \`from:<source>\`. Otherwise make it \`inferred\` and add "(no source found, checked ${today})". Don't delete it. If that line is a rule, a goal or a commitment, add a todo to ask the owner; you can't ask them in this turn.`,
     ...(said.more > 0 ? [`${said.more} more \`said\` ${said.more === 1 ? "line" : "lines"} from that week ${said.more === 1 ? "is" : "are"} not listed; leave ${said.more === 1 ? "it" : "them"}.`] : []),
-    ...(said.truncated ? ["(The scan for these lines stopped early: some files were not read, so the list may be short.)"] : []),
+    ...(said.truncated ? ["(The scan for these lines was incomplete: some files were not read in full, so the list may be short.)"] : []),
   ].join("\n");
 }
 
@@ -285,6 +285,11 @@ function memoryPassFor(p: DuePromotion, sessionKey: string, deps: MemoryPassDeps
   }
 }
 
+/** Same level and period. */
+function samePromotion(a: DuePromotion, b: DuePromotion): boolean {
+  return a.level === b.level && a.period === b.period;
+}
+
 export class RollupRunner {
   private agent: Agent;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -321,6 +326,21 @@ export class RollupRunner {
     // can fire the first check, and without a second runner in this process
     // holding an independent snapshot of the same file.
     this.lastNudged = cooldowns ?? nudgeCooldownStore(defaultNudgeCooldownPath());
+  }
+
+  /**
+   * Is `p` still due for the session after its nudge turn? Read from the
+   * session's file under the id the key has now (a rollup can reload the
+   * session). Unreadable: assume it landed, as before this check existed.
+   */
+  private stillDue(sessionKey: string, sdkSessionId: string, p: DuePromotion): boolean {
+    try {
+      const sid = this.agent.listActiveSessions().find(([k]) => k === sessionKey)?.[1] ?? sdkSessionId;
+      return findDuePromotions(sid, config.sdkSessionsDir).some((d) => samePromotion(d, p));
+    } catch (err) {
+      log.warn({ err, sessionKey }, "Rollup nudge: could not re-read what is due after the turn");
+      return false;
+    }
   }
 
   start(): void {
@@ -469,8 +489,20 @@ export class RollupRunner {
             ...(hasStep ? { dropIf: () => (droppedForSummon = this.agent.hasActiveSummonInto(sessionKey)) } : {}),
           },
         );
-        if (delivered) this.memoryStepFailed.delete(cooldownKey);
-        else if (hasStep && !droppedForSummon) this.memoryStepFailed.add(cooldownKey);
+        // A turn that completed is not yet a rollup that landed: the model
+        // may have spent it on the memory step and replied without running
+        // the command. With the step in it, look: still due means it did not
+        // land, and the next nudge for the period (after the usual cooldown)
+        // goes without the step. A rollup refused as "deferred" reads the
+        // same way, which is right: the step's edits are already saved, and
+        // the retry only has the rollup left to do.
+        const landed = delivered && !(hasStep && this.stillDue(sessionKey, sdkSessionId, next));
+        if (landed) {
+          this.memoryStepFailed.delete(cooldownKey);
+        } else if (hasStep && !droppedForSummon) {
+          this.memoryStepFailed.add(cooldownKey);
+          if (delivered) log.warn({ sessionKey, level: next.level, period: next.period }, "Rollup nudge with the memory step completed without the rollup; the next one goes without the step");
+        }
         // handleCronMessage resolves FALSE rather than rejecting when the turn
         // never happened (no deliverable target for the session, the turn
         // ended on an error result, the per-session queue threw). Holding a 6h

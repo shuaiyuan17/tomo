@@ -32,6 +32,7 @@ const fixture = vi.hoisted(() => ({
   lcm: ((_key: string) => true) as (key: string) => boolean,
   due: [] as Array<{ level: "daily" | "weekly" | "monthly" | "yearly"; period: string; childCount: number }>,
   dueCalls: 0,
+  rollupLands: true,
 }));
 vi.mock("../src/agent/sdk-options.js", () => ({ usesLcmCompact: (key: string) => fixture.lcm(key) }));
 vi.mock("../src/lcm/blocks.js", async (importOriginal) => ({
@@ -58,7 +59,13 @@ function runnerFor(sessionKey: string, summoned: () => boolean = () => false, me
       nudges.push({ text, sessionKey: key, options });
       // As the agent does: asked when the turn is about to run.
       if (options.dropIf?.()) return false;
-      return turnOk();
+      if (!turnOk()) return false;
+      // The turn ran the rollup: its period is no longer due (unless a test says the command never ran).
+      if (fixture.rollupLands) {
+        const m = /name="(\w+) ([^"]+)"/.exec(text);
+        if (m) fixture.due = fixture.due.filter((d) => !(d.level === m[1] && d.period === m[2]));
+      }
+      return true;
     },
   };
   // In-memory cooldown (null path): these cases nudge the same period, and
@@ -79,6 +86,7 @@ beforeEach(() => {
   fixture.lcm = () => true;
   fixture.due = [{ level: "daily", period: "2026-08-27", childCount: 5 }];
   fixture.dueCalls = 0;
+  fixture.rollupLands = true;
 });
 afterEach(() => { vi.useRealTimers(); });
 
@@ -239,6 +247,7 @@ describe("the memory step never costs the rollup (§4.2)", () => {
   });
 
   it("near the forced-compaction line the said check is left out, and nearer still the whole step", async () => {
+    fixture.rollupLands = false; // several runners read the same due list: only the text is under test
     const at = (used: number) => runnerFor("dm:owner", undefined, { memoryDir: () => memDir, contextUsage: () => ({ used, max: 1_000_000 }), forceCompactAtPct: () => 95 });
     const roomy = at(500_000);
     await checkAll(roomy.runner);
@@ -258,6 +267,7 @@ describe("the memory step never costs the rollup (§4.2)", () => {
   });
 
   it("under a tool-round limit the list is cut to leave the rollup its rounds, and a tiny limit drops the step", async () => {
+    fixture.rollupLands = false; // several runners read the same due list: only the text is under test
     writeFileSync(join(memDir, "MEMORY.md"), Array.from({ length: 20 }, (_, i) => `- 2026-08-18 [said] Rule ${i + 1}.`).join("\n"));
     const withTurns = (maxTurns: number) => runnerFor("dm:owner", undefined, { memoryDir: () => memDir, maxTurns: () => maxTurns });
     const fifty = withTurns(50);
@@ -309,12 +319,35 @@ describe("the memory step never costs the rollup (§4.2)", () => {
     expect(nudges[1].text).not.toContain("No calls before 9.");
     expect(nudges[1].text).toContain("tomo lcm weekly --session-id sdk-session-1 --week 2026-W34");
     // That one landed: a later nudge for the period (a rebuild) has the step again.
+    fixture.due = [{ level: "weekly", period: "2026-W34", childCount: 7 }];
     cooldowns.clear("dm:owner:weekly:2026-W34");
     await checkAll(runner);
     expect(nudges[2].text).toContain("No calls before 9.");
   });
 
+  it("a turn that completed without the rollup landing is asked again, after the usual cooldown, without the step", async () => {
+    fixture.rollupLands = false;
+    const { runner, nudges, cooldowns } = runnerFor("dm:owner", undefined, { memoryDir: () => memDir });
+    await checkAll(runner);
+    expect(nudges[0].text).toContain("No calls before 9.");
+    // The cooldown is untouched: a completed turn holds it as before.
+    expect(cooldowns.get("dm:owner:weekly:2026-W34", Date.now())).toBeDefined();
+    cooldowns.clear("dm:owner:weekly:2026-W34");
+    fixture.rollupLands = true;
+    await checkAll(runner);
+    expect(nudges[1].text).toContain("`memory: skipped (the last attempt at this rollup did not finish)`");
+    expect(cooldowns.get("dm:owner:weekly:2026-W34", Date.now())).toBeDefined();
+  });
+
+  it("a nudge without the step keeps the old behaviour: a completed turn holds the cooldown even if still due", async () => {
+    fixture.rollupLands = false;
+    const { runner, cooldowns } = runnerFor("telegram:-1001234567", undefined, { memoryDir: () => memDir });
+    await checkAll(runner);
+    expect(cooldowns.get("telegram:-1001234567:weekly:2026-W34", Date.now())).toBeDefined();
+  });
+
   it("with forced compaction off (0 or 100), room is measured to the window, not to zero", async () => {
+    fixture.rollupLands = false; // several runners read the same due list: only the text is under test
     for (const pct of [0, 100]) {
       const { runner, nudges } = runnerFor("dm:owner", undefined, { memoryDir: () => memDir, contextUsage: () => ({ used: 100_000, max: 1_000_000 }), forceCompactAtPct: () => pct });
       await checkAll(runner);

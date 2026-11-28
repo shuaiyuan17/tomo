@@ -50,7 +50,7 @@ export interface SaidLines {
   lines: SaidLine[];
   /** Lines of that week past the cap: not listed. */
   more: number;
-  /** The scan ran out of time: some topic files were not read. */
+  /** The scan is incomplete: it ran out of time, or a file was read only up to the bound. */
   truncated: boolean;
 }
 
@@ -80,10 +80,13 @@ export function collectSaidLines(memoryDir: string, week: string, opts: { max?: 
     throw err;
   }
   const files: Array<{ path: string; content: Buffer }> = [];
+  let partial = false;
   for (const core of CORES) {
     let read: ReturnType<typeof readMemoryFile>;
     try { read = readMemoryFile(join(root, core), root, false, undefined, SAID_READ_MAX_BYTES); } catch { continue; }
-    if (read !== null && !("refused" in read)) files.push({ path: core, content: read.bytes });
+    if (read === null || "refused" in read) continue;
+    files.push({ path: core, content: read.bytes });
+    if (read.partial) partial = true;
   }
   const topics = collectMemoryFiles({
     memoryDir: root,
@@ -95,7 +98,12 @@ export function collectSaidLines(memoryDir: string, week: string, opts: { max?: 
     budgetMs: opts.budgetMs ?? SAID_SCAN_BUDGET_MS,
     now: opts.now,
   });
-  for (const e of topics.entries) if (!isCoreMemoryPath(e.path) && e.content) files.push({ path: e.path, content: e.content });
+  for (const e of topics.entries) {
+    if (isCoreMemoryPath(e.path) || !e.content) continue;
+    files.push({ path: e.path, content: e.content });
+    // Read up to the bound only: its size on disk is larger than what was read.
+    if (e.bytes > e.content.length) partial = true;
+  }
   const lines: SaidLine[] = [];
   let more = 0;
   for (const file of files) {
@@ -108,7 +116,7 @@ export function collectSaidLines(memoryDir: string, week: string, opts: { max?: 
       lines.push({ path: file.path, line: i + 1, text: chars.length <= SAID_LINE_MAX_CHARS ? chars.join("") : `${chars.slice(0, SAID_LINE_MAX_CHARS - 1).join("")}…` });
     }
   }
-  return { lines, more, truncated: topics.truncated };
+  return { lines, more, truncated: topics.truncated || partial };
 }
 
 /**

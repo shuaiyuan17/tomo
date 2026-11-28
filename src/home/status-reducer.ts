@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import type { WatchEvent, WatchTask } from "../watch/protocol.js";
 import { isDmSessionKey, isGroupSessionKey } from "../sessions/keys.js";
-import type { HomeStatus, HomeSubagent, HomeToolKind, HomeTurnSource } from "./status.js";
+import { HOME_SUBSESSION_TYPE, type HomeStatus, type HomeSubagent, type HomeToolKind, type HomeTurnSource } from "./status.js";
 
 /**
  * Turns the watch bus into HomeStatus: what Tomo is doing, for its home.
@@ -36,6 +36,11 @@ import type { HomeStatus, HomeSubagent, HomeToolKind, HomeTurnSource } from "./s
  *   lowercased and reduced to what a scene key can name; `task` its
  *   description, clipped, ONLY when `mayShowTask(sessionKey)` says the
  *   browser may already read that session (the Tasks panel's rule).
+ * - SUB-SESSIONS. The owner's running sub-sessions (`context.subsessions`,
+ *   read while building a status: the daemon decides which are running and
+ *   which the browser may see) are visitors too, among the subagents by
+ *   when they started: `type` "subsession", `task` the title (never the
+ *   brief), `id` a hash of the task id.
  * - TROUBLE. retry → "retry" for that session until its turn ends or it
  *   makes progress (a tool starts); an API error → "error" until that
  *   session's next turn starts, at most TROUBLE_ERROR_MS; a rate limit
@@ -106,9 +111,21 @@ interface OpenTurn { source: HomeTurnSource; requestId?: string; startedAt: numb
 interface OpenTool { name: string; kind: HomeToolKind; startedAt: number; compact: boolean }
 type Trouble = { kind: "retry" | "error"; at: number };
 
+/** A running sub-session, as the home seats it. */
+export interface HomeSubsession {
+  /** The task's id ("s12"); only its hash leaves the reducer. */
+  id: string;
+  /** Its title, for the visitor's sign. Never the brief. */
+  title: string;
+  /** When it was started (ms epoch): its place among the visitors. */
+  startedAt: number;
+}
+
 export interface ReducerContext {
   /** May the browser already read this session's task text (channels/web.ts taskRouter)? Asked only while building a status. */
   mayShowTask(sessionKey: string): boolean;
+  /** The running sub-sessions the browser may already see (the Tasks rail's list). Asked only while building a status. */
+  subsessions?(): readonly HomeSubsession[];
 }
 
 export class HomeStatusReducer {
@@ -258,6 +275,12 @@ export class HomeStatusReducer {
         } else if (task.background) tasks++;
       }
     }
+    let running: readonly HomeSubsession[] = [];
+    try { running = context.subsessions?.() ?? []; } catch { /* an unreadable table seats nobody */ }
+    for (const s of running) {
+      const text = s.title.replace(/\s+/g, " ").trim().slice(0, HOME_TASK_CHARS);
+      subagents.push({ id: subsessionVisitorId(s.id), type: HOME_SUBSESSION_TYPE, ...(text ? { task: text } : {}), startedAt: s.startedAt });
+    }
     subagents.sort((a, b) => a.startedAt - b.startedAt || a.id.localeCompare(b.id));
 
     let trouble: HomeStatus["trouble"];
@@ -286,6 +309,10 @@ export class HomeStatusReducer {
 /** Stable per subagent, and says nothing about which conversation it belongs to. */
 export function subagentId(sessionKey: string, taskId: string): string {
   return createHash("sha256").update(`${sessionKey}\0${taskId}`).digest("hex").slice(0, 16);
+}
+/** Stable per sub-session; never the same as a subagent's id. */
+export function subsessionVisitorId(id: string): string {
+  return createHash("sha256").update(`subsession\0\0${id}`).digest("hex").slice(0, 16);
 }
 /** The SDK's subagent_type as a scene's visitors.kinds key can name it. */
 export function subagentTypeOf(value: string | undefined): string | undefined {

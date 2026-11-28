@@ -2,12 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { COMPACT_STALE_MS, HomeStatusReducer, RATE_LIMIT_MS, subagentId, toolKind, TROUBLE_ERROR_MS, TURN_STALE_MS, turnSource } from "../src/home/status-reducer.js";
+import { COMPACT_STALE_MS, HomeStatusReducer, MAX_HOME_SUBAGENTS, RATE_LIMIT_MS, subagentId, subsessionVisitorId, toolKind, TROUBLE_ERROR_MS, TURN_STALE_MS, turnSource } from "../src/home/status-reducer.js";
 import { HomeService, STATUS_MIN_INTERVAL_MS } from "../src/home/service.js";
 import { WatchBus } from "../src/watch/bus.js";
 import { TaskTracker, type TaskSystemMessage } from "../src/agent/task-tracker.js";
 import type { WatchEvent, WatchTask } from "../src/watch/protocol.js";
-import type { WebEvent } from "../src/web/protocol.js";
+import type { WebEvent, WebSubsession } from "../src/web/protocol.js";
+import { runningSubsessions } from "../src/web/subsessions-view.js";
 
 const OWNER = "dm:owner";
 const GROUP = "telegram:-100123";
@@ -128,6 +129,44 @@ describe("home status reducer", () => {
     }
   });
 
+  it("running sub-sessions sit among the subagents, by when they started, with their title", () => {
+    const r = new HomeStatusReducer(0);
+    r.apply(at({ type: "tasks", sessionKey: OWNER, tasks: [task("t1", { startedAt: 200 })] }));
+    const subsessions = () => [{ id: "s7", title: "  Fix the\n login page ", startedAt: 300 }, { id: "s3", title: "x".repeat(500), startedAt: 100 }];
+    const status = r.status(ts, { ...all, subsessions });
+    expect(status.subagents.map((s) => s.id)).toEqual([subsessionVisitorId("s3"), subagentId(OWNER, "t1"), subsessionVisitorId("s7")]);
+    expect(status.subagents[2]).toEqual({ id: subsessionVisitorId("s7"), type: "subsession", task: "Fix the login page" });
+    expect(status.subagents[0].task).toHaveLength(120);
+    expect(status.subagents[2].id).not.toContain("s7");
+    // No reader, an empty list or a broken table: only the subagents.
+    for (const context of [all, { ...all, subsessions: () => [] }, { ...all, subsessions: () => { throw new Error("table"); } }])
+      expect(r.status(ts, context).subagents.map((s) => s.id)).toEqual([subagentId(OWNER, "t1")]);
+  });
+
+  it("subagents and sub-sessions together are cut to MAX_HOME_SUBAGENTS, the oldest kept", () => {
+    const r = new HomeStatusReducer(0);
+    r.apply(at({ type: "tasks", sessionKey: OWNER, tasks: Array.from({ length: MAX_HOME_SUBAGENTS }, (_, i) => task(`t${i}`, { startedAt: 10 + i })) }));
+    const status = r.status(ts, { ...all, subsessions: () => [{ id: "old", title: "old", startedAt: 1 }, { id: "new", title: "new", startedAt: 5_000 }] });
+    expect(status.subagents).toHaveLength(MAX_HOME_SUBAGENTS);
+    expect(status.subagents[0].id).toBe(subsessionVisitorId("old"));
+    expect(status.subagents.some((s) => s.id === subsessionVisitorId("new"))).toBe(false);
+  });
+
+  it("only sub-sessions at work are seated: active, a turn running, or background work; never the brief", () => {
+    const sub = (id: string, over: Partial<WebSubsession>): WebSubsession => ({ id, title: `title ${id}`, status: "active", working: false, createdAt: 1, lastActivityAt: 2, activeMs: 0, revision: 0, writable: true, ...over });
+    const tasks = [
+      sub("s1", { status: "active", createdAt: 11 }), sub("s2", { status: "queued" }),
+      sub("s3", { status: "waiting", waitingOn: "owner" }), sub("s4", { status: "waiting", waitingOn: "external" }),
+      sub("s5", { status: "waiting", waitingOn: "external", background: true, createdAt: 15 }),
+      sub("s6", { status: "finished", endedAt: 3 }), sub("s7", { status: "cancelled", endedAt: 3 }), sub("s8", { status: "failed", endedAt: 3 }),
+      sub("s9", { status: "waiting", waitingOn: "owner", working: true, createdAt: 19 }),
+    ];
+    const detail = { ...tasks[0], brief: "the private brief" } as WebSubsession;
+    expect(runningSubsessions([detail, ...tasks.slice(1)])).toEqual([
+      { id: "s1", title: "title s1", startedAt: 11 }, { id: "s5", title: "title s5", startedAt: 15 }, { id: "s9", title: "title s9", startedAt: 19 },
+    ]);
+  });
+
   it("a subagent's task text only for sessions the browser may read", () => {
     const r = new HomeStatusReducer(0);
     r.apply(at({ type: "tasks", sessionKey: "dm:legacy", tasks: [task("hidden")] }));
@@ -227,6 +266,23 @@ describe("home service publishing", () => {
     await vi.advanceTimersByTimeAsync(STATUS_MIN_INTERVAL_MS);
     expect(statuses()).toHaveLength(3);
     expect((statuses().at(-1) as Extract<WebEvent, { type: "home-status" }>).status.tool).toBe("search");
+  });
+
+  it("seats running sub-sessions once a web UI is attached, and publishes when the table changes", () => {
+    vi.useFakeTimers({ now: 10_000 });
+    const events: WebEvent[] = [];
+    let running = [{ id: "s1", title: "Tidy the docs", startedAt: 5 }];
+    service = new HomeService({ workspaceDir: join(root, "ws"), lastGoodPath: join(root, "last.json"), bus: new WatchBus(), pollMs: 60_000, subsessions: () => running });
+    expect(service.status().subagents).toEqual([]);
+    service.attachWeb({ publish: (e) => events.push(e), available: () => true, mayShowTask: () => true });
+    expect(service.status().subagents).toEqual([{ id: subsessionVisitorId("s1"), type: "subsession", task: "Tidy the docs" }]);
+    const last = () => (events.filter((e) => e.type === "home-status").at(-1) as Extract<WebEvent, { type: "home-status" }> | undefined)?.status.subagents;
+    service.refresh();
+    expect(last()).toHaveLength(1);
+    running = [];
+    vi.advanceTimersByTime(STATUS_MIN_INTERVAL_MS);
+    service.refresh();
+    expect(last()).toEqual([]);
   });
 
   it("serves WebHome with the scene, revision and status; publishes home when the scene changes", async () => {

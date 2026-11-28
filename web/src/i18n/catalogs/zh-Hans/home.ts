@@ -13,7 +13,7 @@ export const home = {
   trouble: { retry: "重试中", rate_limit: "被限流，等待中", error: "出错了" },
   troubleIdle: { retry: "重试中", rate_limit: "被限流，等待中", error: "上一轮出错了" },
   compacting: "正在压缩上下文", cronFired: "刚触发了一个定时任务", idle: "空闲", idleFor: "已空闲 {{span}}",
-  subagents_other: "{{count}} 个 subagent", tasks_other: "{{count}} 个后台任务",
+  subagents_other: "{{count}} 个帮手", tasks_other: "{{count}} 个后台任务",
   nextJob: "下个任务 {{when}}",
   failure: {
     chunk: "房间的绘制代码没加载出来。", webgl: "这个浏览器画不了 3D 房间（WebGL 不可用）。",

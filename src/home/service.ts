@@ -5,7 +5,7 @@ import { log } from "../logger.js";
 import { homeSnapshotSchema, WebError, type WebEvent, type WebHome } from "../web/protocol.js";
 import { decodeSnapshotPng } from "./snapshot.js";
 import { HomeSceneStore, type HomeView } from "./store.js";
-import { HomeStatusReducer } from "./status-reducer.js";
+import { HomeStatusReducer, type HomeSubsession } from "./status-reducer.js";
 import type { HomeStatus } from "./status.js";
 import { HomeWeatherSource, type FetchLike } from "./weather.js";
 
@@ -53,6 +53,8 @@ export interface HomeServiceOptions {
   nextJobAt?: () => number | undefined;
   /** The pet's mood word, if Tomo has a pet; must not throw. */
   petMood?: () => string | undefined;
+  /** The owner's running sub-sessions, as the browser may already see them (titles only); a throw seats nobody. */
+  subsessions?: () => readonly HomeSubsession[];
   /** The configured city (`config.city`): what the window shows. No city, no weather request. */
   city?: string | null;
   /** Weather fetch (tests). */
@@ -124,6 +126,8 @@ export class HomeService {
 
   /** Connects the web UI: events go out through `link.publish`. */
   attachWeb(link: HomeWebLink): void { this.link = link; }
+  /** Something the status reads from outside the bus changed (the sub-session table): publish if it shows. */
+  refresh(): void { this.changed(); }
 
   /**
    * The status record. `sky` comes from the weather source: its progress is
@@ -131,7 +135,11 @@ export class HomeService {
    * minutes, while a new phase or weather is one at once.
    */
   status(): HomeStatus {
-    const status = this.reducer.status(this.now(), { mayShowTask: (key) => this.link?.mayShowTask(key) ?? false });
+    const status = this.reducer.status(this.now(), {
+      mayShowTask: (key) => this.link?.mayShowTask(key) ?? false,
+      // Like task text: nothing of a sub-session before a web UI is attached to show it.
+      ...(this.link && this.options.subsessions ? { subsessions: this.options.subsessions } : {}),
+    });
     const sky = this.weather.sky();
     return sky ? { ...status, sky } : status;
   }

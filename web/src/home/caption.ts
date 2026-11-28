@@ -76,7 +76,7 @@ const TROUBLE_WORKING = { retry: "home:trouble.retry", rate_limit: "home:trouble
 const TROUBLE_IDLE = { retry: "home:troubleIdle.retry", rate_limit: "home:troubleIdle.rate_limit", error: "home:troubleIdle.error" } as const satisfies Record<NonNullable<HomeStatus["trouble"]>, string>;
 
 /**
- * One quiet line: "Working on your message · 2 subagents", "Running a
+ * One quiet line: "Working on your message · 2 helpers", "Running a
  * scheduled job", "Idle for 20 min", "Compacting context · retrying".
  * `status` is on the local clock (localizeHomeStatus).
  */

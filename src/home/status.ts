@@ -29,12 +29,16 @@ export interface HomeSky {
   tempC?: number;
 }
 
+/** The `type` of a visitor that is one of the owner's running sub-sessions (a task), not an SDK subagent. */
+export const HOME_SUBSESSION_TYPE = "subsession";
+
+/** A visitor: a running subagent, or one of the owner's running sub-sessions. */
 export interface HomeSubagent {
   /** Stable for the life of the subagent, so its visitor keeps its seat. */
   id: string;
-  /** The SDK's subagent_type, lowercased; absent when unknown. */
+  /** The SDK's subagent_type, lowercased; absent when unknown. HOME_SUBSESSION_TYPE for a sub-session. */
   type?: string;
-  /** What it was sent to do, for its sign. Only for conversations the browser may read. */
+  /** What it was sent to do, for its sign (a sub-session's title). Only for conversations the browser may read. */
   task?: string;
 }
 

@@ -82,7 +82,10 @@ describe("the memory step of a rollup nudge (§4.2, §15.2 of the memory design)
     expect(text).toContain("Before the rollup: memory upkeep for 2026-W34. private/MEMORY.md is 3 lines");
     expect(text).toContain("Move topic files about finished or dropped subjects into archive/ with memory_move.");
     expect(text).toContain("If a shared file holds something on the private list (Layout), move it under private/.");
-    expect(text).toContain("Then check that week's `said` lines");
+    expect(text).toContain("check that week's `said` lines");
+    // Checked before anything is moved: the listed paths are where the lines are now.
+    expect(text.indexOf("check that week's `said` lines")).toBeLessThan(text.indexOf("Move topic files about finished"));
+    expect(text).toContain("before you move any file");
     expect(text).toContain("- MEMORY.md:2: - 2026-11-24 [said] Rule 1.");
     expect(text).toContain("- MEMORY.md:3: - 2026-11-24 [said] Rule 2.");
     expect(text).toContain('(no source found, checked 2026-11-30)');

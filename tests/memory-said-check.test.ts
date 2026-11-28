@@ -86,6 +86,21 @@ describe("collectSaidLines", () => {
     expect(l.text.endsWith("…")).toBe(true);
   });
 
+  it("reads the cores before the time-limited walk, so a slow tree can't crowd them out", () => {
+    put("aaa/big.md", topic(["- 2026-11-25 [said] From an early topic."]));
+    put("private/MEMORY.md", "- 2026-11-25 [said] From the private core.\n");
+    put("MEMORY.md", "- 2026-11-25 [said] From the shared core.\n");
+    const { lines, truncated } = collectSaidLines(dir, WEEK, { budgetMs: -1 });
+    expect(truncated).toBe(true);
+    expect(lines.map((l) => l.path)).toEqual(["MEMORY.md", "private/MEMORY.md"]);
+  });
+
+  it("reads a file only up to a bound, however large an editor made it", () => {
+    put("huge.md", topic(["x".repeat(300 * 1024), "- 2026-11-25 [said] Past the bound."]));
+    put("MEMORY.md", `${"y".repeat(300 * 1024)}\n- 2026-11-25 [said] Past the bound too.\n`);
+    expect(collectSaidLines(dir, WEEK).lines).toEqual([]);
+  });
+
   it("finds nothing in a memory folder that doesn't exist", () => {
     expect(collectSaidLines(join(dir, "missing"), WEEK)).toEqual({ lines: [], more: 0, truncated: false });
   });

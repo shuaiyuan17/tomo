@@ -3,7 +3,7 @@ import { log } from "../logger.js";
 import type { Agent } from "../agent.js";
 import { isGroupSessionKey, sessionKind } from "../sessions/keys.js";
 import { BLOCK_SUMMARY_TOKEN_BUDGETS, findDuePromotions, localDateTag, type DuePromotion } from "./blocks.js";
-import { collectSaidLines, coreStatusLine, type SaidLines } from "../memory/said-check.js";
+import { collectSaidLines, coreStatusLine, SAID_CHECK_MAX_LINES, type SaidLines } from "../memory/said-check.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { usesLcmCompact } from "../agent/sdk-options.js";
 import { config } from "../config.js";
@@ -67,7 +67,7 @@ export type MemoryPass =
     };
 
 /** What both steps say about failure: the memory step never costs the rollup. */
-const MEMORY_STEP_FAILURE = "The rollup matters more than this step: if a memory tool keeps failing, stop here, run the rollup anyway, and say what was left undone in the memory line.";
+const MEMORY_STEP_FAILURE = "The rollup matters more than this step: if a memory tool keeps failing, or a turn budget notice arrives, stop here, run the rollup anyway, and say what was left undone in the memory line.";
 
 /** The daily memory pass (§15.2): save and fix what that day left, before the day is summarized. */
 export function dailyMemoryPassText(period: string): string {
@@ -85,7 +85,7 @@ export function dailyMemoryPassText(period: string): string {
 export function saidCheckText(said: SaidLines, today: string): string {
   if (said.lines.length === 0) return "";
   return [
-    "Then check that week's `said` lines against what the owner actually wrote. For each line below, search the conversation around its date: recall_conversation with 2–4 distinctive words from the line, `after` the day before its date, `before` two days after, and `limit` 5. At most three searches a line. Also memory_search the fact, and bring any copy that disagrees into line with what you confirm.",
+    "First, before you move any file (the paths below are where the lines are now), check that week's `said` lines against what the owner actually wrote. Run the searches for several lines at once where you can. For each line below, search the conversation around its date: recall_conversation with 2–4 distinctive words from the line, `after` the day before its date, `before` two days after, and `limit` 5. At most three searches a line. Also memory_search the fact, and bring any copy that disagrees into line with what you confirm.",
     ...said.lines.map((l) => `- ${l.path}:${l.line}: ${l.text}`),
     "- They said something else: correct the line to what they said, and keep `said` and its date.",
     "- The line says more than they did (a one-off written as a standing rule, a \"maybe\" as a decision, a wider scope): cut it back to what they said. Keep the extra as a separate `inferred` line only if it is still useful.",
@@ -109,13 +109,14 @@ export function weeklyMemoryUpkeepText(period: string, pass: Exclude<MemoryPass,
     : "`memory: <what you moved or removed, or none>`";
   return [
     `Before the rollup: memory upkeep for ${period}.${pass.coreStatus ? ` ${pass.coreStatus}` : ""}`,
+    ...(block ? [block] : []),
+    ...(notChecked ? [notChecked] : []),
+    block ? "Then tidy:" : "Tidy:",
     "- If private/MEMORY.md or MEMORY.md is over budget, or holds things most conversations don't need, move those into topic files.",
     "- Remove lines about events that are over and no longer useful, and lines that are no longer true.",
     "- Move topic files about finished or dropped subjects into archive/ with memory_move.",
     "- If a shared file holds something on the private list (Layout), move it under private/.",
     "- When loose files in one folder clearly belong together, move them into a subfolder and give it a README.md with a description.",
-    ...(block ? [block] : []),
-    ...(notChecked ? [notChecked] : []),
     `If memory needs none of this, change nothing. ${MEMORY_STEP_FAILURE} End the weekly summary with one line: ${summary}, naming each correction as "X corrected to Y".`,
   ].join("\n");
 }
@@ -193,6 +194,16 @@ export function nudgeText(p: DuePromotion, sdkSessionId: string, sessionKey: str
  */
 export const MEMORY_PASS_MIN_ROOM_TOKENS = 40_000;
 export const SAID_CHECK_MIN_ROOM_TOKENS = 150_000;
+/**
+ * Tool rounds a turn needs besides the `said` check (the rest of the step,
+ * the rollup itself, slack), and per listed line (searches run several lines
+ * at once where they can, but count two). Under a `maxTurns` limit the list
+ * is cut to fit, so the check cannot use up the rounds the rollup needs; with
+ * fewer than MEMORY_PASS_MIN_ROUNDS the step is left out.
+ */
+export const MEMORY_PASS_MIN_ROUNDS = 20;
+const SAID_CHECK_BASE_ROUNDS = 25;
+const SAID_CHECK_ROUNDS_PER_LINE = 2;
 
 /** Where the memory tools write: the workspace's memory/ (the same root as the prompt's MEMORY_DIR). */
 export function defaultMemoryDir(): string {
@@ -206,6 +217,8 @@ export interface MemoryPassDeps {
   contextUsage?: (sessionKey: string) => { used: number; max: number } | undefined;
   /** The forced-compaction line, % of the window. */
   forceCompactAtPct?: () => number;
+  /** Tool rounds a turn may use (config.maxTurns; 0 = no limit). */
+  maxTurns?: () => number;
   now?: () => Date;
 }
 
@@ -237,6 +250,9 @@ function memoryPassFor(p: DuePromotion, sessionKey: string, deps: MemoryPassDeps
     log.warn({ err, sessionKey }, "Rollup memory step: context usage unreadable; assuming room");
   }
   if (room !== undefined && room < MEMORY_PASS_MIN_ROOM_TOKENS) return { skip: "the context is too full" };
+  let maxTurns = 0;
+  try { maxTurns = deps.maxTurns?.() ?? 0; } catch { /* unknown: no limit assumed */ }
+  if (maxTurns > 0 && maxTurns < MEMORY_PASS_MIN_ROUNDS) return { skip: "a turn here has too few tool rounds" };
   if (p.level === "daily") return { today };
   let memoryDir: string;
   try { memoryDir = deps.memoryDir(); } catch (err) {
@@ -250,8 +266,12 @@ function memoryPassFor(p: DuePromotion, sessionKey: string, deps: MemoryPassDeps
   if (room !== undefined && room < SAID_CHECK_MIN_ROOM_TOKENS) {
     return { today, coreStatus, saidSkipped: "the context is too full" };
   }
+  const cap = maxTurns > 0
+    ? Math.min(SAID_CHECK_MAX_LINES, Math.max(0, Math.floor((maxTurns - SAID_CHECK_BASE_ROUNDS) / SAID_CHECK_ROUNDS_PER_LINE)))
+    : SAID_CHECK_MAX_LINES;
+  if (cap === 0) return { today, coreStatus, saidSkipped: "a turn here has too few tool rounds" };
   try {
-    return { today, coreStatus, said: collectSaidLines(memoryDir, p.period) };
+    return { today, coreStatus, said: collectSaidLines(memoryDir, p.period, { max: cap }) };
   } catch (err) {
     log.warn({ err, sessionKey, period: p.period }, "Rollup memory step: said-line scan failed; nudging without it");
     return { today, coreStatus };
@@ -281,6 +301,7 @@ export class RollupRunner {
       memoryDir: memory?.memoryDir ?? defaultMemoryDir,
       contextUsage: memory?.contextUsage ?? ((key) => this.agent.contextUsageOf?.(key)),
       forceCompactAtPct: memory?.forceCompactAtPct ?? (() => config.lcm.forceCompactAtPct),
+      maxTurns: memory?.maxTurns ?? (() => config.maxTurns),
       ...(memory?.now ? { now: memory.now } : {}),
     };
     // Shared per path and loaded on first construction — i.e. before start()

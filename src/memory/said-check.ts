@@ -4,22 +4,30 @@
 // daemon's event loop, right before the nudge is sent.
 import { readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { foldPath } from "../agent/permission-paths.js";
 import { isoWeekTag } from "../lcm/blocks.js";
 import {
   collectMemoryFiles,
-  GROUPS_MEMORY_SUBDIR,
   isCoreMemoryPath,
+  MEMORY_FILE_HARD_KB,
   MEMORY_SOFT_KB,
   MEMORY_SOFT_LINES,
+  readMemoryFile,
 } from "../workspace/memory-index.js";
 
 /** At most this many lines are listed for one week; the rest are counted, not carried over. */
 export const SAID_CHECK_MAX_LINES = 20;
-/** The scan's time limit: the same as memory_search's. */
+/** The topic files' scan time limit: the same as memory_search's. */
 export const SAID_SCAN_BUDGET_MS = 300;
+/**
+ * The most of one file that is read. Every write tool keeps a topic file
+ * under MEMORY_FILE_HARD_KB and a core under half that, so this covers any
+ * file the tools wrote; one an editor grew past it is read up to here, and
+ * one slow read cannot hold the event loop for a whole file.
+ */
+const SAID_READ_MAX_BYTES = 4 * MEMORY_FILE_HARD_KB * 1024;
 /** A listed line is cut to this many characters (code points): the nudge stays small whatever a line holds. */
 const SAID_LINE_MAX_CHARS = 300;
+const CORES = ["MEMORY.md", "private/MEMORY.md"] as const;
 
 /** `- YYYY-MM-DD [said] …` (or `*`), the per-line provenance prefix. */
 const SAID_LINE_RE = /^\s*[-*]\s+(\d{4})-(\d{2})-(\d{2})\s+\[said\]\s/;
@@ -40,9 +48,9 @@ export interface SaidLine {
 
 export interface SaidLines {
   lines: SaidLine[];
-  /** Lines of that week past SAID_CHECK_MAX_LINES: not listed. */
+  /** Lines of that week past the cap: not listed. */
   more: number;
-  /** The scan ran out of time: some files were not read. */
+  /** The scan ran out of time: some topic files were not read. */
   truncated: boolean;
 }
 
@@ -56,11 +64,12 @@ function weekOfLocalDate(y: string, m: string, d: string): string | undefined {
 /**
  * The lines to check for `week` (`YYYY-Www`): each line with the per-line
  * prefix `YYYY-MM-DD [said]` whose date (a local date) is in that ISO week.
- * The two cores first, then topic files by path. Not journal/ or archive/
+ * The two cores first, read before the time-limited walk so a slow tree
+ * can't crowd them out; then topic files by path. Not journal/ or archive/
  * folders (collectMemoryFiles skips them without includeUnlisted), not
- * groups/ (members' words are never `said`), not the people registry, not
- * attachments. private/ is included: the list only ever goes to the owner's
- * own DM session, and only while no group is summoned into it.
+ * groups/ (members' words are never `said`; not even read), not the people
+ * registry, not attachments. private/ is included: the list only ever goes
+ * to the owner's own DM session, and only while no group is summoned into it.
  */
 export function collectSaidLines(memoryDir: string, week: string, opts: { max?: number; budgetMs?: number; now?: () => number } = {}): SaidLines {
   const max = opts.max ?? SAID_CHECK_MAX_LINES;
@@ -70,21 +79,27 @@ export function collectSaidLines(memoryDir: string, week: string, opts: { max?: 
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return { lines: [], more: 0, truncated: false };
     throw err;
   }
-  const all = collectMemoryFiles({
+  const files: Array<{ path: string; content: Buffer }> = [];
+  for (const core of CORES) {
+    let read: ReturnType<typeof readMemoryFile>;
+    try { read = readMemoryFile(join(root, core), root, false, undefined, SAID_READ_MAX_BYTES); } catch { continue; }
+    if (read !== null && !("refused" in read)) files.push({ path: core, content: read.bytes });
+  }
+  const topics = collectMemoryFiles({
     memoryDir: root,
     excludePrivate: false,
-    includeCores: true,
+    skipGroups: true,
     withContent: true,
+    headBytes: SAID_READ_MAX_BYTES,
     maxFiles: Number.POSITIVE_INFINITY,
     budgetMs: opts.budgetMs ?? SAID_SCAN_BUDGET_MS,
     now: opts.now,
   });
-  const files = all.entries.filter((e) => foldPath(e.path).split("/")[0] !== GROUPS_MEMORY_SUBDIR);
-  const ordered = [...files.filter((e) => isCoreMemoryPath(e.path)), ...files.filter((e) => !isCoreMemoryPath(e.path))];
+  for (const e of topics.entries) if (!isCoreMemoryPath(e.path) && e.content) files.push({ path: e.path, content: e.content });
   const lines: SaidLine[] = [];
   let more = 0;
-  for (const file of ordered) {
-    const text = (file.content ?? Buffer.alloc(0)).toString("utf8").split("\n");
+  for (const file of files) {
+    const text = file.content.toString("utf8").split("\n");
     for (let i = 0; i < text.length; i++) {
       const m = SAID_LINE_RE.exec(text[i]);
       if (!m || weekOfLocalDate(m[1], m[2], m[3]) !== week || ALREADY_CHECKED_RE.test(text[i])) continue;
@@ -93,7 +108,7 @@ export function collectSaidLines(memoryDir: string, week: string, opts: { max?: 
       lines.push({ path: file.path, line: i + 1, text: chars.length <= SAID_LINE_MAX_CHARS ? chars.join("") : `${chars.slice(0, SAID_LINE_MAX_CHARS - 1).join("")}…` });
     }
   }
-  return { lines, more, truncated: all.truncated };
+  return { lines, more, truncated: topics.truncated };
 }
 
 /** A core's size the way the prompt measures it (trimmed, then split), or null when it doesn't exist or can't be read. */

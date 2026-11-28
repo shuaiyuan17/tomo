@@ -254,6 +254,8 @@ export interface CollectOptions {
   reportUnreadable?: boolean;
   /** Read only this many bytes from the top of each file, enough for its frontmatter: the version is then not known (""). For the prompt's list. */
   headBytes?: number;
+  /** Leave out groups/ altogether, without reading it (the weekly `said` scan: members' words are never `said`). */
+  skipGroups?: boolean;
   /** Stop after this many files (default 5000). */
   maxFiles?: number;
   /** Stop after this long (default 500 ms). */
@@ -280,7 +282,8 @@ export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileE
   let truncated = false;
   const skipped = (rel: string, folder: boolean): boolean => (opts.excludePrivate
       && (isPrivateMemoryPath(rel) || isOtherGroupMemoryPath(rel, opts.ownGroupDir, folder)))
-    || isPeopleMemoryPath(rel) || isIncomingMemoryPath(rel);
+    || isPeopleMemoryPath(rel) || isIncomingMemoryPath(rel)
+    || (opts.skipGroups === true && folded(rel)[0] === GROUPS_MEMORY_SUBDIR);
   const underPrefix = (rel: string): boolean => {
     if (!prefix) return true;
     const f = foldPath(rel);

@@ -62,7 +62,7 @@ function runnerFor(sessionKey: string, summoned: () => boolean = () => false, me
   // In-memory cooldown (null path): these cases nudge the same period, and
   // a shared file would let the first one's cooldown suppress the second.
   const cooldowns = new NudgeCooldownStore(null);
-  return { runner: new RollupRunner(agent as never, cooldowns, memory ?? { memoryDir: () => "/nonexistent-memory-root" }), nudges, cooldowns };
+  return { runner: new RollupRunner(agent as never, cooldowns, { memoryDir: () => "/nonexistent-memory-root", maxTurns: () => 0, ...memory }), nudges, cooldowns };
 }
 
 /** `checkAll` is private; the scheduler is the only production caller. */
@@ -253,6 +253,23 @@ describe("the memory step never costs the rollup (§4.2)", () => {
     expect(full.nudges[0].text).toContain("`memory: skipped (the context is too full)`");
     expect(full.nudges[0].text).not.toContain("memory upkeep for");
     expect(full.nudges[0].text).toContain("tomo lcm weekly --session-id sdk-session-1");
+  });
+
+  it("under a tool-round limit the list is cut to leave the rollup its rounds, and a tiny limit drops the step", async () => {
+    writeFileSync(join(memDir, "MEMORY.md"), Array.from({ length: 20 }, (_, i) => `- 2026-08-18 [said] Rule ${i + 1}.`).join("\n"));
+    const withTurns = (maxTurns: number) => runnerFor("dm:owner", undefined, { memoryDir: () => memDir, maxTurns: () => maxTurns });
+    const fifty = withTurns(50);
+    await checkAll(fifty.runner);
+    expect(fifty.nudges[0].text).toContain("Rule 12.");
+    expect(fifty.nudges[0].text).not.toContain("Rule 13.");
+    expect(fifty.nudges[0].text).toContain("8 more `said` lines from that week are not listed");
+    const unlimited = withTurns(0);
+    await checkAll(unlimited.runner);
+    expect(unlimited.nudges[0].text).toContain("Rule 20.");
+    const tiny = withTurns(10);
+    await checkAll(tiny.runner);
+    expect(tiny.nudges[0].text).toContain("`memory: skipped (a turn here has too few tool rounds)`");
+    expect(tiny.nudges[0].text).toContain("tomo lcm weekly --session-id sdk-session-1");
   });
 
   it("a group session's nudge has no memory step and no said lines", async () => {

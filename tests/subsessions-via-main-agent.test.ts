@@ -38,14 +38,14 @@ const messageNotes = (agent: Agent, key: string) => peekPendingNotes(agent, key)
 type RetryInternals = {
   processContinuity: (...args: unknown[]) => Promise<unknown>;
   subsessions: { deps: { queuePendingNote(k: string, n: string): boolean; messageWake(k: string): void } };
-  messageWakeRetry: { timerApi: BackoffTimers };
+  wakes: { retry: { timerApi: BackoffTimers } };
 };
 const retryInternals = (agent: Agent) => agent as unknown as RetryInternals;
 
 /** The message wake's retry timers, held for the test to fire (nothing fires by itself). */
 function interceptRetryTimers(agent: Agent): Array<{ fn: () => void; ms: number; cleared: boolean }> {
   const timers: Array<{ fn: () => void; ms: number; cleared: boolean }> = [];
-  retryInternals(agent).messageWakeRetry.timerApi = {
+  retryInternals(agent).wakes.retry.timerApi = {
     set: (fn, ms) => { const t = { fn, ms, cleared: false }; timers.push(t); return t; },
     clear: (handle) => { (handle as { cleared: boolean }).cleared = true; },
   };
@@ -150,12 +150,12 @@ describe("via-main through the Agent", () => {
     mockSdk.responseFn = () => "NO_REPLY";
     const internals = agent as unknown as {
       sessions: { ensureEntry(k: string): void };
-      wakeUnreadSubsessionNotes(): void;
+      wakes: { wakeUnread(): void };
       subsessions: { deps: { queuePendingNote(k: string, n: string): boolean } };
     };
     internals.sessions.ensureEntry("telegram:-100555");
     internals.subsessions.deps.queuePendingNote("telegram:-100555", formatTomoEvent("subsession-message", "ORPHAN-NOTICE", { name: "s7:notice:1:abcdef" }));
-    internals.wakeUnreadSubsessionNotes();
+    internals.wakes.wakeUnread();
     await waitFor(() => expect(prompts("telegram:-100555").some((p) => p.includes("ORPHAN-NOTICE"))).toBe(true));
     expect(prompts("dm:alex").some((p) => p.includes("ORPHAN-NOTICE"))).toBe(false);
     await agent.stop();

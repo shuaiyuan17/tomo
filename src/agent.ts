@@ -3421,9 +3421,9 @@ export class Agent {
   }
 
   /** The group chats a `scope: "all"` recall reads: every group session the
-   *  registry knows, once each, with its latest chat title. From the
-   *  in-memory registry only: nothing here touches the disk, so finding the
-   *  groups costs the search's budget next to nothing. */
+   *  registry knows, once each, with its latest chat title. From the session
+   *  registry (re-read only when its file changed), not the transcripts: no
+   *  transcript is listed or sized to find the groups. */
   groupRecallSources(): RecallGroupSource[] {
     const titles = new Map<string, string | undefined>();
     for (const entry of this.sessions.listAllSessions()) {

@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">Tomo</h1>
-  <p align="center">A personal AI assistant that lives in your messaging apps.</p>
+  <p align="center">An always-on, self-hosted personal AI agent.</p>
 </p>
 
 <p align="center">
@@ -16,17 +16,20 @@
 
 ---
 
-Tomo is a long-running assistant you text like a friend. It runs as a daemon on your own machine, answers you on Telegram, iMessage or a private local web chat, and keeps **one continuous conversation** with you across all of them. Under the hood it is the full Claude Agent SDK — files, shell, web, subagents, skills, MCP — with a personality, a memory, and a sense of time.
+Tomo is a personal AI agent that remembers you, works for you, and stays with you across conversations. It runs on your own machine as a long-running daemon, with one continuous owner conversation across Telegram, iMessage and a private web UI.
+
+Powered by the Claude Agent SDK, Tomo combines the ability to use files, shell, web, skills and MCP with its own personality, memory and sense of time. It can delegate work to independent task sessions, follow up on commitments and run scheduled work while you're away.
 
 ## Why Tomo
 
-- **One conversation, every channel.** Text from your phone on iMessage, pick it up on Telegram or in the browser: it's the same session, and Tomo replies where you last wrote.
-- **Remembers you.** File-based memory you can read and edit, a people registry so you refer to people by name, and hierarchical rollups (daily → weekly → monthly → yearly) instead of lossy auto-compaction. Anything compacted out stays searchable.
-- **Has its own personality.** Three markdown files — `SOUL.md`, `AGENT.md`, `IDENTITY.md` — define who it is. Edit them anytime; changes apply on the next message.
-- **Acts on its own time.** Scheduled tasks ("remind me in 30 minutes", "check the weather every morning at 9"), todos that outlive a conversation, and optional heartbeats that give it unstructured time.
-- **Safe in group chats.** Groups get their own isolated sessions, never see your private memory, and run shell commands in a macOS sandbox. `/summon` brings your personal context into a group on demand.
-- **Robust as a daemon.** A durable inbox survives crashes, mid-turn messages steer the running turn, and interrupted subagents are reported after a restart.
-- **Yours to extend.** Add MCP servers (with managed OAuth), Claude Code plugins, skills, or route through LiteLLM to other model backends.
+- **Persistent memory.** Readable, editable Markdown memory with shared and private scopes, source annotations, corrections and daily and weekly memory upkeep. Hierarchical conversation rollups and history search help recover context beyond the active conversation.
+- **Durable tasks.** Delegate work to independent sub-sessions that can run concurrently, report progress, ask for input and receive follow-ups, including after a task finishes. Task state persists across daemon restarts.
+- **Proactive assistance.** Schedule one-off or recurring work, track commitments with todos, and optionally enable heartbeats for autonomous activity.
+- **One conversation, every channel.** Move between iMessage, Telegram and the browser without starting over. Send follow-up messages to steer a running turn.
+- **A personality of its own.** Edit `SOUL.md`, `AGENT.md` and `IDENTITY.md` to shape how Tomo behaves.
+- **Privacy-aware group chats.** Separate group sessions, scoped memory and permission controls. See the security section for the trust boundaries and limitations.
+- **Built for continuous operation.** Durable inbound messages, persisted task state and transactional task-report recording support recovery after interruptions.
+- **Yours to extend.** Add MCP servers with managed OAuth, Claude Code plugins and skills, or use LiteLLM for other supported model backends.
 
 ## Quick start
 
@@ -68,25 +71,34 @@ Tomo has Claude's built-in tools (Read/Write/Edit, Bash, Glob/Grep, WebSearch/We
 | Scheduling | `schedule_create` / `schedule_list` / `schedule_enable` / `schedule_remove` — one-shot, interval or cron |
 | [Todos](docs/todos.md) | `todo_add` / `todo_list` / `todo_resolve` — commitments with a next step and a review date |
 | People | `list_people` / `upsert_person` — the [people registry](docs/channels.md#people-registry) |
-| Memory | `recall_conversation` (full history search), `lcm_rollup` (summary blocks) |
+| Memory | `memory_list`, `memory_read`, `memory_search`, memory editing tools, `recall_conversation`, `lcm_rollup` |
+| Delegation | `task_spawn`, `task_status`, `task_message`, `task_ask`, `task_cancel` |
 | Permissions | `request_permission` (a group asks you for a path), `request_credential` (ask you for a password, [opt-in](docs/permissions-and-privacy.md#credential-broker)) |
 | Home & pet | `home_check` (its 3D room in the web UI), `pet_*` (a Tamagotchi-style virtual pet; check in with `/pet`) |
 
-The **web UI** adds a live Tasks panel (stop or background running subagents), the Study (memory, context usage, cost, cron, todos, model, MCP servers, config) and Tomo's home — a low-poly room it designs itself. See [docs/web-ui.md](docs/web-ui.md).
+The **web UI** adds a live Tasks panel for delegated work and running SDK subagents, the Study (memory, context usage, cost, cron, todos, model, MCP servers, config) and Tomo's home — a low-poly room it designs itself. See [docs/web-ui.md](docs/web-ui.md).
 
 ## How it works
 
+```mermaid
+flowchart TD
+    Channels["Telegram · iMessage · Web"] --> Inbox["Admission · Durable inbox · Routing"]
+    Inbox --> Sessions["Owner and group sessions"]
+    Sessions <--> Tasks["Durable task sub-sessions"]
+    Sessions --> SDK["Claude Agent SDK"]
+    Tasks --> SDK
+    Memory["Memory · Recall · Context rollups"] --- Sessions
+    Schedule["Scheduler · Todos · Heartbeats"] --> Sessions
+    State["SQLite · Markdown · Transcripts"] --- Sessions
+    State --- Tasks
 ```
-Telegram ─┐
-iMessage ─┼─► admission ─► owner DM session  dm:<you>  ─► Claude Agent SDK ─► reply on your last channel
-Web UI ───┘      │
-                 └──────► group session  <channel>:<chatId>  (isolated, sandboxed)
-```
+
+Tomo manages the conversation and task lifecycle around the SDK, which provides model execution and tools. The diagram is a conceptual overview, not a call graph.
 
 - **One owner.** Tomo answers DMs only from your own handles. Everyone else gets no reply and no session — admission fails closed.
 - **Groups are opt-in.** Send the group passphrase (`tomo config` → Group chats) in a group to activate it. Telegram groups respond when mentioned (or always, with `passiveGroups`); iMessage groups observe and reply only when relevant.
 - **Sessions persist.** Conversations resume across restarts; `/new` starts fresh.
-- **Your data stays local.** Config, memory, transcripts and logs live under `~/.tomo/`. Back up with `tomo backup`.
+- **Local state.** Config, memory, transcripts and logs live under `~/.tomo/`. Model requests and external tools may transmit data to their respective providers. Back up with `tomo backup`.
 
 More: [Channels, sessions and groups](docs/channels.md).
 

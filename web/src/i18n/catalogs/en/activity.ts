@@ -31,7 +31,6 @@ export const activity = {
     messages_one: "{{count}} message", messages_other: "{{count}} messages",
     problems_one: "{{count}} problem", problems_other: "{{count}} problems", noProblems: "no problems",
     events_one: "{{count}} event", events_other: "{{count}} events",
-    notHappened: "nothing happened",
   },
   kind: {
     task_one: "worked with a task", task_other: "worked with {{count}} tasks",

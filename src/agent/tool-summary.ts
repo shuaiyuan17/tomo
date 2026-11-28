@@ -63,7 +63,8 @@ function mcpTitle(name: string, input?: Record<string, unknown>): string | undef
   const m = /^mcp__(.+?)__(.+)$/.exec(name);
   if (!m) return undefined;
   const first = Object.values(input ?? {}).find((value): value is string => typeof value === "string" && value.trim() !== "");
-  const said = first?.replace(/\s+/g, " ").trim();
+  // Scrubbed whole before the clip: a secret cut in two would no longer match the scrubber.
+  const said = first === undefined ? undefined : scrubSecretValues(first).replace(/\s+/g, " ").trim();
   return `${m[1]} · ${m[2]}${said ? ` "${said.length > 80 ? `${said.slice(0, 80)}…` : said}"` : ""}`;
 }
 

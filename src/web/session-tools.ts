@@ -40,7 +40,7 @@ export const UNPAIRED_HIDDEN = "(output hidden — call not in view)";
  */
 export interface PrivateScope { workspaceDir?: string; owner?: boolean }
 function redaction(scope: PrivateScope): ToolRedaction {
-  if (scope.owner) return { input: (input) => redactToolInput(input), output: redactText };
+  if (scope.owner) return { input: (input) => redactToolInput(input), output: redactText, activities: true };
   const ctx = scope.workspaceDir
     ? { cwd: scope.workspaceDir, memoryDir: join(scope.workspaceDir, "memory"), privateDir: join(scope.workspaceDir, "memory", "private") }
     : undefined;
@@ -60,6 +60,7 @@ function redaction(scope: PrivateScope): ToolRedaction {
     // private/ unseen). The web UI is the owner's alone (token + tailnet);
     // this is defence in depth, like #492's redaction.
     reachesPrivate: reaches,
+    activities: true,
   };
 }
 

@@ -27,8 +27,20 @@ export function CodeBlock({ language, code, children }: { language?: string; cod
   </div>;
 }
 
-/** Copies `value`; without the async clipboard it selects `fallback`'s text instead. `label`: what it copies, for its accessible name. */
-export function CopyButton({ value, fallback, label }: { value: string; fallback: RefObject<HTMLElement | null>; label?: string }) {
+/** Selects a node's text, for the reader to copy by hand. */
+export function selectContents(node: HTMLElement | null): void {
+  if (!node) return;
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  const selection = window.getSelection(); selection?.removeAllRanges(); selection?.addRange(range);
+}
+
+/**
+ * Copies `value`. Without the async clipboard it falls back: selects
+ * `fallback`'s text, or calls it (a pane that shows only part of the text
+ * first shows it all). `label`: what it copies, for its accessible name.
+ */
+export function CopyButton({ value, fallback, label }: { value: string; fallback: RefObject<HTMLElement | null> | (() => void); label?: string }) {
   const [copied, setCopied] = useState(false);
   useEffect(() => {
     if (!copied) return;
@@ -38,8 +50,7 @@ export function CopyButton({ value, fallback, label }: { value: string; fallback
   const { t } = useTranslation("chat");
   const copy = () => {
     // Without the async clipboard (a page that is not a secure context), select the code so the reader can copy it.
-    const select = () => { const node = fallback.current; const range = document.createRange(); if (!node) return;
-      range.selectNodeContents(node); const selection = window.getSelection(); selection?.removeAllRanges(); selection?.addRange(range); };
+    const select = () => typeof fallback === "function" ? fallback() : selectContents(fallback.current);
     if (!navigator.clipboard?.writeText) { select(); return; }
     navigator.clipboard.writeText(value).then(() => setCopied(true), select);
   };

@@ -107,6 +107,13 @@ export interface ToolRedaction {
   output: (text: string) => string;
   /** Asked with the RAW input: does this call reach memory/private? Its tool item is then marked `privateOutput`. */
   reachesPrivate?: (name: string, input: Record<string, unknown>) => boolean;
+  /**
+   * Read Tomo's own tool calls into `activity` (activity.ts). Only where the
+   * reader also pairs each result with its call to read its outcome
+   * (session-tools.ts's pairOutputs): a row with an activity but no outcome
+   * would say "Removed …" for a job that was not there.
+   */
+  activities?: boolean;
 }
 
 function noticeItems(notice: TaskNotice, offset: number, ts: number | undefined, redact?: ToolRedaction): SubagentItem[] {
@@ -164,7 +171,7 @@ function itemsFromBlocks(entry: Extract<Entry, { kind: "message" }>, content: Bl
       const reaches = redact?.reachesPrivate?.(b.name, raw) === true;
       const page = reaches ? undefined : sources([fetchedPage(b.name, raw)], redact);
       // Read from the raw input (before the clip), field by field; never for a call that reached memory/private.
-      const activity = reaches ? undefined : toolActivity(b.name, raw);
+      const activity = reaches || !redact?.activities ? undefined : toolActivity(b.name, raw);
       items.push({ kind: "tool", id, toolUseId: b.id ?? id, name: b.name.slice(0, 128),
         summary: clip(toolTitle(b.name, input), 200).text, input: inputText.text, inputTruncated: inputText.truncated,
         ...(toolTitleIsProse(b.name, input) ? { prose: true as const } : {}),

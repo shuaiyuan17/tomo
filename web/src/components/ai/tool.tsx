@@ -13,7 +13,7 @@ import { useRef, useState } from "react";
 import { cn } from "@/lib/utils";
 import { preview } from "../../subagent.js";
 import { useTranslation } from "../../i18n/index.js";
-import { CopyButton } from "../../code-block.js";
+import { CopyButton, selectContents } from "../../code-block.js";
 
 /** A labelled, scrollable block of text with a capped "Show more" and a copy button (the whole text, not only what is shown). */
 export function ToolSection({ label, text, truncated, error }:
@@ -26,7 +26,8 @@ export function ToolSection({ label, text, truncated, error }:
   return <div className="space-y-1">
     <div className="flex items-center justify-between gap-2">
       <p className="m-0 font-mono text-[10px] tracking-[0.12em] text-muted-foreground uppercase">{label}</p>
-      {text && <CopyButton value={text} fallback={pre} label={t("trace.copySection", { label })} />}
+      {text && <CopyButton value={text} fallback={() => { setExpanded(true); requestAnimationFrame(() => selectContents(pre.current)); }}
+        label={t("trace.copySection", { label })} />}
     </div>
     <pre ref={pre} className={cn("m-0 max-h-72 overflow-auto rounded-lg px-3 py-2 font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap [overflow-wrap:anywhere]",
       error ? "bg-destructive/10 text-destructive" : "bg-muted/70 text-foreground")}>{shown || t("trace.empty")}</pre>

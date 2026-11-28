@@ -44,7 +44,7 @@ describe("an internal tool's row is a sentence", () => {
   });
   it("returned normally but nothing happened: said in the warn colour", () => {
     const line = activityLine(row(call({ kind: "schedule_remove", id: "ab12" }, { outcome: { noop: "Job ab12 not found." } })));
-    expect(line).toMatchObject({ held: true, detail: "nothing happened" });
+    expect(line).toMatchObject({ held: true, detail: "Job ab12 not found." });
     expect(html(row(call({ kind: "task_message", id: "s3", text: "go" }, { outcome: { delivery: "held", noop: "s3 still waits" } })))).toMatch(/Held a note for s3.*text-warn/);
   });
   it("without an activity, or with one this page does not know, it keeps the plain line", () => {

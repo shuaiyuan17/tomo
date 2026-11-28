@@ -33,8 +33,9 @@ export function internalToolName(name: string): string | undefined {
   return name.startsWith(INTERNAL_TOOL_PREFIX) ? name.slice(INTERNAL_TOOL_PREFIX.length) : undefined;
 }
 
+/** Scrubbed WHOLE, then clipped: a registered secret cut at the clip would no longer match the scrubber. */
 const clean = (value: string, limit: number) => {
-  const scrubbed = redactText(scrubSecretValues(value.length > limit * 2 ? value.slice(0, limit * 2) : value));
+  const scrubbed = redactText(scrubSecretValues(value));
   return scrubbed.length > limit ? { text: scrubbed.slice(0, limit), truncated: true as const } : { text: scrubbed };
 };
 const line = (value: unknown): string | undefined =>

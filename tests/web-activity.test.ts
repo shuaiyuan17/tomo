@@ -4,6 +4,9 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 import { ACTIVITY_TEXT_LIMIT, failureReason, toolActivity, toolOutcome } from "../src/web/activity.js";
 import { pairOutputs, toolItemsFromLine } from "../src/web/session-tools.js";
+import { itemsFromLine } from "../src/web/subagent-reader.js";
+import { clearSecretValuesForTests, registerSecretValue } from "../src/credentials/redactor.js";
+import { toolTitle } from "../src/agent/tool-summary.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
 import { SubsessionService } from "../src/agent/subsessions/service.js";
 import { buildTaskOwnerTools } from "../src/mcp/subsession-tools.js";
@@ -48,8 +51,7 @@ describe("toolOutcome reads what the real tools return", () => {
     const passed = toolOutcome(I("task_message"), textOf(await run(tools, "task_message", { id: "s1", text: "go on" })));
     expect(passed?.delivery).toMatch(/^(passed|queued)$/);
     expect(toolOutcome(I("task_cancel"), textOf(await run(tools, "task_cancel", { id: "s1" })))).toEqual({});
-    const again = toolOutcome(I("task_cancel"), textOf(await run(tools, "task_cancel", { id: "s1" })));
-    expect(again === undefined || again.noop !== undefined).toBe(true);
+    expect(toolOutcome(I("task_cancel"), textOf(await run(tools, "task_cancel", { id: "s1" })))).toEqual({ noop: "s1 was already cancelled." });
     const missing = await run(tools, "task_message", { id: "s9", text: "x" });
     expect(missing.isError).toBe(true);
     expect(failureReason(I("task_message"), textOf(missing))).toBe("no task s9 in this conversation.");
@@ -119,6 +121,19 @@ describe("toolActivity reads the raw input", () => {
   });
 });
 
+describe("secrets in an activity", () => {
+  it("are scrubbed whole before the clip, so a long registered one that straddles it does not leak its start", () => {
+    const secret = `plainsecret${"q".repeat(400)}`;
+    registerSecretValue(secret, "long-one");
+    try {
+      const activity = toolActivity(I("task_spawn"), { title: `intro ${secret}`, brief: `see ${secret}` });
+      expect(activity?.kind === "task_spawn" && activity.title).not.toContain("plainsecret");
+      expect(activity?.kind === "task_spawn" && activity.brief).not.toContain("plainsecret");
+      expect(toolTitle("mcp__docs__fetch", { url: `${"u".repeat(70)}${secret}` })).not.toContain("plain");
+    } finally { clearSecretValuesForTests(); }
+  });
+});
+
 describe("the main chat's tool items carry activity and outcome", () => {
   const line = (type: string, content: unknown[]) => JSON.stringify({ type, isSidechain: false, timestamp: "2026-11-27T10:00:00.000Z", message: { role: type, content } });
   const items = (scope: { owner?: boolean; workspaceDir?: string }) => [
@@ -135,6 +150,10 @@ describe("the main chat's tool items carry activity and outcome", () => {
     expect(spawned.kind === "result" && spawned.outcome).toEqual({ id: "s12", status: "active" });
     expect(add.kind === "tool" && add.activity?.kind).toBe("todo_add");
     expect(failed.kind === "result" && failed.reason).toBe("the title is blank.");
+  });
+  it("a subagent's transcript (no outcome pairing there) gets no activity: its rows stay plain", () => {
+    expect(itemsFromLine(line("assistant", [{ type: "tool_use", id: "x", name: I("schedule_remove"), input: { id: "ab12" } }]), 0)[0])
+      .not.toHaveProperty("activity");
   });
   it("a group: a call that reaches memory/private has no activity, and its output no outcome", () => {
     const privateCall = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "p1", name: I("task_message"),

@@ -34,7 +34,6 @@ export const activity = {
     messages_other: "{{count}} 条",
     problems_other: "{{count}} 个问题", noProblems: "没问题",
     events_other: "{{count}} 条",
-    notHappened: "没有发生",
   },
   kind: {
     task_other: "处理了 {{count}} 个任务",

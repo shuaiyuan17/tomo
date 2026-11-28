@@ -92,7 +92,8 @@ export function activityLine(row: Pick<ToolRow, "activity" | "result">): { title
   const outcome = row.result && !row.result.isError ? row.result.outcome : undefined;
   const held = !!outcome?.noop;
   const count = (key: Key) => outcome?.count !== undefined ? t(key, { count: outcome.count }) : undefined;
-  const say = (title: string, detail?: string) => ({ title, ...(detail ? { detail } : held ? { detail: t("activity:detail.notHappened") } : {}), ...(held ? { held } : {}) });
+  // Nothing happened: the tool's own sentence says why (English, as a failure's reason is).
+  const say = (title: string, detail?: string) => ({ title, ...(held ? { detail: outcome!.noop, held } : detail ? { detail } : {}) });
   switch (activity.kind) {
     case "task_spawn": return say(outcome?.id ? t("activity:line.taskSpawnId", { id: outcome.id, title: activity.title }) : t("activity:line.taskSpawn", { title: activity.title }));
     case "task_message": return say(outcome?.delivery === "held" ? t("activity:line.taskMessageHeld", { id: activity.id }) : t("activity:line.taskMessage", { id: activity.id }));

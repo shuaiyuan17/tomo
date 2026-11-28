@@ -7,6 +7,7 @@ import { ActivityCard } from "../web/src/activity-card.js";
 import { ActivityEnvProvider, publishSubsessions, type ActivityEnv } from "../web/src/activity-env.js";
 import { TurnBlock } from "../web/src/tool-calls.js";
 import { isCardRow } from "../web/src/activity.js";
+import { i18n } from "../web/src/i18n/index.js";
 
 const I = (tool: string) => `mcp__tomo-internal__${tool}`;
 let n = 0;
@@ -255,6 +256,12 @@ describe("to-do cards", () => {
     expect(snoozed).toContain("until Dec 4 · snoozed 2 of 3 · waiting on CI");
     expect(snoozed).not.toContain("line-through");
   });
+  it("a resolve's printed next step is labelled in the reader's language", async () => {
+    await i18n.changeLanguage("zh-Hans");
+    try {
+      expect(card(row(call(done, { outcome: { id: "t-40", title: "Ship · next: merge it" } })))).toContain("Ship · 下一步： merge it");
+    } finally { await i18n.changeLanguage("en"); }
+  });
   it("calls in a row merge into one card: a failed add, the retry, and closes; the head counts them", () => {
     const items = [...call(add, { isError: true, reason: "not in the future." }), ...call(add, { outcome: { id: "t-41" } }),
       ...call(done, { outcome: { id: "t-40" } }), ...call(done, { outcome: { id: "t-38" } })];
@@ -314,6 +321,8 @@ describe("schedule card", () => {
     expect(card(row(call({ ...create, once: undefined } as ToolActivity, { outcome: { id: "ab", lifecycle: "recurring", everyMs: 90_000 } })))).toContain("every 90 seconds");
     // A date kept after it runs: lifecycle "recurring", but it fires once.
     expect(card(row(call({ ...create, once: undefined } as ToolActivity, { outcome: { id: "ab", lifecycle: "recurring", firesOnce: true, nextRunAt: 0 } })))).toContain("· once");
+    // A cron job deleted after its first run (once: true) is once too.
+    expect(card(row(call({ ...create, schedule: "30 8 * * *" } as ToolActivity, { outcome: { id: "ab", lifecycle: "once", cron: "30 8 * * *", nextRunAt: 0 } })))).toContain("· once");
   });
   it("running and failed", () => {
     expect(card(row(call(create)), { running: true })).toContain("Scheduling a task");

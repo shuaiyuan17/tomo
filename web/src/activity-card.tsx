@@ -293,7 +293,8 @@ function TodoLine({ row, state, alone }: { row: TodoRow; state: CardState; alone
   const resolved = activity.kind === "todo_resolve" ? RESOLVED[activity.action] : undefined;
   const Icon = state === "running" ? RunningMark : state === "unknown" ? CircleHelpIcon : add ? PlusIcon : resolved!.icon;
   const id = outcome.id ?? (activity.kind === "todo_resolve" ? activity.id : undefined);
-  const title = add ? activity.title : outcome.title;
+  // A resolve's title is the tool's printed words (title, and next step): its English field label is said in the reader's language.
+  const title = add ? activity.title : outcome.title?.replaceAll(" · next: ", ` · ${t("card.todoNextLabel")} `);
   const struck = state === "done" && (activity.kind === "todo_resolve" && (activity.action === "done" || activity.action === "drop"));
   const date = outcome.review ?? (add ? activity.reviewIn : undefined);
   const small: string[] = [];
@@ -376,7 +377,8 @@ function ScheduleCard({ row, state, raw }: CardProps & { row: ToolRow & { activi
   const env = useActivityEnv();
   const activity = row.activity;
   const outcome = row.result?.outcome;
-  const once = outcome ? !!outcome.firesOnce || (!outcome.everyMs && !outcome.cron && outcome.lifecycle === "once") : !!activity.once;
+  // Once: a date (even kept after it ran), or any job deleted after its first run (`once: true`, also with a cron or an interval).
+  const once = outcome ? !!outcome.firesOnce || outcome.lifecycle === "once" : !!activity.once;
   const head = { k: (once ? HEADS.scheduleOnce : HEADS.scheduleRecurring)[state], values: { name: activity.name } };
   const target = activity.session ? env.sessions.find((s) => s.id === activity.sessionId)?.title || activity.session : undefined;
   const badge = once ? (outcome?.nextRunAt ? when(outcome.nextRunAt) : undefined)

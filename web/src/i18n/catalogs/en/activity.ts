@@ -30,6 +30,7 @@ export const activity = {
     everyDays_one: "every day", everyDays_other: "every {{count}} days", everyHours_one: "every hour", everyHours_other: "every {{count}} hours",
     everyMinutes_one: "every minute", everyMinutes_other: "every {{count}} minutes",
     todoWaiting: { me: "waiting on me", owner: "waiting on you", external: "waiting on someone else" },
+    todoNextLabel: "next:",
     todoNext: "next: {{next}}", todoReview: "review {{date}}", todoDue: "due {{date}}", todoUntil: "until {{date}}", todoSnoozes: "snoozed {{count}} of {{max}}",
     todoNotAdded: "Not added: {{reason}}", todoNotUpdated: "Not updated: {{reason}}",
     scheduledOnce: "Scheduled a task · once", scheduledRecurring: "Scheduled a task · recurring", scheduling: "Scheduling a task", scheduleFailed: "Couldn't schedule “{{name}}”",

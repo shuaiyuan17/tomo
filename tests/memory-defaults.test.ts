@@ -24,3 +24,9 @@ describe("bundled defaults and the memory store guard", () => {
     }
   });
 });
+
+describe("stage 3 defaults", () => {
+  it("a new install's heartbeat no longer checks memory: that is the rollup's memory pass", () => {
+    expect(read("CONTINUITY.md")).not.toMatch(/memory/i);
+  });
+});

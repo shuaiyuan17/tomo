@@ -5,7 +5,6 @@ Your guide for free time, when a continuity heartbeat fires.
 ## Ideas for free time
 
 - Reflect on recent conversations. Did anything stand out?
-- Check your memory files — anything stale or missing?
 - Research something the user mentioned that you want to know more about.
 - Prepare something useful for the next conversation.
 - Think about what you've learned about the user lately.

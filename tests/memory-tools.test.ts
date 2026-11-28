@@ -575,3 +575,44 @@ describe("the share reminder (§8.2): a new file outside private/, or new lines 
     expect(r.text).not.toContain("is shared");
   });
 });
+
+describe("the provenance reminder (§6.1): a fact line added to a core without its source", () => {
+  const NO_SOURCE = "no source: write each fact as `- YYYY-MM-DD [said|inferred|from:<source>] <fact>` (see Provenance).";
+
+  it("is said for an added core line without the prefix, and counts them", async () => {
+    put("MEMORY.md", "## Rules\n");
+    put("private/MEMORY.md", "## Private\n");
+    const t = tools(OWNER);
+    expect((await t.call("memory_append", { path: "MEMORY.md", content: "- No calls before 9." })).text).toContain(`A new line in MEMORY.md has ${NO_SOURCE}`);
+    expect((await t.call("memory_append", { path: "private/MEMORY.md", content: "- one\n- two" })).text).toContain(`2 new lines in private/MEMORY.md have ${NO_SOURCE}`);
+    const r = await t.call("memory_str_replace", { path: "MEMORY.md", old: "- No calls before 9.", new: "- 2026-11-24 No calls before 9." });
+    expect(r.error).toBe(false);
+    expect(r.text).toContain(NO_SOURCE);
+  });
+
+  it("is not said for prefixed lines, headings, removals, or topic files; and never refuses", async () => {
+    put("MEMORY.md", "## Rules\n- old line\n");
+    put("travel.md", topic("Trips."));
+    const t = tools(OWNER);
+    for (const line of ["- 2026-11-24 [said] No calls before 9.", "- 2026-11-24 [inferred] Up by 8.", "* 2026-11-24 [from:group] Meets Fridays.", "- 2026-11-24 [from:email] Trip booked.", "## Ongoing"]) {
+      const r = await t.call("memory_append", { path: "MEMORY.md", content: line });
+      expect(r.error, line).toBe(false);
+      expect(r.text, line).not.toContain("no source");
+    }
+    expect((await t.call("memory_str_replace", { path: "MEMORY.md", old: "- old line\n", new: "" })).text).not.toContain("no source");
+    // A subject under Don't keep, added without reading the file (the shared variant's way), is not a fact.
+    put("private/MEMORY.md", "## Don't keep\n\n## Private\n- 2026-11-01 [said] x\n");
+    const dk = await t.call("memory_str_replace", { path: "private/MEMORY.md", old: "## Don't keep\n", new: "## Don't keep\n- a medical matter\n" });
+    expect(dk.error).toBe(false);
+    expect(dk.text).not.toContain("no source");
+    // The same words added under another heading are a fact: reminded.
+    const dup = await t.call("memory_str_replace", { path: "private/MEMORY.md", old: "## Private\n", new: "## Private\n- a medical matter\n" });
+    expect(dup.text).toContain("A new line in private/MEMORY.md has no source");
+    expect((await t.call("memory_append", { path: "travel.md", content: "- unprefixed in a topic file" })).text).not.toContain("no source");
+    for (const bad of ["- 2026-11-24 [said]", "- 2026-11-24 [from:] x", "- [said] 2026-11-24 x"]) {
+      const r = await t.call("memory_append", { path: "MEMORY.md", content: bad });
+      expect(r.error, bad).toBe(false);
+      expect(r.text, bad).toContain("no source");
+    }
+  });
+});

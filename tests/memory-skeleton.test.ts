@@ -14,9 +14,13 @@ describe("tomo init: the memory skeleton", () => {
     expect(writeMemoryCores(mem, { userName: "Alex", agentName: "Tomo" }, false)).toEqual(["MEMORY.md", "private/MEMORY.md"]);
     const shared = readFileSync(join(mem, "MEMORY.md"), "utf8");
     for (const h of ["## Owner", "## Rules", "## Preferences", "## Ongoing"]) expect(shared).toContain(`${h}\n`);
-    expect(shared).toContain("Alex set up Tomo");
+    // The owner's line is a core fact like any other: dated (local date), with its source.
+    expect(shared).toMatch(/^- \d{4}-\d{2}-\d{2} \[said\] Alex set up Tomo; call them Alex\.$/m);
+    const d = new Date();
+    expect(shared).toContain(`- ${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} [said]`);
     expect(shared).not.toContain("](");
-    expect(readFileSync(join(mem, "private", "MEMORY.md"), "utf8")).toBe("## Private\n");
+    // `## Don't keep` is there from the start (adding a heading later would rebuild a live session), at the top: a core cut at its hard limit loses its bottom, not this.
+    expect(readFileSync(join(mem, "private", "MEMORY.md"), "utf8")).toBe("## Don't keep\n\n## Private\n");
   });
 
   it("without a personality, writes the bare headings", () => {

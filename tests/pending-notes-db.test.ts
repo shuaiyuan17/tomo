@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openTomoDb, TomoDb } from "../src/db/index.js";
 import { PendingNotesQueue } from "../src/agent/pending-notes-queue.js";
+import { EXPORTED_KEY, EXPORT_WRITING_PREFIX, exportPendingNotesToFile } from "../src/sessions/pending-notes-store.js";
+import * as fsUtils from "../src/fs-utils.js";
 import { makeSessionStore } from "./helpers/session-store-fixtures.js";
 
 // ---------------------------------------------------------------------------
@@ -158,6 +160,103 @@ describe("after an export", () => {
     writeFileSync(legacy(dir), "{truncated");
     expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["still here"]);
     expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["still here"]);
+  });
+});
+
+describe("the rollback export (t-67: the mark commits before the file is written)", () => {
+  const metaMark = (dir: string): string | undefined => {
+    const db = openTomoDb(join(dir, "tomo.db"), { readOnly: true });
+    try {
+      return db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", EXPORTED_KEY)?.value;
+    } finally {
+      db.close();
+    }
+  };
+
+  it("a COMMIT that fails leaves no file behind, so the next start does not import notes delivered since", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["deliver once"]);
+    const db = openTomoDb(join(dir, "tomo.db"));
+    // A real COMMIT failure: a deferred foreign key the mark's insert breaks,
+    // checked only at COMMIT.
+    db.exec(`
+      CREATE TABLE commit_guard (ref TEXT REFERENCES missing_parent (id) DEFERRABLE INITIALLY DEFERRED);
+      CREATE TABLE missing_parent (id TEXT PRIMARY KEY);
+      CREATE TRIGGER fail_commit AFTER INSERT ON meta BEGIN INSERT INTO commit_guard (ref) VALUES ('nope'); END;
+    `);
+    try {
+      expect(() => exportPendingNotesToFile(db, legacy(dir), { mark: true })).toThrow(/FOREIGN KEY/i);
+    } finally {
+      db.exec("DROP TRIGGER fail_commit");
+      db.close();
+    }
+    expect(existsSync(legacy(dir))).toBe(false);
+    expect(metaMark(dir)).toBeUndefined();
+    // The note is delivered; the next start must not bring it back.
+    makeSessionStore(dir).setPendingNotes("dm:alice", []);
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual([]);
+  });
+
+  it("a file that fails to land takes its mark back: the table is kept, not emptied as delivered", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["keep me"]);
+    const db = openTomoDb(join(dir, "tomo.db"));
+    vi.spyOn(fsUtils, "writeJsonAtomicSync").mockImplementation(() => { throw new Error("ENOSPC"); });
+    try {
+      expect(() => exportPendingNotesToFile(db, legacy(dir), { mark: true })).toThrow("ENOSPC");
+    } finally {
+      db.close();
+      vi.restoreAllMocks();
+    }
+    expect(metaMark(dir)).toBeUndefined();
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["keep me"]);
+  });
+
+  it("a mark left \"writing\" beside a missing file (a crash before the write) keeps the table", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["keep me"]);
+    const db = openTomoDb(join(dir, "tomo.db"));
+    db.run("INSERT INTO meta (key, value) VALUES (?, ?)", EXPORTED_KEY, `${EXPORT_WRITING_PREFIX}2026-11-28T00:00:00.000Z`);
+    db.close();
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["keep me"]);
+    expect(metaMark(dir)).toBeUndefined();
+  });
+
+  it("a mark left \"writing\" beside the landed file (a crash before the mark settled) imports the file", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["a1"]);
+    const db = openTomoDb(join(dir, "tomo.db"));
+    const real = TomoDb.prototype.run;
+    vi.spyOn(TomoDb.prototype, "run").mockImplementation(function (this: TomoDb, sql: string, ...params) {
+      if (sql.startsWith("UPDATE meta")) throw new Error("crash");
+      return real.call(this, sql, ...params);
+    });
+    try {
+      expect(() => exportPendingNotesToFile(db, legacy(dir), { mark: true })).toThrow("crash");
+    } finally {
+      db.close();
+      vi.restoreAllMocks();
+    }
+    expect(metaMark(dir)?.startsWith(EXPORT_WRITING_PREFIX)).toBe(true);
+    // The older Tomo ran on the file and queued another note.
+    writeLegacy(dir, { "dm:alice": ["a1", "a2"] });
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["a1", "a2"]);
+  });
+
+  it("a landed export settles its mark, and a deleted file then means every note was delivered", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["a1"]);
+    const db = openTomoDb(join(dir, "tomo.db"));
+    try {
+      expect(exportPendingNotesToFile(db, legacy(dir), { mark: true })).toBe(1);
+    } finally {
+      db.close();
+    }
+    const mark = metaMark(dir);
+    expect(mark).toBeDefined();
+    expect(mark!.startsWith(EXPORT_WRITING_PREFIX)).toBe(false);
+    rmSync(legacy(dir));
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual([]);
   });
 });
 

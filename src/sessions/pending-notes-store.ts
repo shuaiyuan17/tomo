@@ -23,7 +23,9 @@ export const IMPORT_PENDING_KEY = "legacy_pending_notes_import_pending";
  * file is the truth. The next start imports it if it is there (a rollback
  * that was called off, or an older Tomo that left notes), and if it is gone
  * (an older Tomo delivered every note and deleted it) empties the table, so
- * nothing it already delivered is delivered again.
+ * nothing it already delivered is delivered again. While the export is
+ * between its mark and its file the value starts with EXPORT_WRITING_PREFIX,
+ * and a missing file then means the export never landed (the table is kept).
  */
 export const EXPORTED_KEY = "legacy_pending_notes_exported";
 
@@ -162,13 +164,19 @@ export class PendingNotesStore {
   private importLegacy(db: TomoDb): void {
     // Read inside the write transaction: what is imported is what the file
     // held while nobody else could write the table.
-    const outcome = db.transaction((): { notes: Record<string, string[]>; displaced: number } | "none" | "consumed" | "unreadable" | "pending" => {
+    const outcome = db.transaction((): { notes: Record<string, string[]>; displaced: number } | "none" | "unlanded" | "consumed" | "unreadable" | "pending" => {
       let raw: Buffer;
       try {
         raw = readFileSync(this.legacyPath);
       } catch (err) {
         if (isEnoent(err)) {
-          if (!db.get("SELECT 1 FROM meta WHERE key = ?", EXPORTED_KEY)) return "none";
+          const mark = db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", EXPORTED_KEY);
+          if (!mark) return "none";
+          if (mark.value.startsWith(EXPORT_WRITING_PREFIX)) {
+            // The export's file never landed: the table is still the truth.
+            db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
+            return "unlanded";
+          }
           db.run("DELETE FROM pending_notes");
           db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
           return "consumed";
@@ -194,6 +202,10 @@ export class PendingNotesStore {
       return { notes, displaced };
     });
     if (outcome === "none") return;
+    if (outcome === "unlanded") {
+      log.warn({ file: this.legacyPath }, "A pending notes rollback export never wrote its file; the notes stay in the database");
+      return;
+    }
     if (outcome === "consumed") {
       log.info("The exported pending notes file is gone (an older Tomo delivered its notes): the table was emptied");
       return;
@@ -339,22 +351,57 @@ export function parsePendingNotesFile(raw: Buffer): Record<string, string[]> {
 }
 
 /**
- * Write every note to the legacy file at `out`. With `mark` (the rollback
- * path, to the file the older Tomo reads) the table is marked exported in the
- * same write transaction, the file written and fsynced inside it: the mark
- * commits only with the file on disk. The table itself is not changed, so an
- * export can be repeated. Returns how many notes were written.
+ * Prefix of the EXPORTED_KEY value while a rollback export is between its
+ * mark and its file: the mark and the snapshot are committed, the file may or
+ * may not be on disk. The next start reads a missing file beside it as an
+ * export that never landed (the table stays the truth), never as an older
+ * Tomo that delivered every note. Any other value (a timestamp) is an export
+ * whose file landed.
+ */
+export const EXPORT_WRITING_PREFIX = "writing ";
+
+/**
+ * Write every note to the legacy file at `out`, fsynced. The table itself is
+ * not changed, so an export can be repeated. Returns how many notes were
+ * written.
+ *
+ * With `mark` (the rollback path, to the file the older Tomo reads) the
+ * export is recorded in `meta` (EXPORTED_KEY), in the order the cron export
+ * uses: the snapshot and a "writing" mark commit together FIRST, then the
+ * file is written, then the mark is settled. A commit that fails leaves no
+ * file behind (a file without its mark would be imported at the next start
+ * as one an older Tomo wrote, bringing back notes delivered since). A file
+ * that fails to land takes its mark back; a mark that cannot be settled or
+ * taken back stays "writing", which the next start reads safely either way
+ * (see importLegacy).
  */
 export function exportPendingNotesToFile(db: TomoDb, out: string, opts: { mark: boolean }): number {
-  const write = (): number => {
-    const notes = readAllNotes(db);
+  const write = (notes: Record<string, string[]>): number => {
     const file: PendingNotesFile = { version: 1, notes };
     writeJsonAtomicSync(out, file, { fsync: true });
     return Object.values(notes).reduce((n, list) => n + list.length, 0);
   };
-  if (!opts.mark) return write();
-  return db.transaction(() => {
-    db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", EXPORTED_KEY, new Date().toISOString());
-    return write();
+  if (!opts.mark) return write(readAllNotes(db));
+  const at = new Date().toISOString();
+  const notes = db.transaction(() => {
+    setMeta(db, EXPORTED_KEY, `${EXPORT_WRITING_PREFIX}${at}`);
+    return readAllNotes(db);
   });
+  let count: number;
+  try {
+    count = write(notes);
+  } catch (err) {
+    // Only when the file did not land: the atomic write can still fail after
+    // its rename (the directory fsync), and a landed file needs its mark.
+    if (!existsSync(out)) {
+      try { db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY); } catch { /* still "writing": the next start keeps the table */ }
+    }
+    throw err;
+  }
+  db.run("UPDATE meta SET value = ? WHERE key = ?", at, EXPORTED_KEY);
+  return count;
+}
+
+function setMeta(db: TomoDb, key: string, value: string): void {
+  db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", key, value);
 }

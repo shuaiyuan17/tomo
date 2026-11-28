@@ -3421,7 +3421,9 @@ export class Agent {
   }
 
   /** The group chats a `scope: "all"` recall reads: every group session the
-   *  registry knows, once each, with its latest chat title. */
+   *  registry knows, once each, with its latest chat title. From the
+   *  in-memory registry only: nothing here touches the disk, so finding the
+   *  groups costs the search's budget next to nothing. */
   groupRecallSources(): RecallGroupSource[] {
     const titles = new Map<string, string | undefined>();
     for (const entry of this.sessions.listAllSessions()) {
@@ -3429,17 +3431,7 @@ export class Agent {
       if (!isGroupSessionKey(key)) continue;
       if (!titles.has(key) || entry.chatTitle) titles.set(key, entry.chatTitle ?? titles.get(key));
     }
-    const keys = [...titles.keys()];
-    const bytes = this.sessions.transcriptBytes(keys);
-    return keys.map((key, i) => {
-      const title = titles.get(key);
-      return { key, ...(title ? { title } : {}), bytes: bytes[i] };
-    });
-  }
-
-  /** Size of a session's transcript files, for sharing out a recall budget. */
-  sessionTranscriptBytes(sessionKey: string): number {
-    return this.sessions.transcriptBytes([sessionKey])[0];
+    return [...titles].map(([key, title]) => ({ key, ...(title ? { title } : {}) }));
   }
 
   /** Scored recall of one GROUP's transcript, for a `scope: "all"` search.

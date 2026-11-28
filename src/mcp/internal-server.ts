@@ -386,7 +386,6 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
           scopeAll: {
             allowed: () => agent.canRecallGroupChats(callerSessionKey),
             groups: () => agent.groupRecallSources(),
-            ownBytes: () => agent.sessionTranscriptBytes(callerSessionKey),
             recallGroup: (key: string, opts: Parameters<Agent["recallGroupTranscript"]>[1]) => agent.recallGroupTranscript(key, opts),
           },
         } : {}),

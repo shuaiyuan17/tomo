@@ -40,8 +40,6 @@ export interface RecallGroupSource {
   key: string;
   /** The chat's title, when known. Shown to the model, so sanitised first. */
   title?: string;
-  /** Size of its transcript files on disk: the order the budget is shared out in. */
-  bytes: number;
 }
 
 /**
@@ -60,8 +58,6 @@ export interface RecallScopeAllDeps {
   allowed: () => boolean;
   /** The group chats, read per call (a group can be added at any time). */
   groups: () => RecallGroupSource[];
-  /** Size of this conversation's own transcript, like `RecallGroupSource.bytes`. */
-  ownBytes: () => number;
   /** Scored search of one group's transcript. */
   recallGroup: (key: string, opts: RecallScoredOpts) => TranscriptRecall;
   /** Monotonic millisecond clock for the shared budget. Defaults to `performance.now`. */
@@ -271,6 +267,8 @@ export interface RecallSourceResult {
   label: string | null;
   /** Absent when the budget was spent before this conversation's turn came. */
   recall?: TranscriptRecall;
+  /** Set exactly when `recall` is absent: which part of the budget was gone. */
+  skipped?: "time" | "bytes";
 }
 
 export interface RecallAcross {
@@ -323,12 +321,14 @@ function hitTime(msg: SessionMessage): number {
  * (`RecallScopeAllDeps.budget`, the store's 300 ms by default: the search is
  * synchronous on the daemon's event loop however many transcripts it reads).
  *
- * The budget is shared out smallest transcript first, each conversation
- * taking an equal part of what is left when its turn comes. What a small
- * transcript does not use passes on to the larger ones after it, so a few
- * small groups cost the owner's long DM history almost nothing, and one large
- * group cannot starve the others: each is searched, newest first, as far as
- * its part goes, and says where it stopped.
+ * The budget is shared out group chats first and this conversation last,
+ * each taking an equal part of what is left when its turn comes. Every
+ * conversation gets at least an equal part of the whole (what came before it
+ * took at most its own part), what a small transcript does not use passes on
+ * to the ones after it, and this conversation, usually the longest, gets all
+ * that is left over. So a few small groups cost the owner's DM history almost
+ * nothing, and one large group cannot starve the others: each is searched,
+ * newest first, as far as its part goes, and says where it stopped.
  *
  * Each conversation is scored on its own (word rarity is that conversation's),
  * keeps its own best `limit`, and the best `limit` of all of them are kept.
@@ -346,27 +346,27 @@ export function recallAcross(
   const labels = groupLabels(groups);
   interface Source {
     label: string | null;
-    bytes: number;
-    order: number;
     run: (o: RecallScoredOpts) => TranscriptRecall;
     recall?: TranscriptRecall;
+    skipped?: "time" | "bytes";
   }
-  const sources: Source[] = [
-    { label: null, bytes: deps.ownBytes(), order: 0, run: own },
-    ...groups.map((group, index): Source => ({
-      label: labels.get(group.key) ?? `group ${group.key}`,
-      bytes: group.bytes,
-      order: index + 1,
-      run: (o) => deps.recallGroup(group.key, o),
-    })),
-  ];
-  const queue = [...sources].sort((a, b) => a.bytes - b.bytes || a.order - b.order);
+  const ownSource: Source = { label: null, run: own };
+  const groupSources = groups.map((group): Source => ({
+    label: labels.get(group.key) ?? `group ${group.key}`,
+    run: (o) => deps.recallGroup(group.key, o),
+  }));
+  // Shown this conversation first; searched last.
+  const sources: Source[] = [ownSource, ...groupSources];
+  const queue: Source[] = [...groupSources, ownSource];
   let bytesLeft = budget.maxBytes;
   for (let i = 0; i < queue.length; i++) {
     const source = queue[i];
     const share = queue.length - i;
     const msLeft = budget.maxMs - (clock() - startedAt);
-    if (msLeft <= 0 || bytesLeft <= 0) continue;
+    if (msLeft <= 0 || bytesLeft <= 0) {
+      source.skipped = msLeft <= 0 ? "time" : "bytes";
+      continue;
+    }
     const byteShare = Math.max(1, Math.floor(bytesLeft / share));
     source.recall = source.run({ ...opts, budget: { maxMs: msLeft / share, maxBytes: byteShare } });
     // What it read, as the scan counted it; a scan that does not say is
@@ -387,7 +387,11 @@ export function recallAcross(
   return {
     hits,
     matched,
-    sources: sources.map((source) => ({ label: source.label, ...(source.recall ? { recall: source.recall } : {}) })),
+    sources: sources.map((source) => ({
+      label: source.label,
+      ...(source.recall ? { recall: source.recall } : {}),
+      ...(source.skipped ? { skipped: source.skipped } : {}),
+    })),
   };
 }
 
@@ -400,7 +404,8 @@ export function formatRecallAcross(across: RecallAcross, window: RecallWindow, t
   const reach = across.sources.map((source) => {
     const name = source.label ?? "this conversation";
     if (!source.recall) {
-      return `- ${name}: not searched; the search's time ran out before it got there. Narrow the time range with \`before\` / \`after\` to reach it.`;
+      const spent = source.skipped === "bytes" ? "the search's read limit was used up" : "the search's time ran out";
+      return `- ${name}: not searched; ${spent} before it got there. Narrow the time range with \`before\` / \`after\` to reach it.`;
     }
     clipped += source.recall.clipped ?? 0;
     const { short, note } = searchedBackTo(source.recall, perSource, toTime);

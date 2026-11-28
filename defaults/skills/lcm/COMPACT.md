@@ -40,9 +40,9 @@ Use the canonical tag formats: `daily YYYY-MM-DD`, `weekly YYYY-Www`, `monthly Y
 - Tool-heavy sections: one sentence on what was attempted and whether it worked
 - Conversations: preserve a key quote or specific detail over a paragraph of abstraction
 
-## Daily memory notes
+## Daily journal notes
 
-After compacting, write a brief note to `memory/YYYY-MM-DD.md` for each date covered:
+Only in your private conversation with the owner (skip this step in a group chat, which can't write there). After compacting, append a brief note for each date covered to `private/journal/YYYY-MM-DD.md` with `memory_append` (`create: true` makes the day's file):
 
 ```markdown
 ## 2026-03-29 — from LCM compact
@@ -52,5 +52,5 @@ After compacting, write a brief note to `memory/YYYY-MM-DD.md` for each date cov
 ```
 
 Two-layer recall:
-1. **`memory/YYYY-MM-DD.md`** — read directly, no tools needed
+1. **`private/journal/YYYY-MM-DD.md`** — read with `memory_read`
 2. **`tomo lcm search`** — for raw original messages

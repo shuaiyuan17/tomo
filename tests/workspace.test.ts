@@ -58,7 +58,7 @@ describe("buildSystemPrompt", () => {
     ["includes the memory directory path", [".tomo/workspace/memory"], []],
     ["includes proactive memory instructions", ["Be proactive", "Don't wait to be told"], []],
     ["says memory is written with the memory tools",
-      ["Write memory only with the memory tools", "memory_str_replace", "memory_append", "if_version \"new\"", "Never store", "Search before you add"],
+      ["Write memory only with the memory tools", "a direct file write to a Markdown file under memory/ is refused", "memory_str_replace", "memory_append", "if_version \"new\"", "Never store", "Search before you add"],
       ["## Memory types", "type frontmatter", "## When NOT to save", "Write the memory file (e.g."]],
   ])("%s", (_label, mustContain, mustNotContain) => {
     for (const phrase of mustContain) expect(defaultPrompt).toContain(phrase);

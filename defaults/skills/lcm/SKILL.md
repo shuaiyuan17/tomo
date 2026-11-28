@@ -92,4 +92,4 @@ If you're writing pure English, aim for the lower end (or below). These are ceil
 
 ## Archive & recall
 
-Rolled-up source events live in `_archive_<sdkSessionId>.jsonl`, searchable via `tomo lcm search`. Daily memory notes also live in `memory/journal/YYYY-MM-DD.md` — read those directly when you want warm texture on a specific date.
+Rolled-up source events live in `_archive_<sdkSessionId>.jsonl`, searchable via `tomo lcm search`. Daily journal notes (owner's DM only) live in memory at `private/journal/YYYY-MM-DD.md` — read those with `memory_read` when you want warm texture on a specific date.

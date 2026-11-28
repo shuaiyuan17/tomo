@@ -192,6 +192,7 @@ export function resetConfig(overrides: Partial<typeof mockConfig> = {}) {
     groupSandbox: { groups: {} },
     // Fresh per reset too, so a test that mutates it in place cannot leak.
     credentialBroker: { enabled: false },
+    memory: { storeGuard: "enforce" },
     effort: null,
     sessionEffortOverrides: {},
     groupSecret: null,

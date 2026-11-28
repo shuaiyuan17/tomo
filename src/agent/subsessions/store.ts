@@ -1,7 +1,9 @@
-import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
-import { dirname } from "node:path";
-import { withFileLockSync } from "../../file-lock.js";
-import { writeJsonAtomicSync } from "../../fs-utils.js";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { openTomoDb, sharedTomoDb, type TomoDb } from "../../db/index.js";
+import { deleteMeta, digestOf, isPlaceholder, keepAside, metaValue, setMeta, writePlaceholder } from "../../db/legacy.js";
+import { isEnoent, writeJsonAtomicSync } from "../../fs-utils.js";
+import { fileTimestamp } from "../../sessions/transcript-names.js";
 import { log } from "../../logger.js";
 import { taskSessionKey } from "../../sessions/keys.js";
 import { IllegalTransitionError, nextStatus, type SubsessionEvent } from "./state-machine.js";
@@ -36,16 +38,31 @@ import {
 } from "./types.js";
 
 /**
- * The task table, `~/.tomo/data/subsessions.json`.
+ * The task table: rows of Tomo's database (`subsessions`, one per task, and
+ * `subsessions_state`, the table-wide fields), until 0.16 the file
+ * `~/.tomo/data/subsessions.json`.
  *
  * It is the reconcile source for everything else a task touches (registry,
- * cron, pending notes), so it is written the way the session registry is
- * since #619: under an advisory lock for the whole read-modify-write, fsynced,
- * and copied to `.bak` after every successful write. And AN UNREADABLE TABLE
- * IS NOT AN EMPTY ONE: a missing file reads as empty (`missing`), but a
- * 0-byte or unparseable one falls back to `.bak` (`recovered`) and, failing
- * that, refuses every read and write (`unreadable`) rather than letting the
- * startup reconcile see "no tasks" and unlink every task's registry entry.
+ * cron, pending notes). Every read-modify-write is one database transaction
+ * (`BEGIN IMMEDIATE`, see src/db), so what was read is what is judged and
+ * written, and a write changes only the rows that changed: a heartbeat is one
+ * row, not the whole table twice. AN UNREADABLE TABLE IS NOT AN EMPTY ONE: a
+ * table never written reads as empty (`missing`); a database that cannot be
+ * opened, or a row that does not parse, refuses every read and write
+ * (`unreadable`) rather than letting the startup reconcile see "no tasks" and
+ * unlink every task's registry entry. `recovered`: this process imported the
+ * old file's `.bak` (the file itself was missing or unreadable), and the
+ * table is marked untrusted.
+ *
+ * THE OLD FILE (see importLegacy). On first use the file is imported in one
+ * transaction (its `.bak` when the file cannot be read), then a copy kept
+ * aside (`.migrated-<ts>`), the `.bak` moved aside too, and a placeholder left
+ * at the path: an older Tomo started without `tomo db export subsessions`
+ * then finds an unreadable table with no backup and keeps sub-sessions off,
+ * instead of starting from an empty one. A real table file found there later
+ * is imported only after a rollback export (it replaces the rows: the older
+ * Tomo continued from the export) or into a database that has no table yet;
+ * any other one is refused, and the file left as it is for the owner.
  */
 export type SubsessionStoreState = "ok" | "missing" | "recovered" | "unreadable";
 
@@ -85,19 +102,57 @@ export type TransitionOutcome =
 
 const EMPTY: () => SubsessionTable = () => ({ version: 1, nextId: 1, tasks: [] });
 
+/**
+ * `meta` row: the digest of the last old table file imported. A file at the
+ * old path with that digest is already in the database (a crash between the
+ * import's commit and the placeholder, a backup restored from before the
+ * first start) and is never imported again.
+ */
+export const SUBSESSIONS_IMPORTED_KEY = "legacy_subsessions_imported";
+/**
+ * `meta` row set by `tomo db export subsessions` (the rollback), from its
+ * snapshot on: the file at the old path continues from the database, so every
+ * store call refuses, and the next start imports the file over the rows.
+ * Cleared by that import, or by a start that finds only the placeholder (an
+ * export whose file never landed).
+ */
+export const SUBSESSIONS_EXPORTED_KEY = "legacy_subsessions_exported";
+
+/** The old file's path for a database (`data/subsessions.json` beside `data/tomo.db`). */
+export function legacySubsessionsPath(dbPath: string): string {
+  return join(dirname(dbPath), "subsessions.json");
+}
+
+export function subsessionsPlaceholder(dbPath: string): { movedToDatabase: string; note: string } {
+  return {
+    movedToDatabase: dbPath,
+    note: "Tomo keeps its sub-session tasks in its database now (tables subsessions, subsessions_state). This file is deliberately not a task table, "
+      + "so an older Tomo keeps sub-sessions off instead of starting from an empty list. To go back to an older Tomo: "
+      + "`tomo stop && tomo db export subsessions`, then install it.",
+  };
+}
+
 export class SubsessionStore {
-  private readonly lockPath: string;
+  /** The database the table lives in. */
+  readonly dbPath: string;
   private readonly backupPath: string;
   private cached: SubsessionTable | null = null;
   private lastState: SubsessionStoreState | null = null;
+  /** This process imported the old `.bak` (until its first write): reads say "recovered". */
+  private recoveredByImport = false;
+  private importChecked = false;
   private readonly now: () => number;
   /** Tests: an illegal transition throws instead of being logged and refused. */
   private readonly strict: boolean;
   /** Called after every successful write (the web UI's live sub-session list); never throws into a write. */
   private readonly onChange: (() => void) | undefined;
 
-  constructor(readonly path: string, opts: { now?: () => number; strictTransitions?: boolean; onChange?: () => void } = {}) {
-    this.lockPath = `${path}.lock`;
+  /**
+   * `path` is the old table file (`data/subsessions.json`), imported on first
+   * use; the database defaults to `tomo.db` beside it.
+   */
+  constructor(readonly path: string, opts: { dbPath?: string; now?: () => number; strictTransitions?: boolean; onChange?: () => void } = {}) {
+    this.dbPath = opts.dbPath ?? join(dirname(path), "tomo.db");
     this.backupPath = `${path}.bak`;
     this.now = opts.now ?? Date.now;
     this.strict = opts.strictTransitions ?? false;
@@ -109,9 +164,10 @@ export class SubsessionStore {
     return this.lastState;
   }
 
-  /** A fresh read (under the lock). Throws SubsessionStoreError when unreadable. */
+  /** A fresh read (one consistent snapshot). Throws SubsessionStoreError when unreadable. */
   read(): SubsessionTable {
-    return withFileLockSync(this.lockPath, () => clone(this.readLocked()));
+    const db = this.ready();
+    return clone(this.readRows(db).table);
   }
 
   list(): SubsessionRecord[] {
@@ -130,7 +186,6 @@ export class SubsessionStore {
   peek(): SubsessionTable | null {
     return this.cached ? clone(this.cached) : null;
   }
-
   create(input: CreateTaskInput): SubsessionRecord {
     return this.mutate((table) => {
       const id = `s${table.nextId}`;
@@ -293,45 +348,181 @@ export class SubsessionStore {
     this.mutate((table) => { table.tasks = table.tasks.filter((t) => !drop.has(t.id)); });
   }
 
-  /** `changed`, when given, may skip the write: only for a table read cleanly from the primary. */
+  /** `changed`, when given, may skip the write: only for a table read cleanly ("ok"). */
   private mutate<T>(fn: (table: SubsessionTable) => T, changed?: () => boolean): T {
-    return withFileLockSync(this.lockPath, () => {
-      const table = clone(this.readLocked());
-      const result = fn(table);
-      if (changed && !changed() && this.lastState === "ok") return result;
-      this.writeLocked(table);
-      return result;
+    const db = this.ready();
+    let written: SubsessionTable | null = null;
+    const result = db.transaction(() => {
+      const before = this.readRows(db);
+      const table = clone(before.table);
+      const out = fn(table);
+      if (changed && !changed() && this.lastState === "ok") return out;
+      writeRows(db, before, table);
+      written = table;
+      return out;
     });
+    if (written) {
+      this.cached = clone(written);
+      this.lastState = "ok";
+      this.recoveredByImport = false;
+      try { this.onChange?.(); } catch (err) { log.warn({ err }, "Sub-session change listener failed"); }
+    }
+    return result;
   }
 
-  private readLocked(): SubsessionTable {
-    const primary = readTable(this.path);
-    if (primary.kind === "ok") return this.remember(primary.table, "ok");
-    if (primary.kind === "missing") {
-      // A missing primary with a good backup is a lost write, not a fresh
-      // install: take the backup.
-      const backup = readTable(this.backupPath);
-      if (backup.kind === "ok") {
-        log.warn({ path: this.path }, "Sub-session table missing; recovered from its backup");
-        return this.remember(this.untrust(backup.table), "recovered");
-      }
-      if (backup.kind === "missing") return this.remember(EMPTY(), "missing");
-      // No primary, and a backup that exists but cannot be read: there WAS a
-      // table. Empty would reuse s1 over a live task:s1 conversation.
+  /** The database, opened and the old file imported. Throws SubsessionStoreError when it cannot be used. */
+  private ready(): TomoDb {
+    let db: TomoDb;
+    try {
+      db = sharedTomoDb(this.dbPath);
+    } catch (err) {
       this.lastState = "unreadable";
-      throw new SubsessionStoreError(`Sub-session table ${this.path} is missing and its backup is unreadable`, backup.cause);
+      throw new SubsessionStoreError(`Sub-session table: Tomo's database ${this.dbPath} could not be opened`, err);
     }
-    const backup = readTable(this.backupPath);
-    if (backup.kind === "ok") {
-      // Keep the bad file for a human to look at, under a second name. The
-      // primary is replaced by the next write.
-      const corrupt = `${this.path}.corrupt-${this.now()}`;
-      try { copyFileSync(this.path, corrupt); } catch (err) { log.warn({ err, corrupt }, "Could not keep a copy of the unreadable sub-session table"); }
-      log.error({ path: this.path, cause: primary.cause, corrupt }, "Sub-session table unreadable; recovered from its backup");
-      return this.remember(this.untrust(backup.table), "recovered");
+    try {
+      if (!this.importChecked) {
+        this.importLegacy(db);
+        this.importChecked = true;
+      } else if (metaValue(db, SUBSESSIONS_EXPORTED_KEY) !== undefined) {
+        throw new SubsessionStoreError(`The sub-session tasks were exported for a rollback (\`tomo db export subsessions\`); Tomo imports ${this.path} when it starts`);
+      }
+    } catch (err) {
+      this.lastState = "unreadable";
+      throw err instanceof SubsessionStoreError ? err : new SubsessionStoreError(`Sub-session table: ${(err as Error).message}`, err);
     }
-    this.lastState = "unreadable";
-    throw new SubsessionStoreError(`Sub-session table ${this.path} is unreadable and has no usable backup`, primary.cause);
+    return db;
+  }
+
+  /** The table as stored, parsed. Throws SubsessionStoreError (and the state says unreadable) when a row does not parse. */
+  private readRows(db: TomoDb): StoredTable {
+    let stored: StoredTable;
+    try {
+      stored = readStored(db);
+    } catch (err) {
+      this.lastState = "unreadable";
+      throw new SubsessionStoreError(`Sub-session table in ${this.dbPath} is unreadable`, err);
+    }
+    this.cached = stored.table;
+    this.lastState = !stored.written ? "missing" : this.recoveredByImport ? "recovered" : "ok";
+    return stored;
+  }
+
+  // --- The old file -------------------------------------------------------
+
+  /**
+   * Import `subsessions.json` (or its `.bak`) into the database, in one
+   * transaction, then keep copies aside and leave the placeholder (see the
+   * class comment). What is imported:
+   *
+   * - The file, when it holds a table not imported before, and either the
+   *   database has no table yet (the first start of this version) or a
+   *   rollback export marked it (an older Tomo continued from the export:
+   *   the file replaces the rows). Otherwise the database already has a table
+   *   that did not come from this file: it is refused, nothing changed.
+   * - The `.bak`, untrusted (`recovered`), when the file is missing or will not
+   *   read and the database has no table yet (or a rollback export marked
+   *   it): the old store's own recovery, done once.
+   * - Nothing, when the file is missing and there is no `.bak` (a fresh
+   *   install: `missing`), or only the placeholder is there. A rollback mark
+   *   beside the placeholder is an export that never landed: cleared.
+   *
+   * A file and a `.bak` that both will not read, with no table in the
+   * database, refuse every call: there was a table.
+   */
+  private importLegacy(db: TomoDb): void {
+    const primary = readLegacyTable(this.path);
+    const backup = readLegacyTable(this.backupPath);
+    const outcome = db.transaction((): { from: "file" | "backup"; tasks: number; replaced: boolean } | null => {
+      const exported = metaValue(db, SUBSESSIONS_EXPORTED_KEY) !== undefined;
+      const stored = readStored(db);
+      const empty = !stored.written && stored.table.tasks.length === 0;
+      if (primary.kind === "table") {
+        // After a rollback export the file is the truth, whatever its bytes
+        // (an older Tomo, or a restored copy, can write the very file imported
+        // before): the mark wins over the digest.
+        if (!exported && metaValue(db, SUBSESSIONS_IMPORTED_KEY) === primary.digest) return null;
+        if (!empty && !exported) {
+          throw new SubsessionStoreError(`${this.path} holds a sub-session table the database has not imported, and the database already has one. `
+            + "Nothing was changed. Move the file aside to keep the database's table, or export with `tomo db export subsessions` first to go back to it.");
+        }
+        replaceRows(db, stored, primary.table);
+        setMeta(db, SUBSESSIONS_IMPORTED_KEY, primary.digest);
+        deleteMeta(db, SUBSESSIONS_EXPORTED_KEY);
+        return { from: "file", tasks: primary.table.tasks.length, replaced: !empty };
+      }
+      if (primary.kind === "placeholder" || (!empty && !exported)) {
+        // The database has the table (or this is the placeholder): a broken
+        // or missing file beside it is not a newer one.
+        if (deleteMeta(db, SUBSESSIONS_EXPORTED_KEY) > 0) log.warn({ file: this.path }, "A sub-session rollback export never wrote its file; the tasks stay in the database");
+        return null;
+      }
+      if (backup.kind === "table") {
+        if (!exported && metaValue(db, SUBSESSIONS_IMPORTED_KEY) === backup.digest) return null;
+        replaceRows(db, stored, this.untrust(backup.table));
+        setMeta(db, SUBSESSIONS_IMPORTED_KEY, backup.digest);
+        deleteMeta(db, SUBSESSIONS_EXPORTED_KEY);
+        return { from: "backup", tasks: backup.table.tasks.length, replaced: !empty };
+      }
+      if (primary.kind === "absent" && backup.kind === "absent") {
+        if (deleteMeta(db, SUBSESSIONS_EXPORTED_KEY) > 0) log.warn({ file: this.path }, "A sub-session rollback export never wrote its file; the tasks stay in the database");
+        return null;
+      }
+      const cause = primary.kind === "bad" ? primary.cause : backup.kind === "bad" ? backup.cause : undefined;
+      throw new SubsessionStoreError(primary.kind === "absent"
+        ? `Sub-session table ${this.path} is missing and its backup is unreadable`
+        : `Sub-session table ${this.path} is unreadable and has no usable backup`, cause);
+    });
+    if (outcome) {
+      if (outcome.from === "backup") {
+        this.recoveredByImport = true;
+        log.warn({ file: this.path, tasks: outcome.tasks }, primary.kind === "absent"
+          ? "Sub-session table missing; imported its backup into the database (untrusted until /s trust)"
+          : "Sub-session table unreadable; imported its backup into the database (untrusted until /s trust)");
+      } else {
+        log.info({ file: this.path, tasks: outcome.tasks, replaced: outcome.replaced }, outcome.replaced
+          ? "Imported the sub-session table file (an older Tomo continued from the rollback export) over the database's"
+          : "Imported the sub-session table file into the database");
+      }
+    }
+    this.finishImport(primary, backup);
+  }
+
+  /**
+   * After the import committed (or found nothing to do): the old files are
+   * kept aside and the placeholder left at the path. Each step is safe to
+   * repeat, and a failure is retried by the next start. Not after a refusal
+   * (that throws before here): the files stay as they are for the owner.
+   */
+  private finishImport(primary: LegacyTable, backup: LegacyTable): void {
+    // Every step must land before this process writes anything: until the
+    // old files are out of the way, an older Tomo started in between must see
+    // exactly what was imported (the file, or the .bak it would recover from
+    // itself), never an empty table nor one this process has moved on from.
+    // A failure keeps sub-sessions off this start; the next start finishes it
+    // (each step is safe to repeat).
+    try {
+      if (primary.kind === "table") {
+        // The file holds what was imported: the .bak can go first.
+        keepAside(this.path, primary.raw);
+        this.moveBackupAside(backup);
+        writePlaceholder(this.path, subsessionsPlaceholder(this.dbPath));
+      } else {
+        // No usable file: an older Tomo would recover from the .bak, so it
+        // goes only once the placeholder (which still sends it there) is in.
+        if (primary.kind === "bad" && primary.raw) keepCorruptCopy(this.path);
+        if (primary.kind !== "placeholder") writePlaceholder(this.path, subsessionsPlaceholder(this.dbPath));
+        this.moveBackupAside(backup);
+      }
+    } catch (err) {
+      throw new SubsessionStoreError(`Imported the sub-session table, but could not put the old files at ${this.path} aside; sub-sessions stay off until that works (the next start retries)`, err);
+    }
+  }
+
+  private moveBackupAside(backup: LegacyTable): void {
+    if (backup.kind === "absent") return;
+    if (backup.kind === "table") keepAside(this.backupPath, backup.raw);
+    else keepCorruptCopy(this.backupPath);
+    unlinkSync(this.backupPath);
   }
 
   /** A table read from `.bak` may be missing tasks, and its records may be stale: it says so from here on, in every write. */
@@ -369,47 +560,179 @@ export class SubsessionStore {
     });
   }
 
-  private remember(table: SubsessionTable, state: SubsessionStoreState): SubsessionTable {
-    this.cached = table;
-    this.lastState = state;
-    return table;
-  }
+}
 
-  private writeLocked(table: SubsessionTable): void {
-    mkdirSync(dirname(this.path), { recursive: true });
-    writeJsonAtomicSync(this.path, table, { fsync: true });
-    this.cached = clone(table);
-    this.lastState = "ok";
-    try {
-      writeJsonAtomicSync(this.backupPath, table, { fsync: true });
-    } catch (err) {
-      // The primary is good; the next successful write refreshes the backup.
-      log.warn({ err, path: this.backupPath }, "Could not refresh the sub-session table backup");
-    }
-    // Inside the lock, so a listener must only schedule work, never read back synchronously.
-    try { this.onChange?.(); } catch (err) { log.warn({ err }, "Sub-session change listener failed"); }
+// --- Rows -----------------------------------------------------------------
+
+interface StoredTable {
+  table: SubsessionTable;
+  /** Has the table been written (or imported) at least once? (The state row exists.) */
+  written: boolean;
+  /** Each stored task's record as parsed, serialized: what a write compares against. */
+  rows: Map<string, string>;
+}
+
+/** Copy a file that will not read aside, byte for byte, as `<path>.corrupt-<ts>`, once per content. */
+function keepCorruptCopy(path: string): void {
+  const raw = readFileSync(path);
+  const dir = dirname(path);
+  const prefix = `${basename(path)}.corrupt-`;
+  for (const name of readdirSync(dir)) {
+    if (name.startsWith(prefix) && readFileSync(join(dir, name)).equals(raw)) return;
+  }
+  copyFileSync(path, `${path}.corrupt-${fileTimestamp()}`);
+}
+
+/** The table as stored, from one snapshot (the state row and the task rows never from two moments). */
+function readStored(db: TomoDb): StoredTable {
+  return db.snapshot(() => readStoredNow(db));
+}
+
+function readStoredNow(db: TomoDb): StoredTable {
+  const state = db.get<{ next_id: number; untrusted: string | null }>("SELECT next_id, untrusted FROM subsessions_state WHERE one = 1");
+  const records = db.all<{ record: string }>("SELECT record FROM subsessions ORDER BY seq").map((r) => JSON.parse(r.record) as unknown);
+  const table = parseTable({
+    version: 1,
+    nextId: state ? Number(state.next_id) : 1,
+    tasks: records,
+    ...(state?.untrusted ? { untrusted: JSON.parse(state.untrusted) as unknown } : {}),
+  });
+  const rows = new Map(table.tasks.map((t) => [t.id, JSON.stringify(t)]));
+  return { table, written: state !== undefined, rows };
+}
+
+/** Write what changed between `before` and `after`: changed and new rows, removed rows, the state row. */
+function writeRows(db: TomoDb, before: StoredTable, after: SubsessionTable): void {
+  const keep = new Set<string>();
+  for (const task of after.tasks) {
+    if (keep.has(task.id)) throw new Error(`Sub-session table: two tasks with id ${task.id}`);
+    keep.add(task.id);
+    const json = JSON.stringify(task);
+    const prev = before.rows.get(task.id);
+    if (prev === json) continue;
+    if (prev === undefined) db.run("INSERT INTO subsessions (id, record) VALUES (?, ?)", task.id, json);
+    else db.run("UPDATE subsessions SET record = ? WHERE id = ?", json, task.id);
+  }
+  for (const id of before.rows.keys()) if (!keep.has(id)) db.run("DELETE FROM subsessions WHERE id = ?", id);
+  const untrusted = after.untrusted ? JSON.stringify(after.untrusted) : null;
+  const prevUntrusted = before.table.untrusted ? JSON.stringify(before.table.untrusted) : null;
+  if (!before.written || after.nextId !== before.table.nextId || untrusted !== prevUntrusted) {
+    db.run("INSERT INTO subsessions_state (one, next_id, untrusted) VALUES (1, ?, ?) ON CONFLICT (one) DO UPDATE SET next_id = excluded.next_id, untrusted = excluded.untrusted",
+      after.nextId, untrusted);
   }
 }
 
-type ReadResult =
-  | { kind: "ok"; table: SubsessionTable }
-  | { kind: "missing" }
-  | { kind: "bad"; cause: unknown };
+/** Replace every row with `table`'s (an import). Never lowers nextId: an id once handed out is not reused. */
+function replaceRows(db: TomoDb, before: StoredTable, table: SubsessionTable): void {
+  db.run("DELETE FROM subsessions");
+  const next = { ...table, nextId: Math.max(table.nextId, before.written ? before.table.nextId : 1) };
+  writeRows(db, { table: EMPTY(), written: false, rows: new Map() }, next);
+}
 
-function readTable(path: string): ReadResult {
+// --- The old file ---------------------------------------------------------
+
+type LegacyTable =
+  | { kind: "absent" }
+  | { kind: "placeholder" }
+  | { kind: "table"; table: SubsessionTable; raw: string; digest: string }
+  | { kind: "bad"; cause: unknown; raw: boolean };
+
+function readLegacyTable(path: string): LegacyTable {
+  let buf: Buffer;
+  try {
+    buf = readFileSync(path);
+  } catch (err) {
+    if (isEnoent(err)) return { kind: "absent" };
+    return { kind: "bad", cause: err, raw: false };
+  }
   let text: string;
   try {
-    text = readFileSync(path, "utf8");
+    text = new TextDecoder("utf-8", { fatal: true }).decode(buf);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
-    return { kind: "bad", cause: err };
+    return { kind: "bad", cause: err, raw: true };
   }
-  if (text.trim() === "") return { kind: "bad", cause: new Error("empty file") };
+  if (text.trim() === "") return { kind: "bad", cause: new Error("empty file"), raw: true };
+  let data: unknown;
   try {
-    return { kind: "ok", table: parseTable(JSON.parse(text)) };
+    data = JSON.parse(text);
   } catch (err) {
-    return { kind: "bad", cause: err };
+    return { kind: "bad", cause: err, raw: true };
   }
+  if (isPlaceholder(data, ["tasks", "nextId", "version"])) return { kind: "placeholder" };
+  try {
+    return { kind: "table", table: parseTable(data), raw: text, digest: digestOf(buf) };
+  } catch (err) {
+    return { kind: "bad", cause: err, raw: true };
+  }
+}
+
+/**
+ * `tomo db export subsessions`: write the table to `out` in the old file's
+ * format, fsynced. With `mark` (the rollback, to the old path) the snapshot
+ * and the mark commit together BEFORE the file is written (the cron export's
+ * order): from the mark on every store call refuses, so nothing changes the
+ * rows behind the snapshot, and the file is never there without the mark (a
+ * table file without it would be refused at the next start). A file that does
+ * not land takes the mark back; one left behind is cleared by the next start,
+ * which finds only the placeholder. Returns how many tasks were written.
+ */
+export function exportSubsessionsToFile(db: TomoDb, out: string, opts: { mark: boolean }): number {
+  const write = (table: SubsessionTable): number => {
+    mkdirSync(dirname(out), { recursive: true });
+    // `exportedAt` is ignored by an older Tomo; it keeps this file's digest
+    // from ever matching a file imported before.
+    writeJsonAtomicSync(out, { ...table, exportedAt: new Date().toISOString() }, { fsync: true });
+    return table.tasks.length;
+  };
+  if (!opts.mark) return write(readStored(db).table);
+  const table = db.transaction(() => {
+    const stored = readStored(db);
+    // An older Tomo reads a file at the old path before its .bak: a .bak
+    // still there (one this version never imported, or one an older Tomo
+    // wrote after an earlier rollback) may be newer than these rows.
+    if (existsSync(`${out}.bak`)) {
+      throw new Error(`${out}.bak is there, and may hold tasks the database does not have. Start this Tomo once to import it, or move it aside, then export again.`);
+    }
+    if (!stored.written) {
+      throw new Error("The database has no sub-session table yet (this Tomo never started sub-sessions here): there is nothing to export, and nothing at the old path to replace.");
+    }
+    setMeta(db, SUBSESSIONS_EXPORTED_KEY, new Date().toISOString());
+    return stored.table;
+  });
+  try {
+    return write(table);
+  } catch (err) {
+    if (legacySubsessionsFileReplaceable(out)) {
+      try { deleteMeta(db, SUBSESSIONS_EXPORTED_KEY); } catch { /* the next start undoes it */ }
+    }
+    throw err;
+  }
+}
+
+/** Is the file at `path` absent, or only the placeholder (safe for a rollback export to replace)? */
+export function legacySubsessionsFileReplaceable(path: string): boolean {
+  const state = readLegacyTable(path);
+  return state.kind === "absent" || state.kind === "placeholder";
+}
+
+/**
+ * Task titles by id, read-only, for the web process's cost page: never
+ * imports, never writes, and best-effort (an empty map when the database or
+ * the table is not there yet).
+ */
+export function readSubsessionTitles(dbPath: string): Map<string, string> {
+  const titles = new Map<string, string>();
+  if (!existsSync(dbPath)) return titles;
+  let db: TomoDb | null = null;
+  try {
+    db = openTomoDb(dbPath, { readOnly: true, allowNewerSchema: true });
+    for (const row of db.all<{ id: string; title: unknown }>("SELECT id, title FROM subsessions")) {
+      if (typeof row.title === "string") titles.set(row.id, row.title);
+    }
+  } catch { /* no titles */ } finally {
+    db?.close();
+  }
+  return titles;
 }
 
 /**

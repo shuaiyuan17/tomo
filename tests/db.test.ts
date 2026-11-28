@@ -70,7 +70,7 @@ describe("opening the database", () => {
     const path = join(freshDir(), "nested", "deeper", "tomo.db");
     const db = openTomoDb(path);
     expect(db.schemaVersion()).toBe(TOMO_DB_MIGRATIONS.at(-1)!.version);
-    expect(db.all("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").map((r) => r.name)).toEqual(["cron_jobs", "meta", "pending_notes"]);
+    expect(db.all("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").map((r) => r.name)).toEqual(["cron_jobs", "meta", "pending_notes", "subsessions", "subsessions_state"]);
     db.close();
   });
 });
@@ -115,6 +115,30 @@ describe("schema migrations", () => {
     const ro = openTomoDb(path, { migrations: [v1], readOnly: true, allowNewerSchema: true });
     expect(ro.schemaVersion()).toBe(2);
     ro.close();
+  });
+});
+
+describe("snapshots", () => {
+  it("reads in a snapshot never see another connection's commit half-way", () => {
+    const path = join(freshDir(), "tomo.db");
+    const a = openTomoDb(path);
+    const b = openTomoDb(path);
+    try {
+      a.exec("CREATE TABLE t (x INTEGER)");
+      const seen = a.snapshot(() => {
+        const first = a.get<{ n: number }>("SELECT count(*) AS n FROM t")!.n;
+        b.run("INSERT INTO t (x) VALUES (1)");
+        const second = a.get<{ n: number }>("SELECT count(*) AS n FROM t")!.n;
+        return [first, second];
+      });
+      expect(seen).toEqual([0, 0]);
+      expect(a.get<{ n: number }>("SELECT count(*) AS n FROM t")!.n).toBe(1);
+      // Inside a write transaction it just runs.
+      expect(a.transaction(() => a.snapshot(() => 7))).toBe(7);
+    } finally {
+      a.close();
+      b.close();
+    }
   });
 });
 

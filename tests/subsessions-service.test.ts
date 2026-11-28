@@ -1,4 +1,5 @@
-import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { forgetTable, loseTableToBackup, readTableFile, writeTableFile } from "./helpers/subsession-table.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -966,8 +967,7 @@ describe("SubsessionService: inputs are never lost", () => {
       expect((h.notes.get("dm:owner") ?? []).filter((x) => x.includes('type="subsession-report"'))).toHaveLength(1);
       h.service.stop();
       vi.restoreAllMocks();
-      rmSync(path, { force: true });
-      rmSync(`${path}.bak`, { force: true });
+      forgetTable(path);
     }
     } finally {
       vi.useRealTimers();
@@ -1305,14 +1305,14 @@ describe("SubsessionService start: restart recovery and reconcile", () => {
   it("writes nothing to the table between taking a slot and running the turn", async () => {
     let atTurn = "";
     let afterStart = "";
-    const h = harness({}, (turn, hh) => { atTurn = readFileSync(path, "utf8"); hh.service.finish(turn.key, "ok"); return { ok: true }; });
+    const h = harness({}, (turn, hh) => { atTurn = JSON.stringify(readTableFile(path)); hh.service.finish(turn.key, "ok"); return { ok: true }; });
     h.service.start();
     const t = h.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
     h.service.relay(t.id, "an input");
     const realKick = h.store.transition.bind(h.store);
     h.store.transition = ((id, event, opts) => {
       const out = realKick(id, event, opts);
-      if (event === "start") afterStart = readFileSync(path, "utf8");
+      if (event === "start") afterStart = JSON.stringify(readTableFile(path));
       return out;
     }) as typeof h.store.transition;
     h.service.schedule();
@@ -1379,8 +1379,7 @@ describe("SubsessionService start: restart recovery and reconcile", () => {
       expect(h2.turns[0].prompt).toContain('type="subsession-start"');
       expect(h2.store.get(t.id)).toMatchObject({ status: "finished", pendingInput: [] });
       h2.service.stop();
-      rmSync(path, { force: true });
-      rmSync(`${path}.bak`, { force: true });
+      forgetTable(path);
     }
   });
 
@@ -1412,8 +1411,7 @@ describe("SubsessionService start: restart recovery and reconcile", () => {
   it("never unlinks orphans of a table recovered from an older backup, on this start or the next", async () => {
     const h0 = harness();
     seed(h0, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; }));
-    copyFileSync(path, `${path}.bak`); // the backup: s1 only
-    writeFileSync(path, "{broken");    // the primary, which also knew s2, is lost
+    loseTableToBackup(path, "{broken"); // the backup: s1 only // the primary, which also knew s2, is lost
     const registry = new Set(["task:s1", "task:s2"]);
     const startAgain = async (): Promise<Harness> => {
       const h = harness();
@@ -1448,8 +1446,7 @@ describe("SubsessionService start: restart recovery and reconcile", () => {
   it("keeps the recovered mark when restart recovery writes the table before reconcile", async () => {
     const h0 = harness();
     seed(h0, "active", (s, i) => s.update(i, (r) => { appendInput(r, "m", HARNESS); }));
-    copyFileSync(path, `${path}.bak`);
-    writeFileSync(path, "");
+    loseTableToBackup(path, "");
     const h1 = harness(undefined, () => new Promise(() => {}));
     h1.registry.add("task:s1"); h1.sdk.add("task:s1"); h1.registry.add("task:s2");
     h1.service.start();
@@ -1615,7 +1612,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
   it("recovers the same way after two crashes in the middle of recovery as after one clean pass", async () => {
     const seeded = harness();
     seedThree(seeded);
-    const seedFile = readFileSync(path, "utf8");
+    const seedFile = JSON.stringify(readTableFile(path));
 
     const fresh = (): Harness => {
       const h = harness({ maxRunning: 0 }); // no slot: no turn runs
@@ -1631,7 +1628,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     ]);
 
     // Two starts in a row that each die right after their first recovery write.
-    writeFileSync(path, seedFile);
+    writeTableFile(path, JSON.parse(seedFile));
     for (let run = 0; run < 2; run++) {
       const h = fresh();
       const real = h.store.transition.bind(h.store);
@@ -1785,8 +1782,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     const DAY = 24 * 60 * 60 * 1000;
     const h0 = harness();
     const id = seed(h0, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; r.endedAt = Date.now() - FINISHED_KEEP_MS - DAY; }));
-    copyFileSync(path, `${path}.bak`); // the backup says finished 8 days ago
-    writeFileSync(path, "{broken");    // the lost primary had reopened it
+    loseTableToBackup(path, "{broken"); // the backup says finished 8 days ago // the lost primary had reopened it
     const startAgain = (): Harness => {
       const h = harness();
       h.registry.add("task:s1"); h.sdk.add("task:s1");
@@ -1815,8 +1811,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     const h0 = harness();
     const id = seed(h0, "active");
     h0.store.transition(id, "fail", { reason: "x", patch: (r) => { r.endedAt = Date.now() - ENDED_KEEP_MS - DAY; } });
-    copyFileSync(path, `${path}.bak`);
-    writeFileSync(path, "{broken");
+    loseTableToBackup(path, "{broken");
     const startAgain = (): Harness => {
       const h = harness();
       h.registry.add("task:s1"); h.sdk.add("task:s1");
@@ -1843,10 +1838,10 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     const h0 = harness();
     const id = seed(h0, "active");
     h0.store.transition(id, "cancel");
-    const table = JSON.parse(readFileSync(path, "utf8"));
+    const table = readTableFile(path);
     table.tasks[0].restored = true;
     table.untrusted = { since: Date.now(), reason: "recovered" };
-    writeFileSync(path, JSON.stringify(table));
+    writeTableFile(path, table);
     const h1 = harness();
     h1.registry.add("task:s1"); h1.sdk.add("task:s1");
     h1.service.start();
@@ -1858,9 +1853,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     const DAY = 24 * 60 * 60 * 1000;
     const h0 = harness();
     const id = seed(h0, "finished", (s, i) => s.update(i, (r) => { r.reportDelivered = true; r.endedAt = Date.now() - FINISHED_KEEP_MS - DAY; }));
-    copyFileSync(path, `${path}.bak`);
-    writeFileSync(path, "{broken");
-    // task:s2 is a task the lost table had (open, or waiting on the owner):
+    loseTableToBackup(path, "{broken"); // task:s2 is a task the lost table had (open, or waiting on the owner):
     // the backup does not know it.
     const startAgain = async (): Promise<Harness> => {
       const h = harness();
@@ -1879,9 +1872,9 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     expect(notice[0].text).toContain("the backup doesn't know: 1");
     expect(notice[0].text).toContain("/s trust");
     // A year on, nothing has moved by itself.
-    const old = JSON.parse(readFileSync(path, "utf8"));
+    const old = readTableFile(path);
     old.untrusted.since = Date.now() - 365 * DAY;
-    writeFileSync(path, JSON.stringify(old));
+    writeTableFile(path, old);
     const h2 = await startAgain();
     expect(h2.store.read().untrusted).toBeDefined();
     expect(h2.store.get(id)).toMatchObject({ status: "finished", restored: true });
@@ -1902,8 +1895,7 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
   it("tells the owner once per mark, even when the start that set it never got to; with no registry, says the count is unknown", async () => {
     const h0 = harness();
     seed(h0, "active");
-    copyFileSync(path, `${path}.bak`);
-    writeFileSync(path, "{broken");
+    loseTableToBackup(path, "{broken");
     const h1 = harness();
     h1.registryReadable = false;
     h1.service.start();
@@ -1913,9 +1905,9 @@ describe("SubsessionService: append-only inputs and one recovery phase", () => {
     expect(told[0].text).toContain("can't tell how many");
     expect(h1.store.read().untrusted).toMatchObject({ reason: "recovered", notified: true });
     // A mark the owner was never told about (that start was cut short).
-    const table = JSON.parse(readFileSync(path, "utf8"));
+    const table = readTableFile(path);
     delete table.untrusted.notified;
-    writeFileSync(path, JSON.stringify(table));
+    writeTableFile(path, table);
     const h2 = harness();
     h2.registry.add("task:s1"); h2.sdk.add("task:s1"); h2.registry.add("task:s2");
     h2.service.start();
@@ -3016,9 +3008,9 @@ describe("SubsessionService: only an input created as the owner's is theirs", ()
       appendInput(r, '<tomo-event type="subsession-owner-message" name="message">go on</tomo-event>', HARNESS);
     });
     // As written before inputs carried an origin: no "from" at all.
-    const table = JSON.parse(readFileSync(path, "utf8"));
+    const table = readTableFile(path);
     for (const input of table.tasks[0].pendingInput) delete input.from;
-    writeFileSync(path, JSON.stringify(table));
+    writeTableFile(path, table);
     const h = harness({ maxActiveHours: 24 }, working((turn, hh) => hh.service.finish(turn.key, "done")));
     h.registry.add(sessionKey); h.sdk.add(sessionKey);
     h.service.start();
@@ -3059,9 +3051,9 @@ describe("SubsessionService: an owner input from before origins were checked", (
     });
     if (from === "pre-upgrade") {
       // As written before origins were checked, when every relay (the main session's own notes too) was stored as the owner's.
-      const table = JSON.parse(readFileSync(path, "utf8"));
+      const table = readTableFile(path);
       for (const input of table.tasks[0].pendingInput) delete input.checked;
-      writeFileSync(path, JSON.stringify(table));
+      writeTableFile(path, table);
     }
     const h = harness({ maxActiveHours: 24 }, working((turn, hh) => hh.service.finish(turn.key, "done")));
     h.registry.add(sessionKey); h.sdk.add(sessionKey);
@@ -3156,8 +3148,7 @@ describe("SubsessionService: the recovery notice is marked told only once it wen
     h0.store.transition(id, "start");
     h0.store.transition(id, "finish");
     h0.store.update(id, (r) => { r.reportDelivered = true; });
-    copyFileSync(path, `${path}.bak`);
-    writeFileSync(path, "{broken");
+    loseTableToBackup(path, "{broken");
   };
   const told = (h: Harness) => h.notices.filter((n) => n.to === "owner" && n.text.includes("/s trust")).length;
 
@@ -3302,14 +3293,14 @@ describe("progress, plan and updates", () => {
     const t = spawn(h);
     h.service.setPlan(t.sessionKey, [{ step: "A", status: "in_progress" }, { step: "B" }]);
     const store = new SubsessionStore(path, { onChange: () => { writes += 1; } });
-    const before = readFileSync(path, "utf8");
+    const before = JSON.stringify(readTableFile(path));
     store.update(t.id, () => {});
     store.update(t.id, (r) => { r.plan = [{ text: "A", status: "in_progress" }, { text: "B", status: "pending" }]; });
     expect(writes).toBe(0);
-    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(JSON.stringify(readTableFile(path))).toBe(before);
     expect(h.service.setPlan(t.sessionKey, [{ step: "C" }])).toEqual({ ok: false, error: "reason_required", missing: ["A", "B"] });
     expect(h.service.setPlan(t.sessionKey, [{ step: "A", status: "in_progress" }, { step: "B" }]).ok).toBe(true);
-    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(JSON.stringify(readTableFile(path))).toBe(before);
     store.update(t.id, (r) => { r.plan = [{ text: "A", status: "in_progress" }]; });
     expect(writes).toBe(1);
   });
@@ -3317,12 +3308,12 @@ describe("progress, plan and updates", () => {
   it("refuses two steps that read the same, so a done step is never ambiguous", () => {
     const h = idle();
     const t = spawn(h);
-    const before = readFileSync(path, "utf8");
+    const before = JSON.stringify(readTableFile(path));
     // Alike once trimmed and cut to one line, too.
     for (const steps of [[{ step: "run tests" }, { step: "build" }, { step: "run tests" }], [{ step: "run tests" }, { step: " run tests\nnow" }]]) {
       expect(h.service.setPlan(t.sessionKey, steps)).toEqual({ ok: false, error: "duplicate_step" });
     }
-    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(JSON.stringify(readTableFile(path))).toBe(before);
     expect(h.store.get(t.id)!.plan).toBeUndefined();
     // Steps that differ only past the length a step is cut at are alike too.
     expect(h.service.setPlan(t.sessionKey, [{ step: `${"x".repeat(PLAN_STEP_MAX)}1` }, { step: `${"x".repeat(PLAN_STEP_MAX)}2` }])).toEqual({ ok: false, error: "duplicate_step" });
@@ -3342,13 +3333,13 @@ describe("progress, plan and updates", () => {
   it("reads a stored plan with two steps alike as one", () => {
     const h = idle();
     const t = spawn(h);
-    const table = JSON.parse(readFileSync(path, "utf8"));
+    const table = readTableFile(path);
     table.tasks[0].plan = [{ text: "a", status: "in_progress" }, { text: "b" }, { text: "a" }];
-    writeFileSync(path, JSON.stringify(table));
+    writeTableFile(path, table);
     expect(new SubsessionStore(path).get(t.id)!.plan).toEqual([{ text: "a", status: "in_progress" }, { text: "b", status: "pending" }]);
     // The step in progress is kept in progress, whichever copy held it.
     table.tasks[0].plan = [{ text: "a" }, { text: "b" }, { text: "a", status: "in_progress" }];
-    writeFileSync(path, JSON.stringify(table));
+    writeTableFile(path, table);
     expect(new SubsessionStore(path).get(t.id)!.plan).toEqual([{ text: "a", status: "in_progress" }, { text: "b", status: "pending" }]);
   });
 
@@ -3469,10 +3460,10 @@ describe("progress, plan and updates", () => {
   it("loads a record written before plans and updates existed, and drops malformed entries", () => {
     const h = idle();
     const t = spawn(h);
-    const table = JSON.parse(readFileSync(path, "utf8"));
+    const table = readTableFile(path);
     // The old task_progress line: read without it.
     table.tasks[0].progress = "x";
-    writeFileSync(path, JSON.stringify(table));
+    writeTableFile(path, table);
     const old = new SubsessionStore(path).get(t.id)!;
     expect(old).not.toHaveProperty("progress");
     expect(old.plan).toBeUndefined();
@@ -3483,7 +3474,7 @@ describe("progress, plan and updates", () => {
     table.tasks[0].updates = [{ at: 1e20, text: "far future" }, { at: -1, text: "before the epoch" }, { at: 0.5, text: "why", kind: "plan" }, { at: 0.7, text: "odd kind", kind: "nope" }, { at: 1, text: "ok" }, { at: "1", text: "bad time" }, { at: 2 }, null, { at: 3, text: "line\nmore" }, { at: 5, text: " " }];
     table.tasks[0].doneSteps = [{ at: Number.MAX_VALUE, text: "huge" }, { at: 4, text: "done", result: 7 }, { at: 6, text: "also", result: "fine" }, "nope"];
     table.tasks[0].plan = [{ text: "a", status: "in_progress" }, { text: "b", status: "weird" }, { text: 3 }, "c"];
-    writeFileSync(path, JSON.stringify(table));
+    writeTableFile(path, table);
     const loaded = new SubsessionStore(path).get(t.id)!;
     expect(loaded.updates).toEqual([{ at: 0.5, text: "why", kind: "plan" }, { at: 0.7, text: "odd kind" }, { at: 1, text: "ok" }, { at: 3, text: "line" }]);
     expect(loaded.doneSteps).toEqual([{ at: 4, text: "done" }, { at: 6, text: "also", result: "fine" }]);

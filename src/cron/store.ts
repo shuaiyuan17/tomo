@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { readFileSync, statSync, mkdirSync } from "node:fs";
+import { readFileSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { CronJob, CronOutcome, CronSchedule, InterruptNotice, InterruptedRun, InterruptedSkip, SkipNotice } from "./types.js";
-import { DbDamagedError, openTomoDb, type TomoDb } from "../db/index.js";
+import { closeSharedTomoDbs, DbDamagedError, sharedTomoDb, type TomoDb } from "../db/index.js";
 import { deleteMeta, digestOf, isPlaceholder, keepAside, metaValue, setMeta, writePlaceholder } from "../db/legacy.js";
 import { writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
 import { log } from "../logger.js";
@@ -578,42 +578,14 @@ function readJobs(db: TomoDb): CronJob[] {
 
 // --- Connections --------------------------------------------------------------
 
-/**
- * One connection per database file per process, reopened when the file at the
- * path is no longer the one it was opened on (a test that deletes its temp
- * directory, a repaired database). Stores are created per call (every MCP
- * handler, `tomo cron`, the web process); a connection each would leave
- * handles for the GC to find, and run `quick_check` every time.
- */
-const connections = new Map<string, { db: TomoDb; identity: string }>();
-
-/** Which file is at `path` (device, inode, birth time: an inode number alone can be reused), or null when none. */
-function fileIdentity(path: string): string | null {
-  try {
-    const st = statSync(path);
-    return `${st.dev}:${st.ino}:${st.birthtimeMs}`;
-  } catch (err) {
-    if (isEnoent(err)) return null;
-    throw err;
-  }
-}
-
+/** See sharedTomoDb (src/db): one connection per database per process. */
 function sharedDb(path: string): TomoDb {
-  const cached = connections.get(path);
-  if (cached && cached.identity === fileIdentity(path)) return cached.db;
-  if (cached) {
-    cached.db.close();
-    connections.delete(path);
-  }
-  const db = openTomoDb(path);
-  connections.set(path, { db, identity: fileIdentity(path) ?? "" });
-  return db;
+  return sharedTomoDb(path);
 }
 
 /** Close the shared connections (tests that remove their database). */
 export function closeCronStoreConnections(): void {
-  for (const { db } of connections.values()) db.close();
-  connections.clear();
+  closeSharedTomoDbs();
 }
 
 // --- The legacy jobs file -------------------------------------------------------

@@ -1,4 +1,5 @@
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { loseTableToBackup, readTableFile, writeTableFile } from "./helpers/subsession-table.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -236,8 +237,7 @@ describe("restart recovery from an older backup", () => {
       appendInput(r, "the owner's message", HARNESS);
     });
     const file = join(dir, "t.json");
-    copyFileSync(file, `${file}.bak`);
-    writeFileSync(file, "{broken");
+    loseTableToBackup(file, "{broken");
     const registry = new Set(["task:s1", "task:s2"]);
     const unlinked: string[] = [];
 
@@ -365,9 +365,9 @@ describe("a task is its own card", () => {
   it("makes no todo, and an old record's todo id is read without it", () => {
     const seed = harness();
     const t = seed.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
-    const raw = JSON.parse(readFileSync(join(dir, "t.json"), "utf8")) as { tasks: Array<Record<string, unknown>> };
+    const raw = readTableFile(join(dir, "t.json")) as { tasks: Array<Record<string, unknown>> };
     raw.tasks[0].todoId = "t-1";
-    writeFileSync(join(dir, "t.json"), JSON.stringify(raw));
+    writeTableFile(join(dir, "t.json"), raw);
     const h = harness();
     expect(h.store.get(t.id)).not.toHaveProperty("todoId");
   });
@@ -656,7 +656,7 @@ describe("a task is its own card", () => {
     // An archived task's unread result stays the owner's todo, as before; and so does the owner's own item.
     expect(open).toEqual(expect.arrayContaining(["t-7", "t-9"]));
     // The old fields are gone from what is written back.
-    const onDisk = JSON.parse(readFileSync(join(dir, "t.json"), "utf8")) as { tasks: Record<string, unknown>[] };
+    const onDisk = readTableFile(join(dir, "t.json")) as { tasks: Record<string, unknown>[] };
     expect(onDisk.tasks.find((r) => r.id === "s1")).not.toHaveProperty("todoId");
     // The answer the owner gives is to the report the task shows.
     expect(h.service.markDone("dm:owner", "s2", 1)).toMatchObject({ ok: false, reason: "newer" });

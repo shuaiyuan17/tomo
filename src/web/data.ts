@@ -1,11 +1,11 @@
-import { constants, readFileSync, statSync } from "node:fs";
+import { constants, statSync } from "node:fs";
 import { open, realpath, type FileHandle } from "node:fs/promises";
 import { basename, extname, join, sep } from "node:path";
 import { ownerBindings, ownerSessionKey, OWNER_CHANNELS, type OwnerConfig } from "../owner.js";
 import { SessionStore } from "../sessions/store.js";
 import { readHistoryPage, HistoryReadError } from "../sessions/history-reader.js";
 import { isGroupSessionKey, legacySessionKeysForBinding, normalizeImessageHandle, parseRawSessionKey, taskIdFromSessionKey } from "../sessions/keys.js";
-import { parseTable } from "../agent/subsessions/store.js";
+import { readSubsessionTitles } from "../agent/subsessions/store.js";
 import { webSessionId } from "./owner.js";
 import { isImageFiledFor } from "../channels/imageStore.js";
 import { sniffImageType } from "./image-type.js";
@@ -250,15 +250,10 @@ export class WebData {
     const labels = new Map<string, SessionLabel>();
     let taskTitles: Map<string, string> | undefined;
     const taskTitle = (id: string): string | undefined => {
-      // Read once per report, read-only, and best-effort: a cost page must not
-      // fail because the task table is missing or mid-write.
-      if (!taskTitles) {
-        taskTitles = new Map();
-        try {
-          const table = parseTable(JSON.parse(readFileSync(join(this.options.tomoHome!, "data", "subsessions.json"), "utf8")));
-          for (const task of table.tasks) taskTitles.set(task.id, task.title);
-        } catch { /* no titles */ }
-      }
+      // Read once per report, read-only (a consistent snapshot of the
+      // database, never an import), and best-effort: a cost page must not
+      // fail because the task table is not there.
+      taskTitles ??= readSubsessionTitles(this.options.cronDbPath ?? join(this.options.tomoHome!, "data", "tomo.db"));
       return taskTitles.get(id);
     };
     const describeSession = (key: string): SessionLabel => {

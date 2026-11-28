@@ -7,6 +7,7 @@ import { isTaskSessionKey } from "../../sessions/keys.js";
 import { formatTomoEvent } from "../../tomo-event.js";
 import type { QuotaGateReading } from "../../usage/limits-log.js";
 import { MODEL_ALIASES } from "../../models.js";
+import { DbDamagedError } from "../../db/index.js";
 import { SubsessionStoreError, type SubsessionStore, type TransitionOptions, type TransitionOutcome } from "./store.js";
 import type { SubsessionEvent } from "./state-machine.js";
 import {
@@ -1697,7 +1698,9 @@ export class SubsessionService {
     } catch (err) {
       this.broken = true;
       log.error({ err, path: this.store.path }, "Sub-session table unreadable; sub-sessions are off until it is repaired. Nothing was unlinked or cancelled.");
-      this.noticeOwner(ownerT("subsessions")("tableUnreadable"));
+      // A damaged database has its own notice (the agent's, which says
+      // sub-sessions are off too): one message, not two.
+      if (!((err as { cause?: unknown }).cause instanceof DbDamagedError)) this.noticeOwner(ownerT("subsessions")("tableUnreadable"));
       return;
     }
     try {

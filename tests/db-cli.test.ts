@@ -51,7 +51,7 @@ describe("tomo db check", () => {
     store().setPendingNotes("dm:alice", ["a", "b"]);
     const r = await run(["check"]);
     expect(r.exitCodes).toEqual([]);
-    expect(r.logs.join("\n")).toMatch(/Schema version: 2/);
+    expect(r.logs.join("\n")).toMatch(/Schema version: 3/);
     expect(r.logs.join("\n")).toContain("pending_notes: 2 row(s)");
     expect(r.logs.join("\n")).toContain("integrity_check: ok");
   });

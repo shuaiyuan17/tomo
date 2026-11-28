@@ -1,4 +1,4 @@
-import { closeSync, constants, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, rmSync, unlinkSync } from "node:fs";
+import { closeSync, constants, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, rmSync, statSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 import { isEnoent } from "../fs-utils.js";
 import { log } from "../logger.js";
@@ -133,6 +133,31 @@ export class TomoDb {
     }
   }
 
+  /**
+   * Run `fn`'s reads against one snapshot (a deferred read transaction), so
+   * statements in it cannot see two states of the database. Inside a write
+   * transaction it simply runs (that one is a snapshot already). Read-only
+   * connections may use it. Synchronous only.
+   */
+  snapshot<T>(fn: () => T): T {
+    if (this.inTransaction) return fn();
+    this.db.exec("BEGIN");
+    this.inTransaction = true;
+    try {
+      const result = fn();
+      if (result && typeof (result as { then?: unknown }).then === "function") {
+        throw new Error("TomoDb.snapshot callbacks must be synchronous");
+      }
+      this.db.exec("COMMIT");
+      return result;
+    } catch (err) {
+      try { this.db.exec("ROLLBACK"); } catch { /* nothing was written */ }
+      throw err;
+    } finally {
+      this.inTransaction = false;
+    }
+  }
+
   /** `PRAGMA quick_check` (or the full `integrity_check`): `["ok"]` when sound. */
   check(full = false): string[] {
     const rows = this.db.prepare(full ? "PRAGMA integrity_check" : "PRAGMA quick_check").all();
@@ -173,6 +198,18 @@ export function dbFamily(path: string): string[] {
   return [path, ...DB_SIDECAR_SUFFIXES.map((s) => `${path}${s}`)];
 }
 
+let durabilityRelaxed = false;
+
+/**
+ * TESTS ONLY: connections opened from now on in this process do not fsync.
+ * For tests that model a crash as a process that stops writing, not as a disk
+ * losing what was committed, and would spend most of their time in fsync (the
+ * sub-session model test). Never called by Tomo itself.
+ */
+export function relaxDurabilityForTests(): void {
+  durabilityRelaxed = true;
+}
+
 function connect(path: string, opts: OpenOptions): SqliteDatabase {
   const { DatabaseSync } = loadNodeSqlite();
   const db = new DatabaseSync(path, { readOnly: opts.readOnly === true, timeout: opts.busyTimeoutMs ?? DB_BUSY_TIMEOUT_MS });
@@ -185,7 +222,9 @@ function connect(path: string, opts: OpenOptions): SqliteDatabase {
       // first start) would fail with "database is locked". Wait for it here.
       enableWal(db, opts.busyTimeoutMs ?? DB_BUSY_TIMEOUT_MS);
     }
-    db.exec("PRAGMA synchronous=FULL; PRAGMA fullfsync=1; PRAGMA checkpoint_fullfsync=1; PRAGMA foreign_keys=ON");
+    db.exec(durabilityRelaxed
+      ? "PRAGMA synchronous=OFF; PRAGMA foreign_keys=ON"
+      : "PRAGMA synchronous=FULL; PRAGMA fullfsync=1; PRAGMA checkpoint_fullfsync=1; PRAGMA foreign_keys=ON");
     return db;
   } catch (err) {
     db.close();
@@ -306,6 +345,48 @@ export class DbDamagedError extends Error {
     super(`${path} is damaged (${(cause as Error)?.message ?? cause}). Stop Tomo and run \`tomo db repair\` to copy it aside and start a fresh one; \`tomo db check\` shows the damage.`, { cause });
     this.name = "DbDamagedError";
   }
+}
+
+// --- Shared connections -----------------------------------------------------
+
+/**
+ * One writable connection per database file per process, reopened when the
+ * file at the path is no longer the one it was opened on (a test that deletes
+ * its temp directory, a repaired database). Stores are created per call (every
+ * MCP handler, `tomo cron`, the web process); a connection each would leave
+ * handles for the GC to find, and run `quick_check` every time. Stores that
+ * share one connection can also write in one transaction.
+ */
+const connections = new Map<string, { db: TomoDb; identity: string }>();
+
+/** Which file is at `path` (device, inode, birth time: an inode number alone can be reused), or null when none. */
+function fileIdentity(path: string): string | null {
+  try {
+    const st = statSync(path);
+    return `${st.dev}:${st.ino}:${st.birthtimeMs}`;
+  } catch (err) {
+    if (isEnoent(err)) return null;
+    throw err;
+  }
+}
+
+/** This process's writable connection to the database at `path` (opened, and migrated, on first use). */
+export function sharedTomoDb(path: string): TomoDb {
+  const cached = connections.get(path);
+  if (cached && cached.identity === fileIdentity(path)) return cached.db;
+  if (cached) {
+    cached.db.close();
+    connections.delete(path);
+  }
+  const db = openTomoDb(path);
+  connections.set(path, { db, identity: fileIdentity(path) ?? "" });
+  return db;
+}
+
+/** Close the shared connections (tests that remove their database). */
+export function closeSharedTomoDbs(): void {
+  for (const { db } of connections.values()) db.close();
+  connections.clear();
 }
 
 // --- Repair -----------------------------------------------------------------

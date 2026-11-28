@@ -801,7 +801,13 @@ describe("sub-session service, model-based", () => {
         // performance.now() is not faked: this is the test's real run time.
         // Not once a run has failed: the runs that shrink it are all made.
         if (++ran > REGRESSIONS.length && !failed && performance.now() - began > TIME_LIMIT_MS) { skipped += 1; return; }
-        const violations = await runOps(ops, cfg);
+        let violations: string[];
+        try {
+          violations = await runOps(ops, cfg);
+        } catch (err) {
+          failed = true;
+          throw err;
+        }
         if (violations.length > 0) failed = true;
         expect(violations).toEqual([]);
       }),

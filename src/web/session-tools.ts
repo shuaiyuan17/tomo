@@ -6,7 +6,6 @@ import { PAGE_BYTES, readLine, readWindow, type ToolRedaction } from "./subagent
 import { isSidechainLine, mayHoldToolBlocks, reportUnreadable, SDK_SESSION_ID, sessionTranscriptFile, type Problem } from "./sdk-transcript.js";
 import { redactText, redactToolInput } from "./redact-command.js";
 import { isPrivateMemoryAccess } from "../agent/private-memory-access.js";
-import { landsInPrivate } from "../agent/private-memory-reach.js";
 import type { CallItem, SessionTools, SubagentItem } from "./protocol.js";
 import { failureReason, toolOutcome } from "./activity.js";
 
@@ -47,7 +46,7 @@ function redaction(scope: PrivateScope): ToolRedaction {
     : undefined;
   // No workspace known: any mention of memory/private withholds (fail closed).
   const reaches = (name: string, input: Record<string, unknown>) =>
-    memoryToolReachesPrivate(name, input, ctx) || (ctx ? isPrivateMemoryAccess(name, input, ctx) : false) || /memory[/\\]private/i.test(JSON.stringify(input));
+    isMemoryTool(name) || memoryToolReachesPrivate(name, input) || (ctx ? isPrivateMemoryAccess(name, input, ctx) : false) || /memory[/\\]private/i.test(JSON.stringify(input));
   return {
     // A file/search tool aimed at memory/private shows its name and its
     // (redacted) path only: no old_string/new_string/content/pattern body,
@@ -74,13 +73,23 @@ const PATH_TOOLS: Record<string, readonly string[]> = {
 };
 
 /**
+ * In a group's conversation every memory call is treated as reaching private
+ * memory: its input keeps only its path(s), its output is withheld, it has no
+ * card. Whether a path reaches private/ can hinge on a link on disk, which can
+ * change after the call (and the store refuses links anyway); judging it at
+ * read time could later show what a group call wrote. A group's own memory
+ * writes are few and stay in its folder; the owner's chat shows them all.
+ */
+const isMemoryTool = (name: string) => /^mcp__tomo-internal__memory_/.test(name);
+
+/**
  * The memory tools address memory/ by a relative path ("private/travel.md"),
  * which the file-tool predicate does not see: one whose path (or a move's
  * either end, or a list's prefix) lands in private/ reaches it. Normalised and
  * case-folded (the disk may not tell case apart); the store refuses links, so
  * the spelled path is the real one.
  */
-function memoryToolReachesPrivate(name: string, input: Record<string, unknown>, ctx?: { cwd: string; memoryDir: string; privateDir: string }): boolean {
+function memoryToolReachesPrivate(name: string, input: Record<string, unknown>): boolean {
   if (!/^mcp__tomo-internal__memory_/.test(name)) return false;
   return ["path", "from", "to", "prefix"].some((key) => {
     const value = input[key];
@@ -88,8 +97,7 @@ function memoryToolReachesPrivate(name: string, input: Record<string, unknown>, 
     // Trimmed first, as the store trims a path before it resolves it.
     const rel = posix.normalize(value.trim().replace(/\\/g, "/").replace(/^\/+/, ""));
     if (rel.toLowerCase() === "private" || rel.toLowerCase().startsWith("private/")) return true;
-    // A link inside memory/ that leads into private/ (the store refuses to follow it, but the call's input would still show): resolved on disk.
-    return !!ctx && landsInPrivate(join(ctx.memoryDir, rel), ctx);
+    return false;
   });
 }
 

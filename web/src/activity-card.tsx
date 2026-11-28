@@ -495,11 +495,12 @@ function MemoryCard({ rows, running, raw }: { rows: MemoryRow[]; running: boolea
   const done = states.filter((s) => s === "done").length;
   const unknown = states.filter((s) => s === "unknown").length;
   let head: { k: string; values?: Record<string, string> };
-  if (state === "running" || state === "unknown") head = { k: MEMORY_HEADS.working };
+  if (state === "running" || (state === "unknown" && rows.length === 1)) head = { k: MEMORY_HEADS.working };
   else if (state === "error") head = { k: rows.length === 1 ? MEMORY_HEADS.failed : MEMORY_HEADS.noneWent };
   else if (rows.length === 1) head = { k: memoryAction(rows[0].activity).head };
   else {
-    const changes = t("card.memoryChanges", { count: done });
+    // Several, none running: what happened to each, counted (changes, failures, calls without a result).
+    const changes = done ? t("card.memoryChanges", { count: done }) : t("card.memoryChanges", { count: 0 });
     const extra = [failed ? t("card.memoryFailedCount", { count: failed }) : "", unknown ? t("card.todoParts.unknown", { count: unknown }) : ""].filter(Boolean);
     head = { k: MEMORY_HEADS.counted, values: { text: [changes, ...extra].join(" · ") } };
   }

@@ -426,6 +426,10 @@ describe("memory cards", () => {
     const block = groupRows(viewRows(items)).find((b) => b.kind === "card");
     const shown = block?.kind === "card" ? renderToStaticMarkup(createElement(ActivityCard, { rows: block.rows, running: false, rawOpen: false, onRawOpen: () => undefined })) : "";
     expect(shown).toContain("Memory · 3 changes · 1 without a result");
+    const lost = [...call(edit, { isError: true, reason: "a" }), ...call(edit, { isError: true, reason: "b" }), ...call(edit, { isError: true, reason: "c" }), ...call(del)];
+    const b2 = groupRows(viewRows(lost)).find((b) => b.kind === "card");
+    const html = b2?.kind === "card" ? renderToStaticMarkup(createElement(ActivityCard, { rows: b2.rows, running: false, rawOpen: false, onRawOpen: () => undefined })) : "";
+    expect(html).toContain("Memory · 0 changes · 3 failed · 1 without a result");
   });
   it("saved over budget: the tool's note in warn", () => {
     expect(card(row(call(edit, { outcome: { note: "MEMORY.md is now 210 lines, over its budget." } })))).toMatch(/text-warn[^>]*>MEMORY.md is now 210 lines/);

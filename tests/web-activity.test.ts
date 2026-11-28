@@ -257,7 +257,7 @@ describe("the main chat's tool items carry activity and outcome", () => {
     expect(toolActivity(I("memory_move"), { from: "a.md", to: "b.md" })).toEqual({ kind: "memory_move", from: "a.md", to: "b.md" });
     expect(toolActivity(I("memory_search"), { query: "kyoto" })).toEqual({ kind: "memory_search", query: "kyoto" });
   });
-  it("a group: a memory tool aimed at private/ (however spelled) has no activity and keeps only its path", () => {
+  it("a group: a memory call has no activity and keeps only its path, wherever it points", () => {
     for (const input of [{ path: "private/notes.md", old: "secret", new: "x" }, { path: "./Private/../private/a.md", old: "s", new: "x" },
       { path: "work/../private/a.md", old: "s", new: "x" }, { path: " private/notes.md ", old: "secret", new: "x" }]) {
       const [call] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m1", name: I("memory_str_replace"), input }]), 0, { workspaceDir: "/w" });
@@ -266,8 +266,10 @@ describe("the main chat's tool items carry activity and outcome", () => {
     }
     const [moved] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m2", name: I("memory_move"), input: { from: "a.md", to: "private/a.md" } }]), 0, { workspaceDir: "/w" });
     expect(moved.kind === "tool" && moved.activity).toBeUndefined();
-    const [open] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m3", name: I("memory_str_replace"), input: { path: "work/a.md", old: "o", new: "n" } }]), 0, { workspaceDir: "/w" });
-    expect(open.kind === "tool" && open.activity).toMatchObject({ kind: "memory_str_replace" });
+    // Every memory call in a group: path only, no card (a link's target can change after the call).
+    const [open] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m3", name: I("memory_str_replace"), input: { path: "groups/club/a.md", old: "o-text", new: "n" } }]), 0, { workspaceDir: "/w" });
+    expect(open.kind === "tool" && open.activity).toBeUndefined();
+    expect(open.kind === "tool" && open.input).not.toContain("o-text");
     // A link inside memory/ into private/: resolved on disk.
     const ws = mkdtempSync(join(ROOT, "ws-"));
     mkdirSync(join(ws, "memory", "private"), { recursive: true });

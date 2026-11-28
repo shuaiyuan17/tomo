@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -14,6 +14,8 @@ import { buildTodoTools } from "../src/mcp/todo-tools.js";
 import { buildCronTools } from "../src/mcp/cron-tools.js";
 import { TodoStore } from "../src/todos/store.js";
 import { buildPetTools } from "../src/mcp/pet-tools.js";
+import { buildMemoryTools } from "../src/mcp/memory-tools.js";
+import { MemoryStore } from "../src/memory/store.js";
 import { PetStore } from "../src/mcp/pet-store.js";
 import { DEFAULT_SUBSESSIONS } from "../src/config.js";
 import type { SubagentItem } from "../src/web/protocol.js";
@@ -117,6 +119,32 @@ describe("toolOutcome reads what the real tools return", () => {
       .toBe("That path is outside the group's folder.");
   });
 
+  it("memory tools: writes, a move, a delete, reads, a list and a search", async () => {
+    const dir = mkdtempSync(join(ROOT, "memory-"));
+    const store = new MemoryStore({ memoryDir: join(dir, "memory"), historyDir: join(dir, "history") });
+    const tools = buildMemoryTools({ store: () => store, access: () => ({ privateBarred: false, canWrite: true, canWriteCore: true }) });
+    const topic = "---\ndescription: Trips\n---\nKyoto in May\n";
+    expect(toolOutcome(I("memory_write"), textOf(await run(tools, "memory_write", { path: "travel.md", content: topic, if_version: "new" })))).toEqual({});
+    expect(toolOutcome(I("memory_str_replace"), textOf(await run(tools, "memory_str_replace", { path: "travel.md", old: "May", new: "June" })))).toEqual({});
+    expect(toolOutcome(I("memory_append"), textOf(await run(tools, "memory_append", { path: "travel.md", content: "Osaka after\n" })))).toEqual({});
+    expect(toolOutcome(I("memory_read"), textOf(await run(tools, "memory_read", { path: "travel.md" })))).toEqual({ count: 6 });
+    expect(toolOutcome(I("memory_read"), textOf(await run(tools, "memory_read", { path: "travel.md", offset: 2, limit: 1 })))).toEqual({ count: 1 });
+    expect(toolOutcome(I("memory_list"), textOf(await run(tools, "memory_list", {})))).toEqual({ count: 1 });
+    expect(toolOutcome(I("memory_list"), textOf(await run(tools, "memory_list", { prefix: "work/" })))).toEqual({ count: 0 });
+    expect(toolOutcome(I("memory_search"), textOf(await run(tools, "memory_search", { query: "osaka" })))).toEqual({ count: 1 });
+    expect(toolOutcome(I("memory_search"), textOf(await run(tools, "memory_search", { query: "lisbon" })))).toEqual({ count: 0 });
+    expect(toolOutcome(I("memory_move"), textOf(await run(tools, "memory_move", { from: "travel.md", to: "trips.md" })))).toEqual({});
+    const listed = textOf(await run(tools, "memory_list", {}));
+    const version = /\(version (\S+)\)/.exec(listed)![1];
+    expect(toolOutcome(I("memory_delete"), textOf(await run(tools, "memory_delete", { path: "trips.md", if_version: version })))).toEqual({});
+    const refused = await run(tools, "memory_str_replace", { path: "nope.md", old: "a", new: "b" });
+    expect(refused.isError).toBe(true);
+    expect(failureReason(I("memory_str_replace"), textOf(refused))).not.toMatch(/^memory_str_replace/);
+    // Over its budget: saved, with the tool's note.
+    const big = await run(tools, "memory_write", { path: "MEMORY.md", content: "- line\n".repeat(210), if_version: "new" });
+    expect(toolOutcome(I("memory_write"), textOf(big))).toMatchObject({ note: expect.stringMatching(/budget/) });
+  });
+
   it("pet tools: an egg or a full pet is a no-op, a feed is its mood", async () => {
     const path = join(mkdtempSync(join(ROOT, "pet-")), "pet.json");
     const tools = buildPetTools(path);
@@ -216,6 +244,45 @@ describe("the main chat's tool items carry activity and outcome", () => {
   it("a subagent's transcript (no outcome pairing there) gets no activity: its rows stay plain", () => {
     expect(itemsFromLine(line("assistant", [{ type: "tool_use", id: "x", name: I("schedule_remove"), input: { id: "ab12" } }]), 0)[0])
       .not.toHaveProperty("activity");
+  });
+  it("memory tools read their input: clipped snippets, line counts, a new file", () => {
+    expect(toolActivity(I("memory_write"), { path: "a.md", content: "x\ny", if_version: "new" })).toEqual({ kind: "memory_write", path: "a.md", created: true, chars: 3 });
+    expect(toolActivity(I("memory_str_replace"), { path: "a.md", old: "o".repeat(200), new: "n" })).toMatchObject({ old: "o".repeat(80), new: "n" });
+    expect(toolActivity(I("memory_append"), { path: "j.md", content: "a\nb\nc\n", create: true })).toEqual({ kind: "memory_append", path: "j.md", lines: 3 });
+    // A path the card cannot show exactly is not linked.
+    expect(toolActivity(I("memory_delete"), { path: "work/my  notes.md" })).toMatchObject({ pathAltered: true });
+    expect(toolActivity(I("memory_delete"), { path: " work/a.md " })).not.toHaveProperty("pathAltered");
+    expect(toolActivity(I("memory_delete"), { path: "./work/a.md" })).toMatchObject({ pathAltered: true });
+    expect(toolActivity(I("memory_move"), { from: "a.md", to: "work/../b.md" })).toMatchObject({ pathAltered: true });
+    expect(toolActivity(I("memory_move"), { from: "a.md", to: "b.md" })).toEqual({ kind: "memory_move", from: "a.md", to: "b.md" });
+    expect(toolActivity(I("memory_search"), { query: "kyoto" })).toEqual({ kind: "memory_search", query: "kyoto" });
+  });
+  it("a group: a memory call has no activity and keeps only its path, wherever it points", () => {
+    for (const input of [{ path: "private/notes.md", old: "secret", new: "x" }, { path: "./Private/../private/a.md", old: "s", new: "x" },
+      { path: "work/../private/a.md", old: "s", new: "x" }, { path: " private/notes.md ", old: "secret", new: "x" }]) {
+      const [call] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m1", name: I("memory_str_replace"), input }]), 0, { workspaceDir: "/w" });
+      expect(call.kind === "tool" && call.activity).toBeUndefined();
+      expect(call.kind === "tool" && call.input).not.toContain("secret");
+    }
+    const [moved] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m2", name: I("memory_move"), input: { from: "a.md", to: "private/a.md" } }]), 0, { workspaceDir: "/w" });
+    expect(moved.kind === "tool" && moved.activity).toBeUndefined();
+    // Every memory call in a group: path only, no card (a link's target can change after the call).
+    const [open] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m3", name: I("memory_str_replace"), input: { path: "groups/club/a.md", old: "o-text", new: "n" } }]), 0, { workspaceDir: "/w" });
+    expect(open.kind === "tool" && open.activity).toBeUndefined();
+    expect(open.kind === "tool" && open.input).not.toContain("o-text");
+    // A link inside memory/ into private/: resolved on disk.
+    const ws = mkdtempSync(join(ROOT, "ws-"));
+    mkdirSync(join(ws, "memory", "private"), { recursive: true });
+    symlinkSync(join(ws, "memory", "private"), join(ws, "memory", "alias"));
+    const [linked] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m5", name: I("memory_str_replace"), input: { path: "alias/notes.md", old: "secret", new: "x" } }]), 0, { workspaceDir: ws });
+    expect(linked.kind === "tool" && linked.activity).toBeUndefined();
+    expect(linked.kind === "tool" && linked.input).not.toContain("secret");
+    const [search] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m6", name: I("memory_search"), input: { query: "private diagnosis" } }]), 0, { workspaceDir: "/w" });
+    expect(search.kind === "tool" && search.activity).toBeUndefined();
+    expect(JSON.stringify(search)).not.toContain("diagnosis");
+    // The owner's own chat: private is theirs.
+    const [own] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m4", name: I("memory_str_replace"), input: { path: "private/a.md", old: "o", new: "n" } }]), 0, { owner: true });
+    expect(own.kind === "tool" && own.activity).toMatchObject({ kind: "memory_str_replace", path: "private/a.md" });
   });
   it("a group: a call that reaches memory/private has no activity, and its output no outcome", () => {
     const privateCall = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "p1", name: I("task_message"),

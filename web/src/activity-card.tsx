@@ -1,5 +1,5 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ArrowRightIcon, BracesIcon, CheckIcon, CircleCheckIcon, CircleHelpIcon, ClockIcon, FileIcon, PlusIcon, Trash2Icon, UserRoundIcon } from "lucide-react";
+import { ArrowRightIcon, BracesIcon, FilePlusIcon, FileXIcon, FolderInputIcon, NotebookPenIcon, PencilLineIcon, TextCursorInputIcon, CheckIcon, CircleCheckIcon, CircleHelpIcon, ClockIcon, FileIcon, PlusIcon, Trash2Icon, UserRoundIcon } from "lucide-react";
 import type { ToolActivity, ToolOutcome, WebSubsession } from "../../src/web/protocol.js";
 import { cn } from "@/lib/utils";
 import { ToolSection } from "@/components/ai/tool";
@@ -13,7 +13,7 @@ import { asksOwner, isOpenSubsession, isWorkingState, subsessionState, subsessio
 import { callDuration, elapsedSince, type ToolRow } from "./subagent.js";
 import { useNow } from "./use-now.js";
 import { formatLocale, i18n, Trans, useTranslation } from "./i18n/index.js";
-import { cronJobHash } from "./study-data.js";
+import { cronJobHash, memoryFileHash } from "./study-data.js";
 import { formatList } from "./i18n/format.js";
 
 /** Keys this file picks at runtime (tests/i18n-catalogs.test.ts). */
@@ -424,6 +424,95 @@ function CredentialCard({ row, state, raw }: CardProps & { row: ToolRow & { acti
   </Card>;
 }
 
+type MemoryKind = "memory_write" | "memory_str_replace" | "memory_append" | "memory_move" | "memory_delete";
+type MemoryRow = ToolRow & { activity: Extract<ToolActivity, { kind: MemoryKind }> };
+/** What a memory write did, for its line: the action's word and icon, and its card's head when it is alone. */
+const MEMORY_ACTIONS = {
+  create: { icon: FilePlusIcon, head: "card.memoryCreated" }, write: { icon: NotebookPenIcon, head: "card.memoryRewrote" },
+  edit: { icon: PencilLineIcon, head: "card.memoryEdited" }, append: { icon: TextCursorInputIcon, head: "card.memoryAppended" },
+  move: { icon: FolderInputIcon, head: "card.memoryMoved" }, delete: { icon: FileXIcon, head: "card.memoryDeleted" },
+} as const;
+const MEMORY_HEADS = { working: "card.memoryWorking", failed: "card.memoryFailed", noneWent: "card.memoryNoneWent", counted: "card.memoryHead" } as const;
+function memoryAction(activity: MemoryRow["activity"]) {
+  const word: keyof typeof MEMORY_ACTIONS = activity.kind === "memory_write" ? (activity.created ? "create" : "write") : activity.kind === "memory_str_replace" ? "edit"
+    : activity.kind === "memory_append" ? "append" : activity.kind === "memory_move" ? "move" : "delete";
+  return { word, ...MEMORY_ACTIONS[word] };
+}
+const MEMORY_WORDS = { create: "card.memoryAction.create", write: "card.memoryAction.write", edit: "card.memoryAction.edit", append: "card.memoryAction.append",
+  move: "card.memoryAction.move", delete: "card.memoryAction.delete" } as const;
+
+/** A memory path: monospace, relative to memory/, a link to it in the Study's Memory tab (not under private/, which the Study does not open). */
+function MemoryPath({ path, gone }: { path: string; gone?: boolean }) {
+  const { t } = useTranslation("activity");
+  const text = <span className="font-mono text-[12.5px] [overflow-wrap:anywhere]">{path}</span>;
+  if (gone) return text;
+  const hash = memoryFileHash(path);
+  return hash === "#study/memory" ? text
+    : <a href={hash} title={t("card.memoryOpen", { path })} className="text-foreground underline decoration-foreground/25 underline-offset-2 hover:decoration-foreground/60">{text}</a>;
+}
+
+function MemoryLine({ row, state }: { row: MemoryRow; state: CardState }) {
+  const { t } = useTranslation("activity");
+  const activity = row.activity;
+  const action = memoryAction(activity);
+  const Icon = state === "running" ? RunningMark : state === "unknown" ? CircleHelpIcon : action.icon;
+  const note = row.result?.outcome?.note;
+  let small: ReactNode = null;
+  // What it changed, only once it did: running, refused or without a result, the line claims nothing.
+  if (state === "done") {
+    switch (activity.kind) {
+      case "memory_write": small = activity.created ? t("card.memoryNew") : t("card.memoryReplaced"); break;
+      case "memory_str_replace": small = <><span className="line-through decoration-muted-foreground/50">“{activity.old}”</span> → “{activity.new}”</>; break;
+      // Not "new file": `create` only allows creating one; the result does not say whether it did.
+      case "memory_append": small = t("card.memoryAdded", { count: activity.lines }); break;
+      case "memory_delete": small = t("card.memoryKept"); break;
+      default: break;
+    }
+  }
+  return <li data-memory-line={action.word} data-state={state} className="flex min-w-0 gap-2 py-0.5">
+    <span aria-hidden="true" className={cn("mt-[3px] grid size-3.5 shrink-0 place-items-center [&_svg]:size-3.5", state === "error" ? "text-destructive" : "text-muted-foreground")}><Icon /></span>
+    <div className="min-w-0 flex-1">
+      <p className={cn("m-0 text-[13px] leading-snug", state === "error" ? "text-destructive" : "text-foreground", state === "running" && "shimmer")}>
+        <span className="mr-1.5 text-[12px] text-muted-foreground">{t(MEMORY_WORDS[action.word])}</span>
+        <span className="sr-only">({t(LINE_STATE[state])}) </span>
+        {activity.kind === "memory_move" ? <><MemoryPath path={activity.from} gone /> → <MemoryPath path={activity.to} gone={state !== "done" || !!activity.pathAltered} /></>
+          : <MemoryPath path={activity.path} gone={activity.kind === "memory_delete" || state !== "done" || !!activity.pathAltered} />}</p>
+      {state === "error" && row.result?.reason && <p className="m-0 mt-0.5 text-[12px] text-destructive [overflow-wrap:anywhere]">{row.result.reason}</p>}
+      {small && <p className="m-0 mt-0.5 text-[12px] text-muted-foreground [overflow-wrap:anywhere]">{small}</p>}
+      {state === "done" && note && <p className="m-0 mt-0.5 text-[12px] text-warn [overflow-wrap:anywhere]">{note}</p>}
+      {state === "unknown" && <p className="m-0 mt-0.5 text-[12px] text-muted-foreground">{t("card.unknown")}</p>}
+    </div>
+  </li>;
+}
+
+/** Memory writes in a row: one card, a line each (the first three, then "N more"); a refused one is a red line in it. */
+function MemoryCard({ rows, running, raw }: { rows: MemoryRow[]; running: boolean; raw: CardProps["raw"] }) {
+  const { t } = useTranslation("activity");
+  const [all, setAll] = useState(false);
+  const states = rows.map((row) => stateOf(row, running));
+  const state = stateOfAll(rows, running);
+  const failed = states.filter((s) => s === "error").length;
+  const done = states.filter((s) => s === "done").length;
+  const unknown = states.filter((s) => s === "unknown").length;
+  let head: { k: string; values?: Record<string, string> };
+  if (state === "running" || (state === "unknown" && rows.length === 1)) head = { k: MEMORY_HEADS.working };
+  else if (state === "error") head = { k: rows.length === 1 ? MEMORY_HEADS.failed : MEMORY_HEADS.noneWent };
+  else if (rows.length === 1) head = { k: memoryAction(rows[0].activity).head };
+  else {
+    // Several, none running: what happened to each, counted (changes, failures, calls without a result).
+    const changes = done ? t("card.memoryChanges", { count: done }) : t("card.memoryChanges", { count: 0 });
+    const extra = [failed ? t("card.memoryFailedCount", { count: failed }) : "", unknown ? t("card.todoParts.unknown", { count: unknown }) : ""].filter(Boolean);
+    head = { k: MEMORY_HEADS.counted, values: { text: [changes, ...extra].join(" · ") } };
+  }
+  const shown = all ? rows : rows.slice(0, TODO_LINES);
+  return <Card rows={rows} state={state} head={head} {...raw}>
+    <ul className="m-0 mt-1.5 list-none space-y-1 p-0">{shown.map((row) => <MemoryLine key={row.id} row={row} state={stateOf(row, running)} />)}</ul>
+    {rows.length > TODO_LINES && <button type="button" onClick={() => setAll((v) => !v)} aria-expanded={all}
+      className="mt-1 rounded px-1 text-[11.5px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline">
+      {all ? t("card.showLess") : t("card.moreLines", { count: rows.length - TODO_LINES })}</button>}
+  </Card>;
+}
+
 interface CardProps { row: ToolRow; state: CardState; raw: { rawOpen: boolean; onRawOpen: (open: boolean) => void } }
 
 /** A card for `rows` (one call, or a run of the same kind), or null when they are not a card's (the caller shows lines). */
@@ -436,6 +525,11 @@ export function ActivityCard({ rows, running, rawOpen, onRawOpen }: { rows: read
     case "todo_add": case "todo_resolve": {
       const todos = rows.flatMap((r) => { const a = knownActivity(r); return a && (a.kind === "todo_add" || a.kind === "todo_resolve") ? [{ ...r, activity: a }] : []; });
       return <TodoCard rows={todos} running={running} raw={props.raw} />;
+    }
+    case "memory_write": case "memory_str_replace": case "memory_append": case "memory_move": case "memory_delete": {
+      const writes = rows.flatMap((r) => { const a = knownActivity(r); return a && (a.kind === "memory_write" || a.kind === "memory_str_replace" || a.kind === "memory_append"
+        || a.kind === "memory_move" || a.kind === "memory_delete") ? [{ ...r, activity: a }] : []; });
+      return <MemoryCard rows={writes} running={running} raw={props.raw} />;
     }
     case "schedule_create": return <ScheduleCard row={{ ...row, activity }} {...props} />;
     case "request_permission": return <PermissionCard row={{ ...row, activity }} {...props} />;

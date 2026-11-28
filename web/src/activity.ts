@@ -1,5 +1,5 @@
-import { BanIcon, CalendarClockIcon, CircleCheckIcon, CornerDownRightIcon, HistoryIcon, HouseIcon, KeyRoundIcon, LayersIcon, ListChecksIcon,
-  ListIcon, PawPrintIcon, SendIcon, ShieldQuestionIcon, SmilePlusIcon, UserRoundIcon, type LucideIcon } from "lucide-react";
+import { BanIcon, BookOpenIcon, CalendarClockIcon, CircleCheckIcon, CornerDownRightIcon, HistoryIcon, HouseIcon, KeyRoundIcon, LayersIcon, ListChecksIcon,
+  ListIcon, NotebookPenIcon, PawPrintIcon, SearchIcon, SendIcon, ShieldQuestionIcon, SmilePlusIcon, UserRoundIcon, type LucideIcon } from "lucide-react";
 import type { ToolActivity } from "../../src/web/protocol.js";
 import type { ToolRow } from "./subagent.js";
 import { i18n } from "./i18n/index.js";
@@ -28,7 +28,8 @@ export function knownActivity(row: Pick<ToolRow, "activity" | "result">): ToolAc
 }
 
 /** What a call did, for the fold's summary ("fed the pet, checked a task"). */
-export type ActivityKind = "task" | "taskCheck" | "message" | "reaction" | "todo" | "schedule" | "ask" | "recall" | "pet" | "home" | "rollup" | "people" | "lookup";
+export type ActivityKind = "task" | "taskCheck" | "message" | "reaction" | "todo" | "schedule" | "ask" | "recall" | "pet" | "home" | "rollup" | "people" | "lookup"
+  | "memory" | "memoryRead" | "memorySearch";
 
 /** Per tool: its icon and what it counts as in a fold. */
 const KINDS: Record<ToolActivity["kind"], { icon: LucideIcon; kind: ActivityKind }> = {
@@ -45,17 +46,25 @@ const KINDS: Record<ToolActivity["kind"], { icon: LucideIcon; kind: ActivityKind
   pet_sleep: { icon: PawPrintIcon, kind: "pet" }, pet_hatch: { icon: PawPrintIcon, kind: "pet" },
   home_check: { icon: HouseIcon, kind: "home" }, recall_conversation: { icon: HistoryIcon, kind: "recall" },
   lcm_rollup: { icon: LayersIcon, kind: "rollup" }, upsert_person: { icon: UserRoundIcon, kind: "people" },
+  memory_write: { icon: NotebookPenIcon, kind: "memory" }, memory_str_replace: { icon: NotebookPenIcon, kind: "memory" },
+  memory_append: { icon: NotebookPenIcon, kind: "memory" }, memory_move: { icon: NotebookPenIcon, kind: "memory" },
+  memory_delete: { icon: NotebookPenIcon, kind: "memory" }, memory_read: { icon: BookOpenIcon, kind: "memoryRead" },
+  memory_list: { icon: BookOpenIcon, kind: "memoryRead" }, memory_search: { icon: SearchIcon, kind: "memorySearch" },
 };
 
 /** Tools shown as a card in the chat (activity-card.tsx); every other internal tool is a line. */
 const CARD_KINDS = new Set<ToolActivity["kind"]>(["task_spawn", "task_message", "task_cancel", "send_message",
-  "todo_add", "todo_resolve", "schedule_create", "request_permission", "request_credential"]);
-/** Kinds whose cards in a row merge into one (3 todo_resolve calls: one card, a line each). */
-const MERGING = new Set<ToolActivity["kind"]>(["todo_add", "todo_resolve"]);
-/** The card `row` joins when it follows `previous` directly: both to-do calls. */
+  "todo_add", "todo_resolve", "schedule_create", "request_permission", "request_credential",
+  "memory_write", "memory_str_replace", "memory_append", "memory_move", "memory_delete"]);
+/** Families whose cards in a row merge into one (3 todo_resolve calls: one card, a line each; so do memory writes). */
+const MERGING: Partial<Record<ToolActivity["kind"], "todo" | "memory">> = {
+  todo_add: "todo", todo_resolve: "todo",
+  memory_write: "memory", memory_str_replace: "memory", memory_append: "memory", memory_move: "memory", memory_delete: "memory",
+};
+/** The card `row` joins when it follows `previous` directly: both of one family (to-dos, memory writes). */
 export function mergesWith(previous: Pick<ToolRow, "activity" | "result">, row: Pick<ToolRow, "activity" | "result">): boolean {
   const a = knownActivity(previous); const b = knownActivity(row);
-  return !!a && !!b && MERGING.has(a.kind) && MERGING.has(b.kind);
+  return !!a && !!b && !!MERGING[a.kind] && MERGING[a.kind] === MERGING[b.kind];
 }
 /** Cards a turn shows before the rest fold under "N more activities". */
 export const MAX_TURN_CARDS = 6;
@@ -89,6 +98,9 @@ export function activityKindText(kind: ActivityKind, count: number): string {
     case "taskCheck": return t("activity:kind.taskCheck");
     case "message": return t("activity:kind.message");
     case "reaction": return t("activity:kind.reaction");
+    case "memory": return t("activity:kind.memory");
+    case "memoryRead": return t("activity:kind.memoryRead");
+    case "memorySearch": return t("activity:kind.memorySearch");
     case "todo": return t("activity:kind.todo");
     case "schedule": return t("activity:kind.schedule");
     case "ask": return t("activity:kind.ask");
@@ -165,5 +177,13 @@ export function activityLine(row: Pick<ToolRow, "activity" | "result">): { title
     }
     case "upsert_person": return say(t(outcome?.status === "created" ? "activity:line.personCreated" : "activity:line.personUpdated", { name: activity.name }));
     case "list_people": return say(t("activity:line.listPeople"), count("activity:detail.people"));
+    case "memory_write": return say(t(activity.created ? "activity:line.memoryCreate" : "activity:line.memoryWrite", { path: activity.path }));
+    case "memory_str_replace": return say(t("activity:line.memoryEdit", { path: activity.path }));
+    case "memory_append": return say(t("activity:line.memoryAppend", { path: activity.path }));
+    case "memory_move": return say(t("activity:line.memoryMove", { from: activity.from, to: activity.to }));
+    case "memory_delete": return say(t("activity:line.memoryDelete", { path: activity.path }));
+    case "memory_read": return say(t("activity:line.memoryRead", { path: activity.path }), count("activity:detail.lines"));
+    case "memory_list": return say(activity.prefix ? t("activity:line.memoryListIn", { prefix: activity.prefix }) : t("activity:line.memoryList"), count("activity:detail.files"));
+    case "memory_search": return say(t("activity:line.memorySearch", { query: activity.query }), count("activity:detail.matches"));
   }
 }

@@ -380,3 +380,101 @@ describe("a turn with more than six cards", () => {
     expect(html).toContain('data-activity-card="send_message"');
   });
 });
+
+describe("memory cards", () => {
+  const edit: ToolActivity = { kind: "memory_str_replace", path: "travel.md", old: "Kyoto in May", new: "Kyoto in June" };
+  const created: ToolActivity = { kind: "memory_write", path: "work/cards.md", created: true, chars: 120 };
+  const append: ToolActivity = { kind: "memory_append", path: "private/journal/2026-11-27.md", lines: 6 };
+  const move: ToolActivity = { kind: "memory_move", from: "old.md", to: "archive/old.md" };
+  const del: ToolActivity = { kind: "memory_delete", path: "scratch.md" };
+  const memCard = (items: SubagentItem[], running = false) => {
+    const block = groupRows(viewRows(items)).find((b) => b.kind === "card");
+    return block?.kind === "card" ? renderToStaticMarkup(createElement(ActivityCard, { rows: block.rows, running, rawOpen: false, onRawOpen: () => undefined })) : "";
+  };
+  it("an edit: its head, the path as a link into the Study, and old → new", () => {
+    const shown = card(row(call(edit, { outcome: {} })));
+    expect(shown).toContain('data-activity-card="memory_str_replace"');
+    expect(shown).toContain("Edited memory");
+    expect(shown).toContain('href="#study/memory/travel.md"');
+    expect(shown).toContain("“Kyoto in May”</span> → “Kyoto in June”");
+  });
+  it("a new file, an append, a move, a delete: each says what it did", () => {
+    expect(card(row(call(created, { outcome: {} })))).toMatch(/Created a memory file[\s\S]*href="#study\/memory\/work%2Fcards.md"[\s\S]*New file/);
+    const appended = card(row(call(append, { outcome: {} })));
+    expect(appended).toContain("+6 lines");
+    expect(appended).not.toContain("new file");
+    expect(card(row(call({ kind: "memory_delete", path: "x", pathAltered: true } as ToolActivity, { outcome: {} })))).not.toContain("href=");
+    expect(card(row(call({ ...edit, path: "work/my notes.md", pathAltered: true } as ToolActivity, { outcome: {} })))).not.toContain('href="#study/memory/work');
+    // private/: the Study does not open it, so no link.
+    expect(appended).not.toContain('href="#study/memory/private');
+    expect(card(row(call(move, { outcome: {} })))).toMatch(/Moved a memory file[\s\S]*old\.md[\s\S]*→[\s\S]*archive\/old\.md/);
+    const deleted = card(row(call(del, { outcome: {} })));
+    expect(deleted).toContain("Deleted a memory file");
+    expect(deleted).not.toContain('href="#study/memory/scratch.md"');
+    expect(deleted).toContain("Kept 30 days");
+  });
+  it("without a result: no claim of what it changed; a path clipped through an emoji still renders", () => {
+    const unknown = card(row(call(del)));
+    expect(unknown).not.toContain("Kept 30 days");
+    expect(unknown).toContain("may or may not have happened");
+    expect(card(row(call(edit)))).not.toContain("Kyoto in June");
+    expect(() => card(row(call({ kind: "memory_delete", path: "a\ud83d" } as ToolActivity, { outcome: {} })))).not.toThrow();
+    expect(() => card(row(call({ ...edit, path: "a\ud83d" } as ToolActivity, { outcome: {} })))).not.toThrow();
+  });
+  it("a merged card counts a write without a result in its head", () => {
+    const items = [...call(edit, { outcome: {} }), ...call(created, { outcome: {} }), ...call(move, { outcome: {} }), ...call(del)];
+    const block = groupRows(viewRows(items)).find((b) => b.kind === "card");
+    const shown = block?.kind === "card" ? renderToStaticMarkup(createElement(ActivityCard, { rows: block.rows, running: false, rawOpen: false, onRawOpen: () => undefined })) : "";
+    expect(shown).toContain("Memory · 3 changes · 1 without a result");
+    const lost = [...call(edit, { isError: true, reason: "a" }), ...call(edit, { isError: true, reason: "b" }), ...call(edit, { isError: true, reason: "c" }), ...call(del)];
+    const b2 = groupRows(viewRows(lost)).find((b) => b.kind === "card");
+    const html = b2?.kind === "card" ? renderToStaticMarkup(createElement(ActivityCard, { rows: b2.rows, running: false, rawOpen: false, onRawOpen: () => undefined })) : "";
+    expect(html).toContain("Memory · 0 changes · 3 failed · 1 without a result");
+  });
+  it("saved over budget: the tool's note in warn", () => {
+    expect(card(row(call(edit, { outcome: { note: "MEMORY.md is now 210 lines, over its budget." } })))).toMatch(/text-warn[^>]*>MEMORY.md is now 210 lines/);
+  });
+  it("running and refused", () => {
+    expect(card(row(call(edit)), { running: true })).toContain("Updating memory");
+    const refused = card(row(call(edit, { isError: true, reason: "travel.md changed since you read it." })));
+    expect(refused).toContain("Couldn&#x27;t change memory");
+    expect(refused).toContain("travel.md changed since you read it.");
+    expect(refused).not.toContain("Kyoto in June");
+  });
+  it("writes in a row merge: counted head, a refused one red inside, three lines then N more; to-dos do not join them", () => {
+    const items = [...call(edit, { outcome: {} }), ...call(created, { outcome: {} }), ...call(edit, { isError: true, reason: "No such text." }), ...call(del, { outcome: {} })];
+    expect(groupRows(viewRows(items)).map((b) => b.kind)).toEqual(["card"]);
+    const shown = memCard(items);
+    expect(shown).toContain("Memory · 3 changes · 1 failed");
+    expect(shown.match(/data-memory-line=/g)).toHaveLength(3);
+    expect(shown).toContain("1 more");
+    const mixed = [...call(edit, { outcome: {} }), ...call({ kind: "todo_add", title: "x", next: "y", waitingOn: "me" }, { outcome: { id: "t-1" } })];
+    expect(groupRows(viewRows(mixed)).map((b) => b.kind)).toEqual(["card", "card"]);
+  });
+  it("reads stay lines, with what they found; the fold counts them in words", () => {
+    const read = row(call({ kind: "memory_read", path: "travel.md" }, { outcome: { count: 6 } }));
+    expect(isCardRow(read)).toBe(false);
+    const items = [...call({ kind: "memory_read", path: "a.md" }, { outcome: { count: 6 } }), ...call({ kind: "memory_read", path: "b.md" }, { outcome: { count: 2 } }),
+      ...call({ kind: "memory_search", query: "kyoto" }, { outcome: { count: 3 } })];
+    const [block] = groupRows(viewRows(items));
+    expect(block.kind).toBe("group");
+    const html = renderToStaticMarkup(createElement(TurnBlock, { block: block as Extract<typeof block, { kind: "group" }>, running: false, choices: { [(block as { key: string }).key]: true }, onChoice: () => undefined }));
+    expect(html).toContain("Read memory 2 times, searched memory");
+    expect(html).toContain("searched memory");
+    expect(html).toContain("Read a.md");
+    expect(html).toContain("Searched memory for “kyoto”");
+  });
+});
+
+describe("Study links to a memory file", () => {
+  it("encodes the path, refuses private/, and reads it back", async () => {
+    const { memoryFileHash, memoryPathFromFocus, focusFromHash, viewFromHash } = await import("../web/src/study-data.js");
+    const hash = memoryFileHash("work/a b.md");
+    expect(hash).toBe("#study/memory/work%2Fa%20b.md");
+    expect(viewFromHash(hash)).toBe("memory");
+    expect(memoryPathFromFocus(focusFromHash(hash))).toBe("work/a b.md");
+    expect(memoryFileHash("private/x.md")).toBe("#study/memory");
+    expect(memoryFileHash("Private/x.md")).toBe("#study/memory");
+    expect(focusFromHash("#study/cron/c7f2a91e")).toBe("c7f2a91e");
+  });
+});

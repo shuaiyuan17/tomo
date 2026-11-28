@@ -24,14 +24,14 @@ const { MIXED_AUDIENCE_KEY } = await import("../src/agent/audience.js");
 type ToolResult = { content: Array<{ text: string }>; isError?: boolean };
 type ToolHandle = { name: string; handler: (args: Record<string, unknown>) => Promise<ToolResult> };
 
-function server(key: string, barred: () => boolean, steering?: () => string) {
+function server(key: string, barred: () => boolean, steering?: () => string, parentKey?: string) {
   const agent = {
     isPrivateMemoryBarred: barred,
     isOwnAudienceTurn: () => !barred(),
     scopedCallerKey: (k: string) => steering?.() ?? k,
     turnOwnerMessages: () => [],
     sdkSessionIdFor: () => undefined,
-    subsessions: undefined,
+    subsessions: parentKey === undefined ? undefined : { parentKeyOf: () => parentKey },
     credentialBroker: undefined,
     permissionBroker: {},
   };
@@ -86,6 +86,18 @@ describe("memory tools on the tomo-internal server", () => {
     const s = server("telegram:-100777", () => true);
     expect((await s.call("memory_write", { path: "groups/telegram_-100777/n.md", content: "---\ndescription: N.\n---\nx\n", if_version: "new" })).isError).toBeUndefined();
     expect((await s.call("memory_write", { path: "groups/telegram_-100555/m.md", content: "---\ndescription: N.\n---\nx\n", if_version: "new" })).isError).toBe(true);
+  });
+
+  it("a group-scoped sub-session reads its own group's folder, not another's; an owner-scoped one reads both", async () => {
+    mkdirSync(join(MEM, "groups", "telegram_-100888"), { recursive: true });
+    mkdirSync(join(MEM, "groups", "telegram_-100999"), { recursive: true });
+    writeFileSync(join(MEM, "groups", "telegram_-100888", "a.md"), "---\ndescription: A.\n---\nx\n");
+    writeFileSync(join(MEM, "groups", "telegram_-100999", "b.md"), "---\ndescription: B.\n---\nx\n");
+    const scoped = server("task:s7", () => true, undefined, "telegram:-100888");
+    expect((await scoped.call("memory_read", { path: "groups/telegram_-100888/a.md" })).isError).toBeUndefined();
+    expect((await scoped.call("memory_read", { path: "groups/telegram_-100999/b.md" })).isError).toBe(true);
+    const owners = server("task:s8", () => false, undefined, "dm:alex");
+    expect((await owners.call("memory_read", { path: "groups/telegram_-100999/b.md" })).isError).toBeUndefined();
   });
 
   it("keeps old versions under <tomoHome>/data/memory-history/", async () => {

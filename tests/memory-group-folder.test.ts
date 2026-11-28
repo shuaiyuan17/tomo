@@ -117,6 +117,24 @@ describe("memory tools on a group's turn", () => {
     expect(existsSync(join(tree.mem, "elsewhere", "x.md"))).toBe(false);
   });
 
+  it("checks where a write really lands again after resolving: a folder swapped for a link meanwhile is refused", async () => {
+    mkdirSync(join(tree.mem, "elsewhere"), { recursive: true });
+    const store = new MemoryStore({ memoryDir: tree.mem, historyDir: join(tree.data, "memory-history") });
+    // Swap a folder for a link right after the path was checked, as an outside process could.
+    const internals = store as unknown as { resolve: (...args: unknown[]) => unknown };
+    const resolve = internals.resolve.bind(store);
+    internals.resolve = (...args: unknown[]) => {
+      const r = resolve(...args);
+      symlinkSync(join(tree.mem, "elsewhere"), join(tree.mem, OWN, "late"));
+      return r;
+    };
+    const list = buildMemoryTools({ store: () => store, access: () => GROUP as never }) as unknown as ToolHandle[];
+    const r = await list.find((t) => t.name === "memory_write")!.handler({ path: `${OWN}/late/x.md`, content: topic("X."), if_version: "new" }, {});
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain(groupWriteRefusal(OWN));
+    expect(existsSync(join(tree.mem, "elsewhere", "x.md"))).toBe(false);
+  });
+
   it("writes its folder only as spelled: a case variant is another folder on a case-sensitive disk", async () => {
     const r = await tools(GROUP)("memory_write", { path: `${OWN.toUpperCase()}/x.md`, content: topic("X."), if_version: "new" });
     expect(r.error).toBe(true);

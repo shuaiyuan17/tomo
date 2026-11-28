@@ -1,0 +1,53 @@
+import type { Translation } from "../../../../../src/i18n/catalog.js";
+import type { activity as en } from "../en/activity.js";
+
+/** Tomo 自己的工具（tomo-internal）在聊天里的样子：一句话、折叠行的统计、（之后的）活动卡片。 */
+export const activity = {
+  line: {
+    taskSpawn: "开了一个任务 · {{title}}", taskSpawnId: "开了 {{id}} · {{title}}",
+    taskMessage: "给 {{id}} 带了话", taskMessageHeld: "给 {{id}} 的话先留着",
+    taskCancel: "取消了 {{id}}", taskDone: "把 {{id}} 标成已处理",
+    taskStatusOne: "看了一下 {{id}}", taskStatusAll: "看了一下任务",
+    sendYou: "给你发了消息", sendTo: "给 {{name}} 发了消息", delegateYou: "请你的对话给你写一条", delegateTo: "请 {{name}} 那边写一条",
+    react: "回应了 {{emoji}}", unreact: "撤回了一个回应", edit: "改了一条消息", unsend: "撤回了一条消息", rename: "把群名改成了“{{title}}”",
+    listSessions: "列了对话",
+    todoAdd: "加了一条待办 · {{title}}", todoAddId: "加了 {{id}} · {{title}}",
+    todoDone: "关了 {{id}}", todoDrop: "放弃了 {{id}}", todoSnooze: "推后了 {{id}}", todoHandoff: "把 {{id}} 交给了你",
+    todoList: "列了待办",
+    scheduleCreate: "定了一个任务“{{name}}”", scheduleRemove: "删了定时任务 {{id}}", schedulePause: "暂停了定时任务 {{id}}",
+    scheduleResume: "恢复了定时任务 {{id}}", scheduleList: "列了定时任务",
+    permissionRead: "向你要读权限 · {{path}}", permissionWrite: "向你要写权限 · {{path}}",
+    credential: "向你要一个凭据 · {{name}}",
+    petStatus: "看了看宠物", petFeed: "喂了宠物", petTreat: "给宠物吃了零食", petPlay: "陪宠物玩了",
+    petSleep: "哄宠物睡了", petWake: "叫醒了宠物", petHatch: "孵出了 {{name}}",
+    homeCheck: "检查了小屋",
+    recall: "在以前的对话里搜了“{{query}}”", recallMore: "在以前的对话里搜了“{{query}}”等 {{count}} 个词", recallBrowse: "翻了翻以前的对话",
+    rollupDaily: "收了一天的摘要", rollupWeekly: "收了一周的摘要", rollupMonthly: "收了一个月的摘要", rollupYearly: "收了一年的摘要",
+    rollupPeriod: "{{what}} · {{period}}",
+    personCreated: "把 {{name}} 加进了人物", personUpdated: "更新了 {{name}} 的档案", listPeople: "列了人物",
+  },
+  detail: {
+    tasks_other: "{{count}} 个任务",
+    todos_other: "{{count}} 条未完成",
+    jobs_other: "{{count}} 个",
+    people_other: "{{count}} 人",
+    messages_other: "{{count}} 条",
+    problems_other: "{{count}} 个问题", noProblems: "没问题",
+    events_other: "{{count}} 条",
+  },
+  kind: {
+    task_other: "处理了 {{count}} 个任务",
+    taskCheck_other: "看了 {{count}} 次任务",
+    message_other: "发了 {{count}} 条消息",
+    reaction_other: "回应了 {{count}} 条消息",
+    todo_other: "改了 {{count}} 条待办",
+    schedule_other: "改了 {{count}} 个定时任务",
+    ask_other: "向你要了 {{count}} 样东西",
+    recall_other: "搜了 {{count}} 次以前的对话",
+    pet_other: "照顾了 {{count}} 次宠物",
+    home_other: "检查了 {{count}} 次小屋",
+    rollup_other: "写了 {{count}} 份摘要",
+    people_other: "更新了 {{count}} 个人",
+    lookup_other: "查了 {{count}} 样东西",
+  },
+} satisfies Translation<typeof en>;

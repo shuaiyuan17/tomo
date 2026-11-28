@@ -1,7 +1,8 @@
-import type { SubagentItem, SubagentPage, TodoEntry, WebSource } from "../../src/web/protocol.js";
+import type { SubagentItem, SubagentPage, TodoEntry, ToolActivity, ToolOutcome, WebSource } from "../../src/web/protocol.js";
 import { safeHref } from "./links.js";
 import { i18n } from "./i18n/index.js";
 import { formatUnit, formatUnitPair } from "./i18n/format.js";
+import { activityKind, activityKindText, activityLine } from "./activity.js";
 
 /** Pure state for the read-only subagent view, kept out of React so it is testable. */
 
@@ -13,8 +14,11 @@ export interface ToolRow {
   ts?: number;
   /** The page a WebFetch reads. */
   sources?: WebSource[];
-  /** `images`: image blocks in the output (never served; the row shows a chip). `sources`: a WebSearch's links. */
-  result?: { output: string; truncated: boolean; isError: boolean; images?: number; ts?: number; sources?: WebSource[] };
+  /** One of Tomo's own tools, as the server read it (activity.ts): the row is a sentence, not the raw call. */
+  activity?: ToolActivity;
+  /** `images`: image blocks in the output (never served; the row shows a chip). `sources`: a WebSearch's links.
+   *  `outcome` / `reason`: what an internal tool's result says happened, or why it failed. */
+  result?: { output: string; truncated: boolean; isError: boolean; images?: number; ts?: number; sources?: WebSource[]; outcome?: ToolOutcome; reason?: string };
 }
 /** A subagent's thinking: a folded, muted row. */
 export interface ThinkingRow { kind: "thinking"; id: string; text: string; truncated: boolean }
@@ -132,8 +136,10 @@ export function viewRows(items: SubagentItem[]): ViewRow[] {
       const result = results.get(item.toolUseId);
       rows.push({ kind: "tool", id: item.id, toolUseId: item.toolUseId, name: item.name, summary: item.summary, input: item.input, inputTruncated: item.inputTruncated,
         ...(item.prose ? { prose: true as const } : {}), ...(item.ts !== undefined ? { ts: item.ts } : {}), ...(item.sources ? { sources: item.sources } : {}),
+        ...(item.activity ? { activity: item.activity } : {}),
         ...(result ? { result: { output: result.output, truncated: result.truncated, isError: result.isError, ...(result.images ? { images: result.images } : {}),
-          ...(result.ts !== undefined ? { ts: result.ts } : {}), ...(result.sources ? { sources: result.sources } : {}) } } : {}) });
+          ...(result.ts !== undefined ? { ts: result.ts } : {}), ...(result.sources ? { sources: result.sources } : {}),
+          ...(result.outcome ? { outcome: result.outcome } : {}), ...(result.reason ? { reason: result.reason } : {}) } } : {}) });
     }
   }
   return rows;
@@ -357,14 +363,16 @@ function kindText(kind: ToolKind, count: number): string {
   }
 }
 
-/** "Ran 5 commands, read 3 files, edited a file" — by what the calls did, in order of first use. */
+/** "Ran 5 commands, read 3 files, edited a file, fed the pet" — by what the calls did, in order of first use. */
 export function groupSummary(tools: ToolRow[]): string {
-  const counts = new Map<ToolKind, number>();
+  const counts = new Map<string, { n: number; text: (count: number) => string }>();
   for (const tool of tools) {
-    const kind = TOOL_KINDS[tool.name] ?? "other";
-    counts.set(kind, (counts.get(kind) ?? 0) + 1);
+    const internal = activityKind(tool);
+    const kind = internal ? `internal:${internal}` : TOOL_KINDS[tool.name] ?? "other";
+    const text = internal ? (count: number) => activityKindText(internal, count) : (count: number) => kindText(TOOL_KINDS[tool.name] ?? "other", count);
+    counts.set(kind, { n: (counts.get(kind)?.n ?? 0) + 1, text });
   }
-  const text = [...counts].map(([kind, n]) => kindText(kind, n)).join(i18n.t("common:format.listSeparator"));
+  const text = [...counts.values()].map(({ n, text: say }) => say(n)).join(i18n.t("common:format.listSeparator"));
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
@@ -385,7 +393,7 @@ export function groupOpen(choices: Readonly<Record<string, boolean>>, key: strin
 export function groupLabel(tools: ToolRow[], running = false): { lead: string; running?: string } {
   const latest = tools.at(-1);
   if (!running || !latest) return { lead: groupSummary(tools) };
-  return { lead: "", running: `${latest.summary || latest.name}${latest.result ? "" : "…"}` };
+  return { lead: "", running: `${activityLine(latest)?.title ?? (latest.summary || latest.name)}${latest.result ? "" : "…"}` };
 }
 
 /** The call still waiting for its result in a running group, if any. */

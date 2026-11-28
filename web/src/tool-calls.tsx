@@ -11,6 +11,7 @@ import { LINK_PROPS, safeHref, sourceHost } from "./links.js";
 import { callDuration, elapsedSince, groupDuration, groupLabel, groupStart, todoSections, todoSummary, type ThinkingRow, type TodosRow, type ToolRow,
   type ViewBlock } from "./subagent.js";
 import { useTranslation } from "./i18n/index.js";
+import { activityIcon, activityLine } from "./activity.js";
 
 /**
  * What the agent does in a turn, as the task view and the main chat both
@@ -82,12 +83,16 @@ export function ToolCall({ row, running }: { row: ToolRow; running: boolean }) {
   const status: TraceStatus | undefined = result?.isError ? "error" : !result && running ? "running" : undefined;
   const now = useNow(status === "running");
   const duration = status === "running" ? elapsedSince(row.ts, now) : callDuration(row);
-  const Icon = status === "running" ? RunningMark : toolIcon(row.name);
-  return <TraceCollapsible data-kind="tool">
+  // One of Tomo's own tools: a sentence (and what came of it), not the raw call.
+  const line = activityLine(row);
+  const Icon = status === "running" ? RunningMark : activityIcon(row) ?? toolIcon(row.name);
+  const detail = line && (result?.isError ? result.reason : line.detail);
+  return <TraceCollapsible data-kind="tool" data-activity={line ? row.activity?.kind : undefined}>
     <TraceCollapsibleTrigger>
       <TraceLine status={status}>
         <TraceIcon><Icon /></TraceIcon>
-        <TraceTitle className={row.prose || PROSE_TITLES.has(row.name) ? undefined : "font-mono text-[11.5px]"}>{row.summary || row.name}</TraceTitle>
+        <TraceTitle className={line || row.prose || PROSE_TITLES.has(row.name) ? undefined : "font-mono text-[11.5px]"}>{line?.title ?? (row.summary || row.name)}</TraceTitle>
+        {detail && <TraceDescription className={line?.held ? "text-warn" : undefined}>{detail}</TraceDescription>}
         {duration && <TraceDescription>{duration}</TraceDescription>}
         <StateText status={status} />
       </TraceLine>

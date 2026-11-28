@@ -9,3 +9,4 @@ export { cron } from "./cron.js";
 export { chat } from "./chat.js";
 export { home } from "./home.js";
 export { screen } from "./screen.js";
+export { activity } from "./activity.js";

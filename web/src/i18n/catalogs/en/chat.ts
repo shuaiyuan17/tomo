@@ -14,7 +14,7 @@ export const chat = {
       other_one: "used a tool", other_other: "used {{count}} tools",
     },
     error: "Error", report: "Report", output: "Output", outputTail: "Output · last part", taskOutput: "Task output", noOutput: "(no output yet)",
-    input: "Input", empty: "(empty)", truncated: "Truncated", running: "Running", failed: "Failed",
+    input: "Input", copySection: "Copy {{label}}", empty: "(empty)", truncated: "Truncated", running: "Running", failed: "Failed",
     images_one: "Image output, not shown", images_other: "{{count}} image outputs, not shown",
     thinking: "Thinking", failedCount_one: "{{count}} failed", failedCount_other: "{{count}} failed",
     todos: "To-dos", more_one: "+{{count}} more", more_other: "+{{count}} more",

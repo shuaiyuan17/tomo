@@ -1,6 +1,6 @@
 /** One-line, secret-scrubbed summaries of tool calls and results for logs and the watch bus. */
 
-import { scrubSecretValues } from "../redact.js";
+import { redactSecrets, scrubSecretValues } from "../redact.js";
 
 /**
  * Tool summaries are the daemon's highest-volume path for other people's
@@ -48,7 +48,27 @@ export function toolTitle(name: string, input?: Record<string, unknown>): string
   if (name === "Bash" && description) return scrubSecretValues(description);
   // A subagent is named by what it was sent to do; its type is in the row's input.
   if ((name === "Agent" || name === "Task") && description) return scrubSecretValues(`Subagent · ${description}`);
+  const mcp = mcpTitle(name, input);
+  if (mcp) return scrubSecretValues(mcp);
   return summarizeToolInput(name, input);
+}
+
+/**
+ * An MCP call, `mcp__<server>__<tool>`, as `server · tool "value"`: the
+ * server and the tool apart, then the input's first string value (80
+ * characters), which for most tools is what the call is about (a query, a
+ * title, a path); never a field named like a secret. No string field,
+ * nothing after the tool's name.
+ */
+function mcpTitle(name: string, input?: Record<string, unknown>): string | undefined {
+  const m = /^mcp__(.+?)__(.+)$/.exec(name);
+  if (!m) return undefined;
+  // A field named like a secret (`password`, `token`, …) is never the one shown, whatever its value looks like.
+  const named = (redactSecrets(input ?? {}) ?? {}) as Record<string, unknown>;
+  const first = Object.entries(input ?? {}).find(([key, value]) => typeof value === "string" && value.trim() !== "" && named[key] === value)?.[1] as string | undefined;
+  // Scrubbed whole before the clip: a secret cut in two would no longer match the scrubber.
+  const said = first === undefined ? undefined : scrubSecretValues(first).replace(/\s+/g, " ").trim();
+  return `${m[1]} · ${m[2]}${said ? ` "${said.length > 80 ? `${said.slice(0, 80)}…` : said}"` : ""}`;
 }
 
 /**

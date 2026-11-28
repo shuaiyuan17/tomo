@@ -192,6 +192,7 @@ export class Agent {
     processInboundItems: (items, steer) => this.processInboundItems(items, steer),
     hasBusyLiveSession: (key) => this.liveSessionManager.isBusy(key),
     canSteerIntoSession: (key, items) => !this.webRequestIds.has(key) && !this.steerNeedsSharedPrompt(key, items),
+    enqueueInbound: (key, items) => this.enqueueInboundForSession(key, items),
   });
   private commands: ChatCommandHandler;
   /** The web Tasks panel's board, read by /tasks (unset while the web UI is off). */
@@ -1700,11 +1701,11 @@ export class Agent {
     // have acted — and the next start tells the session instead, quoting the
     // messages (see replayInbox).
     const inboxIds = inboxIdsOf(routed);
-    const progress = { unconsumed: false, handedOff: false, cutShort: false };
+    const progress = { unconsumed: false, handedOff: false, cutShort: false, requeuedIds: [] as string[] };
     const hooks: InboxTurnHooks | undefined = inboxIds.length > 0
       ? {
         notConsumed: () => { progress.unconsumed = true; },
-        refused: () => { progress.unconsumed = false; },
+        refused: (requeuedIds = []) => { progress.unconsumed = false; progress.requeuedIds = requeuedIds; },
         cutShort: (selfRestart) => {
           progress.cutShort = true;
           // Written now, while the inbox is still open (shutdown closes it
@@ -1759,7 +1760,8 @@ export class Agent {
           this.enqueueForSession(routedKey, async () => { this.inbox?.markDone(inboxIds); })
             .catch((err) => log.warn({ err, sessionKey: routedKey }, "Durable inbox: deferred done failed"));
         } else {
-          this.inbox?.markDone(inboxIds);
+          // A refused turn's requeued records are closed by the turn they are queued as.
+          this.inbox?.markDone(inboxIds.filter((id) => !progress.requeuedIds.includes(id)));
         }
       }
     }
@@ -1971,20 +1973,68 @@ export class Agent {
    * with the shared prompt in time (TurnSpec.onSharedPromptUnavailable). No
    * model call: each group in the turn gets one fixed line, and the owner is
    * told which group went unanswered. The messages stay in the transcript.
+   *
+   * The owner's own messages in a mixed batch are not dropped with the
+   * group's: they go back to the queue as their own turn, which runs on the
+   * session as it is. The group's inbox records are closed only once somebody
+   * was told; when neither the group nor the owner could be reached they stay
+   * open, and the next start answers them.
    */
   private async answerSharedPromptUnavailable(req: UserTurnRequest): Promise<void> {
-    req.inboxHooks?.refused();
+    const ownerItems = req.ownerItems ?? [];
+    if (ownerItems.length > 0) {
+      log.info({ sessionKey: req.key, count: ownerItems.length }, "Refused mixed batch: the owner's own messages are queued again as their own turn");
+      this.enqueueInboundForSession(req.key, ownerItems.map((item) => ({ ...item, userRecorded: true })));
+    }
     const groups = [...new Set((req.audiences ?? []).filter((a) => isGroupSessionKey(a)))];
-    for (const groupKey of groups) {
+    const told = await this.tellSharedPromptUnavailable(groups, groups, false);
+    if (told) req.inboxHooks?.refused(inboxIdsOf(ownerItems));
+    else log.warn({ sessionKey: req.key, groups }, "Refused group turn: nobody could be told; its inbox records stay open for the next start");
+  }
+
+  /**
+   * The busy line to `tellGroups`, and one owner notice naming `groups`.
+   * True when at least one of them was delivered.
+   */
+  private async tellSharedPromptUnavailable(
+    groups: string[],
+    tellGroups: string[],
+    background: boolean,
+  ): Promise<boolean> {
+    let told = false;
+    for (const groupKey of tellGroups) {
       const parsed = parseRawSessionKey(groupKey);
       const channel = parsed ? this.getChannel(parsed.channelName) : undefined;
       if (!parsed || !channel) continue;
-      await channel.send({ chatId: parsed.chatId, text: ownerT("notices")("group.summonBusy") })
-        .catch((err) => log.warn({ err, group: groupKey }, "Could not post the busy notice to the group"));
+      try {
+        await channel.send({ chatId: parsed.chatId, text: ownerT("notices")("group.summonBusy") });
+        told = true;
+      } catch (err) {
+        log.warn({ err, group: groupKey }, "Could not post the busy notice to the group");
+      }
     }
-    const label = groups.map((g) => this.sessions.getEntry(g)?.chatTitle ?? g).join(", ") || req.key;
-    await this.notifyOwner(ownerT("notices")("group.summonBusyOwner", { group: label }))
-      .catch((err) => log.warn({ err }, "Could not tell the owner about a refused group turn"));
+    const label = groups.map((g) => this.sessions.getEntry(g)?.chatTitle ?? g).join(", ") || "a group";
+    try {
+      const notice = background
+        ? ownerT("notices")("group.summonBusyOwnerBackground", { group: label })
+        : ownerT("notices")("group.summonBusyOwner", { group: label });
+      if (await this.notifyOwner(notice)) told = true;
+    } catch (err) {
+      log.warn({ err }, "Could not tell the owner about a refused group turn");
+    }
+    return told;
+  }
+
+  /**
+   * The same refusal for a group's BACKGROUND turn handed to the dm: session
+   * (its cron job, its delegate, its restart notice): the owner is told what
+   * did not run, and a group that asked for a delegate gets the busy line.
+   * Undefined for a turn no group is behind, which keeps the error policy.
+   */
+  private backgroundRefusal(audiences: readonly string[] | undefined, tellGroup: boolean): (() => Promise<void>) | undefined {
+    const groups = [...new Set((audiences ?? []).filter((a) => isGroupSessionKey(a)))];
+    if (groups.length === 0) return undefined;
+    return async () => { await this.tellSharedPromptUnavailable(groups, tellGroup ? groups : [], true); };
   }
 
   private audienceLabel(audience: string): string {
@@ -2745,6 +2795,7 @@ export class Agent {
       audiences,
       origins: items.map((it) => ({ channelName: it.channel.name, chatId: it.message.chatId })),
       ...(isDmSessionKey(key) ? { ownerMessages: items.filter((it) => !(it.message.isGroup ?? false)).map((it) => ownerTurnMessage(it.channel, it.message)) } : {}),
+      ...(isDmSessionKey(key) && summonTargets.length > 0 ? { ownerItems: items.filter((it) => !(it.message.isGroup ?? false)) } : {}),
       suppressErrors: isPassiveGroup,
       ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, ownerT("notices")("suppressed.turn.message"), `${lastChannel.name}:${lastMessage.chatId}`) } : {}),
       errorLogMessage: "Error handling batched messages",
@@ -3010,6 +3061,7 @@ export class Agent {
     // narrows them to that group and which `scopedCallerKey` logs at debug.
     const turnId = options.audiences ? this.turnAudiences.begin(key, options.audiences) : undefined;
     if (turnId !== undefined) options.onTurnBegin?.(turnId);
+    const groupRefusal = this.backgroundRefusal(options.audiences, options.usageSource === "delegate");
     try {
       return await this.turnRunner.runTurn({
         key,
@@ -3043,6 +3095,9 @@ export class Agent {
           suppressedLog: "Cron output suppressed from chat delivery",
         },
         silentMatcher: isSilentReply,
+        // A group's turn refused for the shared prompt: reported, and false
+        // comes back, so a scheduler records a run that did not happen.
+        ...(groupRefusal ? { onSharedPromptUnavailable: groupRefusal } : {}),
         silentLog: "Cron completed silently (no reply sent)",
         transcript: "on-delivery",
         errors: {
@@ -3172,6 +3227,8 @@ export class Agent {
       source: "continuity",
       usage: { source: usageSource, ...(taskId ? { taskId } : {}) },
       prompt,
+      // A summoned group's restart notice refused for the shared prompt.
+      ...(noticeGroupKey ? { onSharedPromptUnavailable: this.backgroundRefusal([noticeGroupKey], false) } : {}),
       // No timestamp stamp, no typing indicator — continuity turns are
       // invisible. A heartbeat speaks only through the explicit `send_message`
       // tool, never through its own text blocks (owner decision 2026-08-28,

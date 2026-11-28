@@ -324,6 +324,9 @@ describe("steering and the prompt variant", () => {
       expect(live.pendingSteers).toHaveLength(0);
       expect(ran("GROUP-MIDTURN")).toEqual([]);
     });
+    // While it waits behind the owner's turn, shutdown can still find it.
+    const queued = [...(agent as unknown as { queuedInbound: Map<symbol, { items: Array<{ message: { text: string } }> }> }).queuedInbound.values()];
+    expect(queued.some((work) => work.items.some((item) => item.message.text === "GROUP-MIDTURN"))).toBe(true);
 
     release();
     await drainQueue(agent);
@@ -432,6 +435,109 @@ describe("a group's turn that cannot get the shared prompt in time", () => {
     await tg.simulateMessage(groupMsg("@tomo GROUP-LATER"));
     await drainQueue(agent);
     expect(ran("GROUP-LATER")).toEqual([{ session: OWNER, variant: "shared" }]);
+    await agent.stop();
+  });
+});
+
+describe("what a refusal does not drop", () => {
+  const refuse = (agent: AgentInstance, match: (prompt: string) => boolean) => {
+    const real = internals(agent).runWithRetry.bind(agent);
+    internals(agent).runWithRetry = (req) => (match(req.prompt)
+      ? Promise.reject(new SharedPromptUnavailableError("background tasks are running"))
+      : real(req));
+  };
+
+  it("the owner's own message in a refused mixed batch is queued again and answered; only the group's is refused", async () => {
+    const { agent, tg } = setup({ steering: false, passiveGroups: { telegram: [GROUP_CHAT] } });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    mockSdk.responseFn = async (text) => {
+      if (text.includes("FIRST")) { await gate; return "first done"; }
+      return text.includes("MIXED-OWNER") ? "reply to MIXED-OWNER" : "NO_REPLY";
+    };
+    await tg.simulateMessage(ownerMsg("FIRST"));
+    await waitFor(() => expect(ran("FIRST")).toHaveLength(1));
+    internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    refuse(agent, (prompt) => prompt.includes("MIXED-GROUP"));
+    await tg.simulateMessage(ownerMsg("MIXED-OWNER"));
+    await tg.simulateMessage(makeMsg({ chatId: GROUP_CHAT, isGroup: true, senderName: "Alice", chatTitle: "Book club", text: "MIXED-GROUP" }));
+    release();
+    await drainQueue(agent);
+
+    expect(ran("MIXED-GROUP")).toEqual([]);
+    expect(ran("MIXED-OWNER")).toHaveLength(1);
+    const toOwner = tg.delivered.filter((d) => d.chatId === OWNER_CHAT).map((d) => d.text);
+    expect(toOwner).toContain("reply to MIXED-OWNER");
+    expect(tg.delivered.filter((d) => d.chatId === GROUP_CHAT).map((d) => d.text)).toEqual(["Busy right now — try again in a bit."]);
+    // Recorded once each, whichever turn it ended up in.
+    const users = internals(agent).sessions.get(OWNER).messages.filter((m) => m.role === "user").map((m) => m.content);
+    expect(users.filter((u) => u.includes("MIXED-OWNER"))).toHaveLength(1);
+    expect(users.filter((u) => u.includes("MIXED-GROUP"))).toHaveLength(1);
+    await agent.stop();
+  });
+
+  it("closes the group's inbox records only once somebody was told, and never the requeued owner ones", async () => {
+    const { agent, tg } = setup();
+    await seed(agent, tg);
+    const answer = (agent as unknown as {
+      answerSharedPromptUnavailable(req: unknown): Promise<void>;
+    }).answerSharedPromptUnavailable.bind(agent);
+    const ownerItem = { channel: tg, message: ownerMsg("OWNER-IN-BATCH"), resolution: { sessionKey: OWNER, replyTarget: { channelName: "telegram", chatId: OWNER_CHAT } }, inboxId: "inbox-owner" };
+    const req = (refused: (ids?: string[]) => void) => ({
+      key: OWNER, audiences: ["dm", GROUP], ownerItems: [ownerItem],
+      inboxHooks: { notConsumed() {}, cutShort() {}, onPromptHandedOff() {}, refused },
+    });
+
+    const told = vi.fn();
+    await answer(req(told));
+    expect(told).toHaveBeenCalledWith(["inbox-owner"]);
+    await drainQueue(agent);
+
+    // Neither the group nor the owner can be reached: the records stay open.
+    tg.tornDown = true;
+    const untold = vi.fn();
+    await answer({ ...req(untold), ownerItems: [] });
+    expect(untold).not.toHaveBeenCalled();
+    tg.tornDown = false;
+    await agent.stop();
+  });
+
+  it("a group's delegate that is refused: the group gets the busy line, the owner is told, nothing runs", async () => {
+    const { agent, tg } = setup();
+    await seed(agent, tg);
+    await tg.simulateMessage(groupMsg("@tomo group hello"));
+    await drainQueue(agent);
+    tg.clearDelivered();
+    refuse(agent, (prompt) => prompt.includes("DELEGATED-ASK"));
+    await agent.delegateToSession("shuai", "DELEGATED-ASK", GROUP);
+    await drainQueue(agent);
+    expect(ran("DELEGATED-ASK")).toEqual([]);
+    expect(tg.delivered.filter((d) => d.chatId === GROUP_CHAT).map((d) => d.text)).toEqual(["Busy right now — try again in a bit."]);
+    const toOwner = tg.delivered.filter((d) => d.chatId === OWNER_CHAT).map((d) => d.text);
+    expect(toOwner).toHaveLength(1);
+    expect(toOwner[0]).toContain("A background turn for Book club");
+    expect(tg.delivered.some((d) => d.text.includes("[error]"))).toBe(false);
+    await agent.stop();
+  });
+
+  it("a summoned group's cron job that is refused reports a run that did not happen, to the owner only", async () => {
+    const { agent, tg } = setup();
+    await seed(agent, tg);
+    internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    tg.clearDelivered();
+    refuse(agent, (prompt) => prompt.includes("GROUP-CRON-JOB"));
+    expect(await agent.handleCronMessage("GROUP-CRON-JOB", GROUP, { waitForHandoff: true })).toBe(false);
+    expect(tg.delivered.filter((d) => d.chatId === GROUP_CHAT)).toEqual([]);
+    const toOwner = tg.delivered.filter((d) => d.chatId === OWNER_CHAT).map((d) => d.text);
+    expect(toOwner).toHaveLength(1);
+    expect(toOwner[0]).toContain("did not run");
+
+    // The owner's own cron job keeps the ordinary error policy.
+    tg.clearDelivered();
+    internals(agent).router.dismissGroup("telegram", GROUP_CHAT);
+    refuse(agent, (prompt) => prompt.includes("OWNER-CRON-JOB"));
+    expect(await agent.handleCronMessage("OWNER-CRON-JOB", OWNER)).toBe(false);
+    expect(tg.delivered.some((d) => d.text.includes("[error]"))).toBe(true);
     await agent.stop();
   });
 });

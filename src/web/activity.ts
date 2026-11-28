@@ -34,12 +34,14 @@ export function internalToolName(name: string): string | undefined {
 }
 
 /** Scrubbed WHOLE, then clipped: a registered secret cut at the clip would no longer match the scrubber. */
-const clean = (value: string, limit: number) => {
-  const scrubbed = redactText(scrubSecretValues(value));
+const clean = (value: string, limit: number, oneLine = false) => {
+  // Normalised only after the scrub too: a registered secret with a run of spaces in it would not match once collapsed.
+  const raw = redactText(scrubSecretValues(value));
+  const scrubbed = oneLine ? raw.replace(/\s+/g, " ").trim() : raw;
   return scrubbed.length > limit ? { text: scrubbed.slice(0, limit), truncated: true as const } : { text: scrubbed };
 };
 const line = (value: unknown): string | undefined =>
-  typeof value === "string" && value.trim() ? clean(value.replace(/\s+/g, " ").trim(), ACTIVITY_LINE_LIMIT).text : undefined;
+  typeof value === "string" && value.trim() ? clean(value, ACTIVITY_LINE_LIMIT, true).text || undefined : undefined;
 const body = (value: unknown): { text: string; truncated?: true } | undefined =>
   typeof value === "string" && value.trim() ? clean(value.trim(), ACTIVITY_TEXT_LIMIT) : undefined;
 const optional = <K extends string>(key: K, value: string | undefined) => (value ? { [key]: value } : {}) as Partial<Record<K, string>>;
@@ -241,7 +243,8 @@ export function toolOutcome(name: string, output: string): ToolOutcome | undefin
     }
     case "recall_conversation":
       if (((m = /^(\d+) message\(s\), oldest first/.exec(text)))) return count(Number(m[1]));
-      return /^No (?:matching )?messages/.test(text) ? count(0) : undefined;
+      if (/^No messages searched:/.test(text)) return noop();
+      return /^No (?:matching messages found|messages in that time range)/.test(text) ? count(0) : undefined;
     case "lcm_rollup": {
       const result = json(text);
       if (!result || typeof result.status !== "string") return undefined;

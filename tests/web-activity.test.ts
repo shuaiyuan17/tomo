@@ -87,6 +87,10 @@ describe("toolOutcome reads what the real tools return", () => {
     expect(toolOutcome(I("schedule_remove"), textOf(await run(tools, "schedule_remove", { id: "nope0000" })))).toEqual({ noop: "Job nope0000 not found." });
   });
 
+  it("recall: no hits is a count of 0; a search that never ran is a no-op", () => {
+    expect(toolOutcome(I("recall_conversation"), "No matching messages found (searched the last 30 days). Try other phrasings.")).toEqual({ count: 0 });
+    expect(toolOutcome(I("recall_conversation"), "No messages searched: `before` (2025-01-01) is more than 30 days ago, and …")).toMatchObject({ noop: expect.any(String) });
+  });
   it("a wording it does not know, or a tool that is not internal, is no outcome", () => {
     expect(toolOutcome(I("task_spawn"), "Spawned s1.")).toBeUndefined();
     expect(toolOutcome(I("not_a_tool"), "OK")).toBeUndefined();
@@ -127,6 +131,9 @@ describe("secrets in an activity", () => {
     registerSecretValue(secret, "long-one");
     try {
       const activity = toolActivity(I("task_spawn"), { title: `intro ${secret}`, brief: `see ${secret}` });
+      registerSecretValue("alpha   beta9", "spaced");
+      expect(toolActivity(I("task_message"), { id: "s1", text: "x", attach_owner_message: false })).toBeDefined();
+      expect(JSON.stringify(toolActivity(I("task_cancel"), { id: "s1", reason: "token alpha   beta9 expired" }))).not.toContain("beta9");
       expect(activity?.kind === "task_spawn" && activity.title).not.toContain("plainsecret");
       expect(activity?.kind === "task_spawn" && activity.brief).not.toContain("plainsecret");
       expect(toolTitle("mcp__docs__fetch", { url: `${"u".repeat(70)}${secret}` })).not.toContain("plain");

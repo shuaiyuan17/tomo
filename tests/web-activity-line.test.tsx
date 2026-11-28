@@ -49,28 +49,34 @@ describe("an internal tool's row is a sentence", () => {
   });
   it("without an activity, or with one this page does not know, it keeps the plain line", () => {
     expect(html(row(call(undefined, {})))).toContain("mcp__tomo-internal__task_spawn: {&quot;raw&quot;:true}");
-    const future = row(call({ kind: "memory_teleport" } as unknown as ToolActivity, {}));
+    const future = row(call({ kind: "memory_teleport" } as unknown as ToolActivity, { outcome: {} }));
     expect(activityLine(future)).toBeUndefined();
     expect(html(future)).toContain("{&quot;raw&quot;:true}");
+  });
+  it("finished with an outcome the server could not read (a new wording): the plain line, no claim of what happened", () => {
+    const unread = row(call({ kind: "schedule_remove", id: "ab12" }, { output: "Could not remove ab12 right now." }));
+    expect(activityLine(unread)).toBeUndefined();
+    expect(html(unread)).not.toContain("Removed scheduled task");
+    expect(groupSummary([unread, unread])).toBe("Used 2 tools");
   });
   it("speaks the reader's language", async () => {
     await i18n.changeLanguage("zh-Hans");
     try {
       expect(html(row(call(spawn, { outcome: { id: "s12" } })))).toContain("开了 s12 · Activity cards");
-      expect(groupSummary([row(call({ kind: "pet_feed" }, {})), row(call({ kind: "pet_play" }, {}))])).toBe("照顾了 2 次宠物");
+      expect(groupSummary([row(call({ kind: "pet_feed" }, { outcome: {} })), row(call({ kind: "pet_play" }, { outcome: {} }))])).toBe("照顾了 2 次宠物");
     } finally { await i18n.changeLanguage("en"); }
   });
 });
 
 describe("a fold of calls counts internal tools by what they did", () => {
   it("in words, in order of first use", () => {
-    const rows = [...call({ kind: "react_to_message", target: "dm:o", reaction: "love" }, {}), ...call({ kind: "pet_feed" }, {}),
-      ...call({ kind: "task_status" }, {}), ...call({ kind: "pet_play" }, {})];
+    const rows = [...call({ kind: "react_to_message", target: "dm:o", reaction: "love" }, { outcome: {} }), ...call({ kind: "pet_feed" }, { outcome: {} }),
+      ...call({ kind: "task_status" }, { outcome: {} }), ...call({ kind: "pet_play" }, { outcome: {} })];
     const [block] = groupRows(viewRows(rows));
     expect(block.kind === "group" && groupSummary(block.tools)).toBe("Reacted to a message, looked after the pet 2 times, checked a task");
   });
   it("a running fold names the running call by its sentence", () => {
-    const tools = viewRows([...call({ kind: "pet_feed" }, {}), ...call({ kind: "home_check" })]) as ToolRow[];
+    const tools = viewRows([...call({ kind: "pet_feed" }, { outcome: {} }), ...call({ kind: "home_check" })]) as ToolRow[];
     expect(groupLabel(tools, true)).toEqual({ lead: "", running: "Checked the home…" });
   });
 });

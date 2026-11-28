@@ -15,9 +15,15 @@ import { i18n } from "./i18n/index.js";
 
 export const INTERNAL_PREFIX = "mcp__tomo-internal__";
 
-/** The row's activity, when it is one this page knows. */
-export function knownActivity(row: Pick<ToolRow, "activity">): ToolActivity | undefined {
+/**
+ * The row's activity, when it is one this page knows, and its result (if it
+ * has one) was read: a call that finished with an outcome the server could
+ * not read (a new wording) makes no claim about what happened, so it keeps
+ * the plain line. A running call and a failed one are sentences.
+ */
+export function knownActivity(row: Pick<ToolRow, "activity" | "result">): ToolActivity | undefined {
   const activity = row.activity;
+  if (row.result && !row.result.isError && !row.result.outcome) return undefined;
   return activity && typeof activity === "object" && typeof activity.kind === "string" && activity.kind in KINDS ? activity : undefined;
 }
 
@@ -41,11 +47,11 @@ const KINDS: Record<ToolActivity["kind"], { icon: LucideIcon; kind: ActivityKind
   lcm_rollup: { icon: LayersIcon, kind: "rollup" }, upsert_person: { icon: UserRoundIcon, kind: "people" },
 };
 
-export function activityIcon(row: Pick<ToolRow, "activity">): LucideIcon | undefined {
+export function activityIcon(row: Pick<ToolRow, "activity" | "result">): LucideIcon | undefined {
   const activity = knownActivity(row);
   return activity ? KINDS[activity.kind].icon : undefined;
 }
-export function activityKind(row: Pick<ToolRow, "activity">): ActivityKind | undefined {
+export function activityKind(row: Pick<ToolRow, "activity" | "result">): ActivityKind | undefined {
   const activity = knownActivity(row);
   return activity ? KINDS[activity.kind].kind : undefined;
 }

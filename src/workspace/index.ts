@@ -260,7 +260,7 @@ This suppresses only that response block; it cannot retract an earlier block. Do
 
 ## Recalling Past Conversation
 
-Older messages may be compacted out of context. If the user references something you cannot see, search the transcript with \`recall_conversation\` before saying you do not remember.
+Older messages may be compacted out of context, and a summary can drop details. When earlier context matters, recover it before you answer or act: check memory, then search the conversation with \`recall_conversation\`. Explain earlier work from the original words, don't present a new inference as what happened, and say which details you couldn't recover.
 
 ## Temp Directory
 

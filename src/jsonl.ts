@@ -210,10 +210,26 @@ export function reportRawJsonlLines(
  * straddle a chunk boundary, and decoding it half-read would corrupt it.
  * Splitting at newline bytes is safe — 0x0A never appears inside a multi-byte
  * UTF-8 sequence.
+ *
+ * `progress`, when given, is a byte budget shared across calls: `bytesRead`
+ * is advanced by every chunk read, and once it has passed `maxBytes` the
+ * generator reads no further, sets `cutShort` and returns. The test sits
+ * before each read rather than with the consumer, because a record is only
+ * yielded once its whole line is in memory: one oversized line, or a long run
+ * of lines that do not parse, would otherwise be read to the end of the file
+ * before any consumer could say stop.
  */
+export interface JsonlReadProgress {
+  bytesRead: number;
+  maxBytes: number;
+  /** Set when a read stopped at the budget with part of a file unread. */
+  cutShort?: boolean;
+}
+
 export function* iterateJsonlBackwardsSync<T = unknown>(
   path: string,
   chunkSize = 64 * 1024,
+  progress?: JsonlReadProgress,
 ): Generator<T> {
   let fd: number;
   try {
@@ -225,10 +241,15 @@ export function* iterateJsonlBackwardsSync<T = unknown>(
     let pos = fstatSync(fd).size;
     let carry = Buffer.alloc(0);
     while (pos > 0) {
+      if (progress && progress.bytesRead > progress.maxBytes) {
+        progress.cutShort = true;
+        return;
+      }
       const readSize = Math.min(chunkSize, pos);
       pos -= readSize;
       const buf = Buffer.alloc(readSize);
       readSync(fd, buf, 0, readSize, pos);
+      if (progress) progress.bytesRead += readSize;
       let chunk = Buffer.concat([buf, carry]);
       carry = Buffer.alloc(0);
       if (pos > 0) {
@@ -277,8 +298,9 @@ function parseJsonlRecord<T>(line: string): T | undefined {
 }
 
 /** Read the first record (a line that parses to a JSON object) of a JSONL
- *  file, or undefined. */
-export function readFirstJsonlRecordSync<T = unknown>(path: string): T | undefined {
+ *  file, or undefined. With `maxBytes`, gives up (undefined) rather than read
+ *  further than that into the file looking for one. */
+export function readFirstJsonlRecordSync<T = unknown>(path: string, maxBytes = Infinity): T | undefined {
   let fd: number;
   try {
     fd = openSync(path, "r");
@@ -291,7 +313,8 @@ export function readFirstJsonlRecordSync<T = unknown>(path: string): T | undefin
     let pos = 0;
     let pending = Buffer.alloc(0);
     while (pos < size) {
-      const readSize = Math.min(chunkSize, size - pos);
+      if (pos >= maxBytes) return undefined;
+      const readSize = Math.min(chunkSize, size - pos, maxBytes - pos);
       const buf = Buffer.alloc(readSize);
       readSync(fd, buf, 0, readSize, pos);
       pos += readSize;

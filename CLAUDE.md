@@ -73,7 +73,8 @@ src/
                       #   `tomo db repair|export` / `tomo backup restore`; the kernel drops it when the holder dies)
   sessions/           # Persistence (store.ts + transcript-names/-rotation/-order.ts, store-support.ts,
                       #   pending-notes-store.ts: pending notes as rows in tomo.db, one-time import of _pending_notes.json),
-                      #   key helpers (keys.ts), summon-store.ts
+                      #   key helpers (keys.ts), summon-store.ts, recall-score.ts (recall_conversation's scoring:
+                      #   words and two-character pieces weighed by rarity; the bounded scan is store.recallTranscript)
   credentials/        # Credential broker, off by default: broker.ts (request on the turn's channel, capture, fulfill),
                       #   capture.ts (CaptureChannel: iMessage/Telegram next message, web password card),
                       #   store.ts (keychain over stdin; state.json), redactor.ts (literal scrub, global PostToolUse hook)

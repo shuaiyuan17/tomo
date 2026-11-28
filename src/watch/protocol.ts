@@ -106,7 +106,12 @@ export type WatchEvent =
    *  src/agent/inbound-markers.ts. `shape` is the closed union rather than
    *  `string` so the compiler, not a comment, is what keeps the Prometheus
    *  label set bounded (the exporter labels its counter with it). */
-  | { type: "fabricated-marker"; ts: number; sessionKey?: string; shape: FabricatedMarkerShape; marker: string };
+  | { type: "fabricated-marker"; ts: number; sessionKey?: string; shape: FabricatedMarkerShape; marker: string }
+  /** One scored `recall_conversation` search ran. `matched` is how many
+   *  messages passed the score filter (zero is what the exporter counts as
+   *  "empty"), `stopped` that the scan ran out of budget first. The outcome
+   *  only: the query never rides the bus. */
+  | { type: "recall"; ts: number; sessionKey?: string; matched: number; stopped: boolean };
 
 export type WatchIssue = Extract<WatchEvent, { type: "issue" }>;
 

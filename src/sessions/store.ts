@@ -6,7 +6,7 @@ import { isDmSessionKey } from "./keys.js";
 import { log } from "../logger.js";
 import { textOfContent, type TranscriptEvent } from "./transcript-event.js";
 import {
-  parseJsonl, readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync,
+  parseJsonl, readJsonlFileSync, readJsonlTailSync, readFirstJsonlRecordSync, iterateJsonlBackwardsSync, type JsonlReadProgress,
   isRawJsonlLine, reportRawJsonlLines, serializeJsonlRecord, type RawJsonlLine,
 } from "../jsonl.js";
 import { writeJsonAtomicSync, isEnoent } from "../fs-utils.js";
@@ -25,6 +25,7 @@ import {
 import { PendingNotesStore } from "./pending-notes-store.js";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { usableSeq, usableTimestamp, orderTimestamp, sortByRecordTime } from "./transcript-order.js";
+import { RecallScorer } from "./recall-score.js";
 import {
   renameIfPresent, NO_CORRUPT_LEDGER_HOLD, stubMetadata, sameFileOnDisk, unlinkIfPresent,
   type LegacyStemLedgerFile, type OwnershipProbe, type CorruptLedgerHold,
@@ -152,6 +153,67 @@ function registryLinkSignature(entries: SessionEntry[]): string {
  * the last state we successfully loaded, which is strictly better than `[]`,
  * but nothing may be persisted from it until the file can be read again.
  */
+/** What bounds one scored transcript search (`recallTranscript`). */
+export interface RecallScanBudget {
+  /** Wall time, in milliseconds. */
+  maxMs: number;
+  /** Bytes read from the transcript files. */
+  maxBytes: number;
+  /** Millisecond clock; tests pass their own. Defaults to `performance.now`. */
+  now?: () => number;
+}
+
+/**
+ * The search runs synchronously on the daemon's event loop, so this is how
+ * long one `recall_conversation` call may hold up everything else. A direct
+ * message transcript of about 30,000 records scans in well under it.
+ */
+export const RECALL_SCAN_BUDGET: Readonly<RecallScanBudget> = { maxMs: 300, maxBytes: 16 * 1024 * 1024 };
+const RECALL_CLOCK_EVERY = 64;
+/** How far into a file the scan looks for its first record before deciding
+ *  whether `toTime` rules the whole file out. */
+const RECALL_FILE_PROBE_BYTES = 64 * 1024;
+
+function safeFileSize(path: string): number {
+  try {
+    return statSync(path).size;
+  } catch {
+    return 0;
+  }
+}
+
+interface RecallCandidate {
+  msg: SessionMessage;
+  fileIndex: number;
+  position: number;
+}
+
+export interface TranscriptRecallHit {
+  msg: SessionMessage;
+  score: number;
+  /** Index in `msg.content` of the first matched word, for an excerpt around it. */
+  matchIndex: number;
+}
+
+export interface TranscriptRecall {
+  /** The best matches, oldest first. */
+  hits: TranscriptRecallHit[];
+  /** How many records passed the score filter, before `limit`. */
+  matched: number;
+  /** Records read inside the scan. */
+  scanned: number;
+  /** Records too long to score whole: only their beginning was searched
+   *  (`RECALL_MAX_SCORED_CHARS`). Absent when there were none. */
+  clipped?: number;
+  /**
+   * Set when the scan ran out of budget before reaching the window's lower
+   * bound. `reachedBackTo` is the timestamp of the oldest record it passed, or
+   * null when that is unknown or means nothing (a read set that is not in
+   * time order).
+   */
+  stopped?: { reason: "time" | "bytes"; reachedBackTo: number | null };
+}
+
 /** What identifies one published version of the registry file. */
 interface RegistryFileIdentity {
   dev: bigint;
@@ -709,6 +771,145 @@ export class SessionStore {
     // identical messages. Reading a preserved duplicate twice is visible and
     // harmless; dropping someone's message is neither.
     return hits.slice(0, limit).map((hit) => hit.msg).reverse();
+  }
+
+  /**
+   * Scored search of the transcript: `recall_conversation` with a query.
+   *
+   * Where `searchTranscript` keeps the most recent records that contain one
+   * substring, this scores every record in the window against each phrasing
+   * in `queries` (see recall-score.ts) and keeps the best `limit`. The scores
+   * weigh a word by how rare it is among the records scanned, so there is no
+   * early exit on `limit`: the window is read to its lower bound.
+   *
+   * THAT READ IS SYNCHRONOUS, ON THE DAEMON'S EVENT LOOP, so it is bounded.
+   * It stops when the window's lower bound is reached, or when `budget` runs
+   * out (wall time or bytes read from disk), whichever comes first, and
+   * `stopped` then says how far back it got. The caller reports that rather
+   * than presenting a partial scan as the whole history.
+   *
+   * `before` only saves reading at the grain of a file: a file that starts
+   * after `toTime` is passed over, but inside a file the scan still runs from
+   * its newest record, and what it passes on the way to the window is charged
+   * to the budget. So a retry with `toTime` set to where the last scan
+   * stopped gets further only while the part of that file above `toTime`
+   * fits the budget. When it does not, the scan stops above `toTime` again
+   * and `stopped.reachedBackTo` shows it (it is not below `toTime`): the
+   * caller says that part of history is out of reach rather than suggesting
+   * another retry. Getting past that needs an offset index, which this is not.
+   *
+   * The window rules are `searchTranscript`'s: only a record whose time is
+   * known may end the scan, and a record that cannot be placed under a bound
+   * is skipped. A file that starts after `toTime` is passed over unread. With a read-only legacy sidecar in the read set the files are
+   * not in time order, so nothing ends the scan but the budget, and the result
+   * is ordered by the records' own timestamps.
+   */
+  recallTranscript(key: string, opts: {
+    queries: readonly string[];
+    fromTime?: number;
+    toTime?: number;
+    limit?: number;
+    budget?: Partial<RecallScanBudget>;
+  }): TranscriptRecall {
+    const scorer = new RecallScorer<RecallCandidate>(opts.queries);
+    // Same withholding as `searchTranscript`: this is the same read.
+    if (scorer.isEmpty || this.withholdsTranscript(key)) return { hits: [], matched: 0, scanned: 0 };
+    const limit = opts.limit ?? 50;
+    const budget = { ...RECALL_SCAN_BUDGET, ...opts.budget };
+    const now = budget.now ?? (() => performance.now());
+    const startedAt = now();
+    const progress: JsonlReadProgress = { bytesRead: 0, maxBytes: budget.maxBytes };
+    const readSet = this.transcriptReadSet(key);
+    const ordered = !readSet.hasSidecars;
+
+    let scanned = 0;
+    let stopped: TranscriptRecall["stopped"];
+    // The oldest placeable record the scan has passed: how far back it got.
+    let reachedBackTo: number | null = null;
+    const exhausted = (): "time" | "bytes" | null => {
+      if (progress.bytesRead > budget.maxBytes) return "bytes";
+      // The clock is read once per few records: a search of tens of thousands
+      // of short records should not spend its budget asking the time.
+      if (scanned % RECALL_CLOCK_EVERY === 0 && now() - startedAt > budget.maxMs) return "time";
+      return null;
+    };
+
+    outer: for (let fileIndex = 0; fileIndex < readSet.files.length; fileIndex++) {
+      const { path } = readSet.files[fileIndex];
+      // A file that begins after the window's upper bound holds nothing in
+      // it, and is not read: this is what lets `before` reach history that a
+      // scan from the newest record would run out of budget before touching.
+      // It leans on the same fact as the lower bound's early exit, that a
+      // chronological read set is in time order inside each file too, and
+      // like it only a record whose time is known may decide.
+      if (ordered && opts.toTime != null) {
+        // The looks are reads too: a long run of files passed over must not
+        // add up to more than the scan may spend.
+        const reason = progress.bytesRead > budget.maxBytes ? "bytes" : now() - startedAt > budget.maxMs ? "time" : null;
+        if (reason) {
+          stopped = { reason, reachedBackTo };
+          break;
+        }
+        // One bounded look, charged to the budget: a file whose first record
+        // is not within it is simply read like any other.
+        const first = readFirstJsonlRecordSync<SessionMessage>(path, RECALL_FILE_PROBE_BYTES);
+        progress.bytesRead += Math.min(RECALL_FILE_PROBE_BYTES, safeFileSize(path));
+        const firstTime = first ? usableTimestamp(first) : null;
+        if (firstTime != null && firstTime > opts.toTime) continue;
+      }
+      let position = 0;
+      let skipped = 0;
+      for (const msg of iterateJsonlBackwardsSync<SessionMessage>(path, undefined, progress)) {
+        position++;
+        const time = usableTimestamp(msg);
+        const belowWindow = opts.fromTime != null && time != null && time < opts.fromTime;
+        // Reaching the lower bound in a chronological read set is the scan
+        // finishing, so it is tested before the budget: a scan that got all
+        // the way there is not reported as cut short.
+        if (belowWindow && ordered) break outer;
+        const reason = exhausted();
+        if (reason) {
+          stopped = { reason, reachedBackTo: ordered ? reachedBackTo : null };
+          if (skipped > 0) log.debug({ file: path, skipped }, "Skipped transcript records that cannot be placed in the search window");
+          break outer;
+        }
+        scanned++;
+        if (belowWindow) continue;
+        if (time != null) reachedBackTo = time;
+        if ((opts.fromTime != null || opts.toTime != null) && time == null) { skipped++; continue; }
+        if (opts.toTime != null && time != null && time > opts.toTime) continue;
+        if (typeof msg.content !== "string") continue;
+        scorer.observe({ msg, fileIndex, position }, msg.content);
+      }
+      if (skipped > 0) log.debug({ file: path, skipped }, "Skipped transcript records that cannot be placed in the search window");
+      // The reader itself stopped at the byte budget, part-way through a line
+      // too long to yield or a run of lines that do not parse.
+      if (progress.cutShort) {
+        stopped = { reason: "bytes", reachedBackTo: ordered ? reachedBackTo : null };
+        break;
+      }
+    }
+
+    // Newest first. In a chronological read set that is the order the records
+    // were read in; with a sidecar it is the records' own timestamps, ties by
+    // file then position, as in `searchTranscriptUnordered`.
+    const newestFirst = (a: RecallCandidate, b: RecallCandidate): number => {
+      if (!ordered) {
+        const ta = orderTimestamp(a.msg);
+        const tb = orderTimestamp(b.msg);
+        if (ta !== tb) return ta < tb ? 1 : -1;
+      }
+      if (a.fileIndex !== b.fileIndex) return a.fileIndex - b.fileIndex;
+      return a.position - b.position;
+    };
+    const { hits, matched } = scorer.results(limit, newestFirst);
+    return {
+      hits: hits.map((hit) => ({ msg: hit.item.msg, score: hit.score, matchIndex: hit.matchIndex })),
+      matched,
+      scanned,
+      ...(scorer.clippedMessages > 0 ? { clipped: scorer.clippedMessages } : {}),
+      ...(stopped ? { stopped } : {}),
+    };
   }
 
   /** Search archive files (compacted SDK events) for a given session ID */

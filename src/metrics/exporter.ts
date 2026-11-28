@@ -60,6 +60,7 @@ export class MetricsExporter {
   private readonly compactions: Counter;
   private readonly issues: Counter;
   private readonly fabricatedMarkers: Counter;
+  private readonly recallSearches: Counter;
 
   constructor(private readonly options: MetricsExporterOptions = {}) {
     this.bus = options.bus ?? watchBus;
@@ -199,6 +200,15 @@ export class MetricsExporter {
       labelNames: ["shape"],
       registers,
     });
+    // Scored recall_conversation searches, by whether any message matched.
+    // The share of "empty" is the signal: a search that keeps finding nothing
+    // for things that were said is what word matching cannot fix.
+    this.recallSearches = new Counter({
+      name: "tomo_recall_searches_total",
+      help: "recall_conversation searches with a query, by outcome (hit or empty).",
+      labelNames: ["outcome"],
+      registers,
+    });
   }
 
   /** Resolves once the HTTP listener is up (or errored — never rejects; a
@@ -295,6 +305,9 @@ export class MetricsExporter {
         break;
       case "fabricated-marker":
         this.fabricatedMarkers.inc({ shape: event.shape });
+        break;
+      case "recall":
+        this.recallSearches.inc({ outcome: event.matched > 0 ? "hit" : "empty" });
         break;
       default:
         break;

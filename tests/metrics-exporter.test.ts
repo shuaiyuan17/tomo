@@ -88,6 +88,17 @@ describe("MetricsExporter", () => {
     expect(await metricValue(exporter, "tomo_heartbeats_total")).toBe(1);
   });
 
+  // The share of recall searches that find nothing is what says word
+  // matching is no longer enough; the query itself is never on the bus.
+  it("counts scored recall searches by whether anything matched", async () => {
+    bus.publish({ type: "recall", sessionKey: "dm:me", matched: 3, stopped: false });
+    bus.publish({ type: "recall", sessionKey: "dm:me", matched: 0, stopped: false });
+    bus.publish({ type: "recall", sessionKey: "telegram:-100", matched: 0, stopped: true });
+
+    expect(await metricValue(exporter, "tomo_recall_searches_total", { outcome: "hit" })).toBe(1);
+    expect(await metricValue(exporter, "tomo_recall_searches_total", { outcome: "empty" })).toBe(2);
+  });
+
   /**
    * The outlet guard (src/agent/inbound-markers.ts) delivers a fabricated
    * inbound marker rather than cutting it, so the ONLY way to notice the rate

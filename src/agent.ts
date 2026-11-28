@@ -7,6 +7,7 @@ import { ForceCompactor } from "./agent/force-compactor.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildIdentityPrompt, promptContextSnapshot } from "./workspace/index.js";
 import { SessionStore } from "./sessions/index.js";
+import type { TranscriptRecall } from "./sessions/store.js";
 import type { ReplyTarget, SessionMessage, UsageBaseline } from "./sessions/types.js";
 import {
   isGroupSessionKey,
@@ -3197,6 +3198,15 @@ export class Agent {
     opts: { query?: string; fromTime?: number; toTime?: number; limit?: number },
   ): SessionMessage[] {
     return this.sessions.searchTranscript(sessionKey, opts);
+  }
+
+  /** Scored transcript recall (recall_conversation with a query), bound to
+   *  the caller's session key like `searchSessionTranscript`. */
+  recallSessionTranscript(
+    sessionKey: string,
+    opts: { queries: string[]; fromTime?: number; toTime?: number; limit?: number },
+  ): TranscriptRecall {
+    return this.sessions.recallTranscript(sessionKey, opts);
   }
 
   private recordLatestInboundMessage(sessionKey: string, channel: Channel, message: IncomingMessage): void {

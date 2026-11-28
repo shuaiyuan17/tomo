@@ -25,7 +25,9 @@ const MILESTONE_LABELS = {
 export function updateText(entry: WebSubsessionUpdate): string {
   if (entry.kind !== "milestone") return entry.plan ? i18n.t("tasks:subsession.updates.planChanged", { reason: entry.text }) : entry.text;
   // A daemon newer than this page may send a milestone it does not know.
-  return Object.hasOwn(MILESTONE_LABELS, entry.milestone) ? i18n.t(MILESTONE_LABELS[entry.milestone]) : "";
+  if (!Object.hasOwn(MILESTONE_LABELS, entry.milestone)) return "";
+  const label = i18n.t(MILESTONE_LABELS[entry.milestone]);
+  return entry.reason ? i18n.t("tasks:subsession.updates.withReason", { label, reason: entry.reason }) : label;
 }
 
 const WAITING = { owner: "waitingOwner", other: "waiting" } as const;
@@ -158,9 +160,9 @@ export function canRetrySend(error: string | undefined): boolean {
   return error !== "subsession_ended" && error !== "subsession_not_found";
 }
 
-/** Plan, done steps or a line of "Decisions and updates": something to show of what the task is doing. */
-export function hasProgress(detail: Pick<WebSubsessionDetail, "plan" | "doneSteps" | "updates">): boolean {
-  return !!detail.plan?.length || !!detail.doneSteps?.length || !!detail.updates?.some((u) => updateText(u));
+/** Plan, done steps, a line of "Decisions and updates" or a checkpoint: something to show of what the task is doing. */
+export function hasProgress(detail: Pick<WebSubsessionDetail, "plan" | "doneSteps" | "updates" | "checkpoint">): boolean {
+  return !!detail.plan?.length || !!detail.doneSteps?.length || !!detail.updates?.some((u) => updateText(u)) || !!detail.checkpoint;
 }
 
 /**
@@ -180,7 +182,7 @@ export function leadsWithChat(rows: readonly SubsessionChatRow[]): boolean {
  * it has a plan.
  */
 export interface ProgressSummary { text: string; look: "running" | "paused" | "pending" | "update" | "done"; done: number; total?: number }
-export function progressSummary(detail: Pick<WebSubsessionDetail, "plan" | "doneSteps" | "updates">, running: boolean): ProgressSummary | undefined {
+export function progressSummary(detail: Pick<WebSubsessionDetail, "plan" | "doneSteps" | "updates" | "checkpoint">, running: boolean): ProgressSummary | undefined {
   const done = detail.doneSteps?.length ?? 0;
   const plan = detail.plan ?? [];
   const total = plan.length ? { total: done + plan.length } : {};
@@ -192,14 +194,17 @@ export function progressSummary(detail: Pick<WebSubsessionDetail, "plan" | "done
   if (own) return { text: updateText(own), look: "update", done };
   const last = detail.doneSteps?.at(-1);
   if (last) return { text: last.text, look: "done", done };
-  return lines[0] ? { text: updateText(lines[0]), look: "update", done } : undefined;
+  if (lines[0]) return { text: updateText(lines[0]), look: "update", done };
+  // Only a checkpoint: the folded line names it, so it can still be opened.
+  return detail.checkpoint ? { text: i18n.t("tasks:subsession.checkpoint.heading"), look: "update", done } : undefined;
 }
 
 /** A row of the chat, in order: the brief, then every line of the conversation, then the report. */
 export type SubsessionChatRow =
   | { kind: "brief"; key: string; brief: string; quote?: string[]; truncated: boolean }
   | { kind: "entry"; key: string; from: "owner" | "task"; tag?: "ask" | "notify"; text: string; at: number; files?: number }
-  | { kind: "report"; key: string; text: string; truncated: boolean }
+  /** `seq`: an earlier report, replaced by a later one before it was read. */
+  | { kind: "report"; key: string; text: string; truncated: boolean; seq?: number }
   | { kind: "pending"; key: string; message: PendingSubsessionMessage };
 
 export function subsessionChatRows(detail: WebSubsessionDetail | undefined, pending: readonly PendingSubsessionMessage[]): SubsessionChatRow[] {
@@ -210,6 +215,7 @@ export function subsessionChatRows(detail: WebSubsessionDetail | undefined, pend
     const tag = entry.from === "task" && (entry.kind === "ask" || entry.kind === "notify") ? entry.kind : undefined;
     rows.push({ kind: "entry", key: `e${entry.seq}`, from: entry.from, ...(tag ? { tag } : {}), text: entry.text, at: entry.at, ...(entry.files ? { files: entry.files } : {}) });
   }
+  for (const earlier of detail.earlierReports ?? []) rows.push({ kind: "report", key: `report${earlier.seq}`, text: earlier.text, truncated: !!earlier.truncated, seq: earlier.seq });
   if (detail.report) rows.push({ kind: "report", key: "report", text: detail.report, truncated: !!detail.reportTruncated });
   for (const message of pending) if (!(message.state === "sent" && message.revision !== undefined && detail.revision >= message.revision)) rows.push({ kind: "pending", key: `p${message.requestId}`, message });
   return rows;

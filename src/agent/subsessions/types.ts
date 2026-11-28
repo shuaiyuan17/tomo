@@ -155,6 +155,8 @@ export interface SubsessionTransition {
   to: SubsessionStatus;
   event: string;
   reason?: string;
+  /** The reason is someone's own words (the owning session's task_cancel), not fixed harness text. */
+  said?: true;
 }
 
 /** A plan step the task marked done (task_plan), with the one-line result it gave. */
@@ -167,12 +169,13 @@ export interface SubsessionDoneStep {
 /**
  * A decision or a change the owner should know about (task_update): scope,
  * approach, blocked or unblocked. `kind: "plan"`: the reason task_plan gave
- * for dropping, rewording or reordering steps.
+ * for dropping, rewording or reordering steps. `kind: "release"`: the
+ * harness's line that the owning session lifted a pause (not the task's).
  */
 export interface SubsessionUpdate {
   at: number;
   text: string;
-  kind?: "plan";
+  kind?: "plan" | "release";
 }
 
 /** A step still ahead in a task's plan (task_plan). Done steps leave the plan for the history. */
@@ -425,12 +428,14 @@ export const REPLY_MAP_KEEP = 200;
 export const OWNER_MESSAGE_IDS_KEEP = 50;
 export const CONVERSATION_KEEP = 40;
 export const DONE_STEPS_KEEP = 20;
-export const UPDATES_KEEP = 20;
-/** A progress or update line is one line of at most this many characters. */
+export const UPDATES_KEEP = 40;
+/** A progress or update line is one line of at most this many characters (an update's lines are joined first). */
 export const PROGRESS_TEXT_MAX = 300;
 /** A plan holds at most this many steps, each one line of at most PLAN_STEP_MAX characters. */
 export const PLAN_MAX_STEPS = 8;
 export const PLAN_STEP_MAX = 120;
+/** task_checkpoint's summary, kept whole up to this many characters. */
+export const CHECKPOINT_MAX = 8000;
 /** A finished step's one-line result. */
 export const STEP_RESULT_MAX = 200;
 
@@ -464,9 +469,20 @@ export function needsOwner(record: Pick<SubsessionRecord, "status" | "ownerActio
   return record.status === "finished" && record.ownerAction ? record.ownerAction : undefined;
 }
 
-/** One line, trimmed, at most `max` characters (by code point, so a pair is never split). */
+/** One line, trimmed, at most `max` characters (by code point, so a pair is never split; trimmed again after the cut, so it reads back the same). */
 export function oneLine(text: string, max: number): string {
-  return Array.from(text.trim().split("\n")[0].trim()).slice(0, max).join("");
+  return Array.from(text.trim().split("\n")[0].trim()).slice(0, max).join("").trimEnd();
+}
+
+/**
+ * Every line joined into one (each line break, \n, \r\n or \r, and the spaces
+ * around it become one space), trimmed, at most `max` characters by code
+ * point, trimmed again after the cut. For an
+ * update the model may write over several lines, where `oneLine` would keep
+ * only the first and drop the reason that follows it.
+ */
+export function joinedLine(text: string, max: number): string {
+  return Array.from(text.trim().replace(/\s*[\r\n]\s*/g, " ")).slice(0, max).join("").trimEnd();
 }
 /** Inputs a task may have owed at once; more are refused (never silently dropped). */
 export const PENDING_INPUT_MAX = 50;

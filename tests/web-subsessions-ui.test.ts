@@ -80,6 +80,7 @@ describe("sub-sessions in the Tasks rail", () => {
     expect(updateText({ at: 1, kind: "update", text: "C was not needed", plan: true })).toBe("Plan changed: C was not needed");
     expect(updateText({ at: 1, kind: "milestone", milestone: "waitingOwner" })).toBe("Waiting for you");
     expect(updateText({ at: 1, kind: "milestone", milestone: "started" })).toBe("Started");
+    expect(updateText({ at: 1, kind: "milestone", milestone: "cancelled", reason: "not needed" })).toBe("Cancelled: not needed");
     // A milestone this page does not know (a newer daemon) shows nothing rather than a raw key.
     expect(updateText({ at: 1, kind: "milestone", milestone: "teleported" as never })).toBe("");
   });
@@ -108,6 +109,9 @@ describe("sub-sessions in the Tasks rail", () => {
     expect(rows.map((r) => r.kind === "entry" ? `${r.from}:${r.tag ?? "-"}` : r.kind)).toEqual(["brief", "task:notify", "owner:-", "task:ask", "task:-", "report", "pending"]);
     expect(rows[0]).toMatchObject({ quote: ["owner words"], brief: "Do it." });
     expect(rows[2]).toMatchObject({ files: 1 });
+    // Earlier reports, replaced before they were read, come before the report.
+    const withEarlier = subsessionChatRows(detail({ report: "Third.", earlierReports: [{ seq: 2, text: "Second." }] }), []);
+    expect(withEarlier.map((r) => r.kind === "report" ? `report:${r.seq ?? "-"}` : r.kind)).toEqual(["brief", "report:2", "report:-"]);
   });
 
   it("leads with what the task is doing until something is said, then with the chat", () => {
@@ -127,6 +131,7 @@ describe("sub-sessions in the Tasks rail", () => {
     expect(hasProgress({ doneSteps: [{ at: 1, text: "A" }] })).toBe(true);
     expect(hasProgress({ updates: [{ at: 1, kind: "milestone", milestone: "started" }] })).toBe(true);
     expect(hasProgress({ updates: [{ at: 1, kind: "milestone", milestone: "teleported" as never }] })).toBe(false);
+    expect(hasProgress({ checkpoint: "Pushed branch x" })).toBe(true);
   });
 
   it("folds what it is doing into one line: the step it is on, else the next, else its latest own update, else its last done step", () => {
@@ -141,6 +146,7 @@ describe("sub-sessions in the Tasks rail", () => {
     expect(progressSummary({ doneSteps, updates: [updates[0]] }, false)).toEqual({ text: "Wrote the fix", look: "done", done: 2 });
     expect(progressSummary({ updates: [updates[0]] }, false)).toEqual({ text: "Finished", look: "update", done: 0 });
     expect(progressSummary({}, false)).toBeUndefined();
+    expect(progressSummary({ checkpoint: "Pushed branch x" }, false)).toEqual({ text: "Checkpoint", look: "update", done: 0 });
   });
 
   it("keeps a sent message until a read of the conversation has it, so it never blinks out", () => {

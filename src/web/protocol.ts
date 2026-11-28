@@ -147,7 +147,8 @@ export type WebSubsessionMilestone = "started" | "waitingOwner" | "finished" | "
 export type WebSubsessionUpdate =
   /** `plan`: the reason the task gave for changing its plan. */
   | { at: number; kind: "update"; text: string; plan?: true }
-  | { at: number; kind: "milestone"; milestone: WebSubsessionMilestone };
+  /** `reason`: why it was cancelled or failed, when the record says. */
+  | { at: number; kind: "milestone"; milestone: WebSubsessionMilestone; reason?: string };
 export interface WebSubsessionDetail extends WebSubsession {
   brief: string;
   /** The brief was cut for the browser. */
@@ -162,6 +163,10 @@ export interface WebSubsessionDetail extends WebSubsession {
   doneSteps?: WebSubsessionDoneStep[];
   /** Decisions and updates, newest first, with the lifecycle's milestones among them. Absent when none. */
   updates?: WebSubsessionUpdate[];
+  /** What the task saved with task_checkpoint: its side effects so far, what it ruled out. */
+  checkpoint?: string;
+  /** Reports a later one replaced before they were read, oldest first (the newest few). */
+  earlierReports?: Array<{ seq: number; text: string; truncated?: true }>;
   report?: string;
   reportTruncated?: boolean;
 }

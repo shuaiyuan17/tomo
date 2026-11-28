@@ -3,7 +3,7 @@ import { z } from "zod";
 import { EFFORT_LEVELS } from "../config.js";
 import type { SubsessionService } from "../agent/subsessions/service.js";
 import type { OwnerTurnMessage } from "../agent/audience.js";
-import { currentStep, DONE_STEPS_KEEP, needsOwner, oneLine, OPEN_STATUSES, OWNER_ACTION_MAX, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, reportNumber, STEP_RESULT_MAX, type SubsessionRecord } from "../agent/subsessions/types.js";
+import { CHECKPOINT_MAX, currentStep, DONE_STEPS_KEEP, joinedLine, needsOwner, oneLine, OPEN_STATUSES, OWNER_ACTION_MAX, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, reportNumber, STEP_RESULT_MAX, type SubsessionRecord } from "../agent/subsessions/types.js";
 
 /** The task_* tools a sub-session reports through (its own session only). */
 export const SUBSESSION_SELF_TOOL_NAMES = ["task_reply", "task_ask", "task_plan", "task_update", "task_checkpoint", "task_finish", "task_reopen", "task_status"] as const;
@@ -129,7 +129,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_plan",
-      "Set the steps still ahead, in order, replacing the plan before (an empty list clears it). Mark the one you are on in_progress (at most one). Move each step you just finished into `done`, with a one-line result (a step in `done` is not also kept ahead; to do it again, add it in a later call, in new words). Silent: the owner sees the plan and the finished steps when they look. Set it when you start, and keep it current. Give each step its own words (no two alike), keep them the same from call to call and add new steps at the end; to drop, reword or reorder a step still ahead, give `reason` (one line), which the owner sees under Decisions and updates.",
+      "Set the steps still ahead, in order, replacing the plan before (an empty list clears it). Mark the one you are on in_progress (at most one). Move each step you just finished into `done`, with a short result (a step in `done` is not also kept ahead; to do it again, add it in a later call, in new words). Silent: the owner sees the plan and the finished steps when they look. Set it when you start, and keep it current. Give each step its own words (no two alike), keep them the same from call to call and add new steps at the end; to drop, reword or reorder a step still ahead, give `reason` (why), which the owner sees under Decisions and updates.",
       {
         steps: z.array(z.object({
           step: z.string().min(1).max(2000).describe(`One short line: what this step gets done (cut at ${PLAN_STEP_MAX} characters).`),
@@ -137,9 +137,9 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
         })).max(PLAN_MAX_STEPS).describe("The steps still ahead, in order. Not the finished ones."),
         done: z.array(z.object({
           step: z.string().min(1).max(2000).describe("The step, in exactly the words it had in the plan."),
-          result: z.string().max(2000).optional().describe(`One line: what came of it (cut at ${STEP_RESULT_MAX} characters).`),
+          result: z.string().max(2000).optional().describe(`What came of it, briefly (several lines are joined into one; cut at ${STEP_RESULT_MAX} characters).`),
         })).max(DONE_STEPS_KEEP).optional().describe("Steps finished since the last task_plan call."),
-        reason: z.string().max(2000).optional().describe("Required when this drops, rewords or reorders a step still ahead: one line on why the plan changed."),
+        reason: z.string().max(2000).optional().describe(`Required when this drops, rewords or reorders a step still ahead: why the plan changed (several lines are joined into one; cut at ${PROGRESS_TEXT_MAX} characters).`),
       },
       async ({ steps, done, reason }) => {
         const r = service("task_plan");
@@ -147,13 +147,17 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
         if (steps.filter((s) => s.status === "in_progress").length > 1) return fail("task_plan", "at most one step can be in_progress.");
         if (steps.some((s) => !oneLine(s.step, PLAN_STEP_MAX)) || (done ?? []).some((d) => !oneLine(d.step, PLAN_STEP_MAX))) return fail("task_plan", "a step is blank. Nothing was saved.");
         const outcome = r.s.setPlan(deps.key, steps, done ?? [], reason);
-        if (outcome.ok) return ok("Plan saved.");
+        if (outcome.ok) {
+          // The one nudge toward task_update: steps are being finished and no decision is on record yet.
+          const noDecisions = (done ?? []).length > 0 && !(outcome.record.updates ?? []).some((u) => !u.kind);
+          return ok(noDecisions ? "Plan saved. No decisions are on record yet: if a step you just finished involved a choice (an approach, a tool, one option over another) or a finding that changed the plan, record it with task_update, with the reason." : "Plan saved.");
+        }
         if (outcome.error === "duplicate_step") return fail("task_plan", "two steps read the same. Give each step its own words (for example \"Run the tests again\" for the second). Nothing was saved.");
         if (outcome.error === "reason_required") {
           const gone = outcome.missing.map((step) => `"${step}"`).join(", ");
           return fail("task_plan", outcome.missing.length > 0
-            ? `${gone} ${outcome.missing.length === 1 ? "is" : "are"} no longer in the plan and not in \`done\`. If you finished ${outcome.missing.length === 1 ? "it" : "them"}, put ${outcome.missing.length === 1 ? "it" : "them"} in \`done\` in exactly these words. If you dropped or reworded ${outcome.missing.length === 1 ? "it" : "them"}, give \`reason\` (one line on why the plan changed). Nothing was saved.`
-            : "this reorders the steps still ahead. Give `reason` (one line on why), or keep their order and add new steps at the end. Nothing was saved.");
+            ? `${gone} ${outcome.missing.length === 1 ? "is" : "are"} no longer in the plan and not in \`done\`. If you finished ${outcome.missing.length === 1 ? "it" : "them"}, put ${outcome.missing.length === 1 ? "it" : "them"} in \`done\` in exactly these words. If you dropped or reworded ${outcome.missing.length === 1 ? "it" : "them"}, give \`reason\` (why the plan changed). Nothing was saved.`
+            : "this reorders the steps still ahead. Give `reason` (why), or keep their order and add new steps at the end. Nothing was saved.");
         }
         return fail("task_plan", "no task record for this session.");
       },
@@ -161,20 +165,20 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
     ),
     tool(
       "task_update",
-      "Record a decision or a change the owner should know about: the scope changed, an approach was chosen (and why, briefly), you are blocked or unblocked, a finding that changes the plan. Kept with its time and shown to the owner as \"Decisions and updates\". Silent (not a message). Not for routine progress: that is task_plan.",
-      { line: z.string().min(1).max(2000).describe("One line: what was decided or what changed (cut at 300 characters).") },
+      "Record one line each time you make a choice (an approach, a tool, an option over another), find something that changes the plan, change the scope, or get blocked or unblocked, with the reason in the same line (\"Using X, not Y: Y needs a login\"). Kept with its time and shown to the owner as \"Decisions and updates\", so they can follow why the work went the way it did. Silent (not a message). Not for finishing a step: that is task_plan.",
+      { line: z.string().min(1).max(2000).describe("What you decided or found, and why. Several lines are joined into one; cut at 300 characters.") },
       async ({ line }) => {
         const r = service("task_update");
         if (!r.ok) return r.error;
-        if (!oneLine(line, PROGRESS_TEXT_MAX)) return fail("task_update", "the line is blank. Nothing was saved.");
+        if (!joinedLine(line, PROGRESS_TEXT_MAX)) return fail("task_update", "the line is blank. Nothing was saved.");
         return r.s.postUpdate(deps.key, line) ? ok("Update saved.") : fail("task_update", "no task record for this session.");
       },
       { alwaysLoad: true, searchHint: "task update decision change blocked scope" },
     ),
     tool(
       "task_checkpoint",
-      "Save what the plan doesn't show: every side effect so far (branch, commits, pushes, PRs, files, messages) and anything you ruled out, replacing the checkpoint before. It survives compaction and restarts. Save it before you end a turn with work left, and before a step that is hard to undo.",
-      { summary: z.string().min(1).max(8000) },
+      "Save what the plan doesn't show: every side effect so far (branch, commits, pushes, PRs, files, messages) and anything you ruled out, replacing the checkpoint before. It survives compaction and restarts, and the owner can read it in the task panel. Save it before you end a turn with work left, and before a step that is hard to undo.",
+      { summary: z.string().min(1).max(CHECKPOINT_MAX) },
       async ({ summary }) => {
         const r = service("task_checkpoint");
         if (!r.ok) return r.error;
@@ -212,7 +216,7 @@ export function buildTaskSelfTools(deps: { service: () => SubsessionService | un
         const outcome = r.s.reopen(deps.key);
         return outcome.ok ? ok("Reopened.") : fail("task_reopen", `this task is ${outcome.from ?? "unknown"}; only a finished task can be reopened.`);
       },
-      { searchHint: "task reopen more work" },
+      { alwaysLoad: true, searchHint: "task reopen more work" },
     ),
     tool(
       "task_status",
@@ -307,7 +311,8 @@ export function buildTaskOwnerTools(deps: {
         // Finished and waiting on the owner (as /s stop): its work is done, and
         // cancelling would hide the ask. task_done is what clears it.
         if (needsOwner(record)) return fail("task_cancel", `${record.id} has finished and is waiting for the owner to: ${needsOwner(record)}. There is nothing to cancel. Once they say it is done (or no longer needed), call task_done("${record.id}", ${reportNumber(record)}).`);
-        const outcome = await c.s.cancel(record.id, reason ?? "cancelled from the main session");
+        const said = reason?.trim() ? reason.trim() : undefined;
+        const outcome = await c.s.cancel(record.id, said ?? "cancelled from the main session", !!said);
         if (!outcome.ok) return fail("task_cancel", `${record.id} is ${outcome.from ?? "unknown"}; there is nothing to cancel.`);
         return ok(outcome.changed ? `Cancelled ${record.id}.` : `${record.id} was already cancelled.`);
       },

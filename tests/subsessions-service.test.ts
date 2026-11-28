@@ -2324,7 +2324,7 @@ describe("SubsessionService: the quota gate", () => {
     // On the record: who let it go on, and it was the main session's note, never the owner's word.
     const record = h.store.get(t.id)!;
     expect(record.transitions.find((x) => x.event === "release")).toMatchObject({ from: "waiting", to: "queued", reason: expect.stringContaining("the main session lifted the pause") });
-    expect(record.updates?.map((u) => u.text)).toEqual(["Pause lifted by the main session; it goes on."]);
+    expect(record.updates?.map((u) => [u.text, u.kind])).toEqual([["Pause lifted by the main session; it goes on.", "release"]]);
     expect(record.activeAtOwnerInputMs).toBeUndefined();
     // The go-ahead was for that work: it left with the finish.
     expect(record.quotaPass).toBeUndefined();
@@ -3179,8 +3179,9 @@ describe("progress, plan and updates", () => {
     h.service.postUpdate(t.sessionKey, "Went with approach B");
     h.service.postUpdate(t.sessionKey, "Went with approach B");
     h.service.postUpdate(t.sessionKey, "  ");
-    h.service.postUpdate(t.sessionKey, "Blocked on CI\ndetails");
-    expect(h.store.get(t.id)!.updates?.map((u) => u.text)).toEqual(["Went with approach B", "Blocked on CI"]);
+    // Every line is kept, joined into one: a reason on the next line is not lost.
+    h.service.postUpdate(t.sessionKey, "Blocked on CI\n  details");
+    expect(h.store.get(t.id)!.updates?.map((u) => u.text)).toEqual(["Went with approach B", "Blocked on CI details"]);
     expect(h.store.get(t.id)!.updates?.every((u) => typeof u.at === "number")).toBe(true);
     for (let i = 0; i < UPDATES_KEEP + 5; i++) h.service.postUpdate(t.sessionKey, `u${i}`);
     const updates = h.store.get(t.id)!.updates!;
@@ -3200,6 +3201,8 @@ describe("progress, plan and updates", () => {
     h.service.setPlan(t.sessionKey, [], [{ step: "a", result: "ok" }]);
     expect(h.store.get(t.id)!.doneSteps).toEqual([{ at: expect.any(Number), text: "a", result: "ok" }]);
     expect(h.store.get(t.id)!.plan).toBeUndefined();
+    h.service.setPlan(t.sessionKey, [], [{ step: "b", result: "merged\n  after a rebase" }]);
+    expect(h.store.get(t.id)!.doneSteps?.at(-1)).toMatchObject({ text: "b", result: "merged after a rebase" });
     for (let i = 0; i < DONE_STEPS_KEEP + 2; i++) h.service.setPlan(t.sessionKey, [], [{ step: `d${i}` }]);
     expect(h.store.get(t.id)!.doneSteps).toHaveLength(DONE_STEPS_KEEP);
   });

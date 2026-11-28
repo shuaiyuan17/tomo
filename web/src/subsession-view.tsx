@@ -129,10 +129,12 @@ export function SubsessionView({ summary, revision, onBack, send, done }: { summ
       fold={progress && foldLine ? <ProgressFold summary={foldLine} open={progressOpen} onOpenChange={setProgressOpen}>
         <Doing plan={progress.plan} done={progress.doneSteps} running={running} />
         <Updates updates={progress.updates} />
+        <Checkpoint text={progress.checkpoint} />
       </ProgressFold> : undefined}
       overview={progress && !chatFirst ? <div data-testid="subsession-overview" className="flex flex-col gap-4 px-0.5 pt-1">
         <Doing plan={progress.plan} done={progress.doneSteps} running={running} roomy />
         <Updates updates={progress.updates} roomy />
+        <Checkpoint text={progress.checkpoint} />
       </div> : undefined} />
     {status === "gone" && detail && <p role="status" className="m-0 mx-2.5 mb-2 text-[11.5px] text-muted-foreground">{t("subsession.gone")}</p>}
     {send && <SubsessionComposer id={id} writable={writable} ended={!shown.writable} onSend={(text) => deliver({ requestId: crypto.randomUUID(), text, state: "sending" })} />}
@@ -207,6 +209,22 @@ function Updates({ updates, roomy }: { updates?: WebSubsessionUpdate[]; roomy?: 
     </ol>
     {view.hidden > 0 || open && lines.length > keep ? <button type="button" aria-expanded={open} onClick={() => setOpen((v) => !v)} className={cn(foldButton, "mt-1")}>
       {open ? t("subsession.updates.fewer") : t("subsession.updates.more", { count: lines.length })}</button> : null}
+  </section>;
+}
+
+/** What the task saved with task_checkpoint (its side effects so far, what it ruled out): three lines, the rest on Show more. */
+function Checkpoint({ text }: { text?: string }) {
+  const { t } = useTranslation("tasks");
+  const [open, setOpen] = useState(false);
+  if (!text) return null;
+  return <section aria-label={t("subsession.checkpoint.heading")} data-testid="subsession-checkpoint">
+    <div className="flex items-center justify-between gap-2">
+      <p className={sectionHeading}>{t("subsession.checkpoint.heading")}</p>
+      <button type="button" aria-expanded={open} onClick={() => setOpen((v) => !v)}
+        className="rounded px-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground">{open ? t("brief.less") : t("brief.more")}</button>
+    </div>
+    <div className={cn("text-[12px] leading-snug text-foreground/85", open ? "max-h-[40vh] overflow-y-auto pr-1" : "line-clamp-3")}>
+      <Text breaks>{text}</Text></div>
   </section>;
 }
 
@@ -289,7 +307,7 @@ export function Chat({ rows, status, id, onRetry, overview, fold, follow }: { ro
 
 function rowView(row: SubsessionChatRow, id: string, onRetry: (message: PendingSubsessionMessage) => void) {
   if (row.kind === "brief") return <Brief brief={row.brief} quote={row.quote} truncated={row.truncated} />;
-  if (row.kind === "report") return <Report text={row.text} truncated={row.truncated} />;
+  if (row.kind === "report") return <Report text={row.text} truncated={row.truncated} seq={row.seq} />;
   if (row.kind === "pending") return <PendingBubble message={row.message} onRetry={() => onRetry(row.message)} />;
   return row.from === "owner" ? <OwnerBubble text={row.text} at={row.at} files={row.files} /> : <TaskMessage id={id} text={row.text} at={row.at} tag={row.tag} />;
 }
@@ -344,10 +362,12 @@ function Brief({ brief, quote, truncated }: { brief: string; quote?: string[]; t
   </section>;
 }
 
-function Report({ text, truncated }: { text: string; truncated: boolean }) {
+/** The report, or (`seq`) an earlier one a later report replaced before it was read. */
+function Report({ text, truncated, seq }: { text: string; truncated: boolean; seq?: number }) {
   const { t } = useTranslation("tasks");
-  return <section aria-label={t("subsession.report")} className="rounded-lg border bg-card/70 px-2.5 py-2">
-    <p className="m-0 mb-1 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">{t("subsession.report")}</p>
+  const heading = seq === undefined ? t("subsession.report") : t("subsession.earlierReport", { seq });
+  return <section aria-label={heading} className="rounded-lg border bg-card/70 px-2.5 py-2">
+    <p className="m-0 mb-1 text-[10.5px] font-medium tracking-[0.08em] text-muted-foreground uppercase">{heading}</p>
     <div className="markdown text-[12.5px]! leading-relaxed!"><Text>{truncated ? t("brief.truncated", { text }) : text}</Text></div>
   </section>;
 }

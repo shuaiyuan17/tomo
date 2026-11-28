@@ -25,7 +25,7 @@ import {
 } from "./prompt.js";
 import type { OwnerTurnMessage } from "../audience.js";
 import { classifyFailure, failureDetail, failureHint, type TurnFailure } from "./failure.js";
-import { MAIN_RELEASABLE_PAUSES, QUOTA_PASS_FALLBACK_MS, type PauseKind, OPEN_STATUSES, OWNER_ACTION_MAX, OWNER_MESSAGE_MARKER, PENDING_INPUT_MAX, PENDING_INPUT_OWNER_RESERVE, needsOwner, reportNumber, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, STEP_RESULT_MAX, TERMINAL_STATUSES, oneLine, type SubsessionPlanStep, activeTotalMs, appendInput, HARNESS, type InputOrigin, lastInputSeq, type SubsessionConversationEntry, type SubsessionInput, type SubsessionRecord, type SubsessionStatus } from "./types.js";
+import { MAIN_RELEASABLE_PAUSES, QUOTA_PASS_FALLBACK_MS, type PauseKind, OPEN_STATUSES, OWNER_ACTION_MAX, OWNER_MESSAGE_MARKER, PENDING_INPUT_MAX, PENDING_INPUT_OWNER_RESERVE, needsOwner, reportNumber, CHECKPOINT_MAX, PLAN_MAX_STEPS, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, STEP_RESULT_MAX, TERMINAL_STATUSES, joinedLine, oneLine, type SubsessionPlanStep, activeTotalMs, appendInput, HARNESS, type InputOrigin, lastInputSeq, type SubsessionConversationEntry, type SubsessionInput, type SubsessionRecord, type SubsessionStatus } from "./types.js";
 
 
 /** How a task turn ended, as the agent's turn runner saw it. */
@@ -633,10 +633,15 @@ export class SubsessionService {
     }
   }
 
-  async cancel(id: string, reason: string): Promise<TransitionOutcome> {
+  /** `said`: the reason is the canceller's own words (task_cancel's), not fixed harness text, so the owner may be shown it. */
+  async cancel(id: string, reason: string, said = false): Promise<TransitionOutcome> {
     if (!this.available()) return { ok: false, from: null };
     // A live ending: the status no longer comes from a backup.
-    const outcome = this.transition(id, "cancel", { reason, patch: (r) => { delete r.restored; } });
+    const outcome = this.transition(id, "cancel", { reason, patch: (r) => {
+      delete r.restored;
+      const last = r.transitions.at(-1);
+      if (said && last?.event === "cancel" && last.to === "cancelled") last.said = true;
+    } });
     if (!outcome.ok || !outcome.changed) return outcome;
     this.continueOwed.delete(id);
     this.safely(() => this.deps.removeCronJobs(outcome.record.sessionKey), "remove cron jobs");
@@ -796,7 +801,7 @@ export class SubsessionService {
         // must not pause it again at once.
         if (kind === "no_progress") r.turnsWithoutProgress = 0;
         // Where the owner looks ("Decisions and updates"): who let it go on.
-        (r.updates ??= []).push({ at: now, text: ownerT("subsessions")("releasedByMain") });
+        (r.updates ??= []).push({ at: now, text: ownerT("subsessions")("releasedByMain"), kind: "release" });
       },
     });
     if (!outcome.ok) return outcome.refused === NOT_RELEASABLE ? undefined : outcome;
@@ -1289,14 +1294,16 @@ export class SubsessionService {
   }
 
   /**
-   * task_update: a decision or change the owner should know about (scope,
-   * approach, blocked or unblocked), kept with its time. The same line twice
-   * in a row is kept once. Counts as progress.
+   * task_update: a decision or change the owner should know about (a choice
+   * and why, a finding that changes the plan, scope, blocked or unblocked),
+   * kept with its time. Lines are joined into one, so a reason written on the
+   * next line is kept. The same line twice in a row is kept once. Counts as
+   * progress.
    */
   postUpdate(key: string, line: string): SubsessionRecord | undefined {
     const record = this.store.byKey(key);
     if (!record) return undefined;
-    const value = oneLine(line, PROGRESS_TEXT_MAX);
+    const value = joinedLine(line, PROGRESS_TEXT_MAX);
     if (!value) return record;
     let changed = false;
     const at = this.now();
@@ -1327,7 +1334,7 @@ export class SubsessionService {
     if (!record) return { ok: false, error: "no_record" };
     const finished = done.flatMap((d) => {
       const text = oneLine(d.step, PLAN_STEP_MAX);
-      const result = d.result ? oneLine(d.result, STEP_RESULT_MAX) : "";
+      const result = d.result ? joinedLine(d.result, STEP_RESULT_MAX) : "";
       return text ? [{ text, ...(result ? { result } : {}) }] : [];
     });
     const finishedTexts = new Set(finished.map((f) => f.text));
@@ -1341,7 +1348,7 @@ export class SubsessionService {
     if (new Set(sent.map((step) => step.text)).size < sent.length) return { ok: false, error: "duplicate_step" };
     // A step sent as done and still in `steps` is done: it is not also shown ahead.
     const next = sent.filter((step) => !finishedTexts.has(step.text)).slice(0, PLAN_MAX_STEPS);
-    const why = reason ? oneLine(reason, PROGRESS_TEXT_MAX) : "";
+    const why = reason ? joinedLine(reason, PROGRESS_TEXT_MAX) : "";
     let changed = false;
     let refused = false;
     let missing: string[] = [];
@@ -1387,7 +1394,7 @@ export class SubsessionService {
     const record = this.store.byKey(key);
     if (!record) return undefined;
     this.progressChanged.add(record.id);
-    return this.store.update(record.id, (r) => { r.checkpoint = summary.trim().slice(0, 8000); });
+    return this.store.update(record.id, (r) => { r.checkpoint = Array.from(summary.trim()).slice(0, CHECKPOINT_MAX).join(""); });
   }
 
   /**
@@ -2918,6 +2925,7 @@ export class SubsessionService {
       const note = formatTomoEvent("subsession-report", [
         `Sub-session ${record.id} ("${record.title}") finished. Its report #${record.reportSeq ?? 1}${report.length > REPORT_NOTE_EXCERPT ? " (start; read the whole report with task_status)" : ""}:`,
         excerpt,
+        ...decisionLines(record),
         ...(earlier.length > 0 ? [`Its earlier report${earlier.length === 1 ? "" : "s"} ${earlier.join(", ")} ${earlier.length === 1 ? "is" : "are"} kept too: task_status shows ${earlier.length === 1 ? "it" : "them"}.`] : []),
         needsOwner(record)
           ? `It needs the owner to: ${needsOwner(record)!.replace(/[.。]+$/, "")}. Tell them. The task shows as "Needs you" until they do it: once they say it is done (or no longer needed), call task_done("${record.id}", ${reportNumber(record)}).`
@@ -3330,6 +3338,25 @@ function newOwnerInputPending(record: SubsessionRecord): string | undefined {
 
 function hasPendingInput(record: SubsessionRecord): string | undefined {
   return record.pendingInput.length > 0 ? "input is pending" : undefined;
+}
+
+/** How many of a task's recorded decisions its report note repeats to the owning session. */
+const REPORT_NOTE_DECISIONS = 5;
+
+/**
+ * The newest decisions and updates a finished task recorded (task_update, and
+ * the reasons it gave for changing its plan), for its report note: the owning
+ * session otherwise sees them only if it reads task_status.
+ */
+function decisionLines(record: SubsessionRecord): string[] {
+  // Only what the task recorded: the harness's own lines (a release) are not its decisions.
+  const recorded = (record.updates ?? []).filter((u) => u.kind !== "release");
+  const updates = recorded.slice(-REPORT_NOTE_DECISIONS);
+  if (updates.length === 0) return [];
+  return [
+    `Decisions and updates it recorded (newest last${recorded.length > updates.length ? `; the ${updates.length} newest of ${recorded.length}` : ""}):`,
+    ...updates.map((u) => `- ${u.kind === "plan" ? `Plan changed: ${u.text}` : u.text}`),
+  ];
 }
 
 /** A report note's name: the task id and which of its reports (`s3#2`). */

@@ -1,4 +1,4 @@
-import { activeTotalMs, currentStep, isTimestamp, needsOwner, reportNumber, type SubsessionRecord } from "../agent/subsessions/types.js";
+import { activeTotalMs, CHECKPOINT_MAX, currentStep, isTimestamp, joinedLine, needsOwner, OWNER_ACTION_MAX, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, reportNumber, STEP_RESULT_MAX, TRANSITION_LOG_KEEP, UPDATES_KEEP, type SubsessionRecord } from "../agent/subsessions/types.js";
 import type { SubsessionEvent } from "../agent/subsessions/state-machine.js";
 import type { WebSubsession, WebSubsessionDetail, WebSubsessionMilestone, WebSubsessionStatus, WebSubsessionUpdate } from "./protocol.js";
 
@@ -13,15 +13,19 @@ export const SUBSESSION_ENDED_VISIBLE_MS = 72 * 60 * 60 * 1000;
 /** Every open task is listed (their number is bounded by `subsessions.maxOpen`); ended ones fill up to this many rows. */
 export const MAX_RAIL_SUBSESSIONS = 24;
 const TITLE_LIMIT = 120;
-const LINE_LIMIT = 300;
 export const BRIEF_LIMIT = 8_000;
 export const REPORT_LIMIT = 20_000;
+/** Earlier reports a detail carries at most (the newest), each clipped like the report. */
+export const EARLIER_REPORTS_LIMIT = 2;
 const QUOTE_LIMIT = 2_000;
-const STEP_LIMIT = 120;
-const RESULT_LIMIT = 200;
-/** Update entries a detail carries at most (the record keeps 20 updates; milestones come from its 50 status changes). */
-export const UPDATES_LIMIT = 40;
-/** Per conversation line. With the table's 40 lines, brief and report, a detail stays well under the 2 MiB IPC frame even fully escaped. */
+/** Update entries a detail carries at most: every update the record keeps, plus a milestone for each status change it keeps. */
+export const UPDATES_LIMIT = UPDATES_KEEP + TRANSITION_LOG_KEEP;
+/**
+ * Per conversation line. With the table's 40 lines, the quote, brief, checkpoint,
+ * report and earlier reports (each cut to BRIEF_LIMIT), a detail is about 1.6 MB
+ * fully escaped: under the 2 MiB IPC budget, which is shared with whatever else
+ * is in flight, so keep any new field small.
+ */
 export const ENTRY_LIMIT = 4_000;
 
 const OPEN = new Set<WebSubsessionStatus>(["queued", "active", "waiting"]);
@@ -51,8 +55,8 @@ export function subsessionView(record: SubsessionRecord, scope: string, now: num
     title: clip(record.title, TITLE_LIMIT).text,
     status,
     ...(status === "waiting" && record.waitingOn ? { waitingOn: record.waitingOn } : {}),
-    ...(action ? { ownerAction: clip(action, LINE_LIMIT).text, reportSeq: reportNumber(record) } : {}),
-    ...(step ? { step: clip(step, STEP_LIMIT).text } : {}),
+    ...(action ? { ownerAction: clip(action, OWNER_ACTION_MAX).text, reportSeq: reportNumber(record) } : {}),
+    ...(step ? { step: clip(step, PLAN_STEP_MAX).text } : {}),
     // Only an open task has a turn worth showing as running.
     working: working && OPEN.has(status),
     ...(live.background && status === "waiting" && record.waitingOn === "external" ? { background: true as const } : {}),
@@ -95,7 +99,7 @@ const MILESTONES: Partial<Record<SubsessionEvent, WebSubsessionMilestone>> = {
  * start counts only while the log still has the spawn before it.
  */
 export function subsessionUpdates(record: SubsessionRecord): WebSubsessionUpdate[] {
-  const out: WebSubsessionUpdate[] = (record.updates ?? []).filter((u) => isTimestamp(u.at)).map((u) => ({ at: u.at, kind: "update" as const, text: clip(u.text, LINE_LIMIT).text, ...(u.kind === "plan" ? { plan: true as const } : {}) }));
+  const out: WebSubsessionUpdate[] = (record.updates ?? []).filter((u) => isTimestamp(u.at)).map((u) => ({ at: u.at, kind: "update" as const, text: clip(u.text, PROGRESS_TEXT_MAX).text, ...(u.kind === "plan" ? { plan: true as const } : {}) }));
   // A second task_ask while it is still waiting for the owner (from a
   // background report's turn) is not a new milestone.
   let waitingOwner = false;
@@ -106,7 +110,9 @@ export function subsessionUpdates(record: SubsessionRecord): WebSubsessionUpdate
     const event = t.event as SubsessionEvent;
     const milestone = event === "start" ? (i > 0 && log[i - 1].from === null ? "started" : undefined)
       : t.to === "cancelled" || t.to === "failed" ? t.to : MILESTONES[event];
-    if (milestone && !(milestone === "waitingOwner" && waitingOwner)) out.push({ at: t.at, kind: "milestone", milestone });
+    // A cancel says why when the reason was the canceller's own words; the harness's fixed reasons are English, not shown.
+    const reason = milestone === "cancelled" && t.said === true && typeof t.reason === "string" ? joinedLine(t.reason, PROGRESS_TEXT_MAX) : "";
+    if (milestone && !(milestone === "waitingOwner" && waitingOwner)) out.push({ at: t.at, kind: "milestone", milestone, ...(reason ? { reason } : {}) });
     waitingOwner = milestone === "waitingOwner" || (waitingOwner && t.to === "waiting");
   });
   // Stable: at the same instant, a milestone reads as the later one (a finish lands after the task's last update).
@@ -120,15 +126,18 @@ export function subsessionDetail(record: SubsessionRecord, scope: string, now: n
   const brief = clip(record.brief, BRIEF_LIMIT);
   const report = record.report !== undefined ? clip(record.report, REPORT_LIMIT) : undefined;
   const updates = subsessionUpdates(record);
-  const doneSteps = (record.doneSteps ?? []).filter((d) => isTimestamp(d.at)).map((d) => ({ at: d.at, text: clip(d.text, STEP_LIMIT).text, ...(d.result ? { result: clip(d.result, RESULT_LIMIT).text } : {}) }));
+  const doneSteps = (record.doneSteps ?? []).filter((d) => isTimestamp(d.at)).map((d) => ({ at: d.at, text: clip(d.text, PLAN_STEP_MAX).text, ...(d.result ? { result: clip(d.result, STEP_RESULT_MAX).text } : {}) }));
+  const earlierReports = (Array.isArray(record.earlierReports) ? record.earlierReports : [])
+    .filter((e) => !!e && typeof e.seq === "number" && typeof e.text === "string").slice(-EARLIER_REPORTS_LIMIT)
+    .map((e) => { const c = clip(e.text, BRIEF_LIMIT); return { seq: e.seq, text: c.text, ...(c.cut ? { truncated: true as const } : {}) }; });
   // The steps ahead mean something only while the task can still take them.
-  const plan = OPEN.has(view.status) && record.plan?.length ? record.plan.map((step) => ({ text: clip(step.text, STEP_LIMIT).text, status: step.status })) : undefined;
+  const plan = OPEN.has(view.status) && record.plan?.length ? record.plan.map((step) => ({ text: clip(step.text, PLAN_STEP_MAX).text, status: step.status })) : undefined;
   return {
     ...view,
     brief: brief.text,
     ...(brief.cut ? { briefTruncated: true } : {}),
     ...(record.quote?.length ? { quote: record.quote.map((line) => clip(line, QUOTE_LIMIT).text) } : {}),
-    ...(record.waitingReason ? { waitingReason: clip(record.waitingReason, LINE_LIMIT).text } : {}),
+    ...(record.waitingReason ? { waitingReason: clip(record.waitingReason, PROGRESS_TEXT_MAX).text } : {}),
     conversation: record.conversation.map((entry) => ({
       seq: entry.seq, at: entry.at, from: entry.from, kind: entry.kind, text: clip(entry.text, ENTRY_LIMIT).text,
       ...(entry.files ? { files: entry.files } : {}),
@@ -136,6 +145,8 @@ export function subsessionDetail(record: SubsessionRecord, scope: string, now: n
     ...(plan ? { plan } : {}),
     ...(doneSteps.length > 0 ? { doneSteps } : {}),
     ...(updates.length > 0 ? { updates } : {}),
+    ...(typeof record.checkpoint === "string" && record.checkpoint.trim() ? { checkpoint: clip(record.checkpoint, CHECKPOINT_MAX).text } : {}),
+    ...(earlierReports.length > 0 ? { earlierReports } : {}),
     ...(report ? { report: report.text, ...(report.cut ? { reportTruncated: true } : {}) } : {}),
   };
 }

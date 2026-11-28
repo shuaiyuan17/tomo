@@ -6,10 +6,10 @@ import { randomUUID } from "node:crypto";
 import { SUBSESSION_EVENT_MS, WebChannel, type WebSubsessionAccess } from "../src/channels/web.js";
 import { WatchBus } from "../src/watch/bus.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
-import type { SubsessionRecord } from "../src/agent/subsessions/types.js";
+import { TRANSITION_LOG_KEEP, UPDATES_KEEP, type SubsessionRecord } from "../src/agent/subsessions/types.js";
 import type { OwnerConfig } from "../src/owner.js";
 import { rpcSchema, type WebEvent, type WebSubsession } from "../src/web/protocol.js";
-import { BRIEF_LIMIT, ENTRY_LIMIT, MAX_RAIL_SUBSESSIONS, SUBSESSION_ENDED_VISIBLE_MS, UPDATES_LIMIT, subsessionDetail, subsessionUpdates, subsessionList, subsessionView } from "../src/web/subsessions-view.js";
+import { BRIEF_LIMIT, EARLIER_REPORTS_LIMIT, ENTRY_LIMIT, MAX_RAIL_SUBSESSIONS, SUBSESSION_ENDED_VISIBLE_MS, UPDATES_LIMIT, subsessionDetail, subsessionUpdates, subsessionList, subsessionView } from "../src/web/subsessions-view.js";
 
 const NOW = 1_800_000_000_000;
 const H = 3_600_000;
@@ -103,6 +103,18 @@ describe("the rail's view of sub-sessions", () => {
     expect(detail.conversation[0]).toEqual({ seq: 1, at: NOW, from: "owner", kind: "message", text: "hi", files: 2 });
     expect(Array.from(detail.conversation[1].text)).toHaveLength(ENTRY_LIMIT + 1);
   });
+
+  it("carries the checkpoint and the newest earlier reports, so the owner can read them", () => {
+    const earlierReports = [{ seq: 1, text: "first" }, { seq: 2, text: "second" }, { seq: 3, text: "r".repeat(BRIEF_LIMIT + 3) }];
+    const detail = subsessionDetail(record("s1", { checkpoint: "Pushed branch x; ruled out y.", earlierReports, report: "fourth", reportSeq: 4 }), "dm:owner", NOW, false)!;
+    expect(detail.checkpoint).toBe("Pushed branch x; ruled out y.");
+    expect(detail.earlierReports).toHaveLength(EARLIER_REPORTS_LIMIT);
+    expect(detail.earlierReports![0]).toEqual({ seq: 2, text: "second" });
+    expect(detail.earlierReports![1]).toMatchObject({ seq: 3, truncated: true });
+    const bare = subsessionDetail(record("s1", { checkpoint: "  " }), "dm:owner", NOW, false)!;
+    expect(bare).not.toHaveProperty("checkpoint");
+    expect(bare).not.toHaveProperty("earlierReports");
+  });
 });
 
 describe("a sub-session's plan, done steps and updates", () => {
@@ -131,6 +143,15 @@ describe("a sub-session's plan, done steps and updates", () => {
     // Once the spawn has left the capped log, no start reads as the first one.
     expect(subsessionUpdates(record("s1", { transitions: transitions.slice(1) })).some((e) => e.kind === "milestone" && e.milestone === "started")).toBe(false);
     expect(subsessionUpdates(record("s1", { transitions: [{ at: NOW, from: "active", to: "failed", event: "fail" }] }))).toEqual([{ at: NOW, kind: "milestone", milestone: "failed" }]);
+    // A cancel says why when the reason was the canceller's own words; the harness's fixed (English) reasons and other milestones carry none.
+    expect(subsessionUpdates(record("s1", { transitions: [{ at: NOW, from: "active", to: "cancelled", event: "cancel", reason: "not needed\nany more", said: true }] })))
+      .toEqual([{ at: NOW, kind: "milestone", milestone: "cancelled", reason: "not needed any more" }]);
+    expect(subsessionUpdates(record("s1", { transitions: [{ at: NOW, from: "active", to: "cancelled", event: "cancel", reason: "stopped by the owner (/s stop)" }] })))
+      .toEqual([{ at: NOW, kind: "milestone", milestone: "cancelled" }]);
+    expect(subsessionUpdates(record("s1", { transitions: [{ at: NOW, from: "active", to: "failed", event: "fail", reason: "interrupted by 4 restarts in a row" }] })))
+      .toEqual([{ at: NOW, kind: "milestone", milestone: "failed" }]);
+    expect(subsessionUpdates(record("s1", { transitions: [{ at: NOW, from: "active", to: "waiting", event: "ask", reason: "a question" }] })))
+      .toEqual([{ at: NOW, kind: "milestone", milestone: "waitingOwner" }]);
   });
 
   it("skips a transition entry that is not shaped like one, instead of failing the detail", () => {
@@ -171,8 +192,13 @@ describe("a sub-session's plan, done steps and updates", () => {
   });
 
   it("caps the updates it sends, keeps done steps in order, and shows the plan only while the task is open", () => {
-    const updates = Array.from({ length: 30 }, (_, i) => ({ at: NOW - 1000 + i, text: `u${i}` }));
-    const many = Array.from({ length: 30 }, (_, i) => ({ at: NOW - 2000 + i, from: "active" as const, to: "finished" as const, event: "finish" }));
+    // Every update the record keeps is shown, whatever its milestones.
+    const updates = Array.from({ length: UPDATES_KEEP }, (_, i) => ({ at: NOW - 1000 + i, text: `u${i}` }));
+    const milestones = Array.from({ length: TRANSITION_LOG_KEEP }, (_, i) => ({ at: NOW - 2000 + i, from: "active" as const, to: "finished" as const, event: "finish" }));
+    const shown = subsessionUpdates(record("s1", { updates, transitions: milestones }));
+    expect(shown.filter((u) => u.kind === "update")).toHaveLength(UPDATES_KEEP);
+    expect(shown).toHaveLength(UPDATES_LIMIT);
+    const many = Array.from({ length: TRANSITION_LOG_KEEP + 10 }, (_, i) => ({ at: NOW - 2000 + i, from: "active" as const, to: "finished" as const, event: "finish" }));
     expect(subsessionUpdates(record("s1", { updates, transitions: many }))).toHaveLength(UPDATES_LIMIT);
     const plan = [{ text: "Write tests", status: "in_progress" as const }, { text: "Open the PR", status: "pending" as const }];
     const doneSteps = [{ at: NOW - 20, text: "Read the code", result: "found it" }, { at: NOW - 10, text: "Fix it" }];

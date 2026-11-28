@@ -378,6 +378,27 @@ describe("a task is its own card", () => {
     expect(task.status).toBe("finished");
     expect(needsOwner(task)).toBeUndefined();
     expect(h.notes.at(-1)).toContain("It needs nothing from the owner.");
+    expect(h.notes.at(-1)).not.toContain("Decisions and updates");
+    h.service.stop();
+  });
+
+  it("the report note repeats the newest decisions the task recorded", async () => {
+    const h = harness();
+    h.onTurn = (prompt, key) => {
+      if (prompt.includes("subsession-start")) {
+        for (let i = 1; i <= 7; i++) h.service.postUpdate(key, `Decision ${i}`);
+        h.service.finish(key, "PR #12 is open.");
+      }
+      return { ok: true };
+    };
+    h.service.start();
+    spawn(h);
+    await flush();
+    const note = h.notes.at(-1)!;
+    expect(note).toContain("Decisions and updates it recorded (newest last; the 5 newest of 7):");
+    expect(note).toContain("- Decision 7");
+    expect(note).toContain("- Decision 3");
+    expect(note).not.toContain("- Decision 2");
     h.service.stop();
   });
 

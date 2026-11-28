@@ -86,19 +86,33 @@ export function sharedReminder(rel: string): string {
     : `${rel} is shared: group chats can read it. If this is private (see Layout), move it under private/.`;
 }
 
-/** Does `after` have a non-blank line more than `before` (counting repeats)? */
-function addsLines(before: string, after: string): boolean {
+/** The non-blank lines `after` has more of than `before` (counting repeats), trimmed. */
+function addedLines(before: string, after: string): string[] {
   // Counted, not a set: a line copied under a second heading is a line added.
   const had = new Map<string, number>();
   for (const l of before.split("\n")) if (l.trim()) had.set(l.trim(), (had.get(l.trim()) ?? 0) + 1);
+  const added: string[] = [];
   for (const l of after.split("\n")) {
     const t = l.trim();
     if (!t) continue;
     const n = had.get(t) ?? 0;
-    if (n === 0) return true;
-    had.set(t, n - 1);
+    if (n === 0) added.push(t);
+    else had.set(t, n - 1);
   }
-  return false;
+  return added;
+}
+
+/** Does `after` have a non-blank line more than `before` (counting repeats)? */
+function addsLines(before: string, after: string): boolean {
+  return addedLines(before, after).length > 0;
+}
+
+/** A core's fact line with its source: `- YYYY-MM-DD [said|inferred|from:<source>] …` (§6.1 of the memory design). */
+const PROVENANCE_LINE_RE = /^[-*]\s+\d{4}-\d{2}-\d{2}\s+\[(?:said|inferred|from:[^\]\s][^\]]*)\]\s+\S/;
+
+/** The reminder after a write that added fact lines to a core without the source prefix. Reminds, never refuses. */
+export function provenanceReminder(rel: string, missing: number): string {
+  return `${missing === 1 ? "A new line" : `${missing} new lines`} in ${rel} ${missing === 1 ? "has" : "have"} no source: write each fact as \`- YYYY-MM-DD [said|inferred|from:<source>] <fact>\` (see Provenance).`;
 }
 
 export const READ_ONLY_REFUSAL =
@@ -342,6 +356,17 @@ export class MemoryStore {
    * owner's turn: a group's turn writes in its own folder, where that is
    * the point. Not on every write, or it would be read past.
    */
+  /**
+   * The provenance reminder: a write to a core that added lines (other than
+   * headings) without the `- YYYY-MM-DD [source]` prefix. Topic files are not
+   * held to it: SOPs and tables don't fit one line per fact.
+   */
+  private provenanceNote(rel: string, before: string | null, after: string): string | undefined {
+    if (!isCoreMemoryPath(rel)) return undefined;
+    const missing = addedLines(before ?? "", after).filter((l) => !l.startsWith("#") && !PROVENANCE_LINE_RE.test(l)).length;
+    return missing > 0 ? provenanceReminder(rel, missing) : undefined;
+  }
+
   private shareNote(access: MemoryAccess, rel: string, before: string | null, after: string): string | undefined {
     if (access.privateBarred || isPrivateMemoryPath(rel)) return undefined;
     if (before === null) return sharedReminder(rel);
@@ -452,7 +477,7 @@ export class MemoryStore {
     if (isListedMemoryPath(r.rel) && descriptionProblem(content) !== null) throw this.missingDescription(r.rel);
     const note = this.checkSize(r.rel, cur?.text ?? null, content);
     if (cur) this.keep(r, cur);
-    return this.saved(r.rel, this.write(r, access, cur, content), note, this.shareNote(access, r.rel, cur?.text ?? null, content));
+    return this.saved(r.rel, this.write(r, access, cur, content), note, this.provenanceNote(r.rel, cur?.text ?? null, content), this.shareNote(access, r.rel, cur?.text ?? null, content));
   }
 
   strReplace(access: MemoryAccess, path: unknown, oldText: string, newText: string): string {
@@ -469,7 +494,7 @@ export class MemoryStore {
     // A replacement that shortens the file is the one that loses content worth
     // keeping; so is any rewrite of bytes that weren't valid UTF-8.
     if (Buffer.byteLength(next, "utf8") < cur.bytes.length || !cur.lossless) this.keep(r, cur);
-    return this.saved(r.rel, this.write(r, access, cur, next), note, this.shareNote(access, r.rel, cur.text, next));
+    return this.saved(r.rel, this.write(r, access, cur, next), note, this.provenanceNote(r.rel, cur.text, next), this.shareNote(access, r.rel, cur.text, next));
   }
 
   append(access: MemoryAccess, path: unknown, content: string, create = false): string {
@@ -487,7 +512,7 @@ export class MemoryStore {
     const note = this.checkSize(r.rel, cur?.text ?? null, next);
     // The file is rewritten from its decoded text: bytes that weren't UTF-8 would be lost.
     if (cur && !cur.lossless) this.keep(r, cur);
-    return this.saved(r.rel, this.write(r, access, cur, next), note, this.shareNote(access, r.rel, cur?.text ?? null, next));
+    return this.saved(r.rel, this.write(r, access, cur, next), note, this.provenanceNote(r.rel, cur?.text ?? null, next), this.shareNote(access, r.rel, cur?.text ?? null, next));
   }
 
   move(access: MemoryAccess, from: unknown, to: unknown): string {

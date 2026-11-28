@@ -42,7 +42,7 @@ export function Study({ page, onPage, session, reload, inert, mutator, focus, cr
   const agent = useAgentName();
   const { t } = useTranslation(["study", "common"]);
   const key = reload + local;
-  return <main id="study" tabIndex={-1} inert={inert} className="mx-auto flex min-h-0 w-full max-w-[1040px] min-w-0 flex-1 flex-col px-10 pt-3 max-[1024px]:px-6 max-[800px]:px-5 max-[600px]:px-4 max-[600px]:pt-1">
+  return <main id="study" tabIndex={-1} inert={inert} className="mx-auto flex min-h-0 w-full max-w-[1040px] min-w-0 flex-1 flex-col px-10 pt-3 max-overlay:px-6 max-[800px]:px-5 max-phone:px-4 max-phone:pt-1">
     {/* The top bar names the Study; the tabs name the page. No title block or description above them. */}
     <h1 className="sr-only">{studyLabel(page)}</h1>
     <Tabs value={page} onValueChange={(value) => onPage(value as StudyPage)} className="min-h-0 flex-1 gap-0">
@@ -51,7 +51,7 @@ export function Study({ page, onPage, session, reload, inert, mutator, focus, cr
         {STUDY_PAGES.map((value) => <TabsTrigger key={value} value={value} title={t(INTRO[value], { agent })}
           className="-mb-px h-10 flex-none rounded-none border-0 border-b-2 border-transparent bg-transparent! px-3 text-[13px] font-medium text-muted-foreground shadow-none! hover:text-foreground data-[state=active]:border-primary data-[state=active]:text-foreground dark:data-[state=active]:border-primary">{studyLabel(value)}</TabsTrigger>)}
       </TabsList>
-      <Button variant="ghost" size="icon" className="size-8 shrink-0 rounded-lg text-muted-foreground max-[600px]:size-9 pointer-coarse:size-9 hover:bg-foreground/[0.07] [&_svg:not([class*='size-'])]:size-4" aria-label={t("refresh")} title={t("refresh")} onClick={() => setLocal((v) => v + 1)}><RefreshCw strokeWidth={1.75} /></Button>
+      <Button variant="ghost" size="icon" className="size-8 shrink-0 rounded-lg text-muted-foreground max-phone:size-9 pointer-coarse:size-9 hover:bg-foreground/[0.07] [&_svg:not([class*='size-'])]:size-4" aria-label={t("refresh")} title={t("refresh")} onClick={() => setLocal((v) => v + 1)}><RefreshCw strokeWidth={1.75} /></Button>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto pt-5 pb-10 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]" role="tabpanel" aria-label={studyLabel(page)}>
         {page === "todos" && <Todos reload={key} />}
@@ -126,7 +126,7 @@ function Memory({ reload, focus }: { reload: number; focus: string | null }) {
     </div>
     <div className="min-w-0">
       {!selected ? <Empty>{t("memory.choose")}</Empty> : <Status resource={file}>
-        {file.state === "ready" && <article className={cn(card, "px-7 py-6 max-[600px]:px-5")} aria-label={file.value.path}>
+        {file.state === "ready" && <article className={cn(card, "px-7 py-6 max-phone:px-5")} aria-label={file.value.path}>
           <div className="mb-4 flex flex-wrap items-baseline gap-x-3 gap-y-1 border-b pb-3">
             <h2 className="m-0 font-mono text-[13px] font-medium [overflow-wrap:anywhere]">{file.value.path}</h2>
             <span className={cn(meta, "ml-auto")}>{t("memory.updated", { when: formatWhen(file.value.modifiedAt) })}</span></div>
@@ -258,7 +258,7 @@ function Config({ reload }: { reload: number }) {
           <ChevronRight className="size-3.5 text-muted-foreground transition-transform group-data-[state=open]:rotate-90" />
           <span className="text-[14px] font-medium">{group === "general" ? t("config.general") : group}</span><span className={cn(meta, "ml-auto")}>{fields.length}</span></CollapsibleTrigger>
         <CollapsibleContent><dl className="m-0 divide-y border-t px-5">{fields.map((field) =>
-          <div key={field.path.join(".")} className="grid grid-cols-[minmax(0,2fr)_minmax(0,3fr)] gap-4 py-2.5 text-[13px] max-[600px]:grid-cols-1 max-[600px]:gap-1">
+          <div key={field.path.join(".")} className="grid grid-cols-[minmax(0,2fr)_minmax(0,3fr)] gap-4 py-2.5 text-[13px] max-phone:grid-cols-1 max-phone:gap-1">
             <dt className="font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]">{(group === "general" ? field.path : field.path.slice(1)).join(".")}</dt>
             <dd className="m-0 min-w-0">{formatValue(field)}</dd></div>)}</dl></CollapsibleContent>
       </Collapsible>)}</div>

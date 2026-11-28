@@ -6,10 +6,13 @@ import { useEffect, useRef, useState, type Dispatch, type RefObject, type SetSta
  * contract of a modal layer (focus moves in, Tab stays inside, Escape closes).
  */
 
-/** Below this the Tasks rail and the Home conversation slide over the page: pinned beside a 232 px sidebar they would leave under ~500 px. */
-export const OVERLAY_QUERY = "(max-width: 1024px)";
-/** Phone width: the sidebar becomes a drawer behind the menu button. */
-export const PHONE_QUERY = "(max-width: 600px)";
+// The same media queries Tailwind writes for `max-overlay:` and `max-phone:` (styles.css), so the
+// script and the stylesheet switch at the same pixel: below the width, not at it.
+// tests/web-breakpoints.test.ts holds the two together.
+/** Below 1024 px the Tasks rail and the Home conversation slide over the page: pinned beside a 232 px sidebar they would leave under ~500 px. */
+export const OVERLAY_QUERY = "not all and (min-width: 1024px)";
+/** Below 600 px (phone width) the sidebar becomes a drawer behind the menu button. */
+export const PHONE_QUERY = "not all and (min-width: 600px)";
 
 export function useMediaQuery(query: string): boolean {
   const [matches, setMatches] = useState(() => window.matchMedia(query).matches);

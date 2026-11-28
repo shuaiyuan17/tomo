@@ -98,10 +98,10 @@ export function ModelPage({ session, reload, mutator }: { session?: WebSession; 
         return <li key={option.id}>
           <button type="button" disabled={!canSwitch || active || busy} aria-current={active ? "true" : undefined}
             onClick={() => choose({ id: option.id, label: option.label })}
-            className="grid w-full grid-cols-[minmax(0,1fr)_auto_20px] items-center gap-3 rounded-lg px-2 py-2.5 text-left text-[13px] enabled:hover:bg-foreground/[0.05] disabled:cursor-default max-[600px]:grid-cols-[minmax(0,1fr)_20px]">
+            className="grid w-full grid-cols-[minmax(0,1fr)_auto_20px] items-center gap-3 rounded-lg px-2 py-2.5 text-left text-[13px] enabled:hover:bg-foreground/[0.05] disabled:cursor-default max-phone:grid-cols-[minmax(0,1fr)_20px]">
             <span className="min-w-0"><span className="block truncate">{option.label}</span>
               <span className={meta}>{option.aliases.join(" · ")}</span></span>
-            <span className="font-mono text-xs text-muted-foreground max-[600px]:hidden">{option.id}</span>
+            <span className="font-mono text-xs text-muted-foreground max-phone:hidden">{option.id}</span>
             <span className="flex justify-end">{active && <Check className="size-4 text-primary" strokeWidth={2} aria-label={t("active")} />}</span>
           </button></li>;
       })}</ul>

@@ -16,7 +16,7 @@ export function LanguageSetting() {
       <p className={cn(meta, "mt-1 mb-0")}>{t("language.note")}</p>
     </div>
     <select id="language-picker" value={choice ?? "default"} onChange={(event) => setChoice(event.target.value === "default" ? null : event.target.value as Locale)}
-      className="h-9 rounded-lg border bg-card px-2.5 text-[13px] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring max-[600px]:h-10 max-[600px]:text-base">
+      className="h-9 rounded-lg border bg-card px-2.5 text-[13px] text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring max-phone:h-10 max-phone:text-base">
       <option value="default">{t("language.default")}</option>
       {LOCALES.map((locale) => <option key={locale} value={locale}>{localeName(locale)}</option>)}
     </select>

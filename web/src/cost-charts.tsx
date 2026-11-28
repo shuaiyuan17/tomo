@@ -10,7 +10,7 @@ export const meta = "text-[11px] tracking-[0.02em] text-muted-foreground";
 const sum = (values: readonly number[]) => values.reduce((a, b) => a + b, 0);
 
 export function Section({ title, aside, children, className, label }: { title: string; aside?: ReactNode; children: ReactNode; className?: string; label?: string }) {
-  return <section aria-label={label ?? title} className={cn(card, "min-w-0 px-6 py-5 max-[600px]:px-4 max-[600px]:py-4", className)}>
+  return <section aria-label={label ?? title} className={cn(card, "min-w-0 px-6 py-5 max-phone:px-4 max-phone:py-4", className)}>
     <div className="mb-4 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1"><h2 className="eyebrow shrink-0 whitespace-nowrap">{title}</h2>{aside && <div className={cn(meta, "text-right")}>{aside}</div>}</div>
     {children}
   </section>;

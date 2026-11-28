@@ -39,12 +39,12 @@ export function Sidebar({ sidebarRef, view, onNavigate, drawer, phone, inert, se
 }) {
   const { t } = useTranslation();
   return <aside ref={sidebarRef} id="sidebar" data-state={drawer ? "open" : "closed"} {...(drawer ? { role: "dialog", "aria-modal": true } : {})}
-    className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-4 pt-4 pb-4 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] max-[1024px]:w-[232px] max-[1024px]:px-3.5 max-[800px]:w-[204px] max-[800px]:px-3 max-[600px]:fixed max-[600px]:top-(--app-header) max-[600px]:bottom-0 max-[600px]:left-0 max-[600px]:z-30 max-[600px]:w-[min(320px,86vw)] max-[600px]:bg-background max-[600px]:px-4 max-[600px]:pt-4 max-[600px]:pb-[max(1.25rem,env(safe-area-inset-bottom))] max-[600px]:shadow-2xl max-[600px]:transition-transform max-[600px]:duration-[220ms] max-[600px]:data-[state=closed]:-translate-x-full max-[600px]:data-[state=closed]:shadow-none"
+    className="flex w-[272px] shrink-0 flex-col gap-1 overflow-y-auto border-r px-4 pt-4 pb-4 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin] max-overlay:w-[232px] max-overlay:px-3.5 max-[800px]:w-[204px] max-[800px]:px-3 max-phone:fixed max-phone:top-(--app-header) max-phone:bottom-0 max-phone:left-0 max-phone:z-30 max-phone:w-[min(320px,86vw)] max-phone:bg-background max-phone:px-4 max-phone:pt-4 max-phone:pb-[max(1.25rem,env(safe-area-inset-bottom))] max-phone:shadow-2xl max-phone:transition-transform max-phone:duration-[220ms] max-phone:data-[state=closed]:-translate-x-full max-phone:data-[state=closed]:shadow-none"
     aria-label={t("sidebar.label")} inert={inert || (phone && !drawer)} aria-hidden={phone && !drawer ? true : undefined}>
     <nav aria-label={t("sidebar.workspace")} className="mb-6 flex flex-col gap-0.5">
       {NAVIGATION.map(([target, label, Icon]) =>
         <Button key={label} variant="ghost" aria-current={view === target ? "page" : undefined} onClick={() => { onNavigate(target); if (drawer) closeDrawer(false); }}
-          className="h-8 justify-start gap-2.5 rounded-lg px-2.5 text-[13px] font-normal text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground aria-[current=page]:bg-foreground/[0.08] aria-[current=page]:font-medium aria-[current=page]:text-foreground max-[600px]:h-10 max-[600px]:text-[14px]">
+          className="h-8 justify-start gap-2.5 rounded-lg px-2.5 text-[13px] font-normal text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground aria-[current=page]:bg-foreground/[0.08] aria-[current=page]:font-medium aria-[current=page]:text-foreground max-phone:h-10 max-phone:text-[14px]">
           <Icon strokeWidth={1.75} /><span>{t(label)}</span></Button>)}
     </nav>
     <div className="mb-2 flex items-center justify-between gap-2 px-0.5">
@@ -57,13 +57,13 @@ export function Sidebar({ sidebarRef, view, onNavigate, drawer, phone, inert, se
     <ContextWindow session={session} web={web} />
     <PlanUsage ready={!!web.bootstrap} locked={web.connection === "locked"} live={web.rateLimit} />
     {/* Theme: pinned to the bottom of the sidebar (and of the phone drawer). */}
-    <div className="mt-auto flex items-center justify-between gap-3 px-0.5 pt-6 max-[600px]:mt-6">
+    <div className="mt-auto flex items-center justify-between gap-3 px-0.5 pt-6 max-phone:mt-6">
       <span className="eyebrow">{t("theme.heading")}</span>
       <ToggleGroup type="single" aria-label={t("theme.label")} value={theme} onValueChange={(value) => { if (value) onTheme(value as Theme); }}
-        className="rounded-xl bg-foreground/[0.05] p-0.5 max-[600px]:rounded-[13px]">
+        className="rounded-xl bg-foreground/[0.05] p-0.5 max-phone:rounded-[13px]">
         {THEMES.map(([value, label, Icon]) =>
           <ToggleGroupItem key={value} value={value} aria-label={t(label)} title={t(label)}
-            className="size-7 rounded-[9px]! px-0 text-muted-foreground max-[600px]:size-10 max-[600px]:rounded-[11px]! hover:bg-transparent hover:text-foreground data-[state=on]:bg-card data-[state=on]:text-foreground data-[state=on]:shadow-sm dark:data-[state=on]:bg-foreground/[0.13] [&_svg:not([class*='size-'])]:size-3.5 max-[600px]:[&_svg:not([class*='size-'])]:size-[18px]">
+            className="size-7 rounded-[9px]! px-0 text-muted-foreground max-phone:size-10 max-phone:rounded-[11px]! hover:bg-transparent hover:text-foreground data-[state=on]:bg-card data-[state=on]:text-foreground data-[state=on]:shadow-sm dark:data-[state=on]:bg-foreground/[0.13] [&_svg:not([class*='size-'])]:size-3.5 max-phone:[&_svg:not([class*='size-'])]:size-[18px]">
             <Icon strokeWidth={1.75} /></ToggleGroupItem>)}
       </ToggleGroup>
     </div>
@@ -87,7 +87,7 @@ function SessionPicker({ sessions, ownerId, session, onSelect, drawer, closeDraw
   return <DropdownMenu modal={false}>
     <DropdownMenuTrigger asChild disabled={!sessions.length}>
       <Button ref={trigger} variant="outline" aria-labelledby="session-label session-value"
-        className="h-9 w-full min-w-0 justify-between rounded-lg bg-card px-3 text-[13px] max-[600px]:h-10 font-normal shadow-xs hover:bg-accent">
+        className="h-9 w-full min-w-0 justify-between rounded-lg bg-card px-3 text-[13px] max-phone:h-10 font-normal shadow-xs hover:bg-accent">
         <span id="session-value" className="flex min-w-0 flex-1 items-center gap-2">
           <span className="truncate" title={session?.title}>{session ? session.kind === "group" ? t("sidebar.groupTitle", { title: session.title }) : session.title : t("sidebar.noSession")}</span>
           {session && session.id === ownerId && <span data-testid="session-main" role="img" aria-label={t("sidebar.mainSession")} title={t("sidebar.mainSession")} className="ml-auto flex shrink-0 pl-1"><Pin aria-hidden="true" className="size-3.5 text-primary" strokeWidth={2} /></span>}

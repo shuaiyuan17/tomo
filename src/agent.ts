@@ -101,6 +101,10 @@ import { RestartCoordinator } from "./agent/restart-coordinator.js";
 import { OwnerNotices } from "./agent/owner-notices.js";
 import { oauthLabel, type McpOAuthLabel } from "./mcp/status-merge.js";
 import { McpAuthPrompts } from "./agent/mcp-auth-prompts.js";
+import { memoryHistoryDir, sweepMemoryHistory } from "./memory/history.js";
+
+/** How often expired memory versions are swept (also once at start). */
+const MEMORY_HISTORY_SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 export type { SendResult, SessionCatalog } from "./agent/proactive-send.js";
 
@@ -266,6 +270,7 @@ export class Agent {
   private readonly mcpOAuthManager: McpOAuthManager;
   /** Background sweep that refreshes OAuth tokens before they expire (start/stop). */
   private mcpTokenRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  private memoryHistoryTimer: ReturnType<typeof setInterval> | undefined;
   /** Re-logs the full migration status once, after the first keys have been
    *  touched (see `start`). Unref'd, and cleared by `stop`. */
   private migrationStatusTimer: ReturnType<typeof setTimeout> | undefined;
@@ -3684,6 +3689,7 @@ export class Agent {
       log.warn({ err }, "Could not reconcile the permission ledger");
     }
     this.startMcpTokenRefreshSweep();
+    this.startMemoryHistorySweep();
     log.info("Tomo is running");
 
     // WHAT THE TRANSCRIPT MIGRATION STILL OWES. `ambiguous`, `sidecars` and
@@ -3763,6 +3769,25 @@ export class Agent {
    * login. Each refresh notifies onServerAuthReady, which hot-mounts the new
    * header into the sessions already serving that server.
    */
+  /**
+   * Old versions the memory tools keep (data/memory-history/) last
+   * MEMORY_HISTORY_DAYS days: swept at start and then once a day.
+   */
+  private startMemoryHistorySweep(): void {
+    const dir = memoryHistoryDir(config.tomoHome);
+    const sweep = () => {
+      try {
+        const removed = sweepMemoryHistory(dir, Date.now());
+        if (removed > 0) log.info({ removed }, "Removed expired memory versions");
+      } catch (err) {
+        log.warn({ err }, "Memory history sweep failed");
+      }
+    };
+    sweep();
+    this.memoryHistoryTimer = setInterval(sweep, MEMORY_HISTORY_SWEEP_INTERVAL_MS);
+    this.memoryHistoryTimer.unref();
+  }
+
   private startMcpTokenRefreshSweep(): void {
     const servers = config.mcpServers ?? {};
     if (!Object.values(servers).some((entry) => entry.oauth)) return;
@@ -3803,6 +3828,10 @@ export class Agent {
     if (this.mcpTokenRefreshTimer) {
       clearInterval(this.mcpTokenRefreshTimer);
       this.mcpTokenRefreshTimer = undefined;
+    }
+    if (this.memoryHistoryTimer) {
+      clearInterval(this.memoryHistoryTimer);
+      this.memoryHistoryTimer = undefined;
     }
     if (this.migrationStatusTimer) {
       clearTimeout(this.migrationStatusTimer);

@@ -14,6 +14,7 @@ import { litellmRoutesModel } from "../litellm.js";
 import { effectiveGroupSandbox, type GroupSandboxConfig } from "./group-fs-policy.js";
 import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, skillsCanUseTool, todoStoreGuardHooks, type PrivateMemoryBar } from "./permissions.js";
 import { TODO_TOOL_NAMES } from "../mcp/todo-tools.js";
+import { MEMORY_TOOL_NAMES } from "../mcp/memory-tools.js";
 import { todosDir } from "../todos/store.js";
 import { dbGuardHooks } from "./db-guard.js";
 import type { AgentProfile, EffortLevel } from "../config.js";
@@ -289,6 +290,8 @@ export function sdkOptions(
       `mcp__${TOMO_INTERNAL_MCP_NAME}__upsert_person`,
       `mcp__${TOMO_INTERNAL_MCP_NAME}__lcm_rollup`,
       ...TODO_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`),
+      // A sub-session registers only the three reading ones (internal-server.ts).
+      ...MEMORY_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`),
       // Registered per session kind (internal-server.ts): the task_* tools a
       // sub-session reports through, and the owner's task_spawn/status/cancel/message.
       ...SUBSESSION_TASK_TOOL_NAMES.map((name) => `mcp__${TOMO_INTERNAL_MCP_NAME}__${name}`),

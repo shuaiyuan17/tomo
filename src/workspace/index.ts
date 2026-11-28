@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { defaultRuntimePaths } from "../runtime-paths.js";
 import { defaultPeopleDirs, loadPeople, renderPeopleRoster } from "../people.js";
 import { PRIVATE_MEMORY_SUBDIR, isPrivateIndexLine } from "./private-memory.js";
+import { MEMORY_HARD_KB, MEMORY_HARD_LINES, MEMORY_SOFT_KB, MEMORY_SOFT_LINES } from "./memory-index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -19,10 +20,7 @@ const MEMORY_ENTRYPOINT = join(MEMORY_DIR, "MEMORY.md");
  * owner's DM prompt says so (memoryBudgetReminder). Only past the HARD one is
  * it cut, and the cut says where (fitMemoryIndex).
  */
-export const MEMORY_SOFT_LINES = 200;
-export const MEMORY_SOFT_KB = 16;
-export const MEMORY_HARD_LINES = 400;
-export const MEMORY_HARD_KB = 32;
+export { MEMORY_SOFT_LINES, MEMORY_SOFT_KB, MEMORY_HARD_LINES, MEMORY_HARD_KB };
 const KB = 1024;
 
 /** Size of the index as the prompt holds it: its lines joined by newlines. */
@@ -122,55 +120,52 @@ function loadMemory(isGroup: boolean, lines: string[] | null, shared = false): s
     ? `\n## Private memories (DM-only)\n\nMemory files under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` are restricted to DM sessions. They are not listed in the index below, and you cannot read them from this group session — the harness will deny the tool call. Two consequences worth knowing before you reach for them: the **shell here runs sandboxed** (every Bash command is wrapped in a \`sandbox-exec\` profile that makes those files unreadable at the kernel level, so assembling the path in an interpreter fails with EPERM rather than working; if the sandbox cannot be set up the Bash tool is withheld for the turn instead), and a \`MEDIA:\` attachment pointing into \`memory/${PRIVATE_MEMORY_SUBDIR}/\` is dropped before it is sent, since attaching a file is a way of reading it out loud.\n`
     : `\n## Private memories (DM-only)\n\nFor anything you wouldn't want surfaced in a group chat (sensitive personal details, private notes), save the memory file under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` instead of the top level. Index it in MEMORY.md the normal way — group sessions automatically see the index with \`${PRIVATE_MEMORY_SUBDIR}/\` lines stripped, and the harness blocks them from reading the files directly.\n`;
 
+  // How a topic file gets indexed: only the owner's own conversation can
+  // change MEMORY.md (MemoryStore refuses a group turn).
+  const howToSave = isGroup
+    ? `Create a topic file with memory_write (if_version "new"), with frontmatter whose \`description:\` (one line, at most 200 characters) says when to read it. MEMORY.md can be changed only in the owner's private conversation, so a file saved here is not indexed there until the owner asks for it.`
+    : `1. Create the topic file with memory_write (if_version "new"), e.g. \`travel.md\`:
+\`\`\`markdown
+---
+description: Travel preferences and booked trips; read when planning or changing a trip.
+---
+# Travel
+- Aisle seats; never a red-eye.
+\`\`\`
+2. Add its pointer to MEMORY.md with memory_append: \`- [Travel](travel.md) — one-line hook\``;
+
   const instructions = `
 # MEMORY — Your Persistent Memory
 
-Your persistent memory lives at ${MEMORY_DIR}/. Read and update it whenever durable context would improve future conversations.
+Your memory lives in ${MEMORY_DIR}/ as Markdown files. It is the durable understanding you carry between conversations: who the owner is, who and what they care about, their preferences, decisions, commitments, and outcomes that change their situation. Write it for the next conversation, with enough context to be useful then. It is not a transcript, a transaction log or a copy of the todo list, and it does not repeat your personality files. When nothing worth keeping has changed, leave it alone.
+
+Bring what you remember to the work so the owner doesn't have to repeat themselves: a preference, constraint or earlier decision can matter even when they haven't mentioned it again.
 
 ## Storage
 
 - **MEMORY.md** is the index loaded into every conversation. Keep it under ${MEMORY_SOFT_LINES} lines and ${MEMORY_SOFT_KB} KB.
-- Store each topic in its own Markdown file with name, description, and type frontmatter.
+- Store each topic in its own Markdown file, organized by topic, not by date. Its frontmatter \`description:\` says when to read it.
 - MEMORY.md contains one-line pointers: \`- [Title](file.md) — short description\`
 ${privacySection}
+## Writing
 
-## Memory types
+Write memory only with the memory tools: memory_list, memory_read, memory_search, memory_write, memory_str_replace, memory_append, memory_move, memory_delete. memory_write and memory_delete take the version you last read; another conversation may have changed the file since, and a stale version is refused, so read it again and retry. Put people in the people registry (\`upsert_person\`), not in memory files.
 
-- **user** — identity, preferences, habits, and relationships. Put facts about a specific person in the PEOPLE registry instead.
-- **feedback** — corrections and confirmed approaches; include why the preference matters.
-- **project** — goals, plans, deadlines, and ongoing work. Convert relative dates to absolute dates.
-- **reference** — useful tools, links, services, and where to find things.
+- Search before you add (memory_search), and update an existing line rather than adding a second one.
+- When something changes (booked, cancelled, done, moved), find the entries that say otherwise and fix them where they live. Remove what is no longer true.
+- Convert relative dates to absolute ones: "next Friday" is stored as its date.
 
 ## How to save
 
-1. Write the memory file (e.g., \`travel.md\`, \`work_context.md\`):
-\`\`\`markdown
----
-name: descriptive-name
-description: one-line summary used to decide relevance
-type: user
----
-
-Content here.
-\`\`\`
-
-2. Add a pointer to MEMORY.md: \`- [Title](file.md) — one-line hook\`
+${howToSave}
 
 ## Be proactive
 
 Don't wait to be told "remember this." Save durable personal details, preferences, feedback, plans, deadlines, and workflows silently. Mention the save only when the user explicitly asked you to remember something.
 
-## When NOT to save
+## Never store
 
-- Trivial ephemeral details ("what's the weather")
-- Things already in your personality files
-- Raw conversation transcripts
-
-## Rules
-
-- Update existing memories rather than creating duplicates — check first
-- Remove stale memories when you notice they're outdated
-- Organize by topic, not chronology`.trim();
+Passwords, verification codes, API keys, card numbers, bank account numbers, government ID numbers. When useful, store where such an item is kept, never its value. Memory records what the owner told you; it never grants permission to act.`.trim();
 
   let memoryContent: string;
   if (lines === null) {

@@ -79,7 +79,10 @@ src/
                       #   capture.ts (CaptureChannel: iMessage/Telegram next message, web password card),
                       #   store.ts (keychain over stdin; state.json), redactor.ts (literal scrub, global PostToolUse hook)
   mcp/                # tomo-internal in-process MCP server (internal-server.ts) + tool factories
-                      #   (cron-, people-, recall-, pet-, todo-tools); external-config.ts, oauth.ts
+                      #   (cron-, people-, recall-, pet-, todo-, memory-tools); external-config.ts, oauth.ts
+  memory/             # The memory tools' operations: store.ts (sync read → if_version check → keep old
+                      #   version → atomic write; path, audience, description and size rules) and
+                      #   history.ts (old versions in data/memory-history/, swept after 30 days)
   cron/               # Scheduler (30s poll → agent.handleCronMessage) + store (cron_jobs in data/tomo.db)
                       #   + schedule.ts (next-run / staleness math, schedule-string parsing)
   todos/              # Todo primitive: store.ts (data/todos/todos.json under withFileLockSync + atomic write,

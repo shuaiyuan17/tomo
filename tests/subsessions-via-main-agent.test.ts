@@ -219,7 +219,7 @@ describe("via-main through the Agent", () => {
     await agent.stop();
   });
 
-  it("keeps one retry timer per session when a second wake fails while one is pending", async () => {
+  it("keeps one retry timer per session: a new note's failed wake replaces the pending one, from the base", async () => {
     const { agent } = await boot();
     mockSdk.responseFn = () => "NO_REPLY";
     const internals = retryInternals(agent);
@@ -231,12 +231,15 @@ describe("via-main through the Agent", () => {
     // Another note's wake fails too while the retry is pending.
     internals.subsessions.deps.queuePendingNote("dm:alex", formatTomoEvent("subsession-message", "TWO", { name: "s1:notify:2" }));
     internals.subsessions.deps.messageWake("dm:alex");
-    await waitFor(() => expect(turn).toHaveBeenCalledTimes(2));
-    await new Promise((r) => setTimeout(r, 20));
-    expect(retries).toHaveLength(1);
-    retries[0].fn();
+    await waitFor(() => expect(retries).toHaveLength(2));
+    expect(turn).toHaveBeenCalledTimes(2);
+    // The new note's wake replaced the pending timer (no second one left
+    // running) and starts from the base.
+    expect(retries[0].cleared).toBe(true);
+    expect(retries[1]).toMatchObject({ ms: MESSAGE_WAKE_RETRY_BASE_MS, cleared: false });
+    retries[1].fn();
     await waitFor(() => expect(messageNotes(agent, "dm:alex")).toEqual([]));
-    expect(retries).toHaveLength(1);
+    expect(retries).toHaveLength(2);
     await agent.stop();
   });
 
@@ -260,6 +263,34 @@ describe("via-main through the Agent", () => {
     internals.subsessions.deps.messageWake("dm:alex");
     await waitFor(() => expect(retries).toHaveLength(3));
     expect(retries[2].ms).toBe(MESSAGE_WAKE_RETRY_BASE_MS);
+    await agent.stop();
+  });
+
+  it("a note read by another turn while a retry is pending does not slow the next note's retry", async () => {
+    const { agent, channel } = await boot();
+    mockSdk.responseFn = () => "NO_REPLY";
+    const internals = retryInternals(agent);
+    const retries = interceptRetryTimers(agent);
+    const turn = vi.spyOn(internals, "processContinuity");
+    for (let i = 0; i < 6; i++) turn.mockRejectedValueOnce(new Error("API down"));
+    internals.subsessions.deps.queuePendingNote("dm:alex", formatTomoEvent("subsession-message", "OLD", { name: "s1:notify:o" }));
+    internals.subsessions.deps.messageWake("dm:alex");
+    for (let i = 1; i < 6; i++) {
+      await waitFor(() => expect(retries).toHaveLength(i));
+      retries[i - 1].fn();
+    }
+    await waitFor(() => expect(retries).toHaveLength(6));
+    expect(retries[5].ms).toBe(MESSAGE_WAKE_RETRY_CAP_MS);
+    // An ordinary turn reads the old note while the capped retry is pending.
+    await channel.simulateMessage(makeMsg({ chatId: "12345", text: "hi" }));
+    await waitFor(() => expect(messageNotes(agent, "dm:alex")).toEqual([]));
+    // A new note's wake fails: its retry starts from the base, not the cap.
+    turn.mockRejectedValueOnce(new Error("API down"));
+    internals.subsessions.deps.queuePendingNote("dm:alex", formatTomoEvent("subsession-message", "NEW", { name: "s1:notify:n" }));
+    internals.subsessions.deps.messageWake("dm:alex");
+    await waitFor(() => expect(retries).toHaveLength(7));
+    expect(retries[5].cleared).toBe(true);
+    expect(retries[6].ms).toBe(MESSAGE_WAKE_RETRY_BASE_MS);
     await agent.stop();
   });
 

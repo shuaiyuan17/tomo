@@ -231,7 +231,7 @@ export class Agent {
   /** Sessions with a task-message wake turn queued (subsessions.ownerMessages "via-main"). */
   private readonly messageWakes = new CoalescedWake((key, task) => this.enqueueForSession(key, task));
   /** Message wake retries per session, after turns that left the note unread: one timer per session. */
-  private readonly messageWakeRetry = new KeyedBackoff(MESSAGE_WAKE_RETRY_BASE_MS, MESSAGE_WAKE_RETRY_CAP_MS, (key) => this.messageWake(key));
+  private readonly messageWakeRetry = new KeyedBackoff(MESSAGE_WAKE_RETRY_BASE_MS, MESSAGE_WAKE_RETRY_CAP_MS, (key) => this.messageWake(key, true));
   private readonly ownerNotices: OwnerNotices;
   private readonly mcpAuthPrompts: McpAuthPrompts;
   private pendingNotesQueue: PendingNotesQueue;
@@ -726,8 +726,13 @@ export class Agent {
    * queued at a time per session, and it does not run when another turn has
    * already read them all. Unlike the mirror wake, not held back at the quota
    * pause: these are messages for the owner, not a look-along.
+   *
+   * A wake for a new note (not `retry`, the backoff's timer) drops the
+   * backoff first: the turn it queues reads every unread note, so a failure
+   * there starts from the base delay instead of inheriting an older note's.
    */
-  private messageWake(parentKey: string): void {
+  private messageWake(parentKey: string, retry = false): void {
+    if (!retry) this.messageWakeRetry.reset(parentKey);
     if (this.messageWakes.isQueued(parentKey)) return;
     const prompt = appendToTomoEventBody(formatTomoEvent("subsession-message",
       "A sub-session (or the harness, about one) handed you something for the owner; it is in a note above. Pass it on as that note says (send_message), hold it for a better moment, or fold it into other news. A question waits for the owner's answer: put it to them, and pass their answer back with task_message and attach_owner_message, in the turn of their answer. A task the harness paused at a limit goes on with a task_message of your own once the owner says so (the note says which kind it is). If nothing needs doing, end with NO_REPLY.",
@@ -775,9 +780,10 @@ export class Agent {
    * cut short, and the note went back to the queue) gets another wake later,
    * with exponential backoff (MESSAGE_WAKE_RETRY_BASE_MS doubling up to
    * MESSAGE_WAKE_RETRY_CAP_MS) and no attempt limit: it keeps retrying at
-   * the cap while the note stays unread. One timer per session: a retry
-   * already pending covers a second failed wake, and a wake already queued
-   * needs none (its own turn decides again). A firing timer only asks for a
+   * the cap while the note stays unread. One timer per session: a wake for a
+   * new note drops the pending one (see messageWake), a retry still pending
+   * covers any other failed wake, and a wake already queued needs none (its
+   * own turn decides again). A firing timer only asks for a
    * wake, which merges with one queued meanwhile. A turn that ran consumed
    * what it read, and a note that came in during it queued its own wake, so
    * a session that is quiet again makes no retry and its backoff resets.

@@ -164,10 +164,10 @@ it("shows a task's own model, and a task waiting on a check-back with background
   expect(moved.ok).toBe(true);
   vi.spyOn(agent, "hasBackgroundWork").mockImplementation((key) => key === "task:s1");
   channel.publishSubsessionsChanged();
-  await browserExpect(row).toContainText("Working (background)");
+  await browserExpect(row).toContainText("Waiting on background work");
   await page.screenshot({ path: "test-results/subsessions-background.png" });
   await row.getByRole("button").click();
-  await browserExpect(rail().getByTestId("subsession-state")).toContainText("Working (background)");
+  await browserExpect(rail().getByTestId("subsession-state")).toContainText("Waiting on background work");
   await browserExpect(rail().locator('[data-subsession="s1"]').getByRole("heading")).toContainText("Fable 5.2");
 });
 

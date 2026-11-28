@@ -3,6 +3,23 @@ import type { activity as en } from "../en/activity.js";
 
 /** Tomo 自己的工具（tomo-internal）在聊天里的样子：一句话、折叠行的统计、（之后的）活动卡片。 */
 export const activity = {
+  card: {
+    raw: "原始数据", rawHide: "收起原始数据", copyJson: "复制 JSON", copyId: "复制调用 ID：{{id}}",
+    rawNote: "这是服务端给浏览器的那份：截到 4,000 字，密钥已打码。完整的在磁盘上的 transcript 里。",
+    showAll: "展开全文", showLess: "收起", longer: "原文比这里显示的更长，看原始数据。", stickers_other: "{{count}} 个贴纸",
+    spawn: "开了一个任务", spawning: "正在开任务", spawnFailed: "任务没开成",
+    unknown: "没有记录到结果，不确定是否已经完成。", openTask: "打开任务", taskGone: "已不在任务列表里",
+    note: "给 <id>{{id}}</id> 带了话", noting: "正在给 <id>{{id}}</id> 带话", noteFailed: "没能给 <id>{{id}}</id> 带话",
+    noteHeld: "给 <id>{{id}}</id> 的话先留着", noteQueued: "它开始第一轮时会收到。", noteReleased: "这句话让它继续了。",
+    withOwner: "附上了你的原话",
+    cancel: "取消了一个任务", cancelling: "正在取消任务", cancelFailed: "没能取消 <id>{{id}}</id>", reason: "原因：{{reason}}",
+    sentTo: "发给了 <b>{{name}}</b>", sendingTo: "正在发给 <b>{{name}}</b>", sendFailed: "没能发给 <b>{{name}}</b>",
+    sentYou: "给你发了消息", sendingYou: "正在给你发消息", sentHere: "发到了这个对话",
+    delegate: "请 <b>{{name}}</b> 那边的会话代写一条", delegateYou: "请你的对话给你写一条", delegating: "正在请 <b>{{name}}</b> 代写",
+    delegateNote: "实际文字由那边的会话写，这里是请它写的内容。",
+    replyTo: "回复“{{text}}”", effect: "效果：{{effect}}",
+    via: { telegram: "Telegram", imessage: "iMessage", web: "Web" },
+  },
   line: {
     taskSpawn: "开了一个任务 · {{title}}", taskSpawnId: "开了 {{id}} · {{title}}",
     taskMessage: "给 {{id}} 带了话", taskMessageHeld: "给 {{id}} 的话先留着",

@@ -227,7 +227,7 @@ function seedConversation(store: SessionStore): void {
   add("assistant", "NO_REPLY", "web", q + 131_000);
   // A turn of Tomo's own tools (tomo-internal): rows as sentences, cards (see ACTIVITY below).
   add("user", "Can you have someone design the activity cards, tell the book club, and remind me tomorrow morning?", "web", q + 200_000);
-  add("assistant", "Done: s12 is on the design, the book club has the note, and there's a reminder for 8:30 tomorrow.", "web", q + 260_000);
+  add("assistant", "Done: s2 is on the design, the book club has the note, and there's a reminder for 8:30 tomorrow.", "web", q + 260_000);
   store.updateStats("dm:owner", { costUsd: 0.4, inputTokens: 1000, outputTokens: 400, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 128_400, contextMax: 200_000,
     // The SDK's real shape: what counts (sums to contextUsed), deferred tool schemas, the reserve and the free rest.
     contextBreakdown: [{ name: "System prompt", tokens: 9_200 }, { name: "System tools", tokens: 14_400 }, { name: "MCP tools", tokens: 3_400 },
@@ -289,14 +289,16 @@ const ACTIVITY: [string, Record<string, unknown>, string, boolean?][] = [
   ["recall_conversation", { query: "activity cards" }, "3 message(s), oldest first. Searched back to 2026-10-15.\n\n…"],
   ["task_spawn", { title: "Web UI: activity cards for internal tool calls", model: "fable",
     brief: "Goal: design cards for Tomo's internal tool calls in the web UI, so the chat shows what Tomo did instead of raw JSON.\n\nRead web/src/tool-calls.tsx first." },
-  "Started s12 (active). Its messages show as [s12 · Web UI: activity cards for internal tool calls]."],
-  ["task_status", { id: "s12" }, "s12: Web UI: activity cards for internal tool calls\nStatus: active\nCreated 0m ago, last activity 0m ago"],
+  "Started s2 (active). Its messages show as [s2 · Web UI: activity cards for internal tool calls]."],
+  ["task_status", { id: "s2" }, "s2: Web UI: activity cards for internal tool calls\nStatus: active\nCreated 0m ago, last activity 0m ago"],
+  ["task_message", { id: "s2", text: "The owner picked option A: keep ordinary tools as they are. Only Tomo's own tools get cards.", attach_owner_message: true },
+    "Passed to s2 with the owner's message."],
   ["send_message", { target: "telegram:-2", mode: "direct", message: "Reminder: Piranesi for next month. Poll for December goes out Friday." }, "OK (direct)."],
-  ["todo_add", { title: "Review the activity cards design", next: "Read s12's report", waiting_on: "owner", review_in: "2026-11-13" },
+  ["todo_add", { title: "Review the activity cards design", next: "Read s2's report", waiting_on: "owner", review_in: "2026-11-13" },
     "todo_add failed: review_in \"2026-11-13\" is not in the future.", true],
-  ["todo_add", { title: "Review the activity cards design", next: "Read s12's report", waiting_on: "owner", review_in: "3d" },
-    "Added t-41 Review the activity cards design · next: Read s12's report · waiting on the owner · review Nov 17"],
-  ["schedule_create", { name: "Design review reminder", schedule: "2026-11-15T08:30", message: "Remind the owner to look at s12's design", once: true },
+  ["todo_add", { title: "Review the activity cards design", next: "Read s2's report", waiting_on: "owner", review_in: "3d" },
+    "Added t-41 Review the activity cards design · next: Read s2's report · waiting on the owner · review Nov 17"],
+  ["schedule_create", { name: "Design review reminder", schedule: "2026-11-15T08:30", message: "Remind the owner to look at s2's design", once: true },
     JSON.stringify({ id: "c7f2a91e", name: "Design review reminder", enabled: true, lifecycle: "once", nextRunAt: "2026-11-15T16:30:00.000Z" })],
   ["pet_feed", {}, JSON.stringify({ event: "fed", hunger: 80, happiness: 72, mood: "happy", diary: "ate contentedly." })],
   ["react_to_message", { target: "dm:owner", reaction: "love" }, "OK. Reaction sent."],
@@ -371,6 +373,8 @@ async function boot(options: { conversation: boolean }): Promise<void> {
     // dispatch never opens (no agent.start()): the task stays queued and runs no turn into the shots.
     theAgent.subsessions?.recoverAtStartup();
     theAgent.subsessions?.spawn("dm:owner", { title: "Draft the release notes", brief: "Draft the 1.9 release notes from the merged PRs.", quote: ["start the 1.9 notes"] });
+    // s2: the task the activity cards' turn started (ACTIVITY).
+    theAgent.subsessions?.spawn("dm:owner", { title: "Web UI: activity cards for internal tool calls", brief: "Design the activity cards.", model: "fable" });
   }
 }
 
@@ -517,10 +521,17 @@ async function conversationSteps(page: Page, vp: Viewport, theme: Theme): Promis
   });
   await s("activity", "open", async (snap) => {
     await reset(page);
-    const group = history(page).getByRole("button", { name: /Searched past conversations/ }).first();
-    await group.click({ timeout: 5000 });
+    const card = history(page).locator("[data-activity-card=task_spawn]").first();
+    await card.evaluate((el) => el.scrollIntoView({ block: "start" }));
     await page.waitForTimeout(300);
-    await group.evaluate((el) => el.scrollIntoView({ block: "start" }));
+    await snap();
+  });
+  await s("activity", "raw", async (snap) => {
+    await reset(page);
+    const card = history(page).locator("[data-activity-card=task_spawn]").first();
+    await card.getByRole("button", { name: "Raw data" }).click({ timeout: 5000 });
+    await card.evaluate((el) => el.scrollIntoView({ block: "start" }));
+    await page.waitForTimeout(300);
     await snap();
   });
   await s("tools", "closed", async (snap) => {

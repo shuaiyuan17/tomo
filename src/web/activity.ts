@@ -1,6 +1,8 @@
 import { scrubSecretValues } from "../redact.js";
 import { redactText } from "./redact-command.js";
 import type { ToolActivity, ToolOutcome } from "./protocol.js";
+import { webSessionId } from "./owner.js";
+import { extractAttachments } from "../agent/text-utils.js";
 
 /**
  * Tomo's own tools (the in-process `tomo-internal` MCP server) as the web UI
@@ -59,8 +61,16 @@ const sessionKey = (value: unknown): string | undefined => {
   return key && /^(?:dm|telegram|imessage|web|task):[^\s]{1,150}$/.test(key) && scrubSecretValues(key) === key ? key : undefined;
 };
 
-/** A `MEDIA:/path` line's file name (never the path: the card shows a chip). */
-const MEDIA_LINE = /^MEDIA:\s*(\S.*)$/;
+/**
+ * Where a send_message goes, as the page can name it: the owner (a `dm:` key,
+ * or their name / "owner", which is how the tool takes them), or a
+ * conversation by the id the page lists it under (WebSession.id).
+ */
+function destination(target: string): { toOwner: true } | { targetId: string } | Record<string, never> {
+  if (target.startsWith("dm:") || !target.includes(":")) return { toOwner: true };
+  return /^[a-z]+:\S+$/.test(target) ? { targetId: webSessionId(target) } : {};
+}
+
 
 /** What a call to one of Tomo's internal tools asked for, or undefined (not internal, unknown, or unreadable). */
 export function toolActivity(name: string, input: Record<string, unknown>): ToolActivity | undefined {
@@ -87,11 +97,15 @@ export function toolActivity(name: string, input: Record<string, unknown>): Tool
     case "send_message": {
       const target = line(input.target);
       if (!target || typeof input.message !== "string") return undefined;
-      const lines = input.message.split("\n");
-      const media = lines.flatMap((l) => { const m = MEDIA_LINE.exec(l.trim()); return m ? [m[1].trim().split(/[\\/]/).pop() ?? ""] : []; }).filter(Boolean);
-      const said = body(lines.filter((l) => !MEDIA_LINE.test(l.trim())).join("\n"));
-      return { kind: tool, target, mode: input.mode === "direct" ? "direct" : "delegate", text: said?.text ?? "", ...(said?.truncated ? { textTruncated: true } : {}),
+      // A direct send: the same tags delivery strips (proactive-send), MEDIA anywhere in a line, quoted or not, and STICKER.
+      // A delegated one goes to the other session verbatim, so its text is shown as it was asked.
+      const direct = input.mode === "direct";
+      const { cleanText, mediaPaths, stickerIds } = direct ? extractAttachments(input.message) : { cleanText: input.message, mediaPaths: [], stickerIds: [] };
+      const media = mediaPaths.map((path) => path.split(/[\\/]/).pop() ?? "").filter(Boolean);
+      const said = body(cleanText);
+      return { kind: tool, target, ...destination(target), mode: direct ? "direct" : "delegate", text: said?.text ?? "", ...(said?.truncated ? { textTruncated: true } : {}),
         chars: input.message.length, ...(media.length ? { media: media.slice(0, 10).map((m) => clean(m, ACTIVITY_LINE_LIMIT).text) } : {}),
+        ...(stickerIds.length ? { stickers: stickerIds.length } : {}),
         ...optional("replyTo", line(input.reply_to)), ...optional("effect", line(input.effect)) };
     }
     case "react_to_message": {

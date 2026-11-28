@@ -31,7 +31,9 @@ export interface RailSubsessions { tasks: WebSubsession[]; revision: number; sen
  * (one opens as a chat in the rail), then other conversations. Ended sub-sessions from before
  * today stay folded under "N earlier" until asked for.
  */
-export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessions }: { tasks: WebTask[]; sessions: WebSession[]; onClose?: () => void; footer?: ReactNode; control?: TaskControl; subsessions?: RailSubsessions }) {
+export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessions, openedSub: openedFromOutside, onOpenSub }: { tasks: WebTask[]; sessions: WebSession[]; onClose?: () => void; footer?: ReactNode; control?: TaskControl; subsessions?: RailSubsessions;
+  /** The sub-session open in the rail, when the page keeps it (an activity card's "Open task" sets it); otherwise the rail keeps its own. */
+  openedSub?: string; onOpenSub?: (id: string | undefined) => void }) {
   const { t } = useTranslation("tasks");
   const [showAmbient, setShowAmbient] = useState(false);
   const listGutter = useScrollbarInPadding<HTMLDivElement>();
@@ -39,7 +41,11 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessi
   const [openFolds, setOpenFolds] = useState<Record<string, boolean>>({});
   const [opened, setOpened] = useState<{ sessionId: string; taskId: string }>();
   const [cameBack, setCameBack] = useState(false);
-  const [openedSub, setOpenedSub] = useState<string>();
+  const [ownOpenedSub, setOwnOpenedSub] = useState<string>();
+  const openedSub = onOpenSub ? openedFromOutside : ownOpenedSub;
+  const setOpenedSub = onOpenSub ?? setOwnOpenedSub;
+  // A sub-session opened from outside (a card's "Open task") replaces a subagent view left open, so Back leads to the list.
+  useEffect(() => { if (openedFromOutside !== undefined) setOpened(undefined); }, [openedFromOutside]);
   /** Ended sub-sessions from before today are listed too. Not kept: the rail opens tidy again. */
   const [showEarlier, setShowEarlier] = useState(false);
   const today = useToday();

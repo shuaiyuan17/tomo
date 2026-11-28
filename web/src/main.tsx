@@ -1,4 +1,4 @@
-import { lazy, useEffect, useRef, useState } from "react";
+import { lazy, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { markSubsessionDone, messageSubsession, taskAction } from "./api.js";
 import { activeSubsessions, useSubsessions } from "./subsessions.js";
@@ -6,6 +6,7 @@ import { useWeb } from "./use-web.js";
 import { onResume, repaint } from "./resume.js";
 import { trackKeyboardViewport } from "./keyboard-viewport.js";
 import { TasksPanel } from "./tasks-panel.js";
+import { ActivityEnvProvider, publishSubsessions } from "./activity-env.js";
 import { ScheduledSection } from "./scheduled-section.js";
 import { useMountedFor } from "./motion.js";
 import { runningCount } from "./tasks.js";
@@ -84,6 +85,13 @@ export function App() {
   const closeTasks = () => { setTasksOpen(false); tasksButton.current?.focus(); };
   useModalLayer(tasksModal, rail, "[data-tasks-close]", closeTasks);
   const subsessionList = useSubsessions(web.subsessionRevision);
+  // Activity cards read a task's live state by id from this store (activity-env.tsx), not through props.
+  useEffect(() => { publishSubsessions(subsessionList.tasks, subsessionList.available); }, [subsessionList]);
+  /** The sub-session open in the rail: here, so a card in the chat can open one ("Open task"). */
+  const [openedSub, setOpenedSub] = useState<string>();
+  const ownerConversation = !!selectedId && selectedId === ownerId;
+  const activityEnv = useMemo(() => ({ sessions, sessionId: selectedId, ownerConversation,
+    openTask: (id: string) => { setOpenedSub(id); setMenuOpen(false); setTasksOpen(true); } }), [sessions, selectedId, ownerConversation, setTasksOpen]);
   // A sub-session running now counts on the Tasks button like a running subagent.
   const running = runningCount(web.tasks) + activeSubsessions(subsessionList.tasks);
   // The owner writes to one of their sub-sessions from its chat in the rail, and marks what its report asked done (same gate as a message).
@@ -163,9 +171,11 @@ export function App() {
         mutator={{ bootstrap: web.bootstrap, refresh: web.refreshBootstrap, live: web.connection === "live" }} /></ChunkBoundary>}
       {home && <HomePage events={web.home} bootstrap={web.bootstrap} refresh={web.refreshBootstrap} inert={modal} />}
       {chatModal && <div aria-hidden="true" data-testid="chat-scrim" onClick={closeChat} className={`${scrim} motion-enter`} />}
+      <ActivityEnvProvider value={activityEnv}>
       <Conversation web={web} agent={agent} session={session} sessionId={selectedId} ownerConversation={!!selectedId && selectedId === ownerId}
         history={history} hidden={!!study || (home && !chatPanel)} inert={tasksModal || drawer}
         panel={chatPanel ? { modal: chatModal, onClose: closeChat } : undefined} />
+      </ActivityEnvProvider>
       {/* Wide screens: the rail takes its full width at once (the chat reflows
           once, not every frame) and only its content slides and fades. Narrow
           ones: it slides over the chat, with a dimmed backdrop. It stays
@@ -176,6 +186,7 @@ export function App() {
         style={railSize.width !== null ? { width: railSize.width } : undefined}
         className="group/rail relative flex min-h-0 w-[300px] shrink-0 flex-col overflow-hidden border-l px-3.5 pt-3 pb-4 max-[1024px]:fixed max-[1024px]:top-(--app-header) max-[1024px]:right-0 max-[1024px]:bottom-0 max-[1024px]:z-30 max-[1024px]:w-[min(340px,88vw)] max-[1024px]:bg-background max-[1024px]:px-3 max-[1024px]:pt-3 max-[1024px]:shadow-2xl max-[1024px]:transition-transform max-[1024px]:duration-[220ms] max-[1024px]:data-[state=closed]:translate-x-full max-[600px]:pb-[max(1rem,env(safe-area-inset-bottom))]">
         <div className="flex min-h-0 min-w-[246px] flex-1 flex-col transition-[opacity,transform] duration-[220ms] min-[1025px]:group-data-[state=closed]/rail:translate-x-4 min-[1025px]:group-data-[state=closed]/rail:opacity-0"><TasksPanel tasks={web.tasks} sessions={sessions} onClose={closeTasks} control={taskControl} subsessions={railSubsessions}
+          openedSub={openedSub} onOpenSub={setOpenedSub}
           footer={<ScheduledSection revision={web.cronRevision} onNavigate={() => { if (overlay) setTasksOpen(false); }} />} /></div>
         {railSize.separator && <div {...railSize.separator}
           className="group/handle absolute inset-y-0 left-0 z-10 w-2 cursor-col-resize touch-none outline-none">

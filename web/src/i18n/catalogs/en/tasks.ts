@@ -29,7 +29,7 @@ export const tasks = {
   subsession: {
     group: "Sub-sessions", openTitle: "Open {{id}} to talk to it",
     earlier_one: "{{n}} earlier", earlier_other: "{{n}} earlier",
-    state: { working: "Working", background: "Working (background)", active: "Active", queued: "Queued", waitingOwner: "Waiting for you", needsYou: "Needs you", waiting: "Waiting", finished: "Done", cancelled: "Cancelled", failed: "Failed" },
+    state: { working: "Working", background: "Waiting on background work", active: "Active", queued: "Queued", waitingOwner: "Waiting for you", needsYou: "Needs you", waiting: "Waiting", finished: "Done", cancelled: "Cancelled", failed: "Failed" },
     conversation: "Conversation with {{id}}",
     you: "You", tag: { ask: "Question", notify: "Update" }, report: "Report", earlierReport: "Earlier report #{{seq}}",
     checkpoint: { heading: "Checkpoint" },

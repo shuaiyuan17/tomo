@@ -1,8 +1,9 @@
 import { extractAttachments } from "./text-utils.js";
 import { landsInPrivate, globReachesPrivate, grepReachesPrivate, bashTouchesMemory } from "./private-memory-reach.js";
 import { expandTilde } from "./bash-write-targets.js";
-import { dirname, isAbsolute } from "node:path";
-import { abs, foldPath, hasTraversalSegment, isInside, realResolve } from "./permission-paths.js";
+import { readdirSync } from "node:fs";
+import { dirname, isAbsolute, join, sep } from "node:path";
+import { abs, foldPath, hasTraversalSegment, isInside, realDir, realResolve } from "./permission-paths.js";
 
 /*
  * The #464 private-memory predicate for one tool call, in a module free of
@@ -210,4 +211,71 @@ export function isPrivateMemoryAccess(
     default:
       return false;
   }
+}
+
+/**
+ * The folders under `memory/groups/` that belong to some group other than
+ * `ownDir` (relative to memory/, `groups/<dir>`; undefined: the turn has no
+ * single group, so every one is another's). Absolute. Read per call: a group
+ * folder appears the first time that group saves something.
+ */
+/** The file paths a file-tool call or a composed message names (not search roots). */
+function namedPaths(toolName: string, toolInput: unknown): string[] {
+  if (!toolInput || typeof toolInput !== "object") return [];
+  const ti = toolInput as Record<string, unknown>;
+  if (toolName === SEND_MESSAGE_TOOL) return typeof ti.message === "string" ? attachmentPathsIn(ti.message).map(expandTilde) : [];
+  const p = toolName === "NotebookEdit" ? ti.notebook_path : HOME_WRITE_TOOLS.has(toolName) || toolName === "Read" ? ti.file_path : undefined;
+  return typeof p === "string" ? [p] : [];
+}
+
+/**
+ * Under `memory/groups/<g>/` (or directly in groups/) for a `g` that is not
+ * the turn's own folder spelled exactly: on a case-sensitive disk a case
+ * variant is another folder. Judged as spelled and as the kernel would
+ * resolve it (a link to groups/ itself, the folder named not existing yet).
+ */
+function spelledInOtherGroup(p: string, ctx: { cwd: string; memoryDir: string; ownGroupDir?: string }): boolean {
+  const own = ctx.ownGroupDir?.split("/")[1];
+  const expanded = expandTilde(p);
+  const groupsDirs = [join(ctx.memoryDir, "groups"), realDir(join(ctx.memoryDir, "groups"), ctx.cwd, true)]
+    .filter((d): d is string => d !== null);
+  const paths = [abs(expanded, ctx.cwd), realResolve(expanded, ctx.cwd, true)];
+  // An unresolvable path (a link loop) is refused, as everywhere else in the guard.
+  if (paths[1] === null) return true;
+  return paths.some((path) => groupsDirs.some((groups) => {
+    if (!isInside(path!, groups) || foldPath(path!) === foldPath(groups)) return false;
+    const segments = path!.split(sep);
+    const depth = groups.split(sep).length;
+    return segments.length === depth + 1 || segments[depth] !== own;
+  }));
+}
+
+export function otherGroupMemoryDirs(memoryDir: string, ownDir: string | undefined): string[] {
+  const groupsDir = join(memoryDir, "groups");
+  let names: string[];
+  try { names = readdirSync(groupsDir); } catch { return []; }
+  const own = ownDir?.split("/")[1];
+  return names.filter((name) => name !== own).map((name) => join(groupsDir, name));
+}
+
+/**
+ * Would this file-tool call (or search, or attachment) reach another group's
+ * memory folder? Each such folder is judged exactly as private/ is (lexical,
+ * real path, `..` under memory/, a search rooted at, in or above it), so a
+ * link or a scan over groups/ does not get round it. Bash is not decided
+ * here: its sandbox closes private/ only, and what another group said is
+ * that group's words, not the owner's private matters (accepted).
+ */
+export function isOtherGroupMemoryAccess(
+  toolName: string,
+  toolInput: unknown,
+  ctx: { cwd: string; memoryDir: string; ownGroupDir?: string; otherGroupDirs: readonly string[] },
+): boolean {
+  if (toolName === "Bash") return false;
+  // As spelled, whether or not the folder exists yet: a path under groups/
+  // in a folder not the turn's own (a file the tool would create included).
+  if (namedPaths(toolName, toolInput).some((p) => spelledInOtherGroup(p, ctx))) return true;
+  if (ctx.otherGroupDirs.length === 0) return false;
+  if (ctx.otherGroupDirs.some((dir) => isPrivateMemoryAccess(toolName, toolInput, { cwd: ctx.cwd, memoryDir: ctx.memoryDir, privateDir: dir }))) return true;
+  return SEARCH_TOOLS.has(toolName) && barredSearch(toolName, toolInput, { cwd: ctx.cwd, barredDirs: ctx.otherGroupDirs });
 }

@@ -369,6 +369,8 @@ describe("private tools during a summoned-group turn", () => {
     expect(prompt).toContain("reply like a participant: short, in its tone, no headers, people by name when natural; chatter that isn't for you needs no group message");
     expect(prompt).toContain("The owner's private context is off limits for this turn");
     expect(prompt).toContain("by any route");
+    // Where this group's turn may save: its own folder (the memory tools hold it there).
+    expect(prompt).toContain(`You can save to memory only under groups/telegram_${GROUP_CHAT_ID}/.`);
     // Stated as a norm: naming the blocked tools would tell a refused model
     // where else to look, and the enforcement is not total (see the residuals
     // in CHANGELOG.md — the system prompt already carries private people

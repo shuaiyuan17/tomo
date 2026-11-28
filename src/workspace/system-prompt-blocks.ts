@@ -25,6 +25,8 @@
  * `static + "\n\n# SESSION…" + "\n\n# RUNTIME…"` string.
  */
 
+import { groupMemoryDir } from "./memory-index.js";
+
 /**
  * The SDK's marker, restated locally rather than imported as a value: most
  * test files replace the SDK module with a mock that has no such export, and
@@ -64,6 +66,8 @@ export function renderSessionSection(ctx: SessionPromptContext): string {
       lines.push(`- Known participants: ${g.participants.join(", ")}`);
     }
     lines.push("- Incoming messages identify the sender. A canonical PEOPLE name in parentheses refers to the same person.");
+    // Per group, so it lives here and not in the shared, cacheable prompt.
+    lines.push(`- Memory folder: ${groupMemoryDir(ctx.sessionKey)}/ — the only place in memory this chat can save to; memory_list with it shows what is there.`);
     if (g.isPassive) {
       lines.push("- **Listen mode: passive.** You see every message. Reply only when directly addressed or genuinely useful; otherwise reply `NO_REPLY`.");
     } else {

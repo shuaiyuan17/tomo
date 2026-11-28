@@ -19,18 +19,19 @@ vi.mock("../src/config.js", () => ({
 vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/agent-mocks.js")).sdkModuleMock());
 
 const { createTomoInternalMcpServer } = await import("../src/mcp/internal-server.js");
+const { MIXED_AUDIENCE_KEY } = await import("../src/agent/audience.js");
 
 type ToolResult = { content: Array<{ text: string }>; isError?: boolean };
 type ToolHandle = { name: string; handler: (args: Record<string, unknown>) => Promise<ToolResult> };
 
-function server(key: string, barred: () => boolean) {
+function server(key: string, barred: () => boolean, steering?: () => string, parentKey?: string) {
   const agent = {
     isPrivateMemoryBarred: barred,
     isOwnAudienceTurn: () => !barred(),
-    scopedCallerKey: (k: string) => k,
+    scopedCallerKey: (k: string) => steering?.() ?? k,
     turnOwnerMessages: () => [],
     sdkSessionIdFor: () => undefined,
-    subsessions: undefined,
+    subsessions: parentKey === undefined ? undefined : { parentKeyOf: () => parentKey },
     credentialBroker: undefined,
     permissionBroker: {},
   };
@@ -65,6 +66,38 @@ describe("memory tools on the tomo-internal server", () => {
     expect((await s.call("memory_read", { path: "private/p.md" })).isError).toBeUndefined();
     expect((await s.call("memory_append", { path: "MEMORY.md", content: "- owner line" })).isError).toBeUndefined();
     expect(readFileSync(join(MEM, "MEMORY.md"), "utf8")).toBe("# M\n- owner line\n");
+  });
+
+  it("a summoned turn writes only in the steering group's folder; a mixed batch nowhere", async () => {
+    let steering = "telegram:-100555";
+    const s = server("dm:alex", () => true, () => steering);
+    const own = await s.call("memory_write", { path: "groups/telegram_-100555/n.md", content: "---\ndescription: N.\n---\nx\n", if_version: "new" });
+    expect(own.isError).toBeUndefined();
+    const other = await s.call("memory_write", { path: "groups/telegram_-100666/n.md", content: "---\ndescription: N.\n---\nx\n", if_version: "new" });
+    expect(other.isError).toBe(true);
+    expect((await s.call("memory_write", { path: "shared-from-group.md", content: "---\ndescription: N.\n---\nx\n", if_version: "new" })).isError).toBe(true);
+    // Several chats in one batch: no single group, so nothing is written.
+    steering = MIXED_AUDIENCE_KEY;
+    expect((await s.call("memory_append", { path: "groups/telegram_-100555/n.md", content: "- more" })).isError).toBe(true);
+    expect(readFileSync(join(MEM, "groups", "telegram_-100555", "n.md"), "utf8")).toBe("---\ndescription: N.\n---\nx\n");
+  });
+
+  it("a group session writes in its own folder", async () => {
+    const s = server("telegram:-100777", () => true);
+    expect((await s.call("memory_write", { path: "groups/telegram_-100777/n.md", content: "---\ndescription: N.\n---\nx\n", if_version: "new" })).isError).toBeUndefined();
+    expect((await s.call("memory_write", { path: "groups/telegram_-100555/m.md", content: "---\ndescription: N.\n---\nx\n", if_version: "new" })).isError).toBe(true);
+  });
+
+  it("a group-scoped sub-session reads its own group's folder, not another's; an owner-scoped one reads both", async () => {
+    mkdirSync(join(MEM, "groups", "telegram_-100888"), { recursive: true });
+    mkdirSync(join(MEM, "groups", "telegram_-100999"), { recursive: true });
+    writeFileSync(join(MEM, "groups", "telegram_-100888", "a.md"), "---\ndescription: A.\n---\nx\n");
+    writeFileSync(join(MEM, "groups", "telegram_-100999", "b.md"), "---\ndescription: B.\n---\nx\n");
+    const scoped = server("task:s7", () => true, undefined, "telegram:-100888");
+    expect((await scoped.call("memory_read", { path: "groups/telegram_-100888/a.md" })).isError).toBeUndefined();
+    expect((await scoped.call("memory_read", { path: "groups/telegram_-100999/b.md" })).isError).toBe(true);
+    const owners = server("task:s8", () => false, undefined, "dm:alex");
+    expect((await owners.call("memory_read", { path: "groups/telegram_-100999/b.md" })).isError).toBeUndefined();
   });
 
   it("keeps old versions under <tomoHome>/data/memory-history/", async () => {

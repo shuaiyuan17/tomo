@@ -3,9 +3,10 @@
 // Pure fs + path: no runtime-path or config imports.
 import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { foldPath, isInside } from "../agent/permission-paths.js";
 import { landsInPrivate } from "../agent/private-memory-reach.js";
+import { transcriptFileStem } from "../sessions/transcript-names.js";
 import { PRIVATE_MEMORY_SUBDIR } from "./private-memory.js";
 
 /**
@@ -33,6 +34,58 @@ function folded(rel: string): string[] {
 /** At or under `memory/private/`, by the folded first segment. */
 export function isPrivateMemoryPath(rel: string): boolean {
   return folded(rel)[0] === PRIVATE_MEMORY_SUBDIR;
+}
+
+/** Where group chats save: one folder per group, `groups/<dir>/`. */
+export const GROUPS_MEMORY_SUBDIR = "groups";
+
+/**
+ * The folder a group's turns save to, relative to memory/:
+ * `groups/<transcript file stem of the group's session key>`. The stem is
+ * injective up to case folding (see transcriptFileStem), so two groups never
+ * share a folder, on a case-insensitive filesystem either.
+ */
+export function groupMemoryDir(groupKey: string): string {
+  return `${GROUPS_MEMORY_SUBDIR}/${transcriptFileStem(groupKey)}`;
+}
+
+/**
+ * The group folder `rel` belongs to (its folded name under groups/), "" for a
+ * file lying directly in groups/ (no group's), or undefined outside groups/
+ * and for groups/ itself. `folder`: `rel` names a folder, not a file.
+ */
+function groupFolderOf(rel: string, folder: boolean): string | undefined {
+  const parts = rel.split("/");
+  if (folded(rel)[0] !== GROUPS_MEMORY_SUBDIR || parts.length < 2) return undefined;
+  if (parts.length === 2 && !folder) return "";
+  return parts[1];
+}
+
+/**
+ * On a turn a group steers: is `rel` in some group's folder other than
+ * `ownDir` (from {@link groupMemoryDir}; undefined when the turn has no single
+ * group, so every group's folder is someone else's)? groups/ is recognised
+ * in any case, the turn's own folder only as spelled: on a case-sensitive
+ * disk a case variant of it is another folder. A file directly under
+ * groups/ is no group's, so it counts as another's too. groups/ itself does
+ * not: listing it shows the turn's own folder.
+ */
+export function isOtherGroupMemoryPath(rel: string, ownDir: string | undefined, folder = false): boolean {
+  const g = groupFolderOf(rel, folder);
+  if (g === undefined) return false;
+  const own = ownDir === undefined ? undefined : groupFolderOf(ownDir, true);
+  return own === undefined || g !== own;
+}
+
+/**
+ * Strictly inside the folder `dir` (relative, no trailing slash), spelled
+ * exactly: on a case-sensitive filesystem `groups/A/` and `groups/a/` are
+ * two folders, and only the one named is the turn's.
+ */
+export function isInsideMemoryFolder(rel: string, dir: string): boolean {
+  const f = rel.split("/");
+  const d = dir.split("/");
+  return f.length > d.length && d.every((part, i) => f[i] === part);
 }
 
 /** `MEMORY.md` or `private/MEMORY.md`. */
@@ -122,7 +175,7 @@ export function descriptionProblem(text: string): "missing" | "multi-line" | "to
 }
 
 /** Why {@link readMemoryFile} refused a file. */
-export type UnreadableReason = "link" | "not-plain" | "outside" | "private" | "moved";
+export type UnreadableReason = "link" | "not-plain" | "outside" | "private" | "other-group" | "moved";
 
 /**
  * Read one memory file safely: never through a symlink in its last part
@@ -134,7 +187,7 @@ export type UnreadableReason = "link" | "not-plain" | "outside" | "private" | "m
  * folder or file replaced by a link into private/ is refused, not read.
  * Returns null when the file doesn't exist; throws on other I/O errors.
  */
-export function readMemoryFile(abs: string, memoryDir: string, excludePrivate: boolean):
+export function readMemoryFile(abs: string, memoryDir: string, excludePrivate: boolean, ownGroupDir?: string):
   { bytes: Buffer } | { refused: UnreadableReason } | null {
   let fd: number;
   try {
@@ -151,6 +204,8 @@ export function readMemoryFile(abs: string, memoryDir: string, excludePrivate: b
     const real = realpathSync(abs);
     if (!isInside(real, memoryDir)) return { refused: "outside" };
     if (excludePrivate && landsInPrivate(real, { cwd: memoryDir, memoryDir, privateDir: join(memoryDir, PRIVATE_MEMORY_SUBDIR) })) return { refused: "private" };
+    // With private/ closed, so is every group's folder but the turn's own: by where the file really is.
+    if (excludePrivate && isOtherGroupMemoryPath(relative(memoryDir, real).split(sep).join("/"), ownGroupDir)) return { refused: "other-group" };
     const now = statSync(real);
     if (now.ino !== st.ino || now.dev !== st.dev) return { refused: "moved" };
     return { bytes: readFileSync(fd) };
@@ -174,8 +229,10 @@ export interface MemoryFileEntry {
 export interface CollectOptions {
   /** The memory root (an absolute, real directory). */
   memoryDir: string;
-  /** Leave out everything under private/ (a group turn). */
+  /** Leave out everything under private/ (a group turn), and every group's folder under groups/ but `ownGroupDir`. */
   excludePrivate: boolean;
+  /** With `excludePrivate`: the one group folder the turn may see (groupMemoryDir); undefined, none. */
+  ownGroupDir?: string;
   /** Only paths under this folder (relative, no leading or trailing slash). */
   prefix?: string;
   /** Include files the list leaves out (journal/, archive/). People and attachments are never included. */
@@ -207,7 +264,8 @@ export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileE
   const prefix = opts.prefix ? foldPath(opts.prefix.replace(/\/+$/, "")) : "";
   const entries: MemoryFileEntry[] = [];
   let truncated = false;
-  const skipped = (rel: string): boolean => (opts.excludePrivate && isPrivateMemoryPath(rel))
+  const skipped = (rel: string, folder: boolean): boolean => (opts.excludePrivate
+      && (isPrivateMemoryPath(rel) || isOtherGroupMemoryPath(rel, opts.ownGroupDir, folder)))
     || isPeopleMemoryPath(rel) || isIncomingMemoryPath(rel);
   const underPrefix = (rel: string): boolean => {
     if (!prefix) return true;
@@ -222,10 +280,10 @@ export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileE
       if (entries.length >= maxFiles || now() > deadline) { truncated = true; return; }
       if (name.startsWith(".")) continue;
       const rel = relDir ? `${relDir}/${name}` : name;
-      if (skipped(rel) || !underPrefix(rel)) continue;
+      if (!underPrefix(rel)) continue;
       let st;
       try { st = lstatSync(join(opts.memoryDir, rel)); } catch { continue; }
-      if (st.isSymbolicLink()) continue;
+      if (st.isSymbolicLink() || skipped(rel, st.isDirectory())) continue;
       if (st.isDirectory()) {
         if (depth < 8) walk(rel, depth + 1);
         continue;
@@ -237,7 +295,7 @@ export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileE
       if (prefix && foldPath(rel) !== prefix && !foldPath(rel).startsWith(`${prefix}/`)) continue;
       let content: Buffer;
       try {
-        const read = readMemoryFile(join(opts.memoryDir, rel), opts.memoryDir, opts.excludePrivate);
+        const read = readMemoryFile(join(opts.memoryDir, rel), opts.memoryDir, opts.excludePrivate, opts.ownGroupDir);
         if (read === null || "refused" in read) continue;
         content = read.bytes;
       } catch { continue; }

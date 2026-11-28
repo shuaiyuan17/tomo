@@ -109,7 +109,7 @@ function load(name: string): string {
  */
 export const SHARED_PRIVATE_MEMORY_NOTE = `## Private memories (not loaded)
 
-A group chat is part of this conversation now, so the files under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` and private people records are not loaded: MEMORY.md lines that link into \`${PRIVATE_MEMORY_SUBDIR}/\` are left out of the index below, and private people are left out of the registry. Don't bring private memory into this conversation while the group is here. What the owner tells you in private that shouldn't surface in a group still goes under \`memory/${PRIVATE_MEMORY_SUBDIR}/\`, indexed in MEMORY.md the normal way.`;
+A group chat is part of this conversation now, so the files under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` and private people records are not loaded: MEMORY.md lines that link into \`${PRIVATE_MEMORY_SUBDIR}/\` are left out of the index below, and private people are left out of the registry. Don't bring private memory into this conversation while the group is here. On a group member's turn you can write only in the folder that turn's reminder names. What the owner tells you in private that shouldn't surface in a group still goes under \`memory/${PRIVATE_MEMORY_SUBDIR}/\`, indexed in MEMORY.md the normal way.`;
 
 /** `lines`: MEMORY.md as this audience sees it (memoryIndexLines), read once
  *  by buildSystemPrompt so the prompt and its context snapshot agree.
@@ -123,7 +123,7 @@ function loadMemory(isGroup: boolean, lines: string[] | null, shared = false): s
   // How a topic file gets indexed: only the owner's own conversation can
   // change MEMORY.md (MemoryStore refuses a group turn).
   const howToSave = isGroup
-    ? `Create a topic file with memory_write (if_version "new"), with frontmatter whose \`description:\` (one line, at most 200 characters) says when to read it. MEMORY.md can be changed only in the owner's private conversation, so a file saved here is not indexed there until the owner asks for it.`
+    ? `When someone here asks you to remember something, save it in this chat's memory folder (Group Chat Context, below) before you reply; nothing from a group chat is saved later. You can't write anywhere else in memory: something every conversation needs is for the owner to ask for in private. Create a file there with memory_write (if_version "new"), with frontmatter whose \`description:\` (one line, at most 200 characters) says when to read it.`
     : `1. Create the topic file with memory_write (if_version "new"), e.g. \`travel.md\`:
 \`\`\`markdown
 ---

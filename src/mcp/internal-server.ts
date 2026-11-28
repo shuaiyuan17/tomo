@@ -14,6 +14,7 @@ import { groupKeyFor, privateMemoryBarFor } from "../agent/private-memory-guard.
 import { buildTodoTools } from "./todo-tools.js";
 import { buildMemoryTools } from "./memory-tools.js";
 import { MemoryStore } from "../memory/store.js";
+import { groupMemoryDir } from "../workspace/memory-index.js";
 import { memoryHistoryDir } from "../memory/history.js";
 import { join } from "node:path";
 import { isDmSessionKey, isGroupSessionKey, isTaskSessionKey } from "../sessions/keys.js";
@@ -323,8 +324,13 @@ export function createTomoInternalMcpServer(agent: Agent, callerSessionKey: stri
       ...buildMemoryTools({
         store: memoryStore,
         access: () => {
-          const barred = agent.isPrivateMemoryBarred(callerSessionKey);
-          return { privateBarred: barred, canWrite: true, canWriteCore: !barred };
+          const bar = privateMemoryBarFor(isGroupSessionKey(callerSessionKey), isOwnAudience);
+          if (!bar) return { privateBarred: false, canWrite: true, canWriteCore: true };
+          // The one group the turn belongs to (as for request_permission):
+          // its folder under groups/ is the only place it writes. None for a
+          // batch spanning several chats.
+          const groupKey = groupKeyFor(bar, callerSessionKey, () => agent.scopedCallerKey(callerSessionKey));
+          return { privateBarred: true, canWrite: true, canWriteCore: false, ...(groupKey ? { groupDir: groupMemoryDir(groupKey) } : {}) };
         },
       }),
       // The owner's DM spawns and steers sub-sessions; a summoned group's turn
@@ -431,7 +437,12 @@ function createSubsessionMcpServer(agent: Agent, taskKey: string): McpSdkServerC
       // Read only: a task reports what should be saved; the main session writes it.
       ...buildMemoryTools({
         store: memoryStore,
-        access: () => ({ privateBarred: groupScope(), canWrite: false, canWriteCore: false }),
+        access: () => {
+          if (!groupScope()) return { privateBarred: false, canWrite: false, canWriteCore: false };
+          // A group-scoped task sees its own group's folder, no other's.
+          const parent = agent.subsessions?.parentKeyOf(taskKey);
+          return { privateBarred: true, canWrite: false, canWriteCore: false, ...(parent && isGroupSessionKey(parent) ? { groupDir: groupMemoryDir(parent) } : {}) };
+        },
         readOnly: true,
       }),
     ],

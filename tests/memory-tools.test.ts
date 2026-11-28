@@ -15,7 +15,7 @@ type ToolResult = { content: Array<{ type: string; text: string }>; isError?: bo
 interface ToolHandle { name: string; handler: (args: Record<string, unknown>, extra: unknown) => Promise<ToolResult> }
 
 const OWNER = { privateBarred: false, canWrite: true, canWriteCore: true };
-const GROUP = { privateBarred: true, canWrite: true, canWriteCore: false };
+const GROUP = { privateBarred: true, canWrite: true, canWriteCore: false, groupDir: "groups/telegram_-100" };
 
 let mem: string;
 let hist: string;
@@ -450,8 +450,9 @@ describe("audience: a group turn", () => {
     expect((await t.call("memory_search", { query: "private pointer" })).text).toBe('No match for "private pointer".');
   });
 
-  it("can still write a shared topic file", async () => {
-    expect((await tools(GROUP).call("memory_write", { path: "groups-note.md", content: topic("From a group."), if_version: "new" })).error).toBe(false);
+  it("writes in its own group folder, not a shared topic file", async () => {
+    expect((await tools(GROUP).call("memory_write", { path: "groups-note.md", content: topic("From a group."), if_version: "new" })).error).toBe(true);
+    expect((await tools(GROUP).call("memory_write", { path: "groups/telegram_-100/note.md", content: topic("From a group."), if_version: "new" })).error).toBe(false);
   });
 
   it("the owner reaches all of it", async () => {

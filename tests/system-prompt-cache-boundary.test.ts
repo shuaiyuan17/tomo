@@ -15,6 +15,7 @@ vi.mock("../src/workspace/index.js", async () => ({
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { installAgentTestHooks, resetConfig } from "./helpers/agent-harness.js";
 import { sdkOptions, type SessionContext } from "../src/agent/sdk-options.js";
+import { groupMemoryDir } from "../src/workspace/memory-index.js";
 import {
   SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
   flattenSystemPrompt,
@@ -78,6 +79,8 @@ function legacySystemPrompt(base: string, sessionContext: SessionContext | undef
         lines.push(`- Known participants: ${g.participants.join(", ")}`);
       }
       lines.push("- Incoming messages identify the sender. A canonical PEOPLE name in parentheses refers to the same person.");
+      // Added since (memory 2b-2): the group's own memory folder.
+      lines.push(`- Memory folder: ${groupMemoryDir(sessionContext.sessionKey)}/ — the only place in memory this chat can save to; memory_list with it shows what is there.`);
       if (g.isPassive) {
         lines.push("- **Listen mode: passive.** You see every message. Reply only when directly addressed or genuinely useful; otherwise reply `NO_REPLY`.");
       } else {

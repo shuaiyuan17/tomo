@@ -25,6 +25,18 @@ describe("memory reader", () => {
     expect((await memory.file("MEMORY.md")).content).toContain("# Index");
   });
 
+  it("does not search journal/ folders, at any depth, though it still lists and reads them", async () => {
+    mkdirSync(join(root, "memory", "journal"), { recursive: true });
+    mkdirSync(join(root, "memory", "topics", "Journal"), { recursive: true });
+    writeFileSync(join(root, "memory", "journal", "2026-11-27.md"), "JOURNAL-NEEDLE top");
+    writeFileSync(join(root, "memory", "topics", "Journal", "d.md"), "JOURNAL-NEEDLE nested");
+    writeFileSync(join(root, "memory", "topics", "journal-notes.md"), "JOURNAL-NEEDLE in a topic file");
+    const found = await memory.search("JOURNAL-NEEDLE");
+    expect(found.results.map((r) => r.path)).toEqual(["topics/journal-notes.md"]);
+    expect((await memory.tree()).entries.map((e) => e.path)).toContain("journal/2026-11-27.md");
+    expect((await memory.file("journal/2026-11-27.md")).content).toContain("JOURNAL-NEEDLE");
+  });
+
   it.each(["../outside.md", "/outside.md", "topics/../../outside.md", "topics\\outside.md", "topics/./topic.md", "note.txt"])("rejects an unsafe path %s", async (path) => {
     await expect(memory.file(path)).rejects.toMatchObject({ code: "invalid_path" });
   });

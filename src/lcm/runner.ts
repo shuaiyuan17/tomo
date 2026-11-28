@@ -103,7 +103,9 @@ export function weeklyMemoryUpkeepText(period: string, pass: Exclude<MemoryPass,
     ? `This week's \`said\` lines are not checked this time: ${pass.saidSkipped}. Leave them.`
     : pass.said === undefined
       ? "This week's `said` lines could not be listed this time; leave them."
-      : "";
+      : !said && pass.said.truncated
+        ? "The scan for this week's `said` lines was incomplete (some files were not read in full) and found none; leave them."
+        : "";
   const summary = said
     ? "`memory: <what you moved or removed, or none>; said check: <n> checked, <a> misquoted, <b> overstated, <c> unsourced`"
     : "`memory: <what you moved or removed, or none>`";

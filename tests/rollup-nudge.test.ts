@@ -107,6 +107,12 @@ describe("the memory step of a rollup nudge (§4.2, §15.2 of the memory design)
     expect(text).not.toContain("not checked this time");
   });
 
+  it("says an incomplete scan that found no lines was incomplete, rather than nothing", () => {
+    const text = weekly({ today, said: { lines: [], more: 0, truncated: true } });
+    expect(text).toContain("was incomplete (some files were not read in full) and found none");
+    expect(text).not.toContain("said check:");
+  });
+
   it("says the said lines are not checked when the scan failed or there is no room, without listing any", () => {
     expect(weekly({ today })).toContain("This week's `said` lines could not be listed this time; leave them.");
     const full = weekly({ today, saidSkipped: "the context is too full" });

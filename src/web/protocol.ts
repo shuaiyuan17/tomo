@@ -253,14 +253,15 @@ export type ToolActivity =
   | { kind: "upsert_person"; name: string }
   /**
    * The memory tools: `path` relative to memory/. `created`: a memory_write of a new file (`if_version: "new"`);
-   * `old` / `new`: a memory_str_replace's two texts, each clipped to 80 characters; `lines`: how many a memory_append adds.
+   * `old` / `new`: a memory_str_replace's two texts, each clipped to 80 characters; `lines`: how many a memory_append adds;
+   * `pathAltered`: the shown path (`to` for a move) is not the exact one (collapsed, clipped, scrubbed), so it is not a link.
    */
-  | { kind: "memory_write"; path: string; created?: true; chars: number }
-  | { kind: "memory_str_replace"; path: string; old: string; new: string }
-  | { kind: "memory_append"; path: string; lines: number; create?: true }
-  | { kind: "memory_move"; from: string; to: string }
-  | { kind: "memory_delete"; path: string }
-  | { kind: "memory_read"; path: string }
+  | { kind: "memory_write"; path: string; pathAltered?: true; created?: true; chars: number }
+  | { kind: "memory_str_replace"; path: string; pathAltered?: true; old: string; new: string }
+  | { kind: "memory_append"; path: string; pathAltered?: true; lines: number }
+  | { kind: "memory_move"; from: string; to: string; pathAltered?: true }
+  | { kind: "memory_delete"; path: string; pathAltered?: true }
+  | { kind: "memory_read"; path: string; pathAltered?: true }
   | { kind: "memory_list"; prefix?: string }
   | { kind: "memory_search"; query: string };
 /**

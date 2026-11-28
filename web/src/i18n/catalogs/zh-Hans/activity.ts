@@ -44,7 +44,7 @@ export const activity = {
     memoryFailedCount_other: "{{count}} 处失败",
     memoryAction: { create: "新建", write: "重写", edit: "改了", append: "追加到", move: "挪了", delete: "删了" },
     memoryHead: "{{text}}", memoryNew: "新文件", memoryReplaced: "整个文件替换了，旧版本留 30 天",
-    memoryAdded_other: "+{{count}} 行", memoryAddedNew_other: "+{{count}} 行，新文件",
+    memoryAdded_other: "+{{count}} 行",
     memoryKept: "在 Tomo 自己的数据里留 30 天", memoryOpen: "在书房里打开 {{path}}",
     via: { telegram: "Telegram", imessage: "iMessage", web: "Web" },
   },

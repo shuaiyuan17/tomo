@@ -128,7 +128,7 @@ describe("toolOutcome reads what the real tools return", () => {
     expect(toolOutcome(I("memory_str_replace"), textOf(await run(tools, "memory_str_replace", { path: "travel.md", old: "May", new: "June" })))).toEqual({});
     expect(toolOutcome(I("memory_append"), textOf(await run(tools, "memory_append", { path: "travel.md", content: "Osaka after\n" })))).toEqual({});
     expect(toolOutcome(I("memory_read"), textOf(await run(tools, "memory_read", { path: "travel.md" })))).toEqual({ count: 6 });
-    expect(toolOutcome(I("memory_read"), textOf(await run(tools, "memory_read", { path: "travel.md", offset: 2, limit: 1 })))).toEqual({ count: 6 });
+    expect(toolOutcome(I("memory_read"), textOf(await run(tools, "memory_read", { path: "travel.md", offset: 2, limit: 1 })))).toEqual({ count: 1 });
     expect(toolOutcome(I("memory_list"), textOf(await run(tools, "memory_list", {})))).toEqual({ count: 1 });
     expect(toolOutcome(I("memory_list"), textOf(await run(tools, "memory_list", { prefix: "work/" })))).toEqual({ count: 0 });
     expect(toolOutcome(I("memory_search"), textOf(await run(tools, "memory_search", { query: "osaka" })))).toEqual({ count: 1 });
@@ -248,13 +248,16 @@ describe("the main chat's tool items carry activity and outcome", () => {
   it("memory tools read their input: clipped snippets, line counts, a new file", () => {
     expect(toolActivity(I("memory_write"), { path: "a.md", content: "x\ny", if_version: "new" })).toEqual({ kind: "memory_write", path: "a.md", created: true, chars: 3 });
     expect(toolActivity(I("memory_str_replace"), { path: "a.md", old: "o".repeat(200), new: "n" })).toMatchObject({ old: "o".repeat(80), new: "n" });
-    expect(toolActivity(I("memory_append"), { path: "j.md", content: "a\nb\nc\n", create: true })).toEqual({ kind: "memory_append", path: "j.md", lines: 3, create: true });
+    expect(toolActivity(I("memory_append"), { path: "j.md", content: "a\nb\nc\n", create: true })).toEqual({ kind: "memory_append", path: "j.md", lines: 3 });
+    // A path the card cannot show exactly is not linked.
+    expect(toolActivity(I("memory_delete"), { path: "work/my  notes.md" })).toMatchObject({ pathAltered: true });
+    expect(toolActivity(I("memory_delete"), { path: " work/a.md " })).not.toHaveProperty("pathAltered");
     expect(toolActivity(I("memory_move"), { from: "a.md", to: "b.md" })).toEqual({ kind: "memory_move", from: "a.md", to: "b.md" });
     expect(toolActivity(I("memory_search"), { query: "kyoto" })).toEqual({ kind: "memory_search", query: "kyoto" });
   });
   it("a group: a memory tool aimed at private/ (however spelled) has no activity and keeps only its path", () => {
     for (const input of [{ path: "private/notes.md", old: "secret", new: "x" }, { path: "./Private/../private/a.md", old: "s", new: "x" },
-      { path: "work/../private/a.md", old: "s", new: "x" }]) {
+      { path: "work/../private/a.md", old: "s", new: "x" }, { path: " private/notes.md ", old: "secret", new: "x" }]) {
       const [call] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m1", name: I("memory_str_replace"), input }]), 0, { workspaceDir: "/w" });
       expect(call.kind === "tool" && call.activity).toBeUndefined();
       expect(call.kind === "tool" && call.input).not.toContain("secret");

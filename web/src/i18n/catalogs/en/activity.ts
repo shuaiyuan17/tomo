@@ -44,7 +44,7 @@ export const activity = {
     memoryFailedCount_one: "{{count}} failed", memoryFailedCount_other: "{{count}} failed",
     memoryAction: { create: "New", write: "Rewrote", edit: "Edited", append: "Added to", move: "Moved", delete: "Deleted" },
     memoryHead: "{{text}}", memoryNew: "New file", memoryReplaced: "Whole file replaced; the old version is kept 30 days",
-    memoryAdded_one: "+{{count}} line", memoryAdded_other: "+{{count}} lines", memoryAddedNew_one: "+{{count}} line, new file", memoryAddedNew_other: "+{{count}} lines, new file",
+    memoryAdded_one: "+{{count}} line", memoryAdded_other: "+{{count}} lines",
     memoryKept: "Kept 30 days in Tomo's own data", memoryOpen: "Open {{path}} in the Study",
     via: { telegram: "Telegram", imessage: "iMessage", web: "Web" },
   },

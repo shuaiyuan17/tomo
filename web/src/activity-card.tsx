@@ -461,7 +461,8 @@ function MemoryLine({ row, state }: { row: MemoryRow; state: CardState }) {
     switch (activity.kind) {
       case "memory_write": small = activity.created ? t("card.memoryNew") : t("card.memoryReplaced"); break;
       case "memory_str_replace": small = <><span className="line-through decoration-muted-foreground/50">“{activity.old}”</span> → “{activity.new}”</>; break;
-      case "memory_append": small = t(activity.create ? "card.memoryAddedNew" : "card.memoryAdded", { count: activity.lines }); break;
+      // Not "new file": `create` only allows creating one; the result does not say whether it did.
+      case "memory_append": small = t("card.memoryAdded", { count: activity.lines }); break;
       case "memory_delete": small = t("card.memoryKept"); break;
       default: break;
     }
@@ -472,8 +473,8 @@ function MemoryLine({ row, state }: { row: MemoryRow; state: CardState }) {
       <p className={cn("m-0 text-[13px] leading-snug", state === "error" ? "text-destructive" : "text-foreground", state === "running" && "shimmer")}>
         <span className="mr-1.5 text-[12px] text-muted-foreground">{t(MEMORY_WORDS[action.word])}</span>
         <span className="sr-only">({t(LINE_STATE[state])}) </span>
-        {activity.kind === "memory_move" ? <><MemoryPath path={activity.from} gone /> → <MemoryPath path={activity.to} gone={state !== "done"} /></>
-          : <MemoryPath path={activity.path} gone={activity.kind === "memory_delete" || state !== "done"} />}</p>
+        {activity.kind === "memory_move" ? <><MemoryPath path={activity.from} gone /> → <MemoryPath path={activity.to} gone={state !== "done" || !!activity.pathAltered} /></>
+          : <MemoryPath path={activity.path} gone={activity.kind === "memory_delete" || state !== "done" || !!activity.pathAltered} />}</p>
       {state === "error" && row.result?.reason && <p className="m-0 mt-0.5 text-[12px] text-destructive [overflow-wrap:anywhere]">{row.result.reason}</p>}
       {small && <p className="m-0 mt-0.5 text-[12px] text-muted-foreground [overflow-wrap:anywhere]">{small}</p>}
       {state === "done" && note && <p className="m-0 mt-0.5 text-[12px] text-warn [overflow-wrap:anywhere]">{note}</p>}

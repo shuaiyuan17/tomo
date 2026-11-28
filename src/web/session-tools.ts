@@ -84,7 +84,8 @@ function memoryToolReachesPrivate(name: string, input: Record<string, unknown>):
   return ["path", "from", "to", "prefix"].some((key) => {
     const value = input[key];
     if (typeof value !== "string") return false;
-    const rel = posix.normalize(value.replace(/\\/g, "/").replace(/^\/+/, "")).toLowerCase();
+    // Trimmed first, as the store trims a path before it resolves it.
+    const rel = posix.normalize(value.trim().replace(/\\/g, "/").replace(/^\/+/, "")).toLowerCase();
     return rel === "private" || rel.startsWith("private/");
   });
 }

@@ -384,7 +384,7 @@ describe("a turn with more than six cards", () => {
 describe("memory cards", () => {
   const edit: ToolActivity = { kind: "memory_str_replace", path: "travel.md", old: "Kyoto in May", new: "Kyoto in June" };
   const created: ToolActivity = { kind: "memory_write", path: "work/cards.md", created: true, chars: 120 };
-  const append: ToolActivity = { kind: "memory_append", path: "private/journal/2026-11-27.md", lines: 6, create: true };
+  const append: ToolActivity = { kind: "memory_append", path: "private/journal/2026-11-27.md", lines: 6 };
   const move: ToolActivity = { kind: "memory_move", from: "old.md", to: "archive/old.md" };
   const del: ToolActivity = { kind: "memory_delete", path: "scratch.md" };
   const memCard = (items: SubagentItem[], running = false) => {
@@ -401,7 +401,10 @@ describe("memory cards", () => {
   it("a new file, an append, a move, a delete: each says what it did", () => {
     expect(card(row(call(created, { outcome: {} })))).toMatch(/Created a memory file[\s\S]*href="#study\/memory\/work%2Fcards.md"[\s\S]*New file/);
     const appended = card(row(call(append, { outcome: {} })));
-    expect(appended).toContain("+6 lines, new file");
+    expect(appended).toContain("+6 lines");
+    expect(appended).not.toContain("new file");
+    expect(card(row(call({ kind: "memory_delete", path: "x", pathAltered: true } as ToolActivity, { outcome: {} })))).not.toContain("href=");
+    expect(card(row(call({ ...edit, path: "work/my notes.md", pathAltered: true } as ToolActivity, { outcome: {} })))).not.toContain('href="#study/memory/work');
     // private/: the Study does not open it, so no link.
     expect(appended).not.toContain('href="#study/memory/private');
     expect(card(row(call(move, { outcome: {} })))).toMatch(/Moved a memory file[\s\S]*old\.md[\s\S]*→[\s\S]*archive\/old\.md/);

@@ -687,6 +687,22 @@ describe("SubsessionService", () => {
     expect(record.transitions.at(-1)?.reason).toContain("refused");
   });
 
+  it("input that arrives during a refused turn is held with the pause, not sent on the refused conversation", async () => {
+    let relayed = false;
+    const h = harness({}, (turn, hh) => {
+      if (!relayed) { relayed = true; hh.service.relay(hh.store.list()[0]!.id, "one more thing"); }
+      return { ok: false, failure: { refusal: "reasoning_extraction" } };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.turns).toHaveLength(1);
+    const record = h.store.get(t.id)!;
+    expect(record).toMatchObject({ status: "waiting", waitingOn: "owner", pausedBy: { kind: "turns_failing" } });
+    expect(record.pendingInput.some((i) => i.text.includes("one more thing"))).toBe(true);
+    expect(record.heldThrough).toBe(record.pendingInput.at(-1)!.seq);
+  });
+
   it("a refusal named only in the error text is not tried again either; an API error still gets its second turn", async () => {
     const refusedText = harness({}, () => ({ ok: false, failure: { detail: 'API Error: {"api_refusal_category":"reasoning_extraction"}' } }));
     refusedText.service.start();

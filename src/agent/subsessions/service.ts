@@ -2687,9 +2687,13 @@ export class SubsessionService {
           newInput("new input arrived during the stopped turn"));
       } else if (record.failStreak >= MAX_FAIL_STREAK) {
         // A failed turn's own inputs are still pending, and stay for the wake.
-        const reason = record.lastFailure?.refused ? "the model refused its turn, so it was not tried again" : "its turns keep failing";
+        // After a refusal, input that arrived during the turn gets no turn
+        // first: it would go out on the same conversation and be refused
+        // with it. It is held with the pause, like the rest.
+        const refused = record.lastFailure?.refused === true;
+        const reason = refused ? "the model refused its turn, so it was not tried again" : "its turns keep failing";
         this.pause(record, { kind: "turns_failing", reason, failure: true }, ownerT("subsessions")("failing", { id: record.id, title: record.title }),
-          newInput("new input arrived during the failed turn"));
+          refused ? undefined : newInput("new input arrived during the failed turn"));
       }
       return;
     }

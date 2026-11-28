@@ -2,7 +2,7 @@
 // One set of data for memory_list now and the generated prompt list later.
 // Pure fs + path: no runtime-path or config imports.
 import { createHash } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { foldPath, isInside } from "../agent/permission-paths.js";
 import { landsInPrivate } from "../agent/private-memory-reach.js";
@@ -187,8 +187,8 @@ export type UnreadableReason = "link" | "not-plain" | "outside" | "private" | "o
  * folder or file replaced by a link into private/ is refused, not read.
  * Returns null when the file doesn't exist; throws on other I/O errors.
  */
-export function readMemoryFile(abs: string, memoryDir: string, excludePrivate: boolean, ownGroupDir?: string):
-  { bytes: Buffer } | { refused: UnreadableReason } | null {
+export function readMemoryFile(abs: string, memoryDir: string, excludePrivate: boolean, ownGroupDir?: string, headBytes?: number):
+  { bytes: Buffer; partial?: true } | { refused: UnreadableReason } | null {
   let fd: number;
   try {
     fd = openSync(abs, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -208,6 +208,12 @@ export function readMemoryFile(abs: string, memoryDir: string, excludePrivate: b
     if (excludePrivate && isOtherGroupMemoryPath(relative(memoryDir, real).split(sep).join("/"), ownGroupDir)) return { refused: "other-group" };
     const now = statSync(real);
     if (now.ino !== st.ino || now.dev !== st.dev) return { refused: "moved" };
+    if (headBytes !== undefined && st.size > headBytes) {
+      // The first part only (the frontmatter is at the top): bounded, whatever the file's size.
+      const head = Buffer.alloc(headBytes);
+      const n = readSync(fd, head, 0, headBytes, 0);
+      return { bytes: head.subarray(0, n), partial: true };
+    }
     return { bytes: readFileSync(fd) };
   } finally {
     closeSync(fd);
@@ -245,6 +251,8 @@ export interface CollectOptions {
   withContent?: boolean;
   /** Keep a file that exists but could not be read (an I/O error) as an entry marked `unreadable`, instead of skipping it. */
   reportUnreadable?: boolean;
+  /** Read only this many bytes from the top of each file, enough for its frontmatter: the version is then not known (""). For the prompt's list. */
+  headBytes?: number;
   /** Stop after this many files (default 5000). */
   maxFiles?: number;
   /** Stop after this long (default 500 ms). */
@@ -260,13 +268,14 @@ export interface CollectOptions {
  * files count, and a file it cannot read is skipped. Sorting by path, not by
  * modification time, keeps the list stable when an old file changes.
  */
-export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileEntry[]; truncated: boolean } {
+export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileEntry[]; truncated: boolean; unreadableDirs: string[] } {
   const now = opts.now ?? Date.now;
   const deadline = now() + (opts.budgetMs ?? 500);
   const maxFiles = opts.maxFiles ?? 5000;
   const maxBytes = opts.maxFileBytes ?? 1024 * 1024;
   const prefix = opts.prefix ? foldPath(opts.prefix.replace(/\/+$/, "")) : "";
   const entries: MemoryFileEntry[] = [];
+  const unreadableDirs: string[] = [];
   let truncated = false;
   const skipped = (rel: string, folder: boolean): boolean => (opts.excludePrivate
       && (isPrivateMemoryPath(rel) || isOtherGroupMemoryPath(rel, opts.ownGroupDir, folder)))
@@ -278,7 +287,11 @@ export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileE
   };
   const walk = (relDir: string, depth: number): void => {
     let names: string[];
-    try { names = readdirSync(relDir ? join(opts.memoryDir, relDir) : opts.memoryDir); } catch { return; }
+    try { names = readdirSync(relDir ? join(opts.memoryDir, relDir) : opts.memoryDir); } catch (err) {
+      // A folder that can't be read is not an empty one: say so, so it doesn't read as its files being deleted.
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") unreadableDirs.push(relDir);
+      return;
+    }
     names.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     for (const name of names) {
       if (entries.length >= maxFiles || now() > deadline) { truncated = true; return; }
@@ -298,10 +311,12 @@ export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileE
       if (!listed && !opts.includeUnlisted && !(opts.includeCores && isCoreMemoryPath(rel))) continue;
       if (prefix && foldPath(rel) !== prefix && !foldPath(rel).startsWith(`${prefix}/`)) continue;
       let content: Buffer;
+      let partial: boolean;
       try {
-        const read = readMemoryFile(join(opts.memoryDir, rel), opts.memoryDir, opts.excludePrivate, opts.ownGroupDir);
+        const read = readMemoryFile(join(opts.memoryDir, rel), opts.memoryDir, opts.excludePrivate, opts.ownGroupDir, opts.headBytes);
         if (read === null || "refused" in read) continue;
         content = read.bytes;
+        partial = read.partial === true;
       } catch {
         if (opts.reportUnreadable) entries.push({ path: rel, version: "", bytes: 0, listed, unreadable: true });
         continue;
@@ -310,15 +325,17 @@ export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileE
       entries.push({
         path: rel,
         ...(description !== undefined ? { description } : {}),
-        version: memoryVersion(content),
-        bytes: content.length,
+        version: opts.headBytes !== undefined ? "" : memoryVersion(content),
+        bytes: partial ? st.size : content.length,
         listed,
         ...(opts.withContent ? { content } : {}),
       });
     }
   };
   walk("", 0);
-  return { entries, truncated };
+  // By whole path (a folder's walk would put work/a.md before work.md).
+  entries.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return { entries, truncated, unreadableDirs };
 }
 
 // ------------------------------------------------------------ the prompt list
@@ -391,12 +408,19 @@ export function renderMemoryFilesList(entries: readonly MemoryFileEntry[], opts:
     && (isPrivateMemoryPath(e.path) || folded(e.path)[0] === GROUPS_MEMORY_SUBDIR)));
   const groupCounts = new Map<string, number>();
   const foldCounts = new Map<string, number>();
+  // Per folded line: how many of its files could not be read, so a folded line still says so.
+  const unreadableIn = new Map<string, number>();
   for (const e of shown) {
     const g = groupKeyOfPath(e.path);
+    const k = g ?? foldKey(e.path);
+    if (k !== undefined && e.unreadable) unreadableIn.set(k, (unreadableIn.get(k) ?? 0) + 1);
     if (g !== undefined) { groupCounts.set(g, (groupCounts.get(g) ?? 0) + 1); continue; }
-    const k = foldKey(e.path);
     if (k !== undefined) foldCounts.set(k, (foldCounts.get(k) ?? 0) + 1);
   }
+  const unreadableNote = (k: string): string => {
+    const n = unreadableIn.get(k);
+    return n ? ` (⚠ ${n} could not be read just now)` : "";
+  };
   const readme = (dir: string): string | undefined =>
     shown.find((e) => foldPath(e.path) === foldPath(`${dir}/README.md`))?.description;
   // Each item: its line and how many files it stands for.
@@ -410,7 +434,7 @@ export function renderMemoryFilesList(entries: readonly MemoryFileEntry[], opts:
       const n = groupCounts.get(g)!;
       const label = opts.groupLabel?.(g);
       const what = `${n} ${n === 1 ? "file" : "files"} a group chat saved (its members' words)`;
-      items.push({ line: `- ${g}/ — ${label ? `"${oneLine(label)}": ` : ""}${what}`, files: n, dir: GROUPS_MEMORY_SUBDIR });
+      items.push({ line: `- ${g}/ — ${label ? `"${oneLine(label)}": ` : ""}${what}${unreadableNote(g)}`, files: n, dir: GROUPS_MEMORY_SUBDIR });
       continue;
     }
     const k = foldKey(e.path);
@@ -419,7 +443,7 @@ export function renderMemoryFilesList(entries: readonly MemoryFileEntry[], opts:
       emitted.add(k);
       const n = foldCounts.get(k)!;
       const d = readme(k);
-      items.push({ line: `- ${k}/ — ${n} files${d ? `: ${d}` : ""}`, files: n, dir: k.split("/").slice(0, -1).join("/") });
+      items.push({ line: `- ${k}/ — ${n} files${d ? `: ${d}` : ""}${unreadableNote(k)}`, files: n, dir: k.split("/").slice(0, -1).join("/") });
       continue;
     }
     const text = e.unreadable ? "⚠ could not be read just now" : e.description ?? NO_DESCRIPTION;

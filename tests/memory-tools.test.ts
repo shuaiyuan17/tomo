@@ -557,6 +557,8 @@ describe("the share reminder (§8.2): a new file outside private/, or new lines 
     expect((await t.call("memory_str_replace", { path: "MEMORY.md", old: "- two\n", new: "" })).text).not.toContain("is shared");
     expect((await t.call("memory_str_replace", { path: "MEMORY.md", old: "- one", new: "- one, corrected" })).text).toContain(SHARED_CORE);
     expect((await t.call("memory_append", { path: "private/MEMORY.md", content: "- secret" })).text).not.toContain("is shared");
+    // A line copied under a second heading is a line added.
+    expect((await t.call("memory_append", { path: "MEMORY.md", content: "## Elsewhere\n- three" })).text).toContain(SHARED_CORE);
   });
 
   it("is said when a file moves out of private/ into a shared place", async () => {

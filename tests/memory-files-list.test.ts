@@ -89,11 +89,41 @@ describe("what the list holds", () => {
   });
 });
 
+describe("reading the tree for the list", () => {
+  it("sorts by whole path: work.md before work/a.md", () => {
+    put("work/a.md", topic("A."));
+    put("work.md", topic("W."));
+    expect(list("full")).toEqual(["- work.md — W.", "- work/a.md — A."]);
+  });
+
+  it("reads only the top of each file: a huge one still gets its description, at a bounded read", () => {
+    put("huge.md", `${topic("Huge.")}${"x".repeat(3 * 1024 * 1024)}`);
+    const { entries } = collectMemoryFiles({ memoryDir: mem, excludePrivate: false, headBytes: 16 * 1024 });
+    expect(entries).toEqual([expect.objectContaining({ path: "huge.md", description: "Huge.", version: "", bytes: 3 * 1024 * 1024 + topic("Huge.").length })]);
+  });
+
+  it("reports a folder it can't read, rather than treating it as empty", () => {
+    put("work/a.md", topic("A."));
+    chmodSync(join(mem, "work"), 0o000);
+    try {
+      expect(collectMemoryFiles({ memoryDir: mem, excludePrivate: false }).unreadableDirs).toEqual(["work"]);
+    } finally { chmodSync(join(mem, "work"), 0o755); }
+  });
+});
+
 describe("folding", () => {
   it(`folds a folder with more than ${LIST_FOLD_FILES} files into one line with its README's description`, () => {
     const entries = [...files("work", LIST_FOLD_FILES + 1), entry("work/README.md", "Work projects.")];
     expect(renderMemoryFilesList(entries, { audience: "full" })).toEqual([`- work/ — ${LIST_FOLD_FILES + 2} files: Work projects.`]);
     expect(renderMemoryFilesList(files("work", LIST_FOLD_FILES + 1), { audience: "full" })).toEqual([`- work/ — ${LIST_FOLD_FILES + 1} files`]);
+  });
+
+  it("a folded line still says when some of its files could not be read", () => {
+    const entries = [{ ...entry("groups/telegram_-100/x.md"), unreadable: true as const }, ...files("work", 13).map((e, i) => (i === 3 ? { ...e, unreadable: true as const } : e))];
+    expect(renderMemoryFilesList(entries, { audience: "full" })).toEqual([
+      "- groups/telegram_-100/ — 1 file a group chat saved (its members' words) (⚠ 1 could not be read just now)",
+      "- work/ — 13 files (⚠ 1 could not be read just now)",
+    ]);
   });
 
   it(`lists a folder of ${LIST_FOLD_FILES} files file by file`, () => {

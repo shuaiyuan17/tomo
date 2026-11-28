@@ -32,6 +32,8 @@ const PRIVATE_MEMORY_ENTRYPOINT = join(MEMORY_DIR, "private", "MEMORY.md");
  */
 export { MEMORY_SOFT_LINES, MEMORY_SOFT_KB, MEMORY_HARD_LINES, MEMORY_HARD_KB };
 const KB = 1024;
+/** How much of each file the prompt's list reads: its frontmatter is at the top. */
+const LIST_HEAD_BYTES = 16 * 1024;
 
 /** Size of the index as the prompt holds it: its lines joined by newlines. */
 function indexBytes(lines: string[]): number {
@@ -272,13 +274,18 @@ function memoryFilesLines(withoutPrivate: boolean, strict = false): string[] {
     if (strict && (err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     return renderMemoryFilesList([], { audience: withoutPrivate ? "shared" : "full" });
   }
-  const { entries, truncated } = collectMemoryFiles({ memoryDir: root, excludePrivate: withoutPrivate, reportUnreadable: true });
-  if (truncated && strict) throw new Error("The memory files scan stopped early");
+  // Only the top of each file: the list needs the frontmatter, and a huge file must not stall the daemon.
+  const { entries, truncated, unreadableDirs } = collectMemoryFiles({ memoryDir: root, excludePrivate: withoutPrivate, reportUnreadable: true, headBytes: LIST_HEAD_BYTES });
+  if (strict && (truncated || unreadableDirs.length > 0)) throw new Error("The memory files scan was incomplete");
   const lines = renderMemoryFilesList(entries, {
     audience: withoutPrivate ? "shared" : "full",
     ...(groupLabelLookup ? { groupLabel: groupLabelLookup } : {}),
   });
-  return truncated ? [...lines, "(the scan stopped early: memory_list shows the rest)"] : lines;
+  const notes = [
+    ...unreadableDirs.map((dir) => `(${dir ? `${dir}/` : "memory/"} could not be read just now)`),
+    ...(truncated ? ["(the scan stopped early: memory_list shows the rest)"] : []),
+  ];
+  return [...lines, ...notes];
 }
 
 function peopleRosterLines(isGroup: boolean, strict = false): string[] {

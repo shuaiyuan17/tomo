@@ -86,10 +86,19 @@ export function sharedReminder(rel: string): string {
     : `${rel} is shared: group chats can read it. If this is private (see Layout), move it under private/.`;
 }
 
-/** Non-blank lines in `after` that `before` doesn't have. */
+/** Does `after` have a non-blank line more than `before` (counting repeats)? */
 function addsLines(before: string, after: string): boolean {
-  const had = new Set(before.split("\n").map((l) => l.trim()));
-  return after.split("\n").some((l) => l.trim() && !had.has(l.trim()));
+  // Counted, not a set: a line copied under a second heading is a line added.
+  const had = new Map<string, number>();
+  for (const l of before.split("\n")) if (l.trim()) had.set(l.trim(), (had.get(l.trim()) ?? 0) + 1);
+  for (const l of after.split("\n")) {
+    const t = l.trim();
+    if (!t) continue;
+    const n = had.get(t) ?? 0;
+    if (n === 0) return true;
+    had.set(t, n - 1);
+  }
+  return false;
 }
 
 export const READ_ONLY_REFUSAL =

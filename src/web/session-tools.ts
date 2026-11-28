@@ -70,6 +70,8 @@ const PATH_TOOLS: Record<string, readonly string[]> = {
   NotebookEdit: ["notebook_path"], Grep: ["path"], Glob: ["path"],
   ...Object.fromEntries(["memory_write", "memory_str_replace", "memory_append", "memory_delete", "memory_read"].map((tool) => [`mcp__tomo-internal__${tool}`, ["path"]])),
   "mcp__tomo-internal__memory_move": ["from", "to"], "mcp__tomo-internal__memory_list": ["prefix"],
+  // A search's query keeps nothing: the words searched for can be the private thing itself.
+  "mcp__tomo-internal__memory_search": [],
 };
 
 /**

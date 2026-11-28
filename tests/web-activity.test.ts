@@ -277,6 +277,9 @@ describe("the main chat's tool items carry activity and outcome", () => {
     const [linked] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m5", name: I("memory_str_replace"), input: { path: "alias/notes.md", old: "secret", new: "x" } }]), 0, { workspaceDir: ws });
     expect(linked.kind === "tool" && linked.activity).toBeUndefined();
     expect(linked.kind === "tool" && linked.input).not.toContain("secret");
+    const [search] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m6", name: I("memory_search"), input: { query: "private diagnosis" } }]), 0, { workspaceDir: "/w" });
+    expect(search.kind === "tool" && search.activity).toBeUndefined();
+    expect(JSON.stringify(search)).not.toContain("diagnosis");
     // The owner's own chat: private is theirs.
     const [own] = toolItemsFromLine(line("assistant", [{ type: "tool_use", id: "m4", name: I("memory_str_replace"), input: { path: "private/a.md", old: "o", new: "n" } }]), 0, { owner: true });
     expect(own.kind === "tool" && own.activity).toMatchObject({ kind: "memory_str_replace", path: "private/a.md" });

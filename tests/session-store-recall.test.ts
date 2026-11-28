@@ -281,7 +281,7 @@ describe("time budget inside one file", () => {
     const path = join(dir, "one-line.jsonl");
     writeFileSync(path, "x".repeat(512 * 1024)); // one huge unparsable line, no newline
     let calls = 0;
-    const progress = { bytesRead: 0, maxBytes: Infinity, outOfTime: () => ++calls > 2 };
+    const progress: import("../src/jsonl.js").JsonlReadProgress = { bytesRead: 0, maxBytes: Infinity, outOfTime: () => ++calls > 2 };
     const records = [...iterateJsonlBackwardsSync(path, 16 * 1024, progress)];
     expect(records).toEqual([]);
     expect(progress.timedOut).toBe(true);

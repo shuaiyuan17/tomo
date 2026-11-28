@@ -15,6 +15,7 @@ import { effectiveGroupSandbox, type GroupSandboxConfig } from "./group-fs-polic
 import { agentProfileGuardHooks, privateMemoryBarFor, privateMemoryGuardHooks, skillsCanUseTool, todoStoreGuardHooks, type PrivateMemoryBar } from "./permissions.js";
 import { TODO_TOOL_NAMES } from "../mcp/todo-tools.js";
 import { MEMORY_TOOL_NAMES } from "../mcp/memory-tools.js";
+import { memoryStoreGuardHooks, type MemoryStoreGuardMode } from "./memory-store-guard.js";
 import { todosDir } from "../todos/store.js";
 import { dbGuardHooks } from "./db-guard.js";
 import type { AgentProfile, EffortLevel } from "../config.js";
@@ -381,6 +382,7 @@ export function sdkOptions(
       todosDir: () => todosDir(),
       dbPath: () => config.dbPath,
       subsessionMemoryGuard: subsession !== undefined,
+      memoryStoreGuard: () => config.memory?.storeGuard ?? "enforce",
     }),
     ...(resumeSessionId ? { resume: resumeSessionId } : {}),
     env: sdkEnv,
@@ -557,6 +559,9 @@ export function buildHooksOption(args: {
   resumeGate?: (taskId: string) => string | null;
   /** A sub-session: memory and the workspace prompt files are read-only to it. */
   subsessionMemoryGuard?: boolean;
+  /** Every other session: memory Markdown is written by the memory tools only
+   *  (memory-store-guard.ts). The mode is read per call. */
+  memoryStoreGuard?: () => MemoryStoreGuardMode;
 }) {
   const hooks: Record<string, unknown[]> = {};
   if (args.credentialBroker) {
@@ -590,6 +595,11 @@ export function buildHooksOption(args: {
   // Deny-only, like the todo guard above.
   if (args.dbPath) {
     mergeHooks(hooks, dbGuardHooks(args.sessionKey, config.workspaceDir, args.dbPath));
+  }
+  // Deny-only (or log-only in warn mode), like the todo guard above. Not on a
+  // sub-session: its own guard below keeps it out of all of memory/.
+  if (args.memoryStoreGuard && !args.subsessionMemoryGuard) {
+    mergeHooks(hooks, memoryStoreGuardHooks(args.sessionKey, config.workspaceDir, () => config.workspaceDir, args.memoryStoreGuard));
   }
   // Deny-only, like the todo guard above.
   if (args.subsessionMemoryGuard && args.sessionKey) {

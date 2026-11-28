@@ -49,6 +49,8 @@ src/
     bash-sandbox.ts         # sandbox-exec wrap for Bash on a private-memory-barred turn (default-deny profile)
     group-fs-policy.ts      # the group-turn path policy shared by the Bash profile and the file-tool guard
     setting-sources.ts      # which settings files the query loads (and the hook guard scans)
+    memory-store-guard.ts   # PreToolUse: direct writes to memory/**/*.md refused (memory.storeGuard enforce|warn|off),
+                            #   every session but a sub-session, subagents included; incoming-* exempt
     permissions.ts          # Re-exports the tool-permission guards: skills-guard, private-memory-guard
                             #   (+ private-memory-reach, permission-paths), agent-profile-guard (+ bash-write-targets)
     #  plus: session-queue, pending-notes-queue, send-target, text-utils, claude-login

@@ -174,6 +174,25 @@ describe("todos", () => {
   });
 });
 
+describe("memory", () => {
+  it("enforces the store guard by default", async () => {
+    const { config, configIssues } = await load({});
+    expect(config.memory).toEqual({ storeGuard: "enforce" });
+    expect(configIssues.join("\n")).not.toContain("memory");
+  });
+
+  it("takes warn and off", async () => {
+    expect((await load({ memory: { storeGuard: "warn" } })).config.memory.storeGuard).toBe("warn");
+    expect((await load({ memory: { storeGuard: "off" } })).config.memory.storeGuard).toBe("off");
+  });
+
+  it("reports a bad value and keeps enforcing", async () => {
+    const { config, configIssues } = await load({ memory: { storeGuard: "loose" } });
+    expect(config.memory.storeGuard).toBe("enforce");
+    expect(configIssues.join("\n")).toContain("memory.storeGuard");
+  });
+});
+
 /**
  * The credential broker asks for secrets over chat, so it is opt-in: a missing
  * block, and a block the loader cannot read, must both leave it OFF.

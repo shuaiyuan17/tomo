@@ -138,7 +138,7 @@ Bring what you remember to the work so the owner doesn't have to repeat themselv
 ${privacySection}
 ## Writing
 
-Write memory only with the memory tools: memory_list, memory_read, memory_search, memory_write, memory_str_replace, memory_append, memory_move, memory_delete. memory_write and memory_delete take the version you last read; another conversation may have changed the file since, and a stale version is refused, so read it again and retry. Put people in the people registry (\`upsert_person\`), not in memory files.
+Write memory only with the memory tools: memory_list, memory_read, memory_search, memory_write, memory_str_replace, memory_append, memory_move, memory_delete; a direct file write to a Markdown file under memory/ is refused. memory_write and memory_delete take the version you last read; another conversation may have changed the file since, and a stale version is refused, so read it again and retry. Put people in the people registry (\`upsert_person\`), not in memory files.
 
 - Search before you add (memory_search), and update an existing line rather than adding a second one.
 - When something changes (booked, cancelled, done, moved), find the entries that say otherwise and fix them where they live. Remove what is no longer true.

@@ -12,6 +12,8 @@ Tomo runs the Claude Agent SDK with permissions bypassed, so in your own DM the 
 
 Memory lives in `~/.tomo/workspace/memory/`. Files under `memory/private/` (including private people records in `memory/private/people/`) are **DM-only**. They are stripped from the index a group session sees, and a `PreToolUse` guard blocks them from `Read`/`Grep`/`Glob` and from `MEDIA:` attachments for any turn a group is steering — a group session for its whole life, and your own DM session for the duration of a `/summon`.
 
+The memory tools follow the same bar: on a turn a group is steering they don't read, list, search or write anything under `memory/private/` (a path that leads there through a link included), and they don't change `MEMORY.md`. Direct file writes to memory Markdown are refused on every session unless `memory.storeGuard` says otherwise ([Configuration](configuration.md#memory-writes)).
+
 **Bash on group turns runs in a macOS sandbox.** Every command is run through a `sandbox-exec` profile, so a path assembled inside `python3 -c` fails with `EPERM` at the kernel instead of slipping past a filter over command text. The profile is deny-by-default:
 
 - System directories are read-only; the workspace and the temp dirs are read-write; nothing else is reachable — not your home directory, not Tomo's config file, logs or state, not the login keychains or `~/.ssh`.

@@ -352,6 +352,11 @@ export interface TomoConfig {
   lcm: LcmConfig;
   metrics: MetricsConfig;
   todos: TodoConfig;
+  /** Memory. `storeGuard`: what happens to a direct file write to
+   *  `memory/**\/*.md` (src/agent/memory-store-guard.ts): `enforce` (default)
+   *  refuses it, pointing to the memory tools; `warn` allows it and logs the
+   *  session, tool and path; `off` does nothing. */
+  memory: { storeGuard: "enforce" | "warn" | "off" };
   /** Sub-sessions (`task:<id>` sessions for long tasks, src/agent/subsessions/).
    *  On by default. File key `subsessions: { enabled?, maxRunning?, ... }`. */
   subsessions: SubsessionConfig;
@@ -695,6 +700,11 @@ function parseSubsessionConfig(raw: unknown): SubsessionConfig {
     maxActiveHours: validated("subsessions.maxActiveHours", z.number().finite().min(0), entry.maxActiveHours, DEFAULT_SUBSESSIONS.maxActiveHours),
     quotaPauseAtPct: validated("subsessions.quotaPauseAtPct", z.number().finite().gt(0).max(100), entry.quotaPauseAtPct, DEFAULT_SUBSESSIONS.quotaPauseAtPct),
   };
+}
+
+function parseMemoryConfig(raw: unknown): TomoConfig["memory"] {
+  const entry = validated("memory", z.looseObject({}), raw, {}) as Record<string, unknown>;
+  return { storeGuard: validated("memory.storeGuard", z.enum(["enforce", "warn", "off"]), entry.storeGuard, "enforce") };
 }
 
 /** Field by field, like metrics: one bad number falls back alone. */
@@ -1220,6 +1230,7 @@ function buildConfig(): TomoConfig {
     lcm: validated("lcm", lcmSchema, file.lcm, DEFAULT_LCM),
     metrics: parseMetricsConfig(file.metrics),
     todos: parseTodoConfig(file.todos),
+    memory: parseMemoryConfig(file.memory),
     subsessions: parseSubsessionConfig(file.subsessions),
   };
 }

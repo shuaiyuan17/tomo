@@ -123,5 +123,7 @@ export const notices = {
   group: {
     activated: "Tomo activated in this group.",
     summonExpired: "Summon expired after inactivity — handed back to this group's own Tomo session.",
+    summonBusy: "Busy right now — try again in a bit.",
+    summonBusyOwner: "A message from {{group}} was not answered: this session was busy (background work or a running turn) and could not be reloaded without your private context in time. Nothing was run; the message is in the transcript.",
   },
 } as const;

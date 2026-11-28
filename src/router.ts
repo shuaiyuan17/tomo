@@ -145,6 +145,27 @@ export class OwnerRouter {
     return this.resolveSummon(channelName, chatId, false);
   }
 
+  /**
+   * Is any group summoned into this dm: session right now? Runs the lazy
+   * expiry check on each of its summons (as a guard read: the dm: session is
+   * told of a lapse, the group gets no notice, and no clock is extended).
+   * Asked when a turn is dispatched on the session, to pick its prompt
+   * variant; false for any key that is not a dm: session.
+   */
+  hasActiveSummonInto(sessionKey: string): boolean {
+    const identity = dmIdentityFromSessionKey(sessionKey);
+    if (identity === undefined) return false;
+    let active = false;
+    for (const rawKey of this.summons.keys()) {
+      const split = rawKey.indexOf(":");
+      if (split <= 0) continue;
+      // Every one is checked, not only up to the first hit: each lapsed
+      // summon is noticed (and reported to its session) here.
+      if (this.resolveSummon(rawKey.slice(0, split), rawKey.slice(split + 1), false) === identity) active = true;
+    }
+    return active;
+  }
+
   /** Active summon for a group, handling lazy inactivity expiry.
    *  `touch` resets the expiry clock and marks this as real group traffic —
    *  pass true only when routing an actual group message. On lapse the store

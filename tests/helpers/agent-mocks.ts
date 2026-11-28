@@ -94,7 +94,7 @@ export const mockSdk = {
    *  (from options.env.TOMO_SESSION_KEY). Lets a test assert WHICH session a
    *  turn ran on without depending on that turn delivering anything — which
    *  suppressed turns (continuity, restart notice) deliberately do not. */
-  promptsBySession: [] as Array<{ sessionKey: string; text: string }>,
+  promptsBySession: [] as Array<{ sessionKey: string; text: string; systemPrompt: string }>,
   /** Options each live session was built with, keyed by session. Lets a test
    *  reach the SDK `hooks` the harness installed — see
    *  tests/summon-private-memory-hook.test.ts. */
@@ -181,7 +181,7 @@ function enqueueAssistantTurnEvents(
   wakeConsumer();
 }
 
-function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
+function createMockQuery(prompt: AsyncGenerator, sessionKey = "", systemPrompt = "") {
   // One-shot failure injection: this query's event stream throws instead of
   // producing events.
   const failWith = mockSdk.failNextQuery;
@@ -231,7 +231,7 @@ function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
           for (const block of content) {
             if (block.type === "text") text += block.text;
           }
-          mockSdk.promptsBySession.push({ sessionKey, text });
+          mockSdk.promptsBySession.push({ sessionKey, text, systemPrompt });
         }
 
         turnRunning = true;
@@ -345,13 +345,17 @@ function createMockQuery(prompt: AsyncGenerator, sessionKey = "") {
 // Mocked config / workspace state
 // ---------------------------------------------------------------------------
 
+/** What the mocked buildSystemPrompt appends for the group prompt and for the dm: session's shared variant. */
+export const GROUP_PROMPT_MARK = "\n[mock: group prompt]";
+export const SHARED_PROMPT_MARK = "\n[mock: shared variant]";
+
 export const mockWorkspace = {
   systemPrompt: "Test system prompt",
   /** What `promptContextSnapshot` answers: the MEMORY.md / roster lines a
    *  live session's prompt is built with. */
   promptContext: { memory: [] as string[], people: [] as string[] },
   /** The options of the last `buildSystemPrompt` call (the mock ignores them). */
-  lastBuildOptions: undefined as { isGroup?: boolean; subsessions?: boolean } | undefined,
+  lastBuildOptions: undefined as { isGroup?: boolean; shared?: boolean; subsessions?: boolean } | undefined,
 };
 
 export const mockConfig = {
@@ -467,10 +471,12 @@ export function configModuleMock() {
 
 export function workspaceModuleMock() {
   return {
-    buildSystemPrompt: (opts?: { isGroup?: boolean; subsessions?: boolean; onContext?: (c: { memory: string[]; people: string[] }) => void }) => {
+    buildSystemPrompt: (opts?: { isGroup?: boolean; shared?: boolean; subsessions?: boolean; onContext?: (c: { memory: string[]; people: string[] }) => void }) => {
       mockWorkspace.lastBuildOptions = opts;
       opts?.onContext?.(mockWorkspace.promptContext);
-      return mockWorkspace.systemPrompt;
+      // Each variant is told apart in the prompt a session was built with
+      // (mockSdk.promptsBySession[].systemPrompt), as the real ones are.
+      return `${mockWorkspace.systemPrompt}${opts?.isGroup ? GROUP_PROMPT_MARK : opts?.shared ? SHARED_PROMPT_MARK : ""}`;
     },
     buildIdentityPrompt: () => mockWorkspace.systemPrompt,
     promptContextSnapshot: () => mockWorkspace.promptContext,
@@ -488,7 +494,9 @@ export function sdkModuleMock() {
         sessionKey: options?.env?.TOMO_SESSION_KEY ?? "",
         options: (options ?? {}) as Record<string, unknown>,
       });
-      return createMockQuery(prompt, options?.env?.TOMO_SESSION_KEY ?? "");
+      const systemPrompt = (options as { systemPrompt?: string | string[] } | undefined)?.systemPrompt;
+      return createMockQuery(prompt, options?.env?.TOMO_SESSION_KEY ?? "",
+        Array.isArray(systemPrompt) ? systemPrompt.join("\n") : systemPrompt ?? "");
     }),
     // `tools` is kept (the real SDK hides them inside `instance`) so a test can
     // build the tomo-internal server for a session and call its handlers

@@ -53,7 +53,7 @@ const { mockState } = vi.hoisted(() => ({
       errors: Record<string, string>;
     } | null>),
     compactTriggered: false,
-    sessionContexts: [] as Array<{ sessionKey: string; backgroundLaunchDenial?: () => string | null; spawnDenial?: () => string | null; onCompacted?: () => void }>,
+    sessionContexts: [] as Array<{ sessionKey: string; sharedPrompt?: boolean; backgroundLaunchDenial?: () => string | null; spawnDenial?: () => string | null; onCompacted?: () => void }>,
     /** What the (mocked) prompt build hands the session as its snapshot. */
     buildContext: null as null | ((key: string) => { memory: string[]; people: string[] }),
     onInterrupt: null as null | ((err: Error, session: FakeSession) => void),
@@ -198,9 +198,10 @@ afterAll(async () => {
   const { rmSync } = await import("node:fs");
   rmSync(mockConfig.sdkSessionsDir, { recursive: true, force: true });
 });
-const { LiveSessionManager, IDLE_REAP_SWEEP_MS, IDLE_REAP_CLOSE_WAIT_MS, SDK_CLI_KILL_MS, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED, PROMPT_RETIRE_BACKGROUND_WAIT_MS, PROMPT_RETIRE_REPORT_WAIT_MS } = await import("../src/agent/live-session-manager.js");
+const { LiveSessionManager, PROMPT_VARIANT_SWITCH_WAIT_MS, PROMPT_VARIANT_SWITCH_POLL_MS, IDLE_REAP_SWEEP_MS, IDLE_REAP_CLOSE_WAIT_MS, SDK_CLI_KILL_MS, SHUTDOWN_FLUSH_TIMEOUT_MS, SHUTDOWN_NOT_PROCESSED, PROMPT_RETIRE_BACKGROUND_WAIT_MS, PROMPT_RETIRE_REPORT_WAIT_MS } = await import("../src/agent/live-session-manager.js");
 const { log } = await import("../src/logger.js");
 const { SdkResultError } = await import("../src/agent/live-session.js");
+const { SharedPromptUnavailableError, SteerDeclinedError } = await import("../src/agent/sdk-result.js");
 type Deps = ConstructorParameters<typeof LiveSessionManager>[0];
 
 function makeDeps(overrides: Partial<Deps> = {}): Deps {
@@ -2270,5 +2271,339 @@ describe("LiveSessionManager forced compaction", () => {
     const hold = manager.holdForForceCompact("dm:owner");
     expect(hold).not.toBeNull();
     hold!.release();
+  });
+});
+
+describe("LiveSessionManager prompt variants (the dm: session's full and shared prompt)", () => {
+  type Need = { shared: boolean; required: boolean };
+  const FULL: Need = { shared: false, required: false };
+  /** The owner's own turn while a group is summoned in: wants shared, runs on either. */
+  const OWNER_WANTS_SHARED: Need = { shared: true, required: false };
+  /** A turn a group is steering: only ever on the shared prompt. */
+  const GROUP: Need = { shared: true, required: true };
+
+  function setup(overrides: Partial<Deps> = {}) {
+    let need = FULL;
+    let sdkId: string | undefined;
+    const sent: Array<{ prompt: string; session: FakeSession; steered: boolean }> = [];
+    mockState.sendImpl = async (prompt, session) => { sent.push({ prompt, session, steered: false }); return "ok"; };
+    const deps = makeDeps({
+      promptVariant: () => need,
+      getSdkSessionId: () => sdkId,
+      setSdkSessionId: (_key: string, id: string) => { sdkId = id; },
+      ...overrides,
+    });
+    const manager = new LiveSessionManager(deps);
+    return { manager, deps, sent, want: (next: Need) => { need = next; } };
+  }
+  /** Which variant each session built so far was built with, in order. */
+  const builtShared = () => mockState.sessionContexts.map((c) => c.sharedPrompt === true);
+
+  it("builds a session with the variant the turn needs, and says which one is live", async () => {
+    const { manager, want } = setup();
+    expect(manager.hasSharedPrompt("dm:owner")).toBeUndefined();
+    want(GROUP);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "from the group" });
+    expect(builtShared()).toEqual([true]);
+    expect(manager.hasSharedPrompt("dm:owner")).toBe(true);
+  });
+
+  it("without the dep every session has the full prompt, and nothing is ever reloaded", async () => {
+    const manager = new LiveSessionManager(makeDeps());
+    await manager.runWithRetry({ key: "dm:owner", prompt: "one" });
+    await manager.runWithRetry({ key: "dm:owner", prompt: "two" });
+    expect(builtShared()).toEqual([false]);
+    expect(manager.hasSharedPrompt("dm:owner")).toBe(false);
+  });
+
+  it("reloads an idle full session as shared BEFORE a group's turn, and back for the owner's next one; every prompt runs once, on the right one", async () => {
+    const { manager, sent, want } = setup();
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 1" });
+    const full = mockState.instances[0];
+
+    want(GROUP);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "group 1" });
+    expect(full.closed).toBe(true);
+    const shared = mockState.instances[1];
+    expect(builtShared()).toEqual([false, true]);
+
+    want(FULL);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 2" });
+    expect(shared.closed).toBe(true);
+    expect(builtShared()).toEqual([false, true, false]);
+
+    expect(sent.map((s) => [s.prompt, mockState.instances.indexOf(s.session)])).toEqual([
+      ["owner 1", 0], ["group 1", 1], ["owner 2", 2],
+    ]);
+  });
+
+  it("keeps the session when the variant already matches", async () => {
+    const { manager, want } = setup();
+    want(GROUP);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "group 1" });
+    want(OWNER_WANTS_SHARED);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner, summon still on" });
+    await manager.runWithRetry({ key: "dm:owner", prompt: "group 2" });
+    expect(mockState.instances).toHaveLength(1);
+    expect(mockState.instances[0].closed).toBe(false);
+  });
+
+  it("resumes only after the closed session's CLI has exited", async () => {
+    const { manager, sent, want } = setup();
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 1" });
+    let exited!: () => void;
+    mockState.closeGate = new Promise<void>((resolve) => { exited = resolve; });
+    want(GROUP);
+    const turn = manager.runWithRetry({ key: "dm:owner", prompt: "group 1" });
+    await flushMicrotasks(20);
+    expect(mockState.instances[0].closed).toBe(true);
+    expect(mockState.instances).toHaveLength(1);
+    expect(sent.map((s) => s.prompt)).toEqual(["owner 1"]);
+    exited();
+    await turn;
+    expect(builtShared()).toEqual([false, true]);
+    expect(sent.at(-1)).toMatchObject({ prompt: "group 1", session: mockState.instances[1] });
+  });
+
+  it("the owner's own turn runs on the live session when it cannot be closed (background work is never stopped for a variant)", async () => {
+    const { manager, sent, want } = setup();
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 1" });
+    mockState.instances[0].background = true;
+    want(OWNER_WANTS_SHARED);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 2" });
+    expect(mockState.instances).toHaveLength(1);
+    expect(mockState.instances[0].closed).toBe(false);
+    expect(sent.map((s) => s.prompt)).toEqual(["owner 1", "owner 2"]);
+
+    // ...and likewise going back to full from a shared session it cannot close.
+    mockState.instances[0].background = false;
+    want(GROUP);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "group 1" });
+    mockState.instances[1].ambient = true;
+    want(FULL);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 3" });
+    expect(mockState.instances).toHaveLength(2);
+    expect(mockState.instances[1].closed).toBe(false);
+    expect(sent.at(-1)).toMatchObject({ prompt: "owner 3", session: mockState.instances[1] });
+  });
+
+  it.each<[string, (s: FakeSession) => void]>([
+    ["background tasks", (s) => { s.background = true; }],
+    ["an ambient watcher", (s) => { s.ambient = true; }],
+    ["a task report still due", (s) => { s.awaitingReport = true; }],
+    ["a running turn", (s) => { s.busy = true; }],
+  ])("a group's turn waits while the full session has %s, never running on it, then reloads and runs", async (_label, block) => {
+    vi.useFakeTimers();
+    try {
+      const { manager, sent, want } = setup();
+      await manager.runWithRetry({ key: "dm:owner", prompt: "owner 1" });
+      const full = mockState.instances[0];
+      block(full);
+      want(GROUP);
+      const turn = manager.runWithRetry({ key: "dm:owner", prompt: "group 1" });
+      await vi.advanceTimersByTimeAsync(PROMPT_VARIANT_SWITCH_POLL_MS * 3);
+      expect(full.closed).toBe(false);
+      expect(sent.map((s) => s.prompt)).toEqual(["owner 1"]);
+
+      full.background = false; full.ambient = false; full.awaitingReport = false; full.busy = false;
+      full.releaseIdle();
+      await vi.advanceTimersByTimeAsync(PROMPT_VARIANT_SWITCH_POLL_MS);
+      await turn;
+      expect(full.closed).toBe(true);
+      expect(builtShared()).toEqual([false, true]);
+      expect(sent.at(-1)).toMatchObject({ prompt: "group 1", session: mockState.instances[1] });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("refuses a group's turn once the wait runs out: nothing reaches the model, and the full session and its work are untouched", async () => {
+    vi.useFakeTimers();
+    try {
+      const { manager, deps, sent, want } = setup();
+      await manager.runWithRetry({ key: "dm:owner", prompt: "owner 1" });
+      const full = mockState.instances[0];
+      full.background = true;
+      want(GROUP);
+      const turn = manager.runWithRetry({ key: "dm:owner", prompt: "group 1" });
+      const outcome = turn.then(() => "ran", (err: unknown) => err);
+      await vi.advanceTimersByTimeAsync(PROMPT_VARIANT_SWITCH_WAIT_MS - PROMPT_VARIANT_SWITCH_POLL_MS);
+      expect(sent.map((s) => s.prompt)).toEqual(["owner 1"]);
+      await vi.advanceTimersByTimeAsync(PROMPT_VARIANT_SWITCH_POLL_MS * 2);
+      const err = await outcome;
+      expect(err).toBeInstanceOf(SharedPromptUnavailableError);
+      expect((err as Error).message).toContain("background tasks are running");
+      expect(sent.map((s) => s.prompt)).toEqual(["owner 1"]);
+      expect(full.closed).toBe(false);
+      expect(mockState.instances).toHaveLength(1);
+      // The turn is over for whoever waits on the key (a deferred restart).
+      expect(deps.handleTurnComplete).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps waiting, without spinning, when shutdown begins while the full session is still alive", async () => {
+    vi.useFakeTimers();
+    try {
+      const { manager, sent, want } = setup();
+      await manager.runWithRetry({ key: "dm:owner", prompt: "owner 1" });
+      mockState.instances[0].background = true;
+      want(GROUP);
+      const outcome = manager.runWithRetry({ key: "dm:owner", prompt: "group 1" }).then(() => "ran", (err: unknown) => err);
+      await vi.advanceTimersByTimeAsync(PROMPT_VARIANT_SWITCH_POLL_MS);
+      // stop() has set the flag but not yet closed the sessions (it drains hot-mounts first).
+      (manager as unknown as { stopping: boolean }).stopping = true;
+      await vi.advanceTimersByTimeAsync(PROMPT_VARIANT_SWITCH_WAIT_MS + PROMPT_VARIANT_SWITCH_POLL_MS);
+      expect(await outcome).toBeInstanceOf(SharedPromptUnavailableError);
+      expect(sent.map((s) => s.prompt)).toEqual(["owner 1"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("declines a group's steer into a session with the full prompt: nothing is injected, and it is not a turn ending", async () => {
+    const { manager, deps, sent, want } = setup();
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 1" });
+    const full = mockState.instances[0];
+    full.busy = true;
+    vi.mocked(deps.handleTurnComplete!).mockClear();
+    want(GROUP);
+    await expect(manager.runWithRetry({ key: "dm:owner", prompt: "group 1", steer: true })).rejects.toBeInstanceOf(SteerDeclinedError);
+    // Idle, too: a steer never reloads a session itself.
+    full.busy = false;
+    await expect(manager.runWithRetry({ key: "dm:owner", prompt: "group 1", steer: true })).rejects.toBeInstanceOf(SteerDeclinedError);
+    expect(sent.map((s) => s.prompt)).toEqual(["owner 1"]);
+    expect(full.closed).toBe(false);
+    expect(deps.handleTurnComplete).not.toHaveBeenCalled();
+  });
+
+  it("lets a steer join when the variant is right, or when the turn is the owner's own", async () => {
+    const { manager, sent, want } = setup();
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 1" });
+    mockState.instances[0].busy = true;
+    want(OWNER_WANTS_SHARED);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner steer", steer: true });
+    expect(mockState.instances[0].closed).toBe(false);
+
+    mockState.instances[0].busy = false;
+    want(GROUP);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "group 1" });
+    mockState.instances[1].busy = true;
+    await manager.runWithRetry({ key: "dm:owner", prompt: "group steer", steer: true });
+    want(FULL);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner steer into shared", steer: true });
+    expect(mockState.instances).toHaveLength(2);
+    expect(mockState.instances[1].closed).toBe(false);
+    expect(sent.map((s) => s.prompt)).toEqual(["owner 1", "owner steer", "group 1", "group steer", "owner steer into shared"]);
+  });
+
+  it("does not close a session another turn is starting on", async () => {
+    const { manager, sent, want } = setup();
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 1" });
+    let finish!: (r: string) => void;
+    mockState.sendImpl = (prompt, session) => {
+      sent.push({ prompt, session, steered: false });
+      return prompt === "hangs" ? new Promise<string>((resolve) => { finish = resolve; }) : Promise.resolve("ok");
+    };
+    const hanging = manager.runWithRetry({ key: "dm:owner", prompt: "hangs", steer: true });
+    await flushMicrotasks(20);
+    want(OWNER_WANTS_SHARED);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 2" });
+    expect(mockState.instances).toHaveLength(1);
+    expect(mockState.instances[0].closed).toBe(false);
+    finish("ok");
+    await hanging;
+  });
+
+  it("checks again right before the prompt is handed over: a group that joined the key meanwhile gets the shared prompt", async () => {
+    // The dep answers FULL while the session is picked, and GROUP from the
+    // check that follows the pre-turn waits on.
+    let calls = 0;
+    const { manager, sent } = setup({ promptVariant: () => (++calls <= 2 ? FULL : GROUP) });
+    await manager.runWithRetry({ key: "dm:owner", prompt: "mixed" });
+    expect(builtShared()).toEqual([false, true]);
+    expect(mockState.instances[0].closed).toBe(true);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ prompt: "mixed", session: mockState.instances[1] });
+  });
+
+  it("a session-error retry never lands a group's turn on a session built with the full prompt", async () => {
+    // The retry's replacement is built while the key's need reads FULL (as a
+    // build started for another turn would be); by the time it is ready the
+    // group's turn is asking again.
+    let need = GROUP;
+    let builds = 0;
+    const { manager, sent } = setup({
+      promptVariant: () => need,
+      buildExternalMcpServers: async () => { if (++builds === 2) need = GROUP; return {}; },
+    });
+    await manager.runWithRetry({ key: "dm:owner", prompt: "group 1" });
+    mockState.sendImpl = async (prompt, session) => {
+      if (session === mockState.instances[0]) { need = FULL; throw new Error("Session is closed"); }
+      sent.push({ prompt, session, steered: false });
+      return "ok";
+    };
+    await expect(manager.runWithRetry({ key: "dm:owner", prompt: "group 2" })).rejects.toBeInstanceOf(SharedPromptUnavailableError);
+    expect(builtShared()).toEqual([true, false]);
+    expect(sent.map((s) => s.prompt)).toEqual(["group 1"]);
+  });
+
+  it("stores the live SDK id before reloading, and does not reload when the registry refuses it", async () => {
+    let sdkId: string | undefined = "older-id";
+    let refuse = true;
+    const { manager, want } = setup({
+      getSdkSessionId: () => sdkId,
+      setSdkSessionId: (_key: string, id: string) => { if (refuse) throw new Error("registry unreadable"); sdkId = id; },
+    });
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 1" });
+    want(OWNER_WANTS_SHARED);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 2" });
+    expect(mockState.instances).toHaveLength(1);
+    expect(mockState.instances[0].closed).toBe(false);
+
+    refuse = false;
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 3" });
+    expect(sdkId).toBe("sdk-1");
+    expect(mockState.instances[0].closed).toBe(true);
+    expect(builtShared()).toEqual([false, true]);
+  });
+
+  it("a session on the shared variant is told no memory change and is not retired for one", async () => {
+    let files = { memory: ["- a"], people: [] as string[] };
+    mockState.buildContext = () => files;
+    const { manager, want } = setup({ promptContextSnapshot: () => files });
+    want(GROUP);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "group 1" });
+    want(OWNER_WANTS_SHARED);
+    // Small enough to note, then far too large to: neither reaches it.
+    files = { memory: ["- a", "- [Secret](private/secret.md)"], people: [] };
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+    files = { memory: Array.from({ length: 40 }, (_, i) => `- line ${i}`), people: [] };
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner, summon still on" });
+    expect(mockState.instances).toHaveLength(1);
+    expect(mockState.instances[0].closed).toBe(false);
+
+    // Back on the full prompt it is built from the files as they are, and noted from there.
+    want(FULL);
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 2" });
+    expect(builtShared()).toEqual([true, false]);
+    expect(manager.takePromptContextNote("dm:owner")).toBeUndefined();
+    files = { memory: [...files.memory, "- one more"], people: [] };
+    expect(manager.takePromptContextNote("dm:owner")?.prefix).toContain("+ - one more");
+  });
+
+  it("a memory note written for the full session is dropped when the turn is reloaded onto the shared one", async () => {
+    let files = { memory: ["- a"], people: [] as string[] };
+    mockState.buildContext = () => files;
+    const { manager, sent, want } = setup({ promptContextSnapshot: () => files });
+    await manager.runWithRetry({ key: "dm:owner", prompt: "owner 1" });
+    files = { memory: ["- a", "- [Secret](private/secret.md)"], people: [] };
+    const ticket = manager.takePromptContextNote("dm:owner")!;
+    expect(ticket.prefix).toContain("private/secret.md");
+    want(OWNER_WANTS_SHARED);
+    await manager.runWithRetry({ key: "dm:owner", prompt: `${ticket.prefix}owner 2`, contextNote: ticket });
+    expect(sent.at(-1)).toMatchObject({ prompt: "owner 2", session: mockState.instances[1] });
   });
 });

@@ -112,5 +112,7 @@ export const notices = {
   group: {
     activated: "Tomo 已在这个群启用。",
     summonExpired: "召唤因长时间没有动静而结束，已交回给这个群自己的 Tomo session。",
+    summonBusy: "正忙，稍后再说。",
+    summonBusyOwner: "{{group}} 的一条消息没有回复：这个 session 正忙（有后台任务或回合在跑），没能及时换成不带你私密内容的版本重新加载。什么都没有执行，消息留在记录里。",
   },
 } satisfies Translation<typeof en>;

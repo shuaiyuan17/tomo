@@ -407,6 +407,7 @@ describe("rollup runner skips sessions with background tasks", () => {
     const agent = {
       listActiveSessions: () => [["dm:owner", sessionId]] as Array<[string, string]>,
       hasBackgroundWork: (_key: string) => count() > 0,
+      hasActiveSummonInto: () => false,
       handleCronMessage: async (text: string) => { nudges.push(text); return true; },
     };
     const runner = new RollupRunner(agent as never, new NudgeCooldownStore(null));

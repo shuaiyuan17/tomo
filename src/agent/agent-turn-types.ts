@@ -135,4 +135,10 @@ export interface InboxTurnHooks {
    */
   cutShort(selfRestart?: { reason?: string }): void;
   onPromptHandedOff(): void;
+  /**
+   * The turn was refused on purpose before its prompt reached the model, and
+   * its senders were told (a group's turn with no shared-prompt session in
+   * time). A deliberate drop: the messages must not come back after a restart.
+   */
+  refused(): void;
 }

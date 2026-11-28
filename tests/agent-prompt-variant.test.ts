@@ -1,0 +1,437 @@
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
+vi.mock("../src/workspace/index.js", async () => (await import("./helpers/agent-mocks.js")).workspaceModuleMock());
+vi.mock("@anthropic-ai/claude-agent-sdk", async () => (await import("./helpers/agent-mocks.js")).sdkModuleMock());
+vi.mock("../src/logger.js", async () => (await import("./helpers/agent-mocks.js")).loggerModuleMock());
+
+import {
+  Agent,
+  MockChannel,
+  drainQueue,
+  expectNoChangeFor,
+  installAgentTestHooks,
+  makeMsg,
+  mockSdk,
+  resetConfig,
+  waitFor,
+} from "./helpers/agent-harness.js";
+import { GROUP_PROMPT_MARK, SHARED_PROMPT_MARK } from "./helpers/agent-mocks.js";
+import { SharedPromptUnavailableError } from "../src/agent/sdk-result.js";
+import { log } from "../src/logger.js";
+
+installAgentTestHooks();
+
+// ===== Which system prompt a turn runs on =====
+//
+// The owner's dm: session has two prompt variants: the full one, and the
+// SHARED one without private index lines and private people. A live session
+// keeps the variant it was built with, so every turn is checked when it is
+// dispatched, and the session is closed and resumed as the other variant
+// first when it has the wrong one. The mocked buildSystemPrompt marks each
+// variant in the prompt it returns, and the mocked SDK records the prompt of
+// the session each user message ran on.
+
+const OWNER = "dm:shuai";
+const OWNER_CHAT = "12345";
+const GROUP_CHAT = "-100270";
+const GROUP = `telegram:${GROUP_CHAT}`;
+
+type Variant = "full" | "shared" | "group";
+type AgentInstance = InstanceType<typeof Agent>;
+
+/** Every model turn whose prompt contains `match`: the session it ran on and that session's prompt variant. */
+function ran(match: string): Array<{ session: string; variant: Variant }> {
+  return mockSdk.promptsBySession.filter((p) => p.text.includes(match)).map((p) => ({
+    session: p.sessionKey,
+    variant: p.systemPrompt.includes(SHARED_PROMPT_MARK) ? "shared" : p.systemPrompt.includes(GROUP_PROMPT_MARK) ? "group" : "full",
+  }));
+}
+
+interface Internals {
+  router: { summonGroup(channel: string, chatId: string): void; dismissGroup(channel: string, chatId: string): boolean };
+  sessions: { get(key: string): { messages: Array<{ role: string; content: string }> } };
+  liveSessionManager: {
+    hasSharedPrompt(key: string): boolean | undefined;
+    liveSessions: Map<string, { isBusy(): boolean; pendingSteers: unknown[] }>;
+  };
+  promptVariantFor(key: string): { shared: boolean; required: boolean };
+  steerNeedsSharedPrompt(key: string, items: unknown[]): boolean;
+  runWithRetry(req: { prompt: string }): Promise<string>;
+}
+const internals = (agent: AgentInstance) => agent as unknown as Internals;
+
+function setup(overrides: Parameters<typeof resetConfig>[0] = {}): { agent: AgentInstance; tg: MockChannel } {
+  resetConfig({
+    identities: [{ name: "shuai", channels: { telegram: OWNER_CHAT }, replyPolicy: "last-active" }],
+    ...overrides,
+  });
+  const agent = new Agent();
+  const tg = new MockChannel("telegram");
+  agent.addChannel(tg);
+  return { agent, tg };
+}
+
+const ownerMsg = (text: string) => makeMsg({ chatId: OWNER_CHAT, text });
+const groupMsg = (text: string) => makeMsg({
+  chatId: GROUP_CHAT, isGroup: true, isMentioned: true, senderName: "Alice", chatTitle: "Book club", text,
+});
+
+/** The owner's first private turn: creates the dm: session and its reply target. */
+async function seed(agent: AgentInstance, tg: MockChannel): Promise<void> {
+  await tg.simulateMessage(ownerMsg("seed hello"));
+  await drainQueue(agent);
+}
+
+describe("the prompt variant each kind of turn runs on", () => {
+  it("the owner's private message, no summon: full", async () => {
+    const { agent, tg } = setup();
+    await tg.simulateMessage(ownerMsg("OWNER-PLAIN"));
+    await drainQueue(agent);
+    expect(ran("OWNER-PLAIN")).toEqual([{ session: OWNER, variant: "full" }]);
+    await agent.stop();
+  });
+
+  it("the owner's private message while a group is summoned in: shared", async () => {
+    const { agent, tg } = setup();
+    await seed(agent, tg);
+    expect(ran("seed hello")).toEqual([{ session: OWNER, variant: "full" }]);
+    internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    await tg.simulateMessage(ownerMsg("OWNER-DURING-SUMMON"));
+    await drainQueue(agent);
+    expect(ran("OWNER-DURING-SUMMON")).toEqual([{ session: OWNER, variant: "shared" }]);
+    await agent.stop();
+  });
+
+  it("a summoned group's message (mention-required group): shared", async () => {
+    const { agent, tg } = setup();
+    await seed(agent, tg);
+    internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    await tg.simulateMessage(groupMsg("@tomo GROUP-ASK"));
+    await drainQueue(agent);
+    expect(ran("GROUP-ASK")).toEqual([{ session: OWNER, variant: "shared" }]);
+    await agent.stop();
+  });
+
+  it("a summoned group's message (passive-listen group): shared", async () => {
+    const { agent, tg } = setup({ passiveGroups: { telegram: [GROUP_CHAT] } });
+    await seed(agent, tg);
+    internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    await tg.simulateMessage(makeMsg({ chatId: GROUP_CHAT, isGroup: true, senderName: "Alice", text: "PASSIVE-CHATTER" }));
+    await drainQueue(agent);
+    expect(ran("PASSIVE-CHATTER")).toEqual([{ session: OWNER, variant: "shared" }]);
+    await agent.stop();
+  });
+
+  it("a batch mixing the owner's message with a summoned group's: shared, even though the session was live with the full prompt", async () => {
+    // No steering: what piles up behind a running turn becomes ONE follow-up turn.
+    const { agent, tg } = setup({ steering: false, passiveGroups: { telegram: [GROUP_CHAT] } });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    mockSdk.responseFn = async (text) => { if (text.includes("FIRST")) await gate; return "ok"; };
+    await tg.simulateMessage(ownerMsg("FIRST"));
+    await waitFor(() => expect(ran("FIRST")).toEqual([{ session: OWNER, variant: "full" }]));
+    // The summon lands while the owner's turn runs on the full prompt.
+    internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    await tg.simulateMessage(ownerMsg("MIXED-OWNER"));
+    await tg.simulateMessage(makeMsg({ chatId: GROUP_CHAT, isGroup: true, senderName: "Alice", text: "MIXED-GROUP" }));
+    release();
+    await drainQueue(agent);
+    const mixed = ran("MIXED-GROUP");
+    expect(mixed).toEqual([{ session: OWNER, variant: "shared" }]);
+    // One turn holds both.
+    expect(mockSdk.promptsBySession.filter((p) => p.text.includes("MIXED-OWNER") && p.text.includes("MIXED-GROUP"))).toHaveLength(1);
+    await agent.stop();
+  });
+
+  it("a group session's delegate to the owner: shared, and the owner's next private turn goes back to full", async () => {
+    const { agent, tg } = setup();
+    await seed(agent, tg);
+    const result = await agent.delegateToSession("shuai", "DELEGATED-ASK", GROUP);
+    expect(result.ok).toBe(true);
+    await drainQueue(agent);
+    expect(ran("DELEGATED-ASK")).toEqual([{ session: OWNER, variant: "shared" }]);
+
+    await tg.simulateMessage(ownerMsg("OWNER-AFTER-DELEGATE"));
+    await drainQueue(agent);
+    expect(ran("OWNER-AFTER-DELEGATE")).toEqual([{ session: OWNER, variant: "full" }]);
+    await agent.stop();
+  });
+
+  it("a delegate the owner's own private turn asked for: full, like any turn of theirs", async () => {
+    const { agent, tg } = setup();
+    await seed(agent, tg);
+    const result = await agent.delegateToSession("shuai", "OWN-DELEGATE", OWNER);
+    expect(result.ok).toBe(true);
+    await drainQueue(agent);
+    expect(ran("OWN-DELEGATE")).toEqual([{ session: OWNER, variant: "full" }]);
+    await agent.stop();
+  });
+
+  it("a summoned group's cron job, handed to the dm: session: shared", async () => {
+    const { agent, tg } = setup();
+    await seed(agent, tg);
+    internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    await agent.handleCronMessage("GROUP-CRON-JOB", GROUP, { waitForHandoff: true });
+    await drainQueue(agent);
+    expect(ran("GROUP-CRON-JOB")).toEqual([{ session: OWNER, variant: "shared" }]);
+    await agent.stop();
+  });
+
+  it("a summoned group's restart notice, handed to the dm: session: shared", async () => {
+    const { agent, tg } = setup();
+    await seed(agent, tg);
+    // The group's own session must exist for the notice to be attributed to it.
+    await tg.simulateMessage(groupMsg("@tomo group hello"));
+    await drainQueue(agent);
+    internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    await agent.handleRestartForSession("System: GROUP-RESTART-NOTICE", GROUP);
+    await drainQueue(agent);
+    expect(ran("GROUP-RESTART-NOTICE")).toEqual([{ session: OWNER, variant: "shared" }]);
+    await agent.stop();
+  });
+
+  it.each<[string, boolean, Variant]>([
+    ["no summon", false, "full"],
+    ["a group summoned in", true, "shared"],
+  ])("the owner's own cron job on the dm: session, %s: %s", async (_label, summoned, variant) => {
+    const { agent, tg } = setup();
+    await seed(agent, tg);
+    if (summoned) internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    expect(await agent.handleCronMessage("OWNER-CRON-JOB", OWNER)).toBe(true);
+    await drainQueue(agent);
+    expect(ran("OWNER-CRON-JOB")).toEqual([{ session: OWNER, variant }]);
+    await agent.stop();
+  });
+
+  it.each<[string, boolean, Variant]>([
+    ["no summon", false, "full"],
+    ["a group summoned in", true, "shared"],
+  ])("a heartbeat, %s: %s", async (_label, summoned, variant) => {
+    const { agent, tg } = setup();
+    await seed(agent, tg);
+    if (summoned) internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    await agent.handleContinuity("System: HEARTBEAT-TICK");
+    await drainQueue(agent);
+    expect(ran("HEARTBEAT-TICK")).toEqual([{ session: OWNER, variant }]);
+    await agent.stop();
+  });
+
+  it("a group's own session (not summoned): the group prompt, never a dm: variant", async () => {
+    const { agent, tg } = setup();
+    await tg.simulateMessage(groupMsg("@tomo GROUP-OWN-SESSION"));
+    await drainQueue(agent);
+    expect(ran("GROUP-OWN-SESSION")).toEqual([{ session: GROUP, variant: "group" }]);
+    expect(internals(agent).promptVariantFor(GROUP)).toEqual({ shared: false, required: false });
+    expect(internals(agent).promptVariantFor("task:t1")).toEqual({ shared: false, required: false });
+    await agent.stop();
+  });
+
+  it("after the summon is dismissed, the owner's next turn goes back to full, with no event in between", async () => {
+    const { agent, tg } = setup();
+    await seed(agent, tg);
+    internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    await tg.simulateMessage(groupMsg("@tomo GROUP-ASK"));
+    await drainQueue(agent);
+    expect(internals(agent).liveSessionManager.hasSharedPrompt(OWNER)).toBe(true);
+
+    internals(agent).router.dismissGroup("telegram", GROUP_CHAT);
+    // Nothing happens until a turn is dispatched.
+    expect(internals(agent).liveSessionManager.hasSharedPrompt(OWNER)).toBe(true);
+    await tg.simulateMessage(ownerMsg("OWNER-AFTER-DISMISS"));
+    await drainQueue(agent);
+    expect(ran("OWNER-AFTER-DISMISS")).toEqual([{ session: OWNER, variant: "full" }]);
+    await agent.stop();
+  });
+
+  it("after the summon lapses from inactivity, the owner's next turn finds that out itself and goes back to full", async () => {
+    // The mocked config leaves the expiry unset (never lapses); production defaults to 60 minutes.
+    const { agent, tg } = setup({ summonExpiryMinutes: 60 } as Parameters<typeof resetConfig>[0]);
+    await seed(agent, tg);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date("2026-08-28T12:00:00"));
+      internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+      await tg.simulateMessage(ownerMsg("OWNER-DURING-SUMMON"));
+      await drainQueue(agent);
+      expect(ran("OWNER-DURING-SUMMON")).toEqual([{ session: OWNER, variant: "shared" }]);
+
+      // Past the default expiry (60 minutes of group silence).
+      vi.setSystemTime(new Date("2026-08-28T13:30:00"));
+      await tg.simulateMessage(ownerMsg("OWNER-AFTER-EXPIRY"));
+      await drainQueue(agent);
+      expect(ran("OWNER-AFTER-EXPIRY")).toEqual([{ session: OWNER, variant: "full" }]);
+      expect(internals(agent).promptVariantFor(OWNER)).toEqual({ shared: false, required: false });
+    } finally {
+      vi.useRealTimers();
+    }
+    await agent.stop();
+  });
+});
+
+describe("switching variants loses nothing", () => {
+  it("owner, group and owner messages queued back to back each run once, in order, the group's on the shared prompt, and every reply is delivered", async () => {
+    const { agent, tg } = setup();
+    mockSdk.responseFn = (text) => (text.includes("GROUP-G1") ? "NO_REPLY" : `reply to ${/OWNER-A\d/.exec(text)?.[0] ?? "?"}`);
+    await tg.simulateMessage(ownerMsg("OWNER-A1"));
+    internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    await tg.simulateMessage(groupMsg("@tomo GROUP-G1"));
+    await tg.simulateMessage(ownerMsg("OWNER-A2"));
+    await drainQueue(agent);
+    internals(agent).router.dismissGroup("telegram", GROUP_CHAT);
+    await tg.simulateMessage(ownerMsg("OWNER-A3"));
+    await drainQueue(agent);
+
+    const order = mockSdk.promptsBySession.map((p) => /OWNER-A\d|GROUP-G1/.exec(p.text)?.[0]);
+    expect(order).toEqual(["OWNER-A1", "GROUP-G1", "OWNER-A2", "OWNER-A3"]);
+    expect(ran("GROUP-G1")).toEqual([{ session: OWNER, variant: "shared" }]);
+    expect(ran("OWNER-A2")).toEqual([{ session: OWNER, variant: "shared" }]);
+    expect(ran("OWNER-A3")).toEqual([{ session: OWNER, variant: "full" }]);
+    expect(tg.delivered.filter((d) => d.chatId === OWNER_CHAT).map((d) => d.text))
+      .toEqual(["reply to OWNER-A1", "reply to OWNER-A2", "reply to OWNER-A3"]);
+    // Each inbound message is in the transcript once.
+    const users = internals(agent).sessions.get(OWNER).messages.filter((m) => m.role === "user").map((m) => m.content);
+    for (const text of ["OWNER-A1", "GROUP-G1", "OWNER-A2", "OWNER-A3"]) {
+      expect(users.filter((u) => u.includes(text)), text).toHaveLength(1);
+    }
+    await agent.stop();
+  });
+});
+
+describe("steering and the prompt variant", () => {
+  /** An owner turn held mid-flight on the full prompt, then a summon. */
+  async function ownerTurnInFlightThenSummon(agent: AgentInstance, tg: MockChannel): Promise<() => void> {
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    mockSdk.responseFn = async (text) => { if (text.includes("OWNER-LONG")) await gate; return "NO_REPLY"; };
+    await tg.simulateMessage(ownerMsg("OWNER-LONG"));
+    await waitFor(() => expect(internals(agent).liveSessionManager.liveSessions.get(OWNER)?.isBusy()).toBe(true));
+    expect(internals(agent).liveSessionManager.hasSharedPrompt(OWNER)).toBe(false);
+    internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    return release;
+  }
+  const passive = () => makeMsg({ chatId: GROUP_CHAT, isGroup: true, senderName: "Alice", text: "GROUP-MIDTURN" });
+  const userRecords = (agent: AgentInstance, text: string) =>
+    internals(agent).sessions.get(OWNER).messages.filter((m) => m.role === "user" && m.content.includes(text));
+
+  it("a summoned group's message is not steered into the owner's turn running on the full prompt; it runs afterwards, on the shared one", async () => {
+    const { agent, tg } = setup({ steering: true, passiveGroups: { telegram: [GROUP_CHAT] } });
+    const release = await ownerTurnInFlightThenSummon(agent, tg);
+    const live = internals(agent).liveSessionManager.liveSessions.get(OWNER)!;
+
+    await tg.simulateMessage(passive());
+    await expectNoChangeFor(() => {
+      expect(live.pendingSteers).toHaveLength(0);
+      expect(ran("GROUP-MIDTURN")).toEqual([]);
+    });
+
+    release();
+    await drainQueue(agent);
+    expect(ran("GROUP-MIDTURN")).toEqual([{ session: OWNER, variant: "shared" }]);
+    expect(userRecords(agent, "GROUP-MIDTURN")).toHaveLength(1);
+    // Kept out at ingress: it never got as far as an injection to be declined.
+    expect(vi.mocked(log.info).mock.calls.some((call) => String(call[1]).includes("Steer declined at injection"))).toBe(false);
+    await agent.stop();
+  });
+
+  it("the owner's own message still steers into their running turn while a group is summoned in", async () => {
+    const { agent, tg } = setup({ steering: true, passiveGroups: { telegram: [GROUP_CHAT] } });
+    const release = await ownerTurnInFlightThenSummon(agent, tg);
+    const live = internals(agent).liveSessionManager.liveSessions.get(OWNER)!;
+    await tg.simulateMessage(ownerMsg("OWNER-FOLLOWUP"));
+    await waitFor(() => expect(live.pendingSteers).toHaveLength(1));
+    release();
+    await drainQueue(agent);
+    expect(ran("OWNER-FOLLOWUP")).toEqual([{ session: OWNER, variant: "full" }]);
+    await agent.stop();
+  });
+
+  it("a group's steer that reaches injection anyway is declined there and queued as its own turn: run once, recorded once, on the shared prompt", async () => {
+    const { agent, tg } = setup({ steering: true, passiveGroups: { telegram: [GROUP_CHAT] } });
+    const release = await ownerTurnInFlightThenSummon(agent, tg);
+    const live = internals(agent).liveSessionManager.liveSessions.get(OWNER)!;
+    // The ingress check passes (as when the session is replaced between it
+    // and injection): only the manager's own check is left.
+    internals(agent).steerNeedsSharedPrompt = () => false;
+
+    await tg.simulateMessage(passive());
+    await expectNoChangeFor(() => {
+      expect(live.pendingSteers).toHaveLength(0);
+      expect(ran("GROUP-MIDTURN")).toEqual([]);
+    });
+    release();
+    await drainQueue(agent);
+    expect(ran("GROUP-MIDTURN")).toEqual([{ session: OWNER, variant: "shared" }]);
+    expect(userRecords(agent, "GROUP-MIDTURN")).toHaveLength(1);
+    // The queued turn still carries the audience-switch note the declined one would have.
+    expect(mockSdk.promptsBySession.find((p) => p.text.includes("GROUP-MIDTURN"))!.text).toContain("Audience switched");
+    expect(vi.mocked(log.info).mock.calls.some((call) => String(call[1]).includes("Steer declined at injection"))).toBe(true);
+    await agent.stop();
+  });
+});
+
+describe("a coalesced batch whose steer is declined", () => {
+  it("is queued whole as its own turn: run once on the shared prompt, each message recorded once, the audience note kept", async () => {
+    const IM_GROUP = "any;+;chat270";
+    const { agent, tg } = setup({ steering: true, imessageInboundSettleMs: 30, imessageInboundMaxSettleMs: 200 });
+    const im = new MockChannel("imessage");
+    agent.addChannel(im);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    mockSdk.responseFn = async (text) => { if (text.includes("OWNER-LONG")) await gate; return "NO_REPLY"; };
+    await tg.simulateMessage(ownerMsg("OWNER-LONG"));
+    await waitFor(() => expect(internals(agent).liveSessionManager.liveSessions.get(OWNER)?.isBusy()).toBe(true));
+    internals(agent).router.summonGroup("imessage", IM_GROUP);
+    internals(agent).steerNeedsSharedPrompt = () => false;
+
+    // Two fragments inside the settle window: one batch, one steer.
+    await im.simulateMessage(makeMsg({ chatId: IM_GROUP, isGroup: true, senderName: "Alice", text: "BATCH-ONE" }));
+    await im.simulateMessage(makeMsg({ chatId: IM_GROUP, isGroup: true, senderName: "Alice", text: "BATCH-TWO" }));
+    await waitFor(() => expect(vi.mocked(log.info).mock.calls.some((call) => String(call[1]).includes("Steer declined at injection"))).toBe(true));
+    expect(ran("BATCH-ONE")).toEqual([]);
+
+    release();
+    await drainQueue(agent);
+    expect(ran("BATCH-ONE")).toEqual([{ session: OWNER, variant: "shared" }]);
+    const turn = mockSdk.promptsBySession.filter((p) => p.text.includes("BATCH-ONE"));
+    expect(turn).toHaveLength(1);
+    expect(turn[0].text).toContain("BATCH-TWO");
+    expect(turn[0].text).toContain("Audience switched");
+    const users = internals(agent).sessions.get(OWNER).messages.filter((m) => m.role === "user").map((m) => m.content);
+    expect(users.filter((u) => u.includes("BATCH-ONE"))).toHaveLength(1);
+    expect(users.filter((u) => u.includes("BATCH-TWO"))).toHaveLength(1);
+    await agent.stop();
+  });
+});
+
+describe("a group's turn that cannot get the shared prompt in time", () => {
+  it("is answered with a fixed line in the group and a notice to the owner, without a model call or an error message", async () => {
+    const { agent, tg } = setup();
+    await seed(agent, tg);
+    internals(agent).router.summonGroup("telegram", GROUP_CHAT);
+    tg.clearDelivered();
+    const real = internals(agent).runWithRetry.bind(agent);
+    internals(agent).runWithRetry = (req) => (req.prompt.includes("GROUP-BUSY")
+      ? Promise.reject(new SharedPromptUnavailableError("background tasks are running"))
+      : real(req));
+
+    await tg.simulateMessage(groupMsg("@tomo GROUP-BUSY"));
+    await drainQueue(agent);
+
+    expect(ran("GROUP-BUSY")).toEqual([]);
+    expect(tg.delivered.filter((d) => d.chatId === GROUP_CHAT).map((d) => d.text)).toEqual(["Busy right now — try again in a bit."]);
+    const toOwner = tg.delivered.filter((d) => d.chatId === OWNER_CHAT).map((d) => d.text);
+    expect(toOwner).toHaveLength(1);
+    expect(toOwner[0]).toContain("Book club");
+    expect(toOwner[0]).toContain("was not answered");
+    expect(tg.delivered.some((d) => d.text.includes("[error]"))).toBe(false);
+    // The message stays in the transcript.
+    expect(internals(agent).sessions.get(OWNER).messages.some((m) => m.role === "user" && m.content.includes("GROUP-BUSY"))).toBe(true);
+
+    // The session is not stuck: the next turn runs.
+    await tg.simulateMessage(groupMsg("@tomo GROUP-LATER"));
+    await drainQueue(agent);
+    expect(ran("GROUP-LATER")).toEqual([{ session: OWNER, variant: "shared" }]);
+    await agent.stop();
+  });
+});

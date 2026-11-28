@@ -80,7 +80,7 @@ import { CredentialBroker } from "./credentials/broker.js";
 import { captureChannelFor } from "./credentials/capture.js";
 import { BrokerStateFile, KeychainBackend } from "./credentials/store.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
-import { LiveSessionManager } from "./agent/live-session-manager.js";
+import { LiveSessionManager, type PromptVariantNeed } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { appendToTomoEventBody, formatTomoEvent, markOwnerAudience } from "./tomo-event.js";
 import { forceSummaryLedgerRow, UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
@@ -191,7 +191,7 @@ export class Agent {
     enqueueForSession: (key, task) => this.enqueueForSession(key, task),
     processInboundItems: (items, steer) => this.processInboundItems(items, steer),
     hasBusyLiveSession: (key) => this.liveSessionManager.isBusy(key),
-    canSteerIntoSession: (key) => !this.webRequestIds.has(key),
+    canSteerIntoSession: (key, items) => !this.webRequestIds.has(key) && !this.steerNeedsSharedPrompt(key, items),
   });
   private commands: ChatCommandHandler;
   /** The web Tasks panel's board, read by /tasks (unset while the web UI is off). */
@@ -430,6 +430,7 @@ export class Agent {
     this.liveSessionManager = new LiveSessionManager({
       buildIdentityPrompt: () => buildIdentityPrompt({ subsessions: config.subsessions.enabled }),
       promptContextSnapshot: (key, { strict }) => promptContextSnapshot({ isGroup: isGroupSessionKey(key), strict }),
+      promptVariant: (key) => this.promptVariantFor(key),
       getSdkSessionId: (key) => this.sessions.getSdkSessionId(key),
       setSdkSessionId: (key, sessionId) => this.sessions.setSdkSessionId(key, sessionId),
       clearSdkSessionId: (key) => this.sessions.clearSdkSessionId(key),
@@ -1703,6 +1704,7 @@ export class Agent {
     const hooks: InboxTurnHooks | undefined = inboxIds.length > 0
       ? {
         notConsumed: () => { progress.unconsumed = true; },
+        refused: () => { progress.unconsumed = false; },
         cutShort: (selfRestart) => {
           progress.cutShort = true;
           // Written now, while the inbox is still open (shutdown closes it
@@ -1714,14 +1716,26 @@ export class Agent {
         onPromptHandedOff: () => { progress.handedOff = true; this.markInboxStarted(routedKey, inboxIds); },
       }
       : undefined;
+    let requeued = false;
     try {
       if (routed.length === 1) {
         await this.handleMessage(routed[0].channel, routed[0].message, steer, routed[0].resolution, routed[0].userRecorded, hooks);
         return;
       }
       await this.handleBatchedMessages(routed, steer, hooks);
+    } catch (err) {
+      if (!(err instanceof SteerDeclinedError)) throw err;
+      // A steer that could not join the running turn before injection
+      // (nothing reached the SDK): owner web input whose turn stopped being
+      // joinable, or a group's message whose session has the owner's full
+      // prompt. Back into the session's FIFO queue as its own turn, behind
+      // whatever is already waiting there — never around it. The transcript
+      // already has it, and its inbox record goes with it (still `received`).
+      requeued = true;
+      log.info({ sessionKey: routedKey, count: routed.length }, "Steer declined at injection; queued as its own turn");
+      this.enqueueInboundForSession(routedKey, routed.map((item) => ({ ...item, userRecorded: true })));
     } finally {
-      if (inboxIds.length > 0) {
+      if (inboxIds.length > 0 && !requeued) {
         if (progress.unconsumed && !progress.handedOff) {
           // A turn was set up for these but the prompt never reached the model
           // (session build failed, refused for shutdown, a steer whose session
@@ -1899,6 +1913,78 @@ export class Agent {
     this.lastAudiences.set(key, audiences[audiences.length - 1]);
     const note = audienceSwitchNote(prev, audiences, (a) => this.audienceLabel(a));
     return note ? `${note}\n` : "";
+  }
+
+  /**
+   * Undo noteAudienceSwitch for a turn that never ran (its steer was
+   * declined), so the turn it is queued as gets the note instead. Only when
+   * no other turn has moved the session's last audience since.
+   */
+  private forgetAudienceSwitch(key: string, audiences: string[], before: string | undefined): void {
+    if (!isDmSessionKey(key) || this.lastAudiences.get(key) !== audiences[audiences.length - 1]) return;
+    if (before === undefined) this.lastAudiences.delete(key);
+    else this.lastAudiences.set(key, before);
+  }
+
+  /**
+   * The system-prompt variant the turn being dispatched on `key` needs
+   * (LiveSessionManagerDeps.promptVariant). Only the owner's dm: session has
+   * two: its full prompt, and the SHARED one without private index lines and
+   * private people (workspace buildSystemPrompt `shared`).
+   *
+   * - A turn that is not the owner's alone MUST run on the shared one: a
+   *   summoned group's message, a batch mixing the owner with a group, a
+   *   group's delegate, cron job or restart notice handed to this session,
+   *   and any turn overlapping one of those. `isOwnAudienceTurn` is the same
+   *   fail-closed reading every session-scoped tool uses.
+   * - The owner's own turn (and a cron, heartbeat or rollup turn, which
+   *   register no audience) wants the shared one while a group is summoned
+   *   into the session, so the group's next message finds it ready, and the
+   *   full one otherwise — which is how a session goes back after a summon
+   *   ends: no event, just the next turn. Asking also runs the summon's
+   *   lazy expiry check.
+   */
+  private promptVariantFor(key: string): PromptVariantNeed {
+    if (!isDmSessionKey(key)) return { shared: false, required: false };
+    if (!this.isOwnAudienceTurn(key)) return { shared: true, required: true };
+    return { shared: this.router.hasActiveSummonInto(key), required: false };
+  }
+
+  /** Is a group summoned into this dm: session right now? (The rollup runner defers on it.) */
+  hasActiveSummonInto(sessionKey: string): boolean {
+    return this.router.hasActiveSummonInto(sessionKey);
+  }
+
+  /**
+   * Would steering these messages put a group's words into a dm: session
+   * built with the owner's full prompt? Then they must not join its running
+   * turn: they are queued, and their own turn reloads the session first.
+   * (LiveSessionManager declines such a steer again at injection.)
+   */
+  private steerNeedsSharedPrompt(key: string, items: readonly InboundItem[]): boolean {
+    return isDmSessionKey(key) && items.some((it) => it.message.isGroup ?? false)
+      && this.liveSessionManager.hasSharedPrompt(key) === false;
+  }
+
+  /**
+   * A turn a group is steering was refused: the session could not be reloaded
+   * with the shared prompt in time (TurnSpec.onSharedPromptUnavailable). No
+   * model call: each group in the turn gets one fixed line, and the owner is
+   * told which group went unanswered. The messages stay in the transcript.
+   */
+  private async answerSharedPromptUnavailable(req: UserTurnRequest): Promise<void> {
+    req.inboxHooks?.refused();
+    const groups = [...new Set((req.audiences ?? []).filter((a) => isGroupSessionKey(a)))];
+    for (const groupKey of groups) {
+      const parsed = parseRawSessionKey(groupKey);
+      const channel = parsed ? this.getChannel(parsed.channelName) : undefined;
+      if (!parsed || !channel) continue;
+      await channel.send({ chatId: parsed.chatId, text: ownerT("notices")("group.summonBusy") })
+        .catch((err) => log.warn({ err, group: groupKey }, "Could not post the busy notice to the group"));
+    }
+    const label = groups.map((g) => this.sessions.getEntry(g)?.chatTitle ?? g).join(", ") || req.key;
+    await this.notifyOwner(ownerT("notices")("group.summonBusyOwner", { group: label }))
+      .catch((err) => log.warn({ err }, "Could not tell the owner about a refused group turn"));
   }
 
   private audienceLabel(audience: string): string {
@@ -2357,6 +2443,7 @@ export class Agent {
       },
       silentMatcher: isSilentReply,
       transcript: "always",
+      onSharedPromptUnavailable: () => this.answerSharedPromptUnavailable(req),
       ...(req.inboxHooks ? {
         onPromptHandedOff: req.inboxHooks.onPromptHandedOff,
         onShutdown: (kind: ShutdownTurnEnd, selfRestart?: { reason?: string }) => { if (kind === "interrupted") req.inboxHooks?.cutShort(selfRestart); },
@@ -2460,6 +2547,7 @@ export class Agent {
     // Prompt-only — the transcript keeps the clean tagged message.
     const isSummoned = isGroup && isDmSessionKey(key);
     const audiences = [audienceOf(channel.name, message)];
+    const audienceBefore = this.lastAudiences.get(key);
     const switchNote = this.noteAudienceSwitch(key, audiences);
     // The audience this message came from, derived exactly like the summon
     // reminder's targets — a summoned group must be answered in the group,
@@ -2498,12 +2586,10 @@ export class Agent {
         ...(channel.name === "web" ? { webRequestId: message.id } : {}),
       });
     } catch (err) {
-      if (!(err instanceof SteerDeclinedError)) throw err;
-      // Owner web input whose turn stopped being joinable before injection
-      // (nothing reached the SDK): back into the session's FIFO queue as its
-      // own turn, behind whatever is already waiting there — never around it.
-      log.info({ sessionKey: key }, "Web steer declined at injection; queued as its own turn");
-      this.enqueueInboundForSession(key, [{ channel, message, resolution, userRecorded: true }]);
+      // Declined before injection: processInboundItems queues it as its own
+      // turn, which must be told of the audience switch this one would have.
+      if (err instanceof SteerDeclinedError) this.forgetAudienceSwitch(key, audiences, audienceBefore);
+      throw err;
     }
   }
 
@@ -2580,7 +2666,7 @@ export class Agent {
     // transcript line, its prompt line, and the batch's sender clock below.
     const people = createPeopleSnapshot();
 
-    for (const { channel, message } of items) {
+    for (const { channel, message, userRecorded } of items) {
       if (message.isGroup) this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle, message.senderId, people);
       this.recordLatestInboundMessage(key, channel, message);
       const transcriptText = this.formatGroupText(channel, message, key, people);
@@ -2595,7 +2681,8 @@ export class Agent {
           log.error({ sessionKey: key, messageId: message.id }, "Web message reached the batch path; its transcript record has no requestId (canCoalesce should exclude web)");
         } catch { /* ignore */ }
       }
-      this.appendInboundUser(key, channel, message, transcriptText, { webRequestId: false });
+      // Already written by the attempt whose steer was declined (processInboundItems).
+      if (!userRecorded) this.appendInboundUser(key, channel, message, transcriptText, { webRequestId: false });
     }
 
     // Transcript recorded; refuse the turn (see resolveReplyDestination).
@@ -2632,6 +2719,7 @@ export class Agent {
       : [];
     const reminder = summonTargets.length > 0 ? `\n${this.summonReminder(summonTargets)}` : "";
     const audiences = items.map((it) => audienceOf(it.channel.name, it.message));
+    const audienceBefore = this.lastAudiences.get(key);
     const switchNote = this.noteAudienceSwitch(key, audiences);
     const combined = `${switchNote}[${subject} — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}${reminder}`;
     const allImages = items.flatMap((it) => it.message.images ?? []);
@@ -2644,7 +2732,7 @@ export class Agent {
     const senderZones = new Set(items.map((it) => this.senderTimeZone(it.channel, it.message, people)));
     const senderTimeZone = senderZones.size === 1 ? [...senderZones][0] : undefined;
 
-    await this.runUserTurn({
+    await this.runUserTurnOrForgetSwitch(key, audiences, audienceBefore, {
       key,
       promptText: combined,
       sourceChannelName: lastChannel.name,
@@ -2675,6 +2763,16 @@ export class Agent {
       passiveListen: isPassiveGroup,
       ...(inboxHooks ? { inboxHooks } : {}),
     });
+  }
+
+  /** runUserTurn for a batch; a declined steer takes back its audience-switch note (see handleMessage). */
+  private async runUserTurnOrForgetSwitch(key: string, audiences: string[], audienceBefore: string | undefined, req: UserTurnRequest): Promise<void> {
+    try {
+      await this.runUserTurn(req);
+    } catch (err) {
+      if (err instanceof SteerDeclinedError) this.forgetAudienceSwitch(key, audiences, audienceBefore);
+      throw err;
+    }
   }
 
   /** Thin delegate kept on Agent so TurnRunner's late-bound dep (and tests

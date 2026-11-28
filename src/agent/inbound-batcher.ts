@@ -28,7 +28,8 @@ export interface InboundBatcherHost {
   processInboundItems(items: InboundItem[], steer?: boolean): Promise<void>;
   /** Is a live turn currently in flight on this session? (steering target check) */
   hasBusyLiveSession(sessionKey: string): boolean;
-  canSteerIntoSession?(sessionKey: string): boolean;
+  /** May this drained batch join the session's running turn? False sends it to the queue as its own turn. */
+  canSteerIntoSession?(sessionKey: string, items: readonly InboundItem[]): boolean;
 }
 
 /**
@@ -240,7 +241,7 @@ export class InboundBatcher {
     }
 
     if (steerable) {
-      if (this.host.hasBusyLiveSession(sessionKey) && this.host.canSteerIntoSession?.(sessionKey) !== false) {
+      if (this.host.hasBusyLiveSession(sessionKey) && this.host.canSteerIntoSession?.(sessionKey, items) !== false) {
         await this.host.processInboundItems(items, true);
         return;
       }

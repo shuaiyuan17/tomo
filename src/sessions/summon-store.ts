@@ -53,6 +53,11 @@ export class SummonStore {
     return { entry };
   }
 
+  /** Every stored group key, lapsed ones included: ask `get` for each to learn (and act on) which have lapsed. */
+  keys(): string[] {
+    return [...this.summons.keys()];
+  }
+
   set(rawKey: string, identity: string, now = Date.now()): void {
     this.summons.set(rawKey, { identity, summonedAt: now, lastActivityAt: now });
     this.persist();

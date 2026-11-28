@@ -47,6 +47,7 @@ async function bootAndCheck(): Promise<string[]> {
   const agent = {
     listActiveSessions: () => [[SESSION, "sdk-session-1"]] as Array<[string, string]>,
     hasBackgroundWork: () => false,
+    hasActiveSummonInto: () => false,
     handleCronMessage: async (text: string) => { nudges.push(text); return true; },
   };
   const runner = new RollupRunner(agent as never); // production wiring: no store

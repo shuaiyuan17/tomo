@@ -103,11 +103,22 @@ function load(name: string): string {
   return "";
 }
 
-/** `lines`: MEMORY.md as this audience sees it (memoryIndexLines), read once
- *  by buildSystemPrompt so the prompt and its context snapshot agree. */
-function loadMemory(isGroup: boolean, lines: string[] | null): string {
+/**
+ * What the owner's DM session is told about private memory while a group chat
+ * is part of the conversation (the SHARED variant, see buildSystemPrompt). It
+ * replaces the DM's own private-memory section: the lines it speaks of are
+ * the ones that variant leaves out.
+ */
+export const SHARED_PRIVATE_MEMORY_NOTE = `## Private memories (not loaded)
 
-  const privacySection = isGroup
+A group chat is part of this conversation now, so the files under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` and private people records are not loaded: MEMORY.md lines that link into \`${PRIVATE_MEMORY_SUBDIR}/\` are left out of the index below, and private people are left out of the registry. Don't bring private memory into this conversation while the group is here. What the owner tells you in private that shouldn't surface in a group still goes under \`memory/${PRIVATE_MEMORY_SUBDIR}/\`, indexed in MEMORY.md the normal way.`;
+
+/** `lines`: MEMORY.md as this audience sees it (memoryIndexLines), read once
+ *  by buildSystemPrompt so the prompt and its context snapshot agree.
+ *  `shared`: the DM session's shared variant (never with `isGroup`). */
+function loadMemory(isGroup: boolean, lines: string[] | null, shared = false): string {
+
+  const privacySection = shared ? `\n${SHARED_PRIVATE_MEMORY_NOTE}\n` : isGroup
     ? `\n## Private memories (DM-only)\n\nMemory files under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` are restricted to DM sessions. They are not listed in the index below, and you cannot read them from this group session — the harness will deny the tool call. Two consequences worth knowing before you reach for them: the **shell here runs sandboxed** (every Bash command is wrapped in a \`sandbox-exec\` profile that makes those files unreadable at the kernel level, so assembling the path in an interpreter fails with EPERM rather than working; if the sandbox cannot be set up the Bash tool is withheld for the turn instead), and a \`MEDIA:\` attachment pointing into \`memory/${PRIVATE_MEMORY_SUBDIR}/\` is dropped before it is sent, since attaching a file is a way of reading it out loud.\n`
     : `\n## Private memories (DM-only)\n\nFor anything you wouldn't want surfaced in a group chat (sensitive personal details, private notes), save the memory file under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` instead of the top level. Index it in MEMORY.md the normal way — group sessions automatically see the index with \`${PRIVATE_MEMORY_SUBDIR}/\` lines stripped, and the harness blocks them from reading the files directly.\n`;
 
@@ -167,8 +178,9 @@ Don't wait to be told "remember this." Save durable personal details, preference
   } else {
     const { shown, notice } = fitMemoryIndex(lines);
     // Owner DM only: a group session is not where the index gets reorganized,
-    // so there the line would be an instruction it cannot act on.
-    const reminder = isGroup ? undefined : memoryBudgetReminder(lines);
+    // so there the line would be an instruction it cannot act on. Nor is a DM
+    // session a group is part of (the shared variant).
+    const reminder = isGroup || shared ? undefined : memoryBudgetReminder(lines);
     memoryContent = [reminder, shown.join("\n"), notice].filter((part) => part !== undefined).join("\n\n");
   }
 
@@ -202,10 +214,12 @@ function peopleRosterLines(isGroup: boolean, strict = false): string[] {
   return renderPeopleRoster(loadPeople({ includePrivate: !isGroup, strict }));
 }
 
-function loadPeopleSection(isGroup: boolean, rosterLines: string[]): string {
+function loadPeopleSection(isGroup: boolean, rosterLines: string[], shared = false): string {
   const dirs = defaultPeopleDirs();
   const roster = rosterLines.length > 0 ? rosterLines.join("\n") : "(no people records yet)";
-  const privacyNote = isGroup
+  const privacyNote = shared
+    ? `Records under \`memory/${PRIVATE_MEMORY_SUBDIR}/people/\` are not listed here while a group chat is part of this conversation.`
+    : isGroup
     ? `Records under \`memory/${PRIVATE_MEMORY_SUBDIR}/people/\` are DM-only — they are not listed here and cannot be read from this group session.`
     : `For people whose details shouldn't surface in group chats, keep their record under \`memory/${PRIVATE_MEMORY_SUBDIR}/people/\` instead — group sessions never see those records.`;
 
@@ -341,6 +355,10 @@ export interface PromptContextSnapshot {
  * result the prompt builder settles for: compared against the snapshot, a
  * partial roster would read as everyone it could not read being removed.
  * Without `strict` it reads exactly as buildSystemPrompt does.
+ *
+ * There is no `shared` here on purpose: a dm: session on the shared variant
+ * is never compared against a re-read (LiveSessionManager.takePromptContextNote
+ * tells it nothing), so its snapshot is only ever the one its own build made.
  */
 export function promptContextSnapshot(opts: { isGroup?: boolean; strict?: boolean } = {}): PromptContextSnapshot {
   const isGroup = !!opts.isGroup;
@@ -358,16 +376,28 @@ export function promptContextSnapshot(opts: { isGroup?: boolean; strict?: boolea
  */
 export function buildSystemPrompt(opts: {
   isGroup?: boolean;
+  /**
+   * The owner's DM session while a group chat is part of it (a summon is
+   * active, or the turn's audience is not the owner alone): the DM prompt
+   * WITHOUT what must stay private. MEMORY.md lines that link into private/
+   * and private people records are left out, exactly as for a group, and the
+   * private-memory section says so (SHARED_PRIVATE_MEMORY_NOTE). Everything
+   * else is the DM prompt. Ignored with `isGroup`. Which turns need it is
+   * decided where they are dispatched (LiveSessionManager).
+   */
+  shared?: boolean;
   /** `subsessions.enabled`: the DM variant then carries DELEGATION_NOTE. One value per process, so it keeps the shared prefix. */
   subsessions?: boolean;
   onContext?: (context: PromptContextSnapshot) => void;
 } = {}): string {
   const isGroup = !!opts.isGroup;
+  const shared = !isGroup && !!opts.shared;
+  const withoutPrivate = isGroup || shared;
   mkdirSync(MEMORY_DIR, { recursive: true });
-  const memoryLines = memoryIndexLines(isGroup);
-  const rosterLines = peopleRosterLines(isGroup);
+  const memoryLines = memoryIndexLines(withoutPrivate);
+  const rosterLines = peopleRosterLines(withoutPrivate);
   opts.onContext?.({ memory: memorySnapshotLines(memoryLines), people: rosterLines });
-  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup, memoryLines), loadPeopleSection(isGroup, rosterLines),
+  const sections = [load("SOUL"), load("AGENT"), load("IDENTITY"), loadMemory(isGroup, memoryLines, shared), loadPeopleSection(isGroup, rosterLines, shared),
     isGroup ? HARNESS_INSTRUCTIONS : `${HARNESS_INSTRUCTIONS}\n\n${ownerNotes(!!opts.subsessions)}`].filter(Boolean);
   return sections.join("\n\n---\n\n");
 }

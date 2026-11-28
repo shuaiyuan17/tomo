@@ -73,6 +73,10 @@ export interface SessionContext {
   /** Receives the MEMORY.md / roster lines the system prompt was built from
    *  (buildSystemPrompt's `onContext`): the live session's snapshot. */
   onPromptContext?: (context: PromptContextLines) => void;
+  /** Build a dm: session's prompt as its SHARED variant: no private index
+   *  lines, no private people (buildSystemPrompt's `shared`). Decided per
+   *  live session by LiveSessionManager; ignored for a group or a sub-session. */
+  sharedPrompt?: boolean;
   /** Group metadata snapshot — present only for group sessions. */
   group?: {
     chatTitle?: string;
@@ -166,7 +170,7 @@ export function sdkOptions(
   const isGroup = subsession ? subsession.groupScope : sessionContext ? isGroupSessionKey(sessionContext.sessionKey) : false;
   const staticPrompt = subsession
     ? subsession.staticPrompt
-    : buildSystemPrompt({ isGroup, subsessions: config.subsessions.enabled, onContext: sessionContext?.onPromptContext });
+    : buildSystemPrompt({ isGroup, shared: !isGroup && sessionContext?.sharedPrompt === true, subsessions: config.subsessions.enabled, onContext: sessionContext?.onPromptContext });
   const maxTurns = subsession ? subsession.maxTurns : config.maxTurns;
 
   // Why `memory/private/` is closed for the turn in flight — or null when it is

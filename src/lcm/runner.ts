@@ -175,6 +175,15 @@ export class RollupRunner {
       // tasks — so `tomo lcm` and `lcm_rollup` refuse while any are running.
       // Asking anyway would only spend a model turn on a refusal; skip the
       // session without arming the cooldown, so the next tick asks again.
+      // While a group is summoned into the owner's dm: session, that session
+      // runs on the prompt without the owner's private context, and whatever
+      // a rollup turn read would stay in a context the group is steering.
+      // Deferred like the background-task case: no cooldown, so the first
+      // tick after the summon ends asks.
+      if (this.agent.hasActiveSummonInto(sessionKey)) {
+        log.info({ sessionKey }, "Rollup nudge deferred (a group is summoned into this session)");
+        continue;
+      }
       if (this.agent.hasBackgroundWork(sessionKey)) {
         log.info({ sessionKey }, "Rollup nudge deferred (session has background tasks running)");
         continue;

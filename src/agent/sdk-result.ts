@@ -245,6 +245,19 @@ export class SteerDeclinedError extends Error {
   }
 }
 
+/**
+ * A turn a group is steering could not get a dm: session built with the
+ * shared prompt variant in time (LiveSessionManager.sessionForTurn): the live
+ * one has the full prompt and could not be closed. Nothing reached the model.
+ * Never retried, and never answered by running the turn on the full prompt.
+ */
+export class SharedPromptUnavailableError extends Error {
+  constructor(readonly blocker: string) {
+    super(`The session is busy (${blocker}) and could not be reloaded without the owner's private context in time; this turn was not run.`);
+    this.name = "SharedPromptUnavailableError";
+  }
+}
+
 export class TurnInterruptedError extends Error {
   constructor(message = "Turn stopped by /rewind.") {
     super(message);

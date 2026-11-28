@@ -341,6 +341,48 @@ describe("OwnerRouter", () => {
       }
     });
 
+    describe("hasActiveSummonInto (which prompt variant the dm: session's next turn needs)", () => {
+      it("is true only for the dm: session a group is summoned into, and false again once dismissed", () => {
+        const router = routerOf(identities, sessions, { telegram: ["-987"] });
+        expect(router.hasActiveSummonInto("dm:alice")).toBe(false);
+        router.summonGroup("telegram", "-987");
+        expect(router.hasActiveSummonInto("dm:alice")).toBe(true);
+        expect(router.hasActiveSummonInto("dm:bob")).toBe(false);
+        expect(router.hasActiveSummonInto("telegram:-987")).toBe(false);
+        router.dismissGroup("telegram", "-987");
+        expect(router.hasActiveSummonInto("dm:alice")).toBe(false);
+      });
+
+      it("runs the lazy expiry check: a lapsed summon is dropped, the dm: session is told, the group is not", () => {
+        const summons = new SummonStore(null, 1000);
+        const router = routerOf(identities, sessions, {}, summons);
+        const expired: string[] = [];
+        router.onSummonExpired = (ch, chatId, identity, notifyGroup) =>
+          expired.push(`${ch}:${chatId}:${identity}:${notifyGroup}`);
+        vi.useFakeTimers();
+        try {
+          vi.setSystemTime(1_000_000);
+          router.summonGroup("telegram", "-987");
+          router.summonGroup("imessage", "any;+;chat1");
+          vi.setSystemTime(1_000_900);
+          // Asking is not group traffic: it must not extend either clock.
+          expect(router.hasActiveSummonInto("dm:alice")).toBe(true);
+          expect(expired).toEqual([]);
+          // One group stays active; the other lapses.
+          router.resolve("imessage", "any;+;chat1", true);
+          vi.setSystemTime(1_001_001);
+          expect(router.hasActiveSummonInto("dm:alice")).toBe(true);
+          expect(expired).toEqual(["telegram:-987:alice:false"]);
+          vi.setSystemTime(1_002_000);
+          expect(router.hasActiveSummonInto("dm:alice")).toBe(false);
+          expect(expired).toEqual(["telegram:-987:alice:false", "imessage:any;+;chat1:alice:false"]);
+          expect(summons.keys()).toEqual([]);
+        } finally {
+          vi.useRealTimers();
+        }
+      });
+    });
+
     it("does not persist the group as the dm session's reply target", () => {
       sessions.setSdkSessionId("dm:alice", "session-alice");
       sessions.setReplyTarget("dm:alice", { channelName: "telegram", chatId: "111" });

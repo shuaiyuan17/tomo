@@ -9,7 +9,8 @@
  * Blocks after the marker are cached per session only.
  *
  * Static here means "identical for every session of the same audience":
- * `buildSystemPrompt({ isGroup })` has two variants (DM / group) because group
+ * `buildSystemPrompt({ isGroup, shared })` has three variants (DM / the DM's
+ * shared variant while a group chat is part of it / group) because group
  * sessions see MEMORY and PEOPLE with private entries stripped and no home
  * note (nor delegation note, which the DM variant carries when
  * `subsessions.enabled` is on: one value per process). Each variant is its own shared prefix. Nothing that names one session

@@ -24,7 +24,7 @@ import { isTaskSessionKey } from "../sessions/keys.js";
 import type { UsageLedgerRow } from "../usage/ledger.js";
 import { SHUTDOWN_NOT_PROCESSED } from "./block-transcript.js";
 import { DELIVERY_TIMEOUT_MS, LiveSession, MAX_TURNS_RESPONSE, QUERY_TIMEOUT_ERROR_PREFIX, STEER_MERGED, SdkResultError, TurnInterruptedError, type McpAuthRefreshOutcome, type QueryResult, type ReplyContext, type TurnRequest } from "./live-session.js";
-import { SteerDeclinedError } from "./sdk-result.js";
+import { SharedPromptUnavailableError, SteerDeclinedError } from "./sdk-result.js";
 import { spawnDenial } from "./spawn-gate.js";
 import type { GroupSandboxConfig } from "./group-fs-policy.js";
 import { makeTurnBudget, sdkOptions, usesLcmCompact, type SessionContext } from "./sdk-options.js";
@@ -71,6 +71,32 @@ function sameServerConfig(a: McpServerConfig | undefined, b: McpServerConfig): b
   } catch {
     return false;
   }
+}
+
+/**
+ * How long a turn that MUST run on the shared prompt variant (a group is
+ * steering it) waits for a dm: session built with the full prompt to become
+ * closable — its running turn to end, its background work to finish — before
+ * it is refused. It waits at the head of the session's queue, so the owner's
+ * own messages wait behind it: short enough not to hold them long, long
+ * enough for a turn or a short subagent run to finish.
+ */
+export const PROMPT_VARIANT_SWITCH_WAIT_MS = 5 * 60_000;
+/** How often that wait looks again when nothing it can listen for will wake it. */
+export const PROMPT_VARIANT_SWITCH_POLL_MS = 1_000;
+
+/** Which system-prompt variant a turn on a key needs (see LiveSessionManagerDeps.promptVariant). */
+export interface PromptVariantNeed {
+  /** The shared variant: the dm: prompt without private index lines and private people. */
+  shared: boolean;
+  /**
+   * The turn may run on nothing else. True for a turn a group is steering,
+   * which must never see the full prompt. False for the owner's own turn: it
+   * moves to the wanted variant when the session can be closed right now, and
+   * otherwise runs on the one that is live (their own private context is
+   * theirs to see; a shared prompt only shows them less).
+   */
+  required: boolean;
 }
 
 /** Upper bound on how long /rewind waits for a stopped session to wind down. */
@@ -212,6 +238,14 @@ export interface LiveSessionManagerDeps {
    */
   subsessionContext?(key: string): SessionContext["subsession"];
   /**
+   * The prompt variant the turn being dispatched on `key` needs, read at
+   * dispatch (and when a session is built) from what is live then: the
+   * audiences of every turn registered on the key, and whether a group is
+   * summoned into it. Only a dm: key ever answers `shared`. Absent: every
+   * session has the full prompt, as before.
+   */
+  promptVariant?(key: string): PromptVariantNeed;
+  /**
    * Does the turn currently in flight on `key` belong to that session?
    * (`Agent.isOwnAudienceTurn`.) False while a summoned group is steering a
    * dm: session, and for a batch spanning several audiences. Read per tool
@@ -299,6 +333,8 @@ export class LiveSessionManager {
    *  change is told again. Keyed by the session, so a replacement session
    *  never inherits it. */
   private promptContextUntold = new WeakMap<LiveSession, PromptContextTicket>();
+  /** Live sessions built with the SHARED prompt variant (dm: keys only). Absent: the full prompt. */
+  private sharedPrompt = new WeakSet<LiveSession>();
   private liveSessionCreates = new Map<string, Promise<LiveSession>>();
   private lastPromptHash: string = "";
   private stopping = false;
@@ -363,6 +399,15 @@ export class LiveSessionManager {
   /** The key has a live session in memory (its history is there; nothing to resume). */
   hasLiveSession(key: string): boolean {
     return this.liveSessions.get(key)?.isAlive() === true;
+  }
+
+  /**
+   * Was the key's live session built with the shared prompt variant?
+   * Undefined with no live session (the next one is built for its turn).
+   */
+  hasSharedPrompt(key: string): boolean | undefined {
+    const live = this.liveSessions.get(key);
+    return live?.isAlive() ? this.sharedPrompt.has(live) : undefined;
   }
 
   /** Is a live turn currently in flight on this session? (steering target check) */
@@ -953,6 +998,10 @@ export class LiveSessionManager {
     if (!this.deps.isOwnAudienceTurn(key)) return undefined;
     const session = this.liveSessions.get(key);
     if (!session?.isAlive() || this.promptStale.has(session)) return undefined;
+    // A session on the shared variant is told nothing and is not retired for
+    // a memory change: a group is part of it, and its next switch back to the
+    // full prompt rebuilds it from the current files anyway.
+    if (this.sharedPrompt.has(session)) return undefined;
     if (this.promptContextUntold.has(session)) return undefined;
     const before = this.promptContext.get(session);
     if (!before) return undefined;
@@ -1084,6 +1133,10 @@ export class LiveSessionManager {
     if (session?.isAlive()) return session;
 
     const generation = this.generations.get(key) ?? 0;
+    // Read before the first await, with the registry as the turn that asked
+    // for this session left it. A turn dispatched later checks again
+    // (sessionForTurn): what it needs may differ by then.
+    const sharedPrompt = this.deps.promptVariant?.(key).shared === true;
     const resumeId = this.deps.getSdkSessionId(key);
     if (resumeId) {
       const repair = repairSdkSessionForResume(
@@ -1110,6 +1163,7 @@ export class LiveSessionManager {
       sessionKey: key,
       ...(subsession ? { subsession } : { onPromptContext: (context: PromptContextLines) => { promptContext = context; } }),
       sdkSessionId: resumeId ?? undefined,
+      ...(sharedPrompt && !subsession ? { sharedPrompt: true } : {}),
       group: this.deps.buildGroupContext(key),
       isOwnAudienceTurn: () => this.deps.isOwnAudienceTurn(key),
       scopedCallerKey: () => this.deps.scopedCallerKey(key),
@@ -1177,6 +1231,7 @@ export class LiveSessionManager {
     // A dead predecessor's connections went with it.
     if (this.liveSessions.has(key)) this.mcpHealth.sessionClosed(key);
     this.liveSessions.set(key, session);
+    if (sharedPrompt && !subsession) this.sharedPrompt.add(session);
     if (promptContext) this.promptContext.set(session, promptContext);
     this.armIdleReaper();
     this.externalMcpServersBySession.set(key, new Set(Object.keys(externalMcpServers)));
@@ -1188,6 +1243,7 @@ export class LiveSessionManager {
       {
         key,
         resume: !!resumeId,
+        ...(sharedPrompt && !subsession ? { prompt: "shared" } : {}),
         model: opts.model,
         gateway: opts.env?.ANTHROPIC_BASE_URL ? "litellm" : "native",
       },
@@ -1482,21 +1538,27 @@ export class LiveSessionManager {
 
     let session: LiveSession | undefined;
     try {
-      session = await this.getOrCreateLiveSession(key, () => token.interrupted);
-      // Stopped by /rewind while it was still getting its session.
-      if (token.interrupted) throw new TurnInterruptedError();
-      // The session was built while we were parked in buildExternalMcpServers
-      // and shutdown began in the meantime, so createLiveSession closed it
-      // rather than publishing it (see there). Refuse rather than call send()
-      // on it: the "Session is closed" that would come back is
-      // indistinguishable from a session that ran and died mid-turn, and would
-      // record this never-processed prompt as a silent turn.
-      if (this.stopping && !session.isAlive()) {
-        return this.refuseForShutdown(req, "session built after stop() began");
+      for (;;) {
+        session = await this.sessionForTurn(key, steer, token);
+        // Stopped by /rewind while it was still getting its session.
+        if (token.interrupted) throw new TurnInterruptedError();
+        // The session was built while we were parked in buildExternalMcpServers
+        // and shutdown began in the meantime, so createLiveSession closed it
+        // rather than publishing it (see there). Refuse rather than call send()
+        // on it: the "Session is closed" that would come back is
+        // indistinguishable from a session that ran and died mid-turn, and would
+        // record this never-processed prompt as a silent turn.
+        if (this.stopping && !session.isAlive()) {
+          return this.refuseForShutdown(req, "session built after stop() began");
+        }
+        // A steer joins a turn already running; a fresh turn first settles MCP.
+        if (!steer && session.isAlive() && !session.isBusy()) await this.preTurnMcp(key, session);
+        if (token.interrupted) throw new TurnInterruptedError();
+        // Checked again with NO await before the prompt is handed over: a
+        // group's turn may have registered on the key during the waits above.
+        if (!this.lacksRequiredSharedPrompt(key, session)) break;
+        if (steer) throw new SteerDeclinedError();
       }
-      // A steer joins a turn already running; a fresh turn first settles MCP.
-      if (!steer && session.isAlive() && !session.isBusy()) await this.preTurnMcp(key, session);
-      if (token.interrupted) throw new TurnInterruptedError();
       const sessionPrompt = this.promptForSession(key, req.contextNote, session, prompt);
       return await this.runTurnOnSession(key, session, steer, () => (steer
         ? session!.steer(sessionPrompt, images, documents, onBlock, onBlockAbandoned, origin, steerAudience, {
@@ -1517,6 +1579,8 @@ export class LiveSessionManager {
       // not yet claimed the session included), it ends as interrupted.
       if (err instanceof TurnInterruptedError) throw err;
       if (token.interrupted) throw new TurnInterruptedError();
+      // Refused before anything reached the model. The caller answers it.
+      if (err instanceof SharedPromptUnavailableError) throw err;
       // One exception: a resume that can't find its conversation. Current SDKs
       // report it as a zero-turn error result instead of throwing, so nothing
       // ran and the reset-and-retry below must still fire (see isResumeMissing).
@@ -1611,6 +1675,10 @@ export class LiveSessionManager {
         }
 
         const retrySession = await this.getOrCreateLiveSession(key);
+        // Built just now for this turn, so it has the variant the turn needs;
+        // one somebody else built meanwhile may not. Never the full prompt
+        // for a group's turn.
+        if (this.lacksRequiredSharedPrompt(key, retrySession)) throw new SharedPromptUnavailableError("session replaced during a retry");
         // Safe to reuse the same sink: the guard above proved it has shipped
         // nothing, so this retry is the first and only delivery of the turn.
         // Same bookkeeping as the first attempt — a retry that ends on an SDK
@@ -1622,6 +1690,104 @@ export class LiveSessionManager {
 
       throw err;
     }
+  }
+
+  /** A live session with the full prompt, on a key whose turn in flight may only run on the shared one. */
+  private lacksRequiredSharedPrompt(key: string, session: LiveSession): boolean {
+    if (!this.deps.promptVariant || !session.isAlive() || this.sharedPrompt.has(session)) return false;
+    const need = this.deps.promptVariant(key);
+    return need.shared && need.required;
+  }
+
+  /**
+   * The live session a turn runs on, built with the prompt variant the turn
+   * needs (`deps.promptVariant`, read here: at dispatch, not when the message
+   * was queued — a summon or a second audience can arrive in between).
+   *
+   * A dm: session has two variants, and a live session keeps the one it was
+   * built with. When that is not the one this turn needs, the session is
+   * closed and resumed from disk as the other — but only when it can be
+   * closed without cutting anything (`variantSwitchBlocker`, the idle
+   * reaper's conditions). NOT `retireWhenIdle`: that waits for the queue to
+   * empty, and the turn waiting here would run on the old prompt first.
+   *
+   * When it cannot be closed right now:
+   * - the owner's own turn (`required` false) runs on the live session as it
+   *   is. Nothing private is shown to anyone but the owner.
+   * - a turn a group is steering waits, up to PROMPT_VARIANT_SWITCH_WAIT_MS,
+   *   and is then refused (SharedPromptUnavailableError). Background work is
+   *   never stopped to make room for it.
+   * - a steer is never the one to close a session: it would cut the turn it
+   *   meant to join. One that must have the shared prompt is declined
+   *   (SteerDeclinedError: back to the queue as its own turn); any other joins.
+   */
+  private async sessionForTurn(key: string, steer: boolean, token: { interrupted: boolean }): Promise<LiveSession> {
+    let deadline: number | undefined;
+    for (;;) {
+      const session = await this.getOrCreateLiveSession(key, () => token.interrupted);
+      // A dead session (discarded by a rewind or by shutdown) and a turn a
+      // rewind stopped are the caller's to end. NOT `stopping` with a live
+      // session: the caller comes back here for as long as a group's turn has
+      // the full prompt, and handing that session back unchanged would spin.
+      if (!this.deps.promptVariant || token.interrupted || !session.isAlive()) return session;
+      const need = this.deps.promptVariant(key);
+      if (need.shared === this.sharedPrompt.has(session)) return session;
+      const mustSwitch = need.shared && need.required;
+      if (steer) {
+        if (mustSwitch) throw new SteerDeclinedError();
+        return session;
+      }
+      const blocker = this.variantSwitchBlocker(key, session, token);
+      if (!blocker) {
+        log.info({ key, to: need.shared ? "shared" : "full" }, "Reloading the live session with the other prompt variant for this turn");
+        this.closeReaped(key, session);
+        continue;
+      }
+      if (!mustSwitch) {
+        log.info({ key, wanted: need.shared ? "shared" : "full", blocker }, "Live session cannot be reloaded right now; the owner's turn runs on the prompt variant it has");
+        return session;
+      }
+      deadline ??= Date.now() + PROMPT_VARIANT_SWITCH_WAIT_MS;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        log.warn({ key, blocker }, "Live session could not be reloaded with the shared prompt in time; refusing the group's turn");
+        throw new SharedPromptUnavailableError(blocker);
+      }
+      const wait = Math.min(remaining, PROMPT_VARIANT_SWITCH_POLL_MS);
+      if (session.isBusy()) await withTimeout(session.waitForIdle(), wait);
+      else await new Promise<void>((resolve) => { setTimeout(resolve, wait); });
+    }
+  }
+
+  /**
+   * Why the key's live session cannot be closed and resumed right now, or
+   * undefined when it can. The idle reaper's conditions (reapIdleSessions),
+   * minus idleness itself and counting every dispatch but the asking one.
+   */
+  private variantSwitchBlocker(key: string, session: LiveSession, own: { interrupted: boolean }): string | undefined {
+    if (session.isBusy()) return "a turn is running";
+    // retireWhenIdle is in charge of it, and is waiting on its background work.
+    if (this.promptStale.has(session)) return "it is retiring for a prompt change";
+    for (const other of this.dispatches.get(key) ?? []) if (other !== own) return "another turn is starting";
+    if (this.sessionHolds.has(key)) return "a rewind or compaction holds the session";
+    if (this.mcpReservations.has(key)) return "an MCP reconnect is running";
+    if (session.hasAnyLiveTasks()) return "background tasks are running";
+    if (session.isAwaitingTaskReportWithin(PROMPT_RETIRE_REPORT_WAIT_MS)) return "a background task's report is due";
+    if ((this.backgroundingInFlight.get(key) ?? 0) > 0) return "a task is moving to the background";
+    if (this.isCompactPending(key)) return "a compact is waiting on its reload";
+    // The next session resumes from the registry's id: it must be this one's.
+    const liveId = session.getSessionId();
+    if (liveId && (this.unpersistedLinks.has(key) || this.deps.getSdkSessionId(key) !== liveId)) {
+      try {
+        this.deps.setSdkSessionId(key, liveId);
+        this.unpersistedLinks.delete(key);
+      } catch (err) {
+        this.unpersistedLinks.add(key);
+        log.error({ err, key }, "The session's SDK id is not stored in the registry; not reloading it for a prompt variant");
+        return "its SDK session id is not stored yet";
+      }
+    }
+    return undefined;
   }
 
   /**

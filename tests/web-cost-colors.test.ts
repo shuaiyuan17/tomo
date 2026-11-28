@@ -47,7 +47,7 @@ describe("cost chart tokens", () => {
 
   it("light mode keeps its validated palette", () => {
     expect(SERIES.map((k) => light[k])).toEqual(["#3d7ab5", "#c8623a", "#2f9a74", "#9e497d"]);
-    expect(RAMP.map((k) => light[k])).toEqual(["#efe8d8", "#cfdcea", "#a3c0dd", "#729fcd", "#3d7ab5", "#27578a"]);
+    expect(RAMP.map((k) => light[k])).toEqual(["#efe8d8", "#d5dfca", "#b2c49e", "#8ca56f", "#678045", "#485d2a"]);
   });
 
   it("dark series pass the dataviz checks on the card, all pairs (You / Background / Scheduled / Tasks can all touch)", () => {

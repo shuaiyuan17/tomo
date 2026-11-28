@@ -431,6 +431,13 @@ export class SubsessionService {
   private keepEndedRecords = false;
   private readonly reportTimers = new Map<string, NodeJS.Timeout>();
   private readonly reportAttempts = new Map<string, number>();
+  /**
+   * Reports whose note is on disk and whose wake is sent, but whose
+   * `reportDelivered` mark could not be written yet (task id → report seq).
+   * A task_finish that lands before the retry treats that report as delivered:
+   * kept beside the new one only while its note is unread, never noted again.
+   */
+  private readonly markOwed = new Map<string, number | undefined>();
   /** The highest input seq the turn in flight carries, per task (runtime only). */
   private readonly inflightThrough = new Map<string, number>();
   /** Which turn is in flight, per task: a serial, so two turns that carry the same seq still differ. */
@@ -1434,8 +1441,10 @@ export class SubsessionService {
         // Every one still unread is kept (no cap: each is bounded by an
         // unread note, or by a report that never got one); a read one goes.
         const kept = (r.earlierReports ?? []).filter((e) => e.seq !== previous && (!e.noted || this.notePending(r.parentKey, `${r.id}#${e.seq}`)));
-        if (r.report !== undefined && previous > 0 && (!r.reportDelivered || this.reportNotePending({ ...r, reportSeq: previous }))) {
-          kept.push({ seq: previous, text: r.report, ...(r.reportDelivered ? { noted: true } : {}) });
+        // Delivered, by the record or by a mark still owed (its note was written; only the mark's write failed).
+        const delivered = r.reportDelivered || (this.markOwed.has(r.id) && this.markOwed.get(r.id) === r.reportSeq);
+        if (r.report !== undefined && previous > 0 && (!delivered || this.reportNotePending({ ...r, reportSeq: previous }))) {
+          kept.push({ seq: previous, text: r.report, ...(delivered ? { noted: true } : {}) });
         }
         r.earlierReports = kept.length > 0 ? kept : undefined;
         r.reportSeq = previous + 1;
@@ -1774,6 +1783,7 @@ export class SubsessionService {
     for (const timer of this.reportTimers.values()) clearTimeout(timer);
     this.reportTimers.clear();
     this.reportAttempts.clear();
+    this.markOwed.clear();
     this.unpersistedReports.clear();
     for (const timer of this.settleTimers.values()) clearTimeout(timer);
     this.settleTimers.clear();
@@ -2975,6 +2985,7 @@ export class SubsessionService {
     } catch (err) {
       log.error({ err, id }, "Could not mark a sub-session report delivered; trying again");
     }
+    this.markOwed.set(id, seq);
     const attempts = (this.reportAttempts.get(id) ?? 0) + 1;
     if (attempts > REPORT_RETRY_MAX) {
       this.clearReportRetry(id);
@@ -3071,6 +3082,7 @@ export class SubsessionService {
     if (timer) clearTimeout(timer);
     this.reportTimers.delete(id);
     this.reportAttempts.delete(id);
+    this.markOwed.delete(id);
   }
 
   /**

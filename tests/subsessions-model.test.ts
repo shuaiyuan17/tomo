@@ -31,7 +31,11 @@ vi.mock("node:fs", async (importOriginal) => ({ ...(await importOriginal<typeof 
 
 const SEED = Number(process.env.FC_SEED ?? 20261127);
 const RUNS = Number(process.env.FC_RUNS ?? 100);
-/** A CI bound: past it no new run starts (the runs so far still count), so a slow runner cannot time the test out. */
+/**
+ * A CI bound, in real time: past it the runs left are skipped (each returns at
+ * once, so none is ever abandoned half-way), and a slow runner cannot time the
+ * test out. The regressions run first and are never skipped.
+ */
 const TIME_LIMIT_MS = Number(process.env.FC_TIME_LIMIT_MS ?? 20_000);
 const PARENT = "dm:owner";
 const DAY = 24 * 3_600_000;
@@ -788,13 +792,19 @@ describe("sub-session service, model-based", () => {
   });
 
   it("keeps its invariants over random event sequences, restarts and faults", async () => {
+    const began = performance.now();
+    let ran = 0;
+    let skipped = 0;
     await fc.assert(
       fc.asyncProperty(fc.array(opArb, { minLength: 10, maxLength: 60, size: "max" }), cfgArb, async (ops, cfg) => {
+        // performance.now() is not faked: this is the test's real run time.
+        if (++ran > REGRESSIONS.length && performance.now() - began > TIME_LIMIT_MS) { skipped += 1; return; }
         const violations = await runOps(ops, cfg);
         expect(violations).toEqual([]);
       }),
-      { seed: SEED, numRuns: RUNS, examples: REGRESSIONS, endOnFailure: false, interruptAfterTimeLimit: TIME_LIMIT_MS, markInterruptAsFailure: false },
+      { seed: SEED, numRuns: RUNS, examples: REGRESSIONS, endOnFailure: false },
     );
+    if (skipped > 0) console.warn(`sub-session model test: ${skipped} of ${RUNS} runs skipped after ${TIME_LIMIT_MS}ms`);
     if (process.env.FC_STATS) writeFileSync(process.env.FC_STATS, [...STATS].sort((a, b) => b[1] - a[1]).map(([k, v]) => `${v}\t${k}`).join("\n"));
   }, 120_000);
 });

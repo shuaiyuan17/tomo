@@ -928,6 +928,41 @@ describe("SubsessionService: inputs are never lost", () => {
     }
   });
 
+  it("a second task_finish while the first report's mark is still owed does not note the first report again", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      let n = 0;
+      const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, `report ${++n}`)));
+      const update = h.store.update.bind(h.store);
+      let fail = 1;
+      vi.spyOn(h.store, "update").mockImplementation((id, fn) => {
+        if (h.wakes.length === 1 && fail > 0) { fail -= 1; throw new Error("disk full"); }
+        return update(id, fn);
+      });
+      h.service.start();
+      const t = spawn(h);
+      await flush();
+      expect(fail).toBe(0);
+      expect(h.store.get(t.id)).toMatchObject({ status: "finished", reportDelivered: false, reportSeq: 1 });
+      // The owning session read report 1's note; before the mark's retry, the owner writes and the task finishes again.
+      h.notes.set("dm:owner", []);
+      h.onTurn = async (turn, hh) => { hh.service.noteToolUse(turn.key); hh.service.reopen(turn.key); hh.service.finish(turn.key, "report 2"); return { ok: true }; };
+      expect(h.service.ownerMessage("dm:owner", t.id, "one more thing")).toMatchObject({ ok: true });
+      await flush();
+      expect(h.store.get(t.id)).toMatchObject({ status: "finished", reportSeq: 2, reportDelivered: true });
+      const reports = (h.notes.get("dm:owner") ?? []).filter((x) => x.includes('type="subsession-report"'));
+      expect(reports).toHaveLength(1);
+      expect(reports[0]).toContain(`name="${t.id}#2"`);
+      expect(h.store.get(t.id)?.earlierReports).toBeUndefined();
+      // The old retry is gone with the new delivery: nothing marks or delivers later.
+      vi.advanceTimersByTime(REPORT_RETRY_MS * 2);
+      expect((h.notes.get("dm:owner") ?? []).filter((x) => x.includes('type="subsession-report"'))).toHaveLength(1);
+      h.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("does not take a note held in memory after a failed write for a durable one", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {

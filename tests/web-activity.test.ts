@@ -13,6 +13,8 @@ import { buildTaskOwnerTools } from "../src/mcp/subsession-tools.js";
 import { buildTodoTools } from "../src/mcp/todo-tools.js";
 import { buildCronTools } from "../src/mcp/cron-tools.js";
 import { TodoStore } from "../src/todos/store.js";
+import { buildPetTools } from "../src/mcp/pet-tools.js";
+import { PetStore } from "../src/mcp/pet-store.js";
 import { DEFAULT_SUBSESSIONS } from "../src/config.js";
 import type { SubagentItem } from "../src/web/protocol.js";
 
@@ -87,6 +89,20 @@ describe("toolOutcome reads what the real tools return", () => {
     expect(toolOutcome(I("schedule_remove"), textOf(await run(tools, "schedule_remove", { id: "nope0000" })))).toEqual({ noop: "Job nope0000 not found." });
   });
 
+  it("pet tools: an egg or a full pet is a no-op, a feed is its mood", async () => {
+    const path = join(mkdtempSync(join(ROOT, "pet-")), "pet.json");
+    const tools = buildPetTools(path);
+    expect(toolOutcome(I("pet_hatch"), textOf(await run(tools, "pet_hatch", { name: "Pinch", species: "crab" })))).toEqual({});
+    expect(toolOutcome(I("pet_feed"), textOf(await run(tools, "pet_feed", {})))).toEqual({ noop: "Pinch is still an egg. They do not need food yet." });
+    const store = new PetStore(path);
+    store.save({ ...store.load()!, stage: "baby", hunger: 95, sleeping: false, last_tick: new Date().toISOString() });
+    expect(toolOutcome(I("pet_feed"), textOf(await run(tools, "pet_feed", {})))).toMatchObject({ noop: expect.any(String) });
+    store.save({ ...store.load()!, hunger: 20 });
+    expect(toolOutcome(I("pet_feed"), textOf(await run(tools, "pet_feed", {})))).toEqual({ status: expect.any(String) });
+  });
+  it("list_sessions: its catalog is a plain success", () => {
+    expect(toolOutcome(I("list_sessions"), JSON.stringify({ owner: { name: "o" }, identities: [], groups: [] }, null, 2))).toEqual({});
+  });
   it("recall: no hits is a count of 0; a search that never ran is a no-op", () => {
     expect(toolOutcome(I("recall_conversation"), "No matching messages found (searched the last 30 days). Try other phrasings.")).toEqual({ count: 0 });
     expect(toolOutcome(I("recall_conversation"), "No messages searched: `before` (2025-01-01) is more than 30 days ago, and …")).toMatchObject({ noop: expect.any(String) });

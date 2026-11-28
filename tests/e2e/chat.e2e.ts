@@ -854,6 +854,33 @@ it("calls the agent by its IDENTITY.md name (re-read on edit); the product keeps
   rmSync(resolve(mockConfig.workspaceDir, "IDENTITY.md"), { force: true });
 });
 
+it("Tomo's own tools read as sentences; a long pane's copy button without a clipboard selects all of it", async () => {
+  const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
+  store.setSdkSessionId("dm:owner", "sdk-activity");
+  const t = Date.now() - 60_000;
+  store.append("dm:owner", { role: "user", channel: "web", content: "Start the cards task.", timestamp: t });
+  store.append("dm:owner", { role: "assistant", channel: "web", content: "Started.", timestamp: t + 5_000 });
+  const line = (type: string, ms: number, content: unknown[]) => JSON.stringify({ type, isSidechain: false, timestamp: new Date(ms).toISOString(), message: { role: type, content } }) + "\n";
+  const long = Array.from({ length: 60 }, (_, i) => `line ${i} of a long file`).join("\n");
+  mkdirSync(mockConfig.sdkSessionsDir, { recursive: true });
+  writeFileSync(resolve(mockConfig.sdkSessionsDir, "sdk-activity.jsonl"),
+    line("user", t + 100, [{ type: "text", text: "Start the cards task." }]) +
+    line("assistant", t + 1_000, [{ type: "tool_use", id: "a1", name: "mcp__tomo-internal__task_spawn", input: { title: "Cards", brief: "Build the cards" } }]) +
+    line("user", t + 1_100, [{ type: "tool_result", tool_use_id: "a1", content: "Started s12 (active). Its messages show as [s12 · Cards]." }]) +
+    line("assistant", t + 2_000, [{ type: "tool_use", id: "a2", name: "Read", input: { file_path: "/repo/long.txt" } }]) +
+    line("user", t + 2_100, [{ type: "tool_result", tool_use_id: "a2", content: long }]));
+  await page.reload();
+  const history = page.getByLabel("Conversation history");
+  const summary = history.getByRole("button", { name: "Worked with a task, read a file" });
+  await summary.click();
+  await browserExpect(history.getByRole("button", { name: /Started s12 · Cards/ })).toBeVisible();
+  expect(await history.textContent()).not.toContain("mcp__tomo-internal");
+  await history.getByRole("button", { name: /Read \/repo\/long\.txt/ }).click();
+  await page.evaluate(() => Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true }));
+  await history.getByRole("button", { name: "Copy Output" }).click();
+  await browserExpect.poll(() => page.evaluate(() => window.getSelection()?.toString() ?? "")).toContain("line 59 of a long file");
+});
+
 it("shows a turn's tool calls inline, folded, between the messages; INPUT/OUTPUT open on demand", async () => {
   const store = new SessionStore(mockConfig.sessionsDir, 20, mockConfig.sdkSessionsDir, { dbPath: mockConfig.dbPath });
   store.setSdkSessionId("dm:owner", "sdk-inline");

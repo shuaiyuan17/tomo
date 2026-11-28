@@ -256,8 +256,12 @@ export function toolOutcome(name: string, output: string): ToolOutcome | undefin
       return undefined;
     case "upsert_person":
       return ((m = /^(Created|Updated) person record:/.exec(text))) ? { status: m[1].toLowerCase() } : undefined;
+    case "list_sessions":
+      return json(text) ? {} : undefined;
     case "pet_status": case "pet_feed": case "pet_play": case "pet_sleep": case "pet_hatch": {
       const state = json(text);
+      // Fed while full: it ignored the food (the diary line says so).
+      if (state?.event === "too full") return { noop: clean(typeof state.diary === "string" ? state.diary : "too full", ACTIVITY_LINE_LIMIT).text };
       if (state) {
         const mood = typeof state.mood === "string" ? state.mood : undefined;
         return mood ? { status: clean(mood, 40).text } : {};

@@ -2,8 +2,8 @@ import { extractAttachments } from "./text-utils.js";
 import { landsInPrivate, globReachesPrivate, grepReachesPrivate, bashTouchesMemory } from "./private-memory-reach.js";
 import { expandTilde } from "./bash-write-targets.js";
 import { readdirSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, sep } from "node:path";
-import { abs, foldPath, hasTraversalSegment, isInside, realResolve } from "./permission-paths.js";
+import { dirname, isAbsolute, join, sep } from "node:path";
+import { abs, foldPath, hasTraversalSegment, isInside, realDir, realResolve } from "./permission-paths.js";
 
 /*
  * The #464 private-memory predicate for one tool call, in a module free of
@@ -228,22 +228,34 @@ function namedPaths(toolName: string, toolInput: unknown): string[] {
   return typeof p === "string" ? [p] : [];
 }
 
-/** Lexically under `memory/groups/<g>/` (or directly in groups/) for a `g` other than the turn's own. */
+/**
+ * Under `memory/groups/<g>/` (or directly in groups/) for a `g` that is not
+ * the turn's own folder spelled exactly: on a case-sensitive disk a case
+ * variant is another folder. Judged as spelled and as the kernel would
+ * resolve it (a link to groups/ itself, the folder named not existing yet).
+ */
 function spelledInOtherGroup(p: string, ctx: { cwd: string; memoryDir: string; ownGroupDir?: string }): boolean {
-  const lexical = abs(expandTilde(p), ctx.cwd);
-  const groups = join(ctx.memoryDir, "groups");
-  if (!isInside(lexical, groups) || foldPath(lexical) === foldPath(groups)) return false;
-  const parts = relative(foldPath(groups), foldPath(lexical)).split(sep);
-  const own = ctx.ownGroupDir === undefined ? undefined : foldPath(ctx.ownGroupDir.split("/")[1] ?? "");
-  return parts.length === 1 || parts[0] !== own;
+  const own = ctx.ownGroupDir?.split("/")[1];
+  const expanded = expandTilde(p);
+  const groupsDirs = [join(ctx.memoryDir, "groups"), realDir(join(ctx.memoryDir, "groups"), ctx.cwd, true)]
+    .filter((d): d is string => d !== null);
+  const paths = [abs(expanded, ctx.cwd), realResolve(expanded, ctx.cwd, true)];
+  // An unresolvable path (a link loop) is refused, as everywhere else in the guard.
+  if (paths[1] === null) return true;
+  return paths.some((path) => groupsDirs.some((groups) => {
+    if (!isInside(path!, groups) || foldPath(path!) === foldPath(groups)) return false;
+    const segments = path!.split(sep);
+    const depth = groups.split(sep).length;
+    return segments.length === depth + 1 || segments[depth] !== own;
+  }));
 }
 
 export function otherGroupMemoryDirs(memoryDir: string, ownDir: string | undefined): string[] {
   const groupsDir = join(memoryDir, "groups");
   let names: string[];
   try { names = readdirSync(groupsDir); } catch { return []; }
-  const own = ownDir === undefined ? undefined : foldPath(ownDir.split("/")[1] ?? "");
-  return names.filter((name) => foldPath(name) !== own).map((name) => join(groupsDir, name));
+  const own = ownDir?.split("/")[1];
+  return names.filter((name) => name !== own).map((name) => join(groupsDir, name));
 }
 
 /**

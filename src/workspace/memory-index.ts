@@ -55,16 +55,18 @@ export function groupMemoryDir(groupKey: string): string {
  * and for groups/ itself. `folder`: `rel` names a folder, not a file.
  */
 function groupFolderOf(rel: string, folder: boolean): string | undefined {
-  const f = folded(rel);
-  if (f[0] !== GROUPS_MEMORY_SUBDIR || f.length < 2) return undefined;
-  if (f.length === 2 && !folder) return "";
-  return f[1];
+  const parts = rel.split("/");
+  if (folded(rel)[0] !== GROUPS_MEMORY_SUBDIR || parts.length < 2) return undefined;
+  if (parts.length === 2 && !folder) return "";
+  return parts[1];
 }
 
 /**
  * On a turn a group steers: is `rel` in some group's folder other than
  * `ownDir` (from {@link groupMemoryDir}; undefined when the turn has no single
- * group, so every group's folder is someone else's)? A file directly under
+ * group, so every group's folder is someone else's)? groups/ is recognised
+ * in any case, the turn's own folder only as spelled: on a case-sensitive
+ * disk a case variant of it is another folder. A file directly under
  * groups/ is no group's, so it counts as another's too. groups/ itself does
  * not: listing it shows the turn's own folder.
  */

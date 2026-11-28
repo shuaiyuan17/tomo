@@ -72,7 +72,9 @@ describe("the group folder name", () => {
 
   it("tells another group's folder from the turn's own, case-folded", () => {
     expect(isOtherGroupMemoryPath(`${OTHER}/x.md`, OWN)).toBe(true);
-    expect(isOtherGroupMemoryPath(`${OWN.toUpperCase()}/x.md`, OWN)).toBe(false);
+    // groups/ in any case; the turn's own folder only as spelled (a case variant is another folder on a case-sensitive disk).
+    expect(isOtherGroupMemoryPath(`GROUPS/${OWN.split("/")[1]}/x.md`, OWN)).toBe(false);
+    expect(isOtherGroupMemoryPath(`${OWN.toUpperCase()}/x.md`, OWN)).toBe(true);
     expect(isOtherGroupMemoryPath("groups/stray.md", OWN)).toBe(true);
     expect(isOtherGroupMemoryPath("groups", OWN, true)).toBe(false);
     expect(isOtherGroupMemoryPath(`${OWN}/x.md`, undefined)).toBe(true);
@@ -118,7 +120,7 @@ describe("memory tools on a group's turn", () => {
   it("writes its folder only as spelled: a case variant is another folder on a case-sensitive disk", async () => {
     const r = await tools(GROUP)("memory_write", { path: `${OWN.toUpperCase()}/x.md`, content: topic("X."), if_version: "new" });
     expect(r.error).toBe(true);
-    expect(r.text).toContain(groupWriteRefusal(OWN));
+    expect(r.text).toContain(OTHER_GROUP_REFUSAL);
   });
 
   it("judges a read by where the file really is: a folder that leads into another group's is refused after opening", () => {
@@ -200,6 +202,14 @@ describe("file tools on a group's turn", () => {
     expect(await denied(h, "Write", { file_path: join(tree.mem, "groups", "telegram_-100999", "new.txt"), content: "x" })).toBe(true);
     expect(await denied(h, "Write", { file_path: join(tree.mem, "groups", "stray.txt"), content: "x" })).toBe(true);
     expect(await denied(h, "Write", { file_path: join(tree.mem, OWN, "new.txt"), content: "x" })).toBe(false);
+    // Through a link to groups/ itself, into a folder that doesn't exist yet.
+    symlinkSync(join(tree.mem, "groups"), join(tree.ws, "group-alias"));
+    try {
+      expect(await denied(h, "Write", { file_path: join(tree.ws, "group-alias", "telegram_-100999", "new.txt"), content: "x" })).toBe(true);
+      expect(await denied(h, "Write", { file_path: join(tree.ws, "group-alias", OWN.split("/")[1], "new.txt"), content: "x" })).toBe(false);
+    } finally { rmSync(join(tree.ws, "group-alias")); }
+    // A case variant of its own folder is not its own.
+    expect(await denied(h, "Write", { file_path: join(tree.mem, OWN.toUpperCase(), "new.txt"), content: "x" })).toBe(true);
     // An attachment is a read the channel makes.
     expect(await denied(h, SEND_MESSAGE_TOOL, { message: `here\nMEDIA:${join(tree.mem, OTHER, "secrets.md")}` })).toBe(true);
     // With groups/ gone (or unreadable), a named path is still judged.

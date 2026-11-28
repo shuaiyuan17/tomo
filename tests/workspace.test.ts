@@ -99,7 +99,7 @@ describe("buildSystemPrompt", () => {
     // Stage 3, group version: everyone here is from:group; corrections and forgetting stay in the chat's folder.
     expect(group).toContain("Record what anyone here says as `from:group`, the owner included.");
     expect(group).toContain("When someone corrects a line in this chat's memory folder, change it there.");
-    expect(group).toContain("When someone asks you to forget something, remove it from this chat's memory folder and say what you removed.");
+    expect(group).toContain("When someone asks you to forget something, remove it from this chat's memory folder and say what you removed, and that the conversation history still holds the original words, and the memory tools keep what they replace or delete for 30 days");
     // Checking: a group can fix only its own folder.
     expect(group).toContain("out of date: say so; here you can change only lines in this chat's memory folder");
     expect(group).not.toContain("out of date: fix it.");
@@ -109,14 +109,18 @@ describe("buildSystemPrompt", () => {
 
   it("the shared variant keeps the owner's provenance and corrections, and says members' words are from:group", () => {
     const shared = buildSystemPrompt({ shared: true });
-    expect(shared).toContain("On a group member's turn you can write only in the folder that turn's reminder names, and what members say is `from:group`.");
+    expect(shared).toContain("On a group member's turn you can write only in the folder that turn's reminder names, and what members say is `from:group`");
     expect(shared).toContain("## Provenance");
     expect(shared).toContain("## Corrections");
     expect(shared).not.toContain("Be proactive");
     // No Don't keep list in this prompt: it says so, and doesn't send a group's turn to write private/MEMORY.md.
     expect(shared).toContain("read that list with memory_read before you save anything personal");
     expect(shared).toContain("ask the owner to repeat it in private");
-    expect(shared).toContain("On the owner's own turn, read that list with memory_read before you save anything personal, and when they ask you to forget something, handle it as in private");
+    expect(shared).toContain("On the owner's own turn, read that list with memory_read before you save anything personal, and save nothing on a subject listed there");
+    expect(shared).toContain("add its subject in a few neutral words under `## Don't keep` at the top of private/MEMORY.md");
+    expect(shared).toContain("Either way, say that the conversation history still holds the original words, and the memory tools keep what they replace or delete for 30 days");
+    // One audience rule scopes every change/fix instruction on a group member's turn.
+    expect(shared).toContain("where the sections below say to change or fix a line, on such a turn that holds only inside that folder");
     expect(shared).not.toContain("add its subject in a few neutral words under `## Don't keep` in private/MEMORY.md");
     expect(shared).toContain("out of date: fix it.");
   });

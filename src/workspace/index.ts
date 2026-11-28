@@ -128,7 +128,7 @@ function load(name: string): string {
  * takes the place of the Layout lines about private/ and private/MEMORY.md:
  * what it speaks of is what that variant leaves out.
  */
-export const SHARED_PRIVATE_MEMORY_NOTE = `- A group chat is part of this conversation now, so private/MEMORY.md, the files under private/ and private people records are not loaded. Don't bring private memory into this conversation while the group is here. On a group member's turn you can write only in the folder that turn's reminder names, and what members say is \`from:group\`.`;
+export const SHARED_PRIVATE_MEMORY_NOTE = `- A group chat is part of this conversation now, so private/MEMORY.md, the files under private/ and private people records are not loaded. Don't bring private memory into this conversation while the group is here. On a group member's turn you can write only in the folder that turn's reminder names, and what members say is \`from:group\`: where the sections below say to change or fix a line, on such a turn that holds only inside that folder; anywhere else, say what is out of date, for the owner to fix in private.`;
 
 /** The Layout lines a group session reads in place of the DM's. */
 const GROUP_LAYOUT = `- **MEMORY.md** is loaded into every conversation. Only the owner, in private, can change it.
@@ -207,12 +207,14 @@ The leading date is when it was said or confirmed; put an event's own date in th
 
 A correction should spare the owner from correcting you again. Change the line where it lives, with the new date. Find other copies with memory_search and follow the change through, within the owner's instructions: people records, open todos and scheduled jobs that relied on the old value. When a value has been wrong more than once, the line can say what it is not: "the 14th (not the 15th)". In a dated note, add a line that names what it corrects. Own the earlier error in one sentence. The \`tomo-memory-corrections\` skill has the details.`;
 
+  // Who keeps what after a removal: said in every variant's forgetting paragraph.
+  const retained = `the conversation history still holds the original words, and the memory tools keep what they replace or delete for ${MEMORY_HISTORY_DAYS} days in Tomo's own data`;
   const forgetting = isGroup
-    ? `When someone asks you to forget something, remove it from this chat's memory folder and say what you removed.`
+    ? `When someone asks you to forget something, remove it from this chat's memory folder and say what you removed, and that ${retained}.`
     : shared
-      // The shared variant has no private core in its prompt, so no Don't keep list to check against.
-      ? `private/MEMORY.md is not loaded now, and with it its \`## Don't keep\` list of subjects the owner asked you to forget. On the owner's own turn, read that list with memory_read before you save anything personal, and when they ask you to forget something, handle it as in private: remove it and add its subject to that list. On a group member's turn, save nothing personal about the owner, and when asked to forget something, remove what you can reach, say what you removed, and ask the owner to repeat it in private so the subject goes on that list.`
-      : `When the owner asks you to forget something, remove it, add its subject in a few neutral words under \`## Don't keep\` in private/MEMORY.md (that section goes at the top of the file: add it there if it is missing), and say exactly what you removed: the conversation history still holds the original words, and the memory tools keep what they replace or delete for ${MEMORY_HISTORY_DAYS} days in Tomo's own data. Don't save anything on a subject listed there.`;
+      // The shared variant has no private core in its prompt, so no Don't keep list to check against: it says so, whole.
+      ? `private/MEMORY.md is not loaded now, and with it its \`## Don't keep\` list of subjects the owner asked you to forget. On the owner's own turn, read that list with memory_read before you save anything personal, and save nothing on a subject listed there; when they ask you to forget something, remove it, add its subject in a few neutral words under \`## Don't keep\` at the top of private/MEMORY.md, and say exactly what you removed. On a group member's turn, save nothing personal about the owner; when asked to forget something, remove what you can reach, say what you removed, and ask the owner to repeat it in private so the subject goes on that list. Either way, say that ${retained}.`
+      : `When the owner asks you to forget something, remove it, add its subject in a few neutral words under \`## Don't keep\` in private/MEMORY.md (that section goes at the top of the file: add it there if it is missing), and say exactly what you removed: ${retained}. Don't save anything on a subject listed there.`;
 
   const instructions = `
 # MEMORY — Your Persistent Memory

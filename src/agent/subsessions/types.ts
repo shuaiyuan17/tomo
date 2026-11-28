@@ -1,6 +1,6 @@
 /**
  * Sub-sessions: one long task per `task:<id>` session. The task table
- * (`data/subsessions.json`, ./store.ts) is the one source of truth for a
+ * (rows in tomo.db, ./store.ts) is the one source of truth for a
  * task's lifecycle; the registry, the SDK session file, pending notes and
  * cron jobs follow it (see ./service.ts for the reconcile rules).
  *

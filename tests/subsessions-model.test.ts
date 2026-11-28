@@ -23,11 +23,14 @@ import { SubsessionStore, type TransitionOptions, type TransitionOutcome } from 
 import { nextStatus, type SubsessionEvent } from "../src/agent/subsessions/state-machine.js";
 import { TERMINAL_STATUSES, activeTotalMs, type SubsessionRecord } from "../src/agent/subsessions/types.js";
 import type { CreateTaskInput } from "../src/agent/subsessions/store.js";
+import { relaxDurabilityForTests } from "../src/db/index.js";
 
-// The table is fsynced on every write (four fsyncs with its backup), which is
+// The table is fsynced on every write, which is
 // most of this file's run time and tests nothing here: a crash is modelled by
 // the store going dead, not by the disk losing a write.
 vi.mock("node:fs", async (importOriginal) => ({ ...(await importOriginal<typeof import("node:fs")>()), fsyncSync: () => {} }));
+// The table is rows in tomo.db now: the same for the database's own syncs.
+relaxDurabilityForTests();
 
 const SEED = Number(process.env.FC_SEED ?? 20261127);
 const RUNS = Number(process.env.FC_RUNS ?? 100);

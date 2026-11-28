@@ -615,6 +615,7 @@ export class Agent {
     const cron = createTaskCronLink(config.dbPath);
     return new SubsessionService({
       store: new SubsessionStore(join(config.tomoHome, "data", "subsessions.json"), {
+        dbPath: config.dbPath,
         onChange: () => { for (const listener of this.subsessionListeners) listener(); },
       }),
       config: () => config.subsessions,

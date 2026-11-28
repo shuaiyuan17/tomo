@@ -70,7 +70,7 @@ describe("opening the database", () => {
     const path = join(freshDir(), "nested", "deeper", "tomo.db");
     const db = openTomoDb(path);
     expect(db.schemaVersion()).toBe(TOMO_DB_MIGRATIONS.at(-1)!.version);
-    expect(db.all("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").map((r) => r.name)).toEqual(["cron_jobs", "meta", "pending_notes"]);
+    expect(db.all("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").map((r) => r.name)).toEqual(["cron_jobs", "meta", "pending_notes", "subsessions", "subsessions_state"]);
     db.close();
   });
 });

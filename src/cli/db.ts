@@ -10,6 +10,7 @@ import { defaultRuntimePaths } from "../runtime-paths.js";
 import { acquireMaintenanceLock, maintenanceLockBusyMessage, maintenanceLockPath, type MaintenanceLock } from "../db/lock.js";
 import { exportCronJobsToFile, legacyCronFileReplaceable, legacyCronJobsPath } from "../cron/store.js";
 import { LEGACY_PENDING_NOTES_FILENAME, exportPendingNotesToFile } from "../sessions/pending-notes-store.js";
+import { exportSubsessionsToFile, legacySubsessionsFileReplaceable, legacySubsessionsPath } from "../agent/subsessions/store.js";
 import { isRecordedProcessLive, readPidFileRecord } from "./pidfile.js";
 
 /**
@@ -121,6 +122,8 @@ dbCommand
       // rule as `tomo todo` and `tomo cron`): a group's shell must not read the owner's.
       const caller = process.env[TOMO_SESSION_KEY_ENV]?.trim() || undefined;
       if (table === "pending_notes") rows = rows.filter((r) => canManageJob({ sessionKey: String(r.session_key) }, caller));
+      // And sub-session tasks: a session sees only the tasks it owns.
+      if (table === "subsessions") rows = rows.filter((r) => canManageJob({ sessionKey: (typeof r.parent_key === "string" ? r.parent_key : undefined) as string }, caller));
       // Same for cron jobs (`tomo cron list` shows a session only its own).
       if (table === "cron_jobs") rows = rows.filter((r) => canManageJob({ sessionKey: (typeof r.session_key === "string" ? r.session_key : undefined) as string }, caller));
       if (opts.json) {
@@ -156,6 +159,20 @@ const EXPORTS: Record<string, {
     rollbackNotes: [
       "If you start this version again instead, it imports the file (it replaces the table). Do not delete the file:",
       "this version then takes it that an older Tomo delivered every note, and empties the table.",
+    ],
+  },
+  subsessions: {
+    file: () => legacySubsessionsPath(config.dbPath),
+    // While a real table file is there every sub-session call refuses, and
+    // this version's daemon imports it at its next start, over the rows (the
+    // older Tomo continued from the export).
+    write: (db, out, mark) => exportSubsessionsToFile(db, out, { mark }),
+    noun: "task(s)",
+    marks: true,
+    replaceable: legacySubsessionsFileReplaceable,
+    rollbackNotes: [
+      "If you start this version again instead, it imports the file (it replaces the tasks in the database), so changes the older Tomo made are kept.",
+      "Export pending notes and cron jobs too (`tomo db export pending-notes`, `tomo db export cron`).",
     ],
   },
   cron: {

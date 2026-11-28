@@ -51,6 +51,35 @@ export const TOMO_DB_MIGRATIONS: readonly Migration[] = [
       `);
     },
   },
+  {
+    version: 3,
+    up(db) {
+      db.exec(`
+        -- Sub-session tasks (src/agent/subsessions/store.ts), one row per task,
+        -- in creation order (seq). The record is the JSON one task had in the
+        -- old data/subsessions.json; the columns after it are read-only
+        -- mirrors for tomo db dump and sqlite3.
+        CREATE TABLE subsessions (
+          seq INTEGER PRIMARY KEY,
+          id TEXT NOT NULL UNIQUE,
+          record TEXT NOT NULL CHECK (json_valid(record) AND json_extract(record, '$.id') = id),
+          session_key ANY GENERATED ALWAYS AS (json_extract(record, '$.sessionKey')) VIRTUAL,
+          parent_key ANY GENERATED ALWAYS AS (json_extract(record, '$.parentKey')) VIRTUAL,
+          title ANY GENERATED ALWAYS AS (json_extract(record, '$.title')) VIRTUAL,
+          status ANY GENERATED ALWAYS AS (json_extract(record, '$.status')) VIRTUAL
+        ) STRICT;
+
+        -- The table-wide fields of the old file: one row, present once the
+        -- table was written (or imported) at least once. No row: a table never
+        -- written, which the service tells apart from an empty one ("missing").
+        CREATE TABLE subsessions_state (
+          one INTEGER PRIMARY KEY CHECK (one = 1),
+          next_id INTEGER NOT NULL CHECK (next_id >= 1),
+          untrusted TEXT CHECK (untrusted IS NULL OR json_valid(untrusted))
+        ) STRICT;
+      `);
+    },
+  },
 ];
 
 /** Tables `tomo db dump` may print, with the column order rows are sorted by. */
@@ -58,4 +87,6 @@ export const DUMPABLE_TABLES: Readonly<Record<string, string>> = {
   meta: "key",
   pending_notes: "session_key, position",
   cron_jobs: "seq",
+  subsessions: "seq",
+  subsessions_state: "one",
 };

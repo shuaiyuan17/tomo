@@ -1,4 +1,5 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import { readTableFile, writeTableFile } from "./helpers/subsession-table.js";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -922,9 +923,9 @@ describe("via-main: nothing lost, nothing twice", () => {
     const legacy = (words: string) => {
       h.store.update(t.id, (r) => appendInput(r, `<tomo-event type="subsession-relay" name="relay">${words}</tomo-event>`, { from: "owner", words }));
       const file = join(dir, "subsessions.json");
-      const table = JSON.parse(readFileSync(file, "utf8"));
+      const table = readTableFile(file);
       for (const input of table.tasks[0].pendingInput) if (input.words === words) delete input.checked;
-      writeFileSync(file, JSON.stringify(table));
+      writeTableFile(file, table);
     };
     legacy("legacy note");
     releases.shift()!();

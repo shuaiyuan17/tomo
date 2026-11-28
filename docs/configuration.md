@@ -288,7 +288,7 @@ You can also talk to a task yourself, from your own DM (Telegram or iMessage):
 
 Only an exact `stop`, `start`, `done` or `model <name>` is a command; `/s s3 stop the deploy` is a message.
 
-State lives in `~/.tomo/data/subsessions.json` (fsynced, with a `.bak`). If it cannot be read at start, sub-sessions stay off until it is repaired and nothing is unlinked or cancelled. What the service keeps true about a task's state, and which test checks each rule, is in [subsessions-invariants.md](subsessions-invariants.md).
+State lives in Tomo's database (`~/.tomo/data/tomo.db`, tables `subsessions` and `subsessions_state`; `tomo db dump subsessions` prints it). An older `subsessions.json` is imported once, kept aside as `subsessions.json.migrated-<ts>`, and replaced with a placeholder; `tomo db export subsessions` writes it back for a rollback. If it cannot be read at start, sub-sessions stay off until it is repaired and nothing is unlinked or cancelled. What the service keeps true about a task's state, and which test checks each rule, is in [subsessions-invariants.md](subsessions-invariants.md).
 
 ## Context management (LCM)
 
@@ -365,7 +365,7 @@ If LiteLLM returns `System messages are not allowed`, use a LiteLLM build that i
     sessions/                 # Transcript logs and session registry
     inbox.jsonl               # Durable inbox
     running-agents.json       # Subagents running right now (for crash recovery)
-    subsessions.json          # Sub-session task table (+ .bak)
+    subsessions.json          # Placeholder: the sub-session tasks are in tomo.db (imported once; the old file kept as .migrated-<ts>)
     permissions/              # Group permission request log
     pet.json                  # Virtual pet state
     summons.json              # Active group summons

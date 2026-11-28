@@ -267,6 +267,20 @@ describe("to-do cards", () => {
     expect(shown.match(/data-todo-line=/g)).toHaveLength(3);
     expect(shown).toContain("1 more");
   });
+  it("a merged call without a result is counted and marked, not shown as done", () => {
+    const items = [...call(add, { outcome: { id: "t-41" } }), ...call(done)];
+    const shown = cardOf(items);
+    expect(shown).toContain("To-dos · added 1 and 1 without a result");
+    expect(shown).toMatch(/data-todo-line="done" data-state="unknown"/);
+    expect(shown).toContain("may or may not have happened");
+  });
+  it("each line tells a screen reader what was done to it", () => {
+    const items = [...call(done, { outcome: { id: "t-40" } }), ...call(snooze, { outcome: { id: "t-39" } }), ...call(add, { isError: true, reason: "x" })];
+    const shown = cardOf(items);
+    expect(shown).toContain('<span class="sr-only">Closed: </span>');
+    expect(shown).toContain('<span class="sr-only">Snoozed: </span>');
+    expect(shown).toContain('<span class="sr-only">Added (failed): </span>');
+  });
   it("a line between them keeps them apart", () => {
     const items = [...call(add, { outcome: { id: "t-41" } }), ...call({ kind: "task_status", id: "s1" }, { outcome: {} }), ...call(done, { outcome: { id: "t-40" } })];
     expect(groupRows(viewRows(items)).map((b) => b.kind)).toEqual(["card", "tool", "card"]);
@@ -287,11 +301,14 @@ describe("schedule card", () => {
   it("recurring: the schedule in words, the next run, and where it delivers", () => {
     const env: ActivityEnv = { sessions: [{ id: "w-club", title: "Book club" } as ActivityEnv["sessions"][number]] };
     const shown = card(row(call({ ...create, schedule: "30 8 * * *", once: undefined, session: "telegram:-2", sessionId: "w-club" } as ToolActivity,
-      { outcome: { id: "ab12", lifecycle: "recurring", scheduleLabel: "30 8 * * *", nextRunAt: Date.parse("2026-11-16T16:30:00Z") } })), { env });
+      { outcome: { id: "ab12", lifecycle: "recurring", cron: "30 8 * * *", nextRunAt: Date.parse("2026-11-16T16:30:00Z") } })), { env });
     expect(shown).toContain("Scheduled a task · recurring");
     expect(shown).toContain("30 8 * * *");
     expect(shown).toContain("Next: ");
     expect(shown).toContain("To Book club");
+  });
+  it("an interval is worded in the reader's language", () => {
+    expect(card(row(call({ ...create, once: undefined } as ToolActivity, { outcome: { id: "ab", lifecycle: "recurring", everyMs: 7_200_000 } })))).toContain("every 2 hours");
   });
   it("running and failed", () => {
     expect(card(row(call(create)), { running: true })).toContain("Scheduling a task");

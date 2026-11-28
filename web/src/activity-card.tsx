@@ -1,5 +1,5 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { ArrowRightIcon, BracesIcon, CheckIcon, CircleCheckIcon, ClockIcon, FileIcon, PlusIcon, Trash2Icon, UserRoundIcon } from "lucide-react";
+import { ArrowRightIcon, BracesIcon, CheckIcon, CircleCheckIcon, CircleHelpIcon, ClockIcon, FileIcon, PlusIcon, Trash2Icon, UserRoundIcon } from "lucide-react";
 import type { ToolActivity, ToolOutcome, WebSubsession } from "../../src/web/protocol.js";
 import { cn } from "@/lib/utils";
 import { ToolSection } from "@/components/ai/tool";
@@ -12,7 +12,7 @@ import { useActivityEnv, useSubsessionById } from "./activity-env.js";
 import { asksOwner, isOpenSubsession, isWorkingState, subsessionState, subsessionStateLabel } from "./subsessions.js";
 import { callDuration, elapsedSince, type ToolRow } from "./subagent.js";
 import { useNow } from "./use-now.js";
-import { formatLocale, Trans, useTranslation } from "./i18n/index.js";
+import { formatLocale, i18n, Trans, useTranslation } from "./i18n/index.js";
 import { cronJobHash } from "./study-data.js";
 import { formatList } from "./i18n/format.js";
 
@@ -54,7 +54,10 @@ const RESOLVED = {
   snooze: { head: "card.todoSnooze", icon: ClockIcon, part: "snoozed" }, handoff: { head: "card.todoHandoff", icon: UserRoundIcon, part: "handed" },
 } as const;
 const PARTS = { added: "card.todoParts.added", closed: "card.todoParts.closed", dropped: "card.todoParts.dropped", snoozed: "card.todoParts.snoozed",
-  handed: "card.todoParts.handed", failed: "card.todoParts.failed" } as const;
+  handed: "card.todoParts.handed", failed: "card.todoParts.failed", unknown: "card.todoParts.unknown" } as const;
+/** Said before a to-do line to a screen reader: what was done to it (the icon and strike-through say it on screen). */
+const LINE_ACTION = { add: "card.lineAction.add", done: "card.lineAction.done", drop: "card.lineAction.drop", snooze: "card.lineAction.snooze",
+  handoff: "card.lineAction.handoff" } as const;
 const WAITING = { me: "card.todoWaiting.me", owner: "card.todoWaiting.owner", external: "card.todoWaiting.external" } as const;
 const ACCESS = { read: "card.access.read", write: "card.access.write" } as const;
 /** A card of several calls: running while any runs, failed when all failed, unknown when none finished, else done. */
@@ -281,13 +284,13 @@ const Chip = ({ children }: { children: ReactNode }) => <span className="inline-
 
 type TodoRow = ToolRow & { activity: Extract<ToolActivity, { kind: "todo_add" | "todo_resolve" }> };
 /** One to-do call as a line of the card: what it did to which to-do, and the small print under it. */
-function TodoLine({ row, state }: { row: TodoRow; state: CardState }) {
+function TodoLine({ row, state, alone }: { row: TodoRow; state: CardState; alone: boolean }) {
   const { t } = useTranslation("activity");
   const activity = row.activity;
   const outcome: ToolOutcome = row.result?.outcome ?? {};
   const add = activity.kind === "todo_add";
   const resolved = activity.kind === "todo_resolve" ? RESOLVED[activity.action] : undefined;
-  const Icon = state === "running" ? RunningMark : add ? PlusIcon : resolved!.icon;
+  const Icon = state === "running" ? RunningMark : state === "unknown" ? CircleHelpIcon : add ? PlusIcon : resolved!.icon;
   const id = outcome.id ?? (activity.kind === "todo_resolve" ? activity.id : undefined);
   const title = add ? activity.title : outcome.title;
   const struck = state === "done" && (activity.kind === "todo_resolve" && (activity.action === "done" || activity.action === "drop"));
@@ -313,11 +316,13 @@ function TodoLine({ row, state }: { row: TodoRow; state: CardState }) {
     <span aria-hidden="true" className={cn("mt-[3px] grid size-3.5 shrink-0 place-items-center [&_svg]:size-3.5", state === "error" ? "text-destructive" : "text-muted-foreground")}><Icon /></span>
     <div className="min-w-0 flex-1">
       <p className={cn("m-0 text-[13px] leading-snug [overflow-wrap:anywhere]", state === "error" ? "text-destructive" : "text-foreground", state === "running" && "shimmer")}>
+        <span className="sr-only">{t(LINE_ACTION[add ? "add" : activity.kind === "todo_resolve" ? activity.action : "add"])}{state === "error" ? ` (${t("card.lineFailed")})` : ""}: </span>
         {id && <IdPill id={id} className="mr-1.5 align-[1px]" />}
         <span className={cn(struck && "line-through decoration-muted-foreground/50")}>{title}</span></p>
       {state === "error" && row.result?.reason && <p className="m-0 mt-0.5 text-[12px] text-destructive [overflow-wrap:anywhere]">
         {t(add ? "card.todoNotAdded" : "card.todoNotUpdated", { reason: row.result.reason })}</p>}
       {small.length > 0 && <p className="m-0 mt-0.5 text-[12px] text-muted-foreground [overflow-wrap:anywhere]">{small.join(" · ")}</p>}
+      {state === "unknown" && !alone && <p className="m-0 mt-0.5 text-[12px] text-muted-foreground">{t("card.unknown")}</p>}
     </div>
   </li>;
 }
@@ -338,7 +343,8 @@ function TodoCard({ rows, running, raw }: { rows: TodoRow[]; running: boolean; r
   } else if (state === "done") {
     const counts: Partial<Record<keyof typeof PARTS, number>> = {};
     rows.forEach((row, i) => {
-      const part = states[i] === "error" ? "failed" : states[i] !== "done" ? undefined : row.activity.kind === "todo_add" ? "added" : RESOLVED[row.activity.action].part;
+      const part = states[i] === "error" ? "failed" : states[i] === "unknown" ? "unknown" : states[i] !== "done" ? undefined
+        : row.activity.kind === "todo_add" ? "added" : RESOLVED[row.activity.action].part;
       if (part) counts[part] = (counts[part] ?? 0) + 1;
     });
     const parts = (Object.keys(PARTS) as (keyof typeof PARTS)[]).flatMap((part) => counts[part] ? [t(PARTS[part], { count: counts[part] })] : []);
@@ -346,13 +352,20 @@ function TodoCard({ rows, running, raw }: { rows: TodoRow[]; running: boolean; r
   } else head = { k: HEADS.todos[state] };
   const shown = all ? rows : rows.slice(0, TODO_LINES);
   return <Card rows={rows} state={state} head={head} {...raw}>
-    <ul className="m-0 mt-1.5 list-none space-y-1 p-0">{shown.map((row) => <TodoLine key={row.id} row={row} state={stateOf(row, running)} />)}</ul>
+    <ul className="m-0 mt-1.5 list-none space-y-1 p-0">{shown.map((row) => <TodoLine key={row.id} row={row} state={stateOf(row, running)} alone={rows.length === 1} />)}</ul>
     {rows.length > TODO_LINES && <button type="button" onClick={() => setAll((v) => !v)} aria-expanded={all}
       className="mt-1 rounded px-1 text-[11.5px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline">
       {all ? t("card.showLess") : t("card.moreLines", { count: rows.length - TODO_LINES })}</button>}
   </Card>;
 }
 
+const MINUTE_MS = 60_000;
+/** An interval in the largest whole unit: "every 2 hours", "every day", "every 90 minutes". */
+function every(ms: number): string {
+  if (ms % (1440 * MINUTE_MS) === 0) return i18n.t("activity:card.everyDays", { count: ms / (1440 * MINUTE_MS) });
+  if (ms % (60 * MINUTE_MS) === 0) return i18n.t("activity:card.everyHours", { count: ms / (60 * MINUTE_MS) });
+  return i18n.t("activity:card.everyMinutes", { count: Math.max(1, Math.round(ms / MINUTE_MS)) });
+}
 /** A time the page names in the reader's own zone and language: "Nov 15, 8:30 AM". */
 const when = (at: number) => new Intl.DateTimeFormat(formatLocale(), { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }).format(at);
 
@@ -364,7 +377,9 @@ function ScheduleCard({ row, state, raw }: CardProps & { row: ToolRow & { activi
   const once = outcome?.lifecycle ? outcome.lifecycle === "once" : !!activity.once;
   const head = { k: (once ? HEADS.scheduleOnce : HEADS.scheduleRecurring)[state], values: { name: activity.name } };
   const target = activity.session ? env.sessions.find((s) => s.id === activity.sessionId)?.title || activity.session : undefined;
-  const badge = once ? (outcome?.nextRunAt ? when(outcome.nextRunAt) : undefined) : outcome?.scheduleLabel ?? activity.schedule;
+  const badge = once ? (outcome?.nextRunAt ? when(outcome.nextRunAt) : undefined)
+    : outcome?.everyMs ? every(outcome.everyMs) : outcome?.cron ? `${outcome.cron}${outcome.tz ? ` (${outcome.tz})` : ""}` : activity.schedule;
+  const mono = !once && !outcome?.everyMs;
   const footer = outcome?.id ? <>
     <span className="font-mono text-[11.5px]">{outcome.id}</span>
     {target && <Chip>{t("card.toSession", { name: target })}</Chip>}
@@ -374,7 +389,7 @@ function ScheduleCard({ row, state, raw }: CardProps & { row: ToolRow & { activi
   </> : undefined;
   return <Card rows={[row]} state={state} head={head} {...raw} footer={footer}>
     <p className="m-0 mt-1.5 text-[13.5px] leading-snug font-medium text-foreground [overflow-wrap:anywhere]">{activity.name}
-      {badge && state !== "error" && <span className={cn("ml-1.5 inline-block rounded-md border px-1.5 align-[1px] text-[11px] font-normal text-muted-foreground", !once && "font-mono")}>{badge}</span>}</p>
+      {badge && state !== "error" && <span className={cn("ml-1.5 inline-block rounded-md border px-1.5 align-[1px] text-[11px] font-normal text-muted-foreground", mono && "font-mono")}>{badge}</span>}</p>
     {state === "error" ? <Reason row={row} /> : <Quote text={activity.message} lines={2} plain truncated={activity.messageTruncated} />}
   </Card>;
 }

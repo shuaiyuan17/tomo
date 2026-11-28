@@ -3,8 +3,6 @@ import { redactText } from "./redact-command.js";
 import type { ToolActivity, ToolOutcome } from "./protocol.js";
 import { webSessionId } from "./owner.js";
 import { extractAttachments } from "../agent/text-utils.js";
-import { formatSchedule } from "../cron/format.js";
-import type { CronSchedule } from "../cron/types.js";
 
 /**
  * Tomo's own tools (the in-process `tomo-internal` MCP server) as the web UI
@@ -190,6 +188,9 @@ export function failureReason(name: string, output: string): string | undefined 
   const tool = internalToolName(name);
   if (!tool) return undefined;
   const text = output.trim().replace(new RegExp(`^${tool}(?: failed)?: `), "");
+  // A refusal some tools return as JSON (request_permission: {status: "denied", reason}): its reason.
+  const reason = json(text)?.reason;
+  if (typeof reason === "string" && reason.trim()) return clean(reason.trim().split("\n")[0], ACTIVITY_LINE_LIMIT).text;
   return text ? clean(text.split("\n")[0], ACTIVITY_LINE_LIMIT).text : undefined;
 }
 
@@ -214,15 +215,18 @@ const TODO_LINE = new RegExp(`^${TODO_ID} (.+?)(?: · next: .+?)? · waiting on 
 function todoLine(line: string): Partial<ToolOutcome> {
   const m = TODO_LINE.exec(line);
   if (!m) return {};
-  return { title: clean(m[1], ACTIVITY_LINE_LIMIT).text, review: clean(m[3], 40).text, ...(m[2] === "due" ? { due: true } : {}),
+  // A title holding a field's own marker (" · next: ", " · waiting on ") cannot be told from the field: no title, rather than a wrong one.
+  const ambiguous = line.split(" · next: ").length > 2 || line.split(" · waiting on ").length > 2;
+  return { ...(ambiguous ? {} : { title: clean(m[1], ACTIVITY_LINE_LIMIT).text }), review: clean(m[3], 40).text, ...(m[2] === "due" ? { due: true } : {}),
     ...(m[4] ? { snoozes: Number(m[4]) } : {}), ...(m[5] ? { maxSnoozes: Number(m[5]) } : {}) };
 }
-/** A job's schedule in words, when it has the shape cron keeps. */
-function scheduleLabel(schedule: unknown): string | undefined {
-  if (!schedule || typeof schedule !== "object") return undefined;
-  const s = schedule as Partial<CronSchedule> & Record<string, unknown>;
-  const ok = (s.kind === "at" && typeof s.at === "string") || (s.kind === "every" && typeof s.everyMs === "number") || (s.kind === "cron" && typeof s.expr === "string");
-  return ok ? clean(formatSchedule(s as CronSchedule), ACTIVITY_LINE_LIMIT).text : undefined;
+/** A recurring job's schedule as the page words it: an interval (`everyMs`), or a cron expression (`cron`, `tz`) shown as written. */
+function scheduleParts(schedule: unknown): Partial<ToolOutcome> {
+  if (!schedule || typeof schedule !== "object") return {};
+  const s = schedule as Record<string, unknown>;
+  if (s.kind === "every" && typeof s.everyMs === "number" && s.everyMs > 0) return { everyMs: s.everyMs };
+  if (s.kind === "cron" && typeof s.expr === "string") return { cron: clean(s.expr, 80).text, ...(typeof s.tz === "string" ? { tz: clean(s.tz, 60).text } : {}) };
+  return {};
 }
 const count = (n: number): ToolOutcome => ({ count: n });
 
@@ -274,8 +278,8 @@ export function toolOutcome(name: string, output: string): ToolOutcome | undefin
       const job = json(text);
       if (!job || typeof job.id !== "string") return undefined;
       const next = typeof job.nextRunAt === "string" ? Date.parse(job.nextRunAt) : NaN;
-      const label = scheduleLabel(job.schedule);
-      return { id: job.id, ...(job.lifecycle === "once" || job.lifecycle === "recurring" ? { lifecycle: job.lifecycle } : {}), ...(label ? { scheduleLabel: label } : {}),
+      const label = scheduleParts(job.schedule);
+      return { id: job.id, ...(job.lifecycle === "once" || job.lifecycle === "recurring" ? { lifecycle: job.lifecycle } : {}), ...label,
         ...(Number.isFinite(next) ? { nextRunAt: next } : {}), ...(typeof job.enabled === "boolean" ? { enabled: job.enabled } : {}) };
     }
     case "schedule_remove":

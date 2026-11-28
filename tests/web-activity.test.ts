@@ -72,11 +72,15 @@ describe("toolOutcome reads what the real tools return", () => {
     const dotted = await run(tools, "todo_add", { title: "Seeds · and soil", next: "Call", waiting_on: "external", ref: "PR 9" });
     expect(toolOutcome(I("todo_add"), textOf(dotted))).toMatchObject({ id: "t-2", title: "Seeds · and soil" });
     await run(tools, "todo_resolve", { id: "t-2", action: "drop", reason: "dup" });
-    await run(tools, "todo_add", { title: "Fix the tap", next: "Phone the plumber", waiting_on: "owner" }); // t-3
+    // A title with a field's marker in it is ambiguous: no title rather than a wrong one.
+    const marked = await run(tools, "todo_add", { title: "Plan · next: discuss", next: "Book a room", waiting_on: "me" });
+    expect(toolOutcome(I("todo_add"), textOf(marked))).not.toHaveProperty("title");
+    await run(tools, "todo_resolve", { id: "t-3", action: "drop", reason: "dup" });
+    await run(tools, "todo_add", { title: "Fix the tap", next: "Phone the plumber", waiting_on: "owner" }); // t-4
     expect(toolOutcome(I("todo_list"), textOf(await run(tools, "todo_list", { filter: "all" })))).toEqual({ count: 2 });
     expect(toolOutcome(I("todo_resolve"), textOf(await run(tools, "todo_resolve", { id: "t-1", action: "done", evidence: "PR 4" })))).toMatchObject({ id: "t-1", title: "Order seeds" });
-    expect(toolOutcome(I("todo_resolve"), textOf(await run(tools, "todo_resolve", { id: "t-3", action: "snooze", until: "3d", reason: "later" }))))
-      .toMatchObject({ id: "t-3", title: "Fix the tap", snoozes: 1, maxSnoozes: expect.any(Number), review: expect.any(String) });
+    expect(toolOutcome(I("todo_resolve"), textOf(await run(tools, "todo_resolve", { id: "t-4", action: "snooze", until: "3d", reason: "later" }))))
+      .toMatchObject({ id: "t-4", title: "Fix the tap", snoozes: 1, maxSnoozes: expect.any(Number), review: expect.any(String) });
     const bad = await run(tools, "todo_resolve", { id: "t-99", action: "done" });
     expect(bad.isError).toBe(true);
     expect(failureReason(I("todo_resolve"), textOf(bad))).not.toMatch(/^todo_resolve/);
@@ -87,10 +91,12 @@ describe("toolOutcome reads what the real tools return", () => {
     const tools = buildCronTools(path, "dm:owner");
     const created = await run(tools, "schedule_create", { name: "Dentist", schedule: "in 2h", message: "Dentist at 4", once: true });
     const outcome = toolOutcome(I("schedule_create"), textOf(created));
-    expect(outcome).toMatchObject({ id: expect.any(String), lifecycle: "once", enabled: true, nextRunAt: expect.any(Number), scheduleLabel: expect.stringMatching(/^once at /) });
+    expect(outcome).toMatchObject({ id: expect.any(String), lifecycle: "once", enabled: true, nextRunAt: expect.any(Number) });
     const brief = await run(tools, "schedule_create", { name: "Brief", schedule: "30 8 * * *", message: "Morning brief" });
-    expect(toolOutcome(I("schedule_create"), textOf(brief))).toMatchObject({ lifecycle: "recurring", scheduleLabel: expect.stringContaining("30 8 * * *") });
-    expect(toolOutcome(I("schedule_list"), textOf(await run(tools, "schedule_list", {})))).toEqual({ count: 2 });
+    expect(toolOutcome(I("schedule_create"), textOf(brief))).toMatchObject({ lifecycle: "recurring", cron: "30 8 * * *" });
+    const every = await run(tools, "schedule_create", { name: "Water", schedule: "every 2h", message: "Water the plants" });
+    expect(toolOutcome(I("schedule_create"), textOf(every))).toMatchObject({ lifecycle: "recurring", everyMs: 7_200_000 });
+    expect(toolOutcome(I("schedule_list"), textOf(await run(tools, "schedule_list", {})))).toEqual({ count: 3 });
     expect(toolOutcome(I("schedule_enable"), textOf(await run(tools, "schedule_enable", { id: outcome!.id, enabled: false })))).toMatchObject({ enabled: false });
     expect(toolOutcome(I("schedule_remove"), textOf(await run(tools, "schedule_remove", { id: outcome!.id })))).toEqual({});
     expect(toolOutcome(I("schedule_remove"), textOf(await run(tools, "schedule_remove", { id: "nope0000" })))).toEqual({ noop: "Job nope0000 not found." });
@@ -100,6 +106,9 @@ describe("toolOutcome reads what the real tools return", () => {
     expect(toolOutcome(I("request_credential"), JSON.stringify({ status: "pending", secret_ref: "r1", asked_on: "telegram", expires_at: 1 }, null, 2)))
       .toEqual({ status: "pending", channel: "telegram" });
     expect(toolOutcome(I("request_permission"), JSON.stringify({ status: "already_allowed", path: "/x" }))).toEqual({ status: "already_allowed" });
+    // A denial comes back as JSON: the card shows its reason, not the object.
+    expect(failureReason(I("request_permission"), JSON.stringify({ status: "denied", reason: "That path is outside the group's folder." })))
+      .toBe("That path is outside the group's folder.");
   });
 
   it("pet tools: an egg or a full pet is a no-op, a feed is its mood", async () => {

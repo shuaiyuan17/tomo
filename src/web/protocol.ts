@@ -264,8 +264,8 @@ export interface ToolOutcome {
   lifecycle?: "once" | "recurring"; nextRunAt?: number; enabled?: boolean;
   /** A to-do's line as the tool printed it: `title`, `review` (its date, as written: "Nov 17"), `due` (that date has passed), `snoozes` / `maxSnoozes`. */
   title?: string; review?: string; due?: true; snoozes?: number; maxSnoozes?: number;
-  /** A scheduled task's schedule in words (src/cron/format.ts, English). */
-  scheduleLabel?: string;
+  /** A recurring scheduled task's schedule: every `everyMs`, or the cron expression `cron` (in `tz`). */
+  everyMs?: number; cron?: string; tz?: string;
   /** request_credential: the channel the owner was asked on. */
   channel?: string;
 }

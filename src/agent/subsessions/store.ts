@@ -381,6 +381,9 @@ export class SubsessionStore {
     }
     try {
       if (!this.importChecked) {
+        // The import moves files once its rows are in: never inside another
+        // transaction, which could still roll those rows back.
+        if (db.inWriteTransaction()) throw new SubsessionStoreError("The sub-session table is first used inside another database transaction; its import runs on its own (read it once first)");
         this.importLegacy(db);
         this.importChecked = true;
       } else if (metaValue(db, SUBSESSIONS_EXPORTED_KEY) !== undefined) {

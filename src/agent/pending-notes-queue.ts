@@ -191,14 +191,20 @@ export class PendingNotesQueue {
       ...(this.inflight.get(sessionKey) ?? []).flatMap((b) => b.notes.map(markInterrupted)),
       ...next,
     ];
+    // In memory BEFORE the write: the commit runs listeners that may queue a
+    // note of their own, and theirs must be written on top of this one.
+    const prev = this.notes.get(sessionKey);
+    this.notes.set(sessionKey, next);
     try {
       this.store.setPendingNotesWith(sessionKey, all, also);
     } catch (err) {
+      // Nothing committed: back to what was there (no listener ran).
+      if (prev === undefined) this.notes.delete(sessionKey);
+      else this.notes.set(sessionKey, prev);
       log.warn({ err, sessionKey }, "Could not persist a pending note with its companion write; nothing was kept");
       return false;
     }
     if (dropped > 0) log.debug({ sessionKey, dropped }, "Pending notes capped at limit; dropped oldest");
-    this.notes.set(sessionKey, next);
     return true;
   }
 

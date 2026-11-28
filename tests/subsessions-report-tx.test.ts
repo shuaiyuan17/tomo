@@ -162,3 +162,27 @@ describe("no commit is reported before the real one", () => {
     closeSharedTomoDbs();
   });
 });
+
+describe("ordering around the commit", () => {
+  it("a listener that queues a note while the report commits keeps both notes, on disk and in memory", () => {
+    const sessions = makeSessionStore(join(dir, "sessions"), { dbPath: join(dir, "tomo.db") });
+    const queue = new PendingNotesQueue(sessions);
+    let armed = false;
+    const store = new SubsessionStore(join(dir, "subsessions.json"), {
+      dbPath: join(dir, "tomo.db"),
+      onChange: () => { if (armed) { armed = false; queue.queueNote("dm:owner", "from the listener"); } },
+    });
+    const t = store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    armed = true;
+    expect(queue.queueNoteWith("dm:owner", "the report", () => { store.update(t.id, (r) => { r.activeMs = 5; }); })).toBe(true);
+    expect(queue.peekNotes("dm:owner")).toEqual(["the report", "from the listener"]);
+    expect(makeSessionStore(join(dir, "sessions"), { dbPath: join(dir, "tomo.db") }).getPendingNotes("dm:owner")).toEqual(["the report", "from the listener"]);
+  });
+
+  it("a store first used inside another transaction refuses rather than import there", () => {
+    const store = new SubsessionStore(join(dir, "subsessions.json"), { dbPath: join(dir, "tomo.db") });
+    const db = sharedTomoDb(join(dir, "tomo.db"));
+    expect(() => db.transaction(() => store.list())).toThrow(/first used inside another/);
+    expect(store.list()).toEqual([]);
+  });
+});

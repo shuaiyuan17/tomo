@@ -5,7 +5,7 @@ import { forceCompactSession } from "./lcm/force-compact.js";
 import { sdkForceSummarizer } from "./lcm/force-summarizer.js";
 import { ForceCompactor } from "./agent/force-compactor.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
-import { buildIdentityPrompt, promptContextSnapshot } from "./workspace/index.js";
+import { buildIdentityPrompt, promptContextSnapshot, setMemoryGroupLabels } from "./workspace/index.js";
 import { groupMemoryDir } from "./workspace/memory-index.js";
 import { SessionStore } from "./sessions/index.js";
 import type { TranscriptRecall } from "./sessions/store.js";
@@ -280,6 +280,13 @@ export class Agent {
 
   constructor() {
     this.sessions = new SessionStore(config.sessionsDir, config.historyLimit, config.sdkSessionsDir, { dbPath: config.dbPath, dbMaintenance: true });
+    // The owner's memory files list names each group's folder by its chat title.
+    setMemoryGroupLabels((dir) => {
+      for (const entry of this.sessions.listAllSessions()) {
+        if (entry.chatTitle && isGroupSessionKey(entry.channelKey) && groupMemoryDir(entry.channelKey) === dir) return entry.chatTitle;
+      }
+      return undefined;
+    });
     this.ownerAdoption = new OwnerAdoption(this.sessions, this.modelOverrides);
     this.contextNudger = new ContextNudger(
       this.sessions,

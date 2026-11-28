@@ -528,3 +528,50 @@ describe("review fixes", () => {
     expect(readMemoryFile(join(mem, "out", "x.md"), mem, false)).toEqual({ refused: "outside" });
   });
 });
+
+describe("the share reminder (§8.2): a new file outside private/, or new lines in MEMORY.md", () => {
+  const SHARED_FILE = "is shared: group chats can read it. If this is private (see Layout), move it under private/.";
+  const SHARED_CORE = "MEMORY.md is shared: group chats have it in every prompt. If what you added is private (see Layout), put it in private/MEMORY.md instead.";
+
+  it("is said when the owner creates a shared file, and not for a private one", async () => {
+    const t = tools(OWNER);
+    expect((await t.call("memory_write", { path: "travel.md", content: topic("Trips."), if_version: "new" })).text).toContain(`travel.md ${SHARED_FILE}`);
+    expect((await t.call("memory_append", { path: "journal/d.md", content: "x", create: true })).text).toContain(SHARED_FILE);
+    expect((await t.call("memory_write", { path: "private/health.md", content: topic("Health."), if_version: "new" })).text).not.toContain("is shared");
+    expect((await t.call("memory_append", { path: "private/journal/d.md", content: "x", create: true })).text).not.toContain("is shared");
+  });
+
+  it("is not said for a change to an existing shared topic file", async () => {
+    put("travel.md", topic("Trips."));
+    const t = tools(OWNER);
+    expect((await t.call("memory_str_replace", { path: "travel.md", old: "- a fact", new: "- another fact" })).text).not.toContain("is shared");
+    expect((await t.call("memory_append", { path: "travel.md", content: "- more" })).text).not.toContain("is shared");
+    expect((await t.call("memory_write", { path: "travel.md", content: topic("Trips!"), if_version: v("travel.md") })).text).not.toContain("is shared");
+  });
+
+  it("is said when lines are added to MEMORY.md, not when one is only removed, nor for private/MEMORY.md", async () => {
+    put("MEMORY.md", "## Owner\n- one\n- two\n");
+    put("private/MEMORY.md", "## Private\n");
+    const t = tools(OWNER);
+    expect((await t.call("memory_append", { path: "MEMORY.md", content: "- three" })).text).toContain(SHARED_CORE);
+    expect((await t.call("memory_str_replace", { path: "MEMORY.md", old: "- two\n", new: "" })).text).not.toContain("is shared");
+    expect((await t.call("memory_str_replace", { path: "MEMORY.md", old: "- one", new: "- one, corrected" })).text).toContain(SHARED_CORE);
+    expect((await t.call("memory_append", { path: "private/MEMORY.md", content: "- secret" })).text).not.toContain("is shared");
+    // A line copied under a second heading is a line added.
+    expect((await t.call("memory_append", { path: "MEMORY.md", content: "## Elsewhere\n- three" })).text).toContain(SHARED_CORE);
+  });
+
+  it("is said when a file moves out of private/ into a shared place", async () => {
+    put("private/p.md", topic("P."));
+    put("private/q.md", topic("Q."));
+    const t = tools(OWNER);
+    expect((await t.call("memory_move", { from: "private/p.md", to: "p.md" })).text).toContain(`p.md ${SHARED_FILE}`);
+    expect((await t.call("memory_move", { from: "private/q.md", to: "private/archive/q.md" })).text).not.toContain("is shared");
+  });
+
+  it("is never said on a group's turn, which writes in its own folder", async () => {
+    const r = await tools(GROUP).call("memory_write", { path: "groups/telegram_-100/n.md", content: topic("N."), if_version: "new" });
+    expect(r.error).toBe(false);
+    expect(r.text).not.toContain("is shared");
+  });
+});

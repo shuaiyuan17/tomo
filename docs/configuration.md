@@ -352,7 +352,7 @@ If LiteLLM returns `System messages are not allowed`, use a LiteLLM build that i
     AGENT.md                  # Operating rules
     IDENTITY.md               # Name and quirks
     CONTINUITY.md             # Standing instructions for continuity heartbeats
-    memory/                   # Persistent memory (MEMORY.md index + topic files)
+    memory/                   # Persistent memory (MEMORY.md, private/MEMORY.md, topic files)
       people/                 # People registry (private records under memory/private/people/)
       private/                # DM-only memory, never visible to groups
     home/                     # Tomo's 3D home scene (drawn by the web UI)

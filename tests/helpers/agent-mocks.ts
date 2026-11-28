@@ -482,6 +482,7 @@ export function workspaceModuleMock() {
     },
     buildIdentityPrompt: () => mockWorkspace.systemPrompt,
     promptContextSnapshot: () => mockWorkspace.promptContext,
+    setMemoryGroupLabels: () => {},
     PRIVATE_MEMORY_SUBDIR: "private",
     PRIVATE_MEMORY_DIR: "/tmp/tomo-mock/workspace/memory/private",
     MEMORY_DIR: "/tmp/tomo-mock/workspace/memory",

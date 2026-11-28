@@ -146,6 +146,8 @@ describe("memory_write", () => {
       ["private/people/kevin.md", "upsert_person"],
       ["Private/People/kevin.md", "upsert_person"],
       ["notes.txt", "ends in .md"],
+      [".hidden.md", "hidden from memory_list"],
+      [".secret/x.md", "hidden from memory_list"],
     ];
     for (const [path, msg] of cases) {
       const r = await t.call("memory_write", { path, content: topic("x"), if_version: "new" });

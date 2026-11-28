@@ -131,6 +131,10 @@ export class MemoryStore {
     if (parts.some((p) => !p || p === "." || p === "..") || parts.length > MAX_DEPTH) {
       throw new MemoryToolError(`${path} is not a path inside memory/: no "..", empty or "." parts, at most ${MAX_DEPTH} levels.`);
     }
+    // Hidden names are skipped by memory_list and memory_search, so a file there would be lost to them.
+    if (parts.some((p) => p.startsWith("."))) {
+      throw new MemoryToolError(`${path}: names starting with "." are hidden from memory_list and memory_search; pick a name without the dot.`);
+    }
     rel = parts.join("/");
     if (!/\.md$/i.test(rel)) throw new MemoryToolError(`${rel}: memory files are Markdown, so the path ends in .md.`);
     if (isPeopleMemoryPath(rel)) throw new MemoryToolError(PEOPLE_PATH_REFUSAL);
@@ -341,6 +345,8 @@ export class MemoryStore {
       includeUnlisted: true,
       includeCores: true,
       withContent: true,
+      // Bounded by time, not by a file count, so no part of a large tree is out of reach for good.
+      maxFiles: Number.POSITIVE_INFINITY,
       budgetMs: SEARCH_BUDGET_MS,
       now: this.now,
     });

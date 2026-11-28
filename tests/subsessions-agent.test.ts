@@ -415,7 +415,7 @@ describe("sub-sessions through the Agent", () => {
       // Allowed when queued, past the pause by the time it runs.
       let allowed = true;
       vi.spyOn(agent.subsessions!, "mirrorTurnAllowed").mockImplementation(() => allowed);
-      (agent as unknown as { mirrorWake(k: string): void }).mirrorWake("dm:alex");
+      (agent as unknown as { wakes: { mirror(k: string): void } }).wakes.mirror("dm:alex");
       allowed = false;
       await new Promise((r) => setTimeout(r, 100));
       expect(ownerPrompts()).toHaveLength(before);
@@ -432,7 +432,7 @@ describe("sub-sessions through the Agent", () => {
       expect((await agent.subsessions!.reply("task:s1", "Using main.")).ok).toBe(true);
       expect(agent.subsessions!.hasUnseenMirror("dm:alex")).toBe(true);
       const before = ownerPrompts().length;
-      (agent as unknown as { mirrorWake(k: string): void }).mirrorWake("dm:alex");
+      (agent as unknown as { wakes: { mirror(k: string): void } }).wakes.mirror("dm:alex");
       await new Promise((r) => setTimeout(r, 100));
       expect(ownerPrompts()).toHaveLength(before);
       await agent.stop();

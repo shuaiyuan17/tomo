@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, renameSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,7 +6,7 @@ import { DEFAULT_SUBSESSIONS } from "../src/config.js";
 import { PendingNotesQueue } from "../src/agent/pending-notes-queue.js";
 import { SubsessionService, type SubsessionServiceDeps } from "../src/agent/subsessions/service.js";
 import { SubsessionStore } from "../src/agent/subsessions/store.js";
-import { TomoDb } from "../src/db/index.js";
+import { closeSharedTomoDbs, sharedTomoDb, TomoDb } from "../src/db/index.js";
 import { makeSessionStore } from "./helpers/session-store-fixtures.js";
 
 // ---------------------------------------------------------------------------
@@ -123,5 +123,42 @@ describe("report delivery is one transaction", () => {
     expect(w.store.get(record.id)).toMatchObject({ status: "finished", reportDelivered: false });
     expect(w.queue.hasNote("dm:owner", (n) => n.includes('type="subsession-report"'))).toBe(false);
     w.service.stop();
+  });
+});
+
+describe("no commit is reported before the real one", () => {
+  it("queueNoteWith inside another transaction refuses, and keeps nothing in memory", () => {
+    const w = world();
+    const db = sharedTomoDb(join(dir, "tomo.db"));
+    const ok = db.transaction(() => w.queue.queueNoteWith("dm:owner", "n", () => {}));
+    expect(ok).toBe(false);
+    expect(w.queue.hasNote("dm:owner", (n) => n === "n")).toBe(false);
+    w.service.stop();
+  });
+
+  it("a task write rolled back with an outer transaction leaves the store's cache as committed", () => {
+    const w = world();
+    const t = w.store.create({ parentKey: "dm:owner", title: "t", brief: "b" });
+    const db = sharedTomoDb(join(dir, "tomo.db"));
+    expect(() => db.transaction(() => {
+      w.store.update(t.id, (r) => { r.activeMs = 1; });
+      w.store.update(t.id, (r) => { r.activeMs = 2; });
+      w.store.list();
+      throw new Error("outer");
+    })).toThrow("outer");
+    expect(w.store.peek()?.tasks[0].activeMs).toBe(0);
+    expect(w.store.get(t.id)?.activeMs).toBe(0);
+    w.service.stop();
+  });
+
+  it("the shared connection is never swapped while a transaction is open on it", () => {
+    const path = join(dir, "solo.db");
+    const db = sharedTomoDb(path);
+    db.transaction(() => {
+      renameSync(path, `${path}.moved`);
+      expect(sharedTomoDb(path)).toBe(db);
+      renameSync(`${path}.moved`, path);
+    });
+    closeSharedTomoDbs();
   });
 });

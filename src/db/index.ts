@@ -436,7 +436,9 @@ function fileIdentity(path: string): string | null {
 /** This process's writable connection to the database at `path` (opened, and migrated, on first use). */
 export function sharedTomoDb(path: string): TomoDb {
   const cached = connections.get(path);
-  if (cached && cached.identity === fileIdentity(path)) return cached.db;
+  // Never swapped under an open transaction: its writes would go one way and
+  // the rest of the transaction's another.
+  if (cached && (cached.db.inWriteTransaction() || cached.identity === fileIdentity(path))) return cached.db;
   if (cached) {
     cached.db.close();
     connections.delete(path);

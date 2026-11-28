@@ -153,6 +153,10 @@ export class PendingNotesStore {
   setWith(key: string, notes: string[], also: () => void): void {
     if (this.opts.readOnly) throw new Error("Read-only session store");
     const db = this.ready();
+    // Outermost only: inside someone else's transaction a "committed" here
+    // would not be, and the caller acts on it (the queue keeps the note, the
+    // delivery wakes the owning session).
+    if (db.inWriteTransaction()) throw new Error("PendingNotesStore.setWith must not run inside another transaction");
     db.transaction(() => {
       writeNotes(db, key, notes);
       also();

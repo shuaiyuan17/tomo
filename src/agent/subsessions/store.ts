@@ -355,7 +355,7 @@ export class SubsessionStore {
       const before = this.readRows(db);
       const table = clone(before.table);
       const out = fn(table);
-      if (changed && !changed() && this.lastState === "ok") return out;
+      if (changed && !changed() && before.written && !this.recoveredByImport) return out;
       writeRows(db, before, table);
       // Once it is committed: inside another store's transaction (a report
       // note and its delivered mark, see the service), that is the outer one.
@@ -402,8 +402,13 @@ export class SubsessionStore {
       this.lastState = "unreadable";
       throw new SubsessionStoreError(`Sub-session table in ${this.dbPath} is unreadable`, err);
     }
-    this.cached = stored.table;
-    this.lastState = !stored.written ? "missing" : this.recoveredByImport ? "recovered" : "ok";
+    // Inside a write transaction what was read may still be rolled back:
+    // the cache and the state follow only committed reads (and, for a
+    // write, its after-commit hook).
+    if (!db.inWriteTransaction()) {
+      this.cached = stored.table;
+      this.lastState = !stored.written ? "missing" : this.recoveredByImport ? "recovered" : "ok";
+    }
     return stored;
   }
 

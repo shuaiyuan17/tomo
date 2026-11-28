@@ -1,8 +1,9 @@
 // The memory tools' operations: synchronous read → check → keep → write.
 import { linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { writeFileAtomicSync } from "../fs-utils.js";
 import { landsInPrivate } from "../agent/private-memory-reach.js";
+import { isInside } from "../agent/permission-paths.js";
 import {
   collectMemoryFiles,
   descriptionProblem,
@@ -93,7 +94,12 @@ interface Current {
  * Every operation is one synchronous stretch, with no `await` between the
  * read, the version check, keeping the old version and the write, so two
  * calls in this process cannot interleave. Writers outside the process (the
- * owner's editor) change the version and are caught by `if_version`.
+ * owner's editor) change the version and are caught by `if_version`, and
+ * again right before the rename or unlink. There is no file lock (by design):
+ * an outside write that lands in the instant between that last check and the
+ * rename can still be lost, as can a folder swapped for a link in that
+ * instant redirect the write. Closing that needs `openat`-style calls Node
+ * does not have.
  */
 export class MemoryStore {
   private readonly now: () => number;
@@ -237,10 +243,26 @@ export class MemoryStore {
   }
 
   /** Write `text` over what this call read as `cur` (null: a new file), unless it changed meanwhile. */
-  private write(r: Resolved, cur: Current | null, text: string): string {
+  private write(r: Resolved, access: MemoryAccess, cur: Current | null, text: string): string {
     mkdirSync(dirname(r.abs), { recursive: true });
-    writeFileAtomicSync(r.abs, text, { beforeRename: () => this.unchanged(r, cur) });
+    this.placeOk(r, access);
+    writeFileAtomicSync(r.abs, text, { beforeRename: () => { this.placeOk(r, access); this.unchanged(r, cur); } });
     return memoryVersion(Buffer.from(text, "utf8"));
+  }
+
+  /**
+   * The folder a write lands in, by its real path: inside memory/, and not
+   * under private/ on a barred turn. Checked again right before the write
+   * lands, so a folder swapped for a link after resolve() does not carry a
+   * group's write into private/ or out of memory/.
+   */
+  private placeOk(r: Resolved, access: MemoryAccess): void {
+    const root = this.root();
+    const real = join(realpathSync(dirname(r.abs)), basename(r.abs));
+    if (!isInside(real, root)) throw new MemoryToolError(`${r.rel} leads outside memory/; memory tools don't follow links.`);
+    if (access.privateBarred && landsInPrivate(real, { cwd: root, memoryDir: root, privateDir: join(root, PRIVATE_MEMORY_SUBDIR) })) {
+      throw new MemoryToolError(PRIVATE_BARRED_REFUSAL);
+    }
   }
 
   private saved(rel: string, version: string, note?: string): string {
@@ -347,7 +369,7 @@ export class MemoryStore {
     if (isListedMemoryPath(r.rel) && descriptionProblem(content) !== null) throw this.missingDescription(r.rel);
     const note = this.checkSize(r.rel, cur?.text ?? null, content);
     if (cur) this.keep(r, cur);
-    return this.saved(r.rel, this.write(r, cur, content), note);
+    return this.saved(r.rel, this.write(r, access, cur, content), note);
   }
 
   strReplace(access: MemoryAccess, path: unknown, oldText: string, newText: string): string {
@@ -364,7 +386,7 @@ export class MemoryStore {
     // A replacement that shortens the file is the one that loses content worth
     // keeping; so is any rewrite of bytes that weren't valid UTF-8.
     if (Buffer.byteLength(next, "utf8") < cur.bytes.length || !cur.lossless) this.keep(r, cur);
-    return this.saved(r.rel, this.write(r, cur, next), note);
+    return this.saved(r.rel, this.write(r, access, cur, next), note);
   }
 
   append(access: MemoryAccess, path: unknown, content: string, create = false): string {
@@ -382,7 +404,7 @@ export class MemoryStore {
     const note = this.checkSize(r.rel, cur?.text ?? null, next);
     // The file is rewritten from its decoded text: bytes that weren't UTF-8 would be lost.
     if (cur && !cur.lossless) this.keep(r, cur);
-    return this.saved(r.rel, this.write(r, cur, next), note);
+    return this.saved(r.rel, this.write(r, access, cur, next), note);
   }
 
   move(access: MemoryAccess, from: unknown, to: unknown): string {
@@ -398,11 +420,21 @@ export class MemoryStore {
     }
     if (isListedMemoryPath(b.rel) && !isListedMemoryPath(a.rel) && descriptionProblem(cur.text) !== null) throw this.missingDescription(b.rel);
     mkdirSync(dirname(b.abs), { recursive: true });
+    this.placeOk(a, access);
+    this.placeOk(b, access);
     // link + unlink, not rename: link refuses an existing destination
     // atomically, so a file created there meanwhile is never overwritten.
     try { linkSync(a.abs, b.abs); } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "EEXIST") throw exists;
       throw err;
+    }
+    // Unlink the source only while it is still the file just linked: one an
+    // editor saved over it meanwhile stays, and the new name is taken back.
+    const src = lstatSync(a.abs);
+    const dst = lstatSync(b.abs);
+    if (src.ino !== dst.ino || src.dev !== dst.dev) {
+      unlinkSync(b.abs);
+      throw new MemoryToolError(`${a.rel} changed while it was being moved, so it was left where it was. Try again.`);
     }
     unlinkSync(a.abs);
     return `Moved ${a.rel} to ${b.rel} (version ${cur.version}).`;
@@ -415,6 +447,7 @@ export class MemoryStore {
     if (!cur) throw new MemoryToolError(`${r.rel} doesn't exist. memory_list shows what does.`);
     if (cur.version !== ifVersion) throw this.stale(r.rel, cur);
     this.keep(r, cur);
+    this.placeOk(r, access);
     this.unchanged(r, cur);
     unlinkSync(r.abs);
     return `Deleted ${r.rel}. Its content is kept for ${MEMORY_HISTORY_DAYS} days in Tomo's own data, outside memory.`;

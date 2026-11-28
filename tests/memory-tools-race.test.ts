@@ -64,3 +64,18 @@ describe("an outside edit during a call is not overwritten", () => {
     expect(readFileSync(join(mem, "b.md"), "utf8")).toBe(topic("the editor's"));
   });
 });
+
+describe("a folder swapped for a link after the path was checked", () => {
+  it("is caught where the write lands: a barred turn never writes into private/, nobody writes outside memory/", () => {
+    mkdirSync(join(mem, "private"), { recursive: true });
+    const { symlinkSync } = process.getBuiltinModule("node:fs");
+    symlinkSync(join(mem, "private"), join(mem, "swapped"));
+    mkdirSync(join(mem, "..", "outside"), { recursive: true });
+    symlinkSync(join(mem, "..", "outside"), join(mem, "away"));
+    const placeOk = (store as unknown as { placeOk: (r: { rel: string; abs: string }, a: typeof OWNER) => void }).placeOk.bind(store);
+    const barred = { privateBarred: true, canWrite: true, canWriteCore: false };
+    expect(() => placeOk({ rel: "swapped/x.md", abs: join(mem, "swapped", "x.md") }, barred)).toThrow(/not available on this turn/);
+    expect(() => placeOk({ rel: "swapped/x.md", abs: join(mem, "swapped", "x.md") }, OWNER)).not.toThrow();
+    expect(() => placeOk({ rel: "away/x.md", abs: join(mem, "away", "x.md") }, OWNER)).toThrow(/outside memory/);
+  });
+});

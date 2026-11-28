@@ -202,7 +202,7 @@ function NoteCard({ row, state, raw }: CardProps & { row: ToolRow & { activity: 
   const head = { k: held && state === "done" ? HEADS.note.held : HEADS.note[state], values };
   return <Card rows={[row]} state={state} head={head} {...raw}>
     {state === "error" ? <Reason row={row} /> : <Quote text={activity.text} lines={3} truncated={activity.textTruncated} />}
-    {state !== "error" && activity.withOwner && <p className="m-0 mt-2 flex items-center gap-1.5 text-[12px] text-muted-foreground">
+    {state === "done" && activity.withOwner && <p className="m-0 mt-2 flex items-center gap-1.5 text-[12px] text-muted-foreground">
       <CheckIcon className="size-3.5" aria-hidden="true" />{t("card.withOwner")}</p>}
     {held && outcome.noop && <Warn>{outcome.noop}</Warn>}
     {outcome?.delivery === "queued" && <p className="m-0 mt-2 text-[12px] text-muted-foreground">{t("card.noteQueued")}</p>}

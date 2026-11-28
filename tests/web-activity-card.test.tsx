@@ -193,6 +193,8 @@ describe("no result after the turn ended", () => {
     expect(shown).not.toContain("Cancelled a task");
     expect(shown).toContain("may or may not have happened");
     expect(shown).not.toContain("shimmer");
+    expect(card(row(call(note)))).not.toContain("With your own message attached");
+    expect(card(row(call(note)), { running: true })).not.toContain("With your own message attached");
     const sent = card(row(call(send)), { env: { sessions: [] } });
     expect(sent).not.toMatch(/Sent to/);
   });

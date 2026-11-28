@@ -272,9 +272,10 @@ export function setMemoryGroupLabels(lookup: ((dir: string) => string | undefine
 
 /**
  * The memory files list's lines for this audience (renderMemoryFilesList).
- * `strict` throws when the scan stopped early (time or file cap): compared
- * against a snapshot, the files it never reached would read as removed. A
- * single file that can't be read stays in the list, marked, either way.
+ * `strict` throws when a folder could not be read: compared against a
+ * snapshot, its files would read as removed. A scan stopped by its cap is
+ * one fixed line either way, and a single file that can't be read stays in
+ * the list, marked.
  */
 function memoryFilesLines(withoutPrivate: boolean, strict = false): string[] {
   let root: string;
@@ -284,11 +285,13 @@ function memoryFilesLines(withoutPrivate: boolean, strict = false): string[] {
   }
   // Only the top of each file: the list needs the frontmatter, and a huge file must not stall the daemon.
   const { entries, truncated, unreadableDirs } = collectMemoryFiles({ memoryDir: root, excludePrivate: withoutPrivate, reportUnreadable: true, headBytes: LIST_HEAD_BYTES, budgetMs: LIST_SCAN_BUDGET_MS });
-  if (strict && (truncated || unreadableDirs.length > 0)) throw new Error("The memory files scan was incomplete");
   // A scan stopped by its time or file cap ends wherever the disk let it, a
   // different place each time: listing that part would differ from build to
-  // build and retire a live session for nothing. One fixed line instead.
+  // build and retire a live session for nothing. One fixed line instead,
+  // the same for a strict read, so a small edit elsewhere is still a note.
   if (truncated) return ["(the memory files list could not be built in time: memory_list shows the files)"];
+  // A folder that can't be read: its files would read as removed.
+  if (strict && unreadableDirs.length > 0) throw new Error("A memory folder could not be read");
   const lines = renderMemoryFilesList(entries, {
     audience: withoutPrivate ? "shared" : "full",
     ...(groupLabelLookup ? { groupLabel: groupLabelLookup } : {}),

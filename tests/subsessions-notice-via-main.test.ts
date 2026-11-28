@@ -226,7 +226,8 @@ describe("via-main notices: the cause, privacy, nothing lost or twice", () => {
     const [note] = notices(h, "dm:owner");
     expect(note).toContain("Failure category: reasoning_extraction");
     expect(note).toContain("last error: API Error: 400 refused");
-    expect(note).toContain("resuming it will likely fail again");
+    expect(note).toContain("resuming it will likely be refused again");
+    expect(note).toContain("Why: the model refused its turn, so it was not tried again");
     expect(note).toContain("task_cancel s1");
     h.service.stop();
   });
@@ -252,7 +253,10 @@ describe("via-main notices: the cause, privacy, nothing lost or twice", () => {
 
   it("failureHint: a refusal of any name or a bad request says start over; a missing model is configuration; an unknown cause is one more try", () => {
     const startOver = "resuming it will likely fail again";
-    expect(failureHint("some_new_refusal", true)).toContain(startOver);
+    // A refusal: not tried again by the harness, and the way on is a new task from its checkpoint.
+    expect(failureHint("some_new_refusal", true)).toContain("did not try it again");
+    expect(failureHint("some_new_refusal", true)).toContain("task_spawn");
+    expect(failureHint("some_new_refusal", true)).toContain("checkpoint");
     expect(failureHint("invalid_request")).toContain(startOver);
     expect(failureHint("prompt_too_long")).toContain(startOver);
     expect(failureHint("model_not_found")).toContain("configuration");

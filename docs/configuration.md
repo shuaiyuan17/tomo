@@ -142,7 +142,7 @@ Environment variables override config file values:
 
 **`notifyOwnerOnSuppressedErrors`** covers passive-group turns, group cron/background turns, and silent housekeeping/heartbeat turns on the owner's own DM (an error already shown in a chat is not repeated). Group failures are reported in the owner's DM, never in the group; DM failures in that DM. Each notice names the session, the kind of error, a one-line excerpt and a recovery hint (`/login` for auth failures). At most one notice per session and error kind per 30 minutes; the next one says how many failures were folded in. Set `false` to keep these failures in the log only.
 
-**`showThinking`**: with it off, thinking blocks are dropped (not delivered, not recorded in the transcript), and if the model put its reply in one it is asked to restate it as text — after its next tool call, or in one follow-up turn if the turn ended there (see `showThinking` in `defaults/skills/system/CONFIG.md`). Read at session start.
+**`showThinking`**: with it off, thinking blocks are dropped (not delivered, not recorded in the transcript), and the model is told its message did not reach the user, so it can write one as its reply — after its next tool call, or in one follow-up turn if the turn ended there; never on a sub-session, whose text is not delivered by design (see `showThinking` in `defaults/skills/system/CONFIG.md`). Read at session start.
 
 ## External MCP servers
 

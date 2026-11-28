@@ -54,12 +54,19 @@ export function failureCategory(f: TurnFailure | undefined): string | undefined 
 const CONTAMINATED = "Its conversation itself is what fails, so resuming it will likely fail again: cancel it and start the work over as a new task (task_spawn) with a clean brief.";
 
 /**
+ * A refusal is about what the conversation holds, so the same conversation
+ * sent again is refused again (and billed again): the harness pauses on the
+ * first one, and the way on is a new task, not this one resumed.
+ */
+const REFUSED = "The model refused the turn because of what this conversation holds, so the harness did not try it again and resuming it will likely be refused again: cancel it and start the work over as a new task (task_spawn) with a clean brief built from its checkpoint (task_status shows it), on a different model if one is available.";
+
+/**
  * What a category means for picking the task up again, for the owning
  * session. `refused`: the category is the model's refusal category (any
  * name: the set is the API's, and open).
  */
 export function failureHint(category: string | undefined, refused = false): string {
-  if (refused) return CONTAMINATED;
+  if (refused) return REFUSED;
   switch (category) {
     case undefined:
       return "The cause is not known; one more try may work, and if it fails again, start the work over as a new task.";

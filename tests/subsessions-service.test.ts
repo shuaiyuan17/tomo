@@ -675,6 +675,50 @@ describe("SubsessionService", () => {
     expect(h.turns[2].prompt).toContain('type="subsession-start"');
   });
 
+  it("pauses on the first refused turn: a refusal is not tried again on the same conversation", async () => {
+    const h = harness({}, () => ({ ok: false, failure: { refusal: "reasoning_extraction" } }));
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.turns).toHaveLength(1);
+    const record = h.store.get(t.id)!;
+    expect(record).toMatchObject({ status: "waiting", waitingOn: "owner", pausedBy: { kind: "turns_failing" } });
+    expect(record.lastFailure).toMatchObject({ category: "reasoning_extraction", refused: true });
+    expect(record.transitions.at(-1)?.reason).toContain("refused");
+  });
+
+  it("input that arrives during a refused turn is held with the pause, not sent on the refused conversation", async () => {
+    let relayed = false;
+    const h = harness({}, (turn, hh) => {
+      if (!relayed) { relayed = true; hh.service.relay(hh.store.list()[0]!.id, "one more thing"); }
+      return { ok: false, failure: { refusal: "reasoning_extraction" } };
+    });
+    h.service.start();
+    const t = spawn(h);
+    await flush();
+    expect(h.turns).toHaveLength(1);
+    const record = h.store.get(t.id)!;
+    expect(record).toMatchObject({ status: "waiting", waitingOn: "owner", pausedBy: { kind: "turns_failing" } });
+    expect(record.pendingInput.some((i) => i.text.includes("one more thing"))).toBe(true);
+    expect(record.heldThrough).toBe(record.pendingInput.at(-1)!.seq);
+  });
+
+  it("a refusal named only in the error text is not tried again either; an API error still gets its second turn", async () => {
+    const refusedText = harness({}, () => ({ ok: false, failure: { detail: 'API Error: {"api_refusal_category":"reasoning_extraction"}' } }));
+    refusedText.service.start();
+    spawn(refusedText);
+    await flush();
+    expect(refusedText.turns).toHaveLength(1);
+
+    const apiError = harness({}, () => ({ ok: false, failure: { errorKind: "server_error", detail: "boom" } }));
+    apiError.service.start();
+    const t = spawn(apiError);
+    await flush();
+    expect(apiError.turns).toHaveLength(2);
+    expect(apiError.store.get(t.id)).toMatchObject({ status: "waiting", failStreak: 2 });
+    expect(apiError.store.get(t.id)!.transitions.at(-1)?.reason).toBe("its turns keep failing");
+  });
+
   it("holds a finished task's unanswered input after two failed turns, or at once when stopped, and says so", async () => {
     const h = harness({}, working((turn, hh) => hh.service.finish(turn.key, "ok")));
     h.service.start();

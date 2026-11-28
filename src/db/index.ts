@@ -74,7 +74,11 @@ export interface OpenOptions {
 
 export class TomoDb {
   private readonly statements = new Map<string, SqliteStatement>();
-  private inTransaction = false;
+  private mode: "none" | "read" | "write" = "none";
+  /** Savepoints open inside the write transaction. */
+  private depth = 0;
+  /** afterCommit hooks waiting for the outermost COMMIT. */
+  private committed: Array<() => void> = [];
 
   constructor(readonly path: string, private readonly db: SqliteDatabase, readonly readOnly: boolean) {}
 
@@ -108,29 +112,88 @@ export class TomoDb {
    * up front (waiting up to the busy timeout for another process), so a read
    * inside `fn` can never be upgraded into a write that fails with BUSY.
    * Anything `fn` throws rolls the whole transaction back and is rethrown.
-   * Synchronous only, and not nestable.
+   * Synchronous only.
+   *
+   * NESTED (a store's write called inside another store's transaction on the
+   * same connection, see sharedTomoDb): the inner one is a SAVEPOINT. Its
+   * throw rolls back only its own writes (and is rethrown); its writes commit
+   * with the outermost transaction, or not at all. What has to wait for the
+   * real commit goes through {@link afterCommit}.
    */
   transaction<T>(fn: () => T): T {
-    if (this.inTransaction) throw new Error("TomoDb.transaction is not re-entrant");
+    if (this.mode === "read") throw new Error("TomoDb.transaction inside a snapshot");
+    if (this.mode === "write") return this.savepoint(fn);
     this.db.exec("BEGIN IMMEDIATE");
-    this.inTransaction = true;
+    this.mode = "write";
+    let result: T;
     try {
-      const result = fn();
+      result = fn();
       if (result && typeof (result as { then?: unknown }).then === "function") {
         throw new Error("TomoDb.transaction callbacks must be synchronous");
       }
       this.db.exec("COMMIT");
-      return result;
     } catch (err) {
       try {
         this.db.exec("ROLLBACK");
       } catch (rollbackErr) {
         log.warn({ err: rollbackErr }, "Database rollback failed");
       }
+      this.committed = [];
       throw err;
     } finally {
-      this.inTransaction = false;
+      this.mode = "none";
+      this.depth = 0;
     }
+    const hooks = this.committed;
+    this.committed = [];
+    for (const hook of hooks) {
+      try { hook(); } catch (err) { log.warn({ err }, "Database after-commit hook failed"); }
+    }
+    return result;
+  }
+
+  private savepoint<T>(fn: () => T): T {
+    const name = `tomo_sp_${++this.depth}`;
+    const hooksBefore = this.committed.length;
+    this.db.exec(`SAVEPOINT ${name}`);
+    try {
+      const result = fn();
+      if (result && typeof (result as { then?: unknown }).then === "function") {
+        throw new Error("TomoDb.transaction callbacks must be synchronous");
+      }
+      this.db.exec(`RELEASE ${name}`);
+      return result;
+    } catch (err) {
+      try {
+        this.db.exec(`ROLLBACK TO ${name}`);
+        this.db.exec(`RELEASE ${name}`);
+      } catch (rollbackErr) {
+        log.warn({ err: rollbackErr }, "Database savepoint rollback failed");
+      }
+      this.committed.length = hooksBefore;
+      throw err;
+    } finally {
+      this.depth -= 1;
+    }
+  }
+
+  /**
+   * Run `hook` once what was written so far is committed: now, outside a
+   * transaction; after the outermost COMMIT inside one (never, if it rolls
+   * back, or if the savepoint that registered it does). A hook that throws
+   * is logged, never thrown into the commit.
+   */
+  afterCommit(hook: () => void): void {
+    if (this.mode === "write") {
+      this.committed.push(hook);
+      return;
+    }
+    try { hook(); } catch (err) { log.warn({ err }, "Database after-commit hook failed"); }
+  }
+
+  /** Is a write transaction open on this connection? */
+  inWriteTransaction(): boolean {
+    return this.mode === "write";
   }
 
   /**
@@ -140,9 +203,9 @@ export class TomoDb {
    * connections may use it. Synchronous only.
    */
   snapshot<T>(fn: () => T): T {
-    if (this.inTransaction) return fn();
+    if (this.mode !== "none") return fn();
     this.db.exec("BEGIN");
-    this.inTransaction = true;
+    this.mode = "read";
     try {
       const result = fn();
       if (result && typeof (result as { then?: unknown }).then === "function") {
@@ -154,7 +217,7 @@ export class TomoDb {
       try { this.db.exec("ROLLBACK"); } catch { /* nothing was written */ }
       throw err;
     } finally {
-      this.inTransaction = false;
+      this.mode = "none";
     }
   }
 
@@ -373,7 +436,9 @@ function fileIdentity(path: string): string | null {
 /** This process's writable connection to the database at `path` (opened, and migrated, on first use). */
 export function sharedTomoDb(path: string): TomoDb {
   const cached = connections.get(path);
-  if (cached && cached.identity === fileIdentity(path)) return cached.db;
+  // Never swapped under an open transaction: its writes would go one way and
+  // the rest of the transaction's another.
+  if (cached && (cached.db.inWriteTransaction() || cached.identity === fileIdentity(path))) return cached.db;
   if (cached) {
     cached.db.close();
     connections.delete(path);

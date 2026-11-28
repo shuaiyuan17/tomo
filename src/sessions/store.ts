@@ -593,6 +593,11 @@ export class SessionStore {
     this.pendingNotes.set(key, notes);
   }
 
+  /** {@link setPendingNotes} with `also` in the same database transaction (see PendingNotesStore.setWith). */
+  setPendingNotesWith(key: string, notes: string[], also: () => void): void {
+    this.pendingNotes.setWith(key, notes, also);
+  }
+
   // --- SDK Session Registry ---
 
   /** Get the active SDK session ID for a channel key */

@@ -176,9 +176,51 @@ describe("transactions", () => {
     db.close();
   });
 
-  it("is not re-entrant and refuses an async callback", () => {
+  it("nests as savepoints: an inner throw undoes only its own writes, and everything commits with the outermost", () => {
+    const path = join(freshDir(), "tomo.db");
+    const db = openTomoDb(path);
+    const other = openTomoDb(path);
+    const order: string[] = [];
+    try {
+      db.transaction(() => {
+        db.run("INSERT INTO meta (key, value) VALUES ('outer', '1')");
+        expect(() => db.transaction(() => {
+          db.run("INSERT INTO meta (key, value) VALUES ('inner-undone', '1')");
+          db.afterCommit(() => order.push("undone hook"));
+          throw new Error("inner");
+        })).toThrow("inner");
+        db.transaction(() => {
+          db.run("INSERT INTO meta (key, value) VALUES ('inner-kept', '1')");
+          db.afterCommit(() => order.push("kept hook"));
+        });
+        // Nothing is visible to another connection before the outer COMMIT, and no hook has run.
+        expect(other.get("SELECT 1 AS x FROM meta WHERE key = 'inner-kept'")).toBeUndefined();
+        expect(order).toEqual([]);
+      });
+      expect(order).toEqual(["kept hook"]);
+      expect(other.all<{ key: string }>("SELECT key FROM meta ORDER BY key").map((r) => r.key)).toEqual(["inner-kept", "outer"]);
+      // An outer rollback takes the inner writes and their hooks with it.
+      expect(() => db.transaction(() => {
+        db.transaction(() => {
+          db.run("INSERT INTO meta (key, value) VALUES ('rolled', '1')");
+          db.afterCommit(() => order.push("rolled hook"));
+        });
+        throw new Error("outer");
+      })).toThrow("outer");
+      expect(db.get("SELECT 1 AS x FROM meta WHERE key = 'rolled'")).toBeUndefined();
+      expect(order).toEqual(["kept hook"]);
+      // Outside a transaction a hook runs at once.
+      db.afterCommit(() => order.push("now"));
+      expect(order).toEqual(["kept hook", "now"]);
+    } finally {
+      db.close();
+      other.close();
+    }
+  });
+
+  it("refuses an async callback, and a write transaction inside a snapshot", () => {
     const db = openTomoDb(join(freshDir(), "tomo.db"));
-    expect(() => db.transaction(() => db.transaction(() => 1))).toThrow("not re-entrant");
+    expect(() => db.snapshot(() => db.transaction(() => 1))).toThrow("inside a snapshot");
     expect(() => db.transaction(() => {
       db.run("INSERT INTO meta (key, value) VALUES ('async', '1')");
       return Promise.resolve();

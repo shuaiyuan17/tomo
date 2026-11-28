@@ -219,6 +219,17 @@ class World {
         if (durable && text.startsWith('<tomo-event type="subsession-handback"')) for (const t of tokensOf(text)) w.handedBack.add(t);
         return durable;
       },
+      // The real one is one transaction over the notes and the task table:
+      // a note write that fails writes neither, a table write that fails
+      // (`also` throws) takes the note back with it.
+      queuePendingNoteWith: (_key, text, also) => {
+        if (w.faults.noteWrites > 0) { w.faults.noteWrites -= 1; return false; }
+        try { also(); } catch { return false; }
+        w.notes.push({ text, durable: true });
+        const report = /type="subsession-report" name="([^"]+)"/.exec(text)?.[1];
+        if (report) w.reportNotes.add(report);
+        return true;
+      },
       withdrawPendingNote: (_key, match) => {
         for (let i = w.notes.length - 1; i >= 0; i--) {
           if (match(w.notes[i].text)) {

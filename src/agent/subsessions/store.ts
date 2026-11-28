@@ -141,6 +141,8 @@ export class SubsessionStore {
   /** This process imported the old `.bak` (until its first write): reads say "recovered". */
   private recoveredByImport = false;
   private importChecked = false;
+  /** Writes made through this store, in order (see mutate's after-commit hook). */
+  private writes = 0;
   private readonly now: () => number;
   /** Tests: an illegal transition throws instead of being logged and refused. */
   private readonly strict: boolean;
@@ -351,23 +353,26 @@ export class SubsessionStore {
   /** `changed`, when given, may skip the write: only for a table read cleanly ("ok"). */
   private mutate<T>(fn: (table: SubsessionTable) => T, changed?: () => boolean): T {
     const db = this.ready();
-    let written: SubsessionTable | null = null;
-    const result = db.transaction(() => {
+    return db.transaction(() => {
       const before = this.readRows(db);
       const table = clone(before.table);
       const out = fn(table);
-      if (changed && !changed() && this.lastState === "ok") return out;
+      if (changed && !changed() && before.written && !this.recoveredByImport) return out;
       writeRows(db, before, table);
-      written = table;
+      // Once it is committed: inside another store's transaction (a report
+      // note and its delivered mark, see the service), that is the outer one.
+      const written = clone(table);
+      // The newest write's table wins the cache, whatever order the hooks
+      // run in (a listener that writes from a hook commits a newer one).
+      const mine = ++this.writes;
+      db.afterCommit(() => {
+        if (mine === this.writes) this.cached = written;
+        this.lastState = "ok";
+        this.recoveredByImport = false;
+        try { this.onChange?.(); } catch (err) { log.warn({ err }, "Sub-session change listener failed"); }
+      });
       return out;
     });
-    if (written) {
-      this.cached = clone(written);
-      this.lastState = "ok";
-      this.recoveredByImport = false;
-      try { this.onChange?.(); } catch (err) { log.warn({ err }, "Sub-session change listener failed"); }
-    }
-    return result;
   }
 
   /** The database, opened and the old file imported. Throws SubsessionStoreError when it cannot be used. */
@@ -381,6 +386,9 @@ export class SubsessionStore {
     }
     try {
       if (!this.importChecked) {
+        // The import moves files once its rows are in: never inside another
+        // transaction, which could still roll those rows back.
+        if (db.inWriteTransaction()) throw new SubsessionStoreError("The sub-session table is first used inside another database transaction; its import runs on its own (read it once first)");
         this.importLegacy(db);
         this.importChecked = true;
       } else if (metaValue(db, SUBSESSIONS_EXPORTED_KEY) !== undefined) {
@@ -402,8 +410,13 @@ export class SubsessionStore {
       this.lastState = "unreadable";
       throw new SubsessionStoreError(`Sub-session table in ${this.dbPath} is unreadable`, err);
     }
-    this.cached = stored.table;
-    this.lastState = !stored.written ? "missing" : this.recoveredByImport ? "recovered" : "ok";
+    // Inside a write transaction what was read may still be rolled back:
+    // the cache and the state follow only committed reads (and, for a
+    // write, its after-commit hook).
+    if (!db.inWriteTransaction()) {
+      this.cached = stored.table;
+      this.lastState = !stored.written ? "missing" : this.recoveredByImport ? "recovered" : "ok";
+    }
     return stored;
   }
 

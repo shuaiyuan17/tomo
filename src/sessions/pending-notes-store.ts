@@ -1,6 +1,6 @@
 import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { DbDamagedError, openTomoDb, type TomoDb } from "../db/index.js";
+import { DbDamagedError, openTomoDb, sharedTomoDb, type TomoDb } from "../db/index.js";
 import { deleteMeta, digestOf, metaValue, setMeta } from "../db/legacy.js";
 import { isEnoent, writeJsonAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
@@ -88,12 +88,25 @@ export class PendingNotesStore {
     return join(this.sessionsDir, LEGACY_MARKER_FILENAME);
   }
 
-  /** The open database, imported and ready. Throws when it cannot be. */
+  /**
+   * The open database, imported and ready. Throws when it cannot be. A
+   * writable store uses this process's shared connection (sharedTomoDb), so
+   * its writes can join another store's transaction (a sub-session report's
+   * note and its delivered mark commit together).
+   */
   private ready(): TomoDb {
-    if (this.db) return this.db;
     let db: TomoDb;
     try {
-      db = openTomoDb(this.dbPath, { readOnly: this.opts.readOnly });
+      if (this.opts.readOnly) {
+        if (this.db) return this.db;
+        db = openTomoDb(this.dbPath, { readOnly: true });
+      } else {
+        db = sharedTomoDb(this.dbPath);
+        if (db === this.db) return db;
+        // The import moves the old file once its rows are in: never inside
+        // another transaction, which could still roll those rows back.
+        if (db.inWriteTransaction()) throw new Error("The pending notes store is first used inside another database transaction; it is opened on its own first");
+      }
     } catch (err) {
       if (err instanceof DbDamagedError) this.damaged = err;
       throw err;
@@ -105,7 +118,7 @@ export class PendingNotesStore {
         throw new Error(`${this.legacyPath} has not been imported into the database yet; Tomo imports it when it starts`);
       }
     } catch (err) {
-      db.close();
+      if (this.opts.readOnly) db.close();
       throw err;
     }
     this.db = db;
@@ -132,9 +145,25 @@ export class PendingNotesStore {
 
   /** Replace one session's notes (an empty list removes them), in one transaction. */
   set(key: string, notes: string[]): void {
+    this.setWith(key, notes, () => {});
+  }
+
+  /**
+   * {@link set}, with `also` in the same transaction: its writes to the same
+   * database (another store on this process's shared connection) commit with
+   * the notes, or neither does. Anything `also` throws rolls both back.
+   */
+  setWith(key: string, notes: string[], also: () => void): void {
     if (this.opts.readOnly) throw new Error("Read-only session store");
     const db = this.ready();
-    db.transaction(() => writeNotes(db, key, notes));
+    // Outermost only: inside someone else's transaction a "committed" here
+    // would not be, and the caller acts on it (the queue keeps the note, the
+    // delivery wakes the owning session).
+    if (db.inWriteTransaction()) throw new Error("PendingNotesStore.setWith must not run inside another transaction");
+    db.transaction(() => {
+      writeNotes(db, key, notes);
+      also();
+    });
   }
 
   /** `oldKey`'s notes go after `newKey`'s, under `newKey`, in one transaction. */
@@ -156,7 +185,8 @@ export class PendingNotesStore {
   }
 
   close(): void {
-    this.db?.close();
+    // The shared connection is the process's, not this store's.
+    if (this.opts.readOnly) this.db?.close();
     this.db = null;
   }
 

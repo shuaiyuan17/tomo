@@ -640,6 +640,7 @@ export class Agent {
       // A task owned by the owner's DM speaks for the owner alone: its notes
       // never drain into a summoned group's turn on that session.
       queuePendingNote: (key, note) => this.queuePendingNote(key, isDmSessionKey(key) ? markOwnerAudience(note) : note),
+      queuePendingNoteWith: (key, note, also) => this.pendingNotesQueue.queueNoteWith(key, isDmSessionKey(key) ? markOwnerAudience(note) : note, also),
       withdrawPendingNote: (key, match) => this.pendingNotesQueue.withdrawNote(key, match),
       hasPendingNote: (key, predicate) => this.pendingNotesQueue.hasNote(key, predicate),
       persistPendingNotes: (key) => this.pendingNotesQueue.persistNow(key),

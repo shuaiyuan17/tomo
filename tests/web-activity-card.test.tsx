@@ -413,6 +413,14 @@ describe("memory cards", () => {
     expect(deleted).not.toContain('href="#study/memory/scratch.md"');
     expect(deleted).toContain("Kept 30 days");
   });
+  it("without a result: no claim of what it changed; a path clipped through an emoji still renders", () => {
+    const unknown = card(row(call(del)));
+    expect(unknown).not.toContain("Kept 30 days");
+    expect(unknown).toContain("may or may not have happened");
+    expect(card(row(call(edit)))).not.toContain("Kyoto in June");
+    expect(() => card(row(call({ kind: "memory_delete", path: "a\ud83d" } as ToolActivity, { outcome: {} })))).not.toThrow();
+    expect(() => card(row(call({ ...edit, path: "a\ud83d" } as ToolActivity, { outcome: {} })))).not.toThrow();
+  });
   it("saved over budget: the tool's note in warn", () => {
     expect(card(row(call(edit, { outcome: { note: "MEMORY.md is now 210 lines, over its budget." } })))).toMatch(/text-warn[^>]*>MEMORY.md is now 210 lines/);
   });

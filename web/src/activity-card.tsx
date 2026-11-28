@@ -444,9 +444,10 @@ const MEMORY_WORDS = { create: "card.memoryAction.create", write: "card.memoryAc
 /** A memory path: monospace, relative to memory/, a link to it in the Study's Memory tab (not under private/, which the Study does not open). */
 function MemoryPath({ path, gone }: { path: string; gone?: boolean }) {
   const { t } = useTranslation("activity");
-  const hash = memoryFileHash(path);
   const text = <span className="font-mono text-[12.5px] [overflow-wrap:anywhere]">{path}</span>;
-  return gone || hash === "#study/memory" ? text
+  if (gone) return text;
+  const hash = memoryFileHash(path);
+  return hash === "#study/memory" ? text
     : <a href={hash} title={t("card.memoryOpen", { path })} className="text-foreground underline decoration-foreground/25 underline-offset-2 hover:decoration-foreground/60">{text}</a>;
 }
 
@@ -457,7 +458,8 @@ function MemoryLine({ row, state }: { row: MemoryRow; state: CardState }) {
   const Icon = state === "running" ? RunningMark : state === "unknown" ? CircleHelpIcon : action.icon;
   const note = row.result?.outcome?.note;
   let small: ReactNode = null;
-  if (state !== "error") {
+  // What it changed, only once it did: running, refused or without a result, the line claims nothing.
+  if (state === "done") {
     switch (activity.kind) {
       case "memory_write": small = activity.created ? t("card.memoryNew") : t("card.memoryReplaced"); break;
       case "memory_str_replace": small = <><span className="line-through decoration-muted-foreground/50">“{activity.old}”</span> → “{activity.new}”</>; break;

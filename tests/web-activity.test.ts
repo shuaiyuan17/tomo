@@ -252,6 +252,8 @@ describe("the main chat's tool items carry activity and outcome", () => {
     // A path the card cannot show exactly is not linked.
     expect(toolActivity(I("memory_delete"), { path: "work/my  notes.md" })).toMatchObject({ pathAltered: true });
     expect(toolActivity(I("memory_delete"), { path: " work/a.md " })).not.toHaveProperty("pathAltered");
+    expect(toolActivity(I("memory_delete"), { path: "./work/a.md" })).toMatchObject({ pathAltered: true });
+    expect(toolActivity(I("memory_move"), { from: "a.md", to: "work/../b.md" })).toMatchObject({ pathAltered: true });
     expect(toolActivity(I("memory_move"), { from: "a.md", to: "b.md" })).toEqual({ kind: "memory_move", from: "a.md", to: "b.md" });
     expect(toolActivity(I("memory_search"), { query: "kyoto" })).toEqual({ kind: "memory_search", query: "kyoto" });
   });

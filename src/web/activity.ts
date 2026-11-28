@@ -1,3 +1,4 @@
+import { posix } from "node:path";
 import { scrubSecretValues } from "../redact.js";
 import { redactText } from "./redact-command.js";
 import type { ToolActivity, ToolOutcome } from "./protocol.js";
@@ -37,7 +38,10 @@ const MEMORY_SNIPPET = 80;
 const altered = (p: { altered: boolean }) => (p.altered ? { pathAltered: true as const } : {});
 const memoryPath = (value: unknown): { path: string; altered: boolean } | undefined => {
   const path = line(value);
-  return path && typeof value === "string" ? { path, altered: path !== value.trim() } : undefined;
+  if (!path || typeof value !== "string") return undefined;
+  // Exact and already in the form the store resolves it to (no "./", "..", "//", leading "/" or backslash): only then a link.
+  const canonical = posix.normalize(path) === path && !path.startsWith("/") && !path.startsWith("./") && !path.includes("\\");
+  return { path, altered: path !== value.trim() || !canonical };
 };
 /** A card's body text (a brief, a message). */
 export const ACTIVITY_TEXT_LIMIT = 2_000;

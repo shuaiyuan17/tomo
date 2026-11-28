@@ -52,7 +52,9 @@ export function useStudyRoute(): [StudyPage | null, (page: StudyPage | null) => 
 export function memoryFileHash(path: string): string {
   const rel = path.replace(/^\/+/, "");
   if (/^private(?:\/|$)/i.test(rel)) return "#study/memory";
-  const encoded = encodeURIComponent(rel);
+  let encoded: string;
+  // A lone surrogate (a path clipped through an emoji) cannot be encoded: the tab alone.
+  try { encoded = encodeURIComponent(rel); } catch { return "#study/memory"; }
   return encoded.length <= 600 ? `#study/memory/${encoded}` : "#study/memory";
 }
 /** The memory path a `#study/memory/<path>` focus names, or null. */

@@ -93,6 +93,9 @@ describe("memory-store guard: Bash", () => {
     "mv /tmp/notes memory/notes",
     "rm -rf memory/project.v2",
     "echo x > memory/incoming-summary.md",
+    'cp "/tmp/draft.md" memory/note.md',
+    "rm memory/incoming-summary.md",
+    "mv memory/incoming-summary.md /tmp/",
   ])("refuses %j", (command) => {
     expect(bash(command)).toBe(true);
   });
@@ -107,6 +110,9 @@ describe("memory-store guard: Bash", () => {
     "echo 'memory/a.md' > /tmp/out.txt",
     "git commit -m 'echo > memory/a.md'",
     "cp /tmp/photo.png memory/notes/",
+    'cp "memory/note.md" /tmp/note.md',
+    "cp /tmp/report.md memory/incoming-files/",
+    "mv /tmp/report.md memory/incoming-files/",
   ])("lets %j through", (command) => {
     expect(bash(command)).toBe(false);
   });

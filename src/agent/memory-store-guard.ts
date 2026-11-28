@@ -78,8 +78,14 @@ function containsMemory(p: string, ctx: Ctx): boolean {
 }
 
 const isMarkdown = (p: string): boolean => /\.md$/i.test(p.replace(/\/+$/, ""));
-/** Inside an attachment folder (`incoming-files/...`): a folder, so a root-level `incoming-x.md` note doesn't count. */
-const inIncoming = (rel: string): boolean => rel.includes("/") && rel.split("/")[0].startsWith("incoming-");
+/**
+ * An attachment folder (`incoming-files/`) or something inside one. Only a
+ * folder counts: a root-level `incoming-x.md` is a note.
+ */
+function inIncoming(rel: string, p?: string, cwd?: string): boolean {
+  if (!rel.split("/")[0].startsWith("incoming-")) return false;
+  return rel.includes("/") || (p !== undefined && cwd !== undefined && isDir(p, cwd));
+}
 /** Is `p` an existing folder (following links)? */
 function isDir(p: string, cwd: string): boolean {
   try { return statSync(abs(expandTilde(p), cwd)).isDirectory(); } catch { return false; }
@@ -103,7 +109,7 @@ function isMemoryNote(p: string, ctx: Ctx): string | undefined {
 function isMemoryTree(p: string, ctx: Ctx): string | undefined {
   if (containsMemory(p, ctx)) return p;
   const rel = underMemory(p, ctx);
-  if (rel === undefined || inIncoming(rel) || rel.split("/")[0].startsWith("incoming-")) return undefined;
+  if (rel === undefined || inIncoming(rel, p, ctx.cwd)) return undefined;
   return isMarkdown(p) || maybeDir(p, ctx.cwd) ? p : undefined;
 }
 
@@ -137,12 +143,13 @@ function bashMemoryWrite(command: string, ctx: Ctx): string | null {
       const hit = isMemoryNote(t, here);
       if (hit) return hit;
     }
-    const at = commandWordIndex(tokens);
-    const verb = at === -1 ? null : writerAt(tokens, at);
+    // Words as the shell splits them (a quoted path keeps its spaces), without redirections.
+    const words = shellWords(segment);
+    const at = commandWordIndex(words);
+    const verb = at === -1 ? null : writerAt(words, at);
     if (!verb) continue;
-    const args = tokens.slice(at + 1);
-    // A quoted operand may hold spaces the word split broke apart: judge it whole as well.
-    const operands = [...args.flatMap((word) => pathCandidates(word)), ...quotedStrings(segment)].filter((w) => !w.startsWith("-"));
+    const args = words.slice(at + 1);
+    const operands = args.flatMap((word) => pathCandidates(word)).filter((w) => !w.startsWith("-"));
     if (verb === "dd") {
       for (const of of args.filter((w) => w.startsWith("of=")).map((w) => w.slice(3))) {
         const hit = isMemoryNote(of, here);
@@ -182,9 +189,34 @@ function bashMemoryWrite(command: string, ctx: Ctx): string | null {
   return null;
 }
 
-/** Quoted strings in a segment, whole (spaces kept). */
-function quotedStrings(segment: string): string[] {
-  return [...segment.matchAll(/"([^"]+)"|'([^']+)'/g)].map((m) => m[1] ?? m[2]);
+/**
+ * A segment's words, split on unquoted whitespace with the quotes removed, so
+ * `"trip notes.md"` stays one word; redirections (`>`, `>> f`, `2>&1`, `<<EOF`)
+ * and their targets are dropped (they are judged on their own).
+ */
+function shellWords(segment: string): string[] {
+  const words: string[] = [];
+  let cur = "";
+  let has = false;
+  let quote: string | null = null;
+  for (const ch of segment) {
+    if (quote) {
+      if (ch === quote) quote = null; else cur += ch;
+      continue;
+    }
+    if (ch === "'" || ch === "\"") { quote = ch; has = true; continue; }
+    if (/\s/.test(ch)) { if (has || cur) words.push(cur); cur = ""; has = false; continue; }
+    cur += ch;
+  }
+  if (has || cur) words.push(cur);
+  const out: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (/^\d*(>>?|<<?-?)(&\d+)?$/.test(w)) { i++; continue; }
+    if (/^\d*(>>?|<<?-?)/.test(w)) continue;
+    out.push(w);
+  }
+  return out;
 }
 
 /** `> "a b.md"`: a quoted redirection target, which the word-based reading cuts at the space. */
@@ -196,7 +228,7 @@ function quotedRedirectTargets(segment: string): string[] {
 function intoMemoryFolder(dest: string, ctx: Ctx): string | undefined {
   if (isMarkdown(dest)) return undefined;
   const rel = underMemory(dest, ctx);
-  if (rel === undefined || inIncoming(rel)) return undefined;
+  if (rel === undefined || inIncoming(rel, dest, ctx.cwd)) return undefined;
   return dest;
 }
 

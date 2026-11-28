@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { compile } from "tailwindcss";
 import { OVERLAY_QUERY, PHONE_QUERY } from "../web/src/layers.js";
 
@@ -48,7 +49,7 @@ describe("the shell's breakpoints", () => {
   });
 
   it("no page spells the two widths as arbitrary values, which would drift from layers.ts again", () => {
-    const dir = new URL("../web/src/", import.meta.url).pathname;
+    const dir = fileURLToPath(new URL("../web/src/", import.meta.url));
     const files = readdirSync(dir, { recursive: true, encoding: "utf8" }).filter((f) => /\.(tsx?|css)$/.test(f));
     const offenders = files.filter((f) => /(max|min)-\[(599|600|601|1023|1024|1025)px\]/.test(readFileSync(join(dir, f), "utf8")));
     expect(offenders).toEqual([]);

@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import { join, sep } from "node:path";
+import { join, posix, sep } from "node:path";
 import { PAGE_BYTES, readLine, readWindow, type ToolRedaction } from "./subagent-reader.js";
 import { isSidechainLine, mayHoldToolBlocks, reportUnreadable, SDK_SESSION_ID, sessionTranscriptFile, type Problem } from "./sdk-transcript.js";
 import { redactText, redactToolInput } from "./redact-command.js";
@@ -46,7 +46,7 @@ function redaction(scope: PrivateScope): ToolRedaction {
     : undefined;
   // No workspace known: any mention of memory/private withholds (fail closed).
   const reaches = (name: string, input: Record<string, unknown>) =>
-    (ctx ? isPrivateMemoryAccess(name, input, ctx) : false) || /memory[/\\]private/i.test(JSON.stringify(input));
+    memoryToolReachesPrivate(name, input) || (ctx ? isPrivateMemoryAccess(name, input, ctx) : false) || /memory[/\\]private/i.test(JSON.stringify(input));
   return {
     // A file/search tool aimed at memory/private shows its name and its
     // (redacted) path only: no old_string/new_string/content/pattern body,
@@ -68,7 +68,26 @@ function redaction(scope: PrivateScope): ToolRedaction {
 const PATH_TOOLS: Record<string, readonly string[]> = {
   Read: ["file_path"], Edit: ["file_path"], Write: ["file_path"], MultiEdit: ["file_path"],
   NotebookEdit: ["notebook_path"], Grep: ["path"], Glob: ["path"],
+  ...Object.fromEntries(["memory_write", "memory_str_replace", "memory_append", "memory_delete", "memory_read"].map((tool) => [`mcp__tomo-internal__${tool}`, ["path"]])),
+  "mcp__tomo-internal__memory_move": ["from", "to"], "mcp__tomo-internal__memory_list": ["prefix"],
 };
+
+/**
+ * The memory tools address memory/ by a relative path ("private/travel.md"),
+ * which the file-tool predicate does not see: one whose path (or a move's
+ * either end, or a list's prefix) lands in private/ reaches it. Normalised and
+ * case-folded (the disk may not tell case apart); the store refuses links, so
+ * the spelled path is the real one.
+ */
+function memoryToolReachesPrivate(name: string, input: Record<string, unknown>): boolean {
+  if (!/^mcp__tomo-internal__memory_/.test(name)) return false;
+  return ["path", "from", "to", "prefix"].some((key) => {
+    const value = input[key];
+    if (typeof value !== "string") return false;
+    const rel = posix.normalize(value.replace(/\\/g, "/").replace(/^\/+/, "")).toLowerCase();
+    return rel === "private" || rel.startsWith("private/");
+  });
+}
 
 export class SessionToolsError extends Error {
   constructor(readonly code: "invalid_cursor" | "transcript_reset") { super(code); }

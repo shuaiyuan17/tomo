@@ -250,7 +250,19 @@ export type ToolActivity =
   /** `query`: the first phrasing; `more`: how many others the call searched. */
   | { kind: "recall_conversation"; query?: string; more?: number }
   | { kind: "lcm_rollup"; level: "daily" | "weekly" | "monthly" | "yearly"; period?: string }
-  | { kind: "upsert_person"; name: string };
+  | { kind: "upsert_person"; name: string }
+  /**
+   * The memory tools: `path` relative to memory/. `created`: a memory_write of a new file (`if_version: "new"`);
+   * `old` / `new`: a memory_str_replace's two texts, each clipped to 80 characters; `lines`: how many a memory_append adds.
+   */
+  | { kind: "memory_write"; path: string; created?: true; chars: number }
+  | { kind: "memory_str_replace"; path: string; old: string; new: string }
+  | { kind: "memory_append"; path: string; lines: number; create?: true }
+  | { kind: "memory_move"; from: string; to: string }
+  | { kind: "memory_delete"; path: string }
+  | { kind: "memory_read"; path: string }
+  | { kind: "memory_list"; prefix?: string }
+  | { kind: "memory_search"; query: string };
 /**
  * What an internal tool's (successful) result says happened, read from its
  * text (src/web/activity.ts). `id`: what it made or touched (s12, t-41, a cron

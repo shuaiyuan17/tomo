@@ -228,6 +228,9 @@ function seedConversation(store: SessionStore): void {
   // A turn of Tomo's own tools (tomo-internal): rows as sentences, cards (see ACTIVITY below).
   add("user", "Can you have someone design the activity cards, tell the book club, and remind me tomorrow morning?", "web", q + 200_000);
   add("assistant", "Done: s2 is on the design, the book club has the note, and there's a reminder for 8:30 tomorrow.", "web", q + 260_000);
+  // A second turn: memory writes (one card) after a read and a search (lines).
+  add("user", "Remember the Kyoto trip moved to June, and file the old packing list.", "web", q + 270_000);
+  add("assistant", "Updated: Kyoto is June now, and the packing list is archived.", "web", q + 290_000);
   store.updateStats("dm:owner", { costUsd: 0.4, inputTokens: 1000, outputTokens: 400, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 128_400, contextMax: 200_000,
     // The SDK's real shape: what counts (sums to contextUsed), deferred tool schemas, the reserve and the free rest.
     contextBreakdown: [{ name: "System prompt", tokens: 9_200 }, { name: "System tools", tokens: 14_400 }, { name: "MCP tools", tokens: 3_400 },
@@ -269,6 +272,10 @@ function seedConversation(store: SessionStore): void {
     body += line("user", q + 201_000 + k * 3000 + (name === "recall_conversation" ? 2400 : 200),
       [{ type: "tool_result", tool_use_id: `i${k}`, content: out, ...(isError ? { is_error: true } : {}) }]);
   });
+  MEMORY_TURN.forEach(([name, input, out, isError], k) => {
+    body += line("assistant", q + 271_000 + k * 2000, [{ type: "tool_use", id: `mt${k}`, name: `mcp__tomo-internal__${name}`, input }]);
+    body += line("user", q + 271_000 + k * 2000 + 150, [{ type: "tool_result", tool_use_id: `mt${k}`, content: out, ...(isError ? { is_error: true } : {}) }]);
+  });
   writeFileSync(resolve(mockConfig.sdkSessionsDir, "sdk-rich.jsonl"), body);
 
   const subagents = resolve(mockConfig.sdkSessionsDir, "sdk-rich", "subagents");
@@ -285,6 +292,17 @@ function seedConversation(store: SessionStore): void {
 }
 
 /** One turn of Tomo's own tools: what the owner asked for above, as the transcript holds it. */
+/** The memory turn: a search and a read (lines), then four writes, one refused (a single card). */
+const MEMORY_TURN: [string, Record<string, unknown>, string, boolean?][] = [
+  ["memory_search", { query: "kyoto" }, "travel.md:4: Kyoto in May\ntravel.md:9: Kyoto packing list"],
+  ["memory_read", { path: "travel.md" }, "travel.md (version 3f2a91c0, 12 lines)\n\n---\ndescription: Trips\n---\n…"],
+  ["memory_str_replace", { path: "travel.md", old: "Kyoto in May", new: "Kyoto in June" }, "travel.md changed since you read it: read it again.", true],
+  ["memory_str_replace", { path: "travel.md", old: "Kyoto in May", new: "Kyoto in June" }, "Saved travel.md (version 8c1d22e4)."],
+  ["memory_move", { from: "packing.md", to: "archive/packing-2025.md" }, "Moved packing.md to archive/packing-2025.md (version 51b0aa9e)."],
+  ["memory_append", { path: "private/journal/2026-11-27.md", content: "Kyoto moved to June.\nPacking list archived.\n", create: true },
+    "Saved private/journal/2026-11-27.md (version 0d9e7712)."],
+];
+
 const ACTIVITY: [string, Record<string, unknown>, string, boolean?][] = [
   ["recall_conversation", { query: "activity cards" }, "3 message(s), oldest first. Searched back to 2026-10-15.\n\n…"],
   ["task_spawn", { title: "Web UI: activity cards for internal tool calls", model: "fable",
@@ -543,6 +561,13 @@ async function conversationSteps(page: Page, vp: Viewport, theme: Theme): Promis
     await reset(page);
     const card = history(page).locator("[data-activity-card=todo_add]").first();
     await card.evaluate((el) => el.scrollIntoView({ block: "start" }));
+    await page.waitForTimeout(300);
+    await snap();
+  });
+  await s("activity", "memory", async (snap) => {
+    await reset(page);
+    const card = history(page).locator("[data-activity-card=memory_str_replace]").first();
+    await card.evaluate((el) => el.scrollIntoView({ block: "center" }));
     await page.waitForTimeout(300);
     await snap();
   });

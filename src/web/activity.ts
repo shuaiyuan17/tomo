@@ -27,6 +27,8 @@ import { extractAttachments } from "../agent/text-utils.js";
 export const INTERNAL_TOOL_PREFIX = "mcp__tomo-internal__";
 /** A card's one-line fields (titles, ids, paths). */
 export const ACTIVITY_LINE_LIMIT = 200;
+/** Each side of a memory_str_replace on its card. */
+const MEMORY_SNIPPET = 80;
 /** A card's body text (a brief, a message). */
 export const ACTIVITY_TEXT_LIMIT = 2_000;
 
@@ -179,6 +181,33 @@ export function toolActivity(name: string, input: Record<string, unknown>): Tool
       const person = line(input.name);
       return person ? { kind: tool, name: person } : undefined;
     }
+    case "memory_write": {
+      const path = line(input.path);
+      return path && typeof input.content === "string" ? { kind: tool, path, ...(input.if_version === "new" ? { created: true } : {}), chars: input.content.length } : undefined;
+    }
+    case "memory_str_replace": {
+      const path = line(input.path);
+      if (!path || typeof input.old !== "string" || typeof input.new !== "string") return undefined;
+      return { kind: tool, path, old: clean(input.old, MEMORY_SNIPPET, true).text, new: clean(input.new, MEMORY_SNIPPET, true).text };
+    }
+    case "memory_append": {
+      const path = line(input.path);
+      if (!path || typeof input.content !== "string") return undefined;
+      return { kind: tool, path, lines: input.content.replace(/\n+$/, "").split("\n").length, ...(input.create === true ? { create: true } : {}) };
+    }
+    case "memory_move": {
+      const from = line(input.from); const to = line(input.to);
+      return from && to ? { kind: tool, from, to } : undefined;
+    }
+    case "memory_delete": case "memory_read": {
+      const path = line(input.path);
+      return path ? { kind: tool, path } : undefined;
+    }
+    case "memory_list": return { kind: tool, ...optional("prefix", line(input.prefix)) };
+    case "memory_search": {
+      const query = line(input.query);
+      return query ? { kind: tool, query } : undefined;
+    }
     default: return undefined;
   }
 }
@@ -313,6 +342,27 @@ export function toolOutcome(name: string, output: string): ToolOutcome | undefin
       return undefined;
     case "upsert_person":
       return ((m = /^(Created|Updated) person record:/.exec(text))) ? { status: m[1].toLowerCase() } : undefined;
+    // src/memory/store.ts: "Saved <path> (version v)." and, after it, a note (a file over its budget).
+    case "memory_write": case "memory_str_replace": case "memory_append":
+      if (!((m = /^Saved \S.* \(version [^)\s]+\)\.(?: ([\s\S]+))?$/.exec(text)))) return undefined;
+      return m[1] ? { note: clean(m[1].replace(/\s+/g, " ").trim(), ACTIVITY_LINE_LIMIT).text } : {};
+    case "memory_move": return /^Moved \S.* to \S.* \(version [^)\s]+\)\.$/.test(text) ? {} : undefined;
+    case "memory_delete": return /^Deleted \S.*\. Its content is kept for /.test(text) ? {} : undefined;
+    case "memory_read":
+      if (((m = /^\S.* \(version [^,)\s]+(?:, (\d+) lines\)|\), lines \d+–\d+ of (\d+))/.exec(first)))) return count(Number(m[1] ?? m[2]));
+      return /^\S.* \(version [^)\s]+\) has \d+ lines; offset \d+ is past the end\.$/.test(text) ? count(0) : undefined;
+    case "memory_list": {
+      const lines = text.split("\n");
+      if (/^\((?:no memory files under .+|no topic files yet)\)$/.test(lines[0])) return count(0);
+      const files = lines.filter((l) => l.startsWith("- "));
+      return files.length && lines.every((l) => l.startsWith("- ") || /^\(.+\)$/.test(l)) ? count(files.length) : undefined;
+    }
+    case "memory_search": {
+      if (/^No match for /.test(text)) return count(0);
+      const lines = text.split("\n");
+      const hits = lines.filter((l) => /^\S.*:\d+: /.test(l));
+      return hits.length && lines.every((l) => /^\S.*:\d+: /.test(l) || /^\(stopped at /.test(l)) ? count(hits.length) : undefined;
+    }
     case "list_sessions":
       return json(text) ? {} : undefined;
     case "pet_status": case "pet_feed": case "pet_play": case "pet_sleep": case "pet_hatch": {

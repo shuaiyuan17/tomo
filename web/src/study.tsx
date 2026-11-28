@@ -17,7 +17,7 @@ import { CostPage } from "./cost-page.js";
 import { Todos } from "./study-todos.js";
 import { Cron } from "./study-cron.js";
 import { ModelPage } from "./study-model.js";
-import { formatWhen, studyLabel, STUDY_PAGES, useResource, type StudyPage } from "./study-data.js";
+import { formatWhen, memoryPathFromFocus, studyLabel, STUDY_PAGES, useResource, type StudyPage } from "./study-data.js";
 import { i18n, Trans, useTranslation } from "./i18n/index.js";
 import { deferred, say, type Message } from "./i18n/message.js";
 
@@ -55,7 +55,7 @@ export function Study({ page, onPage, session, reload, inert, mutator, focus, cr
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto pt-5 pb-10 [scrollbar-color:var(--border)_transparent] [scrollbar-width:thin]" role="tabpanel" aria-label={studyLabel(page)}>
         {page === "todos" && <Todos reload={key} />}
-        {page === "memory" && <Memory reload={key} />}
+        {page === "memory" && <Memory reload={key} focus={focus ?? null} />}
         {page === "context" && <Context session={session} reload={key} />}
         {page === "model" && <ModelPage session={session} reload={key} mutator={mutator} />}
         {page === "cost" && <CostPage reload={key} focus={focus ?? null} />}
@@ -67,10 +67,13 @@ export function Study({ page, onPage, session, reload, inert, mutator, focus, cr
   </main>;
 }
 
-function Memory({ reload }: { reload: number }) {
+/** `focus`: a file a link opened (`#study/memory/<path>`, from an activity card). */
+function Memory({ reload, focus }: { reload: number; focus: string | null }) {
   const { t } = useTranslation(["study", "common"]);
   const [tree] = useResource<WebMemoryTree>("/memory/tree", reload);
-  const [selected, setSelected] = useState<string | null>(null);
+  const linked = memoryPathFromFocus(focus);
+  const [selected, setSelected] = useState<string | null>(linked);
+  useEffect(() => { if (linked) setSelected(linked); }, [linked]);
   const [draft, setDraft] = useState("");
   const [query, setQuery] = useState("");
   const [file] = useResource<WebMemoryFile>(selected ? `/memory/file?path=${encodeURIComponent(selected)}` : null, reload);

@@ -16,7 +16,8 @@ const STUDY_LABELS = {
 export function studyLabel(page: StudyPage): string { return i18n.t(STUDY_LABELS[page]); }
 
 /** `#study/<page>[/<item>]`: the Study is linkable and the back button leaves it. */
-const STUDY_HASH = /^#study(?:\/([a-z]+)(?:\/([A-Za-z0-9_-]{1,64}))?)?$/;
+// The item: an id, or a percent-encoded memory path (encodeURIComponent's alphabet).
+const STUDY_HASH = /^#study(?:\/([a-z]+)(?:\/([A-Za-z0-9_.~%!'()*-]{1,600}))?)?$/;
 export function viewFromHash(hash: string): StudyPage | null {
   const match = STUDY_HASH.exec(hash);
   if (!match) return null;
@@ -43,6 +44,21 @@ export function useStudyRoute(): [StudyPage | null, (page: StudyPage | null) => 
     setPage(next); setFocus(null);
   };
   return [page, go, focus];
+}
+/**
+ * Link to one memory file in the Study's Memory tab; the tab alone for a file
+ * under private/ (the Study does not open those) or a path too long to link.
+ */
+export function memoryFileHash(path: string): string {
+  const rel = path.replace(/^\/+/, "");
+  if (/^private(?:\/|$)/i.test(rel)) return "#study/memory";
+  const encoded = encodeURIComponent(rel);
+  return encoded.length <= 600 ? `#study/memory/${encoded}` : "#study/memory";
+}
+/** The memory path a `#study/memory/<path>` focus names, or null. */
+export function memoryPathFromFocus(focus: string | null | undefined): string | null {
+  if (!focus) return null;
+  try { return decodeURIComponent(focus); } catch { return null; }
 }
 /** Link to one cron job in the Study's Cron tab. */
 export function cronJobHash(id: string): string {

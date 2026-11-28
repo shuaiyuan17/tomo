@@ -19,8 +19,8 @@ describe("tomo init: the memory skeleton", () => {
     const d = new Date();
     expect(shared).toContain(`- ${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} [said]`);
     expect(shared).not.toContain("](");
-    // `## Don't keep` is there from the start: adding a heading later would rebuild a live session.
-    expect(readFileSync(join(mem, "private", "MEMORY.md"), "utf8")).toBe("## Private\n\n## Don't keep\n");
+    // `## Don't keep` is there from the start (adding a heading later would rebuild a live session), at the top: a core cut at its hard limit loses its bottom, not this.
+    expect(readFileSync(join(mem, "private", "MEMORY.md"), "utf8")).toBe("## Don't keep\n\n## Private\n");
   });
 
   it("without a personality, writes the bare headings", () => {

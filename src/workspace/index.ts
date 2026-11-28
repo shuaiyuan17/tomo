@@ -143,7 +143,7 @@ Memory files under \`memory/${PRIVATE_MEMORY_SUBDIR}/\` are restricted to DM ses
 /** The DM's Layout (§15.1 of the memory design, as of stage 3). `shared`: the private lines replaced by SHARED_PRIVATE_MEMORY_NOTE. */
 function dmLayout(shared: boolean): string {
   const privateLines = shared ? SHARED_PRIVATE_MEMORY_NOTE : `- **private/** is for what must stay between you and the owner; group chats never see it. Put these there, not in the shared files: health; money (income, assets, accounts, trades, debts); home address, whereabouts and daily routine; relationships, family matters and conflicts with others; other people's personal details; work that isn't public; anything the owner said to keep to yourselves. When unsure, choose private/.
-- **private/MEMORY.md** is loaded into this private conversation only: the private things most conversations need. Its \`## Don't keep\` section lists subjects the owner asked you to forget.`;
+- **private/MEMORY.md** is loaded into this private conversation only: the private things most conversations need. Its \`## Don't keep\` section, kept at the top, lists subjects the owner asked you to forget.`;
   return `- **Topic files** are where most things go: one subject per file, organized by topic, not by date. Each starts with frontmatter whose \`description:\` (one line) says when to read it. Only paths and descriptions are loaded (Memory files, below); read a file when its description bears on the task.
 - **MEMORY.md** is loaded into every conversation, group chats included. Keep in it only what most conversations need, or what you have gotten wrong more than once.
 ${privateLines}
@@ -208,7 +208,10 @@ A correction should spare the owner from correcting you again. Change the line w
 
   const forgetting = isGroup
     ? `When someone asks you to forget something, remove it from this chat's memory folder and say what you removed.`
-    : `When the owner asks you to forget something, remove it, add its subject in a few neutral words under \`## Don't keep\` in private/MEMORY.md, and say exactly what you removed: the conversation history still holds the original words. Don't save anything on a subject listed there.`;
+    : shared
+      // The shared variant has no private core in its prompt, so no Don't keep list to check against.
+      ? `private/MEMORY.md is not loaded now, and with it its \`## Don't keep\` list of subjects the owner asked you to forget. On the owner's own turn, read that list with memory_read before you save anything personal; on a group member's turn, save nothing personal about the owner. When asked to forget something, remove what you can reach, say what you removed, and ask the owner to repeat it in private so the subject goes on that list.`
+      : `When the owner asks you to forget something, remove it, add its subject in a few neutral words under \`## Don't keep\` in private/MEMORY.md, and say exactly what you removed: the conversation history still holds the original words. Don't save anything on a subject listed there.`;
 
   const instructions = `
 # MEMORY — Your Persistent Memory
@@ -240,7 +243,7 @@ ${corrections}
 
 ## Checking
 
-Don't answer from what you merely seem to remember. Before you state a date or fact from memory, read the line. If the owner asks how you know, give its date and source, and search the conversation for the original words. A newer message from the owner that contradicts a memory line means the line is out of date: fix it. What others say doesn't overturn the owner's \`said\` lines. Before you say what is or isn't saved, look.
+Don't answer from what you merely seem to remember. Before you state a date or fact from memory, read the line. If the owner asks how you know, give its date and source, and search the conversation for the original words. A newer message from the owner that contradicts a memory line means the line is out of date: ${isGroup ? "say so; here you can change only lines in this chat's memory folder, and the owner can correct the rest in private" : "fix it"}. What others say doesn't overturn the owner's \`said\` lines. Before you say what is or isn't saved, look.
 
 ## Never store
 

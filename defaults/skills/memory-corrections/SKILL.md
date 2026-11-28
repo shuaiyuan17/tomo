@@ -5,6 +5,8 @@ description: Use when the owner disputes or corrects a fact you stored or repeat
 
 # The latest correction wins
 
+In a group chat you can change only lines in that chat's own memory folder. For anything else, say plainly what is out of date and that the owner can correct it in private; don't try to write it.
+
 ## Check the latest value before you restate a fact
 - Read the stored line before you state a date or fact from it, and search the conversation for anything newer.
 - When there is both an original plan and a later correction, the latest dated statement from the owner is the current value. Never restate the original once it has been corrected.

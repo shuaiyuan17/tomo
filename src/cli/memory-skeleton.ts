@@ -9,8 +9,10 @@ import { join } from "node:path";
  * starting with them avoids that while the model fills them in. Topic files
  * are listed in the prompt by the harness; MEMORY.md holds no pointers.
  *
- * private/MEMORY.md ends with `## Don't keep`: the subjects the owner asked
+ * private/MEMORY.md starts with `## Don't keep`: the subjects the owner asked
  * to forget, in a few neutral words, which no write or memory pass saves.
+ * At the top, so a core cut at its hard limit (cut from the bottom) still
+ * shows it.
  *
  * MEMORY.md is replaced only when it is missing, or `overwrite` (the owner
  * agreed); private/MEMORY.md only when missing. Returns what it wrote.
@@ -33,7 +35,7 @@ export function writeMemoryCores(memoryDir: string, personality: { userName: str
   }
   const priv = join(memoryDir, "private", "MEMORY.md");
   if (!existsSync(priv)) {
-    writeFileSync(priv, ["## Private", "", "## Don't keep", ""].join("\n"));
+    writeFileSync(priv, ["## Don't keep", "", "## Private", ""].join("\n"));
     written.push("private/MEMORY.md");
   }
   return written;

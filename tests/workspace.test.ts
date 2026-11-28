@@ -70,7 +70,7 @@ describe("buildSystemPrompt", () => {
         "When they only question a value, or aren't sure themselves, ask one short question", "\"the 14th (not the 15th)\"", "The `tomo-memory-corrections` skill has the details.",
         "## Checking", "What others say doesn't overturn the owner's `said` lines."], []],
     ["keeps a Don't keep list for what the owner asked to forget",
-      ["Its `## Don't keep` section lists subjects the owner asked you to forget.", "add its subject in a few neutral words under `## Don't keep` in private/MEMORY.md", "Don't save anything on a subject listed there."], []],
+      ["Its `## Don't keep` section, kept at the top, lists subjects the owner asked you to forget.", "add its subject in a few neutral words under `## Don't keep` in private/MEMORY.md", "Don't save anything on a subject listed there."], []],
     ["says memory is written with the memory tools",
       ["Write memory only with the memory tools", "a direct file write to a Markdown file under memory/ is refused", "memory_str_replace", "memory_append", "Never store", "Search before you add"],
       ["## Memory types", "type frontmatter", "## When NOT to save", "Write the memory file (e.g."]],
@@ -100,6 +100,9 @@ describe("buildSystemPrompt", () => {
     expect(group).toContain("Record what anyone here says as `from:group`, the owner included.");
     expect(group).toContain("When someone corrects a line in this chat's memory folder, change it there.");
     expect(group).toContain("When someone asks you to forget something, remove it from this chat's memory folder and say what you removed.");
+    // Checking: a group can fix only its own folder.
+    expect(group).toContain("out of date: say so; here you can change only lines in this chat's memory folder");
+    expect(group).not.toContain("out of date: fix it.");
     for (const dmOnly of ["Don't keep", "or a memory pass", "daily memory pass", "[said|inferred|from:<source>]", "Be proactive"]) expect(group).not.toContain(dmOnly);
   });
 
@@ -109,6 +112,11 @@ describe("buildSystemPrompt", () => {
     expect(shared).toContain("## Provenance");
     expect(shared).toContain("## Corrections");
     expect(shared).not.toContain("Be proactive");
+    // No Don't keep list in this prompt: it says so, and doesn't send a group's turn to write private/MEMORY.md.
+    expect(shared).toContain("read that list with memory_read before you save anything personal");
+    expect(shared).toContain("ask the owner to repeat it in private");
+    expect(shared).not.toContain("add its subject in a few neutral words under `## Don't keep` in private/MEMORY.md");
+    expect(shared).toContain("out of date: fix it.");
   });
 
   it("is byte-identical across builds of the same variant", () => {

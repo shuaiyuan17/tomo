@@ -30,6 +30,10 @@ describe("the tomo-memory-corrections skill", () => {
     expect(fm.description).toMatch(/^Use when the owner disputes or corrects a fact you stored/);
   });
 
+  it("keeps a group chat's corrections to that chat's own folder", () => {
+    expect(text).toContain("In a group chat you can change only lines in that chat's own memory folder.");
+  });
+
   it("holds the two cases and the follow-through", () => {
     expect(text).toContain("# The latest correction wins");
     expect(text).toContain("## When the owner gives a new value");

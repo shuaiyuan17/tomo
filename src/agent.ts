@@ -4,6 +4,8 @@ import type { CompactReservation } from "./lcm/background-gate.js";
 import { forceCompactSession } from "./lcm/force-compact.js";
 import { sdkForceSummarizer } from "./lcm/force-summarizer.js";
 import { ForceCompactor } from "./agent/force-compactor.js";
+import { CoalescedWake } from "./agent/coalesced-wake.js";
+import { KeyedBackoff } from "./agent/keyed-backoff.js";
 import { config, CONFIG_BACKUP_PATH, CONFIG_PATH, RESTART_REASON_FILE } from "./config.js";
 import { buildIdentityPrompt, promptContextSnapshot, setMemoryGroupLabels } from "./workspace/index.js";
 import { groupMemoryDir } from "./workspace/memory-index.js";
@@ -159,9 +161,17 @@ const TASK_SEND_SETTLE_MS = 30_000;
 /** How much of a stale unmatched reply its warning note quotes. */
 const STALE_REPLY_EXCERPT = 2000;
 
-/** A task-message wake whose turn left the note unread is tried again this soon, this many times. */
-export const MESSAGE_WAKE_RETRY_MS = 60_000;
-export const MESSAGE_WAKE_RETRY_MAX = 5;
+/**
+ * A task-message wake whose turn left the note unread is tried again after
+ * MESSAGE_WAKE_RETRY_BASE_MS, doubling per attempt up to
+ * MESSAGE_WAKE_RETRY_CAP_MS, with no attempt limit (see retryMessageWake).
+ * The base is long enough not to hammer an API that just failed and short
+ * enough that a blip costs seconds; the first five retries span about the
+ * five minutes the old fixed retries did, and past that a quiet session
+ * still reads the note within the cap.
+ */
+export const MESSAGE_WAKE_RETRY_BASE_MS = 10_000;
+export const MESSAGE_WAKE_RETRY_CAP_MS = 5 * 60_000;
 
 export class Agent {
   private channels: Channel[] = [];
@@ -217,11 +227,11 @@ export class Agent {
   /** Sessions with a sub-session mirror note in flight: one at a time (see takeMirrorNote). */
   private readonly mirrorInFlight = new Set<string>();
   /** Sessions with a mirror wake turn queued: later rounds ride on it. */
-  private readonly mirrorWakeQueued = new Set<string>();
+  private readonly mirrorWakes = new CoalescedWake((key, task) => this.enqueueForSession(key, task));
   /** Sessions with a task-message wake turn queued (subsessions.ownerMessages "via-main"). */
-  private readonly messageWakeQueued = new Set<string>();
-  /** Message wakes retried in a row per session, after turns that left the note unread. */
-  private readonly messageWakeRetries = new Map<string, number>();
+  private readonly messageWakes = new CoalescedWake((key, task) => this.enqueueForSession(key, task));
+  /** Message wake retries per session, after turns that left the note unread: one timer per session. */
+  private readonly messageWakeRetry = new KeyedBackoff(MESSAGE_WAKE_RETRY_BASE_MS, MESSAGE_WAKE_RETRY_CAP_MS, (key) => this.messageWake(key));
   private readonly ownerNotices: OwnerNotices;
   private readonly mcpAuthPrompts: McpAuthPrompts;
   private pendingNotesQueue: PendingNotesQueue;
@@ -693,20 +703,17 @@ export class Agent {
    * at all if another turn has already shown it.
    */
   private mirrorWake(parentKey: string): void {
-    if (this.mirrorWakeQueued.has(parentKey)) return;
-    this.mirrorWakeQueued.add(parentKey);
+    if (this.mirrorWakes.isQueued(parentKey)) return;
     const prompt = appendToTomoEventBody(formatTomoEvent("subsession-activity",
       "A sub-session conversation is shown above. Take it in; nothing you write here is sent. If nothing needs doing, end with NO_REPLY.",
       { name: "check" }), CONTINUITY_DELIVERY_NOTE);
-    this.enqueueForSession(parentKey, async () => {
-      this.mirrorWakeQueued.delete(parentKey);
+    this.mirrorWakes.schedule(parentKey, async () => {
       // Only for words the owner wrote (another turn may have shown them meanwhile).
       if (this.stopping || !this.subsessions?.hasUnseenOwnerWords(parentKey)) return;
       // Asked again here: the quota window can fill while the wake waits.
       if (!this.subsessions.mirrorTurnAllowed()) return;
       await this.processContinuity(prompt, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionMirror"), "task-relay");
-    }).catch((err) => {
-      this.mirrorWakeQueued.delete(parentKey);
+    }, (err) => {
       log.error({ err, sessionKey: parentKey }, "Sub-session mirror turn failed in queue");
     });
   }
@@ -721,23 +728,25 @@ export class Agent {
    * pause: these are messages for the owner, not a look-along.
    */
   private messageWake(parentKey: string): void {
-    if (this.messageWakeQueued.has(parentKey)) return;
-    this.messageWakeQueued.add(parentKey);
+    if (this.messageWakes.isQueued(parentKey)) return;
     const prompt = appendToTomoEventBody(formatTomoEvent("subsession-message",
       "A sub-session (or the harness, about one) handed you something for the owner; it is in a note above. Pass it on as that note says (send_message), hold it for a better moment, or fold it into other news. A question waits for the owner's answer: put it to them, and pass their answer back with task_message and attach_owner_message, in the turn of their answer. A task the harness paused at a limit goes on with a task_message of your own once the owner says so (the note says which kind it is). If nothing needs doing, end with NO_REPLY.",
       { name: "check" }), CONTINUITY_DELIVERY_NOTE);
     let ran = false;
-    this.enqueueForSession(parentKey, async () => {
+    this.messageWakes.schedule(parentKey, async () => {
       ran = true;
-      this.messageWakeQueued.delete(parentKey);
-      if (this.stopping || !this.subsessions?.hasMessageNote(parentKey)) return;
+      if (this.stopping) return;
+      if (!this.subsessions?.hasMessageNote(parentKey)) {
+        // Another turn read it: the next failure starts from the base again.
+        this.messageWakeRetry.reset(parentKey);
+        return;
+      }
       try {
         await this.processContinuity(prompt, parentKey, undefined, ownerT("notices")("suppressed.turn.subsessionMessage"), "task-relay");
       } finally {
         this.retryMessageWake(parentKey);
       }
-    }).catch((err) => {
-      this.messageWakeQueued.delete(parentKey);
+    }, (err) => {
       log.error({ err, sessionKey: parentKey }, "Sub-session message turn failed in queue");
       // Retried by the turn's own finally when it ran.
       if (!ran) this.retryMessageWake(parentKey);
@@ -763,26 +772,31 @@ export class Agent {
 
   /**
    * After a message wake: a note it did not consume (the turn failed or was
-   * cut short, and the note went back to the queue) gets another wake in a
-   * while, a few times; past that it waits for the session's next turn or
-   * the next start. A turn that ran consumed what it read, and a note that
-   * came in during it queued its own wake, so a session that is quiet again
-   * makes no retry.
+   * cut short, and the note went back to the queue) gets another wake later,
+   * with exponential backoff (MESSAGE_WAKE_RETRY_BASE_MS doubling up to
+   * MESSAGE_WAKE_RETRY_CAP_MS) and no attempt limit: it keeps retrying at
+   * the cap while the note stays unread. One timer per session: a retry
+   * already pending covers a second failed wake, and a wake already queued
+   * needs none (its own turn decides again). A firing timer only asks for a
+   * wake, which merges with one queued meanwhile. A turn that ran consumed
+   * what it read, and a note that came in during it queued its own wake, so
+   * a session that is quiet again makes no retry and its backoff resets.
+   * The backoff is in memory: after a restart, wakeUnreadSubsessionNotes
+   * wakes every session with an unread note and a failure there starts
+   * from the base again. stop() drops the pending timers.
    */
   private retryMessageWake(parentKey: string): void {
-    if (this.stopping || this.messageWakeQueued.has(parentKey) || !this.subsessions?.hasMessageNote(parentKey)) {
-      if (!this.subsessions?.hasMessageNote(parentKey)) this.messageWakeRetries.delete(parentKey);
+    if (!this.subsessions?.hasMessageNote(parentKey)) {
+      this.messageWakeRetry.reset(parentKey);
       return;
     }
-    const attempts = (this.messageWakeRetries.get(parentKey) ?? 0) + 1;
-    if (attempts > MESSAGE_WAKE_RETRY_MAX) {
-      this.messageWakeRetries.delete(parentKey);
-      log.warn({ sessionKey: parentKey }, "Sub-session message turns keep failing; the note waits for the session's next turn");
-      return;
-    }
-    this.messageWakeRetries.set(parentKey, attempts);
-    const timer = setTimeout(() => this.messageWake(parentKey), MESSAGE_WAKE_RETRY_MS);
-    timer.unref?.();
+    if (this.stopping || this.messageWakes.isQueued(parentKey)) return;
+    const next = this.messageWakeRetry.schedule(parentKey);
+    if (!next) return;
+    const fields = { sessionKey: parentKey, attempt: next.attempt, delayMs: next.delayMs };
+    if (next.attempt === 1) log.warn(fields, "Sub-session message turn left the note unread; retrying with backoff");
+    else if (next.capped) log.warn(fields, "Sub-session message turns keep failing; retrying at the longest interval while the note stays unread");
+    else log.debug(fields, "Sub-session message turn retry scheduled");
   }
 
   /** A sub-session's prompt and limits; undefined for every other key (see LiveSessionManager). */
@@ -3887,6 +3901,7 @@ export class Agent {
     // dropped rather than honoured, so `tomo stop` cannot be reversed by one.
     this.stopping = true;
     this.subsessions?.stop();
+    this.messageWakeRetry.stop();
     // Before any session is closed: closing empties its task set, and what is
     // still running now was interrupted, not finished.
     this.runningAgents?.freeze();

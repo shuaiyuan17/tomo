@@ -2,9 +2,10 @@
 // One set of data for memory_list now and the generated prompt list later.
 // Pure fs + path: no runtime-path or config imports.
 import { createHash } from "node:crypto";
-import { lstatSync, readdirSync, readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { foldPath } from "../agent/permission-paths.js";
+import { foldPath, isInside } from "../agent/permission-paths.js";
+import { landsInPrivate } from "../agent/private-memory-reach.js";
 import { PRIVATE_MEMORY_SUBDIR } from "./private-memory.js";
 
 /**
@@ -81,15 +82,17 @@ export function isListedMemoryPath(rel: string): boolean {
 export function parseDescription(text: string): string | undefined {
   const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/);
   if (lines[0]?.trim() !== "---") return undefined;
-  for (let i = 1; i < lines.length && i < 200; i++) {
+  // A frontmatter block that is never closed is not frontmatter.
+  const close = lines.findIndex((line, i) => i > 0 && line.trim() === "---");
+  if (close === -1) return undefined;
+  for (let i = 1; i < close; i++) {
     const line = lines[i];
-    if (line.trim() === "---") return undefined;
     const m = /^description\s*:\s*(.*)$/.exec(line);
     if (!m) continue;
     let value = m[1].trim();
     if (/^[>|][+-]?$/.test(value)) {
       const parts: string[] = [];
-      for (let j = i + 1; j < lines.length && /^\s+\S/.test(lines[j]) && lines[j].trim() !== "---"; j++) parts.push(lines[j].trim());
+      for (let j = i + 1; j < close && /^\s+\S/.test(lines[j]); j++) parts.push(lines[j].trim());
       value = parts.join(" ");
     }
     if (value.length >= 2 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
@@ -105,6 +108,44 @@ export function descriptionProblem(text: string): "missing" | "too-long" | null 
   const d = parseDescription(text);
   if (d === undefined) return "missing";
   return Array.from(d).length > DESCRIPTION_MAX_CHARS ? "too-long" : null;
+}
+
+/** Why {@link readMemoryFile} refused a file. */
+export type UnreadableReason = "link" | "not-plain" | "outside" | "private" | "moved";
+
+/**
+ * Read one memory file safely: never through a symlink in its last part
+ * (`O_NOFOLLOW`), only a regular file with one name (a hard link is a second
+ * name for the same bytes), and, after opening, only when the file's real
+ * location is inside `memoryDir` (and not under private/ when
+ * `excludePrivate`) and is the very file that was opened. The last check is
+ * what makes a swap between checking a path and reading it harmless: a
+ * folder or file replaced by a link into private/ is refused, not read.
+ * Returns null when the file doesn't exist; throws on other I/O errors.
+ */
+export function readMemoryFile(abs: string, memoryDir: string, excludePrivate: boolean):
+  { bytes: Buffer } | { refused: UnreadableReason } | null {
+  let fd: number;
+  try {
+    fd = openSync(abs, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    if (code === "ELOOP") return { refused: "link" };
+    throw err;
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.nlink !== 1) return { refused: "not-plain" };
+    const real = realpathSync(abs);
+    if (!isInside(real, memoryDir)) return { refused: "outside" };
+    if (excludePrivate && landsInPrivate(real, { cwd: memoryDir, memoryDir, privateDir: join(memoryDir, PRIVATE_MEMORY_SUBDIR) })) return { refused: "private" };
+    const now = statSync(real);
+    if (now.ino !== st.ino || now.dev !== st.dev) return { refused: "moved" };
+    return { bytes: readFileSync(fd) };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export interface MemoryFileEntry {
@@ -178,13 +219,17 @@ export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileE
         if (depth < 8) walk(rel, depth + 1);
         continue;
       }
-      if (!st.isFile() || !/\.md$/i.test(name) || st.nlink !== 1) continue;
+      if (!st.isFile() || !/\.md$/i.test(name)) continue;
       if (isCoreMemoryPath(rel) && !opts.includeCores) continue;
       const listed = isListedMemoryPath(rel);
       if (!listed && !opts.includeUnlisted && !(opts.includeCores && isCoreMemoryPath(rel))) continue;
       if (prefix && foldPath(rel) !== prefix && !foldPath(rel).startsWith(`${prefix}/`)) continue;
       let content: Buffer;
-      try { content = readFileSync(join(opts.memoryDir, rel)); } catch { continue; }
+      try {
+        const read = readMemoryFile(join(opts.memoryDir, rel), opts.memoryDir, opts.excludePrivate);
+        if (read === null || "refused" in read) continue;
+        content = read.bytes;
+      } catch { continue; }
       const description = content.length <= maxBytes ? parseDescription(content.toString("utf8")) : undefined;
       entries.push({
         path: rel,

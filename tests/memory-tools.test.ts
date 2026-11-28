@@ -9,7 +9,7 @@ afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 const { buildMemoryTools, MEMORY_TOOL_NAMES } = await import("../src/mcp/memory-tools.js");
 const { MemoryStore, SEARCH_MAX_RESULTS } = await import("../src/memory/store.js");
 const { keptAt, keepOldVersion, sweepMemoryHistory } = await import("../src/memory/history.js");
-const { memoryVersion } = await import("../src/workspace/memory-index.js");
+const { memoryVersion, readMemoryFile, parseDescription } = await import("../src/workspace/memory-index.js");
 
 type ToolResult = { content: Array<{ type: string; text: string }>; isError?: boolean };
 interface ToolHandle { name: string; handler: (args: Record<string, unknown>, extra: unknown) => Promise<ToolResult> }
@@ -483,5 +483,45 @@ describe("history lives outside memory/", () => {
     const t = tools();
     expect((await t.call("memory_search", { query: "needle" })).text).toBe('No match for "needle".');
     expect((await t.call("memory_list", {})).text).toBe("(no topic files yet)");
+  });
+});
+
+describe("review fixes", () => {
+  it("an unclosed frontmatter block has no description", async () => {
+    expect(parseDescription("---\ndescription: Trips\nbody\n")).toBeUndefined();
+    expect((await tools().call("memory_write", { path: "a.md", content: "---\ndescription: Trips\nbody\n", if_version: "new" })).error).toBe(true);
+  });
+
+  it("a partial copy left under the same name is not taken for a kept version", () => {
+    const content = Buffer.from("the whole old file");
+    const first = keepOldVersion(hist, "a.md", Buffer.from("the who"), "aaaaaaaaaaaa", now);
+    const second = keepOldVersion(hist, "a.md", content, "aaaaaaaaaaaa", now);
+    expect(second).not.toBe(first);
+    expect(readFileSync(second)).toEqual(content);
+    // The same bytes again count as kept.
+    expect(keepOldVersion(hist, "a.md", content, "aaaaaaaaaaaa", now)).toBe(second);
+  });
+
+  it("keeps the old bytes before rewriting a file that isn't valid UTF-8", async () => {
+    mkdirSync(mem, { recursive: true });
+    const bytes = Buffer.concat([Buffer.from("---\ndescription: d\n---\n- caf"), Buffer.from([0xe9]), Buffer.from("\n")]);
+    writeFileSync(join(mem, "latin1.md"), bytes);
+    const r = await tools().call("memory_append", { path: "latin1.md", content: "- more" });
+    expect(r.error).toBe(false);
+    const copies = Object.keys(kept());
+    expect(copies).toHaveLength(1);
+    expect(readFileSync(join(hist, copies[0]))).toEqual(bytes);
+  });
+
+  it("refuses to read through a folder that leads into private/ on a barred turn, checked after opening", () => {
+    put("private/health.md", topic("H.", "- secret\n"));
+    symlinkSync(join(mem, "private"), join(mem, "innocent"));
+    // Opened by name (the last part is no link), then found to be private by its real path.
+    expect(readMemoryFile(join(mem, "innocent", "health.md"), mem, true)).toEqual({ refused: "private" });
+    expect(readMemoryFile(join(mem, "innocent", "health.md"), mem, false)).toMatchObject({ bytes: expect.any(Buffer) });
+    mkdirSync(join(mem, "..", "elsewhere"), { recursive: true });
+    writeFileSync(join(mem, "..", "elsewhere", "x.md"), "x");
+    symlinkSync(join(mem, "..", "elsewhere"), join(mem, "out"));
+    expect(readMemoryFile(join(mem, "out", "x.md"), mem, false)).toEqual({ refused: "outside" });
   });
 });

@@ -1,5 +1,5 @@
 // The memory tools' operations: synchronous read → check → keep → write.
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync } from "node:fs";
+import { linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { writeFileAtomicSync } from "../fs-utils.js";
 import { landsInPrivate } from "../agent/private-memory-reach.js";
@@ -13,6 +13,7 @@ import {
   isPeopleMemoryPath,
   isPrivateMemoryPath,
   memoryVersion,
+  readMemoryFile,
   MEMORY_FILE_HARD_KB,
   MEMORY_HARD_KB,
   MEMORY_HARD_LINES,
@@ -82,6 +83,8 @@ interface Current {
   bytes: Buffer;
   text: string;
   version: string;
+  /** The bytes are valid UTF-8: rewriting from `text` loses nothing. */
+  lossless: boolean;
 }
 
 /**
@@ -149,26 +152,42 @@ export class MemoryStore {
     return { rel, abs };
   }
 
-  /** The file's bytes, or null when it doesn't exist. Refuses a link, a non-file and a hard-linked file. */
-  private current(r: Resolved): Current | null {
-    let fd: number;
-    try {
-      fd = openSync(r.abs, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "ENOENT") return null;
-      if (code === "ELOOP") throw new MemoryToolError(`${r.rel} is a link; memory tools don't follow links.`);
-      throw err;
+  /**
+   * The file's bytes, or null when it doesn't exist. Refuses a link, a
+   * non-file, a hard-linked file, and one whose real location is outside
+   * memory/ (or under private/ on a barred turn) — checked after opening, so
+   * swapping a path for a link while a call runs reads nothing it shouldn't.
+   */
+  private current(r: Resolved, access: MemoryAccess): Current | null {
+    const read = readMemoryFile(r.abs, this.root(), access.privateBarred);
+    if (read === null) return null;
+    if ("refused" in read) {
+      if (read.refused === "private") throw new MemoryToolError(PRIVATE_BARRED_REFUSAL);
+      if (read.refused === "not-plain") throw new MemoryToolError(`${r.rel} is not a plain file (a folder, a device or a hard link).`);
+      if (read.refused === "moved") throw new MemoryToolError(`${r.rel} changed while it was being read. Try again.`);
+      throw new MemoryToolError(`${r.rel} is a link or leads outside memory/; memory tools don't follow links.`);
     }
-    try {
-      const st = fstatSync(fd);
-      // nlink: a second name for the same bytes could let a shared path reach a private file.
-      if (!st.isFile() || st.nlink !== 1) throw new MemoryToolError(`${r.rel} is not a plain file (a folder, a device or a hard link).`);
-      const bytes = readFileSync(fd);
-      return { bytes, text: bytes.toString("utf8"), version: memoryVersion(bytes) };
-    } finally {
-      closeSync(fd);
+    const text = read.bytes.toString("utf8");
+    return { bytes: read.bytes, text, version: memoryVersion(read.bytes), lossless: Buffer.from(text, "utf8").equals(read.bytes) };
+  }
+
+  /**
+   * Throws unless the file is still what this call read (`cur`, or absent
+   * when null). Run at the last moment before the write lands, so an outside
+   * writer (the owner's editor) that changed the file during the call is
+   * caught rather than overwritten.
+   */
+  private unchanged(r: Resolved, cur: Current | null): void {
+    let now: Buffer | null;
+    try { now = readFileSync(r.abs); } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      now = null;
     }
+    if (cur === null && now === null) return;
+    if (cur !== null && now !== null && memoryVersion(now) === cur.version) return;
+    throw now === null
+      ? new MemoryToolError(`${r.rel} was removed while this call ran. Check with memory_list and retry.`)
+      : new MemoryToolError(`${r.rel} changed since you read it (now version ${memoryVersion(now)}). Read it again with memory_read and retry.`);
   }
 
   private stale(rel: string, cur: Current): MemoryToolError {
@@ -217,9 +236,10 @@ export class MemoryStore {
     return new MemoryToolError(`${rel} needs frontmatter with a description: line (at most ${DESCRIPTION_MAX_CHARS} characters) saying when to read this file.`);
   }
 
-  private write(r: Resolved, text: string): string {
+  /** Write `text` over what this call read as `cur` (null: a new file), unless it changed meanwhile. */
+  private write(r: Resolved, cur: Current | null, text: string): string {
     mkdirSync(dirname(r.abs), { recursive: true });
-    writeFileAtomicSync(r.abs, text);
+    writeFileAtomicSync(r.abs, text, { beforeRename: () => this.unchanged(r, cur) });
     return memoryVersion(Buffer.from(text, "utf8"));
   }
 
@@ -247,7 +267,7 @@ export class MemoryStore {
 
   read(access: MemoryAccess, path: unknown, offset?: number, limit?: number): string {
     const r = this.resolve(path, access, "read");
-    const cur = this.current(r);
+    const cur = this.current(r, access);
     if (!cur) throw new MemoryToolError(`${r.rel} doesn't exist. memory_list shows what does; create it with memory_write and if_version "new".`);
     let lines = cur.text.split("\n");
     let withheld = 0;
@@ -316,7 +336,7 @@ export class MemoryStore {
 
   writeFile(access: MemoryAccess, path: unknown, content: string, ifVersion: string): string {
     const r = this.resolve(path, access, "write");
-    const cur = this.current(r);
+    const cur = this.current(r, access);
     if (ifVersion === "new") {
       if (cur) throw new MemoryToolError(`${r.rel} already exists (version ${cur.version}). Read it with memory_read, then replace it with that version, or pick another name.`);
     } else if (!cur) {
@@ -327,12 +347,12 @@ export class MemoryStore {
     if (isListedMemoryPath(r.rel) && descriptionProblem(content) !== null) throw this.missingDescription(r.rel);
     const note = this.checkSize(r.rel, cur?.text ?? null, content);
     if (cur) this.keep(r, cur);
-    return this.saved(r.rel, this.write(r, content), note);
+    return this.saved(r.rel, this.write(r, cur, content), note);
   }
 
   strReplace(access: MemoryAccess, path: unknown, oldText: string, newText: string): string {
     const r = this.resolve(path, access, "write");
-    const cur = this.current(r);
+    const cur = this.current(r, access);
     if (!cur) throw new MemoryToolError(`${r.rel} doesn't exist. memory_list shows what does.`);
     if (!oldText) throw new MemoryToolError("`old` is empty: give the exact text to change.");
     const at = cur.text.indexOf(oldText);
@@ -341,15 +361,16 @@ export class MemoryStore {
     const next = cur.text.slice(0, at) + newText + cur.text.slice(at + oldText.length);
     if (isListedMemoryPath(r.rel) && descriptionProblem(cur.text) === null && descriptionProblem(next) !== null) throw this.missingDescription(r.rel);
     const note = this.checkSize(r.rel, cur.text, next);
-    // Only a replacement that shortens the file loses content worth keeping.
-    if (Buffer.byteLength(next, "utf8") < cur.bytes.length) this.keep(r, cur);
-    return this.saved(r.rel, this.write(r, next), note);
+    // A replacement that shortens the file is the one that loses content worth
+    // keeping; so is any rewrite of bytes that weren't valid UTF-8.
+    if (Buffer.byteLength(next, "utf8") < cur.bytes.length || !cur.lossless) this.keep(r, cur);
+    return this.saved(r.rel, this.write(r, cur, next), note);
   }
 
   append(access: MemoryAccess, path: unknown, content: string, create = false): string {
     const r = this.resolve(path, access, "write");
     if (!content.trim()) throw new MemoryToolError("Nothing to append.");
-    const cur = this.current(r);
+    const cur = this.current(r, access);
     if (!cur && !(create && isJournalMemoryPath(r.rel))) {
       throw new MemoryToolError(create
         ? `Create ${r.rel} with memory_write, with a description in its frontmatter.`
@@ -359,33 +380,42 @@ export class MemoryStore {
     const before = cur?.text ?? "";
     const next = before === "" || before.endsWith("\n") ? before + body : `${before}\n${body}`;
     const note = this.checkSize(r.rel, cur?.text ?? null, next);
-    return this.saved(r.rel, this.write(r, next), note);
+    // The file is rewritten from its decoded text: bytes that weren't UTF-8 would be lost.
+    if (cur && !cur.lossless) this.keep(r, cur);
+    return this.saved(r.rel, this.write(r, cur, next), note);
   }
 
   move(access: MemoryAccess, from: unknown, to: unknown): string {
     const a = this.resolve(from, access, "write");
     const b = this.resolve(to, access, "write");
     if (isCoreMemoryPath(a.rel) || isCoreMemoryPath(b.rel)) throw new MemoryToolError("MEMORY.md files can't be moved, and nothing can be moved onto them.");
-    const cur = this.current(a);
+    const cur = this.current(a, access);
     if (!cur) throw new MemoryToolError(`${a.rel} doesn't exist. memory_list shows what does.`);
-    let exists = false;
-    try { lstatSync(b.abs); exists = true; } catch (err) {
+    const exists = new MemoryToolError(`${b.rel} already exists. Pick another name, or merge the two with memory_read and memory_write.`);
+    try { lstatSync(b.abs); throw exists; } catch (err) {
+      if (err === exists) throw err;
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
-    if (exists) throw new MemoryToolError(`${b.rel} already exists. Pick another name, or merge the two with memory_read and memory_write.`);
     if (isListedMemoryPath(b.rel) && !isListedMemoryPath(a.rel) && descriptionProblem(cur.text) !== null) throw this.missingDescription(b.rel);
     mkdirSync(dirname(b.abs), { recursive: true });
-    renameSync(a.abs, b.abs);
+    // link + unlink, not rename: link refuses an existing destination
+    // atomically, so a file created there meanwhile is never overwritten.
+    try { linkSync(a.abs, b.abs); } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") throw exists;
+      throw err;
+    }
+    unlinkSync(a.abs);
     return `Moved ${a.rel} to ${b.rel} (version ${cur.version}).`;
   }
 
   delete(access: MemoryAccess, path: unknown, ifVersion: string): string {
     const r = this.resolve(path, access, "write");
     if (isCoreMemoryPath(r.rel)) throw new MemoryToolError("MEMORY.md files can't be deleted. Change what they hold with memory_str_replace or memory_write.");
-    const cur = this.current(r);
+    const cur = this.current(r, access);
     if (!cur) throw new MemoryToolError(`${r.rel} doesn't exist. memory_list shows what does.`);
     if (cur.version !== ifVersion) throw this.stale(r.rel, cur);
     this.keep(r, cur);
+    this.unchanged(r, cur);
     unlinkSync(r.abs);
     return `Deleted ${r.rel}. Its content is kept for ${MEMORY_HISTORY_DAYS} days in Tomo's own data, outside memory.`;
   }

@@ -1,5 +1,5 @@
 // Old versions of memory files, kept before a write that loses content.
-import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, rmdirSync, unlinkSync, writeSync } from "node:fs";
+import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, rmdirSync, unlinkSync, writeSync } from "node:fs";
 import { join } from "node:path";
 
 /** How long an old version is kept. */
@@ -39,20 +39,26 @@ export function keptAt(name: string): number | undefined {
  *
  * Synchronous, and THROWS on any failure: the caller runs it in the same
  * synchronous stretch as the write and refuses the write when it throws, so
- * nothing is lost without a copy. Written with `wx` and fsynced; an existing
- * file of the same name holds the same bytes (the name carries their hash),
- * so that case counts as kept.
+ * nothing is lost without a copy. Written with `wx` and fsynced. A file of
+ * the same name that already holds exactly these bytes counts as kept; one
+ * that doesn't (a partial copy a failed attempt could not remove) is left,
+ * and the copy goes under the next free name.
  */
 export function keepOldVersion(historyDir: string, relPath: string, content: Buffer, version: string, now: number): string {
   const dir = join(historyDir, ...relPath.split("/"));
   mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const path = join(dir, `${stamp(now)}-${version}.md`);
-  let fd: number;
-  try {
-    fd = openSync(path, "wx", 0o600);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "EEXIST") return path;
-    throw err;
+  let path = "";
+  let fd: number | undefined;
+  for (let n = 1; fd === undefined; n++) {
+    path = join(dir, `${stamp(now)}-${version}${n > 1 ? `-${n}` : ""}.md`);
+    try {
+      fd = openSync(path, "wx", 0o600);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST" || n >= 20) throw err;
+      // Kept already only if it holds exactly these bytes: a partial copy
+      // left by a failed attempt is not a copy.
+      if (readFileSync(path).equals(content)) return path;
+    }
   }
   try {
     let off = 0;

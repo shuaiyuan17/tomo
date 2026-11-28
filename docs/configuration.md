@@ -288,7 +288,7 @@ You can also talk to a task yourself, from your own DM (Telegram or iMessage):
 
 Only an exact `stop`, `start`, `done` or `model <name>` is a command; `/s s3 stop the deploy` is a message.
 
-State lives in `~/.tomo/data/subsessions.json` (fsynced, with a `.bak`). If it cannot be read at start, sub-sessions stay off until it is repaired and nothing is unlinked or cancelled.
+State lives in `~/.tomo/data/subsessions.json` (fsynced, with a `.bak`). If it cannot be read at start, sub-sessions stay off until it is repaired and nothing is unlinked or cancelled. What the service keeps true about a task's state, and which test checks each rule, is in [subsessions-invariants.md](subsessions-invariants.md).
 
 ## Context management (LCM)
 

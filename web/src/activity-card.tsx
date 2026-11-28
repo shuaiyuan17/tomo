@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { ArrowRightIcon, BracesIcon, CheckIcon, FileIcon } from "lucide-react";
 import type { ToolActivity, WebSubsession } from "../../src/web/protocol.js";
 import { cn } from "@/lib/utils";
@@ -83,6 +83,9 @@ function RawCall({ row }: { row: ToolRow }) {
   const idRef = useRef<HTMLSpanElement>(null);
   // Without the clipboard (not a secure context, or denied): the JSON in a selected box, to copy by hand.
   const [manual, setManual] = useState(false);
+  const manualBox = useRef<HTMLTextAreaElement>(null);
+  // Focused and selected once, when it appears: not again on every re-render (a running card's clock).
+  useEffect(() => { if (manual) { manualBox.current?.focus(); manualBox.current?.select(); } }, [manual]);
   const json = JSON.stringify({ name: row.name, id: row.toolUseId, input: row.input, output: row.result?.output, isError: row.result?.isError ?? false }, null, 2);
   const took = callDuration(row);
   return <div className="space-y-2.5">
@@ -93,7 +96,7 @@ function RawCall({ row }: { row: ToolRow }) {
       <span className="ml-auto flex shrink-0 items-center gap-1"><CopyButton value={row.toolUseId} fallback={idRef} label={t("card.copyId", { id: row.toolUseId })} />
         <CopyButton value={json} fallback={() => setManual(true)} label={t("card.copyJson")} /></span>
     </div>
-    {manual && <textarea readOnly value={json} rows={6} aria-label={t("card.copyJson")} ref={(el) => { el?.focus(); el?.select(); }}
+    {manual && <textarea readOnly value={json} rows={6} aria-label={t("card.copyJson")} ref={manualBox}
       className="block w-full resize-y rounded-md border bg-background p-2 font-mono text-[11px] text-foreground" />}
     {row.input && <ToolSection label={t("chat:trace.input")} text={row.input} truncated={row.inputTruncated} />}
     {row.result && <ToolSection label={row.result.isError ? t("chat:trace.error") : t("chat:trace.output")} text={row.result.output} truncated={row.result.truncated} error={row.result.isError} />}

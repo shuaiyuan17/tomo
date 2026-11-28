@@ -134,9 +134,12 @@ describe("toolActivity reads the raw input", () => {
     expect(toolActivity(I("send_message"), { target: "telegram:-2", message: "hi" })).toMatchObject({ mode: "delegate", targetId: webSessionId("telegram:-2") });
     expect(toolActivity(I("send_message"), { target: "owner", message: "hi" })).toMatchObject({ toOwner: true });
     // The tags delivery strips anywhere in a line, quoted or not, and stickers.
-    const inline = toolActivity(I("send_message"), { target: "dm:owner", message: 'Here is the chart MEDIA:"/Users/me/my chart.png" and media:/tmp/b.pdf STICKER:abc' });
+    const inline = toolActivity(I("send_message"), { target: "dm:owner", mode: "direct", message: 'Here is the chart MEDIA:"/Users/me/my chart.png" and media:/tmp/b.pdf STICKER:abc' });
     expect(inline).toMatchObject({ text: "Here is the chart  and", media: ["my chart.png", "b.pdf"], stickers: 1 });
     expect(JSON.stringify(inline)).not.toContain("/Users/me");
+    // Delegated: passed on verbatim, so shown verbatim.
+    expect(toolActivity(I("send_message"), { target: "dm:owner", mode: "delegate", message: "Send them MEDIA:/tmp/b.pdf" })).toMatchObject({ text: "Send them MEDIA:/tmp/b.pdf" });
+    expect(toolActivity(I("send_message"), { target: "dm:owner", mode: "delegate", message: "Send them MEDIA:/tmp/b.pdf" })).not.toHaveProperty("media");
   });
   it("scrubs a secret in a text field", () => {
     const activity = toolActivity(I("task_message"), { id: "s1", text: "use sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH" });

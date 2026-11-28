@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { COMPACT_STALE_MS, HomeStatusReducer, MAX_HOME_SUBAGENTS, RATE_LIMIT_MS, subagentId, subsessionVisitorId, toolKind, TROUBLE_ERROR_MS, TURN_STALE_MS, turnSource } from "../src/home/status-reducer.js";
-import { HomeService, STATUS_MIN_INTERVAL_MS } from "../src/home/service.js";
+import { HomeService, STATUS_MIN_INTERVAL_MS, TURN_END_RECHECK_MS } from "../src/home/service.js";
 import { WatchBus } from "../src/watch/bus.js";
 import { TaskTracker, type TaskSystemMessage } from "../src/agent/task-tracker.js";
 import type { WatchEvent, WatchTask } from "../src/watch/protocol.js";
@@ -283,6 +283,25 @@ describe("home service publishing", () => {
     vi.advanceTimersByTime(STATUS_MIN_INTERVAL_MS);
     service.refresh();
     expect(last()).toEqual([]);
+  });
+
+  it("reads the sub-sessions once more after a turn ends: the turn still counts as in flight when its end is published", async () => {
+    vi.useFakeTimers({ now: 10_000 });
+    const bus = new WatchBus();
+    const events: WebEvent[] = [];
+    let inFlight = true;
+    service = new HomeService({ workspaceDir: join(root, "ws"), lastGoodPath: join(root, "last.json"), bus, pollMs: 60_000,
+      subsessions: () => inFlight ? [{ id: "s1", title: "Tidy the docs", startedAt: 5 }] : [] });
+    service.attachWeb({ publish: (e) => events.push(e), available: () => true, mayShowTask: () => true });
+    service.start();
+    const last = () => (events.filter((e) => e.type === "home-status").at(-1) as Extract<WebEvent, { type: "home-status" }>).status;
+    bus.publish({ type: "turn.start", sessionKey: "task:s1", source: "user" });
+    await vi.advanceTimersByTimeAsync(STATUS_MIN_INTERVAL_MS);
+    bus.publish({ type: "turn.end", sessionKey: "task:s1" });
+    expect(last()).toMatchObject({ working: false, subagents: [{ type: "subsession" }] });
+    inFlight = false;
+    await vi.advanceTimersByTimeAsync(TURN_END_RECHECK_MS);
+    expect(last().subagents).toEqual([]);
   });
 
   it("serves WebHome with the scene, revision and status; publishes home when the scene changes", async () => {

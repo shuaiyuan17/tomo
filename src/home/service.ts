@@ -26,6 +26,12 @@ export const STATUS_MIN_INTERVAL_MS = 250;
 export const STATUS_TICK_MS = 15_000;
 /** The next scheduled job and the pet's mood are re-read this often (and on each cron event). */
 export const OUTSIDE_REFRESH_MS = 60_000;
+/**
+ * A turn's end is published before the daemon stops counting the turn as in
+ * flight, and "is this sub-session at work" reads that count: the status is
+ * read once more this long after a turn ends.
+ */
+export const TURN_END_RECHECK_MS = 300;
 /** How long home_check waits for an open Home page to send its picture. */
 export const LOOK_TIMEOUT_MS = 6_000;
 const MAX_PENDING_LOOKS = 4;
@@ -84,6 +90,7 @@ export class HomeService {
   private unwatchStore: (() => void) | undefined;
   private tick: ReturnType<typeof setInterval> | undefined;
   private throttle: ReturnType<typeof setTimeout> | undefined;
+  private recheck: ReturnType<typeof setTimeout> | undefined;
   private lastPublishedAt = 0;
   private published: Partial<HomeStatus> | undefined;
   private outsideAt = 0;
@@ -110,6 +117,7 @@ export class HomeService {
         this.reducer.apply(event);
         if (event.type === "cron.fired" || event.type === "cron.done") this.refreshOutside(true);
         this.changed();
+        if (this.options.subsessions && (event.type === "turn.end" || event.type === "turn.requeue")) this.recheckSoon();
       } catch (error) { log.debug({ err: error }, "Home status: event not applied"); }
     });
     this.tick = setInterval(() => { this.refreshOutside(false); this.changed(); }, STATUS_TICK_MS);
@@ -120,6 +128,7 @@ export class HomeService {
     this.unwatchStore?.();
     clearInterval(this.tick);
     clearTimeout(this.throttle);
+    clearTimeout(this.recheck);
     this.store.stop();
     for (const [id, look] of this.pending) { clearTimeout(look.timer); look.resolve(undefined); this.pending.delete(id); }
   }
@@ -151,6 +160,12 @@ export class HomeService {
     return { scene: view.scene, revision: view.revision, starter: view.starter, ...(view.problems ? { problems: view.problems } : {}), status: this.status() };
   }
 
+  /** One more read shortly after a turn ends (TURN_END_RECHECK_MS); the latest end restarts the wait. */
+  private recheckSoon(): void {
+    clearTimeout(this.recheck);
+    this.recheck = setTimeout(() => { this.recheck = undefined; this.changed(); }, TURN_END_RECHECK_MS);
+    this.recheck.unref?.();
+  }
   private emit(event: WebEvent): void {
     try { this.link?.publish(event); } catch { /* an oversized or closed outlet never fails the daemon */ }
   }

@@ -100,6 +100,7 @@ describe("memory-store guard: Bash", () => {
     "rm memory/trip\\ notes.md",
     "printf x > memory/trip\\ notes.md",
     "rm 2>&1 memory/note.md",
+    "cat <<'EOF' > /tmp/x.sh\nrm memory/old.md\nEOF\nrm memory/after.md",
   ])("refuses %j", (command) => {
     expect(bash(command)).toBe(true);
   });
@@ -118,6 +119,7 @@ describe("memory-store guard: Bash", () => {
     "cp /tmp/report.md memory/incoming-files/",
     "mv /tmp/report.md memory/incoming-files/",
     `cp ${tree.home}/LICENSE memory/`,
+    "cat <<'EOF' > /tmp/cleanup.sh\nrm memory/old.md\necho done > memory/x.md\nEOF",
   ])("lets %j through", (command) => {
     expect(bash(command)).toBe(false);
   });

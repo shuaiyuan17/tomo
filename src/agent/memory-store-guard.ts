@@ -128,9 +128,30 @@ export function memoryStoreWriteTarget(toolName: string, toolInput: unknown, ctx
   return bashMemoryWrite(ti.command, ctx);
 }
 
+/**
+ * The command without its heredoc bodies: the lines after `<<EOF` up to the
+ * closing `EOF` are data handed to the command, not commands. The line that
+ * opens the heredoc stays, so `cat >> memory/x.md <<EOF` is still judged.
+ */
+export function withoutHeredocBodies(command: string): string {
+  const out: string[] = [];
+  let end: { word: string; tabs: boolean } | null = null;
+  for (const line of command.split("\n")) {
+    if (end) {
+      const probe = end.tabs ? line.replace(/^\t+/, "") : line;
+      if (probe === end.word) end = null;
+      continue;
+    }
+    out.push(line);
+    const m = /<<(-?)\s*(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z_][\w-]*))/.exec(line);
+    if (m) end = { word: m[2] ?? m[3] ?? m[4], tabs: m[1] === "-" };
+  }
+  return out.join("\n");
+}
+
 function bashMemoryWrite(command: string, ctx: Ctx): string | null {
   let cwd = ctx.cwd;
-  for (const segment of commandSegments(command.replace(/\$\(|`/g, "\n"))) {
+  for (const segment of commandSegments(withoutHeredocBodies(command).replace(/\$\(|`/g, "\n"))) {
     const tokens = bashTokens(segment);
     if (tokens[0] === "cd") {
       const target = tokens[1];

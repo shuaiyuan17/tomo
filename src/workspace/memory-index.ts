@@ -1,0 +1,201 @@
+// The memory files list: which files exist, their description and version.
+// One set of data for memory_list now and the generated prompt list later.
+// Pure fs + path: no runtime-path or config imports.
+import { createHash } from "node:crypto";
+import { lstatSync, readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { foldPath } from "../agent/permission-paths.js";
+import { PRIVATE_MEMORY_SUBDIR } from "./private-memory.js";
+
+/**
+ * Sizes, as lines or UTF-8 bytes, whichever is reached first (KB = 1024).
+ * The two cores (MEMORY.md, private/MEMORY.md) have a soft budget and a hard
+ * limit; every other memory file has a hard limit only.
+ */
+export const MEMORY_SOFT_LINES = 200;
+export const MEMORY_SOFT_KB = 16;
+export const MEMORY_HARD_LINES = 400;
+export const MEMORY_HARD_KB = 32;
+export const MEMORY_FILE_HARD_KB = 64;
+export const DESCRIPTION_MAX_CHARS = 200;
+
+/** A file's version: the first 12 hex characters of the sha256 of its bytes. */
+export function memoryVersion(content: Buffer | string): string {
+  return createHash("sha256").update(content).digest("hex").slice(0, 12);
+}
+
+/** Path segments, case- and Unicode-folded the way the private-memory guard compares them. */
+function folded(rel: string): string[] {
+  return foldPath(rel).split("/");
+}
+
+/** At or under `memory/private/`, by the folded first segment. */
+export function isPrivateMemoryPath(rel: string): boolean {
+  return folded(rel)[0] === PRIVATE_MEMORY_SUBDIR;
+}
+
+/** `MEMORY.md` or `private/MEMORY.md`. */
+export function isCoreMemoryPath(rel: string): boolean {
+  const f = folded(rel);
+  return (f.length === 1 && f[0] === "memory.md") || (f.length === 2 && f[0] === PRIVATE_MEMORY_SUBDIR && f[1] === "memory.md");
+}
+
+/** The people registry (`people/`, `private/people/`): written by upsert_person, not the memory tools. */
+export function isPeopleMemoryPath(rel: string): boolean {
+  const f = folded(rel);
+  return f[0] === "people" || (f[0] === PRIVATE_MEMORY_SUBDIR && f[1] === "people");
+}
+
+/** Inbound attachments (`incoming-images/`, `incoming-files/`, ...): not memory notes. */
+export function isIncomingMemoryPath(rel: string): boolean {
+  return folded(rel)[0].startsWith("incoming-");
+}
+
+/** Under a `journal/` folder at any depth. */
+export function isJournalMemoryPath(rel: string): boolean {
+  return folded(rel).slice(0, -1).includes("journal");
+}
+
+/** Under an `archive/` folder at any depth. */
+export function isArchiveMemoryPath(rel: string): boolean {
+  return folded(rel).slice(0, -1).includes("archive");
+}
+
+/**
+ * Does this file belong in the memory files list? Not the two cores (they
+ * are in the prompt whole), nothing under `journal/` or `archive/`, not the
+ * people registry, not attachments. The audience filter (private/ for a group
+ * turn) is separate: see {@link collectMemoryFiles}.
+ */
+export function isListedMemoryPath(rel: string): boolean {
+  return !isCoreMemoryPath(rel) && !isJournalMemoryPath(rel) && !isArchiveMemoryPath(rel)
+    && !isPeopleMemoryPath(rel) && !isIncomingMemoryPath(rel);
+}
+
+/**
+ * The frontmatter `description:` of a Markdown file, or undefined when there
+ * is no frontmatter or no description in it. Frontmatter is a `---` first
+ * line through the next `---` line. A folded or literal block (`>`, `|`)
+ * reads as its lines joined by spaces; surrounding quotes are dropped.
+ */
+export function parseDescription(text: string): string | undefined {
+  const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/);
+  if (lines[0]?.trim() !== "---") return undefined;
+  for (let i = 1; i < lines.length && i < 200; i++) {
+    const line = lines[i];
+    if (line.trim() === "---") return undefined;
+    const m = /^description\s*:\s*(.*)$/.exec(line);
+    if (!m) continue;
+    let value = m[1].trim();
+    if (/^[>|][+-]?$/.test(value)) {
+      const parts: string[] = [];
+      for (let j = i + 1; j < lines.length && /^\s+\S/.test(lines[j]) && lines[j].trim() !== "---"; j++) parts.push(lines[j].trim());
+      value = parts.join(" ");
+    }
+    if (value.length >= 2 && ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))) {
+      value = value.slice(1, -1).trim();
+    }
+    return value.length > 0 ? value : undefined;
+  }
+  return undefined;
+}
+
+/** What is wrong with a file's description, or null when it has a usable one. */
+export function descriptionProblem(text: string): "missing" | "too-long" | null {
+  const d = parseDescription(text);
+  if (d === undefined) return "missing";
+  return Array.from(d).length > DESCRIPTION_MAX_CHARS ? "too-long" : null;
+}
+
+export interface MemoryFileEntry {
+  /** Relative to memory/, `/`-separated. */
+  path: string;
+  description?: string;
+  version: string;
+  bytes: number;
+  /** Would the memory files list show it (see {@link isListedMemoryPath}). */
+  listed: boolean;
+  /** The bytes the version was taken from, when asked for (`withContent`). */
+  content?: Buffer;
+}
+
+export interface CollectOptions {
+  /** The memory root (an absolute, real directory). */
+  memoryDir: string;
+  /** Leave out everything under private/ (a group turn). */
+  excludePrivate: boolean;
+  /** Only paths under this folder (relative, no leading or trailing slash). */
+  prefix?: string;
+  /** Include files the list leaves out (journal/, archive/). People and attachments are never included. */
+  includeUnlisted?: boolean;
+  /** Include MEMORY.md and private/MEMORY.md (memory_search looks in them; the list does not). */
+  includeCores?: boolean;
+  /** Keep each file's bytes on its entry. */
+  withContent?: boolean;
+  /** Stop after this many files (default 5000). */
+  maxFiles?: number;
+  /** Stop after this long (default 500 ms). */
+  budgetMs?: number;
+  /** Skip reading files above this size: they get no description (default 1 MiB). */
+  maxFileBytes?: number;
+  now?: () => number;
+}
+
+/**
+ * Every memory file this audience may see, sorted by path. Synchronous.
+ * Never follows a symlink (a linked file or folder is skipped), only `.md`
+ * files count, and a file it cannot read is skipped. Sorting by path, not by
+ * modification time, keeps the list stable when an old file changes.
+ */
+export function collectMemoryFiles(opts: CollectOptions): { entries: MemoryFileEntry[]; truncated: boolean } {
+  const now = opts.now ?? Date.now;
+  const deadline = now() + (opts.budgetMs ?? 500);
+  const maxFiles = opts.maxFiles ?? 5000;
+  const maxBytes = opts.maxFileBytes ?? 1024 * 1024;
+  const prefix = opts.prefix ? foldPath(opts.prefix.replace(/\/+$/, "")) : "";
+  const entries: MemoryFileEntry[] = [];
+  let truncated = false;
+  const skipped = (rel: string): boolean => (opts.excludePrivate && isPrivateMemoryPath(rel))
+    || isPeopleMemoryPath(rel) || isIncomingMemoryPath(rel);
+  const underPrefix = (rel: string): boolean => {
+    if (!prefix) return true;
+    const f = foldPath(rel);
+    return f === prefix || f.startsWith(`${prefix}/`) || prefix.startsWith(`${f}/`);
+  };
+  const walk = (relDir: string, depth: number): void => {
+    let names: string[];
+    try { names = readdirSync(relDir ? join(opts.memoryDir, relDir) : opts.memoryDir); } catch { return; }
+    names.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    for (const name of names) {
+      if (entries.length >= maxFiles || now() > deadline) { truncated = true; return; }
+      if (name.startsWith(".")) continue;
+      const rel = relDir ? `${relDir}/${name}` : name;
+      if (skipped(rel) || !underPrefix(rel)) continue;
+      let st;
+      try { st = lstatSync(join(opts.memoryDir, rel)); } catch { continue; }
+      if (st.isSymbolicLink()) continue;
+      if (st.isDirectory()) {
+        if (depth < 8) walk(rel, depth + 1);
+        continue;
+      }
+      if (!st.isFile() || !/\.md$/i.test(name) || st.nlink !== 1) continue;
+      if (isCoreMemoryPath(rel) && !opts.includeCores) continue;
+      const listed = isListedMemoryPath(rel);
+      if (!listed && !opts.includeUnlisted && !(opts.includeCores && isCoreMemoryPath(rel))) continue;
+      if (prefix && foldPath(rel) !== prefix && !foldPath(rel).startsWith(`${prefix}/`)) continue;
+      let content: Buffer;
+      try { content = readFileSync(join(opts.memoryDir, rel)); } catch { continue; }
+      const description = content.length <= maxBytes ? parseDescription(content.toString("utf8")) : undefined;
+      entries.push({
+        path: rel,
+        ...(description !== undefined ? { description } : {}),
+        version: memoryVersion(content),
+        bytes: content.length,
+        listed,
+        ...(opts.withContent ? { content } : {}),
+      });
+    }
+  };
+  walk("", 0);
+  return { entries, truncated };
+}

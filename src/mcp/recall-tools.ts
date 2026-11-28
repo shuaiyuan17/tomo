@@ -369,9 +369,10 @@ export function recallAcross(
     if (msLeft <= 0 || bytesLeft <= 0) continue;
     const byteShare = Math.max(1, Math.floor(bytesLeft / share));
     source.recall = source.run({ ...opts, budget: { maxMs: msLeft / share, maxBytes: byteShare } });
-    // What it could have read at most: a transcript smaller than its share
-    // hands the rest on.
-    bytesLeft -= Math.min(source.bytes, byteShare);
+    // What it read, as the scan counted it; a scan that does not say is
+    // charged its whole share. A transcript smaller than its share hands the
+    // rest on. (A scan may overshoot its share by the chunk it was reading.)
+    bytesLeft -= source.recall.bytesRead ?? byteShare;
   }
 
   const all: RecallAcross["hits"] = [];
@@ -412,8 +413,14 @@ export function formatRecallAcross(across: RecallAcross, window: RecallWindow, t
   ].filter((n) => n !== "").join(" ");
   const searched = ["Searched:", ...reach].join("\n");
   if (across.hits.length === 0) {
+    // Only a search that reached the whole range of every conversation may
+    // say there is nothing there.
+    const partial = across.sources.some((source) => !source.recall || source.recall.stopped !== undefined);
+    const where = partial
+      ? "in the parts of this conversation and the group chats that were searched (some were cut short or not reached: see below)"
+      : `in this conversation or the ${groups} group chat(s)`;
     return [
-      `No matching messages found in this conversation or the ${groups} group chat(s).${notes ? ` ${notes}` : ""} Try other phrasings in queries, fewer or rarer words, or a wider time range.`,
+      `No matching messages found ${where}.${notes ? ` ${notes}` : ""} Try other phrasings in queries, fewer or rarer words, or a wider time range.`,
       searched,
     ].join("\n");
   }

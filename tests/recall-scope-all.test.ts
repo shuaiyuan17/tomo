@@ -35,12 +35,12 @@ function recallOf(hits: Array<{ content: string; at: number; score: number }>, e
 function fakeSources(spec: Array<{ key: string; title?: string; bytes: number; cost: number; recall?: TranscriptRecall }>, own: { bytes: number; cost: number; recall?: TranscriptRecall }) {
   let now = 0;
   const calls: Array<{ key: string; maxMs: number; maxBytes: number; startedAt: number }> = [];
-  const run = (key: string, cost: number, recall: TranscriptRecall | undefined, opts: RecallScoredOpts): TranscriptRecall => {
+  const run = (key: string, cost: number, recall: TranscriptRecall | undefined, opts: RecallScoredOpts, bytes: number): TranscriptRecall => {
     const maxMs = opts.budget!.maxMs;
     calls.push({ key, maxMs, maxBytes: opts.budget!.maxBytes, startedAt: now });
     const spent = Math.min(cost, maxMs);
     now += spent;
-    const base = recall ?? recallOf([]);
+    const base = { ...(recall ?? recallOf([])), bytesRead: Math.min(bytes, opts.budget!.maxBytes) };
     return cost > maxMs ? { ...base, stopped: { reason: "time", reachedBackTo: T0 } } : base;
   };
   const deps: RecallScopeAllDeps = {
@@ -49,12 +49,12 @@ function fakeSources(spec: Array<{ key: string; title?: string; bytes: number; c
     ownBytes: () => own.bytes,
     recallGroup: (key, opts) => {
       const s = spec.find((x) => x.key === key)!;
-      return run(key, s.cost, s.recall, opts);
+      return run(key, s.cost, s.recall, opts, s.bytes);
     },
     clock: () => now,
     budget: { maxMs: 300, maxBytes: 1000 },
   };
-  const ownRun = (opts: RecallScoredOpts) => run("own", own.cost, own.recall, opts);
+  const ownRun = (opts: RecallScoredOpts) => run("own", own.cost, own.recall, opts, own.bytes);
   return { deps, ownRun, calls };
 }
 
@@ -97,6 +97,38 @@ describe("sharing one budget", () => {
     recallAcross(ownRun, deps, OPTS);
     // 1000 bytes: g:a is offered 500 and can use 100 at most; own gets 900.
     expect(calls.map((c) => [c.key, c.maxBytes])).toEqual([["g:a", 500], ["own", 900]]);
+  });
+
+  it("charges the bytes a scan says it read, and a scan that does not say its whole share", () => {
+    const { deps, ownRun, calls } = fakeSources([{ key: "g:a", bytes: 100, cost: 1 }], { bytes: 5000, cost: 1 });
+    const silent = deps.recallGroup;
+    deps.recallGroup = (key, opts) => {
+      const result = silent(key, opts);
+      delete result.bytesRead;
+      return result;
+    };
+    recallAcross(ownRun, deps, OPTS);
+    expect(calls.map((c) => [c.key, c.maxBytes])).toEqual([["g:a", 500], ["own", 500]]);
+  });
+
+  it("charges finding the groups to the same budget", () => {
+    const { deps, ownRun, calls } = fakeSources([{ key: "g:a", bytes: 1, cost: 1 }], { bytes: 2, cost: 1000 });
+    let now = 0;
+    deps.clock = () => now;
+    const groups = deps.groups;
+    deps.groups = () => { now += 250; return groups(); };
+    recallAcross(ownRun, deps, OPTS);
+    // 50 ms left for two conversations.
+    expect(calls[0].maxMs).toBe(25);
+  });
+
+  it("does not claim nothing is there when part of the history was not searched", () => {
+    const { deps, ownRun } = fakeSources([{ key: "g:big", bytes: 500, cost: 1000 }], { bytes: 1, cost: 1 });
+    const cut = formatRecallAcross(recallAcross(ownRun, deps, OPTS), { fromTime: T0 - DAY, defaultWindow: false });
+    expect(cut).toMatch(/^No matching messages found in the parts of this conversation and the group chats that were searched/);
+    const whole = fakeSources([{ key: "g:small", bytes: 5, cost: 1 }], { bytes: 1, cost: 1 });
+    const done = formatRecallAcross(recallAcross(whole.ownRun, whole.deps, OPTS), { fromTime: T0 - DAY, defaultWindow: false });
+    expect(done).toMatch(/^No matching messages found in this conversation or the 1 group chat\(s\)\./);
   });
 
   it("does not search a conversation once the budget is spent, and says so", () => {
@@ -173,8 +205,8 @@ describe("the tool's scope argument", () => {
       ...(scopeAll ? {
         scopeAll: {
           allowed: () => true,
-          groups: () => [GROUP_A, GROUP_B].map((key, i) => ({ key, title: ["Orchard", "Neighbours"][i], bytes: store.transcriptBytes(key) })),
-          ownBytes: () => store.transcriptBytes(OWN),
+          groups: () => [GROUP_A, GROUP_B].map((key, i) => ({ key, title: ["Orchard", "Neighbours"][i], bytes: store.transcriptBytes([key])[0] })),
+          ownBytes: () => store.transcriptBytes([OWN])[0],
           recallGroup: (key, opts) => store.recallTranscript(key, opts),
           ...scopeAll,
         },
@@ -194,6 +226,14 @@ describe("the tool's scope argument", () => {
     expect(text).toContain("3 message(s), oldest first.");
     // Counted once, as one search.
     expect(searches.n).toBe(1);
+  });
+
+  it("gets real transcript sizes and real bytes read from the store", () => {
+    const [own, a] = store.transcriptBytes([OWN, GROUP_A]);
+    expect(own).toBeGreaterThan(0);
+    expect(a).toBeGreaterThan(0);
+    expect(store.transcriptBytes(["telegram:-999"])).toEqual([0]);
+    expect(store.recallTranscript(GROUP_A, { queries: ["walnut"] }).bytesRead).toBeGreaterThanOrEqual(a);
   });
 
   it("is this conversation only by default", async () => {

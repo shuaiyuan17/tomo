@@ -218,6 +218,8 @@ export interface TranscriptRecall {
    * time order).
    */
   stopped?: { reason: "time" | "bytes"; reachedBackTo: number | null };
+  /** Bytes the scan read, probes included: what it spent of `maxBytes`. */
+  bytesRead?: number;
 }
 
 /** What identifies one published version of the registry file. */
@@ -920,14 +922,17 @@ export class SessionStore {
       scanned,
       ...(scorer.clippedMessages > 0 ? { clipped: scorer.clippedMessages } : {}),
       ...(stopped ? { stopped } : {}),
+      bytesRead: progress.bytesRead,
     };
   }
 
-  /** Bytes on disk of every file `recallTranscript` would read for `key`
+  /** Bytes on disk of every file `recallTranscript` would read for each key
    *  (zero for one it cannot stat): how a search across several transcripts
-   *  shares out its budget. */
-  transcriptBytes(key: string): number {
-    return this.transcriptReadSet(key).files.reduce((sum, file) => sum + safeFileSize(file.path), 0);
+   *  shares out its budget. One directory listing for all of them. */
+  transcriptBytes(keys: readonly string[]): number[] {
+    const names = this.dirNames();
+    return keys.map((key) => this.readSetForStem(this.safeKey(key), names).files
+      .reduce((sum, file) => sum + safeFileSize(file.path), 0));
   }
 
   /** Search archive files (compacted SDK events) for a given session ID */
@@ -2969,10 +2974,9 @@ export class SessionStore {
     return this.readSetForStem(stem);
   }
 
-  private readSetForStem(stem: string): { files: TranscriptReadFile[]; hasSidecars: boolean } {
+  private readSetForStem(stem: string, names: readonly string[] = this.dirNames()): { files: TranscriptReadFile[]; hasSidecars: boolean } {
     // ONE listing for the whole family. Resolving each archive's sidecars with
     // its own `readdirSync` made this O(archives) directory scans per search.
-    const names = this.dirNames();
     const files: TranscriptReadFile[] = [{ path: join(this.dir, `${stem}.jsonl`), sidecar: false }];
     for (const sidecar of this.legacySidecarsFor(stem, names).reverse()) {
       files.push({ path: sidecar, sidecar: true });

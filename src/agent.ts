@@ -3429,16 +3429,17 @@ export class Agent {
       if (!isGroupSessionKey(key)) continue;
       if (!titles.has(key) || entry.chatTitle) titles.set(key, entry.chatTitle ?? titles.get(key));
     }
-    return [...titles].map(([key, title]) => ({
-      key,
-      ...(title ? { title } : {}),
-      bytes: this.sessions.transcriptBytes(key),
-    }));
+    const keys = [...titles.keys()];
+    const bytes = this.sessions.transcriptBytes(keys);
+    return keys.map((key, i) => {
+      const title = titles.get(key);
+      return { key, ...(title ? { title } : {}), bytes: bytes[i] };
+    });
   }
 
   /** Size of a session's transcript files, for sharing out a recall budget. */
   sessionTranscriptBytes(sessionKey: string): number {
-    return this.sessions.transcriptBytes(sessionKey);
+    return this.sessions.transcriptBytes([sessionKey])[0];
   }
 
   /** Scored recall of one GROUP's transcript, for a `scope: "all"` search.

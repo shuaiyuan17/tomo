@@ -445,6 +445,20 @@ describe("the rollback export (tomo db export subsessions)", () => {
     expect(metaValue(sharedTomoDb(dbPath()), SUBSESSIONS_EXPORTED_KEY)).toBeUndefined();
   });
 
+  it("refuses a rollback export beside a .bak, or with no table in the database, and marks nothing", () => {
+    const db = openTomoDb(dbPath());
+    try {
+      expect(() => exportSubsessionsToFile(db, path, { mark: true })).toThrow(/no sub-session table/);
+      mkdirSync(join(dir, "data"), { recursive: true });
+      writeLegacy(legacyTable(3), `${path}.bak`);
+      expect(() => exportSubsessionsToFile(db, path, { mark: true })).toThrow(/\.bak is there/);
+      expect(metaValue(db, SUBSESSIONS_EXPORTED_KEY)).toBeUndefined();
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
   it("an export whose file never landed is undone: the mark goes, the rows stay", () => {
     const store = new SubsessionStore(path);
     store.create({ parentKey: "dm:owner", title: "a", brief: "b" });

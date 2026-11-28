@@ -686,8 +686,18 @@ export function exportSubsessionsToFile(db: TomoDb, out: string, opts: { mark: b
   };
   if (!opts.mark) return write(readStored(db).table);
   const table = db.transaction(() => {
+    const stored = readStored(db);
+    // An older Tomo reads a file at the old path before its .bak: a .bak
+    // still there (one this version never imported, or one an older Tomo
+    // wrote after an earlier rollback) may be newer than these rows.
+    if (existsSync(`${out}.bak`)) {
+      throw new Error(`${out}.bak is there, and may hold tasks the database does not have. Start this Tomo once to import it, or move it aside, then export again.`);
+    }
+    if (!stored.written) {
+      throw new Error("The database has no sub-session table yet (this Tomo never started sub-sessions here): there is nothing to export, and nothing at the old path to replace.");
+    }
     setMeta(db, SUBSESSIONS_EXPORTED_KEY, new Date().toISOString());
-    return readStored(db).table;
+    return stored.table;
   });
   try {
     return write(table);

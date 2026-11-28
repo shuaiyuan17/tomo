@@ -74,4 +74,4 @@ clarified the scope.
 
 ## After writing
 
-Also append to `memory/journal/YYYY-MM-DD.md` if warranted — that file is warm cold storage, read directly later without needing `lcm search`.
+In your private conversation with the owner (not in a group chat), also append to `private/journal/YYYY-MM-DD.md` with `memory_append` (`create: true` for a new day) if warranted — that file is warm cold storage, read later with `memory_read` without needing `lcm search`.

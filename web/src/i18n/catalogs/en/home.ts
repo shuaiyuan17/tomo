@@ -11,7 +11,7 @@ export const home = {
   trouble: { retry: "retrying", rate_limit: "rate-limited, waiting", error: "hit an error" },
   troubleIdle: { retry: "Retrying", rate_limit: "Rate-limited, waiting", error: "The last turn hit an error" },
   compacting: "Compacting context", cronFired: "A scheduled job just fired", idle: "Idle", idleFor: "Idle for {{span}}",
-  subagents_one: "{{count}} subagent", subagents_other: "{{count}} subagents", tasks_one: "{{count}} background task", tasks_other: "{{count}} background tasks",
+  subagents_one: "{{count}} helper", subagents_other: "{{count}} helpers", tasks_one: "{{count}} background task", tasks_other: "{{count}} background tasks",
   nextJob: "next job {{when}}",
   failure: {
     chunk: "The room's drawing code didn't load.", webgl: "This browser can't draw the 3D room (WebGL is unavailable).",

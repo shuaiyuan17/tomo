@@ -424,6 +424,8 @@ export const mockConfig = {
   showThinking: false,
   /** config `credentialBroker`: off, as by default (tests/agent-credentials.test.ts turns it on). */
   credentialBroker: { enabled: false },
+  /** config `memory`: the store guard on, as by default. */
+  memory: { storeGuard: "enforce" as "enforce" | "warn" | "off" },
   liveSessionTimeoutMs: 10 * 60 * 1000,
   liveSessionIdleTimeoutMs: 0,
   litellm: null as { mode: "anthropic-compatible" | "chatgpt-subscription"; baseUrl: string; apiKey: string } | null,

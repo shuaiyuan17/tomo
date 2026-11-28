@@ -71,6 +71,7 @@ Security-related settings (`groupSandbox`, `credentialBroker`, `agentProfiles`) 
     "groupCompactStyle": "lcm"
   },
   "todos": { "maxOpen": 30, "maxSnoozes": 3 },
+  "memory": { "storeGuard": "enforce" },
   "web": { "enabled": true, "port": 9465 }
 }
 ```
@@ -209,9 +210,21 @@ Unresolvable entries are skipped with a warning in the logs — a bad plugin ref
 > [!NOTE]
 > A plugin that carries a `PreToolUse` hook disables Bash on group turns. See [Permissions and privacy](permissions-and-privacy.md#private-memory-and-group-turns).
 
+## Memory writes
+
+Tomo writes its memory (`~/.tomo/workspace/memory/`) with its memory tools (`memory_write`, `memory_str_replace`, `memory_append`, `memory_move`, `memory_delete`, plus `memory_list`, `memory_read`, `memory_search` for reading). They check a file's version before replacing or deleting it, and keep the old content for 30 days in `~/.tomo/data/memory-history/` before any write that loses some.
+
+`memory.storeGuard` says what happens when something writes a Markdown file under `memory/` directly instead (Write, Edit, MultiEdit, NotebookEdit, or a shell write such as `>>`, `tee`, `cp`, `mv`, `rm`, `sed -i`), including from a subagent:
+
+- `"enforce"` (default): refused, with a reason pointing to the memory tools.
+- `"warn"`: allowed, and logged (`Direct write to memory`, with the session, the tool, the path and the subagent type) so you can find what still writes directly before switching to `enforce`.
+- `"off"`: not checked.
+
+Attachments under `memory/incoming-*/`, reads, and non-Markdown files are never affected. Sub-sessions keep their own, stricter guard (no writes under `memory/` at all). The shell check reads the command text, so it catches habits, not a script determined to get around it.
+
 ## Continuity heartbeats
 
-With `continuity` on, Tomo gets a periodic heartbeat (every `continuityIntervalMinutes`, default 55) — unstructured time to reflect, tidy memory, journal, or prepare something for the next conversation. Standing instructions for heartbeats live in `~/.tomo/workspace/CONTINUITY.md`; `tomo continuity` triggers one by hand.
+With `continuity` on, Tomo gets a periodic heartbeat (every `continuityIntervalMinutes`, default 55) — unstructured time to reflect, tidy memory, or prepare something for the next conversation. Standing instructions for heartbeats live in `~/.tomo/workspace/CONTINUITY.md`; `tomo continuity` triggers one by hand.
 
 `continuityScript` can be an object (above) or a simple path string, e.g. `"continuityScript": "~/bin/tomo-continuity.sh"`. Relative paths resolve under `~/.tomo`; the script runs once per heartbeat (scheduled or manual), and its stdout/stderr or failure status is appended to the heartbeat prompt. `tomo todo due` is a good thing to call from it.
 

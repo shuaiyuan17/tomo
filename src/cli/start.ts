@@ -7,6 +7,7 @@ import { acquireMaintenanceLock, maintenanceLockPath, type MaintenanceLock } fro
 import { getRunningPid } from "./status-info.js";
 import type { CronJob } from "../cron/types.js";
 import { sleep } from "../sleep.js";
+import type { HomeSubsession } from "../home/status-reducer.js";
 
 const TOMO_HOME = defaultRuntimePaths.tomoHome;
 const PID_FILE = defaultRuntimePaths.pidFile;
@@ -243,12 +244,14 @@ async function startForeground(): Promise<void> {
   const { HomeService, setHomeService } = await import("../home/service.js");
   const { PetStore } = await import("../mcp/pet-store.js");
   let homeNextJob: () => number | undefined = () => undefined;
+  let homeSubsessions: () => readonly HomeSubsession[] = () => [];
   const home = new HomeService({
     workspaceDir: config.workspaceDir,
     lastGoodPath: join(config.tomoHome, "data", "home", "last-good.json"),
     // The window's sky: only the city goes to wttr.in, as for the heartbeat.
     city: config.city,
     nextJobAt: () => homeNextJob(),
+    subsessions: () => homeSubsessions(),
     petMood: () => { const pets = new PetStore(); const pet = pets.load(); return pet ? pets.computeMood(pet) : undefined; },
   });
   setHomeService(home);
@@ -279,6 +282,7 @@ async function startForeground(): Promise<void> {
     try {
       const { WebChannel } = await import("../channels/web.js");
       const { WebSupervisor } = await import("../web/supervisor.js");
+      const { runningSubsessions } = await import("../web/subsessions-view.js");
       const { ownerSessionKeyReader, sessionKeysReader, subagentModelReader } = await import("../web/data.js");
       const { UsageCache } = await import("../web/usage.js");
       const { fetchUsage } = await import("../agent/usage.js");
@@ -338,6 +342,9 @@ async function startForeground(): Promise<void> {
         mayShowTask: (key) => web.mayShowTask(key) });
       agent.addChannel(web);
       agent.onSubsessionsChanged(() => web.publishSubsessionsChanged());
+      // The running ones sit at the home's visitor seats (titles only, as the Tasks rail shows them).
+      homeSubsessions = () => runningSubsessions(web.subsessionList().tasks);
+      agent.onSubsessionsChanged(() => home.refresh());
       // /tasks in chat reads the same board the Tasks panel shows.
       agent.setTaskSource(web.tasks);
       web.markRecorded(agent.recordedWebRequests(web.interruptedAwaiting(), WEB_CHAT_ID));

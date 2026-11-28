@@ -30,7 +30,7 @@ describe("home contract copies", () => {
 
 describe("home caption", () => {
   it("says what is happening, work first", () => {
-    expect(homeCaption(idle({ working: true, by: "owner", subagents: [{ id: "a" }, { id: "b" }] }), NOW)).toBe("Working on your message · 2 subagents");
+    expect(homeCaption(idle({ working: true, by: "owner", subagents: [{ id: "a" }, { id: "b" }] }), NOW)).toBe("Working on your message · 2 helpers");
     expect(homeCaption(idle({ working: true, by: "cron" }), NOW)).toBe("Running a scheduled job");
     expect(homeCaption(idle({ working: true, by: "owner", tool: "shell" }), NOW)).toBe("Working on your message · running a command");
     expect(homeCaption(idle({ working: true, by: "owner", tool: "web", trouble: "retry" }), NOW)).toBe("Working on your message · retrying");
@@ -118,7 +118,7 @@ describe("signs", () => {
     const values = signValues(idle({ idleSince: NOW - 20 * 60_000, nextJobAt: NOW + 12 * 60_000, tasks: 3, subagents: [{ id: "a" }] }), NOW);
     expect(fillSign("Idle {idle} · next {next_job}", values)).toBe("Idle 20 min · next in 12 min");
     expect(fillSign("{subagents} visitors, {tasks} tasks, {nope}", values)).toBe("1 visitors, 3 tasks, {nope}");
-    expect(fillSign("{status}", values)).toBe("Idle for 20 min · 1 subagent · 3 background tasks");
+    expect(fillSign("{status}", values)).toBe("Idle for 20 min · 1 helper · 3 background tasks");
     expect(fillSign("{tool}", values)).toBe("");
     const long = fillSign("Task: {task}", { ...values, task: "x".repeat(200) });
     expect(long.length).toBe(MAX_SIGN_CHARS);

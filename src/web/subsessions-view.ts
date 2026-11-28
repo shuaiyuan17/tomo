@@ -1,5 +1,6 @@
 import { activeTotalMs, CHECKPOINT_MAX, currentStep, isTimestamp, joinedLine, needsOwner, OWNER_ACTION_MAX, PLAN_STEP_MAX, PROGRESS_TEXT_MAX, reportNumber, STEP_RESULT_MAX, TRANSITION_LOG_KEEP, UPDATES_KEEP, type SubsessionRecord } from "../agent/subsessions/types.js";
 import type { SubsessionEvent } from "../agent/subsessions/state-machine.js";
+import type { HomeSubsession } from "../home/status-reducer.js";
 import type { WebSubsession, WebSubsessionDetail, WebSubsessionMilestone, WebSubsessionStatus, WebSubsessionUpdate } from "./protocol.js";
 
 /**
@@ -85,6 +86,18 @@ export function subsessionList(records: readonly SubsessionRecord[], scope: stri
   const ended = views.filter((v) => !kept(v) && now - (v.endedAt ?? v.lastActivityAt) < SUBSESSION_ENDED_VISIBLE_MS)
     .sort((a, b) => (b.endedAt ?? b.lastActivityAt) - (a.endedAt ?? a.lastActivityAt));
   return [...open, ...ended.slice(0, Math.max(0, MAX_RAIL_SUBSESSIONS - open.length))];
+}
+
+/**
+ * The tasks of the rail's list that sit at the home's visitor seats: those
+ * at work right now. That is an active task, any task with a turn running,
+ * and one waiting on something external whose own background work still
+ * runs. Queued, waiting and ended tasks have nobody at a desk. Only the id,
+ * the title and the start time go on: the brief never reaches the home.
+ */
+export function runningSubsessions(tasks: readonly WebSubsession[]): HomeSubsession[] {
+  return tasks.filter((t) => t.status === "active" || t.working || t.background === true)
+    .map((t) => ({ id: t.id, title: t.title, startedAt: t.createdAt }));
 }
 
 /** The status changes worth a line in the history: not the queued/active churn of every turn and check-back. */

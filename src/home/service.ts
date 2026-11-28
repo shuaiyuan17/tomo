@@ -5,7 +5,7 @@ import { log } from "../logger.js";
 import { homeSnapshotSchema, WebError, type WebEvent, type WebHome } from "../web/protocol.js";
 import { decodeSnapshotPng } from "./snapshot.js";
 import { HomeSceneStore, type HomeView } from "./store.js";
-import { HomeStatusReducer } from "./status-reducer.js";
+import { HomeStatusReducer, type HomeSubsession } from "./status-reducer.js";
 import type { HomeStatus } from "./status.js";
 import { HomeWeatherSource, type FetchLike } from "./weather.js";
 
@@ -26,6 +26,12 @@ export const STATUS_MIN_INTERVAL_MS = 250;
 export const STATUS_TICK_MS = 15_000;
 /** The next scheduled job and the pet's mood are re-read this often (and on each cron event). */
 export const OUTSIDE_REFRESH_MS = 60_000;
+/**
+ * A turn's end is published before the daemon stops counting the turn as in
+ * flight, and "is this sub-session at work" reads that count: the status is
+ * read once more this long after a turn ends.
+ */
+export const TURN_END_RECHECK_MS = 300;
 /** How long home_check waits for an open Home page to send its picture. */
 export const LOOK_TIMEOUT_MS = 6_000;
 const MAX_PENDING_LOOKS = 4;
@@ -53,6 +59,8 @@ export interface HomeServiceOptions {
   nextJobAt?: () => number | undefined;
   /** The pet's mood word, if Tomo has a pet; must not throw. */
   petMood?: () => string | undefined;
+  /** The owner's running sub-sessions, as the browser may already see them (titles only); a throw seats nobody. */
+  subsessions?: () => readonly HomeSubsession[];
   /** The configured city (`config.city`): what the window shows. No city, no weather request. */
   city?: string | null;
   /** Weather fetch (tests). */
@@ -82,6 +90,7 @@ export class HomeService {
   private unwatchStore: (() => void) | undefined;
   private tick: ReturnType<typeof setInterval> | undefined;
   private throttle: ReturnType<typeof setTimeout> | undefined;
+  private recheck: ReturnType<typeof setTimeout> | undefined;
   private lastPublishedAt = 0;
   private published: Partial<HomeStatus> | undefined;
   private outsideAt = 0;
@@ -108,6 +117,7 @@ export class HomeService {
         this.reducer.apply(event);
         if (event.type === "cron.fired" || event.type === "cron.done") this.refreshOutside(true);
         this.changed();
+        if (this.options.subsessions && (event.type === "turn.end" || event.type === "turn.requeue")) this.recheckSoon();
       } catch (error) { log.debug({ err: error }, "Home status: event not applied"); }
     });
     this.tick = setInterval(() => { this.refreshOutside(false); this.changed(); }, STATUS_TICK_MS);
@@ -118,12 +128,15 @@ export class HomeService {
     this.unwatchStore?.();
     clearInterval(this.tick);
     clearTimeout(this.throttle);
+    clearTimeout(this.recheck);
     this.store.stop();
     for (const [id, look] of this.pending) { clearTimeout(look.timer); look.resolve(undefined); this.pending.delete(id); }
   }
 
   /** Connects the web UI: events go out through `link.publish`. */
   attachWeb(link: HomeWebLink): void { this.link = link; }
+  /** Something the status reads from outside the bus changed (the sub-session table): publish if it shows. */
+  refresh(): void { this.changed(); }
 
   /**
    * The status record. `sky` comes from the weather source: its progress is
@@ -131,7 +144,11 @@ export class HomeService {
    * minutes, while a new phase or weather is one at once.
    */
   status(): HomeStatus {
-    const status = this.reducer.status(this.now(), { mayShowTask: (key) => this.link?.mayShowTask(key) ?? false });
+    const status = this.reducer.status(this.now(), {
+      mayShowTask: (key) => this.link?.mayShowTask(key) ?? false,
+      // Like task text: nothing of a sub-session before a web UI is attached to show it.
+      ...(this.link && this.options.subsessions ? { subsessions: this.options.subsessions } : {}),
+    });
     const sky = this.weather.sky();
     return sky ? { ...status, sky } : status;
   }
@@ -143,6 +160,12 @@ export class HomeService {
     return { scene: view.scene, revision: view.revision, starter: view.starter, ...(view.problems ? { problems: view.problems } : {}), status: this.status() };
   }
 
+  /** One more read shortly after a turn ends (TURN_END_RECHECK_MS); the latest end restarts the wait. */
+  private recheckSoon(): void {
+    clearTimeout(this.recheck);
+    this.recheck = setTimeout(() => { this.recheck = undefined; this.changed(); }, TURN_END_RECHECK_MS);
+    this.recheck.unref?.();
+  }
   private emit(event: WebEvent): void {
     try { this.link?.publish(event); } catch { /* an oversized or closed outlet never fails the daemon */ }
   }

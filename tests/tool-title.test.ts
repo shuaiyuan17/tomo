@@ -86,5 +86,6 @@ describe("summarizeToolInput", () => {
     expect(toolTitle("mcp__mac-kit__mail_search", { limit: 5, query: "zagg  black\nfriday" })).toBe('mac-kit · mail_search "zagg black friday"');
     expect(toolTitle("mcp__claude_ai_Gmail__list", { limit: 5 })).toBe("claude_ai_Gmail · list");
     expect(toolTitle("mcp__docs__fetch", { url: "x".repeat(100) })).toBe(`docs · fetch "${"x".repeat(80)}…"`);
+    expect(toolTitle("mcp__vault__login", { password: "ordinary passphrase", user: "sam" })).toBe('vault · login "sam"');
   });
 });

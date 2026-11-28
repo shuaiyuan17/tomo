@@ -48,6 +48,17 @@ const optional = <K extends string>(key: K, value: string | undefined) => (value
 const oneOf = <T extends string>(value: unknown, options: readonly T[]): T | undefined =>
   typeof value === "string" && (options as readonly string[]).includes(value) ? value as T : undefined;
 
+/**
+ * A destination session key as the field carries it (`dm:owner`,
+ * `telegram:-100…`, `imessage:any;+;chat…`): only that shape is kept. The
+ * input pane blanks a field named `session`; this keeps the key so the card
+ * can name the conversation, but nothing else a model might have put there.
+ */
+const sessionKey = (value: unknown): string | undefined => {
+  const key = line(value);
+  return key && /^(?:dm|telegram|imessage|web|task):[^\s]{1,150}$/.test(key) && scrubSecretValues(key) === key ? key : undefined;
+};
+
 /** A `MEDIA:/path` line's file name (never the path: the card shows a chip). */
 const MEDIA_LINE = /^MEDIA:\s*(\S.*)$/;
 
@@ -113,7 +124,7 @@ export function toolActivity(name: string, input: Record<string, unknown>): Tool
       const name = line(input.name); const schedule = line(input.schedule); const message = body(input.message);
       if (!name || !schedule || !message) return undefined;
       return { kind: tool, name, schedule, message: message.text, ...(message.truncated ? { messageTruncated: true } : {}),
-        ...optional("session", line(input.session)), ...(input.once === true ? { once: true } : {}) };
+        ...optional("session", sessionKey(input.session)), ...(input.once === true ? { once: true } : {}) };
     }
     case "schedule_remove": {
       const id = line(input.id);

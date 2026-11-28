@@ -125,6 +125,7 @@ describe("toolActivity reads the raw input", () => {
   it("keeps a schedule's destination session (the input redaction would blank a key named `session`)", () => {
     expect(toolActivity(I("schedule_create"), { name: "Poll", schedule: "0 18 * * 5", message: "Post the poll", session: "telegram:-2" }))
       .toMatchObject({ session: "telegram:-2" });
+    expect(toolActivity(I("schedule_create"), { name: "Poll", schedule: "0 18 * * 5", message: "m", session: "hunter2-opaque-value" })).not.toHaveProperty("session");
   });
   it("send_message: MEDIA lines become file names, never paths", () => {
     const activity = toolActivity(I("send_message"), { target: "dm:owner", mode: "direct", message: "Here it is\nMEDIA:/Users/me/out/chart.png" });

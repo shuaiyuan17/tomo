@@ -114,14 +114,14 @@ it("opens Home from the sidebar, loads three.js only then, and follows the statu
 
   publish({ type: "home-status", status: status({ working: true, by: "owner", tool: "subagent", idleSince: undefined, subagents: [
     { id: "a", type: "explore", task: "Read the cron store" }, { id: "b", type: "general-purpose", task: "Draft the reply" }, { id: "c", task: "Check the tests" }] }) });
-  await browserExpect(caption(page)).toHaveText(/^Working on your message · 3 subagents/);
+  await browserExpect(caption(page)).toHaveText(/^Working on your message · 3 helpers/);
   await drawn(page);
   await page.screenshot({ path: "test-results/home-subagents-desktop.png" });
 
   // An older status (by the daemon's clock) never replaces a newer one.
   publish({ type: "home-status", status: status({ at: Date.now() - 60_000 }) });
   await page.waitForTimeout(300);
-  await browserExpect(caption(page)).toHaveText(/3 subagents/);
+  await browserExpect(caption(page)).toHaveText(/3 helpers/);
 
   publish({ type: "home-status", status: status({ cronAt: Date.now(), working: true, by: "cron", idleSince: undefined }) });
   await browserExpect(caption(page)).toHaveText(/^Running a scheduled job/);
@@ -213,7 +213,7 @@ it("on a phone: the room fills the width under the header, and its view is the o
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: "test-results/home-idle-phone.png" });
   publish({ type: "home-status", status: status({ working: true, by: "owner", idleSince: undefined, subagents: [{ id: "a", task: "Look it up" }, { id: "b", type: "explore", task: "Search" }, { id: "c" }] }) });
-  await browserExpect(caption(page)).toHaveText(/3 subagents/);
+  await browserExpect(caption(page)).toHaveText(/3 helpers/);
   await drawn(page);
   await page.screenshot({ path: "test-results/home-subagents-phone.png" });
   await page.evaluate(() => localStorage.setItem("tomo-theme", "dark"));
@@ -328,7 +328,7 @@ it("back from another app on a phone: the scrim is gone, nothing stays inert, an
       inert: [...document.querySelectorAll("main, header")].some((el) => (el as HTMLElement).inert) };
   })).toEqual({ top: 0, hit: true, scrolled: 0, inert: false });
   // The page reconnected and read /home again: the visitor shows.
-  await browserExpect(caption(page)).toHaveText(/1 subagent/);
+  await browserExpect(caption(page)).toHaveText(/1 helper/);
   expect(reads).toBeGreaterThan(before);
 });
 

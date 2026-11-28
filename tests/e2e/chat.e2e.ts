@@ -602,17 +602,21 @@ it("motion: new messages rise in, the rail transitions open and closed, and redu
 it("motion: only what is new rises in (never the history, on load or reload); dots wait for the reply, a skeleton for a slow history", async () => {
   // Every entrance animation the page starts on a message (its row's entrance element, or a streamed block), and every one cut short.
   await page.addInitScript(() => {
-    const w = window as unknown as { entrances: string[]; cancelled: string[] }; w.entrances = []; w.cancelled = [];
-    const record = (into: string[]) => (event: AnimationEvent) => {
+    type Seen = { el: Element; text: string };
+    const w = window as unknown as { entrances: Seen[]; cancelled: Seen[] }; w.entrances = []; w.cancelled = [];
+    // Both the text at the event and the element are kept: an entrance can start before the bubble's text is in it,
+    // so the text is also read again when the test asks (the entrance element is the same one from pending bubble to
+    // recorded message). Each event reads as both, so a filter sees what was there then and what is there now.
+    const record = (into: Seen[]) => (event: AnimationEvent) => {
       const el = event.target as Element;
       // (A streamed block that leaves mid-rise, replaced by the recorded message, is not a cut: the message carries it on.)
-      if (event.animationName === "motion-enter" && el.matches("[data-slot=message-entrance], article.message") && (event.type === "animationstart" || el.isConnected)) into.push(el.textContent ?? "");
+      if (event.animationName === "motion-enter" && el.matches("[data-slot=message-entrance], article.message") && (event.type === "animationstart" || el.isConnected)) into.push({ el, text: el.textContent ?? "" });
     };
     document.addEventListener("animationstart", record(w.entrances), true);
     document.addEventListener("animationcancel", record(w.cancelled), true);
   });
-  const entrances = () => page.evaluate(() => (window as unknown as { entrances: string[] }).entrances);
-  const cancelled = () => page.evaluate(() => (window as unknown as { cancelled: string[] }).cancelled);
+  const entrances = () => page.evaluate(() => (window as unknown as { entrances: { el: Element; text: string }[] }).entrances.map(({ el, text }) => `${text}\n${el.textContent ?? ""}`));
+  const cancelled = () => page.evaluate(() => (window as unknown as { cancelled: { el: Element; text: string }[] }).cancelled.map(({ el, text }) => `${text}\n${el.textContent ?? ""}`));
   const input = page.getByRole("textbox", { name: "Message Tomo" });
   const dots = page.locator("[data-slot=thinking-dots]");
   mockSdk.responseFn = () => "An old reply.";
@@ -684,9 +688,25 @@ it("motion: only what is new rises in (never the history, on load or reload); do
   await input.fill("a calm question"); await input.press("Enter");
   const calm = page.locator("article.message.user").filter({ hasText: "a calm question" });
   await browserExpect(calm).toBeVisible();
-  expect(await calm.evaluate((el) => getComputedStyle(el.closest("[data-slot=message-entrance]")!).animationName)).toBe("none");
+  // The bubble is swapped (pending → recorded) right about now, so the element a locator resolved can be detached
+  // before evaluate runs (closest() then finds no wrapper). Retry only that case; the first reading of a connected
+  // element is the one asserted, as before. (A rise that ran and ended is caught by the entrance log below.)
+  const firstConnected = async <T>(read: () => Promise<T | "detached">): Promise<T> => {
+    let value: T | "detached" = "detached";
+    await browserExpect.poll(async () => (value = await read()) !== "detached").toBe(true);
+    return value as T;
+  };
+  expect(await firstConnected(() => calm.evaluate((el) => {
+    if (!el.isConnected) return "detached" as const;
+    const wrapper = el.closest("[data-slot=message-entrance]");
+    return wrapper ? getComputedStyle(wrapper).animationName : "no entrance wrapper";
+  }))).toBe("none");
   await browserExpect(dots).toBeVisible();
-  expect(await dots.evaluate((el) => [getComputedStyle(el).animationName, getComputedStyle(el.querySelector("i")!).animationName])).toEqual(["none", "none"]);
+  expect(await firstConnected(() => dots.evaluate((el) => {
+    if (!el.isConnected) return "detached" as const;
+    const dot = el.querySelector("i");
+    return dot ? [getComputedStyle(el).animationName, getComputedStyle(dot).animationName] : ["no dot"];
+  }))).toEqual(["none", "none"]);
   answer("A calm reply.");
   await browserExpect(page.locator("article.message.assistant").filter({ hasText: "A calm reply." }).first()).toBeVisible();
   expect((await entrances()).filter((text) => text.includes("calm"))).toEqual([]);

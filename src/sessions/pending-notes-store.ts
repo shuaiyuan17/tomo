@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { DbDamagedError, openTomoDb, type TomoDb } from "../db/index.js";
 import { isEnoent, writeJsonAtomicSync } from "../fs-utils.js";
 import { log } from "../logger.js";
@@ -23,7 +23,10 @@ export const IMPORT_PENDING_KEY = "legacy_pending_notes_import_pending";
  * file is the truth. The next start imports it if it is there (a rollback
  * that was called off, or an older Tomo that left notes), and if it is gone
  * (an older Tomo delivered every note and deleted it) empties the table, so
- * nothing it already delivered is delivered again.
+ * nothing it already delivered is delivered again. While the export is
+ * between its mark and its file the value starts with EXPORT_WRITING_PREFIX,
+ * and a missing file then means the export never landed (the table is kept);
+ * see exportPendingNotesToFile.
  */
 export const EXPORTED_KEY = "legacy_pending_notes_exported";
 
@@ -160,15 +163,22 @@ export class PendingNotesStore {
   // --- Legacy file import ---
 
   private importLegacy(db: TomoDb): void {
+    const merge = this.finishStagedExport(db);
     // Read inside the write transaction: what is imported is what the file
     // held while nobody else could write the table.
-    const outcome = db.transaction((): { notes: Record<string, string[]>; displaced: number } | "none" | "consumed" | "unreadable" | "pending" => {
+    const outcome = db.transaction((): { notes: Record<string, string[]>; displaced: number } | "none" | "unlanded" | "consumed" | "unreadable" | "pending" => {
       let raw: Buffer;
       try {
         raw = readFileSync(this.legacyPath);
       } catch (err) {
         if (isEnoent(err)) {
-          if (!db.get("SELECT 1 FROM meta WHERE key = ?", EXPORTED_KEY)) return "none";
+          const mark = db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", EXPORTED_KEY);
+          if (!mark) return "none";
+          if (mark.value.startsWith(EXPORT_WRITING_PREFIX)) {
+            // The export's file never reached the legacy path: the table is still the truth.
+            db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
+            return "unlanded";
+          }
           db.run("DELETE FROM pending_notes");
           db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
           return "consumed";
@@ -186,22 +196,37 @@ export class PendingNotesStore {
       const digest = createHash("sha256").update(raw).digest("hex");
       const prev = db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", IMPORT_PENDING_KEY);
       if (prev?.value === digest) return "pending";
-      const displaced = Number(db.get<{ n: number }>("SELECT count(*) AS n FROM pending_notes")?.n ?? 0);
-      db.run("DELETE FROM pending_notes");
-      for (const [key, list] of Object.entries(notes)) writeNotes(db, key, list);
+      const displaced = merge ? 0 : Number(db.get<{ n: number }>("SELECT count(*) AS n FROM pending_notes")?.n ?? 0);
+      if (merge) {
+        // The older Tomo never saw the export (it was still staged): the
+        // table's notes were never delivered, and the file's came after them.
+        for (const [key, list] of Object.entries(notes)) writeNotes(db, key, [...readNotes(db, key), ...list]);
+      } else {
+        db.run("DELETE FROM pending_notes");
+        for (const [key, list] of Object.entries(notes)) writeNotes(db, key, list);
+      }
       db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", IMPORT_PENDING_KEY, digest);
       db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
       return { notes, displaced };
     });
+    // Committed: a staged export merged above is in the table now.
+    if (typeof outcome === "object" || outcome === "pending") this.removeStaged();
     if (outcome === "none") return;
+    if (outcome === "unlanded") {
+      log.warn({ file: this.legacyPath }, "A pending notes rollback export never wrote its file; the notes stay in the database");
+      return;
+    }
     if (outcome === "consumed") {
       log.info("The exported pending notes file is gone (an older Tomo delivered its notes): the table was emptied");
       return;
     }
     if (outcome === "unreadable") {
-      this.quarantineLegacy(this.unreadable);
-      // Moved aside by us, not consumed by an older Tomo: the table stays the truth.
+      // Moved aside by us, not consumed by an older Tomo: the table stays the
+      // truth. The mark goes first: a settled one beside no file would read,
+      // at the next start, as every note delivered.
       db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
+      this.quarantineLegacy(this.unreadable);
+      this.removeStaged();
       return;
     }
     if (typeof outcome === "object") {
@@ -227,6 +252,57 @@ export class PendingNotesStore {
       db.run("DELETE FROM meta WHERE key = ?", IMPORT_PENDING_KEY);
       return;
     }
+  }
+
+  /**
+   * A rollback export stopped between its steps (see exportPendingNotesToFile).
+   * A staged file whose mark settled is the export: with nothing at the legacy
+   * path it is renamed into place and imported like one. With a file there
+   * too, an older Tomo started without seeing the export and wrote its own:
+   * that file is MERGED into the table (returns true) instead of replacing
+   * it, since the table's notes, the export's, were never delivered. Any
+   * other staged file never reached the legacy path and goes (its notes are
+   * the table's).
+   */
+  private finishStagedExport(db: TomoDb): boolean {
+    const staged = stagedExportPath(this.legacyPath);
+    const mark = db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", EXPORTED_KEY)?.value;
+    const settled = mark !== undefined && !mark.startsWith(EXPORT_WRITING_PREFIX);
+    if (!existsSync(staged)) {
+      // An export file reaches the legacy path only once its mark settles:
+      // a file there beside a "writing" mark is an older Tomo's own.
+      if (mark !== undefined && !settled && existsSync(this.legacyPath)) {
+        log.warn({ file: this.legacyPath }, "An older Tomo wrote its own pending notes file after a rollback export that never landed; merging it into the database");
+        return true;
+      }
+      return false;
+    }
+    if (settled && !existsSync(this.legacyPath)) {
+      renameSync(staged, this.legacyPath);
+      log.warn({ file: this.legacyPath }, "Finished a pending notes rollback export that stopped before its file was in place");
+      return false;
+    }
+    if (settled) {
+      log.warn({ file: this.legacyPath }, "An older Tomo wrote its own pending notes file while the rollback export was still staged; merging it into the database");
+      // The staged file goes once the import commits (with the mark), or stays for the next start.
+      this.stagedToRemove = staged;
+      return true;
+    }
+    // Never published (the mark is "writing", or gone): its notes are the table's.
+    unlinkSync(staged);
+    if (mark !== undefined && existsSync(this.legacyPath)) {
+      log.warn({ file: this.legacyPath }, "An older Tomo wrote its own pending notes file after a rollback export that never landed; merging it into the database");
+      return true;
+    }
+    return false;
+  }
+
+  private stagedToRemove: string | null = null;
+
+  private removeStaged(): void {
+    if (this.stagedToRemove === null) return;
+    try { unlinkSync(this.stagedToRemove); } catch (err) { if (!isEnoent(err)) log.warn({ err }, "Could not remove the staged pending notes export"); }
+    this.stagedToRemove = null;
   }
 
   /**
@@ -339,22 +415,110 @@ export function parsePendingNotesFile(raw: Buffer): Record<string, string[]> {
 }
 
 /**
- * Write every note to the legacy file at `out`. With `mark` (the rollback
- * path, to the file the older Tomo reads) the table is marked exported in the
- * same write transaction, the file written and fsynced inside it: the mark
- * commits only with the file on disk. The table itself is not changed, so an
- * export can be repeated. Returns how many notes were written.
+ * Prefix of the EXPORTED_KEY value while a rollback export is between its
+ * mark and its file: the mark and the snapshot are committed, the file is not
+ * at the legacy path yet (at most staged beside it). The next start reads that
+ * as an export that never landed: the table stays the truth. Any other value
+ * (a timestamp) is a settled export.
+ */
+export const EXPORT_WRITING_PREFIX = "writing ";
+
+/** Where a rollback export stages its file before the mark settles and it is renamed into place. */
+export function stagedExportPath(out: string): string {
+  return `${out}.export-staged`;
+}
+
+/**
+ * Write every note to the legacy file at `out`, fsynced. The table itself is
+ * not changed, so an export can be repeated. Returns how many notes were
+ * written.
+ *
+ * With `mark` (the rollback path, to the file the older Tomo reads) the
+ * export is recorded in `meta` (EXPORTED_KEY), the mark committed BEFORE any
+ * file reaches `out` (the order the cron export uses):
+ *
+ * 1. the snapshot and a "writing" mark commit together;
+ * 2. the file is written, fsynced, to a staged path beside `out`;
+ * 3. the mark settles (a timestamp);
+ * 4. the staged file is renamed to `out`.
+ *
+ * So `out` never holds an export without its settled mark (a file without it
+ * would be imported at the next start as one an older Tomo wrote, bringing
+ * back notes delivered since), and a settled mark without `out` is either the
+ * staged file still waiting (the next start imports it) or an older Tomo that
+ * delivered every note and deleted the file (the next start empties the
+ * table). A failure before step 3 takes the mark back; one it cannot take
+ * back stays "writing", which the next start reads as "never landed".
+ *
+ * Refuses while a settled mark is there: a second export would overwrite the
+ * one fact that says an older Tomo may have delivered the table's notes.
  */
 export function exportPendingNotesToFile(db: TomoDb, out: string, opts: { mark: boolean }): number {
-  const write = (): number => {
+  const count = (notes: Record<string, string[]>): number => Object.values(notes).reduce((n, list) => n + list.length, 0);
+  if (!opts.mark) {
     const notes = readAllNotes(db);
-    const file: PendingNotesFile = { version: 1, notes };
-    writeJsonAtomicSync(out, file, { fsync: true });
-    return Object.values(notes).reduce((n, list) => n + list.length, 0);
-  };
-  if (!opts.mark) return write();
-  return db.transaction(() => {
-    db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", EXPORTED_KEY, new Date().toISOString());
-    return write();
+    writeJsonAtomicSync(out, { version: 1, notes } satisfies PendingNotesFile, { fsync: true });
+    return count(notes);
+  }
+  const at = new Date().toISOString();
+  const notes = db.transaction(() => {
+    const prev = db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", EXPORTED_KEY);
+    if (prev && !prev.value.startsWith(EXPORT_WRITING_PREFIX)) {
+      throw new Error("The notes were already exported for a rollback, and that export is not settled yet. "
+        + "Start this Tomo once (it imports the exported file, or, when it is gone, takes it that an older Tomo delivered every note), then export again.");
+    }
+    setMeta(db, EXPORTED_KEY, `${EXPORT_WRITING_PREFIX}${at}`);
+    return readAllNotes(db);
   });
+  const staged = stagedExportPath(out);
+  try {
+    writeJsonAtomicSync(staged, { version: 1, notes } satisfies PendingNotesFile, { fsync: true });
+    db.run("UPDATE meta SET value = ? WHERE key = ?", at, EXPORTED_KEY);
+  } catch (err) {
+    takeBack(db, staged);
+    throw err;
+  }
+  try {
+    renameSync(staged, out);
+  } catch (err) {
+    // Settled, but not in place: undo both, or the next start imports the staged file.
+    takeBack(db, staged);
+    throw err;
+  }
+  fsyncDirQuietly(dirname(out));
+  return count(notes);
+}
+
+/**
+ * Best effort: undo the mark, then remove the staged file, but only once the
+ * mark is undone or back to "writing". A staged file beside a settled mark is
+ * the export (the next start imports it); removing it with the mark left
+ * settled would read, at the next start, as an older Tomo that delivered every
+ * note.
+ */
+function takeBack(db: TomoDb, staged: string): void {
+  let undone = false;
+  try {
+    db.run("DELETE FROM meta WHERE key = ?", EXPORTED_KEY);
+    undone = true;
+  } catch {
+    try {
+      db.run("UPDATE meta SET value = ? WHERE key = ?", `${EXPORT_WRITING_PREFIX}${new Date().toISOString()}`, EXPORTED_KEY);
+      undone = true;
+    } catch { /* the staged file stays, for the next start to import */ }
+  }
+  if (undone) {
+    try { unlinkSync(staged); } catch { /* the next start removes it */ }
+  }
+}
+
+function fsyncDirQuietly(dir: string): void {
+  try {
+    const fd = openSync(dir, "r");
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+  } catch { /* advisory on filesystems that refuse it */ }
+}
+
+function setMeta(db: TomoDb, key: string, value: string): void {
+  db.run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value", key, value);
 }

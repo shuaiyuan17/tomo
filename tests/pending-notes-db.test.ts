@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openTomoDb, TomoDb } from "../src/db/index.js";
 import { PendingNotesQueue } from "../src/agent/pending-notes-queue.js";
+import { EXPORTED_KEY, EXPORT_WRITING_PREFIX, exportPendingNotesToFile, parsePendingNotesFile, stagedExportPath } from "../src/sessions/pending-notes-store.js";
+import * as fsUtils from "../src/fs-utils.js";
 import { makeSessionStore } from "./helpers/session-store-fixtures.js";
 
 // ---------------------------------------------------------------------------
@@ -158,6 +160,216 @@ describe("after an export", () => {
     writeFileSync(legacy(dir), "{truncated");
     expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["still here"]);
     expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["still here"]);
+  });
+});
+
+describe("the rollback export (t-67: the mark commits before the file is written)", () => {
+  const metaMark = (dir: string): string | undefined => {
+    const db = openTomoDb(join(dir, "tomo.db"), { readOnly: true });
+    try {
+      return db.get<{ value: string }>("SELECT value FROM meta WHERE key = ?", EXPORTED_KEY)?.value;
+    } finally {
+      db.close();
+    }
+  };
+
+  it("a COMMIT that fails leaves no file behind, so the next start does not import notes delivered since", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["deliver once"]);
+    const db = openTomoDb(join(dir, "tomo.db"));
+    // A real COMMIT failure: a deferred foreign key the mark's insert breaks,
+    // checked only at COMMIT.
+    db.exec(`
+      CREATE TABLE commit_guard (ref TEXT REFERENCES missing_parent (id) DEFERRABLE INITIALLY DEFERRED);
+      CREATE TABLE missing_parent (id TEXT PRIMARY KEY);
+      CREATE TRIGGER fail_commit AFTER INSERT ON meta BEGIN INSERT INTO commit_guard (ref) VALUES ('nope'); END;
+    `);
+    try {
+      expect(() => exportPendingNotesToFile(db, legacy(dir), { mark: true })).toThrow(/FOREIGN KEY/i);
+    } finally {
+      db.exec("DROP TRIGGER fail_commit");
+      db.close();
+    }
+    expect(existsSync(legacy(dir))).toBe(false);
+    expect(metaMark(dir)).toBeUndefined();
+    // The note is delivered; the next start must not bring it back.
+    makeSessionStore(dir).setPendingNotes("dm:alice", []);
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual([]);
+  });
+
+  const setMark = (dir: string, value: string): void => {
+    const db = openTomoDb(join(dir, "tomo.db"));
+    try { db.run("INSERT INTO meta (key, value) VALUES (?, ?)", EXPORTED_KEY, value); } finally { db.close(); }
+  };
+  const exportWith = (dir: string, fail: () => void): void => {
+    const db = openTomoDb(join(dir, "tomo.db"));
+    try {
+      fail();
+      expect(() => exportPendingNotesToFile(db, legacy(dir), { mark: true })).toThrow();
+    } finally {
+      db.close();
+      vi.restoreAllMocks();
+    }
+  };
+
+  it("a staged file that fails to write takes the mark back: nothing at the legacy path, the table kept", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["keep me"]);
+    exportWith(dir, () => vi.spyOn(fsUtils, "writeJsonAtomicSync").mockImplementation(() => { throw new Error("ENOSPC"); }));
+    expect(metaMark(dir)).toBeUndefined();
+    expect(existsSync(legacy(dir))).toBe(false);
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["keep me"]);
+  });
+
+  it("a mark that fails to settle is taken back, and the staged file never reaches the legacy path", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["keep me"]);
+    const real = TomoDb.prototype.run;
+    exportWith(dir, () => vi.spyOn(TomoDb.prototype, "run").mockImplementation(function (this: TomoDb, sql: string, ...params) {
+      if (sql.startsWith("UPDATE meta")) throw new Error("SQLITE_IOERR");
+      return real.call(this, sql, ...params);
+    }));
+    expect(metaMark(dir)).toBeUndefined();
+    expect(existsSync(legacy(dir))).toBe(false);
+    expect(existsSync(stagedExportPath(legacy(dir)))).toBe(false);
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["keep me"]);
+  });
+
+  it("a crash with the mark still \"writing\" (file at most staged) keeps the table and removes the staged file", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["keep me"]);
+    setMark(dir, `${EXPORT_WRITING_PREFIX}2026-11-28T00:00:00.000Z`);
+    writeFileSync(stagedExportPath(legacy(dir)), JSON.stringify({ version: 1, notes: { "dm:alice": ["keep me"] } }));
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["keep me"]);
+    expect(metaMark(dir)).toBeUndefined();
+    expect(existsSync(stagedExportPath(legacy(dir)))).toBe(false);
+    expect(existsSync(legacy(dir))).toBe(false);
+  });
+
+  it("a crash after the mark settled but before the rename: the next start imports the staged file", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["stale"]);
+    setMark(dir, "2026-11-28T00:00:00.000Z");
+    writeFileSync(stagedExportPath(legacy(dir)), JSON.stringify({ version: 1, notes: { "dm:alice": ["a1"], "dm:bob": ["b1"] } }));
+    const store = makeSessionStore(dir);
+    expect(store.getPendingNotes("dm:alice")).toEqual(["a1"]);
+    expect(store.getPendingNotes("dm:bob")).toEqual(["b1"]);
+    expect(metaMark(dir)).toBeUndefined();
+    expect(existsSync(stagedExportPath(legacy(dir)))).toBe(false);
+    expect(filesLike(dir, "_pending_notes.json.migrated-")).toHaveLength(1);
+  });
+
+  it("an older Tomo that started while the export was still staged: its file is merged in, the staged notes kept", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["never delivered"]);
+    setMark(dir, "2026-11-28T00:00:00.000Z");
+    writeFileSync(stagedExportPath(legacy(dir)), JSON.stringify({ version: 1, notes: { "dm:alice": ["never delivered"] } }));
+    // The older Tomo saw no file, started empty and queued its own.
+    writeLegacy(dir, { "dm:alice": ["from the older Tomo"], "dm:bob": ["b1"] });
+    const store = makeSessionStore(dir);
+    expect(store.getPendingNotes("dm:alice")).toEqual(["never delivered", "from the older Tomo"]);
+    expect(store.getPendingNotes("dm:bob")).toEqual(["b1"]);
+    expect(metaMark(dir)).toBeUndefined();
+    expect(existsSync(stagedExportPath(legacy(dir)))).toBe(false);
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["never delivered", "from the older Tomo"]);
+  });
+
+  it.each([["with", true], ["without", false]])("an older Tomo's own file beside a \"writing\" mark (%s a staged file) is merged in", (_label, withStaged) => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["never delivered"]);
+    setMark(dir, `${EXPORT_WRITING_PREFIX}2026-11-28T00:00:00.000Z`);
+    if (withStaged) writeFileSync(stagedExportPath(legacy(dir)), JSON.stringify({ version: 1, notes: { "dm:alice": ["never delivered"] } }));
+    writeLegacy(dir, { "dm:alice": ["from the older Tomo"] });
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["never delivered", "from the older Tomo"]);
+    expect(metaMark(dir)).toBeUndefined();
+    expect(existsSync(stagedExportPath(legacy(dir)))).toBe(false);
+  });
+
+  it("an unreadable file beside a settled mark: the mark goes before the file is moved aside, so the table is never taken as delivered", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["keep me"]);
+    setMark(dir, "2026-11-28T00:00:00.000Z");
+    writeFileSync(legacy(dir), "{truncated");
+    const store = makeSessionStore(dir);
+    // The move aside fails (a crash at that point leaves the same state).
+    const proto = Object.getPrototypeOf(store) as { moveWithoutClobber(from: string, to: string): string };
+    vi.spyOn(proto, "moveWithoutClobber").mockImplementation(() => { throw new Error("EIO"); });
+    expect(() => store.getPendingNotes("dm:alice")).toThrow("EIO");
+    vi.restoreAllMocks();
+    expect(metaMark(dir)).toBeUndefined();
+    rmSync(legacy(dir)); // say the move did land before the crash
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["keep me"]);
+  });
+
+  it("a settled mark that cannot be undone keeps the staged file, which the next start imports", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["keep me"]);
+    const db = openTomoDb(join(dir, "tomo.db"));
+    mkdirSync(join(legacy(dir), "x"), { recursive: true }); // the rename fails
+    const real = TomoDb.prototype.run;
+    vi.spyOn(TomoDb.prototype, "run").mockImplementation(function (this: TomoDb, sql: string, ...params) {
+      if (sql.startsWith("DELETE FROM meta") || (sql.startsWith("UPDATE meta") && String(params[0]).startsWith(EXPORT_WRITING_PREFIX))) throw new Error("SQLITE_IOERR");
+      return real.call(this, sql, ...params);
+    });
+    try {
+      expect(() => exportPendingNotesToFile(db, legacy(dir), { mark: true })).toThrow();
+    } finally {
+      db.close();
+      vi.restoreAllMocks();
+      rmSync(legacy(dir), { recursive: true });
+    }
+    expect(existsSync(stagedExportPath(legacy(dir)))).toBe(true);
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["keep me"]);
+  });
+
+  it("a rename that fails takes the mark back and removes the staged file", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["keep me"]);
+    const db = openTomoDb(join(dir, "tomo.db"));
+    // Something already at the legacy path as a directory: the rename fails.
+    mkdirSync(join(legacy(dir), "x"), { recursive: true });
+    try {
+      expect(() => exportPendingNotesToFile(db, legacy(dir), { mark: true })).toThrow();
+    } finally {
+      db.close();
+      rmSync(legacy(dir), { recursive: true });
+    }
+    expect(metaMark(dir)).toBeUndefined();
+    expect(existsSync(stagedExportPath(legacy(dir)))).toBe(false);
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual(["keep me"]);
+  });
+
+  it("a second export refuses while the first one's mark is settled (its file may have been delivered and deleted)", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["deliver once"]);
+    const db = openTomoDb(join(dir, "tomo.db"));
+    try {
+      expect(exportPendingNotesToFile(db, legacy(dir), { mark: true })).toBe(1);
+      rmSync(legacy(dir)); // the older Tomo delivered it
+      expect(() => exportPendingNotesToFile(db, legacy(dir), { mark: true })).toThrow(/already exported/);
+    } finally {
+      db.close();
+    }
+    expect(existsSync(legacy(dir))).toBe(false);
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual([]);
+  });
+
+  it("a landed export settles its mark, and a deleted file then means every note was delivered", () => {
+    const dir = freshDir();
+    makeSessionStore(dir).setPendingNotes("dm:alice", ["a1"]);
+    const db = openTomoDb(join(dir, "tomo.db"));
+    try {
+      expect(exportPendingNotesToFile(db, legacy(dir), { mark: true })).toBe(1);
+    } finally {
+      db.close();
+    }
+    const mark = metaMark(dir);
+    expect(mark).toBeDefined();
+    expect(mark!.startsWith(EXPORT_WRITING_PREFIX)).toBe(false);
+    expect(existsSync(stagedExportPath(legacy(dir)))).toBe(false);
+    expect(parsePendingNotesFile(readFileSync(legacy(dir)))).toEqual({ "dm:alice": ["a1"] });
+    rmSync(legacy(dir));
+    expect(makeSessionStore(dir).getPendingNotes("dm:alice")).toEqual([]);
   });
 });
 

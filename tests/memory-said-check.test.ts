@@ -3,7 +3,7 @@
  * the model, picks which lines get checked against the conversation.
  */
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -111,6 +111,20 @@ describe("collectSaidLines", () => {
     const r = collectSaidLines(dir, WEEK);
     expect(r.lines.map((l) => l.text)).toEqual(["- 2026-11-25 [said] Within the bound."]);
     expect(r.truncated).toBe(true);
+  });
+
+  it.each([["a core", "private/MEMORY.md"], ["a topic file", "t.md"], ["a folder", "work"]])("%s that can't be read marks the scan incomplete", (_what, rel) => {
+    put("MEMORY.md", "- 2026-11-25 [said] Readable.\n");
+    if (rel === "work") put("work/a.md", topic(["- 2026-11-25 [said] Hidden."]));
+    else put(rel, rel.endsWith("MEMORY.md") ? "- 2026-11-25 [said] Hidden.\n" : topic(["- 2026-11-25 [said] Hidden."]));
+    chmodSync(join(dir, rel), 0o000);
+    try {
+      const r = collectSaidLines(dir, WEEK);
+      expect(r.lines.map((l) => l.text)).toEqual(["- 2026-11-25 [said] Readable."]);
+      expect(r.truncated).toBe(true);
+    } finally {
+      chmodSync(join(dir, rel), 0o755);
+    }
   });
 
   it("a complete scan is not marked incomplete", () => {

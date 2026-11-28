@@ -50,7 +50,7 @@ export interface SaidLines {
   lines: SaidLine[];
   /** Lines of that week past the cap: not listed. */
   more: number;
-  /** The scan is incomplete: it ran out of time, or a file was read only up to the bound. */
+  /** The scan is incomplete: it ran out of time, a file or folder could not be read, or a file was read only up to the bound. */
   truncated: boolean;
 }
 
@@ -83,8 +83,10 @@ export function collectSaidLines(memoryDir: string, week: string, opts: { max?: 
   let partial = false;
   for (const core of CORES) {
     let read: ReturnType<typeof readMemoryFile>;
-    try { read = readMemoryFile(join(root, core), root, false, undefined, SAID_READ_MAX_BYTES); } catch { continue; }
-    if (read === null || "refused" in read) continue;
+    try { read = readMemoryFile(join(root, core), root, false, undefined, SAID_READ_MAX_BYTES); } catch { partial = true; continue; }
+    if (read === null) continue;
+    // There but not readable as a memory file (a link, a FIFO): its lines were not seen.
+    if ("refused" in read) { partial = true; continue; }
     files.push({ path: core, content: read.bytes });
     if (read.partial) partial = true;
   }
@@ -93,13 +95,17 @@ export function collectSaidLines(memoryDir: string, week: string, opts: { max?: 
     excludePrivate: false,
     skipGroups: true,
     withContent: true,
+    reportUnreadable: true,
     headBytes: SAID_READ_MAX_BYTES,
     maxFiles: Number.POSITIVE_INFINITY,
     budgetMs: opts.budgetMs ?? SAID_SCAN_BUDGET_MS,
     now: opts.now,
   });
+  if (topics.unreadableDirs.length > 0) partial = true;
   for (const e of topics.entries) {
-    if (isCoreMemoryPath(e.path) || !e.content) continue;
+    if (isCoreMemoryPath(e.path)) continue;
+    if (e.unreadable) { partial = true; continue; }
+    if (!e.content) continue;
     files.push({ path: e.path, content: e.content });
     // Read up to the bound only: its size on disk is larger than what was read.
     if (e.bytes > e.content.length) partial = true;

@@ -56,6 +56,11 @@ describe("store-owned web history reads", () => {
     store.updateStats(key, { costUsd: 0, inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0, contextUsed: 20, contextMax: 100 });
     expect(data.catalog().sessions[0].stats).toEqual({ contextUsed: 20, contextMax: 100, contextEstimated: false });
   });
+  it("names the owner's conversation after the owner: displayName, else name", () => {
+    store.append(key, { role: "user", content: "hi", timestamp, channel: "web" });
+    expect(new WebData({ ...dirs, owner }).catalog().sessions[0].title).toBe("owner");
+    expect(new WebData({ ...dirs, owner: { ...owner, displayName: "Alex" } }).catalog().sessions[0].title).toBe("Alex");
+  });
   it("fails closed for unreadable registries, unknown sessions, invalid cursors and symlinks", async () => {
     const data = new WebData({ ...dirs, owner });
     await expect(data.history(webSessionId("dm:peer"))).rejects.toMatchObject({ status: 404 });

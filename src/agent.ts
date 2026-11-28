@@ -3457,6 +3457,12 @@ export class Agent {
     return this.liveSessionManager.taskOutput(sessionKey, taskId);
   }
 
+  /** The key's last recorded context usage (tokens), if the registry has one. */
+  contextUsageOf(sessionKey: string): { used: number; max: number } | undefined {
+    const stats = this.sessions.getEntry(sessionKey)?.stats;
+    return stats && stats.contextMax > 0 ? { used: stats.contextUsed, max: stats.contextMax } : undefined;
+  }
+
   /** Does the key's live session have background work a compact reload would cut? */
   hasBackgroundWork(sessionKey: string): boolean {
     const state = this.liveSessionManager.backgroundState(sessionKey);

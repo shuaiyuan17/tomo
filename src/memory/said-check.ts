@@ -1,0 +1,114 @@
+// What the weekly memory upkeep is handed: the week's `said` lines to check
+// against the conversation (§6.3 of the memory design), and the two cores'
+// sizes. Synchronous and bounded: it runs in the rollup runner, on the
+// daemon's event loop, right before the nudge is sent.
+import { readFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+import { foldPath } from "../agent/permission-paths.js";
+import { isoWeekTag } from "../lcm/blocks.js";
+import {
+  collectMemoryFiles,
+  GROUPS_MEMORY_SUBDIR,
+  isCoreMemoryPath,
+  MEMORY_SOFT_KB,
+  MEMORY_SOFT_LINES,
+} from "../workspace/memory-index.js";
+
+/** At most this many lines are listed for one week; the rest are counted, not carried over. */
+export const SAID_CHECK_MAX_LINES = 20;
+/** The scan's time limit: the same as memory_search's. */
+export const SAID_SCAN_BUDGET_MS = 300;
+/** A listed line is cut to this many characters (code points): the nudge stays small whatever a line holds. */
+const SAID_LINE_MAX_CHARS = 300;
+
+/** `- YYYY-MM-DD [said] …` (or `*`), the per-line provenance prefix. */
+const SAID_LINE_RE = /^\s*[-*]\s+(\d{4})-(\d{2})-(\d{2})\s+\[said\]\s/;
+/**
+ * A line an earlier check already turned `inferred` carries this note, so it
+ * no longer matches; the note is matched too, so a line someone marked back
+ * by hand is not checked twice in one week.
+ */
+const ALREADY_CHECKED_RE = /no source found, checked \d{4}-\d{2}-\d{2}/i;
+
+export interface SaidLine {
+  /** Relative to memory/. */
+  path: string;
+  /** 1-based. */
+  line: number;
+  text: string;
+}
+
+export interface SaidLines {
+  lines: SaidLine[];
+  /** Lines of that week past SAID_CHECK_MAX_LINES: not listed. */
+  more: number;
+  /** The scan ran out of time: some files were not read. */
+  truncated: boolean;
+}
+
+/** The ISO week (`YYYY-Www`) a local `YYYY-MM-DD` falls in, or undefined for a date that isn't one. */
+function weekOfLocalDate(y: string, m: string, d: string): string | undefined {
+  const date = new Date(Number(y), Number(m) - 1, Number(d), 12);
+  if (date.getFullYear() !== Number(y) || date.getMonth() !== Number(m) - 1 || date.getDate() !== Number(d)) return undefined;
+  return isoWeekTag(date);
+}
+
+/**
+ * The lines to check for `week` (`YYYY-Www`): each line with the per-line
+ * prefix `YYYY-MM-DD [said]` whose date (a local date) is in that ISO week.
+ * The two cores first, then topic files by path. Not journal/ or archive/
+ * folders (collectMemoryFiles skips them without includeUnlisted), not
+ * groups/ (members' words are never `said`), not the people registry, not
+ * attachments. private/ is included: the list only ever goes to the owner's
+ * own DM session, and only while no group is summoned into it.
+ */
+export function collectSaidLines(memoryDir: string, week: string, opts: { max?: number; budgetMs?: number; now?: () => number } = {}): SaidLines {
+  const max = opts.max ?? SAID_CHECK_MAX_LINES;
+  // collectMemoryFiles compares real paths: the root must be one too.
+  let root: string;
+  try { root = realpathSync(memoryDir); } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { lines: [], more: 0, truncated: false };
+    throw err;
+  }
+  const all = collectMemoryFiles({
+    memoryDir: root,
+    excludePrivate: false,
+    includeCores: true,
+    withContent: true,
+    maxFiles: Number.POSITIVE_INFINITY,
+    budgetMs: opts.budgetMs ?? SAID_SCAN_BUDGET_MS,
+    now: opts.now,
+  });
+  const files = all.entries.filter((e) => foldPath(e.path).split("/")[0] !== GROUPS_MEMORY_SUBDIR);
+  const ordered = [...files.filter((e) => isCoreMemoryPath(e.path)), ...files.filter((e) => !isCoreMemoryPath(e.path))];
+  const lines: SaidLine[] = [];
+  let more = 0;
+  for (const file of ordered) {
+    const text = (file.content ?? Buffer.alloc(0)).toString("utf8").split("\n");
+    for (let i = 0; i < text.length; i++) {
+      const m = SAID_LINE_RE.exec(text[i]);
+      if (!m || weekOfLocalDate(m[1], m[2], m[3]) !== week || ALREADY_CHECKED_RE.test(text[i])) continue;
+      if (lines.length >= max) { more++; continue; }
+      const chars = Array.from(text[i].trim());
+      lines.push({ path: file.path, line: i + 1, text: chars.length <= SAID_LINE_MAX_CHARS ? chars.join("") : `${chars.slice(0, SAID_LINE_MAX_CHARS - 1).join("")}…` });
+    }
+  }
+  return { lines, more, truncated: all.truncated };
+}
+
+/** A core's size the way the prompt measures it (trimmed, then split), or null when it doesn't exist or can't be read. */
+function coreSize(abs: string): { lines: number; bytes: number } | null {
+  let raw: string;
+  try { raw = readFileSync(abs, "utf8"); } catch { return null; }
+  const trimmed = raw.trim();
+  return trimmed ? { lines: trimmed.split("\n").length, bytes: Buffer.byteLength(trimmed, "utf8") } : { lines: 0, bytes: 0 };
+}
+
+/** One sentence: both cores' sizes against their soft budget (the weekly upkeep's `coreStatus`). */
+export function coreStatusLine(memoryDir: string): string {
+  const one = (file: string, abs: string): string => {
+    const s = coreSize(abs);
+    return s === null ? `${file} doesn't exist yet` : `${file} is ${s.lines} lines / ${(s.bytes / 1024).toFixed(1)} KB`;
+  };
+  return `${one("private/MEMORY.md", join(memoryDir, "private", "MEMORY.md"))} and ${one("MEMORY.md", join(memoryDir, "MEMORY.md"))} (budget ${MEMORY_SOFT_LINES} lines or ${MEMORY_SOFT_KB} KB each).`;
+}

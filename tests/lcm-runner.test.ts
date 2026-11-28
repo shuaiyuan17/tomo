@@ -19,6 +19,9 @@
  * DM sessions too. It used to pass `isGroupSessionKey(sessionKey)`, which is
  * exactly `false` for the owner's DM: the one session that leaked.
  */
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/config.js", async () => (await import("./helpers/agent-mocks.js")).configModuleMock());
@@ -41,7 +44,7 @@ const { NudgeCooldownStore } = await import("../src/lcm/nudge-cooldown-store.js"
 
 interface Nudge { text: string; sessionKey: string; options: { suppressDelivery?: boolean } }
 
-function runnerFor(sessionKey: string, summoned: () => boolean = () => false): {
+function runnerFor(sessionKey: string, summoned: () => boolean = () => false, memory?: ConstructorParameters<typeof RollupRunner>[2]): {
   runner: InstanceType<typeof RollupRunner>;
   nudges: Nudge[];
   cooldowns: InstanceType<typeof NudgeCooldownStore>;
@@ -59,7 +62,7 @@ function runnerFor(sessionKey: string, summoned: () => boolean = () => false): {
   // In-memory cooldown (null path): these cases nudge the same period, and
   // a shared file would let the first one's cooldown suppress the second.
   const cooldowns = new NudgeCooldownStore(null);
-  return { runner: new RollupRunner(agent as never, cooldowns), nudges, cooldowns };
+  return { runner: new RollupRunner(agent as never, cooldowns, memory ?? { memoryDir: () => "/nonexistent-memory-root" }), nudges, cooldowns };
 }
 
 /** `checkAll` is private; the scheduler is the only production caller. */
@@ -196,5 +199,67 @@ describe("the gates in front of a nudge", () => {
     const { runner, nudges } = runnerFor("dm:owner");
     await checkAll(runner);
     expect(nudges).toHaveLength(1);
+  });
+});
+
+describe("the memory step never costs the rollup (§4.2)", () => {
+  let memDir: string;
+  beforeEach(() => {
+    memDir = mkdtempSync(join(tmpdir(), "runner-memory-"));
+    writeFileSync(join(memDir, "MEMORY.md"), "## Rules\n- 2026-08-18 [said] No calls before 9.\n- 2026-08-10 [said] An older week's rule.\n");
+    fixture.due = [{ level: "weekly", period: "2026-W34", childCount: 7 }];
+  });
+  afterEach(() => { rmSync(memDir, { recursive: true, force: true }); });
+
+  it("a DM weekly nudge carries the harness's list of that week's said lines", async () => {
+    const { runner, nudges } = runnerFor("dm:owner", undefined, { memoryDir: () => memDir });
+    await checkAll(runner);
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0].text).toContain("- MEMORY.md:2: - 2026-08-18 [said] No calls before 9.");
+    expect(nudges[0].text).not.toContain("An older week's rule");
+    expect(nudges[0].text).toContain("MEMORY.md is 3 lines");
+  });
+
+  it("when the memory root can't be resolved, the nudge still goes out with the rollup command", async () => {
+    const { runner, nudges, cooldowns } = runnerFor("dm:owner", undefined, { memoryDir: () => { throw new Error("boom"); } });
+    await checkAll(runner);
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0].text).toContain("tomo lcm weekly --session-id sdk-session-1 --week 2026-W34");
+    expect(nudges[0].text).toContain("could not be listed this time");
+    expect(cooldowns.get("dm:owner:weekly:2026-W34", Date.now())).toBeDefined();
+  });
+
+  it("when the context usage can't be read, it assumes room rather than dropping the nudge", async () => {
+    const { runner, nudges } = runnerFor("dm:owner", undefined, { memoryDir: () => memDir, contextUsage: () => { throw new Error("boom"); } });
+    await checkAll(runner);
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0].text).toContain("No calls before 9.");
+  });
+
+  it("near the forced-compaction line the said check is left out, and nearer still the whole step", async () => {
+    const at = (used: number) => runnerFor("dm:owner", undefined, { memoryDir: () => memDir, contextUsage: () => ({ used, max: 1_000_000 }), forceCompactAtPct: () => 95 });
+    const roomy = at(500_000);
+    await checkAll(roomy.runner);
+    expect(roomy.nudges[0].text).toContain("No calls before 9.");
+
+    const tight = at(950_000 - 100_000);
+    await checkAll(tight.runner);
+    expect(tight.nudges[0].text).toContain("memory upkeep for 2026-W34");
+    expect(tight.nudges[0].text).toContain("not checked this time: the context is too full");
+    expect(tight.nudges[0].text).not.toContain("No calls before 9.");
+
+    const full = at(950_000 - 10_000);
+    await checkAll(full.runner);
+    expect(full.nudges[0].text).toContain("`memory: skipped (the context is too full)`");
+    expect(full.nudges[0].text).not.toContain("memory upkeep for");
+    expect(full.nudges[0].text).toContain("tomo lcm weekly --session-id sdk-session-1");
+  });
+
+  it("a group session's nudge has no memory step and no said lines", async () => {
+    const { runner, nudges } = runnerFor("telegram:-1001234567", undefined, { memoryDir: () => memDir });
+    await checkAll(runner);
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0].text).not.toContain("memory upkeep");
+    expect(nudges[0].text).not.toContain("No calls before 9.");
   });
 });

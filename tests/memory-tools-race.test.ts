@@ -77,5 +77,17 @@ describe("a folder swapped for a link after the path was checked", () => {
     expect(() => placeOk({ rel: "swapped/x.md", abs: join(mem, "swapped", "x.md") }, barred)).toThrow(/not available on this turn/);
     expect(() => placeOk({ rel: "swapped/x.md", abs: join(mem, "swapped", "x.md") }, OWNER)).not.toThrow();
     expect(() => placeOk({ rel: "away/x.md", abs: join(mem, "away", "x.md") }, OWNER)).toThrow(/outside memory/);
+    // Folders that don't exist yet are judged by the nearest one that does, before anything is created.
+    expect(() => placeOk({ rel: "swapped/new/sub/x.md", abs: join(mem, "swapped", "new", "sub", "x.md") }, barred)).toThrow(/not available on this turn/);
+  });
+
+  it("a search whose reading ran out of time still searches what it read", () => {
+    writeFileSync(join(mem, "a.md"), topic("needle"));
+    writeFileSync(join(mem, "b.md"), topic("needle"));
+    let t = 0;
+    const slow = new MemoryStore({ memoryDir: mem, historyDir: join(mem, "..", "history"), now: () => (t += 200) });
+    const { hits, truncated } = slow.search(OWNER, "needle");
+    expect(truncated).toBe(true);
+    expect(hits.length).toBeGreaterThan(0);
   });
 });

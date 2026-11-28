@@ -244,6 +244,7 @@ export class MemoryStore {
 
   /** Write `text` over what this call read as `cur` (null: a new file), unless it changed meanwhile. */
   private write(r: Resolved, access: MemoryAccess, cur: Current | null, text: string): string {
+    this.placeOk(r, access);
     mkdirSync(dirname(r.abs), { recursive: true });
     this.placeOk(r, access);
     writeFileAtomicSync(r.abs, text, { beforeRename: () => { this.placeOk(r, access); this.unchanged(r, cur); } });
@@ -258,7 +259,17 @@ export class MemoryStore {
    */
   private placeOk(r: Resolved, access: MemoryAccess): void {
     const root = this.root();
-    const real = join(realpathSync(dirname(r.abs)), basename(r.abs));
+    // The nearest folder that exists, so this can run before mkdir creates the rest.
+    let dir = dirname(r.abs);
+    const missing: string[] = [basename(r.abs)];
+    for (;;) {
+      try { lstatSync(dir); break; } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT" || dir === root || dirname(dir) === dir) throw err;
+        missing.unshift(basename(dir));
+        dir = dirname(dir);
+      }
+    }
+    const real = join(realpathSync(dir), ...missing);
     if (!isInside(real, root)) throw new MemoryToolError(`${r.rel} leads outside memory/; memory tools don't follow links.`);
     if (access.privateBarred && landsInPrivate(real, { cwd: root, memoryDir: root, privateDir: join(root, PRIVATE_MEMORY_SUBDIR) })) {
       throw new MemoryToolError(PRIVATE_BARRED_REFUSAL);
@@ -324,7 +335,6 @@ export class MemoryStore {
     const needle = query.trim().toLocaleLowerCase();
     if (!needle) throw new MemoryToolError("memory_search needs a query.");
     if (needle.length > 200) throw new MemoryToolError("The query is too long: search for a few distinctive words.");
-    const started = this.now();
     const all = collectMemoryFiles({
       memoryDir: this.root(),
       excludePrivate: access.privateBarred,
@@ -338,8 +348,8 @@ export class MemoryStore {
     const files = [...all.entries.filter((e) => isCoreMemoryPath(e.path)), ...all.entries.filter((e) => !isCoreMemoryPath(e.path))];
     const hits: Array<{ path: string; line: number; text: string }> = [];
     let truncated = all.truncated;
+    // The budget bounds the reading (collectMemoryFiles); what was read is always searched.
     outer: for (const file of files) {
-      if (this.now() - started > SEARCH_BUDGET_MS) { truncated = true; break; }
       const lines = (file.content ?? Buffer.alloc(0)).toString("utf8").split("\n");
       const barredCore = access.privateBarred && isCoreMemoryPath(file.path);
       for (let i = 0; i < lines.length; i++) {
@@ -419,8 +429,9 @@ export class MemoryStore {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     }
     if (isListedMemoryPath(b.rel) && !isListedMemoryPath(a.rel) && descriptionProblem(cur.text) !== null) throw this.missingDescription(b.rel);
-    mkdirSync(dirname(b.abs), { recursive: true });
     this.placeOk(a, access);
+    this.placeOk(b, access);
+    mkdirSync(dirname(b.abs), { recursive: true });
     this.placeOk(b, access);
     // link + unlink, not rename: link refuses an existing destination
     // atomically, so a file created there meanwhile is never overwritten.
@@ -430,13 +441,19 @@ export class MemoryStore {
     }
     // Unlink the source only while it is still the file just linked: one an
     // editor saved over it meanwhile stays, and the new name is taken back.
+    // The bytes linked must be the ones checked above (an editor may have saved over the source).
     const src = lstatSync(a.abs);
     const dst = lstatSync(b.abs);
-    if (src.ino !== dst.ino || src.dev !== dst.dev) {
+    if (src.ino !== dst.ino || src.dev !== dst.dev || memoryVersion(readFileSync(b.abs)) !== cur.version) {
       unlinkSync(b.abs);
-      throw new MemoryToolError(`${a.rel} changed while it was being moved, so it was left where it was. Try again.`);
+      throw new MemoryToolError(`${a.rel} changed while it was being moved, so it was left where it was. Read it again and retry.`);
     }
-    unlinkSync(a.abs);
+    try { unlinkSync(a.abs); } catch (err) {
+      // Leave one name, not two: a file with two names is refused by every memory tool.
+      try { unlinkSync(b.abs); } catch { /* the error below says what failed */ }
+      const reason = (err as NodeJS.ErrnoException).code ?? String(err);
+      throw new MemoryToolError(`${a.rel} could not be moved (${reason}); it was left where it was.`);
+    }
     return `Moved ${a.rel} to ${b.rel} (version ${cur.version}).`;
   }
 

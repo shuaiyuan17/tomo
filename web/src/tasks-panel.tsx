@@ -10,10 +10,11 @@ import { isShellTask, shellLabel } from "./shell.js";
 import { ShellPill } from "./shell-pill.js";
 import { ChunkBoundary } from "./chunk-boundary.js";
 import { ModelBadge } from "./model-badge.js";
-import { type TaskRow, type TreeGuide, buildTaskView, formatElapsed, lastStep, rowElapsed, stateLabel, taskKind, treeGuides } from "./tasks.js";
+import { type TaskRow, type TreeGuide, buildTaskView, formatElapsed, lastStep, railSections, rowElapsed, stateLabel, taskKind, treeGuides } from "./tasks.js";
 import { i18n, useTranslation } from "./i18n/index.js";
+import { formatNumber } from "./i18n/format.js";
 import { toolIcon } from "./tool-calls.js";
-import { asksOwner, isOpenSubsession, subsessionState, subsessionStateLabel, isWorkingState } from "./subsessions.js";
+import { asksOwner, isOpenSubsession, subsessionState, subsessionStateLabel, isWorkingState, todaysSubsessions, useToday } from "./subsessions.js";
 import { IdPill, SubsessionView, type SubsessionDone, type SubsessionSend } from "./subsession-view.js";
 import { RAIL_SCROLL, useScrollbarInPadding } from "./rail-scroll.js";
 
@@ -26,7 +27,9 @@ export interface RailSubsessions { tasks: WebSubsession[]; revision: number; sen
 /**
  * Shows what is running. The list itself offers nothing to act on; an opened task of the owner
  * conversation can be stopped or moved to the background (`control`, see TaskControls). The
- * owner's sub-sessions come first, in their own group; one opens as a chat in the rail.
+ * owner conversation's own tasks come first, then the owner's sub-sessions in their own group
+ * (one opens as a chat in the rail), then other conversations. Ended sub-sessions from before
+ * today stay folded under "N earlier" until asked for.
  */
 export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessions }: { tasks: WebTask[]; sessions: WebSession[]; onClose?: () => void; footer?: ReactNode; control?: TaskControl; subsessions?: RailSubsessions }) {
   const { t } = useTranslation("tasks");
@@ -37,6 +40,9 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessi
   const [opened, setOpened] = useState<{ sessionId: string; taskId: string }>();
   const [cameBack, setCameBack] = useState(false);
   const [openedSub, setOpenedSub] = useState<string>();
+  /** Ended sub-sessions from before today are listed too. Not kept: the rail opens tidy again. */
+  const [showEarlier, setShowEarlier] = useState(false);
+  const today = useToday();
   // As for a task: a sub-session that leaves the list (archived) keeps its last copy while open.
   const lastSub = useRef<WebSubsession | undefined>(undefined);
   const openSub = openedSub !== undefined ? subsessions?.tasks.find((task) => task.id === openedSub) ?? (lastSub.current?.id === openedSub ? lastSub.current : undefined) : undefined;
@@ -57,6 +63,8 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessi
     return () => clearInterval(timer);
   }, [ticking]);
   const ambient = tasks.some((task) => task.ambient);
+  const subs = todaysSubsessions(subsessions?.tasks ?? [], today);
+  const sections = railSections(view.groups, !!subsessions?.tasks.length);
   const close = onClose && <Button data-tasks-close variant="ghost" size="icon" aria-label={t("close")} title={t("closeTitle")} onClick={onClose}
     className="size-8 rounded-lg max-[600px]:size-10 hover:bg-foreground/[0.07] active:bg-foreground/[0.11] [&_svg:not([class*='size-'])]:size-5"><X strokeWidth={1.75} /></Button>;
   // Task list ↔ task view slide: in from the right when opening, from the left when going back.
@@ -78,12 +86,17 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessi
       <Checkbox checked={showAmbient} onCheckedChange={(value) => setShowAmbient(value === true)} className="size-3.5 rounded-[4px]" />
       {view.hiddenAmbient ? t("watchersCount", { count: view.hiddenAmbient }) : t("watchers")}</label>}
     <div ref={listGutter} className={cn("min-h-0 flex-1 overflow-y-auto focus-visible:outline-offset-0", RAIL_SCROLL)} tabIndex={0} aria-label={t("list")}>
-      {subsessions && subsessions.tasks.length > 0 && <div className="mb-4" data-testid="subsessions">
-        <p className="mt-1 mb-1 px-2.5 tracking-[0.02em] text-[11px] text-muted-foreground">{t("subsession.group")}</p>
-        <ul className="m-0 list-none space-y-0.5 p-0">{subsessions.tasks.map((task) => <SubsessionCard key={task.id} task={task} onOpen={() => setOpenedSub(task.id)} />)}</ul>
-      </div>}
-      {view.groups.length === 0 ? (subsessions?.tasks.length ? null : <p className="m-0 px-2.5 text-[13px] text-muted-foreground">{t("empty")}</p>)
-        : view.groups.map((group) => <div className="[&+&]:mt-4" key={group.sessionId}>
+      {sections.length === 0 ? <p className="m-0 px-2.5 text-[13px] text-muted-foreground">{t("empty")}</p>
+        : sections.map((group) => group === "subsessions" ? <div className="[&+&]:mt-4" key="subsessions" data-testid="subsessions">
+          <p className="mt-1 mb-1 px-2.5 tracking-[0.02em] text-[11px] text-muted-foreground">{t("subsession.group")}</p>
+          <ul className="m-0 list-none space-y-0.5 p-0">
+            {subs.shown.map((task) => <SubsessionCard key={task.id} task={task} onOpen={() => setOpenedSub(task.id)} />)}
+            {subs.earlier.length > 0 && <li><button type="button" data-testid="subsessions-earlier" aria-expanded={showEarlier} onClick={() => setShowEarlier((old) => !old)}
+              className="flex w-full cursor-pointer items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground focus-visible:outline-offset-0">
+              <ChevronRight aria-hidden="true" className={cn("size-3.5 shrink-0 transition-transform", showEarlier && "rotate-90")} />{t("subsession.earlier", { count: subs.earlier.length, n: formatNumber(subs.earlier.length) })}</button></li>}
+            {showEarlier && subs.earlier.map((task) => <SubsessionCard key={task.id} task={task} onOpen={() => setOpenedSub(task.id)} />)}
+          </ul>
+        </div> : <div className="[&+&]:mt-4" key={group.sessionId}>
           <p className="mt-1 mb-1 px-2.5 tracking-[0.02em] text-[11px] text-muted-foreground [overflow-wrap:anywhere]">{group.title}{group.kind === "group" ? <span>{t("groupTag")}</span> : null}</p>
           <GroupRows sessionId={group.sessionId} rows={group.rows} now={now} openFolds={openFolds} setOpenFolds={setOpenFolds}
             onOpen={(task) => setOpened({ sessionId: task.sessionId, taskId: task.taskId })} />

@@ -116,6 +116,62 @@ export function isOpenSubsession(task: Pick<WebSubsession, "status" | "ownerActi
   return task.status === "queued" || task.status === "active" || task.status === "waiting" || (task.status === "finished" && !!task.ownerAction);
 }
 
+/** When a task last did anything: its last activity, or its end if that is later. */
+function lastActive(task: Pick<WebSubsession, "lastActivityAt" | "endedAt">): number {
+  return task.endedAt !== undefined && task.endedAt > task.lastActivityAt ? task.endedAt : task.lastActivityAt;
+}
+/** Midnight that began the day `at` falls on, on the viewer's clock (the browser's time zone). */
+export function startOfLocalDay(at: number): number {
+  return new Date(at).setHours(0, 0, 0, 0);
+}
+/**
+ * The sub-sessions the rail lists, in the order given: every open one (and a
+ * finished one that still needs the owner), whatever day it is from, and the
+ * ended ones last active today. An ended one from before today is `earlier`:
+ * folded away until the owner asks for it. A time that cannot be read is not
+ * taken for an old one.
+ */
+type DatedTask = Pick<WebSubsession, "status" | "ownerAction" | "lastActivityAt" | "endedAt">;
+export function todaysSubsessions<T extends DatedTask>(tasks: readonly T[], now: number): { shown: T[]; earlier: T[] } {
+  const today = startOfLocalDay(now);
+  const isEarlier = (task: T) => !isOpenSubsession(task) && lastActive(task) < today;
+  return { shown: tasks.filter((task) => !isEarlier(task)), earlier: tasks.filter(isEarlier) };
+}
+/** How often the rail looks at the clock for a new day, should the timer set for midnight be held back (a throttled tab). */
+const TODAY_CHECK_MS = 60_000;
+/** How long until the day after `today` (a start of day) begins, on the viewer's clock: never less than a moment, so a timer set for it cannot spin. */
+export function msToNextLocalDay(today: number, now: number): number {
+  return Math.max(250, new Date(today).setHours(24, 0, 0, 0) - now);
+}
+/**
+ * Tells `onDay` today's first moment on the viewer's clock whenever it looks:
+ * at midnight, on a timer; every minute; and whenever the page comes back
+ * into view (a page left open overnight, a laptop woken). Each look sets the
+ * midnight timer again from the clock as it is then, so a clock or time zone
+ * that moved, either way, does not leave it set for the wrong moment.
+ * Returns how to stop.
+ */
+export function watchLocalDay(onDay: (today: number) => void, page: Pick<Document, "addEventListener" | "removeEventListener"> = document): () => void {
+  let midnight: ReturnType<typeof setTimeout> | undefined;
+  const look = () => {
+    const now = Date.now();
+    const today = startOfLocalDay(now);
+    clearTimeout(midnight);
+    midnight = setTimeout(look, msToNextLocalDay(today, now));
+    onDay(today);
+  };
+  look();
+  const timer = setInterval(look, TODAY_CHECK_MS);
+  page.addEventListener("visibilitychange", look);
+  return () => { clearTimeout(midnight); clearInterval(timer); page.removeEventListener("visibilitychange", look); };
+}
+/** Today's first moment on the viewer's clock, moving on when the day does (watchLocalDay). */
+export function useToday(): number {
+  const [today, setToday] = useState(() => startOfLocalDay(Date.now()));
+  useEffect(() => watchLocalDay(setToday), []);
+  return today;
+}
+
 /** Sub-sessions that count as activity on the Tasks button: those running now, in a turn or in the background. */
 export function activeSubsessions(tasks: readonly WebSubsession[]): number {
   return tasks.filter((task) => task.status === "active" || (task.status === "waiting" && task.background === true)).length;

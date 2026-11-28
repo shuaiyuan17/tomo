@@ -95,6 +95,64 @@ it("lists the owner's sub-sessions in their own group and opens one as a chat in
   await browserExpect(rail().getByTestId("subsessions")).toBeVisible();
 });
 
+it("puts the owner conversation's tasks first, then sub-sessions; an ended one from an earlier day is folded away until asked for", async () => {
+  const service = agent.subsessions!;
+  const store = (service as unknown as { store: { now: () => number } }).store;
+  const clock = store.now;
+  // A turn never ends here, so each task holds a running slot for good: room for all five (resetConfig puts it back).
+  mockConfig.subsessions = { ...mockConfig.subsessions, maxRunning: 5 };
+  const start = async (id: string, title: string) => {
+    expect(service.spawn("dm:owner", { title, brief: "b" }).ok).toBe(true);
+    await browserExpect.poll(() => service.get(id)!.status).toBe("active");
+  };
+  /** Ended yesterday on any clock: 26 hours ago (inside the 72 hours the daemon lists an ended task for). */
+  const yesterday = async (end: () => unknown) => { store.now = () => Date.now() - 26 * 60 * 60 * 1000; try { await end(); } finally { store.now = clock; } };
+  await start("s1", "Old cancelled work");
+  await start("s2", "Old finished work");
+  await yesterday(async () => {
+    expect((await service.cancel("s1", "test")).ok).toBe(true);
+    expect(service.finish("task:s2", "Done.").ok).toBe(true);
+  });
+  await start("s3", "Old review to merge");
+  await yesterday(() => expect(service.finish("task:s3", "PR is up.", "Review and merge the PR").ok).toBe(true));
+  await start("s4", "Work still going");
+  await start("s5", "Finished this morning");
+  expect(service.finish("task:s5", "Done.").ok).toBe(true);
+  const running = (taskId: string, description: string) => ({ taskId, taskType: "local_agent", description, ambient: false, background: true, startedAt: Date.now() - 10_000 });
+  watchBus.publish({ type: "tasks", sessionKey: "dm:owner", tasks: [running("d1", "Review the release")] });
+  watchBus.publish({ type: "tasks", sessionKey: "telegram:-1", tasks: [running("g1", "Group work")] });
+
+  await page.getByRole("button", { name: /^Tasks/ }).click();
+  await browserExpect(rail().locator('[data-subsession-row="s4"]')).toBeVisible();
+  // The last change to the table has reached the page (the `subsessions` event is debounced).
+  await browserExpect(rail().locator('[data-subsession-row="s5"]')).toContainText("Done");
+  await browserExpect(rail().getByRole("button", { name: /Group work/ })).toBeVisible();
+  // The rail's content slides and fades in: the shot waits for it to settle.
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: "test-results/subsessions-today.png" });
+  // Top to bottom: the owner conversation's own tasks, the sub-sessions, then other conversations.
+  const tops = async () => Promise.all([rail().getByRole("button", { name: /Review the release/ }), rail().getByTestId("subsessions"), rail().getByRole("button", { name: /Group work/ })]
+    .map(async (part) => (await part.boundingBox())!.y));
+  const [dm, subs, group] = await tops();
+  expect(dm).toBeLessThan(subs);
+  expect(subs).toBeLessThan(group);
+  // Yesterday's: the one still going and the one that needs the owner stay; the cancelled and the finished one are folded away.
+  const rows = () => rail().locator("[data-subsession-row]").evaluateAll((els) => els.map((el) => el.getAttribute("data-subsession-row")));
+  await browserExpect.poll(rows).toEqual(["s3", "s4", "s5"]);
+  const earlier = rail().getByTestId("subsessions-earlier");
+  await browserExpect(earlier).toHaveText("2 earlier");
+  await browserExpect(earlier).toHaveAttribute("aria-expanded", "false");
+  await earlier.click();
+  await browserExpect(earlier).toHaveAttribute("aria-expanded", "true");
+  // They open under the row that offered them, newest first.
+  await browserExpect.poll(rows).toEqual(["s3", "s4", "s5", "s2", "s1"]);
+  expect((await earlier.boundingBox())!.y).toBeLessThan((await rail().locator('[data-subsession-row="s2"]').boundingBox())!.y);
+  await page.waitForTimeout(200);
+  await page.screenshot({ path: "test-results/subsessions-today-earlier.png" });
+  await earlier.click();
+  await browserExpect.poll(rows).toEqual(["s3", "s4", "s5"]);
+});
+
 it("shows a task's own model, and a task waiting on a check-back with background work still running as working", async () => {
   expect(agent.subsessions!.spawn("dm:owner", { title: "Long build", brief: "b", model: "fable" }).ok).toBe(true);
   await page.getByRole("button", { name: /^Tasks/ }).click();

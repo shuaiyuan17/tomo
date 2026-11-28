@@ -27,6 +27,7 @@
   --app-header: calc(45px + env(safe-area-inset-top));
   color-scheme: light;
   --background: #f4efe6;
+  --sidebar-surface: #efe9dd; /* half a step below the page: the sidebar reads as its own plane without a rule */
   --foreground: #2a2622;
   --card: #fbf8f1;
   --card-foreground: #2a2622;
@@ -56,6 +57,7 @@
 .dark {
   color-scheme: dark;
   --background: #1e1c1b;
+  --sidebar-surface: #1a1817;
   --foreground: #e8e2d6;
   --card: #27231f;
   --card-foreground: #e8e2d6;
@@ -249,13 +251,14 @@ html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
    surface in each mode: light #3d7ab5,#c8623a,#2f9a74 on #fbf8f1; dark #3a70b3,#b65329,#28815e on #27231f.
    One meaning per hue across the page: You, Background, Scheduled, Tasks. Tasks (--series-4) is a plum,
    light #9e497d / dark #bb79a5: the only hues that keep ΔE ≥ 15 (≥ 8 under protan/deutan) from all three
-   others; in dark it sits at L 0.66, above the calm band of the other three, since none inside it does. `--seq-*` is the heatmap's single-hue ramp.
+   others; in dark it sits at L 0.66, above the calm band of the other three, since none inside it does. `--seq-*` is the heatmap's single-hue ramp: the brand's olive
+   (OKLCH hue 128) after the $0 step, so the page's one large color field matches the rest of the UI.
    Dark is muted on purpose: series sit just above 3:1 and the ramp tops out at L 0.64 / C 0.09, so the
    hero figure, not the charts, is the brightest thing on the page; each ramp step is ≥ 0.06 OKLCH L apart. */
 .viz { --series-1:#3d7ab5; --series-2:#c8623a; --series-3:#2f9a74; --series-4:#9e497d; --grid:#e6ddca; --axis:#cfc4ad;
-  --seq-0:#efe8d8; --seq-1:#cfdcea; --seq-2:#a3c0dd; --seq-3:#729fcd; --seq-4:#3d7ab5; --seq-5:#27578a; }
+  --seq-0:#efe8d8; --seq-1:#d5dfca; --seq-2:#b2c49e; --seq-3:#8ca56f; --seq-4:#678045; --seq-5:#485d2a; }
 .dark .viz { --series-1:#3a70b3; --series-2:#b65329; --series-3:#28815e; --series-4:#bb79a5; --grid:#3a342d; --axis:#4e463c;
-  --seq-0:#37322c; --seq-1:#354254; --seq-2:#3e5471; --seq-3:#48668d; --seq-4:#5479a9; --seq-5:#658dc1; }
+  --seq-0:#37322c; --seq-1:#3c4433; --seq-2:#4b583b; --seq-3:#5a6c43; --seq-4:#6a804d; --seq-5:#7b955a; }
 .viz .bar { transition: filter 120ms var(--ease-soft); }
 .viz [data-col]:hover .bar, .viz [data-col]:focus-visible .bar { filter: brightness(1.12); }
 .viz .vgrow { transform-origin: bottom; animation: viz-grow var(--motion-grow) var(--ease-soft) both; }

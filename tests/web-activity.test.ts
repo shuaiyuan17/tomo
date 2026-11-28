@@ -124,7 +124,9 @@ describe("toolOutcome reads what the real tools return", () => {
     const store = new MemoryStore({ memoryDir: join(dir, "memory"), historyDir: join(dir, "history") });
     const tools = buildMemoryTools({ store: () => store, access: () => ({ privateBarred: false, canWrite: true, canWriteCore: true }) });
     const topic = "---\ndescription: Trips\n---\nKyoto in May\n";
-    expect(toolOutcome(I("memory_write"), textOf(await run(tools, "memory_write", { path: "travel.md", content: topic, if_version: "new" })))).toEqual({});
+    // A new file outside private/ carries the "group chats can read it" note after "Saved …"; the card shows it.
+    expect(toolOutcome(I("memory_write"), textOf(await run(tools, "memory_write", { path: "travel.md", content: topic, if_version: "new" }))))
+      .toEqual({ note: expect.stringContaining("group chats can read it") });
     expect(toolOutcome(I("memory_str_replace"), textOf(await run(tools, "memory_str_replace", { path: "travel.md", old: "May", new: "June" })))).toEqual({});
     expect(toolOutcome(I("memory_append"), textOf(await run(tools, "memory_append", { path: "travel.md", content: "Osaka after\n" })))).toEqual({});
     expect(toolOutcome(I("memory_read"), textOf(await run(tools, "memory_read", { path: "travel.md" })))).toEqual({ count: 6 });

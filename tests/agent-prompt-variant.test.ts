@@ -13,6 +13,7 @@ import {
   installAgentTestHooks,
   makeMsg,
   mockSdk,
+  peekPendingNotes,
   resetConfig,
   waitFor,
 } from "./helpers/agent-harness.js";
@@ -431,6 +432,11 @@ describe("a group's turn that cannot get the shared prompt in time", () => {
     // The message stays in the transcript.
     expect(internals(agent).sessions.get(OWNER).messages.some((m) => m.role === "user" && m.content.includes("GROUP-BUSY"))).toBe(true);
 
+    // On record for the session too, for the owner's next private turn (survives a restart).
+    const notes = peekPendingNotes(agent, OWNER).join("\n");
+    expect(notes).toContain('type="summon-busy"');
+    expect(notes).toContain("Book club");
+
     // The session is not stuck: the next turn runs.
     await tg.simulateMessage(groupMsg("@tomo GROUP-LATER"));
     await drainQueue(agent);
@@ -493,20 +499,29 @@ describe("what a refusal does not drop", () => {
     expect(told).toHaveBeenCalledWith(["inbox-owner"]);
     await drainQueue(agent);
 
-    // Neither the group nor the owner can be reached: the records stay open.
+    // Nobody can be reached, but the refusal is on record for the session: closed.
     tg.tornDown = true;
+    const recorded = vi.fn();
+    await answer({ ...req(recorded), ownerItems: [] });
+    expect(recorded).toHaveBeenCalledWith([]);
+
+    // Not even that (the note store refuses): the records stay open for the next start.
+    const queue = (agent as unknown as { pendingNotesQueue: { queueNote(key: string, note: string): boolean } }).pendingNotesQueue;
+    const realQueue = queue.queueNote.bind(queue);
+    queue.queueNote = () => false;
     const untold = vi.fn();
     await answer({ ...req(untold), ownerItems: [] });
     expect(untold).not.toHaveBeenCalled();
-    tg.tornDown = false;
 
-    // One of two groups told, the owner not: one group does not speak for the other.
+    // One of two groups told, the owner not, nothing recorded: one group does not speak for the other.
+    tg.tornDown = false;
     const partly = vi.fn();
     const realSend = tg.send.bind(tg);
     tg.send = async (msg) => { if (msg.chatId !== GROUP_CHAT) throw new Error("unreachable"); return realSend(msg); };
     await answer({ ...req(partly), audiences: [GROUP, "telegram:-100999"], ownerItems: [] });
     expect(partly).not.toHaveBeenCalled();
     tg.send = realSend;
+    queue.queueNote = realQueue;
     await agent.stop();
   });
 
@@ -540,12 +555,11 @@ describe("what a refusal does not drop", () => {
     expect(toOwner).toHaveLength(1);
     expect(toOwner[0]).toContain("did not run");
 
-    // Nobody can be told: the ordinary error policy leaves a pending error note instead.
+    // Nobody can be told: the refusal is still on record for the session.
     tg.tornDown = true;
     expect(await agent.handleCronMessage("GROUP-CRON-JOB", GROUP, { waitForHandoff: true })).toBe(false);
     tg.tornDown = false;
-    const errorNotes = (agent as unknown as { pendingNotesQueue: { errorNotes: Map<string, Array<{ text: string }>> } }).pendingNotesQueue.errorNotes;
-    expect((errorNotes.get(OWNER) ?? []).map((n) => n.text).join("\n")).toContain("could not be reloaded without the owner's private context");
+    expect(peekPendingNotes(agent, OWNER).filter((n) => n.includes('type="summon-busy"') && n.includes("A background turn"))).toHaveLength(2);
 
     // The owner's own cron job keeps the ordinary error policy.
     tg.clearDelivered();

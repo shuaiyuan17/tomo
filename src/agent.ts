@@ -1976,9 +1976,9 @@ export class Agent {
    *
    * The owner's own messages in a mixed batch are not dropped with the
    * group's: they go back to the queue as their own turn, which runs on the
-   * session as it is. The group's inbox records are closed only once somebody
-   * was told; when neither the group nor the owner could be reached they stay
-   * open, and the next start answers them.
+   * session as it is. The group's inbox records are closed once the refusal
+   * is on record (tellSharedPromptUnavailable); only when it could be neither
+   * recorded nor told do they stay open, and the next start answers them.
    */
   private async answerSharedPromptUnavailable(req: UserTurnRequest): Promise<void> {
     const ownerItems = req.ownerItems ?? [];
@@ -1987,21 +1987,25 @@ export class Agent {
       this.enqueueInboundForSession(req.key, ownerItems.map((item) => ({ ...item, userRecorded: true })));
     }
     const groups = [...new Set((req.audiences ?? []).filter((a) => isGroupSessionKey(a)))];
-    const told = await this.tellSharedPromptUnavailable(groups, groups, false);
-    if (told) req.inboxHooks?.refused(inboxIdsOf(ownerItems));
-    else log.warn({ sessionKey: req.key, groups }, "Refused group turn: nobody could be told; its inbox records stay open for the next start");
+    const settled = await this.tellSharedPromptUnavailable(req.key, groups, groups, false);
+    if (settled) req.inboxHooks?.refused(inboxIdsOf(ownerItems));
+    else log.warn({ sessionKey: req.key, groups }, "Refused group turn: it could be neither recorded nor told; its inbox records stay open for the next start");
   }
 
   /**
-   * The busy line to `tellGroups`, and one owner notice naming `groups`.
-   * True when the owner notice was delivered, or the line reached every one
-   * of `tellGroups`.
+   * Put a refusal on record and tell people: a durable pending note for the
+   * session (owner-audience: its next private turn reads it, so the refusal
+   * survives a restart and a channel that is down), the busy line to
+   * `tellGroups`, and one owner notice naming `groups`. True when the note
+   * was stored, or failing that when the owner notice or every group line
+   * was delivered.
    */
-  private async tellSharedPromptUnavailable(
-    groups: string[],
-    tellGroups: string[],
-    background: boolean,
-  ): Promise<boolean> {
+  private async tellSharedPromptUnavailable(sessionKey: string, groups: string[], tellGroups: string[], background: boolean): Promise<boolean> {
+    const label = groups.map((g) => this.sessions.getEntry(g)?.chatTitle ?? g).join(", ") || "a group";
+    const noted = this.queuePendingNote(sessionKey, markOwnerAudience(formatTomoEvent(
+      "summon-busy",
+      `${background ? "A background turn (a scheduled job, a delegated request or a restart notice)" : "A message"} from the group ${label} was not run: this session was busy and could not be reloaded without the owner's private context in time. Nothing reached you for it${background ? "" : "; the message itself is in the conversation history"}. The owner was sent a notice if their chat could be reached; mention it if it matters to what they ask next.`,
+    )));
     // Every group told counts; one of several does not speak for the rest.
     let told = tellGroups.length > 0;
     for (const groupKey of tellGroups) {
@@ -2015,7 +2019,6 @@ export class Agent {
         log.warn({ err, group: groupKey }, "Could not post the busy notice to the group");
       }
     }
-    const label = groups.map((g) => this.sessions.getEntry(g)?.chatTitle ?? g).join(", ") || "a group";
     try {
       const notice = background
         ? ownerT("notices")("group.summonBusyOwnerBackground", { group: label })
@@ -2024,7 +2027,7 @@ export class Agent {
     } catch (err) {
       log.warn({ err }, "Could not tell the owner about a refused group turn");
     }
-    return told;
+    return noted || told;
   }
 
   /**
@@ -2033,12 +2036,11 @@ export class Agent {
    * did not run, and a group that asked for a delegate gets the busy line.
    * Undefined for a turn no group is behind, which keeps the error policy.
    */
-  private backgroundRefusal(audiences: readonly string[] | undefined, tellGroup: boolean): (() => Promise<boolean>) | undefined {
+  private backgroundRefusal(sessionKey: string, audiences: readonly string[] | undefined, tellGroup: boolean): (() => Promise<boolean>) | undefined {
     const groups = [...new Set((audiences ?? []).filter((a) => isGroupSessionKey(a)))];
     if (groups.length === 0) return undefined;
-    // False (nobody told): the turn's ordinary error policy takes over, which
-    // leaves a pending error note for the session.
-    return () => this.tellSharedPromptUnavailable(groups, tellGroup ? groups : [], true);
+    // False (neither recorded nor told): the turn's ordinary error policy takes over.
+    return () => this.tellSharedPromptUnavailable(sessionKey, groups, tellGroup ? groups : [], true);
   }
 
   private audienceLabel(audience: string): string {
@@ -3064,7 +3066,7 @@ export class Agent {
     // narrows them to that group and which `scopedCallerKey` logs at debug.
     const turnId = options.audiences ? this.turnAudiences.begin(key, options.audiences) : undefined;
     if (turnId !== undefined) options.onTurnBegin?.(turnId);
-    const groupRefusal = this.backgroundRefusal(options.audiences, options.usageSource === "delegate");
+    const groupRefusal = this.backgroundRefusal(key, options.audiences, options.usageSource === "delegate");
     try {
       return await this.turnRunner.runTurn({
         key,
@@ -3231,7 +3233,7 @@ export class Agent {
       usage: { source: usageSource, ...(taskId ? { taskId } : {}) },
       prompt,
       // A summoned group's restart notice refused for the shared prompt.
-      ...(noticeGroupKey ? { onSharedPromptUnavailable: this.backgroundRefusal([noticeGroupKey], false) } : {}),
+      ...(noticeGroupKey ? { onSharedPromptUnavailable: this.backgroundRefusal(key, [noticeGroupKey], false) } : {}),
       // No timestamp stamp, no typing indicator — continuity turns are
       // invisible. A heartbeat speaks only through the explicit `send_message`
       // tool, never through its own text blocks (owner decision 2026-08-28,

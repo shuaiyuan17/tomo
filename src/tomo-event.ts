@@ -39,6 +39,7 @@ export type TomoEventType =
   | "summon"           // summoned into a group chat
   | "summon-reminder"  // per-turn reply-routing reminder on summoned-group messages
   | "summon-expired"   // summon lapsed from group inactivity
+  | "summon-busy"      // a group's turn was refused: no session with the shared prompt in time
   | "dismiss"          // dismissed from a summoned group
   | "audience"         // audience switch/check on a dm session (name = switch|check)
   | "errors"           // recent harness errors surfaced as operational context

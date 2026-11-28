@@ -141,7 +141,9 @@ describe("send_message card", () => {
   it("long text: clamped at six lines, and a truncated message says the raw data has more", () => {
     const shown = card(row(call({ ...send, text: "x\n".repeat(20), textTruncated: true } as ToolActivity, { outcome: {} })), { env });
     expect(shown).toContain("line-clamp-6");
-    expect(shown).toContain("The message is longer");
+    expect(shown).not.toContain("Longer than shown here");
+    const short = card(row(call({ ...send, text: "short", textTruncated: true } as ToolActivity, { outcome: {} })), { env });
+    expect(short).toContain("Longer than shown here");
   });
 });
 
@@ -202,5 +204,18 @@ describe("a send to the conversation on screen with a problem noted", () => {
     const shown = card(row(call({ ...send, target: "dm:owner", targetId: undefined, toOwner: true } as ToolActivity, { outcome: { note: "chart.png could not be attached." } })), { env });
     expect(shown).not.toContain("Sent to this conversation");
     expect(shown).toMatch(/text-warn[^>]*>chart.png could not be attached/);
+  });
+});
+
+describe("truncation and attachments", () => {
+  it("a note or brief the server clipped says the raw data has more", () => {
+    expect(card(row(call({ ...note, textTruncated: true } as ToolActivity, { outcome: {} })))).toContain("Longer than shown here");
+    expect(card(row(call({ ...spawn, briefTruncated: true } as ToolActivity, { outcome: {} })))).toContain("Longer than shown here");
+    expect(card(row(call(note, { outcome: {} })))).not.toContain("Longer than shown here");
+  });
+  it("stickers are a chip; the raw panel keeps the full call id in the page (CSS truncates it) for manual copy", () => {
+    expect(card(row(call({ ...send, stickers: 2 } as ToolActivity, { outcome: {} })), { env: { sessions: [] } })).toContain("2 stickers");
+    const r = row(call(spawn, { outcome: {} }));
+    expect(card(r, { rawOpen: true })).toContain(`>${r.toolUseId}</span>`);
   });
 });

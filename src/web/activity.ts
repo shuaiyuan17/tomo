@@ -2,6 +2,7 @@ import { scrubSecretValues } from "../redact.js";
 import { redactText } from "./redact-command.js";
 import type { ToolActivity, ToolOutcome } from "./protocol.js";
 import { webSessionId } from "./owner.js";
+import { extractAttachments } from "../agent/text-utils.js";
 
 /**
  * Tomo's own tools (the in-process `tomo-internal` MCP server) as the web UI
@@ -70,8 +71,6 @@ function destination(target: string): { toOwner: true } | { targetId: string } |
   return /^[a-z]+:\S+$/.test(target) ? { targetId: webSessionId(target) } : {};
 }
 
-/** A `MEDIA:/path` line's file name (never the path: the card shows a chip). */
-const MEDIA_LINE = /^MEDIA:\s*(\S.*)$/;
 
 /** What a call to one of Tomo's internal tools asked for, or undefined (not internal, unknown, or unreadable). */
 export function toolActivity(name: string, input: Record<string, unknown>): ToolActivity | undefined {
@@ -98,11 +97,13 @@ export function toolActivity(name: string, input: Record<string, unknown>): Tool
     case "send_message": {
       const target = line(input.target);
       if (!target || typeof input.message !== "string") return undefined;
-      const lines = input.message.split("\n");
-      const media = lines.flatMap((l) => { const m = MEDIA_LINE.exec(l.trim()); return m ? [m[1].trim().split(/[\\/]/).pop() ?? ""] : []; }).filter(Boolean);
-      const said = body(lines.filter((l) => !MEDIA_LINE.test(l.trim())).join("\n"));
+      // The same tags delivery strips (proactive-send): MEDIA anywhere in a line, quoted or not; STICKER too.
+      const { cleanText, mediaPaths, stickerIds } = extractAttachments(input.message);
+      const media = mediaPaths.map((path) => path.split(/[\\/]/).pop() ?? "").filter(Boolean);
+      const said = body(cleanText);
       return { kind: tool, target, ...destination(target), mode: input.mode === "direct" ? "direct" : "delegate", text: said?.text ?? "", ...(said?.truncated ? { textTruncated: true } : {}),
         chars: input.message.length, ...(media.length ? { media: media.slice(0, 10).map((m) => clean(m, ACTIVITY_LINE_LIMIT).text) } : {}),
+        ...(stickerIds.length ? { stickers: stickerIds.length } : {}),
         ...optional("replyTo", line(input.reply_to)), ...optional("effect", line(input.effect)) };
     }
     case "react_to_message": {

@@ -226,9 +226,9 @@ export type ToolActivity =
   | { kind: "task_message"; id: string; text: string; textTruncated?: true; withOwner?: true }
   | { kind: "task_cancel" | "task_done"; id: string; reason?: string }
   | { kind: "task_status"; id?: string }
-  /** `text`: the message without its MEDIA: lines (those are `media`, file names only); `chars`: the whole message's length. */
+  /** `text`: the message without its MEDIA:/STICKER: tags (`media`: file names only; `stickers`: how many); `chars`: the whole message's length. */
   /** `toOwner`: to the owner's own conversation; `targetId`: the WebSession.id of the conversation it went to. */
-  | { kind: "send_message"; target: string; toOwner?: true; targetId?: string; mode: "direct" | "delegate"; text: string; textTruncated?: true; chars: number; media?: string[];
+  | { kind: "send_message"; target: string; toOwner?: true; targetId?: string; mode: "direct" | "delegate"; text: string; textTruncated?: true; chars: number; media?: string[]; stickers?: number;
     replyTo?: string; effect?: string }
   | { kind: "react_to_message"; target: string; reaction: string; remove?: true }
   | { kind: "edit_message" | "unsend_message"; target: string }

@@ -51,7 +51,7 @@ function Head({ k, values }: { k: string; values?: Record<string, string> }) {
 const plain = (k: string, values?: Record<string, string>) => (i18n.t as unknown as (key: string, v?: object) => string)(`activity:${k}`, values).replace(/<\/?\w+>/g, "");
 
 /** Text the agent wrote (a note, a message), set off on a tinted block, clamped to `lines` with "Show all". */
-function Quote({ text, lines }: { text: string; lines: 3 | 6 }) {
+function Quote({ text, lines, plain: bare, truncated }: { text: string; lines: 2 | 3 | 6; plain?: boolean; truncated?: boolean }) {
   const { t } = useTranslation("activity");
   const [open, setOpen] = useState(false);
   // A first guess from the text; once laid out, whether the clamp actually cut it (wrapping on a narrow screen, CJK).
@@ -67,32 +67,44 @@ function Quote({ text, lines }: { text: string; lines: 3 | 6 }) {
     observer.observe(el);
     return () => observer.disconnect();
   }, [text, open]);
-  return <div className="mt-2">
-    <p ref={ref} data-slot="activity-quote" className={cn("m-0 rounded-[10px] bg-foreground/[0.05] px-3 py-2 text-[13px] leading-relaxed whitespace-pre-wrap text-foreground [overflow-wrap:anywhere]",
-      !open && (lines === 3 ? "line-clamp-3" : "line-clamp-6"))}>{text}</p>
+  return <div className={bare ? "mt-1" : "mt-2"}>
+    <p ref={ref} data-slot="activity-quote" className={cn("m-0 whitespace-pre-wrap [overflow-wrap:anywhere]",
+      bare ? "text-[12.5px] leading-relaxed text-muted-foreground" : "rounded-[10px] bg-foreground/[0.05] px-3 py-2 text-[13px] leading-relaxed text-foreground",
+      !open && (lines === 2 ? "line-clamp-2" : lines === 3 ? "line-clamp-3" : "line-clamp-6"))}>{text}</p>
     {long && <button type="button" onClick={() => setOpen((v) => !v)} aria-expanded={open}
       className="mt-1 rounded px-1 text-[11.5px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline">{open ? t("card.showLess") : t("card.showAll")}</button>}
+    {truncated && (open || !long) && <p className="m-0 mt-1 text-[11.5px] text-muted-foreground">{t("card.longer")}</p>}
   </div>;
 }
 
-/** The raw-data panel: per call its full name, id and time, then INPUT / OUTPUT as the server sent them. */
-function RawPanel({ rows }: { rows: readonly ToolRow[] }) {
+/** One call in the raw-data panel: its full name, id and time, then INPUT / OUTPUT as the server sent them. */
+function RawCall({ row }: { row: ToolRow }) {
   const { t } = useTranslation(["activity", "chat"]);
+  const idRef = useRef<HTMLSpanElement>(null);
+  // Without the clipboard (not a secure context, or denied): the JSON in a selected box, to copy by hand.
+  const [manual, setManual] = useState(false);
+  const json = JSON.stringify({ name: row.name, id: row.toolUseId, input: row.input, output: row.result?.output, isError: row.result?.isError ?? false }, null, 2);
+  const took = callDuration(row);
+  return <div className="space-y-2.5">
+    <div className="flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
+      <span className="min-w-0 truncate">{row.name}</span><span aria-hidden="true">·</span>
+      <span ref={idRef} title={row.toolUseId} className="min-w-0 max-w-[14ch] truncate">{row.toolUseId}</span>
+      {took && <span className="shrink-0">· {took}</span>}
+      <span className="ml-auto flex shrink-0 items-center gap-1"><CopyButton value={row.toolUseId} fallback={idRef} label={t("card.copyId", { id: row.toolUseId })} />
+        <CopyButton value={json} fallback={() => setManual(true)} label={t("card.copyJson")} /></span>
+    </div>
+    {manual && <textarea readOnly value={json} rows={6} aria-label={t("card.copyJson")} ref={(el) => { el?.focus(); el?.select(); }}
+      className="block w-full resize-y rounded-md border bg-background p-2 font-mono text-[11px] text-foreground" />}
+    {row.input && <ToolSection label={t("chat:trace.input")} text={row.input} truncated={row.inputTruncated} />}
+    {row.result && <ToolSection label={row.result.isError ? t("chat:trace.error") : t("chat:trace.output")} text={row.result.output} truncated={row.result.truncated} error={row.result.isError} />}
+  </div>;
+}
+
+/** The raw-data panel: every call of the card, and what this data is. */
+function RawPanel({ rows }: { rows: readonly ToolRow[] }) {
+  const { t } = useTranslation("activity");
   return <div data-slot="activity-raw" className="motion-enter space-y-3 border-t bg-foreground/[0.02] px-3.5 py-3">
-    {rows.map((row) => {
-      const json = JSON.stringify({ name: row.name, id: row.toolUseId, input: row.input, output: row.result?.output, isError: row.result?.isError ?? false }, null, 2);
-      const short = row.toolUseId.length > 16 ? `${row.toolUseId.slice(0, 9)}…${row.toolUseId.slice(-4)}` : row.toolUseId;
-      const took = callDuration(row);
-      return <div key={row.id} className="space-y-2.5">
-        <div className="flex items-center gap-2 font-mono text-[11px] text-muted-foreground">
-          <span className="min-w-0 truncate">{row.name} · <span title={row.toolUseId}>{short}</span>{took && <> · {took}</>}</span>
-          <span className="ml-auto flex shrink-0 items-center gap-1"><CopyButton value={row.toolUseId} fallback={() => undefined} label={t("card.copyId", { id: row.toolUseId })} />
-            <CopyButton value={json} fallback={() => undefined} label={t("card.copyJson")} /></span>
-        </div>
-        {row.input && <ToolSection label={t("chat:trace.input")} text={row.input} truncated={row.inputTruncated} />}
-        {row.result && <ToolSection label={row.result.isError ? t("chat:trace.error") : t("chat:trace.output")} text={row.result.output} truncated={row.result.truncated} error={row.result.isError} />}
-      </div>;
-    })}
+    {rows.map((row) => <RawCall key={row.id} row={row} />)}
     <p className="m-0 font-mono text-[10.5px] text-muted-foreground">{t("card.rawNote")}</p>
   </div>;
 }
@@ -174,7 +186,7 @@ function SpawnCard({ row, state, raw }: CardProps & { row: ToolRow & { activity:
   return <Card rows={[row]} state={state} head={head} {...raw} footer={id ? <TaskFooter task={task} /> : undefined}>
     <p className="m-0 mt-1.5 text-[13.5px] leading-snug font-medium text-foreground [overflow-wrap:anywhere]">
       {id && <IdPill id={id} className="mr-1.5 align-[1px]" />}{activity.title}<ModelBadge model={task?.model ?? activity.model} className="ml-1.5" /></p>
-    {state === "error" ? <Reason row={row} /> : <p className="m-0 mt-1 line-clamp-2 text-[12.5px] leading-relaxed whitespace-pre-line text-muted-foreground [overflow-wrap:anywhere]">{activity.brief}</p>}
+    {state === "error" ? <Reason row={row} /> : <Quote text={activity.brief} lines={2} plain truncated={activity.briefTruncated} />}
   </Card>;
 }
 
@@ -186,7 +198,7 @@ function NoteCard({ row, state, raw }: CardProps & { row: ToolRow & { activity: 
   const values = { id: activity.id };
   const head = { k: held && state === "done" ? HEADS.note.held : HEADS.note[state], values };
   return <Card rows={[row]} state={state} head={head} {...raw}>
-    {state === "error" ? <Reason row={row} /> : <Quote text={activity.text} lines={3} />}
+    {state === "error" ? <Reason row={row} /> : <Quote text={activity.text} lines={3} truncated={activity.textTruncated} />}
     {state !== "error" && activity.withOwner && <p className="m-0 mt-2 flex items-center gap-1.5 text-[12px] text-muted-foreground">
       <CheckIcon className="size-3.5" aria-hidden="true" />{t("card.withOwner")}</p>}
     {held && outcome.noop && <Warn>{outcome.noop}</Warn>}
@@ -227,11 +239,11 @@ function SendCard({ row, state, raw }: CardProps & { row: ToolRow & { activity: 
     {channel && <span className="sr-only"> · {channel}</span>}
     {channel && <p aria-hidden="true" className="m-0 -mt-0.5 pl-6 text-[11.5px] text-muted-foreground">{channel}</p>}
     {state === "error" ? <Reason row={row} /> : <>
-      {activity.text && <Quote text={activity.text} lines={6} />}
+      {activity.text && <Quote text={activity.text} lines={6} truncated={activity.textTruncated} />}
       {delegate && <p className="m-0 mt-1.5 text-[12px] text-muted-foreground">{t("card.delegateNote")}</p>}
-      {activity.textTruncated && <p className="m-0 mt-1 text-[11.5px] text-muted-foreground">{t("card.longer")}</p>}
-      {(activity.media?.length || activity.replyTo || activity.effect) && <div className="mt-2 flex flex-wrap gap-1.5">
+      {(activity.media?.length || activity.stickers || activity.replyTo || activity.effect) && <div className="mt-2 flex flex-wrap gap-1.5">
         {activity.media?.map((file, i) => <Chip key={`m${i}`}><FileIcon className="size-3" aria-hidden="true" />{file}</Chip>)}
+        {activity.stickers ? <Chip>{t("card.stickers", { count: activity.stickers })}</Chip> : null}
         {activity.replyTo && <Chip>{t("card.replyTo", { text: activity.replyTo })}</Chip>}
         {activity.effect && <Chip>{t("card.effect", { effect: activity.effect })}</Chip>}
       </div>}

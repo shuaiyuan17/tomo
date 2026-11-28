@@ -3,7 +3,7 @@ export const activity = {
   card: {
     raw: "Raw data", rawHide: "Hide raw data", copyJson: "Copy JSON", copyId: "Copy call ID: {{id}}",
     rawNote: "As the server sends it: clipped at 4,000 characters, secrets masked. The transcript on disk has the rest.",
-    showAll: "Show all", showLess: "Show less", longer: "The message is longer; the raw data has more.",
+    showAll: "Show all", showLess: "Show less", longer: "Longer than shown here; the raw data has more.", stickers_one: "A sticker", stickers_other: "{{count}} stickers",
     spawn: "Started a task", spawning: "Starting a task", spawnFailed: "Couldn't start the task",
     unknown: "No result was recorded, so it may or may not have happened.", openTask: "Open task", taskGone: "No longer in the task list",
     note: "Passed a note to <id>{{id}}</id>", noting: "Passing a note to <id>{{id}}</id>", noteFailed: "Couldn't pass the note to <id>{{id}}</id>",

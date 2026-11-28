@@ -12,6 +12,7 @@ import {
   MEMORY_SOFT_KB,
   MEMORY_SOFT_LINES,
   renderMemoryFilesList,
+  shortPath,
 } from "./memory-index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -277,18 +278,18 @@ function memoryFilesLines(withoutPrivate: boolean, strict = false): string[] {
   // Only the top of each file: the list needs the frontmatter, and a huge file must not stall the daemon.
   const { entries, truncated, unreadableDirs } = collectMemoryFiles({ memoryDir: root, excludePrivate: withoutPrivate, reportUnreadable: true, headBytes: LIST_HEAD_BYTES });
   if (strict && (truncated || unreadableDirs.length > 0)) throw new Error("The memory files scan was incomplete");
+  // A scan stopped by its time or file cap ends wherever the disk let it, a
+  // different place each time: listing that part would differ from build to
+  // build and retire a live session for nothing. One fixed line instead.
+  if (truncated) return ["(the memory files list could not be built in time: memory_list shows the files)"];
   const lines = renderMemoryFilesList(entries, {
     audience: withoutPrivate ? "shared" : "full",
     ...(groupLabelLookup ? { groupLabel: groupLabelLookup } : {}),
   });
-  const notes = [
-    // One line however many: folder names are not bounded by the list's budget.
-    ...(unreadableDirs.length === 1
-      ? [`(${unreadableDirs[0] ? `${unreadableDirs[0]}/` : "memory/"} could not be read just now)`]
-      : unreadableDirs.length > 1 ? [`(${unreadableDirs.length} folders could not be read just now)`] : []),
-    ...(truncated ? ["(the scan stopped early: memory_list shows the rest)"] : []),
-  ];
-  return [...lines, ...notes];
+  // One line however many folders: their names are not bounded by the list's budget.
+  if (unreadableDirs.length === 1) lines.push(`(${shortPath(unreadableDirs[0] ? `${unreadableDirs[0]}/` : "memory/")} could not be read just now)`);
+  else if (unreadableDirs.length > 1) lines.push(`(${unreadableDirs.length} folders could not be read just now)`);
+  return lines;
 }
 
 function peopleRosterLines(isGroup: boolean, strict = false): string[] {

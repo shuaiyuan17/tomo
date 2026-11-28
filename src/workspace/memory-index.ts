@@ -365,6 +365,15 @@ export interface MemoryFilesListOptions {
   groupLabel?: (dir: string) => string | undefined;
 }
 
+/** The most a line after the list (the cut, a notice) takes: its path is shortened to fit. */
+export const LIST_NOTE_MAX_BYTES = 300;
+
+/** A path for a notice line: at most 80 code points (4 bytes each at most), the end kept. */
+export function shortPath(path: string): string {
+  const chars = Array.from(path);
+  return chars.length <= 80 ? path : `…${chars.slice(-79).join("")}`;
+}
+
 /** One line of text, at most 80 characters: a title is data, not a prompt line. */
 function oneLine(text: string, max = 80): string {
   // eslint-disable-next-line no-control-regex -- control characters are exactly what is stripped
@@ -453,8 +462,9 @@ export function renderMemoryFilesList(entries: readonly MemoryFileEntry[], opts:
     items.push({ line: `- ${e.path} — ${text}`, files: 1, dir: e.path.split("/").slice(0, -1).join("/") });
   }
   if (items.length === 0) return [NO_TOPIC_FILES];
-  // The cut leaves room for its own line.
-  const budget = LIST_BUDGET_KB * 1024 - 120;
+  // The cut leaves room for its own line and one notice line after the list
+  // (memoryFilesLines), each at most LIST_NOTE_MAX_BYTES: paths in them are shortened.
+  const budget = LIST_BUDGET_KB * 1024 - 2 * LIST_NOTE_MAX_BYTES;
   let bytes = 0;
   let count = 0;
   for (const item of items) {
@@ -471,7 +481,7 @@ export function renderMemoryFilesList(entries: readonly MemoryFileEntry[], opts:
   const dirs = rest.map((i) => i.dir.split("/").filter(Boolean));
   const common: string[] = [];
   for (let i = 0; dirs.every((d) => d.length > i && d[i] === dirs[0][i]); i++) common.push(dirs[0][i]);
-  const where = common.length > 0 ? ` under ${common.join("/")}/` : "";
+  const where = common.length > 0 ? ` under ${shortPath(`${common.join("/")}/`)}` : "";
   lines.push(`(${n} more ${n === 1 ? "file" : "files"}${where} not listed: memory_list shows them)`);
   return lines;
 }

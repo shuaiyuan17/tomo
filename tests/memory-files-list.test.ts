@@ -8,6 +8,7 @@ import {
   LIST_FOLD_FILES,
   NO_TOPIC_FILES,
   renderMemoryFilesList,
+  shortPath,
   type MemoryFileEntry,
 } from "../src/workspace/memory-index.js";
 import { classifyPromptContextChange } from "../src/workspace/prompt-context-diff.js";
@@ -166,6 +167,19 @@ describe("the size cut", () => {
     const shown = lines.length - 1;
     expect(lines[lines.length - 1]).toBe(`(${60 - shown} more files under private/ not listed: memory_list shows them)`);
     expect(lines[shown - 1]).toBe(`- private/n${String(shown - 1).padStart(2, "0")}.md — ${long}`);
+  });
+
+  it("leaves room for the cut line and one notice even under a very long folder path", () => {
+    const deep = `private/${"very-long-folder-name/".repeat(12)}leaf`;
+    const entries = Array.from({ length: 80 }, (_, i) => entry(`${deep}/n${String(i).padStart(2, "0")}.md`, "d".repeat(150)));
+    // The folder folds (80 > 12) under private/<first>: so spread them over the root instead.
+    const loose = entries.map((e, i) => ({ ...e, path: `private/n${String(i).padStart(2, "0")}-${"x".repeat(60)}.md` }));
+    for (const list of [entries, loose]) {
+      const lines = renderMemoryFilesList(list, { audience: "full" });
+      const notice = `(${shortPath(`${deep}/`)} could not be read just now)`;
+      expect(Buffer.byteLength([...lines, notice].join("\n"))).toBeLessThanOrEqual(LIST_BUDGET_KB * 1024);
+    }
+    expect(shortPath(`${deep}/`).length).toBeLessThanOrEqual(80);
   });
 
   it("an install with 600 files stays inside the budget", () => {

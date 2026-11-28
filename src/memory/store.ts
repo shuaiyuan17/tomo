@@ -3,7 +3,7 @@ import { linkSync, lstatSync, mkdirSync, readFileSync, realpathSync, unlinkSync 
 import { basename, dirname, join } from "node:path";
 import { writeFileAtomicSync } from "../fs-utils.js";
 import { landsInPrivate } from "../agent/private-memory-reach.js";
-import { isInside } from "../agent/permission-paths.js";
+import { isInside, isInsideExact } from "../agent/permission-paths.js";
 import {
   collectMemoryFiles,
   descriptionProblem,
@@ -193,10 +193,11 @@ export class MemoryStore {
    * swapping a path for a link while a call runs reads nothing it shouldn't.
    */
   private current(r: Resolved, access: MemoryAccess): Current | null {
-    const read = readMemoryFile(r.abs, this.root(), access.privateBarred);
+    const read = readMemoryFile(r.abs, this.root(), access.privateBarred, access.groupDir);
     if (read === null) return null;
     if ("refused" in read) {
       if (read.refused === "private") throw new MemoryToolError(PRIVATE_BARRED_REFUSAL);
+      if (read.refused === "other-group") throw new MemoryToolError(OTHER_GROUP_REFUSAL);
       if (read.refused === "not-plain") throw new MemoryToolError(`${r.rel} is not a plain file (a folder, a device or a hard link).`);
       if (read.refused === "moved") throw new MemoryToolError(`${r.rel} changed while it was being read. Try again.`);
       throw new MemoryToolError(`${r.rel} is a link or leads outside memory/; memory tools don't follow links.`);
@@ -303,7 +304,7 @@ export class MemoryStore {
       throw new MemoryToolError(PRIVATE_BARRED_REFUSAL);
     }
     // The real place, not the spelled one, inside the turn's own group folder.
-    if (access.privateBarred && (access.groupDir === undefined || !isInside(real, join(root, access.groupDir)))) {
+    if (access.privateBarred && (access.groupDir === undefined || !isInsideExact(real, join(root, access.groupDir)))) {
       throw new MemoryToolError(access.groupDir === undefined ? MIXED_WRITE_REFUSAL : groupWriteRefusal(access.groupDir));
     }
   }

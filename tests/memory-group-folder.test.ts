@@ -25,8 +25,8 @@ vi.mock("../src/logger.js", () => ({ log: { info: vi.fn(), warn: vi.fn(), error:
 
 const { MemoryStore, MIXED_WRITE_REFUSAL, OTHER_GROUP_REFUSAL, groupWriteRefusal } = await import("../src/memory/store.js");
 const { buildMemoryTools } = await import("../src/mcp/memory-tools.js");
-const { groupMemoryDir, isOtherGroupMemoryPath, collectMemoryFiles } = await import("../src/workspace/memory-index.js");
-const { privateMemoryGuardHooks, OTHER_GROUP_MEMORY_DENIAL } = await import("../src/agent/private-memory-guard.js");
+const { groupMemoryDir, isOtherGroupMemoryPath, collectMemoryFiles, readMemoryFile } = await import("../src/workspace/memory-index.js");
+const { privateMemoryGuardHooks, OTHER_GROUP_MEMORY_DENIAL, SEND_MESSAGE_TOOL } = await import("../src/agent/private-memory-guard.js");
 
 afterAll(() => rmSync(tree.root, { recursive: true, force: true }));
 
@@ -115,6 +115,20 @@ describe("memory tools on a group's turn", () => {
     expect(existsSync(join(tree.mem, "elsewhere", "x.md"))).toBe(false);
   });
 
+  it("writes its folder only as spelled: a case variant is another folder on a case-sensitive disk", async () => {
+    const r = await tools(GROUP)("memory_write", { path: `${OWN.toUpperCase()}/x.md`, content: topic("X."), if_version: "new" });
+    expect(r.error).toBe(true);
+    expect(r.text).toContain(groupWriteRefusal(OWN));
+  });
+
+  it("judges a read by where the file really is: a folder that leads into another group's is refused after opening", () => {
+    symlinkSync(join(tree.mem, OTHER), join(tree.mem, OWN, "swapped"));
+    const read = readMemoryFile(join(tree.mem, OWN, "swapped", "secrets.md"), tree.mem, true, OWN);
+    expect(read).toEqual({ refused: "other-group" });
+    // The owner's reach is not narrowed by it.
+    expect(readMemoryFile(join(tree.mem, OWN, "swapped", "secrets.md"), tree.mem, false)).toHaveProperty("bytes");
+  });
+
   it("can't read, list or search another group's folder; sees its own", async () => {
     const call = tools(GROUP);
     const read = await call("memory_read", { path: `${OTHER}/secrets.md` });
@@ -179,6 +193,18 @@ describe("file tools on a group's turn", () => {
     // Its own folder, and shared files, stay open.
     expect(await denied(h, "Read", { file_path: join(tree.mem, OWN, "plans.md") })).toBe(false);
     expect(await denied(h, "Read", { file_path: join(tree.mem, "shared.md") })).toBe(false);
+  });
+
+  it("can't create files in a group folder that doesn't exist yet, unless it is its own", async () => {
+    const h = hook(OWN_KEY, "group-session");
+    expect(await denied(h, "Write", { file_path: join(tree.mem, "groups", "telegram_-100999", "new.txt"), content: "x" })).toBe(true);
+    expect(await denied(h, "Write", { file_path: join(tree.mem, "groups", "stray.txt"), content: "x" })).toBe(true);
+    expect(await denied(h, "Write", { file_path: join(tree.mem, OWN, "new.txt"), content: "x" })).toBe(false);
+    // An attachment is a read the channel makes.
+    expect(await denied(h, SEND_MESSAGE_TOOL, { message: `here\nMEDIA:${join(tree.mem, OTHER, "secrets.md")}` })).toBe(true);
+    // With groups/ gone (or unreadable), a named path is still judged.
+    rmSync(join(tree.mem, "groups"), { recursive: true, force: true });
+    expect(await denied(h, "Read", { file_path: join(tree.mem, OTHER, "secrets.md") })).toBe(true);
   });
 
   it("nor through a link planted in the workspace", async () => {

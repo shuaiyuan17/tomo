@@ -2,7 +2,7 @@ import { extractAttachments } from "./text-utils.js";
 import { landsInPrivate, globReachesPrivate, grepReachesPrivate, bashTouchesMemory } from "./private-memory-reach.js";
 import { expandTilde } from "./bash-write-targets.js";
 import { readdirSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { abs, foldPath, hasTraversalSegment, isInside, realResolve } from "./permission-paths.js";
 
 /*
@@ -219,6 +219,25 @@ export function isPrivateMemoryAccess(
  * single group, so every one is another's). Absolute. Read per call: a group
  * folder appears the first time that group saves something.
  */
+/** The file paths a file-tool call or a composed message names (not search roots). */
+function namedPaths(toolName: string, toolInput: unknown): string[] {
+  if (!toolInput || typeof toolInput !== "object") return [];
+  const ti = toolInput as Record<string, unknown>;
+  if (toolName === SEND_MESSAGE_TOOL) return typeof ti.message === "string" ? attachmentPathsIn(ti.message).map(expandTilde) : [];
+  const p = toolName === "NotebookEdit" ? ti.notebook_path : HOME_WRITE_TOOLS.has(toolName) || toolName === "Read" ? ti.file_path : undefined;
+  return typeof p === "string" ? [p] : [];
+}
+
+/** Lexically under `memory/groups/<g>/` (or directly in groups/) for a `g` other than the turn's own. */
+function spelledInOtherGroup(p: string, ctx: { cwd: string; memoryDir: string; ownGroupDir?: string }): boolean {
+  const lexical = abs(expandTilde(p), ctx.cwd);
+  const groups = join(ctx.memoryDir, "groups");
+  if (!isInside(lexical, groups) || foldPath(lexical) === foldPath(groups)) return false;
+  const parts = relative(foldPath(groups), foldPath(lexical)).split(sep);
+  const own = ctx.ownGroupDir === undefined ? undefined : foldPath(ctx.ownGroupDir.split("/")[1] ?? "");
+  return parts.length === 1 || parts[0] !== own;
+}
+
 export function otherGroupMemoryDirs(memoryDir: string, ownDir: string | undefined): string[] {
   const groupsDir = join(memoryDir, "groups");
   let names: string[];
@@ -238,9 +257,13 @@ export function otherGroupMemoryDirs(memoryDir: string, ownDir: string | undefin
 export function isOtherGroupMemoryAccess(
   toolName: string,
   toolInput: unknown,
-  ctx: { cwd: string; memoryDir: string; otherGroupDirs: readonly string[] },
+  ctx: { cwd: string; memoryDir: string; ownGroupDir?: string; otherGroupDirs: readonly string[] },
 ): boolean {
-  if (toolName === "Bash" || ctx.otherGroupDirs.length === 0) return false;
+  if (toolName === "Bash") return false;
+  // As spelled, whether or not the folder exists yet: a path under groups/
+  // in a folder not the turn's own (a file the tool would create included).
+  if (namedPaths(toolName, toolInput).some((p) => spelledInOtherGroup(p, ctx))) return true;
+  if (ctx.otherGroupDirs.length === 0) return false;
   if (ctx.otherGroupDirs.some((dir) => isPrivateMemoryAccess(toolName, toolInput, { cwd: ctx.cwd, memoryDir: ctx.memoryDir, privateDir: dir }))) return true;
   return SEARCH_TOOLS.has(toolName) && barredSearch(toolName, toolInput, { cwd: ctx.cwd, barredDirs: ctx.otherGroupDirs });
 }

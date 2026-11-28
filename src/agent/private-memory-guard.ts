@@ -311,7 +311,8 @@ export function privateMemoryGuardHooks(
           // Other groups' memory folders, reads and writes: what one group
           // saved is not another's to read.
           const ownGroup = groupKeyFor(reason, sessionKey, scopedCallerKey);
-          const groupCtx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, otherGroupDirs: otherGroupMemoryDirs(MEMORY_DIR, ownGroup ? groupMemoryDir(ownGroup) : undefined) };
+          const ownGroupDir = ownGroup ? groupMemoryDir(ownGroup) : undefined;
+          const groupCtx = { cwd: config.workspaceDir, memoryDir: MEMORY_DIR, ownGroupDir, otherGroupDirs: otherGroupMemoryDirs(MEMORY_DIR, ownGroupDir) };
           if (isOtherGroupMemoryAccess(input.tool_name, input.tool_input, groupCtx)) {
             log.warn({ key: sessionKey, tool: input.tool_name, bar: reason }, "Blocked access to another group's memory folder");
             return {

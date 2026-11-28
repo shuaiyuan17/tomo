@@ -32,7 +32,7 @@ vi.stubEnv("TOMO_WORKSPACE", TOMO_WORKSPACE);
 // `isolate: true` staying on. Same guard as tests/config.test.ts.
 vi.resetModules();
 
-const { buildSystemPrompt, buildIdentityPrompt, promptContextSnapshot, fitMemoryIndex } = await import("../src/workspace/index.js");
+const { buildSystemPrompt, buildIdentityPrompt, promptContextSnapshot, fitMemoryIndex, SHARED_PRIVATE_MEMORY_NOTE } = await import("../src/workspace/index.js");
 const { buildSubsessionPrompt } = await import("../src/agent/subsessions/prompt.js");
 const { classifyPromptContextChange } = await import("../src/workspace/prompt-context-diff.js");
 
@@ -404,6 +404,85 @@ describe("buildSystemPrompt", () => {
       expect(promptContextSnapshot({ isGroup: false }).memory).toHaveLength(3);
       const group = promptContextSnapshot({ isGroup: true }).memory;
       expect(group).toEqual(["- [Public](public.md) — visible everywhere"]);
+    });
+
+    describe("the dm: session's shared variant (a group chat is part of the conversation)", () => {
+      const publicPeople = join(memoryDir, "people");
+      const privatePeople = join(memoryDir, "private", "people");
+
+      beforeEach(() => {
+        mkdirSync(publicPeople, { recursive: true });
+        mkdirSync(privatePeople, { recursive: true });
+        writeFileSync(join(publicPeople, "pat.md"), "---\nname: Pat Public\naliases: patty\n---\n\nNotes.\n");
+        writeFileSync(join(privatePeople, "quinn.md"), "---\nname: Quinn Private\naliases: qq\n---\n\nNotes.\n");
+      });
+
+      afterEach(() => {
+        rmSync(publicPeople, { recursive: true, force: true });
+        rmSync(join(memoryDir, "private"), { recursive: true, force: true });
+      });
+
+      it("leaves out the index lines that link into private/, and private people", () => {
+        const prompt = buildSystemPrompt({ shared: true });
+        expect(prompt).toContain("visible everywhere");
+        expect(prompt).not.toContain("DM only");
+        expect(prompt).not.toContain("private/secret.md");
+        expect(prompt).not.toContain("private/other.md");
+        expect(prompt).toContain("Pat Public");
+        expect(prompt).not.toContain("Quinn Private");
+        expect(prompt).not.toContain("qq");
+      });
+
+      it("the full variant still has both (the fixture is not vacuous)", () => {
+        const prompt = buildSystemPrompt();
+        expect(prompt).toContain("private/secret.md");
+        expect(prompt).toContain("private/other.md");
+        expect(prompt).toContain("Quinn Private");
+        expect(prompt).toContain("Pat Public");
+      });
+
+      it("says what is not loaded instead of the DM's own private-memory section", () => {
+        const prompt = buildSystemPrompt({ shared: true });
+        expect(prompt).toContain(SHARED_PRIVATE_MEMORY_NOTE);
+        expect(prompt).toContain("A group chat is part of this conversation now");
+        expect(prompt).toContain("Don't bring private memory into this conversation while the group is here.");
+        expect(prompt).not.toContain("## Private memories (DM-only)");
+        expect(prompt).toContain("are not listed here while a group chat is part of this conversation");
+        // The full and the group prompt say nothing of it.
+        expect(buildSystemPrompt()).not.toContain("A group chat is part of this conversation now");
+        expect(buildSystemPrompt({ isGroup: true })).not.toContain("A group chat is part of this conversation now");
+      });
+
+      it("does not name private/MEMORY.md, which does not exist yet", () => {
+        expect(buildSystemPrompt({ shared: true })).not.toContain("private/MEMORY.md");
+      });
+
+      it("is otherwise the DM prompt: the owner notes stay, the group's sections do not appear", () => {
+        const prompt = buildSystemPrompt({ shared: true, subsessions: true });
+        expect(prompt).toContain("## Your Home");
+        expect(prompt).toContain("## Long tasks");
+        expect(prompt).not.toMatch(/restricted to DM sessions/i);
+      });
+
+      it("hands the session the lines it was built from: the filtered ones", () => {
+        let built: { memory: string[]; people: string[] } | undefined;
+        buildSystemPrompt({ shared: true, onContext: (c) => { built = c; } });
+        expect(built!.memory).toEqual(["- [Public](public.md) — visible everywhere"]);
+        expect(built!.people.join("\n")).toContain("Pat Public");
+        expect(built!.people.join("\n")).not.toContain("Quinn Private");
+      });
+
+      it("carries no over-budget reminder: the index is not reorganized while a group is here", () => {
+        writeFileSync(memoryFile, Array.from({ length: 201 }, (_, i) => `- line ${i}`).join("\n") + "\n");
+        expect(buildSystemPrompt()).toContain("over its 200-line");
+        expect(buildSystemPrompt({ shared: true })).not.toContain("over its 200-line");
+      });
+
+      it("isGroup wins over shared: a group session never gets the DM-only notes", () => {
+        const prompt = buildSystemPrompt({ isGroup: true, shared: true });
+        expect(prompt).not.toContain("## Your Home");
+        expect(prompt).toMatch(/restricted to DM sessions/i);
+      });
     });
 
     it("DM prompt tells the agent to use memory/private/ for sensitive notes", () => {

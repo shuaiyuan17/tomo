@@ -41,7 +41,7 @@ const { NudgeCooldownStore } = await import("../src/lcm/nudge-cooldown-store.js"
 
 interface Nudge { text: string; sessionKey: string; options: { suppressDelivery?: boolean } }
 
-function runnerFor(sessionKey: string): {
+function runnerFor(sessionKey: string, summoned: () => boolean = () => false): {
   runner: InstanceType<typeof RollupRunner>;
   nudges: Nudge[];
   cooldowns: InstanceType<typeof NudgeCooldownStore>;
@@ -50,6 +50,7 @@ function runnerFor(sessionKey: string): {
   const agent = {
     listActiveSessions: () => [[sessionKey, "sdk-session-1"]] as Array<[string, string]>,
     hasBackgroundWork: () => false,
+    hasActiveSummonInto: (key: string) => key === sessionKey && summoned(),
     handleCronMessage: async (text: string, key: string, options: Nudge["options"]) => {
       nudges.push({ text, sessionKey: key, options });
       return true;
@@ -84,6 +85,28 @@ describe("rollup nudge delivery suppression", () => {
 
     expect(nudges).toHaveLength(1);
     expect(nudges[0].options.suppressDelivery).toBe(true);
+  });
+});
+
+describe("while a group is summoned into the session", () => {
+  it("defers the rollup without arming its cooldown, and asks on the first tick after the summon ends", async () => {
+    let summoned = true;
+    const { runner, nudges, cooldowns } = runnerFor("dm:owner", () => summoned);
+
+    await checkAll(runner);
+    vi.setSystemTime(new Date("2026-08-28T13:00:00"));
+    await checkAll(runner);
+    expect(nudges).toHaveLength(0);
+    // Not even looked up, and nothing armed: a deferral must not cost the 6h debounce.
+    expect(fixture.dueCalls).toBe(0);
+    expect(cooldowns.get("dm:owner:daily:2026-08-27", Date.now())).toBeUndefined();
+
+    summoned = false;
+    vi.setSystemTime(new Date("2026-08-28T14:00:00"));
+    await checkAll(runner);
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0]).toMatchObject({ sessionKey: "dm:owner" });
+    expect(nudges[0].text).toContain('name="daily 2026-08-27"');
   });
 });
 

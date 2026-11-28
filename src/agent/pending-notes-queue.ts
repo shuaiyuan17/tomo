@@ -51,7 +51,9 @@ function isPinnedNote(note: string): boolean {
     || note.includes('<tomo-event type="subsession-report"')
     || note.includes('<tomo-event type="subsession-message"')
     // A failed task's unanswered messages: the record is forgotten once this is on disk.
-    || note.includes('<tomo-event type="subsession-handback"');
+    || note.includes('<tomo-event type="subsession-handback"')
+    // A group's turn refused for the shared prompt: its inbox record is closed once this is on disk.
+    || note.includes('<tomo-event type="summon-busy"');
 }
 
 /** Drop oldest unpinned notes until `arr` fits the cap (pinned ones always stay). */

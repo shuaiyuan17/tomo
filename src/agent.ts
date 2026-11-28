@@ -80,7 +80,7 @@ import { CredentialBroker } from "./credentials/broker.js";
 import { captureChannelFor } from "./credentials/capture.js";
 import { BrokerStateFile, KeychainBackend } from "./credentials/store.js";
 import { createOrderedBlockTranscript, SHUTDOWN_NOT_PROCESSED } from "./agent/block-transcript.js";
-import { LiveSessionManager } from "./agent/live-session-manager.js";
+import { LiveSessionManager, type PromptVariantNeed } from "./agent/live-session-manager.js";
 import { ProactiveSendService, type SendResult, type SessionCatalog } from "./agent/proactive-send.js";
 import { appendToTomoEventBody, formatTomoEvent, markOwnerAudience } from "./tomo-event.js";
 import { forceSummaryLedgerRow, UsageLedger, triggerSnippet, type UsageLedgerRow, type UsageSource } from "./usage/ledger.js";
@@ -195,7 +195,8 @@ export class Agent {
     enqueueForSession: (key, task) => this.enqueueForSession(key, task),
     processInboundItems: (items, steer) => this.processInboundItems(items, steer),
     hasBusyLiveSession: (key) => this.liveSessionManager.isBusy(key),
-    canSteerIntoSession: (key) => !this.webRequestIds.has(key),
+    canSteerIntoSession: (key, items) => !this.webRequestIds.has(key) && !this.steerNeedsSharedPrompt(key, items),
+    enqueueInbound: (key, items) => this.enqueueInboundForSession(key, items),
   });
   private commands: ChatCommandHandler;
   /** The web Tasks panel's board, read by /tasks (unset while the web UI is off). */
@@ -435,6 +436,7 @@ export class Agent {
     this.liveSessionManager = new LiveSessionManager({
       buildIdentityPrompt: () => buildIdentityPrompt({ subsessions: config.subsessions.enabled }),
       promptContextSnapshot: (key, { strict }) => promptContextSnapshot({ isGroup: isGroupSessionKey(key), strict }),
+      promptVariant: (key) => this.promptVariantFor(key),
       getSdkSessionId: (key) => this.sessions.getSdkSessionId(key),
       setSdkSessionId: (key, sessionId) => this.sessions.setSdkSessionId(key, sessionId),
       clearSdkSessionId: (key) => this.sessions.clearSdkSessionId(key),
@@ -1431,7 +1433,7 @@ export class Agent {
     }
     // Provider batching never steers into a live web turn (canSteerIntoSession).
     // Web must stay out of the batch path: handleBatchedMessages writes no
-    // web requestId and ignores userRecorded (see appendInboundUser).
+    // web requestId (see appendInboundUser).
     const canCoalesce = (!isGroup || isPassiveGroup) && channel.name !== "web";
 
     if (!canCoalesce) {
@@ -1704,10 +1706,11 @@ export class Agent {
     // have acted — and the next start tells the session instead, quoting the
     // messages (see replayInbox).
     const inboxIds = inboxIdsOf(routed);
-    const progress = { unconsumed: false, handedOff: false, cutShort: false };
+    const progress = { unconsumed: false, handedOff: false, cutShort: false, requeuedIds: [] as string[] };
     const hooks: InboxTurnHooks | undefined = inboxIds.length > 0
       ? {
         notConsumed: () => { progress.unconsumed = true; },
+        refused: (requeuedIds = []) => { progress.unconsumed = false; progress.requeuedIds = requeuedIds; },
         cutShort: (selfRestart) => {
           progress.cutShort = true;
           // Written now, while the inbox is still open (shutdown closes it
@@ -1719,14 +1722,26 @@ export class Agent {
         onPromptHandedOff: () => { progress.handedOff = true; this.markInboxStarted(routedKey, inboxIds); },
       }
       : undefined;
+    let requeued = false;
     try {
       if (routed.length === 1) {
         await this.handleMessage(routed[0].channel, routed[0].message, steer, routed[0].resolution, routed[0].userRecorded, hooks);
         return;
       }
       await this.handleBatchedMessages(routed, steer, hooks);
+    } catch (err) {
+      if (!(err instanceof SteerDeclinedError)) throw err;
+      // A steer that could not join the running turn before injection
+      // (nothing reached the SDK): owner web input whose turn stopped being
+      // joinable, or a group's message whose session has the owner's full
+      // prompt. Back into the session's FIFO queue as its own turn, behind
+      // whatever is already waiting there — never around it. The transcript
+      // already has it, and its inbox record goes with it (still `received`).
+      requeued = true;
+      log.info({ sessionKey: routedKey, count: routed.length }, "Steer declined at injection; queued as its own turn");
+      this.enqueueInboundForSession(routedKey, routed.map((item) => ({ ...item, userRecorded: true })));
     } finally {
-      if (inboxIds.length > 0) {
+      if (inboxIds.length > 0 && !requeued) {
         if (progress.unconsumed && !progress.handedOff) {
           // A turn was set up for these but the prompt never reached the model
           // (session build failed, refused for shutdown, a steer whose session
@@ -1750,7 +1765,8 @@ export class Agent {
           this.enqueueForSession(routedKey, async () => { this.inbox?.markDone(inboxIds); })
             .catch((err) => log.warn({ err, sessionKey: routedKey }, "Durable inbox: deferred done failed"));
         } else {
-          this.inbox?.markDone(inboxIds);
+          // A refused turn's requeued records are closed by the turn they are queued as.
+          this.inbox?.markDone(inboxIds.filter((id) => !progress.requeuedIds.includes(id)));
         }
       }
     }
@@ -1904,6 +1920,139 @@ export class Agent {
     this.lastAudiences.set(key, audiences[audiences.length - 1]);
     const note = audienceSwitchNote(prev, audiences, (a) => this.audienceLabel(a));
     return note ? `${note}\n` : "";
+  }
+
+  /**
+   * Undo noteAudienceSwitch for a turn that never ran (its steer was
+   * declined), so the turn it is queued as gets the note instead. Only when
+   * no other turn has moved the session's last audience since.
+   */
+  private forgetAudienceSwitch(key: string, audiences: string[], before: string | undefined): void {
+    if (!isDmSessionKey(key) || this.lastAudiences.get(key) !== audiences[audiences.length - 1]) return;
+    if (before === undefined) this.lastAudiences.delete(key);
+    else this.lastAudiences.set(key, before);
+  }
+
+  /**
+   * The system-prompt variant the turn being dispatched on `key` needs
+   * (LiveSessionManagerDeps.promptVariant). Only the owner's dm: session has
+   * two: its full prompt, and the SHARED one without private index lines and
+   * private people (workspace buildSystemPrompt `shared`).
+   *
+   * - A turn that is not the owner's alone MUST run on the shared one: a
+   *   summoned group's message, a batch mixing the owner with a group, a
+   *   group's delegate, cron job or restart notice handed to this session,
+   *   and any turn overlapping one of those. `isOwnAudienceTurn` is the same
+   *   fail-closed reading every session-scoped tool uses.
+   * - The owner's own turn (and a cron, heartbeat or rollup turn, which
+   *   register no audience) wants the shared one while a group is summoned
+   *   into the session, so the group's next message finds it ready, and the
+   *   full one otherwise — which is how a session goes back after a summon
+   *   ends: no event, just the next turn. Asking also runs the summon's
+   *   lazy expiry check.
+   */
+  private promptVariantFor(key: string): PromptVariantNeed {
+    if (!isDmSessionKey(key)) return { shared: false, required: false };
+    if (!this.isOwnAudienceTurn(key)) return { shared: true, required: true };
+    return { shared: this.router.hasActiveSummonInto(key), required: false };
+  }
+
+  /** Is a group summoned into this dm: session right now? (The rollup runner defers on it.) */
+  hasActiveSummonInto(sessionKey: string): boolean {
+    return this.router.hasActiveSummonInto(sessionKey);
+  }
+
+  /**
+   * Would steering these messages put a group's words into a dm: session
+   * built with the owner's full prompt? Then they must not join its running
+   * turn: they are queued, and their own turn reloads the session first.
+   * (LiveSessionManager declines such a steer again at injection.)
+   */
+  private steerNeedsSharedPrompt(key: string, items: readonly InboundItem[]): boolean {
+    return isDmSessionKey(key) && items.some((it) => it.message.isGroup ?? false)
+      && this.liveSessionManager.hasSharedPrompt(key) === false;
+  }
+
+  /**
+   * A turn a group is steering was refused: the session could not be reloaded
+   * with the shared prompt in time (TurnSpec.onSharedPromptUnavailable). No
+   * model call: each group in the turn gets one fixed line, and the owner is
+   * told which group went unanswered. The messages stay in the transcript.
+   *
+   * The owner's own messages in a mixed batch are not dropped with the
+   * group's: they go back to the queue as their own turn, which runs on the
+   * session as it is. The group's inbox records are closed once the refusal
+   * is on record (tellSharedPromptUnavailable); only when it could be neither
+   * recorded nor told do they stay open, and the next start answers them.
+   */
+  private async answerSharedPromptUnavailable(req: UserTurnRequest): Promise<void> {
+    const ownerItems = req.ownerItems ?? [];
+    if (ownerItems.length > 0) {
+      log.info({ sessionKey: req.key, count: ownerItems.length }, "Refused mixed batch: the owner's own messages are queued again as their own turn");
+      this.enqueueInboundForSession(req.key, ownerItems.map((item) => ({ ...item, userRecorded: true })));
+    }
+    const groups = [...new Set((req.audiences ?? []).filter((a) => isGroupSessionKey(a)))];
+    const settled = await this.tellSharedPromptUnavailable(req.key, groups, groups);
+    if (settled) req.inboxHooks?.refused(inboxIdsOf(ownerItems));
+    else log.warn({ sessionKey: req.key, groups }, "Refused group turn: it could be neither recorded nor told; its inbox records stay open for the next start");
+  }
+
+  /**
+   * Tell people of a refusal and put it on record: the busy line to
+   * `tellGroups`, one owner notice naming `groups`, then a durable pending
+   * note for the session (owner-audience and pinned: only the owner's own
+   * turns read it, the cap never drops it, and it survives a restart, a
+   * disabled inbox and a channel that is down). The note says whether the
+   * owner was reached, so a turn that reads it knows whether telling them is
+   * still to do. `what`: the work that did not run, for a background turn.
+   * True when the note was stored, or failing that when the owner notice or
+   * every group line was delivered.
+   */
+  private async tellSharedPromptUnavailable(sessionKey: string, groups: string[], tellGroups: string[], what?: string): Promise<boolean> {
+    const label = groups.map((g) => this.sessions.getEntry(g)?.chatTitle ?? g).join(", ") || "a group";
+    // Every group told counts; one of several does not speak for the rest.
+    let groupsTold = tellGroups.length > 0;
+    for (const groupKey of tellGroups) {
+      const parsed = parseRawSessionKey(groupKey);
+      const channel = parsed ? this.getChannel(parsed.channelName) : undefined;
+      if (!parsed || !channel) { groupsTold = false; continue; }
+      try {
+        await channel.send({ chatId: parsed.chatId, text: ownerT("notices")("group.summonBusy") });
+      } catch (err) {
+        groupsTold = false;
+        log.warn({ err, group: groupKey }, "Could not post the busy notice to the group");
+      }
+    }
+    let ownerTold = false;
+    try {
+      const notice = what !== undefined
+        ? ownerT("notices")("group.summonBusyOwnerBackground", { group: label })
+        : ownerT("notices")("group.summonBusyOwner", { group: label });
+      ownerTold = await this.notifyOwner(notice);
+    } catch (err) {
+      log.warn({ err }, "Could not tell the owner about a refused group turn");
+    }
+    const subject = what !== undefined ? `A background turn for the group ${label} (${what})` : `A message from the group ${label}`;
+    const noted = this.queuePendingNote(sessionKey, markOwnerAudience(formatTomoEvent(
+      "summon-busy",
+      `${subject} was not run: this session was busy and could not be reloaded without the owner's private context in time. Nothing reached you for it${what !== undefined ? "" : "; the message itself is in the conversation history"}. ${ownerTold
+        ? "The owner has been sent a notice about it."
+        : "The owner could NOT be told (their chat was unreachable): tell them, with send_message if this turn's own reply is not delivered to them."}`,
+    )));
+    return noted || ownerTold || groupsTold;
+  }
+
+  /**
+   * The same refusal for a group's BACKGROUND turn handed to the dm: session
+   * (its cron job, its delegate, its restart notice): the owner is told what
+   * did not run, and a group that asked for a delegate gets the busy line.
+   * Undefined for a turn no group is behind, which keeps the error policy.
+   */
+  private backgroundRefusal(sessionKey: string, audiences: readonly string[] | undefined, tellGroup: boolean, what: string): (() => Promise<boolean>) | undefined {
+    const groups = [...new Set((audiences ?? []).filter((a) => isGroupSessionKey(a)))];
+    if (groups.length === 0) return undefined;
+    // False (neither recorded nor told): the turn's ordinary error policy takes over.
+    return () => this.tellSharedPromptUnavailable(sessionKey, groups, tellGroup ? groups : [], what);
   }
 
   private audienceLabel(audience: string): string {
@@ -2362,6 +2511,7 @@ export class Agent {
       },
       silentMatcher: isSilentReply,
       transcript: "always",
+      onSharedPromptUnavailable: () => this.answerSharedPromptUnavailable(req),
       ...(req.inboxHooks ? {
         onPromptHandedOff: req.inboxHooks.onPromptHandedOff,
         onShutdown: (kind: ShutdownTurnEnd, selfRestart?: { reason?: string }) => { if (kind === "interrupted") req.inboxHooks?.cutShort(selfRestart); },
@@ -2465,6 +2615,7 @@ export class Agent {
     // Prompt-only — the transcript keeps the clean tagged message.
     const isSummoned = isGroup && isDmSessionKey(key);
     const audiences = [audienceOf(channel.name, message)];
+    const audienceBefore = this.lastAudiences.get(key);
     const switchNote = this.noteAudienceSwitch(key, audiences);
     // The audience this message came from, derived exactly like the summon
     // reminder's targets — a summoned group must be answered in the group,
@@ -2503,12 +2654,10 @@ export class Agent {
         ...(channel.name === "web" ? { webRequestId: message.id } : {}),
       });
     } catch (err) {
-      if (!(err instanceof SteerDeclinedError)) throw err;
-      // Owner web input whose turn stopped being joinable before injection
-      // (nothing reached the SDK): back into the session's FIFO queue as its
-      // own turn, behind whatever is already waiting there — never around it.
-      log.info({ sessionKey: key }, "Web steer declined at injection; queued as its own turn");
-      this.enqueueInboundForSession(key, [{ channel, message, resolution, userRecorded: true }]);
+      // Declined before injection: processInboundItems queues it as its own
+      // turn, which must be told of the audience switch this one would have.
+      if (err instanceof SteerDeclinedError) this.forgetAudienceSwitch(key, audiences, audienceBefore);
+      throw err;
     }
   }
 
@@ -2585,13 +2734,12 @@ export class Agent {
     // transcript line, its prompt line, and the batch's sender clock below.
     const people = createPeopleSnapshot();
 
-    for (const { channel, message } of items) {
+    for (const { channel, message, userRecorded } of items) {
       if (message.isGroup) this.updateGroupContext(`${channel.name}:${message.chatId}`, message.senderName, message.chatTitle, message.senderId, people);
       this.recordLatestInboundMessage(key, channel, message);
       const transcriptText = this.formatGroupText(channel, message, key, people);
-      // No web requestId and no userRecorded check here: both only matter for
-      // web input, and web never coalesces (canCoalesce in enqueueMessage).
-      // Kept exactly as the batch path always wrote it; if web ever reaches
+      // No web requestId here: it only matters for web input, and web never
+      // coalesces (canCoalesce in enqueueMessage). If web ever reaches
       // this path, its records would lack the requestId the browser pairs on,
       // so say so loudly instead of silently writing them.
       // Diagnostic only: a logging failure must not abort the batch.
@@ -2600,7 +2748,8 @@ export class Agent {
           log.error({ sessionKey: key, messageId: message.id }, "Web message reached the batch path; its transcript record has no requestId (canCoalesce should exclude web)");
         } catch { /* ignore */ }
       }
-      this.appendInboundUser(key, channel, message, transcriptText, { webRequestId: false });
+      // Already written by the attempt whose steer was declined (processInboundItems).
+      if (!userRecorded) this.appendInboundUser(key, channel, message, transcriptText, { webRequestId: false });
     }
 
     // Transcript recorded; refuse the turn (see resolveReplyDestination).
@@ -2637,6 +2786,7 @@ export class Agent {
       : [];
     const reminder = summonTargets.length > 0 ? `\n${this.summonReminder(summonTargets)}` : "";
     const audiences = items.map((it) => audienceOf(it.channel.name, it.message));
+    const audienceBefore = this.lastAudiences.get(key);
     const switchNote = this.noteAudienceSwitch(key, audiences);
     const combined = `${switchNote}[${subject} — read them all together before responding; later messages may revise or cancel earlier ones]\n${numbered}${reminder}`;
     const allImages = items.flatMap((it) => it.message.images ?? []);
@@ -2649,7 +2799,7 @@ export class Agent {
     const senderZones = new Set(items.map((it) => this.senderTimeZone(it.channel, it.message, people)));
     const senderTimeZone = senderZones.size === 1 ? [...senderZones][0] : undefined;
 
-    await this.runUserTurn({
+    await this.runUserTurnOrForgetSwitch(key, audiences, audienceBefore, {
       key,
       promptText: combined,
       sourceChannelName: lastChannel.name,
@@ -2662,6 +2812,7 @@ export class Agent {
       audiences,
       origins: items.map((it) => ({ channelName: it.channel.name, chatId: it.message.chatId })),
       ...(isDmSessionKey(key) ? { ownerMessages: items.filter((it) => !(it.message.isGroup ?? false)).map((it) => ownerTurnMessage(it.channel, it.message)) } : {}),
+      ...(isDmSessionKey(key) && summonTargets.length > 0 ? { ownerItems: items.filter((it) => !(it.message.isGroup ?? false)) } : {}),
       suppressErrors: isPassiveGroup,
       ...(isPassiveGroup ? { ownerNotice: this.ownerNoticeTarget(key, ownerT("notices")("suppressed.turn.message"), `${lastChannel.name}:${lastMessage.chatId}`) } : {}),
       errorLogMessage: "Error handling batched messages",
@@ -2680,6 +2831,16 @@ export class Agent {
       passiveListen: isPassiveGroup,
       ...(inboxHooks ? { inboxHooks } : {}),
     });
+  }
+
+  /** runUserTurn for a batch; a declined steer takes back its audience-switch note (see handleMessage). */
+  private async runUserTurnOrForgetSwitch(key: string, audiences: string[], audienceBefore: string | undefined, req: UserTurnRequest): Promise<void> {
+    try {
+      await this.runUserTurn(req);
+    } catch (err) {
+      if (err instanceof SteerDeclinedError) this.forgetAudienceSwitch(key, audiences, audienceBefore);
+      throw err;
+    }
   }
 
   /** Thin delegate kept on Agent so TurnRunner's late-bound dep (and tests
@@ -2917,6 +3078,8 @@ export class Agent {
     // narrows them to that group and which `scopedCallerKey` logs at debug.
     const turnId = options.audiences ? this.turnAudiences.begin(key, options.audiences) : undefined;
     if (turnId !== undefined) options.onTurnBegin?.(turnId);
+    const groupRefusal = this.backgroundRefusal(key, options.audiences, options.usageSource === "delegate",
+      `${options.usageSource === "delegate" ? "a delegated request" : options.jobName ? `the scheduled job "${options.jobName}"` : "a scheduled job"}: ${triggerSnippet(message) ?? "no text"}`);
     try {
       return await this.turnRunner.runTurn({
         key,
@@ -2950,6 +3113,9 @@ export class Agent {
           suppressedLog: "Cron output suppressed from chat delivery",
         },
         silentMatcher: isSilentReply,
+        // A group's turn refused for the shared prompt: reported, and false
+        // comes back, so a scheduler records a run that did not happen.
+        ...(groupRefusal ? { onSharedPromptUnavailable: groupRefusal } : {}),
         silentLog: "Cron completed silently (no reply sent)",
         transcript: "on-delivery",
         errors: {
@@ -3079,6 +3245,8 @@ export class Agent {
       source: "continuity",
       usage: { source: usageSource, ...(taskId ? { taskId } : {}) },
       prompt,
+      // A summoned group's restart notice refused for the shared prompt.
+      ...(noticeGroupKey ? { onSharedPromptUnavailable: this.backgroundRefusal(key, [noticeGroupKey], false, `a restart notice: ${triggerSnippet(prompt) ?? "no text"}`) } : {}),
       // No timestamp stamp, no typing indicator — continuity turns are
       // invisible. A heartbeat speaks only through the explicit `send_message`
       // tool, never through its own text blocks (owner decision 2026-08-28,

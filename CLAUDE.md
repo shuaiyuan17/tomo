@@ -223,6 +223,19 @@ Built by `workspace/index.ts` from layered markdown files:
 
 Changes to workspace files take effect on next message (no restart needed) — the prompt is rebuilt on each new LiveSession.
 
+**The owner's `dm:` session has two prompt variants** (`buildSystemPrompt({ shared })`): the full one, and the SHARED one, which leaves out the MEMORY.md lines that link into `private/` and the private people records (the same filter as a group prompt) and says so (`SHARED_PRIVATE_MEMORY_NOTE`); everything else is the DM prompt. A live session keeps the variant it was built with (`LiveSessionManager.sharedPrompt`), so the variant is chosen per TURN, when it is dispatched (`sessionForTurn` ← `deps.promptVariant` = `Agent.promptVariantFor`), never when the message was queued:
+
+| Turn on the `dm:` session | Variant |
+|---|---|
+| The owner's private message (any channel, web), no summon | full |
+| The owner's private message while a group is summoned in | shared (preferred) |
+| A summoned group's message; a batch mixing the owner with a group; any turn overlapping one | shared (required) |
+| A group's delegate, cron job or restart notice handed to the session | shared (required) |
+| The owner's own cron job, heartbeat, rollup or other background turn | as the owner's message: full, or shared (preferred) during a summon |
+| A delegate the owner's own private turn asked for | as the owner's message |
+
+Group sessions and sub-sessions have one prompt each and are never reloaded for this. *Required* is `!isOwnAudienceTurn(key)`, the same fail-closed reading the session-scoped tools use; *preferred* is `OwnerRouter.hasActiveSummonInto(key)`, which also runs the summon's lazy expiry check, so a session goes back to the full prompt on the owner's first turn after a summon ends, with no event. When the live session has the other variant, it is closed and resumed from disk first (`closeReaped`: the resume waits for the old CLI to exit), but only when nothing would be cut (`variantSwitchBlocker`: the idle reaper's conditions). NOT `retireWhenIdle`, which waits for the queue to empty and would let the waiting turn run on the old prompt. When it cannot be closed: a *preferred* turn runs on the session as it is; a *required* one waits at the head of the session queue up to `PROMPT_VARIANT_SWITCH_WAIT_MS` (5 min) and is then refused (`SharedPromptUnavailableError`) without a model call: the group gets one fixed line and the owner a notice (`Agent.answerSharedPromptUnavailable`). Background work is never stopped for a variant. A steer never reloads a session: a group's message is kept out of a running turn on the full prompt at ingress (`steerNeedsSharedPrompt` → the batcher's `canSteerIntoSession`) and declined again at injection (`SteerDeclinedError`, which `processInboundItems` re-queues as its own turn, transcript record and inbox id kept). A session on the shared variant takes no memory-change note and is not retired for one. Each reload restarts the CLI and its MCP servers and misses the prompt cache for the whole conversation (the system prompt leads it). While a group is summoned in, the rollup runner defers the session's rollups without arming their cooldown.
+
 The workspace files are copied once (`tomo init`; CONTINUITY.md at start when missing) and are the owner's from then on, so they are never updated in place (only `tomo init --force` overwrites them). Keep them to personality and personal habits; anything about how Tomo works (tools, routing, delivery, summoning, heartbeats) goes in code-side prompts, events or tool descriptions (`tests/workspace-defaults.test.ts`).
 
 ### Daemon Lifecycle

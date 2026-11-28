@@ -36,6 +36,12 @@ export interface UserTurnRequest {
   passiveListen?: boolean;
   /** Durable-inbox progress for the messages behind this turn. */
   inboxHooks?: InboxTurnHooks;
+  /**
+   * The owner's own messages in a batch that also holds a group's. When the
+   * turn is refused for the shared prompt, these are queued again as their
+   * own turn (which needs no reload), not dropped with the group's.
+   */
+  ownerItems?: InboundItem[];
   /** The owner's own messages in this turn (their private DM ones), for
    *  task_message to attach. See TurnAudienceRegistry.ownerMessages. */
   ownerMessages?: OwnerTurnMessage[];
@@ -135,4 +141,12 @@ export interface InboxTurnHooks {
    */
   cutShort(selfRestart?: { reason?: string }): void;
   onPromptHandedOff(): void;
+  /**
+   * The turn was refused on purpose before its prompt reached the model, and
+   * its senders were told (a group's turn with no shared-prompt session in
+   * time). A deliberate drop: the messages must not come back after a restart.
+   * `requeuedIds`: records of this turn that were put back in the queue
+   * instead (the owner's own messages in a mixed batch); they stay open.
+   */
+  refused(requeuedIds?: string[]): void;
 }

@@ -28,7 +28,16 @@ export interface InboundBatcherHost {
   processInboundItems(items: InboundItem[], steer?: boolean): Promise<void>;
   /** Is a live turn currently in flight on this session? (steering target check) */
   hasBusyLiveSession(sessionKey: string): boolean;
-  canSteerIntoSession?(sessionKey: string): boolean;
+  /** May this drained batch join the session's running turn? False sends it to the queue as its own turn. */
+  canSteerIntoSession?(sessionKey: string, items: readonly InboundItem[]): boolean;
+  /**
+   * Queue a drained batch as its own turn, in a way shutdown can still find
+   * it (Agent.enqueueInboundForSession). It can wait a long time behind the
+   * turn it was not allowed to join, and a batch that is only a closure on
+   * the session queue is lost if the daemon stops meanwhile. Absent: the
+   * plain queue.
+   */
+  enqueueInbound?(sessionKey: string, items: InboundItem[]): void;
 }
 
 /**
@@ -240,11 +249,16 @@ export class InboundBatcher {
     }
 
     if (steerable) {
-      if (this.host.hasBusyLiveSession(sessionKey) && this.host.canSteerIntoSession?.(sessionKey) !== false) {
+      if (this.host.hasBusyLiveSession(sessionKey) && this.host.canSteerIntoSession?.(sessionKey, items) !== false) {
         await this.host.processInboundItems(items, true);
         return;
       }
-      // No turn in flight — process through the ordinary per-session queue.
+      // No turn in flight, or one this batch may not join — process through
+      // the ordinary per-session queue.
+      if (this.host.enqueueInbound) {
+        this.host.enqueueInbound(sessionKey, items);
+        return;
+      }
       this.host.enqueueForSession(sessionKey, () => this.host.processInboundItems(items))
         .catch((err) => log.error({ err, sessionKey }, "Unhandled error in message queue"));
       return;

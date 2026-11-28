@@ -145,19 +145,21 @@ export function msToNextLocalDay(today: number, now: number): number {
 }
 /**
  * Today's first moment on the viewer's clock, moving on when the day does: a
- * timer set for midnight, and a look at the clock every minute and whenever
+ * timer set for midnight (set again each time it fires, so a clock put back
+ * does not leave it unset), and a look at the clock every minute and whenever
  * the page comes back into view (a page left open overnight, a laptop woken).
  */
 export function useToday(): number {
   const [today, setToday] = useState(() => startOfLocalDay(Date.now()));
   useEffect(() => {
     const check = () => setToday(startOfLocalDay(Date.now()));
-    // Set again for each new day: the effect runs again when `today` moves.
-    const midnight = setTimeout(check, msToNextLocalDay(today, Date.now()));
+    let midnight: ReturnType<typeof setTimeout>;
+    const arm = () => { const now = Date.now(); midnight = setTimeout(() => { check(); arm(); }, msToNextLocalDay(startOfLocalDay(now), now)); };
+    arm();
     const timer = setInterval(check, TODAY_CHECK_MS);
     document.addEventListener("visibilitychange", check);
     return () => { clearTimeout(midnight); clearInterval(timer); document.removeEventListener("visibilitychange", check); };
-  }, [today]);
+  }, []);
   return today;
 }
 

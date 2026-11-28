@@ -12,6 +12,7 @@ import { ChunkBoundary } from "./chunk-boundary.js";
 import { ModelBadge } from "./model-badge.js";
 import { type TaskRow, type TreeGuide, buildTaskView, formatElapsed, lastStep, railSections, rowElapsed, stateLabel, taskKind, treeGuides } from "./tasks.js";
 import { i18n, useTranslation } from "./i18n/index.js";
+import { formatNumber } from "./i18n/format.js";
 import { toolIcon } from "./tool-calls.js";
 import { asksOwner, isOpenSubsession, subsessionState, subsessionStateLabel, isWorkingState, todaysSubsessions, useToday } from "./subsessions.js";
 import { IdPill, SubsessionView, type SubsessionDone, type SubsessionSend } from "./subsession-view.js";
@@ -92,7 +93,7 @@ export function TasksPanel({ tasks, sessions, onClose, footer, control, subsessi
             {subs.shown.map((task) => <SubsessionCard key={task.id} task={task} onOpen={() => setOpenedSub(task.id)} />)}
             {subs.earlier.length > 0 && <li><button type="button" data-testid="subsessions-earlier" aria-expanded={showEarlier} onClick={() => setShowEarlier((old) => !old)}
               className="flex w-full cursor-pointer items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground focus-visible:outline-offset-0">
-              <ChevronRight aria-hidden="true" className={cn("size-3.5 shrink-0 transition-transform", showEarlier && "rotate-90")} />{t("subsession.earlier", { count: subs.earlier.length })}</button></li>}
+              <ChevronRight aria-hidden="true" className={cn("size-3.5 shrink-0 transition-transform", showEarlier && "rotate-90")} />{t("subsession.earlier", { count: subs.earlier.length, n: formatNumber(subs.earlier.length) })}</button></li>}
             {showEarlier && subs.earlier.map((task) => <SubsessionCard key={task.id} task={task} onOpen={() => setOpenedSub(task.id)} />)}
           </ul>
         </div> : <div className="[&+&]:mt-4" key={group.sessionId}>

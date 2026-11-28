@@ -108,6 +108,14 @@ export interface SubsessionServiceDeps {
   noticeToScope(parentKey: string, text: OwnerText): Promise<void>;
   queuePendingNote(key: string, note: string): boolean;
   /**
+   * Queue a note and run `also` in the same database transaction (the notes
+   * and the task table share one database): both commit, or neither, and a
+   * note that did not commit is not held in memory either. Returns whether
+   * it committed. Absent: the note and what follows it are written apart
+   * (and the delivery's retries reconcile them).
+   */
+  queuePendingNoteWith?(key: string, note: string, also: () => void): boolean;
+  /**
    * Take back a note just queued whose write failed (the sender is told it
    * was not handed over, so it must not reach a turn from memory).
    */
@@ -2961,6 +2969,27 @@ export class SubsessionService {
           ? `It needs the owner to: ${needsOwner(record)!.replace(/[.。]+$/, "")}. Tell them. The task shows as "Needs you" until they do it: once they say it is done (or no longer needed), call task_done("${record.id}", ${reportNumber(record)}).`
           : "It needs nothing from the owner.",
       ].join("\n"), { name: reportNoteName(record) });
+      if (this.deps.queuePendingNoteWith) {
+        // ONE TRANSACTION: the note and the delivered mark commit together,
+        // or neither does (then nothing is held in memory, and the whole
+        // delivery is tried again). No window with the note on disk and the
+        // record still saying undelivered, so no second note. The wake goes
+        // after the commit; a start that finds a delivered report's note
+        // unread wakes the owning session again (see reconcile).
+        const seq = record.reportSeq;
+        const committed = this.deps.queuePendingNoteWith(record.parentKey, note, () => {
+          this.store.update(record.id, (r) => { if (r.reportSeq === seq) r.reportDelivered = true; });
+        });
+        if (!committed) {
+          this.retryReport(record.id);
+          return;
+        }
+        this.unpersistedReports.delete(record.id);
+        this.clearReportRetry(record.id);
+        this.markOwed.delete(record.id);
+        this.wakeForReport(record);
+        return;
+      }
       if (!this.deps.queuePendingNote(record.parentKey, note)) {
         this.unpersistedReports.add(record.id);
         this.retryReport(record.id);

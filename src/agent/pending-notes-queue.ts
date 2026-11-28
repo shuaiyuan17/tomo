@@ -4,6 +4,8 @@ import { formatTomoEvent, isOwnerAudienceNote } from "../tomo-event.js";
 export interface DurablePendingNotesStore {
   getPendingNotes(key: string): string[];
   setPendingNotes(key: string, notes: string[]): void;
+  /** setPendingNotes with `also` in the same transaction: both commit, or neither. */
+  setPendingNotesWith?(key: string, notes: string[], also: () => void): void;
 }
 
 /** Cap on queued pending notes per session. */
@@ -170,6 +172,34 @@ export class PendingNotesQueue {
     const dropped = capNotes(arr);
     if (dropped > 0) log.debug({ sessionKey, dropped }, "Pending notes capped at limit; dropped oldest");
     return this.persist(sessionKey);
+  }
+
+  /**
+   * Queue a note and run `also` in the same write: the note is on disk
+   * together with what `also` writes (a sub-session's report marked
+   * delivered), or neither is, and then the note is not held in memory
+   * either (the caller tries the whole thing again). Returns whether it
+   * committed. Without a store that can do that, false.
+   */
+  queueNoteWith(sessionKey: string, note: string, also: () => void): boolean {
+    if (!this.store.setPendingNotesWith) return false;
+    const arr = this.queued(sessionKey);
+    if (this.unloaded.has(sessionKey) && !this.retryLoad(sessionKey)) return false;
+    const next = [...(this.notes.get(sessionKey) ?? arr), note];
+    const dropped = capNotes(next);
+    const all = [
+      ...(this.inflight.get(sessionKey) ?? []).flatMap((b) => b.notes.map(markInterrupted)),
+      ...next,
+    ];
+    try {
+      this.store.setPendingNotesWith(sessionKey, all, also);
+    } catch (err) {
+      log.warn({ err, sessionKey }, "Could not persist a pending note with its companion write; nothing was kept");
+      return false;
+    }
+    if (dropped > 0) log.debug({ sessionKey, dropped }, "Pending notes capped at limit; dropped oldest");
+    this.notes.set(sessionKey, next);
+    return true;
   }
 
   /**

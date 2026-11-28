@@ -1,0 +1,127 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_SUBSESSIONS } from "../src/config.js";
+import { PendingNotesQueue } from "../src/agent/pending-notes-queue.js";
+import { SubsessionService, type SubsessionServiceDeps } from "../src/agent/subsessions/service.js";
+import { SubsessionStore } from "../src/agent/subsessions/store.js";
+import { TomoDb } from "../src/db/index.js";
+import { makeSessionStore } from "./helpers/session-store-fixtures.js";
+
+// ---------------------------------------------------------------------------
+// A finished task's report reaches the owning session as a pending note, and
+// the task is marked "report delivered": both rows in tomo.db, written in ONE
+// transaction (the pending-notes store and the task table share the
+// process's connection). Real stores here, no fakes for either half.
+// ---------------------------------------------------------------------------
+
+let dir = "";
+beforeEach(() => { dir = mkdtempSync(join(tmpdir(), "tomo-report-tx-")); });
+afterEach(() => { vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true }); });
+
+async function flush(): Promise<void> {
+  for (let i = 0; i < 60; i++) await new Promise((r) => setImmediate(r));
+}
+
+function world() {
+  const sessions = makeSessionStore(join(dir, "sessions"), { dbPath: join(dir, "tomo.db") });
+  const queue = new PendingNotesQueue(sessions);
+  const store = new SubsessionStore(join(dir, "subsessions.json"), { dbPath: join(dir, "tomo.db"), strictTransitions: true });
+  const wakes: string[] = [];
+  const deps = {
+    store,
+    config: () => ({ ...DEFAULT_SUBSESSIONS, enabled: true, ownerMessages: "direct" as const }),
+    runTaskTurn: async (key: string) => {
+      await new Promise((r) => setImmediate(r));
+      service.noteToolUse(key);
+      service.finish(key, "the report");
+      return { ok: true };
+    },
+    sendToScope: async () => ({ ok: true }),
+    noticeToScope: async () => {},
+    noticeOwner: async () => {},
+    queuePendingNote: (key: string, note: string) => queue.queueNote(key, note),
+    queuePendingNoteWith: (key: string, note: string, also: () => void) => queue.queueNoteWith(key, note, also),
+    persistPendingNotes: (key: string) => queue.persistNow(key),
+    hasPendingNote: (key: string, pred: (n: string) => boolean) => queue.hasNote(key, pred),
+    wakeScope: (key: string) => { wakes.push(key); },
+    contextUsage: () => undefined,
+    cronJobCount: () => 0,
+    removeCronJobs: () => {},
+    stopSession: async () => {},
+    registryReadable: () => true,
+    hasSdkSession: () => false,
+    ensureRegistryEntry: () => {},
+    unlinkRegistryEntry: () => {},
+    registryTaskKeys: () => [],
+    isStopping: () => false,
+  } as unknown as SubsessionServiceDeps;
+  const service = new SubsessionService(deps);
+  service.recoverAtStartup();
+  service.start();
+  return { sessions, queue, store, service, wakes };
+}
+
+const reportNotes = (notes: string[]) => notes.filter((n) => n.includes('type="subsession-report"'));
+
+describe("report delivery is one transaction", () => {
+  it("commits the note and the delivered mark together, then wakes the owning session", async () => {
+    const w = world();
+    const { record } = w.service.spawn("dm:owner", { title: "t", brief: "b" }) as { record: { id: string } };
+    await flush();
+    expect(w.store.get(record.id)).toMatchObject({ status: "finished", reportDelivered: true });
+    expect(reportNotes(makeSessionStore(join(dir, "sessions"), { dbPath: join(dir, "tomo.db") }).getPendingNotes("dm:owner"))).toHaveLength(1);
+    expect(w.wakes).toEqual(["dm:owner"]);
+    w.service.stop();
+  });
+
+  it("a table write that fails takes the note back with it: nothing on disk, nothing in memory, and the retry delivers once", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const w = world();
+      const real = SubsessionStore.prototype.update;
+      let failNext = true;
+      vi.spyOn(SubsessionStore.prototype, "update").mockImplementation(function (this: SubsessionStore, id, fn) {
+        // Only the delivered mark (the first update after the report).
+        const probe = this.get(id);
+        if (failNext && probe?.status === "finished" && !probe.reportDelivered) {
+          const before = { ...probe };
+          fn(before);
+          if (before.reportDelivered) { failNext = false; throw new Error("disk full"); }
+        }
+        return real.call(this, id, fn);
+      });
+      const { record } = w.service.spawn("dm:owner", { title: "t", brief: "b" }) as { record: { id: string } };
+      await flush();
+      expect(w.store.get(record.id)).toMatchObject({ status: "finished", reportDelivered: false });
+      const onDisk = () => reportNotes(makeSessionStore(join(dir, "sessions"), { dbPath: join(dir, "tomo.db") }).getPendingNotes("dm:owner"));
+      expect(onDisk()).toHaveLength(0);
+      expect(w.queue.hasNote("dm:owner", (n) => n.includes('type="subsession-report"'))).toBe(false);
+      expect(w.wakes).toEqual([]);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await flush();
+      expect(w.store.get(record.id)?.reportDelivered).toBe(true);
+      expect(onDisk()).toHaveLength(1);
+      expect(w.wakes).toEqual(["dm:owner"]);
+      w.service.stop();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a note write that fails writes no mark either", async () => {
+    const w = world();
+    const real = TomoDb.prototype.run;
+    let fail = true;
+    vi.spyOn(TomoDb.prototype, "run").mockImplementation(function (this: TomoDb, sql: string, ...params) {
+      if (fail && sql.startsWith("INSERT INTO pending_notes") && String(params[2]).includes('type="subsession-report"')) { fail = false; throw new Error("SQLITE_FULL"); }
+      return real.call(this, sql, ...params);
+    });
+    const { record } = w.service.spawn("dm:owner", { title: "t", brief: "b" }) as { record: { id: string } };
+    await flush();
+    expect(w.store.get(record.id)).toMatchObject({ status: "finished", reportDelivered: false });
+    expect(w.queue.hasNote("dm:owner", (n) => n.includes('type="subsession-report"'))).toBe(false);
+    w.service.stop();
+  });
+});

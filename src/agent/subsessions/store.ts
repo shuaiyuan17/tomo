@@ -351,23 +351,23 @@ export class SubsessionStore {
   /** `changed`, when given, may skip the write: only for a table read cleanly ("ok"). */
   private mutate<T>(fn: (table: SubsessionTable) => T, changed?: () => boolean): T {
     const db = this.ready();
-    let written: SubsessionTable | null = null;
-    const result = db.transaction(() => {
+    return db.transaction(() => {
       const before = this.readRows(db);
       const table = clone(before.table);
       const out = fn(table);
       if (changed && !changed() && this.lastState === "ok") return out;
       writeRows(db, before, table);
-      written = table;
+      // Once it is committed: inside another store's transaction (a report
+      // note and its delivered mark, see the service), that is the outer one.
+      const written = clone(table);
+      db.afterCommit(() => {
+        this.cached = written;
+        this.lastState = "ok";
+        this.recoveredByImport = false;
+        try { this.onChange?.(); } catch (err) { log.warn({ err }, "Sub-session change listener failed"); }
+      });
       return out;
     });
-    if (written) {
-      this.cached = clone(written);
-      this.lastState = "ok";
-      this.recoveredByImport = false;
-      try { this.onChange?.(); } catch (err) { log.warn({ err }, "Sub-session change listener failed"); }
-    }
-    return result;
   }
 
   /** The database, opened and the old file imported. Throws SubsessionStoreError when it cannot be used. */
